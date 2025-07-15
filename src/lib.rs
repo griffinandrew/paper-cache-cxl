@@ -280,7 +280,17 @@ where
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
-				Ok(object.data())
+				let start = Instant::now();
+				let obj = object.data().copy();
+				let elapsed = start.elapsed();
+				println!("Cache get for key {:?} took {:?}", key, elapsed);
+				println!("Cache hit for key {:?}: {:?}", key, obj);
+				Ok(obj)
+			},
+
+			_ => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
 			},
 
 			_ => {
