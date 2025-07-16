@@ -128,8 +128,6 @@ impl<T> CxlPtr<T> {
         &self.inner
     }
 
-
-
 	pub fn get_size(&self) -> usize 
 	where
 		T: TypeSize,
@@ -164,6 +162,7 @@ impl<T: TypeSize> Deref for CxlPtr<T> {
 	where 
 	T: TypeSize,
 	{	
+		//returns a reference to the inner data that is the arc so &arc
 		let target = black_box(&*self.inner);
 		target
     }
