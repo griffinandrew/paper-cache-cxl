@@ -330,15 +330,16 @@ where
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
 				let start = Instant::now();
-				
-				//returns ref to CxlPtr<V>
+
+				//this returns ref to inner 
+				// so &
 				let data_cxl_ptr = object.data();
 				//let data_cxl_ptr = object.data.get_arc();
 				//returns the underlying Arc<V>
-				let arc = data_cxl_ptr.get_arc(); 
+				//let arc = data_cxl_ptr.get_arc(); 
 
 				
-				let clone = black_box((*arc).clone()); // Ensure the data is accessed
+				//let clone = black_box((*arc).clone()); // Ensure the data is accessed
 				//slet clone = data.clone(); // Clone the data to return
 				
 
@@ -348,8 +349,10 @@ where
 				
 				//let derefed_ptr = &(**data_cxl_ptr);
 
+				let derefed_ptr = data_cxl_ptr.deref();
+
 				//the clone is really when accessing the data occurs
-				//let cloned = derefed_ptr.clone();
+				let cloned = derefed_ptr.clone();
 				//println!("clone: {:?}", clone);
 				let elapsed = start.elapsed().as_nanos() as u64; // Convert to nanoseconds for easier reading
 
@@ -364,7 +367,7 @@ where
 				let expected_time = elapsed * 2;
 				black_box(assert!(total_duration >= expected_time, "CxlPtr deref took less time than expected IN SERVER: {} < {}", total_duration, expected_time));
 
-				Ok(clone)
+				Ok(cloned)
 			},
 
 			_ => {

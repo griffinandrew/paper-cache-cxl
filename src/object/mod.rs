@@ -50,7 +50,8 @@ impl<K, V> Object<K, V> {
 		new_obj                
 	}
 
-
+	//does this need to be an arc 
+	// but i will run into same issues as before when just using arc 
 	pub fn data(&self) -> &CxlPtr<V>
 		where
 		K: TypeSize,
