@@ -330,12 +330,20 @@ where
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
 				let start = Instant::now();
-			
+				
+				//returns ref to CxlPtr<V>
 				let data_cxl_ptr = object.data();
 				//let data_cxl_ptr = object.data.get_arc();
+				//returns the underlying Arc<V>
 				let arc = data_cxl_ptr.get_arc(); 
 
-				let clone_1 = (*arc).clone(); // Deref to get the underlying data
+				for byte in (&*arc).iter() {
+					black_box(*byte); // Ensure the data is accessed
+				}
+
+				//i am just concerned this is not thread safe
+				// i kind of think that its not....
+				//let clone = (*arc).clone(); // Deref to get the underlying data
 				
 				//let derefed_ptr = &(**data_cxl_ptr);
 
@@ -355,7 +363,7 @@ where
 				let expected_time = elapsed * 2;
 				black_box(assert!(total_duration >= expected_time, "CxlPtr deref took less time than expected IN SERVER: {} < {}", total_duration, expected_time));
 
-				Ok(clone_1)
+				Ok(clone)
 			},
 
 			_ => {
