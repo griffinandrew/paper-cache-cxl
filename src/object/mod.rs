@@ -40,9 +40,17 @@ impl<K, V> Object<K, V> {
 		}
 	}
 
+	
 	pub fn data(&self) -> Arc<V> {
 		self.data.clone()
 	}
+	
+	/*
+	pub fn data(&self) -> V {
+		let data = (*self.data).clone();
+		data
+	}
+	*/
 
 	pub fn key_matches(&self, key: &K) -> bool
 	where

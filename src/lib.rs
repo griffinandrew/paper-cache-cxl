@@ -60,6 +60,15 @@ pub use crate::{
 	policy::PaperPolicy,
 };
 
+
+// for cxl 
+
+use std::hint::black_box;
+use std::time::Duration;
+use std::time::Instant;
+
+
+
 pub type CacheSize = u64;
 pub type AtomicCacheSize = AtomicU64;
 
@@ -83,7 +92,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 impl<K, V, S> PaperCache<K, V, S>
 where
 	K: 'static + Eq + Hash + TypeSize,
-	V: 'static + TypeSize,
+	V: 'static + TypeSize + Clone,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` with maximum size `max_size` and
@@ -274,13 +283,29 @@ where
 	/// // Getting a key which does not exist in the cache will return a CacheError.
 	/// assert!(cache.get(&1).is_err());
 	/// ```
-	pub fn get(&self, key: &K) -> Result<Arc<V>, CacheError> {
+	pub fn get(&self, key: &K) -> Result<V, CacheError> {
 		let hashed_key = self.hash_key(key);
 
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
-				Ok(object.data())
+				let start_init = Instant::now();
+				let data = (*(object.data())).clone();
+				let elapsed = start_init.elapsed().as_nanos() as u64;
+				let end = Instant::now() + Duration::from_nanos(elapsed);
+				//println!("spinning for {} ns in get after clone", elapsed);
+				
+				while black_box(Instant::now()) < black_box(end) {
+					//println!("CxlPtr deref spin loop");
+					black_box(std::hint::spin_loop());
+				}
+
+				//add an another timers to assert time is actually being spent here
+				let total_duration = start_init.elapsed().as_nanos() as u64;
+				//println!("CxlPtr deref total duration: {} ns", total_duration);
+				let expected_time = elapsed * 2;
+				black_box(assert!(total_duration >= expected_time, "CxlPtr deref took less time than expected IN CACHE: {} < {}", total_duration, expected_time));
+				Ok(data)
 			},
 
 			_ => {
