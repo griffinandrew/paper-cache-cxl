@@ -337,9 +337,10 @@ where
 				//returns the underlying Arc<V>
 				let arc = data_cxl_ptr.get_arc(); 
 
-				for byte in (&*arc).iter() {
-					black_box(*byte); // Ensure the data is accessed
-				}
+				
+				let clone = black_box((*arc).clone()); // Ensure the data is accessed
+				//slet clone = data.clone(); // Clone the data to return
+				
 
 				//i am just concerned this is not thread safe
 				// i kind of think that its not....
