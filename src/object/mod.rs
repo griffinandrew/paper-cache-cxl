@@ -34,14 +34,11 @@ impl<K, V> Object<K, V> {
 		K: TypeSize,
 		V: TypeSize,
 	{
-		//let start = Instant::now();
 		let expiry = match ttl {
 			Some(0) | None => None,
 			Some(ttl) => Some(get_expiry_from_ttl(ttl)),
 		};
 
-
-		//let data_size = (data.get_size() + size_of::<CxlPtr<V>>()) as u64;
 		let cxl_data = CxlPtr::new(data);
 
 		let new_obj = Object {
@@ -53,11 +50,6 @@ impl<K, V> Object<K, V> {
 		new_obj                
 	}
 
-	/*
-	pub fn data(&self) -> Arc<V> {
-		self.data.clone()
-	}
-	*/
 
 	pub fn data(&self) -> &CxlPtr<V>
 		where
@@ -66,6 +58,7 @@ impl<K, V> Object<K, V> {
 	{
 		&self.data
 	}
+
 
 	pub fn key_matches(&self, key: &K) -> bool
 	where
@@ -135,6 +128,8 @@ impl<T> CxlPtr<T> {
         &self.inner
     }
 
+
+
 	pub fn get_size(&self) -> usize 
 	where
 		T: TypeSize,
@@ -161,20 +156,16 @@ impl <T> Clone for CxlPtr<T> {
     }
 }
 
-
+//this might be unsafe behavior, I think i would be violating safety rules but complier never complains
 impl<T: TypeSize> Deref for CxlPtr<T> {
-
     type Target = T;
 
     fn deref(&self) -> &Self::Target 
 	where 
 	T: TypeSize,
 	{	
-
 		let target = black_box(&*self.inner);
-
 		target
-		
     }
 }
  

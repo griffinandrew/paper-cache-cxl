@@ -332,10 +332,16 @@ where
 				let start = Instant::now();
 			
 				let data_cxl_ptr = object.data();
-				let derefed_ptr = &(**data_cxl_ptr); 
+				//let data_cxl_ptr = object.data.get_arc();
+				let arc = data_cxl_ptr.get_arc(); 
+
+				let clone_1 = (*arc).clone(); // Deref to get the underlying data
+				
+				//let derefed_ptr = &(**data_cxl_ptr);
 
 				//the clone is really when accessing the data occurs
-				let cloned = derefed_ptr.clone();
+				//let cloned = derefed_ptr.clone();
+				//println!("clone_1: {:?}", clone_1);
 				let elapsed = start.elapsed().as_nanos() as u64; // Convert to nanoseconds for easier reading
 
 				// Spin for the duration of recorded access
@@ -349,8 +355,7 @@ where
 				let expected_time = elapsed * 2;
 				black_box(assert!(total_duration >= expected_time, "CxlPtr deref took less time than expected IN SERVER: {} < {}", total_duration, expected_time));
 
-				info!("Get operation took: {:?}", elapsed);
-				Ok(cloned)
+				Ok(clone_1)
 			},
 
 			_ => {
