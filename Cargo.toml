@@ -5,7 +5,7 @@ edition = "2024"
 license = "AGPL-3.0"
 description = "An in-memory cache with dynamic eviction policies."
 repository = "https://github.com/griffinandrew/paper-cache-cxl.git"
-branch - "cxl_sim_exp"
+branch = "cxl_sim_exp"
 readme = "README.md"
 homepage = "https://papercache.io"
 keywords = ["caching", "PaperCache"]
