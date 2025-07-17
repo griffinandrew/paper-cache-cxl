@@ -352,7 +352,7 @@ where
 				//let derefed_ptr = data_cxl_ptr.deref();
 
 				//the clone is really when accessing the data occurs
-				let cloned = derefed_ptr.clone();
+				let cloned = deref_ptr.clone();
 				//println!("clone: {:?}", clone);
 				let elapsed = start.elapsed().as_nanos() as u64; // Convert to nanoseconds for easier reading
 
