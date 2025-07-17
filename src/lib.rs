@@ -346,10 +346,10 @@ where
 				//i am just concerned this is not thread safe
 				// i kind of think that its not....
 				//let clone = (*arc).clone(); // Deref to get the underlying data
-				
-				//let derefed_ptr = &(**data_cxl_ptr);
 
-				let derefed_ptr = data_cxl_ptr.deref();
+				let deref_ptr = &(**data_cxl_ptr);
+
+				//let derefed_ptr = data_cxl_ptr.deref();
 
 				//the clone is really when accessing the data occurs
 				let cloned = derefed_ptr.clone();
