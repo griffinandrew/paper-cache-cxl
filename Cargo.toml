@@ -10,6 +10,7 @@ readme = "README.md"
 homepage = "https://papercache.io"
 keywords = ["caching", "PaperCache"]
 categories = ["caching"]
+build = "build.rs"
 
 [dependencies]
 dlv-list = "0.6.0"
@@ -27,3 +28,8 @@ nohash-hasher = "0.2.0"
 serde = { version = "1.0.219", features = ["derive"] }
 rayon = "1.10.0"
 num-traits = "0.2.19"
+bindgen = "0.72.0"
+
+
+[build-dependencies] 
+bindgen = "0.72.0"
