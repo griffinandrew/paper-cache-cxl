@@ -125,7 +125,7 @@ impl<T> CxlPtr<T> {
         }
     }
 
-    pub fn get_inner(&self) -> &T {
+    pub fn get_inner(&self) -> &T { //returns a reference to the inner data that is the arc so &arc
         &self.inner
     }
 
@@ -139,7 +139,7 @@ impl<T> CxlPtr<T> {
 		size
 	}
 
-	pub fn get_arc(&self) -> Arc<T> {
+	pub fn get_arc(&self) -> Arc<T> { //returns a clone of the arc so we can increase ref count
         Arc::clone(&self.inner)
     }
 
