@@ -1,2 +1,1 @@
-#include <numa.h>
-#include <numaif.h>
+#include<libpmemobj.h>
