@@ -33,7 +33,7 @@ use dashmap::{
 use typesize::TypeSize;
 use nohash_hasher::NoHashHasher;
 use crossbeam_channel::unbounded;
-use log::info;
+use log::{info, error};
 
 use kwik::{
 	fmt,
@@ -705,9 +705,10 @@ where
 	}
 
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		self.worker_manager
-			.try_send(event)
-			.map_err(|_| CacheError::Internal)?;
+		if let Err(err) = self.worker_manager.try_send(event) {
+			error!("Could not communicate with workers: {err:?}");
+			return Err(CacheError::Internal);
+		}
 
 		Ok(())
 	}
@@ -741,11 +742,12 @@ where
 			// something went wrong during policy reconstruction) so we fall back
 			// to evicting a random object
 
-			objects
-				.iter()
-				.next()
-				.ok_or(CacheError::Internal)?
-				.key().to_owned()
+			let Some(object) = objects.iter().next() else {
+				error!("Object store is empty with non-zero used size");
+				return Err(CacheError::Internal);
+			};
+
+			object.key().to_owned()
 		},
 	};
 
@@ -1044,7 +1046,7 @@ mod tests {
 			TEST_CACHE_MAX_SIZE,
 			&[PaperPolicy::Lru, PaperPolicy::Lfu],
 			PaperPolicy::Lfu,
-		).expect("Could not initialize test cache.");
+		).expect("Could not initialize test cache");
 
 		let base_expected = 4 + 4 + mem::size_of::<ExpireTime>() as u32;
 		let lfu_expected = base_expected + get_policy_overhead(&PaperPolicy::Lfu);
@@ -1142,7 +1144,7 @@ mod tests {
 			TEST_CACHE_MAX_SIZE,
 			&[PaperPolicy::Lru, PaperPolicy::Lfu],
 			PaperPolicy::Lfu,
-		).expect("Could not initialize test cache.");
+		).expect("Could not initialize test cache");
 
 		let base_expected = 4 + 4 + mem::size_of::<ExpireTime>() as u32;
 		let lfu_expected = base_expected + get_policy_overhead(&PaperPolicy::Lfu);
@@ -1215,6 +1217,6 @@ mod tests {
 			TEST_CACHE_MAX_SIZE,
 			&[PaperPolicy::Lfu],
 			PaperPolicy::Lfu,
-		).expect("Could not initialize test cache.")
+		).expect("Could not initialize test cache")
 	}
 }
