@@ -21,6 +21,8 @@ fn main() {
     // Write the bindings to the $OUT_DIR/bindings.rs
     //let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
 
+    //leave hardcoded as so is the path to wrapper.h `above so when moving, change both anyway
+    `
     let out_path = PathBuf::from("/home/griffin/code/cxl_paper_cache/paper-cache-cxl/");
     bindings
         .write_to_file(out_path.join("pmemobj_bindings.rs"))
