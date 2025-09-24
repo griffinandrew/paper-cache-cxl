@@ -15,18 +15,16 @@ unsafe impl GlobalAlloc for FarTierAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         println!("Allocating {} bytes", layout.size());
         let ptr = memkind_malloc(MEMKIND_DAX_KMEM, layout.size());
-        if ptr.is_null() {
-            null_mut()
-        } else {
-            ptr as *mut u8
-        }
+
+        assert!(!ptr.is_null(), "Failed to allocate memory");
         println!("Allocated {:p}", ptr);
+        return ptr as *mut u8;
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         // not sure about this second argument
         println!("Deallocating {:p}", ptr);
         memkind_free(MEMKIND_DAX_KMEM, ptr as *mut ::std::os::raw::c_void);
-        println!("Deallocated {:p}", ptr);
+        //println!("Deallocated {:p}", ptr);
     }
 }
