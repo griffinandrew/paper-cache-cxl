@@ -11,6 +11,11 @@ mod object;
 mod policy;
 mod status;
 
+mod allocator;
+
+#[global_allocator]
+static GLOBAL: allocator::FarTierAllocator = allocator::FarTierAllocator;
+
 use std::{
 	thread,
 	sync::{
