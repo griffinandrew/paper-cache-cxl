@@ -11,7 +11,7 @@ mod object;
 mod policy;
 mod status;
 
-mod allocator;
+pub mod allocator;
 
 // #[global_allocator]
 // static GLOBAL: allocator::FarTierAllocator = allocator::FarTierAllocator;
