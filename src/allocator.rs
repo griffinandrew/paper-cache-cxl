@@ -9,7 +9,6 @@ use memkind_bindings::*;
 
 pub struct FarTierAllocator;
 
-// export MEMKIND_DAX_KMEM_NODES=0
 
 unsafe impl GlobalAlloc for FarTierAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
