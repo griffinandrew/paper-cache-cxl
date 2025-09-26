@@ -51,7 +51,7 @@ use crate::{
 		Object,
 		ObjectSize,
 		overhead::OverheadManager,
-		CxlPtr
+		//CxlPtr
 
 	},
 	worker::{
@@ -89,9 +89,9 @@ pub struct PaperCache<K, V, S = RandomState> {
 
 
 /// for cxl sim to force the memory access
-use std::ops::Deref;
-use std::time::{Instant, Duration};
-use std::hint::black_box;
+//use std::ops::Deref;
+//use std::time::{Instant, Duration};
+//use std::hint::black_box;
 /// 
 
 
@@ -291,7 +291,7 @@ where
 	/// assert!(cache.get(&1).is_err());
 	/// ```
 	/// 
-	/*
+	
 	pub fn get(&self, key: &K) -> Result<Arc<V>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
@@ -299,15 +299,6 @@ where
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
 				Ok(object.data())
-				let start = Instant::now();
-				let obj = object.data().as_ref().clone();
-				let elapsed = start.elapsed();
-				Ok(obj)
-			},
-
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
 			},
 
 			_ => {
@@ -321,70 +312,7 @@ where
 		result
 	}
 
-	*/
-
-
-	pub fn get(&self, key: &K) -> Result<V, CacheError> 
-
-		where
-		V: Clone,
-		{
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let start = Instant::now();
-
-				//this returns ref to inner 
-				// so &
-				let data_cxl_ptr = object.data();
-				//let data_cxl_ptr = object.data.get_arc();
-				//returns the underlying Arc<V>
-				//let arc = data_cxl_ptr.get_arc(); 
-
-				
-				//let clone = black_box((*arc).clone()); // Ensure the data is accessed
-				//slet clone = data.clone(); // Clone the data to return
-				
-
-				//i am just concerned this is not thread safe
-				// i kind of think that its not....
-				//let clone = (*arc).clone(); // Deref to get the underlying data
-
-				let deref_ptr = &(**data_cxl_ptr);
-
-				//let derefed_ptr = data_cxl_ptr.deref();
-
-				//the clone is really when accessing the data occurs
-				let cloned = deref_ptr.clone();
-				//println!("clone: {:?}", clone);
-				let elapsed = start.elapsed().as_nanos() as u64; // Convert to nanoseconds for easier reading
-
-				// Spin for the duration of recorded access
-				let end = Instant::now() + Duration::from_nanos(elapsed);
-				while black_box(Instant::now()) < black_box(end) {
-					//println!("CxlPtr deref spin loop");
-					black_box(std::hint::spin_loop());
-				}
-				//ensure that the spin loop is actually triggering and running for double the time
-				let total_duration = start.elapsed().as_nanos() as u64;
-				let expected_time = elapsed * 2;
-				black_box(assert!(total_duration >= expected_time, "CxlPtr deref took less time than expected IN SERVER: {} < {}", total_duration, expected_time));
-
-				Ok(cloned)
-			},
-
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-
-		result
-	}
+	
 
 	/// Sets the supplied key and value in the cache.
 	/// Returns a [`CacheError`] if the value size is zero or larger than
@@ -536,12 +464,12 @@ where
 	/// ```
 	/// 
 	/// this is probabaly retuning the wrong thing
-	pub fn peek(&self, key: &K) ->  Result<CxlPtr<V>, CacheError> {
+	pub fn peek(&self, key: &K) ->  Result<Arc<V>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
 		match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data().clone()),
+				Ok(object.data()),
 
 			_ => Err(CacheError::KeyNotFound),
 		}
