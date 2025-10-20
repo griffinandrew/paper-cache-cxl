@@ -5,6 +5,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![cfg_attr(feature = "allocator_api", feature(allocator_api))]
+
+#[cfg(feature = "allocator_api")]
+pub mod allocator;
+use crate::allocator::HybridGlobal as Hybrid;
+
 mod error;
 mod worker;
 mod object;
@@ -274,6 +280,29 @@ where
 	/// // Getting a key which does not exist in the cache will return a CacheError.
 	/// assert!(cache.get(&1).is_err());
 	/// ```
+	/// 
+	#[cfg(feature = "allocator_api")]
+	pub fn get(&self, key: &K) -> Result<Arc<V, Hybrid>, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let result = match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				self.status.incr_hits();
+				Ok(object.data())
+			},
+
+			_ => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
+
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+
+		result
+	}
+
+	#[cfg(not(feature = "allocator_api"))]
 	pub fn get(&self, key: &K) -> Result<Arc<V>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
@@ -442,7 +471,21 @@ where
 	/// assert!(cache.peek(&1).is_ok());
 	/// assert!(cache.peek(&2).is_ok());
 	/// ```
+	///
+	#[cfg(not(feature = "allocator_api"))]
 	pub fn peek(&self, key: &K) -> Result<Arc<V>, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Ok(object.data()),
+
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
+	#[cfg(feature = "allocator_api")]
+	pub fn peek(&self, key: &K) -> Result<Arc<V, Hybrid>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
 		match self.objects.get(&hashed_key) {
