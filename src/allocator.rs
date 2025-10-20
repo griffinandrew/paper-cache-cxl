@@ -37,7 +37,7 @@ unsafe impl GlobalAlloc for HybridGlobal {
             if ptr.is_null() { return ptr::null_mut(); }
             DRAM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
             //ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
-            (ptr, 0)
+            ptr
         } else {
             unsafe {
                 let dax_size = 266_352_984_064; // PMEM size from ndctl list --namespaces
@@ -52,7 +52,7 @@ unsafe impl GlobalAlloc for HybridGlobal {
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
             if ptr.is_null() { return ptr::null_mut(); }
             //ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
-            (ptr, 1)
+            ptr
         };
 
         //for debug only.....
@@ -81,8 +81,6 @@ unsafe impl GlobalAlloc for HybridGlobal {
 
         }
         */
-        
-        raw 
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
