@@ -16,12 +16,14 @@ pub struct HybridGlobal;
 
 static INIT: Once = Once::new();
 static DRAM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
-static mut DRAM_LIMIT: usize = 0; // default 1 GiB
 
-static PRINT_THRESHOLD: usize = 10000;
-static mut NUM_ALLOCS: usize = 0;
-static mut NUM_DEALLOCS: usize = 0;
-static ALL_MEM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+//for now..... 
+static mut DRAM_LIMIT: usize = 100 * 1024 * 1024 * 1024; // default 100 GiB
+
+//static PRINT_THRESHOLD: usize = 10000;
+//static mut NUM_ALLOCS: usize = 0;
+//static mut NUM_DEALLOCS: usize = 0;
+//static ALL_MEM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
 
 //apparently need to make sure this is aligned to max alignment
@@ -29,13 +31,12 @@ static ALL_MEM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for HybridGlobal {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        panic!("HybridGlobal::alloc was called! layout size: {}", layout.size());
         // Decide backend
-        let (raw, tag) = if Self::should_use_dram(layout.size()) {
+        let raw = if Self::should_use_dram(layout.size()) {
             let ptr = Jemalloc.alloc(layout);
             if ptr.is_null() { return ptr::null_mut(); }
             DRAM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
-            ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
+            //ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
             (ptr, 0)
         } else {
             unsafe {
@@ -50,13 +51,13 @@ unsafe impl GlobalAlloc for HybridGlobal {
             }
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
             if ptr.is_null() { return ptr::null_mut(); }
-            ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
+            //ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
             (ptr, 1)
         };
 
         //for debug only.....
        
-        
+        /*
         unsafe {
 
             if PRINT_THRESHOLD < NUM_ALLOCS {
@@ -79,6 +80,7 @@ unsafe impl GlobalAlloc for HybridGlobal {
             NUM_ALLOCS += 1;
 
         }
+        */
         
         raw 
     }
@@ -87,7 +89,8 @@ unsafe impl GlobalAlloc for HybridGlobal {
 
         let tier = unsafe {allocator_bindings::check_tier(ptr as *mut std::ffi::c_void)};
 
-        
+
+        /* 
         unsafe {
 
             if PRINT_THRESHOLD < NUM_DEALLOCS {
@@ -108,17 +111,18 @@ unsafe impl GlobalAlloc for HybridGlobal {
             }
             NUM_DEALLOCS += 1;
         }
+        */
         
 
         if tier == 0 {
             // DRAM
             unsafe { Jemalloc.dealloc(ptr as *mut u8, layout); }
             DRAM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
-            ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
+            //ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
         } else {
             //pmem
             unsafe { allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void); }
-            ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
+            //ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
         }
     }
 }
