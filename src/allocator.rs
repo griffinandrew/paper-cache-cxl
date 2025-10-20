@@ -55,6 +55,7 @@ unsafe impl GlobalAlloc for HybridGlobal {
             ptr
         };
 
+
         //for debug only.....
        
         /*
@@ -81,6 +82,7 @@ unsafe impl GlobalAlloc for HybridGlobal {
 
         }
         */
+        raw
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
