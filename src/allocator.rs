@@ -16,7 +16,7 @@ pub struct HybridGlobal;
 
 static INIT: Once = Once::new();
 static DRAM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
-static mut DRAM_LIMIT: usize = 1024 * 1024 * 1024 * 1; // default 1 GiB
+static mut DRAM_LIMIT: usize = 0; // default 1 GiB
 
 //static PRINT_THRESHOLD: usize = 10000;
 //static mut NUM_ALLOCS: usize = 0;
