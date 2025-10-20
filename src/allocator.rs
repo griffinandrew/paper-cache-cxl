@@ -29,6 +29,7 @@ static ALL_MEM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for HybridGlobal {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        panic!("HybridGlobal::alloc was called! layout size: {}", layout.size());
         // Decide backend
         let (raw, tag) = if Self::should_use_dram(layout.size()) {
             let ptr = Jemalloc.alloc(layout);
