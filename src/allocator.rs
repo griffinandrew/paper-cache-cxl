@@ -18,7 +18,7 @@ static INIT: Once = Once::new();
 static DRAM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
 //for now.....
-static mut DRAM_LIMIT: usize = 0; // default 100 GiB
+static mut DRAM_LIMIT: usize = 1000 * 1024 * 1024 * 1024; // default 100 GiB
 
 //static PRINT_THRESHOLD: usize = 10000;
 //static mut NUM_ALLOCS: usize = 0;
@@ -32,6 +32,31 @@ static mut DRAM_LIMIT: usize = 0; // default 100 GiB
 unsafe impl GlobalAlloc for HybridGlobal {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // Decide backend
+
+         unsafe {
+            INIT.call_once(|| {
+                let dax_size = 266_352_984_064; // PMEM size from ndctl list --namespaces
+                let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
+                allocator_bindings::umf_allocator_init(
+                    dax_path,
+                    dax_size,
+                    );
+            });
+        }
+
+        //if only using pmem ... dont track the fucking counters.... 
+        if DRAM_LIMIT == 0 {
+            let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
+            if ptr.is_null() { return ptr::null_mut(); }
+            return ptr;
+        }
+
+        if DRAM_LIMIT == 1000 * 1024 * 1024 * 1024 {
+            let ptr = Jemalloc.alloc(layout);
+            if ptr.is_null() { return ptr::null_mut(); }
+            return ptr;
+        }
+
         let raw = if Self::should_use_dram(layout.size()) {
             let ptr = Jemalloc.alloc(layout);
             if ptr.is_null() { return ptr::null_mut(); }
@@ -39,16 +64,6 @@ unsafe impl GlobalAlloc for HybridGlobal {
             //ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
             ptr
         } else {
-            unsafe {
-                let dax_size = 266_352_984_064; // PMEM size from ndctl list --namespaces
-                let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
-                INIT.call_once(|| {
-                    allocator_bindings::umf_allocator_init(
-                        dax_path,
-                        dax_size,
-                    );
-                });
-            }
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
             if ptr.is_null() { return ptr::null_mut(); }
             //ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
