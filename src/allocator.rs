@@ -18,7 +18,7 @@ static INIT: Once = Once::new();
 static DRAM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
 //for now.....
-static mut DRAM_LIMIT: usize = 1000 * 1024 * 1024 * 1024; // default 100 GiB
+static mut DRAM_LIMIT: usize = 0; // default 100 GiB
 
 //static PRINT_THRESHOLD: usize = 10000;
 //static mut NUM_ALLOCS: usize = 0;
