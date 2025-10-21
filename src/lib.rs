@@ -13,8 +13,8 @@ pub mod allocator;
 use crate::allocator::HybridGlobal as Hybrid;
 
 
-#[cfg(feature = "allocator_api")]
-println!("Using custom Hybrid Allocator with Paper Cache");
+#[cfg(not(feature = "allocator_api"))]
+compile_error!("The 'allocator_api' feature must be enabled to use the allocator.");
 
 mod error;
 mod worker;
