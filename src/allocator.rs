@@ -252,9 +252,12 @@ unsafe impl Allocator for HybridGlobal {
         if tier == 0 {
             // DRAM
             unsafe { Jemalloc.dealloc(ptr.as_ptr() as *mut u8, layout); }
+            DRAM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
+            //ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
         } else {
             //pmem
             unsafe { allocator_bindings::umf_dealloc(ptr.as_ptr() as *mut std::ffi::c_void); }
+            //ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
         }
     }
 }
