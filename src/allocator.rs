@@ -144,7 +144,7 @@ unsafe impl GlobalAlloc for HybridGlobal {
         if tier == 0 {
             // DRAM
             unsafe { Jemalloc.dealloc(ptr as *mut u8, layout); }
-            DRAM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
+            //DRAM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
             //ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
         } else {
             //pmem
@@ -172,18 +172,44 @@ impl HybridGlobal {
 }
 
 
-
 unsafe impl Allocator for HybridGlobal {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        unsafe {
-            HybridGlobal::alloc(self, layout)
-                .as_mut()
-                .map(|ptr| NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size()))
-                .ok_or(AllocError)
+
+        if DRAM_LIMIT == 0 {
+            unsafe {
+                INIT.call_once(|| {
+                    let dax_size = 266_352_984_064; // PMEM size from ndctl list --namespaces
+                    let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
+                    allocator_bindings::umf_allocator_init(
+                        dax_path,
+                        dax_size,
+                        );
+                });
+            }
+            let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
+            if ptr.is_null() {
+                return Err(AllocError);
+            }
+            return NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size()).into();
+        }
+        if DRAM_LIMIT == 1000 * 1024 * 1024 * 1024 {
+            let ptr = Jemalloc.alloc(layout);
+            if ptr.is_null() {
+                return Err(AllocError);
+            }
+            return NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size()).into();
         }
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        HybridGlobal::dealloc(self, ptr.as_ptr(), layout);
+        //HybridGlobal::dealloc(self, ptr.as_ptr(), layout);
+        let tier = unsafe {allocator_bindings::check_tier(ptr.as_ptr() as *mut std::ffi::c_void)};
+        if tier == 0 {
+            // DRAM
+            unsafe { Jemalloc.dealloc(ptr.as_ptr() as *mut u8, layout); }
+        } else {
+            //pmem
+            unsafe { allocator_bindings::umf_dealloc(ptr.as_ptr() as *mut std::ffi::c_void); }
+        }
     }
 }
