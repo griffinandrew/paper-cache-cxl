@@ -33,19 +33,18 @@ unsafe impl GlobalAlloc for HybridGlobal {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // Decide backend
 
-         unsafe {
-            INIT.call_once(|| {
-                let dax_size = 266_352_984_064; // PMEM size from ndctl list --namespaces
-                let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
-                allocator_bindings::umf_allocator_init(
-                    dax_path,
-                    dax_size,
-                    );
-            });
-        }
-
         //if only using pmem ... dont track the fucking counters.... 
         if DRAM_LIMIT == 0 {
+            unsafe {
+                INIT.call_once(|| {
+                    let dax_size = 266_352_984_064; // PMEM size from ndctl list --namespaces
+                    let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
+                    allocator_bindings::umf_allocator_init(
+                        dax_path,
+                        dax_size,
+                        );
+                });
+            }
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
             if ptr.is_null() { return ptr::null_mut(); }
             return ptr;
@@ -64,6 +63,16 @@ unsafe impl GlobalAlloc for HybridGlobal {
             //ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
             ptr
         } else {
+            unsafe {
+                INIT.call_once(|| {
+                    let dax_size = 266_352_984_064; // PMEM size from ndctl list --namespaces
+                    let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
+                    allocator_bindings::umf_allocator_init(
+                        dax_path,
+                        dax_size,
+                        );
+                });
+            }
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
             if ptr.is_null() { return ptr::null_mut(); }
             //ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);

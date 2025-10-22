@@ -12,7 +12,6 @@ pub mod allocator;
 #[cfg(feature = "allocator_api")]
 use crate::allocator::HybridGlobal as Hybrid;
 
-
 #[cfg(not(feature = "allocator_api"))]
 compile_error!("The 'allocator_api' feature must be enabled to use the allocator.");
 
