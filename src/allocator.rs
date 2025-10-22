@@ -190,14 +190,15 @@ unsafe impl Allocator for HybridGlobal {
             if ptr.is_null() {
                 return Err(AllocError);
             }
-            return NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size()).into();
+            return NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size());
         }
         if DRAM_LIMIT == 1000 * 1024 * 1024 * 1024 {
             let ptr = Jemalloc.alloc(layout);
             if ptr.is_null() {
                 return Err(AllocError);
             }
-            return NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size()).into();
+            return NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size());
+
         }
 
         let raw = if Self::should_use_dram(layout.size()) {
@@ -224,7 +225,7 @@ unsafe impl Allocator for HybridGlobal {
                 return Err(AllocError);
             }
             //ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
-            ptr
+            Ok(NonNull::slice_from_raw_parts(unsafe { NonNull::new_unchecked(raw) }, layout.size()))
         };
     }
 
