@@ -42,6 +42,7 @@ unsafe impl GlobalAlloc for HybridObjects {
                         dax_size,
                         );
                 });
+                #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);}
             }
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
             if ptr.is_null() { println!("Failed to allocate PMEM"); return ptr::null_mut(); }
