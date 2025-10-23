@@ -19,7 +19,7 @@ pub struct HybridObjects;
 static INIT: Once = Once::new();
 static DRAM_ALLOCATED_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 
-static mut DRAM_LIMIT_OBJECTS: usize = 1000 * 1024 * 1024 * 1024; //try with all in pmem......
+static mut DRAM_LIMIT_OBJECTS: usize = 0; //try with all in pmem......
 
 
 static PRINT_THRESHOLD: usize = 10000;
