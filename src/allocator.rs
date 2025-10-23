@@ -115,6 +115,7 @@ unsafe impl GlobalAlloc for HybridGlobal {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
 
+        /*
         if DRAM_LIMIT == 0 {
             //all in pmem
             unsafe { allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void); }
@@ -125,6 +126,7 @@ unsafe impl GlobalAlloc for HybridGlobal {
             unsafe { Jemalloc.dealloc(ptr as *mut u8, layout); }
             return;
         }
+        */
 
         let tier = unsafe {allocator_bindings::check_tier(ptr as *mut std::ffi::c_void)};
 
