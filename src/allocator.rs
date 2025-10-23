@@ -51,13 +51,13 @@ unsafe impl GlobalAlloc for HybridGlobal {
                 });
             }
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
-            if ptr.is_null() { return ptr::null_mut(); }
+            if ptr.is_null() { println!("Failed to allocate PMEM"); return ptr::null_mut(); }
             return ptr;
         }
 
         if DRAM_LIMIT == 1000 * 1024 * 1024 * 1024 {
             let ptr = Jemalloc.alloc(layout);
-            if ptr.is_null() { return ptr::null_mut(); }
+            if ptr.is_null() { println!("Failed to allocate DRAM"); return ptr::null_mut(); }
             return ptr;
         }
 
