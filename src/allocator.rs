@@ -31,9 +31,6 @@ static mut DRAM_LIMIT: usize = 0; //try with all in pmem......
 //static ALL_MEM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
 
-//apparently need to make sure this is aligned to max alignment
-//might need to store pointer to avoid bad freeing....
-
 unsafe impl GlobalAlloc for HybridGlobal {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // Decide backend
@@ -114,8 +111,7 @@ unsafe impl GlobalAlloc for HybridGlobal {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-
-        /*
+        
         if DRAM_LIMIT == 0 {
             //all in pmem
             unsafe { allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void); }
@@ -126,7 +122,8 @@ unsafe impl GlobalAlloc for HybridGlobal {
             unsafe { Jemalloc.dealloc(ptr as *mut u8, layout); }
             return;
         }
-        */
+
+         // Check the tier of the allocated memory only if not all in pmem or all in dram
 
         let tier = unsafe {allocator_bindings::check_tier(ptr as *mut std::ffi::c_void)};
 
@@ -169,13 +166,6 @@ unsafe impl GlobalAlloc for HybridGlobal {
 
 impl HybridGlobal {
     /// Set the DRAM limit in bytes
-    
-    /*
-    pub fn set_dram_limit(limit: usize) {
-        unsafe { DRAM_LIMIT = limit; }
-        println!("In Cache::: Set DRAM limit to {} bytes", limit);
-    }
-    */
 
     /// Determine whether to allocate from DRAM
     fn should_use_dram(size: usize) -> bool {
