@@ -58,7 +58,7 @@ unsafe impl GlobalAlloc for HybridObjects {
         let raw = if Self::should_use_dram(layout.size()) {
             let ptr = Jemalloc.alloc(layout);
             if ptr.is_null() { println!("Failed to allocate DRAM"); return ptr::null_mut(); }
-            DRAM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
+            DRAM_ALLOCATED_OBJECTS.fetch_add(layout.size(), Ordering::SeqCst);
             #[cfg(debug_assertions)] {ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);}
             ptr
         } else {
@@ -77,15 +77,13 @@ unsafe impl GlobalAlloc for HybridObjects {
             #[cfg(debug_assertions)] {ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);}
             ptr
         };
-
-        //for debug only.....
        
         #[cfg(debug_assertions)] {
             unsafe {
 
                 if PRINT_THRESHOLD < NUM_ALLOCS {
                     let total_alloc = ALL_MEM_ALLOCATED.load(Ordering::SeqCst);
-                    let dram_alloc = DRAM_ALLOCATED.load(Ordering::SeqCst);
+                    let dram_alloc = DRAM_ALLOCATED_OBJECTS.load(Ordering::SeqCst);
                     println!("Allocated: total {} bytes, DRAM {} bytes ({:.2}%), PMEM {} bytes ({:.2}%)",
                         total_alloc,
                         dram_alloc,
@@ -95,9 +93,7 @@ unsafe impl GlobalAlloc for HybridObjects {
                     );
                     println!("alloc requested layout size: {}", layout.size());
                     println!("alloc layout align size: {}", layout.align());
-                    //println!("base pointer: {:p}", base);
                     println!("raw pointer {:p}", raw);
-                    println!("hdr tag: {}", tag);
                     NUM_ALLOCS = 0;
                 }
                 NUM_ALLOCS += 1;
@@ -112,11 +108,14 @@ unsafe impl GlobalAlloc for HybridObjects {
         if DRAM_LIMIT_OBJECTS == 0 {
             //all in pmem
             unsafe { allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void); }
+            #[cfg(debug_assertions)] { ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst); }
+
             return;
         }
         if DRAM_LIMIT_OBJECTS == 1000 * 1024 * 1024 * 1024 {
             //all in dram
             unsafe { Jemalloc.dealloc(ptr as *mut u8, layout); }
+            #[cfg(debug_assertions)] { ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst); }
             return;
         }
     
@@ -126,7 +125,7 @@ unsafe impl GlobalAlloc for HybridObjects {
         if tier == 0 {
             // DRAM
             unsafe { Jemalloc.dealloc(ptr as *mut u8, layout); }
-            DRAM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
+            DRAM_ALLOCATED_OBJECTS.fetch_sub(layout.size(), Ordering::SeqCst);
             #[cfg(debug_assertions)] { ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst); }
         } else {
             //pmem
@@ -139,7 +138,7 @@ unsafe impl GlobalAlloc for HybridObjects {
 
                 if PRINT_THRESHOLD < NUM_DEALLOCS {
                     let total_alloc = ALL_MEM_ALLOCATED.load(Ordering::SeqCst);
-                    let dram_alloc = DRAM_ALLOCATED.load(Ordering::SeqCst);
+                    let dram_alloc = DRAM_ALLOCATED_OBJECTS.load(Ordering::SeqCst);
                     println!("Allocated: total {} bytes, DRAM {} bytes ({:.2}%), PMEM {} bytes ({:.2}%)",
                         total_alloc,
                         dram_alloc,
@@ -151,7 +150,7 @@ unsafe impl GlobalAlloc for HybridObjects {
                     println!("dealloc requested layout size: {}", layout.size());
                     println!("dealloc layout align size: {}", layout.align());
                     println!("raw pointer {:p}", ptr);
-                    println!("hdr tag: {}", tier);
+                    println!("tier 0 is dram, 1 is pmem: {}", tier);
                 }
                 NUM_DEALLOCS += 1;
             }
