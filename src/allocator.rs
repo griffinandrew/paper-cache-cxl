@@ -195,6 +195,7 @@ unsafe impl Allocator for HybridGlobal {
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         HybridGlobal::dealloc(self, ptr.as_ptr(), layout);
     }
+}
 
 
 
