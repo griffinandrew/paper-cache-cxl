@@ -170,8 +170,8 @@ impl HybridObjects {
 
     /// Determine whether to allocate from DRAM
     fn should_use_dram(size: usize) -> bool {
-        let current = DRAM_ALLOCATED.load(Ordering::SeqCst); //this was relaxed... but i made it seqcst which might limit performance
-        unsafe { current + size <= DRAM_LIMIT }
+        let current = DRAM_ALLOCATED_OBJECTS.load(Ordering::SeqCst); //this was relaxed... but i made it seqcst which might limit performance
+        unsafe { current + size <= DRAM_LIMIT_OBJECTS }
     }
 }
 
