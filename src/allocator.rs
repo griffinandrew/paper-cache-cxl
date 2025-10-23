@@ -63,8 +63,8 @@ unsafe impl GlobalAlloc for HybridGlobal {
 
         let raw = if Self::should_use_dram(layout.size()) {
             let ptr = Jemalloc.alloc(layout);
-            if ptr.is_null() { return ptr::null_mut(); }
-            DRAM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
+            if ptr.is_null() { println!("Failed to allocate DRAM"); return ptr::null_mut(); }
+            //DRAM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
             //ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
             ptr
         } else {
@@ -79,7 +79,7 @@ unsafe impl GlobalAlloc for HybridGlobal {
                 });
             }
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
-            if ptr.is_null() { return ptr::null_mut(); }
+            if ptr.is_null() { println!("Failed to allocate PMEM"); return ptr::null_mut(); }
             //ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
             ptr
         };
