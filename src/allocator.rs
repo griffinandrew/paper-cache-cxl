@@ -22,7 +22,7 @@ static DRAM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 //for now.....
 //static mut DRAM_LIMIT: usize = 1000 * 1024 * 1024 * 1024; // default 100 GiB
 
-static mut DRAM_LIMIT: usize = 1000 * 1024 * 1024 * 1024; //try with all in pmem......
+static mut DRAM_LIMIT: usize = 0; //try with all in pmem......
 
 
 //static PRINT_THRESHOLD: usize = 10000;
@@ -115,6 +115,17 @@ unsafe impl GlobalAlloc for HybridGlobal {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
 
+        if DRAM_LIMIT == 0 {
+            //all in pmem
+            unsafe { allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void); }
+            return;
+        }
+        if DRAM_LIMIT == 1000 * 1024 * 1024 * 1024 {
+            //all in dram
+            unsafe { Jemalloc.dealloc(ptr as *mut u8, layout); }
+            return;
+        }
+
         let tier = unsafe {allocator_bindings::check_tier(ptr as *mut std::ffi::c_void)};
 
 
@@ -171,7 +182,23 @@ impl HybridGlobal {
     }
 }
 
+unsafe impl Allocator for HybridGlobal {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        unsafe {
+            HybridGlobal::alloc(self, layout)
+                .as_mut()
+                .map(|ptr| NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size()))
+                .ok_or(AllocError)
+        }
+    }
 
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        HybridGlobal::dealloc(self, ptr.as_ptr(), layout);
+    }
+
+
+
+/* 
 unsafe impl Allocator for HybridGlobal {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
 
@@ -261,3 +288,9 @@ unsafe impl Allocator for HybridGlobal {
         }
     }
 }
+
+
+*/
+
+
+
