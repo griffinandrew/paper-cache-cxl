@@ -14,15 +14,15 @@ mod allocator_bindings {
 /// Hybrid allocator: first DRAM up to a limit, then PMEM
 
 #[derive(Clone, Copy)]
-pub struct HybridGlobal;
+pub struct HybridObjects;
 
 static INIT: Once = Once::new();
-static DRAM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+static DRAM_ALLOCATED_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 
 //for now.....
 //static mut DRAM_LIMIT: usize = 1000 * 1024 * 1024 * 1024; // default 100 GiB
 
-static mut DRAM_LIMIT: usize = 0; //try with all in pmem......
+static mut DRAM_LIMIT_OBJECTS: usize = 1000 * 1024 * 1024 * 1024; //try with all in pmem......
 
 
 //static PRINT_THRESHOLD: usize = 10000;
@@ -31,12 +31,12 @@ static mut DRAM_LIMIT: usize = 0; //try with all in pmem......
 //static ALL_MEM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
 
-unsafe impl GlobalAlloc for HybridGlobal {
+unsafe impl GlobalAlloc for HybridObjects {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // Decide backend
 
         //if only using pmem ... dont track the fucking counters.... 
-        if DRAM_LIMIT == 0 {
+        if DRAM_LIMIT_OBJECTS == 0 {
             unsafe {
                 INIT.call_once(|| {
                     let dax_size = 266_352_984_064; // PMEM size from ndctl list --namespaces
@@ -52,7 +52,7 @@ unsafe impl GlobalAlloc for HybridGlobal {
             return ptr;
         }
 
-        if DRAM_LIMIT == 1000 * 1024 * 1024 * 1024 {
+        if DRAM_LIMIT_OBJECTS == 1000 * 1024 * 1024 * 1024 {
             let ptr = Jemalloc.alloc(layout);
             if ptr.is_null() { println!("Failed to allocate DRAM"); return ptr::null_mut(); }
             return ptr;
@@ -111,19 +111,18 @@ unsafe impl GlobalAlloc for HybridGlobal {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        
-        /*
-        if DRAM_LIMIT == 0 {
+
+        if DRAM_LIMIT_OBJECTS == 0 {
             //all in pmem
             unsafe { allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void); }
             return;
         }
-        if DRAM_LIMIT == 1000 * 1024 * 1024 * 1024 {
+        if DRAM_LIMIT_OBJECTS == 1000 * 1024 * 1024 * 1024 {
             //all in dram
             unsafe { Jemalloc.dealloc(ptr as *mut u8, layout); }
             return;
         }
-        */
+        
 
          // Check the tier of the allocated memory only if not all in pmem or all in dram
 
@@ -166,7 +165,7 @@ unsafe impl GlobalAlloc for HybridGlobal {
     }
 }
 
-impl HybridGlobal {
+impl HybridObjects {
     /// Set the DRAM limit in bytes
 
     /// Determine whether to allocate from DRAM
@@ -176,10 +175,10 @@ impl HybridGlobal {
     }
 }
 
-unsafe impl Allocator for HybridGlobal {
+unsafe impl Allocator for HybridObjects {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         unsafe {
-            HybridGlobal::alloc(self, layout)
+            HybridObjects::alloc(self, layout)
                 .as_mut()
                 .map(|ptr| NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size()))
                 .ok_or(AllocError)
@@ -187,7 +186,7 @@ unsafe impl Allocator for HybridGlobal {
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        HybridGlobal::dealloc(self, ptr.as_ptr(), layout);
+        HybridObjects::dealloc(self, ptr.as_ptr(), layout);
     }
 }
 
@@ -286,6 +285,5 @@ unsafe impl Allocator for HybridGlobal {
 
 
 */
-
 
 

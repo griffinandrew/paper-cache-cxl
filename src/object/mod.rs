@@ -15,8 +15,7 @@ use std::{
 
 
 #[cfg(feature = "allocator_api")]
-use crate::allocator::HybridGlobal as Hybrid;
-use std::alloc::Allocator;
+use crate::allocator::HybridObjects as Hybrid;
 
 use typesize::TypeSize;
 
@@ -45,12 +44,6 @@ impl<K, V> Object<K, V> {
 			Some(ttl) => Some(get_expiry_from_ttl(ttl)),
 		};
 
-		//let data_arc = Arc::new(data);
-
-		#[cfg(feature = "allocator_api")]
-		let data_arc = Arc::new_in(data, Hybrid);
-
-		#[cfg(not(feature = "allocator_api"))]
 		let data_arc = Arc::new(data);
 
 		Object {
@@ -156,3 +149,5 @@ impl<K, V> Object<K, V, Hybrid> {
 		};
 	}
 }
+
+
