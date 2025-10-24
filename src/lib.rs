@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+
 #![cfg_attr(feature = "allocator_api", feature(allocator_api))]
 
 #[cfg(feature = "allocator_api")]
@@ -14,6 +15,13 @@ use crate::allocator::HybridObjects as Hybrid;
 
 //#[cfg(not(feature = "allocator_api"))]
 //compile_error!("The 'allocator_api' feature must be enabled to use the allocator.");
+
+//mod allocator;
+//use allocator::UmfGlobal;
+//use allocator::HybridObjects;
+
+#[global_allocator]
+static GLOBAL: Hybrid = Hybrid;
 
 mod error;
 mod worker;
