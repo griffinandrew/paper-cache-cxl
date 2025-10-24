@@ -12,11 +12,9 @@ pub mod allocator;
 #[cfg(feature = "allocator_api")]
 use crate::allocator::HybridObjects as Hybrid;
 
-#[cfg(feature = "allocator_api")]
-println!("Compiling with allocator_api feature enabled.");
 
-//#[cfg(not(feature = "allocator_api"))]
-//compile_error!("The 'allocator_api' feature must be enabled to use the allocator.");
+#[cfg(not(feature = "allocator_api"))]
+compile_error!("The 'allocator_api' feature must be enabled to use the allocator.");
 
 mod error;
 mod worker;
