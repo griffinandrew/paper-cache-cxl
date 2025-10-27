@@ -107,7 +107,9 @@ impl<K, V> Object<K, V, Hybrid> {
 			Some(ttl) => Some(get_expiry_from_ttl(ttl)),
 		};
 
-		println!("data size: {}", mem::size_of_val(&data));
+		println!("data size: {} bytes", mem::size_of_val(&data));
+
+		println!("data size after as_ref: {} bytes", data.as_ref().len());
 
 		Object {
 			key,
