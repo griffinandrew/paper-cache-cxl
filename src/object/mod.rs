@@ -107,6 +107,8 @@ impl<K, V> Object<K, V, Hybrid> {
 			Some(ttl) => Some(get_expiry_from_ttl(ttl)),
 		};
 
+		println!("data size: {}", mem::size_of_val(&data));
+
 		Object {
 			key,
 			data: Arc::new_in(data, Hybrid),
