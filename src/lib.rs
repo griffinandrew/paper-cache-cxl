@@ -20,8 +20,8 @@ use crate::allocator::HybridObjects as Hybrid;
 //use allocator::UmfGlobal;
 //use allocator::HybridObjects;
 
-#[global_allocator]
-static GLOBAL: Hybrid = Hybrid;
+//#[global_allocator]
+//static GLOBAL: Hybrid = Hybrid;
 
 mod error;
 mod worker;
