@@ -109,7 +109,7 @@ impl<K, V> Object<K, V, Hybrid> {
 
 		println!("data size: {} bytes", mem::size_of_val(&data));
 
-		println!("data size after as_ref: {} bytes", data.as_ref().len());
+		println!("data size after as_ref: {} bytes", data.len());
 
 		Object {
 			key,
