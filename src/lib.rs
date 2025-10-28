@@ -325,12 +325,12 @@ where
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
 		if result.is_ok() {
-			println!("get result for key {:?}: {:?}", key, result);
-			println!("get pointers: key: {:p}, result: {:p}", &key, &result);
-			let clean = result.as_ref().map(|r| Arc::as_ptr(r));
-			println!("good real? get pointers: key: {:p}, result: {:?}", &key, result.as_ref().map(|r| Arc::as_ptr(r)));
-			let tier = unsafe { allocator_bindings::check_tier(clean.unwrap() as *mut _) };
-			println!("get tier for key{:?}: {}", key, tier);
+			//println!("get result for key {:?}: {:?}", key, result);
+			//println!("get pointers: key: {:p}, result: {:p}", &key, &result);
+			//let clean = result.as_ref().map(|r| Arc::as_ptr(r));
+			//println!("good real? get pointers: key: {:p}, result: {:?}", &key, result.as_ref().map(|r| Arc::as_ptr(r)));
+			//let tier = unsafe { allocator_bindings::check_tier(clean.unwrap() as *mut _) };
+			//println!("get tier for key {:?}: {}", key, tier);
 		}
 
 		result
