@@ -103,7 +103,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 
 impl<K, V, S> PaperCache<K, V, S>
 where
-	K: 'static + Eq + Hash + TypeSize,
+	K: 'static + Eq + Hash + TypeSize + Debug,
 	V: 'static + TypeSize + Debug,
 	S: Default + Clone + BuildHasher,
 {
@@ -314,7 +314,7 @@ where
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
-		println!("get result for key {:p}: {:?}", key, result);
+		println!("get result for key {:?}: {:?}", key, result);
 
 		result
 	}
