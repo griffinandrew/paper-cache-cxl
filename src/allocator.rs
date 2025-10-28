@@ -19,7 +19,7 @@ pub struct HybridObjects;
 static INIT: Once = Once::new();
 static DRAM_ALLOCATED_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 
-static mut DRAM_LIMIT_OBJECTS: usize = 1000 * 1024 * 1024 * 1024; // try with all in pmem......
+static mut DRAM_LIMIT_OBJECTS: usize = 0; // try with all in pmem......
 
 static PRINT_THRESHOLD: usize = 10000;
 static mut NUM_ALLOCS: usize = 0;
@@ -65,7 +65,7 @@ unsafe impl GlobalAlloc for HybridObjects {
         } else {
             unsafe {
                 INIT.call_once(|| {
-                    let dax_size = 266_352_984_064; // PMEM size from ndctl list --namespaces
+                    let dax_size = 118377938944; // PMEM size from ndctl list --namespaces
                     let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
                     allocator_bindings::umf_allocator_init(
                         dax_path,
