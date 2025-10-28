@@ -47,6 +47,7 @@ unsafe impl GlobalAlloc for HybridObjects {
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
             if ptr.is_null() { println!("Failed to allocate PMEM"); return ptr::null_mut(); }
             println!("CACHE: Allocated {} bytes from PMEM", layout.size());
+            println!("CACHE: allocated size (align): {}", layout.align());
             println!("CACHE: allocated ptr: {:p}", ptr);
             return ptr;
         }
