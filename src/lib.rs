@@ -315,7 +315,7 @@ where
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
 		println!("get result for key {:?}: {:?}", key, result);
-		println!("get pointers: key: {:p}, value: {:p}", &key, &value);
+		println!("get pointers: key: {:p}, result: {:p}", &key, &result);
 
 		result
 	}
