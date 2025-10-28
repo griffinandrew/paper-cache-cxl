@@ -308,6 +308,26 @@ where
 	/// 
 	/// 
 	/// 
+	///
+	#[cfg(not(feature = "allocator_api"))]
+	pub fn get(&self, key: &K) -> Result<Arc<V>, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let result = match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				self.status.incr_hits();
+				Ok(object.data())
+			},
+
+			_ => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
+
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		result
+	}
 	
 	/*
 	#[cfg(feature = "allocator_api")]
@@ -396,53 +416,53 @@ where
 
 
 	#[cfg(feature = "allocator_api")]
-pub fn get(&self, key: &K) -> Result<Arc<V, Hybrid>, CacheError>
-where
-    V: Deref<Target = [u8]>, // ensures we can get a slice of the data
-{
-    let hashed_key = self.hash_key(key);
+	pub fn get(&self, key: &K) -> Result<Arc<V, Hybrid>, CacheError>
+	where
+		V: Deref<Target = [u8]>, // ensures we can get a slice of the data
+	{
+		let hashed_key = self.hash_key(key);
 
-    let result = match self.objects.get(&hashed_key) {
-        Some(object) if object.key_matches(key) && !object.is_expired() => {
-            self.status.incr_hits();
-            Ok(object.data()) // Arc<V, Hybrid>
-        },
-        _ => {
-            self.status.incr_misses();
-            Err(CacheError::KeyNotFound)
-        },
-    };
+		let result = match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				self.status.incr_hits();
+				Ok(object.data()) // Arc<V, Hybrid>
+			},
+			_ => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
 
-    self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
 
-	/* deref to check tier of underlying data
-    if let Ok(ref arc_val) = result {
-        // Deref Arc to get &V
-        let v_ref: &V = arc_val.as_ref(); 
+		/* deref to check tier of underlying data
+		if let Ok(ref arc_val) = result {
+			// Deref Arc to get &V
+			let v_ref: &V = arc_val.as_ref(); 
 
-        // Deref V to get &[u8] (requires V: Deref<Target=[u8]>)
-        let data_slice: &[u8] = &**v_ref;
+			// Deref V to get &[u8] (requires V: Deref<Target=[u8]>)
+			let data_slice: &[u8] = &**v_ref;
 
-        // Get pointer to actual data
-        let data_ptr: *const u8 = data_slice.as_ptr();
+			// Get pointer to actual data
+			let data_ptr: *const u8 = data_slice.as_ptr();
 
-        // Check memory tier
-        let tier = unsafe { allocator_bindings::check_tier(data_ptr as *mut _) };
+			// Check memory tier
+			let tier = unsafe { allocator_bindings::check_tier(data_ptr as *mut _) };
 
-        println!(
-            "CACHE: get result for key {:?}: {:?}, data is in {}",
-            key,
-            &data_slice,
-            if tier == 1 { "PMEM" } else { "DRAM" }
-        );
-    } else {
-        println!("CACHE: result was an error, cannot check tier");
-    }
-	*/
+			println!(
+				"CACHE: get result for key {:?}: {:?}, data is in {}",
+				key,
+				&data_slice,
+				if tier == 1 { "PMEM" } else { "DRAM" }
+			);
+		} else {
+			println!("CACHE: result was an error, cannot check tier");
+		}
+		*/
 
-    result
-}
+		result
+	}
 
 	/// Sets the supplied key and value in the cache.
 	/// Returns a [`CacheError`] if the value size is zero or larger than
