@@ -325,12 +325,12 @@ where
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
 		if result.is_ok() {
-			//println!("get result for key {:?}: {:?}", key, result);
+			println!("CAHCE: get result for key {:?}: {:?}", key, result);
 			//println!("get pointers: key: {:p}, result: {:p}", &key, &result);
-			//let clean = result.as_ref().map(|r| Arc::as_ptr(r));
+			let clean = result.as_ref().map(|r| Arc::as_ptr(r));
 			//println!("good real? get pointers: key: {:p}, result: {:?}", &key, result.as_ref().map(|r| Arc::as_ptr(r)));
-			//let tier = unsafe { allocator_bindings::check_tier(clean.unwrap() as *mut _) };
-			//println!("get tier for key {:?}: {}", key, tier);
+			let tier = unsafe { allocator_bindings::check_tier(clean.unwrap() as *mut _) };
+			println!("get tier for key {:?}: {} {:p}", key, tier, clean.unwrap());
 		}
 
 		result
@@ -424,8 +424,8 @@ where
 	pub fn set(&self, key: K, value: V, ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
-		println!("set for key {:?}: {:?}", key, value);
-		println!("set pointers: key: {:p}, value: {:p}", &key, &value);
+		//println!("set for key {:?}: {:?}", key, value);
+		//println!("set pointers: key: {:p}, value: {:p}", &key, &value);
 
 		let object = Object::new(key, value, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
