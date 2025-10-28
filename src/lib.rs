@@ -415,6 +415,8 @@ where
 
     self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
+
+	/* deref to check tier of underlying data
     if let Ok(ref arc_val) = result {
         // Deref Arc to get &V
         let v_ref: &V = arc_val.as_ref(); 
@@ -437,6 +439,7 @@ where
     } else {
         println!("CACHE: result was an error, cannot check tier");
     }
+	*/
 
     result
 }
