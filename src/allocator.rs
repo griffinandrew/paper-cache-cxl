@@ -35,7 +35,7 @@ unsafe impl GlobalAlloc for HybridObjects {
         if DRAM_LIMIT_OBJECTS == 0 {
             unsafe {
                 INIT.call_once(|| {
-                    let dax_size = 266_352_984_064; // PMEM size from ndctl list --namespaces
+                    let dax_size = 118377938944; // PMEM size from ndctl list --namespaces
                     let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
                     allocator_bindings::umf_allocator_init(
                         dax_path,

@@ -329,7 +329,7 @@ where
 
 		let tier = unsafe { allocator_bindings::check_tier(clean.unwrap() as *mut _) };
 
-		println!("get tier for key {:?}: {}", key, tier);
+		println!("get tier for key{:?}: {}", key, tier);
 
 		result
 	}

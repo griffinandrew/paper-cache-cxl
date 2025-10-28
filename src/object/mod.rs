@@ -45,7 +45,9 @@ impl<K, V> Object<K, V> {
 			Some(0) | None => None,
 			Some(ttl) => Some(get_expiry_from_ttl(ttl)),
 		};
-
+		
+		
+		
 		let data_arc = Arc::new(data);
 
 		Object {
