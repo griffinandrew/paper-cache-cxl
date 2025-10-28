@@ -300,6 +300,8 @@ where
 	pub fn get(&self, key: &K) -> Result<Arc<V, Hybrid>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
+		println!("get for key {:?}: {:?}", key, hashed_key);
+
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
@@ -407,7 +409,7 @@ where
 	pub fn set(&self, key: K, value: V, ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
-		println!("value size: {}", std::mem::size_of_val(&value));
+		println!("set for key {:?}: {:?}", key, value);
 
 		let object = Object::new(key, value, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
