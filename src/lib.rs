@@ -312,9 +312,12 @@ where
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
+		println!("get result for key {:p}: {:?}", key, result);
+
 		result
 	}
 
+	//so only the pointer is returned.... 
 	#[cfg(not(feature = "allocator_api"))]
 	pub fn get(&self, key: &K) -> Result<Arc<V>, CacheError> {
 		let hashed_key = self.hash_key(key);
@@ -401,6 +404,8 @@ where
 	#[cfg(feature = "allocator_api")]
 	pub fn set(&self, key: K, value: V, ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
+
+		println!("value size: {}", std::mem::size_of_val(&value));
 
 		let object = Object::new(key, value, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
