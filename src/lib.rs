@@ -23,6 +23,8 @@ use crate::allocator::HybridObjects as Hybrid;
 //#[global_allocator]
 //static GLOBAL: Hybrid = Hybrid;
 
+use std::fmt::Debug;
+
 mod error;
 mod worker;
 mod object;
@@ -102,7 +104,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 impl<K, V, S> PaperCache<K, V, S>
 where
 	K: 'static + Eq + Hash + TypeSize,
-	V: 'static + TypeSize,
+	V: 'static + TypeSize + Debug,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` with maximum size `max_size` and
