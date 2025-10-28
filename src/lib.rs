@@ -315,6 +315,7 @@ where
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
 		println!("get result for key {:?}: {:?}", key, result);
+		println!("get pointers: key: {:p}, value: {:p}", &key, &value);
 
 		result
 	}
@@ -408,6 +409,7 @@ where
 		let hashed_key = self.hash_key(&key);
 
 		println!("set for key {:?}: {:?}", key, value);
+		println!("set pointers: key: {:p}, value: {:p}", &key, &value);
 
 		let object = Object::new(key, value, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
