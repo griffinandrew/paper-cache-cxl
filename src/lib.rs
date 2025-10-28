@@ -300,8 +300,6 @@ where
 	pub fn get(&self, key: &K) -> Result<Arc<V, Hybrid>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		println!("get for key {:?}: {:?}", key, hashed_key);
-
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
