@@ -328,11 +328,15 @@ where
 			println!("CACHE: get result for key {:?}: {:?}", key, result);
 			//println!("get pointers: key: {:p}, result: {:p}", &key, &result);
 
-			let arc_ptr = Arc::as_ptr(&result);
+			if let Ok(ref arc_val) = result {
+			// arc_val is &Arc<V, HybridObjects>
+			let arc_ptr: *const V = Arc::as_ptr(arc_val);
+
 			let tier = unsafe { allocator_bindings::check_tier(arc_ptr as *mut _) };
-			println!("get tier for key {:?}: {} {:p} {:?}", key, tier, arc_ptr, arc_ptr);
-
-
+			println!("Data is in {}", if tier == 1 { "PMEM" } else { "DRAM" });
+			} else {
+				println!("Result was an error, cannot check tier");
+			}
 
 			let clean = result.as_ref().map(|r| Arc::as_ptr(r));
 			//println!("good real? get pointers: key: {:p}, result: {:?}", &key, result.as_ref().map(|r| Arc::as_ptr(r)));
