@@ -31,6 +31,7 @@ rayon = "1.11.0"
 num-traits = "0.2.19"
 tikv-jemallocator = "0.6.1"
 libc = "0.2.177"
+typenum = "1.19.0"
 
 
 [build-dependencies]

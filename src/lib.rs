@@ -97,6 +97,8 @@ pub type ObjectMapRef<K, V> = Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>;
 pub type StatusRef = Arc<AtomicStatus>;
 pub type OverheadManagerRef = Arc<OverheadManager>;
 
+use typenum::type_operators::Len;
+
 
 pub struct PaperCache<K, V, S = RandomState> {
 	objects: ObjectMapRef<K, V>,
@@ -111,7 +113,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 impl<K, V, S> PaperCache<K, V, S>
 where
 	K: 'static + Eq + Hash + TypeSize + Debug,
-	V: 'static + TypeSize + Debug,
+	V: 'static + TypeSize + Debug + Len,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` with maximum size `max_size` and
@@ -380,6 +382,8 @@ where
 	#[cfg(not(feature = "allocator_api"))]
 	pub fn set(&self, key: K, value: V, ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
+
+		println!("set for key {:?}: {:?}", key, value.len());
 
 		let object = Object::new(key, value, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
