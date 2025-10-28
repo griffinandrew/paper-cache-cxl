@@ -324,7 +324,7 @@ where
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
-		if result.is_ok() {
+		/*if result.is_ok() {
 			println!("CACHE: get result for key {:?}: {:?}", key, result);
 			//println!("get pointers: key: {:p}, result: {:p}", &key, &result);
 
@@ -343,6 +343,24 @@ where
 			let tier = unsafe { allocator_bindings::check_tier(clean.unwrap() as *mut _) };
 			println!("get tier for key {:?}: {} {:p} {:?}", key, tier, clean.unwrap(), clean);
 		}
+		*/
+
+		    if let Ok(ref arc_val) = result {
+				// arc_val: &Arc<V, Hybrid>
+				let data_ptr: *const u8 = match &**arc_val {
+					// If V is Buffer / Vec<u8>, get the internal pointer
+					buf => buf.as_ptr(),
+				};
+
+				let tier = unsafe { allocator_bindings::check_tier(data_ptr as *mut _) };
+				println!("Data is in {}", if tier == 1 { "PMEM" } else { "DRAM" });
+
+				println!(
+					"get tier for key {:?}: {} (data ptr {:p})",
+					key, tier, data_ptr
+				);
+			}
+
 
 		result
 	}
