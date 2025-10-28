@@ -330,7 +330,7 @@ where
 			let clean = result.as_ref().map(|r| Arc::as_ptr(r));
 			//println!("good real? get pointers: key: {:p}, result: {:?}", &key, result.as_ref().map(|r| Arc::as_ptr(r)));
 			let tier = unsafe { allocator_bindings::check_tier(clean.unwrap() as *mut _) };
-			println!("get tier for key {:?}: {} {:p} {}", key, tier, clean.unwrap(), clean.unwrap() as *mut _);
+			println!("get tier for key {:?}: {} {:p} {:?}", key, tier, clean.unwrap(), clean.unwrap() as *mut _);
 		}
 
 		result
