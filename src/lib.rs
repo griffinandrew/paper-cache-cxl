@@ -30,6 +30,8 @@ mod allocator_bindings {
 //#[global_allocator]
 //static GLOBAL: Hybrid = Hybrid;
 
+use std::ops::Deref;
+
 use std::fmt::Debug;
 
 mod error;
@@ -303,6 +305,11 @@ where
 	/// assert!(cache.get(&1).is_err());
 	/// ```
 	/// 
+	/// 
+	/// 
+	/// 
+	
+	/*
 	#[cfg(feature = "allocator_api")]
 	pub fn get(&self, key: &K) -> Result<Arc<V, Hybrid>, CacheError> {
 		let hashed_key = self.hash_key(key);
@@ -345,21 +352,19 @@ where
 		}
 		*/
 
-		    if let Ok(ref arc_val) = result {
-				// arc_val: &Arc<V, Hybrid>
-				let data_ptr: *const u8 = match &**arc_val {
-					// If V is Buffer / Vec<u8>, get the internal pointer
-					buf => buf.as_ptr(),
-				};
 
-				let tier = unsafe { allocator_bindings::check_tier(data_ptr as *mut _) };
-				println!("Data is in {}", if tier == 1 { "PMEM" } else { "DRAM" });
+		if let Ok(ref arc_val) = result {
+			// get pointer to underlying bytes
+			let data_ptr: *const u8 = arc_val.as_ref().as_ref().as_ptr();
 
-				println!(
-					"get tier for key {:?}: {} (data ptr {:p})",
-					key, tier, data_ptr
-				);
-			}
+			let tier = unsafe { allocator_bindings::check_tier(data_ptr as *mut _) };
+			println!("Data is in {}", if tier == 1 { "PMEM" } else { "DRAM" });
+
+			println!(
+				"get tier for key {:?}: {} (data ptr {:p})",
+				key, tier, data_ptr
+			);
+		}
 
 
 		result
@@ -386,6 +391,55 @@ where
 
 		result
 	}
+
+	*/
+
+
+	#[cfg(feature = "allocator_api")]
+pub fn get(&self, key: &K) -> Result<Arc<V, Hybrid>, CacheError>
+where
+    V: Deref<Target = [u8]>, // ensures we can get a slice of the data
+{
+    let hashed_key = self.hash_key(key);
+
+    let result = match self.objects.get(&hashed_key) {
+        Some(object) if object.key_matches(key) && !object.is_expired() => {
+            self.status.incr_hits();
+            Ok(object.data()) // Arc<V, Hybrid>
+        },
+        _ => {
+            self.status.incr_misses();
+            Err(CacheError::KeyNotFound)
+        },
+    };
+
+    self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+
+    if let Ok(ref arc_val) = result {
+        // Deref Arc to get &V
+        let v_ref: &V = arc_val.as_ref(); 
+
+        // Deref V to get &[u8] (requires V: Deref<Target=[u8]>)
+        let data_slice: &[u8] = &**v_ref;
+
+        // Get pointer to actual data
+        let data_ptr: *const u8 = data_slice.as_ptr();
+
+        // Check memory tier
+        let tier = unsafe { allocator_bindings::check_tier(data_ptr as *mut _) };
+
+        println!(
+            "CACHE: get result for key {:?}: {:?}, data is in {}",
+            key,
+            &data_slice,
+            if tier == 1 { "PMEM" } else { "DRAM" }
+        );
+    } else {
+        println!("CACHE: result was an error, cannot check tier");
+    }
+
+    result
+}
 
 	/// Sets the supplied key and value in the cache.
 	/// Returns a [`CacheError`] if the value size is zero or larger than
