@@ -218,6 +218,10 @@ where
 
 		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
+		
+		
+		//commenting out any background shit
+		
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
 		let (worker_sender, worker_listener) = unbounded();
@@ -230,6 +234,7 @@ where
 		)?;
 
 		thread::spawn(move || worker_manager.run());
+		
 
 		let cache = PaperCache {
 			objects,
