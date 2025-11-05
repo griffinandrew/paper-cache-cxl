@@ -67,7 +67,7 @@ impl<K, V> Object<K, V> {
 		self.key.eq(key)
 	}
 
-	fn total_size(&self) -> ObjectSize
+	pub fn total_size(&self) -> ObjectSize
 	where
 		K: TypeSize,
 		V: TypeSize,

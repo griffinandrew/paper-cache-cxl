@@ -76,7 +76,7 @@ where
 				erase(
 					&self.objects,
 					&self.status,
-					&self.overhead_manager,
+					//&self.overhead_manager,
 					Some(EraseKey::Hashed(key)),
 				).ok();
 			}

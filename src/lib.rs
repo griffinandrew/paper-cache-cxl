@@ -104,8 +104,8 @@ pub struct PaperCache<K, V, S = RandomState> {
 	objects: ObjectMapRef<K, V>,
 	status: StatusRef,
 
-	worker_manager: Arc<WorkerSender>,
-	overhead_manager: OverheadManagerRef,
+	//worker_manager: Arc<WorkerSender>,
+	//overhead_manager: OverheadManagerRef,
 
 	hasher: S,
 }
@@ -221,6 +221,8 @@ where
 		
 		
 		//commenting out any background shit
+
+		/* 
 		
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
@@ -245,9 +247,17 @@ where
 
 			hasher,
 		};
+		*/
+
+		let cache = PaperCache {
+			objects,
+			status,
+			hasher,
+		};
 
 		Ok(cache)
 	}
+	
 
 	/// Returns the current cache version.
 	///
@@ -330,7 +340,7 @@ where
 			},
 		};
 
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		//self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 		result
 	}
 	
@@ -438,7 +448,7 @@ where
 			},
 		};
 
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		//self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
 
 		/* deref to check tier of underlying data
@@ -495,28 +505,30 @@ where
 		//println!("set for key {:?}: {:?}", key, std::mem::size_of_val(&value));
 
 		let object = Object::new(key, value, ttl);
-		let base_size = self.overhead_manager.base_size(&object);
+		//let base_size = self.overhead_manager.base_size(&object);
 		let expiry = object.expiry();
 
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
+		//if base_size == 0 {
+		//	return Err(CacheError::ZeroValueSize);
+		//}
 
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
+		//if self.status.exceeds_max_size(base_size) {
+		//	return Err(CacheError::ExceedingValueSize);
+		//}
 
 		self.status.incr_sets();
 
 		let old_object_info = self.objects
 			.insert(hashed_key, object)
 			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
+				//let base_size = self.overhead_manager.base_size(&old_object);
 				let expiry = old_object.expiry();
 
-				(base_size, expiry)
+				//(base_size, expiry)
+				(expiry)
 			});
 
+		/*  needed to remove to diasable bg threads but will mess up size tracking
 		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
 			base_size as i64 - old_object_size as i64
 		} else {
@@ -524,9 +536,10 @@ where
 			self.status.incr_num_objects();
 			base_size as i64
 		};
+		*/
 
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+		//self.status.update_base_used_size(base_size_delta);
+		//self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
 
 		Ok(())
 	}
@@ -572,7 +585,7 @@ where
 		};
 
 		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+		//self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
 
 		Ok(())
 	}
@@ -602,12 +615,12 @@ where
 		let (removed_hashed_key, object) = erase(
 			&self.objects,
 			&self.status,
-			&self.overhead_manager,
+			//&self.overhead_manager,
 			Some(EraseKey::Original(key, hashed_key)),
 		)?;
 
 		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
+		//self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
 
 		Ok(())
 	}
@@ -716,15 +729,15 @@ where
 		};
 
 		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
+		//let old_base_size = self.overhead_manager.base_size(&object);
 
 		object.expires(ttl);
 
 		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
+		//let new_base_size = self.overhead_manager.base_size(&object);
 
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
+		//self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
+		//self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
 
 		Ok(())
 	}
@@ -754,7 +767,8 @@ where
 
 		match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
+				//Ok(self.overhead_manager.total_size(&object)),
+				Ok(object.total_size()),
 
 			_ => Err(CacheError::KeyNotFound),
 		}
@@ -781,7 +795,7 @@ where
 		self.objects.clear();
 		self.status.clear();
 
-		self.broadcast(WorkerEvent::Wipe)?;
+		//self.broadcast(WorkerEvent::Wipe)?;
 
 		Ok(())
 	}
@@ -822,7 +836,7 @@ where
 		);
 
 		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
+		//self.broadcast(WorkerEvent::Resize(max_size))?;
 
 		Ok(())
 	}
@@ -848,16 +862,18 @@ where
 		}
 
 		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
+		//self.broadcast(WorkerEvent::Policy(policy))?;
 
 		Ok(())
 	}
 
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
+		
+		/*if let Err(err) = self.worker_manager.try_send(event) {
 			error!("Could not communicate with workers: {err:?}");
 			return Err(CacheError::Internal);
 		}
+		*/
 
 		Ok(())
 	}
@@ -872,6 +888,11 @@ pub enum EraseKey<'a, K> {
 	Hashed(HashedKey),
 }
 
+
+
+
+
+/*
 pub fn erase<K, V>(
 	objects: &ObjectMapRef<K, V>,
 	status: &StatusRef,
@@ -922,6 +943,61 @@ where
 		false => Err(CacheError::KeyNotFound),
 	}
 }
+*/
+
+
+
+pub fn erase<K, V>(
+	objects: &ObjectMapRef<K, V>,
+	status: &StatusRef,
+	maybe_key: Option<EraseKey<K>>,
+) -> Result<(HashedKey, Object<K, V>), CacheError>
+where
+	K: Eq + TypeSize,
+	V: TypeSize,
+{
+	let hashed_key = match maybe_key {
+		//not sure what t his is doing .... 
+		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
+		Some(EraseKey::Hashed(hashed_key)) => hashed_key,
+
+		None => {
+			// the policy has run out of keys to evict (either it's a mini stack or
+			// something went wrong during policy reconstruction) so we fall back
+			// to evicting a random object
+
+			let Some(object) = objects.iter().next() else {
+				error!("Object store is empty with non-zero used size");
+				return Err(CacheError::Internal);
+			};
+
+			object.key().to_owned()
+		},
+	};
+
+	// don't remove the object right away because if we have the original key,
+	// we need to do a validation check that it matches the object's key in
+	// case of a hash collision
+	let Entry::Occupied(entry) = objects.entry(hashed_key) else {
+		return Err(CacheError::KeyNotFound);
+	};
+
+	if let Some(EraseKey::Original(key, _)) = maybe_key && !entry.get().key_matches(key) {
+		return Err(CacheError::KeyNotFound);
+	};
+
+	let object = entry.remove();
+	//let base_size = overhead_manager.base_size(&object) as i64;
+
+	//status.update_base_used_size(-base_size);
+	status.decr_num_objects();
+
+	match !object.is_expired() {
+		true => Ok((hashed_key, object)),
+		false => Err(CacheError::KeyNotFound),
+	}
+}
+
 
 unsafe impl<K, V, S> Send for PaperCache<K, V, S> {}
 

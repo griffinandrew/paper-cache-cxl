@@ -371,7 +371,7 @@ where
 			let erase_result = erase(
 				&self.objects,
 				&self.status,
-				&self.overhead_manager,
+				//&self.overhead_manager,
 				maybe_key,
 			);
 
@@ -402,7 +402,7 @@ where
 			let erase_result = erase(
 				&self.objects,
 				&self.status,
-				&self.overhead_manager,
+				//&self.overhead_manager,
 				maybe_key,
 			);
 
