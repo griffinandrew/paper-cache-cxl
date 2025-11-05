@@ -39,7 +39,7 @@ use crate::{
 		Worker,
 		WorkerEvent,
 		WorkerReceiver,
-		register_worker,
+		//register_worker,
 		policy::{
 			mini_stack::MiniStackManager,
 			event::{StackEvent, TraceEvent},
@@ -171,10 +171,12 @@ where
 		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
 		let (trace_worker, trace_listener) = unbounded();
 
+		/* 
 		register_worker(TraceWorker::new(
 			trace_listener,
 			trace_fragments.clone(),
 		));
+		*/
 
 		// we need the initial size so we can accurately reconstruct the
 		// policy stacks after the cache is resized

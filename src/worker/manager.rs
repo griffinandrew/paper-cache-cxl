@@ -21,7 +21,7 @@ use crate::{
 		WorkerReceiver,
 		PolicyWorker,
 		TtlWorker,
-		register_worker,
+		//register_worker,
 	},
 };
 
@@ -61,6 +61,7 @@ impl WorkerManager {
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();
 
+		/*
 		register_worker(PolicyWorker::<K, V>::new(
 			policy_listener,
 			objects.clone(),
@@ -74,6 +75,7 @@ impl WorkerManager {
 			status.clone(),
 			overhead_manager.clone(),
 		));
+		*/
 
 		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
 			policy_worker,
