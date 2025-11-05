@@ -43,10 +43,11 @@ where
 {
 	fn run(&mut self) -> Result<(), CacheError>;
 }
-
+/* 
 pub fn register_worker(mut worker: impl Worker) {
 	thread::spawn(move || worker.run());
 }
+*/
 
 pub use crate::worker::{
 	manager::WorkerManager,
