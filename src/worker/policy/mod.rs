@@ -266,6 +266,7 @@ where
 		let current_policy = self.current_policy.clone();
 		let trace_fragments = self.trace_fragments.clone();
 
+		/* 
 		thread::spawn(move || {
 			info!("Reconstructing {policy} stack");
 			let now = Instant::now();
@@ -276,6 +277,7 @@ where
 				current_policy.clone(),
 				trace_fragments.clone(),
 			);
+			*/
 
 			if let Ok(stack) = reconstruction_result {
 				// check to make sure the configured policy was not modified
