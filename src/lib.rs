@@ -503,6 +503,7 @@ where
 		let hashed_key = self.hash_key(&key);
 
 		//println!("set for key {:?}: {:?}", key, std::mem::size_of_val(&value));
+		println!("set pointers: key: {:p}, value: {:p}", &key, &value);
 
 		let object = Object::new(key, value, ttl);
 		//let base_size = self.overhead_manager.base_size(&object);
