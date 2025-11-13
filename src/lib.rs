@@ -558,11 +558,13 @@ where
 		//println!("set pointers: key: {:p}, value: {:p}", &key, &value);
 		//let tier = unsafe {allocator_bindings::check_tier(ptr as *mut std::ffi::c_void)};
 
+		/* 
 		if let Ok(stored) = cache.get(&key) {
 			let data_ptr = stored.0.as_ptr(); // &[u8] pointer
 			let tier = unsafe { allocator_bindings::check_tier(data_ptr as *mut _) };
 			println!("key={} data_ptr={:p} tier={}", key, data_ptr, tier);
 		}
+		*/
 
 		let object = Object::new(key, value, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
