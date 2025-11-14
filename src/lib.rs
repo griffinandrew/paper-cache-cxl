@@ -99,7 +99,7 @@ pub type ObjectMapRef<K, V> = Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>;
 pub type StatusRef = Arc<AtomicStatus>;
 pub type OverheadManagerRef = Arc<OverheadManager>;
 
-
+#[repr(C)]
 pub struct PaperCache<K, V, S = RandomState> {
 	objects: ObjectMapRef<K, V>,
 	status: StatusRef,
@@ -314,8 +314,10 @@ where
 	/// 
 	/// 
 	///
+	
 	#[cfg(not(feature = "allocator_api"))]
-	pub fn get(&self, key: &K) -> Result<Arc<V>, CacheError> {
+	#[unsafe(no_mangle)]
+	pub unsafe extern "C" fn get(&self, key: &K) -> Result<Arc<V>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
 		let result = match self.objects.get(&hashed_key) {
@@ -489,7 +491,8 @@ where
 	/// assert!(cache.set(0, 0, None).is_ok());
 	/// ```
 	#[cfg(not(feature = "allocator_api"))]
-	pub fn set(&self, key: K, value: V, ttl: Option<u32>) -> Result<(), CacheError> {
+	#[unsafe(no_mangle)]
+	pub unsafe extern "C" fn set(&self, key: K, value: V, ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
 		//println!("set for key {:?}: {:?}", key, std::mem::size_of_val(&value));
