@@ -315,6 +315,7 @@ where
 	/// 
 	///
 	#[cfg(not(feature = "allocator_api"))]
+	#[inline(never)]
 	pub fn get(&self, key: &K) -> Result<Arc<V>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
