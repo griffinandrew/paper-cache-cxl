@@ -39,4 +39,7 @@ cc = "1.2.41"
 bindgen = "0.72.1"
 
 #[lib]
+#name = "papercache"
+#crate-type = ["staticlib"]
 #crate-type = ["cdylib"] 
+
