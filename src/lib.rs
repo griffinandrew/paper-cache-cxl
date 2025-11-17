@@ -351,7 +351,7 @@ where
 				self.status.incr_hits();
 				// object.data() returns an Arc<V, Hybrid> — clone the inner V and return it
 				let arc_val = object.data();
-				println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
+				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
 				Ok(arc_val.as_ref().clone())
 			},
 
