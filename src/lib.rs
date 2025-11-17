@@ -339,7 +339,7 @@ where
 	*/
 
 
-
+	#[cfg(not(feature = "allocator_api"))]
 	pub fn get(&self, key: &K) -> Result<V, CacheError>
 	where
 		V: Deref<Target = [u8]> + Clone, // Clone so we can return an owned V cloned from the Arc
@@ -351,6 +351,7 @@ where
 				self.status.incr_hits();
 				// object.data() returns an Arc<V, Hybrid> — clone the inner V and return it
 				let arc_val = object.data();
+				println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
 				Ok(arc_val.as_ref().clone())
 			},
 
