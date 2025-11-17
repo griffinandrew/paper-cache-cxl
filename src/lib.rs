@@ -340,6 +340,7 @@ where
 
 
 	#[cfg(not(feature = "allocator_api"))]
+	#[inline(never)]
 	pub fn get(&self, key: &K) -> Result<V, CacheError>
 	where
 		V: Deref<Target = [u8]> + Clone, // Clone so we can return an owned V cloned from the Arc
