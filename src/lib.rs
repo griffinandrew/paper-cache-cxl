@@ -314,6 +314,8 @@ where
 	/// 
 	/// 
 	///
+	/// 
+	/*
 	#[cfg(not(feature = "allocator_api"))]
 	#[inline(never)]
 	pub fn get(&self, key: &K) -> Result<Arc<V>, CacheError> {
@@ -334,6 +336,62 @@ where
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 		result
 	}
+	*/
+
+
+
+	pub fn get(&self, key: &K) -> Result<V, CacheError>
+	where
+		V: Deref<Target = [u8]> + Clone, // Clone so we can return an owned V cloned from the Arc
+	{
+		let hashed_key = self.hash_key(key);
+
+		let result = match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				self.status.incr_hits();
+				// object.data() returns an Arc<V, Hybrid> — clone the inner V and return it
+				let arc_val = object.data();
+				Ok(arc_val.as_ref().clone())
+			},
+
+			_ => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
+
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+
+		// Optional: inspect the underlying bytes/tier of the returned value for debugging
+		print!("CACHE: get result for key {:?}: {:?} ", key, result);
+		result
+	}
+
+
+
+
+	/*
+	#[cfg(not(feature = "allocator_api"))]
+	#[inline(never)]
+	pub fn get(&self, key: &K) -> Result<V, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let result = match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				self.status.incr_hits();
+				Ok(object.data().as_ref().clone())
+			},
+
+			_ => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
+
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		result
+	}
+	*/
 	
 	/*
 	#[cfg(feature = "allocator_api")]
