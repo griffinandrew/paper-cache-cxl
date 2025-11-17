@@ -364,7 +364,7 @@ where
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
 		// Optional: inspect the underlying bytes/tier of the returned value for debugging
-		//print!("CACHE: get result for key {:?}: {:?} ", key, result);
+		//println!("CACHE: get result for key {:?}: {:?} ", key, result);
 		result
 	}
 
