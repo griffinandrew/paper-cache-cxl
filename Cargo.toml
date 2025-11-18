@@ -33,3 +33,9 @@ tikv-jemallocator = "0.6.1"
 #allocator_api = ["paper-cache/allocator_api"]
 allocator_api = []
 default = []
+
+
+[build-dependencies]
+cc = "1.2.39"
+
+

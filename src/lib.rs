@@ -369,8 +369,7 @@ where
 
 
 		//allocate it as a regular buffer... 
-		
-
+	
 
 
 		let object = Object::new(key, value, ttl);
