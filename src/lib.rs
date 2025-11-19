@@ -895,9 +895,9 @@ where
 				// We need to clone the actual byte slice into a Vec
 				let arc_val = object.data();
 				arc_val.as_ref().to_vec();
-				println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().to_vec().clone());
+				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().to_vec().clone());
 
-				Ok(arc_val.as_ref().to_vec())
+				Ok(arc_val.as_ref().to_vec().clone())
 			},
 
 			_ => {
