@@ -37,5 +37,6 @@ default = []
 
 [build-dependencies]
 cc = "1.2.39"
+bindgen = "0.72.1"
 
 
