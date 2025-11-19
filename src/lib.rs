@@ -1459,7 +1459,7 @@ where
 	/// 
 	
 
-	pub fn get(&self, key: &K) -> Result<BufferPMEM, CacheError>
+	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
 	//where
 		//V: Deref<Target = [u8]> + Clone, // Clone so we can return an owned V cloned from the Arc
 	{
@@ -1471,7 +1471,7 @@ where
 				// object.data() returns an Arc<V, Hybrid> — clone the inner V and return it
 				let arc_val = object.data();
 				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				Ok(arc_val.as_ref().clone())
+				Ok(arc_val.as_ref().to_vec().clone())
 			},
 
 			_ => {
