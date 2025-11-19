@@ -361,8 +361,6 @@ where
 	///
 	/// assert!(cache.set(0, 0, None).is_ok());
 	/// ```
-	
-
 
 	pub fn set(&self, key: K, value: V, ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
