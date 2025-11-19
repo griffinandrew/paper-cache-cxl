@@ -367,10 +367,7 @@ where
 	pub fn set(&self, key: K, value: V, ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
-
 		//allocate it as a regular buffer... 
-	
-
 
 		let object = Object::new(key, value, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
