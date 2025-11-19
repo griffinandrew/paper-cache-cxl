@@ -940,11 +940,6 @@ where
 		let hashed_key = self.hash_key(&key);
 
 		//allocate it as a regular buffer... 
-		//let mut buf1: Vec<u8> = Vec::with_capacity(value.len());
-		//buf1.extend_from_slice(&value);
-
-		//let buf = buf1.into_boxed_slice();
-
 		let buf: Box<[u8]> = value.to_vec().into_boxed_slice();
 
 		let object = Object::new(key, buf, ttl);
@@ -1529,10 +1524,12 @@ where
 		//allocate the object in the cache itself.... lets say pmem buffer
 		
 		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
-		let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
-		buf1.extend_from_slice(&value);
+		//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
+		//buf1.extend_from_slice(&value);
 
-		let buf: BufferPMEM = buf1.into_boxed_slice();
+		//let buf: BufferPMEM = buf1.into_boxed_slice();
+
+		let buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
 
 		let object = Object::new(key, buf, ttl);
 
