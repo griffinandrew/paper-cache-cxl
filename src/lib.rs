@@ -690,7 +690,7 @@ where
 #[cfg(feature = "all_dram")]
 impl<K, S> PaperCache<K, BufferDRAM, S>
 where
-	K: 'static + Eq + Hash + TypeSize, // + std::fmt::Debug, //note added Debug for logging might impact perf thoooo
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug, //note added Debug for logging might impact perf thoooo
 	//V: 'static + TypeSize,
 	S: Default + Clone + BuildHasher,
 {
@@ -891,9 +891,13 @@ where
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
-				// Convert the Box<[u8]> to Vec<u8> to return the actual value
+				// object.data() returns Arc<Box<[u8]>>
+				// We need to clone the actual byte slice into a Vec
 				let arc_val = object.data();
-				Ok(arc_val.to_vec())
+				arc_val.as_ref().to_vec();
+				println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().to_vec().clone());
+
+				Ok(arc_val.as_ref().to_vec())
 			},
 
 			_ => {
