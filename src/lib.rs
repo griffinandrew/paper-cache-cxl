@@ -95,7 +95,7 @@ pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 pub type BufferPMEM = Box<[u8], Hybrid>;
 
 
-#[cfg(feature = "all_dram")]
+//#[cfg(feature = "all_dram")]
 pub type BufferDRAM = Box<[u8]>;
 
 
