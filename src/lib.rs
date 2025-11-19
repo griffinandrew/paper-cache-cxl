@@ -884,19 +884,16 @@ where
 	/// ```
 	/// 
 	
-	pub fn get(&self, key: &K) -> Result<BufferDRAM, CacheError>
-	//where
-		//V: Deref<Target = [u8]> + Clone, // Clone so we can return an owned V cloned from the Arc
+	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
 	{
 		let hashed_key = self.hash_key(key);
 
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
-				// object.data() returns an Arc<V, Hybrid> — clone the inner V and return it
+				// Convert the Box<[u8]> to Vec<u8> to return the actual value
 				let arc_val = object.data();
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				Ok(arc_val.as_ref().clone())
+				Ok(arc_val.to_vec())
 			},
 
 			_ => {
@@ -907,8 +904,6 @@ where
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
-		// Optional: inspect the underlying bytes/tier of the returned value for debugging
-		//println!("CACHE: get result for key {:?}: {:?} ", key, result);
 		result
 	}
 
