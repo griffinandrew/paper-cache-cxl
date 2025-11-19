@@ -950,7 +950,7 @@ where
 
 		//allocate the object in the cache itself.... lets say pmem buffer
 		
-		println!("CACHE: set called for key {:?} with value size {}", key, value.len());
+		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
 		let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
 		buf1.extend_from_slice(&value);
 
