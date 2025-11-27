@@ -1466,7 +1466,7 @@ where
 		//V: Deref<Target = [u8]> + Clone, // Clone so we can return an owned V cloned from the Arc
 	{
 		let hashed_key = self.hash_key(key);
-		println!("CACHE: get called for key {:?}", key);
+		println!("CACHE: get called");
 
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
