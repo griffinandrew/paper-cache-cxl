@@ -939,9 +939,11 @@ where
 		let hashed_key = self.hash_key(&key);
 
 		//allocate it as a regular buffer... 
-		let buf: Box<[u8]> = value.to_vec().into_boxed_slice();
+		let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
 
-		let object = Object::new(key, buf, ttl);
+		//let key_buff = Box::new(key);
+
+		let object = Object::new(key, val_buf, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
 		let expiry = object.expiry();
 
@@ -1464,6 +1466,7 @@ where
 		//V: Deref<Target = [u8]> + Clone, // Clone so we can return an owned V cloned from the Arc
 	{
 		let hashed_key = self.hash_key(key);
+		println!("CACHE: get called for key {:?}", key);
 
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
@@ -1520,6 +1523,8 @@ where
 	{
 		let hashed_key = self.hash_key(&key);
 
+		println!("CACHE: set called for key {:?} with value size {}", key, value.len());
+
 		//allocate the object in the cache itself.... lets say pmem buffer
 		
 		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
@@ -1528,9 +1533,17 @@ where
 
 		//let buf: BufferPMEM = buf1.into_boxed_slice();
 
-		let buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
+		let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
 
-		let object = Object::new(key, buf, ttl);
+		//let key_buf: BufferPMEM = 
+
+		//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(key.len(), Hybrid); 
+		//buf1.extend_from_slice(&key);
+		//let key_buf: BufferPMEM = buf1.into_boxed_slice();
+
+		//let key_buf: BufferPMEM = key.to_vec_in(Hybrid).into_boxed_slice();
+
+		let object = Object::new(key, val_buf, ttl);
 
 		//should =turn this into pmem buffer .... 
 
