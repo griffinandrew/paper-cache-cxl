@@ -723,7 +723,6 @@ self.tiering_manager.dram_threshold()
 	/// Sets the hotness threshold for promotion to DRAM.
 	pub fn set_hotness_threshold(&self, threshold: u64) {
 		self.tiering_manager.set_hotness_threshold(threshold);
-#[cfg(feature = "allocator_api")]
 	}
 
 	#[cfg(feature = "allocator_api")]
@@ -974,14 +973,7 @@ where
 	{
 		let hashed_key = self.hash_key(key);
 
-		// First check DRAM cache for hot objects
-		if let Some(dram_value) = self.tiering_manager.get_from_dram(&hashed_key) {
-			self.status.incr_hits();
-			self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-			return Ok(dram_value.as_ref().to_vec());
-		}
-
-		// Fall back to PMEM (main cache)
+		// all_dram implementation - no tiering, all data in DRAM
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
@@ -1354,13 +1346,11 @@ self.tiering_manager.set_dram_threshold(threshold);
 /// Gets the current DRAM tier threshold in bytes.
 	pub fn dram_threshold(&self) -> u64 {
 self.tiering_manager.dram_threshold()
-#[cfg(feature = "allocator_api")]
 }
 
 	#[cfg(feature = "allocator_api")]
 	/// Sets the hotness threshold for promotion to DRAM.
 	pub fn set_hotness_threshold(&self, threshold: u64) {
-#[cfg(feature = "allocator_api")]
 		self.tiering_manager.set_hotness_threshold(threshold);
 	}
 
@@ -2025,7 +2015,6 @@ self.tiering_manager.dram_threshold()
 		}
 
 		Ok(())
-#[cfg(feature = "allocator_api")]
 	}
 
 	fn hash_key(&self, key: &K) -> HashedKey {
