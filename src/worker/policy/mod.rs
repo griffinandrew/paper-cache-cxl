@@ -193,8 +193,7 @@ where
 		}
 
 		// Initialize tiering manager with DRAM capacity based on cache size
-		let dram_capacity = ((max_cache_size as f64) * DRAM_TIER_RATIO) as usize;
-		let dram_capacity = dram_capacity.max(1); // At least 1 object in DRAM
+		let dram_capacity = (((max_cache_size as f64) * DRAM_TIER_RATIO) as usize).max(1);
 		let tiering_manager = Arc::new(TieringManager::new(dram_capacity));
 
 		let worker = PolicyWorker {
@@ -343,7 +342,10 @@ where
 		// Need to evict the coldest object from DRAM to make room
 		if let Some(stack) = &mut self.policy_stack {
 			// Use the eviction stack to find the least recently used object in DRAM
-			// We need to find an object that is in DRAM and can be evicted
+			// Note: This temporarily modifies and restores the eviction stack.
+			// While this has some overhead, it ensures we use the policy's actual
+			// eviction order. The size parameter (0) doesn't affect the reinsertion
+			// position since the stack uses key-based ordering, not size.
 			
 			// Try to find a cold object in DRAM to evict
 			let mut eviction_candidate = None;
@@ -353,7 +355,7 @@ where
 			while let Some(key) = stack.evict_one() {
 				if self.tiering_manager.is_in_dram(key) {
 					eviction_candidate = Some(key);
-					// Put back the keys we pulled out (size doesn't matter for reinsertion)
+					// Restore the keys we pulled out (size doesn't affect ordering)
 					for k in temp_evictions.iter().rev() {
 						stack.insert(*k, 0);
 					}
@@ -363,7 +365,7 @@ where
 				
 				// Don't search forever - limit to MAX_EVICTION_SEARCH_DEPTH
 				if temp_evictions.len() > MAX_EVICTION_SEARCH_DEPTH {
-					// Put everything back (size doesn't matter for reinsertion)
+					// Restore all keys (size doesn't affect ordering)
 					for k in temp_evictions.iter().rev() {
 						stack.insert(*k, 0);
 					}

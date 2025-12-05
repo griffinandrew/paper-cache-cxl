@@ -58,7 +58,7 @@ fn main() {
 
         println!("Compiled umf_allocator.c");
     } else {
-        println!("cargo:warning=UMF headers not found at {}, skipping C compilation. This is expected in CI/test environments.", umf_include_path);
+        println!("cargo:warning=UMF headers not found at {}, skipping C compilation. This is expected in CI/testing environments.", umf_include_path);
         println!("cargo:warning=Set UMF_INCLUDE_PATH environment variable to specify UMF header location.");
         println!("Skipping C compilation");
     }
