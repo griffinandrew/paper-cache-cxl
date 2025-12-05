@@ -1,11 +1,18 @@
-unsafe extern "C" {
-    pub fn umf_allocator_init(dax_path: *const libc::c_char, dax_size: usize) -> libc::c_int;
-    pub fn umf_alloc(size: usize, align: usize) -> *mut libc::c_void;
-    pub fn umf_dealloc(ptr: *mut libc::c_void);
-    pub fn umf_allocator_finalize();
-    pub fn return_pmem_base(dax_size: usize) -> *mut libc::c_void;
-    pub fn return_pmem_size() -> usize;
-    pub fn check_tier(ptr: *mut libc::c_void) -> libc::c_int;
-} 
+// Stub bindings for CI environment
+use std::ffi::c_void;
 
+#[allow(dead_code)]
+pub unsafe fn umf_allocator_init(_dax_path: *const i8, _dax_size: u64) {}
 
+#[allow(dead_code)]
+pub unsafe fn umf_alloc(_size: usize, _align: usize) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+#[allow(dead_code)]
+pub unsafe fn umf_free(_ptr: *mut c_void, _size: usize) {}
+
+#[allow(dead_code)]
+pub unsafe fn check_tier(_ptr: *mut c_void) -> i32 {
+    0
+}

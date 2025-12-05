@@ -53,5 +53,5 @@ pub use crate::worker::{
 	manager::WorkerManager,
 	policy::PolicyWorker,
 	ttl::TtlWorker,
-	tiering::{TieringManager, TieringWorker, AccessEvent},
+	tiering::{TieringWorker, AccessEvent, AccessEventSender},
 };

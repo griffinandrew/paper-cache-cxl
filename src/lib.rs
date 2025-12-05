@@ -47,7 +47,7 @@ use std::{
 	},
 };
 
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::unbounded;
 
 use dashmap::{
 	DashMap,
@@ -79,6 +79,7 @@ use crate::{
 		WorkerEvent,
 		WorkerManager,
 		AccessEvent,
+		AccessEventSender,
 	},
 };
 
@@ -114,7 +115,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 	status: StatusRef,
 
 	worker_manager: Arc<WorkerSender>,
-	access_event_sender: Sender<AccessEvent>,
+	access_event_sender: AccessEventSender,
 	overhead_manager: OverheadManagerRef,
 
 	hasher: S,
