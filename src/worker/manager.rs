@@ -14,7 +14,6 @@ use crate::{
 	ObjectMapRef,
 	StatusRef,
 	OverheadManagerRef,
-	tiering::TieringManager,
 	error::CacheError,
 	worker::{
 		Worker,
@@ -22,9 +21,14 @@ use crate::{
 		WorkerReceiver,
 		PolicyWorker,
 		TtlWorker,
-		TieringWorker,
 		register_worker,
 	},
+};
+
+#[cfg(feature = "allocator_api")]
+use crate::{
+	tiering::TieringManager,
+	worker::TieringWorker,
 };
 
 pub struct WorkerManager {
@@ -50,6 +54,7 @@ impl Worker for WorkerManager {
 }
 
 impl WorkerManager {
+	#[cfg(feature = "allocator_api")]
 	pub fn new<K, V>(
 		listener: WorkerReceiver,
 		objects: &ObjectMapRef<K, V>,
@@ -91,6 +96,47 @@ impl WorkerManager {
 			policy_worker,
 			ttl_worker,
 			tiering_worker,
+		]));
+
+		let manager = WorkerManager {
+			listener,
+			workers,
+		};
+
+		Ok(manager)
+	}
+
+	#[cfg(not(feature = "allocator_api"))]
+	pub fn new<K, V>(
+		listener: WorkerReceiver,
+		objects: &ObjectMapRef<K, V>,
+		status: &StatusRef,
+		overhead_manager: &OverheadManagerRef,
+	) -> Result<Self, CacheError>
+	where
+		K: 'static + Eq + TypeSize,
+		V: 'static + TypeSize + Clone,
+	{
+		let (policy_worker, policy_listener) = unbounded();
+		let (ttl_worker, ttl_listener) = unbounded();
+
+		register_worker(PolicyWorker::<K, V>::new(
+			policy_listener,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+		)?);
+
+		register_worker(TtlWorker::<K, V>::new(
+			ttl_listener,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+		));
+
+		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
+			policy_worker,
+			ttl_worker,
 		]));
 
 		let manager = WorkerManager {

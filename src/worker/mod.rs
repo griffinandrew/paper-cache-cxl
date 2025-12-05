@@ -8,6 +8,8 @@
 mod manager;
 mod policy;
 mod ttl;
+
+#[cfg(feature = "allocator_api")]
 mod tiering;
 
 use std::thread;
@@ -53,5 +55,7 @@ pub use crate::worker::{
 	manager::WorkerManager,
 	policy::PolicyWorker,
 	ttl::TtlWorker,
-	tiering::TieringWorker,
 };
+
+#[cfg(feature = "allocator_api")]
+pub use crate::worker::tiering::TieringWorker;
