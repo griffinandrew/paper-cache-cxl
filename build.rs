@@ -37,10 +37,19 @@ fn main() {
 
     println!("DONE");
 
-    cc::Build::new()
-        .file("umf_allocator/umf_allocator_wrapper.c")
-        .include("umf_allocator")
-        .compile("umf_allocator"); 
+    // Only try to compile the C code if UMF headers are available
+    // Check if we can find the UMF header
+    let umf_header_path = PathBuf::from("/home/griffin/libs/unified-memory-framework/include/umf/providers/provider_devdax_memory.h");
+    if umf_header_path.exists() {
+        cc::Build::new()
+            .file("umf_allocator/umf_allocator_wrapper.c")
+            .include("umf_allocator")
+            .include("/home/griffin/libs/unified-memory-framework/include")
+            .compile("umf_allocator"); 
 
-    println!("Compiled umf_allocator.c");
+        println!("Compiled umf_allocator.c");
+    } else {
+        println!("cargo:warning=UMF headers not found, skipping C compilation. This is expected in CI/test environments.");
+        println!("Skipping C compilation");
+    }
 }

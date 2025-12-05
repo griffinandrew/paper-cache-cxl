@@ -1,12 +1,6 @@
-/*
- * Copyright (c) Kia Shakiba
- *
- * This source code is licensed under the GNU AGPLv3 license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use std::collections::HashSet;
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     HashedKey,
@@ -23,6 +17,8 @@ pub struct TieringManager {
     dram_objects: RwLock<HashSet<HashedKey>>,
     /// Maximum number of objects that can be in DRAM
     dram_capacity: RwLock<usize>,
+    /// Whether to prefer DRAM for new allocations
+    prefer_dram: AtomicBool,
 }
 
 impl TieringManager {
@@ -31,12 +27,18 @@ impl TieringManager {
         TieringManager {
             dram_objects: RwLock::new(HashSet::new()),
             dram_capacity: RwLock::new(dram_capacity),
+            prefer_dram: AtomicBool::new(true),
         }
     }
 
     /// Check if an object is in the DRAM tier
     pub fn is_in_dram(&self, key: HashedKey) -> bool {
         self.dram_objects.read().contains(&key)
+    }
+
+    /// Check if we should prefer DRAM for allocations right now
+    pub fn should_prefer_dram(&self) -> bool {
+        self.prefer_dram.load(Ordering::Relaxed)
     }
 
     /// Promote an object to DRAM tier
@@ -50,17 +52,23 @@ impl TieringManager {
         }
         
         if dram.len() >= capacity {
+            self.prefer_dram.store(false, Ordering::Relaxed);
             return false; // DRAM is full
         }
         
         dram.insert(key);
+        self.prefer_dram.store(true, Ordering::Relaxed);
         true
     }
 
     /// Demote an object from DRAM tier (keep in PMEM only)
     /// Returns true if the object was demoted, false if not in DRAM
     pub fn demote_from_dram(&self, key: HashedKey) -> bool {
-        self.dram_objects.write().remove(&key)
+        let removed = self.dram_objects.write().remove(&key);
+        if removed {
+            self.prefer_dram.store(true, Ordering::Relaxed);
+        }
+        removed
     }
 
     /// Evict the coldest object from DRAM to make room for a hot object
@@ -68,6 +76,7 @@ impl TieringManager {
     pub fn evict_from_dram(&self, eviction_candidate: HashedKey) -> Option<HashedKey> {
         let mut dram = self.dram_objects.write();
         if dram.remove(&eviction_candidate) {
+            self.prefer_dram.store(true, Ordering::Relaxed);
             Some(eviction_candidate)
         } else {
             None
@@ -87,17 +96,26 @@ impl TieringManager {
     /// Update DRAM capacity based on cache size
     pub fn update_capacity(&self, cache_size: CacheSize, ratio: f64) {
         let new_capacity = ((cache_size as f64) * ratio) as usize;
-        *self.dram_capacity.write() = new_capacity.max(1);
+        let new_capacity = new_capacity.max(1);
+        *self.dram_capacity.write() = new_capacity;
+        
+        // Update prefer_dram based on current fill ratio
+        let current_size = self.dram_size();
+        self.prefer_dram.store(current_size < new_capacity, Ordering::Relaxed);
     }
 
     /// Clear all DRAM tier tracking
     pub fn clear(&self) {
         self.dram_objects.write().clear();
+        self.prefer_dram.store(true, Ordering::Relaxed);
     }
 
     /// Remove a key from tracking (when object is deleted from cache)
     pub fn remove(&self, key: HashedKey) {
-        self.dram_objects.write().remove(&key);
+        let removed = self.dram_objects.write().remove(&key);
+        if removed {
+            self.prefer_dram.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -138,5 +156,26 @@ mod tests {
         
         manager.update_capacity(1000, 0.5);
         assert_eq!(manager.dram_capacity(), 500);
+    }
+
+    #[test]
+    fn test_prefer_dram_flag() {
+        let manager = TieringManager::new(2);
+        
+        assert!(manager.should_prefer_dram());
+        
+        manager.promote_to_dram(1);
+        assert!(manager.should_prefer_dram());
+        
+        manager.promote_to_dram(2);
+        assert!(manager.should_prefer_dram());
+        
+        // DRAM is now full
+        manager.promote_to_dram(3); // This should fail and set prefer_dram to false
+        assert!(!manager.should_prefer_dram());
+        
+        // Demoting should set prefer_dram back to true
+        manager.demote_from_dram(1);
+        assert!(manager.should_prefer_dram());
     }
 }
