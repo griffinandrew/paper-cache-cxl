@@ -32,6 +32,7 @@ mod worker;
 mod object;
 mod policy;
 mod status;
+pub mod tiering;
 
 use std::{
 	thread,
@@ -83,6 +84,7 @@ use crate::{
 pub use crate::{
 	error::CacheError,
 	policy::PaperPolicy,
+	tiering::{TieringManager, TieringConfig, TieringStats},
 };
 
 pub type CacheSize = u64;
