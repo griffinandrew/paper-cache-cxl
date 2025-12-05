@@ -228,7 +228,6 @@ impl TieringManager {
         let config = self.config.read().unwrap();
         let stats = self.stats.read().unwrap();
         let high_water = (config.dram_threshold as f64 * config.high_water_mark) as u64;
-        let _low_water = (config.dram_threshold as f64 * config.low_water_mark) as u64;
 
         if stats.dram_size <= high_water {
             return Vec::new();

@@ -147,8 +147,13 @@ where
         let mut last_periodic = std::time::Instant::now();
         
         loop {
-            // Process all pending events with a timeout
-            let timeout = TIERING_INTERVAL.saturating_sub(last_periodic.elapsed());
+            // Calculate timeout, ensuring we don't busy wait
+            let elapsed = last_periodic.elapsed();
+            let timeout = if elapsed >= TIERING_INTERVAL {
+                Duration::from_millis(1)  // Minimal timeout to avoid busy waiting
+            } else {
+                TIERING_INTERVAL - elapsed
+            };
             
             if let Ok(event) = self.listener.recv_timeout(timeout) {
                 self.process_event(event);
