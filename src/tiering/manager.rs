@@ -22,6 +22,9 @@ pub struct TieringConfig {
     /// Low water mark as percentage of threshold (0.0 to 1.0)
     /// Continue demoting until DRAM usage falls below threshold * low_water_mark
     pub low_water_mark: f64,
+
+    /// Hotness threshold: minimum access count before promotion
+    pub hotness_threshold: u64,
 }
 
 impl Default for TieringConfig {
@@ -30,6 +33,7 @@ impl Default for TieringConfig {
             dram_threshold: 1_073_741_824, // 1 GB default
             high_water_mark: 0.9,
             low_water_mark: 0.7,
+            hotness_threshold: 2, // Promote after 2 accesses
         }
     }
 }
@@ -134,10 +138,12 @@ impl TieringManager {
     /// Returns true if the object should be promoted to DRAM
     /// 
     /// ## Promotion Heuristic
-    /// Objects are promoted after 2 accesses (hardcoded threshold).
-    /// First access: counted but not promoted
-    /// Second+ access: suggests promotion
+    /// Objects are promoted after reaching the configured hotness threshold.
     pub fn record_access(&self, key: HashedKey) -> bool {
+        let config = self.config.read().unwrap();
+        let hotness_threshold = config.hotness_threshold;
+        drop(config);
+
         let mut info_map = self.object_info.write().unwrap();
 
         if let Some(info) = info_map.get_mut(&key) {
@@ -148,8 +154,7 @@ impl TieringManager {
             match info.tier {
                 Tier::PmemOnly => {
                     // Check if we should promote based on access count
-                    // Simple heuristic: promote if accessed more than once
-                    info.access_count > 1
+                    info.access_count >= hotness_threshold
                 }
                 Tier::DramAndPmem => {
                     // Already in DRAM
@@ -223,7 +228,7 @@ impl TieringManager {
         let config = self.config.read().unwrap();
         let stats = self.stats.read().unwrap();
         let high_water = (config.dram_threshold as f64 * config.high_water_mark) as u64;
-        let low_water = (config.dram_threshold as f64 * config.low_water_mark) as u64;
+        let _low_water = (config.dram_threshold as f64 * config.low_water_mark) as u64;
 
         if stats.dram_size <= high_water {
             return Vec::new();
@@ -303,6 +308,17 @@ impl TieringManager {
     /// Gets the current DRAM threshold
     pub fn dram_threshold(&self) -> u64 {
         self.config.read().unwrap().dram_threshold
+    }
+
+    /// Gets the current hotness threshold
+    pub fn hotness_threshold(&self) -> u64 {
+        self.config.read().unwrap().hotness_threshold
+    }
+
+    /// Sets the hotness threshold
+    pub fn set_hotness_threshold(&self, threshold: u64) {
+        let mut config = self.config.write().unwrap();
+        config.hotness_threshold = threshold;
     }
 
     /// Clears all tiering information (for cache wipe)

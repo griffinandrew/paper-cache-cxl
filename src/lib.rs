@@ -57,6 +57,8 @@ use typesize::TypeSize;
 use nohash_hasher::NoHashHasher;
 use crossbeam_channel::unbounded;
 use log::{info, error};
+
+#[cfg(feature = "original")]
 use std::ops::Deref;
 
 
@@ -115,6 +117,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 
 	worker_manager: Arc<WorkerSender>,
 	overhead_manager: OverheadManagerRef,
+	tiering_manager: Arc<TieringManager>,
 
 	hasher: S,
 }
@@ -232,6 +235,11 @@ where
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
+		// Create tiering manager with default DRAM threshold at 20% of max_size
+		let mut tiering_config = tiering::TieringConfig::default();
+		tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+		let tiering_manager = Arc::new(TieringManager::new(tiering_config));
+
 		let (worker_sender, worker_listener) = unbounded();
 
 		let mut worker_manager = WorkerManager::new(
@@ -239,6 +247,7 @@ where
 			&objects,
 			&status,
 			&overhead_manager,
+			&tiering_manager,
 		)?;
 
 		thread::spawn(move || worker_manager.run());
@@ -249,6 +258,7 @@ where
 
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
+			tiering_manager,
 
 			hasher,
 		};
@@ -668,6 +678,31 @@ where
 		Ok(())
 	}
 
+
+/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
+	pub fn tiering_stats(&self) -> tiering::TieringStats {
+self.tiering_manager.stats()
+}
+
+/// Sets the DRAM tier threshold in bytes.
+	pub fn set_dram_threshold(&self, threshold: u64) {
+self.tiering_manager.set_dram_threshold(threshold);
+}
+
+/// Gets the current DRAM tier threshold in bytes.
+	pub fn dram_threshold(&self) -> u64 {
+self.tiering_manager.dram_threshold()
+}
+
+	/// Sets the hotness threshold for promotion to DRAM.
+	pub fn set_hotness_threshold(&self, threshold: u64) {
+		self.tiering_manager.set_hotness_threshold(threshold);
+	}
+
+	/// Gets the current hotness threshold.
+	pub fn hotness_threshold(&self) -> u64 {
+		self.tiering_manager.hotness_threshold()
+	}
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
 		if let Err(err) = self.worker_manager.try_send(event) {
 			error!("Could not communicate with workers: {err:?}");
@@ -800,6 +835,11 @@ where
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
+		// Create tiering manager with default DRAM threshold at 20% of max_size
+		let mut tiering_config = tiering::TieringConfig::default();
+		tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+		let tiering_manager = Arc::new(TieringManager::new(tiering_config));
+
 		let (worker_sender, worker_listener) = unbounded();
 
 		let mut worker_manager = WorkerManager::new(
@@ -807,6 +847,7 @@ where
 			&objects,
 			&status,
 			&overhead_manager,
+			&tiering_manager,
 		)?;
 
 		thread::spawn(move || worker_manager.run());
@@ -817,6 +858,7 @@ where
 
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
+			tiering_manager,
 
 			hasher,
 		};
@@ -1245,6 +1287,31 @@ where
 		Ok(())
 	}
 
+
+/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
+	pub fn tiering_stats(&self) -> tiering::TieringStats {
+self.tiering_manager.stats()
+}
+
+/// Sets the DRAM tier threshold in bytes.
+	pub fn set_dram_threshold(&self, threshold: u64) {
+self.tiering_manager.set_dram_threshold(threshold);
+}
+
+/// Gets the current DRAM tier threshold in bytes.
+	pub fn dram_threshold(&self) -> u64 {
+self.tiering_manager.dram_threshold()
+}
+
+	/// Sets the hotness threshold for promotion to DRAM.
+	pub fn set_hotness_threshold(&self, threshold: u64) {
+		self.tiering_manager.set_hotness_threshold(threshold);
+	}
+
+	/// Gets the current hotness threshold.
+	pub fn hotness_threshold(&self) -> u64 {
+		self.tiering_manager.hotness_threshold()
+	}
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
 		if let Err(err) = self.worker_manager.try_send(event) {
 			error!("Could not communicate with workers: {err:?}");
@@ -1375,6 +1442,11 @@ where
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
+		// Create tiering manager with default DRAM threshold at 20% of max_size
+		let mut tiering_config = tiering::TieringConfig::default();
+		tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+		let tiering_manager = Arc::new(TieringManager::new(tiering_config));
+
 		let (worker_sender, worker_listener) = unbounded();
 
 		let mut worker_manager = WorkerManager::new(
@@ -1382,6 +1454,7 @@ where
 			&objects,
 			&status,
 			&overhead_manager,
+			&tiering_manager,
 		)?;
 
 		thread::spawn(move || worker_manager.run());
@@ -1392,6 +1465,7 @@ where
 
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
+			tiering_manager,
 
 			hasher,
 		};
@@ -1857,6 +1931,31 @@ where
 		Ok(())
 	}
 
+
+/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
+	pub fn tiering_stats(&self) -> tiering::TieringStats {
+self.tiering_manager.stats()
+}
+
+/// Sets the DRAM tier threshold in bytes.
+	pub fn set_dram_threshold(&self, threshold: u64) {
+self.tiering_manager.set_dram_threshold(threshold);
+}
+
+/// Gets the current DRAM tier threshold in bytes.
+	pub fn dram_threshold(&self) -> u64 {
+self.tiering_manager.dram_threshold()
+}
+
+	/// Sets the hotness threshold for promotion to DRAM.
+	pub fn set_hotness_threshold(&self, threshold: u64) {
+		self.tiering_manager.set_hotness_threshold(threshold);
+	}
+
+	/// Gets the current hotness threshold.
+	pub fn hotness_threshold(&self) -> u64 {
+		self.tiering_manager.hotness_threshold()
+	}
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
 		if let Err(err) = self.worker_manager.try_send(event) {
 			error!("Could not communicate with workers: {err:?}");
