@@ -1336,7 +1336,6 @@ self.tiering_manager.stats()
 	pub fn set_dram_threshold(&self, threshold: u64) {
 self.tiering_manager.set_dram_threshold(threshold);
 }
-#[cfg(feature = "allocator_api")]
 
 #[cfg(feature = "allocator_api")]
 /// Gets the current DRAM tier threshold in bytes.

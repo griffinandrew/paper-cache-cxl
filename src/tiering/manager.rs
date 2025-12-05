@@ -207,7 +207,10 @@ where
 
                     // Physically copy data to DRAM:
                     // 1. Extract bytes from the source (which may be PMEM-allocated)
-                    let bytes: &[u8] = value.as_ref().as_ref();
+                    //    First as_ref() dereferences Arc<V> -> &V
+                    //    Second as_ref() calls AsRef<[u8]> on V -> &[u8]
+                    let source_value: &V = value.as_ref();
+                    let bytes: &[u8] = source_value.as_ref();
                     // 2. Create a new DRAM-allocated Vec and Box
                     let dram_copy: Box<[u8]> = bytes.to_vec().into_boxed_slice();
                     // 3. Store the DRAM copy in the cache
@@ -308,7 +311,10 @@ where
         // Only update if object is currently in DRAM
         if self.is_in_dram(&key) {
             // Physically copy the updated data to DRAM
-            let bytes: &[u8] = value.as_ref().as_ref();
+            // First as_ref() dereferences Arc<V> -> &V
+            // Second as_ref() calls AsRef<[u8]> on V -> &[u8]
+            let source_value: &V = value.as_ref();
+            let bytes: &[u8] = source_value.as_ref();
             let dram_copy: Box<[u8]> = bytes.to_vec().into_boxed_slice();
             self.dram_cache.insert(key, Arc::new(dram_copy));
         }
