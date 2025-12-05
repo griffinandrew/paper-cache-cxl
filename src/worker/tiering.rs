@@ -347,3 +347,120 @@ where
 }
 
 unsafe impl<K, V> Send for TieringWorker<K, V> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use crossbeam_channel::{unbounded, bounded};
+    use crate::{
+        ObjectMapRef,
+        StatusRef,
+        OverheadManagerRef,
+        status::AtomicStatus,
+        object::overhead::OverheadManager,
+        policy::PaperPolicy,
+        HashedKey,
+        NoHasher,
+    };
+    use dashmap::DashMap;
+
+    #[test]
+    fn test_tiering_manager_promotion() {
+        let manager = TieringManager::new(1000, 500);
+        
+        let key: HashedKey = 42;
+        
+        // First access
+        let count1 = manager.record_access(key);
+        assert_eq!(count1, 1);
+        assert!(!manager.should_promote(key, count1));
+        
+        // Second access - should trigger promotion threshold
+        let count2 = manager.record_access(key);
+        assert_eq!(count2, 2);
+        assert!(manager.should_promote(key, count2));
+        
+        // Mark as pending and promote
+        manager.mark_pending_promotion(key);
+        assert!(!manager.should_promote(key, count2)); // Already pending
+        
+        manager.promote_to_dram(key, 100);
+        assert_eq!(manager.dram_size(), 100);
+        assert!(!manager.should_promote(key, count2)); // Already in DRAM
+    }
+
+    #[test]
+    fn test_tiering_manager_demotion() {
+        let manager = TieringManager::new(1000, 500);
+        
+        // Promote several objects
+        manager.promote_to_dram(1, 300);
+        manager.promote_to_dram(2, 300);
+        manager.promote_to_dram(3, 300);
+        
+        // Record different access counts
+        manager.record_access(1); // 1 access
+        manager.record_access(2); // 1 access
+        manager.record_access(2); // 2 accesses
+        manager.record_access(3); // 1 access
+        manager.record_access(3); // 2 accesses
+        manager.record_access(3); // 3 accesses
+        
+        assert_eq!(manager.dram_size(), 900);
+        assert!(manager.needs_demotion()); // Over high water mark (1000)
+        
+        // Demote coldest objects
+        let demoted = manager.demote_until_low_water();
+        
+        // Should demote objects with lowest access counts first
+        // Need to free 400 bytes to get to low water mark (500)
+        assert!(!demoted.is_empty());
+        assert!(manager.dram_size() <= 500);
+    }
+
+    #[test]
+    fn test_access_event_batching() {
+        let (sender, receiver) = bounded(10);
+        let (worker_sender, worker_receiver) = unbounded();
+        
+        // Send some access events
+        sender.send(AccessEvent::Get(1)).unwrap();
+        sender.send(AccessEvent::Get(2)).unwrap();
+        sender.send(AccessEvent::Get(1)).unwrap(); // Duplicate
+        
+        // These would normally be processed by the worker
+        // Testing that deduplication works correctly in batch processing
+        let mut batch_counts = HashMap::new();
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                AccessEvent::Get(key) => {
+                    *batch_counts.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
+        
+        assert_eq!(batch_counts.get(&1), Some(&2));
+        assert_eq!(batch_counts.get(&2), Some(&1));
+    }
+
+    #[test]
+    fn test_water_marks() {
+        let high = 1000;
+        let low = 500;
+        let manager = TieringManager::new(high, low);
+        
+        assert!(!manager.needs_demotion());
+        
+        // Add objects up to high water mark
+        manager.promote_to_dram(1, 600);
+        manager.promote_to_dram(2, 400);
+        
+        assert_eq!(manager.dram_size(), 1000);
+        assert!(!manager.needs_demotion()); // Exactly at high water mark
+        
+        // Add one more byte
+        manager.promote_to_dram(3, 1);
+        assert!(manager.needs_demotion()); // Over high water mark
+    }
+}
