@@ -8,6 +8,7 @@
 mod manager;
 mod policy;
 mod ttl;
+mod tiering;
 
 use std::thread;
 use crossbeam_channel::{Sender, Receiver};
@@ -52,4 +53,5 @@ pub use crate::worker::{
 	manager::WorkerManager,
 	policy::PolicyWorker,
 	ttl::TtlWorker,
+	tiering::{TieringManager, TieringWorker, AccessEvent},
 };

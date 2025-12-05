@@ -1,6 +1,7 @@
 extern crate bindgen;
 
 use std::path::PathBuf;
+use std::env;
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
@@ -8,21 +9,21 @@ fn main() {
     println!("cargo:rustc-link-search=native=/home/griffin/libs/unified-memory-framework/lib");
     println!("cargo:rustc-link-lib=umf_allocator");
 
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let wrapper_path = PathBuf::from(&manifest_dir).join("wrapper.h");
+    let src_path = PathBuf::from(&manifest_dir).join("src");
 
-    //these outputs should be different.... all that matters is the linking with the umf repo thooooooooo
-    
     // Generate bindings
     let bindings = bindgen::Builder::default()
-        .header("/home/griffin/cxl_baseline/paper-server-cxl/wrapper.h") // Ensure this header includes memkind headers
+        .header(wrapper_path.to_str().unwrap())
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("Unable to generate bindings");
 
     println!("Generated bindings");
 
-    let out_path = PathBuf::from("/home/griffin/cxl_baseline/paper-server-cxl/src/");
     bindings
-        .write_to_file(out_path.join("umf_bindings.rs"))
+        .write_to_file(src_path.join("umf_bindings.rs"))
         .expect("Couldn't write bindings!");
 
     println!("DONE");

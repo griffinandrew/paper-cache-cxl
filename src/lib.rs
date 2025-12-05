@@ -47,6 +47,8 @@ use std::{
 	},
 };
 
+use crossbeam_channel::{unbounded, Sender};
+
 use dashmap::{
 	DashMap,
 	mapref::entry::Entry,
@@ -54,7 +56,6 @@ use dashmap::{
 
 use typesize::TypeSize;
 use nohash_hasher::NoHashHasher;
-use crossbeam_channel::unbounded;
 use log::{info, error};
 use std::ops::Deref;
 
@@ -77,6 +78,7 @@ use crate::{
 		WorkerSender,
 		WorkerEvent,
 		WorkerManager,
+		AccessEvent,
 	},
 };
 
@@ -112,6 +114,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 	status: StatusRef,
 
 	worker_manager: Arc<WorkerSender>,
+	access_event_sender: Sender<AccessEvent>,
 	overhead_manager: OverheadManagerRef,
 
 	hasher: S,
@@ -232,12 +235,14 @@ where
 
 		let (worker_sender, worker_listener) = unbounded();
 
-		let mut worker_manager = WorkerManager::new(
+		let worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
 			&overhead_manager,
 		)?;
+		
+		let access_event_sender = worker_manager.access_event_sender.clone();
 
 		thread::spawn(move || worker_manager.run());
 
@@ -246,6 +251,7 @@ where
 			status,
 
 			worker_manager: Arc::new(worker_sender),
+			access_event_sender,
 			overhead_manager,
 
 			hasher,
@@ -336,6 +342,11 @@ where
 				Err(CacheError::KeyNotFound)
 			},
 		};
+		
+		// Send access event to tiering worker (non-blocking)
+		if result.is_ok() {
+			let _ = self.access_event_sender.try_send(AccessEvent::Get(hashed_key));
+		}
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
@@ -800,12 +811,14 @@ where
 
 		let (worker_sender, worker_listener) = unbounded();
 
-		let mut worker_manager = WorkerManager::new(
+		let worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
 			&overhead_manager,
 		)?;
+		
+		let access_event_sender = worker_manager.access_event_sender.clone();
 
 		thread::spawn(move || worker_manager.run());
 
@@ -814,6 +827,7 @@ where
 			status,
 
 			worker_manager: Arc::new(worker_sender),
+			access_event_sender,
 			overhead_manager,
 
 			hasher,
@@ -905,6 +919,11 @@ where
 				Err(CacheError::KeyNotFound)
 			},
 		};
+		
+		// Send access event to tiering worker (non-blocking)
+		if result.is_ok() {
+			let _ = self.access_event_sender.try_send(AccessEvent::Get(hashed_key));
+		}
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
@@ -1375,12 +1394,14 @@ where
 
 		let (worker_sender, worker_listener) = unbounded();
 
-		let mut worker_manager = WorkerManager::new(
+		let worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
 			&overhead_manager,
 		)?;
+		
+		let access_event_sender = worker_manager.access_event_sender.clone();
 
 		thread::spawn(move || worker_manager.run());
 
@@ -1389,6 +1410,7 @@ where
 			status,
 
 			worker_manager: Arc::new(worker_sender),
+			access_event_sender,
 			overhead_manager,
 
 			hasher,
@@ -1482,6 +1504,11 @@ where
 				Err(CacheError::KeyNotFound)
 			},
 		};
+		
+		// Send access event to tiering worker (non-blocking)
+		if result.is_ok() {
+			let _ = self.access_event_sender.try_send(AccessEvent::Get(hashed_key));
+		}
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
