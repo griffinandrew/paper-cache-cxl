@@ -77,6 +77,14 @@ impl TieringManager {
         *count
     }
     
+    /// Record multiple accesses to an object (more efficient for batch processing)
+    fn record_access_count(&self, key: HashedKey, count: u32) -> u32 {
+        let mut counts = self.access_counts.write();
+        let entry = counts.entry(key).or_insert(0);
+        *entry += count;
+        *entry
+    }
+    
     /// Check if an object should be promoted
     fn should_promote(&self, key: HashedKey, access_count: u32) -> bool {
         if access_count < PROMOTION_THRESHOLD {
@@ -231,15 +239,8 @@ where
         
         // Process each unique key
         for (key, batch_count) in batch_counts {
-            // Update global access count
-            let total_count = {
-                let mut count = self.tiering_manager.record_access(key);
-                // record_access already incremented by 1, we need to add the rest
-                for _ in 1..batch_count {
-                    count = self.tiering_manager.record_access(key);
-                }
-                count
-            };
+            // Update global access count efficiently
+            let total_count = self.tiering_manager.record_access_count(key, batch_count);
             
             // Check if promotion is needed
             if self.tiering_manager.should_promote(key, total_count) {
