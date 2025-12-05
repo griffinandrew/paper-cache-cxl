@@ -712,14 +712,12 @@ self.tiering_manager.set_dram_threshold(threshold);
 }
 
 #[cfg(feature = "allocator_api")]
-#[cfg(feature = "allocator_api")]
 /// Gets the current DRAM tier threshold in bytes.
 	pub fn dram_threshold(&self) -> u64 {
 self.tiering_manager.dram_threshold()
 }
 
 #[cfg(feature = "allocator_api")]
-	#[cfg(feature = "allocator_api")]
 	/// Sets the hotness threshold for promotion to DRAM.
 	pub fn set_hotness_threshold(&self, threshold: u64) {
 		self.tiering_manager.set_hotness_threshold(threshold);
@@ -1328,13 +1326,11 @@ where
 
 
 #[cfg(feature = "allocator_api")]
-#[cfg(feature = "allocator_api")]
 /// Gets tiering statistics including objects in DRAM, promotions, and demotions.
 	pub fn tiering_stats(&self) -> tiering::TieringStats {
 self.tiering_manager.stats()
 }
 
-#[cfg(feature = "allocator_api")]
 #[cfg(feature = "allocator_api")]
 /// Sets the DRAM tier threshold in bytes.
 	pub fn set_dram_threshold(&self, threshold: u64) {
