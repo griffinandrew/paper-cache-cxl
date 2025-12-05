@@ -40,6 +40,7 @@ use crate::{
 		WorkerEvent,
 		WorkerReceiver,
 		register_worker,
+		tiering_manager::TieringManager,
 		policy::{
 			mini_stack::MiniStackManager,
 			event::{StackEvent, TraceEvent},
@@ -56,6 +57,9 @@ const AUTO_POLICY_DURATION: Duration = Duration::from_secs(3_600);
 const SET_RECENCY_DURATION: Duration = Duration::from_secs(5);
 const SHORT_POLLING_DURATION: Duration = Duration::from_millis(1);
 const LONG_POLLING_DURATION: Duration = Duration::from_secs(1);
+
+// DRAM tier ratio: what fraction of cache objects can be in DRAM
+const DRAM_TIER_RATIO: f64 = 0.2; // 20% of objects can be in DRAM
 
 pub struct PolicyWorker<K, V> {
 	listener: Receiver<WorkerEvent>,
@@ -75,6 +79,8 @@ pub struct PolicyWorker<K, V> {
 
 	last_auto_policy_time: Option<Instant>,
 	last_set_time: Option<Instant>,
+
+	tiering_manager: Arc<TieringManager>,
 }
 
 impl<K, V> Worker for PolicyWorker<K, V>
@@ -183,6 +189,11 @@ where
 			return Err(CacheError::Internal);
 		}
 
+		// Initialize tiering manager with DRAM capacity based on cache size
+		let dram_capacity = ((max_cache_size as f64) * DRAM_TIER_RATIO) as usize;
+		let dram_capacity = dram_capacity.max(1); // At least 1 object in DRAM
+		let tiering_manager = Arc::new(TieringManager::new(dram_capacity));
+
 		let worker = PolicyWorker {
 			listener,
 
@@ -202,6 +213,8 @@ where
 
 			last_auto_policy_time: None,
 			last_set_time: None,
+
+			tiering_manager,
 		};
 
 		Ok(worker)
@@ -213,6 +226,9 @@ where
 		}
 
 		self.mini_stack_manager.handle_get(key);
+
+		// Promote frequently accessed objects to DRAM tier
+		self.manage_dram_tier(key);
 	}
 
 	fn handle_set(&mut self, key: HashedKey, size: ObjectSize) {
@@ -221,6 +237,9 @@ where
 		}
 
 		self.mini_stack_manager.handle_set(key, size);
+
+		// New or updated objects should be considered for DRAM tier
+		self.manage_dram_tier(key);
 	}
 
 	fn handle_del(&mut self, key: HashedKey) {
@@ -229,6 +248,9 @@ where
 		}
 
 		self.mini_stack_manager.handle_del(key);
+
+		// Remove from DRAM tier tracking when deleted
+		self.tiering_manager.remove(key);
 	}
 
 	fn handle_resize(&mut self, size: CacheSize) {
@@ -237,6 +259,9 @@ where
 		}
 
 		self.mini_stack_manager.handle_resize(size);
+
+		// Update DRAM tier capacity when cache is resized
+		self.tiering_manager.update_capacity(size, DRAM_TIER_RATIO);
 	}
 
 	fn handle_policy(
@@ -299,6 +324,60 @@ where
 		}
 
 		self.mini_stack_manager.handle_wipe();
+
+		// Clear DRAM tier tracking when cache is wiped
+		self.tiering_manager.clear();
+	}
+
+	/// Manage DRAM tier by promoting hot objects and demoting cold ones
+	fn manage_dram_tier(&mut self, accessed_key: HashedKey) {
+		// If DRAM is not full, simply promote the accessed key
+		if self.tiering_manager.promote_to_dram(accessed_key) {
+			return; // Successfully promoted
+		}
+
+		// DRAM is full or key is already in DRAM
+		// Need to evict the coldest object from DRAM to make room
+		if let Some(stack) = &mut self.policy_stack {
+			// Use the eviction stack to find the least recently used object in DRAM
+			// We need to find an object that is in DRAM and can be evicted
+			// For simplicity, we'll evict based on the eviction stack order
+			
+			// Try to find a cold object in DRAM to evict
+			let mut eviction_candidate = None;
+			let mut temp_evictions = Vec::new();
+			
+			// Look through the eviction stack to find objects in DRAM
+			while let Some(key) = stack.evict_one() {
+				if self.tiering_manager.is_in_dram(key) {
+					eviction_candidate = Some(key);
+					// Put back the keys we pulled out
+					for k in temp_evictions.iter().rev() {
+						stack.insert(*k, 0); // Size doesn't matter for reinsertion
+					}
+					break;
+				}
+				temp_evictions.push(key);
+				
+				// Don't search forever
+				if temp_evictions.len() > 100 {
+					// Put everything back
+					for k in temp_evictions.iter().rev() {
+						stack.insert(*k, 0);
+					}
+					break;
+				}
+			}
+			
+			if let Some(evict_key) = eviction_candidate {
+				if evict_key != accessed_key {
+					// Demote the cold object from DRAM (it stays in PMEM)
+					self.tiering_manager.demote_from_dram(evict_key);
+					// Now promote the accessed key
+					self.tiering_manager.promote_to_dram(accessed_key);
+				}
+			}
+		}
 	}
 
 	fn apply_buffered_events(

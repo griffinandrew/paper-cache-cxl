@@ -8,6 +8,7 @@
 mod manager;
 mod policy;
 mod ttl;
+pub mod tiering_manager;
 
 use std::thread;
 use crossbeam_channel::{Sender, Receiver};

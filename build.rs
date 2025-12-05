@@ -1,6 +1,7 @@
 extern crate bindgen;
 
 use std::path::PathBuf;
+use std::env;
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
@@ -11,19 +12,28 @@ fn main() {
 
     //these outputs should be different.... all that matters is the linking with the umf repo thooooooooo
     
-    // Generate bindings
-    let bindings = bindgen::Builder::default()
-        .header("/home/griffin/cxl_baseline/paper-server-cxl/wrapper.h") // Ensure this header includes memkind headers
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .generate()
-        .expect("Unable to generate bindings");
+    // Generate bindings using the local wrapper.h
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let wrapper_path = PathBuf::from(&manifest_dir).join("wrapper.h");
+    let bindings_path = PathBuf::from(&manifest_dir).join("src").join("umf_bindings.rs");
+    
+    // Only generate bindings if they don't exist
+    if !bindings_path.exists() {
+        let bindings = bindgen::Builder::default()
+            .header(wrapper_path.to_str().unwrap()) // Use local wrapper.h
+            .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+            .generate()
+            .expect("Unable to generate bindings");
 
-    println!("Generated bindings");
+        println!("Generated bindings");
 
-    let out_path = PathBuf::from("/home/griffin/cxl_baseline/paper-server-cxl/src/");
-    bindings
-        .write_to_file(out_path.join("umf_bindings.rs"))
-        .expect("Couldn't write bindings!");
+        let out_path = PathBuf::from(&manifest_dir).join("src");
+        bindings
+            .write_to_file(out_path.join("umf_bindings.rs"))
+            .expect("Couldn't write bindings!");
+    } else {
+        println!("Using existing bindings");
+    }
 
     println!("DONE");
 
