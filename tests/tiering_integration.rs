@@ -147,7 +147,7 @@ fn test_clear_all_tiering_info() {
 
 #[test]
 fn test_threshold_update() {
-    let mut manager = TieringManager::with_defaults();
+    let manager = TieringManager::with_defaults();
     
     assert_eq!(manager.dram_threshold(), 1_073_741_824); // Default 1GB
     

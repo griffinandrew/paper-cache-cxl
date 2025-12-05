@@ -29,9 +29,9 @@ fn main() {
     println!("  Low water mark: 70%\n");
     
     // Simulate adding objects to cache
-    println!("Step 1: Registering 20 objects in PMEM (each 50 KB)...");
+    println!("Step 1: Registering 20 objects in PMEM (each ~50 KB)...");
     for i in 0..20 {
-        manager.register_object(i, 51_200); // 50 KB each
+        manager.register_object(i, 51_200); // ~50 KB each (51,200 bytes)
     }
     
     let stats = manager.stats();

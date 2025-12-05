@@ -90,8 +90,13 @@ struct ObjectTierInfo {
 /// 
 /// Manages object placement between DRAM and PMEM tiers.
 /// DRAM contains hot copies of objects while PMEM is the source of truth.
+/// 
+/// ## Promotion Policy
+/// Objects are promoted to DRAM after being accessed more than once (hardcoded threshold).
+/// This simple heuristic ensures that only objects with repeated access are promoted.
+/// Future versions may make this configurable via TieringConfig.
 pub struct TieringManager {
-    config: TieringConfig,
+    config: Arc<RwLock<TieringConfig>>,
     stats: Arc<RwLock<TieringStats>>,
     
     /// Tracking information for each object
@@ -105,7 +110,7 @@ impl TieringManager {
     /// Creates a new TieringManager with the given configuration
     pub fn new(config: TieringConfig) -> Self {
         TieringManager {
-            config,
+            config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
@@ -134,6 +139,11 @@ impl TieringManager {
     
     /// Records an access to an object
     /// Returns true if the object should be promoted to DRAM
+    /// 
+    /// ## Promotion Heuristic
+    /// Objects are promoted after 2 accesses (hardcoded threshold).
+    /// First access: counted but not promoted
+    /// Second+ access: suggests promotion
     pub fn record_access(&self, key: HashedKey) -> bool {
         let mut info_map = self.object_info.write().unwrap();
         
@@ -165,11 +175,12 @@ impl TieringManager {
         
         if let Some(info) = info_map.get_mut(&key) {
             if info.tier == Tier::PmemOnly {
+                let config = self.config.read().unwrap();
                 let mut stats = self.stats.write().unwrap();
                 let new_dram_size = stats.dram_size + info.size as u64;
                 
                 // Check if promotion would exceed threshold
-                if new_dram_size <= self.config.dram_threshold {
+                if new_dram_size <= config.dram_threshold {
                     info.tier = Tier::DramAndPmem;
                     
                     let mut dram_objects = self.dram_objects.write().unwrap();
@@ -216,15 +227,17 @@ impl TieringManager {
     /// Checks if DRAM threshold has been exceeded and returns keys to demote
     /// Uses LRU (Least Recently Used) strategy for demotion
     pub fn get_keys_to_demote(&self) -> Vec<HashedKey> {
+        let config = self.config.read().unwrap();
         let stats = self.stats.read().unwrap();
-        let high_water = (self.config.dram_threshold as f64 * self.config.high_water_mark) as u64;
-        let low_water = (self.config.dram_threshold as f64 * self.config.low_water_mark) as u64;
+        let high_water = (config.dram_threshold as f64 * config.high_water_mark) as u64;
+        let low_water = (config.dram_threshold as f64 * config.low_water_mark) as u64;
         
         if stats.dram_size <= high_water {
             return Vec::new();
         }
         
         drop(stats);
+        drop(config);
         
         // Find objects to demote to bring usage below low water mark
         let info_map = self.object_info.read().unwrap();
@@ -238,9 +251,11 @@ impl TieringManager {
         // Sort by last access time (LRU)
         dram_object_info.sort_by_key(|(_, info)| info.last_access);
         
+        let config = self.config.read().unwrap();
         let stats = self.stats.read().unwrap();
         let mut current_size = stats.dram_size;
         let mut keys_to_demote = Vec::new();
+        let low_water = (config.dram_threshold as f64 * config.low_water_mark) as u64;
         
         for (key, info) in dram_object_info {
             if current_size <= low_water {
@@ -287,13 +302,14 @@ impl TieringManager {
     }
     
     /// Updates the DRAM threshold
-    pub fn set_dram_threshold(&mut self, threshold: u64) {
-        self.config.dram_threshold = threshold;
+    pub fn set_dram_threshold(&self, threshold: u64) {
+        let mut config = self.config.write().unwrap();
+        config.dram_threshold = threshold;
     }
     
     /// Gets the current DRAM threshold
     pub fn dram_threshold(&self) -> u64 {
-        self.config.dram_threshold
+        self.config.read().unwrap().dram_threshold
     }
     
     /// Clears all tiering information (for cache wipe)
