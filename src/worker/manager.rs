@@ -14,6 +14,7 @@ use crate::{
 	ObjectMapRef,
 	StatusRef,
 	OverheadManagerRef,
+	tiering::TieringManager,
 	error::CacheError,
 	worker::{
 		Worker,
@@ -21,6 +22,7 @@ use crate::{
 		WorkerReceiver,
 		PolicyWorker,
 		TtlWorker,
+		TieringWorker,
 		register_worker,
 	},
 };
@@ -53,13 +55,15 @@ impl WorkerManager {
 		objects: &ObjectMapRef<K, V>,
 		status: &StatusRef,
 		overhead_manager: &OverheadManagerRef,
+		tiering_manager: &Arc<TieringManager<V>>,
 	) -> Result<Self, CacheError>
 	where
 		K: 'static + Eq + TypeSize,
-		V: 'static + TypeSize,
+		V: 'static + TypeSize + Clone,
 	{
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();
+		let (tiering_worker, tiering_listener) = unbounded();
 
 		register_worker(PolicyWorker::<K, V>::new(
 			policy_listener,
@@ -75,9 +79,18 @@ impl WorkerManager {
 			overhead_manager.clone(),
 		));
 
+		register_worker(TieringWorker::<K, V>::new(
+			tiering_listener,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+			tiering_manager.clone(),
+		));
+
 		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
 			policy_worker,
 			ttl_worker,
+			tiering_worker,
 		]));
 
 		let manager = WorkerManager {

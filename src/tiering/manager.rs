@@ -3,9 +3,13 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use dashmap::DashMap;
+use typesize::TypeSize;
+
 use crate::{
     HashedKey,
     object::ObjectSize,
+    NoHasher,
 };
 
 /// Configuration for the tiering manager
@@ -22,6 +26,9 @@ pub struct TieringConfig {
     /// Low water mark as percentage of threshold (0.0 to 1.0)
     /// Continue demoting until DRAM usage falls below threshold * low_water_mark
     pub low_water_mark: f64,
+
+    /// Hotness threshold: minimum access count before promotion
+    pub hotness_threshold: u64,
 }
 
 impl Default for TieringConfig {
@@ -30,6 +37,7 @@ impl Default for TieringConfig {
             dram_threshold: 1_073_741_824, // 1 GB default
             high_water_mark: 0.9,
             low_water_mark: 0.7,
+            hotness_threshold: 2, // Promote after 2 accesses
         }
     }
 }
@@ -82,13 +90,17 @@ struct ObjectTierInfo {
 /// Tiering Manager
 /// 
 /// Manages object placement between DRAM and PMEM tiers.
-/// DRAM contains hot copies of objects while PMEM is the source of truth.
+/// DRAM contains hot COPIES of objects while PMEM is the source of truth.
+/// 
+/// ## Data Copy Model
+/// Hot objects are physically copied to a DRAM cache for fast access.
+/// The PMEM tier always contains all objects (source of truth).
+/// DRAM tier contains copies of frequently accessed objects.
 /// 
 /// ## Promotion Policy
-/// Objects are promoted to DRAM after being accessed more than once (hardcoded threshold).
+/// Objects are promoted to DRAM after being accessed more than the configured threshold.
 /// This simple heuristic ensures that only objects with repeated access are promoted.
-/// Future versions may make this configurable via TieringConfig.
-pub struct TieringManager {
+pub struct TieringManager<V> {
     config: Arc<RwLock<TieringConfig>>,
     stats: Arc<RwLock<TieringStats>>,
 
@@ -97,9 +109,15 @@ pub struct TieringManager {
 
     /// Set of objects currently in DRAM (for fast lookup)
     dram_objects: Arc<RwLock<HashSet<HashedKey>>>,
+    
+    /// DRAM cache storing actual copies of hot objects
+    dram_cache: Arc<DashMap<HashedKey, Arc<V>, NoHasher>>,
 }
 
-impl TieringManager {
+impl<V> TieringManager<V>
+where
+    V: TypeSize + Clone,
+{
     /// Creates a new TieringManager with the given configuration
     pub fn new(config: TieringConfig) -> Self {
         TieringManager {
@@ -107,6 +125,7 @@ impl TieringManager {
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
+            dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
         }
     }
 
@@ -134,10 +153,12 @@ impl TieringManager {
     /// Returns true if the object should be promoted to DRAM
     /// 
     /// ## Promotion Heuristic
-    /// Objects are promoted after 2 accesses (hardcoded threshold).
-    /// First access: counted but not promoted
-    /// Second+ access: suggests promotion
+    /// Objects are promoted after reaching the configured hotness threshold.
     pub fn record_access(&self, key: HashedKey) -> bool {
+        let config = self.config.read().unwrap();
+        let hotness_threshold = config.hotness_threshold;
+        drop(config);
+
         let mut info_map = self.object_info.write().unwrap();
 
         if let Some(info) = info_map.get_mut(&key) {
@@ -148,8 +169,7 @@ impl TieringManager {
             match info.tier {
                 Tier::PmemOnly => {
                     // Check if we should promote based on access count
-                    // Simple heuristic: promote if accessed more than once
-                    info.access_count > 1
+                    info.access_count >= hotness_threshold
                 }
                 Tier::DramAndPmem => {
                     // Already in DRAM
@@ -161,9 +181,47 @@ impl TieringManager {
         }
     }
 
-    /// Promotes an object to DRAM (creates a copy in DRAM)
+    /// Promotes an object to DRAM (creates a physical copy in DRAM)
     /// Returns true if promotion was successful
-    pub fn promote_to_dram(&self, key: HashedKey) -> bool {
+    /// The value parameter is the actual object data to copy
+    pub fn promote_to_dram_with_data(&self, key: HashedKey, value: Arc<V>) -> bool {
+        let mut info_map = self.object_info.write().unwrap();
+
+        if let Some(info) = info_map.get_mut(&key) {
+            if info.tier == Tier::PmemOnly {
+                let config = self.config.read().unwrap();
+                let mut stats = self.stats.write().unwrap();
+                let new_dram_size = stats.dram_size + info.size as u64;
+
+                // Check if promotion would exceed threshold
+                if new_dram_size <= config.dram_threshold {
+                    info.tier = Tier::DramAndPmem;
+
+                    // Store actual copy in DRAM cache
+                    self.dram_cache.insert(key, value);
+
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.insert(key);
+
+                    stats.dram_size = new_dram_size;
+                    stats.dram_objects += 1;
+                    stats.pmem_only_objects -= 1;
+                    stats.promotions += 1;
+
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+    
+    /// Promotes an object to DRAM (metadata only - for tests)
+    /// Returns true if promotion was successful
+    /// Note: This only updates metadata, not actual data. Use promote_to_dram_with_data for production.
+    #[cfg(test)]
+    fn promote_to_dram(&self, key: HashedKey) -> bool {
+        // This method is only for tests that don't need actual data copies
         let mut info_map = self.object_info.write().unwrap();
 
         if let Some(info) = info_map.get_mut(&key) {
@@ -201,6 +259,9 @@ impl TieringManager {
             if info.tier == Tier::DramAndPmem {
                 info.tier = Tier::PmemOnly;
 
+                // Remove from DRAM cache
+                self.dram_cache.remove(&key);
+
                 let mut dram_objects = self.dram_objects.write().unwrap();
                 dram_objects.remove(&key);
 
@@ -216,6 +277,21 @@ impl TieringManager {
 
         false
     }
+    
+    /// Gets a value from the DRAM cache if it exists there
+    /// Returns None if the object is not in DRAM
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<V>> {
+        self.dram_cache.get(key).map(|entry| entry.value().clone())
+    }
+    
+    /// Updates the DRAM cache copy when the object is updated
+    /// Should be called whenever an object in PMEM is updated
+    pub fn update_dram_copy(&self, key: HashedKey, value: Arc<V>) {
+        // Only update if object is currently in DRAM
+        if self.is_in_dram(&key) {
+            self.dram_cache.insert(key, value);
+        }
+    }
 
     /// Checks if DRAM threshold has been exceeded and returns keys to demote
     /// Uses LRU (Least Recently Used) strategy for demotion
@@ -223,7 +299,6 @@ impl TieringManager {
         let config = self.config.read().unwrap();
         let stats = self.stats.read().unwrap();
         let high_water = (config.dram_threshold as f64 * config.high_water_mark) as u64;
-        let low_water = (config.dram_threshold as f64 * config.low_water_mark) as u64;
 
         if stats.dram_size <= high_water {
             return Vec::new();
@@ -271,6 +346,9 @@ impl TieringManager {
 
             match info.tier {
                 Tier::DramAndPmem => {
+                    // Remove from DRAM cache
+                    self.dram_cache.remove(&key);
+                    
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
@@ -305,6 +383,17 @@ impl TieringManager {
         self.config.read().unwrap().dram_threshold
     }
 
+    /// Gets the current hotness threshold
+    pub fn hotness_threshold(&self) -> u64 {
+        self.config.read().unwrap().hotness_threshold
+    }
+
+    /// Sets the hotness threshold
+    pub fn set_hotness_threshold(&self, threshold: u64) {
+        let mut config = self.config.write().unwrap();
+        config.hotness_threshold = threshold;
+    }
+
     /// Clears all tiering information (for cache wipe)
     pub fn clear(&self) {
         let mut info_map = self.object_info.write().unwrap();
@@ -312,6 +401,9 @@ impl TieringManager {
 
         let mut dram_objects = self.dram_objects.write().unwrap();
         dram_objects.clear();
+        
+        // Clear the DRAM cache
+        self.dram_cache.clear();
 
         let mut stats = self.stats.write().unwrap();
         *stats = TieringStats::default();
@@ -379,6 +471,7 @@ mod tests {
             dram_threshold: 200,
             high_water_mark: 0.9,
             low_water_mark: 0.7,
+            hotness_threshold: 1,
         };
         let manager = TieringManager::new(config);
 
@@ -416,11 +509,63 @@ mod tests {
 
         manager.register_object(1, 100);
 
-        // First access - should not promote yet
+        // First access - should not promote yet (threshold is 2)
         assert!(!manager.record_access(1));
 
         // Second access - should suggest promotion
         assert!(manager.record_access(1));
+    }
+
+    #[test]
+    fn test_configurable_hotness_threshold() {
+        let mut config = TieringConfig::default();
+        config.hotness_threshold = 3;
+        let manager = TieringManager::new(config);
+
+        manager.register_object(1, 100);
+
+        // First two accesses should not promote
+        assert!(!manager.record_access(1));
+        assert!(!manager.record_access(1));
+
+        // Third access should suggest promotion
+        assert!(manager.record_access(1));
+    }
+
+    #[test]
+    fn test_get_keys_to_demote() {
+        let config = TieringConfig {
+            dram_threshold: 300,
+            high_water_mark: 0.9,
+            low_water_mark: 0.6,
+            hotness_threshold: 1,
+        };
+        let manager = TieringManager::new(config);
+
+        // Register and promote 4 objects
+        for i in 1..=4 {
+            manager.register_object(i, 100);
+            manager.promote_to_dram(i);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // DRAM size is now 400, threshold is 300
+        // High water mark: 270, Low water mark: 180
+        // Should demote to bring below 180
+        let keys_to_demote = manager.get_keys_to_demote();
+        
+        // Should demote at least 2 objects (200 bytes)
+        assert!(keys_to_demote.len() >= 2);
+    }
+
+    #[test]
+    fn test_set_and_get_hotness_threshold() {
+        let manager = TieringManager::with_defaults();
+        
+        assert_eq!(manager.hotness_threshold(), 2);
+        
+        manager.set_hotness_threshold(5);
+        assert_eq!(manager.hotness_threshold(), 5);
     }
 }
 
