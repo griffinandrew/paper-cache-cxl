@@ -5,6 +5,19 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! Tiering Worker
+//! 
+//! This module implements the TieringWorker which integrates the TieringManager
+//! into the worker manager workflow. The worker:
+//! 
+//! - Receives WorkerEvents (Get, Set, Del, etc.) from the worker manager
+//! - Tracks object access patterns in coordination with the TieringManager
+//! - Periodically triggers promotion/demotion decisions
+//! - Maintains data consistency across both tiers
+//! 
+//! The TieringWorker runs as a background thread alongside PolicyWorker and TtlWorker,
+//! processing events in real-time and making periodic tiering decisions.
+
 use std::{
     time::Duration,
     sync::Arc,
