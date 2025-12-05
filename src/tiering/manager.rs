@@ -395,6 +395,7 @@ mod tests {
             dram_threshold: 200,
             high_water_mark: 0.9,
             low_water_mark: 0.7,
+            hotness_threshold: 1,
         };
         let manager = TieringManager::new(config);
 
@@ -432,11 +433,63 @@ mod tests {
 
         manager.register_object(1, 100);
 
-        // First access - should not promote yet
+        // First access - should not promote yet (threshold is 2)
         assert!(!manager.record_access(1));
 
         // Second access - should suggest promotion
         assert!(manager.record_access(1));
+    }
+
+    #[test]
+    fn test_configurable_hotness_threshold() {
+        let mut config = TieringConfig::default();
+        config.hotness_threshold = 3;
+        let manager = TieringManager::new(config);
+
+        manager.register_object(1, 100);
+
+        // First two accesses should not promote
+        assert!(!manager.record_access(1));
+        assert!(!manager.record_access(1));
+
+        // Third access should suggest promotion
+        assert!(manager.record_access(1));
+    }
+
+    #[test]
+    fn test_get_keys_to_demote() {
+        let config = TieringConfig {
+            dram_threshold: 300,
+            high_water_mark: 0.9,
+            low_water_mark: 0.6,
+            hotness_threshold: 1,
+        };
+        let manager = TieringManager::new(config);
+
+        // Register and promote 4 objects
+        for i in 1..=4 {
+            manager.register_object(i, 100);
+            manager.promote_to_dram(i);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // DRAM size is now 400, threshold is 300
+        // High water mark: 270, Low water mark: 180
+        // Should demote to bring below 180
+        let keys_to_demote = manager.get_keys_to_demote();
+        
+        // Should demote at least 2 objects (200 bytes)
+        assert!(keys_to_demote.len() >= 2);
+    }
+
+    #[test]
+    fn test_set_and_get_hotness_threshold() {
+        let manager = TieringManager::with_defaults();
+        
+        assert_eq!(manager.hotness_threshold(), 2);
+        
+        manager.set_hotness_threshold(5);
+        assert_eq!(manager.hotness_threshold(), 5);
     }
 }
 
