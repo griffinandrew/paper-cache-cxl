@@ -61,6 +61,9 @@ const LONG_POLLING_DURATION: Duration = Duration::from_secs(1);
 // DRAM tier ratio: what fraction of cache objects can be in DRAM
 const DRAM_TIER_RATIO: f64 = 0.2; // 20% of objects can be in DRAM
 
+// Maximum number of eviction candidates to search when looking for a cold DRAM object
+const MAX_EVICTION_SEARCH_DEPTH: usize = 100;
+
 pub struct PolicyWorker<K, V> {
 	listener: Receiver<WorkerEvent>,
 
@@ -341,7 +344,6 @@ where
 		if let Some(stack) = &mut self.policy_stack {
 			// Use the eviction stack to find the least recently used object in DRAM
 			// We need to find an object that is in DRAM and can be evicted
-			// For simplicity, we'll evict based on the eviction stack order
 			
 			// Try to find a cold object in DRAM to evict
 			let mut eviction_candidate = None;
@@ -351,17 +353,17 @@ where
 			while let Some(key) = stack.evict_one() {
 				if self.tiering_manager.is_in_dram(key) {
 					eviction_candidate = Some(key);
-					// Put back the keys we pulled out
+					// Put back the keys we pulled out (size doesn't matter for reinsertion)
 					for k in temp_evictions.iter().rev() {
-						stack.insert(*k, 0); // Size doesn't matter for reinsertion
+						stack.insert(*k, 0);
 					}
 					break;
 				}
 				temp_evictions.push(key);
 				
-				// Don't search forever
-				if temp_evictions.len() > 100 {
-					// Put everything back
+				// Don't search forever - limit to MAX_EVICTION_SEARCH_DEPTH
+				if temp_evictions.len() > MAX_EVICTION_SEARCH_DEPTH {
+					// Put everything back (size doesn't matter for reinsertion)
 					for k in temp_evictions.iter().rev() {
 						stack.insert(*k, 0);
 					}

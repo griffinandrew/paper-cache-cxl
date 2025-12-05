@@ -6,7 +6,12 @@ use std::env;
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rustc-link-lib=umf");
-    println!("cargo:rustc-link-search=native=/home/griffin/libs/unified-memory-framework/lib");
+    
+    // Allow UMF library path to be configured via environment variable
+    let umf_lib_path = env::var("UMF_LIB_PATH")
+        .unwrap_or_else(|_| "/home/griffin/libs/unified-memory-framework/lib".to_string());
+    println!("cargo:rustc-link-search=native={}", umf_lib_path);
+    
     println!("cargo:rustc-link-lib=umf_allocator");
 
 
@@ -38,18 +43,23 @@ fn main() {
     println!("DONE");
 
     // Only try to compile the C code if UMF headers are available
-    // Check if we can find the UMF header
-    let umf_header_path = PathBuf::from("/home/griffin/libs/unified-memory-framework/include/umf/providers/provider_devdax_memory.h");
+    // Allow UMF include path to be configured via environment variable
+    let umf_include_path = env::var("UMF_INCLUDE_PATH")
+        .unwrap_or_else(|_| "/home/griffin/libs/unified-memory-framework/include".to_string());
+    let umf_header_path = PathBuf::from(&umf_include_path)
+        .join("umf/providers/provider_devdax_memory.h");
+    
     if umf_header_path.exists() {
         cc::Build::new()
             .file("umf_allocator/umf_allocator_wrapper.c")
             .include("umf_allocator")
-            .include("/home/griffin/libs/unified-memory-framework/include")
+            .include(&umf_include_path)
             .compile("umf_allocator"); 
 
         println!("Compiled umf_allocator.c");
     } else {
-        println!("cargo:warning=UMF headers not found, skipping C compilation. This is expected in CI/test environments.");
+        println!("cargo:warning=UMF headers not found at {}, skipping C compilation. This is expected in CI/test environments.", umf_include_path);
+        println!("cargo:warning=Set UMF_INCLUDE_PATH environment variable to specify UMF header location.");
         println!("Skipping C compilation");
     }
 }

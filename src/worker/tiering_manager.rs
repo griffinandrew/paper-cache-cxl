@@ -95,8 +95,7 @@ impl TieringManager {
 
     /// Update DRAM capacity based on cache size
     pub fn update_capacity(&self, cache_size: CacheSize, ratio: f64) {
-        let new_capacity = ((cache_size as f64) * ratio) as usize;
-        let new_capacity = new_capacity.max(1);
+        let new_capacity = (((cache_size as f64) * ratio) as usize).max(1);
         *self.dram_capacity.write() = new_capacity;
         
         // Update prefer_dram based on current fill ratio
