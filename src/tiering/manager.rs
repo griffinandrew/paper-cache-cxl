@@ -216,11 +216,12 @@ where
         false
     }
     
-    /// Promotes an object to DRAM (legacy method for backward compatibility)
+    /// Promotes an object to DRAM (metadata only - for tests)
     /// Returns true if promotion was successful
-    pub fn promote_to_dram(&self, key: HashedKey) -> bool {
-        // This method is kept for backward compatibility but doesn't copy data
-        // The actual data copy should be done via promote_to_dram_with_data
+    /// Note: This only updates metadata, not actual data. Use promote_to_dram_with_data for production.
+    #[cfg(test)]
+    fn promote_to_dram(&self, key: HashedKey) -> bool {
+        // This method is only for tests that don't need actual data copies
         let mut info_map = self.object_info.write().unwrap();
 
         if let Some(info) = info_map.get_mut(&key) {

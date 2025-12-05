@@ -946,10 +946,7 @@ where
 				// object.data() returns Arc<Box<[u8]>>
 				// We need to clone the actual byte slice into a Vec
 				let arc_val = object.data();
-				arc_val.as_ref().to_vec();
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().to_vec().clone());
-
-				Ok(arc_val.as_ref().to_vec().clone())
+				Ok(arc_val.as_ref().to_vec())
 			},
 
 			_ => {
