@@ -3,9 +3,13 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use dashmap::DashMap;
+use typesize::TypeSize;
+
 use crate::{
     HashedKey,
     object::ObjectSize,
+    NoHasher,
 };
 
 /// Configuration for the tiering manager
@@ -86,13 +90,17 @@ struct ObjectTierInfo {
 /// Tiering Manager
 /// 
 /// Manages object placement between DRAM and PMEM tiers.
-/// DRAM contains hot copies of objects while PMEM is the source of truth.
+/// DRAM contains hot COPIES of objects while PMEM is the source of truth.
+/// 
+/// ## Data Copy Model
+/// Hot objects are physically copied to a DRAM cache for fast access.
+/// The PMEM tier always contains all objects (source of truth).
+/// DRAM tier contains copies of frequently accessed objects.
 /// 
 /// ## Promotion Policy
-/// Objects are promoted to DRAM after being accessed more than once (hardcoded threshold).
+/// Objects are promoted to DRAM after being accessed more than the configured threshold.
 /// This simple heuristic ensures that only objects with repeated access are promoted.
-/// Future versions may make this configurable via TieringConfig.
-pub struct TieringManager {
+pub struct TieringManager<V> {
     config: Arc<RwLock<TieringConfig>>,
     stats: Arc<RwLock<TieringStats>>,
 
@@ -101,9 +109,15 @@ pub struct TieringManager {
 
     /// Set of objects currently in DRAM (for fast lookup)
     dram_objects: Arc<RwLock<HashSet<HashedKey>>>,
+    
+    /// DRAM cache storing actual copies of hot objects
+    dram_cache: Arc<DashMap<HashedKey, Arc<V>, NoHasher>>,
 }
 
-impl TieringManager {
+impl<V> TieringManager<V>
+where
+    V: TypeSize + Clone,
+{
     /// Creates a new TieringManager with the given configuration
     pub fn new(config: TieringConfig) -> Self {
         TieringManager {
@@ -111,6 +125,7 @@ impl TieringManager {
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
+            dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
         }
     }
 
@@ -166,9 +181,46 @@ impl TieringManager {
         }
     }
 
-    /// Promotes an object to DRAM (creates a copy in DRAM)
+    /// Promotes an object to DRAM (creates a physical copy in DRAM)
+    /// Returns true if promotion was successful
+    /// The value parameter is the actual object data to copy
+    pub fn promote_to_dram_with_data(&self, key: HashedKey, value: Arc<V>) -> bool {
+        let mut info_map = self.object_info.write().unwrap();
+
+        if let Some(info) = info_map.get_mut(&key) {
+            if info.tier == Tier::PmemOnly {
+                let config = self.config.read().unwrap();
+                let mut stats = self.stats.write().unwrap();
+                let new_dram_size = stats.dram_size + info.size as u64;
+
+                // Check if promotion would exceed threshold
+                if new_dram_size <= config.dram_threshold {
+                    info.tier = Tier::DramAndPmem;
+
+                    // Store actual copy in DRAM cache
+                    self.dram_cache.insert(key, value);
+
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.insert(key);
+
+                    stats.dram_size = new_dram_size;
+                    stats.dram_objects += 1;
+                    stats.pmem_only_objects -= 1;
+                    stats.promotions += 1;
+
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+    
+    /// Promotes an object to DRAM (legacy method for backward compatibility)
     /// Returns true if promotion was successful
     pub fn promote_to_dram(&self, key: HashedKey) -> bool {
+        // This method is kept for backward compatibility but doesn't copy data
+        // The actual data copy should be done via promote_to_dram_with_data
         let mut info_map = self.object_info.write().unwrap();
 
         if let Some(info) = info_map.get_mut(&key) {
@@ -206,6 +258,9 @@ impl TieringManager {
             if info.tier == Tier::DramAndPmem {
                 info.tier = Tier::PmemOnly;
 
+                // Remove from DRAM cache
+                self.dram_cache.remove(&key);
+
                 let mut dram_objects = self.dram_objects.write().unwrap();
                 dram_objects.remove(&key);
 
@@ -220,6 +275,21 @@ impl TieringManager {
         }
 
         false
+    }
+    
+    /// Gets a value from the DRAM cache if it exists there
+    /// Returns None if the object is not in DRAM
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<V>> {
+        self.dram_cache.get(key).map(|entry| entry.value().clone())
+    }
+    
+    /// Updates the DRAM cache copy when the object is updated
+    /// Should be called whenever an object in PMEM is updated
+    pub fn update_dram_copy(&self, key: HashedKey, value: Arc<V>) {
+        // Only update if object is currently in DRAM
+        if self.is_in_dram(&key) {
+            self.dram_cache.insert(key, value);
+        }
     }
 
     /// Checks if DRAM threshold has been exceeded and returns keys to demote
@@ -275,6 +345,9 @@ impl TieringManager {
 
             match info.tier {
                 Tier::DramAndPmem => {
+                    // Remove from DRAM cache
+                    self.dram_cache.remove(&key);
+                    
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
@@ -327,6 +400,9 @@ impl TieringManager {
 
         let mut dram_objects = self.dram_objects.write().unwrap();
         dram_objects.clear();
+        
+        // Clear the DRAM cache
+        self.dram_cache.clear();
 
         let mut stats = self.stats.write().unwrap();
         *stats = TieringStats::default();

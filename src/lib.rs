@@ -117,7 +117,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 
 	worker_manager: Arc<WorkerSender>,
 	overhead_manager: OverheadManagerRef,
-	tiering_manager: Arc<TieringManager>,
+	tiering_manager: Arc<TieringManager<V>>,
 
 	hasher: S,
 }
@@ -932,6 +932,14 @@ where
 	{
 		let hashed_key = self.hash_key(key);
 
+		// First check DRAM cache for hot objects
+		if let Some(dram_value) = self.tiering_manager.get_from_dram(&hashed_key) {
+			self.status.incr_hits();
+			self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+			return Ok(dram_value.as_ref().to_vec());
+		}
+
+		// Fall back to PMEM (main cache)
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();

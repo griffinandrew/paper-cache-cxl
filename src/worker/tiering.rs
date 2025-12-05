@@ -45,27 +45,26 @@ const TIERING_INTERVAL: Duration = Duration::from_secs(5);
 pub struct TieringWorker<K, V> {
     listener: Receiver<WorkerEvent>,
     
-    #[allow(dead_code)]
     objects: ObjectMapRef<K, V>,
     #[allow(dead_code)]
     status: StatusRef,
     #[allow(dead_code)]
     overhead_manager: OverheadManagerRef,
     
-    tiering_manager: Arc<TieringManager>,
+    tiering_manager: Arc<TieringManager<V>>,
 }
 
 impl<K, V> TieringWorker<K, V>
 where
     K: 'static + Eq + TypeSize,
-    V: 'static + TypeSize,
+    V: 'static + TypeSize + Clone,
 {
     pub fn new(
         listener: Receiver<WorkerEvent>,
         objects: ObjectMapRef<K, V>,
         status: StatusRef,
         overhead_manager: OverheadManagerRef,
-        tiering_manager: Arc<TieringManager>,
+        tiering_manager: Arc<TieringManager<V>>,
     ) -> Self {
         TieringWorker {
             listener,
@@ -83,9 +82,12 @@ where
                 if hit {
                     // Record access and check if we should promote
                     if self.tiering_manager.record_access(hashed_key) {
-                        // Object should be promoted to DRAM
-                        if self.tiering_manager.promote_to_dram(hashed_key) {
-                            debug!("Promoted object {} to DRAM", hashed_key);
+                        // Object should be promoted to DRAM - copy the actual data
+                        if let Some(object) = self.objects.get(&hashed_key) {
+                            let value = object.data();
+                            if self.tiering_manager.promote_to_dram_with_data(hashed_key, value) {
+                                debug!("Promoted object {} to DRAM with data copy", hashed_key);
+                            }
                         }
                     }
                 }
@@ -95,17 +97,22 @@ where
                 if old_object_info.is_none() {
                     // New object - register it in PMEM tier
                     self.tiering_manager.register_object(hashed_key, base_size);
+                } else {
+                    // Object updated - update DRAM copy if it exists
+                    if let Some(object) = self.objects.get(&hashed_key) {
+                        let value = object.data();
+                        self.tiering_manager.update_dram_copy(hashed_key, value);
+                    }
                 }
-                // For updates, the object is already tracked; no need to re-register
             }
             
             WorkerEvent::Del(hashed_key, _expiry) => {
-                // Remove object from tiering tracking
+                // Remove object from tiering tracking (this also removes from DRAM cache)
                 self.tiering_manager.remove_object(hashed_key);
             }
             
             WorkerEvent::Wipe => {
-                // Clear all tiering information
+                // Clear all tiering information (including DRAM cache)
                 self.tiering_manager.clear();
             }
             
@@ -141,7 +148,7 @@ impl<K, V> Worker for TieringWorker<K, V>
 where
     Self: 'static + Send,
     K: Eq + TypeSize,
-    V: TypeSize,
+    V: TypeSize + Clone,
 {
     fn run(&mut self) -> Result<(), CacheError> {
         let mut last_periodic = std::time::Instant::now();

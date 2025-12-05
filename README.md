@@ -6,13 +6,14 @@ Note: this crate should not be used directly; please use the paper-server crate 
 
 ## Tiering Manager
 
-The tiering manager provides a two-tier caching architecture:
-- **Far Tier (PMEM)**: All objects are stored in persistent memory by default
-- **Near Tier (DRAM)**: Hot objects are promoted to DRAM for faster access
+The tiering manager provides a two-tier caching architecture with **actual data copies**:
+- **Far Tier (PMEM)**: All objects are stored in persistent memory by default (source of truth)
+- **Near Tier (DRAM)**: Hot objects are **physically copied** to DRAM for faster access
 
 ### Features
 
-- **Automatic Promotion**: Objects accessed frequently are automatically promoted to DRAM
+- **Automatic Promotion with Data Copying**: Objects accessed frequently are automatically **copied** to DRAM
+- **Two-Tier Reads**: Get operations check DRAM cache first, then fall back to PMEM
 - **Configurable Thresholds**: 
   - DRAM capacity (default: 20% of cache size)
   - Hotness threshold (default: 2 accesses before promotion)
@@ -47,11 +48,20 @@ cache.set_hotness_threshold(3);  // Promote after 3 accesses
 
 1. **Object Storage**: All objects are initially stored in PMEM (far tier)
 2. **Access Tracking**: Each `get()` operation increments the object's access count
-3. **Promotion**: When an object's access count reaches the hotness threshold, it's copied to DRAM
-4. **Eviction**: When DRAM reaches capacity, the least recently used objects are demoted back to PMEM only
-5. **Consistency**: All updates happen to both tiers; deletions remove from both tiers
+3. **Promotion with Data Copy**: When an object's access count reaches the hotness threshold, its data is **physically copied** to a DRAM cache
+4. **Fast Reads**: Subsequent `get()` operations check the DRAM cache first for hot objects, providing faster access
+5. **Eviction**: When DRAM reaches capacity, the least recently used objects are demoted (DRAM copies removed, PMEM copies retained)
+6. **Consistency**: All updates write to PMEM and update DRAM copies if they exist; deletions remove from both tiers
 
 ### Background Workers
 
 The tiering manager runs as a worker thread alongside the policy and TTL workers, processing events from the cache and making promotion/demotion decisions periodically (every 5 seconds).
+
+### Data Copy Model
+
+Unlike simple metadata tracking, this implementation maintains **two physical copies** of hot objects:
+- **PMEM copy**: Always exists, serves as source of truth
+- **DRAM copy**: Created on promotion, provides fast access, removed on demotion
+
+This ensures hot objects benefit from DRAM speed while maintaining data durability in PMEM.
 
