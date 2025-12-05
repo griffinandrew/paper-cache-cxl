@@ -64,7 +64,7 @@ impl WorkerManager {
 	) -> Result<Self, CacheError>
 	where
 		K: 'static + Eq + TypeSize,
-		V: 'static + TypeSize + Clone,
+		V: 'static + TypeSize + Clone + AsRef<[u8]>,
 	{
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();
