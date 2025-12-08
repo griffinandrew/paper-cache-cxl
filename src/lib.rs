@@ -1591,6 +1591,7 @@ where
 				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
 				let arc_val = dram_object_ref.data();
 				println!("CACHE: get for key {:?} from DRAM tier", key);
+				println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
 				return Ok(arc_val.as_ref().to_vec());
 			}
 		}
