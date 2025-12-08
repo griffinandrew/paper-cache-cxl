@@ -1591,6 +1591,7 @@ where
 		if let Some(dram_value) = self.tiering_manager.get_from_dram(&hashed_key) {
 			self.status.incr_hits();
 			self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+			println!("CACHE: get for key {:?} from DRAM tier: {:?}", key, dram_value);
 			return Ok(dram_value.to_vec());
 		}
 
