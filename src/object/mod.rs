@@ -41,6 +41,15 @@ impl<K, V> Object<K, V> {
 		}
 	}
 
+	/// Create a new Object with an explicit expiry time
+	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self {
+		Object {
+			key,
+			data: Arc::new(data),
+			expiry,
+		}
+	}
+
 	pub fn data(&self) -> Arc<V> {
 		self.data.clone()
 	}

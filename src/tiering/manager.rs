@@ -116,8 +116,9 @@ pub struct TieringManager<K, V> {
     /// Set of objects currently in DRAM (for fast lookup)
     dram_objects: Arc<RwLock<HashSet<HashedKey>>>,
     
-    /// DRAM cache storing Object<K, V> instances using the same structure as the main cache
-    dram_cache: Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>,
+    /// DRAM cache storing Object<K, Box<[u8]>> instances with physically allocated DRAM data
+    /// Uses the same Object structure as main cache but with DRAM-allocated Box<[u8]> instead of V
+    dram_cache: Arc<DashMap<HashedKey, Object<K, Box<[u8]>>, NoHasher>>,
     
     _phantom: std::marker::PhantomData<(K, V)>,
 }
@@ -194,10 +195,13 @@ where
         }
     }
 
-    /// Promotes an object to DRAM by storing a copy of the Object
+    /// Promotes an object to DRAM by creating a physical copy with DRAM-allocated data
     /// Returns true if promotion was successful
     /// The object parameter is the Object from the main cache to copy to DRAM
-    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool {
+    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
+    where
+        V: AsRef<[u8]>,
+    {
         let mut info_map = self.object_info.write().unwrap();
 
         if let Some(info) = info_map.get_mut(&key) {
@@ -210,9 +214,14 @@ where
                 if new_dram_size <= config.dram_threshold {
                     info.tier = Tier::DramAndPmem;
 
-                    // Clone the Object for the DRAM cache
-                    // This creates a new Object structure with the same Arc<V> data
-                    let dram_object = object.clone();
+                    // Physically copy data to DRAM:
+                    // 1. Extract bytes from the source (which may be PMEM-allocated)
+                    let source_data = object.data();
+                    let bytes: &[u8] = source_data.as_ref().as_ref();
+                    // 2. Create a new DRAM-allocated Box<[u8]>
+                    let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
+                    // 3. Create a new Object with cloned key, DRAM-allocated data, and same expiry
+                    let dram_object = Object::with_expiry(object.key().clone(), dram_data, object.expiry());
                     
                     // Store the Object in the DRAM cache
                     self.dram_cache.insert(key, dram_object);
@@ -297,19 +306,26 @@ where
     }
     
     /// Gets an Object from the DRAM cache if it exists there
-    /// Returns a reference to the Object stored in DRAM
-    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = Object<K, V>> + '_> {
+    /// Returns a reference to the Object<K, Box<[u8]>> stored in DRAM
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = Object<K, Box<[u8]>>> + '_> {
         self.dram_cache.get(key)
     }
     
     /// Updates the DRAM cache when an object is updated
     /// Should be called whenever an object in PMEM is updated
-    /// This updates the Object in the DRAM cache with the updated Object
-    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) {
+    /// This creates a new physical copy with DRAM-allocated data
+    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
+    where
+        V: AsRef<[u8]>,
+    {
         // Only update if object is currently in DRAM
         if self.is_in_dram(&key) {
-            // Clone the updated Object for the DRAM cache
-            let updated_object = object.clone();
+            // Physically copy data to DRAM
+            let source_data = object.data();
+            let bytes: &[u8] = source_data.as_ref().as_ref();
+            let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
+            // Create new Object with DRAM-allocated data and same expiry
+            let updated_object = Object::with_expiry(object.key().clone(), dram_data, object.expiry());
             self.dram_cache.insert(key, updated_object);
         }
     }

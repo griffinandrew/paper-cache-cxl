@@ -57,7 +57,7 @@ pub struct TieringWorker<K, V> {
 impl<K, V> TieringWorker<K, V>
 where
     K: 'static + Eq + TypeSize + Clone,
-    V: 'static + TypeSize + Clone,
+    V: 'static + TypeSize + Clone + AsRef<[u8]>,
 {
     pub fn new(
         listener: Receiver<WorkerEvent>,
@@ -146,7 +146,7 @@ impl<K, V> Worker for TieringWorker<K, V>
 where
     Self: 'static + Send,
     K: Eq + TypeSize + Clone,
-    V: TypeSize + Clone,
+    V: TypeSize + Clone + AsRef<[u8]>,
 {
     fn run(&mut self) -> Result<(), CacheError> {
         let mut last_periodic = std::time::Instant::now();
