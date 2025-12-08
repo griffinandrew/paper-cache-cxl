@@ -1598,10 +1598,10 @@ where
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
-				// object.data() returns an Arc<V, Hybrid> — clone the inner V and return it
+				// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
 				let arc_val = object.data();
 				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				Ok(arc_val.as_ref().to_vec().clone())
+				Ok(arc_val.as_ref().to_vec())
 			},
 
 			_ => {
