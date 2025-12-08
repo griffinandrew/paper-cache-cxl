@@ -27,6 +27,9 @@ impl typesize::TypeSize for BufferPMEM {
     }
 }
 
+#[cfg(feature = "allocator_api")]
+use crate::tiering::manager::Tier;
+
 mod error;
 mod worker;
 mod object;
@@ -1586,6 +1589,17 @@ where
 	{
 		let hashed_key = self.hash_key(key);
 		//println!("CACHE: get called");
+
+		// tiered implementation - data may be in DRAM or PMEM
+
+		let is_dram = self.tiering_manager.get_from_dram(&hashed_key);
+		if Some(is_dram.clone()).is_some() { 
+			//Ok(is_dram);
+			self.broadcast(WorkerEvent::Get(hashed_key, is_dram.is_some()))?;
+			return Ok(is_dram.as_ref().expect("REASON").to_vec().clone());
+		}
+
+		
 
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
