@@ -1586,17 +1586,13 @@ where
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
 	{
 		let hashed_key = self.hash_key(key);
-
 		// Check DRAM tier first
-		let dram_value = match self.tiering_manager.get_from_dram(&hashed_key) {
-			Some(dram_value) if !dram_value.is_expired() && dram_value.key_matches(key) => {
+		if let Some(dram_value) = self.tiering_manager.get_from_dram(&hashed_key) {
 			self.status.incr_hits();
 			self.broadcast(WorkerEvent::Get(hashed_key, true))?;
 			println!("CACHE: get for key {:?} from DRAM tier: {:?}", key, dram_value);
 			return Ok(dram_value.to_vec());
-			},
-			_ => {}
-		};
+		}
 
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
