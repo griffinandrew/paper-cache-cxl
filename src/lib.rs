@@ -246,8 +246,8 @@ where
 			// Create tiering manager with default DRAM threshold at 20% of max_size
 			let mut tiering_config = tiering::TieringConfig::default();
 			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
-			Arc::new(TieringManager::new(tiering_config))
 			println!("Created tiering manager with DRAM threshold: {}", tiering_config.dram_threshold);
+			Arc::new(TieringManager::new(tiering_config))
 		};
 
 		let (worker_sender, worker_listener) = unbounded();
