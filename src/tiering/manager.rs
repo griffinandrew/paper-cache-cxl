@@ -193,6 +193,7 @@ where
     where
         V: AsRef<[u8]>,
     {
+        println!("Promoting object {:?} to DRAM", key);
         let mut info_map = self.object_info.write().unwrap();
 
         if let Some(info) = info_map.get_mut(&key) {
