@@ -202,7 +202,7 @@ where
     where
         V: AsRef<[u8]>,
     {
-        println!("Promoting object {:?} to DRAM", key);
+        //println!("Promoting object {:?} to DRAM", key);
         let mut info_map = self.object_info.write().unwrap();
 
         if let Some(info) = info_map.get_mut(&key) {
@@ -289,7 +289,7 @@ where
         if let Some(info) = info_map.get_mut(&key) {
             if info.tier == Tier::DramAndPmem {
                 info.tier = Tier::PmemOnly;
-                println!("Demoting object {:?} from DRAM", key);
+                //println!("Demoting object {:?} from DRAM", key);
 
                 // Remove from DRAM cache
                 self.dram_cache.remove(&key);
