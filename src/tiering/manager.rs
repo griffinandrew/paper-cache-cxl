@@ -297,7 +297,7 @@ where
         if let Some(info) = info_map.get_mut(&key) {
             if info.tier == Tier::DramAndPmem {
                 info.tier = Tier::PmemOnly;
-                //println!("Demoting object {:?} from DRAM", key);
+                println!("Demoting object {:?} from DRAM", key);
 
                 // Remove from DRAM cache
                 self.dram_cache.remove(&key);
