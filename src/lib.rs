@@ -1378,7 +1378,7 @@ self.tiering_manager.dram_threshold()
 #[cfg(feature = "allocator_api")]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
-    K: 'static + Eq + Hash + TypeSize,
+    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug, //note added Debug for logging might impact perf thoooo
     S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` with maximum size `max_size` and
