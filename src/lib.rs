@@ -247,6 +247,7 @@ where
 			let mut tiering_config = tiering::TieringConfig::default();
 			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
 			Arc::new(TieringManager::new(tiering_config))
+			println!("Created tiering manager with DRAM threshold: {}", tiering_config.dram_threshold);
 		};
 
 		let (worker_sender, worker_listener) = unbounded();
@@ -702,20 +703,20 @@ where
 #[cfg(feature = "allocator_api")]
 /// Gets tiering statistics including objects in DRAM, promotions, and demotions.
 	pub fn tiering_stats(&self) -> tiering::TieringStats {
-self.tiering_manager.stats()
-}
+		self.tiering_manager.stats()
+	}
 
 #[cfg(feature = "allocator_api")]
 /// Sets the DRAM tier threshold in bytes.
 	pub fn set_dram_threshold(&self, threshold: u64) {
-self.tiering_manager.set_dram_threshold(threshold);
-}
+		self.tiering_manager.set_dram_threshold(threshold);
+	}
 
 #[cfg(feature = "allocator_api")]
 /// Gets the current DRAM tier threshold in bytes.
 	pub fn dram_threshold(&self) -> u64 {
-self.tiering_manager.dram_threshold()
-}
+		self.tiering_manager.dram_threshold()
+	}
 
 #[cfg(feature = "allocator_api")]
 	/// Sets the hotness threshold for promotion to DRAM.
