@@ -43,7 +43,7 @@ impl Default for TieringConfig {
             dram_threshold: 50 * 1024 * 1024 , // 100 MB default
             high_water_mark: 0.9,
             low_water_mark: 0.7,
-            hotness_threshold: 2, // Promote after 2 accesses
+            hotness_threshold: 1, // Promote after 2 accesses
         }
     }
 }
