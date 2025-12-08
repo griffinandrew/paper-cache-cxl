@@ -224,11 +224,11 @@ where
                     // 2. Create a new DRAM-allocated Vec and Box
                     let dram_copy: Box<[u8]> = bytes.to_vec().into_boxed_slice();
                     // 3. Store the DRAM copy in the cache
-                    println!("Inserting DRAM copy for object {:?}, size {}", key, dram_copy.len());
-                    println!("Current DRAM size before promotion: {}", stats.dram_size);
-                    println!("New DRAM size after promotion: {}", new_dram_size);
-                    println!("Inserting DRAM copy for object {:?}", key);
-                    println!("value as_ref() length: {}", bytes.len());
+                    //println!("Inserting DRAM copy for object {:?}, size {}", key, dram_copy.len());
+                    //println!("Current DRAM size before promotion: {}", stats.dram_size);
+                    //println!("New DRAM size after promotion: {}", new_dram_size);
+                    //println!("Inserting DRAM copy for object {:?}", key);
+                    //println!("value as_ref() length: {}", bytes.len());
                     self.dram_cache.insert(key, Arc::new(dram_copy));
 
                     let mut dram_objects = self.dram_objects.write().unwrap();

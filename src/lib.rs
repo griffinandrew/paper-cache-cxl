@@ -1584,22 +1584,15 @@ where
 	
 
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
-	//where
-		//V: Deref<Target = [u8]> + Clone, // Clone so we can return an owned V cloned from the Arc
 	{
 		let hashed_key = self.hash_key(key);
-		//println!("CACHE: get called");
 
-		// tiered implementation - data may be in DRAM or PMEM
-
-		let is_dram = self.tiering_manager.get_from_dram(&hashed_key);
-		if Some(is_dram.clone()).is_some() { 
-			//Ok(is_dram);
-			self.broadcast(WorkerEvent::Get(hashed_key, is_dram.is_some()))?;
-			return Ok(is_dram.as_ref().expect("REASON").to_vec().clone());
+		// Check DRAM tier first
+		if let Some(dram_value) = self.tiering_manager.get_from_dram(&hashed_key) {
+			self.status.incr_hits();
+			self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+			return Ok(dram_value.to_vec());
 		}
-
-		
 
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
