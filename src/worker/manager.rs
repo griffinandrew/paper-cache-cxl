@@ -60,11 +60,11 @@ impl WorkerManager {
 		objects: &ObjectMapRef<K, V>,
 		status: &StatusRef,
 		overhead_manager: &OverheadManagerRef,
-		tiering_manager: &Arc<TieringManager<V>>,
+		tiering_manager: &Arc<TieringManager<K, V>>,
 	) -> Result<Self, CacheError>
 	where
-		K: 'static + Eq + TypeSize,
-		V: 'static + TypeSize + Clone + AsRef<[u8]>,
+		K: 'static + Eq + TypeSize + Clone,
+		V: 'static + TypeSize + Clone,
 	{
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();

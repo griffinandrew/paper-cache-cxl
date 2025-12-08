@@ -51,20 +51,20 @@ pub struct TieringWorker<K, V> {
     #[allow(dead_code)]
     overhead_manager: OverheadManagerRef,
     
-    tiering_manager: Arc<TieringManager<V>>,
+    tiering_manager: Arc<TieringManager<K, V>>,
 }
 
 impl<K, V> TieringWorker<K, V>
 where
-    K: 'static + Eq + TypeSize,
-    V: 'static + TypeSize + Clone + AsRef<[u8]>,
+    K: 'static + Eq + TypeSize + Clone,
+    V: 'static + TypeSize + Clone,
 {
     pub fn new(
         listener: Receiver<WorkerEvent>,
         objects: ObjectMapRef<K, V>,
         status: StatusRef,
         overhead_manager: OverheadManagerRef,
-        tiering_manager: Arc<TieringManager<V>>,
+        tiering_manager: Arc<TieringManager<K, V>>,
     ) -> Self {
         TieringWorker {
             listener,
@@ -82,11 +82,10 @@ where
                 if hit {
                     // Record access and check if we should promote
                     if self.tiering_manager.record_access(hashed_key) {
-                        // Object should be promoted to DRAM - copy the actual data
-                        if let Some(object) = self.objects.get(&hashed_key) {
-                            let value = object.data();
-                            if self.tiering_manager.promote_to_dram_with_data(hashed_key, value) {
-                                debug!("Promoted object {} to DRAM with data copy", hashed_key);
+                        // Object should be promoted to DRAM - copy the Object
+                        if let Some(object_ref) = self.objects.get(&hashed_key) {
+                            if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
+                                debug!("Promoted object {} to DRAM", hashed_key);
                             }
                         }
                     }
@@ -99,9 +98,8 @@ where
                     self.tiering_manager.register_object(hashed_key, base_size);
                 } else {
                     // Object updated - update DRAM copy if it exists
-                    if let Some(object) = self.objects.get(&hashed_key) {
-                        let value = object.data();
-                        self.tiering_manager.update_dram_copy(hashed_key, value);
+                    if let Some(object_ref) = self.objects.get(&hashed_key) {
+                        self.tiering_manager.update_dram_copy(hashed_key, &*object_ref);
                     }
                 }
             }
@@ -147,8 +145,8 @@ where
 impl<K, V> Worker for TieringWorker<K, V>
 where
     Self: 'static + Send,
-    K: Eq + TypeSize,
-    V: TypeSize + Clone + AsRef<[u8]>,
+    K: Eq + TypeSize + Clone,
+    V: TypeSize + Clone,
 {
     fn run(&mut self) -> Result<(), CacheError> {
         let mut last_periodic = std::time::Instant::now();

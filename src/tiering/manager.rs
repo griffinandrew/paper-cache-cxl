@@ -8,7 +8,7 @@ use typesize::TypeSize;
 
 use crate::{
     HashedKey,
-    object::ObjectSize,
+    object::{Object, ObjectSize},
     NoHasher,
 };
 
@@ -106,7 +106,7 @@ struct ObjectTierInfo {
 /// ## Promotion Policy
 /// Objects are promoted to DRAM after being accessed more than the configured threshold.
 /// This simple heuristic ensures that only objects with repeated access are promoted.
-pub struct TieringManager<V> {
+pub struct TieringManager<K, V> {
     config: Arc<RwLock<TieringConfig>>,
     stats: Arc<RwLock<TieringStats>>,
 
@@ -116,15 +116,15 @@ pub struct TieringManager<V> {
     /// Set of objects currently in DRAM (for fast lookup)
     dram_objects: Arc<RwLock<HashSet<HashedKey>>>,
     
-    /// DRAM cache storing actual DRAM-allocated copies of hot object data
-    /// Stores Box<[u8]> which is DRAM-allocated, not the original V type
-    dram_cache: Arc<DashMap<HashedKey, Arc<Box<[u8]>>, NoHasher>>,
+    /// DRAM cache storing Object<K, V> instances using the same structure as the main cache
+    dram_cache: Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>,
     
-    _phantom: std::marker::PhantomData<V>,
+    _phantom: std::marker::PhantomData<(K, V)>,
 }
 
-impl<V> TieringManager<V>
+impl<K, V> TieringManager<K, V>
 where
+    K: TypeSize + Clone,
     V: TypeSize + Clone,
 {
     /// Creates a new TieringManager with the given configuration
@@ -194,15 +194,10 @@ where
         }
     }
 
-    /// Promotes an object to DRAM (creates a physical copy in DRAM)
+    /// Promotes an object to DRAM by storing a copy of the Object
     /// Returns true if promotion was successful
-    /// The value parameter is the actual object data to copy
-    /// This method creates a physical DRAM copy of the data, not just an Arc reference
-    pub fn promote_to_dram_with_data(&self, key: HashedKey, value: Arc<V>) -> bool 
-    where
-        V: AsRef<[u8]>,
-    {
-        //println!("Promoting object {:?} to DRAM", key);
+    /// The object parameter is the Object from the main cache to copy to DRAM
+    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool {
         let mut info_map = self.object_info.write().unwrap();
 
         if let Some(info) = info_map.get_mut(&key) {
@@ -215,25 +210,12 @@ where
                 if new_dram_size <= config.dram_threshold {
                     info.tier = Tier::DramAndPmem;
 
-                    // Physically copy data to DRAM:
-                    // 1. Extract bytes from the source (which may be PMEM-allocated)
-                    //    First as_ref() dereferences Arc<V> -> &V
-                    //    Second as_ref() calls AsRef<[u8]> on V -> &[u8]
-                    let source_value: &V = value.as_ref();
-                    let bytes: &[u8] = source_value.as_ref();
-                    // 2. Create a new DRAM-allocated Vec and Box
-                    let dram_copy: Box<[u8]> = bytes.to_vec().into_boxed_slice();
-                    // 3. Store the DRAM copy in the cache
-                    //println!("Inserting DRAM copy for object {:?}, size {}", key, dram_copy.len());
-                    //println!("Current DRAM size before promotion: {}", stats.dram_size);
-                    //println!("New DRAM size after promotion: {}", new_dram_size);
-                    //println!("Inserting DRAM copy for object {:?}", key);
-                    //println!("value as_ref() length: {}", bytes.len());
-                    self.dram_cache.insert(key, Arc::new(dram_copy));
-
-                    dram_object = new::Object
-
-                   
+                    // Clone the Object for the DRAM cache
+                    // This creates a new Object structure with the same Arc<V> data
+                    let dram_object = object.clone();
+                    
+                    // Store the Object in the DRAM cache
+                    self.dram_cache.insert(key, dram_object);
 
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.insert(key);
@@ -314,30 +296,21 @@ where
         false
     }
     
-    /// Gets a value from the DRAM cache if it exists there
-    /// Returns None if the object is not in DRAM
-    /// Returns the DRAM-allocated copy of the data as bytes
-    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<Box<[u8]>>> {
-        let dram_value = self.dram_cache.get(key).map(|entry| entry.value().clone());
-        dram_value
+    /// Gets an Object from the DRAM cache if it exists there
+    /// Returns a reference to the Object stored in DRAM
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = Object<K, V>> + '_> {
+        self.dram_cache.get(key)
     }
     
-    /// Updates the DRAM cache copy when the object is updated
+    /// Updates the DRAM cache when an object is updated
     /// Should be called whenever an object in PMEM is updated
-    /// This creates a new physical DRAM copy of the updated data
-    pub fn update_dram_copy(&self, key: HashedKey, value: Arc<V>) 
-    where
-        V: AsRef<[u8]>,
-    {
+    /// This updates the Object in the DRAM cache with the updated Object
+    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) {
         // Only update if object is currently in DRAM
         if self.is_in_dram(&key) {
-            // Physically copy the updated data to DRAM
-            // First as_ref() dereferences Arc<V> -> &V
-            // Second as_ref() calls AsRef<[u8]> on V -> &[u8]
-            let source_value: &V = value.as_ref();
-            let bytes: &[u8] = source_value.as_ref();
-            let dram_copy: Box<[u8]> = bytes.to_vec().into_boxed_slice();
-            self.dram_cache.insert(key, Arc::new(dram_copy));
+            // Clone the updated Object for the DRAM cache
+            let updated_object = object.clone();
+            self.dram_cache.insert(key, updated_object);
         }
     }
 
