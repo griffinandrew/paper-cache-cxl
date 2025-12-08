@@ -18,6 +18,7 @@ use typesize::TypeSize;
 pub type ObjectSize = u32;
 pub type ExpireTime = Option<Instant>;
 
+#[derive(Clone)]
 pub struct Object<K, V> {
 	key: K,
 	data: Arc<V>,
@@ -40,8 +41,21 @@ impl<K, V> Object<K, V> {
 		}
 	}
 
+	/// Create a new Object with an explicit expiry time
+	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self {
+		Object {
+			key,
+			data: Arc::new(data),
+			expiry,
+		}
+	}
+
 	pub fn data(&self) -> Arc<V> {
 		self.data.clone()
+	}
+
+	pub fn key(&self) -> &K {
+		&self.key
 	}
 
 	pub fn key_matches(&self, key: &K) -> bool

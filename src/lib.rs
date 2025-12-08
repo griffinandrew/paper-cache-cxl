@@ -27,9 +27,6 @@ impl typesize::TypeSize for BufferPMEM {
     }
 }
 
-#[cfg(feature = "allocator_api")]
-use crate::tiering::manager::Tier;
-
 mod error;
 mod worker;
 mod object;
@@ -126,7 +123,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 	overhead_manager: OverheadManagerRef,
 	
 	#[cfg(feature = "allocator_api")]
-	tiering_manager: Arc<TieringManager<V>>,
+	tiering_manager: Arc<TieringManager<K, V>>,
 
 	hasher: S,
 }
@@ -1378,7 +1375,7 @@ where
 #[cfg(feature = "allocator_api")]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
-    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug, //note added Debug for logging might impact perf thoooo
+    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone, //note added Debug for logging might impact perf thoooo
     S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` with maximum size `max_size` and
@@ -1588,23 +1585,23 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// Check DRAM tier first
-		let dram_value = match self.tiering_manager.get_from_dram(&hashed_key) {
-			Some(dram_value) if !dram_value.is_expired() && dram_value.key_matches(key) => {
-			self.status.incr_hits();
-			self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-			println!("CACHE: get for key {:?} from DRAM tier: {:?}", key, dram_value);
-			return Ok(dram_value.to_vec());
-			},
-			_ => {}
-		};
+		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
+			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
+				self.status.incr_hits();
+				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+				let arc_val = dram_object_ref.data();
+				println!("CACHE: get for key {:?} from DRAM tier", key);
+				return Ok(arc_val.as_ref().to_vec());
+			}
+		}
 
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
-				// object.data() returns an Arc<V, Hybrid> — clone the inner V and return it
+				// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
 				let arc_val = object.data();
 				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				Ok(arc_val.as_ref().to_vec().clone())
+				Ok(arc_val.as_ref().to_vec())
 			},
 
 			_ => {
