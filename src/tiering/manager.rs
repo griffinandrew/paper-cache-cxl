@@ -231,6 +231,10 @@ where
                     //println!("value as_ref() length: {}", bytes.len());
                     self.dram_cache.insert(key, Arc::new(dram_copy));
 
+                    dram_object = new::Object
+
+                   
+
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.insert(key);
 

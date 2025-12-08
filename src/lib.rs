@@ -1329,23 +1329,23 @@ where
 	}
 
 
-#[cfg(feature = "allocator_api")]
-/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
+	#[cfg(feature = "allocator_api")]
+	/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
 	pub fn tiering_stats(&self) -> tiering::TieringStats {
-self.tiering_manager.stats()
-}
+		self.tiering_manager.stats()
+	}
 
-#[cfg(feature = "allocator_api")]
-/// Sets the DRAM tier threshold in bytes.
+	#[cfg(feature = "allocator_api")]
+	/// Sets the DRAM tier threshold in bytes.
 	pub fn set_dram_threshold(&self, threshold: u64) {
-self.tiering_manager.set_dram_threshold(threshold);
-}
+		self.tiering_manager.set_dram_threshold(threshold);
+	}
 
-#[cfg(feature = "allocator_api")]
-/// Gets the current DRAM tier threshold in bytes.
+	#[cfg(feature = "allocator_api")]
+	/// Gets the current DRAM tier threshold in bytes.
 	pub fn dram_threshold(&self) -> u64 {
-self.tiering_manager.dram_threshold()
-}
+		self.tiering_manager.dram_threshold()
+	}
 
 	#[cfg(feature = "allocator_api")]
 	/// Sets the hotness threshold for promotion to DRAM.
@@ -1588,12 +1588,15 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// Check DRAM tier first
-		if let Some(dram_value) = self.tiering_manager.get_from_dram(&hashed_key) {
+		let dram_value = match self.tiering_manager.get_from_dram(&hashed_key) {
+			Some(dram_value) if !dram_value.is_expired() && dram_value.key_matches(key) => {
 			self.status.incr_hits();
 			self.broadcast(WorkerEvent::Get(hashed_key, true))?;
 			println!("CACHE: get for key {:?} from DRAM tier: {:?}", key, dram_value);
 			return Ok(dram_value.to_vec());
-		}
+			},
+			_ => {}
+		};
 
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
@@ -1983,23 +1986,23 @@ where
 	}
 
 
-#[cfg(feature = "allocator_api")]
-/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
+	#[cfg(feature = "allocator_api")]
+	/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
 	pub fn tiering_stats(&self) -> tiering::TieringStats {
-self.tiering_manager.stats()
-}
+		self.tiering_manager.stats()
+	}
 
-#[cfg(feature = "allocator_api")]
-/// Sets the DRAM tier threshold in bytes.
+	#[cfg(feature = "allocator_api")]
+	/// Sets the DRAM tier threshold in bytes.
 	pub fn set_dram_threshold(&self, threshold: u64) {
-self.tiering_manager.set_dram_threshold(threshold);
-}
+		self.tiering_manager.set_dram_threshold(threshold);
+	}
 
-#[cfg(feature = "allocator_api")]
-/// Gets the current DRAM tier threshold in bytes.
+	#[cfg(feature = "allocator_api")]
+	/// Gets the current DRAM tier threshold in bytes.
 	pub fn dram_threshold(&self) -> u64 {
-self.tiering_manager.dram_threshold()
-}
+		self.tiering_manager.dram_threshold()
+	}
 
 	#[cfg(feature = "allocator_api")]
 	/// Sets the hotness threshold for promotion to DRAM.
