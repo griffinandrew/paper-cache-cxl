@@ -195,6 +195,25 @@ where
         }
     }
 
+    /// Helper method to create a DRAM Object with physically copied data
+    /// Extracts bytes from source object and creates a new DRAM-allocated copy
+    fn create_dram_object(&self, object: &Object<K, V>) -> Object<K, Box<[u8]>>
+    where
+        V: AsRef<[u8]>,
+    {
+        // Extract bytes from source (which may be PMEM-allocated)
+        let source_data = object.data();
+        // First .as_ref() dereferences Arc<V> -> &V
+        // Second .as_ref() calls AsRef<[u8]> trait on V -> &[u8]
+        let bytes: &[u8] = source_data.as_ref().as_ref();
+        
+        // Create new DRAM-allocated Box<[u8]> (physical copy)
+        let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
+        
+        // Create new Object with cloned key, DRAM-allocated data, and same expiry
+        Object::with_expiry(object.key().clone(), dram_data, object.expiry())
+    }
+
     /// Promotes an object to DRAM by creating a physical copy with DRAM-allocated data
     /// Returns true if promotion was successful
     /// The object parameter is the Object from the main cache to copy to DRAM
@@ -214,14 +233,8 @@ where
                 if new_dram_size <= config.dram_threshold {
                     info.tier = Tier::DramAndPmem;
 
-                    // Physically copy data to DRAM:
-                    // 1. Extract bytes from the source (which may be PMEM-allocated)
-                    let source_data = object.data();
-                    let bytes: &[u8] = source_data.as_ref().as_ref();
-                    // 2. Create a new DRAM-allocated Box<[u8]>
-                    let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
-                    // 3. Create a new Object with cloned key, DRAM-allocated data, and same expiry
-                    let dram_object = Object::with_expiry(object.key().clone(), dram_data, object.expiry());
+                    // Create DRAM object with physical data copy
+                    let dram_object = self.create_dram_object(object);
                     
                     // Store the Object in the DRAM cache
                     self.dram_cache.insert(key, dram_object);
@@ -320,12 +333,8 @@ where
     {
         // Only update if object is currently in DRAM
         if self.is_in_dram(&key) {
-            // Physically copy data to DRAM
-            let source_data = object.data();
-            let bytes: &[u8] = source_data.as_ref().as_ref();
-            let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
-            // Create new Object with DRAM-allocated data and same expiry
-            let updated_object = Object::with_expiry(object.key().clone(), dram_data, object.expiry());
+            // Create DRAM object with physical data copy
+            let updated_object = self.create_dram_object(object);
             self.dram_cache.insert(key, updated_object);
         }
     }
