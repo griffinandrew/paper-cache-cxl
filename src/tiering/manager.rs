@@ -40,7 +40,7 @@ pub struct TieringConfig {
 impl Default for TieringConfig {
     fn default() -> Self {
         TieringConfig {
-            dram_threshold: 3 * 1024 * 1024 * 1024, // 3 GB default
+            dram_threshold: 500 * 1024 * 1024, // 3 GB default
             high_water_mark: 0.95,
             low_water_mark: 0.7,
             hotness_threshold: 3, // Promote after 3 accesses
