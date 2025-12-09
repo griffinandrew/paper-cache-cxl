@@ -40,7 +40,7 @@ use crate::{
 };
 
 /// Interval for periodic tiering decisions (migration checks)
-const TIERING_INTERVAL: Duration = Duration::from_secs(1);
+const TIERING_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct TieringWorker<K, V> {
     listener: Receiver<WorkerEvent>,
