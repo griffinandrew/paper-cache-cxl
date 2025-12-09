@@ -155,7 +155,7 @@ where
             // Calculate timeout, ensuring we don't busy wait
             let elapsed = last_periodic.elapsed();
             let timeout = if elapsed >= TIERING_INTERVAL {
-                Duration::from_millis(1);  // Minimal timeout to avoid busy waiting
+                Duration::from_millis(1)  // Minimal timeout to avoid busy waiting
             } else {
                 TIERING_INTERVAL - elapsed
             };
