@@ -777,7 +777,7 @@ hotness_threshold = 6
 "#;
         file.write_all(toml_content.as_bytes()).unwrap();
         
-        // Rename to have .toml extension for auto-detection
+        // Copy to have .toml extension for auto-detection
         let path = file.path().with_extension("toml");
         std::fs::copy(file.path(), &path).unwrap();
         

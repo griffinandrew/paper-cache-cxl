@@ -1,4 +1,7 @@
 // Integration test to verify example config files work correctly
+// These tests require the allocator_api feature
+#![cfg(feature = "allocator_api")]
+
 use std::path::PathBuf;
 
 #[test]

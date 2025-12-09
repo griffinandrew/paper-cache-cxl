@@ -1,17 +1,10 @@
-// Test config file loading functionality
+// Test config file loading functionality using the real TieringConfig
+// These tests require the allocator_api feature
+#![cfg(feature = "allocator_api")]
+
+use paper_cache::TieringConfig;
 use std::io::Write;
 use tempfile::NamedTempFile;
-
-// Mock the TieringConfig to test serialization in isolation
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct TieringConfig {
-    dram_threshold: u64,
-    high_water_mark: f64,
-    low_water_mark: f64,
-    hotness_threshold: u64,
-}
 
 #[test]
 fn test_json_serialization() {
@@ -25,7 +18,10 @@ fn test_json_serialization() {
     let json = serde_json::to_string(&config).unwrap();
     let deserialized: TieringConfig = serde_json::from_str(&json).unwrap();
     
-    assert_eq!(deserialized, config);
+    assert_eq!(deserialized.dram_threshold, config.dram_threshold);
+    assert_eq!(deserialized.high_water_mark, config.high_water_mark);
+    assert_eq!(deserialized.low_water_mark, config.low_water_mark);
+    assert_eq!(deserialized.hotness_threshold, config.hotness_threshold);
 }
 
 #[test]
@@ -40,7 +36,10 @@ fn test_toml_serialization() {
     let toml_str = toml::to_string(&config).unwrap();
     let deserialized: TieringConfig = toml::from_str(&toml_str).unwrap();
     
-    assert_eq!(deserialized, config);
+    assert_eq!(deserialized.dram_threshold, config.dram_threshold);
+    assert_eq!(deserialized.high_water_mark, config.high_water_mark);
+    assert_eq!(deserialized.low_water_mark, config.low_water_mark);
+    assert_eq!(deserialized.hotness_threshold, config.hotness_threshold);
 }
 
 #[test]
@@ -55,8 +54,7 @@ fn test_json_file_loading() {
     file.write_all(json_content.as_bytes()).unwrap();
     file.flush().unwrap();
     
-    let contents = std::fs::read_to_string(file.path()).unwrap();
-    let config: TieringConfig = serde_json::from_str(&contents).unwrap();
+    let config = TieringConfig::from_json_file(file.path()).unwrap();
     
     assert_eq!(config.dram_threshold, 3_000_000_000);
     assert_eq!(config.high_water_mark, 0.92);
@@ -76,8 +74,7 @@ hotness_threshold = 6
     file.write_all(toml_content.as_bytes()).unwrap();
     file.flush().unwrap();
     
-    let contents = std::fs::read_to_string(file.path()).unwrap();
-    let config: TieringConfig = toml::from_str(&contents).unwrap();
+    let config = TieringConfig::from_toml_file(file.path()).unwrap();
     
     assert_eq!(config.dram_threshold, 4_000_000_000);
     assert_eq!(config.high_water_mark, 0.88);
