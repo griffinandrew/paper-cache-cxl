@@ -44,6 +44,65 @@ cache.set_dram_threshold(5_000_000);  // 5 MB for hot objects
 cache.set_hotness_threshold(3);  // Promote after 3 accesses
 ```
 
+### External Configuration File
+
+You can configure the tiering manager parameters using an external configuration file. Both JSON and TOML formats are supported.
+
+#### Using Configuration Files
+
+```rust
+use paper_cache::{TieringConfig, TieringManager};
+
+// Load from JSON file
+let config = TieringConfig::from_json_file("tiering_config.json")
+    .expect("Failed to load config");
+
+// Or load from TOML file
+let config = TieringConfig::from_toml_file("tiering_config.toml")
+    .expect("Failed to load config");
+
+// Or auto-detect format by file extension
+let config = TieringConfig::from_file("tiering_config.json")
+    .expect("Failed to load config");
+
+// Create tiering manager with loaded config
+let manager = TieringManager::new(config);
+```
+
+#### Example JSON Configuration
+
+```json
+{
+  "dram_threshold": 1073741824,
+  "high_water_mark": 0.95,
+  "low_water_mark": 0.7,
+  "hotness_threshold": 2
+}
+```
+
+#### Example TOML Configuration
+
+```toml
+# DRAM threshold in bytes (1 GB default)
+dram_threshold = 1073741824
+
+# High water mark (95% of threshold)
+high_water_mark = 0.95
+
+# Low water mark (70% of threshold)
+low_water_mark = 0.7
+
+# Hotness threshold (promote after 2 accesses)
+hotness_threshold = 2
+```
+
+#### Configuration Parameters
+
+- **dram_threshold**: Maximum size of DRAM tier in bytes (default: 1 GB)
+- **high_water_mark**: Percentage of threshold to trigger demotion (default: 0.95)
+- **low_water_mark**: Target percentage after demotion (default: 0.7)
+- **hotness_threshold**: Minimum accesses before promotion (default: 2)
+
 ### How It Works
 
 1. **Object Storage**: All objects are initially stored in PMEM (far tier)

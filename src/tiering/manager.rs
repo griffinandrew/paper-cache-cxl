@@ -1,10 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
+    fs,
+    path::Path,
 };
 
 use dashmap::DashMap;
 use typesize::TypeSize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     HashedKey,
@@ -19,7 +22,7 @@ mod allocator_bindings {
 
 
 /// Configuration for the tiering manager
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TieringConfig {
     /// Threshold for DRAM usage in bytes
     /// When DRAM usage exceeds this threshold, cold objects are demoted from DRAM to PMEM
@@ -43,7 +46,82 @@ impl Default for TieringConfig {
             dram_threshold: 1 * 1024 * 1024 * 1024, // 1 GB default
             high_water_mark: 0.95,
             low_water_mark: 0.7,
-            hotness_threshold: 3, // Promote after 3 accesses
+            hotness_threshold: 2, // Promote after 2 accesses
+        }
+    }
+}
+
+impl TieringConfig {
+    /// Load configuration from a JSON file
+    /// 
+    /// # Arguments
+    /// 
+    /// * `path` - Path to the JSON configuration file
+    /// 
+    /// # Example
+    /// 
+    /// ```no_run
+    /// use paper_cache::TieringConfig;
+    /// 
+    /// let config = TieringConfig::from_json_file("tiering_config.json")
+    ///     .expect("Failed to load config");
+    /// ```
+    pub fn from_json_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let contents = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read config file: {}", e))?;
+        
+        serde_json::from_str(&contents)
+            .map_err(|e| format!("Failed to parse JSON config: {}", e))
+    }
+
+    /// Load configuration from a TOML file
+    /// 
+    /// # Arguments
+    /// 
+    /// * `path` - Path to the TOML configuration file
+    /// 
+    /// # Example
+    /// 
+    /// ```no_run
+    /// use paper_cache::TieringConfig;
+    /// 
+    /// let config = TieringConfig::from_toml_file("tiering_config.toml")
+    ///     .expect("Failed to load config");
+    /// ```
+    pub fn from_toml_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let contents = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read config file: {}", e))?;
+        
+        toml::from_str(&contents)
+            .map_err(|e| format!("Failed to parse TOML config: {}", e))
+    }
+
+    /// Load configuration from a file, automatically detecting the format by extension
+    /// 
+    /// Supports .json and .toml extensions.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `path` - Path to the configuration file
+    /// 
+    /// # Example
+    /// 
+    /// ```no_run
+    /// use paper_cache::TieringConfig;
+    /// 
+    /// let config = TieringConfig::from_file("tiering_config.json")
+    ///     .expect("Failed to load config");
+    /// ```
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let path_ref = path.as_ref();
+        let extension = path_ref.extension()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| "File has no extension".to_string())?;
+        
+        match extension {
+            "json" => Self::from_json_file(path),
+            "toml" => Self::from_toml_file(path),
+            _ => Err(format!("Unsupported file extension: {}", extension)),
         }
     }
 }
@@ -612,6 +690,136 @@ mod tests {
         
         manager.set_hotness_threshold(5);
         assert_eq!(manager.hotness_threshold(), 5);
+    }
+
+    #[test]
+    fn test_config_json_serialization() {
+        use serde_json;
+        
+        let config = TieringConfig {
+            dram_threshold: 2_000_000_000,
+            high_water_mark: 0.85,
+            low_water_mark: 0.65,
+            hotness_threshold: 5,
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&config).unwrap();
+        
+        // Deserialize back
+        let deserialized: TieringConfig = serde_json::from_str(&json).unwrap();
+        
+        assert_eq!(deserialized.dram_threshold, config.dram_threshold);
+        assert_eq!(deserialized.high_water_mark, config.high_water_mark);
+        assert_eq!(deserialized.low_water_mark, config.low_water_mark);
+        assert_eq!(deserialized.hotness_threshold, config.hotness_threshold);
+    }
+
+    #[test]
+    fn test_config_toml_serialization() {
+        use toml;
+        
+        let config = TieringConfig {
+            dram_threshold: 2_000_000_000,
+            high_water_mark: 0.85,
+            low_water_mark: 0.65,
+            hotness_threshold: 5,
+        };
+
+        // Serialize to TOML
+        let toml_str = toml::to_string(&config).unwrap();
+        
+        // Deserialize back
+        let deserialized: TieringConfig = toml::from_str(&toml_str).unwrap();
+        
+        assert_eq!(deserialized.dram_threshold, config.dram_threshold);
+        assert_eq!(deserialized.high_water_mark, config.high_water_mark);
+        assert_eq!(deserialized.low_water_mark, config.low_water_mark);
+        assert_eq!(deserialized.hotness_threshold, config.hotness_threshold);
+    }
+
+    #[test]
+    fn test_config_from_json_file() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+        
+        // Create a temporary JSON file
+        let mut file = NamedTempFile::new().unwrap();
+        let json_content = r#"{
+            "dram_threshold": 3000000000,
+            "high_water_mark": 0.92,
+            "low_water_mark": 0.68,
+            "hotness_threshold": 4
+        }"#;
+        file.write_all(json_content.as_bytes()).unwrap();
+        
+        // Load config from file
+        let config = TieringConfig::from_json_file(file.path()).unwrap();
+        
+        assert_eq!(config.dram_threshold, 3_000_000_000);
+        assert_eq!(config.high_water_mark, 0.92);
+        assert_eq!(config.low_water_mark, 0.68);
+        assert_eq!(config.hotness_threshold, 4);
+    }
+
+    #[test]
+    fn test_config_from_toml_file() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+        
+        // Create a temporary TOML file
+        let mut file = NamedTempFile::new().unwrap();
+        let toml_content = r#"
+dram_threshold = 4000000000
+high_water_mark = 0.88
+low_water_mark = 0.72
+hotness_threshold = 6
+"#;
+        file.write_all(toml_content.as_bytes()).unwrap();
+        
+        // Rename to have .toml extension for auto-detection
+        let path = file.path().with_extension("toml");
+        std::fs::copy(file.path(), &path).unwrap();
+        
+        // Load config from file
+        let config = TieringConfig::from_toml_file(&path).unwrap();
+        
+        assert_eq!(config.dram_threshold, 4_000_000_000);
+        assert_eq!(config.high_water_mark, 0.88);
+        assert_eq!(config.low_water_mark, 0.72);
+        assert_eq!(config.hotness_threshold, 6);
+        
+        // Clean up
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_config_from_file_auto_detect() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+        
+        // Test JSON auto-detection
+        let mut json_file = NamedTempFile::new().unwrap();
+        let json_path = json_file.path().with_extension("json");
+        let json_content = r#"{"dram_threshold": 5000000000, "high_water_mark": 0.9, "low_water_mark": 0.7, "hotness_threshold": 7}"#;
+        std::fs::write(&json_path, json_content).unwrap();
+        
+        let config = TieringConfig::from_file(&json_path).unwrap();
+        assert_eq!(config.dram_threshold, 5_000_000_000);
+        assert_eq!(config.hotness_threshold, 7);
+        
+        // Test TOML auto-detection
+        let toml_path = json_file.path().with_extension("toml");
+        let toml_content = "dram_threshold = 6000000000\nhigh_water_mark = 0.93\nlow_water_mark = 0.73\nhotness_threshold = 8\n";
+        std::fs::write(&toml_path, toml_content).unwrap();
+        
+        let config2 = TieringConfig::from_file(&toml_path).unwrap();
+        assert_eq!(config2.dram_threshold, 6_000_000_000);
+        assert_eq!(config2.hotness_threshold, 8);
+        
+        // Clean up
+        std::fs::remove_file(&json_path).ok();
+        std::fs::remove_file(&toml_path).ok();
     }
 }
 

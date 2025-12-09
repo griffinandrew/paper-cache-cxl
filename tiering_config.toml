@@ -1,0 +1,22 @@
+# Tiering Manager Configuration
+# All parameters can be modified to tune the behavior of the tiering manager
+
+# DRAM threshold in bytes
+# When DRAM usage exceeds this threshold, cold objects are demoted from DRAM to PMEM
+# Default: 1073741824 (1 GB)
+dram_threshold = 1073741824
+
+# High water mark as percentage of threshold (0.0 to 1.0)
+# When DRAM usage exceeds threshold * high_water_mark, start demoting
+# Default: 0.95 (95%)
+high_water_mark = 0.95
+
+# Low water mark as percentage of threshold (0.0 to 1.0)
+# Continue demoting until DRAM usage falls below threshold * low_water_mark
+# Default: 0.7 (70%)
+low_water_mark = 0.7
+
+# Hotness threshold: minimum access count before promotion
+# Objects are promoted to DRAM after being accessed this many times
+# Default: 2
+hotness_threshold = 2

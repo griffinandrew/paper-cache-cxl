@@ -38,10 +38,27 @@
 //! # Configuration
 //! 
 //! The tiering manager supports runtime configuration:
-//! - **DRAM Threshold**: Maximum size of DRAM tier (default: 20% of cache size)
+//! - **DRAM Threshold**: Maximum size of DRAM tier (default: 1 GB)
 //! - **Hotness Threshold**: Minimum accesses before promotion (default: 2)
-//! - **High Water Mark**: Percentage of threshold to trigger demotion (default: 90%)
+//! - **High Water Mark**: Percentage of threshold to trigger demotion (default: 95%)
 //! - **Low Water Mark**: Target percentage after demotion (default: 70%)
+//! 
+//! ## External Configuration Files
+//! 
+//! Configuration can be loaded from JSON or TOML files:
+//! 
+//! ```no_run
+//! use paper_cache::TieringConfig;
+//! 
+//! // Load from JSON
+//! let config = TieringConfig::from_json_file("tiering_config.json").unwrap();
+//! 
+//! // Or from TOML
+//! let config = TieringConfig::from_toml_file("tiering_config.toml").unwrap();
+//! 
+//! // Or auto-detect by extension
+//! let config = TieringConfig::from_file("tiering_config.json").unwrap();
+//! ```
 //! 
 //! # Data Consistency
 //! 

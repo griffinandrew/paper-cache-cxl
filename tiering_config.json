@@ -1,0 +1,6 @@
+{
+  "dram_threshold": 1073741824,
+  "high_water_mark": 0.95,
+  "low_water_mark": 0.7,
+  "hotness_threshold": 2
+}
