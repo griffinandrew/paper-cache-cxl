@@ -174,14 +174,15 @@ where
             // Perform periodic tiering decisions
             if last_periodic.elapsed() >= TIERING_INTERVAL {
                 self.periodic_tiering();
-                println!("SIZE: {}", self.tiering_manager.stats().dram_size);
-                println!("OBJS: {}", self.tiering_manager.stats().dram_objects);
-                println!("PROS: {}", self.tiering_manager.stats().promotions);
-                println!("DEMS: {}", self.tiering_manager.stats().demotions);
-                println!("PMEM: {}", self.tiering_manager.stats().pmem_only_objects);
                 last_periodic = std::time::Instant::now();
 
             }
+
+            println!("SIZE: {}", self.tiering_manager.stats().dram_size);
+            println!("OBJS: {}", self.tiering_manager.stats().dram_objects);
+            println!("PROS: {}", self.tiering_manager.stats().promotions);
+            println!("DEMS: {}", self.tiering_manager.stats().demotions);
+            println!("PMEM: {}", self.tiering_manager.stats().pmem_only_objects);
         }
     }
 }
