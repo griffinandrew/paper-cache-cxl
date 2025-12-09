@@ -156,7 +156,6 @@ where
             let elapsed = last_periodic.elapsed();
             let timeout = if elapsed >= TIERING_INTERVAL {
                 Duration::from_millis(1);  // Minimal timeout to avoid busy waiting
-                println!("{}", self.tiering_manager.stats().dram_usage_bytes);
             } else {
                 TIERING_INTERVAL - elapsed
             };
@@ -169,6 +168,13 @@ where
                     self.process_event(event);
                 }
             }
+
+            println!("{SIZE: }", self.tiering_manager.stats().dram_size);
+            println!("{OBJS: }", self.tiering_manager.stats().dram_objects);
+            println!("{PROS: }", self.tiering_manager.stats().promotions);
+            println!("{DEMS: }", self.tiering_manager.stats().demotions);
+            println!("{PMEM: }", self.tiering_manager.stats().pmem_only_objects);
+            
             
             // Perform periodic tiering decisions
             if last_periodic.elapsed() >= TIERING_INTERVAL {
