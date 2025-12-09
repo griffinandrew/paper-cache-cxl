@@ -41,7 +41,7 @@ impl Default for TieringConfig {
     fn default() -> Self {
         TieringConfig {
             dram_threshold: 1024 * 1024 * 1024 + 500 * 1024 * 1024, // 1.5 GB default
-            high_water_mark: 0.9,
+            high_water_mark: 0.95,
             low_water_mark: 0.7,
             hotness_threshold: 3, // Promote after 3 accesses
         }
