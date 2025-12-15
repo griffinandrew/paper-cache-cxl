@@ -27,6 +27,10 @@ impl typesize::TypeSize for BufferPMEM {
     }
 }
 
+// PMEM-backed DashMap wrapper for forcing hash tables to PMEM
+#[cfg(feature = "allocator_api")]
+pub mod pmem_dashmap;
+
 mod error;
 mod worker;
 mod object;
@@ -1451,7 +1455,12 @@ where
 			return Err(CacheError::UnconfiguredPolicy);
 		}
 
-		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		// HASH TABLE PLACEMENT: Create DashMap with hash table structures in PMEM
+		// This allocates the internal buckets, nodes, and hash table metadata in PMEM
+		// while allowing cached data (values) to remain in PMEM as configured.
+		// Both the main cache hash table AND the DRAM tier hash table (in TieringManager)
+		// are placed in PMEM to isolate hash table placement effects on performance.
+		let objects = Arc::new(pmem_dashmap::create_pmem_dashmap(NoHasher::default()));
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 

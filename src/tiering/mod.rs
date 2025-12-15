@@ -3,6 +3,23 @@
 //! This module provides functionality to manage objects between DRAM and PMEM tiers
 //! with **actual physical data copying**.
 //! 
+//! # Hash Table Placement
+//! 
+//! **IMPORTANT**: Both the main cache and the DRAM tier cache use DashMap hash tables
+//! that are **allocated in PMEM**, not DRAM. This design choice allows us to:
+//! 1. Isolate the performance impact of hash table memory placement
+//! 2. Measure cache behavior with hash lookups accessing far memory (PMEM)
+//! 3. Keep data values in their intended memory tiers (DRAM for hot data, PMEM for cold)
+//! 
+//! The hash tables include:
+//! - Bucket arrays (main hash table storage structures)
+//! - Node structures (internal DashMap/HashMap nodes)
+//! - Key storage within hash table entries
+//! 
+//! **Data values** remain in their configured tiers:
+//! - DRAM cache: stores hot object data in DRAM (fast reads)
+//! - PMEM cache: stores all object data in PMEM (source of truth)
+//! 
 //! # Overview
 //! 
 //! The tiering system implements a two-tier caching strategy with physical data copies:

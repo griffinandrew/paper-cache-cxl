@@ -130,12 +130,15 @@ where
 {
     /// Creates a new TieringManager with the given configuration
     pub fn new(config: TieringConfig) -> Self {
+        // HASH TABLE PLACEMENT: Create DRAM cache's DashMap with hash table in PMEM
+        // The DRAM cache stores hot data copies in DRAM, but its hash table (buckets,
+        // nodes, key→value mappings) is placed in PMEM to isolate hash table placement effects
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
-            dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
+            dram_cache: Arc::new(crate::pmem_dashmap::create_pmem_dashmap(NoHasher::default())),
             _phantom: std::marker::PhantomData,
         }
     }

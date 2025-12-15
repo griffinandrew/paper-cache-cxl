@@ -32,6 +32,35 @@ static ALL_MEM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for HybridObjects {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // HASH TABLE PLACEMENT: Check if we should force PMEM allocation for hash tables
+        // This is used when creating DashMap instances to ensure hash table buckets/nodes
+        // are allocated in PMEM rather than DRAM, isolating hash table placement effects
+        #[cfg(feature = "allocator_api")]
+        {
+            if crate::pmem_dashmap::should_force_pmem() {
+                // Force PMEM allocation for DashMap hash table internals
+                unsafe {
+                    INIT.call_once(|| {
+                        let dax_size = 236757975040; // PMEM size from ndctl list --namespaces
+                        let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8;
+                        allocator_bindings::umf_allocator_init(dax_path, dax_size);
+                        #[cfg(debug_assertions)] {
+                            println!("[HASH TABLE] Initialized PMEM allocator for hash table structures");
+                        }
+                    });
+                }
+                let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
+                if ptr.is_null() {
+                    println!("[HASH TABLE] Failed to allocate PMEM for hash table structure");
+                    return ptr::null_mut();
+                }
+                #[cfg(debug_assertions)] {
+                    println!("[HASH TABLE] Allocated {} bytes in PMEM for hash table", layout.size());
+                }
+                return ptr;
+            }
+        }
+
         // Decide backend
 
         //if only using pmem ... dont track the fucking counters.... 
