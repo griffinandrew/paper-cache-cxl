@@ -9,7 +9,7 @@ mod manager;
 mod policy;
 mod ttl;
 
-#[cfg(feature = "allocator_api")]
+#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash"))]
 mod tiering;
 
 use std::thread;
@@ -57,5 +57,5 @@ pub use crate::worker::{
 	ttl::TtlWorker,
 };
 
-#[cfg(feature = "allocator_api")]
+#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash"))]
 pub use crate::worker::tiering::TieringWorker;

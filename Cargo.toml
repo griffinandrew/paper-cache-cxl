@@ -28,6 +28,7 @@ num-traits = "0.2.19"
 libc = "0.2.177"
 tikv-jemallocator = "0.6.1"
 hashbrown = "0.16.1"
+allocator-api2 =  "0.2.21"
 
 
 [features] #think this is working as expected....? 
@@ -36,6 +37,7 @@ allocator_api = []
 default = []
 all_dram = []
 original = []
+alloc_with_hash =[]
 
 
 [build-dependencies]

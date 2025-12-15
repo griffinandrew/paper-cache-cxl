@@ -193,3 +193,26 @@ unsafe impl Allocator for HybridObjects {
     }
 }
 
+
+
+
+//allocator_api2 support
+
+#[cfg(feature = "alloc_with_hash")]
+unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        let ptr = unsafe { self.alloc(layout) };
+        if ptr.is_null() {
+            Err(allocator_api2::alloc:: AllocError)
+        } else {
+            let slice = unsafe {
+                std::slice::from_raw_parts_mut(ptr, layout.size())
+            };
+            Ok(NonNull::from(slice))
+        }
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe { self.dealloc(ptr.as_ptr(), layout) }
+    }
+}
