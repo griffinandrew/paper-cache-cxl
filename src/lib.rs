@@ -2143,7 +2143,6 @@ where
 			Hybrid,
 		)));
 
-
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
