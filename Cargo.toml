@@ -38,6 +38,7 @@ default = []
 all_dram = []
 original = []
 alloc_with_hash =[]
+alloc_api_exp = []
 
 
 [build-dependencies]

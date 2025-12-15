@@ -146,7 +146,7 @@ where
 
 
 
-#[cfg(feature = "alloc_with_hash")]
+#[cfg(any(feature = "alloc_with_hash", feature = "alloc_api_exp"))]
 impl<K, V> TieringWorker<K, V>
 where
     K: 'static + Eq + TypeSize + Clone,
