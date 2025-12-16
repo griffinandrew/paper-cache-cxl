@@ -95,12 +95,16 @@ where
             
             WorkerEvent::Set(hashed_key, base_size, _expiry, old_object_info) => {
                 if old_object_info.is_none() {
-                    // New object - register it in PMEM tier
-                    self.tiering_manager.register_object(hashed_key, base_size);
-                } else {
-                    // Object updated - update DRAM copy if it exists
+                    // New object - insert into both DRAM and PMEM immediately
+                    // This bypasses all tiering policies, thresholds, and access heuristics
                     if let Some(object_ref) = self.objects.get(&hashed_key) {
-                        self.tiering_manager.update_dram_copy(hashed_key, &*object_ref);
+                        self.tiering_manager.register_and_insert_to_dram(hashed_key, base_size, &*object_ref);
+                    }
+                } else {
+                    // Object updated - ensure it's in both DRAM and PMEM
+                    // This bypasses all tiering policies, thresholds, and access heuristics
+                    if let Some(object_ref) = self.objects.get(&hashed_key) {
+                        self.tiering_manager.ensure_in_dram_for_set(hashed_key, base_size, &*object_ref);
                     }
                 }
             }
@@ -188,13 +192,16 @@ where
             
             WorkerEvent::Set(hashed_key, base_size, _expiry, old_object_info) => {
                 if old_object_info.is_none() {
-                    // New object - register it in PMEM tier
-                    self.tiering_manager.register_object(hashed_key, base_size);
-                } else {
-                    // Object updated - update DRAM copy if it exists
-                    //if let Some(object_ref) = self.objects.get(&hashed_key) {
+                    // New object - insert into both DRAM and PMEM immediately
+                    // This bypasses all tiering policies, thresholds, and access heuristics
                     if let Some(object_ref) = self.objects.read().unwrap().get(&hashed_key) {
-                        self.tiering_manager.update_dram_copy(hashed_key, &*object_ref);
+                        self.tiering_manager.register_and_insert_to_dram(hashed_key, base_size, &*object_ref);
+                    }
+                } else {
+                    // Object updated - ensure it's in both DRAM and PMEM
+                    // This bypasses all tiering policies, thresholds, and access heuristics
+                    if let Some(object_ref) = self.objects.read().unwrap().get(&hashed_key) {
+                        self.tiering_manager.ensure_in_dram_for_set(hashed_key, base_size, &*object_ref);
                     }
                 }
             }

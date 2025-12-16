@@ -160,6 +160,40 @@ where
         stats.pmem_only_objects += 1;
     }
 
+    /// Registers a new object and immediately inserts it into both DRAM and PMEM
+    /// This bypasses all tiering policies, thresholds, and access-frequency heuristics
+    /// Used for SET operations to ensure immediate DRAM presence
+    pub fn register_and_insert_to_dram(&self, key: HashedKey, size: ObjectSize, object: &Object<K, V>) -> bool
+    where
+        V: AsRef<[u8]>,
+    {
+        let mut info_map = self.object_info.write().unwrap();
+        
+        // Register the object with DRAM+PMEM tier immediately
+        info_map.insert(key, ObjectTierInfo {
+            tier: Tier::DramAndPmem,
+            size,
+            access_count: 0,
+            last_access: std::time::Instant::now(),
+        });
+        
+        // Create DRAM object with physical data copy
+        let dram_object = self.create_dram_object(object);
+        
+        // Store the Object in the DRAM cache
+        self.dram_cache.insert(key, dram_object);
+        
+        let mut dram_objects = self.dram_objects.write().unwrap();
+        dram_objects.insert(key);
+        
+        let mut stats = self.stats.write().unwrap();
+        stats.dram_size += size as u64;
+        stats.dram_objects += 1;
+        // Note: No change to pmem_only_objects since we're going directly to both tiers
+        
+        true
+    }
+
     /// Records an access to an object
     /// Returns true if the object should be promoted to DRAM
     /// 
@@ -336,6 +370,59 @@ where
             // Create DRAM object with physical data copy
             let updated_object = self.create_dram_object(object);
             self.dram_cache.insert(key, updated_object);
+        }
+    }
+    
+    /// Ensures an object is in both DRAM and PMEM for SET operations
+    /// If the object is already in DRAM, updates it. If not, inserts it.
+    /// This bypasses all tiering policies, thresholds, and access-frequency heuristics
+    pub fn ensure_in_dram_for_set(&self, key: HashedKey, size: ObjectSize, object: &Object<K, V>) -> bool
+    where
+        V: AsRef<[u8]>,
+    {
+        let mut info_map = self.object_info.write().unwrap();
+        
+        if let Some(info) = info_map.get_mut(&key) {
+            // Object already exists - ensure it's in DRAM
+            if info.tier == Tier::PmemOnly {
+                // Promote to DRAM unconditionally
+                info.tier = Tier::DramAndPmem;
+                
+                // Update size in case it changed
+                let old_size = info.size;
+                info.size = size;
+                
+                // Create DRAM object with physical data copy
+                let dram_object = self.create_dram_object(object);
+                self.dram_cache.insert(key, dram_object);
+                
+                let mut dram_objects = self.dram_objects.write().unwrap();
+                dram_objects.insert(key);
+                
+                let mut stats = self.stats.write().unwrap();
+                stats.dram_size = stats.dram_size.saturating_sub(old_size as u64) + size as u64;
+                stats.dram_objects += 1;
+                stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
+                
+                true
+            } else {
+                // Already in DRAM - just update the copy
+                // Update size in case it changed
+                let old_size = info.size;
+                info.size = size;
+                
+                let updated_object = self.create_dram_object(object);
+                self.dram_cache.insert(key, updated_object);
+                
+                // Update size tracking
+                let mut stats = self.stats.write().unwrap();
+                stats.dram_size = stats.dram_size.saturating_sub(old_size as u64) + size as u64;
+                
+                true
+            }
+        } else {
+            // Object doesn't exist yet - this shouldn't happen in update case
+            false
         }
     }
 
