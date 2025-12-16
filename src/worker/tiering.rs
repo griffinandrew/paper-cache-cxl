@@ -11,9 +11,27 @@
 //! into the worker manager workflow. The worker:
 //! 
 //! - Receives WorkerEvents (Get, Set, Del, etc.) from the worker manager
-//! - Tracks object access patterns in coordination with the TieringManager
-//! - Periodically triggers promotion/demotion decisions
+//! - **Immediately inserts objects into both DRAM and PMEM on SET operations**
+//! - Tracks object access patterns for future demotion decisions
+//! - Periodically triggers demotion decisions based on DRAM pressure
 //! - Maintains data consistency across both tiers
+//! 
+//! ## SET Operation Behavior
+//! 
+//! On every SET operation (new or update), the object is **immediately inserted into both
+//! DRAM and PMEM**, bypassing:
+//! - Tiering policies
+//! - Promotion thresholds
+//! - Access-frequency heuristics
+//! 
+//! This ensures DRAM presence is observable immediately after the operation.
+//! 
+//! ## Tiering Policies Application
+//! 
+//! Tiering policies and thresholds apply only to:
+//! - Eviction decisions
+//! - Demotion from DRAM (when DRAM is full)
+//! - Migration between tiers (periodic background process)
 //! 
 //! The TieringWorker runs as a background thread alongside PolicyWorker and TtlWorker,
 //! processing events in real-time and making periodic tiering decisions.

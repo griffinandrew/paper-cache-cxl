@@ -46,12 +46,19 @@ cache.set_hotness_threshold(3);  // Promote after 3 accesses
 
 ### How It Works
 
-1. **Object Storage**: All objects are initially stored in PMEM (far tier)
-2. **Access Tracking**: Each `get()` operation increments the object's access count
-3. **Promotion with Data Copy**: When an object's access count reaches the hotness threshold, its data is **physically copied** to a DRAM cache
-4. **Fast Reads**: Subsequent `get()` operations check the DRAM cache first for hot objects, providing faster access
+1. **Object Storage**: All objects are stored in both DRAM and PMEM on `set()` operations
+2. **Immediate DRAM Insertion**: Every `set()` operation immediately places the object in both tiers, bypassing all tiering policies and thresholds
+3. **Fast Reads**: All `get()` operations check the DRAM cache first for immediate access
+4. **Access Tracking**: Each `get()` operation increments the object's access count for future eviction decisions
 5. **Eviction**: When DRAM reaches capacity, the least recently used objects are demoted (DRAM copies removed, PMEM copies retained)
-6. **Consistency**: All updates write to PMEM and update DRAM copies if they exist; deletions remove from both tiers
+6. **Consistency**: All updates write to both PMEM and DRAM; deletions remove from both tiers
+
+**Key Behavior**: SET operations always insert into both DRAM and PMEM unconditionally, ignoring:
+- Tiering policies
+- Promotion thresholds
+- Access-frequency heuristics
+
+Tiering policies and thresholds apply only to eviction, demotion, and migration after insertion.
 
 ### Background Workers
 
