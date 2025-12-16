@@ -139,7 +139,7 @@ pub struct TieringManager<K, V> {
     dram_cache: Arc<DashMap<HashedKey, Object<K, Box<[u8]>>, NoHasher>>,
     
     #[cfg(feature = "alloc_with_hash")]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, Object<K, Box<[u8]>,  BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>>,
+    dram_cache: Arc<RwLock<hashtable<HashedKey, Object<K, Box<[u8]>>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
 
     #[cfg(feature = "alloc_api_exp")]
     dram_cache: Arc<RwLock<hashtable<HashedKey, Object<K, Box<[u8]>>, BuildHasherDefault<NoHashHasher<u64>>>>>,
@@ -186,7 +186,7 @@ where
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())), //this is probs redundant and not needed.... 
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
-            dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default()), Hybrid)),
+            dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -684,7 +684,7 @@ where
         let mut stats = self.stats.write().unwrap();
         *stats = TieringStats::default();
     }
-    
+
     #[cfg(any(feature = "alloc_with_hash", feature = "alloc_api_exp"))]
         pub fn clear(&self) {
         let mut info_map = self.object_info.write().unwrap();
