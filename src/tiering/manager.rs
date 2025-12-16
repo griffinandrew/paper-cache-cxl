@@ -133,7 +133,7 @@ where
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
-            object_info: Arc::new(RwLock::new(HashMap::new())),
+            object_info: Arc::new(RwLock::new(HashMap::new())), //this is probs redundant and not needed.... 
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
             _phantom: std::marker::PhantomData,
