@@ -198,7 +198,6 @@ where
                     // Record access and check if we should promote
                     if self.tiering_manager.record_access(hashed_key) {
                         // Object should be promoted to DRAM - copy the Object
-                        //if let Some(object_ref) = self.objects.get(&hashed_key) {
                         if let Some(object_ref) = self.objects.read().unwrap().get(&hashed_key) {
                             if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
                                 debug!("Promoted object {} to DRAM", hashed_key);
