@@ -13,7 +13,7 @@ use std::{
 
 #[cfg(any(feature = "alloc_with_hash", feature = "alloc_api_exp"))]
 use hashbrown::HashMap;
-#[cfg(any(feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+#[cfg(feature = "alloc_with_hash")]
 use crate::allocator::HybridObjects;
 
 #[cfg(not(any(feature = "alloc_with_hash", feature = "alloc_api_exp")))]
@@ -89,13 +89,28 @@ where
     pub fn push_front(&mut self, item: T) {
         let hash = self.hash_item(&item);
         
-        let node = Box::new(Node {
-            item,
-            prev: None,
-            next: self.head,
-        });
+        #[cfg(feature = "alloc_with_hash")]
+        let node_ptr = {
+            let node = Box::new_in(Node {
+                item,
+                prev: None,
+                next: self.head,
+            }, HybridObjects);
+            // Convert Box<T, A> to raw pointer manually to avoid type issues
+            let ptr = &*node as *const Node<T> as *mut Node<T>;
+            std::mem::forget(node);
+            unsafe { NonNull::new_unchecked(ptr) }
+        };
         
-        let node_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(node)) };
+        #[cfg(not(feature = "alloc_with_hash"))]
+        let node_ptr = {
+            let node = Box::new(Node {
+                item,
+                prev: None,
+                next: self.head,
+            });
+            unsafe { NonNull::new_unchecked(Box::into_raw(node)) }
+        };
         
         if let Some(head) = self.head {
             unsafe { (*head.as_ptr()).prev = Some(node_ptr); }
@@ -111,7 +126,12 @@ where
     /// Pops an item from the front of the list
     pub fn pop_front(&mut self) -> Option<T> {
         self.head.map(|head_ptr| {
+            #[cfg(feature = "alloc_with_hash")]
+            let head = unsafe { Box::from_raw_in(head_ptr.as_ptr(), HybridObjects) };
+            
+            #[cfg(not(feature = "alloc_with_hash"))]
             let head = unsafe { Box::from_raw(head_ptr.as_ptr()) };
+            
             let hash = self.hash_item(&head.item);
             
             self.head = head.next;
@@ -130,7 +150,12 @@ where
     /// Pops an item from the back of the list
     pub fn pop_back(&mut self) -> Option<T> {
         self.tail.map(|tail_ptr| {
+            #[cfg(feature = "alloc_with_hash")]
+            let tail = unsafe { Box::from_raw_in(tail_ptr.as_ptr(), HybridObjects) };
+            
+            #[cfg(not(feature = "alloc_with_hash"))]
             let tail = unsafe { Box::from_raw(tail_ptr.as_ptr()) };
+            
             let hash = self.hash_item(&tail.item);
             
             self.tail = tail.prev;
@@ -196,6 +221,10 @@ where
         let hash = self.hash_key(key);
         
         self.map.remove(&hash).map(|node_ptr| {
+            #[cfg(feature = "alloc_with_hash")]
+            let node = unsafe { Box::from_raw_in(node_ptr.as_ptr(), HybridObjects) };
+            
+            #[cfg(not(feature = "alloc_with_hash"))]
             let node = unsafe { Box::from_raw(node_ptr.as_ptr()) };
             
             unsafe {
@@ -298,10 +327,22 @@ where
 impl<T, S> Drop for PmemHashList<T, S> {
     fn drop(&mut self) {
         // Clear all nodes manually without needing Hash + Eq bounds
-        while let Some(head_ptr) = self.head {
-            let head = unsafe { Box::from_raw(head_ptr.as_ptr()) };
-            self.head = head.next;
+        #[cfg(feature = "alloc_with_hash")]
+        {
+            while let Some(head_ptr) = self.head {
+                let head = unsafe { Box::from_raw_in(head_ptr.as_ptr(), HybridObjects) };
+                self.head = head.next;
+            }
         }
+        
+        #[cfg(not(feature = "alloc_with_hash"))]
+        {
+            while let Some(head_ptr) = self.head {
+                let head = unsafe { Box::from_raw(head_ptr.as_ptr()) };
+                self.head = head.next;
+            }
+        }
+        
         self.tail = None;
         self.len = 0;
     }
