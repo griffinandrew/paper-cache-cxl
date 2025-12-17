@@ -5,19 +5,18 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use kwik::collections::HashList;
-
 use crate::{
 	HashedKey,
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
 	worker::policy::policy_stack::PolicyStack,
+	collections::PmemHashList,
 };
 
 #[derive(Default)]
 pub struct FifoStack {
-	stack: HashList<HashedKey, NoHasher>,
+	stack: PmemHashList<HashedKey, NoHasher>,
 }
 
 impl PolicyStack for FifoStack {

@@ -33,6 +33,7 @@ mod worker;
 mod object;
 mod policy;
 mod status;
+mod collections;
 
 #[cfg(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"))]
 pub mod tiering;
