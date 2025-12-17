@@ -26,7 +26,7 @@ pub struct PmemHashList<T, S> {
     #[cfg(feature = "alloc_with_hash")]
     map: HashMap<u64, NonNull<Node<T>>, S, HybridObjects>,
     
-    #[cfg(feature = "alloc_api_exp")]
+    #[cfg(all(feature = "alloc_api_exp", not(feature = "alloc_with_hash")))]
     map: HashMap<u64, NonNull<Node<T>>, S>,
     
     #[cfg(not(any(feature = "alloc_with_hash", feature = "alloc_api_exp")))]
@@ -53,7 +53,10 @@ where
         #[cfg(feature = "alloc_with_hash")]
         let map = HashMap::with_hasher_in(hash_builder, HybridObjects);
         
-        #[cfg(not(feature = "alloc_with_hash"))]
+        #[cfg(all(feature = "alloc_api_exp", not(feature = "alloc_with_hash")))]
+        let map = HashMap::with_hasher(hash_builder);
+        
+        #[cfg(not(any(feature = "alloc_with_hash", feature = "alloc_api_exp")))]
         let map = HashMap::with_hasher(hash_builder);
         
         PmemHashList {
@@ -248,7 +251,28 @@ where
 
     /// Clears the list
     pub fn clear(&mut self) {
-        while self.pop_front().is_some() {}
+        // Clear the map first (efficient bulk clear)
+        self.map.clear();
+        
+        // Then traverse and deallocate the linked list nodes
+        #[cfg(feature = "alloc_with_hash")]
+        {
+            while let Some(head_ptr) = self.head {
+                let head = unsafe { Box::from_raw_in(head_ptr.as_ptr(), HybridObjects) };
+                self.head = head.next;
+            }
+        }
+        
+        #[cfg(not(feature = "alloc_with_hash"))]
+        {
+            while let Some(head_ptr) = self.head {
+                let head = unsafe { Box::from_raw(head_ptr.as_ptr()) };
+                self.head = head.next;
+            }
+        }
+        
+        self.tail = None;
+        self.len = 0;
     }
 
     /// Gets a reference to an item in the list
@@ -348,8 +372,12 @@ impl<T, S> Drop for PmemHashList<T, S> {
     }
 }
 
-// Safety: PmemHashList is Send if T is Send
+// Safety: PmemHashList is Send if T is Send and S is Send.
+// The NonNull pointers are owned by this structure and not shared with other threads.
+// The HashMap's allocator is also Send when the alloc_with_hash feature is enabled.
 unsafe impl<T: Send, S: Send> Send for PmemHashList<T, S> {}
 
-// Safety: PmemHashList is Sync if T is Sync and S is Sync
+// Safety: PmemHashList is Sync if T is Sync and S is Sync.
+// Access to the internal state requires exclusive (&mut self) access, and the NonNull
+// pointers are not exposed without proper synchronization.
 unsafe impl<T: Sync, S: Sync> Sync for PmemHashList<T, S> {}
