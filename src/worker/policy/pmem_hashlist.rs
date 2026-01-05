@@ -20,13 +20,14 @@ mod pmem_impl {
     /// A hash-backed linked list with PMem storage via Hybrid allocator
     /// 
     /// This implementation uses hashbrown::HashMap with the Hybrid allocator
-    /// to store data in PMem. The ordering is maintained using a Vec of keys.
+    /// to store data in PMem. The ordering is maintained using a Vec allocated
+    /// in PMem as well (using Vec::new_in with the Hybrid allocator).
     /// 
     /// Note: This is less efficient than a true linked list for move operations
     /// (O(n) instead of O(1)), but it ensures PMem storage for eviction metadata.
     pub struct HashList<K, S> {
         map: HashMap<K, usize, S, Hybrid>,  // Key -> index in order vec
-        order: Vec<K>,  // Ordered list of keys (front to back)
+        order: Vec<K, Hybrid>,  // Ordered list of keys (front to back), allocated in PMem
     }
 
     impl<K, S> HashList<K, S>
@@ -38,7 +39,7 @@ mod pmem_impl {
         pub fn with_hasher(hasher: S) -> Self {
             HashList {
                 map: HashMap::with_hasher_in(hasher, Hybrid),
-                order: Vec::new(),
+                order: Vec::new_in(Hybrid),
             }
         }
 
