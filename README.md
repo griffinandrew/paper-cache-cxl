@@ -65,3 +65,5 @@ Unlike simple metadata tracking, this implementation maintains **two physical co
 
 This ensures hot objects benefit from DRAM speed while maintaining data durability in PMEM.
 
+
+### Add eviction stacks to pmem
