@@ -10,6 +10,10 @@ use std::{
 	hash::{Hash, Hasher},
 };
 
+#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+use crate::worker::policy::pmem_hashlist::HashList;
+
+#[cfg(not(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp")))]
 use kwik::collections::HashList;
 
 use crate::{
@@ -26,6 +30,7 @@ pub struct SieveStack {
 	hand: Option<HashedKey>,
 }
 
+#[derive(Clone)]
 struct Object {
 	key: HashedKey,
 	visited: bool,

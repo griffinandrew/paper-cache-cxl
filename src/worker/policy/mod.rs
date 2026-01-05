@@ -10,6 +10,9 @@ mod mini_stack;
 mod event;
 mod trace;
 
+#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+mod pmem_hashlist;
+
 use std::{
 	thread,
 	sync::Arc,
