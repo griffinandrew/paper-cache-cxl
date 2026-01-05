@@ -10,19 +10,18 @@ use std::{
 	hash::{Hash, Hasher},
 };
 
-use kwik::collections::HashList;
-
 use crate::{
 	HashedKey,
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
 	worker::policy::policy_stack::PolicyStack,
+	collections::PmemHashList,
 };
 
 #[derive(Default)]
 pub struct SieveStack {
-	stack: HashList<Object, NoHasher>,
+	stack: PmemHashList<Object, NoHasher>,
 	hand: Option<HashedKey>,
 }
 

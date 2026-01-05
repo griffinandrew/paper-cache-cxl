@@ -11,8 +11,6 @@ use std::{
 	hash::{Hash, Hasher},
 };
 
-use kwik::collections::HashList;
-
 use crate::{
 	CacheSize,
 	HashedKey,
@@ -20,6 +18,7 @@ use crate::{
 	policy::PaperPolicy,
 	object::ObjectSize,
 	worker::policy::policy_stack::PolicyStack,
+	collections::PmemHashList,
 };
 
 pub struct SThreeFifoStack {
@@ -27,11 +26,11 @@ pub struct SThreeFifoStack {
 
 	small: Stack,
 	main: Stack,
-	ghost: HashList<HashedKey, NoHasher>,
+	ghost: PmemHashList<HashedKey, NoHasher>,
 }
 
 struct Stack {
-	stack: HashList<Object, NoHasher>,
+	stack: PmemHashList<Object, NoHasher>,
 
 	used_size: CacheSize,
 	max_size: Option<CacheSize>,
@@ -115,7 +114,7 @@ impl SThreeFifoStack {
 	pub fn new(ratio: f64, max_size: CacheSize) -> Self {
 		let small = Stack::new(Some((ratio * max_size as f64) as u64));
 		let main = Stack::new(Some(((1.0 - ratio) * max_size as f64) as u64));
-		let ghost = HashList::with_hasher(NoHasher::default());
+		let ghost = PmemHashList::with_hasher(NoHasher::default());
 
 		SThreeFifoStack {
 			ratio,
@@ -168,7 +167,7 @@ impl SThreeFifoStack {
 impl Stack {
 	fn new(max_size: Option<CacheSize>) -> Self {
 		Stack {
-			stack: HashList::with_hasher(NoHasher::default()),
+			stack: PmemHashList::with_hasher(NoHasher::default()),
 
 			used_size: 0,
 			max_size,

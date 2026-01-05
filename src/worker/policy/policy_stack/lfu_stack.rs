@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use dlv_list::{VecList, Index};
-use kwik::collections::HashList;
 
 use crate::{
 	HashedKey,
@@ -15,6 +14,7 @@ use crate::{
 	policy::PaperPolicy,
 	object::ObjectSize,
 	worker::policy::policy_stack::PolicyStack,
+	collections::PmemHashList,
 };
 
 #[derive(Default)]
@@ -25,7 +25,7 @@ pub struct LfuStack {
 
 struct CountStack {
 	count: u32,
-	stack: HashList<HashedKey, NoHasher>,
+	stack: PmemHashList<HashedKey, NoHasher>,
 }
 
 impl PolicyStack for LfuStack {
@@ -133,7 +133,7 @@ impl CountStack {
 	fn new(count: u32) -> Self {
 		CountStack {
 			count,
-			stack: HashList::with_hasher(NoHasher::default()),
+			stack: PmemHashList::with_hasher(NoHasher::default()),
 		}
 	}
 

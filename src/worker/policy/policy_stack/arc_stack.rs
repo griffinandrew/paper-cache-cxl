@@ -10,8 +10,6 @@ use std::{
 	hash::{Hash, Hasher},
 };
 
-use kwik::collections::HashList;
-
 use crate::{
 	CacheSize,
 	HashedKey,
@@ -19,6 +17,7 @@ use crate::{
 	policy::PaperPolicy,
 	object::ObjectSize,
 	worker::policy::policy_stack::PolicyStack,
+	collections::PmemHashList,
 };
 
 pub struct ArcStack {
@@ -34,7 +33,7 @@ pub struct ArcStack {
 
 #[derive(Default)]
 struct Stack {
-	stack: HashList<Object, NoHasher>,
+	stack: PmemHashList<Object, NoHasher>,
 	used_size: CacheSize,
 }
 

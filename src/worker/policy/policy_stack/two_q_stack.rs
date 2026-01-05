@@ -10,8 +10,6 @@ use std::{
 	hash::{Hash, Hasher},
 };
 
-use kwik::collections::HashList;
-
 use crate::{
 	CacheSize,
 	HashedKey,
@@ -19,6 +17,7 @@ use crate::{
 	policy::PaperPolicy,
 	object::ObjectSize,
 	worker::policy::policy_stack::PolicyStack,
+	collections::PmemHashList,
 };
 
 pub struct TwoQStack {
@@ -31,7 +30,7 @@ pub struct TwoQStack {
 }
 
 struct Stack {
-	stack: HashList<Object, NoHasher>,
+	stack: PmemHashList<Object, NoHasher>,
 
 	used_size: CacheSize,
 	max_size: Option<CacheSize>,
@@ -152,7 +151,7 @@ impl TwoQStack {
 impl Stack {
 	fn new(max_size: Option<CacheSize>) -> Self {
 		Stack {
-			stack: HashList::with_hasher(NoHasher::default()),
+			stack: PmemHashList::with_hasher(NoHasher::default()),
 
 			used_size: 0,
 			max_size,
