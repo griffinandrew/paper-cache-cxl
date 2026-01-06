@@ -111,6 +111,10 @@ unsafe impl GlobalAlloc for HybridObjects {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // Safety: Check for null pointer before attempting to free
+        if ptr.is_null() {
+            return;
+        }
         
         if DRAM_LIMIT_OBJECTS == 0 {
             //all in pmem
