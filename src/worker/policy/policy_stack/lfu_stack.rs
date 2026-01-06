@@ -50,6 +50,7 @@ impl PolicyStack for LfuStack {
 		if self.index_map.contains_key(&key) {
 			return self.update(key);
 		}
+		println!("LFU insert key {:?}", key);
 
 		if self.count_stacks.front().is_none_or(|count_stack| count_stack.count != 1) {
 			self.count_stacks.push_front(CountStack::new(1));
@@ -64,6 +65,7 @@ impl PolicyStack for LfuStack {
 	}
 
 	fn update(&mut self, key: HashedKey) {
+		println!("LFU update key {:?}", key);
 		let Some(count_stack_index) = self.index_map.get(&key) else {
 			return;
 		};
