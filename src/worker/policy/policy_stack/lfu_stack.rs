@@ -5,7 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::collections::HashMap;
 use dlv_list::{VecList, Index};
 
 #[cfg(feature = "pmem_eviction_stacks")]
@@ -13,6 +12,17 @@ use crate::worker::policy::pmem_hashlist::HashList;
 
 #[cfg(not(feature = "pmem_eviction_stacks"))]
 use kwik::collections::HashList;
+
+// Use hashbrown::HashMap with Hybrid allocator when PMem eviction stacks are enabled
+#[cfg(feature = "pmem_eviction_stacks")]
+use hashbrown::HashMap;
+
+#[cfg(feature = "pmem_eviction_stacks")]
+use crate::allocator::HybridObjects as Hybrid;
+
+// Use std HashMap when PMem eviction stacks are not enabled
+#[cfg(not(feature = "pmem_eviction_stacks"))]
+use std::collections::HashMap;
 
 use crate::{
 	HashedKey,
@@ -22,10 +32,39 @@ use crate::{
 	worker::policy::policy_stack::PolicyStack,
 };
 
-#[derive(Default)]
+// When pmem_eviction_stacks is enabled, use hashbrown::HashMap with Hybrid allocator
+#[cfg(feature = "pmem_eviction_stacks")]
+pub struct LfuStack {
+	index_map: HashMap<HashedKey, Index<CountStack>, NoHasher, Hybrid>,
+	count_stacks: VecList<CountStack>,
+}
+
+#[cfg(feature = "pmem_eviction_stacks")]
+impl Default for LfuStack {
+	fn default() -> Self {
+		println!("Creating LFU stack with PMem-backed hashbrown::HashMap");
+		LfuStack {
+			index_map: HashMap::with_hasher_in(NoHasher::default(), Hybrid),
+			count_stacks: VecList::new(),
+		}
+	}
+}
+
+// When pmem_eviction_stacks is not enabled, use std::HashMap
+#[cfg(not(feature = "pmem_eviction_stacks"))]
 pub struct LfuStack {
 	index_map: HashMap<HashedKey, Index<CountStack>, NoHasher>,
 	count_stacks: VecList<CountStack>,
+}
+
+#[cfg(not(feature = "pmem_eviction_stacks"))]
+impl Default for LfuStack {
+	fn default() -> Self {
+		LfuStack {
+			index_map: HashMap::with_hasher(NoHasher::default()),
+			count_stacks: VecList::new(),
+		}
+	}
 }
 
 struct CountStack {

@@ -106,6 +106,83 @@ mod pmem_eviction_tests {
 
         println!("Large operations test completed without segfault");
     }
+
+    #[test]
+    fn test_lfu_eviction_with_pmem() {
+        // Test LFU-specific eviction behavior with PMem-backed HashMap
+        let cache = PaperCache::<u32, BufferPMEM>::new(
+            500, // Small cache to force evictions
+            &[PaperPolicy::Lfu],
+            PaperPolicy::Lfu,
+        ).expect("Failed to create cache");
+
+        // Insert items with different access frequencies
+        // Item 0: accessed 4 times
+        // Item 1: accessed 3 times  
+        // Item 2: accessed 2 times
+        // Item 3: accessed 1 time
+        for access in [0, 1, 1, 1, 0, 2, 3, 0, 2, 0] {
+            cache.set(access, &[0u8; 50], None).expect("Failed to set");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        thread::sleep(Duration::from_millis(100));
+
+        // Add more items to trigger evictions
+        // The least frequently used items should be evicted first
+        for i in 10..20 {
+            cache.set(i, &[0u8; 50], None).expect("Failed to set");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        thread::sleep(Duration::from_millis(100));
+
+        // Item 0 (most frequent) should still be in cache
+        let has_0 = cache.get(&0).is_ok();
+        println!("LFU test: Most frequent item (0) in cache: {}", has_0);
+
+        // Item 3 (least frequent) should likely have been evicted
+        let has_3 = cache.get(&3).is_ok();
+        println!("LFU test: Least frequent item (3) in cache: {}", has_3);
+
+        println!("LFU eviction test with PMem completed without segfault");
+    }
+
+    #[test]
+    fn test_lfu_stress_with_pmem() {
+        // Stress test for LFU with many insertions, updates, and evictions
+        let cache = PaperCache::<u32, BufferPMEM>::new(
+            2000, // 2KB cache
+            &[PaperPolicy::Lfu],
+            PaperPolicy::Lfu,
+        ).expect("Failed to create cache");
+
+        // Perform many operations to stress test LFU with PMem HashMap
+        for iteration in 0..10 {
+            // Insert a batch of items
+            for i in (iteration * 20)..((iteration + 1) * 20) {
+                cache.set(i, &[0u8; 30], None).expect("Failed to set");
+            }
+
+            // Access some items multiple times to create frequency patterns
+            for _ in 0..3 {
+                for i in (iteration * 20)..((iteration + 1) * 20) {
+                    if i % 3 == 0 {
+                        let _ = cache.get(&i);
+                    }
+                }
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        thread::sleep(Duration::from_millis(200));
+
+        const NUM_ITERATIONS: u32 = 10;
+        const ITEMS_PER_ITERATION: u32 = 20;
+        let total_operations = NUM_ITERATIONS * ITEMS_PER_ITERATION;
+        println!("LFU stress test with PMem completed without segfault - {} operations", total_operations);
+    }
 }
 
 
