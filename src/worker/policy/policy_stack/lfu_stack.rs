@@ -8,10 +8,10 @@
 use std::collections::HashMap;
 use dlv_list::{VecList, Index};
 
-#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+#[cfg(feature = "pmem_eviction_stacks")]
 use crate::worker::policy::pmem_hashlist::HashList;
 
-#[cfg(not(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp")))]
+#[cfg(not(feature = "pmem_eviction_stacks"))]
 use kwik::collections::HashList;
 
 use crate::{
