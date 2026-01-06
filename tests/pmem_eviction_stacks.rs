@@ -178,7 +178,10 @@ mod pmem_eviction_tests {
 
         thread::sleep(Duration::from_millis(200));
 
-        println!("LFU stress test with PMem completed without segfault - {} operations", 200 * 10);
+        const NUM_ITERATIONS: u32 = 10;
+        const ITEMS_PER_ITERATION: u32 = 20;
+        let total_operations = NUM_ITERATIONS * ITEMS_PER_ITERATION;
+        println!("LFU stress test with PMem completed without segfault - {} operations", total_operations);
     }
 }
 
