@@ -39,6 +39,7 @@ all_dram = []
 original = []
 alloc_with_hash =[]
 alloc_api_exp = []
+pmem_eviction_stacks = []
 
 
 [build-dependencies]

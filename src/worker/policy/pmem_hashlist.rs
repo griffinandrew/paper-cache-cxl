@@ -2,15 +2,15 @@
  * PMem-backed HashList implementation
  * 
  * This module provides a hash-backed linked list that uses PMem allocation
- * when allocator features are enabled. Falls back to kwik::collections::HashList otherwise.
+ * when the pmem_eviction_stacks feature is enabled. Falls back to kwik::collections::HashList otherwise.
  */
 
-// When allocator features are NOT enabled, just re-export the standard HashList
-#[cfg(not(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp")))]
+// When pmem_eviction_stacks feature is NOT enabled, just re-export the standard HashList
+#[cfg(not(feature = "pmem_eviction_stacks"))]
 pub use kwik::collections::HashList;
 
-// When allocator features ARE enabled, provide a PMem-backed implementation
-#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+// When pmem_eviction_stacks feature IS enabled, provide a PMem-backed implementation
+#[cfg(feature = "pmem_eviction_stacks")]
 mod pmem_impl {
     use std::hash::{Hash, BuildHasher};
     use std::borrow::Borrow;
@@ -65,8 +65,10 @@ mod pmem_impl {
             Q: Hash + Eq + ?Sized,
         {
             let index = *self.map.get(key)?;
+            // Use get() for bounds-checked access instead of direct indexing
+            // This prevents potential segfaults from index out of bounds
             if index + 1 < self.order.len() {
-                Some(&self.order[index + 1])
+                self.order.get(index + 1)
             } else {
                 None
             }
@@ -95,6 +97,11 @@ mod pmem_impl {
         pub fn push_front(&mut self, key: K) {
             if self.map.contains_key(&key) {
                 return; // Don't add duplicates
+            }
+            // Pre-allocate if needed to avoid mid-operation allocation failures
+            // This helps prevent issues with PMem allocator
+            if self.order.len() >= self.order.capacity() {
+                self.order.reserve(self.order.len().max(1));
             }
             self.order.insert(0, key.clone());
             self.rebuild_index();
@@ -171,6 +178,9 @@ mod pmem_impl {
         // Rebuild the index map after order changes
         fn rebuild_index(&mut self) {
             self.map.clear();
+            // Pre-allocate to avoid reallocations during iteration
+            // This is important for PMem allocator stability
+            self.map.reserve(self.order.len());
             for (idx, key) in self.order.iter().enumerate() {
                 self.map.insert(key.clone(), idx);
             }
@@ -189,5 +199,5 @@ mod pmem_impl {
     }
 }
 
-#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+#[cfg(feature = "pmem_eviction_stacks")]
 pub use pmem_impl::HashList;

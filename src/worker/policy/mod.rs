@@ -10,8 +10,14 @@ mod mini_stack;
 mod event;
 mod trace;
 
-#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+#[cfg(feature = "pmem_eviction_stacks")]
 mod pmem_hashlist;
+
+// Export for testing
+#[cfg(test)]
+pub use policy_stack::PolicyStack;
+#[cfg(test)]
+pub use policy_stack::init_policy_stack;
 
 use std::{
 	thread,

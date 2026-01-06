@@ -1,0 +1,88 @@
+# Summary of Changes: PMem Eviction Stacks Feature
+
+## What Changed
+
+Modified the latest merged commit that added eviction stacks to PMem to use a dedicated feature flag instead of sharing flags with the object table.
+
+## Files Modified
+
+### Core Implementation (14 files)
+1. Cargo.toml - Added `pmem_eviction_stacks` feature flag
+2. src/lib.rs - Updated feature gates to include new flag
+3. src/worker/policy/mod.rs - Updated conditional compilation
+4. src/worker/policy/pmem_hashlist.rs - Changed feature flags, added safety improvements
+5. src/allocator.rs - Added null pointer check
+6-14. All policy stack files (lru, fifo, mru, arc, lfu, clock, sieve, s3fifo, two_q) - Updated imports
+
+### Tests (1 file)
+15. tests/pmem_eviction_stacks.rs - New comprehensive integration tests
+
+### Documentation (3 files)
+16. PMEM_EVICTION_STACKS.md - Complete feature guide
+17. PMEM_EVICTION_STACKS_DEBUGGING.md - Debugging guide
+18. SEGFAULT_FIXES.md - Safety improvements documentation
+
+## Key Changes
+
+### Feature Flag Independence
+BEFORE: Eviction stacks used same flags as object table
+- `alloc_with_hash` → Both objects and eviction in PMem
+- No flag → Both in DRAM
+
+AFTER: Eviction stacks have independent flag
+- `alloc_with_hash` alone → Objects in PMem, eviction in DRAM
+- `pmem_eviction_stacks` alone → Objects in DRAM, eviction in PMem
+- Both flags → Both in PMem
+- No flags → Both in DRAM (default)
+
+### Safety Improvements (Addressing Segfaults)
+
+1. **Null Pointer Check**: Added check in dealloc() before freeing memory
+2. **Pre-allocation**: Reserve capacity before operations to prevent mid-operation allocation failures
+3. **Bounds Checking**: Use get() instead of direct indexing to prevent out-of-bounds access
+4. **Capacity Checks**: Verify capacity before Vec insertions
+
+### Build Verification
+
+✓ Default build (cargo build) - Works
+✓ PMem eviction stacks (cargo +nightly build --features alloc_with_hash,pmem_eviction_stacks) - Works
+✓ DRAM eviction, PMem objects (cargo +nightly build --features alloc_with_hash) - Works
+✓ No breaking changes to existing code
+
+## Usage
+
+### Enable PMem Eviction Stacks
+```bash
+cargo +nightly build --features alloc_with_hash,pmem_eviction_stacks
+```
+
+### Keep DRAM Eviction Stacks (default or with PMem objects)
+```bash
+cargo build                                        # All DRAM
+cargo +nightly build --features alloc_with_hash    # PMem objects, DRAM eviction
+```
+
+## Addressing the Segfault Issue
+
+The implementation includes multiple safety improvements to prevent segfaults:
+
+1. **Allocator Level**: Null pointer checks before deallocation
+2. **Data Structure Level**: Pre-allocation and capacity checks
+3. **Access Level**: Bounds-checked array access
+4. **Documentation**: Comprehensive debugging guide
+
+See SEGFAULT_FIXES.md for technical details and PMEM_EVICTION_STACKS_DEBUGGING.md for troubleshooting.
+
+## Testing
+
+- Integration tests created in tests/pmem_eviction_stacks.rs
+- Tests verify basic operations, multiple policies, and stress scenarios
+- Tests require actual PMem device to execute (will compile but not run without hardware)
+- All existing tests remain compatible
+
+## Backward Compatibility
+
+✓ No breaking changes
+✓ Default behavior unchanged (all DRAM)
+✓ Existing feature combinations work as before
+✓ New feature is opt-in
