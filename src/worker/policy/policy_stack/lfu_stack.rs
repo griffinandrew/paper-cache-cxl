@@ -43,6 +43,7 @@ impl PolicyStack for LfuStack {
 	}
 
 	fn contains(&self, key: HashedKey) -> bool {
+		println!("LFU contains key {:?}: {}", key, self.index_map.contains_key(&key));
 		self.index_map.contains_key(&key)
 	}
 
@@ -104,6 +105,7 @@ impl PolicyStack for LfuStack {
 	}
 
 	fn remove(&mut self, key: HashedKey) {
+		println!("LFU remove key {:?}", key);
 		let Some(count_stack_index) = self.index_map.remove(&key) else {
 			return;
 		};
@@ -122,6 +124,7 @@ impl PolicyStack for LfuStack {
 	}
 
 	fn evict_one(&mut self) -> Option<HashedKey> {
+		println!("LFU evict_one called");
 		let count_stack_index = self.count_stacks.front_index()?;
 		let count_stack = self.count_stacks.get_mut(count_stack_index)?;
 
