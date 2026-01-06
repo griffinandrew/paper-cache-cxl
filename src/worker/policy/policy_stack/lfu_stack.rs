@@ -119,6 +119,7 @@ impl PolicyStack for LfuStack {
 	}
 
 	fn clear(&mut self) {
+		println!("LFU clear called");
 		self.index_map.clear();
 		self.count_stacks.clear();
 	}

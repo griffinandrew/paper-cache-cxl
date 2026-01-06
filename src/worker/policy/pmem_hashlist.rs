@@ -37,6 +37,7 @@ mod pmem_impl {
     {
         /// Create a new HashList with the given hasher
         pub fn with_hasher(hasher: S) -> Self {
+            println!("Creating PMem-backed HashList with Hybrid allocator");
             HashList {
                 map: HashMap::with_hasher_in(hasher, Hybrid),
                 order: Vec::new_in(Hybrid),
@@ -89,12 +90,14 @@ mod pmem_impl {
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
+            println!("PMem HashList get key");
             let index = *self.map.get(key)?;
             self.order.get(index)
         }
 
         /// Push an element to the front
         pub fn push_front(&mut self, key: K) {
+            println!("PMem HashList push_front key");
             if self.map.contains_key(&key) {
                 return; // Don't add duplicates
             }
@@ -109,6 +112,7 @@ mod pmem_impl {
 
         /// Remove and return the element from the front
         pub fn pop_front(&mut self) -> Option<K> {
+            println!("PMem HashList pop_front key");
             if self.order.is_empty() {
                 return None;
             }
@@ -132,6 +136,7 @@ mod pmem_impl {
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
+            println!("PMem HashList move_front key");
             if let Some(&index) = self.map.get(key) {
                 if index == 0 {
                     return; // Already at front
@@ -168,6 +173,7 @@ mod pmem_impl {
             Q: Hash + Eq + ?Sized,
             F: FnOnce(&mut K),
         {
+            println!("PMem HashList update key");
             if let Some(&index) = self.map.get(key) {
                 if let Some(item) = self.order.get_mut(index) {
                     f(item);
