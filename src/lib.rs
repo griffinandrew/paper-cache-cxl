@@ -1577,17 +1577,13 @@ where
 	{
 		let hashed_key = self.hash_key(key);
 
-		// Check DRAM tier first
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				let arc_val = dram_object_ref.data();
-				//println!("CACHE: get for key {:?} from DRAM tier", key);
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
-				return Ok(arc_val.as_ref().to_vec());
-			}
+		// Check DRAM tier first - get_data_from_dram returns owned Vec<u8>
+		// This is safe because data is copied while holding the DRAM cache lock,
+		// preventing use-after-free if object is concurrently demoted
+		if let Some(dram_data) = self.tiering_manager.get_data_from_dram(key, &hashed_key) {
+			self.status.incr_hits();
+			self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+			return Ok(dram_data);
 		}
 
 		let result = match self.objects.get(&hashed_key) {
@@ -2246,18 +2242,13 @@ where
 	{
 		let hashed_key = self.hash_key(key);
 
-		// Check DRAM tier first
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				let arc_val = dram_object_ref.data();
-				//println!("CACHE: get for key {:?} from DRAM tier", key);
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
-				return Ok(arc_val.as_ref().to_vec());
-			}
-
+		// Check DRAM tier first - get_data_from_dram returns owned Vec<u8>
+		// This is safe because data is copied while holding the DRAM cache lock,
+		// preventing use-after-free if object is concurrently demoted
+		if let Some(dram_data) = self.tiering_manager.get_data_from_dram(key, &hashed_key) {
+			self.status.incr_hits();
+			self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+			return Ok(dram_data);
 		}
 
 		let result = match self.objects.read().unwrap().get(&hashed_key) {
@@ -2918,18 +2909,13 @@ where
 	{
 		let hashed_key = self.hash_key(key);
 
-		// Check DRAM tier first
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				let arc_val = dram_object_ref.data();
-				//println!("CACHE: get for key {:?} from DRAM tier", key);
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
-				return Ok(arc_val.as_ref().to_vec());
-			}
-
+		// Check DRAM tier first - get_data_from_dram returns owned Vec<u8>
+		// This is safe because data is copied while holding the DRAM cache lock,
+		// preventing use-after-free if object is concurrently demoted
+		if let Some(dram_data) = self.tiering_manager.get_data_from_dram(key, &hashed_key) {
+			self.status.incr_hits();
+			self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+			return Ok(dram_data);
 		}
 
 		let result = match self.objects.read().unwrap().get(&hashed_key) {
