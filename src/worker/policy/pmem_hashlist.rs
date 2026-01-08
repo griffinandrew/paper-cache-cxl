@@ -61,6 +61,27 @@ mod pmem_impl {
             }
         }
 
+        /// Helper: Check if a node at the given index is active
+        fn is_node_active(&self, node_idx: NodeIndex) -> bool {
+            self.nodes.get(node_idx).map_or(false, |n| n.active)
+        }
+
+        /// Helper: Allocate a new node and return its index
+        fn allocate_new_node(&mut self, key: K) -> NodeIndex {
+            let idx = self.nodes.len();
+            // Pre-allocate to avoid allocation failures mid-operation
+            if self.nodes.capacity() <= idx {
+                self.nodes.reserve(8); // Reserve in small chunks
+            }
+            self.nodes.push(Node {
+                key,
+                prev: None,
+                next: self.head,
+                active: true,
+            });
+            idx
+        }
+
         /// Returns the number of active elements
         pub fn len(&self) -> usize {
             self.map.len()
@@ -140,32 +161,11 @@ mod pmem_impl {
                     idx
                 } else {
                     // Free list contained invalid index, allocate new node instead
-                    let idx = self.nodes.len();
-                    if self.nodes.capacity() <= idx {
-                        self.nodes.reserve(8);
-                    }
-                    self.nodes.push(Node {
-                        key: key.clone(),
-                        prev: None,
-                        next: self.head,
-                        active: true,
-                    });
-                    idx
+                    self.allocate_new_node(key.clone())
                 }
             } else {
                 // Allocate new node
-                let idx = self.nodes.len();
-                // Pre-allocate to avoid allocation failures mid-operation
-                if self.nodes.capacity() <= idx {
-                    self.nodes.reserve(8); // Reserve in small chunks
-                }
-                self.nodes.push(Node {
-                    key: key.clone(),
-                    prev: None,
-                    next: self.head,
-                    active: true,
-                });
-                idx
+                self.allocate_new_node(key.clone())
             };
 
             // Update the previous head's prev pointer
@@ -280,7 +280,7 @@ mod pmem_impl {
             }
 
             // Safety check: ensure node is active
-            if !self.nodes.get(node_idx).map_or(false, |n| n.active) {
+            if !self.is_node_active(node_idx) {
                 return;
             }
 
@@ -337,7 +337,7 @@ mod pmem_impl {
             let node_idx = *self.map.get(key)?;
             
             // Safety check: ensure node is active
-            if !self.nodes.get(node_idx).map_or(false, |n| n.active) {
+            if !self.is_node_active(node_idx) {
                 return None;
             }
 
