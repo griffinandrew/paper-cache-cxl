@@ -131,12 +131,27 @@ mod pmem_impl {
             // Get or create a node index
             let node_idx = if let Some(idx) = self.free_list.pop() {
                 // Reuse deleted node slot - update its fields
-                let node = &mut self.nodes[idx];
-                node.key = key.clone();
-                node.prev = None;
-                node.next = self.head;
-                node.active = true;
-                idx
+                // Safety: use bounds-checked access even for free_list indices
+                if let Some(node) = self.nodes.get_mut(idx) {
+                    node.key = key.clone();
+                    node.prev = None;
+                    node.next = self.head;
+                    node.active = true;
+                    idx
+                } else {
+                    // Free list contained invalid index, allocate new node instead
+                    let idx = self.nodes.len();
+                    if self.nodes.capacity() <= idx {
+                        self.nodes.reserve(8);
+                    }
+                    self.nodes.push(Node {
+                        key: key.clone(),
+                        prev: None,
+                        next: self.head,
+                        active: true,
+                    });
+                    idx
+                }
             } else {
                 // Allocate new node
                 let idx = self.nodes.len();
@@ -185,7 +200,10 @@ mod pmem_impl {
             let next = head_node.next;
 
             // Mark node as inactive and add to free list
-            self.nodes[head_idx].active = false;
+            // Safety: use bounds-checked access
+            if let Some(node) = self.nodes.get_mut(head_idx) {
+                node.active = false;
+            }
             self.free_list.push(head_idx);
 
             // Update head
@@ -220,7 +238,10 @@ mod pmem_impl {
             let prev = tail_node.prev;
 
             // Mark node as inactive and add to free list
-            self.nodes[tail_idx].active = false;
+            // Safety: use bounds-checked access
+            if let Some(node) = self.nodes.get_mut(tail_idx) {
+                node.active = false;
+            }
             self.free_list.push(tail_idx);
 
             // Update tail
@@ -264,9 +285,10 @@ mod pmem_impl {
             }
 
             // Unlink from current position
-            let (prev, next) = {
-                let node = &self.nodes[node_idx];
-                (node.prev, node.next)
+            let (prev, next) = match self.nodes.get(node_idx) {
+                // Safety: use bounds-checked access
+                Some(node) => (node.prev, node.next),
+                None => return, // Node doesn't exist, bail out
             };
 
             // Update prev node's next pointer
@@ -296,9 +318,11 @@ mod pmem_impl {
             }
 
             // Update the moved node
-            let node = &mut self.nodes[node_idx];
-            node.prev = None;
-            node.next = self.head;
+            // Safety: use bounds-checked access
+            if let Some(node) = self.nodes.get_mut(node_idx) {
+                node.prev = None;
+                node.next = self.head;
+            }
 
             // Update head
             self.head = Some(node_idx);
@@ -317,13 +341,16 @@ mod pmem_impl {
                 return None;
             }
 
-            let node = &self.nodes[node_idx];
-            let key_clone = node.key.clone();
-            let prev = node.prev;
-            let next = node.next;
+            // Safety: use bounds-checked access
+            let (key_clone, prev, next) = {
+                let node = self.nodes.get(node_idx)?;
+                (node.key.clone(), node.prev, node.next)
+            };
 
             // Mark node as inactive
-            self.nodes[node_idx].active = false;
+            if let Some(node) = self.nodes.get_mut(node_idx) {
+                node.active = false;
+            }
             self.free_list.push(node_idx);
 
             // Update prev node's next pointer
