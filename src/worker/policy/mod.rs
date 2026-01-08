@@ -13,11 +13,14 @@ mod trace;
 #[cfg(feature = "pmem_eviction_stacks")]
 mod pmem_hashlist;
 
-// Export for testing
+// Import for internal use and export for testing
+use policy_stack::{PolicyStack, init_policy_stack};
+
+// Also export for testing
 #[cfg(test)]
-pub use policy_stack::PolicyStack;
+pub use policy_stack::PolicyStack as PublicPolicyStack;
 #[cfg(test)]
-pub use policy_stack::init_policy_stack;
+pub use policy_stack::init_policy_stack as public_init_policy_stack;
 
 use std::{
 	thread,
@@ -53,7 +56,6 @@ use crate::{
 			mini_stack::MiniStackManager,
 			event::{StackEvent, TraceEvent},
 			trace::{TraceWorker, TraceFragment},
-			policy_stack::{PolicyStack, init_policy_stack},
 		},
 	},
 };
