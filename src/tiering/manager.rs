@@ -485,72 +485,23 @@ where
         false
     }
     
-    /// Gets data from the DRAM cache if it exists and matches the given key
-    /// Returns owned Vec<u8> to avoid dangling references during tiering operations
-    /// 
-    /// SAFETY: This method copies the data immediately while holding the read lock,
-    /// preventing use-after-free if the object is concurrently demoted from DRAM.
-    /// 
-    /// The data is copied atomically within the lock scope, ensuring that:
-    /// 1. Object cannot be demoted while we're reading it
-    /// 2. Returned data is fully owned and stable (no references to movable memory)
-    /// 3. No use-after-free even if object is immediately demoted after this call
-    /// 
-    /// Returns None if:
-    /// - Key not found in DRAM cache
-    /// - Object is expired
-    /// - Key doesn't match (hash collision)
-    /// 
-    /// Implementation notes:
-    /// - allocator_api: DashMap::get() returns a Ref guard that holds a read lock
-    /// - alloc_with_hash/alloc_api_exp: Explicit RwLock::read() for thread safety
-    /// - Both approaches ensure data is copied before the lock is released
+    /// Gets an Object from the DRAM cache if it exists there
+    /// Returns a reference to the Object<K, Box<[u8]>> stored in DRAM
     #[cfg(feature = "allocator_api")]
-    pub fn get_data_from_dram(&self, key: &K, hashed_key: &HashedKey) -> Option<Vec<u8>> 
-    where
-        K: Eq + std::fmt::Debug,
-    {
-        // DashMap::get() returns a Ref guard that holds a read lock on this entry
-        // The lock is held until the Ref is dropped (at the end of and_then)
-        self.dram_cache.get(hashed_key).and_then(|obj| {
-            // Verify key matches (handle hash collisions)
-            if !obj.key_matches(key) {
-                return None;
-            }
-            // Check if expired - don't return expired data
-            if obj.is_expired() {
-                return None;
-            }
-            // Copy data immediately while holding reference
-            // This is safe because we copy the bytes, not keep a reference
-            Some(obj.data().as_ref().to_vec())
-        })
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = Object<K, Box<[u8]>>> + '_> {
+        self.dram_cache.get(key)
     }
 
+
+   //might be doing an additiona; clone here....
+   //or returning the wrong type / val...... 
     #[cfg(any(feature = "alloc_with_hash", feature = "alloc_api_exp"))]
-    pub fn get_data_from_dram(&self, key: &K, hashed_key: &HashedKey) -> Option<Vec<u8>> 
-    where
-        K: Eq + std::fmt::Debug,
-    {
-        // Explicit read lock for hashtable wrapped in RwLock
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<Object<K, Box<[u8]>>>> {
         self.dram_cache
             .read()
             .unwrap()
-            .get(hashed_key)
-            .and_then(|obj| {
-                // Verify key matches (handle hash collisions)
-                if !obj.key_matches(key) {
-                    return None;
-                }
-                // Check if expired - don't return expired data
-                if obj.is_expired() {
-                    return None;
-                }
-                // Copy data immediately while holding read lock
-                // This prevents use-after-free if object is demoted concurrently
-                // We copy the actual bytes, not keep any references to the Object
-                Some(obj.data().as_ref().to_vec())
-            })
+            .get(key)
+            .map(|obj| Arc::new(obj.clone())) // clone or Arc clone depending on your Object
     }
 
     //pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = Object<K, Box<[u8]>>> + '_> {
