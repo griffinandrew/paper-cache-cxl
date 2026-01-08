@@ -5,13 +5,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use kwik::collections::HashList;
+
 use crate::{
 	HashedKey,
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
 	worker::policy::policy_stack::PolicyStack,
-	collections::PmemHashList,
 };
 
 #[derive(Default)]
@@ -19,7 +20,7 @@ pub struct MruStack {
 	// we hold the MRU key separately to ensure that it isn't immediately evicted
 	// from the cache after it is first set if there are ongoing evictions.
 	maybe_mru_key: Option<HashedKey>,
-	stack: PmemHashList<HashedKey, NoHasher>,
+	stack: HashList<HashedKey, NoHasher>,
 }
 
 impl PolicyStack for MruStack {
