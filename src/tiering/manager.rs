@@ -500,11 +500,18 @@ where
     /// - Key not found in DRAM cache
     /// - Object is expired
     /// - Key doesn't match (hash collision)
+    /// 
+    /// Implementation notes:
+    /// - allocator_api: DashMap::get() returns a Ref guard that holds a read lock
+    /// - alloc_with_hash/alloc_api_exp: Explicit RwLock::read() for thread safety
+    /// - Both approaches ensure data is copied before the lock is released
     #[cfg(feature = "allocator_api")]
     pub fn get_data_from_dram(&self, key: &K, hashed_key: &HashedKey) -> Option<Vec<u8>> 
     where
         K: Eq + std::fmt::Debug,
     {
+        // DashMap::get() returns a Ref guard that holds a read lock on this entry
+        // The lock is held until the Ref is dropped (at the end of and_then)
         self.dram_cache.get(hashed_key).and_then(|obj| {
             // Verify key matches (handle hash collisions)
             if !obj.key_matches(key) {
@@ -525,6 +532,7 @@ where
     where
         K: Eq + std::fmt::Debug,
     {
+        // Explicit read lock for hashtable wrapped in RwLock
         self.dram_cache
             .read()
             .unwrap()
