@@ -130,7 +130,12 @@ mod pmem_impl {
 
             // Get or create a node index
             let node_idx = if let Some(idx) = self.free_list.pop() {
-                // Reuse deleted node slot
+                // Reuse deleted node slot - update its fields
+                let node = &mut self.nodes[idx];
+                node.key = key.clone();
+                node.prev = None;
+                node.next = self.head;
+                node.active = true;
                 idx
             } else {
                 // Allocate new node
@@ -147,15 +152,6 @@ mod pmem_impl {
                 });
                 idx
             };
-
-            // Update the node if reusing
-            if node_idx < self.nodes.len() {
-                let node = &mut self.nodes[node_idx];
-                node.key = key.clone();
-                node.prev = None;
-                node.next = self.head;
-                node.active = true;
-            }
 
             // Update the previous head's prev pointer
             if let Some(old_head_idx) = self.head {
