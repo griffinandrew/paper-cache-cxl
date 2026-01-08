@@ -208,7 +208,8 @@ impl CountStack {
 mod tests {
 	#[test]
 	fn eviction_order_is_correct() {
-		use crate::worker::policy::policy_stack::{PolicyStack, LfuStack};
+		use crate::worker::policy::{PublicPolicyStack as PolicyStack, public_init_policy_stack};
+		use super::LfuStack;
 
 		let mut stack = LfuStack::default();
 
