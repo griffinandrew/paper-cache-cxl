@@ -110,6 +110,12 @@ pub type OverheadManagerRef = Arc<OverheadManager>;
 /// - 0 for DRAM tier
 /// - 1 for PMEM tier
 /// - -1 for unknown/error
+///
+/// # Safety
+/// This function is safe to call because:
+/// - The pointer is only used for tier identification, not dereferenced
+/// - The C function check_tier() only calls umfPoolByPtr which safely checks pool membership
+/// - The pointer cast to *mut c_void is required by the C API but the C function doesn't mutate the data
 #[cfg(feature = "allocator_api")]
 pub fn check_memory_tier<T>(ptr: *const T) -> i32 {
     unsafe {
@@ -1874,8 +1880,9 @@ where
 		let hashed_key = self.hash_key(key);
 
 		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.key_ptr()),
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				Ok(object.key_ptr())
+			},
 			_ => Err(CacheError::KeyNotFound),
 		}
 	}
@@ -1888,8 +1895,8 @@ where
 
 		match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				let data = object.data();
-				Ok(data.as_ptr())
+				let arc_value = object.data();
+				Ok(arc_value.as_ptr())
 			},
 			_ => Err(CacheError::KeyNotFound),
 		}

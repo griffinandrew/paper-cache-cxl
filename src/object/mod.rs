@@ -21,6 +21,10 @@ pub type ExpireTime = Option<Instant>;
 #[cfg(feature = "allocator_api")]
 use crate::allocator::HybridObjects as Hybrid;
 
+/// Object struct for the allocator_api feature.
+/// When allocator_api is enabled, both the key and value are allocated in the pmem tier
+/// using the Hybrid allocator (Box<K, Hybrid>). This ensures that all cache data resides
+/// in persistent memory for CXL/pmem use cases.
 #[cfg(feature = "allocator_api")]
 pub struct Object<K, V> {
 	key: Box<K, Hybrid>,
@@ -29,6 +33,9 @@ pub struct Object<K, V> {
 	expiry: ExpireTime,
 }
 
+/// Object struct for builds without the allocator_api feature.
+/// Keys are stored as plain K type in DRAM, values can be in either DRAM or pmem
+/// depending on the V type.
 #[cfg(not(feature = "allocator_api"))]
 pub struct Object<K, V> {
 	key: K,
