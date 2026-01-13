@@ -1867,6 +1867,34 @@ where
 		Ok(())
 	}
 
+	/// Helper method for testing: gets a pointer to the key stored in the cache.
+	/// This is used to verify which memory tier the key is allocated in.
+	#[cfg(test)]
+	pub fn get_key_ptr(&self, key: &K) -> Result<*const K, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Ok(object.key_ptr()),
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
+	/// Helper method for testing: gets a pointer to the value stored in the cache.
+	/// This is used to verify which memory tier the value is allocated in.
+	#[cfg(test)]
+	pub fn get_value_ptr(&self, key: &K) -> Result<*const u8, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				let data = object.data();
+				Ok(data.as_ptr())
+			},
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
 		if let Err(err) = self.worker_manager.try_send(event) {
 			error!("Could not communicate with workers: {err:?}");
