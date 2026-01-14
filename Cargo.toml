@@ -39,6 +39,9 @@ all_dram = []
 original = []
 alloc_with_hash =[]
 alloc_api_exp = []
+tiering_hashtable_pmem = [] # Place tiering manager's hashtable in pmem
+global_hashtable_pmem = [] # Place global hashtable in pmem
+enable_tiering_manager = [] # Enable the tiering manager functionality
 
 
 [build-dependencies]

@@ -34,7 +34,7 @@ mod object;
 mod policy;
 mod status;
 
-#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+#[cfg(all(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 pub mod tiering;
 
 
@@ -54,13 +54,14 @@ use std::{
 	},
 };
 
-#[cfg(not(any(feature = "alloc_with_hash", feature = "alloc_api_exp")))]
+#[cfg(not(any(feature = "alloc_with_hash", feature = "alloc_api_exp", feature = "global_hashtable_pmem")))]
 use dashmap::{
 	DashMap,
 	mapref::entry::Entry,
 };
 
-
+#[cfg(any(feature = "alloc_with_hash", feature = "alloc_api_exp", feature = "global_hashtable_pmem"))]
+use hashbrown::HashMap;
 
 #[cfg(any(feature = "alloc_with_hash", feature = "alloc_api_exp"))]
 use hashbrown::hash_map::Entry;
@@ -100,7 +101,7 @@ pub use crate::{
 	policy::PaperPolicy,
 };
 
-#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+#[cfg(all(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 pub use crate::tiering::{TieringManager, TieringConfig, TieringStats};
 
 pub type CacheSize = u64;
@@ -117,19 +118,23 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 pub type BufferDRAM = Box<[u8]>;
 
 
-#[cfg(not(any(feature = "alloc_with_hash", feature = "alloc_api_exp")))]
+#[cfg(all(not(any(feature = "alloc_with_hash", feature = "alloc_api_exp")), not(feature = "global_hashtable_pmem")))]
 pub type ObjectMapRef<K, V> = Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>;
 
-#[cfg(any(feature = "alloc_with_hash", feature = "alloc_api_exp"))]
-use hashbrown::HashMap;
+#[cfg(all(not(any(feature = "alloc_with_hash", feature = "alloc_api_exp")), feature = "global_hashtable_pmem"))]
+pub type ObjectMapRef<K, V> = Arc<RwLock<HashMap<HashedKey, Object<K, V>, BuildHasherDefault<NoHashHasher<HashedKey>>, Hybrid>>>;
 
-#[cfg(feature = "alloc_with_hash")]
-type ObjectMapRef<K, V> = Arc<RwLock<HashMap<u64, Object<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>;
-
-
-#[cfg(feature = "alloc_api_exp")]
+#[cfg(all(feature = "alloc_with_hash", not(feature = "global_hashtable_pmem")))]
 type ObjectMapRef<K, V> = Arc<RwLock<HashMap<u64, Object<K, V>, BuildHasherDefault<NoHashHasher<u64>>>>>;
 
+#[cfg(all(feature = "alloc_with_hash", feature = "global_hashtable_pmem"))]
+type ObjectMapRef<K, V> = Arc<RwLock<HashMap<u64, Object<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>;
+
+#[cfg(all(feature = "alloc_api_exp", not(feature = "global_hashtable_pmem")))]
+type ObjectMapRef<K, V> = Arc<RwLock<HashMap<u64, Object<K, V>, BuildHasherDefault<NoHashHasher<u64>>>>>;
+
+#[cfg(all(feature = "alloc_api_exp", feature = "global_hashtable_pmem"))]
+type ObjectMapRef<K, V> = Arc<RwLock<HashMap<u64, Object<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>;
 
 
 pub type StatusRef = Arc<AtomicStatus>;
@@ -143,7 +148,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 	worker_manager: Arc<WorkerSender>,
 	overhead_manager: OverheadManagerRef,
 	
-	#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+	#[cfg(all(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 	tiering_manager: Arc<TieringManager<K, V>>,
 
 	hasher: S,
@@ -260,11 +265,16 @@ where
 			return Err(CacheError::UnconfiguredPolicy);
 		}
 
+		#[cfg(not(feature = "global_hashtable_pmem"))]
 		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		
+		#[cfg(feature = "global_hashtable_pmem")]
+		let objects = Arc::new(RwLock::new(HashMap::with_hasher_in(NoHasher::default(), Hybrid)));
+		
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		#[cfg(feature = "allocator_api")]
+		#[cfg(all(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 		let tiering_manager = {
 			// Create tiering manager with default DRAM threshold at 20% of max_size
 			let mut tiering_config = tiering::TieringConfig::default();
@@ -275,7 +285,7 @@ where
 
 		let (worker_sender, worker_listener) = unbounded();
 
-		#[cfg(feature = "allocator_api")]
+		#[cfg(all(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
@@ -284,7 +294,7 @@ where
 			&tiering_manager,
 		)?;
 
-		#[cfg(not(feature = "allocator_api"))]
+		#[cfg(not(all(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"), feature = "enable_tiering_manager")))]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
@@ -301,7 +311,7 @@ where
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
 			
-			#[cfg(feature = "allocator_api")]
+			#[cfg(all(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 			tiering_manager,
 
 			hasher,
@@ -723,31 +733,31 @@ where
 	}
 
 
-#[cfg(feature = "allocator_api")]
+#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 /// Gets tiering statistics including objects in DRAM, promotions, and demotions.
 	pub fn tiering_stats(&self) -> tiering::TieringStats {
 		self.tiering_manager.stats()
 	}
 
-#[cfg(feature = "allocator_api")]
+#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 /// Sets the DRAM tier threshold in bytes.
 	pub fn set_dram_threshold(&self, threshold: u64) {
 		self.tiering_manager.set_dram_threshold(threshold);
 	}
 
-#[cfg(feature = "allocator_api")]
+#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 /// Gets the current DRAM tier threshold in bytes.
 	pub fn dram_threshold(&self) -> u64 {
 		self.tiering_manager.dram_threshold()
 	}
 
-#[cfg(feature = "allocator_api")]
+#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 	/// Sets the hotness threshold for promotion to DRAM.
 	pub fn set_hotness_threshold(&self, threshold: u64) {
 		self.tiering_manager.set_hotness_threshold(threshold);
 	}
 
-	#[cfg(feature = "allocator_api")]
+	#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 	/// Gets the current hotness threshold.
 	pub fn hotness_threshold(&self) -> u64 {
 		self.tiering_manager.hotness_threshold()
@@ -884,7 +894,7 @@ where
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		#[cfg(feature = "allocator_api")]
+		#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 		let tiering_manager = {
 			// Create tiering manager with default DRAM threshold at 20% of max_size
 			let mut tiering_config = tiering::TieringConfig::default();
@@ -894,7 +904,7 @@ where
 
 		let (worker_sender, worker_listener) = unbounded();
 
-		#[cfg(feature = "allocator_api")]
+		#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
@@ -903,7 +913,7 @@ where
 			&tiering_manager,
 		)?;
 
-		#[cfg(not(feature = "allocator_api"))]
+		#[cfg(not(all(feature = "allocator_api", feature = "enable_tiering_manager")))]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
@@ -920,7 +930,7 @@ where
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
 			
-			#[cfg(feature = "allocator_api")]
+			#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 			tiering_manager,
 
 			hasher,
@@ -1478,19 +1488,31 @@ where
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		// Create tiering manager with default DRAM threshold at 20% of max_size
-		let mut tiering_config = tiering::TieringConfig::default();
-		//tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
-		let tiering_manager = Arc::new(TieringManager::new(tiering_config));
+		#[cfg(feature = "enable_tiering_manager")]
+		let tiering_manager = {
+			// Create tiering manager with default DRAM threshold at 20% of max_size
+			let mut tiering_config = tiering::TieringConfig::default();
+			//tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			Arc::new(TieringManager::new(tiering_config))
+		};
 
 		let (worker_sender, worker_listener) = unbounded();
 
+		#[cfg(feature = "enable_tiering_manager")]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
 			&overhead_manager,
 			&tiering_manager,
+		)?;
+
+		#[cfg(not(feature = "enable_tiering_manager"))]
+		let mut worker_manager = WorkerManager::new(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
 		)?;
 
 		thread::spawn(move || worker_manager.run());
@@ -1501,6 +1523,8 @@ where
 
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
+			
+			#[cfg(feature = "enable_tiering_manager")]
 			tiering_manager,
 
 			hasher,
@@ -1978,31 +2002,31 @@ where
 	}
 
 
-	#[cfg(feature = "allocator_api")]
+	#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 	/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
 	pub fn tiering_stats(&self) -> tiering::TieringStats {
 		self.tiering_manager.stats()
 	}
 
-	#[cfg(feature = "allocator_api")]
+	#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 	/// Sets the DRAM tier threshold in bytes.
 	pub fn set_dram_threshold(&self, threshold: u64) {
 		self.tiering_manager.set_dram_threshold(threshold);
 	}
 
-	#[cfg(feature = "allocator_api")]
+	#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 	/// Gets the current DRAM tier threshold in bytes.
 	pub fn dram_threshold(&self) -> u64 {
 		self.tiering_manager.dram_threshold()
 	}
 
-	#[cfg(feature = "allocator_api")]
+	#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 	/// Sets the hotness threshold for promotion to DRAM.
 	pub fn set_hotness_threshold(&self, threshold: u64) {
 		self.tiering_manager.set_hotness_threshold(threshold);
 	}
 
-	#[cfg(feature = "allocator_api")]
+	#[cfg(all(feature = "allocator_api", feature = "enable_tiering_manager"))]
 	/// Gets the current hotness threshold.
 	pub fn hotness_threshold(&self) -> u64 {
 		self.tiering_manager.hotness_threshold()
@@ -2139,6 +2163,12 @@ where
 
 		//let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
 
+		#[cfg(not(feature = "global_hashtable_pmem"))]
+		let objects = Arc::new(RwLock::new(HashMap::with_hasher(
+			NoHasher::default(),
+		)));
+
+		#[cfg(feature = "global_hashtable_pmem")]
 		let objects = Arc::new(RwLock::new(HashMap::with_hasher_in(
 			NoHasher::default(),
 			Hybrid,
@@ -2147,19 +2177,31 @@ where
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		// Create tiering manager with default DRAM threshold at 20% of max_size
-		let mut tiering_config = tiering::TieringConfig::default();
-		//tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
-		let tiering_manager = Arc::new(TieringManager::new(tiering_config));
+		#[cfg(feature = "enable_tiering_manager")]
+		let tiering_manager = {
+			// Create tiering manager with default DRAM threshold at 20% of max_size
+			let mut tiering_config = tiering::TieringConfig::default();
+			//tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			Arc::new(TieringManager::new(tiering_config))
+		};
 
 		let (worker_sender, worker_listener) = unbounded();
 
+		#[cfg(feature = "enable_tiering_manager")]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
 			&overhead_manager,
 			&tiering_manager,
+		)?;
+
+		#[cfg(not(feature = "enable_tiering_manager"))]
+		let mut worker_manager = WorkerManager::new(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
 		)?;
 
 		thread::spawn(move || worker_manager.run());
@@ -2170,6 +2212,8 @@ where
 
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
+			
+			#[cfg(feature = "enable_tiering_manager")]
 			tiering_manager,
 
 			hasher,
@@ -2656,31 +2700,31 @@ where
 	}
 
 
-	#[cfg(feature = "alloc_with_hash")]
+	#[cfg(all(feature = "alloc_with_hash", feature = "enable_tiering_manager"))]
 	/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
 	pub fn tiering_stats(&self) -> tiering::TieringStats {
 		self.tiering_manager.stats()
 	}
 
-	#[cfg(feature = "alloc_with_hash")]
+	#[cfg(all(feature = "alloc_with_hash", feature = "enable_tiering_manager"))]
 	/// Sets the DRAM tier threshold in bytes.
 	pub fn set_dram_threshold(&self, threshold: u64) {
 		self.tiering_manager.set_dram_threshold(threshold);
 	}
 
-	#[cfg(feature = "alloc_with_hash")]
+	#[cfg(all(feature = "alloc_with_hash", feature = "enable_tiering_manager"))]
 	/// Gets the current DRAM tier threshold in bytes.
 	pub fn dram_threshold(&self) -> u64 {
 		self.tiering_manager.dram_threshold()
 	}
 
-	#[cfg(feature = "alloc_with_hash")]
+	#[cfg(all(feature = "alloc_with_hash", feature = "enable_tiering_manager"))]
 	/// Sets the hotness threshold for promotion to DRAM.
 	pub fn set_hotness_threshold(&self, threshold: u64) {
 		self.tiering_manager.set_hotness_threshold(threshold);
 	}
 
-	#[cfg(feature = "alloc_with_hash")]
+	#[cfg(all(feature = "alloc_with_hash", feature = "enable_tiering_manager"))]
 	/// Gets the current hotness threshold.
 	pub fn hotness_threshold(&self) -> u64 {
 		self.tiering_manager.hotness_threshold()
@@ -2812,26 +2856,45 @@ where
 
 		//let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
 
+		#[cfg(not(feature = "global_hashtable_pmem"))]
 		let objects = Arc::new(RwLock::new(HashMap::with_hasher(
 			NoHasher::default(),
+		)));
+
+		#[cfg(feature = "global_hashtable_pmem")]
+		let objects = Arc::new(RwLock::new(HashMap::with_hasher_in(
+			NoHasher::default(),
+			Hybrid,
 		)));
 
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		// Create tiering manager with default DRAM threshold at 20% of max_size
-		let mut tiering_config = tiering::TieringConfig::default();
-		//tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
-		let tiering_manager = Arc::new(TieringManager::new(tiering_config));
+		#[cfg(feature = "enable_tiering_manager")]
+		let tiering_manager = {
+			// Create tiering manager with default DRAM threshold at 20% of max_size
+			let mut tiering_config = tiering::TieringConfig::default();
+			//tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			Arc::new(TieringManager::new(tiering_config))
+		};
 
 		let (worker_sender, worker_listener) = unbounded();
 
+		#[cfg(feature = "enable_tiering_manager")]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
 			&overhead_manager,
 			&tiering_manager,
+		)?;
+
+		#[cfg(not(feature = "enable_tiering_manager"))]
+		let mut worker_manager = WorkerManager::new(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
 		)?;
 
 		thread::spawn(move || worker_manager.run());
@@ -2842,6 +2905,8 @@ where
 
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
+			
+			#[cfg(feature = "enable_tiering_manager")]
 			tiering_manager,
 
 			hasher,
@@ -3328,31 +3393,31 @@ where
 	}
 
 
-	#[cfg(feature = "alloc_api_exp")]
+	#[cfg(all(feature = "alloc_api_exp", feature = "enable_tiering_manager"))]
 	/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
 	pub fn tiering_stats(&self) -> tiering::TieringStats {
 		self.tiering_manager.stats()
 	}
 
-	#[cfg(feature = "alloc_api_exp")]
+	#[cfg(all(feature = "alloc_api_exp", feature = "enable_tiering_manager"))]
 	/// Sets the DRAM tier threshold in bytes.
 	pub fn set_dram_threshold(&self, threshold: u64) {
 		self.tiering_manager.set_dram_threshold(threshold);
 	}
 
-	#[cfg(feature = "alloc_api_exp")]
+	#[cfg(all(feature = "alloc_api_exp", feature = "enable_tiering_manager"))]
 	/// Gets the current DRAM tier threshold in bytes.
 	pub fn dram_threshold(&self) -> u64 {
 		self.tiering_manager.dram_threshold()
 	}
 
-	#[cfg(feature = "alloc_api_exp")]
+	#[cfg(all(feature = "alloc_api_exp", feature = "enable_tiering_manager"))]
 	/// Sets the hotness threshold for promotion to DRAM.
 	pub fn set_hotness_threshold(&self, threshold: u64) {
 		self.tiering_manager.set_hotness_threshold(threshold);
 	}
 
-	#[cfg(feature = "alloc_api_exp")]
+	#[cfg(all(feature = "alloc_api_exp", feature = "enable_tiering_manager"))]
 	/// Gets the current hotness threshold.
 	pub fn hotness_threshold(&self) -> u64 {
 		self.tiering_manager.hotness_threshold()

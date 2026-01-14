@@ -25,7 +25,7 @@ use crate::{
 	},
 };
 
-#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+#[cfg(all(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 use crate::{
 	tiering::TieringManager,
 	worker::TieringWorker,
@@ -54,7 +54,7 @@ impl Worker for WorkerManager {
 }
 
 impl WorkerManager {
-	#[cfg(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+	#[cfg(all(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 	pub fn new<K, V>(
 		listener: WorkerReceiver,
 		objects: &ObjectMapRef<K, V>,
@@ -106,7 +106,7 @@ impl WorkerManager {
 		Ok(manager)
 	}
 
-	#[cfg(all(not(feature = "allocator_api"), not(feature = "alloc_with_hash"), not(feature = "alloc_api_exp")))]
+	#[cfg(all(not(all(any(feature = "allocator_api", feature = "alloc_with_hash", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))))]
 	pub fn new<K, V>(
 		listener: WorkerReceiver,
 		objects: &ObjectMapRef<K, V>,
