@@ -77,7 +77,8 @@ impl<K, V> Object<K, V> {
 		V: TypeSize,
 	{
 		(
-			(**self.key).get_size()
+			//(**self.key).get_size()
+			self.key.get_size()
 				+ self.data.get_size()
 				+ mem::size_of::<ExpireTime>()
 		) as ObjectSize
@@ -98,11 +99,11 @@ impl<K, V> Object<K, V> {
 		};
 	}
 
-	/// Helper method to get a pointer to the key for tier checking.
-	/// This is only available when the allocator_api feature is enabled.
-	pub fn key_ptr(&self) -> *const K {
-		&**self.key as *const K
-	}
+	// Helper method to get a pointer to the key for tier checking.
+	// This is only available when the allocator_api feature is enabled.
+	//pub fn key_ptr(&self) -> *const K {
+	//	&**self.key as *const K
+	//}
 }
 
 #[cfg(not(feature = "allocator_api"))]
