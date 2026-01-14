@@ -5,6 +5,7 @@ PaperCache is an in-memory cache which supports the dynamic switching between an
 Note: this crate should not be used directly; please use the paper-server crate instead.
 
 This branch makes it such that both the key and value reside in the pmem tier.
+origtinal feature flags for reference... 
 
 ## Tiering Manager
 
