@@ -82,7 +82,9 @@
 //! ```
 
 pub mod manager;
+pub mod object;
 
 pub use manager::TieringManager;
 pub use manager::TieringConfig;
 pub use manager::TieringStats;
+pub use object::TieringObject;
