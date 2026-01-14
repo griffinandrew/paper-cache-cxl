@@ -105,6 +105,24 @@ pub type ObjectMapRef<K, V> = Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>;
 pub type StatusRef = Arc<AtomicStatus>;
 pub type OverheadManagerRef = Arc<OverheadManager>;
 
+/// Check which memory tier a pointer belongs to.
+/// Returns:
+/// - 0 for DRAM tier
+/// - 1 for PMEM tier
+/// - -1 for unknown/error
+///
+/// # Safety
+/// This function is safe to call because:
+/// - The pointer is only used for tier identification, not dereferenced
+/// - The C function check_tier() only calls umfPoolByPtr which safely checks pool membership
+/// - The pointer cast to *mut c_void is required by the C API but the C function doesn't mutate the data
+#[cfg(feature = "allocator_api")]
+pub fn check_memory_tier<T>(ptr: *const T) -> i32 {
+    unsafe {
+        allocator_bindings::check_tier(ptr as *mut std::ffi::c_void)
+    }
+}
+
 
 
 pub struct PaperCache<K, V, S = RandomState> {
@@ -1855,6 +1873,35 @@ where
 		Ok(())
 	}
 
+	/// Helper method for testing: gets a pointer to the key stored in the cache.
+	/// This is used to verify which memory tier the key is allocated in.
+	#[cfg(test)]
+	pub fn get_key_ptr(&self, key: &K) -> Result<*const K, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				Ok(object.key_ptr())
+			},
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
+	/// Helper method for testing: gets a pointer to the value stored in the cache.
+	/// This is used to verify which memory tier the value is allocated in.
+	#[cfg(test)]
+	pub fn get_value_ptr(&self, key: &K) -> Result<*const u8, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				let arc_value = object.data();
+				Ok(arc_value.as_ptr())
+			},
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
 		if let Err(err) = self.worker_manager.try_send(event) {
 			error!("Could not communicate with workers: {err:?}");
@@ -2430,5 +2477,103 @@ mod tests {
 			&[PaperPolicy::Lfu],
 			PaperPolicy::Lfu,
 		).expect("Could not initialize test cache")
+	}
+
+	// Tests for key-value tier allocation with allocator_api feature
+	#[cfg(feature = "allocator_api")]
+	mod tier_allocation_tests {
+		use super::*;
+
+		#[test]
+		fn test_key_stored_in_pmem_tier() {
+			let cache = PaperCache::<u32, BufferPMEM>::new(
+				TEST_CACHE_MAX_SIZE,
+				&[PaperPolicy::Lfu],
+				PaperPolicy::Lfu,
+			).expect("Could not initialize test cache");
+
+			let key: u32 = 42;
+			let value = vec![1u8, 2, 3, 4, 5];
+			
+			assert!(cache.set(key, &value, None).is_ok());
+
+			// Get pointer to the key
+			let key_ptr = cache.get_key_ptr(&key).expect("Failed to get key pointer");
+			
+			// Check that the key is in PMEM tier (tier = 1)
+			let tier = crate::check_memory_tier(key_ptr);
+			assert_eq!(tier, 1, "Key should be allocated in PMEM tier (1), but was in tier {}", tier);
+		}
+
+		#[test]
+		fn test_value_stored_in_pmem_tier() {
+			let cache = PaperCache::<u32, BufferPMEM>::new(
+				TEST_CACHE_MAX_SIZE,
+				&[PaperPolicy::Lfu],
+				PaperPolicy::Lfu,
+			).expect("Could not initialize test cache");
+
+			let key: u32 = 99;
+			let value = vec![10u8, 20, 30, 40, 50];
+			
+			assert!(cache.set(key, &value, None).is_ok());
+
+			// Get pointer to the value
+			let value_ptr = cache.get_value_ptr(&key).expect("Failed to get value pointer");
+			
+			// Check that the value is in PMEM tier (tier = 1)
+			let tier = crate::check_memory_tier(value_ptr);
+			assert_eq!(tier, 1, "Value should be allocated in PMEM tier (1), but was in tier {}", tier);
+		}
+
+		#[test]
+		fn test_multiple_keys_in_pmem_tier() {
+			let cache = PaperCache::<u32, BufferPMEM>::new(
+				TEST_CACHE_MAX_SIZE,
+				&[PaperPolicy::Lfu],
+				PaperPolicy::Lfu,
+			).expect("Could not initialize test cache");
+
+			// Insert multiple key-value pairs
+			for i in 0..10 {
+				let value = vec![i as u8; 100];
+				assert!(cache.set(i, &value, None).is_ok());
+			}
+
+			// Verify all keys are in PMEM tier
+			for i in 0..10 {
+				let key_ptr = cache.get_key_ptr(&i).expect("Failed to get key pointer");
+				let tier = crate::check_memory_tier(key_ptr);
+				assert_eq!(tier, 1, "Key {} should be in PMEM tier", i);
+			}
+		}
+
+		#[test]
+		fn test_key_and_value_tiers_distinguishable() {
+			let cache = PaperCache::<u32, BufferPMEM>::new(
+				TEST_CACHE_MAX_SIZE,
+				&[PaperPolicy::Lfu],
+				PaperPolicy::Lfu,
+			).expect("Could not initialize test cache");
+
+			let key: u32 = 123;
+			let value = vec![55u8; 200];
+			
+			assert!(cache.set(key, &value, None).is_ok());
+
+			let key_ptr = cache.get_key_ptr(&key).expect("Failed to get key pointer");
+			let value_ptr = cache.get_value_ptr(&key).expect("Failed to get value pointer");
+			
+			// Both should be in PMEM tier (1)
+			let key_tier = crate::check_memory_tier(key_ptr);
+			let value_tier = crate::check_memory_tier(value_ptr);
+			
+			assert_eq!(key_tier, 1, "Key should be in PMEM tier");
+			assert_eq!(value_tier, 1, "Value should be in PMEM tier");
+			
+			// Verify we can distinguish them (they should have different addresses)
+			assert_ne!(key_ptr as usize, value_ptr as usize, 
+				"Key and value should have different memory addresses");
+		}
 	}
 }
