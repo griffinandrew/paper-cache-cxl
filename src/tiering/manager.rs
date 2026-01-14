@@ -142,8 +142,6 @@ where
         }
     }
 
-
-
     /// Creates a new TieringManager with default configuration
     pub fn with_defaults() -> Self {
         Self::new(TieringConfig::default())
@@ -263,7 +261,7 @@ where
     /// Promotes an object to DRAM (metadata only - for tests)
     /// Returns true if promotion was successful
     /// Note: This only updates metadata, not actual data. Use promote_to_dram_with_data for production.
-    #[cfg(all(test, feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+    #[cfg(test)]
     fn promote_to_dram(&self, key: HashedKey) -> bool {
         // This method is only for tests that don't need actual data copies
         let mut info_map = self.object_info.write().unwrap();
@@ -293,10 +291,7 @@ where
 
         false
     }
-
-
-
-
+    
     /// Demotes an object from DRAM (removes the DRAM copy, keeps PMEM)
     /// Returns true if demotion was successful
     pub fn demote_from_dram(&self, key: HashedKey) -> bool {
