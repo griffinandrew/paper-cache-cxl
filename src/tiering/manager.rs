@@ -119,7 +119,8 @@ pub struct TieringManager<K, V> {
     dram_objects: Arc<RwLock<HashSet<HashedKey>>>,
     
     /// DRAM cache storing TieringObject<K> instances
-    /// Uses TieringObject to ensure key and value are on the same tier when allocator_api is enabled
+    /// TieringObject always uses DRAM allocation (not Hybrid allocator) to ensure
+    /// both key and value are in DRAM for fast access to hot objects
     dram_cache: Arc<DashMap<HashedKey, TieringObject<K>, NoHasher>>,
     
     _phantom: std::marker::PhantomData<(K, V)>,
