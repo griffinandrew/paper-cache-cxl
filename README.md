@@ -67,3 +67,69 @@ Unlike simple metadata tracking, this implementation maintains **two physical co
 
 This ensures hot objects benefit from DRAM speed while maintaining data durability in PMEM.
 
+## Feature Flags for Memory Tier Configuration
+
+PaperCache provides fine-grained control over memory placement through feature flags:
+
+### Tiering Manager Control
+
+- **`enable_tiering_manager`**: Enables the tiering manager functionality
+  - When enabled: Automatic promotion/demotion between DRAM and PMEM tiers
+  - When disabled: No automatic tiering, but global hashtable can still be placed in PMEM
+
+### Hashtable Memory Placement
+
+Independent control over where hashtables are stored (requires one of the allocator features):
+
+- **`tiering_hashtable_pmem`**: Places the tiering manager's internal hashtable in persistent memory
+  - Requires: `enable_tiering_manager` + one of (`allocator_api`, `alloc_with_hash`, `alloc_api_exp`)
+  - When disabled: Tiering hashtable uses DRAM
+
+- **`global_hashtable_pmem`**: Places the main cache hashtable in persistent memory
+  - Requires: One of (`allocator_api`, `alloc_with_hash`, `alloc_api_exp`)
+  - Works independently of tiering manager
+  - When disabled: Global hashtable uses DRAM
+
+### Usage Examples
+
+#### All combinations with tiering enabled:
+
+```toml
+# Both hashtables in PMEM (maximum persistence)
+[dependencies]
+paper-cache = { features = ["enable_tiering_manager", "tiering_hashtable_pmem", "global_hashtable_pmem", "alloc_with_hash"] }
+
+# Only global hashtable in PMEM (cache data persistent, tiering metadata in DRAM)
+[dependencies]
+paper-cache = { features = ["enable_tiering_manager", "global_hashtable_pmem", "alloc_with_hash"] }
+
+# Only tiering hashtable in PMEM (tiering metadata persistent, cache data in DRAM)
+[dependencies]
+paper-cache = { features = ["enable_tiering_manager", "tiering_hashtable_pmem", "alloc_with_hash"] }
+
+# Neither in PMEM (all in DRAM, baseline performance)
+[dependencies]
+paper-cache = { features = ["enable_tiering_manager", "alloc_with_hash"] }
+```
+
+#### Without tiering manager:
+
+```toml
+# Global hashtable in PMEM without automatic tiering
+[dependencies]
+paper-cache = { features = ["global_hashtable_pmem", "alloc_with_hash"] }
+```
+
+### Performance Considerations
+
+- **PMEM hashtables**: Slower access but persistent across restarts
+- **DRAM hashtables**: Faster access but volatile
+- **Tiering manager off + global in PMEM**: Simplest persistent cache without automatic promotion/demotion overhead
+
+### Required Base Features
+
+These feature flags work in conjunction with:
+- `allocator_api`: Standard allocator API support
+- `alloc_with_hash`: Hashbrown with allocator support
+- `alloc_api_exp`: Experimental allocator API
+
