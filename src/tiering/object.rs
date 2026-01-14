@@ -15,8 +15,6 @@ use std::{
     time::Instant,
 };
 
-use typesize::TypeSize;
-
 use crate::object::ExpireTime;
 
 #[cfg(feature = "allocator_api")]
@@ -47,11 +45,7 @@ impl<K> TieringObject<K> {
     /// Create a new TieringObject with an explicit expiry time
     pub fn with_expiry(key: K, data: Box<[u8]>, expiry: ExpireTime) -> Self {
         // Convert the regular Box<[u8]> to Box<[u8], Hybrid> by copying the data
-        let len = data.len();
-        let mut hybrid_data = Box::new_in([0u8; 0], Hybrid);
-        
-        // We need to allocate the correct size
-        let mut vec = Vec::with_capacity_in(len, Hybrid);
+        let mut vec = Vec::with_capacity_in(data.len(), Hybrid);
         vec.extend_from_slice(&data);
         let hybrid_data = vec.into_boxed_slice();
         

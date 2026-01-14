@@ -214,9 +214,6 @@ where
         let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
         
         // Create new TieringObject with key, data, and expiry
-        // Note: We need a way to get the key from object. For now, we'll need to pass it separately
-        // or add a key() method to Object. Since we can't modify Object per requirements,
-        // we'll change the signature to accept the key separately.
         TieringObject::with_expiry(object.key().clone(), dram_data, object.expiry())
     }
 
