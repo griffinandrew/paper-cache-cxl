@@ -21,6 +21,7 @@ use crate::object::ExpireTime;
 /// TieringObject struct for the tiering manager's DRAM cache.
 /// Both the key and value are always stored in DRAM (not using Hybrid allocator)
 /// to ensure fast access to hot objects.
+#[derive(Clone)]
 pub struct TieringObject<K> {
     key: K,
     data: Arc<Box<[u8]>>,
