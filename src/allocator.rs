@@ -19,14 +19,18 @@ pub struct HybridObjects;
 
 //pub mod allocator;
 
+// Constants for DRAM limit configuration
+const ALL_DRAM_LIMIT_BYTES: usize = 1000 * 1024 * 1024 * 1024; // 1 TB - effectively unlimited for all-DRAM mode
+const ALL_PMEM_LIMIT_BYTES: usize = 0; // 0 bytes - everything goes to PMEM
+
 static INIT: Once = Once::new();
 static DRAM_ALLOCATED_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(feature = "all_dram")]
-static mut DRAM_LIMIT_OBJECTS: usize = 1000 * 1024 * 1024 * 1024; // All in DRAM
+static mut DRAM_LIMIT_OBJECTS: usize = ALL_DRAM_LIMIT_BYTES; // All in DRAM
 
 #[cfg(not(feature = "all_dram"))]
-static mut DRAM_LIMIT_OBJECTS: usize = 0; // All in PMEM by default
+static mut DRAM_LIMIT_OBJECTS: usize = ALL_PMEM_LIMIT_BYTES; // All in PMEM by default
 
 static PRINT_THRESHOLD: usize = 10000;
 static mut NUM_ALLOCS: usize = 0;
@@ -39,7 +43,7 @@ unsafe impl GlobalAlloc for HybridObjects {
         // Decide backend
 
         //if only using pmem ... dont track the fucking counters.... 
-        if DRAM_LIMIT_OBJECTS == 0 {
+        if DRAM_LIMIT_OBJECTS == ALL_PMEM_LIMIT_BYTES {
             unsafe {
                 INIT.call_once(|| {
                     let dax_size = 236757975040; // PMEM size from ndctl list --namespaces
@@ -60,7 +64,7 @@ unsafe impl GlobalAlloc for HybridObjects {
             return ptr;
         }
 
-        if DRAM_LIMIT_OBJECTS == 1000 * 1024 * 1024 * 1024 {
+        if DRAM_LIMIT_OBJECTS == ALL_DRAM_LIMIT_BYTES {
             let ptr = Jemalloc.alloc(layout);
             if ptr.is_null() { println!("Failed to allocate DRAM"); return ptr::null_mut(); }
             return ptr;
@@ -116,14 +120,14 @@ unsafe impl GlobalAlloc for HybridObjects {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         
-        if DRAM_LIMIT_OBJECTS == 0 {
+        if DRAM_LIMIT_OBJECTS == ALL_PMEM_LIMIT_BYTES {
             //all in pmem
             unsafe { allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void); }
             #[cfg(debug_assertions)] { ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst); }
 
             return;
         }
-        if DRAM_LIMIT_OBJECTS == 1000 * 1024 * 1024 * 1024 {
+        if DRAM_LIMIT_OBJECTS == ALL_DRAM_LIMIT_BYTES {
             //all in dram
             unsafe { Jemalloc.dealloc(ptr as *mut u8, layout); }
             #[cfg(debug_assertions)] { ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst); }
