@@ -15,7 +15,7 @@ The implementation provides three independent feature flags to control:
 - **Purpose**: Enable/disable the tiering manager functionality
 - **When enabled**: Automatic promotion/demotion of hot objects between DRAM and PMEM tiers
 - **When disabled**: No automatic tiering, but global hashtable can still be placed in PMEM
-- **Requirements**: Works with `key_value_pmem`, `alloc_with_hash`, or `alloc_api_exp`
+- **Requirements**: Works with `key_value_pmem` or `alloc_api_exp`
 
 ### `tiering_hashtable_pmem`
 - **Purpose**: Control memory placement of the tiering manager's internal hashtable
@@ -27,7 +27,7 @@ The implementation provides three independent feature flags to control:
 - **Purpose**: Control memory placement of the main cache hashtable
 - **When enabled**: Global cache hashtable stored in PMEM
 - **When disabled**: Global cache hashtable stored in DRAM
-- **Requirements**: One of (`key_value_pmem`, `alloc_with_hash`, `alloc_api_exp`)
+- **Requirements**: One of (`key_value_pmem`, `alloc_api_exp`)
 
 ## Implementation Details
 
@@ -63,29 +63,29 @@ The code uses `#[cfg(...)]` attributes extensively to:
 
 1. **All in DRAM** (baseline performance):
    ```toml
-   features = ["enable_tiering_manager", "alloc_with_hash"]
+   features = ["enable_tiering_manager", "key_value_pmem"]
    ```
 
 2. **Global hashtable in PMEM**:
    ```toml
-   features = ["enable_tiering_manager", "global_hashtable_pmem", "alloc_with_hash"]
+   features = ["enable_tiering_manager", "global_hashtable_pmem", "key_value_pmem"]
    ```
 
 3. **Tiering hashtable in PMEM**:
    ```toml
-   features = ["enable_tiering_manager", "tiering_hashtable_pmem", "alloc_with_hash"]
+   features = ["enable_tiering_manager", "tiering_hashtable_pmem", "key_value_pmem"]
    ```
 
 4. **Both hashtables in PMEM** (maximum persistence):
    ```toml
-   features = ["enable_tiering_manager", "tiering_hashtable_pmem", "global_hashtable_pmem", "alloc_with_hash"]
+   features = ["enable_tiering_manager", "tiering_hashtable_pmem", "global_hashtable_pmem", "key_value_pmem"]
    ```
 
 ### Without Tiering Manager
 
 5. **Global hashtable in PMEM, no tiering**:
    ```toml
-   features = ["global_hashtable_pmem", "alloc_with_hash"]
+   features = ["global_hashtable_pmem", "key_value_pmem"]
    ```
 
 ## Performance Characteristics
@@ -126,19 +126,19 @@ To test different combinations (requires nightly Rust for allocator features):
 
 ```bash
 # Test with tiering and both hashtables in PMEM
-cargo +nightly check --features "enable_tiering_manager,tiering_hashtable_pmem,global_hashtable_pmem,alloc_with_hash"
+cargo +nightly check --features "enable_tiering_manager,tiering_hashtable_pmem,global_hashtable_pmem,key_value_pmem"
 
 # Test without tiering, global hashtable in PMEM (global cache only)
-cargo +nightly check --features "global_hashtable_pmem,alloc_with_hash"
+cargo +nightly check --features "global_hashtable_pmem,key_value_pmem"
 
 # Test with tiering, neither hashtable in PMEM
-cargo +nightly check --features "enable_tiering_manager,alloc_with_hash"
+cargo +nightly check --features "enable_tiering_manager,key_value_pmem"
 
 # Test baseline without any features
 cargo +nightly check --no-default-features
 
 # Test global cache with allocator but no tiering
-cargo +nightly check --features "alloc_with_hash"
+cargo +nightly check --features "key_value_pmem"
 ```
 
 **Note**: The tiering worker module is only compiled when BOTH an allocator feature 

@@ -82,11 +82,11 @@ PaperCache provides fine-grained control over memory placement through feature f
 Independent control over where hashtables are stored (requires one of the allocator features):
 
 - **`tiering_hashtable_pmem`**: Places the tiering manager's internal hashtable in persistent memory
-  - Requires: `enable_tiering_manager` + one of (`key_value_pmem`, `alloc_with_hash`, `alloc_api_exp`)
+  - Requires: `enable_tiering_manager` + one of (`key_value_pmem`, `alloc_api_exp`)
   - When disabled: Tiering hashtable uses DRAM
 
 - **`global_hashtable_pmem`**: Places the main cache hashtable in persistent memory
-  - Requires: One of (`key_value_pmem`, `alloc_with_hash`, `alloc_api_exp`)
+  - Requires: One of (`key_value_pmem`, `alloc_api_exp`)
   - Works independently of tiering manager
   - When disabled: Global hashtable uses DRAM
 
@@ -97,19 +97,19 @@ Independent control over where hashtables are stored (requires one of the alloca
 ```toml
 # Both hashtables in PMEM (maximum persistence)
 [dependencies]
-paper-cache = { features = ["enable_tiering_manager", "tiering_hashtable_pmem", "global_hashtable_pmem", "alloc_with_hash"] }
+paper-cache = { features = ["enable_tiering_manager", "tiering_hashtable_pmem", "global_hashtable_pmem", "key_value_pmem"] }
 
 # Only global hashtable in PMEM (cache data persistent, tiering metadata in DRAM)
 [dependencies]
-paper-cache = { features = ["enable_tiering_manager", "global_hashtable_pmem", "alloc_with_hash"] }
+paper-cache = { features = ["enable_tiering_manager", "global_hashtable_pmem", "key_value_pmem"] }
 
 # Only tiering hashtable in PMEM (tiering metadata persistent, cache data in DRAM)
 [dependencies]
-paper-cache = { features = ["enable_tiering_manager", "tiering_hashtable_pmem", "alloc_with_hash"] }
+paper-cache = { features = ["enable_tiering_manager", "tiering_hashtable_pmem", "key_value_pmem"] }
 
 # Neither in PMEM (all in DRAM, baseline performance)
 [dependencies]
-paper-cache = { features = ["enable_tiering_manager", "alloc_with_hash"] }
+paper-cache = { features = ["enable_tiering_manager", "key_value_pmem"] }
 ```
 
 #### Without tiering manager:
@@ -117,7 +117,7 @@ paper-cache = { features = ["enable_tiering_manager", "alloc_with_hash"] }
 ```toml
 # Global hashtable in PMEM without automatic tiering
 [dependencies]
-paper-cache = { features = ["global_hashtable_pmem", "alloc_with_hash"] }
+paper-cache = { features = ["global_hashtable_pmem", "key_value_pmem"] }
 ```
 
 ### Performance Considerations
