@@ -9,6 +9,13 @@
 
 #![cfg_attr(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem"), feature(allocator_api))]
 
+// When all_dram is enabled, use jemalloc as the global allocator
+#[cfg(feature = "all_dram")]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "all_dram")]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem"))]
 pub mod allocator;
