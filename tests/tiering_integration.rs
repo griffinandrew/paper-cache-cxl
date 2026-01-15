@@ -1,13 +1,13 @@
-#[cfg(feature = "all_dram")]
+#[cfg(all(feature = "enable_tiering_manager", feature = "alloc_with_hash"))]
 mod tiering_tests {
-    use paper_cache::{PaperCache, PaperPolicy};
+    use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
     use std::thread;
     use std::time::Duration;
 
     #[test]
     fn test_tiering_manager_integration() {
         // Create a cache with a small max size
-        let cache = PaperCache::<u32, Box<[u8]>>::new(
+        let cache = PaperCache::<u32, BufferPMEM>::new(
             10000,
             &[PaperPolicy::Lfu],
             PaperPolicy::Lfu,
@@ -48,7 +48,7 @@ mod tiering_tests {
 
     #[test]
     fn test_tiering_configuration() {
-        let cache = PaperCache::<u32, Box<[u8]>>::new(
+        let cache = PaperCache::<u32, BufferPMEM>::new(
             10000,
             &[PaperPolicy::Lfu],
             PaperPolicy::Lfu,
@@ -68,7 +68,7 @@ mod tiering_tests {
 
     #[test]
     fn test_tiering_stats() {
-        let cache = PaperCache::<u32, Box<[u8]>>::new(
+        let cache = PaperCache::<u32, BufferPMEM>::new(
             10000,
             &[PaperPolicy::Lfu],
             PaperPolicy::Lfu,
