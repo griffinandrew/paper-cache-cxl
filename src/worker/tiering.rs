@@ -39,7 +39,8 @@ use crate::{
     },
 };
 
-use super::TieringManager;
+#[cfg(feature = "enable_tiering_manager")]
+use crate::tiering::TieringManager;
 
 /// Interval for periodic tiering decisions (migration checks)
 const TIERING_INTERVAL: Duration = Duration::from_secs(5);
