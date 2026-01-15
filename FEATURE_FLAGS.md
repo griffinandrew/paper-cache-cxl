@@ -122,18 +122,28 @@ The code uses `#[cfg(...)]` attributes extensively to:
 
 ## Testing
 
-To test different combinations:
+To test different combinations (requires nightly Rust for allocator features):
 
 ```bash
-# Test with tiering and both hashtables in PMEM (requires nightly Rust)
+# Test with tiering and both hashtables in PMEM
 cargo +nightly check --features "enable_tiering_manager,tiering_hashtable_pmem,global_hashtable_pmem,alloc_with_hash"
 
-# Test without tiering, global hashtable in PMEM
+# Test without tiering, global hashtable in PMEM (global cache only)
 cargo +nightly check --features "global_hashtable_pmem,alloc_with_hash"
 
 # Test with tiering, neither hashtable in PMEM
 cargo +nightly check --features "enable_tiering_manager,alloc_with_hash"
+
+# Test baseline without any features
+cargo +nightly check --no-default-features
+
+# Test global cache with allocator but no tiering
+cargo +nightly check --features "alloc_with_hash"
 ```
+
+**Note**: The tiering worker module is only compiled when BOTH an allocator feature 
+AND `enable_tiering_manager` are enabled. This ensures the tiering manager is not 
+used at all when disabled, allowing the cache to operate as a single global cache.
 
 ## Acceptance Criteria
 
