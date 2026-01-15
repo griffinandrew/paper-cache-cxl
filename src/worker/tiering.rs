@@ -32,12 +32,14 @@ use crate::{
     StatusRef,
     OverheadManagerRef,
     error::CacheError,
-    tiering::TieringManager,
+    //tiering::TieringManager,
     worker::{
         Worker,
         WorkerEvent,
     },
 };
+
+use super::TieringManager;
 
 /// Interval for periodic tiering decisions (migration checks)
 const TIERING_INTERVAL: Duration = Duration::from_secs(5);
