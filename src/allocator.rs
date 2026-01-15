@@ -198,7 +198,7 @@ unsafe impl Allocator for HybridObjects {
 
 //allocator_api2 support
 
-#[cfg(feature = "alloc_api_exp")]
+#[cfg(any(feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem"))]
 unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
         let ptr = unsafe { self.alloc(layout) };

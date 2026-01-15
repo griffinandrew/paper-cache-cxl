@@ -18,7 +18,7 @@ use std::hash::BuildHasherDefault;
 
 pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 
-#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem"))]
 use crate::allocator::HybridObjects as Hybrid;
 
 mod allocator_bindings {
