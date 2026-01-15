@@ -2162,7 +2162,7 @@ where
 		let hashed_key = self.hash_key(&key);
 
 		// Values stored in DRAM (BufferDRAM = Box<[u8]>)
-		let val_buf: BufferDRAM = value.to_vec().into_boxed_slice();
+		let val_buf: BufferDRAM = value.into();
 		let object = Object::new(key, val_buf, ttl);
 
 		let base_size = self.overhead_manager.base_size(&object);
@@ -3660,15 +3660,18 @@ mod test_global_hashtable_pmem_alone {
             PaperPolicy::Lfu,
         ).expect("Failed to create cache");
 
-        cache.set("key1".to_string(), b"value1", None).unwrap();
-        cache.set("key2".to_string(), b"value2", None).unwrap();
+        let key1 = "key1".to_string();
+        let key2 = "key2".to_string();
         
-        assert!(cache.has(&"key1".to_string()));
-        assert!(cache.has(&"key2".to_string()));
+        cache.set(key1.clone(), b"value1", None).unwrap();
+        cache.set(key2.clone(), b"value2", None).unwrap();
+        
+        assert!(cache.has(&key1));
+        assert!(cache.has(&key2));
 
         cache.wipe().expect("Failed to wipe cache");
 
-        assert!(!cache.has(&"key1".to_string()));
-        assert!(!cache.has(&"key2".to_string()));
+        assert!(!cache.has(&key1));
+        assert!(!cache.has(&key2));
     }
 }
