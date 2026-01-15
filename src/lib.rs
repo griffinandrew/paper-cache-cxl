@@ -2291,6 +2291,7 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// Check DRAM tier first
+		#[cfg(feature = "enable_tiering_manager")]
 		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
 			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
 				self.status.incr_hits();
@@ -2984,6 +2985,7 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// Check DRAM tier first
+		#[cfg(feature = "enable_tiering_manager")]
 		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
 			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
 				self.status.incr_hits();
