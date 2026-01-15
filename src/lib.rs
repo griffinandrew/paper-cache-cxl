@@ -3596,3 +3596,79 @@ mod tests {
 		).expect("Could not initialize test cache")
 	}
 }
+
+// Tests for global_hashtable_pmem alone (without key_value_pmem or alloc_api_exp)
+#[cfg(all(feature = "global_hashtable_pmem", not(feature = "key_value_pmem"), not(feature = "alloc_api_exp")))]
+#[cfg(test)]
+mod test_global_hashtable_pmem_alone {
+    use crate::{PaperCache, PaperPolicy};
+    use std::hash::RandomState;
+
+    #[test]
+    fn test_basic_operations() {
+        // Create cache with global hashtable in PMEM, values in DRAM
+        let cache: PaperCache<u32, Box<[u8]>, RandomState> = PaperCache::new(
+            1000000,
+            &[PaperPolicy::Lfu],
+            PaperPolicy::Lfu,
+        ).expect("Failed to create cache");
+
+        // Test set operation
+        let value = vec![1, 2, 3, 4, 5];
+        assert!(cache.set(1, &value, None).is_ok());
+
+        // Test get operation
+        let retrieved = cache.get(&1).expect("Failed to get value");
+        assert_eq!(retrieved, value);
+
+        // Test has operation
+        assert!(cache.has(&1));
+        assert!(!cache.has(&999));
+
+        // Test del operation
+        assert!(cache.del(&1).is_ok());
+        assert!(!cache.has(&1));
+    }
+
+    #[test]
+    fn test_multiple_keys() {
+        let cache: PaperCache<u32, Box<[u8]>, RandomState> = PaperCache::new(
+            10000000,
+            &[PaperPolicy::Lru],
+            PaperPolicy::Lru,
+        ).expect("Failed to create cache");
+
+        // Insert multiple key-value pairs
+        for i in 0..100 {
+            let value = vec![i as u8; 10];
+            assert!(cache.set(i, &value, None).is_ok());
+        }
+
+        // Verify all keys exist
+        for i in 0..100 {
+            assert!(cache.has(&i));
+            let retrieved = cache.get(&i).expect("Failed to get value");
+            assert_eq!(retrieved, vec![i as u8; 10]);
+        }
+    }
+
+    #[test]
+    fn test_wipe() {
+        let cache: PaperCache<String, Box<[u8]>, RandomState> = PaperCache::new(
+            1000000,
+            &[PaperPolicy::Lfu],
+            PaperPolicy::Lfu,
+        ).expect("Failed to create cache");
+
+        cache.set("key1".to_string(), b"value1", None).unwrap();
+        cache.set("key2".to_string(), b"value2", None).unwrap();
+        
+        assert!(cache.has(&"key1".to_string()));
+        assert!(cache.has(&"key2".to_string()));
+
+        cache.wipe().expect("Failed to wipe cache");
+
+        assert!(!cache.has(&"key1".to_string()));
+        assert!(!cache.has(&"key2".to_string()));
+    }
+}
