@@ -57,7 +57,7 @@ pub struct TieringWorker<K, V> {
     tiering_manager: Arc<TieringManager<K, V>>,
 }
 
-#[cfg(feature = "allocator_api")]
+#[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem")))]
 impl<K, V> TieringWorker<K, V>
 where
     K: 'static + Eq + TypeSize + Clone,
@@ -149,7 +149,7 @@ where
 
 
 
-#[cfg(any(feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+#[cfg(any(feature = "alloc_api_exp", all(feature = "key_value_pmem", feature = "global_hashtable_pmem")))]
 impl<K, V> TieringWorker<K, V>
 where
     K: 'static + Eq + TypeSize + Clone,

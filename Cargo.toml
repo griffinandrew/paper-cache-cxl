@@ -31,17 +31,28 @@ hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"
 
 
-[features] #think this is working as expected....? 
-#allocator_api = ["paper-cache/allocator_api"]
-allocator_api = []
-default = []
+[features]
+# Core feature to enable key and value storage in PMEM
+key_value_pmem = []
+
+# All data structures in DRAM (no PMEM usage)
 all_dram = []
-original = []
-alloc_with_hash =[]
+
+# Enable the tiering manager functionality
+enable_tiering_manager = []
+
+# Place tiering manager's hashtable in PMEM (requires enable_tiering_manager + key_value_pmem or alloc_api_exp)
+tiering_hashtable_pmem = []
+
+# Place global hashtable in PMEM (requires key_value_pmem or alloc_api_exp)
+global_hashtable_pmem = []
+
+# Experimental allocator API for testing (uses same hashtable type as key_value_pmem)
 alloc_api_exp = []
-tiering_hashtable_pmem = [] # Place tiering manager's hashtable in pmem
-global_hashtable_pmem = [] # Place global hashtable in pmem
-enable_tiering_manager = [] # Enable the tiering manager functionality
+
+# Legacy features (deprecated, will be removed)
+default = []
+original = []
 
 
 [build-dependencies]
