@@ -1369,7 +1369,7 @@ where
 
 
 
-#[cfg(feature = "key_value_pmem")]
+#[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem")))]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
     K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone, //note added Debug for logging might impact perf thoooo
@@ -1596,6 +1596,7 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// Check DRAM tier first
+		#[cfg(feature = "enable_tiering_manager")]
 		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
 			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
 				self.status.incr_hits();
@@ -2040,7 +2041,7 @@ where
 }
 
 
-#[cfg(feature = "alloc_api_exp")]
+#[cfg(any(feature = "alloc_api_exp", all(feature = "key_value_pmem", feature = "global_hashtable_pmem")))]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
     K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone, //note added Debug for logging might impact perf thoooo
