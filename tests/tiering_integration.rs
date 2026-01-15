@@ -1,4 +1,4 @@
-#[cfg(all(feature = "enable_tiering_manager", feature = "alloc_with_hash"))]
+#[cfg(all(feature = "enable_tiering_manager", feature = "key_value_pmem"))]
 mod tiering_tests {
     use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
     use std::thread;

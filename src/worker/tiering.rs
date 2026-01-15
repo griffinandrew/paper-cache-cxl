@@ -57,7 +57,7 @@ pub struct TieringWorker<K, V> {
     tiering_manager: Arc<TieringManager<K, V>>,
 }
 
-#[cfg(feature = "allocator_api")]
+#[cfg(feature = "key_value_pmem")]
 impl<K, V> TieringWorker<K, V>
 where
     K: 'static + Eq + TypeSize + Clone,
@@ -149,7 +149,7 @@ where
 
 
 
-#[cfg(any(feature = "alloc_with_hash", feature = "alloc_api_exp"))]
+#[cfg(feature = "alloc_api_exp")]
 impl<K, V> TieringWorker<K, V>
 where
     K: 'static + Eq + TypeSize + Clone,

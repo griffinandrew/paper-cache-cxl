@@ -8,7 +8,7 @@
 //! TieringObject - Object type specifically for the tiering manager
 //!
 //! This object type ensures that both the key and value are always allocated in DRAM,
-//! regardless of whether allocator_api is enabled. The tiering manager's DRAM cache
+//! regardless of whether key_value_pmem is enabled. The tiering manager's DRAM cache
 //! stores hot copies of objects for fast access, so they should always be in DRAM.
 
 use std::{

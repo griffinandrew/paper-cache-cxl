@@ -15,7 +15,7 @@ The implementation provides three independent feature flags to control:
 - **Purpose**: Enable/disable the tiering manager functionality
 - **When enabled**: Automatic promotion/demotion of hot objects between DRAM and PMEM tiers
 - **When disabled**: No automatic tiering, but global hashtable can still be placed in PMEM
-- **Requirements**: Works with `allocator_api`, `alloc_with_hash`, or `alloc_api_exp`
+- **Requirements**: Works with `key_value_pmem`, `alloc_with_hash`, or `alloc_api_exp`
 
 ### `tiering_hashtable_pmem`
 - **Purpose**: Control memory placement of the tiering manager's internal hashtable
@@ -27,7 +27,7 @@ The implementation provides three independent feature flags to control:
 - **Purpose**: Control memory placement of the main cache hashtable
 - **When enabled**: Global cache hashtable stored in PMEM
 - **When disabled**: Global cache hashtable stored in DRAM
-- **Requirements**: One of (`allocator_api`, `alloc_with_hash`, `alloc_api_exp`)
+- **Requirements**: One of (`key_value_pmem`, `alloc_with_hash`, `alloc_api_exp`)
 
 ## Implementation Details
 
