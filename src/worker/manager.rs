@@ -54,7 +54,7 @@ impl Worker for WorkerManager {
 }
 
 impl WorkerManager {
-	#[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
+	#[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager", not(feature = "global_hashtable_pmem")))]
 	pub fn new<K, V>(
 		listener: WorkerReceiver,
 		objects: &ObjectMapRef<K, V>,
@@ -106,7 +106,7 @@ impl WorkerManager {
 		Ok(manager)
 	}
 
-	#[cfg(all(not(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))))]
+	#[cfg(not(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager", not(feature = "global_hashtable_pmem"))))]
 	pub fn new<K, V>(
 		listener: WorkerReceiver,
 		objects: &ObjectMapRef<K, V>,
