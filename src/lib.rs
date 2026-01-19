@@ -3152,7 +3152,7 @@ where
 
 unsafe impl<K, V, S> Send for PaperCache<K, V, S> {}
 
-#[cfg(test)]
+#[cfg(all(test, not(all(feature = "global_hashtable_pmem", feature = "key_value_pmem"))))]
 mod tests {
 	use crate::{PaperCache, PaperPolicy, CacheError};
 

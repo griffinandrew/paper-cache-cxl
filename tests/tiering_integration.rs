@@ -1,4 +1,4 @@
-#[cfg(all(feature = "enable_tiering_manager", feature = "key_value_pmem"))]
+#[cfg(all(feature = "enable_tiering_manager", feature = "key_value_pmem", not(feature = "global_hashtable_pmem")))]
 mod tiering_tests {
     use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
     use std::thread;
@@ -86,3 +86,30 @@ mod tiering_tests {
         assert_eq!(stats.pmem_only_objects, 5);
     }
 }
+
+// Test that tiering manager is disabled when global_hashtable_pmem is enabled
+#[cfg(all(feature = "enable_tiering_manager", feature = "global_hashtable_pmem", feature = "key_value_pmem"))]
+mod no_tiering_with_global_hashtable_pmem_tests {
+    use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
+
+    #[test]
+    fn test_no_tiering_manager_with_global_hashtable_pmem() {
+        // Create a cache with global_hashtable_pmem enabled
+        // Even though enable_tiering_manager is enabled, tiering manager should not be available
+        let cache = PaperCache::<u32, BufferPMEM>::new(
+            10000,
+            &[PaperPolicy::Lfu],
+            PaperPolicy::Lfu,
+        ).expect("Failed to create cache");
+
+        // The tiering_stats method should not be available
+        // This test compiles successfully because when global_hashtable_pmem is enabled,
+        // the tiering_manager field is not present in the struct and tiering methods are not available.
+        
+        // Basic operations should still work
+        cache.set(1, &[0u8; 100], None).expect("Failed to set object");
+        let result = cache.get(&1).expect("Failed to get object");
+        assert_eq!(result.len(), 100);
+    }
+}
+

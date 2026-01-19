@@ -675,7 +675,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "global_hashtable_pmem")))]
 mod tests {
     use super::*;
 
