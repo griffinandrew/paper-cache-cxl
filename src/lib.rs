@@ -9,6 +9,10 @@
 
 #![cfg_attr(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"), feature(allocator_api))]
 
+// Validate that both global_flatmap_dram and global_flatmap_pmem are not enabled together
+#[cfg(all(feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
+compile_error!("Cannot enable both 'global_flatmap_dram' and 'global_flatmap_pmem' features simultaneously. Please choose only one FlatMap mode for the global hashtable.");
+
 // When all_dram is enabled, use jemalloc as the global allocator
 #[cfg(feature = "all_dram")]
 use tikv_jemallocator::Jemalloc;
