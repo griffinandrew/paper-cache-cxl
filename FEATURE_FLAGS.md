@@ -48,6 +48,21 @@ The implementation provides explicit feature flags to control:
 - **When enabled**: Uses experimental allocator implementation with same hashtable type as `key_value_pmem`
 - **Use case**: Testing and development
 
+### `flatmap_dram`
+- **Purpose**: Enable high-performance Linear Probing Hash Map (FlatMap) in DRAM
+- **When enabled**: FlatMap module is compiled with DRAM allocator support
+- **When disabled**: FlatMap module is not available
+- **Use case**: High-performance hash map for DRAM with optimized memory layout
+- **Performance**: Reduces cache misses by storing hash, key, and value adjacently
+
+### `flatmap_pmem`
+- **Purpose**: Enable high-performance Linear Probing Hash Map (FlatMap) in PMEM
+- **When enabled**: FlatMap module is compiled with PMEM allocator support (HybridObjects)
+- **When disabled**: FlatMap module is not available
+- **Use case**: High-performance hash map optimized for PMEM latency characteristics
+- **Performance**: Reduces PMEM read overhead from 3x to 1x by using flat layout (Array of Structs)
+- **Design**: Uses Linear Probing (no Robin Hood hashing) to minimize expensive PMEM writes
+
 ## Implementation Details
 
 ### Type System
@@ -61,6 +76,14 @@ The implementation uses Rust's conditional compilation to select the appropriate
 **Global hashtable** (`objects` in `PaperCache`):
 - Without `global_hashtable_pmem`: `DashMap` (DRAM)
 - With `global_hashtable_pmem`: `RwLock<HashMap<..., Hybrid>>` (PMEM)
+
+**FlatMap** (high-performance Linear Probing Hash Map):
+- With `flatmap_dram`: Uses Global allocator (DRAM)
+- With `flatmap_pmem`: Uses HybridObjects allocator (PMEM)
+- Flat layout: `Vec<Bucket<K, V>, A>` where `Bucket` is `#[repr(C)]` with `{ hash: u64, key: K, val: V }`
+- Operations: `insert`, `get`, `get_mut`, `remove`, `contains_key`, `clear`, `iter`
+- Algorithm: Linear probing with `(index + 1) & mask` collision resolution
+- Fixed capacity (no resizing) for optimal performance
 
 ### Allocator Integration
 
@@ -141,11 +164,14 @@ The code uses `#[cfg(...)]` attributes extensively to:
 4. **Tiering + both in PMEM**: Maximum durability, cache state survives restarts
 5. **Tiering + global in PMEM**: Persistent cache data, fast tiering decisions
 6. **Tiering + tiering in PMEM**: Fast cache access, persistent tiering metadata
+7. **`flatmap_dram`**: High-performance hash map in DRAM, optimized memory layout
+8. **`flatmap_pmem`**: High-performance hash map in PMEM, reduced read latency
 
 ## Code Locations
 
 - **Feature definitions**: `Cargo.toml`
 - **Allocator**: `src/allocator.rs`
+- **FlatMap**: `src/flatmap.rs`
 - **Tiering manager hashtable**: `src/tiering/manager.rs`
 - **Global hashtable**: `src/lib.rs`
 - **Worker manager integration**: `src/worker/manager.rs`
@@ -155,6 +181,18 @@ The code uses `#[cfg(...)]` attributes extensively to:
 To test different combinations (requires nightly Rust for allocator features):
 
 ```bash
+# Test FlatMap in DRAM
+cargo +nightly test --lib flatmap::tests --no-default-features --features flatmap_dram
+
+# Test FlatMap in PMEM (requires PMEM hardware)
+cargo +nightly test --lib flatmap::tests --no-default-features --features flatmap_pmem
+
+# Check FlatMap compilation for DRAM
+cargo +nightly check --no-default-features --features flatmap_dram
+
+# Check FlatMap compilation for PMEM
+cargo +nightly check --no-default-features --features flatmap_pmem
+
 # Test with tiering and both hashtables in PMEM
 cargo +nightly check --features "enable_tiering_manager,tiering_hashtable_pmem,global_hashtable_pmem,key_value_pmem"
 
