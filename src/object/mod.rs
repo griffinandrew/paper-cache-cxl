@@ -96,3 +96,32 @@ impl<K, V> Object<K, V> {
 pub fn get_expiry_from_ttl(ttl: u32) -> Instant {
 	Instant::now() + Duration::from_secs(ttl.into())
 }
+
+// Specialized Default implementations for Object to support FlatMap initialization.
+// These create dummy objects with empty buffers that will never be read
+// (only used for FlatMap empty bucket initialization where hash = 0).
+
+// For BufferDRAM (Box<[u8]>)
+impl<K: Default> Default for Object<K, Box<[u8]>> {
+fn default() -> Self {
+Object {
+key: K::default(),
+data: Arc::new(Vec::new().into_boxed_slice()),
+expiry: None,
+}
+}
+}
+
+// For BufferPMEM (Box<[u8], Hybrid>)
+#[cfg(any(feature = "alloc_api_exp", feature = "key_value_pmem", feature = "global_flatmap_pmem"))]
+impl<K: Default> Default for Object<K, Box<[u8], crate::allocator::Hybrid>> {
+	fn default() -> Self {
+		use crate::allocator::Hybrid;
+		let vec: Vec<u8, Hybrid> = Vec::new_in(Hybrid);
+		Object {
+			key: K::default(),
+			data: Arc::new(vec.into_boxed_slice()),
+			expiry: None,
+		}
+	}
+}

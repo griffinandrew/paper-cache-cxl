@@ -296,7 +296,7 @@ where
 			let estimated_objects = (max_size / 1024).max(1024) as usize;
 			// Double for low load factor and find next power of 2
 			let capacity = (estimated_objects * 2).next_power_of_two();
-			Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_and_hasher(capacity, NoHasher::default())))
+			Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_and_hasher_unchecked(capacity, NoHasher::default())))
 		};
 		
 		// FlatMap in PMEM: Use a capacity based on max_size with 2x overhead for low load factor
@@ -3056,6 +3056,557 @@ where
 	}
 }
 
+
+#[cfg(all(feature = "global_flatmap_dram", not(feature = "all_dram")))]
+impl<K, S> PaperCache<K, BufferDRAM, S>
+where
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Default,
+	S: Default + Clone + BuildHasher,
+{
+	pub fn new(
+		max_size: CacheSize,
+		policies: &[PaperPolicy],
+		policy: PaperPolicy,
+	) -> Result<Self, CacheError> {
+		Self::with_hasher(
+			max_size,
+			policies,
+			policy,
+			Default::default(),
+		)
+	}
+
+	pub fn with_hasher(
+		max_size: CacheSize,
+		policies: &[PaperPolicy],
+		policy: PaperPolicy,
+		hasher: S,
+	) -> Result<Self, CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		if policies.is_empty() {
+			return Err(CacheError::EmptyPolicies);
+		}
+
+		if policies.contains(&PaperPolicy::Auto) {
+			return Err(CacheError::ConfiguredAutoPolicy);
+		}
+
+		if policies.iter().is_multiset() {
+			return Err(CacheError::DuplicatePolicies);
+		}
+
+		if !policy.is_auto() && !policies.contains(&policy) {
+			return Err(CacheError::UnconfiguredPolicy);
+		}
+
+		let estimated_objects = (max_size / 1024).max(1024) as usize;
+		let capacity = (estimated_objects * 2).next_power_of_two();
+		let objects = Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_and_hasher_unchecked(
+			capacity,
+			NoHasher::default(),
+		)));
+
+		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		let (worker_sender, worker_listener) = unbounded();
+
+		let mut worker_manager = WorkerManager::new(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+		)?;
+
+		thread::spawn(move || worker_manager.run());
+
+		let cache = PaperCache {
+			objects,
+			status,
+			worker_manager: Arc::new(worker_sender),
+			overhead_manager,
+			hasher,
+		};
+
+		Ok(cache)
+	}
+
+	#[must_use]
+	pub fn version(&self) -> String {
+		env!("CARGO_PKG_VERSION").to_owned()
+	}
+
+	pub fn status(&self) -> Result<Status, CacheError> {
+		self.status.try_to_status()
+	}
+
+	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let result = match self.objects.read().unwrap().get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				self.status.incr_hits();
+				let arc_val = object.data();
+				Ok(arc_val.as_ref().to_vec())
+			},
+			_ => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
+
+		result
+	}
+
+	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
+		let hashed_key = self.hash_key(&key);
+
+		let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
+		let object = Object::new(key, val_buf, ttl);
+		let base_size = self.overhead_manager.base_size(&object);
+		let expiry = object.expiry();
+
+		if base_size == 0 {
+			return Err(CacheError::ZeroValueSize);
+		}
+
+		if self.status.exceeds_max_size(base_size) {
+			return Err(CacheError::ExceedingValueSize);
+		}
+
+		self.status.incr_sets();
+
+		let old_object_info = self.objects
+			.write().unwrap().insert_unchecked(hashed_key, object)
+			.map(|old_object| {
+				let base_size = self.overhead_manager.base_size(&old_object);
+				let expiry = old_object.expiry();
+				(base_size, expiry)
+			});
+
+		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+			base_size as i64 - old_object_size as i64
+		} else {
+			self.status.incr_num_objects();
+			base_size as i64
+		};
+
+		self.status.update_base_used_size(base_size_delta);
+		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+
+		Ok(())
+	}
+
+	pub fn del(&self, key: &K) -> Result<(), CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let (removed_hashed_key, object) = erase(
+			&self.objects,
+			&self.status,
+			&self.overhead_manager,
+			Some(EraseKey::Original(key, hashed_key)),
+		)?;
+
+		self.status.incr_dels();
+		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
+
+		Ok(())
+	}
+
+	pub fn has(&self, key: &K) -> bool {
+		let hashed_key = self.hash_key(key);
+
+		self.objects
+			.read().unwrap().get(&hashed_key)
+			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
+	}
+
+	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.read().unwrap().get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Ok(object.data()),
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
+	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let mut objects_guard = self.objects.write().unwrap();
+		let object = match objects_guard.get_mut(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => object,
+			_ => return Err(CacheError::KeyNotFound),
+		};
+
+		let old_expiry = object.expiry();
+		let old_base_size = self.overhead_manager.base_size(&object);
+
+		object.expires(ttl);
+
+		let new_expiry = object.expiry();
+		let new_base_size = self.overhead_manager.base_size(&object);
+
+		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
+		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
+
+		Ok(())
+	}
+
+	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.read().unwrap().get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Ok(self.overhead_manager.total_size(&object)),
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
+	pub fn wipe(&self) -> Result<(), CacheError> {
+		info!("Wiping cache");
+
+		let mut objects_guard = self.objects.write().unwrap();
+		let keys: Vec<_> = objects_guard.iter().map(|(k, _)| *k).collect();
+		for key in keys {
+			objects_guard.remove_unchecked(&key);
+		}
+		drop(objects_guard);
+		self.status.clear();
+
+		self.broadcast(WorkerEvent::Wipe)?;
+
+		Ok(())
+	}
+
+	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		let current_max_size = self.status.max_size();
+
+		if max_size == current_max_size {
+			return Ok(());
+		}
+
+		info!(
+			"Resizing cache from {} to {}",
+			fmt::memory(current_max_size, Some(2)),
+			fmt::memory(max_size, Some(2)),
+		);
+
+		self.status.set_max_size(max_size);
+		self.broadcast(WorkerEvent::Resize(max_size))?;
+
+		Ok(())
+	}
+
+	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
+		if !policy.is_auto() && !self.status.policies().contains(&policy) {
+			return Err(CacheError::UnconfiguredPolicy);
+		}
+
+		self.status.set_policy(policy)?;
+		self.broadcast(WorkerEvent::Policy(policy))?;
+
+		Ok(())
+	}
+
+	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
+		if let Err(err) = self.worker_manager.try_send(event) {
+			error!("Could not communicate with workers: {err:?}");
+			return Err(CacheError::Internal);
+		}
+
+		Ok(())
+	}
+
+	fn hash_key(&self, key: &K) -> HashedKey {
+		self.hasher.hash_one(key)
+	}
+}
+
+
+#[cfg(all(feature = "global_flatmap_pmem", not(feature = "key_value_pmem"), not(feature = "global_hashtable_pmem"), not(feature = "alloc_api_exp")))]
+impl<K, S> PaperCache<K, BufferPMEM, S>
+where
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Default,
+	S: Default + Clone + BuildHasher,
+{
+	pub fn new(
+		max_size: CacheSize,
+		policies: &[PaperPolicy],
+		policy: PaperPolicy,
+	) -> Result<Self, CacheError> {
+		Self::with_hasher(
+			max_size,
+			policies,
+			policy,
+			Default::default(),
+		)
+	}
+
+	pub fn with_hasher(
+		max_size: CacheSize,
+		policies: &[PaperPolicy],
+		policy: PaperPolicy,
+		hasher: S,
+	) -> Result<Self, CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		if policies.is_empty() {
+			return Err(CacheError::EmptyPolicies);
+		}
+
+		if policies.contains(&PaperPolicy::Auto) {
+			return Err(CacheError::ConfiguredAutoPolicy);
+		}
+
+		if policies.iter().is_multiset() {
+			return Err(CacheError::DuplicatePolicies);
+		}
+
+		if !policy.is_auto() && !policies.contains(&policy) {
+			return Err(CacheError::UnconfiguredPolicy);
+		}
+
+		let estimated_objects = (max_size / 1024).max(1024) as usize;
+		let capacity = (estimated_objects * 2).next_power_of_two();
+		let objects = Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_hasher_in(
+			capacity,
+			NoHasher::default(),
+			Hybrid,
+		)));
+
+		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		let (worker_sender, worker_listener) = unbounded();
+
+		let mut worker_manager = WorkerManager::new(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+		)?;
+
+		thread::spawn(move || worker_manager.run());
+
+		let cache = PaperCache {
+			objects,
+			status,
+			worker_manager: Arc::new(worker_sender),
+			overhead_manager,
+			hasher,
+		};
+
+		Ok(cache)
+	}
+
+	#[must_use]
+	pub fn version(&self) -> String {
+		env!("CARGO_PKG_VERSION").to_owned()
+	}
+
+	pub fn status(&self) -> Result<Status, CacheError> {
+		self.status.try_to_status()
+	}
+
+	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let result = match self.objects.read().unwrap().get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				self.status.incr_hits();
+				let arc_val = object.data();
+				Ok(arc_val.as_ref().to_vec())
+			},
+			_ => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
+
+		result
+	}
+
+	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
+		let hashed_key = self.hash_key(&key);
+
+		let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
+		let object = Object::new(key, val_buf, ttl);
+
+		let base_size = self.overhead_manager.base_size(&object);
+		let expiry = object.expiry();
+
+		if base_size == 0 {
+			return Err(CacheError::ZeroValueSize);
+		}
+
+		if self.status.exceeds_max_size(base_size) {
+			return Err(CacheError::ExceedingValueSize);
+		}
+
+		self.status.incr_sets();
+
+		let old_object_info = self.objects
+			.write().unwrap().insert(hashed_key, object)
+			.map(|old_object| {
+				let base_size = self.overhead_manager.base_size(&old_object);
+				let expiry = old_object.expiry();
+				(base_size, expiry)
+			});
+
+		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+			base_size as i64 - old_object_size as i64
+		} else {
+			self.status.incr_num_objects();
+			base_size as i64
+		};
+
+		self.status.update_base_used_size(base_size_delta);
+		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+
+		Ok(())
+	}
+
+	pub fn del(&self, key: &K) -> Result<(), CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let (removed_hashed_key, object) = erase(
+			&self.objects,
+			&self.status,
+			&self.overhead_manager,
+			Some(EraseKey::Original(key, hashed_key)),
+		)?;
+
+		self.status.incr_dels();
+		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
+
+		Ok(())
+	}
+
+	pub fn has(&self, key: &K) -> bool {
+		let hashed_key = self.hash_key(key);
+
+		self.objects
+			.read().unwrap().get(&hashed_key)
+			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
+	}
+
+	pub fn peek(&self, key: &K) -> Result<Arc<BufferPMEM>, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.read().unwrap().get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Ok(object.data()),
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
+	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let mut objects_guard = self.objects.write().unwrap();
+		let object = match objects_guard.get_mut(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => object,
+			_ => return Err(CacheError::KeyNotFound),
+		};
+
+		let old_expiry = object.expiry();
+		let old_base_size = self.overhead_manager.base_size(&object);
+
+		object.expires(ttl);
+
+		let new_expiry = object.expiry();
+		let new_base_size = self.overhead_manager.base_size(&object);
+
+		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
+		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
+
+		Ok(())
+	}
+
+	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.read().unwrap().get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Ok(self.overhead_manager.total_size(&object)),
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
+	pub fn wipe(&self) -> Result<(), CacheError> {
+		info!("Wiping cache");
+
+		let mut objects_guard = self.objects.write().unwrap();
+		let keys: Vec<_> = objects_guard.iter().map(|(k, _)| *k).collect();
+		for key in keys {
+			objects_guard.remove_unchecked(&key);
+		}
+		drop(objects_guard);
+		self.status.clear();
+
+		self.broadcast(WorkerEvent::Wipe)?;
+
+		Ok(())
+	}
+
+	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		let current_max_size = self.status.max_size();
+
+		if max_size == current_max_size {
+			return Ok(());
+		}
+
+		info!(
+			"Resizing cache from {} to {}",
+			fmt::memory(current_max_size, Some(2)),
+			fmt::memory(max_size, Some(2)),
+		);
+
+		self.status.set_max_size(max_size);
+		self.broadcast(WorkerEvent::Resize(max_size))?;
+
+		Ok(())
+	}
+
+	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
+		if !policy.is_auto() && !self.status.policies().contains(&policy) {
+			return Err(CacheError::UnconfiguredPolicy);
+		}
+
+		self.status.set_policy(policy)?;
+		self.broadcast(WorkerEvent::Policy(policy))?;
+
+		Ok(())
+	}
+
+	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
+		if let Err(err) = self.worker_manager.try_send(event) {
+			error!("Could not communicate with workers: {err:?}");
+			return Err(CacheError::Internal);
+		}
+
+		Ok(())
+	}
+
+	fn hash_key(&self, key: &K) -> HashedKey {
+		self.hasher.hash_one(key)
+	}
+}
 
 
 pub enum EraseKey<'a, K> {
