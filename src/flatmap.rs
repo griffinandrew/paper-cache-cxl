@@ -72,8 +72,7 @@
 //! - `flatmap_dram`: Enable FlatMap with DRAM allocator
 //! - `flatmap_pmem`: Enable FlatMap with PMEM allocator (HybridObjects)
 
-use std::alloc::{Allocator, Layout, Global};
-use std::ptr::NonNull;
+use std::alloc::{Allocator, Global};
 use std::hash::{Hash, BuildHasher};
 use std::mem;
 use std::marker::PhantomData;
@@ -320,7 +319,7 @@ where
                 if bucket.is_empty() {
                     // Empty slot means key not found
                     break;
-                } else if bucket.hash == hash && &bucket.key == key {
+                } else if bucket.matches(hash, key) {
                     // Found the key
                     found = Some(index);
                     break;
@@ -387,15 +386,19 @@ where
                     // Calculate ideal position for next bucket
                     let ideal_index = (next_bucket.hash as usize) & self.mask;
                     
-                    // Check if next bucket can be shifted back
-                    // We can shift if the current position is between ideal and next
-                    let should_shift = if ideal_index <= curr_index {
-                        // Wrapping case
-                        ideal_index <= curr_index && curr_index < next_index
-                    } else {
-                        // Non-wrapping case: ideal position is after current
-                        curr_index < next_index && next_index < ideal_index
+                    // Check if next bucket belongs in current position
+                    // We shift if ideal position is NOT strictly between curr and next (exclusive)
+                    // Using a helper to handle wraparound correctly
+                    let is_between = |start: usize, end: usize, pos: usize| -> bool {
+                        if start < end {
+                            start < pos && pos < end
+                        } else {
+                            // Wraparound case: pos is between start and end if it's > start OR < end
+                            pos > start || pos < end
+                        }
                     };
+                    
+                    let should_shift = !is_between(curr_index, next_index, ideal_index);
                     
                     if !should_shift {
                         self.buckets[curr_index] = Bucket::empty();
