@@ -3380,7 +3380,7 @@ where
 			return Err(CacheError::UnconfiguredPolicy);
 		}
 
-		let estimated_objects = (max_size / 1024).max(1024) as usize;
+		let estimated_objects = 1_500_000 as usize;
 		let capacity = (estimated_objects * 2).next_power_of_two();
 		let objects = Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_and_hasher_unchecked(
 			capacity,
