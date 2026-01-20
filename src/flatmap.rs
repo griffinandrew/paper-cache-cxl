@@ -134,15 +134,145 @@ impl<K, V> Bucket<K, V> {
 /// * `A` - The allocator type (defaults to Global)
 pub struct FlatMap<K, V, A: Allocator = Global> {
     /// The array of buckets
-    buckets: Vec<Bucket<K, V>, A>,
+    pub(crate) buckets: Vec<Bucket<K, V>, A>,
     /// Total capacity (number of buckets)
-    capacity: usize,
+    pub(crate) capacity: usize,
     /// Mask for fast modulo operations (capacity - 1)
-    mask: usize,
+    pub(crate) mask: usize,
     /// Number of occupied buckets
     len: usize,
     /// Phantom data for variance
     _phantom: PhantomData<(K, V)>,
+}
+
+// Unconstrained impl block for methods that don't need Default
+impl<K, V, A: Allocator> FlatMap<K, V, A>
+where
+    K: Hash + Eq,
+{
+    /// Returns the number of elements in the map.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true if the map is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the capacity of the map.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Computes the hash for a key (unconstrained version).
+    #[inline]
+    pub(crate) fn hash_key_unconstrained<Q, S>(&self, key: &Q, hasher: &S) -> u64
+    where
+        Q: Hash,
+        S: BuildHasher,
+    {
+        use std::hash::Hasher;
+        let mut h = hasher.build_hasher();
+        key.hash(&mut h);
+        let hash = h.finish();
+        // Ensure hash is never 0 (reserved for empty)
+        if hash == 0 { 1 } else { hash }
+    }
+
+    /// Gets a reference to the value associated with the key (unconstrained version).
+    #[inline(always)]
+    pub fn get_with_hasher<Q, S>(&self, key: &Q, hasher: &S) -> Option<&V>
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q>,
+        S: BuildHasher,
+    {
+        let hash = self.hash_key_unconstrained(key, hasher);
+        let mut index = (hash as usize) & self.mask;
+        
+        // Linear probing
+        for _ in 0..self.capacity {
+            let bucket = &self.buckets[index];
+            
+            if bucket.is_empty() {
+                return None;
+            } else if bucket.matches(hash, key) {
+                return Some(&bucket.val);
+            }
+            
+            index = (index + 1) & self.mask;
+        }
+        
+        None
+    }
+
+    /// Gets a mutable reference to the value associated with the key (unconstrained version).
+    #[inline(always)]
+    pub fn get_mut_with_hasher<Q, S>(&mut self, key: &Q, hasher: &S) -> Option<&mut V>
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q>,
+        S: BuildHasher,
+    {
+        let hash = self.hash_key_unconstrained(key, hasher);
+        let mut index = (hash as usize) & self.mask;
+        
+        // Linear probing - find the index first
+        let found_index = {
+            let mut found = None;
+            for _ in 0..self.capacity {
+                let bucket = &self.buckets[index];
+                
+                if bucket.is_empty() {
+                    break;
+                } else if bucket.matches(hash, key) {
+                    found = Some(index);
+                    break;
+                }
+                
+                index = (index + 1) & self.mask;
+            }
+            found
+        };
+        
+        found_index.map(|idx| &mut self.buckets[idx].val)
+    }
+
+    /// Checks if the map contains the given key (unconstrained version).
+    #[inline]
+    pub fn contains_key_with_hasher<Q, S>(&self, key: &Q, hasher: &S) -> bool
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q>,
+        S: BuildHasher,
+    {
+        self.get_with_hasher(key, hasher).is_some()
+    }
+
+    /// Returns an iterator over the key-value pairs in the map.
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter {
+            buckets: &self.buckets,
+            index: 0,
+        }
+    }
+
+    /// Clears the map, removing all key-value pairs.
+    /// Requires K and V to implement Default to reset buckets.
+    pub fn clear(&mut self)
+    where
+        K: Default,
+        V: Default,
+    {
+        for bucket in &mut self.buckets {
+            *bucket = Bucket::empty();
+        }
+        self.len = 0;
+    }
 }
 
 impl<K, V> FlatMap<K, V, Global>
@@ -200,39 +330,6 @@ where
         }
     }
 
-    /// Returns the number of elements in the map.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Returns true if the map is empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Returns the capacity of the map.
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Computes the hash for a key.
-    #[inline]
-    fn hash_key<Q, S>(&self, key: &Q, hasher: &S) -> u64
-    where
-        Q: Hash,
-        S: BuildHasher,
-    {
-        use std::hash::Hasher;
-        let mut h = hasher.build_hasher();
-        key.hash(&mut h);
-        let hash = h.finish();
-        // Ensure hash is never 0 (reserved for empty)
-        if hash == 0 { 1 } else { hash }
-    }
-
     /// Inserts a key-value pair into the map with the given hasher.
     ///
     /// Returns the old value if the key was already present.
@@ -244,7 +341,7 @@ where
     where
         S: BuildHasher,
     {
-        let hash = self.hash_key(&key, hasher);
+        let hash = self.hash_key_unconstrained(&key, hasher);
         let mut index = (hash as usize) & self.mask;
         
         // Linear probing
@@ -269,83 +366,6 @@ where
         panic!("FlatMap is full");
     }
 
-    /// Gets a reference to the value associated with the key.
-    #[inline(always)]
-    pub fn get_with_hasher<Q, S>(&self, key: &Q, hasher: &S) -> Option<&V>
-    where
-        Q: Hash + Eq,
-        K: PartialEq<Q>,
-        S: BuildHasher,
-    {
-        let hash = self.hash_key(key, hasher);
-        let mut index = (hash as usize) & self.mask;
-        
-        // Linear probing
-        for _ in 0..self.capacity {
-            let bucket = &self.buckets[index];
-            
-            if bucket.is_empty() {
-                // Empty slot means key not found
-                return None;
-            } else if bucket.matches(hash, key) {
-                // Found the key
-                return Some(&bucket.val);
-            }
-            
-            // Move to next bucket
-            index = (index + 1) & self.mask;
-        }
-        
-        None
-    }
-
-    /// Gets a mutable reference to the value associated with the key.
-    #[inline(always)]
-    pub fn get_mut_with_hasher<Q, S>(&mut self, key: &Q, hasher: &S) -> Option<&mut V>
-    where
-        Q: Hash + Eq,
-        K: PartialEq<Q>,
-        S: BuildHasher,
-    {
-        let hash = self.hash_key(key, hasher);
-        let mut index = (hash as usize) & self.mask;
-        
-        // Linear probing - find the index first
-        let found_index = {
-            let mut found = None;
-            for _ in 0..self.capacity {
-                let bucket = &self.buckets[index];
-                
-                if bucket.is_empty() {
-                    // Empty slot means key not found
-                    break;
-                } else if bucket.matches(hash, key) {
-                    // Found the key
-                    found = Some(index);
-                    break;
-                }
-                
-                // Move to next bucket
-                index = (index + 1) & self.mask;
-            }
-            found
-        };
-        
-        // Now get mutable reference if we found it
-        found_index.map(|idx| &mut self.buckets[idx].val)
-    }
-
-    /// Checks if the map contains the given key.
-    #[inline]
-    pub fn contains_key_with_hasher<Q, S>(&self, key: &Q, hasher: &S) -> bool
-    where
-        Q: Hash + Eq,
-        K: PartialEq<Q>,
-        S: BuildHasher,
-    {
-        self.get_with_hasher(key, hasher).is_some()
-    }
-
     /// Removes a key from the map, returning the value if the key was present.
     ///
     /// Note: This implementation uses backwards shift deletion to maintain probe chain integrity.
@@ -356,7 +376,7 @@ where
         V: Clone,
         S: BuildHasher,
     {
-        let hash = self.hash_key(key, hasher);
+        let hash = self.hash_key_unconstrained(key, hasher);
         let mut index = (hash as usize) & self.mask;
         
         // Linear probing to find the key
@@ -420,20 +440,38 @@ where
         None
     }
 
-    /// Clears the map, removing all key-value pairs.
-    pub fn clear(&mut self) {
-        for bucket in &mut self.buckets {
-            *bucket = Bucket::empty();
+    /// Removes a key from the map using tombstoning (simpler but may degrade performance over time).
+    /// This method works with any V type, not requiring Clone.
+    /// Useful when V doesn't implement Clone or Default constraints are acceptable.
+    pub fn remove_tombstone_with_hasher<Q, S>(&mut self, key: &Q, hasher: &S) -> Option<V>
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q> + Default,
+        V: Default,
+        S: BuildHasher,
+    {
+        let hash = self.hash_key_unconstrained(key, hasher);
+        let mut index = (hash as usize) & self.mask;
+        
+        // Linear probing to find the key
+        for _ in 0..self.capacity {
+            let bucket = &mut self.buckets[index];
+            
+            if bucket.is_empty() {
+                return None;
+            } else if bucket.matches(hash, key) {
+                // Found the key - use tombstone (mark as empty)
+                self.len -= 1;
+                bucket.hash = 0; // Mark as empty
+                let val = mem::replace(&mut bucket.val, V::default());
+                let _ = mem::replace(&mut bucket.key, K::default());
+                return Some(val);
+            }
+            
+            index = (index + 1) & self.mask;
         }
-        self.len = 0;
-    }
-
-    /// Returns an iterator over the key-value pairs in the map.
-    pub fn iter(&self) -> Iter<'_, K, V> {
-        Iter {
-            buckets: &self.buckets,
-            index: 0,
-        }
+        
+        None
     }
 }
 
@@ -456,6 +494,184 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
             }
         }
         None
+    }
+}
+
+/// FlatMapWithHasher wraps FlatMap with a BuildHasher for convenient usage
+/// similar to HashMap. This is used when integrating FlatMap as PaperCache's hashtable.
+pub struct FlatMapWithHasher<K, V, S, A: Allocator = Global> {
+    map: FlatMap<K, V, A>,
+    hasher: S,
+}
+
+impl<K, V, S> FlatMapWithHasher<K, V, S, Global>
+where
+    K: Hash + Eq + Default,
+    V: Default,
+    S: BuildHasher + Default,
+{
+    /// Creates a new FlatMapWithHasher with the specified capacity using the global allocator.
+    pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> Self {
+        Self {
+            map: FlatMap::new(capacity),
+            hasher,
+        }
+    }
+}
+
+// Impl block without Default constraints for methods that don't need them
+impl<K, V, S, A: Allocator> FlatMapWithHasher<K, V, S, A>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    /// Returns the number of elements in the map.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Returns true if the map is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Returns the capacity of the map.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.map.capacity()
+    }
+
+    /// Gets a reference to the value associated with the key.
+    #[inline(always)]
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q>,
+    {
+        self.map.get_with_hasher(key, &self.hasher)
+    }
+
+    /// Gets a mutable reference to the value associated with the key.
+    #[inline(always)]
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q>,
+    {
+        self.map.get_mut_with_hasher(key, &self.hasher)
+    }
+
+    /// Checks if the map contains the given key.
+    #[inline]
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q>,
+    {
+        self.map.contains_key_with_hasher(key, &self.hasher)
+    }
+
+    /// Clears the map, removing all key-value pairs.
+    /// Requires K and V to implement Default to reset buckets.
+    pub fn clear(&mut self)
+    where
+        K: Default,
+        V: Default,
+    {
+        self.map.clear()
+    }
+
+    /// Returns an iterator over the key-value pairs in the map.
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        self.map.iter()
+    }
+
+    /// Internal method to remove without Clone/Default constraints.
+    /// Uses mem::swap with a temporary bucket to extract the value.
+    /// This is safe because we're just moving ownership of the value out.
+    pub fn remove_unchecked<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q>,
+    {
+        // Access the internal FlatMap
+        let hash = self.map.hash_key_unconstrained(key, &self.hasher);
+        let mut index = (hash as usize) & self.map.mask;
+        
+        // Linear probing to find the key
+        for _ in 0..self.map.capacity {
+            let bucket = &mut self.map.buckets[index];
+            
+            if bucket.is_empty() {
+                return None;
+            } else if bucket.matches(hash, key) {
+                // Found the key - extract it by swapping with an empty bucket
+                // This works even without Clone/Default on K, V
+                self.map.len -= 1;
+                
+                // Create a temporary bucket with hash=0 (empty marker)
+                // We use unsafe to create uninitialized K and V, then immediately swap
+                // This is safe because we never read the uninitialized values
+                unsafe {
+                    use std::ptr;
+                    
+                    // Create an empty bucket (hash=0 marks it as empty)
+                    let mut empty_bucket = Bucket {
+                        hash: 0,
+                        key: ptr::read(&bucket.key as *const K),
+                        val: ptr::read(&bucket.val as *const V),
+                    };
+                    
+                    // Swap our empty bucket with the found bucket
+                    mem::swap(bucket, &mut empty_bucket);
+                    
+                    // Mark the bucket as empty
+                    bucket.hash = 0;
+                    
+                    // Return the value from the swapped bucket
+                    return Some(empty_bucket.val);
+                }
+            }
+            
+            index = (index + 1) & self.map.mask;
+        }
+        
+        None
+    }
+}
+
+impl<K, V, S, A: Allocator> FlatMapWithHasher<K, V, S, A>
+where
+    K: Hash + Eq + Default,
+    V: Default,
+    S: BuildHasher,
+{
+    /// Creates a new FlatMapWithHasher with the specified capacity and allocator.
+    pub fn with_capacity_hasher_in(capacity: usize, hasher: S, alloc: A) -> Self {
+        Self {
+            map: FlatMap::new_in(capacity, alloc),
+            hasher,
+        }
+    }
+
+    /// Inserts a key-value pair into the map.
+    #[inline]
+    pub fn insert(&mut self, key: K, val: V) -> Option<V> {
+        self.map.insert_with_hasher(key, val, &self.hasher)
+    }
+
+    /// Removes a key from the map, returning the value if the key was present.
+    /// Uses tombstoning for simplicity (works with any V type).
+    #[inline]
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q> + Default,
+        V: Default,
+    {
+        self.map.remove_tombstone_with_hasher(key, &self.hasher)
     }
 }
 
