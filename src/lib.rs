@@ -3106,7 +3106,8 @@ where
 		}
 
 		// Global flatmap in PMEM using Hybrid allocator
-		let estimated_objects = (max_size / 1024).max(1024) as usize;
+		//hardcoded estimated objects for PMEM global flatmap for now...
+		let estimated_objects = 1_500_000 as usize;
 		let capacity = (estimated_objects * 2).next_power_of_two();
 		let objects = Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_hasher_in_unchecked(
 			capacity,
@@ -3654,8 +3655,9 @@ where
 		if !policy.is_auto() && !policies.contains(&policy) {
 			return Err(CacheError::UnconfiguredPolicy);
 		}
-
-		let estimated_objects = (max_size / 1024).max(1024) as usize;
+		
+		//hardcoded estimated objects for PMEM global flatmap for now...
+		let estimated_objects = 1_500_000 as usize;
 		let capacity = (estimated_objects * 2).next_power_of_two();
 		let objects = Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_hasher_in_unchecked(
 			capacity,
