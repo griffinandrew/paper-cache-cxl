@@ -2087,7 +2087,7 @@ where
 
 // Implementation for global_hashtable_pmem alone (without key_value_pmem or alloc_api_exp)
 // This case uses BufferDRAM for values (data in DRAM) but hashtable in PMEM
-#[cfg(all(feature = "global_hashtable_pmem", not(feature = "key_value_pmem"), not(feature = "alloc_api_exp")))]
+#[cfg(all(feature = "global_hashtable_pmem", not(feature = "key_value_pmem"), not(feature = "alloc_api_exp"), not(feature = "global_flatmap_pmem")))]
 impl<K, S> PaperCache<K, BufferDRAM, S>
 where
     K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone,
