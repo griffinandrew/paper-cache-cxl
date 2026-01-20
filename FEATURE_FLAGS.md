@@ -56,12 +56,28 @@ The implementation provides explicit feature flags to control:
 - **Performance**: Reduces cache misses by storing hash, key, and value adjacently
 
 ### `flatmap_pmem`
-- **Purpose**: Enable high-performance Linear Probing Hash Map (FlatMap) in PMEM
+- **Purpose**: Enable standalone FlatMap module with PMEM allocator support
 - **When enabled**: FlatMap module is compiled with PMEM allocator support (HybridObjects)
 - **When disabled**: FlatMap module is not available
-- **Use case**: High-performance hash map optimized for PMEM latency characteristics
+- **Use case**: Standalone high-performance hash map optimized for PMEM latency characteristics
 - **Performance**: Reduces PMEM read overhead from 3x to 1x by using flat layout (Array of Structs)
 - **Design**: Uses Linear Probing (no Robin Hood hashing) to minimize expensive PMEM writes
+
+### `flatmap_hashtable_dram`
+- **Purpose**: Use FlatMap as PaperCache's global hashtable in DRAM
+- **When enabled**: `ObjectMapRef` uses `Arc<RwLock<FlatMapWithHasher<..., Global>>>` instead of DashMap
+- **When disabled**: Default hashtable implementation is used
+- **Use case**: Replace DashMap with FlatMap for better DRAM cache locality
+- **Performance**: Better cache utilization due to flat layout, fixed capacity for predictable performance
+- **Integration**: Works with all PaperCache operations (get, set, delete, eviction)
+
+### `flatmap_hashtable_pmem`
+- **Purpose**: Use FlatMap as PaperCache's global hashtable in PMEM  
+- **When enabled**: `ObjectMapRef` uses `Arc<RwLock<FlatMapWithHasher<..., Hybrid>>>` for PMEM
+- **When disabled**: Default hashtable implementation is used
+- **Use case**: Replace HashMap with FlatMap for optimal PMEM latency
+- **Performance**: 3x latency reduction (600ns → 300ns per lookup) compared to hashbrown on PMEM
+- **Integration**: Works with all PaperCache operations, uses `remove_unchecked` for eviction without Clone constraints
 
 ## Implementation Details
 
@@ -74,8 +90,10 @@ The implementation uses Rust's conditional compilation to select the appropriate
 - With `tiering_hashtable_pmem`: `HashMap<..., Hybrid>` (PMEM)
 
 **Global hashtable** (`objects` in `PaperCache`):
-- Without `global_hashtable_pmem`: `DashMap` (DRAM)
+- Default (no FlatMap): `DashMap` (DRAM)
 - With `global_hashtable_pmem`: `RwLock<HashMap<..., Hybrid>>` (PMEM)
+- With `flatmap_hashtable_dram`: `Arc<RwLock<FlatMapWithHasher<..., Global>>>` (DRAM)
+- With `flatmap_hashtable_pmem`: `Arc<RwLock<FlatMapWithHasher<..., Hybrid>>>` (PMEM)
 
 **FlatMap** (high-performance Linear Probing Hash Map):
 - With `flatmap_dram`: Uses Global allocator (DRAM)
@@ -164,8 +182,10 @@ The code uses `#[cfg(...)]` attributes extensively to:
 4. **Tiering + both in PMEM**: Maximum durability, cache state survives restarts
 5. **Tiering + global in PMEM**: Persistent cache data, fast tiering decisions
 6. **Tiering + tiering in PMEM**: Fast cache access, persistent tiering metadata
-7. **`flatmap_dram`**: High-performance hash map in DRAM, optimized memory layout
-8. **`flatmap_pmem`**: High-performance hash map in PMEM, reduced read latency
+7. **`flatmap_dram`**: Standalone FlatMap module in DRAM
+8. **`flatmap_pmem`**: Standalone FlatMap module in PMEM
+9. **`flatmap_hashtable_dram`**: Use FlatMap as PaperCache's main hashtable in DRAM
+10. **`flatmap_hashtable_pmem`**: Use FlatMap as PaperCache's main hashtable in PMEM (3x latency reduction)
 
 ## Code Locations
 
@@ -181,16 +201,25 @@ The code uses `#[cfg(...)]` attributes extensively to:
 To test different combinations (requires nightly Rust for allocator features):
 
 ```bash
-# Test FlatMap in DRAM
+# Test standalone FlatMap in DRAM
 cargo +nightly test --lib flatmap::tests --no-default-features --features flatmap_dram
 
-# Test FlatMap in PMEM (requires PMEM hardware)
+# Test standalone FlatMap in PMEM (requires PMEM hardware)
 cargo +nightly test --lib flatmap::tests --no-default-features --features flatmap_pmem
 
-# Check FlatMap compilation for DRAM
+# Check standalone FlatMap compilation for DRAM
 cargo +nightly check --no-default-features --features flatmap_dram
 
-# Check FlatMap compilation for PMEM
+# Check standalone FlatMap compilation for PMEM
+cargo +nightly check --no-default-features --features flatmap_pmem
+
+# Check FlatMap as PaperCache hashtable in DRAM
+cargo +nightly check --no-default-features --features flatmap_hashtable_dram
+
+# Check FlatMap as PaperCache hashtable in PMEM
+cargo +nightly check --no-default-features --features flatmap_hashtable_pmem
+
+# Test with tiering and both hashtables in PMEM
 cargo +nightly check --no-default-features --features flatmap_pmem
 
 # Test with tiering and both hashtables in PMEM
