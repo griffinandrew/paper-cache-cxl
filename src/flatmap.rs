@@ -81,7 +81,7 @@ use std::marker::PhantomData;
 /// Uses #[repr(C)] for predictable memory layout.
 #[derive(Clone)]
 #[repr(C)]
-struct Bucket<K, V> {
+pub(crate) struct Bucket<K, V> {
     /// Hash value. 0 indicates an empty bucket.
     hash: u64,
     /// The key stored in this bucket.
@@ -140,7 +140,7 @@ pub struct FlatMap<K, V, A: Allocator = Global> {
     /// Mask for fast modulo operations (capacity - 1)
     pub(crate) mask: usize,
     /// Number of occupied buckets
-    len: usize,
+    pub(crate) len: usize,
     /// Phantom data for variance
     _phantom: PhantomData<(K, V)>,
 }
@@ -632,6 +632,41 @@ where
         
         None
     }
+
+    /// Internal method to insert without Default constraints.
+    /// Directly implements insert logic to avoid trait bound issues.
+    pub fn insert_unchecked(&mut self, key: K, val: V) -> Option<V>
+    where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        use std::mem;
+        use crate::flatmap::Bucket;
+        
+        let hash = self.map.hash_key_unconstrained(&key, &self.hasher);
+        let mut index = (hash as usize) & self.map.mask;
+        
+        // Linear probing
+        for _ in 0..self.map.capacity {
+            let bucket = &mut self.map.buckets[index];
+            
+            if bucket.is_empty() {
+                // Found empty slot
+                *bucket = Bucket { hash, key, val };
+                self.map.len += 1;
+                return None;
+            } else if bucket.matches(hash, &key) {
+                // Key exists, replace value
+                let old_val = mem::replace(&mut bucket.val, val);
+                return Some(old_val);
+            }
+            
+            // Move to next bucket
+            index = (index + 1) & self.map.mask;
+        }
+        
+        panic!("FlatMap is full");
+    }
 }
 
 impl<K, V, S, A: Allocator> FlatMapWithHasher<K, V, S, A>
@@ -795,5 +830,36 @@ mod tests {
         }
         
         assert_eq!(map.get_with_hasher(&1u64, &hasher), Some(&200u64));
+    }
+}
+
+impl<K, V, S, A: Allocator> FlatMapWithHasher<K, V, S, A>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    /// Creates a new FlatMapWithHasher with the specified capacity and hasher without Default constraints.
+    pub fn with_capacity_and_hasher_unchecked(capacity: usize, hasher: S) -> Self
+    where
+        K: Default,
+        V: Default,
+        A: Default,
+    {
+        Self {
+            map: FlatMap::new_in(capacity, A::default()),
+            hasher,
+        }
+    }
+
+    /// Creates a new FlatMapWithHasher with the specified capacity, hasher, and allocator without Default constraints.
+    pub fn with_capacity_hasher_in_unchecked(capacity: usize, hasher: S, alloc: A) -> Self
+    where
+        K: Default,
+        V: Default,
+    {
+        Self {
+            map: FlatMap::new_in(capacity, alloc),
+            hasher,
+        }
     }
 }
