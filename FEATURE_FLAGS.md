@@ -63,7 +63,7 @@ The implementation provides explicit feature flags to control:
 - **Performance**: Reduces PMEM read overhead from 3x to 1x by using flat layout (Array of Structs)
 - **Design**: Uses Linear Probing (no Robin Hood hashing) to minimize expensive PMEM writes
 
-### `flatmap_hashtable_dram`
+### `global_flatmap_dram`
 - **Purpose**: Use FlatMap as PaperCache's global hashtable in DRAM
 - **When enabled**: `ObjectMapRef` uses `Arc<RwLock<FlatMapWithHasher<..., Global>>>` instead of DashMap
 - **When disabled**: Default hashtable implementation is used
@@ -71,7 +71,7 @@ The implementation provides explicit feature flags to control:
 - **Performance**: Better cache utilization due to flat layout, fixed capacity for predictable performance
 - **Integration**: Works with all PaperCache operations (get, set, delete, eviction)
 
-### `flatmap_hashtable_pmem`
+### `global_flatmap_pmem`
 - **Purpose**: Use FlatMap as PaperCache's global hashtable in PMEM  
 - **When enabled**: `ObjectMapRef` uses `Arc<RwLock<FlatMapWithHasher<..., Hybrid>>>` for PMEM
 - **When disabled**: Default hashtable implementation is used
@@ -92,8 +92,8 @@ The implementation uses Rust's conditional compilation to select the appropriate
 **Global hashtable** (`objects` in `PaperCache`):
 - Default (no FlatMap): `DashMap` (DRAM)
 - With `global_hashtable_pmem`: `RwLock<HashMap<..., Hybrid>>` (PMEM)
-- With `flatmap_hashtable_dram`: `Arc<RwLock<FlatMapWithHasher<..., Global>>>` (DRAM)
-- With `flatmap_hashtable_pmem`: `Arc<RwLock<FlatMapWithHasher<..., Hybrid>>>` (PMEM)
+- With `global_flatmap_dram`: `Arc<RwLock<FlatMapWithHasher<..., Global>>>` (DRAM)
+- With `global_flatmap_pmem`: `Arc<RwLock<FlatMapWithHasher<..., Hybrid>>>` (PMEM)
 
 **FlatMap** (high-performance Linear Probing Hash Map):
 - With `flatmap_dram`: Uses Global allocator (DRAM)
@@ -184,8 +184,8 @@ The code uses `#[cfg(...)]` attributes extensively to:
 6. **Tiering + tiering in PMEM**: Fast cache access, persistent tiering metadata
 7. **`flatmap_dram`**: Standalone FlatMap module in DRAM
 8. **`flatmap_pmem`**: Standalone FlatMap module in PMEM
-9. **`flatmap_hashtable_dram`**: Use FlatMap as PaperCache's main hashtable in DRAM
-10. **`flatmap_hashtable_pmem`**: Use FlatMap as PaperCache's main hashtable in PMEM (3x latency reduction)
+9. **`global_flatmap_dram`**: Use FlatMap as PaperCache's main hashtable in DRAM
+10. **`global_flatmap_pmem`**: Use FlatMap as PaperCache's main hashtable in PMEM (3x latency reduction)
 
 ## Code Locations
 
@@ -214,10 +214,10 @@ cargo +nightly check --no-default-features --features flatmap_dram
 cargo +nightly check --no-default-features --features flatmap_pmem
 
 # Check FlatMap as PaperCache hashtable in DRAM
-cargo +nightly check --no-default-features --features flatmap_hashtable_dram
+cargo +nightly check --no-default-features --features global_flatmap_dram
 
 # Check FlatMap as PaperCache hashtable in PMEM
-cargo +nightly check --no-default-features --features flatmap_hashtable_pmem
+cargo +nightly check --no-default-features --features global_flatmap_pmem
 
 # Test with tiering and both hashtables in PMEM
 cargo +nightly check --no-default-features --features flatmap_pmem

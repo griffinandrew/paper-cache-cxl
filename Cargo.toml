@@ -57,10 +57,10 @@ flatmap_dram = []
 flatmap_pmem = []
 
 # Use FlatMap as global hashtable in DRAM (alternative to DashMap)
-flatmap_hashtable_dram = []
+global_flatmap_dram = []
 
 # Use FlatMap as global hashtable in PMEM (alternative to HashMap with Hybrid allocator)
-flatmap_hashtable_pmem = []
+global_flatmap_pmem = []
 
 # Legacy features (deprecated, will be removed)
 default = []
