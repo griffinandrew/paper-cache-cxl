@@ -821,7 +821,7 @@ where
 /// 
 /// 
 
-#[cfg(feature = "all_dram")]
+#[cfg(all(feature = "all_dram", not(feature = "global_flatmap_dram")))]
 impl<K, S> PaperCache<K, BufferDRAM, S>
 where
 	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug, //note added Debug for logging might impact perf thoooo
@@ -1413,7 +1413,7 @@ where
 
 
 
-#[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem")))]
+#[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_pmem")))]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
     K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone, //note added Debug for logging might impact perf thoooo
@@ -2363,7 +2363,7 @@ where
 }
 
 
-#[cfg(any(feature = "alloc_api_exp", all(feature = "key_value_pmem", feature = "global_hashtable_pmem")))]
+#[cfg(any(feature = "alloc_api_exp", all(feature = "key_value_pmem", feature = "global_hashtable_pmem", not(feature = "global_flatmap_pmem"))))]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
     K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone, //note added Debug for logging might impact perf thoooo
@@ -3057,7 +3057,7 @@ where
 }
 
 
-#[cfg(all(feature = "global_flatmap_dram", not(feature = "all_dram")))]
+#[cfg(all(feature = "global_flatmap_dram", feature = "all_dram"))]
 impl<K, S> PaperCache<K, BufferDRAM, S>
 where
 	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Default,
@@ -3332,7 +3332,7 @@ where
 }
 
 
-#[cfg(all(feature = "global_flatmap_pmem", not(feature = "key_value_pmem"), not(feature = "global_hashtable_pmem"), not(feature = "alloc_api_exp")))]
+#[cfg(all(feature = "global_flatmap_pmem", feature = "key_value_pmem"))]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
 	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Default,

@@ -114,9 +114,9 @@ expiry: None,
 
 // For BufferPMEM (Box<[u8], Hybrid>)
 #[cfg(any(feature = "alloc_api_exp", feature = "key_value_pmem", feature = "global_flatmap_pmem"))]
-impl<K: Default> Default for Object<K, Box<[u8], crate::allocator::Hybrid>> {
+impl<K: Default> Default for Object<K, Box<[u8], crate::Hybrid>> {
 	fn default() -> Self {
-		use crate::allocator::Hybrid;
+		use crate::Hybrid;
 		let vec: Vec<u8, Hybrid> = Vec::new_in(Hybrid);
 		Object {
 			key: K::default(),
