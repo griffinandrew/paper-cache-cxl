@@ -406,19 +406,17 @@ where
                     // Calculate ideal position for next bucket
                     let ideal_index = (next_bucket.hash as usize) & self.mask;
                     
-                    // Check if next bucket belongs in current position
-                    // We shift if ideal position is NOT strictly between curr and next (exclusive)
-                    // Using a helper to handle wraparound correctly
-                    let is_between = |start: usize, end: usize, pos: usize| -> bool {
-                        if start < end {
-                            start < pos && pos < end
-                        } else {
-                            // Wraparound case: pos is between start and end if it's > start OR < end
-                            pos > start || pos < end
-                        }
+                    // Check if we should shift the next bucket back to curr position
+                    // We shift if the ideal position is at or before curr, considering wraparound
+                    let should_shift = if ideal_index <= curr_index {
+                        // Ideal is at or before curr - definitely shift
+                        // OR next is before ideal (meaning it wrapped around)
+                        true
+                    } else {
+                        // Ideal is after curr
+                        // Shift only if next wrapped around past ideal
+                        next_index < ideal_index
                     };
-                    
-                    let should_shift = !is_between(curr_index, next_index, ideal_index);
                     
                     if !should_shift {
                         self.buckets[curr_index] = Bucket::empty();
@@ -589,8 +587,8 @@ where
     }
 
     /// Internal method to remove without Clone/Default constraints.
-    /// Uses mem::swap with a temporary bucket to extract the value.
-    /// This is safe because we're just moving ownership of the value out.
+    /// Uses unsafe ptr::read to extract the value without requiring Clone/Default.
+    /// This is safe because we mark the bucket as empty immediately after reading.
     pub fn remove_unchecked<Q>(&mut self, key: &Q) -> Option<V>
     where
         Q: Hash + Eq,
@@ -607,31 +605,25 @@ where
             if bucket.is_empty() {
                 return None;
             } else if bucket.matches(hash, key) {
-                // Found the key - extract it by swapping with an empty bucket
+                // Found the key - extract the value using unsafe ptr::read
                 // This works even without Clone/Default on K, V
                 self.map.len -= 1;
                 
-                // Create a temporary bucket with hash=0 (empty marker)
-                // We use unsafe to create uninitialized K and V, then immediately swap
-                // This is safe because we never read the uninitialized values
+                // Use unsafe to read the value out of the bucket without calling drop
+                // on the old location. Then mark the bucket as empty.
                 unsafe {
                     use std::ptr;
                     
-                    // Create an empty bucket (hash=0 marks it as empty)
-                    let mut empty_bucket = Bucket {
-                        hash: 0,
-                        key: ptr::read(&bucket.key as *const K),
-                        val: ptr::read(&bucket.val as *const V),
-                    };
+                    // Read the value out (this transfers ownership without dropping)
+                    let val = ptr::read(&bucket.val as *const V);
                     
-                    // Swap our empty bucket with the found bucket
-                    mem::swap(bucket, &mut empty_bucket);
+                    // Drop the key properly
+                    ptr::drop_in_place(&mut bucket.key as *mut K);
                     
                     // Mark the bucket as empty
                     bucket.hash = 0;
                     
-                    // Return the value from the swapped bucket
-                    return Some(empty_bucket.val);
+                    return Some(val);
                 }
             }
             
