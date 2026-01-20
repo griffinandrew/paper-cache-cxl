@@ -3379,7 +3379,7 @@ where
 
 		let estimated_objects = (max_size / 1024).max(1024) as usize;
 		let capacity = (estimated_objects * 2).next_power_of_two();
-		let objects = Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_hasher_in(
+		let objects = Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_hasher_in_unchecked(
 			capacity,
 			NoHasher::default(),
 			Hybrid,

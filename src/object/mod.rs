@@ -103,13 +103,13 @@ pub fn get_expiry_from_ttl(ttl: u32) -> Instant {
 
 // For BufferDRAM (Box<[u8]>)
 impl<K: Default> Default for Object<K, Box<[u8]>> {
-fn default() -> Self {
-Object {
-key: K::default(),
-data: Arc::new(Vec::new().into_boxed_slice()),
-expiry: None,
-}
-}
+	fn default() -> Self {
+		Object {
+			key: K::default(),
+			data: Arc::new(Vec::new().into_boxed_slice()),
+			expiry: None,
+		}
+	}
 }
 
 // For BufferPMEM (Box<[u8], Hybrid>)
