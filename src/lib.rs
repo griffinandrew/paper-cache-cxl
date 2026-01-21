@@ -1059,7 +1059,7 @@ where
 			},
 		};
 
-		//self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
 		result
 	}
@@ -2191,7 +2191,7 @@ where
 			},
 		};
 
-		//self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 		result
 	}
 
@@ -3164,7 +3164,7 @@ where
 			},
 		};
 
-		//self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 		result
 	}
 
