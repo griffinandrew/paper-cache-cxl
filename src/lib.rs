@@ -3428,6 +3428,7 @@ where
 		let result = match self.objects.read().unwrap().get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
+				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
 				let arc_val = object.data();
 				Ok(arc_val.as_ref().to_vec())
 			},
