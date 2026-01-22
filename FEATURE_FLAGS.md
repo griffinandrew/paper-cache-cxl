@@ -79,6 +79,14 @@ The implementation provides explicit feature flags to control:
 - **Performance**: 3x latency reduction (600ns → 300ns per lookup) compared to hashbrown on PMEM
 - **Integration**: Works with all PaperCache operations, uses `remove_unchecked` for eviction without Clone constraints
 
+### `hashbrown_dram`
+- **Purpose**: Use hashbrown HashMap as global hashtable in DRAM (for performance comparison)
+- **When enabled**: `ObjectMapRef` uses `Arc<RwLock<HashMap<..., NoHasher>>>` in DRAM
+- **When disabled**: Default hashtable implementation (DashMap) is used
+- **Use case**: Direct performance comparison with `global_hashtable_pmem` using the same hashbrown implementation
+- **Performance**: Same hashbrown HashMap implementation as `global_hashtable_pmem` but allocated in DRAM instead of PMEM
+- **Requirements**: Mutually exclusive with `global_hashtable_pmem`, `global_flatmap_dram`, and `global_flatmap_pmem`
+
 ## Implementation Details
 
 ### Type System
@@ -92,6 +100,7 @@ The implementation uses Rust's conditional compilation to select the appropriate
 **Global hashtable** (`objects` in `PaperCache`):
 - Default (no FlatMap): `DashMap` (DRAM)
 - With `global_hashtable_pmem`: `RwLock<HashMap<..., Hybrid>>` (PMEM)
+- With `hashbrown_dram`: `RwLock<HashMap<..., NoHasher>>` (DRAM)
 - With `global_flatmap_dram`: `Arc<RwLock<FlatMapWithHasher<..., Global>>>` (DRAM)
 - With `global_flatmap_pmem`: `Arc<RwLock<FlatMapWithHasher<..., Hybrid>>>` (PMEM)
 
@@ -186,6 +195,7 @@ The code uses `#[cfg(...)]` attributes extensively to:
 8. **`flatmap_pmem`**: Standalone FlatMap module in PMEM
 9. **`global_flatmap_dram`**: Use FlatMap as PaperCache's main hashtable in DRAM
 10. **`global_flatmap_pmem`**: Use FlatMap as PaperCache's main hashtable in PMEM (3x latency reduction)
+11. **`hashbrown_dram`**: Use hashbrown HashMap in DRAM for direct performance comparison with `global_hashtable_pmem`
 
 ## Code Locations
 
@@ -218,6 +228,9 @@ cargo +nightly check --no-default-features --features global_flatmap_dram
 
 # Check FlatMap as PaperCache hashtable in PMEM
 cargo +nightly check --no-default-features --features global_flatmap_pmem
+
+# Check hashbrown HashMap in DRAM (for performance comparison)
+cargo +nightly check --no-default-features --features hashbrown_dram
 
 # Test with tiering and both hashtables in PMEM
 cargo +nightly check --no-default-features --features flatmap_pmem
