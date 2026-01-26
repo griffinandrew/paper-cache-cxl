@@ -55,6 +55,12 @@ mod object;
 mod policy;
 mod status;
 
+#[cfg(feature = "perf_counters")]
+pub mod perf_counters;
+
+#[cfg(feature = "hw_perf_counters")]
+pub mod hw_perf_counters;
+
 #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 pub mod tiering;
 
@@ -125,6 +131,13 @@ pub use crate::{
 	error::CacheError,
 	policy::PaperPolicy,
 };
+
+#[cfg(feature = "perf_counters")]
+pub use crate::perf_counters::{HashMapStats, get_global_counters, get_hashmap_stats};
+
+#[cfg(feature = "hw_perf_counters")]
+pub use crate::hw_perf_counters::{get_hw_counters, get_hw_hashmap_stats, print_hw_perf_stats, measure_operation, HwHashMapStats, HwPerfMeasurement};
+
 
 #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 pub use crate::tiering::{TieringManager, TieringConfig, TieringStats};
@@ -2197,6 +2210,10 @@ where
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
+		// Track hashmap read access
+		#[cfg(feature = "perf_counters")]
+		crate::perf_counters::get_global_counters().global_hashbrown_pmem.incr_lookup();
+
 		let result = match self.objects.read().unwrap().get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
@@ -2232,6 +2249,10 @@ where
 		}
 
 		self.status.incr_sets();
+
+		// Track hashmap write access (insert)
+		#[cfg(feature = "perf_counters")]
+		crate::perf_counters::get_global_counters().global_hashbrown_pmem.incr_insertion();
 
 		let old_object_info = self.objects
 			.write().unwrap().insert(hashed_key, object)
@@ -2273,6 +2294,10 @@ where
 	pub fn has(&self, key: &K) -> bool {
 		let hashed_key = self.hash_key(key);
 
+		// Track hashmap read access
+		#[cfg(feature = "perf_counters")]
+		crate::perf_counters::get_global_counters().global_hashbrown_pmem.incr_lookup();
+
 		self.objects
 			.read().unwrap().get(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
@@ -2280,6 +2305,10 @@ where
 
 	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
 		let hashed_key = self.hash_key(key);
+
+		// Track hashmap read access
+		#[cfg(feature = "perf_counters")]
+		crate::perf_counters::get_global_counters().global_hashbrown_pmem.incr_lookup();
 
 		match self.objects.read().unwrap().get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
@@ -2474,6 +2503,10 @@ where
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
+		// Track hashmap read access
+		#[cfg(feature = "perf_counters")]
+		crate::perf_counters::get_global_counters().global_hashbrown_dram.incr_lookup();
+
 		let result = match self.objects.read().unwrap().get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
@@ -2509,6 +2542,10 @@ where
 		}
 
 		self.status.incr_sets();
+
+		// Track hashmap write access (insert)
+		#[cfg(feature = "perf_counters")]
+		crate::perf_counters::get_global_counters().global_hashbrown_dram.incr_insertion();
 
 		let old_object_info = self.objects
 			.write().unwrap().insert(hashed_key, object)
@@ -2550,6 +2587,10 @@ where
 	pub fn has(&self, key: &K) -> bool {
 		let hashed_key = self.hash_key(key);
 
+		// Track hashmap read access
+		#[cfg(feature = "perf_counters")]
+		crate::perf_counters::get_global_counters().global_hashbrown_dram.incr_lookup();
+
 		self.objects
 			.read().unwrap().get(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
@@ -2557,6 +2598,10 @@ where
 
 	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
 		let hashed_key = self.hash_key(key);
+
+		// Track hashmap read access
+		#[cfg(feature = "perf_counters")]
+		crate::perf_counters::get_global_counters().global_hashbrown_dram.incr_lookup();
 
 		match self.objects.read().unwrap().get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
@@ -4213,7 +4258,7 @@ where
 
 			//let Some(object) = objects.iter().next() else {
 			//let Some(object) = objects.read().unwrap().iter().next() else {
-			let mut objects_guard = objects.write().unwrap();
+			let objects_guard = objects.write().unwrap();
 			let Some(object) = objects_guard.iter().next() else {
 				error!("Object store is empty with non-zero used size");
 				return Err(CacheError::Internal);
@@ -4237,6 +4282,13 @@ where
 	if let Some(EraseKey::Original(key, _)) = maybe_key && !entry.get().key_matches(key) {
 		return Err(CacheError::KeyNotFound);
 	};
+
+	// Track hashmap write access (deletion)
+	#[cfg(all(feature = "perf_counters", feature = "hashbrown_dram"))]
+	crate::perf_counters::get_global_counters().global_hashbrown_dram.incr_deletion();
+	
+	#[cfg(all(feature = "perf_counters", any(feature = "alloc_api_exp", feature = "global_hashtable_pmem"), not(feature = "hashbrown_dram")))]
+	crate::perf_counters::get_global_counters().global_hashbrown_pmem.incr_deletion();
 
 	let object = entry.remove();
 	let base_size = overhead_manager.base_size(&object) as i64;
