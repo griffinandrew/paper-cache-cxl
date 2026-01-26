@@ -14,7 +14,11 @@ This branch will add the needed instrumentation to count how many memory accesse
 
 PaperCache includes **two types** of performance counters to track memory access patterns for hashmap structures with both DRAM and PMEM configurations.
 
-### 1. Software Performance Counters
+**Both counter types are optional and gated behind feature flags:**
+- `perf_counters` - Enable software performance counters
+- `hw_perf_counters` - Enable hardware performance counters (requires Linux)
+
+### 1. Software Performance Counters (Feature: `perf_counters`)
 
 Track high-level hashmap operations:
 - **Atomic counters** for thread-safe tracking of hashmap operations
@@ -23,7 +27,7 @@ Track high-level hashmap operations:
 - **Operation breakdown**: Separate counters for different operation types
 - **Feature-aware**: Automatically tracks the correct hashmap based on enabled features
 
-### 2. Hardware Performance Counters (New!)
+### 2. Hardware Performance Counters (Feature: `hw_perf_counters`)
 
 Track actual CPU-level memory accesses using Linux `perf_event`:
 - **CPU cycles** and **instructions** executed per operation
@@ -93,14 +97,17 @@ paper_cache::print_hw_perf_stats();
 ### Running the Examples
 
 ```bash
-# Software counters demo
-cargo run --example perf_counters_demo --no-default-features --features hashbrown_dram
+# Software counters demo (requires perf_counters feature)
+cargo run --example perf_counters_demo --no-default-features --features "hashbrown_dram,perf_counters"
 
-# Hardware counters demo (requires Linux perf_event access)
-cargo run --example hw_perf_demo --no-default-features --features hashbrown_dram
+# Hardware counters demo (requires hw_perf_counters feature and Linux perf_event access)
+cargo run --example hw_perf_demo --no-default-features --features "hashbrown_dram,hw_perf_counters"
+
+# Both counters together
+cargo run --example hw_perf_demo --no-default-features --features "hashbrown_dram,perf_counters,hw_perf_counters"
 
 # With hashbrown in PMEM (requires nightly + PMEM hardware)
-cargo +nightly run --example hw_perf_demo --no-default-features --features global_hashtable_pmem
+cargo +nightly run --example hw_perf_demo --no-default-features --features "global_hashtable_pmem,hw_perf_counters"
 ```
 
 **Note**: Hardware performance counters require Linux `perf_event` access. If running in a container or without sufficient permissions, you may need to:
@@ -109,7 +116,7 @@ cargo +nightly run --example hw_perf_demo --no-default-features --features globa
 sudo sysctl kernel.perf_event_paranoid=-1
 
 # Or run with sudo
-sudo cargo run --example hw_perf_demo --no-default-features --features hashbrown_dram
+sudo cargo run --example hw_perf_demo --no-default-features --features "hashbrown_dram,hw_perf_counters"
 ```
 
 ### Output Example

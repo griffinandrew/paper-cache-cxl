@@ -113,7 +113,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Print hardware performance statistics
     paper_cache::print_hw_perf_stats();
     
-    // Also print software counters for comparison
+    // Also print software counters for comparison (if enabled)
+    #[cfg(feature = "perf_counters")]
     paper_cache::perf_counters::print_perf_stats();
     
     // Access statistics programmatically

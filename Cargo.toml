@@ -29,7 +29,9 @@ libc = "0.2.177"
 tikv-jemallocator = "0.6.1"
 hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"
-perf-event = "0.4.8"
+
+# Optional: Hardware performance counters (Linux only)
+perf-event = { version = "0.4.8", optional = true }
 
 
 [features]
@@ -65,6 +67,12 @@ global_flatmap_pmem = []
 
 # Use hashbrown HashMap as global hashtable in DRAM (for performance comparison)
 hashbrown_dram = []
+
+# Software performance counters for tracking hashmap operations
+perf_counters = []
+
+# Hardware performance counters using Linux perf_event (requires Linux, may need permissions)
+hw_perf_counters = ["perf-event"]
 
 # Legacy features (deprecated, will be removed)
 default = []
