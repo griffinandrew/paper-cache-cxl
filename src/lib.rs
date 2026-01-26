@@ -2511,7 +2511,8 @@ where
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
 				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
+				//Ok(arc_val.as_ref().to_vec())
+				Ok(())
 			},
 			_ => {
 				self.status.incr_misses();
