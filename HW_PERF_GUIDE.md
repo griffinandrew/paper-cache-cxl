@@ -4,6 +4,12 @@
 
 This implementation uses Linux `perf_event` to track actual CPU-level memory accesses during hashmap operations. This provides **real hardware metrics** rather than just software operation counts.
 
+**Note**: Hardware performance counters are gated behind the `hw_perf_counters` feature flag. You must enable this feature to use them:
+
+```bash
+cargo build --features hw_perf_counters
+```
+
 ## What Gets Measured
 
 ### Hardware Events
@@ -20,6 +26,9 @@ This implementation uses Linux `perf_event` to track actual CPU-level memory acc
 - **Average Metrics** - Per-operation averages for cycles, cache misses, etc.
 
 ## Requirements
+
+### Feature Flag
+- **`hw_perf_counters`** - Must be enabled in Cargo.toml or via command line
 
 ### Operating System
 - **Linux kernel** with `perf_event` support (kernel 2.6.31+)
@@ -40,7 +49,7 @@ echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 
 #### Option 2: Run with Sudo
 ```bash
-sudo cargo run --example hw_perf_demo --no-default-features --features hashbrown_dram
+sudo cargo run --example hw_perf_demo --no-default-features --features "hashbrown_dram,hw_perf_counters"
 ```
 
 #### Option 3: Add CAP_PERFMON Capability (Linux 5.8+)
@@ -281,19 +290,25 @@ For production use, measure operations in batches rather than every single opera
 
 ### Example 1: Benchmark GET Performance
 ```bash
-cargo run --example hw_perf_demo --no-default-features --features hashbrown_dram
+cargo run --example hw_perf_demo --no-default-features --features "hashbrown_dram,hw_perf_counters"
 ```
 
 ### Example 2: Compare DRAM vs PMEM
 ```bash
 # DRAM version
-cargo run --example hw_perf_demo --no-default-features --features hashbrown_dram > dram_results.txt
+cargo run --example hw_perf_demo --no-default-features --features "hashbrown_dram,hw_perf_counters" > dram_results.txt
 
 # PMEM version (requires nightly + PMEM hardware)
-cargo +nightly run --example hw_perf_demo --no-default-features --features global_hashtable_pmem > pmem_results.txt
+cargo +nightly run --example hw_perf_demo --no-default-features --features "global_hashtable_pmem,hw_perf_counters" > pmem_results.txt
 
 # Compare results
 diff dram_results.txt pmem_results.txt
+```
+
+### Example 3: Both Software and Hardware Counters
+```bash
+# Run with both counter types enabled
+cargo run --example hw_perf_demo --no-default-features --features "hashbrown_dram,perf_counters,hw_perf_counters"
 ```
 
 ## References
