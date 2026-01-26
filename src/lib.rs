@@ -54,6 +54,7 @@ mod worker;
 mod object;
 mod policy;
 mod status;
+pub mod perf_counters;
 
 #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 pub mod tiering;
@@ -124,6 +125,7 @@ use crate::{
 pub use crate::{
 	error::CacheError,
 	policy::PaperPolicy,
+	perf_counters::{HashMapStats, get_global_counters},
 };
 
 #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
@@ -2197,6 +2199,9 @@ where
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
+		// Track hashmap read access
+		crate::perf_counters::get_global_counters().global_hashbrown_pmem.incr_lookup();
+
 		let result = match self.objects.read().unwrap().get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
@@ -2232,6 +2237,9 @@ where
 		}
 
 		self.status.incr_sets();
+
+		// Track hashmap write access (insert)
+		crate::perf_counters::get_global_counters().global_hashbrown_pmem.incr_insertion();
 
 		let old_object_info = self.objects
 			.write().unwrap().insert(hashed_key, object)
@@ -2473,6 +2481,9 @@ where
 
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
+
+		// Track hashmap read access
+		crate::perf_counters::get_global_counters().global_hashbrown_dram.incr_lookup();
 
 		let result = match self.objects.read().unwrap().get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
@@ -4237,6 +4248,13 @@ where
 	if let Some(EraseKey::Original(key, _)) = maybe_key && !entry.get().key_matches(key) {
 		return Err(CacheError::KeyNotFound);
 	};
+
+	// Track hashmap write access (deletion)
+	#[cfg(feature = "hashbrown_dram")]
+	crate::perf_counters::get_global_counters().global_hashbrown_dram.incr_deletion();
+	
+	#[cfg(all(any(feature = "alloc_api_exp", feature = "global_hashtable_pmem"), not(feature = "hashbrown_dram")))]
+	crate::perf_counters::get_global_counters().global_hashbrown_pmem.incr_deletion();
 
 	let object = entry.remove();
 	let base_size = overhead_manager.base_size(&object) as i64;
