@@ -5,7 +5,11 @@ use core::alloc::{GlobalAlloc, Layout};
 use std::sync::{Once, atomic::{AtomicUsize, Ordering}};
 use std::ptr;
 use tikv_jemallocator::Jemalloc;
+
+// Only import std::alloc types when allocator_api nightly feature is enabled
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
 use std::alloc::{Allocator, AllocError};
+
 use std::ptr::NonNull;
 
 mod allocator_bindings {
@@ -183,9 +187,10 @@ impl HybridObjects {
     }
 }
 
-//needed for allocator api
+//needed for allocator api (std::alloc, requires nightly or allocator_api feature)
 //seemed to be faster to call the alloc and dealloc for global compared to doing it within the allocator trait.... 
 //wierd
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
 unsafe impl Allocator for HybridObjects {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         unsafe {
@@ -206,12 +211,12 @@ unsafe impl Allocator for HybridObjects {
 
 //allocator_api2 support
 
-#[cfg(any(feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem"))]
+#[cfg(any(feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stack_pmem"))]
 unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
         let ptr = unsafe { self.alloc(layout) };
         if ptr.is_null() {
-            Err(allocator_api2::alloc:: AllocError)
+            Err(allocator_api2::alloc::AllocError)
         } else {
             let slice = unsafe {
                 std::slice::from_raw_parts_mut(ptr, layout.size())

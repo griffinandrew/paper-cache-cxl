@@ -65,6 +65,9 @@ global_flatmap_pmem = []
 # Use hashbrown HashMap as global hashtable in DRAM (for performance comparison)
 hashbrown_dram = []
 
+# Enable PMEM-backed eviction stack data structures for LFU policy
+eviction_stack_pmem = []
+
 # Legacy features (deprecated, will be removed)
 default = []
 original = []
