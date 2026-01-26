@@ -1076,21 +1076,24 @@ where
 
 		// all_dram implementation - no tiering, all data in DRAM
 		let result = match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
+			//Some(object) if object.key_matches(key) && !object.is_expired() => {
+			Some(object) => {	
+				//self.status.incr_hits();
 				// object.data() returns Arc<Box<[u8]>>
 				// We need to clone the actual byte slice into a Vec
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
+				//let arc_val = object.data();
+				//Ok(arc_val.as_ref().to_vec())
+				Ok(vec![])
+				
 			},
 
 			_ => {
-				self.status.incr_misses();
+				//self.status.incr_misses();
 				Err(CacheError::KeyNotFound)
 			},
 		};
 
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		//self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
 		result
 	}
