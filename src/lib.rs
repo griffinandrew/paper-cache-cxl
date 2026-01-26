@@ -2509,7 +2509,7 @@ where
 
 		let result = match self.objects.read().unwrap().get(&hashed_key) {
 			//Some(object) if object.key_matches(key) && !object.is_expired() => {
-			Some(_object)  => {
+			Some(object)  => {
 				//self.status.incr_hits();
 				let arc_val = object.data();
 				Ok(arc_val.as_ref().to_vec())
