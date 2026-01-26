@@ -17,6 +17,8 @@ use crate::{
 };
 
 // Import HashMap based on feature flag
+// When eviction_stack_pmem is disabled (default): use std::collections::HashMap (DRAM)
+// When eviction_stack_pmem is enabled: use hashbrown::HashMap with HybridObjects allocator (PMEM)
 #[cfg(not(feature = "eviction_stack_pmem"))]
 use std::collections::HashMap;
 
@@ -26,6 +28,8 @@ use hashbrown::HashMap;
 #[cfg(feature = "eviction_stack_pmem")]
 use crate::allocator::HybridObjects;
 
+// DRAM-based LFU stack (default configuration)
+// Uses standard library HashMap which allocates from DRAM
 #[cfg(not(feature = "eviction_stack_pmem"))]
 #[derive(Default)]
 pub struct LfuStack {
@@ -33,6 +37,9 @@ pub struct LfuStack {
 	count_stacks: VecList<CountStack>,
 }
 
+// PMEM-backed LFU stack (when eviction_stack_pmem feature is enabled)
+// Uses hashbrown::HashMap with HybridObjects allocator for index_map
+// VecList and HashList use the global HybridObjects allocator
 #[cfg(feature = "eviction_stack_pmem")]
 pub struct LfuStack {
 	index_map: HashMap<HashedKey, Index<CountStack>, NoHasher, HybridObjects>,
@@ -196,6 +203,47 @@ mod tests {
 			assert_eq!(stack.evict_one(), Some(eviction));
 		}
 
+		assert_eq!(stack.evict_one(), None);
+	}
+
+	#[test]
+	fn stress_test_no_segfault() {
+		use crate::worker::policy::policy_stack::{PolicyStack, LfuStack};
+
+		let mut stack = LfuStack::default();
+
+		// Insert and update many items to stress test the data structures
+		for i in 0..1000 {
+			stack.insert(i, 1);
+		}
+
+		// Access some items multiple times to create different frequency counts
+		for i in 0..100 {
+			for _ in 0..5 {
+				stack.insert(i, 1);
+			}
+		}
+
+		// Verify we can query the stack
+		assert_eq!(stack.len(), 1000);
+
+		// Remove some items
+		for i in 500..600 {
+			stack.remove(i);
+		}
+
+		assert_eq!(stack.len(), 900);
+
+		// Evict items and verify no crashes
+		for _ in 0..50 {
+			assert!(stack.evict_one().is_some());
+		}
+
+		assert_eq!(stack.len(), 850);
+
+		// Clear the stack
+		stack.clear();
+		assert_eq!(stack.len(), 0);
 		assert_eq!(stack.evict_one(), None);
 	}
 }
