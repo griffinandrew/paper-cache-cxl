@@ -258,16 +258,153 @@ where
 
     */
 
+/*
+ * Copyright (c) Kia Shakiba
+ *
+ * This source code is licensed under the GNU AGPLv3 license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! Custom allocator-aware collections for PMEM-backed eviction stacks
 
 use hashbrown::HashMap;
-use std::hash::{Hash, BuildHasher};
+use std::hash::{Hash, BuildHasher, BuildHasherDefault};
+use nohash_hasher::NoHashHasher;
 use crate::allocator::HybridObjects;
 
-/// A hash-based doubly-linked list implementation using PMEM allocator
+// ============================================================================
+// PmemVecList
+// ============================================================================
+
+type VecListHasher = BuildHasherDefault<NoHashHasher<usize>>;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct PmemIndex(usize);
+
+pub struct PmemVecList<T> {
+    nodes: HashMap<usize, VecNode<T>, VecListHasher, HybridObjects>,
+    head: Option<usize>,
+    next_id: usize,
+}
+
+struct VecNode<T> {
+    value: T,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+impl<T> PmemVecList<T> {
+    pub fn new() -> Self {
+        PmemVecList {
+            nodes: HashMap::with_hasher_in(VecListHasher::default(), HybridObjects),
+            head: None,
+            next_id: 0,
+        }
+    }
+    
+    pub fn front_index(&self) -> Option<PmemIndex> {
+        self.head.map(PmemIndex)
+    }
+    
+    pub fn front(&self) -> Option<&T> {
+        self.head.and_then(|id| self.nodes.get(&id).map(|node| &node.value))
+    }
+    
+    pub fn get_mut(&mut self, index: PmemIndex) -> Option<&mut T> {
+        self.nodes.get_mut(&index.0).map(|node| &mut node.value)
+    }
+    
+    pub fn get_next_index(&self, index: PmemIndex) -> Option<PmemIndex> {
+        self.nodes.get(&index.0).and_then(|node| node.next.map(PmemIndex))
+    }
+    
+    pub fn push_front(&mut self, value: T) -> PmemIndex {
+        let id = self.next_id;
+        self.next_id += 1;
+        
+        let node = VecNode {
+            value,
+            prev: None,
+            next: self.head,
+        };
+        
+        if let Some(old_head) = self.head {
+            if let Some(old_head_node) = self.nodes.get_mut(&old_head) {
+                old_head_node.prev = Some(id);
+            }
+        }
+        
+        self.head = Some(id);
+        self.nodes.insert(id, node);
+        
+        PmemIndex(id)
+    }
+    
+    pub fn insert_after(&mut self, index: PmemIndex, value: T) -> PmemIndex {
+        let id = self.next_id;
+        self.next_id += 1;
+        
+        let next_id = self.nodes.get(&index.0).and_then(|node| node.next);
+        
+        let node = VecNode {
+            value,
+            prev: Some(index.0),
+            next: next_id,
+        };
+        
+        self.nodes.insert(id, node);
+        
+        if let Some(prev_node) = self.nodes.get_mut(&index.0) {
+            prev_node.next = Some(id);
+        }
+        
+        if let Some(next) = next_id {
+            if let Some(next_node) = self.nodes.get_mut(&next) {
+                next_node.prev = Some(id);
+            }
+        }
+        
+        PmemIndex(id)
+    }
+    
+    pub fn remove(&mut self, index: PmemIndex) -> Option<T> {
+        let node = self.nodes.remove(&index.0)?;
+        
+        if let Some(prev) = node.prev {
+            if let Some(prev_node) = self.nodes.get_mut(&prev) {
+                prev_node.next = node.next;
+            }
+        } else {
+            self.head = node.next;
+        }
+        
+        if let Some(next) = node.next {
+            if let Some(next_node) = self.nodes.get_mut(&next) {
+                next_node.prev = node.prev;
+            }
+        }
+        
+        Some(node.value)
+    }
+    
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.head = None;
+    }
+}
+
+impl<T> Default for PmemVecList<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// PmemHashList
+// ============================================================================
+
 pub struct PmemHashList<T, S> {
-    // Map from value to its node ID
     value_to_id: HashMap<T, usize, S, HybridObjects>,
-    // Map from node ID to the actual node
     nodes: HashMap<usize, ListNode<T>, S, HybridObjects>,
     head: Option<usize>,
     tail: Option<usize>,
@@ -308,7 +445,6 @@ where
     }
     
     pub fn push_front(&mut self, value: T) {
-        // Remove if already exists
         if self.value_to_id.contains_key(&value) {
             self.remove(&value);
         }
@@ -322,7 +458,6 @@ where
             next: self.head,
         };
         
-        // Update old head's prev pointer
         if let Some(old_head_id) = self.head {
             if let Some(old_head_node) = self.nodes.get_mut(&old_head_id) {
                 old_head_node.prev = Some(id);
@@ -344,16 +479,13 @@ where
         let node = self.nodes.remove(&tail_id)?;
         self.value_to_id.remove(&node.value);
         
-        // Update tail
         self.tail = node.prev;
         
-        // Update new tail's next pointer
         if let Some(new_tail_id) = self.tail {
             if let Some(new_tail_node) = self.nodes.get_mut(&new_tail_id) {
                 new_tail_node.next = None;
             }
         } else {
-            // List is now empty
             self.head = None;
         }
         
@@ -364,7 +496,6 @@ where
         let id = self.value_to_id.remove(value)?;
         let node = self.nodes.remove(&id)?;
         
-        // Update prev node's next pointer
         if let Some(prev_id) = node.prev {
             if let Some(prev_node) = self.nodes.get_mut(&prev_id) {
                 prev_node.next = node.next;
@@ -373,7 +504,6 @@ where
             self.head = node.next;
         }
         
-        // Update next node's prev pointer
         if let Some(next_id) = node.next {
             if let Some(next_node) = self.nodes.get_mut(&next_id) {
                 next_node.prev = node.prev;
@@ -383,49 +513,6 @@ where
         }
         
         Some(node.value)
-    }
-    
-    pub fn move_front(&mut self, value: &T) {
-        // Used by LRU - moves existing element to front
-        if let Some(&id) = self.value_to_id.get(value) {
-            // Only need to move if not already at head
-            if self.head != Some(id) {
-                // ⚠️ BUG FIX: Store prev/next BEFORE mutable borrows
-                let (prev, next) = {
-                    let node = self.nodes.get(&id).unwrap();
-                    (node.prev, node.next)
-                };
-                
-                // Update surrounding nodes
-                if let Some(prev_id) = prev {
-                    if let Some(prev_node) = self.nodes.get_mut(&prev_id) {
-                        prev_node.next = next;
-                    }
-                }
-                
-                if let Some(next_id) = next {
-                    if let Some(next_node) = self.nodes.get_mut(&next_id) {
-                        next_node.prev = prev;
-                    }
-                } else {
-                    self.tail = prev;
-                }
-                
-                // Move to front
-                if let Some(node) = self.nodes.get_mut(&id) {
-                    node.prev = None;
-                    node.next = self.head;
-                }
-                
-                if let Some(old_head_id) = self.head {
-                    if let Some(old_head_node) = self.nodes.get_mut(&old_head_id) {
-                        old_head_node.prev = Some(id);
-                    }
-                }
-                
-                self.head = Some(id);
-            }
-        }
     }
     
     pub fn clear(&mut self) {
@@ -445,5 +532,3 @@ where
         Self::with_hasher(S::default())
     }
 }
-
-
