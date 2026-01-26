@@ -1,4 +1,4 @@
-/* 
+
 
 /*
  * Copyright (c) Kia Shakiba
@@ -13,28 +13,34 @@
 //! use the HybridObjects allocator instead of relying on the global allocator.
 //! This is necessary because paper-cache is a library, and consuming binaries
 //! may override the global allocator, which would break PMEM allocation.
+//!
+//! These implementations use a Vec-based architecture for simpler memory management
+//! and reduced risk of segfaults compared to HashMap-based approaches.
 
 use hashbrown::HashMap;
-use std::hash::{Hash, BuildHasher, BuildHasherDefault};
-use nohash_hasher::NoHashHasher;
+use std::hash::{Hash, BuildHasher};
 use crate::allocator::HybridObjects;
 
-/// Type alias for the hasher used in PmemVecList's internal HashMap
-type VecListHasher = BuildHasherDefault<NoHashHasher<usize>>;
+// Use allocator-api2's Vec which works on stable Rust
+use allocator_api2::vec::Vec;
 
-/// Index into a PmemVecList - wraps the node ID
+// ============================================================================
+// PmemVecList
+// ============================================================================
+
+/// Index into a PmemVecList - wraps a Vec index
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct PmemIndex(usize);
 
-/// A doubly-linked list implementation using HashMap with PMEM allocator
+/// A doubly-linked list using Vec-based storage with PMEM allocator
 /// 
-/// This replaces VecList<T> with an implementation that uses HybridObjects allocator
-/// for all its internal storage, making it safe to use in library contexts where the
-/// global allocator may be overridden.
+/// Uses a Vec for node storage (simpler than HashMap) with a free list
+/// to reuse deleted slots. This reduces allocator surface area and makes
+/// debugging easier.
 pub struct PmemVecList<T> {
-    nodes: HashMap<usize, Node<T>, VecListHasher, HybridObjects>,
+    entries: Vec<Option<Node<T>>, HybridObjects>,
     head: Option<usize>,
-    next_id: usize,
+    free_list: Vec<usize, HybridObjects>,
 }
 
 struct Node<T> {
@@ -47,9 +53,9 @@ impl<T> PmemVecList<T> {
     /// Creates a new empty PmemVecList
     pub fn new() -> Self {
         PmemVecList {
-            nodes: HashMap::with_hasher_in(VecListHasher::default(), HybridObjects),
+            entries: Vec::new_in(HybridObjects),
             head: None,
-            next_id: 0,
+            free_list: Vec::new_in(HybridObjects),
         }
     }
     
@@ -60,80 +66,100 @@ impl<T> PmemVecList<T> {
     
     /// Returns a reference to the front element, if any
     pub fn front(&self) -> Option<&T> {
-        self.head.and_then(|id| self.nodes.get(&id).map(|node| &node.value))
+        self.head.and_then(|idx| {
+            self.entries.get(idx).and_then(|opt_node| {
+                opt_node.as_ref().map(|node| &node.value)
+            })
+        })
     }
     
     /// Returns a mutable reference to the element at the given index
     pub fn get_mut(&mut self, index: PmemIndex) -> Option<&mut T> {
-        self.nodes.get_mut(&index.0).map(|node| &mut node.value)
+        self.entries.get_mut(index.0).and_then(|opt_node| {
+            opt_node.as_mut().map(|node| &mut node.value)
+        })
     }
     
     /// Returns the index of the next element after the given index
     pub fn get_next_index(&self, index: PmemIndex) -> Option<PmemIndex> {
-        self.nodes.get(&index.0).and_then(|node| node.next.map(PmemIndex))
+        self.entries.get(index.0).and_then(|opt_node| {
+            opt_node.as_ref().and_then(|node| node.next.map(PmemIndex))
+        })
     }
     
     /// Pushes a value to the front of the list
     pub fn push_front(&mut self, value: T) -> PmemIndex {
-        let id = self.next_id;
-        self.next_id += 1;
-        
         let node = Node {
             value,
             prev: None,
             next: self.head,
         };
         
-        self.nodes.insert(id, node);
+        // Allocate index: reuse from free list or append
+        let idx = if let Some(free_idx) = self.free_list.pop() {
+            self.entries[free_idx] = Some(node);
+            free_idx
+        } else {
+            let idx = self.entries.len();
+            self.entries.push(Some(node));
+            idx
+        };
         
+        // Update old head's prev pointer
         if let Some(old_head) = self.head {
-            if let Some(old_head_node) = self.nodes.get_mut(&old_head) {
-                old_head_node.prev = Some(id);
+            if let Some(Some(old_head_node)) = self.entries.get_mut(old_head) {
+                old_head_node.prev = Some(idx);
             }
         }
         
-        self.head = Some(id);
-        
-        PmemIndex(id)
+        self.head = Some(idx);
+        PmemIndex(idx)
     }
     
     /// Inserts a value after the given index
     pub fn insert_after(&mut self, index: PmemIndex, value: T) -> PmemIndex {
-        let id = self.next_id;
-        self.next_id += 1;
-        
-        let next_id = self.nodes.get(&index.0).and_then(|node| node.next);
+        let next_idx = self.entries.get(index.0)
+            .and_then(|opt_node| opt_node.as_ref())
+            .and_then(|node| node.next);
         
         let node = Node {
             value,
             prev: Some(index.0),
-            next: next_id,
+            next: next_idx,
         };
         
-        self.nodes.insert(id, node);
+        // Allocate index: reuse from free list or append
+        let idx = if let Some(free_idx) = self.free_list.pop() {
+            self.entries[free_idx] = Some(node);
+            free_idx
+        } else {
+            let idx = self.entries.len();
+            self.entries.push(Some(node));
+            idx
+        };
         
-        // Update the previous node
-        if let Some(prev_node) = self.nodes.get_mut(&index.0) {
-            prev_node.next = Some(id);
+        // Update previous node's next pointer
+        if let Some(Some(prev_node)) = self.entries.get_mut(index.0) {
+            prev_node.next = Some(idx);
         }
         
-        // Update the next node if it exists
-        if let Some(next) = next_id {
-            if let Some(next_node) = self.nodes.get_mut(&next) {
-                next_node.prev = Some(id);
+        // Update next node's prev pointer if it exists
+        if let Some(next) = next_idx {
+            if let Some(Some(next_node)) = self.entries.get_mut(next) {
+                next_node.prev = Some(idx);
             }
         }
         
-        PmemIndex(id)
+        PmemIndex(idx)
     }
     
     /// Removes the element at the given index
     pub fn remove(&mut self, index: PmemIndex) -> Option<T> {
-        let node = self.nodes.remove(&index.0)?;
+        let node = self.entries.get_mut(index.0)?.take()?;
         
         // Update prev node's next pointer
         if let Some(prev) = node.prev {
-            if let Some(prev_node) = self.nodes.get_mut(&prev) {
+            if let Some(Some(prev_node)) = self.entries.get_mut(prev) {
                 prev_node.next = node.next;
             }
         } else {
@@ -142,254 +168,22 @@ impl<T> PmemVecList<T> {
         
         // Update next node's prev pointer
         if let Some(next) = node.next {
-            if let Some(next_node) = self.nodes.get_mut(&next) {
+            if let Some(Some(next_node)) = self.entries.get_mut(next) {
                 next_node.prev = node.prev;
             }
         }
+        
+        // Add index to free list for reuse
+        self.free_list.push(index.0);
         
         Some(node.value)
     }
     
     /// Clears the list
     pub fn clear(&mut self) {
-        self.nodes.clear();
+        self.entries.clear();
         self.head = None;
-    }
-}
-
-impl<T> Default for PmemVecList<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A hash-based doubly-linked list implementation using PMEM allocator
-/// 
-/// This replaces HashList<T, S> with an implementation that uses HybridObjects allocator
-/// for all its internal storage, making it safe to use in library contexts.
-pub struct PmemHashList<T, S> {
-    map: HashMap<T, ListNode<T>, S, HybridObjects>,
-    head: Option<T>,
-    tail: Option<T>,
-}
-
-struct ListNode<T> {
-    prev: Option<T>,
-    next: Option<T>,
-}
-
-impl<T, S> PmemHashList<T, S>
-where
-    T: Hash + Eq + Clone,
-    S: BuildHasher,
-{
-    /// Creates a new empty PmemHashList with the given hasher
-    pub fn with_hasher(hasher: S) -> Self {
-        PmemHashList {
-            map: HashMap::with_hasher_in(hasher, HybridObjects),
-            head: None,
-            tail: None,
-        }
-    }
-    
-    /// Returns true if the list is empty
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-    
-    /// Pushes a value to the front of the list
-    pub fn push_front(&mut self, value: T) {
-        if self.map.contains_key(&value) {
-            // Value already exists, remove it first
-            self.remove(&value);
-        }
-        
-        let node = ListNode {
-            prev: None,
-            next: self.head.clone(),
-        };
-        
-        if let Some(old_head) = &self.head {
-            if let Some(old_head_node) = self.map.get_mut(old_head) {
-                old_head_node.prev = Some(value.clone());
-            }
-        }
-        
-        self.head = Some(value.clone());
-        
-        if self.tail.is_none() {
-            self.tail = Some(value.clone());
-        }
-        
-        self.map.insert(value, node);
-    }
-    
-    /// Pops a value from the back of the list
-    pub fn pop_back(&mut self) -> Option<T> {
-        let tail_value = self.tail.clone()?;
-        self.remove(&tail_value).map(|_| tail_value)
-    }
-    
-    /// Removes a value from the list
-    pub fn remove(&mut self, value: &T) -> Option<T> {
-        let node = self.map.remove(value)?;
-        
-        // Update prev node's next pointer
-        if let Some(prev) = &node.prev {
-            if let Some(prev_node) = self.map.get_mut(prev) {
-                prev_node.next = node.next.clone();
-            }
-        } else {
-            self.head = node.next.clone();
-        }
-        
-        // Update next node's prev pointer
-        if let Some(next) = &node.next {
-            if let Some(next_node) = self.map.get_mut(next) {
-                next_node.prev = node.prev.clone();
-            }
-        } else {
-            self.tail = node.prev.clone();
-        }
-        
-        Some(value.clone())
-    }
-
-
-    */
-
-/*
- * Copyright (c) Kia Shakiba
- *
- * This source code is licensed under the GNU AGPLv3 license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-//! Custom allocator-aware collections for PMEM-backed eviction stacks
-
-use hashbrown::HashMap;
-use std::hash::{Hash, BuildHasher, BuildHasherDefault};
-use nohash_hasher::NoHashHasher;
-use crate::allocator::HybridObjects;
-
-// ============================================================================
-// PmemVecList
-// ============================================================================
-
-type VecListHasher = BuildHasherDefault<NoHashHasher<usize>>;
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct PmemIndex(usize);
-
-pub struct PmemVecList<T> {
-    nodes: HashMap<usize, VecNode<T>, VecListHasher, HybridObjects>,
-    head: Option<usize>,
-    next_id: usize,
-}
-
-struct VecNode<T> {
-    value: T,
-    prev: Option<usize>,
-    next: Option<usize>,
-}
-
-impl<T> PmemVecList<T> {
-    pub fn new() -> Self {
-        PmemVecList {
-            nodes: HashMap::with_hasher_in(VecListHasher::default(), HybridObjects),
-            head: None,
-            next_id: 0,
-        }
-    }
-    
-    pub fn front_index(&self) -> Option<PmemIndex> {
-        self.head.map(PmemIndex)
-    }
-    
-    pub fn front(&self) -> Option<&T> {
-        self.head.and_then(|id| self.nodes.get(&id).map(|node| &node.value))
-    }
-    
-    pub fn get_mut(&mut self, index: PmemIndex) -> Option<&mut T> {
-        self.nodes.get_mut(&index.0).map(|node| &mut node.value)
-    }
-    
-    pub fn get_next_index(&self, index: PmemIndex) -> Option<PmemIndex> {
-        self.nodes.get(&index.0).and_then(|node| node.next.map(PmemIndex))
-    }
-    
-    pub fn push_front(&mut self, value: T) -> PmemIndex {
-        let id = self.next_id;
-        self.next_id += 1;
-        
-        let node = VecNode {
-            value,
-            prev: None,
-            next: self.head,
-        };
-        
-        if let Some(old_head) = self.head {
-            if let Some(old_head_node) = self.nodes.get_mut(&old_head) {
-                old_head_node.prev = Some(id);
-            }
-        }
-        
-        self.head = Some(id);
-        self.nodes.insert(id, node);
-        
-        PmemIndex(id)
-    }
-    
-    pub fn insert_after(&mut self, index: PmemIndex, value: T) -> PmemIndex {
-        let id = self.next_id;
-        self.next_id += 1;
-        
-        let next_id = self.nodes.get(&index.0).and_then(|node| node.next);
-        
-        let node = VecNode {
-            value,
-            prev: Some(index.0),
-            next: next_id,
-        };
-        
-        self.nodes.insert(id, node);
-        
-        if let Some(prev_node) = self.nodes.get_mut(&index.0) {
-            prev_node.next = Some(id);
-        }
-        
-        if let Some(next) = next_id {
-            if let Some(next_node) = self.nodes.get_mut(&next) {
-                next_node.prev = Some(id);
-            }
-        }
-        
-        PmemIndex(id)
-    }
-    
-    pub fn remove(&mut self, index: PmemIndex) -> Option<T> {
-        let node = self.nodes.remove(&index.0)?;
-        
-        if let Some(prev) = node.prev {
-            if let Some(prev_node) = self.nodes.get_mut(&prev) {
-                prev_node.next = node.next;
-            }
-        } else {
-            self.head = node.next;
-        }
-        
-        if let Some(next) = node.next {
-            if let Some(next_node) = self.nodes.get_mut(&next) {
-                next_node.prev = node.prev;
-            }
-        }
-        
-        Some(node.value)
-    }
-    
-    pub fn clear(&mut self) {
-        self.nodes.clear();
-        self.head = None;
+        self.free_list.clear();
     }
 }
 
@@ -403,132 +197,373 @@ impl<T> Default for PmemVecList<T> {
 // PmemHashList
 // ============================================================================
 
+/// A hash-based doubly-linked list using Vec + HashMap with PMEM allocator
+/// 
+/// Uses Vec for node storage (simpler than two HashMaps) with HashMap for O(1) lookup.
+/// Includes free list to reuse deleted slots.
 pub struct PmemHashList<T, S> {
-    value_to_id: HashMap<T, usize, S, HybridObjects>,
-    nodes: HashMap<usize, ListNode<T>, S, HybridObjects>,
+    entries: Vec<Option<Node<T>>, HybridObjects>,
+    lookup: HashMap<T, usize, S, HybridObjects>,
     head: Option<usize>,
     tail: Option<usize>,
-    next_id: usize,
-}
-
-struct ListNode<T> {
-    value: T,
-    prev: Option<usize>,
-    next: Option<usize>,
+    free_list: Vec<usize, HybridObjects>,
 }
 
 impl<T, S> PmemHashList<T, S>
 where
     T: Hash + Eq + Clone,
-    S: BuildHasher + Clone,
+    S: BuildHasher,
 {
+    /// Creates a new empty PmemHashList with the given hasher
     pub fn with_hasher(hasher: S) -> Self {
         PmemHashList {
-            value_to_id: HashMap::with_hasher_in(hasher.clone(), HybridObjects),
-            nodes: HashMap::with_hasher_in(hasher, HybridObjects),
+            entries: Vec::new_in(HybridObjects),
+            lookup: HashMap::with_hasher_in(hasher, HybridObjects),
             head: None,
             tail: None,
-            next_id: 0,
+            free_list: Vec::new_in(HybridObjects),
         }
     }
     
+    /// Returns true if the list is empty
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.lookup.is_empty()
     }
     
+    /// Returns the number of elements in the list
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.lookup.len()
     }
     
+    /// Returns true if the list contains the given value
     pub fn contains(&self, value: &T) -> bool {
-        self.value_to_id.contains_key(value)
+        self.lookup.contains_key(value)
     }
     
+    /// Pushes a value to the front of the list
     pub fn push_front(&mut self, value: T) {
-        if self.value_to_id.contains_key(&value) {
+        // If value already exists, remove it first
+        if self.lookup.contains_key(&value) {
             self.remove(&value);
         }
         
-        let id = self.next_id;
-        self.next_id += 1;
-        
-        let node = ListNode {
+        let node = Node {
             value: value.clone(),
             prev: None,
             next: self.head,
         };
         
-        if let Some(old_head_id) = self.head {
-            if let Some(old_head_node) = self.nodes.get_mut(&old_head_id) {
-                old_head_node.prev = Some(id);
+        // Allocate index: reuse from free list or append
+        let idx = if let Some(free_idx) = self.free_list.pop() {
+            self.entries[free_idx] = Some(node);
+            free_idx
+        } else {
+            let idx = self.entries.len();
+            self.entries.push(Some(node));
+            idx
+        };
+        
+        // Update old head's prev pointer
+        if let Some(old_head_idx) = self.head {
+            if let Some(Some(old_head_node)) = self.entries.get_mut(old_head_idx) {
+                old_head_node.prev = Some(idx);
             }
         }
         
-        self.head = Some(id);
+        self.head = Some(idx);
         
+        // If list was empty, this is also the tail
         if self.tail.is_none() {
-            self.tail = Some(id);
+            self.tail = Some(idx);
         }
         
-        self.value_to_id.insert(value, id);
-        self.nodes.insert(id, node);
+        self.lookup.insert(value, idx);
     }
     
+    /// Pops a value from the back of the list
     pub fn pop_back(&mut self) -> Option<T> {
-        let tail_id = self.tail?;
-        let node = self.nodes.remove(&tail_id)?;
-        self.value_to_id.remove(&node.value);
+        let tail_idx = self.tail?;
+        let node = self.entries.get_mut(tail_idx)?.take()?;
         
+        self.lookup.remove(&node.value);
         self.tail = node.prev;
         
-        if let Some(new_tail_id) = self.tail {
-            if let Some(new_tail_node) = self.nodes.get_mut(&new_tail_id) {
+        // Update new tail's next pointer
+        if let Some(new_tail_idx) = self.tail {
+            if let Some(Some(new_tail_node)) = self.entries.get_mut(new_tail_idx) {
                 new_tail_node.next = None;
             }
         } else {
+            // List is now empty
             self.head = None;
         }
+        
+        // Add index to free list for reuse
+        self.free_list.push(tail_idx);
         
         Some(node.value)
     }
     
+    /// Removes a value from the list
     pub fn remove(&mut self, value: &T) -> Option<T> {
-        let id = self.value_to_id.remove(value)?;
-        let node = self.nodes.remove(&id)?;
+        let idx = self.lookup.remove(value)?;
+        let node = self.entries.get_mut(idx)?.take()?;
         
-        if let Some(prev_id) = node.prev {
-            if let Some(prev_node) = self.nodes.get_mut(&prev_id) {
+        // Update prev node's next pointer
+        if let Some(prev_idx) = node.prev {
+            if let Some(Some(prev_node)) = self.entries.get_mut(prev_idx) {
                 prev_node.next = node.next;
             }
         } else {
             self.head = node.next;
         }
         
-        if let Some(next_id) = node.next {
-            if let Some(next_node) = self.nodes.get_mut(&next_id) {
+        // Update next node's prev pointer
+        if let Some(next_idx) = node.next {
+            if let Some(Some(next_node)) = self.entries.get_mut(next_idx) {
                 next_node.prev = node.prev;
             }
         } else {
             self.tail = node.prev;
         }
         
+        // Add index to free list for reuse
+        self.free_list.push(idx);
+        
         Some(node.value)
     }
     
+    /// Clears the list
     pub fn clear(&mut self) {
-        self.value_to_id.clear();
-        self.nodes.clear();
+        self.lookup.clear();
+        self.entries.clear();
         self.head = None;
         self.tail = None;
+        self.free_list.clear();
     }
 }
 
 impl<T, S> Default for PmemHashList<T, S>
 where
     T: Hash + Eq + Clone,
-    S: BuildHasher + Clone + Default,
+    S: BuildHasher + Default,
 {
     fn default() -> Self {
         Self::with_hasher(S::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::hash::BuildHasherDefault;
+    use nohash_hasher::NoHashHasher;
+
+    type TestHasher = BuildHasherDefault<NoHashHasher<u64>>;
+
+    #[test]
+    fn pmem_vec_list_basic_operations() {
+        let mut list = PmemVecList::<u64>::new();
+        
+        // Test empty list
+        assert!(list.front().is_none());
+        assert!(list.front_index().is_none());
+        
+        // Test push_front and front
+        let idx1 = list.push_front(1);
+        assert_eq!(list.front(), Some(&1));
+        assert_eq!(list.front_index(), Some(idx1));
+        
+        let idx2 = list.push_front(2);
+        assert_eq!(list.front(), Some(&2));
+        assert_eq!(list.front_index(), Some(idx2));
+        
+        // Test get_mut
+        assert_eq!(list.get_mut(idx1), Some(&mut 1));
+        assert_eq!(list.get_mut(idx2), Some(&mut 2));
+        
+        // Test get_next_index
+        assert_eq!(list.get_next_index(idx2), Some(idx1));
+        assert_eq!(list.get_next_index(idx1), None);
+    }
+
+    #[test]
+    fn pmem_vec_list_insert_after() {
+        let mut list = PmemVecList::<u64>::new();
+        
+        let idx1 = list.push_front(1);
+        let idx3 = list.insert_after(idx1, 3);
+        let idx2 = list.insert_after(idx1, 2);
+        
+        // List should be: 1 -> 2 -> 3
+        assert_eq!(list.front(), Some(&1));
+        assert_eq!(list.get_next_index(idx1), Some(idx2));
+        assert_eq!(list.get_next_index(idx2), Some(idx3));
+        assert_eq!(list.get_next_index(idx3), None);
+    }
+
+    #[test]
+    fn pmem_vec_list_remove_and_free_list() {
+        let mut list = PmemVecList::<u64>::new();
+        
+        let idx1 = list.push_front(1);
+        let idx2 = list.push_front(2);
+        let idx3 = list.push_front(3);
+        
+        // Remove middle element
+        assert_eq!(list.remove(idx2), Some(2));
+        assert_eq!(list.front(), Some(&3));
+        assert_eq!(list.get_next_index(idx3), Some(idx1));
+        
+        // Add new element - should reuse freed slot
+        let idx4 = list.push_front(4);
+        assert_eq!(list.front(), Some(&4));
+        
+        // Remove head
+        assert_eq!(list.remove(idx4), Some(4));
+        assert_eq!(list.front(), Some(&3));
+        
+        // Remove tail
+        assert_eq!(list.remove(idx1), Some(1));
+        assert_eq!(list.front(), Some(&3));
+        assert_eq!(list.get_next_index(idx3), None);
+    }
+
+    #[test]
+    fn pmem_vec_list_clear() {
+        let mut list = PmemVecList::<u64>::new();
+        
+        list.push_front(1);
+        list.push_front(2);
+        list.push_front(3);
+        
+        list.clear();
+        
+        assert!(list.front().is_none());
+        assert!(list.front_index().is_none());
+    }
+
+    #[test]
+    fn pmem_hash_list_basic_operations() {
+        let mut list = PmemHashList::<u64, TestHasher>::with_hasher(TestHasher::default());
+        
+        // Test empty list
+        assert!(list.is_empty());
+        assert_eq!(list.len(), 0);
+        assert!(!list.contains(&1));
+        
+        // Test push_front
+        list.push_front(1);
+        assert!(!list.is_empty());
+        assert_eq!(list.len(), 1);
+        assert!(list.contains(&1));
+        
+        list.push_front(2);
+        assert_eq!(list.len(), 2);
+        assert!(list.contains(&2));
+    }
+
+    #[test]
+    fn pmem_hash_list_pop_back() {
+        let mut list = PmemHashList::<u64, TestHasher>::with_hasher(TestHasher::default());
+        
+        list.push_front(1);
+        list.push_front(2);
+        list.push_front(3);
+        
+        // List is: 3 -> 2 -> 1
+        assert_eq!(list.pop_back(), Some(1));
+        assert_eq!(list.len(), 2);
+        assert!(!list.contains(&1));
+        
+        assert_eq!(list.pop_back(), Some(2));
+        assert_eq!(list.len(), 1);
+        
+        assert_eq!(list.pop_back(), Some(3));
+        assert_eq!(list.len(), 0);
+        assert!(list.is_empty());
+        
+        assert_eq!(list.pop_back(), None);
+    }
+
+    #[test]
+    fn pmem_hash_list_remove() {
+        let mut list = PmemHashList::<u64, TestHasher>::with_hasher(TestHasher::default());
+        
+        list.push_front(1);
+        list.push_front(2);
+        list.push_front(3);
+        
+        // Remove middle element
+        assert_eq!(list.remove(&2), Some(2));
+        assert_eq!(list.len(), 2);
+        assert!(!list.contains(&2));
+        assert!(list.contains(&1));
+        assert!(list.contains(&3));
+        
+        // Remove non-existent element
+        assert_eq!(list.remove(&99), None);
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn pmem_hash_list_push_existing() {
+        let mut list = PmemHashList::<u64, TestHasher>::with_hasher(TestHasher::default());
+        
+        list.push_front(1);
+        list.push_front(2);
+        list.push_front(3);
+        
+        // Push existing element - should remove and re-add at front
+        list.push_front(2);
+        assert_eq!(list.len(), 3);
+        
+        // Pop order should be: 2 is at head, then 3, then 1
+        assert_eq!(list.pop_back(), Some(1));
+        assert_eq!(list.pop_back(), Some(3));
+        assert_eq!(list.pop_back(), Some(2));
+    }
+
+    #[test]
+    fn pmem_hash_list_free_list_reuse() {
+        let mut list = PmemHashList::<u64, TestHasher>::with_hasher(TestHasher::default());
+        
+        // Add and remove multiple times to test free list
+        for i in 0..10 {
+            list.push_front(i);
+        }
+        
+        assert_eq!(list.len(), 10);
+        
+        // Remove half
+        for i in 0..5 {
+            list.remove(&i);
+        }
+        
+        assert_eq!(list.len(), 5);
+        
+        // Add more - should reuse freed slots
+        for i in 100..105 {
+            list.push_front(i);
+        }
+        
+        assert_eq!(list.len(), 10);
+    }
+
+    #[test]
+    fn pmem_hash_list_clear() {
+        let mut list = PmemHashList::<u64, TestHasher>::with_hasher(TestHasher::default());
+        
+        list.push_front(1);
+        list.push_front(2);
+        list.push_front(3);
+        
+        list.clear();
+        
+        assert!(list.is_empty());
+        assert_eq!(list.len(), 0);
+        assert!(!list.contains(&1));
+        assert!(!list.contains(&2));
+        assert!(!list.contains(&3));
     }
 }
