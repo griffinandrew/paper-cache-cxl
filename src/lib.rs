@@ -125,7 +125,7 @@ use crate::{
 pub use crate::{
 	error::CacheError,
 	policy::PaperPolicy,
-	perf_counters::{HashMapStats, get_global_counters},
+	perf_counters::{HashMapStats, get_global_counters, get_hashmap_stats},
 };
 
 #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
@@ -2281,6 +2281,9 @@ where
 	pub fn has(&self, key: &K) -> bool {
 		let hashed_key = self.hash_key(key);
 
+		// Track hashmap read access
+		crate::perf_counters::get_global_counters().global_hashbrown_pmem.incr_lookup();
+
 		self.objects
 			.read().unwrap().get(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
@@ -2288,6 +2291,9 @@ where
 
 	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
 		let hashed_key = self.hash_key(key);
+
+		// Track hashmap read access
+		crate::perf_counters::get_global_counters().global_hashbrown_pmem.incr_lookup();
 
 		match self.objects.read().unwrap().get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
@@ -2521,6 +2527,9 @@ where
 
 		self.status.incr_sets();
 
+		// Track hashmap write access (insert)
+		crate::perf_counters::get_global_counters().global_hashbrown_dram.incr_insertion();
+
 		let old_object_info = self.objects
 			.write().unwrap().insert(hashed_key, object)
 			.map(|old_object| {
@@ -2561,6 +2570,9 @@ where
 	pub fn has(&self, key: &K) -> bool {
 		let hashed_key = self.hash_key(key);
 
+		// Track hashmap read access
+		crate::perf_counters::get_global_counters().global_hashbrown_dram.incr_lookup();
+
 		self.objects
 			.read().unwrap().get(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
@@ -2568,6 +2580,9 @@ where
 
 	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
 		let hashed_key = self.hash_key(key);
+
+		// Track hashmap read access
+		crate::perf_counters::get_global_counters().global_hashbrown_dram.incr_lookup();
 
 		match self.objects.read().unwrap().get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
@@ -4224,7 +4239,7 @@ where
 
 			//let Some(object) = objects.iter().next() else {
 			//let Some(object) = objects.read().unwrap().iter().next() else {
-			let mut objects_guard = objects.write().unwrap();
+			let objects_guard = objects.write().unwrap();
 			let Some(object) = objects_guard.iter().next() else {
 				error!("Object store is empty with non-zero used size");
 				return Err(CacheError::Internal);

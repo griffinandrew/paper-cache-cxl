@@ -211,6 +211,105 @@ pub fn get_global_counters() -> &'static GlobalPerfCounters {
     PERF_COUNTERS.get_or_init(GlobalPerfCounters::new)
 }
 
+/// Get hashmap statistics based on active features
+/// Returns statistics for the active global hashtable configuration
+pub fn get_hashmap_stats() -> Option<HashMapStats> {
+    let counters = get_global_counters();
+    
+    #[cfg(feature = "hashbrown_dram")]
+    {
+        return Some(HashMapStats::from(&counters.global_hashbrown_dram));
+    }
+    
+    #[cfg(all(feature = "global_hashtable_pmem", not(feature = "hashbrown_dram")))]
+    {
+        return Some(HashMapStats::from(&counters.global_hashbrown_pmem));
+    }
+    
+    #[cfg(all(feature = "global_flatmap_dram", not(feature = "hashbrown_dram"), not(feature = "global_hashtable_pmem")))]
+    {
+        return Some(HashMapStats::from(&counters.global_flatmap_dram));
+    }
+    
+    #[cfg(all(feature = "global_flatmap_pmem", not(feature = "hashbrown_dram"), not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram")))]
+    {
+        return Some(HashMapStats::from(&counters.global_flatmap_pmem));
+    }
+    
+    #[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem")))]
+    {
+        None
+    }
+}
+
+/// Get tiering hashtable statistics if tiering is enabled
+pub fn get_tiering_hashtable_stats() -> Option<HashMapStats> {
+    #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager", not(feature = "tiering_hashtable_pmem")))]
+    {
+        let counters = get_global_counters();
+        return Some(HashMapStats::from(&counters.tiering_hashtable_dram));
+    }
+    
+    #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager", feature = "tiering_hashtable_pmem"))]
+    {
+        let counters = get_global_counters();
+        return Some(HashMapStats::from(&counters.tiering_hashtable_pmem));
+    }
+    
+    #[cfg(not(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager")))]
+    {
+        None
+    }
+}
+
+/// Print performance statistics summary
+pub fn print_perf_stats() {
+    println!("\n=== PaperCache Performance Statistics ===\n");
+    
+    if let Some(stats) = get_hashmap_stats() {
+        #[cfg(feature = "hashbrown_dram")]
+        println!("Global HashMap (hashbrown in DRAM):");
+        
+        #[cfg(all(feature = "global_hashtable_pmem", not(feature = "hashbrown_dram")))]
+        println!("Global HashMap (hashbrown in PMEM):");
+        
+        #[cfg(all(feature = "global_flatmap_dram", not(feature = "hashbrown_dram"), not(feature = "global_hashtable_pmem")))]
+        println!("Global HashMap (FlatMap in DRAM):");
+        
+        #[cfg(all(feature = "global_flatmap_pmem", not(feature = "hashbrown_dram"), not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram")))]
+        println!("Global HashMap (FlatMap in PMEM):");
+        
+        print!("{}", stats);
+    } else {
+        println!("Global HashMap: Using DashMap (no performance counters)");
+    }
+    
+    println!();
+    
+    if let Some(stats) = get_tiering_hashtable_stats() {
+        #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager", not(feature = "tiering_hashtable_pmem")))]
+        println!("Tiering Manager HashMap (in DRAM):");
+        
+        #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager", feature = "tiering_hashtable_pmem"))]
+        println!("Tiering Manager HashMap (in PMEM):");
+        
+        print!("{}", stats);
+        println!();
+    }
+    
+    let total_mem = get_global_counters().get_total_memory_accesses();
+    if total_mem > 0 {
+        println!("Total Memory Accesses: {}", total_mem);
+        
+        if let Some(stats) = get_hashmap_stats() {
+            let percentage = 100.0 * stats.total_accesses as f64 / total_mem as f64;
+            println!("HashMap accesses as % of total: {:.2}%", percentage);
+        }
+    }
+    
+    println!("\n==========================================\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
