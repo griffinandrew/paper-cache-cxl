@@ -13,8 +13,12 @@
 //! may override the global allocator, which would break PMEM allocation.
 
 use hashbrown::HashMap;
-use std::hash::{Hash, BuildHasher};
+use std::hash::{Hash, BuildHasher, BuildHasherDefault};
+use nohash_hasher::NoHashHasher;
 use crate::allocator::HybridObjects;
+
+/// Type alias for the hasher used in PmemVecList's internal HashMap
+type VecListHasher = BuildHasherDefault<NoHashHasher<usize>>;
 
 /// Index into a PmemVecList - wraps the node ID
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -26,7 +30,7 @@ pub struct PmemIndex(usize);
 /// for all its internal storage, making it safe to use in library contexts where the
 /// global allocator may be overridden.
 pub struct PmemVecList<T> {
-    nodes: HashMap<usize, Node<T>, std::hash::BuildHasherDefault<nohash_hasher::NoHashHasher<usize>>, HybridObjects>,
+    nodes: HashMap<usize, Node<T>, VecListHasher, HybridObjects>,
     head: Option<usize>,
     next_id: usize,
 }
@@ -41,10 +45,7 @@ impl<T> PmemVecList<T> {
     /// Creates a new empty PmemVecList
     pub fn new() -> Self {
         PmemVecList {
-            nodes: HashMap::with_hasher_in(
-                std::hash::BuildHasherDefault::default(),
-                HybridObjects
-            ),
+            nodes: HashMap::with_hasher_in(VecListHasher::default(), HybridObjects),
             head: None,
             next_id: 0,
         }

@@ -196,14 +196,6 @@ Create custom implementations that explicitly use `HybridObjects` allocator via 
 
 This approach provides PMEM benefits while maintaining compatibility with existing crates.
 
-### Why Not Modify VecList and HashList?
-
-`VecList` (from `dlv-list` crate) and `HashList` (from `kwik` crate) are external dependencies that don't expose allocator parameters. Rather than forking these crates, we rely on:
-1. The global allocator (HybridObjects) for their internal allocations
-2. Explicit custom allocator for `HashMap` where possible (via hashbrown)
-
-This approach provides PMEM benefits while maintaining compatibility with existing crates.
-
 ### Why hashbrown Instead of std::collections::HashMap?
 
 `std::collections::HashMap` doesn't support custom allocators on stable Rust. `hashbrown::HashMap` provides:

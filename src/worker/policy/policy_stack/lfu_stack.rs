@@ -218,10 +218,12 @@ impl CountStack {
 	}
 
 	fn pop(&mut self) -> HashedKey {
+		// Safe to unwrap: caller ensures stack is not empty via is_empty() check
 		self.stack.pop_back().unwrap()
 	}
 
 	fn remove(&mut self, key: HashedKey) {
+		// Safe to unwrap: caller ensures key exists in the stack
 		self.stack.remove(&key).unwrap();
 	}
 }
