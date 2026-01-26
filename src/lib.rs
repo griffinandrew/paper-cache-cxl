@@ -7,6 +7,9 @@
 
 
 
+// Enable allocator_api nightly feature for features that need it
+// Note: eviction_stack_pmem is NOT included here because it uses allocator-api2
+// which works on stable Rust without requiring the nightly allocator_api feature
 #![cfg_attr(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"), feature(allocator_api))]
 
 // Validate that both global_flatmap_dram and global_flatmap_pmem are not enabled together

@@ -216,7 +216,7 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
         let ptr = unsafe { self.alloc(layout) };
         if ptr.is_null() {
-            Err(allocator_api2::alloc:: AllocError)
+            Err(allocator_api2::alloc::AllocError)
         } else {
             let slice = unsafe {
                 std::slice::from_raw_parts_mut(ptr, layout.size())
