@@ -8,6 +8,8 @@ This branch makes it such that both the key and value reside in the pmem tier.
 
 Here we will add a custom basic hashmap because the architecture of the swissmap used by both dashmap and hashbrown hashmap might be hurting perf in a pmem scenario
 
+This branch will add the needed instrumentation to count how many memory accesses are performed to the hashmap
+
 ## Tiering Manager
 
 The tiering manager provides a two-tier caching architecture with **actual data copies**:
