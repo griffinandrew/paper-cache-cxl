@@ -2512,7 +2512,7 @@ where
 				self.status.incr_hits();
 				let arc_val = object.data();
 				//Ok(arc_val.as_ref().to_vec())
-				Ok((0.to_vec()))
+				Ok((0_i32.to_vec()))
 			},
 			_ => {
 				self.status.incr_misses();
