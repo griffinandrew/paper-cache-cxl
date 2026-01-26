@@ -10,6 +10,81 @@ Here we will add a custom basic hashmap because the architecture of the swissmap
 
 This branch will add the needed instrumentation to count how many memory accesses are performed to the hashmap
 
+## Performance Counters
+
+PaperCache includes performance counters to track memory access patterns for hashmap structures with both DRAM and PMEM configurations.
+
+### Features
+
+- **Atomic counters** for thread-safe tracking of hashmap operations
+- **Read tracking**: `get`, `has`, `peek` operations (lookups)
+- **Write tracking**: `insert`, `remove` operations (insertions, deletions)
+- **Operation breakdown**: Separate counters for different operation types
+- **Feature-aware**: Automatically tracks the correct hashmap based on enabled features
+
+### Supported Configurations
+
+Performance counters are available for:
+- `hashbrown_dram`: hashbrown HashMap in DRAM
+- `global_hashtable_pmem`: hashbrown HashMap in PMEM
+- Future: `global_flatmap_dram`, `global_flatmap_pmem`
+
+### Usage
+
+```rust
+use paper_cache::{PaperCache, PaperPolicy};
+
+// Create a cache
+let cache = PaperCache::<u64, Box<[u8]>>::new(
+    10_000_000,
+    &[PaperPolicy::Lru],
+    PaperPolicy::Lru,
+)?;
+
+// Perform operations
+cache.set(1, b"value", None)?;
+cache.get(&1)?;
+cache.has(&1);
+cache.del(&1)?;
+
+// Print statistics
+paper_cache::perf_counters::print_perf_stats();
+
+// Or access programmatically
+if let Some(stats) = paper_cache::perf_counters::get_hashmap_stats() {
+    println!("Total accesses: {}", stats.total_accesses);
+    println!("Reads: {}", stats.reads);
+    println!("Writes: {}", stats.writes);
+}
+```
+
+### Running the Example
+
+```bash
+# With hashbrown in DRAM
+cargo run --example perf_counters_demo --no-default-features --features hashbrown_dram
+
+# With hashbrown in PMEM (requires nightly + PMEM hardware)
+cargo +nightly run --example perf_counters_demo --no-default-features --features global_hashtable_pmem
+```
+
+### Output Example
+
+```
+=== PaperCache Performance Statistics ===
+
+Global HashMap (hashbrown in DRAM):
+HashMap Performance Statistics:
+  Total Accesses: 185
+  Reads: 75 (40.5%)
+    - Lookups: 75
+    - Iterations: 0
+  Writes: 110 (59.5%)
+    - Insertions: 100
+    - Deletions: 10
+    - Clears: 0
+```
+
 ## Tiering Manager
 
 The tiering manager provides a two-tier caching architecture with **actual data copies**:
