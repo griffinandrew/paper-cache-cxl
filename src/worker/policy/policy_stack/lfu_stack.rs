@@ -5,7 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::collections::HashMap;
 use dlv_list::{VecList, Index};
 use kwik::collections::HashList;
 
@@ -17,10 +16,37 @@ use crate::{
 	worker::policy::policy_stack::PolicyStack,
 };
 
+// Import HashMap based on feature flag
+#[cfg(not(feature = "eviction_stack_pmem"))]
+use std::collections::HashMap;
+
+#[cfg(feature = "eviction_stack_pmem")]
+use hashbrown::HashMap;
+
+#[cfg(feature = "eviction_stack_pmem")]
+use crate::allocator::HybridObjects;
+
+#[cfg(not(feature = "eviction_stack_pmem"))]
 #[derive(Default)]
 pub struct LfuStack {
 	index_map: HashMap<HashedKey, Index<CountStack>, NoHasher>,
 	count_stacks: VecList<CountStack>,
+}
+
+#[cfg(feature = "eviction_stack_pmem")]
+pub struct LfuStack {
+	index_map: HashMap<HashedKey, Index<CountStack>, NoHasher, HybridObjects>,
+	count_stacks: VecList<CountStack>,
+}
+
+#[cfg(feature = "eviction_stack_pmem")]
+impl Default for LfuStack {
+	fn default() -> Self {
+		LfuStack {
+			index_map: HashMap::with_hasher_in(NoHasher::default(), HybridObjects),
+			count_stacks: VecList::new(),
+		}
+	}
 }
 
 struct CountStack {
