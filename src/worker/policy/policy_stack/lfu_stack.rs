@@ -28,6 +28,9 @@ use hashbrown::HashMap;
 #[cfg(feature = "eviction_stack_pmem")]
 use crate::allocator::HybridObjects;
 
+#[cfg(feature = "eviction_stack_pmem")]
+use super::pmem_collections::{PmemVecList, PmemHashList, PmemIndex};
+
 // DRAM-based LFU stack (default configuration)
 // Uses standard library HashMap which allocates from DRAM
 #[cfg(not(feature = "eviction_stack_pmem"))]
@@ -39,11 +42,13 @@ pub struct LfuStack {
 
 // PMEM-backed LFU stack (when eviction_stack_pmem feature is enabled)
 // Uses hashbrown::HashMap with HybridObjects allocator for index_map
-// VecList and HashList use the global HybridObjects allocator
+// Uses custom PmemVecList and PmemHashList that explicitly use HybridObjects allocator
+// This ensures PMEM allocation works correctly even when paper-cache is used as a library
+// and the consuming binary overrides the global allocator
 #[cfg(feature = "eviction_stack_pmem")]
 pub struct LfuStack {
-	index_map: HashMap<HashedKey, Index<CountStack>, NoHasher, HybridObjects>,
-	count_stacks: VecList<CountStack>,
+	index_map: HashMap<HashedKey, PmemIndex, NoHasher, HybridObjects>,
+	count_stacks: PmemVecList<CountStack>,
 }
 
 #[cfg(feature = "eviction_stack_pmem")]
@@ -51,14 +56,21 @@ impl Default for LfuStack {
 	fn default() -> Self {
 		LfuStack {
 			index_map: HashMap::with_hasher_in(NoHasher::default(), HybridObjects),
-			count_stacks: VecList::new(),
+			count_stacks: PmemVecList::new(),
 		}
 	}
 }
 
+#[cfg(not(feature = "eviction_stack_pmem"))]
 struct CountStack {
 	count: u32,
 	stack: HashList<HashedKey, NoHasher>,
+}
+
+#[cfg(feature = "eviction_stack_pmem")]
+struct CountStack {
+	count: u32,
+	stack: PmemHashList<HashedKey, NoHasher>,
 }
 
 impl PolicyStack for LfuStack {
@@ -162,11 +174,38 @@ impl PolicyStack for LfuStack {
 	}
 }
 
+#[cfg(not(feature = "eviction_stack_pmem"))]
 impl CountStack {
 	fn new(count: u32) -> Self {
 		CountStack {
 			count,
 			stack: HashList::with_hasher(NoHasher::default()),
+		}
+	}
+
+	fn is_empty(&self) -> bool {
+		self.stack.is_empty()
+	}
+
+	fn push(&mut self, key: HashedKey) {
+		self.stack.push_front(key);
+	}
+
+	fn pop(&mut self) -> HashedKey {
+		self.stack.pop_back().unwrap()
+	}
+
+	fn remove(&mut self, key: HashedKey) {
+		self.stack.remove(&key).unwrap();
+	}
+}
+
+#[cfg(feature = "eviction_stack_pmem")]
+impl CountStack {
+	fn new(count: u32) -> Self {
+		CountStack {
+			count,
+			stack: PmemHashList::with_hasher(NoHasher::default()),
 		}
 	}
 

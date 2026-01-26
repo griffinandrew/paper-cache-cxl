@@ -15,6 +15,9 @@ mod two_q_stack;
 mod arc_stack;
 mod s_three_fifo_stack;
 
+#[cfg(feature = "eviction_stack_pmem")]
+mod pmem_collections;
+
 use crate::{
 	CacheSize,
 	HashedKey,
