@@ -12,15 +12,25 @@ This branch will add the needed instrumentation to count how many memory accesse
 
 ## Performance Counters
 
-PaperCache includes performance counters to track memory access patterns for hashmap structures with both DRAM and PMEM configurations.
+PaperCache includes **two types** of performance counters to track memory access patterns for hashmap structures with both DRAM and PMEM configurations.
 
-### Features
+### 1. Software Performance Counters
 
+Track high-level hashmap operations:
 - **Atomic counters** for thread-safe tracking of hashmap operations
 - **Read tracking**: `get`, `has`, `peek` operations (lookups)
 - **Write tracking**: `insert`, `remove` operations (insertions, deletions)
 - **Operation breakdown**: Separate counters for different operation types
 - **Feature-aware**: Automatically tracks the correct hashmap based on enabled features
+
+### 2. Hardware Performance Counters (New!)
+
+Track actual CPU-level memory accesses using Linux `perf_event`:
+- **CPU cycles** and **instructions** executed per operation
+- **Cache references** and **cache misses** (L1, L2, L3)
+- **Cache miss rate** percentage
+- **IPC (Instructions Per Cycle)** metrics
+- **Per-operation statistics**: Average cycles, cache misses for GET/SET/DEL/HAS operations
 
 ### Supported Configurations
 
@@ -30,6 +40,8 @@ Performance counters are available for:
 - Future: `global_flatmap_dram`, `global_flatmap_pmem`
 
 ### Usage
+
+#### Software Counters
 
 ```rust
 use paper_cache::{PaperCache, PaperPolicy};
@@ -58,18 +70,51 @@ if let Some(stats) = paper_cache::perf_counters::get_hashmap_stats() {
 }
 ```
 
-### Running the Example
+#### Hardware Counters
+
+```rust
+use paper_cache::{PaperCache, PaperPolicy, measure_operation};
+
+let cache = PaperCache::<u64, Box<[u8]>>::new(10_000_000, &[PaperPolicy::Lru], PaperPolicy::Lru)?;
+
+// Measure a GET operation with hardware counters
+let (result, hw_measurement) = measure_operation(|| cache.get(&key));
+
+if let Some(measurement) = hw_measurement {
+    println!("Cycles: {}, Cache misses: {}", 
+             measurement.cycles, measurement.cache_misses);
+    println!("Cache miss rate: {:.2}%", measurement.cache_miss_rate());
+}
+
+// Print aggregated hardware statistics
+paper_cache::print_hw_perf_stats();
+```
+
+### Running the Examples
 
 ```bash
-# With hashbrown in DRAM
+# Software counters demo
 cargo run --example perf_counters_demo --no-default-features --features hashbrown_dram
 
+# Hardware counters demo (requires Linux perf_event access)
+cargo run --example hw_perf_demo --no-default-features --features hashbrown_dram
+
 # With hashbrown in PMEM (requires nightly + PMEM hardware)
-cargo +nightly run --example perf_counters_demo --no-default-features --features global_hashtable_pmem
+cargo +nightly run --example hw_perf_demo --no-default-features --features global_hashtable_pmem
+```
+
+**Note**: Hardware performance counters require Linux `perf_event` access. If running in a container or without sufficient permissions, you may need to:
+```bash
+# Allow non-root access to performance counters
+sudo sysctl kernel.perf_event_paranoid=-1
+
+# Or run with sudo
+sudo cargo run --example hw_perf_demo --no-default-features --features hashbrown_dram
 ```
 
 ### Output Example
 
+#### Software Counters
 ```
 === PaperCache Performance Statistics ===
 
@@ -83,6 +128,30 @@ HashMap Performance Statistics:
     - Insertions: 100
     - Deletions: 10
     - Clears: 0
+```
+
+#### Hardware Counters
+```
+=== Hardware Performance Counter Statistics ===
+
+Global HashMap (hashbrown in DRAM):
+Hardware Performance Statistics (HashMap):
+  Total Operations: 185
+  Total Cycles: 45230
+  Total Cache References: 1850
+  Total Cache Misses: 185 (10.00% miss rate)
+
+GET Operations (75 calls):
+    Avg Cycles: 230
+    Avg Instructions: 450 (IPC: 1.96)
+    Avg Cache References: 25
+    Avg Cache Misses: 2 (8.00% miss rate)
+
+SET Operations (100 calls):
+    Avg Cycles: 250
+    Avg Instructions: 480 (IPC: 1.92)
+    Avg Cache References: 28
+    Avg Cache Misses: 3 (10.71% miss rate)
 ```
 
 ## Tiering Manager

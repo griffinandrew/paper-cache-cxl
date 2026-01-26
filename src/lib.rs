@@ -55,6 +55,7 @@ mod object;
 mod policy;
 mod status;
 pub mod perf_counters;
+pub mod hw_perf_counters;
 
 #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 pub mod tiering;
@@ -126,6 +127,7 @@ pub use crate::{
 	error::CacheError,
 	policy::PaperPolicy,
 	perf_counters::{HashMapStats, get_global_counters, get_hashmap_stats},
+	hw_perf_counters::{get_hw_counters, get_hw_hashmap_stats, print_hw_perf_stats, measure_operation, HwHashMapStats, HwPerfMeasurement},
 };
 
 #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
