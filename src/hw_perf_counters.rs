@@ -380,6 +380,7 @@ impl std::fmt::Display for HwHashMapStats {
             writeln!(f, "DEL Operations ({} calls):", self.del.count)?;
             writeln!(f, "    Avg Cycles: {}", self.del.avg_cycles)?;
             writeln!(f, "    Avg Instructions: {} (IPC: {:.2})", self.del.avg_instructions, self.del.avg_ipc())?;
+            writeln!(f, "    Avg Cache References: {}", self.del.avg_cache_refs)?;
             writeln!(f, "    Avg Cache Misses: {} ({:.2}% miss rate)", 
                      self.del.avg_cache_misses, self.del.cache_miss_rate())?;
             writeln!(f)?;
@@ -389,6 +390,7 @@ impl std::fmt::Display for HwHashMapStats {
             writeln!(f, "HAS Operations ({} calls):", self.has.count)?;
             writeln!(f, "    Avg Cycles: {}", self.has.avg_cycles)?;
             writeln!(f, "    Avg Instructions: {} (IPC: {:.2})", self.has.avg_instructions, self.has.avg_ipc())?;
+            writeln!(f, "    Avg Cache References: {}", self.has.avg_cache_refs)?;
             writeln!(f, "    Avg Cache Misses: {} ({:.2}% miss rate)", 
                      self.has.avg_cache_misses, self.has.cache_miss_rate())?;
         }
