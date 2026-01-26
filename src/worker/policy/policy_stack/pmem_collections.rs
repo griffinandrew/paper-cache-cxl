@@ -1,3 +1,5 @@
+/* 
+
 /*
  * Copyright (c) Kia Shakiba
  *
@@ -252,4 +254,196 @@ where
         
         Some(value.clone())
     }
+
+
+    */
+
+
+use hashbrown::HashMap;
+use std::hash::{Hash, BuildHasher};
+use crate::allocator::HybridObjects;
+
+/// A hash-based doubly-linked list implementation using PMEM allocator
+pub struct PmemHashList<T, S> {
+    // Map from value to its node ID
+    value_to_id: HashMap<T, usize, S, HybridObjects>,
+    // Map from node ID to the actual node
+    nodes: HashMap<usize, ListNode<T>, S, HybridObjects>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    next_id: usize,
 }
+
+struct ListNode<T> {
+    value: T,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+impl<T, S> PmemHashList<T, S>
+where
+    T: Hash + Eq + Clone,
+    S: BuildHasher + Clone,
+{
+    pub fn with_hasher(hasher: S) -> Self {
+        PmemHashList {
+            value_to_id: HashMap::with_hasher_in(hasher.clone(), HybridObjects),
+            nodes: HashMap::with_hasher_in(hasher, HybridObjects),
+            head: None,
+            tail: None,
+            next_id: 0,
+        }
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+    
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+    
+    pub fn contains(&self, value: &T) -> bool {
+        self.value_to_id.contains_key(value)
+    }
+    
+    pub fn push_front(&mut self, value: T) {
+        // Remove if already exists
+        if self.value_to_id.contains_key(&value) {
+            self.remove(&value);
+        }
+        
+        let id = self.next_id;
+        self.next_id += 1;
+        
+        let node = ListNode {
+            value: value.clone(),
+            prev: None,
+            next: self.head,
+        };
+        
+        // Update old head's prev pointer
+        if let Some(old_head_id) = self.head {
+            if let Some(old_head_node) = self.nodes.get_mut(&old_head_id) {
+                old_head_node.prev = Some(id);
+            }
+        }
+        
+        self.head = Some(id);
+        
+        if self.tail.is_none() {
+            self.tail = Some(id);
+        }
+        
+        self.value_to_id.insert(value, id);
+        self.nodes.insert(id, node);
+    }
+    
+    pub fn pop_back(&mut self) -> Option<T> {
+        let tail_id = self.tail?;
+        let node = self.nodes.remove(&tail_id)?;
+        self.value_to_id.remove(&node.value);
+        
+        // Update tail
+        self.tail = node.prev;
+        
+        // Update new tail's next pointer
+        if let Some(new_tail_id) = self.tail {
+            if let Some(new_tail_node) = self.nodes.get_mut(&new_tail_id) {
+                new_tail_node.next = None;
+            }
+        } else {
+            // List is now empty
+            self.head = None;
+        }
+        
+        Some(node.value)
+    }
+    
+    pub fn remove(&mut self, value: &T) -> Option<T> {
+        let id = self.value_to_id.remove(value)?;
+        let node = self.nodes.remove(&id)?;
+        
+        // Update prev node's next pointer
+        if let Some(prev_id) = node.prev {
+            if let Some(prev_node) = self.nodes.get_mut(&prev_id) {
+                prev_node.next = node.next;
+            }
+        } else {
+            self.head = node.next;
+        }
+        
+        // Update next node's prev pointer
+        if let Some(next_id) = node.next {
+            if let Some(next_node) = self.nodes.get_mut(&next_id) {
+                next_node.prev = node.prev;
+            }
+        } else {
+            self.tail = node.prev;
+        }
+        
+        Some(node.value)
+    }
+    
+    pub fn move_front(&mut self, value: &T) {
+        // Used by LRU - moves existing element to front
+        if let Some(&id) = self.value_to_id.get(value) {
+            // Only need to move if not already at head
+            if self.head != Some(id) {
+                // ⚠️ BUG FIX: Store prev/next BEFORE mutable borrows
+                let (prev, next) = {
+                    let node = self.nodes.get(&id).unwrap();
+                    (node.prev, node.next)
+                };
+                
+                // Update surrounding nodes
+                if let Some(prev_id) = prev {
+                    if let Some(prev_node) = self.nodes.get_mut(&prev_id) {
+                        prev_node.next = next;
+                    }
+                }
+                
+                if let Some(next_id) = next {
+                    if let Some(next_node) = self.nodes.get_mut(&next_id) {
+                        next_node.prev = prev;
+                    }
+                } else {
+                    self.tail = prev;
+                }
+                
+                // Move to front
+                if let Some(node) = self.nodes.get_mut(&id) {
+                    node.prev = None;
+                    node.next = self.head;
+                }
+                
+                if let Some(old_head_id) = self.head {
+                    if let Some(old_head_node) = self.nodes.get_mut(&old_head_id) {
+                        old_head_node.prev = Some(id);
+                    }
+                }
+                
+                self.head = Some(id);
+            }
+        }
+    }
+    
+    pub fn clear(&mut self) {
+        self.value_to_id.clear();
+        self.nodes.clear();
+        self.head = None;
+        self.tail = None;
+    }
+}
+
+impl<T, S> Default for PmemHashList<T, S>
+where
+    T: Hash + Eq + Clone,
+    S: BuildHasher + Clone + Default,
+{
+    fn default() -> Self {
+        Self::with_hasher(S::default())
+    }
+}
+
+
