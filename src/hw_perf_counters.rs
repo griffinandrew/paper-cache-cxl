@@ -421,82 +421,29 @@ impl PerfCounterGroup {
             }};
         }
         
-        // Core CPU metrics (most likely to be available)
+        // ========================================================================
+        // ESSENTIAL 8 COUNTERS FOR MEMORY PERFORMANCE ANALYSIS
+        // ========================================================================
+        // Hardware typically supports only ~8 simultaneous counters without
+        // multiplexing. These 8 counters provide the most critical insights
+        // for understanding hashtable memory access patterns:
+        //
+        // 1-2: CPU execution metrics (cycles, instructions) -> IPC
+        // 3-4: Generic cache activity (references, misses) -> overall cache behavior
+        // 5-6: LLC performance (loads, load misses) -> main memory pressure
+        // 7:   L1 D-cache misses -> L1 cache efficiency
+        // 8:   Data TLB misses -> page table overhead
+        // ========================================================================
+        
+        // Core CPU metrics - Essential for IPC and baseline timing
         let cycles = try_counter!(&mut group, Hardware::CPU_CYCLES, "CPU_CYCLES");
         let instructions = try_counter!(&mut group, Hardware::INSTRUCTIONS, "INSTRUCTIONS");
-        let ref_cycles = try_counter!(&mut group, Hardware::REF_CPU_CYCLES, "REF_CPU_CYCLES");
         
-        // Generic cache metrics
+        // Generic cache metrics - Overall cache behavior
         let cache_refs = try_counter!(&mut group, Hardware::CACHE_REFERENCES, "CACHE_REFERENCES");
         let cache_miss = try_counter!(&mut group, Hardware::CACHE_MISSES, "CACHE_MISSES");
         
-        // Branch prediction
-        let branch_instructions = try_counter!(&mut group, Hardware::BRANCH_INSTRUCTIONS, "BRANCH_INSTRUCTIONS");
-        let branch_misses = try_counter!(&mut group, Hardware::BRANCH_MISSES, "BRANCH_MISSES");
-        
-        // Pipeline stalls
-        let stalled_frontend = try_counter!(&mut group, Hardware::STALLED_CYCLES_FRONTEND, "STALLED_CYCLES_FRONTEND");
-        let stalled_backend = try_counter!(&mut group, Hardware::STALLED_CYCLES_BACKEND, "STALLED_CYCLES_BACKEND");
-        
-        // L1 D-cache
-        let l1_dcache_loads = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::L1D,
-                operation: CacheOp::READ,
-                result: CacheResult::ACCESS,
-            },
-            "L1_DCACHE_LOADS"
-        );
-        let l1_dcache_load_misses = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::L1D,
-                operation: CacheOp::READ,
-                result: CacheResult::MISS,
-            },
-            "L1_DCACHE_LOAD_MISSES"
-        );
-        let l1_dcache_stores = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::L1D,
-                operation: CacheOp::WRITE,
-                result: CacheResult::ACCESS,
-            },
-            "L1_DCACHE_STORES"
-        );
-        let l1_dcache_store_misses = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::L1D,
-                operation: CacheOp::WRITE,
-                result: CacheResult::MISS,
-            },
-            "L1_DCACHE_STORE_MISSES"
-        );
-        
-        // L1 I-cache
-        let l1_icache_loads = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::L1I,
-                operation: CacheOp::READ,
-                result: CacheResult::ACCESS,
-            },
-            "L1_ICACHE_LOADS"
-        );
-        let l1_icache_load_misses = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::L1I,
-                operation: CacheOp::READ,
-                result: CacheResult::MISS,
-            },
-            "L1_ICACHE_LOAD_MISSES"
-        );
-        
-        // LLC (Last-Level Cache)
+        // LLC (Last-Level Cache) - Critical for memory performance
         let llc_loads = try_counter!(
             &mut group,
             Cache {
@@ -515,35 +462,19 @@ impl PerfCounterGroup {
             },
             "LLC_LOAD_MISSES"
         );
-        let llc_stores = try_counter!(
+        
+        // L1 D-cache load misses - High-frequency memory events
+        let l1_dcache_load_misses = try_counter!(
             &mut group,
             Cache {
-                which: WhichCache::LL,
-                operation: CacheOp::WRITE,
-                result: CacheResult::ACCESS,
-            },
-            "LLC_STORES"
-        );
-        let llc_store_misses = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::LL,
-                operation: CacheOp::WRITE,
+                which: WhichCache::L1D,
+                operation: CacheOp::READ,
                 result: CacheResult::MISS,
             },
-            "LLC_STORE_MISSES"
+            "L1_DCACHE_LOAD_MISSES"
         );
         
-        // dTLB
-        let dtlb_loads = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::DTLB,
-                operation: CacheOp::READ,
-                result: CacheResult::ACCESS,
-            },
-            "DTLB_LOADS"
-        );
+        // Data TLB load misses - Page table overhead
         let dtlb_load_misses = try_counter!(
             &mut group,
             Cache {
@@ -553,171 +484,131 @@ impl PerfCounterGroup {
             },
             "DTLB_LOAD_MISSES"
         );
-        let dtlb_stores = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::DTLB,
-                operation: CacheOp::WRITE,
-                result: CacheResult::ACCESS,
-            },
-            "DTLB_STORES"
-        );
-        let dtlb_store_misses = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::DTLB,
-                operation: CacheOp::WRITE,
-                result: CacheResult::MISS,
-            },
-            "DTLB_STORE_MISSES"
-        );
         
-        // iTLB
-        let itlb_loads = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::ITLB,
-                operation: CacheOp::READ,
-                result: CacheResult::ACCESS,
-            },
-            "ITLB_LOADS"
-        );
-        let itlb_load_misses = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::ITLB,
-                operation: CacheOp::READ,
-                result: CacheResult::MISS,
-            },
-            "ITLB_LOAD_MISSES"
-        );
+        // ========================================================================
+        // DISABLED COUNTERS (to avoid exceeding hardware limits)
+        // ========================================================================
+        // The following counters are not created to keep the total at 8.
+        // They can be re-enabled if needed, but will cause counter multiplexing.
+        // ========================================================================
         
-        // Software events
-        let page_faults = try_counter!(&mut group, Software::PAGE_FAULTS, "PAGE_FAULTS");
-        let page_faults_min = try_counter!(&mut group, Software::PAGE_FAULTS_MIN, "PAGE_FAULTS_MIN");
-        let page_faults_maj = try_counter!(&mut group, Software::PAGE_FAULTS_MAJ, "PAGE_FAULTS_MAJ");
-        let context_switches = try_counter!(&mut group, Software::CONTEXT_SWITCHES, "CONTEXT_SWITCHES");
-        let cpu_migrations = try_counter!(&mut group, Software::CPU_MIGRATIONS, "CPU_MIGRATIONS");
+        // Disabled: REF_CPU_CYCLES - less critical than regular cycles
+        let ref_cycles = None;
+        
+        // Disabled: Branch prediction - not critical for memory analysis
+        let branch_instructions = None;
+        let branch_misses = None;
+        
+        // Disabled: Pipeline stalls - not supported on all platforms
+        let stalled_frontend = None;
+        let stalled_backend = None;
+        
+        // Disabled: L1 D-cache loads/stores/store_misses - keeping only load misses
+        let l1_dcache_loads = None;
+        let l1_dcache_stores = None;
+        let l1_dcache_store_misses = None;
+        
+        // Disabled: L1 I-cache - instruction cache less relevant for data structures
+        let l1_icache_loads = None;
+        let l1_icache_load_misses = None;
+        
+        // Disabled: LLC stores/store_misses - keeping only load metrics
+        let llc_stores = None;
+        let llc_store_misses = None;
+        
+        // Disabled: dTLB loads/stores/store_misses - keeping only load misses
+        let dtlb_loads = None;
+        let dtlb_stores = None;
+        let dtlb_store_misses = None;
+        
+        // Disabled: iTLB - instruction TLB less relevant for data structures
+        let itlb_loads = None;
+        let itlb_load_misses = None;
+        
+        // Disabled: Software events - not hardware counters, less critical
+        let page_faults = None;
+        let page_faults_min = None;
+        let page_faults_maj = None;
+        let context_switches = None;
+        let cpu_migrations = None;
         
         // Debug: Report which counters were successfully created (only if debug enabled)
         if debug_enabled {
             let mut counters_created = 0;
-            let mut counters_failed = 0;
+            let mut counters_disabled = 0;
             
-            eprintln!("[DEBUG] Performance counter creation summary:");
+            eprintln!("[DEBUG] Performance counter creation summary (limited to 8 essential counters):");
+            eprintln!("[DEBUG] ");
+            eprintln!("[DEBUG] === ESSENTIAL COUNTERS (attempting to create) ===");
             
             // Core CPU metrics
             if cycles.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CPU_CYCLES"); } 
-            else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CPU_CYCLES"); }
+            else { eprintln!("[DEBUG]   ✗ CPU_CYCLES (failed to create)"); }
         
-        if instructions.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ INSTRUCTIONS"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ INSTRUCTIONS"); }
+            if instructions.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ INSTRUCTIONS"); }
+            else { eprintln!("[DEBUG]   ✗ INSTRUCTIONS (failed to create)"); }
         
-        if ref_cycles.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ REF_CPU_CYCLES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ REF_CPU_CYCLES"); }
+            // Cache metrics
+            if cache_refs.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CACHE_REFERENCES"); }
+            else { eprintln!("[DEBUG]   ✗ CACHE_REFERENCES (failed to create)"); }
         
-        // Cache metrics
-        if cache_refs.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CACHE_REFERENCES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CACHE_REFERENCES"); }
+            if cache_miss.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CACHE_MISSES"); }
+            else { eprintln!("[DEBUG]   ✗ CACHE_MISSES (failed to create)"); }
         
-        if cache_miss.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CACHE_MISSES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CACHE_MISSES"); }
+            // LLC
+            if llc_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_LOADS"); }
+            else { eprintln!("[DEBUG]   ✗ LLC_LOADS (failed to create)"); }
         
-        // Branch prediction
-        if branch_instructions.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ BRANCH_INSTRUCTIONS"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ BRANCH_INSTRUCTIONS"); }
+            if llc_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_LOAD_MISSES"); }
+            else { eprintln!("[DEBUG]   ✗ LLC_LOAD_MISSES (failed to create)"); }
         
-        if branch_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ BRANCH_MISSES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ BRANCH_MISSES"); }
+            // L1 D-cache load misses
+            if l1_dcache_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_DCACHE_LOAD_MISSES"); }
+            else { eprintln!("[DEBUG]   ✗ L1_DCACHE_LOAD_MISSES (failed to create)"); }
         
-        // Pipeline stalls
-        if stalled_frontend.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ STALLED_CYCLES_FRONTEND"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ STALLED_CYCLES_FRONTEND"); }
-        
-        if stalled_backend.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ STALLED_CYCLES_BACKEND"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ STALLED_CYCLES_BACKEND"); }
-        
-        // L1 D-cache
-        if l1_dcache_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_DCACHE_LOADS"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ L1_DCACHE_LOADS"); }
-        
-        if l1_dcache_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_DCACHE_LOAD_MISSES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ L1_DCACHE_LOAD_MISSES"); }
-        
-        if l1_dcache_stores.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_DCACHE_STORES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ L1_DCACHE_STORES"); }
-        
-        if l1_dcache_store_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_DCACHE_STORE_MISSES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ L1_DCACHE_STORE_MISSES"); }
-        
-        // L1 I-cache
-        if l1_icache_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_ICACHE_LOADS"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ L1_ICACHE_LOADS"); }
-        
-        if l1_icache_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_ICACHE_LOAD_MISSES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ L1_ICACHE_LOAD_MISSES"); }
-        
-        // LLC
-        if llc_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_LOADS"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ LLC_LOADS"); }
-        
-        if llc_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_LOAD_MISSES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ LLC_LOAD_MISSES"); }
-        
-        if llc_stores.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_STORES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ LLC_STORES"); }
-        
-        if llc_store_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_STORE_MISSES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ LLC_STORE_MISSES"); }
-        
-        // dTLB
-        if dtlb_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_LOADS"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ DTLB_LOADS"); }
-        
-        if dtlb_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_LOAD_MISSES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ DTLB_LOAD_MISSES"); }
-        
-        if dtlb_stores.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_STORES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ DTLB_STORES"); }
-        
-        if dtlb_store_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_STORE_MISSES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ DTLB_STORE_MISSES"); }
-        
-        // iTLB
-        if itlb_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ ITLB_LOADS"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ ITLB_LOADS"); }
-        
-        if itlb_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ ITLB_LOAD_MISSES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ ITLB_LOAD_MISSES"); }
-        
-        // Software events
-        if page_faults.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ PAGE_FAULTS"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ PAGE_FAULTS"); }
-        
-        if page_faults_min.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ PAGE_FAULTS_MIN"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ PAGE_FAULTS_MIN"); }
-        
-        if page_faults_maj.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ PAGE_FAULTS_MAJ"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ PAGE_FAULTS_MAJ"); }
-        
-        if context_switches.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CONTEXT_SWITCHES"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CONTEXT_SWITCHES"); }
-        
-        if cpu_migrations.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CPU_MIGRATIONS"); }
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CPU_MIGRATIONS"); }
-        
-        eprintln!("[DEBUG] Counter creation complete: {} succeeded, {} failed", counters_created, counters_failed);
-        
-        // Provide helpful context based on what succeeded/failed
-        if counters_created == 0 {
-            eprintln!("[DEBUG] WARNING: No performance counters available!");
-            eprintln!("[DEBUG] This system does not support hardware performance monitoring.");
-        } else if cycles.is_none() && instructions.is_none() {
-            eprintln!("[DEBUG] NOTE: Hardware CPU counters (cycles, instructions) are not available.");
-            eprintln!("[DEBUG] This is common in virtualized environments (VMs, containers).");
-            eprintln!("[DEBUG] Only software counters (page faults, context switches) will be tracked.");
-            eprintln!("[DEBUG] For full hardware monitoring, run on bare metal with proper permissions.");
-        }
+            // dTLB load misses
+            if dtlb_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_LOAD_MISSES"); }
+            else { eprintln!("[DEBUG]   ✗ DTLB_LOAD_MISSES (failed to create)"); }
+            
+            // Count disabled counters
+            if ref_cycles.is_none() { counters_disabled += 1; }
+            if branch_instructions.is_none() { counters_disabled += 1; }
+            if branch_misses.is_none() { counters_disabled += 1; }
+            if stalled_frontend.is_none() { counters_disabled += 1; }
+            if stalled_backend.is_none() { counters_disabled += 1; }
+            if l1_dcache_loads.is_none() { counters_disabled += 1; }
+            if l1_dcache_stores.is_none() { counters_disabled += 1; }
+            if l1_dcache_store_misses.is_none() { counters_disabled += 1; }
+            if l1_icache_loads.is_none() { counters_disabled += 1; }
+            if l1_icache_load_misses.is_none() { counters_disabled += 1; }
+            if llc_stores.is_none() { counters_disabled += 1; }
+            if llc_store_misses.is_none() { counters_disabled += 1; }
+            if dtlb_loads.is_none() { counters_disabled += 1; }
+            if dtlb_stores.is_none() { counters_disabled += 1; }
+            if dtlb_store_misses.is_none() { counters_disabled += 1; }
+            if itlb_loads.is_none() { counters_disabled += 1; }
+            if itlb_load_misses.is_none() { counters_disabled += 1; }
+            if page_faults.is_none() { counters_disabled += 1; }
+            if page_faults_min.is_none() { counters_disabled += 1; }
+            if page_faults_maj.is_none() { counters_disabled += 1; }
+            if context_switches.is_none() { counters_disabled += 1; }
+            if cpu_migrations.is_none() { counters_disabled += 1; }
+            
+            eprintln!("[DEBUG] ");
+            eprintln!("[DEBUG] Counter creation complete: {} enabled, {} disabled (to avoid multiplexing)", counters_created, counters_disabled);
+            eprintln!("[DEBUG] Note: {} counters are intentionally disabled to stay within hardware limits (~8 counters)", counters_disabled);
+            
+            // Provide helpful context based on what succeeded/failed
+            if counters_created == 0 {
+                eprintln!("[DEBUG] WARNING: No performance counters available!");
+                eprintln!("[DEBUG] This system does not support hardware performance monitoring.");
+            } else if cycles.is_none() && instructions.is_none() {
+                eprintln!("[DEBUG] NOTE: Hardware CPU counters (cycles, instructions) are not available.");
+                eprintln!("[DEBUG] This is common in virtualized environments (VMs, containers).");
+                eprintln!("[DEBUG] For full hardware monitoring, run on bare metal with proper permissions.");
+            } else if counters_created < 8 {
+                eprintln!("[DEBUG] NOTE: Only {}/8 essential counters available on this platform.", counters_created);
+            }
         } // End of debug_enabled block
         
         Ok(PerfCounterGroup {
