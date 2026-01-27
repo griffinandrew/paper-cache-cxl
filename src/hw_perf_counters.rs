@@ -237,7 +237,8 @@ impl HwPerfMeasurement {
         }
     }
 
-    /// Total memory accesses (loads + stores across all levels)
+    /// Total L1 D-cache memory accesses (loads + stores)
+    /// Note: This represents L1 cache accesses, not total memory accesses to DRAM
     pub fn total_mem_accesses(&self) -> u64 {
         self.l1_dcache_loads + self.l1_dcache_stores
     }
@@ -957,10 +958,13 @@ pub struct AggregatedMeasurement {
 }
 
 impl AggregatedMeasurement {
+    /// Total L1 D-cache accesses (loads + stores)
+    /// Note: This represents L1 cache accesses, not total memory accesses to DRAM
     pub fn total_mem_accesses(&self) -> u64 {
         self.total_l1_dcache_loads + self.total_l1_dcache_stores
     }
 
+    /// Average L1 D-cache accesses per operation
     pub fn avg_mem_accesses(&self) -> u64 {
         self.avg_l1_dcache_loads + self.avg_l1_dcache_stores
     }
@@ -1340,12 +1344,16 @@ where
             return (operation(), None);
         }
         
-        // Reset and start counting
+        // Reset counters
         let _ = counter.reset();
-        let start_time = Instant::now();
+        
+        // Start counting - if this fails, run operation without measurement
         if counter.start().is_err() {
             return (operation(), None);
         }
+        
+        // Capture start time right before operation
+        let start_time = Instant::now();
         
         // Run the operation
         let result = operation();
