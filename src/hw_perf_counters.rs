@@ -374,7 +374,16 @@ impl PerfCounterGroup {
     }
 
     fn try_create_counters() -> io::Result<PerfCounterGroup> {
-        let mut group = Group::new()?;
+        // Try to create the group, but if it fails, return an empty counter group
+        // This allows graceful degradation when group creation is not permitted
+        let mut group = match Group::new() {
+            Ok(g) => g,
+            Err(_) => {
+                // If we can't create a group (e.g., insufficient permissions),
+                // return an empty counter group rather than failing completely
+                return Ok(Self::empty());
+            }
+        };
         
         // Helper macro to create counter, returning None if it fails
         macro_rules! try_counter {
@@ -1501,5 +1510,27 @@ mod tests {
 
         assert_eq!(result, 499500);
         // measurement may be None if perf counters not available
+    }
+
+    #[test]
+    fn test_perf_counter_group_resilience() {
+        // This test verifies that PerfCounterGroup::new() succeeds even if
+        // Group::new() fails or some individual counters fail to create.
+        // The group should be created with whatever counters are available.
+        
+        let mut counter_group = PerfCounterGroup::new();
+        
+        // The counter group should always be created (never panics)
+        // It should have is_available() return true if the group was created,
+        // or false if group creation failed (e.g., insufficient permissions)
+        
+        // We just verify that it doesn't panic and has a valid state
+        let available = counter_group.is_available();
+        
+        // If available, we should be able to start/stop without errors
+        if available {
+            // Group exists, so start() should succeed
+            assert!(counter_group.start().is_ok());
+        }
     }
 }
