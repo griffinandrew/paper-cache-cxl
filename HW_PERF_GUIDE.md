@@ -146,6 +146,72 @@ cat /proc/sys/kernel/perf_event_paranoid
 ✅ **Native Linux** (with permissions)
 ✅ **Some VMs** (with PMU virtualization enabled)
 
+## Debugging Counter Issues
+
+If performance counters are returning all zeros or `None`, use the debug mode to diagnose the issue:
+
+### Debug Mode
+
+Set the `PAPER_CACHE_DEBUG_PERF` environment variable to enable debug output:
+
+#### Basic Debug Info
+```bash
+PAPER_CACHE_DEBUG_PERF=1 cargo run --example hw_perf_demo --features hw_perf_counters
+```
+
+Output shows:
+```
+[DEBUG] Successfully created performance counter group
+[DEBUG] Performance counter creation summary:
+[DEBUG]   ✗ CPU_CYCLES
+[DEBUG]   ✗ INSTRUCTIONS
+[DEBUG]   ✓ PAGE_FAULTS
+[DEBUG]   ✓ CONTEXT_SWITCHES
+[DEBUG] Counter creation complete: 5 succeeded, 25 failed
+[DEBUG] NOTE: Hardware CPU counters (cycles, instructions) are not available.
+[DEBUG] This is common in virtualized environments (VMs, containers).
+```
+
+#### Verbose Debug Info (Detailed Errors)
+```bash
+PAPER_CACHE_DEBUG_PERF=verbose cargo run --example hw_perf_demo --features hw_perf_counters
+```
+
+Output shows detailed error for each counter:
+```
+[DEBUG] Successfully created performance counter group
+[DEBUG]   Counter CPU_CYCLES failed: No such file or directory (os error 2)
+[DEBUG]   Counter INSTRUCTIONS failed: No such file or directory (os error 2)
+[DEBUG]   Counter CACHE_REFERENCES failed: No such file or directory (os error 2)
+... (detailed errors for all 29 counters)
+```
+
+### Common Error Messages
+
+#### "Permission denied (os error 13)"
+**Cause**: Insufficient permissions to access perf_event subsystem.  
+**Solution**: 
+- Run with `sudo sysctl kernel.perf_event_paranoid=-1`
+- Or run your program with `sudo`
+- Or add CAP_PERFMON capability
+
+#### "No such file or directory (os error 2)"
+**Cause**: Hardware performance counters not available (common in VMs/containers).  
+**Solution**:
+- Run on bare metal hardware for full counter support
+- Or accept limited software counters only (page faults, context switches)
+- Some VMs support PMU passthrough - check hypervisor settings
+
+#### "Failed to create performance counter group"
+**Cause**: The perf_event subsystem couldn't create a group.  
+**Solution**: Check if you're in a restricted environment (container, VM) and verify perf_event_paranoid settings.
+
+### Debug Output Control
+
+- **No env var**: Clean output, no debug messages (production mode)
+- **PAPER_CACHE_DEBUG_PERF=1**: Summary of counter availability
+- **PAPER_CACHE_DEBUG_PERF=verbose**: Detailed per-counter failure reasons
+
 ## Usage
 
 ### Basic Usage
