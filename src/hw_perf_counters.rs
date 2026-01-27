@@ -377,10 +377,18 @@ impl PerfCounterGroup {
         // Try to create the group, but if it fails, return an empty counter group
         // This allows graceful degradation when group creation is not permitted
         let mut group = match Group::new() {
-            Ok(g) => g,
-            Err(_) => {
+            Ok(g) => {
+                eprintln!("[DEBUG] Successfully created performance counter group");
+                g
+            },
+            Err(e) => {
                 // If we can't create a group (e.g., insufficient permissions),
                 // return an empty counter group rather than failing completely
+                eprintln!("[DEBUG] Failed to create performance counter group: {}", e);
+                eprintln!("[DEBUG] Possible reasons:");
+                eprintln!("[DEBUG]   - Insufficient permissions (try: sudo sysctl kernel.perf_event_paranoid=-1)");
+                eprintln!("[DEBUG]   - Running in a container or VM without perf access");
+                eprintln!("[DEBUG]   - Hardware doesn't support performance counters");
                 return Ok(Self::empty());
             }
         };
@@ -557,6 +565,114 @@ impl PerfCounterGroup {
         let page_faults_maj = try_counter!(&mut group, Software::PAGE_FAULTS_MAJ);
         let context_switches = try_counter!(&mut group, Software::CONTEXT_SWITCHES);
         let cpu_migrations = try_counter!(&mut group, Software::CPU_MIGRATIONS);
+        
+        // Debug: Report which counters were successfully created
+        let mut counters_created = 0;
+        let mut counters_failed = 0;
+        
+        eprintln!("[DEBUG] Performance counter creation summary:");
+        
+        // Core CPU metrics
+        if cycles.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CPU_CYCLES"); } 
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CPU_CYCLES"); }
+        
+        if instructions.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ INSTRUCTIONS"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ INSTRUCTIONS"); }
+        
+        if ref_cycles.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ REF_CPU_CYCLES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ REF_CPU_CYCLES"); }
+        
+        // Cache metrics
+        if cache_refs.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CACHE_REFERENCES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CACHE_REFERENCES"); }
+        
+        if cache_miss.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CACHE_MISSES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CACHE_MISSES"); }
+        
+        // Branch prediction
+        if branch_instructions.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ BRANCH_INSTRUCTIONS"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ BRANCH_INSTRUCTIONS"); }
+        
+        if branch_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ BRANCH_MISSES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ BRANCH_MISSES"); }
+        
+        // Pipeline stalls
+        if stalled_frontend.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ STALLED_CYCLES_FRONTEND"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ STALLED_CYCLES_FRONTEND"); }
+        
+        if stalled_backend.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ STALLED_CYCLES_BACKEND"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ STALLED_CYCLES_BACKEND"); }
+        
+        // L1 D-cache
+        if l1_dcache_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_DCACHE_LOADS"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ L1_DCACHE_LOADS"); }
+        
+        if l1_dcache_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_DCACHE_LOAD_MISSES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ L1_DCACHE_LOAD_MISSES"); }
+        
+        if l1_dcache_stores.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_DCACHE_STORES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ L1_DCACHE_STORES"); }
+        
+        if l1_dcache_store_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_DCACHE_STORE_MISSES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ L1_DCACHE_STORE_MISSES"); }
+        
+        // L1 I-cache
+        if l1_icache_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_ICACHE_LOADS"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ L1_ICACHE_LOADS"); }
+        
+        if l1_icache_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_ICACHE_LOAD_MISSES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ L1_ICACHE_LOAD_MISSES"); }
+        
+        // LLC
+        if llc_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_LOADS"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ LLC_LOADS"); }
+        
+        if llc_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_LOAD_MISSES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ LLC_LOAD_MISSES"); }
+        
+        if llc_stores.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_STORES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ LLC_STORES"); }
+        
+        if llc_store_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_STORE_MISSES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ LLC_STORE_MISSES"); }
+        
+        // dTLB
+        if dtlb_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_LOADS"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ DTLB_LOADS"); }
+        
+        if dtlb_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_LOAD_MISSES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ DTLB_LOAD_MISSES"); }
+        
+        if dtlb_stores.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_STORES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ DTLB_STORES"); }
+        
+        if dtlb_store_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_STORE_MISSES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ DTLB_STORE_MISSES"); }
+        
+        // iTLB
+        if itlb_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ ITLB_LOADS"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ ITLB_LOADS"); }
+        
+        if itlb_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ ITLB_LOAD_MISSES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ ITLB_LOAD_MISSES"); }
+        
+        // Software events
+        if page_faults.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ PAGE_FAULTS"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ PAGE_FAULTS"); }
+        
+        if page_faults_min.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ PAGE_FAULTS_MIN"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ PAGE_FAULTS_MIN"); }
+        
+        if page_faults_maj.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ PAGE_FAULTS_MAJ"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ PAGE_FAULTS_MAJ"); }
+        
+        if context_switches.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CONTEXT_SWITCHES"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CONTEXT_SWITCHES"); }
+        
+        if cpu_migrations.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CPU_MIGRATIONS"); }
+        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CPU_MIGRATIONS"); }
+        
+        eprintln!("[DEBUG] Counter creation complete: {} succeeded, {} failed", counters_created, counters_failed);
         
         Ok(PerfCounterGroup {
             group: Some(group),
@@ -1337,6 +1453,7 @@ use std::cell::RefCell;
 
 thread_local! {
     static PERF_COUNTER: RefCell<PerfCounterGroup> = RefCell::new(PerfCounterGroup::new());
+    static DEBUG_LOGGED: RefCell<bool> = RefCell::new(false);
 }
 
 /// Measure a hashmap operation with hardware performance counters
@@ -1349,15 +1466,32 @@ where
         let mut counter = counter_cell.borrow_mut();
         
         if !counter.is_available() {
+            // Log debug info only once per thread
+            DEBUG_LOGGED.with(|logged| {
+                if !*logged.borrow() {
+                    eprintln!("[DEBUG] measure_operation: Performance counters not available for this thread");
+                    eprintln!("[DEBUG] measure_operation: Returning None for measurements");
+                    *logged.borrow_mut() = true;
+                }
+            });
             // Counters not available, just run the operation
             return (operation(), None);
         }
         
         // Reset counters
-        let _ = counter.reset();
+        if let Err(e) = counter.reset() {
+            eprintln!("[DEBUG] measure_operation: Failed to reset counters: {}", e);
+        }
         
         // Start counting - if this fails, run operation without measurement
-        if counter.start().is_err() {
+        if let Err(e) = counter.start() {
+            DEBUG_LOGGED.with(|logged| {
+                if !*logged.borrow() {
+                    eprintln!("[DEBUG] measure_operation: Failed to start counters: {}", e);
+                    eprintln!("[DEBUG] measure_operation: Running operation without measurement");
+                    *logged.borrow_mut() = true;
+                }
+            });
             return (operation(), None);
         }
         
@@ -1369,6 +1503,15 @@ where
         
         // Stop counting and get measurements
         let measurement = counter.stop(start_time).ok();
+        
+        if measurement.is_none() {
+            DEBUG_LOGGED.with(|logged| {
+                if !*logged.borrow() {
+                    eprintln!("[DEBUG] measure_operation: Failed to stop counters and get measurement");
+                    *logged.borrow_mut() = true;
+                }
+            });
+        }
         
         (result, measurement)
     })
