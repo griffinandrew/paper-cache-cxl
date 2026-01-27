@@ -14,7 +14,7 @@ use perf_event::{Builder, Group, Counter};
 use perf_event::events::{Hardware, Software, Cache, CacheOp, CacheResult, WhichCache};
 use std::sync::Mutex;
 use std::io;
-use std::time::{Instant, Duration};
+use std::time::Instant;
 
 /// Hardware performance measurement for a specific operation
 /// 
