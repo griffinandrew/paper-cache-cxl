@@ -570,29 +570,8 @@ impl PerfCounterGroup {
             if dtlb_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_LOAD_MISSES"); }
             else { eprintln!("[DEBUG]   ✗ DTLB_LOAD_MISSES (failed to create)"); }
             
-            // Count disabled counters
-            if ref_cycles.is_none() { counters_disabled += 1; }
-            if branch_instructions.is_none() { counters_disabled += 1; }
-            if branch_misses.is_none() { counters_disabled += 1; }
-            if stalled_frontend.is_none() { counters_disabled += 1; }
-            if stalled_backend.is_none() { counters_disabled += 1; }
-            if l1_dcache_loads.is_none() { counters_disabled += 1; }
-            if l1_dcache_stores.is_none() { counters_disabled += 1; }
-            if l1_dcache_store_misses.is_none() { counters_disabled += 1; }
-            if l1_icache_loads.is_none() { counters_disabled += 1; }
-            if l1_icache_load_misses.is_none() { counters_disabled += 1; }
-            if llc_stores.is_none() { counters_disabled += 1; }
-            if llc_store_misses.is_none() { counters_disabled += 1; }
-            if dtlb_loads.is_none() { counters_disabled += 1; }
-            if dtlb_stores.is_none() { counters_disabled += 1; }
-            if dtlb_store_misses.is_none() { counters_disabled += 1; }
-            if itlb_loads.is_none() { counters_disabled += 1; }
-            if itlb_load_misses.is_none() { counters_disabled += 1; }
-            if page_faults.is_none() { counters_disabled += 1; }
-            if page_faults_min.is_none() { counters_disabled += 1; }
-            if page_faults_maj.is_none() { counters_disabled += 1; }
-            if context_switches.is_none() { counters_disabled += 1; }
-            if cpu_migrations.is_none() { counters_disabled += 1; }
+            // Count of intentionally disabled counters (hardcoded to None above)
+            let counters_disabled = 22;  // Total counters (30) - essential counters (8)
             
             eprintln!("[DEBUG] ");
             eprintln!("[DEBUG] Counter creation complete: {} enabled, {} disabled (to avoid multiplexing)", counters_created, counters_disabled);
