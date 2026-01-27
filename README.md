@@ -29,12 +29,35 @@ Track high-level hashmap operations:
 
 ### 2. Hardware Performance Counters (Feature: `hw_perf_counters`)
 
-Track actual CPU-level memory accesses using Linux `perf_event`:
-- **CPU cycles** and **instructions** executed per operation
-- **Cache references** and **cache misses** (L1, L2, L3)
-- **Cache miss rate** percentage
-- **IPC (Instructions Per Cycle)** metrics
-- **Per-operation statistics**: Average cycles, cache misses for GET/SET/DEL/HAS operations
+Track comprehensive microarchitectural and memory hierarchy statistics using Linux `perf_event`:
+
+**Execution Metrics:**
+- **CPU cycles** and **instructions** retired per operation
+- **IPC (Instructions Per Cycle)** and **CPI** metrics
+- **Branch prediction**: Instructions, mispredictions, and miss rates
+- **Pipeline stalls**: Frontend (fetch/decode) and backend (execution/memory) stalls
+
+**Memory Hierarchy:**
+- **L1 D-cache**: Load/store accesses and misses with separate miss rates
+- **L1 I-cache**: Instruction fetch accesses and misses
+- **LLC (Last-Level Cache)**: Load/store accesses and misses
+- **Overall cache**: References, misses, and aggregate miss rates
+
+**TLB Performance:**
+- **dTLB**: Data translation misses for loads and stores
+- **iTLB**: Instruction translation misses
+- **Miss rates**: Separate for each TLB type
+
+**System Events:**
+- **Page faults**: Total, minor (no I/O), and major (disk I/O)
+- **Context switches**: Task scheduler switches
+- **CPU migrations**: Thread moved to different core
+
+**Timing:**
+- **Duration tracking**: Nanosecond precision wall-clock timing
+- **Timestamps**: When each measurement was taken
+
+**Per-operation statistics**: All metrics available as averages and totals for GET/SET/DEL/HAS operations
 
 ### Supported Configurations
 
@@ -143,22 +166,35 @@ HashMap Performance Statistics:
 
 Global HashMap (hashbrown in DRAM):
 Hardware Performance Statistics (HashMap):
-  Total Operations: 185
-  Total Cycles: 45230
-  Total Cache References: 1850
-  Total Cache Misses: 185 (10.00% miss rate)
+  Total Operations: 100
+  Total Cycles: 250000
+  Total Cache References: 12500
+  Total Cache Misses: 1200 (9.60% miss rate)
 
-GET Operations (75 calls):
-    Avg Cycles: 230
-    Avg Instructions: 450 (IPC: 1.96)
-    Avg Cache References: 25
-    Avg Cache Misses: 2 (8.00% miss rate)
-
-SET Operations (100 calls):
-    Avg Cycles: 250
-    Avg Instructions: 480 (IPC: 1.92)
-    Avg Cache References: 28
-    Avg Cache Misses: 3 (10.71% miss rate)
+GET Operations (100 calls):
+  ┌─ Execution Metrics:
+  │  Duration: 1.23 µs avg
+  │  Cycles: 2500 avg, 250000 total
+  │  Instructions: 4800 avg (IPC: 1.92)
+  │  Branches: 180 avg, 5 mispredictions (2.78% miss rate)
+  │  Stalls: Frontend 8.5%, Backend 15.2%
+  ├─ Cache Hierarchy:
+  │  Overall: 125 refs, 12 misses (9.60% miss rate)
+  │  L1 D-cache:
+  │    Loads: 85 avg, 8 misses (9.41% miss rate)
+  │    Stores: 25 avg, 2 misses (8.00% miss rate)
+  │  L1 I-cache: 200 loads, 2 misses (1.00% miss rate)
+  │  LLC:
+  │    Loads: 15 avg, 2 misses
+  │    Stores: 5 avg, 0 misses
+  │    Overall: 10.00% miss rate
+  ├─ TLB Performance:
+  │  dTLB: 110 accesses, 1 misses (0.91% miss rate)
+  │  iTLB: 200 accesses, 0 misses (0.00% miss rate)
+  └─ System Events:
+     Page Faults: 0 total (0 minor, 0 major)
+     Context Switches: 0 avg
+     CPU Migrations: 0 avg
 ```
 
 ## Tiering Manager
