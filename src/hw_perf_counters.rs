@@ -394,32 +394,40 @@ impl PerfCounterGroup {
         };
         
         // Helper macro to create counter, returning None if it fails
+        // Set PAPER_CACHE_DEBUG_PERF=verbose to see individual counter failures
         macro_rules! try_counter {
-            ($group:expr, $kind:expr) => {
-                Builder::new()
+            ($group:expr, $kind:expr, $name:expr) => {{
+                match Builder::new()
                     .group($group)
                     .kind($kind)
-                    .build()
-                    .ok()
-            };
+                    .build() {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        if std::env::var("PAPER_CACHE_DEBUG_PERF").unwrap_or_default() == "verbose" {
+                            eprintln!("[DEBUG]   Counter {} failed: {}", $name, e);
+                        }
+                        None
+                    }
+                }
+            }};
         }
         
         // Core CPU metrics (most likely to be available)
-        let cycles = try_counter!(&mut group, Hardware::CPU_CYCLES);
-        let instructions = try_counter!(&mut group, Hardware::INSTRUCTIONS);
-        let ref_cycles = try_counter!(&mut group, Hardware::REF_CPU_CYCLES);
+        let cycles = try_counter!(&mut group, Hardware::CPU_CYCLES, "CPU_CYCLES");
+        let instructions = try_counter!(&mut group, Hardware::INSTRUCTIONS, "INSTRUCTIONS");
+        let ref_cycles = try_counter!(&mut group, Hardware::REF_CPU_CYCLES, "REF_CPU_CYCLES");
         
         // Generic cache metrics
-        let cache_refs = try_counter!(&mut group, Hardware::CACHE_REFERENCES);
-        let cache_miss = try_counter!(&mut group, Hardware::CACHE_MISSES);
+        let cache_refs = try_counter!(&mut group, Hardware::CACHE_REFERENCES, "CACHE_REFERENCES");
+        let cache_miss = try_counter!(&mut group, Hardware::CACHE_MISSES, "CACHE_MISSES");
         
         // Branch prediction
-        let branch_instructions = try_counter!(&mut group, Hardware::BRANCH_INSTRUCTIONS);
-        let branch_misses = try_counter!(&mut group, Hardware::BRANCH_MISSES);
+        let branch_instructions = try_counter!(&mut group, Hardware::BRANCH_INSTRUCTIONS, "BRANCH_INSTRUCTIONS");
+        let branch_misses = try_counter!(&mut group, Hardware::BRANCH_MISSES, "BRANCH_MISSES");
         
         // Pipeline stalls
-        let stalled_frontend = try_counter!(&mut group, Hardware::STALLED_CYCLES_FRONTEND);
-        let stalled_backend = try_counter!(&mut group, Hardware::STALLED_CYCLES_BACKEND);
+        let stalled_frontend = try_counter!(&mut group, Hardware::STALLED_CYCLES_FRONTEND, "STALLED_CYCLES_FRONTEND");
+        let stalled_backend = try_counter!(&mut group, Hardware::STALLED_CYCLES_BACKEND, "STALLED_CYCLES_BACKEND");
         
         // L1 D-cache
         let l1_dcache_loads = try_counter!(
@@ -428,7 +436,8 @@ impl PerfCounterGroup {
                 which: WhichCache::L1D,
                 operation: CacheOp::READ,
                 result: CacheResult::ACCESS,
-            }
+            },
+            "L1_DCACHE_LOADS"
         );
         let l1_dcache_load_misses = try_counter!(
             &mut group,
@@ -436,7 +445,8 @@ impl PerfCounterGroup {
                 which: WhichCache::L1D,
                 operation: CacheOp::READ,
                 result: CacheResult::MISS,
-            }
+            },
+            "L1_DCACHE_LOAD_MISSES"
         );
         let l1_dcache_stores = try_counter!(
             &mut group,
@@ -444,7 +454,8 @@ impl PerfCounterGroup {
                 which: WhichCache::L1D,
                 operation: CacheOp::WRITE,
                 result: CacheResult::ACCESS,
-            }
+            },
+            "L1_DCACHE_STORES"
         );
         let l1_dcache_store_misses = try_counter!(
             &mut group,
@@ -452,7 +463,8 @@ impl PerfCounterGroup {
                 which: WhichCache::L1D,
                 operation: CacheOp::WRITE,
                 result: CacheResult::MISS,
-            }
+            },
+            "L1_DCACHE_STORE_MISSES"
         );
         
         // L1 I-cache
@@ -462,7 +474,8 @@ impl PerfCounterGroup {
                 which: WhichCache::L1I,
                 operation: CacheOp::READ,
                 result: CacheResult::ACCESS,
-            }
+            },
+            "L1_ICACHE_LOADS"
         );
         let l1_icache_load_misses = try_counter!(
             &mut group,
@@ -470,7 +483,8 @@ impl PerfCounterGroup {
                 which: WhichCache::L1I,
                 operation: CacheOp::READ,
                 result: CacheResult::MISS,
-            }
+            },
+            "L1_ICACHE_LOAD_MISSES"
         );
         
         // LLC (Last-Level Cache)
@@ -480,7 +494,8 @@ impl PerfCounterGroup {
                 which: WhichCache::LL,
                 operation: CacheOp::READ,
                 result: CacheResult::ACCESS,
-            }
+            },
+            "LLC_LOADS"
         );
         let llc_load_misses = try_counter!(
             &mut group,
@@ -488,7 +503,8 @@ impl PerfCounterGroup {
                 which: WhichCache::LL,
                 operation: CacheOp::READ,
                 result: CacheResult::MISS,
-            }
+            },
+            "LLC_LOAD_MISSES"
         );
         let llc_stores = try_counter!(
             &mut group,
@@ -496,7 +512,8 @@ impl PerfCounterGroup {
                 which: WhichCache::LL,
                 operation: CacheOp::WRITE,
                 result: CacheResult::ACCESS,
-            }
+            },
+            "LLC_STORES"
         );
         let llc_store_misses = try_counter!(
             &mut group,
@@ -504,7 +521,8 @@ impl PerfCounterGroup {
                 which: WhichCache::LL,
                 operation: CacheOp::WRITE,
                 result: CacheResult::MISS,
-            }
+            },
+            "LLC_STORE_MISSES"
         );
         
         // dTLB
@@ -514,7 +532,8 @@ impl PerfCounterGroup {
                 which: WhichCache::DTLB,
                 operation: CacheOp::READ,
                 result: CacheResult::ACCESS,
-            }
+            },
+            "DTLB_LOADS"
         );
         let dtlb_load_misses = try_counter!(
             &mut group,
@@ -522,7 +541,8 @@ impl PerfCounterGroup {
                 which: WhichCache::DTLB,
                 operation: CacheOp::READ,
                 result: CacheResult::MISS,
-            }
+            },
+            "DTLB_LOAD_MISSES"
         );
         let dtlb_stores = try_counter!(
             &mut group,
@@ -530,7 +550,8 @@ impl PerfCounterGroup {
                 which: WhichCache::DTLB,
                 operation: CacheOp::WRITE,
                 result: CacheResult::ACCESS,
-            }
+            },
+            "DTLB_STORES"
         );
         let dtlb_store_misses = try_counter!(
             &mut group,
@@ -538,7 +559,8 @@ impl PerfCounterGroup {
                 which: WhichCache::DTLB,
                 operation: CacheOp::WRITE,
                 result: CacheResult::MISS,
-            }
+            },
+            "DTLB_STORE_MISSES"
         );
         
         // iTLB
@@ -548,7 +570,8 @@ impl PerfCounterGroup {
                 which: WhichCache::ITLB,
                 operation: CacheOp::READ,
                 result: CacheResult::ACCESS,
-            }
+            },
+            "ITLB_LOADS"
         );
         let itlb_load_misses = try_counter!(
             &mut group,
@@ -556,15 +579,16 @@ impl PerfCounterGroup {
                 which: WhichCache::ITLB,
                 operation: CacheOp::READ,
                 result: CacheResult::MISS,
-            }
+            },
+            "ITLB_LOAD_MISSES"
         );
         
         // Software events
-        let page_faults = try_counter!(&mut group, Software::PAGE_FAULTS);
-        let page_faults_min = try_counter!(&mut group, Software::PAGE_FAULTS_MIN);
-        let page_faults_maj = try_counter!(&mut group, Software::PAGE_FAULTS_MAJ);
-        let context_switches = try_counter!(&mut group, Software::CONTEXT_SWITCHES);
-        let cpu_migrations = try_counter!(&mut group, Software::CPU_MIGRATIONS);
+        let page_faults = try_counter!(&mut group, Software::PAGE_FAULTS, "PAGE_FAULTS");
+        let page_faults_min = try_counter!(&mut group, Software::PAGE_FAULTS_MIN, "PAGE_FAULTS_MIN");
+        let page_faults_maj = try_counter!(&mut group, Software::PAGE_FAULTS_MAJ, "PAGE_FAULTS_MAJ");
+        let context_switches = try_counter!(&mut group, Software::CONTEXT_SWITCHES, "CONTEXT_SWITCHES");
+        let cpu_migrations = try_counter!(&mut group, Software::CPU_MIGRATIONS, "CPU_MIGRATIONS");
         
         // Debug: Report which counters were successfully created
         let mut counters_created = 0;
@@ -673,6 +697,17 @@ impl PerfCounterGroup {
         else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CPU_MIGRATIONS"); }
         
         eprintln!("[DEBUG] Counter creation complete: {} succeeded, {} failed", counters_created, counters_failed);
+        
+        // Provide helpful context based on what succeeded/failed
+        if counters_created == 0 {
+            eprintln!("[DEBUG] WARNING: No performance counters available!");
+            eprintln!("[DEBUG] This system does not support hardware performance monitoring.");
+        } else if cycles.is_none() && instructions.is_none() {
+            eprintln!("[DEBUG] NOTE: Hardware CPU counters (cycles, instructions) are not available.");
+            eprintln!("[DEBUG] This is common in virtualized environments (VMs, containers).");
+            eprintln!("[DEBUG] Only software counters (page faults, context switches) will be tracked.");
+            eprintln!("[DEBUG] For full hardware monitoring, run on bare metal with proper permissions.");
+        }
         
         Ok(PerfCounterGroup {
             group: Some(group),
