@@ -1516,4 +1516,28 @@ mod tests {
         assert_eq!(result, 499500);
         // measurement may be None if perf counters not available
     }
+
+    #[test]
+    fn test_perf_counter_group_resilience() {
+        // This test verifies that PerfCounterGroup::new() succeeds even if
+        // Group::new() fails or some individual counters fail to create.
+        // The group should be created with whatever counters are available.
+        
+        let mut counter_group = PerfCounterGroup::new();
+        
+        // The counter group should always be created (never panics)
+        // It should have is_available() return true if at least some counters work,
+        // or false if no counters are available
+        
+        // We just verify that it doesn't panic and has a valid state
+        let _available = counter_group.is_available();
+        
+        // If available, we should be able to start/stop without panicking
+        // (though it may return an error if no group was created)
+        if counter_group.is_available() {
+            // This is best-effort - if the group is None but some counters exist,
+            // start() will return an error but shouldn't panic
+            let _ = counter_group.start();
+        }
+    }
 }
