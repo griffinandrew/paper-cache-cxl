@@ -1521,18 +1521,16 @@ mod tests {
         let mut counter_group = PerfCounterGroup::new();
         
         // The counter group should always be created (never panics)
-        // It should have is_available() return true if at least some counters work,
-        // or false if no counters are available
+        // It should have is_available() return true if the group was created,
+        // or false if group creation failed (e.g., insufficient permissions)
         
         // We just verify that it doesn't panic and has a valid state
-        let _available = counter_group.is_available();
+        let available = counter_group.is_available();
         
-        // If available, we should be able to start/stop without panicking
-        // (though it may return an error if no group was created)
-        if counter_group.is_available() {
-            // This is best-effort - if the group is None but some counters exist,
-            // start() will return an error but shouldn't panic
-            let _ = counter_group.start();
+        // If available, we should be able to start/stop without errors
+        if available {
+            // Group exists, so start() should succeed
+            assert!(counter_group.start().is_ok());
         }
     }
 }
