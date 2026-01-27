@@ -374,21 +374,30 @@ impl PerfCounterGroup {
     }
 
     fn try_create_counters() -> io::Result<PerfCounterGroup> {
+        // Check debug mode once at the start
+        let debug_mode = std::env::var("PAPER_CACHE_DEBUG_PERF").unwrap_or_default();
+        let debug_enabled = !debug_mode.is_empty();
+        let verbose_enabled = debug_mode == "verbose";
+        
         // Try to create the group, but if it fails, return an empty counter group
         // This allows graceful degradation when group creation is not permitted
         let mut group = match Group::new() {
             Ok(g) => {
-                eprintln!("[DEBUG] Successfully created performance counter group");
+                if debug_enabled {
+                    eprintln!("[DEBUG] Successfully created performance counter group");
+                }
                 g
             },
             Err(e) => {
                 // If we can't create a group (e.g., insufficient permissions),
                 // return an empty counter group rather than failing completely
-                eprintln!("[DEBUG] Failed to create performance counter group: {}", e);
-                eprintln!("[DEBUG] Possible reasons:");
-                eprintln!("[DEBUG]   - Insufficient permissions (try: sudo sysctl kernel.perf_event_paranoid=-1)");
-                eprintln!("[DEBUG]   - Running in a container or VM without perf access");
-                eprintln!("[DEBUG]   - Hardware doesn't support performance counters");
+                if debug_enabled {
+                    eprintln!("[DEBUG] Failed to create performance counter group: {}", e);
+                    eprintln!("[DEBUG] Possible reasons:");
+                    eprintln!("[DEBUG]   - Insufficient permissions (try: sudo sysctl kernel.perf_event_paranoid=-1)");
+                    eprintln!("[DEBUG]   - Running in a container or VM without perf access");
+                    eprintln!("[DEBUG]   - Hardware doesn't support performance counters");
+                }
                 return Ok(Self::empty());
             }
         };
@@ -403,7 +412,7 @@ impl PerfCounterGroup {
                     .build() {
                     Ok(c) => Some(c),
                     Err(e) => {
-                        if std::env::var("PAPER_CACHE_DEBUG_PERF").unwrap_or_default() == "verbose" {
+                        if verbose_enabled {
                             eprintln!("[DEBUG]   Counter {} failed: {}", $name, e);
                         }
                         None
@@ -590,15 +599,16 @@ impl PerfCounterGroup {
         let context_switches = try_counter!(&mut group, Software::CONTEXT_SWITCHES, "CONTEXT_SWITCHES");
         let cpu_migrations = try_counter!(&mut group, Software::CPU_MIGRATIONS, "CPU_MIGRATIONS");
         
-        // Debug: Report which counters were successfully created
-        let mut counters_created = 0;
-        let mut counters_failed = 0;
-        
-        eprintln!("[DEBUG] Performance counter creation summary:");
-        
-        // Core CPU metrics
-        if cycles.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CPU_CYCLES"); } 
-        else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CPU_CYCLES"); }
+        // Debug: Report which counters were successfully created (only if debug enabled)
+        if debug_enabled {
+            let mut counters_created = 0;
+            let mut counters_failed = 0;
+            
+            eprintln!("[DEBUG] Performance counter creation summary:");
+            
+            // Core CPU metrics
+            if cycles.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CPU_CYCLES"); } 
+            else { counters_failed += 1; eprintln!("[DEBUG]   ✗ CPU_CYCLES"); }
         
         if instructions.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ INSTRUCTIONS"); }
         else { counters_failed += 1; eprintln!("[DEBUG]   ✗ INSTRUCTIONS"); }
@@ -708,6 +718,7 @@ impl PerfCounterGroup {
             eprintln!("[DEBUG] Only software counters (page faults, context switches) will be tracked.");
             eprintln!("[DEBUG] For full hardware monitoring, run on bare metal with proper permissions.");
         }
+        } // End of debug_enabled block
         
         Ok(PerfCounterGroup {
             group: Some(group),
@@ -1497,36 +1508,45 @@ pub fn measure_operation<F, R>(operation: F) -> (R, Option<HwPerfMeasurement>)
 where
     F: FnOnce() -> R,
 {
+    // Check debug mode once
+    let debug_enabled = !std::env::var("PAPER_CACHE_DEBUG_PERF").unwrap_or_default().is_empty();
+    
     PERF_COUNTER.with(|counter_cell| {
         let mut counter = counter_cell.borrow_mut();
         
         if !counter.is_available() {
-            // Log debug info only once per thread
-            DEBUG_LOGGED.with(|logged| {
-                if !*logged.borrow() {
-                    eprintln!("[DEBUG] measure_operation: Performance counters not available for this thread");
-                    eprintln!("[DEBUG] measure_operation: Returning None for measurements");
-                    *logged.borrow_mut() = true;
-                }
-            });
+            // Log debug info only once per thread if debug is enabled
+            if debug_enabled {
+                DEBUG_LOGGED.with(|logged| {
+                    if !*logged.borrow() {
+                        eprintln!("[DEBUG] measure_operation: Performance counters not available for this thread");
+                        eprintln!("[DEBUG] measure_operation: Returning None for measurements");
+                        *logged.borrow_mut() = true;
+                    }
+                });
+            }
             // Counters not available, just run the operation
             return (operation(), None);
         }
         
         // Reset counters
         if let Err(e) = counter.reset() {
-            eprintln!("[DEBUG] measure_operation: Failed to reset counters: {}", e);
+            if debug_enabled {
+                eprintln!("[DEBUG] measure_operation: Failed to reset counters: {}", e);
+            }
         }
         
         // Start counting - if this fails, run operation without measurement
         if let Err(e) = counter.start() {
-            DEBUG_LOGGED.with(|logged| {
-                if !*logged.borrow() {
-                    eprintln!("[DEBUG] measure_operation: Failed to start counters: {}", e);
-                    eprintln!("[DEBUG] measure_operation: Running operation without measurement");
-                    *logged.borrow_mut() = true;
-                }
-            });
+            if debug_enabled {
+                DEBUG_LOGGED.with(|logged| {
+                    if !*logged.borrow() {
+                        eprintln!("[DEBUG] measure_operation: Failed to start counters: {}", e);
+                        eprintln!("[DEBUG] measure_operation: Running operation without measurement");
+                        *logged.borrow_mut() = true;
+                    }
+                });
+            }
             return (operation(), None);
         }
         
@@ -1540,12 +1560,14 @@ where
         let measurement = counter.stop(start_time).ok();
         
         if measurement.is_none() {
-            DEBUG_LOGGED.with(|logged| {
-                if !*logged.borrow() {
-                    eprintln!("[DEBUG] measure_operation: Failed to stop counters and get measurement");
-                    *logged.borrow_mut() = true;
-                }
-            });
+            if debug_enabled {
+                DEBUG_LOGGED.with(|logged| {
+                    if !*logged.borrow() {
+                        eprintln!("[DEBUG] measure_operation: Failed to stop counters and get measurement");
+                        *logged.borrow_mut() = true;
+                    }
+                });
+            }
         }
         
         (result, measurement)
