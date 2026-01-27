@@ -1083,8 +1083,8 @@ where
 				// We need to clone the actual byte slice into a Vec
 				//let arc_val = object.data();
 				//Ok(arc_val.as_ref().to_vec())
-				Ok(vec![])
-
+				//Ok(vec![])
+				Ok([0].to_vec())
 				
 			},
 
