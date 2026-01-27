@@ -1081,9 +1081,10 @@ where
 				//self.status.incr_hits();
 				// object.data() returns Arc<Box<[u8]>>
 				// We need to clone the actual byte slice into a Vec
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
-				//Ok(vec![])
+				//let arc_val = object.data();
+				//Ok(arc_val.as_ref().to_vec())
+				Ok(vec![])
+
 				
 			},
 
