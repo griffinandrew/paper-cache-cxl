@@ -1084,6 +1084,7 @@ where
 				//let arc_val = object.data();
 				//Ok(arc_val.as_ref().to_vec())
 				//Ok(vec![])
+				println!("CACHE: get for key {:?}: {:?}", key, object.data().as_ref());
 				Ok([0].to_vec())
 				
 			},
