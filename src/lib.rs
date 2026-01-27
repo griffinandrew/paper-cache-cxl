@@ -3770,21 +3770,21 @@ where
 		let hashed_key = self.hash_key(key);
 
 		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			//Some(object) if object.key_matches(key) && !object.is_expired() => {
-			Some(object) => {
-				//self.status.incr_hits();
-				//let arc_val = object.data();
-				//Ok(arc_val.as_ref().to_vec())
-				Ok(vec![])
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+			//Some(object) => {
+				self.status.incr_hits();
+				let arc_val = object.data();
+				Ok(arc_val.as_ref().to_vec())
+				//Ok(vec![])
 			},
 			_ => {
-				//self.status.incr_misses();
+				self.status.incr_misses();
 				Err(CacheError::KeyNotFound)
 			},
 		};
 
 		
-//		self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
 		result
 	}
