@@ -376,15 +376,14 @@ impl PerfCounterGroup {
     fn try_create_counters() -> io::Result<PerfCounterGroup> {
         // Try to create the group, but if it fails, return an empty counter group
         // This allows graceful degradation when group creation is not permitted
-        let group_result = Group::new();
-        
-        if group_result.is_err() {
-            // If we can't create a group (e.g., insufficient permissions),
-            // return an empty counter group rather than failing completely
-            return Ok(Self::empty());
-        }
-        
-        let mut group = group_result.unwrap();
+        let mut group = match Group::new() {
+            Ok(g) => g,
+            Err(_) => {
+                // If we can't create a group (e.g., insufficient permissions),
+                // return an empty counter group rather than failing completely
+                return Ok(Self::empty());
+            }
+        };
         
         // Helper macro to create counter, returning None if it fails
         macro_rules! try_counter {
