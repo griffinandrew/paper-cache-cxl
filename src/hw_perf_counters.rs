@@ -582,7 +582,7 @@ impl PerfCounterGroup {
             //else { eprintln!("[DEBUG]   ✗ DTLB_LOAD_MISSES (failed to create)"); }
             
             // Count of intentionally disabled counters (hardcoded to None above)
-            let counters_disabled = 22;  // Total counters (30) - essential counters (8)
+            let counters_disabled = 24;  // Total counters (30) - essential counters (8)
             
             eprintln!("[DEBUG] ");
             eprintln!("[DEBUG] Counter creation complete: {} enabled, {} disabled (to avoid multiplexing)", counters_created, counters_disabled);
@@ -596,8 +596,8 @@ impl PerfCounterGroup {
                 eprintln!("[DEBUG] NOTE: Hardware CPU counters (cycles, instructions) are not available.");
                 eprintln!("[DEBUG] This is common in virtualized environments (VMs, containers).");
                 eprintln!("[DEBUG] For full hardware monitoring, run on bare metal with proper permissions.");
-            } else if counters_created < 8 {
-                eprintln!("[DEBUG] NOTE: Only {}/8 essential counters available on this platform.", counters_created);
+            } else if counters_created < 6 {
+                eprintln!("[DEBUG] NOTE: Only {}/6 essential counters available on this platform.", counters_created);
             }
         } // End of debug_enabled block
         
