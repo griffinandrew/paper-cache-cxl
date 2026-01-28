@@ -11,9 +11,6 @@ mod object;
 mod policy;
 mod status;
 
-// Hardware performance counters module
-pub mod hw_perf_counters;
-
 use std::{
 	thread,
 	sync::{
@@ -61,18 +58,6 @@ use crate::{
 pub use crate::{
 	error::CacheError,
 	policy::PaperPolicy,
-	hw_perf_counters::{
-		HwPerfMeasurement,
-		PerfCounterGroup,
-		HwHashMapCounters,
-		HwHashMapStats,
-		AggregatedMeasurement,
-		GlobalHwPerfCounters,
-		get_hw_counters,
-		get_hw_hashmap_stats,
-		print_hw_perf_stats,
-		measure_operation,
-	},
 };
 
 pub type CacheSize = u64;
