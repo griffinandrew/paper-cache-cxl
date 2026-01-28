@@ -500,6 +500,10 @@ impl PerfCounterGroup {
         // ========================================================================
         
         // Disabled: REF_CPU_CYCLES - less critical than regular cycles
+
+        let l1_dcache_load_misses = None;
+
+        let dtlb_load_misses = None;
         let ref_cycles = None;
         
         // Disabled: Branch prediction - not critical for memory analysis
