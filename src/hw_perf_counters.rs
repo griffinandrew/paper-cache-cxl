@@ -374,105 +374,84 @@ impl PerfCounterGroup {
     }
 
     fn try_create_counters() -> io::Result<PerfCounterGroup> {
+        // Check debug mode once at the start
+        let debug_mode = std::env::var("PAPER_CACHE_DEBUG_PERF").unwrap_or_default();
+        let debug_enabled = !debug_mode.is_empty();
+        let verbose_enabled = debug_mode == "verbose";
+        
         // Try to create the group, but if it fails, return an empty counter group
         // This allows graceful degradation when group creation is not permitted
         let mut group = match Group::new() {
-            Ok(g) => g,
-            Err(_) => {
+            Ok(g) => {
+                if debug_enabled {
+                    eprintln!("[DEBUG] Successfully created performance counter group");
+                }
+                g
+            },
+            Err(e) => {
                 // If we can't create a group (e.g., insufficient permissions),
                 // return an empty counter group rather than failing completely
+                if debug_enabled {
+                    eprintln!("[DEBUG] Failed to create performance counter group: {}", e);
+                    eprintln!("[DEBUG] Possible reasons:");
+                    eprintln!("[DEBUG]   - Insufficient permissions (try: sudo sysctl kernel.perf_event_paranoid=-1)");
+                    eprintln!("[DEBUG]   - Running in a container or VM without perf access");
+                    eprintln!("[DEBUG]   - Hardware doesn't support performance counters");
+                }
                 return Ok(Self::empty());
             }
         };
         
         // Helper macro to create counter, returning None if it fails
+        // Set PAPER_CACHE_DEBUG_PERF=verbose to see individual counter failures
         macro_rules! try_counter {
-            ($group:expr, $kind:expr) => {
-                Builder::new()
+            ($group:expr, $kind:expr, $name:expr) => {{
+                match Builder::new()
                     .group($group)
                     .kind($kind)
-                    .build()
-                    .ok()
-            };
+                    .build() {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        if verbose_enabled {
+                            eprintln!("[DEBUG]   Counter {} failed: {}", $name, e);
+                        }
+                        None
+                    }
+                }
+            }};
         }
         
-        // Core CPU metrics (most likely to be available)
-        let cycles = try_counter!(&mut group, Hardware::CPU_CYCLES);
-        let instructions = try_counter!(&mut group, Hardware::INSTRUCTIONS);
-        let ref_cycles = try_counter!(&mut group, Hardware::REF_CPU_CYCLES);
+        // ========================================================================
+        // ESSENTIAL 8 COUNTERS FOR MEMORY PERFORMANCE ANALYSIS
+        // ========================================================================
+        // Hardware typically supports only ~8 simultaneous counters without
+        // multiplexing. These 8 counters provide the most critical insights
+        // for understanding hashtable memory access patterns:
+        //
+        // 1-2: CPU execution metrics (cycles, instructions) -> IPC
+        // 3-4: Generic cache activity (references, misses) -> overall cache behavior
+        // 5-6: LLC performance (loads, load misses) -> main memory pressure
+        // 7:   L1 D-cache misses -> L1 cache efficiency
+        // 8:   Data TLB misses -> page table overhead
+        // ========================================================================
         
-        // Generic cache metrics
-        let cache_refs = try_counter!(&mut group, Hardware::CACHE_REFERENCES);
-        let cache_miss = try_counter!(&mut group, Hardware::CACHE_MISSES);
+        // Core CPU metrics - Essential for IPC and baseline timing
+        let cycles = try_counter!(&mut group, Hardware::CPU_CYCLES, "CPU_CYCLES");
+        let instructions = try_counter!(&mut group, Hardware::INSTRUCTIONS, "INSTRUCTIONS");
         
-        // Branch prediction
-        let branch_instructions = try_counter!(&mut group, Hardware::BRANCH_INSTRUCTIONS);
-        let branch_misses = try_counter!(&mut group, Hardware::BRANCH_MISSES);
+        // Generic cache metrics - Overall cache behavior
+        let cache_refs = try_counter!(&mut group, Hardware::CACHE_REFERENCES, "CACHE_REFERENCES");
+        let cache_miss = try_counter!(&mut group, Hardware::CACHE_MISSES, "CACHE_MISSES");
         
-        // Pipeline stalls
-        let stalled_frontend = try_counter!(&mut group, Hardware::STALLED_CYCLES_FRONTEND);
-        let stalled_backend = try_counter!(&mut group, Hardware::STALLED_CYCLES_BACKEND);
-        
-        // L1 D-cache
-        let l1_dcache_loads = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::L1D,
-                operation: CacheOp::READ,
-                result: CacheResult::ACCESS,
-            }
-        );
-        let l1_dcache_load_misses = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::L1D,
-                operation: CacheOp::READ,
-                result: CacheResult::MISS,
-            }
-        );
-        let l1_dcache_stores = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::L1D,
-                operation: CacheOp::WRITE,
-                result: CacheResult::ACCESS,
-            }
-        );
-        let l1_dcache_store_misses = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::L1D,
-                operation: CacheOp::WRITE,
-                result: CacheResult::MISS,
-            }
-        );
-        
-        // L1 I-cache
-        let l1_icache_loads = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::L1I,
-                operation: CacheOp::READ,
-                result: CacheResult::ACCESS,
-            }
-        );
-        let l1_icache_load_misses = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::L1I,
-                operation: CacheOp::READ,
-                result: CacheResult::MISS,
-            }
-        );
-        
-        // LLC (Last-Level Cache)
+        // LLC (Last-Level Cache) - Critical for memory performance
         let llc_loads = try_counter!(
             &mut group,
             Cache {
                 which: WhichCache::LL,
                 operation: CacheOp::READ,
                 result: CacheResult::ACCESS,
-            }
+            },
+            "LLC_LOADS"
         );
         let llc_load_misses = try_counter!(
             &mut group,
@@ -480,83 +459,136 @@ impl PerfCounterGroup {
                 which: WhichCache::LL,
                 operation: CacheOp::READ,
                 result: CacheResult::MISS,
-            }
-        );
-        let llc_stores = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::LL,
-                operation: CacheOp::WRITE,
-                result: CacheResult::ACCESS,
-            }
-        );
-        let llc_store_misses = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::LL,
-                operation: CacheOp::WRITE,
-                result: CacheResult::MISS,
-            }
+            },
+            "LLC_LOAD_MISSES"
         );
         
-        // dTLB
-        let dtlb_loads = try_counter!(
+        // L1 D-cache load misses - High-frequency memory events
+        let l1_dcache_load_misses = try_counter!(
             &mut group,
             Cache {
-                which: WhichCache::DTLB,
+                which: WhichCache::L1D,
                 operation: CacheOp::READ,
-                result: CacheResult::ACCESS,
-            }
+                result: CacheResult::MISS,
+            },
+            "L1_DCACHE_LOAD_MISSES"
         );
+        
+        // Data TLB load misses - Page table overhead
         let dtlb_load_misses = try_counter!(
             &mut group,
             Cache {
                 which: WhichCache::DTLB,
                 operation: CacheOp::READ,
                 result: CacheResult::MISS,
-            }
-        );
-        let dtlb_stores = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::DTLB,
-                operation: CacheOp::WRITE,
-                result: CacheResult::ACCESS,
-            }
-        );
-        let dtlb_store_misses = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::DTLB,
-                operation: CacheOp::WRITE,
-                result: CacheResult::MISS,
-            }
+            },
+            "DTLB_LOAD_MISSES"
         );
         
-        // iTLB
-        let itlb_loads = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::ITLB,
-                operation: CacheOp::READ,
-                result: CacheResult::ACCESS,
-            }
-        );
-        let itlb_load_misses = try_counter!(
-            &mut group,
-            Cache {
-                which: WhichCache::ITLB,
-                operation: CacheOp::READ,
-                result: CacheResult::MISS,
-            }
-        );
+        // ========================================================================
+        // DISABLED COUNTERS (to avoid exceeding hardware limits)
+        // ========================================================================
+        // The following counters are not created to keep the total at 8.
+        // They can be re-enabled if needed, but will cause counter multiplexing.
+        // ========================================================================
         
-        // Software events
-        let page_faults = try_counter!(&mut group, Software::PAGE_FAULTS);
-        let page_faults_min = try_counter!(&mut group, Software::PAGE_FAULTS_MIN);
-        let page_faults_maj = try_counter!(&mut group, Software::PAGE_FAULTS_MAJ);
-        let context_switches = try_counter!(&mut group, Software::CONTEXT_SWITCHES);
-        let cpu_migrations = try_counter!(&mut group, Software::CPU_MIGRATIONS);
+        // Disabled: REF_CPU_CYCLES - less critical than regular cycles
+        let ref_cycles = None;
+        
+        // Disabled: Branch prediction - not critical for memory analysis
+        let branch_instructions = None;
+        let branch_misses = None;
+        
+        // Disabled: Pipeline stalls - not supported on all platforms
+        let stalled_frontend = None;
+        let stalled_backend = None;
+        
+        // Disabled: L1 D-cache loads/stores/store_misses - keeping only load misses
+        let l1_dcache_loads = None;
+        let l1_dcache_stores = None;
+        let l1_dcache_store_misses = None;
+        
+        // Disabled: L1 I-cache - instruction cache less relevant for data structures
+        let l1_icache_loads = None;
+        let l1_icache_load_misses = None;
+        
+        // Disabled: LLC stores/store_misses - keeping only load metrics
+        let llc_stores = None;
+        let llc_store_misses = None;
+        
+        // Disabled: dTLB loads/stores/store_misses - keeping only load misses
+        let dtlb_loads = None;
+        let dtlb_stores = None;
+        let dtlb_store_misses = None;
+        
+        // Disabled: iTLB - instruction TLB less relevant for data structures
+        let itlb_loads = None;
+        let itlb_load_misses = None;
+        
+        // Disabled: Software events - not hardware counters, less critical
+        let page_faults = None;
+        let page_faults_min = None;
+        let page_faults_maj = None;
+        let context_switches = None;
+        let cpu_migrations = None;
+        
+        // Debug: Report which counters were successfully created (only if debug enabled)
+        if debug_enabled {
+            let mut counters_created = 0;
+            let mut counters_disabled = 0;
+            
+            eprintln!("[DEBUG] Performance counter creation summary (limited to 8 essential counters):");
+            eprintln!("[DEBUG] ");
+            eprintln!("[DEBUG] === ESSENTIAL COUNTERS (attempting to create) ===");
+            
+            // Core CPU metrics
+            if cycles.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CPU_CYCLES"); } 
+            else { eprintln!("[DEBUG]   ✗ CPU_CYCLES (failed to create)"); }
+        
+            if instructions.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ INSTRUCTIONS"); }
+            else { eprintln!("[DEBUG]   ✗ INSTRUCTIONS (failed to create)"); }
+        
+            // Cache metrics
+            if cache_refs.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CACHE_REFERENCES"); }
+            else { eprintln!("[DEBUG]   ✗ CACHE_REFERENCES (failed to create)"); }
+        
+            if cache_miss.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CACHE_MISSES"); }
+            else { eprintln!("[DEBUG]   ✗ CACHE_MISSES (failed to create)"); }
+        
+            // LLC
+            if llc_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_LOADS"); }
+            else { eprintln!("[DEBUG]   ✗ LLC_LOADS (failed to create)"); }
+        
+            if llc_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_LOAD_MISSES"); }
+            else { eprintln!("[DEBUG]   ✗ LLC_LOAD_MISSES (failed to create)"); }
+        
+            // L1 D-cache load misses
+            if l1_dcache_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_DCACHE_LOAD_MISSES"); }
+            else { eprintln!("[DEBUG]   ✗ L1_DCACHE_LOAD_MISSES (failed to create)"); }
+        
+            // dTLB load misses
+            if dtlb_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_LOAD_MISSES"); }
+            else { eprintln!("[DEBUG]   ✗ DTLB_LOAD_MISSES (failed to create)"); }
+            
+            // Count of intentionally disabled counters (hardcoded to None above)
+            let counters_disabled = 22;  // Total counters (30) - essential counters (8)
+            
+            eprintln!("[DEBUG] ");
+            eprintln!("[DEBUG] Counter creation complete: {} enabled, {} disabled (to avoid multiplexing)", counters_created, counters_disabled);
+            eprintln!("[DEBUG] Note: {} counters are intentionally disabled to stay within hardware limits (~8 counters)", counters_disabled);
+            
+            // Provide helpful context based on what succeeded/failed
+            if counters_created == 0 {
+                eprintln!("[DEBUG] WARNING: No performance counters available!");
+                eprintln!("[DEBUG] This system does not support hardware performance monitoring.");
+            } else if cycles.is_none() && instructions.is_none() {
+                eprintln!("[DEBUG] NOTE: Hardware CPU counters (cycles, instructions) are not available.");
+                eprintln!("[DEBUG] This is common in virtualized environments (VMs, containers).");
+                eprintln!("[DEBUG] For full hardware monitoring, run on bare metal with proper permissions.");
+            } else if counters_created < 8 {
+                eprintln!("[DEBUG] NOTE: Only {}/8 essential counters available on this platform.", counters_created);
+            }
+        } // End of debug_enabled block
         
         Ok(PerfCounterGroup {
             group: Some(group),
@@ -1337,6 +1369,7 @@ use std::cell::RefCell;
 
 thread_local! {
     static PERF_COUNTER: RefCell<PerfCounterGroup> = RefCell::new(PerfCounterGroup::new());
+    static DEBUG_LOGGED: RefCell<bool> = RefCell::new(false);
 }
 
 /// Measure a hashmap operation with hardware performance counters
@@ -1345,19 +1378,45 @@ pub fn measure_operation<F, R>(operation: F) -> (R, Option<HwPerfMeasurement>)
 where
     F: FnOnce() -> R,
 {
+    // Check debug mode once
+    let debug_enabled = !std::env::var("PAPER_CACHE_DEBUG_PERF").unwrap_or_default().is_empty();
+    
     PERF_COUNTER.with(|counter_cell| {
         let mut counter = counter_cell.borrow_mut();
         
         if !counter.is_available() {
+            // Log debug info only once per thread if debug is enabled
+            if debug_enabled {
+                DEBUG_LOGGED.with(|logged| {
+                    if !*logged.borrow() {
+                        eprintln!("[DEBUG] measure_operation: Performance counters not available for this thread");
+                        eprintln!("[DEBUG] measure_operation: Returning None for measurements");
+                        *logged.borrow_mut() = true;
+                    }
+                });
+            }
             // Counters not available, just run the operation
             return (operation(), None);
         }
         
         // Reset counters
-        let _ = counter.reset();
+        if let Err(e) = counter.reset() {
+            if debug_enabled {
+                eprintln!("[DEBUG] measure_operation: Failed to reset counters: {}", e);
+            }
+        }
         
         // Start counting - if this fails, run operation without measurement
-        if counter.start().is_err() {
+        if let Err(e) = counter.start() {
+            if debug_enabled {
+                DEBUG_LOGGED.with(|logged| {
+                    if !*logged.borrow() {
+                        eprintln!("[DEBUG] measure_operation: Failed to start counters: {}", e);
+                        eprintln!("[DEBUG] measure_operation: Running operation without measurement");
+                        *logged.borrow_mut() = true;
+                    }
+                });
+            }
             return (operation(), None);
         }
         
@@ -1369,6 +1428,17 @@ where
         
         // Stop counting and get measurements
         let measurement = counter.stop(start_time).ok();
+        
+        if measurement.is_none() {
+            if debug_enabled {
+                DEBUG_LOGGED.with(|logged| {
+                    if !*logged.borrow() {
+                        eprintln!("[DEBUG] measure_operation: Failed to stop counters and get measurement");
+                        *logged.borrow_mut() = true;
+                    }
+                });
+            }
+        }
         
         (result, measurement)
     })
