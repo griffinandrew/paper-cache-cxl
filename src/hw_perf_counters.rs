@@ -128,6 +128,7 @@ impl HwPerfMeasurement {
     }
 
     /// L1 D-cache load miss rate (percentage)
+    /*
     pub fn l1_dcache_load_miss_rate(&self) -> f64 {
         if self.l1_dcache_loads == 0 {
             0.0
@@ -135,6 +136,7 @@ impl HwPerfMeasurement {
             (self.l1_dcache_load_misses as f64 / self.l1_dcache_loads as f64) * 100.0
         }
     }
+    */
 
     /// L1 D-cache store miss rate (percentage)
     pub fn l1_dcache_store_miss_rate(&self) -> f64 {
@@ -263,9 +265,9 @@ impl HwPerfMeasurement {
     }
 
     /// Total TLB misses
-    pub fn total_tlb_misses(&self) -> u64 {
-        self.dtlb_load_misses + self.dtlb_store_misses + self.itlb_load_misses
-    }
+    //pub fn total_tlb_misses(&self) -> u64 {
+    //    self.dtlb_load_misses + self.dtlb_store_misses + self.itlb_load_misses
+    //}
 
     /// Total page faults
     pub fn total_page_faults(&self) -> u64 {
@@ -464,6 +466,7 @@ impl PerfCounterGroup {
         );
         
         // L1 D-cache load misses - High-frequency memory events
+        /* 
         let l1_dcache_load_misses = try_counter!(
             &mut group,
             Cache {
@@ -473,8 +476,11 @@ impl PerfCounterGroup {
             },
             "L1_DCACHE_LOAD_MISSES"
         );
+        */
+
         
         // Data TLB load misses - Page table overhead
+        /* 
         let dtlb_load_misses = try_counter!(
             &mut group,
             Cache {
@@ -484,6 +490,7 @@ impl PerfCounterGroup {
             },
             "DTLB_LOAD_MISSES"
         );
+        */
         
         // ========================================================================
         // DISABLED COUNTERS (to avoid exceeding hardware limits)
@@ -563,12 +570,12 @@ impl PerfCounterGroup {
             else { eprintln!("[DEBUG]   ✗ LLC_LOAD_MISSES (failed to create)"); }
         
             // L1 D-cache load misses
-            if l1_dcache_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_DCACHE_LOAD_MISSES"); }
-            else { eprintln!("[DEBUG]   ✗ L1_DCACHE_LOAD_MISSES (failed to create)"); }
+            //if l1_dcache_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ L1_DCACHE_LOAD_MISSES"); }
+            //else { eprintln!("[DEBUG]   ✗ L1_DCACHE_LOAD_MISSES (failed to create)"); }
         
             // dTLB load misses
-            if dtlb_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_LOAD_MISSES"); }
-            else { eprintln!("[DEBUG]   ✗ DTLB_LOAD_MISSES (failed to create)"); }
+            //if dtlb_load_misses.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ DTLB_LOAD_MISSES"); }
+            //else { eprintln!("[DEBUG]   ✗ DTLB_LOAD_MISSES (failed to create)"); }
             
             // Count of intentionally disabled counters (hardcoded to None above)
             let counters_disabled = 22;  // Total counters (30) - essential counters (8)
@@ -1026,6 +1033,7 @@ impl AggregatedMeasurement {
         }
     }
 
+    /* 
     pub fn l1_dcache_load_miss_rate(&self) -> f64 {
         if self.total_l1_dcache_loads == 0 {
             0.0
@@ -1033,6 +1041,7 @@ impl AggregatedMeasurement {
             (self.total_l1_dcache_load_misses as f64 / self.total_l1_dcache_loads as f64) * 100.0
         }
     }
+    */
 
     pub fn l1_dcache_store_miss_rate(&self) -> f64 {
         if self.total_l1_dcache_stores == 0 {
@@ -1060,6 +1069,7 @@ impl AggregatedMeasurement {
         }
     }
 
+    /*
     pub fn dtlb_miss_rate(&self) -> f64 {
         let total_dtlb = self.total_dtlb_loads + self.total_dtlb_stores;
         let total_dtlb_misses = self.total_dtlb_load_misses + self.total_dtlb_store_misses;
@@ -1069,6 +1079,7 @@ impl AggregatedMeasurement {
             (total_dtlb_misses as f64 / total_dtlb as f64) * 100.0
         }
     }
+    */
 
     pub fn itlb_miss_rate(&self) -> f64 {
         if self.total_itlb_loads == 0 {
