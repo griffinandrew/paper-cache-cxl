@@ -145,9 +145,11 @@ impl PerfCounterGroup {
             })
             .build()?;
 
-    */        let cache_prefetch_miss = None;
+    */       
         
-        Ok((group, cycles, instructions, cache_refs, cache_miss, cache_prefetch_hit, cache_prefetch_miss))
+        //Ok((group, cycles, instructions, cache_refs, cache_miss, cache_prefetch_hit, cache_prefetch_miss))
+
+        Ok((group, cycles, instructions, cache_refs, cache_miss, cache_prefetch_hit))
     }
 
     /// Start measuring performance counters
