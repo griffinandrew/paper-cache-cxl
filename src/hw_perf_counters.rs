@@ -609,7 +609,7 @@ impl PerfCounterGroup {
             stalled_frontend_counter: stalled_frontend,
             stalled_backend_counter: stalled_backend,
             l1_dcache_loads_counter: l1_dcache_loads,
-            l1_dcache_load_misses_counter: l1_dcache_load_misses,
+            //l1_dcache_load_misses_counter: l1_dcache_load_misses,
             l1_dcache_stores_counter: l1_dcache_stores,
             l1_dcache_store_misses_counter: l1_dcache_store_misses,
             l1_icache_loads_counter: l1_icache_loads,
@@ -619,7 +619,7 @@ impl PerfCounterGroup {
             llc_stores_counter: llc_stores,
             llc_store_misses_counter: llc_store_misses,
             dtlb_loads_counter: dtlb_loads,
-            dtlb_load_misses_counter: dtlb_load_misses,
+            //dtlb_load_misses_counter: dtlb_load_misses,
             dtlb_stores_counter: dtlb_stores,
             dtlb_store_misses_counter: dtlb_store_misses,
             itlb_loads_counter: itlb_loads,
@@ -1198,9 +1198,9 @@ impl std::fmt::Display for HwHashMapStats {
             if agg.total_l1_dcache_loads > 0 || agg.total_l1_dcache_stores > 0 {
                 writeln!(f, "  │  L1 D-cache:")?;
                 if agg.total_l1_dcache_loads > 0 {
-                    writeln!(f, "  │    Loads: {} avg, {} misses ({:.2}% miss rate)", 
-                             agg.avg_l1_dcache_loads, agg.avg_l1_dcache_load_misses, 
-                             agg.l1_dcache_load_miss_rate())?;
+                    //writeln!(f, "  │    Loads: {} avg, {} misses ({:.2}% miss rate)", 
+                             //agg.avg_l1_dcache_loads, agg.avg_l1_dcache_load_misses, 
+                             //agg.l1_dcache_load_miss_rate())?;
                 }
                 if agg.total_l1_dcache_stores > 0 {
                     writeln!(f, "  │    Stores: {} avg, {} misses ({:.2}% miss rate)", 
@@ -1234,8 +1234,8 @@ impl std::fmt::Display for HwHashMapStats {
             if agg.total_dtlb_loads > 0 || agg.total_dtlb_stores > 0 {
                 let dtlb_accesses = agg.avg_dtlb_loads + agg.avg_dtlb_stores;
                 let dtlb_misses = agg.avg_dtlb_load_misses + agg.avg_dtlb_store_misses;
-                writeln!(f, "  │  dTLB: {} accesses, {} misses ({:.2}% miss rate)", 
-                         dtlb_accesses, dtlb_misses, agg.dtlb_miss_rate())?;
+                //writeln!(f, "  │  dTLB: {} accesses, {} misses ({:.2}% miss rate)", 
+                         //dtlb_accesses, dtlb_misses, agg.dtlb_miss_rate())?;
             }
             if agg.total_itlb_loads > 0 {
                 writeln!(f, "  │  iTLB: {} accesses, {} misses ({:.2}% miss rate)", 
