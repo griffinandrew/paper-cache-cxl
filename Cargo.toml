@@ -25,3 +25,4 @@ nohash-hasher = "0.2.0"
 serde = { version = "1.0.219", features = ["derive"] }
 rayon = "1.11.0"
 num-traits = "0.2.19"
+perf-event = "0.4.8"
