@@ -639,8 +639,8 @@ impl PerfCounterGroup {
     /// Start measuring performance counters
     pub fn start(&mut self) -> Result<(), String> {
         if let Some(ref mut group) = self.group {
-            group.enable().map_err(|e| format!("Failed to enable counters: {}", e))
             eprintln!("[DEBUG] Performance counters started");
+            group.enable().map_err(|e| format!("Failed to enable counters: {}", e))
         } else {
             eprintln!("[DEBUG] Performance counters not available to start");
             Err("Performance counters not available".to_string())
