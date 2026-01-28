@@ -23,7 +23,7 @@ pub struct HwPerfMeasurement {
     pub cache_references: u64,    // LLC references (Last-Level Cache accesses)
     pub cache_misses: u64,        // LLC misses (Last-Level Cache misses)
     pub cache_prefetches_hits: u64,     // Cache prefetches (if available)
-    pub cache_prefetches_misses: u64,   // Cache prefetch misses (if available)
+    //pub cache_prefetches_misses: u64,   // Cache prefetch misses (if available)
     pub mem_loads: u64,           // Memory load operations (if available)
     pub mem_stores: u64,          // Memory store operations (if available)
 }
@@ -58,7 +58,7 @@ pub struct PerfCounterGroup {
     cache_refs_counter: Option<Counter>,
     cache_miss_counter: Option<Counter>,
     cache_prefetch_hit_counter: Option<Counter>,
-    cache_prefetch_miss_counter: Option<Counter>,
+    //cache_prefetch_miss_counter: Option<Counter>,
 
 }
 impl PerfCounterGroup {
@@ -66,7 +66,8 @@ impl PerfCounterGroup {
     /// Returns a group with available counters (may be limited based on permissions/platform)
     pub fn new() -> Self {
         match Self::try_create_counters() {
-            Ok((group, cycles, instructions, cache_refs, cache_miss, cache_prefetch_hit, cache_prefetch_miss)) => {
+            //Ok((group, cycles, instructions, cache_refs, cache_miss, cache_prefetch_hit, cache_prefetch_miss)) => {
+            Ok((group, cycles, instructions, cache_refs, cache_miss, cache_prefetch_hit)) => {
                 PerfCounterGroup {
                     group: Some(group),
                     cycles_counter: Some(cycles),
@@ -74,7 +75,7 @@ impl PerfCounterGroup {
                     cache_refs_counter: Some(cache_refs),
                     cache_miss_counter: Some(cache_miss),
                     cache_prefetch_hit_counter: Some(cache_prefetch_hit),
-                    cache_prefetch_miss_counter: Some(cache_prefetch_miss),
+                    //cache_prefetch_miss_counter: Some(cache_prefetch_miss),
                 }
             }
             Err(_) => {
@@ -86,13 +87,13 @@ impl PerfCounterGroup {
                     cache_refs_counter: None,
                     cache_miss_counter: None,
                     cache_prefetch_hit_counter: None,
-                    cache_prefetch_miss_counter: None,
+                    //cache_prefetch_miss_counter: None,
                 }
             }
         }
     }
 
-    fn try_create_counters() -> io::Result<(Group, Counter, Counter, Counter, Counter, Counter, Counter)> {
+    fn try_create_counters() -> io::Result<(Group, Counter, Counter, Counter, Counter, Counter)> {
         let mut group = Group::new()?;
         
         // Core CPU metrics - Essential for IPC
@@ -187,9 +188,9 @@ impl PerfCounterGroup {
                 .and_then(|c| c.read().ok())
                 .unwrap_or(0);
 
-            let cache_prefetch_miss = self.cache_prefetch_miss_counter.as_mut()
-                .and_then(|c| c.read().ok())
-                .unwrap_or(0);
+            //let cache_prefetch_miss = self.cache_prefetch_miss_counter.as_mut()
+            //    .and_then(|c| c.read().ok())
+            //    .unwrap_or(0);
             
             Ok(HwPerfMeasurement {
                 cycles,
@@ -199,7 +200,7 @@ impl PerfCounterGroup {
                 mem_loads: 0,   // Would need architecture-specific events
                 mem_stores: 0,  // Would need architecture-specific events
                 cache_prefetches_hits: cache_prefetch_hit,
-                cache_prefetches_misses: cache_prefetch_miss,
+                //cache_prefetches_misses: cache_prefetch_miss,
             })
         } else {
             Err("Performance counters not available".to_string())
@@ -297,7 +298,7 @@ impl HwHashMapCounters {
             let (total_cache_refs, avg_cache_refs) = sum_and_avg!(cache_references);
             let (total_cache_misses, avg_cache_misses) = sum_and_avg!(cache_misses);
             let (total_cache_prefetch_hits, avg_cache_prefetch_hits) = sum_and_avg!(cache_prefetches_hits);
-            let (total_cache_prefetch_misses, avg_cache_prefetch_misses) = sum_and_avg!(cache_prefetches_misses);
+            //let (total_cache_prefetch_misses, avg_cache_prefetch_misses) = sum_and_avg!(cache_prefetches_misses);
 
             AggregatedMeasurement {
                 count,
@@ -310,9 +311,9 @@ impl HwHashMapCounters {
                 avg_cache_refs,
                 avg_cache_misses,
                 total_cache_prefetch_hits,
-                total_cache_prefetch_misses,
+                //total_cache_prefetch_misses,
                 avg_cache_prefetch_hits,
-                avg_cache_prefetch_misses,
+                //avg_cache_prefetch_misses,
             }
         } else {
             AggregatedMeasurement::default()
@@ -343,9 +344,9 @@ pub struct AggregatedMeasurement {
     pub avg_cache_refs: u64,
     pub avg_cache_misses: u64,
     pub total_cache_prefetch_hits: u64,
-    pub total_cache_prefetch_misses: u64,
+    //pub total_cache_prefetch_misses: u64,
     pub avg_cache_prefetch_hits: u64,
-    pub avg_cache_prefetch_misses: u64,
+    //pub avg_cache_prefetch_misses: u64,
 }
 
 impl AggregatedMeasurement {
@@ -408,12 +409,12 @@ impl HwHashMapStats {
         self.has.total_cache_prefetch_hits
     }
 
-    pub fn total_cache_prefetch_misses(&self) -> u64 {
-        self.get.total_cache_prefetch_misses + 
-        self.set.total_cache_prefetch_misses + 
-        self.del.total_cache_prefetch_misses + 
-        self.has.total_cache_prefetch_misses
-    }
+    // pub fn total_cache_prefetch_misses(&self) -> u64 {
+    //     self.get.total_cache_prefetch_misses + 
+    //     self.set.total_cache_prefetch_misses + 
+    //     self.del.total_cache_prefetch_misses + 
+    //     self.has.total_cache_prefetch_misses
+    //}
 }
 
 impl std::fmt::Display for HwHashMapStats {
@@ -428,7 +429,7 @@ impl std::fmt::Display for HwHashMapStats {
                      100.0 * self.total_cache_misses() as f64 / self.total_cache_refs() as f64
                  } else { 0.0 })?;
         writeln!(f, "  Total Cache Prefetch Hits: {}", self.total_cache_prefetch_hits())?;
-        writeln!(f, "  Total Cache Prefetch Misses: {}", self.total_cache_prefetch_misses())?;
+        //writeln!(f, "  Total Cache Prefetch Misses: {}", self.total_cache_prefetch_misses())?;
         writeln!(f)?;
         
         // Helper closure to print operation details
@@ -446,7 +447,7 @@ impl std::fmt::Display for HwHashMapStats {
             writeln!(f, "  │  LLC Misses: {} avg, {} total ({:.2}% miss rate)", 
                      agg.avg_cache_misses, agg.total_cache_misses, agg.cache_miss_rate())?;
             writeln!(f, "  │  LLC Cache Prefetch Hits: {} avg, {} total", agg.avg_cache_prefetch_hits, agg.total_cache_prefetch_hits)?;
-            writeln!(f, "  │  LLC Cache Prefetch Misses: {} avg, {} total", agg.avg_cache_prefetch_misses, agg.total_cache_prefetch_misses)?;
+            //writeln!(f, "  │  LLC Cache Prefetch Misses: {} avg, {} total", agg.avg_cache_prefetch_misses, agg.total_cache_prefetch_misses)?;
             
             writeln!(f)?;
             Ok(())
