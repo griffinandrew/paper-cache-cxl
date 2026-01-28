@@ -650,6 +650,7 @@ impl PerfCounterGroup {
     /// Stop measuring and return the results
     pub fn stop(&mut self, start_time: Instant) -> Result<HwPerfMeasurement, String> {
         if let Some(ref mut group) = self.group {
+            eprintln!("[DEBUG] Performance counters stopping and reading values");
             group.disable().map_err(|e| format!("Failed to disable counters: {}", e))?;
             
             let duration = start_time.elapsed();
@@ -669,43 +670,52 @@ impl PerfCounterGroup {
             
             Ok(HwPerfMeasurement {
                 // Timing
+                eprintln!("[DEBUG] Measurement duration: {:?} ns", duration.as_nanos());
                 duration_ns: duration.as_nanos() as u64,
                 timestamp_ns: timestamp,
                 
                 // Core CPU metrics
+                eprintln!("[DEBUG] Reading CPU cycles and instructions");
                 cycles: read_counter!(self.cycles_counter),
                 instructions: read_counter!(self.instructions_counter),
                 ref_cpu_cycles: read_counter!(self.ref_cycles_counter),
                 
                 // Branch prediction
+                eprintln!("[DEBUG] Reading branch prediction counters");
                 branch_instructions: read_counter!(self.branch_instructions_counter),
                 branch_misses: read_counter!(self.branch_misses_counter),
                 
                 // Pipeline stalls
+                eprintln!("[DEBUG] Reading pipeline stall counters");
                 stalled_cycles_frontend: read_counter!(self.stalled_frontend_counter),
                 stalled_cycles_backend: read_counter!(self.stalled_backend_counter),
                 
                 // Generic cache
+                eprintln!("[DEBUG] Reading generic cache counters");
                 cache_references: read_counter!(self.cache_refs_counter),
                 cache_misses: read_counter!(self.cache_miss_counter),
                 
                 // L1 D-cache
+                eprintln!("[DEBUG] Reading L1 D-cache counters");
                 l1_dcache_loads: read_counter!(self.l1_dcache_loads_counter),
                 l1_dcache_load_misses: read_counter!(self.l1_dcache_load_misses_counter),
                 l1_dcache_stores: read_counter!(self.l1_dcache_stores_counter),
                 l1_dcache_store_misses: read_counter!(self.l1_dcache_store_misses_counter),
                 
                 // L1 I-cache
+                eprintln!("[DEBUG] Reading L1 I-cache counters");
                 l1_icache_loads: read_counter!(self.l1_icache_loads_counter),
                 l1_icache_load_misses: read_counter!(self.l1_icache_load_misses_counter),
                 
                 // LLC
+                eprintln!("[DEBUG] Reading LLC counters");
                 llc_loads: read_counter!(self.llc_loads_counter),
                 llc_load_misses: read_counter!(self.llc_load_misses_counter),
                 llc_stores: read_counter!(self.llc_stores_counter),
                 llc_store_misses: read_counter!(self.llc_store_misses_counter),
                 
                 // TLB
+                eprintln!("[DEBUG] Reading TLB counters");
                 dtlb_loads: read_counter!(self.dtlb_loads_counter),
                 dtlb_load_misses: read_counter!(self.dtlb_load_misses_counter),
                 dtlb_stores: read_counter!(self.dtlb_stores_counter),
@@ -714,6 +724,7 @@ impl PerfCounterGroup {
                 itlb_load_misses: read_counter!(self.itlb_load_misses_counter),
                 
                 // Software events
+                eprintln!("[DEBUG] Reading software event counters");
                 page_faults: read_counter!(self.page_faults_counter),
                 page_faults_min: read_counter!(self.page_faults_min_counter),
                 page_faults_maj: read_counter!(self.page_faults_maj_counter),
