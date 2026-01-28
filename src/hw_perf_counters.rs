@@ -680,7 +680,7 @@ impl PerfCounterGroup {
             // Read all counter values from the group at once
             // This is the correct way to read counters that are part of a group
             let counts = group.read().map_err(|e| format!("Failed to read group counters: {}", e))?;
-            
+            eprintln!("[DEBUG] counts: {:?}", counts);
             // Helper macro to read counter value from the group's Counts object
             macro_rules! read_counter {
                 ($counter:expr) => {
