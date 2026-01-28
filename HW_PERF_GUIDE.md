@@ -14,42 +14,40 @@ cargo build --features hw_perf_counters
 
 **Hardware Limitation**: Most CPUs support only ~8 simultaneous performance counters. When more counters are requested, the kernel multiplexes them (time-slices), reducing accuracy and adding overhead.
 
-**Our Approach**: This implementation is optimized to use only **8 essential counters** focused on memory access patterns for hashtables:
+**Our Approach**: This implementation is optimized to use only **6 essential counters** focused on memory access patterns for hashtables:
 
-### 8 Essential Counters (Active)
+### 6 Essential Counters (Active)
 
 1. **CPU_CYCLES** - Overall execution time baseline
 2. **INSTRUCTIONS** - For calculating IPC (Instructions Per Cycle)
-3. **CACHE_REFERENCES** - Total cache activity across all levels
-4. **CACHE_MISSES** - Overall cache miss rate
-5. **LLC_LOADS** - Last-level cache load accesses
-6. **LLC_LOAD_MISSES** - LLC misses (indicates main memory pressure)
-7. **L1_DCACHE_LOAD_MISSES** - L1 data cache misses (high-frequency events)
-8. **DTLB_LOAD_MISSES** - Data TLB misses (page table overhead)
+3. **CACHE_REFERENCES (LLC)** - Last-Level Cache references only (using WhichCache::LL)
+4. **CACHE_MISSES (LLC)** - Last-Level Cache misses only (using WhichCache::LL)
+5. **LLC_LOADS** - Last-level cache load accesses (same as item 3, kept for backwards compatibility)
+6. **LLC_LOAD_MISSES** - LLC load misses (same as item 4, kept for backwards compatibility)
 
-These 8 counters provide critical insights into:
+**Note**: CACHE_REFERENCES and CACHE_MISSES have been updated to specifically track LLC (Last-Level Cache) only, using `WhichCache::LL` from the perf-event crate. This ensures precise tracking of LLC behavior rather than aggregate cache statistics across all levels. Items 3-4 and 5-6 measure the same events but are kept as separate counters for backwards compatibility with code that uses both field sets.
+
+These 6 counters provide critical insights into:
 - **CPU efficiency** (IPC from cycles/instructions)
-- **Overall cache behavior** (generic references/misses)
-- **Memory hierarchy performance** (LLC and L1 D-cache)
-- **Address translation overhead** (TLB misses)
+- **LLC cache behavior** (precise LLC references/misses using WhichCache::LL)
+- **Memory hierarchy performance** (LLC loads and load misses)
 
-### Counters Intentionally Disabled (22 total)
+### Counters Intentionally Disabled (24 total)
 
 To avoid multiplexing overhead, the following are **not** created:
 - Reference CPU cycles
 - Branch prediction metrics
 - Pipeline stall counters (not supported on all platforms)
-- L1 cache load/store access counts (keeping only miss counts)
-- L1 instruction cache metrics
+- L1 cache metrics (all L1 D-cache and I-cache counters disabled)
 - LLC store operations (keeping only loads)
-- dTLB/iTLB access counts (keeping only load misses)
+- TLB metrics (all dTLB and iTLB counters disabled)
 - Software events (page faults, context switches)
 
-> **Note**: The struct fields for all counters remain in the code for backward compatibility, but only the 8 essential counters are actually created and measured.
+> **Note**: The struct fields for all counters remain in the code for backward compatibility, but only the 6 essential counters are actually created and measured.
 
 ## What Gets Measured
 
-The following sections describe all the metrics that **could** be measured. In practice, only the 8 essential counters listed above are active.
+The following sections describe all the metrics that **could** be measured. In practice, only the 6 essential counters listed above are active.
 
 ### Timing & Duration
 - **Wall-clock duration** - Nanosecond precision timing for each operation
@@ -189,6 +187,38 @@ cat /proc/sys/kernel/perf_event_paranoid
 
 If performance counters are returning all zeros or `None`, use the debug mode to diagnose the issue:
 
+### Common Issue: Counters Return Zero Despite Being Created
+
+**Symptom**: Debug output shows counters are created successfully (✓) but all values are 0.
+
+**Root Cause**: When counters are part of a `Group`, they must be read using `group.read()` to get a `Counts` object, then individual counter values are retrieved by indexing into the `Counts` object. Calling `.read()` directly on individual counters does not work for grouped counters.
+
+**Fix Applied**: The implementation now correctly uses `group.read()` and retrieves values with `counts.get(counter)`. This follows the proper perf-event API usage as demonstrated in the crate's examples.
+
+**Example of Correct Usage**:
+```rust
+// Enable and run the operation
+group.enable()?;
+// ... do work ...
+group.disable()?;
+
+// Read all counters from the group (CORRECT)
+let counts = group.read()?;
+
+// Get individual counter values (CORRECT)
+if let Some(ref cycles_counter) = cycles {
+    let cycles_value = counts.get(cycles_counter).copied().unwrap_or(0);
+}
+```
+
+**Example of Incorrect Usage** (will return 0):
+```rust
+// WRONG: Reading individual counter directly
+if let Some(mut cycles_counter) = cycles {
+    let cycles_value = cycles_counter.read()?; // This doesn't work for grouped counters!
+}
+```
+
 ### Debug Mode
 
 Set the `PAPER_CACHE_DEBUG_PERF` environment variable to enable debug output:
@@ -198,23 +228,21 @@ Set the `PAPER_CACHE_DEBUG_PERF` environment variable to enable debug output:
 PAPER_CACHE_DEBUG_PERF=1 cargo run --example hw_perf_demo --features hw_perf_counters
 ```
 
-Output shows (optimized to 8 essential counters):
+Output shows (optimized to 6 essential counters):
 ```
 [DEBUG] Successfully created performance counter group
-[DEBUG] Performance counter creation summary (limited to 8 essential counters):
+[DEBUG] Performance counter creation summary (limited to 6 essential counters):
 [DEBUG] 
 [DEBUG] === ESSENTIAL COUNTERS (attempting to create) ===
 [DEBUG]   ✓ CPU_CYCLES
 [DEBUG]   ✓ INSTRUCTIONS
-[DEBUG]   ✓ CACHE_REFERENCES
-[DEBUG]   ✓ CACHE_MISSES
+[DEBUG]   ✓ CACHE_REFERENCES (LLC)
+[DEBUG]   ✓ CACHE_MISSES (LLC)
 [DEBUG]   ✓ LLC_LOADS
 [DEBUG]   ✓ LLC_LOAD_MISSES
-[DEBUG]   ✓ L1_DCACHE_LOAD_MISSES
-[DEBUG]   ✓ DTLB_LOAD_MISSES
 [DEBUG] 
-[DEBUG] Counter creation complete: 8 enabled, 22 disabled (to avoid multiplexing)
-[DEBUG] Note: 22 counters are intentionally disabled to stay within hardware limits (~8 counters)
+[DEBUG] Counter creation complete: 6 enabled, 24 disabled (to avoid multiplexing)
+[DEBUG] Note: 24 counters are intentionally disabled to stay within hardware limits (~6-8 counters)
 ```
 
 #### Verbose Debug Info (Detailed Errors)
@@ -222,13 +250,13 @@ Output shows (optimized to 8 essential counters):
 PAPER_CACHE_DEBUG_PERF=verbose cargo run --example hw_perf_demo --features hw_perf_counters
 ```
 
-Output shows detailed error for each of the 8 essential counters (not all 30):
+Output shows detailed error for each of the 6 essential counters (not all 30):
 ```
 [DEBUG] Successfully created performance counter group
 [DEBUG]   Counter CPU_CYCLES failed: No such file or directory (os error 2)
 [DEBUG]   Counter INSTRUCTIONS failed: No such file or directory (os error 2)
-[DEBUG]   Counter CACHE_REFERENCES failed: No such file or directory (os error 2)
-... (8 counters total, not 30)
+[DEBUG]   Counter CACHE_REFERENCES (LLC) failed: No such file or directory (os error 2)
+... (6 counters total, not 30)
 ```
 
 ### Common Error Messages
@@ -245,13 +273,13 @@ Output shows detailed error for each of the 8 essential counters (not all 30):
 **Solution**:
 - Run on bare metal hardware for full counter support
 - Some VMs support PMU passthrough - check hypervisor settings
-- Note: Even when unavailable, only the 8 essential counters are attempted (not all 30)
+- Note: Even when unavailable, only the 6 essential counters are attempted (not all 30)
 
 #### "Failed to create performance counter group"
 **Cause**: The perf_event subsystem couldn't create a group.  
 **Solution**: Check if you're in a restricted environment (container, VM) and verify perf_event_paranoid settings.
 
-### Why Only 8 Counters?
+### Why Only 6 Counters?
 
 Hardware performance monitoring units (PMUs) typically support only 4-8 simultaneous counters. When you request more:
 - **Kernel multiplexes** counters (time-slices them)
@@ -259,7 +287,7 @@ Hardware performance monitoring units (PMUs) typically support only 4-8 simultan
 - **Accuracy decreases** due to time-slicing
 - **Results become less reliable**
 
-By limiting to 8 essential memory-focused counters, we ensure:
+By limiting to 6 essential memory-focused counters, we ensure:
 - ✓ **No multiplexing** - all counters run simultaneously
 - ✓ **Maximum accuracy** - no time-slicing artifacts  
 - ✓ **Consistent measurements** - no scheduling effects
