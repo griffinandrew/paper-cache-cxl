@@ -135,6 +135,7 @@ impl PerfCounterGroup {
             })
             .build()?;
 
+        /*
         let cache_prefetch_miss = Builder::new()
             .group(&mut group)
             .kind(Cache {
@@ -143,6 +144,8 @@ impl PerfCounterGroup {
                 result: CacheResult::MISS,
             })
             .build()?;
+
+    */        let cache_prefetch_miss = None;
         
         Ok((group, cycles, instructions, cache_refs, cache_miss, cache_prefetch_hit, cache_prefetch_miss))
     }
