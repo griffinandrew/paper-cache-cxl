@@ -124,20 +124,20 @@ impl PerfCounterGroup {
         match Self::try_create_essential_counters() {
             Ok((group, cycles, instructions, cache_refs, cache_miss, llc_loads, llc_load_misses)) => {
                 eprintln!("[DEBUG] Successfully created performance counter group");
-                eprintln!("[DEBUG] Performance counter creation summary (limited to 8 essential counters):");
+                eprintln!("[DEBUG] Performance counter creation summary:");
                 eprintln!("[DEBUG] ");
-                eprintln!("[DEBUG] === ESSENTIAL COUNTERS (attempting to create) ===");
+                eprintln!("[DEBUG] === ESSENTIAL COUNTERS (6 total) ===");
                 
                 eprintln!("[DEBUG]   ✓ CPU_CYCLES");
                 eprintln!("[DEBUG]   ✓ INSTRUCTIONS");
                 eprintln!("[DEBUG]   ✓ CACHE_REFERENCES");
                 eprintln!("[DEBUG]   ✓ CACHE_MISSES");
-                eprintln!("[DEBUG]   ✓ LLC_LOADS");
-                eprintln!("[DEBUG]   ✓ LLC_LOAD_MISSES");
+                eprintln!("[DEBUG]   ✓ LLC_LOADS (WhichCache::LL)");
+                eprintln!("[DEBUG]   ✓ LLC_LOAD_MISSES (WhichCache::LL)");
                 
                 eprintln!("[DEBUG] ");
-                eprintln!("[DEBUG] Counter creation complete: 6 enabled, 24 disabled (to avoid multiplexing)");
-                eprintln!("[DEBUG] Note: 24 counters are intentionally disabled to stay within hardware limits (~6-8 counters)");
+                eprintln!("[DEBUG] Counter creation complete: 6 enabled");
+                eprintln!("[DEBUG] Note: Limited to 6 counters to stay within hardware limits and avoid multiplexing");
                 
                 PerfCounterGroup {
                     group: Some(group),
@@ -680,21 +680,21 @@ pub fn get_hw_counters() -> &'static GlobalHwPerfCounters {
 }
 
 /// Get hardware statistics for the active hashmap configuration
-pub fn get_hw_hashmap_stats() -> Option<HwHashMapStats> {
+/// 
+/// Returns statistics even if hardware counters are unavailable (all values will be 0).
+/// This allows code to uniformly handle the statistics without checking availability first.
+pub fn get_hw_hashmap_stats() -> HwHashMapStats {
     let counters = get_hw_counters();
-    Some(counters.global_hashbrown_dram.get_stats())
+    counters.global_hashbrown_dram.get_stats()
 }
 
 /// Print hardware performance statistics
 pub fn print_hw_perf_stats() {
     println!("\n=== Hardware Performance Counter Statistics ===\n");
     
-    if let Some(stats) = get_hw_hashmap_stats() {
-        println!("Global HashMap (hashbrown in DRAM):");
-        print!("{}", stats);
-    } else {
-        println!("No hardware performance counters available");
-    }
+    let stats = get_hw_hashmap_stats();
+    println!("Global HashMap (hashbrown in DRAM):");
+    print!("{}", stats);
     
     println!("\n===============================================\n");
 }

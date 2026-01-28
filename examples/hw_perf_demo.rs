@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Available counters:");
         println!("  Cycles: {}", if measurement.cycles > 0 { "✓" } else { "✗" });
         println!("  Instructions: {}", if measurement.instructions > 0 { "✓" } else { "✗" });
-        println!("  Branch tracking: {}", if measurement.branch_instructions > 0 { "✗" } else { "✗" });
+        println!("  Branch tracking: ✗");  // Not tracked in this implementation
         println!("  L1 D-cache: {}", if measurement.l1_dcache_loads > 0 { "✓" } else { "✗" });
         println!("  LLC: {}", if measurement.llc_loads > 0 { "✓" } else { "✗" });
         println!("  TLB: {}", if measurement.dtlb_loads > 0 { "✓" } else { "✗" });
