@@ -586,7 +586,7 @@ impl PerfCounterGroup {
             
             eprintln!("[DEBUG] ");
             eprintln!("[DEBUG] Counter creation complete: {} enabled, {} disabled (to avoid multiplexing)", counters_created, counters_disabled);
-            eprintln!("[DEBUG] Note: {} counters are intentionally disabled to stay within hardware limits (~8 counters)", counters_disabled);
+            eprintln!("[DEBUG] Note: {} counters are intentionally disabled to stay within hardware limits (~6-8 counters)", counters_disabled);
             
             // Provide helpful context based on what succeeded/failed
             if counters_created == 0 {
@@ -640,7 +640,9 @@ impl PerfCounterGroup {
     pub fn start(&mut self) -> Result<(), String> {
         if let Some(ref mut group) = self.group {
             group.enable().map_err(|e| format!("Failed to enable counters: {}", e))
+            eprintln!("[DEBUG] Performance counters started");
         } else {
+            eprintln!("[DEBUG] Performance counters not available to start");
             Err("Performance counters not available".to_string())
         }
     }
