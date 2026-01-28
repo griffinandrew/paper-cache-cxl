@@ -441,9 +441,26 @@ impl PerfCounterGroup {
         let cycles = try_counter!(&mut group, Hardware::CPU_CYCLES, "CPU_CYCLES");
         let instructions = try_counter!(&mut group, Hardware::INSTRUCTIONS, "INSTRUCTIONS");
         
-        // Generic cache metrics - Overall cache behavior
-        let cache_refs = try_counter!(&mut group, Hardware::CACHE_REFERENCES, "CACHE_REFERENCES");
-        let cache_miss = try_counter!(&mut group, Hardware::CACHE_MISSES, "CACHE_MISSES");
+        // LLC cache metrics - Track Last-Level Cache only (as per requirements)
+        // Using WhichCache::LL to ensure we're only tracking LLC, not all cache levels
+        let cache_refs = try_counter!(
+            &mut group,
+            Cache {
+                which: WhichCache::LL,
+                operation: CacheOp::READ,
+                result: CacheResult::ACCESS,
+            },
+            "CACHE_REFERENCES (LLC)"
+        );
+        let cache_miss = try_counter!(
+            &mut group,
+            Cache {
+                which: WhichCache::LL,
+                operation: CacheOp::READ,
+                result: CacheResult::MISS,
+            },
+            "CACHE_MISSES (LLC)"
+        );
         
         // LLC (Last-Level Cache) - Critical for memory performance
         let llc_loads = try_counter!(
@@ -559,12 +576,12 @@ impl PerfCounterGroup {
             if instructions.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ INSTRUCTIONS"); }
             else { eprintln!("[DEBUG]   ✗ INSTRUCTIONS (failed to create)"); }
         
-            // Cache metrics
-            if cache_refs.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CACHE_REFERENCES"); }
-            else { eprintln!("[DEBUG]   ✗ CACHE_REFERENCES (failed to create)"); }
+            // Cache metrics (LLC only)
+            if cache_refs.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CACHE_REFERENCES (LLC)"); }
+            else { eprintln!("[DEBUG]   ✗ CACHE_REFERENCES (LLC) (failed to create)"); }
         
-            if cache_miss.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CACHE_MISSES"); }
-            else { eprintln!("[DEBUG]   ✗ CACHE_MISSES (failed to create)"); }
+            if cache_miss.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ CACHE_MISSES (LLC)"); }
+            else { eprintln!("[DEBUG]   ✗ CACHE_MISSES (LLC) (failed to create)"); }
         
             // LLC
             if llc_loads.is_some() { counters_created += 1; eprintln!("[DEBUG]   ✓ LLC_LOADS"); }
@@ -659,11 +676,15 @@ impl PerfCounterGroup {
                 .unwrap_or_default()
                 .as_nanos() as u64;
             
-            // Helper macro to read counter value
+            // Read all counter values from the group at once
+            // This is the correct way to read counters that are part of a group
+            let counts = group.read().map_err(|e| format!("Failed to read group counters: {}", e))?;
+            
+            // Helper macro to read counter value from the group's Counts object
             macro_rules! read_counter {
                 ($counter:expr) => {
-                    $counter.as_mut()
-                        .and_then(|c| c.read().ok())
+                    $counter.as_ref()
+                        .and_then(|c| counts.get(c).copied())
                         .unwrap_or(0)
                 };
             }
@@ -690,8 +711,8 @@ impl PerfCounterGroup {
                 stalled_cycles_frontend: read_counter!(self.stalled_frontend_counter),
                 stalled_cycles_backend: read_counter!(self.stalled_backend_counter),
                 
-                // Generic cache
-                //eprintln!("[DEBUG] Reading generic cache counters");
+                // LLC cache (note: cache_references and cache_misses now track LLC only)
+                //eprintln!("[DEBUG] Reading LLC cache counters");
                 cache_references: read_counter!(self.cache_refs_counter),
                 cache_misses: read_counter!(self.cache_miss_counter),
                 
@@ -707,8 +728,8 @@ impl PerfCounterGroup {
                 l1_icache_loads: read_counter!(self.l1_icache_loads_counter),
                 l1_icache_load_misses: read_counter!(self.l1_icache_load_misses_counter),
                 
-                // LLC
-                //eprintln!("[DEBUG] Reading LLC counters");
+                // LLC detailed metrics
+                //eprintln!("[DEBUG] Reading LLC detailed counters");
                 llc_loads: read_counter!(self.llc_loads_counter),
                 llc_load_misses: read_counter!(self.llc_load_misses_counter),
                 llc_stores: read_counter!(self.llc_stores_counter),
