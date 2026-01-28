@@ -16,16 +16,16 @@ cargo build --features hw_perf_counters
 
 **Our Approach**: This implementation is optimized to use only **6 essential counters** focused on memory access patterns for hashtables:
 
-### 8 Essential Counters (Active)
+### 6 Essential Counters (Active)
 
 1. **CPU_CYCLES** - Overall execution time baseline
 2. **INSTRUCTIONS** - For calculating IPC (Instructions Per Cycle)
 3. **CACHE_REFERENCES (LLC)** - Last-Level Cache references only (using WhichCache::LL)
 4. **CACHE_MISSES (LLC)** - Last-Level Cache misses only (using WhichCache::LL)
-5. **LLC_LOADS** - Last-level cache load accesses
-6. **LLC_LOAD_MISSES** - LLC misses (indicates main memory pressure)
+5. **LLC_LOADS** - Last-level cache load accesses (same as item 3, kept for backwards compatibility)
+6. **LLC_LOAD_MISSES** - LLC load misses (same as item 4, kept for backwards compatibility)
 
-**Note**: CACHE_REFERENCES and CACHE_MISSES have been updated to specifically track LLC (Last-Level Cache) only, using `WhichCache::LL` from the perf-event crate. This ensures precise tracking of LLC behavior rather than aggregate cache statistics across all levels.
+**Note**: CACHE_REFERENCES and CACHE_MISSES have been updated to specifically track LLC (Last-Level Cache) only, using `WhichCache::LL` from the perf-event crate. This ensures precise tracking of LLC behavior rather than aggregate cache statistics across all levels. Items 3-4 and 5-6 measure the same events but are kept as separate counters for backwards compatibility with code that uses both field sets.
 
 These 6 counters provide critical insights into:
 - **CPU efficiency** (IPC from cycles/instructions)

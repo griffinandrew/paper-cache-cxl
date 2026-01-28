@@ -424,17 +424,19 @@ impl PerfCounterGroup {
         }
         
         // ========================================================================
-        // ESSENTIAL 8 COUNTERS FOR MEMORY PERFORMANCE ANALYSIS
+        // ESSENTIAL 6 COUNTERS FOR MEMORY PERFORMANCE ANALYSIS
         // ========================================================================
-        // Hardware typically supports only ~8 simultaneous counters without
-        // multiplexing. These 8 counters provide the most critical insights
+        // Hardware typically supports only ~6-8 simultaneous counters without
+        // multiplexing. These 6 counters provide the most critical insights
         // for understanding hashtable memory access patterns:
         //
         // 1-2: CPU execution metrics (cycles, instructions) -> IPC
-        // 3-4: Generic cache activity (references, misses) -> overall cache behavior
-        // 5-6: LLC performance (loads, load misses) -> main memory pressure
-        // 7:   L1 D-cache misses -> L1 cache efficiency
-        // 8:   Data TLB misses -> page table overhead
+        // 3-4: LLC cache activity (references, misses) -> LLC cache behavior
+        // 5-6: LLC load performance (loads, load misses) -> memory read patterns
+        //
+        // Note: cache_references/misses and llc_loads/load_misses both track LLC,
+        // but are kept separate for backwards compatibility with existing code
+        // that uses both fields.
         // ========================================================================
         
         // Core CPU metrics - Essential for IPC and baseline timing
@@ -563,9 +565,8 @@ impl PerfCounterGroup {
         // Debug: Report which counters were successfully created (only if debug enabled)
         if debug_enabled {
             let mut counters_created = 0;
-            let mut counters_disabled = 0;
             
-            eprintln!("[DEBUG] Performance counter creation summary (limited to 8 essential counters):");
+            eprintln!("[DEBUG] Performance counter creation summary (limited to 6 essential counters):");
             eprintln!("[DEBUG] ");
             eprintln!("[DEBUG] === ESSENTIAL COUNTERS (attempting to create) ===");
             
@@ -599,7 +600,7 @@ impl PerfCounterGroup {
             //else { eprintln!("[DEBUG]   ✗ DTLB_LOAD_MISSES (failed to create)"); }
             
             // Count of intentionally disabled counters (hardcoded to None above)
-            let counters_disabled = 24;  // Total counters (30) - essential counters (8)
+            let counters_disabled = 24;  // Total counters (30) - essential counters (6)
             
             eprintln!("[DEBUG] ");
             eprintln!("[DEBUG] Counter creation complete: {} enabled, {} disabled (to avoid multiplexing)", counters_created, counters_disabled);
