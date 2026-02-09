@@ -68,7 +68,7 @@ pub mod tiering;
 #[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
 pub mod flatmap;
 
-
+#[cfg(any(feature = "global_hashtable_pmem", feature = "alloc_api_exp", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "hashbrown_dram"))]
 use std::sync::RwLock;
 
 use std::{

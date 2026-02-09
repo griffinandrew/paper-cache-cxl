@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+#[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager", not(feature = "tiering_hashtable_pmem")))]
 use dashmap::DashMap;
 use typesize::TypeSize;
 
@@ -681,7 +682,7 @@ mod tests {
 
     #[test]
     fn test_tiering_manager_creation() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, u64> = TieringManager::with_defaults();
         let stats = manager.stats();
 
         assert_eq!(stats.dram_objects, 0);
@@ -692,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_register_object() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, u64> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
 
@@ -703,7 +704,7 @@ mod tests {
 
     #[test]
     fn test_promote_to_dram() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, u64> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
         assert!(manager.promote_to_dram(1));
@@ -717,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_demote_from_dram() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, u64> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
         manager.promote_to_dram(1);
@@ -737,8 +738,9 @@ mod tests {
             high_water_mark: 0.9,
             low_water_mark: 0.7,
             hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
         };
-        let manager = TieringManager::new(config);
+        let manager: TieringManager<u64, u64> = TieringManager::new(config);
 
         // Promote two objects, total 200 bytes (at threshold)
         manager.register_object(1, 100);
@@ -757,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_remove_object() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, u64> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
         manager.promote_to_dram(1);
@@ -770,7 +772,7 @@ mod tests {
 
     #[test]
     fn test_access_recording() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, u64> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
 
@@ -785,7 +787,7 @@ mod tests {
     fn test_configurable_hotness_threshold() {
         let mut config = TieringConfig::default();
         config.hotness_threshold = 3;
-        let manager = TieringManager::new(config);
+        let manager: TieringManager<u64, u64> = TieringManager::new(config);
 
         manager.register_object(1, 100);
 
@@ -804,8 +806,9 @@ mod tests {
             high_water_mark: 0.9,
             low_water_mark: 0.6,
             hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
         };
-        let manager = TieringManager::new(config);
+        let manager: TieringManager<u64, u64> = TieringManager::new(config);
 
         // Register and promote 4 objects
         for i in 1..=4 {
@@ -825,7 +828,7 @@ mod tests {
 
     #[test]
     fn test_set_and_get_hotness_threshold() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, u64> = TieringManager::with_defaults();
         
         assert_eq!(manager.hotness_threshold(), 2);
         
