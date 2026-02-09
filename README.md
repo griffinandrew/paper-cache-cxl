@@ -10,6 +10,8 @@ Here we will add a custom basic hashmap because the architecture of the swissmap
 
 This branch will add the needed instrumentation to count how many memory accesses are performed to the hashmap
 
+add support for tiering the hash table acorss memory levels
+
 ## Performance Counters
 
 PaperCache includes **two types** of performance counters to track memory access patterns for hashmap structures with both DRAM and PMEM configurations.
