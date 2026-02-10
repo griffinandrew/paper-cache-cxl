@@ -135,7 +135,7 @@ pub type AtomicCacheSize = AtomicU64;
 pub type HashedKey = u64;
 pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 
-#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "hashtable_tiering_all_flatmap"))]
 pub type BufferPMEM = Box<[u8], Hybrid>;
 
 
