@@ -74,6 +74,9 @@ perf_counters = []
 # Hardware performance counters using Linux perf_event (requires Linux, may need permissions)
 hw_perf_counters = ["perf-event"]
 
+# Hashtable tiering: Allows warm objects to have metadata in DRAM while data remains in CXL
+hashtable_tiering = []
+
 # Legacy features (deprecated, will be removed)
 default = []
 original = []
