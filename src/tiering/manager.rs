@@ -820,10 +820,13 @@ mod tests {
 
         manager.register_object(1, 100);
 
-        // First access - should not promote yet (threshold is 2)
+        // First access - should not promote yet (default threshold is 3)
         assert!(!manager.record_access(1));
 
-        // Second access - should suggest promotion
+        // Second access - still should not promote
+        assert!(!manager.record_access(1));
+
+        // Third access - should suggest promotion
         assert!(manager.record_access(1));
     }
 
