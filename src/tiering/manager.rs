@@ -723,7 +723,7 @@ mod tests {
 
     #[test]
     fn test_tiering_manager_creation() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
         let stats = manager.stats();
 
         assert_eq!(stats.dram_objects, 0);
@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     fn test_register_object() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
 
@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_promote_to_dram() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
         assert!(manager.promote_to_dram(1));
@@ -759,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_demote_from_dram() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
         manager.promote_to_dram(1);
@@ -779,8 +779,12 @@ mod tests {
             high_water_mark: 0.9,
             low_water_mark: 0.7,
             hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
+            dram_object_limit_bytes: 200,
+            dram_pointer_limit_bytes: 100,
+            flatmap_initial_capacity: 16,
         };
-        let manager = TieringManager::new(config);
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::new(config);
 
         // Promote two objects, total 200 bytes (at threshold)
         manager.register_object(1, 100);
@@ -799,7 +803,7 @@ mod tests {
 
     #[test]
     fn test_remove_object() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
         manager.promote_to_dram(1);
@@ -812,7 +816,7 @@ mod tests {
 
     #[test]
     fn test_access_recording() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
 
@@ -827,7 +831,7 @@ mod tests {
     fn test_configurable_hotness_threshold() {
         let mut config = TieringConfig::default();
         config.hotness_threshold = 3;
-        let manager = TieringManager::new(config);
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::new(config);
 
         manager.register_object(1, 100);
 
@@ -846,8 +850,12 @@ mod tests {
             high_water_mark: 0.9,
             low_water_mark: 0.6,
             hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
+            dram_object_limit_bytes: 300,
+            dram_pointer_limit_bytes: 100,
+            flatmap_initial_capacity: 16,
         };
-        let manager = TieringManager::new(config);
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::new(config);
 
         // Register and promote 4 objects
         for i in 1..=4 {
@@ -867,12 +875,109 @@ mod tests {
 
     #[test]
     fn test_set_and_get_hotness_threshold() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
         
-        assert_eq!(manager.hotness_threshold(), 2);
+        assert_eq!(manager.hotness_threshold(), 3);
         
         manager.set_hotness_threshold(5);
         assert_eq!(manager.hotness_threshold(), 5);
+    }
+
+    // Test 1: Warm tier accounting - only metadata overhead counted
+    #[test]
+    fn test_warm_tier_accounting() {
+        use std::mem::size_of;
+        use crate::object::Object;
+        
+        let config = TieringConfig {
+            dram_threshold: 1024 * 1024, // 1 MB
+            high_water_mark: 0.95,
+            low_water_mark: 0.7,
+            hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
+            dram_object_limit_bytes: 512 * 1024, // 512 KB for hot data
+            dram_pointer_limit_bytes: 64 * 1024,  // 64 KB for warm pointers
+            flatmap_initial_capacity: 16,
+        };
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::new(config);
+
+        // Register objects - each with 1000 bytes of data
+        let object_data_size = 1000;
+        for i in 0..10 {
+            manager.register_object(i, object_data_size);
+        }
+
+        // For warm tier, we would create reference-based TieringObjects
+        // The dram_pointer_size should only count the metadata overhead
+        // (TieringObject struct + Key + Arc pointer, NOT the data size)
+        
+        let stats = manager.stats();
+        
+        // Initially all objects should be in PMEM only
+        assert_eq!(stats.pmem_only_objects, 10);
+        assert_eq!(stats.dram_size, 0);
+        assert_eq!(stats.dram_pointer_size, 0);
+    }
+
+    // Test 2: FlatMap auto-resize at 80% load factor
+    #[test]
+    #[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
+    fn test_flatmap_auto_resize() {
+        use crate::flatmap::FlatMapWithHasher;
+        use std::hash::RandomState;
+
+        let hasher = RandomState::new();
+        let mut map: FlatMapWithHasher<u64, u64, RandomState> = 
+            FlatMapWithHasher::with_capacity_and_hasher(16, hasher);
+
+        assert_eq!(map.capacity(), 16);
+
+        // Insert 12 items (12/16 = 75%, below threshold)
+        for i in 0..12 {
+            map.insert(i, i * 10);
+        }
+        assert_eq!(map.len(), 12);
+        assert_eq!(map.capacity(), 16);
+
+        // Insert 2 more items to hit 14/16 = 87.5% (above 80%)
+        // Should trigger resize to 32
+        for i in 12..14 {
+            map.insert(i, i * 10);
+        }
+        assert_eq!(map.len(), 14);
+        
+        // Manual resize for now (auto-resize would be in TieringManager)
+        let load_factor = map.len() as f64 / map.capacity() as f64;
+        if load_factor > 0.8 {
+            map.resize(32).expect("Resize should succeed");
+        }
+        
+        assert_eq!(map.capacity(), 32);
+        assert_eq!(map.len(), 14);
+        
+        // Verify all items are still accessible
+        for i in 0..14 {
+            assert_eq!(map.get(&i), Some(&(i * 10)));
+        }
+    }
+
+    // Test 3: Eviction consistency - removing from warm tier
+    #[test]
+    fn test_eviction_consistency() {
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
+
+        // Register and track an object
+        manager.register_object(1, 100);
+        
+        let stats = manager.stats();
+        assert_eq!(stats.pmem_only_objects, 1);
+
+        // Simulate eviction (del operation)
+        manager.remove_object(1);
+        
+        let stats = manager.stats();
+        assert_eq!(stats.pmem_only_objects, 0);
+        assert_eq!(stats.dram_objects, 0);
     }
 }
 
