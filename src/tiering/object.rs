@@ -18,9 +18,20 @@ use std::{
 
 use crate::object::ExpireTime;
 
+#[cfg(feature = "hashtable_tiering")]
+/// Data storage mode for TieringObject (hashtable_tiering feature)
+#[derive(Clone)]
+pub enum TieringData<V> {
+    /// Physical copy of data in DRAM
+    PhysicalCopy(Arc<Box<[u8]>>),
+    /// Reference to data in CXL/PMEM (zero-copy)
+    CxlReference(Arc<V>),
+}
+
 /// TieringObject struct for the tiering manager's DRAM cache.
 /// Both the key and value are always stored in DRAM (not using Hybrid allocator)
 /// to ensure fast access to hot objects.
+#[cfg(not(feature = "hashtable_tiering"))]
 #[derive(Clone)]
 pub struct TieringObject<K> {
     key: K,
@@ -28,6 +39,15 @@ pub struct TieringObject<K> {
     expiry: ExpireTime,
 }
 
+#[cfg(feature = "hashtable_tiering")]
+#[derive(Clone)]
+pub struct TieringObject<K, V = Box<[u8]>> {
+    key: K,
+    data: TieringData<V>,
+    expiry: ExpireTime,
+}
+
+#[cfg(not(feature = "hashtable_tiering"))]
 impl<K> TieringObject<K> {
     /// Create a new TieringObject with an explicit expiry time
     pub fn with_expiry(key: K, data: Box<[u8]>, expiry: ExpireTime) -> Self {
@@ -46,6 +66,66 @@ impl<K> TieringObject<K> {
     /// Get a clone of the data Arc
     pub fn data(&self) -> Arc<Box<[u8]>> {
         self.data.clone()
+    }
+
+    /// Get the expiry time
+    pub fn expiry(&self) -> ExpireTime {
+        self.expiry
+    }
+
+    /// Check if the key matches
+    pub fn key_matches(&self, key: &K) -> bool
+    where
+        K: Eq,
+    {
+        self.key.eq(key)
+    }
+
+    /// Check if the object is expired
+    pub fn is_expired(&self) -> bool {
+        self.expiry.is_some_and(|expiry| expiry <= Instant::now())
+    }
+}
+
+#[cfg(feature = "hashtable_tiering")]
+impl<K, V> TieringObject<K, V> {
+    /// Create a new TieringObject with physical copy in DRAM
+    pub fn with_expiry(key: K, data: Box<[u8]>, expiry: ExpireTime) -> Self {
+        TieringObject {
+            key,
+            data: TieringData::PhysicalCopy(Arc::new(data)),
+            expiry,
+        }
+    }
+
+    /// Create a new TieringObject with CXL reference (zero-copy)
+    pub fn with_cxl_reference(key: K, data: Arc<V>, expiry: ExpireTime) -> Self {
+        TieringObject {
+            key,
+            data: TieringData::CxlReference(data),
+            expiry,
+        }
+    }
+
+    /// Get a reference to the key
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// Get a reference to the data
+    pub fn data(&self) -> &TieringData<V> {
+        &self.data
+    }
+
+    /// Get the data as bytes (either from physical copy or CXL reference)
+    pub fn data_as_bytes(&self) -> Vec<u8>
+    where
+        V: AsRef<[u8]>,
+    {
+        match &self.data {
+            TieringData::PhysicalCopy(arc_data) => arc_data.as_ref().to_vec(),
+            TieringData::CxlReference(arc_val) => arc_val.as_ref().as_ref().to_vec(),
+        }
     }
 
     /// Get the expiry time
