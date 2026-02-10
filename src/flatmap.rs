@@ -273,6 +273,42 @@ where
         }
         self.len = 0;
     }
+
+    /// Resizes the map to a new capacity.
+    /// The new capacity must be a power of 2 and larger than the current capacity.
+    /// This method rehashes all existing entries into the new table.
+    pub fn resize<S>(&mut self, new_capacity: usize, hasher: &S) -> Result<(), &'static str>
+    where
+        K: Default + Clone,
+        V: Default + Clone,
+        S: BuildHasher,
+        A: Clone,
+    {
+        if new_capacity <= self.capacity {
+            return Err("New capacity must be larger than current capacity");
+        }
+        if !new_capacity.is_power_of_two() {
+            return Err("New capacity must be a power of 2");
+        }
+
+        // Create a new FlatMap with the larger capacity
+        let mut new_map = FlatMap::new_in(new_capacity, self.buckets.allocator().clone());
+
+        // Rehash all existing entries into the new map
+        for bucket in &self.buckets {
+            if !bucket.is_empty() {
+                new_map.insert_with_hasher(bucket.key.clone(), bucket.val.clone(), hasher);
+            }
+        }
+
+        // Replace the current map with the new one
+        self.buckets = new_map.buckets;
+        self.capacity = new_map.capacity;
+        self.mask = new_map.mask;
+        self.len = new_map.len;
+
+        Ok(())
+    }
 }
 
 impl<K, V> FlatMap<K, V, Global>
@@ -584,6 +620,17 @@ where
     /// Returns an iterator over the key-value pairs in the map.
     pub fn iter(&self) -> Iter<'_, K, V> {
         self.map.iter()
+    }
+
+    /// Resizes the map to a new capacity.
+    /// The new capacity must be a power of 2 and larger than the current capacity.
+    pub fn resize(&mut self, new_capacity: usize) -> Result<(), &'static str>
+    where
+        K: Default + Clone,
+        V: Default + Clone,
+        A: Clone,
+    {
+        self.map.resize(new_capacity, &self.hasher)
     }
 
     /// Internal method to remove without Clone/Default constraints.

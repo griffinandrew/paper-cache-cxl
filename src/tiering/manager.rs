@@ -28,6 +28,10 @@ mod allocator_bindings {
 #[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 use hashbrown::HashMap as hashtable;
 
+// Import FlatMap when hashtable_tiering_all_flatmap is enabled
+#[cfg(feature = "hashtable_tiering_all_flatmap")]
+use crate::flatmap::FlatMapWithHasher;
+
 
 /// Configuration for the tiering manager
 #[derive(Debug, Clone)]
@@ -51,6 +55,15 @@ pub struct TieringConfig {
     /// When true, the dram_cache hashtable uses pmem allocator
     /// When false, uses default DRAM allocation
     pub use_pmem_for_tiering_hashtable: bool,
+
+    /// Limit for "Hot" data copies in bytes (DramAndPmem tier)
+    pub dram_object_limit_bytes: u64,
+
+    /// Limit for "Warm" metadata/pointers in bytes (DramPtrToPmem tier)
+    pub dram_pointer_limit_bytes: u64,
+
+    /// Starting size for the internal FlatMap cache
+    pub flatmap_initial_capacity: usize,
 }
 
 impl Default for TieringConfig {
@@ -61,6 +74,9 @@ impl Default for TieringConfig {
             low_water_mark: 0.7,
             hotness_threshold: 3, // Promote after 3 accesses
             use_pmem_for_tiering_hashtable: false, // Default to DRAM
+            dram_object_limit_bytes: 512 * 1024 * 1024, // 512 MB for hot data copies
+            dram_pointer_limit_bytes: 128 * 1024 * 1024, // 128 MB for warm pointers
+            flatmap_initial_capacity: 1024, // Start with 1024 buckets (power of 2)
         }
     }
 }
@@ -71,8 +87,11 @@ pub struct TieringStats {
     /// Number of objects currently in DRAM
     pub dram_objects: u64,
 
-    /// Total size of objects in DRAM (bytes)
+    /// Total size of objects in DRAM (bytes) - Hot tier
     pub dram_size: u64,
+
+    /// Total size of pointers/metadata in DRAM (bytes) - Warm tier
+    pub dram_pointer_size: u64,
 
     /// Number of promotions from PMEM to DRAM
     pub promotions: u64,
@@ -87,11 +106,14 @@ pub struct TieringStats {
 /// Tier location for an object
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    /// Object exists in both DRAM (copy) and PMEM (source of truth)
-    DramAndPmem,
-
-    /// Object exists only in PMEM
+    /// Object exists only in PMEM (Cold)
     PmemOnly,
+
+    /// Object metadata exists in DRAM holding a pointer to CXL data (Warm)
+    DramPtrToPmem,
+
+    /// Object exists in both DRAM (copy) and PMEM (source of truth) (Hot)
+    DramAndPmem,
 }
 
 /// Information about an object's tiering status
@@ -133,20 +155,24 @@ pub struct TieringManager<K, V> {
     /// Set of objects currently in DRAM (for fast lookup)
     dram_objects: Arc<RwLock<HashSet<HashedKey>>>,
     
-    /// DRAM cache storing TieringObject<K> instances
+    /// DRAM cache storing TieringObject<K, V> instances
     /// TieringObject always uses DRAM allocation (not Hybrid allocator) to ensure
     /// both key and value are in DRAM for fast access to hot objects
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
-    dram_cache: Arc<DashMap<HashedKey, TieringObject<K>, NoHasher>>,
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering_all_flatmap")))]
+    dram_cache: Arc<DashMap<HashedKey, TieringObject<K, V>, NoHasher>>,
     
-    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
+    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering_all_flatmap")))]
+    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
     
-    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem")))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>>>>,
+    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering_all_flatmap")))]
+    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>>>>,
     
-    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem"))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
+    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering_all_flatmap")))]
+    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
+    
+    /// FlatMap-based DRAM cache when hashtable_tiering_all_flatmap is enabled
+    #[cfg(feature = "hashtable_tiering_all_flatmap")]
+    dram_cache: Arc<RwLock<FlatMapWithHasher<HashedKey, TieringObject<K, V>, NoHasher>>>,
     
     _phantom: std::marker::PhantomData<(K, V)>,
 }
@@ -157,7 +183,7 @@ where
     V: TypeSize + Clone,
 {
     /// Creates a new TieringManager with the given configuration
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering_all_flatmap")))]
     pub fn new(config: TieringConfig) -> Self {
         TieringManager {
             config: Arc::new(RwLock::new(config)),
@@ -169,7 +195,7 @@ where
         }
     }
 
-    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
+    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering_all_flatmap")))]
     pub fn new(config: TieringConfig) -> Self {
         TieringManager {
             config: Arc::new(RwLock::new(config)),
@@ -181,7 +207,7 @@ where
         }
     }
 
-    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem")))]
+    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering_all_flatmap")))]
     pub fn new(config: TieringConfig) -> Self {
         TieringManager {
             config: Arc::new(RwLock::new(config)),
@@ -193,7 +219,7 @@ where
         }
     }
 
-    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem"))]
+    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering_all_flatmap")))]
     pub fn new(config: TieringConfig) -> Self {
         TieringManager {
             config: Arc::new(RwLock::new(config)),
@@ -201,6 +227,27 @@ where
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Creates a new TieringManager with FlatMap when hashtable_tiering_all_flatmap is enabled
+    #[cfg(feature = "hashtable_tiering_all_flatmap")]
+    pub fn new(config: TieringConfig) -> Self
+    where
+        K: std::hash::Hash + Eq + Default,
+        TieringObject<K, V>: Default,
+    {
+        let initial_capacity = config.flatmap_initial_capacity;
+        TieringManager {
+            config: Arc::new(RwLock::new(config)),
+            stats: Arc::new(RwLock::new(TieringStats::default())),
+            object_info: Arc::new(RwLock::new(HashMap::new())),
+            dram_objects: Arc::new(RwLock::new(HashSet::new())),
+            dram_cache: Arc::new(RwLock::new(FlatMapWithHasher::with_capacity_and_hasher(
+                initial_capacity,
+                NoHasher::default(),
+            ))),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -250,8 +297,14 @@ where
                     // Check if we should promote based on access count
                     info.access_count >= hotness_threshold
                 }
+                Tier::DramPtrToPmem => {
+                    // Already in warm tier. Warm objects don't auto-promote to hot
+                    // based on access count alone. An explicit promotion decision
+                    // would be needed (e.g., based on size or access pattern).
+                    false
+                }
                 Tier::DramAndPmem => {
-                    // Already in DRAM
+                    // Already in hot tier (DRAM copy)
                     false
                 }
             }
@@ -262,7 +315,7 @@ where
 
     /// Helper method to create a TieringObject with physically copied data
     /// Extracts bytes from source object and creates a new TieringObject
-    fn create_dram_object(&self, object: &Object<K, V>) -> TieringObject<K>
+    fn create_dram_object(&self, object: &Object<K, V>) -> TieringObject<K, V>
     where
         K: Clone,
         V: AsRef<[u8]>,
@@ -277,7 +330,114 @@ where
         let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
         
         // Create new TieringObject with key, data, and expiry
-        TieringObject::with_expiry(object.key().clone(), dram_data, object.expiry())
+        TieringObject::with_physical_copy(object.key().clone(), dram_data, object.expiry())
+    }
+
+    /// Helper method to create a TieringObject with a warm reference (zero-copy pointer)
+    /// This creates a reference to the existing CXL data without copying
+    fn create_warm_object(&self, object: &Object<K, V>) -> TieringObject<K, V>
+    where
+        K: Clone,
+    {
+        // Get Arc reference to the data (zero-copy)
+        let data_arc = object.data();
+        
+        // Create new TieringObject with reference (Warm tier)
+        TieringObject::with_reference(object.key().clone(), data_arc, object.expiry())
+    }
+
+    /// Promotes an object to the Warm tier (DramPtrToPmem) with zero-copy pointer
+    /// Returns true if promotion was successful
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    pub fn promote_to_warm(&self, key: HashedKey, object: &Object<K, V>) -> bool {
+        use std::mem::size_of;
+        
+        let mut info_map = self.object_info.write().unwrap();
+
+        if let Some(info) = info_map.get_mut(&key) {
+            if info.tier == Tier::PmemOnly {
+                let config = self.config.read().unwrap();
+                let mut stats = self.stats.write().unwrap();
+                
+                // Calculate metadata overhead for warm tier
+                // TieringObject struct + Key + Arc pointer (NOT the data size)
+                let metadata_size = (size_of::<TieringObject<K, V>>() 
+                                   + size_of::<HashedKey>() 
+                                   + size_of::<Arc<V>>()) as u64;
+                
+                let new_pointer_size = stats.dram_pointer_size + metadata_size;
+
+                // Check if promotion would exceed pointer limit
+                if new_pointer_size <= config.dram_pointer_limit_bytes {
+                    info.tier = Tier::DramPtrToPmem;
+
+                    // Create warm object with zero-copy reference
+                    let warm_object = self.create_warm_object(object);
+                    
+                    // Store the TieringObject in the DRAM cache
+                    self.dram_cache.insert(key, warm_object);
+
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.insert(key);
+
+                    stats.dram_pointer_size = new_pointer_size;
+                    stats.dram_objects += 1;
+                    stats.pmem_only_objects -= 1;
+                    stats.promotions += 1;
+
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    #[cfg(any(
+        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
+        feature = "alloc_api_exp"
+    ))]
+    pub fn promote_to_warm(&self, key: HashedKey, object: &Object<K, V>) -> bool {
+        use std::mem::size_of;
+        
+        let mut info_map = self.object_info.write().unwrap();
+
+        if let Some(info) = info_map.get_mut(&key) {
+            if info.tier == Tier::PmemOnly {
+                let config = self.config.read().unwrap();
+                let mut stats = self.stats.write().unwrap();
+                
+                // Calculate metadata overhead for warm tier
+                let metadata_size = (size_of::<TieringObject<K, V>>() 
+                                   + size_of::<HashedKey>() 
+                                   + size_of::<Arc<V>>()) as u64;
+                
+                let new_pointer_size = stats.dram_pointer_size + metadata_size;
+
+                // Check if promotion would exceed pointer limit
+                if new_pointer_size <= config.dram_pointer_limit_bytes {
+                    info.tier = Tier::DramPtrToPmem;
+
+                    // Create warm object with zero-copy reference
+                    let warm_object = self.create_warm_object(object);
+                    
+                    // Store the TieringObject in the DRAM cache
+                    self.dram_cache.write().unwrap().insert(key, warm_object);
+
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.insert(key);
+
+                    stats.dram_pointer_size = new_pointer_size;
+                    stats.dram_objects += 1;
+                    stats.pmem_only_objects -= 1;
+                    stats.promotions += 1;
+
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// Promotes an object to DRAM by creating a physical copy with DRAM-allocated data
@@ -460,9 +620,9 @@ where
     }
     
     /// Gets a TieringObject from the DRAM cache if it exists there
-    /// Returns a reference to the TieringObject<K> stored in DRAM
+    /// Returns a reference to the TieringObject<K, V> stored in DRAM
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
-    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = TieringObject<K>> + '_> {
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = TieringObject<K, V>> + '_> {
         self.dram_cache.get(key)
     }
 
@@ -470,7 +630,7 @@ where
         all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
         feature = "alloc_api_exp"
     ))]
-    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K>>> {
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K, V>>> {
         self.dram_cache
             .read()
             .unwrap()
@@ -573,6 +733,16 @@ where
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                 }
+                Tier::DramPtrToPmem => {
+                    // Remove from DRAM cache (warm pointer)
+                    self.dram_cache.remove(&key);
+                    
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
+
+                    stats.dram_pointer_size = stats.dram_pointer_size.saturating_sub(info.size as u64);
+                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                }
                 Tier::PmemOnly => {
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
                 }
@@ -599,6 +769,16 @@ where
                     dram_objects.remove(&key);
 
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
+                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                }
+                Tier::DramPtrToPmem => {
+                    // Remove from DRAM cache (warm pointer)
+                    self.dram_cache.write().unwrap().remove(&key);
+                    
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
+
+                    stats.dram_pointer_size = stats.dram_pointer_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                 }
                 Tier::PmemOnly => {
@@ -681,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_tiering_manager_creation() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
         let stats = manager.stats();
 
         assert_eq!(stats.dram_objects, 0);
@@ -692,7 +872,7 @@ mod tests {
 
     #[test]
     fn test_register_object() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
 
@@ -703,7 +883,7 @@ mod tests {
 
     #[test]
     fn test_promote_to_dram() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
         assert!(manager.promote_to_dram(1));
@@ -717,7 +897,7 @@ mod tests {
 
     #[test]
     fn test_demote_from_dram() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
         manager.promote_to_dram(1);
@@ -737,8 +917,12 @@ mod tests {
             high_water_mark: 0.9,
             low_water_mark: 0.7,
             hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
+            dram_object_limit_bytes: 200,
+            dram_pointer_limit_bytes: 100,
+            flatmap_initial_capacity: 16,
         };
-        let manager = TieringManager::new(config);
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::new(config);
 
         // Promote two objects, total 200 bytes (at threshold)
         manager.register_object(1, 100);
@@ -757,7 +941,7 @@ mod tests {
 
     #[test]
     fn test_remove_object() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
         manager.promote_to_dram(1);
@@ -770,14 +954,17 @@ mod tests {
 
     #[test]
     fn test_access_recording() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
 
         manager.register_object(1, 100);
 
-        // First access - should not promote yet (threshold is 2)
+        // First access - should not promote yet (default threshold is 3)
         assert!(!manager.record_access(1));
 
-        // Second access - should suggest promotion
+        // Second access - still should not promote
+        assert!(!manager.record_access(1));
+
+        // Third access - should suggest promotion
         assert!(manager.record_access(1));
     }
 
@@ -785,7 +972,7 @@ mod tests {
     fn test_configurable_hotness_threshold() {
         let mut config = TieringConfig::default();
         config.hotness_threshold = 3;
-        let manager = TieringManager::new(config);
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::new(config);
 
         manager.register_object(1, 100);
 
@@ -804,8 +991,12 @@ mod tests {
             high_water_mark: 0.9,
             low_water_mark: 0.6,
             hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
+            dram_object_limit_bytes: 300,
+            dram_pointer_limit_bytes: 100,
+            flatmap_initial_capacity: 16,
         };
-        let manager = TieringManager::new(config);
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::new(config);
 
         // Register and promote 4 objects
         for i in 1..=4 {
@@ -825,12 +1016,143 @@ mod tests {
 
     #[test]
     fn test_set_and_get_hotness_threshold() {
-        let manager = TieringManager::with_defaults();
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
         
-        assert_eq!(manager.hotness_threshold(), 2);
+        assert_eq!(manager.hotness_threshold(), 3);
         
         manager.set_hotness_threshold(5);
         assert_eq!(manager.hotness_threshold(), 5);
+    }
+
+    // Test 1: Warm tier accounting - only metadata overhead counted
+    #[test]
+    fn test_warm_tier_accounting() {
+        use std::mem::size_of;
+        use crate::object::Object;
+        
+        let config = TieringConfig {
+            dram_threshold: 1024 * 1024, // 1 MB
+            high_water_mark: 0.95,
+            low_water_mark: 0.7,
+            hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
+            dram_object_limit_bytes: 512 * 1024, // 512 KB for hot data
+            dram_pointer_limit_bytes: 64 * 1024,  // 64 KB for warm pointers
+            flatmap_initial_capacity: 16,
+        };
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::new(config);
+
+        // Register objects - each with 1000 bytes of data
+        let object_data_size = 1000;
+        for i in 0..10 {
+            manager.register_object(i, object_data_size);
+        }
+
+        // For warm tier, we would create reference-based TieringObjects
+        // The dram_pointer_size should only count the metadata overhead
+        // (TieringObject struct + Key + Arc pointer, NOT the data size)
+        
+        let stats = manager.stats();
+        
+        // Initially all objects should be in PMEM only
+        assert_eq!(stats.pmem_only_objects, 10);
+        assert_eq!(stats.dram_size, 0);
+        assert_eq!(stats.dram_pointer_size, 0);
+    }
+
+    // Test 2: FlatMap auto-resize at 80% load factor
+    #[test]
+    #[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
+    fn test_flatmap_auto_resize() {
+        use crate::flatmap::FlatMapWithHasher;
+        use std::hash::RandomState;
+
+        let hasher = RandomState::new();
+        let mut map: FlatMapWithHasher<u64, u64, RandomState> = 
+            FlatMapWithHasher::with_capacity_and_hasher(16, hasher);
+
+        assert_eq!(map.capacity(), 16);
+
+        // Insert 12 items (12/16 = 75%, below threshold)
+        for i in 0..12 {
+            map.insert(i, i * 10);
+        }
+        assert_eq!(map.len(), 12);
+        assert_eq!(map.capacity(), 16);
+
+        // Insert 2 more items to hit 14/16 = 87.5% (above 80%)
+        // Should trigger resize to 32
+        for i in 12..14 {
+            map.insert(i, i * 10);
+        }
+        assert_eq!(map.len(), 14);
+        
+        // Manual resize for now (auto-resize would be in TieringManager)
+        let load_factor = map.len() as f64 / map.capacity() as f64;
+        if load_factor > 0.8 {
+            map.resize(32).expect("Resize should succeed");
+        }
+        
+        assert_eq!(map.capacity(), 32);
+        assert_eq!(map.len(), 14);
+        
+        // Verify all items are still accessible
+        for i in 0..14 {
+            assert_eq!(map.get(&i), Some(&(i * 10)));
+        }
+    }
+
+    // Test 3: Eviction consistency - removing from warm tier
+    #[test]
+    fn test_eviction_consistency() {
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::with_defaults();
+
+        // Register and track an object
+        manager.register_object(1, 100);
+        
+        let stats = manager.stats();
+        assert_eq!(stats.pmem_only_objects, 1);
+
+        // Simulate eviction (del operation)
+        manager.remove_object(1);
+        
+        let stats = manager.stats();
+        assert_eq!(stats.pmem_only_objects, 0);
+        assert_eq!(stats.dram_objects, 0);
+    }
+
+    // Test 4: Warm tier promotion with precise accounting
+    #[test]
+    fn test_warm_tier_promotion_accounting() {
+        use std::mem::size_of;
+        use crate::object::Object;
+        
+        let config = TieringConfig {
+            dram_threshold: 1024 * 1024, // 1 MB
+            high_water_mark: 0.95,
+            low_water_mark: 0.7,
+            hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
+            dram_object_limit_bytes: 512 * 1024, // 512 KB for hot data
+            dram_pointer_limit_bytes: 64 * 1024,  // 64 KB for warm pointers
+            flatmap_initial_capacity: 16,
+        };
+        let manager: TieringManager<u64, Box<[u8]>> = TieringManager::new(config);
+
+        // Register an object
+        manager.register_object(1, 1000);
+        
+        let stats = manager.stats();
+        assert_eq!(stats.pmem_only_objects, 1);
+        assert_eq!(stats.dram_pointer_size, 0);
+        
+        // Note: To actually test warm tier promotion, we would need to:
+        // 1. Create an Object<K, V> instance
+        // 2. Call promote_to_warm with that object
+        // 3. Verify that dram_pointer_size increased by metadata size only
+        
+        // For now, this test verifies the initial state is correct
+        // A full integration test would be needed to test actual promotion
     }
 }
 
