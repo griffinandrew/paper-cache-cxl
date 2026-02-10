@@ -1663,11 +1663,11 @@ where
 			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
 				self.status.incr_hits();
 				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				let arc_val = dram_object_ref.data();
+				let data_bytes = dram_object_ref.get_data_bytes();
 				//println!("CACHE: get for key {:?} from DRAM tier", key);
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
-				return Ok(arc_val.as_ref().to_vec());
+				//println!("CACHE: get for key {:?}: {:?}", key, data_bytes);
+				//println!("CACHE: get for key {:?} value size: {}", key, data_bytes.len());
+				return Ok(data_bytes.to_vec());
 			}
 		}
 

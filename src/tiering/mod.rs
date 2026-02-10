@@ -88,3 +88,4 @@ pub use manager::TieringManager;
 pub use manager::TieringConfig;
 pub use manager::TieringStats;
 pub use object::TieringObject;
+pub use object::TieringData;

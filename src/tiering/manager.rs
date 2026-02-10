@@ -51,6 +51,15 @@ pub struct TieringConfig {
     /// When true, the dram_cache hashtable uses pmem allocator
     /// When false, uses default DRAM allocation
     pub use_pmem_for_tiering_hashtable: bool,
+
+    /// Limit for "Hot" data copies in bytes (DramAndPmem tier)
+    pub dram_object_limit_bytes: u64,
+
+    /// Limit for "Warm" metadata/pointers in bytes (DramPtrToPmem tier)
+    pub dram_pointer_limit_bytes: u64,
+
+    /// Starting size for the internal FlatMap cache
+    pub flatmap_initial_capacity: usize,
 }
 
 impl Default for TieringConfig {
@@ -61,6 +70,9 @@ impl Default for TieringConfig {
             low_water_mark: 0.7,
             hotness_threshold: 3, // Promote after 3 accesses
             use_pmem_for_tiering_hashtable: false, // Default to DRAM
+            dram_object_limit_bytes: 512 * 1024 * 1024, // 512 MB for hot data copies
+            dram_pointer_limit_bytes: 128 * 1024 * 1024, // 128 MB for warm pointers
+            flatmap_initial_capacity: 1024, // Start with 1024 buckets (power of 2)
         }
     }
 }
@@ -71,8 +83,11 @@ pub struct TieringStats {
     /// Number of objects currently in DRAM
     pub dram_objects: u64,
 
-    /// Total size of objects in DRAM (bytes)
+    /// Total size of objects in DRAM (bytes) - Hot tier
     pub dram_size: u64,
+
+    /// Total size of pointers/metadata in DRAM (bytes) - Warm tier
+    pub dram_pointer_size: u64,
 
     /// Number of promotions from PMEM to DRAM
     pub promotions: u64,
@@ -87,11 +102,14 @@ pub struct TieringStats {
 /// Tier location for an object
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    /// Object exists in both DRAM (copy) and PMEM (source of truth)
-    DramAndPmem,
-
-    /// Object exists only in PMEM
+    /// Object exists only in PMEM (Cold)
     PmemOnly,
+
+    /// Object metadata exists in DRAM holding a pointer to CXL data (Warm)
+    DramPtrToPmem,
+
+    /// Object exists in both DRAM (copy) and PMEM (source of truth) (Hot)
+    DramAndPmem,
 }
 
 /// Information about an object's tiering status
@@ -133,20 +151,20 @@ pub struct TieringManager<K, V> {
     /// Set of objects currently in DRAM (for fast lookup)
     dram_objects: Arc<RwLock<HashSet<HashedKey>>>,
     
-    /// DRAM cache storing TieringObject<K> instances
+    /// DRAM cache storing TieringObject<K, V> instances
     /// TieringObject always uses DRAM allocation (not Hybrid allocator) to ensure
     /// both key and value are in DRAM for fast access to hot objects
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
-    dram_cache: Arc<DashMap<HashedKey, TieringObject<K>, NoHasher>>,
+    dram_cache: Arc<DashMap<HashedKey, TieringObject<K, V>, NoHasher>>,
     
     #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
+    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
     
     #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem")))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>>>>,
+    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>>>>,
     
     #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem"))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
+    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
     
     _phantom: std::marker::PhantomData<(K, V)>,
 }
@@ -250,6 +268,10 @@ where
                     // Check if we should promote based on access count
                     info.access_count >= hotness_threshold
                 }
+                Tier::DramPtrToPmem => {
+                    // Already has warm pointer, may promote to hot
+                    false
+                }
                 Tier::DramAndPmem => {
                     // Already in DRAM
                     false
@@ -262,7 +284,7 @@ where
 
     /// Helper method to create a TieringObject with physically copied data
     /// Extracts bytes from source object and creates a new TieringObject
-    fn create_dram_object(&self, object: &Object<K, V>) -> TieringObject<K>
+    fn create_dram_object(&self, object: &Object<K, V>) -> TieringObject<K, V>
     where
         K: Clone,
         V: AsRef<[u8]>,
@@ -277,7 +299,7 @@ where
         let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
         
         // Create new TieringObject with key, data, and expiry
-        TieringObject::with_expiry(object.key().clone(), dram_data, object.expiry())
+        TieringObject::with_physical_copy(object.key().clone(), dram_data, object.expiry())
     }
 
     /// Promotes an object to DRAM by creating a physical copy with DRAM-allocated data
@@ -460,9 +482,9 @@ where
     }
     
     /// Gets a TieringObject from the DRAM cache if it exists there
-    /// Returns a reference to the TieringObject<K> stored in DRAM
+    /// Returns a reference to the TieringObject<K, V> stored in DRAM
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
-    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = TieringObject<K>> + '_> {
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = TieringObject<K, V>> + '_> {
         self.dram_cache.get(key)
     }
 
@@ -470,7 +492,7 @@ where
         all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
         feature = "alloc_api_exp"
     ))]
-    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K>>> {
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K, V>>> {
         self.dram_cache
             .read()
             .unwrap()
@@ -573,6 +595,16 @@ where
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                 }
+                Tier::DramPtrToPmem => {
+                    // Remove from DRAM cache (warm pointer)
+                    self.dram_cache.remove(&key);
+                    
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
+
+                    stats.dram_pointer_size = stats.dram_pointer_size.saturating_sub(info.size as u64);
+                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                }
                 Tier::PmemOnly => {
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
                 }
@@ -599,6 +631,16 @@ where
                     dram_objects.remove(&key);
 
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
+                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                }
+                Tier::DramPtrToPmem => {
+                    // Remove from DRAM cache (warm pointer)
+                    self.dram_cache.write().unwrap().remove(&key);
+                    
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
+
+                    stats.dram_pointer_size = stats.dram_pointer_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                 }
                 Tier::PmemOnly => {

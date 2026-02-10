@@ -65,6 +65,9 @@ global_flatmap_pmem = []
 # Use hashbrown HashMap as global hashtable in DRAM (for performance comparison)
 hashbrown_dram = []
 
+# Use FlatMap for all tiering manager hashtables (global + internal cache)
+hashtable_tiering_all_flatmap = []
+
 # Legacy features (deprecated, will be removed)
 default = []
 original = []
