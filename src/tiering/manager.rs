@@ -298,11 +298,13 @@ where
                     info.access_count >= hotness_threshold
                 }
                 Tier::DramPtrToPmem => {
-                    // Already has warm pointer, may promote to hot
+                    // Already in warm tier. Warm objects don't auto-promote to hot
+                    // based on access count alone. An explicit promotion decision
+                    // would be needed (e.g., based on size or access pattern).
                     false
                 }
                 Tier::DramAndPmem => {
-                    // Already in DRAM
+                    // Already in hot tier (DRAM copy)
                     false
                 }
             }

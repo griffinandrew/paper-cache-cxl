@@ -138,7 +138,7 @@ impl<K> TieringObject<K, Box<[u8]>> {
     pub fn data(&self) -> Arc<Box<[u8]>> {
         match &self.data {
             TieringData::Physical(bytes) => Arc::new(bytes.clone()),
-            TieringData::Reference(_) => panic!("Cannot get physical data from warm tier object"),
+            TieringData::Reference(_) => panic!("Cannot get physical data from warm tier object. Use get_data_bytes() or get_reference() instead."),
         }
     }
 }
