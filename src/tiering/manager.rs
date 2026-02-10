@@ -28,6 +28,10 @@ mod allocator_bindings {
 #[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 use hashbrown::HashMap as hashtable;
 
+// Import FlatMap when hashtable_tiering_all_flatmap is enabled
+#[cfg(feature = "hashtable_tiering_all_flatmap")]
+use crate::flatmap::FlatMapWithHasher;
+
 
 /// Configuration for the tiering manager
 #[derive(Debug, Clone)]
@@ -154,17 +158,21 @@ pub struct TieringManager<K, V> {
     /// DRAM cache storing TieringObject<K, V> instances
     /// TieringObject always uses DRAM allocation (not Hybrid allocator) to ensure
     /// both key and value are in DRAM for fast access to hot objects
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering_all_flatmap")))]
     dram_cache: Arc<DashMap<HashedKey, TieringObject<K, V>, NoHasher>>,
     
-    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
+    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering_all_flatmap")))]
     dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
     
-    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem")))]
+    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering_all_flatmap")))]
     dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>>>>,
     
-    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem"))]
+    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering_all_flatmap")))]
     dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
+    
+    /// FlatMap-based DRAM cache when hashtable_tiering_all_flatmap is enabled
+    #[cfg(feature = "hashtable_tiering_all_flatmap")]
+    dram_cache: Arc<RwLock<FlatMapWithHasher<HashedKey, TieringObject<K, V>, NoHasher>>>,
     
     _phantom: std::marker::PhantomData<(K, V)>,
 }
@@ -175,7 +183,7 @@ where
     V: TypeSize + Clone,
 {
     /// Creates a new TieringManager with the given configuration
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering_all_flatmap")))]
     pub fn new(config: TieringConfig) -> Self {
         TieringManager {
             config: Arc::new(RwLock::new(config)),
@@ -187,7 +195,7 @@ where
         }
     }
 
-    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
+    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering_all_flatmap")))]
     pub fn new(config: TieringConfig) -> Self {
         TieringManager {
             config: Arc::new(RwLock::new(config)),
@@ -199,7 +207,7 @@ where
         }
     }
 
-    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem")))]
+    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering_all_flatmap")))]
     pub fn new(config: TieringConfig) -> Self {
         TieringManager {
             config: Arc::new(RwLock::new(config)),
@@ -211,7 +219,7 @@ where
         }
     }
 
-    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem"))]
+    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering_all_flatmap")))]
     pub fn new(config: TieringConfig) -> Self {
         TieringManager {
             config: Arc::new(RwLock::new(config)),
@@ -219,6 +227,27 @@ where
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Creates a new TieringManager with FlatMap when hashtable_tiering_all_flatmap is enabled
+    #[cfg(feature = "hashtable_tiering_all_flatmap")]
+    pub fn new(config: TieringConfig) -> Self
+    where
+        K: std::hash::Hash + Eq + Default,
+        TieringObject<K, V>: Default,
+    {
+        let initial_capacity = config.flatmap_initial_capacity;
+        TieringManager {
+            config: Arc::new(RwLock::new(config)),
+            stats: Arc::new(RwLock::new(TieringStats::default())),
+            object_info: Arc::new(RwLock::new(HashMap::new())),
+            dram_objects: Arc::new(RwLock::new(HashSet::new())),
+            dram_cache: Arc::new(RwLock::new(FlatMapWithHasher::with_capacity_and_hasher(
+                initial_capacity,
+                NoHasher::default(),
+            ))),
             _phantom: std::marker::PhantomData,
         }
     }

@@ -112,6 +112,21 @@ impl<K, V> TieringObject<K, V> {
     }
 }
 
+// Default implementation for TieringObject to support FlatMap
+impl<K, V> Default for TieringObject<K, V>
+where
+    K: Default,
+    V: Default,
+{
+    fn default() -> Self {
+        TieringObject {
+            key: K::default(),
+            data: TieringData::Physical(Box::new([])),
+            expiry: None,
+        }
+    }
+}
+
 // Backward compatibility - keep the old interface for existing code
 impl<K> TieringObject<K, Box<[u8]>> {
     /// Create a new TieringObject with an explicit expiry time (legacy compatibility)
