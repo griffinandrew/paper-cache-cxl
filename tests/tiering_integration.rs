@@ -102,9 +102,7 @@ mod hashtable_tiering_tests {
             PaperPolicy::Lfu,
         ).expect("Failed to create cache");
 
-        // Configure tiering thresholds: warm_threshold=2, hot_threshold=5
-        // Note: These are set via TieringConfig, but we need public methods to set them
-        // For now, we use default config (warm=2, hot=5) from TieringConfig::default()
+        // Using default config: warm_threshold=2, hot_threshold=5 from TieringConfig::default()
         
         // Set a test object
         cache.set(1, &[42u8; 100], None).expect("Failed to set object");

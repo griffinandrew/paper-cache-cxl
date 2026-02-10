@@ -118,14 +118,27 @@ impl<K, V> TieringObject<K, V> {
     }
 
     /// Get the data as bytes (either from physical copy or CXL reference)
+    /// Returns a Vec for compatibility with the cache API
+    /// Note: This always allocates due to API requirements
     pub fn data_as_bytes(&self) -> Vec<u8>
     where
         V: AsRef<[u8]>,
     {
         match &self.data {
-            TieringData::PhysicalCopy(arc_data) => arc_data.as_ref().to_vec(),
-            TieringData::CxlReference(arc_val) => arc_val.as_ref().as_ref().to_vec(),
+            TieringData::PhysicalCopy(arc_data) => {
+                // For physical copy in DRAM, clone the bytes
+                arc_data.as_ref().to_vec()
+            }
+            TieringData::CxlReference(arc_val) => {
+                // For CXL reference, read and clone the bytes from CXL memory
+                arc_val.as_ref().as_ref().to_vec()
+            }
         }
+    }
+
+    /// Check if this object holds a CXL reference (warm tier) vs physical copy (hot tier)
+    pub fn is_warm_tier(&self) -> bool {
+        matches!(&self.data, TieringData::CxlReference(_))
     }
 
     /// Get the expiry time
