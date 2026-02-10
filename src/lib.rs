@@ -59,7 +59,7 @@ mod status;
 pub mod tiering;
 
 // FlatMap module - high-performance Linear Probing Hash Map for PMEM/DRAM
-#[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
+#[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "hashtable_tiering_all_flatmap"))]
 pub mod flatmap;
 
 
