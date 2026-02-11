@@ -1692,9 +1692,11 @@ where
 				self.status.incr_hits();
 				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
 				let arc_val = dram_object_ref.data();
-				//println!("CACHE: get for key {:?} from DRAM tier", key);
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
+				#[cfg(debug_assertions)] {
+				println!("CACHE: get for key {:?} from DRAM tier", key);
+				println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
+				println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
+				}
 				return Ok(arc_val.as_ref().to_vec());
 			}
 		}
@@ -1705,6 +1707,14 @@ where
 				self.status.incr_hits();
 				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
 				// Use data_as_bytes method to handle both PhysicalCopy and CxlReference
+
+				let arc_val = dram_object_ref.data();
+
+				#[cfg(debug_assertions)] {
+				println!("CACHE: get for key {:?} from DRAM tier", key);
+				println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
+				println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
+				}
 				return Ok(dram_object_ref.data_as_bytes());
 			}
 		}
@@ -1716,6 +1726,13 @@ where
 				// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
 				let arc_val = object.data();
 				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
+
+
+				#[cfg(debug_assertions)] {
+				println!("CACHE: get for key {:?} from DRAM tier", key);
+				println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
+				println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
+				}
 				Ok(arc_val.as_ref().to_vec())
 			},
 
@@ -1733,6 +1750,12 @@ where
 					self.status.incr_hits();
 					// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
 					let arc_val = object.data();
+
+					#[cfg(debug_assertions)] {
+					println!("CACHE: get for key {:?} from DRAM tier", key);
+					println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
+					println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
+					}
 					Ok(arc_val.as_ref().to_vec())
 				},
 
