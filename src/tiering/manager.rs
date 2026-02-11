@@ -55,12 +55,12 @@ pub struct TieringConfig {
     /// When false, uses default DRAM allocation
     pub use_pmem_for_tiering_hashtable: bool,
 
-    #[cfg(feature = "hashtable_tiering")]
+    #[cfg(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))]
     /// Warm threshold: minimum access count for pointer-only promotion (hashtable_tiering feature)
     /// Objects reaching this threshold get metadata in DRAM but data stays in CXL
     pub warm_threshold: u64,
 
-    #[cfg(feature = "hashtable_tiering")]
+    #[cfg(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))]
     /// Hot threshold: minimum access count for full data copy promotion (hashtable_tiering feature)
     /// Objects reaching this threshold get a full physical copy in DRAM
     pub hot_threshold: u64,
@@ -82,9 +82,9 @@ impl Default for TieringConfig {
             low_water_mark: 0.7,
             hotness_threshold: 3, // Promote after 3 accesses
             use_pmem_for_tiering_hashtable: false, // Default to DRAM
-            #[cfg(feature = "hashtable_tiering")]
+            #[cfg(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))]
             warm_threshold: 2, // Pointer promotion after 2 accesses
-            #[cfg(feature = "hashtable_tiering")]
+            #[cfg(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))]
             hot_threshold: 5, // Physical copy after 5 accesses
             dram_object_limit: 1 * 1024 * 1024 * 1024, // 1 GB default for tiering cache objects
             dram_pointer_limit: 5_000_000, // 1 million metadata pointers default
@@ -120,7 +120,7 @@ pub enum Tier {
     /// Object exists only in PMEM
     PmemOnly,
 
-    #[cfg(feature = "hashtable_tiering")]
+    #[cfg(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))]
     /// Object has metadata/pointer in DRAM but data remains in PMEM (hashtable_tiering feature)
     /// This is the "Warm" tier - metadata access is fast but data is still in CXL
     DramPtrToPmem,
@@ -169,11 +169,8 @@ pub struct TieringManager<K, V> {
     /// TieringObject always uses DRAM allocation (not Hybrid allocator) to ensure
     /// both key and value are in DRAM for fast access to hot objects
     
-    /// When flatmap_hash_and_object_tiering is enabled, use FlatMap with automatic resizing
-    #[cfg(all(feature = "flatmap_hash_and_object_tiering", not(feature = "hashtable_tiering")))]
-    dram_cache: Arc<RwLock<FlatMapWithHasher<HashedKey, TieringObject<K>, NoHasher>>>,
-    
-    #[cfg(all(feature = "flatmap_hash_and_object_tiering", feature = "hashtable_tiering"))]
+    /// When flatmap_hash_and_object_tiering is enabled, use FlatMap with automatic resizing and three-tier support
+    #[cfg(feature = "flatmap_hash_and_object_tiering")]
     dram_cache: Arc<RwLock<FlatMapWithHasher<HashedKey, TieringObject<K, V>, NoHasher>>>,
     
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering"), not(feature = "flatmap_hash_and_object_tiering")))]
@@ -304,7 +301,7 @@ where
     /// 
     /// ## Promotion Heuristic
     /// Objects are promoted after reaching the configured hotness threshold.
-    #[cfg(not(feature = "hashtable_tiering"))]
+    #[cfg(not(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering")))]
     pub fn record_access(&self, key: HashedKey) -> bool {
         let config = self.config.read().unwrap();
         let hotness_threshold = config.hotness_threshold;
@@ -335,7 +332,7 @@ where
         }
     }
 
-    #[cfg(feature = "hashtable_tiering")]
+    #[cfg(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))]
     /// Records an access to an object (hashtable_tiering version)
     /// Returns true if the object should be promoted to DRAM (physical copy or pointer)
     /// 
@@ -377,7 +374,7 @@ where
 
     /// Helper method to create a TieringObject with physically copied data
     /// Extracts bytes from source object and creates a new TieringObject
-    #[cfg(not(feature = "hashtable_tiering"))]
+    #[cfg(not(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering")))]
     fn create_dram_object(&self, object: &Object<K, V>) -> TieringObject<K>
     where
         K: Clone,
@@ -396,7 +393,7 @@ where
         TieringObject::with_expiry(object.key().clone(), dram_data, object.expiry())
     }
 
-    #[cfg(feature = "hashtable_tiering")]
+    #[cfg(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))]
     /// Helper method to create a TieringObject with physically copied data (hashtable_tiering version)
     fn create_dram_object(&self, object: &Object<K, V>) -> TieringObject<K, V>
     where
@@ -416,7 +413,7 @@ where
         TieringObject::with_expiry(object.key().clone(), dram_data, object.expiry())
     }
 
-    #[cfg(feature = "hashtable_tiering")]
+    #[cfg(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))]
     /// Helper method to create a TieringObject with CXL reference (zero-copy)
     fn create_warm_object(&self, object: &Object<K, V>) -> TieringObject<K, V>
     where
@@ -433,7 +430,7 @@ where
     /// Promotes an object to DRAM by creating a physical copy with DRAM-allocated data
     /// Returns true if promotion was successful
     /// The object parameter is the Object from the main cache to copy to DRAM
-    /// This version is for flatmap_hash_and_object_tiering feature
+    /// This version is for flatmap_hash_and_object_tiering feature with two-stage promotion
     #[cfg(feature = "flatmap_hash_and_object_tiering")]
     pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
     where
@@ -443,30 +440,56 @@ where
         let mut info_map = self.object_info.write().unwrap();
 
         if let Some(info) = info_map.get_mut(&key) {
-            if info.tier == Tier::PmemOnly {
-                let config = self.config.read().unwrap();
-                let mut stats = self.stats.write().unwrap();
-                let new_dram_size = stats.dram_size + info.size as u64;
+            let config = self.config.read().unwrap();
+            
+            match info.tier {
+                Tier::PmemOnly => {
+                    // Promote to warm tier (pointer-only, zero-copy)
+                    if info.access_count >= config.warm_threshold {
+                        info.tier = Tier::DramPtrToPmem;
 
-                // Check if promotion would exceed threshold
-                if new_dram_size <= config.dram_threshold {
-                    info.tier = Tier::DramAndPmem;
+                        // Create warm object with CXL reference
+                        let warm_object = self.create_warm_object(object);
+                        
+                        // Store the TieringObject in the DRAM cache
+                        self.dram_cache.write().unwrap().insert(key, warm_object);
 
-                    // Create DRAM object with physical data copy
-                    let dram_object = self.create_dram_object(object);
-                    
-                    // Store the TieringObject in the DRAM cache
-                    self.dram_cache.write().unwrap().insert(key, dram_object);
+                        let mut dram_objects = self.dram_objects.write().unwrap();
+                        dram_objects.insert(key);
 
-                    let mut dram_objects = self.dram_objects.write().unwrap();
-                    dram_objects.insert(key);
+                        let mut stats = self.stats.write().unwrap();
+                        stats.dram_objects += 1;
+                        stats.pmem_only_objects -= 1;
+                        stats.promotions += 1;
 
-                    stats.dram_size = new_dram_size;
-                    stats.dram_objects += 1;
-                    stats.pmem_only_objects -= 1;
-                    stats.promotions += 1;
+                        return true;
+                    }
+                }
+                Tier::DramPtrToPmem => {
+                    // Upgrade to hot tier (physical copy)
+                    if info.access_count >= config.hot_threshold {
+                        let mut stats = self.stats.write().unwrap();
+                        let new_dram_size = stats.dram_size + info.size as u64;
 
-                    return true;
+                        // Check if promotion would exceed threshold
+                        if new_dram_size <= config.dram_threshold {
+                            info.tier = Tier::DramAndPmem;
+
+                            // Create DRAM object with physical data copy
+                            let dram_object = self.create_dram_object(object);
+                            
+                            // Update the existing TieringObject in the DRAM cache
+                            self.dram_cache.write().unwrap().insert(key, dram_object);
+
+                            stats.dram_size = new_dram_size;
+                            stats.promotions += 1;
+
+                            return true;
+                        }
+                    }
+                }
+                Tier::DramAndPmem => {
+                    // Already in hot tier
                 }
             }
         }
@@ -731,7 +754,7 @@ where
     
     /// Demotes an object from DRAM (removes the DRAM copy, keeps PMEM)
     /// Returns true if demotion was successful
-    /// This version is for flatmap_hash_and_object_tiering feature
+    /// This version is for flatmap_hash_and_object_tiering feature with three-tier support
     #[cfg(feature = "flatmap_hash_and_object_tiering")]
     pub fn demote_from_dram(&self, key: HashedKey) -> bool 
     where
@@ -740,22 +763,45 @@ where
         let mut info_map = self.object_info.write().unwrap();
 
         if let Some(info) = info_map.get_mut(&key) {
-            if info.tier == Tier::DramAndPmem {
-                info.tier = Tier::PmemOnly;
+            match info.tier {
+                Tier::DramPtrToPmem => {
+                    // Demote from warm tier (pointer-only)
+                    info.tier = Tier::PmemOnly;
 
-                // Remove from DRAM cache
-                self.dram_cache.write().unwrap().remove(&key);
+                    // Remove from DRAM cache
+                    self.dram_cache.write().unwrap().remove(&key);
 
-                let mut dram_objects = self.dram_objects.write().unwrap();
-                dram_objects.remove(&key);
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
 
-                let mut stats = self.stats.write().unwrap();
-                stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
-                stats.dram_objects = stats.dram_objects.saturating_sub(1);
-                stats.pmem_only_objects += 1;
-                stats.demotions += 1;
+                    let mut stats = self.stats.write().unwrap();
+                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                    stats.pmem_only_objects += 1;
+                    stats.demotions += 1;
 
-                return true;
+                    return true;
+                }
+                Tier::DramAndPmem => {
+                    // Demote from hot tier (physical copy)
+                    info.tier = Tier::PmemOnly;
+
+                    // Remove from DRAM cache
+                    self.dram_cache.write().unwrap().remove(&key);
+
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
+
+                    let mut stats = self.stats.write().unwrap();
+                    stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
+                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                    stats.pmem_only_objects += 1;
+                    stats.demotions += 1;
+
+                    return true;
+                }
+                Tier::PmemOnly => {
+                    // Already in PMEM only
+                }
             }
         }
 
@@ -931,9 +977,9 @@ where
     }
     
     /// Gets a TieringObject from the DRAM cache if it exists there
-    /// Returns a reference to the TieringObject<K> stored in DRAM
+    /// Returns a reference to the TieringObject<K, V> stored in DRAM
     #[cfg(feature = "flatmap_hash_and_object_tiering")]
-    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K>>> {
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K, V>>> {
         self.dram_cache
             .read()
             .unwrap()
@@ -1070,7 +1116,7 @@ where
     }
 
     /// Removes an object from tracking (when it's deleted from cache)
-    /// This version is for flatmap_hash_and_object_tiering feature
+    /// This version is for flatmap_hash_and_object_tiering feature with three-tier support
     #[cfg(feature = "flatmap_hash_and_object_tiering")]
     pub fn remove_object(&self, key: HashedKey) 
     where
@@ -1090,6 +1136,15 @@ where
                     dram_objects.remove(&key);
 
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
+                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                }
+                Tier::DramPtrToPmem => {
+                    // Remove from DRAM cache (pointer-only)
+                    self.dram_cache.write().unwrap().remove(&key);
+                    
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
+
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                 }
                 Tier::PmemOnly => {
