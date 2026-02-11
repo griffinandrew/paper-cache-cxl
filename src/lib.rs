@@ -1685,7 +1685,7 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// Check DRAM tier first
-		#[cfg(all(feature = "enable_tiering_manager", not(feature = "hashtable_tiering")))]
+		#[cfg(all(feature = "enable_tiering_manager", not(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))))]
 		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
 			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
 				self.status.incr_hits();
@@ -1698,7 +1698,7 @@ where
 			}
 		}
 
-		#[cfg(all(feature = "enable_tiering_manager", feature = "hashtable_tiering"))]
+		#[cfg(all(feature = "enable_tiering_manager", any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering")))]
 		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
 			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
 				self.status.incr_hits();
@@ -2389,7 +2389,7 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// Check DRAM tier first
-		#[cfg(all(feature = "enable_tiering_manager", not(feature = "hashtable_tiering")))]
+		#[cfg(all(feature = "enable_tiering_manager", not(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))))]
 		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
 			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
 				self.status.incr_hits();
@@ -2402,7 +2402,7 @@ where
 			}
 		}
 
-		#[cfg(all(feature = "enable_tiering_manager", feature = "hashtable_tiering"))]
+		#[cfg(all(feature = "enable_tiering_manager", any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering")))]
 		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
 			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
 				self.status.incr_hits();

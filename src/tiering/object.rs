@@ -18,7 +18,7 @@ use std::{
 
 use crate::object::ExpireTime;
 
-#[cfg(feature = "hashtable_tiering")]
+#[cfg(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))]
 /// Data storage mode for TieringObject (hashtable_tiering feature)
 #[derive(Clone)]
 pub enum TieringData<V> {
@@ -31,7 +31,7 @@ pub enum TieringData<V> {
 /// TieringObject struct for the tiering manager's DRAM cache.
 /// Both the key and value are always stored in DRAM (not using Hybrid allocator)
 /// to ensure fast access to hot objects.
-#[cfg(not(feature = "hashtable_tiering"))]
+#[cfg(not(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering")))]
 #[derive(Clone)]
 pub struct TieringObject<K> {
     key: K,
@@ -39,7 +39,7 @@ pub struct TieringObject<K> {
     expiry: ExpireTime,
 }
 
-#[cfg(not(feature = "hashtable_tiering"))]
+#[cfg(not(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering")))]
 impl<K: Default> Default for TieringObject<K> {
     fn default() -> Self {
         TieringObject {
@@ -50,7 +50,7 @@ impl<K: Default> Default for TieringObject<K> {
     }
 }
 
-#[cfg(feature = "hashtable_tiering")]
+#[cfg(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))]
 #[derive(Clone)]
 pub struct TieringObject<K, V = Box<[u8]>> {
     key: K,
@@ -58,8 +58,8 @@ pub struct TieringObject<K, V = Box<[u8]>> {
     expiry: ExpireTime,
 }
 
-#[cfg(feature = "hashtable_tiering")]
-impl<K: Default, V: Default> Default for TieringObject<K, V> {
+#[cfg(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))]
+impl<K: Default, V> Default for TieringObject<K, V> {
     fn default() -> Self {
         TieringObject {
             key: K::default(),
@@ -69,7 +69,7 @@ impl<K: Default, V: Default> Default for TieringObject<K, V> {
     }
 }
 
-#[cfg(not(feature = "hashtable_tiering"))]
+#[cfg(not(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering")))]
 impl<K> TieringObject<K> {
     /// Create a new TieringObject with an explicit expiry time
     pub fn with_expiry(key: K, data: Box<[u8]>, expiry: ExpireTime) -> Self {
@@ -109,7 +109,7 @@ impl<K> TieringObject<K> {
     }
 }
 
-#[cfg(feature = "hashtable_tiering")]
+#[cfg(any(feature = "hashtable_tiering", feature = "flatmap_hash_and_object_tiering"))]
 impl<K, V> TieringObject<K, V> {
     /// Create a new TieringObject with physical copy in DRAM
     pub fn with_expiry(key: K, data: Box<[u8]>, expiry: ExpireTime) -> Self {
