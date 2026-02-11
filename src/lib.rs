@@ -1457,7 +1457,7 @@ where
 
 
 
-#[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_pmem")))]
+#[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_pmem"), not(feature = "flatmap_hash_and_object_tiering")))]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
     K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone, //note added Debug for logging might impact perf thoooo
