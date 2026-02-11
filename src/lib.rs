@@ -2268,7 +2268,9 @@ where
 			return Err(CacheError::UnconfiguredPolicy);
 		}
 
-		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		let objects = Arc::new(RwLock::new(
+			FlatMapWithHasher::with_capacity_and_hasher_unchecked(4096, NoHasher::default())
+		));
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 

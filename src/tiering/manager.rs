@@ -1259,7 +1259,10 @@ where
     /// Clears all tiering information (for cache wipe)
     /// This version is for flatmap_hash_and_object_tiering feature
     #[cfg(feature = "flatmap_hash_and_object_tiering")]
-    pub fn clear(&self) {
+    pub fn clear(&self) 
+    where
+        K: Default,
+    {
         let mut info_map = self.object_info.write().unwrap();
         info_map.clear();
 
