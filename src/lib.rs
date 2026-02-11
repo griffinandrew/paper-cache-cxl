@@ -1707,6 +1707,7 @@ where
 			}
 		}
 
+		#[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
@@ -1720,6 +1721,24 @@ where
 				self.status.incr_misses();
 				Err(CacheError::KeyNotFound)
 			},
+		};
+
+		#[cfg(feature = "flatmap_hash_and_object_tiering")]
+		let result = {
+			let objects_guard = self.objects.read().unwrap();
+			match objects_guard.get(&hashed_key) {
+				Some(object) if object.key_matches(key) && !object.is_expired() => {
+					self.status.incr_hits();
+					// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
+					let arc_val = object.data();
+					Ok(arc_val.as_ref().to_vec())
+				},
+
+				_ => {
+					self.status.incr_misses();
+					Err(CacheError::KeyNotFound)
+				},
+			}
 		};
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
