@@ -24,6 +24,201 @@ use crate::allocator::HybridObjects;
 // Use allocator-api2's Vec which works on stable Rust
 use allocator_api2::vec::Vec;
 
+
+
+
+// ============================================================================
+// PmemVecList
+// ============================================================================
+
+/// Index into a PmemVecList - wraps a Vec index
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct PmemIndex(usize);
+
+/// A doubly-linked list using Vec-based storage with PMEM allocator
+/// 
+/// Uses a Vec for node storage (simpler than HashMap) with a free list
+/// to reuse deleted slots. This reduces allocator surface area and makes
+/// debugging easier.
+pub struct PmemVecList<T> {
+    entries: Vec<Option<Node<T>>, HybridObjects>,
+    head: Option<usize>,
+    free_list: Vec<usize, HybridObjects>,
+}
+
+struct Node<T> {
+    value: T,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+impl<T> PmemVecList<T> {
+    /// Creates a new empty PmemVecList
+    pub fn new() -> Self {
+        PmemVecList {
+            entries: Vec::new_in(HybridObjects),
+            head: None,
+            free_list: Vec::new_in(HybridObjects),
+        }
+    }
+
+    /// Creates a new PmemVecList with specified capacity
+    /// Use this to avoid reallocation crashes during high-throughput workloads
+    pub fn with_capacity(capacity: usize) -> Self {
+        PmemVecList {
+            entries: Vec::with_capacity_in(capacity, HybridObjects),
+            head: None,
+            free_list: Vec::with_capacity_in(capacity, HybridObjects),
+        }
+    }
+    
+    /// Returns the index of the front element, if any
+    pub fn front_index(&self) -> Option<PmemIndex> {
+        self.head.map(PmemIndex)
+    }
+    
+    /// Returns a reference to the front element, if any
+    pub fn front(&self) -> Option<&T> {
+        self.head.and_then(|idx| {
+            self.entries.get(idx).and_then(|opt_node| {
+                opt_node.as_ref().map(|node| &node.value)
+            })
+        })
+    }
+    
+    /// Returns a mutable reference to the element at the given index
+    pub fn get_mut(&mut self, index: PmemIndex) -> Option<&mut T> {
+        self.entries.get_mut(index.0).and_then(|opt_node| {
+            opt_node.as_mut().map(|node| &mut node.value)
+        })
+    }
+    
+    /// Returns the index of the next element after the given index
+    pub fn get_next_index(&self, index: PmemIndex) -> Option<PmemIndex> {
+        self.entries.get(index.0).and_then(|opt_node| {
+            opt_node.as_ref().and_then(|node| node.next.map(PmemIndex))
+        })
+    }
+    
+    /// Pushes a value to the front of the list
+    pub fn push_front(&mut self, value: T) -> PmemIndex {
+        let node = Node {
+            value,
+            prev: None,
+            next: self.head,
+        };
+        
+        // Allocate index: reuse from free list or append
+        let idx = if let Some(free_idx) = self.free_list.pop() {
+            // CRITICAL FIX: Use ptr::write to overwrite memory without dropping the old value.
+            // If the allocator returns dirty/garbage memory, treating it as a valid Option<Node>
+            // to drop would cause a SEGFAULT.
+            unsafe {
+                std::ptr::write(&mut self.entries[free_idx], Some(node));
+            }
+            free_idx
+        } else {
+            let idx = self.entries.len();
+            self.entries.push(Some(node));
+            idx
+        };
+        
+        // Update old head's prev pointer
+        if let Some(old_head) = self.head {
+            if let Some(Some(old_head_node)) = self.entries.get_mut(old_head) {
+                old_head_node.prev = Some(idx);
+            }
+        }
+        
+        self.head = Some(idx);
+        PmemIndex(idx)
+    }
+    
+    /// Inserts a value after the given index
+    pub fn insert_after(&mut self, index: PmemIndex, value: T) -> PmemIndex {
+        let next_idx = self.entries.get(index.0)
+            .and_then(|opt_node| opt_node.as_ref())
+            .and_then(|node| node.next);
+        
+        let node = Node {
+            value,
+            prev: Some(index.0),
+            next: next_idx,
+        };
+        
+        // Allocate index: reuse from free list or append
+        let idx = if let Some(free_idx) = self.free_list.pop() {
+            // CRITICAL FIX: Use ptr::write to prevent drop-on-garbage
+            unsafe {
+                std::ptr::write(&mut self.entries[free_idx], Some(node));
+            }
+            free_idx
+        } else {
+            let idx = self.entries.len();
+            self.entries.push(Some(node));
+            idx
+        };
+        
+        // Update previous node's next pointer
+        if let Some(Some(prev_node)) = self.entries.get_mut(index.0) {
+            prev_node.next = Some(idx);
+        }
+        
+        // Update next node's prev pointer if it exists
+        if let Some(next) = next_idx {
+            if let Some(Some(next_node)) = self.entries.get_mut(next) {
+                next_node.prev = Some(idx);
+            }
+        }
+        
+        PmemIndex(idx)
+    }
+    
+    /// Removes the element at the given index
+    pub fn remove(&mut self, index: PmemIndex) -> Option<T> {
+        // take() replaces the value with None and returns the old value.
+        // This is generally safe unless the memory was completely corrupted by realloc.
+        let node = self.entries.get_mut(index.0)?.take()?;
+        
+        // Update prev node's next pointer
+        if let Some(prev) = node.prev {
+            if let Some(Some(prev_node)) = self.entries.get_mut(prev) {
+                prev_node.next = node.next;
+            }
+        } else {
+            self.head = node.next;
+        }
+        
+        // Update next node's prev pointer
+        if let Some(next) = node.next {
+            if let Some(Some(next_node)) = self.entries.get_mut(next) {
+                next_node.prev = node.prev;
+            }
+        }
+        
+        // Add index to free list for reuse
+        self.free_list.push(index.0);
+        
+        Some(node.value)
+    }
+    
+    /// Clears the list
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.head = None;
+        self.free_list.clear();
+    }
+}
+
+impl<T> Default for PmemVecList<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+
+
+/* 
 // ============================================================================
 // PmemVecList
 // ============================================================================
@@ -203,6 +398,8 @@ impl<T> Default for PmemVecList<T> {
         Self::new()
     }
 }
+
+*/
 
 // ============================================================================
 // PmemHashList

@@ -52,13 +52,27 @@ pub struct LfuStack {
 }
 
 #[cfg(feature = "eviction_stack_pmem")]
+#[cfg(feature = "eviction_stack_pmem")]
 impl Default for LfuStack {
-	fn default() -> Self {
-		LfuStack {
-			index_map: HashMap::with_hasher_in(NoHasher::default(), HybridObjects),
-			count_stacks: PmemVecList::new(),
-		}
-	}
+    fn default() -> Self {
+        // Pre-allocate 2M items to stop resizing segfaults during your benchmark
+        Self::with_capacity(2_000_000)
+    }
+}
+
+
+#[cfg(feature = "eviction_stack_pmem")]
+impl LfuStack {
+    pub fn with_capacity(capacity: usize) -> Self {
+        LfuStack {
+            index_map: HashMap::with_capacity_and_hasher_in(
+                capacity, 
+                NoHasher::default(), 
+                HybridObjects
+            ),
+            count_stacks: PmemVecList::with_capacity(capacity),
+        }
+    }
 }
 
 #[cfg(not(feature = "eviction_stack_pmem"))]
