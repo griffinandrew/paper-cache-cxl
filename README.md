@@ -12,6 +12,8 @@ This branch will add the needed instrumentation to count how many memory accesse
 
 add support for tiering the hash table acorss memory levels
 
+stage copy of current working branch.... 
+
 ## Performance Counters
 
 PaperCache includes **two types** of performance counters to track memory access patterns for hashmap structures with both DRAM and PMEM configurations.
