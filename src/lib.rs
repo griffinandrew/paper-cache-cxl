@@ -68,6 +68,7 @@ pub mod tiering;
 #[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "flatmap_hash_and_object_tiering"))]
 pub mod flatmap;
 
+use crate::flatmap::FlatMapWithHasher;
 
 use std::sync::RwLock;
 
@@ -2674,7 +2675,8 @@ where
 	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		let mut object = match self.objects.write().unwrap().get_mut(&hashed_key) {
+		let mut binding = self.objects.write().unwrap();
+		let mut object = match binding.get_mut(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => object,
 			_ => return Err(CacheError::KeyNotFound),
 		};
@@ -5062,7 +5064,7 @@ where
 
 
 // FlatMap erase function - uses get/remove instead of entry API
-#[cfg(any(feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
+#[cfg(any(feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "flatmap_hash_and_object_tiering" ))]
 pub fn erase<K, V>(
 	objects: &ObjectMapRef<K, V>,
 	status: &StatusRef,
@@ -5130,7 +5132,7 @@ where
 
 
 
-#[cfg(all(not(any(feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "hashbrown_dram"))))]
+#[cfg(all(not(any(feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "hashbrown_dram", feature = "flatmap_hash_and_object_tiering"))))]
 pub fn erase<K, V>(
 	objects: &ObjectMapRef<K, V>,
 	status: &StatusRef,
