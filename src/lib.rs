@@ -68,6 +68,7 @@ pub mod tiering;
 #[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "flatmap_hash_and_object_tiering"))]
 pub mod flatmap;
 
+#[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "flatmap_hash_and_object_tiering"))]
 use crate::flatmap::FlatMapWithHasher;
 
 use std::sync::RwLock;
