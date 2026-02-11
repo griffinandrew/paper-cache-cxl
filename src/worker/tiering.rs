@@ -87,8 +87,20 @@ where
                     // Record access and check if we should promote
                     if self.tiering_manager.record_access(hashed_key) {
                         // Object should be promoted to DRAM - copy the Object
-                        if let Some(object_ref) = self.objects.get(&hashed_key) {
-                            if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
+                        #[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
+                        let object_ref_opt = self.objects.get(&hashed_key);
+                        
+                        #[cfg(feature = "flatmap_hash_and_object_tiering")]
+                        let object_ref_opt = self.objects.read().unwrap().get(&hashed_key).map(|obj| obj.clone());
+                        
+                        if let Some(object_ref) = object_ref_opt {
+                            #[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
+                            let promote_result = self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref);
+                            
+                            #[cfg(feature = "flatmap_hash_and_object_tiering")]
+                            let promote_result = self.tiering_manager.promote_to_dram_with_object(hashed_key, &object_ref);
+                            
+                            if promote_result {
                                 debug!("Promoted object {} to DRAM", hashed_key);
                             }
                         }
@@ -102,8 +114,18 @@ where
                     self.tiering_manager.register_object(hashed_key, base_size);
                 } else {
                     // Object updated - update DRAM copy if it exists
-                    if let Some(object_ref) = self.objects.get(&hashed_key) {
+                    #[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
+                    let object_ref_opt = self.objects.get(&hashed_key);
+                    
+                    #[cfg(feature = "flatmap_hash_and_object_tiering")]
+                    let object_ref_opt = self.objects.read().unwrap().get(&hashed_key).map(|obj| obj.clone());
+                    
+                    if let Some(object_ref) = object_ref_opt {
+                        #[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
                         self.tiering_manager.update_dram_copy(hashed_key, &*object_ref);
+                        
+                        #[cfg(feature = "flatmap_hash_and_object_tiering")]
+                        self.tiering_manager.update_dram_copy(hashed_key, &object_ref);
                     }
                 }
             }

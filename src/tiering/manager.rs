@@ -438,6 +438,7 @@ where
     pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
     where
         V: AsRef<[u8]>,
+        K: Default,
     {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -732,7 +733,10 @@ where
     /// Returns true if demotion was successful
     /// This version is for flatmap_hash_and_object_tiering feature
     #[cfg(feature = "flatmap_hash_and_object_tiering")]
-    pub fn demote_from_dram(&self, key: HashedKey) -> bool {
+    pub fn demote_from_dram(&self, key: HashedKey) -> bool 
+    where
+        K: Default,
+    {
         let mut info_map = self.object_info.write().unwrap();
 
         if let Some(info) = info_map.get_mut(&key) {
@@ -979,6 +983,7 @@ where
     pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
     where
         V: AsRef<[u8]>,
+        K: Default,
     {
         // Only update if object is currently in DRAM
         if self.is_in_dram(&key) {
@@ -1065,7 +1070,37 @@ where
     }
 
     /// Removes an object from tracking (when it's deleted from cache)
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
+    /// This version is for flatmap_hash_and_object_tiering feature
+    #[cfg(feature = "flatmap_hash_and_object_tiering")]
+    pub fn remove_object(&self, key: HashedKey) 
+    where
+        K: Default,
+    {
+        let mut info_map = self.object_info.write().unwrap();
+
+        if let Some(info) = info_map.remove(&key) {
+            let mut stats = self.stats.write().unwrap();
+
+            match info.tier {
+                Tier::DramAndPmem => {
+                    // Remove from DRAM cache
+                    self.dram_cache.write().unwrap().remove(&key);
+                    
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
+
+                    stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
+                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                }
+                Tier::PmemOnly => {
+                    stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    /// Removes an object from tracking (when it's deleted from cache)
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering"), not(feature = "flatmap_hash_and_object_tiering")))]
     pub fn remove_object(&self, key: HashedKey) {
         let mut info_map = self.object_info.write().unwrap();
 
