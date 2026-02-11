@@ -97,7 +97,13 @@ impl<T> PmemVecList<T> {
         
         // Allocate index: reuse from free list or append
         let idx = if let Some(free_idx) = self.free_list.pop() {
-            self.entries[free_idx] = Some(node);
+            //self.entries[free_idx] = Some(node);
+
+            unsafe {
+                std::ptr::write(&mut self.entries[free_idx], Some(node));
+            }
+
+
             free_idx
         } else {
             let idx = self.entries.len();
@@ -130,7 +136,12 @@ impl<T> PmemVecList<T> {
         
         // Allocate index: reuse from free list or append
         let idx = if let Some(free_idx) = self.free_list.pop() {
-            self.entries[free_idx] = Some(node);
+            //self.entries[free_idx] = Some(node);
+
+            unsafe {
+                std::ptr::write(&mut self.entries[free_idx], Some(node));
+            }
+           
             free_idx
         } else {
             let idx = self.entries.len();
@@ -255,7 +266,11 @@ where
         
         // Allocate index: reuse from free list or append
         let idx = if let Some(free_idx) = self.free_list.pop() {
-            self.entries[free_idx] = Some(node);
+            //self.entries[free_idx] = Some(node);
+
+            unsafe {
+                std::ptr::write(&mut self.entries[free_idx], Some(node));
+            }
             free_idx
         } else {
             let idx = self.entries.len();
