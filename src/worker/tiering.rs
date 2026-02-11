@@ -416,11 +416,11 @@ where
 
             }
 
-            //println!("SIZE: {}", self.tiering_manager.stats().dram_size);
-            //println!("OBJS: {}", self.tiering_manager.stats().dram_objects);
-            //println!("PROS: {}", self.tiering_manager.stats().promotions);
-            //println!("DEMS: {}", self.tiering_manager.stats().demotions);
-            //println!("PMEM: {}", self.tiering_manager.stats().pmem_only_objects);
+            debug!("SIZE: {}", self.tiering_manager.stats().dram_size);
+            debug!("OBJS: {}", self.tiering_manager.stats().dram_objects);
+            debug!("PROS: {}", self.tiering_manager.stats().promotions);
+            debug!("DEMS: {}", self.tiering_manager.stats().demotions);
+            debug!("PMEM: {}", self.tiering_manager.stats().pmem_only_objects);
         }
     }
 }
@@ -464,11 +464,11 @@ where
 
             }
 
-            //println!("SIZE: {}", self.tiering_manager.stats().dram_size);
-            //println!("OBJS: {}", self.tiering_manager.stats().dram_objects);
-            //println!("PROS: {}", self.tiering_manager.stats().promotions);
-            //println!("DEMS: {}", self.tiering_manager.stats().demotions);
-            //println!("PMEM: {}", self.tiering_manager.stats().pmem_only_objects);
+            debug!("SIZE: {}", self.tiering_manager.stats().dram_size);
+            debug!("OBJS: {}", self.tiering_manager.stats().dram_objects);
+            debug!("PROS: {}", self.tiering_manager.stats().promotions);
+            debug!("DEMS: {}", self.tiering_manager.stats().demotions);
+            debug!("PMEM: {}", self.tiering_manager.stats().pmem_only_objects);
         }
     }
 }
