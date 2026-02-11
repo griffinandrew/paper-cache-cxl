@@ -977,3 +977,247 @@ where
         }
     }
 }
+
+/// A sharded FlatMapWithHasher that distributes keys across multiple shards to reduce lock contention.
+/// Each shard is protected by its own RwLock, allowing concurrent access to different shards.
+///
+/// # Type Parameters
+///
+/// * `K` - The key type (must be Hash + Eq)
+/// * `V` - The value type
+/// * `S` - The hasher type
+/// * `A` - The allocator type (defaults to Global)
+///
+/// # Design
+///
+/// The number of shards is configurable and should be a power of 2 for optimal performance.
+/// Keys are distributed across shards based on their hash value modulo the shard count.
+/// This allows concurrent access to different shards without global lock contention.
+pub struct ShardedFlatMap<K, V, S, A: Allocator = Global> {
+    shards: Vec<std::sync::RwLock<FlatMapWithHasher<K, V, S, A>>>,
+    shard_count: usize,
+    shard_mask: usize,
+}
+
+impl<K, V, S> ShardedFlatMap<K, V, S, Global>
+where
+    K: Hash + Eq + Default + Clone,
+    V: Default + Clone,
+    S: BuildHasher + Default + Clone,
+{
+    /// Creates a new ShardedFlatMap with the specified total capacity and number of shards.
+    /// The capacity is distributed evenly across all shards.
+    ///
+    /// # Arguments
+    ///
+    /// * `total_capacity` - Total capacity across all shards
+    /// * `shard_count` - Number of shards (should be a power of 2)
+    ///
+    /// # Panics
+    ///
+    /// Panics if shard_count is 0 or not a power of 2.
+    pub fn with_capacity_and_shards(total_capacity: usize, shard_count: usize) -> Self {
+        assert!(shard_count > 0, "Shard count must be greater than 0");
+        assert!(shard_count.is_power_of_two(), "Shard count must be a power of 2");
+        
+        let capacity_per_shard = total_capacity / shard_count;
+        let hasher = S::default();
+        
+        let shards = (0..shard_count)
+            .map(|_| {
+                std::sync::RwLock::new(
+                    FlatMapWithHasher::with_capacity_and_hasher(capacity_per_shard, hasher.clone())
+                )
+            })
+            .collect();
+        
+        Self {
+            shards,
+            shard_count,
+            shard_mask: shard_count - 1,
+        }
+    }
+}
+
+impl<K, V, S, A: Allocator> ShardedFlatMap<K, V, S, A>
+where
+    K: Hash + Eq,
+    S: BuildHasher + Clone + Default,
+{
+    /// Computes which shard a key belongs to based on its hash.
+    #[inline(always)]
+    fn shard_index<Q>(&self, key: &Q) -> usize
+    where
+        Q: Hash,
+    {
+        use std::hash::Hasher;
+        let mut hasher = S::default().build_hasher();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        (hash as usize) & self.shard_mask
+    }
+    
+    /// Gets a reference to the value associated with the key.
+    #[inline]
+    pub fn get<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q>,
+        V: Clone,
+    {
+        let shard_idx = self.shard_index(key);
+        let shard = self.shards[shard_idx].read().unwrap();
+        shard.get(key).cloned()
+    }
+    
+    /// Gets a reference to the value and applies a function to it.
+    /// This allows reading properties without cloning the entire value.
+    #[inline]
+    pub fn get_with<Q, F, R>(&self, key: &Q, f: F) -> Option<R>
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q>,
+        F: FnOnce(&V) -> R,
+    {
+        let shard_idx = self.shard_index(key);
+        let shard = self.shards[shard_idx].read().unwrap();
+        shard.get(key).map(f)
+    }
+    
+    /// Inserts a key-value pair into the map.
+    /// Returns the previous value if the key was already present.
+    #[inline]
+    pub fn insert(&self, key: K, value: V) -> Option<V>
+    where
+        K: Default + Clone,
+        V: Default + Clone,
+        A: Clone,
+    {
+        let shard_idx = self.shard_index(&key);
+        let mut shard = self.shards[shard_idx].write().unwrap();
+        shard.insert(key, value)
+    }
+    
+    /// Removes a key from the map, returning the value if the key was present.
+    #[inline]
+    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q> + Default + Clone,
+        V: Default + Clone,
+    {
+        let shard_idx = self.shard_index(key);
+        let mut shard = self.shards[shard_idx].write().unwrap();
+        shard.remove(key)
+    }
+    
+    /// Removes a key from the map without Clone/Default constraints.
+    /// Uses unsafe ptr::read to extract the value.
+    #[inline]
+    pub fn remove_unchecked<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q>,
+    {
+        let shard_idx = self.shard_index(key);
+        let mut shard = self.shards[shard_idx].write().unwrap();
+        shard.remove_unchecked(key)
+    }
+    
+    /// Checks if the map contains the given key.
+    #[inline]
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q>,
+    {
+        let shard_idx = self.shard_index(key);
+        let shard = self.shards[shard_idx].read().unwrap();
+        shard.contains_key(key)
+    }
+    
+    /// Returns the total number of elements across all shards.
+    pub fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.read().unwrap().len())
+            .sum()
+    }
+    
+    /// Returns true if the map is empty.
+    pub fn is_empty(&self) -> bool {
+        self.shards
+            .iter()
+            .all(|shard| shard.read().unwrap().is_empty())
+    }
+    
+    /// Returns the total capacity across all shards.
+    pub fn capacity(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.read().unwrap().capacity())
+            .sum()
+    }
+    
+    /// Clears all shards, removing all key-value pairs.
+    pub fn clear(&self)
+    where
+        K: Default,
+        V: Default,
+    {
+        for shard in &self.shards {
+            shard.write().unwrap().clear();
+        }
+    }
+    
+    /// Gets a mutable reference to a value, allowing modification via a closure.
+    /// This is useful when you need to modify a value in place.
+    pub fn get_mut_with<Q, F, R>(&self, key: &Q, f: F) -> Option<R>
+    where
+        Q: Hash + Eq,
+        K: PartialEq<Q>,
+        F: FnOnce(&mut V) -> R,
+    {
+        let shard_idx = self.shard_index(key);
+        let mut shard = self.shards[shard_idx].write().unwrap();
+        shard.get_mut(key).map(f)
+    }
+}
+
+impl<K, V, S, A: Allocator + Clone> ShardedFlatMap<K, V, S, A>
+where
+    K: Hash + Eq + Default + Clone,
+    V: Default + Clone,
+    S: BuildHasher + Default + Clone,
+{
+    /// Creates a new ShardedFlatMap with a custom allocator.
+    pub fn with_capacity_shards_and_alloc_unchecked(
+        total_capacity: usize,
+        shard_count: usize,
+        alloc: A,
+    ) -> Self {
+        assert!(shard_count > 0, "Shard count must be greater than 0");
+        assert!(shard_count.is_power_of_two(), "Shard count must be a power of 2");
+        
+        let capacity_per_shard = total_capacity / shard_count;
+        let hasher = S::default();
+        
+        let shards = (0..shard_count)
+            .map(|_| {
+                std::sync::RwLock::new(
+                    FlatMapWithHasher::with_capacity_hasher_in_unchecked(
+                        capacity_per_shard,
+                        hasher.clone(),
+                        alloc.clone(),
+                    )
+                )
+            })
+            .collect();
+        
+        Self {
+            shards,
+            shard_count,
+            shard_mask: shard_count - 1,
+        }
+    }
+}

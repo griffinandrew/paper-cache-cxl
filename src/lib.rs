@@ -159,8 +159,9 @@ pub type BufferDRAM = Box<[u8]>;
 
 
 // FlatMap for both Global and Tiering caches (unified tiering with resizing)
+// Using ShardedFlatMap to eliminate global lock contention
 #[cfg(feature = "flatmap_hash_and_object_tiering")]
-pub type ObjectMapRef<K, V> = Arc<RwLock<crate::flatmap::FlatMapWithHasher<HashedKey, Object<K, V>, NoHasher>>>;
+pub type ObjectMapRef<K, V> = Arc<crate::flatmap::ShardedFlatMap<HashedKey, Object<K, V>, NoHasher>>;
 
 #[cfg(all(not(feature = "alloc_api_exp"), not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram"), not(feature = "global_flatmap_pmem"), not(feature = "hashbrown_dram"), not(feature = "flatmap_hash_and_object_tiering")))]
 pub type ObjectMapRef<K, V> = Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>;
@@ -315,12 +316,17 @@ where
 			return Err(CacheError::UnconfiguredPolicy);
 		}
 
-		// FlatMap for unified tiering: Start with smaller initial capacity since it will resize automatically
+		// FlatMap for unified tiering: Use sharded version to eliminate global lock contention
+		// Use 64 shards (power of 2) for good parallelism across CPU cores
 		#[cfg(feature = "flatmap_hash_and_object_tiering")]
 		let objects = {
-			// Start with initial capacity of 4096, will resize automatically at 75% load
-			let initial_capacity = 4096_usize.next_power_of_two();
-			Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_and_hasher_unchecked(initial_capacity, NoHasher::default())))
+			// Estimate number of objects based on average object size (conservative estimate: 1KB per object)
+			let estimated_objects = (max_size / 1024).max(4096) as usize;
+			// Use 2x overhead for low load factor and ensure power of 2
+			let total_capacity = (estimated_objects * 2).next_power_of_two();
+			// Use 64 shards for good parallelism (power of 2)
+			let shard_count = 64;
+			Arc::new(crate::flatmap::ShardedFlatMap::with_capacity_and_shards(total_capacity, shard_count))
 		};
 
 		#[cfg(all(not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram"), not(feature = "global_flatmap_pmem"), not(feature = "hashbrown_dram"), not(feature = "flatmap_hash_and_object_tiering")))]
@@ -1744,21 +1750,25 @@ where
 
 		#[cfg(feature = "flatmap_hash_and_object_tiering")]
 		let result = {
-			let objects_guard = self.objects.read().unwrap();
-			match objects_guard.get(&hashed_key) {
-				Some(object) if object.key_matches(key) && !object.is_expired() => {
-					self.status.incr_hits();
+			// Use get_with to avoid cloning the entire object, just access what we need
+			match self.objects.get_with(&hashed_key, |object| {
+				if object.key_matches(key) && !object.is_expired() {
 					// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
 					let arc_val = object.data();
-
 					#[cfg(debug_assertions)] {
 					println!("CACHE: get for key {:?} from DRAM tier", key);
 					println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
 					println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
 					}
-					Ok(arc_val.as_ref().to_vec())
+					Some(arc_val.as_ref().to_vec())
+				} else {
+					None
+				}
+			}) {
+				Some(Some(data)) => {
+					self.status.incr_hits();
+					Ok(data)
 				},
-
 				_ => {
 					self.status.incr_misses();
 					Err(CacheError::KeyNotFound)
@@ -2475,15 +2485,20 @@ where
 
 		#[cfg(feature = "flatmap_hash_and_object_tiering")]
 		let result = {
-			let objects_guard = self.objects.read().unwrap();
-			match objects_guard.get(&hashed_key) {
-				Some(object) if object.key_matches(key) && !object.is_expired() => {
-					self.status.incr_hits();
+			// Use get_with to avoid cloning the entire object, just access what we need
+			match self.objects.get_with(&hashed_key, |object| {
+				if object.key_matches(key) && !object.is_expired() {
 					// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
 					let arc_val = object.data();
-					Ok(arc_val.as_ref().to_vec())
+					Some(arc_val.as_ref().to_vec())
+				} else {
+					None
+				}
+			}) {
+				Some(Some(data)) => {
+					self.status.incr_hits();
+					Ok(data)
 				},
-
 				_ => {
 					self.status.incr_misses();
 					Err(CacheError::KeyNotFound)
@@ -2570,6 +2585,17 @@ where
 
 		self.status.incr_sets();
 
+		#[cfg(feature = "flatmap_hash_and_object_tiering")]
+		let old_object_info = self.objects
+			.insert(hashed_key, object)
+			.map(|old_object| {
+				let base_size = self.overhead_manager.base_size(&old_object);
+				let expiry = old_object.expiry();
+
+				(base_size, expiry)
+			});
+
+		#[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
 		let old_object_info = self.objects.write().unwrap()
 			.insert(hashed_key, object)
 			.map(|old_object| {
@@ -2653,9 +2679,19 @@ where
 	pub fn has(&self, key: &K) -> bool {
 		let hashed_key = self.hash_key(key);
 
-		self.objects.read().unwrap()
-			.get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
+		#[cfg(feature = "flatmap_hash_and_object_tiering")]
+		{
+			self.objects
+				.get_with(&hashed_key, |object| object.key_matches(key) && !object.is_expired())
+				.unwrap_or(false)
+		}
+
+		#[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
+		{
+			self.objects.read().unwrap()
+				.get(&hashed_key)
+				.is_some_and(|object| object.key_matches(key) && !object.is_expired())
+		}
 	}
 
 	/// Gets (peeks) the value associated with the supplied key without altering
@@ -2691,11 +2727,28 @@ where
 	pub fn peek(&self, key: &K) -> Result<Arc<BufferPMEM>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
+		#[cfg(feature = "flatmap_hash_and_object_tiering")]
+		{
+			self.objects
+				.get_with(&hashed_key, |object| {
+					if object.key_matches(key) && !object.is_expired() {
+						Some(object.data())
+					} else {
+						None
+					}
+				})
+				.flatten()
+				.ok_or(CacheError::KeyNotFound)
+		}
 
-			_ => Err(CacheError::KeyNotFound),
+		#[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
+		{
+			match self.objects.read().unwrap().get(&hashed_key) {
+				Some(object) if object.key_matches(key) && !object.is_expired() =>
+					Ok(object.data()),
+
+				_ => Err(CacheError::KeyNotFound),
+			}
 		}
 	}
 
@@ -2720,24 +2773,61 @@ where
 	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		let mut binding = self.objects.write().unwrap();
-		let mut object = match binding.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
+		#[cfg(feature = "flatmap_hash_and_object_tiering")]
+		{
+			let result = self.objects.get_mut_with(&hashed_key, |object| {
+				if object.key_matches(key) && !object.is_expired() {
+					let old_expiry = object.expiry();
+					let old_base_size = self.overhead_manager.base_size(&object);
 
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
+					object.expires(ttl);
 
-		object.expires(ttl);
+					let new_expiry = object.expiry();
+					let new_base_size = self.overhead_manager.base_size(&object);
 
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
+					let base_size_delta = new_base_size as i64 - old_base_size as i64;
 
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
+					Some((old_expiry, new_expiry, base_size_delta))
+				} else {
+					None
+				}
+			});
 
-		Ok(())
+			match result {
+				Some(Some((old_expiry, new_expiry, base_size_delta))) => {
+					self.status.update_base_used_size(base_size_delta);
+					self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
+					Ok(())
+				},
+				_ => Err(CacheError::KeyNotFound),
+			}
+		}
+
+		#[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
+		{
+			let mut binding = self.objects.write().unwrap();
+			let mut object = match binding.get_mut(&hashed_key) {
+				Some(object) if object.key_matches(key) && !object.is_expired() => object,
+				_ => return Err(CacheError::KeyNotFound),
+			};
+
+			let old_expiry = object.expiry();
+			let old_base_size = self.overhead_manager.base_size(&object);
+
+			object.expires(ttl);
+
+			let new_expiry = object.expiry();
+			let new_base_size = self.overhead_manager.base_size(&object);
+
+			let base_size_delta = new_base_size as i64 - old_base_size as i64;
+
+			drop(binding);
+
+			self.status.update_base_used_size(base_size_delta);
+			self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
+
+			Ok(())
+		}
 	}
 
 	/// Gets the size of the value associated with the supplied key in bytes.
@@ -2763,11 +2853,28 @@ where
 	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
+		#[cfg(feature = "flatmap_hash_and_object_tiering")]
+		{
+			self.objects
+				.get_with(&hashed_key, |object| {
+					if object.key_matches(key) && !object.is_expired() {
+						Some(self.overhead_manager.total_size(&object))
+					} else {
+						None
+					}
+				})
+				.flatten()
+				.ok_or(CacheError::KeyNotFound)
+		}
 
-			_ => Err(CacheError::KeyNotFound),
+		#[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
+		{
+			match self.objects.read().unwrap().get(&hashed_key) {
+				Some(object) if object.key_matches(key) && !object.is_expired() =>
+					Ok(self.overhead_manager.total_size(&object)),
+
+				_ => Err(CacheError::KeyNotFound),
+			}
 		}
 	}
 
@@ -2789,7 +2896,12 @@ where
 	pub fn wipe(&self) -> Result<(), CacheError> {
 		info!("Wiping cache");
 
+		#[cfg(feature = "flatmap_hash_and_object_tiering")]
+		self.objects.clear();
+
+		#[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
 		self.objects.write().unwrap().clear();
+
 		self.status.clear();
 
 		self.broadcast(WorkerEvent::Wipe)?;
@@ -5108,8 +5220,8 @@ where
 }
 
 
-// FlatMap erase function - uses get/remove instead of entry API
-#[cfg(any(feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "flatmap_hash_and_object_tiering" ))]
+// FlatMap erase function (non-sharded) - uses get/remove instead of entry API
+#[cfg(all(any(feature = "global_flatmap_dram", feature = "global_flatmap_pmem"), not(feature = "flatmap_hash_and_object_tiering")))]
 pub fn erase<K, V>(
 	objects: &ObjectMapRef<K, V>,
 	status: &StatusRef,
@@ -5154,6 +5266,61 @@ where
 	
 	// Remove the object using unchecked remove (doesn't require Clone/Default)
 	let object = objects_lock.remove_unchecked(&hashed_key).ok_or(CacheError::KeyNotFound)?;
+	let base_size = overhead_manager.base_size(&object) as i64;
+
+	status.update_base_used_size(-base_size);
+	status.decr_num_objects();
+
+	match !object.is_expired() {
+		true => Ok((hashed_key, object)),
+		false => Err(CacheError::KeyNotFound),
+	}
+}
+
+// ShardedFlatMap erase function for flatmap_hash_and_object_tiering
+#[cfg(feature = "flatmap_hash_and_object_tiering")]
+pub fn erase<K, V>(
+	objects: &ObjectMapRef<K, V>,
+	status: &StatusRef,
+	overhead_manager: &OverheadManagerRef,
+	maybe_key: Option<EraseKey<K>>,
+) -> Result<(HashedKey, Object<K, V>), CacheError>
+where
+	K: Eq + TypeSize,
+	V: TypeSize,
+{
+	let hashed_key = match maybe_key {
+		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
+		Some(EraseKey::Hashed(hashed_key)) => hashed_key,
+
+		None => {
+			// For ShardedFlatMap, we need to find any key to evict
+			// This is tricky because we don't have a global iterator
+			// TODO: Implement global key tracking or per-shard random eviction with a
+			// round-robin shard selector to support efficient random eviction
+			error!("Random eviction requires a key to be specified when using ShardedFlatMap");
+			return Err(CacheError::Internal);
+		},
+	};
+
+	// Validate the key if we have the original
+	if let Some(EraseKey::Original(key, _)) = &maybe_key {
+		// Check if object exists and matches key
+		let key_valid = objects.get_with(&hashed_key, |obj| obj.key_matches(key))
+			.unwrap_or(false);
+		
+		if !key_valid {
+			return Err(CacheError::KeyNotFound);
+		}
+	} else {
+		// Just check if key exists
+		if !objects.contains_key(&hashed_key) {
+			return Err(CacheError::KeyNotFound);
+		}
+	}
+	
+	// Remove the object using unchecked remove (doesn't require Clone/Default)
+	let object = objects.remove_unchecked(&hashed_key).ok_or(CacheError::KeyNotFound)?;
 	let base_size = overhead_manager.base_size(&object) as i64;
 
 	status.update_base_used_size(-base_size);
