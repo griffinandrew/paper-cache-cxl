@@ -61,6 +61,14 @@ pub struct TieringConfig {
     /// Hot threshold: minimum access count for full data copy promotion (hashtable_tiering feature)
     /// Objects reaching this threshold get a full physical copy in DRAM
     pub hot_threshold: u64,
+
+    /// Hard limit for DRAM object storage in bytes (Tiering Cache)
+    /// This limits the total size of hot data copies in the DRAM tiering cache
+    pub dram_object_limit: u64,
+
+    /// Soft limit for Global Cache pointer count (metadata entries)
+    /// This limits the number of metadata pointers in the global hashtable
+    pub dram_pointer_limit: usize,
 }
 
 impl Default for TieringConfig {
@@ -75,6 +83,8 @@ impl Default for TieringConfig {
             warm_threshold: 2, // Pointer promotion after 2 accesses
             #[cfg(feature = "hashtable_tiering")]
             hot_threshold: 5, // Physical copy after 5 accesses
+            dram_object_limit: 1 * 1024 * 1024 * 1024, // 1 GB default for tiering cache objects
+            dram_pointer_limit: 1_000_000, // 1 million metadata pointers default
         }
     }
 }
