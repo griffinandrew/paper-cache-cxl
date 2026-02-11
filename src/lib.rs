@@ -5296,9 +5296,9 @@ where
 		None => {
 			// For ShardedFlatMap, we need to find any key to evict
 			// This is tricky because we don't have a global iterator
-			// We'll scan shards until we find one non-empty
-			// TODO: This could be optimized with better tracking
-			error!("Random eviction not efficiently supported with ShardedFlatMap");
+			// TODO: Implement global key tracking or per-shard random eviction with a
+			// round-robin shard selector to support efficient random eviction
+			error!("Random eviction requires a key to be specified when using ShardedFlatMap");
 			return Err(CacheError::Internal);
 		},
 	};

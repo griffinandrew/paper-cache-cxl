@@ -486,7 +486,7 @@ where
         });
 
         match result {
-            Some(Some((true, false, _size, _tier))) => {
+            Some(Some((true, false, _, _))) => {
                 // Promote to warm tier
                 let warm_object = self.create_warm_object(object);
                 self.dram_cache.insert(key, warm_object);
@@ -499,7 +499,7 @@ where
 
                 true
             },
-            Some(Some((false, true, size, _tier))) => {
+            Some(Some((false, true, size, _))) => {
                 // Upgrade to hot tier
                 let mut stats = self.stats.write().unwrap();
                 let new_dram_size = stats.dram_size + size as u64;
