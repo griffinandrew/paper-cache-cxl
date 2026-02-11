@@ -65,6 +65,10 @@ unsafe impl GlobalAlloc for HybridObjects {
             //println!("CACHE: Allocated {} bytes from PMEM", layout.size());
             //println!("CACHE: allocated size (align): {}", layout.align());
             //println!("CACHE: allocated ptr: {:p}", ptr);
+
+            unsafe {
+                ptr.write_bytes(0, layout.size());
+            }
             return ptr;
         }
 
