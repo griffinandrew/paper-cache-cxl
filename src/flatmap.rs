@@ -277,8 +277,8 @@ where
 
 impl<K, V> FlatMap<K, V, Global>
 where
-    K: Hash + Eq + Default,
-    V: Default,
+    K: Hash + Eq + Default + Clone,
+    V: Default + Clone,
 {
     /// Creates a new FlatMap with the specified capacity using the global allocator.
     ///
@@ -296,8 +296,8 @@ where
 
 impl<K, V, A: Allocator> FlatMap<K, V, A>
 where
-    K: Hash + Eq + Default,
-    V: Default,
+    K: Hash + Eq + Default + Clone,
+    V: Default + Clone,
 {
     /// Creates a new FlatMap with the specified capacity and allocator.
     ///
@@ -330,17 +330,66 @@ where
         }
     }
 
+    /// Private method to resize the map when load factor exceeds threshold.
+    /// Doubles the capacity and rehashes all existing entries.
+    fn resize<S>(&mut self, hasher: &S)
+    where
+        S: BuildHasher,
+        A: Clone,
+    {
+        let new_capacity = self.capacity * 2;
+        let new_mask = new_capacity - 1;
+        
+        // Allocate new buckets with the same allocator
+        let alloc_clone = self.buckets.allocator().clone();
+        let mut new_buckets = Vec::with_capacity_in(new_capacity, alloc_clone);
+        for _ in 0..new_capacity {
+            new_buckets.push(Bucket::empty());
+        }
+        
+        // Rehash all existing entries into the new bucket array
+        for old_bucket in self.buckets.iter() {
+            if !old_bucket.is_empty() {
+                let hash = old_bucket.hash;
+                let mut index = (hash as usize) & new_mask;
+                
+                // Linear probing to find an empty slot in new array
+                for _ in 0..new_capacity {
+                    if new_buckets[index].is_empty() {
+                        new_buckets[index] = Bucket {
+                            hash,
+                            key: old_bucket.key.clone(),
+                            val: old_bucket.val.clone(),
+                        };
+                        break;
+                    }
+                    index = (index + 1) & new_mask;
+                }
+            }
+        }
+        
+        // Replace old buckets with new ones
+        self.buckets = new_buckets;
+        self.capacity = new_capacity;
+        self.mask = new_mask;
+    }
+
     /// Inserts a key-value pair into the map with the given hasher.
     ///
     /// Returns the old value if the key was already present.
     ///
-    /// # Panics
-    ///
-    /// Panics if the map is full.
+    /// Automatically resizes the map when load factor exceeds 75%.
     pub fn insert_with_hasher<S>(&mut self, key: K, val: V, hasher: &S) -> Option<V>
     where
         S: BuildHasher,
+        A: Clone,
     {
+        // Check if we need to resize before inserting
+        // Resize at 75% load factor to maintain good performance
+        if (self.len + 1) as f64 > self.capacity as f64 * 0.75 {
+            self.resize(hasher);
+        }
+        
         let hash = self.hash_key_unconstrained(&key, hasher);
         let mut index = (hash as usize) & self.mask;
         
@@ -363,7 +412,8 @@ where
             index = (index + 1) & self.mask;
         }
         
-        panic!("FlatMap is full");
+        // This should never happen after resize implementation
+        panic!("FlatMap is full - resize failed");
     }
 
     /// Removes a key from the map, returning the value if the key was present.
@@ -504,8 +554,8 @@ pub struct FlatMapWithHasher<K, V, S, A: Allocator = Global> {
 
 impl<K, V, S> FlatMapWithHasher<K, V, S, Global>
 where
-    K: Hash + Eq + Default,
-    V: Default,
+    K: Hash + Eq + Default + Clone,
+    V: Default + Clone,
     S: BuildHasher + Default,
 {
     /// Creates a new FlatMapWithHasher with the specified capacity using the global allocator.
@@ -634,14 +684,21 @@ where
     }
 
     /// Internal method to insert without Default constraints.
-    /// Directly implements insert logic to avoid trait bound issues.
+    /// Directly implements insert logic with automatic resizing support.
     pub fn insert_unchecked(&mut self, key: K, val: V) -> Option<V>
     where
-        K: Hash + Eq,
+        K: Hash + Eq + Clone + Default,
+        V: Clone + Default,
         S: BuildHasher,
+        A: Clone,
     {
         use std::mem;
         use crate::flatmap::Bucket;
+        
+        // Check if we need to resize before inserting
+        if (self.map.len + 1) as f64 > self.map.capacity as f64 * 0.75 {
+            self.map.resize(&self.hasher);
+        }
         
         let hash = self.map.hash_key_unconstrained(&key, &self.hasher);
         let mut index = (hash as usize) & self.map.mask;
@@ -665,14 +722,14 @@ where
             index = (index + 1) & self.map.mask;
         }
         
-        panic!("FlatMap is full");
+        panic!("FlatMap is full - resize failed");
     }
 }
 
 impl<K, V, S, A: Allocator> FlatMapWithHasher<K, V, S, A>
 where
-    K: Hash + Eq + Default,
-    V: Default,
+    K: Hash + Eq + Default + Clone,
+    V: Default + Clone,
     S: BuildHasher,
 {
     /// Creates a new FlatMapWithHasher with the specified capacity and allocator.
@@ -684,8 +741,12 @@ where
     }
 
     /// Inserts a key-value pair into the map.
+    /// Automatically resizes when load factor exceeds 75%.
     #[inline]
-    pub fn insert(&mut self, key: K, val: V) -> Option<V> {
+    pub fn insert(&mut self, key: K, val: V) -> Option<V>
+    where
+        A: Clone,
+    {
         self.map.insert_with_hasher(key, val, &self.hasher)
     }
 
@@ -808,14 +869,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "FlatMap is full")]
-    fn test_full_map() {
+    fn test_resize_instead_of_panic() {
+        // Previously this would panic, now it should resize automatically
         let mut map = FlatMap::new(4);
         let hasher = RandomState::new();
         
         for i in 0..5 {
             map.insert_with_hasher(i, i * 10, &hasher);
         }
+        
+        // All items should be present
+        assert_eq!(map.len(), 5);
+        assert!(map.capacity() > 4); // Should have resized
     }
 
     #[test]
@@ -831,6 +896,55 @@ mod tests {
         
         assert_eq!(map.get_with_hasher(&1u64, &hasher), Some(&200u64));
     }
+
+    #[test]
+    fn test_resize() {
+        // Start with a small capacity of 4
+        let mut map = FlatMap::new(4);
+        let hasher = RandomState::new();
+        
+        // Insert 10 items - this should trigger automatic resizing
+        // At 75% load factor: 4 * 0.75 = 3, so resize should happen before 4th insert
+        for i in 0..10 {
+            map.insert_with_hasher(i, i * 10, &hasher);
+        }
+        
+        // Verify all items are present after resize
+        assert_eq!(map.len(), 10);
+        for i in 0..10 {
+            assert_eq!(map.get_with_hasher(&i, &hasher), Some(&(i * 10)));
+        }
+        
+        // Verify capacity has increased (should be at least 8, likely 16)
+        assert!(map.capacity() >= 8);
+    }
+
+    #[test]
+    fn test_resize_preserves_data() {
+        let mut map = FlatMap::new(8);
+        let hasher = RandomState::new();
+        
+        // Fill to just before resize threshold
+        for i in 0..5 {
+            map.insert_with_hasher(i, i * 100, &hasher);
+        }
+        
+        let initial_capacity = map.capacity();
+        
+        // Insert more to trigger resize
+        for i in 5..20 {
+            map.insert_with_hasher(i, i * 100, &hasher);
+        }
+        
+        // Verify capacity increased
+        assert!(map.capacity() > initial_capacity);
+        
+        // Verify all data is preserved
+        assert_eq!(map.len(), 20);
+        for i in 0..20 {
+            assert_eq!(map.get_with_hasher(&i, &hasher), Some(&(i * 100)));
+        }
+    }
 }
 
 impl<K, V, S, A: Allocator> FlatMapWithHasher<K, V, S, A>
@@ -841,8 +955,8 @@ where
     /// Creates a new FlatMapWithHasher with the specified capacity and hasher without Default constraints.
     pub fn with_capacity_and_hasher_unchecked(capacity: usize, hasher: S) -> Self
     where
-        K: Default,
-        V: Default,
+        K: Default + Clone,
+        V: Default + Clone,
         A: Default,
     {
         Self {
@@ -854,8 +968,8 @@ where
     /// Creates a new FlatMapWithHasher with the specified capacity, hasher, and allocator without Default constraints.
     pub fn with_capacity_hasher_in_unchecked(capacity: usize, hasher: S, alloc: A) -> Self
     where
-        K: Default,
-        V: Default,
+        K: Default + Clone,
+        V: Default + Clone,
     {
         Self {
             map: FlatMap::new_in(capacity, alloc),

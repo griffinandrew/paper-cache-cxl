@@ -77,6 +77,9 @@ hw_perf_counters = ["perf-event"]
 # Hashtable tiering: Allows warm objects to have metadata in DRAM while data remains in CXL
 hashtable_tiering = []
 
+# FlatMap for both Global Cache and Tiering Cache with resizing support
+flatmap_hash_and_object_tiering = []
+
 # Legacy features (deprecated, will be removed)
 default = []
 original = []

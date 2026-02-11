@@ -39,12 +39,34 @@ pub struct TieringObject<K> {
     expiry: ExpireTime,
 }
 
+#[cfg(not(feature = "hashtable_tiering"))]
+impl<K: Default> Default for TieringObject<K> {
+    fn default() -> Self {
+        TieringObject {
+            key: K::default(),
+            data: Arc::new(Box::new([])),
+            expiry: None,
+        }
+    }
+}
+
 #[cfg(feature = "hashtable_tiering")]
 #[derive(Clone)]
 pub struct TieringObject<K, V = Box<[u8]>> {
     key: K,
     data: TieringData<V>,
     expiry: ExpireTime,
+}
+
+#[cfg(feature = "hashtable_tiering")]
+impl<K: Default, V: Default> Default for TieringObject<K, V> {
+    fn default() -> Self {
+        TieringObject {
+            key: K::default(),
+            data: TieringData::PhysicalCopy(Arc::new(Box::new([]))),
+            expiry: None,
+        }
+    }
 }
 
 #[cfg(not(feature = "hashtable_tiering"))]
