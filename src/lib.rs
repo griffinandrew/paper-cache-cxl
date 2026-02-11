@@ -7,7 +7,7 @@
 
 
 
-#![cfg_attr(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"), feature(allocator_api))]
+#![cfg_attr(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "flatmap_hash_and_object_tiering"), feature(allocator_api))]
 
 // Validate that both global_flatmap_dram and global_flatmap_pmem are not enabled together
 #[cfg(all(feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
@@ -65,7 +65,7 @@ pub mod hw_perf_counters;
 pub mod tiering;
 
 // FlatMap module - high-performance Linear Probing Hash Map for PMEM/DRAM
-#[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
+#[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "flatmap_hash_and_object_tiering"))]
 pub mod flatmap;
 
 
@@ -156,28 +156,32 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 pub type BufferDRAM = Box<[u8]>;
 
 
-#[cfg(all(not(feature = "alloc_api_exp"), not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram"), not(feature = "global_flatmap_pmem"), not(feature = "hashbrown_dram")))]
+// FlatMap for both Global and Tiering caches (unified tiering with resizing)
+#[cfg(feature = "flatmap_hash_and_object_tiering")]
+pub type ObjectMapRef<K, V> = Arc<RwLock<crate::flatmap::FlatMapWithHasher<HashedKey, Object<K, V>, NoHasher>>>;
+
+#[cfg(all(not(feature = "alloc_api_exp"), not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram"), not(feature = "global_flatmap_pmem"), not(feature = "hashbrown_dram"), not(feature = "flatmap_hash_and_object_tiering")))]
 pub type ObjectMapRef<K, V> = Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>;
 
-#[cfg(all(not(feature = "alloc_api_exp"), feature = "global_hashtable_pmem", not(feature = "global_flatmap_pmem")))]
+#[cfg(all(not(feature = "alloc_api_exp"), feature = "global_hashtable_pmem", not(feature = "global_flatmap_pmem"), not(feature = "flatmap_hash_and_object_tiering")))]
 pub type ObjectMapRef<K, V> = Arc<RwLock<HashMap<HashedKey, Object<K, V>, BuildHasherDefault<NoHashHasher<HashedKey>>, Hybrid>>>;
 
-#[cfg(all(feature = "alloc_api_exp", not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram"), not(feature = "global_flatmap_pmem"), not(feature = "hashbrown_dram")))]
+#[cfg(all(feature = "alloc_api_exp", not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram"), not(feature = "global_flatmap_pmem"), not(feature = "hashbrown_dram"), not(feature = "flatmap_hash_and_object_tiering")))]
 type ObjectMapRef<K, V> = Arc<RwLock<HashMap<u64, Object<K, V>, BuildHasherDefault<NoHashHasher<u64>>>>>;
 
-#[cfg(all(feature = "alloc_api_exp", feature = "global_hashtable_pmem", not(feature = "global_flatmap_pmem")))]
+#[cfg(all(feature = "alloc_api_exp", feature = "global_hashtable_pmem", not(feature = "global_flatmap_pmem"), not(feature = "flatmap_hash_and_object_tiering")))]
 type ObjectMapRef<K, V> = Arc<RwLock<HashMap<u64, Object<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>;
 
 // FlatMap in DRAM (alternative to DashMap)
-#[cfg(feature = "global_flatmap_dram")]
+#[cfg(all(feature = "global_flatmap_dram", not(feature = "flatmap_hash_and_object_tiering")))]
 pub type ObjectMapRef<K, V> = Arc<RwLock<crate::flatmap::FlatMapWithHasher<HashedKey, Object<K, V>, NoHasher>>>;
 
 // FlatMap in PMEM (alternative to HashMap with Hybrid allocator)
-#[cfg(feature = "global_flatmap_pmem")]
+#[cfg(all(feature = "global_flatmap_pmem", not(feature = "flatmap_hash_and_object_tiering")))]
 pub type ObjectMapRef<K, V> = Arc<RwLock<crate::flatmap::FlatMapWithHasher<HashedKey, Object<K, V>, NoHasher, Hybrid>>>;
 
 // Hashbrown HashMap in DRAM (for performance comparison with global_hashtable_pmem)
-#[cfg(feature = "hashbrown_dram")]
+#[cfg(all(feature = "hashbrown_dram", not(feature = "flatmap_hash_and_object_tiering")))]
 pub type ObjectMapRef<K, V> = Arc<RwLock<HashMap<HashedKey, Object<K, V>, BuildHasherDefault<NoHashHasher<HashedKey>>>>>;
 
 
@@ -309,19 +313,27 @@ where
 			return Err(CacheError::UnconfiguredPolicy);
 		}
 
-		#[cfg(all(not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram"), not(feature = "global_flatmap_pmem"), not(feature = "hashbrown_dram")))]
+		// FlatMap for unified tiering: Start with smaller initial capacity since it will resize automatically
+		#[cfg(feature = "flatmap_hash_and_object_tiering")]
+		let objects = {
+			// Start with initial capacity of 4096, will resize automatically at 75% load
+			let initial_capacity = 4096_usize.next_power_of_two();
+			Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_and_hasher_unchecked(initial_capacity, NoHasher::default())))
+		};
+
+		#[cfg(all(not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram"), not(feature = "global_flatmap_pmem"), not(feature = "hashbrown_dram"), not(feature = "flatmap_hash_and_object_tiering")))]
 		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
 		
-		#[cfg(all(feature = "global_hashtable_pmem", not(feature = "global_flatmap_pmem")))]
+		#[cfg(all(feature = "global_hashtable_pmem", not(feature = "global_flatmap_pmem"), not(feature = "flatmap_hash_and_object_tiering")))]
 		let objects = Arc::new(RwLock::new(HashMap::with_hasher_in(NoHasher::default(), Hybrid)));
 		
 		// Hashbrown HashMap in DRAM (for performance comparison)
-		#[cfg(feature = "hashbrown_dram")]
+		#[cfg(all(feature = "hashbrown_dram", not(feature = "flatmap_hash_and_object_tiering")))]
 		let objects = Arc::new(RwLock::new(HashMap::with_hasher(NoHasher::default())));
 		
 		// FlatMap in DRAM: Use a capacity based on max_size with 2x overhead for low load factor
 		// Capacity must be power of 2, so we find the next power of 2 >= (max_size * 2)
-		#[cfg(feature = "global_flatmap_dram")]
+		#[cfg(all(feature = "global_flatmap_dram", not(feature = "flatmap_hash_and_object_tiering")))]
 		let objects = {
 			// Estimate number of objects based on average object size (conservative estimate: 1KB per object)
 			let estimated_objects = (max_size / 1024).max(1024) as usize;
@@ -331,7 +343,7 @@ where
 		};
 		
 		// FlatMap in PMEM: Use a capacity based on max_size with 2x overhead for low load factor
-		#[cfg(feature = "global_flatmap_pmem")]
+		#[cfg(all(feature = "global_flatmap_pmem", not(feature = "flatmap_hash_and_object_tiering")))]
 		let objects = {
 			// Estimate number of objects based on average object size (conservative estimate: 1KB per object)
 			let estimated_objects = (max_size / 1024).max(1024) as usize;
