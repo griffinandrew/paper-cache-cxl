@@ -210,7 +210,10 @@ where
 {
     /// Creates a new TieringManager with the given configuration
     #[cfg(feature = "flatmap_hash_and_object_tiering")]
-    pub fn new(config: TieringConfig) -> Self {
+    pub fn new(config: TieringConfig) -> Self 
+    where
+        K: Default,
+    {
         // Start with a small initial capacity (e.g., 4096) since FlatMap will resize automatically
         let initial_capacity = 4096;
         TieringManager {
@@ -274,7 +277,10 @@ where
     }
 
     /// Creates a new TieringManager with default configuration
-    pub fn with_defaults() -> Self {
+    pub fn with_defaults() -> Self
+    where
+        K: Default,
+    {
         Self::new(TieringConfig::default())
     }
 
@@ -427,7 +433,50 @@ where
     /// Promotes an object to DRAM by creating a physical copy with DRAM-allocated data
     /// Returns true if promotion was successful
     /// The object parameter is the Object from the main cache to copy to DRAM
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
+    /// This version is for flatmap_hash_and_object_tiering feature
+    #[cfg(feature = "flatmap_hash_and_object_tiering")]
+    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
+    where
+        V: AsRef<[u8]>,
+    {
+        let mut info_map = self.object_info.write().unwrap();
+
+        if let Some(info) = info_map.get_mut(&key) {
+            if info.tier == Tier::PmemOnly {
+                let config = self.config.read().unwrap();
+                let mut stats = self.stats.write().unwrap();
+                let new_dram_size = stats.dram_size + info.size as u64;
+
+                // Check if promotion would exceed threshold
+                if new_dram_size <= config.dram_threshold {
+                    info.tier = Tier::DramAndPmem;
+
+                    // Create DRAM object with physical data copy
+                    let dram_object = self.create_dram_object(object);
+                    
+                    // Store the TieringObject in the DRAM cache
+                    self.dram_cache.write().unwrap().insert(key, dram_object);
+
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.insert(key);
+
+                    stats.dram_size = new_dram_size;
+                    stats.dram_objects += 1;
+                    stats.pmem_only_objects -= 1;
+                    stats.promotions += 1;
+
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Promotes an object to DRAM by creating a physical copy with DRAM-allocated data
+    /// Returns true if promotion was successful
+    /// The object parameter is the Object from the main cache to copy to DRAM
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering"), not(feature = "flatmap_hash_and_object_tiering")))]
     pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
     where
         V: AsRef<[u8]>,
@@ -681,7 +730,37 @@ where
     
     /// Demotes an object from DRAM (removes the DRAM copy, keeps PMEM)
     /// Returns true if demotion was successful
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
+    /// This version is for flatmap_hash_and_object_tiering feature
+    #[cfg(feature = "flatmap_hash_and_object_tiering")]
+    pub fn demote_from_dram(&self, key: HashedKey) -> bool {
+        let mut info_map = self.object_info.write().unwrap();
+
+        if let Some(info) = info_map.get_mut(&key) {
+            if info.tier == Tier::DramAndPmem {
+                info.tier = Tier::PmemOnly;
+
+                // Remove from DRAM cache
+                self.dram_cache.write().unwrap().remove(&key);
+
+                let mut dram_objects = self.dram_objects.write().unwrap();
+                dram_objects.remove(&key);
+
+                let mut stats = self.stats.write().unwrap();
+                stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
+                stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                stats.pmem_only_objects += 1;
+                stats.demotions += 1;
+
+                return true;
+            }
+        }
+
+        false
+    }
+    
+    /// Demotes an object from DRAM (removes the DRAM copy, keeps PMEM)
+    /// Returns true if demotion was successful
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering"), not(feature = "flatmap_hash_and_object_tiering")))]
     pub fn demote_from_dram(&self, key: HashedKey) -> bool {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -895,7 +974,24 @@ where
     /// Updates the DRAM cache when an object is updated
     /// Should be called whenever an object in PMEM is updated
     /// This creates a new physical copy with DRAM-allocated data
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    /// This version is for flatmap_hash_and_object_tiering feature
+    #[cfg(feature = "flatmap_hash_and_object_tiering")]
+    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
+    where
+        V: AsRef<[u8]>,
+    {
+        // Only update if object is currently in DRAM
+        if self.is_in_dram(&key) {
+            // Create DRAM object with physical data copy
+            let updated_object = self.create_dram_object(object);
+            self.dram_cache.write().unwrap().insert(key, updated_object);
+        }
+    }
+
+    /// Updates the DRAM cache when an object is updated
+    /// Should be called whenever an object in PMEM is updated
+    /// This creates a new physical copy with DRAM-allocated data
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "flatmap_hash_and_object_tiering")))]
     pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
     where
         V: AsRef<[u8]>,
@@ -1126,7 +1222,24 @@ where
     }
 
     /// Clears all tiering information (for cache wipe)
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    /// This version is for flatmap_hash_and_object_tiering feature
+    #[cfg(feature = "flatmap_hash_and_object_tiering")]
+    pub fn clear(&self) {
+        let mut info_map = self.object_info.write().unwrap();
+        info_map.clear();
+
+        let mut dram_objects = self.dram_objects.write().unwrap();
+        dram_objects.clear();
+        
+        // Clear the DRAM cache
+        self.dram_cache.write().unwrap().clear();
+
+        let mut stats = self.stats.write().unwrap();
+        *stats = TieringStats::default();
+    }
+
+    /// Clears all tiering information (for cache wipe)
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "flatmap_hash_and_object_tiering")))]
     pub fn clear(&self) {
         let mut info_map = self.object_info.write().unwrap();
         info_map.clear();

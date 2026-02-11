@@ -209,7 +209,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 #[cfg(feature = "original")]
 impl<K, V, S> PaperCache<K, V, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug, //note added Debug for logging might impact perf thoooo
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Default + Clone, 
 	V: 'static + TypeSize + Clone,
 	S: Default + Clone + BuildHasher,
 {
