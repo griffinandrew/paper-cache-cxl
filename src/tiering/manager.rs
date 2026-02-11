@@ -215,7 +215,7 @@ where
         K: Default,
     {
         // Start with a small initial capacity (e.g., 4096) since FlatMap will resize automatically
-        let initial_capacity = 4096;
+        let initial_capacity = 33_554_432; // 33554432 is 2^25, a reasonable starting point for testing
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
