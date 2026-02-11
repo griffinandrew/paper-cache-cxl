@@ -159,19 +159,28 @@ pub struct TieringManager<K, V> {
     config: Arc<RwLock<TieringConfig>>,
     stats: Arc<RwLock<TieringStats>>,
 
-    /// Tracking information for each object
+    /// Tracking information for each object (sharded for lock-free concurrent access)
+    #[cfg(feature = "flatmap_hash_and_object_tiering")]
+    object_info: Arc<crate::flatmap::ShardedFlatMap<HashedKey, ObjectTierInfo, NoHasher>>,
+    
+    #[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
     object_info: Arc<RwLock<HashMap<HashedKey, ObjectTierInfo>>>,
 
     /// Set of objects currently in DRAM (for fast lookup)
+    /// Using DashMap for lock-free concurrent access
+    #[cfg(feature = "flatmap_hash_and_object_tiering")]
+    dram_objects: Arc<DashMap<HashedKey, (), NoHasher>>,
+    
+    #[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
     dram_objects: Arc<RwLock<HashSet<HashedKey>>>,
     
     /// DRAM cache storing TieringObject<K> instances
     /// TieringObject always uses DRAM allocation (not Hybrid allocator) to ensure
     /// both key and value are in DRAM for fast access to hot objects
     
-    /// When flatmap_hash_and_object_tiering is enabled, use FlatMap with automatic resizing and three-tier support
+    /// When flatmap_hash_and_object_tiering is enabled, use ShardedFlatMap for lock striping
     #[cfg(feature = "flatmap_hash_and_object_tiering")]
-    dram_cache: Arc<RwLock<FlatMapWithHasher<HashedKey, TieringObject<K, V>, NoHasher>>>,
+    dram_cache: Arc<crate::flatmap::ShardedFlatMap<HashedKey, TieringObject<K, V>, NoHasher>>,
     
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering"), not(feature = "flatmap_hash_and_object_tiering")))]
     dram_cache: Arc<DashMap<HashedKey, TieringObject<K>, NoHasher>>,
@@ -211,15 +220,21 @@ where
     where
         K: Default,
     {
-        // Start with a small initial capacity (e.g., 4096) since FlatMap will resize automatically
-        let initial_capacity = 33_554_432; // 33554432 is 2^25, a reasonable starting point for testing
+        // Use sharding for better concurrency - 64 shards for both caches
+        let total_capacity = 33_554_432; // 2^25, reasonable starting point
+        let shard_count = 64;
+        
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
-            object_info: Arc::new(RwLock::new(HashMap::new())),
-            dram_objects: Arc::new(RwLock::new(HashSet::new())),
-            dram_cache: Arc::new(RwLock::new(
-                FlatMapWithHasher::with_capacity_and_hasher_unchecked(initial_capacity, NoHasher::default())
+            object_info: Arc::new(crate::flatmap::ShardedFlatMap::with_capacity_and_shards(
+                total_capacity,
+                shard_count
+            )),
+            dram_objects: Arc::new(DashMap::with_hasher(NoHasher::default())),
+            dram_cache: Arc::new(crate::flatmap::ShardedFlatMap::with_capacity_and_shards(
+                total_capacity,
+                shard_count
             )),
             _phantom: std::marker::PhantomData,
         }
@@ -437,9 +452,8 @@ where
         V: AsRef<[u8]>,
         K: Default,
     {
-        let mut info_map = self.object_info.write().unwrap();
-
-        if let Some(info) = info_map.get_mut(&key) {
+        // Use get_mut_with to update object_info
+        let result = self.object_info.get_mut_with(&key, |info| {
             let config = self.config.read().unwrap();
             
             match info.tier {
@@ -447,54 +461,70 @@ where
                     // Promote to warm tier (pointer-only, zero-copy)
                     if info.access_count >= config.warm_threshold {
                         info.tier = Tier::DramPtrToPmem;
-
-                        // Create warm object with CXL reference
-                        let warm_object = self.create_warm_object(object);
+                        let size = info.size;
                         
-                        // Store the TieringObject in the DRAM cache
-                        self.dram_cache.write().unwrap().insert(key, warm_object);
-
-                        let mut dram_objects = self.dram_objects.write().unwrap();
-                        dram_objects.insert(key);
-
-                        let mut stats = self.stats.write().unwrap();
-                        stats.dram_objects += 1;
-                        stats.pmem_only_objects -= 1;
-                        stats.promotions += 1;
-
-                        return true;
+                        Some((true, false, size, info.tier)) // (promoted, is_hot_upgrade, size, new_tier)
+                    } else {
+                        None
                     }
                 }
                 Tier::DramPtrToPmem => {
                     // Upgrade to hot tier (physical copy)
                     if info.access_count >= config.hot_threshold {
-                        let mut stats = self.stats.write().unwrap();
-                        let new_dram_size = stats.dram_size + info.size as u64;
-
-                        // Check if promotion would exceed threshold
-                        if new_dram_size <= config.dram_threshold {
-                            info.tier = Tier::DramAndPmem;
-
-                            // Create DRAM object with physical data copy
-                            let dram_object = self.create_dram_object(object);
-                            
-                            // Update the existing TieringObject in the DRAM cache
-                            self.dram_cache.write().unwrap().insert(key, dram_object);
-
-                            stats.dram_size = new_dram_size;
-                            stats.promotions += 1;
-
-                            return true;
-                        }
+                        let size = info.size;
+                        info.tier = Tier::DramAndPmem;
+                        Some((false, true, size, info.tier)) // (promoted, is_hot_upgrade, size, new_tier)
+                    } else {
+                        None
                     }
                 }
                 Tier::DramAndPmem => {
                     // Already in hot tier
+                    None
                 }
             }
-        }
+        });
 
-        false
+        match result {
+            Some(Some((true, false, _size, _tier))) => {
+                // Promote to warm tier
+                let warm_object = self.create_warm_object(object);
+                self.dram_cache.insert(key, warm_object);
+                self.dram_objects.insert(key, ());
+
+                let mut stats = self.stats.write().unwrap();
+                stats.dram_objects += 1;
+                stats.pmem_only_objects -= 1;
+                stats.promotions += 1;
+
+                true
+            },
+            Some(Some((false, true, size, _tier))) => {
+                // Upgrade to hot tier
+                let mut stats = self.stats.write().unwrap();
+                let new_dram_size = stats.dram_size + size as u64;
+
+                // Check if promotion would exceed threshold
+                let config = self.config.read().unwrap();
+                if new_dram_size <= config.dram_threshold {
+                    drop(config);
+                    drop(stats);
+
+                    // Create DRAM object with physical data copy
+                    let dram_object = self.create_dram_object(object);
+                    self.dram_cache.insert(key, dram_object);
+
+                    let mut stats = self.stats.write().unwrap();
+                    stats.dram_size = new_dram_size;
+                    stats.promotions += 1;
+
+                    true
+                } else {
+                    false
+                }
+            },
+            _ => false,
+        }
     }
 
     /// Promotes an object to DRAM by creating a physical copy with DRAM-allocated data
