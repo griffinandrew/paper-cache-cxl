@@ -87,7 +87,7 @@ impl Default for TieringConfig {
             #[cfg(feature = "hashtable_tiering")]
             hot_threshold: 5, // Physical copy after 5 accesses
             dram_object_limit: 1 * 1024 * 1024 * 1024, // 1 GB default for tiering cache objects
-            dram_pointer_limit: 1_000_000, // 1 million metadata pointers default
+            dram_pointer_limit: 5_000_000, // 1 million metadata pointers default
         }
     }
 }
