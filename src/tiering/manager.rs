@@ -754,7 +754,7 @@ where
     
     /// Demotes an object from DRAM (removes the DRAM copy, keeps PMEM)
     /// Returns true if demotion was successful
-    /// This version is for flatmap_hash_and_object_tiering feature with two-tier support
+    /// This version is for flatmap_hash_and_object_tiering feature with three-tier support
     #[cfg(feature = "flatmap_hash_and_object_tiering")]
     pub fn demote_from_dram(&self, key: HashedKey) -> bool 
     where
