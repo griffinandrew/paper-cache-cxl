@@ -849,12 +849,21 @@ where
     
     /// Gets a TieringObject from the DRAM cache if it exists there
     /// Returns a reference to the TieringObject<K> stored in DRAM
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
+    #[cfg(feature = "flatmap_hash_and_object_tiering")]
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K>>> {
+        self.dram_cache
+            .read()
+            .unwrap()
+            .get(key)
+            .map(|obj| Arc::new(obj.clone()))
+    }
+
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering"), not(feature = "flatmap_hash_and_object_tiering")))]
     pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = TieringObject<K>> + '_> {
         self.dram_cache.get(key)
     }
 
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), feature = "hashtable_tiering"))]
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), feature = "hashtable_tiering", not(feature = "flatmap_hash_and_object_tiering")))]
     pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = TieringObject<K, V>> + '_> {
         self.dram_cache.get(key)
     }
