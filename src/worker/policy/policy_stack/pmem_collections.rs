@@ -399,7 +399,6 @@ impl<T> Default for PmemVecList<T> {
     }
 }
 
-*/
 
 // ============================================================================
 // PmemHashList
@@ -465,6 +464,187 @@ where
         let idx = if let Some(free_idx) = self.free_list.pop() {
             //self.entries[free_idx] = Some(node);
 
+            unsafe {
+                std::ptr::write(&mut self.entries[free_idx], Some(node));
+            }
+            free_idx
+        } else {
+            let idx = self.entries.len();
+            self.entries.push(Some(node));
+            idx
+        };
+        
+        // Update old head's prev pointer
+        if let Some(old_head_idx) = self.head {
+            if let Some(Some(old_head_node)) = self.entries.get_mut(old_head_idx) {
+                old_head_node.prev = Some(idx);
+            }
+        }
+        
+        self.head = Some(idx);
+        
+        // If list was empty, this is also the tail
+        if self.tail.is_none() {
+            self.tail = Some(idx);
+        }
+        
+        self.lookup.insert(value, idx);
+    }
+    
+    /// Pops a value from the back of the list
+    pub fn pop_back(&mut self) -> Option<T> {
+        let tail_idx = self.tail?;
+        let node = self.entries.get_mut(tail_idx)?.take()?;
+        
+        self.lookup.remove(&node.value);
+        self.tail = node.prev;
+        
+        // Update new tail's next pointer
+        if let Some(new_tail_idx) = self.tail {
+            if let Some(Some(new_tail_node)) = self.entries.get_mut(new_tail_idx) {
+                new_tail_node.next = None;
+            }
+        } else {
+            // List is now empty
+            self.head = None;
+        }
+        
+        // Add index to free list for reuse
+        self.free_list.push(tail_idx);
+        
+        Some(node.value)
+    }
+    
+    /// Removes a value from the list
+    pub fn remove(&mut self, value: &T) -> Option<T> {
+        let idx = self.lookup.remove(value)?;
+        let node = self.entries.get_mut(idx)?.take()?;
+        
+        // Update prev node's next pointer
+        if let Some(prev_idx) = node.prev {
+            if let Some(Some(prev_node)) = self.entries.get_mut(prev_idx) {
+                prev_node.next = node.next;
+            }
+        } else {
+            self.head = node.next;
+        }
+        
+        // Update next node's prev pointer
+        if let Some(next_idx) = node.next {
+            if let Some(Some(next_node)) = self.entries.get_mut(next_idx) {
+                next_node.prev = node.prev;
+            }
+        } else {
+            self.tail = node.prev;
+        }
+        
+        // Add index to free list for reuse
+        self.free_list.push(idx);
+        
+        Some(node.value)
+    }
+    
+    /// Clears the list
+    pub fn clear(&mut self) {
+        self.lookup.clear();
+        self.entries.clear();
+        self.head = None;
+        self.tail = None;
+        self.free_list.clear();
+    }
+}
+
+impl<T, S> Default for PmemHashList<T, S>
+where
+    T: Hash + Eq + Clone,
+    S: BuildHasher + Default,
+{
+    fn default() -> Self {
+        Self::with_hasher(S::default())
+    }
+}
+
+
+*/
+
+
+
+
+
+// ============================================================================
+// PmemHashList
+// ============================================================================
+
+/// A hash-based doubly-linked list using Vec + HashMap with PMEM allocator
+/// 
+/// Uses Vec for node storage (simpler than two HashMaps) with HashMap for O(1) lookup.
+/// Includes free list to reuse deleted slots.
+pub struct PmemHashList<T, S> {
+    entries: Vec<Option<Node<T>>, HybridObjects>,
+    lookup: HashMap<T, usize, S, HybridObjects>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    free_list: Vec<usize, HybridObjects>,
+}
+
+impl<T, S> PmemHashList<T, S>
+where
+    T: Hash + Eq + Clone,
+    S: BuildHasher,
+{
+    /// Creates a new empty PmemHashList with the given hasher
+    pub fn with_hasher(hasher: S) -> Self {
+        PmemHashList {
+            entries: Vec::new_in(HybridObjects),
+            lookup: HashMap::with_hasher_in(hasher, HybridObjects),
+            head: None,
+            tail: None,
+            free_list: Vec::new_in(HybridObjects),
+        }
+    }
+
+    /// Creates a new PmemHashList with capacity and hasher
+    pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> Self {
+        PmemHashList {
+            entries: Vec::with_capacity_in(capacity, HybridObjects),
+            lookup: HashMap::with_capacity_and_hasher_in(capacity, hasher, HybridObjects),
+            head: None,
+            tail: None,
+            free_list: Vec::with_capacity_in(capacity, HybridObjects),
+        }
+    }
+    
+    /// Returns true if the list is empty
+    pub fn is_empty(&self) -> bool {
+        self.lookup.is_empty()
+    }
+    
+    /// Returns the number of elements in the list
+    pub fn len(&self) -> usize {
+        self.lookup.len()
+    }
+    
+    /// Returns true if the list contains the given value
+    pub fn contains(&self, value: &T) -> bool {
+        self.lookup.contains_key(value)
+    }
+    
+    /// Pushes a value to the front of the list
+    pub fn push_front(&mut self, value: T) {
+        // If value already exists, remove it first
+        if self.lookup.contains_key(&value) {
+            self.remove(&value);
+        }
+        
+        let node = Node {
+            value: value.clone(),
+            prev: None,
+            next: self.head,
+        };
+        
+        // Allocate index: reuse from free list or append
+        let idx = if let Some(free_idx) = self.free_list.pop() {
+            // CRITICAL FIX: Use ptr::write to prevent drop-on-garbage Segfault
             unsafe {
                 std::ptr::write(&mut self.entries[free_idx], Some(node));
             }
