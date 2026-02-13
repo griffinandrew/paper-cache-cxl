@@ -7,7 +7,9 @@
 
 
 
+
 #![cfg_attr(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "flatmap_hash_and_object_tiering"), feature(allocator_api))]
+
 
 // Validate that both global_flatmap_dram and global_flatmap_pmem are not enabled together
 #[cfg(all(feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
@@ -2303,9 +2305,11 @@ where
 			return Err(CacheError::UnconfiguredPolicy);
 		}
 
-		let objects = Arc::new(RwLock::new(
-			FlatMapWithHasher::with_capacity_and_hasher_unchecked(4096, NoHasher::default())
-		));
+		let objects = {
+			let total_capacity = (max_size.max(4096) * 2) as usize; // 2x overhead for low load factor
+			let shard_count = 64;
+			Arc::new(crate::flatmap::ShardedFlatMap::with_capacity_and_shards(total_capacity, shard_count))
+		};
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 

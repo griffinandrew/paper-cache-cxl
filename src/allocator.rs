@@ -43,7 +43,7 @@ unsafe impl GlobalAlloc for HybridObjects {
         // Decide backend
 
         //if only using pmem ... dont track the fucking counters.... 
-        if DRAM_LIMIT_OBJECTS == ALL_PMEM_LIMIT_BYTES {
+        if unsafe { DRAM_LIMIT_OBJECTS } == ALL_PMEM_LIMIT_BYTES {
             unsafe {
                 INIT.call_once(|| {
                     let dax_size = 236757975040; // PMEM size from ndctl list --namespaces
@@ -56,7 +56,7 @@ unsafe impl GlobalAlloc for HybridObjects {
                     //println!("CACHE: Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);
                 });
             }
-            let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
+            let ptr = unsafe { allocator_bindings::umf_alloc(layout.size(), layout.align()) } as *mut u8;
             if ptr.is_null() { println!("Failed to allocate PMEM in cache allocator"); return ptr::null_mut(); }
             
             #[cfg(debug_assertions)] {
@@ -67,7 +67,7 @@ unsafe impl GlobalAlloc for HybridObjects {
             return ptr;
         }
 
-        if DRAM_LIMIT_OBJECTS == ALL_DRAM_LIMIT_BYTES {
+        if unsafe { DRAM_LIMIT_OBJECTS } == ALL_DRAM_LIMIT_BYTES {
             let ptr = Jemalloc.alloc(layout);
             if ptr.is_null() { println!("Failed to allocate DRAM"); return ptr::null_mut(); }
             return ptr;
@@ -90,7 +90,7 @@ unsafe impl GlobalAlloc for HybridObjects {
                         );
                 });
             }
-            let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
+            let ptr = unsafe { allocator_bindings::umf_alloc(layout.size(), layout.align()) } as *mut u8;
             if ptr.is_null() { println!("Failed to allocate PMEM"); return ptr::null_mut(); }
             #[cfg(debug_assertions)] {ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);}
             ptr
@@ -123,14 +123,14 @@ unsafe impl GlobalAlloc for HybridObjects {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         
-        if DRAM_LIMIT_OBJECTS == ALL_PMEM_LIMIT_BYTES {
+        if unsafe { DRAM_LIMIT_OBJECTS } == ALL_PMEM_LIMIT_BYTES {
             //all in pmem
             unsafe { allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void); }
             #[cfg(debug_assertions)] { ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst); }
 
             return;
         }
-        if DRAM_LIMIT_OBJECTS == ALL_DRAM_LIMIT_BYTES {
+        if unsafe { DRAM_LIMIT_OBJECTS } == ALL_DRAM_LIMIT_BYTES {
             //all in dram
             unsafe { Jemalloc.dealloc(ptr as *mut u8, layout); }
             #[cfg(debug_assertions)] { ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst); }
@@ -182,7 +182,7 @@ impl HybridObjects {
     /// Determine whether to allocate from DRAM
     fn should_use_dram(size: usize) -> bool {
         let current = DRAM_ALLOCATED_OBJECTS.load(Ordering::SeqCst); //this was relaxed... but i made it seqcst which might limit performance
-        unsafe { current + size <= DRAM_LIMIT_OBJECTS }
+        current + size <= unsafe { DRAM_LIMIT_OBJECTS }
     }
 }
 
