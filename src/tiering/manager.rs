@@ -1011,7 +1011,7 @@ where
     /// Returns a reference to the TieringObject<K, V> stored in DRAM
     #[cfg(feature = "flatmap_hash_and_object_tiering")]
     pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K, V>>> {
-        // ShardedFlatMap.get() returns Option<V> where V is cloned
+        // ShardedFlatMap.get() clones the value and returns Option<V>
         self.dram_cache
             .get(key)
             .map(|obj| Arc::new(obj))
