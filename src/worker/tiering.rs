@@ -298,7 +298,9 @@ where
                         let object_ref_opt = self.objects.get(&hashed_key);
                         
                         #[cfg(feature = "flatmap_hash_and_object_tiering")]
-                        let object_ref_opt = self.objects.read().unwrap().get(&hashed_key).map(|obj| obj.clone());
+                        let object_ref_opt = self.objects.get(&hashed_key); //check this is doing what I want...
+                        //let object_ref_opt = self.objects.read().unwrap().get(&hashed_key).map(|obj| obj.clone());
+                        //self.objects.read().unwrap().get(&hashed_key).map(|obj| obj.clone());
                         
                         if let Some(object_ref) = object_ref_opt {
                             #[cfg(not(feature = "flatmap_hash_and_object_tiering"))]
@@ -325,7 +327,8 @@ where
                     let object_ref_opt = self.objects.get(&hashed_key);
                     
                     #[cfg(feature = "flatmap_hash_and_object_tiering")]
-                    let object_ref_opt = self.objects.read().unwrap().get(&hashed_key).map(|obj| obj.clone());
+                     let object_ref_opt = self.objects.get(&hashed_key); //could be wrong....
+                    //let object_ref_opt = self.objects.read().unwrap().get(&hashed_key).map(|obj| obj.clone());
                     
                     if let Some(object_ref) = object_ref_opt {
                         #[cfg(not(feature = "flatmap_hash_and_object_tiering"))]

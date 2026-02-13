@@ -298,7 +298,9 @@ where
 
     /// Registers a new object in PMEM
     pub fn register_object(&self, key: HashedKey, size: ObjectSize) {
-        let mut info_map = self.object_info.write().unwrap();
+        //let mut info_map = self.object_info.write().unwrap();
+
+        let mut info_map = self.object_info;
 
         info_map.insert(key, ObjectTierInfo {
             tier: Tier::PmemOnly,
@@ -361,7 +363,9 @@ where
         let hot_threshold = config.hot_threshold;
         drop(config);
 
-        let mut info_map = self.object_info.write().unwrap();
+        //let mut info_map = self.object_info.write().unwrap();
+
+        let mut info_map = self.object_info;
 
         if let Some(info) = info_map.get_mut(&key) {
             info.access_count += 1;
