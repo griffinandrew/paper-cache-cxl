@@ -311,7 +311,12 @@ where
     /// Panics if capacity is 0 or not a power of 2.
     pub fn new_in(capacity: usize, alloc: A) -> Self {
         assert!(capacity > 0, "Capacity must be greater than 0");
-        assert!(capacity.is_power_of_two(), "Capacity must be a power of 2");
+        //assert!(capacity.is_power_of_two(), "Capacity must be a power of 2");
+
+        if !capacity.is_power_of_two() {
+            capacity = capacity.next_power_of_two();
+        }
+
 
         let mask = capacity - 1;
         
