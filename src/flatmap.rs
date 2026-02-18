@@ -309,7 +309,7 @@ where
     /// # Panics
     ///
     /// Panics if capacity is 0 or not a power of 2.
-    pub fn new_in(capacity: usize, alloc: A) -> Self {
+    pub fn new_in(mut capacity: usize, alloc: A) -> Self {
         assert!(capacity > 0, "Capacity must be greater than 0");
         //assert!(capacity.is_power_of_two(), "Capacity must be a power of 2");
 
