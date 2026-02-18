@@ -41,21 +41,21 @@ static ALL_MEM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 unsafe impl GlobalAlloc for HybridObjects {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // Decide backend
+        // Extract DRAM_LIMIT_OBJECTS once for clarity (already in unsafe fn)
+        let dram_limit = DRAM_LIMIT_OBJECTS;
 
         //if only using pmem ... dont track the fucking counters.... 
-        if DRAM_LIMIT_OBJECTS == ALL_PMEM_LIMIT_BYTES {
-            unsafe {
-                INIT.call_once(|| {
-                    let dax_size = 236757975040; // PMEM size from ndctl list --namespaces
-                    let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
-                    allocator_bindings::umf_allocator_init(
-                        dax_path,
-                        dax_size,
-                        );
-                    #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);}
-                    //println!("CACHE: Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);
-                });
-            }
+        if dram_limit == ALL_PMEM_LIMIT_BYTES {
+            INIT.call_once(|| {
+                let dax_size = 236757975040; // PMEM size from ndctl list --namespaces
+                let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
+                allocator_bindings::umf_allocator_init(
+                    dax_path,
+                    dax_size,
+                    );
+                #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);}
+                //println!("CACHE: Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);
+            });
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
             if ptr.is_null() { println!("Failed to allocate PMEM in cache allocator"); return ptr::null_mut(); }
             
@@ -67,7 +67,7 @@ unsafe impl GlobalAlloc for HybridObjects {
             return ptr;
         }
 
-        if DRAM_LIMIT_OBJECTS == ALL_DRAM_LIMIT_BYTES {
+        if dram_limit == ALL_DRAM_LIMIT_BYTES {
             let ptr = Jemalloc.alloc(layout);
             if ptr.is_null() { println!("Failed to allocate DRAM"); return ptr::null_mut(); }
             return ptr;
@@ -80,16 +80,14 @@ unsafe impl GlobalAlloc for HybridObjects {
             #[cfg(debug_assertions)] {ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);}
             ptr
         } else {
-            unsafe {
-                INIT.call_once(|| {
-                    let dax_size = 118377938944; // PMEM size from ndctl list --namespaces
-                    let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
-                    allocator_bindings::umf_allocator_init(
-                        dax_path,
-                        dax_size,
-                        );
-                });
-            }
+            INIT.call_once(|| {
+                let dax_size = 118377938944; // PMEM size from ndctl list --namespaces
+                let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
+                allocator_bindings::umf_allocator_init(
+                    dax_path,
+                    dax_size,
+                    );
+            });
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
             if ptr.is_null() { println!("Failed to allocate PMEM"); return ptr::null_mut(); }
             #[cfg(debug_assertions)] {ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);}
@@ -122,32 +120,34 @@ unsafe impl GlobalAlloc for HybridObjects {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // Extract DRAM_LIMIT_OBJECTS once for clarity
+        let dram_limit = DRAM_LIMIT_OBJECTS;
         
-        if DRAM_LIMIT_OBJECTS == ALL_PMEM_LIMIT_BYTES {
+        if dram_limit == ALL_PMEM_LIMIT_BYTES {
             //all in pmem
-            unsafe { allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void); }
+            allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void);
             #[cfg(debug_assertions)] { ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst); }
 
             return;
         }
-        if DRAM_LIMIT_OBJECTS == ALL_DRAM_LIMIT_BYTES {
+        if dram_limit == ALL_DRAM_LIMIT_BYTES {
             //all in dram
-            unsafe { Jemalloc.dealloc(ptr as *mut u8, layout); }
+            Jemalloc.dealloc(ptr as *mut u8, layout);
             #[cfg(debug_assertions)] { ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst); }
             return;
         }
     
         // Check the tier of the allocated memory only if not all in pmem or all in dram
-        let tier = unsafe {allocator_bindings::check_tier(ptr as *mut std::ffi::c_void)};
+        let tier = allocator_bindings::check_tier(ptr as *mut std::ffi::c_void);
 
         if tier == 0 {
             // DRAM
-            unsafe { Jemalloc.dealloc(ptr as *mut u8, layout); }
+            Jemalloc.dealloc(ptr as *mut u8, layout);
             DRAM_ALLOCATED_OBJECTS.fetch_sub(layout.size(), Ordering::SeqCst);
             #[cfg(debug_assertions)] { ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst); }
         } else {
             //pmem
-            unsafe { allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void); }
+            allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void);
             #[cfg(debug_assertions)] { ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst); }
         }
 
@@ -182,7 +182,7 @@ impl HybridObjects {
     /// Determine whether to allocate from DRAM
     fn should_use_dram(size: usize) -> bool {
         let current = DRAM_ALLOCATED_OBJECTS.load(Ordering::SeqCst); //this was relaxed... but i made it seqcst which might limit performance
-        unsafe { current + size <= DRAM_LIMIT_OBJECTS }
+        current + size <= unsafe { DRAM_LIMIT_OBJECTS }
     }
 }
 

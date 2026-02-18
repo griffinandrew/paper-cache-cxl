@@ -142,6 +142,17 @@ struct ObjectTierInfo {
     last_access: std::time::Instant,
 }
 
+impl Default for ObjectTierInfo {
+    fn default() -> Self {
+        ObjectTierInfo {
+            tier: Tier::PmemOnly,
+            size: 0,
+            access_count: 0,
+            last_access: std::time::Instant::now(),
+        }
+    }
+}
+
 /// Tiering Manager
 /// 
 /// Manages object placement between DRAM and PMEM tiers.
@@ -298,11 +309,7 @@ where
 
     /// Registers a new object in PMEM
     pub fn register_object(&self, key: HashedKey, size: ObjectSize) {
-        //let mut info_map = self.object_info.write().unwrap();
-
-        let mut info_map = self.object_info;
-
-        info_map.insert(key, ObjectTierInfo {
+        self.object_info.insert(key, ObjectTierInfo {
             tier: Tier::PmemOnly,
             size,
             access_count: 0,
@@ -363,11 +370,8 @@ where
         let hot_threshold = config.hot_threshold;
         drop(config);
 
-        //let mut info_map = self.object_info.write().unwrap();
-
-        let mut info_map = self.object_info;
-
-        if let Some(info) = info_map.get_mut(&key) {
+        // Use get_mut_with for closure-based mutation
+        self.object_info.get_mut_with(&key, |info| {
             info.access_count += 1;
             info.last_access = std::time::Instant::now();
 
@@ -386,9 +390,7 @@ where
                     false
                 }
             }
-        } else {
-            false
-        }
+        }).unwrap_or(false)
     }
 
     /// Helper method to create a TieringObject with physically copied data
@@ -794,52 +796,47 @@ where
     where
         K: Default,
     {
-        let mut info_map = self.object_info.write().unwrap();
-
-        if let Some(info) = info_map.get_mut(&key) {
-            match info.tier {
+        // Use get_mut_with for closure-based mutation
+        self.object_info.get_mut_with(&key, |info| {
+            let original_tier = info.tier;
+            let size = info.size;
+            
+            let should_demote = match original_tier {
                 Tier::DramPtrToPmem => {
                     // Demote from warm tier (pointer-only)
                     info.tier = Tier::PmemOnly;
-
-                    // Remove from DRAM cache
-                    self.dram_cache.write().unwrap().remove(&key);
-
-                    let mut dram_objects = self.dram_objects.write().unwrap();
-                    dram_objects.remove(&key);
-
-                    let mut stats = self.stats.write().unwrap();
-                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
-                    stats.pmem_only_objects += 1;
-                    stats.demotions += 1;
-
-                    return true;
+                    true
                 }
                 Tier::DramAndPmem => {
                     // Demote from hot tier (physical copy)
                     info.tier = Tier::PmemOnly;
-
-                    // Remove from DRAM cache
-                    self.dram_cache.write().unwrap().remove(&key);
-
-                    let mut dram_objects = self.dram_objects.write().unwrap();
-                    dram_objects.remove(&key);
-
-                    let mut stats = self.stats.write().unwrap();
-                    stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
-                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
-                    stats.pmem_only_objects += 1;
-                    stats.demotions += 1;
-
-                    return true;
+                    true
                 }
                 Tier::PmemOnly => {
                     // Already in PMEM only
+                    false
                 }
-            }
-        }
+            };
 
-        false
+            if should_demote {
+                // Remove from DRAM cache (ShardedFlatMap has internal locking)
+                self.dram_cache.remove(&key);
+
+                // Remove from DashMap (DashMap has internal locking)
+                self.dram_objects.remove(&key);
+
+                // Update stats
+                let mut stats = self.stats.write().unwrap();
+                if matches!(original_tier, Tier::DramAndPmem) {
+                    stats.dram_size = stats.dram_size.saturating_sub(size as u64);
+                }
+                stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                stats.pmem_only_objects += 1;
+                stats.demotions += 1;
+            }
+
+            should_demote
+        }).unwrap_or(false)
     }
     
     /// Demotes an object from DRAM (removes the DRAM copy, keeps PMEM)
@@ -1014,11 +1011,10 @@ where
     /// Returns a reference to the TieringObject<K, V> stored in DRAM
     #[cfg(feature = "flatmap_hash_and_object_tiering")]
     pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K, V>>> {
+        // ShardedFlatMap.get() clones the value and returns Option<V>
         self.dram_cache
-            .read()
-            .unwrap()
             .get(key)
-            .map(|obj| Arc::new(obj.clone()))
+            .map(|obj| Arc::new(obj))
     }
 
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering"), not(feature = "flatmap_hash_and_object_tiering")))]
@@ -1069,7 +1065,8 @@ where
         if self.is_in_dram(&key) {
             // Create DRAM object with physical data copy
             let updated_object = self.create_dram_object(object);
-            self.dram_cache.write().unwrap().insert(key, updated_object);
+            // ShardedFlatMap.insert() has internal locking
+            self.dram_cache.insert(key, updated_object);
         }
     }
 
@@ -1119,13 +1116,15 @@ where
         drop(stats);
         drop(config);
 
-        // Find objects to demote to bring usage below low water mark
-        let info_map = self.object_info.read().unwrap();
-        let dram_objects = self.dram_objects.read().unwrap();
+        // Collect keys from DashMap (which supports iteration)
+        let dram_keys: Vec<HashedKey> = self.dram_objects.iter().map(|entry| *entry.key()).collect();
 
-        let mut dram_object_info: Vec<(HashedKey, &ObjectTierInfo)> = dram_objects
-            .iter()
-            .filter_map(|key| info_map.get(key).map(|info| (*key, info)))
+        // For each key, get the corresponding ObjectTierInfo
+        let mut dram_object_info: Vec<(HashedKey, ObjectTierInfo)> = dram_keys
+            .into_iter()
+            .filter_map(|key| {
+                self.object_info.get(&key).map(|info| (key, info))
+            })
             .collect();
 
         // Sort by last access time (LRU)
@@ -1156,28 +1155,27 @@ where
     where
         K: Default,
     {
-        let mut info_map = self.object_info.write().unwrap();
-
-        if let Some(info) = info_map.remove(&key) {
+        // Remove from object_info and get the removed value
+        if let Some(info) = self.object_info.remove(&key) {
             let mut stats = self.stats.write().unwrap();
 
             match info.tier {
                 Tier::DramAndPmem => {
-                    // Remove from DRAM cache
-                    self.dram_cache.write().unwrap().remove(&key);
+                    // Remove from DRAM cache (ShardedFlatMap has internal locking)
+                    self.dram_cache.remove(&key);
                     
-                    let mut dram_objects = self.dram_objects.write().unwrap();
-                    dram_objects.remove(&key);
+                    // Remove from DashMap (DashMap has internal locking)
+                    self.dram_objects.remove(&key);
 
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                 }
                 Tier::DramPtrToPmem => {
                     // Remove from DRAM cache (pointer-only)
-                    self.dram_cache.write().unwrap().remove(&key);
+                    self.dram_cache.remove(&key);
                     
-                    let mut dram_objects = self.dram_objects.write().unwrap();
-                    dram_objects.remove(&key);
+                    // Remove from DashMap (DashMap has internal locking)
+                    self.dram_objects.remove(&key);
 
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                 }
@@ -1320,7 +1318,8 @@ where
 
     /// Checks if an object is currently in DRAM
     pub fn is_in_dram(&self, key: &HashedKey) -> bool {
-        self.dram_objects.read().unwrap().contains(key)
+        // DashMap.contains_key() has internal locking
+        self.dram_objects.contains_key(key)
     }
 
     /// Updates the DRAM threshold
@@ -1352,14 +1351,14 @@ where
     where
         K: Default,
     {
-        let mut info_map = self.object_info.write().unwrap();
-        info_map.clear();
+        // Clear object_info (ShardedFlatMap has internal locking)
+        self.object_info.clear();
 
-        let mut dram_objects = self.dram_objects.write().unwrap();
-        dram_objects.clear();
+        // Clear dram_objects (DashMap has internal locking)
+        self.dram_objects.clear();
         
-        // Clear the DRAM cache
-        self.dram_cache.write().unwrap().clear();
+        // Clear the DRAM cache (ShardedFlatMap has internal locking)
+        self.dram_cache.clear();
 
         let mut stats = self.stats.write().unwrap();
         *stats = TieringStats::default();
