@@ -7,7 +7,7 @@
 
 
 
-#![cfg_attr(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem"), feature(allocator_api))]
+#![cfg_attr(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem"), feature(allocator_api))]
 
 // Validate that both global_flatmap_dram and global_flatmap_pmem are not enabled together
 #[cfg(all(feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
