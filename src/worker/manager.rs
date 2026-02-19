@@ -31,6 +31,12 @@ use crate::{
 	worker::TieringWorker,
 };
 
+#[cfg(feature = "multitiering")]
+use crate::{
+	tiering::MultitieringManager,
+	worker::MultitieringWorker,
+};
+
 pub struct WorkerManager {
 	listener: WorkerReceiver,
 	workers: Arc<Box<[WorkerSender]>>,
@@ -106,7 +112,7 @@ impl WorkerManager {
 		Ok(manager)
 	}
 
-	#[cfg(all(not(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))))]
+	#[cfg(all(not(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager")), not(feature = "multitiering")))]
 	pub fn new<K, V>(
 		listener: WorkerReceiver,
 		objects: &ObjectMapRef<K, V>,
@@ -137,6 +143,58 @@ impl WorkerManager {
 		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
 			policy_worker,
 			ttl_worker,
+		]));
+
+		let manager = WorkerManager {
+			listener,
+			workers,
+		};
+
+		Ok(manager)
+	}
+
+	#[cfg(feature = "multitiering")]
+	pub fn new_with_multitiering<K, V>(
+		listener: WorkerReceiver,
+		objects: &ObjectMapRef<K, V>,
+		status: &StatusRef,
+		overhead_manager: &OverheadManagerRef,
+		tiering_manager: &Arc<MultitieringManager<K, V>>,
+	) -> Result<Self, CacheError>
+	where
+		K: 'static + Eq + TypeSize + Clone,
+		V: 'static + TypeSize + Clone,
+	{
+		let (policy_worker, policy_listener) = unbounded();
+		let (ttl_worker, ttl_listener) = unbounded();
+		let (multitiering_worker, multitiering_listener) = unbounded();
+
+		register_worker(PolicyWorker::<K, V>::new(
+			policy_listener,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+		)?);
+
+		register_worker(TtlWorker::<K, V>::new(
+			ttl_listener,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+		));
+
+		register_worker(MultitieringWorker::<K, V>::new(
+			multitiering_listener,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+			tiering_manager.clone(),
+		));
+
+		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
+			policy_worker,
+			ttl_worker,
+			multitiering_worker,
 		]));
 
 		let manager = WorkerManager {
