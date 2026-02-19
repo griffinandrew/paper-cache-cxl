@@ -72,10 +72,13 @@
 //! - `flatmap_dram`: Enable FlatMap with DRAM allocator
 //! - `flatmap_pmem`: Enable FlatMap with PMEM allocator (HybridObjects)
 
-use std::alloc::{Allocator, Global};
+use allocator_api2::alloc::{Allocator, Global};
+use allocator_api2::vec::Vec as AllocVec;
 use std::hash::{Hash, BuildHasher};
 use std::mem;
 use std::marker::PhantomData;
+use std::sync::Arc;
+use parking_lot::RwLock;
 
 /// A bucket in the hash map containing hash, key, and value.
 /// Uses #[repr(C)] for predictable memory layout.
@@ -134,7 +137,7 @@ impl<K, V> Bucket<K, V> {
 /// * `A` - The allocator type (defaults to Global)
 pub struct FlatMap<K, V, A: Allocator = Global> {
     /// The array of buckets
-    pub(crate) buckets: Vec<Bucket<K, V>, A>,
+    pub(crate) buckets: AllocVec<Bucket<K, V>, A>,
     /// Total capacity (number of buckets)
     pub(crate) capacity: usize,
     /// Mask for fast modulo operations (capacity - 1)
@@ -284,11 +287,12 @@ where
     ///
     /// # Arguments
     ///
-    /// * `capacity` - The fixed capacity. Must be a power of 2.
+    /// * `capacity` - The desired capacity. Any positive value is accepted; it will be
+    ///   rounded up to the nearest power of two internally.
     ///
     /// # Panics
     ///
-    /// Panics if capacity is 0 or not a power of 2.
+    /// Panics if capacity is 0.
     pub fn new(capacity: usize) -> Self {
         Self::new_in(capacity, Global)
     }
@@ -303,20 +307,21 @@ where
     ///
     /// # Arguments
     ///
-    /// * `capacity` - The fixed capacity. Must be a power of 2.
+    /// * `capacity` - The desired capacity. Any positive value is accepted; it will be
+    ///   rounded up to the nearest power of two internally.
     /// * `alloc` - The allocator to use
     ///
     /// # Panics
     ///
-    /// Panics if capacity is 0 or not a power of 2.
+    /// Panics if capacity is 0.
     pub fn new_in(capacity: usize, alloc: A) -> Self {
         assert!(capacity > 0, "Capacity must be greater than 0");
-        assert!(capacity.is_power_of_two(), "Capacity must be a power of 2");
+        let capacity = capacity.next_power_of_two();
 
         let mask = capacity - 1;
         
         // Allocate and initialize buckets
-        let mut buckets = Vec::with_capacity_in(capacity, alloc);
+        let mut buckets = AllocVec::with_capacity_in(capacity, alloc);
         for _ in 0..capacity {
             buckets.push(Bucket::empty());
         }
@@ -330,17 +335,64 @@ where
         }
     }
 
+    /// Resizes the map to double the capacity using a create-new-and-copy strategy.
+    ///
+    /// Allocates an entirely new backing buffer, migrates all existing entries into it,
+    /// then atomically swaps the buffer. This ensures safety against partial writes.
+    fn resize(&mut self)
+    where
+        A: Clone,
+    {
+        let new_capacity = (self.capacity * 2).next_power_of_two();
+        let new_mask = new_capacity - 1;
+
+        // Allocate entirely new backing buffer (create-new-and-copy strategy)
+        let alloc = self.buckets.allocator().clone();
+        let mut new_buckets = AllocVec::with_capacity_in(new_capacity, alloc);
+        for _ in 0..new_capacity {
+            new_buckets.push(Bucket::empty());
+        }
+
+        // Migrate existing entries into new buffer using linear probing re-hash.
+        // Each bucket's hash is already stored, so no re-hashing is needed;
+        // we only need to find the new probe position using the new mask.
+        for i in 0..self.buckets.len() {
+            // Destructively extract each non-empty bucket (no Clone needed for K/V)
+            if !self.buckets[i].is_empty() {
+                let bucket = mem::replace(&mut self.buckets[i], Bucket::empty());
+                let mut index = (bucket.hash as usize) & new_mask;
+                loop {
+                    if new_buckets[index].is_empty() {
+                        new_buckets[index] = bucket;
+                        break;
+                    }
+                    index = (index + 1) & new_mask;
+                }
+            }
+        }
+
+        // Atomically swap the backing buffers
+        self.buckets = new_buckets;
+        self.capacity = new_capacity;
+        self.mask = new_mask;
+    }
+
     /// Inserts a key-value pair into the map with the given hasher.
     ///
+    /// Automatically resizes the map when the load factor reaches >= 80%.
     /// Returns the old value if the key was already present.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the map is full.
     pub fn insert_with_hasher<S>(&mut self, key: K, val: V, hasher: &S) -> Option<V>
     where
         S: BuildHasher,
+        A: Clone,
     {
+        // Auto-resize when adding this entry would push load to >= 80%.
+        // Written as an integer comparison to avoid floating-point and
+        // to prevent overflow: 5*(len+1) >= 4*capacity  ≡  load >= 80%.
+        if (self.len + 1).saturating_mul(5) >= self.capacity.saturating_mul(4) {
+            self.resize();
+        }
+
         let hash = self.hash_key_unconstrained(&key, hasher);
         let mut index = (hash as usize) & self.mask;
         
@@ -363,7 +415,7 @@ where
             index = (index + 1) & self.mask;
         }
         
-        panic!("FlatMap is full");
+        panic!("FlatMap is full after resize — this should not happen");
     }
 
     /// Removes a key from the map, returning the value if the key was present.
@@ -684,8 +736,12 @@ where
     }
 
     /// Inserts a key-value pair into the map.
+    /// Automatically triggers resize when load factor reaches >= 80%.
     #[inline]
-    pub fn insert(&mut self, key: K, val: V) -> Option<V> {
+    pub fn insert(&mut self, key: K, val: V) -> Option<V>
+    where
+        A: Clone,
+    {
         self.map.insert_with_hasher(key, val, &self.hasher)
     }
 
@@ -808,13 +864,36 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "FlatMap is full")]
-    fn test_full_map() {
+    fn test_capacity_normalization() {
+        // Any capacity is accepted; it is rounded up to the next power of two
+        let map: FlatMap<u64, u64> = FlatMap::new(3);
+        assert_eq!(map.capacity(), 4);
+
+        let map: FlatMap<u64, u64> = FlatMap::new(1);
+        assert_eq!(map.capacity(), 1);
+
+        let map: FlatMap<u64, u64> = FlatMap::new(100);
+        assert_eq!(map.capacity(), 128);
+    }
+
+    #[test]
+    fn test_auto_resize() {
+        // Start with a small capacity — the map must auto-resize at >= 80% load
         let mut map = FlatMap::new(4);
         let hasher = RandomState::new();
-        
-        for i in 0..5 {
+
+        // Insert enough items to force multiple resize events
+        for i in 0u64..50 {
             map.insert_with_hasher(i, i * 10, &hasher);
+        }
+
+        assert_eq!(map.len(), 50);
+        // Capacity must have grown beyond the original 4
+        assert!(map.capacity() >= 64);
+
+        // All entries must still be retrievable after resize
+        for i in 0u64..50 {
+            assert_eq!(map.get_with_hasher(&i, &hasher), Some(&(i * 10)));
         }
     }
 
@@ -860,6 +939,264 @@ where
         Self {
             map: FlatMap::new_in(capacity, alloc),
             hasher,
+        }
+    }
+}
+
+// ─── ShardedFlatMap ──────────────────────────────────────────────────────────
+
+/// Returns the default number of shards, mirroring DashMap's strategy:
+/// `available_parallelism * 4`, rounded up to the nearest power of two.
+fn default_shard_count() -> usize {
+    use std::thread::available_parallelism;
+    (available_parallelism().map_or(1, usize::from) * 4).next_power_of_two()
+}
+
+/// A concurrent, sharded hash map wrapping multiple `FlatMapWithHasher` shards.
+///
+/// Shard count is determined dynamically from the system's available parallelism
+/// (identical strategy to DashMap: `available_parallelism * 4`, rounded to a power
+/// of two). High-order bits of the key hash are used to route operations to the
+/// correct shard, preventing correlation with the shard-internal linear probing.
+///
+/// The inner `Arc` allows cheap, safe sharing of the map across threads.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use paper_cache::flatmap::ShardedFlatMap;
+/// use std::hash::RandomState;
+///
+/// let map: ShardedFlatMap<u64, u64, RandomState> =
+///     ShardedFlatMap::new(1024);
+///
+/// // Share across threads
+/// let map2 = map.clone();
+///
+/// map.insert(1, 100);
+/// assert_eq!(map2.get(&1), Some(100));
+/// ```
+pub struct ShardedFlatMap<K, V, S> {
+    /// All shards, shared via Arc so the map can be cheaply cloned across threads.
+    shards: Arc<Vec<RwLock<FlatMapWithHasher<K, V, S>>>>,
+    /// Hasher used exclusively for shard-routing (not for internal FlatMap probing).
+    hasher: S,
+    /// Total number of shards (always a power of two).
+    shard_count: usize,
+    /// Bit-shift used to extract the shard index from the high-order hash bits.
+    /// `shard_shift = 64 - log2(shard_count)`.  Set to 64 when shard_count == 1.
+    shard_shift: u32,
+}
+
+impl<K, V, S: Clone> Clone for ShardedFlatMap<K, V, S> {
+    fn clone(&self) -> Self {
+        Self {
+            shards: Arc::clone(&self.shards),
+            hasher: self.hasher.clone(),
+            shard_count: self.shard_count,
+            shard_shift: self.shard_shift,
+        }
+    }
+}
+
+impl<K, V, S> ShardedFlatMap<K, V, S>
+where
+    K: Hash + Eq + Default,
+    V: Default,
+    S: BuildHasher + Clone + Default,
+{
+    /// Creates a new `ShardedFlatMap`.
+    ///
+    /// `initial_capacity_per_shard` is the starting capacity for each individual
+    /// shard's `FlatMapWithHasher`.  It is rounded up to the nearest power of two
+    /// internally.  The shards auto-resize as entries are added.
+    pub fn new(initial_capacity_per_shard: usize) -> Self {
+        let shard_count = default_shard_count();
+        // For shard_count == 1, trailing_zeros() == 0, which would give 64 - 0 = 64.
+        // Right-shifting a u64 by 64 bits is undefined behaviour in Rust (wraps to
+        // shift-by-0 in release mode, panics in debug mode).  Use 64 as a sentinel
+        // value meaning "always select shard 0" and guard against it in shard_index_for.
+        let shard_shift = if shard_count > 1 {
+            64 - shard_count.trailing_zeros()
+        } else {
+            64
+        };
+
+        // Use std::vec::Vec (not AllocVec) for the outer shard container — the shards
+        // themselves are allocated in DRAM and do not require a custom allocator.
+        let shards = (0..shard_count)
+            .map(|_| {
+                RwLock::new(FlatMapWithHasher::with_capacity_and_hasher(
+                    initial_capacity_per_shard,
+                    S::default(),
+                ))
+            })
+            .collect::<std::vec::Vec<_>>();
+
+        Self {
+            shards: Arc::new(shards),
+            hasher: S::default(),
+            shard_count,
+            shard_shift,
+        }
+    }
+}
+
+impl<K, V, S> ShardedFlatMap<K, V, S>
+where
+    S: BuildHasher,
+{
+    /// Computes the hash of `key` using the shard-routing hasher and derives the
+    /// shard index from the **high-order** bits of the hash value.
+    #[inline]
+    fn shard_index_for<Q: Hash>(&self, key: &Q) -> usize {
+        use std::hash::Hasher;
+        let mut h = self.hasher.build_hasher();
+        key.hash(&mut h);
+        let hash = h.finish();
+        // FlatMap uses hash == 0 as the "empty bucket" sentinel, so map 0 → 1.
+        let hash = if hash == 0 { 1 } else { hash };
+
+        if self.shard_shift >= 64 {
+            // Only one shard
+            0
+        } else {
+            (hash >> self.shard_shift) as usize
+        }
+    }
+
+    /// Returns a cloned copy of the value associated with `key`, or `None` if not
+    /// present.
+    ///
+    /// Acquires a **read** lock on the relevant shard.
+    pub fn get<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Eq,
+        K: Hash + Eq + PartialEq<Q>,
+        V: Clone,
+    {
+        let idx = self.shard_index_for(key);
+        self.shards[idx].read().get(key).cloned()
+    }
+
+    /// Inserts a key-value pair, returning the previous value if the key already
+    /// existed.
+    ///
+    /// Acquires a **write** lock on the relevant shard.  The shard auto-resizes
+    /// when the load factor reaches >= 80%.
+    pub fn insert(&self, key: K, val: V) -> Option<V>
+    where
+        K: Hash + Eq + Default,
+        V: Default,
+        S: Clone,
+    {
+        let idx = self.shard_index_for(&key);
+        self.shards[idx].write().insert(key, val)
+    }
+
+    /// Removes the entry for `key`, returning the value if it was present.
+    ///
+    /// Acquires a **write** lock on the relevant shard.
+    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Eq,
+        K: Hash + Eq + Default + PartialEq<Q>,
+        V: Default,
+    {
+        let idx = self.shard_index_for(key);
+        self.shards[idx].write().remove(key)
+    }
+
+    /// Returns the total number of shards.
+    #[inline]
+    pub fn shard_count(&self) -> usize {
+        self.shard_count
+    }
+}
+
+#[cfg(test)]
+mod sharded_tests {
+    use super::*;
+    use std::hash::RandomState;
+
+    #[test]
+    fn test_sharded_basic() {
+        let map: ShardedFlatMap<u64, u64, RandomState> = ShardedFlatMap::new(16);
+        assert!(map.shard_count() >= 1);
+        assert!(map.shard_count().is_power_of_two());
+
+        map.insert(1, 100);
+        map.insert(2, 200);
+
+        assert_eq!(map.get(&1), Some(100));
+        assert_eq!(map.get(&2), Some(200));
+        assert_eq!(map.get(&3u64), None);
+    }
+
+    #[test]
+    fn test_sharded_remove() {
+        let map: ShardedFlatMap<u64, u64, RandomState> = ShardedFlatMap::new(16);
+
+        map.insert(42, 999);
+        assert_eq!(map.get(&42), Some(999));
+
+        let removed = map.remove(&42u64);
+        assert_eq!(removed, Some(999));
+        assert_eq!(map.get(&42u64), None);
+    }
+
+    #[test]
+    fn test_sharded_auto_resize() {
+        // Insert more entries than the initial per-shard capacity to exercise auto-resize
+        let map: ShardedFlatMap<u64, u64, RandomState> = ShardedFlatMap::new(4);
+
+        for i in 0u64..200 {
+            map.insert(i, i * 2);
+        }
+        for i in 0u64..200 {
+            assert_eq!(map.get(&i), Some(i * 2));
+        }
+    }
+
+    #[test]
+    fn test_sharded_clone_shares_state() {
+        let map: ShardedFlatMap<u64, u64, RandomState> = ShardedFlatMap::new(16);
+        let map2 = map.clone();
+
+        map.insert(10, 100);
+        // Clone shares the same underlying shards via Arc
+        assert_eq!(map2.get(&10), Some(100));
+    }
+
+    #[test]
+    fn test_sharded_multithreaded() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        let map: StdArc<ShardedFlatMap<u64, u64, RandomState>> =
+            StdArc::new(ShardedFlatMap::new(64));
+
+        let handles: std::vec::Vec<_> = (0u64..8)
+            .map(|t| {
+                let m = StdArc::clone(&map);
+                thread::spawn(move || {
+                    for i in 0u64..100 {
+                        let key = t * 100 + i;
+                        m.insert(key, key * 2);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        for t in 0u64..8 {
+            for i in 0u64..100 {
+                let key = t * 100 + i;
+                assert_eq!(map.get(&key), Some(key * 2));
+            }
         }
     }
 }
