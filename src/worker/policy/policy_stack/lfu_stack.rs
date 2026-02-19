@@ -5,7 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::collections::HashMap;
 use dlv_list::{VecList, Index};
 use kwik::collections::HashList;
 
@@ -17,15 +16,77 @@ use crate::{
 	worker::policy::policy_stack::PolicyStack,
 };
 
+// Import HashMap based on feature flag
+// When eviction_stacks_pmem is disabled (default): use std::collections::HashMap (DRAM)
+// When eviction_stacks_pmem is enabled: use hashbrown::HashMap with HybridObjects allocator (PMEM)
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+use std::collections::HashMap;
+
+#[cfg(feature = "eviction_stacks_pmem")]
+use hashbrown::HashMap;
+
+#[cfg(feature = "eviction_stacks_pmem")]
+use crate::allocator::HybridObjects;
+
+#[cfg(feature = "eviction_stacks_pmem")]
+use super::pmem_collections::{PmemVecList, PmemHashList, PmemIndex};
+
+// DRAM-based LFU stack (default configuration)
+// Uses standard library HashMap which allocates from DRAM
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 #[derive(Default)]
 pub struct LfuStack {
 	index_map: HashMap<HashedKey, Index<CountStack>, NoHasher>,
 	count_stacks: VecList<CountStack>,
 }
 
+// PMEM-backed LFU stack (when eviction_stacks_pmem feature is enabled)
+// Uses hashbrown::HashMap with HybridObjects allocator for index_map
+// Uses custom PmemVecList and PmemHashList that explicitly use HybridObjects allocator
+// This ensures PMEM allocation works correctly even when paper-cache is used as a library
+// and the consuming binary overrides the global allocator
+#[cfg(feature = "eviction_stacks_pmem")]
+pub struct LfuStack {
+	index_map: HashMap<HashedKey, PmemIndex, NoHasher, HybridObjects>,
+	count_stacks: PmemVecList<CountStack>,
+}
+
+#[cfg(feature = "eviction_stacks_pmem")]
+impl Default for LfuStack {
+    fn default() -> Self {
+        // Pre-allocate capacity for 50 million items to avoid PMEM reallocation during
+        // high-throughput workloads. PMEM reallocation is expensive and can cause
+        // data-structure corruption if the allocator returns uninitialized memory.
+        const DEFAULT_CAPACITY: usize = 50_000_000;
+        Self::with_capacity(DEFAULT_CAPACITY)
+    }
+}
+
+
+#[cfg(feature = "eviction_stacks_pmem")]
+impl LfuStack {
+    pub fn with_capacity(capacity: usize) -> Self {
+        LfuStack {
+            index_map: HashMap::with_capacity_and_hasher_in(
+                capacity, 
+                NoHasher::default(), 
+                HybridObjects
+            ),
+            count_stacks: PmemVecList::with_capacity(capacity),
+        }
+    }
+}
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 struct CountStack {
 	count: u32,
 	stack: HashList<HashedKey, NoHasher>,
+}
+
+#[cfg(feature = "eviction_stacks_pmem")]
+struct CountStack {
+	count: u32,
+	stack: PmemHashList<HashedKey, NoHasher>,
 }
 
 impl PolicyStack for LfuStack {
@@ -129,6 +190,7 @@ impl PolicyStack for LfuStack {
 	}
 }
 
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 impl CountStack {
 	fn new(count: u32) -> Self {
 		CountStack {
@@ -154,6 +216,34 @@ impl CountStack {
 	}
 }
 
+#[cfg(feature = "eviction_stacks_pmem")]
+impl CountStack {
+	fn new(count: u32) -> Self {
+		CountStack {
+			count,
+			stack: PmemHashList::with_hasher(NoHasher::default()),
+		}
+	}
+
+	fn is_empty(&self) -> bool {
+		self.stack.is_empty()
+	}
+
+	fn push(&mut self, key: HashedKey) {
+		self.stack.push_front(key);
+	}
+
+	fn pop(&mut self) -> HashedKey {
+		// Safe to unwrap: caller ensures stack is not empty via is_empty() check
+		self.stack.pop_back().unwrap()
+	}
+
+	fn remove(&mut self, key: HashedKey) {
+		// Safe to unwrap: caller ensures key exists in the stack
+		self.stack.remove(&key).unwrap();
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	#[test]
@@ -170,6 +260,47 @@ mod tests {
 			assert_eq!(stack.evict_one(), Some(eviction));
 		}
 
+		assert_eq!(stack.evict_one(), None);
+	}
+
+	#[test]
+	fn stress_test_no_segfault() {
+		use crate::worker::policy::policy_stack::{PolicyStack, LfuStack};
+
+		let mut stack = LfuStack::default();
+
+		// Insert and update many items to stress test the data structures
+		for i in 0..1000 {
+			stack.insert(i, 1);
+		}
+
+		// Access some items multiple times to create different frequency counts
+		for i in 0..100 {
+			for _ in 0..5 {
+				stack.insert(i, 1);
+			}
+		}
+
+		// Verify we can query the stack
+		assert_eq!(stack.len(), 1000);
+
+		// Remove some items
+		for i in 500..600 {
+			stack.remove(i);
+		}
+
+		assert_eq!(stack.len(), 900);
+
+		// Evict items and verify no crashes
+		for _ in 0..50 {
+			assert!(stack.evict_one().is_some());
+		}
+
+		assert_eq!(stack.len(), 850);
+
+		// Clear the stack
+		stack.clear();
+		assert_eq!(stack.len(), 0);
 		assert_eq!(stack.evict_one(), None);
 	}
 }
