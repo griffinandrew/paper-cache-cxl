@@ -3,6 +3,9 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+#[cfg(feature = "multitiering")]
+use std::collections::VecDeque;
+
 use dashmap::DashMap;
 use typesize::TypeSize;
 
@@ -51,6 +54,17 @@ pub struct TieringConfig {
     /// When true, the dram_cache hashtable uses pmem allocator
     /// When false, uses default DRAM allocation
     pub use_pmem_for_tiering_hashtable: bool,
+
+    /// [multitiering] Maximum number of items in the Warm tier.
+    /// When the Warm queue exceeds this count, the oldest Warm entry is demoted to Cold.
+    #[cfg(feature = "multitiering")]
+    pub warm_capacity_items: usize,
+
+    /// [multitiering] Maximum total bytes in the Hot tier.
+    /// When the Hot tier exceeds this limit, the oldest Hot entry is demoted directly to Cold
+    /// (bypassing Warm).
+    #[cfg(feature = "multitiering")]
+    pub hot_capacity_bytes: u64,
 }
 
 impl Default for TieringConfig {
@@ -61,6 +75,10 @@ impl Default for TieringConfig {
             low_water_mark: 0.7,
             hotness_threshold: 3, // Promote after 3 accesses
             use_pmem_for_tiering_hashtable: false, // Default to DRAM
+            #[cfg(feature = "multitiering")]
+            warm_capacity_items: 100,
+            #[cfg(feature = "multitiering")]
+            hot_capacity_bytes: 100 * 1024 * 1024, // 100 MB
         }
     }
 }
@@ -176,6 +194,7 @@ where
     }
 
     /// Creates a new TieringManager with default configuration
+    #[cfg(feature = "key_value_pmem")]
     pub fn with_defaults() -> Self {
         Self::new(TieringConfig::default())
     }
@@ -639,7 +658,213 @@ where
     }
 }
 
-#[cfg(test)]
+// ============================================================================
+// Multi-tiering: 2Q-inspired Cold / Warm / Hot lifecycle
+// All code below is guarded by #[cfg(feature = "multitiering")].
+// ============================================================================
+
+/// Three-tier state for the multi-tiering 2Q policy.
+///
+/// - **Cold**: Object exists entirely in PMEM. First access promotes to Warm.
+/// - **Warm**: Acts as the 2Q A1out (ghost) queue. Metadata is tracked in DRAM for
+///   fast routing; the payload data remains in PMEM (zero-copy). A subsequent access
+///   while Warm promotes the object to Hot. If the Warm pool overflows its item
+///   limit, the oldest Warm entry is demoted back to Cold.
+/// - **Hot**: Acts as the 2Q Am queue. Both metadata and the payload are physically
+///   cached in DRAM. If the Hot pool overflows its byte limit, the oldest Hot entry
+///   is demoted **directly** to Cold (bypassing Warm).
+#[cfg(feature = "multitiering")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierState {
+    Cold,
+    Warm,
+    Hot,
+}
+
+/// Statistics tracked by [`MultiTieringManager`].
+#[cfg(feature = "multitiering")]
+#[derive(Debug, Clone, Default)]
+pub struct MultiTieringStats {
+    /// Number of objects currently in the Cold tier (PMEM only).
+    pub cold_objects: u64,
+    /// Number of objects currently in the Warm tier (metadata in DRAM, payload in PMEM).
+    pub warm_objects: u64,
+    /// Number of objects currently in the Hot tier (data + metadata in DRAM).
+    pub hot_objects: u64,
+    /// Total bytes currently occupied by Hot-tier objects.
+    pub hot_bytes: u64,
+    /// Cumulative Cold -> Warm promotions.
+    pub promotions_to_warm: u64,
+    /// Cumulative Warm -> Hot promotions.
+    pub promotions_to_hot: u64,
+    /// Cumulative demotions to Cold (from either Warm overflow or Hot overflow).
+    pub demotions_to_cold: u64,
+}
+
+/// Internal mutable state for [`MultiTieringManager`], protected by a single `RwLock`.
+#[cfg(feature = "multitiering")]
+struct MultiState {
+    /// Maps each tracked key to its current tier and byte size.
+    state_map: HashMap<HashedKey, (TierState, u64), NoHasher>,
+    /// FIFO warm queue.  Front = most recently added; back = oldest (eviction candidate).
+    /// Stores only (key, size) — **no payload bytes** (zero-copy warm tier).
+    warm_queue: VecDeque<(HashedKey, u64)>,
+    /// FIFO hot queue.  Front = most recently promoted; back = oldest (eviction candidate).
+    /// Payload is conceptually pinned in DRAM by the caller; we track (key, size) here.
+    hot_queue: VecDeque<(HashedKey, u64)>,
+    /// Running total of bytes used by all Hot-tier objects.
+    hot_bytes: u64,
+}
+
+/// Multi-tier manager implementing a 2Q-inspired Cold / Warm / Hot lifecycle for hybrid
+/// DRAM / PMEM environments.
+///
+/// # State Machine
+///
+/// ```text
+/// insert  ──► Cold ──(1st access)──► Warm ──(2nd access)──► Hot
+///                  ◄─(overflow)──────┘                      │
+///                  ◄─(overflow, direct)─────────────────────┘
+/// ```
+///
+/// All mutable state is protected by a single `RwLock<MultiState>` so that
+/// concurrent readers (e.g., tier-state queries) do not block each other, while
+/// writers hold an exclusive write lock during transitions.
+#[cfg(feature = "multitiering")]
+pub struct MultiTieringManager {
+    config: Arc<RwLock<TieringConfig>>,
+    state: Arc<RwLock<MultiState>>,
+    stats: Arc<RwLock<MultiTieringStats>>,
+}
+
+#[cfg(feature = "multitiering")]
+impl MultiTieringManager {
+    /// Creates a new `MultiTieringManager` with the provided configuration.
+    pub fn new(config: TieringConfig) -> Self {
+        MultiTieringManager {
+            config: Arc::new(RwLock::new(config)),
+            state: Arc::new(RwLock::new(MultiState {
+                state_map: HashMap::with_hasher(NoHasher::default()),
+                warm_queue: VecDeque::new(),
+                hot_queue: VecDeque::new(),
+                hot_bytes: 0,
+            })),
+            stats: Arc::new(RwLock::new(MultiTieringStats::default())),
+        }
+    }
+
+    /// Creates a new `MultiTieringManager` with [`TieringConfig::default`].
+    pub fn with_defaults() -> Self {
+        Self::new(TieringConfig::default())
+    }
+
+    /// Registers a new object in the Cold tier (PMEM only).
+    ///
+    /// If the key is already tracked this call is a no-op.
+    pub fn register_object(&self, key: HashedKey, size: u64) {
+        let mut state = self.state.write().unwrap();
+        if state.state_map.contains_key(&key) {
+            return;
+        }
+        state.state_map.insert(key, (TierState::Cold, size));
+        drop(state);
+
+        let mut stats = self.stats.write().unwrap();
+        stats.cold_objects += 1;
+    }
+
+    /// Records an access to `key` and applies the appropriate tier transition.
+    ///
+    /// - **Cold** → **Warm**: metadata entry added to front of warm queue.
+    ///   If the warm queue now exceeds `warm_capacity_items`, the oldest entry
+    ///   is demoted back to Cold.
+    /// - **Warm** → **Hot**: metadata entry moved from warm queue to hot queue;
+    ///   `size` bytes are added to the hot-bytes counter.
+    ///   If `hot_bytes` now exceeds `hot_capacity_bytes`, the oldest Hot entry is
+    ///   demoted **directly** to Cold (bypassing Warm).
+    /// - **Hot**: no state change.
+    ///
+    /// Returns the final [`TierState`] of the key after all transitions and
+    /// capacity enforcement, or `None` if the key is not tracked.
+    pub fn record_access(&self, key: HashedKey) -> Option<TierState> {
+        let config = self.config.read().unwrap();
+        let warm_cap = config.warm_capacity_items;
+        let hot_cap = config.hot_capacity_bytes;
+        drop(config);
+
+        let mut state = self.state.write().unwrap();
+        let mut stats = self.stats.write().unwrap();
+
+        let (tier, size) = *state.state_map.get(&key)?;
+
+        match tier {
+            TierState::Cold => {
+                // Cold -> Warm: no payload copy — only metadata tracked in DRAM.
+                state.state_map.insert(key, (TierState::Warm, size));
+                state.warm_queue.push_front((key, size));
+                stats.cold_objects = stats.cold_objects.saturating_sub(1);
+                stats.warm_objects += 1;
+                stats.promotions_to_warm += 1;
+
+                // Enforce warm capacity: demote oldest Warm entries to Cold.
+                while state.warm_queue.len() > warm_cap {
+                    if let Some((evict_key, evict_size)) = state.warm_queue.pop_back() {
+                        state.state_map.insert(evict_key, (TierState::Cold, evict_size));
+                        stats.warm_objects = stats.warm_objects.saturating_sub(1);
+                        stats.cold_objects += 1;
+                        stats.demotions_to_cold += 1;
+                    }
+                }
+            }
+            TierState::Warm => {
+                // Warm -> Hot: remove from warm queue (zero-copy; payload stays in PMEM
+                // until the caller physically copies it to DRAM).
+                // The warm queue is bounded by warm_capacity_items so the O(n) retain
+                // is acceptable for typical (small) queue sizes.
+                state.warm_queue.retain(|(k, _)| *k != key);
+                state.state_map.insert(key, (TierState::Hot, size));
+                state.hot_queue.push_front((key, size));
+                state.hot_bytes += size;
+                stats.warm_objects = stats.warm_objects.saturating_sub(1);
+                stats.hot_objects += 1;
+                stats.hot_bytes += size;
+                stats.promotions_to_hot += 1;
+
+                // Enforce hot capacity: demote oldest Hot entries directly to Cold.
+                while state.hot_bytes > hot_cap {
+                    if let Some((evict_key, evict_size)) = state.hot_queue.pop_back() {
+                        state.hot_bytes = state.hot_bytes.saturating_sub(evict_size);
+                        state.state_map.insert(evict_key, (TierState::Cold, evict_size));
+                        stats.hot_objects = stats.hot_objects.saturating_sub(1);
+                        stats.hot_bytes = stats.hot_bytes.saturating_sub(evict_size);
+                        stats.cold_objects += 1;
+                        stats.demotions_to_cold += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            TierState::Hot => {
+                // Already at the hottest tier — no transition needed.
+            }
+        }
+
+        // Return the final tier state after all transitions and enforcement.
+        state.state_map.get(&key).map(|(t, _)| *t)
+    }
+
+    /// Returns the current [`TierState`] of `key`, or `None` if it is not tracked.
+    pub fn get_tier_state(&self, key: &HashedKey) -> Option<TierState> {
+        self.state.read().unwrap().state_map.get(key).map(|(t, _)| *t)
+    }
+
+    /// Returns a snapshot of current [`MultiTieringStats`].
+    pub fn stats(&self) -> MultiTieringStats {
+        self.stats.read().unwrap().clone()
+    }
+}
+
+#[cfg(all(test, feature = "key_value_pmem"))]
 mod tests {
     use super::*;
 

@@ -55,7 +55,7 @@ mod object;
 mod policy;
 mod status;
 
-#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
+#[cfg(any(all(feature = "key_value_pmem", feature = "enable_tiering_manager"), feature = "multitiering"))]
 pub mod tiering;
 
 // FlatMap module - high-performance Linear Probing Hash Map for PMEM/DRAM
@@ -133,7 +133,13 @@ pub use crate::{
 };
 
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-pub use crate::tiering::{TieringManager, TieringConfig, TieringStats};
+pub use crate::tiering::{TieringManager, TieringStats};
+
+#[cfg(any(all(feature = "key_value_pmem", feature = "enable_tiering_manager"), feature = "multitiering"))]
+pub use crate::tiering::TieringConfig;
+
+#[cfg(feature = "multitiering")]
+pub use crate::tiering::{MultiTieringManager, MultiTieringStats, TierState};
 
 pub type CacheSize = u64;
 pub type AtomicCacheSize = AtomicU64;

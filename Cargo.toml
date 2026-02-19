@@ -69,6 +69,9 @@ hw_perf = ["perf-event"]
 # Enable PMEM-backed eviction stacks
 eviction_stacks_pmem = []
 
+# Multi-stage tiering: 3-state Cold/Warm/Hot lifecycle for hybrid DRAM/PMEM environments
+multitiering = []
+
 # Legacy features (deprecated, will be removed)
 default = []
 original = []
