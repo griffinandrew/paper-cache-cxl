@@ -164,6 +164,9 @@ pub struct PaperCache<K, V, S = RandomState> {
 	#[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 	tiering_manager: Arc<TieringManager<K, V>>,
 
+	#[cfg(all(feature = "multitiering", any(feature = "key_value_pmem", feature = "alloc_api_exp")))]
+	multitiering_manager: Arc<MultitieringManager<K, V>>,
+
 	hasher: S,
 }
 
@@ -1520,12 +1523,24 @@ where
 			&tiering_manager,
 		)?;
 
-		#[cfg(not(feature = "enable_tiering_manager"))]
+		#[cfg(feature = "multitiering")]
+		let multitiering_manager = Arc::new(MultitieringManager::with_defaults());
+
+		#[cfg(all(not(feature = "enable_tiering_manager"), not(feature = "multitiering")))]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
 			&overhead_manager,
+		)?;
+
+		#[cfg(all(not(feature = "enable_tiering_manager"), feature = "multitiering"))]
+		let mut worker_manager = WorkerManager::new_with_multitiering(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+			&multitiering_manager,
 		)?;
 
 		thread::spawn(move || worker_manager.run());
@@ -1539,6 +1554,9 @@ where
 			
 			#[cfg(feature = "enable_tiering_manager")]
 			tiering_manager,
+
+			#[cfg(feature = "multitiering")]
+			multitiering_manager,
 
 			hasher,
 		};
@@ -2045,6 +2063,13 @@ where
 	pub fn hotness_threshold(&self) -> u64 {
 		self.tiering_manager.hotness_threshold()
 	}
+
+	/// Gets multitiering statistics including objects per tier and tier transitions.
+	#[cfg(feature = "multitiering")]
+	pub fn multitiering_stats(&self) -> tiering::MultitieringStats {
+		self.multitiering_manager.stats()
+	}
+
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
 		if let Err(err) = self.worker_manager.try_send(event) {
 			error!("Could not communicate with workers: {err:?}");
@@ -2204,12 +2229,24 @@ where
 			&tiering_manager,
 		)?;
 
-		#[cfg(not(feature = "enable_tiering_manager"))]
+		#[cfg(feature = "multitiering")]
+		let multitiering_manager = Arc::new(MultitieringManager::with_defaults());
+
+		#[cfg(all(not(feature = "enable_tiering_manager"), not(feature = "multitiering")))]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
 			&overhead_manager,
+		)?;
+
+		#[cfg(all(not(feature = "enable_tiering_manager"), feature = "multitiering"))]
+		let mut worker_manager = WorkerManager::new_with_multitiering(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+			&multitiering_manager,
 		)?;
 
 		thread::spawn(move || worker_manager.run());
@@ -2223,6 +2260,9 @@ where
 			
 			#[cfg(feature = "enable_tiering_manager")]
 			tiering_manager,
+
+			#[cfg(feature = "multitiering")]
+			multitiering_manager,
 
 			hasher,
 		};
@@ -2737,6 +2777,12 @@ where
 	/// Gets the current hotness threshold.
 	pub fn hotness_threshold(&self) -> u64 {
 		self.tiering_manager.hotness_threshold()
+	}
+
+	/// Gets multitiering statistics including objects per tier and tier transitions.
+	#[cfg(feature = "multitiering")]
+	pub fn multitiering_stats(&self) -> tiering::MultitieringStats {
+		self.multitiering_manager.stats()
 	}
 
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
