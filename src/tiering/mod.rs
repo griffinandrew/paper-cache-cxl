@@ -81,10 +81,26 @@
 //! println!("Promotions: {}", stats.promotions);
 //! ```
 
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 pub mod manager;
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 pub mod object;
 
+#[cfg(feature = "multitiering")]
+pub mod multitier_manager;
+
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 pub use manager::TieringManager;
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 pub use manager::TieringConfig;
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 pub use manager::TieringStats;
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 pub use object::TieringObject;
+
+#[cfg(feature = "multitiering")]
+pub use multitier_manager::MultitieringManager;
+#[cfg(feature = "multitiering")]
+pub use multitier_manager::MultitieringConfig;
+#[cfg(feature = "multitiering")]
+pub use multitier_manager::MultitieringStats;

@@ -41,7 +41,10 @@ mod object;
 mod policy;
 mod status;
 
-#[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
+#[cfg(any(
+    all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"),
+    feature = "multitiering"
+))]
 pub mod tiering;
 
 
@@ -110,6 +113,15 @@ pub use crate::{
 
 #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 pub use crate::tiering::{TieringManager, TieringConfig, TieringStats};
+
+#[cfg(feature = "multitiering")]
+pub use crate::tiering::{MultitieringManager, MultitieringConfig, MultitieringStats};
+#[cfg(feature = "multitiering")]
+pub use crate::tiering::multitier_manager::Tier as MultitieringTier;
+#[cfg(feature = "multitiering")]
+pub mod multitier_manager {
+    pub use crate::tiering::multitier_manager::Tier;
+}
 
 pub type CacheSize = u64;
 pub type AtomicCacheSize = AtomicU64;

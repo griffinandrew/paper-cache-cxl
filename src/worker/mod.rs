@@ -12,6 +12,9 @@ mod ttl;
 #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 mod tiering;
 
+#[cfg(feature = "multitiering")]
+mod multitiering_worker;
+
 use std::thread;
 use crossbeam_channel::{Sender, Receiver};
 
@@ -59,3 +62,6 @@ pub use crate::worker::{
 
 #[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
 pub use crate::worker::tiering::TieringWorker;
+
+#[cfg(feature = "multitiering")]
+pub use crate::worker::multitiering_worker::MultitieringWorker;
