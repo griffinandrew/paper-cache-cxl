@@ -110,9 +110,12 @@ impl<T> PmemVecList<T> {
         
         // Allocate index: reuse from free list or append
         let idx = if let Some(free_idx) = self.free_list.pop() {
-            // CRITICAL FIX: Use ptr::write to overwrite memory without dropping the old value.
-            // If the allocator returns dirty/garbage memory, treating it as a valid Option<Node>
-            // to drop would cause a SEGFAULT.
+            // Safety: Use ptr::write to overwrite the freed slot without running the drop
+            // impl on its previous contents. When a slot is freed via remove(), we set it
+            // to None. Reusing that slot via assignment would drop the None — which is
+            // fine — but if PMEM returned uninitialized bytes, the memory at that location
+            // might not be a valid Option<Node<T>> bitpattern, causing UB on drop.
+            // ptr::write bypasses the drop path entirely, making the write safe.
             unsafe {
                 std::ptr::write(&mut self.entries[free_idx], Some(node));
             }
@@ -148,7 +151,8 @@ impl<T> PmemVecList<T> {
         
         // Allocate index: reuse from free list or append
         let idx = if let Some(free_idx) = self.free_list.pop() {
-            // CRITICAL FIX: Use ptr::write to prevent drop-on-garbage
+            // Safety: Use ptr::write to prevent drop of potentially invalid data when
+            // reusing freed slots. See push_front for full explanation.
             unsafe {
                 std::ptr::write(&mut self.entries[free_idx], Some(node));
             }
@@ -291,7 +295,8 @@ where
         
         // Allocate index: reuse from free list or append
         let idx = if let Some(free_idx) = self.free_list.pop() {
-            // CRITICAL FIX: Use ptr::write to prevent drop-on-garbage Segfault
+            // Safety: Use ptr::write to prevent drop of potentially invalid data when
+            // reusing freed slots. See PmemVecList::push_front for full explanation.
             unsafe {
                 std::ptr::write(&mut self.entries[free_idx], Some(node));
             }

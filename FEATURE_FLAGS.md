@@ -29,24 +29,33 @@ The implementation provides explicit feature flags to control:
 - **Purpose**: Enable/disable the tiering manager functionality
 - **When enabled**: Automatic promotion/demotion of hot objects between DRAM and PMEM tiers
 - **When disabled**: No automatic tiering, but global hashtable can still be placed in PMEM
-- **Requirements**: Works with `key_value_pmem` or `alloc_api_exp`
+- **Requirements**: Works with `key_value_pmem`
 
 ### `tiering_hashtable_pmem`
 - **Purpose**: Control memory placement of the tiering manager's internal hashtable
 - **When enabled**: Tiering manager's hashtable stored in PMEM
 - **When disabled**: Tiering manager's hashtable stored in DRAM
-- **Requirements**: Requires `enable_tiering_manager` + (`key_value_pmem` or `alloc_api_exp`)
+- **Requirements**: Requires `enable_tiering_manager` + `key_value_pmem`
 
 ### `global_hashtable_pmem`
 - **Purpose**: Control memory placement of the main cache hashtable
 - **When enabled**: Global cache hashtable stored in PMEM
 - **When disabled**: Global cache hashtable stored in DRAM
-- **Requirements**: Can be used independently or with `key_value_pmem`/`alloc_api_exp`
+- **Requirements**: Can be used independently or with `key_value_pmem`
 
-### `alloc_api_exp` (Experimental)
-- **Purpose**: Experimental allocator API for testing
-- **When enabled**: Uses experimental allocator implementation with same hashtable type as `key_value_pmem`
-- **Use case**: Testing and development
+### `hw_perf`
+- **Purpose**: Enable hardware performance counters for cache operation profiling
+- **When enabled**: Instruments cache lookup and eviction paths with Linux `perf_event` counters
+- **When disabled**: Zero cost — all instrumentation is completely compiled out
+- **Use case**: Performance analysis of DRAM vs PMEM access patterns (LLC misses, cycles, IPC)
+- **Requirements**: Linux only; requires `perf_event` access (may need elevated permissions or `/proc/sys/kernel/perf_event_paranoid` ≤ 1)
+
+### `eviction_stacks_pmem`
+- **Purpose**: Allocate LFU eviction policy tracking structures in PMEM using the Hybrid allocator
+- **When enabled**: `LfuStack`, `CountStack` internal data structures (`index_map`, `count_stacks`) are allocated via `HybridObjects` (PMEM-backed)
+- **When disabled**: Standard DRAM-backed `std::collections::HashMap` and `kwik::collections::HashList` are used (default)
+- **Use case**: Ensures eviction metadata is co-located with PMEM-stored objects for lower cross-tier access overhead
+- **Requirements**: The Hybrid allocator must be accessible — compatible with `key_value_pmem` and standalone
 
 ### `flatmap_dram`
 - **Purpose**: Enable high-performance Linear Probing Hash Map (FlatMap) in DRAM
@@ -167,6 +176,21 @@ The code uses `#[cfg(...)]` attributes extensively to:
    features = ["enable_tiering_manager", "key_value_pmem", "tiering_hashtable_pmem", "global_hashtable_pmem"]
    ```
 
+8. **Hardware performance counters** (zero-cost when disabled):
+   ```toml
+   features = ["hw_perf"]
+   ```
+
+9. **PMEM-backed eviction stacks + key/value in PMEM**:
+   ```toml
+   features = ["eviction_stacks_pmem", "key_value_pmem"]
+   ```
+
+10. **Full PMEM stack** (tiering + eviction stacks + hw profiling):
+    ```toml
+    features = ["enable_tiering_manager", "key_value_pmem", "eviction_stacks_pmem", "hw_perf"]
+    ```
+
 ## Performance Characteristics
 
 ### Memory Tier Comparison
@@ -196,6 +220,8 @@ The code uses `#[cfg(...)]` attributes extensively to:
 9. **`global_flatmap_dram`**: Use FlatMap as PaperCache's main hashtable in DRAM
 10. **`global_flatmap_pmem`**: Use FlatMap as PaperCache's main hashtable in PMEM (3x latency reduction)
 11. **`hashbrown_dram`**: Use hashbrown HashMap in DRAM for direct performance comparison with `global_hashtable_pmem`
+12. **`hw_perf`**: Hardware performance counters for profiling (zero-cost when disabled)
+13. **`eviction_stacks_pmem`**: LFU eviction stacks allocated in PMEM for co-location with PMEM objects
 
 ## Code Locations
 
@@ -205,6 +231,9 @@ The code uses `#[cfg(...)]` attributes extensively to:
 - **Tiering manager hashtable**: `src/tiering/manager.rs`
 - **Global hashtable**: `src/lib.rs`
 - **Worker manager integration**: `src/worker/manager.rs`
+- **Hardware perf counters**: `src/hw_perf_counters.rs`
+- **PMEM eviction collections**: `src/worker/policy/policy_stack/pmem_collections.rs`
+- **LFU policy stack**: `src/worker/policy/policy_stack/lfu_stack.rs`
 
 ## Testing
 
@@ -249,6 +278,15 @@ cargo +nightly check --no-default-features
 
 # Test global cache with allocator but no tiering
 cargo +nightly check --features "key_value_pmem"
+
+# Verify hw_perf (hardware counters - zero-cost abstraction when disabled)
+cargo +nightly check --features "hw_perf"
+
+# Verify eviction_stacks_pmem with key_value_pmem
+cargo +nightly check --features "hw_perf,eviction_stacks_pmem,key_value_pmem"
+
+# Verify full feature combination
+cargo +nightly check --features "enable_tiering_manager,eviction_stacks_pmem,key_value_pmem"
 ```
 
 **Note**: The tiering worker module is only compiled when BOTH an allocator feature 
@@ -264,3 +302,6 @@ used at all when disabled, allowing the cache to operate as a single global cach
 ✅ No performance regression when features are disabled (different code paths compiled)
 ✅ Tiering manager can be turned on/off independently
 ✅ Global hashtable can use pmem even when tiering is disabled
+✅ `alloc_api_exp` removed; Hybrid allocator still functional for `key_value_pmem`
+✅ `hw_perf` counters compile out to zero cost when feature is disabled
+✅ `eviction_stacks_pmem` correctly allocates LFU stacks via HybridObjects

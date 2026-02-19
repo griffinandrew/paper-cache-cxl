@@ -48,9 +48,6 @@ tiering_hashtable_pmem = []
 # Place global hashtable in PMEM (requires key_value_pmem)
 global_hashtable_pmem = []
 
-# Experimental allocator API for testing (uses same hashtable type as key_value_pmem)
-alloc_api_exp = []
-
 # FlatMap standalone module: High-performance Linear Probing Hash Map for DRAM
 flatmap_dram = []
 

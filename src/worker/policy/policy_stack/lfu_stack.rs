@@ -54,8 +54,11 @@ pub struct LfuStack {
 #[cfg(feature = "eviction_stacks_pmem")]
 impl Default for LfuStack {
     fn default() -> Self {
-        // Pre-allocate 2M items to stop resizing segfaults during your benchmark
-        Self::with_capacity(50_000_000)
+        // Pre-allocate capacity for 50 million items to avoid PMEM reallocation during
+        // high-throughput workloads. PMEM reallocation is expensive and can cause
+        // data-structure corruption if the allocator returns uninitialized memory.
+        const DEFAULT_CAPACITY: usize = 50_000_000;
+        Self::with_capacity(DEFAULT_CAPACITY)
     }
 }
 

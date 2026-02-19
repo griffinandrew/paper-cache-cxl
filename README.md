@@ -91,11 +91,11 @@ PaperCache provides fine-grained control over memory placement through feature f
 Independent control over where hashtables are stored (requires one of the allocator features):
 
 - **`tiering_hashtable_pmem`**: Places the tiering manager's internal hashtable in persistent memory
-  - Requires: `enable_tiering_manager` + one of (`key_value_pmem`, `alloc_api_exp`)
+  - Requires: `enable_tiering_manager` + `key_value_pmem`
   - When disabled: Tiering hashtable uses DRAM
 
 - **`global_hashtable_pmem`**: Places the main cache hashtable in persistent memory
-  - Requires: One of (`key_value_pmem`, `alloc_api_exp`)
+  - Requires: `key_value_pmem`
   - Works independently of tiering manager
   - When disabled: Global hashtable uses DRAM
 
@@ -139,5 +139,4 @@ paper-cache = { features = ["global_hashtable_pmem", "key_value_pmem"] }
 
 These feature flags work in conjunction with:
 - `key_value_pmem`: Place key and value data in PMEM
-- `alloc_api_exp`: Experimental allocator API for testing
 

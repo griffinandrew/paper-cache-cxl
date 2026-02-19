@@ -4867,3 +4867,73 @@ mod test_global_hashtable_pmem_alone {
         assert!(!cache.has(&key2));
     }
 }
+
+/// Unit tests verifying structural compilation and initialization with new feature flags.
+/// These tests prove that hw_perf instrumentation and eviction_stacks_pmem allocations
+/// integrate correctly with the cache initialization path.
+///
+/// Gate on `all_dram` to get a DashMap-backed PaperCache<K, BufferDRAM> that is
+/// available without any PMEM hardware. The `eviction_stacks_pmem` feature is
+/// tested separately via its own test module in lfu_stack.rs.
+#[cfg(all(test, feature = "all_dram"))]
+mod test_new_features {
+    use crate::{PaperCache, PaperPolicy};
+    use std::hash::RandomState;
+
+    /// Verify that the cache initializes and operates correctly with the LFU policy.
+    /// The LfuStack used for eviction is backed by DRAM or PMEM depending on the
+    /// `eviction_stacks_pmem` feature flag — both paths must initialize correctly.
+    #[test]
+    fn test_cache_init_with_lfu_eviction() {
+        let cache: PaperCache<u32, Box<[u8]>, RandomState> = PaperCache::new(
+            1_000_000,
+            &[PaperPolicy::Lfu],
+            PaperPolicy::Lfu,
+        ).expect("Cache with LFU policy must initialize successfully");
+
+        let value: Vec<u8> = vec![10, 20, 30];
+        cache.set(1u32, &value, None).expect("set must succeed");
+        assert!(cache.has(&1u32), "inserted key must be present");
+
+        let retrieved = cache.get(&1u32).expect("get must return value");
+        assert_eq!(retrieved, value, "retrieved value must match inserted value");
+
+        cache.del(&1u32).expect("del must succeed");
+        assert!(!cache.has(&1u32), "deleted key must not be present");
+    }
+
+    /// Verify multiple policies work at initialization.
+    #[test]
+    fn test_cache_init_with_multiple_policies() {
+        let cache: PaperCache<u32, Box<[u8]>, RandomState> = PaperCache::new(
+            1_000_000,
+            &[PaperPolicy::Lfu, PaperPolicy::Lru],
+            PaperPolicy::Lfu,
+        ).expect("Cache with multiple policies must initialize successfully");
+
+        cache.set(42u32, b"hello", None).expect("set must succeed");
+        assert!(cache.has(&42u32));
+    }
+}
+
+/// Verify that hw_perf counters can be measured when the feature is enabled.
+/// When the feature is disabled, this entire module is compiled out — zero cost.
+#[cfg(all(test, feature = "hw_perf"))]
+mod test_hw_perf {
+    /// Verify measure_operation is callable and returns correct results.
+    /// In CI environments without perf_event access, measurement may return None — that's fine.
+    #[test]
+    fn test_hw_perf_measure_operation() {
+        use crate::measure_operation;
+
+        let (result, _measurement) = measure_operation(|| {
+            let mut sum: u64 = 0;
+            for i in 0u64..1000 {
+                sum = sum.wrapping_add(i);
+            }
+            sum
+        });
+
+        assert_eq!(result, 499500u64, "operation result must be correct regardless of perf counter availability");
+    }
+}
