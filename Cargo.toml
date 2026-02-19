@@ -29,6 +29,7 @@ libc = "0.2.177"
 tikv-jemallocator = "0.6.1"
 hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"
+perf-event = { version = "0.4.8", optional = true }
 
 
 [features]
@@ -41,10 +42,10 @@ all_dram = []
 # Enable the tiering manager functionality
 enable_tiering_manager = []
 
-# Place tiering manager's hashtable in PMEM (requires enable_tiering_manager + key_value_pmem or alloc_api_exp)
+# Place tiering manager's hashtable in PMEM (requires enable_tiering_manager + key_value_pmem)
 tiering_hashtable_pmem = []
 
-# Place global hashtable in PMEM (requires key_value_pmem or alloc_api_exp)
+# Place global hashtable in PMEM (requires key_value_pmem)
 global_hashtable_pmem = []
 
 # Experimental allocator API for testing (uses same hashtable type as key_value_pmem)
@@ -64,6 +65,12 @@ global_flatmap_pmem = []
 
 # Use hashbrown HashMap as global hashtable in DRAM (for performance comparison)
 hashbrown_dram = []
+
+# Enable hardware performance counters (requires Linux perf_event)
+hw_perf = ["perf-event"]
+
+# Enable PMEM-backed eviction stacks
+eviction_stacks_pmem = []
 
 # Legacy features (deprecated, will be removed)
 default = []

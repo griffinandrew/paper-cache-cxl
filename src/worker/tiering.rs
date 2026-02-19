@@ -149,7 +149,7 @@ where
 
 
 
-#[cfg(any(feature = "alloc_api_exp", all(feature = "key_value_pmem", feature = "global_hashtable_pmem")))]
+#[cfg(all(feature = "key_value_pmem", feature = "global_hashtable_pmem"))]
 impl<K, V> TieringWorker<K, V>
 where
     K: 'static + Eq + TypeSize + Clone,
