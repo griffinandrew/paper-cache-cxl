@@ -55,9 +55,9 @@ impl Default for MultitieringConfig {
     fn default() -> Self {
         MultitieringConfig {
             warm_capacity_bytes: 512 * 1024 * 1024, // 512 MB
-            hot_capacity_bytes: 512 * 1024 * 1024,  // 512 MB
+            hot_capacity_bytes: 1024 * 1024 * 1024,  // 512 MB
             warm_threshold: 2,
-            hot_threshold: 4,
+            hot_threshold: 4, 
         }
     }
 }
