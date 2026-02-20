@@ -750,7 +750,7 @@ impl Default for MultitieringConfig {
             hot_capacity_bytes: 1024 * 1024 * 1024,
             warm_threshold: 2,
             hot_threshold: 10,
-            evaluation_interval: Duration::from_secs(5),
+            evaluation_interval: Duration::from_secs(5),  // matches TieringWorker default
             warm_high_water_mark: 0.9,
             warm_low_water_mark: 0.7,
             hot_high_water_mark: 0.9,
@@ -1016,11 +1016,13 @@ where
         self.config.read().unwrap().evaluation_interval
     }
 
-    /// Promotes a Hot object (metadata only, no data copy) — for unit testing tier logic.
+    /// Promotes a Hot object (metadata only, no data copy) — for testing tier logic
+    /// without needing a real `Object<K, V>` value.
     ///
-    /// This allows tests to exercise tier-tracking and eviction without needing a real
-    /// `Object<K, V>` value. It is intentionally **not** gated on `#[cfg(test)]` so that
-    /// integration tests (compiled as separate crates) can also use it.
+    /// **Warning**: This method does **not** place any data into the DRAM cache. Calling
+    /// `get_from_dram()` for a key promoted via this method will return `None`. It is
+    /// intended solely for unit and integration tests that exercise tier-tracking and
+    /// eviction logic. Production code should use `promote_to_hot(&key, &object)` instead.
     pub fn promote_to_hot_no_data(&self, key: HashedKey) -> bool {
         let mut info_map = self.object_info.write().unwrap();
         if let Some(info) = info_map.get_mut(&key) {

@@ -85,7 +85,7 @@ mod multitier_tests {
     #[test]
     fn test_multitiering_byte_threshold_evictions() {
         // warm_capacity = 250 bytes, hot_capacity = 150 bytes
-        // high_water_mark: 1.0  → trigger demotion when usage EXCEEDS capacity
+        // high_water_mark: 1.0  → trigger demotion when usage EXCEEDS capacity (i.e. > capacity × 1.0)
         // low_water_mark:  0.8  → stop when usage drops to 80% of capacity
         //   warm low_water = 250 * 0.8 = 200  → demote 1 object (300→200)
         //   hot  low_water = 150 * 0.8 = 120  → demote 1 object (200→100)
