@@ -161,7 +161,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 	worker_manager: Arc<WorkerSender>,
 	overhead_manager: OverheadManagerRef,
 	
-	#[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager"))]
+	#[cfg(all(any(feature = "key_value_pmem", feature = "alloc_api_exp"), feature = "enable_tiering_manager", not(feature = "multitiering")))]
 	tiering_manager: Arc<TieringManager<K, V>>,
 
 	#[cfg(all(feature = "multitiering", any(feature = "key_value_pmem", feature = "alloc_api_exp")))]
@@ -2747,6 +2747,7 @@ where
 
 		Ok(())
 	}
+
 
 
 	#[cfg(all(feature = "alloc_api_exp", feature = "enable_tiering_manager"))]
