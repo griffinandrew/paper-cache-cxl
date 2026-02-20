@@ -83,7 +83,7 @@
 
 #[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 pub mod manager;
-#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "multitiering"))]
 pub mod object;
 
 #[cfg(feature = "multitiering")]
@@ -95,7 +95,7 @@ pub use manager::TieringManager;
 pub use manager::TieringConfig;
 #[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 pub use manager::TieringStats;
-#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "multitiering"))]
 pub use object::TieringObject;
 
 #[cfg(feature = "multitiering")]

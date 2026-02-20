@@ -729,6 +729,18 @@ pub struct MultitieringConfig {
     pub warm_threshold: u64,
     pub hot_threshold: u64,
     pub evaluation_interval: Duration,
+    /// High water mark for the warm tier (0.0–1.0). Demotion starts when warm usage exceeds
+    /// `warm_capacity_bytes * warm_high_water_mark`.
+    pub warm_high_water_mark: f64,
+    /// Low water mark for the warm tier (0.0–1.0). Demotion stops when warm usage drops below
+    /// `warm_capacity_bytes * warm_low_water_mark`.
+    pub warm_low_water_mark: f64,
+    /// High water mark for the hot tier (0.0–1.0). Demotion starts when hot usage exceeds
+    /// `hot_capacity_bytes * hot_high_water_mark`.
+    pub hot_high_water_mark: f64,
+    /// Low water mark for the hot tier (0.0–1.0). Demotion stops when hot usage drops below
+    /// `hot_capacity_bytes * hot_low_water_mark`.
+    pub hot_low_water_mark: f64,
 }
 
 impl Default for MultitieringConfig {
@@ -737,8 +749,12 @@ impl Default for MultitieringConfig {
             warm_capacity_bytes: 512 * 1024 * 1024,
             hot_capacity_bytes: 1024 * 1024 * 1024,
             warm_threshold: 2,
-            hot_threshold: 10, 
-            evaluation_interval: Duration::from_secs(10),
+            hot_threshold: 10,
+            evaluation_interval: Duration::from_secs(5),
+            warm_high_water_mark: 0.9,
+            warm_low_water_mark: 0.7,
+            hot_high_water_mark: 0.9,
+            hot_low_water_mark: 0.7,
         }
     }
 }
@@ -762,9 +778,11 @@ pub struct MultitieringManager<K, V> {
     stats: Arc<RwLock<MultitieringStats>>,
     object_info: Arc<RwLock<HashMap<HashedKey, MultiObjectInfo>>>,
 
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    /// DRAM cache for hot objects (DashMap when no PMEM hashtable allocator is in use).
+    #[cfg(not(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp")))]
     dram_cache: Arc<DashMap<HashedKey, TieringObject<K>, NoHasher>>,
-    
+
+    /// DRAM cache backed by a PMEM-aware hashmap when a PMEM hashtable allocator is enabled.
     #[cfg(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp"))]
     dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, NoHasher, Hybrid>>>,
 
@@ -777,7 +795,7 @@ where
     K: TypeSize + Clone,
 {
     pub fn new(config: MultitieringConfig) -> Self {
-        #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+        #[cfg(not(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp")))]
         let dram_cache = Arc::new(DashMap::with_hasher(NoHasher::default()));
         #[cfg(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp"))]
         let dram_cache = Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid)));
@@ -791,6 +809,11 @@ where
         }
     }
 
+    /// Creates a new `MultitieringManager` with default configuration.
+    pub fn with_defaults() -> Self {
+        Self::new(MultitieringConfig::default())
+    }
+
     pub fn register_object(&self, key: HashedKey, size: ObjectSize) {
         let mut info_map = self.object_info.write().unwrap();
         info_map.insert(key, MultiObjectInfo {
@@ -802,7 +825,7 @@ where
         self.stats.write().unwrap().cold_objects += 1;
     }
 
-    /// This can now be called even if V doesn't implement AsRef<[u8]>
+    /// Records an access to an object, updating its access count and last-access timestamp.
     pub fn record_access(&self, key: HashedKey) {
         let mut info_map = self.object_info.write().unwrap();
         if let Some(info) = info_map.get_mut(&key) {
@@ -815,6 +838,12 @@ where
         self.stats.read().unwrap().clone()
     }
 
+    /// Returns the current tier for the given key, if tracked.
+    pub fn tier_of(&self, key: &HashedKey) -> Option<Tier> {
+        self.object_info.read().unwrap().get(key).map(|i| i.tier)
+    }
+
+    /// Returns keys that should be promoted and their target tier, based on access counts.
     pub fn get_keys_to_promote(&self) -> Vec<(HashedKey, Tier)> {
         let info_map = self.object_info.read().unwrap();
         let config = self.config.read().unwrap();
@@ -834,27 +863,35 @@ where
         to_promote
     }
 
+    /// Returns keys that should be demoted based on high/low water marks.
+    ///
+    /// When a tier's used bytes exceed `capacity * high_water_mark`, the oldest (LRU) objects
+    /// are collected for demotion until usage would fall below `capacity * low_water_mark`.
     pub fn get_keys_to_demote(&self) -> Vec<(HashedKey, Tier)> {
         let info_map = self.object_info.read().unwrap();
         let stats = self.stats.read().unwrap();
         let config = self.config.read().unwrap();
         let mut keys_to_demote = Vec::new();
 
-        if stats.hot_size > config.hot_capacity_bytes {
+        let hot_high_water = (config.hot_capacity_bytes as f64 * config.hot_high_water_mark) as u64;
+        let hot_low_water = (config.hot_capacity_bytes as f64 * config.hot_low_water_mark) as u64;
+        if stats.hot_size > hot_high_water {
             let mut hot_objects: Vec<_> = info_map.iter()
                 .filter(|(_, info)| info.tier == Tier::DramAndPmem)
                 .collect();
             hot_objects.sort_by_key(|(_, info)| info.last_access);
-            
+
             let mut current_hot_size = stats.hot_size;
             for (key, info) in hot_objects {
-                if current_hot_size <= config.hot_capacity_bytes { break; }
+                if current_hot_size <= hot_low_water { break; }
                 keys_to_demote.push((*key, Tier::DramAndPmem));
                 current_hot_size = current_hot_size.saturating_sub(info.size as u64);
             }
         }
 
-        if stats.warm_size > config.warm_capacity_bytes {
+        let warm_high_water = (config.warm_capacity_bytes as f64 * config.warm_high_water_mark) as u64;
+        let warm_low_water = (config.warm_capacity_bytes as f64 * config.warm_low_water_mark) as u64;
+        if stats.warm_size > warm_high_water {
             let mut warm_objects: Vec<_> = info_map.iter()
                 .filter(|(_, info)| info.tier == Tier::DramPtrToPmem)
                 .collect();
@@ -862,7 +899,7 @@ where
 
             let mut current_warm_size = stats.warm_size;
             for (key, info) in warm_objects {
-                if current_warm_size <= config.warm_capacity_bytes { break; }
+                if current_warm_size <= warm_low_water { break; }
                 keys_to_demote.push((*key, Tier::DramPtrToPmem));
                 current_warm_size = current_warm_size.saturating_sub(info.size as u64);
             }
@@ -871,7 +908,9 @@ where
         keys_to_demote
     }
 
-    pub fn promote_to_warm(&self, key: HashedKey) {
+    /// Promotes a Cold (`PmemOnly`) object to Warm (`DramPtrToPmem`).
+    /// Returns `true` if the promotion succeeded.
+    pub fn promote_to_warm(&self, key: HashedKey) -> bool {
         let mut info_map = self.object_info.write().unwrap();
         if let Some(info) = info_map.get_mut(&key) {
             if info.tier == Tier::PmemOnly {
@@ -882,24 +921,27 @@ where
                 stats.warm_objects += 1;
                 stats.cold_objects = stats.cold_objects.saturating_sub(1);
                 stats.promotions += 1;
+                return true;
             }
         }
+        false
     }
 
+    /// Demotes an object from any DRAM tier directly to Cold (`PmemOnly`).
     pub fn demote_to_cold(&self, key: HashedKey) {
         let mut info_map = self.object_info.write().unwrap();
         if let Some(info) = info_map.get_mut(&key) {
             let old_tier = info.tier;
             if old_tier == Tier::DramAndPmem {
-                #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+                #[cfg(not(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp")))]
                 self.dram_cache.remove(&key);
                 #[cfg(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp"))]
                 self.dram_cache.write().unwrap().remove(&key);
             }
-            
+
             info.tier = Tier::PmemOnly;
             info.access_count = 0;
-            
+
             let mut stats = self.stats.write().unwrap();
             match old_tier {
                 Tier::DramAndPmem => {
@@ -917,40 +959,115 @@ where
         }
     }
 
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    /// Removes an object from all tracking (called on cache deletion).
+    pub fn remove_object(&self, key: HashedKey) {
+        let info = {
+            let mut info_map = self.object_info.write().unwrap();
+            info_map.remove(&key)
+        };
+        if let Some(info) = info {
+            if info.tier == Tier::DramAndPmem {
+                #[cfg(not(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp")))]
+                self.dram_cache.remove(&key);
+                #[cfg(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp"))]
+                self.dram_cache.write().unwrap().remove(&key);
+            }
+            let mut stats = self.stats.write().unwrap();
+            match info.tier {
+                Tier::PmemOnly => {
+                    stats.cold_objects = stats.cold_objects.saturating_sub(1);
+                }
+                Tier::DramPtrToPmem => {
+                    stats.warm_objects = stats.warm_objects.saturating_sub(1);
+                    stats.warm_size = stats.warm_size.saturating_sub(info.size as u64);
+                }
+                Tier::DramAndPmem => {
+                    stats.hot_objects = stats.hot_objects.saturating_sub(1);
+                    stats.hot_size = stats.hot_size.saturating_sub(info.size as u64);
+                }
+            }
+        }
+    }
+
+    /// Gets a hot object from the DRAM cache if it exists there.
+    #[cfg(not(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp")))]
     pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = TieringObject<K>> + '_> {
         self.dram_cache.get(key)
     }
 
-    #[cfg(any(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"), feature = "alloc_api_exp"))]
+    /// Gets a hot object from the DRAM cache if it exists there.
+    #[cfg(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp"))]
     pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K>>> {
         self.dram_cache.read().unwrap().get(key).map(|obj| Arc::new(obj.clone()))
     }
 
+    /// Clears all tiering state (for cache wipe).
     pub fn clear(&self) {
         self.object_info.write().unwrap().clear();
-        #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+        #[cfg(not(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp")))]
         self.dram_cache.clear();
         #[cfg(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp"))]
         self.dram_cache.write().unwrap().clear();
         *self.stats.write().unwrap() = MultitieringStats::default();
     }
+
+    /// Returns the configured periodic evaluation interval.
+    pub fn evaluation_interval(&self) -> Duration {
+        self.config.read().unwrap().evaluation_interval
+    }
+
+    /// Promotes a Hot object (metadata only, no data copy) — for unit testing tier logic.
+    ///
+    /// This allows tests to exercise tier-tracking and eviction without needing a real
+    /// `Object<K, V>` value. It is intentionally **not** gated on `#[cfg(test)]` so that
+    /// integration tests (compiled as separate crates) can also use it.
+    pub fn promote_to_hot_no_data(&self, key: HashedKey) -> bool {
+        let mut info_map = self.object_info.write().unwrap();
+        if let Some(info) = info_map.get_mut(&key) {
+            if info.tier != Tier::DramAndPmem {
+                let old_tier = info.tier;
+                info.tier = Tier::DramAndPmem;
+                info.access_count = 0;
+                let mut stats = self.stats.write().unwrap();
+                stats.hot_size += info.size as u64;
+                stats.hot_objects += 1;
+                if old_tier == Tier::DramPtrToPmem {
+                    stats.warm_size = stats.warm_size.saturating_sub(info.size as u64);
+                    stats.warm_objects = stats.warm_objects.saturating_sub(1);
+                } else {
+                    stats.cold_objects = stats.cold_objects.saturating_sub(1);
+                }
+                stats.promotions += 1;
+                return true;
+            }
+        }
+        false
+    }
 }
 
-/// Specialized Implementation (Requires V: AsRef<[u8]>)
+/// Specialized implementation that requires `V: AsRef<[u8]>` in order to physically
+/// copy object payload bytes into the DRAM cache.
 impl<K, V> MultitieringManager<K, V>
 where
     K: TypeSize + Clone,
     V: TypeSize + Clone + AsRef<[u8]>,
 {
-    pub fn promote_to_hot(&self, key: HashedKey, object: &Object<K, V>) {
+    /// Promotes an object to Hot (`DramAndPmem`), physically copying its payload into DRAM.
+    ///
+    /// Returns `true` if the promotion succeeded.
+    pub fn promote_to_hot(&self, key: HashedKey, object: &Object<K, V>) -> bool {
         let mut info_map = self.object_info.write().unwrap();
         if let Some(info) = info_map.get_mut(&key) {
             if info.tier != Tier::DramAndPmem {
-                let bytes: &[u8] = object.data().as_ref().as_ref();
-                let dram_obj = TieringObject::with_expiry(object.key().clone(), bytes.to_vec().into_boxed_slice(), object.expiry());
-                
-                #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+                let data_arc = object.data();
+                let bytes: &[u8] = data_arc.as_ref().as_ref();
+                let dram_obj = TieringObject::with_expiry(
+                    object.key().clone(),
+                    bytes.to_vec().into_boxed_slice(),
+                    object.expiry(),
+                );
+
+                #[cfg(not(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp")))]
                 self.dram_cache.insert(key, dram_obj);
                 #[cfg(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp"))]
                 self.dram_cache.write().unwrap().insert(key, dram_obj);
@@ -969,7 +1086,9 @@ where
                     stats.cold_objects = stats.cold_objects.saturating_sub(1);
                 }
                 stats.promotions += 1;
+                return true;
             }
         }
+        false
     }
 }
