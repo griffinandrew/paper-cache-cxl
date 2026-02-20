@@ -288,4 +288,51 @@ where
     }
 }
 
+
+/* 
+fn run(&mut self) -> Result<(), CacheError> {
+    let mut next_tick = std::time::Instant::now() + TIERING_INTERVAL;
+    
+    loop {
+        let now = std::time::Instant::now();
+        let timeout = if now >= next_tick {
+            Duration::from_millis(0) 
+        } else {
+            next_tick - now
+        };
+
+        // Wait for events until the next scheduled periodic task
+        match self.listener.recv_timeout(timeout) {
+            Ok(event) => {
+                self.process_event(event);
+                // Drain any other pending events quickly
+                for event in self.listener.try_iter() {
+                    self.process_event(event);
+                }
+            }
+            Err(_) => {} // Timeout reached or channel empty
+        }
+
+        // Check if it's time for periodic work
+        if std::time::Instant::now() >= next_tick {
+            self.periodic_tiering();
+            
+            // Fixed Schedule: ensures it runs every TIERING_INTERVAL 
+            // regardless of how long periodic_tiering() took.
+            next_tick = std::time::Instant::now() + TIERING_INTERVAL;
+        }
+    }
+}
+
+*/
+
+
+
+
+
+
+
+
+
+//this is trash / just a placeholder to make sure the file compiles while we work on it, ignore this? 
 unsafe impl<K, V> Send for TieringWorker<K, V> {}
