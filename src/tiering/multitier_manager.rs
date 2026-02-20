@@ -1,4 +1,7 @@
-/*
+/* 
+
+
+/* 
  * Copyright (c) Kia Shakiba
  *
  * This source code is licensed under the GNU AGPLv3 license found in the
@@ -419,6 +422,27 @@ impl<K, V> MultitieringManager<K, V> {
             stats.demotions += 1;
         }
     }
+
+
+        /// Gets a TieringObject from the DRAM cache if it exists there
+    /// Returns a reference to the TieringObject<K> stored in DRAM
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = TieringObject<K>> + '_> {
+        self.dram_cache.get(key)
+    }
+
+    #[cfg(any(
+        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
+        feature = "alloc_api_exp"
+    ))]
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K>>> {
+        self.dram_cache
+            .read()
+            .unwrap()
+            .get(key)
+            .map(|obj| Arc::new(obj.clone()))
+    }
+    
 }
 
 /// Removes the first occurrence of `key` from `deque` (O(n) linear scan).
@@ -645,6 +669,307 @@ mod tests {
             // hot still holds key 3 (100 B < 150 B)
             assert_eq!(stats.hot_size, 100, "hot_size should remain 100");
             assert_eq!(stats.hot_objects, 1);
+        }
+    }
+}
+
+
+*/
+
+
+/*
+ * Copyright (c) Kia Shakiba
+ *
+ * This source code is licensed under the GNU AGPLv3 license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+    time::{Instant, Duration},
+};
+
+use dashmap::DashMap;
+use typesize::TypeSize;
+use nohash_hasher::NoHashHasher;
+use std::hash::BuildHasherDefault;
+
+use crate::{
+    HashedKey,
+    object::{Object, ObjectSize},
+};
+
+use super::object::TieringObject;
+
+pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
+
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "tiering_hashtable_pmem"))]
+use crate::allocator::HybridObjects as Hybrid;
+
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
+use hashbrown::HashMap as hashtable;
+
+/// Statistics tracked by the MultitieringManager.
+#[derive(Debug, Clone, Default)]
+pub struct MultitieringStats {
+    pub warm_size: u64,
+    pub hot_size: u64,
+    pub cold_objects: u64,
+    pub warm_objects: u64,
+    pub hot_objects: u64,
+    pub promotions: u64,
+    pub demotions: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultitieringConfig {
+    pub warm_capacity_bytes: u64,
+    pub hot_capacity_bytes: u64,
+    pub warm_threshold: u64,
+    pub hot_threshold: u64,
+    pub evaluation_interval: Duration,
+}
+
+impl Default for MultitieringConfig {
+    fn default() -> Self {
+        MultitieringConfig {
+            warm_capacity_bytes: 512 * 1024 * 1024,
+            hot_capacity_bytes: 1024 * 1024 * 1024,
+            warm_threshold: 2,
+            hot_threshold: 10, 
+            evaluation_interval: Duration::from_secs(10),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    PmemOnly,
+    DramPtrToPmem,
+    DramAndPmem,
+}
+
+struct MultiObjectInfo {
+    tier: Tier,
+    size: ObjectSize,
+    access_count: u64,
+    last_access: Instant,
+}
+
+pub struct MultitieringManager<K, V> {
+    config: Arc<RwLock<MultitieringConfig>>,
+    stats: Arc<RwLock<MultitieringStats>>,
+    object_info: Arc<RwLock<HashMap<HashedKey, MultiObjectInfo>>>,
+
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    dram_cache: Arc<DashMap<HashedKey, TieringObject<K>, NoHasher>>,
+    
+    #[cfg(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp"))]
+    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, NoHasher, Hybrid>>>,
+
+    _phantom: std::marker::PhantomData<(K, V)>,
+}
+
+/// General Implementation (No AsRef<[u8]> bound required)
+impl<K, V> MultitieringManager<K, V>
+where
+    K: TypeSize + Clone,
+{
+    pub fn new(config: MultitieringConfig) -> Self {
+        #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+        let dram_cache = Arc::new(DashMap::with_hasher(NoHasher::default()));
+        #[cfg(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp"))]
+        let dram_cache = Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid)));
+
+        MultitieringManager {
+            config: Arc::new(RwLock::new(config)),
+            stats: Arc::new(RwLock::new(MultitieringStats::default())),
+            object_info: Arc::new(RwLock::new(HashMap::new())),
+            dram_cache,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    pub fn register_object(&self, key: HashedKey, size: ObjectSize) {
+        let mut info_map = self.object_info.write().unwrap();
+        info_map.insert(key, MultiObjectInfo {
+            tier: Tier::PmemOnly,
+            size,
+            access_count: 0,
+            last_access: Instant::now(),
+        });
+        self.stats.write().unwrap().cold_objects += 1;
+    }
+
+    /// This can now be called even if V doesn't implement AsRef<[u8]>
+    pub fn record_access(&self, key: HashedKey) {
+        let mut info_map = self.object_info.write().unwrap();
+        if let Some(info) = info_map.get_mut(&key) {
+            info.access_count += 1;
+            info.last_access = Instant::now();
+        }
+    }
+
+    pub fn stats(&self) -> MultitieringStats {
+        self.stats.read().unwrap().clone()
+    }
+
+    pub fn get_keys_to_promote(&self) -> Vec<(HashedKey, Tier)> {
+        let info_map = self.object_info.read().unwrap();
+        let config = self.config.read().unwrap();
+        let mut to_promote = Vec::new();
+
+        for (key, info) in info_map.iter() {
+            match info.tier {
+                Tier::PmemOnly if info.access_count >= config.warm_threshold => {
+                    to_promote.push((*key, Tier::DramPtrToPmem));
+                }
+                Tier::DramPtrToPmem if info.access_count >= config.hot_threshold => {
+                    to_promote.push((*key, Tier::DramAndPmem));
+                }
+                _ => {}
+            }
+        }
+        to_promote
+    }
+
+    pub fn get_keys_to_demote(&self) -> Vec<(HashedKey, Tier)> {
+        let info_map = self.object_info.read().unwrap();
+        let stats = self.stats.read().unwrap();
+        let config = self.config.read().unwrap();
+        let mut keys_to_demote = Vec::new();
+
+        if stats.hot_size > config.hot_capacity_bytes {
+            let mut hot_objects: Vec<_> = info_map.iter()
+                .filter(|(_, info)| info.tier == Tier::DramAndPmem)
+                .collect();
+            hot_objects.sort_by_key(|(_, info)| info.last_access);
+            
+            let mut current_hot_size = stats.hot_size;
+            for (key, info) in hot_objects {
+                if current_hot_size <= config.hot_capacity_bytes { break; }
+                keys_to_demote.push((*key, Tier::DramAndPmem));
+                current_hot_size = current_hot_size.saturating_sub(info.size as u64);
+            }
+        }
+
+        if stats.warm_size > config.warm_capacity_bytes {
+            let mut warm_objects: Vec<_> = info_map.iter()
+                .filter(|(_, info)| info.tier == Tier::DramPtrToPmem)
+                .collect();
+            warm_objects.sort_by_key(|(_, info)| info.last_access);
+
+            let mut current_warm_size = stats.warm_size;
+            for (key, info) in warm_objects {
+                if current_warm_size <= config.warm_capacity_bytes { break; }
+                keys_to_demote.push((*key, Tier::DramPtrToPmem));
+                current_warm_size = current_warm_size.saturating_sub(info.size as u64);
+            }
+        }
+
+        keys_to_demote
+    }
+
+    pub fn promote_to_warm(&self, key: HashedKey) {
+        let mut info_map = self.object_info.write().unwrap();
+        if let Some(info) = info_map.get_mut(&key) {
+            if info.tier == Tier::PmemOnly {
+                info.tier = Tier::DramPtrToPmem;
+                info.access_count = 0;
+                let mut stats = self.stats.write().unwrap();
+                stats.warm_size += info.size as u64;
+                stats.warm_objects += 1;
+                stats.cold_objects = stats.cold_objects.saturating_sub(1);
+                stats.promotions += 1;
+            }
+        }
+    }
+
+    pub fn demote_to_cold(&self, key: HashedKey) {
+        let mut info_map = self.object_info.write().unwrap();
+        if let Some(info) = info_map.get_mut(&key) {
+            let old_tier = info.tier;
+            if old_tier == Tier::DramAndPmem {
+                #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+                self.dram_cache.remove(&key);
+                #[cfg(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp"))]
+                self.dram_cache.write().unwrap().remove(&key);
+            }
+            
+            info.tier = Tier::PmemOnly;
+            info.access_count = 0;
+            
+            let mut stats = self.stats.write().unwrap();
+            match old_tier {
+                Tier::DramAndPmem => {
+                    stats.hot_size = stats.hot_size.saturating_sub(info.size as u64);
+                    stats.hot_objects = stats.hot_objects.saturating_sub(1);
+                }
+                Tier::DramPtrToPmem => {
+                    stats.warm_size = stats.warm_size.saturating_sub(info.size as u64);
+                    stats.warm_objects = stats.warm_objects.saturating_sub(1);
+                }
+                _ => return,
+            }
+            stats.cold_objects += 1;
+            stats.demotions += 1;
+        }
+    }
+
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = TieringObject<K>> + '_> {
+        self.dram_cache.get(key)
+    }
+
+    #[cfg(any(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"), feature = "alloc_api_exp"))]
+    pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K>>> {
+        self.dram_cache.read().unwrap().get(key).map(|obj| Arc::new(obj.clone()))
+    }
+
+    pub fn clear(&self) {
+        self.object_info.write().unwrap().clear();
+        #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+        self.dram_cache.clear();
+        #[cfg(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp"))]
+        self.dram_cache.write().unwrap().clear();
+        *self.stats.write().unwrap() = MultitieringStats::default();
+    }
+}
+
+/// Specialized Implementation (Requires V: AsRef<[u8]>)
+impl<K, V> MultitieringManager<K, V>
+where
+    K: TypeSize + Clone,
+    V: TypeSize + Clone + AsRef<[u8]>,
+{
+    pub fn promote_to_hot(&self, key: HashedKey, object: &Object<K, V>) {
+        let mut info_map = self.object_info.write().unwrap();
+        if let Some(info) = info_map.get_mut(&key) {
+            if info.tier != Tier::DramAndPmem {
+                let bytes: &[u8] = object.data().as_ref().as_ref();
+                let dram_obj = TieringObject::with_expiry(object.key().clone(), bytes.to_vec().into_boxed_slice(), object.expiry());
+                
+                #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+                self.dram_cache.insert(key, dram_obj);
+                #[cfg(any(feature = "tiering_hashtable_pmem", feature = "alloc_api_exp"))]
+                self.dram_cache.write().unwrap().insert(key, dram_obj);
+
+                let old_tier = info.tier;
+                info.tier = Tier::DramAndPmem;
+                info.access_count = 0;
+
+                let mut stats = self.stats.write().unwrap();
+                stats.hot_size += info.size as u64;
+                stats.hot_objects += 1;
+                if old_tier == Tier::DramPtrToPmem {
+                    stats.warm_size = stats.warm_size.saturating_sub(info.size as u64);
+                    stats.warm_objects = stats.warm_objects.saturating_sub(1);
+                } else {
+                    stats.cold_objects = stats.cold_objects.saturating_sub(1);
+                }
+                stats.promotions += 1;
+            }
         }
     }
 }

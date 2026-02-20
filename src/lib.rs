@@ -1646,6 +1646,19 @@ where
 			}
 		}
 
+		#[cfg(feature = "multitiering")]
+		if let Some(dram_object_ref) = self.multitiering_manager.get_from_dram(&hashed_key) {
+			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
+				self.status.incr_hits();
+				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+				let arc_val = dram_object_ref.data();
+				//println!("CACHE: get for key {:?} from DRAM tier", key);
+				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
+				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
+				return Ok(arc_val.as_ref().to_vec());
+			}
+		}
+
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
