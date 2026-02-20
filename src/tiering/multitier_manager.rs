@@ -749,9 +749,9 @@ impl Default for MultitieringConfig {
             warm_capacity_bytes: 512 * 1024 * 1024,
             hot_capacity_bytes: 1024 * 1024 * 1024,
             warm_threshold: 2,
-            hot_threshold: 10,
+            hot_threshold: 4,
             evaluation_interval: Duration::from_secs(5),  // matches TieringWorker default
-            warm_high_water_mark: 0.9,
+            warm_high_water_mark: 0.95,
             warm_low_water_mark: 0.7,
             hot_high_water_mark: 0.9,
             hot_low_water_mark: 0.7,
