@@ -69,6 +69,7 @@ hw_perf = ["perf-event"]
 # Enable PMEM-backed eviction stacks
 eviction_stacks_pmem = []
 
+#to emnable 3 tier based data movement
 hashtable_tiering = [] 
 
 # Legacy features (deprecated, will be removed)

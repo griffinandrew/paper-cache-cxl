@@ -45,7 +45,7 @@ unsafe impl GlobalAlloc for HybridObjects {
         //if only using pmem ... dont track the fucking counters.... 
         if DRAM_LIMIT_OBJECTS == ALL_PMEM_LIMIT_BYTES {
             unsafe {
-                /*INIT.call_once(|| {
+                INIT.call_once(|| {
                     let dax_size = 236757975040; // PMEM size from ndctl list --namespaces
                     let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
                     allocator_bindings::umf_allocator_init(
@@ -55,7 +55,8 @@ unsafe impl GlobalAlloc for HybridObjects {
                     #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);}
                     //println!("CACHE: Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);
                 });
-                */
+                
+                /*
                 INIT.call_once(|| {
                     let numa_node = 1;
                     let numa_list = [0, 1];
@@ -68,6 +69,7 @@ unsafe impl GlobalAlloc for HybridObjects {
                         );
                     #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with NUMA list {:?}", numa_list);}
                 });
+                */
 
 
             }
@@ -93,7 +95,7 @@ unsafe impl GlobalAlloc for HybridObjects {
             ptr
         } else {
             unsafe {
-                /* 
+                
                 INIT.call_once(|| {
                     let dax_size = 118377938944; // PMEM size from ndctl list --namespaces
                     let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
@@ -102,8 +104,9 @@ unsafe impl GlobalAlloc for HybridObjects {
                         dax_size,
                         );
                 });
-                */
-                INIT.call_once(|| {
+                
+                
+                /*INIT.call_once(|| {
                     let numa_node = 1;
                     let numa_list = [0, 1];
                     //allocator_bindings::umf_allocator_init(
@@ -115,6 +118,7 @@ unsafe impl GlobalAlloc for HybridObjects {
                         );
                     #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with NUMA list {:?}", numa_list);}
                 });
+                */
             }
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
             if ptr.is_null() { println!("Failed to allocate PMEM"); return ptr::null_mut(); }

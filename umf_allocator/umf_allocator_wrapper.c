@@ -1,6 +1,3 @@
-/*
-
-
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,12 +126,12 @@ int check_tier(void *ptr) {
 }
 
 
-*/
 
 
 
 
 
+/*
 
 
 //working NUMA verison for only using pmem
@@ -302,7 +299,7 @@ void umf_dealloc(void *ptr) {
 //end solo numa node allocation for pmem
 
 
-
+*/
 
 
 
