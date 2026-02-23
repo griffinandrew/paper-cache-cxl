@@ -1,7 +1,6 @@
-/* 
+
 
 //solo numa and daxdev config
-
 
 unsafe extern "C" {
     //pub fn umf_allocator_init(dax_path: *const libc::c_char, dax_size: usize) -> libc::c_int;
@@ -16,9 +15,9 @@ unsafe extern "C" {
 } 
 
 
-*/
 
 
+/*
 unsafe extern "C" {
     /// Initialize UMF allocator with a list of NUMA nodes
     /// `numa_nodes` -> pointer to array of `unsigned` NUMA IDs
@@ -34,3 +33,5 @@ unsafe extern "C" {
     pub fn check_tier(ptr: *mut libc::c_void) -> libc::c_int;
 
 }
+
+*/

@@ -136,7 +136,6 @@ int check_tier(void *ptr) {
 
 
 
-/*
 
 //working NUMA verison for only using pmem
 
@@ -300,13 +299,16 @@ void umf_dealloc(void *ptr) {
 }
 
 
-end solo numa node allocation for pmem
-
-*/
+//end solo numa node allocation for pmem
 
 
 
 
+
+
+
+
+/* doesnt work... tried to have bioht numa nodes in same provider.... 
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -324,7 +326,7 @@ static umf_os_memory_provider_params_handle_t os_params = NULL;
 
 static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ============================================================ */
+
 void umf_allocator_finalize(void) {
     pthread_mutex_lock(&pool_lock);
 
@@ -346,12 +348,12 @@ void umf_allocator_finalize(void) {
     pthread_mutex_unlock(&pool_lock);
 }
 
-/* ============================================================ */
-/**
- * Initialize UMF allocator with a list of NUMA nodes.
- * numa_nodes: array of NUMA node IDs
- * node_count: number of nodes in the array
- */
+
+// Initialize UMF allocator with a list of NUMA nodes.
+// numa_nodes: array of NUMA node IDs
+// node_count: number of nodes in the array
+//
+
 int umf_allocator_init(const unsigned *numa_nodes, size_t node_count) {
     umf_jemalloc_pool_params_handle_t jemalloc_params = NULL;
     umf_result_t res;
@@ -368,7 +370,7 @@ int umf_allocator_init(const unsigned *numa_nodes, size_t node_count) {
         return 0; // already initialized
     }
 
-    /* Create OS provider params */
+    // Create OS provider params 
     res = umfOsMemoryProviderParamsCreate(&os_params);
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to create OS params: %d\n", res);
@@ -376,7 +378,7 @@ int umf_allocator_init(const unsigned *numa_nodes, size_t node_count) {
         return 2;
     }
 
-    /* Set NUMA node list */
+    // Set NUMA node list 
     res = umfOsMemoryProviderParamsSetNumaList(os_params, numa_nodes, node_count);
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to set NUMA list: %d\n", res);
@@ -384,7 +386,7 @@ int umf_allocator_init(const unsigned *numa_nodes, size_t node_count) {
         return 3;
     }
 
-    /* Set default NUMA mode (OS decides allocation, enables auto-tiering) */
+    // Set default NUMA mode (OS decides allocation, enables auto-tiering) 
     res = umfOsMemoryProviderParamsSetNumaMode(os_params, UMF_NUMA_MODE_DEFAULT);
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to set NUMA mode: %d\n", res);
@@ -392,7 +394,7 @@ int umf_allocator_init(const unsigned *numa_nodes, size_t node_count) {
         return 4;
     }
 
-    /* Create OS provider */
+    // Create OS provider 
     res = umfMemoryProviderCreate(umfOsMemoryProviderOps(), os_params, &provider);
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to create OS provider: %d\n", res);
@@ -400,7 +402,7 @@ int umf_allocator_init(const unsigned *numa_nodes, size_t node_count) {
         return 5;
     }
 
-    /* Create jemalloc pool params */
+    // Create jemalloc pool params 
     res = umfJemallocPoolParamsCreate(&jemalloc_params);
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to create jemalloc params: %d\n", res);
@@ -408,7 +410,7 @@ int umf_allocator_init(const unsigned *numa_nodes, size_t node_count) {
         return 6;
     }
 
-    /* Create UMF pool */
+    // Create UMF pool 
     res = umfPoolCreate(umfJemallocPoolOps(), provider, jemalloc_params, 0, &pool);
     umfJemallocPoolParamsDestroy(jemalloc_params);
 
@@ -420,12 +422,12 @@ int umf_allocator_init(const unsigned *numa_nodes, size_t node_count) {
 
     pthread_mutex_unlock(&pool_lock);
 
-    /* Register cleanup at exit */
+    // Register cleanup at exit
     atexit(umf_allocator_finalize);
     return 0;
 }
 
-/* ============================================================ */
+
 void *umf_alloc(size_t size, size_t align) {
     if (!pool || size == 0)
         return NULL;
@@ -443,7 +445,7 @@ void *umf_alloc(size_t size, size_t align) {
     return ptr;
 }
 
-/* ============================================================ */
+// Deallocate memory back to the UMF pool
 void umf_dealloc(void *ptr) {
     if (!pool || !ptr)
         return;
@@ -452,3 +454,5 @@ void umf_dealloc(void *ptr) {
     umfPoolFree(pool, ptr);
     pthread_mutex_unlock(&pool_lock);
 }
+
+*/

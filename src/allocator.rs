@@ -57,11 +57,14 @@ unsafe impl GlobalAlloc for HybridObjects {
                 });
                 */
                 INIT.call_once(|| {
-                    //let numa_node = 1;
+                    let numa_node = 1;
                     let numa_list = [0, 1];
+                    //allocator_bindings::umf_allocator_init(
+                    //    numa_list.as_ptr(),
+                    //    numa_list.len()
+                    //    );
                     allocator_bindings::umf_allocator_init(
-                        numa_list.as_ptr(),
-                        numa_list.len()
+                        numa_node
                         );
                     #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with NUMA list {:?}", numa_list);}
                 });
@@ -103,9 +106,12 @@ unsafe impl GlobalAlloc for HybridObjects {
                 INIT.call_once(|| {
                     let numa_node = 1;
                     let numa_list = [0, 1];
+                    //allocator_bindings::umf_allocator_init(
+                    //    numa_list.as_ptr(),
+                    //    numa_list.len()
+                    //    );
                     allocator_bindings::umf_allocator_init(
-                        numa_list.as_ptr(),
-                        numa_list.len()
+                        numa_node
                         );
                     #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with NUMA list {:?}", numa_list);}
                 });
