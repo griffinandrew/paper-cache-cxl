@@ -57,12 +57,13 @@ unsafe impl GlobalAlloc for HybridObjects {
                 });
                 */
                 INIT.call_once(|| {
-                    let numa_node = 1;
-                    //let numa_list = [0, 1];
+                    //let numa_node = 1;
+                    let numa_list = [0, 1];
                     allocator_bindings::umf_allocator_init(
-                        numa_node
+                        numa_list.as_ptr(),
+                        numa_list.len()
                         );
-                    #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);}
+                    #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with NUMA list {:?}", numa_list);}
                 });
 
 
@@ -101,11 +102,12 @@ unsafe impl GlobalAlloc for HybridObjects {
                 */
                 INIT.call_once(|| {
                     let numa_node = 1;
-                    //let numa_list = [0, 1];
+                    let numa_list = [0, 1];
                     allocator_bindings::umf_allocator_init(
-                        numa_node
+                        numa_list.as_ptr(),
+                        numa_list.len()
                         );
-                    #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);}
+                    #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with NUMA list {:?}", numa_list);}
                 });
             }
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
