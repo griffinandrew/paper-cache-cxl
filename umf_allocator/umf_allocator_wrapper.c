@@ -1,3 +1,6 @@
+/*
+
+
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -123,4 +126,167 @@ int check_tier(void *ptr) {
     }
     //tjhis is unreachabke thoo
     return -1; //not from any UMF pool
+}
+
+
+*/
+
+
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+
+#include <umf/providers/provider_os_memory.h>
+#include <umf/pools/pool_jemalloc.h>
+#include <umf/memory_pool.h>
+#include <umf/memory_provider.h>
+
+static umf_memory_pool_handle_t pool = NULL;
+static umf_memory_provider_handle_t provider = NULL;
+static umf_os_memory_provider_params_handle_t os_params = NULL;
+
+static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
+
+
+/* ============================================================ */
+void umf_allocator_finalize(void) {
+    pthread_mutex_lock(&pool_lock);
+
+    if (pool) {
+        umfPoolDestroy(pool);
+        pool = NULL;
+    }
+
+    if (provider) {
+        umfMemoryProviderDestroy(provider);
+        provider = NULL;
+    }
+
+    if (os_params) {
+        umfOsMemoryProviderParamsDestroy(os_params);
+        os_params = NULL;
+    }
+
+    pthread_mutex_unlock(&pool_lock);
+}
+
+
+/* ============================================================ */
+/* numa_node = NUMA node id (check with numactl -H) */
+int umf_allocator_init(int numa_node) {
+    umf_jemalloc_pool_params_handle_t jemalloc_params = NULL;
+    umf_result_t res;
+
+    pthread_mutex_lock(&pool_lock);
+
+    if (pool != NULL) {
+        pthread_mutex_unlock(&pool_lock);
+        return 0;
+    }
+
+    /* Create OS provider params */
+    res = umfOsMemoryProviderParamsCreate(&os_params);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create OS params: %d\n", res);
+        pthread_mutex_unlock(&pool_lock);
+        return 1;
+    }
+
+    /* Set NUMA node list */
+    unsigned numa_list[] = { (unsigned)numa_node };
+
+    res = umfOsMemoryProviderParamsSetNumaList(
+            os_params,
+            numa_list,
+            1);
+
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to set NUMA list: %d\n", res);
+        pthread_mutex_unlock(&pool_lock);
+        return 2;
+    }
+
+    /* Bind strictly to that NUMA node */
+    res = umfOsMemoryProviderParamsSetNumaMode(
+            os_params,
+            UMF_NUMA_MODE_BIND);
+
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to set NUMA mode: %d\n", res);
+        pthread_mutex_unlock(&pool_lock);
+        return 3;
+    }
+
+    /* Create provider */
+    res = umfMemoryProviderCreate(
+            umfOsMemoryProviderOps(),
+            os_params,
+            &provider);
+
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create OS provider: %d\n", res);
+        pthread_mutex_unlock(&pool_lock);
+        return 4;
+    }
+
+    /* Create jemalloc pool params */
+    res = umfJemallocPoolParamsCreate(&jemalloc_params);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create jemalloc params: %d\n", res);
+        pthread_mutex_unlock(&pool_lock);
+        return 5;
+    }
+
+    /* Create pool */
+    res = umfPoolCreate(
+            umfJemallocPoolOps(),
+            provider,
+            jemalloc_params,
+            0,
+            &pool);
+
+    umfJemallocPoolParamsDestroy(jemalloc_params);
+
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create pool: %d\n", res);
+        pthread_mutex_unlock(&pool_lock);
+        return 6;
+    }
+
+    pthread_mutex_unlock(&pool_lock);
+
+    atexit(umf_allocator_finalize);
+    return 0;
+}
+
+
+/* ============================================================ */
+void *umf_alloc(size_t size, size_t align) {
+    if (!pool || size == 0)
+        return NULL;
+
+    pthread_mutex_lock(&pool_lock);
+
+    void *ptr;
+    if (align && align > sizeof(void*)) {
+        ptr = umfPoolAlignedMalloc(pool, size, align);
+    } else {
+        ptr = umfPoolMalloc(pool, size);
+    }
+
+    pthread_mutex_unlock(&pool_lock);
+    return ptr;
+}
+
+
+/* ============================================================ */
+void umf_dealloc(void *ptr) {
+    if (!pool || !ptr)
+        return;
+
+    pthread_mutex_lock(&pool_lock);
+    umfPoolFree(pool, ptr);
+    pthread_mutex_unlock(&pool_lock);
 }
