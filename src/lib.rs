@@ -1790,6 +1790,10 @@ where
 
 		//let buf: BufferPMEM = buf1.into_boxed_slice();
 
+
+		#[cfg(feature = "sets_dram")]
+		self.tiering_manager.set_dram(hashed_key.clone(), &self.objects);
+
 		let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
 
 		//let key_buf: BufferPMEM = 

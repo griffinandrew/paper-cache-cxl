@@ -908,6 +908,17 @@ pub struct TieringStats {
 
     /// Number of objects only in PMEM
     pub pmem_only_objects: u64,
+
+    pub pointer_promotions: u64, // For hashtable_tiering feature
+
+
+    pub pointer_demotions: u64, // For hashtable_tiering feature
+
+    pub warm_objects: u64, // For hashtable_tiering feature
+
+    pub hot_objects: u64, // For hashtable_tiering feature
+
+    pub dram_only_objects: u64, // For sets_dram feature
 }
 
 /// Tier location for an object
@@ -923,6 +934,10 @@ pub enum Tier {
     /// Object has metadata/pointer in DRAM but data remains in PMEM (hashtable_tiering feature)
     /// This is the "Warm" tier - metadata access is fast but data is still in CXL
     DramPtrToPmem,
+
+    #[cfg(feature = "sets_dram")]
+    /// Object exists only in DRAM (sets_dram feature)
+    DramOnly,
 }
 
 /// Information about an object's tiering status
@@ -1054,6 +1069,7 @@ where
     }
 
     /// Registers a new object in PMEM
+    #[cfg(not(feature = "sets_dram"))]
     pub fn register_object(&self, key: HashedKey, size: ObjectSize) {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -1066,6 +1082,39 @@ where
 
         let mut stats = self.stats.write().unwrap();
         stats.pmem_only_objects += 1;
+    }
+
+    #[cfg(feature = "sets_dram")]
+    pub fn register_object(&self, key: HashedKey, size: ObjectSize) {
+        let mut info_map = self.object_info.write().unwrap();
+
+        info_map.insert(key, ObjectTierInfo {
+            tier: Tier::DramOnly,
+            size,
+            access_count: 0,
+            last_access: std::time::Instant::now(),
+        });
+
+        let mut stats = self.stats.write().unwrap();
+        stats.dram_only_objects += 1;
+    }
+
+    ///menat to provide a fast path for sets...
+    /// This is used in the hashtable_tiering feature where we want to quickly set an object as DRAM 
+    /// instead of paying the full cost of allocating and puttiing on the pmem level 
+    /// so set just sets on dram and in bg will be set to pmem here to help set perf. 
+    pub fn set_dram(&self, key: HashedKey, ObjectRefMap: &DashMap<HashedKey, Object<K, V>, NoHasher>) {
+        let mut info_map = self.object_info.write().unwrap();
+
+        if let Some(info) = info_map.get_mut(&key) {
+            info.tier = Tier::DramAndPmem;
+            //println!("Setting object {:?} to DRAM tier", key);
+
+            let mut dram_objects = self.dram_objects.write().unwrap();
+            //no add it to dram cache..... 
+
+            dram_objects.insert(key);
+        }
     }
 
     /// Records an access to an object
@@ -1096,6 +1145,11 @@ where
                 }
                 Tier::DramAndPmem => {
                     // Already in DRAM
+                    false
+                }
+                #[cfg(feature = "sets_dram")]
+                Tier::DramOnly => {
+                    // Already in DRAM-only tier
                     false
                 }
             }
@@ -1136,6 +1190,11 @@ where
                 }
                 Tier::DramAndPmem => {
                     // Already in hot tier
+                    false
+                }
+                #[cfg(feature = "sets_dram")]
+                Tier::DramOnly => {
+                    // Already in DRAM-only tier
                     false
                 }
             }
@@ -1344,6 +1403,11 @@ where
                 Tier::DramAndPmem => {
                     // Already in hot tier
                 }
+                #[cfg(feature = "sets_dram")]
+                Tier::DramOnly => {
+                    // Already in DRAM-only tier
+                }
+
             }
         }
 
@@ -1560,6 +1624,23 @@ where
                 }
                 Tier::PmemOnly => {
                     // Already in PMEM only
+                }
+                #[cfg(feature = "sets_dram")]
+                Tier::DramOnly => {
+                    // Already in DRAM-only tier, demote to PMEM only
+                    info.tier = Tier::PmemOnly;
+                    self.dram_cache.remove(&key);
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
+                    let mut stats = self.stats.write().unwrap();
+                    stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
+                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                    stats.pmem_only_objects += 1;
+                    stats.demotions += 1;
+
+                    return true;
+
+                    //THIS MUST ACTUALLY ENSUrE THAT THE DATA IS WRITEN TO PMEM IF WE ARE IN SETS DRAM MODE, OTHERWISE WE RISK DATA LOSS.
                 }
             }
         }
@@ -1789,6 +1870,19 @@ where
                 }
                 Tier::PmemOnly => {
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
+                }
+                
+                Tier::DramOnly => {
+                    // Remove from DRAM cache (DRAM-only tier)
+                    self.dram_cache.remove(&key);
+                    
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
+
+                    stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
+                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
+
+                    //I MUST ASERT THAT IT IS COPIED BACK TO PMEM LEVEL BEFORE REMOVING FROM DRAM-ONLY TIER, OTHERWISE DATA LOSS OCCURS.
                 }
             }
         }

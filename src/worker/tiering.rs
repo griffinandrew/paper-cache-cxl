@@ -57,7 +57,11 @@ pub struct TieringWorker<K, V> {
     tiering_manager: Arc<TieringManager<K, V>>,
 }
 
-#[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem")))]
+#[cfg(all(
+    feature = "key_value_pmem", 
+    not(feature = "global_hashtable_pmem"),
+    not(feature = "sets_dram") // <-- Add this exclusion
+))]
 impl<K, V> TieringWorker<K, V>
 where
     K: 'static + Eq + TypeSize + Clone,
@@ -239,6 +243,105 @@ where
         }
     }
 }
+
+
+
+
+
+
+
+
+#[cfg(all(feature = "key_value_pmem", feature = "sets_dram", not(feature = "global_hashtable_pmem")))]
+impl<K, V> TieringWorker<K, V>
+where
+    K: 'static + Eq + TypeSize + Clone,
+    V: 'static + TypeSize + Clone + AsRef<[u8]>,
+{
+    pub fn new(
+        listener: Receiver<WorkerEvent>,
+        objects: ObjectMapRef<K, V>,
+        status: StatusRef,
+        overhead_manager: OverheadManagerRef,
+        tiering_manager: Arc<TieringManager<K, V>>,
+    ) -> Self {
+        TieringWorker {
+            listener,
+            objects,
+            status,
+            overhead_manager,
+            tiering_manager,
+        }
+    }
+    
+    /// Process events from the worker manager
+    fn process_event(&self, event: WorkerEvent) {
+        match event {
+            WorkerEvent::Get(hashed_key, hit) => {
+                if hit {
+                    // Record access and check if we should promote
+                    if self.tiering_manager.record_access(hashed_key) {
+                        // Object should be promoted to DRAM - copy the Object
+                        if let Some(object_ref) = self.objects.get(&hashed_key) {
+                            if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
+                                debug!("Promoted object {} to DRAM", hashed_key);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            WorkerEvent::Set(hashed_key, base_size, _expiry, old_object_info) => {
+                if old_object_info.is_none() {
+                    // New object - register it in PMEM tier
+                    //self.tiering_manager.register_object(hashed_key, base_size);
+                    //self.tiering_manager.set_tiering_for_new_object(&hashed_key);
+                } else {
+                    // Object updated - update DRAM copy if it exists
+                    if let Some(object_ref) = self.objects.get(&hashed_key) {
+                        self.tiering_manager.update_dram_copy(hashed_key, &*object_ref);
+                    }
+                }
+            }
+            
+            WorkerEvent::Del(hashed_key, _expiry) => {
+                // Remove object from tiering tracking (this also removes from DRAM cache)
+                self.tiering_manager.remove_object(hashed_key);
+            }
+            
+            WorkerEvent::Wipe => {
+                // Clear all tiering information (including DRAM cache)
+                self.tiering_manager.clear();
+            }
+            
+            WorkerEvent::Resize(_max_size) => {
+                // Potentially update DRAM threshold based on new cache size
+                // For now, keep the existing threshold
+            }
+            
+            _ => {
+                // Other events (Ttl, Policy) don't directly affect tiering
+            }
+        }
+    }
+    
+    /// Perform periodic tiering decisions (demotion checks)
+    fn periodic_tiering(&self) {
+        // Check if we need to demote any objects from DRAM
+        let keys_to_demote = self.tiering_manager.get_keys_to_demote();
+        
+        if !keys_to_demote.is_empty() {
+            info!("Demoting {} objects from DRAM to PMEM", keys_to_demote.len());
+            
+            for key in keys_to_demote {
+                if self.tiering_manager.demote_from_dram(key) {
+                    debug!("Demoted object {} from DRAM", key);
+                }
+            }
+        }
+    }
+}
+
+
 
 
 

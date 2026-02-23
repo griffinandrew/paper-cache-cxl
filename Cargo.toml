@@ -72,6 +72,8 @@ eviction_stacks_pmem = []
 #to emnable 3 tier based data movement
 hashtable_tiering = [] 
 
+sets_dram = []
+
 # Legacy features (deprecated, will be removed)
 default = []
 original = []
