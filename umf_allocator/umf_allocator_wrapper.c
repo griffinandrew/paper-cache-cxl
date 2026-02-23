@@ -212,7 +212,7 @@ int umf_allocator_init(int numa_node) {
     res = umfOsMemoryProviderParamsSetNumaMode(
             os_params,
             //UMF_NUMA_MODE_BIND);  // UMF_NUMA_MODE_DEFAULT this is what you want for numa auto tiering... 
-            UMF_NUMA_MODE_DEFAULT); // this allows the OS to manage the NUMA allocation, which should enable auto-tiering if configured properly in the OS
+            UMF_NUMA_MODE_BIND); // this allows the OS to manage the NUMA allocation, which should enable auto-tiering if configured properly in the OS
 
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to set NUMA mode: %d\n", res);
