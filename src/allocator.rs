@@ -88,6 +88,7 @@ unsafe impl GlobalAlloc for HybridObjects {
             ptr
         } else {
             unsafe {
+                /* 
                 INIT.call_once(|| {
                     let dax_size = 118377938944; // PMEM size from ndctl list --namespaces
                     let dax_path = b"/dev/dax0.0\0".as_ptr() as *const i8; // PMEM path from ndctl list --namespaces
@@ -95,6 +96,14 @@ unsafe impl GlobalAlloc for HybridObjects {
                         dax_path,
                         dax_size,
                         );
+                });
+                */
+                INIT.call_once(|| {
+                    let numa_node = 1;
+                    allocator_bindings::umf_allocator_init(
+                        numa_node
+                        );
+                    #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);}
                 });
             }
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
