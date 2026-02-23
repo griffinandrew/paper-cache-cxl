@@ -58,9 +58,9 @@ unsafe impl GlobalAlloc for HybridObjects {
                 */
                 INIT.call_once(|| {
                     let numa_node = 1;
-                    let numa_list = [0, 1];
+                    //let numa_list = [0, 1];
                     allocator_bindings::umf_allocator_init(
-                        numa_list
+                        numa_node
                         );
                     #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);}
                 });
@@ -101,9 +101,9 @@ unsafe impl GlobalAlloc for HybridObjects {
                 */
                 INIT.call_once(|| {
                     let numa_node = 1;
-                    let numa_list = [0, 1];
+                    //let numa_list = [0, 1];
                     allocator_bindings::umf_allocator_init(
-                        numa_list
+                        numa_node
                         );
                     #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);}
                 });
