@@ -1653,7 +1653,7 @@ where
 	/// ```
 	/// 
 	
-
+/*
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
 	{
 		let hashed_key = self.hash_key(key);
@@ -1669,6 +1669,59 @@ where
 				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
 				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
 				return Ok(arc_val.as_ref().to_vec());
+			}
+		}
+
+		let result = match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				self.status.incr_hits();
+				// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
+				let arc_val = object.data();
+				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
+				Ok(arc_val.as_ref().to_vec())
+			},
+
+			_ => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
+
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+
+		// Optional: inspect the underlying bytes/tier of the returned value for debugging
+		//println!("CACHE: get result for key {:?}: {:?} ", key, result);
+		result
+	}
+
+	*/
+
+
+	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
+	{
+		let hashed_key = self.hash_key(key);
+
+		// Check DRAM tier first
+		#[cfg(all(feature = "enable_tiering_manager", not(feature = "hashtable_tiering")))]
+		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
+			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
+				self.status.incr_hits();
+				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+				let arc_val = dram_object_ref.data();
+				//println!("CACHE: get for key {:?} from DRAM tier", key);
+				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
+				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
+				return Ok(arc_val.as_ref().to_vec());
+			}
+		}
+
+		#[cfg(all(feature = "enable_tiering_manager", feature = "hashtable_tiering"))]
+		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
+			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
+				self.status.incr_hits();
+				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+				// Use data_as_bytes method to handle both PhysicalCopy and CxlReference
+				return Ok(dram_object_ref.data_as_bytes());
 			}
 		}
 
