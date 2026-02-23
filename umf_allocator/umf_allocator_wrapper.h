@@ -24,7 +24,7 @@ int check_tier(void *ptr);
 */
 
 
-int umf_allocator_init(int numa_node) 
+int umf_allocator_init(int numa_node);
 void *umf_alloc(size_t size, size_t align);
 void umf_dealloc(void *ptr);
 void umf_allocator_finalize(void);

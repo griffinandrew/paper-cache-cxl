@@ -61,8 +61,7 @@ unsafe impl GlobalAlloc for HybridObjects {
                     allocator_bindings::umf_allocator_init(
                         numa_node
                         );
-                    #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with NUMA node {}", numa_node);}
-
+                    #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with DAX path /dev/dax0.0 and size {}", dax_size);}
                 });
 
 
