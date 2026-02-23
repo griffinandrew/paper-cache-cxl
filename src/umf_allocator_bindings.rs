@@ -28,4 +28,9 @@ unsafe extern "C" {
     pub fn umf_dealloc(ptr: *mut libc::c_void);
     pub fn umf_allocator_finalize();
 
+    // Optional DevDAX/PMEM functions if you still have them
+    pub fn return_pmem_base(dax_size: usize) -> *mut libc::c_void;
+    pub fn return_pmem_size() -> usize;
+    pub fn check_tier(ptr: *mut libc::c_void) -> libc::c_int;
+
 }
