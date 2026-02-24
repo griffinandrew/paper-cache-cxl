@@ -56,7 +56,7 @@ mod object;
 mod policy;
 mod status;
 
-#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
+#[cfg(any(all(feature = "key_value_pmem", feature = "enable_tiering_manager"), all(feature = "key_value_pmem", feature = "sets_dram")))]
 pub mod tiering;
 
 // FlatMap module - high-performance Linear Probing Hash Map for PMEM/DRAM
@@ -133,7 +133,7 @@ pub use crate::{
 	policy::PaperPolicy,
 };
 
-#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
+#[cfg(any(all(feature = "key_value_pmem", feature = "enable_tiering_manager"), all(feature = "key_value_pmem", feature = "sets_dram")))]
 pub use crate::tiering::{TieringManager, TieringConfig, TieringStats};
 
 pub type CacheSize = u64;
@@ -180,7 +180,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 	worker_manager: Arc<WorkerSender>,
 	overhead_manager: OverheadManagerRef,
 	
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
+	#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
 	tiering_manager: Arc<TieringManager<K, V>>,
 
 	hasher: S,
@@ -368,7 +368,7 @@ where
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
 			
-			#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
+			#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
 			tiering_manager,
 
 			hasher,
@@ -959,6 +959,13 @@ where
 			Arc::new(TieringManager::new(tiering_config))
 		};
 
+		#[cfg(all(feature = "key_value_pmem", feature = "sets_dram", not(feature = "enable_tiering_manager")))]
+		let tiering_manager = {
+			let tiering_config = tiering::TieringConfig::default();
+			let persist_cb = move |_: crate::tiering::manager::PmemBackfillJob<K>| {};
+			Arc::new(TieringManager::new_with_backfill(tiering_config, persist_cb))
+		};
+
 		let (worker_sender, worker_listener) = unbounded();
 
 		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
@@ -987,7 +994,7 @@ where
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
 			
-			#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
+			#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
 			tiering_manager,
 
 			hasher,
@@ -1435,7 +1442,7 @@ where
 #[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_pmem")))]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
-    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone, //note added Debug for logging might impact perf thoooo
+    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send, //note added Debug for logging might impact perf thoooo
     S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` with maximum size `max_size` and
@@ -1545,25 +1552,21 @@ where
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		#[cfg(feature = "enable_tiering_manager", not(feature = "sets_dram"))]
+		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", not(feature = "sets_dram")))]
 		let tiering_manager = {
 			// Create tiering manager with default DRAM threshold at 20% of max_size
-			let mut tiering_config = tiering::TieringConfig::default();
-			//tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			let tiering_config = tiering::TieringConfig::default();
 			Arc::new(TieringManager::new(tiering_config))
 		};
 
-
-		#[cfg(all(feature = "enable_tiering_manager", feature = "sets_dram"))]
+		#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
 		let tiering_manager = {
-			// Create tiering manager with default DRAM threshold at 20% of max_size
-			let mut tiering_config = tiering::TieringConfig::default();
-			//tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
-
-			    let persist_cb = Arc::new(move |job: crate::tiering::manager::PmemBackfillJob<K>| {
-        		// Example:
-        		// let _ = pmem_write_only(&objects, &status, &overhead_manager, job.key, &job.value, job.ttl);
-    		});
+			// Create tiering manager with backfill support for sets_dram mode
+			let tiering_config = tiering::TieringConfig::default();
+			let persist_cb = move |_job: crate::tiering::manager::PmemBackfillJob<K>| {
+				// PMEM-only write would go here; currently a no-op placeholder
+				// to avoid recursion into the foreground set() path.
+			};
 			Arc::new(TieringManager::new_with_backfill(tiering_config, persist_cb))
 		};
 
@@ -1576,6 +1579,14 @@ where
 			&status,
 			&overhead_manager,
 			&tiering_manager,
+		)?;
+
+		#[cfg(feature = "sets_dram")]
+		let mut worker_manager = WorkerManager::new(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
 		)?;
 
 		#[cfg(all(not(feature = "enable_tiering_manager"), not(feature = "sets_dram")))]
@@ -1595,7 +1606,7 @@ where
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
 			
-			#[cfg(feature = "enable_tiering_manager")]
+			#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
 			tiering_manager,
 
 			hasher,
@@ -1806,7 +1817,10 @@ where
 
 
 		#[cfg(feature = "sets_dram")]
-		self.tiering_manager.set_dram(hashed_key, value, ttl, &self.objects, self)?;
+		{
+			self.tiering_manager.set_dram(hashed_key, key.clone(), value, ttl);
+			return Ok(());
+		}
 
 
 

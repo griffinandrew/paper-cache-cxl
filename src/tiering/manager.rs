@@ -1049,50 +1049,92 @@ where
     /// Creates a new TieringManager with the given configuration
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
     pub fn new(config: TieringConfig) -> Self {
+        #[cfg(feature = "sets_dram")]
+        let (dummy_tx, dummy_rx) = mpsc::channel::<PmemBackfillJob<K>>();
+        #[cfg(feature = "sets_dram")]
+        drop(dummy_rx);
+        #[cfg(feature = "sets_dram")]
+        let dummy_handle = thread::spawn(|| {});
+
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
+            #[cfg(feature = "sets_dram")]
+            pmem_tx: dummy_tx,
+            #[cfg(feature = "sets_dram")]
+            _pmem_consumer: dummy_handle,
             _phantom: std::marker::PhantomData,
         }
     }
 
     #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
     pub fn new(config: TieringConfig) -> Self {
+        #[cfg(feature = "sets_dram")]
+        let (dummy_tx, dummy_rx) = mpsc::channel::<PmemBackfillJob<K>>();
+        #[cfg(feature = "sets_dram")]
+        drop(dummy_rx);
+        #[cfg(feature = "sets_dram")]
+        let dummy_handle = thread::spawn(|| {});
+
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
-            //pmem_tx: mpsc::channel().0, // Dummy sender, not used in this constructor
-            //_pmem_consumer: thread::spawn(|| {}), // Dummy consumer, not used in this constructor
+            #[cfg(feature = "sets_dram")]
+            pmem_tx: dummy_tx,
+            #[cfg(feature = "sets_dram")]
+            _pmem_consumer: dummy_handle,
             _phantom: std::marker::PhantomData,
         }
     }
 
     #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem")))]
     pub fn new(config: TieringConfig) -> Self {
+        #[cfg(feature = "sets_dram")]
+        let (dummy_tx, dummy_rx) = mpsc::channel::<PmemBackfillJob<K>>();
+        #[cfg(feature = "sets_dram")]
+        drop(dummy_rx);
+        #[cfg(feature = "sets_dram")]
+        let dummy_handle = thread::spawn(|| {});
+
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher(NoHasher::default()))),
+            #[cfg(feature = "sets_dram")]
+            pmem_tx: dummy_tx,
+            #[cfg(feature = "sets_dram")]
+            _pmem_consumer: dummy_handle,
             _phantom: std::marker::PhantomData,
         }
     }
 
     #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem"))]
     pub fn new(config: TieringConfig) -> Self {
+        #[cfg(feature = "sets_dram")]
+        let (dummy_tx, dummy_rx) = mpsc::channel::<PmemBackfillJob<K>>();
+        #[cfg(feature = "sets_dram")]
+        drop(dummy_rx);
+        #[cfg(feature = "sets_dram")]
+        let dummy_handle = thread::spawn(|| {});
+
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
+            #[cfg(feature = "sets_dram")]
+            pmem_tx: dummy_tx,
+            #[cfg(feature = "sets_dram")]
+            _pmem_consumer: dummy_handle,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -1143,8 +1185,8 @@ where
     // ...existing code...
 
     #[cfg(feature = "sets_dram")]
-    fn spawn_pmem_consumer<HK, F>(
-        rx: Receiver<PmemBackfillJob<HK>>,
+    fn spawn_pmem_consumer<F>(
+        rx: Receiver<PmemBackfillJob<K>>,
         persist_fn: F,
     ) -> JoinHandle<()>
     where
@@ -1162,10 +1204,11 @@ where
     #[cfg(all(feature = "sets_dram", feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
     pub fn new_with_backfill<F>(config: TieringConfig, persist_fn: F) -> Self
     where
+        K: Send + 'static,
         F: Fn(PmemBackfillJob<K>) + Send + 'static,
     {
         let (tx, rx) = mpsc::channel();
-        let handle = spawn_pmem_consumer(rx, persist_fn);
+        let handle = Self::spawn_pmem_consumer(rx, persist_fn);
 
         TieringManager {
             config: Arc::new(RwLock::new(config)),
@@ -1173,6 +1216,27 @@ where
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
+            pmem_tx: tx,
+            _pmem_consumer: handle,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    #[cfg(all(feature = "sets_dram", feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
+    pub fn new_with_backfill<F>(config: TieringConfig, persist_fn: F) -> Self
+    where
+        K: Send + 'static,
+        F: Fn(PmemBackfillJob<K>) + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        let handle = Self::spawn_pmem_consumer(rx, persist_fn);
+
+        TieringManager {
+            config: Arc::new(RwLock::new(config)),
+            stats: Arc::new(RwLock::new(TieringStats::default())),
+            object_info: Arc::new(RwLock::new(HashMap::new())),
+            dram_objects: Arc::new(RwLock::new(HashSet::new())),
+            dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
             pmem_tx: tx,
             _pmem_consumer: handle,
             _phantom: std::marker::PhantomData,
@@ -1966,6 +2030,15 @@ where
                 Tier::PmemOnly => {
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
                 }
+                #[cfg(feature = "sets_dram")]
+                Tier::DramOnly => {
+                    // Object is DRAM-only pending PMEM backfill. Remove from DRAM tracking.
+                    // Note: if PMEM write has not yet completed, data loss may occur.
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
+                    stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
+                    stats.dram_only_objects = stats.dram_only_objects.saturating_sub(1);
+                }
             }
         }
     }
@@ -2040,6 +2113,14 @@ where
                 }
                 Tier::PmemOnly => {
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
+                }
+                #[cfg(feature = "sets_dram")]
+                Tier::DramOnly => {
+                    // PMEM persistence must be confirmed before dropping a DramOnly object.
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
+                    stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
+                    stats.dram_only_objects = stats.dram_only_objects.saturating_sub(1);
                 }
             }
         }
