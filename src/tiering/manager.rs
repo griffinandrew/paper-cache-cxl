@@ -1268,6 +1268,21 @@ where
         let _ = self.pmem_tx.send(job);
     }
 
+    /// Called by the background PMEM writer after successfully persisting an object.
+    /// Transitions the object's tier from `DramOnly` to `DramAndPmem`.
+    #[cfg(feature = "sets_dram")]
+    pub fn mark_persisted(&self, key: HashedKey) {
+        let mut info_map = self.object_info.write().unwrap();
+        if let Some(info) = info_map.get_mut(&key) {
+            if info.tier == Tier::DramOnly {
+                info.tier = Tier::DramAndPmem;
+                let mut stats = self.stats.write().unwrap();
+                stats.dram_only_objects = stats.dram_only_objects.saturating_sub(1);
+                stats.dram_objects = stats.dram_objects.saturating_add(1);
+            }
+        }
+    }
+
 
     /*
     pub fn set_pmem_only(&self, key: HashedKey,  value: &[u8], ttl: Option<std::time::Duration>) {

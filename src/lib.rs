@@ -1442,7 +1442,7 @@ where
 #[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_pmem")))]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
-    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send, //note added Debug for logging might impact perf thoooo
+    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
     S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` with maximum size `max_size` and
@@ -1561,13 +1561,60 @@ where
 
 		#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
 		let tiering_manager = {
-			// Create tiering manager with backfill support for sets_dram mode
 			let tiering_config = tiering::TieringConfig::default();
-			let persist_cb = move |_job: crate::tiering::manager::PmemBackfillJob<K>| {
-				// PMEM-only write would go here; currently a no-op placeholder
-				// to avoid recursion into the foreground set() path.
-			};
-			Arc::new(TieringManager::new_with_backfill(tiering_config, persist_cb))
+
+			let objects_bg = objects.clone();
+			let status_bg = status.clone();
+			let overhead_bg = overhead_manager.clone();
+
+			// Arc::new_cyclic lets the persist closure capture a Weak<TieringManager>
+			// so it can call mark_persisted() after the background PMEM write succeeds.
+			// The Weak is safe to upgrade once jobs are dequeued, which is always after
+			// the Arc is fully initialised and returned from with_hasher.
+			Arc::new_cyclic(|weak_tm: &std::sync::Weak<TieringManager<K, BufferPMEM>>| {
+				let weak_tm = weak_tm.clone();
+
+				let persist_cb = move |job: crate::tiering::manager::PmemBackfillJob<K>| {
+					// Allocate value bytes in PMEM via the Hybrid allocator.
+					let mut pmem_vec = Vec::<u8, Hybrid>::with_capacity_in(job.value.len(), Hybrid);
+					pmem_vec.extend_from_slice(&job.value);
+					let val_buf: BufferPMEM = pmem_vec.into_boxed_slice();
+
+					let object = crate::object::Object::new(job.key, val_buf, job.ttl);
+
+					let base_size = overhead_bg.base_size(&object);
+					if base_size == 0 || status_bg.exceeds_max_size(base_size) {
+						// PMEM write cannot proceed; remove the stuck DramOnly entry.
+						if let Some(tm) = weak_tm.upgrade() {
+							tm.remove_object(job.hashed_key);
+						}
+						return;
+					}
+
+					// Insert the PMEM-allocated object into the main cache map.
+					// If a previous PMEM insert already exists for this key, replace it
+					// without changing the object count (count only grows for new keys).
+					let old_size = objects_bg
+						.insert(job.hashed_key, object)
+						.map(|old| overhead_bg.base_size(&old));
+
+					let delta = match old_size {
+						Some(old) => base_size as i64 - old as i64,
+						None => {
+							status_bg.incr_num_objects();
+							base_size as i64
+						}
+					};
+					status_bg.update_base_used_size(delta);
+
+					// Transition tier from DramOnly -> DramAndPmem.
+					if let Some(tm) = weak_tm.upgrade() {
+						tm.mark_persisted(job.hashed_key);
+					}
+				};
+
+				TieringManager::new_with_backfill(tiering_config, persist_cb)
+			})
 		};
 
 		let (worker_sender, worker_listener) = unbounded();
