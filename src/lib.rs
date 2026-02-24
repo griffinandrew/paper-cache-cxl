@@ -1545,7 +1545,7 @@ where
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		#[cfg(feature = "enable_tiering_manager")]
+		#[cfg(feature = "enable_tiering_manager", not(feature = "sets_dram"))]
 		let tiering_manager = {
 			// Create tiering manager with default DRAM threshold at 20% of max_size
 			let mut tiering_config = tiering::TieringConfig::default();
@@ -1553,9 +1553,23 @@ where
 			Arc::new(TieringManager::new(tiering_config))
 		};
 
+
+		#[cfg(all(feature = "enable_tiering_manager", feature = "sets_dram"))]
+		let tiering_manager = {
+			// Create tiering manager with default DRAM threshold at 20% of max_size
+			let mut tiering_config = tiering::TieringConfig::default();
+			//tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+
+			    let persist_cb = Arc::new(move |job: crate::tiering::manager::PmemBackfillJob<K>| {
+        		// Example:
+        		// let _ = pmem_write_only(&objects, &status, &overhead_manager, job.key, &job.value, job.ttl);
+    		});
+			Arc::new(TieringManager::new_with_backfill(tiering_config, persist_cb))
+		};
+
 		let (worker_sender, worker_listener) = unbounded();
 
-		#[cfg(feature = "enable_tiering_manager")]
+		#[cfg(all(feature = "enable_tiering_manager", not(feature = "sets_dram")))]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
@@ -1564,7 +1578,7 @@ where
 			&tiering_manager,
 		)?;
 
-		#[cfg(not(feature = "enable_tiering_manager"))]
+		#[cfg(all(not(feature = "enable_tiering_manager"), not(feature = "sets_dram")))]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
@@ -1792,8 +1806,11 @@ where
 
 
 		#[cfg(feature = "sets_dram")]
-		self.tiering_manager.set_dram(hashed_key.clone(), &self.objects);
+		self.tiering_manager.set_dram(hashed_key, value, ttl, &self.objects, self)?;
 
+
+
+		/*
 		let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
 
 		//let key_buf: BufferPMEM = 
@@ -1810,6 +1827,7 @@ where
 
 
 		//let object = Object::new(key, value, ttl);
+		
 		let base_size = self.overhead_manager.base_size(&object);
 		let expiry = object.expiry();
 
@@ -1841,7 +1859,9 @@ where
 		};
 
 		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+		*/
+
+		//self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
 
 		Ok(())
 	}

@@ -828,7 +828,19 @@ use super::object::TieringObject;
 use nohash_hasher::NoHashHasher;
 use std::hash::BuildHasherDefault;
 
+
 pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
+
+
+pub use crate::{
+	error::CacheError,
+	policy::PaperPolicy,
+}; 
+
+use crate::PaperCache;
+
+#[cfg(feature = "key_value_pmem")]
+pub type BufferPMEM = Box<[u8], Hybrid>;
 
 #[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem"))]
 use crate::allocator::HybridObjects as Hybrid;
@@ -839,6 +851,20 @@ mod allocator_bindings {
 
 #[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 use hashbrown::HashMap as hashtable;
+
+
+
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::thread::{self, JoinHandle};
+
+#[cfg(feature = "sets_dram")]
+#[derive(Debug)]
+pub struct PmemBackfillJob<K> {
+    pub key: K,
+    pub hashed_key: HashedKey,
+    pub value: Box<[u8]>,
+    pub ttl: Option<u32>,
+}
 
 
 /// Configuration for the tiering manager
@@ -1006,6 +1032,12 @@ pub struct TieringManager<K, V> {
     #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem", feature = "hashtable_tiering"))]
     dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
     
+
+    #[cfg(feature = "sets_dram")]
+    pmem_tx: Sender<PmemBackfillJob<K>>,
+    #[cfg(feature = "sets_dram")]
+    _pmem_consumer: JoinHandle<()>,
+
     _phantom: std::marker::PhantomData<(K, V)>,
 }
 
@@ -1035,6 +1067,8 @@ where
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
+            //pmem_tx: mpsc::channel().0, // Dummy sender, not used in this constructor
+            //_pmem_consumer: thread::spawn(|| {}), // Dummy consumer, not used in this constructor
             _phantom: std::marker::PhantomData,
         }
     }
@@ -1099,23 +1133,118 @@ where
         stats.dram_only_objects += 1;
     }
 
-    ///menat to provide a fast path for sets...
-    /// This is used in the hashtable_tiering feature where we want to quickly set an object as DRAM 
-    /// instead of paying the full cost of allocating and puttiing on the pmem level 
-    /// so set just sets on dram and in bg will be set to pmem here to help set perf. 
-    pub fn set_dram(&self, key: HashedKey, ObjectRefMap: &DashMap<HashedKey, Object<K, V>, NoHasher>) {
-        let mut info_map = self.object_info.write().unwrap();
+    //let paper_cache_for_bg = paper_cache.clone(); // Arc<PaperCache<...>>
+    
+    //let tiering = TieringManager::new_with_backfill(config, move |job| {
+        // IMPORTANT: call a PMEM-only path to avoid recursion into set_dram
+        // Example:
+        // let _ = paper_cache_for_bg.set_pmem_only(job.key, &job.value, job.ttl);
+    //});
+    // ...existing code...
 
-        if let Some(info) = info_map.get_mut(&key) {
-            info.tier = Tier::DramAndPmem;
-            //println!("Setting object {:?} to DRAM tier", key);
+    #[cfg(feature = "sets_dram")]
+    fn spawn_pmem_consumer<HK, F>(
+        rx: Receiver<PmemBackfillJob<HK>>,
+        persist_fn: F,
+    ) -> JoinHandle<()>
+    where
+        K: Send + 'static,
+        F: Fn(PmemBackfillJob<K>) + Send + 'static,
+    {
+        thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                persist_fn(job);
+            }
+        })
+    }
+    
+    
+    #[cfg(all(feature = "sets_dram", feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    pub fn new_with_backfill<F>(config: TieringConfig, persist_fn: F) -> Self
+    where
+        F: Fn(PmemBackfillJob<K>) + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn_pmem_consumer(rx, persist_fn);
 
-            let mut dram_objects = self.dram_objects.write().unwrap();
-            //no add it to dram cache..... 
-
-            dram_objects.insert(key);
+        TieringManager {
+            config: Arc::new(RwLock::new(config)),
+            stats: Arc::new(RwLock::new(TieringStats::default())),
+            object_info: Arc::new(RwLock::new(HashMap::new())),
+            dram_objects: Arc::new(RwLock::new(HashSet::new())),
+            dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
+            pmem_tx: tx,
+            _pmem_consumer: handle,
+            _phantom: std::marker::PhantomData,
         }
     }
+
+    #[cfg(feature = "sets_dram")]
+    pub fn set_dram(&self, hashed_key: HashedKey, key: K, value: &[u8], ttl: Option<u32>) {
+        // fast metadata path
+        {
+            let mut info_map = self.object_info.write().unwrap();
+            let size = value.len() as ObjectSize;
+            info_map.insert(hashed_key, ObjectTierInfo {
+                tier: Tier::DramOnly,
+                size,
+                access_count: 0,
+                last_access: std::time::Instant::now(),
+            });
+        }
+        self.dram_objects.write().unwrap().insert(hashed_key);
+
+        // async pmem backfill
+        let job = PmemBackfillJob {
+            key,
+            hashed_key,
+            value: value.to_vec().into_boxed_slice(),
+            ttl,
+        };
+        let _ = self.pmem_tx.send(job);
+    }
+
+
+    /*
+    pub fn set_pmem_only(&self, key: HashedKey,  value: &[u8], ttl: Option<std::time::Duration>) {
+        let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
+        let object = Object::new(key, val_buf, ttl);
+
+
+        let base_size = self.overhead_manager.base_size(&object);
+		let expiry = object.expiry();
+
+		if base_size == 0 {
+			return Err(CacheError::ZeroValueSize);
+		}
+
+		if self.status.exceeds_max_size(base_size) {
+			return Err(CacheError::ExceedingValueSize);
+		}
+
+		self.status.incr_sets();
+
+		let old_object_info = self.objects
+			.insert(hashed_key, object)
+			.map(|old_object| {
+				let base_size = self.overhead_manager.base_size(&old_object);
+				let expiry = old_object.expiry();
+
+				(base_size, expiry)
+			});
+
+		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+			base_size as i64 - old_object_size as i64
+		} else {
+			// the object is new, so increase the number of objects count
+			self.status.incr_num_objects();
+			base_size as i64
+		};
+
+		self.status.update_base_used_size(base_size_delta);
+    }
+
+    */
 
     /// Records an access to an object
     /// Returns true if the object should be promoted to DRAM
