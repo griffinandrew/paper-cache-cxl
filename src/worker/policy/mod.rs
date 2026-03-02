@@ -49,6 +49,9 @@ use crate::{
 	},
 };
 
+#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
+use crate::tiering::TieringManager;
+
 // the polling value must be a power of 2
 const RECONSTRUCT_POLICY_POLLING: usize = 1_048_576;
 
@@ -75,6 +78,11 @@ pub struct PolicyWorker<K, V> {
 
 	last_auto_policy_time: Option<Instant>,
 	last_set_time: Option<Instant>,
+
+	/// TieringManager reference used in `sets_dram` mode to intercept
+	/// evictions of keys that haven't been persisted to PMEM yet.
+	#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
+	tiering_manager: Option<Arc<TieringManager<K, V>>>,
 }
 
 impl<K, V> Worker for PolicyWorker<K, V>
@@ -202,6 +210,73 @@ where
 
 			last_auto_policy_time: None,
 			last_set_time: None,
+
+			#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
+			tiering_manager: None,
+		};
+
+		Ok(worker)
+	}
+
+	/// Constructs a `PolicyWorker` that holds a reference to the
+	/// `TieringManager`.  Used in `sets_dram` mode so that the eviction loop
+	/// can force-persist a `DramOnly` key before removing it from the cache.
+	#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
+	pub fn new_with_tiering(
+		listener: WorkerReceiver,
+		objects: ObjectMapRef<K, V>,
+		status: StatusRef,
+		overhead_manager: OverheadManagerRef,
+		tiering_manager: Arc<TieringManager<K, V>>,
+	) -> Result<Self, CacheError>
+	where
+		K: Clone,
+		V: Clone,
+	{
+		let max_cache_size = status.max_size();
+
+		let mini_stacks = MiniStackManager::new(
+			status.policies(),
+			max_cache_size,
+		);
+
+		let policy = status.policy();
+		let policy_stack = init_policy_stack(policy, max_cache_size);
+
+		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
+		let (trace_worker, trace_listener) = unbounded();
+
+		register_worker(TraceWorker::new(
+			trace_listener,
+			trace_fragments.clone(),
+		));
+
+		if let Err(err) = trace_worker.send(StackEvent::Resize(status.max_size())) {
+			error!("Could not send initial cache size to trace worker: {err:?}");
+			return Err(CacheError::Internal);
+		}
+
+		let worker = PolicyWorker {
+			listener,
+
+			objects,
+			status,
+			overhead_manager,
+
+			policy_stack: Some(policy_stack),
+
+			trace_fragments,
+			trace_worker,
+
+			mini_stack_manager: mini_stacks,
+			mini_index: None,
+
+			current_policy: Arc::new(RwLock::new(policy)),
+
+			last_auto_policy_time: None,
+			last_set_time: None,
+
+			tiering_manager: Some(tiering_manager),
 		};
 
 		Ok(worker)
@@ -367,6 +442,22 @@ where
 			let maybe_key = policy_stack
 				.evict_one()
 				.map(|key| EraseKey::Hashed(key));
+
+			// Priority demotion: if the selected key is still in DramOnly state
+			// (pending PMEM backfill), force-persist it synchronously before
+			// removing it from the cache so that no data is lost.
+			#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
+			if let Some(hashed_key) = maybe_key.as_ref().and_then(|k| {
+				if let EraseKey::Hashed(k) = k { Some(*k) } else { None }
+			}) {
+				if let Some(ref tm) = self.tiering_manager {
+					if tm.is_dram_only(hashed_key) {
+						// Force a synchronous PMEM write for this key so that
+						// mark_persisted is called before the eviction proceeds.
+						tm.force_sync_persist(hashed_key);
+					}
+				}
+			}
 
 			let erase_result = erase(
 				&self.objects,

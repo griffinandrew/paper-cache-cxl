@@ -1574,46 +1574,73 @@ where
 			Arc::new_cyclic(|weak_tm: &std::sync::Weak<TieringManager<K, BufferPMEM>>| {
 				let weak_tm = weak_tm.clone();
 
-				let persist_cb = move |job: crate::tiering::manager::PmemBackfillJob<K>| {
-					// Allocate value bytes in PMEM via the Hybrid allocator.
-					let mut pmem_vec = Vec::<u8, Hybrid>::with_capacity_in(job.value.len(), Hybrid);
-					pmem_vec.extend_from_slice(&job.value);
-					let val_buf: BufferPMEM = pmem_vec.into_boxed_slice();
+				let batch_persist_cb = move |batch: Vec<crate::tiering::manager::PmemBackfillJob<K>>| {
+					// Upgrade the weak reference once per batch to avoid repeated
+					// atomic operations and to fail fast if the manager was dropped.
+					let Some(tm) = weak_tm.upgrade() else { return };
 
-					let object = crate::object::Object::new(job.key, val_buf, job.ttl);
+					// ── Phase 1: Pre-allocate PMEM for each job ─────────────────────
+					// Perform all allocations before touching the objects map so that
+					// the DashMap shards are locked for the shortest possible window.
+					// Also performs a TOCTOU check: skip any key whose tier has already
+					// changed (e.g. a concurrent delete or a newer set replaced it).
+					let mut pmem_objects = Vec::with_capacity(batch.len());
+					for job in batch {
+						// TOCTOU: if the key is no longer DramOnly, a concurrent
+						// operation already updated or removed it – skip to avoid
+						// overwriting a newer value.
+						if !tm.is_dram_only(job.hashed_key) {
+							continue;
+						}
 
-					let base_size = overhead_bg.base_size(&object);
-					if base_size == 0 || status_bg.exceeds_max_size(base_size) {
-						// PMEM write cannot proceed; remove the stuck DramOnly entry.
-						if let Some(tm) = weak_tm.upgrade() {
+						// Allocate value bytes in PMEM via the Hybrid allocator.
+						let mut pmem_vec = Vec::<u8, Hybrid>::with_capacity_in(job.value.len(), Hybrid);
+						pmem_vec.extend_from_slice(&job.value);
+						let val_buf: BufferPMEM = pmem_vec.into_boxed_slice();
+
+						let object = crate::object::Object::new(job.key, val_buf, job.ttl);
+						let base_size = overhead_bg.base_size(&object);
+
+						if base_size == 0 || status_bg.exceeds_max_size(base_size) {
+							// PMEM write cannot proceed; remove the stuck DramOnly entry.
 							tm.remove_object(job.hashed_key);
+							continue;
 						}
-						return;
+
+						pmem_objects.push((job.hashed_key, object, base_size));
 					}
 
-					// Insert the PMEM-allocated object into the main cache map.
-					// If a previous PMEM insert already exists for this key, replace it
-					// without changing the object count (count only grows for new keys).
-					let old_size = objects_bg
-						.insert(job.hashed_key, object)
-						.map(|old| overhead_bg.base_size(&old));
+					// ── Phase 2: Minimal locking – batch inserts into the objects map ──
+					let mut batch_delta: i64 = 0;
+					let mut batch_count: u64 = 0;
 
-					let delta = match old_size {
-						Some(old) => base_size as i64 - old as i64,
-						None => {
-							status_bg.incr_num_objects();
-							base_size as i64
+					for (hashed_key, object, base_size) in pmem_objects {
+						let old_size = objects_bg
+							.insert(hashed_key, object)
+							.map(|old| overhead_bg.base_size(&old));
+
+						match old_size {
+							Some(old) => batch_delta += base_size as i64 - old as i64,
+							None => {
+								batch_count += 1;
+								batch_delta += base_size as i64;
+							}
 						}
-					};
-					status_bg.update_base_used_size(delta);
 
-					// Transition tier from DramOnly -> DramAndPmem.
-					if let Some(tm) = weak_tm.upgrade() {
-						tm.mark_persisted(job.hashed_key);
+						// Transition tier from DramOnly -> DramAndPmem immediately
+						// after each insert so the window where the object is in the
+						// objects map but still DramOnly is as short as possible.
+						tm.mark_persisted(hashed_key);
 					}
+
+					// ── Phase 3: Deferred atomics – one update per batch ─────────────
+					// Apply the accumulated size delta and new-object count in a single
+					// pair of atomic operations to minimise cache-line bouncing.
+					status_bg.update_base_used_size(batch_delta);
+					status_bg.add_num_objects(batch_count);
 				};
 
-				TieringManager::new_with_backfill(tiering_config, persist_cb)
+				TieringManager::new_with_backfill(tiering_config, batch_persist_cb)
 			})
 		};
 
