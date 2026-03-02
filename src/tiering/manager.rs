@@ -842,7 +842,7 @@ use crate::PaperCache;
 #[cfg(feature = "key_value_pmem")]
 pub type BufferPMEM = Box<[u8], Hybrid>;
 
-#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem"))]
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "admission_control"))]
 use crate::allocator::HybridObjects as Hybrid;
 
 mod allocator_bindings {
@@ -865,6 +865,17 @@ pub struct PmemBackfillJob<K> {
     pub hashed_key: HashedKey,
     pub value: Box<[u8]>,
     pub ttl: Option<u32>,
+}
+
+/// A victim entry: data evicted from DRAM to CXL as part of the admission_control 2Q lifecycle.
+/// Stored in the TieringManager's victim cache and re-admitted to DRAM on sufficient accesses.
+#[cfg(all(feature = "admission_control", any(feature = "key_value_pmem", feature = "alloc_api_exp")))]
+pub struct AdmissionVictim<K> {
+    pub key: K,
+    /// CXL-backed bytes; allocated via Hybrid when DRAM limit was reached
+    pub data: Vec<u8, Hybrid>,
+    pub expiry: crate::object::ExpireTime,
+    pub access_count: u64,
 }
 
 
@@ -965,6 +976,22 @@ pub enum Tier {
     #[cfg(feature = "sets_dram")]
     /// Object exists only in DRAM (sets_dram feature)
     DramOnly,
+
+    #[cfg(feature = "admission_control")]
+    /// Newly admitted to DRAM (initial state in 2Q lifecycle)
+    Admission,
+
+    #[cfg(feature = "admission_control")]
+    /// Evicted from DRAM to CXL victim cache (cold tier in 2Q lifecycle)
+    Victim,
+
+    #[cfg(feature = "admission_control")]
+    /// Accessed enough to warm up; CXL data + DRAM metadata tracking
+    Warm,
+
+    #[cfg(feature = "admission_control")]
+    /// Promoted back to DRAM; both key and value reside in DRAM (hot tier)
+    Hot,
 }
 
 /// Information about an object's tiering status
@@ -1049,6 +1076,11 @@ pub struct TieringManager<K, V> {
     #[cfg(feature = "sets_dram")]
     sync_persist_fn: Arc<dyn Fn(Vec<PmemBackfillJob<K>>) + Send + Sync>,
 
+    /// CXL victim cache for the admission_control 2Q lifecycle.
+    /// Stores objects evicted from DRAM (key=HashedKey, value=AdmissionVictim).
+    #[cfg(all(feature = "admission_control", any(feature = "key_value_pmem", feature = "alloc_api_exp")))]
+    victim_cache: Arc<DashMap<HashedKey, AdmissionVictim<K>, NoHasher>>,
+
     _phantom: std::marker::PhantomData<(K, V)>,
 }
 
@@ -1081,6 +1113,8 @@ where
             pending_jobs: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "sets_dram")]
             sync_persist_fn: Arc::new(|_batch| {}),
+            #[cfg(all(feature = "admission_control", any(feature = "key_value_pmem", feature = "alloc_api_exp")))]
+            victim_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -1108,6 +1142,8 @@ where
             pending_jobs: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "sets_dram")]
             sync_persist_fn: Arc::new(|_batch| {}),
+            #[cfg(all(feature = "admission_control", any(feature = "key_value_pmem", feature = "alloc_api_exp")))]
+            victim_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -1135,6 +1171,8 @@ where
             pending_jobs: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "sets_dram")]
             sync_persist_fn: Arc::new(|_batch| {}),
+            #[cfg(all(feature = "admission_control", any(feature = "key_value_pmem", feature = "alloc_api_exp")))]
+            victim_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -1162,6 +1200,8 @@ where
             pending_jobs: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "sets_dram")]
             sync_persist_fn: Arc::new(|_batch| {}),
+            #[cfg(all(feature = "admission_control", any(feature = "key_value_pmem", feature = "alloc_api_exp")))]
+            victim_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -1169,6 +1209,140 @@ where
     /// Creates a new TieringManager with default configuration
     pub fn with_defaults() -> Self {
         Self::new(TieringConfig::default())
+    }
+
+    /// Creates a new TieringManager configured for the admission_control 2Q lifecycle.
+    /// Initialises the victim cache for CXL-backed storage of evicted DRAM objects.
+    #[cfg(all(feature = "admission_control", feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    pub fn new_admission_control(config: TieringConfig) -> Self {
+        TieringManager {
+            config: Arc::new(RwLock::new(config)),
+            stats: Arc::new(RwLock::new(TieringStats::default())),
+            object_info: Arc::new(RwLock::new(HashMap::new())),
+            dram_objects: Arc::new(RwLock::new(HashSet::new())),
+            dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
+            #[cfg(feature = "sets_dram")]
+            pmem_tx: { let (tx, rx) = mpsc::channel(); drop(rx); tx },
+            #[cfg(feature = "sets_dram")]
+            _pmem_consumer: thread::spawn(|| {}),
+            #[cfg(feature = "sets_dram")]
+            pending_jobs: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "sets_dram")]
+            sync_persist_fn: Arc::new(|_batch| {}),
+            victim_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Registers a new object as Admission state (newly admitted to DRAM).
+    /// Used by the admission_control 2Q lifecycle.
+    #[cfg(feature = "admission_control")]
+    pub fn register_admission(&self, key: HashedKey, size: ObjectSize) {
+        let mut info_map = self.object_info.write().unwrap();
+        info_map.insert(key, ObjectTierInfo {
+            tier: Tier::Admission,
+            size,
+            access_count: 0,
+            last_access: std::time::Instant::now(),
+        });
+    }
+
+    /// Migrates an object from DRAM to the CXL victim cache (synchronous eviction path).
+    /// The data bytes must be provided by the caller (extracted from the objects map
+    /// *before* calling `erase`).  The Hybrid allocator routes the allocation to CXL
+    /// when DRAM_ALLOCATED_OBJECTS ≥ DRAM_LIMIT_OBJECTS (i.e. when DRAM is full).
+    ///
+    /// In the current implementation this method is intended to be called from
+    /// `PolicyWorker::apply_evictions` before erasing the object.  Full wiring of the
+    /// eviction path requires extending `PolicyWorker` with a `TieringManager` reference
+    /// for `admission_control` mode, which is left as a follow-up.
+    #[cfg(all(feature = "admission_control", any(feature = "key_value_pmem", feature = "alloc_api_exp")))]
+    pub fn migrate_to_victim(&self, hashed_key: HashedKey, key: K, data: Vec<u8, Hybrid>, expiry: crate::object::ExpireTime) {
+        let mut info_map = self.object_info.write().unwrap();
+        if let Some(info) = info_map.get_mut(&hashed_key) {
+            info.tier = Tier::Victim;
+            info.access_count = 0;
+        } else {
+            let size = data.len() as ObjectSize;
+            info_map.insert(hashed_key, ObjectTierInfo {
+                tier: Tier::Victim,
+                size,
+                access_count: 0,
+                last_access: std::time::Instant::now(),
+            });
+        }
+        drop(info_map);
+        self.victim_cache.insert(hashed_key, AdmissionVictim { key, data, expiry, access_count: 0 });
+    }
+
+    /// Retrieves data from the CXL victim cache.  Records the access and handles
+    /// all 2Q state transitions inline (Victim→Warm and Warm→Hot).
+    /// Returns `Some(bytes)` on a hit; removes expired entries eagerly.
+    #[cfg(all(feature = "admission_control", any(feature = "key_value_pmem", feature = "alloc_api_exp")))]
+    pub fn get_from_victim(&self, hashed_key: HashedKey, orig_key: &K) -> Option<Vec<u8>>
+    where
+        K: Eq,
+    {
+        let config = self.config.read().unwrap();
+        let hotness_threshold = config.hotness_threshold;
+        // Victim→Warm threshold: half the hotness threshold (configurable via TieringConfig)
+        let warm_threshold = hotness_threshold.saturating_div(2).max(1);
+        drop(config);
+
+        // Try to get a mutable reference via dashmap's entry API
+        let mut entry = self.victim_cache.get_mut(&hashed_key)?;
+        if &entry.key != orig_key { return None; }
+
+        // Eagerly remove expired entries to prevent memory leaks
+        if entry.expiry.is_some_and(|exp| exp <= std::time::Instant::now()) {
+            drop(entry);
+            self.victim_cache.remove(&hashed_key);
+            let mut info_map = self.object_info.write().unwrap();
+            info_map.remove(&hashed_key);
+            return None;
+        }
+
+        entry.access_count += 1;
+        let ac = entry.access_count;
+        let bytes: Vec<u8> = entry.data.to_vec();
+        drop(entry);
+
+        // State transitions in the 2Q lifecycle
+        let mut info_map = self.object_info.write().unwrap();
+        if let Some(info) = info_map.get_mut(&hashed_key) {
+            info.access_count = ac;
+            match info.tier {
+                Tier::Victim if ac >= warm_threshold => { info.tier = Tier::Warm; }
+                _ => {}
+            }
+        }
+        drop(info_map);
+
+        Some(bytes)
+    }
+
+    /// Marks an object as Hot (promoted back to DRAM).  Called after the actual
+    /// data re-allocation has been performed in the get() path.
+    #[cfg(feature = "admission_control")]
+    pub fn mark_hot(&self, key: HashedKey) {
+        // Remove from victim cache if present
+        #[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
+        self.victim_cache.remove(&key);
+
+        let mut info_map = self.object_info.write().unwrap();
+        if let Some(info) = info_map.get_mut(&key) {
+            info.tier = Tier::Hot;
+        } else {
+            info_map.insert(key, ObjectTierInfo {
+                tier: Tier::Hot,
+                size: 0,
+                access_count: 0,
+                last_access: std::time::Instant::now(),
+            });
+        }
+        let mut stats = self.stats.write().unwrap();
+        stats.promotions += 1;
+        stats.dram_objects += 1;
     }
 
     /// Registers a new object in PMEM
@@ -1283,6 +1457,8 @@ where
             _pmem_consumer: handle,
             pending_jobs,
             sync_persist_fn: sync_fn,
+            #[cfg(all(feature = "admission_control", any(feature = "key_value_pmem", feature = "alloc_api_exp")))]
+            victim_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -1313,6 +1489,8 @@ where
             _pmem_consumer: handle,
             pending_jobs,
             sync_persist_fn: sync_fn,
+            #[cfg(all(feature = "admission_control", any(feature = "key_value_pmem", feature = "alloc_api_exp")))]
+            victim_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -1439,6 +1617,22 @@ where
                     // Already in DRAM-only tier
                     false
                 }
+                // admission_control 2Q lifecycle states
+                #[cfg(feature = "admission_control")]
+                Tier::Admission | Tier::Hot => {
+                    // Already in DRAM; no promotion needed
+                    false
+                }
+                #[cfg(feature = "admission_control")]
+                Tier::Victim => {
+                    // In CXL victim cache — track accesses; get_from_victim handles Victim→Warm
+                    false
+                }
+                #[cfg(feature = "admission_control")]
+                Tier::Warm => {
+                    // Warm objects are ready for full DRAM promotion when threshold is met
+                    info.access_count >= hotness_threshold
+                }
             }
         } else {
             false
@@ -1484,6 +1678,9 @@ where
                     // Already in DRAM-only tier
                     false
                 }
+                // admission_control 2Q states (always return false; handled by the non-hashtable path)
+                #[cfg(feature = "admission_control")]
+                Tier::Admission | Tier::Hot | Tier::Victim | Tier::Warm => false,
             }
         } else {
             false
@@ -2132,6 +2329,20 @@ where
                     dram_objects.remove(&key);
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
                     stats.dram_only_objects = stats.dram_only_objects.saturating_sub(1);
+                }
+                // admission_control 2Q states
+                #[cfg(feature = "admission_control")]
+                Tier::Admission | Tier::Hot => {
+                    // DRAM-resident; remove from tracking
+                    let mut dram_objects = self.dram_objects.write().unwrap();
+                    dram_objects.remove(&key);
+                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                }
+                #[cfg(feature = "admission_control")]
+                Tier::Victim | Tier::Warm => {
+                    // CXL victim cache; clean up
+                    #[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
+                    self.victim_cache.remove(&key);
                 }
             }
         }

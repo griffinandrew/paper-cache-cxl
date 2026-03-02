@@ -74,6 +74,11 @@ hashtable_tiering = []
 
 sets_dram = []
 
+# DRAM-first admission control with CXL/PMEM as the victim/overflow tier.
+# Implements a 2Q-style object lifecycle: Admission (DRAM) → Victim (CXL) → Warm → Hot (DRAM).
+# Requires key_value_pmem to enable the Hybrid allocator for CXL victim storage.
+admission_control = []
+
 # Legacy features (deprecated, will be removed)
 default = []
 original = []

@@ -29,7 +29,11 @@ static DRAM_ALLOCATED_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "all_dram")]
 static mut DRAM_LIMIT_OBJECTS: usize = ALL_DRAM_LIMIT_BYTES; // All in DRAM
 
-#[cfg(not(feature = "all_dram"))]
+// 4 GB DRAM landing zone for admission_control (DRAM-first, CXL overflow)
+#[cfg(all(feature = "admission_control", not(feature = "all_dram")))]
+static mut DRAM_LIMIT_OBJECTS: usize = 4 * 1024 * 1024 * 1024;
+
+#[cfg(not(any(feature = "all_dram", feature = "admission_control")))]
 static mut DRAM_LIMIT_OBJECTS: usize = ALL_PMEM_LIMIT_BYTES; // All in PMEM by default
 
 static PRINT_THRESHOLD: usize = 10000;
