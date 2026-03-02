@@ -1211,7 +1211,6 @@ where
     //});
     // ...existing code...
 
-    #[cfg(feature = "sets_dram")]
     /// Spawns the background PMEM consumer thread.
     /// Drains the channel in batches and calls persist_fn once per batch,
     /// using pending_jobs as a claim registry to avoid double-processing
@@ -1241,7 +1240,8 @@ where
                 // force_sync_persist (they were removed from the map first).
                 let mut batch = Vec::with_capacity(keys.len());
                 {
-                    let mut pending = pending_jobs.lock().unwrap();
+                    let mut pending = pending_jobs.lock()
+                        .expect("pending_jobs mutex should not be poisoned");
                     for key in keys {
                         if let Some(job) = pending.remove(&key) {
                             batch.push(job);
@@ -1341,7 +1341,10 @@ where
             value: value.to_vec().into_boxed_slice(),
             ttl,
         };
-        self.pending_jobs.lock().unwrap().insert(hashed_key, job);
+        self.pending_jobs
+            .lock()
+            .expect("pending_jobs mutex should not be poisoned")
+            .insert(hashed_key, job);
         let _ = self.pmem_tx.send(hashed_key);
     }
 
@@ -2330,7 +2333,7 @@ impl<K, V> TieringManager<K, V> {
     pub fn is_dram_only(&self, key: HashedKey) -> bool {
         self.object_info
             .read()
-            .unwrap()
+            .expect("object_info RwLock should not be poisoned")
             .get(&key)
             .map_or(false, |info| info.tier == Tier::DramOnly)
     }
@@ -2344,7 +2347,12 @@ impl<K, V> TieringManager<K, V> {
     /// This is used by the `PolicyWorker` to ensure data safety before evicting
     /// an object that hasn't yet been flushed to PMEM.
     pub fn force_sync_persist(&self, key: HashedKey) -> bool {
-        if let Some(job) = self.pending_jobs.lock().unwrap().remove(&key) {
+        if let Some(job) = self.pending_jobs
+            .lock()
+            .expect("pending_jobs mutex should not be poisoned")
+            .remove(&key)
+        {
+            (self.sync_persist_fn)(vec![job]);
             true
         } else {
             false

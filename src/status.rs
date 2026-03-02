@@ -263,6 +263,12 @@ impl AtomicStatus {
 		self.num_objects.fetch_add(1, Ordering::AcqRel);
 	}
 
+	pub fn add_num_objects(&self, count: u64) {
+		if count > 0 {
+			self.num_objects.fetch_add(count, Ordering::AcqRel);
+		}
+	}
+
 	pub fn decr_num_objects(&self) {
 		self.num_objects.fetch_sub(1, Ordering::AcqRel);
 	}

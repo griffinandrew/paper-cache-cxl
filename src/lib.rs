@@ -1574,7 +1574,7 @@ where
 			Arc::new_cyclic(|weak_tm: &std::sync::Weak<TieringManager<K, BufferPMEM>>| {
 				let weak_tm = weak_tm.clone();
 
-				let persist_cb = move |batch: Vec<crate::tiering::manager::PmemBackfillJob<K>>| {
+				let batch_persist_cb = move |batch: Vec<crate::tiering::manager::PmemBackfillJob<K>>| {
 					// Upgrade the weak reference once per batch to avoid repeated
 					// atomic operations and to fail fast if the manager was dropped.
 					let Some(tm) = weak_tm.upgrade() else { return };
@@ -1584,7 +1584,7 @@ where
 					// the DashMap shards are locked for the shortest possible window.
 					// Also performs a TOCTOU check: skip any key whose tier has already
 					// changed (e.g. a concurrent delete or a newer set replaced it).
-					let mut prepared = Vec::with_capacity(batch.len());
+					let mut pmem_objects = Vec::with_capacity(batch.len());
 					for job in batch {
 						// TOCTOU: if the key is no longer DramOnly, a concurrent
 						// operation already updated or removed it – skip to avoid
@@ -1607,14 +1607,14 @@ where
 							continue;
 						}
 
-						prepared.push((job.hashed_key, object, base_size));
+						pmem_objects.push((job.hashed_key, object, base_size));
 					}
 
 					// ── Phase 2: Minimal locking – batch inserts into the objects map ──
 					let mut batch_delta: i64 = 0;
 					let mut batch_count: u64 = 0;
 
-					for (hashed_key, object, base_size) in prepared {
+					for (hashed_key, object, base_size) in pmem_objects {
 						let old_size = objects_bg
 							.insert(hashed_key, object)
 							.map(|old| overhead_bg.base_size(&old));
@@ -1637,12 +1637,10 @@ where
 					// Apply the accumulated size delta and new-object count in a single
 					// pair of atomic operations to minimise cache-line bouncing.
 					status_bg.update_base_used_size(batch_delta);
-					for _ in 0..batch_count {
-						status_bg.incr_num_objects();
-					}
+					status_bg.add_num_objects(batch_count);
 				};
 
-				TieringManager::new_with_backfill(tiering_config, persist_cb)
+				TieringManager::new_with_backfill(tiering_config, batch_persist_cb)
 			})
 		};
 
