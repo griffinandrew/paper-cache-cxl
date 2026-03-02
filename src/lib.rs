@@ -1634,6 +1634,7 @@ where
 			&objects,
 			&status,
 			&overhead_manager,
+			&tiering_manager,
 		)?;
 
 		#[cfg(all(not(feature = "enable_tiering_manager"), not(feature = "sets_dram")))]
