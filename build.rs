@@ -8,10 +8,16 @@ fn main() {
     // Only run bindgen if the wrapper exists
     if Path::new(wrapper_path).exists() {
         println!("cargo:rerun-if-changed=wrapper.h");
-        println!("cargo:rustc-link-lib=umf");
-        println!("cargo:rustc-link-search=native=/home/griffin/libs/unified-memory-framework/lib");
-        println!("cargo:rustc-link-lib=umf_allocator");
+        //these work for host but not for vm so modifying.... temp....
+        //println!("cargo:rustc-link-lib=umf");
+        //println!("cargo:rustc-link-search=native=/home/griffin/libs/unified-memory-framework/lib");
+        //println!("cargo:rustc-link-lib=umf_allocator");
 
+        println!("cargo:rustc-link-search=native={}", std::env::var("HOME").unwrap() + "/umf-install/lib64");
+        println!("cargo:rustc-link-lib=dylib=umf");
+        println!("cargo:rustc-link-lib=dylib=umf_allocator");
+
+        /*
         // Generate bindings
         let bindings = bindgen::Builder::default()
             .header(wrapper_path) // Ensure this header includes memkind headers
@@ -27,6 +33,7 @@ fn main() {
             .expect("Couldn't write bindings!");
 
         println!("DONE");
+        */
 
         cc::Build::new()
             .file("umf_allocator/umf_allocator_wrapper.c")
@@ -42,5 +49,7 @@ fn main() {
             std::fs::write(&umf_bindings_path, "// Stub UMF bindings\n")
                 .expect("Could not write stub umf_bindings.rs");
         }
+        
     }
+    
 }
