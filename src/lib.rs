@@ -1898,7 +1898,7 @@ where
 		}
 
 
-		#[not(cfg(feature = "sets_dram"))]
+		#[cfg(not(feature = "sets_dram"))]
 		{
 			let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
 
