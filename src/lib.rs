@@ -1948,11 +1948,13 @@ where
 			};
 
 			self.status.update_base_used_size(base_size_delta);
+			self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+			Ok(())
 		}
 
 		//self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
 
-		Ok(())
+		//Ok(())
 	}
 
 
