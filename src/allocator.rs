@@ -123,15 +123,15 @@ unsafe impl GlobalAlloc for HybridObjects {
                         numa_node
                         );
                     #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with NUMA list {:?}", numa_list);}
-                    #[cfg(debug_assertions)] {println!("CACHE: Allocated {} bytes from PMEM", layout.size());}
-                #[cfg(debug_assertions)] {println!("CACHE: allocated size (align): {}", layout.align());}
-                #[cfg(debug_assertions)] {println!("CACHE: allocated ptr: {:p}", ptr);}
                 });
                 
             }
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
             if ptr.is_null() { println!("Failed to allocate PMEM"); return ptr::null_mut(); }
             #[cfg(debug_assertions)] {ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);}
+            #[cfg(debug_assertions)] {println!("CACHE: Allocated {} bytes from PMEM", layout.size());}
+            #[cfg(debug_assertions)] {println!("CACHE: allocated size (align): {}", layout.align());}
+            #[cfg(debug_assertions)] {println!("CACHE: allocated ptr: {:p}", ptr);}
             ptr
         };
        
