@@ -76,6 +76,9 @@ unsafe impl GlobalAlloc for HybridObjects {
             }
             let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
             if ptr.is_null() { println!("Failed to allocate PMEM in cache allocator"); return ptr::null_mut(); }
+            #[cfg(debug_assertions)] {println!("CACHE: Allocated {} bytes from PMEM", layout.size());}
+            #[cfg(debug_assertions)] {println!("CACHE: allocated size (align): {}", layout.align());}
+            #[cfg(debug_assertions)] {println!("CACHE: allocated ptr: {:p}", ptr);}
             //println!("CACHE: Allocated {} bytes from PMEM", layout.size());
             //println!("CACHE: allocated size (align): {}", layout.align());
             //println!("CACHE: allocated ptr: {:p}", ptr);
@@ -120,6 +123,9 @@ unsafe impl GlobalAlloc for HybridObjects {
                         numa_node
                         );
                     #[cfg(debug_assertions)] {println!("Initialized PMEM allocator with NUMA list {:?}", numa_list);}
+                    #[cfg(debug_assertions)] {println!("CACHE: Allocated {} bytes from PMEM", layout.size());}
+                #[cfg(debug_assertions)] {println!("CACHE: allocated size (align): {}", layout.align());}
+                #[cfg(debug_assertions)] {println!("CACHE: allocated ptr: {:p}", ptr);}
                 });
                 
             }
