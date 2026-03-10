@@ -292,6 +292,22 @@ void umf_dealloc(void *ptr) {
 }
 
 
+int check_tier(void *ptr) {
+    umf_memory_pool_handle_t curr_pool;
+    if (umfPoolByPtr(ptr, &curr_pool) == UMF_RESULT_SUCCESS) {
+
+        if (curr_pool == pool) {
+            return 1; //pmem
+        }
+    }
+    else {
+        return 0; //dram
+    }
+    //tjhis is unreachabke thoo
+    return -1; //not from any UMF pool
+}
+
+
 //end solo numa node allocation for pmem
 
 
