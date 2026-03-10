@@ -1898,57 +1898,57 @@ where
 		}
 
 
+		#[not(cfg(feature = "sets_dram"))]
+		{
+			let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
 
-		/*
-		let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
+			//let key_buf: BufferPMEM = 
 
-		//let key_buf: BufferPMEM = 
+			//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(key.len(), Hybrid); 
+			//buf1.extend_from_slice(&key);
+			//let key_buf: BufferPMEM = buf1.into_boxed_slice();
 
-		//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(key.len(), Hybrid); 
-		//buf1.extend_from_slice(&key);
-		//let key_buf: BufferPMEM = buf1.into_boxed_slice();
+			//let key_buf: BufferPMEM = key.to_vec_in(Hybrid).into_boxed_slice();
 
-		//let key_buf: BufferPMEM = key.to_vec_in(Hybrid).into_boxed_slice();
+			let object = Object::new(key, val_buf, ttl);
 
-		let object = Object::new(key, val_buf, ttl);
-
-		//should =turn this into pmem buffer .... 
+			//should =turn this into pmem buffer .... 
 
 
-		//let object = Object::new(key, value, ttl);
-		
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
+			//let object = Object::new(key, value, ttl);
+			
+			let base_size = self.overhead_manager.base_size(&object);
+			let expiry = object.expiry();
 
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
+			if base_size == 0 {
+				return Err(CacheError::ZeroValueSize);
+			}
+
+			if self.status.exceeds_max_size(base_size) {
+				return Err(CacheError::ExceedingValueSize);
+			}
+
+			self.status.incr_sets();
+
+			let old_object_info = self.objects
+				.insert(hashed_key, object)
+				.map(|old_object| {
+					let base_size = self.overhead_manager.base_size(&old_object);
+					let expiry = old_object.expiry();
+
+					(base_size, expiry)
+				});
+
+			let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+				base_size as i64 - old_object_size as i64
+			} else {
+				// the object is new, so increase the number of objects count
+				self.status.incr_num_objects();
+				base_size as i64
+			};
+
+			self.status.update_base_used_size(base_size_delta);
 		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			// the object is new, so increase the number of objects count
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		*/
 
 		//self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
 
