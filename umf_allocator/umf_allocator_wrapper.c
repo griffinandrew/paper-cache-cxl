@@ -1,3 +1,5 @@
+/*
+
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,13 +127,7 @@ int check_tier(void *ptr) {
     return -1; //not from any UMF pool
 }
 
-
-
-
-
-
-
-/*
+*/
 
 
 //working NUMA verison for only using pmem
