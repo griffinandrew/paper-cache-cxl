@@ -295,7 +295,6 @@ void umf_dealloc(void *ptr) {
 //end solo numa node allocation for pmem
 
 
-*/
 
 
 
