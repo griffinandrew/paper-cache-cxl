@@ -112,7 +112,7 @@ impl<K: Default> Default for Object<K, Box<[u8]>> {
 	}
 }
 
-// For BufferPMEM (Box<[u8], Hybrid>)
+// For BufferPMEM (Box<[u8], Hybrid>) need to mod...
 #[cfg(any(feature = "key_value_pmem", feature = "global_flatmap_pmem"))]
 impl<K: Default> Default for Object<K, Box<[u8], crate::Hybrid>> {
 	fn default() -> Self {

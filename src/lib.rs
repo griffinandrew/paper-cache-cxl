@@ -1821,6 +1821,7 @@ where
 				self.status.incr_hits();
 				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
 				// Use data_as_bytes method to handle both PhysicalCopy and CxlReference
+				//this could be incorrect.....
 				return Ok(dram_object_ref.data_as_bytes());
 			}
 		}
@@ -1910,6 +1911,7 @@ where
 
 			//let key_buf: BufferPMEM = key.to_vec_in(Hybrid).into_boxed_slice();
 
+			//the key should also be in pmem... this is stale or wrong... mut have changed it back??
 			let object = Object::new(key, val_buf, ttl);
 
 			//should =turn this into pmem buffer .... 
