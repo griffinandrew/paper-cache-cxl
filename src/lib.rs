@@ -59,6 +59,13 @@ mod status;
 #[cfg(any(all(feature = "key_value_pmem", feature = "enable_tiering_manager"), all(feature = "key_value_pmem", feature = "sets_dram")))]
 pub mod tiering;
 
+// Admission tiering: independent DRAM hot tier + far-memory cold tier with 2Q per tier.
+#[cfg(feature = "admission_tiering")]
+pub mod admission_tiering;
+
+#[cfg(feature = "admission_tiering")]
+pub use crate::admission_tiering::{AdmissionTierCache, AdmissionTierConfig, AdmissionTierStats};
+
 // FlatMap module - high-performance Linear Probing Hash Map for PMEM/DRAM
 #[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
 pub mod flatmap;
