@@ -8,19 +8,45 @@
 //! Admission Tier Cache — a standalone two-tier cache with a DRAM hot tier and
 //! a far-memory cold tier, each governed by its own independent 2Q structure.
 //!
-//! # Overview
+//! # Object lifecycle
 //!
-//! The `AdmissionTierCache` implements an **admission policy** where:
+//! ```text
+//! set(key) ──► DRAM (hot tier)
+//!                  │ DRAM eviction (cold)
+//!                  ▼
+//!            Far memory (cold tier)  ◄── shadow copy kept on DRAM eviction
+//!                  │ any re-access
+//!                  ▼
+//!            DRAM gets a copy        (far memory KEEPS its copy)
+//!                  │ DRAM eviction
+//!                  ▼
+//!            DRAM copy removed       (far memory still has the object)
+//!                  │ far eviction
+//!                  ▼
+//!            Both copies removed     (object is truly gone)
+//! ```
 //!
-//! 1. **`set`** — New objects are admitted only to the **DRAM cache** (fast tier).
-//! 2. **DRAM eviction** — When the DRAM tier is full, the 2Q policy selects the
-//!    coldest object and moves it **down** to the far-memory (slow) tier.
-//! 3. **`get` from far memory** — If the object is found in far memory, its
-//!    far-memory 2Q entry is updated.  When the 2Q decides the object is hot
-//!    (in `a1_out` — second chance — or already in `am`), it is **promoted**
-//!    back up to the DRAM cache automatically.
-//! 4. **Far-memory eviction** — When the far-memory tier is full, the coldest
-//!    object is evicted entirely from the cache.
+//! # Policy rules
+//!
+//! 1. **`set`** — New objects are admitted only to the **DRAM cache**.
+//!    Any existing far-memory copy of the same key is removed (the fresh write
+//!    starts a new lifecycle for the object).
+//! 2. **DRAM eviction** — The coldest DRAM object (per its 2Q) is evicted.
+//!    - If that object already has a far-memory copy (i.e. it was previously
+//!      promoted from far to DRAM), only the DRAM copy is removed — the far
+//!      copy remains untouched.
+//!    - If there is no far-memory copy, the object is **moved** to far memory.
+//! 3. **`get` from far memory** — Far memory is accessed but **not vacated**.
+//!    A copy of the entry is placed in DRAM while the original remains in far
+//!    memory as a backup.  The far 2Q position is also refreshed so that the
+//!    backup is not evicted while the DRAM copy is hot.
+//! 4. **`get` from DRAM (with far backup)** — Refreshes both the DRAM 2Q and
+//!    the far 2Q, preventing the backup from being evicted while the object is
+//!    actively in use.
+//! 5. **Far-memory eviction** — The coldest far-memory object is evicted.
+//!    Because far memory is the **backing authority**, if there is also a DRAM
+//!    copy of that object it is removed at the same time.  This is the only
+//!    path that causes an object to be fully dropped.
 //!
 //! # Independence
 //!
@@ -90,21 +116,29 @@ impl Default for AdmissionTierConfig {
 // ─── Statistics ───────────────────────────────────────────────────────────────
 
 /// Runtime statistics for the admission tier cache.
+///
+/// Note: after a promotion from far memory to DRAM, an object is present in
+/// **both** tiers simultaneously.  `dram_objects`/`dram_bytes` and
+/// `far_objects`/`far_bytes` each count that object once, so their sum can
+/// exceed the number of unique logical objects.
 #[derive(Clone, Debug, Default)]
 pub struct AdmissionTierStats {
-    /// Current number of objects in the DRAM tier.
+    /// Current number of physical entries in the DRAM tier.
     pub dram_objects: u64,
     /// Current byte usage in the DRAM tier.
     pub dram_bytes: u64,
-    /// Current number of objects in the far-memory tier.
+    /// Current number of physical entries in the far-memory tier
+    /// (includes objects that also have a DRAM copy).
     pub far_objects: u64,
     /// Current byte usage in the far-memory tier.
     pub far_bytes: u64,
-    /// Cumulative count of objects moved from DRAM to far memory (evictions).
+    /// Cumulative count of objects moved *newly* from DRAM to far memory
+    /// (only incremented when the object had no prior far-memory copy).
     pub evictions_to_far: u64,
-    /// Cumulative count of objects fully evicted from far memory.
+    /// Cumulative count of objects fully evicted from far memory (and any
+    /// corresponding DRAM copy).
     pub evictions_from_far: u64,
-    /// Cumulative count of objects promoted from far memory back to DRAM.
+    /// Cumulative count of promotions: far-memory objects copied to DRAM.
     pub promotions_to_dram: u64,
     /// Cumulative `get` hits served from the DRAM tier.
     pub dram_hits: u64,
@@ -221,6 +255,8 @@ where
     /// Insert or update a key-value pair.
     ///
     /// The object is placed **directly into the DRAM tier** (admission policy).
+    /// Any existing far-memory copy of the same key is removed so that the
+    /// fresh write starts a new lifecycle.
     /// If the DRAM tier exceeds its capacity after the insert, the coldest
     /// object (according to the DRAM 2Q) is moved to far memory.
     ///
@@ -279,9 +315,10 @@ where
     /// Retrieve the value associated with `key`.
     ///
     /// Lookup order:
-    /// 1. DRAM tier — update DRAM 2Q position.
-    /// 2. Far-memory tier — update far-memory 2Q; if the 2Q signals the object
-    ///    is hot, **promote it to DRAM** before returning.
+    /// 1. **DRAM tier** — update DRAM 2Q position.  If a far-memory backup copy
+    ///    also exists, refresh its 2Q position to prevent premature eviction.
+    /// 2. **Far-memory tier** — update far-memory 2Q position; **copy** the entry
+    ///    to DRAM while keeping the far-memory copy as a backup.
     ///
     /// # Errors
     /// - [`CacheError::KeyNotFound`] — key is not in either tier (or is expired).
@@ -290,7 +327,6 @@ where
         let mut inner = self.inner.lock().unwrap();
 
         // ── DRAM lookup ──────────────────────────────────────────────────────
-        // Extract all needed info while the borrow is active, then act on it.
         let dram_info = inner.dram_store
             .get(&hashed_key)
             .filter(|e| e.key_matches(key))
@@ -300,18 +336,39 @@ where
             if !expired {
                 inner.dram_2q.access(hashed_key);
                 inner.stats.dram_hits += 1;
+
+                // Refresh far-memory 2Q too if a backup copy exists there.
+                // This prevents the backing store from being evicted while the
+                // DRAM copy is actively in use.
+                if inner.far_store.contains_key(&hashed_key) {
+                    inner.far_2q.access(hashed_key);
+                }
+
                 return Ok(data);
             }
-            // Expired DRAM entry — remove it.
+            // Expired DRAM entry — remove it (and any far backup).
             inner.dram_store.remove(&hashed_key);
             inner.dram_2q.remove(hashed_key);
             inner.stats.dram_objects = inner.stats.dram_objects.saturating_sub(1);
             inner.stats.dram_bytes = inner.stats.dram_bytes.saturating_sub(size as u64);
+
+            let far_size = inner.far_store
+                .get(&hashed_key)
+                .filter(|e| e.key_matches(key))
+                .map(|e| e.size);
+            if let Some(fsz) = far_size {
+                inner.far_store.remove(&hashed_key);
+                inner.far_2q.remove(hashed_key);
+                inner.stats.far_objects = inner.stats.far_objects.saturating_sub(1);
+                inner.stats.far_bytes = inner.stats.far_bytes.saturating_sub(fsz as u64);
+            }
+
             inner.stats.misses += 1;
             return Err(CacheError::KeyNotFound);
         }
 
         // ── Far-memory lookup ────────────────────────────────────────────────
+        // Extract all needed snapshot fields while the borrow is active.
         let far_info = inner.far_store
             .get(&hashed_key)
             .filter(|e| e.key_matches(key))
@@ -319,25 +376,29 @@ where
 
         if let Some((data, size, expired)) = far_info {
             if !expired {
-                // Update far-memory 2Q position for eviction ordering.
+                // Refresh far-memory 2Q (updates eviction ordering for the backup).
                 inner.far_2q.access(hashed_key);
                 inner.stats.far_hits += 1;
 
-                // Any re-access to a far-memory object signals it is "warm".
-                // Promote it back to the DRAM tier immediately.
-                // Use if-let to safely handle the remove (the lock is held, but be
-                // explicit rather than relying on unwrap).
-                if let Some(entry) = inner.far_store.remove(&hashed_key) {
-                    inner.far_2q.remove(hashed_key);
-                    inner.stats.far_objects = inner.stats.far_objects.saturating_sub(1);
-                    inner.stats.far_bytes = inner.stats.far_bytes.saturating_sub(size as u64);
-
-                    inner.dram_store.insert(hashed_key, entry);
+                // Copy to DRAM — far memory KEEPS its backup copy.
+                // Construct the DRAM entry by cloning the Arc pointer (no data copy)
+                // and the key.  The borrow of far_info ended above (it holds only
+                // owned values), so this second access to far_store is safe.
+                if let Some(far_entry) = inner.far_store.get(&hashed_key) {
+                    let dram_entry = TierEntry {
+                        key: far_entry.key.clone(),
+                        data: Arc::clone(&far_entry.data),
+                        expiry: far_entry.expiry,
+                        size: far_entry.size,
+                    };
+                    inner.dram_store.insert(hashed_key, dram_entry);
                     inner.dram_2q.insert(hashed_key, size);
                     inner.stats.dram_objects += 1;
                     inner.stats.dram_bytes += size as u64;
                     inner.stats.promotions_to_dram += 1;
 
+                    // Evict from DRAM if needed.  The eviction helper is aware
+                    // that some DRAM victims may already have a far copy.
                     self.evict_dram_to_far(&mut inner);
                 }
 
@@ -450,8 +511,15 @@ where
         hasher.finish()
     }
 
-    /// Evict objects from the DRAM tier into far memory until the tier is
-    /// within its configured byte limit.
+    /// Evict objects from the DRAM tier until it is within its configured byte
+    /// limit.
+    ///
+    /// For each evicted DRAM entry:
+    /// - If a far-memory copy already exists (e.g. the entry was previously
+    ///   promoted via `get`), only the DRAM copy is removed — the far copy
+    ///   serves as the backing store and is unaffected.
+    /// - Otherwise the entry is **moved** to far memory (and far is trimmed if
+    ///   it also exceeds its limit).
     fn evict_dram_to_far(&self, inner: &mut Inner<K>) {
         let max = self.config.dram_max_bytes;
         while inner.stats.dram_bytes > max {
@@ -464,20 +532,30 @@ where
                 inner.stats.dram_objects = inner.stats.dram_objects.saturating_sub(1);
                 inner.stats.dram_bytes = inner.stats.dram_bytes.saturating_sub(size as u64);
 
-                // Move to far memory.
-                inner.far_2q.insert(victim_key, size);
-                inner.far_store.insert(victim_key, entry);
-                inner.stats.far_objects += 1;
-                inner.stats.far_bytes += size as u64;
-                inner.stats.evictions_to_far += 1;
+                if inner.far_store.contains_key(&victim_key) {
+                    // Far memory already holds the backing copy — no action needed
+                    // beyond removing the DRAM entry (done above).
+                } else {
+                    // No far copy yet — move the entry to far memory.
+                    inner.far_2q.insert(victim_key, size);
+                    inner.far_store.insert(victim_key, entry);
+                    inner.stats.far_objects += 1;
+                    inner.stats.far_bytes += size as u64;
+                    inner.stats.evictions_to_far += 1;
 
-                // If far memory is also over capacity, evict from far.
-                self.evict_from_far(inner);
+                    // Trim far memory if it also exceeded its limit.
+                    self.evict_from_far(inner);
+                }
             }
         }
     }
 
-    /// Evict objects from far memory entirely until the tier is within its limit.
+    /// Evict objects from far memory until it is within its configured byte
+    /// limit.
+    ///
+    /// Far memory is the **backing authority**: when an entry is evicted from
+    /// far memory, any corresponding DRAM copy is also removed (the object is
+    /// fully and permanently dropped from the cache).
     fn evict_from_far(&self, inner: &mut Inner<K>) {
         let max = self.config.far_max_bytes;
         while inner.stats.far_bytes > max {
@@ -490,6 +568,13 @@ where
                 inner.stats.far_objects = inner.stats.far_objects.saturating_sub(1);
                 inner.stats.far_bytes = inner.stats.far_bytes.saturating_sub(size as u64);
                 inner.stats.evictions_from_far += 1;
+
+                // Far memory is the backing store: also drop any DRAM copy.
+                if inner.dram_store.remove(&victim_key).is_some() {
+                    inner.dram_2q.remove(victim_key);
+                    inner.stats.dram_objects = inner.stats.dram_objects.saturating_sub(1);
+                    inner.stats.dram_bytes = inner.stats.dram_bytes.saturating_sub(size as u64);
+                }
             }
         }
     }
