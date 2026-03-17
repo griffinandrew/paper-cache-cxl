@@ -20,18 +20,20 @@ pub type ExpireTime = Option<Instant>;
 
 #[derive(Clone)]
 pub struct Object<K, V> {
+	/// The key stored in DRAM.  Present only when `key_pmem_value_pmem` is
+	/// **not** enabled; when the feature is active the key lives exclusively
+	/// in persistent memory via `_key_pmem` below.
+	#[cfg(not(feature = "key_pmem_value_pmem"))]
 	key: K,
-	data: Arc<V>,
 
-	expiry: ExpireTime,
-
-	/// When `key_pmem_value_pmem` is enabled, a copy of the key is allocated in
-	/// persistent memory via the Hybrid allocator so that both key data and
-	/// value data each reside in PMEM.  The field is prefixed with `_` because
-	/// its purpose is solely to own the PMEM allocation for the key; the
-	/// live copy of the key used for lookups is the `key` field above.
+	/// When `key_pmem_value_pmem` is enabled the key is owned here, allocated
+	/// directly in persistent memory via the Hybrid allocator.  There is no
+	/// separate DRAM copy of the key in this configuration.
 	#[cfg(feature = "key_pmem_value_pmem")]
 	_key_pmem: Box<K, crate::Hybrid>,
+
+	data: Arc<V>,
+	expiry: ExpireTime,
 }
 
 impl<K, V> Object<K, V> {
