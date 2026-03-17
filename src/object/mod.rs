@@ -25,10 +25,10 @@ pub struct Object<K, V> {
 
 	expiry: ExpireTime,
 
-	/// When `key_value_pmem` is enabled, the key's raw bytes are also allocated
+	/// When `key_pmem_value_pmem` is enabled, the key's raw bytes are also allocated
 	/// in persistent memory via the Hybrid allocator so that both key data and
 	/// value data each reside in their own `BufferPMEM`.
-	#[cfg(feature = "key_value_pmem")]
+	#[cfg(feature = "key_pmem_value_pmem")]
 	key_buf: Box<[u8], crate::Hybrid>,
 }
 
@@ -41,7 +41,7 @@ impl<K, V> Object<K, V> {
 
 		// Allocate the key's raw bytes into PMEM before `key` is moved into
 		// the struct.
-		#[cfg(feature = "key_value_pmem")]
+		#[cfg(feature = "key_pmem_value_pmem")]
 		let key_buf = Self::alloc_key_buf(&key);
 
 		Object {
@@ -50,7 +50,7 @@ impl<K, V> Object<K, V> {
 
 			expiry,
 
-			#[cfg(feature = "key_value_pmem")]
+			#[cfg(feature = "key_pmem_value_pmem")]
 			key_buf,
 		}
 	}
@@ -59,7 +59,7 @@ impl<K, V> Object<K, V> {
 	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self {
 		// Allocate the key's raw bytes into PMEM before `key` is moved into
 		// the struct.
-		#[cfg(feature = "key_value_pmem")]
+		#[cfg(feature = "key_pmem_value_pmem")]
 		let key_buf = Self::alloc_key_buf(&key);
 
 		Object {
@@ -67,7 +67,7 @@ impl<K, V> Object<K, V> {
 			data: Arc::new(data),
 			expiry,
 
-			#[cfg(feature = "key_value_pmem")]
+			#[cfg(feature = "key_pmem_value_pmem")]
 			key_buf,
 		}
 	}
@@ -82,7 +82,7 @@ impl<K, V> Object<K, V> {
 	/// only copy the bit pattern.  Types that contain padding bytes will have
 	/// those padding bytes (which may be uninitialized) included in the PMEM
 	/// copy; for typical key types such as `u32` there is no padding.
-	#[cfg(feature = "key_value_pmem")]
+	#[cfg(feature = "key_pmem_value_pmem")]
 	fn alloc_key_buf(key: &K) -> Box<[u8], crate::Hybrid> {
 		use crate::Hybrid;
 		// SAFETY: `key` is a reference to a fully-initialised value of type
@@ -152,7 +152,7 @@ pub fn get_expiry_from_ttl(ttl: u32) -> Instant {
 // For BufferDRAM (Box<[u8]>)
 impl<K: Default> Default for Object<K, Box<[u8]>> {
 	fn default() -> Self {
-		#[cfg(feature = "key_value_pmem")]
+		#[cfg(feature = "key_pmem_value_pmem")]
 		let key_buf = {
 			use crate::Hybrid;
 			Vec::<u8, Hybrid>::new_in(Hybrid).into_boxed_slice()
@@ -163,7 +163,7 @@ impl<K: Default> Default for Object<K, Box<[u8]>> {
 			data: Arc::new(Vec::new().into_boxed_slice()),
 			expiry: None,
 
-			#[cfg(feature = "key_value_pmem")]
+			#[cfg(feature = "key_pmem_value_pmem")]
 			key_buf,
 		}
 	}
@@ -176,9 +176,9 @@ impl<K: Default> Default for Object<K, Box<[u8], crate::Hybrid>> {
 		use crate::Hybrid;
 		let vec: Vec<u8, Hybrid> = Vec::new_in(Hybrid);
 
-		// For `key_value_pmem`, create an empty key_buf in PMEM for the dummy
+		// For `key_pmem_value_pmem`, create an empty key_buf in PMEM for the dummy
 		// sentinel object used to initialise empty FlatMap buckets.
-		#[cfg(feature = "key_value_pmem")]
+		#[cfg(feature = "key_pmem_value_pmem")]
 		let key_buf = Vec::<u8, Hybrid>::new_in(Hybrid).into_boxed_slice();
 
 		Object {
@@ -186,7 +186,7 @@ impl<K: Default> Default for Object<K, Box<[u8], crate::Hybrid>> {
 			data: Arc::new(vec.into_boxed_slice()),
 			expiry: None,
 
-			#[cfg(feature = "key_value_pmem")]
+			#[cfg(feature = "key_pmem_value_pmem")]
 			key_buf,
 		}
 	}
