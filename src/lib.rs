@@ -59,6 +59,13 @@ mod status;
 #[cfg(any(all(feature = "key_value_pmem", feature = "enable_tiering_manager"), all(feature = "key_value_pmem", feature = "sets_dram")))]
 pub mod tiering;
 
+// Admission tiering: independent DRAM hot tier + far-memory cold tier with 2Q per tier.
+#[cfg(feature = "admission_tiering")]
+pub mod admission_tiering;
+
+#[cfg(feature = "admission_tiering")]
+pub use crate::admission_tiering::{AdmissionTierCache, AdmissionTierConfig, AdmissionTierStats};
+
 // FlatMap module - high-performance Linear Probing Hash Map for PMEM/DRAM
 #[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
 pub mod flatmap;
@@ -182,6 +189,12 @@ pub struct PaperCache<K, V, S = RandomState> {
 	
 	#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
 	tiering_manager: Arc<TieringManager<K, V>>,
+
+	/// When the `admission_tiering` feature is enabled and the cache was
+	/// created via an impl block that supports it, this holds the two-tier
+	/// admission cache that backs all `get`/`set`/`del` operations.
+	#[cfg(feature = "admission_tiering")]
+	admission_tier_manager: Option<Arc<crate::admission_tiering::AdmissionTierCache<K>>>,
 
 	hasher: S,
 }
@@ -371,6 +384,8 @@ where
 			#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
 			tiering_manager,
 
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager: None,
 			hasher,
 		};
 
@@ -843,7 +858,7 @@ where
 #[cfg(all(feature = "all_dram", not(feature = "global_flatmap_dram")))]
 impl<K, S> PaperCache<K, BufferDRAM, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug, //note added Debug for logging might impact perf thoooo
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync, //note added Debug for logging might impact perf thoooo
 	//V: 'static + TypeSize,
 	S: Default + Clone + BuildHasher,
 {
@@ -987,6 +1002,16 @@ where
 
 		thread::spawn(move || worker_manager.run());
 
+		#[cfg(feature = "admission_tiering")]
+		let admission_tier_manager = {
+			let config = crate::admission_tiering::AdmissionTierConfig {
+				dram_max_bytes: max_size / 4,
+				far_max_bytes: max_size,
+				..Default::default()
+			};
+			Some(Arc::new(crate::admission_tiering::AdmissionTierCache::new(config)?))
+		};
+
 		let cache = PaperCache {
 			objects,
 			status,
@@ -997,13 +1022,150 @@ where
 			#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
 			tiering_manager,
 
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager,
+
 			hasher,
 		};
 
 		Ok(cache)
 	}
 
-	/// Returns the current cache version.
+	/// Creates an empty `PaperCache` without an admission tier manager.
+	///
+	/// This is an internal factory used when constructing the inner PaperCache
+	/// instances that back the [`AdmissionTierCache`] tiers.  It is identical to
+	/// [`Self::with_hasher`] except that the admission tier manager is always set
+	/// to `None`, preventing recursive construction.
+	#[cfg(feature = "admission_tiering")]
+	pub(crate) fn with_hasher_tier(
+		max_size: CacheSize,
+		policies: &[PaperPolicy],
+		policy: PaperPolicy,
+		hasher: S,
+	) -> Result<Self, CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		if policies.is_empty() {
+			return Err(CacheError::EmptyPolicies);
+		}
+
+		if policies.contains(&PaperPolicy::Auto) {
+			return Err(CacheError::ConfiguredAutoPolicy);
+		}
+
+		if policies.iter().is_multiset() {
+			return Err(CacheError::DuplicatePolicies);
+		}
+
+		if !policy.is_auto() && !policies.contains(&policy) {
+			return Err(CacheError::UnconfiguredPolicy);
+		}
+
+		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		let (worker_sender, worker_listener) = unbounded();
+
+		let mut worker_manager = WorkerManager::new(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+		)?;
+
+		thread::spawn(move || worker_manager.run());
+
+		// admission_tier_manager is intentionally omitted (None) so that
+		// the inner tier PaperCaches do not recursively create more tiers.
+		let cache = PaperCache {
+			objects,
+			status,
+
+			worker_manager: Arc::new(worker_sender),
+			overhead_manager,
+
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager: None,
+
+			hasher,
+		};
+
+		Ok(cache)
+	}
+
+	/// Like [`Self::with_hasher_tier`] but additionally wires an eviction
+	/// callback into the `PolicyWorker`.  Objects evicted from this cache will
+	/// be passed to `eviction_cb` before being removed from the object store.
+	///
+	/// Used by [`crate::admission_tiering::AdmissionTierCache`] to build the
+	/// DRAM tier so that evicted objects flow into the far-memory tier
+	/// automatically.
+	#[cfg(all(
+		feature = "admission_tiering",
+		not(all(feature = "key_value_pmem", feature = "enable_tiering_manager")),
+	))]
+	pub(crate) fn with_hasher_tier_eviction_cb(
+		max_size: CacheSize,
+		policies: &[PaperPolicy],
+		policy: PaperPolicy,
+		hasher: S,
+		eviction_cb: std::sync::Arc<dyn Fn(&crate::object::Object<K, crate::BufferDRAM>) + Send + Sync>,
+	) -> Result<Self, CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		if policies.is_empty() {
+			return Err(CacheError::EmptyPolicies);
+		}
+
+		if policies.contains(&PaperPolicy::Auto) {
+			return Err(CacheError::ConfiguredAutoPolicy);
+		}
+
+		if policies.iter().is_multiset() {
+			return Err(CacheError::DuplicatePolicies);
+		}
+
+		if !policy.is_auto() && !policies.contains(&policy) {
+			return Err(CacheError::UnconfiguredPolicy);
+		}
+
+		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		let (worker_sender, worker_listener) = unbounded();
+
+		let mut worker_manager = WorkerManager::new_with_eviction_cb(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+			eviction_cb,
+		)?;
+
+		thread::spawn(move || worker_manager.run());
+
+		let cache = PaperCache {
+			objects,
+			status,
+
+			worker_manager: Arc::new(worker_sender),
+			overhead_manager,
+
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager: None,
+
+			hasher,
+		};
+
+		Ok(cache)
+	}
 	///
 	/// # Examples
 	/// ```
@@ -1069,6 +1231,18 @@ where
 	{
 		let hashed_key = self.hash_key(key);
 
+		// Admission tiering: route get through the two-tier admission cache.
+		#[cfg(feature = "admission_tiering")]
+		if let Some(atm) = &self.admission_tier_manager {
+			let result = atm.get(key);
+			match &result {
+				Ok(_) => self.status.incr_hits(),
+				Err(_) => self.status.incr_misses(),
+			}
+			self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+			return result;
+		}
+
 		// all_dram implementation - no tiering, all data in DRAM
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
@@ -1116,6 +1290,23 @@ where
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
+
+		// Admission tiering: route set through the two-tier admission cache.
+		#[cfg(feature = "admission_tiering")]
+		if let Some(atm) = &self.admission_tier_manager {
+			let size = value.len() as u32;
+			if size == 0 { return Err(CacheError::ZeroValueSize); }
+			if self.status.exceeds_max_size(size) { return Err(CacheError::ExceedingValueSize); }
+			let expiry = ttl
+				.filter(|&t| t > 0)
+				.map(|t| std::time::Instant::now() + std::time::Duration::from_secs(t as u64));
+			self.status.incr_sets();
+			self.status.incr_num_objects();
+			self.status.update_base_used_size(size as i64);
+			atm.set(key, value, ttl)?;
+			self.broadcast(WorkerEvent::Set(hashed_key, size, expiry, None))?;
+			return Ok(());
+		}
 
 		//allocate it as a regular buffer... 
 		let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
@@ -1182,6 +1373,15 @@ where
 	pub fn del(&self, key: &K) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(key);
 
+		// Admission tiering: route del through the two-tier admission cache.
+		#[cfg(feature = "admission_tiering")]
+		if let Some(atm) = &self.admission_tier_manager {
+			atm.del(key)?;
+			self.status.incr_dels();
+			self.broadcast(WorkerEvent::Del(hashed_key, None))?;
+			return Ok(());
+		}
+
 		let (removed_hashed_key, object) = erase(
 			&self.objects,
 			&self.status,
@@ -1215,6 +1415,12 @@ where
 	/// ```
 	pub fn has(&self, key: &K) -> bool {
 		let hashed_key = self.hash_key(key);
+
+		// Admission tiering: check both tiers without retrieving value data.
+		#[cfg(feature = "admission_tiering")]
+		if let Some(atm) = &self.admission_tier_manager {
+			return atm.has(key);
+		}
 
 		self.objects
 			.get(&hashed_key)
@@ -1429,6 +1635,13 @@ where
 		}
 
 		Ok(())
+	}
+
+	/// Returns the admission tier cache statistics.
+	/// Only available when the `admission_tiering` feature is enabled.
+	#[cfg(feature = "admission_tiering")]
+	pub fn admission_tiering_stats(&self) -> Option<crate::admission_tiering::AdmissionTierStats> {
+		self.admission_tier_manager.as_ref().map(|atm| atm.stats())
 	}
 
 	fn hash_key(&self, key: &K) -> HashedKey {
@@ -1674,6 +1887,9 @@ where
 
 		thread::spawn(move || worker_manager.run());
 
+		#[cfg(feature = "admission_tiering")]
+		let admission_tier_manager: Option<Arc<crate::admission_tiering::AdmissionTierCache<K>>> = None;
+
 		let cache = PaperCache {
 			objects,
 			status,
@@ -1683,6 +1899,9 @@ where
 			
 			#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
 			tiering_manager,
+
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager,
 
 			hasher,
 		};
@@ -1801,6 +2020,18 @@ where
 	{
 		let hashed_key = self.hash_key(key);
 
+		// Admission tiering: route get through the two-tier admission cache.
+		#[cfg(feature = "admission_tiering")]
+		if let Some(atm) = &self.admission_tier_manager {
+			let result = atm.get(key);
+			match &result {
+				Ok(_) => self.status.incr_hits(),
+				Err(_) => self.status.incr_misses(),
+			}
+			self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+			return result;
+		}
+
 		// Check DRAM tier first
 		#[cfg(all(feature = "enable_tiering_manager", not(feature = "hashtable_tiering")))]
 		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
@@ -1880,6 +2111,23 @@ where
 		K: 'static + Eq + Hash + TypeSize + std::fmt::Debug,
 	{
 		let hashed_key = self.hash_key(&key);
+
+		// Admission tiering: route set through the two-tier admission cache.
+		#[cfg(feature = "admission_tiering")]
+		if let Some(atm) = &self.admission_tier_manager {
+			let size = value.len() as u32;
+			if size == 0 { return Err(CacheError::ZeroValueSize); }
+			if self.status.exceeds_max_size(size) { return Err(CacheError::ExceedingValueSize); }
+			let expiry = ttl
+				.filter(|&t| t > 0)
+				.map(|t| std::time::Instant::now() + std::time::Duration::from_secs(t as u64));
+			self.status.incr_sets();
+			self.status.incr_num_objects();
+			self.status.update_base_used_size(size as i64);
+			atm.set(key, value, ttl)?;
+			self.broadcast(WorkerEvent::Set(hashed_key, size, expiry, None))?;
+			return Ok(());
+		}
 
 		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
 
@@ -1983,6 +2231,15 @@ where
 	
 	pub fn del(&self, key: &K) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(key);
+
+		// Admission tiering: route del through the two-tier admission cache.
+		#[cfg(feature = "admission_tiering")]
+		if let Some(atm) = &self.admission_tier_manager {
+			atm.del(key)?;
+			self.status.incr_dels();
+			self.broadcast(WorkerEvent::Del(hashed_key, None))?;
+			return Ok(());
+		}
 
 		let (removed_hashed_key, object) = erase(
 			&self.objects,
@@ -2268,6 +2525,13 @@ where
 		Ok(())
 	}
 
+	/// Returns the admission tier cache statistics.
+	/// Only available when the `admission_tiering` feature is enabled.
+	#[cfg(feature = "admission_tiering")]
+	pub fn admission_tiering_stats(&self) -> Option<crate::admission_tiering::AdmissionTierStats> {
+		self.admission_tier_manager.as_ref().map(|atm| atm.stats())
+	}
+
 	fn hash_key(&self, key: &K) -> HashedKey {
 		self.hasher.hash_one(key)
 	}
@@ -2350,6 +2614,8 @@ where
 			status,
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager: None,
 			hasher,
 		};
 
@@ -2627,6 +2893,8 @@ where
 			status,
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager: None,
 			hasher,
 		};
 
@@ -2993,6 +3261,8 @@ where
 			#[cfg(feature = "enable_tiering_manager")]
 			tiering_manager,
 
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager: None,
 			hasher,
 		};
 
@@ -3570,6 +3840,8 @@ where
 			status,
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager: None,
 			hasher,
 		};
 
@@ -3843,6 +4115,8 @@ where
 			status,
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager: None,
 			hasher,
 		};
 
@@ -4121,6 +4395,8 @@ where
 			status,
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager: None,
 			hasher,
 		};
 

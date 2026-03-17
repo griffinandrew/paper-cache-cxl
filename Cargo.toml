@@ -74,6 +74,10 @@ hashtable_tiering = []
 
 sets_dram = []
 
+# Admission tiering: standalone two-tier cache (DRAM hot tier + far-memory cold tier)
+# with independent 2Q eviction structures per tier.  Toggle with this single feature.
+admission_tiering = []
+
 # Legacy features (deprecated, will be removed)
 default = []
 original = []
