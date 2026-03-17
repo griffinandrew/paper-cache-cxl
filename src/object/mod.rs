@@ -25,77 +25,94 @@ pub struct Object<K, V> {
 
 	expiry: ExpireTime,
 
-	/// When `key_pmem_value_pmem` is enabled, the key's raw bytes are also allocated
-	/// in persistent memory via the Hybrid allocator so that both key data and
-	/// value data each reside in their own `BufferPMEM`.
+	/// When `key_pmem_value_pmem` is enabled, a copy of the key is allocated in
+	/// persistent memory via the Hybrid allocator so that both key data and
+	/// value data each reside in PMEM.  The field is prefixed with `_` because
+	/// its purpose is solely to own the PMEM allocation for the key; the
+	/// live copy of the key used for lookups is the `key` field above.
 	#[cfg(feature = "key_pmem_value_pmem")]
-	key_buf: Box<[u8], crate::Hybrid>,
+	_key_pmem: Box<K, crate::Hybrid>,
 }
 
 impl<K, V> Object<K, V> {
+	/// Create a new Object.
+	///
+	/// When `key_pmem_value_pmem` is **not** enabled this method has no
+	/// additional bounds.
+	#[cfg(not(feature = "key_pmem_value_pmem"))]
 	pub fn new(key: K, data: V, ttl: Option<u32>) -> Self {
 		let expiry = match ttl {
 			Some(0) | None => None,
 			Some(ttl) => Some(get_expiry_from_ttl(ttl)),
 		};
 
-		// Allocate the key's raw bytes into PMEM before `key` is moved into
-		// the struct.
-		#[cfg(feature = "key_pmem_value_pmem")]
-		let key_buf = Self::alloc_key_buf(&key);
-
-		Object {
-			key,
-			data: Arc::new(data),
-
-			expiry,
-
-			#[cfg(feature = "key_pmem_value_pmem")]
-			key_buf,
-		}
-	}
-
-	/// Create a new Object with an explicit expiry time
-	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self {
-		// Allocate the key's raw bytes into PMEM before `key` is moved into
-		// the struct.
-		#[cfg(feature = "key_pmem_value_pmem")]
-		let key_buf = Self::alloc_key_buf(&key);
-
 		Object {
 			key,
 			data: Arc::new(data),
 			expiry,
-
-			#[cfg(feature = "key_pmem_value_pmem")]
-			key_buf,
 		}
 	}
 
-	/// Allocates the raw bytes of `key` into persistent memory via the Hybrid
-	/// allocator, returning a `Box<[u8], Hybrid>` that keeps the key data
-	/// in PMEM alongside the value `BufferPMEM`.
+	/// Create a new Object.
 	///
-	/// # Safety note
-	/// The byte slice is obtained by reinterpreting the memory of `key` as
-	/// `[u8]`.  This is sound for any fully-initialised `K: Sized` because we
-	/// only copy the bit pattern.  Types that contain padding bytes will have
-	/// those padding bytes (which may be uninitialized) included in the PMEM
-	/// copy; for typical key types such as `u32` there is no padding.
+	/// When `key_pmem_value_pmem` is enabled the key is cloned into a
+	/// Hybrid-allocated PMEM region so that it resides in persistent memory
+	/// alongside the value.  This requires `K: Clone` but contains no unsafe
+	/// code.
 	#[cfg(feature = "key_pmem_value_pmem")]
-	fn alloc_key_buf(key: &K) -> Box<[u8], crate::Hybrid> {
+	pub fn new(key: K, data: V, ttl: Option<u32>) -> Self
+	where
+		K: Clone,
+	{
 		use crate::Hybrid;
-		// SAFETY: `key` is a reference to a fully-initialised value of type
-		// `K`.  Reinterpreting its bytes as `[u8]` is sound – we are merely
-		// copying the bit pattern, not constructing any value that could be
-		// invalid.
-		let key_bytes = unsafe {
-			std::slice::from_raw_parts(
-				key as *const K as *const u8,
-				std::mem::size_of::<K>(),
-			)
+
+		let expiry = match ttl {
+			Some(0) | None => None,
+			Some(ttl) => Some(get_expiry_from_ttl(ttl)),
 		};
-		key_bytes.to_vec_in(Hybrid).into_boxed_slice()
+
+		let _key_pmem = Box::new_in(key.clone(), Hybrid);
+
+		Object {
+			key,
+			data: Arc::new(data),
+			expiry,
+			_key_pmem,
+		}
+	}
+
+	/// Create a new Object with an explicit expiry time.
+	///
+	/// When `key_pmem_value_pmem` is **not** enabled this method has no
+	/// additional bounds.
+	#[cfg(not(feature = "key_pmem_value_pmem"))]
+	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self {
+		Object {
+			key,
+			data: Arc::new(data),
+			expiry,
+		}
+	}
+
+	/// Create a new Object with an explicit expiry time.
+	///
+	/// When `key_pmem_value_pmem` is enabled the key is cloned into PMEM.
+	/// Requires `K: Clone`; contains no unsafe code.
+	#[cfg(feature = "key_pmem_value_pmem")]
+	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self
+	where
+		K: Clone,
+	{
+		use crate::Hybrid;
+
+		let _key_pmem = Box::new_in(key.clone(), Hybrid);
+
+		Object {
+			key,
+			data: Arc::new(data),
+			expiry,
+			_key_pmem,
+		}
 	}
 
 	pub fn data(&self) -> Arc<V> {
@@ -153,9 +170,9 @@ pub fn get_expiry_from_ttl(ttl: u32) -> Instant {
 impl<K: Default> Default for Object<K, Box<[u8]>> {
 	fn default() -> Self {
 		#[cfg(feature = "key_pmem_value_pmem")]
-		let key_buf = {
+		let _key_pmem = {
 			use crate::Hybrid;
-			Vec::<u8, Hybrid>::new_in(Hybrid).into_boxed_slice()
+			Box::new_in(K::default(), Hybrid)
 		};
 
 		Object {
@@ -164,7 +181,7 @@ impl<K: Default> Default for Object<K, Box<[u8]>> {
 			expiry: None,
 
 			#[cfg(feature = "key_pmem_value_pmem")]
-			key_buf,
+			_key_pmem,
 		}
 	}
 }
@@ -176,10 +193,10 @@ impl<K: Default> Default for Object<K, Box<[u8], crate::Hybrid>> {
 		use crate::Hybrid;
 		let vec: Vec<u8, Hybrid> = Vec::new_in(Hybrid);
 
-		// For `key_pmem_value_pmem`, create an empty key_buf in PMEM for the dummy
-		// sentinel object used to initialise empty FlatMap buckets.
+		// For `key_pmem_value_pmem`, allocate a default key in PMEM for the
+		// dummy sentinel object used to initialise empty FlatMap buckets.
 		#[cfg(feature = "key_pmem_value_pmem")]
-		let key_buf = Vec::<u8, Hybrid>::new_in(Hybrid).into_boxed_slice();
+		let _key_pmem = Box::new_in(K::default(), Hybrid);
 
 		Object {
 			key: K::default(),
@@ -187,7 +204,7 @@ impl<K: Default> Default for Object<K, Box<[u8], crate::Hybrid>> {
 			expiry: None,
 
 			#[cfg(feature = "key_pmem_value_pmem")]
-			key_buf,
+			_key_pmem,
 		}
 	}
 }
