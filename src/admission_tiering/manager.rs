@@ -82,8 +82,34 @@ use std::{
     time::{Instant, Duration},
 };
 
-use crate::{HashedKey, CacheError, CacheSize};
+use crate::{HashedKey, CacheError, CacheSize, NoHasher};
 use super::two_q::AdmissionTwoQ;
+
+// ─── Far-memory store type ─────────────────────────────────────────────────────
+//
+// When any PMEM/hybrid feature is active the far-memory hashtable is backed by
+// the UMF hybrid allocator so that entries live in CXL/far memory rather than
+// DRAM.  In pure-DRAM builds it falls back to a regular hashbrown HashMap.
+
+#[cfg(any(
+    feature = "key_value_pmem",
+    feature = "global_hashtable_pmem",
+    feature = "tiering_hashtable_pmem",
+    feature = "flatmap_pmem",
+    feature = "global_flatmap_pmem",
+    feature = "eviction_stacks_pmem",
+))]
+type FarStore<K> = hashbrown::HashMap<HashedKey, TierEntry<K>, NoHasher, crate::allocator::HybridObjects>;
+
+#[cfg(not(any(
+    feature = "key_value_pmem",
+    feature = "global_hashtable_pmem",
+    feature = "tiering_hashtable_pmem",
+    feature = "flatmap_pmem",
+    feature = "global_flatmap_pmem",
+    feature = "eviction_stacks_pmem",
+)))]
+type FarStore<K> = hashbrown::HashMap<HashedKey, TierEntry<K>, NoHasher>;
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -192,7 +218,7 @@ impl<K> TierEntry<K> {
 
 struct Inner<K> {
     dram_store: HashMap<HashedKey, TierEntry<K>>,
-    far_store: HashMap<HashedKey, TierEntry<K>>,
+    far_store: FarStore<K>,
     dram_2q: AdmissionTwoQ,
     far_2q: AdmissionTwoQ,
     stats: AdmissionTierStats,
@@ -202,7 +228,24 @@ impl<K> Inner<K> {
     fn new(config: &AdmissionTierConfig) -> Self {
         Inner {
             dram_store: HashMap::new(),
-            far_store: HashMap::new(),
+            #[cfg(any(
+                feature = "key_value_pmem",
+                feature = "global_hashtable_pmem",
+                feature = "tiering_hashtable_pmem",
+                feature = "flatmap_pmem",
+                feature = "global_flatmap_pmem",
+                feature = "eviction_stacks_pmem",
+            ))]
+            far_store: hashbrown::HashMap::with_hasher_in(NoHasher::default(), crate::allocator::HybridObjects),
+            #[cfg(not(any(
+                feature = "key_value_pmem",
+                feature = "global_hashtable_pmem",
+                feature = "tiering_hashtable_pmem",
+                feature = "flatmap_pmem",
+                feature = "global_flatmap_pmem",
+                feature = "eviction_stacks_pmem",
+            )))]
+            far_store: hashbrown::HashMap::with_hasher(NoHasher::default()),
             dram_2q: AdmissionTwoQ::new(config.dram_max_bytes, config.k_in, config.k_out),
             far_2q: AdmissionTwoQ::new(config.far_max_bytes, config.k_in, config.k_out),
             stats: AdmissionTierStats::default(),
