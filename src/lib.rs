@@ -1009,7 +1009,23 @@ where
 				far_max_bytes: max_size,
 				..Default::default()
 			};
-			Some(Arc::new(crate::admission_tiering::AdmissionTierCache::new(config)))
+			let dram_pc = PaperCache::<K, Box<[u8]>, std::hash::RandomState>::with_hasher_tier(
+				config.dram_max_bytes,
+				&[PaperPolicy::TwoQ(config.k_in, config.k_out)],
+				PaperPolicy::TwoQ(config.k_in, config.k_out),
+				std::hash::RandomState::default(),
+			)?;
+			let far_pc = PaperCache::<K, Box<[u8]>, std::hash::RandomState>::with_hasher_tier(
+				config.far_max_bytes,
+				&[PaperPolicy::Lru],
+				PaperPolicy::Lru,
+				std::hash::RandomState::default(),
+			)?;
+			Some(Arc::new(crate::admission_tiering::AdmissionTierCache::with_caches(
+				Arc::new(dram_pc),
+				Arc::new(far_pc),
+				config,
+			)))
 		};
 
 		let cache = PaperCache {
@@ -1030,6 +1046,73 @@ where
 
 		Ok(cache)
 	}
+
+	/// Creates an empty `PaperCache` without an admission tier manager.
+	///
+	/// This is an internal factory used when constructing the inner PaperCache
+	/// instances that back the [`AdmissionTierCache`] tiers.  It is identical to
+	/// [`Self::with_hasher`] except that the admission tier manager is always set
+	/// to `None`, preventing recursive construction.
+	#[cfg(feature = "admission_tiering")]
+	pub(crate) fn with_hasher_tier(
+		max_size: CacheSize,
+		policies: &[PaperPolicy],
+		policy: PaperPolicy,
+		hasher: S,
+	) -> Result<Self, CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		if policies.is_empty() {
+			return Err(CacheError::EmptyPolicies);
+		}
+
+		if policies.contains(&PaperPolicy::Auto) {
+			return Err(CacheError::ConfiguredAutoPolicy);
+		}
+
+		if policies.iter().is_multiset() {
+			return Err(CacheError::DuplicatePolicies);
+		}
+
+		if !policy.is_auto() && !policies.contains(&policy) {
+			return Err(CacheError::UnconfiguredPolicy);
+		}
+
+		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		let (worker_sender, worker_listener) = unbounded();
+
+		let mut worker_manager = WorkerManager::new(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+		)?;
+
+		thread::spawn(move || worker_manager.run());
+
+		// admission_tier_manager is intentionally omitted (None) so that
+		// the inner tier PaperCaches do not recursively create more tiers.
+		let cache = PaperCache {
+			objects,
+			status,
+
+			worker_manager: Arc::new(worker_sender),
+			overhead_manager,
+
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager: None,
+
+			hasher,
+		};
+
+		Ok(cache)
+	}
+
 
 	/// Returns the current cache version.
 	///
@@ -1754,14 +1837,7 @@ where
 		thread::spawn(move || worker_manager.run());
 
 		#[cfg(feature = "admission_tiering")]
-		let admission_tier_manager = {
-			let config = crate::admission_tiering::AdmissionTierConfig {
-				dram_max_bytes: max_size / 4,
-				far_max_bytes: max_size,
-				..Default::default()
-			};
-			Some(Arc::new(crate::admission_tiering::AdmissionTierCache::new(config)))
-		};
+		let admission_tier_manager: Option<Arc<crate::admission_tiering::AdmissionTierCache<K>>> = None;
 
 		let cache = PaperCache {
 			objects,

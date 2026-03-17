@@ -7,9 +7,9 @@
 
 //! Admission Tiering Module
 //!
-//! Provides [`AdmissionTierCache`] — a standalone, independent two-tier cache
-//! that implements an admission policy with a DRAM hot tier and a far-memory
-//! cold tier. Each tier is governed by its own 2Q eviction structure.
+//! Provides [`AdmissionTierCache`] — a two-tier cache backed by inner
+//! PaperCache instances.  Each tier's PaperCache manages its own eviction-
+//! policy worker so that `get` events flow into the policy stacks automatically.
 //!
 //! Enable with the `admission_tiering` feature flag.
 //!
@@ -19,22 +19,23 @@
 //!   set(key, value)
 //!        │
 //!        ▼
-//!   ┌──────────┐   eviction    ┌──────────────┐   eviction
-//!   │  DRAM    │  ──────────►  │  Far Memory  │  ──────────► (deleted)
-//!   │  (hot)   │               │  (cold)      │
-//!   │  2Q LRU  │  ◄──────────  │  2Q LRU      │
-//!   └──────────┘   promotion   └──────────────┘
-//!        │                            │
-//!        ▼                            ▼
-//!   get() fast path            get() slow path
+//!   ┌──────────────────┐           ┌───────────────────┐
+//!   │  DRAM PaperCache │  eviction │  Far PaperCache   │  eviction
+//!   │  (hot, 2Q)       │ ────────► │  (shadow, LRU)    │ ──────────► (deleted)
+//!   └──────────────────┘           └───────────────────┘
+//!        │ WorkerEvent::Get              │ WorkerEvent::Get
+//!        ▼                              ▼
+//!   policy stack updated           policy stack updated
 //! ```
 //!
-//! - **`set`**: new objects go to DRAM only.
-//! - **DRAM eviction**: coldest DRAM objects move to far memory.
+//! - **`set`**: new objects go to both DRAM and far (shadow copy).
+//! - **DRAM eviction**: handled automatically by the DRAM PaperCache worker.
 //! - **Far-memory access**: hot far-memory objects are promoted back to DRAM.
-//! - **Far-memory eviction**: coldest far-memory objects are permanently removed.
+//! - **Far-memory eviction**: handled automatically by the far PaperCache worker.
 
 pub mod manager;
+// two_q is kept as a standalone module; its tests remain valid as unit tests
+// for the 2Q algorithm independent of the tier cache.
 mod two_q;
 
 pub use manager::{AdmissionTierCache, AdmissionTierConfig, AdmissionTierStats};
