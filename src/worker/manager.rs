@@ -192,6 +192,56 @@ impl WorkerManager {
 
 		Ok(manager)
 	}
+
+	/// Creates a `WorkerManager` where the `PolicyWorker` is configured with
+	/// an eviction callback.  This is used for the DRAM tier PaperCache inside
+	/// [`crate::admission_tiering::AdmissionTierCache`] so that objects evicted
+	/// from DRAM are automatically forwarded to the far-memory tier.
+	#[cfg(all(
+		feature = "admission_tiering",
+		not(all(feature = "key_value_pmem", feature = "enable_tiering_manager")),
+	))]
+	pub fn new_with_eviction_cb<K, V>(
+		listener: WorkerReceiver,
+		objects: &ObjectMapRef<K, V>,
+		status: &StatusRef,
+		overhead_manager: &OverheadManagerRef,
+		eviction_cb: std::sync::Arc<dyn Fn(&crate::object::Object<K, V>) + Send + Sync>,
+	) -> Result<Self, CacheError>
+	where
+		K: 'static + Eq + TypeSize,
+		V: 'static + TypeSize + Clone,
+	{
+		let (policy_worker, policy_listener) = unbounded();
+		let (ttl_worker, ttl_listener) = unbounded();
+
+		register_worker(PolicyWorker::<K, V>::new_with_eviction_cb(
+			policy_listener,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+			eviction_cb,
+		)?);
+
+		register_worker(TtlWorker::<K, V>::new(
+			ttl_listener,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+		));
+
+		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
+			policy_worker,
+			ttl_worker,
+		]));
+
+		let manager = WorkerManager {
+			listener,
+			workers,
+		};
+
+		Ok(manager)
+	}
 }
 
 unsafe impl Send for WorkerManager {}

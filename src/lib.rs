@@ -858,7 +858,7 @@ where
 #[cfg(all(feature = "all_dram", not(feature = "global_flatmap_dram")))]
 impl<K, S> PaperCache<K, BufferDRAM, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone, //note added Debug for logging might impact perf thoooo
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync, //note added Debug for logging might impact perf thoooo
 	//V: 'static + TypeSize,
 	S: Default + Clone + BuildHasher,
 {
@@ -1009,23 +1009,7 @@ where
 				far_max_bytes: max_size,
 				..Default::default()
 			};
-			let dram_pc = PaperCache::<K, Box<[u8]>, std::hash::RandomState>::with_hasher_tier(
-				config.dram_max_bytes,
-				&[PaperPolicy::TwoQ(config.k_in, config.k_out)],
-				PaperPolicy::TwoQ(config.k_in, config.k_out),
-				std::hash::RandomState::default(),
-			)?;
-			let far_pc = PaperCache::<K, Box<[u8]>, std::hash::RandomState>::with_hasher_tier(
-				config.far_max_bytes,
-				&[PaperPolicy::Lru],
-				PaperPolicy::Lru,
-				std::hash::RandomState::default(),
-			)?;
-			Some(Arc::new(crate::admission_tiering::AdmissionTierCache::with_caches(
-				Arc::new(dram_pc),
-				Arc::new(far_pc),
-				config,
-			)))
+			Some(Arc::new(crate::admission_tiering::AdmissionTierCache::new(config)?))
 		};
 
 		let cache = PaperCache {
@@ -1113,8 +1097,75 @@ where
 		Ok(cache)
 	}
 
+	/// Like [`Self::with_hasher_tier`] but additionally wires an eviction
+	/// callback into the `PolicyWorker`.  Objects evicted from this cache will
+	/// be passed to `eviction_cb` before being removed from the object store.
+	///
+	/// Used by [`crate::admission_tiering::AdmissionTierCache`] to build the
+	/// DRAM tier so that evicted objects flow into the far-memory tier
+	/// automatically.
+	#[cfg(all(
+		feature = "admission_tiering",
+		not(all(feature = "key_value_pmem", feature = "enable_tiering_manager")),
+	))]
+	pub(crate) fn with_hasher_tier_eviction_cb(
+		max_size: CacheSize,
+		policies: &[PaperPolicy],
+		policy: PaperPolicy,
+		hasher: S,
+		eviction_cb: std::sync::Arc<dyn Fn(&crate::object::Object<K, crate::BufferDRAM>) + Send + Sync>,
+	) -> Result<Self, CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
 
-	/// Returns the current cache version.
+		if policies.is_empty() {
+			return Err(CacheError::EmptyPolicies);
+		}
+
+		if policies.contains(&PaperPolicy::Auto) {
+			return Err(CacheError::ConfiguredAutoPolicy);
+		}
+
+		if policies.iter().is_multiset() {
+			return Err(CacheError::DuplicatePolicies);
+		}
+
+		if !policy.is_auto() && !policies.contains(&policy) {
+			return Err(CacheError::UnconfiguredPolicy);
+		}
+
+		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		let (worker_sender, worker_listener) = unbounded();
+
+		let mut worker_manager = WorkerManager::new_with_eviction_cb(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+			eviction_cb,
+		)?;
+
+		thread::spawn(move || worker_manager.run());
+
+		let cache = PaperCache {
+			objects,
+			status,
+
+			worker_manager: Arc::new(worker_sender),
+			overhead_manager,
+
+			#[cfg(feature = "admission_tiering")]
+			admission_tier_manager: None,
+
+			hasher,
+		};
+
+		Ok(cache)
+	}
 	///
 	/// # Examples
 	/// ```

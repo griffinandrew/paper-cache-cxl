@@ -18,14 +18,13 @@
 //! # Object lifecycle
 //!
 //! ```text
-//! set(key) ──► DRAM tier PaperCache (2Q)
-//!              AND
-//!              Far tier PaperCache  (LRU) ← shadow copy
+//! set(key) ──► DRAM tier PaperCache only (2Q policy)
 //!
-//! get hit DRAM ──► DRAM stack refreshed via WorkerEvent::Get
-//!                  far stack also refreshed to keep shadow copy warm
-//! get hit far  ──► far stack refreshed via WorkerEvent::Get
-//!                  copy promoted to DRAM tier PaperCache
+//! DRAM eviction ──► eviction callback fires ──► written to far-memory tier
+//!
+//! get hit DRAM ──► DRAM 2Q stack refreshed via WorkerEvent::Get
+//! get hit far  ──► far LRU stack refreshed via WorkerEvent::Get
+//!                  copy promoted back to DRAM tier PaperCache
 //! ```
 //!
 //! # Independence
@@ -79,21 +78,19 @@ impl Default for AdmissionTierConfig {
 
 /// Runtime statistics for the admission tier cache.
 ///
-/// `dram_objects`/`dram_bytes` and `far_objects`/`far_bytes` reflect the live
-/// status of the inner PaperCache tiers, so their sum can exceed the number of
-/// unique logical objects when an object is present in both tiers simultaneously.
+/// Objects in the far-memory tier only arrived there via DRAM eviction.
+/// An object is never simultaneously present in both tiers.
 #[derive(Clone, Debug, Default)]
 pub struct AdmissionTierStats {
     /// Current number of physical entries in the DRAM tier.
     pub dram_objects: u64,
     /// Current byte usage in the DRAM tier.
     pub dram_bytes: u64,
-    /// Current number of physical entries in the far-memory tier
-    /// (includes objects that also have a DRAM copy).
+    /// Current number of physical entries in the far-memory tier.
     pub far_objects: u64,
     /// Current byte usage in the far-memory tier.
     pub far_bytes: u64,
-    /// Cumulative count of promotions: far-memory objects copied to DRAM.
+    /// Cumulative count of promotions: far-memory objects copied back to DRAM.
     pub promotions_to_dram: u64,
     /// Cumulative `get` hits served from the DRAM tier.
     pub dram_hits: u64,
@@ -113,12 +110,16 @@ pub struct AdmissionTierStats {
 /// Each PaperCache tier runs its own policy worker thread.  `get` events
 /// propagate into those workers automatically — the admission tier model
 /// decides *which* tier to consult and delegates ordering to the policy stacks.
+///
+/// Objects **only** enter the far-memory tier when they are evicted from the
+/// DRAM tier — never on an initial `set`.
 pub struct AdmissionTierCache<K> {
     /// Hot DRAM tier backed by a PaperCache with a 2Q eviction policy.
+    /// Its `PolicyWorker` is wired with an eviction callback that writes
+    /// evicted objects to `far_cache`.
     dram_cache: Arc<crate::PaperCache<K, crate::BufferDRAM, RandomState>>,
     /// Cold far-memory tier backed by a PaperCache with an LRU eviction policy.
-    /// Holds a shadow copy of every object so that DRAM evictions are
-    /// non-destructive.
+    /// Only contains objects that were evicted from the DRAM tier.
     far_cache: Arc<crate::PaperCache<K, crate::BufferDRAM, RandomState>>,
 
     config: AdmissionTierConfig,
@@ -137,25 +138,23 @@ pub struct AdmissionTierCache<K> {
 ///
 /// Requires the `all_dram` feature (and not `global_flatmap_dram`) so that
 /// the DRAM-backed PaperCache impl is available.
-#[cfg(all(feature = "all_dram", not(feature = "global_flatmap_dram")))]
+#[cfg(all(
+    feature = "all_dram",
+    not(feature = "global_flatmap_dram"),
+    not(all(feature = "key_value_pmem", feature = "enable_tiering_manager")),
+))]
 impl<K> AdmissionTierCache<K>
 where
-    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone,
+    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
 {
     /// Create a new cache with the supplied configuration.
     ///
-    /// Both the DRAM and far-memory tier PaperCaches are constructed here with
-    /// appropriate capacity limits and policies derived from `config`.
+    /// Objects `set()` into this cache are written to the DRAM tier only.
+    /// When the DRAM tier evicts an object, the eviction callback automatically
+    /// writes it to the far-memory tier, so objects only ever enter far-memory
+    /// via DRAM eviction.
     pub fn new(config: AdmissionTierConfig) -> Result<Self, CacheError> {
-        let dram_cache = Arc::new(
-            crate::PaperCache::<K, crate::BufferDRAM, RandomState>::with_hasher_tier(
-                config.dram_max_bytes,
-                &[PaperPolicy::TwoQ(config.k_in, config.k_out)],
-                PaperPolicy::TwoQ(config.k_in, config.k_out),
-                RandomState::default(),
-            )?,
-        );
-
+        // Build the far-memory tier first (no eviction callback needed).
         let far_cache = Arc::new(
             crate::PaperCache::<K, crate::BufferDRAM, RandomState>::with_hasher_tier(
                 config.far_max_bytes,
@@ -165,13 +164,36 @@ where
             )?,
         );
 
+        // Build the DRAM tier with an eviction callback that forwards evicted
+        // objects to far_cache.  The closure captures an Arc so it does not
+        // hold a borrow on Self.
+        let far_for_cb = Arc::clone(&far_cache);
+        let eviction_cb: Arc<dyn Fn(&crate::object::Object<K, crate::BufferDRAM>) + Send + Sync> =
+            Arc::new(move |object| {
+                let key = object.key().clone();
+                let data = object.data();
+                // Ignore errors: e.g. far tier is full or value is zero-size.
+                let _ = far_for_cb.set(key, &data, None);
+            });
+
+        let dram_cache = Arc::new(
+            crate::PaperCache::<K, crate::BufferDRAM, RandomState>::with_hasher_tier_eviction_cb(
+                config.dram_max_bytes,
+                &[PaperPolicy::TwoQ(config.k_in, config.k_out)],
+                PaperPolicy::TwoQ(config.k_in, config.k_out),
+                RandomState::default(),
+                eviction_cb,
+            )?,
+        );
+
         Ok(Self::with_caches(dram_cache, far_cache, config))
     }
 
     /// Construct from pre-built tier PaperCaches.
     ///
-    /// This is the preferred path when the outer `PaperCache` already has an
-    /// appropriate hasher available and wants to share configuration.
+    /// The caller is responsible for wiring the DRAM PaperCache's eviction
+    /// callback to forward evicted items to `far_cache` if that behaviour is
+    /// desired.
     pub(crate) fn with_caches(
         dram_cache: Arc<crate::PaperCache<K, crate::BufferDRAM, RandomState>>,
         far_cache: Arc<crate::PaperCache<K, crate::BufferDRAM, RandomState>>,
@@ -198,37 +220,28 @@ where
 #[cfg(all(feature = "all_dram", not(feature = "global_flatmap_dram")))]
 impl<K> AdmissionTierCache<K>
 where
-    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone,
+    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
 {
     /// Insert or update a key-value pair.
     ///
-    /// The object is written to **both** tiers simultaneously: the DRAM tier
-    /// stores the hot copy and the far-memory tier stores a shadow copy.  This
-    /// ensures that DRAM evictions are non-destructive — when the DRAM
-    /// PaperCache evicts an entry, the far-memory PaperCache still holds it.
+    /// The object is written to the **DRAM tier only**.  It will enter the
+    /// far-memory tier automatically if and when the DRAM `PolicyWorker`
+    /// evicts it (via the eviction callback registered at construction time).
     ///
     /// # Errors
     /// - [`CacheError::ZeroValueSize`] — `value` is empty.
     pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-        // Write to the hot DRAM tier first.
-        self.dram_cache.set(key.clone(), value, ttl)?;
-        // Write a shadow copy to the cold far-memory tier.
-        // Ignore errors here (e.g. value too large for far tier) — the DRAM
-        // copy is still valid.
-        let _ = self.far_cache.set(key, value, ttl);
-        Ok(())
+        self.dram_cache.set(key, value, ttl)
     }
 
     /// Retrieve the value associated with `key`.
     ///
     /// Lookup order:
     /// 1. **DRAM tier** — `dram_cache.get(key)` fires `WorkerEvent::Get` into
-    ///    the DRAM policy worker, refreshing that tier's eviction stack.
-    ///    If a far-memory shadow copy also exists, `far_cache.get(key)` is
-    ///    called as well to keep the shadow copy warm.
+    ///    the DRAM policy worker, refreshing that tier's 2Q eviction stack.
     /// 2. **Far-memory tier** — `far_cache.get(key)` fires `WorkerEvent::Get`
     ///    into the far-memory policy worker.  The retrieved value is then
-    ///    promoted to the DRAM tier via `dram_cache.set`.
+    ///    promoted back to the DRAM tier via `dram_cache.set`.
     ///
     /// # Errors
     /// - [`CacheError::KeyNotFound`] — key is not in either tier (or is expired).
@@ -239,9 +252,6 @@ where
         match self.dram_cache.get(key) {
             Ok(data) => {
                 self.dram_hits.fetch_add(1, Ordering::Relaxed);
-                // Refresh the far-memory eviction stack so the shadow copy is
-                // not evicted while the DRAM entry is actively in use.
-                let _ = self.far_cache.get(key);
                 return Ok(data);
             }
             Err(_) => {}
@@ -253,7 +263,9 @@ where
         match self.far_cache.get(key) {
             Ok(data) => {
                 self.far_hits.fetch_add(1, Ordering::Relaxed);
-                // Promote a copy to the DRAM tier so subsequent accesses are fast.
+                // Promote a copy back to the DRAM tier so subsequent accesses
+                // are fast.  The object will naturally migrate to far memory
+                // again if DRAM capacity is exceeded.
                 let _ = self.dram_cache.set(key.clone(), &data, None);
                 self.promotions_to_dram.fetch_add(1, Ordering::Relaxed);
                 Ok(data)

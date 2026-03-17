@@ -83,6 +83,13 @@ pub struct PolicyWorker<K, V> {
 	/// evictions of keys that haven't been persisted to PMEM yet.
 	#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
 	tiering_manager: Option<Arc<TieringManager<K, V>>>,
+
+	/// Optional callback to forward evicted objects to an external consumer
+	/// (e.g. the admission tier far-memory cache).  The closure owns clones of
+	/// K and Arc<V> and stores them itself; callers only hand over the object
+	/// reference which the closure will clone if it is Some.
+	#[cfg(feature = "admission_tiering")]
+	eviction_cb: Option<Arc<dyn Fn(&crate::object::Object<K, V>) + Send + Sync>>,
 }
 
 impl<K, V> Worker for PolicyWorker<K, V>
@@ -213,6 +220,9 @@ where
 
 			#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
 			tiering_manager: None,
+
+			#[cfg(feature = "admission_tiering")]
+			eviction_cb: None,
 		};
 
 		Ok(worker)
@@ -277,6 +287,73 @@ where
 			last_set_time: None,
 
 			tiering_manager: Some(tiering_manager),
+
+			#[cfg(feature = "admission_tiering")]
+			eviction_cb: None,
+		};
+
+		Ok(worker)
+	}
+
+	/// Constructs a `PolicyWorker` that calls `eviction_cb` for every object
+	/// evicted from this cache.  Used by the admission tiering manager so that
+	/// items evicted from the DRAM tier are automatically forwarded to the
+	/// far-memory tier.
+	#[cfg(feature = "admission_tiering")]
+	pub fn new_with_eviction_cb(
+		listener: WorkerReceiver,
+		objects: ObjectMapRef<K, V>,
+		status: StatusRef,
+		overhead_manager: OverheadManagerRef,
+		eviction_cb: Arc<dyn Fn(&crate::object::Object<K, V>) + Send + Sync>,
+	) -> Result<Self, CacheError> {
+		let max_cache_size = status.max_size();
+
+		let mini_stacks = MiniStackManager::new(
+			status.policies(),
+			max_cache_size,
+		);
+
+		let policy = status.policy();
+		let policy_stack = init_policy_stack(policy, max_cache_size);
+
+		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
+		let (trace_worker, trace_listener) = unbounded();
+
+		register_worker(TraceWorker::new(
+			trace_listener,
+			trace_fragments.clone(),
+		));
+
+		if let Err(err) = trace_worker.send(StackEvent::Resize(status.max_size())) {
+			error!("Could not send initial cache size to trace worker: {err:?}");
+			return Err(CacheError::Internal);
+		}
+
+		let worker = PolicyWorker {
+			listener,
+
+			objects,
+			status,
+			overhead_manager,
+
+			policy_stack: Some(policy_stack),
+
+			trace_fragments,
+			trace_worker,
+
+			mini_stack_manager: mini_stacks,
+			mini_index: None,
+
+			current_policy: Arc::new(RwLock::new(policy)),
+
+			last_auto_policy_time: None,
+			last_set_time: None,
+
+			#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
+			tiering_manager: None,
+
+			eviction_cb: Some(eviction_cb),
 		};
 
 		Ok(worker)
@@ -466,9 +543,17 @@ where
 				maybe_key,
 			);
 
-			let Ok((key, _)) = erase_result else {
+			let Ok((key, object)) = erase_result else {
 				continue;
 			};
+			#[cfg(not(feature = "admission_tiering"))]
+			let _ = object;
+
+			// Forward the evicted item to the far-memory tier if a callback was
+			// registered (used by the admission tiering manager so that objects
+			// enter the far cache only when evicted from DRAM, not on set).
+			#[cfg(feature = "admission_tiering")]
+			self.try_forward_eviction(&object);
 
 			buffered_events.push(StackEvent::Del(key));
 		}
@@ -506,6 +591,18 @@ where
 		}
 
 		self.mini_stack_manager.apply_evictions(mini_index, evictions);
+	}
+
+	/// Forward an evicted object to the far-memory tier if an eviction
+	/// sender was registered.  This method has the required `K: Clone` and
+	/// `V: Clone` bounds so that `apply_evictions` (which does not impose those
+	/// bounds) can call it through a concrete method rather than an inline
+	/// expression.
+	#[cfg(feature = "admission_tiering")]
+	fn try_forward_eviction(&self, object: &crate::object::Object<K, V>) {
+		if let Some(ref cb) = self.eviction_cb {
+			cb(object);
+		}
 	}
 
 	fn perform_auto_policy(&mut self, now: Instant, has_current_set: bool) -> Option<PaperPolicy> {
