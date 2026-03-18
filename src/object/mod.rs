@@ -20,13 +20,28 @@ pub type ExpireTime = Option<Instant>;
 
 #[derive(Clone)]
 pub struct Object<K, V> {
+	/// The key stored in DRAM.  Present only when `key_pmem_value_pmem` is
+	/// **not** enabled; when the feature is active the key lives exclusively
+	/// in persistent memory via `_key_pmem` below.
+	#[cfg(not(feature = "key_pmem_value_pmem"))]
 	key: K,
-	data: Arc<V>,
 
+	/// When `key_pmem_value_pmem` is enabled the key is owned here, allocated
+	/// directly in persistent memory via the Hybrid allocator.  There is no
+	/// separate DRAM copy of the key in this configuration.
+	#[cfg(feature = "key_pmem_value_pmem")]
+	_key_pmem: Box<K, crate::Hybrid>,
+
+	data: Arc<V>,
 	expiry: ExpireTime,
 }
 
 impl<K, V> Object<K, V> {
+	/// Create a new Object.
+	///
+	/// When `key_pmem_value_pmem` is **not** enabled this method has no
+	/// additional bounds.
+	#[cfg(not(feature = "key_pmem_value_pmem"))]
 	pub fn new(key: K, data: V, ttl: Option<u32>) -> Self {
 		let expiry = match ttl {
 			Some(0) | None => None,
@@ -36,15 +51,54 @@ impl<K, V> Object<K, V> {
 		Object {
 			key,
 			data: Arc::new(data),
-
 			expiry,
 		}
 	}
 
-	/// Create a new Object with an explicit expiry time
+	/// Create a new Object.
+	///
+	/// When `key_pmem_value_pmem` is enabled the key is moved directly into a
+	/// `Box` allocated in persistent memory via the Hybrid allocator.  No DRAM
+	/// copy of the key is retained.
+	#[cfg(feature = "key_pmem_value_pmem")]
+	pub fn new(key: K, data: V, ttl: Option<u32>) -> Self {
+		use crate::Hybrid;
+
+		let expiry = match ttl {
+			Some(0) | None => None,
+			Some(ttl) => Some(get_expiry_from_ttl(ttl)),
+		};
+
+		Object {
+			_key_pmem: Box::new_in(key, Hybrid),
+			data: Arc::new(data),
+			expiry,
+		}
+	}
+
+	/// Create a new Object with an explicit expiry time.
+	///
+	/// When `key_pmem_value_pmem` is **not** enabled this method has no
+	/// additional bounds.
+	#[cfg(not(feature = "key_pmem_value_pmem"))]
 	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self {
 		Object {
 			key,
+			data: Arc::new(data),
+			expiry,
+		}
+	}
+
+	/// Create a new Object with an explicit expiry time.
+	///
+	/// When `key_pmem_value_pmem` is enabled the key is moved directly into
+	/// PMEM; no DRAM copy is retained.
+	#[cfg(feature = "key_pmem_value_pmem")]
+	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self {
+		use crate::Hybrid;
+
+		Object {
+			_key_pmem: Box::new_in(key, Hybrid),
 			data: Arc::new(data),
 			expiry,
 		}
@@ -54,10 +108,27 @@ impl<K, V> Object<K, V> {
 		self.data.clone()
 	}
 
+	/// Return a reference to the key.
+	///
+	/// Without `key_pmem_value_pmem` the key lives in DRAM.
+	/// With `key_pmem_value_pmem` the key lives in PMEM and is accessed via
+	/// the `_key_pmem` box; no DRAM copy exists.
+	#[cfg(not(feature = "key_pmem_value_pmem"))]
 	pub fn key(&self) -> &K {
 		&self.key
 	}
 
+	#[cfg(feature = "key_pmem_value_pmem")]
+	pub fn key(&self) -> &K {
+		&self._key_pmem
+	}
+
+	/// Check whether this object's key matches the given key.
+	///
+	/// When `key_pmem_value_pmem` is enabled the comparison reads the key from
+	/// PMEM, ensuring that set/get/delete operations all verify against the
+	/// PMEM-resident copy.
+	#[cfg(not(feature = "key_pmem_value_pmem"))]
 	pub fn key_matches(&self, key: &K) -> bool
 	where
 		K: Eq,
@@ -65,6 +136,15 @@ impl<K, V> Object<K, V> {
 		self.key.eq(key)
 	}
 
+	#[cfg(feature = "key_pmem_value_pmem")]
+	pub fn key_matches(&self, key: &K) -> bool
+	where
+		K: Eq,
+	{
+		(*self._key_pmem).eq(key)
+	}
+
+	#[cfg(not(feature = "key_pmem_value_pmem"))]
 	fn total_size(&self) -> ObjectSize
 	where
 		K: TypeSize,
@@ -72,6 +152,19 @@ impl<K, V> Object<K, V> {
 	{
 		(
 			self.key.get_size()
+				+ self.data.get_size()
+				+ mem::size_of::<ExpireTime>()
+		) as ObjectSize
+	}
+
+	#[cfg(feature = "key_pmem_value_pmem")]
+	fn total_size(&self) -> ObjectSize
+	where
+		K: TypeSize,
+		V: TypeSize,
+	{
+		(
+			(*self._key_pmem).get_size()
 				+ self.data.get_size()
 				+ mem::size_of::<ExpireTime>()
 		) as ObjectSize
@@ -104,24 +197,50 @@ pub fn get_expiry_from_ttl(ttl: u32) -> Instant {
 // For BufferDRAM (Box<[u8]>)
 impl<K: Default> Default for Object<K, Box<[u8]>> {
 	fn default() -> Self {
-		Object {
-			key: K::default(),
-			data: Arc::new(Vec::new().into_boxed_slice()),
-			expiry: None,
+		#[cfg(not(feature = "key_pmem_value_pmem"))]
+		{
+			Object {
+				key: K::default(),
+				data: Arc::new(Vec::new().into_boxed_slice()),
+				expiry: None,
+			}
+		}
+
+		#[cfg(feature = "key_pmem_value_pmem")]
+		{
+			use crate::Hybrid;
+
+			Object {
+				_key_pmem: Box::new_in(K::default(), Hybrid),
+				data: Arc::new(Vec::new().into_boxed_slice()),
+				expiry: None,
+			}
 		}
 	}
 }
 
-// For BufferPMEM (Box<[u8], Hybrid>) need to mod...
+// For BufferPMEM (Box<[u8], Hybrid>)
 #[cfg(any(feature = "key_value_pmem", feature = "global_flatmap_pmem"))]
 impl<K: Default> Default for Object<K, Box<[u8], crate::Hybrid>> {
 	fn default() -> Self {
 		use crate::Hybrid;
-		let vec: Vec<u8, Hybrid> = Vec::new_in(Hybrid);
-		Object {
-			key: K::default(),
-			data: Arc::new(vec.into_boxed_slice()),
-			expiry: None,
+
+		#[cfg(not(feature = "key_pmem_value_pmem"))]
+		{
+			Object {
+				key: K::default(),
+				data: Arc::new(Vec::<u8, Hybrid>::new_in(Hybrid).into_boxed_slice()),
+				expiry: None,
+			}
+		}
+
+		#[cfg(feature = "key_pmem_value_pmem")]
+		{
+			Object {
+				_key_pmem: Box::new_in(K::default(), Hybrid),
+				data: Arc::new(Vec::<u8, Hybrid>::new_in(Hybrid).into_boxed_slice()),
+				expiry: None,
+			}
 		}
 	}
 }

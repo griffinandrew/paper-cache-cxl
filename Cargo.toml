@@ -36,6 +36,11 @@ perf-event = { version = "0.4.8", optional = true }
 # Core feature to enable key and value storage in PMEM
 key_value_pmem = []
 
+# Extended PMEM feature: places BOTH key bytes AND value bytes each in their own
+# BufferPMEM (Hybrid-allocated persistent memory).  Implies key_value_pmem so
+# that the Hybrid allocator and all other PMEM infrastructure are available.
+key_pmem_value_pmem = ["key_value_pmem"]
+
 # All data structures in DRAM (no PMEM usage)
 all_dram = []
 
