@@ -930,6 +930,64 @@ self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 result
 }
 
+/// Sets the supplied key and value in the cache.
+/// Returns a [`CacheError`] if the value size is zero or larger than
+/// the cache's maximum size.
+///
+/// If the key already exists in the cache, the associated value is updated
+/// to the supplied value.
+///
+/// # Examples
+/// ```
+/// use paper_cache::{PaperCache, PaperPolicy};
+///
+/// let mut cache = PaperCache::<u32, u32>::new(
+///     1000,
+///     &[PaperPolicy::Lfu],
+///     PaperPolicy::Lfu,
+/// ).unwrap();
+///
+/// assert!(cache.set(0, 0, None).is_ok());
+/// ```
+pub fn set(&self, key: K, value: V, ttl: Option<u32>) -> Result<(), CacheError> {
+use crate::backend::CacheMap as _;
+
+let hashed_key = self.hash_key(&key);
+let object = Object::new(key, value, ttl);
+let base_size = self.overhead_manager.base_size(&object);
+let expiry = object.expiry();
+
+if base_size == 0 {
+return Err(CacheError::ZeroValueSize);
+}
+
+if self.status.exceeds_max_size(base_size) {
+return Err(CacheError::ExceedingValueSize);
+}
+
+self.status.incr_sets();
+
+let old_object_info = self.objects
+.cm_insert(hashed_key, object)
+.map(|old_object| {
+let base_size = self.overhead_manager.base_size(&old_object);
+let expiry = old_object.expiry();
+(base_size, expiry)
+});
+
+let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+base_size as i64 - old_object_size as i64
+} else {
+self.status.incr_num_objects();
+base_size as i64
+};
+
+self.status.update_base_used_size(base_size_delta);
+self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+
+Ok(())
+}
+
 /// Deletes the object associated with the supplied key in the cache.
 /// Returns a [`CacheError`] if the key was not found in the cache.
 ///
@@ -1389,50 +1447,6 @@ where
 	/// assert!(cache.set(0, 0, None).is_ok());
 	/// ```
 
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		//allocate it as a regular buffer... 
-		let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
-
-		//let key_buff = Box::new(key);
-
-		let object = Object::new(key, val_buf, ttl);
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			// the object is new, so increase the number of objects count
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
 }
 
 
@@ -1777,94 +1791,6 @@ where
 	///
 	/// assert!(cache.set(0, 0, None).is_ok());
 	/// ```
-	
-	// not V but &[u8]?? 
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> 
-	where
-    	//V: AsRef<[u8]> + TypeSize,
-		K: 'static + Eq + Hash + TypeSize + std::fmt::Debug,
-	{
-		let hashed_key = self.hash_key(&key);
-
-		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
-
-		//allocate the object in the cache itself.... lets say pmem buffer
-		
-		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
-		//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
-		//buf1.extend_from_slice(&value);
-
-		//let buf: BufferPMEM = buf1.into_boxed_slice();
-
-
-		#[cfg(feature = "sets_dram")]
-		{
-			self.tiering_manager.set_dram(hashed_key, key.clone(), value, ttl);
-			return Ok(());
-		}
-
-
-		#[cfg(not(feature = "sets_dram"))]
-		{
-			let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
-
-			//let key_buf: BufferPMEM = 
-
-			//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(key.len(), Hybrid); 
-			//buf1.extend_from_slice(&key);
-			//let key_buf: BufferPMEM = buf1.into_boxed_slice();
-
-			//let key_buf: BufferPMEM = key.to_vec_in(Hybrid).into_boxed_slice();
-
-			//the key should also be in pmem... this is stale or wrong... mut have changed it back??
-			let object = Object::new(key, val_buf, ttl);
-
-			//should =turn this into pmem buffer .... 
-
-
-			//let object = Object::new(key, value, ttl);
-			
-			let base_size = self.overhead_manager.base_size(&object);
-			let expiry = object.expiry();
-
-			if base_size == 0 {
-				return Err(CacheError::ZeroValueSize);
-			}
-
-			if self.status.exceeds_max_size(base_size) {
-				return Err(CacheError::ExceedingValueSize);
-			}
-
-			self.status.incr_sets();
-
-			let old_object_info = self.objects
-				.insert(hashed_key, object)
-				.map(|old_object| {
-					let base_size = self.overhead_manager.base_size(&old_object);
-					let expiry = old_object.expiry();
-
-					(base_size, expiry)
-				});
-
-			let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-				base_size as i64 - old_object_size as i64
-			} else {
-				// the object is new, so increase the number of objects count
-				self.status.incr_num_objects();
-				base_size as i64
-			};
-
-			self.status.update_base_used_size(base_size_delta);
-			self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-			Ok(())
-		}
-
-		//self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		//Ok(())
-	}
-
 
 	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 	/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
@@ -1979,47 +1905,6 @@ where
 
 		Ok(cache)
 	}
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		// Values stored in DRAM (BufferDRAM = Box<[u8]>)
-		let val_buf: BufferDRAM = value.into();
-		let object = Object::new(key, val_buf, ttl);
-
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.write().unwrap().insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
 }
 
 
@@ -2102,47 +1987,6 @@ where
 		};
 
 		Ok(cache)
-	}
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		// Values stored in DRAM (BufferDRAM = Box<[u8]>)
-		let val_buf: BufferDRAM = value.into();
-		let object = Object::new(key, val_buf, ttl);
-
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.write().unwrap().insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
 	}
 }
 
@@ -2340,78 +2184,6 @@ where
 	///
 	/// assert!(cache.set(0, 0, None).is_ok());
 	/// ```
-	
-	// not V but &[u8]?? 
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> 
-	where
-    	//V: AsRef<[u8]> + TypeSize,
-		K: 'static + Eq + Hash + TypeSize + std::fmt::Debug,
-	{
-		let hashed_key = self.hash_key(&key);
-
-		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
-
-		//allocate the object in the cache itself.... lets say pmem buffer
-		
-		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
-		//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
-		//buf1.extend_from_slice(&value);
-
-		//let buf: BufferPMEM = buf1.into_boxed_slice();
-
-		let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
-
-		//let key_buf: BufferPMEM = 
-
-		//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(key.len(), Hybrid); 
-		//buf1.extend_from_slice(&key);
-		//let key_buf: BufferPMEM = buf1.into_boxed_slice();
-
-		//let key_buf: BufferPMEM = key.to_vec_in(Hybrid).into_boxed_slice();
-
-		let object = Object::new(key, val_buf, ttl);
-
-		//should =turn this into pmem buffer .... 
-
-
-		//let object = Object::new(key, value, ttl);
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			//.insert(hashed_key, object)
-			.write().unwrap().insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			// the object is new, so increase the number of objects count
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
 }
 
 #[cfg(all(feature = "global_flatmap_pmem", not(feature = "key_value_pmem"), not(feature = "global_hashtable_pmem")))]
@@ -2497,47 +2269,6 @@ where
 
 		Ok(cache)
 	}
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		// Values stored in DRAM (BufferDRAM = Box<[u8]>)
-		let val_buf: BufferDRAM = value.into();
-		let object = Object::new(key, val_buf, ttl);
-
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.write().unwrap().insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
 }
 
 
@@ -2616,45 +2347,6 @@ where
 		};
 
 		Ok(cache)
-	}
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
-		let object = Object::new(key, val_buf, ttl);
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.write().unwrap().insert_unchecked(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
 	}
 }
 
