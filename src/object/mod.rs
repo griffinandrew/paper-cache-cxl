@@ -18,6 +18,16 @@ use typesize::TypeSize;
 pub type ObjectSize = u32;
 pub type ExpireTime = Option<Instant>;
 
+/// The storage type used for an object's value data.
+///
+/// When the `key_value_pmem` feature is enabled, data is placed directly in
+/// persistent memory via the Hybrid allocator.  Otherwise it lives in DRAM.
+#[cfg(feature = "key_value_pmem")]
+pub type DataArc<V> = std::sync::Arc<V, crate::allocator::HybridObjects>;
+
+#[cfg(not(feature = "key_value_pmem"))]
+pub type DataArc<V> = std::sync::Arc<V>;
+
 #[derive(Clone)]
 pub struct Object<K, V> {
 	/// The key stored in DRAM.  Present only when `key_pmem_value_pmem` is
@@ -32,7 +42,7 @@ pub struct Object<K, V> {
 	#[cfg(feature = "key_pmem_value_pmem")]
 	_key_pmem: Box<K, crate::Hybrid>,
 
-	data: Arc<V>,
+	data: DataArc<V>,
 	expiry: ExpireTime,
 }
 
@@ -48,9 +58,14 @@ impl<K, V> Object<K, V> {
 			Some(ttl) => Some(get_expiry_from_ttl(ttl)),
 		};
 
+		#[cfg(feature = "key_value_pmem")]
+		let data_arc: DataArc<V> = std::sync::Arc::new_in(data, crate::Hybrid);
+		#[cfg(not(feature = "key_value_pmem"))]
+		let data_arc: DataArc<V> = std::sync::Arc::new(data);
+
 		Object {
 			key,
-			data: Arc::new(data),
+			data: data_arc,
 			expiry,
 		}
 	}
@@ -71,7 +86,7 @@ impl<K, V> Object<K, V> {
 
 		Object {
 			_key_pmem: Box::new_in(key, Hybrid),
-			data: Arc::new(data),
+			data: std::sync::Arc::new_in(data, Hybrid),
 			expiry,
 		}
 	}
@@ -82,9 +97,14 @@ impl<K, V> Object<K, V> {
 	/// additional bounds.
 	#[cfg(not(feature = "key_pmem_value_pmem"))]
 	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self {
+		#[cfg(feature = "key_value_pmem")]
+		let data_arc: DataArc<V> = std::sync::Arc::new_in(data, crate::Hybrid);
+		#[cfg(not(feature = "key_value_pmem"))]
+		let data_arc: DataArc<V> = std::sync::Arc::new(data);
+
 		Object {
 			key,
-			data: Arc::new(data),
+			data: data_arc,
 			expiry,
 		}
 	}
@@ -99,12 +119,12 @@ impl<K, V> Object<K, V> {
 
 		Object {
 			_key_pmem: Box::new_in(key, Hybrid),
-			data: Arc::new(data),
+			data: std::sync::Arc::new_in(data, Hybrid),
 			expiry,
 		}
 	}
 
-	pub fn data(&self) -> Arc<V> {
+	pub fn data(&self) -> DataArc<V> {
 		self.data.clone()
 	}
 
@@ -201,7 +221,7 @@ impl<K: Default> Default for Object<K, Box<[u8]>> {
 		{
 			Object {
 				key: K::default(),
-				data: Arc::new(Vec::new().into_boxed_slice()),
+				data: DataArc::new(Vec::new().into_boxed_slice()),
 				expiry: None,
 			}
 		}
@@ -212,7 +232,7 @@ impl<K: Default> Default for Object<K, Box<[u8]>> {
 
 			Object {
 				_key_pmem: Box::new_in(K::default(), Hybrid),
-				data: Arc::new(Vec::new().into_boxed_slice()),
+				data: std::sync::Arc::new_in(Vec::new().into_boxed_slice(), Hybrid),
 				expiry: None,
 			}
 		}
@@ -229,7 +249,7 @@ impl<K: Default> Default for Object<K, Box<[u8], crate::Hybrid>> {
 		{
 			Object {
 				key: K::default(),
-				data: Arc::new(Vec::<u8, Hybrid>::new_in(Hybrid).into_boxed_slice()),
+				data: std::sync::Arc::new_in(Vec::<u8, Hybrid>::new_in(Hybrid).into_boxed_slice(), Hybrid),
 				expiry: None,
 			}
 		}
@@ -238,7 +258,7 @@ impl<K: Default> Default for Object<K, Box<[u8], crate::Hybrid>> {
 		{
 			Object {
 				_key_pmem: Box::new_in(K::default(), Hybrid),
-				data: Arc::new(Vec::<u8, Hybrid>::new_in(Hybrid).into_boxed_slice()),
+				data: std::sync::Arc::new_in(Vec::<u8, Hybrid>::new_in(Hybrid).into_boxed_slice(), Hybrid),
 				expiry: None,
 			}
 		}
