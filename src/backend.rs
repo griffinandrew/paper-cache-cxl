@@ -43,6 +43,10 @@ pub trait CacheMap<K, V> {
 		K: Eq,
 		F: FnOnce(&mut Object<K, V>) -> R;
 
+	/// Insert an object into the map, returning the previous object stored
+	/// under `hashed_key` (if any).
+	fn cm_insert(&self, hashed_key: HashedKey, obj: Object<K, V>) -> Option<Object<K, V>>;
+
 	/// Clear every object from the map.
 	fn cm_clear(&self);
 }
@@ -80,12 +84,14 @@ impl<K, V> CacheMap<K, V>
 		}
 	}
 
+	fn cm_insert(&self, hashed_key: HashedKey, obj: Object<K, V>) -> Option<Object<K, V>> {
+		self.insert(hashed_key, obj)
+	}
+
 	fn cm_clear(&self) {
 		self.clear();
 	}
-}
-
-// ── RwLock-wrapped backends (HashMap + FlatMap) ───────────────────────────────
+} (HashMap + FlatMap) ───────────────────────────────
 
 /// Helper for the map type stored *inside* an `Arc<RwLock<M>>`.
 ///
@@ -94,6 +100,7 @@ impl<K, V> CacheMap<K, V>
 trait InnerMap<K, V> {
 	fn inner_get(&self, key: &HashedKey) -> Option<&Object<K, V>>;
 	fn inner_get_mut(&mut self, key: &HashedKey) -> Option<&mut Object<K, V>>;
+	fn inner_insert(&mut self, key: HashedKey, obj: Object<K, V>) -> Option<Object<K, V>>;
 	fn inner_clear(&mut self);
 }
 
@@ -128,12 +135,14 @@ where
 		Some(f(obj))
 	}
 
+	fn cm_insert(&self, hashed_key: HashedKey, obj: Object<K, V>) -> Option<Object<K, V>> {
+		self.write().unwrap().inner_insert(hashed_key, obj)
+	}
+
 	fn cm_clear(&self) {
 		self.write().unwrap().inner_clear();
 	}
-}
-
-// ── InnerMap impls ────────────────────────────────────────────────────────────
+} ────────────────────────────────────────────────────────────
 
 // 1. PMEM HashMap  (global_hashtable_pmem, no FlatMap)
 #[cfg(all(feature = "global_hashtable_pmem", not(feature = "global_flatmap_pmem")))]
@@ -153,6 +162,10 @@ impl<K, V> InnerMap<K, V>
 		self.get_mut(key)
 	}
 
+	fn inner_insert(&mut self, key: HashedKey, obj: Object<K, V>) -> Option<Object<K, V>> {
+		self.insert(key, obj)
+	}
+
 	fn inner_clear(&mut self) {
 		self.clear();
 	}
@@ -169,6 +182,10 @@ impl<K, V> InnerMap<K, V>
 
 	fn inner_get_mut(&mut self, key: &HashedKey) -> Option<&mut Object<K, V>> {
 		self.get_mut(key)
+	}
+
+	fn inner_insert(&mut self, key: HashedKey, obj: Object<K, V>) -> Option<Object<K, V>> {
+		self.insert(key, obj)
 	}
 
 	fn inner_clear(&mut self) {
@@ -194,6 +211,10 @@ impl<K, V> InnerMap<K, V>
 		self.get_mut(key)
 	}
 
+	fn inner_insert(&mut self, key: HashedKey, obj: Object<K, V>) -> Option<Object<K, V>> {
+		self.insert(key, obj)
+	}
+
 	fn inner_clear(&mut self) {
 		self.clear();
 	}
@@ -214,6 +235,10 @@ impl<K, V> InnerMap<K, V>
 
 	fn inner_get_mut(&mut self, key: &HashedKey) -> Option<&mut Object<K, V>> {
 		self.get_mut(key)
+	}
+
+	fn inner_insert(&mut self, key: HashedKey, obj: Object<K, V>) -> Option<Object<K, V>> {
+		self.insert(key, obj)
 	}
 
 	fn inner_clear(&mut self) {
