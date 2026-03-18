@@ -55,6 +55,7 @@ mod worker;
 mod object;
 mod policy;
 mod status;
+pub mod backend;
 
 #[cfg(any(all(feature = "key_value_pmem", feature = "enable_tiering_manager"), all(feature = "key_value_pmem", feature = "sets_dram")))]
 pub mod tiering;
@@ -840,6 +841,367 @@ where
 /// 
 /// 
 
+
+// ── Shared impl (all non-original backends) ──────────────────────────────────
+// Methods in this block are identical across all eight feature-gated backends.
+// Each backend supplies `new`, `with_hasher`, and `set`; everything else lives
+// here and dispatches through the `CacheMap` trait.
+#[cfg(not(feature = "original"))]
+impl<K, V, S> PaperCache<K, V, S>
+where
+K: 'static + Eq + Hash + TypeSize + std::fmt::Debug,
+V: 'static + TypeSize,
+S: Default + Clone + BuildHasher,
+crate::ObjectMapRef<K, V>: crate::backend::CacheMap<K, V>,
+{
+/// Returns the crate version string.
+pub fn version(&self) -> String {
+env!("CARGO_PKG_VERSION").to_owned()
+}
+
+/// Returns a snapshot of the current cache status.
+pub fn status(&self) -> Result<Status, CacheError> {
+	self.status.try_to_status()
+}
+
+/// Gets the value associated with the supplied key.
+/// If the key was not found in the cache, returns a [`CacheError`].
+///
+/// # Examples
+/// ```
+/// use paper_cache::{PaperCache, PaperPolicy};
+///
+/// let mut cache = PaperCache::<u32, u32>::new(
+///     1000,
+///     &[PaperPolicy::Lfu],
+///     PaperPolicy::Lfu,
+/// ).unwrap();
+///
+/// cache.set(0, 0, None);
+///
+/// // Getting a key which exists in the cache will return the associated value.
+/// assert!(cache.get(&0).is_ok());
+/// // Getting a key which does not exist in the cache will return a CacheError.
+/// assert!(cache.get(&1).is_err());
+/// ```
+pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
+where
+V: std::ops::Deref<Target = [u8]>,
+{
+use crate::backend::CacheMap as _;
+
+let hashed_key = self.hash_key(key);
+
+// DRAM-tier fast path (tiering_manager only present with key_value_pmem)
+#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", not(feature = "hashtable_tiering")))]
+if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
+if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
+self.status.incr_hits();
+self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+let arc_val = dram_object_ref.data();
+return Ok(arc_val.as_ref().to_vec());
+}
+}
+
+#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", feature = "hashtable_tiering"))]
+if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
+if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
+self.status.incr_hits();
+self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+return Ok(dram_object_ref.data_as_bytes());
+}
+}
+
+let bytes_opt = self.objects.cm_with_object(hashed_key, key, |obj| {
+self.status.incr_hits();
+let arc_val = obj.data();
+arc_val.as_ref().to_vec()
+});
+
+let result = match bytes_opt {
+Some(bytes) => Ok(bytes),
+None => {
+self.status.incr_misses();
+Err(CacheError::KeyNotFound)
+},
+};
+
+self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+result
+}
+
+/// Deletes the object associated with the supplied key in the cache.
+/// Returns a [`CacheError`] if the key was not found in the cache.
+///
+/// # Examples
+/// ```
+/// use paper_cache::{PaperCache, PaperPolicy};
+///
+/// let mut cache = PaperCache::<u32, u32>::new(
+///     1000,
+///     &[PaperPolicy::Lfu],
+///     PaperPolicy::Lfu,
+/// ).unwrap();
+///
+/// cache.set(0, 0, None);
+/// assert!(cache.del(&0).is_ok());
+///
+/// // Deleting a key which does not exist in the cache will return a CacheError.
+/// assert!(cache.del(&1).is_err());
+/// ```
+pub fn del(&self, key: &K) -> Result<(), CacheError> {
+let hashed_key = self.hash_key(key);
+
+let (removed_hashed_key, object) = erase(
+&self.objects,
+&self.status,
+&self.overhead_manager,
+Some(EraseKey::Original(key, hashed_key)),
+)?;
+
+self.status.incr_dels();
+self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
+
+Ok(())
+}
+
+/// Checks if an object with the supplied key exists in the cache without
+/// altering any of the cache's internal queues.
+///
+/// # Examples
+/// ```
+/// use paper_cache::{PaperCache, PaperPolicy};
+///
+/// let mut cache = PaperCache::<u32, u32>::new(
+///     1000,
+///     &[PaperPolicy::Lfu],
+///     PaperPolicy::Lfu,
+/// ).unwrap();
+///
+/// cache.set(0, 0, None);
+///
+/// assert!(cache.has(&0));
+/// assert!(!cache.has(&1));
+/// ```
+pub fn has(&self, key: &K) -> bool {
+use crate::backend::CacheMap as _;
+
+let hashed_key = self.hash_key(key);
+self.objects.cm_with_object(hashed_key, key, |_| ()).is_some()
+}
+
+/// Gets (peeks) the value associated with the supplied key without altering
+/// any of the cache's internal queues.
+/// If the key was not found in the cache, returns a [`CacheError`].
+///
+/// # Examples
+/// ```
+/// use paper_cache::{PaperCache, PaperPolicy};
+///
+/// let mut cache = PaperCache::<u32, u32>::new(
+///     1000,
+///     &[PaperPolicy::Lfu],
+///     PaperPolicy::Lfu,
+/// ).unwrap();
+///
+/// cache.set(0, 0, None);
+/// cache.set(1, 0, None);
+///
+/// // Peeking a key which exists in the cache will return the associated value.
+/// assert!(cache.peek(&0).is_ok());
+/// // Peeking a key which does not exist in the cache will return a CacheError.
+/// assert!(cache.peek(&2).is_err());
+///
+/// cache.set(2, 0, None);
+///
+/// // Peeking a key will not alter the eviction order of the objects.
+/// assert!(cache.peek(&1).is_ok());
+/// assert!(cache.peek(&2).is_ok());
+/// ```
+pub fn peek(&self, key: &K) -> Result<Arc<V>, CacheError> {
+use crate::backend::CacheMap as _;
+
+let hashed_key = self.hash_key(key);
+self.objects
+.cm_with_object(hashed_key, key, |obj| obj.data())
+.ok_or(CacheError::KeyNotFound)
+}
+
+/// Sets the TTL associated with the supplied key.
+/// If the key was not found in the cache, returns a [`CacheError`].
+///
+/// # Examples
+/// ```
+/// use paper_cache::{PaperCache, PaperPolicy};
+///
+/// let mut cache = PaperCache::<u32, u32>::new(
+///     1000,
+///     &[PaperPolicy::Lfu],
+///     PaperPolicy::Lfu,
+/// ).unwrap();
+///
+/// cache.set(0, 0, None); // value will not expire
+/// cache.ttl(&0, Some(5)); // value will expire in 5 seconds
+/// ```
+pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
+use crate::backend::CacheMap as _;
+
+let hashed_key = self.hash_key(key);
+
+let (old_expiry, new_expiry) = self.objects
+.cm_with_object_mut(hashed_key, key, |object| {
+let old_expiry = object.expiry();
+let old_base_size = self.overhead_manager.base_size(object);
+
+object.expires(ttl);
+
+let new_expiry = object.expiry();
+let new_base_size = self.overhead_manager.base_size(object);
+
+self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
+(old_expiry, new_expiry)
+})
+.ok_or(CacheError::KeyNotFound)?;
+
+self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
+Ok(())
+}
+
+/// Gets the size of the value associated with the supplied key in bytes.
+/// If the key was not found in the cache, returns a [`CacheError`].
+///
+/// # Examples
+/// ```
+/// use paper_cache::{PaperCache, PaperPolicy};
+///
+/// let mut cache = PaperCache::<u32, u32>::new(
+///     1000,
+///     &[PaperPolicy::Lfu],
+///     PaperPolicy::Lfu,
+/// ).unwrap();
+///
+/// cache.set(0, 0, None);
+///
+/// // Sizing a key which exists in the cache will return the size of the associated value.
+/// assert!(cache.size(&0).is_ok());
+/// // Sizing a key which does not exist in the cache will return a CacheError.
+/// assert!(cache.size(&1).is_err());
+/// ```
+pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
+use crate::backend::CacheMap as _;
+
+let hashed_key = self.hash_key(key);
+self.objects
+.cm_with_object(hashed_key, key, |obj| self.overhead_manager.total_size(obj))
+.ok_or(CacheError::KeyNotFound)
+}
+
+/// Deletes all objects in the cache and sets the cache's used size to zero.
+/// Returns a [`CacheError`] if the objects could not be wiped.
+///
+/// # Examples
+/// ```
+/// use paper_cache::{PaperCache, PaperPolicy};
+///
+/// let mut cache = PaperCache::<u32, u32>::new(
+///     1000,
+///     &[PaperPolicy::Lfu],
+///     PaperPolicy::Lfu,
+/// ).unwrap();
+///
+/// cache.wipe();
+/// ```
+pub fn wipe(&self) -> Result<(), CacheError> {
+use crate::backend::CacheMap as _;
+
+info!("Wiping cache");
+self.objects.cm_clear();
+self.status.clear();
+self.broadcast(WorkerEvent::Wipe)?;
+Ok(())
+}
+
+/// Resizes the cache to the supplied maximum size.
+/// If the supplied size is zero, returns a [`CacheError`].
+///
+/// # Examples
+/// ```
+/// use paper_cache::{PaperCache, PaperPolicy};
+///
+/// let mut cache = PaperCache::<u32, u32>::new(
+///     1000,
+///     &[PaperPolicy::Lfu],
+///     PaperPolicy::Lfu,
+/// ).unwrap();
+///
+/// assert!(cache.resize(1).is_ok());
+///
+/// // Resizing to a size of zero will return a CacheError.
+/// assert!(cache.resize(0).is_err());
+/// ```
+pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
+if max_size == 0 {
+return Err(CacheError::ZeroCacheSize);
+}
+
+let current_max_size = self.status.max_size();
+
+if max_size == current_max_size {
+return Ok(());
+}
+
+info!(
+"Resizing cache from {} to {}",
+fmt::memory(current_max_size, Some(2)),
+fmt::memory(max_size, Some(2)),
+);
+
+self.status.set_max_size(max_size);
+self.broadcast(WorkerEvent::Resize(max_size))?;
+
+Ok(())
+}
+
+/// Sets the eviction policy of the cache to the supplied policy.
+///
+/// # Examples
+/// ```
+/// use paper_cache::{PaperCache, PaperPolicy};
+///
+/// let mut cache = PaperCache::<u32, u32>::new(
+///     1000,
+///     &[PaperPolicy::Lfu],
+///     PaperPolicy::Lfu,
+/// ).unwrap();
+///
+/// assert!(cache.policy(PaperPolicy::Lfu).is_ok());
+/// assert!(cache.policy(PaperPolicy::Lru).is_err());
+/// ```
+pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
+if !policy.is_auto() && !self.status.policies().contains(&policy) {
+return Err(CacheError::UnconfiguredPolicy);
+}
+
+self.status.set_policy(policy)?;
+self.broadcast(WorkerEvent::Policy(policy))?;
+
+Ok(())
+}
+
+fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
+if let Err(err) = self.worker_manager.try_send(event) {
+error!("Could not communicate with workers: {err:?}");
+return Err(CacheError::Internal);
+}
+
+Ok(())
+}
+
+fn hash_key(&self, key: &K) -> HashedKey {
+self.hasher.hash_one(key)
+}
+}
+
 #[cfg(all(feature = "all_dram", not(feature = "global_flatmap_dram")))]
 impl<K, S> PaperCache<K, BufferDRAM, S>
 where
@@ -1003,93 +1365,6 @@ where
 		Ok(cache)
 	}
 
-	/// Returns the current cache version.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu
-	/// ).unwrap();
-	///
-	/// assert_eq!(cache.version(), env!("CARGO_PKG_VERSION"));
-	/// ```
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	/// Returns the current statistics.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// let status = cache.status().unwrap();
-	/// assert!(status.used_size() > 0);
-	/// ```
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	/// Gets the value associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// // Getting a key which exists in the cache will return the associated value.
-	/// assert!(cache.get(&0).is_ok());
-	/// // Getting a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.get(&1).is_err());
-	/// ```
-	/// 
-	
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
-	{
-		let hashed_key = self.hash_key(key);
-
-		// all_dram implementation - no tiering, all data in DRAM
-		let result = match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				// object.data() returns Arc<Box<[u8]>>
-				// We need to clone the actual byte slice into a Vec
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
-			},
-
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-
-		result
-	}
-
 
 
 
@@ -1157,282 +1432,6 @@ where
 		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
 
 		Ok(())
-	}
-
-
-	/// Deletes the object associated with the supplied key in the cache.
-	/// Returns a [`CacheError`] if the key was not found in the cache.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	/// assert!(cache.del(&0).is_ok());
-	///
-	/// // Deleting a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.del(&1).is_err());
-	/// ```
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	/// Checks if an object with the supplied key exists in the cache without
-	/// altering any of the cache's internal queues.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// assert!(cache.has(&0));
-	/// assert!(!cache.has(&1));
-	/// ```
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	/// Gets (peeks) the value associated with the supplied key without altering
-	/// any of the cache's internal queues.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	/// cache.set(1, 0, None);
-	///
-	/// // Peeking a key which exists in the cache will return the associated value.
-	/// assert!(cache.peek(&0).is_ok());
-	/// // Peeking a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.peek(&2).is_err());
-	///
-	/// cache.set(2, 0, None);
-	///
-	/// // Peeking a key will not alter the eviction order of the objects.
-	/// assert!(cache.peek(&1).is_ok());
-	/// assert!(cache.peek(&2).is_ok());
-	/// ```
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Sets the TTL associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None); // value will not expire
-	/// cache.ttl(&0, Some(5)); // value will expire in 5 seconds
-	/// ```
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut object = match self.objects.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	/// Gets the size of the value associated with the supplied key in bytes.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// // Sizing a key which exists in the cache will return the size of the associated value.
-	/// assert!(cache.size(&0).is_ok());
-	/// // Sizing a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.size(&1).is_err());
-	/// ```
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Deletes all objects in the cache and sets the cache's used size to zero.
-	/// Returns a [`CacheError`] if the objects could not be wiped.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.wipe();
-	/// ```
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		self.objects.clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	/// Resizes the cache to the supplied maximum size.
-	/// If the supplied size is zero, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.resize(1).is_ok());
-	///
-	/// // Resizing to a size of zero will return a CacheError.
-	/// assert!(cache.resize(0).is_err());
-	/// ```
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	/// Sets the eviction policy of the cache to the supplied policy.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.policy(PaperPolicy::Lfu).is_ok());
-	/// assert!(cache.policy(PaperPolicy::Lru).is_err());
-	/// ```
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
 	}
 }
 
@@ -1690,47 +1689,6 @@ where
 		Ok(cache)
 	}
 
-	/// Returns the current cache version.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu
-	/// ).unwrap();
-	///
-	/// assert_eq!(cache.version(), env!("CARGO_PKG_VERSION"));
-	/// ```
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	/// Returns the current statistics.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// let status = cache.status().unwrap();
-	/// assert!(status.used_size() > 0);
-	/// ```
-	
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
 	/// Gets the value associated with the supplied key.
 	/// If the key was not found in the cache, returns a [`CacheError`].
 	///
@@ -1795,58 +1753,6 @@ where
 	}
 
 	*/
-
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
-	{
-		let hashed_key = self.hash_key(key);
-
-		// Check DRAM tier first
-		#[cfg(all(feature = "enable_tiering_manager", not(feature = "hashtable_tiering")))]
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				let arc_val = dram_object_ref.data();
-				//println!("CACHE: get for key {:?} from DRAM tier", key);
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
-				return Ok(arc_val.as_ref().to_vec());
-			}
-		}
-
-		#[cfg(all(feature = "enable_tiering_manager", feature = "hashtable_tiering"))]
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				// Use data_as_bytes method to handle both PhysicalCopy and CxlReference
-				//this could be incorrect.....
-				return Ok(dram_object_ref.data_as_bytes());
-			}
-		}
-
-		let result = match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
-				let arc_val = object.data();
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				Ok(arc_val.as_ref().to_vec())
-			},
-
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-
-		// Optional: inspect the underlying bytes/tier of the returned value for debugging
-		//println!("CACHE: get result for key {:?}: {:?} ", key, result);
-		result
-	}
 
 
 
@@ -1960,276 +1866,6 @@ where
 	}
 
 
-
-	/// Deletes the object associated with the supplied key in the cache.
-	/// Returns a [`CacheError`] if the key was not found in the cache.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	/// assert!(cache.del(&0).is_ok());
-	///
-	/// // Deleting a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.del(&1).is_err());
-	/// ```
-	
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	/// Checks if an object with the supplied key exists in the cache without
-	/// altering any of the cache's internal queues.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// assert!(cache.has(&0));
-	/// assert!(!cache.has(&1));
-	/// ```
-	
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	/// Gets (peeks) the value associated with the supplied key without altering
-	/// any of the cache's internal queues.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	/// cache.set(1, 0, None);
-	///
-	/// // Peeking a key which exists in the cache will return the associated value.
-	/// assert!(cache.peek(&0).is_ok());
-	/// // Peeking a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.peek(&2).is_err());
-	///
-	/// cache.set(2, 0, None);
-	///
-	/// // Peeking a key will not alter the eviction order of the objects.
-	/// assert!(cache.peek(&1).is_ok());
-	/// assert!(cache.peek(&2).is_ok());
-	/// ```
-	
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferPMEM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Sets the TTL associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None); // value will not expire
-	/// cache.ttl(&0, Some(5)); // value will expire in 5 seconds
-	/// ```
-	
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut object = match self.objects.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	/// Gets the size of the value associated with the supplied key in bytes.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// // Sizing a key which exists in the cache will return the size of the associated value.
-	/// assert!(cache.size(&0).is_ok());
-	/// // Sizing a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.size(&1).is_err());
-	/// ```
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Deletes all objects in the cache and sets the cache's used size to zero.
-	/// Returns a [`CacheError`] if the objects could not be wiped.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.wipe();
-	/// ```
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		self.objects.clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	/// Resizes the cache to the supplied maximum size.
-	/// If the supplied size is zero, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.resize(1).is_ok());
-	///
-	/// // Resizing to a size of zero will return a CacheError.
-	/// assert!(cache.resize(0).is_err());
-	/// ```
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	/// Sets the eviction policy of the cache to the supplied policy.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.policy(PaperPolicy::Lfu).is_ok());
-	/// assert!(cache.policy(PaperPolicy::Lru).is_err());
-	/// ```
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-
 	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 	/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
 	pub fn tiering_stats(&self) -> tiering::TieringStats {
@@ -2258,18 +1894,6 @@ where
 	/// Gets the current hotness threshold.
 	pub fn hotness_threshold(&self) -> u64 {
 		self.tiering_manager.hotness_threshold()
-	}
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
 	}
 }
 
@@ -2356,34 +1980,6 @@ where
 		Ok(cache)
 	}
 
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
-			},
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-		result
-	}
-
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
@@ -2423,131 +2019,6 @@ where
 		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
 
 		Ok(())
-	}
-
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.read().unwrap().get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let object = match objects_guard.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		self.objects.write().unwrap().clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
 	}
 }
 
@@ -2633,34 +2104,6 @@ where
 		Ok(cache)
 	}
 
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
-			},
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-		result
-	}
-
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
@@ -2700,131 +2143,6 @@ where
 		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
 
 		Ok(())
-	}
-
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.read().unwrap().get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let object = match objects_guard.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		self.objects.write().unwrap().clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
 	}
 }
 
@@ -2999,111 +2317,6 @@ where
 		Ok(cache)
 	}
 
-	/// Returns the current cache version.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu
-	/// ).unwrap();
-	///
-	/// assert_eq!(cache.version(), env!("CARGO_PKG_VERSION"));
-	/// ```
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	/// Returns the current statistics.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// let status = cache.status().unwrap();
-	/// assert!(status.used_size() > 0);
-	/// ```
-	
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	/// Gets the value associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// // Getting a key which exists in the cache will return the associated value.
-	/// assert!(cache.get(&0).is_ok());
-	/// // Getting a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.get(&1).is_err());
-	/// ```
-	/// 
-	
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
-	{
-		let hashed_key = self.hash_key(key);
-
-		// Check DRAM tier first
-		#[cfg(feature = "enable_tiering_manager")]
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				let arc_val = dram_object_ref.data();
-				//println!("CACHE: get for key {:?} from DRAM tier", key);
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
-				return Ok(arc_val.as_ref().to_vec());
-			}
-
-		}
-
-		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
-				let arc_val = object.data();
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				Ok(arc_val.as_ref().to_vec())
-			},
-
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-
-		// Optional: inspect the underlying bytes/tier of the returned value for debugging
-		//println!("CACHE: get result for key {:?}: {:?} ", key, result);
-		result
-	}
-
 
 
 
@@ -3199,297 +2412,6 @@ where
 
 		Ok(())
 	}
-
-
-
-	/// Deletes the object associated with the supplied key in the cache.
-	/// Returns a [`CacheError`] if the key was not found in the cache.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	/// assert!(cache.del(&0).is_ok());
-	///
-	/// // Deleting a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.del(&1).is_err());
-	/// ```
-	
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	/// Checks if an object with the supplied key exists in the cache without
-	/// altering any of the cache's internal queues.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// assert!(cache.has(&0));
-	/// assert!(!cache.has(&1));
-	/// ```
-	
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			//.get(&hashed_key)
-			.read().unwrap().get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	/// Gets (peeks) the value associated with the supplied key without altering
-	/// any of the cache's internal queues.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	/// cache.set(1, 0, None);
-	///
-	/// // Peeking a key which exists in the cache will return the associated value.
-	/// assert!(cache.peek(&0).is_ok());
-	/// // Peeking a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.peek(&2).is_err());
-	///
-	/// cache.set(2, 0, None);
-	///
-	/// // Peeking a key will not alter the eviction order of the objects.
-	/// assert!(cache.peek(&1).is_ok());
-	/// assert!(cache.peek(&2).is_ok());
-	/// ```
-	
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferPMEM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		//match self.objects.get(&hashed_key) {
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Sets the TTL associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None); // value will not expire
-	/// cache.ttl(&0, Some(5)); // value will expire in 5 seconds
-	/// ```
-	
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		//let mut object = match self.objects.get_mut(&hashed_key) {
-		//let mut object = match self.objects.write().unwrap().get_mut(&hashed_key) {
-		let mut objects_guard = self.objects.write().unwrap();
-		let object = match objects_guard.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	/// Gets the size of the value associated with the supplied key in bytes.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// // Sizing a key which exists in the cache will return the size of the associated value.
-	/// assert!(cache.size(&0).is_ok());
-	/// // Sizing a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.size(&1).is_err());
-	/// ```
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		//match self.objects.get(&hashed_key) {
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Deletes all objects in the cache and sets the cache's used size to zero.
-	/// Returns a [`CacheError`] if the objects could not be wiped.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.wipe();
-	/// ```
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		//self.objects.clear();
-		self.objects.write().unwrap().clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	/// Resizes the cache to the supplied maximum size.
-	/// If the supplied size is zero, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.resize(1).is_ok());
-	///
-	/// // Resizing to a size of zero will return a CacheError.
-	/// assert!(cache.resize(0).is_err());
-	/// ```
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	/// Sets the eviction policy of the cache to the supplied policy.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.policy(PaperPolicy::Lfu).is_ok());
-	/// assert!(cache.policy(PaperPolicy::Lru).is_err());
-	/// ```
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
-	}
 }
 
 #[cfg(all(feature = "global_flatmap_pmem", not(feature = "key_value_pmem"), not(feature = "global_hashtable_pmem")))]
@@ -3576,34 +2498,6 @@ where
 		Ok(cache)
 	}
 
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
-			},
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-		result
-	}
-
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
@@ -3643,131 +2537,6 @@ where
 		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
 
 		Ok(())
-	}
-
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.read().unwrap().get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let object = match objects_guard.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		self.objects.write().unwrap().clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
 	}
 }
 
@@ -3849,34 +2618,6 @@ where
 		Ok(cache)
 	}
 
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
-			},
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		result
-	}
-
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
@@ -3914,136 +2655,6 @@ where
 		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
 
 		Ok(())
-	}
-
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.read().unwrap().get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let object = match objects_guard.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let keys: Vec<_> = objects_guard.iter().map(|(k, _)| *k).collect();
-		for key in keys {
-			objects_guard.remove_unchecked(&key);
-		}
-		drop(objects_guard);
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
 	}
 }
 
@@ -4127,33 +2738,6 @@ where
 		Ok(cache)
 	}
 
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
-			},
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		result
-	}
-
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
@@ -4192,136 +2776,6 @@ where
 		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
 
 		Ok(())
-	}
-
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.read().unwrap().get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferPMEM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let object = match objects_guard.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let keys: Vec<_> = objects_guard.iter().map(|(k, _)| *k).collect();
-		for key in keys {
-			objects_guard.remove_unchecked(&key);
-		}
-		drop(objects_guard);
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
 	}
 }
 
