@@ -79,6 +79,17 @@ hashtable_tiering = []
 
 sets_dram = []
 
+# Tiering with both key and value in PMEM.
+# Activates the tiering manager (hot objects are copied to DRAM for fast access)
+# while placing *both* the key and the value in persistent memory via the Hybrid
+# allocator.  Objects are therefore either:
+#   • PMEM-only   – cold objects live exclusively in persistent memory, or
+#   • PMEM + DRAM – hot objects have their primary copy in PMEM and a fast DRAM
+#                   read-cache copy that is kept consistent by the tiering manager.
+# This is equivalent to enabling `key_pmem_value_pmem` + `enable_tiering_manager`
+# together.
+tiering = ["key_pmem_value_pmem", "enable_tiering_manager"]
+
 # Legacy features (deprecated, will be removed)
 default = []
 original = []
