@@ -340,3 +340,158 @@ mod hashtable_tiering_tests {
         assert_eq!(result.len(), 50);
     }
 }
+
+/// Tests for the `multitiering` feature, which enables three-tier data movement
+/// with both key and value stored in PMEM (`key_pmem_value_pmem` + `enable_tiering_manager`
+/// + `hashtable_tiering`).
+///
+/// Objects move through three tiers:
+///   • PMEM-only      – cold objects live exclusively in persistent memory,
+///   • Warm (pointer) – a metadata/pointer record is in DRAM, data stays in CXL,
+///   • Hot (copy)     – a full physical copy of the data is in DRAM for fastest reads.
+#[cfg(feature = "multitiering")]
+mod multitiering_tests {
+    use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
+    use std::thread;
+    use std::time::Duration;
+
+    fn make_cache() -> PaperCache<u32, BufferPMEM> {
+        PaperCache::<u32, BufferPMEM>::new(
+            10_000_000, // 10 MB – well above any DRAM threshold reached in tests
+            &[PaperPolicy::Lfu],
+            PaperPolicy::Lfu,
+        )
+        .expect("Failed to create cache with multitiering feature")
+    }
+
+    /// A freshly created cache should have empty tiering statistics.
+    #[test]
+    fn test_multitiering_initial_stats_are_empty() {
+        let cache = make_cache();
+        let stats = cache.tiering_stats();
+        assert_eq!(stats.dram_objects, 0);
+        assert_eq!(stats.promotions, 0);
+        assert_eq!(stats.demotions, 0);
+        assert_eq!(stats.pmem_only_objects, 0);
+    }
+
+    /// Objects inserted via `set` should initially appear in PMEM-only tier.
+    #[test]
+    fn test_multitiering_new_objects_start_in_pmem_only() {
+        let cache = make_cache();
+
+        for i in 0..5u32 {
+            cache.set(i, &[0u8; 100], None).expect("set failed");
+        }
+
+        thread::sleep(Duration::from_millis(150));
+
+        let stats = cache.tiering_stats();
+        assert_eq!(stats.pmem_only_objects, 5, "all objects should start PMEM-only");
+        assert_eq!(stats.dram_objects, 0, "no objects should be in DRAM yet");
+    }
+
+    /// After enough accesses (warm_threshold) an object should be promoted to
+    /// the warm tier (pointer-only in DRAM, data still in CXL/PMEM).
+    #[test]
+    fn test_multitiering_warm_tier_promotion() {
+        let cache = make_cache();
+
+        // Default warm_threshold = 2
+        cache.set(10u32, &[55u8; 128], None).expect("set failed");
+        thread::sleep(Duration::from_millis(100));
+
+        // First access – still PMEM-only
+        cache.get(&10u32).expect("get failed");
+        thread::sleep(Duration::from_millis(50));
+
+        // Second access – should trigger warm promotion
+        cache.get(&10u32).expect("get failed");
+        thread::sleep(Duration::from_millis(200));
+
+        let stats = cache.tiering_stats();
+        println!(
+            "multitiering warm: dram_objects={}, promotions={}, dram_size={}",
+            stats.dram_objects, stats.promotions, stats.dram_size
+        );
+        assert!(stats.dram_objects >= 1, "expected object promoted to warm tier");
+        assert!(stats.promotions >= 1, "expected at least one promotion");
+    }
+
+    /// After enough accesses (hot_threshold) an object should be promoted to
+    /// the hot tier (full physical copy in DRAM).
+    #[test]
+    fn test_multitiering_hot_tier_promotion() {
+        let cache = make_cache();
+
+        // Default warm_threshold = 2, hot_threshold = 5
+        cache.set(20u32, &[77u8; 200], None).expect("set failed");
+        thread::sleep(Duration::from_millis(100));
+
+        // Access 5 times to reach hot threshold
+        for _ in 0..5 {
+            cache.get(&20u32).expect("get failed");
+            thread::sleep(Duration::from_millis(40));
+        }
+        thread::sleep(Duration::from_millis(300));
+
+        let stats = cache.tiering_stats();
+        println!(
+            "multitiering hot: dram_objects={}, promotions={}, dram_size={}",
+            stats.dram_objects, stats.promotions, stats.dram_size
+        );
+        assert!(stats.dram_objects >= 1, "expected object in DRAM (hot tier)");
+        assert!(stats.promotions >= 2, "expected warm + hot promotions");
+        assert!(stats.dram_size > 0, "hot tier should have non-zero DRAM size");
+    }
+
+    /// Data read from a promoted (hot-tier) object must equal the originally stored value.
+    #[test]
+    fn test_multitiering_data_integrity_after_hot_promotion() {
+        let cache = make_cache();
+
+        let expected: Vec<u8> = (0u8..64).collect();
+        cache.set(30u32, &expected, None).expect("set failed");
+        thread::sleep(Duration::from_millis(100));
+
+        // Drive past warm and hot thresholds
+        for _ in 0..6 {
+            let _ = cache.get(&30u32);
+            thread::sleep(Duration::from_millis(30));
+        }
+        thread::sleep(Duration::from_millis(250));
+
+        let result = cache.get(&30u32).expect("get after hot promotion failed");
+        assert_eq!(result, expected, "data integrity check failed after hot promotion");
+    }
+
+    /// The DRAM and hotness thresholds can be configured at runtime.
+    #[test]
+    fn test_multitiering_threshold_configuration() {
+        let cache = make_cache();
+
+        cache.set_dram_threshold(100_000_000);
+        assert_eq!(cache.dram_threshold(), 100_000_000);
+
+        cache.set_hotness_threshold(10);
+        assert_eq!(cache.hotness_threshold(), 10);
+    }
+
+    /// `wipe` clears objects and resets multitiering state.
+    #[test]
+    fn test_multitiering_wipe_resets_state() {
+        let cache = make_cache();
+
+        for i in 0..3u32 {
+            cache.set(i, &[1u8; 64], None).expect("set failed");
+        }
+        thread::sleep(Duration::from_millis(100));
+
+        cache.wipe().expect("wipe failed");
+        thread::sleep(Duration::from_millis(100));
+
+        let stats = cache.tiering_stats();
+        assert_eq!(stats.pmem_only_objects, 0, "pmem_only_objects should be 0 after wipe");
+        assert_eq!(stats.dram_objects, 0, "dram_objects should be 0 after wipe");
+    }
+}
