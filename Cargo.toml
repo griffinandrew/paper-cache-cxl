@@ -101,9 +101,14 @@ tiering = ["key_pmem_value_pmem", "enable_tiering_manager"]
 # and uses the warm_threshold / hot_threshold knobs from TieringConfig.
 multitiering = ["key_pmem_value_pmem", "enable_tiering_manager", "hashtable_tiering"]
 
-# Two-tier DRAM-first cache with S3-FIFO-inspired promotion logic.
-# Wraps two PaperCache instances (small tier + main tier) and promotes
-# frequently accessed items from the small tier to the main tier.
+# Two-tier cache: small DRAM tier (S3-FIFO) backed by a far memory tier (LRU).
+# Writes land in the small S3-FIFO tier; evictions from small are forwarded to
+# the far LRU tier via the PolicyWorker eviction callback.  A main-tier hit
+# schedules a background re-insertion into small so S3-FIFO's ghost queue
+# controls the next admission tier.
+# In production with nightly Rust + key_value_pmem, the far tier uses
+# BufferPMEM (persistent/CXL memory).  On stable Rust the far tier uses
+# BufferDRAM to remain compilable without nightly feature flags.
 hybridcache = ["all_dram"]
 
 # Legacy features (deprecated, will be removed)

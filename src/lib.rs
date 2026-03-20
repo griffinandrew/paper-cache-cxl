@@ -1441,6 +1441,73 @@ where
 	fn hash_key(&self, key: &K) -> HashedKey {
 		self.hasher.hash_one(key)
 	}
+
+	/// Creates an empty `PaperCache` that fires `eviction_callback` each time
+	/// the policy worker evicts an item.
+	///
+	/// The callback receives the item's hashed key, an `Arc` to its value, and
+	/// a reference to its original key.  It is invoked from the policy worker
+	/// background thread so it must be `Send + Sync`.
+	///
+	/// Used by [`crate::hybridcache::S3FifoHybridCache`] to write evicted items
+	/// to the far-memory tier.
+	#[cfg(feature = "hybridcache")]
+	pub fn new_with_eviction_callback(
+		max_size: CacheSize,
+		policies: &[PaperPolicy],
+		policy: PaperPolicy,
+		eviction_callback: Box<dyn for<'a> Fn(HashedKey, Arc<BufferDRAM>, &'a K) + Send + Sync>,
+	) -> Result<Self, CacheError>
+	where
+		S: Default,
+		K: Clone,
+	{
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		if policies.is_empty() {
+			return Err(CacheError::EmptyPolicies);
+		}
+
+		if policies.contains(&PaperPolicy::Auto) {
+			return Err(CacheError::ConfiguredAutoPolicy);
+		}
+
+		if policies.iter().is_multiset() {
+			return Err(CacheError::DuplicatePolicies);
+		}
+
+		if !policy.is_auto() && !policies.contains(&policy) {
+			return Err(CacheError::UnconfiguredPolicy);
+		}
+
+		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		let (worker_sender, worker_listener) = unbounded();
+
+		let mut worker_manager = WorkerManager::new_with_eviction_callback(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+			eviction_callback,
+		)?;
+
+		thread::spawn(move || worker_manager.run());
+
+		let cache = PaperCache {
+			objects,
+			status,
+			worker_manager: Arc::new(worker_sender),
+			overhead_manager,
+			hasher: Default::default(),
+		};
+
+		Ok(cache)
+	}
 }
 
 
@@ -4521,6 +4588,11 @@ where
 }
 
 unsafe impl<K, V, S> Send for PaperCache<K, V, S> {}
+// SAFETY: `PaperCache` uses a `DashMap` (internally sharded, `Sync`)
+// for the object store and `Arc`-wrapped atomics / `crossbeam_channel`
+// senders for all shared state.  No unsynchronised mutable access
+// is exposed, so sharing a `&PaperCache` across threads is safe.
+unsafe impl<K, V, S> Sync for PaperCache<K, V, S> {}
 
 #[cfg(all(test, feature = "original"))]
 mod tests {
