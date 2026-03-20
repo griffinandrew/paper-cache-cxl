@@ -101,6 +101,11 @@ tiering = ["key_pmem_value_pmem", "enable_tiering_manager"]
 # and uses the warm_threshold / hot_threshold knobs from TieringConfig.
 multitiering = ["key_pmem_value_pmem", "enable_tiering_manager", "hashtable_tiering"]
 
+# Two-tier DRAM-first cache with S3-FIFO-inspired promotion logic.
+# Wraps two PaperCache instances (small tier + main tier) and promotes
+# frequently accessed items from the small tier to the main tier.
+hybridcache = ["all_dram"]
+
 # Legacy features (deprecated, will be removed)
 default = []
 original = []

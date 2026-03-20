@@ -69,6 +69,13 @@ pub mod hw_perf_counters;
 #[cfg(feature = "hw_perf")]
 pub use crate::hw_perf_counters::{get_hw_counters, get_hw_hashmap_stats, print_hw_perf_stats, measure_operation, HwHashMapStats, HwPerfMeasurement};
 
+// Two-tier DRAM-first cache with S3-FIFO-inspired promotion logic.
+#[cfg(feature = "hybridcache")]
+pub mod hybridcache;
+
+#[cfg(feature = "hybridcache")]
+pub use crate::hybridcache::{S3FifoHybridCache, HybridCacheConfig, HybridCacheStats};
+
 
 use std::sync::RwLock;
 
