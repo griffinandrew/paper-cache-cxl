@@ -2341,6 +2341,7 @@ where
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
                 }
                 
+                #[cfg(feature = "sets_dram")]
                 Tier::DramOnly => {
                     // Remove from DRAM cache (DRAM-only tier)
                     self.dram_cache.remove(&key);

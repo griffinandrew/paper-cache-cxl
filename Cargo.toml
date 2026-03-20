@@ -90,6 +90,17 @@ sets_dram = []
 # together.
 tiering = ["key_pmem_value_pmem", "enable_tiering_manager"]
 
+# Multi-tier data movement with both key and value in PMEM.
+# Extends the `tiering` feature with a three-tier promotion hierarchy:
+#   • PMEM-only      – cold objects live exclusively in persistent memory,
+#   • Warm (pointer) – a metadata/pointer record is kept in DRAM while data
+#                      stays in CXL/PMEM (zero-copy promotion), or
+#   • Hot (copy)     – a full physical copy of the object resides in DRAM for
+#                      the fastest possible read latency.
+# Combines `key_pmem_value_pmem` + `enable_tiering_manager` + `hashtable_tiering`
+# and uses the warm_threshold / hot_threshold knobs from TieringConfig.
+multitiering = ["key_pmem_value_pmem", "enable_tiering_manager", "hashtable_tiering"]
+
 # Legacy features (deprecated, will be removed)
 default = []
 original = []
