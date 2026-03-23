@@ -1080,7 +1080,7 @@ where
 	{
 		let hashed_key = self.hash_key(key);
 
-		#[cfg(debug_assertions)] println!("GET for key");
+		#[cfg(debug_assertions)] println!("GET for key in all dram");
 
 		// all_dram implementation - no tiering, all data in DRAM
 		let result = match self.objects.get(&hashed_key) {

@@ -404,6 +404,7 @@ return Ok(String::from_utf8_lossy(&val).into_owned());
 match self.main.get(key) {
 Ok(val) => {
 self.stats.main_hits.fetch_add(1, Ordering::Relaxed);
+#[cfg(debug_assertions)]println!("Far tier hit for key {:?} (scheduling reinsertion into small tier)", key);
 // Schedule background re-insertion into the small DRAM tier.
 let _ = self.reinsertion_tx.send((key.clone(), val.clone()));
 Ok(String::from_utf8_lossy(&val).into_owned())
