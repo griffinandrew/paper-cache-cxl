@@ -475,7 +475,6 @@ pub fn set_with_ttl(&self, key: K, value: &str, ttl: u32) -> Result<(), CacheErr
 ///
 /// Returns [`CacheError::KeyNotFound`] when the key is absent from both
 /// tiers and is not in-flight.
-///
 pub fn get(&self, key: &K) -> Result<String, CacheError> {
     // Fast path: small DRAM tier.
     if let Ok(val) = self.small.get(key) {
@@ -496,7 +495,7 @@ pub fn get(&self, key: &K) -> Result<String, CacheError> {
             let _ = self.reinsertion_tx.send((key.clone(), val.clone()));
             Ok(String::from_utf8_lossy(&val).into_owned())
         }
-Err(_) => {
+        Err(_) => {
             // Before recording a miss, check whether the key is currently
             // being migrated from the DRAM tier to the PMEM tier.  During
             // that narrow window the key is present in neither tier's
