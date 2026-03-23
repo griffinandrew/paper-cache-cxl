@@ -396,6 +396,7 @@ self.small.set(key, value.as_bytes(), Some(ttl))
 pub fn get(&self, key: &K) -> Result<String, CacheError> {
 // Fast path: small DRAM tier.
 if let Ok(val) = self.small.get(key) {
+#[cfg(debug_assertions)]println!("Small tier hit for key {:?}", key);
 self.stats.small_hits.fetch_add(1, Ordering::Relaxed);
 return Ok(String::from_utf8_lossy(&val).into_owned());
 }
