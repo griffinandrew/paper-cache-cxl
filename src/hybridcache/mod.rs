@@ -436,6 +436,24 @@ pub fn has(&self, key: &K) -> bool {
 self.small.has(key) || self.main.has(key)
 }
 
+/// Returns `true` if `key` is currently in the **small DRAM tier**.
+///
+/// Useful for testing and diagnostics to confirm that a key has been
+/// admitted (or re-admitted) to the DRAM tier.
+pub fn has_in_dram(&self, key: &K) -> bool {
+self.small.has(key)
+}
+
+/// Returns `true` if `key` is currently in the **far PMEM tier**.
+///
+/// Because the hybrid cache uses copy-on-read semantics — a far-tier hit
+/// schedules an asynchronous re-insertion into the DRAM tier without
+/// removing the PMEM copy — a key can be present in both tiers
+/// simultaneously.
+pub fn has_in_pmem(&self, key: &K) -> bool {
+self.main.has(key)
+}
+
 /// Clears **both** tiers.
 ///
 /// # Errors

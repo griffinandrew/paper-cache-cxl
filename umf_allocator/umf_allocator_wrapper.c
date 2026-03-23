@@ -265,10 +265,19 @@ int umf_allocator_init(int numa_node) {
 
 
 void *umf_alloc(size_t size, size_t align) {
-    if (!pool || size == 0)
+    if (size == 0)
         return NULL;
 
     pthread_mutex_lock(&pool_lock);
+
+    /* Re-check pool inside the lock: umf_allocator_finalize (atexit) may have
+     * destroyed the pool between the caller's initial check and us acquiring
+     * the mutex.  Without this check the subsequent umfPoolMalloc call would
+     * receive a NULL pool handle and trigger a [FATAL UMF] assertion. */
+    if (!pool) {
+        pthread_mutex_unlock(&pool_lock);
+        return NULL;
+    }
 
     void *ptr;
     if (align && align > sizeof(void*)) {
@@ -283,11 +292,20 @@ void *umf_alloc(size_t size, size_t align) {
 
 
 void umf_dealloc(void *ptr) {
-    if (!pool || !ptr)
+    if (!ptr)
         return;
 
     pthread_mutex_lock(&pool_lock);
-    umfPoolFree(pool, ptr);
+
+    /* Re-check pool inside the lock: umf_allocator_finalize (atexit) may have
+     * set pool = NULL between the caller's initial check and us acquiring the
+     * mutex, causing umfPoolFree to receive a NULL pool handle which triggers a
+     * [FATAL UMF] assertion.  If the pool is already gone, the memory was
+     * already released by umfPoolDestroy — skip the redundant free. */
+    if (pool) {
+        umfPoolFree(pool, ptr);
+    }
+
     pthread_mutex_unlock(&pool_lock);
 }
 

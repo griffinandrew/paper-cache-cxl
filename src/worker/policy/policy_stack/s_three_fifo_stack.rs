@@ -275,4 +275,65 @@ mod tests {
 
 		assert_eq!(stack.evict_one(), None);
 	}
+
+	/// A key that passes through the ghost queue on its second visit is routed
+	/// to S3-FIFO's *main* queue and therefore survives longer than fresh keys
+	/// that are still in the *small* queue.
+	///
+	/// Scenario
+	/// --------
+	/// 1. Insert keys 0, 1, 2 into a capacity-4 stack (small.max=2, main.max=2).
+	/// 2. Manually trigger one eviction: key 0 (tail of small, freq=0) is
+	///    evicted and placed into the ghost queue.
+	/// 3. Re-insert key 0.  Because it is in the ghost queue, it is routed to
+	///    the *main* queue instead of the small queue.
+	/// 4. Drain the stack.  Keys 1 and 2 (still in *small*) must be evicted
+	///    before key 0 (in *main*), proving the ghost-queue admission control
+	///    is working.
+	#[test]
+	fn ghost_queue_routes_reinserted_key_to_main() {
+		use crate::worker::policy::policy_stack::{PolicyStack, SThreeFifoStack};
+
+		// capacity=4, ratio=0.5 → small.max=2, main.max=2
+		let mut stack = SThreeFifoStack::new(0.5, 4);
+
+		// Insert three keys (all freq=0) – the stack temporarily exceeds its
+		// per-queue capacity; eviction is driven by evict_one() below.
+		stack.insert(0, 1); // small: [0]
+		stack.insert(1, 1); // small: [1, 0]
+		stack.insert(2, 1); // small: [2, 1, 0]
+
+		// Evict one item from the *small* queue tail (key 0, freq=0).
+		// Key 0 now lives in the ghost queue, not in any active queue.
+		let evicted = stack.evict_one();
+		assert_eq!(evicted, Some(0), "tail of small queue (key 0, freq=0) evicted first");
+		assert!(!stack.contains(0), "key 0 must be absent after eviction");
+
+		// Re-insert key 0: the ghost queue contains it → main queue admission.
+		stack.insert(0, 1);
+		assert!(stack.contains(0), "re-inserted key 0 must be in the stack");
+
+		// Drain the remaining keys.
+		//
+		// Keys 1 and 2 are still in the *small* queue.  The PolicyWorker
+		// prioritises small-queue evictions when main is not full, so keys 1
+		// and 2 must be evicted before key 0 (which is in the *main* queue).
+		assert_eq!(
+			stack.evict_one(),
+			Some(1),
+			"small-queue tail (key 1) must be evicted before the main-queue key",
+		);
+		assert_eq!(
+			stack.evict_one(),
+			Some(2),
+			"small-queue head (key 2) must be evicted before the main-queue key",
+		);
+		// Key 0 is in the main queue and outlasts both small-queue items.
+		assert_eq!(
+			stack.evict_one(),
+			Some(0),
+			"main-queue key 0 (ghost-hit admission) must be evicted last",
+		);
+		assert_eq!(stack.evict_one(), None, "stack must be empty after all evictions");
+	}
 }
