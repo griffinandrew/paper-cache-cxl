@@ -101,6 +101,19 @@ tiering = ["key_pmem_value_pmem", "enable_tiering_manager"]
 # and uses the warm_threshold / hot_threshold knobs from TieringConfig.
 multitiering = ["key_pmem_value_pmem", "enable_tiering_manager", "hashtable_tiering"]
 
+# Two-tier cache: small DRAM tier (S3-FIFO) backed by a far PMEM tier (LRU).
+# - Small cache: all in DRAM using BufferDRAM (requires all_dram)
+# - Far/main cache: all in PMEM using BufferPMEM (requires key_pmem_value_pmem
+#   + eviction_stacks_pmem; needs nightly Rust for allocator_api).
+#
+# Data flow:
+#   set(k,v)  → small DRAM tier (S3-FIFO)
+#                    │ eviction (PolicyWorker callback)
+#                    ▼
+#               far PMEM tier (LRU)
+#   get(k)    → small hit? return  │no→ far hit? return + re-insert into small
+hybridcache = ["all_dram", "key_pmem_value_pmem", "eviction_stacks_pmem"]
+
 # Legacy features (deprecated, will be removed)
 default = []
 original = []

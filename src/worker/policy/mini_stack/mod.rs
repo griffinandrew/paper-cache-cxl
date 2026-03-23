@@ -95,6 +95,16 @@ impl PolicyStack for MiniStack {
 	}
 
 	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
+		// Guard: if the item is larger than the entire mini-stack budget, skip
+		// it.  This can happen when the cache capacity is very small (e.g. in
+		// integration tests using tiny caches) because the mini-stack size is
+		// computed as a small fraction (~0.1 %) of the cache size.  Skipping
+		// oversized items is safe — the sampling is approximate by design and
+		// missing large items does not affect correctness.
+		if (size as CacheSize) >= self.max_size {
+			return;
+		}
+
 		self.reduce(self.max_size - size as CacheSize);
 
 		if let Some(old_size) = self.sizes.insert(key, size) {
