@@ -258,17 +258,39 @@ int umf_allocator_init(int numa_node) {
 
     pthread_mutex_unlock(&pool_lock);
 
-    atexit(umf_allocator_finalize);
+    /* Do NOT register umf_allocator_finalize via atexit.
+     *
+     * Under large cache loads, background PolicyWorker and reinsertion threads
+     * continue to alloc/dealloc PMEM buffers via HybridObjects after main()
+     * returns.  An atexit handler would destroy the UMF pool while those
+     * threads are still active, causing [FATAL UMF] assertion failures
+     * (umfPoolFree / umfPoolMalloc receiving a NULL pool handle) and
+     * "memory allocation of N bytes failed" panics in Rust.
+     *
+     * The OS reclaims all virtual memory (including UMF-managed PMEM pages)
+     * when the process exits, so explicit pool teardown is unnecessary.
+     * Call umf_allocator_finalize() explicitly before exit if deterministic
+     * cleanup is required in a controlled shutdown path.
+     */
     return 0;
 }
 
 
 
 void *umf_alloc(size_t size, size_t align) {
-    if (!pool || size == 0)
+    if (size == 0)
         return NULL;
 
     pthread_mutex_lock(&pool_lock);
+
+    /* Guard against explicit umf_allocator_finalize() calls from a controlled
+     * shutdown path: if the pool has already been destroyed, return NULL rather
+     * than passing a NULL pool handle to umfPoolMalloc (which would trigger a
+     * [FATAL UMF] assertion). */
+    if (!pool) {
+        pthread_mutex_unlock(&pool_lock);
+        return NULL;
+    }
 
     void *ptr;
     if (align && align > sizeof(void*)) {
@@ -283,11 +305,20 @@ void *umf_alloc(size_t size, size_t align) {
 
 
 void umf_dealloc(void *ptr) {
-    if (!pool || !ptr)
+    if (!ptr)
         return;
 
     pthread_mutex_lock(&pool_lock);
-    umfPoolFree(pool, ptr);
+
+    /* Guard against explicit umf_allocator_finalize() calls from a controlled
+     * shutdown path: if the pool has already been destroyed, skip the free
+     * rather than passing a NULL pool handle to umfPoolFree (which would
+     * trigger a [FATAL UMF] assertion).  The memory was already released by
+     * umfPoolDestroy when finalize was called. */
+    if (pool) {
+        umfPoolFree(pool, ptr);
+    }
+
     pthread_mutex_unlock(&pool_lock);
 }
 

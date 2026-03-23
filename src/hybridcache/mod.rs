@@ -9,12 +9,12 @@
 //!
 //! [`S3FifoHybridCache`] wraps two [`crate::PaperCache`] instances:
 //!
-//! - **Small tier** (DRAM, S3-FIFO, configurable fraction – default 10 %):
+//! - **Small tier** (DRAM, S3-FIFO, configurable size – default 1 MB):
 //!   backed by [`crate::BufferDRAM`].  Receives **all** newly inserted items.
 //!   When the small tier evicts an item the PolicyWorker eviction callback
 //!   automatically writes it to the far PMEM tier.
 //!
-//! - **Far / main tier** (PMEM, LRU, remaining capacity):
+//! - **Far / main tier** (PMEM, LRU, configurable size – default 9 MB):
 //!   backed by [`crate::BufferPMEM`] (Hybrid allocator → persistent / CXL
 //!   memory).  Acts as the backing store populated exclusively by evictions
 //!   from the small tier.
@@ -58,16 +58,23 @@
 //! # Example
 //!
 //! ```ignore
-//! use paper_cache::hybridcache::{S3FifoHybridCache, HybridCacheConfig};
+//! use paper_cache::hybridcache::{S3FifoHybridCache, HybridCacheConfig, CacheTierSize};
 //!
-//! let config = HybridCacheConfig::default();
+//! let config = HybridCacheConfig {
+//!     small_size: CacheTierSize::Mb(1),
+//!     main_size: CacheTierSize::Gb(2),
+//!     ..Default::default()
+//! };
 //! let cache = S3FifoHybridCache::<u32>::new(config).unwrap();
 //!
-//! // Insert a value – it starts in the small DRAM tier.
-//! cache.set(1u32, &[0u8; 128], None).unwrap();
+//! // Insert a string value – it starts in the small DRAM tier.
+//! cache.set(1u32, "hello world").unwrap();
 //!
 //! let val = cache.get(&1u32).unwrap();
-//! assert_eq!(val.len(), 128);
+//! assert_eq!(val, "hello world");
+//!
+//! // Insert with an explicit TTL of 60 seconds.
+//! cache.set_with_ttl(2u32, "expires soon", 60).unwrap();
 //! ```
 
 use std::{
@@ -84,45 +91,100 @@ use typesize::TypeSize;
 
 use crate::{PaperCache, PaperPolicy, CacheError, BufferDRAM, BufferPMEM};
 
+// ── Tier Size ─────────────────────────────────────────────────────────────────
+
+/// A size specification for a cache tier, in bytes, megabytes, or gigabytes.
+///
+/// Used in [`HybridCacheConfig`] to set the capacity of each tier independently.
+///
+/// # Examples
+///
+/// ```ignore
+/// use paper_cache::hybridcache::{HybridCacheConfig, CacheTierSize};
+///
+/// let config = HybridCacheConfig {
+///     small_size: CacheTierSize::Mb(1),
+///     main_size: CacheTierSize::Gb(2),
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTierSize {
+    /// Exact capacity in bytes.
+    Bytes(u64),
+    /// Capacity in decimal megabytes (1 MB = 1,000,000 bytes, SI standard).
+    Mb(u64),
+    /// Capacity in decimal gigabytes (1 GB = 1,000,000,000 bytes, SI standard).
+    Gb(u64),
+}
+
+impl CacheTierSize {
+    /// Returns the size converted to bytes.
+    pub fn to_bytes(self) -> u64 {
+        match self {
+            CacheTierSize::Bytes(b) => b,
+            CacheTierSize::Mb(mb) => mb * 1_000_000,
+            CacheTierSize::Gb(gb) => gb * 1_000_000_000,
+        }
+    }
+}
+
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Configuration for [`S3FifoHybridCache`].
 ///
-/// Use [`HybridCacheConfig::default`] to obtain sensible defaults (10 MB
-/// total, 10 % small DRAM tier, S3-FIFO small policy, LRU far policy).
+/// Use [`HybridCacheConfig::default`] to obtain sensible defaults (1 MB small
+/// DRAM tier, 9 MB far PMEM tier, S3-FIFO small policy, LRU far policy).
+///
+/// Each tier's capacity is specified independently via [`CacheTierSize`],
+/// accepting bytes, megabytes, or gigabytes.
+///
+/// # Examples
+///
+/// ```ignore
+/// use paper_cache::hybridcache::{HybridCacheConfig, CacheTierSize};
+///
+/// let config = HybridCacheConfig {
+///     small_size: CacheTierSize::Mb(2),
+///     main_size: CacheTierSize::Gb(1),
+///     ..Default::default()
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct HybridCacheConfig {
-/// Total cache capacity in bytes.
-pub total_size: u64,
+    /// Capacity of the small (DRAM) tier.
+    ///
+    /// Accepts [`CacheTierSize::Bytes`], [`CacheTierSize::Mb`], or
+    /// [`CacheTierSize::Gb`].  Defaults to 1 MB.
+    pub small_size: CacheTierSize,
 
-/// Fraction of [`total_size`](Self::total_size) reserved for the small
-/// DRAM tier.  Must be in `0.0..=1.0`; clamped silently otherwise.
-///
-/// The far PMEM tier receives the remainder `(1.0 - small_ratio) * total_size`.
-/// Defaults to `0.1` (10 %).
-pub small_ratio: f64,
+    /// Capacity of the far (PMEM) tier.
+    ///
+    /// Accepts [`CacheTierSize::Bytes`], [`CacheTierSize::Mb`], or
+    /// [`CacheTierSize::Gb`].  Defaults to 9 MB.
+    pub main_size: CacheTierSize,
 
-/// Eviction policy used by the small DRAM tier.
-///
-/// Defaults to [`PaperPolicy::SThreeFifo`]`(0.1)`, implementing the full
-/// S3-FIFO policy with its internal small-queue ratio at 10 %.
-pub small_policy: PaperPolicy,
+    /// Eviction policy used by the small DRAM tier.
+    ///
+    /// Defaults to [`PaperPolicy::SThreeFifo`]`(0.1)`, implementing the full
+    /// S3-FIFO policy with its internal small-queue ratio at 10 %.
+    pub small_policy: PaperPolicy,
 
-/// Eviction policy used by the far PMEM tier.
-///
-/// Defaults to [`PaperPolicy::Lru`].
-pub main_policy: PaperPolicy,
+    /// Eviction policy used by the far PMEM tier.
+    ///
+    /// Defaults to [`PaperPolicy::Lru`].
+    pub main_policy: PaperPolicy,
 }
 
 impl Default for HybridCacheConfig {
-fn default() -> Self {
-HybridCacheConfig {
-total_size: 10_000_000, // 10 MB
-small_ratio: 0.1,
-small_policy: PaperPolicy::SThreeFifo(0.1),
-main_policy: PaperPolicy::Lru,
-}
-}
+    fn default() -> Self {
+        HybridCacheConfig {
+            small_size: CacheTierSize::Mb(1), // 1 MB DRAM
+            main_size: CacheTierSize::Mb(9),  // 9 MB PMEM
+            small_policy: PaperPolicy::SThreeFifo(0.1),
+            main_policy: PaperPolicy::Lru,
+        }
+    }
 }
 
 // ── Statistics ────────────────────────────────────────────────────────────────
@@ -178,7 +240,8 @@ promotions: self.promotions.load(Ordering::Relaxed),
 /// `K` is the key type.  It must satisfy:
 /// `'static + Eq + Hash + TypeSize + Debug + Clone + Send + Sync`.
 ///
-/// Values are stored as raw byte slices (`&[u8]` on write, `Vec<u8>` on read).
+/// Values are stored and retrieved as UTF-8 strings (`&str` on write,
+/// `String` on read).
 pub struct S3FifoHybridCache<K>
 where
 K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
@@ -207,15 +270,18 @@ K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
 ///
 /// # Errors
 ///
-/// Returns [`CacheError::ZeroCacheSize`] if `total_size` is zero.
+/// Returns [`CacheError::ZeroCacheSize`] if both `small_size` and
+/// `main_size` resolve to zero bytes.
 pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
-if config.total_size == 0 {
+let small_bytes = config.small_size.to_bytes();
+let main_bytes = config.main_size.to_bytes();
+
+if small_bytes == 0 && main_bytes == 0 {
 return Err(CacheError::ZeroCacheSize);
 }
 
-let ratio = config.small_ratio.clamp(0.0, 1.0);
-let small_size = ((ratio * config.total_size as f64) as u64).max(1);
-let main_size = config.total_size.saturating_sub(small_size).max(1);
+let small_size = small_bytes.max(1);
+let main_size = main_bytes.max(1);
 
 // ── Far PMEM tier – LRU, BufferPMEM ──────────────────────────────────
 // Receives items evicted from the small DRAM tier via the eviction
@@ -282,12 +348,29 @@ stats,
 /// automatically writes it to the far PMEM tier via
 /// `PaperCache<K, BufferPMEM>::set()`.
 ///
+/// No TTL is applied.  Use [`set_with_ttl`](Self::set_with_ttl) when an
+/// expiry time is required.
+///
 /// # Errors
 ///
 /// Propagates any [`CacheError`] returned by the underlying
 /// [`PaperCache::set`] call.
-pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-self.small.set(key, value, ttl)
+pub fn set(&self, key: K, value: &str) -> Result<(), CacheError> {
+self.small.set(key, value.as_bytes(), None)
+}
+
+/// Inserts or updates a key-value pair in the **small DRAM tier** with an
+/// explicit TTL.
+///
+/// Behaves identically to [`set`](Self::set) except that the entry expires
+/// after `ttl` seconds.
+///
+/// # Errors
+///
+/// Propagates any [`CacheError`] returned by the underlying
+/// [`PaperCache::set`] call.
+pub fn set_with_ttl(&self, key: K, value: &str, ttl: u32) -> Result<(), CacheError> {
+self.small.set(key, value.as_bytes(), Some(ttl))
 }
 
 /// Retrieves the value associated with `key`.
@@ -299,15 +382,22 @@ self.small.set(key, value, ttl)
 /// tier so that S3-FIFO's ghost queue drives the admission tier on the next
 /// reference.
 ///
+/// # UTF-8 encoding
+///
+/// Since [`set`](Self::set) and [`set_with_ttl`](Self::set_with_ttl) accept
+/// only `&str`, stored bytes are always valid UTF-8.  Any invalid byte
+/// sequences encountered during retrieval are replaced with the Unicode
+/// replacement character (`�`).
+///
 /// # Errors
 ///
 /// Returns [`CacheError::KeyNotFound`] when the key is absent from both
 /// tiers.
-pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
+pub fn get(&self, key: &K) -> Result<String, CacheError> {
 // Fast path: small DRAM tier.
 if let Ok(val) = self.small.get(key) {
 self.stats.small_hits.fetch_add(1, Ordering::Relaxed);
-return Ok(val);
+return Ok(String::from_utf8_lossy(&val).into_owned());
 }
 
 // Slow path: far PMEM tier.
@@ -316,7 +406,7 @@ Ok(val) => {
 self.stats.main_hits.fetch_add(1, Ordering::Relaxed);
 // Schedule background re-insertion into the small DRAM tier.
 let _ = self.reinsertion_tx.send((key.clone(), val.clone()));
-Ok(val)
+Ok(String::from_utf8_lossy(&val).into_owned())
 }
 Err(_) => {
 self.stats.misses.fetch_add(1, Ordering::Relaxed);
@@ -344,6 +434,24 @@ Err(CacheError::KeyNotFound)
 /// Returns `true` if the key exists (and has not expired) in either tier.
 pub fn has(&self, key: &K) -> bool {
 self.small.has(key) || self.main.has(key)
+}
+
+/// Returns `true` if `key` is currently in the **small DRAM tier**.
+///
+/// Useful for testing and diagnostics to confirm that a key has been
+/// admitted (or re-admitted) to the DRAM tier.
+pub fn has_in_dram(&self, key: &K) -> bool {
+self.small.has(key)
+}
+
+/// Returns `true` if `key` is currently in the **far PMEM tier**.
+///
+/// Because the hybrid cache uses copy-on-read semantics — a far-tier hit
+/// schedules an asynchronous re-insertion into the DRAM tier without
+/// removing the PMEM copy — a key can be present in both tiers
+/// simultaneously.
+pub fn has_in_pmem(&self, key: &K) -> bool {
+self.main.has(key)
 }
 
 /// Clears **both** tiers.
