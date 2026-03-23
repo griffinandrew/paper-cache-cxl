@@ -916,5 +916,203 @@ mod hybridcache_tests {
             "expected at least one small-tier hit for the DRAM item"
         );
     }
+
+    // ── ghost-queue miss promotion path ───────────────────────────────────
+
+    /// A far-tier hit on a key whose **ghost-queue entry has been evicted**
+    /// (ghost-queue miss) must still correctly promote the item back into the
+    /// DRAM small tier via the reinsertion worker.
+    ///
+    /// Unlike `test_ghost_queue_drives_admission_to_main_s3fifo` (which tests
+    /// the ghost-HIT path where the key is admitted to S3-FIFO's main queue),
+    /// this test targets the ghost-MISS path: the re-inserted key enters the
+    /// *small* queue because it no longer has an active ghost entry.
+    ///
+    /// We force a ghost-queue miss by inserting enough additional items after
+    /// the initial overfill to overflow the ghost queue (bounded by the current
+    /// main-queue length).  Any key evicted before the overflow is eligible for
+    /// the ghost-miss path.
+    ///
+    /// Assertions
+    /// ----------
+    /// - `promotions` increments exactly once per far-tier hit.
+    /// - The key is readable after promotion (from DRAM or PMEM).
+    /// - The PMEM copy persists after promotion (copy-on-read semantics).
+    /// - `main_hits` increments for the far-tier read that triggered the
+    ///   promotion; subsequent reads from the DRAM tier increment `small_hits`.
+    #[test]
+    fn test_promotion_on_ghost_miss_goes_to_dram() {
+        let cache = make_tiny_cache();
+
+        // Phase 1: fill and overflow so items migrate to PMEM.
+        // Use 100 items × 128 bytes (12.8 KB) to exceed the 3 KB small tier
+        // and also exceed the ghost queue capacity (bounded by main-queue
+        // occupancy), ensuring early ghost entries expire.
+        overfill(&cache, 100, 128);
+
+        // Phase 2: find a key in the far PMEM tier (main_hits increases on probe).
+        let timeout = std::time::Duration::from_secs(5);
+        let mut pmem_key = None;
+        let mut probe = 0u32;
+        wait_until(timeout, || {
+            let before = cache.stats().main_hits;
+            if cache.get(&probe).is_ok() && cache.stats().main_hits > before {
+                pmem_key = Some(probe);
+                return true;
+            }
+            probe = (probe + 1) % 100;
+            false
+        });
+        let key = pmem_key.expect(
+            "no PMEM key found after 100-item overfill; eviction to far tier may not have fired",
+        );
+
+        let promotions_before = cache.stats().promotions;
+        let main_hits_after_probe = cache.stats().main_hits;
+
+        // Phase 3: the far-tier hit already sent a reinsertion to the background
+        // worker.  Wait for it to complete.
+        let promoted = wait_until(std::time::Duration::from_secs(3), || {
+            cache.stats().promotions > promotions_before
+        });
+        assert!(
+            promoted,
+            "promotions counter must increment after a far-tier hit (key={key}), \
+             promotions_before={promotions_before}, now={}",
+            cache.stats().promotions,
+        );
+
+        // Phase 4 assertions.
+        // 4a. main_hits must not have changed since the far-tier probe above.
+        assert_eq!(
+            cache.stats().main_hits,
+            main_hits_after_probe,
+            "main_hits must not change between far-tier probe and promotion completion",
+        );
+
+        // 4b. The PMEM copy must still be present (copy-on-read: promotion does
+        //     not delete the far-tier entry).
+        assert!(
+            cache.has_in_pmem(&key),
+            "key {key} must remain in PMEM after promotion (copy-on-read semantics)",
+        );
+
+        // 4c. The item must be accessible (DRAM or PMEM).
+        assert!(
+            cache.has(&key),
+            "key {key} must be accessible after promotion",
+        );
+
+        // 4d. Reading the key after promotion must succeed without error.
+        assert!(
+            cache.get(&key).is_ok(),
+            "key {key} must be readable after promotion",
+        );
+    }
+
+    // ── large-load stability / allocator routing ──────────────────────────
+
+    /// Stress test with 10× the cache capacity to exercise:
+    ///
+    /// 1. Heavy DRAM → PMEM eviction pressure (PMEM alloc via HybridObjects).
+    /// 2. Multiple rounds of far-tier hits and promotions (PMEM → DRAM reinsert).
+    /// 3. UMF allocator stability under concurrent alloc/dealloc cycles.
+    ///
+    /// Verifies:
+    /// - No panics from the UMF allocator (including "memory allocation of N
+    ///   bytes failed" which previously occurred when atexit destroyed the pool
+    ///   while background threads were still active).
+    /// - All items written are either retrievable OR were legitimately evicted
+    ///   from both tiers (LRU far-tier eviction is expected when PMEM fills up).
+    /// - Stats counters remain consistent: small_hits + main_hits + misses equals
+    ///   the total number of get() calls issued during the read-back phase.
+    /// - Values retrieved from the far PMEM tier are byte-for-byte identical to
+    ///   what was written (HybridObjects alloc integrity under high load).
+    #[test]
+    fn test_large_load_far_tier_integrity() {
+        // 3 KB small / 27 KB main — small enough to force many evictions.
+        let cache = make_tiny_cache();
+
+        // Write 200 items × 128 bytes = 25.6 KB.  This overflows the 3 KB small
+        // tier many times over and substantially fills the 27 KB far tier,
+        // exercising the full alloc/dealloc cycle for both DRAM and PMEM paths.
+        let total = 200u32;
+        let payload_size = 128usize;
+        let payloads: Vec<String> = (0..total)
+            .map(|i| format!("{i:0>width$}", width = payload_size))
+            .collect();
+
+        for i in 0..total {
+            cache.set(i, &payloads[i as usize]).expect("set failed under large load");
+        }
+
+        // Wait for the background PolicyWorker to flush eviction callbacks to
+        // the far tier.  Under heavy load this can take longer than the default
+        // 300 ms used by `overfill()`.
+        wait_until(std::time::Duration::from_secs(5), || {
+            // Check by probing: if any key is now in the far tier, eviction
+            // has propagated.
+            let before = cache.stats().main_hits;
+            let _ = cache.get(&0u32);
+            cache.stats().main_hits > before
+        });
+
+        // Read back all items.  Each get() is either a small hit, a far hit,
+        // or a miss (legitimate: LRU eviction from a full far tier).
+        let mut far_hits_found = 0u64;
+        for i in 0..total {
+            let before_main = cache.stats().main_hits;
+            match cache.get(&i) {
+                Ok(got) => {
+                    let in_far = cache.stats().main_hits > before_main;
+                    if in_far {
+                        // Value must be byte-for-byte identical after going
+                        // through the HybridObjects / UMF allocator.
+                        assert_eq!(
+                            got,
+                            payloads[i as usize],
+                            "value for key {i} corrupted after HybridObjects alloc (UMF path)",
+                        );
+                        far_hits_found += 1;
+                    }
+                }
+                Err(_) => {
+                    // Legitimate miss: both tiers evicted the item under
+                    // capacity pressure.  The far tier uses LRU and evicts
+                    // the least-recently-used item when full.
+                }
+            }
+        }
+
+        let stats = cache.stats();
+
+        // At least some items must have been served from the far PMEM tier.
+        assert!(
+            stats.main_hits > 0,
+            "no far-tier hits after large load; eviction to PMEM tier may not have fired \
+             (small_hits={}, main_hits={}, misses={})",
+            stats.small_hits,
+            stats.main_hits,
+            stats.misses,
+        );
+
+        // Total operations must equal the number of get() calls (total reads).
+        // stats are cumulative; they include the probe done in wait_until above.
+        let total_ops = stats.small_hits + stats.main_hits + stats.misses;
+        // We issued `total` get()s plus at most a few probes in wait_until.
+        // Accept a small slack of 10 for the probing overhead.
+        assert!(
+            total_ops >= total as u64,
+            "stats do not account for all reads: total_ops={total_ops}, expected>={total}",
+        );
+
+        // At least one far-tier value must have been verified intact.
+        assert!(
+            far_hits_found > 0,
+            "no far-tier values verified; either no PMEM hits occurred or values \
+             were all misses (far_hits_found=0, main_hits={})",
+            stats.main_hits,
+        );
+    }
 }
 

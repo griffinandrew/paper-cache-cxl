@@ -258,7 +258,20 @@ int umf_allocator_init(int numa_node) {
 
     pthread_mutex_unlock(&pool_lock);
 
-    atexit(umf_allocator_finalize);
+    /* Do NOT register umf_allocator_finalize via atexit.
+     *
+     * Under large cache loads, background PolicyWorker and reinsertion threads
+     * continue to alloc/dealloc PMEM buffers via HybridObjects after main()
+     * returns.  An atexit handler would destroy the UMF pool while those
+     * threads are still active, causing [FATAL UMF] assertion failures
+     * (umfPoolFree / umfPoolMalloc receiving a NULL pool handle) and
+     * "memory allocation of N bytes failed" panics in Rust.
+     *
+     * The OS reclaims all virtual memory (including UMF-managed PMEM pages)
+     * when the process exits, so explicit pool teardown is unnecessary.
+     * Call umf_allocator_finalize() explicitly before exit if deterministic
+     * cleanup is required in a controlled shutdown path.
+     */
     return 0;
 }
 
@@ -270,10 +283,10 @@ void *umf_alloc(size_t size, size_t align) {
 
     pthread_mutex_lock(&pool_lock);
 
-    /* Re-check pool inside the lock: umf_allocator_finalize (atexit) may have
-     * destroyed the pool between the caller's initial check and us acquiring
-     * the mutex.  Without this check the subsequent umfPoolMalloc call would
-     * receive a NULL pool handle and trigger a [FATAL UMF] assertion. */
+    /* Guard against explicit umf_allocator_finalize() calls from a controlled
+     * shutdown path: if the pool has already been destroyed, return NULL rather
+     * than passing a NULL pool handle to umfPoolMalloc (which would trigger a
+     * [FATAL UMF] assertion). */
     if (!pool) {
         pthread_mutex_unlock(&pool_lock);
         return NULL;
@@ -297,11 +310,11 @@ void umf_dealloc(void *ptr) {
 
     pthread_mutex_lock(&pool_lock);
 
-    /* Re-check pool inside the lock: umf_allocator_finalize (atexit) may have
-     * set pool = NULL between the caller's initial check and us acquiring the
-     * mutex, causing umfPoolFree to receive a NULL pool handle which triggers a
-     * [FATAL UMF] assertion.  If the pool is already gone, the memory was
-     * already released by umfPoolDestroy — skip the redundant free. */
+    /* Guard against explicit umf_allocator_finalize() calls from a controlled
+     * shutdown path: if the pool has already been destroyed, skip the free
+     * rather than passing a NULL pool handle to umfPoolFree (which would
+     * trigger a [FATAL UMF] assertion).  The memory was already released by
+     * umfPoolDestroy when finalize was called. */
     if (pool) {
         umfPoolFree(pool, ptr);
     }
