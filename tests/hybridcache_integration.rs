@@ -25,15 +25,15 @@
 
 #[cfg(feature = "hybridcache")]
 mod hybridcache_tests {
-    use paper_cache::hybridcache::{HybridCacheConfig, HybridCacheStats, S3FifoHybridCache};
+    use paper_cache::hybridcache::{CacheTierSize, HybridCacheConfig, HybridCacheStats, S3FifoHybridCache};
 
     // ── helpers ───────────────────────────────────────────────────────────
 
     /// Large cache with plenty of headroom so no evictions occur during setup.
     fn make_cache() -> S3FifoHybridCache<u32> {
         let config = HybridCacheConfig {
-            total_size: 500_000,
-            small_ratio: 0.1,
+            small_size: CacheTierSize::Bytes(50_000),
+            main_size: CacheTierSize::Bytes(450_000),
             ..Default::default()
         };
         S3FifoHybridCache::<u32>::new(config).expect("failed to create S3FifoHybridCache")
@@ -44,8 +44,8 @@ mod hybridcache_tests {
     /// ~3 KB small (S3-FIFO DRAM), ~27 KB far (LRU PMEM).
     fn make_tiny_cache() -> S3FifoHybridCache<u32> {
         let config = HybridCacheConfig {
-            total_size: 30_000,
-            small_ratio: 0.1,
+            small_size: CacheTierSize::Bytes(3_000),
+            main_size: CacheTierSize::Bytes(27_000),
             ..Default::default()
         };
         S3FifoHybridCache::<u32>::new(config).expect("failed to create tiny S3FifoHybridCache")
@@ -55,9 +55,9 @@ mod hybridcache_tests {
     /// sleep briefly to let the background PolicyWorker thread process all
     /// eviction callbacks before the caller inspects the far tier.
     fn overfill(cache: &S3FifoHybridCache<u32>, count: u32, payload_size: usize) {
-        let payload = vec![0xABu8; payload_size];
+        let payload = "x".repeat(payload_size);
         for i in 0..count {
-            cache.set(i, &payload, None).expect("set failed");
+            cache.set(i, &payload).expect("set failed");
         }
         // Give the background PolicyWorker time to flush eviction callbacks
         // to the far PMEM tier.
@@ -91,8 +91,8 @@ mod hybridcache_tests {
     #[test]
     fn test_basic_set_and_get() {
         let cache = make_cache();
-        let payload: Vec<u8> = (0u8..64).collect();
-        cache.set(42u32, &payload, None).expect("set failed");
+        let payload = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz01";
+        cache.set(42u32, payload).expect("set failed");
         let result = cache.get(&42u32).expect("get failed");
         assert_eq!(result, payload);
     }
@@ -100,7 +100,7 @@ mod hybridcache_tests {
     #[test]
     fn test_has_present_and_absent() {
         let cache = make_cache();
-        cache.set(1u32, &[0xAA; 32], None).expect("set failed");
+        cache.set(1u32, &"x".repeat(32)).expect("set failed");
         assert!(cache.has(&1u32));
         assert!(!cache.has(&2u32));
     }
@@ -119,7 +119,7 @@ mod hybridcache_tests {
     #[test]
     fn test_new_items_start_in_small_tier() {
         let cache = make_cache();
-        cache.set(10u32, &[1u8; 64], None).expect("set failed");
+        cache.set(10u32, &"x".repeat(64)).expect("set failed");
         cache.get(&10u32).expect("get failed");
         let stats = cache.stats();
         assert_eq!(stats.small_hits, 1, "expected one small-tier hit");
@@ -131,7 +131,7 @@ mod hybridcache_tests {
     fn test_set_goes_to_small_tier_only() {
         let cache = make_cache();
         for i in 0u32..10 {
-            cache.set(i, &[i as u8; 32], None).expect("set failed");
+            cache.set(i, &format!("{i:0>32}")).expect("set failed");
         }
         for i in 0u32..10 {
             cache.get(&i).expect("get failed");
@@ -146,7 +146,7 @@ mod hybridcache_tests {
     #[test]
     fn test_del_from_small_tier() {
         let cache = make_cache();
-        cache.set(60u32, &[0u8; 32], None).expect("set failed");
+        cache.set(60u32, &"x".repeat(32)).expect("set failed");
         assert!(cache.has(&60u32));
         cache.del(&60u32).expect("del failed");
         assert!(!cache.has(&60u32));
@@ -165,8 +165,8 @@ mod hybridcache_tests {
     #[test]
     fn test_wipe_clears_small_tier() {
         let cache = make_cache();
-        cache.set(80u32, &[1u8; 32], None).expect("set failed");
-        cache.set(81u32, &[2u8; 32], None).expect("set failed");
+        cache.set(80u32, "hello").expect("set failed");
+        cache.set(81u32, "world").expect("set failed");
         cache.wipe().expect("wipe failed");
         assert!(!cache.has(&80u32));
         assert!(!cache.has(&81u32));
@@ -186,8 +186,8 @@ mod hybridcache_tests {
     #[test]
     fn test_stats_consistency() {
         let cache = make_cache();
-        cache.set(90u32, &[0u8; 32], None).expect("set failed");
-        cache.set(91u32, &[0u8; 32], None).expect("set failed");
+        cache.set(90u32, "value90").expect("set failed");
+        cache.set(91u32, "value91").expect("set failed");
         cache.get(&90u32).expect("get 90-1 failed");
         cache.get(&90u32).expect("get 90-2 failed");
         cache.get(&91u32).expect("get 91-1 failed");
@@ -202,41 +202,45 @@ mod hybridcache_tests {
 
     #[test]
     fn test_zero_total_size_returns_error() {
-        let config = HybridCacheConfig { total_size: 0, ..Default::default() };
+        let config = HybridCacheConfig {
+            small_size: CacheTierSize::Bytes(0),
+            main_size: CacheTierSize::Bytes(0),
+            ..Default::default()
+        };
         assert!(S3FifoHybridCache::<u32>::new(config).is_err());
     }
 
-    /// When small_ratio is 1.0 the entire budget is in the small tier; the
-    /// cache must still create without error (main tier gets the minimum 1 B).
+    /// When the small tier has the full budget and the main tier is minimal,
+    /// the cache must still create without error.
     #[test]
-    fn test_small_ratio_one_does_not_panic() {
+    fn test_large_small_tier_does_not_panic() {
         let config = HybridCacheConfig {
-            total_size: 100_000,
-            small_ratio: 1.0,
+            small_size: CacheTierSize::Bytes(100_000),
+            main_size: CacheTierSize::Bytes(1),
             ..Default::default()
         };
         // Should not panic or error
         let cache = S3FifoHybridCache::<u32>::new(config).expect("new failed");
-        cache.set(1u32, &[1u8; 32], None).expect("set failed");
+        cache.set(1u32, &"x".repeat(32)).expect("set failed");
         assert!(cache.has(&1u32));
     }
 
-    /// When small_ratio is 0.0 the entire budget is in the far PMEM tier; the
-    /// cache must still create without error (small tier gets the minimum 1 B).
-    /// Insertions will exceed the minimal small tier and be immediately evicted,
-    /// but the cache itself must not panic.
+    /// When the small tier is minimal (1 byte) and the far tier holds the
+    /// full budget, the cache must still create without error.  Insertions
+    /// will be immediately evicted from the tiny small tier, but the cache
+    /// itself must not panic.
     #[test]
-    fn test_small_ratio_zero_does_not_panic() {
+    fn test_tiny_small_tier_does_not_panic() {
         let config = HybridCacheConfig {
-            total_size: 100_000,
-            small_ratio: 0.0,
+            small_size: CacheTierSize::Bytes(1),
+            main_size: CacheTierSize::Bytes(100_000),
             ..Default::default()
         };
         // Creation must succeed without panic.
         let _cache = S3FifoHybridCache::<u32>::new(config).expect("new failed");
         // We don't attempt set() here because the 1-byte small tier would
         // immediately reject any value — the goal is just to verify that
-        // construction with an extreme ratio doesn't panic.
+        // construction with a minimal small tier doesn't panic.
     }
 
     // ── eviction-driven persistence ───────────────────────────────────────
@@ -280,11 +284,11 @@ mod hybridcache_tests {
         let cache = make_tiny_cache();
         // Write distinctive payloads and wait for evictions to settle.
         // We use separate set + overfill calls so each key has a known payload.
-        let mut payloads: Vec<Vec<u8>> = (0u32..50)
-            .map(|i| (0..128).map(|b: u8| b.wrapping_add(i as u8)).collect())
+        let payloads: Vec<String> = (0u32..50)
+            .map(|i| format!("{i:0>128}"))
             .collect();
         for (i, payload) in payloads.iter().enumerate() {
-            cache.set(i as u32, payload, None).expect("set failed");
+            cache.set(i as u32, payload).expect("set failed");
         }
         // Give the PolicyWorker time to evict items to the far tier.
         std::thread::sleep(std::time::Duration::from_millis(400));
@@ -299,8 +303,7 @@ mod hybridcache_tests {
             if let Ok(val) = cache.get(&probe) {
                 assert_eq!(
                     val, payloads[probe as usize],
-                    "key {} value corrupted after tier crossing",
-                    probe,
+                    "key {probe} value corrupted after tier crossing",
                 );
                 if cache.stats().main_hits > before {
                     checked_far += 1;
@@ -315,8 +318,7 @@ mod hybridcache_tests {
             checked_far > 0 || cache.stats().main_hits > 0,
             "no values were verified in the far tier; eviction may not have fired"
         );
-        // Suppress "unused variable" warning when the loop succeeds on first probe.
-        let _ = payloads.pop();
+
     }
 
     // ── DRAM tier isolation ───────────────────────────────────────────────
@@ -341,8 +343,8 @@ mod hybridcache_tests {
         // Value must fit within the small tier.
         // make_cache(): total_size=500_000, small_ratio=0.1 → ~50_000 B small.
         // Use 8 KiB (8_192 B) — comfortably under that limit.
-        let large_value = vec![0xFFu8; 8_192];
-        cache.set(100u32, &large_value, None).expect("set failed");
+        let large_value = "x".repeat(8_192);
+        cache.set(100u32, &large_value).expect("set failed");
         let got = cache.get(&100u32).expect("get failed");
         assert_eq!(got, large_value);
         // Must be a small-tier hit — no eviction occurred for a single item.
@@ -355,11 +357,11 @@ mod hybridcache_tests {
     fn test_dram_tier_overwrite() {
         let cache = make_cache();
         for version in 0u8..10 {
-            let payload = vec![version; 64];
-            cache.set(77u32, &payload, None).expect("set failed");
+            let payload = format!("{:0>64}", version);
+            cache.set(77u32, &payload).expect("set failed");
         }
         let final_val = cache.get(&77u32).expect("get failed");
-        assert_eq!(final_val, vec![9u8; 64], "last overwrite must win");
+        assert_eq!(final_val, format!("{:0>64}", 9u8), "last overwrite must win");
         assert_eq!(cache.stats().small_hits, 1);
         assert_eq!(cache.stats().main_hits, 0);
     }
@@ -371,7 +373,7 @@ mod hybridcache_tests {
         let cache = make_cache();
         // Populate the cache so the far tier is not empty (otherwise this test
         // is trivially true).
-        cache.set(1u32, &[1u8; 32], None).expect("set failed");
+        cache.set(1u32, &"x".repeat(32)).expect("set failed");
         // Query a key that was never inserted.
         let _ = cache.get(&9999u32);
         let stats = cache.stats();
@@ -394,8 +396,8 @@ mod hybridcache_tests {
         // small_ratio=0.1 gives ~2 KB small, ~18 KB far — enough headroom
         // for the MiniStack to handle items without overflowing.
         let config = HybridCacheConfig {
-            total_size: 20_000,
-            small_ratio: 0.1,
+            small_size: CacheTierSize::Bytes(2_000),
+            main_size: CacheTierSize::Bytes(18_000),
             ..Default::default()
         };
         let cache = S3FifoHybridCache::<u32>::new(config).expect("new failed");
@@ -576,7 +578,7 @@ mod hybridcache_tests {
             handles.push(std::thread::spawn(move || {
                 for i in 0u32..50 {
                     let key = t * 50 + i;
-                    c.set(key, &[key as u8; 64], None).expect("set failed");
+                    c.set(key, &format!("{key:0>64}")).expect("set failed");
                     let _ = c.get(&key);
                     if i % 10 == 0 {
                         let _ = c.has(&key);
@@ -626,8 +628,8 @@ mod hybridcache_tests {
     #[test]
     fn test_dram_tier_uses_global_allocator() {
         let cache = make_cache();
-        let payload: Vec<u8> = (0u8..=255).cycle().take(512).collect();
-        cache.set(200u32, &payload, None).expect("set failed");
+        let payload = "x".repeat(512);
+        cache.set(200u32, &payload).expect("set failed");
 
         // The value must be retrievable before any eviction occurs.
         let got = cache.get(&200u32).expect("get failed");
@@ -646,11 +648,11 @@ mod hybridcache_tests {
         let cache = make_tiny_cache();
 
         // Write 50 distinctive payloads.
-        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        let mut payloads: Vec<String> = Vec::new();
         for i in 0u32..50 {
-            let payload: Vec<u8> = (0..128).map(|b: u8| b.wrapping_mul(3).wrapping_add(i as u8)).collect();
+            let payload = format!("{i:0>128}");
             payloads.push(payload.clone());
-            cache.set(i, &payload, None).expect("set failed");
+            cache.set(i, &payload).expect("set failed");
         }
 
         // Find ANY key that produces a far-tier hit and verify its value is
@@ -668,8 +670,7 @@ mod hybridcache_tests {
                         // through HybridObjects / UMF allocator.
                         assert_eq!(
                             got, payloads[key as usize],
-                            "key {} value corrupted after HybridObjects alloc (UMF path)",
-                            key
+                            "key {key} value corrupted after HybridObjects alloc (UMF path)",
                         );
                         found_far_hit = true;
                         return true;
@@ -702,9 +703,9 @@ mod hybridcache_tests {
         for round in 0u32..3 {
             for i in 0u32..50 {
                 let size = 64 + (i % 64) as usize; // 64..127 bytes
-                let payload: Vec<u8> = std::iter::repeat(i.wrapping_add(round) as u8).take(size).collect();
+                let payload = "x".repeat(size);
                 let key = round * 1000 + i;
-                cache.set(key, &payload, None).expect("set failed");
+                cache.set(key, &payload).expect("set failed");
             }
 
             // Poll until the PolicyWorker has flushed the eviction callbacks
@@ -755,8 +756,8 @@ mod hybridcache_tests {
         // At this point the HybridObjects (UMF) allocator has been exercised.
         // Now insert a fresh DRAM item and verify it is completely unaffected
         // by the PMEM allocator activity.
-        let dram_payload = vec![0xDDu8; 64];
-        cache.set(9999u32, &dram_payload, None).expect("set DRAM item failed");
+        let dram_payload = "x".repeat(64);
+        cache.set(9999u32, &dram_payload).expect("set DRAM item failed");
 
         let got = cache.get(&9999u32).expect("get DRAM item failed");
         assert_eq!(got, dram_payload, "DRAM item corrupted after PMEM allocator activity");

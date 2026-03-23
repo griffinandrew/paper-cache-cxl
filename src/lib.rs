@@ -78,7 +78,7 @@ pub use crate::hw_perf_counters::{get_hw_counters, get_hw_hashmap_stats, print_h
 pub mod hybridcache;
 
 #[cfg(feature = "hybridcache")]
-pub use crate::hybridcache::{S3FifoHybridCache, HybridCacheConfig, HybridCacheStats};
+pub use crate::hybridcache::{S3FifoHybridCache, HybridCacheConfig, HybridCacheStats, CacheTierSize};
 
 
 use std::sync::RwLock;
