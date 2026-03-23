@@ -1080,6 +1080,8 @@ where
 	{
 		let hashed_key = self.hash_key(key);
 
+		#[cfg(debug_assertions)] println!("GET for key");
+
 		// all_dram implementation - no tiering, all data in DRAM
 		let result = match self.objects.get(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
