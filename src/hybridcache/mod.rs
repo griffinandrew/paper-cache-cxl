@@ -86,7 +86,7 @@ atomic::{AtomicU64, Ordering},
 thread,
 };
 
-use crossbeam_channel::{Sender, unbounded};
+use crossbeam_channel::{Sender, bounded};
 use typesize::TypeSize;
 
 use crate::{PaperCache, PaperPolicy, CacheError, BufferDRAM, BufferPMEM};
@@ -231,6 +231,16 @@ promotions: self.promotions.load(Ordering::Relaxed),
 
 // ── S3FifoHybridCache ─────────────────────────────────────────────────────────
 
+/// Maximum number of pending far-tier → small-tier re-insertion requests.
+///
+/// When the reinsertion worker falls behind (e.g. under a burst of 100 M+
+/// concurrent far-tier hits), the bounded channel absorbs a short backlog and
+/// then silently drops further promotion requests.  The value returned by
+/// `get` is always correct; only the re-admission to the DRAM tier is skipped
+/// for those excess requests.  Sizing at 4096 keeps the backlog small (a few
+/// hundred KB at most) regardless of workload scale.
+const REINSERTION_CHANNEL_CAPACITY: usize = 4096;
+
 /// A two-tier cache: small DRAM tier (S3-FIFO) backed by a far PMEM tier (LRU).
 ///
 /// See the [module documentation](self) for full architecture details.
@@ -252,8 +262,12 @@ small: Arc<PaperCache<K, BufferDRAM>>,
 /// evictions.  Uses the Hybrid allocator to place values in persistent /
 /// CXL memory.
 main: Arc<PaperCache<K, BufferPMEM>>,
-/// Channel used to request re-insertion of a far-tier hit into the small
-/// DRAM tier.  The background reinsertion worker reads from the other end.
+/// Bounded channel used to request re-insertion of a far-tier hit into the
+/// small DRAM tier.  The background reinsertion worker reads from the other
+/// end.  The channel is intentionally bounded: if it is full a promotion
+/// request is silently dropped (the value is still returned correctly; only
+/// the re-admission to the small tier is skipped).  This prevents the channel
+/// from growing without bound and exhausting memory under high get load.
 reinsertion_tx: Sender<(K, Vec<u8>)>,
 /// Shared atomic counters for [`HybridCacheStats`].
 stats: Arc<AtomicHybridStats>,
@@ -295,15 +309,30 @@ config.main_policy,
 
 // ── Eviction callback: small DRAM eviction → write to far PMEM ───────
 // Called synchronously from the PolicyWorker background thread when
-// the small tier evicts an item.  Writes the evicted DRAM item to the
-// far PMEM tier using the PMEM PaperCache's `set` method, which
-// allocates the value via the Hybrid allocator into PMEM.
+// the small tier evicts an item.  Copies the evicted key and value bytes
+// into the far PMEM tier: the value is allocated via the Hybrid (UMF)
+// allocator into PMEM, and – because the `key_pmem_value_pmem` feature is
+// active via `hybridcache` – the key is also box-allocated in PMEM through
+// `Object::new`.  Both key and value therefore reside in persistent/CXL
+// memory after this call.
+//
+// If the key is already present in the far tier (e.g. the item was
+// previously promoted from main back into small and is now being evicted
+// again) the write is skipped: the existing PMEM copy is still valid and
+// a redundant `set` would wastefully free the old PMEM buffers and
+// re-allocate new ones for identical data.
 let main_evict = Arc::clone(&main);
 let eviction_callback: Box<dyn for<'a> Fn(crate::HashedKey, Arc<BufferDRAM>, &'a K) + Send + Sync> =
 Box::new(move |_, val, k| {
-// `val` is Arc<BufferDRAM> = Arc<Box<[u8]>>.
-// `&**val` gives &[u8], which PMEM set() allocates via Hybrid → PMEM.
-let _ = main_evict.set(k.clone(), &**val, None);
+	// Skip if this key already has a live entry in the far PMEM tier.
+	if main_evict.has(k) {
+		return;
+	}
+	// `val` is Arc<BufferDRAM> = Arc<Box<[u8]>>.
+	// `&**val` gives &[u8].  The far-tier `set` copies the bytes into
+	// a PMEM buffer (Hybrid allocator) for the value, and Object::new
+	// (with key_pmem_value_pmem active) copies the key into PMEM too.
+	let _ = main_evict.set(k.clone(), &**val, None);
 });
 
 // ── Small DRAM tier – S3-FIFO, BufferDRAM, with eviction callback ─────
@@ -323,7 +352,13 @@ let stats = Arc::new(AtomicHybridStats::new());
 // reference:
 //   – ghost hit  → item enters S3-FIFO's M (main) queue
 //   – ghost miss → item enters S3-FIFO's S (small) queue
-let (reinsertion_tx, reinsertion_rx) = unbounded::<(K, Vec<u8>)>();
+//
+// The channel is bounded to REINSERTION_CHANNEL_CAPACITY entries.  If the
+// worker falls behind (e.g. under millions of concurrent far-tier hits),
+// `try_send` in `get` will return an error for the excess requests and
+// those re-insertions are silently dropped.  Correctness is preserved: the
+// caller still receives the value; only the optional re-promotion is skipped.
+let (reinsertion_tx, reinsertion_rx) = bounded::<(K, Vec<u8>)>(REINSERTION_CHANNEL_CAPACITY);
 let small_reinsert = Arc::clone(&small);
 let stats_reinsert = Arc::clone(&stats);
 thread::spawn(move || {
@@ -407,7 +442,9 @@ Ok(val) => {
 self.stats.main_hits.fetch_add(1, Ordering::Relaxed);
 #[cfg(debug_assertions)]println!("Far tier hit for key {:?} (scheduling reinsertion into small tier)", key);
 // Schedule background re-insertion into the small DRAM tier.
-let _ = self.reinsertion_tx.send((key.clone(), val.clone()));
+// `try_send` is non-blocking: if the bounded channel is full the
+// promotion is silently skipped to avoid unbounded memory growth.
+let _ = self.reinsertion_tx.try_send((key.clone(), val.clone()));
 Ok(String::from_utf8_lossy(&val).into_owned())
 }
 Err(_) => {
