@@ -16,11 +16,15 @@
 //!   * Eviction from the small DRAM tier propagates to the far PMEM tier
 //!   * Promotion: a far-tier hit schedules a reinsertion into the small tier
 //!   * Value round-trip integrity across tier boundaries
-//!   * Stats counters (small_hits, main_hits, misses, promotions)
-//!   * DRAM tier isolation: `key_pmem_value_pmem` / `eviction_stacks_pmem`
-//!     do NOT affect the DRAM small tier's behaviour
-//!   * PMEM tier isolation: the far PMEM tier correctly uses LRU eviction
-//!     with `PmemHashList`-backed stacks when `eviction_stacks_pmem` is active
+//!   * Stats counters (small_hits, main_hits, misses, promotions, demotions,
+//!     dram_items, pmem_items)
+//!   * DRAM tier isolation: only far-tier object bytes use PMEM; eviction
+//!     stacks and hashtables stay in DRAM (`eviction_stacks_pmem` removed
+//!     from base `hybridcache` feature to avoid segfaults)
+//!   * In-flight demotion: `get` during DRAM→PMEM migration yields and
+//!     retries rather than returning a false miss
+//!   * Copy-on-read: PMEM copy is never deleted on promotion, so re-eviction
+//!     of a promoted item skips the in-flight window entirely
 //!   * Edge cases: zero capacity, small_ratio extremes, large payloads
 
 #[cfg(feature = "hybridcache")]
@@ -197,6 +201,46 @@ mod hybridcache_tests {
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.main_hits, 0);
     }
+
+    /// Demotions counter increments when items are written to the far PMEM tier.
+    #[test]
+    fn test_demotion_counter() {
+        let cache = make_tiny_cache();
+        overfill(&cache, 60, 100);
+        let stats = cache.stats();
+        assert!(stats.demotions > 0, "expected demotions after overfill, got {}", stats.demotions);
+    }
+
+    /// dram_items and pmem_items reflect the live tier population.
+    #[test]
+    fn test_tier_item_counts() {
+        let cache = make_cache();
+        for i in 0u32..5 {
+            cache.set(i, &"x".repeat(64)).expect("set failed");
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.dram_items, 5, "expected 5 items in DRAM tier");
+        assert_eq!(stats.pmem_items, 0, "expected 0 items in far tier before eviction");
+    }
+
+    /// After overfill, the far PMEM tier is populated and pmem_items > 0.
+    #[test]
+    fn test_pmem_items_after_eviction() {
+        let cache = make_tiny_cache();
+        overfill(&cache, 60, 100);
+        let stats = cache.stats();
+        assert!(stats.pmem_items > 0, "expected pmem_items > 0 after eviction, got {}", stats.pmem_items);
+    }
+
+    /// has_in_flight_demotion returns false for keys not being migrated.
+    #[test]
+    fn test_has_in_flight_demotion_idle() {
+        let cache = make_cache();
+        cache.set(42u32, "hello").expect("set failed");
+        assert!(!cache.has_in_flight_demotion(&42u32), "no demotion in flight for a freshly inserted key");
+        assert!(!cache.has_in_flight_demotion(&999u32), "no demotion in flight for absent key");
+    }
+
 
     // ── configuration ─────────────────────────────────────────────────────
 

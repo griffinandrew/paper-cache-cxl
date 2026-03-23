@@ -55,8 +55,24 @@
 //! # Requirements
 //!
 //! This module requires nightly Rust because the PMEM far tier uses the
-//! `allocator_api` nightly feature (via `key_pmem_value_pmem` +
-//! `eviction_stacks_pmem`).
+//! `allocator_api` nightly feature (via `key_pmem_value_pmem`).
+//!
+//! # Segfault avoidance
+//!
+//! Only far-tier **object bytes** (key + value) are placed in PMEM via the
+//! Hybrid allocator.  Eviction stacks and hashtables remain in DRAM.
+//! Enable `far_tier_pmem_evst_hash` to also move those structures to PMEM
+//! (useful for CXL metadata profiling, but requires stable
+//! `eviction_stacks_pmem` support).
+//!
+//! # Copy-on-read and the in-flight demotion window
+//!
+//! Promotions (far-tier hit → re-insert into small) use **copy-on-read**:
+//! the PMEM copy is never deleted.  This means that when the DRAM tier
+//! evicts a previously-promoted item, the eviction callback finds the key
+//! already in the far tier and skips the write entirely — no in-flight
+//! window and no race.  The in-flight set only matters for items being
+//! demoted to PMEM for the **first time**.
 //!
 //! # Example
 //!
@@ -418,7 +434,7 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
 /// Propagates any [`CacheError`] returned by the underlying
 /// [`PaperCache::set`] call.
 pub fn set(&self, key: K, value: &str) -> Result<(), CacheError> {
-self.small.set(key, value.as_bytes(), None)
+    self.small.set(key, value.as_bytes(), None)
 }
 
 /// Inserts or updates a key-value pair in the **small DRAM tier** with an
@@ -432,7 +448,7 @@ self.small.set(key, value.as_bytes(), None)
 /// Propagates any [`CacheError`] returned by the underlying
 /// [`PaperCache::set`] call.
 pub fn set_with_ttl(&self, key: K, value: &str, ttl: u32) -> Result<(), CacheError> {
-self.small.set(key, value.as_bytes(), Some(ttl))
+    self.small.set(key, value.as_bytes(), Some(ttl))
 }
 
 /// Retrieves the value associated with `key`.
@@ -460,27 +476,26 @@ self.small.set(key, value.as_bytes(), Some(ttl))
 /// Returns [`CacheError::KeyNotFound`] when the key is absent from both
 /// tiers and is not in-flight.
 ///
-/// Also adds the in-flight demotion check to prevent false misses.
 pub fn get(&self, key: &K) -> Result<String, CacheError> {
-// Fast path: small DRAM tier.
-if let Ok(val) = self.small.get(key) {
-#[cfg(debug_assertions)]println!("Small tier hit for key {:?}", key);
-self.stats.small_hits.fetch_add(1, Ordering::Relaxed);
-return Ok(String::from_utf8_lossy(&val).into_owned());
-}
+    // Fast path: small DRAM tier.
+    if let Ok(val) = self.small.get(key) {
+        #[cfg(debug_assertions)]println!("Small tier hit for key {:?}", key);
+        self.stats.small_hits.fetch_add(1, Ordering::Relaxed);
+        return Ok(String::from_utf8_lossy(&val).into_owned());
+    }
 
-// Slow path: far PMEM tier.
-match self.main.get(key) {
-Ok(val) => {
-self.stats.main_hits.fetch_add(1, Ordering::Relaxed);
-#[cfg(debug_assertions)]println!("Far tier hit for key {:?} (scheduling reinsertion into small tier)", key);
-// Schedule background re-insertion into the small DRAM tier so
-// that S3-FIFO's ghost queue can decide the admission tier on the
-// next reference.  The channel is unbounded; no promotions are
-// dropped.
-let _ = self.reinsertion_tx.send((key.clone(), val.clone()));
-Ok(String::from_utf8_lossy(&val).into_owned())
-}
+    // Slow path: far PMEM tier.
+    match self.main.get(key) {
+        Ok(val) => {
+            self.stats.main_hits.fetch_add(1, Ordering::Relaxed);
+            #[cfg(debug_assertions)]println!("Far tier hit for key {:?} (scheduling reinsertion into small tier)", key);
+            // Schedule background re-insertion into the small DRAM tier so
+            // that S3-FIFO's ghost queue can decide the admission tier on the
+            // next reference.  The channel is unbounded; no promotions are
+            // dropped.
+            let _ = self.reinsertion_tx.send((key.clone(), val.clone()));
+            Ok(String::from_utf8_lossy(&val).into_owned())
+        }
 Err(_) => {
             // Before recording a miss, check whether the key is currently
             // being migrated from the DRAM tier to the PMEM tier.  During
