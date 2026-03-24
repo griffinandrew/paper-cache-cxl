@@ -37,9 +37,7 @@ use crate::{
     BufferPMEM,
     error::CacheError,
     worker::{
-        Worker,
         WorkerEvent,
-        WorkerReceiver,
         PolicyWorker,
         TtlWorker,
         register_worker,

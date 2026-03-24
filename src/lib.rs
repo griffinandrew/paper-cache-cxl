@@ -80,9 +80,6 @@ pub mod hybridcache;
 #[cfg(feature = "hybridcache")]
 pub use crate::hybridcache::{S3FifoHybridCache, HybridCacheConfig, HybridCacheStats, CacheTierSize};
 
-
-use std::sync::RwLock;
-
 use std::{
 	thread,
 	sync::{
