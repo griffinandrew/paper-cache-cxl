@@ -1460,6 +1460,7 @@ where
 		policies: &[PaperPolicy],
 		policy: PaperPolicy,
 		eviction_callback: Box<dyn for<'a> Fn(HashedKey, Arc<BufferDRAM>, &'a K) + Send + Sync>,
+		promotion_tx: Option<crate::worker::WorkerSender>,
 	) -> Result<Self, CacheError>
 	where
 		S: Default,
@@ -1497,6 +1498,7 @@ where
 			&status,
 			&overhead_manager,
 			eviction_callback,
+			promotion_tx,
 		)?;
 
 		thread::spawn(move || worker_manager.run());
@@ -2348,6 +2350,7 @@ where
 	fn hash_key(&self, key: &K) -> HashedKey {
 		self.hasher.hash_one(key)
 	}
+
 }
 
 

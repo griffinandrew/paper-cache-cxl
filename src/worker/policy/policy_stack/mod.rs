@@ -35,6 +35,13 @@ use crate::{
 	},
 };
 
+/// Outcome of a policy stack access that may carry extra routing signals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessOutcome {
+	None,
+	GhostHit,
+}
+
 pub trait PolicyStack
 where
 	Self: Send,
@@ -45,6 +52,13 @@ where
 	fn contains(&self, key: HashedKey) -> bool;
 	fn insert(&mut self, key: HashedKey, size: ObjectSize);
 	fn update(&mut self, _key: HashedKey) {}
+	fn record_access(&mut self, key: HashedKey, hit: bool) -> AccessOutcome {
+		if hit {
+			self.update(key);
+		}
+
+		AccessOutcome::None
+	}
 	fn remove(&mut self, key: HashedKey);
 
 	fn resize(&mut self, _size: CacheSize) {}

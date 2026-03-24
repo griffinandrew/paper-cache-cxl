@@ -29,6 +29,7 @@ pub type WorkerReceiver = Receiver<WorkerEvent>;
 #[derive(Clone)]
 pub enum WorkerEvent {
 	Get(HashedKey, bool),
+	Promote(HashedKey),
 	Set(HashedKey, ObjectSize, ExpireTime, Option<(ObjectSize, ExpireTime)>),
 	Del(HashedKey, ExpireTime),
 

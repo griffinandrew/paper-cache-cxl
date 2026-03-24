@@ -38,13 +38,14 @@ use crate::{
 	worker::{
 		Worker,
 		WorkerEvent,
+		WorkerSender,
 		WorkerReceiver,
 		register_worker,
 		policy::{
 			mini_stack::MiniStackManager,
 			event::{StackEvent, TraceEvent},
 			trace::{TraceWorker, TraceFragment},
-			policy_stack::{PolicyStack, init_policy_stack},
+			policy_stack::{AccessOutcome, PolicyStack, init_policy_stack},
 		},
 	},
 };
@@ -78,6 +79,8 @@ pub struct PolicyWorker<K, V> {
 
 	last_auto_policy_time: Option<Instant>,
 	last_set_time: Option<Instant>,
+
+	promotion_tx: Option<WorkerSender>,
 
 	/// TieringManager reference used in `sets_dram` mode to intercept
 	/// evictions of keys that haven't been persisted to PMEM yet.
@@ -115,7 +118,7 @@ where
 
 			for event in events {
 				match event {
-					WorkerEvent::Get(key, _) => self.handle_get(key),
+					WorkerEvent::Get(key, hit) => self.handle_get(key, hit),
 
 					WorkerEvent::Set(key, size, _, _) => {
 						self.handle_set(key, size);
@@ -171,6 +174,7 @@ where
 		objects: ObjectMapRef<K, V>,
 		status: StatusRef,
 		overhead_manager: OverheadManagerRef,
+		promotion_tx: Option<WorkerSender>,
 	) -> Result<Self, CacheError> {
 		let max_cache_size = status.max_size();
 
@@ -217,6 +221,8 @@ where
 			last_auto_policy_time: None,
 			last_set_time: None,
 
+			promotion_tx,
+
 			#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
 			tiering_manager: None,
 
@@ -236,6 +242,7 @@ where
 		objects: ObjectMapRef<K, V>,
 		status: StatusRef,
 		overhead_manager: OverheadManagerRef,
+		promotion_tx: Option<WorkerSender>,
 		tiering_manager: Arc<TieringManager<K, V>>,
 	) -> Result<Self, CacheError>
 	where
@@ -285,6 +292,8 @@ where
 			last_auto_policy_time: None,
 			last_set_time: None,
 
+			promotion_tx,
+
 			tiering_manager: Some(tiering_manager),
 
 			#[cfg(feature = "hybridcache")]
@@ -303,6 +312,7 @@ where
 		objects: ObjectMapRef<K, V>,
 		status: StatusRef,
 		overhead_manager: OverheadManagerRef,
+		promotion_tx: Option<WorkerSender>,
 		eviction_callback: Box<dyn for<'a> Fn(HashedKey, Arc<V>, &'a K) + Send + Sync>,
 	) -> Result<Self, CacheError>
 	where
@@ -351,6 +361,8 @@ where
 			last_auto_policy_time: None,
 			last_set_time: None,
 
+			promotion_tx,
+
 			#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
 			tiering_manager: None,
 
@@ -360,9 +372,14 @@ where
 		Ok(worker)
 	}
 
-	fn handle_get(&mut self, key: HashedKey) {
+	fn handle_get(&mut self, key: HashedKey, hit: bool) {
 		if let Some(stack) = &mut self.policy_stack {
-			stack.update(key);
+			if let AccessOutcome::GhostHit = stack.record_access(key, hit) {
+				debug_assert!(self.promotion_tx.is_some(), "promotion channel must exist for ghost hits");
+				if let Some(tx) = &self.promotion_tx {
+					let _ = tx.try_send(WorkerEvent::Promote(key));
+				}
+			}
 		}
 
 		self.mini_stack_manager.handle_get(key);
