@@ -661,6 +661,9 @@ mod hybridcache_tests {
     ///
     /// The ghost-queue routing logic itself is tested at the unit level in
     /// `s_three_fifo_stack::tests::ghost_queue_routes_reinserted_key_to_main`.
+    ///
+    /// Additionally verifies that ghost_hits counter is incremented when the
+    /// key is found in the ghost queue (demoted_keys set).
     #[test]
     fn test_ghost_queue_drives_admission_to_main_s3fifo() {
         let cache = make_tiny_cache();
@@ -683,6 +686,13 @@ mod hybridcache_tests {
             false
         });
         let key = pmem_key.expect("no PMEM key found; overfill did not trigger eviction");
+
+        // Verify ghost_hits counter increased for this ghost-hit access.
+        let stats_after_ghost_hit = cache.stats();
+        assert!(
+            stats_after_ghost_hit.ghost_hits > 0,
+            "ghost_hits counter must be non-zero after PMEM hit on recently evicted key",
+        );
 
         // Step 3: wait for the background reinsertion worker to promote the key
         // into the DRAM tier.  Because the key was previously evicted through the
@@ -964,26 +974,27 @@ mod hybridcache_tests {
     // ── ghost-queue miss promotion path ───────────────────────────────────
 
     /// A far-tier hit on a key whose **ghost-queue entry has been evicted**
-    /// (ghost-queue miss) must still correctly promote the item back into the
-    /// DRAM small tier via the reinsertion worker.
+    /// (ghost-queue miss) serves the value from PMEM without promotion.
     ///
     /// Unlike `test_ghost_queue_drives_admission_to_main_s3fifo` (which tests
-    /// the ghost-HIT path where the key is admitted to S3-FIFO's main queue),
-    /// this test targets the ghost-MISS path: the re-inserted key enters the
-    /// *small* queue because it no longer has an active ghost entry.
+    /// the ghost-HIT path where the key is promoted to DRAM), this test targets
+    /// the ghost-MISS path: the key is served from PMEM only without re-insertion
+    /// into DRAM, preventing unbounded copy-on-read churn.
     ///
     /// We force a ghost-queue miss by inserting enough additional items after
     /// the initial overfill to overflow the ghost queue (bounded by the current
     /// main-queue length).  Any key evicted before the overflow is eligible for
     /// the ghost-miss path.
     ///
+    /// Additionally verifies that ghost_misses counter is incremented when the
+    /// key is NOT found in the ghost queue (demoted_keys set).
+    ///
     /// Assertions
     /// ----------
-    /// - `promotions` increments exactly once per far-tier hit.
-    /// - The key is readable after promotion (from DRAM or PMEM).
-    /// - The PMEM copy persists after promotion (copy-on-read semantics).
-    /// - `main_hits` increments for the far-tier read that triggered the
-    ///   promotion; subsequent reads from the DRAM tier increment `small_hits`.
+    /// - `ghost_misses` increments when accessing a PMEM key not in ghost queue.
+    /// - `promotions` does NOT increment (ghost-hit-only promotion policy).
+    /// - The key is readable from PMEM.
+    /// - `main_hits` increments for the far-tier read.
     #[test]
     fn test_promotion_on_ghost_miss_goes_to_dram() {
         let cache = make_tiny_cache();
@@ -1011,46 +1022,44 @@ mod hybridcache_tests {
             "no PMEM key found after 100-item overfill; eviction to far tier may not have fired",
         );
 
-        let promotions_before = cache.stats().promotions;
-        let main_hits_after_probe = cache.stats().main_hits;
-
-        // Phase 3: the far-tier hit already sent a reinsertion to the background
-        // worker.  Wait for it to complete.
-        let promoted = wait_until(std::time::Duration::from_secs(3), || {
-            cache.stats().promotions > promotions_before
-        });
+        // Verify ghost_misses counter increased for this ghost-miss access.
+        let stats_after_probe = cache.stats();
         assert!(
-            promoted,
-            "promotions counter must increment after a far-tier hit (key={key}), \
-             promotions_before={promotions_before}, now={}",
-            cache.stats().promotions,
+            stats_after_probe.ghost_misses > 0,
+            "ghost_misses counter must be non-zero after PMEM hit on key not in ghost queue",
         );
 
-        // Phase 4 assertions.
-        // 4a. main_hits must not have changed since the far-tier probe above.
+        let promotions_before = cache.stats().promotions;
+
+        // Phase 3: wait to confirm NO promotion occurs (ghost-hit-only policy).
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let promotions_after = cache.stats().promotions;
         assert_eq!(
-            cache.stats().main_hits,
-            main_hits_after_probe,
-            "main_hits must not change between far-tier probe and promotion completion",
+            promotions_after,
+            promotions_before,
+            "promotions counter must NOT increment on ghost miss (ghost-hit-only policy)",
         );
 
-        // 4b. The PMEM copy must still be present (copy-on-read: promotion does
-        //     not delete the far-tier entry).
+        // Phase 4: The key must still be accessible from PMEM.
         assert!(
             cache.has_in_pmem(&key),
-            "key {key} must remain in PMEM after promotion (copy-on-read semantics)",
+            "key {key} must remain in PMEM (ghost miss serves from PMEM only)",
         );
 
-        // 4c. The item must be accessible (DRAM or PMEM).
         assert!(
             cache.has(&key),
-            "key {key} must be accessible after promotion",
+            "key {key} must be accessible from PMEM",
         );
 
-        // 4d. Reading the key after promotion must succeed without error.
+        // Phase 5: Reading the key again should still be a ghost miss.
+        let ghost_misses_before = cache.stats().ghost_misses;
         assert!(
             cache.get(&key).is_ok(),
-            "key {key} must be readable after promotion",
+            "key {key} must be readable from PMEM",
+        );
+        assert!(
+            cache.stats().ghost_misses > ghost_misses_before,
+            "ghost_misses counter must increment on repeated PMEM access",
         );
     }
 
