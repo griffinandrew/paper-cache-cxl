@@ -273,6 +273,21 @@ pub struct HybridCacheStats {
     /// A dropped promotion means the PMEM item is not re-inserted into DRAM.
     /// The next access will re-trigger the promotion attempt.
     pub dropped_promotions: u64,
+    /// PMEM hits where the key was in the ghost queue (recently evicted from DRAM).
+    ///
+    /// These accesses trigger promotion back to DRAM, implementing the
+    /// ghost-hit-only promotion policy.
+    pub ghost_hits: u64,
+    /// PMEM hits where the key was NOT in the ghost queue.
+    ///
+    /// These accesses are served directly from PMEM without promotion,
+    /// preventing unbounded copy-on-read churn.
+    pub ghost_misses: u64,
+    /// Current number of keys in the ghost queue (live snapshot).
+    ///
+    /// The ghost queue tracks recently evicted DRAM keys eligible for
+    /// re-promotion on the next access.
+    pub ghost_queue_size: u64,
 }
 
 struct AtomicHybridStats {
@@ -283,6 +298,8 @@ struct AtomicHybridStats {
     demotions: AtomicU64,
     dropped_demotions: AtomicU64,
     dropped_promotions: AtomicU64,
+    ghost_hits: AtomicU64,
+    ghost_misses: AtomicU64,
 }
 
 impl AtomicHybridStats {
@@ -295,6 +312,8 @@ impl AtomicHybridStats {
             demotions: AtomicU64::new(0),
             dropped_demotions: AtomicU64::new(0),
             dropped_promotions: AtomicU64::new(0),
+            ghost_hits: AtomicU64::new(0),
+            ghost_misses: AtomicU64::new(0),
         }
     }
 }
@@ -598,12 +617,14 @@ pub fn get(&self, key: &K) -> Result<String, CacheError> {
             // demotion cycle grants exactly one promotion attempt.
             if self.demoted_keys.remove(key).is_some() {
                 #[cfg(debug_assertions)]println!("Far tier hit for key {:?} (ghost hit — scheduling reinsertion)", key);
+                self.stats.ghost_hits.fetch_add(1, Ordering::Relaxed);
                 let val_bytes: Vec<u8> = val[..].to_vec();
                 if self.reinsertion_tx.try_send((key.clone(), val_bytes)).is_err() {
                     self.stats.dropped_promotions.fetch_add(1, Ordering::Relaxed);
                 }
             } else {
                 #[cfg(debug_assertions)]println!("Far tier hit for key {:?} (ghost miss — serving from PMEM only)", key);
+                self.stats.ghost_misses.fetch_add(1, Ordering::Relaxed);
             }
             Ok(String::from_utf8_lossy(&val).into_owned())
         }
@@ -699,6 +720,9 @@ pub fn stats(&self) -> HybridCacheStats {
         pmem_items:        self.main.status().map(|s| s.num_objects()).unwrap_or(0),
         dropped_demotions: self.stats.dropped_demotions.load(Ordering::Relaxed),
         dropped_promotions: self.stats.dropped_promotions.load(Ordering::Relaxed),
+        ghost_hits:        self.stats.ghost_hits.load(Ordering::Relaxed),
+        ghost_misses:      self.stats.ghost_misses.load(Ordering::Relaxed),
+        ghost_queue_size:  self.demoted_keys.len() as u64,
     }
 }
 }
