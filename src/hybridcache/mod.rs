@@ -425,13 +425,19 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
             // Signal the parent thread that this worker is running.
             startup_barrier_clone.wait();
             while let Ok((k, val)) = demotion_rx.recv() {
-                let _ = main_worker.set(k.clone(), &val, None);
-                in_flight_worker.remove(&k);
-                demoted_worker.insert(k);
-                stats_worker.demotions.fetch_add(1, Ordering::Relaxed);
+                if main_worker.set(k.clone(), &val, None).is_ok() {
+                    in_flight_worker.remove(&k);
+                    demoted_worker.insert(k);
+                    stats_worker.demotions.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // PMEM write failed: remove the in-flight marker so `get`
+                    // does not spin forever, and count it as a dropped demotion.
+                    in_flight_worker.remove(&k);
+                    stats_worker.dropped_demotions.fetch_add(1, Ordering::Relaxed);
+                }
             }
         })
-        .expect("failed to spawn demotion worker thread");
+        .unwrap_or_else(|e| panic!("failed to spawn demotion worker thread: {e}"));
     // Block until the demotion worker is confirmed running and in recv().
     startup_barrier.wait();
 
@@ -680,7 +686,7 @@ pub fn stats(&self) -> HybridCacheStats {
         dram_items:        self.small.status().map(|s| s.num_objects()).unwrap_or(0),
         pmem_items:        self.main.status().map(|s| s.num_objects()).unwrap_or(0),
         dropped_demotions: self.stats.dropped_demotions.load(Ordering::Relaxed),
-        dropped_promotions:self.stats.dropped_promotions.load(Ordering::Relaxed),
+        dropped_promotions: self.stats.dropped_promotions.load(Ordering::Relaxed),
     }
 }
 }
