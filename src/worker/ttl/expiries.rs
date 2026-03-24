@@ -44,7 +44,7 @@ impl Expiries {
 
 		if self.map.get(&expiry).is_none_or(|got_key| *got_key != key) {
 			return;
-		}
+		};
 
 		self.map.remove(&expiry);
 	}
