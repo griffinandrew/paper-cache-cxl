@@ -102,17 +102,27 @@ tiering = ["key_pmem_value_pmem", "enable_tiering_manager"]
 multitiering = ["key_pmem_value_pmem", "enable_tiering_manager", "hashtable_tiering"]
 
 # Two-tier cache: small DRAM tier (S3-FIFO) backed by a far PMEM tier (LRU).
-# - Small cache: all in DRAM using BufferDRAM (requires all_dram)
-# - Far/main cache: all in PMEM using BufferPMEM (requires key_pmem_value_pmem
-#   + eviction_stacks_pmem; needs nightly Rust for allocator_api).
+#
+# PMEM usage is limited to far-tier object allocations only (key + value bytes
+# via key_pmem_value_pmem / Hybrid allocator).  All other structures — eviction
+# stacks, hashtables — stay in DRAM to avoid segfaults from unstable
+# eviction_stacks_pmem interactions.
 #
 # Data flow:
 #   set(k,v)  → small DRAM tier (S3-FIFO)
 #                    │ eviction (PolicyWorker callback)
 #                    ▼
-#               far PMEM tier (LRU)
+#               far PMEM tier (LRU)  ← object bytes in PMEM, metadata in DRAM
 #   get(k)    → small hit? return  │no→ far hit? return + re-insert into small
-hybridcache = ["all_dram", "key_pmem_value_pmem", "eviction_stacks_pmem"]
+#                                  │no→ in-flight? yield+retry  │no→ miss
+hybridcache = ["all_dram", "key_pmem_value_pmem"]
+
+# Full-PMEM variant of hybridcache: additionally moves the far tier's eviction
+# stacks and hashtable into PMEM.  Useful for profiling CXL memory access
+# patterns at the metadata level, but requires stable eviction_stacks_pmem
+# support on the target machine.  Note that global_hashtable_pmem applies to
+# both tiers (small DRAM and far PMEM), since the hashtable type is global.
+far_tier_pmem_evst_hash = ["hybridcache", "eviction_stacks_pmem", "global_hashtable_pmem"]
 
 # Legacy features (deprecated, will be removed)
 default = []
