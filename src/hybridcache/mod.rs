@@ -102,6 +102,10 @@
 //! cache.set_with_ttl(2u32, "expires soon", 60).unwrap();
 //! ```
 
+mod pool;
+
+pub use pool::{HybridWorkerPool, HybridWorkerPoolConfig, DemotionTask, PromotionTask};
+
 use std::{
 hash::Hash,
 sync::{

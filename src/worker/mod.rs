@@ -84,8 +84,5 @@ pub use crate::worker::{
 	ttl::TtlWorker,
 };
 
-#[cfg(feature = "hybridcache")]
-pub use crate::worker::{CacheId, TaggedWorkerEvent};
-
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 pub use crate::worker::tiering::TieringWorker;
