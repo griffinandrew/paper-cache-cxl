@@ -48,6 +48,7 @@ use crate::{
         register_worker,
         CacheId,
         TaggedWorkerEvent,
+        HybridWorkerSender,
     },
 };
 
@@ -121,11 +122,11 @@ where
 {
     /// Sender given to the small DRAM PaperCache.
     /// Wraps events with `CacheId::Small` before sending to the dispatcher.
-    pub small_sender: WorkerSender,
+    pub small_sender: HybridWorkerSender,
 
     /// Sender given to the far PMEM PaperCache.
     /// Wraps events with `CacheId::Far` before sending to the dispatcher.
-    pub far_sender: WorkerSender,
+    pub far_sender: HybridWorkerSender,
 
     /// Bounded channel for async DRAM→PMEM demotions.
     pub demotion_tx: Sender<DemotionTask<K>>,
