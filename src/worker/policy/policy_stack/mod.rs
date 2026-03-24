@@ -51,6 +51,14 @@ where
 	fn clear(&mut self);
 
 	fn evict_one(&mut self) -> Option<HashedKey>;
+
+	/// Returns `true` if the key is in the ghost queue (S3-FIFO only).
+	///
+	/// For policies without a ghost queue concept (LRU, FIFO, etc.), this
+	/// method always returns `false`.
+	fn ghost_contains(&self, _key: HashedKey) -> bool {
+		false
+	}
 }
 
 pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn PolicyStack> {

@@ -109,6 +109,10 @@ impl PolicyStack for SThreeFifoStack {
 
 		self.evict_main()
 	}
+
+	fn ghost_contains(&self, key: HashedKey) -> bool {
+		self.ghost.contains(&key)
+	}
 }
 
 impl SThreeFifoStack {
@@ -128,6 +132,15 @@ impl SThreeFifoStack {
 
 	fn any_stack_contains(&self, key: HashedKey) -> bool {
 		self.small.stack.contains(&key) || self.main.stack.contains(&key)
+	}
+
+	/// Returns `true` if the key is in the ghost queue.
+	///
+	/// The ghost queue tracks recently-evicted keys from the small queue.
+	/// A re-insertion that finds its key in the ghost queue is admitted to
+	/// the main queue (ghost hit), giving it higher priority.
+	pub fn ghost_contains(&self, key: HashedKey) -> bool {
+		self.ghost.contains(&key)
 	}
 
 	fn evict_small(&mut self) -> Option<HashedKey> {
