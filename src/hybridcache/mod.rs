@@ -104,7 +104,7 @@
 
 mod pool;
 
-pub use pool::{HybridWorkerPool, HybridWorkerPoolConfig, DemotionTask, PromotionTask};
+pub use pool::HybridWorkerPool;
 
 use std::{
 hash::Hash,
