@@ -23,7 +23,34 @@ use crate::{
 	policy::PaperPolicy,
 };
 
+/// Discriminant for tagging worker events in the hybrid cache.
+///
+/// Used by `HybridWorkerPool` to route events to the correct tier-specific
+/// `PolicyWorker` (Small vs Far) while sharing a single `TtlWorker`.
+#[cfg(feature = "hybridcache")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheId {
+	Small,
+	Far,
+}
+
+/// Tagged worker event for the hybrid cache.
+///
+/// The dispatcher reads these and routes `event` to the appropriate worker
+/// channel based on `cache_id`.
+#[cfg(feature = "hybridcache")]
+#[derive(Clone)]
+pub struct TaggedWorkerEvent {
+	pub cache_id: CacheId,
+	pub event: WorkerEvent,
+}
+
+#[cfg(feature = "hybridcache")]
+pub type WorkerSender = Sender<TaggedWorkerEvent>;
+
+#[cfg(not(feature = "hybridcache"))]
 pub type WorkerSender = Sender<WorkerEvent>;
+
 pub type WorkerReceiver = Receiver<WorkerEvent>;
 
 #[derive(Clone)]
@@ -56,6 +83,9 @@ pub use crate::worker::{
 	policy::PolicyWorker,
 	ttl::TtlWorker,
 };
+
+#[cfg(feature = "hybridcache")]
+pub use crate::worker::{CacheId, TaggedWorkerEvent};
 
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 pub use crate::worker::tiering::TieringWorker;
