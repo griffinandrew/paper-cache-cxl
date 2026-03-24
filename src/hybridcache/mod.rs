@@ -102,10 +102,6 @@
 //! cache.set_with_ttl(2u32, "expires soon", 60).unwrap();
 //! ```
 
-mod pool;
-
-pub use pool::HybridWorkerPool;
-
 use std::{
 hash::Hash,
 sync::{
@@ -497,12 +493,23 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
     let (reinsertion_tx, reinsertion_rx) = bounded::<(K, Vec<u8>)>(config.reinsertion_channel_capacity);
     let small_reinsert = Arc::clone(&small);
     let stats_reinsert = Arc::clone(&stats);
-    thread::spawn(move || {
-        while let Ok((k, val)) = reinsertion_rx.recv() {
-            let _ = small_reinsert.set(k, &val, None);
-            stats_reinsert.promotions.fetch_add(1, Ordering::Relaxed);
-        }
-    });
+    thread::Builder::new()
+        .name("hybridcache-reinsertion".to_string())
+        .spawn(move || {
+            while let Ok((k, val)) = reinsertion_rx.recv() {
+                #[cfg(debug_assertions)]println!("Reinsertion worker: received key {:?}, {} bytes", k, val.len());
+                match small_reinsert.set(k.clone(), &val, None) {
+                    Ok(_) => {
+                        stats_reinsert.promotions.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(debug_assertions)]println!("Reinsertion worker: successfully promoted key {:?}", k);
+                    }
+                    Err(e) => {
+                        #[cfg(debug_assertions)]println!("Reinsertion worker: failed to promote key {:?}: {:?}", k, e);
+                    }
+                }
+            }
+        })
+        .unwrap_or_else(|e| panic!("failed to spawn reinsertion worker thread: {e}"));
 
     Ok(S3FifoHybridCache {
         small,
@@ -591,7 +598,8 @@ pub fn get(&self, key: &K) -> Result<String, CacheError> {
             // demotion cycle grants exactly one promotion attempt.
             if self.demoted_keys.remove(key).is_some() {
                 #[cfg(debug_assertions)]println!("Far tier hit for key {:?} (ghost hit — scheduling reinsertion)", key);
-                if self.reinsertion_tx.try_send((key.clone(), val.clone())).is_err() {
+                let val_bytes: Vec<u8> = val[..].to_vec();
+                if self.reinsertion_tx.try_send((key.clone(), val_bytes)).is_err() {
                     self.stats.dropped_promotions.fetch_add(1, Ordering::Relaxed);
                 }
             } else {
