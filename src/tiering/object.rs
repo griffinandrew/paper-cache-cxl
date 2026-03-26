@@ -76,8 +76,6 @@ impl<K> TieringObject<K> {
 
 */
 
-
-
 /*
  * Copyright (c) Kia Shakiba
  *
@@ -91,10 +89,7 @@ impl<K> TieringObject<K> {
 //! regardless of whether key_value_pmem is enabled. The tiering manager's DRAM cache
 //! stores hot copies of objects for fast access, so they should always be in DRAM.
 
-use std::{
-    sync::Arc,
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 use crate::object::ExpireTime;
 

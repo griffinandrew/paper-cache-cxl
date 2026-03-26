@@ -73,9 +73,9 @@
 //! - `flatmap_pmem`: Enable FlatMap with PMEM allocator (HybridObjects)
 
 use std::alloc::{Allocator, Global};
-use std::hash::{Hash, BuildHasher};
-use std::mem;
+use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
+use std::mem;
 
 /// A bucket in the hash map containing hash, key, and value.
 /// Uses #[repr(C)] for predictable memory layout.
@@ -193,20 +193,20 @@ where
     {
         let hash = self.hash_key_unconstrained(key, hasher);
         let mut index = (hash as usize) & self.mask;
-        
+
         // Linear probing
         for _ in 0..self.capacity {
             let bucket = &self.buckets[index];
-            
+
             if bucket.is_empty() {
                 return None;
             } else if bucket.matches(hash, key) {
                 return Some(&bucket.val);
             }
-            
+
             index = (index + 1) & self.mask;
         }
-        
+
         None
     }
 
@@ -220,25 +220,25 @@ where
     {
         let hash = self.hash_key_unconstrained(key, hasher);
         let mut index = (hash as usize) & self.mask;
-        
+
         // Linear probing - find the index first
         let found_index = {
             let mut found = None;
             for _ in 0..self.capacity {
                 let bucket = &self.buckets[index];
-                
+
                 if bucket.is_empty() {
                     break;
                 } else if bucket.matches(hash, key) {
                     found = Some(index);
                     break;
                 }
-                
+
                 index = (index + 1) & self.mask;
             }
             found
         };
-        
+
         found_index.map(|idx| &mut self.buckets[idx].val)
     }
 
@@ -314,7 +314,7 @@ where
         assert!(capacity.is_power_of_two(), "Capacity must be a power of 2");
 
         let mask = capacity - 1;
-        
+
         // Allocate and initialize buckets
         let mut buckets = Vec::with_capacity_in(capacity, alloc);
         for _ in 0..capacity {
@@ -343,11 +343,11 @@ where
     {
         let hash = self.hash_key_unconstrained(&key, hasher);
         let mut index = (hash as usize) & self.mask;
-        
+
         // Linear probing
         for _ in 0..self.capacity {
             let bucket = &mut self.buckets[index];
-            
+
             if bucket.is_empty() {
                 // Found empty slot
                 *bucket = Bucket { hash, key, val };
@@ -358,11 +358,11 @@ where
                 let old_val = mem::replace(&mut bucket.val, val);
                 return Some(old_val);
             }
-            
+
             // Move to next bucket
             index = (index + 1) & self.mask;
         }
-        
+
         panic!("FlatMap is full");
     }
 
@@ -378,11 +378,11 @@ where
     {
         let hash = self.hash_key_unconstrained(key, hasher);
         let mut index = (hash as usize) & self.mask;
-        
+
         // Linear probing to find the key
         for _ in 0..self.capacity {
             let bucket = &mut self.buckets[index];
-            
+
             if bucket.is_empty() {
                 // Empty slot means key not found
                 return None;
@@ -390,22 +390,22 @@ where
                 // Found the key - perform backwards shift deletion
                 self.len -= 1;
                 let val = mem::replace(&mut bucket.val, V::default());
-                
+
                 // Backwards shift deletion to maintain probe chain integrity
                 let mut curr_index = index;
                 loop {
                     let next_index = (curr_index + 1) & self.mask;
                     let next_bucket = &self.buckets[next_index];
-                    
+
                     // If next bucket is empty, we can mark current as empty and stop
                     if next_bucket.is_empty() {
                         self.buckets[curr_index] = Bucket::empty();
                         break;
                     }
-                    
+
                     // Calculate ideal position for next bucket
                     let ideal_index = (next_bucket.hash as usize) & self.mask;
-                    
+
                     // Check if we should shift the next bucket back to curr position
                     // We shift if the ideal position is at or before curr, considering wraparound
                     let should_shift = if ideal_index <= curr_index {
@@ -417,24 +417,24 @@ where
                         // Shift only if next wrapped around past ideal
                         next_index < ideal_index
                     };
-                    
+
                     if !should_shift {
                         self.buckets[curr_index] = Bucket::empty();
                         break;
                     }
-                    
+
                     // Shift the next bucket back
                     self.buckets[curr_index] = self.buckets[next_index].clone();
                     curr_index = next_index;
                 }
-                
+
                 return Some(val);
             }
-            
+
             // Move to next bucket
             index = (index + 1) & self.mask;
         }
-        
+
         None
     }
 
@@ -450,11 +450,11 @@ where
     {
         let hash = self.hash_key_unconstrained(key, hasher);
         let mut index = (hash as usize) & self.mask;
-        
+
         // Linear probing to find the key
         for _ in 0..self.capacity {
             let bucket = &mut self.buckets[index];
-            
+
             if bucket.is_empty() {
                 return None;
             } else if bucket.matches(hash, key) {
@@ -465,10 +465,10 @@ where
                 let _ = mem::replace(&mut bucket.key, K::default());
                 return Some(val);
             }
-            
+
             index = (index + 1) & self.mask;
         }
-        
+
         None
     }
 }
@@ -486,7 +486,7 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
         while self.index < self.buckets.len() {
             let bucket = &self.buckets[self.index];
             self.index += 1;
-            
+
             if !bucket.is_empty() {
                 return Some((&bucket.key, &bucket.val));
             }
@@ -597,39 +597,39 @@ where
         // Access the internal FlatMap
         let hash = self.map.hash_key_unconstrained(key, &self.hasher);
         let mut index = (hash as usize) & self.map.mask;
-        
+
         // Linear probing to find the key
         for _ in 0..self.map.capacity {
             let bucket = &mut self.map.buckets[index];
-            
+
             if bucket.is_empty() {
                 return None;
             } else if bucket.matches(hash, key) {
                 // Found the key - extract the value using unsafe ptr::read
                 // This works even without Clone/Default on K, V
                 self.map.len -= 1;
-                
+
                 // Use unsafe to read the value out of the bucket without calling drop
                 // on the old location. Then mark the bucket as empty.
                 unsafe {
                     use std::ptr;
-                    
+
                     // Read the value out (this transfers ownership without dropping)
                     let val = ptr::read(&bucket.val as *const V);
-                    
+
                     // Drop the key properly
                     ptr::drop_in_place(&mut bucket.key as *mut K);
-                    
+
                     // Mark the bucket as empty
                     bucket.hash = 0;
-                    
+
                     return Some(val);
                 }
             }
-            
+
             index = (index + 1) & self.map.mask;
         }
-        
+
         None
     }
 
@@ -640,16 +640,16 @@ where
         K: Hash + Eq,
         S: BuildHasher,
     {
-        use std::mem;
         use crate::flatmap::Bucket;
-        
+        use std::mem;
+
         let hash = self.map.hash_key_unconstrained(&key, &self.hasher);
         let mut index = (hash as usize) & self.map.mask;
-        
+
         // Linear probing
         for _ in 0..self.map.capacity {
             let bucket = &mut self.map.buckets[index];
-            
+
             if bucket.is_empty() {
                 // Found empty slot
                 *bucket = Bucket { hash, key, val };
@@ -660,11 +660,11 @@ where
                 let old_val = mem::replace(&mut bucket.val, val);
                 return Some(old_val);
             }
-            
+
             // Move to next bucket
             index = (index + 1) & self.map.mask;
         }
-        
+
         panic!("FlatMap is full");
     }
 }
@@ -719,7 +719,7 @@ mod tests {
     fn test_insert_and_get() {
         let mut map = FlatMap::new(16);
         let hasher = RandomState::new();
-        
+
         assert_eq!(map.insert_with_hasher(1u64, 100u64, &hasher), None);
         assert_eq!(map.len(), 1);
         assert_eq!(map.get_with_hasher(&1u64, &hasher), Some(&100u64));
@@ -729,7 +729,7 @@ mod tests {
     fn test_insert_replace() {
         let mut map = FlatMap::new(16);
         let hasher = RandomState::new();
-        
+
         map.insert_with_hasher(1u64, 100u64, &hasher);
         assert_eq!(map.insert_with_hasher(1u64, 200u64, &hasher), Some(100u64));
         assert_eq!(map.len(), 1);
@@ -740,13 +740,13 @@ mod tests {
     fn test_multiple_inserts() {
         let mut map = FlatMap::new(16);
         let hasher = RandomState::new();
-        
+
         for i in 0..10 {
             map.insert_with_hasher(i, i * 10, &hasher);
         }
-        
+
         assert_eq!(map.len(), 10);
-        
+
         for i in 0..10 {
             assert_eq!(map.get_with_hasher(&i, &hasher), Some(&(i * 10)));
         }
@@ -756,10 +756,10 @@ mod tests {
     fn test_remove() {
         let mut map = FlatMap::new(16);
         let hasher = RandomState::new();
-        
+
         map.insert_with_hasher(1u64, 100u64, &hasher);
         map.insert_with_hasher(2u64, 200u64, &hasher);
-        
+
         assert_eq!(map.remove_with_hasher(&1u64, &hasher), Some(100u64));
         assert_eq!(map.len(), 1);
         assert_eq!(map.get_with_hasher(&1u64, &hasher), None);
@@ -770,11 +770,11 @@ mod tests {
     fn test_clear() {
         let mut map = FlatMap::new(16);
         let hasher = RandomState::new();
-        
+
         for i in 0..10 {
             map.insert_with_hasher(i, i * 10, &hasher);
         }
-        
+
         map.clear();
         assert_eq!(map.len(), 0);
         assert!(map.is_empty());
@@ -784,9 +784,9 @@ mod tests {
     fn test_contains_key() {
         let mut map = FlatMap::new(16);
         let hasher = RandomState::new();
-        
+
         map.insert_with_hasher(1u64, 100u64, &hasher);
-        
+
         assert!(map.contains_key_with_hasher(&1u64, &hasher));
         assert!(!map.contains_key_with_hasher(&2u64, &hasher));
     }
@@ -795,10 +795,10 @@ mod tests {
     fn test_iter() {
         let mut map = FlatMap::new(16);
         let hasher = RandomState::new();
-        
+
         map.insert_with_hasher(1u64, 100u64, &hasher);
         map.insert_with_hasher(2u64, 200u64, &hasher);
-        
+
         let mut count = 0;
         for (k, v) in map.iter() {
             count += 1;
@@ -812,7 +812,7 @@ mod tests {
     fn test_full_map() {
         let mut map = FlatMap::new(4);
         let hasher = RandomState::new();
-        
+
         for i in 0..5 {
             map.insert_with_hasher(i, i * 10, &hasher);
         }
@@ -822,13 +822,13 @@ mod tests {
     fn test_get_mut() {
         let mut map = FlatMap::new(16);
         let hasher = RandomState::new();
-        
+
         map.insert_with_hasher(1u64, 100u64, &hasher);
-        
+
         if let Some(v) = map.get_mut_with_hasher(&1u64, &hasher) {
             *v = 200;
         }
-        
+
         assert_eq!(map.get_with_hasher(&1u64, &hasher), Some(&200u64));
     }
 }

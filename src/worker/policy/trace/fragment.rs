@@ -6,17 +6,16 @@
  */
 
 use std::{
-	io,
-	time::{Instant, Duration},
+    io,
+    time::{Duration, Instant},
 };
 
 use parking_lot::{Mutex, MutexGuard};
 use tempfile::tempfile;
 
 use kwik::file::{
-	FileReader,
-	FileWriter,
-	binary::{BinaryReader, BinaryWriter},
+    FileReader, FileWriter,
+    binary::{BinaryReader, BinaryWriter},
 };
 
 use crate::worker::policy::event::TraceEvent;
@@ -28,35 +27,35 @@ const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const REFRESH_AGE: Duration = Duration::from_secs(60 * 60);
 
 pub struct TraceFragment {
-	created: Instant,
-	modifiers: Mutex<Modifiers>,
+    created: Instant,
+    modifiers: Mutex<Modifiers>,
 }
 
 impl TraceFragment {
-	pub fn new() -> io::Result<Self> {
-		let reader_file = tempfile()?;
-		let writer_file = reader_file.try_clone()?;
+    pub fn new() -> io::Result<Self> {
+        let reader_file = tempfile()?;
+        let writer_file = reader_file.try_clone()?;
 
-		let reader = BinaryReader::<TraceEvent>::from_file(reader_file)?;
-		let writer = BinaryWriter::<TraceEvent>::from_file(writer_file)?;
+        let reader = BinaryReader::<TraceEvent>::from_file(reader_file)?;
+        let writer = BinaryWriter::<TraceEvent>::from_file(writer_file)?;
 
-		let fragment = TraceFragment {
-			created: Instant::now(),
-			modifiers: Mutex::new((reader, writer)),
-		};
+        let fragment = TraceFragment {
+            created: Instant::now(),
+            modifiers: Mutex::new((reader, writer)),
+        };
 
-		Ok(fragment)
-	}
+        Ok(fragment)
+    }
 
-	pub fn is_expired(&self) -> bool {
-		self.created.elapsed() > MAX_AGE
-	}
+    pub fn is_expired(&self) -> bool {
+        self.created.elapsed() > MAX_AGE
+    }
 
-	pub fn is_valid(&self) -> bool {
-		self.created.elapsed() <= REFRESH_AGE
-	}
+    pub fn is_valid(&self) -> bool {
+        self.created.elapsed() <= REFRESH_AGE
+    }
 
-	pub fn lock(&self) -> MutexGuard<'_, Modifiers> {
-		self.modifiers.lock()
-	}
+    pub fn lock(&self) -> MutexGuard<'_, Modifiers> {
+        self.modifiers.lock()
+    }
 }
