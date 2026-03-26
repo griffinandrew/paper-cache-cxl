@@ -77,6 +77,7 @@ impl WorkerManager {
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
+			None,
 			tiering_manager.clone(),
 		)?);
 
@@ -121,6 +122,7 @@ impl WorkerManager {
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
+			Some(tiering_worker.clone()),
 		)?);
 
 		register_worker(TtlWorker::<K, V>::new(
@@ -171,6 +173,7 @@ impl WorkerManager {
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
+			None,
 		)?);
 
 		register_worker(TtlWorker::<K, V>::new(
@@ -203,6 +206,7 @@ impl WorkerManager {
 		status: &StatusRef,
 		overhead_manager: &OverheadManagerRef,
 		eviction_callback: Box<dyn for<'a> Fn(crate::HashedKey, std::sync::Arc<V>, &'a K) + Send + Sync>,
+		promotion_tx: Option<WorkerSender>,
 	) -> Result<Self, CacheError>
 	where
 		K: 'static + Eq + TypeSize + Clone,
@@ -216,6 +220,7 @@ impl WorkerManager {
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
+			promotion_tx,
 			eviction_callback,
 		)?);
 

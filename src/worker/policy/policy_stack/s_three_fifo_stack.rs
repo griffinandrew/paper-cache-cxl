@@ -19,7 +19,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
-	worker::policy::policy_stack::PolicyStack,
+	worker::policy::policy_stack::{AccessOutcome, PolicyStack},
 };
 
 pub struct SThreeFifoStack {
@@ -75,6 +75,23 @@ impl PolicyStack for SThreeFifoStack {
 		} else {
 			self.small.insert(object);
 		}
+	}
+
+	fn record_access(&mut self, key: HashedKey, hit: bool) -> AccessOutcome {
+		if hit {
+			self.update(key);
+			return AccessOutcome::None;
+		}
+
+		if self.any_stack_contains(key) {
+			return AccessOutcome::None;
+		}
+
+		if self.ghost.contains(&key) {
+			return AccessOutcome::GhostHit;
+		}
+
+		AccessOutcome::None
 	}
 
 	fn update(&mut self, key: HashedKey) {

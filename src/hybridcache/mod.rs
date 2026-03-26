@@ -38,7 +38,7 @@
 //!                       │  eviction (PolicyWorker eviction callback)
 //!                       ▼  try_send on bounded demotion channel (non-blocking)
 //!                  demotion worker thread  (pre-started, already in recv)
-//!                       │  PMEM write + insert key into demoted_keys
+//!                       │  PMEM write completes (ghost entry remains in policy stack)
 //!                       ▼
 //!                  far tier  (LRU, PMEM / BufferPMEM)
 //!
@@ -46,10 +46,9 @@
 //!                  │no
 //!                  ▼
 //!             far hit?      ──yes──▶  return value
-//!                  │                + if k in demoted_keys (ghost hit):
-//!                  │                    remove from demoted_keys
-//!                  │                    try_send re-insert into small (bounded)
-//!                  │                + else (ghost miss): serve from PMEM only
+//!                  │                + policy worker detects ghost-hit on small
+//!                  │                  miss and signals background promotion
+//!                  │                  (copy PMEM→DRAM)
 //!                  │no
 //!                  ▼
 //!             in-flight?    ──yes──▶  return miss (caller retries)
@@ -111,11 +110,12 @@ sync::{
 thread,
 };
 
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::bounded;
 use dashmap::DashSet;
+use dashmap::DashMap;
 use typesize::TypeSize;
 
-use crate::{PaperCache, PaperPolicy, CacheError, BufferDRAM, BufferPMEM};
+use crate::{PaperCache, PaperPolicy, CacheError, BufferDRAM, BufferPMEM, HashedKey};
 
 // ── Tier Size ─────────────────────────────────────────────────────────────────
 
@@ -213,10 +213,10 @@ pub struct HybridCacheConfig {
 
     /// Capacity of the bounded reinsertion channel (PMEM→DRAM promotion queue).
     ///
-    /// A far-tier hit enqueues `(key, value_bytes)` here with a non-blocking
-    /// send.  A background worker re-inserts the item into the small DRAM tier.
-    /// If the channel is full, the promotion is skipped; the next access will
-    /// re-trigger it.
+    /// Ghost-queue hits enqueue a promotion request here with a non-blocking
+    /// send.  A background worker copies the PMEM bytes back into the small
+    /// DRAM tier.  If the channel is full, the promotion is skipped; the next
+    /// ghost hit will re-trigger it.
     ///
     /// Defaults to `2048`.
     pub reinsertion_channel_capacity: usize,
@@ -322,34 +322,13 @@ K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
     /// evictions.  Uses the Hybrid allocator to place values in persistent /
     /// CXL memory.
     main: Arc<PaperCache<K, BufferPMEM>>,
-    /// Bounded channel used to request re-insertion of a far-tier hit into
-    /// the small DRAM tier.  The background reinsertion worker reads from the
-    /// other end.
-    ///
-    /// The channel capacity is configured via
-    /// [`HybridCacheConfig::reinsertion_channel_capacity`] (default 2048).
-    /// When the channel is full, the promotion is silently dropped
-    /// (`dropped_promotions` counter is incremented) and the next access will
-    /// re-trigger it.
-    reinsertion_tx: Sender<(K, Vec<u8>)>,
     /// Keys currently being migrated from the small DRAM tier to the far PMEM
     /// tier by the demotion worker thread.  During this window the key is
     /// absent from both tier hashtables; `get` treats an in-flight key as a
     /// cache miss rather than spinning, keeping latency predictable.
     in_flight_demotions: Arc<DashSet<K>>,
-    /// Keys that have been successfully written to the far PMEM tier and are
-    /// therefore eligible for promotion back to DRAM on the next far-tier hit.
-    ///
-    /// When a PMEM hit occurs, `get` checks this set.  If the key is present
-    /// it is removed and a re-insertion into the small DRAM tier is enqueued
-    /// (ghost-hit path).  If the key is absent (it was written to PMEM in a
-    /// previous cycle and has already been promoted once, or was never tracked),
-    /// no promotion is triggered — the value is served directly from PMEM.
-    ///
-    /// This prevents unbounded copy-on-read churn: items are only pulled back
-    /// into DRAM when they were recently evicted from it (the proxy for an
-    /// S3-FIFO ghost-queue hit), not on every subsequent PMEM access.
-    demoted_keys: Arc<DashSet<K>>,
+    /// Maps hashed keys to their original keys for PMEM→DRAM promotion.
+    demoted_lookup: Arc<DashMap<HashedKey, K>>,
     /// Shared atomic counters for [`HybridCacheStats`].
     stats: Arc<AtomicHybridStats>,
 }
@@ -390,9 +369,7 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
 
     let stats = Arc::new(AtomicHybridStats::new());
     let in_flight_demotions = Arc::new(DashSet::<K>::new());
-    // Tracks keys that have been written to the far PMEM tier and are eligible
-    // for one promotion back to DRAM on the next far-tier hit.
-    let demoted_keys = Arc::new(DashSet::<K>::new());
+    let demoted_lookup = Arc::new(DashMap::<HashedKey, K>::new());
 
     // ── Demotion channel + dedicated worker ──────────────────────────────────
     // The eviction callback (fired on the PolicyWorker thread) enqueues
@@ -402,7 +379,7 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
     //
     // Capacity is configurable; if the channel is full the demotion is dropped
     // (the item becomes a miss on next access — acceptable).
-    let (demotion_tx, demotion_rx) = bounded::<(K, Vec<u8>)>(config.demotion_channel_capacity);
+    let (demotion_tx, demotion_rx) = bounded::<(HashedKey, K, Vec<u8>)>(config.demotion_channel_capacity);
 
     // ── Demotion worker: drains channel → writes to far PMEM tier ─────────
     // The worker thread is started and confirmed running (via a Barrier)
@@ -410,29 +387,26 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
     // the PolicyWorker fires its first eviction.  This eliminates the
     // "thread not yet scheduled" race that can cause PMEM writes to be
     // delayed beyond the eviction window.
-    //
-    // After each successful write the key is added to `demoted_keys` so that
-    // the next far-tier hit triggers a promotion (ghost-hit proxy).
     let startup_barrier = Arc::new(Barrier::new(2));
     let startup_barrier_clone = Arc::clone(&startup_barrier);
     let main_worker = Arc::clone(&main);
     let stats_worker = Arc::clone(&stats);
     let in_flight_worker = Arc::clone(&in_flight_demotions);
-    let demoted_worker = Arc::clone(&demoted_keys);
+    let demoted_lookup_worker = Arc::clone(&demoted_lookup);
     thread::Builder::new()
         .name("hybridcache-demotion".to_string())
         .spawn(move || {
             // Signal the parent thread that this worker is running.
             startup_barrier_clone.wait();
-            while let Ok((k, val)) = demotion_rx.recv() {
-                if main_worker.set(k.clone(), &val, None).is_ok() {
-                    in_flight_worker.remove(&k);
-                    demoted_worker.insert(k);
+            while let Ok((hashed_key, key, val)) = demotion_rx.recv() {
+                if main_worker.set(key.clone(), &val, None).is_ok() {
+                    demoted_lookup_worker.insert(hashed_key, key.clone());
+                    in_flight_worker.remove(&key);
                     stats_worker.demotions.fetch_add(1, Ordering::Relaxed);
                 } else {
                     // PMEM write failed: remove the in-flight marker so `get`
                     // does not spin forever, and count it as a dropped demotion.
-                    in_flight_worker.remove(&k);
+                    in_flight_worker.remove(&key);
                     stats_worker.dropped_demotions.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -454,8 +428,9 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
     let main_check = Arc::clone(&main);
     let stats_evict = Arc::clone(&stats);
     let in_flight_evict = Arc::clone(&in_flight_demotions);
+    let demoted_lookup_cb = Arc::clone(&demoted_lookup);
     let eviction_callback: Box<dyn for<'a> Fn(crate::HashedKey, Arc<BufferDRAM>, &'a K) + Send + Sync> =
-    Box::new(move |_, val, k| {
+    Box::new(move |hashed_key, val, k| {
         // Skip if this key already has a live entry in the far PMEM tier.
         if main_check.has(k) {
             return;
@@ -463,13 +438,16 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
         // Mark the key as in-flight before enqueuing so `get` detects the
         // migration window.
         in_flight_evict.insert(k.clone());
+        demoted_lookup_cb.insert(hashed_key, k.clone());
         // Non-blocking send.  If the channel is full, drop the demotion,
         // remove the in-flight marker, and count the drop.
-        if demotion_tx.try_send((k.clone(), (**val).to_vec())).is_err() {
+        if demotion_tx.try_send((hashed_key, k.clone(), (**val).to_vec())).is_err() {
             in_flight_evict.remove(k);
             stats_evict.dropped_demotions.fetch_add(1, Ordering::Relaxed);
         }
     });
+
+    let (promotion_tx, promotion_rx) = bounded::<crate::worker::WorkerEvent>(config.reinsertion_channel_capacity);
 
     // ── Small DRAM tier – S3-FIFO, BufferDRAM, with eviction callback ─────
     let small = Arc::new(PaperCache::<K, BufferDRAM>::new_with_eviction_callback(
@@ -477,46 +455,53 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
         &[config.small_policy],
         config.small_policy,
         eviction_callback,
+        Some(promotion_tx.clone()),
     )?);
 
-    // ── Reinsertion worker: far PMEM hit → re-insert into small DRAM ─────
-    // When `get` finds an item in the far PMEM tier, it tries to send
-    // (key, value) here.  The worker re-inserts the item into the small DRAM
-    // tier so that S3-FIFO's ghost queue can control its admission tier on the
-    // next reference:
-    //   – ghost hit  → item enters S3-FIFO's M (main) queue (key was recently
-    //                   evicted and is in demoted_keys)
-    //   – ghost miss → value served from PMEM only; no reinsertion enqueued
-    //
-    // The channel is bounded; if it is full the promotion is dropped
-    // (counted in dropped_promotions).  The next access will re-trigger it.
-    let (reinsertion_tx, reinsertion_rx) = bounded::<(K, Vec<u8>)>(config.reinsertion_channel_capacity);
+    // ── Promotion worker: ghost-hit signal → re-insert into small DRAM ─────
+    // PolicyWorker detects ghost-queue hits and sends a `Promote` event with
+    // the hashed key.  This worker resolves the PMEM copy and re-inserts the
+    // bytes into the DRAM tier without blocking the request path.
     let small_reinsert = Arc::clone(&small);
+    let main_promote = Arc::clone(&main);
+    let demoted_lookup_promote = Arc::clone(&demoted_lookup);
     let stats_reinsert = Arc::clone(&stats);
     thread::Builder::new()
-        .name("hybridcache-reinsertion".to_string())
+        .name("hybridcache-promotion".to_string())
         .spawn(move || {
-            while let Ok((k, val)) = reinsertion_rx.recv() {
-                #[cfg(debug_assertions)]println!("Reinsertion worker: received key {:?}, {} bytes", k, val.len());
-                match small_reinsert.set(k.clone(), &val, None) {
-                    Ok(_) => {
-                        stats_reinsert.promotions.fetch_add(1, Ordering::Relaxed);
-                        #[cfg(debug_assertions)]println!("Reinsertion worker: successfully promoted key {:?}", k);
-                    }
-                    Err(e) => {
-                        #[cfg(debug_assertions)]println!("Reinsertion worker: failed to promote key {:?}: {:?}", k, e);
+            while let Ok(event) = promotion_rx.recv() {
+                if let crate::worker::WorkerEvent::Promote(hashed_key) = event {
+                    if let Some(entry) = demoted_lookup_promote.get(&hashed_key) {
+                        let key = entry.value().clone();
+                        match main_promote.peek(&key) {
+                            Ok(bytes) => {
+                                let val_bytes: Vec<u8> = bytes.as_ref().to_vec();
+                                match small_reinsert.set(key, &val_bytes, None) {
+                                    Ok(_) => {
+                                        stats_reinsert.promotions.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(_) => {
+                                        stats_reinsert.dropped_promotions.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                };
+                            }
+                            Err(_) => {
+                                stats_reinsert.dropped_promotions.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    } else {
+                        stats_reinsert.dropped_promotions.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
         })
-        .unwrap_or_else(|e| panic!("failed to spawn reinsertion worker thread: {e}"));
+        .unwrap_or_else(|e| panic!("failed to spawn promotion worker thread: {e}"));
 
     Ok(S3FifoHybridCache {
         small,
         main,
-        reinsertion_tx,
         in_flight_demotions,
-        demoted_keys,
+        demoted_lookup,
         stats,
     })
 }
@@ -558,12 +543,10 @@ pub fn set_with_ttl(&self, key: K, value: &str, ttl: u32) -> Result<(), CacheErr
 /// Lookup order: **small DRAM tier** (fast path) → **far PMEM tier**
 /// (slow path).
 ///
-/// A far-tier hit only schedules a background re-insertion into the small
-/// DRAM tier when the key is present in the internal `demoted_keys` set,
-/// meaning it was recently evicted from DRAM to PMEM (the proxy for an
-/// S3-FIFO ghost-queue hit).  If the key is not in `demoted_keys`, the
-/// value is served directly from PMEM without a promotion, preventing
-/// unbounded copy-on-read churn.
+/// Promotions are **ghost-hit** driven: the PolicyWorker detects when a
+/// lookup maps to S3-FIFO's ghost queue and signals a background promotion
+/// worker.  The `get` path itself is read-only; it does not enqueue
+/// promotions directly.
 ///
 /// If the key is absent from both tiers but is currently being migrated from
 /// DRAM to PMEM, this method returns [`CacheError::KeyNotFound`] rather than
@@ -592,19 +575,6 @@ pub fn get(&self, key: &K) -> Result<String, CacheError> {
     match self.main.get(key) {
         Ok(val) => {
             self.stats.main_hits.fetch_add(1, Ordering::Relaxed);
-            // Only promote to DRAM if the key is in `demoted_keys` — i.e. it
-            // was recently evicted from DRAM and this access is a ghost-queue
-            // hit proxy.  Remove it from the set atomically to ensure each
-            // demotion cycle grants exactly one promotion attempt.
-            if self.demoted_keys.remove(key).is_some() {
-                #[cfg(debug_assertions)]println!("Far tier hit for key {:?} (ghost hit — scheduling reinsertion)", key);
-                let val_bytes: Vec<u8> = val[..].to_vec();
-                if self.reinsertion_tx.try_send((key.clone(), val_bytes)).is_err() {
-                    self.stats.dropped_promotions.fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
-                #[cfg(debug_assertions)]println!("Far tier hit for key {:?} (ghost miss — serving from PMEM only)", key);
-            }
             Ok(String::from_utf8_lossy(&val).into_owned())
         }
         Err(_) => {
@@ -629,7 +599,6 @@ pub fn get(&self, key: &K) -> Result<String, CacheError> {
 pub fn del(&self, key: &K) -> Result<(), CacheError> {
     let in_small = self.small.del(key).is_ok();
     let in_main = self.main.del(key).is_ok();
-    self.demoted_keys.remove(key);
 
     if in_small || in_main {
         Ok(())
@@ -680,7 +649,7 @@ pub fn has_in_flight_demotion(&self, key: &K) -> bool {
 pub fn wipe(&self) -> Result<(), CacheError> {
     self.small.wipe()?;
     self.main.wipe()?;
-    self.demoted_keys.clear();
+    self.demoted_lookup.clear();
     Ok(())
 }
 

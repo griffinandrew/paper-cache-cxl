@@ -100,6 +100,14 @@ where
                 }
             }
             
+            WorkerEvent::Promote(hashed_key) => {
+                if let Some(object_ref) = self.objects.get(&hashed_key) {
+                    if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
+                        debug!("Promoted object {} to DRAM (ghost hit)", hashed_key);
+                    }
+                }
+            }
+            
             WorkerEvent::Set(hashed_key, base_size, _expiry, old_object_info) => {
                 if old_object_info.is_none() {
                     // New object - register it in PMEM tier
@@ -189,6 +197,14 @@ where
                                 debug!("Promoted object {} to DRAM", hashed_key);
                             }
                         }
+                    }
+                }
+            }
+            
+            WorkerEvent::Promote(hashed_key) => {
+                if let Some(object_ref) = self.objects.read().unwrap().get(&hashed_key) {
+                    if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
+                        debug!("Promoted object {} to DRAM (ghost hit)", hashed_key);
                     }
                 }
             }
@@ -286,6 +302,14 @@ where
                                 debug!("Promoted object {} to DRAM", hashed_key);
                             }
                         }
+                    }
+                }
+            }
+            
+            WorkerEvent::Promote(hashed_key) => {
+                if let Some(object_ref) = self.objects.get(&hashed_key) {
+                    if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
+                        debug!("Promoted object {} to DRAM (ghost hit)", hashed_key);
                     }
                 }
             }

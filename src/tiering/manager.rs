@@ -336,6 +336,24 @@ where
 
         false
     }
+
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    pub fn promote_object(&self, key: HashedKey, object: &Object<K, V>) -> bool
+    where
+        V: AsRef<[u8]>,
+    {
+        self.promote_to_dram_with_object(key, object)
+    }
+
+    #[cfg(any(
+        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
+    ))]
+    pub fn promote_object(&self, key: HashedKey, object: &Object<K, V>) -> bool
+    where
+        V: AsRef<[u8]>,
+    {
+        self.promote_to_dram_with_object(key, object)
+    }
     
     /// Promotes an object to DRAM (metadata only - for tests)
     /// Returns true if promotion was successful
