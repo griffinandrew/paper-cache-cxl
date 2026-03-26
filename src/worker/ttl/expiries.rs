@@ -5,63 +5,58 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::{
-	time::Instant,
-	collections::BTreeMap,
-};
+use std::{collections::BTreeMap, time::Instant};
 
 use crate::{
-	HashedKey,
-	object::{ExpireTime, get_expiry_from_ttl},
+    HashedKey,
+    object::{ExpireTime, get_expiry_from_ttl},
 };
 
 #[derive(Default)]
 pub struct Expiries {
-	map: BTreeMap<Instant, HashedKey>,
+    map: BTreeMap<Instant, HashedKey>,
 }
 
 impl Expiries {
-	pub fn has_within(&self, ttl: u32) -> bool {
-		let Some((nearest_expiry, _)) = self.map.first_key_value() else {
-			return false;
-		};
+    pub fn has_within(&self, ttl: u32) -> bool {
+        let Some((nearest_expiry, _)) = self.map.first_key_value() else {
+            return false;
+        };
 
-		*nearest_expiry <= get_expiry_from_ttl(ttl)
-	}
+        *nearest_expiry <= get_expiry_from_ttl(ttl)
+    }
 
-	pub fn insert(&mut self, key: HashedKey, expiry: ExpireTime) {
-		let Some(expiry) = expiry else {
-			return;
-		};
+    pub fn insert(&mut self, key: HashedKey, expiry: ExpireTime) {
+        let Some(expiry) = expiry else {
+            return;
+        };
 
-		self.map.insert(expiry, key);
-	}
+        self.map.insert(expiry, key);
+    }
 
-	pub fn remove(&mut self, key: HashedKey, expiry: ExpireTime) {
-		let Some(expiry) = expiry else {
-			return;
-		};
+    pub fn remove(&mut self, key: HashedKey, expiry: ExpireTime) {
+        let Some(expiry) = expiry else {
+            return;
+        };
 
-		if self.map.get(&expiry).is_none_or(|got_key| *got_key != key) {
-			return;
-		};
+        if self.map.get(&expiry).is_none_or(|got_key| *got_key != key) {
+            return;
+        };
 
-		self.map.remove(&expiry);
-	}
+        self.map.remove(&expiry);
+    }
 
-	pub fn pop_expired(&mut self, now: Instant) -> Option<HashedKey> {
-		let first_expiry = self.map
-			.first_key_value()
-			.map(|(expiry, _)| expiry)?;
+    pub fn pop_expired(&mut self, now: Instant) -> Option<HashedKey> {
+        let first_expiry = self.map.first_key_value().map(|(expiry, _)| expiry)?;
 
-		if *first_expiry > now {
-			return None;
-		}
+        if *first_expiry > now {
+            return None;
+        }
 
-		self.map.pop_first().map(|(_, key)| key)
-	}
+        self.map.pop_first().map(|(_, key)| key)
+    }
 
-	pub fn clear(&mut self) {
-		self.map.clear();
-	}
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
 }

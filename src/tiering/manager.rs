@@ -1,4 +1,4 @@
-/* 
+/*
 
 
 
@@ -115,15 +115,15 @@ struct ObjectTierInfo {
 }
 
 /// Tiering Manager
-/// 
+///
 /// Manages object placement between DRAM and PMEM tiers.
 /// DRAM contains hot COPIES of objects while PMEM is the source of truth.
-/// 
+///
 /// ## Data Copy Model
 /// Hot objects are physically copied to a DRAM cache for fast access.
 /// The PMEM tier always contains all objects (source of truth).
 /// DRAM tier contains copies of frequently accessed objects.
-/// 
+///
 /// ## Promotion Policy
 /// Objects are promoted to DRAM after being accessed more than the configured threshold.
 /// This simple heuristic ensures that only objects with repeated access are promoted.
@@ -136,16 +136,16 @@ pub struct TieringManager<K, V> {
 
     /// Set of objects currently in DRAM (for fast lookup)
     dram_objects: Arc<RwLock<HashSet<HashedKey>>>,
-    
+
     /// DRAM cache storing TieringObject<K> instances
     /// TieringObject always uses DRAM allocation (not Hybrid allocator) to ensure
     /// both key and value are in DRAM for fast access to hot objects
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
     dram_cache: Arc<DashMap<HashedKey, TieringObject<K>, NoHasher>>,
-    
+
     #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
     dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
-    
+
     _phantom: std::marker::PhantomData<(K, V)>,
 }
 
@@ -201,7 +201,7 @@ where
 
     /// Records an access to an object
     /// Returns true if the object should be promoted to DRAM
-    /// 
+    ///
     /// ## Promotion Heuristic
     /// Objects are promoted after reaching the configured hotness threshold.
     pub fn record_access(&self, key: HashedKey) -> bool {
@@ -246,10 +246,10 @@ where
         // First .as_ref() dereferences Arc<V> -> &V
         // Second .as_ref() calls AsRef<[u8]> trait on V -> &[u8]
         let bytes: &[u8] = source_data.as_ref().as_ref();
-        
+
         // Create new DRAM-allocated Box<[u8]> (physical copy)
         let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
-        
+
         // Create new TieringObject with key, data, and expiry
         TieringObject::with_expiry(object.key().clone(), dram_data, object.expiry())
     }
@@ -258,7 +258,7 @@ where
     /// Returns true if promotion was successful
     /// The object parameter is the Object from the main cache to copy to DRAM
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
-    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
+    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool
     where
         V: AsRef<[u8]>,
     {
@@ -276,7 +276,7 @@ where
 
                     // Create DRAM object with physical data copy
                     let dram_object = self.create_dram_object(object);
-                    
+
                     // Store the TieringObject in the DRAM cache
                     self.dram_cache.insert(key, dram_object);
 
@@ -299,7 +299,7 @@ where
     #[cfg(any(
         all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
     ))]
-    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
+    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool
     where
         V: AsRef<[u8]>,
     {
@@ -317,7 +317,7 @@ where
 
                     // Create DRAM object with physical data copy
                     let dram_object = self.create_dram_object(object);
-                    
+
                     // Store the TieringObject in the DRAM cache
                     self.dram_cache.write().unwrap().insert(key, dram_object);
 
@@ -354,7 +354,7 @@ where
     {
         self.promote_to_dram_with_object(key, object)
     }
-    
+
     /// Promotes an object to DRAM (metadata only - for tests)
     /// Returns true if promotion was successful
     /// Note: This only updates metadata, not actual data. Use promote_to_dram_with_data for production.
@@ -388,7 +388,7 @@ where
 
         false
     }
-    
+
     /// Demotes an object from DRAM (removes the DRAM copy, keeps PMEM)
     /// Returns true if demotion was successful
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
@@ -448,7 +448,7 @@ where
 
         false
     }
-    
+
     /// Gets a TieringObject from the DRAM cache if it exists there
     /// Returns a reference to the TieringObject<K> stored in DRAM
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
@@ -466,12 +466,12 @@ where
             .get(key)
             .map(|obj| Arc::new(obj.clone()))
     }
-    
+
     /// Updates the DRAM cache when an object is updated
     /// Should be called whenever an object in PMEM is updated
     /// This creates a new physical copy with DRAM-allocated data
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
-    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
+    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>)
     where
         V: AsRef<[u8]>,
     {
@@ -486,7 +486,7 @@ where
     #[cfg(any(
         all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
     ))]
-    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
+    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>)
     where
         V: AsRef<[u8]>,
     {
@@ -554,7 +554,7 @@ where
                 Tier::DramAndPmem => {
                     // Remove from DRAM cache
                     self.dram_cache.remove(&key);
-                    
+
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
@@ -581,7 +581,7 @@ where
                 Tier::DramAndPmem => {
                     // Remove from DRAM cache
                     self.dram_cache.write().unwrap().remove(&key);
-                    
+
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
@@ -635,7 +635,7 @@ where
 
         let mut dram_objects = self.dram_objects.write().unwrap();
         dram_objects.clear();
-        
+
         // Clear the DRAM cache
         self.dram_cache.clear();
 
@@ -652,7 +652,7 @@ where
 
         let mut dram_objects = self.dram_objects.write().unwrap();
         dram_objects.clear();
-        
+
         // Clear the DRAM cache
         self.dram_cache.write().unwrap().clear();
 
@@ -804,7 +804,7 @@ mod tests {
         // High water mark: 270, Low water mark: 180
         // Should demote to bring below 180
         let keys_to_demote = manager.get_keys_to_demote();
-        
+
         // Should demote at least 2 objects (200 bytes)
         assert!(keys_to_demote.len() >= 2);
     }
@@ -812,21 +812,15 @@ mod tests {
     #[test]
     fn test_set_and_get_hotness_threshold() {
         let manager = TieringManager::with_defaults();
-        
+
         assert_eq!(manager.hotness_threshold(), 2);
-        
+
         manager.set_hotness_threshold(5);
         assert_eq!(manager.hotness_threshold(), 5);
     }
 }
 
 */
-
-
-
-
-
-
 
 use std::{
     collections::{HashMap, HashSet},
@@ -846,21 +840,21 @@ use super::object::TieringObject;
 use nohash_hasher::NoHashHasher;
 use std::hash::BuildHasherDefault;
 
-
 pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 
-
-pub use crate::{
-	error::CacheError,
-	policy::PaperPolicy,
-}; 
+pub use crate::{error::CacheError, policy::PaperPolicy};
 
 use crate::PaperCache;
 
 #[cfg(feature = "key_value_pmem")]
 pub type BufferPMEM = Box<[u8], Hybrid>;
 
-#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem"))]
+#[cfg(any(
+    feature = "key_value_pmem",
+    feature = "alloc_api_exp",
+    feature = "global_hashtable_pmem",
+    feature = "tiering_hashtable_pmem"
+))]
 use crate::allocator::HybridObjects as Hybrid;
 
 mod allocator_bindings {
@@ -870,10 +864,8 @@ mod allocator_bindings {
 #[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 use hashbrown::HashMap as hashtable;
 
-
-
-use std::sync::mpsc::{self, Sender, Receiver};
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 #[cfg(feature = "sets_dram")]
@@ -884,7 +876,6 @@ pub struct PmemBackfillJob<K> {
     pub value: Box<[u8]>,
     pub ttl: Option<u32>,
 }
-
 
 /// Configuration for the tiering manager
 #[derive(Debug, Clone)]
@@ -926,7 +917,7 @@ impl Default for TieringConfig {
             dram_threshold: 1 * 1024 * 1024 * 1024, // 1 GB default
             high_water_mark: 0.95,
             low_water_mark: 0.7,
-            hotness_threshold: 3, // Promote after 3 accesses
+            hotness_threshold: 3,                  // Promote after 3 accesses
             use_pmem_for_tiering_hashtable: false, // Default to DRAM
             #[cfg(feature = "hashtable_tiering")]
             warm_threshold: 2, // Pointer promotion after 2 accesses
@@ -955,7 +946,6 @@ pub struct TieringStats {
     pub pmem_only_objects: u64,
 
     pub pointer_promotions: u64, // For hashtable_tiering feature
-
 
     pub pointer_demotions: u64, // For hashtable_tiering feature
 
@@ -1002,15 +992,15 @@ struct ObjectTierInfo {
 }
 
 /// Tiering Manager
-/// 
+///
 /// Manages object placement between DRAM and PMEM tiers.
 /// DRAM contains hot COPIES of objects while PMEM is the source of truth.
-/// 
+///
 /// ## Data Copy Model
 /// Hot objects are physically copied to a DRAM cache for fast access.
 /// The PMEM tier always contains all objects (source of truth).
 /// DRAM tier contains copies of frequently accessed objects.
-/// 
+///
 /// ## Promotion Policy
 /// Objects are promoted to DRAM after being accessed more than the configured threshold.
 /// This simple heuristic ensures that only objects with repeated access are promoted.
@@ -1023,34 +1013,94 @@ pub struct TieringManager<K, V> {
 
     /// Set of objects currently in DRAM (for fast lookup)
     dram_objects: Arc<RwLock<HashSet<HashedKey>>>,
-    
+
     /// DRAM cache storing TieringObject<K> instances
     /// TieringObject always uses DRAM allocation (not Hybrid allocator) to ensure
     /// both key and value are in DRAM for fast access to hot objects
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
+    #[cfg(all(
+        feature = "key_value_pmem",
+        not(feature = "tiering_hashtable_pmem"),
+        not(feature = "hashtable_tiering")
+    ))]
     dram_cache: Arc<DashMap<HashedKey, TieringObject<K>, NoHasher>>,
-    
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), feature = "hashtable_tiering"))]
+
+    #[cfg(all(
+        feature = "key_value_pmem",
+        not(feature = "tiering_hashtable_pmem"),
+        feature = "hashtable_tiering"
+    ))]
     dram_cache: Arc<DashMap<HashedKey, TieringObject<K, V>, NoHasher>>,
-    
-    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
-    
-    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", feature = "hashtable_tiering"))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
-    
-    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>>>>,
-    
-    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem"), feature = "hashtable_tiering"))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>>>>,
-    
-    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
-    
-    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem", feature = "hashtable_tiering"))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
-    
+
+    #[cfg(all(
+        feature = "key_value_pmem",
+        feature = "tiering_hashtable_pmem",
+        not(feature = "hashtable_tiering")
+    ))]
+    dram_cache: Arc<
+        RwLock<
+            hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>,
+        >,
+    >,
+
+    #[cfg(all(
+        feature = "key_value_pmem",
+        feature = "tiering_hashtable_pmem",
+        feature = "hashtable_tiering"
+    ))]
+    dram_cache: Arc<
+        RwLock<
+            hashtable<
+                HashedKey,
+                TieringObject<K, V>,
+                BuildHasherDefault<NoHashHasher<u64>>,
+                Hybrid,
+            >,
+        >,
+    >,
+
+    #[cfg(all(
+        feature = "alloc_api_exp",
+        not(feature = "tiering_hashtable_pmem"),
+        not(feature = "hashtable_tiering")
+    ))]
+    dram_cache:
+        Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>>>>,
+
+    #[cfg(all(
+        feature = "alloc_api_exp",
+        not(feature = "tiering_hashtable_pmem"),
+        feature = "hashtable_tiering"
+    ))]
+    dram_cache: Arc<
+        RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>>>,
+    >,
+
+    #[cfg(all(
+        feature = "alloc_api_exp",
+        feature = "tiering_hashtable_pmem",
+        not(feature = "hashtable_tiering")
+    ))]
+    dram_cache: Arc<
+        RwLock<
+            hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>,
+        >,
+    >,
+
+    #[cfg(all(
+        feature = "alloc_api_exp",
+        feature = "tiering_hashtable_pmem",
+        feature = "hashtable_tiering"
+    ))]
+    dram_cache: Arc<
+        RwLock<
+            hashtable<
+                HashedKey,
+                TieringObject<K, V>,
+                BuildHasherDefault<NoHashHasher<u64>>,
+                Hybrid,
+            >,
+        >,
+    >,
 
     #[cfg(feature = "sets_dram")]
     pmem_tx: Sender<HashedKey>,
@@ -1077,7 +1127,11 @@ where
 {
     /// Creates a new TieringManager with the given configuration.
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
-    #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem")))]
+    #[cfg(all(
+        feature = "key_value_pmem",
+        not(feature = "key_pmem_value_pmem"),
+        not(feature = "tiering_hashtable_pmem")
+    ))]
     pub fn new(config: TieringConfig) -> Self {
         #[cfg(feature = "sets_dram")]
         let (dummy_tx, dummy_rx) = mpsc::channel::<HashedKey>();
@@ -1109,7 +1163,10 @@ where
     /// Both the object key and value are PMEM-resident in the main cache.
     /// Promotion reads the key from PMEM (via `Box<K, Hybrid>`) and copies
     /// both key and value bytes into a DRAM-resident `TieringObject<K>`.
-    #[cfg(all(feature = "key_pmem_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    #[cfg(all(
+        feature = "key_pmem_value_pmem",
+        not(feature = "tiering_hashtable_pmem")
+    ))]
     pub fn new(config: TieringConfig) -> Self {
         #[cfg(feature = "sets_dram")]
         let (dummy_tx, dummy_rx) = mpsc::channel::<HashedKey>();
@@ -1150,7 +1207,10 @@ where
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
-            dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
+            dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(
+                NoHasher::default(),
+                Hybrid,
+            ))),
             #[cfg(feature = "sets_dram")]
             pmem_tx: dummy_tx,
             #[cfg(feature = "sets_dram")]
@@ -1204,7 +1264,10 @@ where
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
-            dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
+            dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(
+                NoHasher::default(),
+                Hybrid,
+            ))),
             #[cfg(feature = "sets_dram")]
             pmem_tx: dummy_tx,
             #[cfg(feature = "sets_dram")]
@@ -1227,12 +1290,15 @@ where
     pub fn register_object(&self, key: HashedKey, size: ObjectSize) {
         let mut info_map = self.object_info.write().unwrap();
 
-        info_map.insert(key, ObjectTierInfo {
-            tier: Tier::PmemOnly,
-            size,
-            access_count: 0,
-            last_access: std::time::Instant::now(),
-        });
+        info_map.insert(
+            key,
+            ObjectTierInfo {
+                tier: Tier::PmemOnly,
+                size,
+                access_count: 0,
+                last_access: std::time::Instant::now(),
+            },
+        );
 
         let mut stats = self.stats.write().unwrap();
         stats.pmem_only_objects += 1;
@@ -1242,23 +1308,26 @@ where
     pub fn register_object(&self, key: HashedKey, size: ObjectSize) {
         let mut info_map = self.object_info.write().unwrap();
 
-        info_map.insert(key, ObjectTierInfo {
-            tier: Tier::DramOnly,
-            size,
-            access_count: 0,
-            last_access: std::time::Instant::now(),
-        });
+        info_map.insert(
+            key,
+            ObjectTierInfo {
+                tier: Tier::DramOnly,
+                size,
+                access_count: 0,
+                last_access: std::time::Instant::now(),
+            },
+        );
 
         let mut stats = self.stats.write().unwrap();
         stats.dram_only_objects += 1;
     }
 
     //let paper_cache_for_bg = paper_cache.clone(); // Arc<PaperCache<...>>
-    
+
     //let tiering = TieringManager::new_with_backfill(config, move |job| {
-        // IMPORTANT: call a PMEM-only path to avoid recursion into set_dram
-        // Example:
-        // let _ = paper_cache_for_bg.set_pmem_only(job.key, &job.value, job.ttl);
+    // IMPORTANT: call a PMEM-only path to avoid recursion into set_dram
+    // Example:
+    // let _ = paper_cache_for_bg.set_pmem_only(job.key, &job.value, job.ttl);
     //});
     // ...existing code...
 
@@ -1291,7 +1360,8 @@ where
                 // force_sync_persist (they were removed from the map first).
                 let mut batch = Vec::with_capacity(keys.len());
                 {
-                    let mut pending = pending_jobs.lock()
+                    let mut pending = pending_jobs
+                        .lock()
                         .expect("pending_jobs mutex should not be poisoned");
                     for key in keys {
                         if let Some(job) = pending.remove(&key) {
@@ -1306,9 +1376,12 @@ where
             }
         })
     }
-    
-    
-    #[cfg(all(feature = "sets_dram", feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+
+    #[cfg(all(
+        feature = "sets_dram",
+        feature = "key_value_pmem",
+        not(feature = "tiering_hashtable_pmem")
+    ))]
     pub fn new_with_backfill<F>(config: TieringConfig, persist_fn: F) -> Self
     where
         K: Send + 'static,
@@ -1338,7 +1411,11 @@ where
         }
     }
 
-    #[cfg(all(feature = "sets_dram", feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
+    #[cfg(all(
+        feature = "sets_dram",
+        feature = "key_value_pmem",
+        feature = "tiering_hashtable_pmem"
+    ))]
     pub fn new_with_backfill<F>(config: TieringConfig, persist_fn: F) -> Self
     where
         K: Send + 'static,
@@ -1359,7 +1436,10 @@ where
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
-            dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
+            dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(
+                NoHasher::default(),
+                Hybrid,
+            ))),
             pmem_tx: tx,
             _pmem_consumer: handle,
             pending_jobs,
@@ -1374,12 +1454,15 @@ where
         {
             let mut info_map = self.object_info.write().unwrap();
             let size = value.len() as ObjectSize;
-            info_map.insert(hashed_key, ObjectTierInfo {
-                tier: Tier::DramOnly,
-                size,
-                access_count: 0,
-                last_access: std::time::Instant::now(),
-            });
+            info_map.insert(
+                hashed_key,
+                ObjectTierInfo {
+                    tier: Tier::DramOnly,
+                    size,
+                    access_count: 0,
+                    last_access: std::time::Instant::now(),
+                },
+            );
         }
         self.dram_objects.write().unwrap().insert(hashed_key);
 
@@ -1421,43 +1504,43 @@ where
 
 
         let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
+        let expiry = object.expiry();
 
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
+        if base_size == 0 {
+            return Err(CacheError::ZeroValueSize);
+        }
 
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
+        if self.status.exceeds_max_size(base_size) {
+            return Err(CacheError::ExceedingValueSize);
+        }
 
-		self.status.incr_sets();
+        self.status.incr_sets();
 
-		let old_object_info = self.objects
-			.insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
+        let old_object_info = self.objects
+            .insert(hashed_key, object)
+            .map(|old_object| {
+                let base_size = self.overhead_manager.base_size(&old_object);
+                let expiry = old_object.expiry();
 
-				(base_size, expiry)
-			});
+                (base_size, expiry)
+            });
 
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			// the object is new, so increase the number of objects count
-			self.status.incr_num_objects();
-			base_size as i64
-		};
+        let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+            base_size as i64 - old_object_size as i64
+        } else {
+            // the object is new, so increase the number of objects count
+            self.status.incr_num_objects();
+            base_size as i64
+        };
 
-		self.status.update_base_used_size(base_size_delta);
+        self.status.update_base_used_size(base_size_delta);
     }
 
     */
 
     /// Records an access to an object
     /// Returns true if the object should be promoted to DRAM
-    /// 
+    ///
     /// ## Promotion Heuristic
     /// Objects are promoted after reaching the configured hotness threshold.
     #[cfg(not(feature = "hashtable_tiering"))]
@@ -1499,7 +1582,7 @@ where
     #[cfg(feature = "hashtable_tiering")]
     /// Records an access to an object (hashtable_tiering version)
     /// Returns true if the object should be promoted to DRAM (physical copy or pointer)
-    /// 
+    ///
     /// ## Promotion Heuristic (hashtable_tiering)
     /// Objects are promoted in two stages:
     /// 1. Warm tier (pointer-only): After warm_threshold accesses
@@ -1554,10 +1637,10 @@ where
         // First .as_ref() dereferences Arc<V> -> &V
         // Second .as_ref() calls AsRef<[u8]> trait on V -> &[u8]
         let bytes: &[u8] = source_data.as_ref().as_ref();
-        
+
         // Create new DRAM-allocated Box<[u8]> (physical copy)
         let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
-        
+
         // Create new TieringObject with key, data, and expiry
         TieringObject::with_expiry(object.key().clone(), dram_data, object.expiry())
     }
@@ -1574,10 +1657,10 @@ where
         // First .as_ref() dereferences Arc<V> -> &V
         // Second .as_ref() calls AsRef<[u8]> trait on V -> &[u8]
         let bytes: &[u8] = source_data.as_ref().as_ref();
-        
+
         // Create new DRAM-allocated Box<[u8]> (physical copy)
         let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
-        
+
         // Create new TieringObject with key, data, and expiry
         TieringObject::with_expiry(object.key().clone(), dram_data, object.expiry())
     }
@@ -1589,17 +1672,18 @@ where
         K: Clone,
     {
         // Create TieringObject with pointer to CXL data (zero-copy)
-        TieringObject::with_cxl_reference(
-            object.key().clone(),
-            object.data(),
-            object.expiry()
-        )
+        TieringObject::with_cxl_reference(object.key().clone(), object.data(), object.expiry())
     }
 
     /// Promotes an object to DRAM by creating a physical copy with DRAM-allocated data.
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
-    #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
-    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
+    #[cfg(all(
+        feature = "key_value_pmem",
+        not(feature = "key_pmem_value_pmem"),
+        not(feature = "tiering_hashtable_pmem"),
+        not(feature = "hashtable_tiering")
+    ))]
+    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool
     where
         V: AsRef<[u8]>,
     {
@@ -1617,7 +1701,7 @@ where
 
                     // Create DRAM object with physical data copy
                     let dram_object = self.create_dram_object(object);
-                    
+
                     // Store the TieringObject in the DRAM cache
                     self.dram_cache.insert(key, dram_object);
 
@@ -1642,8 +1726,12 @@ where
     /// Both the key (via `Box<K, Hybrid>`) and value bytes of the source object
     /// live in PMEM.  Promotion reads the key from PMEM and copies both key and
     /// value bytes into a DRAM-resident `TieringObject<K>`.
-    #[cfg(all(feature = "key_pmem_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
-    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
+    #[cfg(all(
+        feature = "key_pmem_value_pmem",
+        not(feature = "tiering_hashtable_pmem"),
+        not(feature = "hashtable_tiering")
+    ))]
+    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool
     where
         V: AsRef<[u8]>,
     {
@@ -1662,7 +1750,7 @@ where
                     // Copy key (from PMEM via Box<K, Hybrid>) and value bytes
                     // (from PMEM) into a DRAM-allocated TieringObject<K>.
                     let dram_object = self.create_dram_object(object);
-                    
+
                     // Store the TieringObject in the DRAM cache
                     self.dram_cache.insert(key, dram_object);
 
@@ -1683,10 +1771,14 @@ where
     }
 
     #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")),
+        all(
+            feature = "key_value_pmem",
+            feature = "tiering_hashtable_pmem",
+            not(feature = "hashtable_tiering")
+        ),
         all(feature = "alloc_api_exp", not(feature = "hashtable_tiering"))
     ))]
-    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
+    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool
     where
         V: AsRef<[u8]>,
     {
@@ -1704,7 +1796,7 @@ where
 
                     // Create DRAM object with physical data copy
                     let dram_object = self.create_dram_object(object);
-                    
+
                     // Store the TieringObject in the DRAM cache
                     self.dram_cache.write().unwrap().insert(key, dram_object);
 
@@ -1724,10 +1816,14 @@ where
         false
     }
 
-    #[cfg(all(feature = "hashtable_tiering", feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    #[cfg(all(
+        feature = "hashtable_tiering",
+        feature = "key_value_pmem",
+        not(feature = "tiering_hashtable_pmem")
+    ))]
     /// Promotes an object to warm tier (pointer-only) or hot tier (physical copy)
     /// Returns true if promotion was successful
-    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
+    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool
     where
         V: AsRef<[u8]>,
     {
@@ -1735,7 +1831,7 @@ where
 
         if let Some(info) = info_map.get_mut(&key) {
             let config = self.config.read().unwrap();
-            
+
             match info.tier {
                 Tier::PmemOnly => {
                     // Promote to warm tier (pointer-only, zero-copy)
@@ -1744,7 +1840,7 @@ where
 
                         // Create warm object with CXL reference
                         let warm_object = self.create_warm_object(object);
-                        
+
                         // Store the TieringObject in the DRAM cache
                         self.dram_cache.insert(key, warm_object);
 
@@ -1771,7 +1867,7 @@ where
 
                             // Create DRAM object with physical data copy
                             let dram_object = self.create_dram_object(object);
-                            
+
                             // Update the existing TieringObject in the DRAM cache
                             self.dram_cache.insert(key, dram_object);
 
@@ -1789,7 +1885,6 @@ where
                 Tier::DramOnly => {
                     // Already in DRAM-only tier
                 }
-
             }
         }
 
@@ -1797,12 +1892,16 @@ where
     }
 
     #[cfg(any(
-        all(feature = "hashtable_tiering", feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
+        all(
+            feature = "hashtable_tiering",
+            feature = "key_value_pmem",
+            feature = "tiering_hashtable_pmem"
+        ),
         all(feature = "hashtable_tiering", feature = "alloc_api_exp")
     ))]
     /// Promotes an object to warm tier (pointer-only) or hot tier (physical copy)
     /// Returns true if promotion was successful
-    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
+    pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool
     where
         V: AsRef<[u8]>,
     {
@@ -1810,7 +1909,7 @@ where
 
         if let Some(info) = info_map.get_mut(&key) {
             let config = self.config.read().unwrap();
-            
+
             match info.tier {
                 Tier::PmemOnly => {
                     // Promote to warm tier (pointer-only, zero-copy)
@@ -1819,7 +1918,7 @@ where
 
                         // Create warm object with CXL reference
                         let warm_object = self.create_warm_object(object);
-                        
+
                         // Store the TieringObject in the DRAM cache
                         self.dram_cache.write().unwrap().insert(key, warm_object);
 
@@ -1846,7 +1945,7 @@ where
 
                             // Create DRAM object with physical data copy
                             let dram_object = self.create_dram_object(object);
-                            
+
                             // Update the existing TieringObject in the DRAM cache
                             self.dram_cache.write().unwrap().insert(key, dram_object);
 
@@ -1865,7 +1964,7 @@ where
 
         false
     }
-    
+
     /// Promotes an object to DRAM (metadata only - for tests)
     /// Returns true if promotion was successful
     /// Note: This only updates metadata, not actual data. Use promote_to_dram_with_data for production.
@@ -1899,10 +1998,15 @@ where
 
         false
     }
-    
+
     /// Demotes an object from DRAM (removes the DRAM copy, keeps PMEM).
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
-    #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
+    #[cfg(all(
+        feature = "key_value_pmem",
+        not(feature = "key_pmem_value_pmem"),
+        not(feature = "tiering_hashtable_pmem"),
+        not(feature = "hashtable_tiering")
+    ))]
     pub fn demote_from_dram(&self, key: HashedKey) -> bool {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -1934,7 +2038,11 @@ where
     /// (`key_pmem_value_pmem` + `enable_tiering_manager`).
     /// Removes the DRAM copy; the authoritative copy (both key and value in PMEM)
     /// remains untouched as the source of truth.
-    #[cfg(all(feature = "key_pmem_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
+    #[cfg(all(
+        feature = "key_pmem_value_pmem",
+        not(feature = "tiering_hashtable_pmem"),
+        not(feature = "hashtable_tiering")
+    ))]
     pub fn demote_from_dram(&self, key: HashedKey) -> bool {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -1962,7 +2070,11 @@ where
     }
 
     #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")),
+        all(
+            feature = "key_value_pmem",
+            feature = "tiering_hashtable_pmem",
+            not(feature = "hashtable_tiering")
+        ),
         all(feature = "alloc_api_exp", not(feature = "hashtable_tiering"))
     ))]
     pub fn demote_from_dram(&self, key: HashedKey) -> bool {
@@ -1992,7 +2104,11 @@ where
         false
     }
 
-    #[cfg(all(feature = "hashtable_tiering", feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    #[cfg(all(
+        feature = "hashtable_tiering",
+        feature = "key_value_pmem",
+        not(feature = "tiering_hashtable_pmem")
+    ))]
     /// Demotes an object from DRAM (hashtable_tiering version)
     /// Handles both warm tier (pointer-only) and hot tier (physical copy)
     pub fn demote_from_dram(&self, key: HashedKey) -> bool {
@@ -2062,7 +2178,11 @@ where
     }
 
     #[cfg(any(
-        all(feature = "hashtable_tiering", feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
+        all(
+            feature = "hashtable_tiering",
+            feature = "key_value_pmem",
+            feature = "tiering_hashtable_pmem"
+        ),
         all(feature = "hashtable_tiering", feature = "alloc_api_exp")
     ))]
     /// Demotes an object from DRAM (hashtable_tiering version)
@@ -2115,11 +2235,19 @@ where
 
         false
     }
-    
+
     /// Gets a TieringObject from the DRAM cache if it exists there.
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
-    #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
-    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = TieringObject<K>> + '_> {
+    #[cfg(all(
+        feature = "key_value_pmem",
+        not(feature = "key_pmem_value_pmem"),
+        not(feature = "tiering_hashtable_pmem"),
+        not(feature = "hashtable_tiering")
+    ))]
+    pub fn get_from_dram(
+        &self,
+        key: &HashedKey,
+    ) -> Option<impl std::ops::Deref<Target = TieringObject<K>> + '_> {
         self.dram_cache.get(key)
     }
 
@@ -2127,18 +2255,36 @@ where
     /// (`key_pmem_value_pmem` + `enable_tiering_manager`).
     /// This is a physical DRAM copy produced during promotion; the authoritative
     /// copy (both key and value bytes) lives in PMEM.
-    #[cfg(all(feature = "key_pmem_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
-    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = TieringObject<K>> + '_> {
+    #[cfg(all(
+        feature = "key_pmem_value_pmem",
+        not(feature = "tiering_hashtable_pmem"),
+        not(feature = "hashtable_tiering")
+    ))]
+    pub fn get_from_dram(
+        &self,
+        key: &HashedKey,
+    ) -> Option<impl std::ops::Deref<Target = TieringObject<K>> + '_> {
         self.dram_cache.get(key)
     }
 
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), feature = "hashtable_tiering"))]
-    pub fn get_from_dram(&self, key: &HashedKey) -> Option<impl std::ops::Deref<Target = TieringObject<K, V>> + '_> {
+    #[cfg(all(
+        feature = "key_value_pmem",
+        not(feature = "tiering_hashtable_pmem"),
+        feature = "hashtable_tiering"
+    ))]
+    pub fn get_from_dram(
+        &self,
+        key: &HashedKey,
+    ) -> Option<impl std::ops::Deref<Target = TieringObject<K, V>> + '_> {
         self.dram_cache.get(key)
     }
 
     #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")),
+        all(
+            feature = "key_value_pmem",
+            feature = "tiering_hashtable_pmem",
+            not(feature = "hashtable_tiering")
+        ),
         all(feature = "alloc_api_exp", not(feature = "hashtable_tiering"))
     ))]
     pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K>>> {
@@ -2150,7 +2296,11 @@ where
     }
 
     #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", feature = "hashtable_tiering"),
+        all(
+            feature = "key_value_pmem",
+            feature = "tiering_hashtable_pmem",
+            feature = "hashtable_tiering"
+        ),
         all(feature = "alloc_api_exp", feature = "hashtable_tiering")
     ))]
     pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K, V>>> {
@@ -2160,11 +2310,15 @@ where
             .get(key)
             .map(|obj| Arc::new(obj.clone()))
     }
-    
+
     /// Updates the DRAM cache when an object is updated.
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
-    #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem")))]
-    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
+    #[cfg(all(
+        feature = "key_value_pmem",
+        not(feature = "key_pmem_value_pmem"),
+        not(feature = "tiering_hashtable_pmem")
+    ))]
+    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>)
     where
         V: AsRef<[u8]>,
     {
@@ -2180,8 +2334,11 @@ where
     /// `tiering` feature (`key_pmem_value_pmem` + `enable_tiering_manager`).
     /// Re-reads both key (from PMEM via `Box<K, Hybrid>`) and value bytes from
     /// PMEM and stores a fresh DRAM-allocated copy in the dram_cache.
-    #[cfg(all(feature = "key_pmem_value_pmem", not(feature = "tiering_hashtable_pmem")))]
-    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
+    #[cfg(all(
+        feature = "key_pmem_value_pmem",
+        not(feature = "tiering_hashtable_pmem")
+    ))]
+    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>)
     where
         V: AsRef<[u8]>,
     {
@@ -2197,7 +2354,7 @@ where
         all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
         feature = "alloc_api_exp"
     ))]
-    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
+    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>)
     where
         V: AsRef<[u8]>,
     {
@@ -2255,7 +2412,12 @@ where
 
     /// Removes an object from all tiering tracking (when it's deleted from cache).
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
-    #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
+    #[cfg(all(
+        feature = "key_value_pmem",
+        not(feature = "key_pmem_value_pmem"),
+        not(feature = "tiering_hashtable_pmem"),
+        not(feature = "hashtable_tiering")
+    ))]
     pub fn remove_object(&self, key: HashedKey) {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -2266,7 +2428,7 @@ where
                 Tier::DramAndPmem => {
                     // Remove from DRAM cache
                     self.dram_cache.remove(&key);
-                    
+
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
@@ -2293,7 +2455,11 @@ where
     /// (`key_pmem_value_pmem` + `enable_tiering_manager`).
     /// Cleans up the DRAM copy if present; the PMEM copy (both key and value
     /// in PMEM) is removed separately by the main cache eviction path.
-    #[cfg(all(feature = "key_pmem_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
+    #[cfg(all(
+        feature = "key_pmem_value_pmem",
+        not(feature = "tiering_hashtable_pmem"),
+        not(feature = "hashtable_tiering")
+    ))]
     pub fn remove_object(&self, key: HashedKey) {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -2305,7 +2471,7 @@ where
                     // Remove DRAM copy; PMEM copy (both key and value in PMEM)
                     // is removed by the main cache eviction path.
                     self.dram_cache.remove(&key);
-                    
+
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
@@ -2328,7 +2494,11 @@ where
         }
     }
 
-    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), feature = "hashtable_tiering"))]
+    #[cfg(all(
+        feature = "key_value_pmem",
+        not(feature = "tiering_hashtable_pmem"),
+        feature = "hashtable_tiering"
+    ))]
     pub fn remove_object(&self, key: HashedKey) {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -2339,7 +2509,7 @@ where
                 Tier::DramAndPmem => {
                     // Remove from DRAM cache
                     self.dram_cache.remove(&key);
-                    
+
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
@@ -2349,7 +2519,7 @@ where
                 Tier::DramPtrToPmem => {
                     // Remove from DRAM cache (pointer-only)
                     self.dram_cache.remove(&key);
-                    
+
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
@@ -2358,12 +2528,12 @@ where
                 Tier::PmemOnly => {
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
                 }
-                
+
                 #[cfg(feature = "sets_dram")]
                 Tier::DramOnly => {
                     // Remove from DRAM cache (DRAM-only tier)
                     self.dram_cache.remove(&key);
-                    
+
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
@@ -2377,7 +2547,11 @@ where
     }
 
     #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")),
+        all(
+            feature = "key_value_pmem",
+            feature = "tiering_hashtable_pmem",
+            not(feature = "hashtable_tiering")
+        ),
         all(feature = "alloc_api_exp", not(feature = "hashtable_tiering"))
     ))]
     pub fn remove_object(&self, key: HashedKey) {
@@ -2390,7 +2564,7 @@ where
                 Tier::DramAndPmem => {
                     // Remove from DRAM cache
                     self.dram_cache.write().unwrap().remove(&key);
-                    
+
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
@@ -2413,7 +2587,11 @@ where
     }
 
     #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", feature = "hashtable_tiering"),
+        all(
+            feature = "key_value_pmem",
+            feature = "tiering_hashtable_pmem",
+            feature = "hashtable_tiering"
+        ),
         all(feature = "alloc_api_exp", feature = "hashtable_tiering")
     ))]
     pub fn remove_object(&self, key: HashedKey) {
@@ -2426,7 +2604,7 @@ where
                 Tier::DramAndPmem => {
                     // Remove from DRAM cache
                     self.dram_cache.write().unwrap().remove(&key);
-                    
+
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
@@ -2436,7 +2614,7 @@ where
                 Tier::DramPtrToPmem => {
                     // Remove from DRAM cache (pointer-only)
                     self.dram_cache.write().unwrap().remove(&key);
-                    
+
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
@@ -2483,14 +2661,18 @@ where
 
     /// Clears all tiering metadata and the DRAM cache.
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
-    #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem")))]
+    #[cfg(all(
+        feature = "key_value_pmem",
+        not(feature = "key_pmem_value_pmem"),
+        not(feature = "tiering_hashtable_pmem")
+    ))]
     pub fn clear(&self) {
         let mut info_map = self.object_info.write().unwrap();
         info_map.clear();
 
         let mut dram_objects = self.dram_objects.write().unwrap();
         dram_objects.clear();
-        
+
         // Clear the DRAM cache
         self.dram_cache.clear();
 
@@ -2502,14 +2684,17 @@ where
     /// (`key_pmem_value_pmem` + `enable_tiering_manager`).
     /// Removes all DRAM copies; the PMEM copies (both key and value in PMEM)
     /// are cleared separately by the main cache wipe path.
-    #[cfg(all(feature = "key_pmem_value_pmem", not(feature = "tiering_hashtable_pmem")))]
+    #[cfg(all(
+        feature = "key_pmem_value_pmem",
+        not(feature = "tiering_hashtable_pmem")
+    ))]
     pub fn clear(&self) {
         let mut info_map = self.object_info.write().unwrap();
         info_map.clear();
 
         let mut dram_objects = self.dram_objects.write().unwrap();
         dram_objects.clear();
-        
+
         // Remove all DRAM copies; PMEM copies are cleared by the main cache wipe
         self.dram_cache.clear();
 
@@ -2527,7 +2712,7 @@ where
 
         let mut dram_objects = self.dram_objects.write().unwrap();
         dram_objects.clear();
-        
+
         // Clear the DRAM cache
         self.dram_cache.write().unwrap().clear();
 
@@ -2559,7 +2744,8 @@ impl<K, V> TieringManager<K, V> {
     /// This is used by the `PolicyWorker` to ensure data safety before evicting
     /// an object that hasn't yet been flushed to PMEM.
     pub fn force_sync_persist(&self, key: HashedKey) -> bool {
-        if let Some(job) = self.pending_jobs
+        if let Some(job) = self
+            .pending_jobs
             .lock()
             .expect("pending_jobs mutex should not be poisoned")
             .remove(&key)
@@ -2715,7 +2901,7 @@ mod tests {
         // High water mark: 270, Low water mark: 180
         // Should demote to bring below 180
         let keys_to_demote = manager.get_keys_to_demote();
-        
+
         // Should demote at least 2 objects (200 bytes)
         assert!(keys_to_demote.len() >= 2);
     }
@@ -2723,9 +2909,9 @@ mod tests {
     #[test]
     fn test_set_and_get_hotness_threshold() {
         let manager = TieringManager::with_defaults();
-        
+
         assert_eq!(manager.hotness_threshold(), 2);
-        
+
         manager.set_hotness_threshold(5);
         assert_eq!(manager.hotness_threshold(), 5);
     }

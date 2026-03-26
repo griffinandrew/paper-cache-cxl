@@ -21,7 +21,6 @@ fn main() {
             .include("umf_allocator")
             .include(umf_include_dir)
             .compile("umf_allocator_wrapper");
-
     } else {
         // UMF hardware / headers not available (CI, developer machines).
         // Compile the stub implementation so that the UMF C symbols are

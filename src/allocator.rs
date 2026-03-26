@@ -20,11 +20,14 @@
 // allocations are never accidentally routed to UMF.
 
 use core::alloc::{GlobalAlloc, Layout};
-use std::sync::{Once, atomic::{AtomicUsize, Ordering}};
+use std::alloc::{AllocError, Allocator};
 use std::ptr;
-use tikv_jemallocator::Jemalloc;
-use std::alloc::{Allocator, AllocError};
 use std::ptr::NonNull;
+use std::sync::{
+    Once,
+    atomic::{AtomicUsize, Ordering},
+};
+use tikv_jemallocator::Jemalloc;
 
 mod allocator_bindings {
     include!("umf_allocator_bindings.rs"); // UMF extern "C" declarations
@@ -53,12 +56,18 @@ unsafe impl GlobalAlloc for HybridObjects {
             let numa_node = 1; // PMEM NUMA node (ignored by stub)
             allocator_bindings::umf_allocator_init(numa_node);
             #[cfg(debug_assertions)]
-            println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
+            println!(
+                "HybridObjects: UMF pool initialised on NUMA node {}",
+                numa_node
+            );
         });
 
         let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
-            println!("HybridObjects: UMF alloc failed for {} bytes", layout.size());
+            println!(
+                "HybridObjects: UMF alloc failed for {} bytes",
+                layout.size()
+            );
             return ptr::null_mut();
         }
 
@@ -67,8 +76,11 @@ unsafe impl GlobalAlloc for HybridObjects {
             ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
             unsafe {
                 if PRINT_THRESHOLD < NUM_ALLOCS {
-                    println!("HybridObjects alloc: {} bytes (total {} bytes)",
-                        layout.size(), ALL_MEM_ALLOCATED.load(Ordering::SeqCst));
+                    println!(
+                        "HybridObjects alloc: {} bytes (total {} bytes)",
+                        layout.size(),
+                        ALL_MEM_ALLOCATED.load(Ordering::SeqCst)
+                    );
                     NUM_ALLOCS = 0;
                 }
                 NUM_ALLOCS += 1;
@@ -86,8 +98,11 @@ unsafe impl GlobalAlloc for HybridObjects {
             ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
             unsafe {
                 if PRINT_THRESHOLD < NUM_DEALLOCS {
-                    println!("HybridObjects dealloc: {} bytes (total {} bytes)",
-                        layout.size(), ALL_MEM_ALLOCATED.load(Ordering::SeqCst));
+                    println!(
+                        "HybridObjects dealloc: {} bytes (total {} bytes)",
+                        layout.size(),
+                        ALL_MEM_ALLOCATED.load(Ordering::SeqCst)
+                    );
                     NUM_DEALLOCS = 0;
                 }
                 NUM_DEALLOCS += 1;
@@ -103,10 +118,9 @@ unsafe impl Allocator for HybridObjects {
         unsafe {
             HybridObjects::alloc(self, layout)
                 .as_mut()
-                .map(|ptr| NonNull::slice_from_raw_parts(
-                    NonNull::new_unchecked(ptr),
-                    layout.size(),
-                ))
+                .map(|ptr| {
+                    NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size())
+                })
                 .ok_or(AllocError)
         }
     }
@@ -117,7 +131,11 @@ unsafe impl Allocator for HybridObjects {
 }
 
 // allocator_api2 support (for hashbrown and dlv-list under eviction_stacks_pmem)
-#[cfg(any(feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem"))]
+#[cfg(any(
+    feature = "global_hashtable_pmem",
+    feature = "tiering_hashtable_pmem",
+    feature = "eviction_stacks_pmem"
+))]
 unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
         let ptr = unsafe { self.alloc(layout) };

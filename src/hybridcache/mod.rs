@@ -102,21 +102,21 @@
 //! ```
 
 use std::{
-hash::Hash,
-time::Duration,
-sync::{
-    Arc, Barrier,
-    atomic::{AtomicU64, Ordering},
-},
-thread,
+    hash::Hash,
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+    time::Duration,
 };
 
 use crossbeam_channel::bounded;
-use dashmap::DashSet;
 use dashmap::DashMap;
+use dashmap::DashSet;
 use typesize::TypeSize;
 
-use crate::{PaperCache, PaperPolicy, CacheError, BufferDRAM, BufferPMEM, HashedKey};
+use crate::{BufferDRAM, BufferPMEM, CacheError, HashedKey, PaperCache, PaperPolicy};
 
 // Limit how long `get` waits for an in-flight demotion before surfacing a miss.
 const IN_FLIGHT_RETRIES: usize = 3;
@@ -319,7 +319,7 @@ impl AtomicHybridStats {
 /// `String` on read).
 pub struct S3FifoHybridCache<K>
 where
-K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
 {
     /// Small DRAM tier (S3-FIFO, `BufferDRAM`) – all new insertions land here.
     small: Arc<PaperCache<K, BufferDRAM>>,
@@ -340,347 +340,370 @@ K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
 
 impl<K> S3FifoHybridCache<K>
 where
-K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
 {
-/// Creates a new [`S3FifoHybridCache`] from the provided `config`.
-///
-/// Spawns a background worker thread that re-inserts far-tier hits back
-/// into the small DRAM tier.
-///
-/// # Errors
-///
-/// Returns [`CacheError::ZeroCacheSize`] if both `small_size` and
-/// `main_size` resolve to zero bytes.
-pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
-    let small_bytes = config.small_size.to_bytes();
-    let main_bytes = config.main_size.to_bytes();
+    /// Creates a new [`S3FifoHybridCache`] from the provided `config`.
+    ///
+    /// Spawns a background worker thread that re-inserts far-tier hits back
+    /// into the small DRAM tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::ZeroCacheSize`] if both `small_size` and
+    /// `main_size` resolve to zero bytes.
+    pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
+        let small_bytes = config.small_size.to_bytes();
+        let main_bytes = config.main_size.to_bytes();
 
-    if small_bytes == 0 && main_bytes == 0 {
-        return Err(CacheError::ZeroCacheSize);
-    }
-
-    let small_size = small_bytes.max(1);
-    let main_size = main_bytes.max(1);
-
-    // ── Far PMEM tier – LRU, BufferPMEM ──────────────────────────────────
-    // Receives items evicted from the small DRAM tier via the eviction
-    // callback.  Values are allocated via the Hybrid (UMF) allocator into
-    // persistent / CXL memory.
-    let main = Arc::new(PaperCache::<K, BufferPMEM>::new(
-        main_size,
-        &[config.main_policy],
-        config.main_policy,
-    )?);
-
-    let stats = Arc::new(AtomicHybridStats::new());
-    let in_flight_demotions = Arc::new(DashSet::<K>::new());
-    let demoted_lookup = Arc::new(DashMap::<HashedKey, Arc<K>>::new());
-
-    // ── Demotion channel + dedicated worker ──────────────────────────────────
-    // The eviction callback (fired on the PolicyWorker thread) enqueues
-    // (key, value_bytes) onto this bounded channel without blocking.  A
-    // dedicated demotion worker thread drains the channel and performs the
-    // actual PMEM write, keeping the PolicyWorker eviction loop non-blocking.
-    //
-    // Capacity is configurable; if the channel is full the demotion is dropped
-    // (the item becomes a miss on next access — acceptable).
-    let (demotion_tx, demotion_rx) = bounded::<(HashedKey, Arc<K>, Arc<BufferDRAM>)>(config.demotion_channel_capacity);
-
-    // ── Demotion worker: drains channel → writes to far PMEM tier ─────────
-    // The worker thread is started and confirmed running (via a Barrier)
-    // BEFORE `small` is created, so it is already blocking on `recv` when
-    // the PolicyWorker fires its first eviction.  This eliminates the
-    // "thread not yet scheduled" race that can cause PMEM writes to be
-    // delayed beyond the eviction window.
-    let startup_barrier = Arc::new(Barrier::new(2));
-    let startup_barrier_clone = Arc::clone(&startup_barrier);
-    let main_worker = Arc::clone(&main);
-    let stats_worker = Arc::clone(&stats);
-    let in_flight_worker = Arc::clone(&in_flight_demotions);
-    let demoted_lookup_worker = Arc::clone(&demoted_lookup);
-    thread::Builder::new()
-        .name("hybridcache-demotion".to_string())
-        .spawn(move || {
-            // Signal the parent thread that this worker is running.
-            startup_barrier_clone.wait();
-            while let Ok((hashed_key, key, val)) = demotion_rx.recv() {
-                if main_worker.set((*key).clone(), val.as_ref(), None).is_ok() {
-                    demoted_lookup_worker
-                        .entry(hashed_key)
-                        .or_insert_with(|| Arc::clone(&key));
-                    in_flight_worker.remove(&*key);
-                    stats_worker.demotions.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    // PMEM write failed: remove the in-flight marker so `get`
-                    // does not spin forever, and count it as a dropped demotion.
-                    in_flight_worker.remove(&*key);
-                    demoted_lookup_worker.remove(&hashed_key);
-                    stats_worker.dropped_demotions.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        })
-        .unwrap_or_else(|e| panic!("failed to spawn demotion worker thread: {e}"));
-    // Block until the demotion worker is confirmed running and in recv().
-    startup_barrier.wait();
-
-    // ── Eviction callback: non-blocking enqueue onto demotion channel ─────
-    // Fired by PolicyWorker when the small tier evicts an item.  Only
-    // enqueues; no synchronous PMEM I/O on the PolicyWorker thread.
-    //
-    // If the key is already in the far tier (copy-on-read: the item was
-    // promoted and re-evicted), skip entirely — the PMEM copy is still valid.
-    //
-    // The key is added to `in_flight_demotions` before the enqueue and
-    // removed by the demotion worker after the PMEM write completes, so that
-    // concurrent `get` calls can detect the migration window.
-    let main_check = Arc::clone(&main);
-    let stats_evict = Arc::clone(&stats);
-    let in_flight_evict = Arc::clone(&in_flight_demotions);
-    let demoted_lookup_cb = Arc::clone(&demoted_lookup);
-    let eviction_callback: Box<dyn for<'a> Fn(crate::HashedKey, Arc<BufferDRAM>, &'a K) + Send + Sync> =
-    Box::new(move |hashed_key, val, k| {
-        // Skip if this key already has a live entry in the far PMEM tier.
-        if main_check.has(k) {
-            return;
+        if small_bytes == 0 && main_bytes == 0 {
+            return Err(CacheError::ZeroCacheSize);
         }
-        // Mark the key as in-flight before enqueuing so `get` detects the
-        // migration window.
-        in_flight_evict.insert(k.clone());
-        let key_arc = Arc::new(k.clone());
-        demoted_lookup_cb.insert(hashed_key, Arc::clone(&key_arc));
-        // Non-blocking send.  If the channel is full, drop the demotion,
-        // remove the in-flight marker, and count the drop.
-        if demotion_tx.try_send((hashed_key, key_arc, Arc::clone(&val))).is_err() {
-            in_flight_evict.remove(k);
-            demoted_lookup_cb.remove(&hashed_key);
-            stats_evict.dropped_demotions.fetch_add(1, Ordering::Relaxed);
-        }
-    });
 
-    let (promotion_tx, promotion_rx) = bounded::<crate::worker::WorkerEvent>(config.reinsertion_channel_capacity);
+        let small_size = small_bytes.max(1);
+        let main_size = main_bytes.max(1);
 
-    // ── Small DRAM tier – S3-FIFO, BufferDRAM, with eviction callback ─────
-    let small = Arc::new(PaperCache::<K, BufferDRAM>::new_with_eviction_callback(
-        small_size,
-        &[config.small_policy],
-        config.small_policy,
-        eviction_callback,
-        Some(promotion_tx.clone()),
-    )?);
+        // ── Far PMEM tier – LRU, BufferPMEM ──────────────────────────────────
+        // Receives items evicted from the small DRAM tier via the eviction
+        // callback.  Values are allocated via the Hybrid (UMF) allocator into
+        // persistent / CXL memory.
+        let main = Arc::new(PaperCache::<K, BufferPMEM>::new(
+            main_size,
+            &[config.main_policy],
+            config.main_policy,
+        )?);
 
-    // ── Promotion worker: ghost-hit signal → re-insert into small DRAM ─────
-    // PolicyWorker detects ghost-queue hits and sends a `Promote` event with
-    // the hashed key.  This worker resolves the PMEM copy and re-inserts the
-    // bytes into the DRAM tier without blocking the request path.
-    let small_reinsert = Arc::clone(&small);
-    let main_promote = Arc::clone(&main);
-    let demoted_lookup_promote = Arc::clone(&demoted_lookup);
-    let stats_reinsert = Arc::clone(&stats);
-    thread::Builder::new()
-        .name("hybridcache-promotion".to_string())
-        .spawn(move || {
-            while let Ok(event) = promotion_rx.recv() {
-                if let crate::worker::WorkerEvent::Promote(hashed_key) = event {
-                    if let Some(entry) = demoted_lookup_promote.get(&hashed_key) {
-                        let key_arc = Arc::clone(entry.value());
-                        match main_promote.peek(&key_arc) {
-                            Ok(bytes) => {
-                                match small_reinsert.set((*key_arc).clone(), bytes.as_ref(), None) {
-                                    Ok(_) => {
-                                        stats_reinsert.promotions.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    Err(_) => {
-                                        stats_reinsert.dropped_promotions.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                };
-                            }
-                            Err(_) => {
-                                demoted_lookup_promote.remove(&hashed_key);
-                                stats_reinsert.dropped_promotions.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
+        let stats = Arc::new(AtomicHybridStats::new());
+        let in_flight_demotions = Arc::new(DashSet::<K>::new());
+        let demoted_lookup = Arc::new(DashMap::<HashedKey, Arc<K>>::new());
+
+        // ── Demotion channel + dedicated worker ──────────────────────────────────
+        // The eviction callback (fired on the PolicyWorker thread) enqueues
+        // (key, value_bytes) onto this bounded channel without blocking.  A
+        // dedicated demotion worker thread drains the channel and performs the
+        // actual PMEM write, keeping the PolicyWorker eviction loop non-blocking.
+        //
+        // Capacity is configurable; if the channel is full the demotion is dropped
+        // (the item becomes a miss on next access — acceptable).
+        let (demotion_tx, demotion_rx) =
+            bounded::<(HashedKey, Arc<K>, Arc<BufferDRAM>)>(config.demotion_channel_capacity);
+
+        // ── Demotion worker: drains channel → writes to far PMEM tier ─────────
+        // The worker thread is started and confirmed running (via a Barrier)
+        // BEFORE `small` is created, so it is already blocking on `recv` when
+        // the PolicyWorker fires its first eviction.  This eliminates the
+        // "thread not yet scheduled" race that can cause PMEM writes to be
+        // delayed beyond the eviction window.
+        let startup_barrier = Arc::new(Barrier::new(2));
+        let startup_barrier_clone = Arc::clone(&startup_barrier);
+        let main_worker = Arc::clone(&main);
+        let stats_worker = Arc::clone(&stats);
+        let in_flight_worker = Arc::clone(&in_flight_demotions);
+        let demoted_lookup_worker = Arc::clone(&demoted_lookup);
+        thread::Builder::new()
+            .name("hybridcache-demotion".to_string())
+            .spawn(move || {
+                // Signal the parent thread that this worker is running.
+                startup_barrier_clone.wait();
+                while let Ok((hashed_key, key, val)) = demotion_rx.recv() {
+                    if main_worker.set((*key).clone(), val.as_ref(), None).is_ok() {
+                        demoted_lookup_worker
+                            .entry(hashed_key)
+                            .or_insert_with(|| Arc::clone(&key));
+                        in_flight_worker.remove(&*key);
+                        stats_worker.demotions.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        stats_reinsert.dropped_promotions.fetch_add(1, Ordering::Relaxed);
+                        // PMEM write failed: remove the in-flight marker so `get`
+                        // does not spin forever, and count it as a dropped demotion.
+                        in_flight_worker.remove(&*key);
+                        demoted_lookup_worker.remove(&hashed_key);
+                        stats_worker
+                            .dropped_demotions
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
+            })
+            .unwrap_or_else(|e| panic!("failed to spawn demotion worker thread: {e}"));
+        // Block until the demotion worker is confirmed running and in recv().
+        startup_barrier.wait();
+
+        // ── Eviction callback: non-blocking enqueue onto demotion channel ─────
+        // Fired by PolicyWorker when the small tier evicts an item.  Only
+        // enqueues; no synchronous PMEM I/O on the PolicyWorker thread.
+        //
+        // If the key is already in the far tier (copy-on-read: the item was
+        // promoted and re-evicted), skip entirely — the PMEM copy is still valid.
+        //
+        // The key is added to `in_flight_demotions` before the enqueue and
+        // removed by the demotion worker after the PMEM write completes, so that
+        // concurrent `get` calls can detect the migration window.
+        let main_check = Arc::clone(&main);
+        let stats_evict = Arc::clone(&stats);
+        let in_flight_evict = Arc::clone(&in_flight_demotions);
+        let demoted_lookup_cb = Arc::clone(&demoted_lookup);
+        let eviction_callback: Box<
+            dyn for<'a> Fn(crate::HashedKey, Arc<BufferDRAM>, &'a K) + Send + Sync,
+        > = Box::new(move |hashed_key, val, k| {
+            // Skip if this key already has a live entry in the far PMEM tier.
+            if main_check.has(k) {
+                return;
             }
+            // Mark the key as in-flight before enqueuing so `get` detects the
+            // migration window.
+            in_flight_evict.insert(k.clone());
+            let key_arc = Arc::new(k.clone());
+            demoted_lookup_cb.insert(hashed_key, Arc::clone(&key_arc));
+            // Non-blocking send.  If the channel is full, drop the demotion,
+            // remove the in-flight marker, and count the drop.
+            if demotion_tx
+                .try_send((hashed_key, key_arc, Arc::clone(&val)))
+                .is_err()
+            {
+                in_flight_evict.remove(k);
+                demoted_lookup_cb.remove(&hashed_key);
+                stats_evict
+                    .dropped_demotions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let (promotion_tx, promotion_rx) =
+            bounded::<crate::worker::WorkerEvent>(config.reinsertion_channel_capacity);
+
+        // ── Small DRAM tier – S3-FIFO, BufferDRAM, with eviction callback ─────
+        let small = Arc::new(PaperCache::<K, BufferDRAM>::new_with_eviction_callback(
+            small_size,
+            &[config.small_policy],
+            config.small_policy,
+            eviction_callback,
+            Some(promotion_tx.clone()),
+        )?);
+
+        // ── Promotion worker: ghost-hit signal → re-insert into small DRAM ─────
+        // PolicyWorker detects ghost-queue hits and sends a `Promote` event with
+        // the hashed key.  This worker resolves the PMEM copy and re-inserts the
+        // bytes into the DRAM tier without blocking the request path.
+        let small_reinsert = Arc::clone(&small);
+        let main_promote = Arc::clone(&main);
+        let demoted_lookup_promote = Arc::clone(&demoted_lookup);
+        let stats_reinsert = Arc::clone(&stats);
+        thread::Builder::new()
+            .name("hybridcache-promotion".to_string())
+            .spawn(move || {
+                while let Ok(event) = promotion_rx.recv() {
+                    if let crate::worker::WorkerEvent::Promote(hashed_key) = event {
+                        if let Some(entry) = demoted_lookup_promote.get(&hashed_key) {
+                            let key_arc = Arc::clone(entry.value());
+                            match main_promote.peek(&key_arc) {
+                                Ok(bytes) => {
+                                    match small_reinsert.set(
+                                        (*key_arc).clone(),
+                                        bytes.as_ref(),
+                                        None,
+                                    ) {
+                                        Ok(_) => {
+                                            stats_reinsert
+                                                .promotions
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Err(_) => {
+                                            stats_reinsert
+                                                .dropped_promotions
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    };
+                                }
+                                Err(_) => {
+                                    demoted_lookup_promote.remove(&hashed_key);
+                                    stats_reinsert
+                                        .dropped_promotions
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        } else {
+                            stats_reinsert
+                                .dropped_promotions
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+            .unwrap_or_else(|e| panic!("failed to spawn promotion worker thread: {e}"));
+
+        Ok(S3FifoHybridCache {
+            small,
+            main,
+            in_flight_demotions,
+            demoted_lookup,
+            stats,
         })
-        .unwrap_or_else(|e| panic!("failed to spawn promotion worker thread: {e}"));
-
-    Ok(S3FifoHybridCache {
-        small,
-        main,
-        in_flight_demotions,
-        demoted_lookup,
-        stats,
-    })
-}
-
-/// Inserts or updates a key-value pair in the **small DRAM tier** only.
-///
-/// All writes land in the small S3-FIFO DRAM tier.  When the small tier
-/// fills up and evicts an item, the PolicyWorker eviction callback
-/// automatically writes it to the far PMEM tier via
-/// `PaperCache<K, BufferPMEM>::set()`.
-///
-/// No TTL is applied.  Use [`set_with_ttl`](Self::set_with_ttl) when an
-/// expiry time is required.
-///
-/// # Errors
-///
-/// Propagates any [`CacheError`] returned by the underlying
-/// [`PaperCache::set`] call.
-pub fn set(&self, key: K, value: &str) -> Result<(), CacheError> {
-    self.small.set(key, value.as_bytes(), None)
-}
-
-/// Inserts or updates a key-value pair in the **small DRAM tier** with an
-/// explicit TTL.
-///
-/// Behaves identically to [`set`](Self::set) except that the entry expires
-/// after `ttl` seconds.
-///
-/// # Errors
-///
-/// Propagates any [`CacheError`] returned by the underlying
-/// [`PaperCache::set`] call.
-pub fn set_with_ttl(&self, key: K, value: &str, ttl: u32) -> Result<(), CacheError> {
-    self.small.set(key, value.as_bytes(), Some(ttl))
-}
-
-/// Retrieves the value associated with `key`.
-///
-/// Lookup order: **small DRAM tier** (fast path) → **far PMEM tier**
-/// (slow path).
-///
-/// Promotions are **ghost-hit** driven: the PolicyWorker detects when a
-/// lookup maps to S3-FIFO's ghost queue and signals a background promotion
-/// worker.  The `get` path itself is read-only; it does not enqueue
-/// promotions directly.
-///
-/// If the key is absent from both tiers but is currently being migrated from
-/// DRAM to PMEM, this method briefly yields and retries before returning
-/// [`CacheError::KeyNotFound`].  The window is normally short; callers can
-/// retry without busy-spinning.
-///
-/// # UTF-8 encoding
-///
-/// Since [`set`](Self::set) and [`set_with_ttl`](Self::set_with_ttl) accept
-/// only `&str`, stored bytes are always valid UTF-8.  Any invalid byte
-/// sequences encountered during retrieval are replaced with the Unicode
-/// replacement character (`\u{FFFD}`).
-///
-/// # Errors
-///
-/// Returns [`CacheError::KeyNotFound`] when the key is absent from both
-/// tiers (or is in-flight).
-pub fn get(&self, key: &K) -> Result<String, CacheError> {
-    // Fast path: small DRAM tier.
-    if let Ok(val) = self.small.get(key) {
-        #[cfg(debug_assertions)]println!("Small tier hit for key {:?}", key);
-        self.stats.small_hits.fetch_add(1, Ordering::Relaxed);
-        return Ok(String::from_utf8_lossy(&val).into_owned());
     }
 
-    // Slow path: far PMEM tier with brief yield-and-retry if a demotion is
-    // currently in flight.
-    for attempt in 0..=IN_FLIGHT_RETRIES {
-        match self.main.get(key) {
-            Ok(val) => {
-                self.stats.main_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(String::from_utf8_lossy(&val).into_owned());
-            }
-            Err(_) => {
-                if self.in_flight_demotions.contains(key) && attempt < IN_FLIGHT_RETRIES {
-                    thread::yield_now();
-                    thread::sleep(IN_FLIGHT_BACKOFF);
-                    continue;
+    /// Inserts or updates a key-value pair in the **small DRAM tier** only.
+    ///
+    /// All writes land in the small S3-FIFO DRAM tier.  When the small tier
+    /// fills up and evicts an item, the PolicyWorker eviction callback
+    /// automatically writes it to the far PMEM tier via
+    /// `PaperCache<K, BufferPMEM>::set()`.
+    ///
+    /// No TTL is applied.  Use [`set_with_ttl`](Self::set_with_ttl) when an
+    /// expiry time is required.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`CacheError`] returned by the underlying
+    /// [`PaperCache::set`] call.
+    pub fn set(&self, key: K, value: &str) -> Result<(), CacheError> {
+        self.small.set(key, value.as_bytes(), None)
+    }
+
+    /// Inserts or updates a key-value pair in the **small DRAM tier** with an
+    /// explicit TTL.
+    ///
+    /// Behaves identically to [`set`](Self::set) except that the entry expires
+    /// after `ttl` seconds.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`CacheError`] returned by the underlying
+    /// [`PaperCache::set`] call.
+    pub fn set_with_ttl(&self, key: K, value: &str, ttl: u32) -> Result<(), CacheError> {
+        self.small.set(key, value.as_bytes(), Some(ttl))
+    }
+
+    /// Retrieves the value associated with `key`.
+    ///
+    /// Lookup order: **small DRAM tier** (fast path) → **far PMEM tier**
+    /// (slow path).
+    ///
+    /// Promotions are **ghost-hit** driven: the PolicyWorker detects when a
+    /// lookup maps to S3-FIFO's ghost queue and signals a background promotion
+    /// worker.  The `get` path itself is read-only; it does not enqueue
+    /// promotions directly.
+    ///
+    /// If the key is absent from both tiers but is currently being migrated from
+    /// DRAM to PMEM, this method briefly yields and retries before returning
+    /// [`CacheError::KeyNotFound`].  The window is normally short; callers can
+    /// retry without busy-spinning.
+    ///
+    /// # UTF-8 encoding
+    ///
+    /// Since [`set`](Self::set) and [`set_with_ttl`](Self::set_with_ttl) accept
+    /// only `&str`, stored bytes are always valid UTF-8.  Any invalid byte
+    /// sequences encountered during retrieval are replaced with the Unicode
+    /// replacement character (`\u{FFFD}`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::KeyNotFound`] when the key is absent from both
+    /// tiers (or is in-flight).
+    pub fn get(&self, key: &K) -> Result<String, CacheError> {
+        // Fast path: small DRAM tier.
+        if let Ok(val) = self.small.get(key) {
+            #[cfg(debug_assertions)]
+            println!("Small tier hit for key {:?}", key);
+            self.stats.small_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(String::from_utf8_lossy(&val).into_owned());
+        }
+
+        // Slow path: far PMEM tier with brief yield-and-retry if a demotion is
+        // currently in flight.
+        for attempt in 0..=IN_FLIGHT_RETRIES {
+            match self.main.get(key) {
+                Ok(val) => {
+                    self.stats.main_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(String::from_utf8_lossy(&val).into_owned());
                 }
-                self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                return Err(CacheError::KeyNotFound);
+                Err(_) => {
+                    if self.in_flight_demotions.contains(key) && attempt < IN_FLIGHT_RETRIES {
+                        thread::yield_now();
+                        thread::sleep(IN_FLIGHT_BACKOFF);
+                        continue;
+                    }
+                    self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                    return Err(CacheError::KeyNotFound);
+                }
             }
         }
+        unreachable!()
     }
-    unreachable!()
-}
 
-/// Removes the key from whichever tier(s) contain it.
-///
-/// # Errors
-///
-/// Returns [`CacheError::KeyNotFound`] if the key is absent from both tiers.
-pub fn del(&self, key: &K) -> Result<(), CacheError> {
-    let in_small = self.small.del(key).is_ok();
-    let in_main = self.main.del(key).is_ok();
+    /// Removes the key from whichever tier(s) contain it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::KeyNotFound`] if the key is absent from both tiers.
+    pub fn del(&self, key: &K) -> Result<(), CacheError> {
+        let in_small = self.small.del(key).is_ok();
+        let in_main = self.main.del(key).is_ok();
 
-    if in_small || in_main {
+        if in_small || in_main {
+            Ok(())
+        } else {
+            Err(CacheError::KeyNotFound)
+        }
+    }
+
+    /// Returns `true` if the key exists (and has not expired) in either tier,
+    /// or is currently being migrated from the DRAM tier to the PMEM tier.
+    pub fn has(&self, key: &K) -> bool {
+        self.small.has(key) || self.main.has(key) || self.in_flight_demotions.contains(key)
+    }
+
+    /// Returns `true` if `key` is currently in the **small DRAM tier**.
+    ///
+    /// Useful for testing and diagnostics to confirm that a key has been
+    /// admitted (or re-admitted) to the DRAM tier.
+    pub fn has_in_dram(&self, key: &K) -> bool {
+        self.small.has(key)
+    }
+
+    /// Returns `true` if `key` is currently in the **far PMEM tier**.
+    ///
+    /// Because the hybrid cache uses copy-on-read semantics — a far-tier hit
+    /// schedules an asynchronous re-insertion into the DRAM tier without
+    /// removing the PMEM copy — a key can be present in both tiers
+    /// simultaneously.
+    pub fn has_in_pmem(&self, key: &K) -> bool {
+        self.main.has(key)
+    }
+
+    /// Returns `true` if `key` is currently being migrated from the small DRAM
+    /// tier to the far PMEM tier (i.e. the demotion worker has not yet written
+    /// it to PMEM).
+    ///
+    /// Under normal conditions this window is very short.  This method is
+    /// primarily useful for diagnostics and tests.
+    pub fn has_in_flight_demotion(&self, key: &K) -> bool {
+        self.in_flight_demotions.contains(key)
+    }
+
+    /// Clears **both** tiers and the internal ghost-tracking set.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`CacheError`] returned by the underlying wipe calls.
+    pub fn wipe(&self) -> Result<(), CacheError> {
+        self.small.wipe()?;
+        self.main.wipe()?;
+        self.demoted_lookup.clear();
         Ok(())
-    } else {
-        Err(CacheError::KeyNotFound)
     }
-}
 
-/// Returns `true` if the key exists (and has not expired) in either tier,
-/// or is currently being migrated from the DRAM tier to the PMEM tier.
-pub fn has(&self, key: &K) -> bool {
-    self.small.has(key) || self.main.has(key) || self.in_flight_demotions.contains(key)
-}
-
-/// Returns `true` if `key` is currently in the **small DRAM tier**.
-///
-/// Useful for testing and diagnostics to confirm that a key has been
-/// admitted (or re-admitted) to the DRAM tier.
-pub fn has_in_dram(&self, key: &K) -> bool {
-    self.small.has(key)
-}
-
-/// Returns `true` if `key` is currently in the **far PMEM tier**.
-///
-/// Because the hybrid cache uses copy-on-read semantics — a far-tier hit
-/// schedules an asynchronous re-insertion into the DRAM tier without
-/// removing the PMEM copy — a key can be present in both tiers
-/// simultaneously.
-pub fn has_in_pmem(&self, key: &K) -> bool {
-    self.main.has(key)
-}
-
-/// Returns `true` if `key` is currently being migrated from the small DRAM
-/// tier to the far PMEM tier (i.e. the demotion worker has not yet written
-/// it to PMEM).
-///
-/// Under normal conditions this window is very short.  This method is
-/// primarily useful for diagnostics and tests.
-pub fn has_in_flight_demotion(&self, key: &K) -> bool {
-    self.in_flight_demotions.contains(key)
-}
-
-/// Clears **both** tiers and the internal ghost-tracking set.
-///
-/// # Errors
-///
-/// Propagates any [`CacheError`] returned by the underlying wipe calls.
-pub fn wipe(&self) -> Result<(), CacheError> {
-    self.small.wipe()?;
-    self.main.wipe()?;
-    self.demoted_lookup.clear();
-    Ok(())
-}
-
-/// Returns a point-in-time snapshot of the cache statistics.
-///
-/// `dram_items` and `pmem_items` are queried live from each tier's internal
-/// status counter.  All other fields are cumulative atomics.
-pub fn stats(&self) -> HybridCacheStats {
-    HybridCacheStats {
-        small_hits:        self.stats.small_hits.load(Ordering::Relaxed),
-        main_hits:         self.stats.main_hits.load(Ordering::Relaxed),
-        misses:            self.stats.misses.load(Ordering::Relaxed),
-        promotions:        self.stats.promotions.load(Ordering::Relaxed),
-        demotions:         self.stats.demotions.load(Ordering::Relaxed),
-        dram_items:        self.small.status().map(|s| s.num_objects()).unwrap_or(0),
-        pmem_items:        self.main.status().map(|s| s.num_objects()).unwrap_or(0),
-        dropped_demotions: self.stats.dropped_demotions.load(Ordering::Relaxed),
-        dropped_promotions: self.stats.dropped_promotions.load(Ordering::Relaxed),
+    /// Returns a point-in-time snapshot of the cache statistics.
+    ///
+    /// `dram_items` and `pmem_items` are queried live from each tier's internal
+    /// status counter.  All other fields are cumulative atomics.
+    pub fn stats(&self) -> HybridCacheStats {
+        HybridCacheStats {
+            small_hits: self.stats.small_hits.load(Ordering::Relaxed),
+            main_hits: self.stats.main_hits.load(Ordering::Relaxed),
+            misses: self.stats.misses.load(Ordering::Relaxed),
+            promotions: self.stats.promotions.load(Ordering::Relaxed),
+            demotions: self.stats.demotions.load(Ordering::Relaxed),
+            dram_items: self.small.status().map(|s| s.num_objects()).unwrap_or(0),
+            pmem_items: self.main.status().map(|s| s.num_objects()).unwrap_or(0),
+            dropped_demotions: self.stats.dropped_demotions.load(Ordering::Relaxed),
+            dropped_promotions: self.stats.dropped_promotions.load(Ordering::Relaxed),
+        }
     }
-}
 }

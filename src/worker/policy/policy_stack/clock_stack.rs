@@ -6,133 +6,130 @@
  */
 
 use std::{
-	borrow::Borrow,
-	hash::{Hash, Hasher},
+    borrow::Borrow,
+    hash::{Hash, Hasher},
 };
 
 use kwik::collections::HashList;
 
 use crate::{
-	HashedKey,
-	NoHasher,
-	policy::PaperPolicy,
-	object::ObjectSize,
-	worker::policy::policy_stack::PolicyStack,
+    HashedKey, NoHasher, object::ObjectSize, policy::PaperPolicy,
+    worker::policy::policy_stack::PolicyStack,
 };
 
 #[derive(Default)]
 pub struct ClockStack {
-	stack: HashList<Object, NoHasher>,
+    stack: HashList<Object, NoHasher>,
 }
 
 struct Object {
-	key: HashedKey,
-	visited: bool,
+    key: HashedKey,
+    visited: bool,
 }
 
 impl PolicyStack for ClockStack {
-	fn is_policy(&self, policy: &PaperPolicy) -> bool {
-		matches!(policy, PaperPolicy::Clock)
-	}
+    fn is_policy(&self, policy: &PaperPolicy) -> bool {
+        matches!(policy, PaperPolicy::Clock)
+    }
 
-	fn len(&self) -> usize {
-		self.stack.len()
-	}
+    fn len(&self) -> usize {
+        self.stack.len()
+    }
 
-	fn contains(&self, key: HashedKey) -> bool {
-		self.stack.contains(&key)
-	}
+    fn contains(&self, key: HashedKey) -> bool {
+        self.stack.contains(&key)
+    }
 
-	fn insert(&mut self, key: HashedKey, _: ObjectSize) {
-		if self.stack.contains(&key) {
-			return self.update(key);
-		}
+    fn insert(&mut self, key: HashedKey, _: ObjectSize) {
+        if self.stack.contains(&key) {
+            return self.update(key);
+        }
 
-		self.stack.push_front(Object::new(key));
-	}
+        self.stack.push_front(Object::new(key));
+    }
 
-	fn update(&mut self, key: HashedKey) {
-		self.stack.update(&key, |object| {
-			object.visited = true;
-		});
-	}
+    fn update(&mut self, key: HashedKey) {
+        self.stack.update(&key, |object| {
+            object.visited = true;
+        });
+    }
 
-	fn remove(&mut self, key: HashedKey) {
-		self.stack.remove(&key);
-	}
+    fn remove(&mut self, key: HashedKey) {
+        self.stack.remove(&key);
+    }
 
-	fn clear(&mut self) {
-		self.stack.clear();
-	}
+    fn clear(&mut self) {
+        self.stack.clear();
+    }
 
-	fn evict_one(&mut self) -> Option<HashedKey> {
-		loop {
-			let mut object = self.stack.pop_back()?;
+    fn evict_one(&mut self) -> Option<HashedKey> {
+        loop {
+            let mut object = self.stack.pop_back()?;
 
-			if !object.visited {
-				return Some(object.key);
-			}
+            if !object.visited {
+                return Some(object.key);
+            }
 
-			object.visited = false;
-			self.stack.push_front(object);
-		}
-	}
+            object.visited = false;
+            self.stack.push_front(object);
+        }
+    }
 }
 
 impl Object {
-	fn new(key: HashedKey) -> Self {
-		Object {
-			key,
-			visited: false,
-		}
-	}
+    fn new(key: HashedKey) -> Self {
+        Object {
+            key,
+            visited: false,
+        }
+    }
 }
 
 impl Borrow<HashedKey> for Object {
-	fn borrow(&self) -> &HashedKey {
-		&self.key
-	}
+    fn borrow(&self) -> &HashedKey {
+        &self.key
+    }
 }
 
 impl Hash for Object {
-	fn hash<H>(&self, state: &mut H)
-	where
-		H: Hasher,
-	{
-		self.key.hash(state)
-	}
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        self.key.hash(state)
+    }
 }
 
 impl PartialEq for Object {
-	fn eq(&self, other: &Self) -> bool {
-		self.key == other.key
-	}
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
 }
 
 impl Eq for Object {}
 
 #[cfg(test)]
 mod tests {
-	#[test]
-	fn eviction_order_is_correct() {
-		use crate::worker::policy::policy_stack::{PolicyStack, ClockStack};
+    #[test]
+    fn eviction_order_is_correct() {
+        use crate::worker::policy::policy_stack::{ClockStack, PolicyStack};
 
-		let mut stack = ClockStack::default();
+        let mut stack = ClockStack::default();
 
-		for access in [0, 1, 0, 2] {
-			stack.insert(access, 1);
-		}
+        for access in [0, 1, 0, 2] {
+            stack.insert(access, 1);
+        }
 
-		assert_eq!(stack.evict_one(), Some(1));
+        assert_eq!(stack.evict_one(), Some(1));
 
-		for access in [3, 0, 1, 3] {
-			stack.insert(access, 1);
-		}
+        for access in [3, 0, 1, 3] {
+            stack.insert(access, 1);
+        }
 
-		for eviction in [2, 1, 0, 3] {
-			assert_eq!(stack.evict_one(), Some(eviction));
-		}
+        for eviction in [2, 1, 0, 3] {
+            assert_eq!(stack.evict_one(), Some(eviction));
+        }
 
-		assert_eq!(stack.evict_one(), None);
-	}
+        assert_eq!(stack.evict_one(), None);
+    }
 }

@@ -12,15 +12,14 @@ mod ttl;
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 mod tiering;
 
+use crossbeam_channel::{Receiver, Sender};
 use std::thread;
-use crossbeam_channel::{Sender, Receiver};
 
 use crate::{
-	CacheSize,
-	HashedKey,
-	error::CacheError,
-	object::{ObjectSize, ExpireTime},
-	policy::PaperPolicy,
+    CacheSize, HashedKey,
+    error::CacheError,
+    object::{ExpireTime, ObjectSize},
+    policy::PaperPolicy,
 };
 
 pub type WorkerSender = Sender<WorkerEvent>;
@@ -28,35 +27,36 @@ pub type WorkerReceiver = Receiver<WorkerEvent>;
 
 #[derive(Clone)]
 pub enum WorkerEvent {
-	Get(HashedKey, bool),
-	Promote(HashedKey),
-	Set(HashedKey, ObjectSize, ExpireTime, Option<(ObjectSize, ExpireTime)>),
-	Del(HashedKey, ExpireTime),
+    Get(HashedKey, bool),
+    Promote(HashedKey),
+    Set(
+        HashedKey,
+        ObjectSize,
+        ExpireTime,
+        Option<(ObjectSize, ExpireTime)>,
+    ),
+    Del(HashedKey, ExpireTime),
 
-	Ttl(HashedKey, ExpireTime, ExpireTime),
+    Ttl(HashedKey, ExpireTime, ExpireTime),
 
-	Wipe,
+    Wipe,
 
-	Resize(CacheSize),
-	Policy(PaperPolicy),
+    Resize(CacheSize),
+    Policy(PaperPolicy),
 }
 
 pub trait Worker
 where
-	Self: 'static + Send,
+    Self: 'static + Send,
 {
-	fn run(&mut self) -> Result<(), CacheError>;
+    fn run(&mut self) -> Result<(), CacheError>;
 }
 
 pub fn register_worker(mut worker: impl Worker) {
-	thread::spawn(move || worker.run());
+    thread::spawn(move || worker.run());
 }
 
-pub use crate::worker::{
-	manager::WorkerManager,
-	policy::PolicyWorker,
-	ttl::TtlWorker,
-};
+pub use crate::worker::{manager::WorkerManager, policy::PolicyWorker, ttl::TtlWorker};
 
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 pub use crate::worker::tiering::TieringWorker;

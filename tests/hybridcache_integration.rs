@@ -29,7 +29,9 @@
 
 #[cfg(feature = "hybridcache")]
 mod hybridcache_tests {
-    use paper_cache::hybridcache::{CacheTierSize, HybridCacheConfig, HybridCacheStats, S3FifoHybridCache};
+    use paper_cache::hybridcache::{
+        CacheTierSize, HybridCacheConfig, HybridCacheStats, S3FifoHybridCache,
+    };
 
     // ── helpers ───────────────────────────────────────────────────────────
 
@@ -141,7 +143,10 @@ mod hybridcache_tests {
             cache.get(&i).expect("get failed");
         }
         let stats = cache.stats();
-        assert_eq!(stats.main_hits, 0, "no item should have come from the far tier");
+        assert_eq!(
+            stats.main_hits, 0,
+            "no item should have come from the far tier"
+        );
         assert_eq!(stats.small_hits, 10);
     }
 
@@ -208,7 +213,11 @@ mod hybridcache_tests {
         let cache = make_tiny_cache();
         overfill(&cache, 60, 100);
         let stats = cache.stats();
-        assert!(stats.demotions > 0, "expected demotions after overfill, got {}", stats.demotions);
+        assert!(
+            stats.demotions > 0,
+            "expected demotions after overfill, got {}",
+            stats.demotions
+        );
     }
 
     /// dram_items and pmem_items reflect the live tier population.
@@ -220,7 +229,10 @@ mod hybridcache_tests {
         }
         let stats = cache.stats();
         assert_eq!(stats.dram_items, 5, "expected 5 items in DRAM tier");
-        assert_eq!(stats.pmem_items, 0, "expected 0 items in far tier before eviction");
+        assert_eq!(
+            stats.pmem_items, 0,
+            "expected 0 items in far tier before eviction"
+        );
     }
 
     /// After overfill, the far PMEM tier is populated and pmem_items > 0.
@@ -229,7 +241,11 @@ mod hybridcache_tests {
         let cache = make_tiny_cache();
         overfill(&cache, 60, 100);
         let stats = cache.stats();
-        assert!(stats.pmem_items > 0, "expected pmem_items > 0 after eviction, got {}", stats.pmem_items);
+        assert!(
+            stats.pmem_items > 0,
+            "expected pmem_items > 0 after eviction, got {}",
+            stats.pmem_items
+        );
     }
 
     /// has_in_flight_demotion returns false for keys not being migrated.
@@ -237,10 +253,15 @@ mod hybridcache_tests {
     fn test_has_in_flight_demotion_idle() {
         let cache = make_cache();
         cache.set(42u32, "hello").expect("set failed");
-        assert!(!cache.has_in_flight_demotion(&42u32), "no demotion in flight for a freshly inserted key");
-        assert!(!cache.has_in_flight_demotion(&999u32), "no demotion in flight for absent key");
+        assert!(
+            !cache.has_in_flight_demotion(&42u32),
+            "no demotion in flight for a freshly inserted key"
+        );
+        assert!(
+            !cache.has_in_flight_demotion(&999u32),
+            "no demotion in flight for absent key"
+        );
     }
-
 
     // ── configuration ─────────────────────────────────────────────────────
 
@@ -328,9 +349,7 @@ mod hybridcache_tests {
         let cache = make_tiny_cache();
         // Write distinctive payloads and wait for evictions to settle.
         // We use separate set + overfill calls so each key has a known payload.
-        let payloads: Vec<String> = (0u32..50)
-            .map(|i| format!("{i:0>128}"))
-            .collect();
+        let payloads: Vec<String> = (0u32..50).map(|i| format!("{i:0>128}")).collect();
         for (i, payload) in payloads.iter().enumerate() {
             cache.set(i as u32, payload).expect("set failed");
         }
@@ -362,7 +381,6 @@ mod hybridcache_tests {
             checked_far > 0 || cache.stats().main_hits > 0,
             "no values were verified in the far tier; eviction may not have fired"
         );
-
     }
 
     // ── DRAM tier isolation ───────────────────────────────────────────────
@@ -405,7 +423,11 @@ mod hybridcache_tests {
             cache.set(77u32, &payload).expect("set failed");
         }
         let final_val = cache.get(&77u32).expect("get failed");
-        assert_eq!(final_val, format!("{:0>64}", 9u8), "last overwrite must win");
+        assert_eq!(
+            final_val,
+            format!("{:0>64}", 9u8),
+            "last overwrite must win"
+        );
         assert_eq!(cache.stats().small_hits, 1);
         assert_eq!(cache.stats().main_hits, 0);
     }
@@ -511,8 +533,14 @@ mod hybridcache_tests {
 
         let key = far_key.expect("no far-tier key found; eviction did not fire");
         cache.del(&key).expect("del from far tier failed");
-        assert!(!cache.has(&key), "deleted far-tier key must not be has()-able");
-        assert!(cache.get(&key).is_err(), "deleted far-tier key must return KeyNotFound");
+        assert!(
+            !cache.has(&key),
+            "deleted far-tier key must not be has()-able"
+        );
+        assert!(
+            cache.get(&key).is_err(),
+            "deleted far-tier key must return KeyNotFound"
+        );
     }
 
     // ── promotion ─────────────────────────────────────────────────────────
@@ -545,10 +573,9 @@ mod hybridcache_tests {
         let key = far_key.expect("no far-tier key found");
 
         // Allow the background reinsertion worker to process the promotion.
-        wait_until(
-            std::time::Duration::from_secs(3),
-            || cache.stats().promotions > 0,
-        );
+        wait_until(std::time::Duration::from_secs(3), || {
+            cache.stats().promotions > 0
+        });
 
         assert!(
             cache.stats().promotions > 0,
@@ -630,7 +657,9 @@ mod hybridcache_tests {
         );
 
         // Wait for the background reinsertion worker to promote the item to DRAM.
-        wait_until(std::time::Duration::from_secs(3), || cache.stats().promotions > 0);
+        wait_until(std::time::Duration::from_secs(3), || {
+            cache.stats().promotions > 0
+        });
 
         // After promotion the PMEM copy must STILL be present.
         // The hybrid cache never actively removes from PMEM on promotion; only
@@ -699,10 +728,7 @@ mod hybridcache_tests {
         );
 
         // Step 5: the item must be reachable (from DRAM or PMEM).
-        assert!(
-            cache.has(&key),
-            "promoted key {key} must remain accessible",
-        );
+        assert!(cache.has(&key), "promoted key {key} must remain accessible",);
 
         // Step 6: promotions counter must have increased.
         assert!(
@@ -918,7 +944,9 @@ mod hybridcache_tests {
             stats.small_hits + stats.main_hits + stats.misses > 0,
             "no cache operations recorded after stress; something is very wrong \
              (small_hits={}, main_hits={}, misses={})",
-            stats.small_hits, stats.main_hits, stats.misses,
+            stats.small_hits,
+            stats.main_hits,
+            stats.misses,
         );
     }
 
@@ -947,10 +975,15 @@ mod hybridcache_tests {
         // Now insert a fresh DRAM item and verify it is completely unaffected
         // by the PMEM allocator activity.
         let dram_payload = "x".repeat(64);
-        cache.set(9999u32, &dram_payload).expect("set DRAM item failed");
+        cache
+            .set(9999u32, &dram_payload)
+            .expect("set DRAM item failed");
 
         let got = cache.get(&9999u32).expect("get DRAM item failed");
-        assert_eq!(got, dram_payload, "DRAM item corrupted after PMEM allocator activity");
+        assert_eq!(
+            got, dram_payload,
+            "DRAM item corrupted after PMEM allocator activity"
+        );
 
         // The DRAM item must have been served by the small tier (jemalloc path,
         // not HybridObjects/UMF path).
@@ -1087,7 +1120,9 @@ mod hybridcache_tests {
             .collect();
 
         for i in 0..total {
-            cache.set(i, &payloads[i as usize]).expect("set failed under large load");
+            cache
+                .set(i, &payloads[i as usize])
+                .expect("set failed under large load");
         }
 
         // Wait for the background PolicyWorker to flush eviction callbacks to
@@ -1113,8 +1148,7 @@ mod hybridcache_tests {
                         // Value must be byte-for-byte identical after going
                         // through the HybridObjects / UMF allocator.
                         assert_eq!(
-                            got,
-                            payloads[i as usize],
+                            got, payloads[i as usize],
                             "value for key {i} corrupted after HybridObjects alloc (UMF path)",
                         );
                         far_hits_found += 1;
@@ -1159,4 +1193,3 @@ mod hybridcache_tests {
         );
     }
 }
-
