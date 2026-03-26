@@ -102,7 +102,7 @@ where
             
             WorkerEvent::Promote(hashed_key) => {
                 if let Some(object_ref) = self.objects.get(&hashed_key) {
-                    if self.tiering_manager.promote_object(hashed_key, &*object_ref) {
+                    if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
                         debug!("Promoted object {} to DRAM (ghost hit)", hashed_key);
                     }
                 }
@@ -203,7 +203,7 @@ where
             
             WorkerEvent::Promote(hashed_key) => {
                 if let Some(object_ref) = self.objects.read().unwrap().get(&hashed_key) {
-                    if self.tiering_manager.promote_object(hashed_key, &*object_ref) {
+                    if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
                         debug!("Promoted object {} to DRAM (ghost hit)", hashed_key);
                     }
                 }
@@ -308,7 +308,7 @@ where
             
             WorkerEvent::Promote(hashed_key) => {
                 if let Some(object_ref) = self.objects.get(&hashed_key) {
-                    if self.tiering_manager.promote_object(hashed_key, &*object_ref) {
+                    if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
                         debug!("Promoted object {} to DRAM (ghost hit)", hashed_key);
                     }
                 }
