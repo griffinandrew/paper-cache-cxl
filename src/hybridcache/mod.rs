@@ -103,6 +103,7 @@
 
 use std::{
 hash::Hash,
+time::Duration,
 sync::{
     Arc, Barrier,
     atomic::{AtomicU64, Ordering},
@@ -116,6 +117,10 @@ use dashmap::DashMap;
 use typesize::TypeSize;
 
 use crate::{PaperCache, PaperPolicy, CacheError, BufferDRAM, BufferPMEM, HashedKey};
+
+// Limit how long `get` waits for an in-flight demotion before surfacing a miss.
+const IN_FLIGHT_RETRIES: usize = 3;
+const IN_FLIGHT_BACKOFF: Duration = Duration::from_micros(50);
 
 // ── Tier Size ─────────────────────────────────────────────────────────────────
 
@@ -328,7 +333,7 @@ K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
     /// cache miss rather than spinning, keeping latency predictable.
     in_flight_demotions: Arc<DashSet<K>>,
     /// Maps hashed keys to their original keys for PMEM→DRAM promotion.
-    demoted_lookup: Arc<DashMap<HashedKey, K>>,
+    demoted_lookup: Arc<DashMap<HashedKey, Arc<K>>>,
     /// Shared atomic counters for [`HybridCacheStats`].
     stats: Arc<AtomicHybridStats>,
 }
@@ -369,7 +374,7 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
 
     let stats = Arc::new(AtomicHybridStats::new());
     let in_flight_demotions = Arc::new(DashSet::<K>::new());
-    let demoted_lookup = Arc::new(DashMap::<HashedKey, K>::new());
+    let demoted_lookup = Arc::new(DashMap::<HashedKey, Arc<K>>::new());
 
     // ── Demotion channel + dedicated worker ──────────────────────────────────
     // The eviction callback (fired on the PolicyWorker thread) enqueues
@@ -379,7 +384,7 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
     //
     // Capacity is configurable; if the channel is full the demotion is dropped
     // (the item becomes a miss on next access — acceptable).
-    let (demotion_tx, demotion_rx) = bounded::<(HashedKey, K, Vec<u8>)>(config.demotion_channel_capacity);
+    let (demotion_tx, demotion_rx) = bounded::<(HashedKey, Arc<K>, Arc<BufferDRAM>)>(config.demotion_channel_capacity);
 
     // ── Demotion worker: drains channel → writes to far PMEM tier ─────────
     // The worker thread is started and confirmed running (via a Barrier)
@@ -399,14 +404,17 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
             // Signal the parent thread that this worker is running.
             startup_barrier_clone.wait();
             while let Ok((hashed_key, key, val)) = demotion_rx.recv() {
-                if main_worker.set(key.clone(), &val, None).is_ok() {
-                    demoted_lookup_worker.insert(hashed_key, key.clone());
-                    in_flight_worker.remove(&key);
+                if main_worker.set((*key).clone(), val.as_ref(), None).is_ok() {
+                    demoted_lookup_worker
+                        .entry(hashed_key)
+                        .or_insert_with(|| Arc::clone(&key));
+                    in_flight_worker.remove(&*key);
                     stats_worker.demotions.fetch_add(1, Ordering::Relaxed);
                 } else {
                     // PMEM write failed: remove the in-flight marker so `get`
                     // does not spin forever, and count it as a dropped demotion.
-                    in_flight_worker.remove(&key);
+                    in_flight_worker.remove(&*key);
+                    demoted_lookup_worker.remove(&hashed_key);
                     stats_worker.dropped_demotions.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -438,11 +446,13 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
         // Mark the key as in-flight before enqueuing so `get` detects the
         // migration window.
         in_flight_evict.insert(k.clone());
-        demoted_lookup_cb.insert(hashed_key, k.clone());
+        let key_arc = Arc::new(k.clone());
+        demoted_lookup_cb.insert(hashed_key, Arc::clone(&key_arc));
         // Non-blocking send.  If the channel is full, drop the demotion,
         // remove the in-flight marker, and count the drop.
-        if demotion_tx.try_send((hashed_key, k.clone(), (**val).to_vec())).is_err() {
+        if demotion_tx.try_send((hashed_key, key_arc, Arc::clone(&val))).is_err() {
             in_flight_evict.remove(k);
+            demoted_lookup_cb.remove(&hashed_key);
             stats_evict.dropped_demotions.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -472,11 +482,10 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
             while let Ok(event) = promotion_rx.recv() {
                 if let crate::worker::WorkerEvent::Promote(hashed_key) = event {
                     if let Some(entry) = demoted_lookup_promote.get(&hashed_key) {
-                        let key = entry.value().clone();
-                        match main_promote.peek(&key) {
+                        let key_arc = Arc::clone(entry.value());
+                        match main_promote.peek(&key_arc) {
                             Ok(bytes) => {
-                                let val_bytes: Vec<u8> = bytes.as_ref().to_vec();
-                                match small_reinsert.set(key, &val_bytes, None) {
+                                match small_reinsert.set((*key_arc).clone(), bytes.as_ref(), None) {
                                     Ok(_) => {
                                         stats_reinsert.promotions.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -486,6 +495,7 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
                                 };
                             }
                             Err(_) => {
+                                demoted_lookup_promote.remove(&hashed_key);
                                 stats_reinsert.dropped_promotions.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -549,8 +559,9 @@ pub fn set_with_ttl(&self, key: K, value: &str, ttl: u32) -> Result<(), CacheErr
 /// promotions directly.
 ///
 /// If the key is absent from both tiers but is currently being migrated from
-/// DRAM to PMEM, this method returns [`CacheError::KeyNotFound`] rather than
-/// spinning.  The caller can retry; with async demotion the window is brief.
+/// DRAM to PMEM, this method briefly yields and retries before returning
+/// [`CacheError::KeyNotFound`].  The window is normally short; callers can
+/// retry without busy-spinning.
 ///
 /// # UTF-8 encoding
 ///
@@ -571,24 +582,26 @@ pub fn get(&self, key: &K) -> Result<String, CacheError> {
         return Ok(String::from_utf8_lossy(&val).into_owned());
     }
 
-    // Slow path: far PMEM tier.
-    match self.main.get(key) {
-        Ok(val) => {
-            self.stats.main_hits.fetch_add(1, Ordering::Relaxed);
-            Ok(String::from_utf8_lossy(&val).into_owned())
-        }
-        Err(_) => {
-            // If the key is currently being migrated to PMEM, treat it as a
-            // miss rather than spinning.  With async demotion the in-flight
-            // window is very short; the caller can retry.
-            if self.in_flight_demotions.contains(key) {
+    // Slow path: far PMEM tier with brief yield-and-retry if a demotion is
+    // currently in flight.
+    for attempt in 0..=IN_FLIGHT_RETRIES {
+        match self.main.get(key) {
+            Ok(val) => {
+                self.stats.main_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(String::from_utf8_lossy(&val).into_owned());
+            }
+            Err(_) => {
+                if self.in_flight_demotions.contains(key) && attempt < IN_FLIGHT_RETRIES {
+                    thread::yield_now();
+                    thread::sleep(IN_FLIGHT_BACKOFF);
+                    continue;
+                }
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
                 return Err(CacheError::KeyNotFound);
             }
-            self.stats.misses.fetch_add(1, Ordering::Relaxed);
-            Err(CacheError::KeyNotFound)
         }
     }
+    unreachable!()
 }
 
 /// Removes the key from whichever tier(s) contain it.
