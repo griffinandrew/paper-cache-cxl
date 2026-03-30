@@ -1876,7 +1876,51 @@ where
 
         if let Some(info) = info_map.get_mut(&key) {
             info.access_count += 1;
+            let prev_access = info.last_access;
             info.last_access = std::time::Instant::now();
+
+            #[cfg(feature = "adaptive_tiering")]
+            let (warm_threshold, hot_threshold) = {
+                let config = self.config.read().unwrap();
+                let stats = self.stats.read().unwrap();
+                let pressure = if config.dram_threshold == 0 {
+                    1.0
+                } else {
+                    stats.dram_size as f64 / config.dram_threshold as f64
+                };
+                drop(stats);
+
+                let small_cutoff = self.adaptive_small_cutoff(&config);
+                let mut warm = self.adaptive_hotness_base(info.access_count as f64, &config);
+                let mut hot_gap = config.hot_threshold.saturating_sub(config.warm_threshold);
+                if hot_gap == 0 {
+                    hot_gap = 1;
+                }
+                let mut hot = warm.saturating_add(hot_gap);
+
+                if pressure > config.high_water_mark {
+                    warm = warm.saturating_add(config.pressure_penalty);
+                    hot = hot.saturating_add(config.pressure_penalty);
+                } else if pressure < config.low_water_mark {
+                    warm = warm.saturating_sub(config.headroom_bonus);
+                    hot = hot.saturating_sub(config.headroom_bonus);
+                }
+
+                if info.size as u64 <= small_cutoff {
+                    warm = warm.saturating_sub(1);
+                }
+
+                let age_ms = info.last_access.duration_since(prev_access).as_millis() as u64;
+                if age_ms <= config.recency_boost_ms {
+                    warm = warm.saturating_sub(1);
+                }
+
+                warm = warm.clamp(config.hotness_floor, config.hotness_ceiling);
+                hot = hot.max(warm.saturating_add(1));
+                hot = hot.clamp(config.hotness_floor.max(warm + 1), config.hotness_ceiling);
+
+                (warm, hot)
+            };
 
             // Decide if promotion is needed
             match info.tier {
