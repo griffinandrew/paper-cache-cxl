@@ -47,6 +47,11 @@ all_dram = []
 # Enable the tiering manager functionality
 enable_tiering_manager = []
 
+# Adaptive, pressure-aware tiering strategy.
+# Builds on the tiering manager and dynamically adjusts promotion/demotion
+# decisions based on DRAM pressure, object size density, and recent access.
+adaptive_tiering = ["enable_tiering_manager", "key_value_pmem"]
+
 # Place tiering manager's hashtable in PMEM (requires enable_tiering_manager + key_value_pmem)
 tiering_hashtable_pmem = []
 
@@ -132,5 +137,4 @@ original = []
 [build-dependencies]
 cc = "1.2.39"
 bindgen = "0.72.1"
-
 
