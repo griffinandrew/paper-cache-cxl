@@ -243,6 +243,13 @@ impl WorkerManager {
 
 		Ok(manager)
 	}
+
+	/// Returns the manager's channel listener and registered worker list without
+	/// starting the forwarding loop. Useful when the caller wants to multiplex
+	/// events across multiple caches from a single coordinator thread.
+	pub(crate) fn into_parts(self) -> (WorkerReceiver, Arc<Box<[WorkerSender]>>) {
+		(self.listener, self.workers)
+	}
 }
 
 unsafe impl Send for WorkerManager {}

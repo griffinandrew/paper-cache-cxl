@@ -111,7 +111,7 @@ sync::{
 thread,
 };
 
-use crossbeam_channel::bounded;
+use crossbeam_channel::{bounded, select};
 use dashmap::DashSet;
 use dashmap::DashMap;
 use typesize::TypeSize;
@@ -366,11 +366,14 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
     // Receives items evicted from the small DRAM tier via the eviction
     // callback.  Values are allocated via the Hybrid (UMF) allocator into
     // persistent / CXL memory.
-    let main = Arc::new(PaperCache::<K, BufferPMEM>::new(
+    let (main_cache, main_worker_manager) = PaperCache::<K, BufferPMEM>::with_hasher_unstarted(
         main_size,
         &[config.main_policy],
         config.main_policy,
-    )?);
+        Default::default(),
+    )?;
+    let (main_listener, main_workers) = main_worker_manager.into_parts();
+    let main = Arc::new(main_cache);
 
     let stats = Arc::new(AtomicHybridStats::new());
     let in_flight_demotions = Arc::new(DashSet::<K>::new());
@@ -460,13 +463,51 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
     let (promotion_tx, promotion_rx) = bounded::<crate::worker::WorkerEvent>(config.reinsertion_channel_capacity);
 
     // ── Small DRAM tier – S3-FIFO, BufferDRAM, with eviction callback ─────
-    let small = Arc::new(PaperCache::<K, BufferDRAM>::new_with_eviction_callback(
+    let (small_cache, small_worker_manager) = PaperCache::<K, BufferDRAM>::new_with_eviction_callback_unstarted(
         small_size,
         &[config.small_policy],
         config.small_policy,
         eviction_callback,
         Some(promotion_tx.clone()),
-    )?);
+    )?;
+    let (small_listener, small_workers) = small_worker_manager.into_parts();
+    let small = Arc::new(small_cache);
+
+    // ── Shared worker coordinator: multiplex events for both tiers ────────
+    let worker_dispatch = |evt: Result<crate::worker::WorkerEvent, crossbeam_channel::RecvError>, targets: &Arc<Box<[crate::worker::WorkerSender]>>| -> bool {
+        match evt {
+            Ok(event) => {
+                for worker in targets.iter() {
+                    if let Err(err) = worker.try_send(event.clone()) {
+                        log::error!("Could not send event to worker: {err:?}");
+                        return false;
+                    }
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    };
+
+    let main_workers_run = Arc::clone(&main_workers);
+    let small_workers_run = Arc::clone(&small_workers);
+    thread::Builder::new()
+        .name("hybridcache-workers".to_string())
+        .spawn(move || {
+            let mut main_open = true;
+            let mut small_open = true;
+            while main_open || small_open {
+                select! {
+                    recv(main_listener) -> evt if main_open => {
+                        main_open = worker_dispatch(evt, &main_workers_run);
+                    }
+                    recv(small_listener) -> evt if small_open => {
+                        small_open = worker_dispatch(evt, &small_workers_run);
+                    }
+                }
+            }
+        })
+        .unwrap_or_else(|e| panic!("failed to spawn hybridcache worker coordinator: {e}"));
 
     // ── Promotion worker: ghost-hit signal → re-insert into small DRAM ─────
     // PolicyWorker detects ghost-queue hits and sends a `Promote` event with

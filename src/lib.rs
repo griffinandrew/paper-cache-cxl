@@ -24,6 +24,9 @@ compile_error!("Cannot enable both 'hashbrown_dram' and 'global_flatmap_dram' fe
 #[cfg(all(feature = "hashbrown_dram", feature = "global_flatmap_pmem"))]
 compile_error!("Cannot enable both 'hashbrown_dram' and 'global_flatmap_pmem' features simultaneously. Please choose only one global hashtable mode.");
 
+#[cfg(all(feature = "hybridcache", feature = "enable_tiering_manager"))]
+compile_error!("'hybridcache' cannot be combined with 'enable_tiering_manager'; hybridcache manages promotion/demotion internally without tiering workers.");
+
 // When all_dram is enabled, use jemalloc as the global allocator
 #[cfg(feature = "all_dram")]
 use tikv_jemallocator::Jemalloc;
@@ -131,8 +134,8 @@ use crate::{
 	worker::{
 		Worker,
 		WorkerSender,
-		WorkerEvent,
 		WorkerManager,
+		WorkerEvent,
 	},
 };
 
@@ -1466,6 +1469,31 @@ where
 		S: Default,
 		K: Clone,
 	{
+		let (cache, mut worker_manager) = Self::new_with_eviction_callback_unstarted(
+			max_size,
+			policies,
+			policy,
+			eviction_callback,
+			promotion_tx,
+		)?;
+
+		thread::spawn(move || worker_manager.run());
+
+		Ok(cache)
+	}
+
+	#[cfg(feature = "hybridcache")]
+	pub(crate) fn new_with_eviction_callback_unstarted(
+		max_size: CacheSize,
+		policies: &[PaperPolicy],
+		policy: PaperPolicy,
+		eviction_callback: Box<dyn for<'a> Fn(HashedKey, Arc<BufferDRAM>, &'a K) + Send + Sync>,
+		promotion_tx: Option<crate::worker::WorkerSender>,
+	) -> Result<(Self, WorkerManager), CacheError>
+	where
+		S: Default,
+		K: Clone,
+	{
 		if max_size == 0 {
 			return Err(CacheError::ZeroCacheSize);
 		}
@@ -1492,7 +1520,7 @@ where
 
 		let (worker_sender, worker_listener) = unbounded();
 
-		let mut worker_manager = WorkerManager::new_with_eviction_callback(
+		let worker_manager = WorkerManager::new_with_eviction_callback(
 			worker_listener,
 			&objects,
 			&status,
@@ -1500,8 +1528,6 @@ where
 			eviction_callback,
 			promotion_tx,
 		)?;
-
-		thread::spawn(move || worker_manager.run());
 
 		let cache = PaperCache {
 			objects,
@@ -1511,7 +1537,7 @@ where
 			hasher: Default::default(),
 		};
 
-		Ok(cache)
+		Ok((cache, worker_manager))
 	}
 }
 
@@ -1607,6 +1633,24 @@ where
 		policy: PaperPolicy,
 		hasher: S,
 	) -> Result<Self, CacheError> {
+		let (cache, mut worker_manager) = Self::with_hasher_unstarted(
+			max_size,
+			policies,
+			policy,
+			hasher,
+		)?;
+
+		thread::spawn(move || worker_manager.run());
+
+		Ok(cache)
+	}
+
+	pub(crate) fn with_hasher_unstarted(
+		max_size: CacheSize,
+		policies: &[PaperPolicy],
+		policy: PaperPolicy,
+		hasher: S,
+	) -> Result<(Self, WorkerManager), CacheError> {
 		if max_size == 0 {
 			return Err(CacheError::ZeroCacheSize);
 		}
@@ -1726,7 +1770,7 @@ where
 		let (worker_sender, worker_listener) = unbounded();
 
 		#[cfg(all(feature = "enable_tiering_manager", not(feature = "sets_dram")))]
-		let mut worker_manager = WorkerManager::new(
+		let worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
@@ -1735,7 +1779,7 @@ where
 		)?;
 
 		#[cfg(feature = "sets_dram")]
-		let mut worker_manager = WorkerManager::new(
+		let worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
@@ -1744,14 +1788,12 @@ where
 		)?;
 
 		#[cfg(all(not(feature = "enable_tiering_manager"), not(feature = "sets_dram")))]
-		let mut worker_manager = WorkerManager::new(
+		let worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
 			&overhead_manager,
 		)?;
-
-		thread::spawn(move || worker_manager.run());
 
 		let cache = PaperCache {
 			objects,
@@ -1766,7 +1808,7 @@ where
 			hasher,
 		};
 
-		Ok(cache)
+		Ok((cache, worker_manager))
 	}
 
 	/// Returns the current cache version.
