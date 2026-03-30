@@ -196,6 +196,13 @@ where
             last_access: std::time::Instant::now(),
         });
 
+        #[cfg(feature = "adaptive_tiering")]
+        {
+            let alpha = self.config.read().unwrap().adaptive_alpha;
+            let mut ewma = self.ewma_obj_size.write().unwrap();
+            *ewma = Self::ewma_update(*ewma, size as f64, alpha);
+        }
+
         let mut stats = self.stats.write().unwrap();
         stats.pmem_only_objects += 1;
     }
@@ -258,7 +265,8 @@ where
             };
             drop(stats);
 
-            let mut effective = config.hotness_threshold;
+            let small_cutoff = self.adaptive_small_cutoff(&config);
+            let mut effective = self.adaptive_hotness_base(info.access_count as f64, &config);
 
             // Raise threshold under pressure; lower it when DRAM has headroom.
             if pressure > config.high_water_mark {
@@ -268,7 +276,7 @@ where
             }
 
             // Prefer small, cheap objects.
-            if info.size as u64 <= config.small_object_cutoff {
+            if info.size as u64 <= small_cutoff {
                 effective = effective.saturating_sub(1);
             }
 
@@ -277,6 +285,8 @@ where
             if age_ms <= config.recency_boost_ms {
                 effective = effective.saturating_sub(1);
             }
+
+            effective = effective.clamp(config.hotness_floor, config.hotness_ceiling);
 
             // Avoid zero or negative thresholds.
             if effective == 0 {
@@ -893,6 +903,47 @@ mod tests {
         assert!(manager.record_access(1));
     }
 
+    #[cfg(feature = "adaptive_tiering")]
+    #[test]
+    fn test_adaptive_small_cutoff_tracks_average_size() {
+        let mut config = TieringConfig::default();
+        config.adaptive_alpha = 0.5;
+        config.small_cutoff_min = 512;
+        config.small_cutoff_max = 8192;
+        let manager = TieringManager::new(config);
+
+        manager.register_object(1, 512);
+        manager.register_object(2, 8192);
+
+        let (small_cutoff, _) = manager.debug_adaptive_cutoffs();
+        assert!(small_cutoff >= 512);
+        assert!(small_cutoff <= 8192);
+        assert!(small_cutoff >= 4000);
+    }
+
+    #[cfg(feature = "adaptive_tiering")]
+    #[test]
+    fn test_adaptive_hotness_tracks_access_distribution() {
+        let mut config = TieringConfig::default();
+        config.hotness_ceiling = 10;
+        config.hotness_floor = 1;
+        config.adaptive_alpha = 0.5;
+        let manager = TieringManager::new(config);
+
+        manager.register_object(99, 1024);
+
+        // First access should not cross adaptive threshold yet.
+        assert!(!manager.record_access_adaptive(99));
+
+        // Additional accesses should raise the adaptive baseline.
+        for _ in 0..4 {
+            let _ = manager.record_access_adaptive(99);
+        }
+
+        let (_, hot_base) = manager.debug_adaptive_cutoffs();
+        assert!(hot_base >= 2);
+    }
+
     #[test]
     fn test_get_keys_to_demote() {
         let config = TieringConfig {
@@ -1074,6 +1125,22 @@ pub struct TieringConfig {
     #[cfg(feature = "adaptive_tiering")]
     pub headroom_bonus: u64,
 
+    /// Adaptive tiering: EWMA smoothing factor (0,1]; higher reacts faster
+    #[cfg(feature = "adaptive_tiering")]
+    pub adaptive_alpha: f64,
+
+    /// Adaptive tiering: minimum/maximum clamp for dynamic small-object cutoff
+    #[cfg(feature = "adaptive_tiering")]
+    pub small_cutoff_min: u64,
+    #[cfg(feature = "adaptive_tiering")]
+    pub small_cutoff_max: u64,
+
+    /// Adaptive tiering: floor/ceiling for dynamic hotness threshold
+    #[cfg(feature = "adaptive_tiering")]
+    pub hotness_floor: u64,
+    #[cfg(feature = "adaptive_tiering")]
+    pub hotness_ceiling: u64,
+
     #[cfg(feature = "hashtable_tiering")]
     /// Warm threshold: minimum access count for pointer-only promotion (hashtable_tiering feature)
     /// Objects reaching this threshold get metadata in DRAM but data stays in CXL
@@ -1101,6 +1168,16 @@ impl Default for TieringConfig {
             pressure_penalty: 1, // raise threshold when DRAM is hot
             #[cfg(feature = "adaptive_tiering")]
             headroom_bonus: 1, // lower threshold when DRAM is cold
+            #[cfg(feature = "adaptive_tiering")]
+            adaptive_alpha: 0.2,
+            #[cfg(feature = "adaptive_tiering")]
+            small_cutoff_min: 1024,
+            #[cfg(feature = "adaptive_tiering")]
+            small_cutoff_max: 512 * 1024,
+            #[cfg(feature = "adaptive_tiering")]
+            hotness_floor: 1,
+            #[cfg(feature = "adaptive_tiering")]
+            hotness_ceiling: 8,
             #[cfg(feature = "hashtable_tiering")]
             warm_threshold: 2, // Pointer promotion after 2 accesses
             #[cfg(feature = "hashtable_tiering")]
@@ -1240,6 +1317,11 @@ pub struct TieringManager<K, V> {
     #[cfg(feature = "sets_dram")]
     sync_persist_fn: Arc<dyn Fn(Vec<PmemBackfillJob<K>>) + Send + Sync>,
 
+    #[cfg(feature = "adaptive_tiering")]
+    ewma_obj_size: Arc<RwLock<f64>>,
+    #[cfg(feature = "adaptive_tiering")]
+    ewma_hotness: Arc<RwLock<f64>>,
+
     _phantom: std::marker::PhantomData<(K, V)>,
 }
 
@@ -1248,10 +1330,52 @@ where
     K: TypeSize + Clone,
     V: TypeSize + Clone,
 {
+    #[cfg(feature = "adaptive_tiering")]
+    fn ewma_update(current: f64, sample: f64, alpha: f64) -> f64 {
+        if current == 0.0 {
+            sample
+        } else {
+            (1.0 - alpha) * current + alpha * sample
+        }
+    }
+
+    #[cfg(feature = "adaptive_tiering")]
+    fn adaptive_small_cutoff(&self, config: &TieringConfig) -> u64 {
+        let avg = *self.ewma_obj_size.read().unwrap();
+        let cutoff = avg.round() as u64;
+        cutoff.clamp(config.small_cutoff_min, config.small_cutoff_max)
+    }
+
+    #[cfg(feature = "adaptive_tiering")]
+    fn adaptive_hotness_base(&self, access_sample: f64, config: &TieringConfig) -> u64 {
+        let mut ewma = self.ewma_hotness.write().unwrap();
+        let updated = Self::ewma_update(*ewma, access_sample, config.adaptive_alpha);
+        *ewma = updated;
+        let base = updated.round() as u64;
+        base.clamp(config.hotness_floor, config.hotness_ceiling)
+    }
+
+    #[cfg(all(test, feature = "adaptive_tiering"))]
+    fn debug_adaptive_cutoffs(&self) -> (u64, u64) {
+        let config = self.config.read().unwrap();
+        let small = self.adaptive_small_cutoff(&config);
+        let hot = {
+            let ew = *self.ewma_hotness.read().unwrap();
+            let base = ew.round() as u64;
+            base.clamp(config.hotness_floor, config.hotness_ceiling)
+        };
+        (small, hot)
+    }
+
     /// Creates a new TieringManager with the given configuration.
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
     #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem")))]
     pub fn new(config: TieringConfig) -> Self {
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_obj_init = config.small_object_cutoff as f64;
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_hot_init = config.hotness_threshold as f64;
+
         #[cfg(feature = "sets_dram")]
         let (dummy_tx, dummy_rx) = mpsc::channel::<HashedKey>();
         #[cfg(feature = "sets_dram")]
@@ -1265,6 +1389,10 @@ where
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_obj_size: Arc::new(RwLock::new(ewma_obj_init)),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_hotness: Arc::new(RwLock::new(ewma_hot_init)),
             #[cfg(feature = "sets_dram")]
             pmem_tx: dummy_tx,
             #[cfg(feature = "sets_dram")]
@@ -1284,6 +1412,11 @@ where
     /// both key and value bytes into a DRAM-resident `TieringObject<K>`.
     #[cfg(all(feature = "key_pmem_value_pmem", not(feature = "tiering_hashtable_pmem")))]
     pub fn new(config: TieringConfig) -> Self {
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_obj_init = config.small_object_cutoff as f64;
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_hot_init = config.hotness_threshold as f64;
+
         #[cfg(feature = "sets_dram")]
         let (dummy_tx, dummy_rx) = mpsc::channel::<HashedKey>();
         #[cfg(feature = "sets_dram")]
@@ -1297,6 +1430,10 @@ where
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_obj_size: Arc::new(RwLock::new(ewma_obj_init)),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_hotness: Arc::new(RwLock::new(ewma_hot_init)),
             #[cfg(feature = "sets_dram")]
             pmem_tx: dummy_tx,
             #[cfg(feature = "sets_dram")]
@@ -1311,6 +1448,11 @@ where
 
     #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
     pub fn new(config: TieringConfig) -> Self {
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_obj_init = config.small_object_cutoff as f64;
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_hot_init = config.hotness_threshold as f64;
+
         #[cfg(feature = "sets_dram")]
         let (dummy_tx, dummy_rx) = mpsc::channel::<HashedKey>();
         #[cfg(feature = "sets_dram")]
@@ -1324,6 +1466,10 @@ where
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_obj_size: Arc::new(RwLock::new(ewma_obj_init)),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_hotness: Arc::new(RwLock::new(ewma_hot_init)),
             #[cfg(feature = "sets_dram")]
             pmem_tx: dummy_tx,
             #[cfg(feature = "sets_dram")]
@@ -1338,6 +1484,11 @@ where
 
     #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem")))]
     pub fn new(config: TieringConfig) -> Self {
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_obj_init = config.small_object_cutoff as f64;
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_hot_init = config.hotness_threshold as f64;
+
         #[cfg(feature = "sets_dram")]
         let (dummy_tx, dummy_rx) = mpsc::channel::<HashedKey>();
         #[cfg(feature = "sets_dram")]
@@ -1351,6 +1502,10 @@ where
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher(NoHasher::default()))),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_obj_size: Arc::new(RwLock::new(ewma_obj_init)),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_hotness: Arc::new(RwLock::new(ewma_hot_init)),
             #[cfg(feature = "sets_dram")]
             pmem_tx: dummy_tx,
             #[cfg(feature = "sets_dram")]
@@ -1365,6 +1520,11 @@ where
 
     #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem"))]
     pub fn new(config: TieringConfig) -> Self {
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_obj_init = config.small_object_cutoff as f64;
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_hot_init = config.hotness_threshold as f64;
+
         #[cfg(feature = "sets_dram")]
         let (dummy_tx, dummy_rx) = mpsc::channel::<HashedKey>();
         #[cfg(feature = "sets_dram")]
@@ -1378,6 +1538,10 @@ where
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_obj_size: Arc::new(RwLock::new(ewma_obj_init)),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_hotness: Arc::new(RwLock::new(ewma_hot_init)),
             #[cfg(feature = "sets_dram")]
             pmem_tx: dummy_tx,
             #[cfg(feature = "sets_dram")]
@@ -1421,6 +1585,13 @@ where
             access_count: 0,
             last_access: std::time::Instant::now(),
         });
+
+        #[cfg(feature = "adaptive_tiering")]
+        {
+            let alpha = self.config.read().unwrap().adaptive_alpha;
+            let mut ewma = self.ewma_obj_size.write().unwrap();
+            *ewma = Self::ewma_update(*ewma, size as f64, alpha);
+        }
 
         let mut stats = self.stats.write().unwrap();
         stats.dram_only_objects += 1;
@@ -1487,6 +1658,11 @@ where
         K: Send + 'static,
         F: Fn(Vec<PmemBackfillJob<K>>) + Send + Sync + 'static,
     {
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_obj_init = config.small_object_cutoff as f64;
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_hot_init = config.hotness_threshold as f64;
+
         let pending_jobs: Arc<Mutex<HashMap<HashedKey, PmemBackfillJob<K>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let sync_fn: Arc<dyn Fn(Vec<PmemBackfillJob<K>>) + Send + Sync> = Arc::new(persist_fn);
@@ -1503,6 +1679,10 @@ where
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_obj_size: Arc::new(RwLock::new(ewma_obj_init)),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_hotness: Arc::new(RwLock::new(ewma_hot_init)),
             pmem_tx: tx,
             _pmem_consumer: handle,
             pending_jobs,
@@ -1517,6 +1697,11 @@ where
         K: Send + 'static,
         F: Fn(Vec<PmemBackfillJob<K>>) + Send + Sync + 'static,
     {
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_obj_init = config.small_object_cutoff as f64;
+        #[cfg(feature = "adaptive_tiering")]
+        let ewma_hot_init = config.hotness_threshold as f64;
+
         let pending_jobs: Arc<Mutex<HashMap<HashedKey, PmemBackfillJob<K>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let sync_fn: Arc<dyn Fn(Vec<PmemBackfillJob<K>>) + Send + Sync> = Arc::new(persist_fn);
@@ -1533,6 +1718,10 @@ where
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_obj_size: Arc::new(RwLock::new(ewma_obj_init)),
+            #[cfg(feature = "adaptive_tiering")]
+            ewma_hotness: Arc::new(RwLock::new(ewma_hot_init)),
             pmem_tx: tx,
             _pmem_consumer: handle,
             pending_jobs,

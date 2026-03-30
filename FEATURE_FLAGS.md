@@ -34,6 +34,7 @@ The implementation provides explicit feature flags to control:
 ### `adaptive_tiering`
 - **Purpose**: Enable an adaptive, pressure-aware tiering strategy on top of the tiering manager
 - **When enabled**: Promotion thresholds are lowered for tiny or bursty-hot objects when DRAM has headroom, and raised when DRAM is near capacity to avoid thrashing
+- **Auto-tuning**: Hotness and small-object cutoffs track EWMAs of live access counts and object sizes (clamped by configurable floors/ceilings) so they follow the current workload distribution
 - **When disabled**: Tiering uses the static hotness threshold
 - **Requirements**: `enable_tiering_manager` + `key_value_pmem`
 
