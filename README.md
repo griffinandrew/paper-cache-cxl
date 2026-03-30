@@ -29,6 +29,20 @@ The tiering manager provides a two-tier caching architecture with **actual data 
 - **Far Tier (PMEM)**: All objects are stored in persistent memory by default (source of truth)
 - **Near Tier (DRAM)**: Hot objects are **physically copied** to DRAM for faster access
 
+### Adaptive Tiering (new)
+
+Enable the `adaptive_tiering` feature to make promotion/demotion decisions respond to DRAM pressure and object size:
+
+```toml
+[dependencies]
+paper-cache = { features = ["adaptive_tiering"] }
+```
+
+Behavior tweaks:
+- Low DRAM pressure: dynamically lowers the promotion threshold, favoring tiny objects and recent bursts.
+- High DRAM pressure: raises the promotion threshold and demotes large, cold objects first.
+- Configurable knobs: `small_object_cutoff`, `recency_boost_ms`, `pressure_penalty`, and `headroom_bonus` in `TieringConfig`.
+
 ### Features
 
 - **Automatic Promotion with Data Copying**: Objects accessed frequently are automatically **copied** to DRAM
@@ -147,4 +161,3 @@ paper-cache = { features = ["global_hashtable_pmem", "key_value_pmem"] }
 
 These feature flags work in conjunction with:
 - `key_value_pmem`: Place key and value data in PMEM
-

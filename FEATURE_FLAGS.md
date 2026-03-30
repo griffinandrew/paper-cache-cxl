@@ -31,6 +31,12 @@ The implementation provides explicit feature flags to control:
 - **When disabled**: No automatic tiering, but global hashtable can still be placed in PMEM
 - **Requirements**: Works with `key_value_pmem`
 
+### `adaptive_tiering`
+- **Purpose**: Enable an adaptive, pressure-aware tiering strategy on top of the tiering manager
+- **When enabled**: Promotion thresholds are lowered for tiny or bursty-hot objects when DRAM has headroom, and raised when DRAM is near capacity to avoid thrashing
+- **When disabled**: Tiering uses the static hotness threshold
+- **Requirements**: `enable_tiering_manager` + `key_value_pmem`
+
 ### `tiering_hashtable_pmem`
 - **Purpose**: Control memory placement of the tiering manager's internal hashtable
 - **When enabled**: Tiering manager's hashtable stored in PMEM
