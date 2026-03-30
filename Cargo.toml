@@ -52,6 +52,11 @@ enable_tiering_manager = []
 # decisions based on DRAM pressure, object size density, and recent access.
 adaptive_tiering = ["enable_tiering_manager", "key_value_pmem"]
 
+# Adaptive thresholds for tiering/multitiering using moving averages
+# Independent of `adaptive_tiering`; enables dynamic warm/hot cutoffs for
+# tiering and multitiering based on workload distributions.
+adaptive = ["enable_tiering_manager", "key_value_pmem"]
+
 # Place tiering manager's hashtable in PMEM (requires enable_tiering_manager + key_value_pmem)
 tiering_hashtable_pmem = []
 
@@ -137,4 +142,3 @@ original = []
 [build-dependencies]
 cc = "1.2.39"
 bindgen = "0.72.1"
-

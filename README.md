@@ -31,10 +31,14 @@ The tiering manager provides a two-tier caching architecture with **actual data 
 
 ### Adaptive Tiering (new)
 
-Enable the `adaptive_tiering` feature to make promotion/demotion decisions respond to DRAM pressure and object size:
+Enable the `adaptive_tiering` feature (full adaptive pipeline) or the lighter `adaptive` flag (auto-tuned thresholds for `tiering`/`multitiering`) to make promotion/demotion decisions respond to DRAM pressure and object size:
 
 ```toml
 [dependencies]
+# Auto-tune tiering/multitiering thresholds without enabling the full adaptive_tiering flag
+paper-cache = { features = ["adaptive"] }
+
+# Full adaptive tiering behavior
 paper-cache = { features = ["adaptive_tiering"] }
 ```
 
