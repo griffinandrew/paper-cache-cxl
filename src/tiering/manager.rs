@@ -808,6 +808,13 @@ where
             info.access_count += 1;
             info.last_access = now;
 
+            // Never promote on the very first access; we only use it to seed
+            // recency/size tracking so adaptive thresholds still require a
+            // second touch before promotion.
+            if info.access_count == 1 {
+                return false;
+            }
+
             let config = self.config.read().unwrap();
             let stats = self.stats.read().unwrap();
             let pressure = if config.dram_threshold == 0 {
@@ -2097,6 +2104,19 @@ mod tests {
 
         // Second access - should suggest promotion
         assert!(manager.record_access(1));
+    }
+
+    #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
+    #[test]
+    fn adaptive_requires_second_touch_before_promotion() {
+        let manager = TestManager::with_defaults();
+        manager.register_object(1, 512);
+
+        // First access only seeds recency/size tracking.
+        assert!(!manager.record_access_adaptive(1));
+
+        // Second access is eligible for promotion under adaptive rules.
+        assert!(manager.record_access_adaptive(1));
     }
 
     #[test]
