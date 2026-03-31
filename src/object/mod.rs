@@ -15,6 +15,13 @@ use std::{
 
 use typesize::TypeSize;
 
+#[cfg(feature = "key_value_pmem")]
+use crate::Hybrid;
+#[cfg(feature = "key_value_pmem")]
+type PmemBox<T> = allocator_api2::boxed::Box<T, Hybrid>;
+#[cfg(feature = "key_value_pmem")]
+type PmemVec<T> = allocator_api2::vec::Vec<T, Hybrid>;
+
 pub type ObjectSize = u32;
 pub type ExpireTime = Option<Instant>;
 
@@ -30,7 +37,7 @@ pub struct Object<K, V> {
 	/// directly in persistent memory via the Hybrid allocator.  There is no
 	/// separate DRAM copy of the key in this configuration.
 	#[cfg(feature = "key_pmem_value_pmem")]
-	_key_pmem: Box<K, crate::Hybrid>,
+	_key_pmem: PmemBox<K>,
 
 	data: Arc<V>,
 	expiry: ExpireTime,
@@ -62,15 +69,13 @@ impl<K, V> Object<K, V> {
 	/// copy of the key is retained.
 	#[cfg(feature = "key_pmem_value_pmem")]
 	pub fn new(key: K, data: V, ttl: Option<u32>) -> Self {
-		use crate::Hybrid;
-
 		let expiry = match ttl {
 			Some(0) | None => None,
 			Some(ttl) => Some(get_expiry_from_ttl(ttl)),
 		};
 
 		Object {
-			_key_pmem: Box::new_in(key, Hybrid),
+			_key_pmem: PmemBox::new_in(key, Hybrid),
 			data: Arc::new(data),
 			expiry,
 		}
@@ -95,10 +100,8 @@ impl<K, V> Object<K, V> {
 	/// PMEM; no DRAM copy is retained.
 	#[cfg(feature = "key_pmem_value_pmem")]
 	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self {
-		use crate::Hybrid;
-
 		Object {
-			_key_pmem: Box::new_in(key, Hybrid),
+			_key_pmem: PmemBox::new_in(key, Hybrid),
 			data: Arc::new(data),
 			expiry,
 		}
@@ -208,10 +211,8 @@ impl<K: Default> Default for Object<K, Box<[u8]>> {
 
 		#[cfg(feature = "key_pmem_value_pmem")]
 		{
-			use crate::Hybrid;
-
 			Object {
-				_key_pmem: Box::new_in(K::default(), Hybrid),
+				_key_pmem: PmemBox::new_in(K::default(), Hybrid),
 				data: Arc::new(Vec::new().into_boxed_slice()),
 				expiry: None,
 			}
@@ -221,15 +222,13 @@ impl<K: Default> Default for Object<K, Box<[u8]>> {
 
 // For BufferPMEM (Box<[u8], Hybrid>)
 #[cfg(any(feature = "key_value_pmem", feature = "global_flatmap_pmem"))]
-impl<K: Default> Default for Object<K, Box<[u8], crate::Hybrid>> {
+impl<K: Default> Default for Object<K, crate::BufferPMEM> {
 	fn default() -> Self {
-		use crate::Hybrid;
-
 		#[cfg(not(feature = "key_pmem_value_pmem"))]
 		{
 			Object {
 				key: K::default(),
-				data: Arc::new(Vec::<u8, Hybrid>::new_in(Hybrid).into_boxed_slice()),
+				data: Arc::new(PmemVec::<u8>::new_in(Hybrid).into_boxed_slice().into()),
 				expiry: None,
 			}
 		}
@@ -237,8 +236,8 @@ impl<K: Default> Default for Object<K, Box<[u8], crate::Hybrid>> {
 		#[cfg(feature = "key_pmem_value_pmem")]
 		{
 			Object {
-				_key_pmem: Box::new_in(K::default(), Hybrid),
-				data: Arc::new(Vec::<u8, Hybrid>::new_in(Hybrid).into_boxed_slice()),
+				_key_pmem: PmemBox::new_in(K::default(), Hybrid),
+				data: Arc::new(PmemVec::<u8>::new_in(Hybrid).into_boxed_slice().into()),
 				expiry: None,
 			}
 		}

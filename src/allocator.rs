@@ -22,9 +22,9 @@
 use core::alloc::{GlobalAlloc, Layout};
 use std::sync::{Once, atomic::{AtomicUsize, Ordering}};
 use std::ptr;
-use tikv_jemallocator::Jemalloc;
-use std::alloc::{Allocator, AllocError};
 use std::ptr::NonNull;
+
+use allocator_api2::alloc::{AllocError, Allocator};
 
 mod allocator_bindings {
     include!("umf_allocator_bindings.rs"); // UMF extern "C" declarations
@@ -51,12 +51,12 @@ unsafe impl GlobalAlloc for HybridObjects {
         // a no-op.
         INIT.call_once(|| {
             let numa_node = 1; // PMEM NUMA node (ignored by stub)
-            allocator_bindings::umf_allocator_init(numa_node);
+            unsafe { allocator_bindings::umf_allocator_init(numa_node) };
             #[cfg(debug_assertions)]
             println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
         });
 
-        let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
+        let ptr = unsafe { allocator_bindings::umf_alloc(layout.size(), layout.align()) } as *mut u8;
         if ptr.is_null() {
             println!("HybridObjects: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
@@ -79,7 +79,7 @@ unsafe impl GlobalAlloc for HybridObjects {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void);
+        unsafe { allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void) };
 
         #[cfg(debug_assertions)]
         {
@@ -96,33 +96,12 @@ unsafe impl GlobalAlloc for HybridObjects {
     }
 }
 
-// Allocator trait — used by Vec<u8, HybridObjects> and Box<[u8], HybridObjects>
-// (i.e. BufferPMEM) via the nightly allocator_api feature.
+// allocator_api2 support (for all PMEM-backed allocations)
 unsafe impl Allocator for HybridObjects {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        unsafe {
-            HybridObjects::alloc(self, layout)
-                .as_mut()
-                .map(|ptr| NonNull::slice_from_raw_parts(
-                    NonNull::new_unchecked(ptr),
-                    layout.size(),
-                ))
-                .ok_or(AllocError)
-        }
-    }
-
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        HybridObjects::dealloc(self, ptr.as_ptr(), layout);
-    }
-}
-
-// allocator_api2 support (for hashbrown and dlv-list under eviction_stacks_pmem)
-#[cfg(any(feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem"))]
-unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
         let ptr = unsafe { self.alloc(layout) };
         if ptr.is_null() {
-            Err(allocator_api2::alloc::AllocError)
+            Err(AllocError)
         } else {
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr, layout.size()) };
             Ok(NonNull::from(slice))
