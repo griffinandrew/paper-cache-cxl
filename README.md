@@ -53,7 +53,7 @@ Behavior tweaks:
 - **Automatic Promotion with Data Copying**: Objects accessed frequently are automatically **copied** to DRAM
 - **Two-Tier Reads**: Get operations check DRAM cache first, then fall back to PMEM
 - **Configurable Thresholds**: 
-  - DRAM capacity (default: 20% of cache size)
+  - DRAM capacity (static default from `TieringConfig`, e.g., 1 GiB unless overridden)
   - Hotness threshold (default: 2 accesses before promotion)
 - **Runtime Controls**: Adjust tiering parameters at runtime without restart
 - **Statistics Tracking**: Monitor promotions, demotions, and tier distribution

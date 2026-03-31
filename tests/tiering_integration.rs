@@ -1,8 +1,13 @@
 #[cfg(all(feature = "enable_tiering_manager", feature = "key_value_pmem"))]
 mod tiering_tests {
     use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
+    use paper_cache::tiering::TieringConfig;
     use std::thread;
     use std::time::Duration;
+
+    fn expected_default_threshold() -> u64 {
+        TieringConfig::default().dram_threshold
+    }
 
     #[test]
     fn test_tiering_manager_integration() {
@@ -19,8 +24,9 @@ mod tiering_tests {
         assert_eq!(stats.promotions, 0);
         assert_eq!(stats.demotions, 0);
 
-        // Default DRAM threshold should be 20% of max_size (2000 bytes)
-        assert_eq!(cache.dram_threshold(), 2000);
+        // Default DRAM threshold uses the static TieringConfig default.
+        let expected_threshold = expected_default_threshold();
+        assert_eq!(cache.dram_threshold(), expected_threshold);
 
         // Set some objects
         for i in 0..10 {
@@ -56,7 +62,8 @@ mod tiering_tests {
 
         // Test DRAM threshold configuration
         let initial_threshold = cache.dram_threshold();
-        assert_eq!(initial_threshold, 2000); // 20% of 10000
+        let expected_threshold = expected_default_threshold();
+        assert_eq!(initial_threshold, expected_threshold);
 
         cache.set_dram_threshold(5000);
         assert_eq!(cache.dram_threshold(), 5000);
