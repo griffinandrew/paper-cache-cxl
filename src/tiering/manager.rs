@@ -1655,6 +1655,14 @@ where
         keys_to_demote
     }
 
+    /// Adaptive variant of demotion that reuses the same LRU selection while
+    /// honoring the adaptive feature gate so callers can compile under the
+    /// `adaptive` / `adaptive_tiering` flags.
+    #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
+    pub fn get_keys_to_demote_adaptive(&self) -> Vec<HashedKey> {
+        self.get_keys_to_demote()
+    }
+
     /// Removes an object from all tiering tracking (when it's deleted from cache).
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
     #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
