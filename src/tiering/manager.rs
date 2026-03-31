@@ -854,6 +854,14 @@ where
         }
     }
 
+    /// Hashtable-tiering builds reuse the adaptive thresholds computed inside
+    /// `record_access` (warm/hot promotion). Provide a feature-compatible
+    /// entrypoint so call sites gated on `adaptive` continue to compile.
+    #[cfg(all(any(feature = "adaptive_tiering", feature = "adaptive"), feature = "hashtable_tiering"))]
+    pub fn record_access_adaptive(&self, key: HashedKey) -> bool {
+        self.record_access(key)
+    }
+
     #[cfg(feature = "hashtable_tiering")]
     /// Records an access to an object (hashtable_tiering version)
     /// Returns true if the object should be promoted to DRAM (physical copy or pointer)
