@@ -1,20 +1,12 @@
 #[cfg(all(feature = "enable_tiering_manager", feature = "key_value_pmem"))]
 mod tiering_tests {
     use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
-    #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
     use paper_cache::tiering::TieringConfig;
     use std::thread;
     use std::time::Duration;
 
-    fn expected_default_threshold(_max_size: u64) -> u64 {
-        #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
-        {
-            TieringConfig::default().dram_threshold
-        }
-        #[cfg(not(any(feature = "adaptive_tiering", feature = "adaptive")))]
-        {
-            (_max_size as f64 * 0.2) as u64
-        }
+    fn expected_default_threshold() -> u64 {
+        TieringConfig::default().dram_threshold
     }
 
     #[test]
@@ -32,9 +24,8 @@ mod tiering_tests {
         assert_eq!(stats.promotions, 0);
         assert_eq!(stats.demotions, 0);
 
-        // Default DRAM threshold uses a static value when adaptive tiering is enabled;
-        // otherwise it scales to 20% of the configured cache size.
-        let expected_threshold = expected_default_threshold(10000);
+        // Default DRAM threshold uses the static TieringConfig default.
+        let expected_threshold = expected_default_threshold();
         assert_eq!(cache.dram_threshold(), expected_threshold);
 
         // Set some objects
@@ -71,7 +62,7 @@ mod tiering_tests {
 
         // Test DRAM threshold configuration
         let initial_threshold = cache.dram_threshold();
-        let expected_threshold = expected_default_threshold(10000);
+        let expected_threshold = expected_default_threshold();
         assert_eq!(initial_threshold, expected_threshold);
 
         cache.set_dram_threshold(5000);
