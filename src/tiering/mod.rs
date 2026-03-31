@@ -38,7 +38,7 @@
 //! # Configuration
 //! 
 //! The tiering manager supports runtime configuration:
-//! - **DRAM Threshold**: Maximum size of DRAM tier (default: 20% of cache size)
+//! - **DRAM Threshold**: Maximum size of DRAM tier (default: 20% of cache size; adaptive tiering uses the static `TieringConfig` default)
 //! - **Hotness Threshold**: Minimum accesses before promotion (default: 2)
 //! - **High Water Mark**: Percentage of threshold to trigger demotion (default: 90%)
 //! - **Low Water Mark**: Target percentage after demotion (default: 70%)

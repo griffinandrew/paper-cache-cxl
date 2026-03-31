@@ -389,9 +389,12 @@ where
 
 		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 		let tiering_manager = {
-			// Create tiering manager with default DRAM threshold at 20% of max_size
+			// Create tiering manager with default DRAM threshold (20% of max_size unless adaptive tiering is enabled)
 			let mut tiering_config = tiering::TieringConfig::default();
-			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			#[cfg(not(any(feature = "adaptive_tiering", feature = "adaptive")))]
+			{
+				tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			}
 			println!("Created tiering manager with DRAM threshold: {}", tiering_config.dram_threshold);
 			Arc::new(TieringManager::new(tiering_config))
 		};
@@ -1009,9 +1012,12 @@ where
 
 		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 		let tiering_manager = {
-			// Create tiering manager with default DRAM threshold at 20% of max_size
+			// Create tiering manager with default DRAM threshold (20% of max_size unless adaptive tiering is enabled)
 			let mut tiering_config = tiering::TieringConfig::default();
-			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			#[cfg(not(any(feature = "adaptive_tiering", feature = "adaptive")))]
+			{
+				tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			}
 			Arc::new(TieringManager::new(tiering_config))
 		};
 
@@ -1682,14 +1688,20 @@ where
 		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", not(feature = "sets_dram")))]
 		let tiering_manager = {
 			let mut tiering_config = tiering::TieringConfig::default();
-			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			#[cfg(not(any(feature = "adaptive_tiering", feature = "adaptive")))]
+			{
+				tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			}
 			Arc::new(TieringManager::new(tiering_config))
 		};
 
 		#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
 		let tiering_manager = {
 			let mut tiering_config = tiering::TieringConfig::default();
-			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			#[cfg(not(any(feature = "adaptive_tiering", feature = "adaptive")))]
+			{
+				tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			}
 
 			let objects_bg = objects.clone();
 			let status_bg = status.clone();
@@ -3085,9 +3097,12 @@ where
 
 		#[cfg(feature = "enable_tiering_manager")]
 		let tiering_manager = {
-			// Create tiering manager with default DRAM threshold at 20% of max_size
+			// Create tiering manager with default DRAM threshold (20% of max_size unless adaptive tiering is enabled)
 			let mut tiering_config = tiering::TieringConfig::default();
-			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			#[cfg(not(any(feature = "adaptive_tiering", feature = "adaptive")))]
+			{
+				tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			}
 			Arc::new(TieringManager::new(tiering_config))
 		};
 
