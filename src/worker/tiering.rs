@@ -89,9 +89,9 @@ where
             WorkerEvent::Get(hashed_key, hit) => {
                 if hit {
                     // Record access and check if we should promote
-                    #[cfg(feature = "adaptive_tiering")]
+                    #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
                     let should_promote = self.tiering_manager.record_access_adaptive(hashed_key);
-                    #[cfg(not(feature = "adaptive_tiering"))]
+                    #[cfg(not(any(feature = "adaptive_tiering", feature = "adaptive")))]
                     let should_promote = self.tiering_manager.record_access(hashed_key);
 
                     if should_promote {
@@ -149,9 +149,9 @@ where
     /// Perform periodic tiering decisions (demotion checks)
     fn periodic_tiering(&self) {
         // Check if we need to demote any objects from DRAM
-        #[cfg(feature = "adaptive_tiering")]
+        #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
         let keys_to_demote = self.tiering_manager.get_keys_to_demote_adaptive();
-        #[cfg(not(feature = "adaptive_tiering"))]
+        #[cfg(not(any(feature = "adaptive_tiering", feature = "adaptive")))]
         let keys_to_demote = self.tiering_manager.get_keys_to_demote();
         
         if !keys_to_demote.is_empty() {
@@ -197,9 +197,9 @@ where
             WorkerEvent::Get(hashed_key, hit) => {
                 if hit {
                     // Record access and check if we should promote
-                    #[cfg(feature = "adaptive_tiering")]
+                    #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
                     let should_promote = self.tiering_manager.record_access_adaptive(hashed_key);
-                    #[cfg(not(feature = "adaptive_tiering"))]
+                    #[cfg(not(any(feature = "adaptive_tiering", feature = "adaptive")))]
                     let should_promote = self.tiering_manager.record_access(hashed_key);
 
                     if should_promote {
@@ -259,9 +259,9 @@ where
     /// Perform periodic tiering decisions (demotion checks)
     fn periodic_tiering(&self) {
         // Check if we need to demote any objects from DRAM
-        #[cfg(feature = "adaptive_tiering")]
+        #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
         let keys_to_demote = self.tiering_manager.get_keys_to_demote_adaptive();
-        #[cfg(not(feature = "adaptive_tiering"))]
+        #[cfg(not(any(feature = "adaptive_tiering", feature = "adaptive")))]
         let keys_to_demote = self.tiering_manager.get_keys_to_demote();
         
         if !keys_to_demote.is_empty() {
@@ -311,9 +311,9 @@ where
             WorkerEvent::Get(hashed_key, hit) => {
                 if hit {
                     // Record access and check if we should promote
-                    #[cfg(feature = "adaptive_tiering")]
+                    #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
                     let should_promote = self.tiering_manager.record_access_adaptive(hashed_key);
-                    #[cfg(not(feature = "adaptive_tiering"))]
+                    #[cfg(not(any(feature = "adaptive_tiering", feature = "adaptive")))]
                     let should_promote = self.tiering_manager.record_access(hashed_key);
 
                     if should_promote {
@@ -372,9 +372,9 @@ where
     /// Perform periodic tiering decisions (demotion checks)
     fn periodic_tiering(&self) {
         // Check if we need to demote any objects from DRAM
-        #[cfg(feature = "adaptive_tiering")]
+        #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
         let keys_to_demote = self.tiering_manager.get_keys_to_demote_adaptive();
-        #[cfg(not(feature = "adaptive_tiering"))]
+        #[cfg(not(any(feature = "adaptive_tiering", feature = "adaptive")))]
         let keys_to_demote = self.tiering_manager.get_keys_to_demote();
         
         if !keys_to_demote.is_empty() {

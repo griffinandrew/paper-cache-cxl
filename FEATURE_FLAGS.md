@@ -38,6 +38,12 @@ The implementation provides explicit feature flags to control:
 - **When disabled**: Tiering uses the static hotness threshold
 - **Requirements**: `enable_tiering_manager` + `key_value_pmem`
 
+### `adaptive`
+- **Purpose**: Dynamically tune tiering and multitiering promotion thresholds using the same EWMAs as `adaptive_tiering`, without enabling the full adaptive tiering feature flag
+- **When enabled**: Hot/warm thresholds for `tiering` and `multitiering` are derived from moving averages of object sizes/access density and DRAM pressure rather than static constants
+- **Independence**: Can be combined with `tiering` or `multitiering`; does not require the `adaptive_tiering` flag
+- **Requirements**: `enable_tiering_manager` + `key_value_pmem`
+
 ### `tiering_hashtable_pmem`
 - **Purpose**: Control memory placement of the tiering manager's internal hashtable
 - **When enabled**: Tiering manager's hashtable stored in PMEM
