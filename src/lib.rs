@@ -8,8 +8,6 @@
 
 
 
-#![cfg_attr(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem"), feature(allocator_api))]
-
 // Validate that both global_flatmap_dram and global_flatmap_pmem are not enabled together
 #[cfg(all(feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
 compile_error!("Cannot enable both 'global_flatmap_dram' and 'global_flatmap_pmem' features simultaneously. Please choose only one FlatMap mode for the global hashtable.");
@@ -111,6 +109,9 @@ use nohash_hasher::NoHashHasher;
 use crossbeam_channel::unbounded;
 use log::{info, error};
 
+#[cfg(feature = "key_value_pmem")]
+use allocator_api2::SliceExt;
+
 #[cfg(feature = "original")]
 use std::ops::Deref;
 
@@ -151,8 +152,55 @@ pub type HashedKey = u64;
 pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 
 #[cfg(feature = "key_value_pmem")]
-pub type BufferPMEM = Box<[u8], Hybrid>;
+#[derive(Clone)]
+pub struct BufferPMEM(pub allocator_api2::boxed::Box<[u8], Hybrid>);
 
+#[cfg(feature = "key_value_pmem")]
+impl From<allocator_api2::boxed::Box<[u8], Hybrid>> for BufferPMEM {
+	fn from(inner: allocator_api2::boxed::Box<[u8], Hybrid>) -> Self {
+		BufferPMEM(inner)
+	}
+}
+
+#[cfg(feature = "key_value_pmem")]
+impl From<BufferPMEM> for allocator_api2::boxed::Box<[u8], Hybrid> {
+	fn from(buf: BufferPMEM) -> Self {
+		buf.0
+	}
+}
+
+#[cfg(feature = "key_value_pmem")]
+impl std::ops::Deref for BufferPMEM {
+	type Target = [u8];
+
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
+}
+
+#[cfg(feature = "key_value_pmem")]
+impl std::ops::DerefMut for BufferPMEM {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		&mut self.0
+	}
+}
+
+#[cfg(feature = "key_value_pmem")]
+impl AsRef<[u8]> for BufferPMEM {
+	fn as_ref(&self) -> &[u8] {
+		&self.0
+	}
+}
+
+#[cfg(feature = "key_value_pmem")]
+impl AsMut<[u8]> for BufferPMEM {
+	fn as_mut(&mut self) -> &mut [u8] {
+		&mut self.0
+	}
+}
+
+#[cfg(feature = "key_value_pmem")]
+type PmemVec<T> = allocator_api2::vec::Vec<T, Hybrid>;
 
 //#[cfg(feature = "all_dram")]
 pub type BufferDRAM = Box<[u8]>;
@@ -1531,9 +1579,9 @@ where
 	/// # Examples
 	///
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let cache = PaperCache::<u32, u32>::new(
+	/// let cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1542,7 +1590,7 @@ where
 	/// assert!(cache.is_ok());
 	///
 	/// // Supplying a maximum size of zero will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
+	/// let cache = PaperCache::<u32, BufferPMEM>::new(
 	///     0,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1551,7 +1599,7 @@ where
 	/// assert!(cache.is_err());
 	///
 	/// // Supplying duplicate policies will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
+	/// let cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu, PaperPolicy::Lru, PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1560,7 +1608,7 @@ where
 	/// assert!(cache.is_err());
 	///
 	/// // Supplying a non-configured policy will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
+	/// let cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lru,
@@ -1588,9 +1636,9 @@ where
 	///
 	/// ```
 	/// use std::hash::RandomState;
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let cache = PaperCache::<u32, u32>::with_hasher(
+	/// let cache = PaperCache::<u32, BufferPMEM>::with_hasher(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1633,14 +1681,15 @@ where
 
 		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", not(feature = "sets_dram")))]
 		let tiering_manager = {
-			// Create tiering manager with default DRAM threshold at 20% of max_size
-			let tiering_config = tiering::TieringConfig::default();
+			let mut tiering_config = tiering::TieringConfig::default();
+			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
 			Arc::new(TieringManager::new(tiering_config))
 		};
 
 		#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
 		let tiering_manager = {
-			let tiering_config = tiering::TieringConfig::default();
+			let mut tiering_config = tiering::TieringConfig::default();
+			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
 
 			let objects_bg = objects.clone();
 			let status_bg = status.clone();
@@ -1673,9 +1722,9 @@ where
 						}
 
 						// Allocate value bytes in PMEM via the Hybrid allocator.
-						let mut pmem_vec = Vec::<u8, Hybrid>::with_capacity_in(job.value.len(), Hybrid);
+						let mut pmem_vec = PmemVec::<u8>::with_capacity_in(job.value.len(), Hybrid);
 						pmem_vec.extend_from_slice(&job.value);
-						let val_buf: BufferPMEM = pmem_vec.into_boxed_slice();
+						let val_buf: BufferPMEM = pmem_vec.into_boxed_slice().into();
 
 						let object = crate::object::Object::new(job.key, val_buf, job.ttl);
 						let base_size = overhead_bg.base_size(&object);
@@ -1773,9 +1822,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu
@@ -1792,15 +1841,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	///
 	/// let status = cache.status().unwrap();
 	/// assert!(status.used_size() > 0);
@@ -1815,15 +1864,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	///
 	/// // Getting a key which exists in the cache will return the associated value.
 	/// assert!(cache.get(&0).is_ok());
@@ -1940,15 +1989,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// assert!(cache.set(0, 0, None).is_ok());
+	/// assert!(cache.set(0, &[0], None).is_ok());
 	/// ```
 	
 	// not V but &[u8]?? 
@@ -1980,7 +2029,7 @@ where
 
 		#[cfg(not(feature = "sets_dram"))]
 		{
-			let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
+			let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice().into();
 
 			//let key_buf: BufferPMEM = 
 
@@ -2045,15 +2094,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	/// assert!(cache.del(&0).is_ok());
 	///
 	/// // Deleting a key which does not exist in the cache will return a CacheError.
@@ -2081,15 +2130,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	///
 	/// assert!(cache.has(&0));
 	/// assert!(!cache.has(&1));
@@ -2109,23 +2158,23 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
-	/// cache.set(1, 0, None);
+	/// cache.set(0, &[0], None);
+	/// cache.set(1, &[0], None);
 	///
 	/// // Peeking a key which exists in the cache will return the associated value.
 	/// assert!(cache.peek(&0).is_ok());
 	/// // Peeking a key which does not exist in the cache will return a CacheError.
 	/// assert!(cache.peek(&2).is_err());
 	///
-	/// cache.set(2, 0, None);
+	/// cache.set(2, &[0], None);
 	///
 	/// // Peeking a key will not alter the eviction order of the objects.
 	/// assert!(cache.peek(&1).is_ok());
@@ -2149,15 +2198,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None); // value will not expire
+	/// cache.set(0, &[0], None); // value will not expire
 	/// cache.ttl(&0, Some(5)); // value will expire in 5 seconds
 	/// ```
 	
@@ -2189,15 +2238,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	///
 	/// // Sizing a key which exists in the cache will return the size of the associated value.
 	/// assert!(cache.size(&0).is_ok());
@@ -2220,9 +2269,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -2246,9 +2295,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -2286,9 +2335,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -2922,9 +2971,9 @@ where
 	/// # Examples
 	///
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let cache = PaperCache::<u32, u32>::new(
+	/// let cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -2933,7 +2982,7 @@ where
 	/// assert!(cache.is_ok());
 	///
 	/// // Supplying a maximum size of zero will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
+	/// let cache = PaperCache::<u32, BufferPMEM>::new(
 	///     0,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -2942,7 +2991,7 @@ where
 	/// assert!(cache.is_err());
 	///
 	/// // Supplying duplicate policies will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
+	/// let cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu, PaperPolicy::Lru, PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -2951,7 +3000,7 @@ where
 	/// assert!(cache.is_err());
 	///
 	/// // Supplying a non-configured policy will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
+	/// let cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lru,
@@ -2979,9 +3028,9 @@ where
 	///
 	/// ```
 	/// use std::hash::RandomState;
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let cache = PaperCache::<u32, u32>::with_hasher(
+	/// let cache = PaperCache::<u32, BufferPMEM>::with_hasher(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -3038,7 +3087,7 @@ where
 		let tiering_manager = {
 			// Create tiering manager with default DRAM threshold at 20% of max_size
 			let mut tiering_config = tiering::TieringConfig::default();
-			//tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
+			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
 			Arc::new(TieringManager::new(tiering_config))
 		};
 
@@ -3083,9 +3132,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu
@@ -3102,15 +3151,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	///
 	/// let status = cache.status().unwrap();
 	/// assert!(status.used_size() > 0);
@@ -3125,15 +3174,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	///
 	/// // Getting a key which exists in the cache will return the associated value.
 	/// assert!(cache.get(&0).is_ok());
@@ -3197,15 +3246,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// assert!(cache.set(0, 0, None).is_ok());
+	/// assert!(cache.set(0, &[0], None).is_ok());
 	/// ```
 	
 	// not V but &[u8]?? 
@@ -3227,7 +3276,7 @@ where
 
 		//let buf: BufferPMEM = buf1.into_boxed_slice();
 
-		let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
+		let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice().into();
 
 		//let key_buf: BufferPMEM = 
 
@@ -3287,15 +3336,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	/// assert!(cache.del(&0).is_ok());
 	///
 	/// // Deleting a key which does not exist in the cache will return a CacheError.
@@ -3323,15 +3372,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	///
 	/// assert!(cache.has(&0));
 	/// assert!(!cache.has(&1));
@@ -3352,23 +3401,23 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
-	/// cache.set(1, 0, None);
+	/// cache.set(0, &[0], None);
+	/// cache.set(1, &[0], None);
 	///
 	/// // Peeking a key which exists in the cache will return the associated value.
 	/// assert!(cache.peek(&0).is_ok());
 	/// // Peeking a key which does not exist in the cache will return a CacheError.
 	/// assert!(cache.peek(&2).is_err());
 	///
-	/// cache.set(2, 0, None);
+	/// cache.set(2, &[0], None);
 	///
 	/// // Peeking a key will not alter the eviction order of the objects.
 	/// assert!(cache.peek(&1).is_ok());
@@ -3393,15 +3442,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None); // value will not expire
+	/// cache.set(0, &[0], None); // value will not expire
 	/// cache.ttl(&0, Some(5)); // value will expire in 5 seconds
 	/// ```
 	
@@ -3436,15 +3485,15 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	///
 	/// // Sizing a key which exists in the cache will return the size of the associated value.
 	/// assert!(cache.size(&0).is_ok());
@@ -3468,9 +3517,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -3495,9 +3544,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -3535,9 +3584,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, BufferPMEM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -4237,7 +4286,7 @@ where
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
-		let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
+		let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice().into();
 		let object = Object::new(key, val_buf, ttl);
 
 		let base_size = self.overhead_manager.base_size(&object);
