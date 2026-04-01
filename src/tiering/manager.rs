@@ -888,6 +888,14 @@ where
             info.last_access = std::time::Instant::now();
 
             #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
+            {
+                // Adaptive paths still require a second touch before any promotion.
+                if info.access_count == 1 {
+                    return false;
+                }
+            }
+
+            #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
             let (warm_threshold, hot_threshold) = {
                 let config = self.config.read().unwrap();
                 let stats = self.stats.read().unwrap();
@@ -926,6 +934,11 @@ where
                 warm = warm.clamp(config.hotness_floor, config.hotness_ceiling);
                 hot = hot.max(warm.saturating_add(1));
                 hot = hot.clamp(config.hotness_floor.max(warm + 1), config.hotness_ceiling);
+
+                // Keep adaptive thresholds from falling below the configured minima.
+                warm = warm.max(config.warm_threshold);
+                hot = hot.max(config.hot_threshold);
+                hot = hot.max(warm.saturating_add(1));
 
                 (warm, hot)
             };
@@ -1900,7 +1913,20 @@ where
     /// Sets the hotness threshold
     pub fn set_hotness_threshold(&self, threshold: u64) {
         let mut config = self.config.write().unwrap();
+        #[cfg(feature = "hashtable_tiering")]
+        let hot_gap = config.hot_threshold.saturating_sub(config.warm_threshold);
+
         config.hotness_threshold = threshold;
+
+        #[cfg(feature = "hashtable_tiering")]
+        {
+            config.warm_threshold = threshold;
+            let gap = hot_gap.max(1);
+            config.hot_threshold = threshold.saturating_add(gap);
+            config.hot_threshold = config
+                .hot_threshold
+                .max(config.warm_threshold.saturating_add(1));
+        }
     }
 
     /// Clears all tiering metadata and the DRAM cache.
@@ -2121,9 +2147,8 @@ mod tests {
 
     #[test]
     fn test_configurable_hotness_threshold() {
-        let mut config = TieringConfig::default();
-        config.hotness_threshold = 3;
-        let manager = TestManager::new(config);
+        let manager = TestManager::with_defaults();
+        manager.set_hotness_threshold(3);
 
         manager.register_object(1, 100);
 
