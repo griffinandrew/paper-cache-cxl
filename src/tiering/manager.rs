@@ -15,6 +15,8 @@ use crate::{
 };
 
 use super::object::TieringObject;
+#[cfg(feature = "hashtable_tiering")]
+use super::object::TieringData;
 
 use nohash_hasher::NoHashHasher;
 use std::hash::BuildHasherDefault;
@@ -165,6 +167,9 @@ pub struct TieringStats {
     /// Total size of objects in DRAM (bytes)
     pub dram_size: u64,
 
+    /// Total size of warm (pointer-only) objects in DRAM (bytes)
+    pub pointer_size: u64,
+
     /// Number of promotions from PMEM to DRAM
     pub promotions: u64,
 
@@ -213,6 +218,9 @@ struct ObjectTierInfo {
 
     /// Size of the object in bytes
     size: ObjectSize,
+
+    /// Estimated DRAM footprint for pointer-only tiering
+    pointer_size: u64,
 
     /// Access count (for LFU-like promotion/demotion)
     access_count: u64,
@@ -323,6 +331,30 @@ where
         *ewma = updated;
         let base = updated.round() as u64;
         base.clamp(config.hotness_floor, config.hotness_ceiling)
+    }
+
+    #[inline]
+    fn combined_usage(stats: &TieringStats) -> u64 {
+        stats.dram_size.saturating_add(stats.pointer_size)
+    }
+
+    #[cfg(feature = "hashtable_tiering")]
+    #[inline]
+    fn pointer_footprint(&self, object: &Object<K, V>) -> u64 {
+        let key_bytes = object.key().get_size() as u64;
+        let data_ptr_bytes = std::mem::size_of::<TieringData<V>>() as u64;
+        let expiry_bytes = std::mem::size_of::<crate::object::ExpireTime>() as u64;
+        key_bytes + data_ptr_bytes + expiry_bytes
+    }
+
+    #[cfg(any(feature = "adaptive_tiering", feature = "adaptive"))]
+    #[inline]
+    fn dram_pressure(&self, stats: &TieringStats, config: &TieringConfig) -> f64 {
+        if config.dram_threshold == 0 {
+            1.0
+        } else {
+            Self::combined_usage(stats) as f64 / config.dram_threshold as f64
+        }
     }
 
     #[cfg(all(test, any(feature = "adaptive_tiering", feature = "adaptive")))]
@@ -537,6 +569,7 @@ where
         info_map.insert(key, ObjectTierInfo {
             tier: Tier::PmemOnly,
             size,
+            pointer_size: 0,
             access_count: 0,
             last_access: std::time::Instant::now(),
         });
@@ -559,6 +592,7 @@ where
         info_map.insert(key, ObjectTierInfo {
             tier: Tier::DramOnly,
             size,
+            pointer_size: 0,
             access_count: 0,
             last_access: std::time::Instant::now(),
         });
@@ -716,6 +750,7 @@ where
             info_map.insert(hashed_key, ObjectTierInfo {
                 tier: Tier::DramOnly,
                 size,
+                pointer_size: 0,
                 access_count: 0,
                 last_access: std::time::Instant::now(),
             });
@@ -817,11 +852,7 @@ where
 
             let config = self.config.read().unwrap();
             let stats = self.stats.read().unwrap();
-            let pressure = if config.dram_threshold == 0 {
-                1.0
-            } else {
-                stats.dram_size as f64 / config.dram_threshold as f64
-            };
+            let pressure = self.dram_pressure(&stats, &config);
             drop(stats);
 
             let small_cutoff = self.adaptive_small_cutoff(&config);
@@ -891,11 +922,7 @@ where
             let (warm_threshold, hot_threshold) = {
                 let config = self.config.read().unwrap();
                 let stats = self.stats.read().unwrap();
-                let pressure = if config.dram_threshold == 0 {
-                    1.0
-                } else {
-                    stats.dram_size as f64 / config.dram_threshold as f64
-                };
+                let pressure = self.dram_pressure(&stats, &config);
                 drop(stats);
 
                 let small_cutoff = self.adaptive_small_cutoff(&config);
@@ -1166,6 +1193,9 @@ where
                         dram_objects.insert(key);
 
                         let mut stats = self.stats.write().unwrap();
+                        let pointer_size = self.pointer_footprint(object);
+                        info.pointer_size = pointer_size;
+                        stats.pointer_size = stats.pointer_size.saturating_add(pointer_size);
                         stats.dram_objects += 1;
                         stats.pmem_only_objects -= 1;
                         stats.promotions += 1;
@@ -1177,10 +1207,14 @@ where
                     // Upgrade to hot tier (physical copy)
                     if info.access_count >= config.hot_threshold {
                         let mut stats = self.stats.write().unwrap();
-                        let new_dram_size = stats.dram_size + info.size as u64;
+                        let current_usage = Self::combined_usage(&stats);
+                        let pointer_size = info.pointer_size;
+                        let new_usage = current_usage
+                            .saturating_sub(pointer_size)
+                            .saturating_add(info.size as u64);
 
                         // Check if promotion would exceed threshold
-                        if new_dram_size <= config.dram_threshold {
+                        if new_usage <= config.dram_threshold {
                             info.tier = Tier::DramAndPmem;
 
                             // Create DRAM object with physical data copy
@@ -1189,7 +1223,8 @@ where
                             // Update the existing TieringObject in the DRAM cache
                             self.dram_cache.insert(key, dram_object);
 
-                            stats.dram_size = new_dram_size;
+                            stats.pointer_size = stats.pointer_size.saturating_sub(pointer_size);
+                            stats.dram_size = stats.dram_size.saturating_add(info.size as u64);
                             stats.promotions += 1;
 
                             return true;
@@ -1241,6 +1276,9 @@ where
                         dram_objects.insert(key);
 
                         let mut stats = self.stats.write().unwrap();
+                        let pointer_size = self.pointer_footprint(object);
+                        info.pointer_size = pointer_size;
+                        stats.pointer_size = stats.pointer_size.saturating_add(pointer_size);
                         stats.dram_objects += 1;
                         stats.pmem_only_objects -= 1;
                         stats.promotions += 1;
@@ -1252,10 +1290,14 @@ where
                     // Upgrade to hot tier (physical copy)
                     if info.access_count >= config.hot_threshold {
                         let mut stats = self.stats.write().unwrap();
-                        let new_dram_size = stats.dram_size + info.size as u64;
+                        let current_usage = Self::combined_usage(&stats);
+                        let pointer_size = info.pointer_size;
+                        let new_usage = current_usage
+                            .saturating_sub(pointer_size)
+                            .saturating_add(info.size as u64);
 
                         // Check if promotion would exceed threshold
-                        if new_dram_size <= config.dram_threshold {
+                        if new_usage <= config.dram_threshold {
                             info.tier = Tier::DramAndPmem;
 
                             // Create DRAM object with physical data copy
@@ -1264,7 +1306,8 @@ where
                             // Update the existing TieringObject in the DRAM cache
                             self.dram_cache.write().unwrap().insert(key, dram_object);
 
-                            stats.dram_size = new_dram_size;
+                            stats.pointer_size = stats.pointer_size.saturating_sub(pointer_size);
+                            stats.dram_size = stats.dram_size.saturating_add(info.size as u64);
                             stats.promotions += 1;
 
                             return true;
@@ -1425,6 +1468,7 @@ where
                     dram_objects.remove(&key);
 
                     let mut stats = self.stats.write().unwrap();
+                    stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                     stats.pmem_only_objects += 1;
                     stats.demotions += 1;
@@ -1442,6 +1486,7 @@ where
                     dram_objects.remove(&key);
 
                     let mut stats = self.stats.write().unwrap();
+                    stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                     stats.pmem_only_objects += 1;
@@ -1460,6 +1505,7 @@ where
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
                     let mut stats = self.stats.write().unwrap();
+                    stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                     stats.pmem_only_objects += 1;
@@ -1497,6 +1543,7 @@ where
                     dram_objects.remove(&key);
 
                     let mut stats = self.stats.write().unwrap();
+                    stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                     stats.pmem_only_objects += 1;
                     stats.demotions += 1;
@@ -1628,9 +1675,11 @@ where
     pub fn get_keys_to_demote(&self) -> Vec<HashedKey> {
         let config = self.config.read().unwrap();
         let stats = self.stats.read().unwrap();
+        let mut current_usage = Self::combined_usage(&stats);
         let high_water = (config.dram_threshold as f64 * config.high_water_mark) as u64;
+        let low_water = (config.dram_threshold as f64 * config.low_water_mark) as u64;
 
-        if stats.dram_size <= high_water {
+        if current_usage <= high_water {
             return Vec::new();
         }
 
@@ -1649,19 +1698,28 @@ where
         // Sort by last access time (LRU)
         dram_object_info.sort_by_key(|(_, info)| info.last_access);
 
-        let config = self.config.read().unwrap();
-        let stats = self.stats.read().unwrap();
-        let mut current_size = stats.dram_size;
         let mut keys_to_demote = Vec::new();
-        let low_water = (config.dram_threshold as f64 * config.low_water_mark) as u64;
 
         for (key, info) in dram_object_info {
-            if current_size <= low_water {
+            if current_usage <= low_water {
                 break;
             }
 
             keys_to_demote.push(key);
-            current_size = current_size.saturating_sub(info.size as u64);
+            let mut usage = match info.tier {
+                Tier::DramAndPmem => info.size as u64,
+                #[cfg(feature = "hashtable_tiering")]
+                Tier::DramPtrToPmem => info.pointer_size,
+                #[cfg(feature = "sets_dram")]
+                Tier::DramOnly => info.size as u64,
+                Tier::PmemOnly => 0,
+            };
+
+            if usage == 0 {
+                usage = info.size as u64;
+            }
+
+            current_usage = current_usage.saturating_sub(usage);
         }
 
         keys_to_demote
@@ -1692,6 +1750,7 @@ where
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
+                    stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                 }
@@ -1776,6 +1835,7 @@ where
                     dram_objects.remove(&key);
 
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                    stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                 }
                 Tier::PmemOnly => {
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
@@ -1816,6 +1876,7 @@ where
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
+                    stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                 }
@@ -1863,6 +1924,7 @@ where
                     dram_objects.remove(&key);
 
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
+                    stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                 }
                 Tier::PmemOnly => {
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
