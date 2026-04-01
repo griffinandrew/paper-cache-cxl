@@ -1197,6 +1197,7 @@ where
                         info.pointer_size = pointer_size;
                         stats.pointer_size = stats.pointer_size.saturating_add(pointer_size);
                         stats.dram_objects += 1;
+                        stats.warm_objects = stats.warm_objects.saturating_add(1);
                         stats.pmem_only_objects -= 1;
                         stats.promotions += 1;
 
@@ -1225,7 +1226,10 @@ where
 
                             stats.pointer_size = stats.pointer_size.saturating_sub(pointer_size);
                             stats.dram_size = stats.dram_size.saturating_add(info.size as u64);
+                            stats.warm_objects = stats.warm_objects.saturating_sub(1);
+                            stats.hot_objects = stats.hot_objects.saturating_add(1);
                             stats.promotions += 1;
+                            info.pointer_size = 0;
 
                             return true;
                         }
@@ -1280,6 +1284,7 @@ where
                         info.pointer_size = pointer_size;
                         stats.pointer_size = stats.pointer_size.saturating_add(pointer_size);
                         stats.dram_objects += 1;
+                        stats.warm_objects = stats.warm_objects.saturating_add(1);
                         stats.pmem_only_objects -= 1;
                         stats.promotions += 1;
 
@@ -1308,7 +1313,10 @@ where
 
                             stats.pointer_size = stats.pointer_size.saturating_sub(pointer_size);
                             stats.dram_size = stats.dram_size.saturating_add(info.size as u64);
+                            stats.warm_objects = stats.warm_objects.saturating_sub(1);
+                            stats.hot_objects = stats.hot_objects.saturating_add(1);
                             stats.promotions += 1;
+                            info.pointer_size = 0;
 
                             return true;
                         }
@@ -1468,10 +1476,12 @@ where
                     dram_objects.remove(&key);
 
                     let mut stats = self.stats.write().unwrap();
+                    stats.warm_objects = stats.warm_objects.saturating_sub(1);
                     stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                     stats.pmem_only_objects += 1;
                     stats.demotions += 1;
+                    info.pointer_size = 0;
 
                     return true;
                 }
@@ -1486,11 +1496,13 @@ where
                     dram_objects.remove(&key);
 
                     let mut stats = self.stats.write().unwrap();
+                    stats.hot_objects = stats.hot_objects.saturating_sub(1);
                     stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                     stats.pmem_only_objects += 1;
                     stats.demotions += 1;
+                    info.pointer_size = 0;
 
                     return true;
                 }
@@ -1543,10 +1555,12 @@ where
                     dram_objects.remove(&key);
 
                     let mut stats = self.stats.write().unwrap();
+                    stats.warm_objects = stats.warm_objects.saturating_sub(1);
                     stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                     stats.pmem_only_objects += 1;
                     stats.demotions += 1;
+                    info.pointer_size = 0;
 
                     return true;
                 }
@@ -1561,10 +1575,13 @@ where
                     dram_objects.remove(&key);
 
                     let mut stats = self.stats.write().unwrap();
+                    stats.hot_objects = stats.hot_objects.saturating_sub(1);
+                    stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                     stats.pmem_only_objects += 1;
                     stats.demotions += 1;
+                    info.pointer_size = 0;
 
                     return true;
                 }
@@ -1824,6 +1841,8 @@ where
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
+                    stats.hot_objects = stats.hot_objects.saturating_sub(1);
+                    stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                 }
@@ -1834,6 +1853,7 @@ where
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
+                    stats.warm_objects = stats.warm_objects.saturating_sub(1);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                     stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                 }
@@ -1913,6 +1933,8 @@ where
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
+                    stats.hot_objects = stats.hot_objects.saturating_sub(1);
+                    stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                     stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                 }
@@ -1923,6 +1945,7 @@ where
                     let mut dram_objects = self.dram_objects.write().unwrap();
                     dram_objects.remove(&key);
 
+                    stats.warm_objects = stats.warm_objects.saturating_sub(1);
                     stats.dram_objects = stats.dram_objects.saturating_sub(1);
                     stats.pointer_size = stats.pointer_size.saturating_sub(info.pointer_size);
                 }
