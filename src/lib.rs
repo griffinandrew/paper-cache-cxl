@@ -643,6 +643,18 @@ where
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
 	}
 
+	/// Resolves the original key from a hashed key without mutating cache state.
+	///
+	/// Returns `None` when the hash is absent or the stored entry is expired.
+	pub fn resolve_key(&self, hashed_key: crate::HashedKey) -> Option<K>
+	where
+		K: Clone,
+	{
+		self.objects
+			.get(&hashed_key)
+			.and_then(|object| (!object.is_expired()).then(|| object.key().clone()))
+	}
+
 	/// Gets (peeks) the value associated with the supplied key without altering
 	/// any of the cache's internal queues.
 	/// If the key was not found in the cache, returns a [`CacheError`].
@@ -1275,6 +1287,15 @@ where
 		self.objects
 			.get(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
+	}
+
+	/// Resolves the original key from a hashed key without mutating cache state.
+	///
+	/// Returns `None` when the hash is absent or the stored entry is expired.
+	pub fn resolve_key(&self, hashed_key: crate::HashedKey) -> Option<K> {
+		self.objects
+			.get(&hashed_key)
+			.and_then(|object| (!object.is_expired()).then(|| object.key().clone()))
 	}
 
 	/// Gets (peeks) the value associated with the supplied key without altering
@@ -2148,6 +2169,15 @@ where
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
 	}
 
+	/// Resolves the original key from a hashed key without mutating cache state.
+	///
+	/// Returns `None` when the hash is absent or the stored entry is expired.
+	pub fn resolve_key(&self, hashed_key: crate::HashedKey) -> Option<K> {
+		self.objects
+			.get(&hashed_key)
+			.and_then(|object| (!object.is_expired()).then(|| object.key().clone()))
+	}
+
 	/// Gets (peeks) the value associated with the supplied key without altering
 	/// any of the cache's internal queues.
 	/// If the key was not found in the cache, returns a [`CacheError`].
@@ -2572,6 +2602,16 @@ where
 		self.objects
 			.read().unwrap().get(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
+	}
+
+	pub fn resolve_key(&self, hashed_key: crate::HashedKey) -> Option<K>
+	where
+		K: Clone,
+	{
+		self.objects
+			.read().unwrap()
+			.get(&hashed_key)
+			.and_then(|object| (!object.is_expired()).then(|| object.key().clone()))
 	}
 
 	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
@@ -3388,6 +3428,19 @@ where
 			//.get(&hashed_key)
 			.read().unwrap().get(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
+	}
+
+	/// Resolves the original key from a hashed key without mutating cache state.
+	///
+	/// Returns `None` when the hash is absent or the stored entry is expired.
+	pub fn resolve_key(&self, hashed_key: crate::HashedKey) -> Option<K>
+	where
+		K: Clone,
+	{
+		self.objects
+			.read().unwrap()
+			.get(&hashed_key)
+			.and_then(|object| (!object.is_expired()).then(|| object.key().clone()))
 	}
 
 	/// Gets (peeks) the value associated with the supplied key without altering

@@ -113,7 +113,6 @@ thread,
 
 use crossbeam_channel::bounded;
 use dashmap::DashSet;
-use dashmap::DashMap;
 use typesize::TypeSize;
 
 use crate::{PaperCache, PaperPolicy, CacheError, BufferDRAM, BufferPMEM, HashedKey};
@@ -332,8 +331,6 @@ K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
     /// absent from both tier hashtables; `get` treats an in-flight key as a
     /// cache miss rather than spinning, keeping latency predictable.
     in_flight_demotions: Arc<DashSet<K>>,
-    /// Maps hashed keys to their original keys for PMEM→DRAM promotion.
-    demoted_lookup: Arc<DashMap<HashedKey, Arc<K>>>,
     /// Shared atomic counters for [`HybridCacheStats`].
     stats: Arc<AtomicHybridStats>,
 }
@@ -374,7 +371,6 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
 
     let stats = Arc::new(AtomicHybridStats::new());
     let in_flight_demotions = Arc::new(DashSet::<K>::new());
-    let demoted_lookup = Arc::new(DashMap::<HashedKey, Arc<K>>::new());
 
     // ── Demotion channel + dedicated worker ──────────────────────────────────
     // The eviction callback (fired on the PolicyWorker thread) enqueues
@@ -397,24 +393,19 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
     let main_worker = Arc::clone(&main);
     let stats_worker = Arc::clone(&stats);
     let in_flight_worker = Arc::clone(&in_flight_demotions);
-    let demoted_lookup_worker = Arc::clone(&demoted_lookup);
     thread::Builder::new()
         .name("hybridcache-demotion".to_string())
         .spawn(move || {
             // Signal the parent thread that this worker is running.
             startup_barrier_clone.wait();
-            while let Ok((hashed_key, key, val)) = demotion_rx.recv() {
+            while let Ok((_, key, val)) = demotion_rx.recv() {
                 if main_worker.set((*key).clone(), val.as_ref(), None).is_ok() {
-                    demoted_lookup_worker
-                        .entry(hashed_key)
-                        .or_insert_with(|| Arc::clone(&key));
                     in_flight_worker.remove(&*key);
                     stats_worker.demotions.fetch_add(1, Ordering::Relaxed);
                 } else {
                     // PMEM write failed: remove the in-flight marker so `get`
                     // does not spin forever, and count it as a dropped demotion.
                     in_flight_worker.remove(&*key);
-                    demoted_lookup_worker.remove(&hashed_key);
                     stats_worker.dropped_demotions.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -436,7 +427,6 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
     let main_check = Arc::clone(&main);
     let stats_evict = Arc::clone(&stats);
     let in_flight_evict = Arc::clone(&in_flight_demotions);
-    let demoted_lookup_cb = Arc::clone(&demoted_lookup);
     let eviction_callback: Box<dyn for<'a> Fn(crate::HashedKey, Arc<BufferDRAM>, &'a K) + Send + Sync> =
     Box::new(move |hashed_key, val, k| {
         // Skip if this key already has a live entry in the far PMEM tier.
@@ -447,12 +437,10 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
         // migration window.
         in_flight_evict.insert(k.clone());
         let key_arc = Arc::new(k.clone());
-        demoted_lookup_cb.insert(hashed_key, Arc::clone(&key_arc));
         // Non-blocking send.  If the channel is full, drop the demotion,
         // remove the in-flight marker, and count the drop.
         if demotion_tx.try_send((hashed_key, key_arc, Arc::clone(&val))).is_err() {
             in_flight_evict.remove(k);
-            demoted_lookup_cb.remove(&hashed_key);
             stats_evict.dropped_demotions.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -474,18 +462,16 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
     // bytes into the DRAM tier without blocking the request path.
     let small_reinsert = Arc::clone(&small);
     let main_promote = Arc::clone(&main);
-    let demoted_lookup_promote = Arc::clone(&demoted_lookup);
     let stats_reinsert = Arc::clone(&stats);
     thread::Builder::new()
         .name("hybridcache-promotion".to_string())
         .spawn(move || {
             while let Ok(event) = promotion_rx.recv() {
                 if let crate::worker::WorkerEvent::Promote(hashed_key) = event {
-                    if let Some(entry) = demoted_lookup_promote.get(&hashed_key) {
-                        let key_arc = Arc::clone(entry.value());
-                        match main_promote.peek(&key_arc) {
+                    if let Some(key) = main_promote.resolve_key(hashed_key) {
+                        match main_promote.peek(&key) {
                             Ok(bytes) => {
-                                match small_reinsert.set((*key_arc).clone(), bytes.as_ref(), None) {
+                                match small_reinsert.set(key, bytes.as_ref(), None) {
                                     Ok(_) => {
                                         stats_reinsert.promotions.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -495,7 +481,6 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
                                 };
                             }
                             Err(_) => {
-                                demoted_lookup_promote.remove(&hashed_key);
                                 stats_reinsert.dropped_promotions.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -511,7 +496,6 @@ pub fn new(config: HybridCacheConfig) -> Result<Self, CacheError> {
         small,
         main,
         in_flight_demotions,
-        demoted_lookup,
         stats,
     })
 }
@@ -662,7 +646,6 @@ pub fn has_in_flight_demotion(&self, key: &K) -> bool {
 pub fn wipe(&self) -> Result<(), CacheError> {
     self.small.wipe()?;
     self.main.wipe()?;
-    self.demoted_lookup.clear();
     Ok(())
 }
 
