@@ -25,6 +25,8 @@ use std::{
 
 use typesize::TypeSize;
 use crossbeam_channel::Receiver;
+#[cfg(feature = "tiering_decoupled")]
+use crossbeam_channel::{Sender, TrySendError};
 use log::{info, debug};
 
 use crate::{
@@ -37,6 +39,8 @@ use crate::{
         Worker,
         WorkerEvent,
     },
+    #[cfg(feature = "tiering_decoupled")]
+    HashedKey,
 };
 
 #[cfg(feature = "enable_tiering_manager")]
@@ -53,8 +57,36 @@ pub struct TieringWorker<K, V> {
     status: StatusRef,
     #[allow(dead_code)]
     overhead_manager: OverheadManagerRef,
+
+    #[cfg(feature = "tiering_decoupled")]
+    promotion_tx: Sender<HashedKey>,
+    #[cfg(feature = "tiering_decoupled")]
+    demotion_tx: Sender<Vec<HashedKey>>,
     
     tiering_manager: Arc<TieringManager<K, V>>,
+}
+
+#[cfg(feature = "tiering_decoupled")]
+impl<K, V> TieringWorker<K, V> {
+    fn enqueue_promotion(&self, key: HashedKey) {
+        match self.promotion_tx.try_send(key) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => debug!("Dropping promotion request for {}: queue full", key),
+            Err(TrySendError::Disconnected(_)) => debug!("Dropping promotion request for {}: queue closed", key),
+        }
+    }
+
+    fn enqueue_demotions(&self, keys: Vec<HashedKey>) {
+        if keys.is_empty() {
+            return;
+        }
+
+        match self.demotion_tx.try_send(keys) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => debug!("Dropping demotion batch: queue full"),
+            Err(TrySendError::Disconnected(_)) => debug!("Dropping demotion batch: queue closed"),
+        }
+    }
 }
 
 #[cfg(all(
@@ -73,12 +105,20 @@ where
         status: StatusRef,
         overhead_manager: OverheadManagerRef,
         tiering_manager: Arc<TieringManager<K, V>>,
+        #[cfg(feature = "tiering_decoupled")]
+        promotion_tx: Sender<HashedKey>,
+        #[cfg(feature = "tiering_decoupled")]
+        demotion_tx: Sender<Vec<HashedKey>>,
     ) -> Self {
         TieringWorker {
             listener,
             objects,
             status,
             overhead_manager,
+            #[cfg(feature = "tiering_decoupled")]
+            promotion_tx,
+            #[cfg(feature = "tiering_decoupled")]
+            demotion_tx,
             tiering_manager,
         }
     }
@@ -95,10 +135,17 @@ where
                     let should_promote = self.tiering_manager.record_access(hashed_key);
 
                     if should_promote {
-                        // Object should be promoted to DRAM - copy the Object
-                        if let Some(object_ref) = self.objects.get(&hashed_key) {
-                            if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
-                                debug!("Promoted object {} to DRAM", hashed_key);
+                        #[cfg(feature = "tiering_decoupled")]
+                        {
+                            self.enqueue_promotion(hashed_key);
+                        }
+
+                        #[cfg(not(feature = "tiering_decoupled"))]
+                        {
+                            if let Some(object_ref) = self.objects.get(&hashed_key) {
+                                if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
+                                    debug!("Promoted object {} to DRAM", hashed_key);
+                                }
                             }
                         }
                     }
@@ -106,9 +153,17 @@ where
             }
             
             WorkerEvent::Promote(hashed_key) => {
-                if let Some(object_ref) = self.objects.get(&hashed_key) {
-                    if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
-                        debug!("Promoted object {} to DRAM (ghost hit)", hashed_key);
+                #[cfg(feature = "tiering_decoupled")]
+                {
+                    self.enqueue_promotion(hashed_key);
+                }
+
+                #[cfg(not(feature = "tiering_decoupled"))]
+                {
+                    if let Some(object_ref) = self.objects.get(&hashed_key) {
+                        if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
+                            debug!("Promoted object {} to DRAM (ghost hit)", hashed_key);
+                        }
                     }
                 }
             }
@@ -156,10 +211,18 @@ where
         
         if !keys_to_demote.is_empty() {
             info!("Demoting {} objects from DRAM to PMEM", keys_to_demote.len());
-            
-            for key in keys_to_demote {
-                if self.tiering_manager.demote_from_dram(key) {
-                    debug!("Demoted object {} from DRAM", key);
+
+            #[cfg(feature = "tiering_decoupled")]
+            {
+                self.enqueue_demotions(keys_to_demote);
+            }
+
+            #[cfg(not(feature = "tiering_decoupled"))]
+            {
+                for key in keys_to_demote {
+                    if self.tiering_manager.demote_from_dram(key) {
+                        debug!("Demoted object {} from DRAM", key);
+                    }
                 }
             }
         }
@@ -181,12 +244,20 @@ where
         status: StatusRef,
         overhead_manager: OverheadManagerRef,
         tiering_manager: Arc<TieringManager<K, V>>,
+        #[cfg(feature = "tiering_decoupled")]
+        promotion_tx: Sender<HashedKey>,
+        #[cfg(feature = "tiering_decoupled")]
+        demotion_tx: Sender<Vec<HashedKey>>,
     ) -> Self {
         TieringWorker {
             listener,
             objects,
             status,
             overhead_manager,
+            #[cfg(feature = "tiering_decoupled")]
+            promotion_tx,
+            #[cfg(feature = "tiering_decoupled")]
+            demotion_tx,
             tiering_manager,
         }
     }
@@ -203,11 +274,18 @@ where
                     let should_promote = self.tiering_manager.record_access(hashed_key);
 
                     if should_promote {
-                        // Object should be promoted to DRAM - copy the Object
-                        //if let Some(object_ref) = self.objects.get(&hashed_key) {
-                        if let Some(object_ref) = self.objects.read().unwrap().get(&hashed_key) {
-                            if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
-                                debug!("Promoted object {} to DRAM", hashed_key);
+                        #[cfg(feature = "tiering_decoupled")]
+                        {
+                            self.enqueue_promotion(hashed_key);
+                        }
+
+                        #[cfg(not(feature = "tiering_decoupled"))]
+                        {
+                            //if let Some(object_ref) = self.objects.get(&hashed_key) {
+                            if let Some(object_ref) = self.objects.read().unwrap().get(&hashed_key) {
+                                if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
+                                    debug!("Promoted object {} to DRAM", hashed_key);
+                                }
                             }
                         }
                     }
@@ -215,9 +293,17 @@ where
             }
             
             WorkerEvent::Promote(hashed_key) => {
-                if let Some(object_ref) = self.objects.read().unwrap().get(&hashed_key) {
-                    if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
-                        debug!("Promoted object {} to DRAM (ghost hit)", hashed_key);
+                #[cfg(feature = "tiering_decoupled")]
+                {
+                    self.enqueue_promotion(hashed_key);
+                }
+
+                #[cfg(not(feature = "tiering_decoupled"))]
+                {
+                    if let Some(object_ref) = self.objects.read().unwrap().get(&hashed_key) {
+                        if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
+                            debug!("Promoted object {} to DRAM (ghost hit)", hashed_key);
+                        }
                     }
                 }
             }
@@ -266,10 +352,18 @@ where
         
         if !keys_to_demote.is_empty() {
             info!("Demoting {} objects from DRAM to PMEM", keys_to_demote.len());
-            
-            for key in keys_to_demote {
-                if self.tiering_manager.demote_from_dram(key) {
-                    debug!("Demoted object {} from DRAM", key);
+
+            #[cfg(feature = "tiering_decoupled")]
+            {
+                self.enqueue_demotions(keys_to_demote);
+            }
+
+            #[cfg(not(feature = "tiering_decoupled"))]
+            {
+                for key in keys_to_demote {
+                    if self.tiering_manager.demote_from_dram(key) {
+                        debug!("Demoted object {} from DRAM", key);
+                    }
                 }
             }
         }
@@ -295,12 +389,20 @@ where
         status: StatusRef,
         overhead_manager: OverheadManagerRef,
         tiering_manager: Arc<TieringManager<K, V>>,
+        #[cfg(feature = "tiering_decoupled")]
+        promotion_tx: Sender<HashedKey>,
+        #[cfg(feature = "tiering_decoupled")]
+        demotion_tx: Sender<Vec<HashedKey>>,
     ) -> Self {
         TieringWorker {
             listener,
             objects,
             status,
             overhead_manager,
+            #[cfg(feature = "tiering_decoupled")]
+            promotion_tx,
+            #[cfg(feature = "tiering_decoupled")]
+            demotion_tx,
             tiering_manager,
         }
     }
@@ -317,10 +419,18 @@ where
                     let should_promote = self.tiering_manager.record_access(hashed_key);
 
                     if should_promote {
-                        // Object should be promoted to DRAM - copy the Object
-                        if let Some(object_ref) = self.objects.get(&hashed_key) {
-                            if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
-                                debug!("Promoted object {} to DRAM", hashed_key);
+                        #[cfg(feature = "tiering_decoupled")]
+                        {
+                            self.enqueue_promotion(hashed_key);
+                        }
+
+                        #[cfg(not(feature = "tiering_decoupled"))]
+                        {
+                            // Object should be promoted to DRAM - copy the Object
+                            if let Some(object_ref) = self.objects.get(&hashed_key) {
+                                if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
+                                    debug!("Promoted object {} to DRAM", hashed_key);
+                                }
                             }
                         }
                     }
@@ -328,9 +438,17 @@ where
             }
             
             WorkerEvent::Promote(hashed_key) => {
-                if let Some(object_ref) = self.objects.get(&hashed_key) {
-                    if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
-                        debug!("Promoted object {} to DRAM (ghost hit)", hashed_key);
+                #[cfg(feature = "tiering_decoupled")]
+                {
+                    self.enqueue_promotion(hashed_key);
+                }
+
+                #[cfg(not(feature = "tiering_decoupled"))]
+                {
+                    if let Some(object_ref) = self.objects.get(&hashed_key) {
+                        if self.tiering_manager.promote_to_dram_with_object(hashed_key, &*object_ref) {
+                            debug!("Promoted object {} to DRAM (ghost hit)", hashed_key);
+                        }
                     }
                 }
             }
@@ -379,10 +497,18 @@ where
         
         if !keys_to_demote.is_empty() {
             info!("Demoting {} objects from DRAM to PMEM", keys_to_demote.len());
-            
-            for key in keys_to_demote {
-                if self.tiering_manager.demote_from_dram(key) {
-                    debug!("Demoted object {} from DRAM", key);
+
+            #[cfg(feature = "tiering_decoupled")]
+            {
+                self.enqueue_demotions(keys_to_demote);
+            }
+
+            #[cfg(not(feature = "tiering_decoupled"))]
+            {
+                for key in keys_to_demote {
+                    if self.tiering_manager.demote_from_dram(key) {
+                        debug!("Demoted object {} from DRAM", key);
+                    }
                 }
             }
         }

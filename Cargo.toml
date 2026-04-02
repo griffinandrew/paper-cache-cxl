@@ -47,6 +47,10 @@ all_dram = []
 # Enable the tiering manager functionality
 enable_tiering_manager = []
 
+# Decoupled control/data plane for the tiering manager. Keeps TieringWorker
+# non-blocking by offloading promotions/demotions onto background executors.
+tiering_decoupled = ["enable_tiering_manager", "key_value_pmem"]
+
 # Adaptive, pressure-aware tiering strategy.
 # Builds on the tiering manager and dynamically adjusts promotion/demotion
 # decisions based on DRAM pressure, object size density, and recent access.
