@@ -13,7 +13,7 @@ use typesize::TypeSize;
 use crossbeam_channel::{bounded as crossbeam_bounded, Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use crate::{
     HashedKey,
-    #[cfg(feature = "tiering_decoupled")]
+    //#[cfg(feature = "tiering_decoupled")]
     ObjectMapRef,
     object::{Object, ObjectSize},
 };

@@ -39,7 +39,7 @@ use crate::{
         Worker,
         WorkerEvent,
     },
-    #[cfg(feature = "tiering_decoupled")]
+    //#[cfg(feature = "tiering_decoupled")]
     HashedKey,
 };
 
