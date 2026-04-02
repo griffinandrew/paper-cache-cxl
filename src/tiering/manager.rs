@@ -9,8 +9,12 @@ use std::{
 use dashmap::DashMap;
 use typesize::TypeSize;
 
+#[cfg(feature = "tiering_decoupled")]
+use crossbeam_channel::{bounded as crossbeam_bounded, Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use crate::{
     HashedKey,
+    #[cfg(feature = "tiering_decoupled")]
+    ObjectMapRef,
     object::{Object, ObjectSize},
 };
 
@@ -23,6 +27,11 @@ use std::hash::BuildHasherDefault;
 
 
 pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
+
+#[cfg(feature = "tiering_decoupled")]
+const PROMOTION_QUEUE_BOUND: usize = 1024;
+#[cfg(feature = "tiering_decoupled")]
+const DEMOTION_QUEUE_BOUND: usize = 256;
 
 
 pub use crate::{
@@ -336,6 +345,82 @@ where
     #[inline]
     fn combined_usage(stats: &TieringStats) -> u64 {
         stats.dram_size.saturating_add(stats.pointer_size)
+    }
+
+    #[cfg(feature = "tiering_decoupled")]
+    pub fn spawn_data_plane(
+        manager: Arc<TieringManager<K, V>>,
+        objects: ObjectMapRef<K, V>,
+    ) -> (CrossbeamSender<HashedKey>, CrossbeamSender<Vec<HashedKey>>)
+    where
+        K: 'static + Eq + TypeSize + Clone + Send,
+        V: 'static + TypeSize + Clone + AsRef<[u8]> + Send,
+    {
+        let (promotion_tx, promotion_rx) = crossbeam_bounded(PROMOTION_QUEUE_BOUND);
+        let (demotion_tx, demotion_rx) = crossbeam_bounded(DEMOTION_QUEUE_BOUND);
+
+        Self::spawn_promoter(manager.clone(), objects, promotion_rx);
+        Self::spawn_demoter(manager, demotion_rx);
+
+        (promotion_tx, demotion_tx)
+    }
+
+    #[cfg(feature = "tiering_decoupled")]
+    fn spawn_promoter(
+        manager: Arc<TieringManager<K, V>>,
+        objects: ObjectMapRef<K, V>,
+        promotion_rx: CrossbeamReceiver<HashedKey>,
+    )
+    where
+        K: 'static + Eq + TypeSize + Clone + Send,
+        V: 'static + TypeSize + Clone + AsRef<[u8]> + Send,
+    {
+        thread::Builder::new()
+            .name("tiering-promoter".into())
+            .spawn(move || {
+                while let Ok(key) = promotion_rx.recv() {
+                    #[cfg(not(feature = "global_hashtable_pmem"))]
+                    {
+                        if let Some(object_ref) = objects.get(&key) {
+                            let _ = manager.promote_to_dram_with_object(key, &*object_ref);
+                        }
+                    }
+
+                    #[cfg(feature = "global_hashtable_pmem")]
+                    {
+                        if let Some(object_ref) = objects.read().unwrap().get(&key) {
+                            let _ = manager.promote_to_dram_with_object(key, object_ref);
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn tiering-promoter thread");
+    }
+
+    #[cfg(feature = "tiering_decoupled")]
+    fn spawn_demoter(
+        manager: Arc<TieringManager<K, V>>,
+        demotion_rx: CrossbeamReceiver<Vec<HashedKey>>,
+    )
+    where
+        K: 'static + Eq + TypeSize + Clone + Send,
+        V: 'static + TypeSize + Clone + AsRef<[u8]> + Send,
+    {
+        thread::Builder::new()
+            .name("tiering-demoter".into())
+            .spawn(move || {
+                while let Ok(batch) = demotion_rx.recv() {
+                    for key in batch {
+                        #[cfg(feature = "sets_dram")]
+                        if manager.is_dram_only(key) {
+                            manager.force_sync_persist(key);
+                        }
+
+                        let _ = manager.demote_from_dram(key);
+                    }
+                }
+            })
+            .expect("failed to spawn tiering-demoter thread");
     }
 
     #[cfg(feature = "hashtable_tiering")]

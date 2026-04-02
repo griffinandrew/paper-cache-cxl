@@ -66,8 +66,8 @@ impl WorkerManager {
 		tiering_manager: &Arc<TieringManager<K, V>>,
 	) -> Result<Self, CacheError>
 	where
-		K: 'static + Eq + TypeSize + Clone,
-		V: 'static + TypeSize + Clone + AsRef<[u8]>,
+		K: 'static + Eq + TypeSize + Clone + Send,
+		V: 'static + TypeSize + Clone + AsRef<[u8]> + Send,
 	{
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();
@@ -110,12 +110,16 @@ impl WorkerManager {
 		tiering_manager: &Arc<TieringManager<K, V>>,
 	) -> Result<Self, CacheError>
 	where
-		K: 'static + Eq + TypeSize + Clone,
-		V: 'static + TypeSize + Clone + AsRef<[u8]>,
+		K: 'static + Eq + TypeSize + Clone + Send,
+		V: 'static + TypeSize + Clone + AsRef<[u8]> + Send,
 	{
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();
 		let (tiering_worker, tiering_listener) = unbounded();
+
+		#[cfg(feature = "tiering_decoupled")]
+		let (promotion_tx, demotion_tx) =
+			TieringManager::spawn_data_plane(tiering_manager.clone(), objects.clone());
 
 		register_worker(PolicyWorker::<K, V>::new(
 			policy_listener,
@@ -138,6 +142,10 @@ impl WorkerManager {
 			status.clone(),
 			overhead_manager.clone(),
 			tiering_manager.clone(),
+			#[cfg(feature = "tiering_decoupled")]
+			promotion_tx.clone(),
+			#[cfg(feature = "tiering_decoupled")]
+			demotion_tx.clone(),
 		));
 
 		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
