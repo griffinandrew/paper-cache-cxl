@@ -353,8 +353,8 @@ where
         objects: ObjectMapRef<K, V>,
     ) -> (CrossbeamSender<HashedKey>, CrossbeamSender<Vec<HashedKey>>)
     where
-        K: 'static + Eq + TypeSize + Clone + Send,
-        V: 'static + TypeSize + Clone + AsRef<[u8]> + Send,
+        K: 'static + Eq + TypeSize + Clone + Send + Sync,
+        V: 'static + TypeSize + Clone + AsRef<[u8]> + Send + Sync,
     {
         let (promotion_tx, promotion_rx) = crossbeam_bounded(PROMOTION_QUEUE_BOUND);
         let (demotion_tx, demotion_rx) = crossbeam_bounded(DEMOTION_QUEUE_BOUND);
@@ -372,8 +372,8 @@ where
         promotion_rx: CrossbeamReceiver<HashedKey>,
     )
     where
-        K: 'static + Eq + TypeSize + Clone + Send,
-        V: 'static + TypeSize + Clone + AsRef<[u8]> + Send,
+        K: 'static + Eq + TypeSize + Clone + Send + Sync,
+        V: 'static + TypeSize + Clone + AsRef<[u8]> + Send + Sync,
     {
         thread::Builder::new()
             .name("tiering-promoter".into())
@@ -403,8 +403,8 @@ where
         demotion_rx: CrossbeamReceiver<Vec<HashedKey>>,
     )
     where
-        K: 'static + Eq + TypeSize + Clone + Send,
-        V: 'static + TypeSize + Clone + AsRef<[u8]> + Send,
+        K: 'static + Eq + TypeSize + Clone + Send + Sync,
+        V: 'static + TypeSize + Clone + AsRef<[u8]> + Send + Sync,
     {
         thread::Builder::new()
             .name("tiering-demoter".into())
