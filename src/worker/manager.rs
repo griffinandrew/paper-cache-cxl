@@ -66,8 +66,8 @@ impl WorkerManager {
 		tiering_manager: &Arc<TieringManager<K, V>>,
 	) -> Result<Self, CacheError>
 	where
-		K: 'static + Eq + TypeSize + Clone + Send,
-		V: 'static + TypeSize + Clone + AsRef<[u8]> + Send,
+		K: 'static + Eq + TypeSize + Clone + Send + Sync,
+		V: 'static + TypeSize + Clone + AsRef<[u8]> + Send + Sync,
 	{
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();
@@ -110,8 +110,8 @@ impl WorkerManager {
 		tiering_manager: &Arc<TieringManager<K, V>>,
 	) -> Result<Self, CacheError>
 	where
-		K: 'static + Eq + TypeSize + Clone + Send,
-		V: 'static + TypeSize + Clone + AsRef<[u8]> + Send,
+		K: 'static + Eq + TypeSize + Clone + Send + Sync,
+		V: 'static + TypeSize + Clone + AsRef<[u8]> + Send + Sync,
 	{
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();
