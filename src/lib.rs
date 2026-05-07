@@ -652,7 +652,7 @@ where
 	{
 		self.objects
 			.get(&hashed_key)
-			.and_then(|object| (!object.is_expired()).then(|| object.key().clone()))
+			.and_then(|object| (!object.is_expired()).then(|| (&*object).key().clone()))
 	}
 
 	/// Gets (peeks) the value associated with the supplied key without altering
@@ -1295,7 +1295,7 @@ where
 	pub fn resolve_key(&self, hashed_key: crate::HashedKey) -> Option<K> {
 		self.objects
 			.get(&hashed_key)
-			.and_then(|object| (!object.is_expired()).then(|| object.key().clone()))
+			.and_then(|object| (!object.is_expired()).then(|| (&*object).key().clone()))
 	}
 
 	/// Gets (peeks) the value associated with the supplied key without altering
@@ -2175,7 +2175,7 @@ where
 	pub fn resolve_key(&self, hashed_key: crate::HashedKey) -> Option<K> {
 		self.objects
 			.get(&hashed_key)
-			.and_then(|object| (!object.is_expired()).then(|| object.key().clone()))
+			.and_then(|object| (!object.is_expired()).then(|| (&*object).key().clone()))
 	}
 
 	/// Gets (peeks) the value associated with the supplied key without altering
@@ -3237,11 +3237,16 @@ where
 			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
 				self.status.incr_hits();
 				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				let arc_val = dram_object_ref.data();
-				//println!("CACHE: get for key {:?} from DRAM tier", key);
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
-				return Ok(arc_val.as_ref().to_vec());
+				#[cfg(not(feature = "hashtable_tiering"))]
+				{
+					let arc_val = dram_object_ref.data();
+					return Ok(arc_val.as_ref().to_vec());
+				}
+
+				#[cfg(feature = "hashtable_tiering")]
+				{
+					return Ok(dram_object_ref.data_as_bytes());
+				}
 			}
 
 		}
