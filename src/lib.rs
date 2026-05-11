@@ -886,6 +886,35 @@ where
 	pub fn hotness_threshold(&self) -> u64 {
 		self.tiering_manager.hotness_threshold()
 	}
+
+	/// Returns the number of bytes physically stored in DRAM for the object at `key`,
+	/// or `None` if the object has not been promoted to DRAM.
+	/// For the `tiering` feature (non-hashtable) this equals the full object byte length
+	/// after promotion, proving a whole-object copy rather than a pointer was made.
+	#[cfg(all(feature = "key_pmem_value_pmem", feature = "enable_tiering_manager", not(feature = "hashtable_tiering")))]
+	pub fn dram_object_data_len(&self, key: &K) -> Option<usize> {
+		let hashed_key = self.hash_key(key);
+		self.tiering_manager.dram_object_data_len(&hashed_key)
+	}
+
+	/// Returns the number of bytes physically copied into DRAM for the object at `key`,
+	/// or `None` if the object is not in DRAM.
+	/// Warm-tier (CXL reference) entries return 0; hot-tier (physical copy) entries
+	/// return the full object byte length.
+	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", feature = "hashtable_tiering"))]
+	pub fn dram_object_data_len(&self, key: &K) -> Option<usize> {
+		let hashed_key = self.hash_key(key);
+		self.tiering_manager.dram_object_data_len(&hashed_key)
+	}
+
+	/// Returns `true` if the DRAM entry for `key` is a warm-tier CXL pointer (zero-copy),
+	/// `false` if it is a hot-tier physical copy, `None` if not in DRAM.
+	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", feature = "hashtable_tiering"))]
+	pub fn dram_object_is_warm_tier(&self, key: &K) -> Option<bool> {
+		let hashed_key = self.hash_key(key);
+		self.tiering_manager.dram_object_is_warm_tier(&hashed_key)
+	}
+
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
 		if let Err(err) = self.worker_manager.try_send(event) {
 			error!("Could not communicate with workers: {err:?}");
@@ -2413,6 +2442,35 @@ where
 	pub fn hotness_threshold(&self) -> u64 {
 		self.tiering_manager.hotness_threshold()
 	}
+
+	/// Returns the number of bytes physically stored in DRAM for the object at `key`,
+	/// or `None` if the object has not been promoted to DRAM.
+	/// For the `tiering` feature (non-hashtable) this equals the full object byte length
+	/// after promotion, proving a whole-object copy rather than a pointer was made.
+	#[cfg(all(feature = "key_pmem_value_pmem", feature = "enable_tiering_manager", not(feature = "hashtable_tiering")))]
+	pub fn dram_object_data_len(&self, key: &K) -> Option<usize> {
+		let hashed_key = self.hash_key(key);
+		self.tiering_manager.dram_object_data_len(&hashed_key)
+	}
+
+	/// Returns the number of bytes physically copied into DRAM for the object at `key`,
+	/// or `None` if the object is not in DRAM.
+	/// Warm-tier (CXL reference) entries return 0; hot-tier (physical copy) entries
+	/// return the full object byte length.
+	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", feature = "hashtable_tiering"))]
+	pub fn dram_object_data_len(&self, key: &K) -> Option<usize> {
+		let hashed_key = self.hash_key(key);
+		self.tiering_manager.dram_object_data_len(&hashed_key)
+	}
+
+	/// Returns `true` if the DRAM entry for `key` is a warm-tier CXL pointer (zero-copy),
+	/// `false` if it is a hot-tier physical copy, `None` if not in DRAM.
+	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", feature = "hashtable_tiering"))]
+	pub fn dram_object_is_warm_tier(&self, key: &K) -> Option<bool> {
+		let hashed_key = self.hash_key(key);
+		self.tiering_manager.dram_object_is_warm_tier(&hashed_key)
+	}
+
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
 		if let Err(err) = self.worker_manager.try_send(event) {
 			error!("Could not communicate with workers: {err:?}");

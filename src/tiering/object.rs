@@ -153,6 +153,11 @@ impl<K> TieringObject<K> {
         self.expiry
     }
 
+    /// Returns the number of bytes physically stored in DRAM for this object.
+    pub fn data_len(&self) -> usize {
+        self.data.len()
+    }
+
     /// Check if the key matches
     pub fn key_matches(&self, key: &K) -> bool
     where
@@ -219,6 +224,16 @@ impl<K, V> TieringObject<K, V> {
     /// Check if this object holds a CXL reference (warm tier) vs physical copy (hot tier)
     pub fn is_warm_tier(&self) -> bool {
         matches!(&self.data, TieringData::CxlReference(_))
+    }
+
+    /// Returns the number of bytes physically copied into DRAM.
+    /// For a warm-tier CXL reference this is 0 — the data stays in CXL memory.
+    /// For a hot-tier physical copy this equals the full object byte length.
+    pub fn physical_data_len(&self) -> usize {
+        match &self.data {
+            TieringData::PhysicalCopy(arc_data) => arc_data.len(),
+            TieringData::CxlReference(_) => 0,
+        }
     }
 
     /// Get the expiry time

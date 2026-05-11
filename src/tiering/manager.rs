@@ -1737,10 +1737,32 @@ where
             .map(|obj| Arc::new(obj.clone()))
     }
     
+    /// Returns the number of bytes physically stored in DRAM for the object at `key`.
+    /// For the basic tiering feature (non-hashtable) this is the full object byte length.
+    #[cfg(all(feature = "key_pmem_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
+    pub fn dram_object_data_len(&self, key: &HashedKey) -> Option<usize> {
+        self.get_from_dram(key).map(|obj| obj.data_len())
+    }
+
+    /// Returns the number of bytes physically copied into DRAM for `key`.
+    /// Warm-tier (CXL reference) objects return 0; hot-tier (physical copy) objects
+    /// return the full object byte length.
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), feature = "hashtable_tiering"))]
+    pub fn dram_object_data_len(&self, key: &HashedKey) -> Option<usize> {
+        self.get_from_dram(key).map(|obj| obj.physical_data_len())
+    }
+
+    /// Returns `true` if the DRAM entry for `key` is a warm-tier CXL pointer,
+    /// `false` if it is a hot-tier physical copy.
+    #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem"), feature = "hashtable_tiering"))]
+    pub fn dram_object_is_warm_tier(&self, key: &HashedKey) -> Option<bool> {
+        self.get_from_dram(key).map(|obj| obj.is_warm_tier())
+    }
+
     /// Updates the DRAM cache when an object is updated.
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
     #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem")))]
-    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
+    pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>)
     where
         V: AsRef<[u8]>,
     {

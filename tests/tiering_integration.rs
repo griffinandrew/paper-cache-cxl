@@ -503,6 +503,388 @@ mod multitiering_tests {
     }
 }
 
+/// Tests that verify the tiering feature physically copies entire objects into DRAM
+/// rather than just storing a pointer to PMEM data.
+///
+/// These tests check object length at the DRAM-cache level so that a pointer-only
+/// implementation (8 bytes) is clearly distinguishable from a full copy (N bytes).
+#[cfg(feature = "tiering")]
+mod tiering_copy_verification_tests {
+    use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
+    use std::thread;
+    use std::time::Duration;
+
+    fn make_cache() -> PaperCache<u32, BufferPMEM> {
+        PaperCache::<u32, BufferPMEM>::new(
+            10_000_000,
+            &[PaperPolicy::Lfu],
+            PaperPolicy::Lfu,
+        )
+        .expect("Failed to create cache")
+    }
+
+    fn wait_for(max_ms: u64, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_millis(max_ms);
+        while std::time::Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// The critical test: verifies the DRAM copy stores all N bytes of the object, not
+    /// just a pointer (which would be 8 bytes regardless of object size).
+    #[test]
+    fn test_dram_copy_has_full_object_length_not_pointer() {
+        let cache = make_cache();
+        cache.set_hotness_threshold(2);
+
+        const OBJ_LEN: usize = 512;
+        cache.set(1u32, &[0xABu8; OBJ_LEN], None).expect("set failed");
+        thread::sleep(Duration::from_millis(100));
+
+        for _ in 0..3 {
+            let _ = cache.get(&1u32);
+            thread::sleep(Duration::from_millis(30));
+        }
+
+        let promoted = wait_for(600, || cache.tiering_stats().dram_objects >= 1);
+        assert!(promoted, "object should have been promoted to DRAM");
+
+        let data_len = cache
+            .dram_object_data_len(&1u32)
+            .expect("DRAM object should exist after promotion");
+
+        assert_eq!(
+            data_len, OBJ_LEN,
+            "DRAM copy must hold the entire {} bytes — a pointer would only be ~8 bytes (got {})",
+            OBJ_LEN, data_len
+        );
+    }
+
+    /// Verifies that `dram_size` in tiering stats accounts for the real object payload
+    /// (not just a pointer) and that `dram_object_data_len` returns exactly the value
+    /// byte count.
+    ///
+    /// Note: `dram_size` includes key and metadata overhead on top of the raw value bytes,
+    /// so it will be >= `OBJ_LEN`.  The `dram_object_data_len` method returns only the
+    /// value bytes, which is the direct proof that the full payload was copied.
+    #[test]
+    fn test_dram_size_stat_includes_value_bytes_and_object_data_len_matches_exactly() {
+        let cache = make_cache();
+        cache.set_hotness_threshold(2);
+
+        const OBJ_LEN: usize = 256;
+        cache.set(2u32, &[0xFFu8; OBJ_LEN], None).expect("set failed");
+        thread::sleep(Duration::from_millis(100));
+
+        for _ in 0..3 {
+            let _ = cache.get(&2u32);
+            thread::sleep(Duration::from_millis(30));
+        }
+
+        let promoted = wait_for(600, || cache.tiering_stats().dram_objects >= 1);
+        assert!(promoted, "object should have been promoted");
+
+        let stats = cache.tiering_stats();
+        // dram_size includes key/metadata overhead so it is >= OBJ_LEN
+        assert!(
+            stats.dram_size >= OBJ_LEN as u64,
+            "dram_size ({}) must be at least the value byte length ({}) — \
+             a pointer-only copy would report ~8 bytes",
+            stats.dram_size, OBJ_LEN
+        );
+
+        // dram_object_data_len returns exactly the value bytes in the DRAM copy
+        let dram_len = cache
+            .dram_object_data_len(&2u32)
+            .expect("DRAM object should exist after promotion");
+        assert_eq!(
+            dram_len, OBJ_LEN,
+            "dram_object_data_len must be exactly {} bytes (the full value copy), got {}",
+            OBJ_LEN, dram_len
+        );
+    }
+
+    /// Verifies every byte of the DRAM copy is correct — a pointer-only implementation
+    /// would have the wrong length, and a partial copy would fail the content check.
+    #[test]
+    fn test_dram_copy_all_bytes_intact_not_just_first() {
+        let cache = make_cache();
+        cache.set_hotness_threshold(2);
+
+        let original: Vec<u8> = (0u8..=255).cycle().take(300).collect();
+        cache.set(3u32, &original, None).expect("set failed");
+        thread::sleep(Duration::from_millis(100));
+
+        for _ in 0..3 {
+            let _ = cache.get(&3u32);
+            thread::sleep(Duration::from_millis(30));
+        }
+
+        let promoted = wait_for(600, || cache.tiering_stats().dram_objects >= 1);
+        assert!(promoted, "object should have been promoted to DRAM");
+
+        let result = cache.get(&3u32).expect("get after promotion failed");
+        assert_eq!(result.len(), original.len(), "returned data length mismatch");
+        assert_eq!(
+            result, original,
+            "every byte must match — a pointer or partial copy would fail here"
+        );
+
+        let dram_len = cache
+            .dram_object_data_len(&3u32)
+            .expect("DRAM object should exist");
+        assert_eq!(
+            dram_len,
+            original.len(),
+            "DRAM cache entry byte count must match original length"
+        );
+    }
+
+    /// Verifies that each of several objects of different sizes is fully copied
+    /// into DRAM — not just a uniform pointer size.
+    #[test]
+    fn test_multiple_objects_each_fully_copied_to_dram() {
+        let cache = make_cache();
+        cache.set_hotness_threshold(2);
+
+        let sizes: &[usize] = &[100, 200, 400, 800];
+        for (i, &sz) in sizes.iter().enumerate() {
+            cache
+                .set(i as u32, &vec![i as u8; sz], None)
+                .expect("set failed");
+        }
+        thread::sleep(Duration::from_millis(100));
+
+        for _ in 0..3 {
+            for i in 0..sizes.len() {
+                let _ = cache.get(&(i as u32));
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+
+        let promoted = wait_for(800, || {
+            cache.tiering_stats().dram_objects >= sizes.len() as u64
+        });
+        assert!(promoted, "all objects should be promoted to DRAM");
+
+        for (i, &expected_len) in sizes.iter().enumerate() {
+            let dram_len = cache
+                .dram_object_data_len(&(i as u32))
+                .expect("each promoted object must be in DRAM");
+            assert_eq!(
+                dram_len, expected_len,
+                "object {} DRAM copy must be {} bytes, got {}",
+                i, expected_len, dram_len
+            );
+        }
+    }
+}
+
+/// Tests that verify the multitiering feature correctly handles both warm-tier (pointer-only)
+/// and hot-tier (full physical copy) promotions, checking byte lengths at each stage.
+///
+/// Key invariants:
+///   • Warm tier: physical DRAM bytes == 0 (data stays in CXL, only a pointer lives in DRAM)
+///   • Hot tier:  physical DRAM bytes == object byte length (full copy in DRAM)
+#[cfg(feature = "multitiering")]
+mod multitiering_copy_verification_tests {
+    use paper_cache::{PaperCache, PaperPolicy, BufferPMEM};
+    use std::thread;
+    use std::time::Duration;
+
+    fn make_cache() -> PaperCache<u32, BufferPMEM> {
+        PaperCache::<u32, BufferPMEM>::new(
+            10_000_000,
+            &[PaperPolicy::Lfu],
+            PaperPolicy::Lfu,
+        )
+        .expect("Failed to create cache")
+    }
+
+    fn wait_for(max_ms: u64, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_millis(max_ms);
+        while std::time::Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// Warm tier must store ONLY a pointer to CXL data — zero physical bytes in DRAM.
+    /// If this returns non-zero, data is being unnecessarily duplicated at warm-tier
+    /// promotion time.
+    #[test]
+    fn test_warm_tier_is_pointer_only_zero_physical_bytes() {
+        let cache = make_cache();
+        // Default: warm_threshold=2, hot_threshold=5
+
+        const OBJ_LEN: usize = 400;
+        cache.set(10u32, &[0xBBu8; OBJ_LEN], None).expect("set failed");
+        thread::sleep(Duration::from_millis(100));
+
+        // Exactly 2 accesses to reach warm threshold but stay below hot threshold
+        cache.get(&10u32).expect("get failed");
+        thread::sleep(Duration::from_millis(50));
+        cache.get(&10u32).expect("get failed");
+        thread::sleep(Duration::from_millis(200));
+
+        let promoted = wait_for(600, || cache.tiering_stats().dram_objects >= 1);
+        assert!(promoted, "object should be in warm tier after 2 accesses");
+
+        let phys_len = cache
+            .dram_object_data_len(&10u32)
+            .expect("warm-tier object should appear in DRAM cache");
+        assert_eq!(
+            phys_len, 0,
+            "warm tier stores only a CXL pointer — physical DRAM bytes must be 0, got {} \
+             (object is {} bytes; if this equals object size, the whole object is being \
+             copied instead of just a pointer)",
+            phys_len, OBJ_LEN
+        );
+
+        // Even with zero DRAM bytes the data must be fully readable via the CXL pointer
+        let result = cache.get(&10u32).expect("warm-tier read failed");
+        assert_eq!(result.len(), OBJ_LEN, "warm tier data length must match original");
+        assert!(
+            result.iter().all(|&b| b == 0xBBu8),
+            "warm tier data bytes must be correct"
+        );
+    }
+
+    /// Hot tier must store a FULL physical copy (N bytes in DRAM), not just a pointer.
+    #[test]
+    fn test_hot_tier_has_full_object_copy_not_just_pointer() {
+        let cache = make_cache();
+
+        const OBJ_LEN: usize = 512;
+        cache.set(20u32, &[0xCCu8; OBJ_LEN], None).expect("set failed");
+        thread::sleep(Duration::from_millis(100));
+
+        // Access past hot_threshold (5) to reach hot tier
+        for _ in 0..6 {
+            let _ = cache.get(&20u32);
+            thread::sleep(Duration::from_millis(40));
+        }
+
+        let hot = wait_for(900, || {
+            let s = cache.tiering_stats();
+            s.promotions >= 2 && s.dram_size > 0
+        });
+        assert!(hot, "object should be in hot tier (physical copy in DRAM)");
+
+        let phys_len = cache
+            .dram_object_data_len(&20u32)
+            .expect("hot-tier object must be in DRAM cache");
+        assert_eq!(
+            phys_len, OBJ_LEN,
+            "hot tier must contain the full {} byte object in DRAM — \
+             a pointer-only copy would report ~8 bytes (got {})",
+            OBJ_LEN, phys_len
+        );
+
+        let is_warm = cache
+            .dram_object_is_warm_tier(&20u32)
+            .expect("hot-tier object should be in DRAM cache");
+        assert!(!is_warm, "hot-tier object must not report as warm tier");
+    }
+
+    /// Tracks the physical-byte-count transition: 0 at warm tier, N at hot tier.
+    /// This directly demonstrates that warm tier moves only a pointer while hot tier
+    /// moves the whole object.
+    #[test]
+    fn test_warm_then_hot_physical_size_transitions() {
+        let cache = make_cache();
+
+        const OBJ_LEN: usize = 300;
+        cache.set(30u32, &[0xDDu8; OBJ_LEN], None).expect("set failed");
+        thread::sleep(Duration::from_millis(100));
+
+        // Warm tier: 2 accesses
+        cache.get(&30u32).expect("get failed");
+        thread::sleep(Duration::from_millis(50));
+        cache.get(&30u32).expect("get failed");
+        thread::sleep(Duration::from_millis(200));
+
+        let warm = wait_for(600, || cache.tiering_stats().dram_objects >= 1);
+        assert!(warm, "should reach warm tier");
+
+        let warm_len = cache
+            .dram_object_data_len(&30u32)
+            .expect("warm-tier object in DRAM");
+        assert_eq!(
+            warm_len, 0,
+            "warm tier must have 0 physical DRAM bytes (only a pointer), got {}",
+            warm_len
+        );
+
+        let is_warm = cache
+            .dram_object_is_warm_tier(&30u32)
+            .expect("object should be in DRAM");
+        assert!(is_warm, "after warm promotion, is_warm_tier must be true");
+
+        // Hot tier: 3 more accesses (5 total)
+        for _ in 0..4 {
+            let _ = cache.get(&30u32);
+            thread::sleep(Duration::from_millis(40));
+        }
+
+        let hot = wait_for(900, || {
+            cache.tiering_stats().dram_size >= OBJ_LEN as u64
+        });
+        assert!(
+            hot,
+            "should reach hot tier with {} bytes in DRAM",
+            OBJ_LEN
+        );
+
+        let hot_len = cache
+            .dram_object_data_len(&30u32)
+            .expect("hot-tier object in DRAM");
+        assert_eq!(
+            hot_len, OBJ_LEN,
+            "after hot promotion physical DRAM bytes must be {} (was 0 in warm tier), got {}",
+            OBJ_LEN, hot_len
+        );
+
+        let is_warm_after = cache
+            .dram_object_is_warm_tier(&30u32)
+            .expect("object should still be in DRAM");
+        assert!(!is_warm_after, "after hot promotion, is_warm_tier must be false");
+    }
+
+    /// Verifies that every byte of a hot-tier DRAM copy is correct — not just the
+    /// length — ruling out partial or zeroed copies.
+    #[test]
+    fn test_hot_tier_all_bytes_correct_not_just_length() {
+        let cache = make_cache();
+
+        let original: Vec<u8> = (0u8..=255).cycle().take(500).collect();
+        cache.set(40u32, &original, None).expect("set failed");
+        thread::sleep(Duration::from_millis(100));
+
+        for _ in 0..7 {
+            let _ = cache.get(&40u32);
+            thread::sleep(Duration::from_millis(30));
+        }
+
+        let hot = wait_for(900, || cache.tiering_stats().dram_size > 0);
+        assert!(hot, "object should be in hot tier");
+
+        let result = cache.get(&40u32).expect("hot-tier read failed");
+        assert_eq!(result.len(), original.len(), "data length must be preserved");
+        assert_eq!(
+            result, original,
+            "every byte must match the original — a pointer or partial copy would fail here"
+        );
+    }
+}
+
 #[cfg(feature = "hybridcache")]
 mod hybridcache_promotion_tests {
     use paper_cache::hybridcache::{CacheTierSize, HybridCacheConfig, S3FifoHybridCache};
