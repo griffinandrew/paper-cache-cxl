@@ -149,5 +149,5 @@ paper-cache = { features = ["global_hashtable_pmem", "key_value_pmem"] }
 ### Required Base Features
 
 These feature flags work in conjunction with:
-- `key_value_pmem`: Place key and value data in PMEM
-
+- `key_value_pmem`: Store value bytes in PMEM (keys remain in DRAM)
+- `key_pmem_value_pmem`: Store both key and value bytes in PMEM (implies `key_value_pmem`)

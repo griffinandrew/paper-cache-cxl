@@ -33,7 +33,8 @@ perf-event = { version = "0.4.8", optional = true }
 
 
 [features]
-# Core feature to enable key and value storage in PMEM
+# Core PMEM feature: allocate value bytes in PMEM (Hybrid allocator).
+# Keys remain in DRAM unless `key_pmem_value_pmem` is also enabled.
 key_value_pmem = []
 
 # Extended PMEM feature: places BOTH key bytes AND value bytes each in their own
@@ -132,4 +133,3 @@ original = []
 [build-dependencies]
 cc = "1.2.39"
 bindgen = "0.72.1"
-
