@@ -132,6 +132,8 @@ int check_tier(void *ptr) {
 
 //working NUMA verison for only using pmem
 
+
+/*
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -258,7 +260,7 @@ int umf_allocator_init(int numa_node) {
 
     pthread_mutex_unlock(&pool_lock);
 
-    /* Do NOT register umf_allocator_finalize via atexit.
+    // Do NOT register umf_allocator_finalize via atexit.
      *
      * Under large cache loads, background PolicyWorker and reinsertion threads
      * continue to alloc/dealloc PMEM buffers via HybridObjects after main()
@@ -271,7 +273,7 @@ int umf_allocator_init(int numa_node) {
      * when the process exits, so explicit pool teardown is unnecessary.
      * Call umf_allocator_finalize() explicitly before exit if deterministic
      * cleanup is required in a controlled shutdown path.
-     */
+     //
     return 0;
 }
 
@@ -283,10 +285,11 @@ void *umf_alloc(size_t size, size_t align) {
 
     pthread_mutex_lock(&pool_lock);
 
-    /* Guard against explicit umf_allocator_finalize() calls from a controlled
+    // Guard against explicit umf_allocator_finalize() calls from a controlled
      * shutdown path: if the pool has already been destroyed, return NULL rather
      * than passing a NULL pool handle to umfPoolMalloc (which would trigger a
-     * [FATAL UMF] assertion). */
+     * [FATAL UMF] assertion).
+     //
     if (!pool) {
         pthread_mutex_unlock(&pool_lock);
         return NULL;
@@ -310,11 +313,11 @@ void umf_dealloc(void *ptr) {
 
     pthread_mutex_lock(&pool_lock);
 
-    /* Guard against explicit umf_allocator_finalize() calls from a controlled
+      // Guard against explicit umf_allocator_finalize() calls from a controlled
      * shutdown path: if the pool has already been destroyed, skip the free
      * rather than passing a NULL pool handle to umfPoolFree (which would
      * trigger a [FATAL UMF] assertion).  The memory was already released by
-     * umfPoolDestroy when finalize was called. */
+     * umfPoolDestroy when finalize was called. 
     if (pool) {
         umfPoolFree(pool, ptr);
     }
@@ -340,6 +343,251 @@ int check_tier(void *ptr) {
 
 
 //end solo numa node allocation for pmem
+
+
+*/
+
+
+
+
+// working NUMA version for only using pmem
+
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdatomic.h>
+#include <pthread.h>
+
+#include <umf/providers/provider_os_memory.h>
+#include <umf/pools/pool_jemalloc.h>
+#include <umf/memory_pool.h>
+#include <umf/memory_provider.h>
+
+/* Hot-path handle: read lock-free from umf_alloc / umf_dealloc / check_tier.
+ * Written only under lifecycle_lock during init / finalize, using release
+ * semantics so the pool is fully constructed before any thread observes it. */
+static _Atomic(umf_memory_pool_handle_t) pool = NULL;
+
+/* Lifecycle-only state: touched solely during init / finalize. */
+static umf_memory_provider_handle_t provider = NULL;
+static umf_os_memory_provider_params_handle_t os_params = NULL;
+
+/* Serializes init / finalize against each other. Does NOT guard the hot path;
+ * jemalloc is already thread-safe and has its own per-arena locks. */
+static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
+
+
+void umf_allocator_finalize(void) {
+    pthread_mutex_lock(&lifecycle_lock);
+
+    /* Publish NULL with release semantics. Any allocator threads still running
+     * at this point are a programmer error: finalize must only be called from
+     * a controlled shutdown path where no allocations are in flight. */
+    umf_memory_pool_handle_t p = atomic_exchange_explicit(
+        &pool, NULL, memory_order_acq_rel);
+
+    if (p) {
+        umfPoolDestroy(p);
+    }
+
+    if (provider) {
+        umfMemoryProviderDestroy(provider);
+        provider = NULL;
+    }
+
+    if (os_params) {
+        umfOsMemoryProviderParamsDestroy(os_params);
+        os_params = NULL;
+    }
+
+    pthread_mutex_unlock(&lifecycle_lock);
+}
+
+
+// numa_node = NUMA node id (check with numactl -H)
+int umf_allocator_init(int numa_node) {
+    umf_jemalloc_pool_params_handle_t jemalloc_params = NULL;
+    umf_memory_pool_handle_t new_pool = NULL;
+    umf_result_t res;
+
+    pthread_mutex_lock(&lifecycle_lock);
+
+    if (atomic_load_explicit(&pool, memory_order_acquire) != NULL) {
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 0;
+    }
+
+    // Create OS provider params
+    res = umfOsMemoryProviderParamsCreate(&os_params);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create OS params: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 1;
+    }
+
+    // Set NUMA node list
+    unsigned numa_list[] = { (unsigned)numa_node };
+
+    res = umfOsMemoryProviderParamsSetNumaList(os_params, numa_list, 1);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to set NUMA list: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 2;
+    }
+
+    // Bind strictly to that NUMA node
+    res = umfOsMemoryProviderParamsSetNumaMode(os_params, UMF_NUMA_MODE_BIND);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to set NUMA mode: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 3;
+    }
+
+    // Create provider
+    res = umfMemoryProviderCreate(
+            umfOsMemoryProviderOps(),
+            os_params,
+            &provider);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create OS provider: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 4;
+    }
+
+    // Create jemalloc pool params
+    res = umfJemallocPoolParamsCreate(&jemalloc_params);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create jemalloc params: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 5;
+    }
+
+    // Create pool into a local first; only publish once fully constructed
+    res = umfPoolCreate(
+            umfJemallocPoolOps(),
+            provider,
+            jemalloc_params,
+            0,
+            &new_pool);
+
+    umfJemallocPoolParamsDestroy(jemalloc_params);
+
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create pool: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 6;
+    }
+
+    /* Release-store publishes the fully-initialized pool. Any thread that
+     * later observes a non-NULL pool via acquire-load is guaranteed to see
+     * a consistent pool object. */
+    atomic_store_explicit(&pool, new_pool, memory_order_release);
+
+    pthread_mutex_unlock(&lifecycle_lock);
+
+    /* Do NOT register umf_allocator_finalize via atexit.
+     *
+     * Under large cache loads, background PolicyWorker and reinsertion threads
+     * continue to alloc/dealloc PMEM buffers via HybridObjects after main()
+     * returns.  An atexit handler would destroy the UMF pool while those
+     * threads are still active, causing [FATAL UMF] assertion failures and
+     * "memory allocation of N bytes failed" panics in Rust.
+     *
+     * The OS reclaims all virtual memory (including UMF-managed PMEM pages)
+     * when the process exits, so explicit pool teardown is unnecessary.
+     * Call umf_allocator_finalize() explicitly before exit if deterministic
+     * cleanup is required in a controlled shutdown path where no allocator
+     * threads are still running.
+     */
+    return 0;
+}
+
+
+void *umf_alloc(size_t size, size_t align) {
+    if (size == 0)
+        return NULL;
+
+    /* Lock-free fast path. jemalloc handles its own thread safety via
+     * per-arena locks and thread caches; wrapping every alloc in a global
+     * mutex would serialize the entire process and destroy scalability. */
+    umf_memory_pool_handle_t p = atomic_load_explicit(&pool, memory_order_acquire);
+    if (!p)
+        return NULL;
+
+    if (align && align > sizeof(void*)) {
+        return umfPoolAlignedMalloc(p, size, align);
+    }
+    return umfPoolMalloc(p, size);
+}
+
+
+void umf_dealloc(void *ptr) {
+    if (!ptr)
+        return;
+
+    umf_memory_pool_handle_t p = atomic_load_explicit(&pool, memory_order_acquire);
+    if (!p)
+        return;  /* pool already destroyed; OS will reclaim on exit */
+
+    umfPoolFree(p, ptr);
+}
+
+
+int check_tier(void *ptr) {
+    umf_memory_pool_handle_t curr_pool;
+    umf_memory_pool_handle_t our_pool =
+        atomic_load_explicit(&pool, memory_order_acquire);
+
+    if (umfPoolByPtr(ptr, &curr_pool) == UMF_RESULT_SUCCESS) {
+        if (curr_pool == our_pool) {
+            return 1; // pmem
+        }
+        return 0;     // some other UMF pool (treat as not-ours)
+    }
+    return 0;         // not from any UMF pool → dram
+}
+
+// end solo numa node allocation for pmem
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
