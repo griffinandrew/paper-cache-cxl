@@ -360,7 +360,8 @@ int check_tier(void *ptr) {
 #include <pthread.h>
 
 #include <umf/providers/provider_os_memory.h>
-#include <umf/pools/pool_jemalloc.h>
+//#include <umf/pools/pool_jemalloc.h>
+#include <umf/pools/pool_scalable.h>
 #include <umf/memory_pool.h>
 #include <umf/memory_provider.h>
 
@@ -404,7 +405,7 @@ void umf_allocator_finalize(void) {
     pthread_mutex_unlock(&lifecycle_lock);
 }
 
-
+/*
 // numa_node = NUMA node id (check with numactl -H)
 int umf_allocator_init(int numa_node) {
     umf_jemalloc_pool_params_handle_t jemalloc_params = NULL;
@@ -482,6 +483,97 @@ int umf_allocator_init(int numa_node) {
     /* Release-store publishes the fully-initialized pool. Any thread that
      * later observes a non-NULL pool via acquire-load is guaranteed to see
      * a consistent pool object. */
+    //atomic_store_explicit(&pool, new_pool, memory_order_release);
+
+    //pthread_mutex_unlock(&lifecycle_lock);
+
+    /* Do NOT register umf_allocator_finalize via atexit.
+     *
+     * Under large cache loads, background PolicyWorker and reinsertion threads
+     * continue to alloc/dealloc PMEM buffers via HybridObjects after main()
+     * returns.  An atexit handler would destroy the UMF pool while those
+     * threads are still active, causing [FATAL UMF] assertion failures and
+     * "memory allocation of N bytes failed" panics in Rust.
+     *
+     * The OS reclaims all virtual memory (including UMF-managed PMEM pages)
+     * when the process exits, so explicit pool teardown is unnecessary.
+     * Call umf_allocator_finalize() explicitly before exit if deterministic
+     * cleanup is required in a controlled shutdown path where no allocator
+     * threads are still running.
+     */
+    //return 0;
+//}
+
+
+
+
+// numa_node = NUMA node id (check with numactl -H)
+int umf_allocator_init(int numa_node) {
+    umf_memory_pool_handle_t new_pool = NULL;
+    umf_result_t res;
+
+    pthread_mutex_lock(&lifecycle_lock);
+
+    if (atomic_load_explicit(&pool, memory_order_acquire) != NULL) {
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 0;
+    }
+
+    // Create OS provider params
+    res = umfOsMemoryProviderParamsCreate(&os_params);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create OS params: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 1;
+    }
+
+    // Set NUMA node list
+    unsigned numa_list[] = { (unsigned)numa_node };
+
+    res = umfOsMemoryProviderParamsSetNumaList(os_params, numa_list, 1);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to set NUMA list: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 2;
+    }
+
+    // Bind strictly to that NUMA node
+    res = umfOsMemoryProviderParamsSetNumaMode(os_params, UMF_NUMA_MODE_BIND);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to set NUMA mode: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 3;
+    }
+
+    // Create provider
+    res = umfMemoryProviderCreate(
+            umfOsMemoryProviderOps(),
+            os_params,
+            &provider);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create OS provider: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 4;
+    }
+
+    // Create pool into a local first; only publish once fully constructed.
+    // Scalable pool takes no params, so pass NULL.
+    res = umfPoolCreate(
+            umfScalablePoolOps(),
+            provider,
+            NULL,
+            0,
+            &new_pool);
+
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create pool: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 6;
+    }
+
+    /* Release-store publishes the fully-initialized pool. Any thread that
+     * later observes a non-NULL pool via acquire-load is guaranteed to see
+     * a consistent pool object. */
     atomic_store_explicit(&pool, new_pool, memory_order_release);
 
     pthread_mutex_unlock(&lifecycle_lock);
@@ -502,6 +594,7 @@ int umf_allocator_init(int numa_node) {
      */
     return 0;
 }
+
 
 
 void *umf_alloc(size_t size, size_t align) {
