@@ -20,9 +20,10 @@
 // allocations are never accidentally routed to UMF.
 
 use core::alloc::{GlobalAlloc, Layout};
-use std::sync::{Once, atomic::{AtomicU64, AtomicUsize, Ordering}};
+use std::sync::{Once, atomic::{AtomicUsize, Ordering}};
+#[cfg(feature = "pmem_region_alloc")]
+use std::sync::atomic::AtomicU64;
 use std::ptr;
-use tikv_jemallocator::Jemalloc;
 use std::alloc::{Allocator, AllocError};
 use std::ptr::NonNull;
 
@@ -269,15 +270,17 @@ impl RegionHybrid {
         let maxnode = bits as libc::c_ulong;
 
         #[allow(clippy::cast_possible_wrap)]
-        let rc = libc::syscall(
-            libc::SYS_mbind as libc::c_long,
-            addr,
-            size,
-            MPOL_BIND,
-            &nodemask as *const libc::c_ulong,
-            maxnode,
-            0usize,
-        );
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_mbind as libc::c_long,
+                addr,
+                size,
+                MPOL_BIND,
+                &nodemask as *const libc::c_ulong,
+                maxnode,
+                0usize,
+            )
+        };
 
         #[cfg(debug_assertions)]
         if rc != 0 {
