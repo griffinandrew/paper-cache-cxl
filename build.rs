@@ -80,7 +80,10 @@ fn main() {
         println!("cargo:rerun-if-changed=umf_allocator/jemalloc_extent_hooks.c");
 
         // jemalloc + libnuma. No UMF, no TBB.
-        println!("cargo:rustc-link-lib=dylib=jemalloc");
+        //println!("cargo:rustc-link-lib=dylib=jemalloc");
+        //println!("cargo:rustc-link-lib=dylib=numa");
+
+        println!("cargo:rustc-link-arg=/usr/lib64/libjemalloc.so.2");
         println!("cargo:rustc-link-lib=dylib=numa");
 
         cc::Build::new()
