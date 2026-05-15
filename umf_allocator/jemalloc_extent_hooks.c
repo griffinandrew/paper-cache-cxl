@@ -22,10 +22,12 @@
  * malloc rather than replacing it), uncomment. Check with:
  *   nm -D /usr/lib64/libjemalloc.so.2 | grep -E 'mallctl|mallocx' | head
  *
- * #define mallctl  je_mallctl
- * #define mallocx  je_mallocx
- * #define dallocx  je_dallocx
  */
+
+#define mallctl  je_mallctl
+#define mallocx  je_mallocx
+#define dallocx  je_dallocx
+
 
 /* ------------------------------------------------------------------ */
 /* State                                                               */
