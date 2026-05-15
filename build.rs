@@ -74,9 +74,9 @@ fn main() {
     ];
     let wrapper_path = candidates.iter().find(|p| Path::new(p).exists());
 
-    if Path::new(wrapper_path).exists() {
-        println!("Compiling UMF allocator wrapper with real UMF support");
-        println!("cargo:rerun-if-changed=wrapper.h");
+    if let Some(path) = wrapper_path {
+        println!("cargo:warning=Building real allocator with wrapper at {}", path);
+        println!("cargo:rerun-if-changed={}", path);
         println!("cargo:rerun-if-changed=umf_allocator/jemalloc_extent_hooks.c");
 
         // jemalloc + libnuma. No UMF, no TBB.
@@ -89,7 +89,10 @@ fn main() {
             .flag("-D_GNU_SOURCE")
             .compile("umf_allocator_wrapper");
     } else {
-        println!("cargo:warning=wrapper.h not found; compiling stub allocator for testing");
+        println!("cargo:warning=No wrapper.h found at any candidate path; compiling stub");
+        for p in &candidates {
+            println!("cargo:warning=  checked: {}", p);
+        }
 
         cc::Build::new()
             .file("umf_allocator/umf_stub.c")
