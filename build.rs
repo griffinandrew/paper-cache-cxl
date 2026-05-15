@@ -1,3 +1,6 @@
+
+/* 
+
 extern crate bindgen;
 
 use std::path::{Path, PathBuf};
@@ -46,3 +49,53 @@ fn main() {
         }
     }
 }
+
+
+
+*/
+
+
+
+
+
+extern crate bindgen;
+
+use std::path::{Path, PathBuf};
+
+fn main() {
+    //let wrapper_path = "/home/griff/work/wrapper.h";
+    let wrapper_path = "/home/griffin/cxl_baseline/paper-cache-cxl/wrapper.h";
+
+    if Path::new(wrapper_path).exists() {
+        println!("Compiling UMF allocator wrapper with real UMF support");
+        println!("cargo:rerun-if-changed=wrapper.h");
+        println!("cargo:rerun-if-changed=umf_allocator/jemalloc_extent_hooks.c");
+
+        // jemalloc + libnuma. No UMF, no TBB.
+        println!("cargo:rustc-link-lib=dylib=jemalloc");
+        println!("cargo:rustc-link-lib=dylib=numa");
+
+        cc::Build::new()
+            .file("umf_allocator/jemalloc_extent_hooks.c")
+            .include("umf_allocator")
+            .flag("-D_GNU_SOURCE")
+            .compile("umf_allocator_wrapper");
+    } else {
+        println!("cargo:warning=wrapper.h not found; compiling stub allocator for testing");
+
+        cc::Build::new()
+            .file("umf_allocator/umf_stub.c")
+            .include("umf_allocator")
+            .compile("umf_allocator_stub");
+
+        let umf_bindings_path = PathBuf::from("src/umf_bindings.rs");
+        if !umf_bindings_path.exists() {
+            std::fs::write(&umf_bindings_path, "// Stub UMF bindings\n")
+                .expect("Could not write stub umf_bindings.rs");
+        }
+    }
+}
+
+
+
+
