@@ -24,10 +24,11 @@
  *
  */
 
+#ifdef JEMALLOC_USE_PREFIX
 #define mallctl  je_mallctl
 #define mallocx  je_mallocx
 #define dallocx  je_dallocx
-
+#endif
 
 /* ------------------------------------------------------------------ */
 /* State                                                               */

@@ -54,19 +54,12 @@ fn main() {
 
 */
 
-
-
-
-
 extern crate bindgen;
 
 use std::path::{Path, PathBuf};
 
 fn main() {
-    //let wrapper_path = "/home/griff/work/wrapper.h";
-    //let wrapper_path = "/home/griffin/cxl_baseline/paper-cache-cxl/wrapper.h";
-
-    // Detect the wrapper header in either canonical location.
+    // Detect the wrapper header in any of the canonical locations.
     let candidates = [
         "/home/griff/work/wrapper.h",
         "/home/griffin/cxl_baseline/paper-cache-cxl/wrapper.h",
@@ -79,18 +72,42 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path);
         println!("cargo:rerun-if-changed=umf_allocator/jemalloc_extent_hooks.c");
 
-        // jemalloc + libnuma. No UMF, no TBB.
-        //println!("cargo:rustc-link-lib=dylib=jemalloc");
-        //println!("cargo:rustc-link-lib=dylib=numa");
+        // Find the system libjemalloc. Both common locations are tried.
+        let jemalloc_candidates = [
+            "/usr/lib64/libjemalloc.so.2",
+            "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
+        ];
+        let jemalloc_path = jemalloc_candidates
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .expect("libjemalloc.so.2 not found in /usr/lib64 or /usr/lib/x86_64-linux-gnu — install jemalloc-devel (Fedora) or libjemalloc-dev (Debian/Ubuntu)");
 
-        println!("cargo:rustc-link-arg=/usr/lib64/libjemalloc.so.2");
+        println!("cargo:warning=Using jemalloc at {}", jemalloc_path);
+
+        // Detect whether the installed libjemalloc uses je_-prefixed symbols.
+        // Fedora: unprefixed (mallctl).  Some Debian builds: prefixed (je_mallctl).
+        // We compile the C file with -DJEMALLOC_USE_PREFIX accordingly so it
+        // can route its calls through je_mallctl / je_mallocx / je_dallocx
+        // when the library expects that.
+        let jemalloc_uses_prefix = detect_jemalloc_prefix(jemalloc_path);
+        println!("cargo:warning=jemalloc je_ prefix: {}", jemalloc_uses_prefix);
+
+        // Link the system jemalloc by absolute path. Using a path instead of
+        // -ljemalloc avoids any chance of the linker resolving to tikv-jemalloc-sys's
+        // build directory (which gets added via -L by tikv-jemallocator).
+        println!("cargo:rustc-link-arg={}", jemalloc_path);
         println!("cargo:rustc-link-lib=dylib=numa");
 
-        cc::Build::new()
+        let mut build = cc::Build::new();
+        build
             .file("umf_allocator/jemalloc_extent_hooks.c")
-            .include("umf_allocator")
-            .flag("-D_GNU_SOURCE")
-            .compile("umf_allocator_wrapper");
+            .include("umf_allocator");
+
+        if jemalloc_uses_prefix {
+            build.define("JEMALLOC_USE_PREFIX", None);
+        }
+
+        build.compile("umf_allocator_wrapper");
     } else {
         println!("cargo:warning=No wrapper.h found at any candidate path; compiling stub");
         for p in &candidates {
@@ -110,6 +127,40 @@ fn main() {
     }
 }
 
+/// Returns true if libjemalloc at `path` exports `je_mallctl` instead of
+/// the unprefixed `mallctl`. Falls back to false (assume unprefixed) on any error.
+fn detect_jemalloc_prefix(path: &str) -> bool {
+    let output = match std::process::Command::new("nm").args(["-D", path]).output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
 
+    let symbols = String::from_utf8_lossy(&output.stdout);
+    let mut has_unprefixed = false;
+    let mut has_prefixed = false;
 
+    for line in symbols.lines() {
+        // nm -D output format: "<addr> <type> <name>"; we want text symbols ('T').
+        // We match "mallctl" / "je_mallctl" exactly to avoid partial matches like
+        // "mallctlbymib" or "mallctlnametomib".
+        if let Some(name) = line.split_whitespace().nth(2) {
+            if !line.contains(" T ") && !line.contains(" W ") {
+                continue;
+            }
+            if name == "mallctl" {
+                has_unprefixed = true;
+            } else if name == "je_mallctl" {
+                has_prefixed = true;
+            }
+        }
+    }
+
+    // Prefer unprefixed when both exist (some builds export both, but the
+    // C file's default is to call unprefixed names from jemalloc.h).
+    if has_unprefixed {
+        false
+    } else {
+        has_prefixed
+    }
+}
 
