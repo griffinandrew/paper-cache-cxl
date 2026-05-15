@@ -100,11 +100,14 @@ fn main() {
         //println!("cargo:rustc-link-lib=dylib=jemalloc");
         //println!("cargo:rustc-link-lib=dylib=numa");
 
-        println!("cargo:rustc-link-search=native=/usr/lib64");
-        println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
+        //println!("cargo:rustc-link-search=native=/usr/lib64");
+        //println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
         //println!("cargo:rustc-link-lib=dylib=jemalloc");
-        println!("cargo:rustc-link-arg=-l:libjemalloc.so.2");
-        println!("cargo:rustc-link-arg=-Wl,--as-needed");
+       // println!("cargo:rustc-link-arg=-l:libjemalloc.so.2");
+        //println!("cargo:rustc-link-arg=-Wl,--as-needed");
+        //println!("cargo:rustc-link-lib=dylib=numa");
+
+        println!("cargo:rustc-link-search=native=/usr/lib64");
         println!("cargo:rustc-link-lib=dylib=numa");
 
         let mut build = cc::Build::new();
