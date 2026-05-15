@@ -64,7 +64,15 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     //let wrapper_path = "/home/griff/work/wrapper.h";
-    let wrapper_path = "/home/griffin/cxl_baseline/paper-cache-cxl/wrapper.h";
+    //let wrapper_path = "/home/griffin/cxl_baseline/paper-cache-cxl/wrapper.h";
+
+    // Detect the wrapper header in either canonical location.
+    let candidates = [
+        "/home/griff/work/wrapper.h",
+        "/home/griffin/cxl_baseline/paper-cache-cxl/wrapper.h",
+        "wrapper.h",  // project-local fallback
+    ];
+    let wrapper_path = candidates.iter().find(|p| Path::new(p).exists());
 
     if Path::new(wrapper_path).exists() {
         println!("Compiling UMF allocator wrapper with real UMF support");
