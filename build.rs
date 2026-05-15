@@ -95,7 +95,9 @@ fn main() {
         // Link the system jemalloc by absolute path. Using a path instead of
         // -ljemalloc avoids any chance of the linker resolving to tikv-jemalloc-sys's
         // build directory (which gets added via -L by tikv-jemallocator).
-        println!("cargo:rustc-link-arg={}", jemalloc_path);
+        //println!("cargo:rustc-link-arg={}", jemalloc_path);
+        println!("cargo:rustc-link-search=native=/usr/lib64");
+        println!("cargo:rustc-link-lib=dylib=jemalloc");
         println!("cargo:rustc-link-lib=dylib=numa");
 
         let mut build = cc::Build::new();
