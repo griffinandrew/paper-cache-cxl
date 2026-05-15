@@ -25,6 +25,13 @@ The implementation provides explicit feature flags to control:
 - **When disabled**: Cache key/value pairs use default allocation (typically DRAM)
 - **Requirements**: Mutually exclusive with `all_dram`
 
+### `pmem_region_alloc`
+- **Purpose**: Replace UMF per-allocation PMEM calls with a pre-mapped bump allocator region
+- **When enabled**: `Hybrid` resolves to `RegionHybrid` (`mmap` + NUMA bind + lock-free bump pointer)
+- **When disabled**: `Hybrid` resolves to `HybridObjects` (UMF-backed allocator path)
+- **Use case**: `key_pmem_value_pmem` workloads that prioritize low alloc/free overhead over fine-grained reclamation
+- **Requirements**: Enables `key_value_pmem`; designed for PMEM key/value object placement
+
 ### `enable_tiering_manager`
 - **Purpose**: Enable/disable the tiering manager functionality
 - **When enabled**: Automatic promotion/demotion of hot objects between DRAM and PMEM tiers
@@ -126,7 +133,8 @@ The implementation uses Rust's conditional compilation to select the appropriate
 The `Hybrid` allocator is used to place data in PMEM:
 - Defined in `src/allocator.rs`
 - Implements both `GlobalAlloc` and `Allocator` traits
-- Routes allocations to either DRAM (jemalloc) or PMEM (UMF) based on configuration
+- Default PMEM path (`HybridObjects`) routes allocations through UMF
+- Region PMEM path (`RegionHybrid`, with `pmem_region_alloc`) uses one large `mmap` region, optional NUMA `mbind`, lock-free bump allocation, no-op deallocate, and bulk reclaim via `reclaim_all`/`reset_epoch`
 
 ### Conditional Compilation
 
