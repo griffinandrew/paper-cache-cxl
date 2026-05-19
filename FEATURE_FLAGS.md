@@ -59,10 +59,10 @@ The implementation provides explicit feature flags to control:
 
 ### `eviction_stacks_pmem`
 - **Purpose**: Allocate LFU eviction policy tracking structures in PMEM using the Hybrid allocator
-- **When enabled**: `LfuStack`, `CountStack` internal data structures (`index_map`, `count_stacks`) are allocated via `HybridObjects` (PMEM-backed)
+- **When enabled**: `LfuStack`, `CountStack` internal data structures (`index_map`, `count_stacks`) are allocated via `Hybrid` (PMEM-backed)
 - **When disabled**: Standard DRAM-backed `std::collections::HashMap` and `kwik::collections::HashList` are used (default)
 - **Use case**: Ensures eviction metadata is co-located with PMEM-stored objects for lower cross-tier access overhead
-- **Requirements**: The Hybrid allocator must be accessible — compatible with `key_value_pmem` and standalone
+- **Requirements**: The Hybrid allocator must be accessible — compatible with `key_value_pmem` and standalone; with `pmem_region_alloc`, the same structures use `RegionHybrid`
 
 ### `flatmap_dram`
 - **Purpose**: Enable high-performance Linear Probing Hash Map (FlatMap) in DRAM
