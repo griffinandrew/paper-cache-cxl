@@ -103,6 +103,14 @@ use std::{
 	},
 };
 
+#[cfg(any(
+	feature = "global_hashtable_pmem",
+	feature = "hashbrown_dram",
+	feature = "global_flatmap_dram",
+	feature = "global_flatmap_pmem",
+))]
+use std::sync::RwLock;
+
 #[cfg(not(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram")))]
 use dashmap::{
 	DashMap,

@@ -5,7 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 use dlv_list::{VecList, Index};
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 use kwik::collections::HashList;
 
 use crate::{
@@ -54,11 +56,24 @@ pub struct LfuStack {
 #[cfg(feature = "eviction_stacks_pmem")]
 impl Default for LfuStack {
     fn default() -> Self {
-        // Pre-allocate capacity for 50 million items to avoid PMEM reallocation during
-        // high-throughput workloads. PMEM reallocation is expensive and can cause
-        // data-structure corruption if the allocator returns uninitialized memory.
-        const DEFAULT_CAPACITY: usize = 50_000_000;
-        Self::with_capacity(DEFAULT_CAPACITY)
+        // Capacity can be tuned via env var.  For pmem_region_alloc, keep a smaller
+        // default to avoid exhausting the pre-mapped region during stack initialization.
+        let default_capacity = std::env::var("PAPER_CACHE_EVICTION_STACK_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or({
+                #[cfg(feature = "pmem_region_alloc")]
+                {
+                    1_000_000
+                }
+                #[cfg(not(feature = "pmem_region_alloc"))]
+                {
+                    50_000_000
+                }
+            });
+
+        Self::with_capacity(default_capacity)
     }
 }
 

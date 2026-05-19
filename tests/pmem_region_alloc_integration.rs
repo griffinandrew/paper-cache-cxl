@@ -5,9 +5,20 @@
 ))]
 mod pmem_region_global_hashtable_tests {
     use paper_cache::{BufferPMEM, PaperCache, PaperPolicy};
+    use std::sync::Once;
+
+    fn configure_test_region() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| unsafe {
+            std::env::set_var("PAPER_CACHE_PMEM_REGION_SIZE", "67108864");
+            std::env::set_var("PAPER_CACHE_PMEM_NUMA_NODE", "0");
+            std::env::set_var("PAPER_CACHE_EVICTION_STACK_CAPACITY", "10000");
+        });
+    }
 
     #[test]
     fn global_hashtable_pmem_region_alloc_supports_get_set() {
+        configure_test_region();
         let cache = PaperCache::<u64, BufferPMEM>::new(
             1_000_000,
             &[PaperPolicy::Lfu],
@@ -33,9 +44,20 @@ mod pmem_region_global_hashtable_tests {
 ))]
 mod pmem_region_eviction_stacks_tests {
     use paper_cache::{BufferPMEM, PaperCache, PaperPolicy};
+    use std::sync::Once;
+
+    fn configure_test_region() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| unsafe {
+            std::env::set_var("PAPER_CACHE_PMEM_REGION_SIZE", "67108864");
+            std::env::set_var("PAPER_CACHE_PMEM_NUMA_NODE", "0");
+            std::env::set_var("PAPER_CACHE_EVICTION_STACK_CAPACITY", "10000");
+        });
+    }
 
     #[test]
     fn eviction_stacks_pmem_region_alloc_supports_get_set() {
+        configure_test_region();
         let cache = PaperCache::<u64, BufferPMEM>::new(
             2_000_000,
             &[PaperPolicy::Lfu],
