@@ -8,7 +8,7 @@
 
 
 
-#![cfg_attr(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem"), feature(allocator_api))]
+#![cfg_attr(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc"), feature(allocator_api))]
 
 // Validate that both global_flatmap_dram and global_flatmap_pmem are not enabled together
 #[cfg(all(feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
@@ -32,17 +32,26 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem"))]
+#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc"))]
 pub mod allocator;
 
-#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem"))]
+#[cfg(all(
+    any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc"),
+    feature = "pmem_region_alloc"
+))]
+use crate::allocator::RegionHybrid as Hybrid;
+
+#[cfg(all(
+    any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc"),
+    not(feature = "pmem_region_alloc")
+))]
 use crate::allocator::HybridObjects as Hybrid;
 
 // UMF bindings are always needed when any PMEM feature is active.
 // The build script guarantees that the UMF C symbols are always present:
 // either the real UMF library (when wrapper.h exists) or the stub
 // implementation (umf_stub.c, using malloc/free) when UMF is unavailable.
-#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem"))]
+#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc"))]
 mod allocator_bindings {
     include!("umf_allocator_bindings.rs"); // UMF extern "C" declarations
 }
