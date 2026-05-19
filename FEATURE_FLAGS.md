@@ -58,8 +58,8 @@ The implementation provides explicit feature flags to control:
 - **Requirements**: Linux only; requires `perf_event` access (may need elevated permissions or `/proc/sys/kernel/perf_event_paranoid` ≤ 1)
 
 ### `eviction_stacks_pmem`
-- **Purpose**: Allocate LFU eviction policy tracking structures in PMEM using the Hybrid allocator
-- **When enabled**: `LfuStack`, `CountStack` internal data structures (`index_map`, `count_stacks`) are allocated via `Hybrid` (PMEM-backed)
+- **Purpose**: Allocate eviction policy tracking structures in PMEM using the Hybrid allocator
+- **When enabled**: `LfuStack` (`index_map`, `count_stacks`) and `LruStack` (`stack`) internal data structures are allocated via `Hybrid` (PMEM-backed)
 - **When disabled**: Standard DRAM-backed `std::collections::HashMap` and `kwik::collections::HashList` are used (default)
 - **Use case**: Ensures eviction metadata is co-located with PMEM-stored objects for lower cross-tier access overhead
 - **Requirements**: The Hybrid allocator must be accessible — compatible with `key_value_pmem` and standalone; with `pmem_region_alloc`, the same structures use `RegionHybrid`
@@ -312,4 +312,4 @@ used at all when disabled, allowing the cache to operate as a single global cach
 ✅ Global hashtable can use pmem even when tiering is disabled
 ✅ `alloc_api_exp` removed; Hybrid allocator still functional for `key_value_pmem`
 ✅ `hw_perf` counters compile out to zero cost when feature is disabled
-✅ `eviction_stacks_pmem` correctly allocates LFU stacks via HybridObjects
+✅ `eviction_stacks_pmem` correctly allocates LFU/LRU stacks via `Hybrid` (UMF or `RegionHybrid` with `pmem_region_alloc`)

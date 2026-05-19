@@ -75,4 +75,54 @@ mod pmem_region_eviction_stacks_tests {
             assert_eq!(value, vec![i as u8; 64]);
         }
     }
+
+    #[test]
+    fn eviction_stacks_pmem_region_alloc_supports_lru_get_set() {
+        configure_test_region();
+        let cache = PaperCache::<u64, BufferPMEM>::new(
+            2_000_000,
+            &[PaperPolicy::Lru],
+            PaperPolicy::Lru,
+        )
+        .expect("cache init failed");
+
+        for i in 0..256u64 {
+            let value = vec![i as u8; 64];
+            cache.set(i, &value, None).expect("set failed");
+        }
+
+        for i in 0..256u64 {
+            let value = cache.get(&i).expect("get failed");
+            assert_eq!(value, vec![i as u8; 64]);
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "eviction_stacks_pmem",
+    feature = "key_value_pmem",
+    not(feature = "pmem_region_alloc")
+))]
+mod eviction_stacks_pmem_lru_tests {
+    use paper_cache::{BufferPMEM, PaperCache, PaperPolicy};
+
+    #[test]
+    fn eviction_stacks_pmem_supports_lru_get_set() {
+        let cache = PaperCache::<u64, BufferPMEM>::new(
+            2_000_000,
+            &[PaperPolicy::Lru],
+            PaperPolicy::Lru,
+        )
+        .expect("cache init failed");
+
+        for i in 0..256u64 {
+            let value = vec![i as u8; 64];
+            cache.set(i, &value, None).expect("set failed");
+        }
+
+        for i in 0..256u64 {
+            let value = cache.get(&i).expect("get failed");
+            assert_eq!(value, vec![i as u8; 64]);
+        }
+    }
 }
