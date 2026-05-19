@@ -5,7 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 use dlv_list::{VecList, Index};
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 use kwik::collections::HashList;
 
 use crate::{
@@ -18,7 +20,7 @@ use crate::{
 
 // Import HashMap based on feature flag
 // When eviction_stacks_pmem is disabled (default): use std::collections::HashMap (DRAM)
-// When eviction_stacks_pmem is enabled: use hashbrown::HashMap with HybridObjects allocator (PMEM)
+// When eviction_stacks_pmem is enabled: use hashbrown::HashMap with PMEM allocator
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 use std::collections::HashMap;
 
@@ -26,7 +28,7 @@ use std::collections::HashMap;
 use hashbrown::HashMap;
 
 #[cfg(feature = "eviction_stacks_pmem")]
-use crate::allocator::HybridObjects;
+use crate::Hybrid;
 
 #[cfg(feature = "eviction_stacks_pmem")]
 use super::pmem_collections::{PmemVecList, PmemHashList, PmemIndex};
@@ -41,24 +43,37 @@ pub struct LfuStack {
 }
 
 // PMEM-backed LFU stack (when eviction_stacks_pmem feature is enabled)
-// Uses hashbrown::HashMap with HybridObjects allocator for index_map
-// Uses custom PmemVecList and PmemHashList that explicitly use HybridObjects allocator
+// Uses hashbrown::HashMap with PMEM allocator for index_map
+// Uses custom PmemVecList and PmemHashList that explicitly use crate-wide Hybrid alias
 // This ensures PMEM allocation works correctly even when paper-cache is used as a library
 // and the consuming binary overrides the global allocator
 #[cfg(feature = "eviction_stacks_pmem")]
 pub struct LfuStack {
-	index_map: HashMap<HashedKey, PmemIndex, NoHasher, HybridObjects>,
+	index_map: HashMap<HashedKey, PmemIndex, NoHasher, Hybrid>,
 	count_stacks: PmemVecList<CountStack>,
 }
 
 #[cfg(feature = "eviction_stacks_pmem")]
 impl Default for LfuStack {
     fn default() -> Self {
-        // Pre-allocate capacity for 50 million items to avoid PMEM reallocation during
-        // high-throughput workloads. PMEM reallocation is expensive and can cause
-        // data-structure corruption if the allocator returns uninitialized memory.
-        const DEFAULT_CAPACITY: usize = 50_000_000;
-        Self::with_capacity(DEFAULT_CAPACITY)
+        // Capacity can be tuned via env var.  For pmem_region_alloc, keep a smaller
+        // default to avoid exhausting the pre-mapped region during stack initialization.
+        let default_capacity = std::env::var("PAPER_CACHE_EVICTION_STACK_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or({
+                #[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+                {
+                    1_000_000
+                }
+                #[cfg(not(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator")))]
+                {
+                    50_000_000
+                }
+            });
+
+        Self::with_capacity(default_capacity)
     }
 }
 
@@ -70,7 +85,7 @@ impl LfuStack {
             index_map: HashMap::with_capacity_and_hasher_in(
                 capacity, 
                 NoHasher::default(), 
-                HybridObjects
+                Hybrid
             ),
             count_stacks: PmemVecList::with_capacity(capacity),
         }
