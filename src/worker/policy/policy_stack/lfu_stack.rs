@@ -65,7 +65,7 @@ impl Default for LfuStack {
             .unwrap_or({
                 #[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
                 {
-                    1_000_000
+                    50_000_000
                 }
                 #[cfg(not(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator")))]
                 {
