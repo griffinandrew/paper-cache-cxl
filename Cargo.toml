@@ -39,11 +39,14 @@ key_value_pmem = []
 
 # Use mmap+NUMA-bound region bump allocator for PMEM allocations.
 # Intended for `key_pmem_value_pmem` to avoid per-object alloc/free overhead.
-pmem_region_alloc = ["key_value_pmem"]
+# Does NOT require key_value_pmem: can be combined with any PMEM feature
+# (e.g. global_hashtable_pmem, eviction_stacks_pmem) without storing objects in PMEM.
+pmem_region_alloc = []
 
 # Select RegionHybrid for all custom PMEM allocator call-sites that use the
 # crate-wide `Hybrid` alias; when disabled those call-sites use HybridObjects.
-region_hybrid_allocator = ["key_value_pmem"]
+# Does NOT require key_value_pmem: works with any PMEM feature independently.
+region_hybrid_allocator = []
 
 # Extended PMEM feature: places BOTH key bytes AND value bytes each in their own
 # BufferPMEM (Hybrid-allocated persistent memory).  Implies key_value_pmem so

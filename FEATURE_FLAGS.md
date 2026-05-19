@@ -28,15 +28,15 @@ The implementation provides explicit feature flags to control:
 ### `pmem_region_alloc`
 - **Purpose**: Replace UMF per-allocation PMEM calls with a pre-mapped bump allocator region
 - **When enabled**: Region allocator implementation (`RegionHybrid`) is compiled and available
-- **Use case**: `key_pmem_value_pmem` workloads that prioritize low alloc/free overhead over fine-grained reclamation
-- **Requirements**: Enables `key_value_pmem`; designed for PMEM key/value object placement
+- **Use case**: Any PMEM structure (hashtable, eviction stacks, key/value objects) that benefits from low alloc/free overhead over fine-grained reclamation
+- **Requirements**: No implicit feature deps; compatible with any PMEM feature (`global_hashtable_pmem`, `eviction_stacks_pmem`, `key_value_pmem`, etc.)
 
 ### `region_hybrid_allocator`
 - **Purpose**: Select `RegionHybrid` as the crate-wide custom PMEM allocator path
 - **When enabled**: `Hybrid` resolves to `RegionHybrid` for allocator-aware PMEM structures
 - **When disabled**: `Hybrid` resolves to `HybridObjects` (UMF-backed allocator path), unless `pmem_region_alloc` is enabled
-- **Use case**: Force region-backed allocator selection for all `Hybrid`-based PMEM call-sites without changing other PMEM feature combinations
-- **Requirements**: Enables `key_value_pmem`; compatible with PMEM allocator-aware features
+- **Use case**: Force region-backed allocator selection for all `Hybrid`-based PMEM call-sites without changing other PMEM feature combinations; works standalone with `global_hashtable_pmem`, `eviction_stacks_pmem`, or any combination
+- **Requirements**: No implicit feature deps; compatible with any PMEM feature combination
 
 ### `enable_tiering_manager`
 - **Purpose**: Enable/disable the tiering manager functionality
