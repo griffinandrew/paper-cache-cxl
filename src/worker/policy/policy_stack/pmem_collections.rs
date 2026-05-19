@@ -10,7 +10,7 @@
 //! Custom allocator-aware collections for PMEM-backed eviction stacks
 //!
 //! This module provides PMEM-aware alternatives to VecList and HashList that explicitly
-//! use the Hybrid allocator instead of relying on the global allocator.
+//! use the PMEM eviction allocator instead of relying on the global allocator.
 //! This is necessary because paper-cache is a library, and consuming binaries
 //! may override the global allocator, which would break PMEM allocation.
 //!
@@ -19,7 +19,10 @@
 
 use hashbrown::HashMap;
 use std::hash::{Hash, BuildHasher};
-use crate::Hybrid;
+#[cfg(feature = "pmem_region_alloc")]
+use crate::allocator::RegionHybrid as EvictionAllocator;
+#[cfg(not(feature = "pmem_region_alloc"))]
+use crate::allocator::HybridObjects as EvictionAllocator;
 
 // Use allocator-api2's Vec which works on stable Rust
 use allocator_api2::vec::Vec;
@@ -41,9 +44,9 @@ pub struct PmemIndex(usize);
 /// to reuse deleted slots. This reduces allocator surface area and makes
 /// debugging easier.
 pub struct PmemVecList<T> {
-    entries: Vec<Option<Node<T>>, Hybrid>,
+    entries: Vec<Option<Node<T>>, EvictionAllocator>,
     head: Option<usize>,
-    free_list: Vec<usize, Hybrid>,
+    free_list: Vec<usize, EvictionAllocator>,
 }
 
 struct Node<T> {
@@ -56,9 +59,9 @@ impl<T> PmemVecList<T> {
     /// Creates a new empty PmemVecList
     pub fn new() -> Self {
         PmemVecList {
-            entries: Vec::new_in(Hybrid),
+            entries: Vec::new_in(EvictionAllocator),
             head: None,
-            free_list: Vec::new_in(Hybrid),
+            free_list: Vec::new_in(EvictionAllocator),
         }
     }
 
@@ -66,9 +69,9 @@ impl<T> PmemVecList<T> {
     /// Use this to avoid reallocation crashes during high-throughput workloads
     pub fn with_capacity(capacity: usize) -> Self {
         PmemVecList {
-            entries: Vec::with_capacity_in(capacity, Hybrid),
+            entries: Vec::with_capacity_in(capacity, EvictionAllocator),
             head: None,
-            free_list: Vec::with_capacity_in(capacity, Hybrid),
+            free_list: Vec::with_capacity_in(capacity, EvictionAllocator),
         }
     }
     
@@ -231,11 +234,11 @@ impl<T> Default for PmemVecList<T> {
 /// Uses Vec for node storage (simpler than two HashMaps) with HashMap for O(1) lookup.
 /// Includes free list to reuse deleted slots.
 pub struct PmemHashList<T, S> {
-    entries: Vec<Option<Node<T>>, Hybrid>,
-    lookup: HashMap<T, usize, S, Hybrid>,
+    entries: Vec<Option<Node<T>>, EvictionAllocator>,
+    lookup: HashMap<T, usize, S, EvictionAllocator>,
     head: Option<usize>,
     tail: Option<usize>,
-    free_list: Vec<usize, Hybrid>,
+    free_list: Vec<usize, EvictionAllocator>,
 }
 
 impl<T, S> PmemHashList<T, S>
@@ -246,22 +249,22 @@ where
     /// Creates a new empty PmemHashList with the given hasher
     pub fn with_hasher(hasher: S) -> Self {
         PmemHashList {
-            entries: Vec::new_in(Hybrid),
-            lookup: HashMap::with_hasher_in(hasher, Hybrid),
+            entries: Vec::new_in(EvictionAllocator),
+            lookup: HashMap::with_hasher_in(hasher, EvictionAllocator),
             head: None,
             tail: None,
-            free_list: Vec::new_in(Hybrid),
+            free_list: Vec::new_in(EvictionAllocator),
         }
     }
 
     /// Creates a new PmemHashList with capacity and hasher
     pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> Self {
         PmemHashList {
-            entries: Vec::with_capacity_in(capacity, Hybrid),
-            lookup: HashMap::with_capacity_and_hasher_in(capacity, hasher, Hybrid),
+            entries: Vec::with_capacity_in(capacity, EvictionAllocator),
+            lookup: HashMap::with_capacity_and_hasher_in(capacity, hasher, EvictionAllocator),
             head: None,
             tail: None,
-            free_list: Vec::with_capacity_in(capacity, Hybrid),
+            free_list: Vec::with_capacity_in(capacity, EvictionAllocator),
         }
     }
     

@@ -20,7 +20,7 @@ use crate::{
 
 // Import HashMap based on feature flag
 // When eviction_stacks_pmem is disabled (default): use std::collections::HashMap (DRAM)
-// When eviction_stacks_pmem is enabled: use hashbrown::HashMap with Hybrid allocator (PMEM)
+// When eviction_stacks_pmem is enabled: use hashbrown::HashMap with PMEM allocator
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 use std::collections::HashMap;
 
@@ -28,7 +28,12 @@ use std::collections::HashMap;
 use hashbrown::HashMap;
 
 #[cfg(feature = "eviction_stacks_pmem")]
-use crate::Hybrid;
+#[cfg(feature = "pmem_region_alloc")]
+use crate::allocator::RegionHybrid as EvictionAllocator;
+
+#[cfg(feature = "eviction_stacks_pmem")]
+#[cfg(not(feature = "pmem_region_alloc"))]
+use crate::allocator::HybridObjects as EvictionAllocator;
 
 #[cfg(feature = "eviction_stacks_pmem")]
 use super::pmem_collections::{PmemVecList, PmemHashList, PmemIndex};
@@ -43,13 +48,13 @@ pub struct LfuStack {
 }
 
 // PMEM-backed LFU stack (when eviction_stacks_pmem feature is enabled)
-// Uses hashbrown::HashMap with Hybrid allocator for index_map
-// Uses custom PmemVecList and PmemHashList that explicitly use Hybrid allocator
+// Uses hashbrown::HashMap with PMEM allocator for index_map
+// Uses custom PmemVecList and PmemHashList that explicitly use EvictionAllocator
 // This ensures PMEM allocation works correctly even when paper-cache is used as a library
 // and the consuming binary overrides the global allocator
 #[cfg(feature = "eviction_stacks_pmem")]
 pub struct LfuStack {
-	index_map: HashMap<HashedKey, PmemIndex, NoHasher, Hybrid>,
+	index_map: HashMap<HashedKey, PmemIndex, NoHasher, EvictionAllocator>,
 	count_stacks: PmemVecList<CountStack>,
 }
 
@@ -85,7 +90,7 @@ impl LfuStack {
             index_map: HashMap::with_capacity_and_hasher_in(
                 capacity, 
                 NoHasher::default(), 
-                Hybrid
+                EvictionAllocator
             ),
             count_stacks: PmemVecList::with_capacity(capacity),
         }

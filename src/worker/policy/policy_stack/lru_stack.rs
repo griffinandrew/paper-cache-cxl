@@ -7,7 +7,8 @@
 
 // DRAM-backed LRU uses kwik's HashList (standard DRAM allocator).
 // PMEM-backed LRU uses PmemHashList which routes allocations through the
-// Hybrid allocator so that the eviction metadata lives in PMEM.
+// feature-selected PMEM eviction allocator so that the metadata lives in PMEM
+// (`RegionHybrid` with `pmem_region_alloc`, otherwise `HybridObjects`).
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 use kwik::collections::HashList;
 
@@ -70,7 +71,7 @@ impl PolicyStack for LruStack {
 
 // ── PMEM-backed LruStack (eviction_stacks_pmem) ───────────────────────────────
 //
-// `PmemHashList` allocates its internal nodes through the `Hybrid`
+// `PmemHashList` allocates its internal nodes through the PMEM eviction
 // allocator so the LRU linked-list metadata lives in PMEM rather than DRAM.
 // `PmemHashList::push_front` already handles the "re-insert at front" case
 // (it removes the existing entry first), so both `insert` and `update` map
