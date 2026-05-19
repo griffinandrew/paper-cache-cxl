@@ -163,7 +163,8 @@ static REGION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "pmem_region_alloc")]
 impl RegionHybrid {
-    #[inline]
+    
+    /*#[inline]
     fn init_if_needed() {
         REGION_INIT.call_once(|| {
             let bytes = std::env::var("PAPER_CACHE_PMEM_REGION_SIZE")
@@ -209,6 +210,79 @@ impl RegionHybrid {
                 bytes, numa_node, mapped
             );
         });
+    }
+    */
+
+    #[inline]
+    fn init_if_needed() {
+        REGION_INIT.call_once(|| {
+            let bytes = std::env::var("PAPER_CACHE_PMEM_REGION_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_PMEM_REGION_BYTES);
+
+            let mapped = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+
+            assert_ne!(
+                mapped,
+                libc::MAP_FAILED,
+                "RegionHybrid: mmap failed to reserve PMEM region"
+            );
+
+            let numa_node = std::env::var("PAPER_CACHE_PMEM_NUMA_NODE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_PMEM_NUMA_NODE);
+
+            #[cfg(target_os = "linux")]
+            unsafe {
+                // Policy first, so faulted pages land on the PMEM node...
+                Self::bind_region_to_numa(mapped, bytes, numa_node);
+                // ...then fault every page in here, off the SET hot path.
+                Self::prefault_region(mapped, bytes);
+            }
+
+            REGION_BASE_ADDR.store(mapped as usize, Ordering::SeqCst);
+            REGION_SIZE_BYTES.store(bytes, Ordering::SeqCst);
+            REGION_OFFSET.store(0, Ordering::SeqCst);
+
+            #[cfg(debug_assertions)]
+            println!(
+                "RegionHybrid: mmap region={} bytes numa_node={} base={:p} (prefaulted: touch-loop)",
+                bytes, numa_node, mapped
+            );
+        });
+    }
+
+    /// Touch every page so the kernel allocates + zeroes physical pages now,
+    /// on the PMEM node selected by the preceding `mbind`.
+    #[cfg(target_os = "linux")]
+    unsafe fn prefault_region(addr: *mut libc::c_void, size: usize) {
+        // Optional: keep for a TLB-fair comparison vs a THP-backed numactl baseline.
+        let _ = unsafe { libc::madvise(addr, size, libc::MADV_HUGEPAGE) };
+
+        let page_size = {
+            let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if v > 0 { v as usize } else { 4096 }
+        };
+
+        let base = addr as *mut u8;
+        let mut offset = 0usize;
+        while offset < size {
+            // volatile so the store isn't elided — the fault must actually happen.
+            unsafe { ptr::write_volatile(base.add(offset), 0u8); }
+            offset += page_size;
+        }
     }
 
     #[inline]
