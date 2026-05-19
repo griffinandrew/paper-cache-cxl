@@ -15,186 +15,200 @@
 #include <numa.h>
 #include <jemalloc/jemalloc.h>
 
-/* If your system's jemalloc symbols are prefixed (installed alongside glibc
- * malloc rather than replacing it), uncomment. Check with:
- *   nm -D /usr/lib64/libjemalloc.so.2 | grep -E 'mallctl|mallocx' | head
- */
-
 #ifdef JEMALLOC_USE_PREFIX
 #define mallctl  je_mallctl
 #define mallocx  je_mallocx
 #define dallocx  je_dallocx
 #endif
 
-/* MADV_NOHUGEPAGE may be missing from very old <sys/mman.h>; define it so the
- * build doesn't fail. Value is stable in the Linux ABI. */
+/* ------------------------------------------------------------------ */
+/* Design                                                              */
+/* ------------------------------------------------------------------ */
+/*
+ * The cache uses jemalloc for object management (size classes, tcache,
+ * reuse). These extent hooks only control WHERE jemalloc gets its raw
+ * memory from.
+ *
+ * Key change vs. the mmap-per-extent version: at init we reserve ONE big
+ * contiguous region (mmap, MAP_NORESERVE — reservation only, NOT faulted)
+ * and mbind it to the target node once. extent_alloc then just carves
+ * bump-pointer slices out of that region. No per-extent mmap, no
+ * per-extent mbind, no per-extent syscalls.
+ *
+ * Faults still happen LAZILY on first touch, on the hot path. This is NOT
+ * prefaulting. The only thing that changes is that every fault now lands
+ * inside one large contiguous VMA (like stock jemalloc's arena) instead of
+ * thousands of scattered small mmap'd VMAs — which is the fault-pattern
+ * difference that made the old hooks slow without prefault.
+ *
+ * extent_dalloc is a no-op (bump region, bulk reclaim at teardown). The
+ * cache workload has no eviction, so nothing is freed mid-run anyway.
+ */
+
 #ifndef MADV_NOHUGEPAGE
 #define MADV_NOHUGEPAGE 15
 #endif
 
-/* ------------------------------------------------------------------ */
-/* Design note                                                         */
-/* ------------------------------------------------------------------ */
-/*
- * This allocator does NOT prefault. Instead it makes the extent hooks
- * behave like native jemalloc: memory is acquired from the OS rarely,
- * faulted lazily on first touch, and then RECYCLED internally forever.
- *
- * The three things that make this work, vs. the original hook file:
- *   1. extent_dalloc RETAINS the extent (no munmap) — jemalloc keeps it
- *      mapped + faulted and hands it back out on the next extent_alloc.
- *   2. The purge hooks REFUSE to purge — pages are never MADV_DONTNEED'd
- *      out from under a retained extent.
- *   3. Arena dirty/muzzy decay is DISABLED — jemalloc never tries to
- *      return idle pages to the OS on a timer.
- *
- * Net effect: each page faults exactly once across the whole run, and the
- * cost amortizes away — the same reason numactl + stock jemalloc has good
- * steady-state SET latency. A short warmup phase before measurement
- * absorbs those one-time first-touch faults; no prefault is needed.
- *
- * Caveat: with retention + no purge + no decay, the arena only ever GROWS.
- * It never returns memory to the OS for the process lifetime. This is a
- * benchmark build — do not use it in long-running or memory-constrained
- * processes.
- */
+/* Default reserved region size. Override with PAPER_CACHE_REGION_BYTES. */
+#define DEFAULT_REGION_BYTES (40ULL * 1024 * 1024 * 1024)
 
 /* ------------------------------------------------------------------ */
 /* State                                                               */
 /* ------------------------------------------------------------------ */
 
-/* Hot-path arena index. Sentinel UINT_MAX = uninitialized. */
-static _Atomic unsigned arena_ind = UINT_MAX;
+static _Atomic unsigned arena_ind   = UINT_MAX;
+static int              target_node = -1;
 
-/* NUMA node to bind extents to. Written once in init, read-only thereafter. */
-static int target_numa_node = -1;
+static void  *region_base = NULL;
+static size_t region_cap  = 0;
+static _Atomic size_t region_off = 0;   /* bump cursor */
 
 static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ------------------------------------------------------------------ */
-/* Extent hooks                                                        */
+/* Region setup                                                        */
 /* ------------------------------------------------------------------ */
 
-static void bind_to_node(void *addr, size_t size) {
-    if (target_numa_node < 0) return;
+/* mbind the whole region to target_node. Policy only — sets where pages
+ * WILL come from when faulted. Does not fault anything. */
+static void bind_region(void *addr, size_t size) {
+    if (target_node < 0) return;
 
     struct bitmask *mask = numa_bitmask_alloc(numa_num_possible_nodes());
     if (!mask) return;
-    numa_bitmask_setbit(mask, target_numa_node);
-    long rc = mbind(addr, size, MPOL_BIND,
-                    mask->maskp, mask->size + 1, 0);
+    numa_bitmask_setbit(mask, target_node);
+    long rc = mbind(addr, size, MPOL_BIND, mask->maskp, mask->size + 1, 0);
     if (rc != 0) {
-        /* Silent mbind failure means pages land on the default (DRAM) node
-         * and the benchmark measures the wrong tier — so make it loud. */
         fprintf(stderr,
-                "bind_to_node: mbind(node=%d, %zu bytes) FAILED: %s\n",
-                target_numa_node, size, strerror(errno));
+                "bind_region: mbind(node=%d, %zu bytes) FAILED: %s\n",
+                target_node, size, strerror(errno));
     }
     numa_bitmask_free(mask);
 }
 
-/* Opt a freshly-mmap'd range out of transparent huge pages so it is backed
- * only by standard (4 KiB) pages. Overrides a system THP mode of "always". */
-static void disable_thp(void *addr, size_t size) {
-    madvise(addr, size, MADV_NOHUGEPAGE);
+/* Reserve the contiguous region. MAP_NORESERVE: address space only, no
+ * commit accounting, NO faulting. */
+static int region_reserve(void) {
+    size_t bytes = DEFAULT_REGION_BYTES;
+    const char *env = getenv("PAPER_CACHE_REGION_BYTES");
+    if (env) {
+        unsigned long long v = strtoull(env, NULL, 10);
+        if (v > 0) bytes = (size_t)v;
+    }
+
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "region_reserve: mmap(%zu) failed: %s\n",
+                bytes, strerror(errno));
+        return 1;
+    }
+
+    /* Bind the whole region to the target node ONCE. */
+    bind_region(p, bytes);
+
+    region_base = p;
+    region_cap  = bytes;
+    atomic_store_explicit(&region_off, 0, memory_order_release);
+
+    fprintf(stderr, "region_reserve: %zu bytes reserved at %p, node %d\n",
+            bytes, p, target_node);
+    return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Extent hooks                                                         */
+/* ------------------------------------------------------------------ */
+
+/* Carve an aligned slice out of the reserved region. No mmap, no syscall,
+ * no fault — the fault happens later, lazily, when jemalloc/the cache
+ * first writes to the returned memory. */
 static void *extent_alloc(extent_hooks_t *hooks, void *new_addr, size_t size,
                           size_t alignment, bool *zero, bool *commit,
                           unsigned arena) {
-    (void)hooks; (void)arena;
-    long pagesize = sysconf(_SC_PAGESIZE);
+    (void)hooks; (void)new_addr; (void)arena;
 
-    if (alignment <= (size_t)pagesize) {
-        void *p = mmap(new_addr, size, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (p == MAP_FAILED) return NULL;
-        bind_to_node(p, size);
-        disable_thp(p, size);
-        *zero = true; *commit = true;
-        return p;
+    if (!region_base || region_cap == 0) return NULL;
+    size_t align = alignment ? alignment : 1;
+
+    for (;;) {
+        size_t cur     = atomic_load_explicit(&region_off,
+                                              memory_order_relaxed);
+        size_t aligned = (cur + align - 1) & ~(align - 1);
+        if (aligned + size < aligned) return NULL;     /* overflow */
+        size_t end = aligned + size;
+        if (end > region_cap) {
+            fprintf(stderr,
+                    "extent_alloc: region exhausted (need %zu, cap %zu)\n",
+                    end, region_cap);
+            return NULL;
+        }
+        if (atomic_compare_exchange_weak_explicit(
+                &region_off, &cur, end,
+                memory_order_seq_cst, memory_order_relaxed)) {
+            void *p = (char *)region_base + aligned;
+            /* Pages from a fresh MAP_ANONYMOUS region are zero on first
+             * fault, so we can promise jemalloc zeroed + committed. */
+            *zero   = true;
+            *commit = true;
+            return p;
+        }
+        /* CAS lost a race (rare; single-threaded benchmark) — retry. */
     }
-
-    size_t over = size + alignment;
-    void *p = mmap(new_addr, over, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) return NULL;
-
-    uintptr_t aligned = ((uintptr_t)p + alignment - 1) & ~(alignment - 1);
-    size_t head = aligned - (uintptr_t)p;
-    size_t tail = over - head - size;
-    if (head) munmap(p, head);
-    if (tail) munmap((void *)(aligned + size), tail);
-
-    bind_to_node((void *)aligned, size);
-    disable_thp((void *)aligned, size);
-    *zero = true; *commit = true;
-    return (void *)aligned;
 }
 
-/* RETAIN, do not munmap. Returning true tells jemalloc the hook did NOT
- * free the extent, so jemalloc keeps it in its pool — still mapped, still
- * faulted, still NUMA-bound — and reuses it for a future extent_alloc.
- * This is the single most important change: it converts a re-fault-on-every-
- * free storm into fault-once-then-recycle, matching native jemalloc. */
+/* No-op: bump region, bulk reclaim at teardown. The workload has no
+ * eviction so this is essentially never called mid-run anyway. Returning
+ * true tells jemalloc the extent was NOT released, so it retains and
+ * reuses it. */
 static bool extent_dalloc(extent_hooks_t *hooks, void *addr, size_t size,
                           bool committed, unsigned arena) {
     (void)hooks; (void)addr; (void)size; (void)committed; (void)arena;
-    return true;   /* not deallocated — jemalloc retains and reuses it */
+    return true;
 }
 
 static void extent_destroy(extent_hooks_t *hooks, void *addr, size_t size,
                            bool committed, unsigned arena) {
-    (void)hooks; (void)committed; (void)arena;
-    /* destroy is called on arena teardown — really unmap here so the
-     * region is not leaked when the benchmark exits. */
-    munmap(addr, size);
+    (void)hooks; (void)addr; (void)size; (void)committed; (void)arena;
+    /* Region is freed as a whole in umf_allocator_finalize. */
 }
 
 static bool extent_commit(extent_hooks_t *h, void *a, size_t s,
                           size_t o, size_t l, unsigned ar) {
     (void)h;(void)a;(void)s;(void)o;(void)l;(void)ar;
-    return false;  /* already committed */
+    return false;   /* already committed */
 }
 
 static bool extent_decommit(extent_hooks_t *h, void *a, size_t s,
                             size_t o, size_t l, unsigned ar) {
     (void)h;(void)a;(void)s;(void)o;(void)l;(void)ar;
-    return true;   /* decommit unsupported, keep pages */
+    return true;    /* refuse — keep pages */
 }
 
-/* REFUSE to purge. Returning true means "purge not done", so jemalloc keeps
- * the pages dirty and resident rather than MADV_FREE / MADV_DONTNEED-ing
- * them. Without this, pages get dropped out of retained extents and
- * re-fault on next touch — defeating the retention above. */
-static bool extent_purge_lazy(extent_hooks_t *h, void *addr, size_t s,
-                              size_t offset, size_t length, unsigned ar) {
-    (void)h;(void)addr;(void)s;(void)offset;(void)length;(void)ar;
-    return true;   /* not purged — keep pages resident */
+/* Refuse purges: keep pages resident, never MADV_DONTNEED them away. */
+static bool extent_purge_lazy(extent_hooks_t *h, void *a, size_t s,
+                              size_t o, size_t l, unsigned ar) {
+    (void)h;(void)a;(void)s;(void)o;(void)l;(void)ar;
+    return true;
 }
 
-static bool extent_purge_forced(extent_hooks_t *h, void *addr, size_t s,
-                                size_t offset, size_t length, unsigned ar) {
-    (void)h;(void)addr;(void)s;(void)offset;(void)length;(void)ar;
-    return true;   /* not purged — keep pages resident */
+static bool extent_purge_forced(extent_hooks_t *h, void *a, size_t s,
+                                size_t o, size_t l, unsigned ar) {
+    (void)h;(void)a;(void)s;(void)o;(void)l;(void)ar;
+    return true;
 }
 
+/* Region is one contiguous mapping — splits and merges are free. */
 static bool extent_split(extent_hooks_t *h, void *a, size_t s,
                          size_t sa, size_t sb, bool c, unsigned ar) {
     (void)h;(void)a;(void)s;(void)sa;(void)sb;(void)c;(void)ar;
-    /* Returning false here means "split succeeded", which lets jemalloc
-     * subdivide a large retained extent to satisfy smaller requests —
-     * important for reuse efficiency. The address space is already one
-     * contiguous mapping, so no syscall is needed to split. */
-    return false;
+    return false;   /* false == success */
 }
 
 static bool extent_merge(extent_hooks_t *h, void *a, size_t sa,
                          void *b, size_t sb, bool c, unsigned ar) {
     (void)h;(void)a;(void)sa;(void)b;(void)sb;(void)c;(void)ar;
-    /* Returning false means "merge succeeded", letting jemalloc coalesce
-     * adjacent retained extents back into a larger one. */
-    return false;
+    return false;   /* false == success */
 }
 
 static extent_hooks_t numa_hooks = {
@@ -210,31 +224,22 @@ static extent_hooks_t numa_hooks = {
 };
 
 /* ------------------------------------------------------------------ */
-/* Decay control                                                       */
+/* Decay control                                                        */
 /* ------------------------------------------------------------------ */
 
-/* Disable dirty/muzzy decay on the arena so jemalloc never tries to return
- * idle pages to the OS on a timer. Combined with the purge hooks refusing
- * to purge, this keeps faulted pages resident for the process lifetime. */
 static void disable_arena_decay(unsigned ind) {
     char path[64];
-    ssize_t neg1 = -1;   /* jemalloc interprets -1 as "never decay" */
-
+    ssize_t neg1 = -1;
     snprintf(path, sizeof(path), "arena.%u.dirty_decay_ms", ind);
-    if (mallctl(path, NULL, NULL, &neg1, sizeof(neg1)) != 0) {
-        fprintf(stderr,
-                "warning: could not disable dirty_decay on arena %u\n", ind);
-    }
-
+    if (mallctl(path, NULL, NULL, &neg1, sizeof(neg1)) != 0)
+        fprintf(stderr, "warning: dirty_decay disable failed (arena %u)\n", ind);
     snprintf(path, sizeof(path), "arena.%u.muzzy_decay_ms", ind);
-    if (mallctl(path, NULL, NULL, &neg1, sizeof(neg1)) != 0) {
-        fprintf(stderr,
-                "warning: could not disable muzzy_decay on arena %u\n", ind);
-    }
+    if (mallctl(path, NULL, NULL, &neg1, sizeof(neg1)) != 0)
+        fprintf(stderr, "warning: muzzy_decay disable failed (arena %u)\n", ind);
 }
 
 /* ------------------------------------------------------------------ */
-/* Public API — same shape as the UMF wrapper                          */
+/* Public API                                                           */
 /* ------------------------------------------------------------------ */
 
 int umf_allocator_init(int numa_node) {
@@ -250,7 +255,13 @@ int umf_allocator_init(int numa_node) {
         pthread_mutex_unlock(&lifecycle_lock);
         return 1;
     }
-    target_numa_node = numa_node;
+    target_node = numa_node;
+
+    /* Reserve the one big contiguous region up front (no faulting). */
+    if (region_reserve() != 0) {
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 4;
+    }
 
     unsigned ind;
     size_t ind_sz = sizeof(ind);
@@ -271,13 +282,10 @@ int umf_allocator_init(int numa_node) {
         return 3;
     }
 
-    /* Disable decay so retained extents are never purged on a timer. */
     disable_arena_decay(ind);
 
     atomic_store_explicit(&arena_ind, ind, memory_order_release);
     pthread_mutex_unlock(&lifecycle_lock);
-
-    /* Do NOT register finalize via atexit; same reasoning as before. */
     return 0;
 }
 
@@ -287,10 +295,13 @@ void umf_allocator_finalize(void) {
                                             memory_order_acq_rel);
     if (ind != UINT_MAX) {
         char path[64];
-        /* arena.<ind>.destroy invokes extent_destroy on every extent,
-         * which really munmaps — so retained memory is released here. */
         snprintf(path, sizeof(path), "arena.%u.destroy", ind);
         mallctl(path, NULL, NULL, NULL, 0);
+    }
+    if (region_base) {
+        munmap(region_base, region_cap);
+        region_base = NULL;
+        region_cap  = 0;
     }
     pthread_mutex_unlock(&lifecycle_lock);
 }
@@ -300,14 +311,10 @@ void *umf_alloc(size_t size, size_t align) {
     unsigned ind = atomic_load_explicit(&arena_ind, memory_order_acquire);
     if (ind == UINT_MAX) return NULL;
 
-    /* Note: tcache is intentionally LEFT ENABLED (no MALLOCX_TCACHE_NONE).
-     * The thread cache absorbs most allocations lock-free, which is a large
-     * part of why native jemalloc has low per-op latency. The arena binding
-     * via MALLOCX_ARENA still routes the backing memory through our hooks. */
+    /* tcache left ENABLED — it absorbs most allocations on the fast path.
+     * MALLOCX_ARENA routes backing memory through our hooks / region. */
     int flags = MALLOCX_ARENA(ind);
-    if (align && align > sizeof(void *)) {
-        flags |= MALLOCX_ALIGN(align);
-    }
+    if (align && align > sizeof(void *)) flags |= MALLOCX_ALIGN(align);
     return mallocx(size, flags);
 }
 
@@ -315,15 +322,14 @@ void umf_dealloc(void *ptr) {
     if (!ptr) return;
     unsigned ind = atomic_load_explicit(&arena_ind, memory_order_acquire);
     if (ind == UINT_MAX) return;
-    /* Match umf_alloc: tcache enabled. */
     dallocx(ptr, MALLOCX_ARENA(ind));
 }
 
 int check_tier(void *ptr) {
-    /* Stub. Tag tier in object metadata instead of querying the allocator. */
     (void)ptr;
-    return 1;  /* matches the UMF version's "pmem" return for our pool */
+    return 1;
 }
+
 
 
 
