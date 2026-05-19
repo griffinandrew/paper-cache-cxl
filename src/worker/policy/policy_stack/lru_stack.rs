@@ -8,7 +8,8 @@
 // DRAM-backed LRU uses kwik's HashList (standard DRAM allocator).
 // PMEM-backed LRU uses PmemHashList which routes allocations through the
 // feature-selected PMEM eviction allocator so that the metadata lives in PMEM
-// (`RegionHybrid` with `pmem_region_alloc`, otherwise `HybridObjects`).
+// (`RegionHybrid` with `pmem_region_alloc` or `region_hybrid_allocator`,
+// otherwise `HybridObjects`).
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 use kwik::collections::HashList;
 

@@ -41,6 +41,10 @@ key_value_pmem = []
 # Intended for `key_pmem_value_pmem` to avoid per-object alloc/free overhead.
 pmem_region_alloc = ["key_value_pmem"]
 
+# Select RegionHybrid for all custom PMEM allocator call-sites that use the
+# crate-wide `Hybrid` alias; when disabled those call-sites use HybridObjects.
+region_hybrid_allocator = ["key_value_pmem"]
+
 # Extended PMEM feature: places BOTH key bytes AND value bytes each in their own
 # BufferPMEM (Hybrid-allocated persistent memory).  Implies key_value_pmem so
 # that the Hybrid allocator and all other PMEM infrastructure are available.
@@ -137,4 +141,3 @@ original = []
 [build-dependencies]
 cc = "1.2.39"
 bindgen = "0.72.1"
-

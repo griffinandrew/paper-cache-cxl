@@ -21,7 +21,7 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use std::sync::{Once, atomic::{AtomicUsize, Ordering}};
-#[cfg(feature = "pmem_region_alloc")]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 use std::sync::atomic::AtomicU64;
 use std::ptr;
 use std::alloc::{Allocator, AllocError};
@@ -140,28 +140,28 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
 /// - attempts NUMA binding to PMEM node
 /// - allocates with lock-free bump pointer
 /// - deallocate is a no-op (bulk reclaim via `reclaim_all`)
-#[cfg(feature = "pmem_region_alloc")]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 #[derive(Clone, Copy)]
 pub struct RegionHybrid;
 
-#[cfg(feature = "pmem_region_alloc")]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 const DEFAULT_PMEM_REGION_BYTES: usize = 48 * 1024 * 1024 * 1024; // 8 GiB virtual region
 
-#[cfg(feature = "pmem_region_alloc")]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 const DEFAULT_PMEM_NUMA_NODE: usize = 1;
 
-#[cfg(feature = "pmem_region_alloc")]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 static REGION_INIT: Once = Once::new();
-#[cfg(feature = "pmem_region_alloc")]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 static REGION_BASE_ADDR: AtomicUsize = AtomicUsize::new(0);
-#[cfg(feature = "pmem_region_alloc")]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 static REGION_SIZE_BYTES: AtomicUsize = AtomicUsize::new(0);
-#[cfg(feature = "pmem_region_alloc")]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 static REGION_OFFSET: AtomicUsize = AtomicUsize::new(0);
-#[cfg(feature = "pmem_region_alloc")]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 static REGION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "pmem_region_alloc")]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 impl RegionHybrid {
         /// Eagerly initialize the PMEM region (mmap + mbind + prefault).
     /// Call this once at process startup, before any latency-sensitive
@@ -373,7 +373,7 @@ impl RegionHybrid {
     }
 }
 
-#[cfg(feature = "pmem_region_alloc")]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 unsafe impl GlobalAlloc for RegionHybrid {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         Self::alloc_bump(layout)
@@ -384,7 +384,7 @@ unsafe impl GlobalAlloc for RegionHybrid {
     }
 }
 
-#[cfg(feature = "pmem_region_alloc")]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 unsafe impl Allocator for RegionHybrid {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let ptr = Self::alloc_bump(layout);
@@ -403,7 +403,7 @@ unsafe impl Allocator for RegionHybrid {
 
 // allocator_api2 support (for hashbrown and dlv-list under PMEM allocator modes)
 #[cfg(all(
-    feature = "pmem_region_alloc",
+    any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"),
     any(
         feature = "global_hashtable_pmem",
         feature = "tiering_hashtable_pmem",

@@ -28,12 +28,7 @@ use std::collections::HashMap;
 use hashbrown::HashMap;
 
 #[cfg(feature = "eviction_stacks_pmem")]
-#[cfg(feature = "pmem_region_alloc")]
-use crate::allocator::RegionHybrid as EvictionAllocator;
-
-#[cfg(feature = "eviction_stacks_pmem")]
-#[cfg(not(feature = "pmem_region_alloc"))]
-use crate::allocator::HybridObjects as EvictionAllocator;
+use crate::Hybrid;
 
 #[cfg(feature = "eviction_stacks_pmem")]
 use super::pmem_collections::{PmemVecList, PmemHashList, PmemIndex};
@@ -49,12 +44,12 @@ pub struct LfuStack {
 
 // PMEM-backed LFU stack (when eviction_stacks_pmem feature is enabled)
 // Uses hashbrown::HashMap with PMEM allocator for index_map
-// Uses custom PmemVecList and PmemHashList that explicitly use EvictionAllocator
+// Uses custom PmemVecList and PmemHashList that explicitly use crate-wide Hybrid alias
 // This ensures PMEM allocation works correctly even when paper-cache is used as a library
 // and the consuming binary overrides the global allocator
 #[cfg(feature = "eviction_stacks_pmem")]
 pub struct LfuStack {
-	index_map: HashMap<HashedKey, PmemIndex, NoHasher, EvictionAllocator>,
+	index_map: HashMap<HashedKey, PmemIndex, NoHasher, Hybrid>,
 	count_stacks: PmemVecList<CountStack>,
 }
 
@@ -68,11 +63,11 @@ impl Default for LfuStack {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
             .unwrap_or({
-                #[cfg(feature = "pmem_region_alloc")]
+                #[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
                 {
                     1_000_000
                 }
-                #[cfg(not(feature = "pmem_region_alloc"))]
+                #[cfg(not(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator")))]
                 {
                     50_000_000
                 }
@@ -90,7 +85,7 @@ impl LfuStack {
             index_map: HashMap::with_capacity_and_hasher_in(
                 capacity, 
                 NoHasher::default(), 
-                EvictionAllocator
+                Hybrid
             ),
             count_stacks: PmemVecList::with_capacity(capacity),
         }

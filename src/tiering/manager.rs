@@ -860,7 +860,7 @@ use crate::PaperCache;
 #[cfg(feature = "key_value_pmem")]
 pub type BufferPMEM = Box<[u8], Hybrid>;
 
-#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "pmem_region_alloc"))]
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 use crate::Hybrid;
 
 mod allocator_bindings {

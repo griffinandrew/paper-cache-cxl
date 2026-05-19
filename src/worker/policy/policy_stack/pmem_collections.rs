@@ -19,10 +19,7 @@
 
 use hashbrown::HashMap;
 use std::hash::{Hash, BuildHasher};
-#[cfg(feature = "pmem_region_alloc")]
-use crate::allocator::RegionHybrid as EvictionAllocator;
-#[cfg(not(feature = "pmem_region_alloc"))]
-use crate::allocator::HybridObjects as EvictionAllocator;
+use crate::Hybrid;
 
 // Use allocator-api2's Vec which works on stable Rust
 use allocator_api2::vec::Vec;
@@ -44,9 +41,9 @@ pub struct PmemIndex(usize);
 /// to reuse deleted slots. This reduces allocator surface area and makes
 /// debugging easier.
 pub struct PmemVecList<T> {
-    entries: Vec<Option<Node<T>>, EvictionAllocator>,
+    entries: Vec<Option<Node<T>>, Hybrid>,
     head: Option<usize>,
-    free_list: Vec<usize, EvictionAllocator>,
+    free_list: Vec<usize, Hybrid>,
 }
 
 struct Node<T> {
@@ -59,9 +56,9 @@ impl<T> PmemVecList<T> {
     /// Creates a new empty PmemVecList
     pub fn new() -> Self {
         PmemVecList {
-            entries: Vec::new_in(EvictionAllocator),
+            entries: Vec::new_in(Hybrid),
             head: None,
-            free_list: Vec::new_in(EvictionAllocator),
+            free_list: Vec::new_in(Hybrid),
         }
     }
 
@@ -69,9 +66,9 @@ impl<T> PmemVecList<T> {
     /// Use this to avoid reallocation crashes during high-throughput workloads
     pub fn with_capacity(capacity: usize) -> Self {
         PmemVecList {
-            entries: Vec::with_capacity_in(capacity, EvictionAllocator),
+            entries: Vec::with_capacity_in(capacity, Hybrid),
             head: None,
-            free_list: Vec::with_capacity_in(capacity, EvictionAllocator),
+            free_list: Vec::with_capacity_in(capacity, Hybrid),
         }
     }
     
@@ -234,11 +231,11 @@ impl<T> Default for PmemVecList<T> {
 /// Uses Vec for node storage (simpler than two HashMaps) with HashMap for O(1) lookup.
 /// Includes free list to reuse deleted slots.
 pub struct PmemHashList<T, S> {
-    entries: Vec<Option<Node<T>>, EvictionAllocator>,
-    lookup: HashMap<T, usize, S, EvictionAllocator>,
+    entries: Vec<Option<Node<T>>, Hybrid>,
+    lookup: HashMap<T, usize, S, Hybrid>,
     head: Option<usize>,
     tail: Option<usize>,
-    free_list: Vec<usize, EvictionAllocator>,
+    free_list: Vec<usize, Hybrid>,
 }
 
 impl<T, S> PmemHashList<T, S>
@@ -249,22 +246,22 @@ where
     /// Creates a new empty PmemHashList with the given hasher
     pub fn with_hasher(hasher: S) -> Self {
         PmemHashList {
-            entries: Vec::new_in(EvictionAllocator),
-            lookup: HashMap::with_hasher_in(hasher, EvictionAllocator),
+            entries: Vec::new_in(Hybrid),
+            lookup: HashMap::with_hasher_in(hasher, Hybrid),
             head: None,
             tail: None,
-            free_list: Vec::new_in(EvictionAllocator),
+            free_list: Vec::new_in(Hybrid),
         }
     }
 
     /// Creates a new PmemHashList with capacity and hasher
     pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> Self {
         PmemHashList {
-            entries: Vec::with_capacity_in(capacity, EvictionAllocator),
-            lookup: HashMap::with_capacity_and_hasher_in(capacity, hasher, EvictionAllocator),
+            entries: Vec::with_capacity_in(capacity, Hybrid),
+            lookup: HashMap::with_capacity_and_hasher_in(capacity, hasher, Hybrid),
             head: None,
             tail: None,
-            free_list: Vec::with_capacity_in(capacity, EvictionAllocator),
+            free_list: Vec::with_capacity_in(capacity, Hybrid),
         }
     }
     

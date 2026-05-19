@@ -27,10 +27,16 @@ The implementation provides explicit feature flags to control:
 
 ### `pmem_region_alloc`
 - **Purpose**: Replace UMF per-allocation PMEM calls with a pre-mapped bump allocator region
-- **When enabled**: `Hybrid` resolves to `RegionHybrid` (`mmap` + NUMA bind + lock-free bump pointer)
-- **When disabled**: `Hybrid` resolves to `HybridObjects` (UMF-backed allocator path)
+- **When enabled**: Region allocator implementation (`RegionHybrid`) is compiled and available
 - **Use case**: `key_pmem_value_pmem` workloads that prioritize low alloc/free overhead over fine-grained reclamation
 - **Requirements**: Enables `key_value_pmem`; designed for PMEM key/value object placement
+
+### `region_hybrid_allocator`
+- **Purpose**: Select `RegionHybrid` as the crate-wide custom PMEM allocator path
+- **When enabled**: `Hybrid` resolves to `RegionHybrid` for allocator-aware PMEM structures
+- **When disabled**: `Hybrid` resolves to `HybridObjects` (UMF-backed allocator path), unless `pmem_region_alloc` is enabled
+- **Use case**: Force region-backed allocator selection for all `Hybrid`-based PMEM call-sites without changing other PMEM feature combinations
+- **Requirements**: Enables `key_value_pmem`; compatible with PMEM allocator-aware features
 
 ### `enable_tiering_manager`
 - **Purpose**: Enable/disable the tiering manager functionality
@@ -62,7 +68,7 @@ The implementation provides explicit feature flags to control:
 - **When enabled**: `LfuStack` (`index_map`, `count_stacks`) and `LruStack` (`stack`) internal data structures are PMEM-backed
 - **When disabled**: Standard DRAM-backed `std::collections::HashMap` and `kwik::collections::HashList` are used (default)
 - **Use case**: Ensures eviction metadata is co-located with PMEM-stored objects for lower cross-tier access overhead
-- **Requirements**: Uses `HybridObjects` by default; when `pmem_region_alloc` is enabled these structures use `RegionHybrid` directly
+- **Requirements**: Uses `HybridObjects` by default; with `pmem_region_alloc` or `region_hybrid_allocator`, these structures use `RegionHybrid`
 
 ### `flatmap_dram`
 - **Purpose**: Enable high-performance Linear Probing Hash Map (FlatMap) in DRAM
@@ -134,7 +140,7 @@ The `Hybrid` allocator is used to place data in PMEM:
 - Defined in `src/allocator.rs`
 - Implements both `GlobalAlloc` and `Allocator` traits
 - Default PMEM path (`HybridObjects`) routes allocations through UMF
-- Region PMEM path (`RegionHybrid`, with `pmem_region_alloc`) uses one large `mmap` region, optional NUMA `mbind`, lock-free bump allocation, no-op deallocate, and bulk reclaim via `reclaim_all`/`reset_epoch`
+- Region PMEM path (`RegionHybrid`, selected via `pmem_region_alloc` or `region_hybrid_allocator`) uses one large `mmap` region, optional NUMA `mbind`, lock-free bump allocation, no-op deallocate, and bulk reclaim via `reclaim_all`/`reset_epoch`
 
 ### Conditional Compilation
 
@@ -312,4 +318,4 @@ used at all when disabled, allowing the cache to operate as a single global cach
 ✅ Global hashtable can use pmem even when tiering is disabled
 ✅ `alloc_api_exp` removed; Hybrid allocator still functional for `key_value_pmem`
 ✅ `hw_perf` counters compile out to zero cost when feature is disabled
-✅ `eviction_stacks_pmem` correctly allocates LFU/LRU stacks via `Hybrid` (UMF or `RegionHybrid` with `pmem_region_alloc`)
+✅ `eviction_stacks_pmem` correctly allocates LFU/LRU stacks via `Hybrid` (UMF or `RegionHybrid` when `pmem_region_alloc` / `region_hybrid_allocator` are enabled)
