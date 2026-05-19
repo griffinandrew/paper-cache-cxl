@@ -163,6 +163,12 @@ static REGION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "pmem_region_alloc")]
 impl RegionHybrid {
+        /// Eagerly initialize the PMEM region (mmap + mbind + prefault).
+    /// Call this once at process startup, before any latency-sensitive
+    /// path, so the prefault cost is not charged to the first SET.
+    pub fn init() {
+        Self::init_if_needed();
+    }
     
     /*#[inline]
     fn init_if_needed() {
