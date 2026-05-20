@@ -32,6 +32,12 @@ use tikv_jemallocator::Jemalloc;
 //#[global_allocator]
 //static GLOBAL: Jemalloc = Jemalloc;
 
+#[cfg(feature = "pmem_region_alloc")]
+#[global_allocator]
+//static GLOBAL: paper_cache::allocator::HybridObjects = paper_cache::allocator::HybridObjects;
+static GLOBAL: paper_cache::allocator::RegionHybrid = paper_cache::allocator::RegionHybrid;
+
+
 #[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 pub mod allocator;
 
