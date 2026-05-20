@@ -510,6 +510,7 @@ int umf_allocator_init(int numa_node) {
 // numa_node = NUMA node id (check with numactl -H)
 int umf_allocator_init(int numa_node) {
     umf_memory_pool_handle_t new_pool = NULL;
+    umf_scalable_pool_params_handle_t scalable_params = NULL;
     umf_result_t res;
 
     pthread_mutex_lock(&lifecycle_lock);
@@ -556,14 +557,31 @@ int umf_allocator_init(int numa_node) {
         return 4;
     }
 
+    /* -------------------------------------------------------------------------
+     * NEW REAL FIX: Create scalable pool params and tell it to KEEP all memory.
+     * This forces the TBB backend to retain freed blocks rather than triggering
+     * purging calls down into the OS memory provider.
+     * ------------------------------------------------------------------------- */
+    res = umfScalablePoolParamsCreate(&scalable_params);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create scalable pool params: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 5;
+    }
+
+    // 1 means TRUE -> retain all memory blocks inside the pool user-space cache
+    umfScalablePoolParamsSetKeepAllMemory(scalable_params, 1);
+
     // Create pool into a local first; only publish once fully constructed.
     // Scalable pool takes no params, so pass NULL.
     res = umfPoolCreate(
             umfScalablePoolOps(),
             provider,
-            NULL,
+            scalable_params,
             0,
             &new_pool);
+
+    umfScalablePoolParamsDestroy(scalable_params);
 
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to create pool: %d\n", res);
@@ -660,7 +678,7 @@ int check_tier(void *ptr) {
  * Returns 0 on success. */
 int umf_allocator_prewarm(size_t bytes, size_t chunk) {
     if (bytes == 0) return 0;
-    if (chunk == 0) chunk = 2 * 1024 * 1024;  /* 2 MiB default */
+    if (chunk == 0) chunk = 4096;  /* 2 MiB default */
 
     umf_memory_pool_handle_t p =
         atomic_load_explicit(&pool, memory_order_acquire);
@@ -709,8 +727,8 @@ int umf_allocator_prewarm(size_t bytes, size_t chunk) {
     /* Free everything back into the pool. The scalable pool retains these
      * blocks for fast reuse; the OS provider does not unmap, so the pages
      * stay mapped, faulted, and bound to the target NUMA node. */
-    //for (size_t i = 0; i < got; i++) umfPoolFree(p, ptrs[i]);
-    //free(ptrs);
+    for (size_t i = 0; i < got; i++) umfPoolFree(p, ptrs[i]);
+    free(ptrs);
     return 0;
 }
 
