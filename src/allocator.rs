@@ -145,7 +145,7 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
 pub struct RegionHybrid;
 
 #[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
-const DEFAULT_PMEM_REGION_BYTES: usize = 110 * 1024 * 1024 * 1024; // 48 GiB virtual region
+const DEFAULT_PMEM_REGION_BYTES: usize = 120 * 1024 * 1024 * 1024; // 48 GiB virtual region
 
 #[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 const DEFAULT_PMEM_NUMA_NODE: usize = 1;
