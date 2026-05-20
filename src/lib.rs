@@ -28,9 +28,9 @@ compile_error!("Cannot enable both 'hashbrown_dram' and 'global_flatmap_pmem' fe
 #[cfg(feature = "all_dram")]
 use tikv_jemallocator::Jemalloc;
 
-//#[cfg(feature = "all_dram")]
-//#[global_allocator]
-//static GLOBAL: Jemalloc = Jemalloc;
+#[cfg(feature = "all_dram")]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 pub mod allocator;
@@ -212,6 +212,14 @@ pub struct PaperCache<K, V, S = RandomState> {
 }
 
 
+
+pub mod rdtsc_probes;
+
+use crate::rdtsc_probes::{
+    rdtsc, PHASE_PRE_ALLOC, PHASE_ALLOC, PHASE_MEMCPY, PHASE_POST,
+};
+
+pub use rdtsc_probes::{calibrate_tsc_hz, report_all};
 
 
 
@@ -1142,14 +1150,34 @@ where
 	/// ```
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
+		
+		let t0 = rdtsc();
 		let hashed_key = self.hash_key(&key);
+		let t1 = rdtsc();
+		PHASE_PRE_ALLOC.record(t1 - t0);
 
 		//allocate it as a regular buffer... 
-		let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
+		//let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
 
 		//let key_buff = Box::new(key);
 
+		let t2_start = rdtsc();
+		let mut val_buf: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
+		let t2_end = rdtsc();
+		PHASE_ALLOC.record(t2_end - t2_start);
+
+		// === phase 3: memcpy value into PMEM ===
+		let t3_start = rdtsc();
+		val_buf.extend_from_slice(value);
+		let val_buf: BufferPMEM = val_buf.into_boxed_slice();
+		let t3_end = rdtsc();
+		PHASE_MEMCPY.record(t3_end - t3_start);
+
+		let t4_start = rdtsc();
+		//let object = Object::new(key, val_buf, ttl); 
 		let object = Object::new(key, val_buf, ttl);
+		let t4_end = rdtsc();
+		PHASE_POST.record(t4_end - t4_start);
 		let base_size = self.overhead_manager.base_size(&object);
 		let expiry = object.expiry();
 
@@ -3232,6 +3260,7 @@ where
     	//V: AsRef<[u8]> + TypeSize,
 		K: 'static + Eq + Hash + TypeSize + std::fmt::Debug,
 	{
+
 		let hashed_key = self.hash_key(&key);
 
 		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
