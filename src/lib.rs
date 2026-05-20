@@ -1162,7 +1162,7 @@ where
 		//let key_buff = Box::new(key);
 
 		let t2_start = rdtsc();
-		let mut val_buf: Vec<u8, Hybrid> = Vec::with_capacity(value.len());
+		let mut val_buf: Vec<u8> = Vec::with_capacity(value.len());
 		let t2_end = rdtsc();
 		PHASE_ALLOC.record(t2_end - t2_start);
 
