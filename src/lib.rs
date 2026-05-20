@@ -174,7 +174,7 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 
 #[cfg(feature = "pmem_region_alloc")]
 #[global_allocator]
-static GLOBAL: paper_cache::allocator::HybridObjects = paper_cache::allocator::HybridObjects;
+static GLOBAL: allocator::HybridObjects = allocator::HybridObjects;
 //static GLOBAL: allocator::RegionHybrid = allocator::RegionHybrid;
 
 
