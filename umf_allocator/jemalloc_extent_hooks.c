@@ -50,7 +50,7 @@
 #endif
 
 /* Default reserved region size. Override with PAPER_CACHE_REGION_BYTES. */
-#define DEFAULT_REGION_BYTES (30ULL * 1024 * 1024 * 1024)
+#define DEFAULT_REGION_BYTES (25ULL * 1024 * 1024 * 1024)
 
 /* ------------------------------------------------------------------ */
 /* State                                                               */
