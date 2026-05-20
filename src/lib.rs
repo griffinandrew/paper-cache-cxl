@@ -172,9 +172,12 @@ pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 pub type BufferPMEM = Box<[u8], Hybrid>;
 
 
-#[cfg(feature = "pmem_region_alloc")]
-#[global_allocator]
-static GLOBAL: allocator::HybridObjects = allocator::HybridObjects;
+//#[cfg(feature = "pmem_region_alloc")]
+//#[global_allocator]
+//static GLOBAL: allocator::HybridObjects = allocator::HybridObjects;
+
+
+
 //static GLOBAL: allocator::RegionHybrid = allocator::RegionHybrid;
 
 
