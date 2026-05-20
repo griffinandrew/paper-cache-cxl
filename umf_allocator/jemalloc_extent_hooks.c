@@ -50,7 +50,7 @@
 #endif
 
 /* Default reserved region size. Override with PAPER_CACHE_REGION_BYTES. */
-#define DEFAULT_REGION_BYTES (40ULL * 1024 * 1024 * 1024)
+#define DEFAULT_REGION_BYTES (30ULL * 1024 * 1024 * 1024)
 
 /* ------------------------------------------------------------------ */
 /* State                                                               */
@@ -58,7 +58,7 @@
 
 static _Atomic unsigned arena_ind   = UINT_MAX;
 static _Atomic unsigned tcache_ind  = UINT_MAX; 
-static int              target_node = 0;
+static int              target_node = -1;
 
 static void  *region_base = NULL;
 static size_t region_cap  = 0;
