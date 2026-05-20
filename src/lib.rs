@@ -28,9 +28,9 @@ compile_error!("Cannot enable both 'hashbrown_dram' and 'global_flatmap_pmem' fe
 #[cfg(feature = "all_dram")]
 use tikv_jemallocator::Jemalloc;
 
-//#[cfg(feature = "all_dram")]
-//#[global_allocator]
-//static GLOBAL: Jemalloc = Jemalloc;
+#[cfg(feature = "all_dram")]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 
 #[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
@@ -172,10 +172,10 @@ pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 pub type BufferPMEM = Box<[u8], Hybrid>;
 
 
-#[cfg(feature = "pmem_region_alloc")]
-#[global_allocator]
+//#[cfg(feature = "pmem_region_alloc")]
+//#[global_allocator]
 //static GLOBAL: paper_cache::allocator::HybridObjects = paper_cache::allocator::HybridObjects;
-static GLOBAL: allocator::RegionHybrid = allocator::RegionHybrid;
+//static GLOBAL: allocator::RegionHybrid = allocator::RegionHybrid;
 
 
 
