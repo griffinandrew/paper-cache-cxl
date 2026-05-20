@@ -57,6 +57,7 @@
 /* ------------------------------------------------------------------ */
 
 static _Atomic unsigned arena_ind   = UINT_MAX;
+static _Atomic unsigned tcache_ind  = UINT_MAX; 
 static int              target_node = 0;
 
 static void  *region_base = NULL;
@@ -284,10 +285,44 @@ int umf_allocator_init(int numa_node) {
 
     disable_arena_decay(ind);
 
+    {
+        unsigned tc;
+        size_t tc_sz = sizeof(tc);
+        if (mallctl("tcache.create", &tc, &tc_sz, NULL, 0) != 0) {
+            fprintf(stderr, "tcache.create failed — falling back to no tcache flag\n");
+            /* leave tcache_ind = UINT_MAX; umf_alloc will skip the flag */
+        } else {
+            atomic_store_explicit(&tcache_ind, tc, memory_order_release);
+            fprintf(stderr, "tcache.create: tcache_ind=%u\n", tc);
+        }
+    }
+
+
+
+
+
     atomic_store_explicit(&arena_ind, ind, memory_order_release);
     pthread_mutex_unlock(&lifecycle_lock);
     return 0;
 }
+
+/*void umf_allocator_finalize(void) {
+    pthread_mutex_lock(&lifecycle_lock);
+    unsigned ind = atomic_exchange_explicit(&arena_ind, UINT_MAX,
+                                            memory_order_acq_rel);
+    if (ind != UINT_MAX) {
+        char path[64];
+        snprintf(path, sizeof(path), "arena.%u.destroy", ind);
+        mallctl(path, NULL, NULL, NULL, 0);
+    }
+    if (region_base) {
+        munmap(region_base, region_cap);
+        region_base = NULL;
+        region_cap  = 0;
+    }
+    pthread_mutex_unlock(&lifecycle_lock);
+}*/
+
 
 void umf_allocator_finalize(void) {
     pthread_mutex_lock(&lifecycle_lock);
@@ -306,6 +341,7 @@ void umf_allocator_finalize(void) {
     pthread_mutex_unlock(&lifecycle_lock);
 }
 
+
 void *umf_alloc(size_t size, size_t align) {
     if (size == 0) return NULL;
     unsigned ind = atomic_load_explicit(&arena_ind, memory_order_acquire);
@@ -314,7 +350,12 @@ void *umf_alloc(size_t size, size_t align) {
     /* tcache left ENABLED — it absorbs most allocations on the fast path.
      * MALLOCX_ARENA routes backing memory through our hooks / region. */
     //int flags = MALLOCX_ARENA(ind);
-    int flags = MALLOCX_ARENA(ind) | MALLOCX_TCACHE(0);
+    //int flags = MALLOCX_ARENA(ind) | MALLOCX_TCACHE(0);
+    //if (align && align > sizeof(void *)) flags |= MALLOCX_ALIGN(align);
+    //return mallocx(size, flags);
+    int flags = MALLOCX_ARENA(ind);
+    unsigned tc = atomic_load_explicit(&tcache_ind, memory_order_acquire);
+    if (tc != UINT_MAX) flags |= MALLOCX_TCACHE(tc);
     if (align && align > sizeof(void *)) flags |= MALLOCX_ALIGN(align);
     return mallocx(size, flags);
 }
@@ -323,7 +364,12 @@ void umf_dealloc(void *ptr) {
     if (!ptr) return;
     unsigned ind = atomic_load_explicit(&arena_ind, memory_order_acquire);
     if (ind == UINT_MAX) return;
-    int flags = MALLOCX_ARENA(ind) | MALLOCX_TCACHE(0);
+    //int flags = MALLOCX_ARENA(ind) | MALLOCX_TCACHE(0);
+    //dallocx(ptr, flags);
+
+    int flags = MALLOCX_ARENA(ind);
+    unsigned tc = atomic_load_explicit(&tcache_ind, memory_order_acquire);
+    if (tc != UINT_MAX) flags |= MALLOCX_TCACHE(tc);
     dallocx(ptr, flags);
 }
 
