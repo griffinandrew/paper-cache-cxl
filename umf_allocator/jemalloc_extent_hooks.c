@@ -313,7 +313,8 @@ void *umf_alloc(size_t size, size_t align) {
 
     /* tcache left ENABLED — it absorbs most allocations on the fast path.
      * MALLOCX_ARENA routes backing memory through our hooks / region. */
-    int flags = MALLOCX_ARENA(ind);
+    //int flags = MALLOCX_ARENA(ind);
+    int flags = MALLOCX_ARENA(ind) | MALLOCX_TCACHE(0);
     if (align && align > sizeof(void *)) flags |= MALLOCX_ALIGN(align);
     return mallocx(size, flags);
 }
@@ -322,7 +323,8 @@ void umf_dealloc(void *ptr) {
     if (!ptr) return;
     unsigned ind = atomic_load_explicit(&arena_ind, memory_order_acquire);
     if (ind == UINT_MAX) return;
-    dallocx(ptr, MALLOCX_ARENA(ind));
+    int flags = MALLOCX_ARENA(ind) | MALLOCX_TCACHE(0);
+    dallocx(ptr, flags);
 }
 
 int check_tier(void *ptr) {
