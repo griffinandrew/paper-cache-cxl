@@ -644,7 +644,75 @@ int check_tier(void *ptr) {
 // end solo numa node allocation for pmem
 
 
+#include <unistd.h>
 
+/* Prewarm the UMF pool by allocating `bytes` worth of memory through it in
+ * `chunk`-sized pieces, touching every page so the OS provider faults +
+ * zeroes them on the target NUMA node now, then freeing back into the pool.
+ *
+ * Whether the prewarm "sticks" depends on the pool retaining freed memory
+ * rather than handing it back to the OS provider. The scalable pool (TBB)
+ * retains aggressively by default — freed blocks stay in the pool's per-
+ * thread caches and superblock free-lists. No decay timer the way jemalloc
+ * has, so there's no special config needed for retention.
+ *
+ * Call AFTER umf_allocator_init, BEFORE the measured workload.
+ * Returns 0 on success. */
+int umf_allocator_prewarm(size_t bytes, size_t chunk) {
+    if (bytes == 0) return 0;
+    if (chunk == 0) chunk = 2 * 1024 * 1024;  /* 2 MiB default */
+
+    umf_memory_pool_handle_t p =
+        atomic_load_explicit(&pool, memory_order_acquire);
+    if (!p) {
+        fprintf(stderr, "umf_allocator_prewarm: pool not initialized\n");
+        return 1;
+    }
+
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) pg = 4096;
+
+    size_t n = (bytes + chunk - 1) / chunk;
+    void **ptrs = calloc(n, sizeof(void *));
+    if (!ptrs) {
+        fprintf(stderr, "umf_allocator_prewarm: out of host memory\n");
+        return 2;
+    }
+
+    size_t got = 0;
+    for (size_t i = 0; i < n; i++) {
+        void *blk = umfPoolMalloc(p, chunk);
+        if (!blk) {
+            fprintf(stderr,
+                    "umf_allocator_prewarm: pool exhausted at %zu/%zu chunks "
+                    "(%zu bytes requested)\n",
+                    got, n, chunk);
+            /* Free what we got; report partial. */
+            for (size_t j = 0; j < got; j++) umfPoolFree(p, ptrs[j]);
+            free(ptrs);
+            return 3;
+        }
+
+        /* Touch one byte per page to force the fault. volatile so the
+         * store is not elided by the compiler. */
+        volatile char *vp = (volatile char *)blk;
+        for (size_t off = 0; off < chunk; off += (size_t)pg) {
+            vp[off] = 0;
+        }
+        ptrs[got++] = blk;
+    }
+
+    fprintf(stderr,
+            "umf_allocator_prewarm: touched %zu chunks x %zu bytes = %zu MiB\n",
+            got, chunk, (got * chunk) >> 20);
+
+    /* Free everything back into the pool. The scalable pool retains these
+     * blocks for fast reuse; the OS provider does not unmap, so the pages
+     * stay mapped, faulted, and bound to the target NUMA node. */
+    for (size_t i = 0; i < got; i++) umfPoolFree(p, ptrs[i]);
+    free(ptrs);
+    return 0;
+}
 
 
 

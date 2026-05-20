@@ -46,16 +46,30 @@ static mut NUM_DEALLOCS: usize = 0;
 static ALL_MEM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for HybridObjects {
+
+
+    fn init_and_prewarm(numa_node: i32, prewarm_bytes: usize) {
+        INIT.call_once(|| {
+            unsafe { allocator_bindings::umf_allocator_init(numa_node); }
+            #[cfg(debug_assertions)]
+            println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
+        });
+        let chunk = 2 * 1024 * 1024usize;
+        let rc = unsafe { umf_allocator_prewarm(prewarm_bytes, chunk) };
+        if rc != 0 {
+            eprintln!("UMF prewarm returned {}", rc);
+        }
+    }
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // Initialise the UMF pool on first allocation.  On real hardware this
         // maps a jemalloc pool over the PMEM NUMA node.  In the stub this is
         // a no-op.
-        INIT.call_once(|| {
-            let numa_node = 0; // PMEM NUMA node (ignored by stub)
-            allocator_bindings::umf_allocator_init(numa_node);
-            #[cfg(debug_assertions)]
-            println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
-        });
+        //INIT.call_once(|| {
+        //    let numa_node = 0; // PMEM NUMA node (ignored by stub)
+        //    allocator_bindings::umf_allocator_init(numa_node);
+        //    #[cfg(debug_assertions)]
+        //    println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
+        //});
 
         let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {

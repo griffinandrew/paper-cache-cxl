@@ -1,5 +1,5 @@
 
-/* 
+
 
 extern crate bindgen;
 
@@ -52,7 +52,7 @@ fn main() {
 
 
 
-*/
+/* this is for jemallic extent hooks``
 
 extern crate bindgen;
 
@@ -176,3 +176,4 @@ fn detect_jemalloc_prefix(path: &str) -> bool {
     }
 }
 
+*/
