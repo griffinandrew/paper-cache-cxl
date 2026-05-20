@@ -1169,7 +1169,7 @@ where
 		// === phase 3: memcpy value into PMEM ===
 		let t3_start = rdtsc();
 		val_buf.extend_from_slice(value);
-		let val_buf: BufferPMEM = val_buf.into_boxed_slice();
+		let val_buf: BufferDRAM = val_buf.into_boxed_slice();
 		let t3_end = rdtsc();
 		PHASE_MEMCPY.record(t3_end - t3_start);
 
