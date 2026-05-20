@@ -57,7 +57,7 @@
 /* ------------------------------------------------------------------ */
 
 static _Atomic unsigned arena_ind   = UINT_MAX;
-static int              target_node = -1;
+static int              target_node = 0;
 
 static void  *region_base = NULL;
 static size_t region_cap  = 0;
