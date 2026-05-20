@@ -26,6 +26,8 @@ this branch will be for adding s3fifo tiered cache...
 
 stage new branch for new agent task
 
+new branch for removanble of FFI calls
+
 ## Tiering Manager
 
 The tiering manager provides a two-tier caching architecture with **actual data copies**:
