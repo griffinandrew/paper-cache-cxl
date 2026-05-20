@@ -709,8 +709,8 @@ int umf_allocator_prewarm(size_t bytes, size_t chunk) {
     /* Free everything back into the pool. The scalable pool retains these
      * blocks for fast reuse; the OS provider does not unmap, so the pages
      * stay mapped, faulted, and bound to the target NUMA node. */
-    for (size_t i = 0; i < got; i++) umfPoolFree(p, ptrs[i]);
-    free(ptrs);
+    //for (size_t i = 0; i < got; i++) umfPoolFree(p, ptrs[i]);
+    //free(ptrs);
     return 0;
 }
 
