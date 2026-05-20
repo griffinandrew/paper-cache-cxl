@@ -148,7 +148,7 @@ pub struct RegionHybrid;
 const DEFAULT_PMEM_REGION_BYTES: usize = 48 * 1024 * 1024 * 1024; // 8 GiB virtual region
 
 #[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
-const DEFAULT_PMEM_NUMA_NODE: usize = 0;
+const DEFAULT_PMEM_NUMA_NODE: usize = 1;
 
 #[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 static REGION_INIT: Once = Once::new();
