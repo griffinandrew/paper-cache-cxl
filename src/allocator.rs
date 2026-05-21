@@ -624,6 +624,8 @@ impl RegionHybrid {
                 // Apply strict binding onto the VMA range so future page faults 
                 // reliably target your secondary tier node without needing full prefault loops.
                 Self::bind_region_to_numa(mapped, bytes, numa_node);
+
+                Self::prefault_region(mapped, bytes);
             }
 
             REGION_BASE_ADDR.store(mapped as usize, Ordering::SeqCst);
