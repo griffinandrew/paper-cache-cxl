@@ -240,7 +240,7 @@ impl RegionHybrid {
             );
         });
     }
-    */
+  
 
     //const MAP_HUGE_2MB: libc::c_int = 21 << 26; // Flags for explicitly selecting 2MB size
 
@@ -293,6 +293,93 @@ impl RegionHybrid {
             #[cfg(debug_assertions)]
             println!(
                 "RegionHybrid: mmap region={} bytes numa_node={} base={:p} (prefaulted: touch-loop)",
+                bytes, numa_node, mapped
+            );
+        });
+    }
+
+    */
+
+
+    #[inline]
+    fn init_if_needed() {
+        REGION_INIT.call_once(|| {
+            let bytes = std::env::var("PAPER_CACHE_PMEM_REGION_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_PMEM_REGION_BYTES);
+
+            let numa_node = std::env::var("PAPER_CACHE_PMEM_NUMA_NODE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_PMEM_NUMA_NODE);
+
+            const MAP_HUGE_2MB: libc::c_int = 21 << 26;
+            const MPOL_BIND: libc::c_int = 2;
+            const MPOL_DEFAULT: libc::c_int = 0;
+
+            let mapped = unsafe {
+                // 1. CONSTRUCT NUMA MASK FOR NODE 1
+                let mut nodemask: libc::c_ulong = 0;
+                let bits = (std::mem::size_of::<libc::c_ulong>() * 8) as usize;
+                if numa_node < bits {
+                    nodemask |= 1u64.wrapping_shl(numa_node as u32) as libc::c_ulong;
+                }
+                let maxnode = bits as libc::c_ulong;
+
+                // 2. TEMPORARILY FORCE THIS THREAD TO ALLOCATE FROM NODE 1
+                // This guarantees the following mmap looks directly into Node 1's Huge Page pool!
+                libc::syscall(
+                    libc::SYS_set_mempolicy as libc::c_long,
+                    MPOL_BIND,
+                    &nodemask as *const libc::c_ulong,
+                    maxnode,
+                );
+
+                // 3. EXECUTE THE MAP
+                let ptr = libc::mmap(
+                    ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | MAP_HUGE_2MB,
+                    -1,
+                    0,
+                );
+
+                // 4. IMMEDIATELY RESTORE THE DEFAULT THREAD POLICY
+                // This surgically isolates the change so the rest of your Rust binary allocates from DRAM normally.
+                libc::syscall(
+                    libc::SYS_set_mempolicy as libc::c_long,
+                    MPOL_DEFAULT,
+                    ptr::null(),
+                    0,
+                );
+
+                ptr
+            };
+
+            assert_ne!(
+                mapped,
+                libc::MAP_FAILED,
+                "RegionHybrid: mmap failed to reserve PMEM region"
+            );
+
+            // 5. SECURE THE ADDRESS SPACE POLICY FOR LIFE
+            #[cfg(target_os = "linux")]
+            unsafe {
+                Self::bind_region_to_numa(mapped, bytes, numa_node);
+                // Optional: touch loop is no longer strictly required on the hot path 
+                // because MAP_HUGETLB allocations resolve quickly, but you can leave it out.
+            }
+
+            REGION_BASE_ADDR.store(mapped as usize, Ordering::SeqCst);
+            REGION_SIZE_BYTES.store(bytes, Ordering::SeqCst);
+            REGION_OFFSET.store(0, Ordering::SeqCst);
+
+            #[cfg(debug_assertions)]
+            println!(
+                "RegionHybrid: mmap region={} bytes numa_node={} base={:p} (2MB Hugepages Secured)",
                 bytes, numa_node, mapped
             );
         });
