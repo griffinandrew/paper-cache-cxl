@@ -281,7 +281,7 @@ impl RegionHybrid {
                 // Policy first, so faulted pages land on the PMEM node...
                 Self::bind_region_to_numa(mapped, bytes, numa_node);
                 // ...then fault every page in here, off the SET hot path.
-                Self::prefault_region(mapped, bytes);
+                //Self::prefault_region(mapped, bytes);
             }
 
             REGION_BASE_ADDR.store(mapped as usize, Ordering::SeqCst);
