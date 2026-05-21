@@ -48,6 +48,9 @@ pmem_region_alloc = []
 # Does NOT require key_value_pmem: works with any PMEM feature independently.
 region_hybrid_allocator = []
 
+
+devdax_bump = []
+
 # Extended PMEM feature: places BOTH key bytes AND value bytes each in their own
 # BufferPMEM (Hybrid-allocated persistent memory).  Implies key_value_pmem so
 # that the Hybrid allocator and all other PMEM infrastructure are available.
@@ -136,9 +139,6 @@ hybridcache = ["all_dram", "key_pmem_value_pmem"]
 # both tiers (small DRAM and far PMEM), since the hashtable type is global.
 far_tier_pmem_evst_hash = ["hybridcache", "eviction_stacks_pmem", "global_hashtable_pmem"]
 
-
-
-devdax-bump = []
 
 
 # Legacy features (deprecated, will be removed)
