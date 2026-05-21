@@ -352,7 +352,7 @@ impl RegionHybrid {
                 libc::syscall(
                     libc::SYS_set_mempolicy as libc::c_long,
                     MPOL_DEFAULT,
-                    ptr::null(),
+                    ptr::null::<libc::c_ulong>(),
                     0,
                 );
 
