@@ -242,7 +242,7 @@ impl RegionHybrid {
     }
     */
 
-    const MAP_HUGE_2MB: libc::c_int = 21 << 26; // Flags for explicitly selecting 2MB size
+    //const MAP_HUGE_2MB: libc::c_int = 21 << 26; // Flags for explicitly selecting 2MB size
 
     #[inline]
     fn init_if_needed() {
@@ -252,6 +252,8 @@ impl RegionHybrid {
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_PMEM_REGION_BYTES);
+
+            const MAP_HUGE_2MB: libc::c_int = 21 << 26;
 
             let mapped = unsafe {
                 libc::mmap(
