@@ -242,6 +242,8 @@ impl RegionHybrid {
     }
     */
 
+    const MAP_HUGE_2MB: libc::c_int = 21 << 26; // Flags for explicitly selecting 2MB size
+
     #[inline]
     fn init_if_needed() {
         REGION_INIT.call_once(|| {
@@ -256,7 +258,8 @@ impl RegionHybrid {
                     ptr::null_mut(),
                     bytes,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    //libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | MAP_HUGE_2MB,
                     -1,
                     0,
                 )
@@ -300,10 +303,11 @@ impl RegionHybrid {
         // Optional: keep for a TLB-fair comparison vs a THP-backed numactl baseline.
         let _ = unsafe { libc::madvise(addr, size, libc::MADV_HUGEPAGE) };
 
-        let page_size = {
-            let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            if v > 0 { v as usize } else { 4096 }
-        };
+        //let page_size = {
+        //    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        //    if v > 0 { v as usize } else { 4096 }
+        //};
+        let page_size = 2 * 1024 * 1024;
 
         let base = addr as *mut u8;
         let mut offset = 0usize;
