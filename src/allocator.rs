@@ -21,9 +21,11 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use std::sync::{Once, atomic::{AtomicUsize, Ordering}};
-#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump"))]
 use std::sync::atomic::AtomicU64;
 use std::ptr;
+#[cfg(feature = "devdax_bump")]
+use std::ffi::CString;
 use std::alloc::{Allocator, AllocError};
 use std::ptr::NonNull;
 
@@ -445,4 +447,193 @@ unsafe impl allocator_api2::alloc::Allocator for RegionHybrid {
     unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
         // Intentionally a no-op: this allocator uses bulk reclamation.
     }
+}
+
+
+
+
+
+
+
+
+
+#[cfg(feature = "devdax_bump")]
+const DEFAULT_DEVDAX_PATH: &str = "/dev/dax0.0";
+
+#[cfg(feature = "devdax_bump")]
+const DEFAULT_DEVDAX_SIZE: usize = 64 * 1024 * 1024 * 1024; // 64 GiB
+
+#[cfg(feature = "devdax_bump")]
+#[derive(Clone, Copy)]
+pub struct DevDaxBump;
+
+#[cfg(feature = "devdax_bump")]
+static DEVDAX_INIT:       Once        = Once::new();
+#[cfg(feature = "devdax_bump")]
+static DEVDAX_BASE_ADDR:  AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "devdax_bump")]
+static DEVDAX_SIZE_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "devdax_bump")]
+static DEVDAX_OFFSET:     AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "devdax_bump")]
+static DEVDAX_GENERATION: AtomicU64   = AtomicU64::new(0);
+
+#[cfg(feature = "devdax_bump")]
+impl DevDaxBump {
+    pub fn init() {
+        Self::init_if_needed();
+    }
+
+    #[inline]
+    fn init_if_needed() {
+        DEVDAX_INIT.call_once(|| {
+            let path = std::env::var("PAPER_CACHE_DEVDAX_PATH")
+                .unwrap_or_else(|_| DEFAULT_DEVDAX_PATH.to_string());
+
+            let size = std::env::var("PAPER_CACHE_DEVDAX_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_DEVDAX_SIZE);
+
+            let cpath = CString::new(path.clone())
+                .expect("PAPER_CACHE_DEVDAX_PATH contains NUL");
+
+            let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+            assert!(
+                fd >= 0,
+                "DevDaxBump: open({}) failed: {}",
+                path,
+                std::io::Error::last_os_error()
+            );
+
+            let mapped = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+
+            unsafe { libc::close(fd); }
+
+            assert_ne!(
+                mapped,
+                libc::MAP_FAILED,
+                "DevDaxBump: mmap({}, {} bytes) failed: {}",
+                path,
+                size,
+                std::io::Error::last_os_error()
+            );
+
+            DEVDAX_BASE_ADDR.store(mapped as usize, Ordering::SeqCst);
+            DEVDAX_SIZE_BYTES.store(size, Ordering::SeqCst);
+            DEVDAX_OFFSET.store(0, Ordering::SeqCst);
+
+            eprintln!(
+                "DevDaxBump: mapped {} bytes from {} at {:p}",
+                size, path, mapped
+            );
+        });
+    }
+
+    #[inline]
+    fn alloc_bump(layout: Layout) -> *mut u8 {
+        Self::init_if_needed();
+
+        let base = DEVDAX_BASE_ADDR.load(Ordering::SeqCst);
+        let cap  = DEVDAX_SIZE_BYTES.load(Ordering::SeqCst);
+        if base == 0 || cap == 0 {
+            return ptr::null_mut();
+        }
+
+        let align = layout.align().max(1);
+        let size  = layout.size().max(1);
+
+        loop {
+            let curr    = DEVDAX_OFFSET.load(Ordering::Relaxed);
+            let aligned = (curr + (align - 1)) & !(align - 1);
+            let end = match aligned.checked_add(size) {
+                Some(v) => v,
+                None    => return ptr::null_mut(),
+            };
+
+            if end > cap {
+                eprintln!(
+                    "DevDaxBump: region exhausted (need {}, cap {})",
+                    end, cap
+                );
+                return ptr::null_mut();
+            }
+
+            if DEVDAX_OFFSET
+                .compare_exchange_weak(curr, end, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                return (base as *mut u8).wrapping_add(aligned);
+            }
+        }
+    }
+
+    pub fn reclaim_all() {
+        Self::init_if_needed();
+        DEVDAX_OFFSET.store(0, Ordering::SeqCst);
+        DEVDAX_GENERATION.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn reset_epoch() {
+        Self::reclaim_all();
+    }
+
+    pub fn generation() -> u64 {
+        DEVDAX_GENERATION.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(feature = "devdax_bump")]
+unsafe impl GlobalAlloc for DevDaxBump {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        Self::alloc_bump(layout)
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+#[cfg(feature = "devdax_bump")]
+unsafe impl Allocator for DevDaxBump {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let ptr = Self::alloc_bump(layout);
+        if ptr.is_null() {
+            return Err(AllocError);
+        }
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, layout.size().max(1)) };
+        Ok(NonNull::from(slice))
+    }
+
+    unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {}
+}
+
+#[cfg(all(
+    feature = "devdax_bump",
+    any(
+        feature = "global_hashtable_pmem",
+        feature = "tiering_hashtable_pmem",
+        feature = "eviction_stacks_pmem",
+        feature = "global_flatmap_pmem"
+    )
+))]
+unsafe impl allocator_api2::alloc::Allocator for DevDaxBump {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        let ptr = Self::alloc_bump(layout);
+        if ptr.is_null() {
+            return Err(allocator_api2::alloc::AllocError);
+        }
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, layout.size().max(1)) };
+        Ok(NonNull::from(slice))
+    }
+
+    unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {}
 }
