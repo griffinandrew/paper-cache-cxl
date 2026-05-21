@@ -292,11 +292,11 @@ use crate::rdtsc_probes::{
 pub use rdtsc_probes::{calibrate_tsc_hz, report_all};
 
 
-#[cfg(feature = "devdax_bump")]
-pub mod devdax_bump;
+//#[cfg(feature = "devdax_bump")]
+//pub mod devdax_bump;
 
-#[cfg(feature = "devdax_bump")]
-pub use devdax_bump::DevDaxBump;
+//#[cfg(feature = "devdax_bump")]
+//pub use devdax_bump::DevDaxBump;
 
 
 #[cfg(feature = "original")]
