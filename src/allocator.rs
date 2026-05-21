@@ -561,7 +561,7 @@ unsafe impl allocator_api2::alloc::Allocator for RegionHybrid {
 pub struct RegionHybrid;
 
 #[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
-const DEFAULT_PMEM_REGION_BYTES: usize = 120 * 1024 * 1024 * 1024; // 120 GiB virtual region
+const DEFAULT_PMEM_REGION_BYTES: usize = 100 * 1024 * 1024 * 1024; // 120 GiB virtual region
 
 #[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 const DEFAULT_PMEM_NUMA_NODE: usize = 1;
