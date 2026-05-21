@@ -158,6 +158,9 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
     }
 }
 
+
+
+/*
 /// PMEM region allocator:
 /// - reserves one large mmap region
 /// - attempts NUMA binding to PMEM node
@@ -535,7 +538,255 @@ unsafe impl allocator_api2::alloc::Allocator for RegionHybrid {
         // Intentionally a no-op: this allocator uses bulk reclamation.
     }
 }
+*/
 
+
+
+
+
+
+
+use std::alloc::{AllocError, Allocator, GlobalAlloc, Layout};
+use std::ptr::{self, NonNull};
+use std::sync::Once;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// PMEM region allocator:
+/// - reserves one large mmap region
+/// - attempts NUMA binding to PMEM node
+/// - allocates with lock-free bump pointer
+/// - deallocate is a no-op (bulk reclaim via `reclaim_all`)
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+#[derive(Clone, Copy)]
+pub struct RegionHybrid;
+
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+const DEFAULT_PMEM_REGION_BYTES: usize = 120 * 1024 * 1024 * 1024; // 120 GiB virtual region
+
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+const DEFAULT_PMEM_NUMA_NODE: usize = 1;
+
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+static REGION_INIT: Once = Once::new();
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+static REGION_BASE_ADDR: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+static REGION_SIZE_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+static REGION_OFFSET: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+static REGION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+impl RegionHybrid {
+    /// Eagerly initialize the PMEM region (mmap + mbind).
+    /// Call this once at process startup, before any latency-sensitive
+    /// path, so the kernel binds the target range.
+    pub fn init() {
+        Self::init_if_needed();
+    }
+    
+    #[inline]
+    fn init_if_needed() {
+        REGION_INIT.call_once(|| {
+            let bytes = std::env::var("PAPER_CACHE_PMEM_REGION_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_PMEM_REGION_BYTES);
+
+            let numa_node = std::env::var("PAPER_CACHE_PMEM_NUMA_NODE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_PMEM_NUMA_NODE);
+
+            const MAP_HUGE_2MB: libc::c_int = 21 << 26;
+
+            let mapped = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | MAP_HUGE_2MB,
+                    -1,
+                    0,
+                )
+            };
+
+            assert_ne!(
+                mapped,
+                libc::MAP_FAILED,
+                "RegionHybrid: mmap failed to reserve PMEM region"
+            );
+
+            #[cfg(target_os = "linux")]
+            unsafe {
+                // Apply strict binding onto the VMA range so future page faults 
+                // reliably target your secondary tier node without needing full prefault loops.
+                Self::bind_region_to_numa(mapped, bytes, numa_node);
+            }
+
+            REGION_BASE_ADDR.store(mapped as usize, Ordering::SeqCst);
+            REGION_SIZE_BYTES.store(bytes, Ordering::SeqCst);
+            REGION_OFFSET.store(0, Ordering::SeqCst);
+
+            #[cfg(debug_assertions)]
+            println!(
+                "RegionHybrid: mmap region={} bytes numa_node={} base={:p}",
+                bytes, numa_node, mapped
+            );
+        });
+    }
+
+    /// Touch every page so the kernel allocates + zeroes physical pages now,
+    /// on the PMEM node selected by the preceding `mbind`.
+    #[cfg(target_os = "linux")]
+    pub unsafe fn prefault_region(addr: *mut libc::c_void, size: usize) {
+        let _ = unsafe { libc::madvise(addr, size, libc::MADV_HUGEPAGE) };
+        let page_size = 2 * 1024 * 1024; // 2MB boundaries matching MAP_HUGE_2MB
+        let base = addr as *mut u8;
+        let mut offset = 0usize;
+        while offset < size {
+            unsafe { ptr::write_volatile(base.add(offset), 0u8); }
+            offset += page_size;
+        }
+    }
+
+    #[inline]
+    fn alloc_bump(layout: Layout) -> *mut u8 {
+        Self::init_if_needed();
+
+        let base = REGION_BASE_ADDR.load(Ordering::Acquire);
+        let cap = REGION_SIZE_BYTES.load(Ordering::Acquire);
+        if base == 0 || cap == 0 {
+            return ptr::null_mut();
+        }
+
+        let align = layout.align().max(1);
+        let size = layout.size().max(1);
+
+        loop {
+            let curr = REGION_OFFSET.load(Ordering::Relaxed);
+            let aligned = (curr + (align - 1)) & !(align - 1);
+            let end = match aligned.checked_add(size) {
+                Some(v) => v,
+                None => return ptr::null_mut(),
+            };
+
+            if end > cap {
+                return ptr::null_mut();
+            }
+
+            if REGION_OFFSET
+                .compare_exchange_weak(curr, end, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                return (base as *mut u8).wrapping_add(aligned);
+            }
+        }
+    }
+
+    pub fn reclaim_all() {
+        Self::init_if_needed();
+        REGION_OFFSET.store(0, Ordering::Release);
+        REGION_GENERATION.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn reset_epoch() {
+        Self::reclaim_all();
+    }
+
+    pub fn generation() -> u64 {
+        REGION_GENERATION.load(Ordering::Acquire)
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn bind_region_to_numa(addr: *mut libc::c_void, size: usize, node: usize) {
+        const MPOL_BIND: libc::c_int = 2;
+        const MPOL_MF_STRICT: libc::c_int = 1;
+        
+        let mut nodemask: libc::c_ulong = 0;
+        let bits = (std::mem::size_of::<libc::c_ulong>() * 8) as usize;
+        if node < bits {
+            nodemask |= 1u64.wrapping_shl(node as u32) as libc::c_ulong;
+        }
+        let maxnode = bits as libc::c_ulong;
+
+        #[allow(clippy::cast_possible_wrap)]
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_mbind as libc::c_long,
+                addr,
+                size,
+                MPOL_BIND,
+                &nodemask as *const libc::c_ulong,
+                maxnode,
+                MPOL_MF_STRICT, // Added strict constraint validation to guarantee bindings hook onto the VMA
+            )
+        };
+
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            panic!(
+                "RegionHybrid: mbind(node={}) failed: {}",
+                node, err
+            );
+        }
+    }
+}
+
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+unsafe impl GlobalAlloc for RegionHybrid {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        Self::alloc_bump(layout)
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        // Intentionally a no-op: this allocator uses bulk reclamation.
+    }
+}
+
+#[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+unsafe impl Allocator for RegionHybrid {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let ptr = Self::alloc_bump(layout);
+        if ptr.is_null() {
+            return Err(AllocError);
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, layout.size().max(1)) };
+        Ok(NonNull::from(slice))
+    }
+
+    unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
+        // Intentionally a no-op: this allocator uses bulk reclamation.
+    }
+}
+
+// allocator_api2 support (for hashbrown and dlv-list under PMEM allocator modes)
+#[cfg(all(
+    any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"),
+    any(
+        feature = "global_hashtable_pmem",
+        feature = "tiering_hashtable_pmem",
+        feature = "eviction_stacks_pmem",
+        feature = "global_flatmap_pmem"
+    )
+))]
+unsafe impl allocator_api2::alloc::Allocator for RegionHybrid {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        let ptr = Self::alloc_bump(layout);
+        if ptr.is_null() {
+            return Err(allocator_api2::alloc::AllocError);
+        }
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, layout.size().max(1)) };
+        Ok(NonNull::from(slice))
+    }
+
+    unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
+        // Intentionally a no-op: this allocator uses bulk reclamation.
+    }
+}
 
 
 
