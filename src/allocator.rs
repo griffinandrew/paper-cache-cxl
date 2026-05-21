@@ -300,7 +300,7 @@ impl RegionHybrid {
 
     */
 
-    #[inline]
+   #[inline]
     fn init_if_needed() {
         REGION_INIT.call_once(|| {
             let bytes = std::env::var("PAPER_CACHE_PMEM_REGION_SIZE")
@@ -319,7 +319,7 @@ impl RegionHybrid {
             const MPOL_DEFAULT: libc::c_int = 0;
 
             let mapped = unsafe {
-                // 1. Establish a 64-bit architecture-safe node pointer mask
+                // 1. Construct a thread mask pointing to Node 1
                 let mut nodemask: libc::c_ulong = 0;
                 let bits = (std::mem::size_of::<libc::c_ulong>() * 8) as usize;
                 if numa_node < bits {
@@ -327,7 +327,7 @@ impl RegionHybrid {
                 }
                 let maxnode = bits as libc::c_ulong;
 
-                // 2. Temporarily intercept the allocation routine
+                // 2. Temporarily switch thread policy to target Node 1's pools
                 libc::syscall(
                     libc::SYS_set_mempolicy as libc::c_long,
                     MPOL_BIND,
@@ -335,7 +335,7 @@ impl RegionHybrid {
                     maxnode,
                 );
 
-                // 3. Request the huge page chunk from the target node
+                // 3. Request the huge page layout mapping
                 let ptr = libc::mmap(
                     ptr::null_mut(),
                     bytes,
@@ -345,12 +345,11 @@ impl RegionHybrid {
                     0,
                 );
 
-                // 4. Safely clear the policy to protect the rest of the application threads
-                // CAST FIX: Cast the null pointer explicitly to *const libc::c_ulong to resolve inference
+                // 4. Restore the default thread allocation policy for the rest of your app
                 libc::syscall(
                     libc::SYS_set_mempolicy as libc::c_long,
                     MPOL_DEFAULT,
-                    ptr::null::<libc::c_ulong>(),
+                    ptr::null::<libc::c_ulong>(), // Fixed compiler type inference
                     0,
                 );
 
@@ -363,7 +362,6 @@ impl RegionHybrid {
                 "RegionHybrid: mmap failed to reserve PMEM region"
             );
 
-            // 5. Establish range pinning protection rules for life
             #[cfg(target_os = "linux")]
             unsafe {
                 Self::bind_region_to_numa(mapped, bytes, numa_node);
@@ -375,8 +373,8 @@ impl RegionHybrid {
 
             #[cfg(debug_assertions)]
             println!(
-                "RegionHybrid: 2MB Hugepages Secured on Node {} at base={:p}",
-                numa_node, mapped
+                "RegionHybrid: mmap region={} bytes numa_node={} base={:p}",
+                bytes, numa_node, mapped
             );
         });
     }
