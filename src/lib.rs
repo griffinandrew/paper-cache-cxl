@@ -33,9 +33,11 @@ compile_error!("Cannot enable both 'hashbrown_dram' and 'global_flatmap_pmem' fe
 //static GLOBAL: Jemalloc = Jemalloc;
 
 
-#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump"))]
 pub mod allocator;
 
+
+/*
 #[cfg(all(
     any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"),
     any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator")
@@ -47,6 +49,63 @@ use crate::allocator::RegionHybrid as Hybrid;
     not(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))
 ))]
 use crate::allocator::HybridObjects as Hybrid;
+*/
+
+
+#[cfg(all(
+    any(
+        feature = "key_value_pmem",
+        feature = "global_hashtable_pmem",
+        feature = "tiering_hashtable_pmem",
+        feature = "flatmap_pmem",
+        feature = "global_flatmap_pmem",
+        feature = "eviction_stacks_pmem",
+        feature = "pmem_region_alloc",
+        feature = "region_hybrid_allocator",
+        feature = "devdax_bump",
+    ),
+    feature = "devdax_bump"
+))]
+use crate::allocator::DevDaxBump as Hybrid;
+
+#[cfg(all(
+    any(
+        feature = "key_value_pmem",
+        feature = "global_hashtable_pmem",
+        feature = "tiering_hashtable_pmem",
+        feature = "flatmap_pmem",
+        feature = "global_flatmap_pmem",
+        feature = "eviction_stacks_pmem",
+        feature = "pmem_region_alloc",
+        feature = "region_hybrid_allocator",
+        feature = "devdax_bump",
+    ),
+    not(feature = "devdax_bump"),
+    any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator")
+))]
+use crate::allocator::RegionHybrid as Hybrid;
+
+#[cfg(all(
+    any(
+        feature = "key_value_pmem",
+        feature = "global_hashtable_pmem",
+        feature = "tiering_hashtable_pmem",
+        feature = "flatmap_pmem",
+        feature = "global_flatmap_pmem",
+        feature = "eviction_stacks_pmem",
+        feature = "pmem_region_alloc",
+        feature = "region_hybrid_allocator",
+        feature = "devdax_bump",
+    ),
+    not(any(
+        feature = "devdax_bump",
+        feature = "pmem_region_alloc",
+        feature = "region_hybrid_allocator",
+    ))
+))]
+use crate::allocator::HybridObjects as Hybrid;
+
+
 
 // UMF bindings are always needed when any PMEM feature is active.
 // The build script guarantees that the UMF C symbols are always present:
