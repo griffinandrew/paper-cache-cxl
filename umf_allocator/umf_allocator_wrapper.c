@@ -678,7 +678,7 @@ int check_tier(void *ptr) {
  * Returns 0 on success. */
 int umf_allocator_prewarm(size_t bytes, size_t chunk) {
     if (bytes == 0) return 0;
-    if (chunk == 0) chunk = 4096;  /* 2 MiB default */
+    if (chunk == 0) chunk = 4096;  
 
     umf_memory_pool_handle_t p =
         atomic_load_explicit(&pool, memory_order_acquire);
