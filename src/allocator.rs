@@ -984,13 +984,6 @@ unsafe impl allocator_api2::alloc::Allocator for DevDaxBump {
 
 
 
-use std::alloc::{GlobalAlloc, Layout};
-use std::core::alloc::{AllocError, Allocator};
-use std::ffi::CString;
-use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Once;
-
 #[cfg(feature = "devdax_bump")]
 const DEFAULT_DEVDAX_PATH: &str = "/dev/dax0.0";
 
