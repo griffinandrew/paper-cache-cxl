@@ -792,9 +792,6 @@ unsafe impl allocator_api2::alloc::Allocator for RegionHybrid {
 
 
 
-/*
-
-
 #[cfg(feature = "devdax_bump")]
 const DEFAULT_DEVDAX_PATH: &str = "/dev/dax0.0";
 
@@ -978,11 +975,13 @@ unsafe impl allocator_api2::alloc::Allocator for DevDaxBump {
 
 
 
-*/
 
  // above is dev dax bump with lazy faults...
 
 
+
+
+ /* 
 
 #[cfg(feature = "devdax_bump")]
 const DEFAULT_DEVDAX_PATH: &str = "/dev/dax0.0";
@@ -1243,3 +1242,4 @@ unsafe impl allocator_api2::alloc::Allocator for DevDaxBump {
 }
 
 
+*/
