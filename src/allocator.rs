@@ -58,8 +58,7 @@ impl HybridObjects {
             #[cfg(debug_assertions)]
             println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
         });
-        //let chunk = 2 * 1024 * 1024usize;
-        let chunk = 4096usize;
+        let chunk = 2 * 1024 * 1024usize;
         let rc = unsafe { allocator_bindings::umf_allocator_prewarm(prewarm_bytes, chunk) };
         if rc != 0 {
             eprintln!("UMF prewarm returned {}", rc);
