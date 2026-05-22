@@ -792,16 +792,14 @@ unsafe impl allocator_api2::alloc::Allocator for RegionHybrid {
 
 
 
-
-
-
 /*
+
 
 #[cfg(feature = "devdax_bump")]
 const DEFAULT_DEVDAX_PATH: &str = "/dev/dax0.0";
 
 #[cfg(feature = "devdax_bump")]
-const DEFAULT_DEVDAX_SIZE: usize = 64 * 1024 * 1024 * 1024; // 64 GiB
+const DEFAULT_DEVDAX_SIZE: usize = 110 * 1024 * 1024 * 1024; // 110 GiB
 
 #[cfg(feature = "devdax_bump")]
 #[derive(Clone, Copy)]
@@ -980,7 +978,9 @@ unsafe impl allocator_api2::alloc::Allocator for DevDaxBump {
 
 
 
-*/ // above is dev dax bump with lazy faults...
+*/
+
+ // above is dev dax bump with lazy faults...
 
 
 
@@ -988,7 +988,7 @@ unsafe impl allocator_api2::alloc::Allocator for DevDaxBump {
 const DEFAULT_DEVDAX_PATH: &str = "/dev/dax0.0";
 
 #[cfg(feature = "devdax_bump")]
-const DEFAULT_DEVDAX_SIZE: usize = 64 * 1024 * 1024 * 1024; // 64 GiB
+const DEFAULT_DEVDAX_SIZE: usize = 110 * 1024 * 1024 * 1024; // 64 GiB
 
 #[cfg(feature = "devdax_bump")]
 #[derive(Clone, Copy)]
@@ -1244,3 +1244,4 @@ unsafe impl allocator_api2::alloc::Allocator for DevDaxBump {
 
 
 
+*/
