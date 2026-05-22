@@ -572,6 +572,9 @@ int umf_allocator_init(int numa_node) {
     // 1 means TRUE -> retain all memory blocks inside the pool user-space cache
     umfScalablePoolParamsSetKeepAllMemory(scalable_params, 1);
 
+    size_t huge_chunk_size = 1024 * 1024 * 1024ULL; // 1 GiB
+    umfScalablePoolParamsSetGranularity(scalable_params, huge_chunk_size);
+
     // Create pool into a local first; only publish once fully constructed.
     // Scalable pool takes no params, so pass NULL.
     res = umfPoolCreate(
