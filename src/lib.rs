@@ -236,9 +236,9 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 
 pub mod allocator;
 
-//#[cfg(feature = "all_dram")]
-//#[global_allocator]
-//static GLOBAL: allocator::HybridObjects = allocator::HybridObjects;
+#[cfg(feature = "all_dram")]
+#[global_allocator]
+static GLOBAL: allocator::HybridObjects = allocator::HybridObjects;
 
 
 
