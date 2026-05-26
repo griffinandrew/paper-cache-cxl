@@ -234,7 +234,7 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 
 //#[cfg(feature = "pmem_region_alloc")]
 
-mod allocator;
+pub mod allocator;
 
 #[cfg(feature = "all_dram")]
 #[global_allocator]
