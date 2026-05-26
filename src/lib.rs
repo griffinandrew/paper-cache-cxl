@@ -162,6 +162,7 @@ use std::{
 		BuildHasher,
 		BuildHasherDefault,
 	},
+	ptr
 };
 
 #[cfg(any(
@@ -244,6 +245,9 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 
 //static GLOBAL: allocator::RegionHybrid = allocator::RegionHybrid;
 
+
+#[cfg(not(feature = "all_dram"))]
+use std::alloc::{Layout, Allocator}; // Essential imports
 
 
 //#[cfg(feature = "all_dram")]
@@ -1644,6 +1648,8 @@ where
 
 
 
+
+
 #[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_pmem")))]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
@@ -2078,6 +2084,7 @@ where
 	/// ```
 	
 	// not V but &[u8]?? 
+
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> 
 	where

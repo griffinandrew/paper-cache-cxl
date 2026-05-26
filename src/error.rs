@@ -38,4 +38,7 @@ pub enum CacheError {
 
 	#[error("invalid policy")]
 	InvalidPolicy,
+
+	#[error("allocation failed")]
+	AllocationFailed,
 }
