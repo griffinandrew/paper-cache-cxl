@@ -2132,7 +2132,7 @@ where
 			unsafe {
 				ptr::copy_nonoverlapping(value.as_ptr(), memory_ptr, value.len());
 
-				use std::arch::x86_64::{_mm_clflushopt, _mm_sfence};
+				use std::arch::x86_64::{_mm_clflush, _mm_sfence};
 
 				let cache_line_size = 64usize;
 				let start = memory_ptr as usize;
@@ -2141,7 +2141,7 @@ where
 				// containing the first byte even if the allocation isn't aligned.
 				let mut addr = start & !(cache_line_size - 1);
 				while addr < end {
-					_mm_clflushopt(addr as *const u8);
+					_mm_clflush(addr as *const u8);
 					addr += cache_line_size;
 				}
 				_mm_sfence();
