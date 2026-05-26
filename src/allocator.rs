@@ -74,15 +74,15 @@ unsafe impl GlobalAlloc for HybridObjects {
         // maps a jemalloc pool over the PMEM NUMA node.  In the stub this is
         // a no-op.
         //INIT.call_once(|| {
-        //    let numa_node = 0; // PMEM NUMA node (ignored by stub)
+        //    let numa_node = 1; // PMEM NUMA node (ignored by stub)
         //    allocator_bindings::umf_allocator_init(numa_node);
         //    #[cfg(debug_assertions)]
         //    println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
 
-        //INIT.call_once( || { 
-        //    HybridObjects::init_and_prewarm(1, 50 * 1024 * 1024 * 1024 )}
-        //);
+        INIT.call_once( || { 
+            HybridObjects::init_and_prewarm(0, 28 * 1024 * 1024 * 1024 )}
+        );
 
         let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
