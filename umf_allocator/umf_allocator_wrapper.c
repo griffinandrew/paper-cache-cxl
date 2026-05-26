@@ -573,7 +573,8 @@ int umf_allocator_init(int numa_node) {
     umfScalablePoolParamsSetKeepAllMemory(scalable_params, 1);
 
     //size_t huge_chunk_size = 1024 * 1024 * 1024ULL; // 1 GiB
-    //umfScalablePoolParamsSetGranularity(scalable_params, huge_chunk_size);
+    size_t huge_chunk_size = 2 * 1024 * 1024ULL; // 2 MiB, the default superblock size for the scalable pool. Setting the granularity to the superblock size can help reduce fragmentation and improve performance for typical workloads.
+    umfScalablePoolParamsSetGranularity(scalable_params, huge_chunk_size);
 
     // Create pool into a local first; only publish once fully constructed.
     // Scalable pool takes no params, so pass NULL.
