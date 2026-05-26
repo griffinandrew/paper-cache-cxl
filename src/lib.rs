@@ -2123,9 +2123,11 @@ where
 
 			let layout = Layout::from_size_align(value.len(), 1).unwrap();
 
-			let memory_ptr = Hybrid.allocate(layout)
-    			.map_err(|_| CacheError::AllocationFailed)?
-    			.as_mut_ptr() as *mut u8;
+			let memory_block = Hybrid.allocate(layout)
+				.map_err(|_| CacheError::Internal)?;
+
+			// 1. Get the raw pointer to the start of the memory
+			let memory_ptr = memory_block.as_ptr() as *mut u8;
 
 			unsafe {
 				ptr::copy_nonoverlapping(value.as_ptr(), memory_ptr, value.len());
