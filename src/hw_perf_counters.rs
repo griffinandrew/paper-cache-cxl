@@ -422,6 +422,10 @@ impl GlobalHwPerfCounters {
             
             #[cfg(feature = "global_flatmap_pmem")]
             global_flatmap_pmem: HwHashMapCounters::new(),
+
+            #[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem")))]
+            // If no specific hashmap configuration is enabled, we can still create an empty struct
+            dashmap_counters: HwHashMapCounters::new(),
         }
     }
 }
@@ -468,7 +472,7 @@ pub fn get_hw_hashmap_stats() -> Option<HwHashMapStats> {
     
     #[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem")))]
     {
-        None
+        return Some(counters.dashmap_counters.get_stats());
     }
 }
 
@@ -488,6 +492,9 @@ pub fn print_hw_perf_stats() {
         
         #[cfg(all(feature = "global_flatmap_pmem", not(feature = "hashbrown_dram"), not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram")))]
         println!("Global HashMap (FlatMap in PMEM):");
+
+        #[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem")))]
+        println!("Global HashMap (DashMap):");
         
         print!("{}", stats);
     } else {
