@@ -611,7 +611,8 @@ impl RegionHybrid {
                     ptr::null_mut(),
                     bytes,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | MAP_HUGE_2MB,
+                    //libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | MAP_HUGE_2MB,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                     -1,
                     0,
                 )
