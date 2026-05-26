@@ -2111,7 +2111,28 @@ where
 
 		#[cfg(not(feature = "sets_dram"))]
 		{
-			let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
+			//let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
+
+
+			let layout = Layout::from_size_align(value.len(), 1).unwrap();
+
+			let memory_ptr = Hybrid.allocate(layout)
+    			.map_err(|_| CacheError::AllocationFailed)?
+    			.as_mut_ptr() as *mut u8;
+
+			unsafe {
+				ptr::copy_nonoverlapping(value.as_ptr(), memory_ptr, value.len());
+			}
+
+			let val_buf: BufferPMEM = unsafe {
+				Box::from_raw_in(
+					ptr::slice_from_raw_parts_mut(memory_ptr, value.len()),
+					Hybrid
+				)
+			};
+
+
+
 
 			// === phase 2: allocation of value buffer ===
 			//let t2_start = rdtsc();
