@@ -170,6 +170,8 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
 //------------ umf for numa 0 
 
 
+#[derive(Clone, Copy)]
+pub struct DRAMObjects;
 
 impl DRAMObjects {
     /// Initialize the UMF pool and prewarm a working-set-sized region.
