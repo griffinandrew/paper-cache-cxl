@@ -40,7 +40,6 @@ mod allocator_bindings {
 /// `malloc`/`free`, so the allocator is fully functional without hardware.
 #[derive(Clone, Copy)]
 pub struct HybridObjects;
-impl HybridObjects { const NODE: i32 = 1; }     // PMEM
 
 static INIT: Once = Once::new();
 static PRINT_THRESHOLD: usize = 10000;
@@ -65,6 +64,7 @@ impl HybridObjects {
             eprintln!("UMF prewarm returned {}", rc);
         }
     }
+    const NODE: i32 = 1;
 }
 
 
@@ -173,7 +173,7 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
 
 #[derive(Clone, Copy)]
 pub struct DRAMObjects;
-impl DRAMObjects { const NODE: i32 = 0; }     // DRAM
+
 
 impl DRAMObjects {
     /// Initialize the UMF pool and prewarm a working-set-sized region.
@@ -190,6 +190,7 @@ impl DRAMObjects {
             eprintln!("UMF prewarm returned {}", rc);
         }
     }
+    const NODE: i32 = 0;
 }
 
 
