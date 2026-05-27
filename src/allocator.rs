@@ -85,7 +85,7 @@ unsafe impl GlobalAlloc for HybridObjects {
         //    HybridObjects::init_and_prewarm(1, 50 * 1024 * 1024 * 1024 )}
         //);
 
-        let ptr = allocator_bindings::umf_alloc(NODE,layout.size(), layout.align()) as *mut u8;
+        let ptr = allocator_bindings::umf_alloc(Self::NODE,layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
             println!("HybridObjects: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
@@ -108,7 +108,7 @@ unsafe impl GlobalAlloc for HybridObjects {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        allocator_bindings::umf_dealloc(NODE, ptr as *mut std::ffi::c_void);
+        allocator_bindings::umf_dealloc(Self::NODE, ptr as *mut std::ffi::c_void);
 
         #[cfg(debug_assertions)]
         {
@@ -208,10 +208,10 @@ unsafe impl GlobalAlloc for DRAMObjects {
         //});
 
         INIT.call_once( || { 
-            DRAMObjects::init_and_prewarm(NODE, 35 * 1024 * 1024 * 1024)}
+            DRAMObjects::init_and_prewarm(Self::NODE, 35 * 1024 * 1024 * 1024)}
         );
 
-        let ptr = allocator_bindings::umf_alloc(NODE,layout.size(), layout.align()) as *mut u8;
+        let ptr = allocator_bindings::umf_alloc(Self::NODE,layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
             println!("DRAMObjects: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
@@ -234,7 +234,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        allocator_bindings::umf_dealloc(NODE, ptr as *mut std::ffi::c_void);
+        allocator_bindings::umf_dealloc(Self::NODE, ptr as *mut std::ffi::c_void);
 
         #[cfg(debug_assertions)]
         {
