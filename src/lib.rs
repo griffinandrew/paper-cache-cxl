@@ -6,7 +6,7 @@
  * correct
  */
 
-#![cfg_attr(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump"), feature(allocator_api))]
+#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump"), feature(allocator_api))]
 
 
 //#![cfg_attr(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump"), feature(allocator_api))]
@@ -34,7 +34,7 @@ compile_error!("Cannot enable both 'hashbrown_dram' and 'global_flatmap_pmem' fe
 //static GLOBAL: Jemalloc = Jemalloc;
 
 
-#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump", feature = "all_dram"))]
+#[cfg(any(feature = "hashbrown_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump", feature = "all_dram"))]
 pub mod allocator;
 
 
