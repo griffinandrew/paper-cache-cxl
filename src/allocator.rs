@@ -208,9 +208,10 @@ unsafe impl GlobalAlloc for DRAMObjects {
         //});
 
         INIT.call_once( || { 
+            DRAMObjects::init_and_prewarm(Self::NODE, 35 * 1024 * 1024 * 1024)}
+
             println!("DRAMObjects: Initialising and prewarming UMF pool on NUMA node {} with {} bytes",
                 Self::NODE, 35 * 1024 * 1024 * 1024);
-            DRAMObjects::init_and_prewarm(Self::NODE, 35 * 1024 * 1024 * 1024)}
         );
 
         let ptr = allocator_bindings::umf_alloc(Self::NODE,layout.size(), layout.align()) as *mut u8;
