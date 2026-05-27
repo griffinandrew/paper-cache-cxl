@@ -24,6 +24,10 @@ unsafe extern "C" {
 
 
 
+use libc::c_int;
+use libc::c_void;
+
+
 
 
 
