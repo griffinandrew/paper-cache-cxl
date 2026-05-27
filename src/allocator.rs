@@ -40,6 +40,7 @@ mod allocator_bindings {
 /// `malloc`/`free`, so the allocator is fully functional without hardware.
 #[derive(Clone, Copy)]
 pub struct HybridObjects;
+impl HybridObjects { const NODE: i32 = 1; }     // PMEM
 
 static INIT: Once = Once::new();
 static PRINT_THRESHOLD: usize = 10000;
@@ -59,7 +60,7 @@ impl HybridObjects {
         println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
         let chunk = 2 * 1024 * 1024usize;
-        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(prewarm_bytes, chunk) };
+        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, prewarm_bytes, chunk) };
         if rc != 0 {
             eprintln!("UMF prewarm returned {}", rc);
         }
@@ -84,7 +85,7 @@ unsafe impl GlobalAlloc for HybridObjects {
         //    HybridObjects::init_and_prewarm(1, 50 * 1024 * 1024 * 1024 )}
         //);
 
-        let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
+        let ptr = allocator_bindings::umf_alloc(NODE,layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
             println!("HybridObjects: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
@@ -107,7 +108,7 @@ unsafe impl GlobalAlloc for HybridObjects {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void);
+        allocator_bindings::umf_dealloc(NODE, ptr as *mut std::ffi::c_void);
 
         #[cfg(debug_assertions)]
         {
@@ -172,6 +173,7 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
 
 #[derive(Clone, Copy)]
 pub struct DRAMObjects;
+impl DRAMObjects { const NODE: i32 = 0; }     // DRAM
 
 impl DRAMObjects {
     /// Initialize the UMF pool and prewarm a working-set-sized region.
@@ -183,7 +185,7 @@ impl DRAMObjects {
         println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
         let chunk = 2 * 1024 * 1024usize;
-        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(prewarm_bytes, chunk) };
+        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, prewarm_bytes, chunk) };
         if rc != 0 {
             eprintln!("UMF prewarm returned {}", rc);
         }
@@ -205,10 +207,10 @@ unsafe impl GlobalAlloc for DRAMObjects {
         //});
 
         INIT.call_once( || { 
-            DRAMObjects::init_and_prewarm(0, 35 * 1024 * 1024 * 1024)}
+            DRAMObjects::init_and_prewarm(NODE, 35 * 1024 * 1024 * 1024)}
         );
 
-        let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
+        let ptr = allocator_bindings::umf_alloc(NODE,layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
             println!("DRAMObjects: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
@@ -231,7 +233,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        allocator_bindings::umf_dealloc(ptr as *mut std::ffi::c_void);
+        allocator_bindings::umf_dealloc(NODE, ptr as *mut std::ffi::c_void);
 
         #[cfg(debug_assertions)]
         {

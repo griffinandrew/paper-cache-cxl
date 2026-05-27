@@ -2,6 +2,8 @@
 
 //solo numa and daxdev config
 
+
+/* 
 unsafe extern "C" {
 
     //this one is for devdax 
@@ -18,6 +20,21 @@ unsafe extern "C" {
     pub fn umf_allocator_prewarm(bytes: usize, chunk: usize) -> i32;
 } 
 
+*/
+
+
+
+
+
+
+
+unsafe extern "C" {
+    pub fn umf_allocator_init(numa_node: c_int) -> c_int;
+    pub fn umf_alloc(numa_node: c_int, size: usize, align: usize) -> *mut c_void;
+    pub fn umf_dealloc(numa_node: c_int, ptr: *mut c_void);
+    pub fn umf_allocator_prewarm(numa_node: c_int, bytes: usize, chunk: usize) -> c_int;
+    pub fn check_tier(ptr: *mut c_void) -> c_int;  // now returns node id, was bool-ish
+}
 
 
 
