@@ -208,7 +208,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
         //});
 
         INIT.call_once( || { 
-            DRAMObjects::init_and_prewarm(Self::NODE_DRAM, 35 * 1024 * 1024 * 1024);
+            DRAMObjects::init_and_prewarm(Self::NODE_DRAM, 50 * 1024 * 1024 * 1024);
 
             //println!("DRAMObjects: Initialising and prewarming UMF pool on NUMA node {} with {} bytes",
             //    Self::NODE_DRAM, 35 * 1024 * 1024 * 1024);
