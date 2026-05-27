@@ -81,7 +81,7 @@ unsafe impl GlobalAlloc for HybridObjects {
         //});
 
         INIT.call_once( || { 
-            HybridObjects::init_and_prewarm(0, 35 * 1024 * 1024 * 1024 )}
+            HybridObjects::init_and_prewarm(1, 50 * 1024 * 1024 * 1024 )}
         );
 
         let ptr = allocator_bindings::umf_alloc(layout.size(), layout.align()) as *mut u8;
