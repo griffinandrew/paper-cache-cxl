@@ -2118,9 +2118,9 @@ where
 
 		#[cfg(not(feature = "sets_dram"))]
 		{
-			//let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
+			let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
 
-
+			/* 
 			let layout = Layout::from_size_align(value.len(), 1).unwrap();
 
 			let memory_block = Hybrid.allocate(layout)
@@ -2153,6 +2153,9 @@ where
 					Hybrid
 				)
 			};
+			
+
+			 */
 
 
 
