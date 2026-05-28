@@ -190,7 +190,7 @@ impl DRAMObjects {
             eprintln!("UMF prewarm returned {}", rc);
         }
     }
-    const NODE_DRAM: i32 = 1;
+    const NODE_DRAM: i32 = 0;
 }
 
 
@@ -201,7 +201,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
         // maps a jemalloc pool over the PMEM NUMA node.  In the stub this is
         // a no-op.
         //INIT.call_once(|| {
-        //    let numa_node = 1; // PMEM NUMA node (ignored by stub)
+        //    let numa_node = 0; // DRAM NUMA node (ignored by stub)
         //    allocator_bindings::umf_allocator_init(numa_node);
         //    #[cfg(debug_assertions)]
         //    println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);

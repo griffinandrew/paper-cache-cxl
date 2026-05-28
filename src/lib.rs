@@ -26,12 +26,12 @@ compile_error!("Cannot enable both 'hashbrown_dram' and 'global_flatmap_dram' fe
 compile_error!("Cannot enable both 'hashbrown_dram' and 'global_flatmap_pmem' features simultaneously. Please choose only one global hashtable mode.");
 
 // When all_dram is enabled, use jemalloc as the global allocator
-//#[cfg(feature = "all_dram")]
-//use tikv_jemallocator::Jemalloc;
+#[cfg(feature = "all_dram")]
+use tikv_jemallocator::Jemalloc;
 
-//#[cfg(feature = "all_dram")]
-//#[global_allocator]
-//static GLOBAL: Jemalloc = Jemalloc;
+#[cfg(feature = "all_dram")]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 
 #[cfg(any(feature = "hashbrown_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump", feature = "all_dram"))]
@@ -244,8 +244,8 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 //pub mod allocator;
 
 
-#[global_allocator]
-static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
+//#[global_allocator]
+//static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 
 
 
