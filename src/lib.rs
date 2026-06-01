@@ -1242,10 +1242,10 @@ where
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		
-		//let t0 = rdtsc();
+		let t0 = rdtsc();
 		let hashed_key = self.hash_key(&key);
-		//let t1 = rdtsc();
-		//PHASE_PRE_ALLOC.record(t1 - t0);
+		let t1 = rdtsc();
+		PHASE_PRE_ALLOC.record(t1 - t0);
 
 		//allocate it as a regular buffer... 
 		let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
@@ -2645,6 +2645,8 @@ where
 		self.status.try_to_status()
 	}
 
+
+	/* none instrumented get
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
@@ -2661,6 +2663,58 @@ where
 		};
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		result
+	}
+
+	*/
+
+
+		pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
+		let t0 = rdtsc();
+		let hashed_key = self.hash_key(key);
+		let t1 = rdtsc();
+		PHASE_GET_HASH.record(t1 - t0);
+
+		let guard = self.objects.read().unwrap();
+		let t2 = rdtsc();
+		PHASE_GET_LOCK.record(t2 - t1);
+
+		let lookup = guard.get(&hashed_key);
+		let t3 = rdtsc();
+		PHASE_GET_LOOKUP.record(t3 - t2);
+
+		let result = match lookup {
+			Some(object) => {
+				let matched = object.key_matches(key) && !object.is_expired();
+				let t4 = rdtsc();
+				PHASE_GET_VALIDATE.record(t4 - t3);
+
+				if matched {
+					self.status.incr_hits();
+					let arc_val = object.data();
+					let v = arc_val.as_ref().to_vec();
+					let t5 = rdtsc();
+					PHASE_GET_COPY.record(t5 - t4);
+					Ok(v)
+				} else {
+					self.status.incr_misses();
+					Err(CacheError::KeyNotFound)
+				}
+			}
+			None => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			}
+		};
+
+		drop(guard); // release read lock before broadcast — matches original lock scope
+
+		let t6 = rdtsc();
+		let br = self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()));
+		let t7 = rdtsc();
+		PHASE_GET_BROADCAST.record(t7 - t6);
+		br?;
+
 		result
 	}
 
@@ -2922,6 +2976,7 @@ where
 		self.status.try_to_status()
 	}
 
+	/* none instrumented get
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
@@ -2938,6 +2993,58 @@ where
 		};
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		result
+	}
+
+	*/
+
+
+		pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
+		let t0 = rdtsc();
+		let hashed_key = self.hash_key(key);
+		let t1 = rdtsc();
+		PHASE_GET_HASH.record(t1 - t0);
+
+		let guard = self.objects.read().unwrap();
+		let t2 = rdtsc();
+		PHASE_GET_LOCK.record(t2 - t1);
+
+		let lookup = guard.get(&hashed_key);
+		let t3 = rdtsc();
+		PHASE_GET_LOOKUP.record(t3 - t2);
+
+		let result = match lookup {
+			Some(object) => {
+				let matched = object.key_matches(key) && !object.is_expired();
+				let t4 = rdtsc();
+				PHASE_GET_VALIDATE.record(t4 - t3);
+
+				if matched {
+					self.status.incr_hits();
+					let arc_val = object.data();
+					let v = arc_val.as_ref().to_vec();
+					let t5 = rdtsc();
+					PHASE_GET_COPY.record(t5 - t4);
+					Ok(v)
+				} else {
+					self.status.incr_misses();
+					Err(CacheError::KeyNotFound)
+				}
+			}
+			None => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			}
+		};
+
+		drop(guard); // release read lock before broadcast — matches original lock scope
+
+		let t6 = rdtsc();
+		let br = self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()));
+		let t7 = rdtsc();
+		PHASE_GET_BROADCAST.record(t7 - t6);
+		br?;
+
 		result
 	}
 

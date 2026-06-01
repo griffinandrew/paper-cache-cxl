@@ -58,6 +58,16 @@ pub static PHASE_PRE_ALLOC:  PhaseStats = PhaseStats::new("pre_alloc (index)");
 pub static PHASE_ALLOC:      PhaseStats = PhaseStats::new("alloc (umf/bump)");
 pub static PHASE_MEMCPY:     PhaseStats = PhaseStats::new("memcpy (write)");
 pub static PHASE_POST:       PhaseStats = PhaseStats::new("post (bookkeeping)");
+pub static PHASE_INSERT:     PhaseStats = PhaseStats::new("hashtable insert");
+
+
+pub static PHASE_GET_HASH:      PhaseStats = PhaseStats::new("get: hash_key");
+pub static PHASE_GET_LOCK:      PhaseStats = PhaseStats::new("get: rwlock read");
+pub static PHASE_GET_LOOKUP:    PhaseStats = PhaseStats::new("get: map.get");
+pub static PHASE_GET_VALIDATE:  PhaseStats = PhaseStats::new("get: key/expiry");
+pub static PHASE_GET_COPY:      PhaseStats = PhaseStats::new("get: to_vec");
+pub static PHASE_GET_BROADCAST: PhaseStats = PhaseStats::new("get: broadcast");
+pub static PHASE_PROBE:         PhaseStats = PhaseStats::new("rdtsc probe pair");
 
 pub fn report_all(tsc_hz: f64) {
     println!("\n=== SET path phase breakdown ===");
@@ -65,6 +75,7 @@ pub fn report_all(tsc_hz: f64) {
     PHASE_ALLOC.report(tsc_hz);
     PHASE_MEMCPY.report(tsc_hz);
     PHASE_POST.report(tsc_hz);
+    PHASE_INSERT.report(tsc_hz);
     println!();
 }
 
@@ -79,6 +90,28 @@ pub fn calibrate_tsc_hz() -> f64 {
     let hz = (t1 - t0) as f64 / elapsed;
     println!("TSC calibration: {:.3} GHz", hz / 1e9);
     hz
+}
+
+
+pub fn report_get(tsc_hz: f64) {
+    println!("\n=== GET path phase breakdown ===");
+    PHASE_GET_HASH.report(tsc_hz);
+    PHASE_GET_LOCK.report(tsc_hz);
+    PHASE_GET_LOOKUP.report(tsc_hz);
+    PHASE_GET_VALIDATE.report(tsc_hz);
+    PHASE_GET_COPY.report(tsc_hz);
+    PHASE_GET_BROADCAST.report(tsc_hz);
+    PHASE_PROBE.report(tsc_hz);  // subtract this floor from each phase above
+    println!();
+}
+
+// Call once at startup, after calibrate_tsc_hz, before the bench loop.
+pub fn calibrate_probe_overhead(iters: u64) {
+    for _ in 0..iters {
+        let a = rdtsc();
+        let b = rdtsc();
+        PHASE_PROBE.record(b - a);
+    }
 }
 
 
