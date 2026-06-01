@@ -1242,10 +1242,10 @@ where
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		
-		let t0 = rdtsc();
+		//let t0 = rdtsc();
 		let hashed_key = self.hash_key(&key);
-		let t1 = rdtsc();
-		PHASE_PRE_ALLOC.record(t1 - t0);
+		//let t1 = rdtsc();
+		//PHASE_PRE_ALLOC.record(t1 - t0);
 
 		//allocate it as a regular buffer... 
 		let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
@@ -2646,7 +2646,7 @@ where
 	}
 
 
-	/* none instrumented get
+	// none instrumented get
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
@@ -2666,10 +2666,12 @@ where
 		result
 	}
 
-	*/
+	
 
 
-		pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
+
+	/*
+	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let t0 = rdtsc();
 		let hashed_key = self.hash_key(key);
 		let t1 = rdtsc();
@@ -2717,6 +2719,7 @@ where
 
 		result
 	}
+	*/
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
@@ -2976,7 +2979,7 @@ where
 		self.status.try_to_status()
 	}
 
-	/* none instrumented get
+	// none instrumented get
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
@@ -2996,10 +2999,10 @@ where
 		result
 	}
 
-	*/
+	
 
-
-		pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
+	/* 
+	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let t0 = rdtsc();
 		let hashed_key = self.hash_key(key);
 		let t1 = rdtsc();
@@ -3047,6 +3050,7 @@ where
 
 		result
 	}
+	*/
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
