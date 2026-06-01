@@ -69,7 +69,7 @@ pub static PHASE_GET_COPY:      PhaseStats = PhaseStats::new("get: to_vec");
 pub static PHASE_GET_BROADCAST: PhaseStats = PhaseStats::new("get: broadcast");
 pub static PHASE_PROBE:         PhaseStats = PhaseStats::new("rdtsc probe pair");
 
-pub fn report_all(tsc_hz: f64) {
+pub fn report_set(tsc_hz: f64) {
     println!("\n=== SET path phase breakdown ===");
     PHASE_PRE_ALLOC.report(tsc_hz);
     PHASE_ALLOC.report(tsc_hz);

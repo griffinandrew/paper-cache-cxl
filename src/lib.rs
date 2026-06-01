@@ -304,7 +304,7 @@ use crate::rdtsc_probes::{
     rdtsc, PHASE_PRE_ALLOC, PHASE_ALLOC, PHASE_MEMCPY, PHASE_POST, PHASE_INSERT, PHASE_GET_HASH, PHASE_GET_LOCK, PHASE_GET_LOOKUP, PHASE_GET_VALIDATE, PHASE_GET_COPY, PHASE_GET_BROADCAST, PHASE_PROBE,
 };
 
-pub use rdtsc_probes::{calibrate_tsc_hz, report_all};
+pub use rdtsc_probes::{calibrate_tsc_hz, report_set, report_get, calibrate_probe_overhead};
 
 
 //#[cfg(feature = "devdax_bump")]
