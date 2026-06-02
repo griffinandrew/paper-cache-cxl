@@ -61,10 +61,10 @@ impl HybridObjects {
         println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
         let chunk = 2 * 1024 * 1024usize;
-        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, prewarm_bytes, chunk) };
-        if rc != 0 {
-            eprintln!("UMF prewarm returned {}", rc);
-        }
+        //let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, prewarm_bytes, chunk) };
+        //if rc != 0 {
+        //    eprintln!("UMF prewarm returned {}", rc);
+        //}
     }
     const NODE: i32 = 1;
 }
@@ -198,10 +198,10 @@ impl DRAMObjects {
         println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
         let chunk = 2 * 1024 * 1024usize;
-        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, prewarm_bytes, chunk) };
-        if rc != 0 {
-            eprintln!("UMF prewarm returned {}", rc);
-        }
+        //let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, prewarm_bytes, chunk) };
+        //if rc != 0 {
+        //    eprintln!("UMF prewarm returned {}", rc);
+        //}
     }
     const NODE_DRAM: i32 = 0;
 }
