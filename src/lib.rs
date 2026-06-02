@@ -1281,6 +1281,7 @@ where
 
 		self.status.incr_sets();
 
+		let t5_start = rdtsc();
 		let old_object_info = self.objects
 			.insert(hashed_key, object)
 			.map(|old_object| {
@@ -1289,6 +1290,8 @@ where
 
 				(base_size, expiry)
 			});
+		let t5_end = rdtsc();
+		PHASE_INSERT.record(t5_end - t5_start);
 
 		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
 			base_size as i64 - old_object_size as i64
@@ -2210,6 +2213,7 @@ where
 
 			self.status.incr_sets();
 
+			let t5_start = rdtsc();
 			let old_object_info = self.objects
 				.insert(hashed_key, object)
 				.map(|old_object| {
@@ -2218,6 +2222,8 @@ where
 
 					(base_size, expiry)
 				});
+			let t5_end = rdtsc();
+			PHASE_INSERT.record(t5_end - t5_start);
 
 			let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
 				base_size as i64 - old_object_size as i64
