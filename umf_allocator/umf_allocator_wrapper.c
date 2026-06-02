@@ -201,7 +201,9 @@ int check_tier(void *ptr) {
  *
  * Call AFTER umf_allocator_init, BEFORE the measured workload.
  * Returns 0 on success. */
-int umf_allocator_prewarm(int numa_node, size_t bytes, size_t chunk) {
+
+
+/*int umf_allocator_prewarm(int numa_node, size_t bytes, size_t chunk) {
     if (bytes == 0) return 0;
     if (chunk == 0) chunk = 4096;
     if (numa_node < 0 || numa_node >= MAX_NODES) {
@@ -239,8 +241,8 @@ int umf_allocator_prewarm(int numa_node, size_t bytes, size_t chunk) {
             return 3;
         }
 
-        /* Touch one byte per page to force the fault. volatile so the
-         * store is not elided by the compiler. */
+        // Touch one byte per page to force the fault. volatile so the
+        // store is not elided by the compiler.
         volatile char *vp = (volatile char *)blk;
         for (size_t off = 0; off < chunk; off += (size_t)pg) {
             vp[off] = 0;
@@ -252,10 +254,147 @@ int umf_allocator_prewarm(int numa_node, size_t bytes, size_t chunk) {
             "umf_allocator_prewarm (node %d): touched %zu chunks x %zu bytes = %zu MiB\n",
             numa_node, got, chunk, (got * chunk) >> 20);
 
-    /* Free everything back into the pool. The scalable pool retains these
-     * blocks for fast reuse; the OS provider does not unmap, so the pages
-     * stay mapped, faulted, and bound to the target NUMA node. */
+    //Free everything back into the pool. The scalable pool retains these
+    //blocks for fast reuse; the OS provider does not unmap, so the pages
+    // stay mapped, faulted, and bound to the target NUMA node. 
     for (size_t i = 0; i < got; i++) umfPoolFree(p, ptrs[i]);
     free(ptrs);
     return 0;
 }
+
+*/
+
+
+
+
+
+/* Prewarm the UMF pool for `numa_node` by allocating `bytes` worth of memory
+ * through it IN THE SAME SIZE CLASSES the workload uses, touching every page so
+ * the OS provider faults + zeroes them on the target NUMA node now, then freeing
+ * everything back into the pool.
+ *
+ * WHY THE SIZE CLASSES MATTER:
+ * The scalable pool (TBB) keeps SIZE-SEGREGATED free lists. A retained 2 MiB
+ * block lives in the large/superblock free list and will NOT satisfy a later
+ * 16 KiB request. So prewarming with one big chunk size warms the wrong size
+ * class: the workload's 245 B .. 32 KiB allocations still pull fresh, unfaulted
+ * pages from the provider and pay first-touch faults on the first write. That
+ * shows up as inflated alloc + memcpy phases (and free memory shrinking during
+ * the run despite "prefaulting everything").
+ *
+ * This version sweeps the size classes the workload actually allocates, so the
+ * retained per-class free lists are warm and page-faulted, and real SETs reuse
+ * them instead of faulting fresh pages.
+ *
+ * Call AFTER umf_allocator_init, BEFORE the measured workload.
+ * Returns 0 on success. */
+int umf_allocator_prewarm(int numa_node, size_t bytes, size_t chunk) {
+    (void)chunk; /* no longer a single chunk size; kept for ABI compatibility */
+
+    if (bytes == 0) return 0;
+    if (numa_node < 0 || numa_node >= MAX_NODES) {
+        fprintf(stderr, "umf_allocator_prewarm: numa_node %d out of range\n", numa_node);
+        return 1;
+    }
+
+    umf_memory_pool_handle_t p = (umf_memory_pool_handle_t)
+        atomic_load_explicit(&pools[numa_node], memory_order_acquire);
+    if (!p) {
+        fprintf(stderr, "umf_allocator_prewarm: pool not initialized (node %d)\n", numa_node);
+        return 1;
+    }
+
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) pg = 4096;
+
+    /* Size classes spanning the workload's value-size range (245 B .. 32 KiB).
+     * Includes points on both sides of the TBB ~8064 B small/large cutoff so
+     * both the per-thread slab path and the central large-object path get
+     * warmed and page-faulted. Adjust to match your trace's size distribution. */
+    static const size_t classes[] = {
+        256, 512, 1024, 2048, 4096, 8192, 16384, 32768
+    };
+    const size_t nclasses = sizeof(classes) / sizeof(classes[0]);
+
+    /* Spread the requested `bytes` budget evenly across the classes, so each
+     * size class gets its free list populated with enough faulted blocks to
+     * cover the working set. */
+    size_t bytes_per_class = bytes / nclasses;
+    if (bytes_per_class == 0) bytes_per_class = bytes; /* tiny budget: still touch each class once */
+
+    /* Track every allocation so we can free them all back at the end (after
+     * touching), letting KeepAllMemory retain the faulted pages per class. */
+    /* Upper bound on count: smallest class dominates. Allocate the tracking
+     * array dynamically and grow if needed. */
+    size_t cap = 0;
+    for (size_t c = 0; c < nclasses; c++) {
+        size_t per = bytes_per_class / classes[c];
+        if (per == 0) per = 1;
+        cap += per;
+    }
+
+    void **ptrs = calloc(cap, sizeof(void *));
+    if (!ptrs) {
+        fprintf(stderr, "umf_allocator_prewarm: out of host memory (cap=%zu)\n", cap);
+        return 2;
+    }
+
+    size_t got = 0;
+    size_t total_bytes = 0;
+
+    for (size_t c = 0; c < nclasses; c++) {
+        size_t sz = classes[c];
+        size_t per = bytes_per_class / sz;
+        if (per == 0) per = 1;
+
+        for (size_t i = 0; i < per; i++) {
+            if (got >= cap) break; /* safety */
+            void *blk = umfPoolMalloc(p, sz);
+            if (!blk) {
+                fprintf(stderr,
+                        "umf_allocator_prewarm (node %d): pool exhausted in class %zu B "
+                        "at %zu/%zu blocks\n",
+                        numa_node, sz, i, per);
+                /* free what we have and bail */
+                for (size_t j = 0; j < got; j++) umfPoolFree(p, ptrs[j]);
+                free(ptrs);
+                return 3;
+            }
+
+            /* Touch one byte per page to force the fault + zero on this node.
+             * volatile so the store is not elided. */
+            volatile char *vp = (volatile char *)blk;
+            for (size_t off = 0; off < sz; off += (size_t)pg) {
+                vp[off] = 0;
+            }
+            /* Also touch the final byte in case sz isn't page-aligned, so the
+             * last (partial) page is faulted too. */
+            if (sz > 0) vp[sz - 1] = 0;
+
+            ptrs[got++] = blk;
+            total_bytes += sz;
+        }
+
+        fprintf(stderr,
+                "umf_allocator_prewarm (node %d): class %6zu B -> %zu blocks\n",
+                numa_node, sz, per);
+    }
+
+    fprintf(stderr,
+            "umf_allocator_prewarm (node %d): touched %zu blocks across %zu classes = %zu MiB\n",
+            numa_node, got, nclasses, total_bytes >> 20);
+
+    /* Free everything back into the pool. KeepAllMemory retains these blocks
+     * per size class; the OS provider does not unmap, so the pages stay mapped,
+     * faulted, and bound to the target NUMA node — ready for the workload's
+     * same-size-class allocations to reuse without re-faulting. */
+    for (size_t i = 0; i < got; i++) umfPoolFree(p, ptrs[i]);
+    free(ptrs);
+    return 0;
+}
+
+
+
+
+
+
