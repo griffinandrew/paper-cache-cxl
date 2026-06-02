@@ -66,7 +66,7 @@ impl HybridObjects {
         //    eprintln!("UMF prewarm returned {}", rc);
         //}
     }
-    const NODE: i32 = 0;
+    const NODE: i32 = 1;
 }
 
 
@@ -203,7 +203,7 @@ impl DRAMObjects {
         //    eprintln!("UMF prewarm returned {}", rc);
         //}
     }
-    const NODE_DRAM: i32 = 0;
+    const NODE_DRAM: i32 = 1;
 }
 
 
