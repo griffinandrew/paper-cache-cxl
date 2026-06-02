@@ -47,7 +47,7 @@ static mut NUM_ALLOCS: usize = 0;
 static mut NUM_DEALLOCS: usize = 0;
 static ALL_MEM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
-static NUM_CALLS_PMEM: AtomicUsize = AtomicUsize::new(0);
+static mut NUM_CALLS_PMEM: usize = 0;
 
 
 
@@ -95,9 +95,11 @@ unsafe impl GlobalAlloc for HybridObjects {
         }
         //println!("HybridObjects: UMF alloc succeeded for {} bytes at {:p} with node {}", layout.size(), ptr, Self::NODE);
 
-        NUM_CALLS_PMEM.fetch_add(1, Ordering::SeqCst);
+        unsafe {
+            NUM_CALLS_PMEM += 1;
+        }
         if NUM_CALLS_PMEM > 0 && NUM_CALLS_PMEM % 10000 == 0 {
-            println!("HybridObjects: UMF alloc called {} times", NUM_CALLS_PMEM.load(Ordering::SeqCst));
+            println!("HybridObjects: UMF alloc called {} times", NUM_CALLS_PMEM);
         }
         #[cfg(debug_assertions)]
         {
@@ -182,7 +184,7 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
 #[derive(Clone, Copy)]
 pub struct DRAMObjects;
 
-static NUM_CALLS_PMEM: AtomicUsize = AtomicUsize::new(0);
+static mut NUM_CALLS_PMEM: usize = 0;
 
 
 
@@ -233,11 +235,14 @@ unsafe impl GlobalAlloc for DRAMObjects {
 
         //println!("DRAMObjects: UMF alloc succeeded for {} bytes at {:p} with node {}", layout.size(), ptr, Self::NODE_DRAM);
 
-
-        NUM_CALLS_PMEM.fetch_add(1, Ordering::SeqCst);
-        if NUM_CALLS_PMEM > 0 && NUM_CALLS_PMEM % 10000 == 0 {
-            println!("DRAMObjects: UMF alloc called {} times", NUM_CALLS_PMEM.load(Ordering::SeqCst));
+        unsafe {
+            NUM_CALLS_PMEM += 1;
         }
+
+        if NUM_CALLS_PMEM > 0 && NUM_CALLS_PMEM % 10000 == 0 {
+            println!("DRAMObjects: UMF alloc called {} times", NUM_CALLS_PMEM);
+        }
+
 
         #[cfg(debug_assertions)]
         {
