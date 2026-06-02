@@ -47,6 +47,8 @@ static mut NUM_ALLOCS: usize = 0;
 static mut NUM_DEALLOCS: usize = 0;
 static ALL_MEM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
+static NUM_CALLS_PMEM: AtomicUsize = AtomicUsize::new(0);
+
 
 
 impl HybridObjects {
@@ -85,12 +87,18 @@ unsafe impl GlobalAlloc for HybridObjects {
         //    HybridObjects::init_and_prewarm(1, 50 * 1024 * 1024 * 1024 )}
         //);
 
+
         let ptr = allocator_bindings::umf_alloc(Self::NODE,layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
             println!("HybridObjects: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
         }
+        //println!("HybridObjects: UMF alloc succeeded for {} bytes at {:p} with node {}", layout.size(), ptr, Self::NODE);
 
+        NUM_CALLS_PMEM.fetch_add(1, Ordering::SeqCst);
+        if NUM_CALLS_PMEM > 0 && NUM_CALLS_PMEM % 10000 == 0 {
+            println!("HybridObjects: UMF alloc called {} times", NUM_CALLS_PMEM.load(Ordering::SeqCst));
+        }
         #[cfg(debug_assertions)]
         {
             ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
@@ -174,6 +182,9 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
 #[derive(Clone, Copy)]
 pub struct DRAMObjects;
 
+static NUM_CALLS_PMEM: AtomicUsize = AtomicUsize::new(0);
+
+
 
 impl DRAMObjects {
     /// Initialize the UMF pool and prewarm a working-set-sized region.
@@ -218,6 +229,14 @@ unsafe impl GlobalAlloc for DRAMObjects {
         if ptr.is_null() {
             println!("DRAMObjects: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
+        }
+
+        //println!("DRAMObjects: UMF alloc succeeded for {} bytes at {:p} with node {}", layout.size(), ptr, Self::NODE_DRAM);
+
+
+        NUM_CALLS_PMEM.fetch_add(1, Ordering::SeqCst);
+        if NUM_CALLS_PMEM > 0 && NUM_CALLS_PMEM % 10000 == 0 {
+            println!("DRAMObjects: UMF alloc called {} times", NUM_CALLS_PMEM.load(Ordering::SeqCst));
         }
 
         #[cfg(debug_assertions)]
