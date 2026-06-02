@@ -2101,10 +2101,10 @@ where
 		K: 'static + Eq + Hash + TypeSize + std::fmt::Debug,
 	{
 
-		let t0 = rdtsc();
+		//let t0 = rdtsc();
 		let hashed_key = self.hash_key(&key);
-		let t1 = rdtsc();
-		PHASE_PRE_ALLOC.record(t1 - t0);
+		//let t1 = rdtsc();
+		//PHASE_PRE_ALLOC.record(t1 - t0);
 
 
 		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
