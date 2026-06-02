@@ -184,7 +184,7 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
 #[derive(Clone, Copy)]
 pub struct DRAMObjects;
 
-static mut NUM_CALLS_PMEM: usize = 0;
+static mut NUM_CALLS_DRAM: usize = 0;
 
 
 
@@ -236,11 +236,11 @@ unsafe impl GlobalAlloc for DRAMObjects {
         //println!("DRAMObjects: UMF alloc succeeded for {} bytes at {:p} with node {}", layout.size(), ptr, Self::NODE_DRAM);
 
         unsafe {
-            NUM_CALLS_PMEM += 1;
+            NUM_CALLS_DRAM += 1;
         }
 
-        if  NUM_CALLS_PMEM % PRINT_THRESHOLD == 0 {
-            println!("DRAMObjects: UMF alloc called {} times", NUM_CALLS_PMEM);
+        if  NUM_CALLS_DRAM % PRINT_THRESHOLD == 0 {
+            println!("DRAMObjects: UMF alloc called {} times", NUM_CALLS_DRAM);
         }
 
 
