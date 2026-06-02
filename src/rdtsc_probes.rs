@@ -54,10 +54,10 @@ impl PhaseStats {
 
 // One global instance per phase you want to time. Add or remove these to
 // match the phases you instrument in the SET path.
-pub static PHASE_PRE_ALLOC:  PhaseStats = PhaseStats::new("pre_alloc (index)");
-pub static PHASE_ALLOC:      PhaseStats = PhaseStats::new("alloc (umf/bump)");
+pub static PHASE_PRE_ALLOC:  PhaseStats = PhaseStats::new("hash key(index)");
+pub static PHASE_ALLOC:      PhaseStats = PhaseStats::new("alloc vector (umf)");
 pub static PHASE_MEMCPY:     PhaseStats = PhaseStats::new("memcpy (write)");
-pub static PHASE_POST:       PhaseStats = PhaseStats::new("post (bookkeeping)");
+pub static PHASE_POST:       PhaseStats = PhaseStats::new("create object");
 pub static PHASE_INSERT:     PhaseStats = PhaseStats::new("hashtable insert");
 
 
