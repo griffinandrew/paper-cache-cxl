@@ -241,7 +241,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
 
         //if  NUM_CALLS_DRAM % PRINT_THRESHOLD == 0 {
         //    println!("DRAMObjects: UMF alloc called {} times", NUM_CALLS_DRAM);
-        }
+        //}
 
 
         #[cfg(debug_assertions)]
