@@ -98,7 +98,7 @@ unsafe impl GlobalAlloc for HybridObjects {
         unsafe {
             NUM_CALLS_PMEM += 1;
         }
-        if NUM_CALLS_PMEM > 0 && NUM_CALLS_PMEM % 10000 == 0 {
+        if NUM_CALLS_PMEM % PRINT_THRESHOLD == 0 {
             println!("HybridObjects: UMF alloc called {} times", NUM_CALLS_PMEM);
         }
         #[cfg(debug_assertions)]
@@ -239,7 +239,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
             NUM_CALLS_PMEM += 1;
         }
 
-        if NUM_CALLS_PMEM > 0 && NUM_CALLS_PMEM % 10000 == 0 {
+        if  NUM_CALLS_PMEM % PRINT_THRESHOLD == 0 {
             println!("DRAMObjects: UMF alloc called {} times", NUM_CALLS_PMEM);
         }
 
