@@ -22,7 +22,7 @@ static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 // numa_node = NUMA node id (check with numactl -H)
-/*
+
 int umf_allocator_init(int numa_node) {
     umf_memory_pool_handle_t new_pool = NULL;
     umf_scalable_pool_params_handle_t scalable_params = NULL;
@@ -133,15 +133,14 @@ int umf_allocator_init(int numa_node) {
      
     return 0;
 }
-    */
 
 
-
+/*
 extern const umf_memory_provider_ops_t *umfPrefaultProviderOps(void);
 typedef struct prefault_params_t { size_t size; int numa_node; } prefault_params_t;
  
-/* size the prefaulted region per node; tune to your largest trace */
-#define PREFAULT_BYTES (45ULL * 1024 * 1024 * 1024)   /* 35 GiB */
+// size the prefaulted region per node; tune to your largest trace
+#define PREFAULT_BYTES (45ULL * 1024 * 1024 * 1024) 
  
 int umf_allocator_init(int numa_node) {
     umf_memory_pool_handle_t new_pool = NULL;
@@ -160,7 +159,7 @@ int umf_allocator_init(int numa_node) {
         return 0;
     }
  
-    /* ---- PROVIDER: prefault provider instead of OS provider ---- */
+    //---- PROVIDER: prefault provider instead of OS provider ---- 
     prefault_params_t pf_params = {
         .size      = PREFAULT_BYTES,
         .numa_node = numa_node,
@@ -176,10 +175,10 @@ int umf_allocator_init(int numa_node) {
         pthread_mutex_unlock(&lifecycle_lock);
         return 4;
     }
-    /* NOTE: os_params_arr / umfOsMemoryProviderParams* no longer used on this
-     * path — the prefault provider takes its config via pf_params above. */
+    //NOTE: os_params_arr umfOsMemoryProviderParams* no longer used on this
+    // path — the prefault provider takes its config via pf_params above. 
  
-    /* ---- POOL: unchanged scalable pool on top ---- */
+    //---- POOL: unchanged scalable pool on top ----
     res = umfScalablePoolParamsCreate(&scalable_params);
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to create scalable pool params (node %d): %d\n",
@@ -188,8 +187,8 @@ int umf_allocator_init(int numa_node) {
         return 5;
     }
  
-    /* keep retaining freed blocks so transient allocs recycle in-pool and the
-     * provider's bump offset advances slowly (only net-new live memory grows it) */
+    // keep retaining freed blocks so transient allocs recycle in-pool and the
+    // provider's bump offset advances slowly (only net-new live memory grows it)
     umfScalablePoolParamsSetKeepAllMemory(scalable_params, 1);
  
     size_t huge_chunk_size = 2 * 1024 * 1024ULL;
@@ -214,6 +213,7 @@ int umf_allocator_init(int numa_node) {
     pthread_mutex_unlock(&lifecycle_lock);
     return 0;
 }
+*/
 
 
 
