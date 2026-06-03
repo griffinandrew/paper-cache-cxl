@@ -17,6 +17,7 @@ fn main() {
         // Tell Rust where UMF lives
         println!("cargo:rustc-link-search=native={}", umf_lib_dir);
         println!("cargo:rustc-link-lib=dylib=umf"); // use shared library
+        println!("cargo:rustc-link-lib=dylib=numa");
 
         // Compile the real UMF wrapper C code
         cc::Build::new()
