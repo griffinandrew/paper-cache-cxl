@@ -22,6 +22,7 @@ static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 // numa_node = NUMA node id (check with numactl -H)
+/*
 int umf_allocator_init(int numa_node) {
     umf_memory_pool_handle_t new_pool = NULL;
     umf_scalable_pool_params_handle_t scalable_params = NULL;
@@ -77,11 +78,11 @@ int umf_allocator_init(int numa_node) {
         return 4;
     }
 
-    /* -------------------------------------------------------------------------
-     * Create scalable pool params and tell it to KEEP all memory.
-     * This forces the TBB backend to retain freed blocks rather than triggering
-     * purging calls down into the OS memory provider.
-     * ------------------------------------------------------------------------- */
+    // -------------------------------------------------------------------------
+    // Create scalable pool params and tell it to KEEP all memory.
+    //This forces the TBB backend to retain freed blocks rather than triggering
+    //purging calls down into the OS memory provider.
+    // -------------------------------------------------------------------------
     res = umfScalablePoolParamsCreate(&scalable_params);
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to create scalable pool params (node %d): %d\n", numa_node, res);
@@ -114,26 +115,112 @@ int umf_allocator_init(int numa_node) {
         return 6;
     }
 
-    /* Release-store publishes the fully-initialized pool. Any thread that
-     * later observes a non-NULL pool via acquire-load is guaranteed to see
-     * a consistent pool object. */
+    //Release-store publishes the fully-initialized pool. Any thread that
+    //later observes a non-NULL pool via acquire-load is guaranteed to see
+    //a consistent pool object. 
     atomic_store_explicit(&pools[numa_node], (uintptr_t)new_pool, memory_order_release);
 
     pthread_mutex_unlock(&lifecycle_lock);
 
-    /* Do NOT register umf_allocator_finalize via atexit.
-     *
-     * Under large cache loads, background PolicyWorker and reinsertion threads
-     * continue to alloc/dealloc PMEM buffers via HybridObjects after main()
-     * returns.  An atexit handler would destroy the UMF pool while those
-     * threads are still active, causing [FATAL UMF] assertion failures and
-     * "memory allocation of N bytes failed" panics in Rust.
-     *
-     * The OS reclaims all virtual memory (including UMF-managed PMEM pages)
-     * when the process exits, so explicit pool teardown is unnecessary.
-     */
+     //Do NOT register umf_allocator_finalize via atexit.
+     //Under large cache loads, background PolicyWorker and reinsertion threads
+     //continue to alloc/dealloc PMEM buffers via HybridObjects after main()
+     //returns.  An atexit handler would destroy the UMF pool while those
+     //threads are still active, causing [FATAL UMF] assertion failures and
+     //"memory allocation of N bytes failed" panics in Rust.
+     //The OS reclaims all virtual memory (including UMF-managed PMEM pages)
+     //when the process exits, so explicit pool teardown is unnecessary.
+     
     return 0;
 }
+    */
+
+
+
+extern const umf_memory_provider_ops_t *umfPrefaultProviderOps(void);
+typedef struct prefault_params_t { size_t size; int numa_node; } prefault_params_t;
+ 
+/* size the prefaulted region per node; tune to your largest trace */
+#define PREFAULT_BYTES (40ULL * 1024 * 1024 * 1024)   /* 40 GiB */
+ 
+int umf_allocator_init(int numa_node) {
+    umf_memory_pool_handle_t new_pool = NULL;
+    umf_scalable_pool_params_handle_t scalable_params = NULL;
+    umf_result_t res;
+ 
+    if (numa_node < 0 || numa_node >= MAX_NODES) {
+        fprintf(stderr, "umf_allocator_init: numa_node %d out of range\n", numa_node);
+        return -1;
+    }
+ 
+    pthread_mutex_lock(&lifecycle_lock);
+ 
+    if (atomic_load_explicit(&pools[numa_node], memory_order_acquire) != NULL) {
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 0;
+    }
+ 
+    /* ---- PROVIDER: prefault provider instead of OS provider ---- */
+    prefault_params_t pf_params = {
+        .size      = PREFAULT_BYTES,
+        .numa_node = numa_node,
+    };
+ 
+    res = umfMemoryProviderCreate(
+            umfPrefaultProviderOps(),
+            &pf_params,
+            &providers[numa_node]);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create prefault provider (node %d): %d\n",
+                numa_node, res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 4;
+    }
+    /* NOTE: os_params_arr / umfOsMemoryProviderParams* no longer used on this
+     * path — the prefault provider takes its config via pf_params above. */
+ 
+    /* ---- POOL: unchanged scalable pool on top ---- */
+    res = umfScalablePoolParamsCreate(&scalable_params);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create scalable pool params (node %d): %d\n",
+                numa_node, res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 5;
+    }
+ 
+    /* keep retaining freed blocks so transient allocs recycle in-pool and the
+     * provider's bump offset advances slowly (only net-new live memory grows it) */
+    umfScalablePoolParamsSetKeepAllMemory(scalable_params, 1);
+ 
+    size_t huge_chunk_size = 2 * 1024 * 1024ULL;
+    umfScalablePoolParamsSetGranularity(scalable_params, huge_chunk_size);
+ 
+    res = umfPoolCreate(
+            umfScalablePoolOps(),
+            providers[numa_node],
+            scalable_params,
+            0,
+            &new_pool);
+ 
+    umfScalablePoolParamsDestroy(scalable_params);
+ 
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create pool (node %d): %d\n", numa_node, res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 6;
+    }
+ 
+    atomic_store_explicit(&pools[numa_node], (uintptr_t)new_pool, memory_order_release);
+    pthread_mutex_unlock(&lifecycle_lock);
+    return 0;
+}
+
+
+
+
+
+
+    
 
 
 void *umf_alloc(int numa_node, size_t size, size_t align) {

@@ -21,6 +21,7 @@ fn main() {
         // Compile the real UMF wrapper C code
         cc::Build::new()
             .file("umf_allocator/umf_allocator_wrapper.c")
+            .file("umf_allocator/prefault_provider.c")   // <-- add this
             .include("umf_allocator")
             .include(umf_include_dir)
             .compile("umf_allocator_wrapper");
