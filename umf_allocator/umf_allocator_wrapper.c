@@ -141,7 +141,7 @@ extern const umf_memory_provider_ops_t *umfPrefaultProviderOps(void);
 typedef struct prefault_params_t { size_t size; int numa_node; } prefault_params_t;
  
 /* size the prefaulted region per node; tune to your largest trace */
-#define PREFAULT_BYTES (35ULL * 1024 * 1024 * 1024)   /* 40 GiB */
+#define PREFAULT_BYTES (35ULL * 1024 * 1024 * 1024)   /* 35 GiB */
  
 int umf_allocator_init(int numa_node) {
     umf_memory_pool_handle_t new_pool = NULL;
