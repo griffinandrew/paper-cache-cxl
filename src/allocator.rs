@@ -55,11 +55,11 @@ impl HybridObjects {
     /// Initialize the UMF pool and prewarm a working-set-sized region.
     /// Call from main() before the benchmark loop.
     pub fn init_and_prewarm(numa_node: i32, prewarm_bytes: usize) {
-        INIT.call_once(|| {
+        //INIT.call_once(|| {
         unsafe { allocator_bindings::umf_allocator_init(numa_node); }
-        #[cfg(debug_assertions)]
-        println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
-        });
+        //#[cfg(debug_assertions)]
+        //println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
+        //});
         let chunk = 2 * 1024 * 1024usize;
         let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, prewarm_bytes, chunk) };
         if rc != 0 {
