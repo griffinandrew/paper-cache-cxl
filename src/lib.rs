@@ -2171,10 +2171,14 @@ where
 
 			//let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
 
+
+			//pub fn clone_from_ref_in(src: &T, alloc: A) -> Box<T, A>
+
 			// === phase 2: allocation of value buffer ===
 			let t2_start = rdtsc();
 			//let mut val_buf: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
-			let val_buf: BufferPMEM = Box::new_in(value, Hybrid);
+			//let val_buf: BufferPMEM = Box::new_in(value, Hybrid);
+			let val_buf: BufferPMEM = BOx::clone_from_ref_in(value, Hybrid);
 			let t2_end = rdtsc();
 			PHASE_ALLOC.record(t2_end - t2_start);
 
