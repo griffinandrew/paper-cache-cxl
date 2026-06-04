@@ -24,6 +24,7 @@ static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 // numa_node = NUMA node id (check with numactl -H)
 
 int umf_allocator_init(int numa_node) {
+    setenv("UMF_CONF", "umf.provider.os.params.mmap_flags=0x8000", 0);
     umf_memory_pool_handle_t new_pool = NULL;
     umf_scalable_pool_params_handle_t scalable_params = NULL;
     umf_result_t res;
@@ -113,6 +114,25 @@ int umf_allocator_init(int numa_node) {
         fprintf(stderr, "Failed to create pool (node %d): %d\n", numa_node, res);
         pthread_mutex_unlock(&lifecycle_lock);
         return 6;
+    }
+
+
+
+    int pool_bootstrap_mb = 10240; // tune to your largest trace's working set size
+    size_t pool_bootstrap_bytes = (size_t)pool_bootstrap_mb << 20;
+    if (pool_bootstrap_bytes > 0) {
+        void *bootstrap_mem = umfPoolMalloc(new_pool, pool_bootstrap_bytes);
+        if (!bootstrap_mem) {
+            fprintf(stderr, "Warning: Failed to eager-bootstrap %zu bytes on node %d. "
+                            "Pool will grow lazily.\n", pool_bootstrap_bytes, numa_node);
+        } else {
+            // Free it immediately back into the pool.
+            // Since KeepAllMemory=1 is set, the scalable pool retains the massive block in user-space.
+            // The physical memory stays completely mapped, faulted, and ready.
+            umfPoolFree(new_pool, bootstrap_mem);
+            fprintf(stderr, "umf_allocator_init: Successfully pre-warmed %zu MiB on node %d\n", 
+                    pool_bootstrap_bytes >> 20, numa_node);
+        }
     }
 
     //Release-store publishes the fully-initialized pool. Any thread that
