@@ -1253,15 +1253,16 @@ where
 
 		//let key_buff = Box::new(key);
 
-		let t2_start = rdtsc();
-		let mut val_buf: Vec<u8> = Vec::with_capacity(value.len());
-		let t2_end = rdtsc();
+		//let t2_start = rdtsc();
+		//let mut val_buf: Vec<u8> = Vec::with_capacity(value.len());
+		//let t2_end = rdtsc();
 		PHASE_ALLOC.record(t2_end - t2_start);
 
 		// === phase 3: memcpy value into PMEM ===
 		let t3_start = rdtsc();
-		val_buf.extend_from_slice(value);
-		let val_buf: BufferDRAM = val_buf.into_boxed_slice();
+		//val_buf.extend_from_slice(value);
+		//let val_buf: BufferDRAM = val_buf.into_boxed_slice();
+		let val_buf: BufferDRAM = Box::clone_from_ref(value);
 		//let val_buf: BufferDRAM = Box::new_in(value, DRAMObjects);
 		let t3_end = rdtsc();
 		PHASE_MEMCPY.record(t3_end - t3_start);
