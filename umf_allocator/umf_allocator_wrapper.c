@@ -118,7 +118,7 @@ int umf_allocator_init(int numa_node) {
 
 
 
-    int pool_bootstrap_mb = 10240; // tune to your largest trace's working set size
+    int pool_bootstrap_mb =  35840; // tune to your largest trace's working set size
     size_t pool_bootstrap_bytes = (size_t)pool_bootstrap_mb << 20;
     if (pool_bootstrap_bytes > 0) {
         void *bootstrap_mem = umfPoolMalloc(new_pool, pool_bootstrap_bytes);
