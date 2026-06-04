@@ -24,7 +24,7 @@ static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 // numa_node = NUMA node id (check with numactl -H)
 
 int umf_allocator_init(int numa_node) {
-    setenv("UMF_CONF", "umf.provider.os.params.mmap_flags=0x8000", 0);
+    //setenv("UMF_CONF", "umf.provider.os.params.mmap_flags=0x8000", 0);
     umf_memory_pool_handle_t new_pool = NULL;
     umf_scalable_pool_params_handle_t scalable_params = NULL;
     umf_result_t res;
