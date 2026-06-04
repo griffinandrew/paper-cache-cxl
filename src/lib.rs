@@ -1256,7 +1256,7 @@ where
 		//let t2_start = rdtsc();
 		//let mut val_buf: Vec<u8> = Vec::with_capacity(value.len());
 		//let t2_end = rdtsc();
-		PHASE_ALLOC.record(t2_end - t2_start);
+		//PHASE_ALLOC.record(t2_end - t2_start);
 
 		// === phase 3: memcpy value into PMEM ===
 		let t3_start = rdtsc();
