@@ -20,7 +20,7 @@ static umf_memory_provider_handle_t providers[MAX_NODES];
 static umf_os_memory_provider_params_handle_t os_params_arr[MAX_NODES];
 static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 
-
+/*
 // numa_node = NUMA node id (check with numactl -H)
 
 int umf_allocator_init(int numa_node) {
@@ -133,9 +133,9 @@ int umf_allocator_init(int numa_node) {
      
     return 0;
 }
+*/
 
 
-/*
 extern const umf_memory_provider_ops_t *umfPrefaultProviderOps(void);
 typedef struct prefault_params_t { size_t size; int numa_node; } prefault_params_t;
  
@@ -213,7 +213,6 @@ int umf_allocator_init(int numa_node) {
     pthread_mutex_unlock(&lifecycle_lock);
     return 0;
 }
-*/
 
 
 
