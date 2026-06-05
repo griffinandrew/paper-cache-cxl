@@ -1,6 +1,6 @@
 
 
-
+/*
 extern crate bindgen;
 
 use std::path::{Path, PathBuf};
@@ -53,8 +53,10 @@ fn main() {
 }
 
 
+*/
 
-/* this is for jemallic extent hooks``
+
+// this is for jemallic extent hooks``
 
 extern crate bindgen;
 
@@ -178,4 +180,13 @@ fn detect_jemalloc_prefix(path: &str) -> bool {
     }
 }
 
-*/
+
+
+
+
+
+
+
+
+
+
