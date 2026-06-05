@@ -203,7 +203,7 @@ impl DRAMObjects {
         //    eprintln!("UMF prewarm returned {}", rc);
         //}
     }
-    const NODE_DRAM: i32 = 1;
+    const NODE_DRAM: i32 = 0;
 }
 
 
