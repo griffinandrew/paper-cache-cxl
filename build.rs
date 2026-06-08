@@ -1,5 +1,5 @@
 
-/* for vm...
+// for vm...
 extern crate bindgen;
 
 use std::path::{Path, PathBuf};
@@ -52,11 +52,11 @@ fn main() {
 }
 
 
-*/
 
 
 
 
+/*
 extern crate bindgen;
 
 use std::path::{Path, PathBuf};
@@ -113,7 +113,7 @@ fn main() {
     
 }
 
-
+*/
 
 
 
