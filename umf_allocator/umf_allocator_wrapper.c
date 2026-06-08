@@ -22,7 +22,7 @@ static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 // numa_node = NUMA node id (check with numactl -H)
-/*
+
 int umf_allocator_init(int numa_node) {
     //setenv("UMF_CONF", "umf.provider.os.params.mmap_flags=0x8000", 0);
     umf_memory_pool_handle_t new_pool = NULL;
@@ -136,12 +136,10 @@ int umf_allocator_init(int numa_node) {
 }
 
 
-*/
 
 
 
-
-
+/*
 
 extern const umf_memory_provider_ops_t *umfPrefaultProviderOps(void);
 typedef struct prefault_params_t { size_t size; int numa_node; } prefault_params_t;
@@ -225,7 +223,7 @@ int umf_allocator_init(int numa_node) {
 
 
 
-
+*/
     
 
 
