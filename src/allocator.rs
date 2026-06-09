@@ -489,7 +489,8 @@ impl DAXPMEM {
         //});
     }
 
-    const DEFAULT_DEVDAX_PATH: &str = "/dev/dax0.0";
+    //const DEFAULT_DEVDAX_PATH: &str = "/dev/dax0.0";
+    const DEFAULT_DEVDAX_PATH: &'static std::ffi::CStr = c"/dev/dax0.0";
     const DAX_SIZE_BYTES: usize = 100 * 1024 * 1024 * 1024; // 100 GiB
 }
 
