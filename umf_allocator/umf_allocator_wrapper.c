@@ -445,7 +445,7 @@ void umf_allocator_finalize_dax(void) {
     }
     if (providers[5]) {
         umfMemoryProviderDestroy(providers[5]);
-        providers[5] = NULL
+        providers[5] = NULL;
     }
     if (dax_params) {
         umfDevDaxMemoryProviderParamsDestroy(dax_params);
