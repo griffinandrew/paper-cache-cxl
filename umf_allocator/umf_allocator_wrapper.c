@@ -433,15 +433,15 @@ int umf_allocator_prewarm(int numa_node, size_t bytes, size_t chunk) {
 
 
 
-static umf_memory_pool_handle_t pool = NULL;
 //static umf_memory_provider_handle_t dax_provider = NULL;
 static umf_devdax_memory_provider_params_handle_t dax_params = NULL;
 
-
+/*
 void umf_allocator_finalize_dax(void) {
-    if (pool) {
-        umfPoolDestroy(pool);
-        pool = NULL;
+    pools[5] = NULL; //pool 5 is our DAX pool
+    if (pools[5]) {
+        umfPoolDestroy(pools[5]);
+        pools[5] = NULL;
     }
     if (providers[5]) {
         umfMemoryProviderDestroy(providers[5]);
@@ -452,10 +452,19 @@ void umf_allocator_finalize_dax(void) {
         dax_params = NULL;
     }
 }
+    */
 
 int umf_allocator_init_dax(const char *dax_path, size_t dax_size) {
+    umf_memory_pool_handle_t new_pool = NULL;
     umf_jemalloc_pool_params_handle_t jemalloc_params = NULL;
     umf_result_t res;
+
+    pthread_mutex_lock(&lifecycle_lock);
+
+    if (atomic_load_explicit(&pools[5], memory_order_acquire) != NULL) {
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 0;
+    }
 
     res = umfDevDaxMemoryProviderParamsCreate(dax_path, dax_size, &dax_params);
     if (res != UMF_RESULT_SUCCESS) {
@@ -475,7 +484,7 @@ int umf_allocator_init_dax(const char *dax_path, size_t dax_size) {
         return 3;
     }
 
-    res = umfPoolCreate(umfJemallocPoolOps(), providers[5], jemalloc_params, 0, &pool);
+    res = umfPoolCreate(umfJemallocPoolOps(), providers[5], jemalloc_params, 0, &pools[5]);
     umfJemallocPoolParamsDestroy(jemalloc_params);
 
     if (res != UMF_RESULT_SUCCESS) {
@@ -483,21 +492,36 @@ int umf_allocator_init_dax(const char *dax_path, size_t dax_size) {
         return 4;
     }
 
+    atomic_store_explicit(&pools[5], (uintptr_t)new_pool, memory_order_release);
+
+
     // Zero all memory in the pool
     // in case of persistence.. dont think it matters for devdax tho.. 
-    size_t pool_size = dax_size;
-    void *base = umfPoolMalloc(pool, pool_size);
-    if (base) {
-        memset(base, 0, pool_size);
-        umfPoolFree(pool, base);
-    }
+    //size_t pool_size = dax_size;
+    //void *base = umfPoolMalloc(pools[5], pool_size);
+    //if (base) {
+        //memset(base, 0, pool_size);
+       // umfPoolFree(pools[5], base);
+    //}
     //printf("base pointer init %p\n", base);
 
-    atexit(umf_allocator_finalize_dax);
+   // if (res != UMF_RESULT_SUCCESS) {
+        //fprintf(stderr, "Failed to create pool (node %d): %d\n", 5, res);
+        //pthread_mutex_unlock(&lifecycle_lock);
+        //return 6;
+    //}
+
+    //Release-store publishes the fully-initialized pool. Any thread that
+    //later observes a non-NULL pool via acquire-load is guaranteed to see
+    //a consistent pool object. 
+
+    pthread_mutex_unlock(&lifecycle_lock);
+
+    //atexit(umf_allocator_finalize_dax);
     return 0;
 }
 
-
+/*
 void *return_pmem_base_dax(size_t dax_size) {
     void *base = umfPoolMalloc(pool, dax_size);
     
@@ -507,19 +531,19 @@ void *return_pmem_base_dax(size_t dax_size) {
     //}
     //printf("base pointer pmem %p\n", base);
     return base; //this should be the base address of the mapped PMEM region
-}
+}*/
+
 
 void *umf_alloc_dax(size_t size, size_t align) {
+
+    umf_memory_pool_handle_t p = (umf_memory_pool_handle_t)
+        atomic_load_explicit(&pools[5], memory_order_acquire);
+    if (!p) return NULL;
     //pthread_mutex_lock(&pool_lock);
-    if (!pool || size == 0) {
-        //pthread_mutex_unlock(&pool_lock);
-        fprintf(stderr, "Invalid allocation request: pool is NULL or size is 0, size=%zu\n", size);
-        return NULL;
-    }
     //void *ptr = umfPoolMalloc(pool, size); //might want to use the aligned version
 
     //respect alignment.... although jemalloc should do this for us...........
-    void *ptr = umfPoolAlignedMalloc(pool, size, align);
+    void *ptr = umfPoolAlignedMalloc(p, size, align);
 
     //pthread_mutex_unlock(&pool_lock);
     return ptr;
@@ -527,11 +551,10 @@ void *umf_alloc_dax(size_t size, size_t align) {
 
 void umf_dealloc_dax(void *ptr) {
     //pthread_mutex_lock(&pool_lock);
-    if (!pool || !ptr) {
-        //pthread_mutex_unlock(&pool_lock);
-        return;
-    }
-    umfPoolFree(pool, ptr);
+    umf_memory_pool_handle_t p = (umf_memory_pool_handle_t)
+        atomic_load_explicit(&pools[5], memory_order_acquire);
+    if (!p) return;  /* pool already destroyed; OS will reclaim on exit */
+    umfPoolFree(p, ptr);
     //pthread_mutex_unlock(&pool_lock);
 }
 
@@ -539,7 +562,7 @@ int check_tier_dax(void *ptr) {
     umf_memory_pool_handle_t curr_pool;
     if (umfPoolByPtr(ptr, &curr_pool) == UMF_RESULT_SUCCESS) {
 
-        if (curr_pool == pool) {
+        if (curr_pool == pools[5]) {
             return 1; //pmem
         }
     }

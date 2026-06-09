@@ -90,7 +90,6 @@ void umf_dealloc_dax(void *ptr);
 
 int check_tier_dax(void *ptr);
 
-void *return_pmem_base_dax(size_t dax_size);
 
 
 
