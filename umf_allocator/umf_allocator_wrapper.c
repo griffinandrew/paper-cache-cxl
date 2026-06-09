@@ -434,7 +434,7 @@ int umf_allocator_prewarm(int numa_node, size_t bytes, size_t chunk) {
 
 
 static umf_memory_pool_handle_t pool = NULL;
-static umf_memory_provider_handle_t dax_provider = NULL;
+//static umf_memory_provider_handle_t dax_provider = NULL;
 static umf_devdax_memory_provider_params_handle_t dax_params = NULL;
 
 
@@ -443,9 +443,9 @@ void umf_allocator_finalize_dax(void) {
         umfPoolDestroy(pool);
         pool = NULL;
     }
-    if (dax_provider) {
-        umfMemoryProviderDestroy(dax_provider);
-        dax_provider = NULL;
+    if (providers[5]) {
+        umfMemoryProviderDestroy(providers[5]);
+        providers[5] = NULL
     }
     if (dax_params) {
         umfDevDaxMemoryProviderParamsDestroy(dax_params);
@@ -475,7 +475,7 @@ int umf_allocator_init_dax(const char *dax_path, size_t dax_size) {
         return 3;
     }
 
-    res = umfPoolCreate(umfJemallocPoolOps(), dax_provider, jemalloc_params, 0, &pool);
+    res = umfPoolCreate(umfJemallocPoolOps(), providers[5], jemalloc_params, 0, &pool);
     umfJemallocPoolParamsDestroy(jemalloc_params);
 
     if (res != UMF_RESULT_SUCCESS) {
