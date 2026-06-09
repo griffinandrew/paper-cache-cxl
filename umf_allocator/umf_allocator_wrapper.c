@@ -365,7 +365,7 @@ int check_tier(void *ptr) {
 
 int umf_allocator_prewarm(int numa_node, size_t bytes, size_t chunk) {
     if (bytes == 0) return 0;
-    if (chunk == 0) chunk = 4096;
+    if (chunk == 0) chunk = 2 * 1024 * 1024;
     if (numa_node < 0 || numa_node >= MAX_NODES) {
         fprintf(stderr, "umf_allocator_prewarm: numa_node %d out of range\n", numa_node);
         return 1;
