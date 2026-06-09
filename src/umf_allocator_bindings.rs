@@ -38,6 +38,11 @@ unsafe extern "C" {
     pub fn umf_dealloc(numa_node: c_int, ptr: *mut c_void);
     pub fn umf_allocator_prewarm(numa_node: c_int, bytes: usize, chunk: usize) -> c_int;
     pub fn check_tier(ptr: *mut c_void) -> c_int;  // now returns node id, was bool-ish
+
+    pub fn return_pmem_base(dax_size: usize) -> *mut c_void;
+    pub fn umf_allocator_init_dax(dax_path: *const libc::c_char, dax_size: usize) -> c_int;
+    pub fn umf_dealloc_dax(ptr: *mut c_void);
+    pub fn umf_alloc_dax(size: usize, align: usize) -> *mut c_void;
 }
 
 
