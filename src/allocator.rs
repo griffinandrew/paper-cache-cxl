@@ -478,7 +478,7 @@ pub struct ValueDRAM;
 
 
 
-impl ValueDRAM {
+impl DAXPMEM {
     /// Initialize the UMF pool and prewarm a working-set-sized region.
     /// Call from main() before the benchmark loop.
     pub fn init_and_prewarm() {
