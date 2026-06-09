@@ -454,9 +454,12 @@ void umf_allocator_finalize_dax(void) {
 }
     */
 
+
+    /*
 int umf_allocator_init_dax(const char *dax_path, size_t dax_size) {
     umf_memory_pool_handle_t new_pool = NULL;
     umf_jemalloc_pool_params_handle_t jemalloc_params = NULL;
+
     umf_result_t res;
 
     pthread_mutex_lock(&lifecycle_lock);
@@ -520,6 +523,7 @@ int umf_allocator_init_dax(const char *dax_path, size_t dax_size) {
     //atexit(umf_allocator_finalize_dax);
     return 0;
 }
+*/
 
 /*
 void *return_pmem_base_dax(size_t dax_size) {
@@ -533,6 +537,71 @@ void *return_pmem_base_dax(size_t dax_size) {
     return base; //this should be the base address of the mapped PMEM region
 }*/
 
+
+
+int umf_allocator_init_dax(const char *dax_path, size_t dax_size) {
+    umf_memory_pool_handle_t new_pool = NULL;
+    umf_jemalloc_pool_params_handle_t jemalloc_params = NULL;
+    umf_result_t res;
+
+    if (dax_path == NULL || dax_size == 0) {
+        fprintf(stderr, "umf_allocator_init_dax: bad args (path=%p size=%zu)\n",
+                (void *)dax_path, dax_size);
+        return -1;
+    }
+
+    pthread_mutex_lock(&lifecycle_lock);
+
+    if (atomic_load_explicit(&pools[5], memory_order_acquire) != NULL) {
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 0;
+    }
+
+    res = umfDevDaxMemoryProviderParamsCreate(dax_path, dax_size, &dax_params);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create DAX params: %d\n", res);
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 1;
+    }
+
+    res = umfMemoryProviderCreate(umfDevDaxMemoryProviderOps(), dax_params, &providers[5]);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create DAX provider: %d\n", res);
+        umfDevDaxMemoryProviderParamsDestroy(dax_params);
+        dax_params = NULL;
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 2;
+    }
+
+    res = umfJemallocPoolParamsCreate(&jemalloc_params);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create jemalloc pool params: %d\n", res);
+        umfMemoryProviderDestroy(providers[5]);
+        providers[5] = NULL;
+        umfDevDaxMemoryProviderParamsDestroy(dax_params);
+        dax_params = NULL;
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 3;
+    }
+
+    res = umfPoolCreate(umfJemallocPoolOps(), providers[5], jemalloc_params, 0, &new_pool);
+    umfJemallocPoolParamsDestroy(jemalloc_params);
+
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create memory pool: %d\n", res);
+        umfMemoryProviderDestroy(providers[5]);
+        providers[5] = NULL;
+        umfDevDaxMemoryProviderParamsDestroy(dax_params);
+        dax_params = NULL;
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 4;
+    }
+
+    atomic_store_explicit(&pools[5], (uintptr_t)new_pool, memory_order_release);
+
+    pthread_mutex_unlock(&lifecycle_lock);
+    return 0;
+}
 
 void *umf_alloc_dax(size_t size, size_t align) {
 
