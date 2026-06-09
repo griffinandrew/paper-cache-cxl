@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <stddef.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 
 #include <umf/memory_pool.h>
 #include <umf/memory_provider.h>
@@ -429,7 +431,7 @@ int umf_allocator_prewarm(int numa_node, size_t bytes, size_t chunk) {
 
 
 #include <umf/providers/provider_devdax_memory.h>
-#include <umf/pools/pool_jemalloc.h>
+//#include <umf/pools/pool_jemalloc.h>
 
 
 
@@ -541,7 +543,7 @@ void *return_pmem_base_dax(size_t dax_size) {
 
 int umf_allocator_init_dax(const char *dax_path, size_t dax_size) {
     umf_memory_pool_handle_t new_pool = NULL;
-    umf_jemalloc_pool_params_handle_t jemalloc_params = NULL;
+    umf_scalable_pool_params_handle_t scalable_params = NULL;
     umf_result_t res;
 
     if (dax_path == NULL || dax_size == 0) {
@@ -573,7 +575,25 @@ int umf_allocator_init_dax(const char *dax_path, size_t dax_size) {
         return 2;
     }
 
-    res = umfJemallocPoolParamsCreate(&jemalloc_params);
+
+    int fd = open(dax_path, O_RDWR);
+    if (fd < 0) {
+        perror("prefault: open dax");
+    } else {
+        void *m = mmap(NULL, dax_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_POPULATE, fd, 0);
+        if (m == MAP_FAILED) {
+            perror("prefault: mmap");
+        } else {
+            memset(m, 0, dax_size);   // force the write fault on every page
+            munmap(m, dax_size);
+        }
+        close(fd);
+    }
+
+
+    //res = umfJemallocPoolParamsCreate(&jemalloc_params);
+    res = umfScalablePoolParamsCreate(&scalable_params);
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to create jemalloc pool params: %d\n", res);
         umfMemoryProviderDestroy(providers[5]);
@@ -584,8 +604,11 @@ int umf_allocator_init_dax(const char *dax_path, size_t dax_size) {
         return 3;
     }
 
-    res = umfPoolCreate(umfJemallocPoolOps(), providers[5], jemalloc_params, 0, &new_pool);
-    umfJemallocPoolParamsDestroy(jemalloc_params);
+   // res = umfPoolCreate(umfJemallocPoolOps(), providers[5], jemalloc_params, 0, &new_pool);
+    //umfJemallocPoolParamsDestroy(jemalloc_params);
+
+    res = umfPoolCreate(umfScalablePoolOps(), providers[5], scalable_params, 0, &new_pool);
+    umfScalablePoolParamsDestroy(scalable_params);
 
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to create memory pool: %d\n", res);
