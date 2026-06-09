@@ -75,6 +75,25 @@ int check_tier(void *ptr);
  */
 int umf_allocator_prewarm(int numa_node, size_t bytes, size_t chunk);
 
+
+
+//dax calls 
+
+void umf_allocator_finalize_dax(void);
+
+
+int umf_allocator_init_dax(const char *dax_path, size_t dax_size);
+
+void *umf_alloc_dax(size_t size, size_t align);
+
+void umf_dealloc_dax(void *ptr);
+
+int check_tier_dax(void *ptr);
+
+void *return_pmem_base_dax(size_t dax_size);
+
+
+
 #ifdef __cplusplus
 }
 #endif

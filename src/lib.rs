@@ -105,7 +105,8 @@ use crate::allocator::RegionHybrid as Hybrid;
         feature = "region_hybrid_allocator",
     ))
 ))]
-use crate::allocator::HybridObjects as Hybrid;
+//use crate::allocator::HybridObjects as Hybrid;
+use crate::allocator::DAXPMEM as Hybrid;
 
 
 

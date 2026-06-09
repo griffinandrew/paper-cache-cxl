@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stddef.h>
+#include <string.h>
 
 #include <umf/memory_pool.h>
 #include <umf/memory_provider.h>
@@ -426,127 +428,125 @@ int umf_allocator_prewarm(int numa_node, size_t bytes, size_t chunk) {
 
 
 
+#include <umf/providers/provider_devdax_memory.h>
+#include <umf/pools/pool_jemalloc.h>
 
 
 
+static umf_memory_pool_handle_t pool = NULL;
+static umf_memory_provider_handle_t dax_provider = NULL;
+static umf_devdax_memory_provider_params_handle_t dax_params = NULL;
 
 
+void umf_allocator_finalize_dax(void) {
+    if (pool) {
+        umfPoolDestroy(pool);
+        pool = NULL;
+    }
+    if (dax_provider) {
+        umfMemoryProviderDestroy(dax_provider);
+        dax_provider = NULL;
+    }
+    if (dax_params) {
+        umfDevDaxMemoryProviderParamsDestroy(dax_params);
+        dax_params = NULL;
+    }
+}
 
+int umf_allocator_init_dax(const char *dax_path, size_t dax_size) {
+    umf_jemalloc_pool_params_handle_t jemalloc_params = NULL;
+    umf_result_t res;
 
-
-
-/* Prewarm the UMF pool for `numa_node` by allocating `bytes` worth of memory
- * through it IN THE SAME SIZE CLASSES the workload uses, touching every page so
- * the OS provider faults + zeroes them on the target NUMA node now, then freeing
- * everything back into the pool.
- *
- * WHY THE SIZE CLASSES MATTER:
- * The scalable pool (TBB) keeps SIZE-SEGREGATED free lists. A retained 2 MiB
- * block lives in the large/superblock free list and will NOT satisfy a later
- * 16 KiB request. So prewarming with one big chunk size warms the wrong size
- * class: the workload's 245 B .. 32 KiB allocations still pull fresh, unfaulted
- * pages from the provider and pay first-touch faults on the first write. That
- * shows up as inflated alloc + memcpy phases (and free memory shrinking during
- * the run despite "prefaulting everything").
- *
- * This version sweeps the size classes the workload actually allocates, so the
- * retained per-class free lists are warm and page-faulted, and real SETs reuse
- * them instead of faulting fresh pages.
- *
- * Call AFTER umf_allocator_init, BEFORE the measured workload.
- * Returns 0 on success. */
-
-/* int umf_allocator_prewarm(int numa_node, size_t bytes, size_t chunk) {
-    (void)chunk; // no longer a single chunk size; kept for ABI compatibility 
-
-    if (bytes == 0) return 0;
-    if (numa_node < 0 || numa_node >= MAX_NODES) {
-        fprintf(stderr, "umf_allocator_prewarm: numa_node %d out of range\n", numa_node);
+    res = umfDevDaxMemoryProviderParamsCreate(dax_path, dax_size, &dax_params);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create DAX params: %d\n", res);
         return 1;
     }
 
-    umf_memory_pool_handle_t p = (umf_memory_pool_handle_t)
-        atomic_load_explicit(&pools[numa_node], memory_order_acquire);
-    if (!p) {
-        fprintf(stderr, "umf_allocator_prewarm: pool not initialized (node %d)\n", numa_node);
-        return 1;
-    }
-
-    long pg = sysconf(_SC_PAGESIZE);
-    if (pg <= 0) pg = 4096;
-
-    static const size_t classes[] = {
-        256, 512, 1024, 2048, 4096, 8192, 16384, 32768
-    };
-    const size_t nclasses = sizeof(classes) / sizeof(classes[0]);
-
-
-    size_t bytes_per_class = bytes / nclasses;
-    if (bytes_per_class == 0) bytes_per_class = bytes; 
-
-
-    size_t cap = 0;
-    for (size_t c = 0; c < nclasses; c++) {
-        size_t per = bytes_per_class / classes[c];
-        if (per == 0) per = 1;
-        cap += per;
-    }
-
-    void **ptrs = calloc(cap, sizeof(void *));
-    if (!ptrs) {
-        fprintf(stderr, "umf_allocator_prewarm: out of host memory (cap=%zu)\n", cap);
+    res = umfMemoryProviderCreate(umfDevDaxMemoryProviderOps(), dax_params, &dax_provider);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create DAX provider: %d\n", res);
         return 2;
     }
 
-    size_t got = 0;
-    size_t total_bytes = 0;
-
-    for (size_t c = 0; c < nclasses; c++) {
-        size_t sz = classes[c];
-        size_t per = bytes_per_class / sz;
-        if (per == 0) per = 1;
-
-        for (size_t i = 0; i < per; i++) {
-            if (got >= cap) break; 
-            void *blk = umfPoolMalloc(p, sz);
-            if (!blk) {
-                fprintf(stderr,
-                        "umf_allocator_prewarm (node %d): pool exhausted in class %zu B "
-                        "at %zu/%zu blocks\n",
-                        numa_node, sz, i, per);
-                for (size_t j = 0; j < got; j++) umfPoolFree(p, ptrs[j]);
-                free(ptrs);
-                return 3;
-            }
-
-            volatile char *vp = (volatile char *)blk;
-            for (size_t off = 0; off < sz; off += (size_t)pg) {
-                vp[off] = 0;
-            }
-
-            if (sz > 0) vp[sz - 1] = 0;
-
-            ptrs[got++] = blk;
-            total_bytes += sz;
-        }
-
-        fprintf(stderr,
-                "umf_allocator_prewarm (node %d): class %6zu B -> %zu blocks\n",
-                numa_node, sz, per);
+    res = umfJemallocPoolParamsCreate(&jemalloc_params);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create jemalloc pool params: %d\n", res);
+        return 3;
     }
 
-    fprintf(stderr,
-            "umf_allocator_prewarm (node %d): touched %zu blocks across %zu classes = %zu MiB\n",
-            numa_node, got, nclasses, total_bytes >> 20);
+    res = umfPoolCreate(umfJemallocPoolOps(), dax_provider, jemalloc_params, 0, &pool);
+    umfJemallocPoolParamsDestroy(jemalloc_params);
 
-    for (size_t i = 0; i < got; i++) umfPoolFree(p, ptrs[i]);
-    free(ptrs);
+    if (res != UMF_RESULT_SUCCESS) {
+        fprintf(stderr, "Failed to create memory pool: %d\n", res);
+        return 4;
+    }
+
+    // Zero all memory in the pool
+    // in case of persistence.. dont think it matters for devdax tho.. 
+    size_t pool_size = dax_size;
+    void *base = umfPoolMalloc(pool, pool_size);
+    if (base) {
+        memset(base, 0, pool_size);
+        umfPoolFree(pool, base);
+    }
+    //printf("base pointer init %p\n", base);
+
+    atexit(umf_allocator_finalize_dax);
     return 0;
 }
 
-*/
 
+void *return_pmem_base_dax(size_t dax_size) {
+    void *base = umfPoolMalloc(pool, dax_size);
+    
+    //if (base) {
+    //    memset(base, 0, dax_size);
+    //    umfPoolFree(pool, base);
+    //}
+    //printf("base pointer pmem %p\n", base);
+    return base; //this should be the base address of the mapped PMEM region
+}
 
+void *umf_alloc_dax(size_t size, size_t align) {
+    //pthread_mutex_lock(&pool_lock);
+    if (!pool || size == 0) {
+        //pthread_mutex_unlock(&pool_lock);
+        fprintf(stderr, "Invalid allocation request: pool is NULL or size is 0, size=%zu\n", size);
+        return NULL;
+    }
+    //void *ptr = umfPoolMalloc(pool, size); //might want to use the aligned version
 
+    //respect alignment.... although jemalloc should do this for us...........
+    void *ptr = umfPoolAlignedMalloc(pool, size, align);
 
+    //pthread_mutex_unlock(&pool_lock);
+    return ptr;
+}
+
+void umf_dealloc_dax(void *ptr) {
+    //pthread_mutex_lock(&pool_lock);
+    if (!pool || !ptr) {
+        //pthread_mutex_unlock(&pool_lock);
+        return;
+    }
+    umfPoolFree(pool, ptr);
+    //pthread_mutex_unlock(&pool_lock);
+}
+
+int check_tier_dax(void *ptr) {
+    umf_memory_pool_handle_t curr_pool;
+    if (umfPoolByPtr(ptr, &curr_pool) == UMF_RESULT_SUCCESS) {
+
+        if (curr_pool == pool) {
+            return 1; //pmem
+        }
+    }
+    else {
+        return 0; //dram
+    }
+    //tjhis is unreachabke thoo
+    return -1; //not from any UMF pool
+}
 

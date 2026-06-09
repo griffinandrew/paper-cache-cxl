@@ -203,7 +203,7 @@ impl DRAMObjects {
             eprintln!("UMF prewarm returned {}", rc);
         }
     }
-    const NODE_DRAM: i32 = 1;
+    const NODE_DRAM: i32 = 0;
 }
 
 
@@ -459,6 +459,175 @@ unsafe impl allocator_api2::alloc::Allocator for ValueDRAM {
         unsafe { self.dealloc(ptr.as_ptr(), layout) }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+//hardcode dram for box value..
+#[derive(Clone, Copy)]
+pub struct ValueDRAM;
+
+//static mut NUM_CALLS_DRAM: usize = 0;
+
+
+
+impl ValueDRAM {
+    /// Initialize the UMF pool and prewarm a working-set-sized region.
+    /// Call from main() before the benchmark loop.
+    pub fn init_and_prewarm(numa_node: i32, prewarm_bytes: usize) {
+        //INIT.call_once(|| {
+        unsafe { allocator_bindings::umf_allocator_init_dax(DEFAULT_DEVDAX_PATH, DAX_SIZE_BYTES); }
+        //#[cfg(debug_assertions)]
+        //println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);
+        //});
+    }
+
+    const DEFAULT_DEVDAX_PATH: &str = "/dev/dax0.0";
+    const DAX_SIZE_BYTES: usize = 100 * 1024 * 1024 * 1024; // 100 GiB
+}
+
+
+
+unsafe impl GlobalAlloc for DAXPMEM {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Initialise the UMF pool on first allocation.  On real hardware this
+        // maps a jemalloc pool over the PMEM NUMA node.  In the stub this is
+        // a no-op.
+        //INIT.call_once(|| {
+        //    let numa_node = 0; // DRAM NUMA node (ignored by stub)
+        //    allocator_bindings::umf_allocator_init(numa_node);
+        //    #[cfg(debug_assertions)]
+        //    println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);
+        //});
+
+        //INIT.call_once( || { 
+            //ValueDRAM::init_and_prewarm(Self::VALUE_DRAM_NODE, 8 * 1024 * 1024 * 1024);
+
+            //println!("ValueDRAM: Initialising and prewarming UMF pool on NUMA node {} with {} bytes",
+            //    Self::VALUE_DRAM_NODE, 8 * 1024 * 1024 * 1024);
+        //});
+
+        let ptr = allocator_bindings::umf_alloc_dax(layout.size(), layout.align()) as *mut u8;
+        if ptr.is_null() {
+            println!("DAXPMEM: UMF alloc failed for {} bytes", layout.size());
+            return ptr::null_mut();
+        }
+
+        //println!("DAXPMEM: UMF alloc succeeded for {} bytes at {:p} with node {}", layout.size(), ptr, Self::VALUE_DRAM_NODE);
+
+        //unsafe {
+        //    NUM_CALLS_DRAM += 1;
+        //}
+
+        //if  NUM_CALLS_DRAM % PRINT_THRESHOLD == 0 {
+        //    println!("DAXPMEM: UMF alloc called {} times", NUM_CALLS_DRAM);
+        //}
+
+
+        #[cfg(debug_assertions)]
+        {
+            ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
+            unsafe {
+                if PRINT_THRESHOLD < NUM_ALLOCS {
+                    println!("DAXPMEM alloc: {} bytes (total {} bytes)",
+                        layout.size(), ALL_MEM_ALLOCATED.load(Ordering::SeqCst));
+                    NUM_ALLOCS = 0;
+                }
+                NUM_ALLOCS += 1;
+            }
+        }
+
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        allocator_bindings::umf_dealloc_dax(ptr as *mut std::ffi::c_void);
+
+        #[cfg(debug_assertions)]
+        {
+            ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
+            unsafe {
+                if PRINT_THRESHOLD < NUM_DEALLOCS {
+                    println!("DAXPMEM dealloc: {} bytes (total {} bytes)",
+                        layout.size(), ALL_MEM_ALLOCATED.load(Ordering::SeqCst));
+                    NUM_DEALLOCS = 0;
+                }
+                NUM_DEALLOCS += 1;
+            }
+        }
+    }
+}
+
+// Allocator trait — used by Vec<u8, HybridObjects> and Box<[u8], HybridObjects>
+// (i.e. BufferPMEM) via the nightly allocator_api feature.
+unsafe impl Allocator for DAXPMEM {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        unsafe {
+            DAXPMEM::alloc(self, layout)
+                .as_mut()
+                .map(|ptr| NonNull::slice_from_raw_parts(
+                    NonNull::new_unchecked(ptr),
+                    layout.size(),
+                ))
+                .ok_or(AllocError)
+        }
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        DAXPMEM::dealloc(self, ptr.as_ptr(), layout);
+    }
+}
+
+// allocator_api2 support (for hashbrown and dlv-list under eviction_stacks_pmem)
+#[cfg(any(feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem"))]
+unsafe impl allocator_api2::alloc::Allocator for DAXPMEM {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        let ptr = unsafe { self.alloc(layout) };
+        if ptr.is_null() {
+            Err(allocator_api2::alloc::AllocError)
+        } else {
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, layout.size()) };
+            Ok(NonNull::from(slice))
+        }
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe { self.dealloc(ptr.as_ptr(), layout) }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
