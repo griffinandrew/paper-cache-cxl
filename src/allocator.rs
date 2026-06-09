@@ -347,7 +347,7 @@ impl ValueDRAM {
             eprintln!("UMF prewarm returned {}", rc);
         }
     }
-    const NODE_DRAM: i32 = 0;
+    const NODE_DRAM: i32 = 2;
 }
 
 
