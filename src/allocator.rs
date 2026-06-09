@@ -347,7 +347,7 @@ impl ValueDRAM {
             eprintln!("UMF prewarm returned {}", rc);
         }
     }
-    const NODE_DRAM: i32 = 2;
+    const VALUE_DRAM_NODE: i32 = 2;
 }
 
 
@@ -364,20 +364,20 @@ unsafe impl GlobalAlloc for ValueDRAM {
         //    println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
 
-        INIT.call_once( || { 
-            ValueDRAM::init_and_prewarm(Self::NODE_DRAM, 8 * 1024 * 1024 * 1024);
+        //INIT.call_once( || { 
+            //ValueDRAM::init_and_prewarm(Self::VALUE_DRAM_NODE, 8 * 1024 * 1024 * 1024);
 
             //println!("ValueDRAM: Initialising and prewarming UMF pool on NUMA node {} with {} bytes",
-            //    Self::NODE_DRAM, 8 * 1024 * 1024 * 1024);
-        });
+            //    Self::VALUE_DRAM_NODE, 8 * 1024 * 1024 * 1024);
+        //});
 
-        let ptr = allocator_bindings::umf_alloc(Self::NODE_DRAM,layout.size(), layout.align()) as *mut u8;
+        let ptr = allocator_bindings::umf_alloc(Self::VALUE_DRAM_NODE,layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
             println!("ValueDRAM: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
         }
 
-        //println!("ValueDRAM: UMF alloc succeeded for {} bytes at {:p} with node {}", layout.size(), ptr, Self::NODE_DRAM);
+        //println!("ValueDRAM: UMF alloc succeeded for {} bytes at {:p} with node {}", layout.size(), ptr, Self::VALUE_DRAM_NODE);
 
         //unsafe {
         //    NUM_CALLS_DRAM += 1;
@@ -405,7 +405,7 @@ unsafe impl GlobalAlloc for ValueDRAM {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        allocator_bindings::umf_dealloc(Self::NODE_DRAM, ptr as *mut std::ffi::c_void);
+        allocator_bindings::umf_dealloc(Self::VALUE_DRAM_NODE, ptr as *mut std::ffi::c_void);
 
         #[cfg(debug_assertions)]
         {
