@@ -483,7 +483,7 @@ impl DAXPMEM {
     /// Call from main() before the benchmark loop.
     pub fn init_and_prewarm() {
         //INIT.call_once(|| {
-        unsafe { allocator_bindings::umf_allocator_init_dax(DEFAULT_DEVDAX_PATH, DAX_SIZE_BYTES); }
+        unsafe { allocator_bindings::umf_allocator_init_dax(Self::DEFAULT_DEVDAX_PATH, Self::DAX_SIZE_BYTES); }
         //#[cfg(debug_assertions)]
         //println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
