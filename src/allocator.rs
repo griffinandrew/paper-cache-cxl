@@ -472,7 +472,7 @@ unsafe impl allocator_api2::alloc::Allocator for ValueDRAM {
 
 //hardcode dram for box value..
 #[derive(Clone, Copy)]
-pub struct ValueDRAM;
+pub struct DAXPMEM;
 
 //static mut NUM_CALLS_DRAM: usize = 0;
 
