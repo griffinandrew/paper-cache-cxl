@@ -481,7 +481,7 @@ pub struct ValueDRAM;
 impl ValueDRAM {
     /// Initialize the UMF pool and prewarm a working-set-sized region.
     /// Call from main() before the benchmark loop.
-    pub fn init_and_prewarm(numa_node: i32, prewarm_bytes: usize) {
+    pub fn init_and_prewarm() {
         //INIT.call_once(|| {
         unsafe { allocator_bindings::umf_allocator_init_dax(DEFAULT_DEVDAX_PATH, DAX_SIZE_BYTES); }
         //#[cfg(debug_assertions)]
