@@ -463,7 +463,7 @@ int umf_allocator_init_dax(const char *dax_path, size_t dax_size) {
         return 1;
     }
 
-    res = umfMemoryProviderCreate(umfDevDaxMemoryProviderOps(), dax_params, &dax_provider);
+    res = umfMemoryProviderCreate(umfDevDaxMemoryProviderOps(), dax_params, &providers[5]);
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to create DAX provider: %d\n", res);
         return 2;
