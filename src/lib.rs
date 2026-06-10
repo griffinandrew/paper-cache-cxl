@@ -303,7 +303,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 pub mod rdtsc_probes;
 
 use crate::rdtsc_probes::{
-    rdtsc, PHASE_PRE_ALLOC, PHASE_ALLOC, PHASE_MEMCPY, PHASE_POST, PHASE_INSERT, PHASE_GET_HASH, PHASE_GET_LOCK, PHASE_GET_LOOKUP, PHASE_GET_VALIDATE, PHASE_GET_COPY, PHASE_GET_BROADCAST, PHASE_PROBE,
+    rdtsc, PHASE_PRE_ALLOC, PHASE_ALLOC, PHASE_MEMCPY, PHASE_POST, PHASE_INSERT, PHASE_GET_HASH, PHASE_GET_LOCK, PHASE_GET_LOOKUP, PHASE_GET_VALIDATE, PHASE_GET_COPY, PHASE_GET_BROADCAST, PHASE_PROBE, PHASE_SET_BROADCAST,
 };
 
 pub use rdtsc_probes::{calibrate_tsc_hz, report_set, report_get, calibrate_probe_overhead};
@@ -1244,34 +1244,34 @@ where
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		
-		//let t0 = rdtsc();
+		let t0 = rdtsc();
 		let hashed_key = self.hash_key(&key);
-		//let t1 = rdtsc();
-		//PHASE_PRE_ALLOC.record(t1 - t0);
+		let t1 = rdtsc();
+		PHASE_PRE_ALLOC.record(t1 - t0);
 
 		//allocate it as a regular buffer... 
 		//let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
 
 		//let key_buff = Box::new(key);
 
-		//let t2_start = rdtsc();
-		//let mut val_buf: Vec<u8> = Vec::with_capacity(value.len());
+		let t2_start = rdtsc();
+		let mut val_buf: Vec<u8> = Vec::with_capacity(value.len());
 
-		//let t2_end = rdtsc();
-		//PHASE_ALLOC.record(t2_end - t2_start);
+		let t2_end = rdtsc();
+		PHASE_ALLOC.record(t2_end - t2_start);
 
 		// === phase 3: memcpy value into PMEM ===
-		//let t3_start = rdtsc();
-		//val_buf.extend_from_slice(value);
-		//let val_buf: BufferDRAM = val_buf.into_boxed_slice();
-		let val_buf: BufferDRAM = Box::clone_from_ref(value);
-		//let t3_end = rdtsc();
-		//PHASE_MEMCPY.record(t3_end - t3_start);
+		let t3_start = rdtsc();
+		val_buf.extend_from_slice(value);
+		let val_buf: BufferDRAM = val_buf.into_boxed_slice();
+		//let val_buf: BufferDRAM = Box::clone_from_ref(value);
+		let t3_end = rdtsc();
+		PHASE_MEMCPY.record(t3_end - t3_start);
 
-		//let t4_start = rdtsc();
+		let t4_start = rdtsc();
 		let object = Object::new(key, val_buf, ttl);
-		//let t4_end = rdtsc();
-		//PHASE_POST.record(t4_end - t4_start);
+		let t4_end = rdtsc();
+		PHASE_POST.record(t4_end - t4_start);
 		let base_size = self.overhead_manager.base_size(&object);
 		let expiry = object.expiry();
 
@@ -1285,7 +1285,7 @@ where
 
 		self.status.incr_sets();
 
-		//let t5_start = rdtsc();
+		let t5_start = rdtsc();
 		let old_object_info = self.objects
 			.insert(hashed_key, object)
 			.map(|old_object| {
@@ -1294,8 +1294,8 @@ where
 
 				(base_size, expiry)
 			});
-		//let t5_end = rdtsc();
-		//PHASE_INSERT.record(t5_end - t5_start);
+		let t5_end = rdtsc();
+		PHASE_INSERT.record(t5_end - t5_start);
 
 		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
 			base_size as i64 - old_object_size as i64
@@ -1306,7 +1306,10 @@ where
 		};
 
 		self.status.update_base_used_size(base_size_delta);
+		let t6_start = rdtsc();
 		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+		let t6_end = rdtsc();
+		PHASE_SET_BROADCAST.record(t6_end - t6_start);
 
 		Ok(())
 	}
@@ -2104,10 +2107,10 @@ where
 		K: 'static + Eq + Hash + TypeSize + std::fmt::Debug,
 	{
 
-		//let t0 = rdtsc();
+		let t0 = rdtsc();
 		let hashed_key = self.hash_key(&key);
-		//let t1 = rdtsc();
-		//PHASE_PRE_ALLOC.record(t1 - t0);
+		let t1 = rdtsc();
+		PHASE_PRE_ALLOC.record(t1 - t0);
 
 
 		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
@@ -2174,17 +2177,17 @@ where
 			//pub fn clone_from_ref_in(src: &T, alloc: A) -> Box<T, A>
 
 			// === phase 2: allocation of value buffer ===
-			//let t2_start = rdtsc();
-			//let mut val_buf: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
-			let val_buf: BufferPMEM = Box::clone_from_ref_in(value, Hybrid);
+			let t2_start = rdtsc();
+			let mut val_buf: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
+			//let val_buf: BufferPMEM = Box::clone_from_ref_in(value, Hybrid);
 			//let mut uninit_buf = Box::new_uninit_slice_in(value.len(), Hybrid);
-			//let t2_end = rdtsc();
-			//PHASE_ALLOC.record(t2_end - t2_start);
+			let t2_end = rdtsc();
+			PHASE_ALLOC.record(t2_end - t2_start);
 
 			// === phase 3: memcpy value into PMEM ===
-			//let t3_start = rdtsc();
-			//val_buf.extend_from_slice(value);
-			//let val_buf: BufferPMEM = val_buf.into_boxed_slice();
+			let t3_start = rdtsc();
+			val_buf.extend_from_slice(value);
+			let val_buf: BufferPMEM = val_buf.into_boxed_slice();
 			//unsafe {
 				// Copy directly into the uninitialized raw pointer
 			//	ptr::copy_nonoverlapping(
@@ -2196,8 +2199,8 @@ where
 			//let val_buf: BufferPMEM = unsafe { uninit_buf.assume_init() };
 
 			//let val_buf: BufferPMEM = { uninit_buf.assume_init() };
-			//let t3_end = rdtsc();
-			//PHASE_MEMCPY.record(t3_end - t3_start);
+			let t3_end = rdtsc();
+			PHASE_MEMCPY.record(t3_end - t3_start);
 
 			//let key_buf: BufferPMEM = 
 
@@ -2208,15 +2211,10 @@ where
 			//let key_buf: BufferPMEM = key.to_vec_in(Hybrid).into_boxed_slice();
 
 			//the key should also be in pmem... this is stale or wrong... mut have changed it back??
-			//let t4_start = rdtsc();
+			let t4_start = rdtsc();
 			let object = Object::new(key, val_buf, ttl);
-			//let t4_end = rdtsc();
-			//PHASE_POST.record(t4_end - t4_start);
-
-			//should =turn this into pmem buffer .... 
-
-
-			//let object = Object::new(key, value, ttl);
+			let t4_end = rdtsc();
+			PHASE_POST.record(t4_end - t4_start);
 			
 			let base_size = self.overhead_manager.base_size(&object);
 			let expiry = object.expiry();
@@ -2231,7 +2229,7 @@ where
 
 			self.status.incr_sets();
 
-			//let t5_start = rdtsc();
+			let t5_start = rdtsc();
 			let old_object_info = self.objects
 				.insert(hashed_key, object)
 				.map(|old_object| {
@@ -2240,8 +2238,8 @@ where
 
 					(base_size, expiry)
 				});
-			//let t5_end = rdtsc();
-			//PHASE_INSERT.record(t5_end - t5_start);
+			let t5_end = rdtsc();
+			PHASE_INSERT.record(t5_end - t5_start);
 
 			let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
 				base_size as i64 - old_object_size as i64
@@ -2252,7 +2250,10 @@ where
 			};
 
 			self.status.update_base_used_size(base_size_delta);
+			let t6_start = rdtsc();
 			self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+			let t6_end = rdtsc();
+			PHASE_SET_BROADCAST.record(t6_end - t6_start)
 			Ok(())
 		}
 
