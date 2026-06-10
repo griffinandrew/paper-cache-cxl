@@ -78,7 +78,7 @@ pub fn report_set(tsc_hz: f64) {
     PHASE_MEMCPY.report(tsc_hz);
     PHASE_POST.report(tsc_hz);
     PHASE_INSERT.report(tsc_hz);
-    PHASE_SET_BROADCAST.report(tsc_hz):
+    PHASE_SET_BROADCAST.report(tsc_hz);
     println!();
 }
 

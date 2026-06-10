@@ -2253,7 +2253,7 @@ where
 			let t6_start = rdtsc();
 			self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
 			let t6_end = rdtsc();
-			PHASE_SET_BROADCAST.record(t6_end - t6_start)
+			PHASE_SET_BROADCAST.record(t6_end - t6_start);
 			Ok(())
 		}
 
