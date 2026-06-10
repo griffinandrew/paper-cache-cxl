@@ -90,6 +90,7 @@ use crate::allocator::RegionHybrid as Hybrid;
 #[cfg(all(
     any(
         feature = "key_value_pmem",
+		feature = "key_pmem_value_pmem",
         feature = "global_hashtable_pmem",
         feature = "tiering_hashtable_pmem",
         feature = "flatmap_pmem",
