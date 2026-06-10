@@ -60,8 +60,16 @@ impl HybridObjects {
         //#[cfg(debug_assertions)]
         //println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
+        let bytes = 18 * 1024 * 1024 * 1024;
         let chunk = 2 * 1024 * 1024usize;
-        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, prewarm_bytes, chunk) };
+        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes, chunk) };
+        if rc != 0 {
+            eprintln!("UMF prewarm returned {}", rc);
+        }
+
+        let chunk_2 = 1024 * 4usize;
+        let bytes_2 = 18 * 1024 * 1024 * 1024;
+        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes_2, chunk_2) };
         if rc != 0 {
             eprintln!("UMF prewarm returned {}", rc);
         }
@@ -197,8 +205,16 @@ impl DRAMObjects {
         //#[cfg(debug_assertions)]
         //println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
+        let bytes = 18 * 1024 * 1024 * 1024;
         let chunk = 2 * 1024 * 1024usize;
-        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, prewarm_bytes, chunk) };
+        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes, chunk) };
+        if rc != 0 {
+            eprintln!("UMF prewarm returned {}", rc);
+        }
+
+        let chunk_2 = 1024 * 4usize;
+        let bytes_2 = 18 * 1024 * 1024 * 1024;
+        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes_2, chunk_2) };
         if rc != 0 {
             eprintln!("UMF prewarm returned {}", rc);
         }
@@ -341,8 +357,17 @@ impl ValueDRAM {
         //#[cfg(debug_assertions)]
         //println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
+
+        let bytes = 18 * 1024 * 1024 * 1024;
         let chunk = 2 * 1024 * 1024usize;
-        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, prewarm_bytes, chunk) };
+        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes, chunk) };
+        if rc != 0 {
+            eprintln!("UMF prewarm returned {}", rc);
+        }
+
+        let chunk_2 = 1024 * 4usize;
+        let bytes_2 = 18 * 1024 * 1024 * 1024;
+        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes_2, chunk_2) };
         if rc != 0 {
             eprintln!("UMF prewarm returned {}", rc);
         }
