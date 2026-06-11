@@ -1265,6 +1265,26 @@ where
 		val_buf.extend_from_slice(value);
 		let val_buf: BufferDRAM = val_buf.into_boxed_slice();
 		//let val_buf: BufferDRAM = Box::clone_from_ref(value);
+
+		unsafe {
+			let ptr = val_buf.as_ptr();
+			let len = val_buf.len();
+
+			if len > 0 {
+				let cache_line_size = 64usize;
+				let start = ptr as usize;
+				let end = start + len;
+
+				let mut addr = start & !(cache_line_size - 1);
+
+				while addr < end {
+					_mm_clflush(addr as *const u8);
+					addr += cache_line_size;
+				}
+
+				_mm_sfence();
+			}
+		}
 		let t3_end = rdtsc();
 		PHASE_MEMCPY.record(t3_end - t3_start);
 
@@ -2188,6 +2208,31 @@ where
 			let t3_start = rdtsc();
 			val_buf.extend_from_slice(value);
 			let val_buf: BufferPMEM = val_buf.into_boxed_slice();
+
+
+			unsafe {
+				let ptr = val_buf.as_ptr();
+				let len = val_buf.len();
+
+				if len > 0 {
+					let cache_line_size = 64usize;
+					let start = ptr as usize;
+					let end = start + len;
+
+					let mut addr = start & !(cache_line_size - 1);
+
+					while addr < end {
+						_mm_clflush(addr as *const u8);
+						addr += cache_line_size;
+					}
+
+					_mm_sfence();
+				}
+			}
+
+				
+
+		
 			//unsafe {
 				// Copy directly into the uninitialized raw pointer
 			//	ptr::copy_nonoverlapping(
