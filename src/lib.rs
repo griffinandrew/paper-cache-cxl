@@ -53,6 +53,8 @@ use crate::allocator::HybridObjects as Hybrid;
 
 
 
+use std::arch::x86_64::{_mm_clflush, _mm_sfence};
+
 
 #[cfg(all(
     any(
