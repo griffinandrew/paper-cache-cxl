@@ -667,7 +667,7 @@ mod tests {
 
     #[test]
     fn test_tiering_manager_creation() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
         let stats = manager.stats();
 
         assert_eq!(stats.dram_objects, 0);
@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_register_object() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
 
         manager.register_object(1, 100);
 
@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_promote_to_dram() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
 
         manager.register_object(1, 100);
         assert!(manager.promote_to_dram(1));
@@ -703,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_demote_from_dram() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
 
         manager.register_object(1, 100);
         manager.promote_to_dram(1);
@@ -723,8 +723,9 @@ mod tests {
             high_water_mark: 0.9,
             low_water_mark: 0.7,
             hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
         };
-        let manager = TieringManager::new(config);
+        let manager = TieringManager::<u32, BufferPMEM>::new(config);
 
         // Promote two objects, total 200 bytes (at threshold)
         manager.register_object(1, 100);
@@ -743,7 +744,7 @@ mod tests {
 
     #[test]
     fn test_remove_object() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
 
         manager.register_object(1, 100);
         manager.promote_to_dram(1);
@@ -756,14 +757,17 @@ mod tests {
 
     #[test]
     fn test_access_recording() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
 
         manager.register_object(1, 100);
 
-        // First access - should not promote yet (threshold is 2)
+        // Default hotness threshold is 3 accesses.
         assert!(!manager.record_access(1));
 
-        // Second access - should suggest promotion
+        // Second access - still below threshold
+        assert!(!manager.record_access(1));
+
+        // Third access - should suggest promotion
         assert!(manager.record_access(1));
     }
 
@@ -771,7 +775,7 @@ mod tests {
     fn test_configurable_hotness_threshold() {
         let mut config = TieringConfig::default();
         config.hotness_threshold = 3;
-        let manager = TieringManager::new(config);
+        let manager = TieringManager::<u32, BufferPMEM>::new(config);
 
         manager.register_object(1, 100);
 
@@ -790,8 +794,9 @@ mod tests {
             high_water_mark: 0.9,
             low_water_mark: 0.6,
             hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
         };
-        let manager = TieringManager::new(config);
+        let manager = TieringManager::<u32, BufferPMEM>::new(config);
 
         // Register and promote 4 objects
         for i in 1..=4 {
@@ -811,9 +816,9 @@ mod tests {
 
     #[test]
     fn test_set_and_get_hotness_threshold() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
         
-        assert_eq!(manager.hotness_threshold(), 2);
+        assert_eq!(manager.hotness_threshold(), 3);
         
         manager.set_hotness_threshold(5);
         assert_eq!(manager.hotness_threshold(), 5);
@@ -2578,7 +2583,7 @@ mod tests {
 
     #[test]
     fn test_tiering_manager_creation() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
         let stats = manager.stats();
 
         assert_eq!(stats.dram_objects, 0);
@@ -2589,7 +2594,7 @@ mod tests {
 
     #[test]
     fn test_register_object() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
 
         manager.register_object(1, 100);
 
@@ -2600,7 +2605,7 @@ mod tests {
 
     #[test]
     fn test_promote_to_dram() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
 
         manager.register_object(1, 100);
         assert!(manager.promote_to_dram(1));
@@ -2614,7 +2619,7 @@ mod tests {
 
     #[test]
     fn test_demote_from_dram() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
 
         manager.register_object(1, 100);
         manager.promote_to_dram(1);
@@ -2634,8 +2639,9 @@ mod tests {
             high_water_mark: 0.9,
             low_water_mark: 0.7,
             hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
         };
-        let manager = TieringManager::new(config);
+        let manager = TieringManager::<u32, BufferPMEM>::new(config);
 
         // Promote two objects, total 200 bytes (at threshold)
         manager.register_object(1, 100);
@@ -2654,7 +2660,7 @@ mod tests {
 
     #[test]
     fn test_remove_object() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
 
         manager.register_object(1, 100);
         manager.promote_to_dram(1);
@@ -2667,14 +2673,17 @@ mod tests {
 
     #[test]
     fn test_access_recording() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
 
         manager.register_object(1, 100);
 
-        // First access - should not promote yet (threshold is 2)
+        // Default hotness threshold is 3 accesses.
         assert!(!manager.record_access(1));
 
-        // Second access - should suggest promotion
+        // Second access - still below threshold
+        assert!(!manager.record_access(1));
+
+        // Third access - should suggest promotion
         assert!(manager.record_access(1));
     }
 
@@ -2682,7 +2691,7 @@ mod tests {
     fn test_configurable_hotness_threshold() {
         let mut config = TieringConfig::default();
         config.hotness_threshold = 3;
-        let manager = TieringManager::new(config);
+        let manager = TieringManager::<u32, BufferPMEM>::new(config);
 
         manager.register_object(1, 100);
 
@@ -2701,8 +2710,9 @@ mod tests {
             high_water_mark: 0.9,
             low_water_mark: 0.6,
             hotness_threshold: 1,
+            use_pmem_for_tiering_hashtable: false,
         };
-        let manager = TieringManager::new(config);
+        let manager = TieringManager::<u32, BufferPMEM>::new(config);
 
         // Register and promote 4 objects
         for i in 1..=4 {
@@ -2722,9 +2732,9 @@ mod tests {
 
     #[test]
     fn test_set_and_get_hotness_threshold() {
-        let manager = TieringManager::with_defaults();
+        let manager = TieringManager::<u32, BufferPMEM>::with_defaults();
         
-        assert_eq!(manager.hotness_threshold(), 2);
+        assert_eq!(manager.hotness_threshold(), 3);
         
         manager.set_hotness_threshold(5);
         assert_eq!(manager.hotness_threshold(), 5);

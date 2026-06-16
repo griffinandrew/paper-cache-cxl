@@ -19,8 +19,8 @@ mod tiering_tests {
         assert_eq!(stats.promotions, 0);
         assert_eq!(stats.demotions, 0);
 
-        // Default DRAM threshold should be 20% of max_size (2000 bytes)
-        assert_eq!(cache.dram_threshold(), 2000);
+        // Default DRAM threshold comes from `TieringConfig::default()`.
+        assert_eq!(cache.dram_threshold(), 1 * 1024 * 1024 * 1024);
 
         // Set some objects
         for i in 0..10 {
@@ -56,7 +56,7 @@ mod tiering_tests {
 
         // Test DRAM threshold configuration
         let initial_threshold = cache.dram_threshold();
-        assert_eq!(initial_threshold, 2000); // 20% of 10000
+        assert_eq!(initial_threshold, 1 * 1024 * 1024 * 1024);
 
         cache.set_dram_threshold(5000);
         assert_eq!(cache.dram_threshold(), 5000);

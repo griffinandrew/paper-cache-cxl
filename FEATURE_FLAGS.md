@@ -20,10 +20,16 @@ The implementation provides explicit feature flags to control:
 - **Use case**: Baseline performance testing, systems without PMEM
 
 ### `key_value_pmem`
-- **Purpose**: Store key and value data in PMEM
-- **When enabled**: Cache key/value pairs are allocated in PMEM
+- **Purpose**: Store value bytes in PMEM (Hybrid allocator)
+- **When enabled**: Cache values (`BufferPMEM`) are allocated in PMEM while keys remain in DRAM
 - **When disabled**: Cache key/value pairs use default allocation (typically DRAM)
 - **Requirements**: Mutually exclusive with `all_dram`
+
+### `key_pmem_value_pmem`
+- **Purpose**: Store both key bytes and value bytes in PMEM
+- **When enabled**: Keys are moved into PMEM (`Box<K, Hybrid>`) and values remain PMEM-backed (`BufferPMEM`)
+- **When disabled**: Keys remain in DRAM even when `key_value_pmem` is enabled
+- **Requirements**: Implies `key_value_pmem`
 
 ### `enable_tiering_manager`
 - **Purpose**: Enable/disable the tiering manager functionality
@@ -97,6 +103,12 @@ The implementation provides explicit feature flags to control:
 - **Requirements**: Mutually exclusive with `global_hashtable_pmem`, `global_flatmap_dram`, and `global_flatmap_pmem`
 
 ## Implementation Details
+
+### Returning PMEM-backed values
+
+For `PaperCache<K, BufferPMEM>` builds:
+- `get()` returns a DRAM `Vec<u8>` copy of the value bytes
+- `get_pmem()` returns an `Arc<BufferPMEM>` pointing at the PMEM-backed value (zero-copy)
 
 ### Type System
 
