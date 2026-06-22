@@ -1250,7 +1250,7 @@ where
 	/// 
 	
 
-	/*
+	
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		
 		let hashed_key = self.hash_key(&key);
@@ -1323,8 +1323,8 @@ where
 		Ok(())
 	}
 
-*/
 
+/* 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		
 		let t0 = rdtsc();
@@ -1419,7 +1419,7 @@ where
 		Ok(())
 	}
 	
-
+*/
 
 	/// Deletes the object associated with the supplied key in the cache.
 	/// Returns a [`CacheError`] if the key was not found in the cache.
@@ -2207,7 +2207,7 @@ where
 	// not V but &[u8]??
 
 
-/* 
+
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> 
 	where
     	//V: AsRef<[u8]> + TypeSize,
@@ -2378,9 +2378,8 @@ where
 	}
 
 
-	*/
 
-
+/*
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> 
 	where
     	//V: AsRef<[u8]> + TypeSize,
@@ -2567,7 +2566,7 @@ where
 
 		//Ok(())
 	}
-
+*/
 
 	/// Deletes the object associated with the supplied key in the cache.
 	/// Returns a [`CacheError`] if the key was not found in the cache.
