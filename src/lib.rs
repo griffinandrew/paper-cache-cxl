@@ -1243,6 +1243,87 @@ where
 	///
 	/// assert!(cache.set(0, 0, None).is_ok());
 	/// ```
+	/// 
+	/// 
+	/// 
+	/// 
+	/// 
+	
+
+	/*
+	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
+		
+		let hashed_key = self.hash_key(&key);
+		//allocate it as a regular buffer... 
+		//let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
+
+		//let key_buff = Box::new(key);
+
+		//let mut val_buf: Vec<u8> = Vec::with_capacity(value.len());
+
+		// === phase 3: memcpy value into PMEM ===
+		//let val_buf: BufferDRAM = val_buf.into_boxed_slice();
+		let val_buf: BufferDRAM = Box::clone_from_ref(value);
+
+		/* 
+		unsafe {
+			let ptr = val_buf.as_ptr();
+			let len = val_buf.len();
+
+			if len > 0 {
+				let cache_line_size = 64usize;
+				let start = ptr as usize;
+				let end = start + len;
+
+				let mut addr = start & !(cache_line_size - 1);
+
+				while addr < end {
+					_mm_clflush(addr as *const u8);
+					addr += cache_line_size;
+				}
+
+				_mm_sfence();
+			}
+		}
+		*/
+		let object = Object::new(key, val_buf, ttl);
+		let base_size = self.overhead_manager.base_size(&object);
+		let expiry = object.expiry();
+
+		if base_size == 0 {
+			return Err(CacheError::ZeroValueSize);
+		}
+
+		if self.status.exceeds_max_size(base_size) {
+			return Err(CacheError::ExceedingValueSize);
+		}
+
+		self.status.incr_sets();
+
+		let old_object_info = self.objects
+			.insert(hashed_key, object)
+			.map(|old_object| {
+				let base_size = self.overhead_manager.base_size(&old_object);
+				let expiry = old_object.expiry();
+
+				(base_size, expiry)
+			});
+
+		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+			base_size as i64 - old_object_size as i64
+		} else {
+			// the object is new, so increase the number of objects count
+			self.status.incr_num_objects();
+			base_size as i64
+		};
+
+		self.status.update_base_used_size(base_size_delta);
+		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+
+		Ok(())
+	}
+
+*/
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		
@@ -1337,6 +1418,7 @@ where
 
 		Ok(())
 	}
+	
 
 
 	/// Deletes the object associated with the supplied key in the cache.
@@ -2122,7 +2204,181 @@ where
 	/// assert!(cache.set(0, 0, None).is_ok());
 	/// ```
 	
-	// not V but &[u8]?? 
+	// not V but &[u8]??
+
+
+/* 
+	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> 
+	where
+    	//V: AsRef<[u8]> + TypeSize,
+		K: 'static + Eq + Hash + TypeSize + std::fmt::Debug,
+	{
+
+		let hashed_key = self.hash_key(&key);
+
+		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
+
+		//allocate the object in the cache itself.... lets say pmem buffer
+		
+		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
+		//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
+		//buf1.extend_from_slice(&value);
+
+		//let buf: BufferPMEM = buf1.into_boxed_slice();
+
+
+		#[cfg(feature = "sets_dram")]
+		{
+			self.tiering_manager.set_dram(hashed_key, key.clone(), value, ttl);
+			return Ok(());
+		}
+
+
+		#[cfg(not(feature = "sets_dram"))]
+		{
+
+			/* 
+			let layout = Layout::from_size_align(value.len(), 1).unwrap();
+
+			let memory_block = Hybrid.allocate(layout)
+				.map_err(|_| CacheError::Internal)?;
+
+			// 1. Get the raw pointer to the start of the memory
+			let memory_ptr = memory_block.as_ptr() as *mut u8;
+
+			unsafe {
+				ptr::copy_nonoverlapping(value.as_ptr(), memory_ptr, value.len());
+
+				use std::arch::x86_64::{_mm_clflush, _mm_sfence};
+
+				let cache_line_size = 64usize;
+				let start = memory_ptr as usize;
+				let end = start + value.len();
+				// Round start down to a cache-line boundary so we flush the line
+				// containing the first byte even if the allocation isn't aligned.
+				let mut addr = start & !(cache_line_size - 1);
+				while addr < end {
+					_mm_clflush(addr as *const u8);
+					addr += cache_line_size;
+				}
+				_mm_sfence();
+			}
+
+			let val_buf: BufferPMEM = unsafe {
+				Box::from_raw_in(
+					ptr::slice_from_raw_parts_mut(memory_ptr, value.len()),
+					Hybrid
+				)
+			};
+			
+
+			 */
+
+			//let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
+
+
+			//pub fn clone_from_ref_in(src: &T, alloc: A) -> Box<T, A>
+
+			// === phase 2: allocation of value buffer ===
+			//let mut val_buf: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
+			let val_buf: BufferPMEM = Box::clone_from_ref_in(value, Hybrid);
+			//let mut uninit_buf = Box::new_uninit_slice_in(value.len(), Hybrid);
+
+			// === phase 3: memcpy value into PMEM ===
+			//val_buf.extend_from_slice(value);
+			//let val_buf: BufferPMEM = val_buf.into_boxed_slice();
+
+			/*
+			unsafe {
+				let ptr = val_buf.as_ptr();
+				let len = val_buf.len();
+
+				if len > 0 {
+					let cache_line_size = 64usize;
+					let start = ptr as usize;
+					let end = start + len;
+
+					let mut addr = start & !(cache_line_size - 1);
+
+					while addr < end {
+						_mm_clflush(addr as *const u8);
+						addr += cache_line_size;
+					}
+
+					_mm_sfence();
+				}
+			}
+			*/
+
+				
+
+		
+			//unsafe {
+				// Copy directly into the uninitialized raw pointer
+			//	ptr::copy_nonoverlapping(
+			//		value.as_ptr(), 
+			//		uninit_buf.as_mut_ptr() as *mut u8, 
+			//		value.len()
+			//	);
+			//}
+			//let val_buf: BufferPMEM = unsafe { uninit_buf.assume_init() };
+
+			//let val_buf: BufferPMEM = { uninit_buf.assume_init() };
+
+			//let key_buf: BufferPMEM = 
+
+			//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(key.len(), Hybrid); 
+			//buf1.extend_from_slice(&key);
+			//let key_buf: BufferPMEM = buf1.into_boxed_slice();
+
+			//let key_buf: BufferPMEM = key.to_vec_in(Hybrid).into_boxed_slice();
+
+			//the key should also be in pmem... this is stale or wrong... mut have changed it back??
+			let object = Object::new(key, val_buf, ttl);
+
+			let base_size = self.overhead_manager.base_size(&object);
+			let expiry = object.expiry();
+
+			if base_size == 0 {
+				return Err(CacheError::ZeroValueSize);
+			}
+
+			if self.status.exceeds_max_size(base_size) {
+				return Err(CacheError::ExceedingValueSize);
+			}
+
+			self.status.incr_sets();
+
+			let old_object_info = self.objects
+				.insert(hashed_key, object)
+				.map(|old_object| {
+					let base_size = self.overhead_manager.base_size(&old_object);
+					let expiry = old_object.expiry();
+
+					(base_size, expiry)
+				});
+
+			let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+				base_size as i64 - old_object_size as i64
+			} else {
+				// the object is new, so increase the number of objects count
+				self.status.incr_num_objects();
+				base_size as i64
+			};
+
+			self.status.update_base_used_size(base_size_delta);
+			self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+	
+			Ok(())
+		}
+
+		//self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+
+		//Ok(())
+	}
+
+
+	*/
 
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> 
@@ -2311,7 +2567,6 @@ where
 
 		//Ok(())
 	}
-
 
 
 	/// Deletes the object associated with the supplied key in the cache.
@@ -3077,8 +3332,7 @@ where
 	}
 
 
-	
-/* 
+	/* 
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let t0 = rdtsc();
 		let hashed_key = self.hash_key(key);
@@ -3128,6 +3382,7 @@ where
 		result
 	}
 	*/
+	
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
