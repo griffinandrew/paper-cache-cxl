@@ -1250,7 +1250,7 @@ where
 	/// 
 	
 
-	
+	/* 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		
 		let hashed_key = self.hash_key(&key);
@@ -1323,8 +1323,9 @@ where
 		Ok(())
 	}
 
+	*/
 
-/* 
+
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		
 		let t0 = rdtsc();
@@ -1419,7 +1420,7 @@ where
 		Ok(())
 	}
 	
-*/
+
 
 	/// Deletes the object associated with the supplied key in the cache.
 	/// Returns a [`CacheError`] if the key was not found in the cache.
@@ -2207,7 +2208,7 @@ where
 	// not V but &[u8]??
 
 
-
+/* 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> 
 	where
     	//V: AsRef<[u8]> + TypeSize,
@@ -2377,9 +2378,10 @@ where
 		//Ok(())
 	}
 
+	*/
 
 
-/*
+
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> 
 	where
     	//V: AsRef<[u8]> + TypeSize,
@@ -2566,7 +2568,7 @@ where
 
 		//Ok(())
 	}
-*/
+
 
 	/// Deletes the object associated with the supplied key in the cache.
 	/// Returns a [`CacheError`] if the key was not found in the cache.
@@ -2974,7 +2976,7 @@ where
 	}
 
 
-/* 
+
 	// none instrumented get
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
@@ -2994,8 +2996,8 @@ where
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 		result
 	}
-*/
 
+/* 
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let t0 = rdtsc();
 		let hashed_key = self.hash_key(key);
@@ -3044,7 +3046,7 @@ where
 
 		result
 	}
-
+*/
 
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
@@ -3305,7 +3307,7 @@ where
 		self.status.try_to_status()
 	}
 
-	/*
+	
 	// none instrumented get
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
@@ -3325,11 +3327,11 @@ where
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 		result
 	}
-	*/
+	
 
 	
 
-
+/* 
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let t0 = rdtsc();
 		let hashed_key = self.hash_key(key);
@@ -3378,6 +3380,7 @@ where
 
 		result
 	}
+	*/
 	
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
