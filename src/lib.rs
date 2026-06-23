@@ -2974,7 +2974,7 @@ where
 	}
 
 
-
+/* 
 	// none instrumented get
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
@@ -2994,11 +2994,8 @@ where
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 		result
 	}
+*/
 
-
-
-
-/* 
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let t0 = rdtsc();
 		let hashed_key = self.hash_key(key);
@@ -3047,7 +3044,7 @@ where
 
 		result
 	}
-*/
+
 
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
@@ -3308,7 +3305,7 @@ where
 		self.status.try_to_status()
 	}
 
-	/* 
+	/*
 	// none instrumented get
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
@@ -3328,8 +3325,9 @@ where
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 		result
 	}
-
 	*/
+
+	
 
 
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
