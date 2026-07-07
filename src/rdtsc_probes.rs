@@ -61,7 +61,11 @@ pub static PHASE_MEMCPY:     PhaseStats = PhaseStats::new("memcpy (write)");
 pub static PHASE_POST:       PhaseStats = PhaseStats::new("create object");
 pub static PHASE_INSERT:     PhaseStats = PhaseStats::new("hashtable insert");
 pub static PHASE_SET_BROADCAST: PhaseStats = PhaseStats::new("set: broadcast");
-
+pub static PHASE_GET_UNLOCK:    PhaseStats = PhaseStats::new("get: rwlock unlock");
+pub static PHASE_GET_COPY_HIT:  PhaseStats = PhaseStats::new("get: copy hit");
+pub static PHASE_GET_COPY_MISS: PhaseStats = PhaseStats::new("get: copy miss");
+pub static PHASE_SET_PREFAULT: PhaseStats = PhaseStats::new("set: prefault");
+pub static PHASE_SET_BOOKKEEP: PhaseStats = PhaseStats::new("set: bookkeeping");
 
 pub static PHASE_GET_HASH:      PhaseStats = PhaseStats::new("get: hash_key");
 pub static PHASE_GET_LOCK:      PhaseStats = PhaseStats::new("get: rwlock read");
@@ -79,6 +83,8 @@ pub fn report_set(tsc_hz: f64) {
     PHASE_POST.report(tsc_hz);
     PHASE_INSERT.report(tsc_hz);
     PHASE_SET_BROADCAST.report(tsc_hz);
+    PHASE_SET_PREFAULT.report(tsc_hz);
+    PHASE_SET_BOOKKEEP.report(tsc_hz);
     println!();
 }
 
@@ -104,6 +110,9 @@ pub fn report_get(tsc_hz: f64) {
     PHASE_GET_VALIDATE.report(tsc_hz);
     PHASE_GET_COPY.report(tsc_hz);
     PHASE_GET_BROADCAST.report(tsc_hz);
+    PHASE_GET_UNLOCK.report(tsc_hz);
+    PHASE_GET_COPY_HIT.report(tsc_hz);
+    PHASE_GET_COPY_MISS.report(tsc_hz);
     PHASE_PROBE.report(tsc_hz);  // subtract this floor from each phase above
     println!();
 }

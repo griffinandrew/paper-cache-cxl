@@ -2978,6 +2978,8 @@ where
 
 
 	// none instrumented get
+
+	/* 
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
@@ -2996,6 +2998,7 @@ where
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 		result
 	}
+	*/
 
 /* 
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
@@ -3047,6 +3050,69 @@ where
 		result
 	}
 */
+
+
+
+
+	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
+		let t0 = rdtsc();
+		let hashed_key = self.hash_key(key);
+		let t1 = rdtsc();
+		PHASE_GET_HASH.record(t1 - t0);
+
+		let guard = self.objects.read().unwrap();
+		let t2 = rdtsc();
+		PHASE_GET_LOCK.record(t2 - t1);
+
+		let lookup = guard.get(&hashed_key);
+		let t3 = rdtsc();
+		PHASE_GET_LOOKUP.record(t3 - t2);
+
+		let (result, hit) = match lookup {
+			Some(object) => {
+				let matched = object.key_matches(key) && !object.is_expired();
+				let t4 = rdtsc();
+				PHASE_GET_VALIDATE.record(t4 - t3);
+				if matched {
+					self.status.incr_hits();
+					let arc_val = object.data();
+					let src = arc_val.as_ref();
+					// real copy phase, hit path only
+					let mut v = Vec::with_capacity(src.len());
+					unsafe {
+						std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr(), src.len());
+						v.set_len(src.len());
+					}
+					let t5 = rdtsc();
+					PHASE_GET_COPY_HIT.record(t5 - t4);
+					(Ok(v), true)
+				} else {
+					self.status.incr_misses();
+					let t5 = rdtsc();
+					PHASE_GET_COPY_MISS.record(t5 - t4); // time the miss tail, not zero
+					(Err(CacheError::KeyNotFound), false)
+				}
+			}
+			None => {
+				self.status.incr_misses();
+				let t4 = rdtsc();
+				PHASE_GET_VALIDATE.record(t4 - t3); // None branch still validates (nothing), time it
+				PHASE_GET_COPY_MISS.record(0);       // no copy exists on None; keep bucket count aligned
+				(Err(CacheError::KeyNotFound), false)
+			}
+		};
+
+		let t5b = rdtsc();
+		drop(guard);
+		let t6 = rdtsc();
+		PHASE_GET_UNLOCK.record(t6 - t5b);
+
+		self.broadcast(WorkerEvent::Get(hashed_key, hit))?;
+		let t7 = rdtsc();
+		PHASE_GET_BROADCAST.record(t7 - t6);
+
+		result
+	}
 
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
@@ -3309,6 +3375,7 @@ where
 
 	
 	// none instrumented get
+	/* 
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
@@ -3327,7 +3394,7 @@ where
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 		result
 	}
-	
+	*/
 
 	
 
@@ -3381,6 +3448,67 @@ where
 		result
 	}
 	*/
+
+
+		pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
+		let t0 = rdtsc();
+		let hashed_key = self.hash_key(key);
+		let t1 = rdtsc();
+		PHASE_GET_HASH.record(t1 - t0);
+
+		let guard = self.objects.read().unwrap();
+		let t2 = rdtsc();
+		PHASE_GET_LOCK.record(t2 - t1);
+
+		let lookup = guard.get(&hashed_key);
+		let t3 = rdtsc();
+		PHASE_GET_LOOKUP.record(t3 - t2);
+
+		let (result, hit) = match lookup {
+			Some(object) => {
+				let matched = object.key_matches(key) && !object.is_expired();
+				let t4 = rdtsc();
+				PHASE_GET_VALIDATE.record(t4 - t3);
+				if matched {
+					self.status.incr_hits();
+					let arc_val = object.data();
+					let src = arc_val.as_ref();
+					// real copy phase, hit path only
+					let mut v = Vec::with_capacity(src.len());
+					unsafe {
+						std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr(), src.len());
+						v.set_len(src.len());
+					}
+					let t5 = rdtsc();
+					PHASE_GET_COPY_HIT.record(t5 - t4);
+					(Ok(v), true)
+				} else {
+					self.status.incr_misses();
+					let t5 = rdtsc();
+					PHASE_GET_COPY_MISS.record(t5 - t4); // time the miss tail, not zero
+					(Err(CacheError::KeyNotFound), false)
+				}
+			}
+			None => {
+				self.status.incr_misses();
+				let t4 = rdtsc();
+				PHASE_GET_VALIDATE.record(t4 - t3); // None branch still validates (nothing), time it
+				PHASE_GET_COPY_MISS.record(0);       // no copy exists on None; keep bucket count aligned
+				(Err(CacheError::KeyNotFound), false)
+			}
+		};
+
+		let t5b = rdtsc();
+		drop(guard);
+		let t6 = rdtsc();
+		PHASE_GET_UNLOCK.record(t6 - t5b);
+
+		self.broadcast(WorkerEvent::Get(hashed_key, hit))?;
+		let t7 = rdtsc();
+		PHASE_GET_BROADCAST.record(t7 - t6);
+
+		result
+	}
 	
 
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
