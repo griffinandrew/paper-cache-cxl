@@ -1325,7 +1325,7 @@ where
 
 	*/
 
-
+/*
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		
 		let t0 = rdtsc();
@@ -1420,7 +1420,97 @@ where
 		Ok(())
 	}
 	
+*/
 
+
+	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
+		let t0 = rdtsc();
+		let hashed_key = self.hash_key(&key);
+		let t1 = rdtsc();
+		PHASE_SET_HASH.record(t1 - t0);
+
+		// real allocation: uninit slice, no first-touch yet
+		let t2 = rdtsc();
+		let mut boxed = Box::<[u8]>::new_uninit_slice(value.len());
+		let t3 = rdtsc();
+		PHASE_SET_ALLOC.record(t3 - t2);
+
+		// explicit prefault so page-zeroing lands here, not smeared into copy
+		let t4 = rdtsc();
+		unsafe {
+			let p = boxed.as_mut_ptr() as *mut u8;
+			let mut off = 0;
+			while off < value.len() {
+				std::ptr::write_volatile(p.add(off), 0);
+				off += 4096;
+			}
+		}
+		let t5 = rdtsc();
+		PHASE_SET_PREFAULT.record(t5 - t4);
+
+		// real copy into faulted pages
+		let t6 = rdtsc();
+		unsafe {
+			std::ptr::copy_nonoverlapping(
+				value.as_ptr(),
+				boxed.as_mut_ptr() as *mut u8,
+				value.len(),
+			);
+		}
+		let val_buf: BufferDRAM = unsafe { boxed.assume_init() };
+		let t7 = rdtsc();
+		PHASE_SET_COPY.record(t7 - t6);
+
+		let t8 = rdtsc();
+		let object = Object::new(key, val_buf, ttl);
+		let t9 = rdtsc();
+		PHASE_SET_CREATE.record(t9 - t8);
+
+		// untimed-before: now bracketed
+		let t10 = rdtsc();
+		let base_size = self.overhead_manager.base_size(&object);
+		let expiry = object.expiry();
+		if base_size == 0 {
+			PHASE_SET_ADMIT.record(rdtsc() - t10);
+			return Err(CacheError::ZeroValueSize);
+		}
+		if self.status.exceeds_max_size(base_size) {
+			PHASE_SET_ADMIT.record(rdtsc() - t10);
+			return Err(CacheError::ExceedingValueSize);
+		}
+		self.status.incr_sets();
+		let t11 = rdtsc();
+		PHASE_SET_ADMIT.record(t11 - t10);
+
+		// insert: DashMap shard lock + bucket probe + possible per-shard resize
+		let t12 = rdtsc();
+		let old_object_info = self.objects
+			.insert(hashed_key, object)
+			.map(|old_object| {
+				let old_size = self.overhead_manager.base_size(&old_object);
+				let old_expiry = old_object.expiry();
+				(old_size, old_expiry)
+			});
+		let t13 = rdtsc();
+		PHASE_SET_INSERT.record(t13 - t12);
+
+		// untimed-after: status bookkeeping, now bracketed
+		let base_size_delta = if let Some((old_size, _)) = old_object_info {
+			base_size as i64 - old_size as i64
+		} else {
+			self.status.incr_num_objects();
+			base_size as i64
+		};
+		self.status.update_base_used_size(base_size_delta);
+		let t14 = rdtsc();
+		PHASE_SET_BOOKKEEP.record(t14 - t13);
+
+		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+		let t15 = rdtsc();
+		PHASE_SET_BROADCAST.record(t15 - t14);
+
+		Ok(())
+	}
 
 	/// Deletes the object associated with the supplied key in the cache.
 	/// Returns a [`CacheError`] if the key was not found in the cache.
