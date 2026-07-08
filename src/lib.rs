@@ -2455,7 +2455,7 @@ where
 	*/
 
 
-
+/*
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> 
 	where
     	//V: AsRef<[u8]> + TypeSize,
@@ -2642,6 +2642,8 @@ where
 
 		//Ok(())
 	}
+
+	*/
 
 
 	/// Deletes the object associated with the supplied key in the cache.
