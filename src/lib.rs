@@ -2646,6 +2646,92 @@ where
 	*/
 
 
+	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError>
+	where
+		K: 'static + Eq + Hash + TypeSize + std::fmt::Debug,
+	{
+		let t0 = rdtsc();
+		let hashed_key = self.hash_key(&key);
+		let t1 = rdtsc();
+		PHASE_SET_HASH.record(t1 - t0);
+
+		#[cfg(feature = "sets_dram")]
+		{
+			self.tiering_manager.set_dram(hashed_key, key.clone(), value, ttl);
+			return Ok(());
+		}
+
+		#[cfg(not(feature = "sets_dram"))]
+		{
+			// real allocation: uninit PMEM slice, no first-touch yet
+			let t2 = rdtsc();
+			let mut boxed = Box::<[u8]>::new_uninit_slice_in(value.len(), Hybrid);
+			let t3 = rdtsc();
+			PHASE_SET_ALLOC.record(t3 - t2);
+
+			// copy into PMEM (includes first-touch faults)
+			let t6 = rdtsc();
+			unsafe {
+				std::ptr::copy_nonoverlapping(
+					value.as_ptr(),
+					boxed.as_mut_ptr() as *mut u8,
+					value.len(),
+				);
+			}
+			let val_buf: BufferPMEM = unsafe { boxed.assume_init() };
+			let t7 = rdtsc();
+			PHASE_SET_COPY.record(t7 - t6);
+
+			let t8 = rdtsc();
+			let object = Object::new(key, val_buf, ttl);
+			let t9 = rdtsc();
+			PHASE_SET_CREATE.record(t9 - t8);
+
+			let t10 = rdtsc();
+			let base_size = self.overhead_manager.base_size(&object);
+			let expiry = object.expiry();
+			if base_size == 0 {
+				PHASE_SET_ADMIT.record(rdtsc() - t10);
+				return Err(CacheError::ZeroValueSize);
+			}
+			if self.status.exceeds_max_size(base_size) {
+				PHASE_SET_ADMIT.record(rdtsc() - t10);
+				return Err(CacheError::ExceedingValueSize);
+			}
+			self.status.incr_sets();
+			let t11 = rdtsc();
+			PHASE_SET_ADMIT.record(t11 - t10);
+
+			let t12 = rdtsc();
+			let old_object_info = self.objects
+				.insert(hashed_key, object)
+				.map(|old_object| {
+					let old_size = self.overhead_manager.base_size(&old_object);
+					let old_expiry = old_object.expiry();
+					(old_size, old_expiry)
+				});
+			let t13 = rdtsc();
+			PHASE_SET_INSERT.record(t13 - t12);
+
+			let base_size_delta = if let Some((old_size, _)) = old_object_info {
+				base_size as i64 - old_size as i64
+			} else {
+				self.status.incr_num_objects();
+				base_size as i64
+			};
+			self.status.update_base_used_size(base_size_delta);
+			let t14 = rdtsc();
+			PHASE_SET_BOOKKEEP.record(t14 - t13);
+
+			self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+			let t15 = rdtsc();
+			PHASE_SET_BROADCAST.record(t15 - t14);
+
+			Ok(())
+		}
+	}
+
+
 	/// Deletes the object associated with the supplied key in the cache.
 	/// Returns a [`CacheError`] if the key was not found in the cache.
 	///
