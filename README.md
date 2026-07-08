@@ -1,4 +1,5 @@
 # paper-cache
+claude edit
 
 PaperCache is an in-memory cache which supports the dynamic switching between any eviction policy at runtime.
 
