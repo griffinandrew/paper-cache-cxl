@@ -2665,7 +2665,7 @@ where
 		{
 			// real allocation: uninit PMEM slice, no first-touch yet
 			let t2 = rdtsc();
-			let mut boxed = Box::<[u8]>::new_uninit_slice_in(value.len(), Hybrid);
+			let mut boxed = Box::<[u8], Hybrid>::new_uninit_slice_in(value.len(), Hybrid);
 			let t3 = rdtsc();
 			PHASE_SET_ALLOC.record(t3 - t2);
 
