@@ -305,7 +305,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 pub mod rdtsc_probes;
 
 use crate::rdtsc_probes::{
-    rdtsc, PHASE_PRE_ALLOC, PHASE_ALLOC, PHASE_MEMCPY, PHASE_POST, PHASE_INSERT, PHASE_GET_HASH, PHASE_GET_LOCK, PHASE_GET_LOOKUP, PHASE_GET_VALIDATE, PHASE_GET_COPY, PHASE_GET_BROADCAST, PHASE_PROBE, PHASE_SET_BROADCAST,PHASE_GET_COPY_HIT, PHASE_GET_COPY_MISS, PHASE_SET_PREFAULT, PHASE_SET_BOOKKEEP, PHASE_GET_UNLOCK
+    rdtsc, PHASE_PRE_ALLOC, PHASE_POST, PHASE_INSERT, PHASE_GET_HASH, PHASE_GET_LOCK, PHASE_GET_LOOKUP, PHASE_GET_VALIDATE, PHASE_GET_COPY, PHASE_GET_BROADCAST, PHASE_PROBE, PHASE_SET_BROADCAST,PHASE_GET_COPY_HIT, PHASE_GET_COPY_MISS, PHASE_SET_PREFAULT, PHASE_SET_BOOKKEEP, PHASE_GET_UNLOCK, PHASE_SET_HASH, PHASE_SET_CREATE, PHASE_SET_INSERT, PHASE_SET_ADMIT
 };
 
 pub use rdtsc_probes::{calibrate_tsc_hz, report_set, report_get, calibrate_probe_overhead};
@@ -1429,26 +1429,12 @@ where
 		let t1 = rdtsc();
 		PHASE_SET_HASH.record(t1 - t0);
 
-		// real allocation: uninit slice, no first-touch yet
 		let t2 = rdtsc();
 		let mut boxed = Box::<[u8]>::new_uninit_slice(value.len());
 		let t3 = rdtsc();
 		PHASE_SET_ALLOC.record(t3 - t2);
 
-		// explicit prefault so page-zeroing lands here, not smeared into copy
-		let t4 = rdtsc();
-		unsafe {
-			let p = boxed.as_mut_ptr() as *mut u8;
-			let mut off = 0;
-			while off < value.len() {
-				std::ptr::write_volatile(p.add(off), 0);
-				off += 4096;
-			}
-		}
-		let t5 = rdtsc();
-		PHASE_SET_PREFAULT.record(t5 - t4);
-
-		// real copy into faulted pages
+		// copy (includes first-touch faults on the freshly allocated pages)
 		let t6 = rdtsc();
 		unsafe {
 			std::ptr::copy_nonoverlapping(
@@ -1466,7 +1452,6 @@ where
 		let t9 = rdtsc();
 		PHASE_SET_CREATE.record(t9 - t8);
 
-		// untimed-before: now bracketed
 		let t10 = rdtsc();
 		let base_size = self.overhead_manager.base_size(&object);
 		let expiry = object.expiry();
@@ -1482,7 +1467,6 @@ where
 		let t11 = rdtsc();
 		PHASE_SET_ADMIT.record(t11 - t10);
 
-		// insert: DashMap shard lock + bucket probe + possible per-shard resize
 		let t12 = rdtsc();
 		let old_object_info = self.objects
 			.insert(hashed_key, object)
@@ -1494,7 +1478,6 @@ where
 		let t13 = rdtsc();
 		PHASE_SET_INSERT.record(t13 - t12);
 
-		// untimed-after: status bookkeeping, now bracketed
 		let base_size_delta = if let Some((old_size, _)) = old_object_info {
 			base_size as i64 - old_size as i64
 		} else {
@@ -1511,6 +1494,7 @@ where
 
 		Ok(())
 	}
+
 
 	/// Deletes the object associated with the supplied key in the cache.
 	/// Returns a [`CacheError`] if the key was not found in the cache.

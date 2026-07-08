@@ -56,8 +56,8 @@ impl PhaseStats {
 // One global instance per phase you want to time. Add or remove these to
 // match the phases you instrument in the SET path.
 pub static PHASE_PRE_ALLOC:  PhaseStats = PhaseStats::new("hash key(index)");
-pub static PHASE_ALLOC:      PhaseStats = PhaseStats::new("alloc vector (umf)");
-pub static PHASE_MEMCPY:     PhaseStats = PhaseStats::new("memcpy (write)");
+pub static PHASE_SET_ALLOC:      PhaseStats = PhaseStats::new("alloc vector (umf)");
+pub static PHASE_SET_COPY:     PhaseStats = PhaseStats::new("memcpy (write)");
 pub static PHASE_POST:       PhaseStats = PhaseStats::new("create object");
 pub static PHASE_INSERT:     PhaseStats = PhaseStats::new("hashtable insert");
 pub static PHASE_SET_BROADCAST: PhaseStats = PhaseStats::new("set: broadcast");
@@ -66,6 +66,11 @@ pub static PHASE_GET_COPY_HIT:  PhaseStats = PhaseStats::new("get: copy hit");
 pub static PHASE_GET_COPY_MISS: PhaseStats = PhaseStats::new("get: copy miss");
 pub static PHASE_SET_PREFAULT: PhaseStats = PhaseStats::new("set: prefault");
 pub static PHASE_SET_BOOKKEEP: PhaseStats = PhaseStats::new("set: bookkeeping");
+
+pub static PHASE_SET_HASH:      PhaseStats = PhaseStats::new("set: hash_key");
+pub static PHASE_SET_CREATE:    PhaseStats = PhaseStats::new("set: create object");
+pub static PHASE_SET_INSERT:    PhaseStats = PhaseStats::new("set: hashtable insert");
+pub static PHASE_SET_ADMIT:     PhaseStats = PhaseStats::new("set: admit to cache");
 
 pub static PHASE_GET_HASH:      PhaseStats = PhaseStats::new("get: hash_key");
 pub static PHASE_GET_LOCK:      PhaseStats = PhaseStats::new("get: rwlock read");
@@ -77,14 +82,15 @@ pub static PHASE_PROBE:         PhaseStats = PhaseStats::new("rdtsc probe pair")
 
 pub fn report_set(tsc_hz: f64) {
     println!("\n=== SET path phase breakdown ===");
-    PHASE_PRE_ALLOC.report(tsc_hz);
-    PHASE_ALLOC.report(tsc_hz);
-    PHASE_MEMCPY.report(tsc_hz);
-    PHASE_POST.report(tsc_hz);
-    PHASE_INSERT.report(tsc_hz);
+    PHASE_SET_HASH.report(tsc_hz);
+    PHASE_SET_ALLOC.report(tsc_hz);
+    PHASE_SET_COPY.report(tsc_hz);
+    PHASE_SET_CREATE.report(tsc_hz);
+    PHASE_SET_INSERT.report(tsc_hz);
     PHASE_SET_BROADCAST.report(tsc_hz);
     PHASE_SET_PREFAULT.report(tsc_hz);
     PHASE_SET_BOOKKEEP.report(tsc_hz);
+    PHASE_SET_ADMIT.report(tsc_hz);
     println!();
 }
 
