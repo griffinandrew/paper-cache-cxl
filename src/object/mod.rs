@@ -108,6 +108,16 @@ impl<K, V> Object<K, V> {
 		self.data.clone()
 	}
 
+	/// Replaces this object's data in place, leaving `key` and `expiry`
+	/// untouched.
+	///
+	/// Used by `lru_hybrid_cache` to physically migrate an object's bytes
+	/// between tiers (e.g. `TieredBuffer::Fast` <-> `TieredBuffer::Slow`)
+	/// without disturbing its TTL or key.
+	pub fn set_data(&mut self, data: V) {
+		self.data = Arc::new(data);
+	}
+
 	/// Return a reference to the key.
 	///
 	/// Without `key_pmem_value_pmem` the key lives in DRAM.

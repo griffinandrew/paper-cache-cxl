@@ -41,4 +41,7 @@ pub enum CacheError {
 
 	#[error("allocation failed")]
 	AllocationFailed,
+
+	#[error("the fast tier size must be greater than zero and cannot exceed the cache size")]
+	InvalidFastTierSize,
 }

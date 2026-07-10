@@ -31,6 +31,9 @@ use crate::{
 	worker::TieringWorker,
 };
 
+#[cfg(feature = "lru_hybrid_cache")]
+use crate::worker::policy::Tier;
+
 pub struct WorkerManager {
 	listener: WorkerReceiver,
 	workers: Arc<Box<[WorkerSender]>>,
@@ -222,6 +225,56 @@ impl WorkerManager {
 			overhead_manager.clone(),
 			promotion_tx,
 			eviction_callback,
+		)?);
+
+		register_worker(TtlWorker::<K, V>::new(
+			ttl_listener,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+		));
+
+		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
+			policy_worker,
+			ttl_worker,
+		]));
+
+		let manager = WorkerManager {
+			listener,
+			workers,
+		};
+
+		Ok(manager)
+	}
+
+	/// Creates a `WorkerManager` whose policy worker physically migrates
+	/// object bytes between tiers whenever `PaperPolicy::LruHybrid` reports a
+	/// promotion or demotion. `migrate` reallocates a value into the target
+	/// tier's representation (e.g. `TieredBuffer::new_fast`/`new_slow`).
+	/// Promotion/demotion/eviction counters and gauges are recorded directly
+	/// on the shared `status` (backing `PaperCache::lru_hybrid_stats`), so no
+	/// separate stats parameter is needed here.
+	#[cfg(feature = "lru_hybrid_cache")]
+	pub fn new_with_tier_migration<K, V>(
+		listener: WorkerReceiver,
+		objects: &ObjectMapRef<K, V>,
+		status: &StatusRef,
+		overhead_manager: &OverheadManagerRef,
+		migrate: Box<dyn Fn(&V, Tier) -> V + Send + Sync>,
+	) -> Result<Self, CacheError>
+	where
+		K: 'static + Eq + TypeSize,
+		V: 'static + TypeSize,
+	{
+		let (policy_worker, policy_listener) = unbounded();
+		let (ttl_worker, ttl_listener) = unbounded();
+
+		register_worker(PolicyWorker::<K, V>::new_with_tier_migration(
+			policy_listener,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+			migrate,
 		)?);
 
 		register_worker(TtlWorker::<K, V>::new(

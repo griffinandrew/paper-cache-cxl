@@ -109,6 +109,53 @@ The implementation provides explicit feature flags to control:
 - **Performance**: Same hashbrown HashMap implementation as `global_hashtable_pmem` but allocated in DRAM instead of PMEM
 - **Requirements**: Mutually exclusive with `global_hashtable_pmem`, `global_flatmap_dram`, and `global_flatmap_pmem`
 
+### `hybridcache`
+- **Purpose**: Two-tier cache built by composing *two independent* `PaperCache` instances — a small DRAM
+  tier running S3-FIFO and a far PMEM tier running LRU — rather than one unified instance
+- **When enabled**: Adds `S3FifoHybridCache<K>`, `HybridCacheConfig`, `HybridCacheStats`, `CacheTierSize`
+- **When disabled**: None of the above are compiled
+- **Behavior**: Admission always goes to the small DRAM tier. Demotion (small-tier eviction) writes bytes
+  to the far PMEM tier asynchronously over a bounded channel. Promotion is driven by the small tier's
+  S3-FIFO *ghost queue*: a ghost hit schedules a background re-insertion into the small tier. Uses
+  **copy-on-read** — the far-tier (PMEM) copy is never deleted on promotion, so a key can legitimately
+  exist in both tiers at once. Contrast with `lru_hybrid_cache` below, which is one unified `PaperCache`
+  instance and does real (non-copying) data movement instead
+- **Requirements**: `["all_dram", "key_pmem_value_pmem"]` — needs both a DRAM-typed tier and a
+  PMEM-typed tier simultaneously, since it's two separate `PaperCache<K, V>` instances with two
+  different `V` types (`BufferDRAM` and `BufferPMEM`)
+
+### `lru_hybrid_cache`
+- **Purpose**: Single-instance, segmented-LRU hybrid cache — implements the paper design where the LRU
+  eviction queue is segmented across a fast (DRAM) tier and a slow (PMEM) tier as two zones of *one*
+  logical queue, rather than composing two independent `PaperCache` instances (contrast with
+  `hybridcache` above)
+- **When enabled**: Adds `PaperPolicy::LruHybrid` and a new `PaperCache<K, TieredBuffer, S>` impl block
+  (`new(max_size, fast_tier_size)`, `get`/`set`/`del`/`has`/`peek`/`ttl`/`size`/`wipe`/`resize`, plus
+  `set_fast_tier_size`/`fast_tier_size`, `lru_hybrid_stats`, and a `tier_of` diagnostic accessor). Also
+  exports `TieredBuffer`, `LruHybridStats`, and `Tier` from the crate root, and shares the
+  `CacheTierSize` unit type with `hybridcache` (moved to `src/size.rs`, gated
+  `any(hybridcache, lru_hybrid_cache)`)
+- **When disabled**: None of the above types/methods are compiled; `PaperPolicy::LruHybrid` doesn't exist
+- **Behavior**: Every `set()` admits (or re-admits) the object at the top of the fast tier. Whenever
+  fast-tier usage exceeds the configured fast-tier byte budget, the least-recently-used fast-tier object
+  is demoted to the slow tier. Accessing (`get()`) a slow-tier object promotes it back to the top of the
+  fast tier — possibly cascading a further demotion if the fast tier is now over budget. Once the
+  cache's overall `max_size` is exceeded, the least-recently-used *slow-tier* object is evicted (counted
+  in `lru_hybrid_stats().evictions`). Every promotion/demotion is **actual data movement**
+  (`Object::set_data` swaps a `TieredBuffer::Fast(Box<[u8]>)` for a `TieredBuffer::Slow(Box<[u8], Hybrid>)`,
+  or vice versa) — a live object's bytes exist in exactly one tier's allocation at a time, never copied
+  into both. TTL survives every tier move unmodified, since a migration only ever replaces
+  `Object::data`, never `key` or `expiry`
+- **Requirements**: `["key_value_pmem"]` only — *not* `all_dram` + `key_pmem_value_pmem` like
+  `hybridcache`. A plain `Box<[u8]>` (the fast-tier representation) already allocates through the
+  crate's global DRAM allocator (`DRAMObjects`) regardless of feature flags, and this feature only needs
+  to migrate *value* bytes between tiers, so the smaller `key_value_pmem` dependency (which makes
+  `BufferPMEM`/`Hybrid` available without forcing the *key* into PMEM) is sufficient and keeps keys
+  DRAM-resident
+- **Use case**: A single unified cache whose "two tiers" are a property of where each object's bytes
+  currently live (not two separate caches/hashtables); useful for comparing against `hybridcache`'s
+  two-`PaperCache`-instance, copy-on-read design for the same fast-DRAM/slow-PMEM workload shape
+
 ## Implementation Details
 
 ### Type System
@@ -248,6 +295,13 @@ The code uses `#[cfg(...)]` attributes extensively to:
 - **Hardware perf counters**: `src/hw_perf_counters.rs`
 - **PMEM eviction collections**: `src/worker/policy/policy_stack/pmem_collections.rs`
 - **LFU policy stack**: `src/worker/policy/policy_stack/lfu_stack.rs`
+- **hybridcache (two-instance hybrid cache)**: `src/hybridcache/mod.rs`
+- **lru_hybrid_cache (single-instance hybrid cache)**: `src/lru_hybrid_cache/` (`buffer.rs` for
+  `TieredBuffer`, `stats.rs` for `LruHybridStats`), `src/worker/policy/policy_stack/lru_hybrid_stack.rs`
+  (`LruHybridStack`), `src/policy.rs` (`PaperPolicy::LruHybrid`), `src/status.rs` (counters/gauges +
+  fast-tier capacity), `PaperCache<K, TieredBuffer, S>` impl block in `src/lib.rs`. Shared tier-size
+  unit type: `src/size.rs` (`CacheTierSize`). See `CLAUDE.md` and `LRU_HYBRID_CACHE.md` for the full
+  design writeup.
 
 ## Testing
 
@@ -301,6 +355,21 @@ cargo +nightly check --features "hw_perf,eviction_stacks_pmem,key_value_pmem"
 
 # Verify full feature combination
 cargo +nightly check --features "enable_tiering_manager,eviction_stacks_pmem,key_value_pmem"
+
+# Check hybridcache (two-instance hybrid cache)
+cargo +nightly check --features hybridcache
+
+# Run hybridcache's PMEM integration tests (requires real PMEM/UMF hardware)
+cargo +nightly test --test hybridcache_integration --features hybridcache
+
+# Check lru_hybrid_cache (single-instance hybrid cache)
+cargo +nightly check --features lru_hybrid_cache
+
+# Run lru_hybrid_cache's unit + inline tests
+cargo +nightly test --lib --features lru_hybrid_cache
+
+# Run lru_hybrid_cache's PMEM integration tests (requires real PMEM/UMF hardware)
+cargo +nightly test --test lru_hybrid_cache_integration --features lru_hybrid_cache
 ```
 
 **Note**: The tiering worker module is only compiled when BOTH an allocator feature 
@@ -319,3 +388,7 @@ used at all when disabled, allowing the cache to operate as a single global cach
 ✅ `alloc_api_exp` removed; Hybrid allocator still functional for `key_value_pmem`
 ✅ `hw_perf` counters compile out to zero cost when feature is disabled
 ✅ `eviction_stacks_pmem` correctly allocates LFU/LRU stacks via `Hybrid` (UMF or `RegionHybrid` when `pmem_region_alloc` / `region_hybrid_allocator` are enabled)
+✅ `hybridcache` composes two `PaperCache` instances (DRAM small tier, PMEM far tier) with real PMEM writes/reads via `Hybrid`
+✅ `lru_hybrid_cache` implements a single unified `PaperCache<K, TieredBuffer>` with a segmented-LRU
+  fast/slow boundary; promotion/demotion verified as real data movement (never present in both tiers)
+  end to end on real PMEM hardware (`tests/lru_hybrid_cache_integration.rs`, 14/14 passing)

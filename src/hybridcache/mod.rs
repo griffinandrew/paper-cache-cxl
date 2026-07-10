@@ -118,47 +118,15 @@ use typesize::TypeSize;
 
 use crate::{PaperCache, PaperPolicy, CacheError, BufferDRAM, BufferPMEM, HashedKey};
 
+// `CacheTierSize` lives in `crate::size` so that `lru_hybrid_cache` can use the
+// same bytes/Mb/Gb unit type without depending on the `hybridcache` feature.
+// Re-exported here for source compatibility with existing
+// `paper_cache::hybridcache::CacheTierSize` imports.
+pub use crate::size::CacheTierSize;
+
 // Limit how long `get` waits for an in-flight demotion before surfacing a miss.
 const IN_FLIGHT_RETRIES: usize = 3;
 const IN_FLIGHT_BACKOFF: Duration = Duration::from_micros(50);
-
-// ── Tier Size ─────────────────────────────────────────────────────────────────
-
-/// A size specification for a cache tier, in bytes, megabytes, or gigabytes.
-///
-/// Used in [`HybridCacheConfig`] to set the capacity of each tier independently.
-///
-/// # Examples
-///
-/// ```ignore
-/// use paper_cache::hybridcache::{HybridCacheConfig, CacheTierSize};
-///
-/// let config = HybridCacheConfig {
-///     small_size: CacheTierSize::Mb(1),
-///     main_size: CacheTierSize::Gb(2),
-///     ..Default::default()
-/// };
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheTierSize {
-    /// Exact capacity in bytes.
-    Bytes(u64),
-    /// Capacity in decimal megabytes (1 MB = 1,000,000 bytes, SI standard).
-    Mb(u64),
-    /// Capacity in decimal gigabytes (1 GB = 1,000,000,000 bytes, SI standard).
-    Gb(u64),
-}
-
-impl CacheTierSize {
-    /// Returns the size converted to bytes.
-    pub fn to_bytes(self) -> u64 {
-        match self {
-            CacheTierSize::Bytes(b) => b,
-            CacheTierSize::Mb(mb) => mb * 1_000_000,
-            CacheTierSize::Gb(gb) => gb * 1_000_000_000,
-        }
-    }
-}
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 

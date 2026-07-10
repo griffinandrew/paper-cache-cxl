@@ -38,6 +38,10 @@ pub enum WorkerEvent {
 	Wipe,
 
 	Resize(CacheSize),
+	/// Runtime-adjusts the fast-tier byte budget for `lru_hybrid_cache`
+	/// (`PaperPolicy::LruHybrid`). No-op for every other policy stack; see
+	/// `PolicyStack::resize_fast_tier`.
+	ResizeFastTier(CacheSize),
 	Policy(PaperPolicy),
 }
 
@@ -60,3 +64,10 @@ pub use crate::worker::{
 
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 pub use crate::worker::tiering::TieringWorker;
+
+// Flattens `worker::policy::Tier` (itself a `pub(crate)` re-export of the
+// private `policy_stack` submodule's `Tier`, see `worker/policy/mod.rs`) so
+// `lib.rs` can re-export it further as a fully public
+// `PaperCache::tier_of`/`lru_hybrid_cache` return type.
+#[cfg(feature = "lru_hybrid_cache")]
+pub use crate::worker::policy::Tier;

@@ -14,6 +14,7 @@ mod mru_stack;
 mod two_q_stack;
 mod arc_stack;
 mod s_three_fifo_stack;
+mod lru_hybrid_stack;
 
 #[cfg(feature = "eviction_stacks_pmem")] mod pmem_collections;
 
@@ -32,6 +33,7 @@ use crate::{
 		two_q_stack::TwoQStack,
 		arc_stack::ArcStack,
 		s_three_fifo_stack::SThreeFifoStack,
+		lru_hybrid_stack::LruHybridStack,
 	},
 };
 
@@ -40,6 +42,16 @@ use crate::{
 pub enum AccessOutcome {
 	None,
 	GhostHit,
+}
+
+/// Which tier an object currently lives in, for policy stacks that track a
+/// segmented (fast/slow) LRU queue. Currently only `LruHybridStack`
+/// (`PaperPolicy::LruHybrid`) uses this; every other stack's default
+/// `drain_tier_migrations` never produces one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tier {
+	Fast,
+	Slow,
 }
 
 pub trait PolicyStack
@@ -65,6 +77,44 @@ where
 	fn clear(&mut self);
 
 	fn evict_one(&mut self) -> Option<HashedKey>;
+
+	/// Runtime-adjusts the fast-tier byte budget. No-op for every stack
+	/// except `LruHybridStack`, which shrinking may trigger immediate
+	/// demotions for (see `drain_tier_migrations`).
+	fn resize_fast_tier(&mut self, _size: CacheSize) {}
+
+	/// Drains and returns every (key, new tier) pair that crossed the
+	/// fast/slow boundary since the last call. Only `LruHybridStack`
+	/// ever produces entries; every other stack keeps the default empty
+	/// `Vec`. The caller (`PolicyWorker`) is responsible for physically
+	/// migrating each returned key's object bytes to `new_tier`.
+	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
+		Vec::new()
+	}
+
+	/// Current bytes accounted to the fast tier. `0` for every stack except
+	/// `LruHybridStack`.
+	fn fast_bytes_used(&self) -> CacheSize {
+		0
+	}
+
+	/// Current bytes accounted to the slow tier. `0` for every stack except
+	/// `LruHybridStack`.
+	fn slow_bytes_used(&self) -> CacheSize {
+		0
+	}
+
+	/// Current number of objects in the fast tier. `0` for every stack
+	/// except `LruHybridStack`.
+	fn fast_object_count(&self) -> usize {
+		0
+	}
+
+	/// Current number of objects in the slow tier. `0` for every stack
+	/// except `LruHybridStack`.
+	fn slow_object_count(&self) -> usize {
+		0
+	}
 }
 
 pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn PolicyStack> {
@@ -79,5 +129,11 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		PaperPolicy::TwoQ(k_in, k_out) => Box::new(TwoQStack::new(k_in, k_out, max_size)),
 		PaperPolicy::Arc => Box::new(ArcStack::new(max_size)),
 		PaperPolicy::SThreeFifo(ratio) => Box::new(SThreeFifoStack::new(ratio, max_size)),
+
+		// Default fast-tier budget is 20% of the overall cache size, matching
+		// the tiering manager's default `dram_threshold` ratio (see
+		// `TieringManager::new` in lib.rs). Runtime-adjustable afterward via
+		// `resize_fast_tier` / `PaperCache::set_fast_tier_size` (step 10).
+		PaperPolicy::LruHybrid => Box::new(LruHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 	}
 }

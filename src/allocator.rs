@@ -41,6 +41,15 @@ mod allocator_bindings {
 #[derive(Clone, Copy)]
 pub struct HybridObjects;
 
+// NOTE: `HybridObjects` (PMEM, NUMA node 1) and `DRAMObjects` (the crate's
+// `#[global_allocator]`, NUMA node 0) used to share this single `Once`. Since
+// `DRAMObjects::alloc` fires on the very first heap allocation of the whole
+// process, it always won the race to run its closure, so `HybridObjects`'s
+// `init_and_prewarm` never ran and `pools[1]` (the PMEM pool) was never
+// created — every `umf_alloc(1, ...)` call returned NULL forever, aborting
+// with "memory allocation of N bytes failed". Gave each allocator its own
+// `Once`, matching the pattern already used correctly by `RegionHybrid`
+// (`REGION_INIT`) and `DevDaxBump` (`DEVDAX_INIT`) below.
 static INIT: Once = Once::new();
 static PRINT_THRESHOLD: usize = 10000;
 static mut NUM_ALLOCS: usize = 0;
@@ -91,9 +100,9 @@ unsafe impl GlobalAlloc for HybridObjects {
         //    println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
 
-        //INIT.call_once( || { 
-        //    HybridObjects::init_and_prewarm(1, 50 * 1024 * 1024 * 1024 )}
-        //);
+        INIT.call_once( || { 
+            HybridObjects::init_and_prewarm(1, 32 * 1024 * 1024 * 1024 )}
+        );
 
 
         let ptr = allocator_bindings::umf_alloc(Self::NODE,layout.size(), layout.align()) as *mut u8;
@@ -186,11 +195,15 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
 
 
 
-//------------ umf for numa 0 
+//------------ umf for numa 0
 
 
 #[derive(Clone, Copy)]
 pub struct DRAMObjects;
+
+// Own dedicated `Once` — see the note on `HybridObjects`'s `INIT` above for
+// why this must not be shared with it.
+static DRAM_INIT: Once = Once::new();
 
 //static mut NUM_CALLS_DRAM: usize = 0;
 
@@ -236,7 +249,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
         //    println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
 
-        INIT.call_once( || { 
+        DRAM_INIT.call_once( || {
             DRAMObjects::init_and_prewarm(Self::NODE_DRAM, 30 * 1024 * 1024 * 1024);
 
             //println!("DRAMObjects: Initialising and prewarming UMF pool on NUMA node {} with {} bytes",

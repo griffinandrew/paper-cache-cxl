@@ -94,6 +94,11 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size, 1 byte for the frequency count
 		PaperPolicy::SThreeFifo(_) => 48 + 8 + 4 + 1,
+
+		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
+		// 24 bytes for the per-key tier-tracking HashMap entry, 1 byte for
+		// the Tier tag
+		PaperPolicy::LruHybrid => 48 + 8 + 24 + 1,
 	}
 }
 
