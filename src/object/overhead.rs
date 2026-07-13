@@ -99,6 +99,14 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// 24 bytes for the per-key tier-tracking HashMap entry, 1 byte for
 		// the Tier tag
 		PaperPolicy::LruHybrid => 48 + 8 + 24 + 1,
+
+		// Base LFU overhead (24 HashMap entry + 48 bucket-list entry + 8
+		// HashedKey + 4 count = 84) plus what LfuHybridStack needs beyond
+		// plain LfuStack: a 24-byte per-key tier-tracking HashMap entry
+		// (+ 1 byte Tier tag), and a 24-byte per-key sizes HashMap entry
+		// (+ 4 bytes for the object size, matching the "+4" charge already
+		// used for TwoQ/Arc/SThreeFifo)
+		PaperPolicy::LfuHybrid => (24 + 48 + 8 + 4) + (24 + 1) + (24 + 4),
 	}
 }
 

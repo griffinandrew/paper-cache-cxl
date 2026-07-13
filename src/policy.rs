@@ -30,6 +30,7 @@ pub enum PaperPolicy {
 	Arc,
 	SThreeFifo(f64),
 	LruHybrid,
+	LfuHybrid,
 }
 
 impl PaperPolicy {
@@ -52,6 +53,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::Arc => write!(f, "arc"),
 			PaperPolicy::SThreeFifo(ratio) => write!(f, "s3-fifo-{ratio}"),
 			PaperPolicy::LruHybrid => write!(f, "lru-hybrid"),
+			PaperPolicy::LfuHybrid => write!(f, "lfu-hybrid"),
 		}
 	}
 }
@@ -72,6 +74,7 @@ impl FromStr for PaperPolicy {
 			"arc" => PaperPolicy::Arc,
 			value if value.starts_with("s3-fifo-") => parse_s_three_fifo(value)?,
 			"lru-hybrid" => PaperPolicy::LruHybrid,
+			"lfu-hybrid" => PaperPolicy::LfuHybrid,
 
 			_ => return Err(CacheError::InvalidPolicy),
 		};
@@ -172,6 +175,21 @@ mod tests {
 		assert_ne!(
 			"lru".parse::<PaperPolicy>().unwrap(),
 			"lru-hybrid".parse::<PaperPolicy>().unwrap(),
+		);
+	}
+
+	#[test]
+	fn lfu_hybrid_round_trips_through_display_and_from_str() {
+		assert_eq!(PaperPolicy::LfuHybrid.to_string(), "lfu-hybrid");
+		assert_eq!("lfu-hybrid".parse::<PaperPolicy>(), Ok(PaperPolicy::LfuHybrid));
+	}
+
+	#[test]
+	fn lfu_hybrid_does_not_collide_with_plain_lfu() {
+		assert_eq!("lfu".parse::<PaperPolicy>(), Ok(PaperPolicy::Lfu));
+		assert_ne!(
+			"lfu".parse::<PaperPolicy>().unwrap(),
+			"lfu-hybrid".parse::<PaperPolicy>().unwrap(),
 		);
 	}
 }

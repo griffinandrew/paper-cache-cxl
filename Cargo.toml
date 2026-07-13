@@ -151,10 +151,20 @@ far_tier_pmem_evst_hash = ["hybridcache", "eviction_stacks_pmem", "global_hashta
 # feature flags, and this feature only needs to migrate *value* bytes between
 # tiers, not force the key into PMEM.
 #
-# NOTE: work in progress — currently only the TieredBuffer value type exists.
-# See CLAUDE.md's `lru_hybrid_cache` plan for the remaining steps (policy,
-# policy stack, worker integration, PaperCache<K, TieredBuffer, _> API).
+# Mutually exclusive with `lfu_hybrid_cache` below: both define their own
+# inherent-method impl block on the identical PaperCache<K, TieredBuffer, S>
+# type (see lib.rs's compile_error! guard).
 lru_hybrid_cache = ["key_value_pmem"]
+
+# Single-instance, segmented-LFU hybrid cache: same one-PaperCache<K,
+# TieredBuffer> architecture as `lru_hybrid_cache` above, but the fast/slow
+# boundary is frequency-ordered rather than recency-ordered — see
+# `lfu_hybrid_cache` module docs (worker/policy/policy_stack/lfu_hybrid_stack.rs
+# has the algorithm). Same dependency reasoning as `lru_hybrid_cache`: only
+# needs `key_value_pmem`, not `key_pmem_value_pmem`.
+#
+# Mutually exclusive with `lru_hybrid_cache` above.
+lfu_hybrid_cache = ["key_value_pmem"]
 
 
 

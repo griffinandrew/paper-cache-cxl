@@ -246,10 +246,18 @@ recency-ordered `HashList<HashedKey>` as `LruStack` (reuse that structure direct
     (needed because the fast/slow boundary is a *byte* threshold, not a fixed slot count, so it
     can't be derived purely from list position without a scan).
   - On `insert`/`update` (admission or access): move the key to the front of the list as `LruStack`
-    already does, mark it `Tier::Fast`, add its size to `fast_used`, then walk backward from the
+    already does, mark it `Tier::Fast`, add its size to `fast_used`, then — only once `fast_used`
+    has actually exceeded `fast_capacity` (the trigger; no early demotion) — walk backward from the
     tier boundary evicting-into-slow (flipping `Tier::Fast` → `Tier::Slow` in the map, subtracting
-    from `fast_used`) until `fast_used <= fast_capacity`. Collect every key that flipped tier this
-    call.
+    from `fast_used`) until `fast_used <= fast_low_water` (a fixed 90%-of-`fast_capacity` floor,
+    `FAST_TIER_LOW_WATER_RATIO`), not merely `<= fast_capacity`. This headroom is what stops nearly
+    every subsequent `set()` from re-triggering a demotion once the fast tier is near capacity —
+    added after the initial implementation, once the user asked whether the fast tier should keep
+    headroom. Unlike `tiering::manager`'s `TieringConfig::{high,low}_water_mark` (checked only
+    periodically, so its *ceiling* also needs headroom to avoid overshoot between polls), this
+    stack's drain runs synchronously on every insert/update, so only the drain *target* needed a
+    lower floor — the trigger stays the user-configured `fast_capacity` exactly. Collect every key
+    that flipped tier this call.
   - `evict_one()` pops the absolute LRU tail of the list — by construction this is always a
     `Tier::Slow` key once any demotion has ever happened (matches "Eviction policy: evict from the
     slow tier"); remove it from the tier map too.
@@ -423,11 +431,191 @@ instead of a second same-sized key.
 
 ### Remaining work
 
-- `FEATURE_FLAGS.md` doesn't yet document `lru_hybrid_cache` (Cargo.toml's own comment is the only
-  documentation right now).
 - Byte-budgeted (not slot-counted) fast/slow boundary means a single admission/promotion can, in
   principle, push more than one key past the boundary in one step if object sizes vary a lot. The
   implementation already returns a `Vec` of migrations per call rather than assuming exactly one,
   so this is handled — flagging only because it's worth a dedicated test case (mixed small/huge
   object sizes) rather than assuming the common "one in, one out" case is the only path.
 - The 2 pre-existing `hybridcache_integration.rs` timing failures noted above.
+
+## Feature: `lfu_hybrid_cache` (implemented — mirrors `lru_hybrid_cache`)
+
+### Source (paper description this implements)
+
+> Functionally, the LFU frequency ordering is segmented across the two tiers... Since the LFU
+> eviction policy assumes the most frequently accessed objects are the most likely to be
+> reaccessed again, it makes sense to place these objects in the fast tier. However, while the
+> fast tier has not yet reached its capacity, new objects are admitted into the fast tier. Once
+> fast tier capacity is reached, every new object is admitted into the slow tier, as it is, by
+> definition, the least frequently accessed object. At some point, an object in the slow tier
+> will have an access count higher than the object with the lowest frequency count in the fast
+> tier. When that happens, the object should be promoted to the fast tier, which may cause
+> objects in the fast tier to be demoted. When slow tier capacity is exhausted, the least
+> frequently accessed object is evicted from the slow tier.
+>
+> - **Admission**: while fast tier capacity is unreached, objects go to the fast tier; once
+>   reached, every new object goes to the slow tier.
+> - **Demotion**: the least frequently accessed fast-tier object moves to the slow tier when
+>   fast-tier space is needed.
+> - **Promotion**: a slow-tier object moves to the fast tier once its access frequency exceeds
+>   the minimum frequency among fast-tier residents.
+> - **Eviction**: the least frequently accessed slow-tier object is removed when cache capacity
+>   is exhausted.
+
+Same overall shape as `lru_hybrid_cache` (see above): **one** `PaperCache<K, TieredBuffer>`, not
+two composed instances — "fast" vs. "slow" is which allocator a given object's bytes currently
+live in, not two separate caches. Requirements 1–5 from the `lru_hybrid_cache` section (single
+instance, actual data movement, TTL survives a tier move, configurable tier size, terminal
+evictions counted) all carry over unchanged; only the tier-membership *rule* differs
+(frequency-ordered rather than recency-ordered).
+
+### Design decisions (differences from `lru_hybrid_cache`, confirmed during planning)
+
+1. **Shared `TieredBuffer`, mutually exclusive features.** `lru_hybrid_cache` and
+   `lfu_hybrid_cache` both define an inherent-method `impl<K, S> PaperCache<K, TieredBuffer, S>`
+   block. Two such blocks for the identical concrete type can't coexist, so `TieredBuffer` was
+   relocated out of `lru_hybrid_cache/buffer.rs` into a neutral `src/tiered_buffer.rs`, gated
+   `any(lru_hybrid_cache, lfu_hybrid_cache)` and re-exported from both feature modules (source
+   compatible — `paper_cache::TieredBuffer` still resolves the same way). `lib.rs` has a
+   `compile_error!` guard rejecting `all(lru_hybrid_cache, lfu_hybrid_cache)`.
+2. **No low-water headroom for demotion.** `LruHybridStack` drains to a 90%-of-capacity floor
+   because *every* `set()` re-admits to fast and could re-trigger demotion. `LfuHybridStack`'s
+   demotion is only triggered by a promotion or an explicit `resize_fast_tier` — inherently
+   rarer — so `settle_fast_tier` drains exactly back to `fast_capacity`, no separate constant.
+3. **Admission still always lands fast first**, exactly like `LruHybridStack` — deliberately
+   *not* special-cased to route new objects straight to the slow tier once the fast tier is
+   full. This keeps `lib.rs`'s `set()` for `TieredBuffer` under `lfu_hybrid_cache` identical to
+   the `lru_hybrid_cache` version (always synchronously build `TieredBuffer::new_fast`, no
+   synchronous capacity check). It still satisfies the paper's admission rule as an *emergent*
+   result: once the fast tier is full, a freshly admitted object (frequency 1) is always tied
+   for the fast tier's lowest frequency, so `settle_fast_tier` demotes *someone* tied at that
+   frequency in the same `insert` call — see the next point for who, specifically.
+4. **Ties within a frequency bucket break toward the least-recently-touched key**, matching the
+   existing `LfuStack` (plain LFU) convention already in this codebase
+   (`worker/policy/policy_stack/lfu_stack.rs`: `CountStack::push` = `push_front` on touch,
+   `pop` = `pop_back` on eviction). This means a freshly admitted key does **not** necessarily
+   demote itself once fast is full — if an older, untouched key shares its frequency, that older
+   key demotes instead (it's the "more LRU" of the tied pair). Either way, the demoted key is,
+   by construction, tied for the fast tier's lowest frequency. Caught this the hard way: an
+   initial unit test asserted the newcomer always demotes and failed — see below.
+
+### Implementation
+
+**New policy: `PaperPolicy::LfuHybrid`** (`policy.rs`), string form `"lfu-hybrid"`, a bare
+literal like `LruHybrid` (no embedded params).
+
+**New policy stack: `LfuHybridStack`** (`worker/policy/policy_stack/lfu_hybrid_stack.rs`). Two
+independent frequency-bucket chains (`FrequencyChain`, a private helper adapted from `LfuStack`'s
+classic O(1) LFU structure — ascending-by-count `dlv_list::VecList<CountStack>` +
+`HashMap<HashedKey, Index<CountStack>>`), one for each tier — chosen over a single shared
+structure (as `LruHybridStack` uses for recency) because LFU's fast/slow boundary is a
+*frequency* threshold, and each chain needs its own O(1)-queryable minimum. `FrequencyChain` adds
+one operation `LfuStack` doesn't need: `insert_at(key, count)`, which places a key directly into
+an *arbitrary* existing count's bucket (creating it in sorted position if absent) — needed when a
+promoted/demoted key crosses chains carrying its already-accumulated frequency, rather than
+always starting fresh at count 1. Unlike `bump`'s O(1) adjacent-bucket check, `insert_at` requires
+a linear scan to find/create the right bucket — an accepted O(distinct frequencies in the target
+chain) cost, expected small since the fast tier is DRAM-budget-limited.
+
+`LfuHybridStack` fields: `fast_chain`/`slow_chain: FrequencyChain`, `tiers: HashMap<HashedKey,
+Tier>`, `sizes: HashMap<HashedKey, ObjectSize>`, `fast_capacity`/`fast_used`/`slow_used`, and
+`migrations: Vec<(HashedKey, Tier)>` — same shape as `LruHybridStack`'s fields minus the
+recency-list/boundary bookkeeping, plus the second chain. `insert`/`update`/`remove`/`clear`/
+`evict_one`/`resize_fast_tier`/`drain_tier_migrations`/the four gauge methods all implement the
+same `PolicyStack` trait `LruHybridStack` already extended (no new trait methods needed —
+`resize_fast_tier`, `drain_tier_migrations`, and the four gauge methods were already added as
+default-no-op methods for `LruHybridStack` and are reused as-is). `evict_one` prefers the slow
+chain, falling back to the fast chain's minimum if slow is empty (mirrors `LruHybridStack`'s
+fallback for "nothing has ever been demoted").
+
+**Worker plumbing (`worker/policy/mod.rs`, `worker/manager.rs`, `worker/mod.rs`) is almost
+entirely reused, not duplicated per-feature** — `PolicyWorker::new_with_tier_migration`,
+`handle_resize_fast_tier`, `WorkerEvent::ResizeFastTier`, and the `Tier` re-export chain are all
+generic over `Tier`/`PolicyStack`, so their `#[cfg(feature = "lru_hybrid_cache")]` gates were
+simply widened to `any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache")`. Two spots
+are genuinely feature-specific and got a parallel sibling instead of a shared implementation
+(since they call out to differently-named `AtomicStatus` methods/types per feature — `lru_hybrid_stats`
+vs. `lfu_hybrid_stats` — and the two features are mutually exclusive, so only one sibling ever
+compiles): `apply_tier_migrations` (records to `lru_hybrid_*` vs. `lfu_hybrid_*` counters/gauges)
+and the terminal-eviction counter increment inside `apply_evictions`.
+
+**`AtomicStatus`** (`status.rs`): `fast_tier_capacity` is a single shared field/method pair
+(gated `any(lru_hybrid_cache, lfu_hybrid_cache)` — safe to share since the two features are
+mutually exclusive), but the promotions/demotions/evictions counters and gauges are a separate,
+independently-named `lfu_hybrid_*` set (not merged with `lru_hybrid_*`), so each feature stays
+self-contained/removable, matching how `tiering_manager` and `hybridcache` already coexist as
+separate concepts in this file.
+
+**Overhead estimate** (`object/overhead.rs::get_policy_overhead`): additive, following the
+established pattern — plain `Lfu`'s existing overhead (84) plus a 24-byte `tiers` HashMap entry
+(+1 byte `Tier` tag) plus a 24-byte `sizes` HashMap entry (+4 bytes for the object size, matching
+the "+4" charge already used for `TwoQ`/`Arc`/`SThreeFifo`) = 137 total.
+
+**New module `src/lfu_hybrid_cache/`** (`mod.rs`, `stats.rs` for `LfuHybridStats`) mirrors
+`lru_hybrid_cache/`'s shape but re-exports `TieredBuffer` from the shared `tiered_buffer` module
+rather than owning it.
+
+**`lib.rs`**: a new `#[cfg(feature = "lfu_hybrid_cache")] impl<K, S> PaperCache<K, TieredBuffer,
+S>` block, adapted mechanically (not generically) from the `lru_hybrid_cache` one — same method
+list, only the seeded `PaperPolicy` and the stats method/type differ.
+
+**Cargo feature**: `lfu_hybrid_cache = ["key_value_pmem"]`, same dependency reasoning as
+`lru_hybrid_cache`.
+
+### A test-writing lesson this caught: don't assume the newcomer is always the one that demotes
+
+An early unit test (`admission_once_fast_is_full_is_demoted_immediately`) asserted that when a
+fast tier fits exactly one key and a second key is admitted (tying its frequency at 1), the
+*newcomer* would be the one demoted — reasoning loosely from the paper's "every new object is,
+by definition, the least frequently accessed" framing. Running the test against the real
+implementation showed the opposite: the *older* key demoted. This is correct, not a bug — see
+design decision 4 above: ties within a frequency bucket break toward whichever key is
+least-recently-touched, and a newcomer is pushed to the *front* of its bucket (most-recently
+touched), so it's actually the pre-existing, untouched resident that's LRU-within-the-tie and
+gets evicted first. This matches `LfuStack`'s (the plain LFU policy already in this crate)
+existing, already-tested tie-breaking convention — it just wasn't the direction the test author
+initially expected. Fixed by correcting the test's expected outcome and its doc comment, not the
+implementation. A second, related pitfall: the module-level doc comment originally claimed
+`settle_fast_tier` "demotes [the freshly admitted key] right back out in the same `insert` call"
+— also corrected, since that's only sometimes true (see the tie-breaking behavior above).
+
+### A test-design lesson: `fast_capacity == max_size` does not guarantee "nothing ever demotes"
+
+An integration test wanted a scenario where the slow tier stays empty, so `evict_one`'s
+fast-tier fallback path gets exercised. The first attempt set `fast_tier_size == max_size`,
+reasoning that admission failures would prevent fast_used from ever exceeding fast_capacity. This
+is wrong on two counts: (1) `set()` only rejects a *single* object whose own `base_size` alone
+exceeds `max_size` — it never blocks based on cumulative usage, relying entirely on the
+asynchronous eviction loop to trim afterward; and (2) `fast_capacity` (tracked in raw `base_size`
+bytes only) and `max_size` (tracked in `base_size` *plus* a fixed per-object policy overhead, 137
+bytes here) are different accounting units, so several small objects can accumulate past
+`fast_capacity` in raw bytes well before their overhead-inclusive total ever threatens
+`max_size`. A tight burst of `set()` calls made this materialize as spurious demotions; even after
+pacing the inserts, a *first* demotion still triggered a real, cold `TieredBuffer::new_slow` PMEM
+allocation in a test that had never called `ensure_pmem_allocator_warm()`, silently stalling the
+worker thread for the one-time ~45s warm-up and making eviction (a completely independent
+mechanism from demotion) look like it had stopped working entirely. Fixed by making the test wait
+for `status().used_size() <= max_size` after each individual `set()` (keeping admission and
+eviction in lockstep so raw bytes never have a chance to spike past `fast_capacity`) rather than
+relying on the capacity numbers or a fixed sleep alone. This subtlety applies to `lru_hybrid_cache`
+too, not just this feature — noted in `FEATURE_FLAGS.md`.
+
+### Implementation status: complete
+
+All of `policy.rs`, `object/overhead.rs`, `worker/policy/policy_stack/lfu_hybrid_stack.rs`,
+`worker/policy/policy_stack/mod.rs`, `status.rs`, `src/lfu_hybrid_cache/`, `src/tiered_buffer.rs`
+(relocated, shared), `lib.rs`, and `Cargo.toml` are done. 55 unit/inline tests pass under
+`--features lfu_hybrid_cache` (including the relocated `tiered_buffer` tests and a
+`worker::policy::lfu_hybrid_tests` module mirroring `lru_hybrid_tests`'s synthetic-buffer wiring
+tests). `tests/lfu_hybrid_cache_integration.rs` (17 tests, real PMEM/UMF allocator, modeled on
+`tests/lru_hybrid_cache_integration.rs`) passes twice in a row (not flaky):
+`cargo +nightly test --test lfu_hybrid_cache_integration --features lfu_hybrid_cache`. Confirmed
+`lru_hybrid_cache`'s own test suites (unit + its 14 integration tests) are unaffected by the
+`TieredBuffer` relocation and are still 100% passing.
+
+### Remaining work
+
+- No dedicated test yet for a multi-key single-step promotion/demotion cascade with mixed
+  small/huge object sizes (same caveat noted for `lru_hybrid_cache` above — the implementation
+  already returns a `Vec` of migrations per call, so this is handled, just not yet exercised by a
+  test with deliberately varied sizes).

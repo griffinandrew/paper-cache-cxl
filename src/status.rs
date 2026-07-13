@@ -69,11 +69,14 @@ pub struct AtomicStatus {
 	start_time: AtomicU64,
 
 	/// Runtime-configurable fast-tier byte budget for `PaperPolicy::LruHybrid`
-	/// (`lru_hybrid_cache`). Written by `PaperCache::set_fast_tier_size`,
-	/// read back by both `PaperCache::fast_tier_size` and `PolicyWorker` (via
-	/// the `WorkerEvent::ResizeFastTier` broadcast, not by reading this field
+	/// / `PaperPolicy::LfuHybrid` (`lru_hybrid_cache` / `lfu_hybrid_cache` —
+	/// mutually exclusive features, see `lib.rs`'s `compile_error!` guard, so
+	/// this single field serves whichever one is active). Written by
+	/// `PaperCache::set_fast_tier_size`, read back by both
+	/// `PaperCache::fast_tier_size` and `PolicyWorker` (via the
+	/// `WorkerEvent::ResizeFastTier` broadcast, not by reading this field
 	/// directly — mirrors how `max_size` and `resize()`/`Resize` work).
-	#[cfg(feature = "lru_hybrid_cache")]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
 	fast_tier_capacity: AtomicCacheSize,
 
 	/// `lru_hybrid_cache` counters/gauges, updated by `PolicyWorker` as it
@@ -96,6 +99,26 @@ pub struct AtomicStatus {
 	lru_hybrid_fast_objects: AtomicU64,
 	#[cfg(feature = "lru_hybrid_cache")]
 	lru_hybrid_slow_objects: AtomicU64,
+
+	/// `lfu_hybrid_cache` counters/gauges — same rationale as the
+	/// `lru_hybrid_*` fields above (kept as a separate, independently named
+	/// set rather than merged with them, so each feature stays
+	/// self-contained/removable, matching how `tiering_manager` and
+	/// `hybridcache` already coexist as separate concepts in this file).
+	#[cfg(feature = "lfu_hybrid_cache")]
+	lfu_hybrid_promotions: AtomicU64,
+	#[cfg(feature = "lfu_hybrid_cache")]
+	lfu_hybrid_demotions: AtomicU64,
+	#[cfg(feature = "lfu_hybrid_cache")]
+	lfu_hybrid_evictions: AtomicU64,
+	#[cfg(feature = "lfu_hybrid_cache")]
+	lfu_hybrid_fast_bytes_used: AtomicCacheSize,
+	#[cfg(feature = "lfu_hybrid_cache")]
+	lfu_hybrid_slow_bytes_used: AtomicCacheSize,
+	#[cfg(feature = "lfu_hybrid_cache")]
+	lfu_hybrid_fast_objects: AtomicU64,
+	#[cfg(feature = "lfu_hybrid_cache")]
+	lfu_hybrid_slow_objects: AtomicU64,
 }
 
 /// This struct holds the basic statistical information about `PaperCache`.
@@ -223,7 +246,7 @@ impl AtomicStatus {
 
 			start_time: AtomicU64::new(time::timestamp()),
 
-			#[cfg(feature = "lru_hybrid_cache")]
+			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
 			fast_tier_capacity: AtomicCacheSize::default(),
 			#[cfg(feature = "lru_hybrid_cache")]
 			lru_hybrid_promotions: AtomicU64::default(),
@@ -239,6 +262,21 @@ impl AtomicStatus {
 			lru_hybrid_fast_objects: AtomicU64::default(),
 			#[cfg(feature = "lru_hybrid_cache")]
 			lru_hybrid_slow_objects: AtomicU64::default(),
+
+			#[cfg(feature = "lfu_hybrid_cache")]
+			lfu_hybrid_promotions: AtomicU64::default(),
+			#[cfg(feature = "lfu_hybrid_cache")]
+			lfu_hybrid_demotions: AtomicU64::default(),
+			#[cfg(feature = "lfu_hybrid_cache")]
+			lfu_hybrid_evictions: AtomicU64::default(),
+			#[cfg(feature = "lfu_hybrid_cache")]
+			lfu_hybrid_fast_bytes_used: AtomicCacheSize::default(),
+			#[cfg(feature = "lfu_hybrid_cache")]
+			lfu_hybrid_slow_bytes_used: AtomicCacheSize::default(),
+			#[cfg(feature = "lfu_hybrid_cache")]
+			lfu_hybrid_fast_objects: AtomicU64::default(),
+			#[cfg(feature = "lfu_hybrid_cache")]
+			lfu_hybrid_slow_objects: AtomicU64::default(),
 		};
 
 		Ok(status)
@@ -350,17 +388,18 @@ impl AtomicStatus {
 		size.as_() > self.max_size.load(Ordering::Relaxed)
 	}
 
-	/// Current fast-tier byte budget (`PaperPolicy::LruHybrid`).
-	#[cfg(feature = "lru_hybrid_cache")]
+	/// Current fast-tier byte budget (`PaperPolicy::LruHybrid` /
+	/// `PaperPolicy::LfuHybrid`).
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
 	#[must_use]
 	pub fn fast_tier_capacity(&self) -> CacheSize {
 		self.fast_tier_capacity.load(Ordering::Relaxed)
 	}
 
 	/// Sets the fast-tier byte budget. Callers are responsible for also
-	/// broadcasting `WorkerEvent::ResizeFastTier` so `LruHybridStack`'s own
+	/// broadcasting `WorkerEvent::ResizeFastTier` so the active stack's own
 	/// internal capacity is updated (mirrors `set_max_size` + `Resize`).
-	#[cfg(feature = "lru_hybrid_cache")]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
 	pub fn set_fast_tier_capacity(&self, size: CacheSize) {
 		self.fast_tier_capacity.store(size, Ordering::Relaxed);
 	}
@@ -408,6 +447,52 @@ impl AtomicStatus {
 			slow_bytes_used: self.lru_hybrid_slow_bytes_used.load(Ordering::Relaxed),
 			fast_objects: self.lru_hybrid_fast_objects.load(Ordering::Relaxed),
 			slow_objects: self.lru_hybrid_slow_objects.load(Ordering::Relaxed),
+		}
+	}
+
+	#[cfg(feature = "lfu_hybrid_cache")]
+	pub fn record_lfu_hybrid_promotion(&self) {
+		self.lfu_hybrid_promotions.fetch_add(1, Ordering::Relaxed);
+	}
+
+	#[cfg(feature = "lfu_hybrid_cache")]
+	pub fn record_lfu_hybrid_demotion(&self) {
+		self.lfu_hybrid_demotions.fetch_add(1, Ordering::Relaxed);
+	}
+
+	#[cfg(feature = "lfu_hybrid_cache")]
+	pub fn record_lfu_hybrid_eviction(&self) {
+		self.lfu_hybrid_evictions.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Overwrites the live tier gauges (bytes/objects currently in each
+	/// tier). Called by `PolicyWorker` each time it drains tier migrations.
+	#[cfg(feature = "lfu_hybrid_cache")]
+	pub fn set_lfu_hybrid_gauges(
+		&self,
+		fast_bytes_used: CacheSize,
+		slow_bytes_used: CacheSize,
+		fast_objects: u64,
+		slow_objects: u64,
+	) {
+		self.lfu_hybrid_fast_bytes_used.store(fast_bytes_used, Ordering::Relaxed);
+		self.lfu_hybrid_slow_bytes_used.store(slow_bytes_used, Ordering::Relaxed);
+		self.lfu_hybrid_fast_objects.store(fast_objects, Ordering::Relaxed);
+		self.lfu_hybrid_slow_objects.store(slow_objects, Ordering::Relaxed);
+	}
+
+	/// Returns a point-in-time snapshot of `lfu_hybrid_cache` statistics.
+	#[cfg(feature = "lfu_hybrid_cache")]
+	#[must_use]
+	pub fn lfu_hybrid_stats(&self) -> crate::lfu_hybrid_cache::LfuHybridStats {
+		crate::lfu_hybrid_cache::LfuHybridStats {
+			promotions: self.lfu_hybrid_promotions.load(Ordering::Relaxed),
+			demotions: self.lfu_hybrid_demotions.load(Ordering::Relaxed),
+			evictions: self.lfu_hybrid_evictions.load(Ordering::Relaxed),
+			fast_bytes_used: self.lfu_hybrid_fast_bytes_used.load(Ordering::Relaxed),
+			slow_bytes_used: self.lfu_hybrid_slow_bytes_used.load(Ordering::Relaxed),
+			fast_objects: self.lfu_hybrid_fast_objects.load(Ordering::Relaxed),
+			slow_objects: self.lfu_hybrid_slow_objects.load(Ordering::Relaxed),
 		}
 	}
 

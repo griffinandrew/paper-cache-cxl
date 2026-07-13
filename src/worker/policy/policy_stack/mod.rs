@@ -15,6 +15,7 @@ mod two_q_stack;
 mod arc_stack;
 mod s_three_fifo_stack;
 mod lru_hybrid_stack;
+mod lfu_hybrid_stack;
 
 #[cfg(feature = "eviction_stacks_pmem")] mod pmem_collections;
 
@@ -34,6 +35,7 @@ use crate::{
 		arc_stack::ArcStack,
 		s_three_fifo_stack::SThreeFifoStack,
 		lru_hybrid_stack::LruHybridStack,
+		lfu_hybrid_stack::LfuHybridStack,
 	},
 };
 
@@ -45,9 +47,10 @@ pub enum AccessOutcome {
 }
 
 /// Which tier an object currently lives in, for policy stacks that track a
-/// segmented (fast/slow) LRU queue. Currently only `LruHybridStack`
-/// (`PaperPolicy::LruHybrid`) uses this; every other stack's default
-/// `drain_tier_migrations` never produces one.
+/// segmented (fast/slow) queue. Used by `LruHybridStack`
+/// (`PaperPolicy::LruHybrid`, recency-segmented) and `LfuHybridStack`
+/// (`PaperPolicy::LfuHybrid`, frequency-segmented); every other stack's
+/// default `drain_tier_migrations` never produces one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
 	Fast,
@@ -84,34 +87,34 @@ where
 	fn resize_fast_tier(&mut self, _size: CacheSize) {}
 
 	/// Drains and returns every (key, new tier) pair that crossed the
-	/// fast/slow boundary since the last call. Only `LruHybridStack`
-	/// ever produces entries; every other stack keeps the default empty
-	/// `Vec`. The caller (`PolicyWorker`) is responsible for physically
-	/// migrating each returned key's object bytes to `new_tier`.
+	/// fast/slow boundary since the last call. Only `LruHybridStack` and
+	/// `LfuHybridStack` ever produce entries; every other stack keeps the
+	/// default empty `Vec`. The caller (`PolicyWorker`) is responsible for
+	/// physically migrating each returned key's object bytes to `new_tier`.
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		Vec::new()
 	}
 
 	/// Current bytes accounted to the fast tier. `0` for every stack except
-	/// `LruHybridStack`.
+	/// `LruHybridStack`/`LfuHybridStack`.
 	fn fast_bytes_used(&self) -> CacheSize {
 		0
 	}
 
 	/// Current bytes accounted to the slow tier. `0` for every stack except
-	/// `LruHybridStack`.
+	/// `LruHybridStack`/`LfuHybridStack`.
 	fn slow_bytes_used(&self) -> CacheSize {
 		0
 	}
 
 	/// Current number of objects in the fast tier. `0` for every stack
-	/// except `LruHybridStack`.
+	/// except `LruHybridStack`/`LfuHybridStack`.
 	fn fast_object_count(&self) -> usize {
 		0
 	}
 
 	/// Current number of objects in the slow tier. `0` for every stack
-	/// except `LruHybridStack`.
+	/// except `LruHybridStack`/`LfuHybridStack`.
 	fn slow_object_count(&self) -> usize {
 		0
 	}
@@ -135,5 +138,8 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// `TieringManager::new` in lib.rs). Runtime-adjustable afterward via
 		// `resize_fast_tier` / `PaperCache::set_fast_tier_size` (step 10).
 		PaperPolicy::LruHybrid => Box::new(LruHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
+
+		// Same default fast-tier budget/override mechanism as `LruHybrid`.
+		PaperPolicy::LfuHybrid => Box::new(LfuHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 	}
 }

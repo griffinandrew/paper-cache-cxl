@@ -5,17 +5,25 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `TieredBuffer` — the value type stored in `lru_hybrid_cache`'s single,
-//! unified object table.
+//! `TieredBuffer` — the value type stored in both `lru_hybrid_cache`'s and
+//! `lfu_hybrid_cache`'s single, unified object table.
 //!
 //! Unlike `hybridcache`, which gets two tiers by running two independent
 //! `PaperCache` instances (one `BufferDRAM`, one `BufferPMEM`) side by side,
-//! `lru_hybrid_cache` stores every object in one `PaperCache<K, TieredBuffer>`.
-//! `TieredBuffer` is a tagged union recording *where this particular object's
-//! bytes currently live*. Promotion and demotion replace an `Object`'s
-//! `TieredBuffer` in place (via `Object::set_data`) rather than copying bytes
-//! into a second map, so a live object's bytes exist in exactly one tier's
-//! allocation at any given time.
+//! the hybrid-cache features built around `TieredBuffer` store every object
+//! in one `PaperCache<K, TieredBuffer>`. `TieredBuffer` is a tagged union
+//! recording *where this particular object's bytes currently live*.
+//! Promotion and demotion replace an `Object`'s `TieredBuffer` in place (via
+//! `Object::set_data`) rather than copying bytes into a second map, so a
+//! live object's bytes exist in exactly one tier's allocation at any given
+//! time.
+//!
+//! Shared (rather than duplicated per feature) because `lru_hybrid_cache`
+//! and `lfu_hybrid_cache` each define their own inherent-method
+//! `impl<K, S> PaperCache<K, TieredBuffer, S>` block — two such blocks for
+//! the same concrete type cannot coexist, so the two features are mutually
+//! exclusive (see the `compile_error!` guard in `lib.rs`) and share this one
+//! buffer type rather than each defining their own.
 
 use typesize::TypeSize;
 

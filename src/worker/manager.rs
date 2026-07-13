@@ -31,7 +31,7 @@ use crate::{
 	worker::TieringWorker,
 };
 
-#[cfg(feature = "lru_hybrid_cache")]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
 use crate::worker::policy::Tier;
 
 pub struct WorkerManager {
@@ -248,13 +248,14 @@ impl WorkerManager {
 	}
 
 	/// Creates a `WorkerManager` whose policy worker physically migrates
-	/// object bytes between tiers whenever `PaperPolicy::LruHybrid` reports a
-	/// promotion or demotion. `migrate` reallocates a value into the target
-	/// tier's representation (e.g. `TieredBuffer::new_fast`/`new_slow`).
-	/// Promotion/demotion/eviction counters and gauges are recorded directly
-	/// on the shared `status` (backing `PaperCache::lru_hybrid_stats`), so no
+	/// object bytes between tiers whenever `PaperPolicy::LruHybrid` or
+	/// `PaperPolicy::LfuHybrid` reports a promotion or demotion. `migrate`
+	/// reallocates a value into the target tier's representation (e.g.
+	/// `TieredBuffer::new_fast`/`new_slow`). Promotion/demotion/eviction
+	/// counters and gauges are recorded directly on the shared `status`
+	/// (backing `PaperCache::lru_hybrid_stats`/`lfu_hybrid_stats`), so no
 	/// separate stats parameter is needed here.
-	#[cfg(feature = "lru_hybrid_cache")]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
 	pub fn new_with_tier_migration<K, V>(
 		listener: WorkerReceiver,
 		objects: &ObjectMapRef<K, V>,

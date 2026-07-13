@@ -14,6 +14,13 @@
 #[cfg(all(feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
 compile_error!("Cannot enable both 'global_flatmap_dram' and 'global_flatmap_pmem' features simultaneously. Please choose only one FlatMap mode for the global hashtable.");
 
+// `lru_hybrid_cache` and `lfu_hybrid_cache` each define their own inherent
+// methods (`new`, `get`, `set`, ...) on `PaperCache<K, TieredBuffer, S>`.
+// Two such impl blocks for the identical concrete type cannot coexist, so
+// only one of these hybrid-cache flavors may be enabled at a time.
+#[cfg(all(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
+compile_error!("Cannot enable both 'lru_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
+
 // Validate that hashbrown_dram is not enabled with other global hashtable features
 #[cfg(all(feature = "hashbrown_dram", feature = "global_hashtable_pmem"))]
 compile_error!("Cannot enable both 'hashbrown_dram' and 'global_hashtable_pmem' features simultaneously. Please choose only one global hashtable mode.");
@@ -135,13 +142,24 @@ mod object;
 mod policy;
 mod status;
 
-// Shared tier-size unit type (bytes/Mb/Gb), used by both `hybridcache` and
-// `lru_hybrid_cache` so neither has to depend on the other for it.
-#[cfg(any(feature = "hybridcache", feature = "lru_hybrid_cache"))]
+// Shared tier-size unit type (bytes/Mb/Gb), used by `hybridcache`,
+// `lru_hybrid_cache`, and `lfu_hybrid_cache` so none of them has to depend
+// on either of the others for it.
+#[cfg(any(feature = "hybridcache", feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
 mod size;
 
-#[cfg(any(feature = "hybridcache", feature = "lru_hybrid_cache"))]
+#[cfg(any(feature = "hybridcache", feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
 pub use crate::size::CacheTierSize;
+
+// Shared value type for the segmented hybrid-cache features. `lru_hybrid_cache`
+// and `lfu_hybrid_cache` are mutually exclusive (see the `compile_error!`
+// guard above) and both re-export it from their own module for source
+// compatibility (`paper_cache::TieredBuffer` works either way).
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
+mod tiered_buffer;
+
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
+pub use crate::tiered_buffer::TieredBuffer;
 
 #[cfg(any(all(feature = "key_value_pmem", feature = "enable_tiering_manager"), all(feature = "key_value_pmem", feature = "sets_dram")))]
 pub mod tiering;
@@ -169,11 +187,21 @@ pub use crate::hybridcache::{S3FifoHybridCache, HybridCacheConfig, HybridCacheSt
 pub mod lru_hybrid_cache;
 
 #[cfg(feature = "lru_hybrid_cache")]
-pub use crate::lru_hybrid_cache::{TieredBuffer, LruHybridStats};
+pub use crate::lru_hybrid_cache::LruHybridStats;
+
+// Single-instance, segmented-LFU hybrid cache. Same architecture as
+// `lru_hybrid_cache` (one PaperCache<K, TieredBuffer>, not two composed
+// instances) but the fast/slow boundary is frequency-ordered rather than
+// recency-ordered — see the `lfu_hybrid_cache` module docs.
+#[cfg(feature = "lfu_hybrid_cache")]
+pub mod lfu_hybrid_cache;
+
+#[cfg(feature = "lfu_hybrid_cache")]
+pub use crate::lfu_hybrid_cache::LfuHybridStats;
 
 // Re-exported so `PaperCache::tier_of`'s return type is nameable by callers
 // without reaching into the private `worker` module tree directly.
-#[cfg(feature = "lru_hybrid_cache")]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
 pub use crate::worker::Tier;
 
 use std::{
@@ -5381,6 +5409,387 @@ where
 	}
 }
 
+/// Single-instance, segmented-LFU hybrid cache: one `PaperCache<K,
+/// TieredBuffer>` running `PaperPolicy::LfuHybrid`, in contrast with
+/// `hybridcache`'s [`crate::hybridcache::S3FifoHybridCache`] (two composed
+/// `PaperCache` instances). See the `lfu_hybrid_cache` module docs for the
+/// full design; this impl block mirrors `lru_hybrid_cache`'s mechanically
+/// (same shape: `new`, `get`, `set`, ...) — the only behavioral difference
+/// lives in `LfuHybridStack`, not here.
+///
+/// Admission always lands in the fast tier; once fast-tier pressure demotes
+/// a key, it is (by construction) always the fast tier's lowest-frequency
+/// resident, satisfying the paper's "new objects are, by definition, the
+/// least frequently accessed" admission rule as an emergent result. A
+/// slow-tier access promotes a key back to the fast tier once its frequency
+/// strictly exceeds the fast tier's minimum, which may itself cascade a
+/// demotion. Terminal evictions (once overall `max_size` is exceeded) only
+/// ever remove the slow-tier minimum-frequency resident. Every migration
+/// physically reallocates the object's bytes (see [`TieredBuffer`] and
+/// `Object::set_data`) — a key is never present in both tiers at once.
+///
+/// Mutually exclusive with `lru_hybrid_cache` (see `lib.rs`'s
+/// `compile_error!` guard) since both define this same inherent-method
+/// impl block on the identical `PaperCache<K, TieredBuffer, S>` type.
+#[cfg(feature = "lfu_hybrid_cache")]
+impl<K, S> PaperCache<K, TieredBuffer, S>
+where
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	S: Default + Clone + BuildHasher,
+{
+	/// Creates an empty `PaperCache` running `PaperPolicy::LfuHybrid`, with
+	/// the given overall `max_size` and initial fast-tier byte budget
+	/// `fast_tier_size` (adjustable afterward via
+	/// [`Self::set_fast_tier_size`]).
+	///
+	/// # Errors
+	///
+	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero, or
+	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
+	/// zero bytes or exceeds `max_size`.
+	///
+	/// # Examples
+	///
+	/// ```ignore
+	/// use paper_cache::{PaperCache, TieredBuffer, CacheTierSize};
+	///
+	/// let cache = PaperCache::<u32, TieredBuffer>::new(
+	///     10_000_000,
+	///     CacheTierSize::Mb(2),
+	/// ).unwrap();
+	///
+	/// cache.set(1u32, b"hello world", None).unwrap();
+	/// assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
+	/// ```
+	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize) -> Result<Self, CacheError> {
+		Self::with_hasher(max_size, fast_tier_size, Default::default())
+	}
+
+	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
+	pub fn with_hasher(
+		max_size: CacheSize,
+		fast_tier_size: CacheTierSize,
+		hasher: S,
+	) -> Result<Self, CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		let fast_capacity = fast_tier_size.to_bytes();
+
+		if fast_capacity == 0 || fast_capacity > max_size {
+			return Err(CacheError::InvalidFastTierSize);
+		}
+
+		let policies = [PaperPolicy::LfuHybrid];
+
+		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		let status = Arc::new(AtomicStatus::new(max_size, &policies, PaperPolicy::LfuHybrid)?);
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		// Requirement: fast-tier size is runtime-configurable (not baked
+		// into the policy string), so the requested capacity is recorded on
+		// the shared status immediately; `init_policy_stack`'s
+		// 20%-of-max_size default (see `policy_stack/mod.rs`) is overridden
+		// below via `ResizeFastTier`.
+		status.set_fast_tier_capacity(fast_capacity);
+
+		// Reallocates a value into the target tier's representation. Must
+		// preserve byte length exactly: both `status.base_used_size` and
+		// `LfuHybridStack`'s own per-key size bookkeeping assume a
+		// migration never changes an object's accounted size.
+		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> TieredBuffer + Send + Sync> =
+			Box::new(|buffer, tier| match tier {
+				Tier::Fast => TieredBuffer::new_fast(buffer.as_ref()),
+				Tier::Slow => TieredBuffer::new_slow(buffer.as_ref()),
+			});
+
+		let (worker_sender, worker_listener) = unbounded();
+
+		let mut worker_manager = WorkerManager::new_with_tier_migration(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+			migrate,
+		)?;
+
+		thread::spawn(move || worker_manager.run());
+
+		let cache = PaperCache {
+			objects,
+			status,
+			worker_manager: Arc::new(worker_sender),
+			overhead_manager,
+			hasher,
+		};
+
+		cache.broadcast(WorkerEvent::ResizeFastTier(fast_capacity))?;
+
+		Ok(cache)
+	}
+
+	/// Returns the current cache version.
+	#[must_use]
+	pub fn version(&self) -> String {
+		env!("CARGO_PKG_VERSION").to_owned()
+	}
+
+	/// Returns the current statistics.
+	pub fn status(&self) -> Result<Status, CacheError> {
+		self.status.try_to_status()
+	}
+
+	/// Gets the value associated with the supplied key.
+	/// If the key was not found in the cache, returns a [`CacheError`].
+	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let result = match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				self.status.incr_hits();
+				let arc_val = object.data();
+				let bytes: &[u8] = arc_val.as_ref().as_ref();
+				Ok(bytes.to_vec())
+			},
+
+			_ => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
+
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+
+		result
+	}
+
+	/// Sets the supplied key and value in the cache. Admission always lands
+	/// in the fast tier — including when overwriting a key currently in the
+	/// slow tier, which this treats as an access (see `LfuHybridStack::insert`).
+	/// Returns a [`CacheError`] if the value size is zero or larger than the
+	/// cache's maximum size.
+	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
+		let hashed_key = self.hash_key(&key);
+
+		let val_buf = TieredBuffer::new_fast(value);
+		let object = Object::new(key, val_buf, ttl);
+		let base_size = self.overhead_manager.base_size(&object);
+		let expiry = object.expiry();
+
+		if base_size == 0 {
+			return Err(CacheError::ZeroValueSize);
+		}
+
+		if self.status.exceeds_max_size(base_size) {
+			return Err(CacheError::ExceedingValueSize);
+		}
+
+		self.status.incr_sets();
+
+		let old_object_info = self.objects
+			.insert(hashed_key, object)
+			.map(|old_object| {
+				let base_size = self.overhead_manager.base_size(&old_object);
+				let expiry = old_object.expiry();
+
+				(base_size, expiry)
+			});
+
+		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+			base_size as i64 - old_object_size as i64
+		} else {
+			self.status.incr_num_objects();
+			base_size as i64
+		};
+
+		self.status.update_base_used_size(base_size_delta);
+		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+
+		Ok(())
+	}
+
+	/// Deletes the object associated with the supplied key in the cache.
+	/// Returns a [`CacheError`] if the key was not found in the cache.
+	pub fn del(&self, key: &K) -> Result<(), CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let (removed_hashed_key, object) = erase(
+			&self.objects,
+			&self.status,
+			&self.overhead_manager,
+			Some(EraseKey::Original(key, hashed_key)),
+		)?;
+
+		self.status.incr_dels();
+		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
+
+		Ok(())
+	}
+
+	/// Checks if an object with the supplied key exists in the cache without
+	/// altering any of the cache's internal queues.
+	pub fn has(&self, key: &K) -> bool {
+		let hashed_key = self.hash_key(key);
+
+		self.objects
+			.get(&hashed_key)
+			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
+	}
+
+	/// Gets (peeks) the value associated with the supplied key without
+	/// altering any of the cache's internal queues (including tier — a peek
+	/// never triggers a promotion). If the key was not found in the cache,
+	/// returns a [`CacheError`].
+	pub fn peek(&self, key: &K) -> Result<Arc<TieredBuffer>, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Ok(object.data()),
+
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
+	/// Sets the TTL associated with the supplied key.
+	/// If the key was not found in the cache, returns a [`CacheError`].
+	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let mut object = match self.objects.get_mut(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => object,
+			_ => return Err(CacheError::KeyNotFound),
+		};
+
+		let old_expiry = object.expiry();
+		let old_base_size = self.overhead_manager.base_size(&object);
+
+		object.expires(ttl);
+
+		let new_expiry = object.expiry();
+		let new_base_size = self.overhead_manager.base_size(&object);
+
+		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
+		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
+
+		Ok(())
+	}
+
+	/// Gets the size of the value associated with the supplied key in bytes.
+	/// If the key was not found in the cache, returns a [`CacheError`].
+	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Ok(self.overhead_manager.total_size(&object)),
+
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
+	/// Deletes all objects in the cache and sets the cache's used size to zero.
+	pub fn wipe(&self) -> Result<(), CacheError> {
+		info!("Wiping cache");
+
+		self.objects.clear();
+		self.status.clear();
+
+		self.broadcast(WorkerEvent::Wipe)?;
+
+		Ok(())
+	}
+
+	/// Resizes the cache's overall maximum size.
+	/// If the supplied size is zero, returns a [`CacheError`].
+	///
+	/// Note this is the *overall* cache capacity, independent of the
+	/// fast-tier budget — see [`Self::set_fast_tier_size`].
+	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		let current_max_size = self.status.max_size();
+
+		if max_size == current_max_size {
+			return Ok(());
+		}
+
+		info!(
+			"Resizing cache from {} to {}",
+			fmt::memory(current_max_size, Some(2)),
+			fmt::memory(max_size, Some(2)),
+		);
+
+		self.status.set_max_size(max_size);
+		self.broadcast(WorkerEvent::Resize(max_size))?;
+
+		Ok(())
+	}
+
+	/// Runtime-adjusts the fast-tier byte budget. Shrinking it may trigger
+	/// immediate demotions (see `LfuHybridStack::settle_fast_tier`).
+	///
+	/// # Errors
+	///
+	/// Returns [`CacheError::InvalidFastTierSize`] if `size` resolves to
+	/// zero bytes or exceeds the cache's overall `max_size`.
+	pub fn set_fast_tier_size(&self, size: CacheTierSize) -> Result<(), CacheError> {
+		let bytes = size.to_bytes();
+
+		if bytes == 0 || bytes > self.status.max_size() {
+			return Err(CacheError::InvalidFastTierSize);
+		}
+
+		self.status.set_fast_tier_capacity(bytes);
+		self.broadcast(WorkerEvent::ResizeFastTier(bytes))?;
+
+		Ok(())
+	}
+
+	/// Returns the current fast-tier byte budget.
+	#[must_use]
+	pub fn fast_tier_size(&self) -> CacheSize {
+		self.status.fast_tier_capacity()
+	}
+
+	/// Returns a point-in-time snapshot of `lfu_hybrid_cache` statistics.
+	#[must_use]
+	pub fn lfu_hybrid_stats(&self) -> LfuHybridStats {
+		self.status.lfu_hybrid_stats()
+	}
+
+	/// Returns which tier `key` currently lives in, or `None` if the key
+	/// isn't present (or has expired).
+	#[must_use]
+	pub fn tier_of(&self, key: &K) -> Option<Tier> {
+		let hashed_key = self.hash_key(key);
+
+		self.objects.get(&hashed_key).and_then(|object| {
+			if !object.key_matches(key) || object.is_expired() {
+				return None;
+			}
+
+			Some(if object.data().is_fast() { Tier::Fast } else { Tier::Slow })
+		})
+	}
+
+	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
+		if let Err(err) = self.worker_manager.try_send(event) {
+			error!("Could not communicate with workers: {err:?}");
+			return Err(CacheError::Internal);
+		}
+
+		Ok(())
+	}
+
+	fn hash_key(&self, key: &K) -> HashedKey {
+		self.hasher.hash_one(key)
+	}
+}
+
 #[cfg(all(test, feature = "original"))]
 mod tests {
 	use crate::{PaperCache, PaperPolicy, CacheError};
@@ -6003,6 +6412,75 @@ mod test_lru_hybrid_cache {
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
         let stats = cache.lru_hybrid_stats();
+        assert_eq!(stats.demotions, 0);
+        assert_eq!(stats.promotions, 0);
+        assert_eq!(stats.evictions, 0);
+
+        assert_eq!(cache.fast_tier_size(), 1_000_000);
+        cache.set_fast_tier_size(CacheTierSize::Bytes(500_000)).expect("resize should succeed");
+        assert_eq!(cache.fast_tier_size(), 500_000);
+
+        cache.del(&1u32).expect("del should succeed");
+        assert!(!cache.has(&1u32));
+        assert_eq!(cache.tier_of(&1u32), None);
+    }
+
+    #[test]
+    fn invalid_fast_tier_size_is_rejected() {
+        assert!(matches!(
+            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000)),
+            Err(CacheError::InvalidFastTierSize),
+        ));
+
+        assert!(matches!(
+            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0)),
+            Err(CacheError::InvalidFastTierSize),
+        ));
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500))
+            .expect("cache should construct");
+
+        assert!(matches!(
+            cache.set_fast_tier_size(CacheTierSize::Bytes(2000)),
+            Err(CacheError::InvalidFastTierSize),
+        ));
+    }
+
+    #[test]
+    fn ttl_is_preserved_across_a_set() {
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"value", Some(60)).expect("set should succeed");
+        assert!(cache.ttl(&1u32, Some(120)).is_ok());
+        assert_eq!(cache.get(&1u32).unwrap(), b"value");
+    }
+}
+
+/// Exercises the real public `PaperCache<K, TieredBuffer>` API end to end
+/// for `lfu_hybrid_cache`. See `test_lru_hybrid_cache`'s doc comment for why
+/// this deliberately stays on the fast-tier-only path (no PMEM allocation) —
+/// the full tier-crossing coverage lives in
+/// `tests/lfu_hybrid_cache_integration.rs`.
+#[cfg(all(test, feature = "lfu_hybrid_cache"))]
+mod test_lfu_hybrid_cache {
+    use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
+
+    #[test]
+    fn basic_construction_and_fast_tier_only_roundtrip() {
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000), // fast tier == whole cache: no demotion possible
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"hello world", None).expect("set should succeed");
+        assert!(cache.has(&1u32));
+        assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
+
+        let stats = cache.lfu_hybrid_stats();
         assert_eq!(stats.demotions, 0);
         assert_eq!(stats.promotions, 0);
         assert_eq!(stats.evictions, 0);

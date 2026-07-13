@@ -95,6 +95,7 @@ pub struct LruHybridStack {
     tiers: HashMap<HashedKey, Tier, NoHasher>, // which tier each tracked key is logically in
 
     fast_capacity: CacheSize,                  // the runtime-configurable fast-tier byte budget
+    fast_low_water: CacheSize,                 // 90% of fast_capacity — see "Headroom" below
     fast_used: CacheSize,                      // current bytes accounted to the fast tier
     slow_used: CacheSize,
 
@@ -123,12 +124,15 @@ next demotion candidate — and maintains it incrementally using `HashList::befo
   tier (this is also what makes an update-in-place safely converge: there is never a stale copy
   left behind in the other tier, because the old tier's accounting is subtracted before the new
   tier's is added).
-- **Demotion** (`settle_fast_tier`, called after every `insert`/`update`): while `fast_used >
-  fast_capacity`, repeatedly take the key at `fast_boundary`, flip its tier to `Slow`, move
+- **Demotion** (`settle_fast_tier`, called after every `insert`/`update`): triggered only once
+  `fast_used` actually exceeds `fast_capacity` (an early-return guard skips the rest of the
+  function otherwise — no early demotion below the user-configured budget). Once triggered, the
+  drain loop repeatedly takes the key at `fast_boundary`, flips its tier to `Slow`, moves
   `fast_boundary` to whatever key was `before` it in the list (which, by the contiguous-prefix
-  invariant, must still be Fast), and record `(key, Tier::Slow)` in `migrations`. Because this is a
-  `while` loop rather than a single check, one oversized admission or promotion can demote more
-  than one key in a single call — the implementation never assumes "one in, one out."
+  invariant, must still be Fast), and records `(key, Tier::Slow)` in `migrations` — but it drains
+  down to `fast_low_water` (see "Headroom" below), not merely back down to `fast_capacity`. Because
+  this is a `while` loop rather than a single check, one oversized admission or promotion can demote
+  more than one key in a single call — the implementation never assumes "one in, one out."
 - **Promotion** (`update`, called from a `get()` hit): if the accessed key is currently `Slow`,
   move it to the front, flip it to `Fast`, add its size to `fast_used`, record `(key, Tier::Fast)`
   in `migrations`, then immediately run the same `settle_fast_tier` demotion check — a promotion
@@ -141,14 +145,45 @@ next demotion candidate — and maintains it incrementally using `HashList::befo
   refusing — a defensive fallback, not the expected steady state.
 
 `drain_tier_migrations()` hands the accumulated `migrations: Vec<(HashedKey, Tier)>` to the caller
-and clears it; `resize_fast_tier(new_capacity)` updates `fast_capacity` and immediately re-runs
-`settle_fast_tier` (so shrinking the budget at runtime demotes eagerly, not lazily on the next
-access).
+and clears it; `resize_fast_tier(new_capacity)` updates both `fast_capacity` and `fast_low_water`
+and immediately re-runs `settle_fast_tier` (so shrinking the budget at runtime demotes eagerly, not
+lazily on the next access — and growing it correctly widens the headroom too, not just the
+ceiling).
 
 Four new default (no-op) methods were added to the `PolicyStack` trait itself so no other policy
 had to change: `resize_fast_tier`, `drain_tier_migrations`, and four gauge readers
 (`fast_bytes_used`, `slow_bytes_used`, `fast_object_count`, `slow_object_count`) that
 `LruHybridStack` overrides and every other stack ignores.
+
+### Headroom: why the drain target is below the trigger, not equal to it
+
+Draining exactly back down to `fast_capacity` (the original implementation) means the fast tier
+hovers right at the boundary once the working set reaches capacity: almost every subsequent
+`set()` pushes `fast_used` back over `fast_capacity` again, triggering another demotion pass on
+nearly every write. `LruHybridStack` instead keeps a second, derived field,
+`fast_low_water = (fast_capacity as f64 * FAST_TIER_LOW_WATER_RATIO) as CacheSize`, with
+`FAST_TIER_LOW_WATER_RATIO = 0.90` (a fixed internal constant, not part of the public API — there
+is no existing precedent in this crate for a runtime-configurable water-mark ratio; even
+`tiering::manager`'s `TieringConfig::{high,low}_water_mark` are construction-time only). Once a
+demotion pass triggers, it drains all the way down to `fast_low_water` — 10% below the ceiling —
+so the next admission has headroom before it re-triggers.
+
+The *trigger* condition intentionally stays exactly `fast_used > fast_capacity`, not
+`fast_used > fast_low_water`: the user-configured budget should be fully usable before any
+demotion starts. This is a deliberately narrower fix than `tiering::manager`'s high/low water mark
+pair, which needs headroom on *both* ends because its demotion check runs on a 5-second background
+poll (`TIERING_INTERVAL`) — its high-water ceiling has to sit below 100% to avoid overshooting the
+threshold in the gap between polls. `LruHybridStack::settle_fast_tier` runs synchronously inside
+every `insert`/`update` call, so there's no such gap and no overshoot risk; only the drain
+*target* needed a floor.
+
+One consequence worth knowing when picking a `fast_tier_size`: if a single object's size is close
+to (say, within 10% of) `fast_capacity`, triggering a demotion pass can cascade further than
+expected, since even the sole remaining fast-tier object may itself exceed `fast_low_water`. This
+showed up while updating this feature's own tests — see `tests/lru_hybrid_cache_integration.rs`
+and `worker/policy/mod.rs::lru_hybrid_tests`, where a couple of tests had picked a `fast_tier_size`
+sized for "exactly one object plus a byte of slack," which needed widening to "exactly one object
+comfortably under the 90% floor" once this headroom was added.
 
 ## Turning "this key changed tier" into an actual byte move
 
