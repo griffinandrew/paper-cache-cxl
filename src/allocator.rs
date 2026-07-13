@@ -100,9 +100,9 @@ unsafe impl GlobalAlloc for HybridObjects {
         //    println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
 
-        INIT.call_once( || { 
-            HybridObjects::init_and_prewarm(1, 32 * 1024 * 1024 * 1024 )}
-        );
+        //INIT.call_once( || { 
+        //    HybridObjects::init_and_prewarm(1, 32 * 1024 * 1024 * 1024 )}
+        //);
 
 
         let ptr = allocator_bindings::umf_alloc(Self::NODE,layout.size(), layout.align()) as *mut u8;
