@@ -107,6 +107,14 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// (+ 4 bytes for the object size, matching the "+4" charge already
 		// used for TwoQ/Arc/SThreeFifo)
 		PaperPolicy::LfuHybrid => (24 + 48 + 8 + 4) + (24 + 1) + (24 + 4),
+
+		// Worst-case charge for a key resident in main_stack as Fast:
+		// 48-byte HashList entry + 8-byte HashedKey + a 24-byte `queue`
+		// HashMap entry (+1 byte Queue tag, Fifo vs Main) + a 24-byte
+		// `main_tiers` HashMap entry (+1 byte Tier tag, only populated
+		// for keys currently in Main) + a 24-byte `sizes` HashMap entry
+		// (+4 bytes for the object size)
+		PaperPolicy::TwoQHybrid(_) => (48 + 8) + (24 + 1) + (24 + 1) + (24 + 4),
 	}
 }
 

@@ -15,23 +15,23 @@
 //! *frequency* threshold, not a position, so two chains — each queryable for
 //! its own minimum frequency in O(1) — are the natural fit.
 //!
-//! Admission always lands in the fast chain at frequency 1, exactly like
-//! `LruHybridStack`'s "always admit fast, let settle demote if needed"
-//! design — deliberately *not* special-cased to route straight to the slow
-//! tier once the fast tier is full. This still satisfies the paper's
-//! admission rule as an emergent result: once the fast tier is full, a
-//! freshly admitted key is tied for the fast tier's lowest frequency (1),
-//! so `settle_fast_tier` immediately demotes *a* frequency-1 resident in
-//! the same `insert` call — not necessarily the newcomer itself. Ties
-//! within a frequency bucket break toward whichever key is
-//! least-recently-touched (matching plain `LfuStack`'s existing
-//! push-front-on-touch/pop-back-on-evict convention elsewhere in this
-//! crate), so a newcomer pushed to the front of its bucket displaces
-//! whatever frequency-1 key was already there instead of demoting itself.
-//! Either way, the key that ends up slow is, by construction, tied for the
-//! fast tier's lowest frequency — and it keeps `lib.rs`'s `set()` identical
-//! to `lru_hybrid_cache`'s (always synchronously build `TieredBuffer::new_fast`,
-//! no synchronous capacity check needed).
+//! Admission checks fast-tier capacity directly, matching the paper's
+//! admission rule literally: while the fast tier has room, a brand-new key
+//! is admitted there at frequency 1; once `fast_used` would exceed
+//! `fast_capacity`, every new key goes straight to the slow chain instead
+//! — it never touches the fast chain and never displaces an existing fast
+//! resident. (An earlier "always admit fast, let settle demote if needed"
+//! design relied on ties-within-a-frequency-bucket breaking
+//! LRU-within-frequency to decide who gets demoted once the fast tier was
+//! full — but that could demote an *older* resident instead of the
+//! newcomer, which is not what the paper specifies: "every new object is
+//! admitted into the slow tier" means the new object specifically, not
+//! whichever key loses a tie-break.) `lib.rs`'s `set()` still always
+//! synchronously builds `TieredBuffer::new_fast` for a brand-new key
+//! regardless of which tier admission ultimately assigns it — when
+//! admission decides slow, that disagreement is exactly what produces a
+//! `(key, Tier::Slow)` migration, physically corrected by
+//! `PolicyWorker::apply_tier_migrations` the same way a demotion is.
 //!
 //! A slow-tier access (`update`) bumps that key's frequency in the slow
 //! chain; if the new count strictly exceeds the fast chain's current
@@ -263,7 +263,18 @@ pub struct LfuHybridStack {
 	slow_used: CacheSize,
 
 	/// (key, new tier) pairs recorded since the last `drain_tier_migrations`.
+	/// `Tier::Slow` entries here can be either a genuine demotion (via
+	/// `settle_fast_tier`) or a fresh admission routed directly to slow
+	/// (via `insert`, once the fast tier was already full) — both need the
+	/// same physical `Object::set_data` correction, but only the former
+	/// should count toward `demotions`; see `pending_demotions`.
 	migrations: Vec<(HashedKey, Tier)>,
+
+	/// Count of genuine `settle_fast_tier` demotions since the last
+	/// `drain_demotions` — kept separate from `migrations.len()` /
+	/// `Tier::Slow` entries specifically so a fresh admission-to-slow isn't
+	/// miscounted as a demotion (see `drain_demotions`'s trait doc).
+	pending_demotions: u64,
 }
 
 impl LfuHybridStack {
@@ -280,6 +291,7 @@ impl LfuHybridStack {
 			slow_used: 0,
 
 			migrations: Vec::new(),
+			pending_demotions: 0,
 		}
 	}
 
@@ -360,6 +372,7 @@ impl LfuHybridStack {
 			self.slow_used += size;
 
 			self.migrations.push((demote_key, Tier::Slow));
+			self.pending_demotions += 1;
 		}
 	}
 }
@@ -400,15 +413,24 @@ impl PolicyStack for LfuHybridStack {
 			return;
 		}
 
-		// Brand-new key: always admitted into the fast chain at frequency 1
-		// — see the module doc for why this is not special-cased to route
-		// straight to slow once the fast tier is full.
+		// Brand-new key: admitted to the fast chain only while there's
+		// room; once fast-tier capacity is reached, every new key goes
+		// straight to the slow chain instead — see the module doc for why
+		// this is a direct capacity check rather than relying on
+		// tie-breaking within `settle_fast_tier`.
 		self.sizes.insert(key, size);
-		self.fast_chain.insert_new(key);
-		self.tiers.insert(key, Tier::Fast);
-		self.fast_used += size as CacheSize;
 
-		self.settle_fast_tier();
+		if self.fast_used + size as CacheSize <= self.fast_capacity {
+			self.fast_chain.insert_new(key);
+			self.tiers.insert(key, Tier::Fast);
+			self.fast_used += size as CacheSize;
+		} else {
+			self.slow_chain.insert_new(key);
+			self.tiers.insert(key, Tier::Slow);
+			self.slow_used += size as CacheSize;
+
+			self.migrations.push((key, Tier::Slow));
+		}
 	}
 
 	fn update(&mut self, key: HashedKey) {
@@ -454,6 +476,7 @@ impl PolicyStack for LfuHybridStack {
 		self.fast_used = 0;
 		self.slow_used = 0;
 		self.migrations.clear();
+		self.pending_demotions = 0;
 	}
 
 	fn evict_one(&mut self) -> Option<HashedKey> {
@@ -482,6 +505,10 @@ impl PolicyStack for LfuHybridStack {
 
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
+	}
+
+	fn drain_demotions(&mut self) -> u64 {
+		std::mem::take(&mut self.pending_demotions)
 	}
 
 	fn fast_bytes_used(&self) -> CacheSize {
@@ -523,51 +550,55 @@ mod tests {
 	}
 
 	#[test]
-	fn admission_once_fast_is_full_is_demoted_immediately() {
-		// Fast capacity fits exactly one 10-byte key. A freshly admitted
-		// key is always frequency 1 — tied with any existing frequency-1
-		// residents once fast is full. Ties within the same frequency
-		// bucket break toward whichever key is least-recently-touched
-		// within that bucket (matching plain `LfuStack`'s established
-		// convention elsewhere in this crate — push_front on touch,
-		// pop_back on eviction) — so it's key 1 (already resident, now the
-		// LRU of the tied pair), not the newcomer, that demotes. Either
-		// way the demoted key is, by construction, tied for the fast
-		// tier's lowest frequency, matching the paper's admission rule.
+	fn admission_once_fast_is_full_goes_directly_to_slow() {
+		// Fast capacity fits exactly one 10-byte key.
 		let mut stack = LfuHybridStack::new(10);
 
 		stack.insert(1, 10);
 		drain(&mut stack);
 		assert_eq!(stack.tier_of(1), Some(Tier::Fast));
 
+		// Fast tier is now full; the new key is admitted straight to slow
+		// -- key 1 (the existing resident) is untouched, matching the
+		// paper's admission rule literally ("every new object is admitted
+		// into the slow tier", not "whichever key loses a tie-break").
 		stack.insert(2, 10);
 		let migrations = drain(&mut stack);
 
-		assert_eq!(migrations, vec![(1, Tier::Slow)]);
-		assert_eq!(stack.tier_of(1), Some(Tier::Slow));
-		assert_eq!(stack.tier_of(2), Some(Tier::Fast));
+		assert_eq!(migrations, vec![(2, Tier::Slow)]);
+		assert_eq!(stack.tier_of(1), Some(Tier::Fast));
+		assert_eq!(stack.tier_of(2), Some(Tier::Slow));
 	}
 
 	#[test]
-	fn fast_tier_pressure_demotes_the_lowest_frequency_key() {
-		let mut stack = LfuHybridStack::new(25);
+	fn promotion_pressure_demotes_the_lowest_frequency_fast_key() {
+		// Admission alone can never overflow the fast tier under the fixed
+		// capacity check (new keys route around it once full), so demotion
+		// pressure here has to come from a promotion instead.
+		let mut stack = LfuHybridStack::new(20); // fits exactly two 10-byte keys
 
 		stack.insert(1, 10);
 		stack.insert(2, 10);
 		drain(&mut stack);
 
-		// Access key 1 twice more so key 2 is the lowest-frequency fast
-		// resident once a third key is admitted.
-		stack.update(1);
+		// Bump key 1's frequency so key 2 is unambiguously the fast tier's
+		// minimum.
 		stack.update(1);
 		drain(&mut stack);
 
-		stack.insert(3, 10); // pushes fast_used to 30 > 25
+		stack.insert(3, 10); // fast tier full -> admitted directly to slow
+		drain(&mut stack);
+		assert_eq!(stack.tier_of(3), Some(Tier::Slow));
+
+		// Bump key 3 past the fast minimum (key 2, count 1) -> promotes,
+		// which needs to demote key 2 to make room.
+		stack.update(3);
 		let migrations = drain(&mut stack);
 
-		assert_eq!(migrations, vec![(2, Tier::Slow)]);
-		assert_eq!(stack.tier_of(2), Some(Tier::Slow));
+		assert!(migrations.iter().any(|(k, t)| *k == 3 && *t == Tier::Fast));
+		assert!(migrations.iter().any(|(k, t)| *k == 2 && *t == Tier::Slow));
 		assert_eq!(stack.tier_of(1), Some(Tier::Fast));
+		assert_eq!(stack.tier_of(2), Some(Tier::Slow));
 		assert_eq!(stack.tier_of(3), Some(Tier::Fast));
 	}
 
@@ -628,32 +659,29 @@ mod tests {
 
 	#[test]
 	fn promotion_can_cascade_a_demotion() {
-		let mut stack = LfuHybridStack::new(20);
+		let mut stack = LfuHybridStack::new(20); // fits exactly two 10-byte keys
 
 		stack.insert(1, 10);
 		stack.insert(2, 10);
-		stack.insert(3, 10); // demotes lowest-frequency key (1 or 2, tie -> LRU)
+		stack.insert(3, 10); // fast tier full -> admitted directly to slow
 		drain(&mut stack);
 
-		let (slow_key, other_fast_key) = if stack.tier_of(1) == Some(Tier::Slow) {
-			(1, 2)
-		} else {
-			(2, 1)
-		};
+		assert_eq!(stack.tier_of(3), Some(Tier::Slow));
+		assert_eq!(stack.tier_of(1), Some(Tier::Fast));
+		assert_eq!(stack.tier_of(2), Some(Tier::Fast));
 
-		assert_eq!(stack.tier_of(3), Some(Tier::Fast));
-
-		// Bump the slow key past the fast minimum (count 1) so it promotes;
-		// fast is already full (20), so the promotion must demote someone.
-		stack.update(slow_key);
+		// Bump key 3 past the fast minimum (count 1, tied between 1 and 2)
+		// so it promotes; fast is already full, so the promotion must
+		// demote whichever fast key is now the minimum (tie -> LRU).
+		stack.update(3);
 		let migrations = drain(&mut stack);
 
-		assert!(migrations.iter().any(|(k, t)| *k == slow_key && *t == Tier::Fast));
+		assert!(migrations.iter().any(|(k, t)| *k == 3 && *t == Tier::Fast));
 		assert!(migrations.iter().any(|(_, t)| *t == Tier::Slow));
 
-		assert_eq!(stack.tier_of(slow_key), Some(Tier::Fast));
-		// Exactly one of {other_fast_key, 3} should now be slow.
-		let now_slow = [other_fast_key, 3].into_iter()
+		assert_eq!(stack.tier_of(3), Some(Tier::Fast));
+		// Exactly one of {1, 2} should now be slow.
+		let now_slow = [1, 2].into_iter()
 			.filter(|k| stack.tier_of(*k) == Some(Tier::Slow))
 			.count();
 		assert_eq!(now_slow, 1);
@@ -678,12 +706,12 @@ mod tests {
 
 		stack.insert(1, 10);
 		stack.insert(2, 10);
-		stack.insert(3, 10); // demotes one of {1, 2}
+		stack.insert(3, 10); // fast tier full -> key 3 admitted directly to slow
 		drain(&mut stack);
 
-		let slow_key = if stack.tier_of(1) == Some(Tier::Slow) { 1 } else { 2 };
+		assert_eq!(stack.tier_of(3), Some(Tier::Slow));
 
-		assert_eq!(stack.evict_one(), Some(slow_key));
+		assert_eq!(stack.evict_one(), Some(3));
 		assert_eq!(stack.slow_bytes_used(), 0);
 	}
 
@@ -708,20 +736,20 @@ mod tests {
 
 		stack.insert(1, 10);
 		stack.insert(2, 10);
-		stack.insert(3, 10); // demotes one of {1, 2}
+		stack.insert(3, 10); // fast tier full -> key 3 admitted directly to slow
 		drain(&mut stack);
 
-		let slow_key = if stack.tier_of(1) == Some(Tier::Slow) { 1 } else { 2 };
+		assert_eq!(stack.tier_of(3), Some(Tier::Slow));
 
 		stack.resize_fast_tier(1_000); // plenty of headroom now
 		drain(&mut stack);
 
-		stack.update(slow_key); // bump to count 2, exceeds fast_min (1) -> promotes
+		stack.update(3); // bump to count 2, exceeds fast_min (1) -> promotes
 		let migrations = drain(&mut stack);
 
 		// With headroom, promotion should not need to demote anyone else.
-		assert_eq!(migrations, vec![(slow_key, Tier::Fast)]);
-		assert_eq!(stack.tier_of(slow_key), Some(Tier::Fast));
+		assert_eq!(migrations, vec![(3, Tier::Fast)]);
+		assert_eq!(stack.tier_of(3), Some(Tier::Fast));
 	}
 
 	#[test]

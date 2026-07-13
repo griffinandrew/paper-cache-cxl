@@ -16,6 +16,7 @@ mod arc_stack;
 mod s_three_fifo_stack;
 mod lru_hybrid_stack;
 mod lfu_hybrid_stack;
+mod two_q_hybrid_stack;
 
 #[cfg(feature = "eviction_stacks_pmem")] mod pmem_collections;
 
@@ -36,6 +37,7 @@ use crate::{
 		s_three_fifo_stack::SThreeFifoStack,
 		lru_hybrid_stack::LruHybridStack,
 		lfu_hybrid_stack::LfuHybridStack,
+		two_q_hybrid_stack::TwoQHybridStack,
 	},
 };
 
@@ -48,9 +50,10 @@ pub enum AccessOutcome {
 
 /// Which tier an object currently lives in, for policy stacks that track a
 /// segmented (fast/slow) queue. Used by `LruHybridStack`
-/// (`PaperPolicy::LruHybrid`, recency-segmented) and `LfuHybridStack`
-/// (`PaperPolicy::LfuHybrid`, frequency-segmented); every other stack's
-/// default `drain_tier_migrations` never produces one.
+/// (`PaperPolicy::LruHybrid`, recency-segmented), `LfuHybridStack`
+/// (`PaperPolicy::LfuHybrid`, frequency-segmented), and `TwoQHybridStack`
+/// (`PaperPolicy::TwoQHybrid`, 2Q-segmented); every other stack's default
+/// `drain_tier_migrations` never produces one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
 	Fast,
@@ -82,40 +85,76 @@ where
 	fn evict_one(&mut self) -> Option<HashedKey>;
 
 	/// Runtime-adjusts the fast-tier byte budget. No-op for every stack
-	/// except `LruHybridStack`, which shrinking may trigger immediate
+	/// except the hybrid stacks, which shrinking may trigger immediate
 	/// demotions for (see `drain_tier_migrations`).
 	fn resize_fast_tier(&mut self, _size: CacheSize) {}
 
 	/// Drains and returns every (key, new tier) pair that crossed the
-	/// fast/slow boundary since the last call. Only `LruHybridStack` and
-	/// `LfuHybridStack` ever produce entries; every other stack keeps the
-	/// default empty `Vec`. The caller (`PolicyWorker`) is responsible for
-	/// physically migrating each returned key's object bytes to `new_tier`.
+	/// fast/slow boundary since the last call. Only the hybrid stacks
+	/// (`LruHybridStack`, `LfuHybridStack`, `TwoQHybridStack`) ever produce
+	/// entries; every other stack keeps the default empty `Vec`. The caller
+	/// (`PolicyWorker`) is responsible for physically migrating each
+	/// returned key's object bytes to `new_tier`.
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		Vec::new()
 	}
 
 	/// Current bytes accounted to the fast tier. `0` for every stack except
-	/// `LruHybridStack`/`LfuHybridStack`.
+	/// the hybrid stacks.
 	fn fast_bytes_used(&self) -> CacheSize {
 		0
 	}
 
 	/// Current bytes accounted to the slow tier. `0` for every stack except
-	/// `LruHybridStack`/`LfuHybridStack`.
+	/// the hybrid stacks.
 	fn slow_bytes_used(&self) -> CacheSize {
 		0
 	}
 
 	/// Current number of objects in the fast tier. `0` for every stack
-	/// except `LruHybridStack`/`LfuHybridStack`.
+	/// except the hybrid stacks.
 	fn fast_object_count(&self) -> usize {
 		0
 	}
 
 	/// Current number of objects in the slow tier. `0` for every stack
-	/// except `LruHybridStack`/`LfuHybridStack`.
+	/// except the hybrid stacks.
 	fn slow_object_count(&self) -> usize {
+		0
+	}
+
+	/// Returns `true` if this stack has an internal sub-structure over its
+	/// own capacity budget and wants `apply_evictions` to keep calling
+	/// `evict_one()` even though overall `status.used_size()` is still
+	/// within `max_size`. Only `TwoQHybridStack` overrides this (its
+	/// `fifo_queue` has its own `k_in`-derived byte budget, independent of
+	/// — and often much tighter than — the overall cache capacity); every
+	/// other stack keeps the default `false`. Unlike `drain_tier_migrations`,
+	/// which the stack can safely apply to its own bookkeeping in-place, an
+	/// eviction needs the caller to also remove the object from the shared
+	/// object map and adjust `status`, which only `apply_evictions`'s
+	/// `evict_one()` + `erase()` pairing does correctly — a stack must never
+	/// silently drop a key from its own bookkeeping without going through
+	/// that path, or the object map and the stack's view of the world
+	/// desync permanently.
+	fn needs_capacity_eviction(&self) -> bool {
+		false
+	}
+
+	/// Drains and returns the number of genuine demotions (fast-tier objects
+	/// moved to slow due to capacity pressure) recorded since the last call.
+	/// Distinct from `drain_tier_migrations`'s `Tier::Slow` entries: for
+	/// `LfuHybridStack`, a `Tier::Slow` migration can *also* be a fresh
+	/// admission routed directly to slow because the fast tier was already
+	/// full — that still needs the same physical `Object::set_data`
+	/// correction (the object was initially built as `Fast` by the API
+	/// layer), but it isn't a demotion in the paper's sense (no existing
+	/// fast-tier object was displaced). `LruHybridStack`/`TwoQHybridStack`
+	/// never produce that ambiguity (their admission never lands fast
+	/// unconditionally then needs correcting), so they keep the default `0`
+	/// and their callers keep counting every `Tier::Slow` migration as a
+	/// demotion directly.
+	fn drain_demotions(&mut self) -> u64 {
 		0
 	}
 }
@@ -141,5 +180,12 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 
 		// Same default fast-tier budget/override mechanism as `LruHybrid`.
 		PaperPolicy::LfuHybrid => Box::new(LfuHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
+
+		// k_in comes from the policy string itself (same as plain `TwoQ`);
+		// the fast-tier budget still defaults to 20% of max_size, same
+		// override mechanism as the other two hybrids.
+		PaperPolicy::TwoQHybrid(k_in) => Box::new(TwoQHybridStack::new(
+			k_in, max_size, (max_size as f64 * 0.2) as CacheSize,
+		)),
 	}
 }

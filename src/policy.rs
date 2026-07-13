@@ -31,6 +31,7 @@ pub enum PaperPolicy {
 	SThreeFifo(f64),
 	LruHybrid,
 	LfuHybrid,
+	TwoQHybrid(f64),
 }
 
 impl PaperPolicy {
@@ -54,6 +55,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::SThreeFifo(ratio) => write!(f, "s3-fifo-{ratio}"),
 			PaperPolicy::LruHybrid => write!(f, "lru-hybrid"),
 			PaperPolicy::LfuHybrid => write!(f, "lfu-hybrid"),
+			PaperPolicy::TwoQHybrid(k_in) => write!(f, "2q-hybrid-{k_in}"),
 		}
 	}
 }
@@ -70,6 +72,7 @@ impl FromStr for PaperPolicy {
 			"sieve" => PaperPolicy::Sieve,
 			"lru" => PaperPolicy::Lru,
 			"mru" => PaperPolicy::Mru,
+			value if value.starts_with("2q-hybrid-") => parse_two_q_hybrid(value)?,
 			value if value.starts_with("2q-") => parse_two_q(value)?,
 			"arc" => PaperPolicy::Arc,
 			value if value.starts_with("s3-fifo-") => parse_s_three_fifo(value)?,
@@ -138,6 +141,27 @@ fn parse_two_q(value: &str) -> Result<PaperPolicy, CacheError> {
 	Ok(PaperPolicy::TwoQ(k_in, k_out))
 }
 
+fn parse_two_q_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "2q-hybrid-"
+	let tokens = value[10..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(k_in) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&k_in) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::TwoQHybrid(k_in))
+}
+
 fn parse_s_three_fifo(value: &str) -> Result<PaperPolicy, CacheError> {
 	// skip the "s3-fifo-"
 	let tokens = value[8..]
@@ -191,5 +215,26 @@ mod tests {
 			"lfu".parse::<PaperPolicy>().unwrap(),
 			"lfu-hybrid".parse::<PaperPolicy>().unwrap(),
 		);
+	}
+
+	#[test]
+	fn two_q_hybrid_round_trips_through_display_and_from_str() {
+		assert_eq!(PaperPolicy::TwoQHybrid(0.2).to_string(), "2q-hybrid-0.2");
+		assert_eq!("2q-hybrid-0.2".parse::<PaperPolicy>(), Ok(PaperPolicy::TwoQHybrid(0.2)));
+	}
+
+	#[test]
+	fn two_q_hybrid_does_not_collide_with_parameterized_2q() {
+		assert_eq!("2q-0.2-0.2".parse::<PaperPolicy>(), Ok(PaperPolicy::TwoQ(0.2, 0.2)));
+		assert_eq!("2q-hybrid-0.2".parse::<PaperPolicy>(), Ok(PaperPolicy::TwoQHybrid(0.2)));
+		assert_ne!(
+			"2q-0.2-0.2".parse::<PaperPolicy>().unwrap(),
+			"2q-hybrid-0.2".parse::<PaperPolicy>().unwrap(),
+		);
+	}
+
+	#[test]
+	fn two_q_hybrid_rejects_out_of_range_ratio() {
+		assert_eq!("2q-hybrid-1.5".parse::<PaperPolicy>(), Err(CacheError::InvalidPolicy));
 	}
 }

@@ -166,6 +166,19 @@ lru_hybrid_cache = ["key_value_pmem"]
 # Mutually exclusive with `lru_hybrid_cache` above.
 lfu_hybrid_cache = ["key_value_pmem"]
 
+# Single-instance, segmented-2Q hybrid cache: same one-PaperCache<K,
+# TieredBuffer> architecture as `lru_hybrid_cache`/`lfu_hybrid_cache` above,
+# but admission always lands in a one-access FIFO queue entirely in the slow
+# tier (a real, synchronous PMEM write on every set()); only a re-access
+# promotes an object into the fast-tier portion of the main LRU queue — see
+# `two_q_hybrid_cache` module docs
+# (worker/policy/policy_stack/two_q_hybrid_stack.rs has the algorithm). Same
+# dependency reasoning as the other two hybrids: only needs `key_value_pmem`,
+# not `key_pmem_value_pmem`.
+#
+# Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache` above.
+two_q_hybrid_cache = ["key_value_pmem"]
+
 
 
 # Legacy features (deprecated, will be removed)

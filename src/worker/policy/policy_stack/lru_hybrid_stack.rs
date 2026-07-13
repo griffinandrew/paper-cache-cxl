@@ -13,11 +13,11 @@
 //! admission or access moves its key to the front and marks it `Tier::Fast`;
 //! whenever that pushes `fast_used` over `fast_capacity`, the least recently
 //! used fast key (tracked via `fast_boundary`, so no scan is needed) is
-//! demoted — not just until `fast_used` fits again, but down to a lower
-//! `fast_low_water` floor (`FAST_TIER_LOW_WATER_RATIO` of capacity), so the
-//! *next* admission has headroom before it re-triggers another demotion
-//! pass. `evict_one` always pops the absolute LRU tail, which — once any
-//! demotion has occurred — is always in the slow tier.
+//! demoted, draining exactly back down to `fast_capacity` (no headroom below
+//! it — an earlier low-water-floor design was removed because keeping
+//! headroom idle hurt performance for no correctness benefit). `evict_one`
+//! always pops the absolute LRU tail, which — once any demotion has
+//! occurred — is always in the slow tier.
 //!
 //! This stack only tracks *order and tier membership*; it does not move any
 //! bytes itself. `PolicyWorker` drains `drain_tier_migrations` after each
@@ -45,30 +45,12 @@ use crate::{
 // both; in that combination, this stack's *metadata* (not object bytes)
 // simply stays DRAM-resident.
 
-/// Fraction of `fast_capacity` the drain loop empties down to once a
-/// demotion pass has been *triggered*, so the next admission has headroom
-/// before it re-triggers another pass. The trigger itself
-/// (`fast_used > fast_capacity`) is unaffected — `fast_capacity` stays the
-/// full, user-configured budget. Unlike `tiering::manager`'s
-/// `TieringConfig::{high,low}_water_mark` (checked periodically, so its
-/// ceiling also needs headroom to avoid overshoot between polls), this
-/// stack's `settle_fast_tier` runs synchronously on every insert/update, so
-/// only the drain target needs a lower floor.
-const FAST_TIER_LOW_WATER_RATIO: f64 = 0.90;
-
 pub struct LruHybridStack {
 	stack: HashList<HashedKey, NoHasher>,
 	sizes: HashMap<HashedKey, ObjectSize, NoHasher>,
 	tiers: HashMap<HashedKey, Tier, NoHasher>,
 
 	fast_capacity: CacheSize,
-
-	/// Derived from `fast_capacity` via `FAST_TIER_LOW_WATER_RATIO`; the byte
-	/// level `settle_fast_tier`'s drain loop empties down to once triggered.
-	/// Recomputed any time `fast_capacity` changes (`new`, `resize_fast_tier`)
-	/// — never mutated anywhere else.
-	fast_low_water: CacheSize,
-
 	fast_used: CacheSize,
 	slow_used: CacheSize,
 
@@ -96,7 +78,6 @@ impl LruHybridStack {
 			tiers: HashMap::default(),
 
 			fast_capacity,
-			fast_low_water: Self::low_water_for(fast_capacity),
 			fast_used: 0,
 			slow_used: 0,
 			fast_count: 0,
@@ -109,12 +90,6 @@ impl LruHybridStack {
 	/// The configured fast-tier byte budget.
 	pub fn fast_capacity(&self) -> CacheSize {
 		self.fast_capacity
-	}
-
-	/// The byte level `settle_fast_tier` drains down to once a demotion pass
-	/// triggers — `FAST_TIER_LOW_WATER_RATIO` of `fast_capacity`.
-	fn low_water_for(capacity: CacheSize) -> CacheSize {
-		(capacity as f64 * FAST_TIER_LOW_WATER_RATIO) as CacheSize
 	}
 
 	/// Returns the tier the given (currently tracked) key is in, or `None`
@@ -191,18 +166,10 @@ impl LruHybridStack {
 		self.settle_fast_tier();
 	}
 
-	/// Demotes the least-recently-used fast key(s). Triggered exactly when
-	/// `fast_used` exceeds `fast_capacity` (the full, user-configured budget
-	/// — no early triggering); once triggered, drains down to
-	/// `fast_low_water` (below `fast_capacity`) rather than stopping the
-	/// instant it fits, so the *next* admission has headroom before it
-	/// re-triggers a demotion pass.
+	/// Demotes the least-recently-used fast key(s) until `fast_used` fits
+	/// back within `fast_capacity` exactly (no headroom below it).
 	fn settle_fast_tier(&mut self) {
-		if self.fast_used <= self.fast_capacity {
-			return;
-		}
-
-		while self.fast_used > self.fast_low_water {
+		while self.fast_used > self.fast_capacity {
 			let Some(demote_key) = self.fast_boundary else { break };
 
 			let size = self.sizes.get(&demote_key).copied().unwrap_or(0) as CacheSize;
@@ -333,7 +300,6 @@ impl PolicyStack for LruHybridStack {
 
 	fn resize_fast_tier(&mut self, size: CacheSize) {
 		self.fast_capacity = size;
-		self.fast_low_water = Self::low_water_for(size);
 		self.settle_fast_tier();
 	}
 
@@ -543,12 +509,7 @@ mod tests {
 		stack.insert(2, 10);
 		drain(&mut stack);
 
-		// Resize to 15, not 10: with the low-water headroom, resizing to
-		// exactly one remaining key's own size (10) would force a full
-		// drain (low_water(10) = 9 < 10), demoting both keys instead of
-		// just the intended one. 15 gives low_water = 13, comfortably
-		// above the single surviving 10-byte key.
-		stack.resize_fast_tier(15);
+		stack.resize_fast_tier(10);
 		let migrations = drain(&mut stack);
 
 		assert_eq!(migrations, vec![(1, Tier::Slow)]);
@@ -557,8 +518,8 @@ mod tests {
 	}
 
 	#[test]
-	fn headroom_absorbs_a_subsequent_small_admission_without_redemoting() {
-		let mut stack = LruHybridStack::new(100); // low_water = 90
+	fn settle_drains_to_exact_capacity_not_below() {
+		let mut stack = LruHybridStack::new(100);
 
 		for key in 1..=10 {
 			stack.insert(key, 10); // fills to exactly 100 (== capacity, no trigger)
@@ -566,55 +527,14 @@ mod tests {
 		drain(&mut stack);
 		assert_eq!(stack.fast_bytes_used(), 100);
 
-		stack.insert(11, 10); // 110 > 100 -> triggers, drains to <= 90
+		// 110 > 100 -> triggers, drains back to exactly 100 (no low-water
+		// floor below it — an earlier headroom design was removed because
+		// keeping idle headroom hurt performance).
+		stack.insert(11, 10);
 		let migrations = drain(&mut stack);
 
-		assert_eq!(migrations, vec![(1, Tier::Slow), (2, Tier::Slow)]);
-		assert_eq!(stack.fast_bytes_used(), 90);
-
-		// Thanks to the 10-byte headroom just carved out, this admission
-		// only brings fast_used back to 100 (<= capacity), so it does NOT
-		// re-trigger a demotion. Under the old exact-boundary behavior
-		// (drain target == capacity == 100), this same admission would
-		// have landed at 110 and immediately demoted again.
-		stack.insert(12, 10);
-		let migrations = drain(&mut stack);
-
-		assert_eq!(migrations, Vec::new());
+		assert_eq!(migrations, vec![(1, Tier::Slow)]);
 		assert_eq!(stack.fast_bytes_used(), 100);
-		assert_eq!(stack.tier_of(12), Some(Tier::Fast));
-	}
-
-	#[test]
-	fn fast_low_water_is_recomputed_on_every_resize_not_just_shrinks() {
-		let mut stack = LruHybridStack::new(10); // low_water = 9
-
-		stack.insert(1, 10); // fast_used=10 <= 10, no trigger
-		stack.insert(2, 5);  // fast_used=15 > 10 -> demotes key 1 down to <=9: fast_used=5
-		drain(&mut stack);
-		assert_eq!(stack.fast_bytes_used(), 5);
-
-		// Grow the fast tier back up; low_water must become 90 (0.9 * 100),
-		// not stay stale at 9 — otherwise a later admission would keep
-		// draining far below the intended headroom target for the new,
-		// larger capacity.
-		stack.resize_fast_tier(100);
-		drain(&mut stack); // no demotions expected; fast_used(5) <= 100
-
-		for key in 3..=12 {
-			stack.insert(key, 10); // cumulative fast_used: 5 + 10*10 = 105
-		}
-		let migrations = drain(&mut stack);
-
-		// Demotion should have triggered once fast_used exceeded 100 and
-		// drained to the *new* low_water (90) — not toward the stale old
-		// low_water (9), which would over-evict.
-		assert!(!migrations.is_empty());
-		assert!(stack.fast_bytes_used() <= 90);
-		assert!(
-			stack.fast_bytes_used() > 9,
-			"should not have drained toward the stale low_water from before the resize",
-		);
 	}
 
 	#[test]
