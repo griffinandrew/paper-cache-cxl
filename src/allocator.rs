@@ -262,7 +262,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
 
         let ptr = allocator_bindings::umf_alloc(Self::NODE_DRAM,layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
-            println!("DRAMObjects: UMF alloc failed for {} bytes", layout.size());
+            //println!("DRAMObjects: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
         }
 
@@ -276,7 +276,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
         //    println!("DRAMObjects: UMF alloc called {} times", NUM_CALLS_DRAM);
         //}
 
-
+        /*
         #[cfg(debug_assertions)]
         {
             ALL_MEM_ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
@@ -289,6 +289,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
                 NUM_ALLOCS += 1;
             }
         }
+        */
 
         ptr
     }
@@ -296,6 +297,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         allocator_bindings::umf_dealloc(Self::NODE_DRAM, ptr as *mut std::ffi::c_void);
 
+        /*
         #[cfg(debug_assertions)]
         {
             ALL_MEM_ALLOCATED.fetch_sub(layout.size(), Ordering::SeqCst);
@@ -308,6 +310,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
                 NUM_DEALLOCS += 1;
             }
         }
+        */
     }
 }
 
