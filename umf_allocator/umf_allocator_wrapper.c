@@ -66,7 +66,7 @@ int umf_allocator_init(int numa_node) {
 
     // Bind strictly to that NUMA node
     //res = umfOsMemoryProviderParamsSetNumaMode(os_params_arr[numa_node], UMF_NUMA_MODE_BIND);
-    res = umfOsMemoryProviderParamsSetNumaMode(os_params_arr[numa_node], UMF_NUMA_MODE_PREFERRED);
+    res = umfOsMemoryProviderParamsSetNumaMode(os_params_arr[numa_node], UMF_NUMA_MODE_DEFAULT);
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to set NUMA mode (node %d): %d\n", numa_node, res);
         pthread_mutex_unlock(&lifecycle_lock);
