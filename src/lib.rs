@@ -277,7 +277,7 @@ static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 //static GLOBAL: allocator::RegionHybrid = allocator::RegionHybrid;
 
 
-#[cfg(not(feature = "all_dram"))]
+//#[cfg(not(feature = "all_dram"))]
 use std::alloc::{Layout, Allocator}; // Essential imports
 
 
