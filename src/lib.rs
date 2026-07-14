@@ -269,8 +269,15 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 
 //pub mod allocator;
 
+#[cfg(not(feature = "all_dram"))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
+
+
+#[cfg(feature = "all_dram")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 
 
 
