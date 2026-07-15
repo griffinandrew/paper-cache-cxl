@@ -310,6 +310,95 @@ Left in place, not reverted, since it's a clear, measured improvement with no ob
 unlike the `KeepAllMemory` flip and the migration-batching experiment, both tested and reverted
 earlier in this same investigation for producing no benefit.
 
+### Three further jemalloc-tuning experiments — all tested, all made things worse, all reverted
+
+After the pool-backend swap above, the user asked to push the residual ~1.4x–2.1x multiple even
+closer to the configured budget ("the allocated budget should be as closely matched at possibly
+1gb should be at max 1gb"). Three statistical/tuning knobs were tried, each via rebuild + the
+200K-object peak/settled comparison against the jemalloc-pool baseline (3959.0/3983.3 MB,
+ratio ~1.006/1.42x budget) — **all three made real DRAM usage worse, not better**, and were
+reverted:
+
+1. **`umfJemallocPoolParamsSetNumArenas(jemalloc_params, 2)`** (down from the default,
+   `num_cpus * 4`): 1.91x budget vs. the default's 1.42x. Hypothesis was fewer arenas → less
+   per-arena retained overhead; actual effect was the opposite — fewer arenas means more threads
+   contend for the same arena, and the resulting cross-thread allocation-pattern fragmentation
+   cost more than the per-arena footprint saved. Reverted (comment-only diff documenting the
+   result in `umf_allocator_wrapper.c`, no `SetNumArenas` call — left at the default).
+2. **`MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0`** (immediate page release instead of the
+   ~10s default decay): worse. Tested via shell env var only, never committed to source (nothing
+   to revert in-tree).
+3. **`MALLOC_CONF=background_thread:true`**: worse. Same as above — env-var-only test, no source
+   change.
+
+Conclusion: jemalloc's plain defaults (as already landed in the pool-backend swap) are the best
+configuration found via statistical/tuning-based approaches. Further improvement requires a
+structural mechanism, not a tuning knob — see the next section.
+
+### Next direction (in progress): a genuine structural hard cap on the global `DRAMObjects` allocator
+
+The user asked directly: "can u somehow set the jemalloc memory size to be some hard limit?" —
+i.e. a structural ceiling rather than a statistical tendency. Two scopes were possible: cap only a
+narrow, dedicated fast-tier-value allocator, or cap `DRAMObjects` itself (the crate's
+`#[global_allocator]`, backing essentially all Rust heap allocation process-wide, not just cache
+values). The user explicitly chose the broader scope: **"i think it should cap the global dram
+allocaotr.... since that is what would really reflect a given fast tier budget."** This is the
+active, in-progress direction — not yet landed.
+
+Mechanism: this repo already has an unused, previously-written `umf_allocator/
+jemalloc_extent_hooks.c` (not currently compiled into the build — see the large commented-out
+block in `build.rs`, ~lines 121–247, which shows how it was previously intended to link against
+system jemalloc directly). It implements a `tier_t`-based custom jemalloc arena whose
+`extent_hooks_t::extent_alloc` bump-allocates from a fixed-size, `mmap(MAP_NORESERVE)`-reserved,
+`mbind(MPOL_BIND)`-pinned region and returns `NULL` once a configured `region_cap` is exceeded —
+a genuine structural ceiling (not a statistical tendency), while individual allocations within
+that region still get jemalloc's normal internal reuse machinery. `extent_dalloc`/`extent_destroy`/
+`extent_decommit`/`extent_purge_*` all refuse to release, so the region is bump/retain at the
+extent level only — this is intentional and fine for a hard-capped tier.
+
+Feasibility check completed: confirmed the system's `/usr/lib64/libjemalloc.so.2` (unprefixed
+`mallctl`, not `je_mallctl` — confirmed via `nm -D`) can be linked directly *alongside* `libumf.so`
+(which bundles its own, separate, statically-linked jemalloc used by the working
+`umfJemallocPoolOps()` pool from the fix above) without symbol collisions — a minimal smoke test
+(`mallctl("opt.narenas", ...)` + `mallocx`/`dallocx` against the system jemalloc, linked
+`-lumf -ljemalloc`) ran cleanly (`rc=0 narenas=32`, valid pointer from `mallocx`) with both
+libraries loaded in the same process. So the two jemalloc instances can coexist: `HybridObjects`
+(node 1/PMEM) keeps using the already-fixed, already-tested UMF jemalloc pool; `DRAMObjects`
+(node 0/DRAM, the global allocator) would be the only one switched to the extent-hooks hard-cap
+arena.
+
+Known wiring gaps still to resolve before this compiles/links, not yet started at the code-editing
+level:
+- `jemalloc_extent_hooks.c`'s function names (`umf_allocator_init`, `umf_alloc`, `umf_dealloc`,
+  `check_tier`) collide with the existing, working UMF-pool-based functions of the same names in
+  `umf_allocator_wrapper.c` — both files can't be compiled into the same binary unimodified since
+  both nodes currently dispatch through those exact shared symbols. Needs either renaming +
+  dispatch-by-`numa_node` inside the existing wrapper, or a `numa_node == 0` branch added directly
+  to `umf_allocator_wrapper.c`'s existing functions that calls into the extent-hooks path instead
+  of the UMF pool path for that node only.
+- Signature mismatch: `jemalloc_extent_hooks.c`'s `umf_dealloc(void *ptr)` takes one argument (does
+  its own internal `tier_of_ptr()` lookup); the Rust side (`src/umf_allocator_bindings.rs`) expects
+  `umf_dealloc(numa_node: i32, ptr: *mut c_void)`. Needs reconciling either by having the C side
+  accept and ignore/use the extra argument, or wrapping it.
+- `jemalloc_extent_hooks.c`'s back-compat shim `umf_allocator_init(numa_node)` hardcodes
+  `tier_id = 0` always (`umf_tier_init(0, numa_node, 0)`) — a latent bug if ever used for two tiers
+  simultaneously, but not actually a problem for the chosen scope (only node 0/DRAM will ever use
+  this path).
+- Region size can't come from a normal Rust function parameter: `DRAMObjects::INIT.call_once`
+  fires on the process's *first-ever* heap allocation — before any `PaperCache::new()` call, before
+  any `fast_tier_size` is known. Current plan is an environment variable
+  (e.g. `PAPER_CACHE_DRAM_CAP_BYTES`) read once at that lazy-init point; this ordering constraint
+  needs to be documented clearly for the user once landed, since it means the hard cap can't simply
+  be threaded through as a constructor argument the way `fast_tier_size` itself is.
+- `build.rs` needs the (currently fully dead/commented) system-jemalloc linking + header include
+  path revived and adapted — the existing dead block's `detect_jemalloc_prefix` helper is likely
+  unnecessary in this sandbox (confirmed unprefixed) but should probably be kept for portability
+  since it's already written and tested logic.
+
+Not yet done: the actual C-level merge, the `build.rs` changes, region-size wiring, or end-to-end
+testing (peak/settled/decayed at multiple scales, confirming node0 genuinely never exceeds the
+cap, and confirming graceful non-corrupting behavior when the cap is actually hit under load).
+
 ## Feature: `lru_hybrid_cache` (steps 1–10 implemented; see status below)
 
 ### Source (paper description this implements)

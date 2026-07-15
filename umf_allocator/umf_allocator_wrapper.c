@@ -102,6 +102,15 @@ int umf_allocator_init(int numa_node) {
         return 5;
     }
 
+    // Tested reducing NumArenas from the default (num CPU cores * 4) down to
+    // 2, hypothesizing fewer arenas would mean less per-arena retained
+    // overhead: made things *worse* (200K-object scale: 1.91x budget vs.
+    // 1.42x at the default arena count) -- fewer arenas means more threads
+    // contend for the same arena, which apparently costs more in
+    // cross-thread allocation-pattern fragmentation than it saves in
+    // per-arena footprint. Left at the default (no explicit SetNumArenas
+    // call).
+
     // Create pool into a local first; only publish once fully constructed.
     res = umfPoolCreate(
             umfJemallocPoolOps(),
