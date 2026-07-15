@@ -619,24 +619,32 @@ where
 		let Some(stack) = &mut self.policy_stack else { return };
 		let migrations = stack.drain_tier_migrations();
 
-		if migrations.is_empty() {
-			return;
-		}
+		if !migrations.is_empty() {
+			if let Some(migrate) = &self.tier_migration_fn {
+				for (key, tier) in migrations {
+					if let Some(mut object) = self.objects.get_mut(&key) {
+						let new_data = migrate(&object.data(), tier);
+						object.set_data(new_data);
+					}
 
-		let Some(migrate) = &self.tier_migration_fn else { return };
-
-		for (key, tier) in migrations {
-			if let Some(mut object) = self.objects.get_mut(&key) {
-				let new_data = migrate(&object.data(), tier);
-				object.set_data(new_data);
-			}
-
-			match tier {
-				Tier::Fast => self.status.record_lru_hybrid_promotion(),
-				Tier::Slow => self.status.record_lru_hybrid_demotion(),
+					match tier {
+						Tier::Fast => self.status.record_lru_hybrid_promotion(),
+						Tier::Slow => self.status.record_lru_hybrid_demotion(),
+					}
+				}
 			}
 		}
 
+		// Refreshed unconditionally (not gated on `migrations` being
+		// non-empty): this runs once per event now, so it's cheap, and
+		// gating it on "a migration just happened" left `lru_hybrid_stats`'s
+		// `fast_objects`/`slow_objects`/`fast_bytes_used`/`slow_bytes_used`
+		// able to go stale and never catch up to the stack's true state --
+		// e.g. the tail of a large insert burst that happens to land without
+		// triggering one further demotion left these gauges permanently
+		// short of the real tracked count, discovered while diagnosing a
+		// reported DRAM-usage gap (the gauges themselves turned out fine;
+		// only their refresh cadence was wrong).
 		if let Some(stack) = &self.policy_stack {
 			self.status.set_lru_hybrid_gauges(
 				stack.fast_bytes_used(),
@@ -676,27 +684,28 @@ where
 
 		let migrations = stack.drain_tier_migrations();
 
-		if migrations.is_empty() {
-			return;
-		}
+		if !migrations.is_empty() {
+			if let Some(migrate) = &self.tier_migration_fn {
+				for (key, tier) in migrations {
+					if let Some(mut object) = self.objects.get_mut(&key) {
+						let new_data = migrate(&object.data(), tier);
+						object.set_data(new_data);
+					}
 
-		let Some(migrate) = &self.tier_migration_fn else { return };
-
-		for (key, tier) in migrations {
-			if let Some(mut object) = self.objects.get_mut(&key) {
-				let new_data = migrate(&object.data(), tier);
-				object.set_data(new_data);
+					if tier == Tier::Fast {
+						self.status.record_lfu_hybrid_promotion();
+					}
+				}
 			}
 
-			if tier == Tier::Fast {
-				self.status.record_lfu_hybrid_promotion();
-			}
-		}
-
-		if let Some(stack) = &mut self.policy_stack {
 			let demotions = stack.drain_demotions();
 			self.status.record_lfu_hybrid_demotions(demotions);
+		}
 
+		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
+		// comment on this same pattern for why gating it on `migrations`
+		// being non-empty let these gauges go stale and never catch up.
+		if let Some(stack) = &self.policy_stack {
 			self.status.set_lfu_hybrid_gauges(
 				stack.fast_bytes_used(),
 				stack.slow_bytes_used(),
@@ -714,24 +723,25 @@ where
 		let Some(stack) = &mut self.policy_stack else { return };
 		let migrations = stack.drain_tier_migrations();
 
-		if migrations.is_empty() {
-			return;
-		}
+		if !migrations.is_empty() {
+			if let Some(migrate) = &self.tier_migration_fn {
+				for (key, tier) in migrations {
+					if let Some(mut object) = self.objects.get_mut(&key) {
+						let new_data = migrate(&object.data(), tier);
+						object.set_data(new_data);
+					}
 
-		let Some(migrate) = &self.tier_migration_fn else { return };
-
-		for (key, tier) in migrations {
-			if let Some(mut object) = self.objects.get_mut(&key) {
-				let new_data = migrate(&object.data(), tier);
-				object.set_data(new_data);
-			}
-
-			match tier {
-				Tier::Fast => self.status.record_two_q_hybrid_promotion(),
-				Tier::Slow => self.status.record_two_q_hybrid_demotion(),
+					match tier {
+						Tier::Fast => self.status.record_two_q_hybrid_promotion(),
+						Tier::Slow => self.status.record_two_q_hybrid_demotion(),
+					}
+				}
 			}
 		}
 
+		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
+		// comment on this same pattern for why gating it on `migrations`
+		// being non-empty let these gauges go stale and never catch up.
 		if let Some(stack) = &self.policy_stack {
 			self.status.set_two_q_hybrid_gauges(
 				stack.fast_bytes_used(),

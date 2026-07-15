@@ -69,6 +69,14 @@ impl HybridObjects {
         //#[cfg(debug_assertions)]
         //println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
+
+        // Prewarm disabled: this unconditionally touched a hardcoded 18 GiB
+        // (ignoring the `prewarm_bytes` argument entirely -- every call site
+        // passes a different intended size, e.g. 32 GiB here, confirming this
+        // was dead/stale rather than intentional), regardless of the actual
+        // configured cache size. Real memory usage should track
+        // `max_size`/`fast_tier_size`, not a large fixed prewarm.
+        /*
         let bytes = 18 * 1024 * 1024 * 1024;
         let chunk = 2 * 1024 * 1024usize;
         let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes, chunk) };
@@ -82,6 +90,7 @@ impl HybridObjects {
         if rc != 0 {
             eprintln!("UMF prewarm returned {}", rc);
         }
+        */
     }
     const NODE: i32 = 1;
 }
@@ -218,6 +227,14 @@ impl DRAMObjects {
         //#[cfg(debug_assertions)]
         //println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
+
+        // Prewarm disabled: this unconditionally touched a hardcoded 18 GiB
+        // (ignoring the `prewarm_bytes` argument entirely -- the call site
+        // passes 30 GiB, confirming this was dead/stale rather than
+        // intentional), regardless of the actual configured cache size. Real
+        // memory usage should track `max_size`/`fast_tier_size`, not a large
+        // fixed prewarm.
+        /*
         let bytes = 18 * 1024 * 1024 * 1024;
         let chunk = 2 * 1024 * 1024usize;
         let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes, chunk) };
@@ -231,6 +248,7 @@ impl DRAMObjects {
         if rc != 0 {
             eprintln!("UMF prewarm returned {}", rc);
         }
+        */
     }
     const NODE_DRAM: i32 = 0;
 }
@@ -371,6 +389,14 @@ impl ValueDRAM {
         //println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);
         //});
 
+        // Prewarm disabled: this unconditionally touched a hardcoded 18 GiB
+        // (ignoring the `prewarm_bytes` argument entirely), regardless of the
+        // actual configured cache size. Already dead in practice (every call
+        // site invoking `ValueDRAM::init_and_prewarm` is itself commented
+        // out), but neutered here too for consistency should it be
+        // reactivated. Real memory usage should track `max_size`/
+        // `fast_tier_size`, not a large fixed prewarm.
+        /*
         let bytes = 18 * 1024 * 1024 * 1024;
         let chunk = 2 * 1024 * 1024usize;
         let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes, chunk) };
@@ -384,6 +410,7 @@ impl ValueDRAM {
         if rc != 0 {
             eprintln!("UMF prewarm returned {}", rc);
         }
+        */
     }
     const VALUE_DRAM_NODE: i32 = 2;
 }

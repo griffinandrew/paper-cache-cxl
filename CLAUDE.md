@@ -143,6 +143,87 @@ is comparing storage-placement strategies. Key points relevant to new work:
 `BufferDRAM = Box<[u8]>` and `BufferPMEM = Box<[u8], Hybrid>` (see `lib.rs`) are the two value
 types the hybrid caches wrap `PaperCache<K, _>` around.
 
+## Investigation: real DRAM usage vs. `fast_tier_size` — two confirmed bugs, one open hypothesis
+
+Reported by the user: with `lru_hybrid_cache`, `fast_tier_size = 1 GB`, real DRAM usage (measured
+via `/proc/<pid>/numa_maps`, node0) ran to several GB, and their benchmark harness had no easy way
+to print `lru_hybrid_stats()` for cross-checking. Rather than continue guessing from code review,
+reproduced the reported workload (~1M objects, ~16 KB average, moderate/single-threaded/steady
+insertion rate) directly inside this crate as a real, `#[ignore]`d integration test —
+`tests/lru_hybrid_cache_integration.rs::repro_real_dram_usage_at_scale` — measuring real
+`/proc/self/numa_maps` from the test process itself (`read_own_numa_usage_mb()`), rather than
+relying on the cache's own self-reported stats to explain a discrepancy in those same stats. Run
+with `cargo +nightly test --release --test lru_hybrid_cache_integration --features
+lru_hybrid_cache repro_real_dram_usage_at_scale -- --ignored --nocapture` (several minutes; real
+PMEM migrations for ~90%+ of a million objects).
+
+**Bug 1 (confirmed, fixed): allocator prewarm ignores its own size parameter and hardcodes 18 GiB,
+twice, per node, unconditionally.** `HybridObjects::init_and_prewarm`, `DRAMObjects::
+init_and_prewarm`, and `ValueDRAM::init_and_prewarm` (`src/allocator.rs`) each accept a
+`prewarm_bytes: usize` parameter — and every call site passes a different, clearly-intentional
+value (32 GiB, 30 GiB, 35 GiB respectively) — but the function *bodies* never read that parameter,
+instead hardcoding `18 * 1024 * 1024 * 1024` twice (once at 2 MB chunk granularity, once at 4 KB)
+regardless of what's passed in. Confirmed directly: the reproduction's startup log showed `touched
+9216 chunks x 2097152 bytes = 18432 MiB` and `touched 4718592 chunks x 4096 bytes = 18432 MiB` on
+*both* NUMA nodes, before a single cache object was inserted — a large, fixed, config-independent
+memory cost baked into the very first heap allocation of the process. This alone accounted for
+roughly 18–24 GB per node in the reproduction (node0 dropped 37.3 GB → 12.9 GB after the fix).
+Fixed per the user's explicit direction: commented out the prewarm body in all three
+`init_and_prewarm` impls (`umf_allocator_init` itself — actual pool setup — is untouched; only the
+prewarm/pre-fault step is disabled). `DAXPMEM::init_and_prewarm` has no prewarm call to begin with
+(unaffected); the dead, fully-commented-out second `HybridObjects`/`UnifiedAllocator` impl block
+further down the file (already inert, would be a duplicate-definition compile error if live) was
+left alone.
+
+**Bug 2 (confirmed, fixed): `lru_hybrid_stats`/`lfu_hybrid_stats`/`two_q_hybrid_stats`'
+`fast_objects`/`slow_objects`/`fast_bytes_used`/`slow_bytes_used` gauges could go stale and never
+catch up to the stack's true state.** All three `PolicyWorker::apply_tier_migrations` siblings
+(`src/worker/policy/mod.rs`) refreshed these gauges only *after* an `if migrations.is_empty() {
+return; }` early exit — meaning any Set/Get event that didn't itself trigger a fast/slow migration
+left the gauges exactly as they were, even though the stack's own internal state had genuinely
+advanced (a new key admitted with room to spare, an access that didn't cross the fast/slow
+boundary, etc.). Caught because the reproduction's `wait_until(fast_objects + slow_objects ==
+num_objects)` completion check *never* became true even after 10 minutes with the worker
+provably idle (confirmed via `gdb -p <pid> -batch -ex "thread apply all bt"` on the stalled
+process: the real `PolicyWorker<u64, TieredBuffer>` thread was parked in a normal sleep inside its
+own polling loop, channel empty — not deadlocked, not crashed, just never having refreshed its
+last few gauge updates). Fixed by restructuring all three `apply_tier_migrations` methods so the
+gauge-refresh block runs unconditionally on every call, independent of whether that call's
+`migrations` was empty — cheap now that this method already runs once per event (see
+`lru_hybrid_cache`'s "burst-write headroom" post-implementation-fix section above) rather than
+once per batch. The physical-migration loop and promotion/demotion counters stay correctly gated
+on `!migrations.is_empty()` (nothing to physically move or count otherwise); only the gauge
+refresh moved outside that gate. Re-running the reproduction after this fix showed genuine,
+verifiable full settlement (`fast_objects + slow_objects == num_objects` exactly) within ~25
+seconds for 1M objects — the "stall" was purely a stats-reporting artifact, not a real backlog or
+hang. (A secondary, previously-unexplained SIGSEGV-on-process-exit that had appeared in every
+earlier reproduction run also stopped reproducing once tests reached genuine full settlement
+before the `PaperCache` — and its worker threads — dropped; plausibly a robustness gap in dropping
+a cache in the middle of an in-flight migration backlog, not investigated further since it stopped
+occurring once settlement was reliable.)
+
+**Open hypothesis (not fixed, needs a decision): even with both bugs fixed and settlement
+genuinely verified, real DRAM usage still ran ~13–14x over the configured fast-tier budget** (node0
+≈ 13.2 GB real vs. a 953.7 MB configured `CacheTierSize::Gb(1)` budget — note `Gb` is decimal SI,
+10^9 bytes, ~7% smaller than a binary GiB; the stack's own `fast_bytes_used` correctly stayed under
+budget throughout, ~848 MB). Traced the allocator chain (`umf_allocator_wrapper.c`): `umf_dealloc`
+calls `umfPoolFree()` — a pool-level free that returns memory to the UMF pool for reuse, not to the
+OS/kernel. This is standard behavior for pool/arena allocators (comparable to glibc malloc or
+jemalloc not immediately shrinking RSS after `free()`), and is consistent with every observation:
+during the insertion burst, every new `set()` call synchronously builds `TieredBuffer::new_fast`
+(a real DRAM allocation) *before* the worker thread has decided whether that object should
+ultimately be fast or slow — so a real, transient population of allocations (large relative to the
+1M-object, ~90%-eventually-demoted workload) briefly exists in DRAM during the burst, before being
+freed back to the pool as demotions catch up. If the pool's underlying OS-level mapping never
+shrinks back down after that peak, `/proc/<pid>/numa_maps` (which reports resident pages, not
+"currently live" bytes) would report something close to that historical peak indefinitely,
+matching the observed gap in order of magnitude. **Not yet confirmed** — would need either a
+targeted smaller-scale comparison (does real DRAM scale with peak burst size rather than final
+tier-size) or inspecting UMF's pool/provider configuration directly to be certain, and doing so
+touches vendored C code (`umf_allocator/`) rather than this crate's own Rust logic. Flagged for the
+user to decide whether it's worth pursuing further now that the two clearer, fixable bugs are
+resolved.
+
 ## Feature: `lru_hybrid_cache` (steps 1–10 implemented; see status below)
 
 ### Source (paper description this implements)

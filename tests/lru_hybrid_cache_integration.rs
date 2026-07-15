@@ -507,4 +507,149 @@ mod lru_hybrid_cache_tests {
         assert_eq!(cache.tier_of(&1u32), None);
         assert_eq!(cache.tier_of(&2u32), None);
     }
+
+    // ── large-scale real-DRAM reproduction (manual, not part of the default
+    //    suite -- run explicitly with --ignored; see doc comment below) ────
+
+    /// Sums the `N0=`/`N1=` fields (page counts) across every mapped region in
+    /// `/proc/self/numa_maps`, converting 4 KiB pages to MB -- the same
+    /// aggregation the reported `numa_maps` `awk` one-liner performs against
+    /// an external process, just done in-process against this test's own PID.
+    fn read_own_numa_usage_mb() -> (f64, f64) {
+        let contents = std::fs::read_to_string("/proc/self/numa_maps")
+            .expect("should be able to read /proc/self/numa_maps");
+
+        let mut n0_pages: u64 = 0;
+        let mut n1_pages: u64 = 0;
+
+        for line in contents.lines() {
+            for field in line.split_whitespace() {
+                if let Some(value) = field.strip_prefix("N0=") {
+                    n0_pages += value.parse::<u64>().unwrap_or(0);
+                } else if let Some(value) = field.strip_prefix("N1=") {
+                    n1_pages += value.parse::<u64>().unwrap_or(0);
+                }
+            }
+        }
+
+        // 4 KiB pages -> MB
+        (n0_pages as f64 * 4.0 / 1024.0, n1_pages as f64 * 4.0 / 1024.0)
+    }
+
+    /// Reproduces the reported scenario directly, in-process, without relying
+    /// on any external benchmark: a 1 GB fast tier, ~1M objects averaging
+    /// ~16 KB, inserted sequentially (single-threaded, no artificial burst),
+    /// then real `/proc/self/numa_maps` is read from *this* process to see
+    /// whether node0 (DRAM) usage tracks the configured fast-tier budget or
+    /// balloons past it, cross-checked against `lru_hybrid_stats()` at the
+    /// same moment to localize any gap to (a) the stack's own bookkeeping
+    /// vs. (b) something outside it.
+    ///
+    /// Not part of the default suite (`#[ignore]` -- this allocates ~16 GB of
+    /// real value bytes and takes several minutes for ~935K real PMEM
+    /// migrations). Run explicitly:
+    ///   cargo +nightly test --release --test lru_hybrid_cache_integration \
+    ///     --features lru_hybrid_cache repro_real_dram_usage_at_scale \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn repro_real_dram_usage_at_scale() {
+        ensure_pmem_allocator_warm();
+
+        const OBJECT_COUNT: u64 = 1_000_000;
+        const VALUE_LEN: usize = 16 * 1024; // 16 KB
+        const FAST_TIER_GB: u64 = 1;
+        const MAX_SIZE_GB: u64 = 24; // comfortably over ~16 GB of raw value bytes
+
+        let cache = PaperCache::<u64, TieredBuffer>::new(
+            MAX_SIZE_GB * 1_073_741_824,
+            CacheTierSize::Gb(FAST_TIER_GB),
+        ).expect("cache should construct");
+
+        // `CacheTierSize::Gb` is decimal SI (10^9 bytes), documented in
+        // `size.rs` -- not binary GiB (2^30). Confirmed via this test: an
+        // earlier version of this assertion expected the binary value and
+        // failed, catching a real (if minor, ~7%) unit gotcha worth knowing
+        // about, distinct from the much larger gap under investigation here.
+        assert_eq!(cache.fast_tier_size(), FAST_TIER_GB * 1_000_000_000);
+
+        let start = std::time::Instant::now();
+
+        for key in 0..OBJECT_COUNT {
+            // Non-zero, non-uniform payload so real distinct pages get
+            // touched (avoids any zero-page-adjacent artifact skewing RSS).
+            let value = vec![(key % 256) as u8; VALUE_LEN];
+            cache.set(key, &value, None).expect("set should succeed");
+
+            if key > 0 && key % 200_000 == 0 {
+                println!("... {key} objects set ({:?} elapsed)", start.elapsed());
+            }
+        }
+
+        println!("all {OBJECT_COUNT} objects set in {:?}; waiting for the worker to settle", start.elapsed());
+
+        // `fast_bytes_used <= fast_tier_size` alone is *not* a reliable
+        // "worker has fully caught up" signal: it can already be satisfied
+        // while a large backlog of Set events the worker hasn't even reached
+        // yet is still sitting in the channel (each one already physically
+        // DRAM-resident, built synchronously by `set()`, but invisible to
+        // the stack -- and therefore to this gauge -- until processed). Wait
+        // for the stack's own tracked count to actually reach every inserted
+        // object before trusting any downstream measurement.
+        let settle_start = std::time::Instant::now();
+        let mut last_print = std::time::Instant::now();
+
+        let settled = wait_until(std::time::Duration::from_secs(600), || {
+            let stats = cache.lru_hybrid_stats();
+            let status = cache.status().expect("status should be available");
+            let processed = stats.fast_objects + stats.slow_objects;
+
+            if last_print.elapsed() >= std::time::Duration::from_secs(5) {
+                let elapsed = settle_start.elapsed().as_secs_f64();
+                let rate = processed as f64 / elapsed.max(0.001);
+                println!(
+                    "... worker processed {processed}/{} ({:?} since insert loop finished, {rate:.0} objects/sec)",
+                    status.num_objects(), settle_start.elapsed(),
+                );
+                last_print = std::time::Instant::now();
+            }
+
+            processed == status.num_objects() && stats.fast_bytes_used <= cache.fast_tier_size()
+        });
+        assert!(settled, "the stack should have processed every inserted object within 10 minutes");
+
+        // Extra settle time: even once the stack has assigned every object a
+        // tier, the *physical* PMEM migration for the very last few of them
+        // may still be in flight inside `apply_tier_migrations` -- give it a
+        // further moment before measuring real memory.
+        std::thread::sleep(std::time::Duration::from_secs(5));
+
+        let stats = cache.lru_hybrid_stats();
+        let status = cache.status().expect("status should be available");
+        let (node0_mb, node1_mb) = read_own_numa_usage_mb();
+
+        println!("=== lru_hybrid_stats ===");
+        println!(
+            "fast_objects={} slow_objects={} fast_bytes_used={} slow_bytes_used={} promotions={} demotions={} evictions={}",
+            stats.fast_objects, stats.slow_objects, stats.fast_bytes_used, stats.slow_bytes_used,
+            stats.promotions, stats.demotions, stats.evictions,
+        );
+        println!("=== status ===");
+        println!(
+            "max_size={} used_size={} num_objects={} configured_fast_tier_size={}",
+            status.max_size(), status.used_size(), status.num_objects(), cache.fast_tier_size(),
+        );
+        println!("=== real /proc/self/numa_maps (this process) ===");
+        println!(
+            "node0={node0_mb:.1} MB  node1={node1_mb:.1} MB  total={:.1} MB",
+            node0_mb + node1_mb,
+        );
+
+        let fast_tier_mb = cache.fast_tier_size() as f64 / 1_048_576.0;
+        println!(
+            "configured fast tier = {fast_tier_mb:.1} MB; real node0 (DRAM) = {node0_mb:.1} MB \
+             ({:.2}x)",
+            node0_mb / fast_tier_mb,
+        );
+    }
 }
