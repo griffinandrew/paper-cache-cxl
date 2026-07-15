@@ -77,6 +77,19 @@ mod lru_hybrid_cache_tests {
 
     const MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+    // The fast-tier budget now also reserves an approximate per-object DRAM
+    // cost for the shared object hashtable + eviction stacks (tens of bytes per
+    // object — see `object/overhead.rs::get_hybrid_dram_shared_overhead`). To
+    // keep the byte-sized fast-tier budgets below behaving intuitively
+    // (~value-sized) rather than being dominated by that reservation, the
+    // demotion/promotion tests use ~1 KB values, so the per-object reservation
+    // is a small fraction and the fast-tier sizes have a wide, robust margin.
+    const VALUE_LEN: usize = 1024;
+
+    fn value(seed: u8) -> Vec<u8> {
+        vec![seed; VALUE_LEN]
+    }
+
     // ── admission ─────────────────────────────────────────────────────────
 
     #[test]
@@ -101,17 +114,18 @@ mod lru_hybrid_cache_tests {
     fn fast_tier_pressure_demotes_lru_tail_with_real_data_movement() {
         ensure_pmem_allocator_warm();
 
-        // A tiny fast tier relative to two ~15-byte values guarantees the
-        // first key demotes once the second is admitted.
+        // A fast tier sized to hold ~1 of these ~1 KB values (after the
+        // per-object shared-metadata reservation) guarantees the first key
+        // demotes once the second is admitted.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(40),
+            CacheTierSize::Bytes(1_600),
         ).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
 
         let demoted = wait_until(MIGRATION_TIMEOUT, || {
             cache.tier_of(&1u32) == Some(Tier::Slow)
@@ -125,7 +139,7 @@ mod lru_hybrid_cache_tests {
         assert_ne!(cache.tier_of(&1u32), Some(Tier::Fast));
 
         // Value survives the physical move intact.
-        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
+        assert_eq!(cache.get(&1u32).unwrap(), value(0xA1));
 
         let stats = cache.lru_hybrid_stats();
         assert!(stats.demotions >= 1);
@@ -139,11 +153,11 @@ mod lru_hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(40),
+            CacheTierSize::Bytes(1_600),
         ).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
+        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
 
         let demoted = wait_until(MIGRATION_TIMEOUT, || {
             cache.tier_of(&1u32) == Some(Tier::Slow)
@@ -151,7 +165,7 @@ mod lru_hybrid_cache_tests {
         assert!(demoted, "key 1 should have demoted to the slow tier");
 
         // Accessing the slow-tier key should promote it back to fast.
-        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
+        assert_eq!(cache.get(&1u32).unwrap(), value(0xA1));
 
         let promoted = wait_until(MIGRATION_TIMEOUT, || {
             cache.tier_of(&1u32) == Some(Tier::Fast)
@@ -176,14 +190,14 @@ mod lru_hybrid_cache_tests {
         // loop), not just the common one-in-one-out case.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(40),
+            CacheTierSize::Bytes(1_600),
         ).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
+        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
 
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
-        assert_eq!(cache.tier_of(&2u32), Some(Tier::Fast));
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&2u32) == Some(Tier::Fast)));
 
         // Promote key 1 back — key 2 should now be the one under pressure.
         cache.get(&1u32).expect("get should succeed");
@@ -192,8 +206,8 @@ mod lru_hybrid_cache_tests {
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&2u32) == Some(Tier::Slow)));
 
         // Both values remain intact and reachable regardless of tier.
-        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
-        assert_eq!(cache.get(&2u32).unwrap(), b"second value 45");
+        assert_eq!(cache.get(&1u32).unwrap(), value(0xA1));
+        assert_eq!(cache.get(&2u32).unwrap(), value(0xB2));
     }
 
     // ── TTL ───────────────────────────────────────────────────────────────
@@ -208,8 +222,11 @@ mod lru_hybrid_cache_tests {
     // immediately trip `settle_fast_tier` again and re-demote the very key
     // just promoted, before the test ever observes it as `Fast`. Use a
     // capacity comfortably larger than one ttl'd object alone, and force
-    // demotion pressure with several smaller filler keys instead of just one.
-    const TTL_FAST_TIER: u64 = 200;
+    // demotion pressure with several filler keys. Sized (with the ~1 KB
+    // `value()` payloads and the per-object shared-metadata reservation) to
+    // hold ~2 objects, so the ttl'd key demotes under filler pressure yet can
+    // still be promoted back and observed as `Fast` before re-settling.
+    const TTL_FAST_TIER: u64 = 2_600;
 
     #[test]
     fn ttl_survives_a_demotion() {
@@ -231,10 +248,10 @@ mod lru_hybrid_cache_tests {
         // the *original* deadline survived rather than being reset/dropped.
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
-        cache.set(1u32, b"first value 123", Some(ttl_secs)).expect("set should succeed");
+        cache.set(1u32, &value(0xC1), Some(ttl_secs)).expect("set should succeed");
 
-        for key in 2u32..=6 {
-            cache.set(key, b"filler bytes", None).expect("set should succeed");
+        for key in 2u32..=4 {
+            cache.set(key, &value(key as u8), None).expect("set should succeed");
         }
 
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
@@ -267,10 +284,10 @@ mod lru_hybrid_cache_tests {
         // uses a larger fast tier and several filler keys rather than one.
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
-        cache.set(1u32, b"first value 123", Some(ttl_secs)).expect("set should succeed");
+        cache.set(1u32, &value(0xC1), Some(ttl_secs)).expect("set should succeed");
 
-        for key in 2u32..=6 {
-            cache.set(key, b"filler bytes", None).expect("set should succeed");
+        for key in 2u32..=4 {
+            cache.set(key, &value(key as u8), None).expect("set should succeed");
         }
 
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
@@ -329,6 +346,51 @@ mod lru_hybrid_cache_tests {
                 assert_eq!(cache.tier_of(&key), None);
             }
         }
+    }
+
+    // ── DRAM cap accounts for shared metadata (hashtable + eviction stacks) ──
+
+    #[test]
+    fn dram_cap_reserves_shared_metadata_and_demotes_without_evicting() {
+        ensure_pmem_allocator_warm();
+
+        // A big overall cache (so `max_size` never triggers eviction) with a
+        // fast tier whose raw byte budget (2 KB) would comfortably hold all of
+        // these tiny (~13-byte) values at once. The fast-tier budget, however,
+        // now also reserves an approximate per-object DRAM cost for the shared
+        // object hashtable + eviction stacks; across many objects that
+        // reservation exceeds the budget, so the DRAM cap forces demotions
+        // even though the values alone would fit. Crucially, the DRAM cap
+        // responds only with demotions — it never evicts.
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(2_000),
+        ).expect("cache should construct");
+
+        for key in 1u32..=40 {
+            cache.set(key, b"payload bytes", None).expect("set should succeed");
+        }
+
+        // The shared-metadata reservation for 40 objects far exceeds 2 KB, so
+        // some objects must have been demoted to slow.
+        let demoted = wait_until(MIGRATION_TIMEOUT, || {
+            cache.lru_hybrid_stats().demotions >= 1
+        });
+        assert!(demoted, "shared-metadata reservation should force demotions");
+
+        // Let the worker settle, then confirm the DRAM cap never evicted: every
+        // key is still present (only demoted, not dropped), and the evictions
+        // counter — which only `max_size` pressure increments — stays 0.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let stats = cache.lru_hybrid_stats();
+        assert_eq!(stats.evictions, 0, "the DRAM cap must demote, never evict");
+
+        let present = (1u32..=40).filter(|key| cache.has(key)).count();
+        assert_eq!(present, 40, "no key should be evicted by the DRAM cap");
+
+        // The fast tier's live value bytes stay within the configured budget.
+        assert!(stats.fast_bytes_used <= cache.fast_tier_size());
     }
 
     // ── runtime fast-tier resize ─────────────────────────────────────────

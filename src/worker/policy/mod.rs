@@ -998,10 +998,18 @@ mod lru_hybrid_tests {
 		NoHasher,
 		object::Object,
 		status::AtomicStatus,
-		object::overhead::OverheadManager,
+		object::overhead::{OverheadManager, get_hybrid_dram_shared_overhead},
 	};
 
 	type TestBuffer = Box<[u8]>;
+
+	// The per-object shared-structure DRAM overhead `init_policy_stack` now
+	// reserves out of the fast-tier budget (via `with_shared_overhead`). Tests
+	// that size the fast tier to a small, exact byte budget must add headroom
+	// for this reservation so their intended fast/slow boundary still holds.
+	fn shared_overhead() -> CacheSize {
+		get_hybrid_dram_shared_overhead(&PaperPolicy::LruHybrid) as CacheSize
+	}
 
 	// Exercises the real `PolicyWorker` migration pipeline end to end using a
 	// plain `Box<[u8]>` value type and a trivial "migrate" closure — this
@@ -1099,10 +1107,12 @@ mod lru_hybrid_tests {
 	fn demotion_physically_replaces_object_bytes_and_updates_stats() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000);
 
-		// Fits exactly one ~15-byte object but not two; `settle_fast_tier`
-		// drains to fast_capacity exactly (no low-water headroom), so this
-		// is a plain "+1" boundary.
-		worker.handle_resize_fast_tier(base_size_of(&overhead_manager, 15) as CacheSize + 1);
+		// Fits exactly one ~15-byte object but not two. The fast budget must
+		// also cover the reserved shared-metadata overhead for both tracked
+		// objects (2 × shared), on top of one object's value bytes + 1.
+		worker.handle_resize_fast_tier(
+			base_size_of(&overhead_manager, 15) as CacheSize + 2 * shared_overhead() + 1,
+		);
 
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15); // fast
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10); // demotes key 1
@@ -1125,8 +1135,11 @@ mod lru_hybrid_tests {
 	fn access_promotes_a_slow_key_and_may_cascade_a_demotion() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000);
 
-		// Fits exactly one ~15-byte object but not two.
-		worker.handle_resize_fast_tier(base_size_of(&overhead_manager, 15) as CacheSize + 1);
+		// Fits exactly one ~15-byte object but not two (plus reserved
+		// shared-metadata overhead for both tracked objects).
+		worker.handle_resize_fast_tier(
+			base_size_of(&overhead_manager, 15) as CacheSize + 2 * shared_overhead() + 1,
+		);
 
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10); // demotes 1
@@ -1204,10 +1217,20 @@ mod lfu_hybrid_tests {
 		NoHasher,
 		object::Object,
 		status::AtomicStatus,
-		object::overhead::OverheadManager,
+		object::overhead::{OverheadManager, get_hybrid_dram_shared_overhead},
 	};
 
 	type TestBuffer = Box<[u8]>;
+
+	// Per-object shared-structure DRAM overhead reserved out of the fast-tier
+	// budget by `init_policy_stack` (`with_shared_overhead`). Tests sizing the
+	// fast tier to a small exact budget add headroom for it — note the
+	// reservation scales with the *total* tracked object count, so a test with
+	// N tracked objects must budget N × this on top of the values it wants
+	// resident.
+	fn shared_overhead() -> CacheSize {
+		get_hybrid_dram_shared_overhead(&PaperPolicy::LfuHybrid) as CacheSize
+	}
 
 	// Same rationale as `lru_hybrid_tests::make_worker`: exercises the real
 	// `PolicyWorker` migration pipeline end to end using a plain `Box<[u8]>`
@@ -1284,8 +1307,12 @@ mod lfu_hybrid_tests {
 	fn admission_once_fast_is_full_goes_directly_to_slow_and_updates_stats() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000);
 
-		// Fits exactly one 15-byte object.
-		worker.handle_resize_fast_tier(base_size_of(&overhead_manager, 15) as CacheSize);
+		// Fits exactly one 15-byte object's value (plus that object's own
+		// reserved shared-metadata overhead), so a second key can't be admitted
+		// fast.
+		worker.handle_resize_fast_tier(
+			base_size_of(&overhead_manager, 15) as CacheSize + shared_overhead(),
+		);
 
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15); // fast, count 1
 		// Fast tier is now full; key 2 is admitted straight to slow -- key 1
@@ -1311,8 +1338,12 @@ mod lfu_hybrid_tests {
 	fn promotion_pressure_demotes_the_lowest_frequency_fast_key_and_updates_stats() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000);
 
-		// Fits exactly two ~15-byte objects, not three.
-		worker.handle_resize_fast_tier(base_size_of(&overhead_manager, 15) as CacheSize * 2);
+		// Fits exactly two ~15-byte object values, not three. Budget for two
+		// values plus the reserved shared-metadata overhead of all three
+		// tracked objects (so the third's promotion demotes exactly one).
+		worker.handle_resize_fast_tier(
+			base_size_of(&overhead_manager, 15) as CacheSize * 2 + 3 * shared_overhead(),
+		);
 
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 15);

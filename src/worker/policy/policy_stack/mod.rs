@@ -176,9 +176,28 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// the tiering manager's default `dram_threshold` ratio (see
 		// `TieringManager::new` in lib.rs). Runtime-adjustable afterward via
 		// `resize_fast_tier` / `PaperCache::set_fast_tier_size` (step 10).
+		// `with_shared_overhead` reserves the DRAM cost of the shared object
+		// hashtable + eviction stacks out of that budget so demotion bounds
+		// total DRAM, not just fast-tier values.
+		#[cfg(feature = "lru_hybrid_cache")]
+		PaperPolicy::LruHybrid => Box::new(
+			LruHybridStack::new((max_size as f64 * 0.2) as CacheSize)
+				.with_shared_overhead(
+					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+				),
+		),
+		#[cfg(not(feature = "lru_hybrid_cache"))]
 		PaperPolicy::LruHybrid => Box::new(LruHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 
 		// Same default fast-tier budget/override mechanism as `LruHybrid`.
+		#[cfg(feature = "lfu_hybrid_cache")]
+		PaperPolicy::LfuHybrid => Box::new(
+			LfuHybridStack::new((max_size as f64 * 0.2) as CacheSize)
+				.with_shared_overhead(
+					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+				),
+		),
+		#[cfg(not(feature = "lfu_hybrid_cache"))]
 		PaperPolicy::LfuHybrid => Box::new(LfuHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 
 		// k_in comes from the policy string itself (same as plain `TwoQ`);

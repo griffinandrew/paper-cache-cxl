@@ -328,6 +328,13 @@ pub struct LfuHybridStack {
 	fast_used: CacheSize,
 	slow_used: CacheSize,
 
+	/// Approximate per-object DRAM cost of the shared structures (object
+	/// hashtable + eviction stacks) that hold an entry for every object of
+	/// both tiers. Reserved out of `fast_capacity` in `settle_fast_tier` so
+	/// the fast-tier budget bounds total DRAM (values + shared metadata), not
+	/// just fast-tier values. `0` unless set via `with_shared_overhead`.
+	shared_overhead: CacheSize,
+
 	/// (key, new tier) pairs recorded since the last `drain_tier_migrations`.
 	/// `Tier::Slow` entries here can be either a genuine demotion (via
 	/// `settle_fast_tier`) or a fresh admission routed directly to slow
@@ -372,15 +379,34 @@ impl LfuHybridStack {
 			fast_capacity,
 			fast_used: 0,
 			slow_used: 0,
+			shared_overhead: 0,
 
 			migrations: Vec::new(),
 			pending_demotions: 0,
 		}
 	}
 
+	/// Sets the approximate per-object shared-structure DRAM overhead (object
+	/// hashtable + eviction stacks) reserved out of the fast-tier budget. See
+	/// `crate::object::overhead::get_hybrid_dram_shared_overhead`. Builder-style
+	/// so `init_policy_stack` can wire it in without disturbing `new`'s
+	/// signature (unit tests keep the default `0`).
+	pub fn with_shared_overhead(mut self, overhead: CacheSize) -> Self {
+		self.shared_overhead = overhead;
+		self
+	}
+
 	/// The configured fast-tier byte budget.
 	pub fn fast_capacity(&self) -> CacheSize {
 		self.fast_capacity
+	}
+
+	/// Total DRAM currently reserved for shared per-object metadata across
+	/// both tiers (`tracked object count × shared_overhead`). Subtracted from
+	/// `fast_capacity` to form the effective value-byte budget in
+	/// `settle_fast_tier`.
+	fn reserved_overhead(&self) -> CacheSize {
+		self.tiers.len() as CacheSize * self.shared_overhead
 	}
 
 	/// Returns the tier the given (currently tracked) key is in, or `None`
@@ -439,11 +465,18 @@ impl LfuHybridStack {
 	}
 
 	/// Demotes the lowest-frequency fast key(s) until `fast_used` fits back
-	/// within `fast_capacity`. Unlike `LruHybridStack`, drains to exactly
-	/// `fast_capacity` — see the module doc for why no low-water floor is
-	/// needed here.
+	/// within the *effective* value budget: `fast_capacity` minus the DRAM
+	/// reserved for shared per-object metadata (hashtable + eviction stacks)
+	/// across both tiers, so the fast-tier budget bounds total DRAM, not just
+	/// fast-tier values (when the shared metadata alone meets/exceeds
+	/// `fast_capacity` the effective budget saturates to 0, draining every fast
+	/// value to slow). Demotion is the only response; the DRAM budget never
+	/// evicts (terminal eviction stays governed solely by `max_size`). No
+	/// low-water floor — see the module doc.
 	fn settle_fast_tier(&mut self) {
-		while self.fast_used > self.fast_capacity {
+		let effective = self.fast_capacity.saturating_sub(self.reserved_overhead());
+
+		while self.fast_used > effective {
 			let Some((demote_key, count)) = self.fast_chain.pop_min() else { break };
 
 			let size = self.sizes.get(&demote_key).copied().unwrap_or(0) as CacheSize;
@@ -501,9 +534,20 @@ impl PolicyStack for LfuHybridStack {
 		// straight to the slow chain instead — see the module doc for why
 		// this is a direct capacity check rather than relying on
 		// tie-breaking within `settle_fast_tier`.
+		//
+		// The capacity checked is the *effective* value budget (`fast_capacity`
+		// minus the DRAM reserved for shared per-object metadata), so admission
+		// honors the same total-DRAM bound as demotion. The `+ 1` reserves for
+		// the new object's own shared metadata, which is DRAM-resident whether
+		// it lands fast or slow. (Unlike `LruHybridStack`, LFU doesn't call
+		// `settle_fast_tier` on a fresh admission, so the budget check has to
+		// happen here.)
 		self.sizes.insert(key, size);
 
-		if self.fast_used + size as CacheSize <= self.fast_capacity {
+		let admit_effective = self.fast_capacity
+			.saturating_sub((self.tiers.len() as CacheSize + 1) * self.shared_overhead);
+
+		if self.fast_used + size as CacheSize <= admit_effective {
 			self.fast_chain.insert_new(key);
 			self.tiers.insert(key, Tier::Fast);
 			self.fast_used += size as CacheSize;
@@ -855,6 +899,50 @@ mod tests {
 		// Popping the minimum should yield key 2 first (count 1), not key 1.
 		assert_eq!(other.pop_min(), Some((2, 1)));
 		assert_eq!(other.pop_min(), Some((1, 3)));
+	}
+
+	#[test]
+	fn shared_overhead_reserves_dram_at_admission() {
+		// Without overhead, two 40-byte values both fit in a 100-byte fast
+		// tier (admission check is against the raw budget).
+		let mut plain = LfuHybridStack::new(100);
+		plain.insert(1, 40);
+		plain.insert(2, 40);
+		drain(&mut plain);
+		assert_eq!(plain.tier_of(1), Some(Tier::Fast));
+		assert_eq!(plain.tier_of(2), Some(Tier::Fast));
+
+		// With a 30-byte per-object shared reservation, admitting the second
+		// key reserves (1 existing + 1 new) × 30 = 60, leaving an effective
+		// value budget of 40; 40 (used) + 40 (new) > 40, so it is admitted
+		// straight to the slow tier.
+		let mut stack = LfuHybridStack::new(100).with_shared_overhead(30);
+		stack.insert(1, 40);
+		stack.insert(2, 40);
+		let migrations = drain(&mut stack);
+
+		assert_eq!(migrations, vec![(2, Tier::Slow)]);
+		assert_eq!(stack.tier_of(1), Some(Tier::Fast));
+		assert_eq!(stack.tier_of(2), Some(Tier::Slow));
+	}
+
+	#[test]
+	fn shared_overhead_exceeding_capacity_routes_admission_to_slow_never_evicts() {
+		// One object's shared reservation (100) already exceeds the whole
+		// fast budget (50): the effective admission budget saturates to 0, so
+		// the object is admitted straight to slow.
+		let mut stack = LfuHybridStack::new(50).with_shared_overhead(100);
+		stack.insert(1, 10);
+		let migrations = drain(&mut stack);
+
+		assert_eq!(migrations, vec![(1, Tier::Slow)]);
+		assert_eq!(stack.tier_of(1), Some(Tier::Slow));
+		assert_eq!(stack.fast_bytes_used(), 0);
+
+		// Demotion/slow-admission is the only response — still tracked, no
+		// eviction (the DRAM budget never evicts).
+		assert_eq!(stack.len(), 1);
+		assert!(!stack.needs_capacity_eviction());
 	}
 
 	#[test]

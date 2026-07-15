@@ -78,6 +78,14 @@ pub struct LruHybridStack {
 	fast_used: CacheSize,
 	slow_used: CacheSize,
 
+	/// Approximate per-object DRAM cost of the shared structures (object
+	/// hashtable + eviction stacks) that hold an entry for every object of
+	/// both tiers. Reserved out of `fast_capacity` in `settle_fast_tier` so
+	/// the fast-tier budget bounds total DRAM (values + shared metadata), not
+	/// just fast-tier values. `0` unless set via `with_shared_overhead` (so
+	/// unit tests exercising the pure value-budget behavior are unaffected).
+	shared_overhead: CacheSize,
+
 	/// Number of keys currently tagged `Tier::Fast`. Kept alongside
 	/// `fast_used` (bytes) so `fast_object_count`/`slow_object_count` don't
 	/// need an O(n) scan over `tiers`.
@@ -122,6 +130,7 @@ impl LruHybridStack {
 			fast_capacity,
 			fast_used: 0,
 			slow_used: 0,
+			shared_overhead: 0,
 			fast_count: 0,
 
 			fast_boundary: None,
@@ -129,9 +138,27 @@ impl LruHybridStack {
 		}
 	}
 
+	/// Sets the approximate per-object shared-structure DRAM overhead (object
+	/// hashtable + eviction stacks) reserved out of the fast-tier budget. See
+	/// `crate::object::overhead::get_hybrid_dram_shared_overhead`. Builder-style
+	/// so `init_policy_stack` can wire it in without disturbing `new`'s
+	/// signature (unit tests keep the default `0`).
+	pub fn with_shared_overhead(mut self, overhead: CacheSize) -> Self {
+		self.shared_overhead = overhead;
+		self
+	}
+
 	/// The configured fast-tier byte budget.
 	pub fn fast_capacity(&self) -> CacheSize {
 		self.fast_capacity
+	}
+
+	/// Total DRAM currently reserved for shared per-object metadata across
+	/// both tiers (`tracked object count × shared_overhead`). Subtracted from
+	/// `fast_capacity` to form the effective value-byte budget in
+	/// `settle_fast_tier`.
+	fn reserved_overhead(&self) -> CacheSize {
+		self.stack.len() as CacheSize * self.shared_overhead
 	}
 
 	/// Returns the tier the given (currently tracked) key is in, or `None`
@@ -208,10 +235,18 @@ impl LruHybridStack {
 		self.settle_fast_tier();
 	}
 
-	/// Demotes the least-recently-used fast key(s) until `fast_used` fits
-	/// back within `fast_capacity` exactly (no headroom below it).
+	/// Demotes the least-recently-used fast key(s) until `fast_used` fits back
+	/// within the *effective* value budget: `fast_capacity` minus the DRAM
+	/// reserved for shared per-object metadata (hashtable + eviction stacks)
+	/// across both tiers. This makes the fast-tier budget bound total DRAM, not
+	/// just fast-tier values — when the shared metadata alone meets/exceeds
+	/// `fast_capacity` the effective budget saturates to 0, draining every fast
+	/// value to slow. Demotion is the only response; the DRAM budget never
+	/// evicts (terminal eviction stays governed solely by `max_size`).
 	fn settle_fast_tier(&mut self) {
-		while self.fast_used > self.fast_capacity {
+		let effective = self.fast_capacity.saturating_sub(self.reserved_overhead());
+
+		while self.fast_used > effective {
 			let Some(demote_key) = self.fast_boundary else { break };
 
 			let size = self.sizes.get(&demote_key).copied().unwrap_or(0) as CacheSize;
@@ -595,6 +630,49 @@ mod tests {
 		stack.resize_fast_tier(0);
 		let migrations = drain(&mut stack);
 		assert_eq!(migrations, vec![(1, Tier::Slow)]);
+	}
+
+	#[test]
+	fn shared_overhead_reserves_dram_and_demotes_earlier() {
+		// Without overhead, two 40-byte values fit in a 100-byte fast tier.
+		let mut plain = LruHybridStack::new(100);
+		plain.insert(1, 40);
+		plain.insert(2, 40);
+		drain(&mut plain);
+		assert_eq!(plain.tier_of(1), Some(Tier::Fast));
+		assert_eq!(plain.tier_of(2), Some(Tier::Fast));
+
+		// With a 30-byte per-object shared reservation, the second insert
+		// reserves 2 × 30 = 60, leaving an effective value budget of 40, so
+		// the LRU tail (key 1) demotes even though the raw values (80) fit.
+		let mut stack = LruHybridStack::new(100).with_shared_overhead(30);
+		stack.insert(1, 40);
+		stack.insert(2, 40);
+		let migrations = drain(&mut stack);
+
+		assert_eq!(migrations, vec![(1, Tier::Slow)]);
+		assert_eq!(stack.tier_of(1), Some(Tier::Slow));
+		assert_eq!(stack.tier_of(2), Some(Tier::Fast));
+		assert_eq!(stack.fast_bytes_used(), 40);
+	}
+
+	#[test]
+	fn shared_overhead_exceeding_capacity_demotes_all_but_never_evicts() {
+		// One object's shared reservation (100) already exceeds the whole
+		// fast budget (50): the effective value budget saturates to 0, so the
+		// object demotes to slow immediately on admission.
+		let mut stack = LruHybridStack::new(50).with_shared_overhead(100);
+		stack.insert(1, 10);
+		let migrations = drain(&mut stack);
+
+		assert_eq!(migrations, vec![(1, Tier::Slow)]);
+		assert_eq!(stack.tier_of(1), Some(Tier::Slow));
+		assert_eq!(stack.fast_bytes_used(), 0);
+
+		// Demotion is the only response — the object is still tracked (the
+		// DRAM budget never evicts; `needs_capacity_eviction` stays default).
+		assert_eq!(stack.len(), 1);
+		assert!(!stack.needs_capacity_eviction());
 	}
 
 	#[test]
