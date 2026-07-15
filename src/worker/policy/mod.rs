@@ -178,6 +178,14 @@ where
 				// calls under heavy concurrent load — cheap to call when
 				// there's nothing to migrate (an early-return on an empty
 				// drain), so this isn't a meaningful throughput cost.
+				//
+				// Tested reverting this to once-per-batch while investigating
+				// why real DRAM usage doesn't track fast_tier_size (see
+				// CLAUDE.md): made no measurable difference (200K-object
+				// scale: batched 4030.4/4039.1 MB vs. per-event's original
+				// 3959.0/3983.3 MB — within normal run-to-run noise). The
+				// allocator-level retention behavior responsible for that gap
+				// is independent of this loop's migration granularity.
 				#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache"))]
 				self.apply_tier_migrations();
 			}

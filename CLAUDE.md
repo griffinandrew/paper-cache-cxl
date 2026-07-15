@@ -247,6 +247,22 @@ these superblocks reclaimable under this allocation/free pattern (many small, st
 original `1` (documented in `umf_allocator_wrapper.c`) since `0` provided no benefit and only adds
 provider round-trip overhead for no gain.
 
+**Also tested and ruled out: `PolicyWorker`'s per-event (vs. batched) migration timing.** The user
+suspected the earlier per-event `apply_tier_migrations` change (see the "burst-write headroom"
+post-implementation-fix section above) might be *causing* the fragmentation, by interleaving
+free/allocate/free/allocate in tight lockstep (a demoted object's DRAM buffer freed right as the
+next admission allocates, potentially keeping many superblocks perpetually non-empty) versus
+batched frees letting a whole cluster of older superblocks go empty together while new allocations
+land elsewhere. Tested directly: reverted the call site to once-per-batch (outside the inner
+`for event in events` loop, matching its pre-session position), rebuilt, and re-ran the 200K-object
+comparison. Result: 4030.4/4039.1 MB (ratio 1.002) — statistically identical to per-event's
+3959.0/3983.3 MB (ratio 1.006), well within normal run-to-run noise. Reverted back to per-event
+(comment-only diff in `worker/policy/mod.rs`) since batching bought no memory benefit and would
+have reintroduced the DRAM-write-vs-PMEM-migration latency window that change was written to close.
+The allocator-level retention behavior is independent of migration granularity — consistent with
+the earlier finding that it's TBB's own internal superblock heuristics, not anything this crate's
+worker loop controls.
+
 **Not fixed. Two real paths forward, both bigger than a flag flip, left for the user to decide:**
 (a) swap the pool backend — UMF also supports a jemalloc-backed pool (referenced, currently
 commented out, in `allocator.rs`/`umf_allocator_wrapper.c`'s `DAXPMEM` path via
