@@ -45,10 +45,21 @@
 //! by every admission, so the thrashing concern that motivated LRU-hybrid's
 //! headroom largely doesn't apply.
 
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 use std::collections::HashMap;
+#[cfg(feature = "eviction_stacks_pmem")]
+use hashbrown::HashMap;
 
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 use dlv_list::{VecList, Index};
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 use kwik::collections::HashList;
+
+#[cfg(feature = "eviction_stacks_pmem")]
+use super::pmem_collections::{PmemVecList, PmemHashList, PmemIndex};
+
+#[cfg(feature = "eviction_stacks_pmem")]
+use crate::Hybrid;
 
 use crate::{
 	CacheSize,
@@ -59,6 +70,28 @@ use crate::{
 	worker::policy::policy_stack::{PolicyStack, Tier},
 };
 
+// The two frequency-bucket chains and the per-key maps are DRAM-backed by
+// default. When `eviction_stacks_pmem` is enabled, they are instead allocated
+// in the slow tier (PMEM, via `crate::Hybrid`), mirroring how plain `LfuStack`
+// switches to `PmemVecList`/`PmemHashList` under that flag. The PMEM and DRAM
+// collection variants share a method surface, so the stack logic below is
+// identical for both. Only the transient `migrations`/`pending_demotions`
+// scratch and scalar counters stay in DRAM.
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type ChainIndex = Index<CountStack>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type ChainIndex = PmemIndex;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type SizeMap = HashMap<HashedKey, ObjectSize, NoHasher>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type SizeMap = HashMap<HashedKey, ObjectSize, NoHasher, Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type TierMap = HashMap<HashedKey, Tier, NoHasher>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type TierMap = HashMap<HashedKey, Tier, NoHasher, Hybrid>;
+
 /// A classic O(1) LFU frequency-bucket chain: an ascending-by-count linked
 /// list of `CountStack` buckets (each holding every key at that exact
 /// frequency, itself recency-ordered so ties break LRU-within-frequency),
@@ -67,22 +100,55 @@ use crate::{
 /// which places a key at an *arbitrary* existing count rather than always
 /// starting at 1 or advancing by exactly 1 — needed when a key crosses from
 /// the other chain carrying its already-accumulated frequency.
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 #[derive(Default)]
 struct FrequencyChain {
-	index_map: HashMap<HashedKey, Index<CountStack>, NoHasher>,
+	index_map: HashMap<HashedKey, ChainIndex, NoHasher>,
 	count_stacks: VecList<CountStack>,
 }
 
+#[cfg(feature = "eviction_stacks_pmem")]
+struct FrequencyChain {
+	index_map: HashMap<HashedKey, ChainIndex, NoHasher, Hybrid>,
+	count_stacks: PmemVecList<CountStack>,
+}
+
+#[cfg(feature = "eviction_stacks_pmem")]
+impl Default for FrequencyChain {
+	fn default() -> Self {
+		FrequencyChain {
+			index_map: HashMap::with_hasher_in(NoHasher::default(), Hybrid),
+			count_stacks: PmemVecList::new(),
+		}
+	}
+}
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 struct CountStack {
 	count: u32,
 	stack: HashList<HashedKey, NoHasher>,
 }
 
+#[cfg(feature = "eviction_stacks_pmem")]
+struct CountStack {
+	count: u32,
+	stack: PmemHashList<HashedKey, NoHasher>,
+}
+
 impl CountStack {
+	#[cfg(not(feature = "eviction_stacks_pmem"))]
 	fn new(count: u32) -> Self {
 		CountStack {
 			count,
 			stack: HashList::with_hasher(NoHasher::default()),
+		}
+	}
+
+	#[cfg(feature = "eviction_stacks_pmem")]
+	fn new(count: u32) -> Self {
+		CountStack {
+			count,
+			stack: PmemHashList::with_hasher(NoHasher::default()),
 		}
 	}
 
@@ -255,8 +321,8 @@ pub struct LfuHybridStack {
 	fast_chain: FrequencyChain,
 	slow_chain: FrequencyChain,
 
-	tiers: HashMap<HashedKey, Tier, NoHasher>,
-	sizes: HashMap<HashedKey, ObjectSize, NoHasher>,
+	tiers: TierMap,
+	sizes: SizeMap,
 
 	fast_capacity: CacheSize,
 	fast_used: CacheSize,
@@ -278,13 +344,30 @@ pub struct LfuHybridStack {
 }
 
 impl LfuHybridStack {
+	/// Constructs the (tier map, size map) pair, DRAM- or PMEM-backed
+	/// depending on `eviction_stacks_pmem`.
+	#[cfg(not(feature = "eviction_stacks_pmem"))]
+	fn new_maps() -> (TierMap, SizeMap) {
+		(HashMap::default(), HashMap::default())
+	}
+
+	#[cfg(feature = "eviction_stacks_pmem")]
+	fn new_maps() -> (TierMap, SizeMap) {
+		(
+			HashMap::with_hasher_in(NoHasher::default(), Hybrid),
+			HashMap::with_hasher_in(NoHasher::default(), Hybrid),
+		)
+	}
+
 	pub fn new(fast_capacity: CacheSize) -> Self {
+		let (tiers, sizes) = Self::new_maps();
+
 		LfuHybridStack {
 			fast_chain: FrequencyChain::default(),
 			slow_chain: FrequencyChain::default(),
 
-			tiers: HashMap::default(),
-			sizes: HashMap::default(),
+			tiers,
+			sizes,
 
 			fast_capacity,
 			fast_used: 0,

@@ -24,9 +24,18 @@
 //! `insert`/`update` call and performs the actual `TieredBuffer`
 //! reallocation against the shared object map (see `Object::set_data`).
 
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 use std::collections::HashMap;
+#[cfg(feature = "eviction_stacks_pmem")]
+use hashbrown::HashMap;
 
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 use kwik::collections::HashList;
+#[cfg(feature = "eviction_stacks_pmem")]
+use super::pmem_collections::PmemHashList;
+
+#[cfg(feature = "eviction_stacks_pmem")]
+use crate::Hybrid;
 
 use crate::{
 	CacheSize,
@@ -37,18 +46,33 @@ use crate::{
 	worker::policy::policy_stack::{PolicyStack, Tier},
 };
 
-// Unlike `LruStack`, this stack always keeps its recency list in DRAM
-// (`kwik::collections::HashList`), even when `eviction_stacks_pmem` is also
-// enabled: `PmemHashList` doesn't expose `before`/`back`/`move_front`, which
-// the fast/slow boundary tracking below needs. `lru_hybrid_cache` doesn't
-// depend on `eviction_stacks_pmem`, so this only matters if a caller enables
-// both; in that combination, this stack's *metadata* (not object bytes)
-// simply stays DRAM-resident.
+// The recency list and per-key maps are DRAM-backed by default. When
+// `eviction_stacks_pmem` is enabled, they are instead allocated in the slow
+// tier (PMEM, via `crate::Hybrid`) — co-located with the slow-tier object
+// bytes — exactly the way plain `LruStack` switches to PMEM collections under
+// that flag. The method surface of the PMEM `PmemHashList`/`hashbrown::HashMap`
+// variants matches the DRAM `HashList`/`std::collections::HashMap` ones used
+// below, so the stack logic itself is identical for both backings. Only the
+// transient `migrations` scratch and the scalar counters stay in DRAM.
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type RecencyList = HashList<HashedKey, NoHasher>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type RecencyList = PmemHashList<HashedKey, NoHasher>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type SizeMap = HashMap<HashedKey, ObjectSize, NoHasher>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type SizeMap = HashMap<HashedKey, ObjectSize, NoHasher, Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type TierMap = HashMap<HashedKey, Tier, NoHasher>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type TierMap = HashMap<HashedKey, Tier, NoHasher, Hybrid>;
 
 pub struct LruHybridStack {
-	stack: HashList<HashedKey, NoHasher>,
-	sizes: HashMap<HashedKey, ObjectSize, NoHasher>,
-	tiers: HashMap<HashedKey, Tier, NoHasher>,
+	stack: RecencyList,
+	sizes: SizeMap,
+	tiers: TierMap,
 
 	fast_capacity: CacheSize,
 	fast_used: CacheSize,
@@ -71,11 +95,29 @@ pub struct LruHybridStack {
 }
 
 impl LruHybridStack {
+	/// Constructs the (recency list, size map, tier map) triple, DRAM- or
+	/// PMEM-backed depending on `eviction_stacks_pmem`.
+	#[cfg(not(feature = "eviction_stacks_pmem"))]
+	fn new_collections() -> (RecencyList, SizeMap, TierMap) {
+		(HashList::default(), HashMap::default(), HashMap::default())
+	}
+
+	#[cfg(feature = "eviction_stacks_pmem")]
+	fn new_collections() -> (RecencyList, SizeMap, TierMap) {
+		(
+			PmemHashList::with_hasher(NoHasher::default()),
+			HashMap::with_hasher_in(NoHasher::default(), Hybrid),
+			HashMap::with_hasher_in(NoHasher::default(), Hybrid),
+		)
+	}
+
 	pub fn new(fast_capacity: CacheSize) -> Self {
+		let (stack, sizes, tiers) = Self::new_collections();
+
 		LruHybridStack {
-			stack: HashList::default(),
-			sizes: HashMap::default(),
-			tiers: HashMap::default(),
+			stack,
+			sizes,
+			tiers,
 
 			fast_capacity,
 			fast_used: 0,

@@ -86,13 +86,20 @@ impl<T> PmemVecList<T> {
         })
     }
     
+    /// Returns a reference to the element at the given index
+    pub fn get(&self, index: PmemIndex) -> Option<&T> {
+        self.entries.get(index.0).and_then(|opt_node| {
+            opt_node.as_ref().map(|node| &node.value)
+        })
+    }
+
     /// Returns a mutable reference to the element at the given index
     pub fn get_mut(&mut self, index: PmemIndex) -> Option<&mut T> {
         self.entries.get_mut(index.0).and_then(|opt_node| {
             opt_node.as_mut().map(|node| &mut node.value)
         })
     }
-    
+
     /// Returns the index of the next element after the given index
     pub fn get_next_index(&self, index: PmemIndex) -> Option<PmemIndex> {
         self.entries.get(index.0).and_then(|opt_node| {
@@ -174,10 +181,44 @@ impl<T> PmemVecList<T> {
                 next_node.prev = Some(idx);
             }
         }
-        
+
         PmemIndex(idx)
     }
-    
+
+    /// Inserts a value immediately before the given index. Implemented in terms
+    /// of the existing `insert_after`/`push_front` primitives (no new pointer
+    /// bookkeeping): if `index` has a predecessor, insert after it; otherwise
+    /// `index` is the head, so this is a `push_front`.
+    pub fn insert_before(&mut self, index: PmemIndex, value: T) -> PmemIndex {
+        let prev_idx = self.entries.get(index.0)
+            .and_then(|opt_node| opt_node.as_ref())
+            .and_then(|node| node.prev);
+
+        match prev_idx {
+            Some(prev) => self.insert_after(PmemIndex(prev), value),
+            None => self.push_front(value),
+        }
+    }
+
+    /// Appends a value to the back of the list. The list tracks only `head`, so
+    /// this walks `next` to the last node and reuses `insert_after`; the walk is
+    /// O(len) but `PmemVecList` is only used for frequency-bucket chains (one
+    /// node per distinct frequency), and only `insert_at`'s fallback hits this.
+    pub fn push_back(&mut self, value: T) -> PmemIndex {
+        let Some(mut idx) = self.head else {
+            return self.push_front(value);
+        };
+
+        while let Some(next) = self.entries.get(idx)
+            .and_then(|opt_node| opt_node.as_ref())
+            .and_then(|node| node.next)
+        {
+            idx = next;
+        }
+
+        self.insert_after(PmemIndex(idx), value)
+    }
+
     /// Removes the element at the given index
     pub fn remove(&mut self, index: PmemIndex) -> Option<T> {
         // take() replaces the value with None and returns the old value.
@@ -279,7 +320,50 @@ where
     pub fn contains(&self, value: &T) -> bool {
         self.lookup.contains_key(value)
     }
-    
+
+    /// Returns a reference to the value at the front (head) of the list.
+    pub fn front(&self) -> Option<&T> {
+        self.head.and_then(|idx| {
+            self.entries.get(idx).and_then(|opt_node| {
+                opt_node.as_ref().map(|node| &node.value)
+            })
+        })
+    }
+
+    /// Returns a reference to the value at the back (tail) of the list.
+    pub fn back(&self) -> Option<&T> {
+        self.tail.and_then(|idx| {
+            self.entries.get(idx).and_then(|opt_node| {
+                opt_node.as_ref().map(|node| &node.value)
+            })
+        })
+    }
+
+    /// Returns the value immediately before `value` — i.e. its neighbor toward
+    /// the head — or `None` if `value` is absent or is itself the head. Matches
+    /// `kwik::collections::HashList::before` as used by `LruHybridStack`.
+    pub fn before(&self, value: &T) -> Option<&T> {
+        let idx = *self.lookup.get(value)?;
+        let prev = self.entries.get(idx)
+            .and_then(|opt_node| opt_node.as_ref())
+            .and_then(|node| node.prev)?;
+
+        self.entries.get(prev).and_then(|opt_node| {
+            opt_node.as_ref().map(|node| &node.value)
+        })
+    }
+
+    /// Moves an existing value to the front of the list. `push_front` already
+    /// performs a remove-then-prepend for a value that is already present, so
+    /// this is a thin wrapper over it (a no-op if `value` isn't present).
+    /// Matches `kwik::collections::HashList::move_front`'s `&T` signature.
+    pub fn move_front(&mut self, value: &T) {
+        if self.lookup.contains_key(value) {
+            let owned = value.clone();
+            self.push_front(owned);
+        }
+    }
+
     /// Pushes a value to the front of the list
     pub fn push_front(&mut self, value: T) {
         // If value already exists, remove it first
