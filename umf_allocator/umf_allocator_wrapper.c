@@ -15,6 +15,7 @@
 #include <umf/memory_provider.h>
 #include <umf/providers/provider_os_memory.h>
 #include <umf/pools/pool_scalable.h>
+#include <umf/pools/pool_jemalloc.h>
 
 #define MAX_NODES 8
 
@@ -30,7 +31,7 @@ static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 int umf_allocator_init(int numa_node) {
     //setenv("UMF_CONF", "umf.provider.os.params.mmap_flags=0x8000", 0);
     umf_memory_pool_handle_t new_pool = NULL;
-    umf_scalable_pool_params_handle_t scalable_params = NULL;
+    umf_jemalloc_pool_params_handle_t jemalloc_params = NULL;
     umf_result_t res;
 
     if (numa_node < 0 || numa_node >= MAX_NODES) {
@@ -84,47 +85,32 @@ int umf_allocator_init(int numa_node) {
     }
 
     // -------------------------------------------------------------------------
-    // Create scalable pool params and tell it to KEEP all memory.
-    //This forces the TBB backend to retain freed blocks rather than triggering
-    //purging calls down into the OS memory provider.
+    // EXPERIMENT: switched from the TBB scalable pool (see git history / the
+    // commented block below for the KeepAllMemory-based version) to UMF's
+    // jemalloc-backed pool, to test whether jemalloc's own decay-based page
+    // release behaves differently under this workload's fragmentation
+    // pattern (see CLAUDE.md's "real DRAM usage vs. fast_tier_size"
+    // investigation). Deliberately not attempting to replicate
+    // KeepAllMemory's "retain everything" semantics here -- jemalloc's
+    // default dirty/muzzy decay (madvise-based, ~10s idle before a page is
+    // eligible for release) is used as-is.
     // -------------------------------------------------------------------------
-    res = umfScalablePoolParamsCreate(&scalable_params);
+    res = umfJemallocPoolParamsCreate(&jemalloc_params);
     if (res != UMF_RESULT_SUCCESS) {
-        fprintf(stderr, "Failed to create scalable pool params (node %d): %d\n", numa_node, res);
+        fprintf(stderr, "Failed to create jemalloc pool params (node %d): %d\n", numa_node, res);
         pthread_mutex_unlock(&lifecycle_lock);
         return 5;
     }
 
-    // 1 means TRUE -> retain all memory blocks inside the pool user-space cache
-    //
-    // Tested flipping this to 0 while investigating why real DRAM usage
-    // doesn't track fast_tier_size (see CLAUDE.md): made no measurable
-    // difference (still ~4.2x budget at 200K objects / 140,972 demotions,
-    // same as with KeepAllMemory=1). Root cause is one level deeper: this
-    // pool wraps Intel TBB's scalable allocator (libtbbmalloc), whose own
-    // internal superblock/slab retention heuristics decide whether a given
-    // freed region is ever eligible to be handed back to the UMF provider
-    // (which *does* correctly munmap on free -- see os_free() in
-    // provider_os_memory.c) -- independent of this flag, which only gates
-    // whether TBB is *permitted* to give memory back at all. Reverted to the
-    // original `1` since `0` provided no benefit.
-    umfScalablePoolParamsSetKeepAllMemory(scalable_params, 1);
-
-    // 2 MiB == default superblock size for the scalable pool. Matching the
-    // granularity to the superblock size reduces fragmentation and improves
-    // performance for typical workloads.
-    size_t huge_chunk_size = 2 * 1024 * 1024ULL;
-    umfScalablePoolParamsSetGranularity(scalable_params, huge_chunk_size);
-
     // Create pool into a local first; only publish once fully constructed.
     res = umfPoolCreate(
-            umfScalablePoolOps(),
+            umfJemallocPoolOps(),
             providers[numa_node],
-            scalable_params,
+            jemalloc_params,
             0,
             &new_pool);
 
-    umfScalablePoolParamsDestroy(scalable_params);
+    umfJemallocPoolParamsDestroy(jemalloc_params);
 
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to create pool (node %d): %d\n", numa_node, res);

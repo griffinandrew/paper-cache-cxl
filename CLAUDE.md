@@ -263,17 +263,52 @@ The allocator-level retention behavior is independent of migration granularity �
 the earlier finding that it's TBB's own internal superblock heuristics, not anything this crate's
 worker loop controls.
 
-**Not fixed. Two real paths forward, both bigger than a flag flip, left for the user to decide:**
-(a) swap the pool backend — UMF also supports a jemalloc-backed pool (referenced, currently
-commented out, in `allocator.rs`/`umf_allocator_wrapper.c`'s `DAXPMEM` path via
-`umfJemallocPoolOps()`); jemalloc's configurable `dirty_decay`/`muzzy_decay` and `MADV_FREE`-based
-reclaim may behave differently under this fragmentation pattern, but this is unverified and would
-need the same peak-vs-settled comparison to confirm before trusting it; (b) treat this as inherent
-to any general-purpose C pool allocator under a "many small objects, staggered lifetimes, no aligned
-freeing pattern" workload, and address it architecturally within this crate instead (e.g. a
-purpose-built fixed-size slab/arena specifically for hybrid-cache value bytes, with predictable,
-crate-controlled reclaim, rather than delegating to a general-purpose allocator not designed to
-shrink under this access pattern).
+### Fix: switched the pool backend from TBB scalable to UMF's jemalloc pool — confirmed, large win
+
+Per the user's request, tested swapping `umf_allocator_init`'s pool (`umf_allocator/
+umf_allocator_wrapper.c`, shared by every allocator that routes through it — `HybridObjects`/node 1
+*and* `DRAMObjects`/node 0, so this affects every PMEM-backed feature, not just the hybrid caches)
+from `umfScalablePoolOps()` (TBB, `KeepAllMemory=1`) to `umfJemallocPoolOps()`, using jemalloc's
+*default* decay-based release behavior as-is (no attempt to replicate `KeepAllMemory`'s
+retain-everything semantics — the whole point was to let a decay-based reclaimer actually reclaim).
+`libumf.so`/`libumf.a` already bundles jemalloc statically (confirmed via `strings`/`nm` — no new
+link dependency needed) and exports the pool ops via the already-included `pool_jemalloc.h`; the
+DAXPMEM path elsewhere in the same file had a *dead, broken* reference attempt at this pattern
+(referenced a `new_pool` that was never assigned) — not used as a template, rewritten from scratch
+mirroring the already-correct scalable-pool code's structure (local `new_pool`, proper lock +
+atomic-publish sequencing).
+
+Re-ran the same peak/settled/decayed multi-scale comparison (the `repro_real_dram_usage_at_scale`
+test gained a third measurement, taken 30s after the "settled" one, since jemalloc's default
+`dirty_decay`/`muzzy_decay` release freed pages only after an idle period — ~10s by default — not
+immediately on free, so a measurement taken only 5s after settling could still catch pages
+mid-decay):
+
+| objects | demotions | peak node0 | settled node0 (+5s) | decayed node0 (+35s) | vs. TBB settled |
+|---|---|---|---|---|---|
+| 50,000 | 0 | 1,013.4 MB | 1,025.5 MB | 1,025.5 MB (1.08x budget) | 1,120.3 MB (1.17x) — slightly better |
+| 200,000 | 140,972 | 3,533.8 MB | 1,382.2 MB | 1,358.4 MB (1.42x budget) | 3,983.3 MB (4.18x) — **~2.9x better** |
+| 1,000,000 | 945,823 | 11,402.0 MB | 2,032.4 MB | 2,032.4 MB (2.13x budget) | 13,246.3 MB (13.89x) — **~6.5x better** |
+
+At 1M objects, decayed/peak ratio dropped to **0.178** (vs. TBB's ~1.0 at every scale) — strong,
+direct confirmation that jemalloc is genuinely releasing freed pages back to the OS as the fast
+tier settles, not just retaining the historical peak. Real DRAM now tracks `fast_tier_size` within
+roughly 1.1–2.1x across three orders of magnitude, rather than diverging without bound as object
+count grew (13.89x at 1M under the old pool, and climbing — see the table in the section above).
+The residual multiple (worse at larger scale) is consistent with jemalloc's own arena/decay
+overhead plus the shared-metadata terms already accounted for in the DRAM-cap feature itself
+(`object/overhead.rs`) — not fully investigated further, but far smaller in magnitude than the
+retention behavior this replaces.
+
+Verified no regressions: full `lru_hybrid_cache`/`lfu_hybrid_cache`/`two_q_hybrid_cache` lib +
+integration suites pass unchanged, and `hybridcache_integration.rs` (which also routes through
+`HybridObjects`) stays at its documented pre-existing baseline (35/37 — the same two timing-
+sensitive tests, `test_demotion_counter`/`test_pmem_items_after_eviction`, that were already
+failing before this session for unrelated reasons; not new).
+
+Left in place, not reverted, since it's a clear, measured improvement with no observed downside —
+unlike the `KeepAllMemory` flip and the migration-batching experiment, both tested and reverted
+earlier in this same investigation for producing no benefit.
 
 ## Feature: `lru_hybrid_cache` (steps 1–10 implemented; see status below)
 

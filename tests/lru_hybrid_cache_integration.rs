@@ -651,6 +651,19 @@ mod lru_hybrid_cache_tests {
         let status = cache.status().expect("status should be available");
         let (settled_node0_mb, settled_node1_mb) = read_own_numa_usage_mb();
 
+        // A second, later sample: some pool allocators (e.g. jemalloc's
+        // default dirty/muzzy decay) release freed pages back to the OS only
+        // after an idle decay period (~10s by default), not immediately on
+        // free -- so a measurement taken only 5s after settling may still
+        // catch pages mid-decay. Comfortably clear that window and re-sample
+        // to see whether memory keeps dropping (decay-based release) or has
+        // already reached its floor (e.g. a pool that never releases at all).
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        let (decayed_node0_mb, decayed_node1_mb) = read_own_numa_usage_mb();
+        println!(
+            "[n={object_count}] DECAYED (+30s more): node0={decayed_node0_mb:.1} MB  node1={decayed_node1_mb:.1} MB"
+        );
+
         println!("[n={object_count}] === lru_hybrid_stats ===");
         println!(
             "[n={object_count}] fast_objects={} slow_objects={} fast_bytes_used={} slow_bytes_used={} promotions={} demotions={} evictions={}",
@@ -671,12 +684,16 @@ mod lru_hybrid_cache_tests {
         println!(
             "[n={object_count}] SUMMARY: configured fast tier = {fast_tier_mb:.1} MB; \
              peak node0 = {peak_node0_mb:.1} MB ({:.2}x budget); \
-             settled node0 = {settled_node0_mb:.1} MB ({:.2}x budget); \
-             settled/peak ratio = {:.3} (near 1.0 => DRAM stayed pinned near peak \
+             settled node0 (+5s) = {settled_node0_mb:.1} MB ({:.2}x budget); \
+             decayed node0 (+35s) = {decayed_node0_mb:.1} MB ({:.2}x budget); \
+             decayed/peak ratio = {:.3} (near 1.0 => DRAM stayed pinned near peak \
              despite settlement; well below 1.0 => DRAM tracked the true live footprint)",
             peak_node0_mb / fast_tier_mb,
             settled_node0_mb / fast_tier_mb,
-            settled_node0_mb / peak_node0_mb.max(0.001),
+            decayed_node0_mb / fast_tier_mb,
+            decayed_node0_mb / peak_node0_mb.max(0.001),
         );
+
+        let _ = decayed_node1_mb;
     }
 }
