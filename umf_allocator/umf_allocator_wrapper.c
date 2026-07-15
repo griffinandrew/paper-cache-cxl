@@ -7,7 +7,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
+#include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 
@@ -17,6 +21,20 @@
 #include <umf/pools/pool_scalable.h>
 #include <umf/pools/pool_jemalloc.h>
 
+// DRAM hard cap (node 0 only) links the SYSTEM jemalloc directly (distinct
+// from the jemalloc statically bundled inside libumf.so that backs
+// umfJemallocPoolOps() below for node 1/PMEM) -- see the "DRAM hard cap"
+// block further down for why the two coexist safely in one process.
+#include <jemalloc/jemalloc.h>
+#include <numaif.h>
+#include <numa.h>
+
+#ifdef JEMALLOC_USE_PREFIX
+#define mallctl  je_mallctl
+#define mallocx  je_mallocx
+#define dallocx  je_dallocx
+#endif
+
 #define MAX_NODES 8
 
 // Per-node state. Index by NUMA node id.
@@ -25,10 +43,265 @@ static umf_memory_provider_handle_t providers[MAX_NODES];
 static umf_os_memory_provider_params_handle_t os_params_arr[MAX_NODES];
 static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* ------------------------------------------------------------------ */
+/* DRAM hard cap (node 0 / DRAMObjects, the crate's #[global_allocator], */
+/* only) -- a custom jemalloc arena whose extent hooks bump-allocate    */
+/* from a fixed-size, MAP_NORESERVE-reserved, MPOL_BIND-pinned region   */
+/* and return NULL once the cap is exhausted: a genuine structural      */
+/* ceiling, not a statistical tendency like the pool-level tuning       */
+/* (KeepAllMemory, arena count, decay knobs -- see CLAUDE.md's DRAM-    */
+/* usage investigation) tried and ruled out before this.                */
+/*                                                                      */
+/* Ported from the previously-unused umf_allocator/jemalloc_extent_     */
+/* hooks.c (not compiled into this build), simplified from its N-tier   */
+/* design to a single tier since only node 0 ever uses this path;       */
+/* node 1 (HybridObjects/PMEM) keeps using the umfJemallocPoolOps()     */
+/* pool above unchanged. Dealloc/decommit/purge hooks all refuse to     */
+/* release -- bump/retain at the extent level, while individual         */
+/* allocations within the region still get jemalloc's normal size-class */
+/* reuse via its own arena machinery.                                   */
+/*                                                                      */
+/* Opt-in via the PAPER_CACHE_DRAM_CAP_BYTES environment variable, read */
+/* once at node 0's lazy init (DRAMObjects::INIT.call_once fires on the */
+/* process's first-ever heap allocation -- before any PaperCache::new() */
+/* call, so the cap size cannot be threaded through as a constructor    */
+/* parameter the way fast_tier_size is). If unset, node 0 falls back to */
+/* the existing UMF jemalloc pool path below, unchanged.                */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    extent_hooks_t   hooks;        /* MUST be first member (cast target) */
+    void            *region_base;
+    size_t           region_cap;
+    _Atomic size_t   region_off;   /* bump cursor */
+    _Atomic unsigned arena_ind;
+} dram_cap_tier_t;
+
+static dram_cap_tier_t dram_cap_tier;
+static atomic_bool     dram_cap_active = ATOMIC_VAR_INIT(false);
+
+static void *dram_cap_extent_alloc(extent_hooks_t *hooks, void *new_addr, size_t size,
+                                    size_t alignment, bool *zero, bool *commit,
+                                    unsigned arena) {
+    (void)new_addr; (void)arena;
+    dram_cap_tier_t *t = (dram_cap_tier_t *)hooks;  /* hooks == &t->hooks == t */
+    if (!t->region_base || t->region_cap == 0) return NULL;
+
+    size_t align = alignment ? alignment : 1;
+    for (;;) {
+        size_t cur     = atomic_load_explicit(&t->region_off, memory_order_relaxed);
+        size_t aligned = (cur + align - 1) & ~(align - 1);
+        if (aligned < cur) return NULL;               /* alignment overflow */
+        if (aligned + size < aligned) return NULL;     /* size overflow */
+        size_t end = aligned + size;
+        if (end > t->region_cap) {
+            fprintf(stderr,
+                    "dram_cap: DRAM hard cap exhausted (need %zu, cap %zu)\n",
+                    end, t->region_cap);
+            return NULL;
+        }
+        if (atomic_compare_exchange_weak_explicit(
+                &t->region_off, &cur, end,
+                memory_order_seq_cst, memory_order_relaxed)) {
+            *zero   = true;   /* fresh anon pages zero on first fault */
+            *commit = true;
+            return (char *)t->region_base + aligned;
+        }
+        /* CAS lost a race -- retry. */
+    }
+}
+
+static bool dram_cap_extent_dalloc(extent_hooks_t *h, void *a, size_t s,
+                                   bool c, unsigned ar) {
+    (void)h;(void)a;(void)s;(void)c;(void)ar;
+    return true;    /* bump region: retain, bulk reclaim at process exit */
+}
+
+static void dram_cap_extent_destroy(extent_hooks_t *h, void *a, size_t s,
+                                    bool c, unsigned ar) {
+    (void)h;(void)a;(void)s;(void)c;(void)ar;
+}
+
+static bool dram_cap_extent_commit(extent_hooks_t *h, void *a, size_t s,
+                                   size_t o, size_t l, unsigned ar) {
+    (void)h;(void)a;(void)s;(void)o;(void)l;(void)ar;
+    return false;   /* already committed */
+}
+
+static bool dram_cap_extent_decommit(extent_hooks_t *h, void *a, size_t s,
+                                     size_t o, size_t l, unsigned ar) {
+    (void)h;(void)a;(void)s;(void)o;(void)l;(void)ar;
+    return true;    /* refuse -- keep pages */
+}
+
+static bool dram_cap_extent_purge_lazy(extent_hooks_t *h, void *a, size_t s,
+                                       size_t o, size_t l, unsigned ar) {
+    (void)h;(void)a;(void)s;(void)o;(void)l;(void)ar;
+    return true;    /* refuse -- never MADV_DONTNEED our pages */
+}
+
+static bool dram_cap_extent_purge_forced(extent_hooks_t *h, void *a, size_t s,
+                                         size_t o, size_t l, unsigned ar) {
+    (void)h;(void)a;(void)s;(void)o;(void)l;(void)ar;
+    return true;
+}
+
+static bool dram_cap_extent_split(extent_hooks_t *h, void *a, size_t s,
+                                  size_t sa, size_t sb, bool c, unsigned ar) {
+    (void)h;(void)a;(void)s;(void)sa;(void)sb;(void)c;(void)ar;
+    return false;   /* one contiguous VMA -- split is free */
+}
+
+static bool dram_cap_extent_merge(extent_hooks_t *h, void *a, size_t sa,
+                                  void *b, size_t sb, bool c, unsigned ar) {
+    (void)h;(void)a;(void)sa;(void)b;(void)sb;(void)c;(void)ar;
+    return false;
+}
+
+static void dram_cap_init_hooks(dram_cap_tier_t *t) {
+    t->hooks.alloc        = dram_cap_extent_alloc;
+    t->hooks.dalloc       = dram_cap_extent_dalloc;
+    t->hooks.destroy      = dram_cap_extent_destroy;
+    t->hooks.commit       = dram_cap_extent_commit;
+    t->hooks.decommit     = dram_cap_extent_decommit;
+    t->hooks.purge_lazy   = dram_cap_extent_purge_lazy;
+    t->hooks.purge_forced = dram_cap_extent_purge_forced;
+    t->hooks.split        = dram_cap_extent_split;
+    t->hooks.merge        = dram_cap_extent_merge;
+}
+
+static void dram_cap_bind_region(void *addr, size_t size) {
+    struct bitmask *mask = numa_bitmask_alloc(numa_num_possible_nodes());
+    if (!mask) return;
+    numa_bitmask_setbit(mask, 0); /* DRAM NUMA node -- node 0 by definition here */
+    /* Policy only (flags 0): nothing is faulted yet, so no MOVE needed;
+     * faults land on node 0 afterward. */
+    if (mbind(addr, size, MPOL_BIND, mask->maskp, mask->size + 1, 0) != 0) {
+        fprintf(stderr, "dram_cap: mbind(%zu) failed: %s\n", size, strerror(errno));
+    }
+    numa_bitmask_free(mask);
+}
+
+/* Reads PAPER_CACHE_DRAM_CAP_BYTES and, if set to a nonzero value,
+ * reserves the region and installs the capped arena. Returns:
+ *   0 -- cap successfully activated
+ *   1 -- no (or zero) cap configured; caller should fall back to the
+ *        existing UMF jemalloc pool path for node 0
+ *  >1 -- a real initialization error occurred
+ */
+static int dram_cap_init_from_env(void) {
+    const char *env = getenv("PAPER_CACHE_DRAM_CAP_BYTES");
+    if (!env || env[0] == '\0') return 1;
+
+    unsigned long long requested = strtoull(env, NULL, 10);
+    if (requested == 0) return 1;
+    size_t bytes = (size_t)requested;
+
+    dram_cap_init_hooks(&dram_cap_tier);
+
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "dram_cap: mmap(%zu) failed: %s\n", bytes, strerror(errno));
+        return 2;
+    }
+    dram_cap_bind_region(p, bytes);
+    dram_cap_tier.region_base = p;
+    dram_cap_tier.region_cap  = bytes;
+    atomic_store_explicit(&dram_cap_tier.region_off, 0, memory_order_release);
+
+    unsigned ind;
+    size_t ind_sz = sizeof(ind);
+    if (mallctl("arenas.create", &ind, &ind_sz, NULL, 0) != 0) {
+        fprintf(stderr, "dram_cap: arenas.create failed\n");
+        munmap(p, bytes);
+        dram_cap_tier.region_base = NULL;
+        dram_cap_tier.region_cap  = 0;
+        return 3;
+    }
+
+    char path[64];
+    snprintf(path, sizeof(path), "arena.%u.extent_hooks", ind);
+    extent_hooks_t *hooks_ptr = &dram_cap_tier.hooks;
+    if (mallctl(path, NULL, NULL, &hooks_ptr, sizeof(hooks_ptr)) != 0) {
+        fprintf(stderr, "dram_cap: setting extent_hooks on arena %u failed\n", ind);
+        snprintf(path, sizeof(path), "arena.%u.destroy", ind);
+        mallctl(path, NULL, NULL, NULL, 0);
+        munmap(p, bytes);
+        dram_cap_tier.region_base = NULL;
+        dram_cap_tier.region_cap  = 0;
+        return 4;
+    }
+
+    /* No dedicated tcache: DRAMObjects is the crate's #[global_allocator],
+     * called concurrently from every OS thread in the process. A tcache
+     * (thread cache) is not safe to share across threads -- its bin
+     * freelists are plain linked lists with no internal locking, only
+     * correct when each tcache is used by a single thread at a time. A
+     * first version of this code created ONE tcache per tier via
+     * `tcache.create` and reused its index (`MALLOCX_TCACHE(tc)`) from every
+     * calling thread; under concurrent load this corrupted jemalloc's own
+     * internal extent-heap bookkeeping and crashed inside
+     * je_tcache_bin_flush_small -> je_extent_heap_remove (confirmed via gdb
+     * on a real SIGSEGV during the 200K-object repro test). Every alloc/
+     * dealloc below instead goes straight to the arena's own bins via
+     * MALLOCX_TCACHE_NONE, which jemalloc already protects with a proper
+     * per-arena-bin lock (slower than a tcache hit, but correct). */
+    atomic_store_explicit(&dram_cap_tier.arena_ind, ind, memory_order_release);
+    atomic_store_explicit(&dram_cap_active, true, memory_order_release);
+
+    fprintf(stderr,
+            "dram_cap: DRAM hard cap active -- %zu bytes reserved at %p "
+            "(PAPER_CACHE_DRAM_CAP_BYTES=%s)\n",
+            bytes, p, env);
+    return 0;
+}
+
+static bool dram_cap_is_active(void) {
+    return atomic_load_explicit(&dram_cap_active, memory_order_acquire);
+}
+
+static bool dram_cap_owns(void *ptr) {
+    if (!dram_cap_tier.region_base) return false;
+    uintptr_t p    = (uintptr_t)ptr;
+    uintptr_t base = (uintptr_t)dram_cap_tier.region_base;
+    return p >= base && p < base + dram_cap_tier.region_cap;
+}
+
+static void *dram_cap_alloc(size_t size, size_t align) {
+    if (size == 0) return NULL;
+    unsigned ind = atomic_load_explicit(&dram_cap_tier.arena_ind, memory_order_acquire);
+    if (ind == UINT_MAX) return NULL;
+
+    int flags = MALLOCX_ARENA(ind) | MALLOCX_TCACHE_NONE;
+    if (align && align > sizeof(void *)) flags |= MALLOCX_ALIGN(align);
+    return mallocx(size, flags);
+}
+
+static void dram_cap_dealloc(void *ptr) {
+    if (!ptr) return;
+    unsigned ind = atomic_load_explicit(&dram_cap_tier.arena_ind, memory_order_acquire);
+    if (ind == UINT_MAX) return;
+    dallocx(ptr, MALLOCX_ARENA(ind) | MALLOCX_TCACHE_NONE);
+}
+
 
 // numa_node = NUMA node id (check with numactl -H)
 
+static int umf_pool_init(int numa_node);
+
 int umf_allocator_init(int numa_node) {
+    if (numa_node == 0) {
+        int rc = dram_cap_init_from_env();
+        if (rc == 0) return 0;      /* hard-capped arena is now active */
+        if (rc != 1) return rc;     /* a real error occurred setting it up */
+        /* rc == 1: PAPER_CACHE_DRAM_CAP_BYTES not set -- fall through to
+         * the existing UMF jemalloc pool path below, unchanged. */
+    }
+    return umf_pool_init(numa_node);
+}
+
+static int umf_pool_init(int numa_node) {
     //setenv("UMF_CONF", "umf.provider.os.params.mmap_flags=0x8000", 0);
     umf_memory_pool_handle_t new_pool = NULL;
     umf_jemalloc_pool_params_handle_t jemalloc_params = NULL;
@@ -242,6 +515,10 @@ void *umf_alloc(int numa_node, size_t size, size_t align) {
     if (size == 0) return NULL;
     if (numa_node < 0 || numa_node >= MAX_NODES) return NULL;
 
+    if (numa_node == 0 && dram_cap_is_active()) {
+        return dram_cap_alloc(size, align);
+    }
+
     /* Lock-free fast path. The scalable pool (TBB) handles its own thread
      * safety via per-thread caches; wrapping every alloc in a global mutex
      * would serialize the entire process and destroy scalability. */
@@ -260,6 +537,11 @@ void umf_dealloc(int numa_node, void *ptr) {
     if (!ptr) return;
     if (numa_node < 0 || numa_node >= MAX_NODES) return;
 
+    if (numa_node == 0 && dram_cap_is_active()) {
+        dram_cap_dealloc(ptr);
+        return;
+    }
+
     umf_memory_pool_handle_t p = (umf_memory_pool_handle_t)
         atomic_load_explicit(&pools[numa_node], memory_order_acquire);
     if (!p) return;  /* pool already destroyed; OS will reclaim on exit */
@@ -269,13 +551,18 @@ void umf_dealloc(int numa_node, void *ptr) {
 
 
 /* Returns the NUMA node id that owns this pointer, or -1 if the pointer
- * is not managed by any of our UMF pools.
+ * is not managed by any of our UMF pools (or, when active, the DRAM hard
+ * cap's own region).
  *
  * NOTE: return semantics changed. The old version returned 1=pmem / 0=dram.
  * Callers that used the return as a bool must be updated. Use the node id
  * directly, or compare against a known value (e.g. `check_tier(p) == 1`).
  */
 int check_tier(void *ptr) {
+    if (dram_cap_is_active() && dram_cap_owns(ptr)) {
+        return 0;
+    }
+
     umf_memory_pool_handle_t curr_pool;
     if (umfPoolByPtr(ptr, &curr_pool) != UMF_RESULT_SUCCESS) {
         return -1;

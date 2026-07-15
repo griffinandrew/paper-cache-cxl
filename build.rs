@@ -26,6 +26,36 @@ fn main() {
             .include(umf_include_dir)
             .compile("umf_allocator_wrapper");
 
+        // DRAM hard cap (node 0 only, see umf_allocator_wrapper.c): links the
+        // SYSTEM jemalloc directly, alongside (not instead of) the separate
+        // jemalloc statically bundled inside libumf.so that backs node 1's
+        // umfJemallocPoolOps() pool. Confirmed safe: both jemalloc instances
+        // coexist in one process without symbol collisions (the system
+        // library's `mallctl`/`mallocx`/`dallocx` are the only ones visible
+        // dynamically; libumf's internal jemalloc symbols are not exported).
+        //
+        // Linked by absolute path via `rustc-link-arg` (not `rustc-link-lib`)
+        // so it lands at the true tail of the linker invocation, after the
+        // `libumf_allocator_wrapper.a` archive that references its symbols
+        // (`mallctl`/`mallocx`/`dallocx`). The `-l`/`-L`-based form put
+        // `-ljemalloc` before that archive on the command line regardless of
+        // *this* println!'s position in build.rs (cargo groups
+        // `rustc-link-lib` output together ahead of the crate's own compiled
+        // archives), and with `--as-needed` in effect rust-lld only resolves
+        // a dylib's symbols against references already outstanding when it
+        // reaches that dylib -- so the symbols stayed permanently undefined.
+        let jemalloc_candidates = [
+            "/usr/lib64/libjemalloc.so.2",
+            "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
+        ];
+        if let Some(jemalloc_path) = jemalloc_candidates.iter().find(|p| Path::new(p).exists()) {
+            println!("cargo:rustc-link-arg={}", jemalloc_path);
+        } else {
+            println!(
+                "cargo:warning=libjemalloc.so.2 not found; DRAM hard cap (PAPER_CACHE_DRAM_CAP_BYTES) will be unavailable"
+            );
+        }
+
     } else {
         // UMF hardware / headers not available (CI, developer machines).
         // Compile the stub implementation so that the UMF C symbols are
