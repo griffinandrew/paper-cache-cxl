@@ -489,21 +489,30 @@ mod lfu_hybrid_cache_tests {
         // fast tier whose raw byte budget (2 KB) would comfortably hold all of
         // these tiny (~13-byte) values at once. The fast-tier budget, however,
         // now also reserves an approximate per-object DRAM cost for the shared
-        // object hashtable + eviction stacks; across many objects that
-        // reservation fills the budget, so once the fast tier is full every
-        // further admission is routed straight to the slow tier — even though
-        // the values alone would all fit. Crucially, this never evicts.
+        // object hashtable (and the eviction stacks too, when those are also
+        // DRAM-resident -- excluded here under `eviction_stacks_pmem`, so this
+        // test only needs to rely on the smaller hashtable-only term); across
+        // *enough* objects that reservation fills the budget regardless of
+        // which terms apply, so once the fast tier is full every further
+        // admission is routed straight to the slow tier -- even though the
+        // values alone would all fit. Crucially, this never evicts. 300
+        // objects gives comfortable margin under the hashtable-only
+        // reservation alone (roughly 11 bytes/object -- see
+        // `object/overhead.rs::HASHTABLE_ENTRY_OVERHEAD` -- so >180 objects
+        // already exceeds the 2 KB budget on that term by itself); once the
+        // admission latch trips (see `LfuHybridStack`'s module doc), every
+        // later admission stays routed to slow regardless.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
             CacheTierSize::Bytes(2_000),
         ).expect("cache should construct");
 
-        for key in 1u32..=40 {
+        for key in 1u32..=300 {
             cache.set(key, b"payload bytes", None).expect("set should succeed");
         }
 
         // The shared-metadata reservation fills the 2 KB fast budget well
-        // before 40 objects, so later admissions land in the slow tier.
+        // before 300 objects, so later admissions land in the slow tier.
         let routed = wait_until(MIGRATION_TIMEOUT, || {
             cache.lfu_hybrid_stats().slow_objects >= 1
         });
@@ -514,8 +523,8 @@ mod lfu_hybrid_cache_tests {
         let stats = cache.lfu_hybrid_stats();
         assert_eq!(stats.evictions, 0, "the DRAM cap must route to slow, never evict");
 
-        let present = (1u32..=40).filter(|key| cache.has(key)).count();
-        assert_eq!(present, 40, "no key should be evicted by the DRAM cap");
+        let present = (1u32..=300).filter(|key| cache.has(key)).count();
+        assert_eq!(present, 300, "no key should be evicted by the DRAM cap");
 
         // The fast tier's live value bytes stay within the configured budget.
         assert!(stats.fast_bytes_used <= cache.fast_tier_size());

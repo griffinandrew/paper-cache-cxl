@@ -689,6 +689,64 @@ floor (see the "No headroom" note in `lru_hybrid_cache`'s section above) was rem
 explicit request (*"keeping the 10% high water mark in the lru implementation hurts performance so
 get rid of it"*) — `settle_fast_tier` there now also drains to exactly `fast_capacity`.
 
+### Post-implementation fix: fast-tier size as a total-DRAM budget, and two follow-on corrections
+
+In a later session, `lru_hybrid_cache`/`lfu_hybrid_cache`'s fast-tier budget (`CacheTierSize`,
+e.g. `CacheTierSize::Gb(4)`) was extended to bound *total DRAM*, not just fast-tier object values:
+both stacks gained a `shared_overhead: CacheSize` field (`0` unless set via `with_shared_overhead`,
+wired in by `init_policy_stack` via `object::overhead::get_hybrid_dram_shared_overhead(&policy)`)
+representing the approximate per-object DRAM cost of the shared object hashtable + eviction stacks
+(both hold an entry for every object of *both* tiers). `settle_fast_tier` demotes against an
+*effective* budget of `fast_capacity − (tracked_count × shared_overhead)` rather than raw
+`fast_capacity`. Per the user's explicit direction, this is **demotion-only** — it never triggers
+eviction; terminal eviction remains governed solely by `used_size() > max_size`, popping the slow
+tail exactly as before. `eviction_stacks_pmem` moving the eviction stacks to PMEM (see the section
+below) drops that term from the reservation; a hashtable-PMEM feature would similarly drop the
+hashtable term. `two_q_hybrid_cache` was left out of scope.
+
+Two follow-on bugs were then reported and fixed in the same area:
+
+**1. LFU admission wasn't honoring frequency order once the fast tier had ever been demoted from.**
+`LfuHybridStack::settle_fast_tier`'s demotion granularity is per-*object*, not per-*byte*: demoting
+one lowest-frequency fast object to cover a small promotion overage can free far more bytes than
+the overage itself (e.g. demoting a 90-byte object to cover a 5-byte overage leaves 85 bytes of
+slack). The byte-capacity admission check alone let a brand-new, frequency-1 key sneak into that
+slack — bypassing the "prove yourself via promotion from slow" path — even when every current fast
+resident already had frequency ≥ 2. Reproduced directly against the stack (two 50-byte keys fill a
+100-byte fast tier; a promotion demotes one via LRU-tied eviction, leaving headroom; once every
+remaining fast resident is bumped past frequency 1, a brand-new frequency-1 key still lands in
+fast purely on leftover bytes). Two fixes were considered — gating admission on whether the fast
+chain's *current minimum frequency* is still 1 (rejected by the user: "it still is not really
+honoring lfu order" — it still lets a newcomer ride in alongside any surviving untouched
+frequency-1 resident) vs. a one-time latch (chosen) — `fast_tier_latched: bool` permanently closes
+brand-new-key admission to fast the first time capacity is genuinely reached (a failed admission,
+or any `settle_fast_tier` demotion). Once latched, every subsequent brand-new key goes straight to
+slow regardless of later byte slack, only reachable via promotion. Resets on `clear()`; also resets
+on `resize_fast_tier` *growing* the budget (a deliberate capacity increase should be immediately
+usable, not gated behind promotions) but not on shrinking. See `lfu_hybrid_stack.rs`'s module doc
+for the full derivation and the rejected frequency-gate alternative, kept as a documented option
+for a future revision.
+
+**2. The DRAM-reservation constants were overestimating by a meaningful margin.** Investigation
+(measuring real `std::mem::size_of` values for the concrete types involved, combined with
+`hashbrown`'s ~7/8 max-load-factor amortization formula, `ceil((raw_pair_size + 1) * 8 / 7)` —
+see `object/overhead.rs`'s derivation block) found two concrete sources of over-counting: (a)
+`HASHTABLE_ENTRY_OVERHEAD` was an arbitrary `24`, versus a derived `11` (the map's own 8-byte
+`HashedKey`, distinct from any key the `Object` stores internally, plus its amortized hashbrown
+overhead); (b) `get_hybrid_dram_shared_overhead`'s eviction-stack term reused `get_policy_overhead`
+verbatim, which turned out to measure `size_of::<HashList<..>>()` — the *container's* one-time
+fixed struct size (a 32-byte `HashMap` header + 2 pointers) — as if it were a per-entry cost, on
+top of a separately redundant "+8 for the key" charge (the key is already stored once, inside the
+list's heap node). Replaced with dedicated, derived-from-measurement constants
+(`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD = 84`, `LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD = 113`)
+computed independently of `get_policy_overhead` (which is left untouched — it's shared,
+`used_size`-oriented, out of scope here, and reusing it was the mistake). Net effect: total
+reserved per-object overhead dropped from 105→95 bytes (LRU) and 161→124 bytes (LFU). Two
+integration tests (`dram_cap_reserves_shared_metadata_*`) that relied on the reservation alone
+forcing demotion/slow-routing within 40 tiny objects had their object counts bumped to 300 for
+comfortable margin under the smaller, now-correct numbers (especially under `eviction_stacks_pmem`,
+where only the ~11-byte hashtable term applies, not the larger eviction-stack term).
+
 ### Remaining work
 
 - No dedicated test yet for a multi-key single-step promotion/demotion cascade with mixed

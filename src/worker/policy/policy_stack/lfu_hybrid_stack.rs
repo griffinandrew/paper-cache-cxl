@@ -33,6 +33,36 @@
 //! `(key, Tier::Slow)` migration, physically corrected by
 //! `PolicyWorker::apply_tier_migrations` the same way a demotion is.
 //!
+//! ## Admission latches shut once the fast tier has ever reached capacity
+//!
+//! A raw byte-capacity check alone (`fast_used + size <= admit_effective`)
+//! is not sufficient to keep admission honoring frequency order over time,
+//! because `settle_fast_tier`'s demotion granularity is per-*object*, not
+//! per-*byte*: demoting one lowest-frequency fast object to cover a small
+//! promotion overage can free far more bytes than the overage itself (e.g.
+//! demoting a 90-byte object to cover a 5-byte overage leaves 85 bytes of
+//! slack). A brand-new, frequency-1 key admitted purely because that slack
+//! exists bypasses the "prove yourself via promotion from slow" path
+//! entirely — even when every current fast resident already has frequency
+//! ≥ 2 — which does not honor LFU ordering.
+//!
+//! To close this, `fast_tier_latched: bool` permanently closes brand-new-key
+//! admission to the fast tier the first time capacity is genuinely reached
+//! (a new admission that doesn't fit, or a demotion firing inside
+//! `settle_fast_tier`): once latched, *every* subsequent brand-new key goes
+//! straight to slow regardless of any later byte slack, and can only reach
+//! the fast tier by earning a promotion. The latch resets on `clear()`
+//! (full state reset) and on `resize_fast_tier` *growing* the budget (a
+//! deliberate capacity increase should be immediately usable by new
+//! admissions, not gated behind promotions).
+//!
+//! A previously-considered alternative — gating admission on whether the
+//! fast chain's *current minimum frequency* is still 1, rather than a
+//! one-time latch — was rejected for now: it still permits a brand-new key
+//! to ride in alongside any surviving untouched frequency-1 resident, which
+//! does not fully honor LFU order either. Left as a documented option for a
+//! future revision if the one-time latch proves too coarse in practice.
+//!
 //! A slow-tier access (`update`) bumps that key's frequency in the slow
 //! chain; if the new count strictly exceeds the fast chain's current
 //! minimum (or the fast chain is empty), the key is promoted — moved to the
@@ -348,6 +378,14 @@ pub struct LfuHybridStack {
 	/// `Tier::Slow` entries specifically so a fresh admission-to-slow isn't
 	/// miscounted as a demotion (see `drain_demotions`'s trait doc).
 	pending_demotions: u64,
+
+	/// Once `true`, every brand-new key is admitted straight to slow,
+	/// regardless of any leftover fast-tier byte slack. Set the first time
+	/// fast-tier capacity is genuinely reached (a failed admission or a
+	/// `settle_fast_tier` demotion); reset by `clear()` and by
+	/// `resize_fast_tier` growing the budget. See the module doc for why a
+	/// one-time latch is needed on top of the raw byte check.
+	fast_tier_latched: bool,
 }
 
 impl LfuHybridStack {
@@ -383,6 +421,7 @@ impl LfuHybridStack {
 
 			migrations: Vec::new(),
 			pending_demotions: 0,
+			fast_tier_latched: false,
 		}
 	}
 
@@ -489,6 +528,11 @@ impl LfuHybridStack {
 
 			self.migrations.push((demote_key, Tier::Slow));
 			self.pending_demotions += 1;
+
+			// A demotion firing at all means fast-tier capacity was
+			// genuinely reached — latch shut brand-new admission (see the
+			// module doc).
+			self.fast_tier_latched = true;
 		}
 	}
 }
@@ -529,12 +573,22 @@ impl PolicyStack for LfuHybridStack {
 			return;
 		}
 
-		// Brand-new key: admitted to the fast chain only while there's
-		// room; once fast-tier capacity is reached, every new key goes
-		// straight to the slow chain instead — see the module doc for why
-		// this is a direct capacity check rather than relying on
-		// tie-breaking within `settle_fast_tier`.
-		//
+		// Brand-new key: admitted to the fast chain only while there's room
+		// *and* the fast tier has never yet reached capacity — see the
+		// module doc for why a one-time latch is needed on top of the raw
+		// byte check (byte slack left over from an object-granular demotion
+		// would otherwise let a frequency-1 newcomer bypass promotion).
+		self.sizes.insert(key, size);
+
+		if self.fast_tier_latched {
+			self.slow_chain.insert_new(key);
+			self.tiers.insert(key, Tier::Slow);
+			self.slow_used += size as CacheSize;
+
+			self.migrations.push((key, Tier::Slow));
+			return;
+		}
+
 		// The capacity checked is the *effective* value budget (`fast_capacity`
 		// minus the DRAM reserved for shared per-object metadata), so admission
 		// honors the same total-DRAM bound as demotion. The `+ 1` reserves for
@@ -542,8 +596,6 @@ impl PolicyStack for LfuHybridStack {
 		// it lands fast or slow. (Unlike `LruHybridStack`, LFU doesn't call
 		// `settle_fast_tier` on a fresh admission, so the budget check has to
 		// happen here.)
-		self.sizes.insert(key, size);
-
 		let admit_effective = self.fast_capacity
 			.saturating_sub((self.tiers.len() as CacheSize + 1) * self.shared_overhead);
 
@@ -557,6 +609,10 @@ impl PolicyStack for LfuHybridStack {
 			self.slow_used += size as CacheSize;
 
 			self.migrations.push((key, Tier::Slow));
+
+			// Capacity was genuinely reached — latch shut for all future
+			// brand-new admissions (see the module doc).
+			self.fast_tier_latched = true;
 		}
 	}
 
@@ -604,6 +660,7 @@ impl PolicyStack for LfuHybridStack {
 		self.slow_used = 0;
 		self.migrations.clear();
 		self.pending_demotions = 0;
+		self.fast_tier_latched = false;
 	}
 
 	fn evict_one(&mut self) -> Option<HashedKey> {
@@ -626,6 +683,15 @@ impl PolicyStack for LfuHybridStack {
 	}
 
 	fn resize_fast_tier(&mut self, size: CacheSize) {
+		// Growing the budget is a deliberate decision to make more capacity
+		// available; the fresh room should be immediately usable by new
+		// admissions rather than gated behind promotions, so unlatch. A
+		// shrink (or no-op resize) leaves the latch as-is — `settle_fast_tier`
+		// below will naturally re-latch it if the shrink forces a demotion.
+		if size > self.fast_capacity {
+			self.fast_tier_latched = false;
+		}
+
 		self.fast_capacity = size;
 		self.settle_fast_tier();
 	}
@@ -963,5 +1029,98 @@ mod tests {
 		assert_eq!(stack.slow_bytes_used(), 0);
 		assert_eq!(stack.tier_of(2), None);
 		assert_eq!(stack.evict_one(), None);
+	}
+
+	#[test]
+	fn admission_latches_shut_once_capacity_is_reached_even_after_headroom_reopens() {
+		// Reproduces the object-granular-demotion headroom gap: two 50-byte
+		// keys fill a 100-byte fast tier; promoting a third (5-byte) slow key
+		// demotes one of them (LRU-within-tie), leaving 45 bytes of slack even
+		// though the tier has "reached capacity" in the LFU sense. A raw byte
+		// check alone would let a brand-new frequency-1 key back into that
+		// slack; the latch must block it once every current fast resident is
+		// frequency >= 2.
+		let mut stack = LfuHybridStack::new(100);
+
+		stack.insert(1, 50); // A, freq 1
+		stack.insert(2, 50); // B, freq 1
+		drain(&mut stack);
+		assert_eq!(stack.fast_bytes_used(), 100);
+
+		stack.insert(3, 5); // C, freq 1 -> capacity full -> slow, latches
+		drain(&mut stack);
+		assert_eq!(stack.tier_of(3), Some(Tier::Slow));
+
+		stack.update(3); // C: freq 1 -> 2, promotes, demotes the freq-1 LRU tie
+		drain(&mut stack);
+
+		// Demotion left byte slack (some fast resident's size exceeded the
+		// promotion's overage).
+		assert!(stack.fast_bytes_used() < 100, "demotion should have overshot the exact overage");
+
+		// A brand-new key must go straight to slow: the latch is already
+		// tripped, regardless of the leftover slack.
+		stack.insert(4, 5);
+		let migrations = drain(&mut stack);
+
+		assert_eq!(migrations, vec![(4, Tier::Slow)]);
+		assert_eq!(stack.tier_of(4), Some(Tier::Slow));
+	}
+
+	#[test]
+	fn growing_fast_tier_via_resize_unlatches_admission() {
+		let mut stack = LfuHybridStack::new(10);
+
+		stack.insert(1, 10); // fills the tiny fast tier
+		drain(&mut stack);
+
+		stack.insert(2, 10); // doesn't fit -> slow, latches
+		drain(&mut stack);
+		assert_eq!(stack.tier_of(2), Some(Tier::Slow));
+
+		// A deliberate capacity increase should immediately reopen direct
+		// admission, not force new keys to wait on a promotion.
+		stack.resize_fast_tier(1_000);
+		drain(&mut stack);
+
+		stack.insert(3, 10);
+		let migrations = drain(&mut stack);
+
+		assert_eq!(migrations, Vec::new(), "key 3 should have been admitted directly to fast");
+		assert_eq!(stack.tier_of(3), Some(Tier::Fast));
+	}
+
+	#[test]
+	fn shrinking_fast_tier_via_resize_does_not_unlatch() {
+		let mut stack = LfuHybridStack::new(1_000);
+
+		stack.insert(1, 10);
+		drain(&mut stack);
+
+		// Never reached capacity yet -- latch still open.
+		stack.resize_fast_tier(500);
+		drain(&mut stack);
+
+		stack.insert(2, 10);
+		let migrations = drain(&mut stack);
+		assert_eq!(stack.tier_of(2), Some(Tier::Fast), "shrinking alone must not spuriously latch");
+		assert_eq!(migrations, Vec::new());
+	}
+
+	#[test]
+	fn clear_resets_the_latch() {
+		let mut stack = LfuHybridStack::new(10);
+
+		stack.insert(1, 10);
+		stack.insert(2, 10); // doesn't fit -> slow, latches
+		drain(&mut stack);
+		assert_eq!(stack.tier_of(2), Some(Tier::Slow));
+
+		stack.clear();
+
+		stack.insert(3, 10);
+		let migrations = drain(&mut stack);
+		assert_eq!(stack.tier_of(3), Some(Tier::Fast), "clear() should reset the latch");
+		assert_eq!(migrations, Vec::new());
 	}
 }
