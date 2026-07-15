@@ -202,27 +202,62 @@ before the `PaperCache` — and its worker threads — dropped; plausibly a robu
 a cache in the middle of an in-flight migration backlog, not investigated further since it stopped
 occurring once settlement was reliable.)
 
-**Open hypothesis (not fixed, needs a decision): even with both bugs fixed and settlement
-genuinely verified, real DRAM usage still ran ~13–14x over the configured fast-tier budget** (node0
-≈ 13.2 GB real vs. a 953.7 MB configured `CacheTierSize::Gb(1)` budget — note `Gb` is decimal SI,
-10^9 bytes, ~7% smaller than a binary GiB; the stack's own `fast_bytes_used` correctly stayed under
-budget throughout, ~848 MB). Traced the allocator chain (`umf_allocator_wrapper.c`): `umf_dealloc`
-calls `umfPoolFree()` — a pool-level free that returns memory to the UMF pool for reuse, not to the
-OS/kernel. This is standard behavior for pool/arena allocators (comparable to glibc malloc or
-jemalloc not immediately shrinking RSS after `free()`), and is consistent with every observation:
-during the insertion burst, every new `set()` call synchronously builds `TieredBuffer::new_fast`
-(a real DRAM allocation) *before* the worker thread has decided whether that object should
-ultimately be fast or slow — so a real, transient population of allocations (large relative to the
-1M-object, ~90%-eventually-demoted workload) briefly exists in DRAM during the burst, before being
-freed back to the pool as demotions catch up. If the pool's underlying OS-level mapping never
-shrinks back down after that peak, `/proc/<pid>/numa_maps` (which reports resident pages, not
-"currently live" bytes) would report something close to that historical peak indefinitely,
-matching the observed gap in order of magnitude. **Not yet confirmed** — would need either a
-targeted smaller-scale comparison (does real DRAM scale with peak burst size rather than final
-tier-size) or inspecting UMF's pool/provider configuration directly to be certain, and doing so
-touches vendored C code (`umf_allocator/`) rather than this crate's own Rust logic. Flagged for the
-user to decide whether it's worth pursuing further now that the two clearer, fixable bugs are
-resolved.
+**Confirmed root cause (not fixed — third-party allocator behavior, not a bug in this crate):
+real DRAM usage tracks total cumulative admission volume, not the fast-tier budget, because the
+underlying TBB scalable-pool allocator never releases fragmented freed blocks back to the OS.**
+Even with both bugs above fixed and settlement genuinely verified (`fast_objects + slow_objects ==
+num_objects` exactly, not just a plausible-looking gauge snapshot), real DRAM (node0) still ran
+~13–14x over the configured fast-tier budget at 1M objects (13.2 GB real vs. 953.7 MB configured
+`CacheTierSize::Gb(1)` — note `Gb` is decimal SI, 10^9 bytes, ~7% smaller than a binary GiB; the
+stack's own `fast_bytes_used` correctly stayed under budget throughout, ~848 MB).
+
+Confirmed via a **peak-vs-settled, multi-scale comparison** added to the same reproduction test
+(`repro_real_dram_usage_at_scale` now reads `REPRO_OBJECT_COUNT` from the environment, sampling
+`numa_maps` both immediately after the insert burst — before the worker has caught up — and again
+after genuine full settlement):
+
+| objects | demotions | peak node0 | settled node0 | settled/peak |
+|---|---|---|---|---|
+| 50,000 | 0 (all fit in budget) | 1,106.5 MB | 1,120.3 MB | 1.012 |
+| 200,000 | 140,972 | 3,959.0 MB | 3,983.3 MB | 1.006 |
+| 1,000,000 | 945,823 | 13,098.4 MB | 13,246.3 MB | 1.011 |
+
+Two things this table proves directly: (1) settled/peak ≈ 1.0 at every scale — DRAM never shrinks
+back down once the worker genuinely catches up, it just stays wherever the peak left it; (2) at
+50K objects, where *nothing* was ever demoted (the whole workload fit inside the fast-tier budget),
+real DRAM tracked the configured budget closely (1.17x — a small, explicable margin, not a mystery
+multiplier). The "peak" itself is real: every `set()` synchronously builds `TieredBuffer::new_fast`
+in DRAM before the worker has decided a tier, so cumulative *admissions* (not the final tier
+occupancy) drive how much memory is ever touched.
+
+Traced to the exact line: `umf_allocator/umf_allocator_wrapper.c`'s `umf_allocator_init` explicitly
+calls `umfScalablePoolParamsSetKeepAllMemory(scalable_params, 1)`, documented in its own comment as
+forcing "the TBB backend to retain freed blocks rather than triggering purging calls down into the
+OS memory provider." This looked like the obvious lever — but **flipping it to `0` and rebuilding
+made no measurable difference** (200K-object test: 3994.9/4018.5 MB, ratio 1.006 — statistically
+identical to `KeepAllMemory=1`'s 3959.0/3983.3 MB). Traced one level deeper: `umfScalablePoolOps()`
+wraps Intel TBB's scalable allocator (`libtbbmalloc`), a slab/superblock allocator (2 MB granularity
+here, via `umfScalablePoolParamsSetGranularity`). `KeepAllMemory` only gates whether the *pool* is
+permitted to call the *provider's* free at all — and the provider's own `os_free()` (in UMF's
+vendored `provider_os_memory.c`) does correctly call `munmap()` when invoked. But TBB's internal
+superblock-retention heuristics — which decide whether a given freed region is ever fully empty and
+thus eligible to hand back — are opaque from the UMF wrapper level and evidently never consider
+these superblocks reclaimable under this allocation/free pattern (many small, staggered-lifetime
+16 KB objects spread across superblocks), independent of the flag. Reverted `KeepAllMemory` to its
+original `1` (documented in `umf_allocator_wrapper.c`) since `0` provided no benefit and only adds
+provider round-trip overhead for no gain.
+
+**Not fixed. Two real paths forward, both bigger than a flag flip, left for the user to decide:**
+(a) swap the pool backend — UMF also supports a jemalloc-backed pool (referenced, currently
+commented out, in `allocator.rs`/`umf_allocator_wrapper.c`'s `DAXPMEM` path via
+`umfJemallocPoolOps()`); jemalloc's configurable `dirty_decay`/`muzzy_decay` and `MADV_FREE`-based
+reclaim may behave differently under this fragmentation pattern, but this is unverified and would
+need the same peak-vs-settled comparison to confirm before trusting it; (b) treat this as inherent
+to any general-purpose C pool allocator under a "many small objects, staggered lifetimes, no aligned
+freeing pattern" workload, and address it architecturally within this crate instead (e.g. a
+purpose-built fixed-size slab/arena specifically for hybrid-cache value bytes, with predictable,
+crate-controlled reclaim, rather than delegating to a general-purpose allocator not designed to
+shrink under this access pattern).
 
 ## Feature: `lru_hybrid_cache` (steps 1–10 implemented; see status below)
 

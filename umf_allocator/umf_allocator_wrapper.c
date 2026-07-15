@@ -96,6 +96,18 @@ int umf_allocator_init(int numa_node) {
     }
 
     // 1 means TRUE -> retain all memory blocks inside the pool user-space cache
+    //
+    // Tested flipping this to 0 while investigating why real DRAM usage
+    // doesn't track fast_tier_size (see CLAUDE.md): made no measurable
+    // difference (still ~4.2x budget at 200K objects / 140,972 demotions,
+    // same as with KeepAllMemory=1). Root cause is one level deeper: this
+    // pool wraps Intel TBB's scalable allocator (libtbbmalloc), whose own
+    // internal superblock/slab retention heuristics decide whether a given
+    // freed region is ever eligible to be handed back to the UMF provider
+    // (which *does* correctly munmap on free -- see os_free() in
+    // provider_os_memory.c) -- independent of this flag, which only gates
+    // whether TBB is *permitted* to give memory back at all. Reverted to the
+    // original `1` since `0` provided no benefit.
     umfScalablePoolParamsSetKeepAllMemory(scalable_params, 1);
 
     // 2 MiB == default superblock size for the scalable pool. Matching the

@@ -537,26 +537,39 @@ mod lru_hybrid_cache_tests {
     }
 
     /// Reproduces the reported scenario directly, in-process, without relying
-    /// on any external benchmark: a 1 GB fast tier, ~1M objects averaging
-    /// ~16 KB, inserted sequentially (single-threaded, no artificial burst),
-    /// then real `/proc/self/numa_maps` is read from *this* process to see
-    /// whether node0 (DRAM) usage tracks the configured fast-tier budget or
-    /// balloons past it, cross-checked against `lru_hybrid_stats()` at the
-    /// same moment to localize any gap to (a) the stack's own bookkeeping
-    /// vs. (b) something outside it.
+    /// on any external benchmark: a 1 GB fast tier, ~16 KB average objects,
+    /// inserted sequentially (single-threaded, no artificial burst), then
+    /// real `/proc/self/numa_maps` is read from *this* process at two points
+    /// -- right after the insert burst (captures the near-peak in-flight
+    /// backlog, since every `set()` writes to DRAM synchronously before the
+    /// worker has decided a tier) and again after the worker has *verifiably*
+    /// fully settled (`fast_objects + slow_objects == num_objects` exactly,
+    /// not just `fast_bytes_used` looking momentarily low -- see the fixed
+    /// gauge-staleness bug this test caught) -- to test the high-water-mark
+    /// hypothesis directly: does real DRAM shrink back down once the stack
+    /// has genuinely caught up, or does it stay pinned near the peak
+    /// (suggesting the allocator pool doesn't return freed pages to the OS)?
     ///
-    /// Not part of the default suite (`#[ignore]` -- this allocates ~16 GB of
-    /// real value bytes and takes several minutes for ~935K real PMEM
-    /// migrations). Run explicitly:
-    ///   cargo +nightly test --release --test lru_hybrid_cache_integration \
-    ///     --features lru_hybrid_cache repro_real_dram_usage_at_scale \
-    ///     -- --ignored --nocapture
+    /// Object count is read from `REPRO_OBJECT_COUNT` (default 1,000,000) so
+    /// the same code path can be run at different scales in separate,
+    /// uncontaminated processes for comparison:
+    ///   REPRO_OBJECT_COUNT=50000 cargo +nightly test --release \
+    ///     --test lru_hybrid_cache_integration --features lru_hybrid_cache \
+    ///     repro_real_dram_usage_at_scale -- --ignored --nocapture
+    ///
+    /// Not part of the default suite (`#[ignore]` -- allocates real value
+    /// bytes proportional to `REPRO_OBJECT_COUNT` and does real PMEM
+    /// migrations for ~90%+ of them).
     #[test]
     #[ignore]
     fn repro_real_dram_usage_at_scale() {
         ensure_pmem_allocator_warm();
 
-        const OBJECT_COUNT: u64 = 1_000_000;
+        let object_count: u64 = std::env::var("REPRO_OBJECT_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+
         const VALUE_LEN: usize = 16 * 1024; // 16 KB
         const FAST_TIER_GB: u64 = 1;
         const MAX_SIZE_GB: u64 = 24; // comfortably over ~16 GB of raw value bytes
@@ -575,7 +588,7 @@ mod lru_hybrid_cache_tests {
 
         let start = std::time::Instant::now();
 
-        for key in 0..OBJECT_COUNT {
+        for key in 0..object_count {
             // Non-zero, non-uniform payload so real distinct pages get
             // touched (avoids any zero-page-adjacent artifact skewing RSS).
             let value = vec![(key % 256) as u8; VALUE_LEN];
@@ -586,7 +599,17 @@ mod lru_hybrid_cache_tests {
             }
         }
 
-        println!("all {OBJECT_COUNT} objects set in {:?}; waiting for the worker to settle", start.elapsed());
+        println!("[n={object_count}] all objects set in {:?}", start.elapsed());
+
+        // Peak measurement: sampled immediately after the insert burst,
+        // before the worker has had a chance to catch up -- this is close to
+        // the largest number of objects ever simultaneously resident in DRAM
+        // (every `set()` builds `TieredBuffer::new_fast` synchronously,
+        // regardless of eventual tier).
+        let (peak_node0_mb, peak_node1_mb) = read_own_numa_usage_mb();
+        println!(
+            "[n={object_count}] PEAK (right after insert burst): node0={peak_node0_mb:.1} MB  node1={peak_node1_mb:.1} MB"
+        );
 
         // `fast_bytes_used <= fast_tier_size` alone is *not* a reliable
         // "worker has fully caught up" signal: it can already be satisfied
@@ -608,7 +631,7 @@ mod lru_hybrid_cache_tests {
                 let elapsed = settle_start.elapsed().as_secs_f64();
                 let rate = processed as f64 / elapsed.max(0.001);
                 println!(
-                    "... worker processed {processed}/{} ({:?} since insert loop finished, {rate:.0} objects/sec)",
+                    "[n={object_count}] ... worker processed {processed}/{} ({:?} since insert loop finished, {rate:.0} objects/sec)",
                     status.num_objects(), settle_start.elapsed(),
                 );
                 last_print = std::time::Instant::now();
@@ -616,7 +639,7 @@ mod lru_hybrid_cache_tests {
 
             processed == status.num_objects() && stats.fast_bytes_used <= cache.fast_tier_size()
         });
-        assert!(settled, "the stack should have processed every inserted object within 10 minutes");
+        assert!(settled, "[n={object_count}] the stack should have processed every inserted object within 10 minutes");
 
         // Extra settle time: even once the stack has assigned every object a
         // tier, the *physical* PMEM migration for the very last few of them
@@ -626,30 +649,34 @@ mod lru_hybrid_cache_tests {
 
         let stats = cache.lru_hybrid_stats();
         let status = cache.status().expect("status should be available");
-        let (node0_mb, node1_mb) = read_own_numa_usage_mb();
+        let (settled_node0_mb, settled_node1_mb) = read_own_numa_usage_mb();
 
-        println!("=== lru_hybrid_stats ===");
+        println!("[n={object_count}] === lru_hybrid_stats ===");
         println!(
-            "fast_objects={} slow_objects={} fast_bytes_used={} slow_bytes_used={} promotions={} demotions={} evictions={}",
+            "[n={object_count}] fast_objects={} slow_objects={} fast_bytes_used={} slow_bytes_used={} promotions={} demotions={} evictions={}",
             stats.fast_objects, stats.slow_objects, stats.fast_bytes_used, stats.slow_bytes_used,
             stats.promotions, stats.demotions, stats.evictions,
         );
-        println!("=== status ===");
+        println!("[n={object_count}] === status ===");
         println!(
-            "max_size={} used_size={} num_objects={} configured_fast_tier_size={}",
+            "[n={object_count}] max_size={} used_size={} num_objects={} configured_fast_tier_size={}",
             status.max_size(), status.used_size(), status.num_objects(), cache.fast_tier_size(),
         );
-        println!("=== real /proc/self/numa_maps (this process) ===");
         println!(
-            "node0={node0_mb:.1} MB  node1={node1_mb:.1} MB  total={:.1} MB",
-            node0_mb + node1_mb,
+            "[n={object_count}] SETTLED: node0={settled_node0_mb:.1} MB  node1={settled_node1_mb:.1} MB  total={:.1} MB",
+            settled_node0_mb + settled_node1_mb,
         );
 
         let fast_tier_mb = cache.fast_tier_size() as f64 / 1_048_576.0;
         println!(
-            "configured fast tier = {fast_tier_mb:.1} MB; real node0 (DRAM) = {node0_mb:.1} MB \
-             ({:.2}x)",
-            node0_mb / fast_tier_mb,
+            "[n={object_count}] SUMMARY: configured fast tier = {fast_tier_mb:.1} MB; \
+             peak node0 = {peak_node0_mb:.1} MB ({:.2}x budget); \
+             settled node0 = {settled_node0_mb:.1} MB ({:.2}x budget); \
+             settled/peak ratio = {:.3} (near 1.0 => DRAM stayed pinned near peak \
+             despite settlement; well below 1.0 => DRAM tracked the true live footprint)",
+            peak_node0_mb / fast_tier_mb,
+            settled_node0_mb / fast_tier_mb,
+            settled_node0_mb / peak_node0_mb.max(0.001),
         );
     }
 }
