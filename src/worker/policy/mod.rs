@@ -659,9 +659,21 @@ where
 	/// displaced). So every migration is still applied physically here, but
 	/// the demotion *count* comes from `drain_demotions` instead of being
 	/// inferred per-entry from `Tier::Slow`.
+	///
+	/// Also mirrors `stack.admission_latched()` onto `AtomicStatus` on every
+	/// call (unconditionally, before the empty-migrations early return —
+	/// this method already runs after every event, per-event, so this keeps
+	/// the mirror fresh regardless of whether *this particular* event
+	/// produced a migration) so `PaperCache::set()`, running on the
+	/// API-calling thread with no direct access to this worker-owned stack,
+	/// can build a brand-new key's `TieredBuffer` in the correct tier up
+	/// front instead of always guessing fast.
 	#[cfg(feature = "lfu_hybrid_cache")]
 	fn apply_tier_migrations(&mut self) {
 		let Some(stack) = &mut self.policy_stack else { return };
+
+		self.status.set_lfu_hybrid_admission_latched(stack.admission_latched());
+
 		let migrations = stack.drain_tier_migrations();
 
 		if migrations.is_empty() {

@@ -5589,7 +5589,24 @@ where
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
-		let val_buf = TieredBuffer::new_fast(value);
+		// A brand-new key built once the fast tier has genuinely reached
+		// capacity (`LfuHybridStack`'s one-time admission latch, mirrored
+		// onto `AtomicStatus` since this thread has no direct access to the
+		// worker-owned stack) goes straight into `TieredBuffer::new_slow` --
+		// this is what the stack would decide anyway, so building it fast
+		// first would only cost a synchronous DRAM write immediately
+		// followed by an async PMEM correction. An *existing* key is never
+		// affected by this check regardless of its current tier: re-setting
+		// one is an access (see this method's doc comment above), which may
+		// or may not promote it, and only the stack can decide that.
+		let is_new = !self.objects.contains_key(&hashed_key);
+
+		let val_buf = if is_new && self.status.lfu_hybrid_admission_latched() {
+			TieredBuffer::new_slow(value)
+		} else {
+			TieredBuffer::new_fast(value)
+		};
+
 		let object = Object::new(key, val_buf, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
 		let expiry = object.expiry();

@@ -530,6 +530,49 @@ mod lfu_hybrid_cache_tests {
         assert!(stats.fast_bytes_used <= cache.fast_tier_size());
     }
 
+    #[test]
+    fn set_places_a_brand_new_key_directly_in_slow_once_admission_is_latched() {
+        ensure_pmem_allocator_warm();
+
+        // A tiny fast tier that a single filler already exhausts, latching
+        // admission shut for every subsequent brand-new key (see
+        // `LfuHybridStack`'s module doc on the admission latch).
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(DEMOTES_ONE_OF_TWO),
+        ).expect("cache should construct");
+
+        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
+        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
+
+        // Wait for the worker to have applied key 2's admission-to-slow
+        // migration -- by the time `slow_objects` reflects that, the same
+        // `apply_tier_migrations` call has already synced the admission
+        // latch onto `AtomicStatus` (the sync runs unconditionally, before
+        // the migration is even applied).
+        let latched = wait_until(MIGRATION_TIMEOUT, || {
+            cache.lfu_hybrid_stats().slow_objects >= 1
+        });
+        assert!(latched, "fast tier should have latched shut after the second filler");
+
+        // A brand-new key's `set()` should place it directly in the slow
+        // tier -- checked with *no* `wait_until`: if `PaperCache::set()`
+        // still unconditionally built `TieredBuffer::new_fast` (the bug this
+        // fixes), this key would read back as `Fast` immediately after
+        // `set()` returns, only becoming `Slow` later once the worker's
+        // async correction caught up. Reading `Slow` synchronously proves
+        // the object's bytes were placed correctly the first time, with no
+        // DRAM write followed by a PMEM correction.
+        cache.set(3u32, &value(0xC3), None).expect("set should succeed");
+        assert_eq!(cache.tier_of(&3u32), Some(Tier::Slow));
+
+        // The latch must not affect an *existing* key: re-setting the very
+        // first (still-fast) filler is an access, not an admission, and
+        // should stay fast.
+        cache.set(1u32, &value(0xA9), None).expect("set should succeed");
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
+    }
+
     // ── runtime fast-tier resize ─────────────────────────────────────────
 
     #[test]

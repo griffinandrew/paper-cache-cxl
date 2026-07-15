@@ -795,6 +795,47 @@ forcing demotion/slow-routing within 40 tiny objects had their object counts bum
 comfortable margin under the smaller, now-correct numbers (especially under `eviction_stacks_pmem`,
 where only the ~11-byte hashtable term applies, not the larger eviction-stack term).
 
+### Post-implementation fix: the admission latch only fixed bookkeeping, not physical placement
+
+Reported by the user after the latch above had already shipped: the admission fix only changes
+*`LfuHybridStack`'s logical* decision about which tier a brand-new key belongs in — it doesn't
+touch `PaperCache::set()` (the `TieredBuffer` impl block, `lib.rs`), which still unconditionally
+built every brand-new key as `TieredBuffer::new_fast` regardless of what the stack would go on to
+decide. Once latched, this meant *every* admission still paid a synchronous DRAM write followed by
+an async PMEM correction (physically applied by the now-per-event `apply_tier_migrations`) — the
+latch closed the "who gets to stay fast" question but never shortened that per-admission round
+trip once closed.
+
+Fixing this required exposing the latch to the API-calling thread, which has no direct access to
+the worker-owned `policy_stack`. Added `PolicyStack::admission_latched() -> bool` (default `false`;
+only `LfuHybridStack` overrides it — `LruHybridStack`/`TwoQHybridStack` have no such ambiguity,
+since their admission rules are unconditional in one direction each), mirrored onto a new
+`AtomicStatus::lfu_hybrid_admission_latched: AtomicBool`, written by
+`PolicyWorker::apply_tier_migrations`'s LFU sibling *unconditionally at the top* (before the
+empty-migrations early return, so the mirror stays fresh even on iterations whose event alone
+didn't happen to produce a migration) and reset synchronously by `AtomicStatus::clear()` (called
+from `wipe()` on the API thread) rather than waiting for the worker to catch up. `PaperCache::set()`
+now checks `!self.objects.contains_key(&hashed_key) && self.status.lfu_hybrid_admission_latched()`
+— gated on the key being genuinely new, via one extra cheap `DashMap::contains_key` — before
+choosing `TieredBuffer::new_slow` over the default `new_fast`; an **existing** key is deliberately
+never affected by this check, regardless of its current tier, since re-setting one is an access
+(may or may not promote it) that only the stack can decide.
+
+**Known, accepted tradeoff, confirmed with the user before implementing:** building
+`TieredBuffer::new_slow` directly means that specific `set()` call now allocates via the PMEM/UMF
+allocator *synchronously, on the calling thread* — a real latency cost the previous always-DRAM
+`set()` didn't have, previously deferred entirely to the background worker. Chosen anyway (the
+alternative — leaving `set()` unconditionally fast and relying solely on the faster
+`apply_tier_migrations` — was explicitly offered and declined) because once warmed up this
+eliminates the write-then-correct round trip entirely for the common steady-state case (every
+`set()` after the fast tier first fills).
+
+Verified end-to-end (not just via the stack's own bookkeeping) with a new integration test,
+`set_places_a_brand_new_key_directly_in_slow_once_admission_is_latched`, that reads `tier_of()`
+immediately after `set()` returns with **no** `wait_until` — proving the object was placed
+correctly the first time rather than starting `Fast` and being corrected moments later — plus an
+assertion that re-setting an existing fast key stays fast (the `is_new` guard).
+
 ### Remaining work
 
 - No dedicated test yet for a multi-key single-step promotion/demotion cascade with mixed

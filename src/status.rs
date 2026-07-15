@@ -121,6 +121,17 @@ pub struct AtomicStatus {
 	#[cfg(feature = "lfu_hybrid_cache")]
 	lfu_hybrid_slow_objects: AtomicU64,
 
+	/// Mirrors `LfuHybridStack::admission_latched()` (see that trait method's
+	/// doc). Written by `PolicyWorker` every time it runs
+	/// `apply_tier_migrations`, read by `PaperCache::set()` — running on the
+	/// API-calling thread, which has no direct access to the worker-owned
+	/// policy stack — so a brand-new key can be built as
+	/// `TieredBuffer::new_slow` directly once the fast tier has genuinely
+	/// filled, instead of always guessing `new_fast` and relying on an async
+	/// correction.
+	#[cfg(feature = "lfu_hybrid_cache")]
+	lfu_hybrid_admission_latched: AtomicBool,
+
 	/// `two_q_hybrid_cache` counters/gauges — same rationale as the
 	/// `lru_hybrid_*`/`lfu_hybrid_*` fields above.
 	#[cfg(feature = "two_q_hybrid_cache")]
@@ -295,6 +306,8 @@ impl AtomicStatus {
 			lfu_hybrid_fast_objects: AtomicU64::default(),
 			#[cfg(feature = "lfu_hybrid_cache")]
 			lfu_hybrid_slow_objects: AtomicU64::default(),
+			#[cfg(feature = "lfu_hybrid_cache")]
+			lfu_hybrid_admission_latched: AtomicBool::new(false),
 
 			#[cfg(feature = "two_q_hybrid_cache")]
 			two_q_hybrid_promotions: AtomicU64::default(),
@@ -527,6 +540,25 @@ impl AtomicStatus {
 		self.lfu_hybrid_slow_objects.store(slow_objects, Ordering::Relaxed);
 	}
 
+	/// Mirrors `LfuHybridStack::admission_latched()`'s current value. Written
+	/// by `PolicyWorker::apply_tier_migrations` every time it runs, read by
+	/// `PaperCache::set()` on the API-calling thread — see the field's doc
+	/// on the struct for why this needs to cross threads via an atomic
+	/// rather than a direct call into the stack.
+	#[cfg(feature = "lfu_hybrid_cache")]
+	pub fn set_lfu_hybrid_admission_latched(&self, latched: bool) {
+		self.lfu_hybrid_admission_latched.store(latched, Ordering::Relaxed);
+	}
+
+	/// Current best-known value of `LfuHybridStack::admission_latched()`.
+	/// May be up to one worker event-loop iteration stale relative to the
+	/// stack's true internal state — see `set_lfu_hybrid_admission_latched`.
+	#[cfg(feature = "lfu_hybrid_cache")]
+	#[must_use]
+	pub fn lfu_hybrid_admission_latched(&self) -> bool {
+		self.lfu_hybrid_admission_latched.load(Ordering::Relaxed)
+	}
+
 	/// Returns a point-in-time snapshot of `lfu_hybrid_cache` statistics.
 	#[cfg(feature = "lfu_hybrid_cache")]
 	#[must_use]
@@ -596,6 +628,16 @@ impl AtomicStatus {
 		self.total_gets.store(0, Ordering::Relaxed);
 		self.total_sets.store(0, Ordering::Relaxed);
 		self.total_dels.store(0, Ordering::Relaxed);
+
+		// Reset synchronously here (called from `wipe()` on the API-calling
+		// thread) rather than waiting for `PolicyWorker` to process the
+		// corresponding `WorkerEvent::Wipe` and resync via
+		// `apply_tier_migrations` — closes the window where `set()` could
+		// otherwise read a stale `true` and build a brand-new key as
+		// `TieredBuffer::new_slow` right after a wipe, before the stack
+		// itself has caught up to also being empty (and thus unlatched).
+		#[cfg(feature = "lfu_hybrid_cache")]
+		self.lfu_hybrid_admission_latched.store(false, Ordering::Relaxed);
 	}
 
 	pub fn try_to_status(&self) -> Result<Status, CacheError> {

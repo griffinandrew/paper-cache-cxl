@@ -157,6 +157,22 @@ where
 	fn drain_demotions(&mut self) -> u64 {
 		0
 	}
+
+	/// Returns `true` if this stack has permanently closed brand-new-key
+	/// admission to the fast tier (see `LfuHybridStack`'s module doc for why
+	/// a one-time latch is needed on top of a raw byte-capacity check).
+	/// Every other stack keeps the default `false` — `LruHybridStack` and
+	/// `TwoQHybridStack`'s admission rules don't have this ambiguity (LRU
+	/// always lands fast; 2Q-hybrid always lands slow), so there's nothing
+	/// to latch. `PolicyWorker` mirrors this onto `AtomicStatus` so the
+	/// API-calling thread — which has no access to the stack itself, owned
+	/// exclusively by the worker thread — can decide a brand-new key's
+	/// physical tier placement (`TieredBuffer::new_fast` vs. `new_slow`) up
+	/// front in `PaperCache::set()`, instead of always guessing fast and
+	/// relying on an async correction.
+	fn admission_latched(&self) -> bool {
+		false
+	}
 }
 
 pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn PolicyStack> {

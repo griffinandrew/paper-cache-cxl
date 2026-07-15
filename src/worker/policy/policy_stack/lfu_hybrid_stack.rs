@@ -704,6 +704,10 @@ impl PolicyStack for LfuHybridStack {
 		std::mem::take(&mut self.pending_demotions)
 	}
 
+	fn admission_latched(&self) -> bool {
+		self.fast_tier_latched
+	}
+
 	fn fast_bytes_used(&self) -> CacheSize {
 		self.fast_used
 	}
