@@ -37,8 +37,8 @@ impl CacheTierSize {
 	pub fn to_bytes(self) -> u64 {
 		match self {
 			CacheTierSize::Bytes(b) => b,
-			CacheTierSize::Mb(mb) => mb * 1_000_000,
-			CacheTierSize::Gb(gb) => gb * 1_000_000_000,
+			CacheTierSize::Mb(mb) => mb * 1_048_576,
+			CacheTierSize::Gb(gb) => gb * 1_073_741_824,
 		}
 	}
 }
