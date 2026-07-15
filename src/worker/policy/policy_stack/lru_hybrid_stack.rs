@@ -13,11 +13,33 @@
 //! admission or access moves its key to the front and marks it `Tier::Fast`;
 //! whenever that pushes `fast_used` over `fast_capacity`, the least recently
 //! used fast key (tracked via `fast_boundary`, so no scan is needed) is
-//! demoted, draining exactly back down to `fast_capacity` (no headroom below
-//! it — an earlier low-water-floor design was removed because keeping
-//! headroom idle hurt performance for no correctness benefit). `evict_one`
-//! always pops the absolute LRU tail, which — once any demotion has
-//! occurred — is always in the slow tier.
+//! demoted. `evict_one` always pops the absolute LRU tail, which — once any
+//! demotion has occurred — is always in the slow tier.
+//!
+//! ## Low-water headroom (reintroduced, smaller than before)
+//!
+//! `settle_fast_tier` still only *triggers* once `fast_used` genuinely
+//! exceeds the effective budget (no early demotion), but once triggered,
+//! drains down to `FAST_TIER_LOW_WATER_RATIO` of that budget rather than
+//! back to exactly the ceiling. An earlier version of this stack had a
+//! larger (90%) low-water floor, removed at the user's explicit request
+//! ("keeping the 10% high water mark in the lru implementation hurts
+//! performance so get rid of it") because idle headroom cost usable space
+//! for no correctness benefit at the time. It was reintroduced, deliberately
+//! smaller, for a *different* reason: `PaperCache::set()` writes a new
+//! object's `TieredBuffer` to DRAM synchronously at the API layer, before
+//! this stack (running on the background `PolicyWorker` thread) even sees
+//! the corresponding event — so a burst of concurrent `set()` calls can
+//! transiently push real DRAM usage above what the stack's own bookkeeping
+//! shows, in the window between that physical write and the worker's next
+//! pass. Draining slightly below the ceiling on each settle leaves that
+//! burst some room to land in before the *next* settle needs to trigger
+//! again. This headroom is not itself what bounds that window — see
+//! `PolicyWorker::apply_tier_migrations`'s per-event (not per-batch)
+//! scheduling for the change that actually shrinks it — it only reduces how
+//! close to the edge the tier sits between settles, and is applied only to
+//! `LruHybridStack` (not `LfuHybridStack`, which doesn't re-settle on every
+//! admission the way this stack does).
 //!
 //! This stack only tracks *order and tier membership*; it does not move any
 //! bytes itself. `PolicyWorker` drains `drain_tier_migrations` after each
@@ -45,6 +67,16 @@ use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{PolicyStack, Tier},
 };
+
+/// Fraction of the effective fast-tier budget `settle_fast_tier` drains down
+/// to once triggered, rather than back to exactly the ceiling — see the
+/// module doc's "Low-water headroom" section for why. Deliberately much
+/// smaller than the 90% low-water floor an earlier version of this stack
+/// used (and which was removed for hurting performance): this is a burst
+/// safety margin, not a thrashing-reduction mechanism, so it only needs to
+/// be big enough to give concurrent `set()` calls some landing room, not
+/// large enough to meaningfully reduce demotion-pass frequency on its own.
+const FAST_TIER_LOW_WATER_RATIO: f64 = 0.98;
 
 // The recency list and per-key maps are DRAM-backed by default. When
 // `eviction_stacks_pmem` is enabled, they are instead allocated in the slow
@@ -235,18 +267,26 @@ impl LruHybridStack {
 		self.settle_fast_tier();
 	}
 
-	/// Demotes the least-recently-used fast key(s) until `fast_used` fits back
-	/// within the *effective* value budget: `fast_capacity` minus the DRAM
-	/// reserved for shared per-object metadata (hashtable + eviction stacks)
-	/// across both tiers. This makes the fast-tier budget bound total DRAM, not
-	/// just fast-tier values — when the shared metadata alone meets/exceeds
-	/// `fast_capacity` the effective budget saturates to 0, draining every fast
-	/// value to slow. Demotion is the only response; the DRAM budget never
+	/// Demotes the least-recently-used fast key(s), *triggered* once
+	/// `fast_used` exceeds the *effective* value budget (`fast_capacity`
+	/// minus the DRAM reserved for shared per-object metadata — hashtable +
+	/// eviction stacks — across both tiers; this makes the fast-tier budget
+	/// bound total DRAM, not just fast-tier values, saturating to 0 when the
+	/// shared metadata alone meets/exceeds `fast_capacity`), but *drained*
+	/// down to `FAST_TIER_LOW_WATER_RATIO` of that budget rather than back to
+	/// the ceiling exactly — see the module doc for why this headroom was
+	/// reintroduced. Demotion is the only response; the DRAM budget never
 	/// evicts (terminal eviction stays governed solely by `max_size`).
 	fn settle_fast_tier(&mut self) {
 		let effective = self.fast_capacity.saturating_sub(self.reserved_overhead());
 
-		while self.fast_used > effective {
+		if self.fast_used <= effective {
+			return;
+		}
+
+		let drain_target = (effective as f64 * FAST_TIER_LOW_WATER_RATIO) as CacheSize;
+
+		while self.fast_used > drain_target {
 			let Some(demote_key) = self.fast_boundary else { break };
 
 			let size = self.sizes.get(&demote_key).copied().unwrap_or(0) as CacheSize;
@@ -582,36 +622,41 @@ mod tests {
 	fn shrinking_fast_tier_at_runtime_triggers_demotions() {
 		let mut stack = LruHybridStack::new(1_000);
 
-		stack.insert(1, 10);
-		stack.insert(2, 10);
+		stack.insert(1, 100);
+		stack.insert(2, 100);
 		drain(&mut stack);
 
-		stack.resize_fast_tier(10);
+		// effective=150, drain_target = (150 * 0.98) = 147 (truncated).
+		// fast_used starts at 200; demoting the LRU tail (key 1, 100 bytes)
+		// alone already lands at 100, comfortably under 147.
+		stack.resize_fast_tier(150);
 		let migrations = drain(&mut stack);
 
 		assert_eq!(migrations, vec![(1, Tier::Slow)]);
 		assert_eq!(stack.tier_of(2), Some(Tier::Fast));
-		assert_eq!(stack.fast_bytes_used(), 10);
+		assert_eq!(stack.fast_bytes_used(), 100);
 	}
 
 	#[test]
-	fn settle_drains_to_exact_capacity_not_below() {
-		let mut stack = LruHybridStack::new(100);
+	fn settle_drains_to_low_water_target_with_headroom() {
+		let mut stack = LruHybridStack::new(1_000);
 
-		for key in 1..=10 {
-			stack.insert(key, 10); // fills to exactly 100 (== capacity, no trigger)
+		for key in 1..=100 {
+			stack.insert(key, 10); // fills to exactly 1_000 (== capacity, no trigger)
 		}
 		drain(&mut stack);
-		assert_eq!(stack.fast_bytes_used(), 100);
+		assert_eq!(stack.fast_bytes_used(), 1_000);
 
-		// 110 > 100 -> triggers, drains back to exactly 100 (no low-water
-		// floor below it — an earlier headroom design was removed because
-		// keeping idle headroom hurt performance).
-		stack.insert(11, 10);
+		// 1_010 > 1_000 -> triggers; drains down to the low-water target
+		// (1_000 * 0.98 = 980), demoting more than the single object that
+		// would have been the bare minimum to get back under capacity --
+		// this is the reintroduced headroom (see FAST_TIER_LOW_WATER_RATIO
+		// and the module doc's "Low-water headroom" section).
+		stack.insert(101, 10);
 		let migrations = drain(&mut stack);
 
-		assert_eq!(migrations, vec![(1, Tier::Slow)]);
-		assert_eq!(stack.fast_bytes_used(), 100);
+		assert_eq!(migrations, vec![(1, Tier::Slow), (2, Tier::Slow), (3, Tier::Slow)]);
+		assert_eq!(stack.fast_bytes_used(), 980);
 	}
 
 	#[test]
@@ -643,17 +688,24 @@ mod tests {
 		assert_eq!(plain.tier_of(2), Some(Tier::Fast));
 
 		// With a 30-byte per-object shared reservation, the second insert
-		// reserves 2 × 30 = 60, leaving an effective value budget of 40, so
-		// the LRU tail (key 1) demotes even though the raw values (80) fit.
+		// reserves 2 × 30 = 60, leaving an effective value budget of 40 --
+		// tighter than the raw values (80) fit. Both objects end up demoted:
+		// after the LRU tail (key 1) demotes, fast_used (40) is still above
+		// the low-water drain target (40 * 0.98 = 39, truncated), so settle
+		// continues and demotes key 2 as well, landing at 0. This is the
+		// reintroduced low-water headroom (FAST_TIER_LOW_WATER_RATIO)
+		// interacting with the DRAM-cap reservation at small scale -- with
+		// only two same-sized objects there's no smaller demotion available
+		// to land closer to the target without emptying the tier.
 		let mut stack = LruHybridStack::new(100).with_shared_overhead(30);
 		stack.insert(1, 40);
 		stack.insert(2, 40);
 		let migrations = drain(&mut stack);
 
-		assert_eq!(migrations, vec![(1, Tier::Slow)]);
+		assert_eq!(migrations, vec![(1, Tier::Slow), (2, Tier::Slow)]);
 		assert_eq!(stack.tier_of(1), Some(Tier::Slow));
-		assert_eq!(stack.tier_of(2), Some(Tier::Fast));
-		assert_eq!(stack.fast_bytes_used(), 40);
+		assert_eq!(stack.tier_of(2), Some(Tier::Slow));
+		assert_eq!(stack.fast_bytes_used(), 0);
 	}
 
 	#[test]

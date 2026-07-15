@@ -430,6 +430,54 @@ observed as `Fast`) and then expire mid-test. Fixed by sizing the TTL tests' fas
 larger than one ttl'd object and using several small filler keys to create demotion pressure
 instead of a second same-sized key.
 
+### Post-implementation fix: burst-write headroom, and why headroom alone doesn't bound it
+
+The user asked whether `LruHybridStack` should keep some headroom below `fast_capacity` so
+concurrent `set()` calls don't immediately push it over the threshold, given the background
+`PolicyWorker` thread processes tier decisions asynchronously. Investigating the actual mechanism
+first: `PaperCache::set()` writes a new object's `TieredBuffer` to DRAM **synchronously**, at the
+API layer, before the corresponding `WorkerEvent::Set` is even broadcast — the worker only updates
+`LruHybridStack`'s bookkeeping (and decides demotions) once it later processes that event. Tracing
+through `PolicyWorker::run` showed the bookkeeping decision itself is already eager (`settle_fast_tier`
+runs synchronously inside `stack.insert()`, not deferred) — the actual gap is between that decision
+and `apply_tier_migrations` physically moving demoted bytes to PMEM, which used to run once *per
+polling-loop batch* (after draining and processing every currently-queued event), not per event.
+Headroom in `settle_fast_tier`'s drain target doesn't touch that gap at all: a burst of concurrent
+`set()` calls still write straight to DRAM regardless of what threshold the stack targets internally.
+Two changes were made together, addressing the two different halves of the problem:
+
+1. **`PolicyWorker::apply_tier_migrations` is now called per-event, inside the event loop's `for`
+   block, instead of once after the whole batch drains** (`worker/policy/mod.rs`). This is the
+   change that actually shrinks the DRAM-write-vs-PMEM-migration window: for a large batch of
+   queued events, earlier ones' migrations now execute immediately rather than waiting for the rest
+   of the batch to be logically processed first. Safe to call more often — it's a cheap early
+   return when there's nothing to migrate (`drain_tier_migrations` returns empty) — and applies
+   uniformly to `lru_hybrid_cache`/`lfu_hybrid_cache`/`two_q_hybrid_cache` alike, since they share
+   this loop.
+2. **`LruHybridStack::settle_fast_tier` regained a low-water floor** — `FAST_TIER_LOW_WATER_RATIO
+   = 0.98` (2%), reintroduced deliberately smaller than the 90% floor removed earlier in this same
+   file's history (*"keeping the 10% high water mark in the lru implementation hurts performance so
+   get rid of it"*). The trigger condition is unchanged (only fires once genuinely over the
+   effective budget — no early demotion), but the drain target is now `effective *
+   FAST_TIER_LOW_WATER_RATIO` rather than `effective` exactly, leaving concurrent bursts some room
+   to land in before the next settle needs to trigger again. Scoped to `LruHybridStack` only, per
+   the user's explicit "at least for lru" — `LfuHybridStack` doesn't re-settle on every admission
+   the way this stack does, so the same thrashing-vs-burst-room tradeoff doesn't apply the same way
+   there. Framed honestly in the code as a *smaller* safety margin layered on top of fix #1, not a
+   bound on transient overshoot by itself.
+
+At the razor-thin fast-tier capacities several existing unit/worker tests intentionally use ("fits
+exactly one object"), a 2% shave of an already-tiny effective budget can land the drain target
+*below* what a single already-resident object needs, cascading an extra demotion that isn't the
+scenario under test (observed as, e.g., a stack test that meant to assert one demotion instead
+demoting both same-sized objects to zero, and a worker-level cascade test flipping from 2 to 3
+demotions). Fixed two ways depending on the test's intent: where the point was specifically to
+demonstrate the reintroduced headroom, the expected outcome was updated to match the real (fully-
+evacuating, at that tiny scale) result; where the tight capacity was incidental to a *different*
+scenario under test, the capacity was scaled up via a small `low_water_safe(target) = ceil(target /
+0.98)` helper so the object(s) meant to survive comfortably clear the drain target regardless of
+the shave.
+
 ### Remaining work
 
 - Byte-budgeted (not slot-counted) fast/slow boundary means a single admission/promotion can, in

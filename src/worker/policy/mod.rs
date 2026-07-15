@@ -165,10 +165,22 @@ where
 						buffered_events.push(stack_event);
 					}
 				}
-			}
 
-			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache"))]
-			self.apply_tier_migrations();
+				// Applied per-event rather than once after the whole batch
+				// drains: a `set()` writes its `TieredBuffer` to DRAM
+				// synchronously at the API layer, before this worker even
+				// sees the event, so the only latency this loop controls is
+				// how soon a demotion decision made *during* this batch gets
+				// physically executed (moving bytes to PMEM). Migrating
+				// per-event shrinks that window from "however long the rest
+				// of this batch takes to process" down to one event, at the
+				// cost of potentially more, smaller `apply_tier_migrations`
+				// calls under heavy concurrent load — cheap to call when
+				// there's nothing to migrate (an early-return on an empty
+				// drain), so this isn't a meaningful throughput cost.
+				#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache"))]
+				self.apply_tier_migrations();
+			}
 
 			self.apply_buffered_events(&buffered_events, &policy_reconstruct_rx);
 			self.flush_buffered_events(&mut buffered_events)?;
@@ -1011,6 +1023,19 @@ mod lru_hybrid_tests {
 		get_hybrid_dram_shared_overhead(&PaperPolicy::LruHybrid) as CacheSize
 	}
 
+	// `LruHybridStack::settle_fast_tier` now also drains to
+	// `FAST_TIER_LOW_WATER_RATIO` (0.98, private to that module -- duplicated
+	// here) of the effective budget rather than back to exactly the ceiling.
+	// At the razor-thin margins these tests intentionally use ("fits exactly
+	// one object"), shaving 2% off can land the drain target *below* what a
+	// single already-resident object needs, cascading an extra demotion that
+	// isn't the scenario under test. Scaling a target byte count up by this
+	// factor keeps that object comfortably above the drain target even after
+	// the shave.
+	fn low_water_safe(target: CacheSize) -> CacheSize {
+		(target as f64 / 0.98).ceil() as CacheSize
+	}
+
 	// Exercises the real `PolicyWorker` migration pipeline end to end using a
 	// plain `Box<[u8]>` value type and a trivial "migrate" closure — this
 	// tests the generic wiring (LruHybridStack -> drain_tier_migrations ->
@@ -1109,9 +1134,12 @@ mod lru_hybrid_tests {
 
 		// Fits exactly one ~15-byte object but not two. The fast budget must
 		// also cover the reserved shared-metadata overhead for both tracked
-		// objects (2 × shared), on top of one object's value bytes + 1.
+		// objects (2 × shared), on top of one object's value bytes + 1,
+		// scaled up via `low_water_safe` so the 2% low-water headroom (see
+		// `FAST_TIER_LOW_WATER_RATIO`) doesn't shave the drain target below
+		// what the single surviving object needs.
 		worker.handle_resize_fast_tier(
-			base_size_of(&overhead_manager, 15) as CacheSize + 2 * shared_overhead() + 1,
+			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 2 * shared_overhead() + 1),
 		);
 
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15); // fast
@@ -1136,9 +1164,12 @@ mod lru_hybrid_tests {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000);
 
 		// Fits exactly one ~15-byte object but not two (plus reserved
-		// shared-metadata overhead for both tracked objects).
+		// shared-metadata overhead for both tracked objects), scaled up via
+		// `low_water_safe` so the 2% low-water headroom doesn't cascade an
+		// extra demotion of the single object this scenario expects to
+		// survive the promotion.
 		worker.handle_resize_fast_tier(
-			base_size_of(&overhead_manager, 15) as CacheSize + 2 * shared_overhead() + 1,
+			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 2 * shared_overhead() + 1),
 		);
 
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
