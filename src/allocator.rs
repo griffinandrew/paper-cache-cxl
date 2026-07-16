@@ -116,7 +116,7 @@ unsafe impl GlobalAlloc for HybridObjects {
 
         let ptr = allocator_bindings::umf_alloc(Self::NODE,layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
-            println!("HybridObjects: UMF alloc failed for {} bytes", layout.size());
+            eprintln!("HybridObjects: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
         }
         //println!("HybridObjects: UMF alloc succeeded for {} bytes at {:p} with node {}", layout.size(), ptr, Self::NODE);
@@ -276,7 +276,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
 
         let ptr = allocator_bindings::umf_alloc(Self::NODE_DRAM,layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
-            println!("DRAMObjects: UMF alloc failed for {} bytes", layout.size());
+            eprintln!("DRAMObjects: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
         }
 
@@ -438,7 +438,7 @@ unsafe impl GlobalAlloc for ValueDRAM {
 
         let ptr = allocator_bindings::umf_alloc(Self::VALUE_DRAM_NODE,layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
-            println!("ValueDRAM: UMF alloc failed for {} bytes", layout.size());
+            eprintln!("ValueDRAM: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
         }
 
@@ -582,7 +582,7 @@ unsafe impl GlobalAlloc for DAXPMEM {
 
         let ptr = allocator_bindings::umf_alloc_dax(layout.size(), layout.align()) as *mut u8;
         if ptr.is_null() {
-            println!("DAXPMEM: UMF alloc failed for {} bytes", layout.size());
+            eprintln!("DAXPMEM: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
         }
 

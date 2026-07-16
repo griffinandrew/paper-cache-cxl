@@ -18,6 +18,29 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=umf"); // use shared library
         println!("cargo:rustc-link-lib=dylib=numa");
 
+        // DRAM hard cap (node 0 only, see umf_allocator_wrapper.c) resolves
+        // the SYSTEM jemalloc's mallctl/mallocx/dallocx via dlopen(RTLD_LOCAL)
+        // + dlsym at runtime, lazily, only when PAPER_CACHE_DRAM_CAP_BYTES is
+        // actually set -- deliberately NOT linked here at build time. An
+        // earlier version linked libjemalloc.so.2 directly (rustc-link-arg
+        // with an absolute path, placed after this cc::Build::compile() call
+        // so it landed after the archive referencing its symbols on the
+        // linker command line -- necessary because --as-needed means
+        // rust-lld only resolves a dylib's symbols against references
+        // already outstanding when it reaches that dylib). That worked, but
+        // broke allocation *process-wide even with the cap unset*: most
+        // jemalloc builds (this system's included, confirmed via `nm -D`)
+        // export unprefixed `malloc`/`free`/`calloc`/`realloc`, so merely
+        // linking it into the binary makes it a global malloc replacement
+        // for the whole process via ELF symbol interposition -- reported by
+        // the user as allocation failures on an unrelated, cap-disabled
+        // run. `dlopen(RTLD_LOCAL)` (done in the C code, not here) avoids
+        // this entirely: symbols stay private to this file's own `dlsym`
+        // handles, and the library is never even loaded into the process
+        // when the cap isn't configured. `-ldl` below is needed for
+        // `dlopen`/`dlsym`/`dlerror` themselves.
+        println!("cargo:rustc-link-lib=dylib=dl");
+
         // Compile the real UMF wrapper C code
         cc::Build::new()
             .file("umf_allocator/umf_allocator_wrapper.c")
@@ -25,36 +48,6 @@ fn main() {
             .include("umf_allocator")
             .include(umf_include_dir)
             .compile("umf_allocator_wrapper");
-
-        // DRAM hard cap (node 0 only, see umf_allocator_wrapper.c): links the
-        // SYSTEM jemalloc directly, alongside (not instead of) the separate
-        // jemalloc statically bundled inside libumf.so that backs node 1's
-        // umfJemallocPoolOps() pool. Confirmed safe: both jemalloc instances
-        // coexist in one process without symbol collisions (the system
-        // library's `mallctl`/`mallocx`/`dallocx` are the only ones visible
-        // dynamically; libumf's internal jemalloc symbols are not exported).
-        //
-        // Linked by absolute path via `rustc-link-arg` (not `rustc-link-lib`)
-        // so it lands at the true tail of the linker invocation, after the
-        // `libumf_allocator_wrapper.a` archive that references its symbols
-        // (`mallctl`/`mallocx`/`dallocx`). The `-l`/`-L`-based form put
-        // `-ljemalloc` before that archive on the command line regardless of
-        // *this* println!'s position in build.rs (cargo groups
-        // `rustc-link-lib` output together ahead of the crate's own compiled
-        // archives), and with `--as-needed` in effect rust-lld only resolves
-        // a dylib's symbols against references already outstanding when it
-        // reaches that dylib -- so the symbols stayed permanently undefined.
-        let jemalloc_candidates = [
-            "/usr/lib64/libjemalloc.so.2",
-            "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
-        ];
-        if let Some(jemalloc_path) = jemalloc_candidates.iter().find(|p| Path::new(p).exists()) {
-            println!("cargo:rustc-link-arg={}", jemalloc_path);
-        } else {
-            println!(
-                "cargo:warning=libjemalloc.so.2 not found; DRAM hard cap (PAPER_CACHE_DRAM_CAP_BYTES) will be unavailable"
-            );
-        }
 
     } else {
         // UMF hardware / headers not available (CI, developer machines).

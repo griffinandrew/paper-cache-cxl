@@ -467,6 +467,105 @@ integration suites (15/15, 19/19, 18/18) all pass unchanged with `PAPER_CACHE_DR
 unset, confirming the fallback path to the existing UMF jemalloc pool is untouched by this feature
 when the cap isn't opted into.
 
+### Two critical follow-up bugs, both found via direct reproduction — build-time jemalloc linking silently broke all allocation (cap disabled or not), and a real self-deadlock
+
+Reported by the user in production: `HybridObjects: UMF alloc failed` and `DRAMObjects: UMF alloc
+failed` on a real, >1M-object, 4 GB `fast_tier_size` run — **with `PAPER_CACHE_DRAM_CAP_BYTES`
+unset**, i.e. the cap feature not opted into at all. Investigated by direct code reading rather than
+guessing, per this file's established pattern:
+
+**Bug 1 (confirmed, fixed): linking `libjemalloc.so.2` at build time made it a process-wide
+`malloc`/`free` replacement, active regardless of whether the cap was ever configured at runtime.**
+The original implementation (see "Wiring, as actually landed" above) linked the system jemalloc via
+`cargo:rustc-link-arg` so its `mallctl`/`mallocx`/`dallocx` symbols were resolvable at build time.
+Confirmed via `nm -D /usr/lib64/libjemalloc.so.2`: like most non-`--with-jemalloc-prefix` jemalloc
+builds, it *also* exports plain, unprefixed `malloc`/`free`/`calloc`/`realloc`/`posix_memalign`.
+Merely linking such a library into a binary makes it a global `malloc` replacement for the *entire*
+process via standard ELF symbol interposition — every allocation anywhere (UMF's own internals,
+libnuma, any other C dependency, not just this file's own code) silently gets rerouted to jemalloc's
+regular default arenas, independent of `dram_cap_is_active()` or any runtime check in this crate's
+own code, since interposition happens at the dynamic linker level before any of that code even runs.
+Any code path still holding a pointer allocated by the *other*, now-shadowed allocator (or vice
+versa) is a mismatched-allocator condition — undefined behavior that can corrupt heap metadata over
+many allocation cycles, consistent with the user's report only manifesting at >1M objects on a long
+run, not immediately.
+
+Fixed by never linking `libjemalloc.so.2` into the binary at all. `build.rs`'s
+`cargo:rustc-link-arg=<path>` for it was removed entirely; `umf_allocator_wrapper.c` now resolves
+`mallctl`/`mallocx`/`dallocx` via `dlopen(path, RTLD_NOW | RTLD_LOCAL)` + `dlsym`, called lazily
+from `dram_cap_init_from_env()` — i.e. *only* once `PAPER_CACHE_DRAM_CAP_BYTES` is confirmed set.
+`RTLD_LOCAL` (the default, named explicitly) keeps the loaded library's symbols out of the process's
+global symbol table, reachable only via this file's own `dlsym` handles — no interposition. Users
+who never set the env var never have `libjemalloc.so.2` loaded into their process at all. `-ldl` was
+added to `build.rs` for `dlopen`/`dlsym`/`dlerror` themselves (`mallctl`-family symbol names are
+tried both unprefixed and `je_`-prefixed, for portability across distributions).
+
+**Bug 2 (confirmed, fixed): a genuine, reproducible self-deadlock, hung indefinitely (matching the
+user's report of "well over 11 hours" before being killed).** Found via `gdb -p <pid> -batch -ex
+"thread apply all bt full"` on the actual hung process while verifying Bug 1's fix (a
+`PAPER_CACHE_DRAM_CAP_BYTES`-set run on this sandbox, which — separately, see below — cannot
+actually `dlopen` `libjemalloc.so.2` at all). Full backtrace showed the single thread parked in a
+futex wait inside `<std::sync::sync::once::futex::Once>::call`, reached via: `main` →
+`lang_start_internal` → `set_current_info` (Rust's own early runtime bootstrap, setting up the
+stack-overflow guard) → `__rust_alloc` (the very first heap allocation of the whole process) →
+[our `DRAMObjects::alloc`, inlined/not itself in the trace] → that allocation failed (see below for
+why) → `println!("DRAMObjects: UMF alloc failed for {} bytes", ...)` → `std::io::stdio::_print` →
+lazily initializing stdout's buffered `LineWriter` for the first time (via a `OnceLock`) → *that*
+initializer itself needed to allocate a buffer → back into `__rust_alloc` → the second allocation
+attempt *also* failed (the underlying cause hadn't changed) → tried to `println!` again → tried to
+initialize the *same* stdout `OnceLock` a second time, from the same thread, while already in the
+middle of initializing it the first time → permanent self-deadlock (`Once`/`OnceLock` are not
+reentrant).
+
+This is a **pre-existing latent bug, not something introduced by the DRAM-cap work** — `allocator.rs`
+used `println!` (not `eprintln!`) inside the alloc-failure diagnostic of all four `GlobalAlloc`
+impls (`HybridObjects`, `DRAMObjects`, `ValueDRAM`, `DAXPMEM`). `println!`/`Stdout` uses a buffered
+`LineWriter` that lazily allocates its own buffer on first use; `eprintln!`/`Stderr` is deliberately
+*unbuffered* (writes go straight to fd 2, no lazy allocation) specifically so it stays safe to use
+from contexts like this one. The bug was latent because, prior to this session, the very first
+allocation in a process essentially never failed — the DRAM-cap work is what first made "the
+first-ever allocation in the process can genuinely fail" a real, reachable scenario (see Bug 3
+below for why it *was* failing on this sandbox specifically). Fixed by changing all four `println!`
+alloc-failure sites (`grep -n 'println!("HybridObjects: UMF alloc failed` etc.) to `eprintln!`; two
+more, textually identical instances further down the file are inside inert `/* ... */` block
+comments (confirmed by mapping every `/*`/`*/` marker in the file, including nested ones) and were
+left alone. This is a general robustness fix, not specific to the DRAM cap: any allocation failure
+in any of these four allocators, for any reason, could previously have hit this exact deadlock if
+it happened to be (or immediately follow) the first allocation of the process.
+
+**Bug 3 (confirmed, structural, not fixable in this crate): on this sandbox, `libjemalloc.so.2`
+cannot be `dlopen`'d after process start at all.** Direct reproduction (a standalone 10-line C
+program calling `dlopen("/usr/lib64/libjemalloc.so.2", RTLD_NOW | RTLD_LOCAL)`) fails with
+`cannot allocate memory in static TLS block` — a real glibc limit: shared libraries using the
+initial-exec TLS model (which jemalloc's own thread-local arena/tcache state uses) can only be
+loaded via `dlopen` if enough "static TLS surplus" was reserved at process startup, and glibc's
+default reservation is small. This is *why* Bug 1's fix (switching to `dlopen`) surfaced Bug 2 in
+the first place — the cap path now reliably fails closed on this system. Fixed defensively:
+`dram_cap_init_from_env()` treats a failed `dram_cap_load_jemalloc()` (or any other failure in the
+setup sequence — `mmap`, `arenas.create`, `extent_hooks`) as "fall back to the existing UMF pool for
+node 0," never as a fatal condition (see `umf_allocator_init`'s simplified two-outcome contract:
+0 = cap active, 1 = cap not active for *any* reason, always fall through to `umf_pool_init`). The
+printed diagnostic on this specific failure suggests two real remediations for a user who wants the
+cap to actually activate on a system with this constraint: launch with `LD_PRELOAD=libjemalloc.so.2`
+(loads it at startup instead, before this constraint applies — but note this also makes jemalloc the
+process's malloc, the interposition Bug 1 avoided, so it's an explicit, informed choice rather than
+a silent side effect) or `GLIBC_TUNABLES=glibc.rtld.optional_static_tls=<bytes>` (glibc >= 2.35,
+directly increases the reserved surplus). Neither was tested end-to-end in this session (no
+`LD_PRELOAD`/`GLIBC_TUNABLES`-set run confirming the cap actually activates on this sandbox) — the
+graceful-fallback behavior was verified instead, since that's what the crate does by default and
+what most users will actually experience without extra launch-time configuration.
+
+**Verification**: re-ran the exact scenario that hung (`REPRO_OBJECT_COUNT=200000
+PAPER_CACHE_DRAM_CAP_BYTES=3000000000`, this sandbox, which per Bug 3 cannot load jemalloc at all)
+under a hard 90s `timeout` — completes cleanly in ~41s (matching the cap-*disabled* baseline's
+timing almost exactly, confirming the fallback path is genuinely equivalent, not a degraded/broken
+mode), prints the actionable dlopen-failure diagnostic once, and exits 0. Re-ran the cap-*disabled*
+path too (confirming Bug 1's fix directly): also clean, and its peak/settled numbers now show real
+decay (0.412–0.643 decayed/peak ratio) rather than the artificially-pinned-at-peak behavior a
+process-wide jemalloc-malloc-replacement side effect might have caused. Full `lru_hybrid_cache`
+(25 unit + 15 integration), `lfu_hybrid_cache` (27 + 19), and `two_q_hybrid_cache` (21 + 18) suites
+all still pass.
+
 ### Remaining work on the DRAM hard cap
 
 - No dedicated automated integration test for the cap itself yet (the verification above was done

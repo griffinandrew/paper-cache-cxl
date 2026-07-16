@@ -21,19 +21,95 @@
 #include <umf/pools/pool_scalable.h>
 #include <umf/pools/pool_jemalloc.h>
 
-// DRAM hard cap (node 0 only) links the SYSTEM jemalloc directly (distinct
-// from the jemalloc statically bundled inside libumf.so that backs
-// umfJemallocPoolOps() below for node 1/PMEM) -- see the "DRAM hard cap"
-// block further down for why the two coexist safely in one process.
+// DRAM hard cap (node 0 only) uses the SYSTEM jemalloc's extent-hooks API
+// (distinct from the jemalloc statically bundled inside libumf.so that
+// backs umfJemallocPoolOps() below for node 1/PMEM) -- see the "DRAM hard
+// cap" block further down for why the two coexist safely in one process.
+// Still include the header for its type/macro declarations (extent_hooks_t,
+// MALLOCX_* macros) -- but NOT for its extern mallctl/mallocx/dallocx
+// declarations, which are deliberately never called directly (see the
+// dlopen/dlsym note below).
 #include <jemalloc/jemalloc.h>
 #include <numaif.h>
 #include <numa.h>
+#include <dlfcn.h>
 
-#ifdef JEMALLOC_USE_PREFIX
-#define mallctl  je_mallctl
-#define mallocx  je_mallocx
-#define dallocx  je_dallocx
-#endif
+// mallctl/mallocx/dallocx are resolved via dlopen(RTLD_LOCAL)+dlsym at
+// runtime, lazily, only when PAPER_CACHE_DRAM_CAP_BYTES is actually set --
+// deliberately NOT linked at build time (no cargo:rustc-link-lib / rustc-
+// link-arg for libjemalloc.so.2). A first version linked it directly, which
+// compiled and worked when the cap was exercised, but broke allocation
+// process-wide even with the cap *unset*: the system libjemalloc.so.2 (like
+// most jemalloc builds without --with-jemalloc-prefix) exports unprefixed
+// `malloc`/`free`/`calloc`/`realloc` symbols (confirmed via `nm -D`), so
+// merely linking it into the binary makes it a global malloc replacement
+// for the *entire* process via standard ELF symbol interposition -- every
+// allocation anywhere (UMF's own internals, libnuma, any other C
+// dependency, not just this file's own code) silently gets rerouted to
+// jemalloc's regular default arenas, and any place still holding a
+// glibc-malloc'd pointer risks being freed through the interposed
+// allocator instead (or vice versa), a mismatched-allocator condition that
+// is undefined behavior and can corrupt heap metadata over many alloc/free
+// cycles. Reported by the user as allocation failures (both `DRAMObjects`
+// and `HybridObjects`) on a >1M-object, unrelated (cap-disabled) run.
+// `dlopen(..., RTLD_LOCAL)` avoids this: `RTLD_LOCAL` (the default, but
+// named explicitly here) keeps the loaded library's symbols out of the
+// process's global symbol table, so they are reachable only via this
+// file's own `dlsym` handles -- no interposition -- and skipping the
+// dlopen entirely when the env var is unset means libjemalloc.so.2 is
+// never even loaded into the process for users who don't opt into this
+// feature at all.
+typedef int   (*jemalloc_mallctl_fn)(const char *, void *, size_t *, void *, size_t);
+typedef void *(*jemalloc_mallocx_fn)(size_t, int);
+typedef void  (*jemalloc_dallocx_fn)(void *, int);
+
+static void *dram_cap_jemalloc_handle = NULL;
+static jemalloc_mallctl_fn dram_cap_mallctl = NULL;
+static jemalloc_mallocx_fn dram_cap_mallocx = NULL;
+static jemalloc_dallocx_fn dram_cap_dallocx = NULL;
+
+// Tries both the unprefixed and `je_`-prefixed symbol names since different
+// distributions' jemalloc packages differ (this sandbox's is unprefixed,
+// confirmed via `nm -D`; kept generic rather than hardcoding that).
+static bool dram_cap_load_jemalloc(void) {
+    if (dram_cap_mallctl && dram_cap_mallocx && dram_cap_dallocx) {
+        return true;
+    }
+
+    static const char *candidates[] = {
+        "libjemalloc.so.2",
+        "/usr/lib64/libjemalloc.so.2",
+        "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
+    };
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        dram_cap_jemalloc_handle = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
+        if (dram_cap_jemalloc_handle) break;
+    }
+
+    if (!dram_cap_jemalloc_handle) {
+        fprintf(stderr, "dram_cap: dlopen(libjemalloc.so.2) failed: %s\n", dlerror());
+        return false;
+    }
+
+    dram_cap_mallctl = (jemalloc_mallctl_fn)dlsym(dram_cap_jemalloc_handle, "mallctl");
+    dram_cap_mallocx = (jemalloc_mallocx_fn)dlsym(dram_cap_jemalloc_handle, "mallocx");
+    dram_cap_dallocx = (jemalloc_dallocx_fn)dlsym(dram_cap_jemalloc_handle, "dallocx");
+
+    if (!dram_cap_mallctl || !dram_cap_mallocx || !dram_cap_dallocx) {
+        dram_cap_mallctl = (jemalloc_mallctl_fn)dlsym(dram_cap_jemalloc_handle, "je_mallctl");
+        dram_cap_mallocx = (jemalloc_mallocx_fn)dlsym(dram_cap_jemalloc_handle, "je_mallocx");
+        dram_cap_dallocx = (jemalloc_dallocx_fn)dlsym(dram_cap_jemalloc_handle, "je_dallocx");
+    }
+
+    if (!dram_cap_mallctl || !dram_cap_mallocx || !dram_cap_dallocx) {
+        fprintf(stderr, "dram_cap: dlsym failed to resolve mallctl/mallocx/dallocx "
+                         "(tried both unprefixed and je_-prefixed names)\n");
+        return false;
+    }
+
+    return true;
+}
 
 #define MAX_NODES 8
 
@@ -182,12 +258,29 @@ static void dram_cap_bind_region(void *addr, size_t size) {
     numa_bitmask_free(mask);
 }
 
-/* Reads PAPER_CACHE_DRAM_CAP_BYTES and, if set to a nonzero value,
- * reserves the region and installs the capped arena. Returns:
+/* Reads PAPER_CACHE_DRAM_CAP_BYTES and, if set to a nonzero value, tries to
+ * reserve the region and install the capped arena. Returns:
  *   0 -- cap successfully activated
- *   1 -- no (or zero) cap configured; caller should fall back to the
- *        existing UMF jemalloc pool path for node 0
- *  >1 -- a real initialization error occurred
+ *   1 -- no cap configured, OR a cap was requested but could not be set up
+ *        for any reason; caller should fall back to the existing UMF
+ *        jemalloc pool path for node 0
+ *
+ * Every failure path below falls back (returns 1) rather than a distinct
+ * "real error" code. An earlier version returned a distinct nonzero code
+ * per failure, which `umf_allocator_init` treated as fatal -- skipping
+ * `umf_pool_init` entirely and leaving `pools[0]` permanently NULL. That
+ * silently broke *all* node-0 (DRAM) allocation for the rest of the
+ * process, including the very first one -- which, combined with a then-
+ * separate, pre-existing bug (`allocator.rs` using `println!`, which lazily
+ * allocates its own stdout buffer on first use, inside the alloc-failure
+ * diagnostic of `DRAMObjects::alloc` itself), produced a genuine self-
+ * deadlock: the first-ever allocation failed, tried to print via `println!`,
+ * which needed to allocate to set up stdout's buffer, which failed and
+ * tried to print again, recursing into the same uninitialized `OnceLock`
+ * from the same thread forever (confirmed via `gdb` on a hung process that
+ * a user reported running for many hours). Falling back here instead means
+ * an unusable cap (for whatever reason) degrades to "the feature quietly
+ * doesn't activate," not "the allocator stops working."
  */
 static int dram_cap_init_from_env(void) {
     const char *env = getenv("PAPER_CACHE_DRAM_CAP_BYTES");
@@ -197,13 +290,43 @@ static int dram_cap_init_from_env(void) {
     if (requested == 0) return 1;
     size_t bytes = (size_t)requested;
 
+    // Only reached (and libjemalloc.so.2 only ever dlopen'd) once the env
+    // var is confirmed set -- see the dlopen/dlsym note above this function.
+    // Confirmed to genuinely fail on at least one real system: this
+    // sandbox's libjemalloc.so.2 cannot be dlopen'd after process start at
+    // all ("cannot allocate memory in static TLS block" -- a real glibc
+    // limit on the small TLS surplus reserved for post-startup dlopen of
+    // libraries using the initial-exec TLS model, which jemalloc's own
+    // thread-local caches use). Falling back (not aborting) here is the
+    // correct behavior for that case; see this function's remediation
+    // suggestions in the printed message below for how to actually get the
+    // cap working on such a system.
+    if (!dram_cap_load_jemalloc()) {
+        fprintf(stderr,
+                "dram_cap: could not load libjemalloc.so.2 for the DRAM hard "
+                "cap (PAPER_CACHE_DRAM_CAP_BYTES=%s) -- falling back to "
+                "normal (uncapped) allocation for node 0. If this is a "
+                "\"cannot allocate memory in static TLS block\" error, your "
+                "system's libjemalloc.so.2 cannot be dlopen'd after process "
+                "start; try either `LD_PRELOAD=libjemalloc.so.2` (loads it "
+                "at startup instead, avoiding the static-TLS limit -- note "
+                "this also makes jemalloc your process-wide malloc) or "
+                "`GLIBC_TUNABLES=glibc.rtld.optional_static_tls=<bytes>` "
+                "(increases the reserved dlopen-time TLS surplus, glibc "
+                ">= 2.35) before launching.\n",
+                env);
+        return 1;
+    }
+
     dram_cap_init_hooks(&dram_cap_tier);
 
     void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) {
-        fprintf(stderr, "dram_cap: mmap(%zu) failed: %s\n", bytes, strerror(errno));
-        return 2;
+        fprintf(stderr, "dram_cap: mmap(%zu) failed: %s -- falling back to "
+                         "normal (uncapped) allocation for node 0\n",
+                bytes, strerror(errno));
+        return 1;
     }
     dram_cap_bind_region(p, bytes);
     dram_cap_tier.region_base = p;
@@ -212,25 +335,28 @@ static int dram_cap_init_from_env(void) {
 
     unsigned ind;
     size_t ind_sz = sizeof(ind);
-    if (mallctl("arenas.create", &ind, &ind_sz, NULL, 0) != 0) {
-        fprintf(stderr, "dram_cap: arenas.create failed\n");
+    if (dram_cap_mallctl("arenas.create", &ind, &ind_sz, NULL, 0) != 0) {
+        fprintf(stderr, "dram_cap: arenas.create failed -- falling back to "
+                         "normal (uncapped) allocation for node 0\n");
         munmap(p, bytes);
         dram_cap_tier.region_base = NULL;
         dram_cap_tier.region_cap  = 0;
-        return 3;
+        return 1;
     }
 
     char path[64];
     snprintf(path, sizeof(path), "arena.%u.extent_hooks", ind);
     extent_hooks_t *hooks_ptr = &dram_cap_tier.hooks;
-    if (mallctl(path, NULL, NULL, &hooks_ptr, sizeof(hooks_ptr)) != 0) {
-        fprintf(stderr, "dram_cap: setting extent_hooks on arena %u failed\n", ind);
+    if (dram_cap_mallctl(path, NULL, NULL, &hooks_ptr, sizeof(hooks_ptr)) != 0) {
+        fprintf(stderr, "dram_cap: setting extent_hooks on arena %u failed -- "
+                         "falling back to normal (uncapped) allocation for "
+                         "node 0\n", ind);
         snprintf(path, sizeof(path), "arena.%u.destroy", ind);
-        mallctl(path, NULL, NULL, NULL, 0);
+        dram_cap_mallctl(path, NULL, NULL, NULL, 0);
         munmap(p, bytes);
         dram_cap_tier.region_base = NULL;
         dram_cap_tier.region_cap  = 0;
-        return 4;
+        return 1;
     }
 
     /* No dedicated tcache: DRAMObjects is the crate's #[global_allocator],
@@ -275,14 +401,14 @@ static void *dram_cap_alloc(size_t size, size_t align) {
 
     int flags = MALLOCX_ARENA(ind) | MALLOCX_TCACHE_NONE;
     if (align && align > sizeof(void *)) flags |= MALLOCX_ALIGN(align);
-    return mallocx(size, flags);
+    return dram_cap_mallocx(size, flags);
 }
 
 static void dram_cap_dealloc(void *ptr) {
     if (!ptr) return;
     unsigned ind = atomic_load_explicit(&dram_cap_tier.arena_ind, memory_order_acquire);
     if (ind == UINT_MAX) return;
-    dallocx(ptr, MALLOCX_ARENA(ind) | MALLOCX_TCACHE_NONE);
+    dram_cap_dallocx(ptr, MALLOCX_ARENA(ind) | MALLOCX_TCACHE_NONE);
 }
 
 
@@ -291,12 +417,14 @@ static void dram_cap_dealloc(void *ptr) {
 static int umf_pool_init(int numa_node);
 
 int umf_allocator_init(int numa_node) {
-    if (numa_node == 0) {
-        int rc = dram_cap_init_from_env();
-        if (rc == 0) return 0;      /* hard-capped arena is now active */
-        if (rc != 1) return rc;     /* a real error occurred setting it up */
-        /* rc == 1: PAPER_CACHE_DRAM_CAP_BYTES not set -- fall through to
-         * the existing UMF jemalloc pool path below, unchanged. */
+    // dram_cap_init_from_env() only ever returns 0 (cap activated) or 1
+    // (no cap configured, or one was requested but couldn't be set up --
+    // see its doc comment for why every failure there falls back rather
+    // than returning a distinct "real error" code). Either way, rc == 1
+    // means: fall through to the existing UMF jemalloc pool path below,
+    // unchanged.
+    if (numa_node == 0 && dram_cap_init_from_env() == 0) {
+        return 0;
     }
     return umf_pool_init(numa_node);
 }
