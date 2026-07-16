@@ -24,6 +24,13 @@ use crossbeam_channel::{Sender, Receiver, unbounded};
 use log::{info, warn, error};
 use kwik::fmt;
 
+#[cfg(any(
+	feature = "lru_hybrid_cache",
+	feature = "lfu_hybrid_cache",
+	feature = "two_q_hybrid_cache",
+))]
+use rayon::prelude::*;
+
 use crate::{
 	CacheSize,
 	HashedKey,
@@ -640,6 +647,19 @@ where
 	/// mutually exclusive features (see `lib.rs`'s `compile_error!` guards),
 	/// so exactly one of this method and its two siblings below ever
 	/// compiles.
+	///
+	/// Physical migrations are applied in two sequential phases, not one
+	/// combined pass: every demotion in this batch is applied (in
+	/// parallel with every other demotion, via `rayon`) and fully lands
+	/// before any promotion in the same batch begins. This is a strict,
+	/// batch-wide barrier -- `into_par_iter().for_each` only returns once
+	/// every entry in that call has completed -- so a promotion's new
+	/// fast-tier DRAM allocation can never race ahead of a demotion that
+	/// exists specifically to free room for it, no matter how many
+	/// migrations land in one call or what order the stack originally
+	/// pushed them in. Within a single phase, entries are independent
+	/// (distinct keys) and apply concurrently for real multi-core
+	/// throughput.
 	#[cfg(feature = "lru_hybrid_cache")]
 	fn apply_tier_migrations(&mut self) {
 		let Some(stack) = &mut self.policy_stack else { return };
@@ -647,17 +667,29 @@ where
 
 		if !migrations.is_empty() {
 			if let Some(migrate) = &self.tier_migration_fn {
-				for (key, tier) in migrations {
-					if let Some(mut object) = self.objects.get_mut(&key) {
+				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
+					.into_iter()
+					.partition(|(_, tier)| *tier == Tier::Slow);
+
+				let objects = AssertSync(&self.objects);
+				let status = &self.status;
+
+				let apply_physical = |(key, tier): (HashedKey, Tier)| {
+					if let Some(mut object) = objects.get().get_mut(&key) {
 						let new_data = migrate(&object.data(), tier);
 						object.set_data(new_data);
 					}
+				};
 
-					match tier {
-						Tier::Fast => self.status.record_lru_hybrid_promotion(),
-						Tier::Slow => self.status.record_lru_hybrid_demotion(),
-					}
-				}
+				demotions.into_par_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_lru_hybrid_demotion();
+				});
+
+				promotions.into_par_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_lru_hybrid_promotion();
+				});
 			}
 		}
 
@@ -702,6 +734,14 @@ where
 	/// API-calling thread with no direct access to this worker-owned stack,
 	/// can build a brand-new key's `TieredBuffer` in the correct tier up
 	/// front instead of always guessing fast.
+	///
+	/// Same two-phase parallel-with-a-barrier shape as the
+	/// `lru_hybrid_cache` sibling above (see its comment): every
+	/// `Tier::Slow` entry in this batch -- genuine demotions and
+	/// fresh-admission-to-slow corrections alike -- is applied (in
+	/// parallel) and fully lands before any `Tier::Fast` (promotion)
+	/// entry begins, so a promotion never allocates fast-tier DRAM ahead
+	/// of the demotion(s) that were supposed to make room for it.
 	#[cfg(feature = "lfu_hybrid_cache")]
 	fn apply_tier_migrations(&mut self) {
 		let Some(stack) = &mut self.policy_stack else { return };
@@ -712,16 +752,31 @@ where
 
 		if !migrations.is_empty() {
 			if let Some(migrate) = &self.tier_migration_fn {
-				for (key, tier) in migrations {
-					if let Some(mut object) = self.objects.get_mut(&key) {
+				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
+					.into_iter()
+					.partition(|(_, tier)| *tier == Tier::Slow);
+
+				let objects = AssertSync(&self.objects);
+				let status = &self.status;
+
+				let apply_physical = |(key, tier): (HashedKey, Tier)| {
+					if let Some(mut object) = objects.get().get_mut(&key) {
 						let new_data = migrate(&object.data(), tier);
 						object.set_data(new_data);
 					}
+				};
 
-					if tier == Tier::Fast {
-						self.status.record_lfu_hybrid_promotion();
-					}
-				}
+				// Not counted per-entry here -- unlike the other two
+				// hybrids, a `Tier::Slow` entry isn't always a genuine
+				// demotion (see the doc comment above this method's
+				// declaration); the real count comes from
+				// `stack.drain_demotions()` below, unchanged from before.
+				demotions.into_par_iter().for_each(apply_physical);
+
+				promotions.into_par_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_lfu_hybrid_promotion();
+				});
 			}
 
 			let demotions = stack.drain_demotions();
@@ -744,6 +799,11 @@ where
 	/// `two_q_hybrid_cache` counterpart of the two methods above — identical
 	/// shape, draining `TwoQHybridStack`'s migrations instead and recording
 	/// to the `two_q_hybrid_*` counters/gauges on `status`.
+	///
+	/// Same two-phase parallel-with-a-barrier shape as the
+	/// `lru_hybrid_cache` sibling above (see its comment): all demotions
+	/// in this batch are applied in parallel and fully land before any
+	/// promotion in the same batch begins.
 	#[cfg(feature = "two_q_hybrid_cache")]
 	fn apply_tier_migrations(&mut self) {
 		let Some(stack) = &mut self.policy_stack else { return };
@@ -751,17 +811,29 @@ where
 
 		if !migrations.is_empty() {
 			if let Some(migrate) = &self.tier_migration_fn {
-				for (key, tier) in migrations {
-					if let Some(mut object) = self.objects.get_mut(&key) {
+				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
+					.into_iter()
+					.partition(|(_, tier)| *tier == Tier::Slow);
+
+				let objects = AssertSync(&self.objects);
+				let status = &self.status;
+
+				let apply_physical = |(key, tier): (HashedKey, Tier)| {
+					if let Some(mut object) = objects.get().get_mut(&key) {
 						let new_data = migrate(&object.data(), tier);
 						object.set_data(new_data);
 					}
+				};
 
-					match tier {
-						Tier::Fast => self.status.record_two_q_hybrid_promotion(),
-						Tier::Slow => self.status.record_two_q_hybrid_demotion(),
-					}
-				}
+				demotions.into_par_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_two_q_hybrid_demotion();
+				});
+
+				promotions.into_par_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_two_q_hybrid_promotion();
+				});
 			}
 		}
 
@@ -1047,6 +1119,36 @@ where
 	K: TypeSize,
 	V: TypeSize,
 {}
+
+/// Thin wrapper asserting `Send + Sync` unconditionally, for sharing a
+/// reference across `rayon` worker threads inside `apply_tier_migrations`.
+///
+/// SAFETY: this follows the same trust boundary the crate already applies
+/// unconditionally at `PolicyWorker<K, V>: Send` (just above) and at
+/// `PaperCache<K, V, S>: Send + Sync` (`lib.rs`) rather than threading
+/// `K: Send + Sync, V: Send + Sync` bounds through the crate's generic
+/// worker/policy-stack machinery: every concrete `K`/`V` this crate is
+/// ever built with is a plain, genuinely thread-safe type (integer-typed
+/// keys, `TieredBuffer`'s byte buffers), and all access to the wrapped
+/// `ObjectMapRef<K, V>` goes exclusively through `DashMap`'s own
+/// per-shard locking (`get_mut`) -- there is no unsynchronised mutable
+/// access exposed here, only the compile-time bound is missing.
+struct AssertSync<T>(T);
+
+unsafe impl<T> Sync for AssertSync<T> {}
+unsafe impl<T> Send for AssertSync<T> {}
+
+impl<T> AssertSync<T> {
+	/// Accessor rather than a public `.0` field, deliberately: Rust's
+	/// disjoint-closure-capture analysis (RFC 2229) captures a direct
+	/// tuple-field projection (`wrapper.0.foo()`) as just the *inner*
+	/// field's type, bypassing this wrapper's `Send`/`Sync` impls
+	/// entirely -- a method call forces the closure to capture the whole
+	/// `AssertSync<T>` value instead.
+	fn get(&self) -> &T {
+		&self.0
+	}
+}
 
 #[cfg(all(test, feature = "lru_hybrid_cache"))]
 mod lru_hybrid_tests {

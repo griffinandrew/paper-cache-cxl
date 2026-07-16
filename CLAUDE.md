@@ -1295,3 +1295,79 @@ two_q_hybrid_cache`. Confirmed `lru_hybrid_cache`'s and `lfu_hybrid_cache`'s own
   matter for real workloads, without paying an exact-membership check on every slow-tier write.
 - No dedicated test yet for a multi-key single-step promotion/demotion cascade with mixed
   small/huge object sizes (same caveat noted for the other two hybrids above).
+
+## Performance: parallelizing `apply_tier_migrations`'s physical migration copies
+
+Per profiling earlier in this investigation (real `perf` capture against the actual
+`paper-benchmark-cxl` benchmark, not just this crate's own tests) `TieredBuffer::new_slow`
+(the demotion path's PMEM byte copy, run inside `PolicyWorker::apply_tier_migrations`) consumed
+~26% of total process CPU time under a demotion-heavy workload — the single `PolicyWorker`
+background thread doing this work sequentially, one migration at a time, was a genuine bottleneck
+(spawning additional `PolicyWorker` threads doesn't help — each `WorkerManager` constructor
+registers exactly one). Per the user's explicit request ("look at parallelizing the migration copy
+for demotions or promotions ... but make sure to always respect the fast tier dram threshold so
+demotions should occur before promotions"), all three hybrids' `apply_tier_migrations` siblings
+(`worker/policy/mod.rs`) now apply a batch's physical migrations in two sequential phases instead
+of one interleaved loop: `migrations` is partitioned into `demotions` (`Tier::Slow`) and
+`promotions` (`Tier::Fast`); `demotions.into_par_iter().for_each(...)` (via `rayon`, already a
+crate dependency — `mini_stack/manager.rs` already used it) runs every demotion in the batch
+concurrently and **fully returns** before `promotions.into_par_iter().for_each(...)` starts. This
+is a strict, batch-wide barrier — stronger than the earlier per-push-order fix (commit `620f376`,
+"Apply demotions before the promotion that triggers them, not after"), which only ordered
+migrations pairwise as pushed; this guarantees *every* demotion in a call has physically freed its
+fast-tier bytes before *any* promotion in that same call begins allocating new ones, regardless of
+batch size or push order. `LfuHybridStack`'s sibling keeps its existing `drain_demotions()`-based
+counting (a `Tier::Slow` entry there isn't always a genuine demotion — see that method's doc
+comment) unchanged, just moved the physical copy onto the parallel demotion phase.
+
+**A real, non-obvious compile problem this hit, and why the fix isn't `K: Send + Sync` bounds
+threaded through the call chain:** `rayon`'s `for_each` requires the closure (and its captures) to
+be `Send + Sync`, which requires `ObjectMapRef<K, V>: Sync`. Naively adding `K: Send + Sync, V:
+Send + Sync` to `apply_tier_migrations`'s signature doesn't work in isolation — `run()` (the only
+caller, on `impl Worker for PolicyWorker<K, V>`) doesn't have those bounds either, and adding them
+*there* cascades outward through every `WorkerManager` constructor (used by every policy, not just
+the three hybrids), since `PolicyWorker<K, V>: Send` is otherwise satisfied for free via an
+existing, pre-this-session `unsafe impl<K, V> Send for PolicyWorker<K, V> where K: TypeSize, V:
+TypeSize {}` near the bottom of `worker/policy/mod.rs` — this crate's established pattern
+(mirrored at the top level by `lib.rs`'s unconditional `unsafe impl<K, V, S> Send`/`Sync for
+PaperCache<K, V, S>`) is to assert thread-safety unconditionally at a few key boundary points
+rather than thread `Send`/`Sync` bounds through ~5000 lines of generic worker/policy-stack code,
+trusting that every concrete `K`/`V` this crate is ever built with (integer-typed keys,
+`TieredBuffer`) is genuinely thread-safe in practice. Threading explicit bounds through the call
+chain would have been a much larger, inconsistent-with-existing-style change, and risked breaking
+other, non-hybrid `K`/`V` combinations that currently rely on the same unconditional-`unsafe impl`
+escape hatch. Instead, added a second, narrowly-scoped wrapper following the *same* established
+pattern: `AssertSync<T>(T)` with unconditional `unsafe impl<T> Send`/`Sync`, used only to wrap
+`&self.objects` for the duration of the parallel closures inside `apply_tier_migrations`. Safety
+argument is the same one already given for `PaperCache: Sync` (`lib.rs`): all access goes through
+`DashMap`'s own per-shard locking (`get_mut`), so no unsynchronized mutable access is actually
+exposed — only the compile-time bound was missing.
+
+A second, genuinely subtle compile issue surfaced *after* adding `AssertSync`: wrapping
+`&self.objects` and then calling `objects.0.get_mut(&key)` (direct tuple-field access) still
+failed with the same `Send`/`Sync` errors, because Rust's disjoint-closure-capture analysis (RFC
+2229) captures a direct field projection (`wrapper.0.foo()`) as just the *inner* field's type,
+bypassing the wrapper's `unsafe impl` entirely — the closure captured `&Arc<DashMap<...>>`
+directly, never actually capturing the `AssertSync` value itself. Fixed by replacing the public
+`.0` field access with a private `.get(&self) -> &T` accessor method: a method call forces the
+closure to capture the whole `AssertSync<T>` receiver (method resolution isn't as transparent to
+the disjoint-capture analysis as a syntactic field projection is), which does pick up the
+unconditional `Send`/`Sync` impls as intended.
+
+Verified: `cargo +nightly build --features {lru_hybrid_cache,lfu_hybrid_cache,two_q_hybrid_cache}`
+each compile clean; unit tests for all three hybrids pass (25/25 lru, 27/27 lfu, 21/21 two_q,
+filtered to each's own module); all three real-PMEM integration suites pass twice in a row (not
+flaky): 15/15 (+1 ignored bench) lru, 19/19 lfu, 18/18 two_q — matching this file's previously
+documented baselines exactly, confirming no regression from the physical-migration restructuring.
+Also confirmed representative non-hybrid feature builds (`hybridcache`, `all_dram`,
+`key_value_pmem`) still compile clean, since the only unconditional (non-`#[cfg]`-gated) change is
+the addition of the `rayon` import and the new `AssertSync` type, both inert unless a hybrid
+feature is active.
+
+Not yet done: re-verifying against the real `paper-benchmark-cxl` benchmark (the rigorous
+verification step used earlier in this same investigation) to directly confirm the parallelization
+reduces `PolicyWorker`'s wall-clock migration latency / CPU burden under real concurrent load, not
+just this crate's own (lower-scale, lower-concurrency) test suite — worth doing before relying on
+this as a proven throughput win, following the same "verify against the actual benchmark, not just
+this crate's tests" pattern this investigation has used throughout (e.g. the jemalloc-pool
+findings above only became trustworthy once checked against the real benchmark).
