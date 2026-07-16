@@ -444,10 +444,28 @@ where
 	) -> Result<Self, CacheError> {
 		let max_cache_size = status.max_size();
 
-		let mini_stacks = MiniStackManager::new(
-			status.policies(),
-			max_cache_size,
-		);
+		// Hybrid caches (`lru_hybrid_cache`/`lfu_hybrid_cache`/`two_q_hybrid_cache`,
+		// the only callers of this constructor) are always constructed with a
+		// single-element policies list containing only their own fixed policy
+		// (e.g. `[PaperPolicy::LruHybrid]`) and never with `PaperPolicy::Auto`
+		// -- there is no public API to switch a hybrid cache's policy at all
+		// (see `PaperCache<K, TieredBuffer, S>`'s design: "no `policy()`
+		// method, there's only one policy"). `perform_auto_policy` already
+		// short-circuits on `!self.status.is_auto_policy()` before ever
+		// consulting a mini stack, so passing the real (single-entry)
+		// policies list here only bought a self-referential `MiniStack` that
+		// received a sampled copy of every get/set/del/resize/wipe/eviction
+		// event (`MiniStackManager`'s `handle_*` methods aren't gated by
+		// `is_auto_policy` at all) and could never possibly be switched to.
+		// An empty policies list here means zero `MiniStack`s are ever
+		// constructed, so those `handle_*` calls become true no-ops. Safe
+		// even for the eviction-during-reconstruction path
+		// (`apply_mini_evictions`/`MiniStackManager::get_eviction`, the one
+		// place that indexes directly into the mini-stacks slice): it only
+		// runs when `self.mini_index` is `Some`, which is only ever set by
+		// the explicit-policy-switch handler elsewhere in this file --
+		// unreachable here for the same reason auto-switching is.
+		let mini_stacks = MiniStackManager::new(&[], max_cache_size);
 
 		let policy = status.policy();
 		let policy_stack = init_policy_stack(policy, max_cache_size);
