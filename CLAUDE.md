@@ -335,294 +335,90 @@ Conclusion: jemalloc's plain defaults (as already landed in the pool-backend swa
 configuration found via statistical/tuning-based approaches. Further improvement requires a
 structural mechanism, not a tuning knob — see the next section.
 
-### Implemented: a genuine structural hard cap on the global `DRAMObjects` allocator
+### Tried and abandoned: a structural DRAM hard cap on the global `DRAMObjects` allocator
 
-The user asked directly: "can u somehow set the jemalloc memory size to be some hard limit?" —
-i.e. a structural ceiling rather than a statistical tendency. Two scopes were possible: cap only a
-narrow, dedicated fast-tier-value allocator, or cap `DRAMObjects` itself (the crate's
-`#[global_allocator]`, backing essentially all Rust heap allocation process-wide, not just cache
-values). The user explicitly chose the broader scope: **"i think it should cap the global dram
-allocaotr.... since that is what would really reflect a given fast tier budget."** This is the
-active, in-progress direction — not yet landed.
+A structural hard cap was implemented (a custom jemalloc arena, bump-allocated within a fixed
+`mmap`+`mbind`-pinned region, returning `NULL` once a configured `PAPER_CACHE_DRAM_CAP_BYTES` was
+exhausted, opt-in and scoped to node 0/`DRAMObjects` only) after the earlier jemalloc-pool-swap
+investigation (see below) plateaued at ~1.4–2.1x `fast_tier_size`, per the user's ask for something
+closer to a true ceiling. It required resolving the system jemalloc's `mallctl`/`mallocx`/`dallocx`
+at runtime — first via build-time linking (found to interpose over the *entire process's* `malloc`/
+`free` via ELF symbol resolution, since most non-prefixed jemalloc builds export unprefixed libc
+symbol names — this alone caused real, reported allocation failures with the cap completely
+*unset*, root-caused via `nm -D`), then via `dlopen(RTLD_LOCAL)`, which avoided the interposition
+but surfaced a second, unrelated pre-existing bug: `allocator.rs` used `println!` (which lazily
+allocates its own stdout buffer on first use) inside the alloc-failure diagnostic of all four
+`GlobalAlloc` impls, so a first-ever allocation failure recursed into initializing that same
+`OnceLock` from within itself and deadlocked forever (confirmed via `gdb` on a real hung process
+matching a user report of the benchmark hanging for many hours; fixed independently by switching to
+`eprintln!`, which is unbuffered and allocation-free — this fix is retained even though the feature
+that surfaced it was later removed, since it protects the same four allocators' failure paths in
+general).
 
-Mechanism: this repo already has an unused, previously-written `umf_allocator/
-jemalloc_extent_hooks.c` (not currently compiled into the build — see the large commented-out
-block in `build.rs`, ~lines 121–247, which shows how it was previously intended to link against
-system jemalloc directly). It implements a `tier_t`-based custom jemalloc arena whose
-`extent_hooks_t::extent_alloc` bump-allocates from a fixed-size, `mmap(MAP_NORESERVE)`-reserved,
-`mbind(MPOL_BIND)`-pinned region and returns `NULL` once a configured `region_cap` is exceeded —
-a genuine structural ceiling (not a statistical tendency), while individual allocations within
-that region still get jemalloc's normal internal reuse machinery. `extent_dalloc`/`extent_destroy`/
-`extent_decommit`/`extent_purge_*` all refuse to release, so the region is bump/retain at the
-extent level only — this is intentional and fine for a hard-capped tier.
+Ultimately abandoned and fully removed at the user's explicit request, for two independent reasons
+confirmed by direct testing rather than assumption:
+- On this sandbox, `dlopen("libjemalloc.so.2", ...)` fails unconditionally with "cannot allocate
+  memory in static TLS block" — a real glibc limit on the small TLS surplus reserved for post-
+  startup loading of libraries using the initial-exec TLS model (which jemalloc's thread-local
+  caches use). Tested whether loading as early as physically possible (a C `__attribute__((constructor))`
+  running before `main()`) could dodge this — it made no difference, failing identically. This is a
+  structural constraint of this specific glibc/jemalloc-build combination, not something fixable by
+  changing *when* the dlopen happens.
+- Separately (see below), UMF's own jemalloc pool — the mechanism this hard cap's design was meant
+  to route *around* — turned out to be independently unreliable under real load anyway, making the
+  whole DRAM-cap effort moot regardless of the dlopen/TLS issue.
 
-Feasibility check completed: confirmed the system's `/usr/lib64/libjemalloc.so.2` (unprefixed
-`mallctl`, not `je_mallctl` — confirmed via `nm -D`) can be linked directly *alongside* `libumf.so`
-(which bundles its own, separate, statically-linked jemalloc used by the working
-`umfJemallocPoolOps()` pool from the fix above) without symbol collisions — a minimal smoke test
-(`mallctl("opt.narenas", ...)` + `mallocx`/`dallocx` against the system jemalloc, linked
-`-lumf -ljemalloc`) ran cleanly (`rc=0 narenas=32`, valid pointer from `mallocx`) with both
-libraries loaded in the same process. So the two jemalloc instances can coexist: `HybridObjects`
-(node 1/PMEM) keeps using the already-fixed, already-tested UMF jemalloc pool; `DRAMObjects`
-(node 0/DRAM, the global allocator) would be the only one switched to the extent-hooks hard-cap
-arena.
+All `dram_cap_*` code, the `PAPER_CACHE_DRAM_CAP_BYTES` environment variable, and the associated
+`build.rs` wiring have been removed entirely. `umf_allocator_init`/`umf_alloc`/`umf_dealloc`/
+`check_tier` are back to their pre-this-feature shape (a plain per-node `pools[]` array, no dram-cap
+branch). If this direction is revisited, the two blockers above (process-wide malloc interposition
+from build-time linking; this sandbox's dlopen/static-TLS failure) still apply and would need
+addressing first.
 
-**Wiring, as actually landed** (`umf_allocator/umf_allocator_wrapper.c`, `build.rs`):
-`jemalloc_extent_hooks.c` itself was never compiled in — instead its tier machinery was ported
-directly into `umf_allocator_wrapper.c`, renamed to a `dram_cap_*` prefix (`dram_cap_extent_alloc`,
-`dram_cap_init_from_env`, `dram_cap_alloc`, `dram_cap_dealloc`, `dram_cap_owns`,
-`dram_cap_is_active`) so it coexists with the file's existing UMF-pool functions without name
-collisions, simplified from the original's `MAX_TIERS`-array design to a single static
-`dram_cap_tier_t` since only node 0 ever uses it. `umf_allocator_init`/`umf_alloc`/`umf_dealloc`/
-`check_tier` each gained a `numa_node == 0 && dram_cap_is_active()` branch at the top that
-dispatches into the capped path; falling through unchanged to the existing UMF jemalloc pool
-(node 1/`HybridObjects` and friends are entirely unaffected). `build.rs` links the system
-`libjemalloc.so.2` by absolute path via `cargo:rustc-link-arg` (not `cargo:rustc-link-lib=dylib=`)
-placed *after* the `cc::Build::compile()` call — necessary because with `--as-needed` in effect,
-rust-lld only resolves a dylib's symbols against references already outstanding when it reaches
-that dylib on the command line, so the more natural `-l`-based form (which cargo groups before the
-crate's own compiled archives regardless of println! order) left `mallctl`/`mallocx`/`dallocx`
-permanently undefined; a raw `rustc-link-arg` with an absolute path lands at the true tail of the
-linker invocation, after the archive that creates the references.
+### Reverted, twice: `umfJemallocPoolOps()` (UMF's jemalloc pool) is unreliable under real concurrent load
 
-**Size configuration**: `PAPER_CACHE_DRAM_CAP_BYTES`, read once inside `dram_cap_init_from_env()`
-at node 0's lazy init (`DRAMObjects::DRAM_INIT.call_once`, which fires on the process's first-ever
-heap allocation — before any `PaperCache::new()` call, so this genuinely cannot be threaded through
-as a constructor parameter the way `fast_tier_size` is). Unset or `0` → falls through to the
-existing UMF jemalloc pool path for node 0, unchanged from before this feature; confirmed via the
-full `lru_hybrid_cache`/`lfu_hybrid_cache`/`two_q_hybrid_cache` lib + integration suites (all green,
-run with the env var unset).
+The earlier TBB→jemalloc pool swap (below) was a measured DRAM-retention win against this crate's
+own tests (single/few-threaded, bounded object counts) — but crashes reproducibly the first time it
+was exercised under real load: `paper-benchmark-cxl`'s actual `read-through` client, multiple
+concurrent rayon worker threads, a 2.3M-access real trace. Reported by the user as the benchmark
+process dying partway through a run; reproduced directly under `gdb -batch -ex run -ex "thread apply
+all bt full"`, confirmed via `dmesg` it wasn't an OOM kill (100+ GB free at the time).
 
-**A real concurrency bug this caught, found via `gdb` on a live SIGSEGV**: the first working build
-crashed deep inside jemalloc's own internals (`je_tcache_bin_flush_small` → `je_extent_heap_remove`,
-confirmed via `gdb -batch -ex run -ex "thread apply all bt full"` on the crashing process) as soon
-as more than one thread touched the capped arena concurrently — which is immediate and unavoidable,
-since `DRAMObjects` is the crate's `#[global_allocator]` and every `PaperCache` spawns several
-background worker threads (`PolicyWorker`, `TtlWorker`, `TraceWorker`, ...) that all allocate
-through it. Root cause: the ported code (copied from `jemalloc_extent_hooks.c`, which — worth
-noting — had never actually been compiled or run before this session, despite existing in the repo)
-created one `tcache` per tier via `mallctl("tcache.create", ...)` and reused that single tcache
-index from every calling thread via `MALLOCX_TCACHE(tc)`. A jemalloc tcache's bin freelists are
-plain linked lists with no internal locking — safe only when confined to one thread at a time;
-sharing one across threads is a data race that corrupts jemalloc's own extent bookkeeping. Fixed by
-dropping the tcache entirely: `dram_cap_alloc`/`dram_cap_dealloc` now pass `MALLOCX_TCACHE_NONE`
-unconditionally, going straight to the arena's own bins, which jemalloc already protects with a
-proper per-arena lock (confirmed present and used correctly by other threads in the same crash's
-backtrace, via `je_malloc_mutex_lock_slow`). Slower than a tcache hit would have been, but correct
-— and correctness, not peak throughput, is the point of a hard cap. Re-ran the exact scenario that
-crashed (200K objects, concurrent worker threads) after the fix: passes cleanly, repeatedly.
+The full backtrace traced entirely through UMF's own internals, no crate code involved: jemalloc's
+completely routine internal extent-splitting (normal as arenas grow/shrink under concurrent
+allocation pressure) invokes **`arena_extent_split`**, UMF's own extent-hooks callback installed on
+`umfJemallocPoolOps()`'s pool so UMF can track which bytes belong to which provider — which crashes
+inside UMF's own critnib (compressed radix trie) memory-tracker implementation
+(`umfMemoryTrackerAddAtLevel` → `critnib_insert` → `add_metadata_and_align`, all in
+`libumf.so.1.0.3`, UMF version 1.0.3). This is a bug in UMF's own prebuilt library, not in this
+crate's code — no source access to `libumf.so` to patch it directly, and UMF's jemalloc pool params
+expose no option that avoids the crashing path (the only exposed knob,
+`umfJemallocPoolParamsSetNumArenas`, doesn't touch extent-splitting at all, and was separately
+already tested and found to make memory usage worse, not better — see above).
 
-**A build-cache trap this also caught**: after the tcache fix, the test kept reproducing the
-*exact same* crash — until `strings` on the freshly-built test binary showed it still contained the
-string `"tcache.create"`, proving it was linked against a stale archive. `cargo clean -p
-paper-cache` reported removing 12,198 files but, for reasons not fully root-caused, left at least
-one `target/{debug,release}/build/paper-cache-<hash>/out/libumf_allocator_wrapper.a` in place with
-its pre-fix mtime and content; cargo's own freshness check then didn't recompile it on the next
-build despite the C source's mtime being newer. Fixed by manually `rm -rf`-ing every
-`target/{debug,release}/{build,deps}/{paper_cache,libpaper_cache}*` path before rebuilding — worth
-remembering as a general lesson for this crate specifically, since it mixes a Rust build graph with
-a hand-rolled C compilation step (`cc::Build`) outside Cargo's own artifact tracking: if a C-level
-fix doesn't reproduce, verify with `strings <binary> | grep <old-symbol-or-string>` before assuming
-the fix itself is wrong.
+Reverted to `umfScalablePoolOps()` (TBB, `KeepAllMemory=1`) — the previously-proven-stable
+configuration — reintroducing the already-documented DRAM-retention tradeoff (real usage tracks peak
+cumulative admission, not settled occupancy) as a known, accepted cost. Verified end-to-end against
+the actual benchmark (not just this crate's own tests): the exact command that crashed completed
+cleanly to 100% with full GET/SET stats, no new `dmesg` segfaults.
 
-**End-to-end results** (`REPRO_OBJECT_COUNT=200000`, `PAPER_CACHE_DRAM_CAP_BYTES` set explicitly,
-same methodology as the earlier multi-scale table):
+**Re-tested a second time, per explicit request, rather than relying on memory of the above
+result** (after the DRAM-hard-cap feature above was abandoned, to check whether "just use UMF
+jemalloc" — without the hard-cap complexity — might behave differently): failed again, a *different*
+way. No SIGSEGV this time; instead a corrupted-looking allocation-failure abort partway through the
+same benchmark (`DRAMObjects: UMF alloc failed for N bytes` messages with visibly torn/interleaved
+byte counts mid-string, e.g. one message's tail merged into another's — a signature of concurrent
+heap corruption, not a clean error path), with 160 GB of system memory still free at the time
+(confirmed via `free -h`), ruling out genuine exhaustion as the cause. Two separate test runs, two
+different failure modes, zero successful completions — consistent with an underlying UMF concurrency
+bug that manifests differently run to run (as races typically do), not a one-off fluke. Reverted to
+TBB a second time; this is now the settled, tested-working configuration, confirmed via a third
+successful end-to-end benchmark run after the DRAM-hard-cap code was fully removed (previous section).
 
-| `PAPER_CACHE_DRAM_CAP_BYTES` | outcome |
-|---|---|
-| 3,000,000,000 (3.0x the 953.7 MB fast-tier budget) | test passes; node0 peak/settled/decayed = 2547.1 / 2568.7 / 2568.7 MB (2.69x budget); decayed/peak ratio = 1.008 |
-| 1,200,000,000 (1.26x the fast-tier budget) | cap genuinely exhausted mid-run; clean `SIGABRT` via Rust's `handle_alloc_error`, not a crash or hang |
-
-Two things confirmed directly: (1) **the cap is a real, provable ceiling** — node0 never exceeded
-either configured value, unlike the unbounded growth-with-scale the earlier TBB/jemalloc-pool
-investigation measured (13.89x at 1M objects and climbing); (2) **this arena never releases
-memory** (by design — `dram_cap_extent_dalloc`/`decommit`/`purge_*` all refuse, matching
-`jemalloc_extent_hooks.c`'s original bump/retain intent), so real usage tracks *peak cumulative
-admission volume* over the run, not final tier occupancy or a shrink-after-settlement curve the way
-the jemalloc-*pool* fix does — decayed/peak ≈ 1.0 here versus that fix's 0.178 at 1M objects. This
-is a real, structural difference in what "the cap" is capping: it bounds the worst case a run can
-ever reach, but does not make steady-state usage hug `fast_tier_size` the way the phrase "at max
-1gb" originally hoped — the practical number to size the cap against is peak cumulative admission
-(itself several times `fast_tier_size` under sustained demotion pressure, exactly the "cumulative
-admissions, not final occupancy, drive real memory" finding from the section above), not
-`fast_tier_size` itself.
-
-**On "graceful failure"**: since this caps the crate's `#[global_allocator]`, exhausting it does
-not fail just the one `set()` call that pushed usage over the line — Rust's default
-`handle_alloc_error` fires for *any* failed allocation anywhere in the process (cache-related or
-not) and aborts the whole process. Confirmed via the 1.2 GB-cap run above: a clear diagnostic trail
-(`dram_cap: DRAM hard cap exhausted (need N, cap N)` from every retry, then `DRAMObjects: UMF alloc
-failed for N bytes`, then Rust's own `memory allocation of N bytes failed`) followed by a clean
-`SIGABRT` — no memory corruption, no hang, no silently-wrong results. That is the best "graceful"
-outcome achievable with this design (capping the *global* allocator, per the user's explicit
-choice over a narrower dedicated-type allocator — see above): a deterministic, diagnosable,
-controlled termination rather than a soft degradation. In practice this means
-`PAPER_CACHE_DRAM_CAP_BYTES` needs deliberate headroom above `fast_tier_size` — enough to cover
-peak cumulative admission volume plus all other process DRAM use (hashtable, eviction stacks,
-thread stacks, general runtime allocation) — not a tight value close to `fast_tier_size`; setting
-it too tight *will* abort the process, by design.
-
-Verified no regressions: full `lru_hybrid_cache`, `lfu_hybrid_cache`, and `two_q_hybrid_cache`
-integration suites (15/15, 19/19, 18/18) all pass unchanged with `PAPER_CACHE_DRAM_CAP_BYTES`
-unset, confirming the fallback path to the existing UMF jemalloc pool is untouched by this feature
-when the cap isn't opted into.
-
-### Two critical follow-up bugs, both found via direct reproduction — build-time jemalloc linking silently broke all allocation (cap disabled or not), and a real self-deadlock
-
-Reported by the user in production: `HybridObjects: UMF alloc failed` and `DRAMObjects: UMF alloc
-failed` on a real, >1M-object, 4 GB `fast_tier_size` run — **with `PAPER_CACHE_DRAM_CAP_BYTES`
-unset**, i.e. the cap feature not opted into at all. Investigated by direct code reading rather than
-guessing, per this file's established pattern:
-
-**Bug 1 (confirmed, fixed): linking `libjemalloc.so.2` at build time made it a process-wide
-`malloc`/`free` replacement, active regardless of whether the cap was ever configured at runtime.**
-The original implementation (see "Wiring, as actually landed" above) linked the system jemalloc via
-`cargo:rustc-link-arg` so its `mallctl`/`mallocx`/`dallocx` symbols were resolvable at build time.
-Confirmed via `nm -D /usr/lib64/libjemalloc.so.2`: like most non-`--with-jemalloc-prefix` jemalloc
-builds, it *also* exports plain, unprefixed `malloc`/`free`/`calloc`/`realloc`/`posix_memalign`.
-Merely linking such a library into a binary makes it a global `malloc` replacement for the *entire*
-process via standard ELF symbol interposition — every allocation anywhere (UMF's own internals,
-libnuma, any other C dependency, not just this file's own code) silently gets rerouted to jemalloc's
-regular default arenas, independent of `dram_cap_is_active()` or any runtime check in this crate's
-own code, since interposition happens at the dynamic linker level before any of that code even runs.
-Any code path still holding a pointer allocated by the *other*, now-shadowed allocator (or vice
-versa) is a mismatched-allocator condition — undefined behavior that can corrupt heap metadata over
-many allocation cycles, consistent with the user's report only manifesting at >1M objects on a long
-run, not immediately.
-
-Fixed by never linking `libjemalloc.so.2` into the binary at all. `build.rs`'s
-`cargo:rustc-link-arg=<path>` for it was removed entirely; `umf_allocator_wrapper.c` now resolves
-`mallctl`/`mallocx`/`dallocx` via `dlopen(path, RTLD_NOW | RTLD_LOCAL)` + `dlsym`, called lazily
-from `dram_cap_init_from_env()` — i.e. *only* once `PAPER_CACHE_DRAM_CAP_BYTES` is confirmed set.
-`RTLD_LOCAL` (the default, named explicitly) keeps the loaded library's symbols out of the process's
-global symbol table, reachable only via this file's own `dlsym` handles — no interposition. Users
-who never set the env var never have `libjemalloc.so.2` loaded into their process at all. `-ldl` was
-added to `build.rs` for `dlopen`/`dlsym`/`dlerror` themselves (`mallctl`-family symbol names are
-tried both unprefixed and `je_`-prefixed, for portability across distributions).
-
-**Bug 2 (confirmed, fixed): a genuine, reproducible self-deadlock, hung indefinitely (matching the
-user's report of "well over 11 hours" before being killed).** Found via `gdb -p <pid> -batch -ex
-"thread apply all bt full"` on the actual hung process while verifying Bug 1's fix (a
-`PAPER_CACHE_DRAM_CAP_BYTES`-set run on this sandbox, which — separately, see below — cannot
-actually `dlopen` `libjemalloc.so.2` at all). Full backtrace showed the single thread parked in a
-futex wait inside `<std::sync::sync::once::futex::Once>::call`, reached via: `main` →
-`lang_start_internal` → `set_current_info` (Rust's own early runtime bootstrap, setting up the
-stack-overflow guard) → `__rust_alloc` (the very first heap allocation of the whole process) →
-[our `DRAMObjects::alloc`, inlined/not itself in the trace] → that allocation failed (see below for
-why) → `println!("DRAMObjects: UMF alloc failed for {} bytes", ...)` → `std::io::stdio::_print` →
-lazily initializing stdout's buffered `LineWriter` for the first time (via a `OnceLock`) → *that*
-initializer itself needed to allocate a buffer → back into `__rust_alloc` → the second allocation
-attempt *also* failed (the underlying cause hadn't changed) → tried to `println!` again → tried to
-initialize the *same* stdout `OnceLock` a second time, from the same thread, while already in the
-middle of initializing it the first time → permanent self-deadlock (`Once`/`OnceLock` are not
-reentrant).
-
-This is a **pre-existing latent bug, not something introduced by the DRAM-cap work** — `allocator.rs`
-used `println!` (not `eprintln!`) inside the alloc-failure diagnostic of all four `GlobalAlloc`
-impls (`HybridObjects`, `DRAMObjects`, `ValueDRAM`, `DAXPMEM`). `println!`/`Stdout` uses a buffered
-`LineWriter` that lazily allocates its own buffer on first use; `eprintln!`/`Stderr` is deliberately
-*unbuffered* (writes go straight to fd 2, no lazy allocation) specifically so it stays safe to use
-from contexts like this one. The bug was latent because, prior to this session, the very first
-allocation in a process essentially never failed — the DRAM-cap work is what first made "the
-first-ever allocation in the process can genuinely fail" a real, reachable scenario (see Bug 3
-below for why it *was* failing on this sandbox specifically). Fixed by changing all four `println!`
-alloc-failure sites (`grep -n 'println!("HybridObjects: UMF alloc failed` etc.) to `eprintln!`; two
-more, textually identical instances further down the file are inside inert `/* ... */` block
-comments (confirmed by mapping every `/*`/`*/` marker in the file, including nested ones) and were
-left alone. This is a general robustness fix, not specific to the DRAM cap: any allocation failure
-in any of these four allocators, for any reason, could previously have hit this exact deadlock if
-it happened to be (or immediately follow) the first allocation of the process.
-
-**Bug 3 (confirmed, structural, not fixable in this crate): on this sandbox, `libjemalloc.so.2`
-cannot be `dlopen`'d after process start at all.** Direct reproduction (a standalone 10-line C
-program calling `dlopen("/usr/lib64/libjemalloc.so.2", RTLD_NOW | RTLD_LOCAL)`) fails with
-`cannot allocate memory in static TLS block` — a real glibc limit: shared libraries using the
-initial-exec TLS model (which jemalloc's own thread-local arena/tcache state uses) can only be
-loaded via `dlopen` if enough "static TLS surplus" was reserved at process startup, and glibc's
-default reservation is small. This is *why* Bug 1's fix (switching to `dlopen`) surfaced Bug 2 in
-the first place — the cap path now reliably fails closed on this system. Fixed defensively:
-`dram_cap_init_from_env()` treats a failed `dram_cap_load_jemalloc()` (or any other failure in the
-setup sequence — `mmap`, `arenas.create`, `extent_hooks`) as "fall back to the existing UMF pool for
-node 0," never as a fatal condition (see `umf_allocator_init`'s simplified two-outcome contract:
-0 = cap active, 1 = cap not active for *any* reason, always fall through to `umf_pool_init`). The
-printed diagnostic on this specific failure suggests two real remediations for a user who wants the
-cap to actually activate on a system with this constraint: launch with `LD_PRELOAD=libjemalloc.so.2`
-(loads it at startup instead, before this constraint applies — but note this also makes jemalloc the
-process's malloc, the interposition Bug 1 avoided, so it's an explicit, informed choice rather than
-a silent side effect) or `GLIBC_TUNABLES=glibc.rtld.optional_static_tls=<bytes>` (glibc >= 2.35,
-directly increases the reserved surplus). Neither was tested end-to-end in this session (no
-`LD_PRELOAD`/`GLIBC_TUNABLES`-set run confirming the cap actually activates on this sandbox) — the
-graceful-fallback behavior was verified instead, since that's what the crate does by default and
-what most users will actually experience without extra launch-time configuration.
-
-**Verification**: re-ran the exact scenario that hung (`REPRO_OBJECT_COUNT=200000
-PAPER_CACHE_DRAM_CAP_BYTES=3000000000`, this sandbox, which per Bug 3 cannot load jemalloc at all)
-under a hard 90s `timeout` — completes cleanly in ~41s (matching the cap-*disabled* baseline's
-timing almost exactly, confirming the fallback path is genuinely equivalent, not a degraded/broken
-mode), prints the actionable dlopen-failure diagnostic once, and exits 0. Re-ran the cap-*disabled*
-path too (confirming Bug 1's fix directly): also clean, and its peak/settled numbers now show real
-decay (0.412–0.643 decayed/peak ratio) rather than the artificially-pinned-at-peak behavior a
-process-wide jemalloc-malloc-replacement side effect might have caused. Full `lru_hybrid_cache`
-(25 unit + 15 integration), `lfu_hybrid_cache` (27 + 19), and `two_q_hybrid_cache` (21 + 18) suites
-all still pass.
-
-### Reverted: the jemalloc pool backend (`umfJemallocPoolOps()`) crashes under real concurrent load — reverted to TBB
-
-The earlier "Fix: switched the pool backend from TBB scalable to UMF's jemalloc pool" (this file,
-above) was measured as a large DRAM-tracking win using this crate's own tests (single/few-threaded,
-bounded object counts) — but a real, reproducible SIGSEGV surfaced the first time it was exercised
-under `paper-benchmark-cxl`'s actual concurrent, trace-driven load (`lru_hybrid_cache`, `--client-type
-read-through`, multiple rayon worker threads, a 2.3M-access real trace). Reported by the user as the
-benchmark process dying partway through a run. Reproduced directly (not guessed at): ran the exact
-benchmark command under `gdb -batch -ex run -ex "thread apply all bt full"`, caught the live SIGSEGV,
-confirmed via `dmesg` (`segfault ... in libumf.so.1.0.3`) that it wasn't an OOM kill (171 GB free at
-the time).
-
-Full backtrace of the crashing thread traced entirely through UMF's own internals, no crate code
-involved: `je_large_palloc` → `je_arena_extent_alloc_large` → `je_pa_alloc` → ... → `je_ecache_alloc`
-→ `extent_recycle` → `extent_split_impl` → `ehooks_split` → **`arena_extent_split`** (UMF's own
-extent-hooks callback, installed on `umfJemallocPoolOps()`'s pool to let UMF track which bytes belong
-to which provider) → `umfMemoryProviderAllocationSplit` → `trackingAllocationSplit` →
-`umfMemoryTrackerAddAtLevel` → `critnib_insert` → **crash inside `add_metadata_and_align`**, UMF's own
-critnib (compressed radix trie) memory-tracker implementation, `libumf.so.1.0.3`. This is jemalloc's
-completely normal internal extent-splitting (routine as arenas grow/shrink under real concurrent
-allocation pressure) triggering a bug in *UMF's* tracker code, not anything this crate does
-differently — this crate has no source access to `libumf.so` to patch it directly, and no upstream
-UMF fix was checked (no reliable way to check issue trackers from this environment).
-
-Since a crash is a strictly worse outcome than elevated-but-bounded DRAM usage, reverted
-`umf_pool_init` (`umf_allocator/umf_allocator_wrapper.c`) back to `umfScalablePoolOps()` (TBB,
-`KeepAllMemory=1`, 2 MB granularity) — the previously-proven-stable configuration from before this
-session's jemalloc-pool experiment. This reintroduces the *already-documented, already-understood*
-DRAM-retention behavior (real usage tracks peak cumulative admission, not settled occupancy — see
-the multi-scale table earlier in this file) as a known, accepted tradeoff until either UMF fixes this
-upstream or a jemalloc-pool configuration is found that avoids the crashing code path under real
-concurrent load. The DRAM hard cap (`dram_cap_*`, opt-in via `PAPER_CACHE_DRAM_CAP_BYTES`) does not
-route through this pool for node 0 at all and is unaffected by this revert.
-
-**Verified end-to-end, twice, using the actual benchmark rather than this crate's own tests**: the
-exact command that crashed (`paper-benchmark -t <2.3M-access trace> --client-type read-through`,
-built against the reverted code) now completes cleanly to 100%, printing full GET/SET latency and
-throughput stats, with no new `dmesg` segfault entries. `cargo test` regressions re-confirmed clean
-too (`lru_hybrid_cache` unit + integration suites).
-
-### Remaining work on the DRAM hard cap
-
-- No dedicated automated integration test for the cap itself yet (the verification above was done
-  manually via `REPRO_OBJECT_COUNT`/`PAPER_CACHE_DRAM_CAP_BYTES` env vars against the existing
-  `repro_real_dram_usage_at_scale` `#[ignore]`d test) — worth turning into a proper `#[test]` that
-  spawns a subprocess with a tight cap and asserts the clean-`SIGABRT` behavior, since the parent
-  test process itself can't safely set `PAPER_CACHE_DRAM_CAP_BYTES` (it's read once, process-wide,
-  at the first heap allocation — far too early to scope per-test within one binary).
-- The `cargo clean -p paper-cache` staleness trap above suggests this crate's C build-artifact
-  tracking may be fragile in other scenarios too (e.g. CI cache restores) — not investigated
-  further since a manual `rm -rf` of the build directories is a reliable workaround, but worth
-  flagging if C-level changes ever appear to "not take effect" again.
-- No attempt made to reduce the never-shrinks peak/decayed≈1.0 characteristic (e.g. periodically
-  destroying and recreating the arena to reclaim virtual address space, or reintroducing a
-  size-limited LRU-style internal reuse scheme) — out of scope for "make it a hard cap," which was
-  the literal ask; flagged as a follow-up if steady-state memory efficiency (not just worst-case
-  boundedness) becomes the goal again.
+**Bottom line for future work**: `umfJemallocPoolOps()` should be treated as unsafe under real
+concurrent load on this UMF version (1.0.3) until proven otherwise by UMF fixing this upstream —
+don't re-enable it without re-running the actual benchmark (not just this crate's own test suite,
+which is too low-concurrency/low-scale to reproduce either failure mode) to confirm.
 
 ## Feature: `lru_hybrid_cache` (steps 1–10 implemented; see status below)
 
