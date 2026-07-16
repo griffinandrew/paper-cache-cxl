@@ -566,6 +566,46 @@ process-wide jemalloc-malloc-replacement side effect might have caused. Full `lr
 (25 unit + 15 integration), `lfu_hybrid_cache` (27 + 19), and `two_q_hybrid_cache` (21 + 18) suites
 all still pass.
 
+### Reverted: the jemalloc pool backend (`umfJemallocPoolOps()`) crashes under real concurrent load — reverted to TBB
+
+The earlier "Fix: switched the pool backend from TBB scalable to UMF's jemalloc pool" (this file,
+above) was measured as a large DRAM-tracking win using this crate's own tests (single/few-threaded,
+bounded object counts) — but a real, reproducible SIGSEGV surfaced the first time it was exercised
+under `paper-benchmark-cxl`'s actual concurrent, trace-driven load (`lru_hybrid_cache`, `--client-type
+read-through`, multiple rayon worker threads, a 2.3M-access real trace). Reported by the user as the
+benchmark process dying partway through a run. Reproduced directly (not guessed at): ran the exact
+benchmark command under `gdb -batch -ex run -ex "thread apply all bt full"`, caught the live SIGSEGV,
+confirmed via `dmesg` (`segfault ... in libumf.so.1.0.3`) that it wasn't an OOM kill (171 GB free at
+the time).
+
+Full backtrace of the crashing thread traced entirely through UMF's own internals, no crate code
+involved: `je_large_palloc` → `je_arena_extent_alloc_large` → `je_pa_alloc` → ... → `je_ecache_alloc`
+→ `extent_recycle` → `extent_split_impl` → `ehooks_split` → **`arena_extent_split`** (UMF's own
+extent-hooks callback, installed on `umfJemallocPoolOps()`'s pool to let UMF track which bytes belong
+to which provider) → `umfMemoryProviderAllocationSplit` → `trackingAllocationSplit` →
+`umfMemoryTrackerAddAtLevel` → `critnib_insert` → **crash inside `add_metadata_and_align`**, UMF's own
+critnib (compressed radix trie) memory-tracker implementation, `libumf.so.1.0.3`. This is jemalloc's
+completely normal internal extent-splitting (routine as arenas grow/shrink under real concurrent
+allocation pressure) triggering a bug in *UMF's* tracker code, not anything this crate does
+differently — this crate has no source access to `libumf.so` to patch it directly, and no upstream
+UMF fix was checked (no reliable way to check issue trackers from this environment).
+
+Since a crash is a strictly worse outcome than elevated-but-bounded DRAM usage, reverted
+`umf_pool_init` (`umf_allocator/umf_allocator_wrapper.c`) back to `umfScalablePoolOps()` (TBB,
+`KeepAllMemory=1`, 2 MB granularity) — the previously-proven-stable configuration from before this
+session's jemalloc-pool experiment. This reintroduces the *already-documented, already-understood*
+DRAM-retention behavior (real usage tracks peak cumulative admission, not settled occupancy — see
+the multi-scale table earlier in this file) as a known, accepted tradeoff until either UMF fixes this
+upstream or a jemalloc-pool configuration is found that avoids the crashing code path under real
+concurrent load. The DRAM hard cap (`dram_cap_*`, opt-in via `PAPER_CACHE_DRAM_CAP_BYTES`) does not
+route through this pool for node 0 at all and is unaffected by this revert.
+
+**Verified end-to-end, twice, using the actual benchmark rather than this crate's own tests**: the
+exact command that crashed (`paper-benchmark -t <2.3M-access trace> --client-type read-through`,
+built against the reverted code) now completes cleanly to 100%, printing full GET/SET latency and
+throughput stats, with no new `dmesg` segfault entries. `cargo test` regressions re-confirmed clean
+too (`lru_hybrid_cache` unit + integration suites).
+
 ### Remaining work on the DRAM hard cap
 
 - No dedicated automated integration test for the cap itself yet (the verification above was done

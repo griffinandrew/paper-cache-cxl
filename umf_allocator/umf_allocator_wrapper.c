@@ -432,7 +432,7 @@ int umf_allocator_init(int numa_node) {
 static int umf_pool_init(int numa_node) {
     //setenv("UMF_CONF", "umf.provider.os.params.mmap_flags=0x8000", 0);
     umf_memory_pool_handle_t new_pool = NULL;
-    umf_jemalloc_pool_params_handle_t jemalloc_params = NULL;
+    umf_scalable_pool_params_handle_t scalable_params = NULL;
     umf_result_t res;
 
     if (numa_node < 0 || numa_node >= MAX_NODES) {
@@ -486,41 +486,52 @@ static int umf_pool_init(int numa_node) {
     }
 
     // -------------------------------------------------------------------------
-    // EXPERIMENT: switched from the TBB scalable pool (see git history / the
-    // commented block below for the KeepAllMemory-based version) to UMF's
-    // jemalloc-backed pool, to test whether jemalloc's own decay-based page
-    // release behaves differently under this workload's fragmentation
-    // pattern (see CLAUDE.md's "real DRAM usage vs. fast_tier_size"
-    // investigation). Deliberately not attempting to replicate
-    // KeepAllMemory's "retain everything" semantics here -- jemalloc's
-    // default dirty/muzzy decay (madvise-based, ~10s idle before a page is
-    // eligible for release) is used as-is.
+    // REVERTED back to the TBB scalable pool (from UMF's jemalloc-backed
+    // pool, which this code briefly switched to -- see CLAUDE.md's "real
+    // DRAM usage vs. fast_tier_size" investigation for that swap's
+    // measured DRAM-retention win). The jemalloc pool was found, via a real
+    // benchmark run under paper-benchmark-cxl (multiple concurrent rayon
+    // worker threads, real trace-driven load), to SEGFAULT reproducibly
+    // inside UMF's own internals: confirmed via gdb -- jemalloc's extent
+    // splitting (inside umfJemallocPoolOps(), needed as arenas grow/shrink
+    // under concurrent allocation pressure) invokes UMF's custom
+    // arena_extent_split extent hook, which crashes inside UMF's own
+    // critnib-based memory tracker (umfMemoryTrackerAddAtLevel ->
+    // critnib_insert -> add_metadata_and_align, all in libumf.so.1.0.3,
+    // UMF version 1.0.3). This is a bug inside UMF's own prebuilt library,
+    // not in this crate's code -- not something fixable here. A crash is a
+    // strictly worse outcome than elevated-but-bounded DRAM usage, so this
+    // reverts to the previously-proven-stable TBB pool (with
+    // KeepAllMemory=1, as before the jemalloc-pool experiment) until either
+    // UMF fixes this upstream or a jemalloc-pool configuration is found
+    // that avoids triggering the crashing code path under real concurrent
+    // load. The DRAM hard cap (dram_cap_* functions above, opt-in via
+    // PAPER_CACHE_DRAM_CAP_BYTES) does NOT go through this pool at all for
+    // node 0 -- it is unaffected by this revert.
     // -------------------------------------------------------------------------
-    res = umfJemallocPoolParamsCreate(&jemalloc_params);
+    res = umfScalablePoolParamsCreate(&scalable_params);
     if (res != UMF_RESULT_SUCCESS) {
-        fprintf(stderr, "Failed to create jemalloc pool params (node %d): %d\n", numa_node, res);
+        fprintf(stderr, "Failed to create scalable pool params (node %d): %d\n", numa_node, res);
         pthread_mutex_unlock(&lifecycle_lock);
         return 5;
     }
 
-    // Tested reducing NumArenas from the default (num CPU cores * 4) down to
-    // 2, hypothesizing fewer arenas would mean less per-arena retained
-    // overhead: made things *worse* (200K-object scale: 1.91x budget vs.
-    // 1.42x at the default arena count) -- fewer arenas means more threads
-    // contend for the same arena, which apparently costs more in
-    // cross-thread allocation-pattern fragmentation than it saves in
-    // per-arena footprint. Left at the default (no explicit SetNumArenas
-    // call).
+    // Keep retaining freed blocks so transient allocs recycle in-pool and the
+    // provider's bump offset advances slowly (only net-new live memory grows it).
+    umfScalablePoolParamsSetKeepAllMemory(scalable_params, 1);
+
+    size_t huge_chunk_size = 2 * 1024 * 1024ULL;
+    umfScalablePoolParamsSetGranularity(scalable_params, huge_chunk_size);
 
     // Create pool into a local first; only publish once fully constructed.
     res = umfPoolCreate(
-            umfJemallocPoolOps(),
+            umfScalablePoolOps(),
             providers[numa_node],
-            jemalloc_params,
+            scalable_params,
             0,
             &new_pool);
 
-    umfJemallocPoolParamsDestroy(jemalloc_params);
+    umfScalablePoolParamsDestroy(scalable_params);
 
     if (res != UMF_RESULT_SUCCESS) {
         fprintf(stderr, "Failed to create pool (node %d): %d\n", numa_node, res);
