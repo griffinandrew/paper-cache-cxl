@@ -45,6 +45,20 @@
 //! bytes itself. `PolicyWorker` drains `drain_tier_migrations` after each
 //! `insert`/`update` call and performs the actual `TieredBuffer`
 //! reallocation against the shared object map (see `Object::set_data`).
+//!
+//! ## One combined per-key map, not two
+//!
+//! Every tracked key needs both a tier and a size, and nearly every
+//! operation here touches both together (`resize_key` adjusts whichever
+//! tier's counter applies to the size change; `touch_fast_key`/
+//! `settle_fast_tier`/`remove`/`evict_one` all read the size right after
+//! reading or writing the tier). An earlier version kept these in two
+//! separate maps (`sizes`, `tiers`); they're now one
+//! `entries: HashMap<HashedKey, LruEntry>` (`LruEntry { tier, size }`),
+//! matching `TwoQHybridStack`'s equivalent consolidation. This removes one
+//! of the two hashtable-structural-overhead charges per tracked object (see
+//! `object/overhead.rs`'s `LruHybrid` arm) and removes the possibility of a
+//! key being present in one map but not the other by construction.
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 use std::collections::HashMap;
@@ -78,7 +92,7 @@ use crate::{
 /// large enough to meaningfully reduce demotion-pass frequency on its own.
 const FAST_TIER_LOW_WATER_RATIO: f64 = 0.98;
 
-// The recency list and per-key maps are DRAM-backed by default. When
+// The recency list and per-key map are DRAM-backed by default. When
 // `eviction_stacks_pmem` is enabled, they are instead allocated in the slow
 // tier (PMEM, via `crate::Hybrid`) — co-located with the slow-tier object
 // bytes — exactly the way plain `LruStack` switches to PMEM collections under
@@ -91,20 +105,22 @@ type RecencyList = HashList<HashedKey, NoHasher>;
 #[cfg(feature = "eviction_stacks_pmem")]
 type RecencyList = PmemHashList<HashedKey, NoHasher>;
 
-#[cfg(not(feature = "eviction_stacks_pmem"))]
-type SizeMap = HashMap<HashedKey, ObjectSize, NoHasher>;
-#[cfg(feature = "eviction_stacks_pmem")]
-type SizeMap = HashMap<HashedKey, ObjectSize, NoHasher, Hybrid>;
+/// Combined per-key bookkeeping: tier and size. See the module doc's "One
+/// combined per-key map" section for why this replaced two separate maps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LruEntry {
+	tier: Tier,
+	size: ObjectSize,
+}
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
-type TierMap = HashMap<HashedKey, Tier, NoHasher>;
+type EntryMap = HashMap<HashedKey, LruEntry, NoHasher>;
 #[cfg(feature = "eviction_stacks_pmem")]
-type TierMap = HashMap<HashedKey, Tier, NoHasher, Hybrid>;
+type EntryMap = HashMap<HashedKey, LruEntry, NoHasher, Hybrid>;
 
 pub struct LruHybridStack {
 	stack: RecencyList,
-	sizes: SizeMap,
-	tiers: TierMap,
+	entries: EntryMap,
 
 	fast_capacity: CacheSize,
 	fast_used: CacheSize,
@@ -120,7 +136,7 @@ pub struct LruHybridStack {
 
 	/// Number of keys currently tagged `Tier::Fast`. Kept alongside
 	/// `fast_used` (bytes) so `fast_object_count`/`slow_object_count` don't
-	/// need an O(n) scan over `tiers`.
+	/// need an O(n) scan over `entries`.
 	fast_count: usize,
 
 	/// The least-recently-used key currently tagged `Tier::Fast` — i.e. the
@@ -135,29 +151,27 @@ pub struct LruHybridStack {
 }
 
 impl LruHybridStack {
-	/// Constructs the (recency list, size map, tier map) triple, DRAM- or
-	/// PMEM-backed depending on `eviction_stacks_pmem`.
+	/// Constructs the (recency list, entry map) pair, DRAM- or PMEM-backed
+	/// depending on `eviction_stacks_pmem`.
 	#[cfg(not(feature = "eviction_stacks_pmem"))]
-	fn new_collections() -> (RecencyList, SizeMap, TierMap) {
-		(HashList::default(), HashMap::default(), HashMap::default())
+	fn new_collections() -> (RecencyList, EntryMap) {
+		(HashList::default(), HashMap::default())
 	}
 
 	#[cfg(feature = "eviction_stacks_pmem")]
-	fn new_collections() -> (RecencyList, SizeMap, TierMap) {
+	fn new_collections() -> (RecencyList, EntryMap) {
 		(
 			PmemHashList::with_hasher(NoHasher::default()),
-			HashMap::with_hasher_in(NoHasher::default(), Hybrid),
 			HashMap::with_hasher_in(NoHasher::default(), Hybrid),
 		)
 	}
 
 	pub fn new(fast_capacity: CacheSize) -> Self {
-		let (stack, sizes, tiers) = Self::new_collections();
+		let (stack, entries) = Self::new_collections();
 
 		LruHybridStack {
 			stack,
-			sizes,
-			tiers,
+			entries,
 
 			fast_capacity,
 			fast_used: 0,
@@ -196,25 +210,26 @@ impl LruHybridStack {
 	/// Returns the tier the given (currently tracked) key is in, or `None`
 	/// if the key isn't tracked. Exposed for tests/diagnostics.
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
-		self.tiers.get(&key).copied()
+		self.entries.get(&key).map(|entry| entry.tier)
 	}
 
 	/// Records a size change for an already-tracked key without altering its
 	/// tier, adjusting whichever tier's used-bytes counter currently applies.
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
-		let old_size = self.sizes.insert(key, new_size).unwrap_or(0) as i64;
-		let delta = new_size as i64 - old_size;
+		let Some(entry) = self.entries.get_mut(&key) else { return };
 
-		match self.tiers.get(&key) {
-			Some(Tier::Fast) => {
+		let old_size = entry.size;
+		entry.size = new_size;
+		let delta = new_size as i64 - old_size as i64;
+
+		match entry.tier {
+			Tier::Fast => {
 				self.fast_used = (self.fast_used as i64 + delta).max(0) as CacheSize;
 			},
 
-			Some(Tier::Slow) => {
+			Tier::Slow => {
 				self.slow_used = (self.slow_used as i64 + delta).max(0) as CacheSize;
 			},
-
-			None => {},
 		}
 	}
 
@@ -224,7 +239,7 @@ impl LruHybridStack {
 	/// existing key — a `set()` always re-admits to the fast tier) and
 	/// `update` (a fast-or-slow hit).
 	fn touch_fast_key(&mut self, key: HashedKey) {
-		let previous_tier = self.tiers.get(&key).copied();
+		let previous_tier = self.entries.get(&key).map(|entry| entry.tier);
 
 		let already_at_front = self.stack.front() == Some(&key);
 		let is_boundary = self.fast_boundary == Some(key);
@@ -250,7 +265,7 @@ impl LruHybridStack {
 
 		if previous_tier != Some(Tier::Fast) {
 			if previous_tier == Some(Tier::Slow) {
-				let size = self.sizes.get(&key).copied().unwrap_or(0) as CacheSize;
+				let size = self.entries.get(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
 
 				self.slow_used = self.slow_used.saturating_sub(size);
 				self.fast_used += size;
@@ -259,7 +274,9 @@ impl LruHybridStack {
 				promoted = true;
 			}
 
-			self.tiers.insert(key, Tier::Fast);
+			if let Some(entry) = self.entries.get_mut(&key) {
+				entry.tier = Tier::Fast;
+			}
 
 			if self.fast_boundary.is_none() {
 				self.fast_boundary = Some(key);
@@ -283,7 +300,7 @@ impl LruHybridStack {
 		// that case `settle_fast_tier` already pushed the correct final
 		// `(key, Tier::Slow)` entry and no separate `Fast` entry should
 		// follow it.
-		if promoted && self.tiers.get(&key) == Some(&Tier::Fast) {
+		if promoted && self.entries.get(&key).map(|entry| entry.tier) == Some(Tier::Fast) {
 			self.migrations.push((key, Tier::Fast));
 		}
 	}
@@ -310,10 +327,13 @@ impl LruHybridStack {
 		while self.fast_used > drain_target {
 			let Some(demote_key) = self.fast_boundary else { break };
 
-			let size = self.sizes.get(&demote_key).copied().unwrap_or(0) as CacheSize;
+			let size = self.entries.get(&demote_key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
 			let new_boundary = self.stack.before(&demote_key).copied();
 
-			self.tiers.insert(demote_key, Tier::Slow);
+			if let Some(entry) = self.entries.get_mut(&demote_key) {
+				entry.tier = Tier::Slow;
+			}
+
 			self.fast_used = self.fast_used.saturating_sub(size);
 			self.fast_count = self.fast_count.saturating_sub(1);
 			self.slow_used += size;
@@ -347,9 +367,8 @@ impl PolicyStack for LruHybridStack {
 			return;
 		}
 
-		self.sizes.insert(key, size);
 		self.stack.push_front(key);
-		self.tiers.insert(key, Tier::Fast);
+		self.entries.insert(key, LruEntry { tier: Tier::Fast, size });
 		self.fast_used += size as CacheSize;
 		self.fast_count += 1;
 
@@ -361,14 +380,15 @@ impl PolicyStack for LruHybridStack {
 	}
 
 	fn update(&mut self, key: HashedKey) {
-		if self.tiers.contains_key(&key) {
+		if self.entries.contains_key(&key) {
 			self.touch_fast_key(key);
 		}
 	}
 
 	fn remove(&mut self, key: HashedKey) {
-		let size = self.sizes.remove(&key).unwrap_or(0) as CacheSize;
-		let tier = self.tiers.remove(&key);
+		let entry = self.entries.remove(&key);
+		let size = entry.map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let tier = entry.map(|entry| entry.tier);
 
 		let new_boundary_if_needed = if tier == Some(Tier::Fast) && self.fast_boundary == Some(key) {
 			self.stack.before(&key).copied()
@@ -398,8 +418,7 @@ impl PolicyStack for LruHybridStack {
 
 	fn clear(&mut self) {
 		self.stack.clear();
-		self.sizes.clear();
-		self.tiers.clear();
+		self.entries.clear();
 
 		self.fast_used = 0;
 		self.slow_used = 0;
@@ -410,9 +429,10 @@ impl PolicyStack for LruHybridStack {
 
 	fn evict_one(&mut self) -> Option<HashedKey> {
 		let key = self.stack.pop_back()?;
-		let size = self.sizes.remove(&key).unwrap_or(0) as CacheSize;
+		let entry = self.entries.remove(&key);
+		let size = entry.map(|entry| entry.size).unwrap_or(0) as CacheSize;
 
-		match self.tiers.remove(&key) {
+		match entry.map(|entry| entry.tier) {
 			Some(Tier::Fast) => {
 				self.fast_used = self.fast_used.saturating_sub(size);
 				self.fast_count = self.fast_count.saturating_sub(1);
@@ -458,7 +478,7 @@ impl PolicyStack for LruHybridStack {
 	}
 
 	fn slow_object_count(&self) -> usize {
-		self.tiers.len() - self.fast_count
+		self.entries.len() - self.fast_count
 	}
 }
 

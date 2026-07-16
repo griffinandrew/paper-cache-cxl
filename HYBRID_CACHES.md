@@ -233,8 +233,10 @@ pure value-budget behavior) and is set via `with_shared_overhead(...)` only by
 
 - `HASHTABLE_ENTRY_OVERHEAD = 11` bytes, included unless `global_hashtable_pmem`/
   `global_flatmap_pmem` moves the object map to PMEM.
-- `LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD = 84` / `LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD = 113`
-  bytes, included unless `eviction_stacks_pmem` moves the eviction stacks to PMEM.
+- `LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD = 64` / `LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD = 93`
+  bytes, included unless `eviction_stacks_pmem` moves the eviction stacks to PMEM. (Both dropped —
+  from 84/113 — after `LruHybridStack`/`LfuHybridStack` combined their separate `tiers`+`sizes`
+  maps into one `entries` map each; see "One combined per-key map" in their sections below.)
 
 This is **demotion-only** — it never triggers eviction. If the shared metadata alone meets or
 exceeds `fast_capacity`, the effective value budget saturates to `0` and every fast value drains to
@@ -444,6 +446,38 @@ simply evicted outright, no trace kept. A probabilistic structure (a counting Bl
 similar) is the natural next step if re-admission-after-eviction turns out to matter for real
 workloads, without paying an exact-membership check on every write — left as future work.
 
+### `eviction_stacks_pmem`
+
+Added after the other two hybrids' equivalent support, mirroring their exact pattern: `fifo_queue`,
+`main_stack`, and the combined per-key `entries` map (see "One combined per-key map" below) all
+move to PMEM (via `crate::Hybrid`) when the feature is enabled, with `PmemHashList`/`hashbrown::
+HashMap` swapped in for `kwik::collections::HashList`/`std::collections::HashMap` behind the same
+type-alias switch `LruHybridStack`/`LfuHybridStack` already use. Measured against the real
+benchmark: unlike LRU (~0% cost — its recency-list operations are cheap O(1) pointer splices
+regardless of tier) or LFU (~7–8% cost — its frequency-chain operations do meaningfully more
+per-touch work), 2Q lands in between at a real but smaller **~4–5% GET/SET latency cost**, since
+`fifo_queue`/`main_stack` are themselves simple recency lists (closer to LRU's shape) even though
+there are two of them. Does **not** include the `shared_overhead` DRAM-budget reservation LRU/LFU
+have (see the comparison table) — that remains a separate, not-yet-implemented mechanism for this
+policy.
+
+### One combined per-key map, not three
+
+Every tracked key needs a queue tag (`Fifo`/`Main`), a size, and — only while in `Main` — a tier.
+An earlier version of this stack tracked these in three separate maps (`queue`, `main_tiers`,
+`sizes`), mirroring how it was originally built by extending `LruHybridStack`'s (`tiers`+`sizes`)
+shape with a third map bolted on for the extra Fifo/Main dimension. No operation ever wants just
+one of these in isolation — `insert` touches queue+size together, `remove` touches all three, etc.
+— so they're now one `entries: HashMap<HashedKey, TwoQEntry>` (`TwoQEntry { queue, tier:
+Option<Tier>, size }`, `tier: None` iff `queue == Fifo`). `LruHybridStack`/`LfuHybridStack` got the
+same treatment (`tiers`+`sizes` → one `entries` map each, `LruEntry`/`LfuEntry { tier, size }`, no
+`Option` needed since those stacks have only one queue). This removes one or two of the previous
+hashtable-structural-overhead charges per tracked object — see `object/overhead.rs`'s
+`LruHybrid`/`LfuHybrid`/`TwoQHybrid` arms of `get_policy_overhead`, and the
+`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`/`LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD` constants above
+(84→64, 113→93) — and removes an entire class of possible desync bug (a key present in one map but
+not another) by construction.
+
 ---
 
 ## Comparison at a glance
@@ -454,6 +488,7 @@ workloads, without paying an exact-membership check on every write — left as f
 | `set()` builds | `TieredBuffer::new_fast` always | `new_slow` if new + latched, else `new_fast` | `new_slow` always |
 | Promotion trigger | Any access to a Slow key | Access count strictly exceeds fast tier's minimum frequency | A second access to a FIFO-queue key, or an access to a Slow main-queue key |
 | Demotion low-water floor | 98% of budget | None | None |
+| `eviction_stacks_pmem` support | Yes | Yes | Yes |
 | DRAM-budget reservation (`shared_overhead`) | Yes | Yes | No |
 | Extra sizing knob | — | — | `k_in` (FIFO queue's own byte budget) |
 | Ghost/ ​re-admission memory | N/A | N/A | None (considered and rejected) |

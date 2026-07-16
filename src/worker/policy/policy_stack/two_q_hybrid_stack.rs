@@ -49,10 +49,51 @@
 //! This reconciles the paper's two eviction clauses into one rule:
 //! sacrificing still-unproven FIFO objects before ever touching the proven
 //! main queue reproduces both stated behaviors.
+//!
+//! ## One combined per-key map, not three
+//!
+//! Every tracked key needs a queue tag (`Fifo`/`Main`), a size, and — only
+//! while in `Main` — a tier. An earlier version of this stack tracked these
+//! in three separate maps (`queue`, `main_tiers`, `sizes`), mirroring how it
+//! was originally built by extending `LruHybridStack`'s (`tiers`+`sizes`)
+//! shape with a third map bolted on for the extra Fifo/Main dimension.
+//! Checking every call site showed no operation ever wants just one of these
+//! in isolation — `insert` touches queue+size together, `remove` touches all
+//! three, etc. — so they're now one `entries: HashMap<HashedKey, TwoQEntry>`
+//! (`TwoQEntry { queue, tier: Option<Tier>, size }`, `tier: None` iff
+//! `queue == Fifo`). This eliminates two of the three hashtable-structural
+//! overhead charges per tracked object (see `object/overhead.rs`'s
+//! `TwoQHybrid` arm) and removes an entire class of possible desync bug
+//! (a key present in one map but not another) by construction, since there
+//! is now only one map for a key to be present or absent from. The one
+//! `Some -> None` case, `main_tiers.len()` (used by `slow_object_count`), no
+//! longer comes for free from the map itself, so a `main_count` counter
+//! tracks it explicitly, mirroring the existing `fast_count` pattern.
+//!
+//! ## `eviction_stacks_pmem`
+//!
+//! Both live queues (`fifo_queue`, `main_stack`) and the combined per-key
+//! `entries` map are DRAM-backed by default. When `eviction_stacks_pmem` is
+//! enabled, they are instead allocated in the slow tier (PMEM, via
+//! `crate::Hybrid`) — the same switch `LruHybridStack`/`LfuHybridStack` make
+//! under this flag. The `PmemHashList`/`hashbrown::HashMap` variants expose
+//! the same method surface as the DRAM `HashList`/`std::collections::
+//! HashMap` ones used below, so the stack logic itself is identical for both
+//! backings; only the transient `migrations` scratch and the scalar
+//! counters stay in DRAM.
 
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 use std::collections::HashMap;
+#[cfg(feature = "eviction_stacks_pmem")]
+use hashbrown::HashMap;
 
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 use kwik::collections::HashList;
+#[cfg(feature = "eviction_stacks_pmem")]
+use super::pmem_collections::PmemHashList;
+
+#[cfg(feature = "eviction_stacks_pmem")]
+use crate::Hybrid;
 
 use crate::{
 	CacheSize,
@@ -70,13 +111,31 @@ enum Queue {
 	Main,
 }
 
-pub struct TwoQHybridStack {
-	fifo_queue: HashList<HashedKey, NoHasher>,
-	main_stack: HashList<HashedKey, NoHasher>,
+/// Combined per-key bookkeeping: which queue, which tier (only meaningful
+/// while `queue == Main`), and the object's size. See the module doc's "One
+/// combined per-key map" section for why this replaced three separate maps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TwoQEntry {
+	queue: Queue,
+	tier: Option<Tier>,
+	size: ObjectSize,
+}
 
-	queue: HashMap<HashedKey, Queue, NoHasher>,
-	main_tiers: HashMap<HashedKey, Tier, NoHasher>,
-	sizes: HashMap<HashedKey, ObjectSize, NoHasher>,
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type QueueList = HashList<HashedKey, NoHasher>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type QueueList = PmemHashList<HashedKey, NoHasher>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type EntryMap = HashMap<HashedKey, TwoQEntry, NoHasher>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type EntryMap = HashMap<HashedKey, TwoQEntry, NoHasher, Hybrid>;
+
+pub struct TwoQHybridStack {
+	fifo_queue: QueueList,
+	main_stack: QueueList,
+
+	entries: EntryMap,
 
 	k_in: f64,
 	fifo_capacity: CacheSize,
@@ -88,9 +147,15 @@ pub struct TwoQHybridStack {
 
 	/// Number of keys currently tagged `Tier::Fast` within `main_stack`.
 	/// Kept alongside `fast_used` so `fast_object_count`/`slow_object_count`
-	/// don't need an O(n) scan over `main_tiers` — mirrors
+	/// don't need an O(n) scan over `entries` — mirrors
 	/// `LruHybridStack::fast_count`.
 	fast_count: usize,
+
+	/// Number of keys currently in the `Main` queue (Fast or Slow). Kept
+	/// explicitly since `entries.len()` now covers *both* queues; before the
+	/// three-maps-to-one consolidation this was `main_tiers.len()`, free
+	/// from that map's own length.
+	main_count: usize,
 
 	/// The least-recently-used key currently tagged `Tier::Fast` within
 	/// `main_stack` — i.e. the next demotion candidate. `None` iff no key in
@@ -102,14 +167,30 @@ pub struct TwoQHybridStack {
 }
 
 impl TwoQHybridStack {
-	pub fn new(k_in: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
-		TwoQHybridStack {
-			fifo_queue: HashList::default(),
-			main_stack: HashList::default(),
+	/// Constructs the (fifo list, main list, entry map) triple, DRAM- or
+	/// PMEM-backed depending on `eviction_stacks_pmem`.
+	#[cfg(not(feature = "eviction_stacks_pmem"))]
+	fn new_collections() -> (QueueList, QueueList, EntryMap) {
+		(HashList::default(), HashList::default(), HashMap::default())
+	}
 
-			queue: HashMap::default(),
-			main_tiers: HashMap::default(),
-			sizes: HashMap::default(),
+	#[cfg(feature = "eviction_stacks_pmem")]
+	fn new_collections() -> (QueueList, QueueList, EntryMap) {
+		(
+			PmemHashList::with_hasher(NoHasher::default()),
+			PmemHashList::with_hasher(NoHasher::default()),
+			HashMap::with_hasher_in(NoHasher::default(), Hybrid),
+		)
+	}
+
+	pub fn new(k_in: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
+		let (fifo_queue, main_stack, entries) = Self::new_collections();
+
+		TwoQHybridStack {
+			fifo_queue,
+			main_stack,
+
+			entries,
 
 			k_in,
 			fifo_capacity: (k_in * max_size as f64) as CacheSize,
@@ -119,6 +200,7 @@ impl TwoQHybridStack {
 			fast_used: 0,
 			slow_used: 0,
 			fast_count: 0,
+			main_count: 0,
 
 			main_boundary: None,
 			migrations: Vec::new(),
@@ -128,38 +210,37 @@ impl TwoQHybridStack {
 	/// Returns which queue/tier the given (currently tracked) key is in, or
 	/// `None` if the key isn't tracked. Exposed for tests/diagnostics.
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
-		match self.queue.get(&key)? {
+		let entry = self.entries.get(&key)?;
+
+		match entry.queue {
 			Queue::Fifo => Some(Tier::Slow),
-			Queue::Main => self.main_tiers.get(&key).copied(),
+			Queue::Main => entry.tier,
 		}
 	}
 
 	/// Records a size change for an already-tracked key without altering its
 	/// queue/tier, adjusting whichever counter currently applies.
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
-		let old_size = self.sizes.insert(key, new_size).unwrap_or(0) as i64;
-		let delta = new_size as i64 - old_size;
+		let Some(entry) = self.entries.get_mut(&key) else { return };
 
-		match self.queue.get(&key) {
-			Some(Queue::Fifo) => {
+		let old_size = entry.size;
+		entry.size = new_size;
+		let delta = new_size as i64 - old_size as i64;
+
+		match (entry.queue, entry.tier) {
+			(Queue::Fifo, _) => {
 				self.fifo_used = (self.fifo_used as i64 + delta).max(0) as CacheSize;
 			},
 
-			Some(Queue::Main) => {
-				match self.main_tiers.get(&key) {
-					Some(Tier::Fast) => {
-						self.fast_used = (self.fast_used as i64 + delta).max(0) as CacheSize;
-					},
-
-					Some(Tier::Slow) => {
-						self.slow_used = (self.slow_used as i64 + delta).max(0) as CacheSize;
-					},
-
-					None => {},
-				}
+			(Queue::Main, Some(Tier::Fast)) => {
+				self.fast_used = (self.fast_used as i64 + delta).max(0) as CacheSize;
 			},
 
-			None => {},
+			(Queue::Main, Some(Tier::Slow)) => {
+				self.slow_used = (self.slow_used as i64 + delta).max(0) as CacheSize;
+			},
+
+			(Queue::Main, None) => {},
 		}
 	}
 
@@ -167,7 +248,7 @@ impl TwoQHybridStack {
 	/// straight to `Main`+`Fast`; a `Main` key is handled by
 	/// `touch_main_fast` (reorder if already Fast, promote if Slow).
 	fn touch(&mut self, key: HashedKey) {
-		match self.queue.get(&key).copied() {
+		match self.entries.get(&key).map(|entry| entry.queue) {
 			Some(Queue::Fifo) => self.promote_from_fifo(key),
 			Some(Queue::Main) => self.touch_main_fast(key),
 			None => {},
@@ -179,16 +260,18 @@ impl TwoQHybridStack {
 	/// `before`/boundary bookkeeping is needed beyond setting `main_boundary`
 	/// if this is the first Fast key.
 	fn promote_from_fifo(&mut self, key: HashedKey) {
-		let size = self.sizes.get(&key).copied().unwrap_or(0) as CacheSize;
+		let Some(entry) = self.entries.get(&key) else { return };
+		let size = entry.size;
+		let size_bytes = size as CacheSize;
 
 		self.fifo_queue.remove(&key);
-		self.fifo_used = self.fifo_used.saturating_sub(size);
+		self.fifo_used = self.fifo_used.saturating_sub(size_bytes);
 
 		self.main_stack.push_front(key);
-		self.queue.insert(key, Queue::Main);
-		self.main_tiers.insert(key, Tier::Fast);
-		self.fast_used += size;
+		self.entries.insert(key, TwoQEntry { queue: Queue::Main, tier: Some(Tier::Fast), size });
+		self.fast_used += size_bytes;
 		self.fast_count += 1;
+		self.main_count += 1;
 
 		if self.main_boundary.is_none() {
 			self.main_boundary = Some(key);
@@ -205,7 +288,7 @@ impl TwoQHybridStack {
 		// extremely tight budget can demote it straight back out within the
 		// same `settle_fast_tier` call (self-eviction), in which case that
 		// call already pushed the correct final `(key, Tier::Slow)` entry.
-		if self.main_tiers.get(&key) == Some(&Tier::Fast) {
+		if self.entries.get(&key).and_then(|entry| entry.tier) == Some(Tier::Fast) {
 			self.migrations.push((key, Tier::Fast));
 		}
 	}
@@ -215,7 +298,7 @@ impl TwoQHybridStack {
 	/// tier. Mirrors `LruHybridStack::touch_fast_key` exactly, scoped to
 	/// `main_stack`.
 	fn touch_main_fast(&mut self, key: HashedKey) {
-		let previous_tier = self.main_tiers.get(&key).copied();
+		let previous_tier = self.entries.get(&key).and_then(|entry| entry.tier);
 
 		let already_at_front = self.main_stack.front() == Some(&key);
 		let is_boundary = self.main_boundary == Some(key);
@@ -236,7 +319,7 @@ impl TwoQHybridStack {
 
 		if previous_tier != Some(Tier::Fast) {
 			if previous_tier == Some(Tier::Slow) {
-				let size = self.sizes.get(&key).copied().unwrap_or(0) as CacheSize;
+				let size = self.entries.get(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
 
 				self.slow_used = self.slow_used.saturating_sub(size);
 				self.fast_used += size;
@@ -245,7 +328,9 @@ impl TwoQHybridStack {
 				promoted = true;
 			}
 
-			self.main_tiers.insert(key, Tier::Fast);
+			if let Some(entry) = self.entries.get_mut(&key) {
+				entry.tier = Some(Tier::Fast);
+			}
 
 			if self.main_boundary.is_none() {
 				self.main_boundary = Some(key);
@@ -256,7 +341,7 @@ impl TwoQHybridStack {
 
 		// See `promote_from_fifo`'s doc for why this is pushed after
 		// `settle_fast_tier` and guarded on the key still being `Fast`.
-		if promoted && self.main_tiers.get(&key) == Some(&Tier::Fast) {
+		if promoted && self.entries.get(&key).and_then(|entry| entry.tier) == Some(Tier::Fast) {
 			self.migrations.push((key, Tier::Fast));
 		}
 	}
@@ -270,10 +355,13 @@ impl TwoQHybridStack {
 		while self.fast_used > self.fast_capacity {
 			let Some(demote_key) = self.main_boundary else { break };
 
-			let size = self.sizes.get(&demote_key).copied().unwrap_or(0) as CacheSize;
+			let size = self.entries.get(&demote_key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
 			let new_boundary = self.main_stack.before(&demote_key).copied();
 
-			self.main_tiers.insert(demote_key, Tier::Slow);
+			if let Some(entry) = self.entries.get_mut(&demote_key) {
+				entry.tier = Some(Tier::Slow);
+			}
+
 			self.fast_used = self.fast_used.saturating_sub(size);
 			self.fast_count = self.fast_count.saturating_sub(1);
 			self.slow_used += size;
@@ -301,9 +389,8 @@ impl TwoQHybridStack {
 	/// (through the correct removal path) until it's satisfied.
 	fn evict_fifo_tail(&mut self) -> Option<HashedKey> {
 		let key = self.fifo_queue.pop_back()?;
-		let size = self.sizes.remove(&key).unwrap_or(0) as CacheSize;
+		let size = self.entries.remove(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
 
-		self.queue.remove(&key);
 		self.fifo_used = self.fifo_used.saturating_sub(size);
 
 		Some(key)
@@ -316,15 +403,15 @@ impl PolicyStack for TwoQHybridStack {
 	}
 
 	fn len(&self) -> usize {
-		self.queue.len()
+		self.entries.len()
 	}
 
 	fn contains(&self, key: HashedKey) -> bool {
-		self.queue.contains_key(&key)
+		self.entries.contains_key(&key)
 	}
 
 	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
-		if self.queue.contains_key(&key) {
+		if self.entries.contains_key(&key) {
 			// Existing key: track any size change, then treat as an access.
 			self.resize_key(key, size);
 			self.touch(key);
@@ -335,40 +422,38 @@ impl PolicyStack for TwoQHybridStack {
 		// If this pushes fifo_used over fifo_capacity, `needs_capacity_eviction`
 		// will report it and `apply_evictions` will drain it via `evict_one`
 		// (see that method's doc comment for why eviction can't happen here).
-		self.sizes.insert(key, size);
 		self.fifo_queue.push_front(key);
-		self.queue.insert(key, Queue::Fifo);
+		self.entries.insert(key, TwoQEntry { queue: Queue::Fifo, tier: None, size });
 		self.fifo_used += size as CacheSize;
 	}
 
 	fn update(&mut self, key: HashedKey) {
-		if self.queue.contains_key(&key) {
+		if self.entries.contains_key(&key) {
 			self.touch(key);
 		}
 	}
 
 	fn remove(&mut self, key: HashedKey) {
-		let Some(q) = self.queue.remove(&key) else { return };
-		let size = self.sizes.remove(&key).unwrap_or(0) as CacheSize;
+		let Some(entry) = self.entries.remove(&key) else { return };
+		let size = entry.size as CacheSize;
 
-		match q {
+		match entry.queue {
 			Queue::Fifo => {
 				self.fifo_queue.remove(&key);
 				self.fifo_used = self.fifo_used.saturating_sub(size);
 			},
 
 			Queue::Main => {
-				let tier = self.main_tiers.remove(&key);
-
-				let new_boundary_if_needed = if tier == Some(Tier::Fast) && self.main_boundary == Some(key) {
+				let new_boundary_if_needed = if entry.tier == Some(Tier::Fast) && self.main_boundary == Some(key) {
 					self.main_stack.before(&key).copied()
 				} else {
 					None
 				};
 
 				self.main_stack.remove(&key);
+				self.main_count = self.main_count.saturating_sub(1);
 
-				match tier {
+				match entry.tier {
 					Some(Tier::Fast) => {
 						self.fast_used = self.fast_used.saturating_sub(size);
 						self.fast_count = self.fast_count.saturating_sub(1);
@@ -397,14 +482,13 @@ impl PolicyStack for TwoQHybridStack {
 	fn clear(&mut self) {
 		self.fifo_queue.clear();
 		self.main_stack.clear();
-		self.queue.clear();
-		self.main_tiers.clear();
-		self.sizes.clear();
+		self.entries.clear();
 
 		self.fifo_used = 0;
 		self.fast_used = 0;
 		self.slow_used = 0;
 		self.fast_count = 0;
+		self.main_count = 0;
 		self.main_boundary = None;
 		self.migrations.clear();
 	}
@@ -415,10 +499,13 @@ impl PolicyStack for TwoQHybridStack {
 		}
 
 		let key = self.main_stack.pop_back()?;
-		let size = self.sizes.remove(&key).unwrap_or(0) as CacheSize;
-		self.queue.remove(&key);
+		let removed = self.entries.remove(&key);
+		let size = removed.map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let tier = removed.and_then(|entry| entry.tier);
 
-		match self.main_tiers.remove(&key) {
+		self.main_count = self.main_count.saturating_sub(1);
+
+		match tier {
 			Some(Tier::Fast) => {
 				self.fast_used = self.fast_used.saturating_sub(size);
 				self.fast_count = self.fast_count.saturating_sub(1);
@@ -464,7 +551,7 @@ impl PolicyStack for TwoQHybridStack {
 	}
 
 	fn slow_object_count(&self) -> usize {
-		self.fifo_queue.len() + (self.main_tiers.len() - self.fast_count)
+		self.fifo_queue.len() + (self.main_count - self.fast_count)
 	}
 
 	fn needs_capacity_eviction(&self) -> bool {

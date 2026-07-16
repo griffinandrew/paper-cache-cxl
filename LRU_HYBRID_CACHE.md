@@ -93,10 +93,14 @@ this policy. It tracks *order and tier membership only* — it never touches act
 that's the `PolicyWorker`'s job (next section). Its state:
 
 ```rust
+struct LruEntry {
+    tier: Tier,       // which tier this key is logically in
+    size: ObjectSize,
+}
+
 pub struct LruHybridStack {
     stack: HashList<HashedKey, NoHasher>,      // one recency-ordered list, same structure LruStack uses
-    sizes: HashMap<HashedKey, ObjectSize, NoHasher>,
-    tiers: HashMap<HashedKey, Tier, NoHasher>, // which tier each tracked key is logically in
+    entries: HashMap<HashedKey, LruEntry, NoHasher>,
 
     fast_capacity: CacheSize,                  // the runtime-configurable fast-tier byte budget
     fast_used: CacheSize,                      // current bytes accounted to the fast tier
@@ -106,6 +110,11 @@ pub struct LruHybridStack {
     migrations: Vec<(HashedKey, Tier)>,        // pending (key, new tier) pairs, drained each pass
 }
 ```
+
+(`sizes`/`tiers` were originally two separate maps here; they were later combined into the single
+`entries` map shown above, since no operation ever wanted just one of them in isolation — see
+`HYBRID_CACHES.md`'s "One combined per-key map" section for the full rationale and the matching
+change made to `LfuHybridStack`/`TwoQHybridStack`.)
 
 **Key structural fact this design leans on:** because every admission/promotion moves a key to the
 *front* of the list and every demotion removes from the *tail end of the fast segment*, the set of
