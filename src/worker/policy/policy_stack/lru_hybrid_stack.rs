@@ -246,6 +246,8 @@ impl LruHybridStack {
 			self.fast_boundary = new_boundary_if_moved;
 		}
 
+		let mut promoted = false;
+
 		if previous_tier != Some(Tier::Fast) {
 			if previous_tier == Some(Tier::Slow) {
 				let size = self.sizes.get(&key).copied().unwrap_or(0) as CacheSize;
@@ -254,7 +256,7 @@ impl LruHybridStack {
 				self.fast_used += size;
 				self.fast_count += 1;
 
-				self.migrations.push((key, Tier::Fast));
+				promoted = true;
 			}
 
 			self.tiers.insert(key, Tier::Fast);
@@ -265,6 +267,25 @@ impl LruHybridStack {
 		}
 
 		self.settle_fast_tier();
+
+		// Pushed *after* `settle_fast_tier` (which pushes any demotions this
+		// promotion itself triggered) rather than before: `apply_tier_
+		// migrations` applies a stack's migrations in order, physically
+		// reallocating each one, so pushing the promotion first meant a
+		// promotion that pushed `fast_used` over budget had its DRAM
+		// allocation applied *before* the corresponding demotion's DRAM
+		// free -- a real, reported transient window where both the
+		// promoted object's new DRAM copy and a not-yet-demoted victim's
+		// old DRAM copy were resident simultaneously. Guarded on the key
+		// still being `Fast` afterward: an extremely tight budget can demote
+		// this same key straight back out within the same `settle_fast_tier`
+		// call (self-eviction, e.g. a fast tier that fits nothing) -- in
+		// that case `settle_fast_tier` already pushed the correct final
+		// `(key, Tier::Slow)` entry and no separate `Fast` entry should
+		// follow it.
+		if promoted && self.tiers.get(&key) == Some(&Tier::Fast) {
+			self.migrations.push((key, Tier::Fast));
+		}
 	}
 
 	/// Demotes the least-recently-used fast key(s), *triggered* once
@@ -520,7 +541,10 @@ mod tests {
 		let migrations = drain(&mut stack);
 
 		assert_eq!(stack.tier_of(1), Some(Tier::Fast));
-		assert_eq!(migrations, vec![(1, Tier::Fast), (2, Tier::Slow)]);
+		// Demotion is applied before the promotion that triggered it, so a
+		// promotion never has its DRAM write applied before the
+		// corresponding demotion's DRAM free (see `touch_fast_key`'s doc).
+		assert_eq!(migrations, vec![(2, Tier::Slow), (1, Tier::Fast)]);
 		assert_eq!(stack.tier_of(2), Some(Tier::Slow));
 		assert_eq!(stack.tier_of(3), Some(Tier::Fast));
 	}

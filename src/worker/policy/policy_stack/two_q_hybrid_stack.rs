@@ -194,8 +194,20 @@ impl TwoQHybridStack {
 			self.main_boundary = Some(key);
 		}
 
-		self.migrations.push((key, Tier::Fast));
 		self.settle_fast_tier();
+
+		// Pushed *after* `settle_fast_tier` (which pushes any demotions this
+		// promotion itself triggered), not before: `apply_tier_migrations`
+		// applies a stack's migrations in push order, so pushing the
+		// promotion first would apply its DRAM allocation before the
+		// corresponding demotion's DRAM free -- a transient window with both
+		// copies resident. Guarded on the key still being `Fast`: an
+		// extremely tight budget can demote it straight back out within the
+		// same `settle_fast_tier` call (self-eviction), in which case that
+		// call already pushed the correct final `(key, Tier::Slow)` entry.
+		if self.main_tiers.get(&key) == Some(&Tier::Fast) {
+			self.migrations.push((key, Tier::Fast));
+		}
 	}
 
 	/// Moves an already-`Main`-tracked key to the front of `main_stack`,
@@ -220,6 +232,8 @@ impl TwoQHybridStack {
 			self.main_boundary = new_boundary_if_moved;
 		}
 
+		let mut promoted = false;
+
 		if previous_tier != Some(Tier::Fast) {
 			if previous_tier == Some(Tier::Slow) {
 				let size = self.sizes.get(&key).copied().unwrap_or(0) as CacheSize;
@@ -228,7 +242,7 @@ impl TwoQHybridStack {
 				self.fast_used += size;
 				self.fast_count += 1;
 
-				self.migrations.push((key, Tier::Fast));
+				promoted = true;
 			}
 
 			self.main_tiers.insert(key, Tier::Fast);
@@ -239,6 +253,12 @@ impl TwoQHybridStack {
 		}
 
 		self.settle_fast_tier();
+
+		// See `promote_from_fifo`'s doc for why this is pushed after
+		// `settle_fast_tier` and guarded on the key still being `Fast`.
+		if promoted && self.main_tiers.get(&key) == Some(&Tier::Fast) {
+			self.migrations.push((key, Tier::Fast));
+		}
 	}
 
 	/// Demotes the least-recently-used fast key(s) within `main_stack` until
@@ -562,7 +582,10 @@ mod tests {
 		let migrations = drain(&mut stack);
 
 		assert_eq!(stack.tier_of(1), Some(Tier::Fast));
-		assert_eq!(migrations, vec![(1, Tier::Fast), (2, Tier::Slow)]);
+		// Demotion is applied before the promotion that triggered it, so a
+		// promotion never has its DRAM write applied before the
+		// corresponding demotion's DRAM free (see `touch_main_fast`'s doc).
+		assert_eq!(migrations, vec![(2, Tier::Slow), (1, Tier::Fast)]);
 		assert_eq!(stack.tier_of(2), Some(Tier::Slow));
 	}
 

@@ -478,7 +478,16 @@ impl LfuHybridStack {
 	/// is empty), promotes it — moving it to the fast chain at its new,
 	/// accumulated count. A tie does *not* promote (spec: "exceeds"), which
 	/// avoids promote/demote ping-pong between equal-frequency neighbors.
-	fn maybe_promote(&mut self, key: HashedKey) {
+	///
+	/// Returns `Some(key)` if it promoted (the caller is responsible for
+	/// calling `settle_fast_tier` and then pushing this key's own `Fast`
+	/// migration entry *afterward* — see `maybe_promote`'s callers for why:
+	/// pushing it here, before the caller's `settle_fast_tier` call, would
+	/// let a promotion that pushes `fast_used` over budget have its DRAM
+	/// allocation physically applied before the corresponding demotion's
+	/// DRAM free, since `apply_tier_migrations` applies a batch in push
+	/// order).
+	fn maybe_promote(&mut self, key: HashedKey) -> Option<HashedKey> {
 		let new_count = self.slow_chain.bump(key);
 		let fast_min = self.fast_chain.min_count();
 
@@ -488,7 +497,7 @@ impl LfuHybridStack {
 		};
 
 		if !should_promote {
-			return;
+			return None;
 		}
 
 		let size = self.sizes.get(&key).copied().unwrap_or(0) as CacheSize;
@@ -500,7 +509,7 @@ impl LfuHybridStack {
 		self.tiers.insert(key, Tier::Fast);
 		self.fast_used += size;
 
-		self.migrations.push((key, Tier::Fast));
+		Some(key)
 	}
 
 	/// Demotes the lowest-frequency fast key(s) until `fast_used` fits back
@@ -557,19 +566,30 @@ impl PolicyStack for LfuHybridStack {
 			// `update`).
 			self.resize_key(key, size);
 
-			match self.tiers.get(&key).copied() {
+			let promoted_key = match self.tiers.get(&key).copied() {
 				Some(Tier::Fast) => {
 					self.fast_chain.bump(key);
+					None
 				},
 
-				Some(Tier::Slow) => {
-					self.maybe_promote(key);
-				},
+				Some(Tier::Slow) => self.maybe_promote(key),
 
-				None => {},
-			}
+				None => None,
+			};
 
 			self.settle_fast_tier();
+
+			// Pushed after `settle_fast_tier` -- see `maybe_promote`'s doc.
+			// Guarded on the key still being `Fast`: an extremely tight
+			// budget can demote it straight back out within the same
+			// `settle_fast_tier` call (self-eviction), in which case that
+			// call already pushed the correct final `(key, Tier::Slow)`
+			// entry and no separate `Fast` entry should follow it.
+			if let Some(k) = promoted_key {
+				if self.tiers.get(&k) == Some(&Tier::Fast) {
+					self.migrations.push((k, Tier::Fast));
+				}
+			}
 			return;
 		}
 
@@ -623,8 +643,17 @@ impl PolicyStack for LfuHybridStack {
 			},
 
 			Some(Tier::Slow) => {
-				self.maybe_promote(key);
+				let promoted_key = self.maybe_promote(key);
 				self.settle_fast_tier();
+
+				// See `maybe_promote`'s doc for why this is pushed after
+				// `settle_fast_tier`, and why it's guarded on the key still
+				// being `Fast` (self-eviction case).
+				if let Some(k) = promoted_key {
+					if self.tiers.get(&k) == Some(&Tier::Fast) {
+						self.migrations.push((k, Tier::Fast));
+					}
+				}
 			},
 
 			None => {},
