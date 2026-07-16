@@ -1,8 +1,12 @@
 # `lru_hybrid_cache`: a single-instance, segmented-LRU hybrid cache
 
-This document explains what `lru_hybrid_cache` is, exactly how it works, and why it's built the way
-it is. For the day-to-day feature-flag reference see `FEATURE_FLAGS.md`; for the implementation
-history (what was tried, what broke, what was fixed) see `CLAUDE.md`.
+This document explains what `lru_hybrid_cache` is and why it's built the way it is — the design
+rationale and the road taken to get there. For the current, authoritative description of exactly
+*how* this and its two siblings (`lfu_hybrid_cache`, `two_q_hybrid_cache`) work today — including
+the shared migration machinery and the DRAM-budget reservation added after this document was
+written — see `HYBRID_CACHES.md`, which supersedes this file wherever the two disagree. For the
+day-to-day feature-flag reference see `FEATURE_FLAGS.md`; for the implementation history (what was
+tried, what broke, what was fixed) see `CLAUDE.md`.
 
 ## What problem this solves
 
@@ -153,18 +157,28 @@ had to change: `resize_fast_tier`, `drain_tier_migrations`, and four gauge reade
 (`fast_bytes_used`, `slow_bytes_used`, `fast_object_count`, `slow_object_count`) that
 `LruHybridStack` overrides and every other stack ignores.
 
-### No headroom: the drain target is exactly the trigger, not below it
+### Low-water headroom: removed, then reintroduced smaller, for a different reason
 
 An earlier version of this implementation drained demotions down to a 90%-of-capacity floor
 (`fast_low_water`) instead of exactly `fast_capacity`, reasoning that draining to the exact ceiling
 would leave the fast tier hovering right at the boundary — so almost every subsequent `set()` would
 push `fast_used` back over `fast_capacity` and re-trigger a demotion pass. That headroom was removed
 at the user's explicit request: keeping idle capacity in reserve costs usable fast-tier space for a
-marginal reduction in demotion-pass frequency, and the user judged that trade not worth it for this
-feature. `settle_fast_tier` now drains exactly back down to `fast_capacity` — no lower — so the fast
-tier can legitimately sit right at 100% utilization, and a `set()` that pushes it back over will
-simply trigger another (cheap, synchronous) demotion pass rather than being pre-empted by reserved
-slack.
+marginal reduction in demotion-pass frequency, and the user judged that trade not worth it. For a
+while, `settle_fast_tier` drained exactly back down to `fast_capacity` and no lower.
+
+**This was later revisited for an unrelated reason and a small floor was reintroduced.**
+`PaperCache::set()` writes a new object's `TieredBuffer` to DRAM *synchronously*, at the API layer,
+before the corresponding event even reaches `PolicyWorker` — so a burst of concurrent `set()` calls
+can transiently push real DRAM usage above what the stack's own bookkeeping shows, in the window
+between that physical write and the worker processing it. `settle_fast_tier` now drains to 98% of
+the effective budget (`FAST_TIER_LOW_WATER_RATIO`), not back to exactly the ceiling — a small margin
+that leaves a concurrent burst some room to land in before the next settle needs to trigger again.
+This is much smaller than the original 90% floor and exists for a different reason (burst safety,
+not thrashing reduction); it's paired with (not a substitute for) `apply_tier_migrations` running
+per-event rather than per-batch, which is what actually shrinks the demote-decision-to-physical-
+DRAM-free window. See `HYBRID_CACHES.md`'s "Low-water headroom" section for the current, precise
+description, and `CLAUDE.md` for the full back-and-forth.
 
 ## Turning "this key changed tier" into an actual byte move
 
@@ -177,28 +191,14 @@ object map and no idea what `TieredBuffer` is. The physical move happens one lay
 tier_migration_fn: Option<Box<dyn Fn(&V, Tier) -> V + Send + Sync>>,
 ```
 
-After processing each batch of `Get`/`Set` events, `PolicyWorker::run()` calls
-`apply_tier_migrations()`:
-
-```rust
-fn apply_tier_migrations(&mut self) {
-    let migrations = stack.drain_tier_migrations();
-    if migrations.is_empty() { return; }
-    let Some(migrate) = &self.tier_migration_fn else { return };
-
-    for (key, tier) in migrations {
-        if let Some(mut object) = self.objects.get_mut(&key) {
-            let new_data = migrate(&object.data(), tier);
-            object.set_data(new_data);          // <-- the actual physical move
-        }
-        match tier {
-            Tier::Fast => self.status.record_lru_hybrid_promotion(),
-            Tier::Slow => self.status.record_lru_hybrid_demotion(),
-        }
-    }
-    // ...then refresh the live gauges (fast/slow bytes/object counts) from the stack.
-}
-```
+After processing *each* `Get`/`Set`/etc event (not once per batch, so a demotion decision made
+mid-batch gets physically executed as soon as possible under concurrent load), `PolicyWorker::run()`
+calls `apply_tier_migrations()`, which drains the stack's pending migrations
+and applies them in two parallel phases — every demotion, fully complete, before any promotion
+begins — via `rayon`. See `HYBRID_CACHES.md`'s "Turning 'this key changed tier' into an actual byte
+move" section for the current, exact mechanism (this document previously showed a simple sequential
+`for` loop here, which was accurate at the time but has since been replaced for throughput reasons
+under demotion-heavy real workloads).
 
 `migrate` is supplied at construction time (`PaperCache::new`, see below) as:
 

@@ -420,6 +420,64 @@ concurrent load on this UMF version (1.0.3) until proven otherwise by UMF fixing
 don't re-enable it without re-running the actual benchmark (not just this crate's own test suite,
 which is too low-concurrency/low-scale to reproduce either failure mode) to confirm.
 
+### Confirmed, definitively: TBB's own retention behavior is not reachable via any exposed API
+
+Per explicit request ("see if u can get rid of the memory retention issue in tbb"), tested the two
+remaining levers directly (both outside this crate, via a standalone C reproduction linking the
+same UMF scalable-pool code path and `libtbbmalloc.so.2`) rather than continuing to guess:
+
+- **UMF's `KeepAllMemory` flag** (already tested earlier in this investigation, see above) —
+  reconfirmed: `0` vs `1` makes no difference to real RSS for this allocation pattern.
+- **TBB's own documented release API**, `scalable_allocation_command(TBBMALLOC_CLEAN_ALL_BUFFERS,
+  NULL)` (declared in `/usr/include/tbb/scalable_allocator.h`, exported by `libtbbmalloc.so.2` —
+  confirmed safe to link directly against, unlike jemalloc: `nm -D` shows it exports only
+  `scalable_*`-prefixed symbols, no unprefixed `malloc`/`free`/`calloc`/`realloc`, so no risk of the
+  process-wide malloc-interposition problem that ruled out linking jemalloc directly earlier in
+  this investigation). Confirmed via `nm`/`strings` that UMF's scalable pool `dlopen`s this exact
+  same system library at runtime, so a direct call from this process operates on the identical
+  allocator instance/state UMF's pool uses internally — no separate/inert copy.
+
+Reproduced the crate's real fragmentation pattern directly (300,000 × 16 KB allocations through a
+real `umfScalablePoolOps()` pool at the crate's actual 2 MB granularity, then freeing ~90% at
+scattered/staggered positions rather than a clean contiguous run, matching how demotion leaves
+survivors scattered rather than clustered): RSS went from a 3 MB baseline to 6,519 MB after
+admission, stayed at exactly 6,519 MB after freeing 90%, and **stayed at exactly 6,519 MB** after
+calling `scalable_allocation_command(TBBMALLOC_CLEAN_ALL_BUFFERS, ...)` — which returned
+`TBBMALLOC_NO_EFFECT` (not an error; TBB's own honest answer that it found nothing releasable).
+Retested with `KeepAllMemory=0` too: identical result, `NO_EFFECT` again.
+
+**Root cause, now confirmed at the TBB API level directly rather than inferred**: at 2 MB
+granularity and ~16 KB objects, each chunk holds ~128 objects; with only 10% survival scattered
+essentially at random, nearly every chunk still contains at least one live object, so none are
+"empty" by TBB's own accounting and none are eligible for release under *any* exposed API — this
+isn't a missing flag, it's TBB's slab/superblock design colliding with this workload's actual
+survivor-scattering pattern. No further UMF- or TBB-level knob exists to try.
+
+**The only approach that structurally can't have this problem — bypassing pooling entirely
+(`mmap`/`munmap`, or a persistent arena + `MADV_DONTNEED` on free) — works, but at a real,
+measured throughput cost.** Validated both directly, same reproduction: `mmap`+touch per object
+took ~7.5 µs/op, `MADV_DONTNEED`+re-touch (against a pre-existing arena, avoiding repeated `mmap`
+syscalls) took ~3.5–6 µs/op — versus TBB's effectively-free in-pool reuse. Both gave RSS that
+tracked survivors almost exactly (472–474 MB after freeing 90% of 4,691–4,693 MB admitted, matching
+the true 10% survival rate). The cost is fundamentally a page-fault cost, not syscall overhead —
+even a long-lived arena pays a fresh fault every time a `MADV_DONTNEED`'d slot is re-touched on
+reuse, since the physical page is genuinely gone — so it can't be tuned away by avoiding `mmap`
+calls specifically; giving memory back to the OS accurately and reusing it near-instantly are in
+direct tension. At this crate's measured real throughput (~150K sets/sec, ~5.5 µs avg SET latency
+end-to-end in the real benchmark), several extra µs per fast-tier admission/demotion would likely
+become the dominant cost and could substantially cut throughput — not confirmed via a full
+benchmark run since the option was not pursued (see below), but the per-op numbers alone make this
+a real risk, not a rounding error.
+
+**Decision (explicit, after being presented with this tradeoff): do not implement it.** Real DRAM
+usage continues to track cumulative peak admission volume rather than `fast_tier_size`, as already
+documented above — this is the accepted, known cost of staying on the TBB backend, which remains
+the only pool backend proven stable under real concurrent load (see the jemalloc-pool section
+above). If this is revisited, the two validated-but-rejected levers (raw `mmap`/`munmap` per
+object; a persistent arena + `MADV_DONTNEED`) are the correct starting point — no further time
+should be spent on UMF/TBB flags or purge APIs, both now confirmed dead ends at the API level, not
+just empirically absent from measurements.
+
 ## Feature: `lru_hybrid_cache` (steps 1–10 implemented; see status below)
 
 ### Source (paper description this implements)
