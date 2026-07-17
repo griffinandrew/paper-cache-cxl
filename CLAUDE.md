@@ -1548,3 +1548,87 @@ test suite" was flagged as a gap at the time, now resolved with this real answer
 guard (skip `rayon` and apply sequentially below some small threshold, e.g. 2–3 entries) would very
 likely recover the `-c 1` regression while keeping the `-c 8` win, but hasn't been implemented —
 this section reports the measurement, not a fix.
+
+### Follow-up: the batch-size guard doesn't have a clean answer — the bottleneck is the allocator, not rayon
+
+Implemented the guard flagged as "hasn't been implemented" above (`PARALLEL_MIGRATION_THRESHOLD`,
+`apply_migrations_batch` in `worker/policy/mod.rs`, commit `e8dbcc8`), but the small-threshold
+premise turned out to be wrong. Direct instrumentation against the real benchmark (temporary atomic
+histogram counters over `apply_tier_migrations`' batch sizes, removed again once the data was
+collected) showed real per-event migration batches are **bimodal**, not uniformly small: ~50/50
+split between 0 and 1 entries, plus a rare (~0.016% of calls) but volume-dominant tail up to 4,899
+entries in a single batch — that tail alone accounted for 61% of all migrated bytes in one sample.
+Thresholds of 4 and 1,000 both made no measurable difference against unconditional parallelization,
+because real batches land either far below or far above either value — there's no "medium" batch
+size for a threshold in that range to actually intercept.
+
+Only a threshold *above* the observed max (`10_000`) genuinely serializes every real batch, and
+that's what recovered sequential-equivalent CPU/wall-clock numbers at `-c 1`. This directly
+confirms the original regression was never about `rayon` scheduling overhead on small batches — it's
+that parallelizing the *large* batches (concurrent `TieredBuffer::new_slow` calls, i.e. concurrent
+PMEM allocations) contends on the underlying TBB/UMF allocator, which doesn't scale under concurrent
+access to begin with (consistent with everything already documented above about this allocator).
+The same contention cost is why `-c 8`'s `-14.7%` wall-clock win also evaporates under the
+`10_000` threshold — serializing there lands back at sequential-equivalent numbers too, so there is
+**no threshold value that helps `-c 1` without also losing `-c 8`'s benefit**: the two scenarios
+disagree about whether concurrent allocator access is net-helpful, and a single global constant
+can't resolve that per-workload.
+
+Landed `PARALLEL_MIGRATION_THRESHOLD = 10_000` anyway — in practice "always sequential for this
+allocator" — rather than deleting the `rayon` path outright, since the mechanism costs nothing when
+unused and stays available if a future allocator swap (see the jemalloc-pool retest below, which
+did not pan out) ever has different concurrent-access characteristics where parallel migration
+copies genuinely pay off. Verified no regressions: all three hybrids' unit tests (25/25 lru, 27/27
+lfu, 21/21 two_q) and real-PMEM integration suites (15/15+1 ignored, 19/19, 18/18, each run twice)
+pass unchanged — the threshold only changes *how* a batch is applied, never the result.
+
+## Third retest: `umfJemallocPoolOps()` still crashes under real concurrent load — and a methodological near-miss
+
+Per explicit request ("use jemalloc for the fast tier to better align with memory constraints"),
+and after being shown the two previously-documented `umfJemallocPoolOps()` crash writeups above and
+explicitly choosing "retry anyway," swapped `umf_allocator_wrapper.c`'s active `umf_allocator_init`
+(shared by both `HybridObjects`/node 1 and `DRAMObjects`/node 0) from `umfScalablePoolOps()` (TBB)
+back to `umfJemallocPoolOps()` a third time, to get a direct, current answer rather than relying on
+memory of the prior two failures.
+
+**A genuine methodological mistake, caught before it produced a false conclusion.** The first two
+benchmark runs against this change (`-c 8`, `standard_web.bin`, 20 GiB cache) both completed
+cleanly — full GET/SET stats, exit 0, no new `dmesg` entries — which would have contradicted both
+prior documented crashes. Before trusting that surprising result, checked whether the binary
+actually *exercised* the new code: `nm -D` on the tested binary showed only `umfScalablePoolOps`
+symbols, no `umfJemallocPoolOps` at all. Root cause: `paper-benchmark-cxl`'s `Cargo.toml` had been
+repointed from a git branch to `path = "/home/griff/work/paper-cache-cxl"` (the established pattern
+for testing uncommitted local changes), but `cargo build`'s fingerprint for the *new* path-based
+source resolved to a build-script `OUT_DIR` whose `umf_allocator_wrapper.o` still dated from
+*before* the C-file edit — i.e., `cargo build --release` reported "Finished... in 3.60s" and never
+actually re-invoked the C compiler, silently reusing a stale cached object from an earlier session.
+Confirmed by comparing file mtimes (`.o` at 08:02, source edit at 08:04) and by `cargo clean -p
+paper-cache --release && touch umf_allocator_wrapper.c && cargo build -v`, which forced a genuine
+recompile and produced a binary whose `nm -D` correctly showed `umfJemallocPoolOps` and no TBB
+symbols. **The first two "successful" runs were invalid — they tested the old TBB binary by
+accident, not jemalloc — and must be disregarded**, not reported as a real result.
+
+Re-ran against the verified binary (freshly rebuilt, symbol-checked before running): **crashed on
+the very first attempt**, 15.7 seconds in (`Command terminated by signal 11`), `dmesg` confirming
+`paper-benchmark[195167]: segfault at 30 ... in libumf.so.1.0.3` at the matching wall-clock
+timestamp. This is a third confirmed failure, consistent with (though not identical in signature
+to) the two previously documented ones — all three point at the same underlying conclusion: UMF's
+jemalloc pool (version 1.0.3) is not safe under this crate's real concurrent access pattern.
+
+Reverted `umf_allocator_wrapper.c` back to `umfScalablePoolOps()` (`git checkout --`, since the
+change was uncommitted) and confirmed the crate still builds clean afterward. `paper-benchmark-cxl`'s
+`Cargo.toml` was restored to its prior `branch = "libcache8-claude"` state.
+
+**Bottom line, now confirmed a third time**: do not re-enable `umfJemallocPoolOps()` without a fix
+from upstream UMF. TBB (`umfScalablePoolOps()`, `KeepAllMemory=1`) remains the only pool backend
+proven stable under real concurrent load in this environment — this investigation's real-DRAM-vs-
+`fast_tier_size` gap (documented at length above) stays an accepted, known cost rather than
+something fixable by an allocator swap.
+
+**Process lesson for future sessions**: when repointing a downstream crate's dependency to a local
+`path` after editing C source compiled via a `build.rs` `cc::Build`, don't trust a suspiciously fast
+`cargo build` completion as proof the change was picked up — verify the *linked binary* actually
+references the expected symbols (`nm -D <binary> | grep <expected_symbol>`) before treating a
+benchmark run's outcome as meaningful, especially when the result contradicts prior findings. A
+successful run that silently tested old code is worse than an honest failure, because nothing about
+its output looks wrong on its own.
