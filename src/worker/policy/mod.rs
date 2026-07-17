@@ -649,17 +649,16 @@ where
 	/// compiles.
 	///
 	/// Physical migrations are applied in two sequential phases, not one
-	/// combined pass: every demotion in this batch is applied (in
-	/// parallel with every other demotion, via `rayon`) and fully lands
-	/// before any promotion in the same batch begins. This is a strict,
-	/// batch-wide barrier -- `into_par_iter().for_each` only returns once
-	/// every entry in that call has completed -- so a promotion's new
-	/// fast-tier DRAM allocation can never race ahead of a demotion that
-	/// exists specifically to free room for it, no matter how many
-	/// migrations land in one call or what order the stack originally
-	/// pushed them in. Within a single phase, entries are independent
-	/// (distinct keys) and apply concurrently for real multi-core
-	/// throughput.
+	/// combined pass: every demotion in this batch is applied (via
+	/// `apply_migrations_batch`, sequentially or in parallel depending on
+	/// batch size -- see that function's doc) and fully lands before any
+	/// promotion in the same batch begins. This is a strict, batch-wide
+	/// barrier -- `apply_migrations_batch` only returns once every entry in
+	/// that call has completed, whichever way it applied them -- so a
+	/// promotion's new fast-tier DRAM allocation can never race ahead of a
+	/// demotion that exists specifically to free room for it, no matter how
+	/// many migrations land in one call or what order the stack originally
+	/// pushed them in.
 	#[cfg(feature = "lru_hybrid_cache")]
 	fn apply_tier_migrations(&mut self) {
 		let Some(stack) = &mut self.policy_stack else { return };
@@ -681,12 +680,12 @@ where
 					}
 				};
 
-				demotions.into_par_iter().for_each(|entry| {
+				apply_migrations_batch(demotions, |entry| {
 					apply_physical(entry);
 					status.record_lru_hybrid_demotion();
 				});
 
-				promotions.into_par_iter().for_each(|entry| {
+				apply_migrations_batch(promotions, |entry| {
 					apply_physical(entry);
 					status.record_lru_hybrid_promotion();
 				});
@@ -771,9 +770,9 @@ where
 				// demotion (see the doc comment above this method's
 				// declaration); the real count comes from
 				// `stack.drain_demotions()` below, unchanged from before.
-				demotions.into_par_iter().for_each(apply_physical);
+				apply_migrations_batch(demotions, apply_physical);
 
-				promotions.into_par_iter().for_each(|entry| {
+				apply_migrations_batch(promotions, |entry| {
 					apply_physical(entry);
 					status.record_lfu_hybrid_promotion();
 				});
@@ -825,12 +824,12 @@ where
 					}
 				};
 
-				demotions.into_par_iter().for_each(|entry| {
+				apply_migrations_batch(demotions, |entry| {
 					apply_physical(entry);
 					status.record_two_q_hybrid_demotion();
 				});
 
-				promotions.into_par_iter().for_each(|entry| {
+				apply_migrations_batch(promotions, |entry| {
 					apply_physical(entry);
 					status.record_two_q_hybrid_promotion();
 				});
@@ -1119,6 +1118,60 @@ where
 	K: TypeSize,
 	V: TypeSize,
 {}
+
+/// Below this many entries, applies sequentially instead of via `rayon`.
+///
+/// The original hypothesis behind this constant was wrong, and it's worth
+/// recording why: the assumption was that per-event migration batches are
+/// small (0-2 entries), so `rayon`'s scheduling overhead would dominate for
+/// tiny batches specifically. Direct instrumentation against the real
+/// benchmark (`standard_web.bin`, `-c 1`) showed the real distribution is
+/// bimodal, not uniformly small: ~50% of calls carry 0 entries, ~50% carry
+/// exactly 1, and a rare (~0.016% of calls) but volume-dominant tail carries
+/// hundreds to *thousands* (observed max: 4,899) -- that tail alone
+/// accounted for 61% of all migrated bytes in the sample. A threshold of 4,
+/// then 1,000, made no measurable difference versus unconditional
+/// parallelization, because real batches either fall far below either
+/// threshold (cheap regardless) or far above it (already parallelized
+/// either way). Only a threshold *above* the observed max (10,000) actually
+/// serializes every real batch and recovers sequential-equivalent
+/// performance -- confirming the regression was never about scheduling
+/// overhead on small batches; it's that parallelizing genuinely large
+/// batches of `TieredBuffer::new_slow` (real PMEM allocations) contends on
+/// the underlying TBB/UMF allocator itself, which doesn't scale under
+/// concurrent access from multiple threads. That cost turned out to be
+/// present at both `-c 1` and `-c 8` -- serializing at `-c 8` too (via this
+/// same 10,000 threshold) lost the `-c 8` wall-clock win unconditional
+/// parallelization had shown (-14.7%), landing back at sequential-equivalent
+/// numbers there as well. So this threshold is, in practice, "always
+/// sequential for this allocator" rather than a genuine small/large cutover
+/// -- kept as a threshold (not a flag) so the mechanism is still available
+/// if a future allocator swap (see the jemalloc-pool investigation in
+/// `CLAUDE.md`) has different concurrent-access characteristics that make
+/// parallelizing large batches viable again. See `CLAUDE.md`'s "the
+/// migration-copy parallelization is a net loss" section for the full
+/// measurement trail.
+const PARALLEL_MIGRATION_THRESHOLD: usize = 10_000;
+
+/// Applies a batch of tier-migration entries via `apply_one`, either
+/// sequentially or in parallel via `rayon` depending on batch size -- see
+/// `PARALLEL_MIGRATION_THRESHOLD`'s doc for why size-gating this matters.
+/// Shared by all three `apply_tier_migrations` siblings' demotion and
+/// promotion phases; each call site still supplies its own `apply_one`
+/// (physical copy plus whatever stats recording that phase needs), so this
+/// only factors out the seq-vs-parallel dispatch, not the migration logic
+/// itself.
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache"))]
+fn apply_migrations_batch(
+	entries: Vec<(HashedKey, Tier)>,
+	apply_one: impl Fn((HashedKey, Tier)) + Sync + Send,
+) {
+	if entries.len() >= PARALLEL_MIGRATION_THRESHOLD {
+		entries.into_par_iter().for_each(apply_one);
+	} else {
+		entries.into_iter().for_each(apply_one);
+	}
+}
 
 /// Thin wrapper asserting `Send + Sync` unconditionally, for sharing a
 /// reference across `rayon` worker threads inside `apply_tier_migrations`.
