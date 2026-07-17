@@ -1422,10 +1422,129 @@ Also confirmed representative non-hybrid feature builds (`hybridcache`, `all_dra
 the addition of the `rayon` import and the new `AssertSync` type, both inert unless a hybrid
 feature is active.
 
-Not yet done: re-verifying against the real `paper-benchmark-cxl` benchmark (the rigorous
-verification step used earlier in this same investigation) to directly confirm the parallelization
-reduces `PolicyWorker`'s wall-clock migration latency / CPU burden under real concurrent load, not
-just this crate's own (lower-scale, lower-concurrency) test suite — worth doing before relying on
-this as a proven throughput win, following the same "verify against the actual benchmark, not just
-this crate's tests" pattern this investigation has used throughout (e.g. the jemalloc-pool
-findings above only became trustworthy once checked against the real benchmark).
+Not yet done (at the time this section was first written): re-verifying against the real
+`paper-benchmark-cxl` benchmark to directly confirm the parallelization reduces `PolicyWorker`'s
+wall-clock migration latency / CPU burden under real concurrent load — see the dedicated section
+below, which resolves this.
+
+## Combining each hybrid stack's separate per-key maps into one
+
+Per the user's question "why not just one queue: for the tier mapping, queue mapping and size
+mapping" — `LruHybridStack`/`LfuHybridStack` (`sizes`+`tiers`) and `TwoQHybridStack`
+(`queue`+`main_tiers`+`sizes`) each collapsed their separate per-key maps into a single
+`entries: HashMap<HashedKey, Entry>` per stack (`LruEntry`/`LfuEntry { tier, size }`,
+`TwoQEntry { queue, tier: Option<Tier>, size }`). Motivated by checking every call site in all
+three stacks and finding no operation ever wanted just one of the separate maps in isolation —
+`insert` touches queue+size together, `remove` touches all of them, etc. — so the split was pure
+historical accident (`TwoQHybridStack` was built by extending `LruHybridStack`'s `tiers`+`sizes`
+shape with a third map bolted on, not a from-scratch design).
+
+Real, measured (not `size_of`-estimated) structural sizes confirmed via a standalone Rust check:
+`Tier` and `Option<Tier>` are both niche-optimized to 1 byte, so all three combined entry structs
+(`LruEntry`, `LfuEntry`, `TwoQEntry`) are 8 bytes, and `(HashedKey, Entry)` pairs to exactly 16
+bytes for all three — the same pair size either of the two separate maps LRU/LFU used to cost
+individually. This let `object/overhead.rs`'s constants be updated precisely rather than re-guessed:
+`get_policy_overhead`'s `TwoQHybrid` arm dropped from 134 to 86 bytes/object (three maps to one is
+the biggest single win), `LruHybrid` 81→85, `LfuHybrid` 137→113; the more precise
+`get_hybrid_dram_shared_overhead` constants (used for the fast-tier DRAM-budget reservation, LRU/LFU
+only) dropped 84→64 (LRU) and 113→93 (LFU).
+
+Verified: all 6 build combos (3 policies × with/without `eviction_stacks_pmem`) compile clean; unit
+tests 25/25 (LRU), 27/27 (LFU), 21/21 (2Q) both ways; real-PMEM integration suites 15/15+1 ignored,
+19/19, 18/18, each run twice, matching documented baselines exactly. One non-reproducible SIGSEGV
+was observed during unit testing (1 out of ~26 repeated runs of 2Q's `--lib` suite specifically) —
+crash signature (two threads at an identical instruction pointer, small offset from null) points at
+allocator-level concurrency, not application logic, and is architecturally expected to concentrate
+on 2Q specifically since 2Q's admission always writes to PMEM synchronously (unlike LRU/LFU, whose
+unit-level tests mostly avoid touching the real allocator) — treated as a rare, pre-existing
+environmental flake given the diff contains no unsafe code or new allocator-touching logic, and the
+dedicated integration suite (which exists specifically to exercise real concurrent PMEM load safely,
+via its `ensure_pmem_allocator_warm()` warm-up) passed cleanly twice.
+
+### Real-DRAM impact, measured via a controlled before/after benchmark A/B
+
+Per explicit request to verify this against the real benchmark (not just assume the byte-count
+math translates to real savings): built `paper-benchmark-cxl` twice against `paper-cache-cxl` — once
+pinned to commit `4844716` (immediately before this consolidation) and once at current HEAD
+`6e8be5b` (after) — identical binary otherwise, identical workload. Used a purpose-built synthetic
+trace (2,000,000 distinct keys, 200-byte values, matching the crate's real 25-byte trace record
+format) rather than the standard traces, since metadata is only a meaningful fraction of footprint
+for small objects — the real traces (`final_traces/*.bin`) average ~16 KB objects, where metadata
+is under 1% of the total and this change would be statistically invisible. `fast_tier_size` forced
+down to 50 MB (vs. ~400 MB of raw value data) via a temporary benchmark-side edit to force real
+demotion churn; single client; `/proc/<pid>/numa_maps` node0 sampled every second to settlement.
+
+| | before (`4844716`) | after (`6e8be5b`) |
+|---|---|---|
+| Settled real DRAM (node0) | 1,717.3 MB | 1,588.5 MB |
+| SET throughput | 1,220,487/sec | 1,251,657/sec |
+
+**128.8 MB less real DRAM for the identical 2M-object workload — a 7.5% reduction, ~67.5
+bytes/object.** Larger than the ~20–24 bytes/object predicted from the `hashbrown_entry_cost`
+arithmetic alone (see the derivation block in `object/overhead.rs`) — consistent with eliminating
+an *entire separate* `HashMap` (its own `RawTable` allocation, with its own capacity-doubling
+overprovisioning) mattering more in practice than the "amortized per-entry" formula captures.
+Throughput was unaffected (marginally better, consistent with fewer hashtable lookups per
+operation). No crashes in either run (`dmesg` checked against wall-clock timestamps for both).
+
+**Overage ratio against the configured 50 MB fast tier: 34.3x (before) → 31.8x (after).** A real,
+measured improvement, but a modest dent, not a fix — the dominant driver of that 30x+ overage
+remains the already-documented TBB allocator retention behavior (see "Investigation: real DRAM
+usage vs. `fast_tier_size`" above), which this change does not touch at all (it only reduced the
+fixed *metadata* cost per tracked object, not the *value-byte* retention behavior that dominates
+the overage at this scale). Metadata was always a small fraction of the total next to 2M × 200B of
+retained value bytes, so a large move in the 30x number was never on the table here.
+
+## Performance follow-up: the migration-copy parallelization is a net loss at the standard test concurrency
+
+Per explicit skepticism ("i dont think it did if it didnt get rid of it [the DRAM overage]") —
+first, a scope clarification worth stating precisely: the parallelization (commit `d3050f5`) was
+never aimed at the DRAM-retention/overage problem documented above. It targeted a completely
+different, already-separately-confirmed finding — `perf` profiling showing `TieredBuffer::new_slow`
+(the demotion path's PMEM byte copy) consuming ~26% of total process CPU time under a
+demotion-heavy real workload. Whether it moved that CPU number is an independent question from
+whether real DRAM tracks `fast_tier_size`, and this section answers the CPU/latency question
+directly rather than assuming the earlier reasoning ("profiling showed 26% CPU, so parallelizing
+the hot spot should help") actually held up under real measurement.
+
+**It didn't hold up — not at the concurrency this investigation has been testing at.** Built
+`paper-benchmark-cxl` twice more, pinned to `18cf802` (immediately before the parallelization,
+sequential migration copy) and `d3050f5` (immediately after, parallel two-phase copy) — isolating
+just this one change, since `4844716`→`6e8be5b` (the map consolidation) touched the same method
+later and would have confounded the comparison. Real trace (`standard_web.bin`, 14M accesses), same
+demotion-heavy config (20GB cache / 4GB fast tier) as the DRAM investigation above, `/usr/bin/time
+-v` for real process CPU time (not just wall clock), `dmesg` cross-checked against wall-clock
+timestamps for both runs (clean, no crashes):
+
+| | sequential (`18cf802`) | parallel (`d3050f5`) | delta |
+|---|---|---|---|
+| **-c 1** (single client — the config this whole investigation has used) | | | |
+| total CPU (user+sys) | 334.42s | 489.37s | **+46.3%** |
+| wall clock | 181.04s | 194.18s | **+7.3%** |
+| **-c 8** (multiple concurrent clients — the scenario the original `perf` profiling used) | | | |
+| total CPU (user+sys) | 472.82s | 495.10s | +4.7% |
+| wall clock | 176.73s | 150.74s | **-14.7%** |
+
+At `-c 1`, parallelizing made things **worse on both axes** — 46% more total CPU burned and 7%
+slower wall clock. This is consistent with the crate's own per-event migration scheduling (see
+"Applied per-event rather than once after the whole batch drains" in `apply_tier_migrations`'s
+comment): each `WorkerEvent` typically produces a tiny migrations batch (often 0–2 entries), and
+spinning up `rayon`'s work-stealing scheduler for a batch that small pays real coordination
+overhead without enough parallel work to amortize it — the higher CPU% (252% vs. 184%) confirms
+more cores were engaged, but that engagement was net-wasted, not productive.
+
+At `-c 8`, the picture flips: parallel wins meaningfully on wall clock (-14.7%) for a modest extra
+CPU cost (+4.7%). With more concurrent client threads, more events queue up between `PolicyWorker`
+poll iterations, producing genuinely larger per-event migration batches (more demotions and
+promotions accumulate before each `apply_tier_migrations` call), which is exactly the shape `rayon`
+needs to pay off — closer to the original `perf` profiling's own test conditions ("multiple
+concurrent rayon worker threads, a real trace").
+
+**Conclusion: the parallelization is conditionally beneficial, not unconditionally beneficial, and
+this investigation's own established single-client test methodology is exactly the case where it
+loses.** It was landed and verified against this crate's low-concurrency unit/integration tests
+only (see the original section above — "not just this crate's own (lower-scale, lower-concurrency)
+test suite" was flagged as a gap at the time, now resolved with this real answer). A batch-size
+guard (skip `rayon` and apply sequentially below some small threshold, e.g. 2–3 entries) would very
+likely recover the `-c 1` regression while keeping the `-c 8` win, but hasn't been implemented —
+this section reports the measurement, not a fix.
