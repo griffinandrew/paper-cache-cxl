@@ -1632,3 +1632,38 @@ references the expected symbols (`nm -D <binary> | grep <expected_symbol>`) befo
 benchmark run's outcome as meaningful, especially when the result contradicts prior findings. A
 successful run that silently tested old code is worse than an honest failure, because nothing about
 its output looks wrong on its own.
+
+## Removed the migration-copy parallelization entirely — inline sequential in the policy worker
+
+Per explicit request ("get rid of using background threads for the eviction and promotion... just
+have the policy worker do it like it was done initially... doing it with background appears to be
+hurting performance"), the `rayon`-based parallel migration copies (commit `d3050f5`, later gated
+behind `PARALLEL_MIGRATION_THRESHOLD = 10_000` in `e8dbcc8`) were removed outright. All three
+hybrids' `apply_tier_migrations` siblings (`worker/policy/mod.rs`) now apply demotions and
+promotions with a plain sequential `into_iter().for_each(...)` directly on the `PolicyWorker`
+thread — the original pre-`d3050f5` shape. Deleted along with them: the `apply_migrations_batch`
+dispatch helper, the `PARALLEL_MIGRATION_THRESHOLD` const, the `AssertSync<T>` cross-thread wrapper
+(only needed to share `&self.objects` across `rayon` workers), and the now-unused `use
+rayon::prelude::*` import (`rayon` stays a crate dependency — `mini_stack/manager.rs` still uses it).
+
+This folds into an actual code removal the conclusion the two sections above had already reached
+from measurement: at `-c 1` (the standard single-client config) unconditional parallelization was
+**+46.3% CPU / +7.3% wall clock**, and no `PARALLEL_MIGRATION_THRESHOLD` value recovered `-c 1`
+without also losing the narrow `-c 8` wall-clock win — because the bottleneck is TBB/UMF allocator
+contention under concurrent access, which parallelizing PMEM-allocating migration copies can only
+worsen. The measurement tables in those sections are kept as the historical record of *why* this
+was removed.
+
+**Retained deliberately: the demotion-before-promotion ordering.** Each sibling still `partition`s
+the batch into demotions (`Tier::Slow`) and promotions (`Tier::Fast`) and runs every demotion
+before any promotion — this is a correctness guarantee (a promotion must not allocate fast-tier
+DRAM ahead of the demotion freeing room for it), an earlier explicit user requirement, and now just
+a sequential two-pass loop rather than a `rayon` barrier. Everything else is unchanged: the
+per-event call cadence (`run()`, gated on a non-empty drain), the physical `Object::set_data`
+reallocation, all stats/gauge recording, LFU's `drain_demotions()`-based demotion count and
+`admission_latched` mirror. `apply_evictions` was already sequential and is untouched.
+
+Verified: all three hybrids' unit tests (25/25 lru, 27/27 lfu, 21/21 two_q) and real-PMEM
+integration suites (15/15 +1 ignored lru, 19/19 lfu, 18/18 two_q, each run twice) pass unchanged —
+the removal only changes *how* a batch is applied (sequential vs. the effectively-already-sequential
+threshold path), never the result.
