@@ -119,6 +119,13 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// Queue tag, 1 byte for the Option<Tier> tag (only meaningful for
 		// keys currently in Main), 4 bytes for the object size
 		PaperPolicy::TwoQHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
+
+		// Structurally identical to LruHybrid: 48 bytes for the HashList
+		// entry, 8 bytes for the HashedKey, 24 bytes for the single
+		// combined per-key `entries` HashMap entry (tier + size, one map —
+		// see `FifoHybridStack`'s module doc), 1 byte for the Tier tag,
+		// 4 bytes for the object size.
+		PaperPolicy::FifoHybrid => 48 + 8 + 24 + 1 + 4,
 	}
 }
 

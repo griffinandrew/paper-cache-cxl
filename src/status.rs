@@ -69,15 +69,16 @@ pub struct AtomicStatus {
 	start_time: AtomicU64,
 
 	/// Runtime-configurable fast-tier byte budget for `PaperPolicy::LruHybrid`
-	/// / `PaperPolicy::LfuHybrid` / `PaperPolicy::TwoQHybrid` (`lru_hybrid_cache`
-	/// / `lfu_hybrid_cache` / `two_q_hybrid_cache` — mutually exclusive
+	/// / `PaperPolicy::LfuHybrid` / `PaperPolicy::TwoQHybrid` /
+	/// `PaperPolicy::FifoHybrid` (`lru_hybrid_cache` / `lfu_hybrid_cache` /
+	/// `two_q_hybrid_cache` / `fifo_hybrid_cache` — mutually exclusive
 	/// features, see `lib.rs`'s `compile_error!` guards, so this single field
 	/// serves whichever one is active). Written by
 	/// `PaperCache::set_fast_tier_size`, read back by both
 	/// `PaperCache::fast_tier_size` and `PolicyWorker` (via the
 	/// `WorkerEvent::ResizeFastTier` broadcast, not by reading this field
 	/// directly — mirrors how `max_size` and `resize()`/`Resize` work).
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache"))]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
 	fast_tier_capacity: AtomicCacheSize,
 
 	/// `lru_hybrid_cache` counters/gauges, updated by `PolicyWorker` as it
@@ -148,6 +149,26 @@ pub struct AtomicStatus {
 	two_q_hybrid_fast_objects: AtomicU64,
 	#[cfg(feature = "two_q_hybrid_cache")]
 	two_q_hybrid_slow_objects: AtomicU64,
+
+	/// `fifo_hybrid_cache` counters/gauges — same rationale as the
+	/// `lru_hybrid_*`/`lfu_hybrid_*`/`two_q_hybrid_*` fields above.
+	/// `fifo_hybrid_promotions` stays permanently `0` — FIFO has no
+	/// promotion policy at all — kept for API-shape symmetry with the other
+	/// three hybrids' stats (see `FifoHybridStats::promotions`'s doc).
+	#[cfg(feature = "fifo_hybrid_cache")]
+	fifo_hybrid_promotions: AtomicU64,
+	#[cfg(feature = "fifo_hybrid_cache")]
+	fifo_hybrid_demotions: AtomicU64,
+	#[cfg(feature = "fifo_hybrid_cache")]
+	fifo_hybrid_evictions: AtomicU64,
+	#[cfg(feature = "fifo_hybrid_cache")]
+	fifo_hybrid_fast_bytes_used: AtomicCacheSize,
+	#[cfg(feature = "fifo_hybrid_cache")]
+	fifo_hybrid_slow_bytes_used: AtomicCacheSize,
+	#[cfg(feature = "fifo_hybrid_cache")]
+	fifo_hybrid_fast_objects: AtomicU64,
+	#[cfg(feature = "fifo_hybrid_cache")]
+	fifo_hybrid_slow_objects: AtomicU64,
 }
 
 /// This struct holds the basic statistical information about `PaperCache`.
@@ -275,7 +296,7 @@ impl AtomicStatus {
 
 			start_time: AtomicU64::new(time::timestamp()),
 
-			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache"))]
+			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
 			fast_tier_capacity: AtomicCacheSize::default(),
 			#[cfg(feature = "lru_hybrid_cache")]
 			lru_hybrid_promotions: AtomicU64::default(),
@@ -323,6 +344,21 @@ impl AtomicStatus {
 			two_q_hybrid_fast_objects: AtomicU64::default(),
 			#[cfg(feature = "two_q_hybrid_cache")]
 			two_q_hybrid_slow_objects: AtomicU64::default(),
+
+			#[cfg(feature = "fifo_hybrid_cache")]
+			fifo_hybrid_promotions: AtomicU64::default(),
+			#[cfg(feature = "fifo_hybrid_cache")]
+			fifo_hybrid_demotions: AtomicU64::default(),
+			#[cfg(feature = "fifo_hybrid_cache")]
+			fifo_hybrid_evictions: AtomicU64::default(),
+			#[cfg(feature = "fifo_hybrid_cache")]
+			fifo_hybrid_fast_bytes_used: AtomicCacheSize::default(),
+			#[cfg(feature = "fifo_hybrid_cache")]
+			fifo_hybrid_slow_bytes_used: AtomicCacheSize::default(),
+			#[cfg(feature = "fifo_hybrid_cache")]
+			fifo_hybrid_fast_objects: AtomicU64::default(),
+			#[cfg(feature = "fifo_hybrid_cache")]
+			fifo_hybrid_slow_objects: AtomicU64::default(),
 		};
 
 		Ok(status)
@@ -435,8 +471,9 @@ impl AtomicStatus {
 	}
 
 	/// Current fast-tier byte budget (`PaperPolicy::LruHybrid` /
-	/// `PaperPolicy::LfuHybrid` / `PaperPolicy::TwoQHybrid`).
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache"))]
+	/// `PaperPolicy::LfuHybrid` / `PaperPolicy::TwoQHybrid` /
+	/// `PaperPolicy::FifoHybrid`).
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
 	#[must_use]
 	pub fn fast_tier_capacity(&self) -> CacheSize {
 		self.fast_tier_capacity.load(Ordering::Relaxed)
@@ -445,7 +482,7 @@ impl AtomicStatus {
 	/// Sets the fast-tier byte budget. Callers are responsible for also
 	/// broadcasting `WorkerEvent::ResizeFastTier` so the active stack's own
 	/// internal capacity is updated (mirrors `set_max_size` + `Resize`).
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache"))]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
 	pub fn set_fast_tier_capacity(&self, size: CacheSize) {
 		self.fast_tier_capacity.store(size, Ordering::Relaxed);
 	}
@@ -617,6 +654,52 @@ impl AtomicStatus {
 			slow_bytes_used: self.two_q_hybrid_slow_bytes_used.load(Ordering::Relaxed),
 			fast_objects: self.two_q_hybrid_fast_objects.load(Ordering::Relaxed),
 			slow_objects: self.two_q_hybrid_slow_objects.load(Ordering::Relaxed),
+		}
+	}
+
+	// `record_fifo_hybrid_promotion` intentionally does not exist:
+	// `FifoHybridStack` never emits a `Tier::Fast` migration (no promotion
+	// policy at all — see that stack's module doc), so
+	// `fifo_hybrid_promotions` is only ever read (always 0), never written.
+
+	#[cfg(feature = "fifo_hybrid_cache")]
+	pub fn record_fifo_hybrid_demotion(&self) {
+		self.fifo_hybrid_demotions.fetch_add(1, Ordering::Relaxed);
+	}
+
+	#[cfg(feature = "fifo_hybrid_cache")]
+	pub fn record_fifo_hybrid_eviction(&self) {
+		self.fifo_hybrid_evictions.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Overwrites the live tier gauges (bytes/objects currently in each
+	/// tier). Called by `PolicyWorker` each time it drains tier migrations.
+	#[cfg(feature = "fifo_hybrid_cache")]
+	pub fn set_fifo_hybrid_gauges(
+		&self,
+		fast_bytes_used: CacheSize,
+		slow_bytes_used: CacheSize,
+		fast_objects: u64,
+		slow_objects: u64,
+	) {
+		self.fifo_hybrid_fast_bytes_used.store(fast_bytes_used, Ordering::Relaxed);
+		self.fifo_hybrid_slow_bytes_used.store(slow_bytes_used, Ordering::Relaxed);
+		self.fifo_hybrid_fast_objects.store(fast_objects, Ordering::Relaxed);
+		self.fifo_hybrid_slow_objects.store(slow_objects, Ordering::Relaxed);
+	}
+
+	/// Returns a point-in-time snapshot of `fifo_hybrid_cache` statistics.
+	#[cfg(feature = "fifo_hybrid_cache")]
+	#[must_use]
+	pub fn fifo_hybrid_stats(&self) -> crate::fifo_hybrid_cache::FifoHybridStats {
+		crate::fifo_hybrid_cache::FifoHybridStats {
+			promotions: self.fifo_hybrid_promotions.load(Ordering::Relaxed),
+			demotions: self.fifo_hybrid_demotions.load(Ordering::Relaxed),
+			evictions: self.fifo_hybrid_evictions.load(Ordering::Relaxed),
+			fast_bytes_used: self.fifo_hybrid_fast_bytes_used.load(Ordering::Relaxed),
+			slow_bytes_used: self.fifo_hybrid_slow_bytes_used.load(Ordering::Relaxed),
+			fast_objects: self.fifo_hybrid_fast_objects.load(Ordering::Relaxed),
+			slow_objects: self.fifo_hybrid_slow_objects.load(Ordering::Relaxed),
 		}
 	}
 

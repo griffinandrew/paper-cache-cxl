@@ -32,6 +32,7 @@ pub enum PaperPolicy {
 	LruHybrid,
 	LfuHybrid,
 	TwoQHybrid(f64),
+	FifoHybrid,
 }
 
 impl PaperPolicy {
@@ -56,6 +57,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::LruHybrid => write!(f, "lru-hybrid"),
 			PaperPolicy::LfuHybrid => write!(f, "lfu-hybrid"),
 			PaperPolicy::TwoQHybrid(k_in) => write!(f, "2q-hybrid-{k_in}"),
+			PaperPolicy::FifoHybrid => write!(f, "fifo-hybrid"),
 		}
 	}
 }
@@ -78,6 +80,7 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("s3-fifo-") => parse_s_three_fifo(value)?,
 			"lru-hybrid" => PaperPolicy::LruHybrid,
 			"lfu-hybrid" => PaperPolicy::LfuHybrid,
+			"fifo-hybrid" => PaperPolicy::FifoHybrid,
 
 			_ => return Err(CacheError::InvalidPolicy),
 		};
@@ -236,5 +239,20 @@ mod tests {
 	#[test]
 	fn two_q_hybrid_rejects_out_of_range_ratio() {
 		assert_eq!("2q-hybrid-1.5".parse::<PaperPolicy>(), Err(CacheError::InvalidPolicy));
+	}
+
+	#[test]
+	fn fifo_hybrid_round_trips_through_display_and_from_str() {
+		assert_eq!(PaperPolicy::FifoHybrid.to_string(), "fifo-hybrid");
+		assert_eq!("fifo-hybrid".parse::<PaperPolicy>(), Ok(PaperPolicy::FifoHybrid));
+	}
+
+	#[test]
+	fn fifo_hybrid_does_not_collide_with_plain_fifo() {
+		assert_eq!("fifo".parse::<PaperPolicy>(), Ok(PaperPolicy::Fifo));
+		assert_ne!(
+			"fifo".parse::<PaperPolicy>().unwrap(),
+			"fifo-hybrid".parse::<PaperPolicy>().unwrap(),
+		);
 	}
 }

@@ -17,6 +17,7 @@ mod s_three_fifo_stack;
 mod lru_hybrid_stack;
 mod lfu_hybrid_stack;
 mod two_q_hybrid_stack;
+mod fifo_hybrid_stack;
 
 #[cfg(feature = "eviction_stacks_pmem")] mod pmem_collections;
 
@@ -38,6 +39,7 @@ use crate::{
 		lru_hybrid_stack::LruHybridStack,
 		lfu_hybrid_stack::LfuHybridStack,
 		two_q_hybrid_stack::TwoQHybridStack,
+		fifo_hybrid_stack::FifoHybridStack,
 	},
 };
 
@@ -51,9 +53,10 @@ pub enum AccessOutcome {
 /// Which tier an object currently lives in, for policy stacks that track a
 /// segmented (fast/slow) queue. Used by `LruHybridStack`
 /// (`PaperPolicy::LruHybrid`, recency-segmented), `LfuHybridStack`
-/// (`PaperPolicy::LfuHybrid`, frequency-segmented), and `TwoQHybridStack`
-/// (`PaperPolicy::TwoQHybrid`, 2Q-segmented); every other stack's default
-/// `drain_tier_migrations` never produces one.
+/// (`PaperPolicy::LfuHybrid`, frequency-segmented), `TwoQHybridStack`
+/// (`PaperPolicy::TwoQHybrid`, 2Q-segmented), and `FifoHybridStack`
+/// (`PaperPolicy::FifoHybrid`, insertion-order-segmented); every other
+/// stack's default `drain_tier_migrations` never produces one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
 	Fast,
@@ -222,5 +225,15 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		PaperPolicy::TwoQHybrid(k_in) => Box::new(TwoQHybridStack::new(
 			k_in, max_size, (max_size as f64 * 0.2) as CacheSize,
 		)),
+
+		// Pure paper-spec implementation for now: no `with_shared_overhead`
+		// reservation and no low-water headroom (see `FifoHybridStack`'s
+		// module doc) — unlike `LruHybrid`/`LfuHybrid` above, which picked
+		// those refinements up later from real-usage measurements. Revisit
+		// this arm (and give it the same two-arm with/without-feature shape
+		// as `LruHybrid`/`LfuHybrid`) if a follow-up DRAM-usage measurement
+		// for `fifo_hybrid_cache` shows the same issues. Single unconditional
+		// arm for now, matching `TwoQHybrid`'s style above.
+		PaperPolicy::FifoHybrid => Box::new(FifoHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 	}
 }

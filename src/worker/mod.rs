@@ -39,8 +39,10 @@ pub enum WorkerEvent {
 
 	Resize(CacheSize),
 	/// Runtime-adjusts the fast-tier byte budget for `lru_hybrid_cache`
-	/// (`PaperPolicy::LruHybrid`) / `lfu_hybrid_cache` (`PaperPolicy::LfuHybrid`).
-	/// No-op for every other policy stack; see `PolicyStack::resize_fast_tier`.
+	/// (`PaperPolicy::LruHybrid`) / `lfu_hybrid_cache` (`PaperPolicy::LfuHybrid`)
+	/// / `two_q_hybrid_cache` (`PaperPolicy::TwoQHybrid`) / `fifo_hybrid_cache`
+	/// (`PaperPolicy::FifoHybrid`). No-op for every other policy stack; see
+	/// `PolicyStack::resize_fast_tier`.
 	ResizeFastTier(CacheSize),
 	Policy(PaperPolicy),
 }
@@ -68,6 +70,7 @@ pub use crate::worker::tiering::TieringWorker;
 // Flattens `worker::policy::Tier` (itself a `pub(crate)` re-export of the
 // private `policy_stack` submodule's `Tier`, see `worker/policy/mod.rs`) so
 // `lib.rs` can re-export it further as a fully public `PaperCache::tier_of`/
-// `lru_hybrid_cache`/`lfu_hybrid_cache`/`two_q_hybrid_cache` return type.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache"))]
+// `lru_hybrid_cache`/`lfu_hybrid_cache`/`two_q_hybrid_cache`/
+// `fifo_hybrid_cache` return type.
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
 pub use crate::worker::policy::Tier;
