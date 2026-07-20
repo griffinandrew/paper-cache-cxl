@@ -32,6 +32,12 @@ allocator-api2 =  "0.2.21"
 perf-event = { version = "0.4.8", optional = true }
 sysinfo = "=0.33"
 
+# Runtime-parameterized NUMA-tier allocation for the four hybrid-cache
+# features' `TieredBuffer` type -- see `umf_tier_allocator/README.md`. Optional:
+# only pulled in when one of `lru_hybrid_cache`/`lfu_hybrid_cache`/
+# `two_q_hybrid_cache`/`fifo_hybrid_cache` is enabled.
+tier_allocator = { path = "umf_tier_allocator", optional = true }
+
 
 [features]
 # Core feature to enable key and value storage in PMEM
@@ -154,7 +160,7 @@ far_tier_pmem_evst_hash = ["hybridcache", "eviction_stacks_pmem", "global_hashta
 # Mutually exclusive with `lfu_hybrid_cache` below: both define their own
 # inherent-method impl block on the identical PaperCache<K, TieredBuffer, S>
 # type (see lib.rs's compile_error! guard).
-lru_hybrid_cache = ["key_value_pmem"]
+lru_hybrid_cache = ["key_value_pmem", "dep:tier_allocator"]
 
 # Single-instance, segmented-LFU hybrid cache: same one-PaperCache<K,
 # TieredBuffer> architecture as `lru_hybrid_cache` above, but the fast/slow
@@ -164,7 +170,7 @@ lru_hybrid_cache = ["key_value_pmem"]
 # needs `key_value_pmem`, not `key_pmem_value_pmem`.
 #
 # Mutually exclusive with `lru_hybrid_cache` above.
-lfu_hybrid_cache = ["key_value_pmem"]
+lfu_hybrid_cache = ["key_value_pmem", "dep:tier_allocator"]
 
 # Single-instance, segmented-2Q hybrid cache: same one-PaperCache<K,
 # TieredBuffer> architecture as `lru_hybrid_cache`/`lfu_hybrid_cache` above,
@@ -177,7 +183,7 @@ lfu_hybrid_cache = ["key_value_pmem"]
 # not `key_pmem_value_pmem`.
 #
 # Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache` above.
-two_q_hybrid_cache = ["key_value_pmem"]
+two_q_hybrid_cache = ["key_value_pmem", "dep:tier_allocator"]
 
 # Single-instance, segmented-FIFO hybrid cache: same one-PaperCache<K,
 # TieredBuffer> architecture as `lru_hybrid_cache`/`lfu_hybrid_cache`/
@@ -192,7 +198,7 @@ two_q_hybrid_cache = ["key_value_pmem"]
 #
 # Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
 # `two_q_hybrid_cache` above.
-fifo_hybrid_cache = ["key_value_pmem"]
+fifo_hybrid_cache = ["key_value_pmem", "dep:tier_allocator"]
 
 
 

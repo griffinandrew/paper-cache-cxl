@@ -5,8 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `TieredBuffer` — the value type stored in both `lru_hybrid_cache`'s and
-//! `lfu_hybrid_cache`'s single, unified object table.
+//! `TieredBuffer` — the value type stored in all four hybrid-cache
+//! features' (`lru_hybrid_cache`, `lfu_hybrid_cache`, `two_q_hybrid_cache`,
+//! `fifo_hybrid_cache`) single, unified object table.
 //!
 //! Unlike `hybridcache`, which gets two tiers by running two independent
 //! `PaperCache` instances (one `BufferDRAM`, one `BufferPMEM`) side by side,
@@ -18,36 +19,98 @@
 //! live object's bytes exist in exactly one tier's allocation at any given
 //! time.
 //!
-//! Shared (rather than duplicated per feature) because `lru_hybrid_cache`
-//! and `lfu_hybrid_cache` each define their own inherent-method
-//! `impl<K, S> PaperCache<K, TieredBuffer, S>` block — two such blocks for
-//! the same concrete type cannot coexist, so the two features are mutually
-//! exclusive (see the `compile_error!` guard in `lib.rs`) and share this one
-//! buffer type rather than each defining their own.
+//! Shared (rather than duplicated per feature) because each of the four
+//! hybrid-cache features defines its own inherent-method `impl<K, S>
+//! PaperCache<K, TieredBuffer, S>` block — two such blocks for the same
+//! concrete type cannot coexist, so the four features are mutually
+//! exclusive (see the `compile_error!` guards in `lib.rs`) and share this
+//! one buffer type rather than each defining their own.
+//!
+//! ## Backed by `tier_allocator`, not the crate's own `Hybrid` allocator
+//!
+//! Both variants are backed by the standalone `tier_allocator` crate's
+//! `TierBuffer` (see `umf_tier_allocator/`) rather than `Box<[u8]>`/
+//! `Box<[u8], Hybrid>` as in earlier versions of this file. This is a
+//! deliberate architectural swap, not a behavioral change: `tier_allocator`
+//! is a runtime-parameterized NUMA-tier allocator (construct a
+//! `TierAllocator` bound to any NUMA node id at runtime, rather than
+//! picking a hardcoded allocator type at compile time via Cargo features
+//! the way `Hybrid`/`HybridObjects`/`DRAMObjects` do). It builds on stable
+//! Rust (no `std::alloc::Allocator`/`#![feature(allocator_api)]` involved),
+//! and its `TierAllocator` deliberately has no teardown — pools live for
+//! the process, matching this crate's own `HybridObjects`/`DRAMObjects`
+//! precedent — so a `TierBuffer` allocated from one of the two static
+//! allocators below stays valid regardless of anything else in the process.
+//! See `tier_allocator`'s own crate-level doc comment for the full
+//! reasoning (including why `std::alloc::Allocator` was rejected in favor
+//! of this hand-rolled buffer type).
+//!
+//! `new_fast`/`new_slow`/`is_fast`/`is_slow`/`AsRef<[u8]>`/`TypeSize`/
+//! `Clone` are unchanged from before this swap, so no other file in this
+//! crate needed to change to adopt it.
+
+use std::sync::OnceLock;
 
 use typesize::TypeSize;
 
-use crate::Hybrid;
+use tier_allocator::{TierAllocator, TierBuffer};
+
+/// NUMA node backing the fast (DRAM) tier, matching this crate's own
+/// `DRAMObjects::NODE_DRAM` convention (`src/allocator.rs`).
+const FAST_TIER_NODE: i32 = 0;
+
+/// NUMA node backing the slow (PMEM/CXL) tier, matching this crate's own
+/// `HybridObjects::NODE` convention (`src/allocator.rs`).
+const SLOW_TIER_NODE: i32 = 1;
+
+/// The fast-tier `TierAllocator`, constructed once and kept alive for the
+/// life of the process (see `tier_allocator::TierAllocator`'s "no teardown"
+/// doc comment for why that's safe).
+fn fast_allocator() -> &'static TierAllocator {
+	static FAST: OnceLock<TierAllocator> = OnceLock::new();
+	FAST.get_or_init(|| {
+		TierAllocator::new_numa(FAST_TIER_NODE)
+			.expect("TierAllocator::new_numa(FAST_TIER_NODE) should succeed")
+	})
+}
+
+/// The slow-tier `TierAllocator`, constructed once and kept alive for the
+/// life of the process.
+fn slow_allocator() -> &'static TierAllocator {
+	static SLOW: OnceLock<TierAllocator> = OnceLock::new();
+	SLOW.get_or_init(|| {
+		TierAllocator::new_numa(SLOW_TIER_NODE)
+			.expect("TierAllocator::new_numa(SLOW_TIER_NODE) should succeed")
+	})
+}
 
 /// A value buffer that is physically stored in exactly one tier at a time.
-#[derive(Clone)]
 pub enum TieredBuffer {
-	/// Fast tier: plain DRAM allocation (goes through the crate's global allocator).
-	Fast(Box<[u8]>),
-	/// Slow tier: PMEM allocation via the `Hybrid` allocator.
-	Slow(Box<[u8], Hybrid>),
+	/// Fast tier: DRAM allocation via a dedicated `tier_allocator::TierAllocator`.
+	Fast(TierBuffer),
+	/// Slow tier: PMEM/CXL allocation via a dedicated `tier_allocator::TierAllocator`.
+	Slow(TierBuffer),
 }
 
 impl TieredBuffer {
 	/// Creates a new fast-tier (DRAM) buffer by copying the given bytes.
 	pub fn new_fast(bytes: &[u8]) -> Self {
-		TieredBuffer::Fast(bytes.to_vec().into_boxed_slice())
+		let mut buffer = fast_allocator()
+			.alloc(bytes.len())
+			.expect("fast-tier allocation should succeed");
+
+		buffer.copy_from_slice(bytes);
+		TieredBuffer::Fast(buffer)
 	}
 
-	/// Creates a new slow-tier (PMEM) buffer by copying the given bytes into
-	/// a `Hybrid`-allocated buffer.
+	/// Creates a new slow-tier (PMEM/CXL) buffer by copying the given bytes.
 	pub fn new_slow(bytes: &[u8]) -> Self {
-		TieredBuffer::Slow(bytes.to_vec_in(Hybrid).into_boxed_slice())
+		let mut buffer = slow_allocator()
+			.alloc(bytes.len())
+			.expect("slow-tier allocation should succeed");
+
+		buffer.copy_from_slice(bytes);
+		TieredBuffer::Slow(buffer)
 	}
 
 	/// Returns `true` if this buffer currently lives in the fast (DRAM) tier.
@@ -58,6 +121,20 @@ impl TieredBuffer {
 	/// Returns `true` if this buffer currently lives in the slow (PMEM) tier.
 	pub fn is_slow(&self) -> bool {
 		matches!(self, TieredBuffer::Slow(_))
+	}
+}
+
+impl Clone for TieredBuffer {
+	fn clone(&self) -> Self {
+		match self {
+			TieredBuffer::Fast(buffer) => TieredBuffer::Fast(
+				buffer.duplicate(fast_allocator()).expect("fast-tier duplicate should succeed"),
+			),
+
+			TieredBuffer::Slow(buffer) => TieredBuffer::Slow(
+				buffer.duplicate(slow_allocator()).expect("slow-tier duplicate should succeed"),
+			),
+		}
 	}
 }
 
