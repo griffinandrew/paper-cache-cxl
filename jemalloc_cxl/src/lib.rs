@@ -60,11 +60,25 @@ pub use arena::{create_cxl_arena, ArenaError, CxlArena, CxlArenaConfig};
 pub use extent::NumaPolicy;
 pub use thread_arena::{ThreadArenaError, ThreadArenaGuard};
 
-/// The one jemalloc instance this crate (and every ordinary, non-CXL
-/// allocation made while it's linked in) uses. Re-exported so downstream
-/// crates don't need their own direct `tikv-jemallocator` dependency just
-/// to see the type used here.
+/// The one jemalloc instance this crate (and, when [`own_global_allocator`]
+/// is enabled, every ordinary non-CXL allocation made while it's linked in)
+/// uses. Re-exported so downstream crates don't need their own direct
+/// `tikv-jemallocator` dependency just to see the type used here.
+///
+/// [`own_global_allocator`]: https://doc.rust-lang.org/cargo/reference/features.html
 pub use tikv_jemallocator::Jemalloc;
 
+/// Gated behind the `own_global_allocator` feature (on by default) so a
+/// consumer that already manages its own `#[global_allocator]` (e.g.
+/// paper-cache, which switches between several of its own allocator types
+/// by feature flag) can depend on this crate with `default-features =
+/// false` and keep its own choice -- Rust permits exactly one
+/// `#[global_allocator]` per binary. Every arena/`mallctl`/`mallocx`/
+/// [`CxlAllocator`] call in this crate still routes through the identical
+/// jemalloc instance either way, since it links against the same static
+/// library regardless of what's installed as the global allocator; this
+/// feature only controls whether *ordinary, unrelated* allocations
+/// (`Vec::new()`, `Box::new()`, ...) also happen to go through it.
+#[cfg(feature = "own_global_allocator")]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;

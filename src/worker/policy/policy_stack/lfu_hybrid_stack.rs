@@ -103,8 +103,12 @@ use kwik::collections::HashList;
 #[cfg(feature = "eviction_stacks_pmem")]
 use super::pmem_collections::{PmemVecList, PmemHashList, PmemIndex};
 
+// `Hybrid` here is `crate::allocator::EvictionStackAllocator` (jemalloc_cxl's
+// CXL/NUMA arena mechanism) -- a different type from the crate-level
+// `Hybrid` alias used by `BufferPMEM`/other PMEM features. Kept under this
+// local name only to minimize the diff against the call sites below.
 #[cfg(feature = "eviction_stacks_pmem")]
-use crate::Hybrid;
+use crate::allocator::EvictionStackAllocator as Hybrid;
 
 use crate::{
 	CacheSize,

@@ -38,6 +38,17 @@ sysinfo = "=0.33"
 # `two_q_hybrid_cache`/`fifo_hybrid_cache` is enabled.
 tier_allocator = { path = "umf_tier_allocator", optional = true }
 
+# One-jemalloc-instance, custom-extent-hooks NUMA/CXL arena allocator (see
+# `jemalloc_cxl/README.md`) -- backs `EvictionStackAllocator` (src/allocator.rs),
+# used only for eviction-stack metadata (PmemHashList/PmemVecList/EntryMap,
+# see worker/policy/policy_stack/pmem_collections.rs) under `eviction_stacks_pmem`.
+# `default-features = false` disables jemalloc_cxl's own `#[global_allocator]`
+# declaration -- this crate keeps its own (DRAMObjects/NumaAllocator, chosen
+# by feature flag elsewhere in this file); jemalloc_cxl's arena/mallctl/mallocx
+# machinery works identically regardless of what's installed as the global
+# allocator, since it always links against the same jemalloc static library.
+jemalloc_cxl = { path = "jemalloc_cxl", optional = true, default-features = false }
+
 
 [features]
 # Core feature to enable key and value storage in PMEM
@@ -92,8 +103,13 @@ hashbrown_dram = []
 # Enable hardware performance counters (requires Linux perf_event)
 hw_perf = ["perf-event"]
 
-# Enable PMEM-backed eviction stacks
-eviction_stacks_pmem = []
+# Enable PMEM-backed eviction stacks. Eviction-stack metadata
+# (PmemHashList/PmemVecList/EntryMap in worker/policy/policy_stack/) is
+# allocated via EvictionStackAllocator (src/allocator.rs), backed by
+# jemalloc_cxl's custom-extent-hooks NUMA/CXL arena mechanism -- independent
+# of `crate::Hybrid` (the UMF-based allocator backing BufferPMEM/other PMEM
+# features), so enabling this alone doesn't require any other PMEM feature.
+eviction_stacks_pmem = ["dep:jemalloc_cxl"]
 
 #to emnable 3 tier based data movement
 hashtable_tiering = [] 

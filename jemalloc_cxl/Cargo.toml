@@ -14,6 +14,20 @@ thiserror = "2.0.16"
 [build-dependencies]
 cc = "1.2.39"
 
+[features]
+# On by default: this crate's own binary (its tests, its example) needs
+# *some* global allocator, and installing jemalloc is this crate's whole
+# point to demonstrate. Disable via `default-features = false` when
+# depending on this crate from something that already manages its own
+# `#[global_allocator]` (e.g. paper-cache) -- Rust allows exactly one
+# per binary, so both can't declare one. The arena/mallctl/mallocx/
+# CxlAllocator machinery works identically either way: it links directly
+# against the same jemalloc static library regardless of what's installed
+# as the global allocator, so disabling this feature costs nothing but the
+# global-allocator declaration itself.
+default = ["own_global_allocator"]
+own_global_allocator = []
+
 [[example]]
 name = "cxl_vec"
 path = "examples/cxl_vec.rs"

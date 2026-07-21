@@ -1945,3 +1945,91 @@ unsafe impl allocator_api2::alloc::Allocator for DRAMObjects {
 
 
 */
+
+// ---------------------------------------------------------------------
+// EvictionStackAllocator: eviction-stack metadata PMEM allocation via
+// jemalloc_cxl's custom-extent-hooks NUMA/CXL arena.
+// ---------------------------------------------------------------------
+//
+// Deliberately independent of `Hybrid`/`HybridObjects` (the UMF-based
+// allocator backing `BufferPMEM` and the other PMEM features above) --
+// eviction-stack metadata (`PmemHashList`/`PmemVecList`/the per-stack
+// `EntryMap`s in `worker/policy/policy_stack/`) is a different, much
+// smaller allocation workload (per-key list/map nodes, not full object
+// byte buffers), so it gets its own dedicated jemalloc arena rather than
+// sharing UMF's. See `jemalloc_cxl/README.md` for the underlying mechanism:
+// one jemalloc instance, a custom `extent_hooks_t` doing `mmap`+`mbind`,
+// and a nightly `Allocator` handle over one arena.
+#[cfg(feature = "eviction_stacks_pmem")]
+mod eviction_stack_allocator {
+    use std::sync::OnceLock;
+
+    use jemalloc_cxl::{create_cxl_arena, CxlAllocator, CxlArena, CxlArenaConfig, NumaPolicy};
+
+    /// NUMA node eviction-stack metadata is bound to, matching this crate's
+    /// own `HybridObjects::NODE`/PMEM-node convention (node 1).
+    const EVICTION_STACK_NODE: u32 = 1;
+
+    /// Lazily creates (once, process-lifetime -- matching every other
+    /// pool/arena in this file) the CXL arena backing all eviction-stack
+    /// metadata. `BindStrict` (`MPOL_BIND`) matches `HybridObjects`'s own
+    /// existing UMF configuration (`UMF_NUMA_MODE_BIND`), for closer
+    /// behavioral parity between the two PMEM paths.
+    fn arena() -> CxlArena {
+        static ARENA: OnceLock<CxlArena> = OnceLock::new();
+        *ARENA.get_or_init(|| {
+            create_cxl_arena(CxlArenaConfig::new(EVICTION_STACK_NODE, NumaPolicy::BindStrict))
+                .expect("eviction-stack CXL arena creation should succeed")
+        })
+    }
+
+    /// Zero-sized allocator handle for eviction-stack metadata, routed
+    /// through a dedicated jemalloc arena via `jemalloc_cxl`. A plain,
+    /// `Copy`, no-state value -- matching `HybridObjects`/`DRAMObjects`'s
+    /// own zero-sized-marker-type shape -- with the real arena/allocator
+    /// handle looked up lazily via `arena()` on every call, the same
+    /// lazy-init pattern this file already uses for its UMF pools.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct EvictionStackAllocator;
+
+    // `allocator_api2::alloc::Allocator`, not the nightly `std::alloc::
+    // Allocator` -- `PmemHashList`/`PmemVecList`/`hashbrown::HashMap`'s
+    // `EntryMap`s (the only consumers of this type) are all built on the
+    // stable-Rust-compatible `allocator_api2` crate, matching
+    // `HybridObjects`/`DRAMObjects`'s own `allocator_api2` impls above.
+    unsafe impl allocator_api2::alloc::Allocator for EvictionStackAllocator {
+        fn allocate(
+            &self,
+            layout: std::alloc::Layout,
+        ) -> Result<std::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+            // Bridges to CxlAllocator's own nightly `Allocator::allocate`
+            // (jemalloc_cxl's only public allocation entry point) -- no
+            // unsafe work of our own, just adapting one allocator-trait
+            // shape to another; both mirror the same allocate contract.
+            <CxlAllocator as std::alloc::Allocator>::allocate(&CxlAllocator::new(arena()), layout)
+                .map_err(|_| allocator_api2::alloc::AllocError)
+        }
+
+        unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: std::alloc::Layout) {
+            // SAFETY: caller upholds `allocator_api2::alloc::Allocator::
+            // deallocate`'s contract (`ptr`/`layout` describe a still-live
+            // allocation previously returned by this same allocator's
+            // `allocate`). `CxlAllocator::deallocate`'s contract is
+            // identical, and `CxlAllocator::new(arena())` reconstructs the
+            // exact same arena/tcache encoding on every call (`arena()`
+            // itself is cached behind a `OnceLock`, and `CxlAllocator::new`
+            // always uses `TcacheMode::Automatic`) -- so this is the same
+            // allocator in every sense `deallocate`'s contract cares about.
+            unsafe {
+                <CxlAllocator as std::alloc::Allocator>::deallocate(
+                    &CxlAllocator::new(arena()),
+                    ptr,
+                    layout,
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "eviction_stacks_pmem")]
+pub use eviction_stack_allocator::EvictionStackAllocator;
