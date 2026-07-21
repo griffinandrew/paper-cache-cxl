@@ -2033,3 +2033,68 @@ mod eviction_stack_allocator {
 
 #[cfg(feature = "eviction_stacks_pmem")]
 pub use eviction_stack_allocator::EvictionStackAllocator;
+
+// ---------------------------------------------------------------------
+// SlowTierJemallocAllocator: TieredBuffer::Slow's value bytes, via
+// jemalloc_cxl's custom-extent-hooks NUMA/CXL arena, as an alternative
+// backend to tier_allocator (the default -- see tiered_buffer.rs).
+// ---------------------------------------------------------------------
+//
+// Unlike EvictionStackAllocator (which bridges to the stable-Rust-compatible
+// `allocator_api2::alloc::Allocator` for PmemHashList/hashbrown), this backs
+// `Box<[u8], SlowTierJemallocAllocator>` directly, so it implements the
+// nightly `std::alloc::Allocator` trait CxlAllocator already implements --
+// no bridging layer needed, just a direct delegation.
+#[cfg(feature = "jemalloc_cxl_slow_tier")]
+mod slow_tier_jemalloc_allocator {
+    use std::alloc::{AllocError, Allocator, Layout};
+    use std::ptr::NonNull;
+    use std::sync::OnceLock;
+
+    use jemalloc_cxl::{create_cxl_arena, CxlAllocator, CxlArena, CxlArenaConfig, NumaPolicy};
+
+    /// NUMA node backing the slow tier, matching `tiered_buffer.rs`'s own
+    /// `SLOW_TIER_NODE` constant (kept separate/duplicated rather than
+    /// shared, since this module must compile standalone from
+    /// `tiered_buffer.rs`'s own cfg-gated half of that constant).
+    const SLOW_TIER_NODE: u32 = 1;
+
+    fn arena() -> CxlArena {
+        static ARENA: OnceLock<CxlArena> = OnceLock::new();
+        *ARENA.get_or_init(|| {
+            create_cxl_arena(CxlArenaConfig::new(SLOW_TIER_NODE, NumaPolicy::BindStrict))
+                .expect("slow-tier CXL arena creation should succeed")
+        })
+    }
+
+    /// Zero-sized allocator handle for `TieredBuffer::Slow`'s value bytes,
+    /// routed through a dedicated jemalloc arena via `jemalloc_cxl`,
+    /// independent of `tier_allocator`'s own UMF/TBB pool for the same
+    /// node. A plain, `Copy`, no-state value, matching this file's other
+    /// allocator-marker types; the real arena/allocator handle is looked
+    /// up lazily via `arena()` on every call.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct SlowTierJemallocAllocator;
+
+    unsafe impl Allocator for SlowTierJemallocAllocator {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            // Delegates directly to CxlAllocator's own nightly
+            // Allocator::allocate -- no bridging needed, both this type and
+            // CxlAllocator implement the same trait.
+            CxlAllocator::new(arena()).allocate(layout)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            // SAFETY: caller upholds Allocator::deallocate's contract
+            // (ptr/layout describe a still-live allocation previously
+            // returned by this same allocator's `allocate`).
+            // CxlAllocator::new(arena()) reconstructs the identical
+            // arena/tcache encoding on every call (arena() is cached, and
+            // CxlAllocator::new always uses TcacheMode::Automatic).
+            unsafe { CxlAllocator::new(arena()).deallocate(ptr, layout) }
+        }
+    }
+}
+
+#[cfg(feature = "jemalloc_cxl_slow_tier")]
+pub use slow_tier_jemalloc_allocator::SlowTierJemallocAllocator;
