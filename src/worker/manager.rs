@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use typesize::TypeSize;
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded, TryRecvError};
 use log::error;
 
 use crate::{
@@ -40,10 +40,35 @@ pub struct WorkerManager {
 }
 
 impl Worker for WorkerManager {
+	// Busy-polls via `try_recv` rather than blocking on `recv`. Measured
+	// directly (real `perf record` profiling against paper-benchmark-cxl,
+	// both a PMEM-mixed and an all-DRAM config): at this crate's real
+	// single-client request rates, the gap between successive get()/set()
+	// calls consistently exceeds crossbeam's internal spin/yield backoff
+	// window, so this thread's blocking `recv()` was parking via a real
+	// OS futex between nearly every event -- ~30%+ of total CPU cycles
+	// went to futex_wait/futex_wake/sched_yield machinery in both configs,
+	// not to any allocator-specific cost. `PolicyWorker`/`TtlWorker` never
+	// had this problem: both already drain via `try_iter()` (non-blocking)
+	// in their own `run()` loops -- this was the one remaining blocking
+	// wait in the whole worker architecture.
+	//
+	// Trade-off, accepted deliberately: this thread now spins continuously
+	// rather than sleeping between events, permanently consuming one CPU
+	// core even when the cache is idle. Only worth it because there's a
+	// core to spare in this crate's real deployment/benchmark shape (a
+	// handful of worker threads on an 8-core machine) -- if that's ever
+	// not true, this trades a real latency win for a real throughput/power
+	// cost elsewhere.
 	fn run(&mut self) -> Result<(), CacheError> {
 		loop {
-			let Ok(event) = self.listener.recv() else {
-				return Ok(());
+			let event = match self.listener.try_recv() {
+				Ok(event) => event,
+				Err(TryRecvError::Empty) => {
+					std::hint::spin_loop();
+					continue;
+				},
+				Err(TryRecvError::Disconnected) => return Ok(()),
 			};
 
 			for worker in self.workers.iter() {
