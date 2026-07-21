@@ -1,0 +1,19 @@
+[package]
+name = "jemalloc_cxl"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Prototype: one jemalloc instance, multiple arenas -- a CXL/NUMA-tier arena reachable via a nightly Allocator handle, built on custom jemalloc extent hooks."
+
+[dependencies]
+libc = "0.2.177"
+tikv-jemallocator = "0.6.1"
+tikv-jemalloc-sys = "0.6.1"
+thiserror = "2.0.16"
+
+[build-dependencies]
+cc = "1.2.39"
+
+[[example]]
+name = "cxl_vec"
+path = "examples/cxl_vec.rs"
