@@ -178,6 +178,14 @@ impl TierAllocator {
         self.node
     }
 
+    /// The raw UMF pool handle, for use by `NumaAllocator`'s `GlobalAlloc`
+    /// impl, which frees raw pointers handed to it by `Box`/`Vec`'s own drop
+    /// glue rather than a `TierBuffer` -- so it needs direct pool access,
+    /// not the `TierBuffer`-wrapping `alloc`/`alloc_aligned` methods.
+    pub(crate) fn pool_handle(&self) -> ffi::umf_memory_pool_handle_t {
+        self.pool
+    }
+
     /// Constructs a `TierAllocator` bound to NUMA node `node`, backed by
     /// UMF's jemalloc pool instead of the default scalable (TBB) pool.
     ///

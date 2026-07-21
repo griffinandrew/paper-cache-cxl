@@ -335,6 +335,22 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 
 //pub mod allocator;
 
+// The four hybrid-cache features (lru/lfu/two_q/fifo_hybrid_cache) install
+// tier_allocator's NumaAllocator (bound to NUMA node 0) as the global
+// allocator instead of DRAMObjects. This is what lets TieredBuffer::Fast
+// collapse to a plain Box<[u8]> (see tiered_buffer.rs) -- an ordinary heap
+// allocation on this global allocator IS the fast tier for those features,
+// sharing one real UMF pool per node with the slow tier's explicit
+// tier_allocator::alloc_on(SLOW_TIER_NODE, ..) calls rather than each tier
+// having its own independent, redundant pool. Gated on exactly the same
+// predicate as `mod tiered_buffer;`/`pub use crate::tiered_buffer::
+// TieredBuffer;` above, so there is no reachable build where TieredBuffer
+// exists without this also being the active global allocator.
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+#[global_allocator]
+static GLOBAL: tier_allocator::NumaAllocator = tier_allocator::NumaAllocator::new(0);
+
+#[cfg(not(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache")))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 

@@ -7,7 +7,7 @@ use crate::ffi::umf_result_t;
 /// callers/logs retain enough detail to debug against UMF's own error-code
 /// reference, without this crate needing to re-derive a full mapping of
 /// every UMF error variant into its own type up front.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, thiserror::Error)]
 pub enum TierAllocError {
     #[error("umfOsMemoryProviderParamsCreate failed: {0:?}")]
     ProviderParamsCreate(umf_result_t),
@@ -44,4 +44,13 @@ pub enum TierAllocError {
     #[cfg(feature = "jemalloc_pool")]
     #[error("umfJemallocPoolParamsCreate failed: {0:?}")]
     JemallocPoolParamsCreate(umf_result_t),
+
+    /// Requested NUMA node is outside the shared registry's supported range
+    /// (see `registry::MAX_NODES`). Distinct from a `TierAllocator::new_numa`
+    /// failure: that constructor accepts any `i32` and only fails lazily at
+    /// first `alloc()`; this is a stricter, eager check only reachable via
+    /// the registry-backed paths (`registry::pool_for_node`, `alloc_on`,
+    /// `allocator_for`, and `NumaAllocator`).
+    #[error("NUMA node {node} is outside this crate's supported registry range")]
+    InvalidNode { node: i32 },
 }

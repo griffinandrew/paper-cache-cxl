@@ -62,20 +62,60 @@
 //! caller code, and are not fixable from this wrapper. **Do not enable
 //! `jemalloc_pool` in production expecting it to be safe.**
 //!
+//! # Dual access: `#[global_allocator]` vs explicit `alloc_on`
+//!
+//! [`NumaAllocator`] and the free functions in this module ([`alloc_on`],
+//! [`allocator_for`]) are two *access patterns* over one shared mechanism,
+//! not two allocators. Both resolve to the same lazily-initialized,
+//! per-NUMA-node pool registry (internal `registry` module): `NumaAllocator`
+//! implements `GlobalAlloc` so it can be installed as a crate's
+//! `#[global_allocator]`, giving every ordinary `Box`/`Vec` allocation
+//! implicit access to whichever node it's bound to; `alloc_on(node, len)`
+//! is for reaching any *other* node explicitly. Since every call site knows
+//! its target node statically -- the global allocator's node is fixed at
+//! construction, and every `alloc_on` call names its node directly --
+//! `dealloc` never needs to guess which pool a pointer came from, unlike a
+//! thread-local "current node" design would.
+//!
+//! This is deliberately not the thread-local-scoped design considered
+//! earlier: reading an ambient "current node" at allocation time would
+//! leave `dealloc` unable to trust that same thread-local at free time (an
+//! allocation may outlive the thread/scope that created it), forcing a
+//! cross-pool pointer-to-pool lookup on *every* free via UMF's `umfFree`
+//! auto-detection -- a real cost, and more exposure to the same UMF
+//! memory-tracking subsystem already implicated in the sibling
+//! `paper-cache-cxl` crate's documented jemalloc-pool crash history. Every
+//! access pattern here keeps its target node statically known instead, so
+//! `dealloc` is always a direct, single-pool free.
+//!
+//! One concrete consequence: a caller that installs `NumaAllocator::new(0)`
+//! as `#[global_allocator]` gets an ordinary `Box<[u8]>` on node 0 "for
+//! free" (it's just a normal heap allocation once installed), while still
+//! being able to call `alloc_on(1, len)` to place bytes on node 1
+//! explicitly via a [`TierBuffer`] -- both routes share the exact same
+//! per-node pool as any other caller asking for that node, so there's
+//! never a redundant second pool for a node that's already in use.
+//!
 //! # Future integration
 //!
-//! A natural follow-up (not part of this crate) would let `paper-cache-cxl`
-//! adopt `TierAllocator`/`TierBuffer` alongside or instead of its
-//! compile-time `HybridObjects`/`DRAMObjects`/`ValueDRAM`/`DAXPMEM` markers
-//! -- e.g. `TieredBuffer::Slow(Box<[u8], Hybrid>)` becoming
-//! `TieredBuffer::Slow(TierBuffer)`, a straightforward variant swap. Out of
-//! scope here.
+//! `paper-cache-cxl`'s `lru_hybrid_cache`/`lfu_hybrid_cache`/
+//! `two_q_hybrid_cache`/`fifo_hybrid_cache` features are the first
+//! consumers of this dual-access design: `NumaAllocator::new(0)` becomes
+//! their `#[global_allocator]` (replacing that crate's own `DRAMObjects`
+//! for those four features only), and `TieredBuffer::Fast` collapses to a
+//! plain `Box<[u8]>` (an ordinary allocation, now implicitly on this same
+//! node-0 pool), while `TieredBuffer::Slow` uses `alloc_on(1, len)`
+//! explicitly, same as it already did via `TierAllocator` directly.
 
 mod error;
 mod ffi;
+mod numa_allocator;
+mod registry;
 mod tier_allocator;
 mod tier_buffer;
 
 pub use error::TierAllocError;
+pub use numa_allocator::NumaAllocator;
+pub use registry::{alloc_on, alloc_on_aligned, allocator_for};
 pub use tier_allocator::TierAllocator;
 pub use tier_buffer::TierBuffer;
