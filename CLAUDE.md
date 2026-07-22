@@ -1667,3 +1667,97 @@ Verified: all three hybrids' unit tests (25/25 lru, 27/27 lfu, 21/21 two_q) and 
 integration suites (15/15 +1 ignored lru, 19/19 lfu, 18/18 two_q, each run twice) pass unchanged —
 the removal only changes *how* a batch is applied (sequential vs. the effectively-already-sequential
 threshold path), never the result.
+
+## Generics unification: collapsed the storage-matrix and hybrid-cache `impl` block duplication
+
+Per explicit request ("generate a plan to use generics for the all_dram ... as well as all the
+hybridcache designs"), `lib.rs` had grown to 7,564 lines specifically *because* the "same API,
+different backing storage" design documented at the top of this file was written out longhand —
+once per Cargo-feature storage combination — rather than behind generics, on the original reasoning
+that comparing storage strategies shouldn't cost a shared abstraction's overhead. That tradeoff had
+started costing real maintenance weight (any `set()` bugfix needed hand-copying into 6-12 places),
+so this was revisited on a branch (`generics-unification`, off `jemalloc-extent-hooks-cxl`), in
+three parts, after two scoping questions were confirmed with the user: **"do it broadly... but
+forget all the flatmap stuff.. in fact all that flatmap stuff can be removed"** (broad unification,
+plus remove FlatMap entirely rather than migrate it), and, for the four hybrid-cache designs,
+**"Keep compile-time exclusivity, just dedupe source"** (no runtime policy selection — still exactly
+one Cargo feature compiles per build, same mutual-exclusion model as everything else in this crate —
+purely a source-level dedup).
+
+**Part 1 — removed the FlatMap storage backend entirely**
+(`flatmap_dram`/`flatmap_pmem`/`global_flatmap_dram`/`global_flatmap_pmem`, `src/flatmap.rs`,
+`tests/global_flatmap_integration.rs`, and every FlatMap-gated `impl PaperCache<K, BufferDRAM/
+BufferPMEM, S>` block, cfg branch, and doc section) — this was also a scope-reducer for Part 2,
+since without FlatMap the object-map storage axis has exactly two shapes left (`DashMap`; `RwLock<
+HashMap<..., A>>` generic over an allocator `A`) instead of five. Caught one genuine pre-existing bug
+while verifying (unrelated to FlatMap): `GlobalHwPerfCounters` (`hw_perf_counters.rs`) referenced a
+`dashmap_counters` field it never actually declared, so any `hw_perf` build without also enabling
+`hashbrown_dram`/`global_hashtable_pmem` (e.g. `all_dram,hw_perf`) failed to compile even before this
+session — confirmed via `git show HEAD` — fixed in passing by adding the missing field.
+
+**Part 2 — collapsed the five remaining non-hybrid `impl PaperCache<K, V, S>` blocks (all_dram,
+key_value_pmem, global_hashtable_pmem, hashbrown_dram, and key_value_pmem+global_hashtable_pmem
+together) into two**, one per object-map shape, via two new traits: `ObjectStore<K, V>`
+(`src/object_store.rs` — `get_ref`/`get_mut_ref`/`insert`/`clear`/`len`, using return-position `impl
+Trait` in traits so DashMap's own `Ref`/`RefMut` guards satisfy it for free, and a small
+`RwLockObjectRef`/`RwLockObjectMut` wrapper re-indexes the RwLock shape's guard on `Deref` to match)
+and `ValueBuffer` (`src/value_buffer.rs` — one `from_bytes(&[u8]) -> Self`, replacing four different
+existing spellings of "copy these bytes into a fresh buffer" across the five blocks: `Box::
+clone_from_ref`, `Box::clone_from_ref_in`, `value.into()`, `value.to_vec_in(Hybrid).into_boxed_slice()`).
+`key_value_pmem`'s `enable_tiering_manager`/`sets_dram` tiering-manager logic (including the
+`sets_dram` closure's PMEM allocation, now via `V::from_bytes` instead of a hardcoded `BufferPMEM`
+literal) stayed as internal `#[cfg]` branches inside the shared bodies rather than being genericized
+away, since `TieringManager<K, V>` is already generic and this only matters when `key_value_pmem`
+pins `V` to `BufferPMEM` at the real call site — confirmed this compiles correctly for both `V`s
+without further changes. `new_with_eviction_callback` (`hybridcache`'s always-`BufferDRAM` small
+tier) stayed its own small non-generic block rather than being forced generic. One real bug the merge
+surfaced: `Arc<V>::as_ref()` resolves to `Arc`'s own blanket `AsRef<V>` (giving `&V`) *before* ever
+reaching `V`'s `AsRef<[u8]>`, unlike the old concrete `Box<[u8]>`/`Box<[u8], Hybrid>` code where
+`&Box<[u8]>` auto-derefs through to `[u8]` for the following `.to_vec()` — a bare generic `V` has no
+such deref chain, so this needed an explicit `AsRef::<[u8]>::as_ref(&*arc_val).to_vec()` at the three
+call sites it affected. `lib.rs`: 6,620 → 4,854 lines.
+
+**Part 3 — collapsed the four hybrid-cache designs' (`lru_hybrid_cache`/`lfu_hybrid_cache`/
+`two_q_hybrid_cache`/`fifo_hybrid_cache`) `impl PaperCache<K, TieredBuffer, S>` blocks into one**,
+via a new `HybridPolicy` trait (`src/hybrid_policy.rs`) plus one small marker struct per design
+(`LruHybridPolicy` etc., one in each design's own `mod.rs`), selected per build through a `#[cfg]
+type ActiveHybridPolicy = ...;` alias (mirroring the crate's existing `ObjectMapRef`/`Hybrid`/
+`BufferDRAM` pattern). Confirmed via direct diff that the four ~380-line blocks differed only in:
+which `PaperPolicy` variant gets seeded; the `Stats` type and its `{name}_hybrid_stats()` accessor's
+name; one admission-rule branch inside `set()` (lru always fast; lfu conditionally slow via
+`is_new && lfu_hybrid_admission_latched()`; two_q always slow; fifo looks up an *existing* key's
+current tier directly — the one design whose rule isn't purely a function of "is this key new"); and
+`two_q_hybrid_cache`'s extra `k_in: f64` constructor parameter (`HybridPolicy::ExtraConfig`, `()` for
+the other three). One shared generic block now carries every method except `new`/`with_hasher`/the
+stats accessor; four tiny per-feature blocks (kept in `lib.rs` itself rather than distributed into
+each hybrid module, simpler since inherent impls don't need to be co-located with their type) supply
+just those three, preserving each feature's distinct external name/signature (`paper-server`/
+`paper-benchmark-cxl` compatibility) unchanged. `lib.rs`: 4,872 → 3,914 lines.
+
+**Net result**: `lib.rs` 7,564 → 3,914 lines (48% reduction) across all three parts, zero change to
+the public API surface. Verified end-to-end: every storage-combo/hybrid-feature build listed in the
+"Layout"/feature-flag sections above still compiles and passes its full unit suite unchanged (83/81/
+84/81 non-hybrid; 91/91/91/92/92 hybrid, counts differ from the pre-refactor per-module baselines
+only because `--lib` now runs the whole crate's test binary rather than a module-filtered subset);
+all four hybrid integration suites pass twice in a row unchanged (15/15+2 ignored lru, 19/19 lfu,
+18/18 two_q, 14/14 fifo); the `hybridcache`/`tiering`/`eviction_stacks_pmem`/`jemalloc_cxl_slow_tier`
+untouched-feature regression builds and the `lru_hybrid_cache`+`lfu_hybrid_cache` mutual-exclusion
+`compile_error!` all still behave identically. `paper-benchmark-cxl` (external consumer, `path`-
+pointed at this checkout) builds clean in release mode against both its currently-configured feature
+set (`lru_hybrid_cache,jemalloc_cxl_slow_tier`) and `all_dram` — confirmed the public API surface it
+depends on is unaffected — but a full trace-driven run wasn't performed in this session (no `.bin`
+trace file was available in this sandbox to drive one); this is a lower-risk gap than it would be for
+a logic change, since nothing in `worker`/`allocator`/policy-stack code was touched — only the
+`PaperCache` API-layer inherent-method bodies were restructured, calling the exact same underlying
+functions as before.
+
+Two small, pre-existing (not introduced by this refactor, confirmed via side-by-side diff against
+the pre-Part-2 commit) issues were found and left alone as out of scope: a bare `key_value_pmem,
+sets_dram` build (without `enable_tiering_manager`) fails with a `WorkerManager::new` argument-count
+mismatch in `worker/manager.rs`; `key_value_pmem,enable_tiering_manager`/`multitiering,key_value_pmem`
+builds fine but their `--lib` test run hits an unrelated compile error inside `tiering/manager.rs`'s
+own test module (a `TieringManager::with_defaults()` type-inference failure and a `TieringConfig`
+missing-field literal). Also pre-existing: the doc-comment examples on the merged non-hybrid blocks
+(`PaperCache::<u32, u32>::new(...)`) were already failing as doctests before this refactor, since
+`u32` never satisfied the concrete `BufferDRAM`/`BufferPMEM` bound the original non-generic blocks
+required either.
