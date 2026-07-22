@@ -2051,7 +2051,7 @@ mod slow_tier_jemalloc_allocator {
     use std::ptr::NonNull;
     use std::sync::OnceLock;
 
-    use jemalloc_cxl::{create_cxl_arena, CxlAllocator, CxlArena, CxlArenaConfig, NumaPolicy};
+    use jemalloc_cxl::{create_cxl_arena, CxlAllocator, CxlArena, CxlArenaConfig, NumaPolicy, TcacheMode};
 
     /// NUMA node backing the slow tier, matching `tiered_buffer.rs`'s own
     /// `SLOW_TIER_NODE` constant (kept separate/duplicated rather than
@@ -2078,20 +2078,34 @@ mod slow_tier_jemalloc_allocator {
 
     unsafe impl Allocator for SlowTierJemallocAllocator {
         fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-            // Delegates directly to CxlAllocator's own nightly
-            // Allocator::allocate -- no bridging needed, both this type and
-            // CxlAllocator implement the same trait.
-            CxlAllocator::new(arena()).allocate(layout)
+            // TcacheMode::None (MALLOCX_TCACHE_NONE): TcacheMode::Automatic
+            // let jemalloc satisfy MALLOCX_ARENA(33) requests from the
+            // calling thread's own tcache, which is bound to whichever
+            // arena that thread was auto-assigned to (not this arena) --
+            // confirmed directly: instrumenting both this call site and the
+            // extent-hooks alloc callback showed 140,000+ successful
+            // "arena 33" allocations (totaling ~2.3 GB) against only ~8 MB
+            // of extents ever actually mapped/mbind'd for arena 33, and a
+            // corresponding real /proc/self/numa_maps read showed 0 MB on
+            // the target NUMA node despite `lru_hybrid_stats().slow_bytes_used`
+            // reporting multiple GB -- i.e. the data was silently served
+            // from the wrong (unbound) arena's cached memory, not genuinely
+            // NUMA-placed. MALLOCX_TCACHE_NONE forces every call to bypass
+            // the tcache and draw directly from the named arena's own
+            // extents, which is what actually makes the CXL/NUMA placement
+            // real rather than nominal.
+            CxlAllocator::with_tcache(arena(), TcacheMode::None).allocate(layout)
         }
 
         unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
             // SAFETY: caller upholds Allocator::deallocate's contract
             // (ptr/layout describe a still-live allocation previously
-            // returned by this same allocator's `allocate`).
-            // CxlAllocator::new(arena()) reconstructs the identical
-            // arena/tcache encoding on every call (arena() is cached, and
-            // CxlAllocator::new always uses TcacheMode::Automatic).
-            unsafe { CxlAllocator::new(arena()).deallocate(ptr, layout) }
+            // returned by this same allocator's `allocate`). Must match
+            // `allocate`'s TcacheMode::None exactly (see the README's "Don't
+            // mix allocation/deallocation APIs" section) -- deallocating
+            // with mismatched tcache flags is undefined per jemalloc's own
+            // contract.
+            unsafe { CxlAllocator::with_tcache(arena(), TcacheMode::None).deallocate(ptr, layout) }
         }
     }
 }
