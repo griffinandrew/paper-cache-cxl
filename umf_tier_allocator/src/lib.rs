@@ -75,6 +75,42 @@
 //! concurrent allocation pressure, as integrated by UMF). **Do not enable
 //! `jemalloc_pool` in production expecting it to be safe.**
 //!
+//! A third backend, initially promising but now also confirmed unsafe: the
+//! optional `disjoint_pool` feature exposes `umfDisjointPoolOps` -- UMF's
+//! *own* pool implementation, not a third-party allocator. Architecturally,
+//! it buckets allocations by size class and tracks each bucket's slabs
+//! individually with an explicit `capacity`; there is no cross-size-class
+//! extent coalescing at all, so it has no analog to the eset/pairing-heap
+//! code that crashed `jemalloc_pool`. A controlled 300k-object, 90%-freed
+//! reproduction showed real settled memory landing within ~1.23x of the
+//! true theoretical minimum (`slab_min_size` tuned near the real average
+//! object size), versus TBB's ~1.0x-of-*peak* under the identical test --
+//! and a standalone 24M-allocation/8-thread stress test (direct
+//! `TierAllocator::alloc` calls, not installed as `#[global_allocator]`)
+//! passed cleanly with correct checksums.
+//!
+//! **That standalone result did not hold up once wired into the real
+//! `paper-cache-cxl` integration.** A direct, minimal reproduction (`cargo
+//! +nightly test --test lru_hybrid_cache_integration --features
+//! lru_hybrid_cache,umf_disjoint_pool
+//! concurrent_set_from_multiple_threads_still_demotes -- --ignored
+//! --nocapture`, in that sibling crate): N threads concurrently calling
+//! `set()`, well within available memory on both nodes. TBB passes cleanly
+//! at every thread count tried; the disjoint pool passes at 2 and 4
+//! threads but reliably fails at 6+ with spurious allocation failures on
+//! **both** the fast tier's global-allocator pool (node 0) and the slow
+//! tier's independent explicit-`alloc_on` pool (node 1) simultaneously --
+//! two separate pool instances failing together rules out ordinary
+//! per-node memory exhaustion and points at a genuine concurrency bug
+//! inside `umfDisjointPoolOps` itself. The standalone stress test evidently
+//! never exercised the real pattern of this pool serving as the *entire*
+//! process's global allocator under the full, varied allocation traffic a
+//! real multi-threaded Rust program generates (thread stacks, hashmap
+//! bucket growth, channel internals, etc., not just a narrow fixed set of
+//! explicitly-sized test buffers). **Do not enable `disjoint_pool` in
+//! production** until this is root-caused or fixed upstream in UMF --
+//! TBB remains the only backend proven stable under real concurrent load.
+//!
 //! # Dual access: `#[global_allocator]` vs explicit `alloc_on`
 //!
 //! [`NumaAllocator`] and the free functions in this module ([`alloc_on`],

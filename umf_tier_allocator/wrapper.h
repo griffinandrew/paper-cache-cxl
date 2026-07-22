@@ -6,6 +6,7 @@
 #include <umf/memory_provider.h>
 #include <umf/providers/provider_os_memory.h>
 #include <umf/pools/pool_scalable.h>
+#include <umf/pools/pool_disjoint.h>
 
 #ifdef TIER_ALLOCATOR_WITH_JEMALLOC_POOL
 #include <umf/pools/pool_jemalloc.h>

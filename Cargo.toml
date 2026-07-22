@@ -138,6 +138,28 @@ jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl", "jemalloc_cxl/own_global_allocator
 # this file's CLAUDE.md history) -- re-test before trusting under real load.
 umf_jemalloc_pool = ["tier_allocator/jemalloc_pool"]
 
+# Alternative backend for the four hybrid-cache features' TieredBuffer:
+# swaps tier_allocator's UMF pool backend from Intel TBB to UMF's own
+# disjoint pool (umfDisjointPoolOps), used uniformly for both tiers via the
+# same shared per-node registry (same "used exactly like TBB" pattern as
+# umf_jemalloc_pool above). UMF's own native pool implementation (no
+# third-party allocator's extent-coalescing machinery involved at all), and
+# a controlled 300k-object/90%-freed repro showed real memory reclaim TBB
+# structurally cannot (settled within ~1.23x of the true theoretical
+# minimum vs. TBB's ~1.0x of peak) -- BUT confirmed unsafe under real
+# concurrent load: a direct reproduction against this crate's own
+# lru_hybrid_cache_integration test (N concurrent set() threads, well
+# within available memory) passes at 2/4 threads but reliably fails at 6+
+# with spurious allocation failures on both the fast-tier global allocator
+# (node 0) and the slow tier's independent alloc_on pool (node 1)
+# simultaneously -- a genuine concurrency bug inside umfDisjointPoolOps
+# itself, not this crate's integration. See umf_tier_allocator/src/lib.rs
+# and TierAllocator::new_numa_disjoint's doc comment for the full writeup
+# and exact repro command. Do not enable in production. Mutually exclusive
+# with umf_jemalloc_pool (tier_allocator's own compile_error! guard
+# enforces this).
+umf_disjoint_pool = ["tier_allocator/disjoint_pool"]
+
 #to emnable 3 tier based data movement
 hashtable_tiering = [] 
 

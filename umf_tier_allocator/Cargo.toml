@@ -18,3 +18,11 @@ bindgen = "0.72.1"
 # the only backend proven stable under real concurrent load in this
 # environment (UMF 1.0.3).
 jemalloc_pool = []
+
+# Opt-in: routes the shared per-node registry through UMF's own disjoint
+# pool (umfDisjointPoolOps) instead of TBB. Unlike jemalloc_pool, this is
+# UMF's own native implementation (no third-party allocator's extent/eset
+# machinery involved) and offers real, measured memory reclaim TBB
+# structurally cannot (see src/lib.rs's doc comment). Mutually exclusive
+# with jemalloc_pool -- see registry.rs's compile_error! guard.
+disjoint_pool = []

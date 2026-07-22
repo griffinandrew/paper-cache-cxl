@@ -172,6 +172,99 @@ impl TierAllocator {
         }
     }
 
+    /// Constructs a `TierAllocator` bound to NUMA node `node`, backed by
+    /// UMF's own disjoint pool (`umfDisjointPoolOps`) instead of TBB or
+    /// jemalloc.
+    ///
+    /// # ⚠️ Stability warning
+    ///
+    /// Initially promising, now confirmed unsafe under real concurrent
+    /// load. A controlled 300k-object repro showed genuinely excellent
+    /// memory reclaim (settled real memory within ~1.23x of the true
+    /// theoretical minimum after 90% freed, versus TBB's ~1.0x-of-peak --
+    /// i.e. no reclaim at all -- under the identical test), and a
+    /// standalone 24M-allocation/8-thread stress test (direct `alloc()`
+    /// calls, not installed as `#[global_allocator]`) passed cleanly.
+    /// **That result did not hold up once wired into the real
+    /// `paper-cache-cxl` integration**: a direct reproduction (N threads
+    /// concurrently calling `set()`, well within available memory on both
+    /// nodes) passes at 2 and 4 threads but reliably fails at 6+ with
+    /// spurious allocation failures on **both** the fast tier's
+    /// global-allocator pool (node 0) *and* the slow tier's independent
+    /// explicit-`alloc_on` pool (node 1) simultaneously -- two separate
+    /// pool instances failing together rules out ordinary per-node memory
+    /// exhaustion and points at a genuine concurrency bug inside
+    /// `umfDisjointPoolOps` itself. See the crate-level doc comment for
+    /// the full writeup and exact repro command. **Do not use this
+    /// constructor in production expecting it to be safe.**
+    pub fn new_numa_disjoint(
+        node: i32,
+        slab_min_size: usize,
+        max_poolable_size: usize,
+        capacity: usize,
+    ) -> Result<Self, TierAllocError> {
+        unsafe {
+            let mut provider_params: ffi::umf_os_memory_provider_params_handle_t = ptr::null_mut();
+            check(
+                ffi::umfOsMemoryProviderParamsCreate(&mut provider_params),
+                TierAllocError::ProviderParamsCreate,
+            )?;
+
+            let mut numa_list: [u32; 1] = [node as u32];
+            if let Err(e) = check(
+                ffi::umfOsMemoryProviderParamsSetNumaList(provider_params, numa_list.as_mut_ptr(), 1),
+                TierAllocError::ProviderParamsSetNumaList,
+            ) {
+                ffi::umfOsMemoryProviderParamsDestroy(provider_params);
+                return Err(e);
+            }
+            if let Err(e) = check(
+                ffi::umfOsMemoryProviderParamsSetNumaMode(provider_params, ffi::umf_numa_mode_t_UMF_NUMA_MODE_BIND),
+                TierAllocError::ProviderParamsSetNumaMode,
+            ) {
+                ffi::umfOsMemoryProviderParamsDestroy(provider_params);
+                return Err(e);
+            }
+
+            let mut provider: ffi::umf_memory_provider_handle_t = ptr::null_mut();
+            let create_provider_rc = ffi::umfMemoryProviderCreate(
+                ffi::umfOsMemoryProviderOps(),
+                provider_params as *const _,
+                &mut provider,
+            );
+            ffi::umfOsMemoryProviderParamsDestroy(provider_params);
+            check(create_provider_rc, TierAllocError::ProviderCreate)?;
+
+            let mut pool_params: ffi::umf_disjoint_pool_params_handle_t = ptr::null_mut();
+            if let Err(e) = check(
+                ffi::umfDisjointPoolParamsCreate(&mut pool_params),
+                TierAllocError::DisjointPoolParamsCreate,
+            ) {
+                ffi::umfMemoryProviderDestroy(provider);
+                return Err(e);
+            }
+            ffi::umfDisjointPoolParamsSetSlabMinSize(pool_params, slab_min_size);
+            ffi::umfDisjointPoolParamsSetMaxPoolableSize(pool_params, max_poolable_size);
+            ffi::umfDisjointPoolParamsSetCapacity(pool_params, capacity);
+
+            let mut pool: ffi::umf_memory_pool_handle_t = ptr::null_mut();
+            let create_pool_rc = ffi::umfPoolCreate(
+                ffi::umfDisjointPoolOps(),
+                provider,
+                pool_params as *const _,
+                ffi::umf_pool_create_flag_t_UMF_POOL_CREATE_FLAG_OWN_PROVIDER,
+                &mut pool,
+            );
+            ffi::umfDisjointPoolParamsDestroy(pool_params);
+            if let Err(e) = check(create_pool_rc, TierAllocError::PoolCreate) {
+                ffi::umfMemoryProviderDestroy(provider);
+                return Err(e);
+            }
+
+            Ok(TierAllocator { pool, node })
+        }
+    }
+
     /// The NUMA node this allocator is bound to.
     #[must_use]
     pub fn node(&self) -> i32 {

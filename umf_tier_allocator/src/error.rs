@@ -45,6 +45,11 @@ pub enum TierAllocError {
     #[error("umfJemallocPoolParamsCreate failed: {0:?}")]
     JemallocPoolParamsCreate(umf_result_t),
 
+    /// Disjoint-pool-specific construction errors (experimental probe,
+    /// `TierAllocator::new_numa_disjoint`).
+    #[error("umfDisjointPoolParamsCreate failed: {0:?}")]
+    DisjointPoolParamsCreate(umf_result_t),
+
     /// Requested NUMA node is outside the shared registry's supported range
     /// (see `registry::MAX_NODES`). Distinct from a `TierAllocator::new_numa`
     /// failure: that constructor accepts any `i32` and only fails lazily at

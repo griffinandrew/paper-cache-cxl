@@ -696,4 +696,75 @@ mod lru_hybrid_cache_tests {
 
         let _ = decayed_node1_mb;
     }
+
+    /// Diagnostic (not part of the default suite) that isolated a real,
+    /// serious concurrency bug in UMF's disjoint pool (`umf_disjoint_pool`
+    /// feature): under this exact test (N threads concurrently calling
+    /// `set()`, well within available memory on both nodes -- ~6.4GB total
+    /// against nodes with 50GB/124GB respectively), TBB (the default
+    /// backend) passes cleanly at every thread count tried (2/4/6/8+); the
+    /// disjoint pool passes at 2 and 4 threads but reliably fails at 6+
+    /// with spurious `AllocFailed`/`UMF alloc failed` errors on **both**
+    /// the fast tier's global allocator (node 0) and the slow tier's
+    /// explicit `alloc_on` pool (node 1) -- two structurally independent
+    /// pool instances failing together rules out simple node-level memory
+    /// exhaustion and points at a genuine concurrency bug inside
+    /// `umfDisjointPoolOps` itself, not this crate's integration of it.
+    /// This directly contradicts the standalone (non-`#[global_allocator]`,
+    /// narrower size-class) 24M-allocation/8-thread stress test that passed
+    /// cleanly earlier in this investigation -- that test evidently didn't
+    /// exercise the real production pattern of disjoint pool serving as
+    /// the *entire* process's global allocator under the full, varied
+    /// allocation traffic a real multi-threaded Rust program generates.
+    /// **Do not enable `umf_disjoint_pool` in production** until this is
+    /// root-caused or fixed upstream in UMF.
+    #[test]
+    #[ignore]
+    fn concurrent_set_from_multiple_threads_still_demotes() {
+        ensure_pmem_allocator_warm();
+
+        const THREADS: u64 = 8;
+        const PER_THREAD: u64 = 50_000;
+        const VALUE_LEN: usize = 16 * 1024;
+
+        let cache = std::sync::Arc::new(
+            PaperCache::<u64, TieredBuffer>::new(24 * 1_073_741_824, CacheTierSize::Gb(1))
+                .expect("cache should construct"),
+        );
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let cache = std::sync::Arc::clone(&cache);
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let key = t * PER_THREAD + i;
+                        let value = vec![(key % 256) as u8; VALUE_LEN];
+                        cache.set(key, &value, None).expect("set should succeed");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread should not panic");
+        }
+
+        let settled = wait_until(std::time::Duration::from_secs(60), || {
+            let stats = cache.lru_hybrid_stats();
+            let status = cache.status().expect("status should be available");
+            let processed = stats.fast_objects + stats.slow_objects;
+            println!(
+                "... processed {processed}/{} fast={} slow={} demotions={}",
+                status.num_objects(), stats.fast_objects, stats.slow_objects, stats.demotions,
+            );
+            processed == status.num_objects()
+        });
+        assert!(settled, "worker should process every inserted object within 60s");
+
+        let stats = cache.lru_hybrid_stats();
+        println!(
+            "FINAL: fast_objects={} slow_objects={} demotions={} fast_bytes_used={} slow_bytes_used={}",
+            stats.fast_objects, stats.slow_objects, stats.demotions, stats.fast_bytes_used, stats.slow_bytes_used,
+        );
+        assert!(stats.demotions > 0, "expected real demotions once the 1GB fast tier filled -- got 0");
+    }
 }

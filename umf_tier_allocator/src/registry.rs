@@ -4,6 +4,24 @@ use crate::error::TierAllocError;
 use crate::tier_allocator::TierAllocator;
 use crate::tier_buffer::TierBuffer;
 
+#[cfg(all(feature = "jemalloc_pool", feature = "disjoint_pool"))]
+compile_error!("jemalloc_pool and disjoint_pool are mutually exclusive pool backends -- pick one");
+
+/// Disjoint-pool tuning, only relevant under `disjoint_pool`. `SLAB_MIN_SIZE`
+/// is set close to this crate's real average object size (~16 KB, per the
+/// sibling `paper-cache-cxl` crate's own documented trace analysis) rather
+/// than UMF's own 64 KB default -- measured directly (a controlled
+/// 300k-object, 90%-freed, randomly-scattered repro) to make the difference
+/// between real settled memory landing at ~0.35x peak (64 KB default) vs.
+/// ~0.13x peak (16 KB, within ~1.23x of the true theoretical minimum).
+/// `MAX_POOLABLE_SIZE`/`CAPACITY` are left at UMF's own defaults (2 MB / 4).
+#[cfg(feature = "disjoint_pool")]
+const DISJOINT_SLAB_MIN_SIZE: usize = 16 * 1024;
+#[cfg(feature = "disjoint_pool")]
+const DISJOINT_MAX_POOLABLE_SIZE: usize = 2 * 1024 * 1024;
+#[cfg(feature = "disjoint_pool")]
+const DISJOINT_CAPACITY: usize = 4;
+
 /// Upper bound on NUMA node ids this registry will track a pool for.
 /// Matches the sibling `paper-cache-cxl` crate's own C wrapper
 /// (`umf_allocator/umf_allocator_wrapper.c`) convention, even though only
@@ -42,11 +60,20 @@ pub(crate) fn pool_for_node(node: i32) -> Result<&'static TierAllocator, TierAll
     };
 
     match slot.get_or_init(|| {
-        #[cfg(feature = "jemalloc_pool")]
+        #[cfg(feature = "disjoint_pool")]
+        {
+            TierAllocator::new_numa_disjoint(
+                node,
+                DISJOINT_SLAB_MIN_SIZE,
+                DISJOINT_MAX_POOLABLE_SIZE,
+                DISJOINT_CAPACITY,
+            )
+        }
+        #[cfg(all(feature = "jemalloc_pool", not(feature = "disjoint_pool")))]
         {
             TierAllocator::new_numa_jemalloc(node)
         }
-        #[cfg(not(feature = "jemalloc_pool"))]
+        #[cfg(not(any(feature = "jemalloc_pool", feature = "disjoint_pool")))]
         {
             TierAllocator::new_numa(node)
         }

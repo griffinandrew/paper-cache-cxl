@@ -44,7 +44,7 @@ fn main() {
     }
 
     builder = builder
-        .allowlist_function("umf(Memory(Provider|Pool).*|OsMemoryProvider.*|Pool.*|ScalablePool.*|Jemalloc.*|Free)")
+        .allowlist_function("umf(Memory(Provider|Pool).*|OsMemoryProvider.*|Pool.*|ScalablePool.*|Jemalloc.*|Disjoint.*|Free)")
         .allowlist_type("umf_.*")
         .allowlist_var("UMF_.*")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
