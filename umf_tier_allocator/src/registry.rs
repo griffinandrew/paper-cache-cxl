@@ -41,7 +41,16 @@ pub(crate) fn pool_for_node(node: i32) -> Result<&'static TierAllocator, TierAll
         return Err(TierAllocError::InvalidNode { node });
     };
 
-    match slot.get_or_init(|| TierAllocator::new_numa(node)) {
+    match slot.get_or_init(|| {
+        #[cfg(feature = "jemalloc_pool")]
+        {
+            TierAllocator::new_numa_jemalloc(node)
+        }
+        #[cfg(not(feature = "jemalloc_pool"))]
+        {
+            TierAllocator::new_numa(node)
+        }
+    }) {
         Ok(allocator) => Ok(allocator),
         Err(e) => Err(*e),
     }

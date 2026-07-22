@@ -123,6 +123,21 @@ eviction_stacks_pmem = ["dep:jemalloc_cxl"]
 # actually called in this configuration.
 jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl", "jemalloc_cxl/own_global_allocator"]
 
+# Alternative backend for the four hybrid-cache features' TieredBuffer:
+# swaps tier_allocator's UMF pool backend from Intel TBB (umfScalablePoolOps,
+# the default) to UMF's own jemalloc pool (umfJemallocPoolOps), used
+# uniformly for both tiers via the same shared per-node registry -- i.e.
+# jemalloc used exactly the way TBB is used today (one pool per node,
+# NumaAllocator's #[global_allocator] for the fast tier and explicit
+# tier_allocator::alloc_on for the slow tier both draw from it), NOT the
+# separate custom-extent-hooks jemalloc_cxl crate `jemalloc_cxl_slow_tier`
+# uses. Requested explicitly despite tier_allocator's own documented
+# stability warning on this UMF pool backend (three prior real-concurrent-
+# load crashes inside UMF's own critnib memory tracker, root-caused to UMF
+# 1.0.3 itself, not caller code -- see umf_tier_allocator/src/lib.rs and
+# this file's CLAUDE.md history) -- re-test before trusting under real load.
+umf_jemalloc_pool = ["tier_allocator/jemalloc_pool"]
+
 #to emnable 3 tier based data movement
 hashtable_tiering = [] 
 

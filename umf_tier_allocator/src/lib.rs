@@ -53,13 +53,26 @@
 //! backend proven stable under real concurrent load against this UMF build
 //! in the sibling `paper-cache-cxl` crate's own testing (see that crate's
 //! `CLAUDE.md`). The optional `jemalloc_pool` feature exposes
-//! `umfJemallocPoolOps` for experimentation ONLY -- it has crashed three
+//! `umfJemallocPoolOps` for experimentation ONLY -- it has crashed **four**
 //! separate times under real concurrent multi-threaded load on this exact
 //! UMF version (1.0.3): twice with a SIGSEGV inside UMF's own critnib
 //! memory-tracker during jemalloc's internal extent-splitting, once with a
 //! corrupted/torn allocation-failure message under concurrent heap
-//! pressure. All three were root-caused to UMF's own prebuilt library, not
-//! caller code, and are not fixable from this wrapper. **Do not enable
+//! pressure, and once (this crate's own `registry.rs` wired to use
+//! `new_numa_jemalloc` uniformly for both `NumaAllocator`'s
+//! `#[global_allocator]` role and explicit `alloc_on` -- i.e. jemalloc used
+//! exactly the way TBB is used by default) with a SIGSEGV inside jemalloc's
+//! *own* internal extent-coalescing code (`ph_remove` /
+//! `je_edata_heap_remove` / `extent_coalesce`, a null-pointer dereference in
+//! jemalloc's pairing-heap free-extent tracking, confirmed via `gdb -batch
+//! -ex run -ex "thread apply all bt full"` against the real
+//! `paper-benchmark-cxl` benchmark, `-c 8`, a 14M-access real trace,
+//! `lru_hybrid_cache` + `umf_jemalloc_pool`). All four were root-caused to
+//! UMF's own prebuilt library and/or jemalloc's own internals as wired by
+//! UMF, not caller code, and are not fixable from this wrapper -- the newest
+//! crash is in a genuinely different function than the first three, but the
+//! same overall subsystem (jemalloc extent/free-list management under real
+//! concurrent allocation pressure, as integrated by UMF). **Do not enable
 //! `jemalloc_pool` in production expecting it to be safe.**
 //!
 //! # Dual access: `#[global_allocator]` vs explicit `alloc_on`

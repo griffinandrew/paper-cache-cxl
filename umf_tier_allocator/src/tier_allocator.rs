@@ -191,15 +191,21 @@ impl TierAllocator {
     ///
     /// # ⚠️ Stability warning
     ///
-    /// UMF's jemalloc pool (`umfJemallocPoolOps`) has crashed three separate
+    /// UMF's jemalloc pool (`umfJemallocPoolOps`) has crashed four separate
     /// times under real concurrent multi-threaded load on this exact UMF
     /// version (1.0.3), in the sibling `paper-cache-cxl` crate's own
     /// testing: twice a SIGSEGV inside UMF's own critnib memory-tracker
     /// during jemalloc's internal extent-splitting, once a corrupted/torn
-    /// allocation-failure message under concurrent heap pressure. All three
-    /// were root-caused to bugs inside UMF's own prebuilt library, not
-    /// caller code, and are not fixable from this wrapper. **Do not use
-    /// this constructor in production expecting it to be safe** -- it
+    /// allocation-failure message under concurrent heap pressure, and once
+    /// (with this same constructor wired into `registry.rs` uniformly for
+    /// both tiers, mirroring TBB's default usage) a SIGSEGV inside
+    /// jemalloc's own extent-coalescing code (`ph_remove` --
+    /// `include/jemalloc/internal/ph.h`, a null-pointer deref in its
+    /// pairing-heap free-extent tracking). All four were root-caused to bugs
+    /// inside UMF's own prebuilt library and/or jemalloc's internals as
+    /// wired by UMF, not caller code, and are not fixable from this wrapper.
+    /// **Do not use this constructor in production expecting it to be
+    /// safe** -- it
     /// exists only for experimentation/future re-testing against a UMF
     /// version that has actually fixed the underlying bug.
     #[cfg(feature = "jemalloc_pool")]
