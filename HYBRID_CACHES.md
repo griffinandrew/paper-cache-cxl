@@ -231,8 +231,8 @@ pure value-budget behavior) and is set via `with_shared_overhead(...)` only by
 `init_policy_stack`, which computes the real value from
 `object::overhead::get_hybrid_dram_shared_overhead(&policy)`:
 
-- `HASHTABLE_ENTRY_OVERHEAD = 11` bytes, included unless `global_hashtable_pmem`/
-  `global_flatmap_pmem` moves the object map to PMEM.
+- `HASHTABLE_ENTRY_OVERHEAD = 11` bytes, included unless `global_hashtable_pmem`
+  moves the object map to PMEM.
 - `LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD = 64` / `LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD = 93`
   bytes, included unless `eviction_stacks_pmem` moves the eviction stacks to PMEM. (Both dropped —
   from 84/113 — after `LruHybridStack`/`LfuHybridStack` combined their separate `tiers`+`sizes`

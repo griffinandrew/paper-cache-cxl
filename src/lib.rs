@@ -6,13 +6,9 @@
  * correct
  */
 
-#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump", feature = "jemalloc_cxl_slow_tier"), feature(allocator_api), feature(clone_from_ref))]
+#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump", feature = "jemalloc_cxl_slow_tier"), feature(allocator_api), feature(clone_from_ref))]
 
-//#![cfg_attr(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump"), feature(allocator_api))]
-
-// Validate that both global_flatmap_dram and global_flatmap_pmem are not enabled together
-#[cfg(all(feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
-compile_error!("Cannot enable both 'global_flatmap_dram' and 'global_flatmap_pmem' features simultaneously. Please choose only one FlatMap mode for the global hashtable.");
+//#![cfg_attr(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump"), feature(allocator_api))]
 
 // `lru_hybrid_cache`, `lfu_hybrid_cache`, `two_q_hybrid_cache`, and
 // `fifo_hybrid_cache` each define their own inherent methods (`new`, `get`,
@@ -41,12 +37,6 @@ compile_error!("Cannot enable both 'fifo_hybrid_cache' and 'two_q_hybrid_cache' 
 #[cfg(all(feature = "hashbrown_dram", feature = "global_hashtable_pmem"))]
 compile_error!("Cannot enable both 'hashbrown_dram' and 'global_hashtable_pmem' features simultaneously. Please choose only one global hashtable mode.");
 
-#[cfg(all(feature = "hashbrown_dram", feature = "global_flatmap_dram"))]
-compile_error!("Cannot enable both 'hashbrown_dram' and 'global_flatmap_dram' features simultaneously. Please choose only one global hashtable mode.");
-
-#[cfg(all(feature = "hashbrown_dram", feature = "global_flatmap_pmem"))]
-compile_error!("Cannot enable both 'hashbrown_dram' and 'global_flatmap_pmem' features simultaneously. Please choose only one global hashtable mode.");
-
 // When all_dram is enabled, use jemalloc as the global allocator
 //#[cfg(feature = "all_dram")]
 //use tikv_jemallocator::Jemalloc;
@@ -56,19 +46,19 @@ compile_error!("Cannot enable both 'hashbrown_dram' and 'global_flatmap_pmem' fe
 //static GLOBAL: Jemalloc = Jemalloc;
 
 
-#[cfg(any(feature = "hashbrown_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump", feature = "all_dram", feature = "jemalloc_cxl_slow_tier"))]
+#[cfg(any(feature = "hashbrown_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump", feature = "all_dram", feature = "jemalloc_cxl_slow_tier"))]
 pub mod allocator;
 
 
 /*
 #[cfg(all(
-    any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"),
+    any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"),
     any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator")
 ))]
 use crate::allocator::RegionHybrid as Hybrid;
 
 #[cfg(all(
-    any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"),
+    any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"),
     not(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))
 ))]
 use crate::allocator::HybridObjects as Hybrid;
@@ -84,8 +74,6 @@ use std::arch::x86_64::{_mm_clflush, _mm_sfence};
         feature = "key_value_pmem",
         feature = "global_hashtable_pmem",
         feature = "tiering_hashtable_pmem",
-        feature = "flatmap_pmem",
-        feature = "global_flatmap_pmem",
         feature = "eviction_stacks_pmem",
         feature = "pmem_region_alloc",
         feature = "region_hybrid_allocator",
@@ -100,8 +88,6 @@ use crate::allocator::DevDaxBump as Hybrid;
         feature = "key_value_pmem",
         feature = "global_hashtable_pmem",
         feature = "tiering_hashtable_pmem",
-        feature = "flatmap_pmem",
-        feature = "global_flatmap_pmem",
         feature = "eviction_stacks_pmem",
         feature = "pmem_region_alloc",
         feature = "region_hybrid_allocator",
@@ -118,8 +104,6 @@ use crate::allocator::RegionHybrid as Hybrid;
 		feature = "key_pmem_value_pmem",
         feature = "global_hashtable_pmem",
         feature = "tiering_hashtable_pmem",
-        feature = "flatmap_pmem",
-        feature = "global_flatmap_pmem",
         feature = "eviction_stacks_pmem",
         feature = "pmem_region_alloc",
         feature = "region_hybrid_allocator",
@@ -140,7 +124,7 @@ use crate::allocator::HybridObjects as Hybrid;
 // The build script guarantees that the UMF C symbols are always present:
 // either the real UMF library (when wrapper.h exists) or the stub
 // implementation (umf_stub.c, using malloc/free) when UMF is unavailable.
-#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "flatmap_pmem", feature = "global_flatmap_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
 mod allocator_bindings {
     include!("umf_allocator_bindings.rs"); // UMF extern "C" declarations
 }
@@ -181,10 +165,6 @@ pub use crate::tiered_buffer::TieredBuffer;
 
 #[cfg(any(all(feature = "key_value_pmem", feature = "enable_tiering_manager"), all(feature = "key_value_pmem", feature = "sets_dram")))]
 pub mod tiering;
-
-// FlatMap module - high-performance Linear Probing Hash Map for PMEM/DRAM
-#[cfg(any(feature = "flatmap_dram", feature = "flatmap_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
-pub mod flatmap;
 
 #[cfg(feature = "hw_perf")]
 pub mod hw_perf_counters;
@@ -260,8 +240,6 @@ use std::{
 #[cfg(any(
 	feature = "global_hashtable_pmem",
 	feature = "hashbrown_dram",
-	feature = "global_flatmap_dram",
-	feature = "global_flatmap_pmem",
 ))]
 use std::sync::RwLock;
 
@@ -376,19 +354,11 @@ use std::alloc::{Layout, Allocator}; // Essential imports
 pub type BufferDRAM = Box<[u8]>;
 
 
-#[cfg(all(not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram"), not(feature = "global_flatmap_pmem"), not(feature = "hashbrown_dram")))]
+#[cfg(all(not(feature = "global_hashtable_pmem"), not(feature = "hashbrown_dram")))]
 pub type ObjectMapRef<K, V> = Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>;
 
-#[cfg(all(feature = "global_hashtable_pmem", not(feature = "global_flatmap_pmem")))]
+#[cfg(feature = "global_hashtable_pmem")]
 pub type ObjectMapRef<K, V> = Arc<RwLock<HashMap<HashedKey, Object<K, V>, BuildHasherDefault<NoHashHasher<HashedKey>>, Hybrid>>>;
-
-// FlatMap in DRAM (alternative to DashMap)
-#[cfg(feature = "global_flatmap_dram")]
-pub type ObjectMapRef<K, V> = Arc<RwLock<crate::flatmap::FlatMapWithHasher<HashedKey, Object<K, V>, NoHasher>>>;
-
-// FlatMap in PMEM (alternative to HashMap with Hybrid allocator)
-#[cfg(feature = "global_flatmap_pmem")]
-pub type ObjectMapRef<K, V> = Arc<RwLock<crate::flatmap::FlatMapWithHasher<HashedKey, Object<K, V>, NoHasher, Hybrid>>>;
 
 // Hashbrown HashMap in DRAM (for performance comparison with global_hashtable_pmem)
 #[cfg(feature = "hashbrown_dram")]
@@ -537,37 +507,16 @@ where
 			return Err(CacheError::UnconfiguredPolicy);
 		}
 
-		#[cfg(all(not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram"), not(feature = "global_flatmap_pmem"), not(feature = "hashbrown_dram")))]
+		#[cfg(all(not(feature = "global_hashtable_pmem"), not(feature = "hashbrown_dram")))]
 		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
-		
-		#[cfg(all(feature = "global_hashtable_pmem", not(feature = "global_flatmap_pmem")))]
+
+		#[cfg(feature = "global_hashtable_pmem")]
 		let objects = Arc::new(RwLock::new(HashMap::with_hasher_in(NoHasher::default(), Hybrid)));
-		
+
 		// Hashbrown HashMap in DRAM (for performance comparison)
 		#[cfg(feature = "hashbrown_dram")]
 		let objects = Arc::new(RwLock::new(HashMap::with_hasher(NoHasher::default())));
-		
-		// FlatMap in DRAM: Use a capacity based on max_size with 2x overhead for low load factor
-		// Capacity must be power of 2, so we find the next power of 2 >= (max_size * 2)
-		#[cfg(feature = "global_flatmap_dram")]
-		let objects = {
-			// Estimate number of objects based on average object size (conservative estimate: 1KB per object)
-			let estimated_objects = (max_size / 1024).max(1024) as usize;
-			// Double for low load factor and find next power of 2
-			let capacity = (estimated_objects * 2).next_power_of_two();
-			Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_and_hasher_unchecked(capacity, NoHasher::default())))
-		};
-		
-		// FlatMap in PMEM: Use a capacity based on max_size with 2x overhead for low load factor
-		#[cfg(feature = "global_flatmap_pmem")]
-		let objects = {
-			// Estimate number of objects based on average object size (conservative estimate: 1KB per object)
-			let estimated_objects = (max_size / 1024).max(1024) as usize;
-			// Double for low load factor and find next power of 2
-			let capacity = (estimated_objects * 2).next_power_of_two();
-			Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_hasher_in(capacity, NoHasher::default(), Hybrid)))
-		};
-		
+
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
@@ -1080,7 +1029,7 @@ where
 /// 
 /// 
 
-#[cfg(all(feature = "all_dram", not(feature = "global_flatmap_dram")))]
+#[cfg(feature = "all_dram")]
 impl<K, S> PaperCache<K, BufferDRAM, S>
 where
 	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug, //note added Debug for logging might impact perf thoooo
@@ -1801,7 +1750,7 @@ where
 
 
 
-#[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_pmem")))]
+#[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem")))]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
     K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
@@ -2742,7 +2691,7 @@ where
 
 // Implementation for global_hashtable_pmem alone (without key_value_pmem)
 // This case uses BufferDRAM for values (data in DRAM) but hashtable in PMEM
-#[cfg(all(feature = "global_hashtable_pmem", not(feature = "key_value_pmem"), not(feature = "global_flatmap_pmem")))]
+#[cfg(all(feature = "global_hashtable_pmem", not(feature = "key_value_pmem")))]
 impl<K, S> PaperCache<K, BufferDRAM, S>
 where
     K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone,
@@ -3407,7 +3356,7 @@ where
 }
 
 
-#[cfg(all(feature = "key_value_pmem", feature = "global_hashtable_pmem", not(feature = "global_flatmap_pmem")))]
+#[cfg(all(feature = "key_value_pmem", feature = "global_hashtable_pmem"))]
 impl<K, S> PaperCache<K, BufferPMEM, S>
 where
     K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone, //note added Debug for logging might impact perf thoooo
@@ -4071,839 +4020,6 @@ where
 	}
 }
 
-#[cfg(all(feature = "global_flatmap_pmem", not(feature = "key_value_pmem"), not(feature = "global_hashtable_pmem")))]
-impl<K, S> PaperCache<K, BufferDRAM, S>
-where
-    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Default,
-    S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` with maximum size `max_size` and
-	/// eviction policy `policy`. If the maximum size is zero, a
-	/// [`CacheError`] will be returned.
-	pub fn new(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-	) -> Result<Self, CacheError> {
-		Self::with_hasher(
-			max_size,
-			policies,
-			policy,
-			Default::default(),
-		)
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher.
-	pub fn with_hasher(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		if policies.is_empty() {
-			return Err(CacheError::EmptyPolicies);
-		}
-
-		if policies.contains(&PaperPolicy::Auto) {
-			return Err(CacheError::ConfiguredAutoPolicy);
-		}
-
-		if policies.iter().is_multiset() {
-			return Err(CacheError::DuplicatePolicies);
-		}
-
-		if !policy.is_auto() && !policies.contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		// Global flatmap in PMEM using Hybrid allocator
-		//hardcoded estimated objects for PMEM global flatmap for now...
-		let estimated_objects = 1_500_000 as usize;
-		let capacity = (estimated_objects * 2).next_power_of_two();
-		let objects = Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_hasher_in_unchecked(
-			capacity,
-			NoHasher::default(),
-			Hybrid,
-		)));
-
-		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		let (worker_sender, worker_listener) = unbounded();
-
-		let mut worker_manager = WorkerManager::new(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-		)?;
-
-		thread::spawn(move || worker_manager.run());
-
-		let cache = PaperCache {
-			objects,
-			status,
-			worker_manager: Arc::new(worker_sender),
-			overhead_manager,
-			hasher,
-		};
-
-		Ok(cache)
-	}
-
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
-			},
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-		result
-	}
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		// Values stored in DRAM (BufferDRAM = Box<[u8]>)
-		let val_buf: BufferDRAM = value.into();
-		let object = Object::new(key, val_buf, ttl);
-
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.write().unwrap().insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
-
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.read().unwrap().get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let object = match objects_guard.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		self.objects.write().unwrap().clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
-	}
-}
-
-
-#[cfg(all(feature = "global_flatmap_dram", feature = "all_dram"))]
-impl<K, S> PaperCache<K, BufferDRAM, S>
-where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Default,
-	S: Default + Clone + BuildHasher,
-{
-	pub fn new(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-	) -> Result<Self, CacheError> {
-		Self::with_hasher(
-			max_size,
-			policies,
-			policy,
-			Default::default(),
-		)
-	}
-
-	pub fn with_hasher(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		if policies.is_empty() {
-			return Err(CacheError::EmptyPolicies);
-		}
-
-		if policies.contains(&PaperPolicy::Auto) {
-			return Err(CacheError::ConfiguredAutoPolicy);
-		}
-
-		if policies.iter().is_multiset() {
-			return Err(CacheError::DuplicatePolicies);
-		}
-
-		if !policy.is_auto() && !policies.contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		let estimated_objects = 1_500_000 as usize;
-		let capacity = (estimated_objects * 2).next_power_of_two();
-		let objects = Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_and_hasher_unchecked(
-			capacity,
-			NoHasher::default(),
-		)));
-
-		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		let (worker_sender, worker_listener) = unbounded();
-
-		let mut worker_manager = WorkerManager::new(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-		)?;
-
-		thread::spawn(move || worker_manager.run());
-
-		let cache = PaperCache {
-			objects,
-			status,
-			worker_manager: Arc::new(worker_sender),
-			overhead_manager,
-			hasher,
-		};
-
-		Ok(cache)
-	}
-
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
-			},
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		result
-	}
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
-		let object = Object::new(key, val_buf, ttl);
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.write().unwrap().insert_unchecked(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
-
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.read().unwrap().get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let object = match objects_guard.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let keys: Vec<_> = objects_guard.iter().map(|(k, _)| *k).collect();
-		for key in keys {
-			objects_guard.remove_unchecked(&key);
-		}
-		drop(objects_guard);
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
-	}
-}
-
-
-#[cfg(all(feature = "global_flatmap_pmem", feature = "key_value_pmem"))]
-impl<K, S> PaperCache<K, BufferPMEM, S>
-where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Default,
-	S: Default + Clone + BuildHasher,
-{
-	pub fn new(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-	) -> Result<Self, CacheError> {
-		Self::with_hasher(
-			max_size,
-			policies,
-			policy,
-			Default::default(),
-		)
-	}
-
-	pub fn with_hasher(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		if policies.is_empty() {
-			return Err(CacheError::EmptyPolicies);
-		}
-
-		if policies.contains(&PaperPolicy::Auto) {
-			return Err(CacheError::ConfiguredAutoPolicy);
-		}
-
-		if policies.iter().is_multiset() {
-			return Err(CacheError::DuplicatePolicies);
-		}
-
-		if !policy.is_auto() && !policies.contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-		
-		//hardcoded estimated objects for PMEM global flatmap for now...
-		let estimated_objects = 1_500_000 as usize;
-		let capacity = (estimated_objects * 2).next_power_of_two();
-		let objects = Arc::new(RwLock::new(crate::flatmap::FlatMapWithHasher::with_capacity_hasher_in_unchecked(
-			capacity,
-			NoHasher::default(),
-			Hybrid,
-		)));
-
-		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		let (worker_sender, worker_listener) = unbounded();
-
-		let mut worker_manager = WorkerManager::new(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-		)?;
-
-		thread::spawn(move || worker_manager.run());
-
-		let cache = PaperCache {
-			objects,
-			status,
-			worker_manager: Arc::new(worker_sender),
-			overhead_manager,
-			hasher,
-		};
-
-		Ok(cache)
-	}
-
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
-			},
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		result
-	}
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
-		let object = Object::new(key, val_buf, ttl);
-
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.write().unwrap().insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
-
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.read().unwrap().get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferPMEM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let object = match objects_guard.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let keys: Vec<_> = objects_guard.iter().map(|(k, _)| *k).collect();
-		for key in keys {
-			objects_guard.remove_unchecked(&key);
-		}
-		drop(objects_guard);
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
-	}
-}
-
 
 pub enum EraseKey<'a, K> {
 	Original(&'a K, HashedKey),
@@ -4911,7 +4027,7 @@ pub enum EraseKey<'a, K> {
 }
 
 
-#[cfg(all(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"), not(feature = "global_flatmap_dram"), not(feature = "global_flatmap_pmem")))]
+#[cfg(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 pub fn erase<K, V>(
 	objects: &ObjectMapRef<K, V>,
 	status: &StatusRef,
@@ -4971,62 +4087,6 @@ where
 }
 
 
-// FlatMap erase function - uses get/remove instead of entry API
-#[cfg(any(feature = "global_flatmap_dram", feature = "global_flatmap_pmem"))]
-pub fn erase<K, V>(
-	objects: &ObjectMapRef<K, V>,
-	status: &StatusRef,
-	overhead_manager: &OverheadManagerRef,
-	maybe_key: Option<EraseKey<K>>,
-) -> Result<(HashedKey, Object<K, V>), CacheError>
-where
-	K: Eq + TypeSize,
-	V: TypeSize,
-{
-	let hashed_key = match maybe_key {
-		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
-		Some(EraseKey::Hashed(hashed_key)) => hashed_key,
-
-		None => {
-			// the policy has run out of keys to evict (either it's a mini stack or
-			// something went wrong during policy reconstruction) so we fall back
-			// to evicting a random object
-
-			let objects_guard = objects.read().unwrap();
-			let Some((_key, _object)) = objects_guard.iter().next() else {
-				error!("Object store is empty with non-zero used size");
-				return Err(CacheError::Internal);
-			};
-
-			*_key
-		},
-	};
-
-	// Check if key exists and validate if we have the original key
-	let mut objects_lock = objects.write().unwrap();
-	
-	// Get the object to check if it exists and matches the key
-	let object_ref = objects_lock.get(&hashed_key).ok_or(CacheError::KeyNotFound)?;
-	
-	// If we have the original key, validate it matches
-	if let Some(EraseKey::Original(key, _)) = &maybe_key {
-		if !object_ref.key_matches(key) {
-			return Err(CacheError::KeyNotFound);
-		}
-	}
-	
-	// Remove the object using unchecked remove (doesn't require Clone/Default)
-	let object = objects_lock.remove_unchecked(&hashed_key).ok_or(CacheError::KeyNotFound)?;
-	let base_size = overhead_manager.base_size(&object) as i64;
-
-	status.update_base_used_size(-base_size);
-	status.decr_num_objects();
-
-	match !object.is_expired() {
-		true => Ok((hashed_key, object)),
-		false => Err(CacheError::KeyNotFound),
-	}
-}
 
 
 
@@ -5036,11 +4096,7 @@ where
 
 
 
-
-
-
-
-#[cfg(all(not(any(feature = "global_hashtable_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem", feature = "hashbrown_dram"))))]
+#[cfg(not(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram")))]
 pub fn erase<K, V>(
 	objects: &ObjectMapRef<K, V>,
 	status: &StatusRef,

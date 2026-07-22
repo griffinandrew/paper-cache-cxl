@@ -1073,8 +1073,7 @@ unsafe impl Allocator for RegionHybrid {
     any(
         feature = "global_hashtable_pmem",
         feature = "tiering_hashtable_pmem",
-        feature = "eviction_stacks_pmem",
-        feature = "global_flatmap_pmem"
+        feature = "eviction_stacks_pmem"
     )
 ))]
 unsafe impl allocator_api2::alloc::Allocator for RegionHybrid {
@@ -1324,8 +1323,7 @@ unsafe impl Allocator for RegionHybrid {
     any(
         feature = "global_hashtable_pmem",
         feature = "tiering_hashtable_pmem",
-        feature = "eviction_stacks_pmem",
-        feature = "global_flatmap_pmem"
+        feature = "eviction_stacks_pmem"
     )
 ))]
 unsafe impl allocator_api2::alloc::Allocator for RegionHybrid {
@@ -1509,8 +1507,7 @@ unsafe impl Allocator for DevDaxBump {
     any(
         feature = "global_hashtable_pmem",
         feature = "tiering_hashtable_pmem",
-        feature = "eviction_stacks_pmem",
-        feature = "global_flatmap_pmem"
+        feature = "eviction_stacks_pmem"
     )
 ))]
 unsafe impl allocator_api2::alloc::Allocator for DevDaxBump {
@@ -1777,8 +1774,7 @@ unsafe impl Allocator for DevDaxBump {
     any(
         feature = "global_hashtable_pmem",
         feature = "tiering_hashtable_pmem",
-        feature = "eviction_stacks_pmem",
-        feature = "global_flatmap_pmem"
+        feature = "eviction_stacks_pmem"
     )
 ))]
 unsafe impl allocator_api2::alloc::Allocator for DevDaxBump {

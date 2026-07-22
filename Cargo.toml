@@ -85,18 +85,6 @@ tiering_hashtable_pmem = []
 # Place global hashtable in PMEM (requires key_value_pmem)
 global_hashtable_pmem = []
 
-# FlatMap standalone module: High-performance Linear Probing Hash Map for DRAM
-flatmap_dram = []
-
-# FlatMap standalone module: High-performance Linear Probing Hash Map for PMEM
-flatmap_pmem = []
-
-# Use FlatMap as global hashtable in DRAM (alternative to DashMap)
-global_flatmap_dram = []
-
-# Use FlatMap as global hashtable in PMEM (alternative to HashMap with Hybrid allocator)
-global_flatmap_pmem = []
-
 # Use hashbrown HashMap as global hashtable in DRAM (for performance comparison)
 hashbrown_dram = []
 

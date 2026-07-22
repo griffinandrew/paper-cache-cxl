@@ -400,12 +400,17 @@ pub struct GlobalHwPerfCounters {
     
     #[cfg(feature = "global_hashtable_pmem")]
     pub global_hashbrown_pmem: HwHashMapCounters,
-    
-    #[cfg(feature = "global_flatmap_dram")]
-    pub global_flatmap_dram: HwHashMapCounters,
-    
-    #[cfg(feature = "global_flatmap_pmem")]
-    pub global_flatmap_pmem: HwHashMapCounters,
+
+    // Pre-existing bug fixed in passing (found while verifying the FlatMap
+    // removal, not caused by it -- confirmed via `git show HEAD` that this
+    // field was already missing before that removal): the constructor and
+    // accessor below both reference `dashmap_counters` under
+    // `not(any(hashbrown_dram, global_hashtable_pmem))`, but the struct
+    // never declared it, so any build enabling `hw_perf` without also
+    // enabling `hashbrown_dram`/`global_hashtable_pmem` (e.g. `all_dram,hw_perf`)
+    // failed to compile.
+    #[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem")))]
+    pub dashmap_counters: HwHashMapCounters,
 }
 
 impl GlobalHwPerfCounters {
@@ -416,14 +421,8 @@ impl GlobalHwPerfCounters {
             
             #[cfg(feature = "global_hashtable_pmem")]
             global_hashbrown_pmem: HwHashMapCounters::new(),
-            
-            #[cfg(feature = "global_flatmap_dram")]
-            global_flatmap_dram: HwHashMapCounters::new(),
-            
-            #[cfg(feature = "global_flatmap_pmem")]
-            global_flatmap_pmem: HwHashMapCounters::new(),
 
-            #[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem")))]
+            #[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem")))]
             // If no specific hashmap configuration is enabled, we can still create an empty struct
             dashmap_counters: HwHashMapCounters::new(),
         }
@@ -459,18 +458,8 @@ pub fn get_hw_hashmap_stats() -> Option<HwHashMapStats> {
     {
         return Some(counters.global_hashbrown_pmem.get_stats());
     }
-    
-    #[cfg(all(feature = "global_flatmap_dram", not(feature = "hashbrown_dram"), not(feature = "global_hashtable_pmem")))]
-    {
-        return Some(counters.global_flatmap_dram.get_stats());
-    }
-    
-    #[cfg(all(feature = "global_flatmap_pmem", not(feature = "hashbrown_dram"), not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram")))]
-    {
-        return Some(counters.global_flatmap_pmem.get_stats());
-    }
-    
-    #[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem")))]
+
+    #[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem")))]
     {
         return Some(counters.dashmap_counters.get_stats());
     }
@@ -486,14 +475,8 @@ pub fn print_hw_perf_stats() {
         
         #[cfg(all(feature = "global_hashtable_pmem", not(feature = "hashbrown_dram")))]
         println!("Global HashMap (hashbrown in PMEM):");
-        
-        #[cfg(all(feature = "global_flatmap_dram", not(feature = "hashbrown_dram"), not(feature = "global_hashtable_pmem")))]
-        println!("Global HashMap (FlatMap in DRAM):");
-        
-        #[cfg(all(feature = "global_flatmap_pmem", not(feature = "hashbrown_dram"), not(feature = "global_hashtable_pmem"), not(feature = "global_flatmap_dram")))]
-        println!("Global HashMap (FlatMap in PMEM):");
 
-        #[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem", feature = "global_flatmap_dram", feature = "global_flatmap_pmem")))]
+        #[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem")))]
         println!("Global HashMap (DashMap):");
         
         print!("{}", stats);

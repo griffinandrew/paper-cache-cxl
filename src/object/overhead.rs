@@ -264,8 +264,8 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	}
 
 	// The object hashtable lives in DRAM unless a hashtable-PMEM feature
-	// relocates it (`global_hashtable_pmem` / `global_flatmap_pmem`).
-	#[cfg(not(any(feature = "global_hashtable_pmem", feature = "global_flatmap_pmem")))]
+	// relocates it (`global_hashtable_pmem`).
+	#[cfg(not(feature = "global_hashtable_pmem"))]
 	{
 		overhead += HASHTABLE_ENTRY_OVERHEAD;
 	}
