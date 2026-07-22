@@ -44,3 +44,44 @@ mod stats;
 
 pub use crate::tiered_buffer::TieredBuffer;
 pub use stats::LfuHybridStats;
+
+/// Marker type selecting `lfu_hybrid_cache`'s behavior for the shared
+/// generic `impl<K, S> PaperCache<K, TieredBuffer, S>` block in `lib.rs`
+/// (see `crate::hybrid_policy::HybridPolicy`). A brand-new key built once
+/// the fast tier has genuinely reached capacity (`LfuHybridStack`'s
+/// one-time admission latch, mirrored onto `AtomicStatus` since this
+/// thread has no direct access to the worker-owned stack) goes straight
+/// to the slow tier -- this is what the stack would decide anyway, so
+/// building it fast first would only cost a synchronous DRAM write
+/// immediately followed by an async correction. An *existing* key is
+/// never affected by this check regardless of its current tier:
+/// re-setting one is an access, which may or may not promote it, and only
+/// the stack can decide that.
+pub struct LfuHybridPolicy;
+
+impl crate::hybrid_policy::HybridPolicy for LfuHybridPolicy {
+	type Stats = LfuHybridStats;
+	type ExtraConfig = ();
+
+	fn seed_policy(_extra: ()) -> crate::PaperPolicy {
+		crate::PaperPolicy::LfuHybrid
+	}
+
+	fn stats_from_status(status: &crate::status::AtomicStatus) -> LfuHybridStats {
+		status.lfu_hybrid_stats()
+	}
+
+	fn admission_tier<K>(
+		hashed_key: crate::HashedKey,
+		status: &crate::status::AtomicStatus,
+		objects: &std::sync::Arc<crate::hybrid_policy::HybridObjectMap<K>>,
+	) -> crate::Tier {
+		let is_new = !objects.contains_key(&hashed_key);
+
+		if is_new && status.lfu_hybrid_admission_latched() {
+			crate::Tier::Slow
+		} else {
+			crate::Tier::Fast
+		}
+	}
+}

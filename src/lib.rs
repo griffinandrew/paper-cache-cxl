@@ -236,6 +236,24 @@ pub use crate::fifo_hybrid_cache::FifoHybridStats;
 #[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
 pub use crate::worker::Tier;
 
+// Trait abstracting the behavior that differs between the four hybrid-cache
+// designs, plus the compile-time selection of exactly one concrete
+// implementation -- see `hybrid_policy.rs`'s module doc for why this stays
+// a compile-time (not runtime) dispatch.
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+mod hybrid_policy;
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+use crate::hybrid_policy::HybridPolicy;
+
+#[cfg(feature = "lru_hybrid_cache")]
+type ActiveHybridPolicy = crate::lru_hybrid_cache::LruHybridPolicy;
+#[cfg(feature = "lfu_hybrid_cache")]
+type ActiveHybridPolicy = crate::lfu_hybrid_cache::LfuHybridPolicy;
+#[cfg(feature = "two_q_hybrid_cache")]
+type ActiveHybridPolicy = crate::two_q_hybrid_cache::TwoQHybridPolicy;
+#[cfg(feature = "fifo_hybrid_cache")]
+type ActiveHybridPolicy = crate::fifo_hybrid_cache::FifoHybridPolicy;
+
 use std::{
 	thread,
 	sync::{
@@ -2389,18 +2407,362 @@ unsafe impl<K, V, S> Send for PaperCache<K, V, S> {}
 // is exposed, so sharing a `&PaperCache` across threads is safe.
 unsafe impl<K, V, S> Sync for PaperCache<K, V, S> {}
 
+/// Shared engine behind every hybrid-cache feature's own inherent methods
+/// (`new`/`with_hasher`/`get`/`set`/.../the `{name}_hybrid_stats()`
+/// accessor). Confirmed via direct diff that the four original per-feature
+/// impl blocks this replaces differed only in: which `PaperPolicy` variant
+/// gets seeded; the `Stats` type and its accessor method's name; one
+/// admission-rule branch inside `set()`; and `two_q_hybrid_cache`'s extra
+/// `k_in: f64` constructor parameter -- all captured by `ActiveHybridPolicy`
+/// (see `hybrid_policy.rs`). The four small per-feature impl blocks below
+/// this one exist only to preserve each feature's distinct public
+/// constructor/stats-accessor names and signatures for source
+/// compatibility with existing callers (`paper-server`/`paper-benchmark-cxl`).
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+impl<K, S> PaperCache<K, TieredBuffer, S>
+where
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	S: Default + Clone + BuildHasher,
+{
+	fn new_hybrid(
+		max_size: CacheSize,
+		fast_tier_size: CacheTierSize,
+		extra: <ActiveHybridPolicy as HybridPolicy>::ExtraConfig,
+		hasher: S,
+	) -> Result<Self, CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		let fast_capacity = fast_tier_size.to_bytes();
+
+		if fast_capacity == 0 || fast_capacity > max_size {
+			return Err(CacheError::InvalidFastTierSize);
+		}
+
+		let policy = ActiveHybridPolicy::seed_policy(extra);
+		let policies = [policy];
+
+		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		let status = Arc::new(AtomicStatus::new(max_size, &policies, policy)?);
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		// Requirement: fast-tier size is runtime-configurable (not baked
+		// into the policy string, unlike e.g. `TwoQ`/`SThreeFifo`), so the
+		// requested capacity is recorded on the shared status immediately;
+		// `init_policy_stack`'s 20%-of-max_size default (see
+		// `policy_stack/mod.rs`) is overridden below via `ResizeFastTier`.
+		status.set_fast_tier_capacity(fast_capacity);
+
+		// Reallocates a value into the target tier's representation. Must
+		// preserve byte length exactly: both `status.base_used_size` and
+		// the active stack's own per-key size bookkeeping assume a
+		// migration never changes an object's accounted size.
+		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> TieredBuffer + Send + Sync> =
+			Box::new(|buffer, tier| match tier {
+				Tier::Fast => TieredBuffer::new_fast(buffer.as_ref()),
+				Tier::Slow => TieredBuffer::new_slow(buffer.as_ref()),
+			});
+
+		let (worker_sender, worker_listener) = unbounded();
+
+		let mut worker_manager = WorkerManager::new_with_tier_migration(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+			migrate,
+		)?;
+
+		thread::spawn(move || worker_manager.run());
+
+		let cache = PaperCache {
+			objects,
+			status,
+			worker_manager: Arc::new(worker_sender),
+			overhead_manager,
+			hasher,
+		};
+
+		cache.broadcast(WorkerEvent::ResizeFastTier(fast_capacity))?;
+
+		Ok(cache)
+	}
+
+	/// Returns the current cache version.
+	#[must_use]
+	pub fn version(&self) -> String {
+		env!("CARGO_PKG_VERSION").to_owned()
+	}
+
+	/// Returns the current statistics.
+	pub fn status(&self) -> Result<Status, CacheError> {
+		self.status.try_to_status()
+	}
+
+	/// Gets the value associated with the supplied key.
+	/// If the key was not found in the cache, returns a [`CacheError`].
+	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let result = match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				self.status.incr_hits();
+				let arc_val = object.data();
+				let bytes: &[u8] = arc_val.as_ref().as_ref();
+				Ok(bytes.to_vec())
+			},
+
+			_ => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
+
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+
+		result
+	}
+
+	/// Sets the supplied key and value in the cache. Which tier the value's
+	/// bytes are built in is decided by `ActiveHybridPolicy::admission_tier`
+	/// -- see each hybrid-cache feature's marker-type doc comment (in its
+	/// own `mod.rs`) for its specific admission rule. Returns a
+	/// [`CacheError`] if the value size is zero or larger than the cache's
+	/// maximum size.
+	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
+		let hashed_key = self.hash_key(&key);
+
+		let tier = ActiveHybridPolicy::admission_tier(hashed_key, &self.status, &self.objects);
+		let val_buf = match tier {
+			Tier::Fast => TieredBuffer::new_fast(value),
+			Tier::Slow => TieredBuffer::new_slow(value),
+		};
+
+		let object = Object::new(key, val_buf, ttl);
+		let base_size = self.overhead_manager.base_size(&object);
+		let expiry = object.expiry();
+
+		if base_size == 0 {
+			return Err(CacheError::ZeroValueSize);
+		}
+
+		if self.status.exceeds_max_size(base_size) {
+			return Err(CacheError::ExceedingValueSize);
+		}
+
+		self.status.incr_sets();
+
+		let old_object_info = self.objects
+			.insert(hashed_key, object)
+			.map(|old_object| {
+				let base_size = self.overhead_manager.base_size(&old_object);
+				let expiry = old_object.expiry();
+
+				(base_size, expiry)
+			});
+
+		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+			base_size as i64 - old_object_size as i64
+		} else {
+			self.status.incr_num_objects();
+			base_size as i64
+		};
+
+		self.status.update_base_used_size(base_size_delta);
+		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+
+		Ok(())
+	}
+
+	/// Deletes the object associated with the supplied key in the cache.
+	/// Returns a [`CacheError`] if the key was not found in the cache.
+	pub fn del(&self, key: &K) -> Result<(), CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let (removed_hashed_key, object) = erase(
+			&self.objects,
+			&self.status,
+			&self.overhead_manager,
+			Some(EraseKey::Original(key, hashed_key)),
+		)?;
+
+		self.status.incr_dels();
+		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
+
+		Ok(())
+	}
+
+	/// Checks if an object with the supplied key exists in the cache without
+	/// altering any of the cache's internal queues.
+	pub fn has(&self, key: &K) -> bool {
+		let hashed_key = self.hash_key(key);
+
+		self.objects
+			.get(&hashed_key)
+			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
+	}
+
+	/// Gets (peeks) the value associated with the supplied key without
+	/// altering any of the cache's internal queues (including tier — a peek
+	/// never triggers a promotion). If the key was not found in the cache,
+	/// returns a [`CacheError`].
+	pub fn peek(&self, key: &K) -> Result<Arc<TieredBuffer>, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Ok(object.data()),
+
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
+	/// Sets the TTL associated with the supplied key.
+	/// If the key was not found in the cache, returns a [`CacheError`].
+	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		let mut object = match self.objects.get_mut(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => object,
+			_ => return Err(CacheError::KeyNotFound),
+		};
+
+		let old_expiry = object.expiry();
+		let old_base_size = self.overhead_manager.base_size(&object);
+
+		object.expires(ttl);
+
+		let new_expiry = object.expiry();
+		let new_base_size = self.overhead_manager.base_size(&object);
+
+		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
+		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
+
+		Ok(())
+	}
+
+	/// Gets the size of the value associated with the supplied key in bytes.
+	/// If the key was not found in the cache, returns a [`CacheError`].
+	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
+		let hashed_key = self.hash_key(key);
+
+		match self.objects.get(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Ok(self.overhead_manager.total_size(&object)),
+
+			_ => Err(CacheError::KeyNotFound),
+		}
+	}
+
+	/// Deletes all objects in the cache and sets the cache's used size to zero.
+	pub fn wipe(&self) -> Result<(), CacheError> {
+		info!("Wiping cache");
+
+		self.objects.clear();
+		self.status.clear();
+
+		self.broadcast(WorkerEvent::Wipe)?;
+
+		Ok(())
+	}
+
+	/// Resizes the cache's overall maximum size.
+	/// If the supplied size is zero, returns a [`CacheError`].
+	///
+	/// Note this is the *overall* cache capacity, independent of the
+	/// fast-tier budget — see [`Self::set_fast_tier_size`]. (`two_q_hybrid_cache`
+	/// additionally rescales its FIFO queue's byte budget proportionally,
+	/// inside `TwoQHybridStack::resize` -- not this method.)
+	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		let current_max_size = self.status.max_size();
+
+		if max_size == current_max_size {
+			return Ok(());
+		}
+
+		info!(
+			"Resizing cache from {} to {}",
+			fmt::memory(current_max_size, Some(2)),
+			fmt::memory(max_size, Some(2)),
+		);
+
+		self.status.set_max_size(max_size);
+		self.broadcast(WorkerEvent::Resize(max_size))?;
+
+		Ok(())
+	}
+
+	/// Runtime-adjusts the fast-tier byte budget. Shrinking it may trigger
+	/// immediate demotions (see the active policy stack's `settle_fast_tier`).
+	///
+	/// # Errors
+	///
+	/// Returns [`CacheError::InvalidFastTierSize`] if `size` resolves to
+	/// zero bytes or exceeds the cache's overall `max_size`.
+	pub fn set_fast_tier_size(&self, size: CacheTierSize) -> Result<(), CacheError> {
+		let bytes = size.to_bytes();
+
+		if bytes == 0 || bytes > self.status.max_size() {
+			return Err(CacheError::InvalidFastTierSize);
+		}
+
+		self.status.set_fast_tier_capacity(bytes);
+		self.broadcast(WorkerEvent::ResizeFastTier(bytes))?;
+
+		Ok(())
+	}
+
+	/// Returns the current fast-tier byte budget.
+	#[must_use]
+	pub fn fast_tier_size(&self) -> CacheSize {
+		self.status.fast_tier_capacity()
+	}
+
+	/// Returns which tier `key` currently lives in, or `None` if the key
+	/// isn't present (or has expired). Useful for tests/diagnostics — unlike
+	/// `S3FifoHybridCache`'s `has_in_dram`/`has_in_pmem` pair, there's only
+	/// one object map here, so tier is a property read off the object itself.
+	#[must_use]
+	pub fn tier_of(&self, key: &K) -> Option<Tier> {
+		let hashed_key = self.hash_key(key);
+
+		self.objects.get(&hashed_key).and_then(|object| {
+			if !object.key_matches(key) || object.is_expired() {
+				return None;
+			}
+
+			Some(if object.data().is_fast() { Tier::Fast } else { Tier::Slow })
+		})
+	}
+
+	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
+		if let Err(err) = self.worker_manager.try_send(event) {
+			error!("Could not communicate with workers: {err:?}");
+			return Err(CacheError::Internal);
+		}
+
+		Ok(())
+	}
+
+	fn hash_key(&self, key: &K) -> HashedKey {
+		self.hasher.hash_one(key)
+	}
+}
+
 /// Single-instance, segmented-LRU hybrid cache: one `PaperCache<K,
 /// TieredBuffer>` running `PaperPolicy::LruHybrid`, in contrast with
 /// `hybridcache`'s [`crate::hybridcache::S3FifoHybridCache`] (two composed
-/// `PaperCache` instances). See the `lru_hybrid_cache` module docs and
-/// `CLAUDE.md`'s `lru_hybrid_cache` plan for the full design.
-///
-/// Admission always lands in the fast tier; fast-tier pressure demotes the
-/// LRU tail to the slow tier; a slow-tier access promotes it back to the
-/// fast tier; terminal evictions (once overall `max_size` is exceeded) only
-/// ever remove the slow-tier LRU tail. Every migration physically
-/// reallocates the object's bytes (see [`TieredBuffer`] and
-/// `Object::set_data`) — a key is never present in both tiers at once.
+/// `PaperCache` instances). See the `lru_hybrid_cache` module docs for the
+/// full design. This impl block only carries `new`/`with_hasher` (this
+/// design's constructor has no extra parameters beyond `max_size`/
+/// `fast_tier_size`) and the `lru_hybrid_stats()` accessor -- every other
+/// method is shared, in the generic block above (see
+/// `crate::hybrid_policy::HybridPolicy`).
 #[cfg(feature = "lru_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
@@ -2441,324 +2803,13 @@ where
 		fast_tier_size: CacheTierSize,
 		hasher: S,
 	) -> Result<Self, CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let fast_capacity = fast_tier_size.to_bytes();
-
-		if fast_capacity == 0 || fast_capacity > max_size {
-			return Err(CacheError::InvalidFastTierSize);
-		}
-
-		let policies = [PaperPolicy::LruHybrid];
-
-		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
-		let status = Arc::new(AtomicStatus::new(max_size, &policies, PaperPolicy::LruHybrid)?);
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		// Requirement: fast-tier size is runtime-configurable (not baked
-		// into the policy string, unlike e.g. `TwoQ`/`SThreeFifo`), so the
-		// requested capacity is recorded on the shared status immediately;
-		// `init_policy_stack`'s 20%-of-max_size default (see
-		// `policy_stack/mod.rs`) is overridden below via `ResizeFastTier`.
-		status.set_fast_tier_capacity(fast_capacity);
-
-		// Reallocates a value into the target tier's representation. Must
-		// preserve byte length exactly: both `status.base_used_size` and
-		// `LruHybridStack`'s own per-key size bookkeeping assume a
-		// migration never changes an object's accounted size.
-		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> TieredBuffer + Send + Sync> =
-			Box::new(|buffer, tier| match tier {
-				Tier::Fast => TieredBuffer::new_fast(buffer.as_ref()),
-				Tier::Slow => TieredBuffer::new_slow(buffer.as_ref()),
-			});
-
-		let (worker_sender, worker_listener) = unbounded();
-
-		let mut worker_manager = WorkerManager::new_with_tier_migration(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-			migrate,
-		)?;
-
-		thread::spawn(move || worker_manager.run());
-
-		let cache = PaperCache {
-			objects,
-			status,
-			worker_manager: Arc::new(worker_sender),
-			overhead_manager,
-			hasher,
-		};
-
-		cache.broadcast(WorkerEvent::ResizeFastTier(fast_capacity))?;
-
-		Ok(cache)
-	}
-
-	/// Returns the current cache version.
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	/// Returns the current statistics.
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	/// Gets the value associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let arc_val = object.data();
-				let bytes: &[u8] = arc_val.as_ref().as_ref();
-				Ok(bytes.to_vec())
-			},
-
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-
-		result
-	}
-
-	/// Sets the supplied key and value in the cache. Admission always lands
-	/// in the fast tier — including when overwriting a key currently in the
-	/// slow tier, which this promotes back to fast (see `LruHybridStack::insert`).
-	/// Returns a [`CacheError`] if the value size is zero or larger than the
-	/// cache's maximum size.
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		let val_buf = TieredBuffer::new_fast(value);
-		let object = Object::new(key, val_buf, ttl);
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
-
-	/// Deletes the object associated with the supplied key in the cache.
-	/// Returns a [`CacheError`] if the key was not found in the cache.
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	/// Checks if an object with the supplied key exists in the cache without
-	/// altering any of the cache's internal queues.
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	/// Gets (peeks) the value associated with the supplied key without
-	/// altering any of the cache's internal queues (including tier — a peek
-	/// never triggers a promotion). If the key was not found in the cache,
-	/// returns a [`CacheError`].
-	pub fn peek(&self, key: &K) -> Result<Arc<TieredBuffer>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Sets the TTL associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut object = match self.objects.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	/// Gets the size of the value associated with the supplied key in bytes.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Deletes all objects in the cache and sets the cache's used size to zero.
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		self.objects.clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	/// Resizes the cache's overall maximum size.
-	/// If the supplied size is zero, returns a [`CacheError`].
-	///
-	/// Note this is the *overall* cache capacity, independent of the
-	/// fast-tier budget — see [`Self::set_fast_tier_size`].
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	/// Runtime-adjusts the fast-tier byte budget. Shrinking it may trigger
-	/// immediate demotions (see `LruHybridStack::settle_fast_tier`).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::InvalidFastTierSize`] if `size` resolves to
-	/// zero bytes or exceeds the cache's overall `max_size`.
-	pub fn set_fast_tier_size(&self, size: CacheTierSize) -> Result<(), CacheError> {
-		let bytes = size.to_bytes();
-
-		if bytes == 0 || bytes > self.status.max_size() {
-			return Err(CacheError::InvalidFastTierSize);
-		}
-
-		self.status.set_fast_tier_capacity(bytes);
-		self.broadcast(WorkerEvent::ResizeFastTier(bytes))?;
-
-		Ok(())
-	}
-
-	/// Returns the current fast-tier byte budget.
-	#[must_use]
-	pub fn fast_tier_size(&self) -> CacheSize {
-		self.status.fast_tier_capacity()
+		Self::new_hybrid(max_size, fast_tier_size, (), hasher)
 	}
 
 	/// Returns a point-in-time snapshot of `lru_hybrid_cache` statistics.
 	#[must_use]
 	pub fn lru_hybrid_stats(&self) -> LruHybridStats {
-		self.status.lru_hybrid_stats()
-	}
-
-	/// Returns which tier `key` currently lives in, or `None` if the key
-	/// isn't present (or has expired). Useful for tests/diagnostics — unlike
-	/// `S3FifoHybridCache`'s `has_in_dram`/`has_in_pmem` pair, there's only
-	/// one object map here, so tier is a property read off the object itself.
-	#[must_use]
-	pub fn tier_of(&self, key: &K) -> Option<Tier> {
-		let hashed_key = self.hash_key(key);
-
-		self.objects.get(&hashed_key).and_then(|object| {
-			if !object.key_matches(key) || object.is_expired() {
-				return None;
-			}
-
-			Some(if object.data().is_fast() { Tier::Fast } else { Tier::Slow })
-		})
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
+		ActiveHybridPolicy::stats_from_status(&self.status)
 	}
 }
 
@@ -2766,9 +2817,8 @@ where
 /// TieredBuffer>` running `PaperPolicy::LfuHybrid`, in contrast with
 /// `hybridcache`'s [`crate::hybridcache::S3FifoHybridCache`] (two composed
 /// `PaperCache` instances). See the `lfu_hybrid_cache` module docs for the
-/// full design; this impl block mirrors `lru_hybrid_cache`'s mechanically
-/// (same shape: `new`, `get`, `set`, ...) — the only behavioral difference
-/// lives in `LfuHybridStack`, not here.
+/// full design; only `new`/`with_hasher`/`lfu_hybrid_stats()` live here --
+/// everything else is shared (see the generic block above).
 ///
 /// Admission always lands in the fast tier; once fast-tier pressure demotes
 /// a key, it is (by construction) always the fast tier's lowest-frequency
@@ -2782,8 +2832,9 @@ where
 /// `Object::set_data`) — a key is never present in both tiers at once.
 ///
 /// Mutually exclusive with `lru_hybrid_cache` (see `lib.rs`'s
-/// `compile_error!` guard) since both define this same inherent-method
-/// impl block on the identical `PaperCache<K, TieredBuffer, S>` type.
+/// `compile_error!` guard) since both would otherwise define the same
+/// inherent-method impl block on the identical `PaperCache<K, TieredBuffer,
+/// S>` type.
 #[cfg(feature = "lfu_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
@@ -2800,20 +2851,6 @@ where
 	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero, or
 	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
 	/// zero bytes or exceeds `max_size`.
-	///
-	/// # Examples
-	///
-	/// ```ignore
-	/// use paper_cache::{PaperCache, TieredBuffer, CacheTierSize};
-	///
-	/// let cache = PaperCache::<u32, TieredBuffer>::new(
-	///     10_000_000,
-	///     CacheTierSize::Mb(2),
-	/// ).unwrap();
-	///
-	/// cache.set(1u32, b"hello world", None).unwrap();
-	/// assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
-	/// ```
 	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize) -> Result<Self, CacheError> {
 		Self::with_hasher(max_size, fast_tier_size, Default::default())
 	}
@@ -2824,339 +2861,13 @@ where
 		fast_tier_size: CacheTierSize,
 		hasher: S,
 	) -> Result<Self, CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let fast_capacity = fast_tier_size.to_bytes();
-
-		if fast_capacity == 0 || fast_capacity > max_size {
-			return Err(CacheError::InvalidFastTierSize);
-		}
-
-		let policies = [PaperPolicy::LfuHybrid];
-
-		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
-		let status = Arc::new(AtomicStatus::new(max_size, &policies, PaperPolicy::LfuHybrid)?);
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		// Requirement: fast-tier size is runtime-configurable (not baked
-		// into the policy string), so the requested capacity is recorded on
-		// the shared status immediately; `init_policy_stack`'s
-		// 20%-of-max_size default (see `policy_stack/mod.rs`) is overridden
-		// below via `ResizeFastTier`.
-		status.set_fast_tier_capacity(fast_capacity);
-
-		// Reallocates a value into the target tier's representation. Must
-		// preserve byte length exactly: both `status.base_used_size` and
-		// `LfuHybridStack`'s own per-key size bookkeeping assume a
-		// migration never changes an object's accounted size.
-		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> TieredBuffer + Send + Sync> =
-			Box::new(|buffer, tier| match tier {
-				Tier::Fast => TieredBuffer::new_fast(buffer.as_ref()),
-				Tier::Slow => TieredBuffer::new_slow(buffer.as_ref()),
-			});
-
-		let (worker_sender, worker_listener) = unbounded();
-
-		let mut worker_manager = WorkerManager::new_with_tier_migration(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-			migrate,
-		)?;
-
-		thread::spawn(move || worker_manager.run());
-
-		let cache = PaperCache {
-			objects,
-			status,
-			worker_manager: Arc::new(worker_sender),
-			overhead_manager,
-			hasher,
-		};
-
-		cache.broadcast(WorkerEvent::ResizeFastTier(fast_capacity))?;
-
-		Ok(cache)
-	}
-
-	/// Returns the current cache version.
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	/// Returns the current statistics.
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	/// Gets the value associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let arc_val = object.data();
-				let bytes: &[u8] = arc_val.as_ref().as_ref();
-				Ok(bytes.to_vec())
-			},
-
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-
-		result
-	}
-
-	/// Sets the supplied key and value in the cache. Admission always lands
-	/// in the fast tier — including when overwriting a key currently in the
-	/// slow tier, which this treats as an access (see `LfuHybridStack::insert`).
-	/// Returns a [`CacheError`] if the value size is zero or larger than the
-	/// cache's maximum size.
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		// A brand-new key built once the fast tier has genuinely reached
-		// capacity (`LfuHybridStack`'s one-time admission latch, mirrored
-		// onto `AtomicStatus` since this thread has no direct access to the
-		// worker-owned stack) goes straight into `TieredBuffer::new_slow` --
-		// this is what the stack would decide anyway, so building it fast
-		// first would only cost a synchronous DRAM write immediately
-		// followed by an async PMEM correction. An *existing* key is never
-		// affected by this check regardless of its current tier: re-setting
-		// one is an access (see this method's doc comment above), which may
-		// or may not promote it, and only the stack can decide that.
-		let is_new = !self.objects.contains_key(&hashed_key);
-
-		let val_buf = if is_new && self.status.lfu_hybrid_admission_latched() {
-			TieredBuffer::new_slow(value)
-		} else {
-			TieredBuffer::new_fast(value)
-		};
-
-		let object = Object::new(key, val_buf, ttl);
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
-
-	/// Deletes the object associated with the supplied key in the cache.
-	/// Returns a [`CacheError`] if the key was not found in the cache.
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	/// Checks if an object with the supplied key exists in the cache without
-	/// altering any of the cache's internal queues.
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	/// Gets (peeks) the value associated with the supplied key without
-	/// altering any of the cache's internal queues (including tier — a peek
-	/// never triggers a promotion). If the key was not found in the cache,
-	/// returns a [`CacheError`].
-	pub fn peek(&self, key: &K) -> Result<Arc<TieredBuffer>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Sets the TTL associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut object = match self.objects.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	/// Gets the size of the value associated with the supplied key in bytes.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Deletes all objects in the cache and sets the cache's used size to zero.
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		self.objects.clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	/// Resizes the cache's overall maximum size.
-	/// If the supplied size is zero, returns a [`CacheError`].
-	///
-	/// Note this is the *overall* cache capacity, independent of the
-	/// fast-tier budget — see [`Self::set_fast_tier_size`].
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	/// Runtime-adjusts the fast-tier byte budget. Shrinking it may trigger
-	/// immediate demotions (see `LfuHybridStack::settle_fast_tier`).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::InvalidFastTierSize`] if `size` resolves to
-	/// zero bytes or exceeds the cache's overall `max_size`.
-	pub fn set_fast_tier_size(&self, size: CacheTierSize) -> Result<(), CacheError> {
-		let bytes = size.to_bytes();
-
-		if bytes == 0 || bytes > self.status.max_size() {
-			return Err(CacheError::InvalidFastTierSize);
-		}
-
-		self.status.set_fast_tier_capacity(bytes);
-		self.broadcast(WorkerEvent::ResizeFastTier(bytes))?;
-
-		Ok(())
-	}
-
-	/// Returns the current fast-tier byte budget.
-	#[must_use]
-	pub fn fast_tier_size(&self) -> CacheSize {
-		self.status.fast_tier_capacity()
+		Self::new_hybrid(max_size, fast_tier_size, (), hasher)
 	}
 
 	/// Returns a point-in-time snapshot of `lfu_hybrid_cache` statistics.
 	#[must_use]
 	pub fn lfu_hybrid_stats(&self) -> LfuHybridStats {
-		self.status.lfu_hybrid_stats()
-	}
-
-	/// Returns which tier `key` currently lives in, or `None` if the key
-	/// isn't present (or has expired).
-	#[must_use]
-	pub fn tier_of(&self, key: &K) -> Option<Tier> {
-		let hashed_key = self.hash_key(key);
-
-		self.objects.get(&hashed_key).and_then(|object| {
-			if !object.key_matches(key) || object.is_expired() {
-				return None;
-			}
-
-			Some(if object.data().is_fast() { Tier::Fast } else { Tier::Slow })
-		})
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
+		ActiveHybridPolicy::stats_from_status(&self.status)
 	}
 }
 
@@ -3164,12 +2875,10 @@ where
 /// TieredBuffer>` running `PaperPolicy::TwoQHybrid`, in contrast with
 /// `hybridcache`'s [`crate::hybridcache::S3FifoHybridCache`] (two composed
 /// `PaperCache` instances). See the `two_q_hybrid_cache` module docs for the
-/// full design; this impl block mirrors `lru_hybrid_cache`'s/
-/// `lfu_hybrid_cache`'s mechanically (same shape: `new`, `get`, `set`, ...)
-/// with two differences: `new`/`with_hasher` take an extra `k_in` parameter
-/// (this policy's FIFO-queue byte budget is embedded like plain
-/// `PaperPolicy::TwoQ`'s, not purely runtime-configurable), and `set()`
-/// admits into the slow tier rather than the fast tier.
+/// full design; this impl block only carries `new`/`with_hasher` (the one
+/// design with an extra `k_in` constructor parameter) and
+/// `two_q_hybrid_stats()` -- everything else is shared (see the generic
+/// block above).
 ///
 /// Admission always lands in a one-access FIFO queue entirely in the slow
 /// tier. A re-access to a FIFO-queue object promotes it straight to the top
@@ -3183,9 +2892,9 @@ where
 /// present in both tiers at once.
 ///
 /// Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache` (see
-/// `lib.rs`'s `compile_error!` guards) since all three define this same
-/// inherent-method impl block on the identical `PaperCache<K, TieredBuffer,
-/// S>` type.
+/// `lib.rs`'s `compile_error!` guards) since all three would otherwise
+/// define the same inherent-method impl block on the identical
+/// `PaperCache<K, TieredBuffer, S>` type.
 #[cfg(feature = "two_q_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
@@ -3232,331 +2941,17 @@ where
 		k_in: f64,
 		hasher: S,
 	) -> Result<Self, CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
 		if !(0.0..=1.0).contains(&k_in) {
 			return Err(CacheError::InvalidPolicy);
 		}
 
-		let fast_capacity = fast_tier_size.to_bytes();
-
-		if fast_capacity == 0 || fast_capacity > max_size {
-			return Err(CacheError::InvalidFastTierSize);
-		}
-
-		let policies = [PaperPolicy::TwoQHybrid(k_in)];
-
-		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
-		let status = Arc::new(AtomicStatus::new(max_size, &policies, PaperPolicy::TwoQHybrid(k_in))?);
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		// Requirement: the main queue's fast-tier size is runtime-configurable
-		// (not baked into the policy string, unlike `k_in`), so the requested
-		// capacity is recorded on the shared status immediately;
-		// `init_policy_stack`'s 20%-of-max_size default (see
-		// `policy_stack/mod.rs`) is overridden below via `ResizeFastTier`.
-		status.set_fast_tier_capacity(fast_capacity);
-
-		// Reallocates a value into the target tier's representation. Must
-		// preserve byte length exactly: both `status.base_used_size` and
-		// `TwoQHybridStack`'s own per-key size bookkeeping assume a
-		// migration never changes an object's accounted size.
-		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> TieredBuffer + Send + Sync> =
-			Box::new(|buffer, tier| match tier {
-				Tier::Fast => TieredBuffer::new_fast(buffer.as_ref()),
-				Tier::Slow => TieredBuffer::new_slow(buffer.as_ref()),
-			});
-
-		let (worker_sender, worker_listener) = unbounded();
-
-		let mut worker_manager = WorkerManager::new_with_tier_migration(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-			migrate,
-		)?;
-
-		thread::spawn(move || worker_manager.run());
-
-		let cache = PaperCache {
-			objects,
-			status,
-			worker_manager: Arc::new(worker_sender),
-			overhead_manager,
-			hasher,
-		};
-
-		cache.broadcast(WorkerEvent::ResizeFastTier(fast_capacity))?;
-
-		Ok(cache)
-	}
-
-	/// Returns the current cache version.
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	/// Returns the current statistics.
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	/// Gets the value associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let arc_val = object.data();
-				let bytes: &[u8] = arc_val.as_ref().as_ref();
-				Ok(bytes.to_vec())
-			},
-
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-
-		result
-	}
-
-	/// Sets the supplied key and value in the cache. Admission always lands
-	/// in the slow tier — every new object starts in the one-access FIFO
-	/// queue (see `TwoQHybridStack::insert`); only a re-access promotes it
-	/// to the fast tier. Returns a [`CacheError`] if the value size is zero
-	/// or larger than the cache's maximum size.
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		let val_buf = TieredBuffer::new_slow(value);
-		let object = Object::new(key, val_buf, ttl);
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
-
-	/// Deletes the object associated with the supplied key in the cache.
-	/// Returns a [`CacheError`] if the key was not found in the cache.
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	/// Checks if an object with the supplied key exists in the cache without
-	/// altering any of the cache's internal queues.
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	/// Gets (peeks) the value associated with the supplied key without
-	/// altering any of the cache's internal queues (including tier — a peek
-	/// never triggers a promotion). If the key was not found in the cache,
-	/// returns a [`CacheError`].
-	pub fn peek(&self, key: &K) -> Result<Arc<TieredBuffer>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Sets the TTL associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut object = match self.objects.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	/// Gets the size of the value associated with the supplied key in bytes.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Deletes all objects in the cache and sets the cache's used size to zero.
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		self.objects.clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	/// Resizes the cache's overall maximum size. If the supplied size is
-	/// zero, returns a [`CacheError`]. Because `k_in` is a fraction of
-	/// `max_size`, this also proportionally rescales the FIFO queue's byte
-	/// budget (`TwoQHybridStack::resize`) — which may trigger immediate FIFO
-	/// evictions on a shrink.
-	///
-	/// Note this is the *overall* cache capacity, independent of the main
-	/// queue's fast-tier budget — see [`Self::set_fast_tier_size`].
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	/// Runtime-adjusts the main queue's fast-tier byte budget. Shrinking it
-	/// may trigger immediate demotions (see `TwoQHybridStack::settle_fast_tier`).
-	/// Independent of `k_in` (the FIFO queue's own budget), which is fixed
-	/// for the lifetime of the cache.
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::InvalidFastTierSize`] if `size` resolves to
-	/// zero bytes or exceeds the cache's overall `max_size`.
-	pub fn set_fast_tier_size(&self, size: CacheTierSize) -> Result<(), CacheError> {
-		let bytes = size.to_bytes();
-
-		if bytes == 0 || bytes > self.status.max_size() {
-			return Err(CacheError::InvalidFastTierSize);
-		}
-
-		self.status.set_fast_tier_capacity(bytes);
-		self.broadcast(WorkerEvent::ResizeFastTier(bytes))?;
-
-		Ok(())
-	}
-
-	/// Returns the current main-queue fast-tier byte budget.
-	#[must_use]
-	pub fn fast_tier_size(&self) -> CacheSize {
-		self.status.fast_tier_capacity()
+		Self::new_hybrid(max_size, fast_tier_size, k_in, hasher)
 	}
 
 	/// Returns a point-in-time snapshot of `two_q_hybrid_cache` statistics.
 	#[must_use]
 	pub fn two_q_hybrid_stats(&self) -> TwoQHybridStats {
-		self.status.two_q_hybrid_stats()
-	}
-
-	/// Returns which tier `key` currently lives in, or `None` if the key
-	/// isn't present (or has expired).
-	#[must_use]
-	pub fn tier_of(&self, key: &K) -> Option<Tier> {
-		let hashed_key = self.hash_key(key);
-
-		self.objects.get(&hashed_key).and_then(|object| {
-			if !object.key_matches(key) || object.is_expired() {
-				return None;
-			}
-
-			Some(if object.data().is_fast() { Tier::Fast } else { Tier::Slow })
-		})
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
+		ActiveHybridPolicy::stats_from_status(&self.status)
 	}
 }
 
@@ -3564,23 +2959,13 @@ where
 /// TieredBuffer>` running `PaperPolicy::FifoHybrid`, in contrast with
 /// `hybridcache`'s [`crate::hybridcache::S3FifoHybridCache`] (two composed
 /// `PaperCache` instances). See the `fifo_hybrid_cache` module docs for the
-/// full design; this impl block mirrors `lru_hybrid_cache`'s mechanically
-/// (same shape: `new`, `get`, `set`, ...) with one deliberate deviation in
-/// `set()` (see its doc comment below) — the rest of the behavioral
-/// difference lives in `FifoHybridStack`, not here.
-///
-/// Admission always lands in the fast tier; fast-tier pressure demotes the
-/// oldest fast-tier object to the slow tier; there is no promotion policy at
-/// all — objects are never reordered by subsequent access, so a `get()` hit
-/// never migrates anything. Terminal evictions (once overall `max_size` is
-/// exceeded) only ever remove the slow-tier oldest object. Every migration
-/// physically reallocates the object's bytes (see [`TieredBuffer`] and
-/// `Object::set_data`) — a key is never present in both tiers at once.
+/// full design; only `new`/`with_hasher`/`fifo_hybrid_stats()` live here --
+/// everything else is shared (see the generic block above).
 ///
 /// Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
 /// `two_q_hybrid_cache` (see `lib.rs`'s `compile_error!` guards) since all
-/// four define this same inherent-method impl block on the identical
-/// `PaperCache<K, TieredBuffer, S>` type.
+/// four would otherwise define the same inherent-method impl block on the
+/// identical `PaperCache<K, TieredBuffer, S>` type.
 #[cfg(feature = "fifo_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
@@ -3607,341 +2992,16 @@ where
 		fast_tier_size: CacheTierSize,
 		hasher: S,
 	) -> Result<Self, CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let fast_capacity = fast_tier_size.to_bytes();
-
-		if fast_capacity == 0 || fast_capacity > max_size {
-			return Err(CacheError::InvalidFastTierSize);
-		}
-
-		let policies = [PaperPolicy::FifoHybrid];
-
-		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
-		let status = Arc::new(AtomicStatus::new(max_size, &policies, PaperPolicy::FifoHybrid)?);
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		// Requirement: fast-tier size is runtime-configurable (not baked
-		// into the policy string), so the requested capacity is recorded on
-		// the shared status immediately; `init_policy_stack`'s
-		// 20%-of-max_size default (see `policy_stack/mod.rs`) is overridden
-		// below via `ResizeFastTier`.
-		status.set_fast_tier_capacity(fast_capacity);
-
-		// Reallocates a value into the target tier's representation. Must
-		// preserve byte length exactly: both `status.base_used_size` and
-		// `FifoHybridStack`'s own per-key size bookkeeping assume a
-		// migration never changes an object's accounted size.
-		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> TieredBuffer + Send + Sync> =
-			Box::new(|buffer, tier| match tier {
-				Tier::Fast => TieredBuffer::new_fast(buffer.as_ref()),
-				Tier::Slow => TieredBuffer::new_slow(buffer.as_ref()),
-			});
-
-		let (worker_sender, worker_listener) = unbounded();
-
-		let mut worker_manager = WorkerManager::new_with_tier_migration(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-			migrate,
-		)?;
-
-		thread::spawn(move || worker_manager.run());
-
-		let cache = PaperCache {
-			objects,
-			status,
-			worker_manager: Arc::new(worker_sender),
-			overhead_manager,
-			hasher,
-		};
-
-		cache.broadcast(WorkerEvent::ResizeFastTier(fast_capacity))?;
-
-		Ok(cache)
-	}
-
-	/// Returns the current cache version.
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	/// Returns the current statistics.
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	/// Gets the value associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let arc_val = object.data();
-				let bytes: &[u8] = arc_val.as_ref().as_ref();
-				Ok(bytes.to_vec())
-			},
-
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-
-		result
-	}
-
-	/// Sets the supplied key and value in the cache. A genuinely new key is
-	/// always admitted at the bottom of the fast tier. Overwriting an
-	/// existing key never changes its tier or position — FIFO has no
-	/// promotion/reordering policy at all (see `FifoHybridStack`'s module
-	/// doc) — the value is written into whichever tier's representation the
-	/// key already occupies, looked up here since the API-calling thread has
-	/// no access to the worker-owned policy stack. This is the one method in
-	/// this impl block that deviates from a verbatim `lru_hybrid_cache`
-	/// copy: `LruHybridStack::insert` always re-admits an existing key to
-	/// fast (promoting it), so `lru_hybrid_cache`'s `set()` can always build
-	/// `TieredBuffer::new_fast` unconditionally — but `FifoHybridStack` never
-	/// changes an existing key's tier, so unconditionally building
-	/// `new_fast` here would desync a slow-tier key's physical
-	/// representation from the stack's own bookkeeping permanently.
-	/// Returns a [`CacheError`] if the value size is zero or larger than the
-	/// cache's maximum size.
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		let existing_tier = self.objects.get(&hashed_key)
-			.map(|object| if object.data().is_fast() { Tier::Fast } else { Tier::Slow });
-
-		let val_buf = match existing_tier {
-			Some(Tier::Slow) => TieredBuffer::new_slow(value),
-			Some(Tier::Fast) | None => TieredBuffer::new_fast(value),
-		};
-
-		let object = Object::new(key, val_buf, ttl);
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
-
-	/// Deletes the object associated with the supplied key in the cache.
-	/// Returns a [`CacheError`] if the key was not found in the cache.
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	/// Checks if an object with the supplied key exists in the cache without
-	/// altering any of the cache's internal queues.
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	/// Gets (peeks) the value associated with the supplied key without
-	/// altering any of the cache's internal queues. If the key was not found
-	/// in the cache, returns a [`CacheError`].
-	pub fn peek(&self, key: &K) -> Result<Arc<TieredBuffer>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Sets the TTL associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut object = match self.objects.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	/// Gets the size of the value associated with the supplied key in bytes.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Deletes all objects in the cache and sets the cache's used size to zero.
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		self.objects.clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	/// Resizes the cache's overall maximum size.
-	/// If the supplied size is zero, returns a [`CacheError`].
-	///
-	/// Note this is the *overall* cache capacity, independent of the
-	/// fast-tier budget — see [`Self::set_fast_tier_size`].
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	/// Runtime-adjusts the fast-tier byte budget. Shrinking it may trigger
-	/// immediate demotions (see `FifoHybridStack::settle_fast_tier`).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::InvalidFastTierSize`] if `size` resolves to
-	/// zero bytes or exceeds the cache's overall `max_size`.
-	pub fn set_fast_tier_size(&self, size: CacheTierSize) -> Result<(), CacheError> {
-		let bytes = size.to_bytes();
-
-		if bytes == 0 || bytes > self.status.max_size() {
-			return Err(CacheError::InvalidFastTierSize);
-		}
-
-		self.status.set_fast_tier_capacity(bytes);
-		self.broadcast(WorkerEvent::ResizeFastTier(bytes))?;
-
-		Ok(())
-	}
-
-	/// Returns the current fast-tier byte budget.
-	#[must_use]
-	pub fn fast_tier_size(&self) -> CacheSize {
-		self.status.fast_tier_capacity()
+		Self::new_hybrid(max_size, fast_tier_size, (), hasher)
 	}
 
 	/// Returns a point-in-time snapshot of `fifo_hybrid_cache` statistics.
 	#[must_use]
 	pub fn fifo_hybrid_stats(&self) -> FifoHybridStats {
-		self.status.fifo_hybrid_stats()
-	}
-
-	/// Returns which tier `key` currently lives in, or `None` if the key
-	/// isn't present (or has expired).
-	#[must_use]
-	pub fn tier_of(&self, key: &K) -> Option<Tier> {
-		let hashed_key = self.hash_key(key);
-
-		self.objects.get(&hashed_key).and_then(|object| {
-			if !object.key_matches(key) || object.is_expired() {
-				return None;
-			}
-
-			Some(if object.data().is_fast() { Tier::Fast } else { Tier::Slow })
-		})
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
+		ActiveHybridPolicy::stats_from_status(&self.status)
 	}
 }
+
 
 #[cfg(all(test, feature = "original"))]
 mod tests {

@@ -48,3 +48,34 @@ mod stats;
 
 pub use crate::tiered_buffer::TieredBuffer;
 pub use stats::TwoQHybridStats;
+
+/// Marker type selecting `two_q_hybrid_cache`'s behavior for the shared
+/// generic `impl<K, S> PaperCache<K, TieredBuffer, S>` block in `lib.rs`
+/// (see `crate::hybrid_policy::HybridPolicy`). Admission is unconditional
+/// to the *slow* tier: every new object starts in the one-access FIFO
+/// queue (`TwoQHybridStack::insert`); only a re-access promotes it to the
+/// fast tier. `ExtraConfig = f64` carries `k_in`, the FIFO queue's byte
+/// budget as a fraction of `max_size` -- the one hybrid design with a
+/// constructor parameter beyond `max_size`/`fast_tier_size`.
+pub struct TwoQHybridPolicy;
+
+impl crate::hybrid_policy::HybridPolicy for TwoQHybridPolicy {
+	type Stats = TwoQHybridStats;
+	type ExtraConfig = f64;
+
+	fn seed_policy(k_in: f64) -> crate::PaperPolicy {
+		crate::PaperPolicy::TwoQHybrid(k_in)
+	}
+
+	fn stats_from_status(status: &crate::status::AtomicStatus) -> TwoQHybridStats {
+		status.two_q_hybrid_stats()
+	}
+
+	fn admission_tier<K>(
+		_hashed_key: crate::HashedKey,
+		_status: &crate::status::AtomicStatus,
+		_objects: &std::sync::Arc<crate::hybrid_policy::HybridObjectMap<K>>,
+	) -> crate::Tier {
+		crate::Tier::Slow
+	}
+}

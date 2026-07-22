@@ -34,3 +34,32 @@ mod stats;
 
 pub use crate::tiered_buffer::TieredBuffer;
 pub use stats::LruHybridStats;
+
+/// Marker type selecting `lru_hybrid_cache`'s behavior for the shared
+/// generic `impl<K, S> PaperCache<K, TieredBuffer, S>` block in `lib.rs`
+/// (see `crate::hybrid_policy::HybridPolicy`). Admission is unconditional:
+/// every `set()` builds `TieredBuffer::new_fast`, matching
+/// `LruHybridStack::insert` always re-admitting to the fast tier
+/// (including on overwrite, which it treats as a promotion).
+pub struct LruHybridPolicy;
+
+impl crate::hybrid_policy::HybridPolicy for LruHybridPolicy {
+	type Stats = LruHybridStats;
+	type ExtraConfig = ();
+
+	fn seed_policy(_extra: ()) -> crate::PaperPolicy {
+		crate::PaperPolicy::LruHybrid
+	}
+
+	fn stats_from_status(status: &crate::status::AtomicStatus) -> LruHybridStats {
+		status.lru_hybrid_stats()
+	}
+
+	fn admission_tier<K>(
+		_hashed_key: crate::HashedKey,
+		_status: &crate::status::AtomicStatus,
+		_objects: &std::sync::Arc<crate::hybrid_policy::HybridObjectMap<K>>,
+	) -> crate::Tier {
+		crate::Tier::Fast
+	}
+}
