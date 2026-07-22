@@ -81,7 +81,7 @@ use std::arch::x86_64::{_mm_clflush, _mm_sfence};
     ),
     feature = "devdax_bump"
 ))]
-use crate::allocator::DevDaxBump as Hybrid;
+pub(crate) use crate::allocator::DevDaxBump as Hybrid;
 
 #[cfg(all(
     any(
@@ -96,7 +96,7 @@ use crate::allocator::DevDaxBump as Hybrid;
     not(feature = "devdax_bump"),
     any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator")
 ))]
-use crate::allocator::RegionHybrid as Hybrid;
+pub(crate) use crate::allocator::RegionHybrid as Hybrid;
 
 #[cfg(all(
     any(
@@ -115,7 +115,7 @@ use crate::allocator::RegionHybrid as Hybrid;
         feature = "region_hybrid_allocator",
     ))
 ))]
-use crate::allocator::HybridObjects as Hybrid;
+pub(crate) use crate::allocator::HybridObjects as Hybrid;
 //use crate::allocator::DAXPMEM as Hybrid;
 
 
@@ -141,6 +141,20 @@ mod worker;
 mod object;
 mod policy;
 mod status;
+
+// Shared object-map storage-backend abstraction and value-buffer
+// abstraction (see each module's doc comment) -- used by the generic
+// `impl<K, V, S> PaperCache<K, V, S>` blocks below to replace what used to
+// be one impl block per (object-map shape, value-buffer type) combination.
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
+mod object_store;
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
+mod value_buffer;
+
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
+use crate::object_store::ObjectStore;
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
+use crate::value_buffer::ValueBuffer;
 
 // Shared tier-size unit type (bytes/Mb/Gb), used by `hybridcache`,
 // `lru_hybrid_cache`, `lfu_hybrid_cache`, `two_q_hybrid_cache`, and
@@ -1029,11 +1043,20 @@ where
 /// 
 /// 
 
-#[cfg(feature = "all_dram")]
-impl<K, S> PaperCache<K, BufferDRAM, S>
+// ---------------------------------------------------------------------
+// Shape A: DashMap-backed object map. Covers `all_dram` (V = BufferDRAM)
+// and `key_value_pmem` without `global_hashtable_pmem` (V = BufferPMEM) --
+// see `ObjectMapRef`'s DashMap arm above. One generic-over-`V: ValueBuffer`
+// block replaces what used to be two nearly-identical impl blocks (one per
+// concrete V); the value-buffer axis and the tiering-manager machinery
+// below (V-agnostic: `TieringManager<K, V>` is itself generic) are the only
+// things that used to force separate blocks.
+// ---------------------------------------------------------------------
+#[cfg(any(feature = "all_dram", all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem"))))]
+impl<K, V, S> PaperCache<K, V, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug, //note added Debug for logging might impact perf thoooo
-	//V: 'static + TypeSize,
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	V: ValueBuffer,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` with maximum size `max_size` and
@@ -1151,8 +1174,86 @@ where
 		#[cfg(all(feature = "key_value_pmem", feature = "sets_dram", not(feature = "enable_tiering_manager")))]
 		let tiering_manager = {
 			let tiering_config = tiering::TieringConfig::default();
-			let persist_cb = move |_: crate::tiering::manager::PmemBackfillJob<K>| {};
-			Arc::new(TieringManager::new_with_backfill(tiering_config, persist_cb))
+
+			let objects_bg = objects.clone();
+			let status_bg = status.clone();
+			let overhead_bg = overhead_manager.clone();
+
+			// Arc::new_cyclic lets the persist closure capture a Weak<TieringManager>
+			// so it can call mark_persisted() after the background PMEM write succeeds.
+			// The Weak is safe to upgrade once jobs are dequeued, which is always after
+			// the Arc is fully initialised and returned from with_hasher.
+			Arc::new_cyclic(|weak_tm: &std::sync::Weak<TieringManager<K, V>>| {
+				let weak_tm = weak_tm.clone();
+
+				let batch_persist_cb = move |batch: Vec<crate::tiering::manager::PmemBackfillJob<K>>| {
+					// Upgrade the weak reference once per batch to avoid repeated
+					// atomic operations and to fail fast if the manager was dropped.
+					let Some(tm) = weak_tm.upgrade() else { return };
+
+					// ── Phase 1: Pre-allocate the value's backing bytes for each job ──
+					// Perform all allocations before touching the objects map so that
+					// the DashMap shards are locked for the shortest possible window.
+					// Also performs a TOCTOU check: skip any key whose tier has already
+					// changed (e.g. a concurrent delete or a newer set replaced it).
+					let mut new_objects = Vec::with_capacity(batch.len());
+					for job in batch {
+						// TOCTOU: if the key is no longer DramOnly, a concurrent
+						// operation already updated or removed it – skip to avoid
+						// overwriting a newer value.
+						if !tm.is_dram_only(job.hashed_key) {
+							continue;
+						}
+
+						// Allocate the value's bytes through whichever backend `V`
+						// uses (`ValueBuffer::from_bytes` -- plain heap for
+						// `BufferDRAM`, the `Hybrid` PMEM allocator for `BufferPMEM`).
+						let val_buf: V = V::from_bytes(&job.value);
+
+						let object = crate::object::Object::new(job.key, val_buf, job.ttl);
+						let base_size = overhead_bg.base_size(&object);
+
+						if base_size == 0 || status_bg.exceeds_max_size(base_size) {
+							// Backfill write cannot proceed; remove the stuck DramOnly entry.
+							tm.remove_object(job.hashed_key);
+							continue;
+						}
+
+						new_objects.push((job.hashed_key, object, base_size));
+					}
+
+					// ── Phase 2: Minimal locking – batch inserts into the objects map ──
+					let mut batch_delta: i64 = 0;
+					let mut batch_count: u64 = 0;
+
+					for (hashed_key, object, base_size) in new_objects {
+						let old_size = objects_bg
+							.insert(hashed_key, object)
+							.map(|old| overhead_bg.base_size(&old));
+
+						match old_size {
+							Some(old) => batch_delta += base_size as i64 - old as i64,
+							None => {
+								batch_count += 1;
+								batch_delta += base_size as i64;
+							}
+						}
+
+						// Transition tier from DramOnly -> DramAndPmem immediately
+						// after each insert so the window where the object is in the
+						// objects map but still DramOnly is as short as possible.
+						tm.mark_persisted(hashed_key);
+					}
+
+					// ── Phase 3: Deferred atomics – one update per batch ─────────────
+					// Apply the accumulated size delta and new-object count in a single
+					// pair of atomic operations to minimise cache-line bouncing.
+					status_bg.update_base_used_size(batch_delta);
+					status_bg.add_num_objects(batch_count);
+				};
+
+				TieringManager::new_with_backfill(tiering_config, batch_persist_cb)
+			})
 		};
 
 		let (worker_sender, worker_listener) = unbounded();
@@ -1166,7 +1267,16 @@ where
 			&tiering_manager,
 		)?;
 
-		#[cfg(not(all(feature = "key_value_pmem", feature = "enable_tiering_manager")))]
+		#[cfg(all(feature = "key_value_pmem", feature = "sets_dram", not(feature = "enable_tiering_manager")))]
+		let mut worker_manager = WorkerManager::new(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+			&tiering_manager,
+		)?;
+
+		#[cfg(not(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram"))))]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
@@ -1182,7 +1292,7 @@ where
 
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
-			
+
 			#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
 			tiering_manager,
 
@@ -1252,22 +1362,36 @@ where
 	/// // Getting a key which does not exist in the cache will return a CacheError.
 	/// assert!(cache.get(&1).is_err());
 	/// ```
-	/// 
-	
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
-	{
+	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		#[cfg(debug_assertions)] println!("GET for key in all dram");
+		// Check the DRAM tier first (only ever wired up together with the
+		// `key_value_pmem` copy-based tiering manager -- see `src/tiering/`).
+		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", not(feature = "hashtable_tiering")))]
+		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
+			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
+				self.status.incr_hits();
+				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+				let arc_val = dram_object_ref.data();
+				return Ok(arc_val.as_ref().to_vec());
+			}
+		}
 
-		// all_dram implementation - no tiering, all data in DRAM
-		let result = match self.objects.get(&hashed_key) {
+		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", feature = "hashtable_tiering"))]
+		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
+			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
+				self.status.incr_hits();
+				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+				// Use data_as_bytes to handle both PhysicalCopy and CxlReference
+				return Ok(dram_object_ref.data_as_bytes());
+			}
+		}
+
+		let result = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
-				// object.data() returns Arc<Box<[u8]>>
-				// We need to clone the actual byte slice into a Vec
 				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
+				Ok(AsRef::<[u8]>::as_ref(&*arc_val).to_vec())
 			},
 
 			_ => {
@@ -1280,10 +1404,6 @@ where
 
 		result
 	}
-
-
-
-
 
 	/// Sets the supplied key and value in the cache.
 	/// Returns a [`CacheError`] if the value size is zero or larger than
@@ -1304,101 +1424,59 @@ where
 	///
 	/// assert!(cache.set(0, 0, None).is_ok());
 	/// ```
-
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		
-		//let t0 = rdtsc();
 		let hashed_key = self.hash_key(&key);
-		//let t1 = rdtsc();
-		//PHASE_PRE_ALLOC.record(t1 - t0);
 
-		//allocate it as a regular buffer... 
-		//let val_buf: Box<[u8]> = value.to_vec().into_boxed_slice();
+		// Under `sets_dram`, admission is handled entirely by the tiering
+		// manager (which owns its own DRAM side-cache and backfills to the
+		// slow tier asynchronously) -- the shared `objects` map is never
+		// touched directly by a `sets_dram` `set()`.
+		#[cfg(feature = "sets_dram")]
+		{
+			self.tiering_manager.set_dram(hashed_key, key.clone(), value, ttl);
+			return Ok(());
+		}
 
-		//let key_buff = Box::new(key);
+		#[cfg(not(feature = "sets_dram"))]
+		{
+			let val_buf: V = V::from_bytes(value);
+			let object = Object::new(key, val_buf, ttl);
+			let base_size = self.overhead_manager.base_size(&object);
+			let expiry = object.expiry();
 
-		//let t2_start = rdtsc();
-		//let mut val_buf: Vec<u8> = Vec::with_capacity(value.len());
-
-		//let t2_end = rdtsc();
-		//PHASE_ALLOC.record(t2_end - t2_start);
-
-		// === phase 3: memcpy value into PMEM ===
-		//let t3_start = rdtsc();
-		//val_buf.extend_from_slice(value);
-		//let val_buf: BufferDRAM = val_buf.into_boxed_slice();
-		let val_buf: BufferDRAM = Box::clone_from_ref(value);
-
-		/* 
-		unsafe {
-			let ptr = val_buf.as_ptr();
-			let len = val_buf.len();
-
-			if len > 0 {
-				let cache_line_size = 64usize;
-				let start = ptr as usize;
-				let end = start + len;
-
-				let mut addr = start & !(cache_line_size - 1);
-
-				while addr < end {
-					_mm_clflush(addr as *const u8);
-					addr += cache_line_size;
-				}
-
-				_mm_sfence();
+			if base_size == 0 {
+				return Err(CacheError::ZeroValueSize);
 			}
+
+			if self.status.exceeds_max_size(base_size) {
+				return Err(CacheError::ExceedingValueSize);
+			}
+
+			self.status.incr_sets();
+
+			let old_object_info = self.objects
+				.insert(hashed_key, object)
+				.map(|old_object| {
+					let base_size = self.overhead_manager.base_size(&old_object);
+					let expiry = old_object.expiry();
+
+					(base_size, expiry)
+				});
+
+			let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+				base_size as i64 - old_object_size as i64
+			} else {
+				// the object is new, so increase the number of objects count
+				self.status.incr_num_objects();
+				base_size as i64
+			};
+
+			self.status.update_base_used_size(base_size_delta);
+			self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+
+			Ok(())
 		}
-		*/
-		//let t3_end = rdtsc();
-		//PHASE_MEMCPY.record(t3_end - t3_start);
-
-		//let t4_start = rdtsc();
-		let object = Object::new(key, val_buf, ttl);
-		//let t4_end = rdtsc();
-		//PHASE_POST.record(t4_end - t4_start);
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		//let t5_start = rdtsc();
-		let old_object_info = self.objects
-			.insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-
-				(base_size, expiry)
-			});
-		//let t5_end = rdtsc();
-		//PHASE_INSERT.record(t5_end - t5_start);
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			// the object is new, so increase the number of objects count
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		//let t6_start = rdtsc();
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-		//let t6_end = rdtsc();
-		//PHASE_SET_BROADCAST.record(t6_end - t6_start);
-
-		Ok(())
 	}
-
 
 	/// Deletes the object associated with the supplied key in the cache.
 	/// Returns a [`CacheError`] if the key was not found in the cache.
@@ -1457,7 +1535,7 @@ where
 		let hashed_key = self.hash_key(key);
 
 		self.objects
-			.get(&hashed_key)
+			.get_ref(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
 	}
 
@@ -1489,10 +1567,10 @@ where
 	/// assert!(cache.peek(&1).is_ok());
 	/// assert!(cache.peek(&2).is_ok());
 	/// ```
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
+	pub fn peek(&self, key: &K) -> Result<Arc<V>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		match self.objects.get(&hashed_key) {
+		match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
 				Ok(object.data()),
 
@@ -1519,7 +1597,7 @@ where
 	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		let mut object = match self.objects.get_mut(&hashed_key) {
+		let mut object = match self.objects.get_mut_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => object,
 			_ => return Err(CacheError::KeyNotFound),
 		};
@@ -1561,7 +1639,7 @@ where
 	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		match self.objects.get(&hashed_key) {
+		match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
 				Ok(self.overhead_manager.total_size(&object)),
 
@@ -1662,6 +1740,36 @@ where
 		Ok(())
 	}
 
+	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
+	/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
+	pub fn tiering_stats(&self) -> tiering::TieringStats {
+		self.tiering_manager.stats()
+	}
+
+	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
+	/// Sets the DRAM tier threshold in bytes.
+	pub fn set_dram_threshold(&self, threshold: u64) {
+		self.tiering_manager.set_dram_threshold(threshold);
+	}
+
+	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
+	/// Gets the current DRAM tier threshold in bytes.
+	pub fn dram_threshold(&self) -> u64 {
+		self.tiering_manager.dram_threshold()
+	}
+
+	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
+	/// Sets the hotness threshold for promotion to DRAM.
+	pub fn set_hotness_threshold(&self, threshold: u64) {
+		self.tiering_manager.set_hotness_threshold(threshold);
+	}
+
+	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
+	/// Gets the current hotness threshold.
+	pub fn hotness_threshold(&self) -> u64 {
+		self.tiering_manager.hotness_threshold()
+	}
+
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
 		if let Err(err) = self.worker_manager.try_send(event) {
 			error!("Could not communicate with workers: {err:?}");
@@ -1674,7 +1782,19 @@ where
 	fn hash_key(&self, key: &K) -> HashedKey {
 		self.hasher.hash_one(key)
 	}
+}
 
+/// `S3FifoHybridCache`'s small (DRAM) tier needs a constructor that fires a
+/// callback on every policy-worker eviction (see `worker/policy/mod.rs`'s
+/// `eviction_callback`). This only ever applies to `BufferDRAM` -- the small
+/// tier is always plain DRAM by design -- so it's kept as its own
+/// non-generic constructor rather than folded into the generic block above.
+#[cfg(feature = "hybridcache")]
+impl<K, S> PaperCache<K, BufferDRAM, S>
+where
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone,
+	S: Default + Clone + BuildHasher,
+{
 	/// Creates an empty `PaperCache` that fires `eviction_callback` each time
 	/// the policy worker evicts an item.
 	///
@@ -1684,7 +1804,6 @@ where
 	///
 	/// Used by [`crate::hybridcache::S3FifoHybridCache`] to write evicted items
 	/// to the far-memory tier.
-	#[cfg(feature = "hybridcache")]
 	pub fn new_with_eviction_callback(
 		max_size: CacheSize,
 		policies: &[PaperPolicy],
@@ -1746,61 +1865,31 @@ where
 }
 
 
-
-
-
-
-#[cfg(all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem")))]
-impl<K, S> PaperCache<K, BufferPMEM, S>
+// ---------------------------------------------------------------------
+// Shape B: `RwLock<HashMap<..., A>>`-backed object map, generic over the
+// allocator `A`. Covers `global_hashtable_pmem` alone (V = BufferDRAM,
+// A = Hybrid), `hashbrown_dram` (V = BufferDRAM, A = default/Global), and
+// `key_value_pmem` + `global_hashtable_pmem` together (V = BufferPMEM,
+// A = Hybrid) -- see `ObjectMapRef`'s two RwLock arms above. One
+// generic-over-`V: ValueBuffer` block replaces what used to be three
+// nearly-identical impl blocks.
+//
+// Unlike Shape A, this shape's tiering-manager support is limited to the
+// plain `enable_tiering_manager` DRAM-side-cache check in `get()` -- there
+// is no `sets_dram`/`hashtable_tiering` support here, and no
+// `tiering_stats`/`set_dram_threshold`/etc. accessors, matching this
+// shape's pre-merge behavior exactly (only Shape A ever had those).
+// ---------------------------------------------------------------------
+#[cfg(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
+impl<K, V, S> PaperCache<K, V, S>
 where
-    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
-    S: Default + Clone + BuildHasher,
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone,
+	V: ValueBuffer,
+	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` with maximum size `max_size` and
 	/// eviction policy `policy`. If the maximum size is zero, a
 	/// [`CacheError`] will be returned.
-	///
-	/// # Examples
-	///
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// );
-	///
-	/// assert!(cache.is_ok());
-	///
-	/// // Supplying a maximum size of zero will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
-	///     0,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// );
-	///
-	/// assert!(cache.is_err());
-	///
-	/// // Supplying duplicate policies will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu, PaperPolicy::Lru, PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// );
-	///
-	/// assert!(cache.is_err());
-	///
-	/// // Supplying a non-configured policy will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lru,
-	/// );
-	///
-	/// assert!(cache.is_err());
-	/// ```
-	
 	pub fn new(
 		max_size: CacheSize,
 		policies: &[PaperPolicy],
@@ -1815,24 +1904,6 @@ where
 	}
 
 	/// Creates an empty `PaperCache` with the supplied hasher.
-	///
-	/// # Examples
-	///
-	/// ```
-	/// use std::hash::RandomState;
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let cache = PaperCache::<u32, u32>::with_hasher(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	///     RandomState::default(),
-	/// );
-	///
-	/// assert!(cache.is_ok());
-	/// ```
-	
-
 	pub fn with_hasher(
 		max_size: CacheSize,
 		policies: &[PaperPolicy],
@@ -1859,105 +1930,34 @@ where
 			return Err(CacheError::UnconfiguredPolicy);
 		}
 
-		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		// Global hashtable in PMEM (Hybrid allocator) when
+		// `global_hashtable_pmem` is on; otherwise a plain-DRAM hashbrown
+		// table (`hashbrown_dram`'s default allocator).
+		#[cfg(feature = "global_hashtable_pmem")]
+		let objects = Arc::new(RwLock::new(HashMap::with_hasher_in(
+			NoHasher::default(),
+			Hybrid,
+		)));
+
+		#[cfg(not(feature = "global_hashtable_pmem"))]
+		let objects = Arc::new(RwLock::new(HashMap::with_hasher(
+			NoHasher::default(),
+		)));
+
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", not(feature = "sets_dram")))]
+		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 		let tiering_manager = {
 			// Create tiering manager with default DRAM threshold at 20% of max_size
-			let tiering_config = tiering::TieringConfig::default();
+			let mut tiering_config = tiering::TieringConfig::default();
+			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
 			Arc::new(TieringManager::new(tiering_config))
-		};
-
-		#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
-		let tiering_manager = {
-			let tiering_config = tiering::TieringConfig::default();
-
-			let objects_bg = objects.clone();
-			let status_bg = status.clone();
-			let overhead_bg = overhead_manager.clone();
-
-			// Arc::new_cyclic lets the persist closure capture a Weak<TieringManager>
-			// so it can call mark_persisted() after the background PMEM write succeeds.
-			// The Weak is safe to upgrade once jobs are dequeued, which is always after
-			// the Arc is fully initialised and returned from with_hasher.
-			Arc::new_cyclic(|weak_tm: &std::sync::Weak<TieringManager<K, BufferPMEM>>| {
-				let weak_tm = weak_tm.clone();
-
-				let batch_persist_cb = move |batch: Vec<crate::tiering::manager::PmemBackfillJob<K>>| {
-					// Upgrade the weak reference once per batch to avoid repeated
-					// atomic operations and to fail fast if the manager was dropped.
-					let Some(tm) = weak_tm.upgrade() else { return };
-
-					// ── Phase 1: Pre-allocate PMEM for each job ─────────────────────
-					// Perform all allocations before touching the objects map so that
-					// the DashMap shards are locked for the shortest possible window.
-					// Also performs a TOCTOU check: skip any key whose tier has already
-					// changed (e.g. a concurrent delete or a newer set replaced it).
-					let mut pmem_objects = Vec::with_capacity(batch.len());
-					for job in batch {
-						// TOCTOU: if the key is no longer DramOnly, a concurrent
-						// operation already updated or removed it – skip to avoid
-						// overwriting a newer value.
-						if !tm.is_dram_only(job.hashed_key) {
-							continue;
-						}
-
-						// Allocate value bytes in PMEM via the Hybrid allocator.
-						let mut pmem_vec = Vec::<u8, Hybrid>::with_capacity_in(job.value.len(), Hybrid);
-						pmem_vec.extend_from_slice(&job.value);
-						let val_buf: BufferPMEM = pmem_vec.into_boxed_slice();
-
-						let object = crate::object::Object::new(job.key, val_buf, job.ttl);
-						let base_size = overhead_bg.base_size(&object);
-
-						if base_size == 0 || status_bg.exceeds_max_size(base_size) {
-							// PMEM write cannot proceed; remove the stuck DramOnly entry.
-							tm.remove_object(job.hashed_key);
-							continue;
-						}
-
-						pmem_objects.push((job.hashed_key, object, base_size));
-					}
-
-					// ── Phase 2: Minimal locking – batch inserts into the objects map ──
-					let mut batch_delta: i64 = 0;
-					let mut batch_count: u64 = 0;
-
-					for (hashed_key, object, base_size) in pmem_objects {
-						let old_size = objects_bg
-							.insert(hashed_key, object)
-							.map(|old| overhead_bg.base_size(&old));
-
-						match old_size {
-							Some(old) => batch_delta += base_size as i64 - old as i64,
-							None => {
-								batch_count += 1;
-								batch_delta += base_size as i64;
-							}
-						}
-
-						// Transition tier from DramOnly -> DramAndPmem immediately
-						// after each insert so the window where the object is in the
-						// objects map but still DramOnly is as short as possible.
-						tm.mark_persisted(hashed_key);
-					}
-
-					// ── Phase 3: Deferred atomics – one update per batch ─────────────
-					// Apply the accumulated size delta and new-object count in a single
-					// pair of atomic operations to minimise cache-line bouncing.
-					status_bg.update_base_used_size(batch_delta);
-					status_bg.add_num_objects(batch_count);
-				};
-
-				TieringManager::new_with_backfill(tiering_config, batch_persist_cb)
-			})
 		};
 
 		let (worker_sender, worker_listener) = unbounded();
 
-		#[cfg(all(feature = "enable_tiering_manager", not(feature = "sets_dram")))]
+		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
@@ -1966,16 +1966,7 @@ where
 			&tiering_manager,
 		)?;
 
-		#[cfg(feature = "sets_dram")]
-		let mut worker_manager = WorkerManager::new(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-			&tiering_manager,
-		)?;
-
-		#[cfg(all(not(feature = "enable_tiering_manager"), not(feature = "sets_dram")))]
+		#[cfg(not(all(feature = "key_value_pmem", feature = "enable_tiering_manager")))]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
@@ -1988,11 +1979,10 @@ where
 		let cache = PaperCache {
 			objects,
 			status,
-
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
-			
-			#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
+
+			#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 			tiering_manager,
 
 			hasher,
@@ -2001,400 +1991,143 @@ where
 		Ok(cache)
 	}
 
-	/// Returns the current cache version.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu
-	/// ).unwrap();
-	///
-	/// assert_eq!(cache.version(), env!("CARGO_PKG_VERSION"));
-	/// ```
 	#[must_use]
 	pub fn version(&self) -> String {
 		env!("CARGO_PKG_VERSION").to_owned()
 	}
 
-	/// Returns the current statistics.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// let status = cache.status().unwrap();
-	/// assert!(status.used_size() > 0);
-	/// ```
-	
 	pub fn status(&self) -> Result<Status, CacheError> {
 		self.status.try_to_status()
 	}
 
 	/// Gets the value associated with the supplied key.
 	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// // Getting a key which exists in the cache will return the associated value.
-	/// assert!(cache.get(&0).is_ok());
-	/// // Getting a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.get(&1).is_err());
-	/// ```
-	/// 
-	
-/*
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
-	{
-		let hashed_key = self.hash_key(key);
+	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
+		// This ad hoc rdtsc phase instrumentation predates this merge and
+		// only ever ran for this shape without `key_value_pmem` (i.e. the
+		// pre-merge `global_hashtable_pmem`-alone / `hashbrown_dram`-alone
+		// blocks); preserved as-is, gated the same way, rather than
+		// expanded to every combination this shape now also covers.
+		#[cfg(not(feature = "key_value_pmem"))]
+		{
+			let t0 = rdtsc();
+			let hashed_key = self.hash_key(key);
+			let t1 = rdtsc();
+			PHASE_GET_HASH.record(t1 - t0);
 
-		// Check DRAM tier first
-		#[cfg(feature = "enable_tiering_manager")]
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				let arc_val = dram_object_ref.data();
-				//println!("CACHE: get for key {:?} from DRAM tier", key);
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
-				return Ok(arc_val.as_ref().to_vec());
-			}
+			let lookup = self.objects.get_ref(&hashed_key);
+			let t2 = rdtsc();
+			PHASE_GET_LOCK.record(t2 - t1);
+
+			let result = match lookup {
+				Some(object) => {
+					let matched = object.key_matches(key) && !object.is_expired();
+					let t3 = rdtsc();
+					PHASE_GET_VALIDATE.record(t3 - t2);
+
+					if matched {
+						self.status.incr_hits();
+						let arc_val = object.data();
+						let v = AsRef::<[u8]>::as_ref(&*arc_val).to_vec();
+						let t4 = rdtsc();
+						PHASE_GET_COPY.record(t4 - t3);
+						Ok(v)
+					} else {
+						self.status.incr_misses();
+						Err(CacheError::KeyNotFound)
+					}
+				}
+				None => {
+					self.status.incr_misses();
+					Err(CacheError::KeyNotFound)
+				}
+			};
+
+			let t5 = rdtsc();
+			let br = self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()));
+			let t6 = rdtsc();
+			PHASE_GET_BROADCAST.record(t6 - t5);
+			br?;
+
+			return result;
 		}
 
-		let result = match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
-				let arc_val = object.data();
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				Ok(arc_val.as_ref().to_vec())
-			},
+		#[cfg(feature = "key_value_pmem")]
+		{
+			let hashed_key = self.hash_key(key);
 
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
+			#[cfg(feature = "enable_tiering_manager")]
+			if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
+				if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
+					self.status.incr_hits();
+					self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+					let arc_val = dram_object_ref.data();
+					return Ok(arc_val.as_ref().to_vec());
+				}
+			}
 
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+			let result = match self.objects.get_ref(&hashed_key) {
+				Some(object) if object.key_matches(key) && !object.is_expired() => {
+					self.status.incr_hits();
+					let arc_val = object.data();
+					Ok(AsRef::<[u8]>::as_ref(&*arc_val).to_vec())
+				},
 
-		// Optional: inspect the underlying bytes/tier of the returned value for debugging
-		//println!("CACHE: get result for key {:?}: {:?} ", key, result);
-		result
+				_ => {
+					self.status.incr_misses();
+					Err(CacheError::KeyNotFound)
+				},
+			};
+
+			self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+
+			result
+		}
 	}
-
-	*/
-
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
-	{
-		let hashed_key = self.hash_key(key);
-
-		// Check DRAM tier first
-		#[cfg(all(feature = "enable_tiering_manager", not(feature = "hashtable_tiering")))]
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				let arc_val = dram_object_ref.data();
-				//println!("CACHE: get for key {:?} from DRAM tier", key);
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
-				return Ok(arc_val.as_ref().to_vec());
-			}
-		}
-
-		#[cfg(all(feature = "enable_tiering_manager", feature = "hashtable_tiering"))]
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				// Use data_as_bytes method to handle both PhysicalCopy and CxlReference
-				//this could be incorrect.....
-				return Ok(dram_object_ref.data_as_bytes());
-			}
-		}
-
-		let result = match self.objects.get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
-				let arc_val = object.data();
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				Ok(arc_val.as_ref().to_vec())
-			},
-
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-
-		// Optional: inspect the underlying bytes/tier of the returned value for debugging
-		//println!("CACHE: get result for key {:?}: {:?} ", key, result);
-		result
-	}
-
-
-
-
 
 	/// Sets the supplied key and value in the cache.
 	/// Returns a [`CacheError`] if the value size is zero or larger than
 	/// the cache's maximum size.
-	///
-	/// If the key already exists in the cache, the associated value is updated
-	/// to the supplied value.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.set(0, 0, None).is_ok());
-	/// ```
-	
-	// not V but &[u8]?? 
-
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> 
-	where
-    	//V: AsRef<[u8]> + TypeSize,
-		K: 'static + Eq + Hash + TypeSize + std::fmt::Debug,
-	{
-
-		//let t0 = rdtsc();
+	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
-		//let t1 = rdtsc();
-		//PHASE_PRE_ALLOC.record(t1 - t0);
 
+		let val_buf: V = V::from_bytes(value);
+		let object = Object::new(key, val_buf, ttl);
 
-		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
+		let base_size = self.overhead_manager.base_size(&object);
+		let expiry = object.expiry();
 
-		//allocate the object in the cache itself.... lets say pmem buffer
-		
-		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
-		//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
-		//buf1.extend_from_slice(&value);
-
-		//let buf: BufferPMEM = buf1.into_boxed_slice();
-
-
-		#[cfg(feature = "sets_dram")]
-		{
-			self.tiering_manager.set_dram(hashed_key, key.clone(), value, ttl);
-			return Ok(());
+		if base_size == 0 {
+			return Err(CacheError::ZeroValueSize);
 		}
 
-
-		#[cfg(not(feature = "sets_dram"))]
-		{
-
-			/* 
-			let layout = Layout::from_size_align(value.len(), 1).unwrap();
-
-			let memory_block = Hybrid.allocate(layout)
-				.map_err(|_| CacheError::Internal)?;
-
-			// 1. Get the raw pointer to the start of the memory
-			let memory_ptr = memory_block.as_ptr() as *mut u8;
-
-			unsafe {
-				ptr::copy_nonoverlapping(value.as_ptr(), memory_ptr, value.len());
-
-				use std::arch::x86_64::{_mm_clflush, _mm_sfence};
-
-				let cache_line_size = 64usize;
-				let start = memory_ptr as usize;
-				let end = start + value.len();
-				// Round start down to a cache-line boundary so we flush the line
-				// containing the first byte even if the allocation isn't aligned.
-				let mut addr = start & !(cache_line_size - 1);
-				while addr < end {
-					_mm_clflush(addr as *const u8);
-					addr += cache_line_size;
-				}
-				_mm_sfence();
-			}
-
-			let val_buf: BufferPMEM = unsafe {
-				Box::from_raw_in(
-					ptr::slice_from_raw_parts_mut(memory_ptr, value.len()),
-					Hybrid
-				)
-			};
-			
-
-			 */
-
-			//let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
-
-
-			//pub fn clone_from_ref_in(src: &T, alloc: A) -> Box<T, A>
-
-			// === phase 2: allocation of value buffer ===
-			//let t2_start = rdtsc();
-			//let mut val_buf: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
-			let val_buf: BufferPMEM = Box::clone_from_ref_in(value, Hybrid);
-			//let mut uninit_buf = Box::new_uninit_slice_in(value.len(), Hybrid);
-			//let t2_end = rdtsc();
-			//PHASE_ALLOC.record(t2_end - t2_start);
-
-			// === phase 3: memcpy value into PMEM ===
-			//let t3_start = rdtsc();
-			//val_buf.extend_from_slice(value);
-			//let val_buf: BufferPMEM = val_buf.into_boxed_slice();
-
-			/*
-			unsafe {
-				let ptr = val_buf.as_ptr();
-				let len = val_buf.len();
-
-				if len > 0 {
-					let cache_line_size = 64usize;
-					let start = ptr as usize;
-					let end = start + len;
-
-					let mut addr = start & !(cache_line_size - 1);
-
-					while addr < end {
-						_mm_clflush(addr as *const u8);
-						addr += cache_line_size;
-					}
-
-					_mm_sfence();
-				}
-			}
-			*/
-
-				
-
-		
-			//unsafe {
-				// Copy directly into the uninitialized raw pointer
-			//	ptr::copy_nonoverlapping(
-			//		value.as_ptr(), 
-			//		uninit_buf.as_mut_ptr() as *mut u8, 
-			//		value.len()
-			//	);
-			//}
-			//let val_buf: BufferPMEM = unsafe { uninit_buf.assume_init() };
-
-			//let val_buf: BufferPMEM = { uninit_buf.assume_init() };
-			//let t3_end = rdtsc();
-			//PHASE_MEMCPY.record(t3_end - t3_start);
-
-			//let key_buf: BufferPMEM = 
-
-			//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(key.len(), Hybrid); 
-			//buf1.extend_from_slice(&key);
-			//let key_buf: BufferPMEM = buf1.into_boxed_slice();
-
-			//let key_buf: BufferPMEM = key.to_vec_in(Hybrid).into_boxed_slice();
-
-			//the key should also be in pmem... this is stale or wrong... mut have changed it back??
-			//let t4_start = rdtsc();
-			let object = Object::new(key, val_buf, ttl);
-			//let t4_end = rdtsc();
-			//PHASE_POST.record(t4_end - t4_start);
-
-			let base_size = self.overhead_manager.base_size(&object);
-			let expiry = object.expiry();
-
-			if base_size == 0 {
-				return Err(CacheError::ZeroValueSize);
-			}
-
-			if self.status.exceeds_max_size(base_size) {
-				return Err(CacheError::ExceedingValueSize);
-			}
-
-			self.status.incr_sets();
-
-			//let t5_start = rdtsc();
-			let old_object_info = self.objects
-				.insert(hashed_key, object)
-				.map(|old_object| {
-					let base_size = self.overhead_manager.base_size(&old_object);
-					let expiry = old_object.expiry();
-
-					(base_size, expiry)
-				});
-			//let t5_end = rdtsc();
-			//PHASE_INSERT.record(t5_end - t5_start);
-
-			let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-				base_size as i64 - old_object_size as i64
-			} else {
-				// the object is new, so increase the number of objects count
-				self.status.incr_num_objects();
-				base_size as i64
-			};
-
-			self.status.update_base_used_size(base_size_delta);
-			//let t6_start = rdtsc();
-			self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-			//let t6_end = rdtsc();
-			//PHASE_SET_BROADCAST.record(t6_end - t6_start);
-			Ok(())
+		if self.status.exceeds_max_size(base_size) {
+			return Err(CacheError::ExceedingValueSize);
 		}
 
-		//self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+		self.status.incr_sets();
 
-		//Ok(())
+		let old_object_info = self.objects
+			.insert(hashed_key, object)
+			.map(|old_object| {
+				let base_size = self.overhead_manager.base_size(&old_object);
+				let expiry = old_object.expiry();
+				(base_size, expiry)
+			});
+
+		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+			base_size as i64 - old_object_size as i64
+		} else {
+			self.status.incr_num_objects();
+			base_size as i64
+		};
+
+		self.status.update_base_used_size(base_size_delta);
+		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+
+		Ok(())
 	}
 
-
-
-	/// Deletes the object associated with the supplied key in the cache.
-	/// Returns a [`CacheError`] if the key was not found in the cache.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	/// assert!(cache.del(&0).is_ok());
-	///
-	/// // Deleting a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.del(&1).is_err());
-	/// ```
-	
 	pub fn del(&self, key: &K) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(key);
 
@@ -2411,96 +2144,28 @@ where
 		Ok(())
 	}
 
-	/// Checks if an object with the supplied key exists in the cache without
-	/// altering any of the cache's internal queues.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// assert!(cache.has(&0));
-	/// assert!(!cache.has(&1));
-	/// ```
-	
 	pub fn has(&self, key: &K) -> bool {
 		let hashed_key = self.hash_key(key);
 
 		self.objects
-			.get(&hashed_key)
+			.get_ref(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
 	}
 
-	/// Gets (peeks) the value associated with the supplied key without altering
-	/// any of the cache's internal queues.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	/// cache.set(1, 0, None);
-	///
-	/// // Peeking a key which exists in the cache will return the associated value.
-	/// assert!(cache.peek(&0).is_ok());
-	/// // Peeking a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.peek(&2).is_err());
-	///
-	/// cache.set(2, 0, None);
-	///
-	/// // Peeking a key will not alter the eviction order of the objects.
-	/// assert!(cache.peek(&1).is_ok());
-	/// assert!(cache.peek(&2).is_ok());
-	/// ```
-	
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferPMEM>, CacheError> {
+	pub fn peek(&self, key: &K) -> Result<Arc<V>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		match self.objects.get(&hashed_key) {
+		match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
 				Ok(object.data()),
-
 			_ => Err(CacheError::KeyNotFound),
 		}
 	}
 
-	/// Sets the TTL associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None); // value will not expire
-	/// cache.ttl(&0, Some(5)); // value will expire in 5 seconds
-	/// ```
-	
-
 	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		let mut object = match self.objects.get_mut(&hashed_key) {
+		let mut object = match self.objects.get_mut_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => object,
 			_ => return Err(CacheError::KeyNotFound),
 		};
@@ -2519,52 +2184,16 @@ where
 		Ok(())
 	}
 
-	/// Gets the size of the value associated with the supplied key in bytes.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// // Sizing a key which exists in the cache will return the size of the associated value.
-	/// assert!(cache.size(&0).is_ok());
-	/// // Sizing a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.size(&1).is_err());
-	/// ```
 	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		match self.objects.get(&hashed_key) {
+		match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
 				Ok(self.overhead_manager.total_size(&object)),
-
 			_ => Err(CacheError::KeyNotFound),
 		}
 	}
 
-	/// Deletes all objects in the cache and sets the cache's used size to zero.
-	/// Returns a [`CacheError`] if the objects could not be wiped.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.wipe();
-	/// ```
 	pub fn wipe(&self) -> Result<(), CacheError> {
 		info!("Wiping cache");
 
@@ -2576,406 +2205,6 @@ where
 		Ok(())
 	}
 
-	/// Resizes the cache to the supplied maximum size.
-	/// If the supplied size is zero, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.resize(1).is_ok());
-	///
-	/// // Resizing to a size of zero will return a CacheError.
-	/// assert!(cache.resize(0).is_err());
-	/// ```
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	/// Sets the eviction policy of the cache to the supplied policy.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.policy(PaperPolicy::Lfu).is_ok());
-	/// assert!(cache.policy(PaperPolicy::Lru).is_err());
-	/// ```
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
-	pub fn tiering_stats(&self) -> tiering::TieringStats {
-		self.tiering_manager.stats()
-	}
-
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	/// Sets the DRAM tier threshold in bytes.
-	pub fn set_dram_threshold(&self, threshold: u64) {
-		self.tiering_manager.set_dram_threshold(threshold);
-	}
-
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	/// Gets the current DRAM tier threshold in bytes.
-	pub fn dram_threshold(&self) -> u64 {
-		self.tiering_manager.dram_threshold()
-	}
-
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	/// Sets the hotness threshold for promotion to DRAM.
-	pub fn set_hotness_threshold(&self, threshold: u64) {
-		self.tiering_manager.set_hotness_threshold(threshold);
-	}
-
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	/// Gets the current hotness threshold.
-	pub fn hotness_threshold(&self) -> u64 {
-		self.tiering_manager.hotness_threshold()
-	}
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
-	}
-
-}
-
-
-// Implementation for global_hashtable_pmem alone (without key_value_pmem)
-// This case uses BufferDRAM for values (data in DRAM) but hashtable in PMEM
-#[cfg(all(feature = "global_hashtable_pmem", not(feature = "key_value_pmem")))]
-impl<K, S> PaperCache<K, BufferDRAM, S>
-where
-    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone,
-    S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` with maximum size `max_size` and
-	/// eviction policy `policy`. If the maximum size is zero, a
-	/// [`CacheError`] will be returned.
-	pub fn new(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-	) -> Result<Self, CacheError> {
-		Self::with_hasher(
-			max_size,
-			policies,
-			policy,
-			Default::default(),
-		)
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher.
-	pub fn with_hasher(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		if policies.is_empty() {
-			return Err(CacheError::EmptyPolicies);
-		}
-
-		if policies.contains(&PaperPolicy::Auto) {
-			return Err(CacheError::ConfiguredAutoPolicy);
-		}
-
-		if policies.iter().is_multiset() {
-			return Err(CacheError::DuplicatePolicies);
-		}
-
-		if !policy.is_auto() && !policies.contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		// Global hashtable in PMEM using Hybrid allocator
-		let objects = Arc::new(RwLock::new(HashMap::with_hasher_in(
-			NoHasher::default(),
-			Hybrid,
-		)));
-
-		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		let (worker_sender, worker_listener) = unbounded();
-
-		let mut worker_manager = WorkerManager::new(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-		)?;
-
-		thread::spawn(move || worker_manager.run());
-
-		let cache = PaperCache {
-			objects,
-			status,
-			worker_manager: Arc::new(worker_sender),
-			overhead_manager,
-			hasher,
-		};
-
-		Ok(cache)
-	}
-
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-
-/* 
-	// none instrumented get
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
-			},
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-		result
-	}
-
-*/
-
-
-
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let t0 = rdtsc();
-		let hashed_key = self.hash_key(key);
-		let t1 = rdtsc();
-		PHASE_GET_HASH.record(t1 - t0);
-
-		let guard = self.objects.read().unwrap();
-		let t2 = rdtsc();
-		PHASE_GET_LOCK.record(t2 - t1);
-
-		let lookup = guard.get(&hashed_key);
-		let t3 = rdtsc();
-		PHASE_GET_LOOKUP.record(t3 - t2);
-
-		let result = match lookup {
-			Some(object) => {
-				let matched = object.key_matches(key) && !object.is_expired();
-				let t4 = rdtsc();
-				PHASE_GET_VALIDATE.record(t4 - t3);
-
-				if matched {
-					self.status.incr_hits();
-					let arc_val = object.data();
-					let v = arc_val.as_ref().to_vec();
-					let t5 = rdtsc();
-					PHASE_GET_COPY.record(t5 - t4);
-					Ok(v)
-				} else {
-					self.status.incr_misses();
-					Err(CacheError::KeyNotFound)
-				}
-			}
-			None => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			}
-		};
-
-		drop(guard); // release read lock before broadcast — matches original lock scope
-
-		let t6 = rdtsc();
-		let br = self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()));
-		let t7 = rdtsc();
-		PHASE_GET_BROADCAST.record(t7 - t6);
-		br?;
-
-		result
-	}
-
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		// Values stored in DRAM (BufferDRAM = Box<[u8]>)
-		let val_buf: BufferDRAM = value.into();
-		let object = Object::new(key, val_buf, ttl);
-
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.write().unwrap().insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
-
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.read().unwrap().get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let object = match objects_guard.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		self.objects.write().unwrap().clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
 	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
 		if max_size == 0 {
 			return Err(CacheError::ZeroCacheSize);
@@ -3024,1001 +2253,6 @@ where
 	}
 }
 
-
-// Implementation for hashbrown_dram feature (hashbrown HashMap in DRAM)
-// This allows direct performance comparison with global_hashtable_pmem
-#[cfg(all(feature = "hashbrown_dram", not(feature = "key_value_pmem"), not(feature = "global_hashtable_pmem")))]
-impl<K, S> PaperCache<K, BufferDRAM, S>
-where
-    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone,
-    S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` with maximum size `max_size` and
-	/// eviction policy `policy`. If the maximum size is zero, a
-	/// [`CacheError`] will be returned.
-	pub fn new(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-	) -> Result<Self, CacheError> {
-		Self::with_hasher(
-			max_size,
-			policies,
-			policy,
-			Default::default(),
-		)
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher.
-	pub fn with_hasher(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		if policies.is_empty() {
-			return Err(CacheError::EmptyPolicies);
-		}
-
-		if policies.contains(&PaperPolicy::Auto) {
-			return Err(CacheError::ConfiguredAutoPolicy);
-		}
-
-		if policies.iter().is_multiset() {
-			return Err(CacheError::DuplicatePolicies);
-		}
-
-		if !policy.is_auto() && !policies.contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		// Hashbrown HashMap in DRAM (no Hybrid allocator)
-		let objects = Arc::new(RwLock::new(HashMap::with_hasher(
-			NoHasher::default(),
-		)));
-
-		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		let (worker_sender, worker_listener) = unbounded();
-
-		let mut worker_manager = WorkerManager::new(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-		)?;
-
-		thread::spawn(move || worker_manager.run());
-
-		let cache = PaperCache {
-			objects,
-			status,
-			worker_manager: Arc::new(worker_sender),
-			overhead_manager,
-			hasher,
-		};
-
-		Ok(cache)
-	}
-
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-/* 
-	// none instrumented get
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				let arc_val = object.data();
-				Ok(arc_val.as_ref().to_vec())
-			},
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-		result
-	}
-
-	*/
-	
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let t0 = rdtsc();
-		let hashed_key = self.hash_key(key);
-		let t1 = rdtsc();
-		PHASE_GET_HASH.record(t1 - t0);
-
-		let guard = self.objects.read().unwrap();
-		let t2 = rdtsc();
-		PHASE_GET_LOCK.record(t2 - t1);
-
-		let lookup = guard.get(&hashed_key);
-		let t3 = rdtsc();
-		PHASE_GET_LOOKUP.record(t3 - t2);
-
-		let result = match lookup {
-			Some(object) => {
-				let matched = object.key_matches(key) && !object.is_expired();
-				let t4 = rdtsc();
-				PHASE_GET_VALIDATE.record(t4 - t3);
-
-				if matched {
-					self.status.incr_hits();
-					let arc_val = object.data();
-					let v = arc_val.as_ref().to_vec();
-					let t5 = rdtsc();
-					PHASE_GET_COPY.record(t5 - t4);
-					Ok(v)
-				} else {
-					self.status.incr_misses();
-					Err(CacheError::KeyNotFound)
-				}
-			}
-			None => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			}
-		};
-
-		drop(guard); // release read lock before broadcast — matches original lock scope
-
-		let t6 = rdtsc();
-		let br = self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()));
-		let t7 = rdtsc();
-		PHASE_GET_BROADCAST.record(t7 - t6);
-		br?;
-
-		result
-	}
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		// Values stored in DRAM (BufferDRAM = Box<[u8]>)
-		let val_buf: BufferDRAM = value.into();
-		let object = Object::new(key, val_buf, ttl);
-
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.write().unwrap().insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
-
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			.read().unwrap().get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferDRAM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut objects_guard = self.objects.write().unwrap();
-		let object = match objects_guard.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		self.objects.write().unwrap().clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
-	}
-}
-
-
-#[cfg(all(feature = "key_value_pmem", feature = "global_hashtable_pmem"))]
-impl<K, S> PaperCache<K, BufferPMEM, S>
-where
-    K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone, //note added Debug for logging might impact perf thoooo
-    S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` with maximum size `max_size` and
-	/// eviction policy `policy`. If the maximum size is zero, a
-	/// [`CacheError`] will be returned.
-	///
-	/// # Examples
-	///
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// );
-	///
-	/// assert!(cache.is_ok());
-	///
-	/// // Supplying a maximum size of zero will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
-	///     0,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// );
-	///
-	/// assert!(cache.is_err());
-	///
-	/// // Supplying duplicate policies will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu, PaperPolicy::Lru, PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// );
-	///
-	/// assert!(cache.is_err());
-	///
-	/// // Supplying a non-configured policy will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lru,
-	/// );
-	///
-	/// assert!(cache.is_err());
-	/// ```
-	
-	pub fn new(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-	) -> Result<Self, CacheError> {
-		Self::with_hasher(
-			max_size,
-			policies,
-			policy,
-			Default::default(),
-		)
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher.
-	///
-	/// # Examples
-	///
-	/// ```
-	/// use std::hash::RandomState;
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let cache = PaperCache::<u32, u32>::with_hasher(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	///     RandomState::default(),
-	/// );
-	///
-	/// assert!(cache.is_ok());
-	/// ```
-	
-
-	pub fn with_hasher(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		if policies.is_empty() {
-			return Err(CacheError::EmptyPolicies);
-		}
-
-		if policies.contains(&PaperPolicy::Auto) {
-			return Err(CacheError::ConfiguredAutoPolicy);
-		}
-
-		if policies.iter().is_multiset() {
-			return Err(CacheError::DuplicatePolicies);
-		}
-
-		if !policy.is_auto() && !policies.contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		//let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
-
-		#[cfg(not(feature = "global_hashtable_pmem"))]
-		let objects = Arc::new(RwLock::new(HashMap::with_hasher(
-			NoHasher::default(),
-		)));
-
-		#[cfg(feature = "global_hashtable_pmem")]
-		let objects = Arc::new(RwLock::new(HashMap::with_hasher_in(
-			NoHasher::default(),
-			Hybrid,
-		)));
-
-		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		#[cfg(feature = "enable_tiering_manager")]
-		let tiering_manager = {
-			// Create tiering manager with default DRAM threshold at 20% of max_size
-			let mut tiering_config = tiering::TieringConfig::default();
-			//tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
-			Arc::new(TieringManager::new(tiering_config))
-		};
-
-		let (worker_sender, worker_listener) = unbounded();
-
-		#[cfg(feature = "enable_tiering_manager")]
-		let mut worker_manager = WorkerManager::new(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-			&tiering_manager,
-		)?;
-
-		#[cfg(not(feature = "enable_tiering_manager"))]
-		let mut worker_manager = WorkerManager::new(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-		)?;
-
-		thread::spawn(move || worker_manager.run());
-
-		let cache = PaperCache {
-			objects,
-			status,
-
-			worker_manager: Arc::new(worker_sender),
-			overhead_manager,
-			
-			#[cfg(feature = "enable_tiering_manager")]
-			tiering_manager,
-
-			hasher,
-		};
-
-		Ok(cache)
-	}
-
-	/// Returns the current cache version.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu
-	/// ).unwrap();
-	///
-	/// assert_eq!(cache.version(), env!("CARGO_PKG_VERSION"));
-	/// ```
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	/// Returns the current statistics.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// let status = cache.status().unwrap();
-	/// assert!(status.used_size() > 0);
-	/// ```
-	
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	/// Gets the value associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// // Getting a key which exists in the cache will return the associated value.
-	/// assert!(cache.get(&0).is_ok());
-	/// // Getting a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.get(&1).is_err());
-	/// ```
-	/// 
-	
-
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError>
-	{
-		let hashed_key = self.hash_key(key);
-
-		// Check DRAM tier first
-		#[cfg(feature = "enable_tiering_manager")]
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-				let arc_val = dram_object_ref.data();
-				//println!("CACHE: get for key {:?} from DRAM tier", key);
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				//println!("CACHE: get for key {:?} value size: {}", key, arc_val.as_ref().len());
-				return Ok(arc_val.as_ref().to_vec());
-			}
-
-		}
-
-		let result = match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => {
-				self.status.incr_hits();
-				// object.data() returns an Arc<V, Hybrid> — convert to Vec<u8>
-				let arc_val = object.data();
-				//println!("CACHE: get for key {:?}: {:?}", key, arc_val.as_ref().clone());
-				Ok(arc_val.as_ref().to_vec())
-			},
-
-			_ => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-
-		// Optional: inspect the underlying bytes/tier of the returned value for debugging
-		//println!("CACHE: get result for key {:?}: {:?} ", key, result);
-		result
-	}
-
-
-
-
-
-	/// Sets the supplied key and value in the cache.
-	/// Returns a [`CacheError`] if the value size is zero or larger than
-	/// the cache's maximum size.
-	///
-	/// If the key already exists in the cache, the associated value is updated
-	/// to the supplied value.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.set(0, 0, None).is_ok());
-	/// ```
-	
-	// not V but &[u8]?? 
-
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> 
-	where
-    	//V: AsRef<[u8]> + TypeSize,
-		K: 'static + Eq + Hash + TypeSize + std::fmt::Debug,
-	{
-
-		let hashed_key = self.hash_key(&key);
-
-		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
-
-		//allocate the object in the cache itself.... lets say pmem buffer
-		
-		//println!("CACHE: set called for key {:?} with value size {}", key, value.len());
-		//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(value.len(), Hybrid);
-		//buf1.extend_from_slice(&value);
-
-		//let buf: BufferPMEM = buf1.into_boxed_slice();
-
-		let val_buf: BufferPMEM = value.to_vec_in(Hybrid).into_boxed_slice();
-
-		//let key_buf: BufferPMEM = 
-
-		//let mut buf1: Vec<u8, Hybrid> = Vec::with_capacity_in(key.len(), Hybrid); 
-		//buf1.extend_from_slice(&key);
-		//let key_buf: BufferPMEM = buf1.into_boxed_slice();
-
-		//let key_buf: BufferPMEM = key.to_vec_in(Hybrid).into_boxed_slice();
-
-		let object = Object::new(key, val_buf, ttl);
-
-		//should =turn this into pmem buffer .... 
-
-
-		//let object = Object::new(key, value, ttl);
-		let base_size = self.overhead_manager.base_size(&object);
-		let expiry = object.expiry();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			//.insert(hashed_key, object)
-			.write().unwrap().insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			// the object is new, so increase the number of objects count
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-		Ok(())
-	}
-
-
-
-	/// Deletes the object associated with the supplied key in the cache.
-	/// Returns a [`CacheError`] if the key was not found in the cache.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	/// assert!(cache.del(&0).is_ok());
-	///
-	/// // Deleting a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.del(&1).is_err());
-	/// ```
-	
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	/// Checks if an object with the supplied key exists in the cache without
-	/// altering any of the cache's internal queues.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// assert!(cache.has(&0));
-	/// assert!(!cache.has(&1));
-	/// ```
-	
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		self.objects
-			//.get(&hashed_key)
-			.read().unwrap().get(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	/// Gets (peeks) the value associated with the supplied key without altering
-	/// any of the cache's internal queues.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	/// cache.set(1, 0, None);
-	///
-	/// // Peeking a key which exists in the cache will return the associated value.
-	/// assert!(cache.peek(&0).is_ok());
-	/// // Peeking a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.peek(&2).is_err());
-	///
-	/// cache.set(2, 0, None);
-	///
-	/// // Peeking a key will not alter the eviction order of the objects.
-	/// assert!(cache.peek(&1).is_ok());
-	/// assert!(cache.peek(&2).is_ok());
-	/// ```
-	
-
-	pub fn peek(&self, key: &K) -> Result<Arc<BufferPMEM>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		//match self.objects.get(&hashed_key) {
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Sets the TTL associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None); // value will not expire
-	/// cache.ttl(&0, Some(5)); // value will expire in 5 seconds
-	/// ```
-	
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		//let mut object = match self.objects.get_mut(&hashed_key) {
-		//let mut object = match self.objects.write().unwrap().get_mut(&hashed_key) {
-		let mut objects_guard = self.objects.write().unwrap();
-		let object = match objects_guard.get_mut(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	/// Gets the size of the value associated with the supplied key in bytes.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.set(0, 0, None);
-	///
-	/// // Sizing a key which exists in the cache will return the size of the associated value.
-	/// assert!(cache.size(&0).is_ok());
-	/// // Sizing a key which does not exist in the cache will return a CacheError.
-	/// assert!(cache.size(&1).is_err());
-	/// ```
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		//match self.objects.get(&hashed_key) {
-		match self.objects.read().unwrap().get(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	/// Deletes all objects in the cache and sets the cache's used size to zero.
-	/// Returns a [`CacheError`] if the objects could not be wiped.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// cache.wipe();
-	/// ```
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		//self.objects.clear();
-		self.objects.write().unwrap().clear();
-		self.status.clear();
-
-		self.broadcast(WorkerEvent::Wipe)?;
-
-		Ok(())
-	}
-
-	/// Resizes the cache to the supplied maximum size.
-	/// If the supplied size is zero, returns a [`CacheError`].
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.resize(1).is_ok());
-	///
-	/// // Resizing to a size of zero will return a CacheError.
-	/// assert!(cache.resize(0).is_err());
-	/// ```
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	/// Sets the eviction policy of the cache to the supplied policy.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.policy(PaperPolicy::Lfu).is_ok());
-	/// assert!(cache.policy(PaperPolicy::Lru).is_err());
-	/// ```
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		if let Err(err) = self.worker_manager.try_send(event) {
-			error!("Could not communicate with workers: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		Ok(())
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
-	}
-}
 
 
 pub enum EraseKey<'a, K> {
