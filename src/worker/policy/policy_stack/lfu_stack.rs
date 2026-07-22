@@ -60,22 +60,12 @@ pub struct LfuStack {
 #[cfg(feature = "eviction_stacks_pmem")]
 impl Default for LfuStack {
     fn default() -> Self {
-        // Capacity can be tuned via env var.  For pmem_region_alloc, keep a smaller
-        // default to avoid exhausting the pre-mapped region during stack initialization.
+        // Capacity can be tuned via env var.
         let default_capacity = std::env::var("PAPER_CACHE_EVICTION_STACK_CAPACITY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or({
-                #[cfg(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
-                {
-                    50_000_000
-                }
-                #[cfg(not(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator")))]
-                {
-                    50_000_000
-                }
-            });
+            .unwrap_or(50_000_000);
 
         Self::with_capacity(default_capacity)
     }

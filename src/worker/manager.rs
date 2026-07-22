@@ -82,54 +82,7 @@ impl Worker for WorkerManager {
 }
 
 impl WorkerManager {
-	/// `sets_dram` variant: PolicyWorker receives a TieringManager reference so
-	/// it can intercept evictions of DramOnly keys and force-persist them first.
-	/// No TieringWorker is spawned because tiering is driven by the backfill path.
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", feature = "sets_dram"))]
-	pub fn new<K, V>(
-		listener: WorkerReceiver,
-		objects: &ObjectMapRef<K, V>,
-		status: &StatusRef,
-		overhead_manager: &OverheadManagerRef,
-		tiering_manager: &Arc<TieringManager<K, V>>,
-	) -> Result<Self, CacheError>
-	where
-		K: 'static + Eq + TypeSize + Clone,
-		V: 'static + TypeSize + Clone + AsRef<[u8]>,
-	{
-		let (policy_worker, policy_listener) = unbounded();
-		let (ttl_worker, ttl_listener) = unbounded();
-
-		register_worker(PolicyWorker::<K, V>::new_with_tiering(
-			policy_listener,
-			objects.clone(),
-			status.clone(),
-			overhead_manager.clone(),
-			None,
-			tiering_manager.clone(),
-		)?);
-
-		register_worker(TtlWorker::<K, V>::new(
-			ttl_listener,
-			objects.clone(),
-			status.clone(),
-			overhead_manager.clone(),
-		));
-
-		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
-			policy_worker,
-			ttl_worker,
-		]));
-
-		let manager = WorkerManager {
-			listener,
-			workers,
-		};
-
-		Ok(manager)
-	}
-
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", not(feature = "sets_dram")))]
+	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 	pub fn new<K, V>(
 		listener: WorkerReceiver,
 		objects: &ObjectMapRef<K, V>,

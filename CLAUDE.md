@@ -1761,3 +1761,62 @@ missing-field literal). Also pre-existing: the doc-comment examples on the merge
 (`PaperCache::<u32, u32>::new(...)`) were already failing as doctests before this refactor, since
 `u32` never satisfied the concrete `BufferDRAM`/`BufferPMEM` bound the original non-generic blocks
 required either.
+
+## Cleanup pass: removed rdtsc/phase profiling, `sets_dram`, `hw_perf`, and the old non-TBB/non-jemalloc allocators
+
+Per explicit request, four unrelated pieces of legacy/experimental machinery were removed outright
+from the `generics-unification` branch, each verified independently (build + `--lib` test for
+`all_dram`/`key_value_pmem`/`global_hashtable_pmem`/`hashbrown_dram`, plus a full untouched-feature
+regression build sweep and all four hybrid integration suites, after all four removals):
+
+- **rdtsc/phase-analysis instrumentation**: deleted `src/rdtsc_probes.rs` entirely (the `PhaseStats`
+  histogram type, all 13 `PHASE_*` statics, `rdtsc()`, `calibrate_tsc_hz`/`calibrate_probe_overhead`,
+  `report_get`/`report_set`) and the one place it was still wired up post-Part-2 — the RwLock-shape
+  `get()`'s `not(key_value_pmem)` branch (added during the generics-unification Part 2 merge,
+  documented there as "ad hoc... predates this merge") — collapsing that method back to the single
+  plain body every other shape already had.
+- **`sets_dram`**: removed the Cargo feature and every line gated on it. This was woven through five
+  files: `lib.rs` (the `set()` early-return branch that bypassed the shared object map entirely,
+  delegating straight to `tiering_manager.set_dram`, and the constructor's `Arc::new_cyclic` backfill
+  closure), `tiering/manager.rs` (the `PmemBackfillJob` struct, the `pmem_tx`/`_pmem_consumer`/
+  `pending_jobs`/`sync_persist_fn` fields, `Tier::DramOnly` and every match arm referencing it across
+  8 call sites, `register_object`'s sets_dram-only arm, `spawn_pmem_consumer`, both `new_with_backfill`
+  arms, `set_dram`, `mark_persisted`, and the `is_dram_only`/`force_sync_persist` impl block --
+  confirmed via a live/dead block-comment nesting scan, using Python to count `/*`/`*/` depth, that
+  none of this touched the file's own large pre-existing dead-code comment blocks), `worker/manager.rs`
+  (the sets_dram-specific 5-arg `WorkerManager::new` variant -- this is also where the pre-existing,
+  already-documented `key_value_pmem,sets_dram`-without-`enable_tiering_manager` arg-count bug lived;
+  moot now, the whole variant is gone), `worker/policy/mod.rs` (`new_with_tiering`, the
+  `tiering_manager` field, and the priority-demotion check in `apply_evictions`), and
+  `worker/tiering.rs` (a second, entirely duplicate `TieringWorker` impl block gated on `sets_dram`).
+- **`hw_perf`**: removed the Cargo feature, the `perf-event` dependency, `src/hw_perf_counters.rs`
+  (`get_hw_counters`/`get_hw_hashmap_stats`/`print_hw_perf_stats`/`measure_operation`/
+  `HwHashMapStats`/`HwPerfMeasurement`), and its one `#[cfg(test)]` module in `lib.rs`.
+- **Old non-TBB/non-jemalloc allocators**: removed `pmem_region_alloc`, `region_hybrid_allocator`,
+  and `devdax_bump` (Cargo features + `RegionHybrid`/`DevDaxBump`/`DaxPtr` from `src/allocator.rs`),
+  and `DAXPMEM` (never Cargo-feature-gated as reachable at all -- confirmed dead, its only reference
+  was a commented-out `//use crate::allocator::DAXPMEM as Hybrid;` in `lib.rs` -- so this one wasn't
+  "old" in the sense of a still-selectable backend, just genuinely unused code). Used the same
+  block-comment-depth scan to confirm large stretches of `RegionHybrid`/`DevDaxBump` were *already*
+  dead/commented-out duplicates before touching anything (this crate's established "second copy for
+  reference" pattern, same as the `HybridObjects`/`UnifiedAllocator` dead block already documented
+  above -- left untouched, unrelated to this cleanup). `lib.rs`'s `Hybrid` type-alias cascade (5
+  cfg arms picking between `DevDaxBump`/`RegionHybrid`/`HybridObjects`) collapsed to one unconditional
+  `pub(crate) use crate::allocator::HybridObjects as Hybrid;` -- every PMEM feature now routes through
+  the same TBB-backed UMF pool (`HybridObjects`) or, for eviction-stack metadata specifically, the
+  separate jemalloc_cxl extent-hooks allocator (`EvictionStackAllocator`/`SlowTierJemallocAllocator`,
+  untouched by this cleanup). Also deleted `tests/pmem_region_alloc_integration.rs` (tested a feature
+  that no longer exists) and a byte-identical-both-arms `#[cfg(any(pmem_region_alloc,
+  region_hybrid_allocator))]` branch in `lfu_stack.rs`'s eviction-stack default capacity (both arms
+  already returned the same `50_000_000` -- collapsed to one unconditional value regardless of the
+  feature removal).
+
+Verified: all four non-hybrid storage combos and all four hybrid-cache features build clean and
+pass their full `--lib` suites unchanged (same counts as every prior checkpoint in this document);
+untouched-feature regression builds (`eviction_stacks_pmem`, `hybridcache`, `tiering`,
+`multitiering`, `jemalloc_cxl_slow_tier`) all still build clean; all four hybrid integration suites
+(15/15+2 ignored lru, 19/19 lfu, 18/18 two_q, 14/14 fifo) pass unchanged; `hybridcache_integration.rs`
+shows the same already-documented non-deterministic timing flakiness (not a regression). Confirmed
+(via `git stash`, rebuilding the pre-cleanup commit) that a bare no-features `cargo build` already
+failed identically before this cleanup too -- this crate has never supported building with zero
+features selected; not something introduced here, and out of scope to fix.

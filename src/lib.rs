@@ -6,9 +6,8 @@
  * correct
  */
 
-#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump", feature = "jemalloc_cxl_slow_tier"), feature(allocator_api), feature(clone_from_ref))]
+#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "jemalloc_cxl_slow_tier"), feature(allocator_api), feature(clone_from_ref))]
 
-//#![cfg_attr(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump"), feature(allocator_api))]
 
 // `lru_hybrid_cache`, `lfu_hybrid_cache`, `two_q_hybrid_cache`, and
 // `fifo_hybrid_cache` each define their own inherent methods (`new`, `get`,
@@ -46,85 +45,27 @@ compile_error!("Cannot enable both 'hashbrown_dram' and 'global_hashtable_pmem' 
 //static GLOBAL: Jemalloc = Jemalloc;
 
 
-#[cfg(any(feature = "hashbrown_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator", feature = "devdax_bump", feature = "all_dram", feature = "jemalloc_cxl_slow_tier"))]
+#[cfg(any(feature = "hashbrown_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "all_dram", feature = "jemalloc_cxl_slow_tier"))]
 pub mod allocator;
-
-
-/*
-#[cfg(all(
-    any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"),
-    any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator")
-))]
-use crate::allocator::RegionHybrid as Hybrid;
-
-#[cfg(all(
-    any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"),
-    not(any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))
-))]
-use crate::allocator::HybridObjects as Hybrid;
-*/
-
-
 
 use std::arch::x86_64::{_mm_clflush, _mm_sfence};
 
-
-#[cfg(all(
-    any(
-        feature = "key_value_pmem",
-        feature = "global_hashtable_pmem",
-        feature = "tiering_hashtable_pmem",
-        feature = "eviction_stacks_pmem",
-        feature = "pmem_region_alloc",
-        feature = "region_hybrid_allocator",
-        feature = "devdax_bump",
-    ),
-    feature = "devdax_bump"
-))]
-pub(crate) use crate::allocator::DevDaxBump as Hybrid;
-
-#[cfg(all(
-    any(
-        feature = "key_value_pmem",
-        feature = "global_hashtable_pmem",
-        feature = "tiering_hashtable_pmem",
-        feature = "eviction_stacks_pmem",
-        feature = "pmem_region_alloc",
-        feature = "region_hybrid_allocator",
-        feature = "devdax_bump",
-    ),
-    not(feature = "devdax_bump"),
-    any(feature = "pmem_region_alloc", feature = "region_hybrid_allocator")
-))]
-pub(crate) use crate::allocator::RegionHybrid as Hybrid;
-
-#[cfg(all(
-    any(
-        feature = "key_value_pmem",
-		feature = "key_pmem_value_pmem",
-        feature = "global_hashtable_pmem",
-        feature = "tiering_hashtable_pmem",
-        feature = "eviction_stacks_pmem",
-        feature = "pmem_region_alloc",
-        feature = "region_hybrid_allocator",
-        feature = "devdax_bump",
-    ),
-    not(any(
-        feature = "devdax_bump",
-        feature = "pmem_region_alloc",
-        feature = "region_hybrid_allocator",
-    ))
+// `Hybrid` is the crate-wide PMEM allocator alias: every PMEM feature routes
+// through UMF's TBB-backed pool (`HybridObjects`, see `allocator.rs`).
+#[cfg(any(
+    feature = "key_value_pmem",
+    feature = "key_pmem_value_pmem",
+    feature = "global_hashtable_pmem",
+    feature = "tiering_hashtable_pmem",
+    feature = "eviction_stacks_pmem",
 ))]
 pub(crate) use crate::allocator::HybridObjects as Hybrid;
-//use crate::allocator::DAXPMEM as Hybrid;
-
-
 
 // UMF bindings are always needed when any PMEM feature is active.
 // The build script guarantees that the UMF C symbols are always present:
 // either the real UMF library (when wrapper.h exists) or the stub
 // implementation (umf_stub.c, using malloc/free) when UMF is unavailable.
-#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem"))]
 mod allocator_bindings {
     include!("umf_allocator_bindings.rs"); // UMF extern "C" declarations
 }
@@ -177,14 +118,8 @@ mod tiered_buffer;
 #[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
 pub use crate::tiered_buffer::TieredBuffer;
 
-#[cfg(any(all(feature = "key_value_pmem", feature = "enable_tiering_manager"), all(feature = "key_value_pmem", feature = "sets_dram")))]
+#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 pub mod tiering;
-
-#[cfg(feature = "hw_perf")]
-pub mod hw_perf_counters;
-
-#[cfg(feature = "hw_perf")]
-pub use crate::hw_perf_counters::{get_hw_counters, get_hw_hashmap_stats, print_hw_perf_stats, measure_operation, HwHashMapStats, HwPerfMeasurement};
 
 // Two-tier DRAM-first cache with S3-FIFO-inspired promotion logic.
 #[cfg(feature = "hybridcache")]
@@ -322,7 +257,7 @@ pub use crate::{
 	policy::PaperPolicy,
 };
 
-#[cfg(any(all(feature = "key_value_pmem", feature = "enable_tiering_manager"), all(feature = "key_value_pmem", feature = "sets_dram")))]
+#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 pub use crate::tiering::{TieringManager, TieringConfig, TieringStats};
 
 pub type CacheSize = u64;
@@ -334,10 +269,6 @@ pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 #[cfg(feature = "key_value_pmem")]
 pub type BufferPMEM = Box<[u8], Hybrid>;
 
-
-//#[cfg(feature = "pmem_region_alloc")]
-
-//pub mod allocator;
 
 //#[cfg(feature = "all_dram")]
 //#[global_allocator]
@@ -373,11 +304,6 @@ static GLOBAL: tier_allocator::NumaAllocator = tier_allocator::NumaAllocator::ne
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 
-
-
-//static GLOBAL: allocator::RegionHybrid = allocator::RegionHybrid;
-
-
 #[cfg(not(feature = "all_dram"))]
 use std::alloc::{Layout, Allocator}; // Essential imports
 
@@ -408,7 +334,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 	worker_manager: Arc<WorkerSender>,
 	overhead_manager: OverheadManagerRef,
 	
-	#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
+	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 	tiering_manager: Arc<TieringManager<K, V>>,
 
 	hasher: S,
@@ -416,20 +342,8 @@ pub struct PaperCache<K, V, S = RandomState> {
 
 
 
-pub mod rdtsc_probes;
-
-use crate::rdtsc_probes::{
-    rdtsc, PHASE_PRE_ALLOC, PHASE_ALLOC, PHASE_MEMCPY, PHASE_POST, PHASE_INSERT, PHASE_GET_HASH, PHASE_GET_LOCK, PHASE_GET_LOOKUP, PHASE_GET_VALIDATE, PHASE_GET_COPY, PHASE_GET_BROADCAST, PHASE_PROBE, PHASE_SET_BROADCAST,
-};
-
-pub use rdtsc_probes::{calibrate_tsc_hz, report_set, report_get, calibrate_probe_overhead};
 
 
-//#[cfg(feature = "devdax_bump")]
-//pub mod devdax_bump;
-
-//#[cfg(feature = "devdax_bump")]
-//pub use devdax_bump::DevDaxBump;
 
 
 #[cfg(feature = "original")]
@@ -589,7 +503,7 @@ where
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
 			
-			#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
+			#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 			tiering_manager,
 
 			hasher,
@@ -1189,91 +1103,6 @@ where
 			Arc::new(TieringManager::new(tiering_config))
 		};
 
-		#[cfg(all(feature = "key_value_pmem", feature = "sets_dram", not(feature = "enable_tiering_manager")))]
-		let tiering_manager = {
-			let tiering_config = tiering::TieringConfig::default();
-
-			let objects_bg = objects.clone();
-			let status_bg = status.clone();
-			let overhead_bg = overhead_manager.clone();
-
-			// Arc::new_cyclic lets the persist closure capture a Weak<TieringManager>
-			// so it can call mark_persisted() after the background PMEM write succeeds.
-			// The Weak is safe to upgrade once jobs are dequeued, which is always after
-			// the Arc is fully initialised and returned from with_hasher.
-			Arc::new_cyclic(|weak_tm: &std::sync::Weak<TieringManager<K, V>>| {
-				let weak_tm = weak_tm.clone();
-
-				let batch_persist_cb = move |batch: Vec<crate::tiering::manager::PmemBackfillJob<K>>| {
-					// Upgrade the weak reference once per batch to avoid repeated
-					// atomic operations and to fail fast if the manager was dropped.
-					let Some(tm) = weak_tm.upgrade() else { return };
-
-					// ── Phase 1: Pre-allocate the value's backing bytes for each job ──
-					// Perform all allocations before touching the objects map so that
-					// the DashMap shards are locked for the shortest possible window.
-					// Also performs a TOCTOU check: skip any key whose tier has already
-					// changed (e.g. a concurrent delete or a newer set replaced it).
-					let mut new_objects = Vec::with_capacity(batch.len());
-					for job in batch {
-						// TOCTOU: if the key is no longer DramOnly, a concurrent
-						// operation already updated or removed it – skip to avoid
-						// overwriting a newer value.
-						if !tm.is_dram_only(job.hashed_key) {
-							continue;
-						}
-
-						// Allocate the value's bytes through whichever backend `V`
-						// uses (`ValueBuffer::from_bytes` -- plain heap for
-						// `BufferDRAM`, the `Hybrid` PMEM allocator for `BufferPMEM`).
-						let val_buf: V = V::from_bytes(&job.value);
-
-						let object = crate::object::Object::new(job.key, val_buf, job.ttl);
-						let base_size = overhead_bg.base_size(&object);
-
-						if base_size == 0 || status_bg.exceeds_max_size(base_size) {
-							// Backfill write cannot proceed; remove the stuck DramOnly entry.
-							tm.remove_object(job.hashed_key);
-							continue;
-						}
-
-						new_objects.push((job.hashed_key, object, base_size));
-					}
-
-					// ── Phase 2: Minimal locking – batch inserts into the objects map ──
-					let mut batch_delta: i64 = 0;
-					let mut batch_count: u64 = 0;
-
-					for (hashed_key, object, base_size) in new_objects {
-						let old_size = objects_bg
-							.insert(hashed_key, object)
-							.map(|old| overhead_bg.base_size(&old));
-
-						match old_size {
-							Some(old) => batch_delta += base_size as i64 - old as i64,
-							None => {
-								batch_count += 1;
-								batch_delta += base_size as i64;
-							}
-						}
-
-						// Transition tier from DramOnly -> DramAndPmem immediately
-						// after each insert so the window where the object is in the
-						// objects map but still DramOnly is as short as possible.
-						tm.mark_persisted(hashed_key);
-					}
-
-					// ── Phase 3: Deferred atomics – one update per batch ─────────────
-					// Apply the accumulated size delta and new-object count in a single
-					// pair of atomic operations to minimise cache-line bouncing.
-					status_bg.update_base_used_size(batch_delta);
-					status_bg.add_num_objects(batch_count);
-				};
-
-				TieringManager::new_with_backfill(tiering_config, batch_persist_cb)
-			})
-		};
-
 		let (worker_sender, worker_listener) = unbounded();
 
 		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
@@ -1285,16 +1114,7 @@ where
 			&tiering_manager,
 		)?;
 
-		#[cfg(all(feature = "key_value_pmem", feature = "sets_dram", not(feature = "enable_tiering_manager")))]
-		let mut worker_manager = WorkerManager::new(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-			&tiering_manager,
-		)?;
-
-		#[cfg(not(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram"))))]
+		#[cfg(not(all(feature = "key_value_pmem", feature = "enable_tiering_manager")))]
 		let mut worker_manager = WorkerManager::new(
 			worker_listener,
 			&objects,
@@ -1311,7 +1131,7 @@ where
 			worker_manager: Arc::new(worker_sender),
 			overhead_manager,
 
-			#[cfg(all(feature = "key_value_pmem", any(feature = "enable_tiering_manager", feature = "sets_dram")))]
+			#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 			tiering_manager,
 
 			hasher,
@@ -1445,55 +1265,42 @@ where
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
-		// Under `sets_dram`, admission is handled entirely by the tiering
-		// manager (which owns its own DRAM side-cache and backfills to the
-		// slow tier asynchronously) -- the shared `objects` map is never
-		// touched directly by a `sets_dram` `set()`.
-		#[cfg(feature = "sets_dram")]
-		{
-			self.tiering_manager.set_dram(hashed_key, key.clone(), value, ttl);
-			return Ok(());
+		let val_buf: V = V::from_bytes(value);
+		let object = Object::new(key, val_buf, ttl);
+		let base_size = self.overhead_manager.base_size(&object);
+		let expiry = object.expiry();
+
+		if base_size == 0 {
+			return Err(CacheError::ZeroValueSize);
 		}
 
-		#[cfg(not(feature = "sets_dram"))]
-		{
-			let val_buf: V = V::from_bytes(value);
-			let object = Object::new(key, val_buf, ttl);
-			let base_size = self.overhead_manager.base_size(&object);
-			let expiry = object.expiry();
-
-			if base_size == 0 {
-				return Err(CacheError::ZeroValueSize);
-			}
-
-			if self.status.exceeds_max_size(base_size) {
-				return Err(CacheError::ExceedingValueSize);
-			}
-
-			self.status.incr_sets();
-
-			let old_object_info = self.objects
-				.insert(hashed_key, object)
-				.map(|old_object| {
-					let base_size = self.overhead_manager.base_size(&old_object);
-					let expiry = old_object.expiry();
-
-					(base_size, expiry)
-				});
-
-			let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-				base_size as i64 - old_object_size as i64
-			} else {
-				// the object is new, so increase the number of objects count
-				self.status.incr_num_objects();
-				base_size as i64
-			};
-
-			self.status.update_base_used_size(base_size_delta);
-			self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
-
-			Ok(())
+		if self.status.exceeds_max_size(base_size) {
+			return Err(CacheError::ExceedingValueSize);
 		}
+
+		self.status.incr_sets();
+
+		let old_object_info = self.objects
+			.insert(hashed_key, object)
+			.map(|old_object| {
+				let base_size = self.overhead_manager.base_size(&old_object);
+				let expiry = old_object.expiry();
+
+				(base_size, expiry)
+			});
+
+		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
+			base_size as i64 - old_object_size as i64
+		} else {
+			// the object is new, so increase the number of objects count
+			self.status.incr_num_objects();
+			base_size as i64
+		};
+
+		self.status.update_base_used_size(base_size_delta);
+		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+
+		Ok(())
 	}
 
 	/// Deletes the object associated with the supplied key in the cache.
@@ -1894,9 +1701,8 @@ where
 //
 // Unlike Shape A, this shape's tiering-manager support is limited to the
 // plain `enable_tiering_manager` DRAM-side-cache check in `get()` -- there
-// is no `sets_dram`/`hashtable_tiering` support here, and no
-// `tiering_stats`/`set_dram_threshold`/etc. accessors, matching this
-// shape's pre-merge behavior exactly (only Shape A ever had those).
+// is no `tiering_stats`/`set_dram_threshold`/etc. accessors here, matching
+// this shape's pre-merge behavior exactly (only Shape A ever had those).
 // ---------------------------------------------------------------------
 #[cfg(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 impl<K, V, S> PaperCache<K, V, S>
@@ -2021,86 +1827,34 @@ where
 	/// Gets the value associated with the supplied key.
 	/// If the key was not found in the cache, returns a [`CacheError`].
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		// This ad hoc rdtsc phase instrumentation predates this merge and
-		// only ever ran for this shape without `key_value_pmem` (i.e. the
-		// pre-merge `global_hashtable_pmem`-alone / `hashbrown_dram`-alone
-		// blocks); preserved as-is, gated the same way, rather than
-		// expanded to every combination this shape now also covers.
-		#[cfg(not(feature = "key_value_pmem"))]
-		{
-			let t0 = rdtsc();
-			let hashed_key = self.hash_key(key);
-			let t1 = rdtsc();
-			PHASE_GET_HASH.record(t1 - t0);
+		let hashed_key = self.hash_key(key);
 
-			let lookup = self.objects.get_ref(&hashed_key);
-			let t2 = rdtsc();
-			PHASE_GET_LOCK.record(t2 - t1);
-
-			let result = match lookup {
-				Some(object) => {
-					let matched = object.key_matches(key) && !object.is_expired();
-					let t3 = rdtsc();
-					PHASE_GET_VALIDATE.record(t3 - t2);
-
-					if matched {
-						self.status.incr_hits();
-						let arc_val = object.data();
-						let v = AsRef::<[u8]>::as_ref(&*arc_val).to_vec();
-						let t4 = rdtsc();
-						PHASE_GET_COPY.record(t4 - t3);
-						Ok(v)
-					} else {
-						self.status.incr_misses();
-						Err(CacheError::KeyNotFound)
-					}
-				}
-				None => {
-					self.status.incr_misses();
-					Err(CacheError::KeyNotFound)
-				}
-			};
-
-			let t5 = rdtsc();
-			let br = self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()));
-			let t6 = rdtsc();
-			PHASE_GET_BROADCAST.record(t6 - t5);
-			br?;
-
-			return result;
-		}
-
-		#[cfg(feature = "key_value_pmem")]
-		{
-			let hashed_key = self.hash_key(key);
-
-			#[cfg(feature = "enable_tiering_manager")]
-			if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-				if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-					self.status.incr_hits();
-					self.broadcast(WorkerEvent::Get(hashed_key, true))?;
-					let arc_val = dram_object_ref.data();
-					return Ok(arc_val.as_ref().to_vec());
-				}
+		#[cfg(feature = "enable_tiering_manager")]
+		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
+			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
+				self.status.incr_hits();
+				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+				let arc_val = dram_object_ref.data();
+				return Ok(arc_val.as_ref().to_vec());
 			}
-
-			let result = match self.objects.get_ref(&hashed_key) {
-				Some(object) if object.key_matches(key) && !object.is_expired() => {
-					self.status.incr_hits();
-					let arc_val = object.data();
-					Ok(AsRef::<[u8]>::as_ref(&*arc_val).to_vec())
-				},
-
-				_ => {
-					self.status.incr_misses();
-					Err(CacheError::KeyNotFound)
-				},
-			};
-
-			self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
-
-			result
 		}
+
+		let result = match self.objects.get_ref(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => {
+				self.status.incr_hits();
+				let arc_val = object.data();
+				Ok(AsRef::<[u8]>::as_ref(&*arc_val).to_vec())
+			},
+
+			_ => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
+
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+
+		result
 	}
 
 	/// Sets the supplied key and value in the cache.
@@ -3528,8 +3282,8 @@ mod test_global_hashtable_pmem_alone {
 }
 
 /// Unit tests verifying structural compilation and initialization with new feature flags.
-/// These tests prove that hw_perf instrumentation and eviction_stacks_pmem allocations
-/// integrate correctly with the cache initialization path.
+/// These tests prove that eviction_stacks_pmem allocations integrate correctly with
+/// the cache initialization path.
 ///
 /// Gate on `all_dram` to get a DashMap-backed PaperCache<K, BufferDRAM> that is
 /// available without any PMEM hardware. The `eviction_stacks_pmem` feature is
@@ -3572,28 +3326,6 @@ mod test_new_features {
 
         cache.set(42u32, b"hello", None).expect("set must succeed");
         assert!(cache.has(&42u32));
-    }
-}
-
-/// Verify that hw_perf counters can be measured when the feature is enabled.
-/// When the feature is disabled, this entire module is compiled out — zero cost.
-#[cfg(all(test, feature = "hw_perf"))]
-mod test_hw_perf {
-    /// Verify measure_operation is callable and returns correct results.
-    /// In CI environments without perf_event access, measurement may return None — that's fine.
-    #[test]
-    fn test_hw_perf_measure_operation() {
-        use crate::measure_operation;
-
-        let (result, _measurement) = measure_operation(|| {
-            let mut sum: u64 = 0;
-            for i in 0u64..1000 {
-                sum = sum.wrapping_add(i);
-            }
-            sum
-        });
-
-        assert_eq!(result, 499500u64, "operation result must be correct regardless of perf counter availability");
     }
 }
 

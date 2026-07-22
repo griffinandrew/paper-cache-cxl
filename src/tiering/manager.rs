@@ -860,7 +860,7 @@ use crate::PaperCache;
 #[cfg(feature = "key_value_pmem")]
 pub type BufferPMEM = Box<[u8], Hybrid>;
 
-#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "pmem_region_alloc", feature = "region_hybrid_allocator"))]
+#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem"))]
 use crate::Hybrid;
 
 mod allocator_bindings {
@@ -870,20 +870,6 @@ mod allocator_bindings {
 #[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
 use hashbrown::HashMap as hashtable;
 
-
-
-use std::sync::mpsc::{self, Sender, Receiver};
-use std::sync::Mutex;
-use std::thread::{self, JoinHandle};
-
-#[cfg(feature = "sets_dram")]
-#[derive(Debug, Clone)]
-pub struct PmemBackfillJob<K> {
-    pub key: K,
-    pub hashed_key: HashedKey,
-    pub value: Box<[u8]>,
-    pub ttl: Option<u32>,
-}
 
 
 /// Configuration for the tiering manager
@@ -963,7 +949,6 @@ pub struct TieringStats {
 
     pub hot_objects: u64, // For hashtable_tiering feature
 
-    pub dram_only_objects: u64, // For sets_dram feature
 }
 
 /// Tier location for an object
@@ -980,9 +965,6 @@ pub enum Tier {
     /// This is the "Warm" tier - metadata access is fast but data is still in CXL
     DramPtrToPmem,
 
-    #[cfg(feature = "sets_dram")]
-    /// Object exists only in DRAM (sets_dram feature)
-    DramOnly,
 }
 
 /// Information about an object's tiering status
@@ -1052,21 +1034,6 @@ pub struct TieringManager<K, V> {
     dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
     
 
-    #[cfg(feature = "sets_dram")]
-    pmem_tx: Sender<HashedKey>,
-    #[cfg(feature = "sets_dram")]
-    _pmem_consumer: JoinHandle<()>,
-    /// Pending backfill jobs indexed by hashed key.
-    /// Acts as the source of truth for unprocessed jobs; the channel carries
-    /// only the key so jobs can be claimed either by the background consumer
-    /// or by force_sync_persist without double-processing.
-    #[cfg(feature = "sets_dram")]
-    pending_jobs: Arc<Mutex<HashMap<HashedKey, PmemBackfillJob<K>>>>,
-    /// Stored reference to the batch-persist closure so that
-    /// force_sync_persist can call it synchronously from any thread.
-    #[cfg(feature = "sets_dram")]
-    sync_persist_fn: Arc<dyn Fn(Vec<PmemBackfillJob<K>>) + Send + Sync>,
-
     _phantom: std::marker::PhantomData<(K, V)>,
 }
 
@@ -1079,27 +1046,12 @@ where
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
     #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem")))]
     pub fn new(config: TieringConfig) -> Self {
-        #[cfg(feature = "sets_dram")]
-        let (dummy_tx, dummy_rx) = mpsc::channel::<HashedKey>();
-        #[cfg(feature = "sets_dram")]
-        drop(dummy_rx);
-        #[cfg(feature = "sets_dram")]
-        let dummy_handle = thread::spawn(|| {});
-
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
-            #[cfg(feature = "sets_dram")]
-            pmem_tx: dummy_tx,
-            #[cfg(feature = "sets_dram")]
-            _pmem_consumer: dummy_handle,
-            #[cfg(feature = "sets_dram")]
-            pending_jobs: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(feature = "sets_dram")]
-            sync_persist_fn: Arc::new(|_batch| {}),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -1111,108 +1063,48 @@ where
     /// both key and value bytes into a DRAM-resident `TieringObject<K>`.
     #[cfg(all(feature = "key_pmem_value_pmem", not(feature = "tiering_hashtable_pmem")))]
     pub fn new(config: TieringConfig) -> Self {
-        #[cfg(feature = "sets_dram")]
-        let (dummy_tx, dummy_rx) = mpsc::channel::<HashedKey>();
-        #[cfg(feature = "sets_dram")]
-        drop(dummy_rx);
-        #[cfg(feature = "sets_dram")]
-        let dummy_handle = thread::spawn(|| {});
-
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
-            #[cfg(feature = "sets_dram")]
-            pmem_tx: dummy_tx,
-            #[cfg(feature = "sets_dram")]
-            _pmem_consumer: dummy_handle,
-            #[cfg(feature = "sets_dram")]
-            pending_jobs: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(feature = "sets_dram")]
-            sync_persist_fn: Arc::new(|_batch| {}),
             _phantom: std::marker::PhantomData,
         }
     }
 
     #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
     pub fn new(config: TieringConfig) -> Self {
-        #[cfg(feature = "sets_dram")]
-        let (dummy_tx, dummy_rx) = mpsc::channel::<HashedKey>();
-        #[cfg(feature = "sets_dram")]
-        drop(dummy_rx);
-        #[cfg(feature = "sets_dram")]
-        let dummy_handle = thread::spawn(|| {});
-
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
-            #[cfg(feature = "sets_dram")]
-            pmem_tx: dummy_tx,
-            #[cfg(feature = "sets_dram")]
-            _pmem_consumer: dummy_handle,
-            #[cfg(feature = "sets_dram")]
-            pending_jobs: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(feature = "sets_dram")]
-            sync_persist_fn: Arc::new(|_batch| {}),
             _phantom: std::marker::PhantomData,
         }
     }
 
     #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem")))]
     pub fn new(config: TieringConfig) -> Self {
-        #[cfg(feature = "sets_dram")]
-        let (dummy_tx, dummy_rx) = mpsc::channel::<HashedKey>();
-        #[cfg(feature = "sets_dram")]
-        drop(dummy_rx);
-        #[cfg(feature = "sets_dram")]
-        let dummy_handle = thread::spawn(|| {});
-
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher(NoHasher::default()))),
-            #[cfg(feature = "sets_dram")]
-            pmem_tx: dummy_tx,
-            #[cfg(feature = "sets_dram")]
-            _pmem_consumer: dummy_handle,
-            #[cfg(feature = "sets_dram")]
-            pending_jobs: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(feature = "sets_dram")]
-            sync_persist_fn: Arc::new(|_batch| {}),
             _phantom: std::marker::PhantomData,
         }
     }
 
     #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem"))]
     pub fn new(config: TieringConfig) -> Self {
-        #[cfg(feature = "sets_dram")]
-        let (dummy_tx, dummy_rx) = mpsc::channel::<HashedKey>();
-        #[cfg(feature = "sets_dram")]
-        drop(dummy_rx);
-        #[cfg(feature = "sets_dram")]
-        let dummy_handle = thread::spawn(|| {});
-
         TieringManager {
             config: Arc::new(RwLock::new(config)),
             stats: Arc::new(RwLock::new(TieringStats::default())),
             object_info: Arc::new(RwLock::new(HashMap::new())),
             dram_objects: Arc::new(RwLock::new(HashSet::new())),
             dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
-            #[cfg(feature = "sets_dram")]
-            pmem_tx: dummy_tx,
-            #[cfg(feature = "sets_dram")]
-            _pmem_consumer: dummy_handle,
-            #[cfg(feature = "sets_dram")]
-            pending_jobs: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(feature = "sets_dram")]
-            sync_persist_fn: Arc::new(|_batch| {}),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -1223,7 +1115,6 @@ where
     }
 
     /// Registers a new object in PMEM
-    #[cfg(not(feature = "sets_dram"))]
     pub fn register_object(&self, key: HashedKey, size: ObjectSize) {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -1236,182 +1127,6 @@ where
 
         let mut stats = self.stats.write().unwrap();
         stats.pmem_only_objects += 1;
-    }
-
-    #[cfg(feature = "sets_dram")]
-    pub fn register_object(&self, key: HashedKey, size: ObjectSize) {
-        let mut info_map = self.object_info.write().unwrap();
-
-        info_map.insert(key, ObjectTierInfo {
-            tier: Tier::DramOnly,
-            size,
-            access_count: 0,
-            last_access: std::time::Instant::now(),
-        });
-
-        let mut stats = self.stats.write().unwrap();
-        stats.dram_only_objects += 1;
-    }
-
-    //let paper_cache_for_bg = paper_cache.clone(); // Arc<PaperCache<...>>
-    
-    //let tiering = TieringManager::new_with_backfill(config, move |job| {
-        // IMPORTANT: call a PMEM-only path to avoid recursion into set_dram
-        // Example:
-        // let _ = paper_cache_for_bg.set_pmem_only(job.key, &job.value, job.ttl);
-    //});
-    // ...existing code...
-
-    /// Spawns the background PMEM consumer thread.
-    /// Drains the channel in batches and calls persist_fn once per batch,
-    /// using pending_jobs as a claim registry to avoid double-processing
-    /// jobs that were already force-persisted synchronously.
-    #[cfg(feature = "sets_dram")]
-    fn spawn_pmem_consumer<F>(
-        rx: Receiver<HashedKey>,
-        pending_jobs: Arc<Mutex<HashMap<HashedKey, PmemBackfillJob<K>>>>,
-        persist_fn: F,
-    ) -> JoinHandle<()>
-    where
-        K: Send + 'static,
-        F: Fn(Vec<PmemBackfillJob<K>>) + Send + 'static,
-    {
-        thread::spawn(move || {
-            loop {
-                // Block until at least one key is available.
-                let Ok(first_key) = rx.recv() else { break };
-
-                // Drain any additional keys that are already queued.
-                let mut keys = vec![first_key];
-                while let Ok(key) = rx.try_recv() {
-                    keys.push(key);
-                }
-
-                // Claim jobs from pending_jobs; skip keys already handled by
-                // force_sync_persist (they were removed from the map first).
-                let mut batch = Vec::with_capacity(keys.len());
-                {
-                    let mut pending = pending_jobs.lock()
-                        .expect("pending_jobs mutex should not be poisoned");
-                    for key in keys {
-                        if let Some(job) = pending.remove(&key) {
-                            batch.push(job);
-                        }
-                    }
-                }
-
-                if !batch.is_empty() {
-                    persist_fn(batch);
-                }
-            }
-        })
-    }
-    
-    
-    #[cfg(all(feature = "sets_dram", feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
-    pub fn new_with_backfill<F>(config: TieringConfig, persist_fn: F) -> Self
-    where
-        K: Send + 'static,
-        F: Fn(Vec<PmemBackfillJob<K>>) + Send + Sync + 'static,
-    {
-        let pending_jobs: Arc<Mutex<HashMap<HashedKey, PmemBackfillJob<K>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let sync_fn: Arc<dyn Fn(Vec<PmemBackfillJob<K>>) + Send + Sync> = Arc::new(persist_fn);
-
-        let (tx, rx) = mpsc::channel::<HashedKey>();
-        let handle = Self::spawn_pmem_consumer(rx, pending_jobs.clone(), {
-            let sync_fn = sync_fn.clone();
-            move |batch| sync_fn(batch)
-        });
-
-        TieringManager {
-            config: Arc::new(RwLock::new(config)),
-            stats: Arc::new(RwLock::new(TieringStats::default())),
-            object_info: Arc::new(RwLock::new(HashMap::new())),
-            dram_objects: Arc::new(RwLock::new(HashSet::new())),
-            dram_cache: Arc::new(DashMap::with_hasher(NoHasher::default())),
-            pmem_tx: tx,
-            _pmem_consumer: handle,
-            pending_jobs,
-            sync_persist_fn: sync_fn,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    #[cfg(all(feature = "sets_dram", feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
-    pub fn new_with_backfill<F>(config: TieringConfig, persist_fn: F) -> Self
-    where
-        K: Send + 'static,
-        F: Fn(Vec<PmemBackfillJob<K>>) + Send + Sync + 'static,
-    {
-        let pending_jobs: Arc<Mutex<HashMap<HashedKey, PmemBackfillJob<K>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let sync_fn: Arc<dyn Fn(Vec<PmemBackfillJob<K>>) + Send + Sync> = Arc::new(persist_fn);
-
-        let (tx, rx) = mpsc::channel::<HashedKey>();
-        let handle = Self::spawn_pmem_consumer(rx, pending_jobs.clone(), {
-            let sync_fn = sync_fn.clone();
-            move |batch| sync_fn(batch)
-        });
-
-        TieringManager {
-            config: Arc::new(RwLock::new(config)),
-            stats: Arc::new(RwLock::new(TieringStats::default())),
-            object_info: Arc::new(RwLock::new(HashMap::new())),
-            dram_objects: Arc::new(RwLock::new(HashSet::new())),
-            dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
-            pmem_tx: tx,
-            _pmem_consumer: handle,
-            pending_jobs,
-            sync_persist_fn: sync_fn,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    #[cfg(feature = "sets_dram")]
-    pub fn set_dram(&self, hashed_key: HashedKey, key: K, value: &[u8], ttl: Option<u32>) {
-        // fast metadata path
-        {
-            let mut info_map = self.object_info.write().unwrap();
-            let size = value.len() as ObjectSize;
-            info_map.insert(hashed_key, ObjectTierInfo {
-                tier: Tier::DramOnly,
-                size,
-                access_count: 0,
-                last_access: std::time::Instant::now(),
-            });
-        }
-        self.dram_objects.write().unwrap().insert(hashed_key);
-
-        // Build the job and register it in pending_jobs before notifying the
-        // consumer thread so that the job is always retrievable via
-        // force_sync_persist even if the consumer wakes up immediately.
-        let job = PmemBackfillJob {
-            key,
-            hashed_key,
-            value: value.to_vec().into_boxed_slice(),
-            ttl,
-        };
-        self.pending_jobs
-            .lock()
-            .expect("pending_jobs mutex should not be poisoned")
-            .insert(hashed_key, job);
-        let _ = self.pmem_tx.send(hashed_key);
-    }
-
-    /// Called by the background PMEM writer after successfully persisting an object.
-    /// Transitions the object's tier from `DramOnly` to `DramAndPmem`.
-    #[cfg(feature = "sets_dram")]
-    pub fn mark_persisted(&self, key: HashedKey) {
-        let mut info_map = self.object_info.write().unwrap();
-        if let Some(info) = info_map.get_mut(&key) {
-            if info.tier == Tier::DramOnly {
-                info.tier = Tier::DramAndPmem;
-                let mut stats = self.stats.write().unwrap();
-                stats.dram_only_objects = stats.dram_only_objects.saturating_sub(1);
-                stats.dram_objects = stats.dram_objects.saturating_add(1);
-            }
-        }
     }
 
     /*
@@ -1485,11 +1200,6 @@ where
                     // Already in DRAM
                     false
                 }
-                #[cfg(feature = "sets_dram")]
-                Tier::DramOnly => {
-                    // Already in DRAM-only tier
-                    false
-                }
             }
         } else {
             false
@@ -1528,11 +1238,6 @@ where
                 }
                 Tier::DramAndPmem => {
                     // Already in hot tier
-                    false
-                }
-                #[cfg(feature = "sets_dram")]
-                Tier::DramOnly => {
-                    // Already in DRAM-only tier
                     false
                 }
             }
@@ -1785,11 +1490,6 @@ where
                 Tier::DramAndPmem => {
                     // Already in hot tier
                 }
-                #[cfg(feature = "sets_dram")]
-                Tier::DramOnly => {
-                    // Already in DRAM-only tier
-                }
-
             }
         }
 
@@ -2038,23 +1738,6 @@ where
                 Tier::PmemOnly => {
                     // Already in PMEM only
                 }
-                #[cfg(feature = "sets_dram")]
-                Tier::DramOnly => {
-                    // Already in DRAM-only tier, demote to PMEM only
-                    info.tier = Tier::PmemOnly;
-                    self.dram_cache.remove(&key);
-                    let mut dram_objects = self.dram_objects.write().unwrap();
-                    dram_objects.remove(&key);
-                    let mut stats = self.stats.write().unwrap();
-                    stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
-                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
-                    stats.pmem_only_objects += 1;
-                    stats.demotions += 1;
-
-                    return true;
-
-                    //THIS MUST ACTUALLY ENSUrE THAT THE DATA IS WRITEN TO PMEM IF WE ARE IN SETS DRAM MODE, OTHERWISE WE RISK DATA LOSS.
-                }
             }
         }
 
@@ -2276,15 +1959,6 @@ where
                 Tier::PmemOnly => {
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
                 }
-                #[cfg(feature = "sets_dram")]
-                Tier::DramOnly => {
-                    // Object is DRAM-only pending PMEM backfill. Remove from DRAM tracking.
-                    // Note: if PMEM write has not yet completed, data loss may occur.
-                    let mut dram_objects = self.dram_objects.write().unwrap();
-                    dram_objects.remove(&key);
-                    stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
-                    stats.dram_only_objects = stats.dram_only_objects.saturating_sub(1);
-                }
             }
         }
     }
@@ -2314,15 +1988,6 @@ where
                 }
                 Tier::PmemOnly => {
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
-                }
-                #[cfg(feature = "sets_dram")]
-                Tier::DramOnly => {
-                    // Object is DRAM-only pending PMEM backfill. Remove from DRAM tracking.
-                    // Note: if PMEM write has not yet completed, data loss may occur.
-                    let mut dram_objects = self.dram_objects.write().unwrap();
-                    dram_objects.remove(&key);
-                    stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
-                    stats.dram_only_objects = stats.dram_only_objects.saturating_sub(1);
                 }
             }
         }
@@ -2359,19 +2024,6 @@ where
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
                 }
                 
-                #[cfg(feature = "sets_dram")]
-                Tier::DramOnly => {
-                    // Remove from DRAM cache (DRAM-only tier)
-                    self.dram_cache.remove(&key);
-                    
-                    let mut dram_objects = self.dram_objects.write().unwrap();
-                    dram_objects.remove(&key);
-
-                    stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
-                    stats.dram_objects = stats.dram_objects.saturating_sub(1);
-
-                    //I MUST ASERT THAT IT IS COPIED BACK TO PMEM LEVEL BEFORE REMOVING FROM DRAM-ONLY TIER, OTHERWISE DATA LOSS OCCURS.
-                }
             }
         }
     }
@@ -2399,14 +2051,6 @@ where
                 }
                 Tier::PmemOnly => {
                     stats.pmem_only_objects = stats.pmem_only_objects.saturating_sub(1);
-                }
-                #[cfg(feature = "sets_dram")]
-                Tier::DramOnly => {
-                    // PMEM persistence must be confirmed before dropping a DramOnly object.
-                    let mut dram_objects = self.dram_objects.write().unwrap();
-                    dram_objects.remove(&key);
-                    stats.dram_size = stats.dram_size.saturating_sub(info.size as u64);
-                    stats.dram_only_objects = stats.dram_only_objects.saturating_sub(1);
                 }
             }
         }
@@ -2533,42 +2177,6 @@ where
 
         let mut stats = self.stats.write().unwrap();
         *stats = TieringStats::default();
-    }
-}
-
-/// Methods with minimal type-parameter bounds so callers (e.g. `PolicyWorker`)
-/// that don't require `Clone` on `K` can still use them.
-#[cfg(feature = "sets_dram")]
-impl<K, V> TieringManager<K, V> {
-    /// Returns `true` if the key is currently in the `DramOnly` tier,
-    /// meaning its PMEM backfill write has not yet completed.
-    pub fn is_dram_only(&self, key: HashedKey) -> bool {
-        self.object_info
-            .read()
-            .expect("object_info RwLock should not be poisoned")
-            .get(&key)
-            .map_or(false, |info| info.tier == Tier::DramOnly)
-    }
-
-    /// Synchronously persists a `DramOnly` key by removing its pending job
-    /// from the queue and calling the persist callback inline.
-    ///
-    /// Returns `true` if the job was found in the pending queue and processed.
-    /// Returns `false` if the job was already claimed by the background thread.
-    ///
-    /// This is used by the `PolicyWorker` to ensure data safety before evicting
-    /// an object that hasn't yet been flushed to PMEM.
-    pub fn force_sync_persist(&self, key: HashedKey) -> bool {
-        if let Some(job) = self.pending_jobs
-            .lock()
-            .expect("pending_jobs mutex should not be poisoned")
-            .remove(&key)
-        {
-            (self.sync_persist_fn)(vec![job]);
-            true
-        } else {
-            false
-        }
     }
 }
 

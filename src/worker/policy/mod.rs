@@ -50,9 +50,6 @@ use crate::{
 	},
 };
 
-#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
-use crate::tiering::TieringManager;
-
 // Re-exported (fully `pub`, not `pub(crate)`) so sibling modules (e.g.
 // `worker::manager`) can name `Tier` without reaching into the private
 // `policy_stack` submodule directly, *and* so it can flow all the way out
@@ -89,11 +86,6 @@ pub struct PolicyWorker<K, V> {
 	last_set_time: Option<Instant>,
 
 	promotion_tx: Option<WorkerSender>,
-
-	/// TieringManager reference used in `sets_dram` mode to intercept
-	/// evictions of keys that haven't been persisted to PMEM yet.
-	#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
-	tiering_manager: Option<Arc<TieringManager<K, V>>>,
 
 	/// Callback fired by the eviction loop each time an item is evicted from
 	/// this cache.  Receives `(hashed_key, Arc<value>, &original_key)`.
@@ -265,82 +257,6 @@ where
 
 			promotion_tx,
 
-			#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
-			tiering_manager: None,
-
-			#[cfg(feature = "hybridcache")]
-			eviction_callback: None,
-
-			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
-			tier_migration_fn: None,
-		};
-
-		Ok(worker)
-	}
-
-	/// Constructs a `PolicyWorker` that holds a reference to the
-	/// `TieringManager`.  Used in `sets_dram` mode so that the eviction loop
-	/// can force-persist a `DramOnly` key before removing it from the cache.
-	#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
-	pub fn new_with_tiering(
-		listener: WorkerReceiver,
-		objects: ObjectMapRef<K, V>,
-		status: StatusRef,
-		overhead_manager: OverheadManagerRef,
-		promotion_tx: Option<WorkerSender>,
-		tiering_manager: Arc<TieringManager<K, V>>,
-	) -> Result<Self, CacheError>
-	where
-		K: Clone,
-		V: Clone,
-	{
-		let max_cache_size = status.max_size();
-
-		let mini_stacks = MiniStackManager::new(
-			status.policies(),
-			max_cache_size,
-		);
-
-		let policy = status.policy();
-		let policy_stack = init_policy_stack(policy, max_cache_size);
-
-		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
-		let (trace_worker, trace_listener) = unbounded();
-
-		register_worker(TraceWorker::new(
-			trace_listener,
-			trace_fragments.clone(),
-		));
-
-		if let Err(err) = trace_worker.send(StackEvent::Resize(status.max_size())) {
-			error!("Could not send initial cache size to trace worker: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		let worker = PolicyWorker {
-			listener,
-
-			objects,
-			status,
-			overhead_manager,
-
-			policy_stack: Some(policy_stack),
-
-			trace_fragments,
-			trace_worker,
-
-			mini_stack_manager: mini_stacks,
-			mini_index: None,
-
-			current_policy: Arc::new(RwLock::new(policy)),
-
-			last_auto_policy_time: None,
-			last_set_time: None,
-
-			promotion_tx,
-
-			tiering_manager: Some(tiering_manager),
-
 			#[cfg(feature = "hybridcache")]
 			eviction_callback: None,
 
@@ -410,9 +326,6 @@ where
 			last_set_time: None,
 
 			promotion_tx,
-
-			#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
-			tiering_manager: None,
 
 			eviction_callback: Some(eviction_callback),
 
@@ -508,9 +421,6 @@ where
 			// ever emits `AccessOutcome::GhostHit`, so no ghost-hit-driven
 			// promotion channel is needed for any of them.
 			promotion_tx: None,
-
-			#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
-			tiering_manager: None,
 
 			#[cfg(feature = "hybridcache")]
 			eviction_callback: None,
@@ -981,22 +891,6 @@ where
 			let maybe_key = policy_stack
 				.evict_one()
 				.map(|key| EraseKey::Hashed(key));
-
-			// Priority demotion: if the selected key is still in DramOnly state
-			// (pending PMEM backfill), force-persist it synchronously before
-			// removing it from the cache so that no data is lost.
-			#[cfg(all(feature = "key_value_pmem", feature = "sets_dram"))]
-			if let Some(hashed_key) = maybe_key.as_ref().and_then(|k| {
-				if let EraseKey::Hashed(k) = k { Some(*k) } else { None }
-			}) {
-				if let Some(ref tm) = self.tiering_manager {
-					if tm.is_dram_only(hashed_key) {
-						// Force a synchronous PMEM write for this key so that
-						// mark_persisted is called before the eviction proceeds.
-						tm.force_sync_persist(hashed_key);
-					}
-				}
-			}
 
 			let erase_result = erase(
 				&self.objects,

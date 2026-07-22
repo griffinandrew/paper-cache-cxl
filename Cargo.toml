@@ -29,7 +29,6 @@ libc = "0.2.177"
 tikv-jemallocator = "0.6.1"
 hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"
-perf-event = { version = "0.4.8", optional = true }
 sysinfo = "=0.33"
 
 # Runtime-parameterized NUMA-tier allocation for the four hybrid-cache
@@ -54,20 +53,6 @@ jemalloc_cxl = { path = "jemalloc_cxl", optional = true, default-features = fals
 # Core feature to enable key and value storage in PMEM
 key_value_pmem = []
 
-# Use mmap+NUMA-bound region bump allocator for PMEM allocations.
-# Intended for `key_pmem_value_pmem` to avoid per-object alloc/free overhead.
-# Does NOT require key_value_pmem: can be combined with any PMEM feature
-# (e.g. global_hashtable_pmem, eviction_stacks_pmem) without storing objects in PMEM.
-pmem_region_alloc = []
-
-# Select RegionHybrid for all custom PMEM allocator call-sites that use the
-# crate-wide `Hybrid` alias; when disabled those call-sites use HybridObjects.
-# Does NOT require key_value_pmem: works with any PMEM feature independently.
-region_hybrid_allocator = []
-
-
-devdax_bump = []
-
 # Extended PMEM feature: places BOTH key bytes AND value bytes each in their own
 # BufferPMEM (Hybrid-allocated persistent memory).  Implies key_value_pmem so
 # that the Hybrid allocator and all other PMEM infrastructure are available.
@@ -87,9 +72,6 @@ global_hashtable_pmem = []
 
 # Use hashbrown HashMap as global hashtable in DRAM (for performance comparison)
 hashbrown_dram = []
-
-# Enable hardware performance counters (requires Linux perf_event)
-hw_perf = ["perf-event"]
 
 # Enable PMEM-backed eviction stacks. Eviction-stack metadata
 # (PmemHashList/PmemVecList/EntryMap in worker/policy/policy_stack/) is
@@ -149,9 +131,7 @@ umf_jemalloc_pool = ["tier_allocator/jemalloc_pool"]
 umf_disjoint_pool = ["tier_allocator/disjoint_pool"]
 
 #to emnable 3 tier based data movement
-hashtable_tiering = [] 
-
-sets_dram = []
+hashtable_tiering = []
 
 # Tiering with both key and value in PMEM.
 # Activates the tiering manager (hot objects are copied to DRAM for fast access)
