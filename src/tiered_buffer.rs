@@ -29,26 +29,31 @@
 //! ## Fast tier: ordinary heap allocation; slow tier: one of two backends
 //!
 //! `Fast` is a plain `Box<[u8]>` — an ordinary heap allocation through
-//! whatever this crate's `#[global_allocator]` currently is. For each of
-//! the four hybrid-cache features, that global allocator is
-//! `tier_allocator::NumaAllocator` bound to NUMA node 0 (see `lib.rs`'s
-//! `#[global_allocator]` declaration, gated on exactly these four
-//! features). `Fast` needing nothing beyond `Box::from` is a direct
-//! consequence of that: "ordinary heap allocation" and "the fast tier" are
-//! the same thing once the global allocator is installed.
+//! whatever this crate's `#[global_allocator]` currently is. `Fast` needing
+//! nothing beyond `Box::from` is a direct consequence of that: "ordinary
+//! heap allocation" and "the fast tier" are the same thing once the global
+//! allocator is installed -- which global allocator that is depends on the
+//! same feature switch that picks `Slow`'s backend, below.
 //!
-//! `Slow` has two selectable backends, chosen at compile time:
+//! `Slow` has two selectable backends, chosen at compile time, and each one
+//! also determines what `Fast`'s global allocator is (see `lib.rs`'s
+//! `#[global_allocator]` cfg split):
 //!
 //! - **Default**: `tier_allocator::TierBuffer`, via `tier_allocator::alloc_on`
-//!   (UMF + Intel TBB's scalable pool) — the same shared per-node registry
-//!   `Fast`'s global allocator also draws from (node 0), so node 1 gets its
-//!   own single real UMF pool the same way. See `tier_allocator`'s own
-//!   crate-level doc comment for the full reasoning.
+//!   (UMF + Intel TBB's scalable pool). `Fast`'s global allocator is
+//!   `tier_allocator::NumaAllocator` bound to node 0 -- the same shared
+//!   per-node registry `Slow` draws from for node 1, so both tiers share one
+//!   real UMF pool per node. See `tier_allocator`'s own crate-level doc
+//!   comment for the full reasoning.
 //! - **`jemalloc_cxl_slow_tier` feature**: `Box<[u8], allocator::
 //!   SlowTierJemallocAllocator>` — jemalloc_cxl's custom-extent-hooks
-//!   NUMA/CXL arena mechanism (a completely independent pool from
-//!   `tier_allocator`'s, on the same node). Measured (single-threaded and
-//!   under real concurrent stress, both against a real UMF/tier_allocator
+//!   NUMA/CXL arena mechanism. This feature also switches `Fast`'s global
+//!   allocator to plain jemalloc (via jemalloc_cxl's own `#[global_allocator]`
+//!   declaration, enabled through its `own_global_allocator` feature -- see
+//!   `lib.rs`) -- so **both** tiers go through jemalloc in this
+//!   configuration, and `tier_allocator`/UMF is never actually called at
+//!   all, deliberately, not just for the slow tier. Measured (single-threaded
+//!   and under real concurrent stress, both against a real UMF/tier_allocator
 //!   comparison) to be slower per-call single-threaded but faster in
 //!   aggregate under concurrent multi-thread load, and to place data
 //!   correctly on the target NUMA node under that same concurrent load

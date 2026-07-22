@@ -342,15 +342,24 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 // allocation on this global allocator IS the fast tier for those features,
 // sharing one real UMF pool per node with the slow tier's explicit
 // tier_allocator::alloc_on(SLOW_TIER_NODE, ..) calls rather than each tier
-// having its own independent, redundant pool. Gated on exactly the same
-// predicate as `mod tiered_buffer;`/`pub use crate::tiered_buffer::
-// TieredBuffer;` above, so there is no reachable build where TieredBuffer
-// exists without this also being the active global allocator.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+// having its own independent, redundant pool.
+//
+// Under `jemalloc_cxl_slow_tier`, this is deliberately NOT the case: that
+// feature enables jemalloc_cxl's own `own_global_allocator` feature (see
+// Cargo.toml's `jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl",
+// "jemalloc_cxl/own_global_allocator"]`), so jemalloc_cxl's own crate
+// declares the one `#[global_allocator]` in the whole binary (plain
+// jemalloc, no UMF at all) -- this crate deliberately does NOT declare a
+// competing one for that case (Rust permits exactly one per binary). That
+// makes the fast tier ordinary jemalloc allocation and the slow tier
+// jemalloc_cxl's custom-extent-hooks NUMA/CXL arena (SlowTierJemallocAllocator,
+// src/allocator.rs) -- one jemalloc instance for both tiers, UMF/tier_allocator
+// entirely out of the picture, rather than mixing the two allocator stacks.
+#[cfg(all(not(feature = "jemalloc_cxl_slow_tier"), any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache")))]
 #[global_allocator]
 static GLOBAL: tier_allocator::NumaAllocator = tier_allocator::NumaAllocator::new(0);
 
-#[cfg(not(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache")))]
+#[cfg(all(not(feature = "jemalloc_cxl_slow_tier"), not(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 

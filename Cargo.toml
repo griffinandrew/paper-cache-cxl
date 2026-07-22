@@ -111,13 +111,17 @@ hw_perf = ["perf-event"]
 # features), so enabling this alone doesn't require any other PMEM feature.
 eviction_stacks_pmem = ["dep:jemalloc_cxl"]
 
-# Alternative backend for the four hybrid-cache features' TieredBuffer::Slow
-# (value bytes in the slow/PMEM tier): jemalloc_cxl's custom-extent-hooks
-# NUMA/CXL arena mechanism (SlowTierJemallocAllocator, src/allocator.rs)
-# instead of the default tier_allocator (UMF/TBB). Independent of
-# eviction_stacks_pmem -- both may use jemalloc_cxl simultaneously, each via
-# its own separate arena.
-jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl"]
+# Alternative backend for the four hybrid-cache features' TieredBuffer: both
+# tiers go through jemalloc, not tier_allocator/UMF at all. Fast tier is
+# ordinary jemalloc allocation via jemalloc_cxl's own #[global_allocator]
+# declaration (enabled here via "jemalloc_cxl/own_global_allocator" -- see
+# lib.rs's global-allocator cfg split, which deliberately does NOT declare a
+# competing one when this feature is on). Slow tier is jemalloc_cxl's
+# custom-extent-hooks NUMA/CXL arena (SlowTierJemallocAllocator,
+# src/allocator.rs). One jemalloc instance for both tiers -- UMF/tier_allocator
+# stays linked (still a dependency of the hybrid features) but is never
+# actually called in this configuration.
+jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl", "jemalloc_cxl/own_global_allocator"]
 
 #to emnable 3 tier based data movement
 hashtable_tiering = [] 
