@@ -105,8 +105,8 @@ pub struct AtomicStatus {
 	/// `lfu_hybrid_cache` counters/gauges — same rationale as the
 	/// `lru_hybrid_*` fields above (kept as a separate, independently named
 	/// set rather than merged with them, so each feature stays
-	/// self-contained/removable, matching how `tiering_manager` and
-	/// `hybridcache` already coexist as separate concepts in this file).
+	/// self-contained/removable, matching how `tiering_manager` already
+	/// coexists as a separate concept in this file).
 	#[cfg(feature = "lfu_hybrid_cache")]
 	lfu_hybrid_promotions: AtomicU64,
 	#[cfg(feature = "lfu_hybrid_cache")]

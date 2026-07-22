@@ -1820,3 +1820,35 @@ shows the same already-documented non-deterministic timing flakiness (not a regr
 (via `git stash`, rebuilding the pre-cleanup commit) that a bare no-features `cargo build` already
 failed identically before this cleanup too -- this crate has never supported building with zero
 features selected; not something introduced here, and out of scope to fix.
+
+## Removed the original S3-FIFO hybridcache module entirely
+
+Per explicit follow-up request, `hybridcache` (`S3FifoHybridCache<K>`, `HybridCacheConfig`,
+`HybridCacheStats`) -- the small-DRAM/far-PMEM two-*instance* design that predates and motivated
+`lru_hybrid_cache`/`lfu_hybrid_cache`/`two_q_hybrid_cache`/`fifo_hybrid_cache`'s single-instance
+designs -- was removed outright: `src/hybridcache/` (whole module), the `hybridcache` and
+`far_tier_pmem_evst_hash` (which only ever existed to extend `hybridcache`) Cargo features,
+`tests/hybridcache_integration.rs`, and every piece of wiring that existed solely to support it:
+`PaperCache::new_with_eviction_callback` (the `BufferDRAM`-only constructor, `lib.rs`),
+`WorkerManager::new_with_eviction_callback` (`worker/manager.rs`), `PolicyWorker::
+new_with_eviction_callback` plus the `eviction_callback` field and the `apply_evictions` callback
+invocation (`worker/policy/mod.rs`), and a dead `#[cfg(feature = "hybridcache")] mod
+hybridcache_promotion_tests` left over in `tests/tiering_integration.rs` (referenced a module that
+no longer exists, would never have compiled once the feature was gone). Cleaned up the doc-comment
+cross-references describing the other four hybrid designs by contrast with `hybridcache` (`size.rs`,
+`tiered_buffer.rs`, `lru_hybrid_cache`/`lfu_hybrid_cache`/`fifo_hybrid_cache`'s module docs, `status.rs`,
+`s_three_fifo_stack.rs`, both remaining hybrid integration test files' doc comments) and the
+corresponding sections of `FEATURE_FLAGS.md` and `Cargo.toml`'s comments -- left `HYBRID_CACHES.md`/
+`LRU_HYBRID_CACHE.md` (the two dedicated design docs, which discuss `hybridcache` extensively as
+historical design context for decisions already made and shipped) untouched, matching this file's
+own convention of not rewriting historical narrative after the fact.
+
+Verified: all four non-hybrid storage combos and all four hybrid-cache features build clean;
+`cargo build --features hybridcache` now correctly reports "the package 'paper-cache' does not
+contain this feature" (feature genuinely gone, not just broken); untouched-feature regression
+builds (`eviction_stacks_pmem`, `tiering`, `multitiering`, `jemalloc_cxl_slow_tier`) still build
+clean; all four hybrid-cache features' `--lib` suites and real-PMEM integration suites pass at
+their established baselines unchanged (91/91/92/92 unit; 15/15+2 ignored lru, 19/19 lfu, 18/18
+two_q, 14/14 fifo integration); `tiering_integration.rs`'s remaining 10 tests (the
+`hybridcache_promotion_tests` module removed, `tiering_tests`/`tiering_pmem_key_tests` untouched)
+pass unchanged.

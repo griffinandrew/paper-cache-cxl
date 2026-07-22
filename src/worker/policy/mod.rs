@@ -87,12 +87,6 @@ pub struct PolicyWorker<K, V> {
 
 	promotion_tx: Option<WorkerSender>,
 
-	/// Callback fired by the eviction loop each time an item is evicted from
-	/// this cache.  Receives `(hashed_key, Arc<value>, &original_key)`.
-	/// Used by `hybridcache` to write evicted DRAM items to the far LRU tier.
-	#[cfg(feature = "hybridcache")]
-	eviction_callback: Option<Box<dyn for<'a> Fn(HashedKey, Arc<V>, &'a K) + Send + Sync>>,
-
 	/// Reallocates a value into the target tier's representation (e.g.
 	/// `TieredBuffer::new_fast`/`new_slow`). Used by `lru_hybrid_cache` /
 	/// `lfu_hybrid_cache` to physically move an object's bytes when
@@ -257,78 +251,6 @@ where
 
 			promotion_tx,
 
-			#[cfg(feature = "hybridcache")]
-			eviction_callback: None,
-
-			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
-			tier_migration_fn: None,
-		};
-
-		Ok(worker)
-	}
-
-	/// Constructs a `PolicyWorker` with an eviction callback.
-	/// Used by `hybridcache` so that items evicted from the small DRAM tier
-	/// are forwarded to the far PMEM tier via the callback.
-	#[cfg(feature = "hybridcache")]
-	pub fn new_with_eviction_callback(
-		listener: WorkerReceiver,
-		objects: ObjectMapRef<K, V>,
-		status: StatusRef,
-		overhead_manager: OverheadManagerRef,
-		promotion_tx: Option<WorkerSender>,
-		eviction_callback: Box<dyn for<'a> Fn(HashedKey, Arc<V>, &'a K) + Send + Sync>,
-	) -> Result<Self, CacheError>
-	where
-		K: Clone,
-	{
-		let max_cache_size = status.max_size();
-
-		let mini_stacks = MiniStackManager::new(
-			status.policies(),
-			max_cache_size,
-		);
-
-		let policy = status.policy();
-		let policy_stack = init_policy_stack(policy, max_cache_size);
-
-		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
-		let (trace_worker, trace_listener) = unbounded();
-
-		register_worker(TraceWorker::new(
-			trace_listener,
-			trace_fragments.clone(),
-		));
-
-		if let Err(err) = trace_worker.send(StackEvent::Resize(status.max_size())) {
-			error!("Could not send initial cache size to trace worker: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		let worker = PolicyWorker {
-			listener,
-
-			objects,
-			status,
-			overhead_manager,
-
-			policy_stack: Some(policy_stack),
-
-			trace_fragments,
-			trace_worker,
-
-			mini_stack_manager: mini_stacks,
-			mini_index: None,
-
-			current_policy: Arc::new(RwLock::new(policy)),
-
-			last_auto_policy_time: None,
-			last_set_time: None,
-
-			promotion_tx,
-
-			eviction_callback: Some(eviction_callback),
-
 			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
 			tier_migration_fn: None,
 		};
@@ -421,9 +343,6 @@ where
 			// ever emits `AccessOutcome::GhostHit`, so no ghost-hit-driven
 			// promotion channel is needed for any of them.
 			promotion_tx: None,
-
-			#[cfg(feature = "hybridcache")]
-			eviction_callback: None,
 
 			tier_migration_fn: Some(migrate),
 		};
@@ -899,15 +818,9 @@ where
 				maybe_key,
 			);
 
-			#[cfg_attr(not(feature = "hybridcache"), allow(unused_variables))]
-			let Ok((key, evicted_obj)) = erase_result else {
+			let Ok((key, _evicted_obj)) = erase_result else {
 				continue;
 			};
-
-			#[cfg(feature = "hybridcache")]
-			if let Some(ref cb) = self.eviction_callback {
-				cb(key, evicted_obj.data(), evicted_obj.key());
-			}
 
 			#[cfg(feature = "lru_hybrid_cache")]
 			if *policy == PaperPolicy::LruHybrid {

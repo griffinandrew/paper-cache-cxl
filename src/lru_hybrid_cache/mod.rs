@@ -7,9 +7,9 @@
 
 //! Single-instance, segmented-LRU hybrid cache.
 //!
-//! Unlike `hybridcache` (`S3FifoHybridCache`), which composes two independent
-//! `PaperCache` instances, `lru_hybrid_cache` is **one** `PaperCache<K,
-//! TieredBuffer>`. The fast (DRAM) and slow (PMEM) tiers are a single logical
+//! Unlike a design that composes two independent `PaperCache` instances,
+//! `lru_hybrid_cache` is **one** `PaperCache<K, TieredBuffer>`. The fast
+//! (DRAM) and slow (PMEM) tiers are a single logical
 //! LRU queue segmented by a byte-budgeted boundary: every new object is
 //! admitted at the top of the fast tier; as objects age past the boundary
 //! they are demoted (physically moved) to the slow tier; accessing a

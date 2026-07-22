@@ -10,16 +10,14 @@
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
 //!   cargo +nightly test --test lru_hybrid_cache_integration --features lru_hybrid_cache
 //!
-//! Unlike `hybridcache_integration.rs`, this feature is **one**
-//! `PaperCache<K, TieredBuffer>` instance (not two composed `PaperCache`s), so
-//! there's no `has_in_dram`/`has_in_pmem` pair to reuse — `tier_of` reads the
-//! tier directly off the single object map.
+//! This feature is **one** `PaperCache<K, TieredBuffer>` instance (not two
+//! composed `PaperCache`s), so `tier_of` reads the tier directly off the
+//! single object map.
 //!
 //! What is tested:
 //!   * Admission always lands in the fast tier
 //!   * Fast-tier pressure demotes the LRU tail to the slow tier, and `tier_of`
-//!     confirms it is gone from the fast tier (real data movement, not a
-//!     copy — the defining difference from `S3FifoHybridCache`)
+//!     confirms it is gone from the fast tier (real data movement, not a copy)
 //!   * A slow-tier hit promotes the key back to the fast tier, and `tier_of`
 //!     confirms it is gone from the slow tier
 //!   * TTL set before a demotion/promotion is still correctly enforced after

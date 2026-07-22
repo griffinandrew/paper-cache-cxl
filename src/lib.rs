@@ -97,14 +97,13 @@ use crate::object_store::ObjectStore;
 #[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 use crate::value_buffer::ValueBuffer;
 
-// Shared tier-size unit type (bytes/Mb/Gb), used by `hybridcache`,
-// `lru_hybrid_cache`, `lfu_hybrid_cache`, `two_q_hybrid_cache`, and
-// `fifo_hybrid_cache` so none of them has to depend on any of the others for
-// it.
-#[cfg(any(feature = "hybridcache", feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+// Shared tier-size unit type (bytes/Mb/Gb), used by `lru_hybrid_cache`,
+// `lfu_hybrid_cache`, `two_q_hybrid_cache`, and `fifo_hybrid_cache` so none
+// of them has to depend on any of the others for it.
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
 mod size;
 
-#[cfg(any(feature = "hybridcache", feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
 pub use crate::size::CacheTierSize;
 
 // Shared value type for the segmented hybrid-cache features. `lru_hybrid_cache`,
@@ -121,15 +120,7 @@ pub use crate::tiered_buffer::TieredBuffer;
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 pub mod tiering;
 
-// Two-tier DRAM-first cache with S3-FIFO-inspired promotion logic.
-#[cfg(feature = "hybridcache")]
-pub mod hybridcache;
-
-#[cfg(feature = "hybridcache")]
-pub use crate::hybridcache::{S3FifoHybridCache, HybridCacheConfig, HybridCacheStats};
-
-// Single-instance, segmented-LRU hybrid cache. Contrast with `hybridcache`:
-// one PaperCache<K, TieredBuffer> rather than two composed instances.
+// Single-instance, segmented-LRU hybrid cache: one PaperCache<K, TieredBuffer>.
 #[cfg(feature = "lru_hybrid_cache")]
 pub mod lru_hybrid_cache;
 
@@ -1609,87 +1600,6 @@ where
 	}
 }
 
-/// `S3FifoHybridCache`'s small (DRAM) tier needs a constructor that fires a
-/// callback on every policy-worker eviction (see `worker/policy/mod.rs`'s
-/// `eviction_callback`). This only ever applies to `BufferDRAM` -- the small
-/// tier is always plain DRAM by design -- so it's kept as its own
-/// non-generic constructor rather than folded into the generic block above.
-#[cfg(feature = "hybridcache")]
-impl<K, S> PaperCache<K, BufferDRAM, S>
-where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` that fires `eviction_callback` each time
-	/// the policy worker evicts an item.
-	///
-	/// The callback receives the item's hashed key, an `Arc` to its value, and
-	/// a reference to its original key.  It is invoked from the policy worker
-	/// background thread so it must be `Send + Sync`.
-	///
-	/// Used by [`crate::hybridcache::S3FifoHybridCache`] to write evicted items
-	/// to the far-memory tier.
-	pub fn new_with_eviction_callback(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-		eviction_callback: Box<dyn for<'a> Fn(HashedKey, Arc<BufferDRAM>, &'a K) + Send + Sync>,
-		promotion_tx: Option<crate::worker::WorkerSender>,
-	) -> Result<Self, CacheError>
-	where
-		S: Default,
-		K: Clone,
-	{
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		if policies.is_empty() {
-			return Err(CacheError::EmptyPolicies);
-		}
-
-		if policies.contains(&PaperPolicy::Auto) {
-			return Err(CacheError::ConfiguredAutoPolicy);
-		}
-
-		if policies.iter().is_multiset() {
-			return Err(CacheError::DuplicatePolicies);
-		}
-
-		if !policy.is_auto() && !policies.contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
-		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		let (worker_sender, worker_listener) = unbounded();
-
-		let mut worker_manager = WorkerManager::new_with_eviction_callback(
-			worker_listener,
-			&objects,
-			&status,
-			&overhead_manager,
-			eviction_callback,
-			promotion_tx,
-		)?;
-
-		thread::spawn(move || worker_manager.run());
-
-		let cache = PaperCache {
-			objects,
-			status,
-			worker_manager: Arc::new(worker_sender),
-			overhead_manager,
-			hasher: Default::default(),
-		};
-
-		Ok(cache)
-	}
-}
-
-
 // ---------------------------------------------------------------------
 // Shape B: `RwLock<HashMap<..., A>>`-backed object map, generic over the
 // allocator `A`. Covers `global_hashtable_pmem` alone (V = BufferDRAM,
@@ -2479,7 +2389,7 @@ where
 
 	/// Returns which tier `key` currently lives in, or `None` if the key
 	/// isn't present (or has expired). Useful for tests/diagnostics — unlike
-	/// `S3FifoHybridCache`'s `has_in_dram`/`has_in_pmem` pair, there's only
+	/// an external two-cache composition's `has_in_dram`/`has_in_pmem` pair, there's only
 	/// one object map here, so tier is a property read off the object itself.
 	#[must_use]
 	pub fn tier_of(&self, key: &K) -> Option<Tier> {
@@ -2510,8 +2420,7 @@ where
 
 /// Single-instance, segmented-LRU hybrid cache: one `PaperCache<K,
 /// TieredBuffer>` running `PaperPolicy::LruHybrid`, in contrast with
-/// `hybridcache`'s [`crate::hybridcache::S3FifoHybridCache`] (two composed
-/// `PaperCache` instances). See the `lru_hybrid_cache` module docs for the
+/// composing two independent `PaperCache` instances. See the `lru_hybrid_cache` module docs for the
 /// full design. This impl block only carries `new`/`with_hasher` (this
 /// design's constructor has no extra parameters beyond `max_size`/
 /// `fast_tier_size`) and the `lru_hybrid_stats()` accessor -- every other
@@ -2569,8 +2478,7 @@ where
 
 /// Single-instance, segmented-LFU hybrid cache: one `PaperCache<K,
 /// TieredBuffer>` running `PaperPolicy::LfuHybrid`, in contrast with
-/// `hybridcache`'s [`crate::hybridcache::S3FifoHybridCache`] (two composed
-/// `PaperCache` instances). See the `lfu_hybrid_cache` module docs for the
+/// composing two independent `PaperCache` instances. See the `lfu_hybrid_cache` module docs for the
 /// full design; only `new`/`with_hasher`/`lfu_hybrid_stats()` live here --
 /// everything else is shared (see the generic block above).
 ///
@@ -2627,8 +2535,7 @@ where
 
 /// Single-instance, segmented-2Q hybrid cache: one `PaperCache<K,
 /// TieredBuffer>` running `PaperPolicy::TwoQHybrid`, in contrast with
-/// `hybridcache`'s [`crate::hybridcache::S3FifoHybridCache`] (two composed
-/// `PaperCache` instances). See the `two_q_hybrid_cache` module docs for the
+/// composing two independent `PaperCache` instances. See the `two_q_hybrid_cache` module docs for the
 /// full design; this impl block only carries `new`/`with_hasher` (the one
 /// design with an extra `k_in` constructor parameter) and
 /// `two_q_hybrid_stats()` -- everything else is shared (see the generic
@@ -2711,8 +2618,7 @@ where
 
 /// Single-instance, segmented-FIFO hybrid cache: one `PaperCache<K,
 /// TieredBuffer>` running `PaperPolicy::FifoHybrid`, in contrast with
-/// `hybridcache`'s [`crate::hybridcache::S3FifoHybridCache`] (two composed
-/// `PaperCache` instances). See the `fifo_hybrid_cache` module docs for the
+/// composing two independent `PaperCache` instances. See the `fifo_hybrid_cache` module docs for the
 /// full design; only `new`/`with_hasher`/`fifo_hybrid_stats()` live here --
 /// everything else is shared (see the generic block above).
 ///
@@ -3334,12 +3240,12 @@ mod test_new_features {
 /// Deliberately stays on the fast-tier-only path (fast_tier_size == max_size,
 /// tiny values) so no object ever demotes to the slow tier: `TieredBuffer::
 /// new_slow` allocates through the `Hybrid`/UMF PMEM allocator, which
-/// (like `hybridcache`'s PMEM-tier integration tests) requires real PMEM/DAX
+/// requires real PMEM/DAX
 /// hardware and aborts ("memory allocation ... failed") in a plain dev
 /// sandbox. A full integration test covering demotion/promotion/eviction
 /// belongs in `tests/lru_hybrid_cache_integration.rs` (not yet written —
 /// see `CLAUDE.md`'s `lru_hybrid_cache` plan, step 12) and should be run on
-/// PMEM-capable hardware, same as `tests/hybridcache_integration.rs`.
+/// PMEM-capable hardware.
 #[cfg(all(test, feature = "lru_hybrid_cache"))]
 mod test_lru_hybrid_cache {
     use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};

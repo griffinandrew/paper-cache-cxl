@@ -10,10 +10,9 @@
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
 //!   cargo +nightly test --test fifo_hybrid_cache_integration --features fifo_hybrid_cache
 //!
-//! Unlike `hybridcache_integration.rs`, this feature is **one**
-//! `PaperCache<K, TieredBuffer>` instance (not two composed `PaperCache`s), so
-//! there's no `has_in_dram`/`has_in_pmem` pair to reuse — `tier_of` reads the
-//! tier directly off the single object map. Modeled on
+//! This feature is **one** `PaperCache<K, TieredBuffer>` instance (not two
+//! composed `PaperCache`s), so `tier_of` reads the tier directly off the
+//! single object map. Modeled on
 //! `tests/lru_hybrid_cache_integration.rs`, with promotion-specific tests
 //! dropped (FIFO has no promotion policy at all) and two FIFO-defining tests
 //! added instead.

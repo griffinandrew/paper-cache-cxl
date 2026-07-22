@@ -177,54 +177,6 @@ impl WorkerManager {
 		Ok(manager)
 	}
 
-	/// Creates a `WorkerManager` where the policy worker fires `eviction_callback`
-	/// for each evicted item.  Used by `hybridcache` to propagate evictions from
-	/// the small DRAM tier to the far PMEM tier.
-	#[cfg(feature = "hybridcache")]
-	pub fn new_with_eviction_callback<K, V>(
-		listener: WorkerReceiver,
-		objects: &ObjectMapRef<K, V>,
-		status: &StatusRef,
-		overhead_manager: &OverheadManagerRef,
-		eviction_callback: Box<dyn for<'a> Fn(crate::HashedKey, std::sync::Arc<V>, &'a K) + Send + Sync>,
-		promotion_tx: Option<WorkerSender>,
-	) -> Result<Self, CacheError>
-	where
-		K: 'static + Eq + TypeSize + Clone,
-		V: 'static + TypeSize + Clone,
-	{
-		let (policy_worker, policy_listener) = unbounded();
-		let (ttl_worker, ttl_listener) = unbounded();
-
-		register_worker(PolicyWorker::<K, V>::new_with_eviction_callback(
-			policy_listener,
-			objects.clone(),
-			status.clone(),
-			overhead_manager.clone(),
-			promotion_tx,
-			eviction_callback,
-		)?);
-
-		register_worker(TtlWorker::<K, V>::new(
-			ttl_listener,
-			objects.clone(),
-			status.clone(),
-			overhead_manager.clone(),
-		));
-
-		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
-			policy_worker,
-			ttl_worker,
-		]));
-
-		let manager = WorkerManager {
-			listener,
-			workers,
-		};
-
-		Ok(manager)
-	}
-
 	/// Creates a `WorkerManager` whose policy worker physically migrates
 	/// object bytes between tiers whenever `PaperPolicy::LruHybrid`,
 	/// `PaperPolicy::LfuHybrid`, `PaperPolicy::TwoQHybrid`, or

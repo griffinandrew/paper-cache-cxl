@@ -360,10 +360,11 @@ mod tests {
 	/// This is the ghost-queue **miss** path — the complement of
 	/// `ghost_queue_routes_reinserted_key_to_main` (ghost-queue hit path).
 	///
-	/// In the hybridcache two-tier setup this corresponds to a re-promotion from
-	/// PMEM where the ghost entry has already been evicted (e.g., due to ghost
-	/// queue overflow from large object counts).  The re-inserted item must still
-	/// land in the DRAM tier, but via the small queue rather than the main queue.
+	/// In a two-tier design built on this policy, this corresponds to a
+	/// re-promotion from the far tier where the ghost entry has already been
+	/// evicted (e.g., due to ghost queue overflow from large object counts).
+	/// The re-inserted item must still land in the near tier, but via the
+	/// small queue rather than the main queue.
 	///
 	/// Scenario
 	/// --------

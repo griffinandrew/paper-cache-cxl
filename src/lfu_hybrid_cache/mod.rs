@@ -8,9 +8,8 @@
 //! Single-instance, segmented-LFU hybrid cache.
 //!
 //! Same overall architecture as `lru_hybrid_cache` — **one**
-//! `PaperCache<K, TieredBuffer>`, not two composed instances (contrast with
-//! `hybridcache`'s `S3FifoHybridCache`) — but the fast/slow boundary is
-//! frequency-ordered rather than recency-ordered:
+//! `PaperCache<K, TieredBuffer>`, not two composed instances — but the
+//! fast/slow boundary is frequency-ordered rather than recency-ordered:
 //!
 //! * Admission: while the fast tier has capacity, new objects are admitted
 //!   into the fast tier. Once the fast tier is full, every new object is,

@@ -7,10 +7,10 @@
 
 //! Shared tier-size unit type.
 //!
-//! Used by both `hybridcache` (`HybridCacheConfig::small_size`/`main_size`) and
-//! `lru_hybrid_cache` (fast-tier capacity, including the runtime-adjustable
+//! Used by `lru_hybrid_cache`/`lfu_hybrid_cache`/`two_q_hybrid_cache`/
+//! `fifo_hybrid_cache` (fast-tier capacity, including the runtime-adjustable
 //! `PaperCache::set_fast_tier_size`) so that tier capacities can be specified in
-//! bytes, megabytes, or gigabytes without either feature depending on the other.
+//! bytes, megabytes, or gigabytes without any of them depending on the others.
 
 /// A size specification for a cache tier, in bytes, megabytes, or gigabytes.
 ///

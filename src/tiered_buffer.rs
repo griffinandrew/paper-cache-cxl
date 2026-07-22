@@ -9,7 +9,7 @@
 //! features' (`lru_hybrid_cache`, `lfu_hybrid_cache`, `two_q_hybrid_cache`,
 //! `fifo_hybrid_cache`) single, unified object table.
 //!
-//! Unlike `hybridcache`, which gets two tiers by running two independent
+//! Unlike a design that gets two tiers by running two independent
 //! `PaperCache` instances (one `BufferDRAM`, one `BufferPMEM`) side by side,
 //! the hybrid-cache features built around `TieredBuffer` store every object
 //! in one `PaperCache<K, TieredBuffer>`. `TieredBuffer` is a tagged union

@@ -8,8 +8,8 @@
 //! Single-instance, segmented-FIFO hybrid cache.
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture as `lru_hybrid_cache`/
-//! `lfu_hybrid_cache`/`two_q_hybrid_cache` (contrast with `hybridcache`,
-//! which composes two independent `PaperCache` instances) — but with **no
+//! `lfu_hybrid_cache`/`two_q_hybrid_cache` (rather than composing two
+//! independent `PaperCache` instances) — but with **no
 //! promotion policy at all**. Every new object is admitted at the bottom of
 //! the fast tier; objects age strictly by insertion order and are never
 //! reordered by subsequent access or overwrite; when fast-tier space is
