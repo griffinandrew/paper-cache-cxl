@@ -76,16 +76,18 @@ hashbrown_dram = []
 eviction_stacks_pmem = ["dep:jemalloc_cxl"]
 
 # Alternative backend for the four hybrid-cache features' TieredBuffer: both
-# tiers go through jemalloc, not Hybrid/UMF at all. Fast tier is ordinary
-# jemalloc allocation via jemalloc_cxl's own #[global_allocator] declaration
-# (enabled here via "jemalloc_cxl/own_global_allocator" -- see lib.rs's
-# global-allocator cfg split, which deliberately does NOT declare a competing
-# one when this feature is on). Slow tier is jemalloc_cxl's
-# custom-extent-hooks NUMA/CXL arena (SlowTierJemallocAllocator,
+# tiers go through jemalloc, not Hybrid/UMF at all. Fast tier is jemalloc
+# allocation explicitly pinned to NUMA node 0 via this crate's own
+# DramMultiArenaObjects (src/allocator.rs), declared as the
+# #[global_allocator] in place of DRAMObjects (see lib.rs's global-allocator
+# cfg split) -- NOT jemalloc_cxl's own `own_global_allocator` feature, which
+# would install plain, NUMA-oblivious jemalloc instead (left off, matching
+# jemalloc_cxl's `default-features = false` above). Slow tier is
+# jemalloc_cxl's custom-extent-hooks NUMA/CXL arena (SlowTierJemallocAllocator,
 # src/allocator.rs). One jemalloc instance for both tiers -- UMF/Hybrid
 # stays linked (still a dependency of the hybrid features via key_value_pmem)
 # but is never actually called in this configuration.
-jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl", "jemalloc_cxl/own_global_allocator"]
+jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl"]
 
 #to emnable 3 tier based data movement
 hashtable_tiering = []

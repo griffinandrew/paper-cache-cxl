@@ -507,12 +507,23 @@ unsafe extern "C" fn cxl_extent_split(
     _committed: bool,
     _arena_ind: c_uint,
 ) -> bool {
-    // Conservative opt-out (`true` = "cannot split"). Splitting a single
-    // mmap'd region into two independently-managed extents is possible in
-    // principle but adds real bookkeeping (each half would need its own
-    // dalloc/destroy accounting) for no benefit this prototype needs --
-    // jemalloc falls back to treating the extent as a single unit instead.
-    true
+    // Accept (`false` = "split succeeded"). Splitting one mmap'd region
+    // into two independently-managed extents needs no bookkeeping of our
+    // own: `cxl_extent_dalloc`/`cxl_extent_destroy` already just `munmap`
+    // whatever `[addr, addr+size)` jemalloc hands them, and `munmap`
+    // operates on virtual address ranges, not on the original `mmap` call
+    // that created them -- it's perfectly valid to `munmap` half of a
+    // larger mapping while the other half stays live. jemalloc's own
+    // extent tracker (not this hook) is what remembers the two halves are
+    // now separate; nothing here needs to record that split.
+    //
+    // Declining this (the prior behavior) meant every extent, once
+    // allocated, could only ever be freed or destroyed as a single whole
+    // unit -- jemalloc could never carve a smaller allocation out of a
+    // larger extent's leftover space, which is a prerequisite for
+    // `cxl_extent_merge` below ever mattering (there's nothing to
+    // re-merge if nothing was ever split).
+    false
 }
 
 unsafe extern "C" fn cxl_extent_merge(
@@ -524,12 +535,32 @@ unsafe extern "C" fn cxl_extent_merge(
     _committed: bool,
     _arena_ind: c_uint,
 ) -> bool {
-    // Conservative opt-out (`true` = "cannot merge"), for the same reason
-    // as `cxl_extent_split`: merging would require confirming the two
-    // regions are truly adjacent, independently-freeable mmap results --
-    // not implemented here, so jemalloc keeps managing them as separate
-    // extents instead.
-    true
+    // Accept (`false` = "merge succeeded"). jemalloc only ever calls this
+    // for two extents it has already verified are adjacent
+    // (`addr_b == addr_a + size_a`) and that belong to the same arena --
+    // this hook doesn't need to re-verify either property itself, just
+    // honor the request. Two same-arena extents are always safe to treat
+    // as one from here on:
+    //
+    //  - NUMA policy can't mismatch: every extent in a given arena was
+    //    `mbind`'d with that arena's single registered `ArenaNumaConfig`
+    //    (see `cxl_extent_alloc`), so both halves already share the same
+    //    node/policy.
+    //  - Commit state can't mismatch: `cxl_extent_commit` always reports
+    //    "already committed" and `cxl_extent_decommit` always declines, so
+    //    every extent this hook set ever produces is uniformly committed.
+    //  - Freeing the merged range later is already safe: same reasoning as
+    //    `cxl_extent_split` above -- `munmap` doesn't care whether
+    //    `[addr_a, addr_a+size_a+size_b)` was one original mapping, two
+    //    adjacent ones, or a re-split/re-merged combination of prior
+    //    splits.
+    //
+    // This is what actually lets jemalloc's own decay/coalescing logic
+    // reclaim fragmented free space in these arenas (previously declining
+    // both split and merge meant every freed extent stayed a permanently
+    // separate, never-reunited island -- see the DramMultiArenaObjects
+    // investigation in the parent crate for the retention cost this had).
+    false
 }
 
 #[cfg(test)]
