@@ -169,19 +169,8 @@ fifo_hybrid_cache = ["key_value_pmem"]
 
 
 
-# jemalloc_cxl_slow_tier is on by default: it's a strict improvement over the
-# UMF-based DRAMObjects global allocator it replaces (see jemalloc_cxl's own
-# stress-testing and the real-benchmark runs documented in CLAUDE.md -- no
-# crashes under real concurrent load at any scale tested, unlike UMF's own
-# jemalloc pool, umfJemallocPoolOps, which crashed three separate times) and
-# is a no-op for any feature combination that doesn't also enable one of the
-# four hybrid-cache features (it only changes which allocator backs ordinary
-# DRAM allocations; PMEM-tier features still route through Hybrid/UMF
-# unaffected). Opt out via `default-features = false` if a UMF/DRAMObjects
-# baseline is specifically what's being measured.
-default = ["jemalloc_cxl_slow_tier"]
-
 # Legacy features (deprecated, will be removed)
+default = []
 original = []
 
 
