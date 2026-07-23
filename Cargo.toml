@@ -31,19 +31,13 @@ hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"
 sysinfo = "=0.33"
 
-# Runtime-parameterized NUMA-tier allocation for the four hybrid-cache
-# features' `TieredBuffer` type -- see `umf_tier_allocator/README.md`. Optional:
-# only pulled in when one of `lru_hybrid_cache`/`lfu_hybrid_cache`/
-# `two_q_hybrid_cache`/`fifo_hybrid_cache` is enabled.
-tier_allocator = { path = "umf_tier_allocator", optional = true }
-
 # One-jemalloc-instance, custom-extent-hooks NUMA/CXL arena allocator (see
 # `jemalloc_cxl/README.md`) -- backs `EvictionStackAllocator` (src/allocator.rs),
 # used only for eviction-stack metadata (PmemHashList/PmemVecList/EntryMap,
 # see worker/policy/policy_stack/pmem_collections.rs) under `eviction_stacks_pmem`.
 # `default-features = false` disables jemalloc_cxl's own `#[global_allocator]`
-# declaration -- this crate keeps its own (DRAMObjects/NumaAllocator, chosen
-# by feature flag elsewhere in this file); jemalloc_cxl's arena/mallctl/mallocx
+# declaration -- this crate keeps its own (DRAMObjects, see src/lib.rs);
+# jemalloc_cxl's arena/mallctl/mallocx
 # machinery works identically regardless of what's installed as the global
 # allocator, since it always links against the same jemalloc static library.
 jemalloc_cxl = { path = "jemalloc_cxl", optional = true, default-features = false }
@@ -82,53 +76,16 @@ hashbrown_dram = []
 eviction_stacks_pmem = ["dep:jemalloc_cxl"]
 
 # Alternative backend for the four hybrid-cache features' TieredBuffer: both
-# tiers go through jemalloc, not tier_allocator/UMF at all. Fast tier is
-# ordinary jemalloc allocation via jemalloc_cxl's own #[global_allocator]
-# declaration (enabled here via "jemalloc_cxl/own_global_allocator" -- see
-# lib.rs's global-allocator cfg split, which deliberately does NOT declare a
-# competing one when this feature is on). Slow tier is jemalloc_cxl's
+# tiers go through jemalloc, not Hybrid/UMF at all. Fast tier is ordinary
+# jemalloc allocation via jemalloc_cxl's own #[global_allocator] declaration
+# (enabled here via "jemalloc_cxl/own_global_allocator" -- see lib.rs's
+# global-allocator cfg split, which deliberately does NOT declare a competing
+# one when this feature is on). Slow tier is jemalloc_cxl's
 # custom-extent-hooks NUMA/CXL arena (SlowTierJemallocAllocator,
-# src/allocator.rs). One jemalloc instance for both tiers -- UMF/tier_allocator
-# stays linked (still a dependency of the hybrid features) but is never
-# actually called in this configuration.
+# src/allocator.rs). One jemalloc instance for both tiers -- UMF/Hybrid
+# stays linked (still a dependency of the hybrid features via key_value_pmem)
+# but is never actually called in this configuration.
 jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl", "jemalloc_cxl/own_global_allocator"]
-
-# Alternative backend for the four hybrid-cache features' TieredBuffer:
-# swaps tier_allocator's UMF pool backend from Intel TBB (umfScalablePoolOps,
-# the default) to UMF's own jemalloc pool (umfJemallocPoolOps), used
-# uniformly for both tiers via the same shared per-node registry -- i.e.
-# jemalloc used exactly the way TBB is used today (one pool per node,
-# NumaAllocator's #[global_allocator] for the fast tier and explicit
-# tier_allocator::alloc_on for the slow tier both draw from it), NOT the
-# separate custom-extent-hooks jemalloc_cxl crate `jemalloc_cxl_slow_tier`
-# uses. Requested explicitly despite tier_allocator's own documented
-# stability warning on this UMF pool backend (three prior real-concurrent-
-# load crashes inside UMF's own critnib memory tracker, root-caused to UMF
-# 1.0.3 itself, not caller code -- see umf_tier_allocator/src/lib.rs and
-# this file's CLAUDE.md history) -- re-test before trusting under real load.
-umf_jemalloc_pool = ["tier_allocator/jemalloc_pool"]
-
-# Alternative backend for the four hybrid-cache features' TieredBuffer:
-# swaps tier_allocator's UMF pool backend from Intel TBB to UMF's own
-# disjoint pool (umfDisjointPoolOps), used uniformly for both tiers via the
-# same shared per-node registry (same "used exactly like TBB" pattern as
-# umf_jemalloc_pool above). UMF's own native pool implementation (no
-# third-party allocator's extent-coalescing machinery involved at all), and
-# a controlled 300k-object/90%-freed repro showed real memory reclaim TBB
-# structurally cannot (settled within ~1.23x of the true theoretical
-# minimum vs. TBB's ~1.0x of peak) -- BUT confirmed unsafe under real
-# concurrent load: a direct reproduction against this crate's own
-# lru_hybrid_cache_integration test (N concurrent set() threads, well
-# within available memory) passes at 2/4 threads but reliably fails at 6+
-# with spurious allocation failures on both the fast-tier global allocator
-# (node 0) and the slow tier's independent alloc_on pool (node 1)
-# simultaneously -- a genuine concurrency bug inside umfDisjointPoolOps
-# itself, not this crate's integration. See umf_tier_allocator/src/lib.rs
-# and TierAllocator::new_numa_disjoint's doc comment for the full writeup
-# and exact repro command. Do not enable in production. Mutually exclusive
-# with umf_jemalloc_pool (tier_allocator's own compile_error! guard
-# enforces this).
-umf_disjoint_pool = ["tier_allocator/disjoint_pool"]
 
 #to emnable 3 tier based data movement
 hashtable_tiering = []
@@ -170,7 +127,7 @@ multitiering = ["key_pmem_value_pmem", "enable_tiering_manager", "hashtable_tier
 # Mutually exclusive with `lfu_hybrid_cache` below: both define their own
 # inherent-method impl block on the identical PaperCache<K, TieredBuffer, S>
 # type (see lib.rs's compile_error! guard).
-lru_hybrid_cache = ["key_value_pmem", "dep:tier_allocator"]
+lru_hybrid_cache = ["key_value_pmem"]
 
 # Single-instance, segmented-LFU hybrid cache: same one-PaperCache<K,
 # TieredBuffer> architecture as `lru_hybrid_cache` above, but the fast/slow
@@ -180,7 +137,7 @@ lru_hybrid_cache = ["key_value_pmem", "dep:tier_allocator"]
 # needs `key_value_pmem`, not `key_pmem_value_pmem`.
 #
 # Mutually exclusive with `lru_hybrid_cache` above.
-lfu_hybrid_cache = ["key_value_pmem", "dep:tier_allocator"]
+lfu_hybrid_cache = ["key_value_pmem"]
 
 # Single-instance, segmented-2Q hybrid cache: same one-PaperCache<K,
 # TieredBuffer> architecture as `lru_hybrid_cache`/`lfu_hybrid_cache` above,
@@ -193,7 +150,7 @@ lfu_hybrid_cache = ["key_value_pmem", "dep:tier_allocator"]
 # not `key_pmem_value_pmem`.
 #
 # Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache` above.
-two_q_hybrid_cache = ["key_value_pmem", "dep:tier_allocator"]
+two_q_hybrid_cache = ["key_value_pmem"]
 
 # Single-instance, segmented-FIFO hybrid cache: same one-PaperCache<K,
 # TieredBuffer> architecture as `lru_hybrid_cache`/`lfu_hybrid_cache`/
@@ -208,7 +165,7 @@ two_q_hybrid_cache = ["key_value_pmem", "dep:tier_allocator"]
 #
 # Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
 # `two_q_hybrid_cache` above.
-fifo_hybrid_cache = ["key_value_pmem", "dep:tier_allocator"]
+fifo_hybrid_cache = ["key_value_pmem"]
 
 
 

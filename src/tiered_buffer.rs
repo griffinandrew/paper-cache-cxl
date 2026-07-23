@@ -29,34 +29,38 @@
 //! ## Fast tier: ordinary heap allocation; slow tier: one of two backends
 //!
 //! `Fast` is a plain `Box<[u8]>` — an ordinary heap allocation through
-//! whatever this crate's `#[global_allocator]` currently is. `Fast` needing
-//! nothing beyond `Box::from` is a direct consequence of that: "ordinary
-//! heap allocation" and "the fast tier" are the same thing once the global
-//! allocator is installed -- which global allocator that is depends on the
-//! same feature switch that picks `Slow`'s backend, below.
+//! whatever this crate's `#[global_allocator]` currently is (`DRAMObjects`,
+//! `src/allocator.rs`, NUMA node 0). `Fast` needing nothing beyond `Box::from`
+//! is a direct consequence of that: "ordinary heap allocation" and "the fast
+//! tier" are the same thing once the global allocator is installed.
 //!
-//! `Slow` has two selectable backends, chosen at compile time, and each one
-//! also determines what `Fast`'s global allocator is (see `lib.rs`'s
-//! `#[global_allocator]` cfg split):
+//! `Slow` has two selectable backends, chosen at compile time:
 //!
-//! - **Default**: `tier_allocator::TierBuffer`, via `tier_allocator::alloc_on`
-//!   (UMF + Intel TBB's scalable pool). `Fast`'s global allocator is
-//!   `tier_allocator::NumaAllocator` bound to node 0 -- the same shared
-//!   per-node registry `Slow` draws from for node 1, so both tiers share one
-//!   real UMF pool per node. See `tier_allocator`'s own crate-level doc
-//!   comment for the full reasoning.
+//! - **Default**: `Box<[u8], Hybrid>` — the crate-wide PMEM allocator alias
+//!   (`Hybrid` = `HybridObjects`, `src/allocator.rs`), the same UMF +
+//!   Intel TBB scalable-pool allocator every other PMEM feature
+//!   (`key_value_pmem`, `global_hashtable_pmem`, ...) already uses. A prior
+//!   session tried replacing this with a standalone `tier_allocator` crate
+//!   (a from-scratch, runtime-parameterized reimplementation of "one UMF/TBB
+//!   pool per NUMA node") on the theory that sharing one registry between the
+//!   fast and slow tier's pools would be an improvement over two separate,
+//!   independent allocator types. It wasn't: `tier_allocator`'s own registry
+//!   still constructed one pool per node (`DRAMObjects`-equivalent for node 0,
+//!   `HybridObjects`-equivalent for node 1) -- structurally identical to what
+//!   `DRAMObjects`+`HybridObjects` already provided, just reimplemented in a
+//!   second crate. Removed entirely; `Slow` reverted to plain `Box<[u8],
+//!   Hybrid>`.
 //! - **`jemalloc_cxl_slow_tier` feature**: `Box<[u8], allocator::
 //!   SlowTierJemallocAllocator>` — jemalloc_cxl's custom-extent-hooks
 //!   NUMA/CXL arena mechanism. This feature also switches `Fast`'s global
 //!   allocator to plain jemalloc (via jemalloc_cxl's own `#[global_allocator]`
 //!   declaration, enabled through its `own_global_allocator` feature -- see
 //!   `lib.rs`) -- so **both** tiers go through jemalloc in this
-//!   configuration, and `tier_allocator`/UMF is never actually called at
-//!   all, deliberately, not just for the slow tier. Measured (single-threaded
-//!   and under real concurrent stress, both against a real UMF/tier_allocator
-//!   comparison) to be slower per-call single-threaded but faster in
-//!   aggregate under concurrent multi-thread load, and to place data
-//!   correctly on the target NUMA node under that same concurrent load
+//!   configuration, and `Hybrid`/UMF is never actually called at all,
+//!   deliberately, not just for the slow tier. Measured (single-threaded and
+//!   under real concurrent stress) to be slower per-call single-threaded but
+//!   faster in aggregate under concurrent multi-thread load, and to place
+//!   data correctly on the target NUMA node under that same concurrent load
 //!   (verified via `/proc/self/numa_maps`, not merely assumed). See
 //!   `jemalloc_cxl/README.md` for the underlying mechanism.
 //!
@@ -66,32 +70,21 @@
 
 use typesize::TypeSize;
 
-#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
-use tier_allocator::TierBuffer;
+use crate::Hybrid;
 
 #[cfg(feature = "jemalloc_cxl_slow_tier")]
 use crate::allocator::SlowTierJemallocAllocator;
 
-/// NUMA node backing the slow (PMEM/CXL) tier, matching this crate's own
-/// `HybridObjects::NODE` convention (`src/allocator.rs`). Only meaningful
-/// for the default (`tier_allocator`) backend; the `jemalloc_cxl_slow_tier`
-/// backend has its own copy of this same node id in
-/// `allocator::slow_tier_jemalloc_allocator`, since that module must
-/// compile standalone.
-#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
-const SLOW_TIER_NODE: i32 = 1;
-
 /// A value buffer that is physically stored in exactly one tier at a time.
 pub enum TieredBuffer {
 	/// Fast tier: an ordinary DRAM allocation through this crate's active
-	/// global allocator (`tier_allocator::NumaAllocator`, node 0, for the
-	/// four hybrid-cache features).
+	/// global allocator.
 	Fast(Box<[u8]>),
 
 	/// Slow tier: PMEM/CXL allocation. Backend selected at compile time --
 	/// see the module doc comment above.
 	#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
-	Slow(TierBuffer),
+	Slow(Box<[u8], Hybrid>),
 	#[cfg(feature = "jemalloc_cxl_slow_tier")]
 	Slow(Box<[u8], SlowTierJemallocAllocator>),
 }
@@ -105,16 +98,11 @@ impl TieredBuffer {
 	/// Creates a new slow-tier (PMEM/CXL) buffer by copying the given bytes.
 	#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
 	pub fn new_slow(bytes: &[u8]) -> Self {
-		let mut buffer = tier_allocator::alloc_on(SLOW_TIER_NODE, bytes.len())
-			.expect("slow-tier allocation should succeed");
-
-		buffer.copy_from_slice(bytes);
-		TieredBuffer::Slow(buffer)
+		TieredBuffer::Slow(Box::clone_from_ref_in(bytes, Hybrid))
 	}
 
 	/// Creates a new slow-tier (PMEM/CXL) buffer by copying the given bytes,
-	/// via jemalloc_cxl's custom-extent-hooks arena instead of
-	/// `tier_allocator`.
+	/// via jemalloc_cxl's custom-extent-hooks arena instead of `Hybrid`.
 	#[cfg(feature = "jemalloc_cxl_slow_tier")]
 	pub fn new_slow(bytes: &[u8]) -> Self {
 		let mut buffer = Box::<[u8], _>::new_uninit_slice_in(bytes.len(), SlowTierJemallocAllocator);
@@ -146,15 +134,7 @@ impl Clone for TieredBuffer {
 	fn clone(&self) -> Self {
 		match self {
 			TieredBuffer::Fast(buffer) => TieredBuffer::Fast(buffer.clone()),
-
-			TieredBuffer::Slow(buffer) => {
-				let allocator = tier_allocator::allocator_for(SLOW_TIER_NODE)
-					.expect("slow-tier allocator should be available");
-
-				TieredBuffer::Slow(
-					buffer.duplicate(allocator).expect("slow-tier duplicate should succeed"),
-				)
-			}
+			TieredBuffer::Slow(buffer) => TieredBuffer::Slow(buffer.clone()),
 		}
 	}
 

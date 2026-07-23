@@ -779,7 +779,7 @@ pub use eviction_stack_allocator::EvictionStackAllocator;
 // ---------------------------------------------------------------------
 // SlowTierJemallocAllocator: TieredBuffer::Slow's value bytes, via
 // jemalloc_cxl's custom-extent-hooks NUMA/CXL arena, as an alternative
-// backend to tier_allocator (the default -- see tiered_buffer.rs).
+// backend to Hybrid/HybridObjects (the default -- see tiered_buffer.rs).
 // ---------------------------------------------------------------------
 //
 // Unlike EvictionStackAllocator (which bridges to the stable-Rust-compatible
@@ -795,10 +795,8 @@ mod slow_tier_jemalloc_allocator {
 
     use jemalloc_cxl::{create_cxl_arena, CxlAllocator, CxlArena, CxlArenaConfig, NumaPolicy, TcacheMode};
 
-    /// NUMA node backing the slow tier, matching `tiered_buffer.rs`'s own
-    /// `SLOW_TIER_NODE` constant (kept separate/duplicated rather than
-    /// shared, since this module must compile standalone from
-    /// `tiered_buffer.rs`'s own cfg-gated half of that constant).
+    /// NUMA node backing the slow tier, matching `HybridObjects`'s own PMEM
+    /// node (this file, above).
     const SLOW_TIER_NODE: u32 = 1;
 
     fn arena() -> CxlArena {
@@ -811,8 +809,8 @@ mod slow_tier_jemalloc_allocator {
 
     /// Zero-sized allocator handle for `TieredBuffer::Slow`'s value bytes,
     /// routed through a dedicated jemalloc arena via `jemalloc_cxl`,
-    /// independent of `tier_allocator`'s own UMF/TBB pool for the same
-    /// node. A plain, `Copy`, no-state value, matching this file's other
+    /// independent of `Hybrid`/`HybridObjects`'s own UMF/TBB pool for the
+    /// same node. A plain, `Copy`, no-state value, matching this file's other
     /// allocator-marker types; the real arena/allocator handle is looked
     /// up lazily via `arena()` on every call.
     #[derive(Debug, Clone, Copy, Default)]

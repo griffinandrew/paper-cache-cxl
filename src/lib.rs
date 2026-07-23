@@ -267,14 +267,18 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 
 //pub mod allocator;
 
-// The four hybrid-cache features (lru/lfu/two_q/fifo_hybrid_cache) install
-// tier_allocator's NumaAllocator (bound to NUMA node 0) as the global
-// allocator instead of DRAMObjects. This is what lets TieredBuffer::Fast
-// collapse to a plain Box<[u8]> (see tiered_buffer.rs) -- an ordinary heap
-// allocation on this global allocator IS the fast tier for those features,
-// sharing one real UMF pool per node with the slow tier's explicit
-// tier_allocator::alloc_on(SLOW_TIER_NODE, ..) calls rather than each tier
-// having its own independent, redundant pool.
+// DRAMObjects (NUMA node 0, src/allocator.rs) is the crate's global
+// allocator for every feature, including the four hybrid-cache features
+// (lru/lfu/two_q/fifo_hybrid_cache) -- an ordinary heap allocation on this
+// global allocator IS the fast tier for those features (see
+// tiered_buffer.rs's TieredBuffer::Fast = Box<[u8]>); the slow tier uses
+// `Hybrid`/`HybridObjects` (NUMA node 1) explicitly via TieredBuffer::Slow.
+// A prior session tried routing both tiers through a separate,
+// runtime-parameterized `tier_allocator` crate instead -- removed again
+// (see tiered_buffer.rs's module doc) since its default backend still
+// constructed one independent UMF/TBB pool per NUMA node, the same shape
+// DRAMObjects+HybridObjects already had; it added a second implementation
+// of the same mechanism without changing that mechanism's properties.
 //
 // Under `jemalloc_cxl_slow_tier`, this is deliberately NOT the case: that
 // feature enables jemalloc_cxl's own `own_global_allocator` feature (see
@@ -285,13 +289,9 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 // competing one for that case (Rust permits exactly one per binary). That
 // makes the fast tier ordinary jemalloc allocation and the slow tier
 // jemalloc_cxl's custom-extent-hooks NUMA/CXL arena (SlowTierJemallocAllocator,
-// src/allocator.rs) -- one jemalloc instance for both tiers, UMF/tier_allocator
+// src/allocator.rs) -- one jemalloc instance for both tiers, UMF/Hybrid
 // entirely out of the picture, rather than mixing the two allocator stacks.
-#[cfg(all(not(feature = "jemalloc_cxl_slow_tier"), any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache")))]
-#[global_allocator]
-static GLOBAL: tier_allocator::NumaAllocator = tier_allocator::NumaAllocator::new(0);
-
-#[cfg(all(not(feature = "jemalloc_cxl_slow_tier"), not(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))))]
+#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 

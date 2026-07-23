@@ -1852,3 +1852,57 @@ their established baselines unchanged (91/91/92/92 unit; 15/15+2 ignored lru, 19
 two_q, 14/14 fifo integration); `tiering_integration.rs`'s remaining 10 tests (the
 `hybridcache_promotion_tests` module removed, `tiering_tests`/`tiering_pmem_key_tests` untouched)
 pass unchanged.
+
+## Removed the `tier_allocator` crate: it still used two allocator instances under the hood
+
+A prior session added a standalone `umf_tier_allocator` crate (`Add tier_allocator:
+runtime-parameterized NUMA-tier allocation via UMF`, then `Unify tier_allocator into one
+mechanism: #[global_allocator] + explicit alloc_on`) and wired it into all four hybrid caches'
+`TieredBuffer` (`Integrate tier_allocator into TieredBuffer for all four hybrid caches`), replacing
+`Fast`'s reliance on `DRAMObjects` (node 0) and `Slow`'s `Box<[u8], Hybrid>` (`HybridObjects`, node
+1) with `tier_allocator::NumaAllocator`/`tier_allocator::alloc_on` against a shared per-node
+registry. It also grew two optional alternate UMF pool backends (`umf_jemalloc_pool`,
+`umf_disjoint_pool`), both already documented elsewhere in this file as confirmed unsafe under
+real concurrent load.
+
+Per explicit user request, checked whether this crate delivered anything over what already
+existed, given the suspicion that it "still uses two allocator instances under the hood." It did:
+`umf_tier_allocator/src/registry.rs`'s `REGISTRY` is a per-NUMA-node array — `pool_for_node(0)` and
+`pool_for_node(1)` each lazily construct and cache their own independent `TierAllocator` (i.e. UMF
+pool). For the two-tier hybrid caches (fast tier pinned to node 0, slow tier to node 1), this means
+exactly two live pool instances, structurally identical in shape to the `DRAMObjects` (node 0) +
+`HybridObjects` (node 1) pair the crate already had before `tier_allocator` was added — same
+default backend (`umfScalablePoolOps`, TBB), same one-pool-per-node property, just reimplemented in
+a second crate with runtime NUMA-node parameterization neither tier actually needed (both nodes are
+hardcoded constants at every real call site, 0 and 1). The crate's own doc comments (`tiered_buffer.rs`'s
+old module doc, `lib.rs`'s global-allocator comment) had framed "both access patterns resolve to
+the exact same per-node pool" as an improvement over "two independent allocator instances" — but
+that framing compared the two *access patterns for a single node* (implicit `GlobalAlloc` vs.
+explicit `alloc_on`), not the two *tiers*, which were never sharing a pool and structurally
+couldn't (different NUMA nodes require different `mbind` targets). So the premise was confirmed:
+the crate added an entire second UMF/TBB integration without changing the number of pool instances
+the four hybrid caches actually run with, or any other externally-observable property.
+
+Removed entirely: `umf_tier_allocator/` (whole crate directory), the `tier_allocator` path
+dependency and its `dep:tier_allocator` requirement on all four hybrid-cache features, and the
+`umf_jemalloc_pool`/`umf_disjoint_pool` Cargo features (both were solely alternate pool backends
+*within* `tier_allocator`, meaningless without it). `TieredBuffer::Slow` (`src/tiered_buffer.rs`)
+reverted to `Box<[u8], Hybrid>` (`Hybrid` = `HybridObjects`, the same alias every other PMEM feature
+already uses); `TieredBuffer::Fast`'s `Clone` impl simplified to a plain `buffer.clone()` for the
+`Hybrid` case, since `Box<[u8], Hybrid>: Clone` already holds for free via this crate's existing
+`clone_from_ref` nightly feature gate (`Hybrid`/`HybridObjects` is `Clone + Copy`) — no manual
+duplicate-via-explicit-allocator dance needed, unlike `TierBuffer`, which required one.
+`lib.rs`'s `#[global_allocator]` selection collapsed back to unconditionally `DRAMObjects` whenever
+`jemalloc_cxl_slow_tier` isn't active (previously branched on whether a hybrid-cache feature was
+enabled, to pick between `DRAMObjects` and `tier_allocator::NumaAllocator`). The
+`jemalloc_cxl_slow_tier` alternate backend (a genuinely different, unrelated mechanism -- one
+jemalloc instance for both tiers, no UMF at all) is untouched and still available.
+
+Verified: all four hybrid-cache features (`lru_hybrid_cache`/`lfu_hybrid_cache`/
+`two_q_hybrid_cache`/`fifo_hybrid_cache`, individually and combined with `jemalloc_cxl_slow_tier`)
+and four untouched-feature regression builds (`key_value_pmem`, `all_dram`, `eviction_stacks_pmem`,
+`hashbrown_dram`) all build clean; `Cargo.lock` no longer references `tier_allocator`.
+`lru_hybrid_cache`'s `--lib` suite (91/91) and real-PMEM integration suite (15/15 +2 ignored) both
+pass at their previously-documented baselines, now genuinely exercising `Hybrid`/`HybridObjects`
+(this sandbox's real UMF pool + memory-only NUMA node) rather than `tier_allocator`'s reimplementation
+of the same thing.
