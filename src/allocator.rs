@@ -689,77 +689,6 @@ unsafe impl allocator_api2::alloc::Allocator for DRAMObjects {
 */
 
 // ---------------------------------------------------------------------
-// NumaArenaPool: a small pool of same-node, BindStrict-pinned jemalloc_cxl
-// arenas, shared by EvictionStackAllocator and SlowTierJemallocAllocator
-// below -- both bypass jemalloc's tcache (TcacheMode::None), which is
-// required for correct NUMA placement (see SlowTierJemallocAllocator's own
-// doc comment for the bug this fixed), but means every allocation takes the
-// arena-lock slow path directly instead of a thread-local fast path.
-//
-// Confirmed by direct measurement: a single shared arena under this
-// tcache-bypassed access pattern is a severe bottleneck -- 8 concurrent
-// threads on one arena measured ~460K ops/sec; 8 threads each on their own
-// arena (from an 8-arena pool) measured ~11.7M ops/sec, a ~25x difference,
-// saturating right around the thread count with no further gain from more
-// arenas than that. Sized like DramMultiArenaObjects's pool (`4 * ncpus`)
-// for the same reason -- enough arenas that concurrent threads rarely
-// collide, without an arena per thread.
-//
-// Deliberately NOT the same mechanism DramMultiArenaObjects uses
-// (`jemalloc_cxl::bind_thread_arena`, which permanently rebinds a whole
-// thread's *implicit* default arena): that would misdirect a thread's
-// *other*, unrelated allocations onto this node too. Each consumer instead
-// keeps its own `thread_local!` caching this thread's round-robin-assigned
-// arena, looked up once and reused for every subsequent allocation that
-// consumer's `arena()` function serves.
-#[cfg(any(feature = "eviction_stacks_pmem", feature = "jemalloc_cxl_slow_tier"))]
-mod numa_arena_pool {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::OnceLock;
-
-    use jemalloc_cxl::{create_cxl_arena, CxlArena, CxlArenaConfig, NumaPolicy};
-
-    pub(super) struct NumaArenaPool {
-        node: u32,
-        arenas: OnceLock<Vec<CxlArena>>,
-        next: AtomicUsize,
-    }
-
-    impl NumaArenaPool {
-        pub(super) const fn new(node: u32) -> Self {
-            NumaArenaPool {
-                node,
-                arenas: OnceLock::new(),
-                next: AtomicUsize::new(0),
-            }
-        }
-
-        fn arena_list(&self) -> &[CxlArena] {
-            self.arenas.get_or_init(|| {
-                let count = 4 * std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-                let node = self.node;
-                (0..count)
-                    .map(|_| {
-                        create_cxl_arena(CxlArenaConfig::new(node, NumaPolicy::BindStrict))
-                            .unwrap_or_else(|e| panic!("node-{node} CXL arena creation should succeed: {e}"))
-                    })
-                    .collect()
-            })
-        }
-
-        /// Hands back the next arena in round-robin order. Callers are
-        /// expected to cache the result once per thread (see each
-        /// consumer's own `thread_local!` below) rather than calling this
-        /// on every allocation.
-        pub(super) fn next_arena(&self) -> CxlArena {
-            let list = self.arena_list();
-            let idx = self.next.fetch_add(1, Ordering::Relaxed) % list.len();
-            list[idx]
-        }
-    }
-}
-
-// ---------------------------------------------------------------------
 // EvictionStackAllocator: eviction-stack metadata PMEM allocation via
 // jemalloc_cxl's custom-extent-hooks NUMA/CXL arena.
 // ---------------------------------------------------------------------
@@ -775,34 +704,24 @@ mod numa_arena_pool {
 // and a nightly `Allocator` handle over one arena.
 #[cfg(feature = "eviction_stacks_pmem")]
 mod eviction_stack_allocator {
-    use std::cell::Cell;
+    use std::sync::OnceLock;
 
-    use jemalloc_cxl::{CxlAllocator, CxlArena, TcacheMode};
-
-    use super::numa_arena_pool::NumaArenaPool;
+    use jemalloc_cxl::{create_cxl_arena, CxlAllocator, CxlArena, CxlArenaConfig, NumaPolicy};
 
     /// NUMA node eviction-stack metadata is bound to, matching this crate's
     /// own `HybridObjects::NODE`/PMEM-node convention (node 1).
     const EVICTION_STACK_NODE: u32 = 1;
 
-    static POOL: NumaArenaPool = NumaArenaPool::new(EVICTION_STACK_NODE);
-
-    /// This calling thread's round-robin-assigned arena from `POOL`,
-    /// looked up once and cached for the thread's remaining lifetime (see
-    /// `numa_arena_pool`'s module doc for why this is a per-thread
-    /// thread_local rather than jemalloc_cxl's whole-thread
-    /// `bind_thread_arena`).
+    /// Lazily creates (once, process-lifetime -- matching every other
+    /// pool/arena in this file) the CXL arena backing all eviction-stack
+    /// metadata. `BindStrict` (`MPOL_BIND`) matches `HybridObjects`'s own
+    /// existing UMF configuration (`UMF_NUMA_MODE_BIND`), for closer
+    /// behavioral parity between the two PMEM paths.
     fn arena() -> CxlArena {
-        thread_local! {
-            static ASSIGNED: Cell<Option<CxlArena>> = const { Cell::new(None) };
-        }
-        ASSIGNED.with(|slot| {
-            if let Some(a) = slot.get() {
-                return a;
-            }
-            let a = POOL.next_arena();
-            slot.set(Some(a));
-            a
+        static ARENA: OnceLock<CxlArena> = OnceLock::new();
+        *ARENA.get_or_init(|| {
+            create_cxl_arena(CxlArenaConfig::new(EVICTION_STACK_NODE, NumaPolicy::BindStrict))
+                .expect("eviction-stack CXL arena creation should succeed")
         })
     }
 
@@ -825,25 +744,11 @@ mod eviction_stack_allocator {
             &self,
             layout: std::alloc::Layout,
         ) -> Result<std::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
-            // TcacheMode::None (MALLOCX_TCACHE_NONE), not the
-            // TcacheMode::Automatic this used before: TcacheMode::Automatic
-            // lets jemalloc satisfy a MALLOCX_ARENA(N) request from the
-            // calling thread's own automatic tcache -- bound to whichever
-            // arena that thread was auto-assigned to, not this arena --
-            // whenever a same-size-class chunk happens to be cached there.
-            // This is the exact bug already found and fixed for
-            // `SlowTierJemallocAllocator` (see that type's own doc comment):
-            // confirmed there via direct instrumentation that
-            // `TcacheMode::Automatic` allocations logically counted against
-            // one arena were silently served from the wrong one, with zero
-            // real pages resident on the target NUMA node despite the
-            // allocator's own stats reporting the data as present. Applying
-            // the same fix here rather than assuming eviction-stack
-            // metadata was exempt from the same mechanism.
-            <CxlAllocator as std::alloc::Allocator>::allocate(
-                &CxlAllocator::with_tcache(arena(), TcacheMode::None),
-                layout,
-            )
+            // Bridges to CxlAllocator's own nightly `Allocator::allocate`
+            // (jemalloc_cxl's only public allocation entry point) -- no
+            // unsafe work of our own, just adapting one allocator-trait
+            // shape to another; both mirror the same allocate contract.
+            <CxlAllocator as std::alloc::Allocator>::allocate(&CxlAllocator::new(arena()), layout)
                 .map_err(|_| allocator_api2::alloc::AllocError)
         }
 
@@ -851,13 +756,15 @@ mod eviction_stack_allocator {
             // SAFETY: caller upholds `allocator_api2::alloc::Allocator::
             // deallocate`'s contract (`ptr`/`layout` describe a still-live
             // allocation previously returned by this same allocator's
-            // `allocate`). Must match `allocate`'s TcacheMode::None exactly
-            // (see the jemalloc_cxl README's "Don't mix allocation/
-            // deallocation APIs" section) -- deallocating with mismatched
-            // tcache flags is undefined per jemalloc's own contract.
+            // `allocate`). `CxlAllocator::deallocate`'s contract is
+            // identical, and `CxlAllocator::new(arena())` reconstructs the
+            // exact same arena/tcache encoding on every call (`arena()`
+            // itself is cached behind a `OnceLock`, and `CxlAllocator::new`
+            // always uses `TcacheMode::Automatic`) -- so this is the same
+            // allocator in every sense `deallocate`'s contract cares about.
             unsafe {
                 <CxlAllocator as std::alloc::Allocator>::deallocate(
-                    &CxlAllocator::with_tcache(arena(), TcacheMode::None),
+                    &CxlAllocator::new(arena()),
                     ptr,
                     layout,
                 )
@@ -883,36 +790,20 @@ pub use eviction_stack_allocator::EvictionStackAllocator;
 #[cfg(feature = "jemalloc_cxl_slow_tier")]
 mod slow_tier_jemalloc_allocator {
     use std::alloc::{AllocError, Allocator, Layout};
-    use std::cell::Cell;
     use std::ptr::NonNull;
+    use std::sync::OnceLock;
 
-    use jemalloc_cxl::{CxlAllocator, CxlArena, TcacheMode};
-
-    use super::numa_arena_pool::NumaArenaPool;
+    use jemalloc_cxl::{create_cxl_arena, CxlAllocator, CxlArena, CxlArenaConfig, NumaPolicy, TcacheMode};
 
     /// NUMA node backing the slow tier, matching `HybridObjects`'s own PMEM
     /// node (this file, above).
     const SLOW_TIER_NODE: u32 = 1;
 
-    static POOL: NumaArenaPool = NumaArenaPool::new(SLOW_TIER_NODE);
-
-    /// This calling thread's round-robin-assigned arena from `POOL` (see
-    /// `numa_arena_pool`'s module doc, and `EvictionStackAllocator::arena`'s
-    /// identical pattern -- confirmed by direct measurement that a single
-    /// shared arena under `TcacheMode::None` is a ~25x throughput
-    /// bottleneck under concurrent access, since every allocation then
-    /// takes the arena-lock slow path directly).
     fn arena() -> CxlArena {
-        thread_local! {
-            static ASSIGNED: Cell<Option<CxlArena>> = const { Cell::new(None) };
-        }
-        ASSIGNED.with(|slot| {
-            if let Some(a) = slot.get() {
-                return a;
-            }
-            let a = POOL.next_arena();
-            slot.set(Some(a));
-            a
+        static ARENA: OnceLock<CxlArena> = OnceLock::new();
+        *ARENA.get_or_init(|| {
+            create_cxl_arena(CxlArenaConfig::new(SLOW_TIER_NODE, NumaPolicy::BindStrict))
+                .expect("slow-tier CXL arena creation should succeed")
         })
     }
 
@@ -961,343 +852,3 @@ mod slow_tier_jemalloc_allocator {
 
 #[cfg(feature = "jemalloc_cxl_slow_tier")]
 pub use slow_tier_jemalloc_allocator::SlowTierJemallocAllocator;
-
-// ---------------------------------------------------------------------
-// DramMultiArenaObjects: the crate's #[global_allocator] under
-// `jemalloc_cxl_slow_tier` -- multiple node-0-pinned jemalloc arenas via
-// jemalloc_cxl's custom extent hooks, instead of jemalloc's own default
-// (unbound) arena selection.
-// ---------------------------------------------------------------------
-//
-// Plain `jemalloc_cxl::Jemalloc` (what `jemalloc_cxl_slow_tier` used before
-// this type existed) never calls `mbind` for its own default arenas at all
-// -- it lands on node 0 today only incidentally, because node 1 in this
-// crate's target topology has zero CPUs, so the kernel's ordinary
-// local-allocation policy already happens to put every faulting thread's
-// pages on node 0. That's not a guarantee: a different topology, a
-// mem-pressure-triggered NUMA-balancing migration, or any future change
-// that lets threads run on node 1 could silently drift fast-tier bytes off
-// node 0. This type makes the placement explicit instead of incidental.
-//
-// A single node-0-bound arena (the obvious alternative, and how
-// `SlowTierJemallocAllocator`/`EvictionStackAllocator` each pin *their*
-// single node-1 arena) would reintroduce the exact contention problem
-// jemalloc's own default multi-arena design exists to avoid: every thread
-// serializing on one arena's locks. So instead this creates a small pool of
-// node-0-bound arenas (sized like jemalloc's own default `narenas`
-// heuristic -- `4 * available_parallelism()`) and permanently binds each
-// thread, round-robin, to one of them via `jemalloc_cxl::bind_thread_arena`
-// on that thread's first allocation.
-//
-// Critically, once a thread is bound, ordinary `alloc`/`dealloc` calls are
-// delegated straight to `jemalloc_cxl::Jemalloc`'s own `GlobalAlloc` impl --
-// which itself calls plain `malloc`/`free`/`sdallocx` with no
-// `MALLOCX_ARENA`/`MALLOCX_TCACHE_NONE` flags (confirmed by reading
-// `tikv-jemallocator`'s source: `layout_to_flags` only ever returns an
-// alignment flag or `0`). That means every one of *this* thread's
-// allocations uses its now-permanently-bound arena's own tcache completely
-// normally -- unlike `SlowTierJemallocAllocator` (which must pass
-// `MALLOCX_TCACHE_NONE` on every call, see that type's own doc comment, to
-// stop the calling thread's *unrelated* automatic tcache from silently
-// masking the explicit `MALLOCX_ARENA` request), there is no mismatch here
-// to guard against: the tcache the thread ends up using *is* the
-// node-0-pinned arena's own tcache, because the thread itself -- not just
-// one allocation -- was rebound.
-#[cfg(feature = "jemalloc_cxl_slow_tier")]
-mod dram_multi_arena {
-    use std::alloc::{GlobalAlloc, Layout};
-    use std::cell::Cell;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::OnceLock;
-
-    use jemalloc_cxl::{
-        bind_thread_arena, create_cxl_arena, CxlArena, CxlArenaConfig, Jemalloc as InnerJemalloc,
-        NumaPolicy,
-    };
-
-    /// NUMA node the crate's ordinary (fast-tier) allocations are pinned
-    /// to, matching every other DRAM-side convention in this file (node 0).
-    const DRAM_NODE: u32 = 0;
-
-    fn num_arenas() -> usize {
-        // Mirrors jemalloc's own default `narenas` heuristic (`4 *
-        // ncpus`) -- enough arenas that concurrently-running threads
-        // rarely collide on the same one, without creating an arena per
-        // thread (arenas, and the extents backing them, aren't free).
-        4 * std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
-    }
-
-    fn arenas() -> &'static [CxlArena] {
-        static ARENAS: OnceLock<Vec<CxlArena>> = OnceLock::new();
-        ARENAS.get_or_init(|| {
-            (0..num_arenas())
-                .map(|_| {
-                    // `BindStrict` (MPOL_BIND): fast-tier/ordinary
-                    // allocations must genuinely stay on node 0, hard
-                    // failure otherwise -- confirmed this can be reached
-                    // under real pressure (a workload whose combined
-                    // fast-tier + bookkeeping footprint exceeds node 0's
-                    // free memory aborts rather than silently spilling
-                    // onto node 1), which is the explicit, accepted
-                    // tradeoff of a strict node-0-only guarantee.
-                    create_cxl_arena(CxlArenaConfig::new(DRAM_NODE, NumaPolicy::BindStrict))
-                        .expect("node-0 CXL arena creation should succeed")
-                })
-                .collect()
-        })
-    }
-
-    thread_local! {
-        // Per-thread "have I been bound yet" flag -- binding is permanent
-        // (see `bind_thread_arena`'s own docs: there is nothing to restore),
-        // so this only ever needs to happen once per thread, not once per
-        // allocation.
-        static BOUND: Cell<bool> = const { Cell::new(false) };
-
-        // Reentrancy guard for the *binding process itself*. Building the
-        // arena pool the first time (`arenas()`'s `OnceLock::get_or_init`,
-        // which `.collect()`s a `Vec`) and `bind_thread_arena`'s own mallctl
-        // call both potentially allocate (a growing `Vec`; jemalloc_cxl's
-        // internal arena-NUMA registry, a `HashMap` behind its own separate
-        // `OnceLock`) -- and every allocation in the process, including
-        // those, comes back through this same `GlobalAlloc::alloc`. Without
-        // this guard, the very first allocation the process ever makes
-        // would recurse into `ensure_thread_bound()` a second time while
-        // still inside the first call's `arenas()` -- and `OnceLock` is not
-        // reentrant, so a nested `get_or_init` on the same thread deadlocks
-        // forever rather than erroring. While this guard is set, nested
-        // allocations skip straight to `InnerJemalloc` (unbound, but
-        // correct) instead of recursing.
-        static BINDING_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
-    }
-
-    #[inline]
-    fn ensure_thread_bound() {
-        BOUND.with(|bound| {
-            if bound.get() {
-                return;
-            }
-
-            let already_binding = BINDING_IN_PROGRESS.with(|p| p.replace(true));
-            if already_binding {
-                // Reentered from within our own binding process (see the
-                // thread_local's doc comment above) -- let the nested
-                // allocation fall through to InnerJemalloc unbound. The
-                // outer call will still finish and mark this thread bound.
-                return;
-            }
-
-            let list = arenas();
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let idx = NEXT.fetch_add(1, Ordering::Relaxed) % list.len();
-
-            if let Err(e) = bind_thread_arena(list[idx]) {
-                eprintln!(
-                    "DramMultiArenaObjects: failed to bind thread to node-{DRAM_NODE} arena {idx}: {e} \
-                     -- this thread's allocations will use jemalloc's own default (unbound) arena instead"
-                );
-            }
-
-            // Mark bound regardless of success -- a failed mallctl isn't
-            // expected to be transient (see `ThreadArenaGuard`'s own
-            // drop-path precedent for the same "log and move on" choice),
-            // and retrying on every single allocation would turn one
-            // eprintln into millions.
-            bound.set(true);
-            BINDING_IN_PROGRESS.with(|p| p.set(false));
-        });
-    }
-
-    /// The crate's `#[global_allocator]` under `jemalloc_cxl_slow_tier`. A
-    /// plain, `Copy`, no-state marker type -- matching every other
-    /// allocator-handle type in this file -- whose real state (the arena
-    /// pool, and each thread's bound/unbound flag) lives behind the
-    /// process-lifetime statics above.
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct DramMultiArenaObjects;
-
-    unsafe impl GlobalAlloc for DramMultiArenaObjects {
-        #[inline]
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            ensure_thread_bound();
-            // SAFETY: delegates directly to `jemalloc_cxl::Jemalloc`'s own
-            // `GlobalAlloc::alloc`, which has the same safety contract this
-            // method does; `layout` is passed through unchanged.
-            unsafe { InnerJemalloc.alloc(layout) }
-        }
-
-        #[inline]
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            ensure_thread_bound();
-            // SAFETY: see `alloc` above.
-            unsafe { InnerJemalloc.alloc_zeroed(layout) }
-        }
-
-        #[inline]
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            // No `ensure_thread_bound()` here: `sdallocx` (which
-            // `jemalloc_cxl::Jemalloc::dealloc` uses) takes the size/layout
-            // directly and looks up the owning extent/arena from jemalloc's
-            // own metadata, not from the calling thread's arena -- a thread
-            // that has only ever freed memory (never allocated any) has no
-            // need to be bound to one of this pool's arenas at all.
-            //
-            // SAFETY: caller upholds `GlobalAlloc::dealloc`'s contract
-            // (`ptr`/`layout` describe a still-live allocation previously
-            // returned by this same allocator's `alloc`/`alloc_zeroed`).
-            unsafe { InnerJemalloc.dealloc(ptr, layout) }
-        }
-
-        #[inline]
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            ensure_thread_bound();
-            // SAFETY: see `alloc` above; `ptr`/`layout`/`new_size` are
-            // passed through unchanged to `jemalloc_cxl::Jemalloc::realloc`,
-            // which has the same contract this method does.
-            unsafe { InnerJemalloc.realloc(ptr, layout, new_size) }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        // `DramMultiArenaObjects` is this crate's actual `#[global_allocator]`
-        // under this feature (see lib.rs), so an ordinary `Vec`/`Box` in this
-        // test binary already exercises `alloc`/`dealloc` through it -- these
-        // tests check the two properties that can't be inferred from "the
-        // rest of the suite didn't hang or crash": real NUMA residency (not
-        // just that the reentrancy-guard fix stopped deadlocking), and that
-        // concurrent threads actually spread across more than one arena
-        // rather than piling onto one.
-
-        fn numa_node1_available() -> bool {
-            std::path::Path::new("/sys/devices/system/node/node1").exists()
-        }
-
-        /// Same helper shape as jemalloc_cxl's own numa_integration tests.
-        fn resident_pages_on_node(addr: usize, node: u32) -> Option<u64> {
-            let contents = std::fs::read_to_string("/proc/self/numa_maps").ok()?;
-            let mut best: Option<&str> = None;
-            for line in contents.lines() {
-                let start_hex = line.split_whitespace().next()?;
-                let Ok(start) = usize::from_str_radix(start_hex, 16) else {
-                    continue;
-                };
-                if start <= addr {
-                    best = Some(line);
-                } else {
-                    break;
-                }
-            }
-            let line = best?;
-            let field = format!("N{node}=");
-            let value = line.split_whitespace().find_map(|tok| tok.strip_prefix(&field))?;
-            value.parse().ok()
-        }
-
-        #[test]
-        fn ordinary_allocations_are_resident_on_node_0() {
-            // Meaningful even on a single-node machine (asserts >0 pages on
-            // node 0, which is always true there); the interesting case --
-            // confirming it's *not* landing on node 1 instead -- only
-            // applies when a second node genuinely exists.
-            const LEN: usize = 4 * 1024 * 1024; // 4 MiB, several pages
-            let mut v: Vec<u8> = Vec::with_capacity(LEN);
-            v.resize(LEN, 0x7A);
-
-            let addr = v.as_ptr() as usize;
-            let resident_node0 = resident_pages_on_node(addr, 0).unwrap_or(0);
-            assert!(resident_node0 > 0, "expected pages resident on node 0, found none");
-
-            if numa_node1_available() {
-                let resident_node1 = resident_pages_on_node(addr, 1).unwrap_or(0);
-                assert_eq!(resident_node1, 0, "expected zero pages on node 1 for a fast-tier/ordinary allocation");
-            }
-        }
-
-        #[test]
-        fn concurrent_threads_are_resident_on_node_0_and_spread_across_arenas() {
-            use std::collections::HashSet;
-            use std::sync::{Arc, Mutex};
-
-            let seen_arenas: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
-            let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(8);
-
-            let handles: Vec<_> = (0..n_threads)
-                .map(|_| {
-                    let seen_arenas = Arc::clone(&seen_arenas);
-                    std::thread::spawn(move || {
-                        const LEN: usize = 1024 * 1024; // 1 MiB
-                        let mut v: Vec<u8> = Vec::with_capacity(LEN);
-                        v.resize(LEN, 0x5C);
-                        let addr = v.as_ptr() as usize;
-
-                        let resident_node0 = resident_pages_on_node(addr, 0).unwrap_or(0);
-                        assert!(resident_node0 > 0, "expected pages resident on node 0, found none");
-                        if numa_node1_available() {
-                            let resident_node1 = resident_pages_on_node(addr, 1).unwrap_or(0);
-                            assert_eq!(resident_node1, 0, "expected zero pages on node 1");
-                        }
-
-                        seen_arenas.lock().unwrap().insert(current_thread_arena());
-                        drop(v);
-                    })
-                })
-                .collect();
-
-            for h in handles {
-                h.join().unwrap();
-            }
-
-            let distinct = seen_arenas.lock().unwrap().len();
-            assert!(
-                distinct > 1,
-                "expected concurrent threads to spread across more than one arena, all landed on {distinct}"
-            );
-        }
-
-        fn current_thread_arena() -> u32 {
-            use std::os::raw::c_uint;
-            let mut ind: c_uint = 0;
-            let mut ind_size = std::mem::size_of::<c_uint>();
-            let rc = unsafe {
-                jemalloc_cxl_mallctl_thread_arena_get(&raw mut ind, &raw mut ind_size)
-            };
-            assert_eq!(rc, 0, "reading thread.arena should succeed");
-            ind
-        }
-
-        // `jemalloc_cxl` doesn't expose a public "read current thread.arena"
-        // helper (it's only ever a private test helper inside its own crate,
-        // see `thread_arena.rs`'s `tests::current_thread_arena`) -- this
-        // duplicates that same raw mallctl read locally rather than adding
-        // a new public API to jemalloc_cxl for a test-only need in a
-        // downstream crate.
-        unsafe fn jemalloc_cxl_mallctl_thread_arena_get(
-            oldp: *mut std::os::raw::c_uint,
-            oldlenp: *mut usize,
-        ) -> std::os::raw::c_int {
-            unsafe extern "C" {
-                #[link_name = "_rjem_mallctl"]
-                fn mallctl(
-                    name: *const std::os::raw::c_char,
-                    oldp: *mut std::ffi::c_void,
-                    oldlenp: *mut usize,
-                    newp: *mut std::ffi::c_void,
-                    newlen: usize,
-                ) -> std::os::raw::c_int;
-            }
-            unsafe {
-                mallctl(
-                    c"thread.arena".as_ptr(),
-                    oldp.cast(),
-                    oldlenp,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            }
-        }
-    }
-}
-
-#[cfg(feature = "jemalloc_cxl_slow_tier")]
-pub use dram_multi_arena::DramMultiArenaObjects;

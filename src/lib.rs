@@ -280,29 +280,20 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 // DRAMObjects+HybridObjects already had; it added a second implementation
 // of the same mechanism without changing that mechanism's properties.
 //
-// Under `jemalloc_cxl_slow_tier`, this is deliberately NOT the case: the
-// crate's own `allocator::DramMultiArenaObjects` (src/allocator.rs) is
-// declared as the `#[global_allocator]` instead of `DRAMObjects` -- Rust
-// permits exactly one per binary, so these two are mutually exclusive
-// `#[cfg]` arms, never both compiled. `DramMultiArenaObjects` still routes
-// through the same one jemalloc instance `jemalloc_cxl` links (UMF/TBB is
-// not involved at all under this feature), but explicitly pins every
-// thread's allocations to one of a pool of node-0-bound jemalloc arenas
-// (via jemalloc_cxl's custom extent hooks) rather than jemalloc's own
-// default, NUMA-oblivious arena selection -- see that type's own doc
-// comment for why a *pool* of node-0 arenas (not a single one) is used.
-// That makes the fast tier explicitly-node-0-pinned jemalloc allocation and
-// the slow tier jemalloc_cxl's custom-extent-hooks NUMA/CXL arena
-// (SlowTierJemallocAllocator, src/allocator.rs) -- one jemalloc instance
-// for both tiers, UMF/Hybrid entirely out of the picture, rather than
-// mixing the two allocator stacks.
+// Under `jemalloc_cxl_slow_tier`, this is deliberately NOT the case: that
+// feature enables jemalloc_cxl's own `own_global_allocator` feature (see
+// Cargo.toml's `jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl",
+// "jemalloc_cxl/own_global_allocator"]`), so jemalloc_cxl's own crate
+// declares the one `#[global_allocator]` in the whole binary (plain
+// jemalloc, no UMF at all) -- this crate deliberately does NOT declare a
+// competing one for that case (Rust permits exactly one per binary). That
+// makes the fast tier ordinary jemalloc allocation and the slow tier
+// jemalloc_cxl's custom-extent-hooks NUMA/CXL arena (SlowTierJemallocAllocator,
+// src/allocator.rs) -- one jemalloc instance for both tiers, UMF/Hybrid
+// entirely out of the picture, rather than mixing the two allocator stacks.
 #[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
-
-#[cfg(feature = "jemalloc_cxl_slow_tier")]
-#[global_allocator]
-static GLOBAL: allocator::DramMultiArenaObjects = allocator::DramMultiArenaObjects;
 
 #[cfg(not(feature = "all_dram"))]
 use std::alloc::{Layout, Allocator}; // Essential imports

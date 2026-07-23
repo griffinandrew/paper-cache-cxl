@@ -10,68 +10,9 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::os::raw::c_uint;
-use std::sync::Once;
 
 use crate::extent::{self, ArenaNumaConfig, NumaPolicy, CXL_HOOKS, ExtentHooks};
 use crate::ffi;
-
-/// Enables jemalloc's background thread (a process-wide toggle, not
-/// per-arena -- `mallctl("background_thread", ...)` affects every arena in
-/// this one jemalloc instance) the first time any CXL arena is created.
-///
-/// **Why this matters, confirmed by direct measurement**: with
-/// `background_thread` off (jemalloc's own default), its dirty/muzzy decay
-/// purge is *tick-driven*, not timer-driven -- a decay check only runs as a
-/// side effect of enough subsequent `alloc`/`dealloc` calls on that arena.
-/// A workload that does a burst of allocation/deallocation and then goes
-/// quiet (a very ordinary pattern -- e.g. a batch of cache admissions,
-/// followed by an idle period) can leave large amounts of genuinely
-/// freeable memory permanently unreclaimed, because nothing ever pokes the
-/// ticker again to notice the decay window has passed. Reproduced directly:
-/// 300,000 x 16 KiB allocations then freeing 90% (scattered) left real RSS
-/// flat at ~5.9 GB even 35+ seconds later and even after an extra manual
-/// alloc/dealloc "poke" -- zero `purge_lazy`/`purge_forced` hook calls the
-/// entire time. An explicit `arena.<i>.purge` call *did* reclaim it (down
-/// to ~645 MB, matching the ~469 MB expected survivor footprint plus normal
-/// overhead), proving the memory was always genuinely freeable -- jemalloc
-/// just never checked. Enabling `background_thread` (a dedicated thread
-/// that sweeps arenas independent of allocation activity) reproduced that
-/// same ~645 MB outcome automatically, within 15 seconds, with no explicit
-/// purge call needed.
-///
-/// This requires the split/merge support the extent hooks gained alongside
-/// this change (see `extent.rs`) -- without split/merge, an arena's freed
-/// extents can never coalesce back into the larger contiguous free regions
-/// jemalloc's own decay/purge logic acts on, so there would be far less for
-/// `background_thread` to actually reclaim.
-fn ensure_background_thread_enabled() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let mut want: bool = true;
-        // SAFETY: `newp` points at `want`, a valid `bool` for the duration
-        // of this call, with `newlen` matching its size exactly; `oldp`/
-        // `oldlenp` are null, meaning "caller does not want the previous
-        // value back" (we don't need it -- this only ever runs once, and
-        // we're setting an intentional new value regardless of what it was
-        // before).
-        let rc = unsafe {
-            ffi::mallctl(
-                c"background_thread".as_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                (&raw mut want).cast::<c_void>(),
-                size_of::<bool>(),
-            )
-        };
-        if rc != 0 {
-            eprintln!(
-                "jemalloc_cxl: failed to enable background_thread (mallctl error {rc}) -- CXL \
-                 arenas will still function, but freed memory may not be reclaimed automatically \
-                 without an explicit arena.<i>.purge call"
-            );
-        }
-    });
-}
 
 /// Configuration for a new CXL/NUMA-tier arena.
 #[derive(Debug, Clone, Copy)]
@@ -135,8 +76,6 @@ pub enum ArenaError {
 /// is valid forever); this crate just never needs more than one such
 /// pointer to exist.
 pub fn create_cxl_arena(config: CxlArenaConfig) -> Result<CxlArena, ArenaError> {
-    ensure_background_thread_enabled();
-
     let mut arena_ind: c_uint = 0;
     let mut arena_ind_size = size_of::<c_uint>();
 
