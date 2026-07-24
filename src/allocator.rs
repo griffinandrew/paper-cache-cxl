@@ -1080,11 +1080,22 @@ mod dram_multi_arena {
         // capacity exhaustion (no relief valve without a slow tier), not
         // fragmentation, so it isn't something this constant can fix.
         //
-        // Re-tested at --cache-max-size 24G after the tcache-bypass fix
-        // above (see this module's doc comment): the edata_heap_remove
-        // SIGSEGV reproduced at both 4 and 6 arenas under
-        // `TcacheMode::Automatic`, so it was never really an arena-count
-        // question -- 3 stays the value validated at 15G.
+        // Re-tested (8 arenas, one per `-c 8` client thread) after the
+        // tcache-bypass fix above, to check whether the earlier 2/3/4/32
+        // comparison's conclusions still held now that `TcacheMode::
+        // Automatic`'s corruption bug is gone. They did: 8 arenas failed
+        // with the same signature and at the same rough point (mid-run,
+        // ~80-86% through standard_web.bin at --cache-max-size 24G) as 3
+        // arenas. Arena count isn't the lever for this remaining failure --
+        // see the `lru_hybrid_cache` -c1/-c4/-c8 comparison this uncovered
+        // (paper-benchmark-cxl session notes): -c1 and -c4 both complete
+        // the identical trace cleanly, only -c8 fails, which points at a
+        // genuine peak-concurrent-admission-backlog effect (higher client
+        // concurrency means a higher SET/GET arrival rate than the single
+        // PolicyWorker thread can drain tier decisions for, so more bytes
+        // sit admitted-to-fast-but-not-yet-demoted at any given moment) --
+        // not a per-arena fragmentation/contention problem this constant
+        // could fix either way. Back to 3, the value validated at 15G.
         3
     }
 
