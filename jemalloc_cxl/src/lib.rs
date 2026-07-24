@@ -58,7 +58,7 @@ pub mod thread_arena;
 pub use allocator::{CxlAllocator, TcacheMode};
 pub use arena::{create_cxl_arena, ArenaError, CxlArena, CxlArenaConfig};
 pub use extent::NumaPolicy;
-pub use thread_arena::{ThreadArenaError, ThreadArenaGuard};
+pub use thread_arena::{bind_thread_arena, ThreadArenaError, ThreadArenaGuard};
 
 /// The one jemalloc instance this crate (and, when [`own_global_allocator`]
 /// is enabled, every ordinary non-CXL allocation made while it's linked in)
