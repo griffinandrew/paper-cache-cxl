@@ -1020,11 +1020,38 @@ mod dram_multi_arena {
     const DRAM_NODE: u32 = 0;
 
     fn num_arenas() -> usize {
-        // Mirrors jemalloc's own default `narenas` heuristic (`4 *
-        // ncpus`) -- enough arenas that concurrently-running threads
-        // rarely collide on the same one, without creating an arena per
-        // thread (arenas, and the extents backing them, aren't free).
-        4 * std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        // A small, fixed count (3) -- NOT jemalloc's own default `narenas`
+        // heuristic (`4 * ncpus`, 32 on this 8-core machine), which was
+        // tried first and confirmed to cause real allocation failures
+        // under real -c8 load against the full standard_web.bin trace.
+        //
+        // Root cause: node 0's real settled footprint here is only
+        // ~5.3-5.7 GB, but that budget gets split into `num_arenas()`
+        // independent fragmentation domains -- more arenas means each one
+        // is smaller, so a single large allocation (e.g. paper-benchmark's
+        // ~50-67 MB end-of-run latency-percentile buffer) needs to find a
+        // bigger *fraction* of its arena's total space as one contiguous
+        // span, which gets exponentially harder under fragmentation as
+        // that fraction grows. At 32 arenas (~170 MB each), a 50-67 MB
+        // request needs ~30-40% of the entire arena contiguous; at 3
+        // arenas (~1.8 GB each), the same request only needs ~3-4%.
+        //
+        // Confirmed directly by testing arena counts 2/3/4/32 against the
+        // real benchmark (`-c 8`, full 14M-record trace, `--cache-max-size
+        // 15G`): 32 arenas failed (an allocation aborting the process,
+        // `memory allocation of N bytes failed`) after completing the
+        // full trace, during final stats computation. 2 arenas failed
+        // twice in a row, once even *mid-run* (67 MB allocation failure at
+        // 66% through the trace, not just at the end) -- worse than 32,
+        // confirming this isn't simply "fewer arenas is always safer." 3
+        // arenas passed three times in a row cleanly, with throughput
+        // matching or exceeding the 32-arena baseline (~125-150K SETs/sec
+        // either way -- this workload's traffic goes through each bound
+        // thread's own tcache, so arena count barely affects the hot
+        // path). 4 arenas also passed once, comparably. Settled on 3 for a
+        // small safety margin above the confirmed-failing floor of 2,
+        // without reintroducing 32's fragmentation risk.
+        3
     }
 
     fn arenas() -> &'static [CxlArena] {
