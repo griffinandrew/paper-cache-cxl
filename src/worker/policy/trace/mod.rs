@@ -48,6 +48,10 @@ impl Worker for TraceWorker {
 				let mut should_flush = false;
 
 				for event in events {
+					if matches!(event, StackEvent::Shutdown) {
+						return Ok(());
+					}
+
 					if matches!(event, StackEvent::Wipe) {
 						// wiping the cache deletes all the trace fragments
 						self.trace_fragments.write().clear();

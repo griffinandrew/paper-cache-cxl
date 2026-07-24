@@ -68,6 +68,8 @@ where
 
 					WorkerEvent::Wipe => self.expiries.clear(),
 
+					WorkerEvent::Shutdown => return Ok(()),
+
 					_ => {},
 				}
 			}

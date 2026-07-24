@@ -283,10 +283,16 @@ where
             };
             
             if let Ok(event) = self.listener.recv_timeout(timeout) {
+                if matches!(event, WorkerEvent::Shutdown) {
+                    return Ok(());
+                }
                 self.process_event(event);
-                
+
                 // Process any additional events that are immediately available
                 for event in self.listener.try_iter() {
+                    if matches!(event, WorkerEvent::Shutdown) {
+                        return Ok(());
+                    }
                     self.process_event(event);
                 }
             }

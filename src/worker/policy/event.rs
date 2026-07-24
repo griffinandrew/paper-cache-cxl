@@ -22,6 +22,15 @@ pub enum StackEvent {
 	Del(HashedKey),
 	Wipe,
 	Resize(CacheSize),
+
+	/// Not derived from a `WorkerEvent` (see `maybe_from_worker_event`,
+	/// which never produces this) -- `PolicyWorker` sends this directly to
+	/// its own `TraceWorker` when it receives `WorkerEvent::Shutdown`, so
+	/// `TraceWorker`'s loop has an exit condition too. Never written to a
+	/// trace fragment file (`TraceEvent::maybe_from_stack_event`'s
+	/// catch-all already maps it to `None`, same as it does today for any
+	/// other `StackEvent` variant that isn't trace-worthy).
+	Shutdown,
 }
 
 pub enum TraceEvent {

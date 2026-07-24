@@ -12,7 +12,7 @@ mod ttl;
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 mod tiering;
 
-use std::thread;
+use std::thread::{self, JoinHandle};
 use crossbeam_channel::{Sender, Receiver};
 
 use crate::{
@@ -25,6 +25,13 @@ use crate::{
 
 pub type WorkerSender = Sender<WorkerEvent>;
 pub type WorkerReceiver = Receiver<WorkerEvent>;
+
+/// Join handles for every background thread transitively spawned on behalf
+/// of a single `PaperCache` instance -- collected at construction time (see
+/// `WorkerManager::new`/`new_with_tier_migration`'s return type and each
+/// `PaperCache::new`/`with_hasher`'s call site) and joined in `PaperCache`'s
+/// `Drop` impl after signalling `WorkerEvent::Shutdown`.
+pub type WorkerHandles = Vec<JoinHandle<Result<(), CacheError>>>;
 
 #[derive(Clone)]
 pub enum WorkerEvent {
@@ -45,6 +52,21 @@ pub enum WorkerEvent {
 	/// `PolicyStack::resize_fast_tier`.
 	ResizeFastTier(CacheSize),
 	Policy(PaperPolicy),
+
+	/// Tells a worker to stop its event loop and return. Sent exactly once,
+	/// by `PaperCache::drop`, and cascaded onward by `WorkerManager` to its
+	/// own sub-workers -- see that type's `run` impl. Every `Worker::run`
+	/// loop must actually check for this and return on receipt; before this
+	/// was added, no worker loop had any exit condition at all (they ran
+	/// until the process itself terminated), which meant a `PaperCache`
+	/// being dropped never actually stopped its background threads before
+	/// returning -- those threads could still be mid-allocation when the
+	/// process's own exit-time global-allocator teardown ran concurrently
+	/// with them, a real, reproduced SIGSEGV inside a UMF/TBB pool's own
+	/// teardown code racing a still-live `PolicyWorker` thread's `tbb_malloc`
+	/// call. See `PaperCache`'s `Drop` impl for the send-then-join sequence
+	/// this variant exists to support.
+	Shutdown,
 }
 
 pub trait Worker
@@ -54,8 +76,8 @@ where
 	fn run(&mut self) -> Result<(), CacheError>;
 }
 
-pub fn register_worker(mut worker: impl Worker) {
-	thread::spawn(move || worker.run());
+pub fn register_worker(mut worker: impl Worker) -> JoinHandle<Result<(), CacheError>> {
+	thread::spawn(move || worker.run())
 }
 
 pub use crate::worker::{

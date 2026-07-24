@@ -240,6 +240,7 @@ use crate::{
 		WorkerSender,
 		WorkerEvent,
 		WorkerManager,
+		WorkerHandles,
 	},
 };
 
@@ -332,12 +333,48 @@ pub struct PaperCache<K, V, S = RandomState> {
 	status: StatusRef,
 
 	worker_manager: Arc<WorkerSender>,
+	/// Join handles for every background thread spawned on this cache's
+	/// behalf (`WorkerManager` itself, plus its `PolicyWorker`/`TtlWorker`/
+	/// `TieringWorker` sub-workers -- `PolicyWorker`'s own `TraceWorker`
+	/// child is joined internally by `PolicyWorker` itself, see its
+	/// `Shutdown` handling, so it never appears here). `Drop` sends
+	/// `WorkerEvent::Shutdown` through `worker_manager` and then joins
+	/// these, so that by the time a `PaperCache` value has finished
+	/// dropping, none of its background threads are still running --
+	/// closing the real race this fixes: before this existed, no worker
+	/// thread was ever joined at all, so a `PaperCache` being dropped (or a
+	/// process exiting without explicitly dropping one) could leave a
+	/// `PolicyWorker` thread genuinely still executing, mid-allocation,
+	/// concurrently with the global allocator's own process-exit teardown
+	/// -- confirmed directly via a real SIGSEGV inside a UMF/TBB pool's
+	/// `tbb_malloc`, racing that pool's own `umfTearDown` destructor.
+	worker_handles: WorkerHandles,
 	overhead_manager: OverheadManagerRef,
-	
+
 	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 	tiering_manager: Arc<TieringManager<K, V>>,
 
 	hasher: S,
+}
+
+impl<K, V, S> Drop for PaperCache<K, V, S> {
+	fn drop(&mut self) {
+		// Best-effort: if every other clone of `worker_manager` (there are
+		// none today -- this field is never cloned out of `PaperCache`
+		// itself -- but the type is `Arc` defensively) is already gone, or
+		// `WorkerManager`'s thread already exited on its own for some other
+		// reason, the channel may already be disconnected; `send` returning
+		// `Err` here just means there's nothing left to signal, not a bug.
+		let _ = self.worker_manager.send(WorkerEvent::Shutdown);
+
+		for handle in self.worker_handles.drain(..) {
+			// A worker thread's own `Err`/panic is already logged from
+			// inside `run()` (or by the default panic hook); nothing
+			// further to do with the join result here beyond waiting for
+			// it, which is this loop's entire purpose.
+			let _ = handle.join();
+		}
+	}
 }
 
 
@@ -478,7 +515,7 @@ where
 		let (worker_sender, worker_listener) = unbounded();
 
 		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-		let mut worker_manager = WorkerManager::new(
+		let (mut worker_manager, mut worker_handles) = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
@@ -487,22 +524,23 @@ where
 		)?;
 
 		#[cfg(not(all(feature = "key_value_pmem", feature = "enable_tiering_manager")))]
-		let mut worker_manager = WorkerManager::new(
+		let (mut worker_manager, mut worker_handles) = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
 			&overhead_manager,
 		)?;
 
-		thread::spawn(move || worker_manager.run());
+		worker_handles.push(thread::spawn(move || worker_manager.run()));
 
 		let cache = PaperCache {
 			objects,
 			status,
 
 			worker_manager: Arc::new(worker_sender),
+			worker_handles,
 			overhead_manager,
-			
+
 			#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 			tiering_manager,
 
@@ -1106,7 +1144,7 @@ where
 		let (worker_sender, worker_listener) = unbounded();
 
 		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-		let mut worker_manager = WorkerManager::new(
+		let (mut worker_manager, mut worker_handles) = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
@@ -1115,20 +1153,21 @@ where
 		)?;
 
 		#[cfg(not(all(feature = "key_value_pmem", feature = "enable_tiering_manager")))]
-		let mut worker_manager = WorkerManager::new(
+		let (mut worker_manager, mut worker_handles) = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
 			&overhead_manager,
 		)?;
 
-		thread::spawn(move || worker_manager.run());
+		worker_handles.push(thread::spawn(move || worker_manager.run()));
 
 		let cache = PaperCache {
 			objects,
 			status,
 
 			worker_manager: Arc::new(worker_sender),
+			worker_handles,
 			overhead_manager,
 
 			#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
@@ -1701,7 +1740,7 @@ where
 		let (worker_sender, worker_listener) = unbounded();
 
 		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-		let mut worker_manager = WorkerManager::new(
+		let (mut worker_manager, mut worker_handles) = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
@@ -1710,19 +1749,20 @@ where
 		)?;
 
 		#[cfg(not(all(feature = "key_value_pmem", feature = "enable_tiering_manager")))]
-		let mut worker_manager = WorkerManager::new(
+		let (mut worker_manager, mut worker_handles) = WorkerManager::new(
 			worker_listener,
 			&objects,
 			&status,
 			&overhead_manager,
 		)?;
 
-		thread::spawn(move || worker_manager.run());
+		worker_handles.push(thread::spawn(move || worker_manager.run()));
 
 		let cache = PaperCache {
 			objects,
 			status,
 			worker_manager: Arc::new(worker_sender),
+			worker_handles,
 			overhead_manager,
 
 			#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
@@ -2139,7 +2179,7 @@ where
 
 		let (worker_sender, worker_listener) = unbounded();
 
-		let mut worker_manager = WorkerManager::new_with_tier_migration(
+		let (mut worker_manager, mut worker_handles) = WorkerManager::new_with_tier_migration(
 			worker_listener,
 			&objects,
 			&status,
@@ -2147,12 +2187,13 @@ where
 			migrate,
 		)?;
 
-		thread::spawn(move || worker_manager.run());
+		worker_handles.push(thread::spawn(move || worker_manager.run()));
 
 		let cache = PaperCache {
 			objects,
 			status,
 			worker_manager: Arc::new(worker_sender),
+			worker_handles,
 			overhead_manager,
 			hasher,
 		};

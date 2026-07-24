@@ -17,8 +17,10 @@ use crate::{
 	error::CacheError,
 	worker::{
 		Worker,
+		WorkerEvent,
 		WorkerSender,
 		WorkerReceiver,
+		WorkerHandles,
 		PolicyWorker,
 		TtlWorker,
 		register_worker,
@@ -71,11 +73,26 @@ impl Worker for WorkerManager {
 				Err(TryRecvError::Disconnected) => return Ok(()),
 			};
 
+			// Forward first (every sub-worker needs its own copy of
+			// `Shutdown` to stop its own loop -- see each `Worker::run`
+			// impl), *then* stop ourselves. Don't join the sub-workers
+			// here: `PaperCache::drop` already holds their `JoinHandle`s
+			// directly (see `WorkerHandles`, returned from `WorkerManager::
+			// new`/`new_with_tier_migration` at construction time) and
+			// joins them itself after this thread's own handle, so a
+			// second join here would be redundant, not incorrect, but
+			// pointless complexity.
+			let is_shutdown = matches!(event, WorkerEvent::Shutdown);
+
 			for worker in self.workers.iter() {
 				if let Err(err) = worker.try_send(event.clone()) {
 					error!("Could not send event to worker: {err:?}");
 					return Err(CacheError::Internal);
 				}
+			}
+
+			if is_shutdown {
+				return Ok(());
 			}
 		}
 	}
@@ -89,7 +106,7 @@ impl WorkerManager {
 		status: &StatusRef,
 		overhead_manager: &OverheadManagerRef,
 		tiering_manager: &Arc<TieringManager<K, V>>,
-	) -> Result<Self, CacheError>
+	) -> Result<(Self, WorkerHandles), CacheError>
 	where
 		K: 'static + Eq + TypeSize + Clone,
 		V: 'static + TypeSize + Clone + AsRef<[u8]>,
@@ -98,28 +115,30 @@ impl WorkerManager {
 		let (ttl_worker, ttl_listener) = unbounded();
 		let (tiering_worker, tiering_listener) = unbounded();
 
-		register_worker(PolicyWorker::<K, V>::new(
+		let mut handles: WorkerHandles = Vec::new();
+
+		handles.push(register_worker(PolicyWorker::<K, V>::new(
 			policy_listener,
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
 			Some(tiering_worker.clone()),
-		)?);
+		)?));
 
-		register_worker(TtlWorker::<K, V>::new(
+		handles.push(register_worker(TtlWorker::<K, V>::new(
 			ttl_listener,
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
-		));
+		)));
 
-		register_worker(TieringWorker::<K, V>::new(
+		handles.push(register_worker(TieringWorker::<K, V>::new(
 			tiering_listener,
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
 			tiering_manager.clone(),
-		));
+		)));
 
 		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
 			policy_worker,
@@ -132,7 +151,7 @@ impl WorkerManager {
 			workers,
 		};
 
-		Ok(manager)
+		Ok((manager, handles))
 	}
 
 	#[cfg(all(not(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))))]
@@ -141,7 +160,7 @@ impl WorkerManager {
 		objects: &ObjectMapRef<K, V>,
 		status: &StatusRef,
 		overhead_manager: &OverheadManagerRef,
-	) -> Result<Self, CacheError>
+	) -> Result<(Self, WorkerHandles), CacheError>
 	where
 		K: 'static + Eq + TypeSize,
 		V: 'static + TypeSize + Clone,
@@ -149,20 +168,22 @@ impl WorkerManager {
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();
 
-		register_worker(PolicyWorker::<K, V>::new(
+		let mut handles: WorkerHandles = Vec::new();
+
+		handles.push(register_worker(PolicyWorker::<K, V>::new(
 			policy_listener,
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
 			None,
-		)?);
+		)?));
 
-		register_worker(TtlWorker::<K, V>::new(
+		handles.push(register_worker(TtlWorker::<K, V>::new(
 			ttl_listener,
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
-		));
+		)));
 
 		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
 			policy_worker,
@@ -174,7 +195,7 @@ impl WorkerManager {
 			workers,
 		};
 
-		Ok(manager)
+		Ok((manager, handles))
 	}
 
 	/// Creates a `WorkerManager` whose policy worker physically migrates
@@ -194,7 +215,7 @@ impl WorkerManager {
 		status: &StatusRef,
 		overhead_manager: &OverheadManagerRef,
 		migrate: Box<dyn Fn(&V, Tier) -> V + Send + Sync>,
-	) -> Result<Self, CacheError>
+	) -> Result<(Self, WorkerHandles), CacheError>
 	where
 		K: 'static + Eq + TypeSize,
 		V: 'static + TypeSize,
@@ -202,20 +223,22 @@ impl WorkerManager {
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();
 
-		register_worker(PolicyWorker::<K, V>::new_with_tier_migration(
+		let mut handles: WorkerHandles = Vec::new();
+
+		handles.push(register_worker(PolicyWorker::<K, V>::new_with_tier_migration(
 			policy_listener,
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
 			migrate,
-		)?);
+		)?));
 
-		register_worker(TtlWorker::<K, V>::new(
+		handles.push(register_worker(TtlWorker::<K, V>::new(
 			ttl_listener,
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
-		));
+		)));
 
 		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
 			policy_worker,
@@ -227,7 +250,7 @@ impl WorkerManager {
 			workers,
 		};
 
-		Ok(manager)
+		Ok((manager, handles))
 	}
 }
 

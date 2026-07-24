@@ -77,6 +77,16 @@ pub struct PolicyWorker<K, V> {
 
 	trace_fragments: Arc<RwLock<VecDeque<TraceFragment>>>,
 	trace_worker: Sender<StackEvent>,
+	/// `TraceWorker`'s own thread handle -- `None` after `WorkerEvent::
+	/// Shutdown` has already been handled once (joined and taken; see the
+	/// `run` loop's `Shutdown` arm), `Some` otherwise. Owned here (not by
+	/// `WorkerManager`/`PaperCache` directly) because `TraceWorker` is
+	/// itself spawned from inside `PolicyWorker::new`, not from the
+	/// `WorkerManager::new*` call sites those two collect handles from --
+	/// joining it here, before this worker's own `run` returns, means
+	/// `PaperCache`'s top-level `WorkerHandles` list doesn't need to know
+	/// about this nested worker at all.
+	trace_handle: Option<thread::JoinHandle<Result<(), CacheError>>>,
 
 	mini_stack_manager: MiniStackManager,
 	mini_index: Option<usize>,
@@ -136,6 +146,22 @@ where
 
 					WorkerEvent::Policy(policy) => {
 						self.handle_policy(policy, policy_reconstruct_tx.clone());
+					},
+
+					WorkerEvent::Shutdown => {
+						// Cascade to our own child worker before stopping
+						// ourselves -- see `StackEvent::Shutdown`'s doc
+						// comment. Best-effort: if `TraceWorker` already
+						// exited on its own (e.g. a prior error return),
+						// the send is simply a no-op and the join returns
+						// immediately.
+						let _ = self.trace_worker.send(StackEvent::Shutdown);
+
+						if let Some(handle) = self.trace_handle.take() {
+							let _ = handle.join();
+						}
+
+						return Ok(());
 					},
 
 					_ => {},
@@ -217,10 +243,10 @@ where
 		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
 		let (trace_worker, trace_listener) = unbounded();
 
-		register_worker(TraceWorker::new(
+		let trace_handle = Some(register_worker(TraceWorker::new(
 			trace_listener,
 			trace_fragments.clone(),
-		));
+		)));
 
 		// we need the initial size so we can accurately reconstruct the
 		// policy stacks after the cache is resized
@@ -240,6 +266,7 @@ where
 
 			trace_fragments,
 			trace_worker,
+			trace_handle,
 
 			mini_stack_manager: mini_stacks,
 			mini_index: None,
@@ -309,10 +336,10 @@ where
 		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
 		let (trace_worker, trace_listener) = unbounded();
 
-		register_worker(TraceWorker::new(
+		let trace_handle = Some(register_worker(TraceWorker::new(
 			trace_listener,
 			trace_fragments.clone(),
-		));
+		)));
 
 		if let Err(err) = trace_worker.send(StackEvent::Resize(status.max_size())) {
 			error!("Could not send initial cache size to trace worker: {err:?}");
@@ -330,6 +357,7 @@ where
 
 			trace_fragments,
 			trace_worker,
+			trace_handle,
 
 			mini_stack_manager: mini_stacks,
 			mini_index: None,
@@ -744,6 +772,13 @@ where
 					StackEvent::Del(key) => stack.remove(*key),
 					StackEvent::Wipe => stack.clear(),
 					StackEvent::Resize(size) => stack.resize(*size),
+
+					// Never actually buffered -- `Shutdown` is sent
+					// directly to `trace_worker`, not derived from a
+					// `WorkerEvent` via `maybe_from_worker_event` (the only
+					// thing that populates `buffered_events`). Exhaustive
+					// match still needs an arm.
+					StackEvent::Shutdown => {},
 				}
 			}
 
