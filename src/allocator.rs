@@ -985,34 +985,55 @@ pub use slow_tier_jemalloc_allocator::SlowTierJemallocAllocator;
 // jemalloc's own default multi-arena design exists to avoid: every thread
 // serializing on one arena's locks. So instead this creates a small pool of
 // node-0-bound arenas (sized like jemalloc's own default `narenas`
-// heuristic -- `4 * available_parallelism()`) and permanently binds each
-// thread, round-robin, to one of them via `jemalloc_cxl::bind_thread_arena`
-// on that thread's first allocation.
+// heuristic -- `4 * available_parallelism()`), and each thread is handed a
+// round-robin-assigned arena from that pool on its first allocation (see
+// `current_arena()` below).
 //
-// Critically, once a thread is bound, ordinary `alloc`/`dealloc` calls are
-// delegated straight to `jemalloc_cxl::Jemalloc`'s own `GlobalAlloc` impl --
-// which itself calls plain `malloc`/`free`/`sdallocx` with no
-// `MALLOCX_ARENA`/`MALLOCX_TCACHE_NONE` flags (confirmed by reading
-// `tikv-jemallocator`'s source: `layout_to_flags` only ever returns an
-// alignment flag or `0`). That means every one of *this* thread's
-// allocations uses its now-permanently-bound arena's own tcache completely
-// normally -- unlike `SlowTierJemallocAllocator` (which must pass
-// `MALLOCX_TCACHE_NONE` on every call, see that type's own doc comment, to
-// stop the calling thread's *unrelated* automatic tcache from silently
-// masking the explicit `MALLOCX_ARENA` request), there is no mismatch here
-// to guard against: the tcache the thread ends up using *is* the
-// node-0-pinned arena's own tcache, because the thread itself -- not just
-// one allocation -- was rebound.
+// CORRECTION (was: `jemalloc_cxl::bind_thread_arena` permanently rebinding
+// each thread's own default arena via the "thread.arena" mallctl, then
+// delegating straight to `jemalloc_cxl::Jemalloc`'s ordinary `GlobalAlloc`
+// impl and relying on jemalloc's automatic per-thread tcache to follow that
+// rebinding). That design was proven unsafe under real concurrent load: a
+// real `-c 8` run against the full `standard_web.bin` trace (24 GB
+// `--cache-max-size`, fast tier under real demotion/promotion pressure)
+// reproducibly crashed with SIGSEGV *inside jemalloc's own extent-coalescing
+// code* (`extent_try_coalesce_impl` -> `eset_remove` -> `edata_heap_remove`),
+// reached from an entirely ordinary allocation path
+// (`tcache_alloc_small_hard` -> `arena_cache_bin_fill_small` -> `pa_alloc`
+// -> `ecache_alloc_grow` -> `extent_record`) -- a routine tcache bin refill
+// that needed more pages from the arena ended up corrupting that arena's
+// own free-extent heap. This is the same tcache/multi-arena interaction
+// already documented (and fixed) for `SlowTierJemallocAllocator` above --
+// `TcacheMode::Automatic` lets a per-arena request get quietly satisfied by
+// state tied to the wrong/stale arena binding -- except here it manifested
+// as real memory corruption inside jemalloc's own coalescing path (enabled
+// by `cxl_extent_split`/`cxl_extent_merge`, see `extent.rs`) rather than
+// merely incorrect NUMA placement. Fixed by applying the same proven fix
+// used there: every allocation now goes through
+// `CxlAllocator::with_tcache(arena, TcacheMode::None)` -- explicit
+// `MALLOCX_ARENA(idx) | MALLOCX_TCACHE_NONE` on every call, bypassing
+// jemalloc's per-thread tcache entirely so each request/free goes straight
+// to the arena's own (properly locked) slab/bin path, instead of relying on
+// a whole-thread rebind plus that thread's automatic tcache staying
+// consistent with it. `dealloc` does not need to use the *same* arena the
+// memory was originally allocated from: `sdallocx` looks up the owning
+// extent/arena from jemalloc's own metadata, not from the `MALLOCX_ARENA`
+// flag passed to the free call (this exact pattern -- a freeing thread's
+// round-robin arena routinely differing from the allocating thread's -- is
+// already used, and tested, in `SlowTierJemallocAllocator`/
+// `EvictionStackAllocator` above); only the `MALLOCX_TCACHE_NONE` flag
+// needs to match on the free side.
 #[cfg(feature = "jemalloc_cxl_slow_tier")]
 mod dram_multi_arena {
-    use std::alloc::{GlobalAlloc, Layout};
+    use std::alloc::{Allocator, GlobalAlloc, Layout};
     use std::cell::Cell;
+    use std::ptr::NonNull;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::OnceLock;
 
     use jemalloc_cxl::{
-        bind_thread_arena, create_cxl_arena, CxlArena, CxlArenaConfig, Jemalloc as InnerJemalloc,
-        NumaPolicy,
+        create_cxl_arena, CxlAllocator, CxlArena, CxlArenaConfig, Jemalloc as InnerJemalloc,
+        NumaPolicy, TcacheMode,
     };
 
     /// NUMA node the crate's ordinary (fast-tier) allocations are pinned
@@ -1051,6 +1072,19 @@ mod dram_multi_arena {
         // path). 4 arenas also passed once, comparably. Settled on 3 for a
         // small safety margin above the confirmed-failing floor of 2,
         // without reintroducing 32's fragmentation risk.
+        //
+        // Also tested 5 arenas specifically against the separate
+        // `all_dram`/`standard_web.bin` node-0-exhaustion failure (see
+        // that config's own notes) -- made no difference (failed
+        // identically), confirming that failure is genuine aggregate
+        // capacity exhaustion (no relief valve without a slow tier), not
+        // fragmentation, so it isn't something this constant can fix.
+        //
+        // Re-tested at --cache-max-size 24G after the tcache-bypass fix
+        // above (see this module's doc comment): the edata_heap_remove
+        // SIGSEGV reproduced at both 4 and 6 arenas under
+        // `TcacheMode::Automatic`, so it was never really an arena-count
+        // question -- 3 stays the value validated at 15G.
         3
     }
 
@@ -1075,70 +1109,68 @@ mod dram_multi_arena {
     }
 
     thread_local! {
-        // Per-thread "have I been bound yet" flag -- binding is permanent
-        // (see `bind_thread_arena`'s own docs: there is nothing to restore),
-        // so this only ever needs to happen once per thread, not once per
-        // allocation.
-        static BOUND: Cell<bool> = const { Cell::new(false) };
+        // This thread's round-robin-assigned arena, looked up once and
+        // cached for the thread's remaining lifetime -- same pattern
+        // `EvictionStackAllocator`/`SlowTierJemallocAllocator` use via the
+        // shared `numa_arena_pool` helper (see that module's doc comment);
+        // inlined here rather than sharing it because this type is the
+        // process's actual `#[global_allocator]`, which needs the extra
+        // reentrancy guard below that the other two never do.
+        static ASSIGNED_ARENA: Cell<Option<CxlArena>> = const { Cell::new(None) };
 
-        // Reentrancy guard for the *binding process itself*. Building the
-        // arena pool the first time (`arenas()`'s `OnceLock::get_or_init`,
-        // which `.collect()`s a `Vec`) and `bind_thread_arena`'s own mallctl
-        // call both potentially allocate (a growing `Vec`; jemalloc_cxl's
-        // internal arena-NUMA registry, a `HashMap` behind its own separate
-        // `OnceLock`) -- and every allocation in the process, including
-        // those, comes back through this same `GlobalAlloc::alloc`. Without
-        // this guard, the very first allocation the process ever makes
-        // would recurse into `ensure_thread_bound()` a second time while
-        // still inside the first call's `arenas()` -- and `OnceLock` is not
-        // reentrant, so a nested `get_or_init` on the same thread deadlocks
-        // forever rather than erroring. While this guard is set, nested
-        // allocations skip straight to `InnerJemalloc` (unbound, but
-        // correct) instead of recursing.
-        static BINDING_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
+        // Reentrancy guard for the arena-*lookup* process itself. Building
+        // the arena pool the first time (`arenas()`'s `OnceLock::
+        // get_or_init`, which `.collect()`s a `Vec`) allocates -- and every
+        // allocation in the process, including that one, comes back through
+        // this same `GlobalAlloc::alloc`. Without this guard, the very
+        // first allocation the process ever makes would recurse into
+        // `current_arena()` a second time while still inside the first
+        // call's `arenas()` -- and `OnceLock` is not reentrant, so a nested
+        // `get_or_init` on the same thread deadlocks forever rather than
+        // erroring. While this guard is set, nested allocations skip
+        // straight to `InnerJemalloc` (unbound, but correct) instead of
+        // recursing.
+        static ARENA_LOOKUP_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
     }
 
+    /// This calling thread's round-robin-assigned arena, or `None` if
+    /// called reentrantly from within the arena pool's own first-time setup
+    /// (see `ARENA_LOOKUP_IN_PROGRESS` above) -- callers treat `None` as
+    /// "fall back to `InnerJemalloc`'s ordinary, unbound default arena for
+    /// just this one allocation."
     #[inline]
-    fn ensure_thread_bound() {
-        BOUND.with(|bound| {
-            if bound.get() {
-                return;
+    fn current_arena() -> Option<CxlArena> {
+        ASSIGNED_ARENA.with(|slot| {
+            if let Some(a) = slot.get() {
+                return Some(a);
             }
 
-            let already_binding = BINDING_IN_PROGRESS.with(|p| p.replace(true));
-            if already_binding {
-                // Reentered from within our own binding process (see the
+            let already_looking = ARENA_LOOKUP_IN_PROGRESS.with(|p| p.replace(true));
+            if already_looking {
+                // Reentered from within our own lookup process (see the
                 // thread_local's doc comment above) -- let the nested
                 // allocation fall through to InnerJemalloc unbound. The
-                // outer call will still finish and mark this thread bound.
-                return;
+                // outer call will still finish and cache this thread's
+                // assigned arena.
+                return None;
             }
 
             let list = arenas();
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let idx = NEXT.fetch_add(1, Ordering::Relaxed) % list.len();
+            let a = list[idx];
 
-            if let Err(e) = bind_thread_arena(list[idx]) {
-                eprintln!(
-                    "DramMultiArenaObjects: failed to bind thread to node-{DRAM_NODE} arena {idx}: {e} \
-                     -- this thread's allocations will use jemalloc's own default (unbound) arena instead"
-                );
-            }
+            slot.set(Some(a));
+            ARENA_LOOKUP_IN_PROGRESS.with(|p| p.set(false));
 
-            // Mark bound regardless of success -- a failed mallctl isn't
-            // expected to be transient (see `ThreadArenaGuard`'s own
-            // drop-path precedent for the same "log and move on" choice),
-            // and retrying on every single allocation would turn one
-            // eprintln into millions.
-            bound.set(true);
-            BINDING_IN_PROGRESS.with(|p| p.set(false));
-        });
+            Some(a)
+        })
     }
 
     /// The crate's `#[global_allocator]` under `jemalloc_cxl_slow_tier`. A
     /// plain, `Copy`, no-state marker type -- matching every other
     /// allocator-handle type in this file -- whose real state (the arena
-    /// pool, and each thread's bound/unbound flag) lives behind the
+    /// pool, and each thread's assigned arena) lives behind the
     /// process-lifetime statics above.
     #[derive(Debug, Clone, Copy, Default)]
     pub struct DramMultiArenaObjects;
@@ -1146,42 +1178,93 @@ mod dram_multi_arena {
     unsafe impl GlobalAlloc for DramMultiArenaObjects {
         #[inline]
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            ensure_thread_bound();
-            // SAFETY: delegates directly to `jemalloc_cxl::Jemalloc`'s own
-            // `GlobalAlloc::alloc`, which has the same safety contract this
-            // method does; `layout` is passed through unchanged.
-            unsafe { InnerJemalloc.alloc(layout) }
+            match current_arena() {
+                Some(arena) => {
+                    // SAFETY: `layout` is passed through unchanged;
+                    // `CxlAllocator::with_tcache(_, TcacheMode::None)`'s
+                    // `Allocator::allocate` has the same size/alignment
+                    // contract `GlobalAlloc::alloc` does. `MALLOCX_TCACHE_
+                    // NONE` is required here, not optional -- see this
+                    // module's doc comment for the real SIGSEGV this fixed.
+                    match CxlAllocator::with_tcache(arena, TcacheMode::None).allocate(layout) {
+                        Ok(ptr) => ptr.as_ptr() as *mut u8,
+                        Err(_) => std::ptr::null_mut(),
+                    }
+                }
+                // SAFETY: see `current_arena`'s reentrancy note.
+                None => unsafe { InnerJemalloc.alloc(layout) },
+            }
         }
 
         #[inline]
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            ensure_thread_bound();
-            // SAFETY: see `alloc` above.
-            unsafe { InnerJemalloc.alloc_zeroed(layout) }
+            // `CxlAllocator` only implements the nightly `Allocator` trait
+            // (`allocate`/`deallocate`), which has no dedicated zeroing
+            // fast path (no `MALLOCX_ZERO` plumbing) -- zero manually here,
+            // matching what `GlobalAlloc::alloc_zeroed`'s own default
+            // provided implementation already does for allocators without
+            // one.
+            let ptr = unsafe { self.alloc(layout) };
+            if !ptr.is_null() {
+                unsafe { std::ptr::write_bytes(ptr, 0, layout.size()) };
+            }
+            ptr
         }
 
         #[inline]
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            // No `ensure_thread_bound()` here: `sdallocx` (which
-            // `jemalloc_cxl::Jemalloc::dealloc` uses) takes the size/layout
-            // directly and looks up the owning extent/arena from jemalloc's
-            // own metadata, not from the calling thread's arena -- a thread
-            // that has only ever freed memory (never allocated any) has no
-            // need to be bound to one of this pool's arenas at all.
+            // Uses this (freeing) thread's own assigned arena, not
+            // necessarily the one the allocation came from -- correct per
+            // this module's doc comment above (`sdallocx` resolves the real
+            // owning arena from jemalloc's own metadata; only the
+            // `MALLOCX_TCACHE_NONE` flag needs to match what `alloc` used).
+            // Falls back to `InnerJemalloc` in the same reentrant-lookup
+            // edge case `alloc` does.
             //
             // SAFETY: caller upholds `GlobalAlloc::dealloc`'s contract
             // (`ptr`/`layout` describe a still-live allocation previously
-            // returned by this same allocator's `alloc`/`alloc_zeroed`).
-            unsafe { InnerJemalloc.dealloc(ptr, layout) }
+            // returned by this same allocator's `alloc`/`alloc_zeroed`), so
+            // `ptr` is non-null.
+            match current_arena() {
+                Some(arena) => unsafe {
+                    CxlAllocator::with_tcache(arena, TcacheMode::None)
+                        .deallocate(NonNull::new_unchecked(ptr), layout)
+                },
+                None => unsafe { InnerJemalloc.dealloc(ptr, layout) },
+            }
         }
 
         #[inline]
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            ensure_thread_bound();
-            // SAFETY: see `alloc` above; `ptr`/`layout`/`new_size` are
-            // passed through unchanged to `jemalloc_cxl::Jemalloc::realloc`,
-            // which has the same contract this method does.
-            unsafe { InnerJemalloc.realloc(ptr, layout, new_size) }
+            // No `rallocx`/`xallocx` wired through `CxlAllocator` (it only
+            // implements the nightly `Allocator` trait's `allocate`/
+            // `deallocate`) -- reimplements `GlobalAlloc::realloc`'s own
+            // documented default behavior instead: allocate new, copy the
+            // overlapping prefix, free old. Not as fast as an in-place
+            // `xallocx` would be, but this method was not implicated in the
+            // crash this module's doc comment describes (a tcache bin-
+            // refill path reached from plain `alloc`), so this
+            // straightforward reimplementation is deliberately no fancier
+            // than it needs to be.
+            let new_layout = match Layout::from_size_align(new_size, layout.align()) {
+                Ok(l) => l,
+                Err(_) => return std::ptr::null_mut(),
+            };
+
+            // SAFETY: `alloc`/`dealloc` above are this same type's own
+            // methods; `ptr`/`layout` describe a still-live allocation per
+            // `GlobalAlloc::realloc`'s contract, so copying
+            // `min(layout.size(), new_size)` bytes into the new allocation
+            // before freeing the old one is exactly what jemalloc's own
+            // realloc semantics guarantee.
+            let new_ptr = unsafe { self.alloc(new_layout) };
+            if !new_ptr.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr, new_ptr, layout.size().min(new_size));
+                    self.dealloc(ptr, layout);
+                }
+            }
+            new_ptr
         }
     }
 
