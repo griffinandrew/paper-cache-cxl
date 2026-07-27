@@ -33,6 +33,7 @@ pub enum PaperPolicy {
 	LfuHybrid,
 	TwoQHybrid(f64),
 	FifoHybrid,
+	LruSizedHybrid,
 }
 
 impl PaperPolicy {
@@ -58,6 +59,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::LfuHybrid => write!(f, "lfu-hybrid"),
 			PaperPolicy::TwoQHybrid(k_in) => write!(f, "2q-hybrid-{k_in}"),
 			PaperPolicy::FifoHybrid => write!(f, "fifo-hybrid"),
+			PaperPolicy::LruSizedHybrid => write!(f, "lru-sized-hybrid"),
 		}
 	}
 }
@@ -81,6 +83,7 @@ impl FromStr for PaperPolicy {
 			"lru-hybrid" => PaperPolicy::LruHybrid,
 			"lfu-hybrid" => PaperPolicy::LfuHybrid,
 			"fifo-hybrid" => PaperPolicy::FifoHybrid,
+			"lru-sized-hybrid" => PaperPolicy::LruSizedHybrid,
 
 			_ => return Err(CacheError::InvalidPolicy),
 		};
@@ -253,6 +256,21 @@ mod tests {
 		assert_ne!(
 			"fifo".parse::<PaperPolicy>().unwrap(),
 			"fifo-hybrid".parse::<PaperPolicy>().unwrap(),
+		);
+	}
+
+	#[test]
+	fn lru_sized_hybrid_round_trips_through_display_and_from_str() {
+		assert_eq!(PaperPolicy::LruSizedHybrid.to_string(), "lru-sized-hybrid");
+		assert_eq!("lru-sized-hybrid".parse::<PaperPolicy>(), Ok(PaperPolicy::LruSizedHybrid));
+	}
+
+	#[test]
+	fn lru_sized_hybrid_does_not_collide_with_lru_hybrid() {
+		assert_eq!("lru-hybrid".parse::<PaperPolicy>(), Ok(PaperPolicy::LruHybrid));
+		assert_ne!(
+			"lru-hybrid".parse::<PaperPolicy>().unwrap(),
+			"lru-sized-hybrid".parse::<PaperPolicy>().unwrap(),
 		);
 	}
 }

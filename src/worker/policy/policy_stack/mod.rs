@@ -18,6 +18,7 @@ mod lru_hybrid_stack;
 mod lfu_hybrid_stack;
 mod two_q_hybrid_stack;
 mod fifo_hybrid_stack;
+mod lru_sized_hybrid_stack;
 
 #[cfg(feature = "eviction_stacks_pmem")] mod pmem_collections;
 
@@ -40,6 +41,7 @@ use crate::{
 		lfu_hybrid_stack::LfuHybridStack,
 		two_q_hybrid_stack::TwoQHybridStack,
 		fifo_hybrid_stack::FifoHybridStack,
+		lru_sized_hybrid_stack::LruSizedHybridStack,
 	},
 };
 
@@ -176,6 +178,64 @@ where
 	fn admission_latched(&self) -> bool {
 		false
 	}
+
+	/// Runtime-adjusts the LARGE fast segment's byte budget. Only
+	/// `LruSizedHybridStack` overrides this -- the SMALL segment reuses
+	/// `resize_fast_tier` above; every other stack keeps the default no-op.
+	fn resize_large_fast_tier(&mut self, _size: CacheSize) {}
+
+	/// Runtime-adjusts the small/large size-classification threshold. Only
+	/// `LruSizedHybridStack` overrides this; every other stack keeps the
+	/// default no-op.
+	fn resize_size_threshold(&mut self, _size: CacheSize) {}
+
+	/// Current bytes accounted to the SMALL fast segment. `0` for every
+	/// stack except `LruSizedHybridStack`.
+	fn small_fast_bytes_used(&self) -> CacheSize {
+		0
+	}
+
+	/// Current bytes accounted to the LARGE fast segment. `0` for every
+	/// stack except `LruSizedHybridStack`.
+	fn large_fast_bytes_used(&self) -> CacheSize {
+		0
+	}
+
+	/// Current number of objects in the SMALL fast segment. `0` for every
+	/// stack except `LruSizedHybridStack`.
+	fn small_fast_object_count(&self) -> usize {
+		0
+	}
+
+	/// Current number of objects in the LARGE fast segment. `0` for every
+	/// stack except `LruSizedHybridStack`.
+	fn large_fast_object_count(&self) -> usize {
+		0
+	}
+
+	/// Current bytes accounted to the SMALL slow list. `0` for every stack
+	/// except `LruSizedHybridStack`.
+	fn small_slow_bytes_used(&self) -> CacheSize {
+		0
+	}
+
+	/// Current bytes accounted to the LARGE slow list. `0` for every stack
+	/// except `LruSizedHybridStack`.
+	fn large_slow_bytes_used(&self) -> CacheSize {
+		0
+	}
+
+	/// Current number of objects in the SMALL slow list. `0` for every
+	/// stack except `LruSizedHybridStack`.
+	fn small_slow_object_count(&self) -> usize {
+		0
+	}
+
+	/// Current number of objects in the LARGE slow list. `0` for every
+	/// stack except `LruSizedHybridStack`.
+	fn large_slow_object_count(&self) -> usize {
+		0
+	}
 }
 
 pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn PolicyStack> {
@@ -235,5 +295,32 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// for `fifo_hybrid_cache` shows the same issues. Single unconditional
 		// arm for now, matching `TwoQHybrid`'s style above.
 		PaperPolicy::FifoHybrid => Box::new(FifoHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
+
+		// Default small/large fast-segment budgets: 10% of max_size each
+		// (totaling the same 20% aggregate default the other four hybrids
+		// use for their single fast tier), immediately overridden by the
+		// real constructor-supplied values right after construction (see
+		// `PaperCache::new_sized_hybrid`'s three broadcasts). The
+		// 4096-byte (4 KiB) default size threshold is a fixed constant
+		// rather than max_size-scaled -- there's no principled way to scale
+		// a *classification* threshold with overall cache size the way a
+		// capacity budget scales -- also immediately overridden by the real
+		// constructor-supplied value.
+		#[cfg(feature = "lru_sized_hybrid_cache")]
+		PaperPolicy::LruSizedHybrid => Box::new(
+			LruSizedHybridStack::new(
+				(max_size as f64 * 0.1) as CacheSize,
+				(max_size as f64 * 0.1) as CacheSize,
+				4_096,
+			).with_shared_overhead(
+				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+			),
+		),
+		#[cfg(not(feature = "lru_sized_hybrid_cache"))]
+		PaperPolicy::LruSizedHybrid => Box::new(LruSizedHybridStack::new(
+			(max_size as f64 * 0.1) as CacheSize,
+			(max_size as f64 * 0.1) as CacheSize,
+			4_096,
+		)),
 	}
 }

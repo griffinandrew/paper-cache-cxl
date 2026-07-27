@@ -33,7 +33,7 @@ use crate::{
 	worker::TieringWorker,
 };
 
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 use crate::worker::policy::Tier;
 
 pub struct WorkerManager {
@@ -208,7 +208,7 @@ impl WorkerManager {
 	/// (backing `PaperCache::lru_hybrid_stats`/`lfu_hybrid_stats`/
 	/// `two_q_hybrid_stats`/`fifo_hybrid_stats`), so no separate stats
 	/// parameter is needed here.
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 	pub fn new_with_tier_migration<K, V>(
 		listener: WorkerReceiver,
 		objects: &ObjectMapRef<K, V>,

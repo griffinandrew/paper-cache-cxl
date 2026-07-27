@@ -78,7 +78,13 @@ pub struct AtomicStatus {
 	/// `PaperCache::fast_tier_size` and `PolicyWorker` (via the
 	/// `WorkerEvent::ResizeFastTier` broadcast, not by reading this field
 	/// directly — mirrors how `max_size` and `resize()`/`Resize` work).
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+	///
+	/// For `PaperPolicy::LruSizedHybrid` (`lru_sized_hybrid_cache`)
+	/// specifically, this field means the SMALL fast segment's capacity —
+	/// that design has a second, independent fast segment ("large") with its
+	/// own dedicated `lru_sized_hybrid_large_fast_capacity` field below,
+	/// since a single shared field can't represent two independent budgets.
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 	fast_tier_capacity: AtomicCacheSize,
 
 	/// `lru_hybrid_cache` counters/gauges, updated by `PolicyWorker` as it
@@ -169,6 +175,61 @@ pub struct AtomicStatus {
 	fifo_hybrid_fast_objects: AtomicU64,
 	#[cfg(feature = "fifo_hybrid_cache")]
 	fifo_hybrid_slow_objects: AtomicU64,
+
+	/// `lru_sized_hybrid_cache` counters/gauges — same rationale as the
+	/// `lru_hybrid_*`/`lfu_hybrid_*`/`two_q_hybrid_*`/`fifo_hybrid_*` fields
+	/// above. The `_fast_bytes_used`/`_slow_bytes_used`/`_fast_objects`/
+	/// `_slow_objects` gauges are the small+large COMBINED totals (kept for
+	/// drop-in consistency with the other four hybrids' stats shape); the
+	/// `_small_*`/`_large_*` gauges below give the finer per-segment
+	/// breakdown this design's two independent fast segments and two
+	/// independent slow lists actually need.
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_promotions: AtomicU64,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_demotions: AtomicU64,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_evictions: AtomicU64,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_fast_bytes_used: AtomicCacheSize,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_slow_bytes_used: AtomicCacheSize,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_fast_objects: AtomicU64,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_slow_objects: AtomicU64,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_small_fast_bytes_used: AtomicCacheSize,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_large_fast_bytes_used: AtomicCacheSize,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_small_fast_objects: AtomicU64,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_large_fast_objects: AtomicU64,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_small_slow_bytes_used: AtomicCacheSize,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_large_slow_bytes_used: AtomicCacheSize,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_small_slow_objects: AtomicU64,
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_large_slow_objects: AtomicU64,
+
+	/// The LARGE fast segment's own capacity (the SMALL segment reuses the
+	/// shared `fast_tier_capacity` field above — see that field's doc for
+	/// why). Written by `PaperCache::set_large_fast_tier_size`, read back by
+	/// `PaperCache::large_fast_tier_size` and `PolicyWorker` (via
+	/// `WorkerEvent::ResizeLargeFastTier`, not by reading this field
+	/// directly — same indirection `fast_tier_capacity` uses).
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_large_fast_capacity: AtomicCacheSize,
+
+	/// The small/large size-classification threshold, in bytes. Written by
+	/// `PaperCache::set_size_threshold`, read back by
+	/// `PaperCache::size_threshold` and `PolicyWorker` (via
+	/// `WorkerEvent::ResizeSizeThreshold`).
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	lru_sized_hybrid_size_threshold: AtomicCacheSize,
 }
 
 /// This struct holds the basic statistical information about `PaperCache`.
@@ -296,7 +357,7 @@ impl AtomicStatus {
 
 			start_time: AtomicU64::new(time::timestamp()),
 
-			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 			fast_tier_capacity: AtomicCacheSize::default(),
 			#[cfg(feature = "lru_hybrid_cache")]
 			lru_hybrid_promotions: AtomicU64::default(),
@@ -359,6 +420,41 @@ impl AtomicStatus {
 			fifo_hybrid_fast_objects: AtomicU64::default(),
 			#[cfg(feature = "fifo_hybrid_cache")]
 			fifo_hybrid_slow_objects: AtomicU64::default(),
+
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_promotions: AtomicU64::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_demotions: AtomicU64::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_evictions: AtomicU64::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_fast_bytes_used: AtomicCacheSize::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_slow_bytes_used: AtomicCacheSize::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_fast_objects: AtomicU64::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_slow_objects: AtomicU64::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_small_fast_bytes_used: AtomicCacheSize::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_large_fast_bytes_used: AtomicCacheSize::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_small_fast_objects: AtomicU64::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_large_fast_objects: AtomicU64::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_small_slow_bytes_used: AtomicCacheSize::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_large_slow_bytes_used: AtomicCacheSize::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_small_slow_objects: AtomicU64::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_large_slow_objects: AtomicU64::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_large_fast_capacity: AtomicCacheSize::default(),
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			lru_sized_hybrid_size_threshold: AtomicCacheSize::default(),
 		};
 
 		Ok(status)
@@ -472,8 +568,9 @@ impl AtomicStatus {
 
 	/// Current fast-tier byte budget (`PaperPolicy::LruHybrid` /
 	/// `PaperPolicy::LfuHybrid` / `PaperPolicy::TwoQHybrid` /
-	/// `PaperPolicy::FifoHybrid`).
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+	/// `PaperPolicy::FifoHybrid` / `PaperPolicy::LruSizedHybrid`'s SMALL
+	/// segment — see the field's doc on the struct).
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 	#[must_use]
 	pub fn fast_tier_capacity(&self) -> CacheSize {
 		self.fast_tier_capacity.load(Ordering::Relaxed)
@@ -482,7 +579,7 @@ impl AtomicStatus {
 	/// Sets the fast-tier byte budget. Callers are responsible for also
 	/// broadcasting `WorkerEvent::ResizeFastTier` so the active stack's own
 	/// internal capacity is updated (mirrors `set_max_size` + `Resize`).
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 	pub fn set_fast_tier_capacity(&self, size: CacheSize) {
 		self.fast_tier_capacity.store(size, Ordering::Relaxed);
 	}
@@ -701,6 +798,104 @@ impl AtomicStatus {
 			fast_objects: self.fifo_hybrid_fast_objects.load(Ordering::Relaxed),
 			slow_objects: self.fifo_hybrid_slow_objects.load(Ordering::Relaxed),
 		}
+	}
+
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	pub fn record_lru_sized_hybrid_promotion(&self) {
+		self.lru_sized_hybrid_promotions.fetch_add(1, Ordering::Relaxed);
+	}
+
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	pub fn record_lru_sized_hybrid_demotion(&self) {
+		self.lru_sized_hybrid_demotions.fetch_add(1, Ordering::Relaxed);
+	}
+
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	pub fn record_lru_sized_hybrid_eviction(&self) {
+		self.lru_sized_hybrid_evictions.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Overwrites every live tier gauge (bytes/objects currently in each of
+	/// the four segments, plus the small+large combined fast/slow totals
+	/// derived from them). Called by `PolicyWorker` each time it drains tier
+	/// migrations.
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	pub fn set_lru_sized_hybrid_gauges(
+		&self,
+		small_fast_bytes_used: CacheSize,
+		large_fast_bytes_used: CacheSize,
+		small_slow_bytes_used: CacheSize,
+		large_slow_bytes_used: CacheSize,
+		small_fast_objects: u64,
+		large_fast_objects: u64,
+		small_slow_objects: u64,
+		large_slow_objects: u64,
+	) {
+		self.lru_sized_hybrid_small_fast_bytes_used.store(small_fast_bytes_used, Ordering::Relaxed);
+		self.lru_sized_hybrid_large_fast_bytes_used.store(large_fast_bytes_used, Ordering::Relaxed);
+		self.lru_sized_hybrid_small_slow_bytes_used.store(small_slow_bytes_used, Ordering::Relaxed);
+		self.lru_sized_hybrid_large_slow_bytes_used.store(large_slow_bytes_used, Ordering::Relaxed);
+		self.lru_sized_hybrid_small_fast_objects.store(small_fast_objects, Ordering::Relaxed);
+		self.lru_sized_hybrid_large_fast_objects.store(large_fast_objects, Ordering::Relaxed);
+		self.lru_sized_hybrid_small_slow_objects.store(small_slow_objects, Ordering::Relaxed);
+		self.lru_sized_hybrid_large_slow_objects.store(large_slow_objects, Ordering::Relaxed);
+
+		self.lru_sized_hybrid_fast_bytes_used.store(small_fast_bytes_used + large_fast_bytes_used, Ordering::Relaxed);
+		self.lru_sized_hybrid_slow_bytes_used.store(small_slow_bytes_used + large_slow_bytes_used, Ordering::Relaxed);
+		self.lru_sized_hybrid_fast_objects.store(small_fast_objects + large_fast_objects, Ordering::Relaxed);
+		self.lru_sized_hybrid_slow_objects.store(small_slow_objects + large_slow_objects, Ordering::Relaxed);
+	}
+
+	/// Returns a point-in-time snapshot of `lru_sized_hybrid_cache` statistics.
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	#[must_use]
+	pub fn lru_sized_hybrid_stats(&self) -> crate::lru_sized_hybrid_cache::LruSizedHybridStats {
+		crate::lru_sized_hybrid_cache::LruSizedHybridStats {
+			promotions: self.lru_sized_hybrid_promotions.load(Ordering::Relaxed),
+			demotions: self.lru_sized_hybrid_demotions.load(Ordering::Relaxed),
+			evictions: self.lru_sized_hybrid_evictions.load(Ordering::Relaxed),
+			fast_bytes_used: self.lru_sized_hybrid_fast_bytes_used.load(Ordering::Relaxed),
+			slow_bytes_used: self.lru_sized_hybrid_slow_bytes_used.load(Ordering::Relaxed),
+			fast_objects: self.lru_sized_hybrid_fast_objects.load(Ordering::Relaxed),
+			slow_objects: self.lru_sized_hybrid_slow_objects.load(Ordering::Relaxed),
+			small_fast_bytes_used: self.lru_sized_hybrid_small_fast_bytes_used.load(Ordering::Relaxed),
+			large_fast_bytes_used: self.lru_sized_hybrid_large_fast_bytes_used.load(Ordering::Relaxed),
+			small_fast_objects: self.lru_sized_hybrid_small_fast_objects.load(Ordering::Relaxed),
+			large_fast_objects: self.lru_sized_hybrid_large_fast_objects.load(Ordering::Relaxed),
+			small_slow_bytes_used: self.lru_sized_hybrid_small_slow_bytes_used.load(Ordering::Relaxed),
+			large_slow_bytes_used: self.lru_sized_hybrid_large_slow_bytes_used.load(Ordering::Relaxed),
+			small_slow_objects: self.lru_sized_hybrid_small_slow_objects.load(Ordering::Relaxed),
+			large_slow_objects: self.lru_sized_hybrid_large_slow_objects.load(Ordering::Relaxed),
+		}
+	}
+
+	/// Current LARGE fast segment's byte budget (the SMALL segment reuses
+	/// `fast_tier_capacity` above).
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	#[must_use]
+	pub fn lru_sized_hybrid_large_fast_capacity(&self) -> CacheSize {
+		self.lru_sized_hybrid_large_fast_capacity.load(Ordering::Relaxed)
+	}
+
+	/// Sets the LARGE fast segment's byte budget. Callers are responsible
+	/// for also broadcasting `WorkerEvent::ResizeLargeFastTier`.
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	pub fn set_lru_sized_hybrid_large_fast_capacity(&self, size: CacheSize) {
+		self.lru_sized_hybrid_large_fast_capacity.store(size, Ordering::Relaxed);
+	}
+
+	/// Current small/large size-classification threshold, in bytes.
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	#[must_use]
+	pub fn lru_sized_hybrid_size_threshold(&self) -> CacheSize {
+		self.lru_sized_hybrid_size_threshold.load(Ordering::Relaxed)
+	}
+
+	/// Sets the small/large size-classification threshold. Callers are
+	/// responsible for also broadcasting `WorkerEvent::ResizeSizeThreshold`.
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	pub fn set_lru_sized_hybrid_size_threshold(&self, size: CacheSize) {
+		self.lru_sized_hybrid_size_threshold.store(size, Ordering::Relaxed);
 	}
 
 	pub fn clear(&self) {

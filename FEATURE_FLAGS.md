@@ -185,6 +185,57 @@ The implementation provides explicit feature flags to control:
   `true` for an object the stack had already "forgotten") — caught by
   `tests/two_q_hybrid_cache_integration.rs`'s FIFO-eviction tests failing outright, not merely flaking
 
+### `lru_sized_hybrid_cache`
+- **Purpose**: Single-instance, segmented-LRU hybrid cache with a *size-split* fast AND slow tier — same
+  LRU admission/promotion/demotion/eviction semantics as `lru_hybrid_cache`, but the fast (DRAM) tier's
+  and the slow (PMEM) tier's bookkeeping are each further split into two independently-tracked segments
+  ("small"/"large") by a runtime-configurable byte threshold, so a handful of large objects can't
+  dominate/starve many small ones (or vice versa) in either tier's recency order purely because of size
+- **When enabled**: Adds `PaperPolicy::LruSizedHybrid` and a new `PaperCache<K, TieredBuffer, S>` impl
+  block — `new(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold)`,
+  `get`/`set`/`del`/`has`/`peek`/`ttl`/`size`/`wipe`/`resize`/`tier_of` (shared with the other hybrids),
+  plus `set_fast_tier_size`/`fast_tier_size` (reused from the shared block to mean the SMALL segment's
+  capacity specifically — this design is the only hybrid with a second, independent fast segment with no
+  shared-block equivalent), `set_large_fast_tier_size`/`large_fast_tier_size`,
+  `set_size_threshold`/`size_threshold`, and `lru_sized_hybrid_stats`. Also exports
+  `LruSizedHybridStats` from the crate root; shares `TieredBuffer`/`Tier`/`CacheTierSize` with the other
+  four hybrids rather than duplicating them — still exactly one physical DRAM allocator path and one
+  physical PMEM allocator path (`Tier` stays 2 variants, `TieredBuffer` is unchanged); the size split is
+  purely which of four internal recency lists a key's bookkeeping is tracked in, invisible at the
+  `TieredBuffer`/physical-allocation level
+- **When disabled**: None of the above types/methods are compiled; `PaperPolicy::LruSizedHybrid` doesn't exist
+- **Behavior**: Admission/re-admission-on-overwrite/promotion all route through one rule: classify by the
+  object's current size against `size_threshold` (`size < size_threshold` → small, else large) and land
+  in the matching FAST segment — mirrors `lru_hybrid_cache`'s existing "any touch always promotes to
+  fast" rule, just adding "which of the two fast segments" on top of it, so a reclassifying overwrite
+  (a `set()` whose new size crosses the threshold) moves between the two fast segments directly with
+  **no migration emitted** (both segments are physically `TieredBuffer::Fast`). Demotion: each fast
+  segment's own pressure (its raw byte usage exceeding its own configured capacity, minus a proportional
+  share of the shared-metadata DRAM reservation) demotes only *that* segment's LRU tail, into the
+  *matching* slow list — segment-local, never crossing. Eviction: prefers whichever of the two slow
+  lists is non-empty; if both are non-empty, whichever currently holds more objects (a cheap proxy for
+  "probably has the older tail," avoiding real cross-list timestamps). Only if *both* slow lists are
+  empty (nothing has ever been demoted) does eviction fall back to whichever fast segment is furthest
+  over its own budget by ratio — a direct port of `lru_hybrid_cache`'s own documented last-resort
+  fallback for the equivalent single-fast-tier case, not a new behavior invented for this design. Every
+  promotion/demotion that does cross the fast/slow boundary is actual data movement, same as
+  `lru_hybrid_cache` — a live object's bytes exist in exactly one tier's allocation at a time. TTL
+  survives every tier/segment move unmodified for the same reason (`Object::set_data` only ever replaces
+  `data`, never `key` or `expiry`)
+- **Requirements**: `["key_value_pmem"]` only, same reasoning as the other four hybrids. **Mutually
+  exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/`two_q_hybrid_cache`/`fifo_hybrid_cache`**
+- **Use case**: Same "single unified cache" shape as the other hybrids, for workloads with a real mix of
+  small and large object sizes where a single shared recency budget would otherwise let size (rather
+  than actual access pattern) dictate which objects survive in DRAM/hot PMEM
+- **A design note worth knowing**: only the two fast segments carry independent, configurable capacities
+  — the two slow lists carry no capacity of their own and stay governed purely by the overall `max_size`
+  terminal-eviction trigger, exactly like `lru_hybrid_cache`'s single slow tier today. The slow-tier
+  split is entirely about eviction-order fairness (which recency list a demoted object's eviction
+  candidacy is tracked in), not a new capacity dimension — confirmed as the intended scope during design
+  (a physically-separate-PMEM-arenas-per-size-class alternative was considered and explicitly rejected,
+  given this project's own prior history of multi-arena PMEM/DRAM allocator experiments proving costly —
+  see `CLAUDE.md`)
+
 ## Implementation Details
 
 ### Type System

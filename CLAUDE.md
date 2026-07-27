@@ -1988,3 +1988,185 @@ jemalloc_cxl_slow_tier` now correctly reports "the package 'paper-cache' does no
 feature." `all_dram`/`key_value_pmem`/`global_hashtable_pmem`/`hashbrown_dram`/`tiering`/
 `multitiering` regression builds all still build clean. `Cargo.lock` no longer references
 `jemalloc_cxl`.
+
+## Feature: `lru_sized_hybrid_cache` (implemented — mirrors `lru_hybrid_cache`, with a size-split fast AND slow tier)
+
+### Source (design brief from the user)
+
+Requested as "very similar in structure to `lru_hybrid_cache`... should use the same logic for
+promotion, demotion, and admission" but with the fast tier "separate[d]... into two different
+configurable fast tier sizes" routed by "a configurable sizing threshold." Confirmed through a
+plan-mode back-and-forth (recapped here since the reasoning shaped several non-obvious design
+choices):
+
+1. **Still exactly one physical DRAM tier and one physical PMEM tier** — the size split is purely a
+   bookkeeping concern, not a new allocator/arena. Confirmed explicitly: "There is still 1 dram
+   tier and 1 pmem tier... however each object size class has their own data movement."
+2. **The slow (PMEM) tier also splits by size, bookkeeping-only** — the user's own follow-up
+   ("i think the pmem arena would also be local to the size here") was clarified down to: two
+   independent slow *recency lists*, still sharing the one physical `Hybrid`/`HybridObjects` PMEM
+   pool — explicitly **not** two separate physical PMEM arenas, given this project's own
+   extensively-documented history (see the `jemalloc_cxl`/UMF-jemalloc-pool sections above) of
+   multi-arena allocator experiments proving costly or unstable.
+3. **Neither slow list gets an independent capacity** — confirmed the split is purely for eviction
+   fairness, matching the user's original scope ("only asked for... configurable fast tier sizes").
+4. **Terminal eviction, three rungs**: prefer the slow list with more objects (recency proxy avoiding
+   real cross-list timestamps); if both slow lists are non-empty, whichever has more objects wins; if
+   *both* are empty, fall back to whichever fast segment is furthest over its own budget by ratio.
+5. **The last-resort fast-tier-eviction fallback is deliberately preserved, not eliminated.** Before
+   designing this feature, `lru_hybrid_cache`'s own `evict_one()` was checked directly and confirmed
+   to already have this same fallback (its combined fast+slow list's absolute tail can be a
+   fast-tagged key if nothing has ever been demoted, and `apply_evictions` still erases it) — reported
+   to the user, who explicitly asked the new design to replicate it rather than "fix" it away via
+   admission-time rejection.
+
+### Design
+
+**Four independent, homogeneous recency lists (`small_fast`/`large_fast`/`small_slow`/`large_slow`)
+plus one combined `entries: HashMap<HashedKey, SizedEntry>`** — a deliberate departure from
+`LruHybridStack`'s single-combined-list-plus-`fast_boundary`-cursor trick, which only works for
+exactly one fast segment sharing one list with exactly one slow segment. With two independent fast
+sources each feeding their own independent slow destination, four separate homogeneous lists turned
+out *simpler* than any cursor-based scheme: each list's own tail is directly its own
+demotion/eviction candidate, no cursor needed anywhere (see `worker/policy/policy_stack/
+lru_sized_hybrid_stack.rs`'s module doc for the full derivation).
+
+**Classification compares against `ObjectSize` (`base_size`), not raw `value.len()`** — a deliberate
+deviation from the literal request, confirmed as the right tradeoff rather than silently decided:
+`PolicyStack::insert`'s only size parameter is the same `base_size` every other stack already
+budgets against; threading a second raw-length parameter through would mean changing that trait
+method's signature for all nine other stacks for a benefit that's only ever a small, near-constant
+offset near the threshold boundary.
+
+**Admission, promotion, and reclassification are all one `touch_fast` code path**, mirroring
+`LruHybridStack::touch_fast_key`'s existing "any touch always promotes to fast, whichever tier it
+was in" rule — this design just adds "which of the two fast segments" on top of that unchanged rule.
+A fast↔fast reclassification (an overwrite whose new size crosses the threshold) moves between the
+two fast lists directly and **emits no `(key, Tier)` migration** — both segments are physically
+`TieredBuffer::Fast`, so `PolicyWorker::apply_tier_migrations`'s existing binary
+demotion/promotion-partition pipeline needed **zero changes** to support this feature; only the
+stack's own internal bookkeeping needed the four-way split, entirely invisible to `Tier`/
+`TieredBuffer`/the `migrate` closure.
+
+**Shared DRAM-reservation overhead is split proportionally between the two fast segments'
+capacities** (`LruSizedHybridStack::reserved_shares`, using a `u128` intermediate to avoid overflow),
+not charged in full against each independently, which would double-count the same physical metadata
+cost. The two slow lists have no capacity to reserve against.
+
+**API surface**: `PaperCache::<K, TieredBuffer>::new(max_size, small_fast_tier_size,
+large_fast_tier_size, size_threshold)`. The shared generic block's existing
+`set_fast_tier_size`/`fast_tier_size` are reused to mean the SMALL segment specifically (documented
+clearly on this feature's own impl block, since every other hybrid design means "the whole fast
+tier" by those same method names) — new bespoke `set_large_fast_tier_size`/`large_fast_tier_size`
+and `set_size_threshold`/`size_threshold` cover the rest. Doesn't reuse the shared `new_hybrid`
+helper (needs three sizing scalars routed to three different places — two `AtomicStatus` fields plus
+three `WorkerEvent` broadcasts — rather than `new_hybrid`'s one `CacheTierSize`/one broadcast);
+duplicates that ~65-line setup in a bespoke `new_sized_hybrid` instead, judged less invasive than
+widening `new_hybrid`'s signature for every other hybrid design's benefit. `new_hybrid` itself picked
+up a narrower inner `#[cfg]` (the original four features only) so an `lru_sized_hybrid_cache`-only
+build doesn't compile an unused method.
+
+**`PolicyStack` trait gained 10 new default (no-op) methods**, purely additive:
+`resize_large_fast_tier`, `resize_size_threshold`, and eight granular
+`small_fast_bytes_used`/`large_fast_bytes_used`/`small_fast_object_count`/`large_fast_object_count`/
+`small_slow_bytes_used`/`large_slow_bytes_used`/`small_slow_object_count`/`large_slow_object_count`
+accessors — every other stack keeps compiling unaffected via the defaults.
+
+**Stats (`LruSizedHybridStats`, 15 fields)** keep the existing 7-field shape (`promotions`/
+`demotions`/`evictions`/combined `fast_bytes_used`/`slow_bytes_used`/`fast_objects`/`slow_objects`,
+for drop-in consistency with the other four hybrids) plus 8 new per-segment granular fields, since
+the slow tier genuinely has two independently-tracked lists now too — symmetry judged more useful
+than parsimony here.
+
+### A real bug this caught while writing the integration test: hand-derived overhead math was wrong twice
+
+The `terminal_eviction_falls_back_to_the_more_over_budget_fast_segment_when_slow_is_empty`
+integration test needed a scenario where overall `max_size` is exceeded while both slow lists stay
+genuinely empty — only possible if a fast segment's own effective budget (capacity minus its
+proportional share of the shared-metadata DRAM reservation) never gets exceeded by real usage, while
+the overhead-inclusive `used_size()` does exceed `max_size`. Two attempts at hand-deriving the
+needed numbers from the overhead constants in `object/overhead.rs` (75 bytes/object reservation, 85
+bytes/object policy overhead, an independently-measured 49-byte `base_size` for a representative
+test object) were both measurably wrong: the first (`small_capacity == large_capacity == max_size ==
+500`) under-shot the reservation's real bite and 7 of the 10 test objects demoted for real, not the
+intended 0; the second guess for `max_size` (1200) overshot the real measured `used_size()` (1180)
+by just 20. Root cause of the discrepancy: the 49-byte probe measurement used a throwaway
+`Object<u32, Box<[u8]>>` rather than the real `Object<u32, TieredBuffer>` the feature actually
+stores, and the two buffer types' overhead isn't quite identical. Fixed by measuring the real
+`status().used_size()` directly (via a temporary `eprintln!` diagnostic, removed once the true
+number was known) rather than continuing to guess from constants — a lesson worth generalizing:
+prefer a direct runtime measurement over hand-deriving from multiple independent overhead constants
+when precision actually matters for a test's correctness, not just its intent.
+
+### Implementation status: complete
+
+`policy.rs`, `status.rs`, `object/overhead.rs`, `worker/mod.rs`, `worker/manager.rs`,
+`worker/policy/mod.rs`, `worker/policy/policy_stack/mod.rs`,
+`worker/policy/policy_stack/lru_sized_hybrid_stack.rs` (new), `src/lru_sized_hybrid_cache/` (new),
+`lib.rs`, and `Cargo.toml` are done. 115 unit/inline tests pass under `--features
+lru_sized_hybrid_cache` (17 in the new stack file, 6 in a `worker::policy::lru_sized_hybrid_tests`
+module mirroring `lru_hybrid_tests`'s synthetic-buffer wiring pattern, 4 in a
+`test_lru_sized_hybrid_cache` lib.rs module mirroring the other hybrids' fast-tier-only happy-path
+suite, plus the existing suite's other tests unaffected). `tests/lru_sized_hybrid_cache_integration.rs`
+(20 tests, real PMEM/UMF allocator, modeled on `tests/lru_hybrid_cache_integration.rs`) passes twice
+in a row (not flaky): `cargo +nightly test --test lru_sized_hybrid_cache_integration --features
+lru_sized_hybrid_cache`.
+
+### Remaining work
+
+- No dedicated stress/scale test yet (the `#[ignore]`d `repro_real_dram_usage_at_scale`/
+  `concurrent_set_from_multiple_threads_still_demotes` tests `lru_hybrid_cache_integration.rs` has
+  for its own DRAM-usage/concurrency investigations weren't ported — this feature's functional test
+  suite is complete, but no large-N/concurrent-access real-DRAM measurement has been done for the
+  four-list design specifically).
+
+## Restored the jemalloc_cxl multi-arena extent-hooks allocator, on request — available again, not rewired
+
+Per explicit request ("bring back the multi-arena jemalloc extent hooks that recently got
+removed... it should be doable to use this as allocator, tho just return it and don't worry about
+that for now"), restored the `jemalloc_cxl/` crate and everything in `src/allocator.rs` that the
+earlier `original`-feature-removal session (see "Removed the deprecated `original` feature; migrate
+`eviction_stacks_pmem` off jemalloc_cxl onto Hybrid/HybridObjects" above) deleted:
+`numa_arena_pool`, `EvictionStackAllocator`, `SlowTierJemallocAllocator`, and
+`DramMultiArenaObjects`, plus `jemalloc_cxl_slow_tier`'s `Cargo.toml` feature, `TieredBuffer`'s
+jemalloc_cxl-backed `Slow` variant (`src/tiered_buffer.rs`), and `lib.rs`'s
+`#[global_allocator]`/`cfg_attr`/`mod allocator` wiring for it. Restored via `git checkout
+<pre-removal-commit> -- jemalloc_cxl/ src/allocator.rs src/tiered_buffer.rs` (both files were
+untouched by any work done since that removal, so a clean full-file checkout was safe) plus manual
+re-application of the `Cargo.toml`/`lib.rs` hunks that would otherwise have collided with this
+session's unrelated `lru_sized_hybrid_cache` additions to those same two files.
+
+**One deliberate change from the original shape, not a full byte-for-byte revert**:
+`EvictionStackAllocator`'s gate moved from `#[cfg(feature = "eviction_stacks_pmem")]` to
+`#[cfg(feature = "jemalloc_cxl_slow_tier")]` (both the module and its `pub use`), and
+`numa_arena_pool`'s gate dropped `eviction_stacks_pmem` from its `any(...)` down to
+`jemalloc_cxl_slow_tier` alone. Explicit tradeoff, not an oversight: `eviction_stacks_pmem` was
+migrated to `crate::Hybrid`/`HybridObjects` earlier this session specifically so it would stop
+depending on `jemalloc_cxl` — restoring `EvictionStackAllocator` under its *original* gate would
+have silently reintroduced that dependency (`use jemalloc_cxl::...` inside a module compiled
+whenever `eviction_stacks_pmem` is enabled, forcing `eviction_stacks_pmem = ["dep:jemalloc_cxl"]`
+again) for code nothing actually calls anymore — undoing a change already made, verified, and
+documented in this same file. Re-gating under `jemalloc_cxl_slow_tier` instead keeps
+`eviction_stacks_pmem` exactly as it is today (confirmed via `cargo tree --features
+eviction_stacks_pmem`: still no `jemalloc_cxl` in the dependency graph) while still making
+`EvictionStackAllocator`'s code fully available again, compiling and ready to be wired back into
+its six original call sites (`worker/policy/policy_stack/{lru,lfu,two_q,fifo}_hybrid_stack.rs`,
+`lfu_stack.rs`, `pmem_collections.rs`) later if ever wanted — which is the "return it, don't worry
+about wiring it in for now" scope this was explicitly asked for. None of those six files were
+touched; they still import `crate::Hybrid`.
+
+Verified: `cargo +nightly build --features jemalloc_cxl_slow_tier` builds clean; `cargo +nightly
+build --features eviction_stacks_pmem` still builds clean with `jemalloc_cxl` absent from `cargo
+tree`'s output; the full unit-test regression sweep (`lru_sized_hybrid_cache`,
+`lru_sized_hybrid_cache,eviction_stacks_pmem`, all four existing hybrid-cache features,
+`lru_hybrid_cache,jemalloc_cxl_slow_tier`) passes at the exact same counts as before this
+restoration (115/125/112/112/113/113/114) — this was purely additive, nothing it touched changed
+behavior for any build that doesn't explicitly opt into `jemalloc_cxl_slow_tier`.
+
+**Bottom line, unchanged from before removal**: `jemalloc_cxl_slow_tier` is available again but
+still not the default, and still not proven safe under real concurrent load — three separate
+retests earlier in this project's history all failed (see the "Reverted, twice" and "Third retest"
+`umfJemallocPoolOps`/`jemalloc_cxl_slow_tier` sections above). Passing this crate's own low-
+concurrency unit/integration suites was never in question; don't treat that as evidence of fitness
+for real concurrent load, and don't re-run `paper-benchmark-cxl` against it without being prepared
+for it to fail the same way again.

@@ -55,7 +55,7 @@ use crate::{
 // `policy_stack` submodule directly, *and* so it can flow all the way out
 // to `PaperCache::tier_of`'s public return type via `worker::Tier` /
 // `crate::Tier` (see `worker/mod.rs` and `lib.rs`).
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 pub use policy_stack::Tier;
 
 // the polling value must be a power of 2
@@ -104,7 +104,7 @@ pub struct PolicyWorker<K, V> {
 	/// for every other policy/value type. Promotion/demotion/eviction
 	/// counters and gauges are recorded directly on the shared `status`
 	/// (see `apply_tier_migrations`), not a separate field.
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 	tier_migration_fn: Option<Box<dyn Fn(&V, Tier) -> V + Send + Sync>>,
 }
 
@@ -143,6 +143,8 @@ where
 					WorkerEvent::Wipe => self.handle_wipe(),
 					WorkerEvent::Resize(max_size) => self.handle_resize(max_size),
 					WorkerEvent::ResizeFastTier(size) => self.handle_resize_fast_tier(size),
+					WorkerEvent::ResizeLargeFastTier(size) => self.handle_resize_large_fast_tier(size),
+					WorkerEvent::ResizeSizeThreshold(size) => self.handle_resize_size_threshold(size),
 
 					WorkerEvent::Policy(policy) => {
 						self.handle_policy(policy, policy_reconstruct_tx.clone());
@@ -198,7 +200,7 @@ where
 				// 3959.0/3983.3 MB — within normal run-to-run noise). The
 				// allocator-level retention behavior responsible for that gap
 				// is independent of this loop's migration granularity.
-				#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+				#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 				self.apply_tier_migrations();
 			}
 
@@ -278,7 +280,7 @@ where
 
 			promotion_tx,
 
-			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 			tier_migration_fn: None,
 		};
 
@@ -297,7 +299,7 @@ where
 	/// eviction counters and the current tier gauges are recorded directly
 	/// on `status` (see `apply_tier_migrations`), which is why this
 	/// constructor needs no separate stats parameter.
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 	pub fn new_with_tier_migration(
 		listener: WorkerReceiver,
 		objects: ObjectMapRef<K, V>,
@@ -421,6 +423,24 @@ where
 	fn handle_resize_fast_tier(&mut self, size: CacheSize) {
 		if let Some(stack) = &mut self.policy_stack {
 			stack.resize_fast_tier(size);
+		}
+	}
+
+	/// Runtime-adjusts the LARGE fast segment's byte budget
+	/// (`lru_sized_hybrid_cache` specifically). No-op for every other policy
+	/// stack. May itself trigger demotions, drained by `apply_tier_migrations`
+	/// on the next pass through the event loop.
+	fn handle_resize_large_fast_tier(&mut self, size: CacheSize) {
+		if let Some(stack) = &mut self.policy_stack {
+			stack.resize_large_fast_tier(size);
+		}
+	}
+
+	/// Runtime-adjusts the small/large size-classification threshold
+	/// (`lru_sized_hybrid_cache`). No-op for every other policy stack.
+	fn handle_resize_size_threshold(&mut self, size: CacheSize) {
+		if let Some(stack) = &mut self.policy_stack {
+			stack.resize_size_threshold(size);
 		}
 	}
 
@@ -759,6 +779,67 @@ where
 		}
 	}
 
+	/// `lru_sized_hybrid_cache` counterpart of the four methods above —
+	/// same overall shape (drain, partition demotions/promotions on
+	/// `Tier::Slow`, demotions fully before promotions, sequential,
+	/// gauges refreshed unconditionally) as the `lru_hybrid_cache`
+	/// sibling, since every `Tier::Slow`/`Tier::Fast` migration
+	/// `LruSizedHybridStack` emits is unambiguously a genuine
+	/// demotion/promotion (no `LfuHybridStack`-style admission-latch
+	/// ambiguity — see `drain_demotions`'s doc). The only real
+	/// difference is the gauge call itself: `LruSizedHybridStack`
+	/// tracks four segments, not two, so `set_lru_sized_hybrid_gauges`
+	/// takes the four granular trait-method reads instead of two.
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	fn apply_tier_migrations(&mut self) {
+		let Some(stack) = &mut self.policy_stack else { return };
+		let migrations = stack.drain_tier_migrations();
+
+		if !migrations.is_empty() {
+			if let Some(migrate) = &self.tier_migration_fn {
+				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
+					.into_iter()
+					.partition(|(_, tier)| *tier == Tier::Slow);
+
+				let objects = &self.objects;
+				let status = &self.status;
+
+				let apply_physical = |(key, tier): (HashedKey, Tier)| {
+					if let Some(mut object) = objects.get_mut(&key) {
+						let new_data = migrate(&object.data(), tier);
+						object.set_data(new_data);
+					}
+				};
+
+				demotions.into_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_lru_sized_hybrid_demotion();
+				});
+
+				promotions.into_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_lru_sized_hybrid_promotion();
+				});
+			}
+		}
+
+		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
+		// comment on this same pattern for why gating it on `migrations`
+		// being non-empty let these gauges go stale and never catch up.
+		if let Some(stack) = &self.policy_stack {
+			self.status.set_lru_sized_hybrid_gauges(
+				stack.small_fast_bytes_used(),
+				stack.large_fast_bytes_used(),
+				stack.small_slow_bytes_used(),
+				stack.large_slow_bytes_used(),
+				stack.small_fast_object_count() as u64,
+				stack.large_fast_object_count() as u64,
+				stack.small_slow_object_count() as u64,
+				stack.large_slow_object_count() as u64,
+			);
+		}
+	}
+
 	fn apply_buffered_events(
 		&mut self,
 		buffered_events: &[StackEvent],
@@ -875,6 +956,11 @@ where
 			#[cfg(feature = "fifo_hybrid_cache")]
 			if *policy == PaperPolicy::FifoHybrid {
 				self.status.record_fifo_hybrid_eviction();
+			}
+
+			#[cfg(feature = "lru_sized_hybrid_cache")]
+			if *policy == PaperPolicy::LruSizedHybrid {
+				self.status.record_lru_sized_hybrid_eviction();
 			}
 
 			buffered_events.push(StackEvent::Del(key));
@@ -1846,5 +1932,265 @@ mod two_q_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10);
 
 		worker.apply_tier_migrations();
+	}
+}
+
+#[cfg(all(test, feature = "lru_sized_hybrid_cache"))]
+mod lru_sized_hybrid_tests {
+	use super::*;
+
+	use dashmap::DashMap;
+
+	use crate::{
+		NoHasher,
+		object::Object,
+		status::AtomicStatus,
+		object::overhead::{OverheadManager, get_hybrid_dram_shared_overhead},
+	};
+
+	type TestBuffer = Box<[u8]>;
+
+	// See `lru_hybrid_tests::shared_overhead`'s identical rationale.
+	#[allow(dead_code)]
+	fn shared_overhead() -> CacheSize {
+		get_hybrid_dram_shared_overhead(&PaperPolicy::LruSizedHybrid) as CacheSize
+	}
+
+	// See `lru_hybrid_tests::low_water_safe`'s identical rationale --
+	// `LruSizedHybridStack` reuses the same `FAST_TIER_LOW_WATER_RATIO`
+	// (0.98) for both segments.
+	fn low_water_safe(target: CacheSize) -> CacheSize {
+		(target as f64 / 0.98).ceil() as CacheSize
+	}
+
+	// Mirrors `lru_hybrid_tests::make_worker` exactly, seeded with
+	// `PaperPolicy::LruSizedHybrid` instead.
+	fn make_worker(max_size: CacheSize) -> (
+		PolicyWorker<u32, TestBuffer>,
+		ObjectMapRef<u32, TestBuffer>,
+		StatusRef,
+		OverheadManagerRef,
+	) {
+		let (_tx, rx) = unbounded::<WorkerEvent>();
+
+		let objects: ObjectMapRef<u32, TestBuffer> =
+			Arc::new(DashMap::with_hasher(NoHasher::default()));
+
+		let status = Arc::new(
+			AtomicStatus::new(max_size, &[PaperPolicy::LruSizedHybrid], PaperPolicy::LruSizedHybrid).unwrap(),
+		);
+
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		let migrate: Box<dyn Fn(&TestBuffer, Tier) -> TestBuffer + Send + Sync> =
+			Box::new(|bytes, tier| {
+				let marker: u8 = match tier {
+					Tier::Fast => 0xFA,
+					Tier::Slow => 0x50,
+				};
+
+				let mut v = bytes.to_vec();
+				if let Some(last) = v.last_mut() {
+					*last = marker;
+				}
+				v.into_boxed_slice()
+			});
+
+		let worker = PolicyWorker::new_with_tier_migration(
+			rx,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+			migrate,
+		).unwrap();
+
+		(worker, objects, status, overhead_manager)
+	}
+
+	// Mirrors `lru_hybrid_tests::insert` exactly.
+	fn insert(
+		objects: &ObjectMapRef<u32, TestBuffer>,
+		status: &StatusRef,
+		overhead_manager: &OverheadManagerRef,
+		worker: &mut PolicyWorker<u32, TestBuffer>,
+		key: HashedKey,
+		size: usize,
+	) {
+		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
+		let base_size = overhead_manager.base_size(&object);
+
+		objects.insert(key, object);
+		status.update_base_used_size(base_size as i64);
+		status.incr_num_objects();
+		worker.handle_set(key, base_size);
+	}
+
+	// Mirrors `lru_hybrid_tests::base_size_of` exactly.
+	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
+		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		overhead_manager.base_size(&probe)
+	}
+
+	#[test]
+	fn demotion_physically_replaces_object_bytes_and_updates_stats() {
+		let (mut worker, objects, status, overhead_manager) = make_worker(1_000_000);
+
+		// Route everything to the small segment and make the large
+		// segment's capacity dwarf the small one's, so the shared-metadata
+		// reservation's share against small stays negligible (rounds to 0)
+		// -- see `LruSizedHybridStack::reserved_shares`. Lets this test
+		// reuse the same simple math `lru_hybrid_tests`'s equivalent uses.
+		worker.handle_resize_size_threshold(1_000_000);
+		worker.handle_resize_large_fast_tier(1_000_000);
+		worker.handle_resize_fast_tier(
+			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1),
+		);
+
+		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15); // fast
+		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10); // demotes key 1
+
+		worker.apply_tier_migrations();
+
+		let snapshot = status.lru_sized_hybrid_stats();
+		assert_eq!(snapshot.demotions, 1);
+		assert_eq!(snapshot.promotions, 0);
+		assert_eq!(snapshot.fast_objects, 1);
+		assert_eq!(snapshot.slow_objects, 1);
+		assert_eq!(snapshot.small_fast_objects, 1);
+		assert_eq!(snapshot.small_slow_objects, 1);
+		assert_eq!(snapshot.large_fast_objects, 0);
+		assert_eq!(snapshot.large_slow_objects, 0);
+
+		let data = objects.get(&1).unwrap().data();
+		assert_eq!(data.last(), Some(&0x50));
+	}
+
+	#[test]
+	fn access_promotes_a_slow_key_and_may_cascade_a_demotion() {
+		let (mut worker, objects, status, overhead_manager) = make_worker(1_000_000);
+
+		worker.handle_resize_size_threshold(1_000_000);
+		worker.handle_resize_large_fast_tier(1_000_000);
+		worker.handle_resize_fast_tier(
+			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1),
+		);
+
+		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
+		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10); // demotes 1
+		worker.apply_tier_migrations();
+
+		worker.handle_get(1, true);
+		worker.apply_tier_migrations();
+
+		let snapshot = status.lru_sized_hybrid_stats();
+		assert_eq!(snapshot.promotions, 1);
+		assert_eq!(snapshot.demotions, 2);
+
+		let data_1 = objects.get(&1).unwrap().data();
+		assert_eq!(data_1.last(), Some(&0xFA));
+	}
+
+	#[test]
+	fn eviction_under_lru_sized_hybrid_policy_is_recorded_in_stats() {
+		let (mut worker, objects, status, overhead_manager) = make_worker(20);
+
+		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
+		insert(&objects, &status, &overhead_manager, &mut worker, 2, 15);
+		worker.apply_tier_migrations();
+
+		let mut buffered_events = Vec::new();
+		worker.apply_evictions(&mut buffered_events).unwrap();
+
+		let evictions = status.lru_sized_hybrid_stats().evictions;
+		assert!(evictions >= 1);
+		assert_eq!(objects.len() as u64, 2 - evictions);
+	}
+
+	#[test]
+	fn no_migration_fn_is_a_safe_no_op() {
+		let (_tx, rx) = unbounded::<WorkerEvent>();
+		let objects: ObjectMapRef<u32, TestBuffer> =
+			Arc::new(DashMap::with_hasher(NoHasher::default()));
+		let status = Arc::new(
+			AtomicStatus::new(100, &[PaperPolicy::LruSizedHybrid], PaperPolicy::LruSizedHybrid).unwrap(),
+		);
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		let mut worker = PolicyWorker::<u32, TestBuffer>::new(
+			rx,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+			None,
+		).unwrap();
+
+		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
+		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10);
+
+		worker.apply_tier_migrations();
+	}
+
+	#[test]
+	fn small_and_large_segments_demote_independently() {
+		let (mut worker, objects, status, overhead_manager) = make_worker(1_000_000);
+
+		let small_base = base_size_of(&overhead_manager, 15) as CacheSize;
+		let large_base = base_size_of(&overhead_manager, 200) as CacheSize;
+
+		worker.handle_resize_size_threshold((small_base + large_base) / 2);
+		// Generous capacities up front -- both objects land and stay fast.
+		worker.handle_resize_fast_tier(10_000);
+		worker.handle_resize_large_fast_tier(10_000);
+
+		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);  // small
+		insert(&objects, &status, &overhead_manager, &mut worker, 2, 200); // large
+		worker.apply_tier_migrations();
+
+		assert_eq!(status.lru_sized_hybrid_stats().small_fast_objects, 1);
+		assert_eq!(status.lru_sized_hybrid_stats().large_fast_objects, 1);
+
+		// Shrinking only the SMALL segment's budget demotes key 1 without
+		// touching key 2 in the large segment.
+		worker.handle_resize_fast_tier(0);
+		worker.apply_tier_migrations();
+
+		let snapshot = status.lru_sized_hybrid_stats();
+		assert_eq!(snapshot.demotions, 1);
+		assert_eq!(snapshot.small_slow_objects, 1);
+		assert_eq!(snapshot.large_fast_objects, 1);
+		assert_eq!(snapshot.large_slow_objects, 0);
+	}
+
+	#[test]
+	fn reclassification_on_overwrite_moves_segments_without_a_migration() {
+		let (mut worker, objects, status, overhead_manager) = make_worker(1_000_000);
+
+		let small_base = base_size_of(&overhead_manager, 15) as CacheSize;
+		let large_base = base_size_of(&overhead_manager, 200) as CacheSize;
+
+		worker.handle_resize_size_threshold((small_base + large_base) / 2);
+		worker.handle_resize_fast_tier(10_000);
+		worker.handle_resize_large_fast_tier(10_000);
+
+		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15); // small
+		worker.apply_tier_migrations();
+		assert_eq!(status.lru_sized_hybrid_stats().small_fast_objects, 1);
+
+		let before = status.lru_sized_hybrid_stats();
+
+		// A re-`handle_set` for the same key with a larger size mirrors what
+		// `PaperCache::set()` does on a real overwrite (recompute base_size,
+		// call handle_set again) -- reclassifies key 1 into the large
+		// segment.
+		worker.handle_set(1, large_base as ObjectSize);
+		worker.apply_tier_migrations();
+
+		let after = status.lru_sized_hybrid_stats();
+		assert_eq!(after.small_fast_objects, 0);
+		assert_eq!(after.large_fast_objects, 1);
+		// A fast<->fast reclassification never crosses Tier, so it's
+		// invisible to the promotion/demotion counters.
+		assert_eq!(after.promotions, before.promotions);
+		assert_eq!(after.demotions, before.demotions);
 	}
 }

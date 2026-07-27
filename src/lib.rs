@@ -6,7 +6,7 @@
  * correct
  */
 
-#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem"), feature(allocator_api), feature(clone_from_ref))]
+#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "jemalloc_cxl_slow_tier"), feature(allocator_api), feature(clone_from_ref))]
 
 
 // `lru_hybrid_cache`, `lfu_hybrid_cache`, `two_q_hybrid_cache`, and
@@ -32,6 +32,18 @@ compile_error!("Cannot enable both 'fifo_hybrid_cache' and 'lfu_hybrid_cache' fe
 #[cfg(all(feature = "fifo_hybrid_cache", feature = "two_q_hybrid_cache"))]
 compile_error!("Cannot enable both 'fifo_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
 
+#[cfg(all(feature = "lru_sized_hybrid_cache", feature = "lru_hybrid_cache"))]
+compile_error!("Cannot enable both 'lru_sized_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
+
+#[cfg(all(feature = "lru_sized_hybrid_cache", feature = "lfu_hybrid_cache"))]
+compile_error!("Cannot enable both 'lru_sized_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
+
+#[cfg(all(feature = "lru_sized_hybrid_cache", feature = "two_q_hybrid_cache"))]
+compile_error!("Cannot enable both 'lru_sized_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
+
+#[cfg(all(feature = "lru_sized_hybrid_cache", feature = "fifo_hybrid_cache"))]
+compile_error!("Cannot enable both 'lru_sized_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
+
 // Validate that hashbrown_dram is not enabled with other global hashtable features
 #[cfg(all(feature = "hashbrown_dram", feature = "global_hashtable_pmem"))]
 compile_error!("Cannot enable both 'hashbrown_dram' and 'global_hashtable_pmem' features simultaneously. Please choose only one global hashtable mode.");
@@ -45,7 +57,7 @@ compile_error!("Cannot enable both 'hashbrown_dram' and 'global_hashtable_pmem' 
 //static GLOBAL: Jemalloc = Jemalloc;
 
 
-#[cfg(any(feature = "hashbrown_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "all_dram"))]
+#[cfg(any(feature = "hashbrown_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "all_dram", feature = "jemalloc_cxl_slow_tier"))]
 pub mod allocator;
 
 use std::arch::x86_64::{_mm_clflush, _mm_sfence};
@@ -100,10 +112,10 @@ use crate::value_buffer::ValueBuffer;
 // Shared tier-size unit type (bytes/Mb/Gb), used by `lru_hybrid_cache`,
 // `lfu_hybrid_cache`, `two_q_hybrid_cache`, and `fifo_hybrid_cache` so none
 // of them has to depend on any of the others for it.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 mod size;
 
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 pub use crate::size::CacheTierSize;
 
 // Shared value type for the segmented hybrid-cache features. `lru_hybrid_cache`,
@@ -111,10 +123,10 @@ pub use crate::size::CacheTierSize;
 // mutually exclusive (see the `compile_error!` guards above) and all
 // re-export it from their own module for source compatibility
 // (`paper_cache::TieredBuffer` works either way).
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 mod tiered_buffer;
 
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 pub use crate::tiered_buffer::TieredBuffer;
 
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
@@ -157,18 +169,29 @@ pub mod fifo_hybrid_cache;
 #[cfg(feature = "fifo_hybrid_cache")]
 pub use crate::fifo_hybrid_cache::FifoHybridStats;
 
+// Single-instance, segmented-LRU hybrid cache with a size-split fast AND
+// slow tier. Same one-PaperCache<K, TieredBuffer> architecture and LRU
+// admission/promotion/demotion/eviction semantics as `lru_hybrid_cache`, but
+// both tiers' bookkeeping are each further split into two size-routed
+// segments — see the `lru_sized_hybrid_cache` module docs.
+#[cfg(feature = "lru_sized_hybrid_cache")]
+pub mod lru_sized_hybrid_cache;
+
+#[cfg(feature = "lru_sized_hybrid_cache")]
+pub use crate::lru_sized_hybrid_cache::LruSizedHybridStats;
+
 // Re-exported so `PaperCache::tier_of`'s return type is nameable by callers
 // without reaching into the private `worker` module tree directly.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 pub use crate::worker::Tier;
 
 // Trait abstracting the behavior that differs between the four hybrid-cache
 // designs, plus the compile-time selection of exactly one concrete
 // implementation -- see `hybrid_policy.rs`'s module doc for why this stays
 // a compile-time (not runtime) dispatch.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 mod hybrid_policy;
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 use crate::hybrid_policy::HybridPolicy;
 
 #[cfg(feature = "lru_hybrid_cache")]
@@ -179,6 +202,8 @@ type ActiveHybridPolicy = crate::lfu_hybrid_cache::LfuHybridPolicy;
 type ActiveHybridPolicy = crate::two_q_hybrid_cache::TwoQHybridPolicy;
 #[cfg(feature = "fifo_hybrid_cache")]
 type ActiveHybridPolicy = crate::fifo_hybrid_cache::FifoHybridPolicy;
+#[cfg(feature = "lru_sized_hybrid_cache")]
+type ActiveHybridPolicy = crate::lru_sized_hybrid_cache::LruSizedHybridPolicy;
 
 use std::{
 	thread,
@@ -277,18 +302,27 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 // DRAMObjects+HybridObjects already had; it added a second implementation
 // of the same mechanism without changing that mechanism's properties.
 //
-// A later, separate `jemalloc_cxl_slow_tier` feature swapped this for
+// A later, separate `jemalloc_cxl_slow_tier` feature swaps this for
 // `allocator::DramMultiArenaObjects` (a pool of node-0-pinned jemalloc
 // arenas via jemalloc_cxl's custom extent hooks) paired with
 // `SlowTierJemallocAllocator` for the slow tier -- one jemalloc instance for
-// both tiers, UMF/Hybrid unused. Removed along with the `jemalloc_cxl` crate
-// it depended on: never proven stable under real concurrent load (see the
-// UMF-jemalloc-pool and jemalloc_cxl_slow_tier retest history in
-// `CLAUDE.md`) and never the default, opt-in-only path this crate actually
-// ran. `DRAMObjects`/`HybridObjects` (TBB/UMF) is the only allocator pairing
-// this crate uses now, for every feature.
+// both tiers, UMF/Hybrid unused. This was removed once already (never
+// proven stable under real concurrent load in three separate retests -- see
+// the UMF-jemalloc-pool and jemalloc_cxl_slow_tier retest history in
+// `CLAUDE.md`) and has been brought back on request as a standalone,
+// available-but-not-the-default mechanism: `DRAMObjects`/`HybridObjects`
+// (TBB/UMF) remains the default allocator pairing for every feature, and
+// `jemalloc_cxl_slow_tier` stays opt-in only -- do not re-enable it as the
+// default, and do not trust it under real concurrent load without
+// re-running the actual benchmark (not just this crate's own test suite)
+// to confirm, per that retest history.
+#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
+
+#[cfg(feature = "jemalloc_cxl_slow_tier")]
+#[global_allocator]
+static GLOBAL: allocator::DramMultiArenaObjects = allocator::DramMultiArenaObjects;
 
 #[cfg(not(feature = "all_dram"))]
 use std::alloc::{Layout, Allocator}; // Essential imports
@@ -1487,12 +1521,20 @@ unsafe impl<K, V, S> Sync for PaperCache<K, V, S> {}
 /// this one exist only to preserve each feature's distinct public
 /// constructor/stats-accessor names and signatures for source
 /// compatibility with existing callers (`paper-server`/`paper-benchmark-cxl`).
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
 	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
+	// `lru_sized_hybrid_cache` doesn't call this: it needs three sizing
+	// scalars (two independent fast-segment capacities + a threshold)
+	// threaded to three different places rather than this method's single
+	// `CacheTierSize`, so it has its own bespoke `new_sized_hybrid` instead
+	// (see that feature's own small impl block below). Gated narrower than
+	// the outer block so an `lru_sized_hybrid_cache`-only build doesn't
+	// compile (and warn about) an unused method.
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"))]
 	fn new_hybrid(
 		max_size: CacheSize,
 		fast_tier_size: CacheTierSize,
@@ -2068,6 +2110,191 @@ where
 	}
 }
 
+/// Single-instance, segmented-LRU hybrid cache with a size-split fast AND
+/// slow tier: same `PaperCache<K, TieredBuffer>` architecture and LRU
+/// admission/promotion/demotion/eviction semantics as `lru_hybrid_cache`,
+/// but each tier's bookkeeping is split into two independently-tracked
+/// segments ("small"/"large") by object size. See the
+/// `lru_sized_hybrid_cache` module docs.
+///
+/// Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
+/// `two_q_hybrid_cache`/`fifo_hybrid_cache` (see `lib.rs`'s `compile_error!`
+/// guards).
+///
+/// Sizing knobs: [`Self::set_fast_tier_size`]/[`Self::fast_tier_size`]
+/// (defined on the shared generic block above) resize/read the SMALL fast
+/// segment specifically for this design -- unlike every other hybrid, where
+/// they mean the whole fast tier -- because this design has a second,
+/// independent fast segment with no shared-block equivalent.
+/// [`Self::set_large_fast_tier_size`]/[`Self::large_fast_tier_size`] and
+/// [`Self::set_size_threshold`]/[`Self::size_threshold`] are this design's
+/// own bespoke accessors, defined here.
+#[cfg(feature = "lru_sized_hybrid_cache")]
+impl<K, S> PaperCache<K, TieredBuffer, S>
+where
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	S: Default + Clone + BuildHasher,
+{
+	/// Creates an empty `PaperCache` running `PaperPolicy::LruSizedHybrid`,
+	/// with the given overall `max_size` and initial small/large fast-segment
+	/// byte budgets and size-classification threshold (each independently
+	/// adjustable afterward via [`Self::set_fast_tier_size`]/
+	/// [`Self::set_large_fast_tier_size`]/[`Self::set_size_threshold`]). An
+	/// object whose size is strictly below `size_threshold` routes to the
+	/// small segment on admission, promotion, or a reclassifying overwrite;
+	/// at or above routes to the large segment.
+	///
+	/// # Errors
+	///
+	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero, or
+	/// [`CacheError::InvalidFastTierSize`] if either `small_fast_tier_size`
+	/// or `large_fast_tier_size` resolves to zero bytes or exceeds
+	/// `max_size` (checked independently -- there is no requirement that
+	/// their sum stay under `max_size`). `size_threshold` is never rejected.
+	pub fn new(
+		max_size: CacheSize,
+		small_fast_tier_size: CacheTierSize,
+		large_fast_tier_size: CacheTierSize,
+		size_threshold: CacheTierSize,
+	) -> Result<Self, CacheError> {
+		Self::with_hasher(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold, Default::default())
+	}
+
+	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
+	pub fn with_hasher(
+		max_size: CacheSize,
+		small_fast_tier_size: CacheTierSize,
+		large_fast_tier_size: CacheTierSize,
+		size_threshold: CacheTierSize,
+		hasher: S,
+	) -> Result<Self, CacheError> {
+		Self::new_sized_hybrid(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold, hasher)
+	}
+
+	/// Duplicates `new_hybrid`'s common setup rather than reusing it: this
+	/// design needs three sizing scalars (two fast-segment capacities + a
+	/// threshold) threaded to three different places -- two `AtomicStatus`
+	/// fields plus three `WorkerEvent` broadcasts -- rather than
+	/// `new_hybrid`'s single `CacheTierSize`/one broadcast, so widening
+	/// `new_hybrid`'s signature for every other hybrid design's benefit was
+	/// judged more invasive than this small duplication.
+	fn new_sized_hybrid(
+		max_size: CacheSize,
+		small_fast_tier_size: CacheTierSize,
+		large_fast_tier_size: CacheTierSize,
+		size_threshold: CacheTierSize,
+		hasher: S,
+	) -> Result<Self, CacheError> {
+		if max_size == 0 {
+			return Err(CacheError::ZeroCacheSize);
+		}
+
+		let small_capacity = small_fast_tier_size.to_bytes();
+		let large_capacity = large_fast_tier_size.to_bytes();
+		let threshold = size_threshold.to_bytes();
+
+		if small_capacity == 0 || small_capacity > max_size {
+			return Err(CacheError::InvalidFastTierSize);
+		}
+
+		if large_capacity == 0 || large_capacity > max_size {
+			return Err(CacheError::InvalidFastTierSize);
+		}
+
+		let policy = PaperPolicy::LruSizedHybrid;
+		let policies = [policy];
+
+		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		let status = Arc::new(AtomicStatus::new(max_size, &policies, policy)?);
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		status.set_fast_tier_capacity(small_capacity);
+		status.set_lru_sized_hybrid_large_fast_capacity(large_capacity);
+		status.set_lru_sized_hybrid_size_threshold(threshold);
+
+		// Same byte-length-preserving contract `new_hybrid`'s `migrate`
+		// closure documents.
+		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> TieredBuffer + Send + Sync> =
+			Box::new(|buffer, tier| match tier {
+				Tier::Fast => TieredBuffer::new_fast(buffer.as_ref()),
+				Tier::Slow => TieredBuffer::new_slow(buffer.as_ref()),
+			});
+
+		let (worker_sender, worker_listener) = unbounded();
+
+		let (mut worker_manager, mut worker_handles) = WorkerManager::new_with_tier_migration(
+			worker_listener,
+			&objects,
+			&status,
+			&overhead_manager,
+			migrate,
+		)?;
+
+		worker_handles.push(thread::spawn(move || worker_manager.run()));
+
+		let cache = PaperCache {
+			objects,
+			status,
+			worker_manager: Arc::new(worker_sender),
+			worker_handles,
+			overhead_manager,
+			hasher,
+		};
+
+		cache.broadcast(WorkerEvent::ResizeFastTier(small_capacity))?;
+		cache.broadcast(WorkerEvent::ResizeLargeFastTier(large_capacity))?;
+		cache.broadcast(WorkerEvent::ResizeSizeThreshold(threshold))?;
+
+		Ok(cache)
+	}
+
+	/// Returns a point-in-time snapshot of `lru_sized_hybrid_cache` statistics.
+	#[must_use]
+	pub fn lru_sized_hybrid_stats(&self) -> LruSizedHybridStats {
+		ActiveHybridPolicy::stats_from_status(&self.status)
+	}
+
+	/// Runtime-adjusts the LARGE fast segment's byte budget. The SMALL
+	/// segment is adjusted via the shared [`Self::set_fast_tier_size`]
+	/// instead (see this impl block's own doc for why).
+	pub fn set_large_fast_tier_size(&self, size: CacheTierSize) -> Result<(), CacheError> {
+		let bytes = size.to_bytes();
+
+		if bytes == 0 || bytes > self.status.max_size() {
+			return Err(CacheError::InvalidFastTierSize);
+		}
+
+		self.status.set_lru_sized_hybrid_large_fast_capacity(bytes);
+		self.broadcast(WorkerEvent::ResizeLargeFastTier(bytes))?;
+
+		Ok(())
+	}
+
+	/// Returns the LARGE fast segment's current byte budget.
+	#[must_use]
+	pub fn large_fast_tier_size(&self) -> CacheSize {
+		self.status.lru_sized_hybrid_large_fast_capacity()
+	}
+
+	/// Runtime-adjusts the small/large size-classification threshold. Only
+	/// affects future admissions, overwrites, and slow-to-fast promotions --
+	/// already-tracked keys are not retroactively rescanned/reclassified.
+	pub fn set_size_threshold(&self, threshold: CacheTierSize) -> Result<(), CacheError> {
+		let bytes = threshold.to_bytes();
+
+		self.status.set_lru_sized_hybrid_size_threshold(bytes);
+		self.broadcast(WorkerEvent::ResizeSizeThreshold(bytes))?;
+
+		Ok(())
+	}
+
+	/// Returns the current size-classification threshold, in bytes.
+	#[must_use]
+	pub fn size_threshold(&self) -> CacheSize {
+		self.status.lru_sized_hybrid_size_threshold()
+	}
+}
+
 // Tests for global_hashtable_pmem alone (without key_value_pmem)
 #[cfg(all(feature = "global_hashtable_pmem", not(feature = "key_value_pmem")))]
 #[cfg(all(test, feature = "global_hashtable_pmem"))]
@@ -2499,6 +2726,124 @@ mod test_fifo_hybrid_cache {
         // still in the fast tier should stay fast and just work.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"hello", None).expect("set should succeed");
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
+
+        cache.set(1u32, b"hello world", None).expect("overwrite should succeed");
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
+        assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
+    }
+}
+
+/// Exercises the real public `PaperCache<K, TieredBuffer>` API for
+/// `lru_sized_hybrid_cache` end to end. Deliberately stays on the
+/// fast-tier-only path (both fast-segment capacities == max_size, tiny
+/// values) so no object ever demotes -- see `test_lru_hybrid_cache`'s
+/// identical rationale. A full integration test covering demotion/
+/// promotion/eviction across both segments and both tiers belongs in
+/// `tests/lru_sized_hybrid_cache_integration.rs` and should be run on
+/// PMEM-capable hardware.
+#[cfg(all(test, feature = "lru_sized_hybrid_cache"))]
+mod test_lru_sized_hybrid_cache {
+    use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
+
+    #[test]
+    fn basic_construction_and_fast_tier_only_roundtrip() {
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000), // small segment == whole cache
+            CacheTierSize::Bytes(1_000_000), // large segment == whole cache
+            CacheTierSize::Bytes(1_000_000), // threshold huge -> everything classifies small
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"hello world", None).expect("set should succeed");
+        assert!(cache.has(&1u32));
+        assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
+
+        let stats = cache.lru_sized_hybrid_stats();
+        assert_eq!(stats.demotions, 0);
+        assert_eq!(stats.promotions, 0);
+        assert_eq!(stats.evictions, 0);
+
+        assert_eq!(cache.fast_tier_size(), 1_000_000);
+        cache.set_fast_tier_size(CacheTierSize::Bytes(500_000)).expect("resize should succeed");
+        assert_eq!(cache.fast_tier_size(), 500_000);
+
+        assert_eq!(cache.large_fast_tier_size(), 1_000_000);
+        cache.set_large_fast_tier_size(CacheTierSize::Bytes(500_000)).expect("resize should succeed");
+        assert_eq!(cache.large_fast_tier_size(), 500_000);
+
+        assert_eq!(cache.size_threshold(), 1_000_000);
+        cache.set_size_threshold(CacheTierSize::Bytes(4_096)).expect("threshold change should succeed");
+        assert_eq!(cache.size_threshold(), 4_096);
+
+        cache.del(&1u32).expect("del should succeed");
+        assert!(!cache.has(&1u32));
+        assert_eq!(cache.tier_of(&1u32), None);
+    }
+
+    #[test]
+    fn invalid_fast_tier_size_is_rejected() {
+        assert!(matches!(
+            PaperCache::<u32, TieredBuffer>::new(
+                1000, CacheTierSize::Bytes(2000), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
+            ),
+            Err(CacheError::InvalidFastTierSize),
+        ));
+
+        assert!(matches!(
+            PaperCache::<u32, TieredBuffer>::new(
+                1000, CacheTierSize::Bytes(0), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
+            ),
+            Err(CacheError::InvalidFastTierSize),
+        ));
+
+        assert!(matches!(
+            PaperCache::<u32, TieredBuffer>::new(
+                1000, CacheTierSize::Bytes(500), CacheTierSize::Bytes(2000), CacheTierSize::Bytes(100),
+            ),
+            Err(CacheError::InvalidFastTierSize),
+        ));
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1000, CacheTierSize::Bytes(500), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
+        ).expect("cache should construct");
+
+        assert!(matches!(
+            cache.set_fast_tier_size(CacheTierSize::Bytes(2000)),
+            Err(CacheError::InvalidFastTierSize),
+        ));
+
+        assert!(matches!(
+            cache.set_large_fast_tier_size(CacheTierSize::Bytes(2000)),
+            Err(CacheError::InvalidFastTierSize),
+        ));
+    }
+
+    #[test]
+    fn ttl_is_preserved_across_a_set() {
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+            CacheTierSize::Bytes(1_000_000),
+            CacheTierSize::Bytes(1_000_000),
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"value", Some(60)).expect("set should succeed");
+        assert!(cache.ttl(&1u32, Some(120)).is_ok());
+        assert_eq!(cache.get(&1u32).unwrap(), b"value");
+    }
+
+    #[test]
+    fn overwrite_of_a_still_fast_key_stays_fast_and_keeps_working() {
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+            CacheTierSize::Bytes(1_000_000),
             CacheTierSize::Bytes(1_000_000),
         ).expect("cache should construct");
 

@@ -31,6 +31,22 @@ hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"
 sysinfo = "=0.33"
 
+# One-jemalloc-instance, custom-extent-hooks NUMA/CXL arena allocator (see
+# `jemalloc_cxl/README.md`). Backs `EvictionStackAllocator`/
+# `SlowTierJemallocAllocator`/`DramMultiArenaObjects` (src/allocator.rs),
+# all gated on `jemalloc_cxl_slow_tier` below. Previously removed entirely
+# (never proven stable under real concurrent load, see `CLAUDE.md`) and
+# brought back on request as a standalone, available-but-not-the-default
+# mechanism -- `eviction_stacks_pmem` does NOT depend on this; it uses
+# `crate::Hybrid`/`HybridObjects` (UMF/TBB) exclusively, unaffected by
+# whether this dependency/feature is enabled. `default-features = false`
+# disables jemalloc_cxl's own `#[global_allocator]` declaration -- this
+# crate keeps its own (DRAMObjects unless `jemalloc_cxl_slow_tier` is
+# active, see src/lib.rs); jemalloc_cxl's arena/mallctl/mallocx machinery
+# works identically regardless of what's installed as the global allocator,
+# since it always links against the same jemalloc static library.
+jemalloc_cxl = { path = "jemalloc_cxl", optional = true, default-features = false }
+
 
 [features]
 # Core feature to enable key and value storage in PMEM
@@ -61,14 +77,36 @@ hashbrown_dram = []
 # allocated via `crate::Hybrid` (HybridObjects, UMF/TBB, NUMA node 1,
 # src/allocator.rs) -- the same allocator BufferPMEM/other PMEM features
 # already use, so enabling this alone doesn't require any other PMEM
-# feature. Previously routed through a separate jemalloc_cxl-backed
-# `EvictionStackAllocator`; removed (along with jemalloc_cxl entirely) since
-# it was never proven stable under real concurrent load -- see
-# `jemalloc_cxl_slow_tier`'s removal notes in `CLAUDE.md`.
+# feature and does NOT pull in `jemalloc_cxl`. Previously routed through a
+# separate jemalloc_cxl-backed `EvictionStackAllocator` (removed, then
+# brought back gated on `jemalloc_cxl_slow_tier` instead, currently unused
+# by this feature -- see `CLAUDE.md`).
 eviction_stacks_pmem = []
 
 #to emnable 3 tier based data movement
 hashtable_tiering = []
+
+# Alternative backend for the four hybrid-cache features' TieredBuffer: both
+# tiers go through jemalloc, not Hybrid/UMF at all. Fast tier is jemalloc
+# allocation explicitly pinned to NUMA node 0 via this crate's own
+# DramMultiArenaObjects (src/allocator.rs), declared as the
+# #[global_allocator] in place of DRAMObjects (see lib.rs's global-allocator
+# cfg split) -- NOT jemalloc_cxl's own `own_global_allocator` feature, which
+# would install plain, NUMA-oblivious jemalloc instead (left off, matching
+# jemalloc_cxl's `default-features = false` above). Slow tier is
+# jemalloc_cxl's custom-extent-hooks NUMA/CXL arena (SlowTierJemallocAllocator,
+# src/allocator.rs). Also re-enables EvictionStackAllocator (src/allocator.rs)
+# as an available allocator, though nothing currently wires it into
+# eviction_stacks_pmem's six call sites -- see that feature's own comment.
+# One jemalloc instance for both tiers -- UMF/Hybrid stays linked (still a
+# dependency of the hybrid features via key_value_pmem) but is never
+# actually called in this configuration.
+#
+# Never proven stable under real concurrent load across three separate
+# retests (see `CLAUDE.md`'s UMF-jemalloc-pool and jemalloc_cxl_slow_tier
+# retest history) -- opt-in only, not the default, and not to be trusted
+# under real concurrent load without re-running the actual benchmark first.
+jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl"]
 
 # Tiering with both key and value in PMEM.
 # Activates the tiering manager (hot objects are copied to DRAM for fast access)
@@ -104,7 +142,8 @@ multitiering = ["key_pmem_value_pmem", "enable_tiering_manager", "hashtable_tier
 # feature flags, and this feature only needs to migrate *value* bytes between
 # tiers, not force the key into PMEM.
 #
-# Mutually exclusive with `lfu_hybrid_cache` below: both define their own
+# Mutually exclusive with `lfu_hybrid_cache`/`two_q_hybrid_cache`/
+# `fifo_hybrid_cache`/`lru_sized_hybrid_cache` below: all define their own
 # inherent-method impl block on the identical PaperCache<K, TieredBuffer, S>
 # type (see lib.rs's compile_error! guard).
 lru_hybrid_cache = ["key_value_pmem"]
@@ -116,7 +155,8 @@ lru_hybrid_cache = ["key_value_pmem"]
 # has the algorithm). Same dependency reasoning as `lru_hybrid_cache`: only
 # needs `key_value_pmem`, not `key_pmem_value_pmem`.
 #
-# Mutually exclusive with `lru_hybrid_cache` above.
+# Mutually exclusive with `lru_hybrid_cache`/`two_q_hybrid_cache`/
+# `fifo_hybrid_cache`/`lru_sized_hybrid_cache`.
 lfu_hybrid_cache = ["key_value_pmem"]
 
 # Single-instance, segmented-2Q hybrid cache: same one-PaperCache<K,
@@ -129,7 +169,8 @@ lfu_hybrid_cache = ["key_value_pmem"]
 # dependency reasoning as the other two hybrids: only needs `key_value_pmem`,
 # not `key_pmem_value_pmem`.
 #
-# Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache` above.
+# Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
+# `fifo_hybrid_cache`/`lru_sized_hybrid_cache`.
 two_q_hybrid_cache = ["key_value_pmem"]
 
 # Single-instance, segmented-FIFO hybrid cache: same one-PaperCache<K,
@@ -144,18 +185,43 @@ two_q_hybrid_cache = ["key_value_pmem"]
 # `key_pmem_value_pmem`.
 #
 # Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
-# `two_q_hybrid_cache` above.
+# `two_q_hybrid_cache`/`lru_sized_hybrid_cache`.
 fifo_hybrid_cache = ["key_value_pmem"]
 
+# Single-instance, segmented-LRU hybrid cache with a size-split fast AND slow
+# tier: same one-PaperCache<K, TieredBuffer> architecture and LRU
+# admission/promotion/demotion/eviction semantics as `lru_hybrid_cache`, but
+# both the fast (DRAM) tier's and the slow (PMEM) tier's *bookkeeping* are
+# each split into two independently-tracked segments ("small"/"large") by a
+# runtime-configurable byte threshold on each object's size -- see
+# `lru_sized_hybrid_cache` module docs
+# (worker/policy/policy_stack/lru_sized_hybrid_stack.rs has the algorithm).
+# Still exactly 1 physical DRAM allocator path and 1 physical PMEM allocator
+# path (`Tier` stays 2 variants, `TieredBuffer` is unchanged) -- the split is
+# purely which of four internal recency lists a key is tracked in. Only the
+# two fast segments have independently configurable capacities; the two slow
+# lists carry no capacity of their own and stay governed by the overall
+# `max_size` terminal-eviction trigger, exactly like the single slow tier in
+# `lru_hybrid_cache` today.
+#
+# Same dependency reasoning as the other four hybrids: only needs
+# `key_value_pmem`, not `key_pmem_value_pmem`.
+#
+# Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
+# `two_q_hybrid_cache`/`fifo_hybrid_cache` above.
+lru_sized_hybrid_cache = ["key_value_pmem"]
 
 
-# jemalloc_cxl_slow_tier (an alternate, jemalloc_cxl-backed allocator for
-# TieredBuffer's slow tier) and eviction_stacks_pmem's own former
-# jemalloc_cxl-backed EvictionStackAllocator were both removed, along with
-# the jemalloc_cxl crate itself -- never proven stable under real concurrent
-# load (see the removal notes in `CLAUDE.md`). DRAMObjects+HybridObjects
-# (TBB/UMF) is the only allocator pairing this crate uses now, for every
-# feature, including eviction_stacks_pmem.
+
+# jemalloc_cxl_slow_tier is NOT on by default. It (and eviction_stacks_pmem's
+# own former jemalloc_cxl-backed EvictionStackAllocator) was removed once
+# already -- never proven stable under real concurrent load across three
+# separate retests (see `CLAUDE.md`'s UMF-jemalloc-pool and
+# jemalloc_cxl_slow_tier retest history) -- and has been brought back on
+# request as a standalone, available-but-opt-in mechanism, not as a change
+# to the default. DRAMObjects+HybridObjects (TBB/UMF) remains the default
+# allocator pairing this crate uses for every feature, including
+# eviction_stacks_pmem, unless `jemalloc_cxl_slow_tier` is explicitly enabled.
 default = []
 
 
