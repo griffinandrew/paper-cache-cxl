@@ -262,9 +262,9 @@ pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 pub type BufferPMEM = Box<[u8], Hybrid>;
 
 
-//#[cfg(feature = "all_dram")]
-//#[global_allocator]
-//static GLOBAL: allocator::HybridObjects = allocator::HybridObjects;
+#[cfg(feature = "all_dram")]
+#[global_allocator]
+static GLOBAL: tikv::jemallocator::Jemalloc = tikv::jemallocator::Jemalloc;
 
 //pub mod allocator;
 
@@ -297,7 +297,7 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 // (SlowTierJemallocAllocator, src/allocator.rs) -- one jemalloc instance
 // for both tiers, UMF/Hybrid entirely out of the picture, rather than
 // mixing the two allocator stacks.
-#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
+#[cfg(not(feature = "jemalloc_cxl_slow_tier"), not(feature = "all_dram"))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 
