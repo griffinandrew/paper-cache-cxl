@@ -31,17 +31,6 @@ hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"
 sysinfo = "=0.33"
 
-# One-jemalloc-instance, custom-extent-hooks NUMA/CXL arena allocator (see
-# `jemalloc_cxl/README.md`) -- backs `EvictionStackAllocator` (src/allocator.rs),
-# used only for eviction-stack metadata (PmemHashList/PmemVecList/EntryMap,
-# see worker/policy/policy_stack/pmem_collections.rs) under `eviction_stacks_pmem`.
-# `default-features = false` disables jemalloc_cxl's own `#[global_allocator]`
-# declaration -- this crate keeps its own (DRAMObjects, see src/lib.rs);
-# jemalloc_cxl's arena/mallctl/mallocx
-# machinery works identically regardless of what's installed as the global
-# allocator, since it always links against the same jemalloc static library.
-jemalloc_cxl = { path = "jemalloc_cxl", optional = true, default-features = false }
-
 
 [features]
 # Core feature to enable key and value storage in PMEM
@@ -69,25 +58,14 @@ hashbrown_dram = []
 
 # Enable PMEM-backed eviction stacks. Eviction-stack metadata
 # (PmemHashList/PmemVecList/EntryMap in worker/policy/policy_stack/) is
-# allocated via EvictionStackAllocator (src/allocator.rs), backed by
-# jemalloc_cxl's custom-extent-hooks NUMA/CXL arena mechanism -- independent
-# of `crate::Hybrid` (the UMF-based allocator backing BufferPMEM/other PMEM
-# features), so enabling this alone doesn't require any other PMEM feature.
-eviction_stacks_pmem = ["dep:jemalloc_cxl"]
-
-# Alternative backend for the four hybrid-cache features' TieredBuffer: both
-# tiers go through jemalloc, not Hybrid/UMF at all. Fast tier is jemalloc
-# allocation explicitly pinned to NUMA node 0 via this crate's own
-# DramMultiArenaObjects (src/allocator.rs), declared as the
-# #[global_allocator] in place of DRAMObjects (see lib.rs's global-allocator
-# cfg split) -- NOT jemalloc_cxl's own `own_global_allocator` feature, which
-# would install plain, NUMA-oblivious jemalloc instead (left off, matching
-# jemalloc_cxl's `default-features = false` above). Slow tier is
-# jemalloc_cxl's custom-extent-hooks NUMA/CXL arena (SlowTierJemallocAllocator,
-# src/allocator.rs). One jemalloc instance for both tiers -- UMF/Hybrid
-# stays linked (still a dependency of the hybrid features via key_value_pmem)
-# but is never actually called in this configuration.
-jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl"]
+# allocated via `crate::Hybrid` (HybridObjects, UMF/TBB, NUMA node 1,
+# src/allocator.rs) -- the same allocator BufferPMEM/other PMEM features
+# already use, so enabling this alone doesn't require any other PMEM
+# feature. Previously routed through a separate jemalloc_cxl-backed
+# `EvictionStackAllocator`; removed (along with jemalloc_cxl entirely) since
+# it was never proven stable under real concurrent load -- see
+# `jemalloc_cxl_slow_tier`'s removal notes in `CLAUDE.md`.
+eviction_stacks_pmem = []
 
 #to emnable 3 tier based data movement
 hashtable_tiering = []
@@ -171,28 +149,14 @@ fifo_hybrid_cache = ["key_value_pmem"]
 
 
 
-# jemalloc_cxl_slow_tier is NOT on by default (reverted). Its original
-# SIGSEGV-under-concurrent-load bug (jemalloc's own extent-coalescing code
-# corrupted via TcacheMode::Automatic's tcache/multi-arena interaction --
-# see DramMultiArenaObjects's doc comment in allocator.rs) is fixed, and
-# stays fixed (no more crashes, at any concurrency tested). But a real
-# concurrency ceiling remains even with that fix plus paper-benchmark-cxl's
-# own Stats pre-sizing/merge fixes applied: standard_web.bin at
-# --cache-max-size 24G / 4G fast tier reproducibly aborts with a clean
-# allocation-failure (not a crash) at -c5 and above, no matter the fast-tier
-# size tried (2/3/4/8 arenas all made no difference either). Head-to-head
-# confirmed directly, identical trace/config/-c8: DRAMObjects+HybridObjects
-# (UMF/TBB) completed 100% (GET avg 7,468ns, SET avg 7,986ns);
-# DramMultiArenaObjects+SlowTierJemallocAllocator (jemalloc_cxl) failed at
-# 79%. TBB/UMF remains the only pair proven stable at this concurrency, so
-# it's the default again (two separate pool instances, one per NUMA node --
-# DRAMObjects for the fast tier, HybridObjects for the slow tier -- the same
-# shape this crate has used throughout, not a regression). Explicitly opt in
-# via `--features jemalloc_cxl_slow_tier` to keep exercising/improving it.
+# jemalloc_cxl_slow_tier (an alternate, jemalloc_cxl-backed allocator for
+# TieredBuffer's slow tier) and eviction_stacks_pmem's own former
+# jemalloc_cxl-backed EvictionStackAllocator were both removed, along with
+# the jemalloc_cxl crate itself -- never proven stable under real concurrent
+# load (see the removal notes in `CLAUDE.md`). DRAMObjects+HybridObjects
+# (TBB/UMF) is the only allocator pairing this crate uses now, for every
+# feature, including eviction_stacks_pmem.
 default = []
-
-# Legacy features (deprecated, will be removed)
-original = []
 
 
 [build-dependencies]

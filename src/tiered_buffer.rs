@@ -34,46 +34,36 @@
 //! is a direct consequence of that: "ordinary heap allocation" and "the fast
 //! tier" are the same thing once the global allocator is installed.
 //!
-//! `Slow` has two selectable backends, chosen at compile time:
+//! `Slow` is `Box<[u8], Hybrid>` — the crate-wide PMEM allocator alias
+//! (`Hybrid` = `HybridObjects`, `src/allocator.rs`), the same UMF +
+//! Intel TBB scalable-pool allocator every other PMEM feature
+//! (`key_value_pmem`, `global_hashtable_pmem`, ...) already uses. A prior
+//! session tried replacing this with a standalone `tier_allocator` crate
+//! (a from-scratch, runtime-parameterized reimplementation of "one UMF/TBB
+//! pool per NUMA node") on the theory that sharing one registry between the
+//! fast and slow tier's pools would be an improvement over two separate,
+//! independent allocator types. It wasn't: `tier_allocator`'s own registry
+//! still constructed one pool per node (`DRAMObjects`-equivalent for node 0,
+//! `HybridObjects`-equivalent for node 1) -- structurally identical to what
+//! `DRAMObjects`+`HybridObjects` already provided, just reimplemented in a
+//! second crate. Removed entirely; `Slow` reverted to plain `Box<[u8],
+//! Hybrid>`.
 //!
-//! - **Default**: `Box<[u8], Hybrid>` — the crate-wide PMEM allocator alias
-//!   (`Hybrid` = `HybridObjects`, `src/allocator.rs`), the same UMF +
-//!   Intel TBB scalable-pool allocator every other PMEM feature
-//!   (`key_value_pmem`, `global_hashtable_pmem`, ...) already uses. A prior
-//!   session tried replacing this with a standalone `tier_allocator` crate
-//!   (a from-scratch, runtime-parameterized reimplementation of "one UMF/TBB
-//!   pool per NUMA node") on the theory that sharing one registry between the
-//!   fast and slow tier's pools would be an improvement over two separate,
-//!   independent allocator types. It wasn't: `tier_allocator`'s own registry
-//!   still constructed one pool per node (`DRAMObjects`-equivalent for node 0,
-//!   `HybridObjects`-equivalent for node 1) -- structurally identical to what
-//!   `DRAMObjects`+`HybridObjects` already provided, just reimplemented in a
-//!   second crate. Removed entirely; `Slow` reverted to plain `Box<[u8],
-//!   Hybrid>`.
-//! - **`jemalloc_cxl_slow_tier` feature**: `Box<[u8], allocator::
-//!   SlowTierJemallocAllocator>` — jemalloc_cxl's custom-extent-hooks
-//!   NUMA/CXL arena mechanism. This feature also switches `Fast`'s global
-//!   allocator to plain jemalloc (via jemalloc_cxl's own `#[global_allocator]`
-//!   declaration, enabled through its `own_global_allocator` feature -- see
-//!   `lib.rs`) -- so **both** tiers go through jemalloc in this
-//!   configuration, and `Hybrid`/UMF is never actually called at all,
-//!   deliberately, not just for the slow tier. Measured (single-threaded and
-//!   under real concurrent stress) to be slower per-call single-threaded but
-//!   faster in aggregate under concurrent multi-thread load, and to place
-//!   data correctly on the target NUMA node under that same concurrent load
-//!   (verified via `/proc/self/numa_maps`, not merely assumed). See
-//!   `jemalloc_cxl/README.md` for the underlying mechanism.
+//! A later, separate `jemalloc_cxl_slow_tier` feature offered an alternate
+//! backend (`Box<[u8], allocator::SlowTierJemallocAllocator>`, jemalloc_cxl's
+//! custom-extent-hooks NUMA/CXL arena) that also switched `Fast`'s global
+//! allocator to jemalloc, so both tiers went through jemalloc and `Hybrid`/
+//! UMF was never called at all. Removed: its underlying `jemalloc_cxl` crate
+//! was never proven stable under real concurrent load (see the UMF-jemalloc
+//! and jemalloc_cxl_slow_tier retest history in `CLAUDE.md`), and it never
+//! became the default, opt-in-only path this crate actually ran.
 //!
 //! `new_fast`/`new_slow`/`is_fast`/`is_slow`/`AsRef<[u8]>`/`TypeSize`/
-//! `Clone` keep the same signatures regardless of which slow-tier backend
-//! is selected, so no other file in this crate needs to change either way.
+//! `Clone` have one implementation now that only `Hybrid` backs `Slow`.
 
 use typesize::TypeSize;
 
 use crate::Hybrid;
-
-#[cfg(feature = "jemalloc_cxl_slow_tier")]
-use crate::allocator::SlowTierJemallocAllocator;
 
 /// A value buffer that is physically stored in exactly one tier at a time.
 pub enum TieredBuffer {
@@ -81,12 +71,8 @@ pub enum TieredBuffer {
 	/// global allocator.
 	Fast(Box<[u8]>),
 
-	/// Slow tier: PMEM/CXL allocation. Backend selected at compile time --
-	/// see the module doc comment above.
-	#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
+	/// Slow tier: PMEM/CXL allocation via `Hybrid` (UMF/TBB, NUMA node 1).
 	Slow(Box<[u8], Hybrid>),
-	#[cfg(feature = "jemalloc_cxl_slow_tier")]
-	Slow(Box<[u8], SlowTierJemallocAllocator>),
 }
 
 impl TieredBuffer {
@@ -96,26 +82,8 @@ impl TieredBuffer {
 	}
 
 	/// Creates a new slow-tier (PMEM/CXL) buffer by copying the given bytes.
-	#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
 	pub fn new_slow(bytes: &[u8]) -> Self {
 		TieredBuffer::Slow(Box::clone_from_ref_in(bytes, Hybrid))
-	}
-
-	/// Creates a new slow-tier (PMEM/CXL) buffer by copying the given bytes,
-	/// via jemalloc_cxl's custom-extent-hooks arena instead of `Hybrid`.
-	#[cfg(feature = "jemalloc_cxl_slow_tier")]
-	pub fn new_slow(bytes: &[u8]) -> Self {
-		let mut buffer = Box::<[u8], _>::new_uninit_slice_in(bytes.len(), SlowTierJemallocAllocator);
-
-		// SAFETY: `buffer` was just allocated with exactly `bytes.len()`
-		// elements; `MaybeUninit<u8>` has the same layout as `u8`, so
-		// writing `bytes.len()` bytes into it via a raw copy and then
-		// calling `assume_init()` is exactly equivalent to initializing
-		// each element individually.
-		unsafe {
-			std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.as_mut_ptr().cast::<u8>(), bytes.len());
-			TieredBuffer::Slow(buffer.assume_init())
-		}
 	}
 
 	/// Returns `true` if this buffer currently lives in the fast (DRAM) tier.
@@ -130,34 +98,10 @@ impl TieredBuffer {
 }
 
 impl Clone for TieredBuffer {
-	#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
 	fn clone(&self) -> Self {
 		match self {
 			TieredBuffer::Fast(buffer) => TieredBuffer::Fast(buffer.clone()),
 			TieredBuffer::Slow(buffer) => TieredBuffer::Slow(buffer.clone()),
-		}
-	}
-
-	#[cfg(feature = "jemalloc_cxl_slow_tier")]
-	fn clone(&self) -> Self {
-		match self {
-			TieredBuffer::Fast(buffer) => TieredBuffer::Fast(buffer.clone()),
-
-			TieredBuffer::Slow(buffer) => {
-				let mut new_buffer =
-					Box::<[u8], _>::new_uninit_slice_in(buffer.len(), SlowTierJemallocAllocator);
-
-				// SAFETY: same reasoning as `new_slow` above -- `new_buffer`
-				// has exactly `buffer.len()` elements, freshly allocated.
-				unsafe {
-					std::ptr::copy_nonoverlapping(
-						buffer.as_ptr(),
-						new_buffer.as_mut_ptr().cast::<u8>(),
-						buffer.len(),
-					);
-					TieredBuffer::Slow(new_buffer.assume_init())
-				}
-			}
 		}
 	}
 }

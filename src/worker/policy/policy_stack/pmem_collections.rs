@@ -17,18 +17,18 @@
 //! These implementations use a Vec-based architecture for simpler memory management
 //! and reduced risk of segfaults compared to HashMap-based approaches.
 //!
-//! Allocator: `Hybrid` here is `crate::allocator::EvictionStackAllocator`
-//! (jemalloc_cxl's custom-extent-hooks NUMA/CXL arena mechanism), not
-//! `crate::Hybrid` (the UMF-based allocator backing `BufferPMEM` and the
-//! other PMEM features) -- eviction-stack metadata is a separate, much
-//! smaller allocation workload routed through its own dedicated jemalloc
-//! arena. Kept under the same local `Hybrid` name throughout this file
-//! purely to minimize the diff against every call site below; it is a
-//! genuinely different type from the crate-level `Hybrid` alias.
+//! Allocator: `Hybrid` here is the same crate-wide `crate::Hybrid` alias
+//! (`HybridObjects`, UMF/TBB, NUMA node 1) that `BufferPMEM` and the other
+//! PMEM features already use -- eviction-stack metadata (a separate, much
+//! smaller allocation workload than full object byte buffers) previously
+//! routed through its own dedicated jemalloc_cxl arena
+//! (`EvictionStackAllocator`), removed for depending on an allocator with no
+//! stability track record under real concurrent load (see
+//! `jemalloc_cxl_slow_tier`'s removal notes in `CLAUDE.md`).
 
 use hashbrown::HashMap;
 use std::hash::{Hash, BuildHasher};
-use crate::allocator::EvictionStackAllocator as Hybrid;
+use crate::Hybrid;
 
 // Use allocator-api2's Vec which works on stable Rust
 use allocator_api2::vec::Vec;

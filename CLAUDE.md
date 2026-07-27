@@ -1906,3 +1906,85 @@ and four untouched-feature regression builds (`key_value_pmem`, `all_dram`, `evi
 pass at their previously-documented baselines, now genuinely exercising `Hybrid`/`HybridObjects`
 (this sandbox's real UMF pool + memory-only NUMA node) rather than `tier_allocator`'s reimplementation
 of the same thing.
+
+## Removed the deprecated `original` Cargo feature
+
+A standalone `original = []` feature, marked `# Legacy features (deprecated, will be removed)` in
+`Cargo.toml`, gated a pre-generics-unification `impl<K, V, S> PaperCache<K, V, S>` block (generic
+over any `V: TypeSize + Clone`, `lib.rs`) plus one gated import and one `#[cfg(all(test, feature =
+"original"))]` test module. Checked whether it was safe to delete rather than assuming: not pulled
+in by `all_dram`, any hybrid-cache feature, or anything else (nothing else's feature list named
+it); combined with any real storage feature (e.g. `all_dram`) it failed to compile outright with 16
+duplicate-definition errors (`E0592`/`E0034`) against the generics-unification work already done to
+`PaperCache`'s other `impl` blocks; built alone it also failed (`E0433`, since this crate has never
+supported a bare/no-storage-feature build). No external consumer either -- `paper-benchmark-cxl` has
+its own unrelated `original = []` feature in its own `Cargo.toml` but nothing in its `src/` gates on
+`feature = "original"`. Removed the feature, the impl block, the gated import, and the test module.
+Verified: `all_dram`/`key_value_pmem`/all four hybrid-cache features still build and pass their
+`--lib` suites at documented baselines (83/91/91/92/92) unchanged.
+
+## Migrated `eviction_stacks_pmem` off jemalloc_cxl onto `Hybrid`/`HybridObjects`; removed jemalloc_cxl and `jemalloc_cxl_slow_tier` entirely
+
+Per a user question ("is eviction_stacks_pmem now using TBB with NUMA node 1 instead of the
+jemalloc extent hooks") that turned out to have the wrong premise -- checked directly rather than
+assuming either way: `eviction_stacks_pmem` still depended on `jemalloc_cxl` (`Cargo.toml`'s
+`eviction_stacks_pmem = ["dep:jemalloc_cxl"]`) and its metadata allocator, `EvictionStackAllocator`
+(`src/allocator.rs`), was still built entirely on `jemalloc_cxl::{CxlAllocator, CxlArena,
+TcacheMode}` -- nothing had switched it to TBB. Flagged the distinction the user's follow-up request
+("delete the jemalloc extent hooks directory, it's not stable") glossed over: the *documented*
+instability (three confirmed crashes, see the `umfJemallocPoolOps()` sections above) is specifically
+about UMF's own built-in jemalloc pool backend -- a different mechanism from this repo's own
+`jemalloc_cxl` crate (a custom-extent-hooks NUMA/CXL arena allocator). `jemalloc_cxl_slow_tier`
+(the other feature depending on the same crate) had its own, different, already-fixed SIGSEGV
+history, and its only remaining documented issue is a concurrency ceiling (a clean allocation-
+failure abort at high client counts, not a crash) -- which is why it stayed opt-in, not evidence it
+"can't be used." `eviction_stacks_pmem`'s own use of the crate had no documented instability at all.
+Surfaced this before deleting anything, since removing the crate outright would have broken
+`eviction_stacks_pmem` (its only allocator, no fallback) as a side effect, not just
+`jemalloc_cxl_slow_tier`. Given three options (cancel; remove both features + the crate; migrate
+`eviction_stacks_pmem` to TBB then delete), the user chose the migration.
+
+`HybridObjects` (`src/allocator.rs`, UMF/TBB, NUMA node 1 -- the same allocator that already backs
+`BufferPMEM`/every other PMEM feature) already implements `allocator_api2::alloc::Allocator` gated
+under `any(feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature =
+"eviction_stacks_pmem")` -- the exact trait `EvictionStackAllocator` implemented for
+`PmemHashList`/`PmemVecList`/the per-stack `EntryMap`s (`worker/policy/policy_stack/
+pmem_collections.rs` and five call sites: `lru_hybrid_stack.rs`, `lfu_hybrid_stack.rs`,
+`two_q_hybrid_stack.rs`, `fifo_hybrid_stack.rs`, `lfu_stack.rs`) to consume. So no new allocator
+code was needed: each of those six files' `use crate::allocator::EvictionStackAllocator as Hybrid;`
+became `use crate::Hybrid;` (the crate-level alias, already `HybridObjects`) -- eviction-stack
+metadata now allocates through the exact same UMF/TBB pool `BufferPMEM` uses, not a second,
+independent one. (Coincidentally, `lru_stack.rs`'s existing comment already claimed `PmemHashList`
+"routes allocations through `HybridObjects`" -- that was aspirational/wrong before this change,
+since `pmem_collections.rs` actually used `EvictionStackAllocator`/jemalloc_cxl at the time; it's
+accurate now.)
+
+With `eviction_stacks_pmem` no longer needing `jemalloc_cxl` at all, and `jemalloc_cxl_slow_tier`
+(the crate's only other consumer) carrying the same never-fully-proven-safe-under-load status as
+the UMF jemalloc pool investigations above, removed `jemalloc_cxl` entirely rather than leaving it
+half-used: the `eviction_stack_allocator`, `slow_tier_jemalloc_allocator`, `dram_multi_arena`
+(`DramMultiArenaObjects`, the `jemalloc_cxl_slow_tier` `#[global_allocator]`), and the
+`numa_arena_pool` helper they all shared (dead once its only two consumers were gone) --
+`src/allocator.rs`'s lines 691-1423, its entire back half -- were deleted outright. `tiered_buffer.rs`'s
+`jemalloc_cxl_slow_tier` branch of `TieredBuffer::Slow`/`new_slow`/`Clone` was removed, leaving
+`Slow(Box<[u8], Hybrid>)` as the only shape (matching every other PMEM feature). `lib.rs`'s
+`#[global_allocator]` selection collapsed back to unconditionally `DRAMObjects` (the
+`jemalloc_cxl_slow_tier`-gated `DramMultiArenaObjects` arm removed), and `jemalloc_cxl_slow_tier`
+was dropped from the `#![cfg_attr(...)]` nightly-feature gate and the `mod allocator` gate (which
+still includes `eviction_stacks_pmem`, still needed for `Hybrid`'s `allocator_api2::alloc::Allocator`
+impl). `Cargo.toml`: removed the `jemalloc_cxl` path dependency, removed the `jemalloc_cxl_slow_tier`
+feature entirely, and changed `eviction_stacks_pmem = ["dep:jemalloc_cxl"]` to `eviction_stacks_pmem
+= []`. Deleted the `jemalloc_cxl/` crate directory itself (confirmed fully committed, no
+uncommitted changes, before deleting).
+
+Verified: `eviction_stacks_pmem` alone and combined with each of the four hybrid-cache features
+builds clean and passes its `--lib` suite (91/101/101/102/102 -- the +10 over each hybrid's
+non-`eviction_stacks_pmem` baseline is `eviction_stacks_pmem`'s own additional PMEM-stack test
+coverage, unaffected by the allocator swap); all four hybrid-cache real-PMEM integration suites
+combined with `eviction_stacks_pmem` pass at their documented baselines unchanged (15/15+2 ignored
+lru, 19/19 lfu, 18/18 two_q, 14/14 fifo) -- genuinely exercising `HybridObjects` under real PMEM
+load via `PmemHashList`/`PmemVecList`, not just the bare-stack unit tests. `cargo build --features
+jemalloc_cxl_slow_tier` now correctly reports "the package 'paper-cache' does not contain this
+feature." `all_dram`/`key_value_pmem`/`global_hashtable_pmem`/`hashbrown_dram`/`tiering`/
+`multitiering` regression builds all still build clean. `Cargo.lock` no longer references
+`jemalloc_cxl`.
