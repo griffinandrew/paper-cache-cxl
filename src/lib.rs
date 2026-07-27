@@ -297,7 +297,7 @@ static GLOBAL: tikv::jemallocator::Jemalloc = tikv::jemallocator::Jemalloc;
 // (SlowTierJemallocAllocator, src/allocator.rs) -- one jemalloc instance
 // for both tiers, UMF/Hybrid entirely out of the picture, rather than
 // mixing the two allocator stacks.
-#[cfg(not(feature = "jemalloc_cxl_slow_tier"), not(feature = "all_dram"))]
+#[cfg(all(not(feature = "jemalloc_cxl_slow_tier"), not(feature = "all_dram")))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 
