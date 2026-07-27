@@ -264,8 +264,7 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 
 #[cfg(feature = "all_dram")]
 #[global_allocator]
-static GLOBAL: Jemalloc = tikv::jemallocator::Jemalloc;
-
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 //pub mod allocator;
 
 // DRAMObjects (NUMA node 0, src/allocator.rs) is the crate's global
