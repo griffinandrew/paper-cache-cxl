@@ -316,7 +316,10 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 // default, and do not trust it under real concurrent load without
 // re-running the actual benchmark (not just this crate's own test suite)
 // to confirm, per that retest history.
-#[cfg(not(feature = "jemalloc_cxl_slow_tier"), not(feature = "all_dram"))]
+#[cfg(all(
+    not(feature = "jemalloc_cxl_slow_tier"),
+    not(feature = "all_dram")
+))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 
