@@ -324,9 +324,10 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 
 #[cfg(feature = "all_dram")]
-static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+//static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 
-#static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+//static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(feature = "jemalloc_cxl_slow_tier")]
 #[global_allocator]
