@@ -318,7 +318,8 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 // to confirm, per that retest history.
 #[cfg(all(
     not(feature = "jemalloc_cxl_slow_tier"),
-    not(feature = "all_dram")
+    not(feature = "all_dram"),
+	not(feature = "hashbrown_dram"),
 ))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
@@ -326,6 +327,10 @@ static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 #[cfg(feature = "all_dram")]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 //static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
+
+#[cfg(feature = "hashbrown_dram")]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 
 //static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
