@@ -108,6 +108,18 @@ hashtable_tiering = []
 # under real concurrent load without re-running the actual benchmark first.
 jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl"]
 
+# Swaps DRAMObjects (the default fast-tier/general-purpose global allocator,
+# UMF/TBB on NUMA node 0) for plain tikv-jemallocator -- no UMF, no custom
+# extent hooks, just jemalloc via its own well-tested Rust bindings (already
+# an unconditional dependency above). Distinct from `jemalloc_cxl_slow_tier`
+# (a custom NUMA-extent-hooks arena) and from the UMF jemalloc *pool*
+# backend (separately retested three times and found unsafe under real
+# concurrent load, see CLAUDE.md) -- mutually exclusive with
+# `jemalloc_cxl_slow_tier` (see the compile_error! guard in lib.rs), since
+# both install a #[global_allocator]. The slow tier is unaffected --
+# `Hybrid`/`HybridObjects` (UMF/TBB, NUMA node 1) is untouched.
+tikv_jemalloc_global = []
+
 # Tiering with both key and value in PMEM.
 # Activates the tiering manager (hot objects are copied to DRAM for fast access)
 # while placing *both* the key and the value in persistent memory via the Hybrid

@@ -73,9 +73,11 @@ impl crate::hybrid_policy::HybridPolicy for LfuHybridPolicy {
 	fn admission_tier<K>(
 		hashed_key: crate::HashedKey,
 		status: &crate::status::AtomicStatus,
-		objects: &std::sync::Arc<crate::hybrid_policy::HybridObjectMap<K>>,
+		objects: &crate::hybrid_policy::HybridObjectMap<K>,
 	) -> crate::Tier {
-		let is_new = !objects.contains_key(&hashed_key);
+		use crate::object_store::ObjectStore;
+
+		let is_new = objects.get_ref(&hashed_key).is_none();
 
 		if is_new && status.lfu_hybrid_admission_latched() {
 			crate::Tier::Slow

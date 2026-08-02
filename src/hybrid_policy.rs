@@ -21,22 +21,20 @@
 //! method's name; one admission-rule branch inside `set()`; and
 //! `two_q_hybrid_cache`'s extra `k_in: f64` constructor parameter.
 
-use std::sync::Arc;
-
-use dashmap::DashMap;
-
-use crate::{HashedKey, NoHasher, Tier};
+use crate::{HashedKey, ObjectMapRef, Tier};
 use crate::status::AtomicStatus;
-use crate::object::Object;
 use crate::policy::PaperPolicy;
 use crate::tiered_buffer::TieredBuffer;
 
-/// The object map type every hybrid-cache design uses -- always a plain
-/// DRAM-resident `DashMap` (none of the four features interact with
-/// `global_hashtable_pmem`/`hashbrown_dram`), so `admission_tier` can name
-/// it concretely rather than going through the `ObjectStore` abstraction
-/// built for the non-hybrid storage matrix.
-pub type HybridObjectMap<K> = DashMap<HashedKey, Object<K, TieredBuffer>, NoHasher>;
+/// The object map type every hybrid-cache design uses. Resolves to whatever
+/// `ObjectMapRef<K, TieredBuffer>` resolves to crate-wide -- a plain
+/// `DashMap` by default, or the `hashbrown_dram`-selected
+/// `RwLock<HashMap<..., Global>>` shape when that feature is enabled --
+/// rather than always hardcoding `DashMap` regardless of the active
+/// storage-backend feature. `admission_tier` implementations go through the
+/// `ObjectStore` abstraction (see `crate::object_store`) so they work
+/// unchanged against either shape.
+pub type HybridObjectMap<K> = ObjectMapRef<K, TieredBuffer>;
 
 /// The behavior that varies between the four hybrid-cache designs; see
 /// each design's own module doc comment for the full paper-derived
@@ -72,6 +70,6 @@ pub trait HybridPolicy {
 	fn admission_tier<K>(
 		hashed_key: HashedKey,
 		status: &AtomicStatus,
-		objects: &Arc<HybridObjectMap<K>>,
+		objects: &HybridObjectMap<K>,
 	) -> Tier;
 }

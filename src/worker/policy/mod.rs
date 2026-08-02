@@ -24,6 +24,9 @@ use crossbeam_channel::{Sender, Receiver, unbounded};
 use log::{info, warn, error};
 use kwik::fmt;
 
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
+use crate::object_store::ObjectStore;
+
 use crate::{
 	CacheSize,
 	HashedKey,
@@ -543,7 +546,7 @@ where
 				let status = &self.status;
 
 				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					if let Some(mut object) = objects.get_mut(&key) {
+					if let Some(mut object) = objects.get_mut_ref(&key) {
 						let new_data = migrate(&object.data(), tier);
 						object.set_data(new_data);
 					}
@@ -628,7 +631,7 @@ where
 				let status = &self.status;
 
 				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					if let Some(mut object) = objects.get_mut(&key) {
+					if let Some(mut object) = objects.get_mut_ref(&key) {
 						let new_data = migrate(&object.data(), tier);
 						object.set_data(new_data);
 					}
@@ -687,7 +690,7 @@ where
 				let status = &self.status;
 
 				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					if let Some(mut object) = objects.get_mut(&key) {
+					if let Some(mut object) = objects.get_mut_ref(&key) {
 						let new_data = migrate(&object.data(), tier);
 						object.set_data(new_data);
 					}
@@ -746,7 +749,7 @@ where
 				let status = &self.status;
 
 				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					if let Some(mut object) = objects.get_mut(&key) {
+					if let Some(mut object) = objects.get_mut_ref(&key) {
 						let new_data = migrate(&object.data(), tier);
 						object.set_data(new_data);
 					}
@@ -805,7 +808,7 @@ where
 				let status = &self.status;
 
 				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					if let Some(mut object) = objects.get_mut(&key) {
+					if let Some(mut object) = objects.get_mut_ref(&key) {
 						let new_data = migrate(&object.data(), tier);
 						object.set_data(new_data);
 					}
@@ -1109,8 +1112,6 @@ where
 mod lru_hybrid_tests {
 	use super::*;
 
-	use dashmap::DashMap;
-
 	use crate::{
 		NoHasher,
 		object::Object,
@@ -1156,7 +1157,7 @@ mod lru_hybrid_tests {
 		let (_tx, rx) = unbounded::<WorkerEvent>();
 
 		let objects: ObjectMapRef<u32, TestBuffer> =
-			Arc::new(DashMap::with_hasher(NoHasher::default()));
+			crate::new_hybrid_object_map();
 
 		let status = Arc::new(
 			AtomicStatus::new(max_size, &[PaperPolicy::LruHybrid], PaperPolicy::LruHybrid).unwrap(),
@@ -1260,7 +1261,7 @@ mod lru_hybrid_tests {
 
 		// The demoted key's bytes were physically replaced by `migrate`
 		// with the Slow-tagged version.
-		let data = objects.get(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().data();
 		assert_eq!(data.last(), Some(&0x50));
 	}
 
@@ -1290,7 +1291,7 @@ mod lru_hybrid_tests {
 		assert_eq!(snapshot.promotions, 1);
 		assert_eq!(snapshot.demotions, 2);
 
-		let data_1 = objects.get(&1).unwrap().data();
+		let data_1 = objects.get_ref(&1).unwrap().data();
 		assert_eq!(data_1.last(), Some(&0xFA));
 	}
 
@@ -1322,7 +1323,7 @@ mod lru_hybrid_tests {
 		// its policy stack may still be LruHybrid via `init_policy_stack`.
 		let (_tx, rx) = unbounded::<WorkerEvent>();
 		let objects: ObjectMapRef<u32, TestBuffer> =
-			Arc::new(DashMap::with_hasher(NoHasher::default()));
+			crate::new_hybrid_object_map();
 		let status = Arc::new(
 			AtomicStatus::new(100, &[PaperPolicy::LruHybrid], PaperPolicy::LruHybrid).unwrap(),
 		);
@@ -1346,8 +1347,6 @@ mod lru_hybrid_tests {
 #[cfg(all(test, feature = "lfu_hybrid_cache"))]
 mod lfu_hybrid_tests {
 	use super::*;
-
-	use dashmap::DashMap;
 
 	use crate::{
 		NoHasher,
@@ -1381,7 +1380,7 @@ mod lfu_hybrid_tests {
 		let (_tx, rx) = unbounded::<WorkerEvent>();
 
 		let objects: ObjectMapRef<u32, TestBuffer> =
-			Arc::new(DashMap::with_hasher(NoHasher::default()));
+			crate::new_hybrid_object_map();
 
 		let status = Arc::new(
 			AtomicStatus::new(max_size, &[PaperPolicy::LfuHybrid], PaperPolicy::LfuHybrid).unwrap(),
@@ -1466,7 +1465,7 @@ mod lfu_hybrid_tests {
 
 		// Key 2's bytes were physically built as Slow via the migration;
 		// key 1 was never migrated (correctly Fast from the start).
-		let data_2 = objects.get(&2).unwrap().data();
+		let data_2 = objects.get_ref(&2).unwrap().data();
 		assert_eq!(data_2.last(), Some(&0x50));
 	}
 
@@ -1502,10 +1501,10 @@ mod lfu_hybrid_tests {
 		assert_eq!(snapshot.promotions, 1);
 		assert_eq!(snapshot.demotions, 1);
 
-		let data_3 = objects.get(&3).unwrap().data();
+		let data_3 = objects.get_ref(&3).unwrap().data();
 		assert_eq!(data_3.last(), Some(&0xFA));
 
-		let data_2 = objects.get(&2).unwrap().data();
+		let data_2 = objects.get_ref(&2).unwrap().data();
 		assert_eq!(data_2.last(), Some(&0x50));
 	}
 
@@ -1536,7 +1535,7 @@ mod lfu_hybrid_tests {
 		// its policy stack may still be LfuHybrid via `init_policy_stack`.
 		let (_tx, rx) = unbounded::<WorkerEvent>();
 		let objects: ObjectMapRef<u32, TestBuffer> =
-			Arc::new(DashMap::with_hasher(NoHasher::default()));
+			crate::new_hybrid_object_map();
 		let status = Arc::new(
 			AtomicStatus::new(100, &[PaperPolicy::LfuHybrid], PaperPolicy::LfuHybrid).unwrap(),
 		);
@@ -1560,8 +1559,6 @@ mod lfu_hybrid_tests {
 #[cfg(all(test, feature = "fifo_hybrid_cache"))]
 mod fifo_hybrid_tests {
 	use super::*;
-
-	use dashmap::DashMap;
 
 	use crate::{
 		NoHasher,
@@ -1589,7 +1586,7 @@ mod fifo_hybrid_tests {
 		let (_tx, rx) = unbounded::<WorkerEvent>();
 
 		let objects: ObjectMapRef<u32, TestBuffer> =
-			Arc::new(DashMap::with_hasher(NoHasher::default()));
+			crate::new_hybrid_object_map();
 
 		let status = Arc::new(
 			AtomicStatus::new(max_size, &[PaperPolicy::FifoHybrid], PaperPolicy::FifoHybrid).unwrap(),
@@ -1667,7 +1664,7 @@ mod fifo_hybrid_tests {
 
 		// The demoted key's bytes were physically replaced by `migrate`
 		// with the Slow-tagged version.
-		let data = objects.get(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().data();
 		assert_eq!(data.last(), Some(&0x50));
 	}
 
@@ -1698,7 +1695,7 @@ mod fifo_hybrid_tests {
 		assert_eq!(snapshot_after.slow_objects, snapshot_before.slow_objects);
 
 		// Bytes are still tagged Slow -- never re-migrated back to Fast.
-		let data_1 = objects.get(&1).unwrap().data();
+		let data_1 = objects.get_ref(&1).unwrap().data();
 		assert_eq!(data_1.last(), Some(&0x50));
 	}
 
@@ -1729,7 +1726,7 @@ mod fifo_hybrid_tests {
 		// its policy stack may still be FifoHybrid via `init_policy_stack`.
 		let (_tx, rx) = unbounded::<WorkerEvent>();
 		let objects: ObjectMapRef<u32, TestBuffer> =
-			Arc::new(DashMap::with_hasher(NoHasher::default()));
+			crate::new_hybrid_object_map();
 		let status = Arc::new(
 			AtomicStatus::new(100, &[PaperPolicy::FifoHybrid], PaperPolicy::FifoHybrid).unwrap(),
 		);
@@ -1754,8 +1751,6 @@ mod fifo_hybrid_tests {
 mod two_q_hybrid_tests {
 	use super::*;
 
-	use dashmap::DashMap;
-
 	use crate::{
 		NoHasher,
 		object::Object,
@@ -1778,7 +1773,7 @@ mod two_q_hybrid_tests {
 		let (_tx, rx) = unbounded::<WorkerEvent>();
 
 		let objects: ObjectMapRef<u32, TestBuffer> =
-			Arc::new(DashMap::with_hasher(NoHasher::default()));
+			crate::new_hybrid_object_map();
 
 		let policy = PaperPolicy::TwoQHybrid(1.0);
 		let status = Arc::new(
@@ -1851,7 +1846,7 @@ mod two_q_hybrid_tests {
 		let snapshot = status.two_q_hybrid_stats();
 		assert_eq!(snapshot.promotions, 0);
 
-		let data = objects.get(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().data();
 		assert_eq!(data.last(), Some(&0u8)); // untouched: admission builds no migration
 
 		// Accessing the FIFO key promotes it straight to Main/Fast.
@@ -1862,7 +1857,7 @@ mod two_q_hybrid_tests {
 		assert_eq!(snapshot.promotions, 1);
 		assert_eq!(snapshot.fast_objects, 1);
 
-		let data = objects.get(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().data();
 		assert_eq!(data.last(), Some(&0xFA));
 	}
 
@@ -1888,7 +1883,7 @@ mod two_q_hybrid_tests {
 		assert_eq!(snapshot.promotions, 2);
 		assert_eq!(snapshot.demotions, 1);
 
-		let data_2 = objects.get(&2).unwrap().data();
+		let data_2 = objects.get_ref(&2).unwrap().data();
 		assert_eq!(data_2.last(), Some(&0xFA));
 	}
 
@@ -1912,7 +1907,7 @@ mod two_q_hybrid_tests {
 	fn no_migration_fn_is_a_safe_no_op() {
 		let (_tx, rx) = unbounded::<WorkerEvent>();
 		let objects: ObjectMapRef<u32, TestBuffer> =
-			Arc::new(DashMap::with_hasher(NoHasher::default()));
+			crate::new_hybrid_object_map();
 
 		let policy = PaperPolicy::TwoQHybrid(1.0);
 		let status = Arc::new(
@@ -1938,8 +1933,6 @@ mod two_q_hybrid_tests {
 #[cfg(all(test, feature = "lru_sized_hybrid_cache"))]
 mod lru_sized_hybrid_tests {
 	use super::*;
-
-	use dashmap::DashMap;
 
 	use crate::{
 		NoHasher,
@@ -1974,7 +1967,7 @@ mod lru_sized_hybrid_tests {
 		let (_tx, rx) = unbounded::<WorkerEvent>();
 
 		let objects: ObjectMapRef<u32, TestBuffer> =
-			Arc::new(DashMap::with_hasher(NoHasher::default()));
+			crate::new_hybrid_object_map();
 
 		let status = Arc::new(
 			AtomicStatus::new(max_size, &[PaperPolicy::LruSizedHybrid], PaperPolicy::LruSizedHybrid).unwrap(),
@@ -2061,7 +2054,7 @@ mod lru_sized_hybrid_tests {
 		assert_eq!(snapshot.large_fast_objects, 0);
 		assert_eq!(snapshot.large_slow_objects, 0);
 
-		let data = objects.get(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().data();
 		assert_eq!(data.last(), Some(&0x50));
 	}
 
@@ -2086,7 +2079,7 @@ mod lru_sized_hybrid_tests {
 		assert_eq!(snapshot.promotions, 1);
 		assert_eq!(snapshot.demotions, 2);
 
-		let data_1 = objects.get(&1).unwrap().data();
+		let data_1 = objects.get_ref(&1).unwrap().data();
 		assert_eq!(data_1.last(), Some(&0xFA));
 	}
 
@@ -2110,7 +2103,7 @@ mod lru_sized_hybrid_tests {
 	fn no_migration_fn_is_a_safe_no_op() {
 		let (_tx, rx) = unbounded::<WorkerEvent>();
 		let objects: ObjectMapRef<u32, TestBuffer> =
-			Arc::new(DashMap::with_hasher(NoHasher::default()));
+			crate::new_hybrid_object_map();
 		let status = Arc::new(
 			AtomicStatus::new(100, &[PaperPolicy::LruSizedHybrid], PaperPolicy::LruSizedHybrid).unwrap(),
 		);

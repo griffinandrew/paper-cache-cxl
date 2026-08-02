@@ -48,13 +48,11 @@ compile_error!("Cannot enable both 'lru_sized_hybrid_cache' and 'fifo_hybrid_cac
 #[cfg(all(feature = "hashbrown_dram", feature = "global_hashtable_pmem"))]
 compile_error!("Cannot enable both 'hashbrown_dram' and 'global_hashtable_pmem' features simultaneously. Please choose only one global hashtable mode.");
 
-// When all_dram is enabled, use jemalloc as the global allocator
-//#[cfg(feature = "all_dram")]
-//use tikv_jemallocator::Jemalloc;
+#[cfg(all(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global"))]
+compile_error!("Cannot enable both 'jemalloc_cxl_slow_tier' and 'tikv_jemalloc_global' simultaneously -- both install a #[global_allocator], and only one static GLOBAL can be declared.");
 
-//#[cfg(feature = "all_dram")]
-//#[global_allocator]
-//static GLOBAL: Jemalloc = Jemalloc;
+#[cfg(feature = "tikv_jemalloc_global")]
+use tikv_jemallocator::Jemalloc;
 
 
 #[cfg(any(feature = "hashbrown_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "all_dram", feature = "jemalloc_cxl_slow_tier"))]
@@ -316,13 +314,30 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 // default, and do not trust it under real concurrent load without
 // re-running the actual benchmark (not just this crate's own test suite)
 // to confirm, per that retest history.
-#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
+#[cfg(not(any(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global")))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 
 #[cfg(feature = "jemalloc_cxl_slow_tier")]
 #[global_allocator]
 static GLOBAL: allocator::DramMultiArenaObjects = allocator::DramMultiArenaObjects;
+
+// Swaps ONLY the fast-tier/general-purpose global allocator (DRAMObjects,
+// NUMA node 0, UMF/TBB) for the plain, off-the-shelf tikv-jemallocator
+// binding -- unlike `jemalloc_cxl_slow_tier` (a custom NUMA-extent-hooks
+// jemalloc arena) or the UMF jemalloc *pool* backend (umfJemallocPoolOps,
+// separately retested three times and found unsafe under real concurrent
+// load -- see CLAUDE.md), this is plain jemalloc via its own well-tested
+// Rust bindings, with no UMF or custom-extent-hooks machinery involved at
+// all. No NUMA pinning is applied explicitly; since every CPU on this
+// machine's topology is on node 0 (node 1 is memory-only), the kernel's
+// default local-allocation policy still lands these pages on node 0 in
+// practice. The slow tier is untouched -- `Hybrid`/`HybridObjects`
+// (UMF/TBB, NUMA node 1) still backs `TieredBuffer::Slow` regardless of
+// which allocator this static resolves to.
+#[cfg(feature = "tikv_jemalloc_global")]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[cfg(not(feature = "all_dram"))]
 use std::alloc::{Layout, Allocator}; // Essential imports
@@ -411,8 +426,14 @@ impl<K, V, S> Drop for PaperCache<K, V, S> {
 // concrete V); the value-buffer axis and the tiering-manager machinery
 // below (V-agnostic: `TieringManager<K, V>` is itself generic) are the only
 // things that used to force separate blocks.
+//
+// Excludes `hashbrown_dram` (in addition to `global_hashtable_pmem`) to
+// stay disjoint from Shape B below, mirroring `ObjectMapRef`'s own DashMap
+// arm gate exactly -- without this, `hashbrown_dram` combined with
+// `all_dram`/`key_value_pmem` would compile both this block and Shape B
+// for the same `V: ValueBuffer`, a duplicate-inherent-impl error.
 // ---------------------------------------------------------------------
-#[cfg(any(feature = "all_dram", all(feature = "key_value_pmem", not(feature = "global_hashtable_pmem"))))]
+#[cfg(any(all(feature = "all_dram", not(feature = "hashbrown_dram")), all(feature = "key_value_pmem", not(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram")))))]
 impl<K, V, S> PaperCache<K, V, S>
 where
 	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
@@ -1510,6 +1531,28 @@ unsafe impl<K, V, S> Send for PaperCache<K, V, S> {}
 // is exposed, so sharing a `&PaperCache` across threads is safe.
 unsafe impl<K, V, S> Sync for PaperCache<K, V, S> {}
 
+/// Builds the object map every hybrid-cache design (`lru_hybrid_cache`/
+/// `lfu_hybrid_cache`/`two_q_hybrid_cache`/`fifo_hybrid_cache`/
+/// `lru_sized_hybrid_cache`) stores its objects in -- mirrors Shape B's
+/// `with_hasher` (see above) rather than hardcoding `DashMap`, so
+/// `hashbrown_dram` gets the same plain-DRAM `hashbrown::HashMap` object
+/// table it already gives the non-hybrid storage combos, instead of always
+/// silently using `DashMap` regardless of that feature. The return type
+/// (`ObjectMapRef<K, V>`) is picked by the same cfg that already selects it
+/// crate-wide -- this just has to build a matching value.
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
+fn new_hybrid_object_map<K, V>() -> ObjectMapRef<K, V> {
+	#[cfg(feature = "hashbrown_dram")]
+	{
+		Arc::new(RwLock::new(HashMap::with_hasher(NoHasher::default())))
+	}
+
+	#[cfg(not(feature = "hashbrown_dram"))]
+	{
+		Arc::new(DashMap::with_hasher(NoHasher::default()))
+	}
+}
+
 /// Shared engine behind every hybrid-cache feature's own inherent methods
 /// (`new`/`with_hasher`/`get`/`set`/.../the `{name}_hybrid_stats()`
 /// accessor). Confirmed via direct diff that the four original per-feature
@@ -1554,7 +1597,7 @@ where
 		let policy = ActiveHybridPolicy::seed_policy(extra);
 		let policies = [policy];
 
-		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		let objects = new_hybrid_object_map();
 		let status = Arc::new(AtomicStatus::new(max_size, &policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
@@ -1617,7 +1660,7 @@ where
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		let result = match self.objects.get(&hashed_key) {
+		let result = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => {
 				self.status.incr_hits();
 				let arc_val = object.data();
@@ -1711,7 +1754,7 @@ where
 		let hashed_key = self.hash_key(key);
 
 		self.objects
-			.get(&hashed_key)
+			.get_ref(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
 	}
 
@@ -1722,7 +1765,7 @@ where
 	pub fn peek(&self, key: &K) -> Result<Arc<TieredBuffer>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		match self.objects.get(&hashed_key) {
+		match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
 				Ok(object.data()),
 
@@ -1735,7 +1778,7 @@ where
 	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		let mut object = match self.objects.get_mut(&hashed_key) {
+		let mut object = match self.objects.get_mut_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() => object,
 			_ => return Err(CacheError::KeyNotFound),
 		};
@@ -1759,7 +1802,7 @@ where
 	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		match self.objects.get(&hashed_key) {
+		match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
 				Ok(self.overhead_manager.total_size(&object)),
 
@@ -1843,7 +1886,7 @@ where
 	pub fn tier_of(&self, key: &K) -> Option<Tier> {
 		let hashed_key = self.hash_key(key);
 
-		self.objects.get(&hashed_key).and_then(|object| {
+		self.objects.get_ref(&hashed_key).and_then(|object| {
 			if !object.key_matches(key) || object.is_expired() {
 				return None;
 			}
@@ -2204,7 +2247,7 @@ where
 		let policy = PaperPolicy::LruSizedHybrid;
 		let policies = [policy];
 
-		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+		let objects = new_hybrid_object_map();
 		let status = Arc::new(AtomicStatus::new(max_size, &policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 

@@ -64,9 +64,11 @@ impl crate::hybrid_policy::HybridPolicy for FifoHybridPolicy {
 	fn admission_tier<K>(
 		hashed_key: crate::HashedKey,
 		_status: &crate::status::AtomicStatus,
-		objects: &std::sync::Arc<crate::hybrid_policy::HybridObjectMap<K>>,
+		objects: &crate::hybrid_policy::HybridObjectMap<K>,
 	) -> crate::Tier {
-		let existing_tier = objects.get(&hashed_key)
+		use crate::object_store::ObjectStore;
+
+		let existing_tier = objects.get_ref(&hashed_key)
 			.map(|object| if object.data().is_fast() { crate::Tier::Fast } else { crate::Tier::Slow });
 
 		match existing_tier {

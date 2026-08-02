@@ -74,7 +74,7 @@ impl crate::hybrid_policy::HybridPolicy for TwoQHybridPolicy {
 	fn admission_tier<K>(
 		_hashed_key: crate::HashedKey,
 		_status: &crate::status::AtomicStatus,
-		_objects: &std::sync::Arc<crate::hybrid_policy::HybridObjectMap<K>>,
+		_objects: &crate::hybrid_policy::HybridObjectMap<K>,
 	) -> crate::Tier {
 		crate::Tier::Slow
 	}
