@@ -347,6 +347,15 @@ use std::alloc::{Layout, Allocator}; // Essential imports
 pub type BufferDRAM = Box<[u8]>;
 
 
+/// Initial capacity (in entries) for the hashbrown-backed object map used
+/// by `hashbrown_dram`, `global_hashtable_pmem`, and any hybrid-cache
+/// feature combined with `hashbrown_dram` (see `new_hybrid_object_map`).
+/// Sized to hold every object across this project's real benchmark traces
+/// (`/home/griff/final_traces/*.bin`, distinct GET-driven keys measured at
+/// ~1.06M-1.09M per trace) without ever growing/rehashing mid-benchmark.
+#[cfg(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
+const HASHBROWN_INITIAL_CAPACITY: usize = 1_500_000;
+
 #[cfg(all(not(feature = "global_hashtable_pmem"), not(feature = "hashbrown_dram")))]
 pub type ObjectMapRef<K, V> = Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>;
 
@@ -1127,13 +1136,15 @@ where
 		// `global_hashtable_pmem` is on; otherwise a plain-DRAM hashbrown
 		// table (`hashbrown_dram`'s default allocator).
 		#[cfg(feature = "global_hashtable_pmem")]
-		let objects = Arc::new(RwLock::new(HashMap::with_hasher_in(
+		let objects = Arc::new(RwLock::new(HashMap::with_capacity_and_hasher_in(
+			HASHBROWN_INITIAL_CAPACITY,
 			NoHasher::default(),
 			Hybrid,
 		)));
 
 		#[cfg(not(feature = "global_hashtable_pmem"))]
-		let objects = Arc::new(RwLock::new(HashMap::with_hasher(
+		let objects = Arc::new(RwLock::new(HashMap::with_capacity_and_hasher(
+			HASHBROWN_INITIAL_CAPACITY,
 			NoHasher::default(),
 		)));
 
@@ -1544,7 +1555,10 @@ unsafe impl<K, V, S> Sync for PaperCache<K, V, S> {}
 fn new_hybrid_object_map<K, V>() -> ObjectMapRef<K, V> {
 	#[cfg(feature = "hashbrown_dram")]
 	{
-		Arc::new(RwLock::new(HashMap::with_hasher(NoHasher::default())))
+		Arc::new(RwLock::new(HashMap::with_capacity_and_hasher(
+			HASHBROWN_INITIAL_CAPACITY,
+			NoHasher::default(),
+		)))
 	}
 
 	#[cfg(not(feature = "hashbrown_dram"))]
