@@ -19,6 +19,7 @@ mod lfu_hybrid_stack;
 mod two_q_hybrid_stack;
 mod fifo_hybrid_stack;
 mod lru_sized_hybrid_stack;
+mod s3_fifo_hybrid_stack;
 
 #[cfg(feature = "eviction_stacks_pmem")] mod pmem_collections;
 
@@ -42,6 +43,7 @@ use crate::{
 		two_q_hybrid_stack::TwoQHybridStack,
 		fifo_hybrid_stack::FifoHybridStack,
 		lru_sized_hybrid_stack::LruSizedHybridStack,
+		s3_fifo_hybrid_stack::S3FifoHybridStack,
 	},
 };
 
@@ -321,6 +323,19 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 			(max_size as f64 * 0.1) as CacheSize,
 			(max_size as f64 * 0.1) as CacheSize,
 			4_096,
+		)),
+
+		// `ratio` comes from the policy string itself (same as plain
+		// `SThreeFifo`/`TwoQHybrid`); the fast-tier budget still
+		// defaults to 20% of max_size, same override mechanism as the
+		// other hybrids -- immediately overridden by the caller's real
+		// CacheTierSize via `new_hybrid`'s `ResizeFastTier` broadcast, same
+		// as every other hybrid design. No `with_shared_overhead`
+		// reservation for now, matching `TwoQHybrid`'s precedent above
+		// (same admission shape: always slow, no ambiguity to reserve
+		// against yet).
+		PaperPolicy::S3FifoHybrid(ratio) => Box::new(S3FifoHybridStack::new(
+			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
 		)),
 	}
 }

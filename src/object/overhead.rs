@@ -138,6 +138,17 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// (SizedEntry { queue: SizeQueue, size: ObjectSize }), 1 byte for
 		// the SizeQueue tag, 4 bytes for the object size.
 		PaperPolicy::LruSizedHybrid => 48 + 8 + 24 + 1 + 4,
+
+		// Structurally identical to TwoQHybrid's charge (same shape: a
+		// one-access queue + a segmented main FIFO queue, one combined
+		// per-key `entries` HashMap entry — see `S3FifoHybridStack`'s
+		// module doc): 48 bytes for the HashList entry, 8 bytes for the
+		// HashedKey, 24 bytes for the combined entry, 1 byte for the Queue
+		// tag, 1 byte for the Option<Tier> tag (only meaningful for keys
+		// currently in Main), 4 bytes for the object size, plus 1 more byte
+		// than TwoQHybrid for the `accessed: bool` reference bit (only
+		// meaningful for keys currently in Main — see that field's doc).
+		PaperPolicy::S3FifoHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
 	}
 }
 

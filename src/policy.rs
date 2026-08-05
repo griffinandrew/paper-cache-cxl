@@ -34,6 +34,7 @@ pub enum PaperPolicy {
 	TwoQHybrid(f64),
 	FifoHybrid,
 	LruSizedHybrid,
+	S3FifoHybrid(f64),
 }
 
 impl PaperPolicy {
@@ -60,6 +61,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::TwoQHybrid(k_in) => write!(f, "2q-hybrid-{k_in}"),
 			PaperPolicy::FifoHybrid => write!(f, "fifo-hybrid"),
 			PaperPolicy::LruSizedHybrid => write!(f, "lru-sized-hybrid"),
+			PaperPolicy::S3FifoHybrid(ratio) => write!(f, "s3-fifo-hybrid-{ratio}"),
 		}
 	}
 }
@@ -79,6 +81,7 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("2q-hybrid-") => parse_two_q_hybrid(value)?,
 			value if value.starts_with("2q-") => parse_two_q(value)?,
 			"arc" => PaperPolicy::Arc,
+			value if value.starts_with("s3-fifo-hybrid-") => parse_s_three_fifo_hybrid(value)?,
 			value if value.starts_with("s3-fifo-") => parse_s_three_fifo(value)?,
 			"lru-hybrid" => PaperPolicy::LruHybrid,
 			"lfu-hybrid" => PaperPolicy::LfuHybrid,
@@ -189,6 +192,27 @@ fn parse_s_three_fifo(value: &str) -> Result<PaperPolicy, CacheError> {
 	Ok(PaperPolicy::SThreeFifo(ratio))
 }
 
+fn parse_s_three_fifo_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "s3-fifo-hybrid-"
+	let tokens = value[15..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(ratio) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&ratio) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::S3FifoHybrid(ratio))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -272,5 +296,26 @@ mod tests {
 			"lru-hybrid".parse::<PaperPolicy>().unwrap(),
 			"lru-sized-hybrid".parse::<PaperPolicy>().unwrap(),
 		);
+	}
+
+	#[test]
+	fn s3_fifo_hybrid_round_trips_through_display_and_from_str() {
+		assert_eq!(PaperPolicy::S3FifoHybrid(0.1).to_string(), "s3-fifo-hybrid-0.1");
+		assert_eq!("s3-fifo-hybrid-0.1".parse::<PaperPolicy>(), Ok(PaperPolicy::S3FifoHybrid(0.1)));
+	}
+
+	#[test]
+	fn s3_fifo_hybrid_does_not_collide_with_parameterized_s3_fifo() {
+		assert_eq!("s3-fifo-0.1".parse::<PaperPolicy>(), Ok(PaperPolicy::SThreeFifo(0.1)));
+		assert_eq!("s3-fifo-hybrid-0.1".parse::<PaperPolicy>(), Ok(PaperPolicy::S3FifoHybrid(0.1)));
+		assert_ne!(
+			"s3-fifo-0.1".parse::<PaperPolicy>().unwrap(),
+			"s3-fifo-hybrid-0.1".parse::<PaperPolicy>().unwrap(),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_hybrid_rejects_out_of_range_ratio() {
+		assert_eq!("s3-fifo-hybrid-1.5".parse::<PaperPolicy>(), Err(CacheError::InvalidPolicy));
 	}
 }
