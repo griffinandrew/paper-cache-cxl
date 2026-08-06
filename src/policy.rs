@@ -39,6 +39,7 @@ pub enum PaperPolicy {
 	S3FifoGhostHybrid(f64),
 	S3FifoGhostLazyDemotionHybrid(f64),
 	S3FifoGhostLazyDemotionFastAdmissionHybrid(f64),
+	S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(f64),
 }
 
 impl PaperPolicy {
@@ -70,6 +71,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::S3FifoGhostHybrid(ratio) => write!(f, "s3-fifo-ghost-hybrid-{ratio}"),
 			PaperPolicy::S3FifoGhostLazyDemotionHybrid(ratio) => write!(f, "s3-fifo-ghost-lazy-demotion-hybrid-{ratio}"),
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ratio) => write!(f, "s3-fifo-ghost-lazy-demotion-fast-admission-hybrid-{ratio}"),
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(ratio) => write!(f, "s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-{ratio}"),
 		}
 	}
 }
@@ -90,6 +92,7 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("2q-hybrid-") => parse_two_q_hybrid(value)?,
 			value if value.starts_with("2q-") => parse_two_q(value)?,
 			"arc" => PaperPolicy::Arc,
+			value if value.starts_with("s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-") => parse_s_three_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid(value)?,
 			value if value.starts_with("s3-fifo-ghost-lazy-demotion-fast-admission-hybrid-") => parse_s_three_fifo_ghost_lazy_demotion_fast_admission_hybrid(value)?,
 			value if value.starts_with("s3-fifo-ghost-lazy-demotion-hybrid-") => parse_s_three_fifo_ghost_lazy_demotion_hybrid(value)?,
 			value if value.starts_with("s3-fifo-ghost-hybrid-") => parse_s_three_fifo_ghost_hybrid(value)?,
@@ -307,6 +310,27 @@ fn parse_s_three_fifo_ghost_lazy_demotion_fast_admission_hybrid(value: &str) -> 
 	}
 
 	Ok(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ratio))
+}
+
+fn parse_s_three_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-"
+	let tokens = value[59..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(ratio) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&ratio) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(ratio))
 }
 
 #[cfg(test)]
@@ -529,6 +553,44 @@ mod tests {
 	fn s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_rejects_out_of_range_ratio() {
 		assert_eq!(
 			"s3-fifo-ghost-lazy-demotion-fast-admission-hybrid-1.5".parse::<PaperPolicy>(),
+			Err(CacheError::InvalidPolicy),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_round_trips_through_display_and_from_str() {
+		assert_eq!(
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(0.1).to_string(),
+			"s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-0.1",
+		);
+		assert_eq!(
+			"s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(0.1)),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_does_not_collide_with_fast_admission_hybrid_or_others() {
+		assert_eq!("s3-fifo-0.1".parse::<PaperPolicy>(), Ok(PaperPolicy::SThreeFifo(0.1)));
+		assert_eq!("s3-fifo-hybrid-0.1".parse::<PaperPolicy>(), Ok(PaperPolicy::S3FifoHybrid(0.1)));
+		assert_eq!(
+			"s3-fifo-ghost-lazy-demotion-fast-admission-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(0.1)),
+		);
+		assert_eq!(
+			"s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(0.1)),
+		);
+		assert_ne!(
+			"s3-fifo-ghost-lazy-demotion-fast-admission-hybrid-0.1".parse::<PaperPolicy>().unwrap(),
+			"s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-0.1".parse::<PaperPolicy>().unwrap(),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_rejects_out_of_range_ratio() {
+		assert_eq!(
+			"s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-1.5".parse::<PaperPolicy>(),
 			Err(CacheError::InvalidPolicy),
 		);
 	}

@@ -173,6 +173,13 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// tier is a placement/accounting change, not a bookkeeping-shape
 		// change.
 		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+
+
+		// Identical entry shape to S3FifoGhostLazyDemotionFastAdmissionHybrid
+		// (same S3FifoEntry fields) -- the midpoint cursor is a
+		// stack-level field (like main_boundary), not a per-object one, so
+		// it doesn't change this per-tracked-object charge.
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
 	}
 }
 

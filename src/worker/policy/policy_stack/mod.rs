@@ -24,6 +24,7 @@ mod two_q_ghost_hybrid_stack;
 mod s3_fifo_ghost_hybrid_stack;
 mod s3_fifo_ghost_lazy_demotion_hybrid_stack;
 mod s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack;
+mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack;
 
 #[cfg(feature = "eviction_stacks_pmem")] mod pmem_collections;
 
@@ -52,6 +53,7 @@ use crate::{
 		s3_fifo_ghost_hybrid_stack::S3FifoGhostHybridStack,
 		s3_fifo_ghost_lazy_demotion_hybrid_stack::S3FifoGhostLazyDemotionHybridStack,
 		s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionHybridStack,
+		s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack,
 	},
 };
 
@@ -371,6 +373,15 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// one-access queue now competes with the main queue's fast segment
 		// for the same fast_capacity).
 		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ratio) => Box::new(S3FifoGhostLazyDemotionFastAdmissionHybridStack::new(
+			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
+		)),
+
+		// Same construction/default-fast-tier-budget shape as
+		// S3FifoGhostLazyDemotionFastAdmissionHybrid above -- see
+		// s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack.rs's
+		// module doc for the mid-slow-segment reference-bit checkpoint this
+		// adds on top.
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(ratio) => Box::new(S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack::new(
 			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
 		)),
 	}

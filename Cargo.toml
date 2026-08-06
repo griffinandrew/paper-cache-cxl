@@ -285,6 +285,19 @@ s3_fifo_ghost_lazy_demotion_hybrid_cache = ["key_value_pmem"]
 # Mutually exclusive with every other hybrid-cache feature above.
 s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache = ["key_value_pmem"]
 
+# `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` plus one more
+# addition: a checkpoint roughly halfway through the SLOW portion of the
+# main queue gives a reaccessed object an early second chance instead of
+# making it wait until it reaches the eviction tail. Locating "the middle"
+# uses an O(1)-amortized incrementally-maintained cursor, not an O(n) scan
+# -- see `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache`
+# module docs
+# (worker/policy/policy_stack/s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack.rs
+# has the full mechanics).
+#
+# Mutually exclusive with every other hybrid-cache feature above.
+s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache = ["key_value_pmem"]
+
 
 
 # jemalloc_cxl_slow_tier is NOT on by default. It (and eviction_stacks_pmem's
