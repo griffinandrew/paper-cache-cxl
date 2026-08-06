@@ -1,0 +1,421 @@
+/*
+ * Copyright (c) Kia Shakiba
+ *
+ * This source code is licensed under the GNU AGPLv3 license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! Integration tests for the `s3_fifo_ghost_lazy_demotion_hybrid_cache`
+//! feature.
+//!
+//! Run with nightly (required for `allocator_api` via `key_value_pmem`):
+//!   cargo +nightly test --test s3_fifo_ghost_lazy_demotion_hybrid_cache_integration --features s3_fifo_ghost_lazy_demotion_hybrid_cache
+//!
+//! Same one-`PaperCache<K, TieredBuffer>` architecture, ghost-queue
+//! lifecycle, and eviction-time second-chance mechanic as
+//! `s3_fifo_ghost_hybrid_cache` — see that feature's integration test file
+//! for the shared coverage; this file mirrors it end to end and adds one
+//! test specific to the new behavior: a demotion-time reference-bit gate
+//! (`an_accessed_fast_boundary_key_is_reprieved_at_demotion_time_instead_of_the_newcomer`).
+
+#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
+mod s3_fifo_ghost_lazy_demotion_hybrid_cache_tests {
+    use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
+
+    fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if predicate() {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn ensure_pmem_allocator_warm() {
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), 1.0)
+            .expect("warm-up cache should construct");
+
+        cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
+        assert_eq!(cache.tier_of(&0u32), Some(Tier::Slow));
+    }
+
+    const MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn admission_always_lands_in_slow_tier() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+            1.0,
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"hello world", None).expect("set should succeed");
+
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
+        assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn reaccessing_a_one_access_key_promotes_it_eagerly_to_fast_tier() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+            1.0,
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"hello world", None).expect("set should succeed");
+        cache.get(&1u32).expect("get should succeed");
+
+        let promoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast));
+        assert!(promoted, "key should have promoted to the fast tier after a re-access");
+
+        let stats = cache.s3_fifo_ghost_lazy_demotion_hybrid_stats();
+        assert!(stats.promotions >= 1);
+    }
+
+    // ── ghost queue: unchanged from s3_fifo_ghost_hybrid_cache ─────────────
+
+    #[test]
+    fn a_key_that_ages_out_and_is_readmitted_lands_directly_in_fast_tier() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+            0.00004, // one_access_capacity = 40 bytes, fits one ~15-byte value
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"first value 123", None).expect("set should succeed");
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
+
+        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+
+        let evicted = wait_until(MIGRATION_TIMEOUT, || !cache.has(&1u32));
+        assert!(evicted, "key 1 should have aged out of the one-access queue");
+
+        cache.set(1u32, b"first value 123", None).expect("re-set should succeed");
+
+        let promoted_directly = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast));
+        assert!(
+            promoted_directly,
+            "a ghost-queue hit on re-admission should land directly in the fast tier, \
+             got tier {:?}",
+            cache.tier_of(&1u32),
+        );
+        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
+    }
+
+    #[test]
+    fn a_key_with_no_ghost_history_still_lands_in_the_one_access_queue_slow() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+            1.0,
+        ).expect("cache should construct");
+
+        cache.set(9u32, b"brand new value", None).expect("set should succeed");
+
+        assert_eq!(cache.tier_of(&9u32), Some(Tier::Slow));
+        assert_eq!(cache.get(&9u32).unwrap(), b"brand new value");
+    }
+
+    // ── main-queue behavior (unaffected by the ghost queue) ────────────────
+
+    #[test]
+    fn a_plain_access_on_a_fast_main_queue_key_does_not_migrate_or_reorder() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+            1.0,
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"first value 123", None).expect("set should succeed");
+        cache.get(&1u32).expect("get should succeed");
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
+
+        let promotions_before = cache.s3_fifo_ghost_lazy_demotion_hybrid_stats().promotions;
+
+        cache.get(&1u32).expect("get should succeed");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
+        assert_eq!(cache.s3_fifo_ghost_lazy_demotion_hybrid_stats().promotions, promotions_before);
+    }
+
+    #[test]
+    fn an_accessed_key_at_the_main_queue_tail_gets_a_second_chance_instead_of_eviction() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(40),
+            1.0,
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
+        cache.get(&1u32).expect("get should succeed");
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
+
+        cache.set(2u32, b"payload bytes B", None).expect("set should succeed");
+        cache.get(&2u32).expect("get should succeed");
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&2u32) == Some(Tier::Fast)));
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
+
+        cache.get(&1u32).expect("get should succeed");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
+
+        // Deterministic trigger, not a filler set() -- see
+        // s3_fifo_hybrid_cache_integration.rs's equivalent test for why.
+        cache.resize(180).expect("resize should succeed");
+
+        let survived_and_promoted = wait_until(MIGRATION_TIMEOUT, || {
+            cache.has(&1u32) && cache.tier_of(&1u32) == Some(Tier::Fast)
+        });
+        assert!(
+            survived_and_promoted,
+            "key 1 should have been given a second chance and promoted back to fast",
+        );
+        assert_eq!(cache.get(&1u32).unwrap(), b"payload bytes A");
+    }
+
+    // ── the signature new mechanic: reprieve at DEMOTION time ───────────────
+
+    #[test]
+    fn an_accessed_fast_boundary_key_is_reprieved_at_demotion_time_instead_of_the_newcomer() {
+        ensure_pmem_allocator_warm();
+
+        // Fast tier fits comfortably one "payload bytes N"-sized value but
+        // not two (same 40-byte budget the eviction-time second-chance test
+        // above already relies on for "exactly one slot").
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(40),
+            1.0,
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
+        cache.get(&1u32).expect("get should succeed");
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
+
+        let promotions_before = cache.s3_fifo_ghost_lazy_demotion_hybrid_stats().promotions;
+        let demotions_before = cache.s3_fifo_ghost_lazy_demotion_hybrid_stats().demotions;
+
+        // Touch key 1 again while it's still Fast -- sets its reference bit,
+        // no reorder, no migration (same lazy-bit convention proven by
+        // `a_plain_access_on_a_fast_main_queue_key_does_not_migrate_or_reorder`
+        // above).
+        cache.get(&1u32).expect("get should succeed");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
+
+        // Promoting key 2 forces fast-tier pressure. In
+        // `s3_fifo_ghost_hybrid_cache` (unconditional demotion) this would
+        // demote key 1. Here, key 1's bit is set, so it must be reprieved
+        // (stay Fast) and key 2 -- the only other candidate, with a clear
+        // bit -- must be demoted in its place instead.
+        //
+        // Note: `tier_of(&2u32)` is NOT a usable signal for "key 2 was
+        // demoted" here -- admission for this design always builds a
+        // brand-new key's bytes as Slow at the API layer to begin with (see
+        // `S3FifoGhostLazyDemotionHybridPolicy::admission_tier`), and key
+        // 2's promotion-then-immediate-re-demotion happens entirely within
+        // one worker batch, so its physical buffer never visibly passes
+        // through Fast at all -- `tier_of(&2u32) == Some(Tier::Slow)` would
+        // already be true the instant `set()` returns, well before the real
+        // demotion this test means to observe. Wait on the demotion counter
+        // itself instead, which only increments once the real
+        // `settle_fast_tier` demotion has been physically applied.
+        cache.set(2u32, b"payload bytes B", None).expect("set should succeed");
+        cache.get(&2u32).expect("get should succeed");
+
+        let demoted = wait_until(MIGRATION_TIMEOUT, || {
+            cache.s3_fifo_ghost_lazy_demotion_hybrid_stats().demotions > demotions_before
+        });
+        assert!(demoted, "key 2 should have been demoted in key 1's place");
+
+        // Confirm key 1 was never moved off the fast tier at any point
+        // during this, and key 2 settled back to (still) Slow.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            cache.tier_of(&1u32), Some(Tier::Fast),
+            "key 1 should have been reprieved at the demotion boundary, not demoted",
+        );
+        assert_eq!(cache.tier_of(&2u32), Some(Tier::Slow));
+
+        // A reprieve is not a promotion (key 1 was already Fast) and key 2's
+        // own promotion-then-immediate-demotion nets out to exactly one
+        // real demotion, zero new promotions.
+        let stats = cache.s3_fifo_ghost_lazy_demotion_hybrid_stats();
+        assert_eq!(stats.promotions, promotions_before, "reprieve must not count as a promotion");
+        assert_eq!(stats.demotions, demotions_before + 1, "exactly key 2 should have been demoted");
+
+        assert_eq!(cache.get(&1u32).unwrap(), b"payload bytes A");
+        assert_eq!(cache.get(&2u32).unwrap(), b"payload bytes B");
+    }
+
+    // ── TTL ───────────────────────────────────────────────────────────────
+
+    const TTL_FAST_TIER: u64 = 200;
+
+    #[test]
+    fn ttl_survives_a_demotion() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(TTL_FAST_TIER),
+            1.0,
+        ).expect("cache should construct");
+
+        let ttl_secs = 5u32;
+        let set_at = std::time::Instant::now();
+        cache.set(1u32, b"first value 123", Some(ttl_secs)).expect("set should succeed");
+
+        for key in 2u32..=6 {
+            cache.set(key, b"filler bytes", None).expect("set should succeed");
+        }
+
+        cache.get(&1u32).expect("get should succeed");
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
+
+        for key in 2u32..=6 {
+            cache.get(&key).expect("get should succeed");
+        }
+
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
+        assert!(cache.has(&1u32), "key should still be alive right after migrating");
+
+        let remaining = std::time::Duration::from_millis(ttl_secs as u64 * 1000 + 500)
+            .saturating_sub(set_at.elapsed());
+        std::thread::sleep(remaining);
+
+        assert!(matches!(cache.get(&1u32), Err(CacheError::KeyNotFound)));
+        assert!(!cache.has(&1u32));
+    }
+
+    // ── eviction priority ─────────────────────────────────────────────────
+
+    #[test]
+    fn terminal_eviction_prefers_one_access_queue_over_main_queue() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            200,
+            CacheTierSize::Bytes(200),
+            1.0,
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"payload bytes 1", None).expect("set should succeed");
+        cache.get(&1u32).expect("get should succeed");
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
+
+        for key in 2u32..=10 {
+            let _ = cache.set(key, b"payload bytes", None);
+        }
+
+        let evicted = wait_until(MIGRATION_TIMEOUT, || {
+            cache.s3_fifo_ghost_lazy_demotion_hybrid_stats().evictions >= 1
+        });
+        assert!(evicted, "at least one terminal eviction should have occurred");
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(
+            cache.has(&1u32),
+            "the proven main-queue key should not be evicted while one-access objects remain",
+        );
+    }
+
+    // ── runtime resize ────────────────────────────────────────────────────
+
+    #[test]
+    fn set_fast_tier_size_takes_effect_at_runtime() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+            1.0,
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"first value 123", None).expect("set should succeed");
+        cache.get(&1u32).expect("get should succeed");
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
+
+        cache.set_fast_tier_size(CacheTierSize::Bytes(1)).expect("resize should succeed");
+
+        let demoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow));
+        assert!(demoted, "shrinking the fast tier should demote the promoted key");
+    }
+
+    // ── edge cases ────────────────────────────────────────────────────────
+
+    #[test]
+    fn zero_fast_tier_size_is_rejected() {
+        let result = PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(0), 0.5);
+        assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
+    }
+
+    #[test]
+    fn invalid_one_access_ratio_is_rejected() {
+        assert!(matches!(
+            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(500), 1.5),
+            Err(CacheError::InvalidPolicy),
+        ));
+    }
+
+    #[test]
+    fn del_removes_key_from_whichever_tier_it_is_in() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+            1.0,
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"first value 123", None).expect("set should succeed");
+        cache.get(&1u32).expect("get should succeed");
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
+
+        cache.del(&1u32).expect("del should succeed");
+        assert!(!cache.has(&1u32));
+        assert_eq!(cache.tier_of(&1u32), None);
+    }
+
+    #[test]
+    fn wipe_clears_both_tiers() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+            1.0,
+        ).expect("cache should construct");
+
+        cache.set(1u32, b"first value 123", None).expect("set should succeed");
+        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.get(&1u32).expect("get should succeed");
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
+
+        cache.wipe().expect("wipe should succeed");
+
+        assert!(!cache.has(&1u32));
+        assert!(!cache.has(&2u32));
+        assert_eq!(cache.tier_of(&1u32), None);
+        assert_eq!(cache.tier_of(&2u32), None);
+    }
+}

@@ -149,6 +149,30 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// than TwoQHybrid for the `accessed: bool` reference bit (only
 		// meaningful for keys currently in Main — see that field's doc).
 		PaperPolicy::S3FifoHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+
+		// Ghost-hybrid variants: identical per-*tracked*-object charge to
+		// their non-ghost counterparts. The ghost list's own memory isn't
+		// charged here at all, matching this crate's existing precedent for
+		// `SThreeFifo`'s plain (non-hybrid) ghost queue above -- a ghost
+		// entry only ever exists for a key that has already been evicted
+		// (no longer counted in `num_objects`, which is what this whole
+		// function's result gets multiplied by), so it isn't a *tracked*
+		// object's overhead to add to in the first place.
+		PaperPolicy::TwoQGhostHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
+		PaperPolicy::S3FifoGhostHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+
+		// Identical entry shape to S3FifoGhostHybrid (same S3FifoEntry
+		// fields: queue, tier, size, accessed) -- the reference-bit gate
+		// this variant adds only changes when the bit is read, not
+		// anything about the per-entry bookkeeping shape.
+		PaperPolicy::S3FifoGhostLazyDemotionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+
+
+		// Identical entry shape to S3FifoGhostLazyDemotionHybrid (same
+		// S3FifoEntry fields) -- moving the one-access queue into the fast
+		// tier is a placement/accounting change, not a bookkeeping-shape
+		// change.
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
 	}
 }
 

@@ -238,6 +238,53 @@ lru_sized_hybrid_cache = ["key_value_pmem"]
 # `two_q_hybrid_cache`/`fifo_hybrid_cache`/`lru_sized_hybrid_cache` above.
 s3_fifo_hybrid_cache = ["key_value_pmem"]
 
+# `two_q_hybrid_cache` plus a bare-key ghost queue: objects that age out of
+# the one-access FIFO queue without a second access are remembered (key
+# only, no object data -- mirrors `s_three_fifo_stack.rs`'s existing plain
+# ghost queue, not plain `TwoQStack`'s heavier real-object `a1_out`), so a
+# later re-admission is trusted immediately (lands directly in the main
+# queue's fast tier) instead of restarting from the FIFO queue. See
+# `two_q_ghost_hybrid_cache` module docs
+# (worker/policy/policy_stack/two_q_ghost_hybrid_stack.rs has the ghost
+# mechanics). Same dependency reasoning as the other hybrids.
+#
+# Mutually exclusive with every other hybrid-cache feature above.
+two_q_ghost_hybrid_cache = ["key_value_pmem"]
+
+# `s3_fifo_hybrid_cache` plus the same bare-key ghost queue described above,
+# applied to the one-access queue there. See `s3_fifo_ghost_hybrid_cache`
+# module docs (worker/policy/policy_stack/s3_fifo_ghost_hybrid_stack.rs has
+# the ghost mechanics).
+#
+# Mutually exclusive with every other hybrid-cache feature above.
+s3_fifo_ghost_hybrid_cache = ["key_value_pmem"]
+
+# `s3_fifo_ghost_hybrid_cache` plus one more change: demotion (moving a fast
+# main-queue key to the slow tier) is now reference-bit gated too, not just
+# eviction. A fast key found at the demotion boundary with its bit set is
+# given a fresh start at the front instead of being demoted, and the sweep
+# continues to the next candidate -- S3-FIFO's usual "quick demotion, lazy
+# promotion" becomes "lazy demotion, lazy promotion". See
+# `s3_fifo_ghost_lazy_demotion_hybrid_cache` module docs
+# (worker/policy/policy_stack/s3_fifo_ghost_lazy_demotion_hybrid_stack.rs has
+# the mechanics).
+#
+# Mutually exclusive with every other hybrid-cache feature above.
+s3_fifo_ghost_lazy_demotion_hybrid_cache = ["key_value_pmem"]
+
+# `s3_fifo_ghost_lazy_demotion_hybrid_cache` plus one more change: the
+# one-access queue now lives in the FAST tier instead of the slow tier, so
+# admission is a cheap synchronous DRAM write instead of a synchronous
+# PMEM/UMF allocation. The one-access queue's own byte budget
+# (`one_access_ratio * max_size`) is now reserved out of the fast-tier size
+# rather than being an independent PMEM-side budget -- see
+# `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` module docs
+# (worker/policy/policy_stack/s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack.rs
+# has the shared-DRAM-budget accounting).
+#
+# Mutually exclusive with every other hybrid-cache feature above.
+s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache = ["key_value_pmem"]
+
 
 
 # jemalloc_cxl_slow_tier is NOT on by default. It (and eviction_stacks_pmem's

@@ -24,7 +24,7 @@ use crossbeam_channel::{Sender, Receiver, unbounded};
 use log::{info, warn, error};
 use kwik::fmt;
 
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
 use crate::object_store::ObjectStore;
 
 use crate::{
@@ -58,7 +58,7 @@ use crate::{
 // `policy_stack` submodule directly, *and* so it can flow all the way out
 // to `PaperCache::tier_of`'s public return type via `worker::Tier` /
 // `crate::Tier` (see `worker/mod.rs` and `lib.rs`).
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
 pub use policy_stack::Tier;
 
 // the polling value must be a power of 2
@@ -107,7 +107,7 @@ pub struct PolicyWorker<K, V> {
 	/// for every other policy/value type. Promotion/demotion/eviction
 	/// counters and gauges are recorded directly on the shared `status`
 	/// (see `apply_tier_migrations`), not a separate field.
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
 	tier_migration_fn: Option<Box<dyn Fn(&V, Tier) -> V + Send + Sync>>,
 }
 
@@ -203,7 +203,7 @@ where
 				// 3959.0/3983.3 MB — within normal run-to-run noise). The
 				// allocator-level retention behavior responsible for that gap
 				// is independent of this loop's migration granularity.
-				#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
+				#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
 				self.apply_tier_migrations();
 			}
 
@@ -225,7 +225,7 @@ where
 			// requirement now that at least one stack's eviction sweep can
 			// produce a promotion. Cheap early-return when there's nothing
 			// to migrate, same as the per-event call above.
-			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
+			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
 			self.apply_tier_migrations();
 
 			let now = Instant::now();
@@ -300,7 +300,7 @@ where
 
 			promotion_tx,
 
-			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
+			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
 			tier_migration_fn: None,
 		};
 
@@ -319,7 +319,7 @@ where
 	/// eviction counters and the current tier gauges are recorded directly
 	/// on `status` (see `apply_tier_migrations`), which is why this
 	/// constructor needs no separate stats parameter.
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
 	pub fn new_with_tier_migration(
 		listener: WorkerReceiver,
 		objects: ObjectMapRef<K, V>,
@@ -920,6 +920,201 @@ where
 		}
 	}
 
+	/// `two_q_ghost_hybrid_cache` counterpart of the methods above —
+	/// identical shape to `two_q_hybrid_cache`'s sibling. A ghost-queue hit
+	/// (`TwoQGhostHybridStack::admit_via_ghost_hit`) produces an ordinary
+	/// `Tier::Fast` migration, no different from any other promotion here.
+	#[cfg(feature = "two_q_ghost_hybrid_cache")]
+	fn apply_tier_migrations(&mut self) {
+		let Some(stack) = &mut self.policy_stack else { return };
+		let migrations = stack.drain_tier_migrations();
+
+		if !migrations.is_empty() {
+			if let Some(migrate) = &self.tier_migration_fn {
+				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
+					.into_iter()
+					.partition(|(_, tier)| *tier == Tier::Slow);
+
+				let objects = &self.objects;
+				let status = &self.status;
+
+				let apply_physical = |(key, tier): (HashedKey, Tier)| {
+					if let Some(mut object) = objects.get_mut_ref(&key) {
+						let new_data = migrate(&object.data(), tier);
+						object.set_data(new_data);
+					}
+				};
+
+				demotions.into_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_two_q_ghost_hybrid_demotion();
+				});
+
+				promotions.into_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_two_q_ghost_hybrid_promotion();
+				});
+			}
+		}
+
+		if let Some(stack) = &self.policy_stack {
+			self.status.set_two_q_ghost_hybrid_gauges(
+				stack.fast_bytes_used(),
+				stack.slow_bytes_used(),
+				stack.fast_object_count() as u64,
+				stack.slow_object_count() as u64,
+			);
+		}
+	}
+
+	/// `s3_fifo_ghost_hybrid_cache` counterpart of the methods above —
+	/// identical shape to `s3_fifo_hybrid_cache`'s sibling, including the
+	/// eviction-sweep-triggered `give_second_chance` promotions (see that
+	/// sibling's doc). A ghost-queue hit produces an ordinary `Tier::Fast`
+	/// migration, no different from any other promotion here.
+	#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
+	fn apply_tier_migrations(&mut self) {
+		let Some(stack) = &mut self.policy_stack else { return };
+		let migrations = stack.drain_tier_migrations();
+
+		if !migrations.is_empty() {
+			if let Some(migrate) = &self.tier_migration_fn {
+				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
+					.into_iter()
+					.partition(|(_, tier)| *tier == Tier::Slow);
+
+				let objects = &self.objects;
+				let status = &self.status;
+
+				let apply_physical = |(key, tier): (HashedKey, Tier)| {
+					if let Some(mut object) = objects.get_mut_ref(&key) {
+						let new_data = migrate(&object.data(), tier);
+						object.set_data(new_data);
+					}
+				};
+
+				demotions.into_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_s3_fifo_ghost_hybrid_demotion();
+				});
+
+				promotions.into_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_s3_fifo_ghost_hybrid_promotion();
+				});
+			}
+		}
+
+		if let Some(stack) = &self.policy_stack {
+			self.status.set_s3_fifo_ghost_hybrid_gauges(
+				stack.fast_bytes_used(),
+				stack.slow_bytes_used(),
+				stack.fast_object_count() as u64,
+				stack.slow_object_count() as u64,
+			);
+		}
+	}
+
+	/// `s3_fifo_ghost_lazy_demotion_hybrid_cache` counterpart of the method
+	/// above — identical shape, since the demotion-time reference-bit gate
+	/// this variant adds is entirely internal to the stack's own
+	/// `settle_fast_tier` (see that stack's module doc): the migrations this
+	/// drains and the way they're applied physically are unchanged, only
+	/// the stack's *decision* of which key ends up in `demotions` differs.
+	#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
+	fn apply_tier_migrations(&mut self) {
+		let Some(stack) = &mut self.policy_stack else { return };
+		let migrations = stack.drain_tier_migrations();
+
+		if !migrations.is_empty() {
+			if let Some(migrate) = &self.tier_migration_fn {
+				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
+					.into_iter()
+					.partition(|(_, tier)| *tier == Tier::Slow);
+
+				let objects = &self.objects;
+				let status = &self.status;
+
+				let apply_physical = |(key, tier): (HashedKey, Tier)| {
+					if let Some(mut object) = objects.get_mut_ref(&key) {
+						let new_data = migrate(&object.data(), tier);
+						object.set_data(new_data);
+					}
+				};
+
+				demotions.into_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_s3_fifo_ghost_lazy_demotion_hybrid_demotion();
+				});
+
+				promotions.into_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_s3_fifo_ghost_lazy_demotion_hybrid_promotion();
+				});
+			}
+		}
+
+		if let Some(stack) = &self.policy_stack {
+			self.status.set_s3_fifo_ghost_lazy_demotion_hybrid_gauges(
+				stack.fast_bytes_used(),
+				stack.slow_bytes_used(),
+				stack.fast_object_count() as u64,
+				stack.slow_object_count() as u64,
+			);
+		}
+	}
+
+	/// `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache`
+	/// counterpart of the method above — identical shape. The only
+	/// difference this variant makes (the one-access queue's bytes are
+	/// already Fast at admission time, so `promote_from_one_access`/
+	/// `admit_via_ghost_hit` no longer produce a Fast migration for the
+	/// common case -- see that stack's module doc) is entirely internal to
+	/// `drain_tier_migrations`'s own output; the physical-apply/counting
+	/// logic here is unchanged.
+	#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
+	fn apply_tier_migrations(&mut self) {
+		let Some(stack) = &mut self.policy_stack else { return };
+		let migrations = stack.drain_tier_migrations();
+
+		if !migrations.is_empty() {
+			if let Some(migrate) = &self.tier_migration_fn {
+				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
+					.into_iter()
+					.partition(|(_, tier)| *tier == Tier::Slow);
+
+				let objects = &self.objects;
+				let status = &self.status;
+
+				let apply_physical = |(key, tier): (HashedKey, Tier)| {
+					if let Some(mut object) = objects.get_mut_ref(&key) {
+						let new_data = migrate(&object.data(), tier);
+						object.set_data(new_data);
+					}
+				};
+
+				demotions.into_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_demotion();
+				});
+
+				promotions.into_iter().for_each(|entry| {
+					apply_physical(entry);
+					status.record_s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_promotion();
+				});
+			}
+		}
+
+		if let Some(stack) = &self.policy_stack {
+			self.status.set_s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_gauges(
+				stack.fast_bytes_used(),
+				stack.slow_bytes_used(),
+				stack.fast_object_count() as u64,
+				stack.slow_object_count() as u64,
+			);
+		}
+	}
+
 	fn apply_buffered_events(
 		&mut self,
 		buffered_events: &[StackEvent],
@@ -1046,6 +1241,26 @@ where
 			#[cfg(feature = "s3_fifo_hybrid_cache")]
 			if matches!(*policy, PaperPolicy::S3FifoHybrid(_)) {
 				self.status.record_s3_fifo_hybrid_eviction();
+			}
+
+			#[cfg(feature = "two_q_ghost_hybrid_cache")]
+			if matches!(*policy, PaperPolicy::TwoQGhostHybrid(_)) {
+				self.status.record_two_q_ghost_hybrid_eviction();
+			}
+
+			#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
+			if matches!(*policy, PaperPolicy::S3FifoGhostHybrid(_)) {
+				self.status.record_s3_fifo_ghost_hybrid_eviction();
+			}
+
+			#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
+			if matches!(*policy, PaperPolicy::S3FifoGhostLazyDemotionHybrid(_)) {
+				self.status.record_s3_fifo_ghost_lazy_demotion_hybrid_eviction();
+			}
+
+			#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
+			if matches!(*policy, PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_)) {
+				self.status.record_s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_eviction();
 			}
 
 			buffered_events.push(StackEvent::Del(key));

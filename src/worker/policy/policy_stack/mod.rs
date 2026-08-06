@@ -20,6 +20,10 @@ mod two_q_hybrid_stack;
 mod fifo_hybrid_stack;
 mod lru_sized_hybrid_stack;
 mod s3_fifo_hybrid_stack;
+mod two_q_ghost_hybrid_stack;
+mod s3_fifo_ghost_hybrid_stack;
+mod s3_fifo_ghost_lazy_demotion_hybrid_stack;
+mod s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack;
 
 #[cfg(feature = "eviction_stacks_pmem")] mod pmem_collections;
 
@@ -44,6 +48,10 @@ use crate::{
 		fifo_hybrid_stack::FifoHybridStack,
 		lru_sized_hybrid_stack::LruSizedHybridStack,
 		s3_fifo_hybrid_stack::S3FifoHybridStack,
+		two_q_ghost_hybrid_stack::TwoQGhostHybridStack,
+		s3_fifo_ghost_hybrid_stack::S3FifoGhostHybridStack,
+		s3_fifo_ghost_lazy_demotion_hybrid_stack::S3FifoGhostLazyDemotionHybridStack,
+		s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionHybridStack,
 	},
 };
 
@@ -335,6 +343,34 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// (same admission shape: always slow, no ambiguity to reserve
 		// against yet).
 		PaperPolicy::S3FifoHybrid(ratio) => Box::new(S3FifoHybridStack::new(
+			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
+		)),
+
+		// Same construction/default-fast-tier-budget shape as TwoQHybrid/
+		// S3FifoHybrid above -- see two_q_ghost_hybrid_stack.rs's module doc
+		// for the ghost-queue mechanics these add on top.
+		PaperPolicy::TwoQGhostHybrid(k_in) => Box::new(TwoQGhostHybridStack::new(
+			k_in, max_size, (max_size as f64 * 0.2) as CacheSize,
+		)),
+		PaperPolicy::S3FifoGhostHybrid(ratio) => Box::new(S3FifoGhostHybridStack::new(
+			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
+		)),
+
+		// Same construction/default-fast-tier-budget shape as
+		// S3FifoGhostHybrid above -- see
+		// s3_fifo_ghost_lazy_demotion_hybrid_stack.rs's module doc for the
+		// demotion-time reference-bit gate this adds on top.
+		PaperPolicy::S3FifoGhostLazyDemotionHybrid(ratio) => Box::new(S3FifoGhostLazyDemotionHybridStack::new(
+			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
+		)),
+
+		// Same construction/default-fast-tier-budget shape as
+		// S3FifoGhostLazyDemotionHybrid above -- see
+		// s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack.rs's
+		// module doc for the shared-DRAM-budget accounting this adds (the
+		// one-access queue now competes with the main queue's fast segment
+		// for the same fast_capacity).
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ratio) => Box::new(S3FifoGhostLazyDemotionFastAdmissionHybridStack::new(
 			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
 		)),
 	}
