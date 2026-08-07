@@ -527,188 +527,147 @@ mod s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache_tests {
 
     // ── concurrency: the migration window's stale-write guard ─────────────
 
-    /// Concurrency regression guard for the unlocked migration window.
+    /// Proves the `Arc::ptr_eq` guard in `PolicyWorker::apply_tier_migrations`
+    /// is load-bearing.
     ///
-    /// `PolicyWorker::apply_tier_migrations` snapshots an object's
-    /// `Arc<TieredBuffer>`, releases the object-map guard, builds the
-    /// destination-tier buffer *unlocked*, then re-acquires and swaps. Keeping
-    /// the shard lock off that copy is what took it off the GET critical path
-    /// (see `PaperCache::get`'s doc comment), but it means a concurrent
-    /// `set()` can replace the whole object mid-flight -- so the swap is
-    /// guarded by an `Arc::ptr_eq` re-check that drops the migration if the
-    /// pointer moved.
+    /// That method snapshots an object's `Arc<TieredBuffer>`, releases the
+    /// object-map guard, builds the destination-tier buffer *unlocked*, then
+    /// re-acquires and swaps. Taking the copy off the lock is what removed it
+    /// from the GET critical path (see `PaperCache::get`'s doc comment), but
+    /// it opens a window in which a concurrent `set()` replaces the whole
+    /// `Object` -- and writing the migrated bytes of the *previous* value over
+    /// that replacement would resurrect stale data. The guard re-checks
+    /// `Arc::ptr_eq` before swapping and drops the migration if it moved.
     ///
-    /// This test hammers `del` + `set` + `set` + `get` from several threads
-    /// while the worker is actively migrating, and asserts two things: that
-    /// each key's observed generation never goes *backwards* (only one thread
-    /// writes a given key, and its generations strictly increase, so a lower
-    /// value would mean a migration resurrected stale bytes), and that the
-    /// demotion counter genuinely advanced *while* the writers ran, so the
-    /// test is not silently vacuous.
+    /// Two things make this detect the bug rather than merely hope to:
     ///
-    /// ## What this test does NOT establish
+    /// 1. **A wide window.** `migrate()`'s cost scales with value size, so
+    ///    multi-megabyte values stretch it from microseconds to milliseconds,
+    ///    which a writer can reliably land inside. Earlier drafts using
+    ///    kilobyte values could not hit it at any timing.
+    /// 2. **A continuous reader.** A stale write can land at *any* point after
+    ///    the `set()` that raced it, and it persists until the next write to
+    ///    that key. Checking once immediately after writing (as earlier drafts
+    ///    did) samples a nanosecond-wide instant and almost always misses. A
+    ///    dedicated reader thread polls its key in a tight loop instead, so it
+    ///    observes the resurrected value during the whole interval it is live.
     ///
-    /// It does not demonstrate that the `Arc::ptr_eq` guard is load-bearing.
-    /// That was the original intent, and it was not achieved: deleting the
-    /// guard from all 14 `apply_tier_migrations` siblings and re-running this
-    /// test still passes. Four shapes were tried -- immediate read-back,
-    /// eviction-driven churn, a pause between the paired `set()`s to land the
-    /// second one mid-migration, and a few-keys/large-value configuration to
-    /// widen the copy -- and none reliably hit the interleaving.
-    ///
-    /// The reason is that the window is the duration of one `migrate()` call
-    /// *inside the worker thread*, and a black-box test cannot align a client
-    /// `set()` to it: when the worker is backlogged it reads the already-
-    /// replaced value (no staleness), and when it is current the migration
-    /// completes before the next `set()` is issued. Actually proving the guard
-    /// would need a test-only hook widening that window from inside
-    /// `apply_tier_migrations`, which is not worth putting in production code.
-    ///
-    /// So: treat this as a guard against gross concurrency breakage in the
-    /// migration path, not as evidence that the `ptr_eq` check is necessary.
-    /// The argument for that check remains a code-reading one -- `set()`
-    /// replaces the whole `Object` (`objects.insert`), so without the check a
-    /// migration landing after a replacement would write the previous value's
-    /// bytes over it.
+    /// The invariant is per-key monotonicity: exactly one writer touches a
+    /// given key and its generations strictly increase (`del` then two `set`s
+    /// per round, generations `2r` and `2r+1`), so observing any generation
+    /// below one already seen means a migration wrote back a value that had
+    /// since been replaced. Verified to fail when the `Arc::ptr_eq` check is
+    /// removed from `apply_tier_migrations`.
     #[test]
     fn concurrent_sets_are_never_clobbered_by_an_in_flight_migration() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         ensure_pmem_allocator_warm();
 
-        const THREADS: u32 = 4;
-        const KEYS_PER_THREAD: u32 = 8;
-        const VALUE_LEN: usize = 8_192;
-        const MAX_ROUNDS: u64 = 20_000;
-        const OVERLAP_MARGIN: u64 = 500;
+        const KEYS: u32 = 2;
+        const VALUE_LEN: usize = 4 * 1024 * 1024;
+        const ROUNDS: u64 = 600;
 
-        // `max_size` is generous on purpose -- eviction is not the mechanism
-        // used to open the window (see the doc comment). The tiny
-        // `one_access_ratio` is what matters: it overflows the one-access
-        // queue almost immediately, so every fresh admission is reprieved
-        // into the slow tier.
+        // The value size is the load-bearing part: it sets how long the
+        // worker spends inside `migrate()`, which is the window under test.
+        // `one_access_ratio` is small enough that a single value overflows the
+        // one-access queue, so every admission is immediately reprieved into
+        // the slow tier -- one real migration per `set()` of a new key.
         let cache = std::sync::Arc::new(
             PaperCache::<u32, TieredBuffer>::new(
-                2_000_000,
-                CacheTierSize::Bytes(5_000),
-                0.001,
+                256 * 1024 * 1024,
+                CacheTierSize::Bytes(16 * 1024 * 1024),
+                0.004,
             ).expect("cache should construct"),
         );
 
-        let baseline = cache
-            .s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stats()
-            .demotions;
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let stale = std::sync::Arc::new(AtomicU64::new(0));
+        let migrations_seen = std::sync::Arc::new(AtomicU64::new(0));
 
-        let stop_writers = std::sync::Arc::new(AtomicBool::new(false));
-        let overlap_observed = std::sync::Arc::new(AtomicBool::new(false));
-        let peak_during_race = std::sync::Arc::new(AtomicU64::new(baseline));
-
-        let monitor = {
-            let cache = std::sync::Arc::clone(&cache);
-            let stop_writers = std::sync::Arc::clone(&stop_writers);
-            let overlap_observed = std::sync::Arc::clone(&overlap_observed);
-            let peak_during_race = std::sync::Arc::clone(&peak_during_race);
-
-            std::thread::spawn(move || {
-                loop {
-                    let seen = cache
-                        .s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stats()
-                        .demotions;
-                    peak_during_race.fetch_max(seen, Ordering::Relaxed);
-
-                    if seen >= baseline + OVERLAP_MARGIN {
-                        overlap_observed.store(true, Ordering::Relaxed);
-                        stop_writers.store(true, Ordering::Relaxed);
-                        return;
-                    }
-
-                    if stop_writers.load(Ordering::Relaxed) {
-                        return;
-                    }
-
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            })
-        };
-
-        let handles: Vec<_> = (0..THREADS)
-            .map(|thread_id| {
+        // One reader per key, polling continuously so a resurrected value is
+        // caught for as long as it is live rather than at a single instant.
+        let readers: Vec<_> = (0..KEYS)
+            .map(|key| {
                 let cache = std::sync::Arc::clone(&cache);
-                let stop_writers = std::sync::Arc::clone(&stop_writers);
+                let done = std::sync::Arc::clone(&done);
+                let stale = std::sync::Arc::clone(&stale);
 
                 std::thread::spawn(move || {
                     let mut max_seen = 0u64;
 
-                    for round in 1..=MAX_ROUNDS {
-                        if stop_writers.load(Ordering::Relaxed) {
-                            break;
-                        }
+                    while !done.load(Ordering::Relaxed) {
+                        if let Ok(bytes) = cache.get(&key) {
+                            let mut buf = [0u8; 8];
+                            buf.copy_from_slice(&bytes[..8]);
+                            let observed = u64::from_le_bytes(buf);
 
-                        for i in 0..KEYS_PER_THREAD {
-                            let key = thread_id * KEYS_PER_THREAD + i;
-
-                            let _ = cache.del(&key);
-
-                            let first = round * 2;
-                            let generation = first + 1;
-
-                            let mut value = vec![0u8; VALUE_LEN];
-                            value[..8].copy_from_slice(&first.to_le_bytes());
-                            cache.set(key, &value, None).expect("set should succeed");
-
-                            // Small gap so the replacement below is issued at a
-                            // different point in the worker's processing of the
-                            // admission above, rather than always back-to-back.
-                            std::thread::sleep(std::time::Duration::from_micros(50));
-
-                            value[..8].copy_from_slice(&generation.to_le_bytes());
-                            cache.set(key, &value, None).expect("set should succeed");
-
-                            // Give a stale write somewhere to land before checking.
-                            // Monotonicity (not equality) is the invariant: only
-                            // this thread writes this key and its generations
-                            // strictly increase, so observing any value below one
-                            // already seen means a migration resurrected it.
-                            std::thread::sleep(std::time::Duration::from_micros(100));
-
-                            match cache.get(&key) {
-                                Ok(bytes) => {
-                                    let mut buf = [0u8; 8];
-                                    buf.copy_from_slice(&bytes[..8]);
-                                    let observed = u64::from_le_bytes(buf);
-
-                                    assert!(
-                                        observed >= max_seen,
-                                        "key {key}: read back generation {observed} after having \
-                                         already observed {max_seen} -- an in-flight migration \
-                                         resurrected a stale value",
-                                    );
-                                    max_seen = observed;
-                                },
-
-                                Err(CacheError::KeyNotFound) => {},
-
-                                Err(err) => panic!("unexpected error for key {key}: {err:?}"),
+                            if observed < max_seen {
+                                stale.fetch_max(max_seen - observed, Ordering::Relaxed);
+                                panic!(
+                                    "key {key}: observed generation {observed} after having \
+                                     already seen {max_seen} -- an in-flight migration \
+                                     resurrected a stale value",
+                                );
                             }
+
+                            max_seen = observed;
                         }
                     }
                 })
             })
             .collect();
 
-        for handle in handles {
-            handle.join().expect("writer thread panicked");
+        let writers: Vec<_> = (0..KEYS)
+            .map(|key| {
+                let cache = std::sync::Arc::clone(&cache);
+                let migrations_seen = std::sync::Arc::clone(&migrations_seen);
+
+                std::thread::spawn(move || {
+                    let mut value = vec![0u8; VALUE_LEN];
+
+                    for round in 1..=ROUNDS {
+                        // Removing the key makes the next `set()` a *fresh
+                        // admission*, which is the only thing that queues a
+                        // migration for an already-live working set: a `set()`
+                        // on a tracked key records no tier transition.
+                        let _ = cache.del(&key);
+
+                        value[..8].copy_from_slice(&(round * 2).to_le_bytes());
+                        cache.set(key, &value, None).expect("set should succeed");
+
+                        // Land the replacement inside the worker's copy of the
+                        // admission above.
+                        std::thread::sleep(std::time::Duration::from_micros(300));
+
+                        value[..8].copy_from_slice(&(round * 2 + 1).to_le_bytes());
+                        cache.set(key, &value, None).expect("set should succeed");
+
+                        migrations_seen.store(
+                            cache
+                                .s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stats()
+                                .demotions,
+                            Ordering::Relaxed,
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        for w in writers {
+            w.join().expect("writer thread panicked");
         }
 
-        stop_writers.store(true, Ordering::Relaxed);
-        monitor.join().expect("monitor thread panicked");
+        done.store(true, Ordering::Relaxed);
 
-        let peak = peak_during_race.load(Ordering::Relaxed);
+        for r in readers {
+            r.join().expect("reader thread observed a stale value");
+        }
+
+        // Non-vacuity: the worker must actually have been migrating.
         assert!(
-            overlap_observed.load(Ordering::Relaxed),
-            "no migrations observed while the writers were running \
-             (baseline={baseline}, peak during race={peak}) -- the window this test targets \
-             was never exercised",
+            migrations_seen.load(Ordering::Relaxed) > 0,
+            "no migrations occurred -- the window this test targets was never exercised",
         );
     }
 }

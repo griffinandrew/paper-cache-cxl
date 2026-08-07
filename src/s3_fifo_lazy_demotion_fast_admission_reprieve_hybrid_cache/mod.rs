@@ -50,10 +50,30 @@ impl crate::hybrid_policy::HybridPolicy for S3FifoLazyDemotionFastAdmissionRepri
 	}
 
 	fn admission_tier<K>(
-		_hashed_key: crate::HashedKey,
+		hashed_key: crate::HashedKey,
 		_status: &crate::status::AtomicStatus,
-		_objects: &crate::hybrid_policy::HybridObjectMap<K>,
+		objects: &crate::hybrid_policy::HybridObjectMap<K>,
 	) -> crate::Tier {
-		crate::Tier::Fast
+		use crate::object_store::ObjectStore;
+
+		// A brand-new key is admitted to the fast tier (the one-access queue).
+		//
+		// An *existing* key keeps whatever tier it is already in, which is not
+		// merely a nicety: this design's stack records no tier transition for a
+		// `set()` on a tracked key -- `insert()` routes to `touch()`, which only
+		// marks the reference bit -- so unconditionally rebuilding the value as
+		// `Fast` leaves the object physically in DRAM while the stack still
+		// accounts it to the slow tier. Nothing ever reconciles that, so every
+		// re-set of a demoted key silently pushes real DRAM usage past the
+		// fast-tier budget, and the `fast_bytes_used` gauge under-reports it.
+		//
+		// The cost is a synchronous PMEM write on a `set()` to a slow-resident
+		// key -- the same tradeoff `lfu_hybrid_cache` already accepts for its
+		// latched admissions -- in exchange for physical placement matching the
+		// stack's accounting.
+		match objects.get_ref(&hashed_key) {
+			Some(object) if object.data().is_slow() => crate::Tier::Slow,
+			_ => crate::Tier::Fast,
+		}
 	}
 }
