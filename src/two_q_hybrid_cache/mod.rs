@@ -72,10 +72,24 @@ impl crate::hybrid_policy::HybridPolicy for TwoQHybridPolicy {
 	}
 
 	fn admission_tier<K>(
-		_hashed_key: crate::HashedKey,
+		hashed_key: crate::HashedKey,
 		_status: &crate::status::AtomicStatus,
-		_objects: &crate::hybrid_policy::HybridObjectMap<K>,
+		objects: &crate::hybrid_policy::HybridObjectMap<K>,
 	) -> crate::Tier {
-		crate::Tier::Slow
+		use crate::object_store::ObjectStore;
+
+		// Brand-new key: admitted to the one-access FIFO queue, always slow.
+		//
+		// An *existing* key is built Fast, because this stack's `touch()`
+		// always ends with the key in the fast tier -- a `Fifo` hit promotes
+		// it to the main queue's fast portion, and a `Main` hit reorders it
+		// there (promoting first if it was slow). Building Slow here, as this
+		// previously did unconditionally, left every re-set of an
+		// already-fast key physically in PMEM while the stack accounted it to
+		// the fast tier, and nothing ever reconciled the two.
+		match objects.get_ref(&hashed_key) {
+			Some(_) => crate::Tier::Fast,
+			None => crate::Tier::Slow,
+		}
 	}
 }

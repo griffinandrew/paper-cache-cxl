@@ -44,10 +44,35 @@ impl crate::hybrid_policy::HybridPolicy for S3FifoGhostLazyDemotionHybridPolicy 
 	}
 
 	fn admission_tier<K>(
-		_hashed_key: crate::HashedKey,
+		hashed_key: crate::HashedKey,
 		_status: &crate::status::AtomicStatus,
-		_objects: &crate::hybrid_policy::HybridObjectMap<K>,
+		objects: &crate::hybrid_policy::HybridObjectMap<K>,
 	) -> crate::Tier {
-		crate::Tier::Slow
+		use crate::object_store::ObjectStore;
+
+		// A brand-new key follows this design's own admission rule (below).
+		// An *existing* key keeps whatever tier it currently occupies.
+		//
+		// That second clause is load-bearing. This stack records no tier
+		// transition for a `set()` on a key already in its main queue --
+		// `insert()` routes to `touch()`, which only marks the reference bit
+		// -- so choosing a tier here that disagrees with where the object
+		// already lives leaves physical placement and the stack's accounting
+		// permanently out of step, with no event that ever reconciles them.
+		// Real DRAM then drifts away from `fast_tier_size` while
+		// `fast_bytes_used` reports the stack's (wrong) view.
+		//
+		// Where the stack *does* move the key, it emits a migration and the
+		// worker corrects the placement, so preserving the current tier is
+		// safe in every case.
+		match objects.get_ref(&hashed_key) {
+			Some(object) => match object.data().is_fast() {
+				true => crate::Tier::Fast,
+				false => crate::Tier::Slow,
+			},
+
+			// Brand-new key: this design admits to the slow tier.
+			None => crate::Tier::Slow,
+		}
 	}
 }

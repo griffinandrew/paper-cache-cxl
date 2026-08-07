@@ -77,12 +77,25 @@ impl crate::hybrid_policy::HybridPolicy for LfuHybridPolicy {
 	) -> crate::Tier {
 		use crate::object_store::ObjectStore;
 
-		let is_new = objects.get_ref(&hashed_key).is_none();
+		// An *existing* key keeps whatever tier it currently occupies.
+		// `insert()` on a tracked key routes to `maybe_promote`, which only
+		// moves a slow key to the fast chain if its bumped frequency beats
+		// the fast chain's minimum -- it can decline. Building Fast
+		// unconditionally, as this previously did, left every declined
+		// promotion physically in DRAM while the stack still accounted it to
+		// the slow tier, with nothing to reconcile them. When the promotion
+		// *is* granted the stack emits a migration and the worker corrects
+		// the placement, so preserving the current tier is safe either way.
+		match objects.get_ref(&hashed_key) {
+			Some(object) => match object.data().is_fast() {
+				true => crate::Tier::Fast,
+				false => crate::Tier::Slow,
+			},
 
-		if is_new && status.lfu_hybrid_admission_latched() {
-			crate::Tier::Slow
-		} else {
-			crate::Tier::Fast
+			// Brand-new key: fast unless the admission latch has closed --
+			// see `LfuHybridStack`'s module doc.
+			None if status.lfu_hybrid_admission_latched() => crate::Tier::Slow,
+			None => crate::Tier::Fast,
 		}
 	}
 }
