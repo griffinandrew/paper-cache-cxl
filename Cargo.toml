@@ -298,6 +298,50 @@ s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache = ["key_value_pmem"]
 # Mutually exclusive with every other hybrid-cache feature above.
 s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache = ["key_value_pmem"]
 
+# s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache: same
+# as s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache, with
+# two changes -- no ghost queue (removed entirely, since nothing ever
+# populates it here), and a one-access-queue key that ages out without a
+# second access is spliced directly into the slow tier of the main queue
+# (immediately adjacent to the fast/slow boundary, never tagged Fast even
+# transiently) instead of being evicted. See
+# `s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache`
+# module docs
+# (worker/policy/policy_stack/s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stack.rs
+# has the full mechanics, including the O(number of currently-fast keys)
+# splice technique).
+#
+# Mutually exclusive with every other hybrid-cache feature above.
+s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache = ["key_value_pmem"]
+
+# s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache: the reprieve design with
+# NO mid-slow-tier reference-bit checkpoint at all. Both earlier attempts at
+# such a checkpoint -- an approximate sampled cursor (..._midpoint_reprieve_...)
+# and a real two-segment boundary (..._split_slow_reprieve_...) -- measured
+# bit-identical hit rates to having no check, because terminal eviction only
+# ever removes the slow tier's tail, where the reference bit is already
+# honoured. The segment-boundary version additionally cost GET latency and
+# throughput. This variant keeps only the checks that pay for themselves:
+# the demotion boundary and the eviction tail.
+#
+# Mutually exclusive with every other hybrid-cache feature above.
+s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache = ["key_value_pmem"]
+
+# s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache: same as
+# s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache, except the
+# approximate mid-slow-segment cursor (measured to be a no-op on the real
+# traces) is replaced by splitting the slow tier into two physical FIFO
+# segments. Every object's reference bit is checked at the moment it would
+# cross from the newer segment into the older one -- a real structural
+# checkpoint with full coverage, rather than one sampled key per eviction
+# pass. See
+# `s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache` module docs
+# (worker/policy/policy_stack/s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_stack.rs
+# has the full mechanics).
+#
+# Mutually exclusive with every other hybrid-cache feature above.
+s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache = ["key_value_pmem"]
+
 
 
 # jemalloc_cxl_slow_tier is NOT on by default. It (and eviction_stacks_pmem's

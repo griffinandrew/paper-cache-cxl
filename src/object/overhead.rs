@@ -180,6 +180,31 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// stack-level field (like main_boundary), not a per-object one, so
 		// it doesn't change this per-tracked-object charge.
 		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+
+		// Same S3FifoEntry shape as S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid,
+		// minus the ghost list -- this variant removes it entirely (a
+		// one-access key that ages out is spliced into the slow tier of
+		// the main queue instead of being evicted, so there's no longer
+		// any event that ever populates a ghost entry). No per-tracked-
+		// object charge changes either way (the ghost list was never
+		// charged per-object to begin with -- see the comment on
+		// TwoQGhostHybrid/S3FifoGhostHybrid above), so the number is
+		// identical; only the removed list's fixed struct-level cost
+		// (irrelevant here, this function is purely per-object) is gone.
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+
+		// Same per-object charge as the midpoint variant -- dropping the
+		// mid-slow checkpoint removes stack-level fields (a cursor and a
+		// drift counter), not per-object ones.
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+
+		// Same per-object charge as the predecessor. The slow tier being
+		// two physical lists instead of one doesn't change what a tracked
+		// object costs -- it's still one list node plus one combined
+		// entry -- and this variant actually drops the separate
+		// `Option<Tier>` field (the queue tag now carries the tier), so
+		// if anything this is a slight over-estimate rather than under.
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
 	}
 }
 

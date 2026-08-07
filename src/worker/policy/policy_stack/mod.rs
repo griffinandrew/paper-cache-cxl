@@ -25,6 +25,9 @@ mod s3_fifo_ghost_hybrid_stack;
 mod s3_fifo_ghost_lazy_demotion_hybrid_stack;
 mod s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack;
 mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack;
+mod s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stack;
+mod s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stack;
+mod s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_stack;
 
 #[cfg(feature = "eviction_stacks_pmem")] mod pmem_collections;
 
@@ -54,6 +57,9 @@ use crate::{
 		s3_fifo_ghost_lazy_demotion_hybrid_stack::S3FifoGhostLazyDemotionHybridStack,
 		s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionHybridStack,
 		s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack,
+		s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stack::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack,
+		s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stack::S3FifoLazyDemotionFastAdmissionReprieveHybridStack,
+		s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_stack::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack,
 	},
 };
 
@@ -382,6 +388,33 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// module doc for the mid-slow-segment reference-bit checkpoint this
 		// adds on top.
 		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(ratio) => Box::new(S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack::new(
+			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
+		)),
+
+		// Same construction/default-fast-tier-budget shape as
+		// S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid above -- see
+		// s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stack.rs's
+		// module doc: no ghost queue (removed entirely), and a one-access
+		// key that ages out is spliced into the slow tier of the main
+		// queue instead of being evicted.
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(ratio) => Box::new(S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack::new(
+			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
+		)),
+
+		// Same construction shape as the midpoint variant above, minus the
+		// mid-slow checkpoint -- see
+		// s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stack.rs's module doc.
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(ratio) => Box::new(S3FifoLazyDemotionFastAdmissionReprieveHybridStack::new(
+			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
+		)),
+
+		// Same construction/default-fast-tier-budget shape as its
+		// predecessor above -- see
+		// s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_stack.rs's
+		// module doc: the slow tier is split into two physical FIFO
+		// segments, and every object's reference bit is checked as it
+		// crosses between them.
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(ratio) => Box::new(S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack::new(
 			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
 		)),
 	}

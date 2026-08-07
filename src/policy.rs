@@ -40,6 +40,9 @@ pub enum PaperPolicy {
 	S3FifoGhostLazyDemotionHybrid(f64),
 	S3FifoGhostLazyDemotionFastAdmissionHybrid(f64),
 	S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(f64),
+	S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(f64),
+	S3FifoLazyDemotionFastAdmissionReprieveHybrid(f64),
+	S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(f64),
 }
 
 impl PaperPolicy {
@@ -72,6 +75,9 @@ impl Display for PaperPolicy {
 			PaperPolicy::S3FifoGhostLazyDemotionHybrid(ratio) => write!(f, "s3-fifo-ghost-lazy-demotion-hybrid-{ratio}"),
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ratio) => write!(f, "s3-fifo-ghost-lazy-demotion-fast-admission-hybrid-{ratio}"),
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(ratio) => write!(f, "s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-{ratio}"),
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-{ratio}"),
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-{ratio}"),
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-{ratio}"),
 		}
 	}
 }
@@ -97,6 +103,9 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("s3-fifo-ghost-lazy-demotion-hybrid-") => parse_s_three_fifo_ghost_lazy_demotion_hybrid(value)?,
 			value if value.starts_with("s3-fifo-ghost-hybrid-") => parse_s_three_fifo_ghost_hybrid(value)?,
 			value if value.starts_with("s3-fifo-hybrid-") => parse_s_three_fifo_hybrid(value)?,
+			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid(value)?,
+			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_reprieve_hybrid(value)?,
+			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid(value)?,
 			value if value.starts_with("s3-fifo-") => parse_s_three_fifo(value)?,
 			"lru-hybrid" => PaperPolicy::LruHybrid,
 			"lfu-hybrid" => PaperPolicy::LfuHybrid,
@@ -331,6 +340,69 @@ fn parse_s_three_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid(value: 
 	}
 
 	Ok(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(ratio))
+}
+
+fn parse_s_three_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-"
+	let tokens = value[62..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(ratio) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&ratio) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(ratio))
+}
+
+fn parse_s_three_fifo_lazy_demotion_fast_admission_reprieve_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-"
+	let tokens = value[53..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(ratio) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&ratio) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(ratio))
+}
+
+fn parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-"
+	let tokens = value[64..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(ratio) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&ratio) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(ratio))
 }
 
 #[cfg(test)]
@@ -591,6 +663,119 @@ mod tests {
 	fn s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_rejects_out_of_range_ratio() {
 		assert_eq!(
 			"s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-1.5".parse::<PaperPolicy>(),
+			Err(CacheError::InvalidPolicy),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_round_trips_through_display_and_from_str() {
+		assert_eq!(
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.1).to_string(),
+			"s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-0.1",
+		);
+		assert_eq!(
+			"s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.1)),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_does_not_collide_with_others() {
+		assert_eq!("s3-fifo-0.1".parse::<PaperPolicy>(), Ok(PaperPolicy::SThreeFifo(0.1)));
+		assert_eq!("s3-fifo-hybrid-0.1".parse::<PaperPolicy>(), Ok(PaperPolicy::S3FifoHybrid(0.1)));
+		assert_eq!(
+			"s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(0.1)),
+		);
+		assert_eq!(
+			"s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.1)),
+		);
+		assert_ne!(
+			"s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-0.1".parse::<PaperPolicy>().unwrap(),
+			"s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-0.1".parse::<PaperPolicy>().unwrap(),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_rejects_out_of_range_ratio() {
+		assert_eq!(
+			"s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-1.5".parse::<PaperPolicy>(),
+			Err(CacheError::InvalidPolicy),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_round_trips_through_display_and_from_str() {
+		assert_eq!(
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.1).to_string(),
+			"s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-0.1",
+		);
+		assert_eq!(
+			"s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.1)),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_does_not_collide_with_the_midpoint_variant() {
+		assert_eq!("s3-fifo-0.1".parse::<PaperPolicy>(), Ok(PaperPolicy::SThreeFifo(0.1)));
+		assert_eq!(
+			"s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.1)),
+		);
+		assert_eq!(
+			"s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.1)),
+		);
+		assert_ne!(
+			"s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-0.1".parse::<PaperPolicy>().unwrap(),
+			"s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-0.1".parse::<PaperPolicy>().unwrap(),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_rejects_out_of_range_ratio() {
+		assert_eq!(
+			"s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-1.5".parse::<PaperPolicy>(),
+			Err(CacheError::InvalidPolicy),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_round_trips_through_display_and_from_str() {
+		assert_eq!(
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(0.1).to_string(),
+			"s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-0.1",
+		);
+		assert_eq!(
+			"s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(0.1)),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_does_not_collide_with_others() {
+		assert_eq!("s3-fifo-0.1".parse::<PaperPolicy>(), Ok(PaperPolicy::SThreeFifo(0.1)));
+		assert_eq!("s3-fifo-hybrid-0.1".parse::<PaperPolicy>(), Ok(PaperPolicy::S3FifoHybrid(0.1)));
+		assert_eq!(
+			"s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.1)),
+		);
+		assert_eq!(
+			"s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(0.1)),
+		);
+		assert_ne!(
+			"s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-0.1".parse::<PaperPolicy>().unwrap(),
+			"s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-0.1".parse::<PaperPolicy>().unwrap(),
+		);
+	}
+
+	#[test]
+	fn s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_rejects_out_of_range_ratio() {
+		assert_eq!(
+			"s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-1.5".parse::<PaperPolicy>(),
 			Err(CacheError::InvalidPolicy),
 		);
 	}
