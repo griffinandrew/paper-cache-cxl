@@ -46,11 +46,15 @@ src/
                                allocation. `build.rs` generates a stub (malloc/free-backed) when
                                UMF isn't available so the crate still builds on non-PMEM machines.
 
-  worker/                     Background-thread machinery. PaperCache::new() spawns a
-                               WorkerManager thread that owns all mutation of eviction state so
-                               the hot get()/set() path stays lock-cheap.
-    manager.rs                 WorkerManager — fans WorkerEvent out to sub-workers
-                                (PolicyWorker, TtlWorker, TieringWorker).
+  worker/                     Background-thread machinery. PaperCache::new() spawns the workers
+                               that own all mutation of eviction state so the hot get()/set()
+                               path stays lock-cheap.
+    manager.rs                 WorkerFanout — routes each WorkerEvent to the sub-workers
+                                (PolicyWorker, TtlWorker, TieringWorker) that actually consume
+                                it, per worker/mod.rs's `Events` subscription masks. NOT a
+                                thread: the fan-out runs inline on the calling thread. It was a
+                                thread until the GET-path work below; see "Performance: the
+                                background event pipeline on the GET path".
     mod.rs                      WorkerEvent enum: Get(key, hit), Promote(key), Set(key, size,
                                  expiry, old_info), Del(key, expiry), Ttl, Wipe, Resize, Policy.
                                  This is the *only* channel between PaperCache's API calls and
@@ -74,7 +78,12 @@ src/
       mini_stack/                Lightweight per-policy stacks used for PaperCache's "auto" mode
                                  (estimating what other policies would have done, to support
                                  switching policy live).
-      trace/                    Optional access-trace recording/replay used by mini-stacks.
+      trace/                    Optional access-trace recording/replay, the input
+                                 reconstruct_policy_stack() replays to rebuild a *different*
+                                 policy's stack after a live policy switch. Only spawned when
+                                 more than one policy is configured (see trace_is_useful) —
+                                 with a single policy, which is every hybrid cache, no switch is
+                                 reachable and the trace would be written and never read.
     ttl/                        TtlWorker — background expiry sweep.
     tiering.rs                  TieringWorker — bridges WorkerEvent to TieringManager
                                  (see below); only compiled under the tiering-manager features.
@@ -2170,3 +2179,159 @@ retests earlier in this project's history all failed (see the "Reverted, twice" 
 concurrency unit/integration suites was never in question; don't treat that as evidence of fitness
 for real concurrent load, and don't re-run `paper-benchmark-cxl` against it without being prepared
 for it to fail the same way again.
+
+## Performance: the background event pipeline on the GET path
+
+Per explicit request ("see what efficiencies can be made to the background eviction queue manager
+to get the best performance out of get requests"). Unlike most of the performance work above,
+which chased where *memory* goes, this one is about what a single `get()` costs the rest of the
+process — the background machinery every read feeds, not the read's own object-map lookup and byte
+copy.
+
+Traced the full per-read path first rather than guessing at hot spots. A cache read used to cost:
+(1) a `try_send` from the API thread into `WorkerManager`'s channel; (2) `WorkerManager` — a
+dedicated thread **spinning** on `try_recv` — popping it, cloning it, and pushing a copy into
+*every* sub-worker's channel including `TtlWorker`, whose `run` loop has no `Get` arm at all and
+discards it; (3) `PolicyWorker` sending a *second* channel message, per read, to `TraceWorker`;
+(4) `TraceWorker` copying a 13-byte record per hit into an on-disk temp file; (5)
+`apply_tier_migrations` republishing four gauges into `AtomicStatus`, per event, via four virtual
+calls and four atomic stores. Steps 3–4 exist for exactly one consumer,
+`reconstruct_policy_stack`, which replays the trace to rebuild a *different* policy's stack after
+a live policy switch — and every hybrid cache is constructed with a single fixed policy and
+exposes no way to switch, so that trace was being written and never read.
+
+### Methodology: measure the ceiling before optimizing toward it
+
+The first measurement attempt was nearly useless and worth recording as a trap. A throughput
+harness (temporary `tests/zz_get_bench.rs`, deleted after use: 20,000 x 4 KiB objects, 512 MB
+cache, 64 MB fast tier so demotion is real, 2M reads over a deterministic per-thread xorshift key
+stream, `BENCH_THREADS` selecting the client count) showed the changes landing at *zero* measurable
+difference. Correct, and uninformative: GET throughput in that harness is bound by the API thread's
+own hash + `DashMap` read + 4 KiB copy, so shaving worker-thread work is invisible. Two things
+made it informative:
+
+1. **A ceiling probe.** Temporarily gating the `WorkerEvent::Get` broadcast out of `get()` entirely
+   (behind a `OnceLock`-cached env check — note `std::env::var_os` per call would itself have
+   poisoned the measurement) answers "what does the background pipeline cost a read *at all*",
+   which bounds every possible optimization. Answer: **677K -> 834K gets/sec single-threaded
+   (+23%)**, 3.25M -> 3.63M at 8 threads. Large enough to be worth real work — and, crucially,
+   large enough that a change measuring "no difference" is a change that missed.
+2. **Sweeping the client-thread count** (1 / 4 / 8 on this 8-core box). Every conclusion below
+   flips sign somewhere in that sweep. A single-thread-only or 8-thread-only measurement would
+   have produced a confidently wrong answer either way.
+
+A second probe isolated *why* the pipeline was expensive: replacing `WorkerManager`'s
+`std::hint::spin_loop()` with a short sleep recovered ~4.5% on its own. The spinning thread was
+hammering the head/tail cache lines of the very channel the API threads were producing into.
+
+### Landed
+
+1. **`WorkerManager` (a thread) became `WorkerFanout` (an inline call).** The whole type existed to
+   pop one event and push copies of it to N sub-workers. Doing that on the calling thread removes
+   one channel round trip per operation, both horns of the receive-side dilemma (blocking `recv()`
+   parked on a futex — the ~30%-of-cycles problem that motivated the spin in the first place; the
+   spin traded that for producer-side cache-line contention), and an entire permanently-occupied
+   core. `PaperCache::worker_manager: Arc<WorkerSender>` became `workers: Arc<WorkerFanout>`; the
+   five construction sites lost their `unbounded()` + `thread::spawn(move || worker_manager.run())`
+   pair; `broadcast` became `self.workers.send(event)`. `WorkerFanout::send` hands the event itself
+   to the *last* subscriber and clones only for the ones before it, so the single-subscriber case
+   (every `Get`, after change 2) is a plain move — exactly the cost the old single unconditional
+   send into the manager's channel had.
+2. **Per-worker event subscription masks** (`EventMask` / `Events` in `worker/mod.rs`, one bit per
+   `WorkerEvent` variant plus one subscription constant per sub-worker; `WorkerEvent::mask_bit()`
+   maps a variant to its bit). `TtlWorker` no longer receives a copy of every read. `PolicyWorker`
+   is also deliberately *not* subscribed to `Promote` (delivered to the tiering worker directly via
+   its own `promotion_tx`, never routed back through the fan-out) or `Ttl` (no arm; an expiry
+   change doesn't reorder or resize anything a policy stack tracks). **Maintenance hazard worth
+   knowing**: a worker's mask and its `run` match arms are now a single edit — adding an arm
+   without adding the bit silently drops that event.
+3. **The trace subsystem is off unless a policy switch is actually reachable** (`trace_is_useful`:
+   `status.policies().len() > 1`). `PolicyWorker::trace_worker` became `Option<Sender<StackEvent>>`;
+   when `None`, no `TraceWorker` thread is spawned, the per-event `StackEvent` isn't even derived
+   (not just not sent), `apply_evictions` skips pushing eviction records into `buffered_events`, and
+   `flush_buffered_events` returns immediately. `PaperPolicy::Auto` doesn't change the condition:
+   auto-switching picks from the same `policies` list, so a one-entry list can only ever
+   "switch" to the policy already running. `handle_policy` grew a defensive early return for the
+   trace-disabled case — bailing *before* it clears `policy_stack`, since a reconstruction
+   that can never deliver would otherwise leave the worker with no stack, permanently.
+4. **`refresh_tier_gauges` split out of all 14 `apply_tier_migrations` siblings**, called once per
+   event-loop pass instead of once per event. These are pure gauges — a snapshot of state the
+   stack already owns — so republishing after each batch reports the same values as republishing
+   after each event; only the write frequency changes, and that frequency was putting four
+   virtual calls and four atomic stores into `AtomicStatus` on the path of every read. Still
+   unconditional (not gated on a migration having happened) — that gate is what let them go stale
+   indefinitely, see "Bug 2" above; this moves *when* the refresh runs, never *whether*.
+   `LfuHybridStack`'s `admission_latched` mirror moved with the gauges: the latch is one-way, so a
+   mirror lagging by one pass only means a handful of sets around the transition build `Fast` and
+   get corrected — the pre-latch behaviour, briefly, not an incorrect placement.
+5. **`PolicyWorker::run` reuses its event buffer** instead of `try_iter().collect::<Vec<_>>()` per
+   pass, so steady-state polling allocates nothing.
+
+### Measured (8-core box, 20k x 4 KiB working set, 2M reads, median of 5 runs)
+
+| client threads | before | after | delta |
+|---|---|---|---|
+| 1 | 684,195 | 685,608 | +0.2% |
+| 4 | 2,482,037 | 2,456,834 | -1.0% |
+| 8 | 3,184,438 | **4,223,833** | **+32.6%** |
+
+The shape is the point, and it's the reason the thread-count sweep mattered. The win arrives
+exactly at saturation, because that is when a dedicated fan-out thread stops being free work on a
+spare core and becomes a core taken away from the request path. Below saturation the spare core
+absorbed the fan-out, so doing it inline is a wash to marginally negative — the 4-thread column is
+within this harness's run-to-run spread. Note the 8-thread result (4.22M) also clears the earlier
+ceiling probe's 3.63M: that probe measured the pipeline's cost *with the manager thread still
+running*, so freeing its core is worth more than the entire per-read pipeline it was serving.
+
+### Tried, measured, reverted: draining the backlog instead of sleeping
+
+`delay_event_loop` sleeps `SHORT_POLLING_DURATION` (1 ms) after every pass, including when the pass
+just processed a full batch and more work is already queued. That looks obviously wrong — the
+backlog visibly grows, and every decision the loop makes (demotions, evictions, the ordering a
+subsequent GET is served against) runs that much further behind reality — so it was changed to
+return immediately whenever the pass had events.
+
+Measured: **-24% at 8 threads** (4.20M -> 3.17M gets/sec). `thread::yield_now()` in place of the
+sleep measured the same as the spin (3.15M), because with every client thread runnable a yield
+returns almost immediately. Reverted; the sleep is now documented as load-bearing with those
+numbers attached, so it doesn't get "fixed" again. The reasoning it was reverted on: this thread
+shares cores with the request path, and `try_iter()` drains everything accumulated during the
+sleep, so sleeping costs staleness bounded by the polling interval but *not* throughput — the
+queue does not grow without bound, it stabilizes at whatever arrived during one poll interval.
+Skipping the sleep converts the loop into a spin competing with the clients it exists to serve.
+
+This is the same lesson as the migration-parallelization sections above, arrived at independently:
+on a core-constrained box, making a background worker more eager is a transfer from the request
+path, not a free improvement.
+
+### Verified
+
+All 23 feature-flag build combos compile (all 14 hybrid variants, `all_dram`, `key_value_pmem`,
+`global_hashtable_pmem`, `hashbrown_dram`, `eviction_stacks_pmem`, `tiering`, `multitiering`,
+`key_value_pmem,enable_tiering_manager` — the 3-sub-worker fan-out path — and
+`lru_hybrid_cache,eviction_stacks_pmem`). Unit suites pass unchanged (240 lru, 240 lfu, 241 two_q,
+241 fifo, 243 lru_sized, 232 all_dram, 230 key_value_pmem, 233 global_hashtable_pmem, 230
+hashbrown_dram). All five real-PMEM hybrid integration suites pass twice consecutively at their
+documented baselines (15/15 +2 ignored lru, 19/19 lfu, 18/18 two_q, 14/14 fifo, 20/20 lru_sized),
+as does `tiering_integration` (3/3).
+
+The 33 worker unit tests that drive `apply_tier_migrations()` directly and then assert on gauges
+now also call `refresh_tier_gauges()`, mirroring what `run()` does — the split is internal, so the
+tests had to follow it rather than the behaviour having changed.
+
+One honest caveat: a single `two_q_hybrid_cache_integration` failure appeared once mid-session and
+did not reproduce in 8 consecutive re-runs afterward; the test name wasn't captured before it was
+lost. Consistent with that suite's already-documented timing sensitivity, but unproven.
+
+### Noticed, deliberately not done (outside the worker pipeline)
+
+- **`AtomicStatus` has no cache-line separation between hot-read and hot-write groups.** The
+  per-read `total_hits`/`total_gets` counters live in the same struct as `base_used_size`/
+  `num_objects` and every hybrid's worker-written gauges, with `repr(Rust)` layout, so nothing
+  prevents an API-thread counter from sharing a 64-byte line with a worker-written gauge. Change 4
+  removes most of the *frequency* of those worker writes without addressing the layout. Fixing it
+  properly needs `#[repr(C)]` plus explicit padding (no `crossbeam-utils` dependency today, so no
+  `CachePadded`), which is a `status.rs` change, not a worker one.
+- **`incr_hits` does two contended read-modify-writes per read** (`total_gets` and `total_hits`) on
+  lines shared by every client thread. Sharded or per-thread counters would fix it, but that
+  changes `Status`'s semantics and is well outside "the background eviction queue manager".

@@ -79,7 +79,23 @@ pub struct PolicyWorker<K, V> {
 	policy_stack: Option<Box<dyn PolicyStack>>,
 
 	trace_fragments: Arc<RwLock<VecDeque<TraceFragment>>>,
-	trace_worker: Sender<StackEvent>,
+	/// Sender into `TraceWorker`, or `None` when access tracing is switched
+	/// off entirely (see `trace_is_useful`).
+	///
+	/// The trace exists for exactly one purpose: replaying past accesses to
+	/// rebuild a *different* policy's stack after a live policy switch (see
+	/// `handle_policy` -> `reconstruct_policy_stack`). A cache configured with
+	/// a single policy -- which is every hybrid cache, and any `paper-server`
+	/// instance pinned to one eviction policy -- can never perform that
+	/// switch, so every byte it records is written and never read.
+	///
+	/// Leaving it on wasn't free: each cache read produced a second channel
+	/// send from this thread into `TraceWorker`, which then copied a 13-byte
+	/// chunk per hit into an on-disk temp file and flushed it once a second.
+	/// At this crate's real request rates that is tens of MB/s of pure write
+	/// amplification, plus a whole extra thread competing for cores with the
+	/// GET path, in service of a reconstruction that can never be requested.
+	trace_worker: Option<Sender<StackEvent>>,
 	/// `TraceWorker`'s own thread handle -- `None` after `WorkerEvent::
 	/// Shutdown` has already been handled once (joined and taken; see the
 	/// `run` loop's `Shutdown` arm), `Some` otherwise. Owned here (not by
@@ -126,14 +142,21 @@ where
 		let policy_reconstruct_tx = Arc::new(policy_reconstruct_tx);
 		let mut buffered_events = Vec::<StackEvent>::new();
 
+		// Drained into and reused across iterations rather than re-collected
+		// into a fresh `Vec` each pass. The collect is needed at all only
+		// because `try_iter()` borrows `self.listener` while the loop body
+		// needs `&mut self`; keeping one buffer alive means a steady-state
+		// poll allocates nothing, instead of allocating (and, under bursty
+		// load, repeatedly growing) a new one every millisecond.
+		let mut events = Vec::<WorkerEvent>::new();
+
 		loop {
-			let events = self.listener
-				.try_iter()
-				.collect::<Vec<WorkerEvent>>();
+			events.clear();
+			events.extend(self.listener.try_iter());
 
 			let mut has_current_set = false;
 
-			for event in events {
+			for event in events.drain(..) {
 				match event {
 					WorkerEvent::Get(key, hit) => self.handle_get(key, hit),
 
@@ -160,7 +183,9 @@ where
 						// exited on its own (e.g. a prior error return),
 						// the send is simply a no-op and the join returns
 						// immediately.
-						let _ = self.trace_worker.send(StackEvent::Shutdown);
+						if let Some(trace_worker) = &self.trace_worker {
+							let _ = trace_worker.send(StackEvent::Shutdown);
+						}
 
 						if let Some(handle) = self.trace_handle.take() {
 							let _ = handle.join();
@@ -172,14 +197,21 @@ where
 					_ => {},
 				}
 
-				if let Some(stack_event) = StackEvent::maybe_from_worker_event(&event) {
-					if self.policy_stack.is_some() {
-						if let Err(err) = self.trace_worker.send(stack_event) {
-							error!("Could not send stack event to trace worker: {err:?}");
-							return Err(CacheError::Internal);
+				// Skipped entirely when tracing is off (see `trace_worker`'s
+				// doc comment) -- not just the send, but deriving the
+				// `StackEvent` in the first place. This is the per-access cost
+				// that a single-policy cache was paying for a replay it can
+				// never perform.
+				if let Some(trace_worker) = &self.trace_worker {
+					if let Some(stack_event) = StackEvent::maybe_from_worker_event(&event) {
+						if self.policy_stack.is_some() {
+							if let Err(err) = trace_worker.send(stack_event) {
+								error!("Could not send stack event to trace worker: {err:?}");
+								return Err(CacheError::Internal);
+							}
+						} else {
+							buffered_events.push(stack_event);
 						}
-					} else {
-						buffered_events.push(stack_event);
 					}
 				}
 
@@ -228,6 +260,14 @@ where
 			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
 			self.apply_tier_migrations();
 
+			// Once per pass, after every migration and eviction this pass
+			// could produce has already been applied -- so what gets published
+			// here is exactly as current as a per-event refresh would have
+			// left it, without putting those stores on the per-read path. See
+			// `refresh_tier_gauges`.
+			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
+			self.refresh_tier_gauges();
+
 			let now = Instant::now();
 
 			if let Some(policy) = self.perform_auto_policy(now, has_current_set) {
@@ -263,19 +303,11 @@ where
 		let policy_stack = init_policy_stack(policy, max_cache_size);
 
 		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
-		let (trace_worker, trace_listener) = unbounded();
-
-		let trace_handle = Some(register_worker(TraceWorker::new(
-			trace_listener,
-			trace_fragments.clone(),
-		)));
-
-		// we need the initial size so we can accurately reconstruct the
-		// policy stacks after the cache is resized
-		if let Err(err) = trace_worker.send(StackEvent::Resize(status.max_size())) {
-			error!("Could not send initial cache size to trace worker: {err:?}");
-			return Err(CacheError::Internal);
-		}
+		let (trace_worker, trace_handle) = spawn_trace_worker(
+			trace_is_useful(&status),
+			&trace_fragments,
+			status.max_size(),
+		)?;
 
 		let worker = PolicyWorker {
 			listener,
@@ -355,18 +387,15 @@ where
 		let policy = status.policy();
 		let policy_stack = init_policy_stack(policy, max_cache_size);
 
+		// A hybrid cache is always constructed with a single fixed policy and
+		// exposes no way to switch it, so `trace_is_useful` is always false
+		// here -- no `TraceWorker` thread, and no per-access trace writes.
 		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
-		let (trace_worker, trace_listener) = unbounded();
-
-		let trace_handle = Some(register_worker(TraceWorker::new(
-			trace_listener,
-			trace_fragments.clone(),
-		)));
-
-		if let Err(err) = trace_worker.send(StackEvent::Resize(status.max_size())) {
-			error!("Could not send initial cache size to trace worker: {err:?}");
-			return Err(CacheError::Internal);
-		}
+		let (trace_worker, trace_handle) = spawn_trace_worker(
+			trace_is_useful(&status),
+			&trace_fragments,
+			status.max_size(),
+		)?;
 
 		let worker = PolicyWorker {
 			listener,
@@ -470,6 +499,21 @@ where
 		policy_reconstruct_tx: Arc<Sender<Box<dyn PolicyStack>>>,
 	) {
 		if policy.is_auto() || policy == *self.current_policy.read() {
+			return;
+		}
+
+		// Defensive: reconstruction replays the access trace, so without one
+		// there is nothing to rebuild the new stack from. Bail before the
+		// teardown below rather than after -- clearing `policy_stack` for a
+		// reconstruction that can never deliver would leave this worker with
+		// no stack at all, permanently. Unreachable in practice: tracing is
+		// only off when a single policy is configured, and both callers
+		// (`WorkerEvent::Policy`, itself validated against the configured
+		// policy list by `PaperCache::policy()`, and `perform_auto_policy`,
+		// which picks from that same list) can then only ever name the policy
+		// already running, which the equality check above already caught.
+		if self.trace_worker.is_none() {
+			warn!("Ignoring switch to {policy}: policy reconstruction is disabled");
 			return;
 		}
 
@@ -608,10 +652,31 @@ where
 				});
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "lru_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		// Refreshed unconditionally (not gated on `migrations` being
-		// non-empty): this runs once per event now, so it's cheap, and
-		// gating it on "a migration just happened" left `lru_hybrid_stats`'s
+		// non-empty): gating it on "a migration just happened" left
+		// `lru_hybrid_stats`'s
 		// `fast_objects`/`slow_objects`/`fast_bytes_used`/`slow_bytes_used`
 		// able to go stale and never catch up to the stack's true state --
 		// e.g. the tail of a large insert burst that happens to land without
@@ -661,8 +726,6 @@ where
 	#[cfg(feature = "lfu_hybrid_cache")]
 	fn apply_tier_migrations(&mut self) {
 		let Some(stack) = &mut self.policy_stack else { return };
-
-		self.status.set_lfu_hybrid_admission_latched(stack.admission_latched());
 
 		let migrations = stack.drain_tier_migrations();
 
@@ -725,6 +788,38 @@ where
 
 			let demotions = stack.drain_demotions();
 			self.status.record_lfu_hybrid_demotions(demotions);
+		}
+	}
+
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "lfu_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
+		// Mirrored alongside the gauges for the same reason, and with the
+		// same safety: the latch is one-way (it closes when the fast tier
+		// first fills and never reopens except on `clear`), so a mirror
+		// that lags by one pass of the event loop only means a handful of
+		// sets around the transition build `Fast` and get corrected --
+		// exactly the behaviour that existed before the latch, for a
+		// moment, rather than any incorrect placement.
+		if let Some(stack) = &self.policy_stack {
+			self.status.set_lfu_hybrid_admission_latched(stack.admission_latched());
 		}
 
 		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
@@ -808,7 +903,28 @@ where
 				});
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "two_q_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
 		// comment on this same pattern for why gating it on `migrations`
 		// being non-empty let these gauges go stale and never catch up.
@@ -897,7 +1013,28 @@ where
 				promotions.into_iter().for_each(apply_physical);
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "fifo_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
 		// comment on this same pattern for why gating it on `migrations`
 		// being non-empty let these gauges go stale and never catch up.
@@ -982,7 +1119,28 @@ where
 				});
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "lru_sized_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
 		// comment on this same pattern for why gating it on `migrations`
 		// being non-empty let these gauges go stale and never catch up.
@@ -1074,7 +1232,28 @@ where
 				});
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "s3_fifo_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
 		// comment on this same pattern for why gating it on `migrations`
 		// being non-empty let these gauges go stale and never catch up.
@@ -1152,7 +1331,28 @@ where
 				});
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "two_q_ghost_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		if let Some(stack) = &self.policy_stack {
 			self.status.set_two_q_ghost_hybrid_gauges(
 				stack.fast_bytes_used(),
@@ -1228,7 +1428,28 @@ where
 				});
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		if let Some(stack) = &self.policy_stack {
 			self.status.set_s3_fifo_ghost_hybrid_gauges(
 				stack.fast_bytes_used(),
@@ -1305,7 +1526,28 @@ where
 				});
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		if let Some(stack) = &self.policy_stack {
 			self.status.set_s3_fifo_ghost_lazy_demotion_hybrid_gauges(
 				stack.fast_bytes_used(),
@@ -1384,7 +1626,28 @@ where
 				});
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		if let Some(stack) = &self.policy_stack {
 			self.status.set_s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_gauges(
 				stack.fast_bytes_used(),
@@ -1461,7 +1724,28 @@ where
 				});
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		if let Some(stack) = &self.policy_stack {
 			self.status.set_s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_gauges(
 				stack.fast_bytes_used(),
@@ -1537,7 +1821,28 @@ where
 				});
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		if let Some(stack) = &self.policy_stack {
 			self.status.set_s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_gauges(
 				stack.fast_bytes_used(),
@@ -1608,7 +1913,28 @@ where
 				});
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		if let Some(stack) = &self.policy_stack {
 			self.status.set_s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_gauges(
 				stack.fast_bytes_used(),
@@ -1679,7 +2005,28 @@ where
 				});
 			}
 		}
+	}
 
+	/// Republishes the active hybrid stack's tier gauges onto
+	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
+	/// accessor.
+	///
+	/// Split out of `apply_tier_migrations` and called once per pass of
+	/// the event loop rather than once per event. These are pure gauges --
+	/// a snapshot of state the stack already owns -- so republishing them
+	/// after each batch reports exactly the same values as republishing
+	/// after each event; only the write frequency changes. That frequency
+	/// mattered: it put four virtual calls and four atomic stores into
+	/// `AtomicStatus` on the path of every single cache read, and those
+	/// stores land in the same struct the API threads are concurrently
+	/// incrementing their hit/miss counters in.
+	///
+	/// Still unconditional (not gated on a migration having happened):
+	/// that gate is what let these gauges go stale indefinitely -- see the
+	/// note in `apply_tier_migrations` -- and removing it is what fixed
+	/// them. This only moves *when* the refresh runs, not *whether*.
+	#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
+	fn refresh_tier_gauges(&mut self) {
 		if let Some(stack) = &self.policy_stack {
 			self.status.set_s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_gauges(
 				stack.fast_bytes_used(),
@@ -1724,6 +2071,14 @@ where
 		&self,
 		buffered_events: &mut Vec<StackEvent>,
 	) -> Result<(), CacheError> {
+		// Nothing ever buffers when tracing is off (both producers -- the run
+		// loop's stack-event derivation and `apply_evictions`' eviction
+		// record -- are gated on the same `Option`), so this is a plain
+		// no-op rather than a silent drop.
+		let Some(trace_worker) = &self.trace_worker else {
+			return Ok(());
+		};
+
 		if self.mini_index.is_some() {
 			// the mini policy is still running so stack events should be buffered
 			// until the full stack is reconstructed
@@ -1731,7 +2086,7 @@ where
 		}
 
 		for event in buffered_events.iter() {
-			if let Err(err) = self.trace_worker.send(event.clone()) {
+			if let Err(err) = trace_worker.send(event.clone()) {
 				error!("Could not send buffered event to trace worker: {err:?}");
 				return Err(CacheError::Internal);
 			}
@@ -1858,7 +2213,14 @@ where
 				self.status.record_s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_eviction();
 			}
 
-			buffered_events.push(StackEvent::Del(key));
+			// Only recorded when something can replay it. Without this gate an
+			// eviction-heavy workload would keep pushing into a `Vec` that
+			// `flush_buffered_events` now clears without sending, which is
+			// merely wasted work -- but wasted work inside the eviction loop,
+			// which is precisely the loop GET latency waits on.
+			if self.trace_worker.is_some() {
+				buffered_events.push(StackEvent::Del(key));
+			}
 		}
 
 		Ok(())
@@ -1916,6 +2278,20 @@ where
 		self.mini_stack_manager.get_optimal_policy(&self.current_policy.read())
 	}
 
+	/// Parks this thread between polls.
+	///
+	/// The sleep is unconditional, including when the poll just processed a
+	/// full batch and more work is already queued. That looks like it should
+	/// be wrong -- the backlog visibly grows -- but it is load-bearing, and
+	/// measured: this thread shares its cores with the request path, and
+	/// `try_iter()` drains everything that accumulated during the sleep, so
+	/// sleeping costs staleness (bounded by the polling interval) but not
+	/// throughput. Skipping the sleep while work remains turns this loop into
+	/// a spin that competes with the clients it exists to serve. On an 8-core
+	/// box with 8 client threads and a 20k x 4 KiB working set, that cost
+	/// 4.20M -> 3.17M gets/sec; `thread::yield_now()` in place of the sleep
+	/// measured the same as the spin (3.15M), because with every client
+	/// thread runnable a yield returns almost immediately.
 	fn delay_event_loop(&mut self, now: Instant, has_current_set: bool) {
 		let has_recent_set = self.last_set_time
 			.is_some_and(|last_set_time| now - last_set_time <= SET_RECENCY_DURATION);
@@ -1932,6 +2308,56 @@ where
 
 		thread::sleep(delay);
 	}
+}
+
+/// Whether this cache can ever actually *use* an access trace.
+///
+/// The trace's only consumer is `reconstruct_policy_stack`, which replays it
+/// to rebuild a different policy's stack after a live policy switch. A switch
+/// requires a second policy to switch *to*: `PaperCache::policy()` rejects
+/// anything outside the configured `policies` list, and `handle_policy`
+/// early-returns when the requested policy already matches the current one.
+/// So with a single configured policy -- every hybrid cache, and any
+/// single-policy `paper-server` deployment -- reconstruction is unreachable
+/// and every trace write is dead weight on the hot path.
+///
+/// `PaperPolicy::Auto` doesn't change this: it drives `perform_auto_policy`,
+/// which picks from the same `policies` list via the mini stacks, so a
+/// one-entry list can only ever "switch" to the policy already running.
+fn trace_is_useful(status: &StatusRef) -> bool {
+	status.policies().len() > 1
+}
+
+/// Spawns `TraceWorker` and seeds it with the cache's starting size, or
+/// returns `(None, None)` when tracing is off (see `trace_is_useful`).
+///
+/// The initial `Resize` matters for reconstruction accuracy: a replay has to
+/// know the size the cache was at when the recorded accesses happened.
+fn spawn_trace_worker(
+	enabled: bool,
+	trace_fragments: &Arc<RwLock<VecDeque<TraceFragment>>>,
+	max_size: CacheSize,
+) -> Result<
+	(Option<Sender<StackEvent>>, Option<thread::JoinHandle<Result<(), CacheError>>>),
+	CacheError,
+> {
+	if !enabled {
+		return Ok((None, None));
+	}
+
+	let (trace_worker, trace_listener) = unbounded();
+
+	let trace_handle = register_worker(TraceWorker::new(
+		trace_listener,
+		trace_fragments.clone(),
+	));
+
+	if let Err(err) = trace_worker.send(StackEvent::Resize(max_size)) {
+		error!("Could not send initial cache size to trace worker: {err:?}");
+		return Err(CacheError::Internal);
+	}
+
+	Ok((Some(trace_worker), Some(trace_handle)))
 }
 
 fn reconstruct_policy_stack(
@@ -2144,6 +2570,7 @@ mod lru_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10); // demotes key 1
 
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let snapshot = status.lru_hybrid_stats();
 		assert_eq!(snapshot.demotions, 1);
@@ -2173,11 +2600,13 @@ mod lru_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10); // demotes 1
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		// Accessing the now-slow key promotes it, which may itself demote
 		// key 2 (the new fast-tier LRU tail).
 		worker.handle_get(1, true);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let snapshot = status.lru_hybrid_stats();
 		assert_eq!(snapshot.promotions, 1);
@@ -2199,6 +2628,7 @@ mod lru_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 15);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let mut buffered_events = Vec::new();
 		worker.apply_evictions(&mut buffered_events).unwrap();
@@ -2233,6 +2663,7 @@ mod lru_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10);
 
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 	}
 }
 
@@ -2348,6 +2779,7 @@ mod lfu_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10);
 
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let snapshot = status.lfu_hybrid_stats();
 		assert_eq!(snapshot.demotions, 0);
@@ -2375,19 +2807,23 @@ mod lfu_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 15);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		// Bump key 1 so key 2 is unambiguously the fast tier's minimum.
 		worker.handle_get(1, true);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		// Fast tier is full -> key 3 is admitted directly to slow.
 		insert(&objects, &status, &overhead_manager, &mut worker, 3, 15);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		// Bump key 3 past the fast minimum (key 2, count 1) -> promotes,
 		// which must demote key 2 to make room.
 		worker.handle_get(3, true);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let snapshot = status.lfu_hybrid_stats();
 		assert_eq!(snapshot.promotions, 1);
@@ -2411,6 +2847,7 @@ mod lfu_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 15);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let mut buffered_events = Vec::new();
 		worker.apply_evictions(&mut buffered_events).unwrap();
@@ -2445,6 +2882,7 @@ mod lfu_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10);
 
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 	}
 }
 
@@ -2547,6 +2985,7 @@ mod fifo_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10); // demotes key 1 (oldest)
 
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let snapshot = status.fifo_hybrid_stats();
 		assert_eq!(snapshot.demotions, 1);
@@ -2572,6 +3011,7 @@ mod fifo_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10); // demotes 1
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let snapshot_before = status.fifo_hybrid_stats();
 		assert_eq!(snapshot_before.demotions, 1);
@@ -2579,6 +3019,7 @@ mod fifo_hybrid_tests {
 		// A "hit" on the now-slow key must be a total no-op.
 		worker.handle_get(1, true);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let snapshot_after = status.fifo_hybrid_stats();
 		assert_eq!(snapshot_after.demotions, snapshot_before.demotions);
@@ -2602,6 +3043,7 @@ mod fifo_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 15);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let mut buffered_events = Vec::new();
 		worker.apply_evictions(&mut buffered_events).unwrap();
@@ -2636,6 +3078,7 @@ mod fifo_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10);
 
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 	}
 }
 
@@ -2729,6 +3172,7 @@ mod two_q_hybrid_tests {
 
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15); // fifo, slow
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		// Admission produces no migration (physical and logical tier already
 		// agree — see decision 3 in CLAUDE.md's `two_q_hybrid_cache` section),
@@ -2744,6 +3188,7 @@ mod two_q_hybrid_tests {
 		// Accessing the FIFO key promotes it straight to Main/Fast.
 		worker.handle_get(1, true);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let snapshot = status.two_q_hybrid_stats();
 		assert_eq!(snapshot.promotions, 1);
@@ -2762,14 +3207,17 @@ mod two_q_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 15);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		worker.handle_get(1, true); // promote 1 -> Main/Fast
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		// Fast tier only fits one 15-byte object, so promoting key 2 must
 		// demote key 1 back down.
 		worker.handle_get(2, true);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let snapshot = status.two_q_hybrid_stats();
 		assert_eq!(snapshot.promotions, 2);
@@ -2786,6 +3234,7 @@ mod two_q_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 15);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let mut buffered_events = Vec::new();
 		worker.apply_evictions(&mut buffered_events).unwrap();
@@ -2819,6 +3268,7 @@ mod two_q_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10);
 
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 	}
 }
 
@@ -2935,6 +3385,7 @@ mod lru_sized_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10); // demotes key 1
 
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let snapshot = status.lru_sized_hybrid_stats();
 		assert_eq!(snapshot.demotions, 1);
@@ -2963,9 +3414,11 @@ mod lru_sized_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10); // demotes 1
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		worker.handle_get(1, true);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let snapshot = status.lru_sized_hybrid_stats();
 		assert_eq!(snapshot.promotions, 1);
@@ -2982,6 +3435,7 @@ mod lru_sized_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 15);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let mut buffered_events = Vec::new();
 		worker.apply_evictions(&mut buffered_events).unwrap();
@@ -3013,6 +3467,7 @@ mod lru_sized_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 10);
 
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 	}
 
 	#[test]
@@ -3030,6 +3485,7 @@ mod lru_sized_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);  // small
 		insert(&objects, &status, &overhead_manager, &mut worker, 2, 200); // large
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		assert_eq!(status.lru_sized_hybrid_stats().small_fast_objects, 1);
 		assert_eq!(status.lru_sized_hybrid_stats().large_fast_objects, 1);
@@ -3038,6 +3494,7 @@ mod lru_sized_hybrid_tests {
 		// touching key 2 in the large segment.
 		worker.handle_resize_fast_tier(0);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let snapshot = status.lru_sized_hybrid_stats();
 		assert_eq!(snapshot.demotions, 1);
@@ -3059,6 +3516,7 @@ mod lru_sized_hybrid_tests {
 
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15); // small
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 		assert_eq!(status.lru_sized_hybrid_stats().small_fast_objects, 1);
 
 		let before = status.lru_sized_hybrid_stats();
@@ -3069,6 +3527,7 @@ mod lru_sized_hybrid_tests {
 		// segment.
 		worker.handle_set(1, large_base as ObjectSize);
 		worker.apply_tier_migrations();
+		worker.refresh_tier_gauges();
 
 		let after = status.lru_sized_hybrid_stats();
 		assert_eq!(after.small_fast_objects, 0);

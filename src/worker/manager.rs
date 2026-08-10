@@ -5,9 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::sync::Arc;
 use typesize::TypeSize;
-use crossbeam_channel::{unbounded, TryRecvError};
+use crossbeam_channel::unbounded;
 use log::error;
 
 use crate::{
@@ -16,16 +15,19 @@ use crate::{
 	OverheadManagerRef,
 	error::CacheError,
 	worker::{
-		Worker,
 		WorkerEvent,
 		WorkerSender,
-		WorkerReceiver,
 		WorkerHandles,
+		EventMask,
+		Events,
 		PolicyWorker,
 		TtlWorker,
 		register_worker,
 	},
 };
+
+#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
+use std::sync::Arc;
 
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 use crate::{
@@ -36,72 +38,105 @@ use crate::{
 #[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
 use crate::worker::policy::Tier;
 
-pub struct WorkerManager {
-	listener: WorkerReceiver,
-	workers: Arc<Box<[WorkerSender]>>,
+/// Routes each `WorkerEvent` to the background workers that consume it.
+///
+/// This used to be a background thread of its own: `PaperCache` pushed every
+/// event into *its* channel, and it looped popping events back out, cloning
+/// each one, and pushing the copies into each sub-worker's channel. That cost
+/// every cache operation two channel round trips instead of one, and the pop
+/// side had no good options -- blocking `recv()` parked on a real futex
+/// between nearly every event (~30%+ of process cycles in `futex_wait`/
+/// `futex_wake`/`sched_yield`, measured under `perf` against
+/// paper-benchmark-cxl), so it was changed to a non-blocking spin, which
+/// traded that for a thread hammering the head/tail cache lines of the very
+/// channel the API threads were producing into, plus a permanently occupied
+/// core.
+///
+/// Fanning out inline on the calling thread removes the whole dilemma: no
+/// futex, no spin, no extra core, and one channel push per interested worker
+/// instead of one push, one pop, and one push per interested worker. With
+/// `Events`' per-worker masks a `Get` -- the dominant event in a read-heavy
+/// workload -- now reaches exactly one channel (`PolicyWorker`'s), so a cache
+/// read costs a single uncontended push.
+///
+/// Measured on an 8-core box, 20k x 4 KiB working set, 2M reads, median of 5
+/// (gets/sec, before -> after):
+///
+/// | client threads | before | after |
+/// |---|---|---|
+/// | 1 | 684,195 | 685,608 |
+/// | 4 | 2,482,037 | 2,456,834 |
+/// | 8 | 3,184,438 | 4,223,833 |
+///
+/// The shape of that is the point: the win arrives exactly when the machine
+/// is saturated, because that is when a dedicated fan-out thread stops being
+/// free work on a spare core and starts being a core taken away from the
+/// request path. Below saturation the extra core absorbed the fan-out, so
+/// doing it inline is a wash to marginally negative (the 4-thread column is
+/// -1%, at the edge of this harness's run-to-run spread).
+///
+/// One property is deliberately given up: events no longer pass through a
+/// single serialization point, so two *different* API threads' events can
+/// reach two different sub-workers in opposite relative orders. Nothing
+/// depends on that. `PolicyWorker` and `TtlWorker` consume disjoint concerns
+/// (eviction ordering vs. expiry bookkeeping), each individual channel is
+/// still FIFO so a single thread's own events stay ordered relative to each
+/// other, and two threads racing on the same key were already unordered --
+/// a thread can be preempted between its object-map write and its broadcast,
+/// so the old single-channel funnel never implied the events arrived in the
+/// order the map was actually mutated.
+pub struct WorkerFanout {
+	/// Each sub-worker's sender paired with the set of `WorkerEvent` variants
+	/// its own `run` loop actually has an arm for -- see `Events`' per-worker
+	/// subscription constants. Anything outside a worker's mask is dropped
+	/// here rather than cloned, sent, and discarded on the far side.
+	workers: Box<[(WorkerSender, EventMask)]>,
 }
 
-impl Worker for WorkerManager {
-	// Busy-polls via `try_recv` rather than blocking on `recv`. Measured
-	// directly (real `perf record` profiling against paper-benchmark-cxl,
-	// both a PMEM-mixed and an all-DRAM config): at this crate's real
-	// single-client request rates, the gap between successive get()/set()
-	// calls consistently exceeds crossbeam's internal spin/yield backoff
-	// window, so this thread's blocking `recv()` was parking via a real
-	// OS futex between nearly every event -- ~30%+ of total CPU cycles
-	// went to futex_wait/futex_wake/sched_yield machinery in both configs,
-	// not to any allocator-specific cost. `PolicyWorker`/`TtlWorker` never
-	// had this problem: both already drain via `try_iter()` (non-blocking)
-	// in their own `run()` loops -- this was the one remaining blocking
-	// wait in the whole worker architecture.
-	//
-	// Trade-off, accepted deliberately: this thread now spins continuously
-	// rather than sleeping between events, permanently consuming one CPU
-	// core even when the cache is idle. Only worth it because there's a
-	// core to spare in this crate's real deployment/benchmark shape (a
-	// handful of worker threads on an 8-core machine) -- if that's ever
-	// not true, this trades a real latency win for a real throughput/power
-	// cost elsewhere.
-	fn run(&mut self) -> Result<(), CacheError> {
-		loop {
-			let event = match self.listener.try_recv() {
-				Ok(event) => event,
-				Err(TryRecvError::Empty) => {
-					std::hint::spin_loop();
-					continue;
-				},
-				Err(TryRecvError::Disconnected) => return Ok(()),
-			};
+impl WorkerFanout {
+	/// Delivers `event` to every sub-worker subscribed to its variant.
+	///
+	/// Runs on the caller's thread -- this is the hot path for `get`/`set`,
+	/// so the per-worker mask test exists to keep an uninterested worker from
+	/// costing a clone and a channel push.
+	pub fn send(&self, event: WorkerEvent) -> Result<(), CacheError> {
+		let bit = event.mask_bit();
 
-			// Forward first (every sub-worker needs its own copy of
-			// `Shutdown` to stop its own loop -- see each `Worker::run`
-			// impl), *then* stop ourselves. Don't join the sub-workers
-			// here: `PaperCache::drop` already holds their `JoinHandle`s
-			// directly (see `WorkerHandles`, returned from `WorkerManager::
-			// new`/`new_with_tier_migration` at construction time) and
-			// joins them itself after this thread's own handle, so a
-			// second join here would be redundant, not incorrect, but
-			// pointless complexity.
-			let is_shutdown = matches!(event, WorkerEvent::Shutdown);
+		// Hand the event itself to the last subscriber and clone only for the
+		// ones before it, so the common case -- a `Get`, which after the mask
+		// filter has exactly one subscriber -- costs a plain move, exactly as
+		// it did when this was a single unconditional send into the manager's
+		// channel. Deferring by one keeps that without needing to know the
+		// subscriber count up front.
+		let mut pending: Option<&WorkerSender> = None;
 
-			for worker in self.workers.iter() {
-				if let Err(err) = worker.try_send(event.clone()) {
-					error!("Could not send event to worker: {err:?}");
-					return Err(CacheError::Internal);
-				}
+		for (worker, mask) in self.workers.iter() {
+			if bit & mask == 0 {
+				continue;
 			}
 
-			if is_shutdown {
-				return Ok(());
+			if let Some(previous) = pending.replace(worker) {
+				Self::deliver(previous, event.clone())?;
 			}
 		}
-	}
-}
 
-impl WorkerManager {
+		match pending {
+			Some(last) => Self::deliver(last, event),
+			None => Ok(()),
+		}
+	}
+
+	fn deliver(worker: &WorkerSender, event: WorkerEvent) -> Result<(), CacheError> {
+		if let Err(err) = worker.try_send(event) {
+			error!("Could not send event to worker: {err:?}");
+			return Err(CacheError::Internal);
+		}
+
+		Ok(())
+	}
+
 	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 	pub fn new<K, V>(
-		listener: WorkerReceiver,
 		objects: &ObjectMapRef<K, V>,
 		status: &StatusRef,
 		overhead_manager: &OverheadManagerRef,
@@ -140,23 +175,17 @@ impl WorkerManager {
 			tiering_manager.clone(),
 		)));
 
-		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
-			policy_worker,
-			ttl_worker,
-			tiering_worker,
-		]));
+		let workers: Box<[(WorkerSender, EventMask)]> = Box::new([
+			(policy_worker, Events::POLICY_WORKER),
+			(ttl_worker, Events::TTL_WORKER),
+			(tiering_worker, Events::TIERING_WORKER),
+		]);
 
-		let manager = WorkerManager {
-			listener,
-			workers,
-		};
-
-		Ok((manager, handles))
+		Ok((WorkerFanout { workers }, handles))
 	}
 
 	#[cfg(all(not(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))))]
 	pub fn new<K, V>(
-		listener: WorkerReceiver,
 		objects: &ObjectMapRef<K, V>,
 		status: &StatusRef,
 		overhead_manager: &OverheadManagerRef,
@@ -185,20 +214,15 @@ impl WorkerManager {
 			overhead_manager.clone(),
 		)));
 
-		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
-			policy_worker,
-			ttl_worker,
-		]));
+		let workers: Box<[(WorkerSender, EventMask)]> = Box::new([
+			(policy_worker, Events::POLICY_WORKER),
+			(ttl_worker, Events::TTL_WORKER),
+		]);
 
-		let manager = WorkerManager {
-			listener,
-			workers,
-		};
-
-		Ok((manager, handles))
+		Ok((WorkerFanout { workers }, handles))
 	}
 
-	/// Creates a `WorkerManager` whose policy worker physically migrates
+	/// Creates a `WorkerFanout` whose policy worker physically migrates
 	/// object bytes between tiers whenever `PaperPolicy::LruHybrid`,
 	/// `PaperPolicy::LfuHybrid`, `PaperPolicy::TwoQHybrid`, or
 	/// `PaperPolicy::FifoHybrid` reports a promotion or demotion. `migrate`
@@ -210,7 +234,6 @@ impl WorkerManager {
 	/// parameter is needed here.
 	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
 	pub fn new_with_tier_migration<K, V>(
-		listener: WorkerReceiver,
 		objects: &ObjectMapRef<K, V>,
 		status: &StatusRef,
 		overhead_manager: &OverheadManagerRef,
@@ -240,18 +263,12 @@ impl WorkerManager {
 			overhead_manager.clone(),
 		)));
 
-		let workers: Arc<Box<[WorkerSender]>> = Arc::new(Box::new([
-			policy_worker,
-			ttl_worker,
-		]));
+		let workers: Box<[(WorkerSender, EventMask)]> = Box::new([
+			(policy_worker, Events::POLICY_WORKER),
+			(ttl_worker, Events::TTL_WORKER),
+		]);
 
-		let manager = WorkerManager {
-			listener,
-			workers,
-		};
-
-		Ok((manager, handles))
+		Ok((WorkerFanout { workers }, handles))
 	}
 }
 
-unsafe impl Send for WorkerManager {}
