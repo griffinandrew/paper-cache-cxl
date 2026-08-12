@@ -171,10 +171,19 @@ mod s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache_tests {
     fn a_plain_access_on_a_fast_main_queue_key_does_not_migrate_or_reorder() {
         ensure_pmem_allocator_warm();
 
+        // `one_access_ratio` must leave the MAIN queue real fast-tier room:
+        // `effective_main_fast_capacity` is `fast_capacity - one_access_capacity`,
+        // so a ratio of 1.0 (with fast_tier_size == max_size) zeroes it out and
+        // `promote_from_one_access` demotes the key straight back to slow inside
+        // the very same worker event. This test is about a key sitting *in* the
+        // main queue's fast segment, so it needs a ratio that leaves headroom on
+        // both sides: 0.5 gives the one-access queue 500_000 bytes (far more than
+        // one payload, so set() never ages it out) and leaves the main queue the
+        // other 500_000 (so the first get()'s promotion sticks).
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
             CacheTierSize::Bytes(1_000_000),
-            1.0,
+            0.5,
         ).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");

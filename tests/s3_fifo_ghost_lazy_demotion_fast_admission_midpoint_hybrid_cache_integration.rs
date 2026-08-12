@@ -50,8 +50,24 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
     /// instead (a tiny effective main-fast budget makes a single promoted
     /// key self-demote immediately), which is what actually allocates
     /// through the UMF/TBB pool for the first time in this process.
+    ///
+    /// The one-access queue must be given enough capacity to actually HOLD the
+    /// warm-up key (`one_access_ratio` 0.001 * 1_000_000 = 1000 bytes, far more
+    /// than one payload). A ratio of 0.0 would leave it zero-capacity, making
+    /// the key eligible for `needs_capacity_eviction` the instant it is
+    /// admitted -- and in *this* variant an aged-out one-access key is
+    /// `evict_one_access_tail`'d (removed outright, remembered only as a bare
+    /// ghost key), never demoted. Whether the eviction pass or the `get()`
+    /// below reached the key first was then a genuine coin flip: if eviction
+    /// won, `tier_of` returned `None` forever and this helper burned its full
+    /// 90-second budget before failing. The reprieve variants splice an
+    /// aged-out key into the main queue's slow tier instead of evicting it, so
+    /// they are not exposed to this and keep their own simpler warm-up.
     fn ensure_pmem_allocator_warm() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1), 0.0)
+        // fast_tier_size == one_access_capacity (1000 == 0.001 * 1_000_000)
+        // leaves `effective_main_fast_capacity` at exactly 0, so the promotion
+        // triggered by the get() below self-demotes deterministically.
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000), 0.001)
             .expect("warm-up cache should construct");
 
         cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
@@ -65,6 +81,28 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
     }
 
     const MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A `one_access_ratio` of 0.0 is unusable in this variant, and was the
+    /// cause of a whole class of flaky failures across this file.
+    ///
+    /// Two of this variant's properties combine badly at ratio 0.0. Admission
+    /// is Fast, so a brand-new key lands in the DRAM one-access queue; and an
+    /// aged-out one-access key is `evict_one_access_tail`'d -- removed from the
+    /// cache outright, remembered only as a bare ghost key -- never demoted.
+    /// With `one_access_capacity` at 0, `needs_capacity_eviction()` is
+    /// therefore true the instant *any* key is admitted, so every `set()` races
+    /// the worker's eviction pass against the test's own next observation.
+    /// Whichever won decided whether `tier_of` returned `Some(Tier::Fast)` or
+    /// `None`, which is exactly the coin-flip these tests were showing.
+    ///
+    /// `ONE_ACCESS_RATIO * max_size` gives the one-access queue 1000 bytes
+    /// (~8 objects at this policy's measured 122-byte accounted size), enough
+    /// that admission never self-evicts. Because
+    /// `effective_main_fast_capacity` is `fast_capacity - one_access_capacity`,
+    /// each test below adds `ONE_ACCESS_RESERVE` to its fast-tier size so the
+    /// main queue's own budget stays exactly the value that test intends.
+    const ONE_ACCESS_RATIO: f64 = 0.001;
+    const ONE_ACCESS_RESERVE: u64 = 1_000;
 
     #[test]
     fn admission_always_lands_in_fast_tier() {
@@ -122,10 +160,19 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
     fn a_plain_access_on_a_fast_main_queue_key_does_not_migrate_or_reorder() {
         ensure_pmem_allocator_warm();
 
+        // `one_access_ratio` must leave the MAIN queue real fast-tier room:
+        // `effective_main_fast_capacity` is `fast_capacity - one_access_capacity`,
+        // so a ratio of 1.0 (with fast_tier_size == max_size) zeroes it out and
+        // `promote_from_one_access` demotes the key straight back to slow inside
+        // the very same worker event. This test is about a key sitting *in* the
+        // main queue's fast segment, so it needs a ratio that leaves headroom on
+        // both sides: 0.5 gives the one-access queue 500_000 bytes (far more than
+        // one payload, so set() never ages it out) and leaves the main queue the
+        // other 500_000 (so the first get()'s promotion sticks).
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
             CacheTierSize::Bytes(1_000_000),
-            1.0,
+            0.5,
         ).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
@@ -148,10 +195,14 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
     fn an_accessed_key_at_the_main_queue_tail_gets_a_second_chance_instead_of_eviction() {
         ensure_pmem_allocator_warm();
 
+        // Leaves 40 bytes of effective room for the main queue (this test is
+        // specifically about main-queue eviction priority, not the one-access
+        // budget) -- see ONE_ACCESS_RATIO for why that reservation is added on
+        // top rather than the ratio simply being 0.0.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(40),
-            0.0,
+            CacheTierSize::Bytes(40 + ONE_ACCESS_RESERVE),
+            ONE_ACCESS_RATIO,
         ).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
@@ -186,10 +237,12 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
     fn an_accessed_fast_boundary_key_is_reprieved_at_demotion_time_instead_of_the_newcomer() {
         ensure_pmem_allocator_warm();
 
+        // Same 40 bytes of effective main-queue room, and the same one-access
+        // reservation on top, as the second-chance test above.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(40),
-            0.0,
+            CacheTierSize::Bytes(40 + ONE_ACCESS_RESERVE),
+            ONE_ACCESS_RATIO,
         ).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
@@ -322,8 +375,8 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(TTL_FAST_TIER),
-            0.0,
+            CacheTierSize::Bytes(TTL_FAST_TIER + ONE_ACCESS_RESERVE),
+            ONE_ACCESS_RATIO,
         ).expect("cache should construct");
 
         let ttl_secs = 5u32;
@@ -358,18 +411,47 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
     fn terminal_eviction_prefers_one_access_queue_over_main_queue() {
         ensure_pmem_allocator_warm();
 
+        // Each object here accounts for 122 bytes (measured, not derived --
+        // base bytes plus this policy's fixed per-object overhead). The old
+        // config (max_size 200, fast_tier_size 200, ratio 1.0) was wrong three
+        // ways: only ONE object fits in 200 bytes, so no one-access key could
+        // ever still "remain" for the final assertion to be about; and a ratio
+        // of 1.0 zeroed `effective_main_fast_capacity` (fast_capacity minus
+        // one_access_capacity), so key 1 self-demoted to slow instead of
+        // staying Fast as asserted below.
+        //
+        // max_size 500 holds four objects; one_access_capacity is 0.4 * 500 =
+        // 200 (one key at a time, so sets 2..=10 generate real one-access
+        // eviction pressure) and `effective_main_fast_capacity` is 400 - 200 =
+        // 200, comfortably holding key 1 in the main queue's FAST segment.
+        const MAX_SIZE: u64 = 500;
+
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            200,
-            CacheTierSize::Bytes(200),
-            1.0,
+            MAX_SIZE,
+            CacheTierSize::Bytes(400),
+            0.4,
         ).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes 1", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
+        // Paced, not burst. `apply_evictions` triggers on `status.used_size()`,
+        // which `set()` updates synchronously on the API thread, but picks its
+        // victim from the policy stack, which the worker updates asynchronously.
+        // A tight loop can therefore leave eviction pressure genuinely present
+        // while the stack still knows only about key 1 -- so `evict_one` finds
+        // nothing in the one-access queue and takes the main-queue key this test
+        // is asserting about. Same lockstep fix already documented for
+        // `lfu_hybrid_cache`'s equivalent burst-admission test.
         for key in 2u32..=10 {
             let _ = cache.set(key, b"payload bytes", None);
+            assert!(
+                wait_until(MIGRATION_TIMEOUT, || {
+                    cache.status().map(|s| s.used_size() <= MAX_SIZE).unwrap_or(false)
+                }),
+                "eviction should keep used_size within max_size between admissions",
+            );
         }
 
         let evicted = wait_until(MIGRATION_TIMEOUT, || {
@@ -394,7 +476,7 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
             CacheTierSize::Bytes(1_000_000),
-            0.0,
+            ONE_ACCESS_RATIO,
         ).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
@@ -430,7 +512,7 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
             CacheTierSize::Bytes(1_000_000),
-            0.0,
+            ONE_ACCESS_RATIO,
         ).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
@@ -449,7 +531,7 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
             CacheTierSize::Bytes(1_000_000),
-            0.0,
+            ONE_ACCESS_RATIO,
         ).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
