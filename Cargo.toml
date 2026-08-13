@@ -327,6 +327,18 @@ s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache = ["key_valu
 # Mutually exclusive with every other hybrid-cache feature above.
 s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache = ["key_value_pmem"]
 
+# Fills the s3-fifo family's one empty design cell: the one-access queue lives
+# in the SLOW tier (paper-literal admission -- every set() is a real PMEM
+# write), AND a key that ages out of it without a second access is spliced into
+# the main queue's slow segment instead of being evicted. Because both
+# structures are in PMEM that splice moves no bytes and emits no migration at
+# all, unlike the fast-admission reprieve variants which pay a DRAM->PMEM copy
+# per aged-out object. Lazy demotion retained; no ghost queue (nothing would
+# populate it -- no key is ever evicted from the one-access queue).
+#
+# Mutually exclusive with every other hybrid-cache feature above.
+s3_fifo_lazy_demotion_reprieve_hybrid_cache = ["key_value_pmem"]
+
 # s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache: same as
 # s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache, except the
 # approximate mid-slow-segment cursor (measured to be a no-op on the real

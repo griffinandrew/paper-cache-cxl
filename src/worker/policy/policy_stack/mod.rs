@@ -27,6 +27,7 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack;
 mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack;
 mod s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stack;
 mod s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stack;
+mod s3_fifo_lazy_demotion_reprieve_hybrid_stack;
 mod s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_stack;
 
 #[cfg(feature = "eviction_stacks_pmem")] mod pmem_collections;
@@ -59,6 +60,7 @@ use crate::{
 		s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack,
 		s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stack::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack,
 		s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stack::S3FifoLazyDemotionFastAdmissionReprieveHybridStack,
+		s3_fifo_lazy_demotion_reprieve_hybrid_stack::S3FifoLazyDemotionReprieveHybridStack,
 		s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_stack::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack,
 	},
 };
@@ -405,6 +407,15 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// mid-slow checkpoint -- see
 		// s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stack.rs's module doc.
 		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(ratio) => Box::new(S3FifoLazyDemotionFastAdmissionReprieveHybridStack::new(
+			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
+		)),
+
+		// Same construction shape as its fast-admission sibling above. The
+		// one-access queue is slow-tier here, so its `one_access_capacity`
+		// bounds PMEM rather than being carved out of the DRAM budget -- see
+		// s3_fifo_lazy_demotion_reprieve_hybrid_stack.rs's
+		// `effective_main_fast_capacity`.
+		PaperPolicy::S3FifoLazyDemotionReprieveHybrid(ratio) => Box::new(S3FifoLazyDemotionReprieveHybridStack::new(
 			ratio, max_size, (max_size as f64 * 0.2) as CacheSize,
 		)),
 

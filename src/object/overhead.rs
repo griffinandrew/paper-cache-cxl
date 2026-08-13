@@ -198,6 +198,13 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// drift counter), not per-object ones.
 		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
 
+		// Identical per-object bookkeeping to the fast-admission reprieve
+		// variant above: same `S3FifoEntry { queue, tier, size, accessed }`,
+		// same two-list main queue. Moving the one-access queue to the slow
+		// tier changes which allocator backs an object's bytes, not what the
+		// stack records per key.
+		PaperPolicy::S3FifoLazyDemotionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+
 		// Same per-object charge as the predecessor. The slow tier being
 		// two physical lists instead of one doesn't change what a tracked
 		// object costs -- it's still one list node plus one combined

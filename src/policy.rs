@@ -42,6 +42,7 @@ pub enum PaperPolicy {
 	S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(f64),
 	S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(f64),
 	S3FifoLazyDemotionFastAdmissionReprieveHybrid(f64),
+	S3FifoLazyDemotionReprieveHybrid(f64),
 	S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(f64),
 }
 
@@ -77,6 +78,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(ratio) => write!(f, "s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-{ratio}"),
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-{ratio}"),
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-{ratio}"),
+			PaperPolicy::S3FifoLazyDemotionReprieveHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-reprieve-hybrid-{ratio}"),
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-{ratio}"),
 		}
 	}
@@ -105,6 +107,7 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("s3-fifo-hybrid-") => parse_s_three_fifo_hybrid(value)?,
 			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid(value)?,
 			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_reprieve_hybrid(value)?,
+			value if value.starts_with("s3-fifo-lazy-demotion-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_reprieve_hybrid(value)?,
 			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid(value)?,
 			value if value.starts_with("s3-fifo-") => parse_s_three_fifo(value)?,
 			"lru-hybrid" => PaperPolicy::LruHybrid,
@@ -382,6 +385,27 @@ fn parse_s_three_fifo_lazy_demotion_fast_admission_reprieve_hybrid(value: &str) 
 	}
 
 	Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(ratio))
+}
+
+fn parse_s_three_fifo_lazy_demotion_reprieve_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "s3-fifo-lazy-demotion-reprieve-hybrid-"
+	let tokens = value[38..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(ratio) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&ratio) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::S3FifoLazyDemotionReprieveHybrid(ratio))
 }
 
 fn parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
