@@ -52,27 +52,25 @@ static ALL_MEM_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
 
 impl HybridObjects {
-    /// Initialize the UMF pool and prewarm a working-set-sized region.
-    /// Call from main() before the benchmark loop.
-    pub fn init_and_prewarm(numa_node: i32, prewarm_bytes: usize) {
-        //INIT.call_once(|| {
+    /// Initialize the UMF pool. Prewarming disabled -- see `DRAMObjects::
+    /// init_and_prewarm`'s doc comment for why (identical hardcoded-size
+    /// touch-loop pattern, just for node 1 instead of node 0).
+    pub fn init_and_prewarm(numa_node: i32, _prewarm_bytes: usize) {
         unsafe { allocator_bindings::umf_allocator_init(numa_node); }
-        //#[cfg(debug_assertions)]
-        //println!("HybridObjects: UMF pool initialised on NUMA node {}", numa_node);
-        //});
-        let bytes = 18 * 1024 * 1024 * 1024;
-        let chunk = 2 * 1024 * 1024usize;
-        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes, chunk) };
-        if rc != 0 {
-            eprintln!("UMF prewarm returned {}", rc);
-        }
 
-        let chunk_2 = 1024 * 4usize;
-        let bytes_2 = 18 * 1024 * 1024 * 1024;
-        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes_2, chunk_2) };
-        if rc != 0 {
-            eprintln!("UMF prewarm returned {}", rc);
-        }
+        // let bytes = 18 * 1024 * 1024 * 1024;
+        // let chunk = 2 * 1024 * 1024usize;
+        // let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes, chunk) };
+        // if rc != 0 {
+        //     eprintln!("UMF prewarm returned {}", rc);
+        // }
+        //
+        // let chunk_2 = 1024 * 4usize;
+        // let bytes_2 = 18 * 1024 * 1024 * 1024;
+        // let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes_2, chunk_2) };
+        // if rc != 0 {
+        //     eprintln!("UMF prewarm returned {}", rc);
+        // }
     }
     const NODE: i32 = 1;
 }
@@ -197,27 +195,30 @@ pub struct DRAMObjects;
 
 
 impl DRAMObjects {
-    /// Initialize the UMF pool and prewarm a working-set-sized region.
-    /// Call from main() before the benchmark loop.
-    pub fn init_and_prewarm(numa_node: i32, prewarm_bytes: usize) {
-        //INIT.call_once(|| {
+    /// Initialize the UMF pool. Prewarming (the two touch-loop calls below)
+    /// is disabled: both hardcoded their own byte counts (18 GiB at 2 MiB
+    /// granularity, then 18 GiB again at 4 KiB granularity) rather than
+    /// reading `prewarm_bytes`, unconditionally, on the very first heap
+    /// allocation of the process -- a large, fixed, config-independent
+    /// startup cost (and confound for perf profiling) regardless of the
+    /// actual working set. Pool setup itself (`umf_allocator_init`) is
+    /// untouched; only the eager pre-fault step is disabled.
+    pub fn init_and_prewarm(numa_node: i32, _prewarm_bytes: usize) {
         unsafe { allocator_bindings::umf_allocator_init(numa_node); }
-        //#[cfg(debug_assertions)]
-        //println!("DRAMObjects: UMF pool initialised on NUMA node {}", numa_node);
-        //});
-        let bytes = 18 * 1024 * 1024 * 1024;
-        let chunk = 2 * 1024 * 1024usize;
-        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes, chunk) };
-        if rc != 0 {
-            eprintln!("UMF prewarm returned {}", rc);
-        }
 
-        let chunk_2 = 1024 * 4usize;
-        let bytes_2 = 18 * 1024 * 1024 * 1024;
-        let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes_2, chunk_2) };
-        if rc != 0 {
-            eprintln!("UMF prewarm returned {}", rc);
-        }
+        // let bytes = 18 * 1024 * 1024 * 1024;
+        // let chunk = 2 * 1024 * 1024usize;
+        // let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes, chunk) };
+        // if rc != 0 {
+        //     eprintln!("UMF prewarm returned {}", rc);
+        // }
+        //
+        // let chunk_2 = 1024 * 4usize;
+        // let bytes_2 = 18 * 1024 * 1024 * 1024;
+        // let rc = unsafe { allocator_bindings::umf_allocator_prewarm(numa_node, bytes_2, chunk_2) };
+        // if rc != 0 {
+        //     eprintln!("UMF prewarm returned {}", rc);
+        // }
     }
     const NODE_DRAM: i32 = 0;
 }
