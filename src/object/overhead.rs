@@ -127,6 +127,10 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// per-key metadata.
 		PaperPolicy::TwoQFastAdmissionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
 
+		// Structurally identical again: the reprieve variant changes where an
+		// aged-out one-access key goes, not what is tracked per key.
+		PaperPolicy::TwoQFastAdmissionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
+
 		// Structurally identical to LruHybrid: 48 bytes for the HashList
 		// entry, 8 bytes for the HashedKey, 24 bytes for the single
 		// combined per-key `entries` HashMap entry (tier + size, one map —

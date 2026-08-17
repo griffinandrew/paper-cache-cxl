@@ -18,6 +18,7 @@ mod lru_hybrid_stack;
 mod lfu_hybrid_stack;
 mod two_q_hybrid_stack;
 mod two_q_fast_admission_hybrid_stack;
+mod two_q_fast_admission_reprieve_hybrid_stack;
 mod fifo_hybrid_stack;
 mod lru_sized_hybrid_stack;
 mod s3_fifo_hybrid_stack;
@@ -52,6 +53,7 @@ use crate::{
 		lfu_hybrid_stack::LfuHybridStack,
 		two_q_hybrid_stack::TwoQHybridStack,
 		two_q_fast_admission_hybrid_stack::TwoQFastAdmissionHybridStack,
+		two_q_fast_admission_reprieve_hybrid_stack::TwoQFastAdmissionReprieveHybridStack,
 		fifo_hybrid_stack::FifoHybridStack,
 		lru_sized_hybrid_stack::LruSizedHybridStack,
 		s3_fifo_hybrid_stack::S3FifoHybridStack,
@@ -317,6 +319,12 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// the budget via `ResizeFastTier` immediately after construction
 		// anyway, but it is worth knowing when picking k_in.
 		PaperPolicy::TwoQFastAdmissionHybrid(k_in) => Box::new(TwoQFastAdmissionHybridStack::new(
+			k_in, max_size, (max_size as f64 * 0.2) as CacheSize,
+		)),
+
+		// Same construction shape and the same k_in-vs-fast-tier caveat as
+		// `TwoQFastAdmissionHybrid` above.
+		PaperPolicy::TwoQFastAdmissionReprieveHybrid(k_in) => Box::new(TwoQFastAdmissionReprieveHybridStack::new(
 			k_in, max_size, (max_size as f64 * 0.2) as CacheSize,
 		)),
 

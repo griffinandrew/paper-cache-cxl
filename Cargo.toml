@@ -200,6 +200,17 @@ two_q_hybrid_cache = ["key_value_pmem"]
 # Mutually exclusive with every other hybrid-cache feature.
 two_q_fast_admission_hybrid_cache = ["key_value_pmem"]
 
+# As `two_q_fast_admission_hybrid_cache`, but a one-access object that ages out
+# of the FIFO queue without a second access is REPRIEVED into the slow tier
+# (spliced onto the bottom of the main queue) rather than evicted outright. The
+# DRAM->PMEM copy that costs is paid on the PolicyWorker thread, not the set()
+# path, so SET latency should be unaffected; the cost shows up as worker CPU,
+# PMEM write volume and slow-tier occupancy. Same dependency reasoning as the
+# other hybrids.
+#
+# Mutually exclusive with every other hybrid-cache feature.
+two_q_fast_admission_reprieve_hybrid_cache = ["key_value_pmem"]
+
 # Single-instance, segmented-FIFO hybrid cache: same one-PaperCache<K,
 # TieredBuffer> architecture as `lru_hybrid_cache`/`lfu_hybrid_cache`/
 # `two_q_hybrid_cache` above, but the fast/slow boundary is pure insertion

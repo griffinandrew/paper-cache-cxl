@@ -229,6 +229,59 @@ The implementation provides explicit feature flags to control:
   `two_q_hybrid_cache` had 200 MB in PMEM by construction. The cost side shows in the same numbers:
   624 MB of DRAM used versus 374 MB for the same workload
 
+### `two_q_fast_admission_reprieve_hybrid_cache`
+- **Purpose**: `two_q_fast_admission_hybrid_cache` with one change — a one-access object that ages
+  out of the FIFO queue without a second access is **reprieved into the slow tier** (spliced onto
+  the bottom of the main queue) rather than evicted outright
+- **When enabled**: Adds `PaperPolicy::TwoQFastAdmissionReprieveHybrid(f64)` (string form
+  `"2q-fast-admission-reprieve-hybrid-{k_in}"`), a `PaperCache<K, TieredBuffer, S>` impl block with
+  the same `new(max_size, fast_tier_size, k_in)` signature, and `TwoQFastAdmissionReprieveHybridStats`
+- **Behavior**: Admission, promotion, main-queue demotion and the fast-tier accounting are all
+  identical to `two_q_fast_admission_hybrid_cache`. The difference is `settle_fifo_queue`, which runs
+  **synchronously from `insert`/`resize`** (never through `evict_one`) and moves the FIFO tail to the
+  back of the main queue tagged `Tier::Slow`. `needs_capacity_eviction()` therefore returns to the
+  trait default `false`, and `evict_one` becomes purely about the main queue's LRU tail — with a
+  last-resort FIFO fallback that exists only so `apply_evictions` is never handed a `None` (which it
+  answers by evicting a *random* object)
+- **Placement**: the bottom of the main queue, not the top of its slow segment. An object with no
+  demonstrated reuse should rank below proven-but-cold ones, and `push_back` is O(1) on the existing
+  single list — the s3-fifo equivalent needed to insert at the fast/slow *boundary*, which forced
+  that stack's two-physical-lists restructure after an O(n)-per-reprieve first attempt burned ~18
+  minutes of worker CPU on a real trace
+- **Counter semantics**: a reprieve is counted in `demotions` (it is a real DRAM→PMEM copy), **not**
+  `evictions`. So `evictions` here means only "removed from the cache", which is a narrower thing
+  than the same field in the non-reprieve variant
+- **Requirements**: `["key_value_pmem"]`. **Mutually exclusive with every other hybrid-cache feature**
+- **Measured** (800K accesses of `standard_web.bin`, `-c 1`, 2 GB cache / 1 GB fast tier, `k_in` 0.1,
+  same binary otherwise, all three 2Q designs run back to back):
+
+  | | `2q-hybrid` | `2q-fast-admission` | `2q-fast-admission-reprieve` |
+  |---|---|---|---|
+  | miss ratio | 0.3308 | 0.3211 | **0.2673** |
+  | SET mean | 7.11 µs | **3.30 µs** | 4.35 µs |
+  | SET p99 | 25.48 µs | **9.36 µs** | 23.49 µs |
+  | GET mean | 4.09 µs | **3.34 µs** | 4.59 µs |
+  | objects retained | 34,666 | 37,668 | **120,416** |
+  | evictions | 229,983 | 219,232 | 93,410 |
+  | demotions | 0 | 0 | 190,066 |
+  | DRAM / PMEM | 374 / 200 MB | 624 / 0 MB | 906 / 1,083 MB |
+
+  **The headline is the miss ratio, and the reason is worth understanding before reading the rest.**
+  The non-reprieve variant filled only 598 MB of its 2 GB cache yet still evicted 219,232 objects:
+  with nothing ever demoted, objects could only leave via FIFO-capacity eviction, so the cache
+  self-limited at roughly `fifo_capacity + main_fast` and threw away objects it had room to keep.
+  Reprieving instead routes those objects into the (uncapped) slow tier, so the cache actually uses
+  its configured size — 3.2x more objects retained and a 16.8% relative reduction in misses.
+  The costs are real and visible in the same row: SET mean is 32% higher and SET p99 2.5x higher
+  than the non-reprieve variant despite admission still being a pure DRAM write, because 190,066
+  reprieve copies on the `PolicyWorker` thread contend with the API threads for the allocator (the
+  same contention documented at length in `CLAUDE.md`); and GET is slower because 65,637 objects now
+  live in PMEM rather than none
+- **Use case**: when the working set exceeds what the fast tier plus FIFO reservation can hold and
+  hit rate matters more than tail SET latency. If the non-reprieve variant is leaving a large part
+  of `max_size` unused (compare `used_size` against `max_size` in the summary CSV), that is the
+  signal this variant is worth trying
+
 ### `lru_sized_hybrid_cache`
 - **Purpose**: Single-instance, segmented-LRU hybrid cache with a *size-split* fast AND slow tier — same
   LRU admission/promotion/demotion/eviction semantics as `lru_hybrid_cache`, but the fast (DRAM) tier's

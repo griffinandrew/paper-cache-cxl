@@ -417,6 +417,59 @@ where
         self.lookup.insert(value, idx);
     }
     
+    /// Pushes a value onto the back (tail) of the list.
+    ///
+    /// The mirror of `push_front`, added for
+    /// `TwoQFastAdmissionReprieveHybridStack`, which splices a reprieved
+    /// one-access key onto the LRU tail of its main queue -- the DRAM
+    /// `kwik::collections::HashList` this type shadows already has one, so
+    /// without it that stack could not compile under `eviction_stacks_pmem`.
+    ///
+    /// Same existing-value handling as `push_front` (remove first, so a key
+    /// is never present twice) and the same `ptr::write` safety reasoning
+    /// when reusing a freed slot -- see `PmemVecList::push_front` for the
+    /// full explanation of why assignment would be unsound there.
+    pub fn push_back(&mut self, value: T) {
+        // If value already exists, remove it first
+        if self.lookup.contains_key(&value) {
+            self.remove(&value);
+        }
+
+        let node = Node {
+            value: value.clone(),
+            prev: self.tail,
+            next: None,
+        };
+
+        // Allocate index: reuse from free list or append
+        let idx = if let Some(free_idx) = self.free_list.pop() {
+            unsafe {
+                std::ptr::write(&mut self.entries[free_idx], Some(node));
+            }
+            free_idx
+        } else {
+            let idx = self.entries.len();
+            self.entries.push(Some(node));
+            idx
+        };
+
+        // Update old tail's next pointer
+        if let Some(old_tail_idx) = self.tail {
+            if let Some(Some(old_tail_node)) = self.entries.get_mut(old_tail_idx) {
+                old_tail_node.next = Some(idx);
+            }
+        }
+
+        self.tail = Some(idx);
+
+        // If list was empty, this is also the head
+        if self.head.is_none() {
+            self.head = Some(idx);
+        }
+
+        self.lookup.insert(value, idx);
+    }
+
     /// Pops a value from the back of the list
     pub fn pop_back(&mut self) -> Option<T> {
         let tail_idx = self.tail?;

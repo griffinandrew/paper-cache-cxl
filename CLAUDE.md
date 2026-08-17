@@ -2599,3 +2599,118 @@ was demoted, so no PMEM→DRAM move ever occurred.
 - `k_in` has not been swept. Given the reservation now comes out of DRAM, the value inherited from
   `two_q_hybrid_cache` (0.1) is unlikely to be the right one here; `TWO_Q_K_IN` exists to sweep it
   without a rebuild.
+
+## Feature: `two_q_fast_admission_reprieve_hybrid_cache` (implemented)
+
+`two_q_fast_admission_hybrid_cache` with one change, requested as a separate variant: a one-access
+object that ages out of the FIFO queue without a second access is **reprieved into the slow tier**
+rather than evicted. The placement was the user's own suggestion — *"adding an element to the bottom
+of the lru queue if its not reaccessed again"* — and it turned out to be both the right ranking and
+the cheap implementation; see below.
+
+### The two traps the s3-fifo precedent had already documented
+
+Reading `s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stack.rs`'s module doc *before*
+writing this saved repeating both of its bugs:
+
+1. **A reprieve must not run through `evict_one()`.** `apply_evictions` unconditionally *erases*
+   whatever key `evict_one()` returns, and answers a `None` by evicting a **random** object. So
+   relief runs synchronously from `insert`/`resize` via `settle_fifo_queue()`, mirroring
+   `settle_fast_tier`; `needs_capacity_eviction()` returns to the trait default `false`.
+   This does **not** contradict `two_q_hybrid_cache`'s opposite lesson ("a `PolicyStack` cannot evict
+   on its own", which desynced the stack from the object map) — the two rules are about different
+   operations. *Eviction* must go through `evict_one`/`erase` because the stack cannot touch the
+   object map; a *reprieve* removes nothing, so the key stays in `entries` and in the object map and
+   only moves between two of the stack's own lists. Both rules are now stated together in the
+   stack's module doc so the next person doesn't have to reconcile them from two places.
+2. **Inserting at the fast/slow boundary is O(n).** `HashList`/`PmemHashList` expose only
+   `push_front`/`push_back`/`move_front`/`move_back`, so the s3-fifo variant's first attempt walked
+   every fast key per reprieve and burned ~18 minutes of worker CPU on a real trace without
+   finishing a run — which is what forced its two-physical-lists restructure. **This variant sidesteps
+   that entirely by landing at the back**, which is `push_back` — O(1) on the existing single
+   `main_stack`, no restructure needed.
+
+### Why the bottom is also the right answer, not just the cheap one
+
+The main queue is LRU-ordered and its slow segment holds keys that were promoted at least once and
+later demoted. A key aging out of the one-access queue has demonstrated *no* reuse, so ranking it
+above proven-but-cold objects would invert the ordering the main queue exists to maintain. The
+s3-fifo variant splices to the *front* of its slow segment (a full traversal before eviction); that
+is defensible there because its main queue is FIFO-ish, and it is documented here as the natural
+alternative if this placement proves too weak.
+
+The boundary invariant survives a back-splice for free: `main_boundary` marks the LRU-most `Fast`
+key and relies on fast keys forming a contiguous prefix. Appending a `Slow` key behind everything
+preserves that and needs no boundary update — the second reason this placement is O(1). A dedicated
+test (`a_reprieve_does_not_corrupt_the_fast_slow_boundary`) pins it down, including that a
+subsequent fast-tier demotion still picks the right key.
+
+### Measured: the hit-rate win is real, and its cause is not what it first looks like
+
+800K accesses of `standard_web.bin`, `-c 1`, 2 GB cache / 1 GB fast tier, `k_in` 0.1, all three 2Q
+designs run back to back with the same binary:
+
+| | `2q-hybrid` | `2q-fast-admission` | `2q-fast-admission-reprieve` |
+|---|---|---|---|
+| miss ratio | 0.3308 | 0.3211 | **0.2673** |
+| SET mean | 7.11 µs | **3.30 µs** | 4.35 µs |
+| SET p99 | 25.48 µs | **9.36 µs** | 23.49 µs |
+| GET mean | 4.09 µs | **3.34 µs** | 4.59 µs |
+| objects retained | 34,666 | 37,668 | **120,416** |
+| evictions | 229,983 | 219,232 | 93,410 |
+| demotions | 0 | 0 | 190,066 |
+| DRAM / PMEM | 374 / 200 MB | 624 / 0 MB | 906 / 1,083 MB |
+
+The 16.8% relative miss-ratio reduction is not mainly "second chances pay off". It is that **the
+non-reprieve variant was leaving most of its configured cache unused**: it filled only 598 MB of
+2 GB yet still evicted 219,232 objects, because with nothing ever demoted the only exit was
+FIFO-capacity eviction, so the cache self-limited at roughly `fifo_capacity + main_fast`. Reprieving
+routes those objects into the uncapped slow tier instead, so the cache actually uses `max_size` —
+3.2x more objects retained. That is worth knowing because it means the comparison is partly between
+two different *effective* cache sizes, and it also flags that the non-reprieve variant's `k_in` is
+badly tuned at this configuration.
+
+The costs are real and show in the same row. SET mean is 32% higher and SET p99 **2.5x** higher than
+the non-reprieve variant *despite admission still being a pure DRAM write* — 190,066 reprieve copies
+on the `PolicyWorker` thread contend with the API threads for the allocator, the same contention
+documented throughout this file. GET is slower because 65,637 objects now live in PMEM instead of
+none. So this variant trades tail SET latency and GET latency for hit rate.
+
+### Two bugs of my own, both caught by the regression sweep
+
+Worth recording because both came from scripted code duplication, not from design:
+
+1. **A cloned `status.rs` region swept up neighbouring designs.** Duplicating the
+   `two_q_fast_admission_*` recorder block by slicing from its first method to the `hybrid_stats`
+   doc comment also copied every design defined in between (`fifo_hybrid_*`, `s3_fifo_hybrid_*`,
+   `two_q_ghost_hybrid_*`, ...) verbatim — 63 methods — which only surfaced as `E0592 duplicate
+   definitions` when building `fifo_hybrid_cache`, a feature the new variant does not touch. Fixed
+   by deleting the duplicated tail, with a scripted assertion that every method being removed
+   already existed earlier in the file so nothing unique could be lost.
+2. **`PmemHashList` had no `push_back`.** The DRAM `HashList` this type shadows does, so the stack
+   compiled fine by default and only failed under `eviction_stacks_pmem`. Added it, mirroring
+   `push_front` exactly (same remove-if-present handling, same `ptr::write` reasoning for reused
+   freed slots).
+
+Both are arguments for running the *whole* feature-flag sweep rather than only the features a change
+appears to touch.
+
+### Verified
+
+289/289 unit tests (14 new stack tests, 2 new worker-level tests), 299/299 with
+`eviction_stacks_pmem`; `tests/two_q_fast_admission_reprieve_hybrid_cache_integration.rs` 19/19,
+run twice; the mutual-exclusion `compile_error!` fires. No regressions across 13 other feature
+suites, and `two_q_fast_admission_hybrid_cache` (17/17), `two_q_hybrid_cache` (18/18) integration
+suites unchanged. `tiering`/`multitiering` `--lib` still fails on the **pre-existing**
+`TieringManager::with_defaults()` inference error already documented above — confirmed identical on
+the stashed pre-session tree (11 errors either way); both still *build* clean.
+
+### Remaining work
+
+- `k_in` unswept for both fast-admission variants. The measurement above strongly suggests 0.1 is
+  wrong for the non-reprieve one (it caps the effective cache size); `TWO_Q_K_IN` sweeps it without
+  a rebuild.
+- No high-concurrency run. The SET p99 regression is allocator contention from the reprieve copies,
+  so `-c 8` may look materially different from this `-c 1` measurement — in either direction.
+- The front-of-slow-segment placement (what the s3-fifo variant does) is untested here, and would
+  need `main_stack` split in two the way that stack's was.
