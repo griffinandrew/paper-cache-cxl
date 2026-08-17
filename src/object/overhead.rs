@@ -120,6 +120,13 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// keys currently in Main), 4 bytes for the object size
 		PaperPolicy::TwoQHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
 
+		// Structurally identical to TwoQHybrid: `TwoQFastAdmissionHybridStack`
+		// is the same two-list/one-combined-entry-map shape, differing only in
+		// which physical tier the one-access FIFO queue's bytes live in (fast
+		// rather than slow) — a placement decision that costs no extra
+		// per-key metadata.
+		PaperPolicy::TwoQFastAdmissionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
+
 		// Structurally identical to LruHybrid: 48 bytes for the HashList
 		// entry, 8 bytes for the HashedKey, 24 bytes for the single
 		// combined per-key `entries` HashMap entry (tier + size, one map —

@@ -32,6 +32,7 @@ pub enum PaperPolicy {
 	LruHybrid,
 	LfuHybrid,
 	TwoQHybrid(f64),
+	TwoQFastAdmissionHybrid(f64),
 	FifoHybrid,
 	LruSizedHybrid,
 	S3FifoHybrid(f64),
@@ -68,6 +69,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::LruHybrid => write!(f, "lru-hybrid"),
 			PaperPolicy::LfuHybrid => write!(f, "lfu-hybrid"),
 			PaperPolicy::TwoQHybrid(k_in) => write!(f, "2q-hybrid-{k_in}"),
+			PaperPolicy::TwoQFastAdmissionHybrid(k_in) => write!(f, "2q-fast-admission-hybrid-{k_in}"),
 			PaperPolicy::FifoHybrid => write!(f, "fifo-hybrid"),
 			PaperPolicy::LruSizedHybrid => write!(f, "lru-sized-hybrid"),
 			PaperPolicy::S3FifoHybrid(ratio) => write!(f, "s3-fifo-hybrid-{ratio}"),
@@ -96,6 +98,13 @@ impl FromStr for PaperPolicy {
 			"sieve" => PaperPolicy::Sieve,
 			"lru" => PaperPolicy::Lru,
 			"mru" => PaperPolicy::Mru,
+			// Order matters and is load-bearing: every guard below also starts
+			// with a prefix of the ones above it ("2q-fast-admission-hybrid-"
+			// starts with "2q-", and so does "2q-hybrid-"), so the most
+			// specific prefix has to be tested first or a more general guard
+			// silently swallows it. See
+			// `two_q_fast_admission_hybrid_does_not_collide_with_other_2q_forms`.
+			value if value.starts_with("2q-fast-admission-hybrid-") => parse_two_q_fast_admission_hybrid(value)?,
 			value if value.starts_with("2q-ghost-hybrid-") => parse_two_q_ghost_hybrid(value)?,
 			value if value.starts_with("2q-hybrid-") => parse_two_q_hybrid(value)?,
 			value if value.starts_with("2q-") => parse_two_q(value)?,
@@ -196,6 +205,27 @@ fn parse_two_q_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
 	}
 
 	Ok(PaperPolicy::TwoQHybrid(k_in))
+}
+
+fn parse_two_q_fast_admission_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "2q-fast-admission-hybrid-"
+	let tokens = value[25..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(k_in) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&k_in) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::TwoQFastAdmissionHybrid(k_in))
 }
 
 fn parse_s_three_fifo(value: &str) -> Result<PaperPolicy, CacheError> {
@@ -512,6 +542,42 @@ mod tests {
 			"lru-hybrid".parse::<PaperPolicy>().unwrap(),
 			"lru-sized-hybrid".parse::<PaperPolicy>().unwrap(),
 		);
+	}
+
+	#[test]
+	fn two_q_fast_admission_hybrid_round_trips_through_display_and_from_str() {
+		assert_eq!(PaperPolicy::TwoQFastAdmissionHybrid(0.2).to_string(), "2q-fast-admission-hybrid-0.2");
+
+		assert_eq!(
+			"2q-fast-admission-hybrid-0.2".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::TwoQFastAdmissionHybrid(0.2)),
+		);
+	}
+
+	/// Locks in `FromStr`'s guard ordering. Every one of these strings also
+	/// starts with `"2q-"`, and two of them also start with `"2q-hybrid-"`'s
+	/// stem, so a less specific guard placed first would silently swallow the
+	/// more specific form and parse it as the wrong policy.
+	#[test]
+	fn two_q_fast_admission_hybrid_does_not_collide_with_other_2q_forms() {
+		assert_eq!("2q-0.2-0.2".parse::<PaperPolicy>(), Ok(PaperPolicy::TwoQ(0.2, 0.2)));
+		assert_eq!("2q-hybrid-0.2".parse::<PaperPolicy>(), Ok(PaperPolicy::TwoQHybrid(0.2)));
+		assert_eq!("2q-ghost-hybrid-0.2".parse::<PaperPolicy>(), Ok(PaperPolicy::TwoQGhostHybrid(0.2)));
+
+		assert_eq!(
+			"2q-fast-admission-hybrid-0.2".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::TwoQFastAdmissionHybrid(0.2)),
+		);
+
+		assert_ne!(
+			"2q-hybrid-0.2".parse::<PaperPolicy>().unwrap(),
+			"2q-fast-admission-hybrid-0.2".parse::<PaperPolicy>().unwrap(),
+		);
+	}
+
+	#[test]
+	fn two_q_fast_admission_hybrid_rejects_out_of_range_k_in() {
+		assert_eq!("2q-fast-admission-hybrid-1.5".parse::<PaperPolicy>(), Err(CacheError::InvalidPolicy));
 	}
 
 	#[test]

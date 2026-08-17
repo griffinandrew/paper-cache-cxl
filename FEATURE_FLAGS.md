@@ -185,6 +185,50 @@ The implementation provides explicit feature flags to control:
   `true` for an object the stack had already "forgotten") — caught by
   `tests/two_q_hybrid_cache_integration.rs`'s FIFO-eviction tests failing outright, not merely flaking
 
+### `two_q_fast_admission_hybrid_cache`
+- **Purpose**: `two_q_hybrid_cache` with the one-access FIFO queue relocated to the **fast (DRAM)
+  tier**, so `set()` is a plain DRAM write rather than a synchronous PMEM/UMF allocation on the
+  calling thread. The same trade `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` makes for
+  the s3-fifo family. The logical 2Q structure is unchanged — only the physical placement of the
+  one-access queue's bytes differs
+- **When enabled**: Adds `PaperPolicy::TwoQFastAdmissionHybrid(f64)` (string form
+  `"2q-fast-admission-hybrid-{k_in}"`) and a new `PaperCache<K, TieredBuffer, S>` impl block with the
+  same `new(max_size, fast_tier_size, k_in)` signature as `two_q_hybrid_cache`. Exports
+  `TwoQFastAdmissionHybridStats`; shares `TieredBuffer`/`Tier`/`CacheTierSize` with every other hybrid
+- **When disabled**: None of the above types/methods are compiled
+- **Behavior**: Admission: every new object → the one-access FIFO queue, in the **fast** tier
+  (`admission_tier` is unconditionally `Tier::Fast`, needing no object-map probe at all — one fewer
+  `DashMap` lookup per `set()` than `two_q_hybrid_cache`, on top of the avoided PMEM allocation).
+  Promotion: a re-accessed FIFO object moves into the main queue's fast portion — a bookkeeping move
+  that emits **no migration**, since the bytes are already in DRAM (so `promotions` counts only
+  genuine PMEM→DRAM moves in this design, never FIFO→main). Demotion, eviction priority, and the
+  no-ghost-queue decision are all identical to `two_q_hybrid_cache`
+- **The one accounting difference that matters**: `fifo_capacity = k_in * max_size` is now a DRAM
+  reservation **carved out of `fast_tier_size`**, not an independent PMEM budget:
+  `effective_main_fast_capacity = fast_tier_size − k_in * max_size`. Since `k_in` is denominated in
+  `max_size` while the budget it consumes is `fast_tier_size` (typically a small fraction of
+  `max_size`), a `k_in` that is unremarkable under `two_q_hybrid_cache` can swallow the whole fast
+  tier here — at a 24 GB cache with a 4 GB fast tier, `k_in = 0.1` reserves 2.4 GB (60%) for objects
+  with no demonstrated reuse. If the reservation meets or exceeds `fast_tier_size`, the main queue
+  gets zero fast capacity and every promotion self-demotes immediately: legitimate, but rarely
+  intended. **Sweep `k_in` down here in a way that is unnecessary for `two_q_hybrid_cache`.** The
+  reservation is the *fixed* `fifo_capacity`, not live `fifo_used`, so the main queue's budget stays
+  stable as the FIFO queue fills and drains (and admission therefore never demotes anyone by itself);
+  `resize()` re-settles, which `TwoQHybridStack::resize` need not
+- **Requirements**: `["key_value_pmem"]`, same as every other hybrid. **Mutually exclusive with every
+  other hybrid-cache feature**
+- **Use case**: Workloads where SET latency matters and there is DRAM headroom to spend on unproven
+  objects — the inverse of `two_q_hybrid_cache`'s tradeoff, which spends SET latency to keep DRAM
+  exclusively for proven-hot objects
+- **Measured** (800K accesses of `standard_web.bin`, `-c 1`, 2 GB cache / 1 GB fast tier, `k_in`
+  0.1, same binary otherwise): SET mean **7.11 µs → 3.30 µs (2.15x)**, SET p99 **25.48 µs → 9.36 µs
+  (2.72x)**, miss ratio essentially unchanged (0.3308 → 0.3211) — as expected, since the logical
+  queue structure is identical. GET mean also improved (4.09 → 3.34 µs), but that is **specific to
+  this configuration**, not a general property: at this scale the whole retained working set fit
+  inside the effective fast budget, so nothing was ever demoted (slow tier empty, 0 demotions) while
+  `two_q_hybrid_cache` had 200 MB in PMEM by construction. The cost side shows in the same numbers:
+  624 MB of DRAM used versus 374 MB for the same workload
+
 ### `lru_sized_hybrid_cache`
 - **Purpose**: Single-instance, segmented-LRU hybrid cache with a *size-split* fast AND slow tier — same
   LRU admission/promotion/demotion/eviction semantics as `lru_hybrid_cache`, but the fast (DRAM) tier's

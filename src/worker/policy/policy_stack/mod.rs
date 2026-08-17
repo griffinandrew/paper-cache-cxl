@@ -17,6 +17,7 @@ mod s_three_fifo_stack;
 mod lru_hybrid_stack;
 mod lfu_hybrid_stack;
 mod two_q_hybrid_stack;
+mod two_q_fast_admission_hybrid_stack;
 mod fifo_hybrid_stack;
 mod lru_sized_hybrid_stack;
 mod s3_fifo_hybrid_stack;
@@ -50,6 +51,7 @@ use crate::{
 		lru_hybrid_stack::LruHybridStack,
 		lfu_hybrid_stack::LfuHybridStack,
 		two_q_hybrid_stack::TwoQHybridStack,
+		two_q_fast_admission_hybrid_stack::TwoQFastAdmissionHybridStack,
 		fifo_hybrid_stack::FifoHybridStack,
 		lru_sized_hybrid_stack::LruSizedHybridStack,
 		s3_fifo_hybrid_stack::S3FifoHybridStack,
@@ -303,6 +305,18 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// the fast-tier budget still defaults to 20% of max_size, same
 		// override mechanism as the other two hybrids.
 		PaperPolicy::TwoQHybrid(k_in) => Box::new(TwoQHybridStack::new(
+			k_in, max_size, (max_size as f64 * 0.2) as CacheSize,
+		)),
+
+		// Same construction shape as `TwoQHybrid` above. Note the default
+		// fast-tier budget matters more here: `fifo_capacity` (k_in *
+		// max_size) is carved *out of* it rather than being an independent
+		// PMEM budget, so at the 20% default a k_in above 0.2 would leave
+		// the main queue no fast segment at all. That is a legitimate
+		// configuration (see the stack's module doc), and callers override
+		// the budget via `ResizeFastTier` immediately after construction
+		// anyway, but it is worth knowing when picking k_in.
+		PaperPolicy::TwoQFastAdmissionHybrid(k_in) => Box::new(TwoQFastAdmissionHybridStack::new(
 			k_in, max_size, (max_size as f64 * 0.2) as CacheSize,
 		)),
 

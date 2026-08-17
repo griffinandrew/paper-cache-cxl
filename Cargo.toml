@@ -185,6 +185,21 @@ lfu_hybrid_cache = ["key_value_pmem"]
 # `fifo_hybrid_cache`/`lru_sized_hybrid_cache`.
 two_q_hybrid_cache = ["key_value_pmem"]
 
+# Two-tier segmented-2Q hybrid cache with the one-access FIFO queue in the
+# FAST tier rather than the slow tier: identical to `two_q_hybrid_cache`
+# except that admission is a plain DRAM write instead of a synchronous
+# PMEM/UMF allocation on the calling thread. The FIFO queue's `k_in *
+# max_size` budget becomes a reservation carved out of `fast_tier_size`
+# (both are DRAM now), so it directly reduces the room available to
+# proven-hot main-queue objects -- see
+# `worker/policy/policy_stack/two_q_fast_admission_hybrid_stack.rs`'s module
+# doc for the accounting. Same trade, and the same mechanism, as
+# `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` makes for the
+# s3-fifo family. Same dependency reasoning as the other hybrids.
+#
+# Mutually exclusive with every other hybrid-cache feature.
+two_q_fast_admission_hybrid_cache = ["key_value_pmem"]
+
 # Single-instance, segmented-FIFO hybrid cache: same one-PaperCache<K,
 # TieredBuffer> architecture as `lru_hybrid_cache`/`lfu_hybrid_cache`/
 # `two_q_hybrid_cache` above, but the fast/slow boundary is pure insertion

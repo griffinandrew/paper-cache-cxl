@@ -2335,3 +2335,267 @@ lost. Consistent with that suite's already-documented timing sensitivity, but un
 - **`incr_hits` does two contended read-modify-writes per read** (`total_gets` and `total_hits`) on
   lines shared by every client thread. Sharded or per-thread counters would fix it, but that
   changes `Status`'s semantics and is well outside "the background eviction queue manager".
+
+## Reporting: hybrid tier stats in the benchmark, and a summary CSV per run
+
+The benchmark recorded **none** of the hybrid designs' tier statistics. Nothing called any
+`*_hybrid_stats()` accessor; the only trace of intent was a commented-out
+`//CacheBackend::report_stats_lru(backend)` at the end of `main.rs`. `--output-csv` writes only a
+100-row latency *distribution* (`Stats::save_latency_percentiles`), truncating on open, with
+nowhere sensible to put a scalar like "total demotions" and one file per run to stitch together
+afterwards.
+
+### The obstacle, and where the `#[cfg]` cascade belongs
+
+Each of the 15 hybrid designs exposes a differently-*named* accessor returning a differently-named
+type (`lru_hybrid_stats() -> LruHybridStats`, `s3_fifo_ghost_hybrid_stats() ->
+S3FifoGhostHybridStats`, ...). Any consumer generic over "whichever design this binary was built
+against" therefore needed its own 15-arm cascade naming all 15 methods *and* all 15 types,
+duplicated per call site, needing a new arm every time a design is added here.
+
+Checked all 15 `*_hybrid_cache/stats.rs` structs directly: they share the same seven fields
+(`promotions`/`demotions`/`evictions`/`fast_bytes_used`/`slow_bytes_used`/`fast_objects`/
+`slow_objects`) *identically*; only `LruSizedHybridStats` carries extras (8 per-size-segment
+gauges). So the cascade was collapsed to one place inside this crate:
+
+- **`src/hybrid_stats.rs`** — `HybridStats`, the neutral seven-field snapshot, plus
+  `total_objects()`/`total_bytes_used()`.
+- **`AtomicStatus::hybrid_stats()`** (`status.rs`) — 15 one-line `#[cfg]`'d bodies, each delegating
+  to that design's *existing* named accessor through a `common_hybrid_stats!` macro. Reading
+  *through* the named accessor (rather than the underlying atomics) is deliberate: the two can
+  never disagree about a counter because there is only one place either loads from. A design added
+  without an arm here is a **compile error**, which is the intended failure mode — never a
+  silently-zeroed column in someone's results CSV.
+- **`PaperCache::hybrid_stats()`** (`lib.rs`) — one method on the shared generic hybrid impl block.
+
+The per-design named accessors are untouched: `paper-server` and existing callers keep the names
+they use, and designs with extra fields keep them.
+
+### Benchmark side
+
+- **`CacheBackend::cache_report()`** (`cache_backend.rs`) — one trait method, one
+  `#[cfg(any(..))]`, no per-design arms. Returns policy, max/used size, object count, RSS/HWM, miss
+  ratio, fast-tier budget, and the seven tier stats. Returns benchmark-local structs (`CacheReport`/
+  `HybridStatsSnapshot`) rather than `paper_cache::HybridStats`, which only exists under a hybrid
+  feature — naming it in the trait would push the same cascade back out into `main.rs`/`stats.rs`.
+  **The policy string comes from the cache itself** (`Status::policy()`), so each row labels its own
+  design instead of a hardcoded 15-name table in the harness.
+- **`src/summary.rs`** — a `*** CACHE stats ***` / `*** TIER stats ***` stdout block (tier block
+  skipped entirely on non-hybrid builds, where seven zeros would read as "nothing moved" rather
+  than "not applicable"), plus `--summary-csv`: **one appended row per run**, 27 columns, header
+  written only when the file is new or empty. Point every run of a sweep at the same file and it
+  accumulates directly comparable rows — the shape the aggregate counts are actually wanted in.
+  Hand-rolled rather than via `kwik`'s `CsvWriter`, which opens with `File::create` (truncating,
+  the opposite of an accumulating sweep file) and whose `WriteRow` signature differs between the
+  benchmark's `hot_fix` feature states.
+- `Stats::get_summary()`/`set_summary()` (`stats.rs`) — the scalar count/mean/p99/bytes columns,
+  the same numbers `print_get_stats`/`print_set_stats` render as distributions.
+
+### Verified against real traces, all 15 designs — including a falsification test
+
+800K accesses of `standard_web.bin`, 2 GB cache, `-c 1`, one run per design (rebuilt against each
+paper-cache hybrid feature in turn). Three independent cross-checks, all exact:
+
+1. **`fast_objects + slow_objects == num_objects`, exactly, for all 15.** These come from
+   completely separate paths — `num_objects` is incremented on the API thread in `set()`, the tier
+   gauges from the policy stack's own bookkeeping in `PolicyWorker`. Exact agreement at ~120K
+   objects across 15 different stack implementations means neither side drifts.
+2. **`used_size − (fast_bytes_used + slow_bytes_used)` is an exact integer multiple of
+   `num_objects`**, and the per-object value matches that design's `get_policy_overhead` constant
+   to the byte: 85 (LruHybrid/FifoHybrid/LruSized), 86 (TwoQHybrid/2Q-ghost), 87 (s3-fifo family),
+   113 (LfuHybrid). Zero remainder — a third accounting path (`OverheadManager::base_size`)
+   agreeing exactly.
+3. **`fast_bytes_used <= fast_tier_size`** for every design.
+
+Several designs legitimately report a **0** in one counter, and the shapes are all explained by
+their own documented semantics rather than a reporting gap: `fifo-hybrid` has 0 promotions (FIFO
+does not reorder on access — no promotion mechanism exists); the two non-reprieve `fast_admission`
+variants have 0 promotions because their one-access queue is already Fast, so the
+one-access→main promotion is Fast→Fast and emits no migration (exactly the optimization documented
+in `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack.rs`'s module doc); and six designs
+reported 0 demotions with the fast tier sitting well under budget.
+
+That last group was the one that could plausibly have been a stuck counter, so it was tested
+directly rather than argued: **the same sweep was re-run at a 750 MB fast tier instead of 1 GB.**
+The three ghost designs whose fast tier went from 91% to 100% of budget flipped from 0 demotions to
+**10,931 / 9,592 / 9,736**; the designs still reporting 0 (`2q-hybrid` at 49.7%, `s3-fifo-hybrid` at
+49.9%, `s3-fifo-lazy-demotion-reprieve` at 93.4%) are exactly the ones still under budget. Every
+design's demotion count moved monotonically with fast-tier pressure. The zeros were genuine
+headroom, not a broken gauge.
+
+Also verified: a non-hybrid (`all_dram`) build still writes a valid row (`policy=lru`, empty
+`fast_tier_size`, zeroed tier columns) and skips the tier block; every row in both CSVs has exactly
+27 fields matching the 27 headers; unit suites pass unchanged (253 lru, 253 lfu, 254 two_q, 254
+fifo, 256 lru_sized, 246 s3_fifo, 246 s3_fifo_lazy_demotion_reprieve); six real-PMEM integration
+suites pass at their documented baselines (15/15 +2 ignored lru, 19/19 lfu, 18/18 two_q, 14/14
+fifo, 20/20 lru_sized, 20/20 s3_fifo); and `all_dram`/`key_value_pmem`/`global_hashtable_pmem`/
+`hashbrown_dram`/`eviction_stacks_pmem`/`tiering` still build clean (the crate-side change is purely
+additive — a new module and one new method).
+
+### A real pre-existing bug this surfaced: `FAST_TIER_GB` was integer-only in 13 of 15 backends
+
+Found while setting up the verification sweep, not by code review: `--features hybrid_2q` died with
+`InvalidFastTierSize` at `FAST_TIER_GB=0.25`. Root cause in `cache_backend.rs`: only `hybrid` and
+`hybrid_lfu` parsed the env var as `f64`; the other 13 parsed it as **`u64`**, so
+`"0.25".parse::<u64>()` failed, `.ok()` swallowed the error, and `.unwrap_or(4)` silently
+substituted the 4 GB default. **Any fast-tier sweep that passed a fractional GB value was measuring
+4 GB for 13 of the 15 designs** — silently, with no error, producing plausible-looking results at
+the wrong configuration. (It only surfaced as a hard failure here because 4 GB exceeded the 2 GB
+`--cache-max-size` the verification used; at production cache sizes it would just quietly
+mismeasure.)
+
+Fixed at all 13 sites, mirroring the two already-correct ones: parse `f64`, convert via
+`CacheTierSize::Mb((gb * 1000.0).round() as u64)` instead of `CacheTierSize::Gb(gb)`.
+`hybrid_lru_sized`'s even split needed its own variant (`(gb * 1000.0 / 2.0).round() as u64`).
+**Behavior-preserving for whole-GB values**: `CacheTierSize` is decimal in both units (`Mb` = 10^6,
+`Gb` = 10^9), so `Mb(gb * 1000)` is byte-identical to the old `Gb(gb)` — existing whole-GB sweep
+results stay directly comparable. Verified by re-running all 15 designs at `FAST_TIER_GB=0.75`
+against a 2 GB cache (a value unparseable as `u64`, with the old 4 GB fallback exceeding
+`max_size`, so any unconverted design would fail outright rather than mismeasure): all 15 built,
+ran, and reported exactly `fast_tier_size=750000000`, with all three invariants above still exact.
+
+### One API asymmetry worth knowing: `fast_tier_size()` means something different for `lru_sized`
+
+The first sweep showed `lru-sized-hybrid` at **194.7%** of its fast-tier budget — not a leak, and
+not an accounting bug. `lru_sized_hybrid_cache` is the one design where `fast_tier_size()` means the
+**SMALL segment only**, with the LARGE segment carried separately as `large_fast_tier_size()` (see
+that feature's section above); the benchmark's constructor splits `FAST_TIER_GB` evenly between
+them. So `fast_bytes_used` (both segments combined) was being divided by half the real budget.
+Fixed in `cache_report()` by summing the two segments for that design specifically — re-measured at
+98.0%, in line with every other design. Worth remembering for any other consumer of
+`fast_tier_size()`: it is the whole DRAM budget for 14 of the 15 designs and half of it for the
+fifteenth.
+
+## Feature: `two_q_fast_admission_hybrid_cache` (implemented)
+
+`two_q_hybrid_cache` with the one-access FIFO queue in the **fast** tier instead of the slow tier, so
+`set()` is a plain DRAM write rather than a synchronous PMEM/UMF allocation on the calling thread.
+Requested directly ("using 2q... but having the single access queue in the fast tier so set
+performance is good"). This is the same delta
+`s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` already applies to the s3-fifo family, so
+most of the design risk was already retired — that stack's module doc was the working template.
+
+### What actually differs from `TwoQHybridStack`
+
+The logical 2Q structure is untouched (two live queues, no ghost queue, main-queue LRU segmentation,
+FIFO-tail-first eviction, one combined per-key `entries` map). Only physical placement changes:
+
+1. **`admission_tier` is unconditionally `Tier::Fast`**, for brand-new and existing keys alike. This
+   removes the `DashMap` probe `TwoQHybridPolicy::admission_tier` needs to distinguish the two cases
+   — one fewer lookup per `set()`, on top of the avoided PMEM allocation.
+2. **`effective_main_fast_capacity() = fast_capacity.saturating_sub(fifo_capacity)`**, checked by
+   `settle_fast_tier` in place of raw `fast_capacity`. Both structures are DRAM now, so leaving the
+   budgets independent would let real DRAM reach `fast_capacity + fifo_capacity`.
+3. **Gauges flip**: `fast_bytes_used = fifo_used + fast_used`, `slow_bytes_used = slow_used`,
+   `fast_object_count = fifo_queue.len() + fast_count`, `slow_object_count = main_count - fast_count`.
+4. **`promote_from_fifo` emits no migration.** In `TwoQHybridStack` that `(key, Tier::Fast)` push was
+   load-bearing — the API layer had built the bytes Slow, so the migration was the only thing that
+   ever moved them to DRAM. Here it would copy a value onto itself. A FIFO promotion can still
+   *cause* migrations (the bytes move from the FIFO reservation into the main-fast budget, which can
+   demote someone else), producing a batch with `Tier::Slow` entries and no matching `Tier::Fast` —
+   a shape `apply_tier_migrations` already handles, so no worker-side change was needed.
+5. **`resize()` re-settles**, which `TwoQHybridStack::resize` need not: `fifo_capacity` derives from
+   `max_size`, so growing the cache grows the reservation and shrinks the main queue's effective
+   budget.
+
+### A design decision a failing test forced me to get right
+
+The first implementation also called `settle_fast_tier()` from `insert`, on the reasoning that
+"admission now consumes DRAM, so it must be able to demote." A unit test written from that same
+reasoning (`a_brand_new_admission_alone_can_force_a_demotion`) failed — correctly. The reservation is
+the **fixed `fifo_capacity`, not live `fifo_used`**, so admission moves no capacity and that call was
+dead code.
+
+The alternative (charging live `fifo_used`) would bound total DRAM more tightly, but would make the
+main queue's budget breathe with FIFO occupancy and churn migrations as the queue fills and drains.
+Kept the fixed reservation — matching the s3-fifo precedent — removed the dead call, and replaced the
+test with two that pin the decision down in both directions
+(`admission_does_not_move_the_main_queues_budget`,
+`the_fifo_reservation_is_held_even_while_the_fifo_queue_is_empty`), documenting that they are the
+tests that should fail if this is ever revisited. Two doc comments written from the same wrong
+premise were corrected at the same time.
+
+### The sizing trap this design introduces, and how the tests hit it
+
+`k_in` is denominated in `max_size`, but the budget it consumes is `fast_tier_size`. Four of the
+first seventeen integration tests failed on this: at `max_size = 1_000_000`, `k_in = 0.05` reserves
+50,000 bytes against a 600-byte test fast tier, saturating the main queue's capacity to **zero** — so
+every promotion self-demoted instantly and no key was ever observably fast in the main queue. Not an
+implementation bug; the configurations were degenerate. Fixed with documented module-level constants
+(`MAX_SIZE`/`FAST_TIER`/`K_IN`) and a `make_cache()` helper keeping the three quantities in a stated
+relationship, rather than re-deriving the arithmetic at each call site. The one test that
+deliberately keeps a degenerate-looking config (`many_admissions_all_land_fast_without_any_migration`,
+which needs a FIFO queue roomy enough for 20 keys and never promotes) carries a comment saying so.
+
+The same trap applies at real scale, which is why it is called out in `FEATURE_FLAGS.md` and the
+benchmark backend: at a 24 GB cache with a 4 GB fast tier, `k_in = 0.1` reserves 2.4 GB — 60% of the
+DRAM budget — for objects with no demonstrated reuse. Per explicit instruction, `k_in` stays
+denominated in `max_size` (consistent with `two_q_hybrid_cache` and the s3-fifo family); tune the
+value rather than the denominator. The benchmark backend reads `TWO_Q_K_IN` (default 0.1) so a k_in
+sweep needs no rebuild.
+
+Two other tests failed on **gauge-refresh cadence**, not correctness: a fixed 200 ms sleep observed
+15 of 20 admissions, because `refresh_tier_gauges` runs once per worker event-loop pass. Switched to
+`wait_until`, the convention the rest of this suite already uses.
+
+### Files touched
+
+`Cargo.toml`, `policy.rs` (variant + `Display`/`FromStr` + 3 tests, with the new
+`"2q-fast-admission-hybrid-"` guard placed **before** `"2q-ghost-hybrid-"`/`"2q-hybrid-"`/`"2q-"` —
+the same prefix-ordering trap `two_q_hybrid` hit, locked in by
+`two_q_fast_admission_hybrid_does_not_collide_with_other_2q_forms`), `object/overhead.rs` (86
+bytes/object, structurally identical to `TwoQHybrid`), `status.rs` (counters/gauges + an arm in
+`hybrid_stats()`), `worker/mod.rs`, `worker/manager.rs`, `worker/policy/mod.rs` (16th
+`apply_tier_migrations`/`refresh_tier_gauges` sibling, eviction counter, 6-test worker module),
+`worker/policy/policy_stack/{mod.rs,two_q_fast_admission_hybrid_stack.rs}`,
+`src/two_q_fast_admission_hybrid_cache/{mod.rs,stats.rs}`, `lib.rs` (module, `ActiveHybridPolicy`
+alias, 15 pairwise `compile_error!` guards, impl block), and
+`tests/two_q_fast_admission_hybrid_cache_integration.rs`. Benchmark side:
+`hybrid_2q_fast_admission` feature + backend in `paper-benchmark-cxl`.
+
+The 29 canonical `any(...)` hybrid cfg lists were updated by matching the exact
+`feature = "two_q_hybrid_cache", feature = "fifo_hybrid_cache"` substring — verified beforehand to
+occur exactly 29 times and never in a single-feature gate, so single-design `#[cfg]`s could not be
+caught by accident.
+
+### Verified
+
+272/272 unit tests (including 17 new stack tests and 6 worker-level wiring tests);
+`tests/two_q_fast_admission_hybrid_cache_integration.rs` 17/17, run three times consecutively (not
+flaky); builds clean alone and with `eviction_stacks_pmem`; the mutual-exclusion `compile_error!`
+fires as intended. No regressions: 12 other feature builds pass their full `--lib` suites (counts up
+by exactly the 3 new `policy.rs` tests), and `two_q_hybrid_cache` (18/18) and `lru_hybrid_cache`
+(15/15 +2 ignored) real-PMEM integration suites are unchanged.
+
+**End-to-end against the real benchmark** (800K accesses of `standard_web.bin`, `-c 1`, 2 GB cache /
+1 GB fast tier, `k_in` 0.1, same binary otherwise, both designs run back to back):
+
+| | `2q-hybrid-0.1` | `2q-fast-admission-hybrid-0.1` |
+|---|---|---|
+| SET mean | 7.11 µs | **3.30 µs** (2.15x) |
+| SET p99 | 25.48 µs | **9.36 µs** (2.72x) |
+| GET mean | 4.09 µs | 3.34 µs |
+| miss ratio | 0.3308 | 0.3211 |
+| DRAM (fast_bytes_used) | 374 MB | 624 MB |
+| PMEM (slow_bytes_used) | 200 MB | 0 MB |
+| promotions / demotions | 22,565 / 0 | 0 / 0 |
+
+The SET win is the designed effect and matches the ~2–3x the s3-fifo fast-admission variants
+measured. The miss ratio being unchanged is the expected confirmation that only placement moved.
+**The GET improvement should not be generalized**: at this scale the entire retained working set fit
+inside the effective fast budget, so nothing was ever demoted (slow tier empty) while
+`two_q_hybrid_cache` had 200 MB in PMEM by construction — that is a difference in tier placement, not
+a like-for-like latency comparison, and the same rows show the cost (624 MB of DRAM versus 374 MB for
+the identical workload). A configuration whose working set exceeds the effective fast budget would
+exercise the demotion path and likely show GET neutral or slightly worse. Zero promotions is correct
+by construction, not a missing counter: FIFO→main is Fast→Fast and emits no migration, and nothing
+was demoted, so no PMEM→DRAM move ever occurred.
+
+### Remaining work
+
+- No large-scale/high-concurrency run yet (the comparison above is `-c 1` on an 800K-access slice).
+  A configuration that genuinely exceeds the effective fast budget is the interesting one — it would
+  exercise demotion and give a real GET comparison, which this run does not.
+- `k_in` has not been swept. Given the reservation now comes out of DRAM, the value inherited from
+  `two_q_hybrid_cache` (0.1) is unlikely to be the right one here; `TWO_Q_K_IN` exists to sweep it
+  without a rebuild.
