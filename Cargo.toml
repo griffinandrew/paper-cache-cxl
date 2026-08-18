@@ -249,6 +249,26 @@ fifo_hybrid_cache = ["key_value_pmem"]
 # `two_q_hybrid_cache`/`fifo_hybrid_cache` above.
 lru_sized_hybrid_cache = ["key_value_pmem"]
 
+# Single-instance hybrid cache with a DIFFERENT eviction discipline per tier:
+# the fast (DRAM) tier is recency-ordered (LRU) and the slow (PMEM) tier is
+# frequency-ordered (LFU). Every other hybrid here ranks both tiers by the
+# same metric; this is the first that does not, which is why promotion is a
+# fixed access-count threshold (`promote_k`) rather than a cross-tier
+# comparison — a recency-ordered fast tier has no queryable minimum frequency
+# to compare against. See `worker/policy/policy_stack/lru_lfu_hybrid_stack.rs`
+# for the full derivation.
+#
+# Rationale: recency is the right signal for the small hot tier, while LRU
+# over a very large slow tier is dominated by scans and one-hit-wonders. LFU
+# there is scan-resistant and actually identifies which cold objects deserve
+# promotion and which deserve eviction.
+#
+# Same dependency reasoning as the other hybrids: only needs
+# `key_value_pmem`, not `key_pmem_value_pmem`.
+#
+# Mutually exclusive with every other hybrid-cache feature.
+lru_lfu_hybrid_cache = ["key_value_pmem"]
+
 # Single-instance, segmented-S3-FIFO hybrid cache: same one-PaperCache<K,
 # TieredBuffer> architecture as the other hybrids above. Structurally
 # closest to `two_q_hybrid_cache` (a one-access FIFO queue always in the

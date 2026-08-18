@@ -15,6 +15,7 @@ mod two_q_stack;
 mod arc_stack;
 mod s_three_fifo_stack;
 mod lru_hybrid_stack;
+mod lru_lfu_hybrid_stack;
 mod lfu_hybrid_stack;
 mod two_q_hybrid_stack;
 mod two_q_fast_admission_hybrid_stack;
@@ -50,6 +51,7 @@ use crate::{
 		arc_stack::ArcStack,
 		s_three_fifo_stack::SThreeFifoStack,
 		lru_hybrid_stack::LruHybridStack,
+		lru_lfu_hybrid_stack::LruLfuHybridStack,
 		lfu_hybrid_stack::LfuHybridStack,
 		two_q_hybrid_stack::TwoQHybridStack,
 		two_q_fast_admission_hybrid_stack::TwoQFastAdmissionHybridStack,
@@ -291,6 +293,21 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		),
 		#[cfg(not(feature = "lru_hybrid_cache"))]
 		PaperPolicy::LruHybrid => Box::new(LruHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
+
+		// Same default fast-tier budget/override mechanism as `LruHybrid`.
+		// `promote_k` comes from the policy value itself rather than a default
+		// here, since it is carried in the policy string.
+		#[cfg(feature = "lru_lfu_hybrid_cache")]
+		PaperPolicy::LruLfuHybrid(promote_k) => Box::new(
+			LruLfuHybridStack::new((max_size as f64 * 0.2) as CacheSize, promote_k)
+				.with_shared_overhead(
+					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+				),
+		),
+		#[cfg(not(feature = "lru_lfu_hybrid_cache"))]
+		PaperPolicy::LruLfuHybrid(promote_k) => Box::new(
+			LruLfuHybridStack::new((max_size as f64 * 0.2) as CacheSize, promote_k),
+		),
 
 		// Same default fast-tier budget/override mechanism as `LruHybrid`.
 		#[cfg(feature = "lfu_hybrid_cache")]

@@ -29,7 +29,7 @@ use crate::{
 	object::overhead::get_policy_overhead,
 };
 
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
 use crate::hybrid_stats::HybridStats;
 
 /// Projects one of the 15 per-design `*_hybrid_stats()` accessors onto the
@@ -42,7 +42,7 @@ use crate::hybrid_stats::HybridStats;
 /// fields directly is deliberate: it means `hybrid_stats()` can never
 /// disagree with `{design}_hybrid_stats()` about the same counter, because
 /// there is only one place either value is loaded from.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
 macro_rules! common_hybrid_stats {
 	($self:ident, $accessor:ident) => {{
 		let stats = $self.$accessor();
@@ -114,7 +114,7 @@ pub struct AtomicStatus {
 	/// that design has a second, independent fast segment ("large") with its
 	/// own dedicated `lru_sized_hybrid_large_fast_capacity` field below,
 	/// since a single shared field can't represent two independent budgets.
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache"))]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
 	fast_tier_capacity: AtomicCacheSize,
 
 	/// `lru_hybrid_cache` counters/gauges, updated by `PolicyWorker` as it
@@ -137,6 +137,24 @@ pub struct AtomicStatus {
 	lru_hybrid_fast_objects: AtomicU64,
 	#[cfg(feature = "lru_hybrid_cache")]
 	lru_hybrid_slow_objects: AtomicU64,
+
+	/// `lru_lfu_hybrid_cache` counters/gauges — same rationale as the
+	/// `lru_hybrid_*` fields above (kept as a separate, independently named
+	/// set so each feature stays self-contained and removable).
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	lru_lfu_hybrid_promotions: AtomicU64,
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	lru_lfu_hybrid_demotions: AtomicU64,
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	lru_lfu_hybrid_evictions: AtomicU64,
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	lru_lfu_hybrid_fast_bytes_used: AtomicCacheSize,
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	lru_lfu_hybrid_slow_bytes_used: AtomicCacheSize,
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	lru_lfu_hybrid_fast_objects: AtomicU64,
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	lru_lfu_hybrid_slow_objects: AtomicU64,
 
 	/// `lfu_hybrid_cache` counters/gauges — same rationale as the
 	/// `lru_hybrid_*` fields above (kept as a separate, independently named
@@ -593,7 +611,7 @@ impl AtomicStatus {
 
 			start_time: AtomicU64::new(time::timestamp()),
 
-			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache"))]
+			#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
 			fast_tier_capacity: AtomicCacheSize::default(),
 			#[cfg(feature = "lru_hybrid_cache")]
 			lru_hybrid_promotions: AtomicU64::default(),
@@ -609,6 +627,21 @@ impl AtomicStatus {
 			lru_hybrid_fast_objects: AtomicU64::default(),
 			#[cfg(feature = "lru_hybrid_cache")]
 			lru_hybrid_slow_objects: AtomicU64::default(),
+
+			#[cfg(feature = "lru_lfu_hybrid_cache")]
+			lru_lfu_hybrid_promotions: AtomicU64::default(),
+			#[cfg(feature = "lru_lfu_hybrid_cache")]
+			lru_lfu_hybrid_demotions: AtomicU64::default(),
+			#[cfg(feature = "lru_lfu_hybrid_cache")]
+			lru_lfu_hybrid_evictions: AtomicU64::default(),
+			#[cfg(feature = "lru_lfu_hybrid_cache")]
+			lru_lfu_hybrid_fast_bytes_used: AtomicCacheSize::default(),
+			#[cfg(feature = "lru_lfu_hybrid_cache")]
+			lru_lfu_hybrid_slow_bytes_used: AtomicCacheSize::default(),
+			#[cfg(feature = "lru_lfu_hybrid_cache")]
+			lru_lfu_hybrid_fast_objects: AtomicU64::default(),
+			#[cfg(feature = "lru_lfu_hybrid_cache")]
+			lru_lfu_hybrid_slow_objects: AtomicU64::default(),
 
 			#[cfg(feature = "lfu_hybrid_cache")]
 			lfu_hybrid_promotions: AtomicU64::default(),
@@ -986,7 +1019,7 @@ impl AtomicStatus {
 	/// `PaperPolicy::LfuHybrid` / `PaperPolicy::TwoQHybrid` /
 	/// `PaperPolicy::FifoHybrid` / `PaperPolicy::LruSizedHybrid`'s SMALL
 	/// segment — see the field's doc on the struct).
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache"))]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
 	#[must_use]
 	pub fn fast_tier_capacity(&self) -> CacheSize {
 		self.fast_tier_capacity.load(Ordering::Relaxed)
@@ -995,7 +1028,7 @@ impl AtomicStatus {
 	/// Sets the fast-tier byte budget. Callers are responsible for also
 	/// broadcasting `WorkerEvent::ResizeFastTier` so the active stack's own
 	/// internal capacity is updated (mirrors `set_max_size` + `Resize`).
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache"))]
+	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
 	pub fn set_fast_tier_capacity(&self, size: CacheSize) {
 		self.fast_tier_capacity.store(size, Ordering::Relaxed);
 	}
@@ -1043,6 +1076,52 @@ impl AtomicStatus {
 			slow_bytes_used: self.lru_hybrid_slow_bytes_used.load(Ordering::Relaxed),
 			fast_objects: self.lru_hybrid_fast_objects.load(Ordering::Relaxed),
 			slow_objects: self.lru_hybrid_slow_objects.load(Ordering::Relaxed),
+		}
+	}
+
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	pub fn record_lru_lfu_hybrid_promotion(&self) {
+		self.lru_lfu_hybrid_promotions.fetch_add(1, Ordering::Relaxed);
+	}
+
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	pub fn record_lru_lfu_hybrid_demotion(&self) {
+		self.lru_lfu_hybrid_demotions.fetch_add(1, Ordering::Relaxed);
+	}
+
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	pub fn record_lru_lfu_hybrid_eviction(&self) {
+		self.lru_lfu_hybrid_evictions.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Overwrites the live tier gauges (bytes/objects currently in each
+	/// tier). Called by `PolicyWorker` once per event-loop pass.
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	pub fn set_lru_lfu_hybrid_gauges(
+		&self,
+		fast_bytes_used: CacheSize,
+		slow_bytes_used: CacheSize,
+		fast_objects: u64,
+		slow_objects: u64,
+	) {
+		self.lru_lfu_hybrid_fast_bytes_used.store(fast_bytes_used, Ordering::Relaxed);
+		self.lru_lfu_hybrid_slow_bytes_used.store(slow_bytes_used, Ordering::Relaxed);
+		self.lru_lfu_hybrid_fast_objects.store(fast_objects, Ordering::Relaxed);
+		self.lru_lfu_hybrid_slow_objects.store(slow_objects, Ordering::Relaxed);
+	}
+
+	/// Returns a point-in-time snapshot of `lru_lfu_hybrid_cache` statistics.
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	#[must_use]
+	pub fn lru_lfu_hybrid_stats(&self) -> crate::lru_lfu_hybrid_cache::LruLfuHybridStats {
+		crate::lru_lfu_hybrid_cache::LruLfuHybridStats {
+			promotions: self.lru_lfu_hybrid_promotions.load(Ordering::Relaxed),
+			demotions: self.lru_lfu_hybrid_demotions.load(Ordering::Relaxed),
+			evictions: self.lru_lfu_hybrid_evictions.load(Ordering::Relaxed),
+			fast_bytes_used: self.lru_lfu_hybrid_fast_bytes_used.load(Ordering::Relaxed),
+			slow_bytes_used: self.lru_lfu_hybrid_slow_bytes_used.load(Ordering::Relaxed),
+			fast_objects: self.lru_lfu_hybrid_fast_objects.load(Ordering::Relaxed),
+			slow_objects: self.lru_lfu_hybrid_slow_objects.load(Ordering::Relaxed),
 		}
 	}
 
@@ -1909,6 +1988,12 @@ impl AtomicStatus {
 	#[must_use]
 	pub fn hybrid_stats(&self) -> HybridStats {
 		common_hybrid_stats!(self, lru_hybrid_stats)
+	}
+
+	#[cfg(feature = "lru_lfu_hybrid_cache")]
+	#[must_use]
+	pub fn hybrid_stats(&self) -> HybridStats {
+		common_hybrid_stats!(self, lru_lfu_hybrid_stats)
 	}
 
 	#[cfg(feature = "lfu_hybrid_cache")]

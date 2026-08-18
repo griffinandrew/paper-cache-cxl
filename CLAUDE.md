@@ -2825,3 +2825,228 @@ were ever observed and the pre-expiry baseline assertion failed. It passed on th
 failed on the second. Fixed by calling `ensure_pmem_allocator_warm()` (cheap after the first call
 anywhere in the process) and raising the TTL to 5 s — the same pattern the other TTL tests here
 already use.
+
+## Feature: `lru_lfu_hybrid_cache` (implemented) — the first design whose two tiers rank by different metrics
+
+Requested directly: "use lru for the fast tier and lfu for the slow tier ... how u would admit and
+migrate objects across tiers."
+
+Every prior hybrid here orders both tiers by the *same* metric, and that is load-bearing:
+`LruHybridStack` is literally one recency list with a `fast_boundary` cursor marking the cut, and
+`LfuHybridStack` runs two chains that both rank by frequency. Splitting the metrics breaks one rule
+outright — **`LfuHybridStack`'s promotion rule is not portable**. It promotes when a slow object's
+frequency exceeds the *fast tier's minimum frequency*; a recency-ordered fast tier has no
+O(1)-queryable minimum frequency, and making it queryable means maintaining a frequency chain over
+the fast tier *in addition to* its recency list, roughly doubling that tier's structural cost to
+answer a question a constant answers for free. So promotion became a fixed threshold, `promote_k`.
+
+**Motivation** (not "mix two policies for variety"): the tiers have different jobs. Recency is right
+for the small hot tier and costs one splice per access. LRU over a very large slow tier is close to
+meaningless — its tail is dominated by scans and one-hit-wonders — whereas LFU is scan-resistant and
+actually identifies which cold objects deserve promotion and which deserve eviction. In one line:
+**frequency is the admission control *into* DRAM; recency is the retention policy *within* DRAM.**
+
+### Rules
+
+- **Admission**: new object → fast tier, recency head, frequency 1. Admitting to slow instead would
+  make every `set()` a synchronous PMEM allocation, which `two_q_hybrid` vs `two_q_fast_admission`
+  measured at 2.15x SET mean / 2.72x SET p99 — and the traces this is aimed at are 80–94% SETs.
+- **Demotion**: fast tier's LRU tail → slow chain via `FrequencyChain::insert_at`, **carrying its
+  accumulated frequency**.
+- **Promotion**: a slow object whose frequency reaches `promote_k` → fast tier's recency head,
+  counter reset.
+- **Eviction**: slow chain's minimum-frequency key (ties LRU-within-frequency, matching `LfuStack`),
+  falling back to the fast tier's LRU tail when nothing has ever been demoted — the same last-resort
+  fallback every hybrid stack here keeps.
+
+### Three decisions worth recording
+
+**1. The fast tier counts a frequency it does not rank by.** If demoted objects entered the slow
+chain at frequency 1, everything the fast tier learned would be discarded — an object hit 50 times
+in DRAM would land indistinguishable from a one-hit-wonder demoted in the same pass, and those are
+exactly the objects most likely to be referenced again. So the counter is carried metadata, handed
+to `insert_at` on demotion. Unit test `a_demoted_object_outranks_a_one_hit_wonder_in_the_slow_tier`
+pins the payoff; the integration suite checks it end-to-end.
+
+**2. The counter is a `u16`, and that is not a micro-optimization — it pays twice.** Verified
+against real measured type sizes rather than assumed: `LruEntry { tier, size }` is `u8 + u32` = 8
+bytes, pairing with the 8-byte `HashedKey` to exactly 16, which is the figure `object/overhead.rs`'s
+DRAM-reservation constants are derived from. A `u32` counter gives `4+4+1 = 9` → padded to 12 → a
+**24-byte pair, +8 bytes on every object in both tiers**. A `u16` gives `4+2+1 = 7` → padded back to
+8, so the pair stays 16 and this design costs no more per-object DRAM than `LruHybridStack`. Locked
+in by a unit test (`entry_packs_to_eight_bytes`) that asserts both sizes, so the overhead constant
+can't silently drift. The same cap independently bounds `FrequencyChain::insert_at`'s **linear scan**
+over count buckets — every demotion performs one into the *large* slow chain, and capping counts at
+`1..=16` caps the chain at 16 buckets. Capping is what keeps demotion cheap, not just what keeps the
+entry small.
+
+**3. A `set()` is an access, not an automatic promotion** — a deliberate divergence from
+`LruHybridStack`, where an overwrite always re-admits to the fast tier. The gate would otherwise be
+porous on exactly the workloads this targets: on an 80–94% SET trace, "any set promotes" means
+nearly everything reaches DRAM without demonstrating reuse and the slow tier's ordering never
+filters anything. Consequence for the API layer: `admission_tier` must look up an *existing* key's
+current tier (the `fifo_hybrid_cache` precedent) rather than answering purely from "is this key
+new", so an overwrite of a slow key is written straight to PMEM instead of DRAM-then-corrected.
+
+### Structure — simpler than `LruHybridStack`, not harder
+
+```
+fast_stack:  RecencyList      // fast tier only, recency-ordered
+slow_chain:  FrequencyChain   // slow tier only, frequency-ordered
+entries:     EntryMap         // { size: u32, freq: u16, tier: u8 } = 8 bytes
+```
+
+`fast_boundary` is **gone**. With the slow tier no longer part of the same list there is no cut to
+track — the fast list's own tail *is* the demotion candidate in O(1) — and all the boundary-repair
+logic `touch_fast_key`/`remove`/`evict_one` need in `LruHybridStack` simply does not exist here.
+Same conclusion `LruSizedHybridStack` reached from the other direction: homogeneous per-tier
+structures beat cursor tricks. `FrequencyChain` was lifted from `lfu_hybrid_stack.rs` minus
+`min_count`/`bump` (only one tier needs a chain), plus `move_to` for reordering after a bump.
+
+No new `PolicyStack` trait methods were needed, and no `drain_demotions()`-style disambiguation
+either (unlike the LFU sibling): admission always lands fast and emits no migration, so every
+`Tier::Slow` migration is a genuine demotion and every `Tier::Fast` one a genuine promotion.
+
+### The bug my own tests caught: `promote_k` is an ABSOLUTE frequency, not "accesses since demotion"
+
+The integration suite failed on `a_single_slow_access_does_not_promote` at `promote_k = 2`, and the
+test was wrong in a way that exposed a real usability trap rather than a coding slip. Because the
+counter carries across demotion, a key admitted and never accessed demotes at frequency **1** — so a
+single slow access reaches 2. **`promote_k = 2` therefore behaves exactly like `promote_k = 1`, i.e.
+exactly like `lru_hybrid_cache`, making the entire feature invisible at what looked like the obvious
+default.** The first threshold that filters anything is **3**.
+
+Kept the behavior rather than "fixing" it, for a reason worth stating: a key that was genuinely hot
+before demoting arrives near the cap and returns on its very next access at any `promote_k`, and
+that is the *desired* property — an object with demonstrated popularity needs one confirmation it is
+still in use, while a one-hit-wonder must earn the whole climb. Sharpening this to true
+"accesses since demotion" would need a second per-key counter (or the demotion-time frequency stored
+alongside), which pushes `LruLfuEntry` past 8 bytes and forfeits decision 2 entirely. So the
+semantics are now documented precisely in three places (stack module doc, the `promote_k` field, and
+`PaperCache::new`), the integration default moved to 3, and a unit test
+(`a_slow_access_below_the_absolute_threshold_does_not_promote`) asserts *both* halves — that k=2
+promotes on one access, and that k=3 does not.
+
+A second, more ordinary test bug: two unit tests sized the fast tier to exactly what should survive
+and got an extra cascaded demotion, because `settle_fast_tier` triggers at the ceiling but drains to
+`FAST_TIER_LOW_WATER_RATIO` (98%) of it. This is the same trap `LruHybridStack`'s tests already
+document; fixed with the same `low_water_safe()` helper rather than by adjusting expectations to
+whatever the code happened to do.
+
+### Which trace can actually evaluate this
+
+- **`cluster31` cannot.** Every one of its 82.9M GET keys is unique — zero GET reuse, 100%
+  compulsory miss floor — so no promotion ever fires and the slow tier's frequency ordering never
+  differentiates anything. Any measurement there is noise.
+- **`cluster12` can.** 29.2% of GETs hit a previously-GET key, and its reachable working set
+  (526 GiB) is two orders of magnitude larger than any plausible fast tier — exactly the regime
+  where *which* slow object gets promoted and evicted dominates hit ratio, and where LRU on the slow
+  tier is weakest.
+- Watch on cluster12: sizes are bimodal (p50 6 B, p99 15 KB), and pure LFU eviction is size-blind,
+  so it will retain many tiny popular objects over a few large ones. Hit ratio and byte-hit-ratio
+  will diverge much more than on `standard_web.bin`. If byte-hit-ratio matters, frequency/size
+  ranking (GDSF-style) is the natural follow-on.
+
+### Verified
+
+300/300 unit tests (17 new stack tests), 310/310 with `eviction_stacks_pmem`;
+`tests/lru_lfu_hybrid_cache_integration.rs` 13/13, run twice consecutively; all 27 feature-flag
+build combos OK; the mutual-exclusion `compile_error!` fires. No regressions — 12 other features'
+`--lib` suites and 5 other real-PMEM integration suites pass at their documented baselines (17/17 +2
+ignored lru, 19/19 lfu, 18/18 two_q, 14/14 fifo, 20/20 lru_sized), each run twice.
+
+### Remaining work
+
+- **`promote_k` is unswept.** The measurement above says 3 is the floor for it to mean anything, but
+  nothing establishes the right value. Unlike `TWO_Q_K_IN` there is no benchmark env var for it yet;
+  adding one (`LRU_LFU_PROMOTE_K`) is the prerequisite for a sweep without rebuilds.
+- **No benchmark backend yet** — `paper-benchmark-cxl` has no `hybrid_lru_lfu` feature/backend, so
+  this has not been run against a real trace at all. The crate side is complete and tested; the
+  end-to-end comparison against `lru_hybrid_cache` on `cluster12` is the actual open question.
+- **No aging beyond cap + reset-on-promotion.** Over a 7-day trace with shifting popularity, capped
+  counts may still ossify. Real decay is O(n) over the slow chain — deliberately out of scope, but
+  the thing to suspect if hit ratio degrades over a run's back half.
+
+### Benchmark backend + synthetic-trace sweep across all 18 hybrid designs
+
+`paper-benchmark-cxl` gained a `hybrid_lru_lfu` feature and `PaperCacheBackend`, following the same
+shape as every other hybrid backend: `FAST_TIER_GB` (parsed as `f64` — see the already-documented
+bug where 13 backends parsed it as `u64` and silently fell back to 4 GB on any fractional value),
+plus a new `LRU_LFU_PROMOTE_K` env var so the threshold can be swept without a rebuild (same
+convention as `TWO_Q_K_IN`). It defaults to **3**, not 1 or 2, for the reason documented above:
+below 3 the design degenerates to `lru_hybrid_cache` and measuring it would be measuring nothing.
+
+Then all **18** hybrid designs were run against all **3** synthetic traces
+(`final_traces/{standard_web,low_alpha_cold,uniform_baseline}.bin`) — 54 runs, 0 failures, driver at
+`work/synthetic_sweep.sh`, results in `work/synthetic_sweep/{summary.csv,raw/,progress.txt}`.
+
+**Sizing is the part that makes the sweep meaningful, and it is not the default.** All three traces
+are 100% GET, ~1M distinct keys of ~16.5 KB, WSS **15.6–16.7 GiB**. The benchmark's default
+`--cache-max-size` is 24 GiB — *larger than the whole working set*, so nothing would ever evict and
+all 18 designs would report identical, meaningless numbers. The sweep uses **8 GB cache (~48% of
+WSS)** so eviction is real, and **2 GB fast tier (25% of the cache)** so demotion/promotion are real.
+
+Three independent invariants held on all 54 runs: `fast_objects + slow_objects == num_objects`
+exactly, `fast_bytes_used <= fast_tier_size`, and the `used_size` overhead residual matching each
+design's `get_policy_overhead` constant.
+
+#### Result: the new design does not win on these traces, and the reason is not a bug
+
+| trace | `lru-hybrid` | `lfu-hybrid` | `lru-lfu-hybrid-3` | vs lru | vs lfu |
+|---|---|---|---|---|---|
+| standard_web | 0.1237 | **0.1159** | 0.1228 | **-0.7%** | +6.0% |
+| low_alpha_cold | **0.3034** | 0.3300 | 0.3465 | **+14.2%** | +5.0% |
+| uniform_baseline | **0.5274** | 0.5878 | 0.5588 | **+5.9%** | -4.9% |
+
+Best overall per trace: `lfu-hybrid` (standard_web, 0.1159), `lru-sized-hybrid` (low_alpha_cold,
+0.2868), `s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve` (uniform_baseline, 0.5253).
+`lru-lfu-hybrid-3` placed 8th / 9th / 7th of 18.
+
+**The mechanism demonstrably works — it just doesn't pay here.** Promotions dropped ~40% against
+`lru-hybrid` on every trace (1.03M vs 1.72M on standard_web; 217K vs 415K on uniform_baseline),
+which is exactly what a frequency gate on promotion is supposed to do, and demotions fell with them.
+So the gate is filtering real traffic; the filtered-out promotions simply were not the ones that
+mattered on these workloads.
+
+That is consistent with what these traces *are*. `uniform_baseline` is uniform-random, so frequency
+carries **no** signal at all and an LFU-ordered slow tier is pure overhead against LRU — the design
+losing there is the expected outcome, not a surprise. `low_alpha_cold` is low-skew for the same
+reason. Only `standard_web` has enough popularity structure for frequency to mean anything, and
+there it is a wash (-0.7%, within run-to-run noise).
+
+It also is not the regime this was designed for. The argument for LFU in the slow tier is that LRU
+becomes meaningless when the slow tier is *far* larger than the fast tier and dominated by a long
+cold tail. Here the slow tier is 6 GB against a 2 GB fast tier — **3x**. On `cluster12` the
+read-through-reachable working set is 526 GiB against a few GB of DRAM — **two orders of magnitude**
+— which is the case actually worth testing, and which these traces cannot stand in for.
+
+#### A configuration artifact worth knowing before reading any of these tables
+
+Three designs — `2q-hybrid-0.1`, `s3-fifo-hybrid-0.1`, `2q-fast-admission-hybrid-0.1` — **never
+filled the cache**, and their much worse miss ratios are mostly that, not policy quality:
+
+| trace | design | used_size | miss |
+|---|---|---|---|
+| standard_web | `2q-hybrid-0.1` / `s3-fifo-hybrid-0.1` | 4.56 GB of 8 | 0.1816 |
+| uniform_baseline | `2q-hybrid-0.1` / `s3-fifo-hybrid-0.1` | 2.43 GB of 8 | 0.9157 |
+| uniform_baseline | `2q-fast-admission-hybrid-0.1` | 2.55 GB of 8 | 0.9073 |
+
+This is the already-documented `k_in`/one-access-queue self-limiting effect (see
+`two_q_fast_admission_reprieve_hybrid_cache`'s section: with nothing ever reprieved, the only exit
+from the FIFO queue is eviction, so the cache stabilizes at roughly `fifo_capacity + main_fast`
+rather than `max_size`). At `k_in = 0.1` against an 8 GB cache it is severe — on
+`uniform_baseline` those designs used **30%** of the configured cache and evicted ~2M objects while
+demoting 0. The reprieve variants of the same designs, which route aged-out one-access objects into
+the slow tier instead of evicting them, fill the cache normally and score near the top. Any
+comparison that reads these three as "2Q and S3-FIFO are bad policies" is reading a `k_in`
+misconfiguration.
+
+#### Remaining work
+
+- **`LRU_LFU_PROMOTE_K` is still unswept** — every run above used 3. Whether a higher threshold
+  helps on a trace with real popularity structure is untested.
+- **`k_in` is unswept and is currently distorting three designs**, per above. A `k_in` sweep is
+  worth more than another policy variant right now.
+- **The traces that would actually test this design have not been run.** `cluster12` (526 GiB
+  reachable WSS, 29.2% GET reuse) is the discriminating case; `cluster31` cannot evaluate it at all
+  (zero GET reuse, 100% compulsory miss floor).

@@ -102,6 +102,19 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// 4 bytes for the object size
 		PaperPolicy::LruHybrid => 48 + 8 + 24 + 1 + 4,
 
+		// Structurally identical to LruHybrid, and deliberately so: the fast
+		// tier is the same 48-byte HashList entry + 8-byte HashedKey, and a
+		// slow-tier key occupies one CountStack HashList entry instead --
+		// never both, since a key is in exactly one tier's structure at a
+		// time. The single combined `entries` map charge (24) is unchanged,
+		// and the added frequency counter is a u16 that packs into the
+		// existing padding of `LruLfuEntry { size: u32, freq: u16, tier: u8 }`
+		// -- 7 bytes padded to 8, exactly what `LruEntry { tier, size }`
+		// already measured. See `lru_lfu_hybrid_stack.rs`'s "Why the counter
+		// is capped" section and its `entry_packs_to_eight_bytes` test, which
+		// is what keeps this arm honest.
+		PaperPolicy::LruLfuHybrid(_) => 48 + 8 + 24 + 1 + 4,
+
 		// Base LFU overhead (24 HashMap entry + 48 bucket-list entry + 8
 		// HashedKey + 4 count = 84) plus what LfuHybridStack needs beyond
 		// plain LfuStack: a single combined per-key `entries` HashMap entry
@@ -288,7 +301,7 @@ pub fn get_ttl_overhead() -> ObjectSize {
 /// (see the `lru_hybrid_cache`/`lfu_hybrid_cache` design notes). TODO: if an
 /// exact DRAM ceiling is ever needed, thread a `size_of::<Object<K,V>>()`
 /// hint through from the generic `PaperCache::new` call site instead.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
 pub const HASHTABLE_ENTRY_OVERHEAD: ObjectSize = 11;
 
 /// Dedicated per-object DRAM cost of `LruHybridStack`'s eviction-stack
@@ -343,6 +356,27 @@ const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 29 + 20;
 #[cfg(feature = "lru_sized_hybrid_cache")]
 const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
+/// Dedicated per-object DRAM cost of `LruLfuHybridStack`'s eviction-stack
+/// bookkeeping. A key is resident in exactly one tier's structure at a time,
+/// so this is a worst-case charge over the two:
+///
+/// - **Fast tier**: the recency list's per-key entry (44) + the combined
+///   `entries` map entry (20) = 64, identical to
+///   `LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD` (the added frequency counter
+///   is free — it packs into `LruLfuEntry`'s existing padding).
+/// - **Slow tier**: its `CountStack` list entry (44) + the chain's
+///   `index_map` entry (29) + the combined `entries` entry (20) = 93,
+///   matching `LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`'s derivation.
+///
+/// The slow-tier figure is the larger, but charging it would over-reserve:
+/// this constant is subtracted from the *fast-tier* budget, and the DRAM it
+/// is reserving against is dominated by fast-tier residents. Under
+/// `eviction_stacks_pmem` the whole term drops out anyway (both structures
+/// move to PMEM). Charged at the fast-tier figure, which is what the
+/// reservation is actually protecting.
+#[cfg(feature = "lru_lfu_hybrid_cache")]
+const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
 /// Approximate per-object DRAM cost of the *shared* structures (the object
 /// hashtable + the eviction stacks) that hold an entry for every object of both
 /// tiers. Used by the LRU/LFU/LRU-sized hybrid stacks to reserve room in the
@@ -355,7 +389,7 @@ const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// terms that are actually DRAM-resident: the eviction-stack term is dropped
 /// when `eviction_stacks_pmem` moves those stacks to PMEM, and the hashtable
 /// entry is dropped when a hashtable-PMEM feature moves the object map to PMEM.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
+#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
 pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	#[allow(unused_mut)]
 	let mut overhead: ObjectSize = 0;
@@ -376,6 +410,11 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 		#[cfg(feature = "lru_sized_hybrid_cache")]
 		if matches!(policy, PaperPolicy::LruSizedHybrid) {
 			overhead += LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "lru_lfu_hybrid_cache")]
+		if matches!(policy, PaperPolicy::LruLfuHybrid(_)) {
+			overhead += LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
 		}
 	}
 

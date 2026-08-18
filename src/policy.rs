@@ -36,6 +36,12 @@ pub enum PaperPolicy {
 	TwoQFastAdmissionReprieveHybrid(f64),
 	FifoHybrid,
 	LruSizedHybrid,
+	/// Recency (LRU) in the fast tier, frequency (LFU) in the slow tier.
+	/// The parameter is `promote_k`: how many accesses a slow-tier object
+	/// must accumulate to earn promotion into the fast tier. Carried in the
+	/// policy string (like `TwoQHybrid`'s `k_in`) rather than being runtime-
+	/// configurable, because it is a policy parameter, not a size.
+	LruLfuHybrid(u16),
 	S3FifoHybrid(f64),
 	TwoQGhostHybrid(f64),
 	S3FifoGhostHybrid(f64),
@@ -74,6 +80,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::TwoQFastAdmissionReprieveHybrid(k_in) => write!(f, "2q-fast-admission-reprieve-hybrid-{k_in}"),
 			PaperPolicy::FifoHybrid => write!(f, "fifo-hybrid"),
 			PaperPolicy::LruSizedHybrid => write!(f, "lru-sized-hybrid"),
+			PaperPolicy::LruLfuHybrid(promote_k) => write!(f, "lru-lfu-hybrid-{promote_k}"),
 			PaperPolicy::S3FifoHybrid(ratio) => write!(f, "s3-fifo-hybrid-{ratio}"),
 			PaperPolicy::TwoQGhostHybrid(k_in) => write!(f, "2q-ghost-hybrid-{k_in}"),
 			PaperPolicy::S3FifoGhostHybrid(ratio) => write!(f, "s3-fifo-ghost-hybrid-{ratio}"),
@@ -122,6 +129,13 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("s3-fifo-lazy-demotion-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_reprieve_hybrid(value)?,
 			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid(value)?,
 			value if value.starts_with("s3-fifo-") => parse_s_three_fifo(value)?,
+			// Prefix guard, so it must be tested before any *exact* arm it
+			// could be confused with is irrelevant (exact arms cannot swallow a
+			// longer string) -- but it does have to precede nothing else here,
+			// since no other guard starts with "lru-lfu-hybrid-". Kept beside
+			// the other lru forms for readability. See
+			// `lru_lfu_hybrid_does_not_collide_with_other_lru_forms`.
+			value if value.starts_with("lru-lfu-hybrid-") => parse_lru_lfu_hybrid(value)?,
 			"lru-hybrid" => PaperPolicy::LruHybrid,
 			"lfu-hybrid" => PaperPolicy::LfuHybrid,
 			"fifo-hybrid" => PaperPolicy::FifoHybrid,
@@ -187,6 +201,31 @@ fn parse_two_q(value: &str) -> Result<PaperPolicy, CacheError> {
 	}
 
 	Ok(PaperPolicy::TwoQ(k_in, k_out))
+}
+
+fn parse_lru_lfu_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "lru-lfu-hybrid-"
+	let tokens = value[15..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(promote_k) = tokens[0].parse::<u16>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	// 0 would make every slow object promotable before it was ever accessed.
+	// The upper bound is enforced by the stack itself (clamped to its
+	// frequency cap), not here, so the policy string stays a faithful record
+	// of what was asked for.
+	if promote_k == 0 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::LruLfuHybrid(promote_k))
 }
 
 fn parse_two_q_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
@@ -551,6 +590,41 @@ mod tests {
 			"fifo".parse::<PaperPolicy>().unwrap(),
 			"fifo-hybrid".parse::<PaperPolicy>().unwrap(),
 		);
+	}
+
+	#[test]
+	fn lru_lfu_hybrid_round_trips_through_display_and_from_str() {
+		assert_eq!(PaperPolicy::LruLfuHybrid(3).to_string(), "lru-lfu-hybrid-3");
+		assert_eq!(
+			"lru-lfu-hybrid-3".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::LruLfuHybrid(3)),
+		);
+	}
+
+	#[test]
+	fn lru_lfu_hybrid_does_not_collide_with_other_lru_forms() {
+		// "lru-lfu-hybrid-3" is matched by a `starts_with` guard while
+		// "lru"/"lru-hybrid"/"lru-sized-hybrid" are exact arms, so they
+		// cannot swallow it -- but a future guard added as
+		// `starts_with("lru-")` could, which is what this pins down.
+		assert_eq!("lru".parse::<PaperPolicy>(), Ok(PaperPolicy::Lru));
+		assert_eq!("lru-hybrid".parse::<PaperPolicy>(), Ok(PaperPolicy::LruHybrid));
+		assert_eq!("lru-sized-hybrid".parse::<PaperPolicy>(), Ok(PaperPolicy::LruSizedHybrid));
+		assert_eq!(
+			"lru-lfu-hybrid-4".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::LruLfuHybrid(4)),
+		);
+	}
+
+	#[test]
+	fn lru_lfu_hybrid_rejects_malformed_and_zero_thresholds() {
+		// 0 would make every slow object promotable before it was ever
+		// accessed, which is not the same policy at any threshold.
+		assert!("lru-lfu-hybrid-0".parse::<PaperPolicy>().is_err());
+		assert!("lru-lfu-hybrid-".parse::<PaperPolicy>().is_err());
+		assert!("lru-lfu-hybrid-abc".parse::<PaperPolicy>().is_err());
+		assert!("lru-lfu-hybrid-1-2".parse::<PaperPolicy>().is_err());
+		assert!("lru-lfu-hybrid".parse::<PaperPolicy>().is_err());
 	}
 
 	#[test]
