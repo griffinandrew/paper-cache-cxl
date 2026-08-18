@@ -765,4 +765,133 @@ mod lru_hybrid_cache_tests {
         );
         assert!(stats.demotions > 0, "expected real demotions once the 1GB fast tier filled -- got 0");
     }
+
+    // ── ttl reaping vs. the tier gauges ───────────────────────────────────
+
+    /// A TTL reap must clear the reaped object out of the policy stack's tier
+    /// accounting, not just out of the object map.
+    ///
+    /// `TtlWorker` erases expired objects itself, and `erase` only touches the
+    /// object map and `AtomicStatus`. Before it also emitted
+    /// `WorkerEvent::Expire`, the policy stack went on ranking every reaped
+    /// key and went on counting its bytes toward `fast_used` -- so
+    /// `status().num_objects()` fell to 0 while
+    /// `lru_hybrid_stats().fast_bytes_used` stayed pinned at its pre-expiry
+    /// value. On an idle cache that never self-corrected: the only thing that
+    /// dropped a phantom key was it reaching the eviction tail, and nothing
+    /// evicts when `used_size()` is already 0.
+    ///
+    /// The practical damage was to demotion decisions -- `settle_fast_tier`
+    /// compares `fast_used` against the budget, so an inflated `fast_used`
+    /// demotes live objects to PMEM to make room for bytes that no longer
+    /// exist.
+    #[test]
+    fn ttl_reap_clears_the_fast_tier_gauges() {
+        // This test never demotes, so it never allocates PMEM itself -- but it
+        // still has to wait out the warm-up, because a *concurrently running*
+        // test in this binary can trigger it and stall the whole process well
+        // past a short TTL. Racing that is exactly what made the first version
+        // of this test flaky: every key expired and was reaped before the
+        // admission gauges were ever observed, so the pre-expiry baseline
+        // assertion below failed. See the module doc comment.
+        ensure_pmem_allocator_warm();
+
+        // Fast tier far larger than the working set on purpose: this test is
+        // about expiry, not demotion. Keeping every object in the fast tier
+        // leaves `fast_bytes_used` as the single gauge that has to move.
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+        ).expect("cache should construct");
+
+        const KEYS: u32 = 8;
+        // Long enough that the admission gauges are comfortably observable
+        // before the first reap, even on a loaded box.
+        const TTL_SECS: u32 = 5;
+
+        for key in 0..KEYS {
+            cache.set(key, &value(0xC3), Some(TTL_SECS)).expect("set should succeed");
+        }
+
+        // The gauges are published once per worker poll, so wait for the
+        // admissions to be accounted for rather than assuming they are.
+        let admitted = wait_until(MIGRATION_TIMEOUT, || {
+            cache.lru_hybrid_stats().fast_objects == KEYS as u64
+        });
+        assert!(admitted, "all {KEYS} keys should be accounted for in the fast tier");
+
+        let before = cache.lru_hybrid_stats();
+        assert!(
+            before.fast_bytes_used >= (KEYS as u64) * (VALUE_LEN as u64),
+            "fast tier should be holding all {KEYS} values before expiry; got {}",
+            before.fast_bytes_used,
+        );
+
+        // The TTL, then the TtlWorker's own poll (1ms once an expiry is
+        // imminent). Generous budget so this can't flake on a loaded box.
+        let reaped = wait_until(std::time::Duration::from_secs(60), || {
+            cache.status().expect("status should be available").num_objects() == 0
+        });
+        assert!(reaped, "all {KEYS} keys should expire and be reaped from the object map");
+
+        // The actual regression: the stack's own tier accounting has to
+        // follow the reap.
+        let cleared = wait_until(std::time::Duration::from_secs(10), || {
+            let stats = cache.lru_hybrid_stats();
+            stats.fast_objects == 0 && stats.fast_bytes_used == 0
+        });
+
+        let after = cache.lru_hybrid_stats();
+        assert!(
+            cleared,
+            "fast-tier gauges should clear after a TTL reap, but stayed at \
+             fast_objects={} fast_bytes_used={} (was fast_objects={} \
+             fast_bytes_used={} before expiry)",
+            after.fast_objects, after.fast_bytes_used,
+            before.fast_objects, before.fast_bytes_used,
+        );
+    }
+
+    /// The reap notification must not clobber a key that was re-`set` in the
+    /// window between `TtlWorker`'s `erase` and `PolicyWorker` handling the
+    /// resulting `Expire` -- that would desync the other way (live in the
+    /// object map, absent from the stack), leaving an object that can never
+    /// be evicted and whose bytes go unaccounted for. `handle_expire` guards
+    /// against it by re-reading the object map before touching the stack.
+    #[test]
+    fn a_key_re_set_after_expiring_is_still_tracked_by_the_stack() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(1_000_000),
+        ).expect("cache should construct");
+
+        cache.set(1u32, &value(0xD4), Some(1)).expect("set should succeed");
+
+        let reaped = wait_until(std::time::Duration::from_secs(60), || {
+            cache.status().expect("status should be available").num_objects() == 0
+        });
+        assert!(reaped, "key 1 should expire and be reaped");
+
+        // Re-admit the same key, now with no TTL.
+        cache.set(1u32, &value(0xD4), None).expect("re-set should succeed");
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
+
+        // The stack must be tracking the new object, not have dropped it on
+        // the back of the previous incarnation's expiry.
+        let tracked = wait_until(MIGRATION_TIMEOUT, || {
+            let stats = cache.lru_hybrid_stats();
+            stats.fast_objects == 1 && stats.fast_bytes_used >= VALUE_LEN as u64
+        });
+
+        let stats = cache.lru_hybrid_stats();
+        assert!(
+            tracked,
+            "re-set key should be tracked in the fast tier; got fast_objects={} \
+             fast_bytes_used={}",
+            stats.fast_objects, stats.fast_bytes_used,
+        );
+        assert_eq!(cache.get(&1u32).unwrap(), value(0xD4));
+    }
 }

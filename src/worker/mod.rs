@@ -40,6 +40,30 @@ pub enum WorkerEvent {
 	Set(HashedKey, ObjectSize, ExpireTime, Option<(ObjectSize, ExpireTime)>),
 	Del(HashedKey, ExpireTime),
 
+	/// A `TtlWorker` reap: the object at this key expired, and that worker has
+	/// already removed it from the object map and decremented `AtomicStatus`
+	/// via its own `erase` call. Sent point-to-point to `PolicyWorker` (see
+	/// `TtlWorker::notify_expired`), not through `WorkerFanout`.
+	///
+	/// Kept distinct from `Del` for two reasons: the sender is a background
+	/// worker rather than an API call that just succeeded, and the receiver
+	/// therefore has to re-check the object map before acting on it -- see
+	/// `PolicyWorker::handle_expire`.
+	///
+	/// Before this existed `TtlWorker` reaped silently. `erase` only touches
+	/// the object map and the size counters, so a reaped key stayed in the
+	/// policy stack's recency/frequency structures *and* kept counting its
+	/// bytes toward the hybrid stacks' `fast_used`/`slow_used`. `used_size()`
+	/// stayed correct, so global eviction pressure was right, but
+	/// `settle_fast_tier` was choosing demotions against an inflated
+	/// `fast_used` and so demoted earlier than the fast tier's live contents
+	/// warranted. The stack only self-corrected once the phantom key reached
+	/// the eviction tail, where `evict_one()` popped it and `erase` answered
+	/// `KeyNotFound` -- which on a TTL-dominated workload (every object
+	/// expiring rather than being evicted) could be a very long time, or
+	/// never.
+	Expire(HashedKey),
+
 	Ttl(HashedKey, ExpireTime, ExpireTime),
 
 	Wipe,
@@ -104,6 +128,7 @@ impl Events {
 	pub const PROMOTE: EventMask = 1 << 1;
 	pub const SET: EventMask = 1 << 2;
 	pub const DEL: EventMask = 1 << 3;
+	pub const EXPIRE: EventMask = 1 << 12;
 	pub const TTL: EventMask = 1 << 4;
 	pub const WIPE: EventMask = 1 << 5;
 	pub const RESIZE: EventMask = 1 << 6;
@@ -121,6 +146,7 @@ impl Events {
 	pub const POLICY_WORKER: EventMask = Self::GET
 		| Self::SET
 		| Self::DEL
+		| Self::EXPIRE
 		| Self::WIPE
 		| Self::RESIZE
 		| Self::RESIZE_FAST_TIER
@@ -131,7 +157,8 @@ impl Events {
 
 	/// `TtlWorker` -- expiry bookkeeping only. Reads never change an object's
 	/// expiry, so `Get` (the dominant event in a read-heavy workload) is
-	/// deliberately absent.
+	/// deliberately absent. `Expire` is absent because this worker *emits* it
+	/// (to `PolicyWorker`, point-to-point) rather than consuming it.
 	pub const TTL_WORKER: EventMask = Self::SET
 		| Self::DEL
 		| Self::TTL
@@ -161,6 +188,7 @@ impl WorkerEvent {
 			WorkerEvent::Promote(..) => Events::PROMOTE,
 			WorkerEvent::Set(..) => Events::SET,
 			WorkerEvent::Del(..) => Events::DEL,
+			WorkerEvent::Expire(..) => Events::EXPIRE,
 			WorkerEvent::Ttl(..) => Events::TTL,
 			WorkerEvent::Wipe => Events::WIPE,
 			WorkerEvent::Resize(..) => Events::RESIZE,

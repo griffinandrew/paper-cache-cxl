@@ -2714,3 +2714,114 @@ the stashed pre-session tree (11 errors either way); both still *build* clean.
   so `-c 8` may look materially different from this `-c 1` measurement — in either direction.
 - The front-of-slow-segment placement (what the s3-fifo variant does) is untested here, and would
   need `main_stack` split in two the way that stack's was.
+
+## Bug fix: a TTL reap left the policy stack (and the hybrid tier gauges) stale
+
+Found while checking whether TTLs are reaped actively, in the course of characterizing the
+`cluster12`/`cluster31` Twitter traces (both carry a TTL on ~80–94% of records). They are reaped
+actively — `TtlWorker` (`worker/ttl/mod.rs`) keeps a `BTreeMap<Instant, HashedKey>` (`Expiries`)
+and each pass drains everything due via `pop_expired(now)` → `erase(...)`, sleeping 1 ms when the
+nearest expiry is within 2 s and 1000 ms otherwise. Reads additionally check `Object::is_expired()`
+on every path (`get`/`has`/`peek`/`ttl`), so an expired object is never *served* regardless.
+
+**The bug: reaping told nobody.** `erase` only touches the object map and `AtomicStatus` —
+`TtlWorker` had no sender at all, so it could not broadcast anything. The reaped key therefore
+stayed in the policy stack's recency/frequency structures **and** kept counting its bytes toward
+the hybrid stacks' `fast_used`/`slow_used`. `status.used_size()` stayed correct (erase decrements
+it), so global eviction pressure was right, but `settle_fast_tier` compares `fast_used` against the
+fast-tier budget — so it was demoting live objects to PMEM to make room for bytes that no longer
+existed. The stack only self-corrected when a phantom key eventually reached the eviction tail
+(`evict_one()` pops it, `erase` answers `KeyNotFound`, `apply_evictions` `continue`s), which on a
+TTL-dominated workload — where objects leave by expiring rather than by eviction — could be a very
+long time, or never. Measured directly: 8 objects × 1 KB reaped to `num_objects() == 0`, with
+`lru_hybrid_stats().fast_bytes_used` still reporting **8,864 bytes across 8 objects**, indefinitely.
+
+**Fix**: a new `WorkerEvent::Expire(HashedKey)`, sent point-to-point from `TtlWorker` to
+`PolicyWorker` after each reap (`TtlWorker::notify_expired`), handled by
+`PolicyWorker::handle_expire`, which delegates to the existing `handle_del` (policy stack + mini
+stacks) — after one guard `handle_del` does not need.
+
+Three decisions worth recording:
+
+1. **A dedicated variant rather than reusing `Del`.** `Del`'s contract is "an API call just
+   successfully erased this"; a reap is asynchronous with the policy worker, and the receiver has
+   to behave differently because of it (point 2). Reusing `Del` would have meant changing
+   `handle_del` for every existing caller to fix a problem only the reap path has.
+2. **`handle_expire` re-reads the object map before touching the stack.** `TtlWorker` erases and
+   *then* sends; nothing stops a `set()` on that key from landing in between, in which case the map
+   entry has already been replaced by a live one and removing it from the stack would desync in the
+   opposite, worse direction — an object present in the map but absent from the stack can never be
+   chosen for eviction, and its bytes go unaccounted for in the tier gauges for as long as it
+   lives. Re-reading *at handling time* (not send time) is what makes this safe: the re-set's
+   `Set` and this `Expire` land in the same single-consumer channel, so in either arrival order the
+   lookup agrees with the stack state the worker is about to produce.
+3. **Sent point-to-point, not through `WorkerFanout`.** `TtlWorker` has no handle on the fanout
+   (the fanout is built *from* the sub-workers it constructs, so handing it back would need an
+   `Arc::new_cyclic` dance), and a fanned-out `Expire` would be delivered back to `TtlWorker`
+   itself. `PolicyWorker` already takes the tiering worker's sender straight into its constructor
+   (`promotion_tx`) — same pattern. `Events::EXPIRE` and its `POLICY_WORKER` mask bit are still
+   added, so the file's stated "a worker's mask and its `run` arms are a single edit" rule holds
+   and a future fanout-routed `Expire` would reach the right worker.
+
+The notification is **unconditional**, not gated on `erase`'s result: `erase` answers
+`KeyNotFound` both for a key that was already gone and for one it just successfully removed that
+turned out to be expired — which is every reap, by construction (its trailing
+`match !object.is_expired()`) — so the result cannot distinguish the two cases. Notifying in the
+already-gone case is harmless: `handle_expire` re-checks the map, and `PolicyStack::remove` on an
+untracked key is a no-op for every stack.
+
+**A build-config trap this hit**: `handle_expire`'s map lookup needs `ObjectStore::get_ref`, but
+`object_store` is itself gated on a *storage* feature (`all_dram`/`key_value_pmem`/
+`global_hashtable_pmem`/`hashbrown_dram`), while the import in `worker/policy/mod.rs` had been
+gated on the *hybrid* features that were its only prior users. Making it unconditional broke a bare
+`eviction_stacks_pmem` build (no storage feature selected → no `object_store` module at all), which
+had built clean before. Fixed with `PolicyWorker::object_exists`, gated the same way `object_store`
+is, plus a second body using `DashMap::contains_key` directly for the no-storage-feature case.
+Confirmed via `git stash` that the failure was this session's regression and not pre-existing —
+worth repeating for any change here, since this crate's feature matrix makes "which cfg gates the
+thing I need" a real question rather than a formality.
+
+**Not changed (pre-existing, still true)**: `TieringWorker` (`enable_tiering_manager`) also
+subscribes to `Del` and also goes stale on a TTL reap; it is not notified, exactly as before. It
+would be a one-line mask/arm addition, deliberately left out to keep this change off a legacy path
+whose own `--lib` tests already don't compile (documented above). Also unchanged: `Expire` is not
+mapped in `StackEvent::maybe_from_worker_event`, so TTL reaps stay absent from the policy-switch
+trace exactly as they were — mapping it to `StackEvent::Del` would be more accurate for
+reconstruction but would record a removal `handle_expire` may decline to make, and the trace is
+disabled entirely for every hybrid cache anyway (single policy, see `trace_is_useful`).
+
+Separately worth knowing, found while reading this code and *not* fixed: `Expiries` is a
+`BTreeMap<Instant, HashedKey>` — **one key per instant** — and `insert` is a plain
+`BTreeMap::insert`, so two objects whose expiry lands on the exact same `Instant` silently evict
+each other from the reaper index; the loser is then only cleaned up lazily on read or by eviction.
+`get_expiry_from_ttl` is `Instant::now() + Duration::from_secs(ttl)`, so this needs a
+nanosecond-exact collision — unlikely single-threaded, more plausible at `-c 8`. (`remove` already
+guards with a key-match check before deleting, so the aliasing was at least anticipated.)
+
+### Verified
+
+Regression test `ttl_reap_clears_the_fast_tier_gauges` (plus
+`a_key_re_set_after_expiring_is_still_tracked_by_the_stack`, covering decision 2's guard) in
+`tests/lru_hybrid_cache_integration.rs`. **Negative-controlled**: with `notify_expired` commented
+out, the first test fails on exactly the gauge assertion (`fast_objects=8 fast_bytes_used=8864`
+after everything was reaped) and passes with it restored — the second passes either way, since it
+guards against a regression this change could introduce rather than the original bug.
+
+27 feature-flag build combos OK (all 17 hybrid variants, `all_dram`, `key_value_pmem`,
+`global_hashtable_pmem`, `hashbrown_dram`, `eviction_stacks_pmem`, `tiering`, `multitiering`,
+`key_value_pmem,enable_tiering_manager`, and two `*,eviction_stacks_pmem` pairs). Unit suites pass
+unchanged (288 lru, 288 lfu, 289 two_q, 289 fifo, 291 lru_sized, 281 s3_fifo, 280 all_dram, 278
+key_value_pmem, 281 global_hashtable_pmem, 278 hashbrown_dram). Real-PMEM integration suites pass
+at their documented baselines (17/17 +2 ignored lru — 15 plus the 2 new tests — 19/19 lfu, 18/18
+two_q, 14/14 fifo, 20/20 lru_sized, 20/20 s3_fifo), and `tiering_integration` 3/3. The lru suite
+was run 5 consecutive times after the test-flakiness fix below, all green.
+
+**Test-writing trap this re-taught**: the first version of the regression test used a 1 s TTL and
+did not call `ensure_pmem_allocator_warm()`, on the reasoning that a test which never demotes never
+touches PMEM and so has no warm-up to wait for. That reasoning is wrong in a way the module doc
+already warned about: a *concurrently running* test in the same binary triggers the process-wide
+warm-up and stalls everything, so all 8 keys expired and were reaped before the admission gauges
+were ever observed and the pre-expiry baseline assertion failed. It passed on the first run and
+failed on the second. Fixed by calling `ensure_pmem_allocator_warm()` (cheap after the first call
+anywhere in the process) and raising the TTL to 5 s — the same pattern the other TTL tests here
+already use.

@@ -162,6 +162,7 @@ impl WorkerFanout {
 
 		handles.push(register_worker(TtlWorker::<K, V>::new(
 			ttl_listener,
+			policy_worker.clone(),
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
@@ -209,6 +210,7 @@ impl WorkerFanout {
 
 		handles.push(register_worker(TtlWorker::<K, V>::new(
 			ttl_listener,
+			policy_worker.clone(),
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
@@ -258,6 +260,7 @@ impl WorkerFanout {
 
 		handles.push(register_worker(TtlWorker::<K, V>::new(
 			ttl_listener,
+			policy_worker.clone(),
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),

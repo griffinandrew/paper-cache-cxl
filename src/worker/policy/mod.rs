@@ -24,7 +24,13 @@ use crossbeam_channel::{Sender, Receiver, unbounded};
 use log::{info, warn, error};
 use kwik::fmt;
 
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache"))]
+// Gated exactly as the `object_store` module itself is (see `lib.rs`) rather
+// than on the hybrid features that were its original users, because
+// `handle_expire` needs it on any build that has it available. A build that
+// selects no storage feature at all (e.g. bare `eviction_stacks_pmem`) has no
+// `object_store` module to import; `PolicyWorker::object_exists` carries a
+// second body for that case.
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 use crate::object_store::ObjectStore;
 
 use crate::{
@@ -166,6 +172,7 @@ where
 					},
 
 					WorkerEvent::Del(key, _) => self.handle_del(key),
+					WorkerEvent::Expire(key) => self.handle_expire(key),
 					WorkerEvent::Wipe => self.handle_wipe(),
 					WorkerEvent::Resize(max_size) => self.handle_resize(max_size),
 					WorkerEvent::ResizeFastTier(size) => self.handle_resize_fast_tier(size),
@@ -456,6 +463,55 @@ where
 		}
 
 		self.mini_stack_manager.handle_del(key);
+	}
+
+	/// Drops a key the `TtlWorker` has already reaped out of the object map.
+	///
+	/// Same stack bookkeeping as `handle_del` -- the object is gone either
+	/// way, and the policy stack should not go on ranking it or counting its
+	/// bytes -- behind one guard `handle_del` does not need.
+	///
+	/// The guard exists because a reap is not synchronous with this worker.
+	/// `TtlWorker` erases the object and then sends `Expire`; nothing stops a
+	/// `set()` on that same key from landing in between, in which case the map
+	/// entry this event refers to has already been replaced by a live one.
+	/// Removing the key from the stack then would desync in the opposite
+	/// direction -- an object present in the map but absent from the stack,
+	/// which is strictly worse than the staleness being fixed here, since such
+	/// an object can never be chosen for eviction and its bytes go
+	/// unaccounted for in the hybrid stacks' tier gauges for as long as it
+	/// lives.
+	///
+	/// Re-reading the map here rather than at send time is what makes this
+	/// safe: both the re-set's `WorkerEvent::Set` and this event land in the
+	/// same single-consumer channel, so whichever order they arrive in, the
+	/// map lookup performed *at the moment this event is handled* agrees with
+	/// the stack state this worker is about to produce.
+	fn handle_expire(&mut self, key: HashedKey) {
+		if self.object_exists(key) {
+			// Re-set between the reap and this notification -- the key is
+			// live again, and its `Set` event owns the stack entry now.
+			return;
+		}
+
+		self.handle_del(key);
+	}
+
+	/// Whether the object map still holds `key`.
+	///
+	/// Two bodies because the `object_store` module -- and so the
+	/// `ObjectStore` trait that supplies `get_ref` -- is itself gated on a
+	/// storage feature being selected (`lib.rs`). A build that selects none
+	/// (bare `eviction_stacks_pmem`, say) still resolves `ObjectMapRef` to the
+	/// default `DashMap` shape, which answers this directly.
+	#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
+	fn object_exists(&self, key: HashedKey) -> bool {
+		self.objects.get_ref(&key).is_some()
+	}
+
+	#[cfg(not(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram")))]
+	fn object_exists(&self, key: HashedKey) -> bool {
+		self.objects.contains_key(&key)
 	}
 
 	fn handle_resize(&mut self, size: CacheSize) {
