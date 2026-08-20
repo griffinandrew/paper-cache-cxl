@@ -908,6 +908,117 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 // default, and do not trust it under real concurrent load without
 // re-running the actual benchmark (not just this crate's own test suite)
 // to confirm, per that retest history.
+/// Samples jemalloc's internal accounting, for diagnosing where resident
+/// memory goes relative to what the cache thinks it holds.
+///
+/// Returns `None` unless the process actually links jemalloc
+/// (`tikv_jemalloc_global`) and it was built with stats support.
+///
+/// The three ratios this exposes decompose resident memory into its causes,
+/// which `used_size` alone cannot distinguish:
+///
+/// - `allocated` -- bytes the application asked for and still holds.
+/// - `active` / `allocated` -- **external fragmentation**: pages in slabs that
+///   hold at least one live allocation. A slab cannot be released while any
+///   object in it is live, so under high churn this rises even though live
+///   bytes are flat.
+/// - `resident` / `active` -- pages the allocator has not yet returned to the
+///   OS (dirty/muzzy, subject to decay).
+/// - `retained` -- address space mapped but madvised away; costs no RSS.
+///
+/// `stats_print:true` via `_RJEM_MALLOC_CONF` cannot answer this: it runs from
+/// jemalloc's atexit handler, by which point the cache has been dropped and
+/// `allocated` has fallen to a few MB. This can be called at peak.
+#[cfg(feature = "tikv_jemalloc_global")]
+pub fn jemalloc_stats() -> Option<String> {
+	unsafe extern "C" {
+		#[link_name = "_rjem_mallctl"]
+		fn mallctl(
+			name: *const std::os::raw::c_char,
+			oldp: *mut std::ffi::c_void,
+			oldlenp: *mut usize,
+			newp: *mut std::ffi::c_void,
+			newlen: usize,
+		) -> std::os::raw::c_int;
+	}
+
+	// jemalloc's stats are cached; advancing `epoch` refreshes them.
+	unsafe {
+		let mut epoch: u64 = 1;
+		let mut epoch_len = std::mem::size_of::<u64>();
+
+		mallctl(
+			c"epoch".as_ptr(),
+			(&raw mut epoch).cast(),
+			&raw mut epoch_len,
+			(&raw mut epoch).cast(),
+			std::mem::size_of::<u64>(),
+		);
+	}
+
+	fn read(name: &std::ffi::CStr) -> Option<usize> {
+		let mut value: usize = 0;
+		let mut len = std::mem::size_of::<usize>();
+
+		let rc = unsafe {
+			mallctl(
+				name.as_ptr(),
+				(&raw mut value).cast(),
+				&raw mut len,
+				std::ptr::null_mut(),
+				0,
+			)
+		};
+
+		(rc == 0).then_some(value)
+	}
+
+	let allocated = read(c"stats.allocated")?;
+	let active = read(c"stats.active")?;
+	let resident = read(c"stats.resident")?;
+	let mapped = read(c"stats.mapped")?;
+	let retained = read(c"stats.retained")?;
+
+	let ratio = |numerator: usize, denominator: usize| {
+		if denominator == 0 { 0.0 } else { numerator as f64 / denominator as f64 }
+	};
+
+	Some(format!(
+		"JEMALLOC allocated={allocated} active={active} resident={resident} \
+mapped={mapped} retained={retained} \
+active/allocated={:.4} resident/active={:.4} resident/allocated={:.4}",
+		ratio(active, allocated),
+		ratio(resident, active),
+		ratio(resident, allocated),
+	))
+}
+
+/// UMF/TBB node-0 accounting, the counterpart to [`jemalloc_stats`] for the
+/// default build.
+///
+/// Reports live requested vs live usable bytes. Compare `usable` against
+/// resident (from `numastat`) to get the same decomposition jemalloc gives:
+/// `usable/requested` is size-class rounding, and the gap from usable to
+/// resident is external fragmentation plus unreturned pages.
+pub fn umf_dram_stats() -> String {
+	let (requested, usable) = allocator::dram_pool_stats();
+
+	let ratio = if requested == 0 {
+		0.0
+	} else {
+		usable as f64 / requested as f64
+	};
+
+	format!("UMFDRAM requested={requested} usable={usable} usable/requested={ratio:.4}")
+}
+
+/// Not linking jemalloc: nothing to sample. The default build allocates node 0
+/// through UMF/TBB, which exposes no equivalent accounting at all.
+#[cfg(not(feature = "tikv_jemalloc_global"))]
+pub fn jemalloc_stats() -> Option<String> {
+	None
+}
+
 #[cfg(not(any(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global")))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;

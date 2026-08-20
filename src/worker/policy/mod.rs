@@ -4877,7 +4877,17 @@ mod two_q_fast_admission_hybrid_tests {
 	fn promotion_out_of_the_fifo_queue_moves_no_bytes() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000);
 
-		worker.handle_resize_fast_tier(base_size_of(&overhead_manager, 15) as CacheSize * 4);
+		// Room for four 15-byte objects' value bytes, plus the per-object DRAM
+		// metadata reservation for the one object actually tracked. The
+		// reservation is added UNSCALED: it is subtracted from the budget
+		// before the watermarks apply, so scaling it too would inflate the
+		// capacity rather than preserve the intended headroom. Without this
+		// term the corrected (measurement-calibrated) per-object overhead
+		// exceeds the whole budget, and the key demotes straight back out.
+		worker.handle_resize_fast_tier(
+			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize * 4)
+				+ shared_overhead(),
+		);
 
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);
 		worker.handle_get(1, true);

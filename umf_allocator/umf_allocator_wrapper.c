@@ -120,9 +120,36 @@ int umf_allocator_init(int numa_node) {
 
     // Keep retaining freed blocks so transient allocs recycle in-pool and the
     // provider's bump offset advances slowly (only net-new live memory grows it).
-    umfScalablePoolParamsSetKeepAllMemory(scalable_params, 1);
+    // Whether the pool retains freed blocks instead of returning them to the
+    // provider. Overridable via UMF_KEEP_ALL_MEMORY (0/1) so it can be A/B'd
+    // without a rebuild -- measurement showed TBB's resident footprint sits
+    // ~29% above the bytes its own size classes reserve, and this is the only
+    // UMF-level knob that plausibly governs that retention.
+    {
+        int keep_all = 0;
+        const char *keep_env = getenv("UMF_KEEP_ALL_MEMORY");
+        if (keep_env != NULL && keep_env[0] == '1') {
+            keep_all = 1;
+        }
+        umfScalablePoolParamsSetKeepAllMemory(scalable_params, keep_all);
+    }
 
+    // Pool granularity: the unit the scalable pool requests from the provider.
+    // Overridable via UMF_POOL_GRANULARITY (bytes) so it can be swept without
+    // a rebuild. A large granularity means a single live object can pin a
+    // whole chunk, which is one candidate explanation for resident memory
+    // running ~1.7x the cache's accounted live bytes. Values below 4 KiB (one
+    // page) are ignored.
     size_t huge_chunk_size = 2 * 1024 * 1024ULL;
+    {
+        const char *granularity_env = getenv("UMF_POOL_GRANULARITY");
+        if (granularity_env != NULL) {
+            unsigned long long parsed = strtoull(granularity_env, NULL, 10);
+            if (parsed >= 4096ULL) {
+                huge_chunk_size = (size_t)parsed;
+            }
+        }
+    }
     umfScalablePoolParamsSetGranularity(scalable_params, huge_chunk_size);
 
     // Create pool into a local first; only publish once fully constructed.
@@ -219,9 +246,36 @@ int umf_allocator_init(int numa_node) {
  
     // keep retaining freed blocks so transient allocs recycle in-pool and the
     // provider's bump offset advances slowly (only net-new live memory grows it)
-    umfScalablePoolParamsSetKeepAllMemory(scalable_params, 1);
+    // Whether the pool retains freed blocks instead of returning them to the
+    // provider. Overridable via UMF_KEEP_ALL_MEMORY (0/1) so it can be A/B'd
+    // without a rebuild -- measurement showed TBB's resident footprint sits
+    // ~29% above the bytes its own size classes reserve, and this is the only
+    // UMF-level knob that plausibly governs that retention.
+    {
+        int keep_all = 0;
+        const char *keep_env = getenv("UMF_KEEP_ALL_MEMORY");
+        if (keep_env != NULL && keep_env[0] == '1') {
+            keep_all = 1;
+        }
+        umfScalablePoolParamsSetKeepAllMemory(scalable_params, keep_all);
+    }
  
+    // Pool granularity: the unit the scalable pool requests from the provider.
+    // Overridable via UMF_POOL_GRANULARITY (bytes) so it can be swept without
+    // a rebuild. A large granularity means a single live object can pin a
+    // whole chunk, which is one candidate explanation for resident memory
+    // running ~1.7x the cache's accounted live bytes. Values below 4 KiB (one
+    // page) are ignored.
     size_t huge_chunk_size = 2 * 1024 * 1024ULL;
+    {
+        const char *granularity_env = getenv("UMF_POOL_GRANULARITY");
+        if (granularity_env != NULL) {
+            unsigned long long parsed = strtoull(granularity_env, NULL, 10);
+            if (parsed >= 4096ULL) {
+                huge_chunk_size = (size_t)parsed;
+            }
+        }
+    }
     umfScalablePoolParamsSetGranularity(scalable_params, huge_chunk_size);
  
     res = umfPoolCreate(
@@ -252,6 +306,52 @@ int umf_allocator_init(int numa_node) {
     
 
 
+/* Diagnostic accounting: TBB, unlike jemalloc, exposes no stats at all, so
+ * the only way to decompose its resident footprint is to measure the two
+ * quantities ourselves. `live_usable` is what the pool actually reserves per
+ * live allocation (request rounded up to its size class); the *requested*
+ * total is tracked on the Rust side, which knows `layout.size()` on both the
+ * alloc and dealloc paths. usable/requested is then internal fragmentation and
+ * resident/usable is everything else. Costs one msize query and one atomic per
+ * alloc and per free -- diagnostic builds only. */
+static _Atomic size_t live_usable[MAX_NODES];
+
+size_t umf_live_usable(int numa_node) {
+    if (numa_node < 0 || numa_node >= MAX_NODES) return 0;
+    return atomic_load_explicit(&live_usable[numa_node], memory_order_relaxed);
+}
+
+/* Off unless UMF_TRACK_USABLE=1. The msize query runs on every alloc and every
+ * free and costs on the order of a hundred nanoseconds per operation, which is
+ * material against ~1.5us cache ops -- so it must never be on for a run whose
+ * latency numbers are being recorded. Resolved once; the getenv race is benign
+ * because every racing thread computes the same value. */
+static atomic_int track_usable_enabled = -1;
+
+static int usable_tracking_on(void) {
+    int enabled = atomic_load_explicit(&track_usable_enabled, memory_order_relaxed);
+
+    if (enabled < 0) {
+        const char *env = getenv("UMF_TRACK_USABLE");
+        enabled = (env != NULL && env[0] == '1') ? 1 : 0;
+        atomic_store_explicit(&track_usable_enabled, enabled, memory_order_relaxed);
+    }
+
+    return enabled;
+}
+
+static void track_usable(umf_memory_pool_handle_t p, void *ptr, int numa_node, int add) {
+    size_t usable = 0;
+    if (ptr == NULL) return;
+    if (!usable_tracking_on()) return;
+    if (umfPoolMallocUsableSize(p, ptr, &usable) != UMF_RESULT_SUCCESS) return;
+    if (add) {
+        atomic_fetch_add_explicit(&live_usable[numa_node], usable, memory_order_relaxed);
+    } else {
+        atomic_fetch_sub_explicit(&live_usable[numa_node], usable, memory_order_relaxed);
+    }
+}
+
 void *umf_alloc(int numa_node, size_t size, size_t align) {
     if (size == 0) return NULL;
     if (numa_node < 0 || numa_node >= MAX_NODES) return NULL;
@@ -263,10 +363,14 @@ void *umf_alloc(int numa_node, size_t size, size_t align) {
         atomic_load_explicit(&pools[numa_node], memory_order_acquire);
     if (!p) return NULL;
 
+    void *ptr;
     if (align && align > sizeof(void*)) {
-        return umfPoolAlignedMalloc(p, size, align);
+        ptr = umfPoolAlignedMalloc(p, size, align);
+    } else {
+        ptr = umfPoolMalloc(p, size);
     }
-    return umfPoolMalloc(p, size);
+    track_usable(p, ptr, numa_node, 1);
+    return ptr;
 }
 
 
@@ -278,6 +382,7 @@ void umf_dealloc(int numa_node, void *ptr) {
         atomic_load_explicit(&pools[numa_node], memory_order_acquire);
     if (!p) return;  /* pool already destroyed; OS will reclaim on exit */
 
+    track_usable(p, ptr, numa_node, 0);
     umfPoolFree(p, ptr);
 }
 

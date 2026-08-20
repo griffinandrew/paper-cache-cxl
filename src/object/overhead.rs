@@ -302,6 +302,7 @@ pub fn get_ttl_overhead() -> ObjectSize {
 /// exact DRAM ceiling is ever needed, thread a `size_of::<Object<K,V>>()`
 /// hint through from the generic `PaperCache::new` call site instead.
 #[cfg(feature = "hybrid_cache_common")]
+#[allow(dead_code)] // superseded by OBJECT_MAP_ENTRY_OVERHEAD; kept for the derivation notes above
 pub const HASHTABLE_ENTRY_OVERHEAD: ObjectSize = 11;
 
 /// Dedicated per-object DRAM cost of `LruHybridStack`'s eviction-stack
@@ -705,6 +706,70 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_S
 /// terms that are actually DRAM-resident: the eviction-stack term is dropped
 /// when `eviction_stacks_pmem` moves those stacks to PMEM, and the hashtable
 /// entry is dropped when a hashtable-PMEM feature moves the object map to PMEM.
+/// Per-object DRAM cost of the value's `Arc` header: the `Arc` inner
+/// allocation (two 8-byte refcounts) plus the `TieredBuffer` enum it wraps
+/// (16-byte fat pointer + discriminant, padded), landing in the 48-byte size
+/// class. Fixed-size, so independent of the trace's value distribution.
+/// Always DRAM-resident: the `Arc` itself is allocated by the global
+/// allocator even when the buffer it points at lives in PMEM.
+#[cfg(feature = "hybrid_cache_common")]
+const ARC_VALUE_HEADER_OVERHEAD: ObjectSize = 48;
+
+/// Per-object DRAM cost of the object map (`DashMap<HashedKey, Object>`):
+/// the `(u64, Object{key, Arc ptr, expiry})` pair plus hashbrown's control
+/// bytes and load-factor slack.
+///
+/// CALIBRATED, not purely analytic: measured on cluster12 at 9.46M objects
+/// (u32 keys) by instrumenting the node-0 allocator -- live requested bytes
+/// minus the cache's own fast-tier value bytes came to ~277 B/object, of
+/// which the analytic policy + Arc terms account for ~112, leaving ~165 for
+/// the object map. Two known sources of variation: hashbrown's slack moves
+/// with object count relative to the table's power-of-two capacity (a
+/// sawtooth of up to tens of bytes), and a different key type changes
+/// `Object`'s size. Replaces the old 11-byte estimate, which was a 4-5x
+/// under-reservation in practice.
+#[cfg(feature = "hybrid_cache_common")]
+const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 165;
+
+/// Requested-to-resident multiplier for DRAM metadata, as (numerator,
+/// denominator).
+///
+/// The reservation above counts *requested* bytes, but the fast-tier budget
+/// is meant to bound *resident* DRAM, and the allocator holds more than was
+/// requested: size-class rounding (~6% on both allocators, measured), plus
+/// whatever freed memory the allocator retains rather than returning.
+/// Measured at peak on the same cluster12 run:
+///
+/// - UMF/TBB (default): usable/requested 1.0643, resident/usable 1.29 --
+///   TBB's per-thread and large-object caches hold freed pages with no purge
+///   discipline -- so ~1.37 overall.
+/// - `tikv_jemalloc_global`: active/allocated 1.0612, resident/active 1.0533
+///   (decay returns dirty pages) -- ~1.12 overall.
+///
+/// The TBB retention component is churn-dependent (this trace cycles ~34M
+/// evictions over ~9M live objects), so it is the least general of these
+/// calibrations; override for other workloads via
+/// `DRAM_OVERHEAD_RESIDENT_FACTOR` (a float, e.g. `1.2`), recalibrating from
+/// the `umf_dram_stats()` / `jemalloc_stats()` probes.
+#[cfg(all(feature = "hybrid_cache_common", not(feature = "tikv_jemalloc_global")))]
+const DEFAULT_RESIDENT_FACTOR: f64 = 1.37;
+#[cfg(all(feature = "hybrid_cache_common", feature = "tikv_jemalloc_global"))]
+const DEFAULT_RESIDENT_FACTOR: f64 = 1.12;
+
+#[cfg(feature = "hybrid_cache_common")]
+fn resident_factor() -> f64 {
+	use std::sync::OnceLock;
+	static FACTOR: OnceLock<f64> = OnceLock::new();
+
+	*FACTOR.get_or_init(|| {
+		std::env::var("DRAM_OVERHEAD_RESIDENT_FACTOR")
+			.ok()
+			.and_then(|value| value.parse::<f64>().ok())
+			.filter(|factor| (1.0..=4.0).contains(factor))
+			.unwrap_or(DEFAULT_RESIDENT_FACTOR)
+	})
+}
+
 #[cfg(feature = "hybrid_cache_common")]
 pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	#[allow(unused_mut)]
@@ -804,12 +869,19 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 		}
 	}
 
-	// The object hashtable lives in DRAM unless a hashtable-PMEM feature
+	// The value's Arc header is DRAM-resident regardless of which tier the
+	// buffer itself occupies, and regardless of any hashtable-PMEM feature.
+	overhead += ARC_VALUE_HEADER_OVERHEAD;
+
+	// The object map lives in DRAM unless a hashtable-PMEM feature
 	// relocates it (`global_hashtable_pmem`).
 	#[cfg(not(feature = "global_hashtable_pmem"))]
 	{
-		overhead += HASHTABLE_ENTRY_OVERHEAD;
+		overhead += OBJECT_MAP_ENTRY_OVERHEAD;
 	}
 
-	overhead
+	// Requested -> resident: what this reservation is protecting is real
+	// DRAM, and the allocator holds more than was requested (size-class
+	// rounding plus retained freed pages; see `DEFAULT_RESIDENT_FACTOR`).
+	(overhead as f64 * resident_factor()) as ObjectSize
 }

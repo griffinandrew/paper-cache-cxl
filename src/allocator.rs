@@ -202,8 +202,39 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
 //------------ umf for numa 0
 
 
+/// Live bytes the application has REQUESTED from node 0: the sum of
+/// `layout.size()` over outstanding allocations.
+///
+/// The UMF/TBB pool exposes no equivalent of jemalloc's `stats.allocated`, so
+/// without this there is no way to tell whether node 0's resident footprint is
+/// live data or allocator overhead. Paired with `umf_live_usable` (the pool's
+/// own per-allocation reservation) this gives the same decomposition jemalloc
+/// reports for free: usable/requested is internal fragmentation, and
+/// resident/usable is external fragmentation plus unreturned pages.
+pub static LIVE_REQUESTED_DRAM: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Clone, Copy)]
 pub struct DRAMObjects;
+
+/// Node-0 pool accounting: `(requested, usable)` live bytes.
+///
+/// `requested` is what the application asked for; `usable` is what the pool
+/// actually reserves for those same allocations. TBB rounds each request up to
+/// a size class, so `usable / requested` is internal fragmentation, and
+/// `resident / usable` (resident read externally, e.g. `numastat`) is external
+/// fragmentation plus pages not yet returned. This is the counterpart to
+/// jemalloc's `stats.allocated` / `stats.active`, which UMF/TBB does not
+/// provide.
+pub fn dram_pool_stats() -> (usize, usize) {
+    const NODE_DRAM_ID: libc::c_int = 0;
+
+    let requested = LIVE_REQUESTED_DRAM.load(std::sync::atomic::Ordering::Relaxed);
+    let usable = unsafe { allocator_bindings::umf_live_usable(NODE_DRAM_ID) };
+
+    (requested, usable)
+}
+
 
 // Own dedicated `Once` — see the note on `HybridObjects`'s `INIT` above for
 // why this must not be shared with it.
@@ -270,6 +301,9 @@ unsafe impl GlobalAlloc for DRAMObjects {
         });
 
         let ptr = allocator_bindings::umf_alloc(Self::NODE_DRAM,layout.size(), layout.align()) as *mut u8;
+        if !ptr.is_null() {
+            LIVE_REQUESTED_DRAM.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        }
         if ptr.is_null() {
             eprintln!("DRAMObjects: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
@@ -303,6 +337,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_REQUESTED_DRAM.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
         allocator_bindings::umf_dealloc(Self::NODE_DRAM, ptr as *mut std::ffi::c_void);
 
         #[cfg(debug_assertions)]
@@ -594,6 +629,9 @@ unsafe impl GlobalAlloc for UnifiedAllocator {
         });
 
         let ptr = allocator_bindings::umf_alloc(Self::NODE_DRAM,layout.size(), layout.align()) as *mut u8;
+        if !ptr.is_null() {
+            LIVE_REQUESTED_DRAM.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        }
         if ptr.is_null() {
             println!("DRAMObjects: UMF alloc failed for {} bytes", layout.size());
             return ptr::null_mut();
@@ -627,6 +665,7 @@ unsafe impl GlobalAlloc for UnifiedAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_REQUESTED_DRAM.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
         allocator_bindings::umf_dealloc(Self::NODE_DRAM, ptr as *mut std::ffi::c_void);
 
         #[cfg(debug_assertions)]

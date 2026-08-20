@@ -36,6 +36,12 @@ unsafe extern "C" {
     pub fn umf_allocator_init(numa_node: c_int) -> c_int;
     pub fn umf_alloc(numa_node: c_int, size: usize, align: usize) -> *mut c_void;
     pub fn umf_dealloc(numa_node: c_int, ptr: *mut c_void);
+
+    /// Live bytes the pool currently reserves for outstanding allocations on
+    /// this node (each request rounded up to its size class). Diagnostic:
+    /// paired with `LIVE_REQUESTED_DRAM` it decomposes TBB's footprint the
+    /// way jemalloc's `stats.allocated`/`active` do.
+    pub fn umf_live_usable(numa_node: c_int) -> usize;
     pub fn umf_allocator_prewarm(numa_node: c_int, bytes: usize, chunk: usize) -> c_int;
     pub fn check_tier(ptr: *mut c_void) -> c_int;  // now returns node id, was bool-ish
 
