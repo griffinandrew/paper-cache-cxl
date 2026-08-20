@@ -99,19 +99,23 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
-	worker::policy::policy_stack::{PolicyStack, Tier},
+	worker::policy::policy_stack::{PolicyStack, Tier, watermarks},
 };
 
-/// Fraction of the effective fast-segment budget `settle_small_fast`/
-/// `settle_large_fast` drain down to once triggered — identical constant and
-/// rationale to `LruHybridStack`'s (see that module doc's "Low-water
-/// headroom" section): `PaperCache::set()` writes new object bytes to DRAM
-/// synchronously at the API layer before this stack (on the background
-/// `PolicyWorker` thread) ever sees the corresponding event, so a burst of
-/// concurrent `set()`s can transiently overshoot either segment's own
-/// last-known bookkeeping between worker polls. Applied identically to both
-/// segments — the race this protects against doesn't care which segment a
-/// burst's objects land in.
+/// SUPERSEDED by the shared `super::watermarks` high/low pair, and
+/// deliberately no longer read by `settle_small_fast`/`settle_large_fast`.
+/// Kept defined (and explicitly allowed to be dead) as the record of the
+/// ratio this file used before the switch.
+///
+/// It was a flat 2% burst margin: `PaperCache::set()` writes new object bytes
+/// to DRAM synchronously at the API layer before this stack (on the
+/// background `PolicyWorker` thread) ever sees the corresponding event, so a
+/// burst of concurrent `set()`s can transiently overshoot either segment's
+/// own last-known bookkeeping between worker polls. `watermarks::low()`
+/// subsumes that role, and `watermarks::high()` adds the trigger hysteresis
+/// the flat ratio never had. Set `FAST_TIER_HIGH_WATERMARK=1.0` with
+/// `FAST_TIER_LOW_WATERMARK=0.98` to reproduce the old behaviour exactly.
+#[allow(dead_code)]
 const FAST_TIER_LOW_WATER_RATIO: f64 = 0.98;
 
 // DRAM-backed by default; under `eviction_stacks_pmem`, all four recency
@@ -430,17 +434,28 @@ impl LruSizedHybridStack {
 	}
 
 	/// Demotes the SMALL fast segment's LRU tail(s) into `small_slow`,
-	/// triggered only once `small_fast_used` genuinely exceeds its effective
-	/// budget, drained down to `FAST_TIER_LOW_WATER_RATIO` of that budget —
-	/// see `LruHybridStack::settle_fast_tier`'s identical shape/rationale.
+	/// triggered only once `small_fast_used` crosses the shared *high*
+	/// watermark of its effective budget, then drained in one pass down to
+	/// the shared *low* watermark of that same budget — see
+	/// `super::watermarks` for why the pair exists (draining to the exact
+	/// ceiling pinned the segment at 100% and turned every subsequent
+	/// admission into a one-object migration batch) and
+	/// `LruHybridStack::settle_fast_tier` for the identical shape/rationale.
+	///
+	/// `effective_small()` — the configured capacity minus this segment's
+	/// proportional share of the reserved shared-structure overhead — remains
+	/// the budget in play: the watermarks scale that effective value, they
+	/// never replace it. It is also loop-invariant here, since
+	/// `reserved_shares()` counts *tracked* entries and a demotion only
+	/// changes which list an entry is in, never whether it is tracked.
 	fn settle_small_fast(&mut self) {
 		let effective = self.effective_small();
 
-		if self.small_fast_used <= effective {
+		if self.small_fast_used <= watermarks::high_bytes(effective) {
 			return;
 		}
 
-		let drain_target = (effective as f64 * FAST_TIER_LOW_WATER_RATIO) as CacheSize;
+		let drain_target = watermarks::low_bytes(effective);
 
 		while self.small_fast_used > drain_target {
 			let Some(demote_key) = self.small_fast.pop_back() else { break };
@@ -462,15 +477,16 @@ impl LruSizedHybridStack {
 	}
 
 	/// LARGE-segment counterpart of `settle_small_fast`, demoting into
-	/// `large_slow`.
+	/// `large_slow`. Same shared high/low watermark pair, taken against
+	/// `effective_large()` instead.
 	fn settle_large_fast(&mut self) {
 		let effective = self.effective_large();
 
-		if self.large_fast_used <= effective {
+		if self.large_fast_used <= watermarks::high_bytes(effective) {
 			return;
 		}
 
-		let drain_target = (effective as f64 * FAST_TIER_LOW_WATER_RATIO) as CacheSize;
+		let drain_target = watermarks::low_bytes(effective);
 
 		while self.large_fast_used > drain_target {
 			let Some(demote_key) = self.large_fast.pop_back() else { break };
@@ -748,7 +764,7 @@ mod tests {
 		let mut stack = LruSizedHybridStack::new(15, 1_000, 20);
 
 		stack.insert(1, 10); // small: small_fast = [1]
-		stack.insert(2, 10); // small: 20 > 15 -> demotes 1
+		stack.insert(2, 10); // small: 20 > high_bytes(15) -> demotes 1
 		let migrations = drain(&mut stack);
 
 		assert_eq!(migrations, vec![(1, Tier::Slow)]);
@@ -764,11 +780,11 @@ mod tests {
 
 	#[test]
 	fn large_segment_pressure_demotes_lru_tail_without_touching_small_segment() {
-		let mut stack = LruSizedHybridStack::new(1_000, 25, 5);
+		let mut stack = LruSizedHybridStack::new(1_000, 30, 5);
 
 		stack.insert(1, 10); // large (10 >= 5)
-		stack.insert(2, 10); // large: 20 <= 25, no trigger yet
-		stack.insert(3, 10); // large: 30 > 25 -> demotes 1 (LRU tail)
+		stack.insert(2, 10); // large: 20 <= high_bytes(30) = 28, no trigger yet
+		stack.insert(3, 10); // large: 30 > 28 -> drains to low_bytes(30) = 22, demoting 1
 		let migrations = drain(&mut stack);
 
 		assert_eq!(migrations, vec![(1, Tier::Slow)]);
@@ -804,7 +820,7 @@ mod tests {
 
 	#[test]
 	fn promotion_from_large_slow_routes_back_to_large_fast() {
-		let mut stack = LruSizedHybridStack::new(1_000, 25, 5);
+		let mut stack = LruSizedHybridStack::new(1_000, 30, 5);
 
 		stack.insert(1, 10);
 		stack.insert(2, 10);
@@ -897,8 +913,8 @@ mod tests {
 		// effective_small = effective_large = 60.
 		let mut stack = LruSizedHybridStack::new(100, 100, 50).with_shared_overhead(40);
 
-		stack.insert(1, 10); // small, 10 <= 60, no trigger
-		stack.insert(2, 90); // large, 90 > 60 -> triggers demotion
+		stack.insert(1, 10); // small, 10 <= high_bytes(80), no trigger
+		stack.insert(2, 90); // large, 90 > high_bytes(60) -> triggers demotion
 		let migrations = drain(&mut stack);
 
 		assert_eq!(migrations, vec![(2, Tier::Slow)]);
@@ -1022,5 +1038,195 @@ mod tests {
 		assert_eq!(stack.fast_object_count(), 2);
 		assert_eq!(stack.small_fast_bytes_used(), 10);
 		assert_eq!(stack.large_fast_bytes_used(), 100);
+	}
+
+	// ---- Shared fast-tier high/low watermarks (see `super::watermarks`) ----
+	//
+	// Written against `watermarks::high_bytes`/`low_bytes` rather than
+	// hard-coded byte counts, so they hold at whatever
+	// `FAST_TIER_HIGH_WATERMARK`/`FAST_TIER_LOW_WATERMARK` the process is
+	// configured with. Deliberately NO `std::env::set_var` in here: both
+	// ratios are cached in a process-wide `OnceLock` on first read, so a test
+	// that set them would race every other test in the same binary.
+
+	/// Byte budget the watermark tests below size their segments against.
+	/// Large enough that `high_bytes` and `low_bytes` stay many 10-byte
+	/// objects apart at any sane ratio.
+	const WATERMARK_CAPACITY: CacheSize = 10_000;
+
+	/// Admits 10-byte SMALL objects under keys `1..` until one more would
+	/// push `small_fast_used` past `target`. Returns the number admitted
+	/// (which is also the highest key used).
+	fn fill_small_to(stack: &mut LruSizedHybridStack, target: CacheSize) -> HashedKey {
+		let mut key: HashedKey = 0;
+
+		while stack.small_fast_bytes_used() + 10 <= target {
+			key += 1;
+			stack.insert(key, 10);
+		}
+
+		key
+	}
+
+	#[test]
+	fn usage_up_to_the_high_watermark_triggers_no_demotion() {
+		let mut stack = LruSizedHybridStack::new(WATERMARK_CAPACITY, WATERMARK_CAPACITY, 20);
+		let high = watermarks::high_bytes(WATERMARK_CAPACITY);
+		let admitted = fill_small_to(&mut stack, high);
+
+		assert!(admitted > 0);
+		assert!(stack.small_fast_bytes_used() <= high);
+
+		// The trigger is strictly `>`, so sitting at (or just under) the high
+		// watermark must stay completely quiet.
+		assert!(drain(&mut stack).is_empty());
+		assert_eq!(stack.small_slow_object_count(), 0);
+		assert_eq!(stack.small_slow_bytes_used(), 0);
+		assert_eq!(stack.small_fast_object_count(), admitted as usize);
+	}
+
+	#[test]
+	fn usage_above_the_high_watermark_triggers_a_demotion_pass() {
+		let mut stack = LruSizedHybridStack::new(WATERMARK_CAPACITY, WATERMARK_CAPACITY, 20);
+		let admitted = fill_small_to(&mut stack, watermarks::high_bytes(WATERMARK_CAPACITY));
+
+		assert!(drain(&mut stack).is_empty());
+
+		// `fill_small_to` stops one object short of crossing, so this
+		// admission puts usage strictly above the high watermark; the pass
+		// runs synchronously inside `insert`.
+		stack.insert(admitted + 1, 10);
+		let migrations = drain(&mut stack);
+
+		assert!(!migrations.is_empty(), "crossing the high watermark must trigger a pass");
+		assert!(migrations.iter().all(|(_, tier)| *tier == Tier::Slow));
+		// A pass always drains from the LRU end, so key 1 goes first.
+		assert_eq!(migrations.first(), Some(&(1, Tier::Slow)));
+	}
+
+	#[test]
+	fn a_triggered_pass_drains_to_the_low_watermark_not_merely_to_the_ceiling() {
+		let high = watermarks::high_bytes(WATERMARK_CAPACITY);
+		let low = watermarks::low_bytes(WATERMARK_CAPACITY);
+
+		let mut stack = LruSizedHybridStack::new(WATERMARK_CAPACITY, WATERMARK_CAPACITY, 20);
+		let admitted = fill_small_to(&mut stack, high);
+		drain(&mut stack);
+
+		stack.insert(admitted + 1, 10);
+		let migrations = drain(&mut stack);
+
+		assert!(stack.small_fast_bytes_used() <= low);
+
+		// Not merely back under the ceiling: unless the low watermark is
+		// configured at 1.0, the segment ends the pass strictly below its
+		// full effective budget.
+		if low < WATERMARK_CAPACITY {
+			assert!(stack.small_fast_bytes_used() < WATERMARK_CAPACITY);
+		}
+
+		// Which is the whole point of the pair: one pass demotes a batch, not
+		// just the single object that happened to cross the line.
+		if low + 10 < high {
+			assert!(migrations.len() > 1);
+		}
+	}
+
+	#[test]
+	fn counters_stay_consistent_after_a_watermark_triggered_pass() {
+		let mut stack = LruSizedHybridStack::new(WATERMARK_CAPACITY, WATERMARK_CAPACITY, 20);
+		let admitted = fill_small_to(&mut stack, watermarks::high_bytes(WATERMARK_CAPACITY));
+
+		stack.insert(admitted + 1, 10);
+
+		let total = (admitted + 1) as usize;
+		let migrations = drain(&mut stack);
+
+		assert!(!migrations.is_empty());
+
+		// Nothing lost, nothing double-counted: every admitted key is still
+		// tracked, in exactly one of the two SMALL lists.
+		assert_eq!(stack.len(), total);
+		assert_eq!(stack.small_fast_object_count() + stack.small_slow_object_count(), total);
+		assert_eq!(
+			stack.small_fast_bytes_used() + stack.small_slow_bytes_used(),
+			total as CacheSize * 10,
+		);
+
+		// The per-demotion bookkeeping ran exactly once per migrated object.
+		assert_eq!(migrations.len(), stack.small_slow_object_count());
+		assert_eq!(stack.small_slow_bytes_used(), migrations.len() as CacheSize * 10);
+
+		// The LARGE segment was never touched.
+		assert_eq!(stack.large_fast_bytes_used(), 0);
+		assert_eq!(stack.large_slow_bytes_used(), 0);
+		assert_eq!(stack.large_fast_object_count(), 0);
+		assert_eq!(stack.large_slow_object_count(), 0);
+
+		// Combined gauges still agree with the per-segment ones.
+		assert_eq!(stack.fast_bytes_used(), stack.small_fast_bytes_used());
+		assert_eq!(stack.slow_bytes_used(), stack.small_slow_bytes_used());
+		assert_eq!(stack.fast_object_count(), stack.small_fast_object_count());
+		assert_eq!(stack.slow_object_count(), stack.small_slow_object_count());
+	}
+
+	#[test]
+	fn large_segment_uses_the_same_watermarks_against_its_own_budget() {
+		let high = watermarks::high_bytes(WATERMARK_CAPACITY);
+		let low = watermarks::low_bytes(WATERMARK_CAPACITY);
+
+		// Threshold 5 => every 10-byte object classifies LARGE.
+		let mut stack = LruSizedHybridStack::new(WATERMARK_CAPACITY, WATERMARK_CAPACITY, 5);
+		let mut key: HashedKey = 0;
+
+		while stack.large_fast_bytes_used() + 10 <= high {
+			key += 1;
+			stack.insert(key, 10);
+		}
+
+		assert!(drain(&mut stack).is_empty());
+		assert_eq!(stack.large_slow_object_count(), 0);
+
+		stack.insert(key + 1, 10);
+		let migrations = drain(&mut stack);
+
+		assert!(!migrations.is_empty());
+		assert_eq!(migrations.first(), Some(&(1, Tier::Slow)));
+		assert!(stack.large_fast_bytes_used() <= low);
+		assert_eq!(migrations.len(), stack.large_slow_object_count());
+		assert_eq!(
+			stack.large_fast_bytes_used() + stack.large_slow_bytes_used(),
+			(key + 1) as CacheSize * 10,
+		);
+		assert_eq!(stack.small_fast_bytes_used(), 0);
+		assert_eq!(stack.small_slow_object_count(), 0);
+	}
+
+	#[test]
+	fn watermarks_scale_the_effective_budget_not_the_raw_capacity() {
+		// 1_000/1_000 capacities with a 400-byte/object shared reservation:
+		// at two tracked objects that is 800 bytes, split 400/400, so each
+		// segment's *effective* budget is 600 -- the value the watermarks
+		// have to be taken against.
+		let mut stack = LruSizedHybridStack::new(1_000, 1_000, 50).with_shared_overhead(400);
+
+		stack.insert(1, 10); // small, nowhere near its own watermark
+		assert!(drain(&mut stack).is_empty());
+
+		// One byte over the high watermark of the EFFECTIVE budget, but
+		// comfortably under the high watermark of the raw capacity -- so a
+		// demotion here can only come from the reservation being preserved.
+		let size = watermarks::high_bytes(600) + 1;
+		assert!(size <= watermarks::high_bytes(1_000));
+
+		stack.insert(2, size as ObjectSize);
+		let migrations = drain(&mut stack);
+
+		assert_eq!(stack.effective_large(), 600);
+		assert_eq!(migrations, vec![(2, Tier::Slow)]);
+		assert_eq!(stack.tier_of(1), Some(Tier::Fast));
+		assert_eq!(stack.tier_of(2), Some(Tier::Slow));
+		assert_eq!(stack.large_fast_bytes_used(), 0);
+		assert_eq!(stack.large_slow_bytes_used(), size);
 	}
 }

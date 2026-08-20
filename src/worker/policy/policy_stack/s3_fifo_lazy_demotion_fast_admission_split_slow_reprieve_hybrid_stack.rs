@@ -87,6 +87,45 @@
 //! separate call sites, and the check is O(1) per crossing rather than
 //! O(1) per eviction-pass-sampling-one-key. The whole midpoint apparatus
 //! is simply gone.
+//!
+//! ## Shared DRAM-reservation overhead
+//!
+//! The object hashtable and this stack's own eviction bookkeeping live in
+//! DRAM but are not counted in any of the byte gauges below, so the fast
+//! tier's real DRAM footprint would otherwise exceed its budget.
+//! `shared_overhead` (see `crate::object::overhead::
+//! get_hybrid_dram_shared_overhead`) is the approximate per-*tracked-key*
+//! cost of those structures; `reserved_overhead()` scales it by
+//! `entries.len()` and the result is carved out of the fast-tier budget, so
+//! demotion bounds total DRAM rather than just fast-tier values.
+//!
+//! Two properties are worth spelling out, because both are easy to get
+//! wrong:
+//!
+//! * **It is charged against every tracked key, not just the fast ones.**
+//!   A key's `entries` slot and its `QueueList` node live in DRAM whether
+//!   its *data* sits in DRAM or in PMEM -- only the value bytes move on a
+//!   demotion. This matches `LruHybridStack`'s `stack.len()` and
+//!   `LruSizedHybridStack`'s `entries.len()`.
+//!
+//! * **It is split proportionally between the two fast segments, not
+//!   charged in full to each.** This stack has two independently-capacitied
+//!   fast segments -- the one-access queue (`one_access_capacity`) and the
+//!   main queue's fast portion (`main_fast_capacity()`, i.e.
+//!   `fast_capacity` with the one-access carve-out removed). The underlying
+//!   metadata cost is real only once, so `reserved_shares()` proportions it
+//!   across the two budgets exactly as `LruSizedHybridStack::reserved_shares`
+//!   does. The two slow segments carry no capacity of their own, so they
+//!   have nothing to reserve against.
+//!
+//! There is deliberately no ghost-queue term: this lineage has no ghost
+//! queue at all (see the opening of this doc), so `entries` is the complete
+//! set of keys this stack holds metadata for, and a per-tracked-key constant
+//! models it exactly.
+//!
+//! The watermarks are applied *on top of* the reserved value, never in
+//! place of it -- `high_bytes(capacity - reserved)`, not
+//! `high_bytes(capacity)`.
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 use std::collections::HashMap;
@@ -107,7 +146,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
-	worker::policy::policy_stack::{PolicyStack, Tier},
+	worker::policy::policy_stack::{PolicyStack, Tier, watermarks},
 };
 
 /// Fraction of the slow tier's bytes `slow_head` is allowed to hold before
@@ -182,6 +221,13 @@ pub struct S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack {
 	slow_head_used: CacheSize,
 	slow_tail_used: CacheSize,
 
+	/// Approximate per-*tracked-key* DRAM cost of the shared structures (the
+	/// object hashtable + this stack's eviction bookkeeping), reserved
+	/// proportionally between the two fast segments' capacities -- see the
+	/// module doc. `0` unless set via `with_shared_overhead`, which is why
+	/// every test below that doesn't opt in is unaffected by it.
+	shared_overhead: CacheSize,
+
 	migrations: Vec<(HashedKey, Tier)>,
 }
 
@@ -228,12 +274,79 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack {
 			slow_head_used: 0,
 			slow_tail_used: 0,
 
+			shared_overhead: 0,
+
 			migrations: Vec::new(),
 		}
 	}
 
-	fn effective_main_fast_capacity(&self) -> CacheSize {
+	/// Sets the approximate per-tracked-key shared-structure DRAM overhead
+	/// (object hashtable + eviction stacks) reserved out of the fast-tier
+	/// budget. See `crate::object::overhead::get_hybrid_dram_shared_overhead`.
+	/// Builder-style so `init_policy_stack` can wire it in without disturbing
+	/// `new`'s signature (unit tests keep the default `0`).
+	pub fn with_shared_overhead(mut self, overhead: CacheSize) -> Self {
+		self.shared_overhead = overhead;
+		self
+	}
+
+	/// The CONFIGURED (pre-reservation) main-fast budget: `fast_capacity`
+	/// with the one-access queue's carve-out removed. This is the
+	/// proportioning basis for `reserved_shares`, and is deliberately *not*
+	/// what `settle_fast_tier` settles against -- that is
+	/// `effective_main_fast_capacity()`, which removes this segment's share
+	/// of the reservation on top.
+	fn main_fast_capacity(&self) -> CacheSize {
 		self.fast_capacity.saturating_sub(self.one_access_capacity)
+	}
+
+	/// Total DRAM currently reserved for shared per-object metadata across
+	/// *both* tiers (`tracked key count x shared_overhead`). A key occupies
+	/// exactly one `QueueList` node plus exactly one `entries` slot no matter
+	/// which of the four lists it is in, so a demotion or a crossing does not
+	/// change this value -- which is what makes it loop-invariant inside
+	/// `settle_fast_tier` and `settle_one_access`.
+	fn reserved_overhead(&self) -> CacheSize {
+		self.entries.len() as CacheSize * self.shared_overhead
+	}
+
+	/// Splits `reserved_overhead()` proportionally between the two
+	/// independently-capacitied fast segments, as `(one_access, main_fast)`.
+	/// Charging the full amount to each would double-count metadata that
+	/// exists only once and would waste usable fast-tier budget for no
+	/// reason. `(0, 0)` when neither segment has any capacity to proportion
+	/// against. Widened to `u128` for the multiply so a large capacity times
+	/// a large reservation cannot overflow `CacheSize` (`u64`) mid-expression.
+	fn reserved_shares(&self) -> (CacheSize, CacheSize) {
+		let reserved = self.reserved_overhead();
+
+		let one_access_capacity = self.one_access_capacity;
+		let main_fast_capacity = self.main_fast_capacity();
+		let total_capacity = one_access_capacity + main_fast_capacity;
+
+		if total_capacity == 0 {
+			return (0, 0);
+		}
+
+		let one_access_share = ((reserved as u128 * one_access_capacity as u128)
+			/ total_capacity as u128) as CacheSize;
+		let main_fast_share = reserved.saturating_sub(one_access_share);
+
+		(one_access_share, main_fast_share)
+	}
+
+	/// The one-access queue's byte budget once its share of the shared
+	/// metadata reservation is carved out. Settled against by
+	/// `settle_one_access`.
+	fn effective_one_access_capacity(&self) -> CacheSize {
+		self.one_access_capacity.saturating_sub(self.reserved_shares().0)
+	}
+
+	/// The main queue's fast-portion byte budget once its share of the shared
+	/// metadata reservation is carved out. Settled against by
+	/// `settle_fast_tier`, which applies the watermarks on top of this value.
+	fn effective_main_fast_capacity(&self) -> CacheSize {
+		self.main_fast_capacity().saturating_sub(self.reserved_shares().1)
 	}
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
@@ -359,10 +472,41 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack {
 		}
 	}
 
-	/// Demotes oldest-first out of `main_fast` into `slow_head` until the
-	/// effective fast budget is met, reprieving any key whose bit is set
-	/// instead. Terminates even when every fast key's bit is set, since
-	/// each reprieve clears one bit.
+	/// Demotes oldest-first out of `main_fast` into `slow_head` under the
+	/// shared fast-tier watermarks (`super::watermarks`), reprieving any key
+	/// whose bit is set instead. Terminates even when every fast key's bit
+	/// is set, since each reprieve clears one bit.
+	///
+	/// A pass triggers only once `fast_used` exceeds
+	/// `high_bytes(effective_capacity)`, and once triggered it drains all the
+	/// way down to `low_bytes(effective_capacity)` rather than stopping at
+	/// the ceiling. This replaces the previous drain-to-exactly-the-ceiling
+	/// rule, which pinned the fast tier at 100% utilisation and left almost
+	/// every triggered pass demoting exactly one object -- migration batches
+	/// of one, which maximise per-batch worker overhead and cannot be
+	/// parallelised. See `super::watermarks`' doc for the full rationale and
+	/// for the `FAST_TIER_HIGH_WATERMARK`/`FAST_TIER_LOW_WATERMARK`
+	/// overrides (setting both to `1.0` restores the old drain-to-ceiling
+	/// behaviour exactly).
+	///
+	/// `effective_main_fast_capacity()` is still this stack's fast-tier
+	/// ceiling -- `fast_capacity` with the one-access queue's carve-out
+	/// removed (that queue is fast-tier here and settles against its own
+	/// budget), and now with this segment's proportional share of the shared
+	/// per-object metadata reservation removed on top of that (see the module
+	/// doc's "Shared DRAM-reservation overhead"; it saturates to 0 when the
+	/// metadata alone meets or exceeds the segment's budget). The watermarks
+	/// are applied on top of that effective value, never in place of it.
+	///
+	/// The effective value is loop-invariant, which is why it is read once up
+	/// front: a demotion moves a key from `main_fast` into `slow_head` but
+	/// leaves it tracked in `entries`, so `reserved_shares()` cannot shift
+	/// underneath the loop.
+	///
+	/// Only the loop's entry condition and its stopping point changed. The
+	/// per-demotion bookkeeping below (the reference-bit reprieve, the queue
+	/// tag, `fast_used`, `slow_head_used`, and the migration emission) is
+	/// untouched and still runs exactly once per demoted object.
 	///
 	/// Deliberately does NOT call `settle_slow_split` -- that method calls
 	/// `give_second_chance`, which calls back into here, so the two must
@@ -372,7 +516,17 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack {
 	fn settle_fast_tier(&mut self) {
 		let effective_capacity = self.effective_main_fast_capacity();
 
-		while self.fast_used > effective_capacity {
+		// Trigger: nothing happens at all until usage crosses the high
+		// watermark. Checked once, up front, rather than per iteration --
+		// that is what lets a triggered pass keep draining *below* the high
+		// watermark, down to the low one.
+		if self.fast_used <= watermarks::high_bytes(effective_capacity) {
+			return;
+		}
+
+		let low_water = watermarks::low_bytes(effective_capacity);
+
+		while self.fast_used > low_water {
 			let Some(candidate) = self.main_fast.back().copied() else { break };
 
 			let accessed = self.entries.get(&candidate).map(|entry| entry.accessed).unwrap_or(false);
@@ -459,8 +613,23 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack {
 	/// through eviction would make `apply_evictions` erase a live object (or
 	/// fall back to evicting a random one). See the predecessor's module doc
 	/// for the full account of that bug.
+	///
+	/// Settles against `effective_one_access_capacity()` -- this segment's
+	/// proportional share of the shared per-object metadata reservation
+	/// carved out of `one_access_capacity`, since the one-access queue is a
+	/// fast-tier (DRAM) segment with a budget of its own. Read once up front
+	/// for the same reason as in `settle_fast_tier`: a reprieve into
+	/// `slow_head` leaves the key tracked, so the reservation is
+	/// loop-invariant here too.
+	///
+	/// No watermarks here, deliberately. This segment relieves pressure by
+	/// reprieving into the slow tier synchronously from `insert`/`resize`,
+	/// which is not a `PolicyWorker` migration batch, so there is no
+	/// batch-of-one cost for a low-water drain to amortise away.
 	fn settle_one_access(&mut self) {
-		while self.one_access_used > self.one_access_capacity {
+		let effective_capacity = self.effective_one_access_capacity();
+
+		while self.one_access_used > effective_capacity {
 			let Some(key) = self.one_access_queue.pop_back() else { break };
 			let Some(entry) = self.entries.get(&key).copied() else { continue };
 			let size = entry.size as CacheSize;
@@ -658,6 +827,86 @@ mod tests {
 		stack.drain_tier_migrations()
 	}
 
+	/// One-access capacity every watermark-sensitive fixture below is built
+	/// with (ratio 1.0 x this `max_size`). Sized so `settle_one_access` never
+	/// fires: a key sits in the one-access queue only until its `update()`
+	/// promotes it into `main_fast`, which is the list the watermarks govern.
+	const ONE_ACCESS_CAPACITY: CacheSize = 1_000;
+
+	/// Effective main-fast budget the watermark tests size against -- i.e.
+	/// what `effective_main_fast_capacity()` returns once the one-access
+	/// carve-out above is subtracted from `fast_capacity`. Deliberately
+	/// paired with the 1-byte objects `fill_fast` inserts: that makes the
+	/// drain byte-exact, so a triggered pass lands on precisely `low_bytes()`
+	/// and the expectations below hold at any configured watermark ratio
+	/// rather than only at the 0.95/0.75 defaults. (The watermarks are
+	/// process-global `OnceLock`s, so a test cannot pin them via env vars
+	/// without racing every other test in the binary -- expectations are
+	/// computed from `watermarks::` instead.)
+	const CAPACITY: CacheSize = 1_000;
+
+	/// A stack whose `effective_main_fast_capacity()` is exactly `CAPACITY`.
+	fn watermark_stack() -> S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack {
+		S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack::new(
+			1.0, ONE_ACCESS_CAPACITY, ONE_ACCESS_CAPACITY + CAPACITY,
+		)
+	}
+
+	/// Byte threshold at which a demotion pass triggers, for `CAPACITY`.
+	fn high_bytes() -> CacheSize {
+		watermarks::high_bytes(CAPACITY)
+	}
+
+	/// Byte target a triggered demotion pass drains down to, for `CAPACITY`.
+	fn low_bytes() -> CacheSize {
+		watermarks::low_bytes(CAPACITY)
+	}
+
+	/// Effective main-fast budget at which `resident` bytes sit at or below
+	/// the low watermark while `resident + step` bytes sit above the high
+	/// one -- so a pass fires once the `step` bytes land and stops with
+	/// `resident` bytes still in `main_fast`. Derived from `watermarks::`
+	/// rather than hard-coded so the fixture holds at any configured ratio;
+	/// at the drain-to-ceiling pair (1.0/1.0) it returns exactly `resident`.
+	///
+	/// A two-object fixture like this one only exists when the marks are
+	/// within a factor of two of each other (`low() > high() / 2`) -- below
+	/// that, one object cannot sit under the low mark while two sit over the
+	/// high one, whatever the budget. That is a property of the fixture's
+	/// shape, not of `settle_fast_tier`; the watermark tests further down use
+	/// 1-byte objects instead and hold at any pair.
+	fn budget_holding(resident: CacheSize, step: CacheSize) -> CacheSize {
+		(resident..=(resident + step) * 100)
+			.find(|budget| {
+				watermarks::low_bytes(*budget) >= resident
+					&& watermarks::high_bytes(*budget) < resident + step
+			})
+			.expect("no budget fits this fixture; needs FAST_TIER_LOW_WATERMARK > FAST_TIER_HIGH_WATERMARK / 2")
+	}
+
+	/// Inserts `count` 1-byte keys numbered from `first` and re-accesses each
+	/// one, promoting it out of the one-access queue into `main_fast` with a
+	/// CLEAR reference bit (`promote_from_one_access` clears it), so nothing
+	/// in the fill is eligible for a demotion-time reprieve. Returns the keys
+	/// in promotion order, so index 0 is `main_fast`'s back -- the first
+	/// demotion candidate.
+	fn fill_fast(
+		stack: &mut S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack,
+		first: HashedKey,
+		count: CacheSize,
+	) -> Vec<HashedKey> {
+		(0..count)
+			.map(|offset| {
+				let key = first + offset;
+
+				stack.insert(key, 1);
+				stack.update(key);
+
+				key
+			})
+			.collect()
+	}
+
 	#[test]
 	fn admission_always_lands_in_one_access_queue_fast() {
 		let mut stack = S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack::new(1.0, 1_000, 1_000);
@@ -811,7 +1060,15 @@ mod tests {
 
 	#[test]
 	fn an_accessed_fast_boundary_key_is_reprieved_at_demotion_time_not_demoted() {
-		let mut stack = S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack::new(1.0, 1_000, 1_010);
+		// `one_access_capacity` is 1_000 (ratio 1.0), so everything added on
+		// top of it is the effective main-fast budget. Sized from the
+		// watermarks so one 10-byte key rests at or below the low mark while
+		// two cross the high one -- i.e. the pass fires and stops with
+		// exactly one key resident. At the drain-to-ceiling config (1.0/1.0)
+		// this is the literal 1_010 the fixture used before the watermarks.
+		let mut stack = S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack::new(
+			1.0, 1_000, 1_000 + budget_holding(10, 10),
+		);
 
 		stack.insert(1, 10);
 		stack.update(1);
@@ -899,5 +1156,407 @@ mod tests {
 		assert_eq!(stack.slow_bytes_used(), 0);
 		assert_eq!(stack.fast_object_count(), 2);
 		assert_eq!(stack.slow_object_count(), 0);
+	}
+
+	// ---- fast-tier watermarks (`super::watermarks`) ----
+
+	#[test]
+	fn usage_at_the_high_watermark_triggers_no_demotion() {
+		let mut stack = watermark_stack();
+
+		// Fills to exactly `high_bytes()` -- the largest usage the trigger
+		// (`fast_used > high_bytes`) still leaves alone.
+		let keys = fill_fast(&mut stack, 1, high_bytes());
+
+		assert_eq!(drain(&mut stack), Vec::new(), "no object should have crossed a tier boundary");
+		assert_eq!(stack.fast_bytes_used(), high_bytes());
+		assert_eq!(stack.slow_bytes_used(), 0);
+		assert_eq!(stack.fast_object_count(), keys.len());
+		assert_eq!(stack.slow_object_count(), 0);
+	}
+
+	#[test]
+	fn usage_above_the_high_watermark_triggers_a_pass() {
+		let mut stack = watermark_stack();
+
+		fill_fast(&mut stack, 1, high_bytes());
+		drain(&mut stack);
+
+		assert_eq!(stack.slow_object_count(), 0, "nothing demotes below the high watermark");
+
+		// A single byte over the high watermark is enough.
+		fill_fast(&mut stack, high_bytes() + 1, 1);
+		let migrations = drain(&mut stack);
+
+		let demotions = migrations
+			.iter()
+			.filter(|(_, tier)| *tier == Tier::Slow)
+			.count();
+
+		assert!(demotions > 0);
+		assert!(stack.slow_object_count() > 0);
+
+		// ...and it fired while usage was still comfortably inside
+		// `effective_main_fast_capacity()`, which is all the old
+		// `fast_used > effective_capacity` rule ever waited for. Skipped when
+		// the high watermark is configured back to 1.0, which deliberately
+		// restores trigger-at-ceiling.
+		if watermarks::high() < 1.0 {
+			assert!(high_bytes() + 1 <= CAPACITY);
+		}
+	}
+
+	#[test]
+	fn a_triggered_pass_drains_to_the_low_watermark_not_the_ceiling() {
+		let mut stack = watermark_stack();
+
+		let keys = fill_fast(&mut stack, 1, high_bytes() + 1);
+		let migrations = drain(&mut stack);
+
+		let demoted = migrations
+			.iter()
+			.filter(|(_, tier)| *tier == Tier::Slow)
+			.map(|(key, _)| *key)
+			.collect::<Vec<_>>();
+
+		// 1-byte objects make the drain byte-exact, so the pass stops on
+		// precisely the object that brings usage to the low watermark -- not
+		// one demotion earlier, not one later.
+		assert_eq!(stack.fast_bytes_used(), low_bytes());
+		assert_eq!(demoted.len() as CacheSize, high_bytes() + 1 - low_bytes());
+
+		// The whole point of the low watermark: the pass keeps going well
+		// past the ceiling the old rule stopped at. Skipped when the low
+		// watermark is configured back to 1.0 (drain-to-ceiling).
+		if watermarks::low() < 1.0 {
+			assert!(stack.fast_bytes_used() < CAPACITY);
+		}
+
+		// Demotion order is oldest-first out of `main_fast`'s back, same as
+		// before the watermarks.
+		assert_eq!(demoted, keys[..demoted.len()].to_vec());
+	}
+
+	#[test]
+	fn counters_stay_consistent_after_a_watermark_pass() {
+		let mut stack = watermark_stack();
+
+		let total = high_bytes() + 1;
+		let keys = fill_fast(&mut stack, 1, total);
+		drain(&mut stack);
+
+		let demoted = total - low_bytes();
+
+		// The pass moved bytes between the tier counters; it neither lost nor
+		// double-counted any, and every key is still tracked exactly once.
+		assert_eq!(stack.len(), total as usize);
+		assert_eq!(stack.fast_bytes_used(), low_bytes());
+		assert_eq!(stack.slow_bytes_used(), demoted);
+		assert_eq!(stack.fast_bytes_used() + stack.slow_bytes_used(), total);
+
+		// Objects are 1 byte apiece, so each byte counter doubles as a count.
+		// `slow_object_count()` spans both slow segments, so this also covers
+		// the objects `settle_slow_split` pushed on into `slow_tail`.
+		assert_eq!(stack.fast_object_count() as CacheSize, low_bytes());
+		assert_eq!(stack.slow_object_count() as CacheSize, demoted);
+		assert_eq!(stack.fast_object_count() + stack.slow_object_count(), total as usize);
+
+		// Per-key tier tags agree with the aggregate counters.
+		let fast = keys.iter().filter(|key| stack.tier_of(**key) == Some(Tier::Fast)).count();
+		let slow = keys.iter().filter(|key| stack.tier_of(**key) == Some(Tier::Slow)).count();
+
+		assert_eq!(fast, stack.fast_object_count());
+		assert_eq!(slow, stack.slow_object_count());
+
+		// And the pass is idempotent: usage now rests under the high
+		// watermark, so re-settling demotes nothing further.
+		stack.resize_fast_tier(ONE_ACCESS_CAPACITY + CAPACITY);
+
+		assert_eq!(drain(&mut stack), Vec::new());
+		assert_eq!(stack.fast_bytes_used(), low_bytes());
+		assert_eq!(stack.slow_bytes_used(), demoted);
+	}
+
+	// ---- shared DRAM-reservation overhead (`with_shared_overhead`) ----
+	//
+	// Every test ABOVE this line builds its stack without
+	// `with_shared_overhead`, so `shared_overhead` is 0, `reserved_shares()`
+	// is `(0, 0)`, and both effective capacities equal the configured ones.
+	// That is why none of them needed rescaling for this change -- not
+	// because the reservation was weakened anywhere.
+
+	/// `watermark_stack()`'s segment shape (one-access 1_000 : main-fast
+	/// 1_000 once resized), but with a per-tracked-key reservation and a
+	/// deliberately oversized initial fast capacity, so the fill itself
+	/// demotes nothing and a single later `resize_fast_tier` triggers exactly
+	/// one pass at a known, FIXED tracked-key count. Fixing the count is what
+	/// makes the reservation arithmetic exact: `reserved_overhead()` scales
+	/// with `entries.len()`, which a mid-fill trigger would leave changing
+	/// under the assertion.
+	fn reserved_stack(overhead: CacheSize) -> S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack {
+		S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack::new(
+			1.0, ONE_ACCESS_CAPACITY, 1_000_000,
+		)
+		.with_shared_overhead(overhead)
+	}
+
+	/// Tracked-key count the two `reserved_stack` fixtures below fill to, and
+	/// (since their objects are 1 byte apiece) their resident byte count.
+	const RESERVED_KEYS: CacheSize = 500;
+
+	/// Per-tracked-key reservation those fixtures use. 500 keys x 3 = 1_500
+	/// bytes reserved, apportioned 1_000:1_000 across the two fast segments
+	/// -> 750 each, leaving an effective main-fast budget of 250.
+	const RESERVED_OVERHEAD: CacheSize = 3;
+
+	/// The effective main-fast budget `reserved_stack(RESERVED_OVERHEAD)` has
+	/// once resized to the standard fixture capacity. Chosen strictly below
+	/// `RESERVED_KEYS` so a pass fires at ANY configured high watermark
+	/// (`fast_used` 500 > `high_bytes(250)` <= 250), not only at the default.
+	const RESERVED_EFFECTIVE: CacheSize = 250;
+
+	#[test]
+	fn shared_overhead_reserves_a_share_of_each_fast_segment() {
+		// Equal segments: one_access_capacity = 0.5 x 1_000 = 500, and
+		// main_fast_capacity() = fast_capacity - one_access_capacity = 500.
+		let mut plain = S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack::new(0.5, 1_000, 1_000);
+		let mut split = S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack::new(0.5, 1_000, 1_000)
+			.with_shared_overhead(20);
+
+		// Five 1-byte keys left sitting in the one-access queue (deliberately
+		// no `update()`), so nothing settles anywhere and the tracked count is
+		// exactly 5 in both stacks.
+		for key in 1..=5u64 {
+			plain.insert(key, 1);
+			split.insert(key, 1);
+		}
+
+		assert_eq!(plain.len(), 5);
+		assert_eq!(split.len(), 5);
+		assert_eq!(plain.slow_object_count(), 0);
+		assert_eq!(split.slow_object_count(), 0);
+
+		// No reservation configured -> the effective budgets ARE the
+		// configured ones. This is the property that leaves every test above
+		// untouched by this change.
+		assert_eq!(plain.reserved_overhead(), 0);
+		assert_eq!(plain.reserved_shares(), (0, 0));
+		assert_eq!(plain.effective_one_access_capacity(), 500);
+		assert_eq!(plain.effective_main_fast_capacity(), 500);
+
+		// 5 tracked keys x 20 bytes = 100 bytes of shared metadata, split
+		// 500:500 -> 50 apiece.
+		assert_eq!(split.reserved_overhead(), 100);
+		assert_eq!(split.reserved_shares(), (50, 50));
+		assert_eq!(split.effective_one_access_capacity(), 450);
+		assert_eq!(split.effective_main_fast_capacity(), 450);
+
+		// The shares SUM to the total: the metadata exists once, so it is
+		// reserved once, not once per segment.
+		let (one_access_share, main_fast_share) = split.reserved_shares();
+		assert_eq!(one_access_share + main_fast_share, split.reserved_overhead());
+	}
+
+	#[test]
+	fn the_reservation_splits_in_proportion_to_the_two_segment_budgets() {
+		// Unequal segments: one_access_capacity = 0.25 x 1_000 = 250, and
+		// main_fast_capacity() = 1_000 - 250 = 750.
+		let mut stack = S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack::new(0.25, 1_000, 1_000)
+			.with_shared_overhead(20);
+
+		for key in 1..=5u64 {
+			stack.insert(key, 1);
+		}
+
+		// 100 bytes reserved, apportioned 250:750 -> 25 / 75.
+		assert_eq!(stack.reserved_overhead(), 100);
+		assert_eq!(stack.reserved_shares(), (25, 75));
+		assert_eq!(stack.effective_one_access_capacity(), 225);
+		assert_eq!(stack.effective_main_fast_capacity(), 675);
+
+		// The bug this guards against: charging the full 100 to each segment
+		// independently, which would have left 150 / 650 and thrown away 100
+		// bytes of usable fast tier for metadata that exists only once.
+		assert!(stack.effective_one_access_capacity() > 250 - 100);
+		assert!(stack.effective_main_fast_capacity() > 750 - 100);
+	}
+
+	#[test]
+	fn shared_overhead_reserves_dram_and_demotes_earlier() {
+		// `high_bytes()` 1-byte keys is, by construction, the largest fill an
+		// unreserved stack leaves completely alone -- see
+		// `usage_at_the_high_watermark_triggers_no_demotion`. Both stacks get
+		// that identical fixture and that identical fill; only the
+		// reservation differs.
+		let count = high_bytes();
+
+		let mut plain = watermark_stack();
+		fill_fast(&mut plain, 1, count);
+
+		assert_eq!(drain(&mut plain), Vec::new(), "the unreserved stack rests exactly at its high watermark");
+		assert_eq!(plain.slow_object_count(), 0);
+		assert_eq!(plain.fast_bytes_used(), count);
+
+		// 2 bytes per tracked key, apportioned 1_000:1_000, so the main-fast
+		// share is ceil(n x 2 / 2) = n and the effective budget is
+		// `CAPACITY - n` -- a budget that SHRINKS as the fill grows. At the
+		// default 0.95 high mark the pass therefore first fires at n = 488
+		// (488 > floor(0.95 x 512) = 486, while 487 > floor(0.95 x 513) = 487
+		// is false), versus n = 951 with no reservation at all.
+		let mut reserved = watermark_stack().with_shared_overhead(2);
+		fill_fast(&mut reserved, 1, count);
+
+		let migrations = drain(&mut reserved);
+
+		assert!(
+			migrations.iter().any(|(_, tier)| *tier == Tier::Slow),
+			"the reservation must force demotions the unreserved stack never needed",
+		);
+		assert!(reserved.slow_object_count() > 0);
+		assert!(reserved.fast_bytes_used() < plain.fast_bytes_used());
+
+		// Both stacks still track every key: reserving DRAM demotes, it never
+		// evicts.
+		assert_eq!(plain.len(), count as usize);
+		assert_eq!(reserved.len(), count as usize);
+	}
+
+	#[test]
+	fn overhead_composes_with_the_watermarks_on_the_reduced_budget() {
+		let mut stack = reserved_stack(RESERVED_OVERHEAD);
+
+		fill_fast(&mut stack, 1, RESERVED_KEYS);
+		drain(&mut stack);
+
+		assert_eq!(stack.fast_bytes_used(), RESERVED_KEYS, "the oversized fixture must not demote during the fill");
+		assert_eq!(stack.slow_object_count(), 0);
+		assert_eq!(stack.len(), RESERVED_KEYS as usize);
+
+		// Shrink to the standard fixture budget. The tracked count is pinned
+		// at 500 across the whole pass, so the arithmetic is exact:
+		//
+		//   reserved            = 500 keys x 3 bytes  = 1_500
+		//   segment budgets     = 1_000 : 1_000
+		//   shares              =   750 :   750
+		//   effective main-fast = 1_000 - 750         =   250
+		stack.resize_fast_tier(ONE_ACCESS_CAPACITY + CAPACITY);
+
+		assert_eq!(stack.reserved_overhead(), RESERVED_KEYS * RESERVED_OVERHEAD);
+		assert_eq!(stack.reserved_shares(), (750, 750));
+		assert_eq!(stack.effective_main_fast_capacity(), RESERVED_EFFECTIVE);
+
+		// THE POINT: the pass drained to `low_bytes(250)` -- the low watermark
+		// of the RESERVED budget -- and not to `low_bytes(CAPACITY)`. At the
+		// default 0.75 low mark that is 187 bytes resident rather than 750.
+		// 1-byte objects keep the drain byte-exact, so it lands precisely.
+		assert_eq!(stack.fast_bytes_used(), watermarks::low_bytes(RESERVED_EFFECTIVE));
+
+		// ...and it could not be the unreserved target even in principle: the
+		// reserved budget is 250, so any watermark of it is at most 250, while
+		// the unreserved budget is CAPACITY (1_000) on its own.
+		assert!(stack.fast_bytes_used() <= RESERVED_EFFECTIVE);
+
+		// Skipped at a low watermark configured under 0.25, where flooring
+		// collapses the two targets together.
+		if watermarks::low() > 0.25 {
+			assert!(stack.fast_bytes_used() < watermarks::low_bytes(CAPACITY));
+		}
+
+		// The TRIGGER composed the same way, not just the drain target: 500
+		// resident bytes sit comfortably under `high_bytes(CAPACITY)` (950 by
+		// default), so without the reservation this pass would not have fired
+		// at all. Skipped when the high mark is configured under 0.5, where
+		// 500 bytes clears the unreserved trigger too.
+		if watermarks::high() >= 0.5 {
+			assert!(RESERVED_KEYS <= watermarks::high_bytes(CAPACITY));
+		}
+	}
+
+	#[test]
+	fn counters_stay_consistent_after_a_reserved_watermark_pass() {
+		let mut stack = reserved_stack(RESERVED_OVERHEAD);
+
+		let keys = fill_fast(&mut stack, 1, RESERVED_KEYS);
+		drain(&mut stack);
+
+		stack.resize_fast_tier(ONE_ACCESS_CAPACITY + CAPACITY);
+		let migrations = drain(&mut stack);
+
+		let resident = watermarks::low_bytes(RESERVED_EFFECTIVE);
+		let demoted = RESERVED_KEYS - resident;
+
+		// Every key is still tracked exactly once -- the reservation demotes,
+		// it never evicts.
+		assert_eq!(stack.len(), RESERVED_KEYS as usize);
+
+		// Bytes moved between the tier counters; none were lost or
+		// double-counted.
+		assert_eq!(stack.fast_bytes_used(), resident);
+		assert_eq!(stack.slow_bytes_used(), demoted);
+		assert_eq!(stack.fast_bytes_used() + stack.slow_bytes_used(), RESERVED_KEYS);
+
+		// Objects are 1 byte apiece, so each byte counter doubles as a count.
+		// `slow_object_count()` spans both slow segments, so this also covers
+		// whatever `settle_slow_split` pushed on into `slow_tail`.
+		assert_eq!(stack.fast_object_count() as CacheSize, resident);
+		assert_eq!(stack.slow_object_count() as CacheSize, demoted);
+		assert_eq!(stack.fast_object_count() + stack.slow_object_count(), RESERVED_KEYS as usize);
+
+		// Exactly one migration per demoted object, all in the demotion
+		// direction, oldest-first out of `main_fast`'s back.
+		let demotions = migrations
+			.iter()
+			.filter(|(_, tier)| *tier == Tier::Slow)
+			.map(|(key, _)| *key)
+			.collect::<Vec<_>>();
+
+		assert_eq!(demotions.len() as CacheSize, demoted);
+		assert_eq!(migrations.len() as CacheSize, demoted, "no spurious promotions");
+		assert_eq!(demotions, keys[..demotions.len()].to_vec());
+
+		// Per-key tier tags agree with the aggregate counters.
+		let fast = keys.iter().filter(|key| stack.tier_of(**key) == Some(Tier::Fast)).count();
+		let slow = keys.iter().filter(|key| stack.tier_of(**key) == Some(Tier::Slow)).count();
+
+		assert_eq!(fast, stack.fast_object_count());
+		assert_eq!(slow, stack.slow_object_count());
+
+		// And the pass is idempotent against the REDUCED budget: usage now
+		// rests at the low watermark of 250, which is at or below its high
+		// watermark, so re-settling demotes nothing further.
+		stack.resize_fast_tier(ONE_ACCESS_CAPACITY + CAPACITY);
+
+		assert_eq!(drain(&mut stack), Vec::new());
+		assert_eq!(stack.fast_bytes_used(), resident);
+		assert_eq!(stack.slow_bytes_used(), demoted);
+	}
+
+	#[test]
+	fn a_reservation_exceeding_the_fast_budget_reprieves_but_never_evicts() {
+		// one_access_capacity = 1.0 x 100 = 100 and main_fast_capacity() = 0,
+		// so the whole 100-byte fast budget belongs to the one-access queue
+		// and takes the entire 1_000-byte reservation. Its effective budget
+		// saturates to 0.
+		let mut stack = S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack::new(1.0, 100, 100)
+			.with_shared_overhead(1_000);
+
+		stack.insert(1, 10);
+
+		assert_eq!(stack.reserved_overhead(), 1_000);
+		assert_eq!(stack.reserved_shares(), (1_000, 0));
+		assert_eq!(stack.effective_one_access_capacity(), 0);
+		assert_eq!(stack.effective_main_fast_capacity(), 0);
+
+		// The object is reprieved into the slow tier on admission...
+		assert_eq!(drain(&mut stack), vec![(1, Tier::Slow)]);
+		assert_eq!(stack.tier_of(1), Some(Tier::Slow));
+		assert_eq!(stack.fast_bytes_used(), 0);
+
+		// ...but is still tracked. The DRAM budget demotes; terminal eviction
+		// stays governed solely by `max_size`, so `needs_capacity_eviction`
+		// remains the trait's default `false`.
+		assert_eq!(stack.len(), 1);
+		assert!(stack.contains(1));
+		assert!(!stack.needs_capacity_eviction());
 	}
 }

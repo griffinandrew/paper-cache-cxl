@@ -301,7 +301,7 @@ pub fn get_ttl_overhead() -> ObjectSize {
 /// (see the `lru_hybrid_cache`/`lfu_hybrid_cache` design notes). TODO: if an
 /// exact DRAM ceiling is ever needed, thread a `size_of::<Object<K,V>>()`
 /// hint through from the generic `PaperCache::new` call site instead.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+#[cfg(feature = "hybrid_cache_common")]
 pub const HASHTABLE_ENTRY_OVERHEAD: ObjectSize = 11;
 
 /// Dedicated per-object DRAM cost of `LruHybridStack`'s eviction-stack
@@ -377,6 +377,322 @@ const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 #[cfg(feature = "lru_lfu_hybrid_cache")]
 const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
+/// Per-*ghost-entry* DRAM cost shared by every hybrid design that keeps a
+/// bare-key ghost queue (`TwoQGhostHybrid`, and the four `S3Fifo*Ghost*`
+/// variants).
+///
+/// One `HashList<HashedKey>` node: 24-byte heap `Entry<HashedKey>` (8 data +
+/// 8 prev + 8 next) plus the list's internal key->node map slot,
+/// `cost(16) = 20`. Same 44 every other list-entry term in this module uses.
+///
+/// Deliberately *not* a per-tracked-object charge, and so deliberately not
+/// part of [`get_hybrid_dram_shared_overhead`]'s return value: a ghost entry
+/// exists precisely for a key that is *no longer in the cache*, so there is
+/// no tracked-object count to multiply it by and — critically — it has **no
+/// object-hashtable slot**, which is why it must never carry
+/// [`HASHTABLE_ENTRY_OVERHEAD`]. The owning stacks multiply it by
+/// `ghost.len()` inside their own `reserved_overhead`.
+///
+/// Gated on `eviction_stacks_pmem` **only** (never `global_hashtable_pmem`,
+/// per the no-hashtable-slot point above): when that feature moves the
+/// eviction stacks — ghost list included — to PMEM, the ghost costs the
+/// fast/DRAM tier nothing and the term drops to 0.
+///
+/// Unlike the per-policy constants below this is *not* gated on
+/// `hybrid_cache_common`: the policy-stack modules are declared
+/// unconditionally (see `worker::policy::policy_stack`), so they compile —
+/// and reference this — under every feature combination, including none.
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 44;
+
+/// PMEM-resident ghost list: costs the fast/DRAM tier nothing. See the
+/// `not(eviction_stacks_pmem)` arm above for the derivation and rationale.
+#[cfg(feature = "eviction_stacks_pmem")]
+pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
+
+/// Per-object DRAM cost of `FifoHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+#[cfg(feature = "fifo_hybrid_cache")]
+const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `TwoQHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+#[cfg(feature = "two_q_hybrid_cache")]
+const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `TwoQFastAdmissionHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+#[cfg(feature = "two_q_fast_admission_hybrid_cache")]
+const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `TwoQFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
+const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `TwoQGhostHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+///
+/// Excludes the bare-key ghost queue, which is charged separately via
+/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`: its length is
+/// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
+/// eviction, while one-access-queue evictions are what grow it), so it is
+/// not expressible as a per-tracked-key term.
+#[cfg(feature = "two_q_ghost_hybrid_cache")]
+const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `S3FifoHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+#[cfg(feature = "s3_fifo_hybrid_cache")]
+const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `S3FifoGhostHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+///
+/// Excludes the bare-key ghost queue, which is charged separately via
+/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`: its length is
+/// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
+/// eviction, while one-access-queue evictions are what grow it), so it is
+/// not expressible as a per-tracked-key term.
+#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
+const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `S3FifoGhostLazyDemotionHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+///
+/// Excludes the bare-key ghost queue, which is charged separately via
+/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`: its length is
+/// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
+/// eviction, while one-access-queue evictions are what grow it), so it is
+/// not expressible as a per-tracked-key term.
+#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
+const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+///
+/// Excludes the bare-key ghost queue, which is charged separately via
+/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`: its length is
+/// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
+/// eviction, while one-access-queue evictions are what grow it), so it is
+/// not expressible as a per-tracked-key term.
+#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
+const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+///
+/// Excludes the bare-key ghost queue, which is charged separately via
+/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`: its length is
+/// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
+/// eviction, while one-access-queue evictions are what grow it), so it is
+/// not expressible as a per-tracked-key term.
+#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
+const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `S3FifoLazyDemotionReprieveHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+#[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
+const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
+const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
+const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
+/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
+/// node for the single queue the key occupies at any one time (24-byte heap
+/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
+/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
+/// `cost(16)` for the `(HashedKey, Entry)` pair).
+///
+/// The single-node term is correct rather than an undercount: this design's
+/// queues are disjoint and a key is removed from one before being pushed to
+/// the other, so it is never resident in two at once. The key itself is
+/// stored once, inside the heap node, and is not charged again (the
+/// double-charge [`get_policy_overhead`] makes and this module's derivation
+/// block flags).
+#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
+const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+
 /// Approximate per-object DRAM cost of the *shared* structures (the object
 /// hashtable + the eviction stacks) that hold an entry for every object of both
 /// tiers. Used by the LRU/LFU/LRU-sized hybrid stacks to reserve room in the
@@ -389,7 +705,7 @@ const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// terms that are actually DRAM-resident: the eviction-stack term is dropped
 /// when `eviction_stacks_pmem` moves those stacks to PMEM, and the hashtable
 /// entry is dropped when a hashtable-PMEM feature moves the object map to PMEM.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+#[cfg(feature = "hybrid_cache_common")]
 pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	#[allow(unused_mut)]
 	let mut overhead: ObjectSize = 0;
@@ -415,6 +731,76 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 		#[cfg(feature = "lru_lfu_hybrid_cache")]
 		if matches!(policy, PaperPolicy::LruLfuHybrid(_)) {
 			overhead += LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "fifo_hybrid_cache")]
+		if matches!(policy, PaperPolicy::FifoHybrid) {
+			overhead += FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "two_q_hybrid_cache")]
+		if matches!(policy, PaperPolicy::TwoQHybrid(_)) {
+			overhead += TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "two_q_fast_admission_hybrid_cache")]
+		if matches!(policy, PaperPolicy::TwoQFastAdmissionHybrid(_)) {
+			overhead += TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
+		if matches!(policy, PaperPolicy::TwoQFastAdmissionReprieveHybrid(_)) {
+			overhead += TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "two_q_ghost_hybrid_cache")]
+		if matches!(policy, PaperPolicy::TwoQGhostHybrid(_)) {
+			overhead += TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "s3_fifo_hybrid_cache")]
+		if matches!(policy, PaperPolicy::S3FifoHybrid(_)) {
+			overhead += S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
+		if matches!(policy, PaperPolicy::S3FifoGhostHybrid(_)) {
+			overhead += S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
+		if matches!(policy, PaperPolicy::S3FifoGhostLazyDemotionHybrid(_)) {
+			overhead += S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
+		if matches!(policy, PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_)) {
+			overhead += S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
+		if matches!(policy, PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(_)) {
+			overhead += S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
+		if matches!(policy, PaperPolicy::S3FifoLazyDemotionReprieveHybrid(_)) {
+			overhead += S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
+		if matches!(policy, PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(_)) {
+			overhead += S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
+		if matches!(policy, PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(_)) {
+			overhead += S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
+		if matches!(policy, PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(_)) {
+			overhead += S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
 		}
 	}
 

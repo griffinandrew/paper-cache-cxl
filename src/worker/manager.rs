@@ -143,8 +143,8 @@ impl WorkerFanout {
 		tiering_manager: &Arc<TieringManager<K, V>>,
 	) -> Result<(Self, WorkerHandles), CacheError>
 	where
-		K: 'static + Eq + TypeSize + Clone,
-		V: 'static + TypeSize + Clone + AsRef<[u8]>,
+		K: 'static + Eq + TypeSize + Clone + Send + Sync,
+		V: 'static + TypeSize + Clone + AsRef<[u8]> + Send + Sync,
 	{
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();
@@ -192,8 +192,8 @@ impl WorkerFanout {
 		overhead_manager: &OverheadManagerRef,
 	) -> Result<(Self, WorkerHandles), CacheError>
 	where
-		K: 'static + Eq + TypeSize,
-		V: 'static + TypeSize + Clone,
+		K: 'static + Eq + TypeSize + Send + Sync,
+		V: 'static + TypeSize + Clone + Send + Sync,
 	{
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();
@@ -239,11 +239,11 @@ impl WorkerFanout {
 		objects: &ObjectMapRef<K, V>,
 		status: &StatusRef,
 		overhead_manager: &OverheadManagerRef,
-		migrate: Box<dyn Fn(&V, Tier) -> V + Send + Sync>,
+		migrate: Box<dyn Fn(&V, Tier) -> Option<V> + Send + Sync>,
 	) -> Result<(Self, WorkerHandles), CacheError>
 	where
-		K: 'static + Eq + TypeSize,
-		V: 'static + TypeSize,
+		K: 'static + Eq + TypeSize + Send + Sync,
+		V: 'static + TypeSize + Send + Sync,
 	{
 		let (policy_worker, policy_listener) = unbounded();
 		let (ttl_worker, ttl_listener) = unbounded();

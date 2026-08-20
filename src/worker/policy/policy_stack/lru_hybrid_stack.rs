@@ -16,12 +16,24 @@
 //! demoted. `evict_one` always pops the absolute LRU tail, which — once any
 //! demotion has occurred — is always in the slow tier.
 //!
-//! ## Low-water headroom (reintroduced, smaller than before)
+//! ## High/low watermarks (shared with every other hybrid stack)
 //!
-//! `settle_fast_tier` still only *triggers* once `fast_used` genuinely
-//! exceeds the effective budget (no early demotion), but once triggered,
-//! drains down to `FAST_TIER_LOW_WATER_RATIO` of that budget rather than
-//! back to exactly the ceiling. An earlier version of this stack had a
+//! `settle_fast_tier` triggers once `fast_used` exceeds
+//! `watermarks::high_bytes` of the effective budget, and once triggered
+//! drains down to `watermarks::low_bytes` of that budget rather than back to
+//! exactly the ceiling. Both ratios live in `super::watermarks` (defaults
+//! 0.95 / 0.75, overridable at runtime via `FAST_TIER_HIGH_WATERMARK` /
+//! `FAST_TIER_LOW_WATERMARK`) and are shared by every hybrid stack, so the
+//! trigger/drain tradeoff is tuned in one place. Setting both to `1.0`
+//! restores the original trigger-and-drain-at-the-ceiling behaviour exactly.
+//!
+//! The *effective budget* itself is unchanged by this: it is still
+//! `fast_capacity` minus `reserved_overhead()`, and the watermarks are
+//! applied on top of that value rather than in place of it.
+//!
+//! This supersedes the stack-local `FAST_TIER_LOW_WATER_RATIO` (0.98), which
+//! is retained only as documentation of the previous value. An earlier
+//! version of this stack had a
 //! larger (90%) low-water floor, removed at the user's explicit request
 //! ("keeping the 10% high water mark in the lru implementation hurts
 //! performance so get rid of it") because idle headroom cost usable space
@@ -85,17 +97,19 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
-	worker::policy::policy_stack::{PolicyStack, Tier},
+	worker::policy::policy_stack::{PolicyStack, Tier, watermarks},
 };
 
-/// Fraction of the effective fast-tier budget `settle_fast_tier` drains down
-/// to once triggered, rather than back to exactly the ceiling — see the
-/// module doc's "Low-water headroom" section for why. Deliberately much
-/// smaller than the 90% low-water floor an earlier version of this stack
-/// used (and which was removed for hurting performance): this is a burst
-/// safety margin, not a thrashing-reduction mechanism, so it only needs to
-/// be big enough to give concurrent `set()` calls some landing room, not
-/// large enough to meaningfully reduce demotion-pass frequency on its own.
+/// Superseded by the shared `super::watermarks` pair — `settle_fast_tier`
+/// now drains to `watermarks::low_bytes` of the effective budget instead of
+/// this stack-local ratio. Retained (unused) purely to document the value
+/// this stack ran with before the watermarks were centralised: a 2% burst
+/// safety margin, deliberately much smaller than the 90% low-water floor an
+/// even earlier version used (and which was removed for hurting
+/// performance), sized only to give concurrent `set()` calls some landing
+/// room rather than to reduce demotion-pass frequency on its own. The shared
+/// defaults are more aggressive on purpose; see `super::watermarks`.
+#[allow(dead_code)]
 const FAST_TIER_LOW_WATER_RATIO: f64 = 0.98;
 
 // The recency list and per-key map are DRAM-backed by default. When
@@ -312,23 +326,28 @@ impl LruHybridStack {
 	}
 
 	/// Demotes the least-recently-used fast key(s), *triggered* once
-	/// `fast_used` exceeds the *effective* value budget (`fast_capacity`
-	/// minus the DRAM reserved for shared per-object metadata — hashtable +
-	/// eviction stacks — across both tiers; this makes the fast-tier budget
-	/// bound total DRAM, not just fast-tier values, saturating to 0 when the
-	/// shared metadata alone meets/exceeds `fast_capacity`), but *drained*
-	/// down to `FAST_TIER_LOW_WATER_RATIO` of that budget rather than back to
-	/// the ceiling exactly — see the module doc for why this headroom was
-	/// reintroduced. Demotion is the only response; the DRAM budget never
-	/// evicts (terminal eviction stays governed solely by `max_size`).
+	/// `fast_used` exceeds `watermarks::high_bytes` of the *effective* value
+	/// budget (`fast_capacity` minus the DRAM reserved for shared per-object
+	/// metadata — hashtable + eviction stacks — across both tiers; this makes
+	/// the fast-tier budget bound total DRAM, not just fast-tier values,
+	/// saturating to 0 when the shared metadata alone meets/exceeds
+	/// `fast_capacity`), but *drained* down to `watermarks::low_bytes` of that
+	/// same effective budget rather than back to the ceiling exactly — see the
+	/// module doc's "High/low watermarks" section, and `super::watermarks` for
+	/// the ratios and their env overrides. Demotion is the only response; the
+	/// DRAM budget never evicts (terminal eviction stays governed solely by
+	/// `max_size`).
 	fn settle_fast_tier(&mut self) {
+		// The effective budget is unchanged — capacity minus the shared
+		// per-object metadata reservation. The watermarks are applied *on top
+		// of* that value, never in place of it.
 		let effective = self.fast_capacity.saturating_sub(self.reserved_overhead());
 
-		if self.fast_used <= effective {
+		if self.fast_used <= watermarks::high_bytes(effective) {
 			return;
 		}
 
-		let drain_target = (effective as f64 * FAST_TIER_LOW_WATER_RATIO) as CacheSize;
+		let drain_target = watermarks::low_bytes(effective);
 
 		while self.fast_used > drain_target {
 			let Some(demote_key) = self.fast_boundary else { break };
@@ -496,6 +515,23 @@ mod tests {
 		stack.drain_tier_migrations()
 	}
 
+	/// Smallest `fast_capacity` whose high watermark is at least `bytes`, so a
+	/// test can fill the fast tier to exactly `bytes` without tripping a
+	/// demotion pass at whatever ratios are configured. The watermarks are
+	/// process-global (`OnceLock` + env), so tests derive their expectations
+	/// from `watermarks::high()`/`low()` instead of setting the env vars.
+	fn capacity_admitting(bytes: CacheSize) -> CacheSize {
+		let mut capacity = (bytes as f64 / watermarks::high()).ceil() as CacheSize;
+
+		// Guard against `high_bytes`'s `as u64` truncation landing a byte short
+		// for some ratio/rounding combinations.
+		while watermarks::high_bytes(capacity) < bytes {
+			capacity += 1;
+		}
+
+		capacity
+	}
+
 	#[test]
 	fn evict_one_terminates_when_both_keys_are_immediately_demoted() {
 		// Reproduces the `apply_evictions` scenario where fast_capacity is
@@ -533,46 +569,94 @@ mod tests {
 
 	#[test]
 	fn fast_tier_pressure_demotes_lru_tail() {
-		let mut stack = LruHybridStack::new(25);
+		// Sized so two 10-byte objects sit at/below the high watermark and the
+		// third pushes past it, whatever ratios are configured. How *many*
+		// objects the resulting pass demotes depends on the low watermark, so
+		// assert the victim order (LRU end inward) rather than a fixed count.
+		let capacity = capacity_admitting(20);
+		let mut stack = LruHybridStack::new(capacity);
 
 		stack.insert(1, 10); // fast: [1]
 		stack.insert(2, 10); // fast: [2, 1]
 		drain(&mut stack);
+		assert_eq!(stack.fast_bytes_used(), 20);
 
-		stack.insert(3, 10); // pushes fast_used to 30 > 25 -> demotes key 1 (LRU)
+		stack.insert(3, 10); // pushes fast_used to 30, past the high watermark
 		let migrations = drain(&mut stack);
 
-		assert_eq!(migrations, vec![(1, Tier::Slow)]);
+		// Victims are taken from the LRU end inward (1, then 2, ...) and the
+		// just-inserted MRU key is never among them.
+		assert!(!migrations.is_empty());
+		assert!(migrations.iter().all(|(_, tier)| *tier == Tier::Slow));
+
+		let demoted: Vec<HashedKey> = migrations.iter().map(|(key, _)| *key).collect();
+		assert_eq!(demoted, (1..=demoted.len() as HashedKey).collect::<Vec<HashedKey>>());
+
 		assert_eq!(stack.tier_of(1), Some(Tier::Slow));
-		assert_eq!(stack.tier_of(2), Some(Tier::Fast));
-		assert_eq!(stack.tier_of(3), Some(Tier::Fast));
-		assert_eq!(stack.fast_bytes_used(), 20);
-		assert_eq!(stack.slow_bytes_used(), 10);
+
+		// The MRU key survives unless the low watermark is tight enough to
+		// empty the tier outright.
+		if watermarks::low_bytes(capacity) >= 10 {
+			assert_eq!(stack.tier_of(3), Some(Tier::Fast));
+		}
+
+		// The pass drained to the low watermark, and no bytes were lost.
+		assert!(stack.fast_bytes_used() <= watermarks::low_bytes(capacity));
+		assert_eq!(stack.fast_bytes_used() + stack.slow_bytes_used(), 30);
 	}
 
 	#[test]
 	fn accessing_a_slow_key_promotes_it_and_may_demote_another() {
-		let mut stack = LruHybridStack::new(25);
+		// `capacity_admitting(20)` puts the high watermark in [20, 21], so
+		// four 10-byte objects always overshoot it and key 1 (the LRU tail) is
+		// always the first victim -- i.e. always slow by the time it is
+		// re-accessed below, at any configured ratio.
+		let capacity = capacity_admitting(20);
+		let mut stack = LruHybridStack::new(capacity);
 
 		stack.insert(1, 10);
 		stack.insert(2, 10);
-		stack.insert(3, 10); // demotes 1 -> slow
+		stack.insert(3, 10); // demotes from the LRU end, starting with key 1
+		stack.insert(4, 10);
 		drain(&mut stack);
 
 		assert_eq!(stack.tier_of(1), Some(Tier::Slow));
 
 		// Accessing the slow key promotes it back to the fast tier, which
-		// may itself demote the new fast-tier LRU tail (key 2).
+		// pushes fast_used past the high watermark and so demotes the fast-tier
+		// LRU tail behind it.
+		let before = stack.fast_bytes_used();
+
 		stack.update(1);
 		let migrations = drain(&mut stack);
 
 		assert_eq!(stack.tier_of(1), Some(Tier::Fast));
-		// Demotion is applied before the promotion that triggered it, so a
-		// promotion never has its DRAM write applied before the
-		// corresponding demotion's DRAM free (see `touch_fast_key`'s doc).
-		assert_eq!(migrations, vec![(2, Tier::Slow), (1, Tier::Fast)]);
-		assert_eq!(stack.tier_of(2), Some(Tier::Slow));
-		assert_eq!(stack.tier_of(3), Some(Tier::Fast));
+
+		// Demotions are applied before the promotion that triggered them, so a
+		// promotion never has its DRAM write applied before the corresponding
+		// demotion's DRAM free (see `touch_fast_key`'s doc). The promotion is
+		// therefore always the *last* entry, and everything ahead of it is a
+		// demotion of some other key.
+		assert_eq!(migrations.last(), Some(&(1, Tier::Fast)));
+		assert!(
+			migrations[..migrations.len() - 1]
+				.iter()
+				.all(|(key, tier)| *tier == Tier::Slow && *key != 1)
+		);
+
+		// Whenever the promotion carries the tier past the high watermark --
+		// which it does at the default ratios -- it must have demoted something,
+		// and the resulting pass must have drained to the low watermark. When it
+		// does not, the promotion is the only migration and the tier is left
+		// wherever it already sat.
+		if before + 10 > watermarks::high_bytes(capacity) {
+			assert!(migrations.len() > 1);
+			assert!(stack.fast_bytes_used() <= watermarks::low_bytes(capacity));
+		} else {
+			assert_eq!(migrations.len(), 1);
+		}
+
+		assert_eq!(stack.fast_bytes_used() + stack.slow_bytes_used(), 40);
 	}
 
 	#[test]
@@ -676,37 +760,47 @@ mod tests {
 		stack.insert(2, 100);
 		drain(&mut stack);
 
-		// effective=150, drain_target = (150 * 0.98) = 147 (truncated).
-		// fast_used starts at 200; demoting the LRU tail (key 1, 100 bytes)
-		// alone already lands at 100, comfortably under 147.
+		// effective=150. fast_used starts at 200, above the high watermark
+		// (150 * 0.95 = 142), so the shrink triggers a pass; demoting the LRU
+		// tail (key 1, 100 bytes) alone lands at 100, already under the low
+		// watermark (150 * 0.75 = 112), so the pass stops there.
 		stack.resize_fast_tier(150);
 		let migrations = drain(&mut stack);
 
 		assert_eq!(migrations, vec![(1, Tier::Slow)]);
 		assert_eq!(stack.tier_of(2), Some(Tier::Fast));
 		assert_eq!(stack.fast_bytes_used(), 100);
+		assert!(stack.fast_bytes_used() <= watermarks::low_bytes(150));
 	}
 
 	#[test]
 	fn settle_drains_to_low_water_target_with_headroom() {
-		let mut stack = LruHybridStack::new(1_000);
+		const CAPACITY: CacheSize = 1_000;
 
-		for key in 1..=100 {
-			stack.insert(key, 10); // fills to exactly 1_000 (== capacity, no trigger)
+		let high = watermarks::high_bytes(CAPACITY);
+		let low = watermarks::low_bytes(CAPACITY);
+
+		let mut stack = LruHybridStack::new(CAPACITY);
+
+		// Fill to exactly the high watermark in 1-byte objects. The trigger is
+		// strict (`fast_used > high_bytes`), so landing *on* it demotes nothing.
+		for key in 1..=high {
+			stack.insert(key, 1);
 		}
 		drain(&mut stack);
-		assert_eq!(stack.fast_bytes_used(), 1_000);
+		assert_eq!(stack.fast_bytes_used(), high);
 
-		// 1_010 > 1_000 -> triggers; drains down to the low-water target
-		// (1_000 * 0.98 = 980), demoting more than the single object that
-		// would have been the bare minimum to get back under capacity --
-		// this is the reintroduced headroom (see FAST_TIER_LOW_WATER_RATIO
-		// and the module doc's "Low-water headroom" section).
-		stack.insert(101, 10);
+		// One more byte trips the trigger; the pass then drains all the way to
+		// the low watermark rather than merely back under the ceiling, demoting
+		// far more than the single object that would have been the bare minimum
+		// (see the module doc's "High/low watermarks" section).
+		stack.insert(high + 1, 1);
 		let migrations = drain(&mut stack);
 
-		assert_eq!(migrations, vec![(1, Tier::Slow), (2, Tier::Slow), (3, Tier::Slow)]);
-		assert_eq!(stack.fast_bytes_used(), 980);
+		assert_eq!(stack.fast_bytes_used(), low);
+		assert_eq!(migrations.len() as CacheSize, high + 1 - low);
+		assert_eq!(migrations.first(), Some(&(1, Tier::Slow)));
+		assert!(migrations.iter().all(|(_, tier)| *tier == Tier::Slow));
 	}
 
 	#[test]
@@ -739,14 +833,15 @@ mod tests {
 
 		// With a 30-byte per-object shared reservation, the second insert
 		// reserves 2 × 30 = 60, leaving an effective value budget of 40 --
-		// tighter than the raw values (80) fit. Both objects end up demoted:
-		// after the LRU tail (key 1) demotes, fast_used (40) is still above
-		// the low-water drain target (40 * 0.98 = 39, truncated), so settle
-		// continues and demotes key 2 as well, landing at 0. This is the
-		// reintroduced low-water headroom (FAST_TIER_LOW_WATER_RATIO)
-		// interacting with the DRAM-cap reservation at small scale -- with
-		// only two same-sized objects there's no smaller demotion available
-		// to land closer to the target without emptying the tier.
+		// tighter than the raw values (80) fit. The watermarks apply on top of
+		// that reduced effective budget, not the raw capacity. Both objects end
+		// up demoted: 80 exceeds the high watermark (40 * 0.95 = 38), and after
+		// the LRU tail (key 1) demotes, fast_used (40) is still above the low
+		// watermark (40 * 0.75 = 30), so settle continues and demotes key 2 as
+		// well, landing at 0. This is the low-water drain interacting with the
+		// DRAM-cap reservation at small scale -- with only two same-sized
+		// objects there's no smaller demotion available to land closer to the
+		// target without emptying the tier.
 		let mut stack = LruHybridStack::new(100).with_shared_overhead(30);
 		stack.insert(1, 40);
 		stack.insert(2, 40);
@@ -775,6 +870,142 @@ mod tests {
 		// DRAM budget never evicts; `needs_capacity_eviction` stays default).
 		assert_eq!(stack.len(), 1);
 		assert!(!stack.needs_capacity_eviction());
+	}
+
+	// ---------------------------------------------------------------------
+	// Shared high/low watermarks (`super::watermarks`).
+	//
+	// The ratios are process-global (`OnceLock`, seeded once from
+	// `FAST_TIER_HIGH_WATERMARK` / `FAST_TIER_LOW_WATERMARK`), so these tests
+	// cannot set the env vars for themselves without racing every other test in
+	// the binary. They compute their expectations from `watermarks::high()` /
+	// `watermarks::low()` instead, and therefore hold at any configured ratio
+	// pair -- including the `1.0` / `1.0` setting that restores the original
+	// drain-to-the-ceiling behaviour.
+	// ---------------------------------------------------------------------
+
+	#[test]
+	fn usage_just_below_the_high_watermark_does_not_trigger_a_pass() {
+		const CAPACITY: CacheSize = 1_000;
+
+		let high = watermarks::high_bytes(CAPACITY);
+		let mut stack = LruHybridStack::new(CAPACITY);
+
+		// Fill to exactly the high watermark in 1-byte objects. The trigger is
+		// strict (`fast_used > high_bytes`), so sitting *on* the watermark --
+		// and every byte below it -- must demote nothing.
+		for key in 1..=high {
+			stack.insert(key, 1);
+			assert!(
+				stack.drain_tier_migrations().is_empty(),
+				"demoted at {} bytes, below the high watermark of {}",
+				key,
+				high,
+			);
+		}
+
+		assert_eq!(stack.fast_bytes_used(), high);
+		assert_eq!(stack.slow_bytes_used(), 0);
+		assert_eq!(stack.fast_object_count(), high as usize);
+		assert_eq!(stack.slow_object_count(), 0);
+	}
+
+	#[test]
+	fn usage_above_the_high_watermark_triggers_a_pass() {
+		const CAPACITY: CacheSize = 1_000;
+
+		let high = watermarks::high_bytes(CAPACITY);
+		let mut stack = LruHybridStack::new(CAPACITY);
+
+		for key in 1..=high {
+			stack.insert(key, 1);
+		}
+		drain(&mut stack);
+		assert_eq!(stack.fast_bytes_used(), high);
+
+		// The very first byte past the watermark fires the pass.
+		stack.insert(high + 1, 1);
+		let migrations = drain(&mut stack);
+
+		assert!(!migrations.is_empty());
+		assert!(migrations.iter().all(|(_, tier)| *tier == Tier::Slow));
+		assert_eq!(migrations.first(), Some(&(1, Tier::Slow)));
+	}
+
+	#[test]
+	fn a_triggered_pass_drains_to_the_low_watermark_not_the_ceiling() {
+		const CAPACITY: CacheSize = 1_000;
+
+		let high = watermarks::high_bytes(CAPACITY);
+		let low = watermarks::low_bytes(CAPACITY);
+		let mut stack = LruHybridStack::new(CAPACITY);
+
+		for key in 1..=high {
+			stack.insert(key, 1);
+		}
+		drain(&mut stack);
+
+		stack.insert(high + 1, 1);
+		let migrations = drain(&mut stack);
+
+		// 1-byte objects, so the drain lands exactly on the low watermark
+		// rather than merely somewhere at or below it.
+		assert_eq!(stack.fast_bytes_used(), low);
+		assert!(stack.fast_bytes_used() <= watermarks::low_bytes(CAPACITY));
+
+		// Draining back to the ceiling would have demoted exactly one object
+		// and left the tier at `high`; the low watermark instead demotes the
+		// whole `high - low` band in a single pass.
+		assert_eq!(migrations.len() as CacheSize, high + 1 - low);
+
+		if low < high {
+			assert!(stack.fast_bytes_used() < high);
+			assert!(stack.fast_bytes_used() < CAPACITY);
+			assert!(migrations.len() > 1);
+		}
+	}
+
+	#[test]
+	fn counters_stay_consistent_across_a_watermark_pass() {
+		const CAPACITY: CacheSize = 1_000;
+
+		let high = watermarks::high_bytes(CAPACITY);
+		let low = watermarks::low_bytes(CAPACITY);
+		let total = high + 1;
+
+		let mut stack = LruHybridStack::new(CAPACITY);
+
+		for key in 1..=total {
+			stack.insert(key, 1);
+		}
+		let migrations = drain(&mut stack);
+
+		let demoted = migrations.len() as CacheSize;
+
+		// Byte counters: every inserted byte is accounted to exactly one tier,
+		// and the split matches the number of demotions the pass emitted.
+		assert_eq!(stack.fast_bytes_used(), low);
+		assert_eq!(stack.slow_bytes_used(), demoted);
+		assert_eq!(stack.fast_bytes_used() + stack.slow_bytes_used(), total);
+
+		// Object counts: 1-byte objects, so each count equals its tier's bytes,
+		// and together they cover every tracked key exactly once.
+		assert_eq!(stack.fast_object_count() as CacheSize, low);
+		assert_eq!(stack.slow_object_count() as CacheSize, demoted);
+		assert_eq!(stack.fast_object_count() + stack.slow_object_count(), total as usize);
+		assert_eq!(stack.len(), total as usize);
+
+		// Per-key tiers agree with the counters: the demoted keys are exactly
+		// the LRU-end prefix, and nothing was dropped or double-counted.
+		for (key, tier) in &migrations {
+			assert_eq!(stack.tier_of(*key), Some(*tier));
+		}
+
+		let fast_keys = (1..=total).filter(|key| stack.tier_of(*key) == Some(Tier::Fast)).count();
+		let slow_keys = (1..=total).filter(|key| stack.tier_of(*key) == Some(Tier::Slow)).count();
+
+		assert_eq!(fast_keys, stack.fast_object_count());
+		assert_eq!(slow_keys, stack.slow_object_count());
 	}
 
 	#[test]

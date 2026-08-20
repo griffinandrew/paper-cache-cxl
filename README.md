@@ -92,6 +92,45 @@ Unlike simple metadata tracking, this implementation maintains **two physical co
 
 This ensures hot objects benefit from DRAM speed while maintaining data durability in PMEM.
 
+### Migration Counters vs Physical Copies
+
+The hybrid stats (`*_hybrid_stats()`'s `demotions` / `promotions`, and the
+`MIGSTATS` instrumentation) count **tier decisions made by the policy stack**,
+not physical byte copies. The two are normally identical, but they are not the
+same quantity, and the distinction matters when reading the numbers.
+
+A migration is emitted whenever a stack changes an object's tier tag. The
+worker then asks the migrate closure to move the bytes -- and the closure
+returns `None`, skipping the copy, when the value is **already** in the
+requested tier. That happens because the API thread chooses a placement of its
+own: `PaperCache::set()` consults each variant's `HybridPolicy::admission_tier`
+and builds the value with `TieredBuffer::new_fast` or `new_slow` accordingly,
+so an object can already be where the stack is about to say it should be.
+
+Consequences when interpreting stats:
+
+- **Counters lead the copies.** With the migration queue enabled
+  (`MIGRATION_QUEUE_THREADS` non-zero) the copies are applied asynchronously by
+  a pool, so a mid-run snapshot reports decisions that have been made but not
+  yet physically performed. They converge once the queue drains; `flush()`
+  forces that.
+- **A persistent gap is a defect signal, not noise.** If the decision count
+  exceeds the copies performed, some stack is emitting migrations for objects
+  already in the target tier. That is wasted work in every build that predates
+  the `Option`-returning closure, and silent in all of them.
+  `LfuHybridStack` did exactly this on every latched admission -- 445,465,067
+  migrations against ~448M sets on cluster12, roughly 99% of its reported
+  demotions -- because `admission_tier` already returned `Tier::Slow` and built
+  the bytes in PMEM, while the stack emitted a `Tier::Slow` migration anyway.
+  Any `demotions` figure for `lfu_hybrid_cache` collected before that fix is
+  inflated by that factor and is not comparable with other variants or with
+  later runs.
+- **Declined migrations are legitimate, not errors.** `TwoQHybridStack` reaches
+  this case by design under a lookaside workload: `admission_tier` returns
+  `Fast` for a re-set (correct -- the key is now most-recently-used), so the
+  value is already in DRAM by the time `touch_main_fast` emits its promotion.
+  The decision is real and is counted; the copy is correctly skipped.
+
 ## Feature Flags for Memory Tier Configuration
 
 PaperCache provides fine-grained control over memory placement through feature flags:

@@ -2215,10 +2215,26 @@ where
 		// preserve byte length exactly: both `status.base_used_size` and
 		// the active stack's own per-key size bookkeeping assume a
 		// migration never changes an object's accounted size.
-		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> TieredBuffer + Send + Sync> =
-			Box::new(|buffer, tier| match tier {
-				Tier::Fast => TieredBuffer::new_fast(buffer.as_ref()),
-				Tier::Slow => TieredBuffer::new_slow(buffer.as_ref()),
+		// Returns `None` when the value is already in the requested tier, in
+		// which case the worker skips the swap entirely.
+		//
+		// This is the only place the check can live: the worker is generic
+		// over `V` and cannot ask an arbitrary value which tier it occupies,
+		// which is why a stack emitting a migration for an already-correctly
+		// -placed object used to cost a full allocate-and-memcpy that produced
+		// a byte-identical object at a new address. `LfuHybridStack` did
+		// exactly that on every latched admission (445,465,067 migrations
+		// against ~448M sets on cluster12 before it was fixed at source), and
+		// `TwoQHybridStack` still reaches this case legitimately under a
+		// lookaside workload: `admission_tier` returns `Fast` for a re-set --
+		// correct, since the key is now MRU -- so `set()` has already built
+		// the bytes in DRAM by the time `touch_main_fast` emits its
+		// `(key, Tier::Fast)` promotion.
+		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> Option<TieredBuffer> + Send + Sync> =
+			Box::new(|buffer, tier| match (tier, buffer.is_fast()) {
+				(Tier::Fast, true) | (Tier::Slow, false) => None,
+				(Tier::Fast, false) => Some(TieredBuffer::new_fast(buffer.as_ref())),
+				(Tier::Slow, true) => Some(TieredBuffer::new_slow(buffer.as_ref())),
 			});
 
 		let (worker_fanout, worker_handles) = WorkerFanout::new_with_tier_migration(
@@ -3138,10 +3154,26 @@ where
 
 		// Same byte-length-preserving contract `new_hybrid`'s `migrate`
 		// closure documents.
-		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> TieredBuffer + Send + Sync> =
-			Box::new(|buffer, tier| match tier {
-				Tier::Fast => TieredBuffer::new_fast(buffer.as_ref()),
-				Tier::Slow => TieredBuffer::new_slow(buffer.as_ref()),
+		// Returns `None` when the value is already in the requested tier, in
+		// which case the worker skips the swap entirely.
+		//
+		// This is the only place the check can live: the worker is generic
+		// over `V` and cannot ask an arbitrary value which tier it occupies,
+		// which is why a stack emitting a migration for an already-correctly
+		// -placed object used to cost a full allocate-and-memcpy that produced
+		// a byte-identical object at a new address. `LfuHybridStack` did
+		// exactly that on every latched admission (445,465,067 migrations
+		// against ~448M sets on cluster12 before it was fixed at source), and
+		// `TwoQHybridStack` still reaches this case legitimately under a
+		// lookaside workload: `admission_tier` returns `Fast` for a re-set --
+		// correct, since the key is now MRU -- so `set()` has already built
+		// the bytes in DRAM by the time `touch_main_fast` emits its
+		// `(key, Tier::Fast)` promotion.
+		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> Option<TieredBuffer> + Send + Sync> =
+			Box::new(|buffer, tier| match (tier, buffer.is_fast()) {
+				(Tier::Fast, true) | (Tier::Slow, false) => None,
+				(Tier::Fast, false) => Some(TieredBuffer::new_fast(buffer.as_ref())),
+				(Tier::Slow, true) => Some(TieredBuffer::new_slow(buffer.as_ref())),
 			});
 
 		let (worker_fanout, worker_handles) = WorkerFanout::new_with_tier_migration(
