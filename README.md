@@ -257,7 +257,7 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | `PARALLEL_MIGRATION_THREADS` | `4` | Pool size if the above is enabled. |
 | `FAST_TIER_HIGH_WATERMARK` | `0.98` | Fast-tier fraction at which demotion triggers. |
 | `FAST_TIER_LOW_WATERMARK` | `0.95` | Fraction a triggered demotion pass drains down to. Set both to `1.0` to restore drain-to-the-ceiling. |
-| `NUMA_ARENAS_PER_NODE` | `4` | jemalloc arenas per node (max 32). A starting point, not a swept value. |
+| `NUMA_ARENAS_PER_NODE` | `8` | jemalloc arenas per node (clamped to 32). Swept on cluster12: a single arena costs 5% of SET latency at one client and 27% at sixteen, while 8→32 buys 1–2%, inside the run-to-run spread. |
 | `PAPER_NUMA_SLOW_TCACHE` | off | Per-thread cache for slow-tier allocations. Correct but measured not worth enabling. |
 | `DRAM_OVERHEAD_RESIDENT_FACTOR` | per-config constant | Recalibrates the per-object DRAM overhead reservation. Recalibrate when the workload or allocator changes. |
 | `PAPER_CACHE_EVICTION_STACK_CAPACITY` | — | Pre-sizes the eviction stack's backing collections. |
