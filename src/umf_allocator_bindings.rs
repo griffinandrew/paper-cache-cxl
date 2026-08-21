@@ -43,8 +43,6 @@ unsafe extern "C" {
     /// way jemalloc's `stats.allocated`/`active` do.
     pub fn umf_live_usable(numa_node: c_int) -> usize;
 
-    /// Empties TBB's per-thread and large-object caches. Diagnostic.
-    pub fn umf_clean_all_buffers() -> c_int;
     pub fn umf_allocator_prewarm(numa_node: c_int, bytes: usize, chunk: usize) -> c_int;
     pub fn check_tier(ptr: *mut c_void) -> c_int;  // now returns node id, was bool-ish
 

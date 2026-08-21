@@ -1009,44 +1009,6 @@ active/allocated={:.4} resident/active={:.4} resident/allocated={:.4}",
 	))
 }
 
-/// Empties TBB's internal caches and reports resident memory either side.
-///
-/// Diagnostic for locating TBB's retention. `KeepAllMemory=0` only makes the
-/// pool return memory to the provider; if the bulk of the excess is instead
-/// held in per-thread block caches above the pool, this is what releases it,
-/// and RSS should fall sharply. If RSS barely moves, the memory is not in
-/// those caches and the excess is slab occupancy instead.
-pub fn umf_purge_and_report() -> String {
-	fn rss_kb() -> u64 {
-		std::fs::read_to_string("/proc/self/status")
-			.ok()
-			.and_then(|status| {
-				status
-					.lines()
-					.find(|line| line.starts_with("VmRSS:"))
-					.and_then(|line| line.split_whitespace().nth(1))
-					.and_then(|value| value.parse().ok())
-			})
-			.unwrap_or(0)
-	}
-
-	let before = rss_kb();
-	let result = unsafe { allocator::allocator_bindings_clean_all_buffers() };
-
-	// The release is asynchronous enough that reading immediately understates
-	// it; this is a diagnostic path, so a short settle is acceptable.
-	std::thread::sleep(std::time::Duration::from_millis(500));
-	let after = rss_kb();
-
-	let freed = before.saturating_sub(after);
-
-	format!(
-		"TBBPURGE rss_before_kb={before} rss_after_kb={after} freed_kb={freed} \
-freed_gb={:.2} cmd_result={result}",
-		freed as f64 / 1048576.0,
-	)
-}
-
 /// UMF/TBB node-0 accounting, the counterpart to [`jemalloc_stats`] for the
 /// default build.
 ///

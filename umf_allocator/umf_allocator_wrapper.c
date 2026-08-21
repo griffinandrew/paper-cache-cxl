@@ -1,5 +1,3 @@
-/* RTLD_DEFAULT (used by umf_clean_all_buffers) is a GNU extension. */
-#define _GNU_SOURCE
 
 
 
@@ -7,7 +5,6 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <dlfcn.h>
 #include <unistd.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -353,49 +350,6 @@ static void track_usable(umf_memory_pool_handle_t p, void *ptr, int numa_node, i
     } else {
         atomic_fetch_sub_explicit(&live_usable[numa_node], usable, memory_order_relaxed);
     }
-}
-
-/* TBB's own purge, reached directly rather than through UMF.
- *
- * `umfScalablePoolParamsSetKeepAllMemory(0)` governs only whether the pool
- * returns memory to the provider. TBB keeps per-thread block free-lists and a
- * large-object cache ABOVE the pool, which that flag never reaches -- and this
- * workload allocates on the API thread while freeing on the worker and
- * migration consumers, so freed blocks accumulate in the freeing thread's
- * cache and are never handed back to the allocating one. This is the only call
- * that empties them.
- *
- * Returns TBBMALLOC_OK (0) if anything was released, TBBMALLOC_NO_EFFECT (1)
- * if there was nothing to release. Declared locally rather than including
- * <tbb/scalable_allocator.h> so the wrapper keeps building without TBB headers
- * present; the symbol is exported by libtbbmalloc, which UMF already links. */
-#define TBB_CMD_CLEAN_ALL_BUFFERS 0
-
-int umf_clean_all_buffers(void) {
-    /* Resolved at run time rather than linked: the binary links -lumf, not
-     * -ltbbmalloc -- UMF loads TBB itself -- so the symbol is present in the
-     * process but not on the link line. RTLD_DEFAULT searches everything
-     * already loaded. Returns -1 if TBB is not the backing pool. */
-    static int (*cmd)(int, void *) = NULL;
-    static atomic_int resolved = 0;
-
-    if (!atomic_load_explicit(&resolved, memory_order_acquire)) {
-        /* RTLD_DEFAULT does NOT work here: libumf dlopens libtbbmalloc
-         * without RTLD_GLOBAL, so TBB's symbols are loaded but not in the
-         * global namespace. RTLD_NOLOAD returns a handle to the already-mapped
-         * library without loading a second copy -- which matters, since a
-         * fresh copy would have its own empty caches and report nothing. */
-        void *tbb = dlopen("libtbbmalloc.so.2", RTLD_LAZY | RTLD_NOLOAD);
-
-        if (tbb != NULL) {
-            cmd = (int (*)(int, void *))dlsym(tbb, "scalable_allocation_command");
-        }
-
-        atomic_store_explicit(&resolved, 1, memory_order_release);
-    }
-
-    if (!cmd) return -1;
-    return cmd(TBB_CMD_CLEAN_ALL_BUFFERS, 0);
 }
 
 void *umf_alloc(int numa_node, size_t size, size_t align) {
