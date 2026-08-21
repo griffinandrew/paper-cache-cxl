@@ -45,7 +45,7 @@ impl crate::hybrid_policy::HybridPolicy for S3FifoGhostLazyDemotionFastAdmission
 	}
 
 	fn stats_from_status(status: &crate::status::AtomicStatus) -> S3FifoGhostLazyDemotionFastAdmissionHybridStats {
-		status.s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stats()
+		status.hybrid_stats()
 	}
 
 	fn admission_tier<K>(

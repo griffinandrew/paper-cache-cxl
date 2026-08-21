@@ -67,7 +67,7 @@ impl crate::hybrid_policy::HybridPolicy for LfuHybridPolicy {
 	}
 
 	fn stats_from_status(status: &crate::status::AtomicStatus) -> LfuHybridStats {
-		status.lfu_hybrid_stats()
+		status.hybrid_stats()
 	}
 
 	fn admission_tier<K>(
@@ -94,7 +94,7 @@ impl crate::hybrid_policy::HybridPolicy for LfuHybridPolicy {
 
 			// Brand-new key: fast unless the admission latch has closed --
 			// see `LfuHybridStack`'s module doc.
-			None if status.lfu_hybrid_admission_latched() => crate::Tier::Slow,
+			None if status.hybrid_admission_latched() => crate::Tier::Slow,
 			None => crate::Tier::Fast,
 		}
 	}

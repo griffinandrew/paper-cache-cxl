@@ -8,7 +8,7 @@
 //! Integration tests for the `s3_fifo_ghost_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test s3_fifo_ghost_hybrid_cache_integration --features s3_fifo_ghost_hybrid_cache
+//!   cargo +nightly test --test hybrid_cache_integration --features s3_fifo_ghost_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture and admission/
 //! demotion/promotion/eviction rules as `s3_fifo_hybrid_cache` — see that
@@ -18,7 +18,7 @@
 //! ghost queue.
 
 #[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
-mod s3_fifo_ghost_hybrid_cache_tests {
+mod hybrid_cache_tests {
     use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -76,7 +76,7 @@ mod s3_fifo_ghost_hybrid_cache_tests {
         let promoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast));
         assert!(promoted, "key should have promoted to the fast tier after a re-access");
 
-        let stats = cache.s3_fifo_ghost_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.promotions >= 1);
     }
 
@@ -144,13 +144,13 @@ mod s3_fifo_ghost_hybrid_cache_tests {
         cache.get(&1u32).expect("get should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
 
-        let promotions_before = cache.s3_fifo_ghost_hybrid_stats().promotions;
+        let promotions_before = cache.hybrid_stats().promotions;
 
         cache.get(&1u32).expect("get should succeed");
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-        assert_eq!(cache.s3_fifo_ghost_hybrid_stats().promotions, promotions_before);
+        assert_eq!(cache.hybrid_stats().promotions, promotions_before);
     }
 
     #[test]
@@ -177,7 +177,7 @@ mod s3_fifo_ghost_hybrid_cache_tests {
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
 
         // Deterministic trigger, not a filler set() -- see
-        // s3_fifo_hybrid_cache_integration.rs's equivalent test for why.
+        // hybrid_cache_integration.rs's equivalent test for why.
         cache.resize(180).expect("resize should succeed");
 
         let survived_and_promoted = wait_until(MIGRATION_TIMEOUT, || {
@@ -251,7 +251,7 @@ mod s3_fifo_ghost_hybrid_cache_tests {
         }
 
         let evicted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.s3_fifo_ghost_hybrid_stats().evictions >= 1
+            cache.hybrid_stats().evictions >= 1
         });
         assert!(evicted, "at least one terminal eviction should have occurred");
 

@@ -8,10 +8,10 @@
 //! Integration tests for the `two_q_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test two_q_hybrid_cache_integration --features two_q_hybrid_cache
+//!   cargo +nightly test --test hybrid_cache_integration --features two_q_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture as
-//! `lru_hybrid_cache_integration.rs`/`lfu_hybrid_cache_integration.rs` —
+//! `hybrid_cache_integration.rs`/`hybrid_cache_integration.rs` —
 //! `tier_of` reads the tier directly off the single object map.
 //!
 //! The biggest structural difference from the other two hybrids: admission
@@ -21,7 +21,7 @@
 //! This means, unlike the other two integration test files, **every** test
 //! here pays (or waits out) the one-time PMEM pool warm-up cost — there is
 //! no "fast-tier-only path" that avoids touching PMEM at all. See
-//! `lru_hybrid_cache_integration.rs`'s module doc for the ~45s warm-up
+//! `hybrid_cache_integration.rs`'s module doc for the ~45s warm-up
 //! caveat itself; `ensure_pmem_allocator_warm` below is the same pattern.
 //!
 //! What is tested:
@@ -41,7 +41,7 @@
 //!   * Zero/invalid/tiny fast-tier-size and `k_in` edge cases
 
 #[cfg(feature = "two_q_hybrid_cache")]
-mod two_q_hybrid_cache_tests {
+mod hybrid_cache_tests {
     use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -119,7 +119,7 @@ mod two_q_hybrid_cache_tests {
         });
         assert!(promoted, "key should have promoted to the fast tier after a re-access");
 
-        let stats = cache.two_q_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.promotions >= 1);
     }
 
@@ -148,7 +148,7 @@ mod two_q_hybrid_cache_tests {
         assert!(evicted, "key 1 should have aged out of the FIFO queue and been evicted");
         assert_eq!(cache.tier_of(&1u32), None);
 
-        let stats = cache.two_q_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.evictions >= 1);
     }
 
@@ -343,7 +343,7 @@ mod two_q_hybrid_cache_tests {
         }
 
         let evicted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.two_q_hybrid_stats().evictions >= 1
+            cache.hybrid_stats().evictions >= 1
         });
         assert!(evicted, "at least one terminal eviction should have occurred");
 

@@ -78,9 +78,11 @@ tiers.
 
 Because each design defines its own inherent `impl<K, S> PaperCache<K, TieredBuffer, S>`
 block, and two such blocks cannot coexist for one concrete type, **the hybrid features are
-mutually exclusive**. `lib.rs` names all 153 conflicting pairs -- every pair of the 18 designs
--- in its own `compile_error!` guard, so enabling two surfaces as a sentence naming both rather
-than as a duplicate-definition error deep in a generic impl.
+mutually exclusive**, and `lib.rs` carries a `compile_error!` guard per conflicting pair so that
+enabling two surfaces as a sentence naming both rather than as a duplicate-definition error deep
+in a generic impl. 152 of the 153 pairs are covered. The exception is
+`fifo_hybrid_cache` + `two_q_fast_admission_hybrid_cache`: its guard's `cfg` carries a spurious
+third feature, so that combination compiles past it and fails with `E0428`/`E0592` instead.
 
 ### Who decides, and who moves the bytes
 
@@ -100,8 +102,11 @@ set(k, v) ──WorkerEvent──> policy stack decides tiers
 - **`PolicyWorker`** owns the active policy stack and is the only thing that mutates it. It
   decides which keys should change tier and runs terminal evictions when `used_size()` exceeds
   `max_size`.
-- **Ordering.** Migrations are applied demotions-before-promotions, so the fast tier has
-  already given back space before anything tries to move into it.
+- **Ordering.** Demotions are applied before promotions. On the inline path
+  (`MIGRATION_QUEUE_THREADS=0`) that is a physical barrier: the fast tier has given back space
+  before anything moves into it. With the queue enabled it is an ordering of *enqueues* — per-key
+  order is guaranteed by the hash sharding, but a promotion for one key can be physically applied
+  before an unrelated key's demotion has run.
 - **Watermarks.** Demotion triggers at `FAST_TIER_HIGH_WATERMARK` of the effective fast-tier
   budget and then drains in one pass down to `FAST_TIER_LOW_WATERMARK` (0.98 / 0.95), rather
   than trimming back to exactly the ceiling. Draining to the ceiling pinned the tier at 100%
@@ -157,8 +162,9 @@ Consequences when interpreting stats:
 - **Counters lead the copies.** With the migration queue enabled (the default) the copies are
   applied asynchronously by the consumer pool, so a mid-run snapshot reports decisions that
   have been made but not yet physically performed. They converge once the queue drains. There
-  is no public flush — `MigrationQueue::flush` exists but is `#[cfg(test)]`-only, so that tests
-  can assert on buffer contents deterministically. Set `MIGRATION_QUEUE_THREADS=0` if you need
+  is no public flush — `MigrationQueue` is crate-internal (`mod worker` is private), and the only
+  call to its `flush` is `#[cfg(test)]`-gated so test assertions on buffer contents stay
+  deterministic. Set `MIGRATION_QUEUE_THREADS=0` if you need
   a snapshot with no in-flight window at all.
 - **The four tier gauges are polled, not live.** `fast_objects`/`slow_objects`/
   `fast_bytes_used`/`slow_bytes_used` are republished by `PolicyWorker::refresh_tier_gauges`
@@ -191,7 +197,7 @@ two. Any further argument is that design's own tuning knob.
 | `lru_hybrid_cache` | `new(max_size, fast_tier_size)` | One LRU queue, segmented by byte budget |
 | `lfu_hybrid_cache` | `new(max_size, fast_tier_size)` | Frequency-ordered, admission gated on capacity |
 | `fifo_hybrid_cache` | `new(max_size, fast_tier_size)` | Insertion order; no promotion at all |
-| `lru_sized_hybrid_cache` | `new(max_size, small_fast, large_fast, size_threshold)` | LRU, with each tier's bookkeeping split small/large by object size |
+| `lru_sized_hybrid_cache` | `new(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold)` | LRU, with each tier's bookkeeping split small/large by object size |
 | `lru_lfu_hybrid_cache` | `new(max_size, fast_tier_size, promote_k)` | LRU fast tier, LFU slow tier — promotion is a fixed access-count threshold |
 
 ### 2Q family — a one-access FIFO queue feeding a segmented main queue
@@ -222,7 +228,7 @@ much as they add.
 | `s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache` | Drops the ghost queue; aged-out keys are reprieved into the slow tier |
 | `s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache` | Drops the midpoint checkpoint — measured bit-identical to no check |
 | `s3_fifo_lazy_demotion_reprieve_hybrid_cache` | Returns admission to the **slow** tier, keeping reprieve, so the splice moves no bytes at all |
-| `s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache` | Replaces the sampled midpoint with a real two-segment slow tier |
+| `s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache` | *(branches from the midpoint-reprieve row, not the one above)* Replaces the sampled midpoint cursor with a real two-segment slow tier, so every crossing object's bit is checked |
 
 The two midpoint variants are kept as recorded negative results: an approximate sampled cursor
 and a real segment boundary both measured bit-identical hit rates to having no check at all,
@@ -259,7 +265,7 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | `FAST_TIER_LOW_WATERMARK` | `0.95` | Fraction a triggered demotion pass drains down to. Set both to `1.0` to restore drain-to-the-ceiling. |
 | `NUMA_ARENAS_PER_NODE` | `8` | jemalloc arenas per node (clamped to 32). Swept on cluster12: a single arena costs 5% of SET latency at one client and 27% at sixteen, while 8→32 buys 1–2%, inside the run-to-run spread. |
 | `PAPER_NUMA_SLOW_TCACHE` | off | Per-thread cache for slow-tier allocations. Correct but measured not worth enabling. |
-| `DRAM_OVERHEAD_RESIDENT_FACTOR` | per-config constant | Recalibrates the per-object DRAM overhead reservation. Recalibrate when the workload or allocator changes. |
+| `DRAM_OVERHEAD_RESIDENT_FACTOR` | `1.12` | Recalibrates the per-object DRAM overhead reservation. Recalibrate when the workload or allocator changes. |
 | `PAPER_CACHE_EVICTION_STACK_CAPACITY` | — | Pre-sizes the eviction stack's backing collections. |
 
 ## Testing
@@ -306,8 +312,9 @@ stacks in `src/worker/policy/policy_stack/` each carry their algorithm's derivat
 
 ## Legacy: the copy-based tiering manager
 
-`src/tiering/` implements an older, unrelated design, still reachable behind
-`enable_tiering_manager` / `tiering` / `multitiering`. It is a *hotness-threshold, copy-based*
+`src/tiering/` implements an older, unrelated design, still reachable behind `tiering` /
+`multitiering` (or `enable_tiering_manager` together with `key_value_pmem` -- on its own that
+feature implies nothing and the module is not compiled at all). It is a *hotness-threshold, copy-based*
 scheme: PMEM is the permanent source of truth, and an object accessed at least
 `hotness_threshold` times gets a **second, physical copy** placed in a DRAM side-cache, kept
 consistent on write and dropped on demotion. Under `hashtable_tiering` it adds a third,

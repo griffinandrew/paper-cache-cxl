@@ -8,7 +8,7 @@
 //! Integration tests for the `lru_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test lru_hybrid_cache_integration --features lru_hybrid_cache
+//!   cargo +nightly test --test hybrid_cache_integration --features lru_hybrid_cache
 //!
 //! This feature is **one** `PaperCache<K, TieredBuffer>` instance (not two
 //! composed `PaperCache`s), so `tier_of` reads the tier directly off the
@@ -22,7 +22,7 @@
 //!     confirms it is gone from the slow tier
 //!   * TTL set before a demotion/promotion is still correctly enforced after
 //!   * Terminal eviction only ever removes the slow-tier LRU tail and is
-//!     counted in `lru_hybrid_stats().evictions`
+//!     counted in `hybrid_stats().evictions`
 //!   * `set_fast_tier_size` takes effect at runtime
 //!   * Zero/invalid/tiny fast-tier-size edge cases
 //!
@@ -42,7 +42,7 @@
 //! immediately once the allocator is warm.
 
 #[cfg(feature = "lru_hybrid_cache")]
-mod lru_hybrid_cache_tests {
+mod hybrid_cache_tests {
     use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -139,7 +139,7 @@ mod lru_hybrid_cache_tests {
         // Value survives the physical move intact.
         assert_eq!(cache.get(&1u32).unwrap(), value(0xA1));
 
-        let stats = cache.lru_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.demotions >= 1);
     }
 
@@ -174,7 +174,7 @@ mod lru_hybrid_cache_tests {
         // the demotion test, checked in the other direction.
         assert_ne!(cache.tier_of(&1u32), Some(Tier::Slow));
 
-        let stats = cache.lru_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.promotions >= 1);
     }
 
@@ -323,14 +323,14 @@ mod lru_hybrid_cache_tests {
         }
 
         let evicted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.lru_hybrid_stats().evictions >= 1
+            cache.hybrid_stats().evictions >= 1
         });
         assert!(evicted, "at least one terminal eviction should have occurred");
 
         // Give the worker a moment to settle so the count below is stable.
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let stats = cache.lru_hybrid_stats();
+        let stats = cache.hybrid_stats();
         let present = (1u32..=10).filter(|key| cache.has(key)).count() as u64;
 
         // Every key is accounted for exactly once: either still present
@@ -378,7 +378,7 @@ mod lru_hybrid_cache_tests {
         // The shared-metadata reservation for 300 objects far exceeds 2 KB, so
         // some objects must have been demoted to slow.
         let demoted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.lru_hybrid_stats().demotions >= 1
+            cache.hybrid_stats().demotions >= 1
         });
         assert!(demoted, "shared-metadata reservation should force demotions");
 
@@ -387,7 +387,7 @@ mod lru_hybrid_cache_tests {
         // counter — which only `max_size` pressure increments — stays 0.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let stats = cache.lru_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.evictions, 0, "the DRAM cap must demote, never evict");
 
         let present = (1u32..=300).filter(|key| cache.has(key)).count();
@@ -552,7 +552,7 @@ mod lru_hybrid_cache_tests {
     /// the same code path can be run at different scales in separate,
     /// uncontaminated processes for comparison:
     ///   REPRO_OBJECT_COUNT=50000 cargo +nightly test --release \
-    ///     --test lru_hybrid_cache_integration --features lru_hybrid_cache \
+    ///     --test hybrid_cache_integration --features lru_hybrid_cache \
     ///     repro_real_dram_usage_at_scale -- --ignored --nocapture
     ///
     /// Not part of the default suite (`#[ignore]` -- allocates real value
@@ -621,7 +621,7 @@ mod lru_hybrid_cache_tests {
         let mut last_print = std::time::Instant::now();
 
         let settled = wait_until(std::time::Duration::from_secs(600), || {
-            let stats = cache.lru_hybrid_stats();
+            let stats = cache.hybrid_stats();
             let status = cache.status().expect("status should be available");
             let processed = stats.fast_objects + stats.slow_objects;
 
@@ -645,7 +645,7 @@ mod lru_hybrid_cache_tests {
         // further moment before measuring real memory.
         std::thread::sleep(std::time::Duration::from_secs(5));
 
-        let stats = cache.lru_hybrid_stats();
+        let stats = cache.hybrid_stats();
         let status = cache.status().expect("status should be available");
         let (settled_node0_mb, settled_node1_mb) = read_own_numa_usage_mb();
 
@@ -662,7 +662,7 @@ mod lru_hybrid_cache_tests {
             "[n={object_count}] DECAYED (+30s more): node0={decayed_node0_mb:.1} MB  node1={decayed_node1_mb:.1} MB"
         );
 
-        println!("[n={object_count}] === lru_hybrid_stats ===");
+        println!("[n={object_count}] === hybrid_stats ===");
         println!(
             "[n={object_count}] fast_objects={} slow_objects={} fast_bytes_used={} slow_bytes_used={} promotions={} demotions={} evictions={}",
             stats.fast_objects, stats.slow_objects, stats.fast_bytes_used, stats.slow_bytes_used,
@@ -747,7 +747,7 @@ mod lru_hybrid_cache_tests {
         }
 
         let settled = wait_until(std::time::Duration::from_secs(60), || {
-            let stats = cache.lru_hybrid_stats();
+            let stats = cache.hybrid_stats();
             let status = cache.status().expect("status should be available");
             let processed = stats.fast_objects + stats.slow_objects;
             println!(
@@ -758,7 +758,7 @@ mod lru_hybrid_cache_tests {
         });
         assert!(settled, "worker should process every inserted object within 60s");
 
-        let stats = cache.lru_hybrid_stats();
+        let stats = cache.hybrid_stats();
         println!(
             "FINAL: fast_objects={} slow_objects={} demotions={} fast_bytes_used={} slow_bytes_used={}",
             stats.fast_objects, stats.slow_objects, stats.demotions, stats.fast_bytes_used, stats.slow_bytes_used,
@@ -776,7 +776,7 @@ mod lru_hybrid_cache_tests {
     /// `WorkerEvent::Expire`, the policy stack went on ranking every reaped
     /// key and went on counting its bytes toward `fast_used` -- so
     /// `status().num_objects()` fell to 0 while
-    /// `lru_hybrid_stats().fast_bytes_used` stayed pinned at its pre-expiry
+    /// `hybrid_stats().fast_bytes_used` stayed pinned at its pre-expiry
     /// value. On an idle cache that never self-corrected: the only thing that
     /// dropped a phantom key was it reaching the eviction tail, and nothing
     /// evicts when `used_size()` is already 0.
@@ -816,11 +816,11 @@ mod lru_hybrid_cache_tests {
         // The gauges are published once per worker poll, so wait for the
         // admissions to be accounted for rather than assuming they are.
         let admitted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.lru_hybrid_stats().fast_objects == KEYS as u64
+            cache.hybrid_stats().fast_objects == KEYS as u64
         });
         assert!(admitted, "all {KEYS} keys should be accounted for in the fast tier");
 
-        let before = cache.lru_hybrid_stats();
+        let before = cache.hybrid_stats();
         assert!(
             before.fast_bytes_used >= (KEYS as u64) * (VALUE_LEN as u64),
             "fast tier should be holding all {KEYS} values before expiry; got {}",
@@ -837,11 +837,11 @@ mod lru_hybrid_cache_tests {
         // The actual regression: the stack's own tier accounting has to
         // follow the reap.
         let cleared = wait_until(std::time::Duration::from_secs(10), || {
-            let stats = cache.lru_hybrid_stats();
+            let stats = cache.hybrid_stats();
             stats.fast_objects == 0 && stats.fast_bytes_used == 0
         });
 
-        let after = cache.lru_hybrid_stats();
+        let after = cache.hybrid_stats();
         assert!(
             cleared,
             "fast-tier gauges should clear after a TTL reap, but stayed at \
@@ -881,11 +881,11 @@ mod lru_hybrid_cache_tests {
         // The stack must be tracking the new object, not have dropped it on
         // the back of the previous incarnation's expiry.
         let tracked = wait_until(MIGRATION_TIMEOUT, || {
-            let stats = cache.lru_hybrid_stats();
+            let stats = cache.hybrid_stats();
             stats.fast_objects == 1 && stats.fast_bytes_used >= VALUE_LEN as u64
         });
 
-        let stats = cache.lru_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(
             tracked,
             "re-set key should be tracked in the fast tier; got fast_objects={} \

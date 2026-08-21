@@ -251,6 +251,14 @@ where
 	/// unconditionally then needs correcting), so they keep the default `0`
 	/// and their callers keep counting every `Tier::Slow` migration as a
 	/// demotion directly.
+	/// Whether `PolicyWorker` should count each applied `Tier::Slow`
+	/// migration as a demotion. The LFU-style design returns `false`: its
+	/// `Tier::Slow` entries are not always genuine demotions, and the true
+	/// count comes from [`Self::drain_demotions`] instead.
+	fn inline_demotion_accounting(&self) -> bool {
+		true
+	}
+
 	fn drain_demotions(&mut self) -> u64 {
 		0
 	}

@@ -68,7 +68,7 @@ impl crate::hybrid_policy::HybridPolicy for TwoQHybridPolicy {
 	}
 
 	fn stats_from_status(status: &crate::status::AtomicStatus) -> TwoQHybridStats {
-		status.two_q_hybrid_stats()
+		status.hybrid_stats()
 	}
 
 	fn admission_tier<K>(

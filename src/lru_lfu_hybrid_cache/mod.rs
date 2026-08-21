@@ -54,7 +54,7 @@ impl crate::hybrid_policy::HybridPolicy for LruLfuHybridPolicy {
 	}
 
 	fn stats_from_status(status: &crate::status::AtomicStatus) -> LruLfuHybridStats {
-		status.lru_lfu_hybrid_stats()
+		status.hybrid_stats()
 	}
 
 	/// A brand-new key is admitted to the fast tier; an **existing** key is

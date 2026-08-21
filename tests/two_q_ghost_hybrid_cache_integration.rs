@@ -8,7 +8,7 @@
 //! Integration tests for the `two_q_ghost_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test two_q_ghost_hybrid_cache_integration --features two_q_ghost_hybrid_cache
+//!   cargo +nightly test --test hybrid_cache_integration --features two_q_ghost_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture and admission/
 //! demotion/promotion/eviction rules as `two_q_hybrid_cache` — see that
@@ -17,7 +17,7 @@
 //! focuses on what's actually new here: the ghost queue.
 
 #[cfg(feature = "two_q_ghost_hybrid_cache")]
-mod two_q_ghost_hybrid_cache_tests {
+mod hybrid_cache_tests {
     use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -75,7 +75,7 @@ mod two_q_ghost_hybrid_cache_tests {
         let promoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast));
         assert!(promoted, "key should have promoted to the fast tier after a re-access");
 
-        let stats = cache.two_q_ghost_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.promotions >= 1);
     }
 
@@ -221,7 +221,7 @@ mod two_q_ghost_hybrid_cache_tests {
         }
 
         let evicted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.two_q_ghost_hybrid_stats().evictions >= 1
+            cache.hybrid_stats().evictions >= 1
         });
         assert!(evicted, "at least one terminal eviction should have occurred");
 

@@ -8,7 +8,7 @@
 //! Integration tests for the `lru_sized_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test lru_sized_hybrid_cache_integration --features lru_sized_hybrid_cache
+//!   cargo +nightly test --test hybrid_cache_integration --features lru_sized_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture as `lru_hybrid_cache`
 //! (see that feature's own integration test file for the base pattern this
@@ -18,7 +18,7 @@
 //! two independently-tracked segments ("small"/"large") by a configurable
 //! byte threshold, so tests here additionally check the granular
 //! `small_fast_objects`/`large_fast_objects`/`small_slow_objects`/
-//! `large_slow_objects` gauges on `lru_sized_hybrid_stats()`, not just the
+//! `large_slow_objects` gauges on `hybrid_stats()`, not just the
 //! combined `fast_objects`/`slow_objects` totals `lru_hybrid_cache` has.
 //!
 //! What is tested:
@@ -39,13 +39,13 @@
 //!   * Zero/invalid/tiny fast-tier-size edge cases
 //!
 //! All tier-crossing tests exercise the real `Hybrid`/UMF PMEM allocator --
-//! see `lru_hybrid_cache_integration.rs`'s module doc for the one-time
+//! see `hybrid_cache_integration.rs`'s module doc for the one-time
 //! ~45s pool warm-up this sandbox pays on first PMEM touch, and why
 //! `ensure_pmem_allocator_warm()` below forces that cost to be paid
 //! synchronously before any test's own timing-sensitive assertions begin.
 
 #[cfg(feature = "lru_sized_hybrid_cache")]
-mod lru_sized_hybrid_cache_tests {
+mod hybrid_cache_tests {
     use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -85,7 +85,7 @@ mod lru_sized_hybrid_cache_tests {
     // Size-classification threshold used throughout: values well below/above
     // this land unambiguously in the small/large segment regardless of the
     // small, fixed key/expiry overhead `overhead_manager.base_size` adds on
-    // top of raw value length (see `lru_hybrid_cache_integration.rs`'s
+    // top of raw value length (see `hybrid_cache_integration.rs`'s
     // `VALUE_LEN` comment for the equivalent reservation-vs-budget
     // reasoning this crate's hybrid-cache tests already established).
     const SIZE_THRESHOLD: u64 = 1_000;
@@ -149,7 +149,7 @@ mod lru_sized_hybrid_cache_tests {
         assert_eq!(cache.tier_of(&2u32), Some(Tier::Fast));
         assert_eq!(cache.get(&1u32).unwrap(), small_value(0xA1));
 
-        let stats = cache.lru_sized_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.demotions >= 1);
         assert_eq!(stats.large_slow_objects, 0);
     }
@@ -178,7 +178,7 @@ mod lru_sized_hybrid_cache_tests {
         assert_eq!(cache.tier_of(&2u32), Some(Tier::Fast));
         assert_eq!(cache.get(&1u32).unwrap(), large_value(0xA1));
 
-        let stats = cache.lru_sized_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.demotions >= 1);
         assert_eq!(stats.small_slow_objects, 0);
     }
@@ -207,7 +207,7 @@ mod lru_sized_hybrid_cache_tests {
         assert!(promoted, "key 1 should have promoted back to the fast tier");
         assert_ne!(cache.tier_of(&1u32), Some(Tier::Slow));
 
-        let stats = cache.lru_sized_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.promotions >= 1);
         assert_eq!(stats.small_fast_objects, 1); // back in the SMALL segment specifically
     }
@@ -223,14 +223,14 @@ mod lru_sized_hybrid_cache_tests {
 
         cache.set(1u32, &small_value(0xA1), None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-        assert!(wait_until(MIGRATION_TIMEOUT, || cache.lru_sized_hybrid_stats().small_fast_objects == 1));
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.hybrid_stats().small_fast_objects == 1));
 
         cache.set(1u32, &large_value(0xB2), None).expect("overwrite should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast)); // still fast, just a different segment
         assert_eq!(cache.get(&1u32).unwrap(), large_value(0xB2));
 
         let reclassified = wait_until(MIGRATION_TIMEOUT, || {
-            let stats = cache.lru_sized_hybrid_stats();
+            let stats = cache.hybrid_stats();
             stats.small_fast_objects == 0 && stats.large_fast_objects == 1
         });
         assert!(reclassified, "key 1 should have reclassified into the large segment");
@@ -238,7 +238,7 @@ mod lru_sized_hybrid_cache_tests {
 
     // ── TTL ───────────────────────────────────────────────────────────────
 
-    // See `lru_hybrid_cache_integration.rs`'s `TTL_FAST_TIER` comment for
+    // See `hybrid_cache_integration.rs`'s `TTL_FAST_TIER` comment for
     // the full rationale (a capacity sized only for `None`-ttl objects is
     // too tight for a single ttl'd object once its bookkeeping overhead is
     // included). Sized comfortably for one ttl'd 100-byte object plus
@@ -329,13 +329,13 @@ mod lru_sized_hybrid_cache_tests {
         }
 
         let evicted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.lru_sized_hybrid_stats().evictions >= 1
+            cache.hybrid_stats().evictions >= 1
         });
         assert!(evicted, "at least one terminal eviction should have occurred");
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let stats = cache.lru_sized_hybrid_stats();
+        let stats = cache.hybrid_stats();
         let present = (1u32..=10).filter(|key| cache.has(key)).count() as u64;
 
         assert_eq!(present + stats.evictions, 10);
@@ -382,13 +382,13 @@ mod lru_sized_hybrid_cache_tests {
         }
 
         let evicted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.lru_sized_hybrid_stats().evictions >= 1
+            cache.hybrid_stats().evictions >= 1
         });
         assert!(evicted, "at least one terminal eviction should have occurred");
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let stats = cache.lru_sized_hybrid_stats();
+        let stats = cache.hybrid_stats();
         // Confirm this genuinely went through the fast-segment fallback,
         // not a normal slow-tier eviction: nothing was ever demoted.
         assert_eq!(stats.demotions, 0, "nothing should have been demoted in this scenario");
@@ -408,7 +408,7 @@ mod lru_sized_hybrid_cache_tests {
         // almost entirely on the small segment (see
         // `LruSizedHybridStack::reserved_shares` -- the split is
         // proportional to each segment's *capacity*), matching
-        // `lru_hybrid_cache_integration.rs`'s equivalent single-tier test.
+        // `hybrid_cache_integration.rs`'s equivalent single-tier test.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
             CacheTierSize::Bytes(2_000),
@@ -421,13 +421,13 @@ mod lru_sized_hybrid_cache_tests {
         }
 
         let demoted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.lru_sized_hybrid_stats().demotions >= 1
+            cache.hybrid_stats().demotions >= 1
         });
         assert!(demoted, "shared-metadata reservation should force demotions");
 
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let stats = cache.lru_sized_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.evictions, 0, "the DRAM cap must demote, never evict");
 
         let present = (1u32..=300).filter(|key| cache.has(key)).count();
@@ -496,7 +496,7 @@ mod lru_sized_hybrid_cache_tests {
         ).expect("cache should construct");
 
         cache.set(1u32, &small_value(0xA1), None).expect("set should succeed"); // small
-        assert!(wait_until(MIGRATION_TIMEOUT, || cache.lru_sized_hybrid_stats().small_fast_objects == 1));
+        assert!(wait_until(MIGRATION_TIMEOUT, || cache.hybrid_stats().small_fast_objects == 1));
 
         assert_eq!(cache.size_threshold(), SIZE_THRESHOLD);
         cache.set_size_threshold(CacheTierSize::Bytes(1)).expect("threshold change should succeed");
@@ -509,7 +509,7 @@ mod lru_sized_hybrid_cache_tests {
         // under the lowered threshold.
         cache.set(2u32, &small_value(0xB2), None).expect("set should succeed");
         let routed_large = wait_until(MIGRATION_TIMEOUT, || {
-            cache.lru_sized_hybrid_stats().large_fast_objects == 1
+            cache.hybrid_stats().large_fast_objects == 1
         });
         assert!(routed_large, "key 2 should route to the large segment under the new threshold");
     }

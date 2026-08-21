@@ -231,8 +231,8 @@ impl WorkerFanout {
 	/// reallocates a value into the target tier's representation (e.g.
 	/// `TieredBuffer::new_fast`/`new_slow`). Promotion/demotion/eviction
 	/// counters and gauges are recorded directly on the shared `status`
-	/// (backing `PaperCache::lru_hybrid_stats`/`lfu_hybrid_stats`/
-	/// `two_q_hybrid_stats`/`fifo_hybrid_stats`), so no separate stats
+	/// (backing `PaperCache::hybrid_stats`/`hybrid_stats`/
+	/// `hybrid_stats`/`hybrid_stats`), so no separate stats
 	/// parameter is needed here.
 	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
 	pub fn new_with_tier_migration<K, V>(

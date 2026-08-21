@@ -8,10 +8,10 @@
 //! Integration tests for the `lfu_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test lfu_hybrid_cache_integration --features lfu_hybrid_cache
+//!   cargo +nightly test --test hybrid_cache_integration --features lfu_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture as
-//! `lru_hybrid_cache_integration.rs` — `tier_of` reads the tier directly off
+//! `hybrid_cache_integration.rs` — `tier_of` reads the tier directly off
 //! the single object map, no `has_in_dram`/`has_in_pmem` pair needed.
 //!
 //! One behavioral difference from the LRU-hybrid tests worth calling out:
@@ -35,17 +35,17 @@
 //!   * TTL set before a demotion/promotion is still correctly enforced after
 //!   * Terminal eviction only ever removes the slow-tier minimum-frequency
 //!     resident (falling back to the fast tier only if slow is empty) and
-//!     is counted in `lfu_hybrid_stats().evictions`
+//!     is counted in `hybrid_stats().evictions`
 //!   * `set_fast_tier_size` takes effect at runtime
 //!   * Zero/invalid/tiny fast-tier-size edge cases
 //!
 //! All tier-crossing tests exercise the real `Hybrid`/UMF PMEM allocator —
-//! see `lru_hybrid_cache_integration.rs`'s module doc for the one-time
+//! see `hybrid_cache_integration.rs`'s module doc for the one-time
 //! ~45s PMEM pool warm-up caveat this shares (`ensure_pmem_allocator_warm`
 //! below is the same pattern, backed by the same process-wide `Once`).
 
 #[cfg(feature = "lfu_hybrid_cache")]
-mod lfu_hybrid_cache_tests {
+mod hybrid_cache_tests {
     use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -145,7 +145,7 @@ mod lfu_hybrid_cache_tests {
         // (correcting the API layer's initially-Fast-built TieredBuffer)
         // but is not a demotion -- no existing fast-tier object was
         // displaced.
-        let stats = cache.lfu_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.demotions, 0);
     }
 
@@ -215,7 +215,7 @@ mod lfu_hybrid_cache_tests {
 
         assert_ne!(cache.tier_of(&2u32), Some(Tier::Slow));
 
-        let stats = cache.lfu_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.promotions >= 1);
     }
 
@@ -278,7 +278,7 @@ mod lfu_hybrid_cache_tests {
 
     // ── TTL ───────────────────────────────────────────────────────────────
 
-    // See `lru_hybrid_cache_integration.rs`'s analogous constant/tests for
+    // See `hybrid_cache_integration.rs`'s analogous constant/tests for
     // why this is comfortably larger than one ttl'd object's base_size
     // (which includes fixed TTL bookkeeping overhead on top of key + value)
     // and why several small filler keys (rather than one) are used to
@@ -294,7 +294,7 @@ mod lfu_hybrid_cache_tests {
             CacheTierSize::Bytes(TTL_FAST_TIER),
         ).expect("cache should construct");
 
-        // See `ttl_survives_a_demotion` in `lru_hybrid_cache_integration.rs`
+        // See `ttl_survives_a_demotion` in `hybrid_cache_integration.rs`
         // for why the TTL must be comfortably longer than any plausible
         // migration latency, not merely comparable to it.
         let ttl_secs = 5u32;
@@ -407,14 +407,14 @@ mod lfu_hybrid_cache_tests {
         }
 
         let evicted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.lfu_hybrid_stats().evictions >= 1
+            cache.hybrid_stats().evictions >= 1
         });
         assert!(evicted, "at least one terminal eviction should have occurred");
 
         // Give the worker a moment to settle so the count below is stable.
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let stats = cache.lfu_hybrid_stats();
+        let stats = cache.hybrid_stats();
         let present = (1u32..=10).filter(|key| cache.has(key)).count() as u64;
 
         // Every key is accounted for exactly once: either still present
@@ -456,7 +456,7 @@ mod lfu_hybrid_cache_tests {
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
         // Nothing demoted; the slow tier is genuinely empty.
-        let stats = cache.lfu_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.demotions, 0);
         assert_eq!(stats.slow_objects, 0);
 
@@ -467,13 +467,13 @@ mod lfu_hybrid_cache_tests {
         cache.resize(1).expect("resize should succeed");
 
         let evicted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.lfu_hybrid_stats().evictions >= 1
+            cache.hybrid_stats().evictions >= 1
         });
         assert!(evicted, "shrinking max_size below the fast resident should evict it");
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let stats = cache.lfu_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.demotions, 0, "the object should have been evicted from fast, never demoted");
         assert_eq!(stats.slow_objects, 0, "the slow tier stayed empty throughout");
         assert!(!cache.has(&1u32), "the single fast resident should have been evicted");
@@ -514,13 +514,13 @@ mod lfu_hybrid_cache_tests {
         // The shared-metadata reservation fills the 2 KB fast budget well
         // before 300 objects, so later admissions land in the slow tier.
         let routed = wait_until(MIGRATION_TIMEOUT, || {
-            cache.lfu_hybrid_stats().slow_objects >= 1
+            cache.hybrid_stats().slow_objects >= 1
         });
         assert!(routed, "shared-metadata reservation should route admissions to slow");
 
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let stats = cache.lfu_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.evictions, 0, "the DRAM cap must route to slow, never evict");
 
         let present = (1u32..=300).filter(|key| cache.has(key)).count();
@@ -551,7 +551,7 @@ mod lfu_hybrid_cache_tests {
         // latch onto `AtomicStatus` (the sync runs unconditionally, before
         // the migration is even applied).
         let latched = wait_until(MIGRATION_TIMEOUT, || {
-            cache.lfu_hybrid_stats().slow_objects >= 1
+            cache.hybrid_stats().slow_objects >= 1
         });
         assert!(latched, "fast tier should have latched shut after the second filler");
 

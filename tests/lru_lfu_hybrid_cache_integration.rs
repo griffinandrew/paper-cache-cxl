@@ -8,7 +8,7 @@
 //! Integration tests for the `lru_lfu_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test lru_lfu_hybrid_cache_integration --features lru_lfu_hybrid_cache
+//!   cargo +nightly test --test hybrid_cache_integration --features lru_lfu_hybrid_cache
 //!
 //! This design is **one** `PaperCache<K, TieredBuffer>` whose two tiers rank
 //! by *different* metrics — recency (LRU) in the fast tier, frequency (LFU)
@@ -26,13 +26,13 @@
 //!   * TTL survives a demotion and a promotion
 //!   * `set_fast_tier_size` takes effect at runtime; `del`/`wipe` across tiers
 //!
-//! See `tests/lru_hybrid_cache_integration.rs`'s module doc for why every
+//! See `tests/hybrid_cache_integration.rs`'s module doc for why every
 //! PMEM-touching test calls `ensure_pmem_allocator_warm()` first (a one-time
 //! ~45s NUMA pool init that a concurrently running test can otherwise stall
 //! this one behind, losing races against short TTLs).
 
 #[cfg(feature = "lru_lfu_hybrid_cache")]
-mod lru_lfu_hybrid_cache_tests {
+mod hybrid_cache_tests {
     use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -153,7 +153,7 @@ mod lru_lfu_hybrid_cache_tests {
         assert_ne!(cache.tier_of(&1u32), Some(Tier::Fast));
         assert_eq!(cache.get(&1u32).unwrap(), value(0xA1));
 
-        let stats = cache.lru_lfu_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.demotions > 0, "expected a real demotion; got {stats:?}");
     }
 
@@ -209,7 +209,7 @@ mod lru_lfu_hybrid_cache_tests {
         assert_ne!(cache.tier_of(&1u32), Some(Tier::Slow));
         assert_eq!(cache.get(&1u32).unwrap(), value(0xA1));
 
-        let stats = cache.lru_lfu_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.promotions > 0, "expected a real promotion; got {stats:?}");
     }
 
@@ -273,7 +273,7 @@ mod lru_lfu_hybrid_cache_tests {
             });
         }
 
-        let stats = cache.lru_lfu_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.evictions > 0, "expected terminal evictions; got {stats:?}");
 
         // Key 2 (frequency 1) should have been evicted before key 1
@@ -454,12 +454,12 @@ mod lru_lfu_hybrid_cache_tests {
         }
 
         let settled = wait_until(MIGRATION_TIMEOUT, || {
-            let stats = cache.lru_lfu_hybrid_stats();
+            let stats = cache.hybrid_stats();
             let objects = cache.status().expect("status").num_objects();
             stats.fast_objects + stats.slow_objects == objects
         });
 
-        let stats = cache.lru_lfu_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(
             settled,
             "every object should be accounted to exactly one tier; got fast={} slow={} objects={}",

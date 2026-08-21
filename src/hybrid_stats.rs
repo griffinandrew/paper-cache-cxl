@@ -10,7 +10,7 @@
 //! to read it.
 //!
 //! Every one of the hybrid designs already exposes its own accessor
-//! (`lru_hybrid_stats()`, `s3_fifo_ghost_hybrid_stats()`, ...) returning its
+//! (`hybrid_stats()`, `hybrid_stats()`, ...) returning its
 //! own named struct (`LruHybridStats`, `S3FifoGhostHybridStats`, ...). Those
 //! stay exactly as they are — `paper-server` and existing callers keep the
 //! names they already use, and designs that track *extra* fields keep them
@@ -63,6 +63,17 @@ pub struct HybridStats {
 
 	/// Objects currently in the slow (PMEM) tier.
 	pub slow_objects: u64,
+
+	/// Four-segment (small/large x fast/slow) gauges. Populated only by the
+	/// size-split `lru_sized` design; zero for every other policy.
+	pub small_fast_bytes_used: u64,
+	pub large_fast_bytes_used: u64,
+	pub small_slow_bytes_used: u64,
+	pub large_slow_bytes_used: u64,
+	pub small_fast_objects: u64,
+	pub large_fast_objects: u64,
+	pub small_slow_objects: u64,
+	pub large_slow_objects: u64,
 }
 
 impl HybridStats {

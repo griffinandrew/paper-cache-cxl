@@ -1,3 +1,7 @@
+// Constructor signatures differ per hybrid feature; this suite pins the
+// genericity claims on the lru design.
+#![cfg(feature = "lru_hybrid_cache")]
+
 // Does the library actually accept a non-integer key type end to end?
 use paper_cache::{PaperCache, CacheTierSize, TieredBuffer};
 

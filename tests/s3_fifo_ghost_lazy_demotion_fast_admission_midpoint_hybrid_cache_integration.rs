@@ -10,7 +10,7 @@
 //! feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_integration --features s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache
+//!   cargo +nightly test --test hybrid_cache_integration --features s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture, fast-tier one-access
 //! queue, ghost-queue lifecycle, demotion-time reprieve, and eviction-time
@@ -29,7 +29,7 @@
 //! re-derive the exact cursor arithmetic.
 
 #[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
-mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
+mod hybrid_cache_tests {
     use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -179,14 +179,14 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
         cache.get(&1u32).expect("get should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        let promotions_before = cache.s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stats().promotions;
+        let promotions_before = cache.hybrid_stats().promotions;
 
         cache.get(&1u32).expect("get should succeed");
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
         assert_eq!(
-            cache.s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stats().promotions,
+            cache.hybrid_stats().promotions,
             promotions_before,
         );
     }
@@ -218,7 +218,7 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
 
         // Deterministic trigger, not a filler set() -- see
-        // s3_fifo_hybrid_cache_integration.rs's equivalent test for why.
+        // hybrid_cache_integration.rs's equivalent test for why.
         cache.resize(180).expect("resize should succeed");
 
         let survived_and_promoted = wait_until(MIGRATION_TIMEOUT, || {
@@ -249,8 +249,8 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
         cache.get(&1u32).expect("get should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        let promotions_before = cache.s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stats().promotions;
-        let demotions_before = cache.s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stats().demotions;
+        let promotions_before = cache.hybrid_stats().promotions;
+        let demotions_before = cache.hybrid_stats().demotions;
 
         cache.get(&1u32).expect("get should succeed");
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -268,7 +268,7 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
             "key 1 should have been reprieved at the demotion boundary, not demoted",
         );
 
-        let stats = cache.s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.promotions, promotions_before, "reprieve must not count as a promotion");
         assert_eq!(stats.demotions, demotions_before + 1, "exactly key 2 should have been demoted");
 
@@ -455,7 +455,7 @@ mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache_tests {
         }
 
         let evicted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stats().evictions >= 1
+            cache.hybrid_stats().evictions >= 1
         });
         assert!(evicted, "at least one terminal eviction should have occurred");
 

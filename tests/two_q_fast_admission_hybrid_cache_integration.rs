@@ -8,13 +8,13 @@
 //! Integration tests for the `two_q_fast_admission_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test two_q_fast_admission_hybrid_cache_integration --features two_q_fast_admission_hybrid_cache
+//!   cargo +nightly test --test hybrid_cache_integration --features two_q_fast_admission_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture as the other hybrid
 //! integration suites — `tier_of` reads the tier directly off the single
 //! object map.
 //!
-//! The defining difference from `two_q_hybrid_cache_integration.rs`:
+//! The defining difference from `hybrid_cache_integration.rs`:
 //! admission lands in the **fast** tier here. Every `set()` is a plain DRAM
 //! write, so — unlike that suite, where every single test pays a synchronous
 //! PMEM allocation — the tests below only touch PMEM once a demotion
@@ -38,11 +38,11 @@
 //!   * Terminal eviction prefers the FIFO queue over the main queue
 //!   * TTL set before a demotion/promotion is still correctly enforced after
 //!   * `set_fast_tier_size` / `resize` take effect at runtime
-//!   * `hybrid_stats()` agrees with `two_q_fast_admission_hybrid_stats()`
+//!   * `hybrid_stats()` agrees with `hybrid_stats()`
 //!   * Zero/invalid fast-tier-size and `k_in` edge cases
 
 #[cfg(feature = "two_q_fast_admission_hybrid_cache")]
-mod two_q_fast_admission_hybrid_cache_tests {
+mod hybrid_cache_tests {
     use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -171,13 +171,13 @@ mod two_q_fast_admission_hybrid_cache_tests {
         // fixed sleep is long enough (a fixed 200ms observed 15 of 20).
         assert!(
             wait_until(MIGRATION_TIMEOUT, || {
-                cache.two_q_fast_admission_hybrid_stats().fast_objects == 20
+                cache.hybrid_stats().fast_objects == 20
             }),
             "all 20 admissions should be accounted to the fast tier",
         );
 
         // Nothing was demoted or promoted: no key ever needed to move.
-        let stats = cache.two_q_fast_admission_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.demotions, 0);
         assert_eq!(stats.promotions, 0);
         assert_eq!(stats.slow_objects, 0);
@@ -200,7 +200,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-        assert_eq!(cache.two_q_fast_admission_hybrid_stats().promotions, 0);
+        assert_eq!(cache.hybrid_stats().promotions, 0);
         assert_eq!(cache.get(&1u32).unwrap(), b"value");
     }
 
@@ -223,7 +223,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
 
         assert!(
             wait_until(MIGRATION_TIMEOUT, || {
-                cache.two_q_fast_admission_hybrid_stats().demotions > 0
+                cache.hybrid_stats().demotions > 0
             }),
             "main-queue pressure should have demoted something",
         );
@@ -264,7 +264,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
 
         assert!(
             wait_until(MIGRATION_TIMEOUT, || {
-                cache.two_q_fast_admission_hybrid_stats().demotions > 0
+                cache.hybrid_stats().demotions > 0
             }),
             "should have demoted under a 2000-byte fast tier",
         );
@@ -272,7 +272,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
         // Give the worker a moment to settle, then check the gauge.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let stats = cache.two_q_fast_admission_hybrid_stats();
+        let stats = cache.hybrid_stats();
 
         assert!(
             stats.fast_bytes_used <= FAST_TIER_BYTES,
@@ -320,7 +320,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
             "re-accessing key {slow_key} should have promoted it back to fast",
         );
 
-        assert!(cache.two_q_fast_admission_hybrid_stats().promotions > 0);
+        assert!(cache.hybrid_stats().promotions > 0);
         assert_eq!(cache.get(&slow_key).unwrap(), vec![slow_key as u8; 64]);
     }
 
@@ -345,7 +345,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
 
         assert!(
             wait_until(MIGRATION_TIMEOUT, || {
-                cache.two_q_fast_admission_hybrid_stats().evictions > 0
+                cache.hybrid_stats().evictions > 0
             }),
             "FIFO-capacity pressure should have produced evictions",
         );
@@ -359,7 +359,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
             "an evicted key should no longer be present",
         );
 
-        let stats = cache.two_q_fast_admission_hybrid_stats();
+        let stats = cache.hybrid_stats();
         let present = (1..=30u32).filter(|key| cache.has(key)).count() as u64;
 
         assert_eq!(
@@ -393,7 +393,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
 
         assert!(
             wait_until(MIGRATION_TIMEOUT, || {
-                cache.two_q_fast_admission_hybrid_stats().evictions > 0
+                cache.hybrid_stats().evictions > 0
             }),
             "should have evicted from the FIFO queue",
         );
@@ -477,7 +477,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
         }
 
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert_eq!(cache.two_q_fast_admission_hybrid_stats().demotions, 0);
+        assert_eq!(cache.hybrid_stats().demotions, 0);
 
         // Shrinking the fast tier must force demotions immediately, without
         // waiting for another access.
@@ -486,7 +486,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
 
         assert!(
             wait_until(MIGRATION_TIMEOUT, || {
-                cache.two_q_fast_admission_hybrid_stats().demotions > 0
+                cache.hybrid_stats().demotions > 0
             }),
             "shrinking the fast tier should have demoted something",
         );
@@ -514,7 +514,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let before = cache.two_q_fast_admission_hybrid_stats().demotions;
+        let before = cache.hybrid_stats().demotions;
 
         // Growing max_size grows the FIFO reservation (0.5 * max_size),
         // squeezing the main queue's share of the same 1_500-byte fast tier.
@@ -522,7 +522,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
 
         assert!(
             wait_until(MIGRATION_TIMEOUT, || {
-                cache.two_q_fast_admission_hybrid_stats().demotions > before
+                cache.hybrid_stats().demotions > before
             }),
             "growing max_size should have grown the FIFO reservation and demoted",
         );
@@ -543,7 +543,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
 
         assert!(
             wait_until(MIGRATION_TIMEOUT, || {
-                cache.two_q_fast_admission_hybrid_stats().demotions > 0
+                cache.hybrid_stats().demotions > 0
             }),
             "should have produced a demotion to compare",
         );
@@ -553,7 +553,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
         // reading must fall at or below the later named reading rather than
         // being compared for strict equality against a moving target.
         let common = cache.hybrid_stats();
-        let named = cache.two_q_fast_admission_hybrid_stats();
+        let named = cache.hybrid_stats();
 
         assert!(common.demotions <= named.demotions);
         assert!(common.promotions <= named.promotions);
@@ -701,7 +701,7 @@ mod two_q_fast_admission_hybrid_cache_tests {
         // than slept on, for the same gauge-refresh-cadence reason as above.
         assert!(
             wait_until(MIGRATION_TIMEOUT, || {
-                let stats = cache.two_q_fast_admission_hybrid_stats();
+                let stats = cache.hybrid_stats();
                 stats.fast_objects + stats.slow_objects == 1
             }),
             "the re-set key should be counted exactly once",

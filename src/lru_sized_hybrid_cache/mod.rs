@@ -66,7 +66,7 @@ impl crate::hybrid_policy::HybridPolicy for LruSizedHybridPolicy {
 	}
 
 	fn stats_from_status(status: &crate::status::AtomicStatus) -> LruSizedHybridStats {
-		status.lru_sized_hybrid_stats()
+		status.hybrid_stats()
 	}
 
 	fn admission_tier<K>(

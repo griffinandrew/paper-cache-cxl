@@ -80,7 +80,7 @@ impl crate::hybrid_policy::HybridPolicy for S3FifoHybridPolicy {
 	}
 
 	fn stats_from_status(status: &crate::status::AtomicStatus) -> S3FifoHybridStats {
-		status.s3_fifo_hybrid_stats()
+		status.hybrid_stats()
 	}
 
 	fn admission_tier<K>(

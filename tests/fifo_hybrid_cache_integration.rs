@@ -8,12 +8,12 @@
 //! Integration tests for the `fifo_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test fifo_hybrid_cache_integration --features fifo_hybrid_cache
+//!   cargo +nightly test --test hybrid_cache_integration --features fifo_hybrid_cache
 //!
 //! This feature is **one** `PaperCache<K, TieredBuffer>` instance (not two
 //! composed `PaperCache`s), so `tier_of` reads the tier directly off the
 //! single object map. Modeled on
-//! `tests/lru_hybrid_cache_integration.rs`, with promotion-specific tests
+//! `tests/hybrid_cache_integration.rs`, with promotion-specific tests
 //! dropped (FIFO has no promotion policy at all) and two FIFO-defining tests
 //! added instead.
 //!
@@ -29,7 +29,7 @@
 //!     rule differs from LRU's)
 //!   * TTL set before a demotion is still correctly enforced after
 //!   * Terminal eviction only ever removes the slow-tier oldest object and
-//!     is counted in `fifo_hybrid_stats().evictions`
+//!     is counted in `hybrid_stats().evictions`
 //!   * `set_fast_tier_size` takes effect at runtime
 //!   * Zero/invalid/tiny fast-tier-size edge cases
 //!
@@ -44,7 +44,7 @@
 //! immediately once the allocator is warm.
 
 #[cfg(feature = "fifo_hybrid_cache")]
-mod fifo_hybrid_cache_tests {
+mod hybrid_cache_tests {
     use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -77,7 +77,7 @@ mod fifo_hybrid_cache_tests {
 
     const MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    // ~1 KB values, same rationale as `lru_hybrid_cache_integration.rs`'s
+    // ~1 KB values, same rationale as `hybrid_cache_integration.rs`'s
     // `VALUE_LEN`: keeps the byte-sized fast-tier budgets behaving
     // intuitively (~value-sized) for the demotion tests below.
     const VALUE_LEN: usize = 1024;
@@ -136,7 +136,7 @@ mod fifo_hybrid_cache_tests {
         // Value survives the physical move intact.
         assert_eq!(cache.get(&1u32).unwrap(), value(0xA1));
 
-        let stats = cache.fifo_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.demotions >= 1);
         assert_eq!(stats.promotions, 0);
     }
@@ -196,7 +196,7 @@ mod fifo_hybrid_cache_tests {
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
 
-        let stats = cache.fifo_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.promotions, 0);
     }
 
@@ -237,7 +237,7 @@ mod fifo_hybrid_cache_tests {
 
     // ── TTL ───────────────────────────────────────────────────────────────
 
-    // Same rationale as `lru_hybrid_cache_integration.rs`'s `TTL_FAST_TIER`:
+    // Same rationale as `hybrid_cache_integration.rs`'s `TTL_FAST_TIER`:
     // a TTL'd object's `base_size` (via `get_ttl_overhead`) is large enough
     // that a fast tier sized only for `None`-ttl objects is too tight for a
     // single ttl'd object alone. Sized to hold ~2 objects, with several
@@ -302,14 +302,14 @@ mod fifo_hybrid_cache_tests {
         }
 
         let evicted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.fifo_hybrid_stats().evictions >= 1
+            cache.hybrid_stats().evictions >= 1
         });
         assert!(evicted, "at least one terminal eviction should have occurred");
 
         // Give the worker a moment to settle so the count below is stable.
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let stats = cache.fifo_hybrid_stats();
+        let stats = cache.hybrid_stats();
         let present = (1u32..=10).filter(|key| cache.has(key)).count() as u64;
 
         // Every key is accounted for exactly once: either still present

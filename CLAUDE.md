@@ -26,8 +26,10 @@ src/
                                per storage combination behind #[cfg(feature = ...)] impl blocks;
                                grep for `impl<K, S> PaperCache<K, TieredBuffer` to find each
                                hybrid design's own new/with_hasher/stats block. Also carries the
-                               153 compile_error! guards making the hybrid features mutually
-                               exclusive (one per pair of the 18 designs).
+                               compile_error! guards making the hybrid features mutually
+                               exclusive -- one per pair of the 18 designs, covering 152 of the
+                               153 (fifo + two_q_fast_admission has a malformed cfg and is
+                               unguarded).
   policy.rs                   PaperPolicy — the plain policies (Lfu, Fifo, Clock, Sieve, Lru,
                                Mru, TwoQ, Arc, SThreeFifo) plus one variant per hybrid design
                                (LruHybrid, LfuHybrid, TwoQHybrid(f64), S3FifoHybrid(f64), ...),
@@ -104,7 +106,10 @@ Nearly everything is gated by Cargo features, because the point of the branch is
 placement strategies. Current state:
 
 - `numa_jemalloc` — node-bound jemalloc arenas (`src/numa_alloc.rs`). Pulled in by everything
-  below; the global allocator and `Hybrid` are wired up unconditionally.
+  below. The global allocator is wired up unconditionally; `Hybrid` exists only under one of the
+  PMEM features (`cfg(any(key_value_pmem, key_pmem_value_pmem, global_hashtable_pmem,
+  tiering_hashtable_pmem, eviction_stacks_pmem))`) — notably *not* under `all_dram` alone, or
+  under the empty default feature set.
 - `key_value_pmem` / `key_pmem_value_pmem` — value (or key+value) bytes in PMEM via `Hybrid`.
 - `all_dram` — force every allocation to DRAM.
 - `eviction_stacks_pmem` — move the eviction stacks' own bookkeeping into PMEM.

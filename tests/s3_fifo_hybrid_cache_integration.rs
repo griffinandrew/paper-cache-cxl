@@ -8,18 +8,18 @@
 //! Integration tests for the `s3_fifo_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test s3_fifo_hybrid_cache_integration --features s3_fifo_hybrid_cache
+//!   cargo +nightly test --test hybrid_cache_integration --features s3_fifo_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture as the other
 //! hybrids — `tier_of` reads the tier directly off the single object map.
 //!
-//! Structurally closest to `two_q_hybrid_cache_integration.rs`: admission
+//! Structurally closest to `hybrid_cache_integration.rs`: admission
 //! always lands in the **slow** tier (the one-access queue), a real
 //! synchronous PMEM write on every `set()`, so — same as that file — every
 //! test here pays (or waits out) the one-time PMEM pool warm-up cost. See
 //! that file's module doc for the ~45s warm-up caveat.
 //!
-//! What is tested, beyond what `two_q_hybrid_cache_integration.rs` already
+//! What is tested, beyond what `hybrid_cache_integration.rs` already
 //! covers structurally:
 //!   * Admission always lands in the slow tier (the one-access queue)
 //!   * A re-access to a one-access-queue object promotes it EAGERLY (same
@@ -40,7 +40,7 @@
 //!   * Zero/invalid/tiny fast-tier-size and ratio edge cases
 
 #[cfg(feature = "s3_fifo_hybrid_cache")]
-mod s3_fifo_hybrid_cache_tests {
+mod hybrid_cache_tests {
     use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -58,7 +58,7 @@ mod s3_fifo_hybrid_cache_tests {
 
     /// Forces the one-time PMEM allocator pool init/prewarm to complete
     /// before a test's own timing-sensitive assertions begin. Same shape as
-    /// `two_q_hybrid_cache_integration.rs`'s helper -- admission itself
+    /// `hybrid_cache_integration.rs`'s helper -- admission itself
     /// calls `TieredBuffer::new_slow` directly (synchronous), so by the
     /// time `set()` returns, the allocator is warm.
     fn ensure_pmem_allocator_warm() {
@@ -113,7 +113,7 @@ mod s3_fifo_hybrid_cache_tests {
         });
         assert!(promoted, "key should have promoted to the fast tier after a re-access");
 
-        let stats = cache.s3_fifo_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.promotions >= 1);
     }
 
@@ -142,7 +142,7 @@ mod s3_fifo_hybrid_cache_tests {
         assert!(evicted, "key 1 should have aged out of the one-access queue and been evicted");
         assert_eq!(cache.tier_of(&1u32), None);
 
-        let stats = cache.s3_fifo_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert!(stats.evictions >= 1);
     }
 
@@ -218,7 +218,7 @@ mod s3_fifo_hybrid_cache_tests {
         cache.get(&1u32).expect("get should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
 
-        let promotions_before = cache.s3_fifo_hybrid_stats().promotions;
+        let promotions_before = cache.hybrid_stats().promotions;
 
         // A second access while already Fast should be a pure no-op from
         // the tiering machinery's point of view -- unlike two_q_hybrid_cache
@@ -227,7 +227,7 @@ mod s3_fifo_hybrid_cache_tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-        assert_eq!(cache.s3_fifo_hybrid_stats().promotions, promotions_before);
+        assert_eq!(cache.hybrid_stats().promotions, promotions_before);
     }
 
     #[test]
@@ -411,7 +411,7 @@ mod s3_fifo_hybrid_cache_tests {
         }
 
         let evicted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.s3_fifo_hybrid_stats().evictions >= 1
+            cache.hybrid_stats().evictions >= 1
         });
         assert!(evicted, "at least one terminal eviction should have occurred");
 

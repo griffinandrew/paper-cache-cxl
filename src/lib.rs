@@ -2606,7 +2606,7 @@ where
 /// composing two independent `PaperCache` instances. See the `lru_hybrid_cache` module docs for the
 /// full design. This impl block only carries `new`/`with_hasher` (this
 /// design's constructor has no extra parameters beyond `max_size`/
-/// `fast_tier_size`) and the `lru_hybrid_stats()` accessor -- every other
+/// `fast_tier_size`) and the `hybrid_stats()` accessor -- every other
 /// method is shared, in the generic block above (see
 /// `crate::hybrid_policy::HybridPolicy`).
 #[cfg(feature = "lru_hybrid_cache")]
@@ -2652,18 +2652,13 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, (), hasher)
 	}
 
-	/// Returns a point-in-time snapshot of `lru_hybrid_cache` statistics.
-	#[must_use]
-	pub fn lru_hybrid_stats(&self) -> LruHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance hybrid cache with recency (LRU) in the fast tier and
 /// frequency (LFU) in the slow tier: one `PaperCache<K, TieredBuffer>`
 /// running `PaperPolicy::LruLfuHybrid`. See the `lru_lfu_hybrid_cache` module
 /// docs for the full design; only `new`/`with_hasher`/
-/// `lru_lfu_hybrid_stats()` live here -- everything else is shared (see the
+/// `hybrid_stats()` live here -- everything else is shared (see the
 /// generic block above).
 #[cfg(feature = "lru_lfu_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
@@ -2720,17 +2715,12 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, promote_k, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of `lru_lfu_hybrid_cache` statistics.
-	#[must_use]
-	pub fn lru_lfu_hybrid_stats(&self) -> LruLfuHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-LFU hybrid cache: one `PaperCache<K,
 /// TieredBuffer>` running `PaperPolicy::LfuHybrid`, in contrast with
 /// composing two independent `PaperCache` instances. See the `lfu_hybrid_cache` module docs for the
-/// full design; only `new`/`with_hasher`/`lfu_hybrid_stats()` live here --
+/// full design; only `new`/`with_hasher`/`hybrid_stats()` live here --
 /// everything else is shared (see the generic block above).
 ///
 /// Admission always lands in the fast tier; once fast-tier pressure demotes
@@ -2777,11 +2767,6 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, (), hasher)
 	}
 
-	/// Returns a point-in-time snapshot of `lfu_hybrid_cache` statistics.
-	#[must_use]
-	pub fn lfu_hybrid_stats(&self) -> LfuHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-2Q hybrid cache: one `PaperCache<K,
@@ -2789,7 +2774,7 @@ where
 /// composing two independent `PaperCache` instances. See the `two_q_hybrid_cache` module docs for the
 /// full design; this impl block only carries `new`/`with_hasher` (the one
 /// design with an extra `k_in` constructor parameter) and
-/// `two_q_hybrid_stats()` -- everything else is shared (see the generic
+/// `hybrid_stats()` -- everything else is shared (see the generic
 /// block above).
 ///
 /// Admission always lands in a one-access FIFO queue entirely in the slow
@@ -2860,18 +2845,13 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, k_in, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of `two_q_hybrid_cache` statistics.
-	#[must_use]
-	pub fn two_q_hybrid_stats(&self) -> TwoQHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance segmented-2Q hybrid cache with a **fast-tier** one-access
 /// queue. See the `two_q_fast_admission_hybrid_cache` module docs for the full
 /// design; this impl block only carries `new`/`with_hasher` (it shares
 /// `two_q_hybrid_cache`'s extra `k_in` constructor parameter) and
-/// `two_q_fast_admission_hybrid_stats()` -- everything else is shared (see the
+/// `hybrid_stats()` -- everything else is shared (see the
 /// generic block above).
 ///
 /// Identical to `two_q_hybrid_cache` except that admission places the object
@@ -2945,12 +2925,6 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, k_in, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of
-	/// `two_q_fast_admission_hybrid_cache` statistics.
-	#[must_use]
-	pub fn two_q_fast_admission_hybrid_stats(&self) -> TwoQFastAdmissionHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance segmented-2Q hybrid cache with a **fast-tier** one-access
@@ -2958,7 +2932,7 @@ where
 /// than evicted. See the `two_q_fast_admission_reprieve_hybrid_cache` module docs for the full
 /// design; this impl block only carries `new`/`with_hasher` (it shares
 /// `two_q_hybrid_cache`'s extra `k_in` constructor parameter) and
-/// `two_q_fast_admission_reprieve_hybrid_stats()` -- everything else is shared (see the
+/// `hybrid_stats()` -- everything else is shared (see the
 /// generic block above).
 ///
 /// Identical to `two_q_fast_admission_hybrid_cache` except that a one-access
@@ -3037,18 +3011,12 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, k_in, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of
-	/// `two_q_fast_admission_reprieve_hybrid_cache` statistics.
-	#[must_use]
-	pub fn two_q_fast_admission_reprieve_hybrid_stats(&self) -> TwoQFastAdmissionReprieveHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-FIFO hybrid cache: one `PaperCache<K,
 /// TieredBuffer>` running `PaperPolicy::FifoHybrid`, in contrast with
 /// composing two independent `PaperCache` instances. See the `fifo_hybrid_cache` module docs for the
-/// full design; only `new`/`with_hasher`/`fifo_hybrid_stats()` live here --
+/// full design; only `new`/`with_hasher`/`hybrid_stats()` live here --
 /// everything else is shared (see the generic block above).
 ///
 /// Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
@@ -3084,11 +3052,6 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, (), hasher)
 	}
 
-	/// Returns a point-in-time snapshot of `fifo_hybrid_cache` statistics.
-	#[must_use]
-	pub fn fifo_hybrid_stats(&self) -> FifoHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-LRU hybrid cache with a size-split fast AND
@@ -3190,8 +3153,8 @@ where
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
 		status.set_fast_tier_capacity(small_capacity);
-		status.set_lru_sized_hybrid_large_fast_capacity(large_capacity);
-		status.set_lru_sized_hybrid_size_threshold(threshold);
+		status.set_hybrid_large_fast_capacity(large_capacity);
+		status.set_hybrid_size_threshold(threshold);
 
 		// Same byte-length-preserving contract `new_hybrid`'s `migrate`
 		// closure documents.
@@ -3240,12 +3203,6 @@ where
 		Ok(cache)
 	}
 
-	/// Returns a point-in-time snapshot of `lru_sized_hybrid_cache` statistics.
-	#[must_use]
-	pub fn lru_sized_hybrid_stats(&self) -> LruSizedHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
-
 	/// Runtime-adjusts the LARGE fast segment's byte budget. The SMALL
 	/// segment is adjusted via the shared [`Self::set_fast_tier_size`]
 	/// instead (see this impl block's own doc for why).
@@ -3256,7 +3213,7 @@ where
 			return Err(CacheError::InvalidFastTierSize);
 		}
 
-		self.status.set_lru_sized_hybrid_large_fast_capacity(bytes);
+		self.status.set_hybrid_large_fast_capacity(bytes);
 		self.broadcast(WorkerEvent::ResizeLargeFastTier(bytes))?;
 
 		Ok(())
@@ -3265,7 +3222,7 @@ where
 	/// Returns the LARGE fast segment's current byte budget.
 	#[must_use]
 	pub fn large_fast_tier_size(&self) -> CacheSize {
-		self.status.lru_sized_hybrid_large_fast_capacity()
+		self.status.hybrid_large_fast_capacity()
 	}
 
 	/// Runtime-adjusts the small/large size-classification threshold. Only
@@ -3274,7 +3231,7 @@ where
 	pub fn set_size_threshold(&self, threshold: CacheTierSize) -> Result<(), CacheError> {
 		let bytes = threshold.to_bytes();
 
-		self.status.set_lru_sized_hybrid_size_threshold(bytes);
+		self.status.set_hybrid_size_threshold(bytes);
 		self.broadcast(WorkerEvent::ResizeSizeThreshold(bytes))?;
 
 		Ok(())
@@ -3283,7 +3240,7 @@ where
 	/// Returns the current size-classification threshold, in bytes.
 	#[must_use]
 	pub fn size_threshold(&self) -> CacheSize {
-		self.status.lru_sized_hybrid_size_threshold()
+		self.status.hybrid_size_threshold()
 	}
 }
 
@@ -3294,7 +3251,7 @@ where
 /// only carries `new`/`with_hasher` (the one-access queue's byte budget,
 /// `one_access_ratio`, is this design's one extra constructor parameter,
 /// same shape as `two_q_hybrid_cache`'s `k_in`) and the
-/// `s3_fifo_hybrid_stats()` accessor -- everything else is shared (see the
+/// `hybrid_stats()` accessor -- everything else is shared (see the
 /// generic block above).
 ///
 /// Admission always lands in the one-access queue, entirely in the slow
@@ -3354,11 +3311,6 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of `s3_fifo_hybrid_cache` statistics.
-	#[must_use]
-	pub fn s3_fifo_hybrid_stats(&self) -> S3FifoHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-2Q hybrid cache with a ghost queue: one
@@ -3366,7 +3318,7 @@ where
 /// the `two_q_ghost_hybrid_cache` module docs for the full design; this
 /// impl block only carries `new`/`with_hasher` (`one_access_ratio`, same
 /// shape as `two_q_hybrid_cache`'s `k_in`) and the
-/// `two_q_ghost_hybrid_stats()` accessor -- everything else is shared (see
+/// `hybrid_stats()` accessor -- everything else is shared (see
 /// the generic block above).
 ///
 /// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
@@ -3410,18 +3362,13 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, k_in, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of `two_q_ghost_hybrid_cache` statistics.
-	#[must_use]
-	pub fn two_q_ghost_hybrid_stats(&self) -> TwoQGhostHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-S3-FIFO hybrid cache with a ghost queue: one
 /// `PaperCache<K, TieredBuffer>` running `PaperPolicy::S3FifoGhostHybrid`.
 /// See the `s3_fifo_ghost_hybrid_cache` module docs for the full design;
 /// this impl block only carries `new`/`with_hasher` and the
-/// `s3_fifo_ghost_hybrid_stats()` accessor -- everything else is shared.
+/// `hybrid_stats()` accessor -- everything else is shared.
 ///
 /// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
 /// `compile_error!` guards).
@@ -3460,11 +3407,6 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of `s3_fifo_ghost_hybrid_cache` statistics.
-	#[must_use]
-	pub fn s3_fifo_ghost_hybrid_stats(&self) -> S3FifoGhostHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-S3-FIFO hybrid cache with a ghost queue AND a
@@ -3472,7 +3414,7 @@ where
 /// running `PaperPolicy::S3FifoGhostLazyDemotionHybrid`. See the
 /// `s3_fifo_ghost_lazy_demotion_hybrid_cache` module docs for the full
 /// design; this impl block only carries `new`/`with_hasher` and the
-/// `s3_fifo_ghost_lazy_demotion_hybrid_stats()` accessor -- everything else
+/// `hybrid_stats()` accessor -- everything else
 /// is shared.
 ///
 /// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
@@ -3513,12 +3455,6 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of
-	/// `s3_fifo_ghost_lazy_demotion_hybrid_cache` statistics.
-	#[must_use]
-	pub fn s3_fifo_ghost_lazy_demotion_hybrid_stats(&self) -> S3FifoGhostLazyDemotionHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-S3-FIFO hybrid cache with a ghost queue, a
@@ -3527,7 +3463,7 @@ where
 /// `PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid`. See the
 /// `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` module docs
 /// for the full design; this impl block only carries `new`/`with_hasher`
-/// and the `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stats()`
+/// and the `hybrid_stats()`
 /// accessor -- everything else is shared.
 ///
 /// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
@@ -3570,12 +3506,6 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of
-	/// `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` statistics.
-	#[must_use]
-	pub fn s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stats(&self) -> S3FifoGhostLazyDemotionFastAdmissionHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-S3-FIFO hybrid cache with a ghost queue, a
@@ -3586,7 +3516,7 @@ where
 /// the `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache`
 /// module docs for the full design; this impl block only carries
 /// `new`/`with_hasher` and the
-/// `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stats()`
+/// `hybrid_stats()`
 /// accessor -- everything else is shared.
 ///
 /// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
@@ -3628,13 +3558,6 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of
-	/// `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache`
-	/// statistics.
-	#[must_use]
-	pub fn s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stats(&self) -> S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-S3-FIFO hybrid cache with a demotion-time
@@ -3645,7 +3568,7 @@ where
 /// the `s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache`
 /// module docs for the full design; this impl block only carries
 /// `new`/`with_hasher` and the
-/// `s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stats()`
+/// `hybrid_stats()`
 /// accessor -- everything else is shared.
 ///
 /// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
@@ -3687,13 +3610,6 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of
-	/// `s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache`
-	/// statistics.
-	#[must_use]
-	pub fn s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stats(&self) -> S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-S3-FIFO hybrid cache with a demotion-time
@@ -3704,7 +3620,7 @@ where
 /// the `s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache`
 /// module docs for the full design; this impl block only carries
 /// `new`/`with_hasher` and the
-/// `s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stats()`
+/// `hybrid_stats()`
 /// accessor -- everything else is shared.
 ///
 /// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
@@ -3746,13 +3662,6 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of
-	/// `s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache`
-	/// statistics.
-	#[must_use]
-	pub fn s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stats(&self) -> S3FifoLazyDemotionFastAdmissionReprieveHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-S3-FIFO hybrid cache with a demotion-time
@@ -3763,7 +3672,7 @@ where
 /// the `s3_fifo_lazy_demotion_reprieve_hybrid_cache`
 /// module docs for the full design; this impl block only carries
 /// `new`/`with_hasher` and the
-/// `s3_fifo_lazy_demotion_reprieve_hybrid_stats()`
+/// `hybrid_stats()`
 /// accessor -- everything else is shared.
 ///
 /// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
@@ -3807,13 +3716,6 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of
-	/// `s3_fifo_lazy_demotion_reprieve_hybrid_cache`
-	/// statistics.
-	#[must_use]
-	pub fn s3_fifo_lazy_demotion_reprieve_hybrid_stats(&self) -> S3FifoLazyDemotionReprieveHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 /// Single-instance, segmented-S3-FIFO hybrid cache with a demotion-time
@@ -3824,7 +3726,7 @@ where
 /// the `s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache`
 /// module docs for the full design; this impl block only carries
 /// `new`/`with_hasher` and the
-/// `s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_stats()`
+/// `hybrid_stats()`
 /// accessor -- everything else is shared.
 ///
 /// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
@@ -3866,13 +3768,6 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
 	}
 
-	/// Returns a point-in-time snapshot of
-	/// `s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache`
-	/// statistics.
-	#[must_use]
-	pub fn s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_stats(&self) -> S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStats {
-		ActiveHybridPolicy::stats_from_status(&self.status)
-	}
 }
 
 // Tests for global_hashtable_pmem alone (without key_value_pmem)
@@ -4010,7 +3905,7 @@ mod test_new_features {
 /// requires real PMEM/DAX
 /// hardware and aborts ("memory allocation ... failed") in a plain dev
 /// sandbox. A full integration test covering demotion/promotion/eviction
-/// belongs in `tests/lru_hybrid_cache_integration.rs` (not yet written —
+/// belongs in `tests/hybrid_cache_integration.rs` (not yet written —
 /// see `CLAUDE.md`'s `lru_hybrid_cache` plan, step 12) and should be run on
 /// PMEM-capable hardware.
 #[cfg(all(test, feature = "lru_hybrid_cache"))]
@@ -4029,7 +3924,7 @@ mod test_lru_hybrid_cache {
         assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        let stats = cache.lru_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.demotions, 0);
         assert_eq!(stats.promotions, 0);
         assert_eq!(stats.evictions, 0);
@@ -4081,7 +3976,7 @@ mod test_lru_hybrid_cache {
 /// for `lfu_hybrid_cache`. See `test_lru_hybrid_cache`'s doc comment for why
 /// this deliberately stays on the fast-tier-only path (no PMEM allocation) —
 /// the full tier-crossing coverage lives in
-/// `tests/lfu_hybrid_cache_integration.rs`.
+/// `tests/hybrid_cache_integration.rs`.
 #[cfg(all(test, feature = "lfu_hybrid_cache"))]
 mod test_lfu_hybrid_cache {
     use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
@@ -4098,7 +3993,7 @@ mod test_lfu_hybrid_cache {
         assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        let stats = cache.lfu_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.demotions, 0);
         assert_eq!(stats.promotions, 0);
         assert_eq!(stats.evictions, 0);
@@ -4151,7 +4046,7 @@ mod test_lfu_hybrid_cache {
 /// `test_lfu_hybrid_cache`, this module cannot avoid the real `Hybrid`
 /// PMEM allocator: `set()` always admits via `TieredBuffer::new_slow`
 /// regardless of `fast_tier_size`, so even a single `set()` call here pays
-/// the one-time PMEM pool warm-up cost (see `tests/two_q_hybrid_cache_integration.rs`'s
+/// the one-time PMEM pool warm-up cost (see `tests/hybrid_cache_integration.rs`'s
 /// module doc for details). The full tier-crossing coverage lives there.
 #[cfg(all(test, feature = "two_q_hybrid_cache"))]
 mod test_two_q_hybrid_cache {
@@ -4170,7 +4065,7 @@ mod test_two_q_hybrid_cache {
         assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
 
-        let stats = cache.two_q_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.demotions, 0);
         assert_eq!(stats.evictions, 0);
 
@@ -4235,7 +4130,7 @@ mod test_two_q_hybrid_cache {
 /// for `fifo_hybrid_cache`. See `test_lru_hybrid_cache`'s doc comment for why
 /// this deliberately stays on the fast-tier-only path (no PMEM allocation) —
 /// the full tier-crossing coverage (including Correction 2's slow-tier
-/// overwrite path) lives in `tests/fifo_hybrid_cache_integration.rs`.
+/// overwrite path) lives in `tests/hybrid_cache_integration.rs`.
 #[cfg(all(test, feature = "fifo_hybrid_cache"))]
 mod test_fifo_hybrid_cache {
     use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
@@ -4252,7 +4147,7 @@ mod test_fifo_hybrid_cache {
         assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        let stats = cache.fifo_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.demotions, 0);
         assert_eq!(stats.promotions, 0);
         assert_eq!(stats.evictions, 0);
@@ -4324,7 +4219,7 @@ mod test_fifo_hybrid_cache {
 /// values) so no object ever demotes -- see `test_lru_hybrid_cache`'s
 /// identical rationale. A full integration test covering demotion/
 /// promotion/eviction across both segments and both tiers belongs in
-/// `tests/lru_sized_hybrid_cache_integration.rs` and should be run on
+/// `tests/hybrid_cache_integration.rs` and should be run on
 /// PMEM-capable hardware.
 #[cfg(all(test, feature = "lru_sized_hybrid_cache"))]
 mod test_lru_sized_hybrid_cache {
@@ -4344,7 +4239,7 @@ mod test_lru_sized_hybrid_cache {
         assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        let stats = cache.lru_sized_hybrid_stats();
+        let stats = cache.hybrid_stats();
         assert_eq!(stats.demotions, 0);
         assert_eq!(stats.promotions, 0);
         assert_eq!(stats.evictions, 0);

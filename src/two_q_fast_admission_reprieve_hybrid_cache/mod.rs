@@ -96,7 +96,7 @@ impl crate::hybrid_policy::HybridPolicy for TwoQFastAdmissionReprieveHybridPolic
 	}
 
 	fn stats_from_status(status: &crate::status::AtomicStatus) -> TwoQFastAdmissionReprieveHybridStats {
-		status.two_q_fast_admission_reprieve_hybrid_stats()
+		status.hybrid_stats()
 	}
 
 	/// Always `Tier::Fast`, for brand-new and existing keys alike.

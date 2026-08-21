@@ -1150,31 +1150,19 @@ where
 		self.mini_stack_manager.handle_wipe();
 	}
 
-	/// Drains tier migrations recorded by the policy stack (only
-	/// `LruHybridStack` ever produces any) since the last call, and
-	/// physically reallocates each migrated object's bytes into the target
-	/// tier's representation via `Object::set_data`. Also refreshes the live
-	/// gauge fields in `lru_hybrid_stats`. No-op unless this worker was built
-	/// via `new_with_tier_migration` (`tier_migration_fn` is `None`
-	/// otherwise, regardless of the active policy).
+	/// Applies every tier migration the policy stack has accumulated.
 	///
-	/// `lru_hybrid_cache`, `lfu_hybrid_cache`, `two_q_hybrid_cache`, and
-	/// `fifo_hybrid_cache` are mutually exclusive features (see `lib.rs`'s
-	/// `compile_error!` guards), so exactly one of this method and its three
-	/// siblings below ever compiles.
-	///
-	/// Physical migrations are applied inline in this policy-worker thread,
-	/// sequentially, in two phases: every demotion in this batch is applied
-	/// before any promotion in the same batch begins. That ordering is a
-	/// correctness requirement, not an optimization -- a promotion's new
-	/// fast-tier DRAM allocation must never run ahead of a demotion that
-	/// exists specifically to free room for it. (An earlier version spread
-	/// these copies across `rayon`'s worker pool; that was removed as a
-	/// measured performance loss -- concurrent PMEM allocations contend on
-	/// the underlying allocator -- see CLAUDE.md.)
-	#[cfg(feature = "lru_hybrid_cache")]
+	/// One body for all hybrid designs; the two per-design accounting
+	/// differences live on the stack itself. `inline_demotion_accounting`
+	/// is `false` only for the LFU-style design, whose `Tier::Slow` entries
+	/// are not always genuine demotions -- its true count arrives through
+	/// `drain_demotions` (zero for every other stack). The FIFO design
+	/// never emits `Tier::Fast`, so its promotion counter stays 0 through
+	/// the same per-entry path rather than by special case.
+	#[cfg(feature = "hybrid_cache_common")]
 	fn apply_tier_migrations(&mut self) {
 		let Some(stack) = &mut self.policy_stack else { return };
+		let inline_demotion_accounting = stack.inline_demotion_accounting();
 		let migrations = stack.drain_tier_migrations();
 
 		if !migrations.is_empty() {
@@ -1191,22 +1179,10 @@ where
 				let migration_queue = self.migration_queue.as_ref();
 
 				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
+				// held -- see the pre-unification history for the full
+				// latency reasoning; `Object::data()` is an `Arc` refcount
+				// bump and keeps the source bytes alive unlocked.
 				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
 					if let Some(queue) = migration_queue {
 						queue.push((key, tier));
 						return;
@@ -1216,19 +1192,10 @@ where
 						return;
 					};
 
-					// Declined: already in the requested tier, nothing to move.
 					let Some(new_data) = migrate(&old_data, tier) else {
 						return;
 					};
 
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
 					if let Some(mut object) = objects.get_mut_ref(&key) {
 						if Arc::ptr_eq(&object.data(), &old_data) {
 							object.set_data(new_data);
@@ -1238,1043 +1205,54 @@ where
 
 				parallel_migration::apply_batch(demotions, |entry| {
 					apply_physical(entry);
-					status.record_lru_hybrid_demotion();
+					if inline_demotion_accounting {
+						status.record_hybrid_demotion();
+					}
 				});
 
 				parallel_migration::apply_batch(promotions, |entry| {
 					apply_physical(entry);
-					status.record_lru_hybrid_promotion();
+					status.record_hybrid_promotion();
 				});
 
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
+				// Tests assert on tier residency right after triggering a
+				// migration; the standing consumer pool applies
+				// asynchronously, so drain it before returning.
 				#[cfg(test)]
 				if let Some(queue) = migration_queue {
 					queue.flush();
 				}
 			}
 		}
+
+		let drained_demotions = stack.drain_demotions();
+		if drained_demotions > 0 {
+			self.status.record_hybrid_demotions(drained_demotions);
+		}
 	}
 
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
+	/// Mirrors the stack's tier gauges (and the LFU admission latch) onto
+	/// the shared status.
 	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "lru_hybrid_cache")]
+	/// Refreshed unconditionally, not gated on "a migration just happened":
+	/// gating let the gauges go permanently stale after insert bursts that
+	/// ended without one further demotion. The four-segment gauges are read
+	/// through trait methods that default to zero, so only the size-split
+	/// design ever populates them; likewise `admission_latched` is `false`
+	/// for every stack but the LFU-style one.
+	#[cfg(feature = "hybrid_cache_common")]
 	fn refresh_tier_gauges(&mut self) {
-		// Refreshed unconditionally (not gated on `migrations` being
-		// non-empty): gating it on "a migration just happened" left
-		// `lru_hybrid_stats`'s
-		// `fast_objects`/`slow_objects`/`fast_bytes_used`/`slow_bytes_used`
-		// able to go stale and never catch up to the stack's true state --
-		// e.g. the tail of a large insert burst that happens to land without
-		// triggering one further demotion left these gauges permanently
-		// short of the real tracked count, discovered while diagnosing a
-		// reported DRAM-usage gap (the gauges themselves turned out fine;
-		// only their refresh cadence was wrong).
 		if let Some(stack) = &self.policy_stack {
-			self.status.set_lru_hybrid_gauges(
+			self.status.set_hybrid_admission_latched(stack.admission_latched());
+
+			self.status.set_hybrid_gauges(
 				stack.fast_bytes_used(),
 				stack.slow_bytes_used(),
 				stack.fast_object_count() as u64,
 				stack.slow_object_count() as u64,
 			);
-		}
-	}
 
-	/// `lru_lfu_hybrid_cache` counterpart of the `lru_hybrid_cache` methods
-	/// above -- structurally identical, recording to the `lru_lfu_hybrid_*`
-	/// counters/gauges instead.
-	///
-	/// No `drain_demotions()`-style disambiguation is needed here (unlike the
-	/// `lfu_hybrid_cache` sibling below): `LruLfuHybridStack` admits every
-	/// brand-new key to the fast tier and emits no migration for it, so every
-	/// `Tier::Slow` migration it produces is a genuine demotion and every
-	/// `Tier::Fast` one a genuine promotion.
-	#[cfg(feature = "lru_lfu_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_lru_lfu_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_lru_lfu_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "lru_lfu_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		// Refreshed unconditionally (not gated on `migrations` being
-		// non-empty): gating it on "a migration just happened" left
-		// `lru_lfu_hybrid_stats`'s
-		// `fast_objects`/`slow_objects`/`fast_bytes_used`/`slow_bytes_used`
-		// able to go stale and never catch up to the stack's true state --
-		// e.g. the tail of a large insert burst that happens to land without
-		// triggering one further demotion left these gauges permanently
-		// short of the real tracked count, discovered while diagnosing a
-		// reported DRAM-usage gap (the gauges themselves turned out fine;
-		// only their refresh cadence was wrong).
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_lru_lfu_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-
-	/// `lfu_hybrid_cache` counterpart of the `lru_hybrid_cache` method above
-	/// — same overall shape, draining `LfuHybridStack`'s migrations instead
-	/// and recording to the `lfu_hybrid_*` counters/gauges on `status`, but
-	/// with one difference: a `Tier::Slow` migration here isn't always a
-	/// genuine demotion — `LfuHybridStack::insert` can also route a fresh
-	/// admission directly to slow once the fast tier is already full, which
-	/// still needs the same physical `Object::set_data` correction (the
-	/// object was initially built as `Fast` by the API layer) but must not
-	/// be counted as a demotion (no existing fast-tier object was
-	/// displaced). So every migration is still applied physically here, but
-	/// the demotion *count* comes from `drain_demotions` instead of being
-	/// inferred per-entry from `Tier::Slow`.
-	///
-	/// Also mirrors `stack.admission_latched()` onto `AtomicStatus` on every
-	/// call (unconditionally, before the empty-migrations early return —
-	/// this method already runs after every event, per-event, so this keeps
-	/// the mirror fresh regardless of whether *this particular* event
-	/// produced a migration) so `PaperCache::set()`, running on the
-	/// API-calling thread with no direct access to this worker-owned stack,
-	/// can build a brand-new key's `TieredBuffer` in the correct tier up
-	/// front instead of always guessing fast.
-	///
-	/// Same inline-sequential, demotions-before-promotions shape as the
-	/// `lru_hybrid_cache` sibling above (see its comment): every
-	/// `Tier::Slow` entry in this batch -- genuine demotions and
-	/// fresh-admission-to-slow corrections alike -- is applied before any
-	/// `Tier::Fast` (promotion) entry, so a promotion never allocates
-	/// fast-tier DRAM ahead of the demotion(s) that were supposed to make
-	/// room for it.
-	#[cfg(feature = "lfu_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				// Not counted per-entry here -- unlike the other two
-				// hybrids, a `Tier::Slow` entry isn't always a genuine
-				// demotion (see the doc comment above this method's
-				// declaration); the real count comes from
-				// `stack.drain_demotions()` below, unchanged from before.
-				parallel_migration::apply_batch(demotions, &apply_physical);
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_lfu_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-
-			let demotions = stack.drain_demotions();
-			self.status.record_lfu_hybrid_demotions(demotions);
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "lfu_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		// Mirrored alongside the gauges for the same reason, and with the
-		// same safety: the latch is one-way (it closes when the fast tier
-		// first fills and never reopens except on `clear`), so a mirror
-		// that lags by one pass of the event loop only means a handful of
-		// sets around the transition build `Fast` and get corrected --
-		// exactly the behaviour that existed before the latch, for a
-		// moment, rather than any incorrect placement.
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_lfu_hybrid_admission_latched(stack.admission_latched());
-		}
-
-		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
-		// comment on this same pattern for why gating it on `migrations`
-		// being non-empty let these gauges go stale and never catch up.
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_lfu_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	/// `two_q_hybrid_cache` counterpart of the two methods above — identical
-	/// shape, draining `TwoQHybridStack`'s migrations instead and recording
-	/// to the `two_q_hybrid_*` counters/gauges on `status`.
-	///
-	/// Same inline-sequential, demotions-before-promotions shape as the
-	/// `lru_hybrid_cache` sibling above (see its comment): all demotions
-	/// in this batch are applied before any promotion in the same batch
-	/// begins.
-	#[cfg(feature = "two_q_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_two_q_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_two_q_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "two_q_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
-		// comment on this same pattern for why gating it on `migrations`
-		// being non-empty let these gauges go stale and never catch up.
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_two_q_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	/// `two_q_fast_admission_hybrid_cache` counterpart of the methods above — identical
-	/// shape, draining `TwoQFastAdmissionHybridStack`'s migrations instead and recording
-	/// to the `two_q_fast_admission_hybrid_*` counters/gauges on `status`.
-	///
-	/// Note this design's `promotions` counter only ever counts genuine
-	/// slow->fast moves: its FIFO->main promotion is Fast->Fast and emits
-	/// no migration at all (see `TwoQFastAdmissionHybridStack`'s module
-	/// doc), so nothing reaches here to be counted for it.
-	///
-	/// Same inline-sequential, demotions-before-promotions shape as the
-	/// `lru_hybrid_cache` sibling above (see its comment): all demotions
-	/// in this batch are applied before any promotion in the same batch
-	/// begins.
-	#[cfg(feature = "two_q_fast_admission_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_two_q_fast_admission_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_two_q_fast_admission_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "two_q_fast_admission_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
-		// comment on this same pattern for why gating it on `migrations`
-		// being non-empty let these gauges go stale and never catch up.
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_two_q_fast_admission_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	/// `two_q_fast_admission_reprieve_hybrid_cache` counterpart of the methods above — identical
-	/// shape, draining `TwoQFastAdmissionHybridStack`'s migrations instead and recording
-	/// to the `two_q_fast_admission_reprieve_hybrid_*` counters/gauges on `status`.
-	///
-	/// Note `demotions` here covers both real fast->slow demotions AND
-	/// one-access keys reprieved out of the FIFO queue -- both are
-	/// `Tier::Slow` migrations carrying a real DRAM->PMEM copy, and the
-	/// stack does not distinguish them.
-	///
-	/// Note this design's `promotions` counter only ever counts genuine
-	/// slow->fast moves: its FIFO->main promotion is Fast->Fast and emits
-	/// no migration at all (see `TwoQFastAdmissionHybridStack`'s module
-	/// doc), so nothing reaches here to be counted for it.
-	///
-	/// Same inline-sequential, demotions-before-promotions shape as the
-	/// `lru_hybrid_cache` sibling above (see its comment): all demotions
-	/// in this batch are applied before any promotion in the same batch
-	/// begins.
-	#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_two_q_fast_admission_reprieve_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_two_q_fast_admission_reprieve_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
-		// comment on this same pattern for why gating it on `migrations`
-		// being non-empty let these gauges go stale and never catch up.
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_two_q_fast_admission_reprieve_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	/// `fifo_hybrid_cache` counterpart of the three methods above — same
-	/// overall shape, draining `FifoHybridStack`'s migrations instead and
-	/// recording to the `fifo_hybrid_*` counters/gauges on `status`.
-	/// `FifoHybridStack` never emits a `Tier::Fast` entry at all (no
-	/// promotion path exists — see that stack's module doc), so the
-	/// `promotions` half of the demotions/promotions partition below is
-	/// always empty in practice; kept structurally symmetric with the other
-	/// three siblings anyway (cheap early exit, matches this file's
-	/// established style) rather than special-cased away.
-	///
-	/// Same inline-sequential, demotions-before-promotions shape as the
-	/// `lru_hybrid_cache` sibling above (see its comment), though it never
-	/// actually matters here since there are no promotions to order against.
-	#[cfg(feature = "fifo_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_fifo_hybrid_demotion();
-				});
-
-				// Unreachable in practice -- FifoHybridStack never emits
-				// Tier::Fast -- but applied physically anyway for the same
-				// structural-symmetry reason noted above. No
-				// `record_fifo_hybrid_promotion()` call: `fifo_hybrid_stats`'s
-				// `promotions` field stays permanently 0 by construction.
-				parallel_migration::apply_batch(promotions, apply_physical);
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "fifo_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
-		// comment on this same pattern for why gating it on `migrations`
-		// being non-empty let these gauges go stale and never catch up.
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_fifo_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	/// `lru_sized_hybrid_cache` counterpart of the four methods above —
-	/// same overall shape (drain, partition demotions/promotions on
-	/// `Tier::Slow`, demotions fully before promotions, sequential,
-	/// gauges refreshed unconditionally) as the `lru_hybrid_cache`
-	/// sibling, since every `Tier::Slow`/`Tier::Fast` migration
-	/// `LruSizedHybridStack` emits is unambiguously a genuine
-	/// demotion/promotion (no `LfuHybridStack`-style admission-latch
-	/// ambiguity — see `drain_demotions`'s doc). The only real
-	/// difference is the gauge call itself: `LruSizedHybridStack`
-	/// tracks four segments, not two, so `set_lru_sized_hybrid_gauges`
-	/// takes the four granular trait-method reads instead of two.
-	#[cfg(feature = "lru_sized_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_lru_sized_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_lru_sized_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "lru_sized_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
-		// comment on this same pattern for why gating it on `migrations`
-		// being non-empty let these gauges go stale and never catch up.
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_lru_sized_hybrid_gauges(
+			self.status.set_hybrid_sized_gauges(
 				stack.small_fast_bytes_used(),
 				stack.large_fast_bytes_used(),
 				stack.small_slow_bytes_used(),
@@ -2283,1229 +1261,6 @@ where
 				stack.large_fast_object_count() as u64,
 				stack.small_slow_object_count() as u64,
 				stack.large_slow_object_count() as u64,
-			);
-		}
-	}
-
-	/// `s3_fifo_hybrid_cache` counterpart of the methods above — identical
-	/// shape to `two_q_hybrid_cache`'s sibling, draining
-	/// `S3FifoHybridStack`'s migrations instead and recording to the
-	/// `s3_fifo_hybrid_*` counters/gauges on `status`. No `LfuHybridStack`-
-	/// style admission-latch ambiguity here (admission always lands in the
-	/// one-access queue unconditionally, never fast), so every
-	/// `Tier::Slow`/`Tier::Fast` entry is unambiguously a genuine
-	/// demotion/promotion — including the ones produced by
-	/// `give_second_chance`'s lazy, reference-bit-gated promotion, which is
-	/// still just a `Tier::Fast` migration from this method's point of view.
-	///
-	/// Same inline-sequential, demotions-before-promotions shape as the
-	/// `lru_hybrid_cache` sibling above (see its comment): every demotion in
-	/// this batch is applied before any promotion in the same batch begins.
-	#[cfg(feature = "s3_fifo_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "s3_fifo_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		// Refreshed unconditionally -- see the `lru_hybrid_cache` sibling's
-		// comment on this same pattern for why gating it on `migrations`
-		// being non-empty let these gauges go stale and never catch up.
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_s3_fifo_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	/// `two_q_ghost_hybrid_cache` counterpart of the methods above —
-	/// identical shape to `two_q_hybrid_cache`'s sibling. A ghost-queue hit
-	/// (`TwoQGhostHybridStack::admit_via_ghost_hit`) produces an ordinary
-	/// `Tier::Fast` migration, no different from any other promotion here.
-	#[cfg(feature = "two_q_ghost_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_two_q_ghost_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_two_q_ghost_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "two_q_ghost_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_two_q_ghost_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	/// `s3_fifo_ghost_hybrid_cache` counterpart of the methods above —
-	/// identical shape to `s3_fifo_hybrid_cache`'s sibling, including the
-	/// eviction-sweep-triggered `give_second_chance` promotions (see that
-	/// sibling's doc). A ghost-queue hit produces an ordinary `Tier::Fast`
-	/// migration, no different from any other promotion here.
-	#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_ghost_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_ghost_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_s3_fifo_ghost_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	/// `s3_fifo_ghost_lazy_demotion_hybrid_cache` counterpart of the method
-	/// above — identical shape, since the demotion-time reference-bit gate
-	/// this variant adds is entirely internal to the stack's own
-	/// `settle_fast_tier` (see that stack's module doc): the migrations this
-	/// drains and the way they're applied physically are unchanged, only
-	/// the stack's *decision* of which key ends up in `demotions` differs.
-	#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_ghost_lazy_demotion_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_ghost_lazy_demotion_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_s3_fifo_ghost_lazy_demotion_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	/// `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache`
-	/// counterpart of the method above — identical shape. The only
-	/// difference this variant makes (the one-access queue's bytes are
-	/// already Fast at admission time, so `promote_from_one_access`/
-	/// `admit_via_ghost_hit` no longer produce a Fast migration for the
-	/// common case -- see that stack's module doc) is entirely internal to
-	/// `drain_tier_migrations`'s own output; the physical-apply/counting
-	/// logic here is unchanged.
-	#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	/// `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache`
-	/// counterpart of the method above — identical shape. The new
-	/// mid-slow-segment checkpoint this variant adds only decides *which*
-	/// key ends up in a migration (via the stack's own `settle_fast_tier`/
-	/// `give_second_chance`/`check_slow_midpoint`), not how migrations get
-	/// drained, applied, or counted here.
-	#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	/// Same shape as the `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache`
-	/// sibling above -- this variant's differences (no ghost queue, the
-	/// one-access queue's own capacity pressure settled synchronously
-	/// instead of through eviction) are entirely internal to the stack;
-	/// migrations still drain, apply, and count exactly the same way here.
-	#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	#[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_lazy_demotion_reprieve_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_lazy_demotion_reprieve_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	#[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_s3_fifo_lazy_demotion_reprieve_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-			);
-		}
-	}
-
-	#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
-	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let migrations = stack.drain_tier_migrations();
-
-		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
-
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held. `migrate` is a real allocation plus a full byte
-				// copy of the value -- a PMEM write on demotion, a PMEM
-				// read on promotion -- and at this crate's real object
-				// sizes (~16 KB average on the benchmark traces) that is
-				// microseconds, not nanoseconds. Holding the shard's
-				// *write* guard across it stalls every concurrent `get()`
-				// that hashes to the same shard, which surfaces as GET tail
-				// latency rather than a uniform slowdown.
-				//
-				// `Object::data()` is only an `Arc` refcount bump, and the
-				// `Arc` keeps the source bytes alive independently of the
-				// map, so the snapshot below is safe to use unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					// Standing pool enabled: hand off the allocate-copy-swap and
-					// return, leaving the worker free for stack mutation. The
-					// consumer runs the identical body below.
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					// Declined: already in the requested tier, nothing to move.
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					// Re-acquire only to swap the pointer. The `ptr_eq`
-					// guard matters: `PaperCache::set()` runs on the API
-					// thread and can replace this entry while the copy
-					// above is in flight, and writing `new_data` over a
-					// *replacement* value would resurrect the bytes of the
-					// value it replaced. If the object changed (or was
-					// evicted), the migration is stale -- drop it, and let
-					// the stack's next event re-derive the correct tier.
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_demotion();
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_promotion();
-				});
-
-				// With the pool enabled the copies above are still in flight when
-				// this returns: the stack's tier tags are already correct, but the
-				// bytes have not moved yet. Tests assert on buffer contents
-				// immediately afterwards, so in test builds the batch is drained
-				// before returning -- keeping those assertions deterministic while
-				// still exercising the real queue path rather than bypassing it.
-				// Production keeps the asynchrony, which is the entire point.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
-		}
-	}
-
-	/// Republishes the active hybrid stack's tier gauges onto
-	/// `AtomicStatus`, backing this feature's `*_hybrid_stats()`
-	/// accessor.
-	///
-	/// Split out of `apply_tier_migrations` and called once per pass of
-	/// the event loop rather than once per event. These are pure gauges --
-	/// a snapshot of state the stack already owns -- so republishing them
-	/// after each batch reports exactly the same values as republishing
-	/// after each event; only the write frequency changes. That frequency
-	/// mattered: it put four virtual calls and four atomic stores into
-	/// `AtomicStatus` on the path of every single cache read, and those
-	/// stores land in the same struct the API threads are concurrently
-	/// incrementing their hit/miss counters in.
-	///
-	/// Still unconditional (not gated on a migration having happened):
-	/// that gate is what let these gauges go stale indefinitely -- see the
-	/// note in `apply_tier_migrations` -- and removing it is what fixed
-	/// them. This only moves *when* the refresh runs, not *whether*.
-	#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
-	fn refresh_tier_gauges(&mut self) {
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
 			);
 		}
 	}
@@ -3620,94 +1375,9 @@ where
 			};
 			_evicted_this_call += 1;
 
-			#[cfg(feature = "lru_hybrid_cache")]
-			if *policy == PaperPolicy::LruHybrid {
-				self.status.record_lru_hybrid_eviction();
-			}
-
-			#[cfg(feature = "lru_lfu_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::LruLfuHybrid(_)) {
-				self.status.record_lru_lfu_hybrid_eviction();
-			}
-
-			#[cfg(feature = "lfu_hybrid_cache")]
-			if *policy == PaperPolicy::LfuHybrid {
-				self.status.record_lfu_hybrid_eviction();
-			}
-
-			#[cfg(feature = "two_q_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::TwoQHybrid(_)) {
-				self.status.record_two_q_hybrid_eviction();
-			}
-
-			#[cfg(feature = "two_q_fast_admission_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::TwoQFastAdmissionHybrid(_)) {
-				self.status.record_two_q_fast_admission_hybrid_eviction();
-			}
-
-			#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::TwoQFastAdmissionReprieveHybrid(_)) {
-				self.status.record_two_q_fast_admission_reprieve_hybrid_eviction();
-			}
-
-			#[cfg(feature = "fifo_hybrid_cache")]
-			if *policy == PaperPolicy::FifoHybrid {
-				self.status.record_fifo_hybrid_eviction();
-			}
-
-			#[cfg(feature = "lru_sized_hybrid_cache")]
-			if *policy == PaperPolicy::LruSizedHybrid {
-				self.status.record_lru_sized_hybrid_eviction();
-			}
-
-			#[cfg(feature = "s3_fifo_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::S3FifoHybrid(_)) {
-				self.status.record_s3_fifo_hybrid_eviction();
-			}
-
-			#[cfg(feature = "two_q_ghost_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::TwoQGhostHybrid(_)) {
-				self.status.record_two_q_ghost_hybrid_eviction();
-			}
-
-			#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::S3FifoGhostHybrid(_)) {
-				self.status.record_s3_fifo_ghost_hybrid_eviction();
-			}
-
-			#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::S3FifoGhostLazyDemotionHybrid(_)) {
-				self.status.record_s3_fifo_ghost_lazy_demotion_hybrid_eviction();
-			}
-
-			#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_)) {
-				self.status.record_s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_eviction();
-			}
-
-			#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(_)) {
-				self.status.record_s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_eviction();
-			}
-
-			#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(_)) {
-				self.status.record_s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_eviction();
-			}
-
-			#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(_)) {
-				self.status.record_s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_eviction();
-			}
-
-			#[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::S3FifoLazyDemotionReprieveHybrid(_)) {
-				self.status.record_s3_fifo_lazy_demotion_reprieve_hybrid_eviction();
-			}
-
-			#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
-			if matches!(*policy, PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(_)) {
-				self.status.record_s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_eviction();
+			#[cfg(feature = "hybrid_cache_common")]
+			if policy.is_hybrid() {
+				self.status.record_hybrid_eviction();
 			}
 
 			// Only recorded when something can replay it. Without this gate an
@@ -3924,7 +1594,7 @@ where
 {}
 
 #[cfg(all(test, feature = "lru_hybrid_cache"))]
-mod lru_hybrid_tests {
+mod hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -4092,7 +1762,7 @@ mod lru_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.lru_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.demotions, 1);
 		assert_eq!(snapshot.promotions, 0);
 		assert_eq!(snapshot.fast_objects, 1);
@@ -4130,7 +1800,7 @@ mod lru_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.lru_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 1);
 		assert_eq!(snapshot.demotions, 2);
 
@@ -4155,7 +1825,7 @@ mod lru_hybrid_tests {
 		let mut buffered_events = Vec::new();
 		worker.apply_evictions(&mut buffered_events).unwrap();
 
-		let evictions = status.lru_hybrid_stats().evictions;
+		let evictions = status.hybrid_stats().evictions;
 		assert!(evictions >= 1);
 		assert_eq!(objects.len() as u64, 2 - evictions);
 	}
@@ -4190,7 +1860,7 @@ mod lru_hybrid_tests {
 }
 
 #[cfg(all(test, feature = "lfu_hybrid_cache"))]
-mod lfu_hybrid_tests {
+mod hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -4239,7 +1909,7 @@ mod lfu_hybrid_tests {
 		(target as f64 / watermarks::low()).ceil() as CacheSize
 	}
 
-	// Same rationale as `lru_hybrid_tests::make_worker`: exercises the real
+	// Same rationale as `hybrid_tests::make_worker`: exercises the real
 	// `PolicyWorker` migration pipeline end to end using a plain `Box<[u8]>`
 	// value type and a trivial "migrate" closure, without needing the real
 	// `Hybrid` slow-tier allocator that `TieredBuffer::new_slow` depends on.
@@ -4260,7 +1930,7 @@ mod lfu_hybrid_tests {
 
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		// See `lru_hybrid_tests::make_worker` for why this must never change
+		// See `hybrid_tests::make_worker` for why this must never change
 		// the buffer's byte length (a migration that does desyncs
 		// `base_used_size` and can hang `apply_evictions`'s loop forever).
 		let migrate: Box<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
@@ -4336,7 +2006,7 @@ mod lfu_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.lfu_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.demotions, 0);
 		assert_eq!(snapshot.promotions, 0);
 		assert_eq!(snapshot.fast_objects, 1);
@@ -4392,7 +2062,7 @@ mod lfu_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.lfu_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 1);
 		assert_eq!(snapshot.demotions, 1);
 
@@ -4419,7 +2089,7 @@ mod lfu_hybrid_tests {
 		let mut buffered_events = Vec::new();
 		worker.apply_evictions(&mut buffered_events).unwrap();
 
-		let evictions = status.lfu_hybrid_stats().evictions;
+		let evictions = status.hybrid_stats().evictions;
 		assert!(evictions >= 1);
 		assert_eq!(objects.len() as u64, 2 - evictions);
 	}
@@ -4454,7 +2124,7 @@ mod lfu_hybrid_tests {
 }
 
 #[cfg(all(test, feature = "fifo_hybrid_cache"))]
-mod fifo_hybrid_tests {
+mod hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -4471,7 +2141,7 @@ mod fifo_hybrid_tests {
 	// reserves out of the fast-tier budget (via `with_shared_overhead`) is
 	// now wired up for *every* hybrid variant, `FifoHybrid` included — it is
 	// no longer an LRU/LFU-only concern, so this module needs the same
-	// headroom helpers as `lru_hybrid_tests`. Tests that size the fast tier
+	// headroom helpers as `hybrid_tests`. Tests that size the fast tier
 	// to a small, exact byte budget must add room for this reservation so
 	// their intended fast/slow boundary still holds.
 	fn shared_overhead() -> CacheSize {
@@ -4505,7 +2175,7 @@ mod fifo_hybrid_tests {
 		(target as f64 / watermarks::low()).ceil() as CacheSize
 	}
 
-	// Same rationale as `lru_hybrid_tests::make_worker`/`two_q_hybrid_tests::
+	// Same rationale as `hybrid_tests::make_worker`/`hybrid_tests::
 	// make_worker`: exercises the real `PolicyWorker` migration pipeline end
 	// to end using a plain `Box<[u8]>` value type and a trivial "migrate"
 	// closure, without needing the real `Hybrid` slow-tier allocator that
@@ -4527,7 +2197,7 @@ mod fifo_hybrid_tests {
 
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		// See `lru_hybrid_tests::make_worker` for why this must never change
+		// See `hybrid_tests::make_worker` for why this must never change
 		// the buffer's byte length (a migration that does desyncs
 		// `base_used_size` and can hang `apply_evictions`'s loop forever).
 		let migrate: Box<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
@@ -4607,7 +2277,7 @@ mod fifo_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.fifo_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.demotions, 1);
 		assert_eq!(snapshot.promotions, 0);
 		assert_eq!(snapshot.fast_objects, 1);
@@ -4640,7 +2310,7 @@ mod fifo_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot_before = status.fifo_hybrid_stats();
+		let snapshot_before = status.hybrid_stats();
 		assert_eq!(snapshot_before.demotions, 1);
 
 		// A "hit" on the now-slow key must be a total no-op.
@@ -4648,7 +2318,7 @@ mod fifo_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot_after = status.fifo_hybrid_stats();
+		let snapshot_after = status.hybrid_stats();
 		assert_eq!(snapshot_after.demotions, snapshot_before.demotions);
 		assert_eq!(snapshot_after.promotions, 0);
 		assert_eq!(snapshot_after.fast_objects, snapshot_before.fast_objects);
@@ -4675,7 +2345,7 @@ mod fifo_hybrid_tests {
 		let mut buffered_events = Vec::new();
 		worker.apply_evictions(&mut buffered_events).unwrap();
 
-		let evictions = status.fifo_hybrid_stats().evictions;
+		let evictions = status.hybrid_stats().evictions;
 		assert!(evictions >= 1);
 		assert_eq!(objects.len() as u64, 2 - evictions);
 	}
@@ -4710,7 +2380,7 @@ mod fifo_hybrid_tests {
 }
 
 #[cfg(all(test, feature = "two_q_fast_admission_hybrid_cache"))]
-mod two_q_fast_admission_hybrid_tests {
+mod hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -4734,7 +2404,7 @@ mod two_q_fast_admission_hybrid_tests {
 	/// The FIFO queue's fixed reservation, which
 	/// `TwoQFastAdmissionHybridStack::effective_main_fast_capacity` carves
 	/// out of `fast_capacity` before anything else. Unlike
-	/// `two_q_hybrid_tests`' independent FIFO budget, this one comes *out of*
+	/// `hybrid_tests`' independent FIFO budget, this one comes *out of*
 	/// the fast tier, so a test sizing the main queue's fast segment must add
 	/// it back on top.
 	fn fifo_reservation(max_size: CacheSize) -> CacheSize {
@@ -4780,7 +2450,7 @@ mod two_q_fast_admission_hybrid_tests {
 		(target as f64 / watermarks::low()).ceil() as CacheSize
 	}
 
-	/// `k_in` is deliberately tiny (not `1.0`, unlike `two_q_hybrid_tests`):
+	/// `k_in` is deliberately tiny (not `1.0`, unlike `hybrid_tests`):
 	/// here the FIFO budget is carved *out of* the fast tier, so a large
 	/// `k_in` would leave the main queue no fast segment at all and every
 	/// promotion would self-demote. `K_IN` of these tests' `MAX_SIZE`
@@ -4862,7 +2532,7 @@ mod two_q_fast_admission_hybrid_tests {
 
 	/// The whole point of this design: a brand-new key is admitted fast and
 	/// stays fast, with no migration to correct it. Contrast
-	/// `two_q_hybrid_tests::admission_lands_slow_and_promotion_physically_moves_bytes`.
+	/// `hybrid_tests::admission_lands_slow_and_promotion_physically_moves_bytes`.
 	#[test]
 	fn admission_lands_fast_and_needs_no_migration() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000);
@@ -4873,7 +2543,7 @@ mod two_q_fast_admission_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.two_q_fast_admission_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 0);
 		assert_eq!(snapshot.demotions, 0);
 		assert_eq!(snapshot.fast_objects, 1);
@@ -4909,7 +2579,7 @@ mod two_q_fast_admission_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.two_q_fast_admission_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 0);
 		assert_eq!(snapshot.demotions, 0);
 		assert_eq!(snapshot.fast_objects, 1);
@@ -4943,7 +2613,7 @@ mod two_q_fast_admission_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.two_q_fast_admission_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.demotions, 1);
 		assert_eq!(snapshot.slow_objects, 1);
 
@@ -4976,13 +2646,13 @@ mod two_q_fast_admission_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		assert_eq!(status.two_q_fast_admission_hybrid_stats().demotions, 1);
+		assert_eq!(status.hybrid_stats().demotions, 1);
 
 		worker.handle_get(1, true);
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.two_q_fast_admission_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 1);
 
 		let data_1 = objects.get_ref(&1).unwrap().data();
@@ -5005,7 +2675,7 @@ mod two_q_fast_admission_hybrid_tests {
 		let mut buffered_events = Vec::new();
 		worker.apply_evictions(&mut buffered_events).unwrap();
 
-		let evictions = status.two_q_fast_admission_hybrid_stats().evictions;
+		let evictions = status.hybrid_stats().evictions;
 		assert!(evictions >= 1);
 		assert_eq!(objects.len() as u64, 2 - evictions);
 	}
@@ -5025,7 +2695,7 @@ mod two_q_fast_admission_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let named = status.two_q_fast_admission_hybrid_stats();
+		let named = status.hybrid_stats();
 		let common = status.hybrid_stats();
 
 		assert_eq!(common.promotions, named.promotions);
@@ -5040,7 +2710,7 @@ mod two_q_fast_admission_hybrid_tests {
 }
 
 #[cfg(all(test, feature = "two_q_fast_admission_reprieve_hybrid_cache"))]
-mod two_q_fast_admission_reprieve_hybrid_tests {
+mod hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -5053,7 +2723,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 
 	type TestBuffer = Box<[u8]>;
 
-	/// `k_in` is deliberately tiny (not `1.0`, unlike `two_q_hybrid_tests`):
+	/// `k_in` is deliberately tiny (not `1.0`, unlike `hybrid_tests`):
 	/// here the FIFO budget is carved *out of* the fast tier, so a large
 	/// `k_in` would leave the main queue no fast segment at all and every
 	/// promotion would self-demote. `0.001` of these tests' `max_size`
@@ -5209,7 +2879,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 	/// charged once and divided, not charged twice.
 	///
 	/// That proportional split is why this module cannot reuse
-	/// `two_q_fast_admission_hybrid_tests`' "just add `n * shared_overhead()`"
+	/// `hybrid_tests`' "just add `n * shared_overhead()`"
 	/// adjustment: there the FIFO reservation is 1 byte and the main queue
 	/// absorbs essentially the whole reservation, whereas here it is
 	/// `FIFO_CAPACITY` (1,000) against a main budget of a few dozen bytes, so
@@ -5264,7 +2934,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 
 	/// The whole point of this design: a brand-new key is admitted fast and
 	/// stays fast, with no migration to correct it. Contrast
-	/// `two_q_hybrid_tests::admission_lands_slow_and_promotion_physically_moves_bytes`.
+	/// `hybrid_tests::admission_lands_slow_and_promotion_physically_moves_bytes`.
 	#[test]
 	fn admission_lands_fast_and_needs_no_migration() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(TEST_MAX_SIZE);
@@ -5275,7 +2945,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.two_q_fast_admission_reprieve_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 0);
 		assert_eq!(snapshot.demotions, 0);
 		assert_eq!(snapshot.fast_objects, 1);
@@ -5301,7 +2971,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.two_q_fast_admission_reprieve_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 0);
 		assert_eq!(snapshot.demotions, 0);
 		assert_eq!(snapshot.fast_objects, 1);
@@ -5336,7 +3006,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.two_q_fast_admission_reprieve_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.demotions, 1);
 		assert_eq!(snapshot.slow_objects, 1);
 
@@ -5370,13 +3040,13 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		assert_eq!(status.two_q_fast_admission_reprieve_hybrid_stats().demotions, 1);
+		assert_eq!(status.hybrid_stats().demotions, 1);
 
 		worker.handle_get(1, true);
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.two_q_fast_admission_reprieve_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 1);
 
 		let data_1 = objects.get_ref(&1).unwrap().data();
@@ -5399,7 +3069,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		let mut buffered_events = Vec::new();
 		worker.apply_evictions(&mut buffered_events).unwrap();
 
-		let evictions = status.two_q_fast_admission_reprieve_hybrid_stats().evictions;
+		let evictions = status.hybrid_stats().evictions;
 		assert!(evictions >= 1);
 		assert_eq!(objects.len() as u64, 2 - evictions);
 	}
@@ -5424,7 +3094,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.two_q_fast_admission_reprieve_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 
 		assert!(snapshot.demotions > 0, "FIFO pressure should have reprieved");
 		assert_eq!(snapshot.evictions, 0, "a reprieve must not evict");
@@ -5459,7 +3129,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		// max_size is nowhere near exceeded and FIFO pressure is relieved
 		// internally, so the eviction loop should have removed nothing.
 		assert_eq!(objects.len(), 40);
-		assert_eq!(status.two_q_fast_admission_reprieve_hybrid_stats().evictions, 0);
+		assert_eq!(status.hybrid_stats().evictions, 0);
 	}
 
 	/// `hybrid_stats()` (the design-neutral accessor) must agree with this
@@ -5477,7 +3147,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let named = status.two_q_fast_admission_reprieve_hybrid_stats();
+		let named = status.hybrid_stats();
 		let common = status.hybrid_stats();
 
 		assert_eq!(common.promotions, named.promotions);
@@ -5492,7 +3162,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 }
 
 #[cfg(all(test, feature = "two_q_hybrid_cache"))]
-mod two_q_hybrid_tests {
+mod hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -5524,7 +3194,7 @@ mod two_q_hybrid_tests {
 	// razor-thin margins these tests intentionally use ("fits exactly one
 	// object"), a drain target below what a single already-resident object
 	// needs sweeps out the key the scenario is actually about. Worse here
-	// than in `lru_hybrid_tests`: `promote_from_fifo`/`touch_main_fast` push
+	// than in `hybrid_tests`: `promote_from_fifo`/`touch_main_fast` push
 	// their `(key, Tier::Fast)` migration only if the key is *still* Fast
 	// after their own `settle_fast_tier` call, so a too-tight budget doesn't
 	// merely add a demotion -- it erases the promotion under test entirely.
@@ -5550,7 +3220,7 @@ mod two_q_hybrid_tests {
 	// k_in=1.0 keeps fifo_capacity == max_size, so these tests can focus on
 	// fast-tier (main-queue) behavior via `handle_resize_fast_tier` without
 	// incidentally tripping fifo-capacity pressure. Same rationale as
-	// `lru_hybrid_tests`/`lfu_hybrid_tests::make_worker` otherwise.
+	// `hybrid_tests`/`hybrid_tests::make_worker` otherwise.
 	fn make_worker(max_size: CacheSize) -> (
 		PolicyWorker<u32, TestBuffer>,
 		ObjectMapRef<u32, TestBuffer>,
@@ -5647,7 +3317,7 @@ mod two_q_hybrid_tests {
 		// so the gauges (only refreshed when a migration is drained) are
 		// still at their initial zero here; only `promotions` is meaningful
 		// to check at this point.
-		let snapshot = status.two_q_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 0);
 
 		let data = objects.get_ref(&1).unwrap().data();
@@ -5658,7 +3328,7 @@ mod two_q_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.two_q_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 1);
 		assert_eq!(snapshot.fast_objects, 1);
 
@@ -5696,7 +3366,7 @@ mod two_q_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.two_q_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 2);
 		assert_eq!(snapshot.demotions, 1);
 
@@ -5716,7 +3386,7 @@ mod two_q_hybrid_tests {
 		let mut buffered_events = Vec::new();
 		worker.apply_evictions(&mut buffered_events).unwrap();
 
-		let evictions = status.two_q_hybrid_stats().evictions;
+		let evictions = status.hybrid_stats().evictions;
 		assert!(evictions >= 1);
 		assert_eq!(objects.len() as u64, 2 - evictions);
 	}
@@ -5750,7 +3420,7 @@ mod two_q_hybrid_tests {
 }
 
 #[cfg(all(test, feature = "lru_sized_hybrid_cache"))]
-mod lru_sized_hybrid_tests {
+mod hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -5763,13 +3433,13 @@ mod lru_sized_hybrid_tests {
 
 	type TestBuffer = Box<[u8]>;
 
-	// See `lru_hybrid_tests::shared_overhead`'s identical rationale.
+	// See `hybrid_tests::shared_overhead`'s identical rationale.
 	#[allow(dead_code)]
 	fn shared_overhead() -> CacheSize {
 		get_hybrid_dram_shared_overhead(&PaperPolicy::LruSizedHybrid) as CacheSize
 	}
 
-	// See `lru_hybrid_tests::low_water_safe`'s identical rationale --
+	// See `hybrid_tests::low_water_safe`'s identical rationale --
 	// `LruSizedHybridStack` settles each of its two fast segments with
 	// the same shared high/low watermark pair (`settle_small_fast` /
 	// `settle_large_fast`), so one conversion serves both.
@@ -5787,7 +3457,7 @@ mod lru_sized_hybrid_tests {
 	// instead of silently re-breaking the tests.
 	//
 	// NOTE: callers here do NOT add `shared_overhead()` on top, unlike
-	// `lru_hybrid_tests`'s: these tests deliberately pair a tiny SMALL
+	// `hybrid_tests`'s: these tests deliberately pair a tiny SMALL
 	// segment capacity with a huge LARGE one, so
 	// `LruSizedHybridStack::reserved_shares` proportions effectively all
 	// of the reservation onto the large segment and the small segment's
@@ -5796,7 +3466,7 @@ mod lru_sized_hybrid_tests {
 		(target as f64 / watermarks::low()).ceil() as CacheSize
 	}
 
-	// Mirrors `lru_hybrid_tests::make_worker` exactly, seeded with
+	// Mirrors `hybrid_tests::make_worker` exactly, seeded with
 	// `PaperPolicy::LruSizedHybrid` instead.
 	fn make_worker(max_size: CacheSize) -> (
 		PolicyWorker<u32, TestBuffer>,
@@ -5846,7 +3516,7 @@ mod lru_sized_hybrid_tests {
 		(worker, objects, status, overhead_manager)
 	}
 
-	// Mirrors `lru_hybrid_tests::insert` exactly.
+	// Mirrors `hybrid_tests::insert` exactly.
 	fn insert(
 		objects: &ObjectMapRef<u32, TestBuffer>,
 		status: &StatusRef,
@@ -5864,7 +3534,7 @@ mod lru_sized_hybrid_tests {
 		worker.handle_set(key, base_size);
 	}
 
-	// Mirrors `lru_hybrid_tests::base_size_of` exactly.
+	// Mirrors `hybrid_tests::base_size_of` exactly.
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
 		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
 		overhead_manager.base_size(&probe)
@@ -5878,7 +3548,7 @@ mod lru_sized_hybrid_tests {
 		// segment's capacity dwarf the small one's, so the shared-metadata
 		// reservation's share against small stays negligible (rounds to 0)
 		// -- see `LruSizedHybridStack::reserved_shares`. Lets this test
-		// reuse the same simple math `lru_hybrid_tests`'s equivalent uses.
+		// reuse the same simple math `hybrid_tests`'s equivalent uses.
 		worker.handle_resize_size_threshold(1_000_000);
 		worker.handle_resize_large_fast_tier(1_000_000);
 		worker.handle_resize_fast_tier(
@@ -5891,7 +3561,7 @@ mod lru_sized_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.lru_sized_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.demotions, 1);
 		assert_eq!(snapshot.promotions, 0);
 		assert_eq!(snapshot.fast_objects, 1);
@@ -5924,7 +3594,7 @@ mod lru_sized_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.lru_sized_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 1);
 		assert_eq!(snapshot.demotions, 2);
 
@@ -5944,7 +3614,7 @@ mod lru_sized_hybrid_tests {
 		let mut buffered_events = Vec::new();
 		worker.apply_evictions(&mut buffered_events).unwrap();
 
-		let evictions = status.lru_sized_hybrid_stats().evictions;
+		let evictions = status.hybrid_stats().evictions;
 		assert!(evictions >= 1);
 		assert_eq!(objects.len() as u64, 2 - evictions);
 	}
@@ -5991,8 +3661,8 @@ mod lru_sized_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		assert_eq!(status.lru_sized_hybrid_stats().small_fast_objects, 1);
-		assert_eq!(status.lru_sized_hybrid_stats().large_fast_objects, 1);
+		assert_eq!(status.hybrid_stats().small_fast_objects, 1);
+		assert_eq!(status.hybrid_stats().large_fast_objects, 1);
 
 		// Shrinking only the SMALL segment's budget demotes key 1 without
 		// touching key 2 in the large segment.
@@ -6000,7 +3670,7 @@ mod lru_sized_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let snapshot = status.lru_sized_hybrid_stats();
+		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.demotions, 1);
 		assert_eq!(snapshot.small_slow_objects, 1);
 		assert_eq!(snapshot.large_fast_objects, 1);
@@ -6021,9 +3691,9 @@ mod lru_sized_hybrid_tests {
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15); // small
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
-		assert_eq!(status.lru_sized_hybrid_stats().small_fast_objects, 1);
+		assert_eq!(status.hybrid_stats().small_fast_objects, 1);
 
-		let before = status.lru_sized_hybrid_stats();
+		let before = status.hybrid_stats();
 
 		// A re-`handle_set` for the same key with a larger size mirrors what
 		// `PaperCache::set()` does on a real overwrite (recompute base_size,
@@ -6033,7 +3703,7 @@ mod lru_sized_hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let after = status.lru_sized_hybrid_stats();
+		let after = status.hybrid_stats();
 		assert_eq!(after.small_fast_objects, 0);
 		assert_eq!(after.large_fast_objects, 1);
 		// A fast<->fast reclassification never crosses Tier, so it's

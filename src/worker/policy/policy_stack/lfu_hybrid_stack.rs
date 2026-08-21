@@ -591,6 +591,10 @@ impl LfuHybridStack {
 }
 
 impl PolicyStack for LfuHybridStack {
+	fn inline_demotion_accounting(&self) -> bool {
+		false
+	}
+
 	fn is_policy(&self, policy: &PaperPolicy) -> bool {
 		matches!(policy, PaperPolicy::LfuHybrid)
 	}
