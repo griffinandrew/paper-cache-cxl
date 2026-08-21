@@ -303,8 +303,9 @@ unsafe extern "C" fn numa_extent_alloc(
 ) -> *mut c_void {
 	let cfg = unsafe { NumaHooks::from_ptr(hooks) };
 
-	// A specific address cannot be honoured while also guaranteeing a fresh
-	// bound mapping; declining lets jemalloc fall back to a normal request.
+	// Declining a specific address is legal -- jemalloc's contract permits
+	// returning NULL -- and honouring it via MAP_FIXED_NOREPLACE was tested
+	// and changed nothing, so the simple path stays.
 	if !new_addr.is_null() {
 		cfg.alloc_declined.fetch_add(1, Ordering::Relaxed);
 		return std::ptr::null_mut();
@@ -344,6 +345,28 @@ unsafe extern "C" fn numa_extent_dalloc(
 	_arena_ind: c_uint,
 ) -> bool {
 	let cfg = unsafe { NumaHooks::from_ptr(hooks) };
+
+	// Under `retain`, refuse -- exactly what jemalloc's own hook does:
+	//
+	//     bool extent_dalloc_mmap(void *addr, size_t size) {
+	//         if (!opt_retain) { pages_unmap(addr, size); }
+	//         return opt_retain;
+	//     }
+	//
+	// `retain` means jemalloc keeps the address space and reuses it. Unmapping
+	// here while jemalloc still believes it owns the range makes the two
+	// disagree about what is mapped, and its retained-extent tree eventually
+	// walks into memory that is gone -- a SIGSEGV inside
+	// `extent_try_coalesce`. It surfaced only with several arenas and a
+	// concurrent migration worker (more retained extents, more coalescing),
+	// which is why it looked like an arena-count problem and was not.
+	//
+	// Costs nothing resident: retained extents are decommitted, and peak RSS
+	// measured identical either way (12.50 GB vs 12.46 GB over 20M accesses).
+	if retain_enabled() {
+		return true;
+	}
+
 	let rc = unsafe { libc::munmap(addr, size) };
 
 	if rc == 0 {
@@ -352,6 +375,28 @@ unsafe extern "C" fn numa_extent_dalloc(
 
 	// `false` == success.
 	rc != 0
+}
+
+/// jemalloc's `opt.retain`, read from jemalloc rather than assumed.
+///
+/// It defaults on for 64-bit Linux but is configurable, and the `dalloc`
+/// contract differs between the two settings, so it is queried.
+fn retain_enabled() -> bool {
+	static ON: OnceLock<bool> = OnceLock::new();
+	*ON.get_or_init(|| {
+		let mut value: bool = false;
+		let mut sz = size_of::<bool>();
+		let rc = unsafe {
+			mallctl(
+				c"opt.retain".as_ptr(),
+				(&raw mut value).cast(),
+				&raw mut sz,
+				std::ptr::null_mut(),
+				0,
+			)
+		};
+		rc == 0 && value
+	})
 }
 
 unsafe extern "C" fn numa_extent_destroy(
@@ -381,15 +426,16 @@ unsafe extern "C" fn numa_extent_commit(
 
 unsafe extern "C" fn numa_extent_decommit(
 	_hooks: *mut ExtentHooks,
-	_addr: *mut c_void,
+	addr: *mut c_void,
 	_size: size_t,
-	_offset: size_t,
-	_length: size_t,
+	offset: size_t,
+	length: size_t,
 	_arena_ind: c_uint,
 ) -> bool {
-	// Opt out: decommitting would drop the VMA and with it the mbind policy,
-	// so a later recommit could land on the wrong node. `true` == failure,
-	// which tells jemalloc to keep the extent committed.
+	// Refuse. Decommitting via munmap or PROT_NONE would drop the VMA and its
+	// mbind policy; MADV_DONTNEED would keep both, but measured identically
+	// (SET 1446 vs 1454, same peak RSS) because the purge hooks already
+	// release the pages. Refusing keeps the policy attached with no cost.
 	true
 }
 
@@ -445,8 +491,11 @@ unsafe extern "C" fn numa_extent_merge(
 	_committed: bool,
 	_arena_ind: c_uint,
 ) -> bool {
-	// Both extents came from this arena and share a policy, so merging is
-	// sound. Same reasoning as `split`.
+	// Both extents belong to the same arena and share a policy. Each is an
+	// independent `mmap`, so a merge spans two mappings -- legal on Linux,
+	// where adjacent anonymous VMAs with the same policy coalesce. Refusing
+	// merges was tested against the extent-tree corruption and made no
+	// difference, so the permissive answer stands.
 	false
 }
 
