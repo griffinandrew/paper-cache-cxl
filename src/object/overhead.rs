@@ -717,43 +717,76 @@ const ARC_VALUE_HEADER_OVERHEAD: ObjectSize = 48;
 
 /// Per-object DRAM cost of the object map (`DashMap<HashedKey, Object>`):
 /// the `(u64, Object{key, Arc ptr, expiry})` pair plus hashbrown's control
-/// bytes and load-factor slack.
+/// byte and load-factor slack.
 ///
-/// CALIBRATED, not purely analytic: measured on cluster12 at 9.46M objects
-/// (u32 keys) by instrumenting the node-0 allocator -- live requested bytes
-/// minus the cache's own fast-tier value bytes came to ~277 B/object, of
-/// which the analytic policy + Arc terms account for ~112, leaving ~165 for
-/// the object map. Two known sources of variation: hashbrown's slack moves
-/// with object count relative to the table's power-of-two capacity (a
-/// sawtooth of up to tens of bytes), and a different key type changes
-/// `Object`'s size. Replaces the old 11-byte estimate, which was a 4-5x
-/// under-reservation in practice.
+/// Measured by fitting node-0 live requested bytes against object count over
+/// three steady-state runs (cluster12, fifo, 2/6/15 GB caches, all at their
+/// cap), then subtracting the two analytically-known terms:
+///
+///   metadata = 175.4 B/object x objects + 1.016 GB fixed
+///   175.4 - 64 (eviction stack) - 48 (`Arc` header) = 63
+///
+/// The 63 agrees with an independent analytic estimate of ~72 (a 40-byte
+/// pair, hashbrown's 7/8 load factor and its power-of-two table slack), which
+/// is the main reason to trust it.
+///
+/// The 1.016 GB intercept is deliberately NOT reserved: it is benchmark-side,
+/// not cache metadata. `Access::from_chunk` synthesises a value buffer per
+/// trace record (`[0u8].repeat(value_size)`) and the reader prefetches
+/// `PREFETCH_RECORDS` (256K) of them, so ~440 MB of node 0 belongs to the
+/// harness, plus its channels and client state. An earlier estimate of 165 B
+/// came from dividing total metadata by object count at a single cache size,
+/// which silently amortised that fixed cost into the per-object term -- at
+/// 1.2M objects the same arithmetic yields 989 B/object, which is what made
+/// the contamination obvious.
 #[cfg(feature = "hybrid_cache_common")]
-const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 165;
+const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 63;
 
-/// Requested-to-resident multiplier for DRAM metadata, as (numerator,
-/// denominator).
+/// Requested-to-resident multiplier for the DRAM metadata reserved above.
 ///
-/// The reservation above counts *requested* bytes, but the fast-tier budget
-/// is meant to bound *resident* DRAM, and the allocator holds more than was
-/// requested: size-class rounding (~6% on both allocators, measured), plus
-/// whatever freed memory the allocator retains rather than returning.
-/// Measured at peak on the same cluster12 run:
+/// The terms above count bytes the cache *requests*; the fast-tier budget is
+/// meant to bound bytes actually *resident*, and an allocator holds more than
+/// was asked for -- size-class rounding plus whatever it retains rather than
+/// returning to the OS. Measured at peak on cluster12:
 ///
-/// - UMF/TBB (default): usable/requested 1.0643, resident/usable 1.29 --
-///   TBB's per-thread and large-object caches hold freed pages with no purge
-///   discipline -- so ~1.37 overall.
-/// - `tikv_jemalloc_global`: active/allocated 1.0612, resident/active 1.0533
-///   (decay returns dirty pages) -- ~1.12 overall.
+/// | allocator                    | rounding | retention | total |
+/// |------------------------------|----------|-----------|-------|
+/// | UMF/TBB (default)            | 1.064    | 1.29      | ~1.37 |
+/// | jemalloc (`tikv_jemalloc_global`, `numa_jemalloc`) | 1.061 | 1.017-1.056 | 1.08-1.12 |
 ///
-/// The TBB retention component is churn-dependent (this trace cycles ~34M
-/// evictions over ~9M live objects), so it is the least general of these
-/// calibrations; override for other workloads via
-/// `DRAM_OVERHEAD_RESIDENT_FACTOR` (a float, e.g. `1.2`), recalibrating from
-/// the `umf_dram_stats()` / `jemalloc_stats()` probes.
-#[cfg(all(feature = "hybrid_cache_common", not(feature = "tikv_jemalloc_global")))]
+/// Rounding is near-identical between them; the entire difference is
+/// retention, because TBB's per-thread and large-object caches have no purge
+/// discipline while jemalloc decays dirty pages back.
+///
+/// # This is an allocator property, not a workload constant
+///
+/// It is a *ratio*, so unlike the per-object terms it is not inflated by the
+/// harness's own allocations -- those bytes pay the same multiplier. What it
+/// does depend on is churn, which depends on the fast-tier size, which this
+/// number helps determine: measured values on TBB ranged 1.29-2.75 across
+/// configurations for exactly that reason. Treat the constants as starting
+/// points for the shipped configurations and recalibrate with
+/// `DRAM_OVERHEAD_RESIDENT_FACTOR` when the workload or allocator changes;
+/// `jemalloc_stats()` and `umf_dram_stats()` report the inputs.
+///
+/// A second-order caveat: the ratio is measured process-wide, so a workload
+/// whose non-cache allocations have a very different size profile from the
+/// cache's metadata will skew it slightly.
+#[cfg(all(
+	feature = "hybrid_cache_common",
+	not(any(feature = "tikv_jemalloc_global", feature = "numa_jemalloc"))
+))]
 const DEFAULT_RESIDENT_FACTOR: f64 = 1.37;
-#[cfg(all(feature = "hybrid_cache_common", feature = "tikv_jemalloc_global"))]
+
+/// jemalloc backs the allocations, whether as the plain global allocator or
+/// through the NUMA-bound arenas -- both measured 1.08-1.12 resident/allocated,
+/// so both take the same factor. Keying this only on `tikv_jemalloc_global`
+/// left `numa_jemalloc` builds silently over-reserving by ~22% against TBB's
+/// number, shrinking their effective fast tier for no reason.
+#[cfg(all(
+	feature = "hybrid_cache_common",
+	any(feature = "tikv_jemalloc_global", feature = "numa_jemalloc")
+))]
 const DEFAULT_RESIDENT_FACTOR: f64 = 1.12;
 
 #[cfg(feature = "hybrid_cache_common")]

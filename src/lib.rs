@@ -484,6 +484,20 @@ compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' 
 #[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
 compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
 
+#[cfg(all(feature = "numa_jemalloc", any(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global")))]
+compile_error!("'numa_jemalloc' installs its own #[global_allocator]; it cannot be combined with 'jemalloc_cxl_slow_tier' or 'tikv_jemalloc_global'.");
+
+/// Node-0-bound jemalloc arenas as the process allocator.
+///
+/// Covers everything Rust allocates. It does NOT cover glibc's heap, the C
+/// libraries reached through bindgen (UMF, hwloc), or pthread stacks --
+/// jemalloc is built `JEMALLOC_PREFIX=_rjem_` and so does not interpose
+/// `malloc`. Pair with `numactl --membind=0` when the whole process must be
+/// bound.
+#[cfg(feature = "numa_jemalloc")]
+#[global_allocator]
+static GLOBAL: numa_alloc::FastAlloc = numa_alloc::NumaAlloc;
+
 #[cfg(all(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global"))]
 compile_error!("Cannot enable both 'jemalloc_cxl_slow_tier' and 'tikv_jemalloc_global' simultaneously -- both install a #[global_allocator], and only one static GLOBAL can be declared.");
 
@@ -493,6 +507,8 @@ use tikv_jemallocator::Jemalloc;
 
 #[cfg(any(feature = "hashbrown_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "all_dram", feature = "jemalloc_cxl_slow_tier"))]
 pub mod allocator;
+#[cfg(feature = "numa_jemalloc")]
+pub mod numa_alloc;
 
 use std::arch::x86_64::{_mm_clflush, _mm_sfence};
 
@@ -993,6 +1009,44 @@ active/allocated={:.4} resident/active={:.4} resident/allocated={:.4}",
 	))
 }
 
+/// Empties TBB's internal caches and reports resident memory either side.
+///
+/// Diagnostic for locating TBB's retention. `KeepAllMemory=0` only makes the
+/// pool return memory to the provider; if the bulk of the excess is instead
+/// held in per-thread block caches above the pool, this is what releases it,
+/// and RSS should fall sharply. If RSS barely moves, the memory is not in
+/// those caches and the excess is slab occupancy instead.
+pub fn umf_purge_and_report() -> String {
+	fn rss_kb() -> u64 {
+		std::fs::read_to_string("/proc/self/status")
+			.ok()
+			.and_then(|status| {
+				status
+					.lines()
+					.find(|line| line.starts_with("VmRSS:"))
+					.and_then(|line| line.split_whitespace().nth(1))
+					.and_then(|value| value.parse().ok())
+			})
+			.unwrap_or(0)
+	}
+
+	let before = rss_kb();
+	let result = unsafe { allocator::allocator_bindings_clean_all_buffers() };
+
+	// The release is asynchronous enough that reading immediately understates
+	// it; this is a diagnostic path, so a short settle is acceptable.
+	std::thread::sleep(std::time::Duration::from_millis(500));
+	let after = rss_kb();
+
+	let freed = before.saturating_sub(after);
+
+	format!(
+		"TBBPURGE rss_before_kb={before} rss_after_kb={after} freed_kb={freed} \
+freed_gb={:.2} cmd_result={result}",
+		freed as f64 / 1048576.0,
+	)
+}
+
 /// UMF/TBB node-0 accounting, the counterpart to [`jemalloc_stats`] for the
 /// default build.
 ///
@@ -1019,7 +1073,7 @@ pub fn jemalloc_stats() -> Option<String> {
 	None
 }
 
-#[cfg(not(any(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global")))]
+#[cfg(not(any(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global", feature = "numa_jemalloc")))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 

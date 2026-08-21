@@ -226,6 +226,15 @@ pub struct DRAMObjects;
 /// fragmentation plus pages not yet returned. This is the counterpart to
 /// jemalloc's `stats.allocated` / `stats.active`, which UMF/TBB does not
 /// provide.
+/// Thin wrapper so `lib.rs` can reach the private bindings module.
+///
+/// # Safety
+/// Calls into TBB; safe to invoke at any point, but it walks every thread's
+/// cache and so is not cheap. Diagnostic use only.
+pub unsafe fn allocator_bindings_clean_all_buffers() -> libc::c_int {
+    unsafe { allocator_bindings::umf_clean_all_buffers() }
+}
+
 pub fn dram_pool_stats() -> (usize, usize) {
     const NODE_DRAM_ID: libc::c_int = 0;
 

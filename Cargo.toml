@@ -27,6 +27,10 @@ rayon = "1.11.0"
 num-traits = "0.2.19"
 libc = "0.2.177"
 tikv-jemallocator = { version = "0.6.1", features = ["stats"] }
+# Direct dependency so `numa_jemalloc` actually links libjemalloc: the
+# `_rjem_*` symbols its arenas call come from this crate's build script, and
+# reaching it only transitively leaves them undefined at link time.
+tikv-jemalloc-sys = "0.6.1"
 hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"
 sysinfo = "=0.33"
@@ -409,6 +413,18 @@ s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache = ["key_va
 # variant is added, and is silently wrong (the variant gets no overhead
 # reservation, or fails to compile) whenever that edit is forgotten.
 hybrid_cache_common = []
+
+# NUMA-bound jemalloc arenas (src/numa_alloc.rs). Each node gets its own
+# arenas whose extents are mmap'd and mbind'd to that node before jemalloc
+# hands them out, so placement is decided by kernel policy at first fault
+# rather than by which CPU happens to touch the page. Replaces the UMF/TBB
+# pairing for both tiers.
+#
+# NOTE this cannot cover the whole process: jemalloc is built with
+# JEMALLOC_PREFIX=_rjem_ and so does not interpose malloc, leaving glibc's
+# heap, bindgen'd C libraries and pthread stacks outside its reach. Pair it
+# with `numactl --membind=0` if the whole process must be bound.
+numa_jemalloc = []
 
 
 

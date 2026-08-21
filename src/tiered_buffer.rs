@@ -83,8 +83,11 @@ pub enum TieredBuffer {
 
 	/// Slow tier: PMEM/CXL allocation. Backend selected at compile time --
 	/// see the module doc comment above.
-	#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
+	#[cfg(all(not(feature = "jemalloc_cxl_slow_tier"), not(feature = "numa_jemalloc")))]
 	Slow(Box<[u8], Hybrid>),
+	/// Slow tier on node-1-bound jemalloc arenas, replacing the UMF/TBB pool.
+	#[cfg(all(not(feature = "jemalloc_cxl_slow_tier"), feature = "numa_jemalloc"))]
+	Slow(Box<[u8], crate::numa_alloc::SlowAlloc>),
 	#[cfg(feature = "jemalloc_cxl_slow_tier")]
 	Slow(Box<[u8], SlowTierJemallocAllocator>),
 }
@@ -96,9 +99,15 @@ impl TieredBuffer {
 	}
 
 	/// Creates a new slow-tier (PMEM/CXL) buffer by copying the given bytes.
-	#[cfg(not(feature = "jemalloc_cxl_slow_tier"))]
+	#[cfg(all(not(feature = "jemalloc_cxl_slow_tier"), not(feature = "numa_jemalloc")))]
 	pub fn new_slow(bytes: &[u8]) -> Self {
 		TieredBuffer::Slow(Box::clone_from_ref_in(bytes, Hybrid))
+	}
+
+	/// Slow-tier copy onto node-1-bound jemalloc arenas.
+	#[cfg(all(not(feature = "jemalloc_cxl_slow_tier"), feature = "numa_jemalloc"))]
+	pub fn new_slow(bytes: &[u8]) -> Self {
+		TieredBuffer::Slow(Box::clone_from_ref_in(bytes, crate::numa_alloc::NumaAlloc))
 	}
 
 	/// Creates a new slow-tier (PMEM/CXL) buffer by copying the given bytes,
