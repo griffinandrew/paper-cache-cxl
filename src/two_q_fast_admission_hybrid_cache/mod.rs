@@ -32,7 +32,7 @@
 //!
 //! `two_q_hybrid_cache` implements the paper's admission rule literally
 //! ("every new object is placed in the one-access FIFO queue in the slow
-//! tier"), which makes every single `set()` pay a synchronous PMEM/UMF
+//! tier"), which makes every single `set()` pay a synchronous PMEM
 //! allocation before the object is even in the cache. That is the intended
 //! cost of only ever spending DRAM on proven-hot objects — but it is a real,
 //! measured cost. This variant trades it the other way, exactly as

@@ -26,7 +26,6 @@ serde = { version = "1.0.219", features = ["derive"] }
 rayon = "1.11.0"
 num-traits = "0.2.19"
 libc = "0.2.177"
-tikv-jemallocator = { version = "0.6.1", features = ["stats"] }
 # Direct dependency so `numa_jemalloc` actually links libjemalloc: the
 # `_rjem_*` symbols its arenas call come from this crate's build script, and
 # reaching it only transitively leaves them undefined at link time.
@@ -34,22 +33,6 @@ tikv-jemalloc-sys = "0.6.1"
 hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"
 sysinfo = "=0.33"
-
-# One-jemalloc-instance, custom-extent-hooks NUMA/CXL arena allocator (see
-# `jemalloc_cxl/README.md`). Backs `EvictionStackAllocator`/
-# `SlowTierJemallocAllocator`/`DramMultiArenaObjects` (src/allocator.rs),
-# all gated on `jemalloc_cxl_slow_tier` below. Previously removed entirely
-# (never proven stable under real concurrent load, see `CLAUDE.md`) and
-# brought back on request as a standalone, available-but-not-the-default
-# mechanism -- `eviction_stacks_pmem` does NOT depend on this; it uses
-# `crate::Hybrid`/`HybridObjects` (UMF/TBB) exclusively, unaffected by
-# whether this dependency/feature is enabled. `default-features = false`
-# disables jemalloc_cxl's own `#[global_allocator]` declaration -- this
-# crate keeps its own (DRAMObjects unless `jemalloc_cxl_slow_tier` is
-# active, see src/lib.rs); jemalloc_cxl's arena/mallctl/mallocx machinery
-# works identically regardless of what's installed as the global allocator,
-# since it always links against the same jemalloc static library.
-jemalloc_cxl = { path = "jemalloc_cxl", optional = true, default-features = false }
 
 
 [features]
@@ -78,51 +61,15 @@ hashbrown_dram = ["numa_jemalloc"]
 
 # Enable PMEM-backed eviction stacks. Eviction-stack metadata
 # (PmemHashList/PmemVecList/EntryMap in worker/policy/policy_stack/) is
-# allocated via `crate::Hybrid` (HybridObjects, UMF/TBB, NUMA node 1,
-# src/allocator.rs) -- the same allocator BufferPMEM/other PMEM features
-# already use, so enabling this alone doesn't require any other PMEM
-# feature and does NOT pull in `jemalloc_cxl`. Previously routed through a
-# separate jemalloc_cxl-backed `EvictionStackAllocator` (removed, then
-# brought back gated on `jemalloc_cxl_slow_tier` instead, currently unused
-# by this feature -- see `CLAUDE.md`).
+# allocated via `crate::Hybrid` (`numa_alloc::SlowObjects`, node-1-bound
+# jemalloc arenas) -- the same allocator BufferPMEM and the other PMEM
+# features use, so enabling this alone requires no other PMEM feature.
 eviction_stacks_pmem = ["numa_jemalloc"]
 
 #to emnable 3 tier based data movement
 hashtable_tiering = []
 
-# Alternative backend for the four hybrid-cache features' TieredBuffer: both
-# tiers go through jemalloc, not Hybrid/UMF at all. Fast tier is jemalloc
-# allocation explicitly pinned to NUMA node 0 via this crate's own
-# DramMultiArenaObjects (src/allocator.rs), declared as the
-# #[global_allocator] in place of DRAMObjects (see lib.rs's global-allocator
-# cfg split) -- NOT jemalloc_cxl's own `own_global_allocator` feature, which
-# would install plain, NUMA-oblivious jemalloc instead (left off, matching
-# jemalloc_cxl's `default-features = false` above). Slow tier is
-# jemalloc_cxl's custom-extent-hooks NUMA/CXL arena (SlowTierJemallocAllocator,
-# src/allocator.rs). Also re-enables EvictionStackAllocator (src/allocator.rs)
-# as an available allocator, though nothing currently wires it into
-# eviction_stacks_pmem's six call sites -- see that feature's own comment.
-# One jemalloc instance for both tiers -- UMF/Hybrid stays linked (still a
-# dependency of the hybrid features via key_value_pmem) but is never
-# actually called in this configuration.
-#
-# Never proven stable under real concurrent load across three separate
-# retests (see `CLAUDE.md`'s UMF-jemalloc-pool and jemalloc_cxl_slow_tier
-# retest history) -- opt-in only, not the default, and not to be trusted
-# under real concurrent load without re-running the actual benchmark first.
-jemalloc_cxl_slow_tier = ["dep:jemalloc_cxl"]
 
-# Swaps DRAMObjects (the default fast-tier/general-purpose global allocator,
-# UMF/TBB on NUMA node 0) for plain tikv-jemallocator -- no UMF, no custom
-# extent hooks, just jemalloc via its own well-tested Rust bindings (already
-# an unconditional dependency above). Distinct from `jemalloc_cxl_slow_tier`
-# (a custom NUMA-extent-hooks arena) and from the UMF jemalloc *pool*
-# backend (separately retested three times and found unsafe under real
-# concurrent load, see CLAUDE.md) -- mutually exclusive with
-# `jemalloc_cxl_slow_tier` (see the compile_error! guard in lib.rs), since
-# both install a #[global_allocator]. The slow tier is unaffected --
-# `Hybrid`/`HybridObjects` (UMF/TBB, NUMA node 1) is untouched.
-tikv_jemalloc_global = []
 
 # Tiering with both key and value in PMEM.
 # Activates the tiering manager (hot objects are copied to DRAM for fast access)
@@ -192,7 +139,7 @@ two_q_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # Two-tier segmented-2Q hybrid cache with the one-access FIFO queue in the
 # FAST tier rather than the slow tier: identical to `two_q_hybrid_cache`
 # except that admission is a plain DRAM write instead of a synchronous
-# PMEM/UMF allocation on the calling thread. The FIFO queue's `k_in *
+# PMEM allocation on the calling thread. The FIFO queue's `k_in *
 # max_size` budget becomes a reservation carved out of `fast_tier_size`
 # (both are DRAM now), so it directly reduces the room available to
 # proven-hot main-queue objects -- see
@@ -325,7 +272,7 @@ s3_fifo_ghost_lazy_demotion_hybrid_cache = ["key_value_pmem", "hybrid_cache_comm
 # `s3_fifo_ghost_lazy_demotion_hybrid_cache` plus one more change: the
 # one-access queue now lives in the FAST tier instead of the slow tier, so
 # admission is a cheap synchronous DRAM write instead of a synchronous
-# PMEM/UMF allocation. The one-access queue's own byte budget
+# PMEM allocation. The one-access queue's own byte budget
 # (`one_access_ratio * max_size`) is now reserved out of the fast-tier size
 # rather than being an independent PMEM-side budget -- see
 # `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` module docs
@@ -415,25 +362,9 @@ s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache = ["key_va
 #
 # It also selects the tier allocator for every hybrid variant: enabling it
 # turns on `numa_jemalloc`, so all 18 designs get NUMA-bound jemalloc arenas
-# rather than UMF/TBB. Set `hybrid_tbb` alongside to go back.
+# rather than an ordinary unbound heap.
 hybrid_cache_common = ["numa_jemalloc"]
 
-# Revert a hybrid build to the UMF/TBB pairing.
-#
-# Hybrid caches allocate both tiers through NUMA-bound jemalloc arenas by
-# default (see `numa_jemalloc`). Measured on cluster12 (15 GB cap / 5 GB fast
-# tier), with the `dram_alloc_accounting` counter compiled out of both so the
-# comparison is even:
-#
-#              SET latency        peak RSS        node 0
-#   1 client   -16% vs TBB        -17%            -13%
-#   8 clients  -13% vs TBB        -20%            -23%
-#
-# jemalloc is ahead on every axis, and the memory gap is the decisive one --
-# TBB held ~1.75x the memory in use and would not return it, which is what
-# drove the fast-tier RSS blowup. This feature exists so that comparison stays
-# reproducible, not because TBB is a reasonable default.
-hybrid_tbb = []
 
 # NUMA-bound jemalloc arenas (src/numa_alloc.rs). Each node gets its own
 # arenas whose extents are mmap'd and mbind'd to that node before jemalloc
@@ -447,35 +378,10 @@ hybrid_tbb = []
 # with `numactl --membind=0` if the whole process must be bound.
 numa_jemalloc = []
 
-# Track live requested bytes on node 0, for the usable/requested decomposition
-# `umf_dram_stats` reports.
-#
-# OFF by default because the counter sits on the allocation path of
-# `DRAMObjects`, which is the *global* allocator in the UMF/TBB build -- so
-# every allocation in the process, on every thread, did a read-modify-write on
-# one global cache line. That is a per-allocation cost the `numa_jemalloc`
-# build does not carry (its counters live in the extent hooks, firing once per
-# multi-MB extent, and jemalloc reports `stats.allocated` natively), so leaving
-# it on made every TBB-vs-jemalloc latency comparison an unequal contest --
-# increasingly so with concurrency, where the contended line is worst.
-#
-# Enable it when the decomposition is the point; leave it off when latency is.
-dram_alloc_accounting = []
 
 
 
-# jemalloc_cxl_slow_tier is NOT on by default. It (and eviction_stacks_pmem's
-# own former jemalloc_cxl-backed EvictionStackAllocator) was removed once
-# already -- never proven stable under real concurrent load across three
-# separate retests (see `CLAUDE.md`'s UMF-jemalloc-pool and
-# jemalloc_cxl_slow_tier retest history) -- and has been brought back on
-# request as a standalone, available-but-opt-in mechanism, not as a change
-# to the default. DRAMObjects+HybridObjects (TBB/UMF) remains the default
-# allocator pairing this crate uses for every feature, including
-# eviction_stacks_pmem, unless `jemalloc_cxl_slow_tier` is explicitly enabled.
 default = []
 
 
 [build-dependencies]
-cc = "1.2.39"
-bindgen = "0.72.1"

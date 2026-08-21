@@ -751,8 +751,8 @@ const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 63;
 ///
 /// | allocator                    | rounding | retention | total |
 /// |------------------------------|----------|-----------|-------|
-/// | UMF/TBB (default)            | 1.064    | 1.29      | ~1.37 |
-/// | jemalloc (`tikv_jemalloc_global`, `numa_jemalloc`) | 1.061 | 1.017-1.056 | 1.08-1.12 |
+/// | jemalloc (default)            | 1.064    | 1.29      | ~1.37 |
+/// | jemalloc (`numa_jemalloc`) | 1.061 | 1.017-1.056 | 1.08-1.12 |
 ///
 /// Rounding is near-identical between them; the entire difference is
 /// retention, because TBB's per-thread and large-object caches have no purge
@@ -767,26 +767,16 @@ const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 63;
 /// configurations for exactly that reason. Treat the constants as starting
 /// points for the shipped configurations and recalibrate with
 /// `DRAM_OVERHEAD_RESIDENT_FACTOR` when the workload or allocator changes;
-/// `jemalloc_stats()` and `umf_dram_stats()` report the inputs.
+/// `jemalloc_stats()` reports the inputs.
 ///
 /// A second-order caveat: the ratio is measured process-wide, so a workload
 /// whose non-cache allocations have a very different size profile from the
 /// cache's metadata will skew it slightly.
-#[cfg(all(
-	feature = "hybrid_cache_common",
-	not(any(feature = "tikv_jemalloc_global", all(feature = "numa_jemalloc", not(feature = "hybrid_tbb"))))
-))]
-const DEFAULT_RESIDENT_FACTOR: f64 = 1.37;
-
-/// jemalloc backs the allocations, whether as the plain global allocator or
-/// through the NUMA-bound arenas -- both measured 1.08-1.12 resident/allocated,
-/// so both take the same factor. Keying this only on `tikv_jemalloc_global`
-/// left `numa_jemalloc` builds silently over-reserving by ~22% against TBB's
-/// number, shrinking their effective fast tier for no reason.
-#[cfg(all(
-	feature = "hybrid_cache_common",
-	any(feature = "tikv_jemalloc_global", all(feature = "numa_jemalloc", not(feature = "hybrid_tbb")))
-))]
+/// Measured 1.08-1.12 resident/allocated on the NUMA-bound jemalloc arenas
+/// that back every build. The jemalloc pairing this replaced needed 1.37, and
+/// carrying TBB's number into a jemalloc build over-reserved by ~22%,
+/// shrinking the effective fast tier for no reason.
+#[cfg(feature = "hybrid_cache_common")]
 const DEFAULT_RESIDENT_FACTOR: f64 = 1.12;
 
 #[cfg(feature = "hybrid_cache_common")]

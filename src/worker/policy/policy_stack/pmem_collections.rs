@@ -18,13 +18,9 @@
 //! and reduced risk of segfaults compared to HashMap-based approaches.
 //!
 //! Allocator: `Hybrid` here is the same crate-wide `crate::Hybrid` alias
-//! (`HybridObjects`, UMF/TBB, NUMA node 1) that `BufferPMEM` and the other
-//! PMEM features already use -- eviction-stack metadata (a separate, much
-//! smaller allocation workload than full object byte buffers) previously
-//! routed through its own dedicated jemalloc_cxl arena
-//! (`EvictionStackAllocator`), removed for depending on an allocator with no
-//! stability track record under real concurrent load (see
-//! `jemalloc_cxl_slow_tier`'s removal notes in `CLAUDE.md`).
+//! (`SlowObjects`, node-1 jemalloc arenas) that `BufferPMEM` and the other
+//! PMEM features already use, so eviction-stack metadata lands on
+//! the same node as the slow-tier values it indexes.
 
 use hashbrown::HashMap;
 use std::hash::{Hash, BuildHasher};

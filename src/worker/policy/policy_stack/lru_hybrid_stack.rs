@@ -83,11 +83,9 @@ use kwik::collections::HashList;
 use super::pmem_collections::PmemHashList;
 
 // Eviction-stack metadata is allocated through the same crate-wide `Hybrid`
-// alias (`HybridObjects`, UMF/TBB, NUMA node 1) that `BufferPMEM`/other PMEM
-// features already use -- previously routed through a separate,
-// jemalloc_cxl-backed `EvictionStackAllocator`, removed for depending on an
-// allocator with no stability track record under real concurrent load (see
-// `jemalloc_cxl_slow_tier`'s removal notes in `CLAUDE.md`).
+// alias (`numa_alloc::SlowObjects`, node-1-bound jemalloc arenas) that
+// `BufferPMEM` and the other PMEM features use, so the stacks land on the
+// same node as the slow-tier values they index.
 #[cfg(feature = "eviction_stacks_pmem")]
 use crate::Hybrid;
 

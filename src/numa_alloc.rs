@@ -10,7 +10,7 @@
 //! It guarantees placement for memory obtained **through these arenas**. It
 //! cannot guarantee anything about the rest of the process: jemalloc here is
 //! built with `JEMALLOC_PREFIX=_rjem_` and therefore does not interpose
-//! `malloc`, so glibc's heap, every bindgen'd C library (UMF, TBB, hwloc) and
+//! `malloc`, so glibc's heap, every bindgen'd C library and
 //! all pthread stacks are outside its reach. Covering those needs a *task*
 //! mempolicy -- `numactl --membind=0`, or `set_mempolicy` before any thread is
 //! spawned. [`assert_numa_environment`] reports whether one is in effect.
@@ -795,7 +795,7 @@ pub type SlowAlloc = NumaAlloc<NODE_SLOW>;
 /// `SlowAlloc` is a type alias to a generic struct, and an alias lives only in
 /// the type namespace -- so `Box<[u8], SlowAlloc>` resolves but
 /// `Box::new_in(x, SlowAlloc)` does not. The crate-wide `Hybrid` name is used
-/// in both positions (it replaced `HybridObjects`, an ordinary unit struct),
+/// in both positions (it replaced an ordinary unit struct),
 /// so the replacement has to occupy both namespaces too. Delegates
 /// everything to `NumaAlloc<NODE_SLOW>`.
 #[derive(Clone, Copy, Default)]
@@ -990,8 +990,8 @@ unsafe impl<const NODE: u32> std::alloc::Allocator for NumaAlloc<NODE> {
 ///
 /// The PMEM collections (`hashbrown` maps and vectors parameterised by an
 /// allocator) take `allocator_api2::alloc::Allocator`, not the unstable std
-/// one, so serving them requires both. This is the trait `HybridObjects`
-/// implemented for the UMF/TBB pool.
+/// one, so serving them requires both -- the previous allocator implemented
+/// this trait too.
 unsafe impl<const NODE: u32> allocator_api2::alloc::Allocator for NumaAlloc<NODE> {
 	fn allocate(
 		&self,

@@ -88,8 +88,8 @@ use kwik::collections::HashList;
 use super::pmem_collections::PmemHashList;
 
 // See `LruHybridStack`'s identical note: eviction-stack metadata is
-// allocated through the same crate-wide `Hybrid` alias (`HybridObjects`,
-// UMF/TBB, NUMA node 1) that `BufferPMEM`/other PMEM features already use.
+// allocated through the same crate-wide `Hybrid` alias (`SlowObjects`,
+// jemalloc, NUMA node 1) that `BufferPMEM`/other PMEM features already use.
 #[cfg(feature = "eviction_stacks_pmem")]
 use crate::Hybrid;
 

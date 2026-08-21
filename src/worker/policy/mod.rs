@@ -3975,7 +3975,7 @@ mod lru_hybrid_tests {
 	// plain `Box<[u8]>` value type and a trivial "migrate" closure — this
 	// tests the generic wiring (LruHybridStack -> drain_tier_migrations ->
 	// apply_tier_migrations -> Object::set_data -> AtomicStatus counters)
-	// without needing the real `Hybrid`/UMF PMEM allocator that
+	// without needing the real `Hybrid` slow-tier allocator that
 	// `TieredBuffer::new_slow` depends on.
 	fn make_worker(max_size: CacheSize) -> (
 		PolicyWorker<u32, TestBuffer>,
@@ -4242,7 +4242,7 @@ mod lfu_hybrid_tests {
 	// Same rationale as `lru_hybrid_tests::make_worker`: exercises the real
 	// `PolicyWorker` migration pipeline end to end using a plain `Box<[u8]>`
 	// value type and a trivial "migrate" closure, without needing the real
-	// `Hybrid`/UMF PMEM allocator that `TieredBuffer::new_slow` depends on.
+	// `Hybrid` slow-tier allocator that `TieredBuffer::new_slow` depends on.
 	fn make_worker(max_size: CacheSize) -> (
 		PolicyWorker<u32, TestBuffer>,
 		ObjectMapRef<u32, TestBuffer>,
@@ -4508,7 +4508,7 @@ mod fifo_hybrid_tests {
 	// Same rationale as `lru_hybrid_tests::make_worker`/`two_q_hybrid_tests::
 	// make_worker`: exercises the real `PolicyWorker` migration pipeline end
 	// to end using a plain `Box<[u8]>` value type and a trivial "migrate"
-	// closure, without needing the real `Hybrid`/UMF PMEM allocator that
+	// closure, without needing the real `Hybrid` slow-tier allocator that
 	// `TieredBuffer::new_slow` depends on.
 	fn make_worker(max_size: CacheSize) -> (
 		PolicyWorker<u32, TestBuffer>,

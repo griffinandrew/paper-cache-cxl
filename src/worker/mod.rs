@@ -95,8 +95,8 @@ pub enum WorkerEvent {
 	/// being dropped never actually stopped its background threads before
 	/// returning -- those threads could still be mid-allocation when the
 	/// process's own exit-time global-allocator teardown ran concurrently
-	/// with them, a real, reproduced SIGSEGV inside a UMF/TBB pool's own
-	/// teardown code racing a still-live `PolicyWorker` thread's `tbb_malloc`
+	/// with them, a real, reproduced SIGSEGV inside a jemalloc pool's own
+	/// teardown code racing a still-live `PolicyWorker` thread's allocations
 	/// call. See `PaperCache`'s `Drop` impl for the send-then-join sequence
 	/// this variant exists to support.
 	Shutdown,

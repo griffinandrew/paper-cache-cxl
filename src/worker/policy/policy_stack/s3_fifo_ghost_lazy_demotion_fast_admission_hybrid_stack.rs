@@ -22,7 +22,7 @@
 //! literal paper rule ("every new object is placed in the slow tier"). At
 //! the `PaperCache::set()` API layer this means every single admission
 //! (and every one-access-queue re-admission of a ghost-recycled key)
-//! synchronously builds `TieredBuffer::new_slow`, i.e. a real PMEM/UMF
+//! synchronously builds `TieredBuffer::new_slow`, i.e. a real PMEM
 //! allocation on the calling thread, before the object is even in the
 //! cache. Reported by the user as a real cost worth trying to avoid: this
 //! variant places the one-access queue's bytes in the FAST tier instead,

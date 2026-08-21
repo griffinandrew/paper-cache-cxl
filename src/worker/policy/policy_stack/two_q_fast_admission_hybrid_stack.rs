@@ -22,7 +22,7 @@
 //! the literal paper rule ("every new object is placed in the one-access
 //! FIFO queue in the slow tier"). At the `PaperCache::set()` API layer that
 //! means every single admission synchronously builds
-//! `TieredBuffer::new_slow`, i.e. a real PMEM/UMF allocation on the calling
+//! `TieredBuffer::new_slow`, i.e. a real PMEM allocation on the calling
 //! thread, before the object is even in the cache. This variant places the
 //! one-access queue's bytes in the FAST tier instead, so admission becomes a
 //! cheap DRAM write (`TieredBuffer::new_fast`) — the same change
@@ -181,7 +181,7 @@ use kwik::collections::HashList;
 use super::pmem_collections::PmemHashList;
 
 // Eviction-stack metadata is allocated through the same crate-wide `Hybrid`
-// alias (`HybridObjects`, UMF/TBB, NUMA node 1) that `BufferPMEM`/other PMEM
+// alias (`SlowObjects`, node-1 jemalloc arenas) that `BufferPMEM`/other PMEM
 // features already use.
 #[cfg(feature = "eviction_stacks_pmem")]
 use crate::Hybrid;

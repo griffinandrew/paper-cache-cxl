@@ -1,6 +1,6 @@
 #![feature(allocator_api)]
 
-// Isolates the PMEM allocator (`HybridObjects`, NUMA node 1, UMF/TBB-backed)
+// Isolates the slow-tier allocator (`SlowObjects`, node-1-bound jemalloc arenas)
 // from all cache logic -- no PaperCache, no worker threads, no policy stack,
 // no LRU/demotion decisions. Just raw allocate/write/free cycles at the
 // crate's real demotion size (~16 KB) and volume, matching how real objects
@@ -12,7 +12,7 @@
 //   --features key_value_pmem -- --ignored --nocapture
 
 use std::time::Instant;
-use paper_cache::allocator::HybridObjects;
+use paper_cache::numa_alloc::SlowObjects;
 
 const OBJECT_SIZE: usize = 16 * 1024; // matches the crate's real trace avg (~16 KB)
 const TOTAL_ADMISSIONS: usize = 1_000_000; // sized so each process launch takes ~1s, for repeated-process testing
@@ -22,11 +22,11 @@ const STALL_THRESHOLD_NS: u128 = 1_000_000; // 1ms -- anything above this gets l
 #[test]
 #[ignore]
 fn isolate_pmem_latency() {
-    HybridObjects::init_and_prewarm(1, 0);
+    assert!(paper_cache::numa_alloc::init(), "arena pool must build");
 
     let layout = std::alloc::Layout::from_size_align(OBJECT_SIZE, 8).unwrap();
 
-    let mut live: Vec<Box<[u8], HybridObjects>> = Vec::new();
+    let mut live: Vec<Box<[u8], SlowObjects>> = Vec::new();
     let mut latencies_ns: Vec<u128> = Vec::with_capacity(TOTAL_ADMISSIONS);
     let mut stalls: Vec<(usize, u128)> = Vec::new();
 
@@ -37,7 +37,7 @@ fn isolate_pmem_latency() {
 
         // Allocate + touch every page (matches a real write, not just a
         // reservation -- TBB/UMF only pay real cost once pages are dirtied).
-        let mut buf: Box<[u8], HybridObjects> = Box::new_in([0u8; OBJECT_SIZE], HybridObjects);
+        let mut buf: Box<[u8], SlowObjects> = Box::new_in([0u8; OBJECT_SIZE], SlowObjects);
         for page in buf.chunks_mut(4096) {
             page[0] = (i % 256) as u8;
         }

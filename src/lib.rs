@@ -6,7 +6,7 @@
  * correct
  */
 
-#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "jemalloc_cxl_slow_tier"), feature(allocator_api), feature(clone_from_ref))]
+#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem"), feature(allocator_api), feature(clone_from_ref))]
 
 
 // `lru_hybrid_cache`, `lfu_hybrid_cache`, `two_q_hybrid_cache`, and
@@ -484,30 +484,16 @@ compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' 
 #[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
 compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
 
-#[cfg(all(feature = "numa_jemalloc", not(feature = "hybrid_tbb"), any(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global")))]
-compile_error!("'numa_jemalloc' installs its own #[global_allocator]; it cannot be combined with 'jemalloc_cxl_slow_tier' or 'tikv_jemalloc_global'.");
-
 /// Node-0-bound jemalloc arenas as the process allocator.
 ///
 /// Covers everything Rust allocates. It does NOT cover glibc's heap, the C
-/// libraries reached through bindgen (UMF, hwloc), or pthread stacks --
+/// libraries reached through bindgen, or pthread stacks --
 /// jemalloc is built `JEMALLOC_PREFIX=_rjem_` and so does not interpose
 /// `malloc`. Pair with `numactl --membind=0` when the whole process must be
 /// bound.
-#[cfg(all(feature = "numa_jemalloc", not(feature = "hybrid_tbb")))]
 #[global_allocator]
 static GLOBAL: numa_alloc::FastAlloc = numa_alloc::NumaAlloc;
 
-#[cfg(all(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global"))]
-compile_error!("Cannot enable both 'jemalloc_cxl_slow_tier' and 'tikv_jemalloc_global' simultaneously -- both install a #[global_allocator], and only one static GLOBAL can be declared.");
-
-#[cfg(feature = "tikv_jemalloc_global")]
-use tikv_jemallocator::Jemalloc;
-
-
-#[cfg(any(feature = "hashbrown_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "all_dram", feature = "jemalloc_cxl_slow_tier"))]
-pub mod allocator;
-#[cfg(all(feature = "numa_jemalloc", not(feature = "hybrid_tbb")))]
 pub mod numa_alloc;
 
 use std::arch::x86_64::{_mm_clflush, _mm_sfence};
@@ -528,15 +514,6 @@ use std::arch::x86_64::{_mm_clflush, _mm_sfence};
     feature = "eviction_stacks_pmem",
 ))]
 pub(crate) use crate::numa_alloc::SlowObjects as Hybrid;
-
-// UMF bindings are always needed when any PMEM feature is active.
-// The build script guarantees that the UMF C symbols are always present:
-// either the real UMF library (when wrapper.h exists) or the stub
-// implementation (umf_stub.c, using malloc/free) when UMF is unavailable.
-#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem"))]
-mod allocator_bindings {
-    include!("umf_allocator_bindings.rs"); // UMF extern "C" declarations
-}
 
 #[cfg(feature = "key_value_pmem")]
 impl typesize::TypeSize for BufferPMEM {
@@ -897,44 +874,17 @@ pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 pub type BufferPMEM = Box<[u8], Hybrid>;
 
 
-//#[cfg(feature = "all_dram")]
-//#[global_allocator]
-//static GLOBAL: allocator::HybridObjects = allocator::HybridObjects;
+// Both tiers are allocated by `numa_alloc` (src/numa_alloc.rs): node-0-bound
+// jemalloc arenas back the fast tier and the process allocator, node-1-bound
+// arenas back `Hybrid`/`TieredBuffer::Slow`. This replaced a jemalloc pool per
+// node, which held ~1.75x the memory in use and would not return it; see the
+// numa_alloc module doc for the placement guarantee and its failure modes.
 
-//pub mod allocator;
-
-// DRAMObjects (NUMA node 0, src/allocator.rs) is the crate's global
-// allocator for every feature, including the four hybrid-cache features
-// (lru/lfu/two_q/fifo_hybrid_cache) -- an ordinary heap allocation on this
-// global allocator IS the fast tier for those features (see
-// tiered_buffer.rs's TieredBuffer::Fast = Box<[u8]>); the slow tier uses
-// `Hybrid`/`HybridObjects` (NUMA node 1) explicitly via TieredBuffer::Slow.
-// A prior session tried routing both tiers through a separate,
-// runtime-parameterized `tier_allocator` crate instead -- removed again
-// (see tiered_buffer.rs's module doc) since its default backend still
-// constructed one independent UMF/TBB pool per NUMA node, the same shape
-// DRAMObjects+HybridObjects already had; it added a second implementation
-// of the same mechanism without changing that mechanism's properties.
-//
-// A later, separate `jemalloc_cxl_slow_tier` feature swaps this for
-// `allocator::DramMultiArenaObjects` (a pool of node-0-pinned jemalloc
-// arenas via jemalloc_cxl's custom extent hooks) paired with
-// `SlowTierJemallocAllocator` for the slow tier -- one jemalloc instance for
-// both tiers, UMF/Hybrid unused. This was removed once already (never
-// proven stable under real concurrent load in three separate retests -- see
-// the UMF-jemalloc-pool and jemalloc_cxl_slow_tier retest history in
-// `CLAUDE.md`) and has been brought back on request as a standalone,
-// available-but-not-the-default mechanism: `DRAMObjects`/`HybridObjects`
-// (TBB/UMF) remains the default allocator pairing for every feature, and
-// `jemalloc_cxl_slow_tier` stays opt-in only -- do not re-enable it as the
-// default, and do not trust it under real concurrent load without
-// re-running the actual benchmark (not just this crate's own test suite)
-// to confirm, per that retest history.
 /// Samples jemalloc's internal accounting, for diagnosing where resident
 /// memory goes relative to what the cache thinks it holds.
 ///
 /// Returns `None` unless the process actually links jemalloc
-/// (`tikv_jemalloc_global`) and it was built with stats support.
+/// (`numa_jemalloc`) and it was built with stats support.
 ///
 /// The three ratios this exposes decompose resident memory into its causes,
 /// which `used_size` alone cannot distinguish:
@@ -951,7 +901,7 @@ pub type BufferPMEM = Box<[u8], Hybrid>;
 /// `stats_print:true` via `_RJEM_MALLOC_CONF` cannot answer this: it runs from
 /// jemalloc's atexit handler, by which point the cache has been dropped and
 /// `allocated` has fallen to a few MB. This can be called at peak.
-#[cfg(feature = "tikv_jemalloc_global")]
+#[cfg(feature = "numa_jemalloc")]
 pub fn jemalloc_stats() -> Option<String> {
 	unsafe extern "C" {
 		#[link_name = "_rjem_mallctl"]
@@ -1015,64 +965,11 @@ active/allocated={:.4} resident/active={:.4} resident/allocated={:.4}",
 	))
 }
 
-/// UMF/TBB node-0 accounting, the counterpart to [`jemalloc_stats`] for the
-/// default build.
-///
-/// Reports live requested vs live usable bytes. Compare `usable` against
-/// resident (from `numastat`) to get the same decomposition jemalloc gives:
-/// `usable/requested` is size-class rounding, and the gap from usable to
-/// resident is external fragmentation plus unreturned pages.
-pub fn umf_dram_stats() -> String {
-	if !cfg!(feature = "dram_alloc_accounting") {
-		// Saying so beats reporting requested=0, which reads as a live
-		// measurement of an empty pool.
-		return String::from(
-			"UMFDRAM requested=<unmeasured: build with --features dram_alloc_accounting>",
-		);
-	}
-
-	let (requested, usable) = allocator::dram_pool_stats();
-
-	let ratio = if requested == 0 {
-		0.0
-	} else {
-		usable as f64 / requested as f64
-	};
-
-	format!("UMFDRAM requested={requested} usable={usable} usable/requested={ratio:.4}")
-}
-
-/// Not linking jemalloc: nothing to sample. The default build allocates node 0
-/// through UMF/TBB, which exposes no equivalent accounting at all.
-#[cfg(not(feature = "tikv_jemalloc_global"))]
+/// Not linking jemalloc: nothing to sample.
+#[cfg(not(feature = "numa_jemalloc"))]
 pub fn jemalloc_stats() -> Option<String> {
 	None
 }
-
-#[cfg(not(any(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global", all(feature = "numa_jemalloc", not(feature = "hybrid_tbb")))))]
-#[global_allocator]
-static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
-
-#[cfg(feature = "jemalloc_cxl_slow_tier")]
-#[global_allocator]
-static GLOBAL: allocator::DramMultiArenaObjects = allocator::DramMultiArenaObjects;
-
-// Swaps ONLY the fast-tier/general-purpose global allocator (DRAMObjects,
-// NUMA node 0, UMF/TBB) for the plain, off-the-shelf tikv-jemallocator
-// binding -- unlike `jemalloc_cxl_slow_tier` (a custom NUMA-extent-hooks
-// jemalloc arena) or the UMF jemalloc *pool* backend (umfJemallocPoolOps,
-// separately retested three times and found unsafe under real concurrent
-// load -- see CLAUDE.md), this is plain jemalloc via its own well-tested
-// Rust bindings, with no UMF or custom-extent-hooks machinery involved at
-// all. No NUMA pinning is applied explicitly; since every CPU on this
-// machine's topology is on node 0 (node 1 is memory-only), the kernel's
-// default local-allocation policy still lands these pages on node 0 in
-// practice. The slow tier is untouched -- `Hybrid`/`HybridObjects`
-// (UMF/TBB, NUMA node 1) still backs `TieredBuffer::Slow` regardless of
-// which allocator this static resolves to.
-#[cfg(feature = "tikv_jemalloc_global")]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
 
 #[cfg(not(feature = "all_dram"))]
 use std::alloc::{Layout, Allocator}; // Essential imports
@@ -1126,8 +1023,8 @@ pub struct PaperCache<K, V, S = RandomState> {
 	/// process exiting without explicitly dropping one) could leave a
 	/// `PolicyWorker` thread genuinely still executing, mid-allocation,
 	/// concurrently with the global allocator's own process-exit teardown
-	/// -- confirmed directly via a real SIGSEGV inside a UMF/TBB pool's
-	/// `tbb_malloc`, racing that pool's own `umfTearDown` destructor.
+	/// -- confirmed directly via a real SIGSEGV inside a jemalloc pool's
+	/// allocations, racing that pool's own teardown.
 	worker_handles: WorkerHandles,
 	overhead_manager: OverheadManagerRef,
 
@@ -4106,7 +4003,7 @@ mod test_new_features {
 ///
 /// Deliberately stays on the fast-tier-only path (fast_tier_size == max_size,
 /// tiny values) so no object ever demotes to the slow tier: `TieredBuffer::
-/// new_slow` allocates through the `Hybrid`/UMF PMEM allocator, which
+/// new_slow` allocates through the `Hybrid` slow-tier allocator, which
 /// requires real PMEM/DAX
 /// hardware and aborts ("memory allocation ... failed") in a plain dev
 /// sandbox. A full integration test covering demotion/promotion/eviction
@@ -4248,7 +4145,7 @@ mod test_lfu_hybrid_cache {
 
 /// Exercises the real public `PaperCache<K, TieredBuffer>` API end to end
 /// for `two_q_hybrid_cache`. Unlike `test_lru_hybrid_cache`/
-/// `test_lfu_hybrid_cache`, this module cannot avoid the real `Hybrid`/UMF
+/// `test_lfu_hybrid_cache`, this module cannot avoid the real `Hybrid`
 /// PMEM allocator: `set()` always admits via `TieredBuffer::new_slow`
 /// regardless of `fast_tier_size`, so even a single `set()` call here pays
 /// the one-time PMEM pool warm-up cost (see `tests/two_q_hybrid_cache_integration.rs`'s
