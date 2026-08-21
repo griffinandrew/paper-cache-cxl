@@ -1076,7 +1076,7 @@ impl<K, V, S> Drop for PaperCache<K, V, S> {
 #[cfg(any(all(feature = "all_dram", not(feature = "hashbrown_dram")), all(feature = "key_value_pmem", not(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram")))))]
 impl<K, V, S> PaperCache<K, V, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	V: ValueBuffer,
 	S: Default + Clone + BuildHasher,
 {
@@ -1717,7 +1717,7 @@ where
 	// `Send + Sync` because `WorkerFanout::new` hands the object map to worker
 	// threads. Every other `PaperCache` impl carries these; this shape was
 	// merged without them, so the two features that select it never built.
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	V: ValueBuffer,
 	S: Default + Clone + BuildHasher,
 {
@@ -2211,7 +2211,7 @@ fn new_hybrid_object_map<K, V>() -> ObjectMapRef<K, V> {
 #[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	// `lru_sized_hybrid_cache` doesn't call this: it needs three sizing
@@ -2612,7 +2612,7 @@ where
 #[cfg(feature = "lru_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running `PaperPolicy::LruHybrid`, with
@@ -2668,7 +2668,7 @@ where
 #[cfg(feature = "lru_lfu_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running `PaperPolicy::LruLfuHybrid`,
@@ -2751,7 +2751,7 @@ where
 #[cfg(feature = "lfu_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running `PaperPolicy::LfuHybrid`, with
@@ -2810,7 +2810,7 @@ where
 #[cfg(feature = "two_q_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running `PaperPolicy::TwoQHybrid`, with
@@ -2889,7 +2889,7 @@ where
 #[cfg(feature = "two_q_fast_admission_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running
@@ -2981,7 +2981,7 @@ where
 #[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running
@@ -3058,7 +3058,7 @@ where
 #[cfg(feature = "fifo_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running `PaperPolicy::FifoHybrid`, with
@@ -3113,7 +3113,7 @@ where
 #[cfg(feature = "lru_sized_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running `PaperPolicy::LruSizedHybrid`,
@@ -3319,7 +3319,7 @@ where
 #[cfg(feature = "s3_fifo_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running `PaperPolicy::S3FifoHybrid`,
@@ -3376,7 +3376,7 @@ where
 #[cfg(feature = "two_q_ghost_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running `PaperPolicy::TwoQGhostHybrid`,
@@ -3428,7 +3428,7 @@ where
 #[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running `PaperPolicy::S3FifoGhostHybrid`,
@@ -3480,7 +3480,7 @@ where
 #[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running
@@ -3535,7 +3535,7 @@ where
 #[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running
@@ -3594,7 +3594,7 @@ where
 #[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running
@@ -3653,7 +3653,7 @@ where
 #[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running
@@ -3712,7 +3712,7 @@ where
 #[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running
@@ -3771,7 +3771,7 @@ where
 #[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running
@@ -3832,7 +3832,7 @@ where
 #[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` running
