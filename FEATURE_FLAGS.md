@@ -55,7 +55,7 @@ The implementation provides explicit feature flags to control:
 - **When enabled**: `LfuStack` (`index_map`, `count_stacks`) and `LruStack` (`stack`) internal data structures are PMEM-backed
 - **When disabled**: Standard DRAM-backed `std::collections::HashMap` and `kwik::collections::HashList` are used (default)
 - **Use case**: Ensures eviction metadata is co-located with PMEM-stored objects for lower cross-tier access overhead
-- **Requirements**: Uses `HybridObjects` (UMF-backed)
+- **Requirements**: Uses `Hybrid` (`numa_alloc::SlowObjects`, node-1-bound jemalloc arenas)
 
 ### `hashbrown_dram`
 - **Purpose**: Use hashbrown HashMap as global hashtable in DRAM (for performance comparison)
@@ -88,7 +88,7 @@ The implementation provides explicit feature flags to control:
   into both. TTL survives every tier move unmodified, since a migration only ever replaces
   `Object::data`, never `key` or `expiry`
 - **Requirements**: `["key_value_pmem"]` only. A plain `Box<[u8]>` (the fast-tier representation)
-  already allocates through the crate's global DRAM allocator (`DRAMObjects`) regardless of feature
+  already allocates through the crate's global DRAM allocator (`numa_alloc::FastAlloc`, node-0-bound jemalloc arenas) regardless of feature
   flags, and this feature only needs to migrate *value* bytes between tiers, so the smaller
   `key_value_pmem` dependency (which makes `BufferPMEM`/`Hybrid` available without forcing the *key*
   into PMEM) is sufficient and keeps keys DRAM-resident. **Mutually exclusive with `lfu_hybrid_cache`**
@@ -194,7 +194,7 @@ The implementation provides explicit feature flags to control:
 
 ### `two_q_fast_admission_hybrid_cache`
 - **Purpose**: `two_q_hybrid_cache` with the one-access FIFO queue relocated to the **fast (DRAM)
-  tier**, so `set()` is a plain DRAM write rather than a synchronous PMEM/UMF allocation on the
+  tier**, so `set()` is a plain DRAM write rather than a synchronous PMEM allocation on the
   calling thread. The same trade `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` makes for
   the s3-fifo family. The logical 2Q structure is unchanged — only the physical placement of the
   one-access queue's bytes differs
@@ -360,7 +360,7 @@ The implementation uses Rust's conditional compilation to select the appropriate
 The `Hybrid` allocator is used to place data in PMEM:
 - Defined in `src/allocator.rs`
 - Implements both `GlobalAlloc` and `Allocator` traits
-- Resolves to `HybridObjects`, which routes allocations through UMF's TBB-backed pool
+- Resolves to `numa_alloc::SlowObjects`, which routes allocations through node-1-bound jemalloc arenas
 
 ### Conditional Compilation
 
@@ -512,7 +512,7 @@ cargo +nightly check --features lru_hybrid_cache
 # Run lru_hybrid_cache's unit + inline tests
 cargo +nightly test --lib --features lru_hybrid_cache
 
-# Run lru_hybrid_cache's PMEM integration tests (requires real PMEM/UMF hardware)
+# Run lru_hybrid_cache's PMEM integration tests (requires a second NUMA node)
 cargo +nightly test --test lru_hybrid_cache_integration --features lru_hybrid_cache
 
 # Check lfu_hybrid_cache (single-instance, frequency-segmented hybrid cache)
@@ -521,7 +521,7 @@ cargo +nightly check --features lfu_hybrid_cache
 # Run lfu_hybrid_cache's unit + inline tests
 cargo +nightly test --lib --features lfu_hybrid_cache
 
-# Run lfu_hybrid_cache's PMEM integration tests (requires real PMEM/UMF hardware)
+# Run lfu_hybrid_cache's PMEM integration tests (requires a second NUMA node)
 cargo +nightly test --test lfu_hybrid_cache_integration --features lfu_hybrid_cache
 
 # Check two_q_hybrid_cache (single-instance, 2Q-segmented hybrid cache)
@@ -530,7 +530,7 @@ cargo +nightly check --features two_q_hybrid_cache
 # Run two_q_hybrid_cache's unit + inline tests
 cargo +nightly test --lib --features two_q_hybrid_cache
 
-# Run two_q_hybrid_cache's PMEM integration tests (requires real PMEM/UMF hardware)
+# Run two_q_hybrid_cache's PMEM integration tests (requires a second NUMA node)
 cargo +nightly test --test two_q_hybrid_cache_integration --features two_q_hybrid_cache
 
 # Confirm every pairwise combination of the three hybrid-cache features is
@@ -554,7 +554,7 @@ used at all when disabled, allowing the cache to operate as a single global cach
 ✅ Tiering manager can be turned on/off independently
 ✅ Global hashtable can use pmem even when tiering is disabled
 ✅ `alloc_api_exp` removed; Hybrid allocator still functional for `key_value_pmem`
-✅ `eviction_stacks_pmem` correctly allocates LFU/LRU stacks via `Hybrid` (UMF-backed)
+✅ `eviction_stacks_pmem` correctly allocates LFU/LRU stacks via `Hybrid` (node-1-bound jemalloc arenas)
 ✅ `lru_hybrid_cache` implements a single unified `PaperCache<K, TieredBuffer>` with a segmented-LRU
   fast/slow boundary; promotion/demotion verified as real data movement (never present in both tiers)
   end to end on real PMEM hardware (`tests/lru_hybrid_cache_integration.rs`, 14/14 passing)

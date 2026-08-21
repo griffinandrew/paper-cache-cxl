@@ -167,8 +167,11 @@ The pair exists because draining to exactly the ceiling pinned the tier at 100% 
 made almost every pass a single-object migration batch. It trades a slice of resident fast
 capacity for larger, less frequent batches, and it is tuned in one place for all 18 stacks.
 
-> Several stack module docs still quote the old `0.95 / 0.75` defaults in prose. The code above
-> is authoritative.
+> `watermarks::DEFAULT_HIGH` / `DEFAULT_LOW` are authoritative. Both are read once through a
+> `OnceLock` on first use, so the env vars are startup configuration rather than runtime
+> adjustable, and a value that fails to parse or falls outside `(0.0, 1.0]` is silently
+> replaced by the default. `low()` is clamped to at most `high()` so a misconfigured pair
+> cannot invert and turn every pass into a no-op.
 
 ### The shared-DRAM-overhead reservation
 

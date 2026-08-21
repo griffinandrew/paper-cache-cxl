@@ -384,4 +384,3 @@ numa_jemalloc = []
 default = []
 
 
-[build-dependencies]

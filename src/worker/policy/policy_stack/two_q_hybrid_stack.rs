@@ -696,7 +696,7 @@ mod tests {
 	/// Deliberately paired with 1-byte objects below: that makes the drain
 	/// byte-exact, so a triggered pass lands on exactly `low_bytes()` and the
 	/// expectations below hold at any configured watermark ratio rather than
-	/// only at the 0.95/0.75 defaults. (The watermarks are process-global
+	/// only at the default ratios. (The watermarks are process-global
 	/// `OnceLock`s, so a test cannot pin them via env vars without racing
 	/// every other test in the binary -- expectations are computed from
 	/// `watermarks::` instead.)

@@ -716,7 +716,7 @@ mod tests {
 	/// `bytes`. Lets the fast-tier tests state their expectations in whole
 	/// objects instead of hard-coded byte thresholds, so they hold at whatever
 	/// `FAST_TIER_HIGH_WATERMARK`/`FAST_TIER_LOW_WATERMARK` pair is configured
-	/// rather than only at the 0.95/0.75 defaults. The `while` loop absorbs the
+	/// rather than only at the default ratios. The `while` loop absorbs the
 	/// truncation in `watermarks::low_bytes`' `as u64` cast, which a bare
 	/// `ceil()` on its own can land a byte short of.
 	fn capacity_holding(bytes: CacheSize) -> CacheSize {
@@ -1035,7 +1035,7 @@ mod tests {
 	//
 	// Like the watermark tests, they derive their expectations from
 	// `watermarks::high_bytes`/`low_bytes` of the *effective* (post-
-	// reservation) budget rather than hard-coding the 0.95/0.75 defaults, so
+	// reservation) budget rather than hard-coding the default ratios, so
 	// they hold at whatever ratios are configured.
 	// ---------------------------------------------------------------------
 

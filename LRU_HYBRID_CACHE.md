@@ -56,7 +56,7 @@ itself a **tagged union of the two allocation strategies**:
 // src/lru_hybrid_cache/buffer.rs
 pub enum TieredBuffer {
     Fast(Box<[u8]>),           // DRAM — the crate's global allocator
-    Slow(Box<[u8], Hybrid>),   // PMEM — the same Hybrid/UMF allocator BufferPMEM uses
+    Slow(Box<[u8], Hybrid>),   // PMEM — the same Hybrid allocator BufferPMEM uses
 }
 ```
 
@@ -397,7 +397,7 @@ tests/
 - **`lib.rs::test_lru_hybrid_cache`**: the real public `PaperCache<K, TieredBuffer>` API, kept to
   the fast-tier-only path (`fast_tier_size == max_size`) so it never needs the PMEM allocator.
 - **`tests/lru_hybrid_cache_integration.rs`** (14 tests): the full path through the real
-  `Hybrid`/UMF PMEM allocator — this is the suite that actually proves the "real data movement, one
+  `Hybrid` slow-tier allocator — this is the suite that actually proves the "real data movement, one
   copy ever" requirement, by demoting a key and confirming with `tier_of` that it is *gone* from
   the fast tier (not just present in the slow tier), and symmetrically for promotion. Also covers
   TTL surviving both directions of migration, terminal eviction accounting, runtime
@@ -410,9 +410,9 @@ cargo +nightly test --lib --features lru_hybrid_cache
 cargo +nightly test --test lru_hybrid_cache_integration --features lru_hybrid_cache
 ```
 
-The integration tests need a machine where the `Hybrid`/UMF allocator can actually create a PMEM
-pool (a real PMEM/CXL DIMM, or — as in the sandbox this was developed and verified in — any
-NUMA node UMF can bind an OS memory provider to). The very first PMEM allocation in a test process
-triggers a one-time pool init + prewarm that can take on the order of a minute; the test file's
-`ensure_pmem_allocator_warm()` helper pays that cost up front so it doesn't race against any single
-test's own timing assertions.
+The integration tests need a machine with a second NUMA node for the `Hybrid` allocator to bind
+to (a real PMEM/CXL DIMM, or any memory-only node). The first slow-tier allocation in a test
+process builds that node's jemalloc arenas, which is cheap but not free; the test file's
+`ensure_pmem_allocator_warm()` helper does it up front so it doesn't land inside a single test's
+timing assertions. It used to cover a UMF pool init and prewarm that took on the order of a
+minute — that cost is gone with the allocator that incurred it.

@@ -784,7 +784,7 @@ mod tests {
 	/// expressible while `high() / low() < 1.5`: below that no capacity
 	/// satisfies both `low_bytes(cap) >= target` and
 	/// `high_bytes(cap) < target + 50` at once. That covers the defaults
-	/// (0.95/0.75) and the drain-to-ceiling restore (1.0/1.0). The watermark
+	/// (0.98/0.95) and the drain-to-ceiling restore (1.0/1.0). The watermark
 	/// tests at the bottom of this module are granular enough to hold at any
 	/// pair, and are the ones that pin the watermark semantics themselves.
 	fn low_water_safe(target: CacheSize) -> CacheSize {

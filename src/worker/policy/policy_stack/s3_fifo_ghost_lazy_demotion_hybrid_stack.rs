@@ -731,7 +731,7 @@ mod tests {
 	/// `bytes`. Lets the fast-tier tests state their expectations in whole
 	/// objects instead of hard-coded byte thresholds, so they hold at whatever
 	/// `FAST_TIER_HIGH_WATERMARK`/`FAST_TIER_LOW_WATERMARK` pair is configured
-	/// rather than only at the 0.95/0.75 defaults. The `while` loop absorbs the
+	/// rather than only at the default ratios. The `while` loop absorbs the
 	/// truncation in `watermarks::low_bytes`' `as u64` cast, which a bare
 	/// `ceil()` on its own can land a byte short of.
 	fn capacity_holding(bytes: CacheSize) -> CacheSize {
@@ -809,7 +809,7 @@ mod tests {
 		// the very first object and drains the tier empty.) Assumes a
 		// watermark pair narrow enough that two of these objects still trip
 		// the high watermark -- i.e. `high()/low() < 2`, comfortably true of
-		// the 0.95/0.75 defaults.
+		// the 0.98/0.95 defaults.
 		let mut stack = S3FifoGhostLazyDemotionHybridStack::new(1.0, 1_000, capacity_holding(10));
 
 		stack.insert(1, 10);
@@ -859,7 +859,7 @@ mod tests {
 		// drains to 18 and takes key 2 down with key 1.) The premise -- three
 		// objects trip the high watermark while two still fit under the low
 		// one -- needs `high()/low() < 1.5`, again comfortably true of the
-		// 0.95/0.75 defaults. The watermark-specific tests at the bottom of
+		// 0.98/0.95 defaults. The watermark-specific tests at the bottom of
 		// this module derive their expectations instead, so they hold at any
 		// configured pair.
 		let mut stack = S3FifoGhostLazyDemotionHybridStack::new(1.0, 1_000, capacity_holding(20));
@@ -1401,7 +1401,7 @@ mod tests {
 
 		// Smallest per-key reservation that makes those same two keys overflow
 		// the effective budget. Derived from the configured watermarks so this
-		// holds at any ratio pair, not just the 0.95/0.75 defaults.
+		// holds at any ratio pair, not just the default ratios.
 		let mut overhead: CacheSize = 1;
 
 		while watermarks::high_bytes(capacity.saturating_sub(2 * overhead)) >= 20 {

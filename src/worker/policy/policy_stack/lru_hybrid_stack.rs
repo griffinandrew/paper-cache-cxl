@@ -21,9 +21,10 @@
 //! `settle_fast_tier` triggers once `fast_used` exceeds
 //! `watermarks::high_bytes` of the effective budget, and once triggered
 //! drains down to `watermarks::low_bytes` of that budget rather than back to
-//! exactly the ceiling. Both ratios live in `super::watermarks` (defaults
-//! 0.95 / 0.75, overridable at runtime via `FAST_TIER_HIGH_WATERMARK` /
-//! `FAST_TIER_LOW_WATERMARK`) and are shared by every hybrid stack, so the
+//! exactly the ceiling. Both ratios live in `super::watermarks`
+//! (`DEFAULT_HIGH` / `DEFAULT_LOW`, currently 0.98 / 0.95 -- those constants
+//! are authoritative, not this sentence) and are shared by every hybrid
+//! stack, so the
 //! trigger/drain tradeoff is tuned in one place. Setting both to `1.0`
 //! restores the original trigger-and-drain-at-the-ceiling behaviour exactly.
 //!
