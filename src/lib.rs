@@ -1714,7 +1714,10 @@ where
 #[cfg(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 impl<K, V, S> PaperCache<K, V, S>
 where
-	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone,
+	// `Send + Sync` because `WorkerFanout::new` hands the object map to worker
+	// threads. Every other `PaperCache` impl carries these; this shape was
+	// merged without them, so the two features that select it never built.
+	K: 'static + Eq + Hash + TypeSize + std::fmt::Debug + Clone + Send + Sync,
 	V: ValueBuffer,
 	S: Default + Clone + BuildHasher,
 {
