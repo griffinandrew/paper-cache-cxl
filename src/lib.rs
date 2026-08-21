@@ -593,7 +593,7 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let cache = PaperCache::<u32, u32>::new(
+	/// let cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -602,7 +602,7 @@ where
 	/// assert!(cache.is_ok());
 	///
 	/// // Supplying a maximum size of zero will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
+	/// let cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     0,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -611,7 +611,7 @@ where
 	/// assert!(cache.is_err());
 	///
 	/// // Supplying duplicate policies will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
+	/// let cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu, PaperPolicy::Lru, PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -620,7 +620,7 @@ where
 	/// assert!(cache.is_err());
 	///
 	/// // Supplying a non-configured policy will return a `CacheError`.
-	/// let cache = PaperCache::<u32, u32>::new(
+	/// let cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lru,
@@ -649,7 +649,7 @@ where
 	/// use std::hash::RandomState;
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let cache = PaperCache::<u32, u32>::with_hasher(
+	/// let cache = PaperCache::<u32, Box<[u8]>>::with_hasher(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -734,7 +734,7 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu
@@ -753,13 +753,13 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	///
 	/// let status = cache.status().unwrap();
 	/// assert!(status.used_size() > 0);
@@ -775,13 +775,13 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	///
 	/// // Getting a key which exists in the cache will return the associated value.
 	/// assert!(cache.get(&0).is_ok());
@@ -851,13 +851,13 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// assert!(cache.set(0, 0, None).is_ok());
+	/// assert!(cache.set(0, &[0], None).is_ok());
 	/// ```
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
@@ -907,13 +907,13 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	/// assert!(cache.del(&0).is_ok());
 	///
 	/// // Deleting a key which does not exist in the cache will return a CacheError.
@@ -942,13 +942,13 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	///
 	/// assert!(cache.has(&0));
 	/// assert!(!cache.has(&1));
@@ -969,21 +969,21 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
-	/// cache.set(1, 0, None);
+	/// cache.set(0, &[0], None);
+	/// cache.set(1, &[0], None);
 	///
 	/// // Peeking a key which exists in the cache will return the associated value.
 	/// assert!(cache.peek(&0).is_ok());
 	/// // Peeking a key which does not exist in the cache will return a CacheError.
 	/// assert!(cache.peek(&2).is_err());
 	///
-	/// cache.set(2, 0, None);
+	/// cache.set(2, &[0], None);
 	///
 	/// // Peeking a key will not alter the eviction order of the objects.
 	/// assert!(cache.peek(&1).is_ok());
@@ -1007,13 +1007,13 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None); // value will not expire
+	/// cache.set(0, &[0], None); // value will not expire
 	/// cache.ttl(&0, Some(5)); // value will expire in 5 seconds
 	/// ```
 	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
@@ -1045,13 +1045,13 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
 	/// ).unwrap();
 	///
-	/// cache.set(0, 0, None);
+	/// cache.set(0, &[0], None);
 	///
 	/// // Sizing a key which exists in the cache will return the size of the associated value.
 	/// assert!(cache.size(&0).is_ok());
@@ -1076,7 +1076,7 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1102,7 +1102,7 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1142,7 +1142,7 @@ where
 	/// ```
 	/// use paper_cache::{PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, u32>::new(
+	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,

@@ -64,6 +64,9 @@ mod hybrid_cache_tests {
     /// before a test's own timing-sensitive assertions begin. See the module
     /// doc comment above for why this is necessary.
     fn ensure_pmem_allocator_warm() {
+        // Mechanics tests at toy scales: metadata reservation off (see
+        // `get_hybrid_dram_shared_overhead`).
+        unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
         let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1), PaperPolicy::FifoHybrid)
             .expect("warm-up cache should construct");
 

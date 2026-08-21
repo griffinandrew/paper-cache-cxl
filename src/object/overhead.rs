@@ -795,6 +795,18 @@ fn resident_factor() -> f64 {
 
 #[cfg(feature = "hybrid_cache_common")]
 pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
+	// Test support: the tier-mechanics integration tests choreograph
+	// promotions and demotions with fast-tier budgets of tens of bytes,
+	// where the ~75 B/object metadata reservation below exceeds the whole
+	// budget and no promotion can ever fit. Those tests predate the
+	// reservation and test policy mechanics, not DRAM accounting, so
+	// `PAPER_DISABLE_SHARED_OVERHEAD=1` restores their value-only
+	// semantics. `shared_overhead_reservation_is_active_by_default` in the
+	// lru integration suite pins the production default.
+	if std::env::var_os("PAPER_DISABLE_SHARED_OVERHEAD").is_some_and(|v| v == "1") {
+		return 0;
+	}
+
 	#[allow(unused_mut)]
 	let mut overhead: ObjectSize = 0;
 

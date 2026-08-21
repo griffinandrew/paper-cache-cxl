@@ -64,6 +64,9 @@ mod hybrid_cache_tests {
     /// aged-out key into the main queue's slow tier instead of evicting it, so
     /// they are not exposed to this and keep their own simpler warm-up.
     fn ensure_pmem_allocator_warm() {
+        // Mechanics tests at toy scales: metadata reservation off (see
+        // `get_hybrid_dram_shared_overhead`).
+        unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
         // fast_tier_size == one_access_capacity (1000 == 0.001 * 1_000_000)
         // leaves `effective_main_fast_capacity` at exactly 0, so the promotion
         // triggered by the get() below self-demotes deterministically.

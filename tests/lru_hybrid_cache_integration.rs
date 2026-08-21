@@ -62,6 +62,9 @@ mod hybrid_cache_tests {
     /// before a test's own timing-sensitive assertions begin. See the module
     /// doc comment above for why this is necessary.
     fn ensure_pmem_allocator_warm() {
+        // Mechanics tests at toy scales: metadata reservation off (see
+        // `get_hybrid_dram_shared_overhead`).
+        unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
         let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1), PaperPolicy::LruHybrid)
             .expect("warm-up cache should construct");
 
@@ -876,5 +879,37 @@ mod hybrid_cache_tests {
             stats.fast_objects, stats.fast_bytes_used,
         );
         assert_eq!(cache.get(&1u32).unwrap(), value(0xD4));
+    }
+
+    /// The DRAM metadata reservation must stay ON by default: with a fast
+    /// budget smaller than one object's metadata overhead, nothing may ever
+    /// be promoted. Runs in its own process-visible env state by explicitly
+    /// clearing the mechanics-test switch first.
+    #[test]
+    fn shared_overhead_reservation_is_active_by_default() {
+        unsafe { std::env::remove_var("PAPER_DISABLE_SHARED_OVERHEAD") };
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(40),
+            PaperPolicy::LruHybrid,
+        )
+        .expect("cache should construct");
+
+        for key in 1u32..=3 {
+            cache.set(key, b"tiny value bytes", None).expect("set");
+        }
+        cache.get(&1u32).expect("get");
+
+        // Give a would-be promotion ample time, then require it did NOT
+        // happen: 40 bytes cannot hold ~75 B of per-object metadata.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let stats = cache.hybrid_stats();
+        assert_eq!(
+            stats.fast_bytes_used, 0,
+            "fast tier admitted bytes despite a budget below one object's metadata overhead"
+        );
+
+        unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
     }
 }

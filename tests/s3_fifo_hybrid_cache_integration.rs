@@ -62,6 +62,9 @@ mod hybrid_cache_tests {
     /// calls `TieredBuffer::new_slow` directly (synchronous), so by the
     /// time `set()` returns, the allocator is warm.
     fn ensure_pmem_allocator_warm() {
+        // Mechanics tests at toy scales: metadata reservation off (see
+        // `get_hybrid_dram_shared_overhead`).
+        unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
         let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(1.0))
             .expect("warm-up cache should construct");
 

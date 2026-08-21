@@ -100,6 +100,9 @@ mod hybrid_cache_tests {
     /// allocator, so only the first call anywhere in this binary actually
     /// waits.
     fn ensure_pmem_allocator_warm() {
+        // Mechanics tests at toy scales: metadata reservation off (see
+        // `get_hybrid_dram_shared_overhead`).
+        unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
             CacheTierSize::Bytes(400), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)).expect("warm-up cache should construct");

@@ -65,6 +65,9 @@ mod hybrid_cache_tests {
     /// before a test's own timing-sensitive assertions begin. See the module
     /// doc comment above for why this is necessary.
     fn ensure_pmem_allocator_warm() {
+        // Mechanics tests at toy scales: metadata reservation off (see
+        // `get_hybrid_dram_shared_overhead`).
+        unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
         let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1), PaperPolicy::LfuHybrid)
             .expect("warm-up cache should construct");
 
@@ -357,6 +360,16 @@ mod hybrid_cache_tests {
         for key in 2u32..=6 {
             cache.set(key, &value(key as u8), None).expect("set should succeed");
         }
+
+        // The fillers overfill the fast tier, but sets flow through the
+        // async policy worker: the stack latches admission only once it has
+        // processed them, and `set()` reads a status mirror refreshed one
+        // worker pass later still. Wait for the observable consequence -- a
+        // filler demoted to slow -- before relying on the latch, or key 1
+        // races the mirror and lands fast.
+        assert!(wait_until(MIGRATION_TIMEOUT, || {
+            (2u32..=6).any(|k| cache.tier_of(&k) == Some(Tier::Slow))
+        }));
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
