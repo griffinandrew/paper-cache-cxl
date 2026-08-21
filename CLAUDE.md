@@ -22,135 +22,116 @@ feature.
 
 ```
 src/
-  lib.rs                      PaperCache<K, V, S> — the core cache type. Repeated per storage
-                               combination (BufferDRAM vs BufferPMEM, with/without eviction
-                               callback, etc.) behind #[cfg(feature = ...)] impl blocks. This file
-                               is large (~5500 lines) because most of the "same API, different
-                               backing storage" variants are written out longhand rather than
-                               generically — grep for `impl<K, S> PaperCache<K, Buffer` to find
-                               each variant.
-  policy.rs                   PaperPolicy enum (Lfu, Fifo, Clock, Sieve, Lru, Mru, TwoQ, Arc,
-                               SThreeFifo) + its Display/FromStr for the string config format
-                               used by paper-server (e.g. "2q-0.2-0.2", "s3-fifo-0.1").
+  lib.rs                      PaperCache<K, V, S> — the core cache type (~4400 lines). Repeated
+                               per storage combination behind #[cfg(feature = ...)] impl blocks;
+                               grep for `impl<K, S> PaperCache<K, TieredBuffer` to find each
+                               hybrid design's own new/with_hasher/stats block. Also carries the
+                               153 compile_error! guards making the hybrid features mutually
+                               exclusive (one per pair of the 18 designs).
+  policy.rs                   PaperPolicy — the plain policies (Lfu, Fifo, Clock, Sieve, Lru,
+                               Mru, TwoQ, Arc, SThreeFifo) plus one variant per hybrid design
+                               (LruHybrid, LfuHybrid, TwoQHybrid(f64), S3FifoHybrid(f64), ...),
+                               with Display/FromStr for paper-server's string config format.
   error.rs                    CacheError.
-  status.rs                   AtomicStatus — size accounting, hit/miss/set/del counters, current
-                               policy, max size. Shared, lock-light state read/written by both the
-                               PaperCache API and the background workers.
-  object/                     Object<K, V> (the stored entry) + overhead accounting
-                               (object/overhead.rs computes per-object bookkeeping size).
-  allocator.rs                Custom allocators: HybridObjects / RegionHybrid / DevDaxBump /
-                               DRAMObjects — the concrete types the crate-wide `Hybrid` type alias
-                               resolves to, selected by feature flags in lib.rs.
-  umf_bindings.rs,
-  umf_allocator_bindings.rs    FFI bindings to UMF (Unified Memory Framework), used for real PMEM
-                               allocation. `build.rs` generates a stub (malloc/free-backed) when
-                               UMF isn't available so the crate still builds on non-PMEM machines.
+  status.rs                   AtomicStatus — size accounting, hit/miss/set/del counters, the
+                               hybrid tier counters and gauges, current policy, max size.
+  size.rs                     CacheTierSize (Bytes/Mb/Gb, decimal).
+  tiered_buffer.rs            TieredBuffer — Fast(Box<[u8]>) / Slow(Box<[u8], Hybrid>), the
+                               value type every hybrid design stores. Tier is a property of the
+                               value; a live object's bytes are in exactly one tier.
+  hybrid_policy.rs            HybridPolicy trait — the per-design marker (admission_tier,
+                               seed_policy, stats_from_status) parameterizing the one shared
+                               generic impl block in lib.rs.
+  hybrid_stats.rs             HybridStats — feature-neutral 3-counter/4-gauge snapshot, so a
+                               consumer need not cfg-cascade over all 18 designs.
+  numa_alloc.rs               Node-bound jemalloc arenas. NumaAlloc<NODE_FAST> is the crate's
+                               #[global_allocator]; SlowObjects (aliased crate-wide as `Hybrid`)
+                               backs the slow tier. Extents are mmap'd then mbind'd before
+                               jemalloc hands them out, and the alloc hook fails closed. This
+                               replaced the UMF/TBB allocators and their FFI bindings.
+  object/                     Object<K, V> + overhead accounting (object/overhead.rs computes
+                               the per-object DRAM reservation the stacks subtract from
+                               fast_capacity).
+  object_store.rs             ObjectStore trait over the object map.
+  value_buffer.rs             ValueBuffer.
+  <design>_hybrid_cache/      One module per hybrid design (18), each holding its marker type,
+                               its HybridPolicy impl, and its own Stats struct.
+  tiering/                    LEGACY copy-based tiering manager (enable_tiering_manager /
+                               tiering / multitiering). Keeps a *second* physical copy of hot
+                               objects in a DRAM side-cache — the opposite data-movement model
+                               from the hybrid designs, which keep one copy and move it. The
+                               hybrid designs do not use any of this.
 
-  worker/                     Background-thread machinery. PaperCache::new() spawns the workers
-                               that own all mutation of eviction state so the hot get()/set()
-                               path stays lock-cheap.
-    manager.rs                 WorkerFanout — routes each WorkerEvent to the sub-workers
-                                (PolicyWorker, TtlWorker, TieringWorker) that actually consume
-                                it, per worker/mod.rs's `Events` subscription masks. NOT a
-                                thread: the fan-out runs inline on the calling thread. It was a
-                                thread until the GET-path work below; see "Performance: the
-                                background event pipeline on the GET path".
-    mod.rs                      WorkerEvent enum: Get(key, hit), Promote(key), Set(key, size,
-                                 expiry, old_info), Del(key, expiry), Ttl, Wipe, Resize, Policy.
-                                 This is the *only* channel between PaperCache's API calls and
-                                 all background eviction/tiering logic.
+  worker/                     Background-thread machinery. All mutation of eviction state lives
+                               here so the hot get()/set() path stays lock-cheap.
+    manager.rs                 WorkerFanout — routes each WorkerEvent to the sub-workers. NOT a
+                                thread: the fan-out runs inline on the calling thread.
+    mod.rs                     WorkerEvent enum + the Tier type.
     policy/
-      mod.rs                    PolicyWorker — drives the active PolicyStack, runs evictions
-                                 when status.used_size() exceeds max_size, and (under the
-                                 `hybridcache` feature) can carry an eviction_callback that fires
-                                 per evicted object, plus a promotion_tx sender used when a
-                                 policy stack reports AccessOutcome::GhostHit.
-      policy_stack/              One file per eviction policy, all implementing the PolicyStack
-                                 trait (insert/update/remove/evict_one/resize/clear + record_access
-                                 returning AccessOutcome::{None, GhostHit}). init_policy_stack()
-                                 in mod.rs maps PaperPolicy -> Box<dyn PolicyStack>.
-                                   lru_stack.rs      plain LRU (HashList, or PmemHashList under
-                                                     `eviction_stacks_pmem`) — the policy this new
-                                                     feature's two tiers will each use internally.
-                                   two_q_stack.rs,
-                                   s_three_fifo_stack.rs   examples of policies with a *ghost*
-                                                     queue; only these currently emit GhostHit.
-      mini_stack/                Lightweight per-policy stacks used for PaperCache's "auto" mode
-                                 (estimating what other policies would have done, to support
-                                 switching policy live).
-      trace/                    Optional access-trace recording/replay, the input
-                                 reconstruct_policy_stack() replays to rebuild a *different*
-                                 policy's stack after a live policy switch. Only spawned when
-                                 more than one policy is configured (see trace_is_useful) —
-                                 with a single policy, which is every hybrid cache, no switch is
-                                 reachable and the trace would be written and never read.
+      mod.rs                    PolicyWorker — drives the active PolicyStack, applies tier
+                                 migrations (demotions before promotions), runs evictions. Also
+                                 holds three submodules: `migration_queue` (the standing
+                                 consumer pool that actually performs the byte moves, one
+                                 channel per consumer sharded by key hash, 2 threads by
+                                 default), `parallel_migration` (the abandoned per-batch rayon
+                                 fan-out, disabled by default) and `migstats` (the MIGSTATS
+                                 batch-size histograms dumped to stderr).
+      policy_stack/             One file per policy, all implementing the PolicyStack trait.
+                                 The 18 *_hybrid_stack.rs files carry each design's algorithm
+                                 and its full derivation in the module doc — those are the
+                                 authoritative description of what each design does.
+                                 `watermarks` (in mod.rs) holds the shared fast-tier high/low
+                                 ratios: defaults 0.98 / 0.95, overridable via
+                                 FAST_TIER_HIGH_WATERMARK / FAST_TIER_LOW_WATERMARK.
+      mini_stack/               Lightweight per-policy stacks for PaperCache's "auto" mode.
+      trace/                    Access-trace recording/replay, replayed to rebuild a different
+                                 policy's stack after a live switch. Only spawned when more than
+                                 one policy is configured — never for a hybrid cache, which has
+                                 exactly one, so no switch is reachable.
     ttl/                        TtlWorker — background expiry sweep.
-    tiering.rs                  TieringWorker — bridges WorkerEvent to TieringManager
-                                 (see below); only compiled under the tiering-manager features.
-
-  tiering/                     The **existing** DRAM/PMEM tiering mechanism (`enable_tiering_manager`
-                                / `tiering` / `multitiering` / `sets_dram` features). This is a
-                                *hotness-threshold, copy-based* design: PMEM is always the source
-                                of truth, and objects accessed >= a configurable threshold get a
-                                physical copy placed in a separate DRAM side-cache
-                                (manager.rs: promote_to_dram_with_object / demote_from_dram).
-                                Under `hashtable_tiering` it adds a third, zero-copy "warm" state
-                                (object/TieringObject holds a CXL reference instead of a physical
-                                copy). NOTE: this module intentionally keeps copies in both tiers
-                                simultaneously — it is the opposite data-movement model from the
-                                new lru_hybrid_cache feature described below. Don't reuse its
-                                copy-on-promote pattern for the new feature.
-
-  hybridcache/                 Higher-level two-tier caches built by composing *two independent
-                                PaperCache instances* (one BufferDRAM, one BufferPMEM) rather than
-                                by adding tiering logic inside a single PaperCache. This is the
-                                module the new lru_hybrid_cache feature belongs in.
-    mod.rs                      S3FifoHybridCache<K> (feature = "hybridcache"): small DRAM tier
-                                 runs S3-FIFO, far PMEM tier runs LRU. Admission always goes to
-                                 the small tier. Demotion: PolicyWorker's eviction_callback (see
-                                 worker/policy/mod.rs) fires on small-tier eviction and
-                                 asynchronously writes the bytes to the far tier over a bounded
-                                 channel + dedicated worker thread. Promotion: driven by the small
-                                 tier's S3-FIFO *ghost queue* — a ghost hit sends
-                                 WorkerEvent::Promote, a background worker looks the key up in a
-                                 demoted_lookup: DashMap<HashedKey, Arc<K>> and re-inserts far-tier
-                                 bytes into the small tier. Uses copy-on-read: the far-tier (PMEM)
-                                 copy is *never deleted* on promotion, so a key can legitimately
-                                 exist in both tiers at once. An in_flight_demotions: DashSet<K>
-                                 plus yield-and-retry in get() covers the DRAM->PMEM migration
-                                 window.
+    tiering.rs                  TieringWorker — bridges WorkerEvent to the legacy TieringManager.
 
 tests/
-  hybridcache_integration.rs   Integration tests for S3FifoHybridCache; run with
-                               `cargo +nightly test --test hybridcache_integration --features hybridcache`.
-                               Good template for the new feature's test file — mirrors tier
-                               routing, eviction propagation, promotion, stats counters, and
-                               in-flight-migration edge cases.
-  tiering_integration.rs        Integration tests for the copy-based tiering manager.
-  global_flatmap_integration.rs,
-  pmem_region_alloc_integration.rs   Tests for other storage-backend feature combinations.
+  <design>_hybrid_cache_integration.rs   One per hybrid design (18), each gated on its own
+                                         feature. Some carry #[ignore]d at-scale reproductions.
+  tiering_integration.rs                 The legacy copy-based manager.
+  isolate_pmem_latency.rs                Allocator-level latency probe.
 ```
 
 ## Feature-flag model (read `FEATURE_FLAGS.md` for full detail)
 
-Nearly everything in this crate is gated by Cargo features because the whole point of the branch
-is comparing storage-placement strategies. Key points relevant to new work:
+Nearly everything is gated by Cargo features, because the point of the branch is comparing
+placement strategies. Current state:
 
+- `numa_jemalloc` — node-bound jemalloc arenas (`src/numa_alloc.rs`). Pulled in by everything
+  below; the global allocator and `Hybrid` are wired up unconditionally.
+- `key_value_pmem` / `key_pmem_value_pmem` — value (or key+value) bytes in PMEM via `Hybrid`.
 - `all_dram` — force every allocation to DRAM.
-- `key_value_pmem` / `key_pmem_value_pmem` — put value (or key+value) bytes in PMEM via the
-  `Hybrid` allocator alias (resolves to `HybridObjects`, `RegionHybrid`, or `DevDaxBump` depending
-  on which of `pmem_region_alloc` / `region_hybrid_allocator` / `devdax_bump` is also set).
-- `enable_tiering_manager`, `tiering`, `multitiering`, `sets_dram`, `hashtable_tiering` — the
-  existing copy-based tiering manager (`src/tiering/`), not the same as `hybridcache`.
-- `hybridcache = ["all_dram", "key_pmem_value_pmem"]` — the S3-FIFO/LRU two-tier cache. This is
-  the closest precedent for the new feature: it needs a DRAM-typed tier (`BufferDRAM`, via
-  `all_dram`) and a PMEM-typed tier (`BufferPMEM`, via `key_pmem_value_pmem`) simultaneously,
-  which is exactly what `lru_hybrid_cache` will also need.
-- Combining features generally means AND-ing requirements; several `compile_error!` guards in
-  `lib.rs` reject known-invalid combinations (e.g. `global_flatmap_dram` + `global_flatmap_pmem`).
+- `eviction_stacks_pmem` — move the eviction stacks' own bookkeeping into PMEM.
+- `global_hashtable_pmem`, `tiering_hashtable_pmem`, `hashbrown_dram` — hashtable placement.
+- `enable_tiering_manager`, `tiering`, `multitiering`, `hashtable_tiering` — the legacy
+  copy-based tiering manager (`src/tiering/`).
+- **The 18 `*_hybrid_cache` features** — one per design. Each implies `key_value_pmem` and
+  `hybrid_cache_common`, and they are **mutually exclusive**: all define an inherent impl block
+  on the identical `PaperCache<K, TieredBuffer, S>` type. `hybrid_cache_common` is an internal
+  marker every design turns on, so code common to all of them needs one `cfg` rather than an
+  `any(...)` list that is silently wrong whenever someone forgets to extend it.
 
 `BufferDRAM = Box<[u8]>` and `BufferPMEM = Box<[u8], Hybrid>` (see `lib.rs`) are the two value
-types the hybrid caches wrap `PaperCache<K, _>` around.
+types; `TieredBuffer` is the tagged union of them that the hybrid designs actually store.
+
+**Features that no longer exist**, but are still named in the log below: `hybridcache` (the
+original two-PaperCache-instance S3-FIFO composition), `sets_dram`, `pmem_region_alloc`,
+`region_hybrid_allocator`, `devdax_bump`, `global_flatmap_dram`/`global_flatmap_pmem`. See the
+removal entries near the end of this file.
+
+---
+
+**Everything below this line is a chronological work log**, not current reference material.
+Entries record investigations, measurements and decisions in the order they happened, so a later
+entry supersedes an earlier one wherever they disagree — several describe code that was
+subsequently removed or replaced. The two sections above, `HYBRID_CACHES.md`, and the module doc
+comments in the source are the current-state documentation.
 
 ## Investigation: real DRAM usage vs. `fast_tier_size` — two confirmed bugs, one open hypothesis
 

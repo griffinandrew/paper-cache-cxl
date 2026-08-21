@@ -2,6 +2,13 @@
 
 This document explains the implementation of separate configuration options for persistent memory (PMEM) placement in PaperCache.
 
+> **Scope note.** The `*_hybrid_cache` sections below cover only the first six designs, in the
+> detail they were written up with at the time. There are now **18**, and this file has not
+> kept pace. For the complete set — what each one does, and how they relate — see
+> `HYBRID_CACHES.md`; `Cargo.toml` carries a comment on every feature. The placement flags in
+> this file (`all_dram`, `key_value_pmem`, the hashtable flags, `eviction_stacks_pmem`) are
+> current.
+
 ## Overview
 
 The implementation provides explicit feature flags to control:

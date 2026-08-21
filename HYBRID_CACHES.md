@@ -1,545 +1,665 @@
-# The hybrid caches: how `lru_hybrid_cache`, `lfu_hybrid_cache`, and `two_q_hybrid_cache` work
+# The hybrid caches
 
-This is the reference for how all three single-instance DRAM/PMEM hybrid caches are built and,
-specifically, exactly how objects move between the fast (DRAM) and slow (PMEM) tier. For the
-day-to-day feature-flag reference see `FEATURE_FLAGS.md`; for the chronological implementation
-history (what was tried, what broke, what was fixed, and why) see `CLAUDE.md`. `LRU_HYBRID_CACHE.md`
-is a deeper design-rationale writeup of `lru_hybrid_cache` specifically and is still worth reading
-for the "why," but this document is the current, authoritative description of *how* — for all
-three policies — and supersedes anything in that file that disagrees with it.
+This crate builds the same two-tier cache 18 different ways, one Cargo feature per design, to
+compare how eviction disciplines use a small DRAM tier in front of a large CXL/PMEM tier.
+Exactly one design is compiled into any build.
 
-## The shared idea: tier is a value, not a cache
+This document covers the machinery all 18 share, then each design individually. For the
+feature-flag matrix see `FEATURE_FLAGS.md`; for one design end to end in maximum detail see
+`LRU_HYBRID_CACHE.md`.
 
-All three features implement the same architectural pattern, just with a different eviction
-algorithm deciding *when* an object crosses tiers. Each is **one** `PaperCache<K, TieredBuffer, S>`
-— one object map, one `AtomicStatus`, one background `PolicyWorker` — not two `PaperCache`s wired
-together. "Fast" and "slow" are not two caches an object gets copied between; they're a property of
-*where a single object's bytes are currently allocated*, encoded in the value type itself:
+---
+
+# Part 1: What every design shares
+
+## Tier is a property of the value, not a separate cache
+
+There is one `PaperCache<K, TieredBuffer>`. `TieredBuffer` is a tagged union recording where
+this object's bytes currently are:
 
 ```rust
-// src/tiered_buffer.rs — shared by lru_hybrid_cache and lfu_hybrid_cache
-// (two_q_hybrid_cache uses the same type, just admits into Slow first)
 pub enum TieredBuffer {
-    Fast(Box<[u8]>),           // DRAM — the crate's global allocator
-    Slow(Box<[u8], Hybrid>),   // PMEM — the same Hybrid/UMF allocator BufferPMEM uses
+    Fast(Box<[u8]>),          // node-0 arenas, via the global allocator
+    Slow(Box<[u8], Hybrid>),  // node-1 arenas, via numa_alloc::SlowObjects
 }
 ```
 
-A promotion or demotion **physically reallocates** the object's bytes into the other variant —
-never a copy left behind in both. This is a deliberate departure from the other two tiering
-mechanisms already in this crate:
+A live object's bytes exist in **exactly one** tier. Promotion and demotion replace the
+`TieredBuffer` in place (`Object::set_data`), so a migration is a byte *move*. Contrast
+`src/tiering/`, the legacy manager, which deliberately keeps a copy in both tiers at once.
 
-| | `tiering/` (`enable_tiering_manager`) | `hybridcache` (`S3FifoHybridCache`) | These three hybrid caches |
-|---|---|---|---|
-| Cache instances | 1 `PaperCache` + a side `TieringManager` hashtable | 2 (`PaperCache<K,BufferDRAM>` + `PaperCache<K,BufferPMEM>`) | 1 (`PaperCache<K,TieredBuffer>`) |
-| Data on promotion/demotion | copied (PMEM stays source of truth) | copied (copy-on-read; PMEM copy never deleted) | **moved** (`Object::set_data`, one copy ever) |
-| Can a key be in both tiers? | yes, always | yes (until re-evicted) | **never** |
-| Cross-thread coordination | shared `Arc<TieringManager>` | `DashSet`s for in-flight demotion/promotion windows | none needed — one worker thread owns all migrations |
+Because each design defines its own inherent `impl<K, S> PaperCache<K, TieredBuffer, S>` block
+and two such blocks cannot coexist for one concrete type, the designs are mutually exclusive.
+`lib.rs` names all 153 conflicting pairs in their own `compile_error!` guards.
 
-`PaperCache<K, V, S>` is generic over the value type `V`; `TieredBuffer` is just one more
-instantiation of that, alongside `BufferDRAM = Box<[u8]>` and `BufferPMEM = Box<[u8], Hybrid>`.
+## How a stack decides, without ever touching a byte
 
-Each feature adds one new `PaperPolicy` variant and one new `PolicyStack` implementation that
-decides tier membership; everything else (the object map, the background worker, the migration
-machinery below) is shared code, not duplicated per feature.
+A `PolicyStack` tracks **order and tier membership only**. It never allocates, copies, or frees
+object bytes, and it holds no reference to the object map — it cannot, since it runs inside
+`PolicyWorker` while API threads are concurrently reading the map.
 
-| Feature | Policy | Policy stack | Fixed policy string |
-|---|---|---|---|
-| `lru_hybrid_cache` | `PaperPolicy::LruHybrid` | `LruHybridStack` | `"lru-hybrid"` |
-| `lfu_hybrid_cache` | `PaperPolicy::LfuHybrid` | `LfuHybridStack` | `"lfu-hybrid"` |
-| `two_q_hybrid_cache` | `PaperPolicy::TwoQHybrid(k_in)` | `TwoQHybridStack` | `"2q-hybrid-{k_in}"` |
+When a stack decides a key belongs in a different tier it pushes `(HashedKey, Tier)` onto an
+internal `migrations` vector. `PolicyWorker` drains that with `drain_tier_migrations()` after
+each event and performs the real work.
 
-The three features are mutually exclusive with each other (`lib.rs` has `compile_error!` guards for
-every pairwise combination) since each defines the same inherent-method `impl<K, S>
-PaperCache<K, TieredBuffer, S>` block for the same concrete type.
-
-## How a `PolicyStack` decides — without ever touching a byte
-
-A `PolicyStack` (`worker/policy/policy_stack/mod.rs`) only ever manipulates `HashedKey`s and a
-small `Tier` enum:
-
-```rust
-pub enum Tier { Fast, Slow }
-```
-
-It has **no access to the object map** and no idea what `TieredBuffer` is — it just tracks *which
-tier each key is logically in* using whatever ordering its algorithm calls for (a recency list for
-LRU, two frequency-bucket chains for LFU, two live queues for 2Q — see the per-policy sections
-below). Every stack method that can change a key's tier appends a `(HashedKey, Tier)` pair to an
-internal `migrations: Vec<...>` buffer; `drain_tier_migrations()` hands that buffer to the caller
-and clears it. This split — *decide* in the stack, *move bytes* one layer up — is what lets all
-three policies share one physical-migration path instead of each reimplementing it.
-
-Five trait methods (all default no-ops so no other, non-hybrid `PolicyStack` needs to change) carry
-this:
-
-```rust
-fn resize_fast_tier(&mut self, _size: CacheSize) {}
-fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> { Vec::new() }
-fn fast_bytes_used(&self) -> CacheSize { 0 }
-fn slow_bytes_used(&self) -> CacheSize { 0 }
-fn fast_object_count(&self) -> usize { 0 }
-fn slow_object_count(&self) -> usize { 0 }
-```
-
-Two more exist for reasons specific to one policy each (see their sections below):
-`drain_demotions() -> u64` (LFU only — a `Tier::Slow` migration there isn't always a genuine
-demotion) and `needs_capacity_eviction() -> bool` (2Q only — its FIFO queue can need eviction
-independently of the overall `max_size` budget).
+This is why a stack can be unit-tested with no allocator, no map, and no threads: its entire
+observable output is the sequence of `(key, tier)` pairs it emits.
 
 ## Turning "this key changed tier" into an actual byte move
 
-`PolicyWorker` (`worker/policy/mod.rs`) owns the shared object map, so it's the one that physically
-applies migrations. It's built with one extra field, populated only via
-`PolicyWorker::new_with_tier_migration` (the only constructor all three hybrid caches use):
+`PolicyWorker` owns the shared object map, so it applies migrations. It carries:
 
 ```rust
-tier_migration_fn: Option<Box<dyn Fn(&V, Tier) -> V + Send + Sync>>,
+tier_migration_fn: Option<Arc<dyn Fn(&V, Tier) -> Option<V> + Send + Sync>>,
 ```
 
-supplied at `PaperCache::new` as:
+populated only by `PolicyWorker::new_with_tier_migration`, which every hybrid design uses. The
+closure returns `Option<V>`: `None` means **declined** — the value is already in the requested
+tier, so there is nothing to move. That case is normal, not an error; see "Counters vs physical
+copies" below.
+
+### The work is done by a standing consumer pool, not by the worker
+
+`apply_tier_migrations` partitions the drained migrations into demotions and promotions, then
+hands each entry to `apply_physical`. With the migration queue enabled — the default — that
+function does one thing:
 
 ```rust
-Box::new(|buffer: &TieredBuffer, tier| match tier {
-    Tier::Fast => TieredBuffer::new_fast(buffer.as_ref()),
-    Tier::Slow => TieredBuffer::new_slow(buffer.as_ref()),
-})
+if let Some(queue) = migration_queue {
+    queue.push((key, tier));
+    return;
+}
 ```
 
-After every processed `WorkerEvent` (`Get`/`Set`/`Del`/`Wipe`/`Resize`/`ResizeFastTier`/`Policy`),
-`PolicyWorker::run()`'s event loop calls `apply_tier_migrations()` — per event, not once per batch,
-specifically to keep the window between a demotion decision and its physical DRAM-freeing copy as
-short as possible under concurrent load.
+The worker returns immediately and gets back to mutating the stack. The **`migration_queue`
+consumer threads** (`mig-N`, 2 by default) perform the allocate-copy-swap. Setting
+`MIGRATION_QUEUE_THREADS=0` disables the queue, and the worker runs the identical body inline
+instead.
 
-### The physical copy is parallelized, with a strict demotion-before-promotion barrier
+The queue keeps **one channel per consumer, indexed by key hash**. A single shared channel with
+N consumers would let two migrations for the *same* key be applied out of order: a demote and a
+following promote could be picked up concurrently, and whichever won the shard lock last would
+be the one whose `Arc::ptr_eq` check fails and gets discarded. Each swap is individually
+correct — the value is never corrupted — but the survivor could be the *older* decision,
+stranding the object in the wrong tier. Sharding by key hash makes per-key order structural.
 
-`apply_tier_migrations` drains the stack's pending migrations, splits them into two groups, and
-applies them in two sequential phases:
+### Ordering: demotions before promotions, at enqueue time
 
-```rust
-let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-    .into_iter()
-    .partition(|(_, tier)| *tier == Tier::Slow);
+Demotions are enqueued fully before promotions, so the fast tier gives back space before
+anything tries to move into it. Note what this is **not**: with the queue enabled it is an
+ordering of *enqueues*, not a physical barrier. Consumers run concurrently across shards, so a
+promotion of key B may physically complete before a demotion of key A. Per-key ordering is
+guaranteed; cross-key ordering is not.
 
-demotions.into_par_iter().for_each(|entry| {
-    apply_physical(entry);
-    status.record_..._demotion();
-});
+(An earlier revision did enforce a hard batch-wide barrier via two sequential
+`rayon::into_par_iter().for_each` phases. That is gone — see "The abandoned fan-out" below.)
 
-// only starts once every demotion above has returned
-promotions.into_par_iter().for_each(|entry| {
-    apply_physical(entry);
-    status.record_..._promotion();
-});
-```
+### The copy runs with no map guard held
 
-Each phase runs its entries concurrently via `rayon` (`into_par_iter().for_each`) for real
-multi-core throughput on the actual byte copy (`TieredBuffer::new_slow`'s PMEM allocation is the
-expensive part — profiling showed it as ~26% of total process CPU time under a demotion-heavy real
-workload). The two phases are **not** interleaved: `for_each` only returns once every entry in that
-call has completed, so this is a hard, batch-wide guarantee that every demotion has already freed
-its fast-tier DRAM before any promotion in the same batch starts allocating new fast-tier DRAM —
-never just a pairwise/push-order approximation of that ordering.
+Building the destination buffer is a real allocation plus a full byte copy — a PMEM write on
+demotion, a PMEM read on promotion — and at this crate's object sizes (~16 KB average on the
+benchmark traces) that is microseconds. Holding the shard's write guard across it stalls every
+concurrent `get()` hashing to the same shard, surfacing as GET tail latency.
 
-`apply_physical` for each entry, regardless of policy:
+So the consumer snapshots the source bytes with no guard held (`Object::data()` is an `Arc`
+refcount bump, and the `Arc` keeps the bytes alive independently of the map), does the copy, and
+re-acquires the shard only to swap the pointer:
 
 ```rust
-let apply_physical = |(key, tier): (HashedKey, Tier)| {
-    if let Some(mut object) = objects.get().get_mut(&key) {
-        let new_data = migrate(&object.data(), tier);
+if let Some(mut object) = objects.get_mut_ref(&key) {
+    if Arc::ptr_eq(&object.data(), &old_data) {
         object.set_data(new_data);
     }
-};
-```
-
-`objects` here is `&self.objects` wrapped in a small `AssertSync<T>` newtype (unconditional `unsafe
-impl Send + Sync`, with a `.get() -> &T` accessor rather than a public `.0` field — Rust's
-disjoint-closure-capture analysis would otherwise capture the field projection `objects.0` as just
-the inner `&ObjectMapRef<K, V>`, bypassing the wrapper's `unsafe impl` entirely; a method call
-forces capturing the whole wrapper). This lets the closures be shared across `rayon` worker threads
-without threading `K: Send + Sync, V: Send + Sync` bounds through the whole generic
-worker/policy-stack call chain — mirroring the crate's existing `unsafe impl<K, V> Send for
-PolicyWorker<K, V>` and `PaperCache<K, V, S>: Send + Sync` precedent (both unconditional, for the
-same reason). Safety rests on the same argument already given for those: all access to the object
-map goes through `DashMap`'s own per-shard locking, so no unsynchronized mutable access is ever
-actually exposed.
-
-`LfuHybridStack`'s sibling applies every migration the same way but counts demotions differently
-(see its section below) via `stack.drain_demotions()` instead of counting `Tier::Slow` entries
-directly, since not every `Tier::Slow` migration there is a genuine demotion.
-
-### `Object::set_data`: why this is a move, not a delete-then-reinsert
-
-```rust
-// src/object/mod.rs
-pub fn set_data(&mut self, data: V) {
-    self.data = Arc::new(data);
 }
 ```
 
-It touches only `data`; `key` and `expiry` are untouched. That's the entire reason TTL survives a
-tier move "for free" — there's nothing to carry over, because the same `Object` never stopped
-existing. In a two-instance design (like `hybridcache`) TTL would have to be read off one instance
-and manually reapplied on the other during every migration; here it's structurally impossible for
-it to diverge.
+The `ptr_eq` guard is load-bearing. `PaperCache::set()` runs on an API thread and can replace
+the entry while the copy is in flight; writing `new_data` over a *replacement* would resurrect
+the bytes of the value it replaced. If the object changed or was evicted, the migration is
+stale — it is dropped, and the stack's next event re-derives the correct tier. The same `Arc`
+strong reference makes this immune to ABA: the allocation cannot be reused while it is held.
 
-**Byte-length invariant.** `migrate` must never change the value's byte length.
-`AtomicStatus::base_used_size` is computed once at insert time and subtracted again at erase time
-via the identical recomputation, which depends only on the byte length. A migration that silently
-changed length would desync those two computations — since `base_used_size` is an unsigned counter,
-that mismatch would eventually underflow to a huge value and hang `apply_evictions`'s `while
-used_size() > max_size` loop forever. (This was found in exactly this form during development, when
-a throwaway test `migrate` closure appended a marker byte instead of overwriting one in place —
-see `CLAUDE.md`.) `TieredBuffer::new_fast`/`new_slow` are straight byte-for-byte copies, so real
-migrations satisfy this by construction.
+### The abandoned fan-out
 
-**No `used_size()` delta from a migration itself.** `overhead_manager.base_size`/`total_size`
-depend only on the object's logical byte length and the active policy's fixed per-object overhead —
-neither depends on which allocator backs the bytes. Swapping `Fast` ↔ `Slow` never changes an
-object's accounted size; `status.used_size()` is only touched by real admission/deletion/eviction.
+`parallel_migration` fanned a single *batch* across a rayon pool. It is still on the call path
+as a dispatcher, but `DEFAULT_THRESHOLD = 0` makes it degenerate to a sequential `for_each` on
+the worker — which, with the queue enabled, is just a loop of channel pushes.
 
-**Concurrency.** All tier decisions and all physical migrations happen inside `PolicyWorker` (on its
-own background thread, now parallelized internally via `rayon` for the physical-copy phase — see
-above); there is no second thread doing PMEM writes that the public API has to coordinate with, and
-no in-flight-tracking `DashSet`s like `hybridcache` needs. A `get()`/`set()` on the API-calling
-thread racing a migration just sees `DashMap`'s normal per-shard locking hand it either the pre- or
-post-migration `Arc<TieredBuffer>` for that key — never torn, never visible in neither or both
-tiers, because there is only ever one map entry for that key.
+It was measured and abandoned rather than tuned: 99.4% of demotion volume arrives as
+single-object batches (37M calls of exactly 1 object against 9 calls of ≥16K), so there is
+nothing to fan out. `migration_queue` replaced it by decoupling from batch boundaries
+entirely — the work is genuinely fine-grained, not genuinely serial.
 
-## Bounding total DRAM, not just fast-tier values (`lru_hybrid_cache` / `lfu_hybrid_cache` only)
+### Counters vs physical copies
 
-`fast_tier_size` naively only bounds the *value* bytes of fast-tier objects. But two more things
-also live in DRAM for every tracked object of *either* tier: the shared object hashtable (one entry
-per object of both tiers) and, unless `eviction_stacks_pmem` relocates them, the eviction stack's
-own per-key bookkeeping (the recency list / frequency chains + their `tiers`/`sizes` maps). Both
-`LruHybridStack` and `LfuHybridStack` reserve an approximate per-object cost for these out of the
-fast-tier budget:
+The stats count **tier decisions**, not byte copies. They diverge in three legitimate ways:
 
-```rust
-fn reserved_overhead(&self) -> CacheSize {
-    self.stack.len() as CacheSize * self.shared_overhead   // "tracked_count × per-object cost"
-}
+- **Counters lead the copies.** Migrations are applied asynchronously, so a mid-run snapshot
+  reports decisions not yet performed. They converge as the queue drains. There is no public
+  flush — `MigrationQueue::flush` is `#[cfg(test)]`-only, so test assertions on buffer contents
+  stay deterministic while still exercising the real queue path.
+- **Declined migrations are normal.** `PaperCache::set()` picks a placement of its own via
+  `HybridPolicy::admission_tier`, so an object can already be where the stack is about to say it
+  belongs. `TwoQHybridStack` hits this by design: `admission_tier` returns `Fast` for a re-set
+  (correct — the key is now most-recently-used), so the value is already in DRAM by the time
+  `touch_main_fast` emits its promotion.
+- **A persistent gap is a defect signal.** `LfuHybridStack` once emitted a `Tier::Slow`
+  migration on every latched admission whose bytes `admission_tier` had *already* placed in
+  PMEM — 445,465,067 migrations against ~448M sets on cluster12, ~99% of its reported demotions.
+  Any `lfu_hybrid_cache` demotion figure from before that fix is inflated and not comparable.
 
-fn settle_fast_tier(&mut self) {
-    let effective = self.fast_capacity.saturating_sub(self.reserved_overhead());
-    // demote against `effective`, not raw `fast_capacity`
-}
-```
+The four tier gauges (`fast_objects`/`slow_objects`/`fast_bytes_used`/`slow_bytes_used`) are
+republished by `refresh_tier_gauges` once per event-loop pass, so they are up to one pass stale.
+That refresh is deliberately unconditional: gating it on "a migration just happened" is what
+once let the gauges go stale indefinitely.
 
-`shared_overhead` defaults to `0` (so unit tests constructing a stack directly via `new(...)` keep
-pure value-budget behavior) and is set via `with_shared_overhead(...)` only by
-`init_policy_stack`, which computes the real value from
-`object::overhead::get_hybrid_dram_shared_overhead(&policy)`:
+## Shared machinery
 
-- `HASHTABLE_ENTRY_OVERHEAD = 11` bytes, included unless `global_hashtable_pmem`
-  moves the object map to PMEM.
-- `LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD = 64` / `LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD = 93`
-  bytes, included unless `eviction_stacks_pmem` moves the eviction stacks to PMEM. (Both dropped —
-  from 84/113 — after `LruHybridStack`/`LfuHybridStack` combined their separate `tiers`+`sizes`
-  maps into one `entries` map each; see "One combined per-key map" in their sections below.)
+### High/low watermarks
 
-This is **demotion-only** — it never triggers eviction. If the shared metadata alone meets or
-exceeds `fast_capacity`, the effective value budget saturates to `0` and every fast value drains to
-slow, but terminal eviction remains governed solely by `status.used_size() > max_size`, popping the
-slow tail exactly as it always does. `two_q_hybrid_cache` does not currently have this reservation
-(left out of scope when it was added).
+`settle_fast_tier` triggers once `fast_used` exceeds `watermarks::high_bytes` of the effective
+budget, then drains in one pass down to `watermarks::low_bytes` rather than back to exactly the
+ceiling. Defaults are **`DEFAULT_HIGH = 0.98` / `DEFAULT_LOW = 0.95`**, overridable at runtime
+via `FAST_TIER_HIGH_WATERMARK` / `FAST_TIER_LOW_WATERMARK`. Setting both to `1.0` restores the
+original drain-to-the-ceiling behaviour exactly.
 
-## Runtime-configurable fast-tier size
+The pair exists because draining to exactly the ceiling pinned the tier at 100% utilisation and
+made almost every pass a single-object migration batch. It trades a slice of resident fast
+capacity for larger, less frequent batches, and it is tuned in one place for all 18 stacks.
 
-All three policies support adjusting the fast-tier budget after construction, mirroring the
-existing `resize()`/`WorkerEvent::Resize` precedent:
+> Several stack module docs still quote the old `0.95 / 0.75` defaults in prose. The code above
+> is authoritative.
 
-- `CacheTierSize` (`src/size.rs`, bytes/Mb/Gb, shared with `hybridcache`) is the input type.
-- `WorkerEvent::ResizeFastTier(CacheSize)` → `PolicyWorker::handle_resize_fast_tier` →
-  `stack.resize_fast_tier(new_capacity)`, which re-runs the stack's own settle/demote logic
-  immediately (so *shrinking* the budget can trigger demotions right away, not lazily on the next
-  access).
-- `PaperCache::set_fast_tier_size(&self, size: CacheTierSize) -> Result<(), CacheError>` validates
-  `0 < bytes <= max_size` (`CacheError::InvalidFastTierSize` otherwise), writes
-  `status.set_fast_tier_capacity(bytes)` synchronously, then broadcasts the resize event.
-- `PaperCache::fast_tier_size(&self) -> CacheSize` reads `status.fast_tier_capacity()` directly —
-  no round trip to the worker thread, since `status` is the shared, always-current source of truth.
+### The shared-DRAM-overhead reservation
 
-`two_q_hybrid_cache` has a second, independent sizing knob on top of this: `k_in` (fixed at
-construction, `PaperPolicy::TwoQHybrid(k_in)`), which sizes the one-access FIFO queue as
-`fifo_capacity = k_in * max_size`. `fast_tier_size` governs `main_stack`'s fast/slow split; `k_in`
-governs how much of the cache the FIFO queue gets. They're unrelated and both freely adjustable
-(`k_in` rescales on `resize()`; `fast_tier_size` is adjustable at any time via
-`set_fast_tier_size`).
+The object hashtable and each stack's own bookkeeping live in DRAM but are not part of
+`fast_used`, so demoting purely against `fast_capacity` lets real DRAM exceed its budget — which
+is exactly what was observed in practice.
 
-## Stats
+`get_hybrid_dram_shared_overhead` gives a per-tracked-key byte figure; `reserved_overhead()`
+multiplies it by the tracked key count; `settle_fast_tier` subtracts that from `fast_capacity`
+**before** applying the watermarks. The composition order is load-bearing: the reservation comes
+out of capacity first, and the watermarks are ratios of what is left.
 
-Each policy has its own independently-named set of counters/gauges living directly on
-`AtomicStatus` (`status.rs`), not a separate field on `PaperCache` — `PaperCache`'s struct
-definition is shared across every value type in the crate and duplicated across roughly ten
-constructors, so a new field there would force every unrelated constructor to also learn how to
-initialize it. `AtomicStatus` is already the one structure both `PaperCache` and `PolicyWorker`
-hold an `Arc` to, with one construction site, so this needed no changes elsewhere.
-
-```rust
-pub struct LruHybridStats {   // LfuHybridStats / TwoQHybridStats: same shape
-    pub promotions: u64,
-    pub demotions: u64,
-    pub evictions: u64,       // terminal removals from the slow tier
-    pub fast_bytes_used: u64,
-    pub slow_bytes_used: u64,
-    pub fast_objects: u64,
-    pub slow_objects: u64,
-}
-```
-
-read via `PaperCache::lru_hybrid_stats()` / `lfu_hybrid_stats()` / `two_q_hybrid_stats()`. The
-`fast_*`/`slow_*` gauges are refreshed unconditionally on every `apply_tier_migrations` call (not
-gated on that call having produced a migration) — an earlier version gated the refresh on
-`!migrations.is_empty()`, which let the gauges go stale and never catch up to the stack's true
-state whenever a batch happened to process without triggering a further migration (see
-`CLAUDE.md`'s DRAM-usage investigation for how this was originally caught).
-
----
-
-## `lru_hybrid_cache`: segmented by recency
-
-> New objects are admitted into the fast tier. As objects age without being accessed they drift
-> down the queue and are eventually demoted to the slow tier. Accessing a slow-tier object promotes
-> it back to the top of the fast tier. When capacity is exhausted, the least recently accessed
-> object is evicted from the slow tier.
-
-One recency-ordered list (`LruHybridStack::stack`) backs both tiers. The fast tier is always the
-**contiguous prefix** of that list, starting from the head (most-recently-used) end: every
-admission/access moves its key to the front, and every demotion only ever removes from the current
-fast tier's tail — so a Slow key can never be more recently used than a Fast key. This invariant
-lets the stack track the single boundary key (`fast_boundary`, the current least-recently-used Fast
-key) incrementally instead of scanning the list on every demotion.
-
-| | Rule |
-|---|---|
-| **Admission** | Every `set()` — new key or overwrite of an existing key — moves it to the front of the list and tags it `Tier::Fast`. Overwriting a currently-`Slow` key is itself a promotion. |
-| **Promotion** | A `get()` hit on a `Slow` key moves it to the front and tags it `Tier::Fast`, then immediately re-runs the demotion check below (a promotion can cascade a demotion of whatever is now the new LRU tail of the fast tier). |
-| **Demotion** | *Triggered* only once `fast_used` genuinely exceeds the effective budget (`fast_capacity` minus the DRAM reserved for shared metadata, see above) — never early. Once triggered, *drains* down to 98% of that budget (`FAST_TIER_LOW_WATER_RATIO`), not back to exactly the ceiling — see "Low-water headroom" below. A `while` loop, so one oversized admission/promotion can demote more than one key in a single pass. |
-| **Eviction** | Pops the absolute LRU tail of the list. Once any demotion has ever happened, that tail is guaranteed `Slow` (nothing Fast can be behind a Slow key). If the whole working set still fits in the fast tier, this gracefully falls back to evicting the Fast tail instead of refusing. |
-
-### Low-water headroom: why demotion doesn't drain to exactly the ceiling
-
-`PaperCache::set()` writes a new object's `TieredBuffer` to DRAM **synchronously**, at the API
-layer, before the corresponding event even reaches `PolicyWorker`. That means a burst of concurrent
-`set()` calls can transiently push real DRAM usage above what the stack's own bookkeeping shows, in
-the window between that physical write and the worker processing it. `settle_fast_tier` draining to
-a target slightly below the ceiling (`FAST_TIER_LOW_WATER_RATIO = 0.98`) leaves that burst some
-room to land in before the *next* settle needs to trigger again — a small safety margin layered on
-top of (not a substitute for) `apply_tier_migrations` running per-event rather than per-batch, which
-is what actually shrinks the demote-decision-to-physical-DRAM-free window.
-
-This ratio has moved twice in this crate's history: an original 90%-of-capacity floor was removed
-entirely at explicit request ("keeping the 10% high water mark ... hurts performance"), then a much
-smaller 98% floor was reintroduced later for the burst-safety reason above — see `CLAUDE.md` for
-the full back-and-forth. It applies to `LruHybridStack` only: `LfuHybridStack` doesn't re-settle on
-every admission the way this stack does (see below), so the same burst-vs-thrashing tradeoff
-doesn't apply the same way there, and `TwoQHybridStack` similarly has no floor (its fast-tier
-pressure is only ever triggered by a promotion or an explicit resize, never by every `set()`).
-
----
-
-## `lfu_hybrid_cache`: segmented by access frequency, admission gated on capacity
-
-> While the fast tier has not yet reached capacity, new objects are admitted there. Once fast-tier
-> capacity is reached, every new object is admitted into the slow tier. When a slow-tier object's
-> access count exceeds the minimum frequency among fast-tier residents, it is promoted (which may
-> cause a demotion). When slow-tier capacity is exhausted, the least frequently accessed object is
-> evicted from the slow tier.
-
-Two independent frequency-bucket chains (`fast_chain`/`slow_chain`, an O(1) classic-LFU structure —
-ascending-by-count buckets + a `HashMap<HashedKey, Index>`), rather than one shared structure: LFU's
-fast/slow boundary is a *frequency* threshold, and each chain needs its own O(1)-queryable minimum,
-which a single shared structure (as LRU uses for recency) can't give directly.
-
-| | Rule |
-|---|---|
-| **Admission** | An **explicit, unconditional capacity check** — a brand-new key is admitted to the fast chain only while `fast_used + size` fits the effective budget; once the fast tier is full, every subsequent new key goes straight to the slow chain. This is checked at `set()` time on the API-calling thread too (see "Admission latch" below), not decided later by the stack. |
-| **Promotion** | A `get()`/re-`set()` hit on a `Slow` key promotes it only if its new access count is **strictly greater than** the fast chain's current minimum frequency (a tie does *not* promote). Promotion carries the key's already-accumulated frequency into the fast chain (`insert_at`, not a fresh count of 1), then re-runs the demotion check (can cascade). |
-| **Demotion** | Repeatedly pops the fast chain's lowest-frequency key (ties break toward the least-recently-touched, matching plain `LfuStack`'s existing convention) until `fast_used` fits the effective budget again. No low-water floor — demotion here is only ever triggered by a promotion or an explicit resize, not by every admission. |
-| **Eviction** | Pops the slow chain's minimum-frequency key. Falls back to the fast chain's minimum if the slow chain is empty (nothing has ever been demoted yet), mirroring LRU's fallback. |
-
-### The admission latch: why a raw byte check alone isn't enough
-
-Demotion here is per-*object*, not per-*byte*: demoting one low-frequency fast object to cover a
-small promotion overage can free far more bytes than the overage itself, leaving slack. A raw
-`fast_used + size <= budget` check alone would let a brand-new, frequency-1 key sneak into that
-slack — bypassing "prove yourself via promotion" — even when every current fast resident already
-has a higher frequency, which doesn't honor frequency order.
-
-`fast_tier_latched: bool` closes this: the first time fast-tier capacity is genuinely reached (a
-failed admission, or any demotion firing inside `settle_fast_tier`), it latches shut permanently —
-every subsequent brand-new key goes straight to slow regardless of later byte slack, reachable only
-via promotion. It resets on `clear()` and on `resize_fast_tier` **growing** the budget (a deliberate
-capacity increase should be immediately usable, not gated behind promotions); a shrink leaves it
-as-is.
-
-The latch is mirrored onto `AtomicStatus` (`lfu_hybrid_admission_latched`) so `PaperCache::set()`,
-running on the API-calling thread with no direct access to the worker-owned stack, can build a
-brand-new key's `TieredBuffer` directly as `new_slow` once latched — matching what the stack would
-decide anyway, avoiding a synchronous DRAM write immediately followed by an async PMEM correction
-for the common steady-state case. This is a real, accepted latency tradeoff: that specific `set()`
-call now allocates via the PMEM/UMF allocator synchronously on the calling thread, in exchange for
-eliminating the write-then-correct round trip. An *existing* key is never affected by this check —
-re-setting one is an access, which only the stack can decide whether to promote.
-
-### Why demotions are counted via `drain_demotions()`, not per `Tier::Slow` entry
-
-Unlike the other two hybrids, a `Tier::Slow` migration here isn't always a genuine demotion — it's
-also how a fresh admission that the latch (or the capacity check) routed directly to slow gets
-physically corrected from the API layer's default `TieredBuffer::new_fast` build. Counting every
-`Tier::Slow` entry as a demotion would inflate `lfu_hybrid_stats().demotions` for admissions that
-displaced nothing. `PolicyStack::drain_demotions() -> u64` (default `0`; only `LfuHybridStack`
-overrides it) is backed by a `pending_demotions` counter incremented *only* inside
-`settle_fast_tier` (never on admission) — `apply_tier_migrations`'s LFU sibling still physically
-applies every migration in both directions, but counts demotions once per pass via this method
-afterward instead of inferring them from `Tier::Slow` entries.
-
----
-
-## `two_q_hybrid_cache`: an unproven FIFO queue feeding a segmented main LRU queue
-
-> Every new object is placed in a one-access FIFO queue, entirely in the slow tier. A re-access
-> promotes it to the top of the fast tier's main LRU queue (which behaves like `lru_hybrid_cache`
-> from that point on). An object that reaches the top of the FIFO queue without a second access is
-> evicted. When capacity is exhausted, the least recently accessed object at the bottom of the slow
-> portion of the main queue is evicted.
-
-Two live queues, matching the paper's two-queue shape (unlike this crate's plain, heavier `TwoQ`
-policy, which has a real-object overflow queue too): `fifo_queue` (real objects, always slow) and
-`main_stack` (recency-ordered, segmented fast/slow, structurally identical to
-`LruHybridStack::stack`). No ghost/re-admission memory is kept — see "No ghost queue" below.
-
-| | Rule |
-|---|---|
-| **Admission** | Every `set()` — new or existing key — is admitted or re-admitted into `fifo_queue`, entirely slow. `PaperCache::set()` always synchronously builds `TieredBuffer::new_slow` for this policy: the physical tier the API layer chooses and the tier the stack assigns agree by construction, so admission never itself produces a migration. |
-| **Promotion** | A re-access (`touch`) dispatches on which queue the key is in: a `fifo_queue` hit (`promote_from_fifo`) moves it straight to the front of `main_stack` at `Tier::Fast`; a `main_stack` hit re-orders if already Fast, or promotes-and-settles if Slow (`touch_main_fast`, identical logic to `LruHybridStack::touch_fast_key`). Either can cascade a demotion. |
-| **Demotion** | Only within `main_stack`, once its fast portion exceeds `fast_capacity` — identical mechanics to `lru_hybrid_cache`'s demotion, but with **no low-water floor** (fast-tier pressure here is only ever triggered by a promotion or an explicit resize, never by every `set()`, since admission never touches the fast tier directly). |
-| **Eviction** | `fifo_queue`'s tail first (still-unproven, one-access objects are sacrificed before ever touching the proven main queue), then `main_stack`'s slow tail, falling back to `main_stack`'s fast tail only if nothing has ever been demoted there yet. This single priority order reconciles the paper's two separately-stated eviction clauses. |
-
-### Why `fifo_queue` pressure can't self-evict, and the `needs_capacity_eviction` trait method
-
-An early implementation had `insert`/`resize` pop `fifo_queue`'s tail directly whenever
-`fifo_used > fifo_capacity`. This compiled and passed unit tests (which only exercise the bare
-stack), but broke every integration test: a `PolicyStack` has no reference to the shared object map
-or `AtomicStatus`, so popping a key from the stack's own bookkeeping without going through the real
-removal path desyncs the stack from the object map permanently — the object leaks forever, still
-present and `has()`-visible, but uncounted and unreachable via the stack.
-
-The fix generalizes an existing rule: only `PolicyWorker::apply_evictions`'s `evict_one()` +
-`erase()` pairing is allowed to actually remove an object (the same rule `LruHybridStack`/
-`LfuHybridStack`'s demotions already respect — they only ever swap `Object::data` in place, never
-remove). `PolicyStack::needs_capacity_eviction() -> bool` (default `false`; `TwoQHybridStack`
-overrides it as `fifo_used > fifo_capacity`) lets `insert`/`resize` report pressure without acting
-on it; `apply_evictions`'s loop condition became `while used_size() > max_size ||
-policy_stack.needs_capacity_eviction()` (guarded by `stack.len() > 0` too, defensively), so
-`fifo_capacity` pressure now drains through the exact same generic path global `max_size` pressure
-already used. This is a pure additive default for `LruHybridStack`/`LfuHybridStack`.
-
-### No ghost queue
-
-An early draft added a classic-2Q-style ghost queue (bare evicted keys, checked on every admission
-so a "reformed" object could skip straight back to the main queue). Rejected: an exact-membership
-check on *every* `set()` — which already pays a synchronous slow-tier/PMEM write for this policy —
-was flagged as an unwelcome added cost. A FIFO object that ages out without a second access is
-simply evicted outright, no trace kept. A probabilistic structure (a counting Bloom filter or
-similar) is the natural next step if re-admission-after-eviction turns out to matter for real
-workloads, without paying an exact-membership check on every write — left as future work.
+The multiplier is *every* tracked key, not just fast ones — a slow-tier object still has a
+hashtable entry, a list node and an `entries` slot in DRAM.
 
 ### `eviction_stacks_pmem`
 
-Added after the other two hybrids' equivalent support, mirroring their exact pattern: `fifo_queue`,
-`main_stack`, and the combined per-key `entries` map (see "One combined per-key map" below) all
-move to PMEM (via `crate::Hybrid`) when the feature is enabled, with `PmemHashList`/`hashbrown::
-HashMap` swapped in for `kwik::collections::HashList`/`std::collections::HashMap` behind the same
-type-alias switch `LruHybridStack`/`LfuHybridStack` already use. Measured against the real
-benchmark: unlike LRU (~0% cost — its recency-list operations are cheap O(1) pointer splices
-regardless of tier) or LFU (~7–8% cost — its frequency-chain operations do meaningfully more
-per-touch work), 2Q lands in between at a real but smaller **~4–5% GET/SET latency cost**, since
-`fifo_queue`/`main_stack` are themselves simple recency lists (closer to LRU's shape) even though
-there are two of them. Does **not** include the `shared_overhead` DRAM-budget reservation LRU/LFU
-have (see the comparison table) — that remains a separate, not-yet-implemented mechanism for this
-policy.
+Moves each stack's lists and per-key map into the slow tier via `crate::Hybrid`. The
+`PmemHashList`/`hashbrown` variants expose the same method surface as the DRAM ones, so stack
+logic is identical either way. No stack needs a `cfg` of its own: under this flag the
+eviction-stack term simply drops out of the value `get_hybrid_dram_shared_overhead` returns.
 
-### One combined per-key map, not three
+### One combined per-key map
 
-Every tracked key needs a queue tag (`Fifo`/`Main`), a size, and — only while in `Main` — a tier.
-An earlier version of this stack tracked these in three separate maps (`queue`, `main_tiers`,
-`sizes`), mirroring how it was originally built by extending `LruHybridStack`'s (`tiers`+`sizes`)
-shape with a third map bolted on for the extra Fifo/Main dimension. No operation ever wants just
-one of these in isolation — `insert` touches queue+size together, `remove` touches all three, etc.
-— so they're now one `entries: HashMap<HashedKey, TwoQEntry>` (`TwoQEntry { queue, tier:
-Option<Tier>, size }`, `tier: None` iff `queue == Fifo`). `LruHybridStack`/`LfuHybridStack` got the
-same treatment (`tiers`+`sizes` → one `entries` map each, `LruEntry`/`LfuEntry { tier, size }`, no
-`Option` needed since those stacks have only one queue). This removes one or two of the previous
-hashtable-structural-overhead charges per tracked object — see `object/overhead.rs`'s
-`LruHybrid`/`LfuHybrid`/`TwoQHybrid` arms of `get_policy_overhead`, and the
-`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`/`LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD` constants above
-(84→64, 113→93) — and removes an entire class of possible desync bug (a key present in one map but
-not another) by construction.
+Every stack keeps a single `entries: HashMap<HashedKey, XEntry>` rather than parallel
+`tiers`/`sizes`/`queue` maps. Nearly every operation touches those fields together, and merging
+them removes one hashtable-structural-overhead charge per object per map eliminated, plus an
+entire class of desync bug (a key present in one map but not another) by construction.
+
+`LruEntry { tier, size }` is 8 bytes (`u8` + `u32`), pairing with the 8-byte `HashedKey` to
+exactly 16 — the figure `object/overhead.rs`'s DRAM constants are derived from. This is why
+`LruLfuHybridStack`'s frequency counter is a `u16`: a `u32` would push the entry to 12 bytes and
+add 8 bytes to *every* object in *both* tiers.
+
+### Boundary cursor vs homogeneous lists
+
+Two structural idioms recur:
+
+- **One list plus a cursor.** `LruHybridStack` keeps a single recency list with a
+  `fast_boundary` cursor marking where the fast prefix ends. Cheap, but every operation that
+  can move the boundary has to repair it.
+- **Homogeneous per-tier lists.** `LruSizedHybridStack` (four lists) and `LruLfuHybridStack`
+  (a recency list plus a frequency chain) give each tier its own structure, so each list's own
+  tail is directly its own candidate and no cursor exists. Both arrived at this independently,
+  and in both cases it came out *simpler* than the cursor.
 
 ---
 
-## Comparison at a glance
+# Part 2: The 18 designs
 
-| | `lru_hybrid_cache` | `lfu_hybrid_cache` | `two_q_hybrid_cache` |
-|---|---|---|---|
-| Admission lands in | Fast, always | Fast while there's room, then Slow (latched) | Slow (the FIFO queue), always |
-| `set()` builds | `TieredBuffer::new_fast` always | `new_slow` if new + latched, else `new_fast` | `new_slow` always |
-| Promotion trigger | Any access to a Slow key | Access count strictly exceeds fast tier's minimum frequency | A second access to a FIFO-queue key, or an access to a Slow main-queue key |
-| Demotion low-water floor | 98% of budget | None | None |
-| `eviction_stacks_pmem` support | Yes | Yes | Yes |
-| DRAM-budget reservation (`shared_overhead`) | Yes | Yes | No |
-| Extra sizing knob | — | — | `k_in` (FIFO queue's own byte budget) |
-| Ghost/ ​re-admission memory | N/A | N/A | None (considered and rejected) |
-| Terminal eviction source | Slow tail (falls back to Fast tail) | Slow chain min (falls back to Fast chain min) | FIFO tail, then main-queue slow tail, then main-queue fast tail |
-
-## Testing
-
-Each feature has the same three layers, at the same relative depth:
-
-```bash
-# Unit tests: the algorithm in isolation, no threads, no allocator
-cargo +nightly test --lib --features lru_hybrid_cache lru_hybrid
-cargo +nightly test --lib --features lfu_hybrid_cache lfu_hybrid
-cargo +nightly test --lib --features two_q_hybrid_cache two_q_hybrid
-
-# PolicyWorker wiring, using a plain Box<[u8]> value type (not TieredBuffer) and a
-# marker-tagging migrate closure, so these run without the real PMEM allocator
-cargo +nightly test --lib --features lru_hybrid_cache worker::policy::lru_hybrid_tests
-cargo +nightly test --lib --features lfu_hybrid_cache worker::policy::lfu_hybrid_tests
-cargo +nightly test --lib --features two_q_hybrid_cache worker::policy::two_q_hybrid_tests
-
-# Integration: the real public API through the real Hybrid/UMF PMEM allocator —
-# the suite that actually proves "real data movement, one copy ever" via `tier_of`
-cargo +nightly test --test lru_hybrid_cache_integration --features lru_hybrid_cache
-cargo +nightly test --test lfu_hybrid_cache_integration --features lfu_hybrid_cache
-cargo +nightly test --test two_q_hybrid_cache_integration --features two_q_hybrid_cache
+```
+BASE                    2Q FAMILY                      S3-FIFO FAMILY
+lru                     two_q                          s3_fifo
+lfu                     ├── +fast admission            ├── +ghost
+fifo                    │   └── +reprieve              │   └── +lazy demotion
+lru_sized               └── +ghost                     │       ├── +fast admission
+lru_lfu                                                │       │   └── +midpoint
+                                                       │       │       ├── -ghost +reprieve
+                                                       │       │       │   ├── -midpoint
+                                                       │       │       │   └── +split slow
+                                                       │       └── (slow admission) +reprieve
 ```
 
-The integration tests need a machine where the `Hybrid`/UMF allocator can actually create a PMEM
-pool. The first PMEM allocation in a test process triggers a one-time pool init + prewarm that can
-take on the order of a minute; each integration test file's `ensure_pmem_allocator_warm()` helper
-pays that cost up front (gated by a process-wide `Once`, so only the very first call anywhere in the
-binary actually waits) so it doesn't race a test's own timing assertions — see `CLAUDE.md` for the
-specific TTL-test pitfall this was written to avoid.
+## Base designs
 
-## Known limitations / not yet done
+### `lru_hybrid_cache`
 
-- **Real DRAM usage does not track `fast_tier_size` under sustained load**, for `lru_hybrid_cache`
-  and `lfu_hybrid_cache` (`two_q_hybrid_cache` hasn't been separately profiled for this). The
-  *logical* accounting above (`fast_bytes_used`, demotion timing, the DRAM-budget reservation) is
-  correct and settles precisely — the gap is that the underlying TBB allocator retains freed memory
-  rather than returning it to the OS for this workload's fragmentation pattern, confirmed
-  unfixable via any exposed UMF/TBB API. See `CLAUDE.md`'s "Investigation: real DRAM usage vs.
-  `fast_tier_size`" section for the full investigation, including the one approach that does fix it
-  (bypassing pooling via `mmap`/`MADV_DONTNEED`) and the real throughput cost that came with it.
-- `two_q_hybrid_cache` has no ghost/re-admission memory (see its section above) and no DRAM-budget
-  reservation.
-- None of the three have a dedicated test yet for a multi-key single-step promotion/demotion
-  cascade with deliberately mixed small/huge object sizes — the byte-budgeted (not slot-counted)
-  boundary already handles this correctly (each stack returns a `Vec` of migrations per call, not
-  an assumed single pair), it just isn't yet exercised by a test built specifically for it.
-- Re-verifying the parallel migration-copy change against the real `paper-benchmark-cxl` benchmark
-  under real concurrent load (not just this crate's own tests) to directly confirm the wall-clock
-  throughput win — done once (see `CLAUDE.md`), worth repeating if this area changes again.
+`LruHybridStack` · `PaperPolicy::LruHybrid` · `new(max_size, fast_tier_size)`
+
+One recency-ordered list backs both tiers. The fast tier is the maximal prefix from the MRU end
+whose cumulative size fits `fast_capacity`; everything behind is slow.
+
+- **Admission** — front of the list, `Tier::Fast`, unconditionally.
+- **Promotion** — every access *and every overwrite* moves the key to the front and tags it
+  `Fast`. A `set()` on an existing key is treated exactly like a hit.
+- **Demotion** — when `fast_used` crosses the high watermark, the LRU-most fast key (found via
+  `fast_boundary`, no scan) is demoted, repeating down to the low watermark.
+- **Eviction** — the absolute LRU tail, which after any demotion is always slow.
+
+This stack alone carries extra burst-write headroom, for a specific reason: `PaperCache::set()`
+writes a new object's `TieredBuffer` to DRAM synchronously at the API layer, before the stack
+running on `PolicyWorker` sees the event. A burst of concurrent `set()` calls can transiently
+push real DRAM above what the stack's bookkeeping shows. Draining slightly below the ceiling
+leaves that burst somewhere to land. It applies here and not to `LfuHybridStack` because only
+this stack re-settles on every admission.
+
+### `lfu_hybrid_cache`
+
+`LfuHybridStack` · `PaperPolicy::LfuHybrid` · `new(max_size, fast_tier_size)`
+
+Two independent `FrequencyChain`s (the classic O(1) LFU bucket structure) back the two tiers.
+LFU's boundary is a *frequency* threshold, not a list position, so two chains — each queryable
+for its own minimum in O(1) — are the natural fit.
+
+- **Admission** — fast at frequency 1 while the fast tier has room; once full, straight to slow.
+  This is the paper rule read literally: "every new object is admitted into the slow tier" means
+  *the new object*, not whichever key loses a tie-break.
+- **Promotion** — a slow access bumps that key's frequency; if it strictly exceeds the fast
+  chain's current minimum (or the fast chain is empty) the key moves to the fast chain,
+  **preserving its accumulated frequency** via `insert_at`.
+- **Demotion** — `settle_fast_tier` on the watermark, demoting the fast minimum.
+
+**The admission latch.** A raw byte check is not enough to keep admission honouring frequency
+order, because demotion granularity is per-object, not per-byte: demoting a 90-byte object to
+cover a 5-byte overage leaves 85 bytes of slack, and a brand-new frequency-1 key admitted purely
+because that slack exists bypasses the "prove yourself via promotion" path entirely — even when
+every fast resident already has frequency ≥ 2. So `fast_tier_latched` permanently closes
+brand-new-key fast admission the first time capacity is genuinely reached. It resets on
+`clear()` and on `resize_fast_tier` *growing* the budget.
+
+### `fifo_hybrid_cache`
+
+`FifoHybridStack` · `PaperPolicy::FifoHybrid` · `new(max_size, fast_tier_size)`
+
+One insertion-ordered list. **No promotion policy at all** — this is the defining difference
+from every sibling.
+
+- **Admission** — front (bottom of the fast tier).
+- **Promotion** — none. `update()` is deliberately left as the trait's default no-op body,
+  matching this crate's plain `FifoStack`. A hit on a slow key must never migrate it back.
+  *Do not add an override here* — a refactor pass assuming this stack "forgot" to override
+  `update()` like its siblings would be wrong.
+- **Overwrite** — never repositions the key and never changes its tier; only the size accounting
+  for whichever tier it already occupies is corrected.
+- **Demotion** — the oldest fast key. **Eviction** — the absolute tail.
+
+### `lru_sized_hybrid_cache`
+
+`LruSizedHybridStack` · `PaperPolicy::LruSizedHybrid` ·
+`new(max_size, small_fast, large_fast, size_threshold)`
+
+`lru_hybrid_cache`'s semantics with each tier's bookkeeping split into two size-routed segments
+by a runtime-configurable byte threshold. Four homogeneous lists (`small_fast`, `large_fast`,
+`small_slow`, `large_slow`), no cursor — two independent fast sources each feeding their own slow
+destination is a shape a cursor does not generalise to.
+
+- **Classification** uses the same `ObjectSize` (key + value + expiry slot) every other stack
+  budgets against, not a raw `value.len()`. Threading a second size channel through
+  `PolicyStack::insert` for all ten stacks would buy only a small near-constant offset.
+- **Admission, promotion and reclassification** all funnel through one `touch_fast` method,
+  landing wherever `classify` says the key's *current* size belongs. A fast→fast segment move
+  emits **no** migration — both segments are physically `TieredBuffer::Fast`.
+- **Eviction** prefers whichever slow list holds more objects (a cheap proxy for "probably has
+  the older tail"); only if both are empty does it fall back to whichever fast segment is
+  furthest over budget by ratio.
+- Only the two fast segments have capacities. The slow lists are governed by the overall
+  `max_size` trigger, exactly like the single slow tier in `lru_hybrid_cache`.
+- The shared overhead is split *proportionally* between the two fast segments, not charged in
+  full against each — the per-object metadata cost is real only once.
+
+Exposes an extra `set_large_fast_tier_size()` alongside the usual `set_fast_tier_size()`.
+
+### `lru_lfu_hybrid_cache`
+
+`LruLfuHybridStack` · `PaperPolicy::LruLfuHybrid(u16)` ·
+`new(max_size, fast_tier_size, promote_k)`
+
+The first design whose two tiers rank by *different* metrics: a recency list for the fast tier, a
+frequency chain for the slow tier. In one line: **frequency is the admission control into DRAM;
+recency is the retention policy within DRAM.**
+
+The rationale is that the tiers have different jobs. The fast tier is small and holds the active
+working set, where recency is the right short-term signal. The slow tier is far larger and holds
+a long cold tail, where LRU is close to meaningless — its tail position is dominated by scans and
+one-hit-wonders. LFU is scan-resistant and actually identifies which cold objects deserve
+promotion.
+
+- **Admission** — fast tier, recency head, frequency 1. Admitting to slow instead would make
+  every `set()` a synchronous PMEM allocation, measured at 2.15x SET mean / 2.72x SET p99 in the
+  `two_q` vs `two_q_fast_admission` comparison, on traces that are 80–94% SETs.
+- **Demotion** — the fast LRU tail, **carrying its accumulated frequency** into the slow chain.
+- **Promotion** — a slow object whose frequency *reaches* `promote_k` moves to the fast recency
+  head, and its counter **resets**.
+- **Eviction** — the slow chain's minimum-frequency key (ties broken least-recently-touched).
+
+**`promote_k` is an absolute frequency, not accesses-since-demotion.** This is easy to get wrong
+(this file's own tests did): a key admitted and never accessed demotes carrying frequency 1, so
+`promote_k == 2` behaves exactly like `promote_k == 1`. The first threshold that filters anything
+is **3**. Conversely a genuinely hot key arrives in the slow tier at or near the cap and promotes
+on its next access regardless — deliberate, and the point of carrying frequency at all: proven
+popularity needs one confirmation, a one-hit-wonder has to earn the whole climb.
+
+**Why the fast tier counts a frequency it does not rank by:** without it, an object hit 50 times
+in DRAM would land in the slow chain indistinguishable from a one-hit-wonder demoted in the same
+pass — precisely the objects most likely to be referenced again.
+
+**Why the counter is capped, and capped small.** `FREQUENCY_CAP` pays twice. *Memory*: a `u16`
+keeps `LruLfuEntry` at 8 bytes so the pair stays 16; a `u32` would cost +8 bytes on every object
+in both tiers. *Demotion cost*: `FrequencyChain::insert_at` is a linear scan over count buckets
+and every demotion performs one, so the cap directly bounds it. Pair the cap with
+reset-on-promotion, without which a repeatedly-promoted object accumulates an unassailable count
+and becomes effectively un-evictable.
+
+**A `set()` is an access, not an automatic promotion** — a deliberate divergence from
+`lru_hybrid_cache`. On an 80–94% SET trace, "any set promotes" would push nearly everything into
+DRAM without demonstrating reuse, and the slow tier's frequency ordering would never filter
+anything. Consequently `admission_tier` must look up an existing key's current tier, so an
+overwrite of a slow key is written straight to PMEM rather than to DRAM and corrected afterward.
+
+## 2Q family
+
+A one-access FIFO queue feeding a segmented main LRU queue. All take
+`new(max_size, fast_tier_size, k_in)`, where `k_in * max_size` is the FIFO queue's byte budget.
+
+### `two_q_hybrid_cache`
+
+`TwoQHybridStack` · `PaperPolicy::TwoQHybrid(f64)`
+
+Two live queues, matching the paper text directly — unlike this crate's plain `TwoQStack`, which
+carries a heavier three-live-queue shape with a real-object `a1_out` overflow queue.
+
+- `fifo_queue` — one-access, holds real objects, **always entirely in the slow tier**.
+- `main_stack` — recency-ordered, segmented fast/slow exactly like `LruHybridStack::stack`.
+
+- **Admission** always lands in `fifo_queue`, so every `set()` is a synchronous PMEM write.
+- **Promotion** — a hit on a `fifo_queue` key moves it straight to the top of `main_stack` at
+  `Tier::Fast`. Once inside `main_stack` an object behaves exactly like `lru_hybrid_cache`.
+- **Ageing out** — a `fifo_queue` object reaching the tail without a second access is evicted
+  outright. No ghost queue: an exact-membership check on every admission was judged an unwelcome
+  cost given admission already pays a synchronous PMEM write. A probabilistic structure is the
+  right tool to revisit this, and is left as future work.
+- **Eviction priority** — `fifo_queue` tail, then `main_stack`'s slow tail, falling back to its
+  fast tail only if nothing has ever been demoted. This reconciles the paper's two eviction
+  clauses into one rule: sacrifice unproven FIFO objects before touching the proven main queue.
+
+`fifo_capacity` and `fast_capacity` are two independent knobs here — one governs a slow/PMEM
+queue, the other the main queue's DRAM portion.
+
+**This stack never evicts on its own.** `needs_capacity_eviction` reports when `fifo_used`
+exceeds `fifo_capacity` and the caller (`PolicyWorker::apply_evictions`) does the removal, since
+a `PolicyStack` has no reference to the object map.
+
+`entries` holds `TwoQEntry { queue, tier: Option<Tier>, size }`, with `tier: None` iff the key is
+in the FIFO queue.
+
+### `two_q_fast_admission_hybrid_cache`
+
+`TwoQFastAdmissionHybridStack` · `PaperPolicy::TwoQFastAdmissionHybrid(f64)`
+
+`two_q_hybrid_cache` with the one-access queue in the **fast** tier, so admission is a cheap DRAM
+write instead of a synchronous PMEM allocation. Only the physical placement changes; the logical
+queue structure is untouched, and a key still has to prove itself with a second access to reach
+the recency-durable part of the cache. Only its bytes are in DRAM *while on probation*.
+
+**The accounting had to change, not just the label.** With the FIFO queue also in DRAM, both
+budgets draw on the same physical pool, and leaving them independent would let real DRAM grow to
+`fast_capacity + fifo_capacity`. Fixed by treating `fifo_capacity` as a reservation carved out
+first — `effective_main_fast_capacity = fast_capacity.saturating_sub(fifo_capacity)` — with the
+watermarks applied to that reduced number. The net result is
+`fast_used (main) + fifo_used <= fast_capacity` by construction.
+
+### `two_q_fast_admission_reprieve_hybrid_cache`
+
+`TwoQFastAdmissionReprieveHybridStack` · `PaperPolicy::TwoQFastAdmissionReprieveHybrid(f64)`
+
+As above, but a one-access key ageing out **without** a second access is reprieved into the slow
+tier rather than evicted. `settle_fifo_queue` splices it onto the **back** of `main_stack` — the
+absolute LRU tail, i.e. the next eviction candidate — tagged `Tier::Slow`.
+
+Deliberately weaker than the s3-fifo equivalent, which splices to the *front* of its slow
+segment. Two reasons:
+
+1. **Rank.** The main queue is LRU-ordered and its slow segment holds keys that were promoted at
+   least once and later demoted. A key ageing out of the one-access queue has demonstrated *no*
+   reuse, so ranking it above proven-but-cold objects would invert the ordering.
+2. **Cost.** `push_back` is O(1) on the existing list. The s3-fifo variant needed to insert at
+   the fast/slow *boundary*, which `HashList` cannot do — its first implementation walked every
+   fast key per reprieve and burned ~18 minutes of worker CPU on a real trace without completing,
+   which is what forced that stack's two-physical-list restructure.
+
+The tradeoff when reading results: a reprieved key at the LRU tail may be evicted very soon under
+pressure, having cost a real DRAM→PMEM copy on the way there. Whether that buys enough extra hits
+is exactly what this variant exists to measure — a null result is a finding, not a bug.
+
+### `two_q_ghost_hybrid_cache`
+
+`TwoQGhostHybridStack` · `PaperPolicy::TwoQGhostHybrid(f64)`
+
+`two_q_hybrid_cache` plus a bare-key ghost queue, adding what that stack deliberately left out.
+Mirrors `s_three_fifo_stack.rs`'s `ghost: HashList<HashedKey>` shape — a lightweight membership
+list, not a third place bytes can live (explicitly chosen over plain `TwoQStack`'s heavier
+`a1_out`, which holds real objects).
+
+Ghost lifecycle, matching `SThreeFifoStack`'s convention:
+
+- **Added to** only when a `fifo_queue` object ages out without a second access — never by a
+  main-queue eviction.
+- **Checked** by `insert`'s brand-new-key branch.
+- **Not removed on a hit** — trimmed lazily, capped relative to `main_count`, only during a
+  genuine main-queue eviction; cleared outright by `remove`/`clear`.
+
+A ghost hit is admitted directly into `main_stack` at `Tier::Fast`. This was an explicit,
+acknowledged-as-arguable choice — the conservative alternative (land in the slow portion and earn
+promotion normally) is a one-line change if measurement says otherwise. It is cheap either way:
+`set()` always builds a brand-new key as `new_slow` regardless of ghost history, so a ghost hit
+costs one extra migration rather than a synchronous PMEM-vs-DRAM decision at the API layer.
+
+## S3-FIFO family
+
+All take `new(max_size, fast_tier_size, one_access_ratio)`.
+
+### `s3_fifo_hybrid_cache`
+
+`S3FifoHybridStack` · `PaperPolicy::S3FifoHybrid(f64)`
+
+Structurally close to `two_q_hybrid_cache` — a one-access queue in the slow tier feeding a main
+queue segmented fast/slow — but the mechanism deciding who stays is different.
+
+- `one_access_queue` behaves like 2Q's: a re-access promotes **eagerly** to the front of
+  `main_queue` at `Tier::Fast`. Anything still there at the tail has by construction never been
+  re-accessed, so eviction from it is unconditional — no bit to check.
+- `main_queue` is **pure FIFO, never reordered on access**. Every `Main` key carries an
+  `accessed: bool` reference bit (classic CLOCK/second-chance), set on every touch regardless of
+  which portion the key occupies. The bit is consulted **lazily**, only when a key reaches the
+  tail and is about to be evicted: set → `give_second_chance` (reinserted at the front, retagged
+  `Fast`, bit cleared); clear → evicted for real.
+- **Demotion is unconditional** — whichever key anchors `main_boundary` ages down. The reference
+  bit plays no part here, only at eviction time. This is S3-FIFO's "quick demotion, lazy
+  promotion".
+
+The asymmetry is a direct reading of the paper: "if accessed again *before reaching the top* of
+the one-access FIFO queue, they are promoted" (eager) versus "if they *have been re-accessed
+during this period*, they are reinserted", evaluated only "after objects have traversed through
+both portions... and are about to be evicted" (lazy).
+
+**The contiguous front run invariant.** `main_queue` is never reordered except by insertion at
+the front and by demotion, which moves nothing in the list at all — it only re-tags the key
+`main_boundary` points at and walks the cursor one step. So "the front `main_boundary`-worth of
+keys are exactly the `Tier::Fast` ones" always holds. A key given a second chance re-enters at
+the front, deliberately scrambling true insertion age in exchange for matching the paper's
+wording — exactly how a real CLOCK sweep works.
+
+### `s3_fifo_ghost_hybrid_cache`
+
+`S3FifoGhostHybridStack` · `PaperPolicy::S3FifoGhostHybrid(f64)`
+
+Adds a bare-key ghost queue with the same lifecycle as `two_q_ghost_hybrid_cache`'s, bringing the
+hybrid design in line with this crate's plain `SThreeFifoStack`, which already has a ghost queue
+of exactly this shape.
+
+### `s3_fifo_ghost_lazy_demotion_hybrid_cache`
+
+`S3FifoGhostLazyDemotionHybridStack` · `PaperPolicy::S3FifoGhostLazyDemotionHybrid(f64)`
+
+One change: **demotion is now reference-bit gated too.** Before demoting the key anchoring
+`main_boundary`, its `accessed` bit is checked.
+
+- **Bit set** — the key was touched since promotion, so it gets a fresh start here: moved to the
+  front of the fast portion, bit cleared, tier and accounting untouched. This is a *reprieve, not
+  a promotion* — it was already `Fast` and stays `Fast`, so **no migration is produced**. The
+  sweep continues to the next-oldest fast key.
+- **Bit clear** — demoted for real.
+
+S3-FIFO's tagline becomes "lazy demotion, lazy promotion": the bit now gates both tier
+transitions. The eviction-time second chance is unchanged and still matters — the two mechanisms
+protect different things (an unfairly *demoted* fast key here, an unfairly *evicted* slow key
+there) and compose naturally. Termination is guaranteed because each reprieve clears the bit and
+moves the key to the front, so it cannot be re-examined until every other fast key has had a turn.
+
+### `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache`
+
+`S3FifoGhostLazyDemotionFastAdmissionHybridStack`
+
+Moves the one-access queue to the **fast** tier, so admission is a cheap DRAM write. Same change,
+same motivation, and same shared-DRAM-budget accounting as
+`two_q_fast_admission_hybrid_cache`: `one_access_capacity` becomes a reservation carved out of
+`fast_capacity` rather than an independent budget.
+
+### `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache`
+
+`S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack`
+
+Adds a checkpoint roughly halfway through the **slow** portion of the main queue. The slow
+portion was previously a passive holding area — nothing looked at an object there until it
+reached the eviction tail or was promoted by a ghost hit. Now, if the object at the midpoint has
+its reference bit set, it gets the same treatment as a tail-reached second chance instead of
+having to survive all the way to the tail. A genuinely cold object at the midpoint is left alone
+and still gets its one real chance at the tail.
+
+The check runs once per `evict_one()` call, after the one-access queue is confirmed empty — the
+same cadence the tail check already runs at.
+
+Locating "the middle" uses an incrementally-maintained cursor with a drift counter, not a walk:
+the slow segment holds hundreds of thousands of objects at benchmark scale, and an O(n) scan once
+per eviction would be O(n²) over a cache's lifetime.
+
+### `s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache`
+
+`S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack`
+
+Two changes from the midpoint variant:
+
+1. **No ghost queue.** Since a one-access key ageing out is no longer evicted (see 2), nothing
+   ever populates a ghost list. Rather than keep a permanently-empty structure, the ghost list and
+   all machinery serving it were removed outright.
+2. **The one-access tail is reprieved, not evicted** — moved into the slow tier of the main queue
+   and given a full life there, promotable via the ordinary touch/midpoint/tail machinery.
+
+**The reprieve runs synchronously from `insert()`/`resize()`** via a new `settle_one_access()`,
+mirroring `settle_fast_tier()` — deliberately *not* through `evict_one()`. The first draft routed
+it through `evict_one()` and hit a real bug: `apply_evictions` unconditionally erases whatever key
+`evict_one()` returns from the *entire cache*, and if it returns `None`, `erase()` falls back to
+evicting a **random** object. A reprieve is neither of those, and `over_max_size` might not even
+be true at that moment. So `evict_one()` here is purely about the main queue, and
+`needs_capacity_eviction()` stays at the trait's default `false`.
+
+### `s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache`
+
+`S3FifoLazyDemotionFastAdmissionReprieveHybridStack`
+
+The reprieve design with **no mid-slow checkpoint at all**. Keeps only the checks that pay for
+themselves: the demotion boundary and the eviction tail. See "Recorded negative results" below
+for why both checkpoint attempts were dropped.
+
+### `s3_fifo_lazy_demotion_reprieve_hybrid_cache`
+
+`S3FifoLazyDemotionReprieveHybridStack`
+
+Fills the family's one empty design cell — a **slow**-tier one-access queue whose aged-out keys
+are **reprieved**:
+
+| variant | one-access tier | ages out without reaccess |
+|---|---|---|
+| `s3_fifo` (+ghost, +lazy demotion) | slow | evicted |
+| `...fast_admission...` (+midpoint) | fast | evicted |
+| `...fast_admission_reprieve...` (+split slow) | fast | reprieved |
+| **this** | **slow** | **reprieved** |
+
+**The splice costs nothing.** In the fast-admission reprieve variants the one-access queue is
+DRAM and the main queue's slow segment is PMEM, so every aged-out object costs a real
+`TieredBuffer::new_slow` copy. Here both structures are in PMEM: `settle_one_access` moves the key
+between lists and emits **no migration at all**. The reprieve is strictly cheaper than the
+eviction it replaces.
+
+The cost is on the other side of the ledger — the paper-literal admission rule it keeps means
+every `set()` is a synchronous PMEM write, which is exactly what the fast-admission branch exists
+to avoid.
+
+**Promotion is a real move again**, the mirror image: the fast-admission variants push no
+migration on promotion from the one-access queue because the bytes were already in DRAM. Here a
+one-access key really is in PMEM, so promotion is a genuine PMEM→DRAM move and must emit the
+migration — guarded, since `settle_fast_tier` may demote it straight back out in the same call.
+
+### `s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache`
+
+`S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack`
+
+Replaces the approximate midpoint cursor with a **real structural boundary**: the slow tier is
+split into two physical FIFO segments, and every object's reference bit is checked at the moment
+it would cross from the newer segment into the older one — full coverage rather than one sampled
+key per eviction pass.
+
+## Recorded negative results
+
+Three variants exist as measured dead ends and are kept deliberately, so the lineage is not
+re-explored by accident.
+
+**The midpoint cursor did nothing.** Benchmarked against the real traces it was
+indistinguishable from not being there: largest difference 291 hits out of 2.34M accesses, i.e.
+0.01%.
+
+**And not for the reason first assumed.** An earlier draft of that stack's own doc claimed the
+cursor sampled too few keys to matter. *That was wrong.* In steady state the cursor holds a
+roughly fixed index while objects flow past it, so it lands on a new object each cycle and sees
+most objects crossing the midpoint. Its coverage was fine.
+
+**The actual reason is structural: an earlier checkpoint cannot save anything the tail check
+wouldn't.** Terminal eviction only ever removes the slow tier's *tail*, so any object whose
+reference bit is set is already spared when it arrives there. A mid-tier check changes *when* a
+reaccessed object returns to DRAM, never *whether* it survives.
+
+**The full structural boundary did nothing either, and cost.** The split-slow variant tested the
+one remaining hypothesis — that checking *every* crossing object gets hot objects back to DRAM
+earlier and more uniformly, a residency effect rather than a survival one. It does not: hit
+counts were bit-identical to the cursor version on all three traces, while costing **2.7–11.8% on
+GET p99** and **1.2–6.9% on GET throughput**. The extra Slow→Fast migrations are pure added work
+on the `PolicyWorker` thread and the object map's shard locks.
+
+**The batch fan-out did nothing.** See "The abandoned fan-out" above: 99.4% of demotion volume
+arrives as single-object batches.
+
+## Comparison at a glance
+
+| Design | Fast tier order | Slow tier order | Admission | Promotion | Knob |
+|---|---|---|---|---|---|
+| `lru` | recency | recency (same list) | fast | any access or set | — |
+| `lfu` | frequency | frequency | fast until latched | freq > fast min | — |
+| `fifo` | insertion | insertion (same list) | fast | **never** | — |
+| `lru_sized` | recency ×2 | recency ×2 | fast | any access or set | `size_threshold` |
+| `lru_lfu` | recency | **frequency** | fast | freq reaches `promote_k` | `promote_k` |
+| `two_q` | recency | recency | slow (FIFO queue) | 2nd access, eager | `k_in` |
+| `two_q_fast_admission` | recency | recency | **fast** (FIFO queue) | 2nd access, eager | `k_in` |
+| `s3_fifo` | insertion + ref bit | insertion + ref bit | slow (1-access queue) | eager from queue, lazy in main | `one_access_ratio` |
+| `s3_fifo_*_fast_admission_*` | insertion + ref bit | insertion + ref bit | **fast** (1-access queue) | eager from queue, lazy in main | `one_access_ratio` |
