@@ -505,19 +505,33 @@ unsafe extern "C" fn numa_extent_merge(
 
 /// Arenas per node.
 ///
-/// **Chosen, not derived.** jemalloc's own default is `4 * ncpus` (32 on this
-/// 8-CPU host); this is deliberately far below that, because the two costs run
-/// in opposite directions and the one that matters here is memory:
+/// **Swept, not guessed.** cluster12, 20M accesses, 15 GB cache / 5 GB fast
+/// tier, one run per cell -- SET latency in ns:
 ///
-/// - more arenas -> less contention on extent growth and slab refill
-/// - more arenas -> more *retained* extents, since each arena holds its own
-///   free extents and never lends them to another
+/// ```text
+///   arenas:      1      2      4      8     16     32
+///   1 client  1533   1505   1465   1454   1465   1459
+///   4        3187   3026   2962   2880   2937   2854
+///   8        5089   4769   4613   4551   4575   4485
+///   16       8328   7036   6491   6213   6226   6109
+/// ```
 ///
-/// Retention is exactly what this module exists to avoid, so the default errs
-/// small. It has been measured working at 1 and 8 clients but not swept, so
-/// treat it as a starting point rather than a tuned value; override with
-/// `NUMA_ARENAS_PER_NODE` to sweep it.
-const DEFAULT_ARENAS_PER_NODE: usize = 4;
+/// Two things decide the value. The cost of a single arena *grows with
+/// concurrency* -- 5% at one client, 12% at eight, 27% at sixteen -- because
+/// every thread then contends for the same arena on extent growth and slab
+/// refill, and the slow tier has no thread cache in front of it to absorb
+/// that. And the gains are essentially spent by 8: 8 -> 32 buys 1-2%, inside
+/// the run-to-run spread.
+///
+/// Memory does not push back. Peak RSS and node-0 residency were flat across
+/// the sweep (spans 1-13%, no trend), so the retention argument that
+/// previously kept this number small is not supported by measurement.
+///
+/// Caveats: single runs per cell, so trust the monotonic trend rather than any
+/// one number; and the 16-client row is oversubscribed on this 8-CPU host, so
+/// it mixes scheduler queueing into the figure. Override with
+/// `NUMA_ARENAS_PER_NODE`.
+const DEFAULT_ARENAS_PER_NODE: usize = 8;
 
 /// Upper bound on the per-node arena array. Sizing the array statically keeps
 /// the hot path free of indirection; anything above this is clamped.
