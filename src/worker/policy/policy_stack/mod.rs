@@ -358,53 +358,43 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// `with_shared_overhead` reserves the DRAM cost of the shared object
 		// hashtable + eviction stacks out of that budget so demotion bounds
 		// total DRAM, not just fast-tier values.
-		#[cfg(feature = "lru_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::LruHybrid => Box::new(
 			LruHybridStack::new((max_size as f64 * 0.2) as CacheSize)
 				.with_shared_overhead(
 					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 				),
 		),
-		#[cfg(not(feature = "lru_hybrid_cache"))]
-		PaperPolicy::LruHybrid => Box::new(LruHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 
 		// Same default fast-tier budget/override mechanism as `LruHybrid`.
 		// `promote_k` comes from the policy value itself rather than a default
 		// here, since it is carried in the policy string.
-		#[cfg(feature = "lru_lfu_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::LruLfuHybrid(promote_k) => Box::new(
 			LruLfuHybridStack::new((max_size as f64 * 0.2) as CacheSize, promote_k)
 				.with_shared_overhead(
 					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 				),
 		),
-		#[cfg(not(feature = "lru_lfu_hybrid_cache"))]
-		PaperPolicy::LruLfuHybrid(promote_k) => Box::new(
-			LruLfuHybridStack::new((max_size as f64 * 0.2) as CacheSize, promote_k),
-		),
 
 		// Same default fast-tier budget/override mechanism as `LruHybrid`.
-		#[cfg(feature = "lfu_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::LfuHybrid => Box::new(
 			LfuHybridStack::new((max_size as f64 * 0.2) as CacheSize)
 				.with_shared_overhead(
 					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 				),
 		),
-		#[cfg(not(feature = "lfu_hybrid_cache"))]
-		PaperPolicy::LfuHybrid => Box::new(LfuHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 
 		// k_in comes from the policy string itself (same as plain `TwoQ`);
 		// the fast-tier budget still defaults to 20% of max_size, same
 		// override mechanism as the other two hybrids.
-		#[cfg(feature = "two_q_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::TwoQHybrid(k_in) => Box::new(
 			TwoQHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "two_q_hybrid_cache"))]
-		PaperPolicy::TwoQHybrid(k_in) => Box::new(TwoQHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
 
 		// Same construction shape as `TwoQHybrid` above. Note the default
 		// fast-tier budget matters more here: `fifo_capacity` (k_in *
@@ -414,25 +404,21 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// configuration (see the stack's module doc), and callers override
 		// the budget via `ResizeFastTier` immediately after construction
 		// anyway, but it is worth knowing when picking k_in.
-		#[cfg(feature = "two_q_fast_admission_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::TwoQFastAdmissionHybrid(k_in) => Box::new(
 			TwoQFastAdmissionHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "two_q_fast_admission_hybrid_cache"))]
-		PaperPolicy::TwoQFastAdmissionHybrid(k_in) => Box::new(TwoQFastAdmissionHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
 
 		// Same construction shape and the same k_in-vs-fast-tier caveat as
 		// `TwoQFastAdmissionHybrid` above.
-		#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::TwoQFastAdmissionReprieveHybrid(k_in) => Box::new(
 			TwoQFastAdmissionReprieveHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "two_q_fast_admission_reprieve_hybrid_cache"))]
-		PaperPolicy::TwoQFastAdmissionReprieveHybrid(k_in) => Box::new(TwoQFastAdmissionReprieveHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
 
 		// Now carries the same `with_shared_overhead` reservation and the same
 		// high/low fast-tier watermarks as `LruHybrid`/`LfuHybrid`, in the
@@ -440,14 +426,12 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// for: a follow-up DRAM-usage measurement did show the same issue
 		// (metadata is DRAM-resident but is not counted in `fast_used`, so
 		// the fast tier overshot its budget).
-		#[cfg(feature = "fifo_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::FifoHybrid => Box::new(
 			FifoHybridStack::new((max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "fifo_hybrid_cache"))]
-		PaperPolicy::FifoHybrid => Box::new(FifoHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 
 		// Default small/large fast-segment budgets: 10% of max_size each
 		// (totaling the same 20% aggregate default the other four hybrids
@@ -459,7 +443,7 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// a *classification* threshold with overall cache size the way a
 		// capacity budget scales -- also immediately overridden by the real
 		// constructor-supplied value.
-		#[cfg(feature = "lru_sized_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::LruSizedHybrid => Box::new(
 			LruSizedHybridStack::new(
 				(max_size as f64 * 0.1) as CacheSize,
@@ -469,12 +453,6 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "lru_sized_hybrid_cache"))]
-		PaperPolicy::LruSizedHybrid => Box::new(LruSizedHybridStack::new(
-			(max_size as f64 * 0.1) as CacheSize,
-			(max_size as f64 * 0.1) as CacheSize,
-			4_096,
-		)),
 
 		// `ratio` comes from the policy string itself (same as plain
 		// `SThreeFifo`/`TwoQHybrid`); the fast-tier budget still
@@ -486,47 +464,39 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// one too: admission being always-slow does not avoid the cost, since
 		// the hashtable and eviction-stack entries are DRAM-resident for
 		// slow-tier objects just as much as for fast-tier ones.
-		#[cfg(feature = "s3_fifo_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoHybrid(ratio) => Box::new(
 			S3FifoHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "s3_fifo_hybrid_cache"))]
-		PaperPolicy::S3FifoHybrid(ratio) => Box::new(S3FifoHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 
 		// Same construction/default-fast-tier-budget shape as TwoQHybrid/
 		// S3FifoHybrid above -- see two_q_ghost_hybrid_stack.rs's module doc
 		// for the ghost-queue mechanics these add on top.
-		#[cfg(feature = "two_q_ghost_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::TwoQGhostHybrid(k_in) => Box::new(
 			TwoQGhostHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "two_q_ghost_hybrid_cache"))]
-		PaperPolicy::TwoQGhostHybrid(k_in) => Box::new(TwoQGhostHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
-		#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoGhostHybrid(ratio) => Box::new(
 			S3FifoGhostHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "s3_fifo_ghost_hybrid_cache"))]
-		PaperPolicy::S3FifoGhostHybrid(ratio) => Box::new(S3FifoGhostHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 
 		// Same construction/default-fast-tier-budget shape as
 		// S3FifoGhostHybrid above -- see
 		// s3_fifo_ghost_lazy_demotion_hybrid_stack.rs's module doc for the
 		// demotion-time reference-bit gate this adds on top.
-		#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoGhostLazyDemotionHybrid(ratio) => Box::new(
 			S3FifoGhostLazyDemotionHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache"))]
-		PaperPolicy::S3FifoGhostLazyDemotionHybrid(ratio) => Box::new(S3FifoGhostLazyDemotionHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 
 		// Same construction/default-fast-tier-budget shape as
 		// S3FifoGhostLazyDemotionHybrid above -- see
@@ -534,28 +504,24 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// module doc for the shared-DRAM-budget accounting this adds (the
 		// one-access queue now competes with the main queue's fast segment
 		// for the same fast_capacity).
-		#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ratio) => Box::new(
 			S3FifoGhostLazyDemotionFastAdmissionHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ratio) => Box::new(S3FifoGhostLazyDemotionFastAdmissionHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 
 		// Same construction/default-fast-tier-budget shape as
 		// S3FifoGhostLazyDemotionFastAdmissionHybrid above -- see
 		// s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack.rs's
 		// module doc for the mid-slow-segment reference-bit checkpoint this
 		// adds on top.
-		#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(ratio) => Box::new(
 			S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache"))]
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(ratio) => Box::new(S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 
 		// Same construction/default-fast-tier-budget shape as
 		// S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid above -- see
@@ -563,40 +529,34 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// module doc: no ghost queue (removed entirely), and a one-access
 		// key that ages out is spliced into the slow tier of the main
 		// queue instead of being evicted.
-		#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(ratio) => Box::new(
 			S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache"))]
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(ratio) => Box::new(S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 
 		// Same construction shape as the midpoint variant above, minus the
 		// mid-slow checkpoint -- see
 		// s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stack.rs's module doc.
-		#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(ratio) => Box::new(
 			S3FifoLazyDemotionFastAdmissionReprieveHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache"))]
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(ratio) => Box::new(S3FifoLazyDemotionFastAdmissionReprieveHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 
 		// Same construction shape as its fast-admission sibling above. The
 		// one-access queue is slow-tier here, so its `one_access_capacity`
 		// bounds PMEM rather than being carved out of the DRAM budget -- see
 		// s3_fifo_lazy_demotion_reprieve_hybrid_stack.rs's
 		// `effective_main_fast_capacity`.
-		#[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoLazyDemotionReprieveHybrid(ratio) => Box::new(
 			S3FifoLazyDemotionReprieveHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache"))]
-		PaperPolicy::S3FifoLazyDemotionReprieveHybrid(ratio) => Box::new(S3FifoLazyDemotionReprieveHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 
 		// Same construction/default-fast-tier-budget shape as its
 		// predecessor above -- see
@@ -604,13 +564,11 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// module doc: the slow tier is split into two physical FIFO
 		// segments, and every object's reference bit is checked as it
 		// crosses between them.
-		#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(ratio) => Box::new(
 			S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(not(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(ratio) => Box::new(S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 	}
 }

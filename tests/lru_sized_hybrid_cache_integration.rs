@@ -65,7 +65,7 @@ mod hybrid_cache_tests {
     /// before a test's own timing-sensitive assertions begin. See the module
     /// doc comment above for why this is necessary.
     fn ensure_pmem_allocator_warm() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(1),
             CacheTierSize::Bytes(1),
@@ -104,7 +104,7 @@ mod hybrid_cache_tests {
 
     #[test]
     fn admission_routes_small_and_large_values_to_their_respective_segments() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(1_000_000),
             CacheTierSize::Bytes(1_000_000),
@@ -129,7 +129,7 @@ mod hybrid_cache_tests {
     fn small_segment_pressure_demotes_independently_of_large_segment() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(160),       // fits ~1 of the 100-byte values
             CacheTierSize::Bytes(1_000_000), // large: huge, never demotes
@@ -158,7 +158,7 @@ mod hybrid_cache_tests {
     fn large_segment_pressure_demotes_independently_of_small_segment() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(1_000_000), // small: huge, never demotes
             CacheTierSize::Bytes(3_200),      // fits ~1 of the 2000-byte values
@@ -189,7 +189,7 @@ mod hybrid_cache_tests {
     fn slow_tier_hit_promotes_back_into_the_segment_matching_current_size() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(160),
             CacheTierSize::Bytes(1_000_000),
@@ -214,7 +214,7 @@ mod hybrid_cache_tests {
 
     #[test]
     fn overwrite_reclassifies_an_existing_key_into_the_other_segment() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(1_000_000),
             CacheTierSize::Bytes(1_000_000),
@@ -249,7 +249,7 @@ mod hybrid_cache_tests {
     fn ttl_survives_a_demotion() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(TTL_SMALL_FAST_TIER),
             CacheTierSize::Bytes(1_000_000),
@@ -282,7 +282,7 @@ mod hybrid_cache_tests {
     fn ttl_survives_a_promotion() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(TTL_SMALL_FAST_TIER),
             CacheTierSize::Bytes(1_000_000),
@@ -317,7 +317,7 @@ mod hybrid_cache_tests {
     fn terminal_eviction_only_removes_from_slow_tier_and_is_counted() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             200,
             CacheTierSize::Bytes(10),
             CacheTierSize::Bytes(10),
@@ -370,7 +370,7 @@ mod hybrid_cache_tests {
         // `evict_one()` must evict directly from the fast segment furthest
         // over its own budget -- here, the only fast segment with any
         // objects at all.
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_150,
             CacheTierSize::Bytes(1_000),
             CacheTierSize::Bytes(1_000),
@@ -409,7 +409,7 @@ mod hybrid_cache_tests {
         // `LruSizedHybridStack::reserved_shares` -- the split is
         // proportional to each segment's *capacity*), matching
         // `hybrid_cache_integration.rs`'s equivalent single-tier test.
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(2_000),
             CacheTierSize::Bytes(1),
@@ -442,7 +442,7 @@ mod hybrid_cache_tests {
     fn set_fast_tier_size_resizes_small_segment_at_runtime() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(1_000_000), // huge: nothing demotes initially
             CacheTierSize::Bytes(1_000_000),
@@ -466,7 +466,7 @@ mod hybrid_cache_tests {
     fn set_large_fast_tier_size_resizes_large_segment_at_runtime() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(1_000_000),
             CacheTierSize::Bytes(1_000_000), // huge: nothing demotes initially
@@ -488,7 +488,7 @@ mod hybrid_cache_tests {
 
     #[test]
     fn set_size_threshold_changes_future_routing_at_runtime() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(1_000_000),
             CacheTierSize::Bytes(1_000_000),
@@ -518,7 +518,7 @@ mod hybrid_cache_tests {
 
     #[test]
     fn zero_small_fast_tier_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(
+        let result = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000, CacheTierSize::Bytes(0), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
         );
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
@@ -526,7 +526,7 @@ mod hybrid_cache_tests {
 
     #[test]
     fn zero_large_fast_tier_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(
+        let result = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000, CacheTierSize::Bytes(500), CacheTierSize::Bytes(0), CacheTierSize::Bytes(100),
         );
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
@@ -534,7 +534,7 @@ mod hybrid_cache_tests {
 
     #[test]
     fn small_fast_tier_size_exceeding_max_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(
+        let result = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000, CacheTierSize::Bytes(2_000), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
         );
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
@@ -542,7 +542,7 @@ mod hybrid_cache_tests {
 
     #[test]
     fn large_fast_tier_size_exceeding_max_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(
+        let result = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000, CacheTierSize::Bytes(500), CacheTierSize::Bytes(2_000), CacheTierSize::Bytes(100),
         );
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
@@ -550,7 +550,7 @@ mod hybrid_cache_tests {
 
     #[test]
     fn zero_max_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(
+        let result = PaperCache::<u32, TieredBuffer>::new_sized(
             0, CacheTierSize::Bytes(100), CacheTierSize::Bytes(100), CacheTierSize::Bytes(50),
         );
         assert!(matches!(result, Err(CacheError::ZeroCacheSize)));
@@ -560,7 +560,7 @@ mod hybrid_cache_tests {
     fn del_removes_key_from_whichever_segment_or_tier_it_is_in() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(160),
             CacheTierSize::Bytes(1_000_000),
@@ -590,7 +590,7 @@ mod hybrid_cache_tests {
     fn wipe_clears_every_segment_and_the_slow_tier() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(160),
             CacheTierSize::Bytes(1_000_000),

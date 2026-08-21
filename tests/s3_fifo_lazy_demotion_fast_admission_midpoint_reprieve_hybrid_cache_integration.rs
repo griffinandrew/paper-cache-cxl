@@ -25,7 +25,7 @@
 
 #[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
 mod hybrid_cache_tests {
-    use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
+    use paper_cache::{PaperPolicy, PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + timeout;
@@ -46,7 +46,7 @@ mod hybrid_cache_tests {
     /// key self-demote immediately), which is what actually allocates
     /// through the UMF/TBB pool for the first time in this process.
     fn ensure_pmem_allocator_warm() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1), 0.0)
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.0))
             .expect("warm-up cache should construct");
 
         cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
@@ -67,9 +67,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            1.0,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(1.0)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
 
@@ -83,11 +81,7 @@ mod hybrid_cache_tests {
     fn a_key_that_ages_out_lands_directly_in_the_main_queues_slow_tier() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            0.00004, // one_access_capacity = 40 bytes, fits one ~15-byte value
-        ).expect("cache should construct");
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.00004)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
@@ -109,9 +103,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            0.00004,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.00004)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.set(2u32, b"second value 45", None).expect("set should succeed");
@@ -146,9 +138,7 @@ mod hybrid_cache_tests {
         // and fixed), the evictions counter would move; it must not.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            0.00004,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.00004)).expect("cache should construct");
 
         for key in 1u32..=20 {
             cache.set(key, b"payload bytes A", None).expect("set should succeed");
@@ -182,9 +172,7 @@ mod hybrid_cache_tests {
         // other 500_000 (so the first get()'s promotion sticks).
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            0.5,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -217,9 +205,7 @@ mod hybrid_cache_tests {
         // dynamics this test was originally built around.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(80),
-            0.00004,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(80), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.00004)).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -264,9 +250,7 @@ mod hybrid_cache_tests {
         // dynamics this test was originally built around.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(80),
-            0.00004,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(80), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.00004)).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -313,9 +297,7 @@ mod hybrid_cache_tests {
         // hence the mid-segment checkpoint this test is exercising.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             2_000,
-            CacheTierSize::Bytes(470),
-            0.2,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(470), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.2)).expect("cache should construct");
 
         // Build a real slow segment: each key is admitted (Fast), then
         // immediately re-accessed to promote it into the main queue,
@@ -363,9 +345,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             2_000,
-            CacheTierSize::Bytes(470),
-            0.2,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(470), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.2)).expect("cache should construct");
 
         for key in 1u32..=6 {
             cache.set(key, b"payload bytes A", None).expect("set should succeed");
@@ -395,9 +375,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(TTL_FAST_TIER),
-            0.0,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.0)).expect("cache should construct");
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
@@ -429,11 +407,7 @@ mod hybrid_cache_tests {
     fn ttl_survives_a_reprieve() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            0.00004, // one_access_capacity = 40 bytes, fits one ~15-byte value
-        ).expect("cache should construct");
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.00004)).expect("cache should construct");
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
@@ -462,9 +436,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            0.0,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.0)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -480,14 +452,14 @@ mod hybrid_cache_tests {
 
     #[test]
     fn zero_fast_tier_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(0), 0.5);
+        let result = PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(0), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.5));
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
 
     #[test]
     fn invalid_one_access_ratio_is_rejected() {
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(500), 1.5),
+            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(500), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(1.5)),
             Err(CacheError::InvalidPolicy),
         ));
     }
@@ -498,9 +470,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            0.0,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.0)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -517,9 +487,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            0.0,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.0)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.set(2u32, b"second value 45", None).expect("set should succeed");
@@ -585,9 +553,7 @@ mod hybrid_cache_tests {
         let cache = std::sync::Arc::new(
             PaperCache::<u32, TieredBuffer>::new(
                 256 * 1024 * 1024,
-                CacheTierSize::Bytes(16 * 1024 * 1024),
-                0.004,
-            ).expect("cache should construct"),
+                CacheTierSize::Bytes(16 * 1024 * 1024), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.004)).expect("cache should construct"),
         );
 
         let done = std::sync::Arc::new(AtomicBool::new(false));

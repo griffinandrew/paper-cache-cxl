@@ -33,7 +33,7 @@
 
 #[cfg(feature = "lru_lfu_hybrid_cache")]
 mod hybrid_cache_tests {
-    use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
+    use paper_cache::{PaperPolicy, PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + timeout;
@@ -51,7 +51,7 @@ mod hybrid_cache_tests {
     /// Forces the one-time PMEM allocator pool init/prewarm to complete
     /// before a test's own timing-sensitive assertions begin.
     fn ensure_pmem_allocator_warm() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1), 2)
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1), PaperPolicy::LruLfuHybrid(2))
             .expect("warm-up cache should construct");
 
         cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
@@ -90,9 +90,7 @@ mod hybrid_cache_tests {
     fn make_cache() -> PaperCache<u32, TieredBuffer> {
         PaperCache::<u32, TieredBuffer>::new(
             MAX_SIZE,
-            CacheTierSize::Bytes(FAST_TIER),
-            PROMOTE_K,
-        ).expect("cache should construct")
+            CacheTierSize::Bytes(FAST_TIER), PaperPolicy::LruLfuHybrid(PROMOTE_K)).expect("cache should construct")
     }
 
     /// Fills the fast tier and keeps admitting until `key` is observed in the
@@ -123,9 +121,7 @@ mod hybrid_cache_tests {
     fn admission_always_lands_in_the_fast_tier() {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             MAX_SIZE,
-            CacheTierSize::Bytes(MAX_SIZE),
-            PROMOTE_K,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(MAX_SIZE), PaperPolicy::LruLfuHybrid(PROMOTE_K)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
 
@@ -295,9 +291,7 @@ mod hybrid_cache_tests {
         // than to a bare multiple of VALUE_LEN.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             MAX_SIZE,
-            CacheTierSize::Bytes(4_500),
-            PROMOTE_K,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(4_500), PaperPolicy::LruLfuHybrid(PROMOTE_K)).expect("cache should construct");
 
         // A TTL comfortably longer than any plausible migration latency:
         // `tier_of` reports an expired object as absent, so a short TTL would
@@ -330,9 +324,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             MAX_SIZE,
-            CacheTierSize::Bytes(4_500),
-            PROMOTE_K,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(4_500), PaperPolicy::LruLfuHybrid(PROMOTE_K)).expect("cache should construct");
 
         let ttl_secs = 8u32;
         let set_at = std::time::Instant::now();
@@ -368,9 +360,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             MAX_SIZE,
-            CacheTierSize::Bytes(MAX_SIZE),
-            PROMOTE_K,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(MAX_SIZE), PaperPolicy::LruLfuHybrid(PROMOTE_K)).expect("cache should construct");
 
         cache.set(1u32, &value(0xA1), None).expect("set should succeed");
         cache.set(2u32, &value(0xB2), None).expect("set should succeed");
@@ -391,16 +381,12 @@ mod hybrid_cache_tests {
     fn invalid_fast_tier_sizes_are_rejected() {
         let zero = PaperCache::<u32, TieredBuffer>::new(
             MAX_SIZE,
-            CacheTierSize::Bytes(0),
-            PROMOTE_K,
-        );
+            CacheTierSize::Bytes(0), PaperPolicy::LruLfuHybrid(PROMOTE_K));
         assert!(matches!(zero, Err(CacheError::InvalidFastTierSize)));
 
         let too_big = PaperCache::<u32, TieredBuffer>::new(
             MAX_SIZE,
-            CacheTierSize::Bytes(MAX_SIZE + 1),
-            PROMOTE_K,
-        );
+            CacheTierSize::Bytes(MAX_SIZE + 1), PaperPolicy::LruLfuHybrid(PROMOTE_K));
         assert!(matches!(too_big, Err(CacheError::InvalidFastTierSize)));
     }
 
@@ -410,9 +396,7 @@ mod hybrid_cache_tests {
         // accessed, which is not the same policy at any k.
         let bad = PaperCache::<u32, TieredBuffer>::new(
             MAX_SIZE,
-            CacheTierSize::Bytes(FAST_TIER),
-            0,
-        );
+            CacheTierSize::Bytes(FAST_TIER), PaperPolicy::LruLfuHybrid(0));
         assert!(matches!(bad, Err(CacheError::InvalidPolicy)));
     }
 

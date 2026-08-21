@@ -44,36 +44,4 @@ mod stats;
 pub use crate::tiered_buffer::TieredBuffer;
 pub use stats::LruSizedHybridStats;
 
-/// Marker type selecting `lru_sized_hybrid_cache`'s behavior for the shared
-/// generic `impl<K, S> PaperCache<K, TieredBuffer, S>` block in `lib.rs`
-/// (see `crate::hybrid_policy::HybridPolicy`). Admission is unconditional:
-/// every `set()` builds `TieredBuffer::new_fast`, matching
-/// `LruSizedHybridStack::insert` always re-admitting to one of the two fast
-/// segments (including on overwrite, which it treats as a promotion/
-/// reclassification). Which of the two fast segments an admission lands in
-/// is decided entirely by `LruSizedHybridStack` on the worker thread, using
-/// the `size: ObjectSize` it's already given -- invisible at this layer,
-/// since both segments share the identical `TieredBuffer::Fast` physical
-/// representation.
-pub struct LruSizedHybridPolicy;
 
-impl crate::hybrid_policy::HybridPolicy for LruSizedHybridPolicy {
-	type Stats = LruSizedHybridStats;
-	type ExtraConfig = ();
-
-	fn seed_policy(_extra: ()) -> crate::PaperPolicy {
-		crate::PaperPolicy::LruSizedHybrid
-	}
-
-	fn stats_from_status(status: &crate::status::AtomicStatus) -> LruSizedHybridStats {
-		status.hybrid_stats()
-	}
-
-	fn admission_tier<K>(
-		_hashed_key: crate::HashedKey,
-		_status: &crate::status::AtomicStatus,
-		_objects: &crate::hybrid_policy::HybridObjectMap<K>,
-	) -> crate::Tier {
-		crate::Tier::Fast
-	}
-}

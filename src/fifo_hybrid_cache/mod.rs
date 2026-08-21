@@ -36,44 +36,4 @@ mod stats;
 pub use crate::tiered_buffer::TieredBuffer;
 pub use stats::FifoHybridStats;
 
-/// Marker type selecting `fifo_hybrid_cache`'s behavior for the shared
-/// generic `impl<K, S> PaperCache<K, TieredBuffer, S>` block in `lib.rs`
-/// (see `crate::hybrid_policy::HybridPolicy`). A genuinely new key is
-/// always admitted at the bottom of the fast tier. Overwriting an existing
-/// key never changes its tier or position -- FIFO has no promotion/
-/// reordering policy at all (see `FifoHybridStack`'s module doc) -- so the
-/// value must be written into whichever tier's representation the key
-/// already occupies, looked up here since the API-calling thread has no
-/// access to the worker-owned policy stack. This is the one design whose
-/// admission rule depends on an *existing* key's current tier rather than
-/// only on whether the key is new.
-pub struct FifoHybridPolicy;
 
-impl crate::hybrid_policy::HybridPolicy for FifoHybridPolicy {
-	type Stats = FifoHybridStats;
-	type ExtraConfig = ();
-
-	fn seed_policy(_extra: ()) -> crate::PaperPolicy {
-		crate::PaperPolicy::FifoHybrid
-	}
-
-	fn stats_from_status(status: &crate::status::AtomicStatus) -> FifoHybridStats {
-		status.hybrid_stats()
-	}
-
-	fn admission_tier<K>(
-		hashed_key: crate::HashedKey,
-		_status: &crate::status::AtomicStatus,
-		objects: &crate::hybrid_policy::HybridObjectMap<K>,
-	) -> crate::Tier {
-		use crate::object_store::ObjectStore;
-
-		let existing_tier = objects.get_ref(&hashed_key)
-			.map(|object| if object.data().is_fast() { crate::Tier::Fast } else { crate::Tier::Slow });
-
-		match existing_tier {
-			Some(crate::Tier::Slow) => crate::Tier::Slow,
-			Some(crate::Tier::Fast) | None => crate::Tier::Fast,
-		}
-	}
-}

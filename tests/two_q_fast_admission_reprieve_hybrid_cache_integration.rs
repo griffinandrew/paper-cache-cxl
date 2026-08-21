@@ -38,7 +38,7 @@
 
 #[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
 mod hybrid_cache_tests {
-    use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
+    use paper_cache::{PaperPolicy, PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + timeout;
@@ -84,9 +84,7 @@ mod hybrid_cache_tests {
     fn make_cache() -> PaperCache<u32, TieredBuffer> {
         PaperCache::<u32, TieredBuffer>::new(
             MAX_SIZE,
-            CacheTierSize::Bytes(FAST_TIER),
-            K_IN,
-        ).expect("cache should construct")
+            CacheTierSize::Bytes(FAST_TIER), PaperPolicy::TwoQFastAdmissionReprieveHybrid(K_IN)).expect("cache should construct")
     }
 
     /// Forces the one-time PMEM allocator pool init/prewarm to complete
@@ -104,9 +102,7 @@ mod hybrid_cache_tests {
     fn ensure_pmem_allocator_warm() {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(400),
-            0.1,
-        ).expect("warm-up cache should construct");
+            CacheTierSize::Bytes(400), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)).expect("warm-up cache should construct");
 
         for key in 0..8u32 {
             cache.set(key, &[0u8; 64], None).expect("warm-up set should succeed");
@@ -132,9 +128,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(500_000),
-            0.1,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(500_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)).expect("cache should construct");
 
         cache.set(1u32, b"hello", None).expect("set should succeed");
 
@@ -152,9 +146,7 @@ mod hybrid_cache_tests {
         // zero effective main-queue capacity is irrelevant here.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(500_000),
-            0.5,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(500_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.5)).expect("cache should construct");
 
         for key in 1..=20u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -248,9 +240,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(FAST_TIER_BYTES),
-            0.001,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(FAST_TIER_BYTES), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.001)).expect("cache should construct");
 
         for key in 1..=40u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -332,9 +322,7 @@ mod hybrid_cache_tests {
         // never fires, isolating the reprieve path.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             10_000_000,
-            CacheTierSize::Bytes(500_000),
-            0.0001,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(500_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.0001)).expect("cache should construct");
 
         for key in 1..=30u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -368,9 +356,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             10_000_000,
-            CacheTierSize::Bytes(500_000),
-            0.0001,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(500_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.0001)).expect("cache should construct");
 
         for key in 1..=30u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -400,9 +386,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             10_000_000,
-            CacheTierSize::Bytes(500_000),
-            0.0001,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(500_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.0001)).expect("cache should construct");
 
         for key in 1..=30u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -440,9 +424,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             8_000,
-            CacheTierSize::Bytes(4_000),
-            0.05,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(4_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.05)).expect("cache should construct");
 
         for key in 1..=60u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -530,9 +512,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(500_000),
-            0.001,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(500_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.001)).expect("cache should construct");
 
         for key in 1..=10u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -566,9 +546,7 @@ mod hybrid_cache_tests {
         // max_size meaningfully shrinks what the main queue may keep fast.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             2_000,
-            CacheTierSize::Bytes(1_500),
-            0.5,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_500), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.5)).expect("cache should construct");
 
         for key in 1..=6u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -682,30 +660,30 @@ mod hybrid_cache_tests {
     fn invalid_construction_parameters_are_rejected() {
         // Zero fast tier.
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(0), 0.1),
+            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(0), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)),
             Err(CacheError::InvalidFastTierSize),
         ));
 
         // Fast tier larger than the whole cache.
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(2_000), 0.1),
+            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(2_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)),
             Err(CacheError::InvalidFastTierSize),
         ));
 
         // Zero cache size.
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(0, CacheTierSize::Bytes(1), 0.1),
+            PaperCache::<u32, TieredBuffer>::new(0, CacheTierSize::Bytes(1), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)),
             Err(CacheError::ZeroCacheSize),
         ));
 
         // k_in outside [0.0, 1.0].
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000), 1.5),
+            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(1.5)),
             Err(CacheError::InvalidPolicy),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000), -0.1),
+            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(-0.1)),
             Err(CacheError::InvalidPolicy),
         ));
     }
@@ -720,9 +698,7 @@ mod hybrid_cache_tests {
         // so the main queue's effective capacity saturates to zero.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             10_000,
-            CacheTierSize::Bytes(1_000),
-            1.0,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(1.0)).expect("cache should construct");
 
         cache.set(1u32, &[1u8; 64], None).expect("set should succeed");
 

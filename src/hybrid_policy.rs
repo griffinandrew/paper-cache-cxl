@@ -36,40 +36,84 @@ use crate::tiered_buffer::TieredBuffer;
 /// unchanged against either shape.
 pub type HybridObjectMap<K> = ObjectMapRef<K, TieredBuffer>;
 
-/// The behavior that varies between the four hybrid-cache designs; see
-/// each design's own module doc comment for the full paper-derived
-/// admission/demotion/promotion/eviction rules. Implemented once by a
-/// small marker struct per feature (`LruHybridPolicy`, `LfuHybridPolicy`,
-/// `TwoQHybridPolicy`, `FifoHybridPolicy`), selected at compile time via
-/// `lib.rs`'s `ActiveHybridPolicy` type alias.
-pub trait HybridPolicy {
-	/// The stats snapshot type returned by this policy's
-	/// `{name}_hybrid_stats()` accessor (e.g. `LruHybridStats`).
-	type Stats;
+/// Which tier a `set()` builds the value's bytes in, for the given hybrid
+/// policy.
+///
+/// Runtime replacement for the compile-time `HybridPolicy::admission_tier`
+/// markers: one match, with each arm carrying its design's admission rule
+/// verbatim. Non-hybrid policies never reach `set()` on a hybrid cache
+/// (construction rejects them), so the catch-all admits fast, which is also
+/// every design's default for a brand-new key except the ghost variants.
+pub fn admission_tier<K>(
+	policy: PaperPolicy,
+	hashed_key: HashedKey,
+	status: &AtomicStatus,
+	objects: &HybridObjectMap<K>,
+) -> Tier {
+	use crate::object_store::ObjectStore;
 
-	/// Extra constructor input beyond `max_size`/`fast_tier_size`: `()` for
-	/// every design except `two_q_hybrid_cache`, which needs `k_in: f64`
-	/// (the FIFO queue's byte budget, fixed at construction).
-	type ExtraConfig: Copy;
+	// Shared bindings the arms below use; harmless where unused.
+	let _ = (&hashed_key, &status, &objects);
 
-	/// Builds the `PaperPolicy` value seeded into `AtomicStatus::new` at
-	/// construction time.
-	fn seed_policy(extra: Self::ExtraConfig) -> PaperPolicy;
-
-	/// Reads this policy's stats snapshot off the shared status.
-	fn stats_from_status(status: &AtomicStatus) -> Self::Stats;
-
-	/// Decides which tier `set()` should build a value's bytes in.
-	/// Implementations that need to know whether `hashed_key` is a
-	/// brand-new key, or what tier it currently occupies, look that up
-	/// from `objects` themselves -- the two designs that need this
-	/// (`lfu_hybrid_cache`, `fifo_hybrid_cache`) each look up exactly what
-	/// they need; the two that don't (`lru_hybrid_cache`,
-	/// `two_q_hybrid_cache`, both unconditional) ignore the arguments
-	/// entirely.
-	fn admission_tier<K>(
-		hashed_key: HashedKey,
-		status: &AtomicStatus,
-		objects: &HybridObjectMap<K>,
-	) -> Tier;
+	match policy {
+		PaperPolicy::FifoHybrid | PaperPolicy::LruLfuHybrid(..) => {
+			let existing_tier = objects.get_ref(&hashed_key)
+				.map(|object| if object.data().is_fast() { crate::Tier::Fast } else { crate::Tier::Slow });
+			match existing_tier {
+				Some(crate::Tier::Slow) => crate::Tier::Slow,
+				Some(crate::Tier::Fast) | None => crate::Tier::Fast,
+			}
+		},
+		PaperPolicy::LfuHybrid => {
+			match objects.get_ref(&hashed_key) {
+				Some(object) => match object.data().is_fast() {
+					true => crate::Tier::Fast,
+					false => crate::Tier::Slow,
+				},
+				None if status.hybrid_admission_latched() => crate::Tier::Slow,
+				None => crate::Tier::Fast,
+			}
+		},
+		PaperPolicy::LruHybrid | PaperPolicy::LruSizedHybrid | PaperPolicy::TwoQFastAdmissionHybrid(..) | PaperPolicy::TwoQFastAdmissionReprieveHybrid(..) => {
+			crate::Tier::Fast
+		},
+		PaperPolicy::S3FifoGhostHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionHybrid(..) | PaperPolicy::S3FifoHybrid(..) => {
+			match objects.get_ref(&hashed_key) {
+				Some(object) => match object.data().is_fast() {
+					true => crate::Tier::Fast,
+					false => crate::Tier::Slow,
+				},
+				None => crate::Tier::Slow,
+			}
+		},
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(..) => {
+			match objects.get_ref(&hashed_key) {
+				Some(object) => match object.data().is_fast() {
+					true => crate::Tier::Fast,
+					false => crate::Tier::Slow,
+				},
+				None => crate::Tier::Fast,
+			}
+		},
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(..) | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(..) | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(..) => {
+			match objects.get_ref(&hashed_key) {
+				Some(object) if object.data().is_slow() => crate::Tier::Slow,
+				_ => crate::Tier::Fast,
+			}
+		},
+		PaperPolicy::S3FifoLazyDemotionReprieveHybrid(..) => {
+			match objects.get_ref(&hashed_key) {
+				Some(object) if object.data().is_slow() => crate::Tier::Slow,
+				Some(_) => crate::Tier::Fast,
+				None => crate::Tier::Slow,
+			}
+		},
+		PaperPolicy::TwoQGhostHybrid(..) | PaperPolicy::TwoQHybrid(..) => {
+			match objects.get_ref(&hashed_key) {
+				Some(_) => crate::Tier::Fast,
+				None => crate::Tier::Slow,
+			}
+		},
+		_ => crate::Tier::Fast,
+	}
 }

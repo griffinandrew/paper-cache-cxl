@@ -14,372 +14,6 @@
 // `set`, ...) on `PaperCache<K, TieredBuffer, S>`. Two such impl blocks for
 // the identical concrete type cannot coexist, so only one of these
 // hybrid-cache flavors may be enabled at a time.
-#[cfg(all(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 'lfu_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "fifo_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 'fifo_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "fifo_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 'fifo_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "fifo_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 'fifo_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_sized_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_sized_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_sized_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_sized_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_sized_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_sized_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_sized_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_sized_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_ghost_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_ghost_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_ghost_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_ghost_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_ghost_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_ghost_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_ghost_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_ghost_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_ghost_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_ghost_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_ghost_hybrid_cache' and 's3_fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_hybrid_cache' and 's3_fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_hybrid_cache", feature = "two_q_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_hybrid_cache' and 'two_q_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_hybrid_cache' and 's3_fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "two_q_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_hybrid_cache' and 'two_q_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_hybrid_cache' and 's3_fifo_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' and 's3_fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "two_q_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' and 'two_q_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' and 's3_fifo_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' and 's3_fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "two_q_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' and 'two_q_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' and 's3_fifo_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' and 's3_fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "two_q_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' and 'two_q_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' and 's3_fifo_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' and 's3_fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "two_q_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' and 'two_q_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' and 's3_fifo_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 's3_fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "two_q_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 'two_q_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 's3_fifo_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 'two_q_fast_admission_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 'two_q_fast_admission_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 's3_fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "two_q_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 'two_q_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 's3_fifo_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "lru_lfu_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'lru_lfu_hybrid_cache' and 's3_fifo_lazy_demotion_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 's3_fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "two_q_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 'two_q_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 's3_fifo_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 's3_fifo_lazy_demotion_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
 
 // Validate that hashbrown_dram is not enabled with other global hashtable features
 #[cfg(all(feature = "hashbrown_dram", feature = "global_hashtable_pmem"))]
@@ -389,101 +23,8 @@ compile_error!("Cannot enable both 'hashbrown_dram' and 'global_hashtable_pmem' 
 // Pairwise mutual-exclusion guards for the new `two_q_fast_admission_hybrid_cache`
 // design against every existing one, matching this file's established
 // pairwise-guard style (rather than a single N-way check).
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 's3_fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 'two_q_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 's3_fifo_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 's3_fifo_lazy_demotion_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
 
 // Pairwise mutual-exclusion guards for `two_q_fast_admission_reprieve_hybrid_cache`.
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "lru_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 'lru_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "lfu_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 'lfu_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "two_q_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 'two_q_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 'two_q_fast_admission_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 'fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "lru_sized_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 'lru_sized_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 's3_fifo_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "two_q_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 'two_q_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 's3_fifo_ghost_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 's3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
-#[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
-compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
-
 /// Node-0-bound jemalloc arenas as the process allocator.
 ///
 /// Covers everything Rust allocates. It does NOT cover glibc's heap, the C
@@ -545,10 +86,10 @@ use crate::value_buffer::ValueBuffer;
 // Shared tier-size unit type (bytes/Mb/Gb), used by `lru_hybrid_cache`,
 // `lfu_hybrid_cache`, `two_q_hybrid_cache`, and `fifo_hybrid_cache` so none
 // of them has to depend on any of the others for it.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+#[cfg(feature = "hybrid_cache_common")]
 mod size;
 
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+#[cfg(feature = "hybrid_cache_common")]
 pub use crate::size::CacheTierSize;
 
 // Shared value type for the segmented hybrid-cache features. `lru_hybrid_cache`,
@@ -556,20 +97,20 @@ pub use crate::size::CacheTierSize;
 // mutually exclusive (see the `compile_error!` guards above) and all
 // re-export it from their own module for source compatibility
 // (`paper_cache::TieredBuffer` works either way).
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+#[cfg(feature = "hybrid_cache_common")]
 mod tiered_buffer;
 
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+#[cfg(feature = "hybrid_cache_common")]
 pub use crate::tiered_buffer::TieredBuffer;
 
 // Feature-neutral view of whichever hybrid design this build selected, so a
 // consumer that just wants demotion/promotion/eviction totals doesn't need
 // its own 15-arm `#[cfg]` cascade over the per-design accessor names. See
 // `hybrid_stats.rs`'s module doc.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+#[cfg(feature = "hybrid_cache_common")]
 mod hybrid_stats;
 
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+#[cfg(feature = "hybrid_cache_common")]
 pub use crate::hybrid_stats::HybridStats;
 
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
@@ -750,55 +291,18 @@ pub use crate::s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_c
 
 // Re-exported so `PaperCache::tier_of`'s return type is nameable by callers
 // without reaching into the private `worker` module tree directly.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+#[cfg(feature = "hybrid_cache_common")]
 pub use crate::worker::Tier;
 
 // Trait abstracting the behavior that differs between the four hybrid-cache
 // designs, plus the compile-time selection of exactly one concrete
 // implementation -- see `hybrid_policy.rs`'s module doc for why this stays
 // a compile-time (not runtime) dispatch.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+#[cfg(feature = "hybrid_cache_common")]
 mod hybrid_policy;
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
-use crate::hybrid_policy::HybridPolicy;
+#[cfg(feature = "hybrid_cache_common")]
 
-#[cfg(feature = "lru_hybrid_cache")]
-type ActiveHybridPolicy = crate::lru_hybrid_cache::LruHybridPolicy;
-#[cfg(feature = "lfu_hybrid_cache")]
-type ActiveHybridPolicy = crate::lfu_hybrid_cache::LfuHybridPolicy;
-#[cfg(feature = "two_q_hybrid_cache")]
-type ActiveHybridPolicy = crate::two_q_hybrid_cache::TwoQHybridPolicy;
-#[cfg(feature = "two_q_fast_admission_hybrid_cache")]
-type ActiveHybridPolicy = crate::two_q_fast_admission_hybrid_cache::TwoQFastAdmissionHybridPolicy;
-#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
-type ActiveHybridPolicy = crate::two_q_fast_admission_reprieve_hybrid_cache::TwoQFastAdmissionReprieveHybridPolicy;
-#[cfg(feature = "fifo_hybrid_cache")]
-type ActiveHybridPolicy = crate::fifo_hybrid_cache::FifoHybridPolicy;
-#[cfg(feature = "lru_sized_hybrid_cache")]
-type ActiveHybridPolicy = crate::lru_sized_hybrid_cache::LruSizedHybridPolicy;
-#[cfg(feature = "s3_fifo_hybrid_cache")]
-type ActiveHybridPolicy = crate::s3_fifo_hybrid_cache::S3FifoHybridPolicy;
-#[cfg(feature = "two_q_ghost_hybrid_cache")]
-type ActiveHybridPolicy = crate::two_q_ghost_hybrid_cache::TwoQGhostHybridPolicy;
-#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
-type ActiveHybridPolicy = crate::s3_fifo_ghost_hybrid_cache::S3FifoGhostHybridPolicy;
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
-type ActiveHybridPolicy = crate::s3_fifo_ghost_lazy_demotion_hybrid_cache::S3FifoGhostLazyDemotionHybridPolicy;
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
-type ActiveHybridPolicy = crate::s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache::S3FifoGhostLazyDemotionFastAdmissionHybridPolicy;
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
-type ActiveHybridPolicy = crate::s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache::S3FifoGhostLazyDemotionFastAdmissionMidpointHybridPolicy;
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
-type ActiveHybridPolicy = crate::s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridPolicy;
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
-type ActiveHybridPolicy = crate::s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache::S3FifoLazyDemotionFastAdmissionReprieveHybridPolicy;
 
-#[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
-type ActiveHybridPolicy = crate::s3_fifo_lazy_demotion_reprieve_hybrid_cache::S3FifoLazyDemotionReprieveHybridPolicy;
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
-type ActiveHybridPolicy = crate::s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridPolicy;
-#[cfg(feature = "lru_lfu_hybrid_cache")]
-type ActiveHybridPolicy = crate::lru_lfu_hybrid_cache::LruLfuHybridPolicy;
 
 use std::{
 	sync::{
@@ -2181,7 +1685,7 @@ unsafe impl<K, V, S> Sync for PaperCache<K, V, S> {}
 /// silently using `DashMap` regardless of that feature. The return type
 /// (`ObjectMapRef<K, V>`) is picked by the same cfg that already selects it
 /// crate-wide -- this just has to build a matching value.
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+#[cfg(feature = "hybrid_cache_common")]
 fn new_hybrid_object_map<K, V>() -> ObjectMapRef<K, V> {
 	#[cfg(feature = "hashbrown_dram")]
 	{
@@ -2208,12 +1712,45 @@ fn new_hybrid_object_map<K, V>() -> ObjectMapRef<K, V> {
 /// this one exist only to preserve each feature's distinct public
 /// constructor/stats-accessor names and signatures for source
 /// compatibility with existing callers (`paper-server`/`paper-benchmark-cxl`).
-#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "lru_sized_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+#[cfg(feature = "hybrid_cache_common")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
 	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
+	/// Creates an empty tiered cache running the given hybrid `policy`, with
+	/// overall byte budget `max_size` and initial fast-tier budget
+	/// `fast_tier_size` (adjustable afterward via
+	/// [`Self::set_fast_tier_size`]). Policy parameters (`k_in`, ghost
+	/// ratios, `promote_k`, ...) travel inside the [`PaperPolicy`] value.
+	///
+	/// The size-split design has its own constructor, [`Self::new_sized`],
+	/// because it takes three sizing scalars rather than one.
+	///
+	/// # Errors
+	///
+	/// [`CacheError::InvalidPolicy`] if `policy` is not a hybrid design (or
+	/// is `LruSizedHybrid`, which `new_sized` serves);
+	/// [`CacheError::ZeroCacheSize`]/[`CacheError::InvalidFastTierSize`] as
+	/// for every other constructor.
+	pub fn new(
+		max_size: CacheSize,
+		fast_tier_size: CacheTierSize,
+		policy: PaperPolicy,
+	) -> Result<Self, CacheError> {
+		Self::with_hasher(max_size, fast_tier_size, policy, Default::default())
+	}
+
+	/// Creates an empty tiered cache with the supplied hasher. See [`Self::new`].
+	pub fn with_hasher(
+		max_size: CacheSize,
+		fast_tier_size: CacheTierSize,
+		policy: PaperPolicy,
+		hasher: S,
+	) -> Result<Self, CacheError> {
+		Self::new_hybrid(max_size, fast_tier_size, policy, hasher)
+	}
+
 	// `lru_sized_hybrid_cache` doesn't call this: it needs three sizing
 	// scalars (two independent fast-segment capacities + a threshold)
 	// threaded to three different places rather than this method's single
@@ -2221,15 +1758,52 @@ where
 	// (see that feature's own small impl block below). Gated narrower than
 	// the outer block so an `lru_sized_hybrid_cache`-only build doesn't
 	// compile (and warn about) an unused method.
-	#[cfg(any(feature = "lru_hybrid_cache", feature = "lfu_hybrid_cache", feature = "two_q_hybrid_cache", feature = "two_q_fast_admission_hybrid_cache", feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "fifo_hybrid_cache", feature = "s3_fifo_hybrid_cache", feature = "two_q_ghost_hybrid_cache", feature = "s3_fifo_ghost_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache", feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache", feature = "lru_lfu_hybrid_cache"))]
+	#[cfg(feature = "hybrid_cache_common")]
 	fn new_hybrid(
 		max_size: CacheSize,
 		fast_tier_size: CacheTierSize,
-		extra: <ActiveHybridPolicy as HybridPolicy>::ExtraConfig,
+		policy: PaperPolicy,
 		hasher: S,
 	) -> Result<Self, CacheError> {
 		if max_size == 0 {
 			return Err(CacheError::ZeroCacheSize);
+		}
+
+		// The size-split design needs three sizing scalars and has its own
+		// constructor (`new_sized`); everything non-hybrid is simply not a
+		// tiered design.
+		if !policy.is_hybrid() || matches!(policy, PaperPolicy::LruSizedHybrid) {
+			return Err(CacheError::InvalidPolicy);
+		}
+
+		// Parameter ranges the per-design constructors used to enforce:
+		// every ratio-shaped parameter lives in [0, 1], and a promotion
+		// threshold of zero degenerates to plain LRU and is rejected rather
+		// than silently meaning something else.
+		let params_ok = match policy {
+			PaperPolicy::LruLfuHybrid(promote_k) => promote_k != 0,
+
+			PaperPolicy::TwoQHybrid(r)
+			| PaperPolicy::TwoQFastAdmissionHybrid(r)
+			| PaperPolicy::TwoQFastAdmissionReprieveHybrid(r)
+			| PaperPolicy::TwoQGhostHybrid(r)
+			| PaperPolicy::S3FifoHybrid(r)
+			| PaperPolicy::S3FifoGhostHybrid(r)
+			| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
+			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
+			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(r)
+			| PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(r)
+			| PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(r)
+			| PaperPolicy::S3FifoLazyDemotionReprieveHybrid(r)
+			| PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(r) => {
+				(0.0..=1.0).contains(&r)
+			},
+
+			_ => true,
+		};
+
+		if !params_ok {
+			return Err(CacheError::InvalidPolicy);
 		}
 
 		let fast_capacity = fast_tier_size.to_bytes();
@@ -2238,7 +1812,6 @@ where
 			return Err(CacheError::InvalidFastTierSize);
 		}
 
-		let policy = ActiveHybridPolicy::seed_policy(extra);
 		let policies = [policy];
 
 		let objects = new_hybrid_object_map();
@@ -2370,7 +1943,12 @@ where
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
-		let tier = ActiveHybridPolicy::admission_tier(hashed_key, &self.status, &self.objects);
+		let tier = crate::hybrid_policy::admission_tier(
+			self.status.policy(),
+			hashed_key,
+			&self.status,
+			&self.objects,
+		);
 		let val_buf = match tier {
 			Tier::Fast => TieredBuffer::new_fast(value),
 			Tier::Slow => TieredBuffer::new_slow(value),
@@ -2601,459 +2179,6 @@ where
 	}
 }
 
-/// Single-instance, segmented-LRU hybrid cache: one `PaperCache<K,
-/// TieredBuffer>` running `PaperPolicy::LruHybrid`, in contrast with
-/// composing two independent `PaperCache` instances. See the `lru_hybrid_cache` module docs for the
-/// full design. This impl block only carries `new`/`with_hasher` (this
-/// design's constructor has no extra parameters beyond `max_size`/
-/// `fast_tier_size`) and the `hybrid_stats()` accessor -- every other
-/// method is shared, in the generic block above (see
-/// `crate::hybrid_policy::HybridPolicy`).
-#[cfg(feature = "lru_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running `PaperPolicy::LruHybrid`, with
-	/// the given overall `max_size` and initial fast-tier byte budget
-	/// `fast_tier_size` (adjustable afterward via
-	/// [`Self::set_fast_tier_size`]).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero, or
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`.
-	///
-	/// # Examples
-	///
-	/// ```ignore
-	/// use paper_cache::{PaperCache, TieredBuffer, CacheTierSize};
-	///
-	/// let cache = PaperCache::<u32, TieredBuffer>::new(
-	///     10_000_000,
-	///     CacheTierSize::Mb(2),
-	/// ).unwrap();
-	///
-	/// cache.set(1u32, b"hello world", None).unwrap();
-	/// assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
-	/// ```
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		Self::new_hybrid(max_size, fast_tier_size, (), hasher)
-	}
-
-}
-
-/// Single-instance hybrid cache with recency (LRU) in the fast tier and
-/// frequency (LFU) in the slow tier: one `PaperCache<K, TieredBuffer>`
-/// running `PaperPolicy::LruLfuHybrid`. See the `lru_lfu_hybrid_cache` module
-/// docs for the full design; only `new`/`with_hasher`/
-/// `hybrid_stats()` live here -- everything else is shared (see the
-/// generic block above).
-#[cfg(feature = "lru_lfu_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running `PaperPolicy::LruLfuHybrid`,
-	/// with the given overall `max_size`, initial fast-tier byte budget
-	/// `fast_tier_size` (adjustable afterward via
-	/// [`Self::set_fast_tier_size`]), and promotion threshold `promote_k`.
-	///
-	/// `promote_k` is the **absolute frequency** a slow-tier object must
-	/// reach to be promoted into the fast tier — not a count of accesses
-	/// since it was demoted. Because an object admitted and never accessed
-	/// demotes carrying frequency 1, it needs `promote_k - 1` further
-	/// accesses to return: `1` and `2` both promote on the first slow access
-	/// (matching `lru_hybrid_cache`'s rule, leaving frequency to govern
-	/// eviction only), and **`3` is the smallest value that actually filters
-	/// anything**. An object that was hot before demoting arrives near the
-	/// cap and returns on its next access at any `promote_k`, which is
-	/// deliberate. See `lru_lfu_hybrid_stack`'s module doc for the full
-	/// reasoning.
-	///
-	/// Clamped internally to the stack's frequency cap, since a threshold
-	/// above that cap could never be reached and would silently disable
-	/// promotion entirely.
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `promote_k` is zero.
-	pub fn new(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		promote_k: u16,
-	) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, promote_k, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		promote_k: u16,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if promote_k == 0 {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, promote_k, hasher)
-	}
-
-}
-
-/// Single-instance, segmented-LFU hybrid cache: one `PaperCache<K,
-/// TieredBuffer>` running `PaperPolicy::LfuHybrid`, in contrast with
-/// composing two independent `PaperCache` instances. See the `lfu_hybrid_cache` module docs for the
-/// full design; only `new`/`with_hasher`/`hybrid_stats()` live here --
-/// everything else is shared (see the generic block above).
-///
-/// Admission always lands in the fast tier; once fast-tier pressure demotes
-/// a key, it is (by construction) always the fast tier's lowest-frequency
-/// resident, satisfying the paper's "new objects are, by definition, the
-/// least frequently accessed" admission rule as an emergent result. A
-/// slow-tier access promotes a key back to the fast tier once its frequency
-/// strictly exceeds the fast tier's minimum, which may itself cascade a
-/// demotion. Terminal evictions (once overall `max_size` is exceeded) only
-/// ever remove the slow-tier minimum-frequency resident. Every migration
-/// physically reallocates the object's bytes (see [`TieredBuffer`] and
-/// `Object::set_data`) — a key is never present in both tiers at once.
-///
-/// Mutually exclusive with `lru_hybrid_cache` (see `lib.rs`'s
-/// `compile_error!` guard) since both would otherwise define the same
-/// inherent-method impl block on the identical `PaperCache<K, TieredBuffer,
-/// S>` type.
-#[cfg(feature = "lfu_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running `PaperPolicy::LfuHybrid`, with
-	/// the given overall `max_size` and initial fast-tier byte budget
-	/// `fast_tier_size` (adjustable afterward via
-	/// [`Self::set_fast_tier_size`]).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero, or
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`.
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		Self::new_hybrid(max_size, fast_tier_size, (), hasher)
-	}
-
-}
-
-/// Single-instance, segmented-2Q hybrid cache: one `PaperCache<K,
-/// TieredBuffer>` running `PaperPolicy::TwoQHybrid`, in contrast with
-/// composing two independent `PaperCache` instances. See the `two_q_hybrid_cache` module docs for the
-/// full design; this impl block only carries `new`/`with_hasher` (the one
-/// design with an extra `k_in` constructor parameter) and
-/// `hybrid_stats()` -- everything else is shared (see the generic
-/// block above).
-///
-/// Admission always lands in a one-access FIFO queue entirely in the slow
-/// tier. A re-access to a FIFO-queue object promotes it straight to the top
-/// of the main queue's fast tier. Once in the main queue, an object behaves
-/// exactly like `lru_hybrid_cache`: fast-tier pressure demotes the LRU
-/// tail; a slow-tier access promotes it back, possibly cascading a further
-/// demotion. Terminal evictions prefer the FIFO queue's tail (an object
-/// that aged out without a second access) before ever touching the main
-/// queue's slow tail. Every migration physically reallocates the object's
-/// bytes (see [`TieredBuffer`] and `Object::set_data`) — a key is never
-/// present in both tiers at once.
-///
-/// Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache` (see
-/// `lib.rs`'s `compile_error!` guards) since all three would otherwise
-/// define the same inherent-method impl block on the identical
-/// `PaperCache<K, TieredBuffer, S>` type.
-#[cfg(feature = "two_q_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running `PaperPolicy::TwoQHybrid`, with
-	/// the given overall `max_size`, initial fast-tier byte budget
-	/// `fast_tier_size` (adjustable afterward via
-	/// [`Self::set_fast_tier_size`]), and `k_in` — the FIFO queue's byte
-	/// budget as a fraction of `max_size` (fixed for the lifetime of the
-	/// cache, rescaled proportionally on [`Self::resize`], same as plain
-	/// `PaperPolicy::TwoQ`'s `k_in`).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `k_in` is outside `[0.0, 1.0]`.
-	///
-	/// # Examples
-	///
-	/// ```ignore
-	/// use paper_cache::{PaperCache, TieredBuffer, CacheTierSize};
-	///
-	/// let cache = PaperCache::<u32, TieredBuffer>::new(
-	///     10_000_000,
-	///     CacheTierSize::Mb(2),
-	///     0.2,
-	/// ).unwrap();
-	///
-	/// cache.set(1u32, b"hello world", None).unwrap();
-	/// assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
-	/// ```
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, k_in: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, k_in, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		k_in: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&k_in) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, k_in, hasher)
-	}
-
-}
-
-/// Single-instance segmented-2Q hybrid cache with a **fast-tier** one-access
-/// queue. See the `two_q_fast_admission_hybrid_cache` module docs for the full
-/// design; this impl block only carries `new`/`with_hasher` (it shares
-/// `two_q_hybrid_cache`'s extra `k_in` constructor parameter) and
-/// `hybrid_stats()` -- everything else is shared (see the
-/// generic block above).
-///
-/// Identical to `two_q_hybrid_cache` except that admission places the object
-/// in the one-access FIFO queue **in the fast tier**, so `set()` is a plain
-/// DRAM write rather than a synchronous PMEM allocation on the calling
-/// thread. The consequence to be aware of when sizing: `k_in * max_size` is
-/// now a DRAM reservation carved *out of* `fast_tier_size`, not an
-/// independent PMEM budget, so it directly reduces the room available to
-/// proven-hot main-queue objects.
-///
-/// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
-/// `compile_error!` guards), since they would otherwise define the same
-/// inherent-method impl block on the identical `PaperCache<K, TieredBuffer,
-/// S>` type.
-#[cfg(feature = "two_q_fast_admission_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running
-	/// `PaperPolicy::TwoQFastAdmissionHybrid`, with the given overall
-	/// `max_size`, initial fast-tier byte budget `fast_tier_size`
-	/// (adjustable afterward via [`Self::set_fast_tier_size`]), and `k_in` —
-	/// the one-access FIFO queue's byte budget as a fraction of `max_size`
-	/// (fixed for the lifetime of the cache, rescaled proportionally on
-	/// [`Self::resize`]).
-	///
-	/// Note `k_in` is more consequential here than in `two_q_hybrid_cache`:
-	/// the FIFO queue is DRAM-resident, so its budget is subtracted from
-	/// `fast_tier_size` rather than drawn from PMEM. A `k_in` at or above
-	/// `fast_tier_size / max_size` leaves the main queue no fast segment at
-	/// all — a legitimate configuration, but rarely the intended one.
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `k_in` is outside `[0.0, 1.0]`.
-	///
-	/// # Examples
-	///
-	/// ```ignore
-	/// use paper_cache::{PaperCache, TieredBuffer, CacheTierSize};
-	///
-	/// let cache = PaperCache::<u32, TieredBuffer>::new(
-	///     10_000_000,
-	///     CacheTierSize::Mb(2),
-	///     0.1,
-	/// ).unwrap();
-	///
-	/// cache.set(1u32, b"hello world", None).unwrap();
-	/// assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
-	/// ```
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, k_in: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, k_in, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		k_in: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&k_in) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, k_in, hasher)
-	}
-
-}
-
-/// Single-instance segmented-2Q hybrid cache with a **fast-tier** one-access
-/// queue whose aged-out objects are **reprieved into the slow tier** rather
-/// than evicted. See the `two_q_fast_admission_reprieve_hybrid_cache` module docs for the full
-/// design; this impl block only carries `new`/`with_hasher` (it shares
-/// `two_q_hybrid_cache`'s extra `k_in` constructor parameter) and
-/// `hybrid_stats()` -- everything else is shared (see the
-/// generic block above).
-///
-/// Identical to `two_q_fast_admission_hybrid_cache` except that a one-access
-/// object aging out of the FIFO queue is spliced onto the bottom of the main
-/// queue in the slow tier instead of being dropped -- a real DRAM->PMEM copy
-/// paid on the worker thread, not the `set()` path.
-///
-/// Admission places the object
-/// in the one-access FIFO queue **in the fast tier**, so `set()` is a plain
-/// DRAM write rather than a synchronous PMEM allocation on the calling
-/// thread. The consequence to be aware of when sizing: `k_in * max_size` is
-/// now a DRAM reservation carved *out of* `fast_tier_size`, not an
-/// independent PMEM budget, so it directly reduces the room available to
-/// proven-hot main-queue objects.
-///
-/// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
-/// `compile_error!` guards), since they would otherwise define the same
-/// inherent-method impl block on the identical `PaperCache<K, TieredBuffer,
-/// S>` type.
-#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running
-	/// `PaperPolicy::TwoQFastAdmissionReprieveHybrid`, with the given overall
-	/// `max_size`, initial fast-tier byte budget `fast_tier_size`
-	/// (adjustable afterward via [`Self::set_fast_tier_size`]), and `k_in` —
-	/// the one-access FIFO queue's byte budget as a fraction of `max_size`
-	/// (fixed for the lifetime of the cache, rescaled proportionally on
-	/// [`Self::resize`]).
-	///
-	/// Note `k_in` is more consequential here than in `two_q_hybrid_cache`:
-	/// the FIFO queue is DRAM-resident, so its budget is subtracted from
-	/// `fast_tier_size` rather than drawn from PMEM. A `k_in` at or above
-	/// `fast_tier_size / max_size` leaves the main queue no fast segment at
-	/// all — a legitimate configuration, but rarely the intended one.
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `k_in` is outside `[0.0, 1.0]`.
-	///
-	/// # Examples
-	///
-	/// ```ignore
-	/// use paper_cache::{PaperCache, TieredBuffer, CacheTierSize};
-	///
-	/// let cache = PaperCache::<u32, TieredBuffer>::new(
-	///     10_000_000,
-	///     CacheTierSize::Mb(2),
-	///     0.1,
-	/// ).unwrap();
-	///
-	/// cache.set(1u32, b"hello world", None).unwrap();
-	/// assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
-	/// ```
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, k_in: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, k_in, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		k_in: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&k_in) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, k_in, hasher)
-	}
-
-}
-
-/// Single-instance, segmented-FIFO hybrid cache: one `PaperCache<K,
-/// TieredBuffer>` running `PaperPolicy::FifoHybrid`, in contrast with
-/// composing two independent `PaperCache` instances. See the `fifo_hybrid_cache` module docs for the
-/// full design; only `new`/`with_hasher`/`hybrid_stats()` live here --
-/// everything else is shared (see the generic block above).
-///
-/// Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
-/// `two_q_hybrid_cache` (see `lib.rs`'s `compile_error!` guards) since all
-/// four would otherwise define the same inherent-method impl block on the
-/// identical `PaperCache<K, TieredBuffer, S>` type.
-#[cfg(feature = "fifo_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running `PaperPolicy::FifoHybrid`, with
-	/// the given overall `max_size` and initial fast-tier byte budget
-	/// `fast_tier_size` (adjustable afterward via
-	/// [`Self::set_fast_tier_size`]).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero, or
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`.
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		Self::new_hybrid(max_size, fast_tier_size, (), hasher)
-	}
-
-}
-
 /// Single-instance, segmented-LRU hybrid cache with a size-split fast AND
 /// slow tier: same `PaperCache<K, TieredBuffer>` architecture and LRU
 /// admission/promotion/demotion/eviction semantics as `lru_hybrid_cache`,
@@ -3073,7 +2198,7 @@ where
 /// [`Self::set_large_fast_tier_size`]/[`Self::large_fast_tier_size`] and
 /// [`Self::set_size_threshold`]/[`Self::size_threshold`] are this design's
 /// own bespoke accessors, defined here.
-#[cfg(feature = "lru_sized_hybrid_cache")]
+#[cfg(feature = "hybrid_cache_common")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
 	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
@@ -3095,17 +2220,17 @@ where
 	/// or `large_fast_tier_size` resolves to zero bytes or exceeds
 	/// `max_size` (checked independently -- there is no requirement that
 	/// their sum stay under `max_size`). `size_threshold` is never rejected.
-	pub fn new(
+	pub fn new_sized(
 		max_size: CacheSize,
 		small_fast_tier_size: CacheTierSize,
 		large_fast_tier_size: CacheTierSize,
 		size_threshold: CacheTierSize,
 	) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold, Default::default())
+		Self::with_hasher_sized(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold, Default::default())
 	}
 
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
+	/// Creates an empty size-split cache with the supplied hasher. See [`Self::new_sized`].
+	pub fn with_hasher_sized(
 		max_size: CacheSize,
 		small_fast_tier_size: CacheTierSize,
 		large_fast_tier_size: CacheTierSize,
@@ -3242,532 +2367,6 @@ where
 	pub fn size_threshold(&self) -> CacheSize {
 		self.status.hybrid_size_threshold()
 	}
-}
-
-/// Single-instance, segmented-S3-FIFO hybrid cache: one `PaperCache<K,
-/// TieredBuffer>` running `PaperPolicy::S3FifoHybrid`, in contrast with
-/// composing two independent `PaperCache` instances. See the
-/// `s3_fifo_hybrid_cache` module docs for the full design; this impl block
-/// only carries `new`/`with_hasher` (the one-access queue's byte budget,
-/// `one_access_ratio`, is this design's one extra constructor parameter,
-/// same shape as `two_q_hybrid_cache`'s `k_in`) and the
-/// `hybrid_stats()` accessor -- everything else is shared (see the
-/// generic block above).
-///
-/// Admission always lands in the one-access queue, entirely in the slow
-/// tier. A re-access there promotes eagerly and immediately to the top of
-/// the main queue's fast tier. Once in the main queue, an object is never
-/// reordered on access — only a reference bit is set — and ages
-/// unconditionally from fast to slow under fast-tier pressure; only once it
-/// reaches the tail of the main queue (about to be evicted) is that bit
-/// consulted: set gives it a second chance (reinserted at the top of the
-/// fast tier, bit cleared), clear evicts it for real. Terminal evictions
-/// prefer the one-access queue's tail (unconditional — anything left there
-/// was, by construction, never re-accessed) before ever sweeping the main
-/// queue. Every migration physically reallocates the object's bytes (see
-/// [`TieredBuffer`] and `Object::set_data`) — a key is never present in both
-/// tiers at once.
-///
-/// Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
-/// `two_q_hybrid_cache`/`fifo_hybrid_cache`/`lru_sized_hybrid_cache` (see
-/// `lib.rs`'s `compile_error!` guards) since all six would otherwise define
-/// the same inherent-method impl block on the identical `PaperCache<K,
-/// TieredBuffer, S>` type.
-#[cfg(feature = "s3_fifo_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running `PaperPolicy::S3FifoHybrid`,
-	/// with the given overall `max_size`, initial fast-tier byte budget
-	/// `fast_tier_size` (adjustable afterward via
-	/// [`Self::set_fast_tier_size`]), and `one_access_ratio` — the
-	/// one-access queue's byte budget as a fraction of `max_size` (fixed
-	/// for the lifetime of the cache, rescaled proportionally on
-	/// [`Self::resize`], same as `two_q_hybrid_cache`'s `k_in`).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `one_access_ratio` is outside `[0.0, 1.0]`.
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, one_access_ratio: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, one_access_ratio, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		one_access_ratio: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&one_access_ratio) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
-	}
-
-}
-
-/// Single-instance, segmented-2Q hybrid cache with a ghost queue: one
-/// `PaperCache<K, TieredBuffer>` running `PaperPolicy::TwoQGhostHybrid`. See
-/// the `two_q_ghost_hybrid_cache` module docs for the full design; this
-/// impl block only carries `new`/`with_hasher` (`one_access_ratio`, same
-/// shape as `two_q_hybrid_cache`'s `k_in`) and the
-/// `hybrid_stats()` accessor -- everything else is shared (see
-/// the generic block above).
-///
-/// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
-/// `compile_error!` guards) since all would otherwise define the same
-/// inherent-method impl block on the identical `PaperCache<K, TieredBuffer,
-/// S>` type.
-#[cfg(feature = "two_q_ghost_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running `PaperPolicy::TwoQGhostHybrid`,
-	/// with the given overall `max_size`, initial fast-tier byte budget
-	/// `fast_tier_size` (adjustable afterward via
-	/// [`Self::set_fast_tier_size`]), and `k_in` — the one-access FIFO
-	/// queue's byte budget as a fraction of `max_size` (fixed for the
-	/// lifetime of the cache, rescaled proportionally on [`Self::resize`]).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `k_in` is outside `[0.0, 1.0]`.
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, k_in: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, k_in, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		k_in: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&k_in) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, k_in, hasher)
-	}
-
-}
-
-/// Single-instance, segmented-S3-FIFO hybrid cache with a ghost queue: one
-/// `PaperCache<K, TieredBuffer>` running `PaperPolicy::S3FifoGhostHybrid`.
-/// See the `s3_fifo_ghost_hybrid_cache` module docs for the full design;
-/// this impl block only carries `new`/`with_hasher` and the
-/// `hybrid_stats()` accessor -- everything else is shared.
-///
-/// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
-/// `compile_error!` guards).
-#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running `PaperPolicy::S3FifoGhostHybrid`,
-	/// with the given overall `max_size`, initial fast-tier byte budget
-	/// `fast_tier_size`, and `one_access_ratio` — the one-access queue's
-	/// byte budget as a fraction of `max_size`.
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `one_access_ratio` is outside `[0.0, 1.0]`.
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, one_access_ratio: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, one_access_ratio, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		one_access_ratio: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&one_access_ratio) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
-	}
-
-}
-
-/// Single-instance, segmented-S3-FIFO hybrid cache with a ghost queue AND a
-/// demotion-time reference-bit gate: one `PaperCache<K, TieredBuffer>`
-/// running `PaperPolicy::S3FifoGhostLazyDemotionHybrid`. See the
-/// `s3_fifo_ghost_lazy_demotion_hybrid_cache` module docs for the full
-/// design; this impl block only carries `new`/`with_hasher` and the
-/// `hybrid_stats()` accessor -- everything else
-/// is shared.
-///
-/// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
-/// `compile_error!` guards).
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running
-	/// `PaperPolicy::S3FifoGhostLazyDemotionHybrid`, with the given overall
-	/// `max_size`, initial fast-tier byte budget `fast_tier_size`, and
-	/// `one_access_ratio` — the one-access queue's byte budget as a fraction
-	/// of `max_size`.
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `one_access_ratio` is outside `[0.0, 1.0]`.
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, one_access_ratio: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, one_access_ratio, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		one_access_ratio: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&one_access_ratio) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
-	}
-
-}
-
-/// Single-instance, segmented-S3-FIFO hybrid cache with a ghost queue, a
-/// demotion-time reference-bit gate, AND a fast-tier-resident one-access
-/// queue: one `PaperCache<K, TieredBuffer>` running
-/// `PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid`. See the
-/// `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` module docs
-/// for the full design; this impl block only carries `new`/`with_hasher`
-/// and the `hybrid_stats()`
-/// accessor -- everything else is shared.
-///
-/// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
-/// `compile_error!` guards).
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running
-	/// `PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid`, with the
-	/// given overall `max_size`, initial fast-tier byte budget
-	/// `fast_tier_size`, and `one_access_ratio` — the one-access queue's
-	/// byte budget as a fraction of `max_size`, now reserved out of
-	/// `fast_tier_size` rather than being an independent slow-tier budget
-	/// (see the module docs for the accounting).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `one_access_ratio` is outside `[0.0, 1.0]`.
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, one_access_ratio: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, one_access_ratio, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		one_access_ratio: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&one_access_ratio) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
-	}
-
-}
-
-/// Single-instance, segmented-S3-FIFO hybrid cache with a ghost queue, a
-/// demotion-time reference-bit gate, a fast-tier-resident one-access
-/// queue, AND a mid-slow-segment reference-bit checkpoint: one
-/// `PaperCache<K, TieredBuffer>` running
-/// `PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid`. See
-/// the `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache`
-/// module docs for the full design; this impl block only carries
-/// `new`/`with_hasher` and the
-/// `hybrid_stats()`
-/// accessor -- everything else is shared.
-///
-/// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
-/// `compile_error!` guards).
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running
-	/// `PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid`,
-	/// with the given overall `max_size`, initial fast-tier byte budget
-	/// `fast_tier_size`, and `one_access_ratio` — the one-access queue's
-	/// byte budget as a fraction of `max_size`, reserved out of
-	/// `fast_tier_size` (see the module docs for the accounting).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `one_access_ratio` is outside `[0.0, 1.0]`.
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, one_access_ratio: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, one_access_ratio, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		one_access_ratio: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&one_access_ratio) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
-	}
-
-}
-
-/// Single-instance, segmented-S3-FIFO hybrid cache with a demotion-time
-/// reference-bit gate, a fast-tier-resident one-access queue, a
-/// mid-slow-segment reference-bit checkpoint, and no ghost queue: one
-/// `PaperCache<K, TieredBuffer>` running
-/// `PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid`. See
-/// the `s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache`
-/// module docs for the full design; this impl block only carries
-/// `new`/`with_hasher` and the
-/// `hybrid_stats()`
-/// accessor -- everything else is shared.
-///
-/// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
-/// `compile_error!` guards).
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running
-	/// `PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid`,
-	/// with the given overall `max_size`, initial fast-tier byte budget
-	/// `fast_tier_size`, and `one_access_ratio` — the one-access queue's
-	/// byte budget as a fraction of `max_size`, reserved out of
-	/// `fast_tier_size` (see the module docs for the accounting).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `one_access_ratio` is outside `[0.0, 1.0]`.
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, one_access_ratio: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, one_access_ratio, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		one_access_ratio: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&one_access_ratio) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
-	}
-
-}
-
-/// Single-instance, segmented-S3-FIFO hybrid cache with a demotion-time
-/// reference-bit gate, a fast-tier-resident one-access queue, a
-/// mid-slow-segment reference-bit checkpoint, and no ghost queue: one
-/// `PaperCache<K, TieredBuffer>` running
-/// `PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid`. See
-/// the `s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache`
-/// module docs for the full design; this impl block only carries
-/// `new`/`with_hasher` and the
-/// `hybrid_stats()`
-/// accessor -- everything else is shared.
-///
-/// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
-/// `compile_error!` guards).
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running
-	/// `PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid`,
-	/// with the given overall `max_size`, initial fast-tier byte budget
-	/// `fast_tier_size`, and `one_access_ratio` — the one-access queue's
-	/// byte budget as a fraction of `max_size`, reserved out of
-	/// `fast_tier_size` (see the module docs for the accounting).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `one_access_ratio` is outside `[0.0, 1.0]`.
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, one_access_ratio: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, one_access_ratio, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		one_access_ratio: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&one_access_ratio) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
-	}
-
-}
-
-/// Single-instance, segmented-S3-FIFO hybrid cache with a demotion-time
-/// reference-bit gate, a fast-tier-resident one-access queue, a
-/// mid-slow-segment reference-bit checkpoint, and no ghost queue: one
-/// `PaperCache<K, TieredBuffer>` running
-/// `PaperPolicy::S3FifoLazyDemotionReprieveHybrid`. See
-/// the `s3_fifo_lazy_demotion_reprieve_hybrid_cache`
-/// module docs for the full design; this impl block only carries
-/// `new`/`with_hasher` and the
-/// `hybrid_stats()`
-/// accessor -- everything else is shared.
-///
-/// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
-/// `compile_error!` guards).
-#[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running
-	/// `PaperPolicy::S3FifoLazyDemotionReprieveHybrid`,
-	/// with the given overall `max_size`, initial fast-tier byte budget
-	/// `fast_tier_size`, and `one_access_ratio` — the one-access queue's
-	/// byte budget as a fraction of `max_size`. Unlike the fast-admission
-	/// variants this is NOT reserved out of `fast_tier_size` -- the
-	/// one-access queue lives in PMEM here, so it bounds slow-tier footprint
-	/// and the main queue keeps the whole DRAM budget.
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `one_access_ratio` is outside `[0.0, 1.0]`.
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, one_access_ratio: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, one_access_ratio, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		one_access_ratio: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&one_access_ratio) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
-	}
-
-}
-
-/// Single-instance, segmented-S3-FIFO hybrid cache with a demotion-time
-/// reference-bit gate, a fast-tier-resident one-access queue, a
-/// mid-slow-segment reference-bit checkpoint, and no ghost queue: one
-/// `PaperCache<K, TieredBuffer>` running
-/// `PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid`. See
-/// the `s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache`
-/// module docs for the full design; this impl block only carries
-/// `new`/`with_hasher` and the
-/// `hybrid_stats()`
-/// accessor -- everything else is shared.
-///
-/// Mutually exclusive with every other hybrid-cache feature (see `lib.rs`'s
-/// `compile_error!` guards).
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
-impl<K, S> PaperCache<K, TieredBuffer, S>
-where
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` running
-	/// `PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid`,
-	/// with the given overall `max_size`, initial fast-tier byte budget
-	/// `fast_tier_size`, and `one_access_ratio` — the one-access queue's
-	/// byte budget as a fraction of `max_size`, reserved out of
-	/// `fast_tier_size` (see the module docs for the accounting).
-	///
-	/// # Errors
-	///
-	/// Returns [`CacheError::ZeroCacheSize`] if `max_size` is zero,
-	/// [`CacheError::InvalidFastTierSize`] if `fast_tier_size` resolves to
-	/// zero bytes or exceeds `max_size`, or [`CacheError::InvalidPolicy`] if
-	/// `one_access_ratio` is outside `[0.0, 1.0]`.
-	pub fn new(max_size: CacheSize, fast_tier_size: CacheTierSize, one_access_ratio: f64) -> Result<Self, CacheError> {
-		Self::with_hasher(max_size, fast_tier_size, one_access_ratio, Default::default())
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher. See [`Self::new`].
-	pub fn with_hasher(
-		max_size: CacheSize,
-		fast_tier_size: CacheTierSize,
-		one_access_ratio: f64,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if !(0.0..=1.0).contains(&one_access_ratio) {
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		Self::new_hybrid(max_size, fast_tier_size, one_access_ratio, hasher)
-	}
-
 }
 
 // Tests for global_hashtable_pmem alone (without key_value_pmem)
@@ -3910,14 +2509,12 @@ mod test_new_features {
 /// PMEM-capable hardware.
 #[cfg(all(test, feature = "lru_hybrid_cache"))]
 mod test_lru_hybrid_cache {
+	use crate::PaperPolicy;
     use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     #[test]
     fn basic_construction_and_fast_tier_only_roundtrip() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), // fast tier == whole cache: no demotion possible
-        ).expect("cache should construct");
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::LruHybrid).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
         assert!(cache.has(&1u32));
@@ -3941,16 +2538,16 @@ mod test_lru_hybrid_cache {
     #[test]
     fn invalid_fast_tier_size_is_rejected() {
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000)),
+            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000), PaperPolicy::LruHybrid),
             Err(CacheError::InvalidFastTierSize),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0)),
+            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0), PaperPolicy::LruHybrid),
             Err(CacheError::InvalidFastTierSize),
         ));
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500))
+        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), PaperPolicy::LruHybrid)
             .expect("cache should construct");
 
         assert!(matches!(
@@ -3963,8 +2560,7 @@ mod test_lru_hybrid_cache {
     fn ttl_is_preserved_across_a_set() {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::LruHybrid).expect("cache should construct");
 
         cache.set(1u32, b"value", Some(60)).expect("set should succeed");
         assert!(cache.ttl(&1u32, Some(120)).is_ok());
@@ -3979,14 +2575,12 @@ mod test_lru_hybrid_cache {
 /// `tests/hybrid_cache_integration.rs`.
 #[cfg(all(test, feature = "lfu_hybrid_cache"))]
 mod test_lfu_hybrid_cache {
+	use crate::PaperPolicy;
     use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     #[test]
     fn basic_construction_and_fast_tier_only_roundtrip() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), // fast tier == whole cache: no demotion possible
-        ).expect("cache should construct");
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::LfuHybrid).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
         assert!(cache.has(&1u32));
@@ -4010,16 +2604,16 @@ mod test_lfu_hybrid_cache {
     #[test]
     fn invalid_fast_tier_size_is_rejected() {
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000)),
+            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000), PaperPolicy::LfuHybrid),
             Err(CacheError::InvalidFastTierSize),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0)),
+            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0), PaperPolicy::LfuHybrid),
             Err(CacheError::InvalidFastTierSize),
         ));
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500))
+        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), PaperPolicy::LfuHybrid)
             .expect("cache should construct");
 
         assert!(matches!(
@@ -4032,8 +2626,7 @@ mod test_lfu_hybrid_cache {
     fn ttl_is_preserved_across_a_set() {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::LfuHybrid).expect("cache should construct");
 
         cache.set(1u32, b"value", Some(60)).expect("set should succeed");
         assert!(cache.ttl(&1u32, Some(120)).is_ok());
@@ -4050,15 +2643,14 @@ mod test_lfu_hybrid_cache {
 /// module doc for details). The full tier-crossing coverage lives there.
 #[cfg(all(test, feature = "two_q_hybrid_cache"))]
 mod test_two_q_hybrid_cache {
+	use crate::PaperPolicy;
     use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     #[test]
     fn basic_construction_and_slow_tier_admission_roundtrip() {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            0.5,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::TwoQHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
         assert!(cache.has(&1u32));
@@ -4081,16 +2673,16 @@ mod test_two_q_hybrid_cache {
     #[test]
     fn invalid_fast_tier_size_is_rejected() {
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000), 0.5),
+            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000), PaperPolicy::TwoQHybrid(0.5)),
             Err(CacheError::InvalidFastTierSize),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0), 0.5),
+            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0), PaperPolicy::TwoQHybrid(0.5)),
             Err(CacheError::InvalidFastTierSize),
         ));
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), 0.5)
+        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), PaperPolicy::TwoQHybrid(0.5))
             .expect("cache should construct");
 
         assert!(matches!(
@@ -4102,12 +2694,12 @@ mod test_two_q_hybrid_cache {
     #[test]
     fn invalid_k_in_is_rejected() {
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), 1.5),
+            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), PaperPolicy::TwoQHybrid(1.5)),
             Err(CacheError::InvalidPolicy),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), -0.1),
+            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), PaperPolicy::TwoQHybrid(-0.1)),
             Err(CacheError::InvalidPolicy),
         ));
     }
@@ -4116,9 +2708,7 @@ mod test_two_q_hybrid_cache {
     fn ttl_is_preserved_across_a_set() {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            0.5,
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::TwoQHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"value", Some(60)).expect("set should succeed");
         assert!(cache.ttl(&1u32, Some(120)).is_ok());
@@ -4133,14 +2723,12 @@ mod test_two_q_hybrid_cache {
 /// overwrite path) lives in `tests/hybrid_cache_integration.rs`.
 #[cfg(all(test, feature = "fifo_hybrid_cache"))]
 mod test_fifo_hybrid_cache {
+	use crate::PaperPolicy;
     use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
     #[test]
     fn basic_construction_and_fast_tier_only_roundtrip() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), // fast tier == whole cache: no demotion possible
-        ).expect("cache should construct");
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::FifoHybrid).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
         assert!(cache.has(&1u32));
@@ -4164,16 +2752,16 @@ mod test_fifo_hybrid_cache {
     #[test]
     fn invalid_fast_tier_size_is_rejected() {
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000)),
+            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000), PaperPolicy::FifoHybrid),
             Err(CacheError::InvalidFastTierSize),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0)),
+            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0), PaperPolicy::FifoHybrid),
             Err(CacheError::InvalidFastTierSize),
         ));
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500))
+        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), PaperPolicy::FifoHybrid)
             .expect("cache should construct");
 
         assert!(matches!(
@@ -4186,8 +2774,7 @@ mod test_fifo_hybrid_cache {
     fn ttl_is_preserved_across_a_set() {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::FifoHybrid).expect("cache should construct");
 
         cache.set(1u32, b"value", Some(60)).expect("set should succeed");
         assert!(cache.ttl(&1u32, Some(120)).is_ok());
@@ -4201,8 +2788,7 @@ mod test_fifo_hybrid_cache {
         // still in the fast tier should stay fast and just work.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-        ).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::FifoHybrid).expect("cache should construct");
 
         cache.set(1u32, b"hello", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
@@ -4227,7 +2813,7 @@ mod test_lru_sized_hybrid_cache {
 
     #[test]
     fn basic_construction_and_fast_tier_only_roundtrip() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(1_000_000), // small segment == whole cache
             CacheTierSize::Bytes(1_000_000), // large segment == whole cache
@@ -4264,27 +2850,27 @@ mod test_lru_sized_hybrid_cache {
     #[test]
     fn invalid_fast_tier_size_is_rejected() {
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(
+            PaperCache::<u32, TieredBuffer>::new_sized(
                 1000, CacheTierSize::Bytes(2000), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
             ),
             Err(CacheError::InvalidFastTierSize),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(
+            PaperCache::<u32, TieredBuffer>::new_sized(
                 1000, CacheTierSize::Bytes(0), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
             ),
             Err(CacheError::InvalidFastTierSize),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(
+            PaperCache::<u32, TieredBuffer>::new_sized(
                 1000, CacheTierSize::Bytes(500), CacheTierSize::Bytes(2000), CacheTierSize::Bytes(100),
             ),
             Err(CacheError::InvalidFastTierSize),
         ));
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1000, CacheTierSize::Bytes(500), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
         ).expect("cache should construct");
 
@@ -4301,7 +2887,7 @@ mod test_lru_sized_hybrid_cache {
 
     #[test]
     fn ttl_is_preserved_across_a_set() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(1_000_000),
             CacheTierSize::Bytes(1_000_000),
@@ -4315,7 +2901,7 @@ mod test_lru_sized_hybrid_cache {
 
     #[test]
     fn overwrite_of_a_still_fast_key_stays_fast_and_keeps_working() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(1_000_000),
             CacheTierSize::Bytes(1_000_000),

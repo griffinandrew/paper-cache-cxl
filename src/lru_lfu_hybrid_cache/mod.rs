@@ -38,49 +38,4 @@ mod stats;
 pub use crate::tiered_buffer::TieredBuffer;
 pub use stats::LruLfuHybridStats;
 
-/// Marker type selecting `lru_lfu_hybrid_cache`'s behavior for the shared
-/// generic `impl<K, S> PaperCache<K, TieredBuffer, S>` block in `lib.rs`
-/// (see `crate::hybrid_policy::HybridPolicy`).
-pub struct LruLfuHybridPolicy;
 
-impl crate::hybrid_policy::HybridPolicy for LruLfuHybridPolicy {
-	type Stats = LruLfuHybridStats;
-	/// `promote_k`: accesses a slow-tier object must accumulate to earn the
-	/// fast tier. Carried into the seeded `PaperPolicy` value.
-	type ExtraConfig = u16;
-
-	fn seed_policy(promote_k: u16) -> crate::PaperPolicy {
-		crate::PaperPolicy::LruLfuHybrid(promote_k)
-	}
-
-	fn stats_from_status(status: &crate::status::AtomicStatus) -> LruLfuHybridStats {
-		status.hybrid_stats()
-	}
-
-	/// A brand-new key is admitted to the fast tier; an **existing** key is
-	/// written back to whichever tier it currently occupies.
-	///
-	/// The second half is what makes the frequency gate real. An overwrite
-	/// is an access, not an automatic promotion (see the stack's module
-	/// doc), so a `set()` on a slow-tier key must not be built in DRAM and
-	/// then corrected back to PMEM — it is written straight to PMEM, and if
-	/// the stack decides that access crossed `promote_k` it emits a
-	/// `Tier::Fast` migration that moves it. Same shape as
-	/// `fifo_hybrid_cache`'s, which needs an existing key's tier for its own
-	/// reasons.
-	fn admission_tier<K>(
-		hashed_key: crate::HashedKey,
-		_status: &crate::status::AtomicStatus,
-		objects: &crate::hybrid_policy::HybridObjectMap<K>,
-	) -> crate::Tier {
-		use crate::object_store::ObjectStore;
-
-		let existing_tier = objects.get_ref(&hashed_key)
-			.map(|object| if object.data().is_fast() { crate::Tier::Fast } else { crate::Tier::Slow });
-
-		match existing_tier {
-			Some(crate::Tier::Slow) => crate::Tier::Slow,
-			Some(crate::Tier::Fast) | None => crate::Tier::Fast,
-		}
-	}
-}
