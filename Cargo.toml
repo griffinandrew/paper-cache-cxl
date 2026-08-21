@@ -412,7 +412,28 @@ s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache = ["key_va
 # `any(...)` feature list that must be hand-edited every time a new hybrid
 # variant is added, and is silently wrong (the variant gets no overhead
 # reservation, or fails to compile) whenever that edit is forgotten.
-hybrid_cache_common = []
+#
+# It also selects the tier allocator for every hybrid variant: enabling it
+# turns on `numa_jemalloc`, so all 18 designs get NUMA-bound jemalloc arenas
+# rather than UMF/TBB. Set `hybrid_tbb` alongside to go back.
+hybrid_cache_common = ["numa_jemalloc"]
+
+# Revert a hybrid build to the UMF/TBB pairing.
+#
+# Hybrid caches allocate both tiers through NUMA-bound jemalloc arenas by
+# default (see `numa_jemalloc`). Measured on cluster12 (15 GB cap / 5 GB fast
+# tier), with the `dram_alloc_accounting` counter compiled out of both so the
+# comparison is even:
+#
+#              SET latency        peak RSS        node 0
+#   1 client   -16% vs TBB        -17%            -13%
+#   8 clients  -13% vs TBB        -20%            -23%
+#
+# jemalloc is ahead on every axis, and the memory gap is the decisive one --
+# TBB held ~1.75x the memory in use and would not return it, which is what
+# drove the fast-tier RSS blowup. This feature exists so that comparison stays
+# reproducible, not because TBB is a reasonable default.
+hybrid_tbb = []
 
 # NUMA-bound jemalloc arenas (src/numa_alloc.rs). Each node gets its own
 # arenas whose extents are mmap'd and mbind'd to that node before jemalloc
@@ -425,6 +446,21 @@ hybrid_cache_common = []
 # heap, bindgen'd C libraries and pthread stacks outside its reach. Pair it
 # with `numactl --membind=0` if the whole process must be bound.
 numa_jemalloc = []
+
+# Track live requested bytes on node 0, for the usable/requested decomposition
+# `umf_dram_stats` reports.
+#
+# OFF by default because the counter sits on the allocation path of
+# `DRAMObjects`, which is the *global* allocator in the UMF/TBB build -- so
+# every allocation in the process, on every thread, did a read-modify-write on
+# one global cache line. That is a per-allocation cost the `numa_jemalloc`
+# build does not carry (its counters live in the extent hooks, firing once per
+# multi-MB extent, and jemalloc reports `stats.allocated` natively), so leaving
+# it on made every TBB-vs-jemalloc latency comparison an unequal contest --
+# increasingly so with concurrency, where the contended line is worst.
+#
+# Enable it when the decomposition is the point; leave it off when latency is.
+dram_alloc_accounting = []
 
 
 

@@ -774,7 +774,7 @@ const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 63;
 /// cache's metadata will skew it slightly.
 #[cfg(all(
 	feature = "hybrid_cache_common",
-	not(any(feature = "tikv_jemalloc_global", feature = "numa_jemalloc"))
+	not(any(feature = "tikv_jemalloc_global", all(feature = "numa_jemalloc", not(feature = "hybrid_tbb"))))
 ))]
 const DEFAULT_RESIDENT_FACTOR: f64 = 1.37;
 
@@ -785,7 +785,7 @@ const DEFAULT_RESIDENT_FACTOR: f64 = 1.37;
 /// number, shrinking their effective fast tier for no reason.
 #[cfg(all(
 	feature = "hybrid_cache_common",
-	any(feature = "tikv_jemalloc_global", feature = "numa_jemalloc")
+	any(feature = "tikv_jemalloc_global", all(feature = "numa_jemalloc", not(feature = "hybrid_tbb")))
 ))]
 const DEFAULT_RESIDENT_FACTOR: f64 = 1.12;
 

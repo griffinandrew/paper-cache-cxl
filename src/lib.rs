@@ -484,7 +484,7 @@ compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' 
 #[cfg(all(feature = "two_q_fast_admission_reprieve_hybrid_cache", feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache"))]
 compile_error!("Cannot enable both 'two_q_fast_admission_reprieve_hybrid_cache' and 's3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache' features simultaneously. Both define their own PaperCache<K, TieredBuffer, S> impl block; choose only one hybrid-cache flavor.");
 
-#[cfg(all(feature = "numa_jemalloc", any(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global")))]
+#[cfg(all(feature = "numa_jemalloc", not(feature = "hybrid_tbb"), any(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global")))]
 compile_error!("'numa_jemalloc' installs its own #[global_allocator]; it cannot be combined with 'jemalloc_cxl_slow_tier' or 'tikv_jemalloc_global'.");
 
 /// Node-0-bound jemalloc arenas as the process allocator.
@@ -494,7 +494,7 @@ compile_error!("'numa_jemalloc' installs its own #[global_allocator]; it cannot 
 /// jemalloc is built `JEMALLOC_PREFIX=_rjem_` and so does not interpose
 /// `malloc`. Pair with `numactl --membind=0` when the whole process must be
 /// bound.
-#[cfg(feature = "numa_jemalloc")]
+#[cfg(all(feature = "numa_jemalloc", not(feature = "hybrid_tbb")))]
 #[global_allocator]
 static GLOBAL: numa_alloc::FastAlloc = numa_alloc::NumaAlloc;
 
@@ -507,7 +507,7 @@ use tikv_jemallocator::Jemalloc;
 
 #[cfg(any(feature = "hashbrown_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "all_dram", feature = "jemalloc_cxl_slow_tier"))]
 pub mod allocator;
-#[cfg(feature = "numa_jemalloc")]
+#[cfg(all(feature = "numa_jemalloc", not(feature = "hybrid_tbb")))]
 pub mod numa_alloc;
 
 use std::arch::x86_64::{_mm_clflush, _mm_sfence};
@@ -1017,6 +1017,14 @@ active/allocated={:.4} resident/active={:.4} resident/allocated={:.4}",
 /// `usable/requested` is size-class rounding, and the gap from usable to
 /// resident is external fragmentation plus unreturned pages.
 pub fn umf_dram_stats() -> String {
+	if !cfg!(feature = "dram_alloc_accounting") {
+		// Saying so beats reporting requested=0, which reads as a live
+		// measurement of an empty pool.
+		return String::from(
+			"UMFDRAM requested=<unmeasured: build with --features dram_alloc_accounting>",
+		);
+	}
+
 	let (requested, usable) = allocator::dram_pool_stats();
 
 	let ratio = if requested == 0 {
@@ -1035,7 +1043,7 @@ pub fn jemalloc_stats() -> Option<String> {
 	None
 }
 
-#[cfg(not(any(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global", feature = "numa_jemalloc")))]
+#[cfg(not(any(feature = "jemalloc_cxl_slow_tier", feature = "tikv_jemalloc_global", all(feature = "numa_jemalloc", not(feature = "hybrid_tbb")))))]
 #[global_allocator]
 static GLOBAL: allocator::DRAMObjects = allocator::DRAMObjects;
 

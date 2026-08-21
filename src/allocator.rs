@@ -214,6 +214,25 @@ unsafe impl allocator_api2::alloc::Allocator for HybridObjects {
 pub static LIVE_REQUESTED_DRAM: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Record an allocation against the live-requested counter, or compile to
+/// nothing.
+///
+/// Gated because this sits on the global allocator's hot path: an
+/// unconditional atomic RMW here is paid by every allocation in the process
+/// and contends across all threads. See the `dram_alloc_accounting` feature.
+#[inline(always)]
+fn account_alloc(_bytes: usize) {
+    #[cfg(feature = "dram_alloc_accounting")]
+    LIVE_REQUESTED_DRAM.fetch_add(_bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `account_alloc` counterpart.
+#[inline(always)]
+fn account_dealloc(_bytes: usize) {
+    #[cfg(feature = "dram_alloc_accounting")]
+    LIVE_REQUESTED_DRAM.fetch_sub(_bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[derive(Clone, Copy)]
 pub struct DRAMObjects;
 
@@ -302,7 +321,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
 
         let ptr = allocator_bindings::umf_alloc(Self::NODE_DRAM,layout.size(), layout.align()) as *mut u8;
         if !ptr.is_null() {
-            LIVE_REQUESTED_DRAM.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+            account_alloc(layout.size());
         }
         if ptr.is_null() {
             eprintln!("DRAMObjects: UMF alloc failed for {} bytes", layout.size());
@@ -337,7 +356,7 @@ unsafe impl GlobalAlloc for DRAMObjects {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE_REQUESTED_DRAM.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        account_dealloc(layout.size());
         allocator_bindings::umf_dealloc(Self::NODE_DRAM, ptr as *mut std::ffi::c_void);
 
         #[cfg(debug_assertions)]
@@ -630,7 +649,7 @@ unsafe impl GlobalAlloc for UnifiedAllocator {
 
         let ptr = allocator_bindings::umf_alloc(Self::NODE_DRAM,layout.size(), layout.align()) as *mut u8;
         if !ptr.is_null() {
-            LIVE_REQUESTED_DRAM.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+            account_alloc(layout.size());
         }
         if ptr.is_null() {
             println!("DRAMObjects: UMF alloc failed for {} bytes", layout.size());
@@ -665,7 +684,7 @@ unsafe impl GlobalAlloc for UnifiedAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE_REQUESTED_DRAM.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        account_dealloc(layout.size());
         allocator_bindings::umf_dealloc(Self::NODE_DRAM, ptr as *mut std::ffi::c_void);
 
         #[cfg(debug_assertions)]
