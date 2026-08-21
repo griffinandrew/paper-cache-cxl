@@ -6,10 +6,6 @@
  */
 
 
-/// TEMPORARY DIAGNOSTIC: batch-size histograms for tier migrations and
-/// evictions, to decide whether parallelising the migration copies is
-/// worthwhile on a given trace. Buckets are log2: [0]=0, [1]=1, [2]=2-3,
-/// [3]=4-7 ... [15]=16384+. Dumped to stderr periodically.
 /// Persistent migration queue: a standing pool that drains physical tier
 /// copies continuously, decoupled from batch boundaries.
 ///
@@ -41,8 +37,9 @@
 /// The counts therefore lead the physical copies slightly; they converge once
 /// the queue drains.
 ///
-/// Off unless `MIGRATION_QUEUE_THREADS` is set to a non-zero value, in which
-/// case migrations apply inline exactly as before.
+/// On by default: `MIGRATION_QUEUE_THREADS` sets the consumer count, and 0
+/// disables the queue entirely, in which case migrations apply inline on the
+/// worker exactly as before.
 #[cfg(feature = "hybrid_cache_common")]
 pub mod migration_queue {
 	use std::sync::atomic::{AtomicU64, Ordering};
@@ -317,10 +314,24 @@ pub mod parallel_migration {
 	use crate::HashedKey;
 	use crate::worker::policy::policy_stack::Tier;
 
-	/// Batches below this many objects are applied inline on the worker.
-	/// Chosen well above the 0-1 object batches the drain-to-ceiling cadence
-	/// produces, and far below the ~626K batches a wide watermark band
-	/// produces, so the default only ever engages on genuinely large passes.
+	/// Zero, i.e. parallel application is off by default: every batch
+	/// runs inline on the worker regardless of size. Set
+	/// `PARALLEL_MIGRATION_THRESHOLD` to a non-zero value to re-enable
+	/// the fan-out.
+	///
+	/// A measured dead end rather than a tuned value. The batch-size
+	/// distribution leaves nothing to fan out: 99.4% of demotion volume
+	/// arrives as single-object batches, so a threshold low enough to
+	/// engage at all would mostly have the pool paying dispatch cost to
+	/// hand one object to one thread. The ~626K-object passes this
+	/// module was built for only appear under a wide watermark band, and
+	/// are far too rare to pay back the machinery -- so the value is 0,
+	/// not a compromise picked somewhere between 1 and that size.
+	///
+	/// Superseded by the `migration_queue` module above, which takes the
+	/// same win without depending on batch size: a standing pool of
+	/// consumers sharded by key hash drains migrations off the worker as
+	/// they are produced, one object at a time.
 	pub const DEFAULT_THRESHOLD: usize = 0;
 
 	/// Pool size when parallel application does engage.
@@ -387,6 +398,10 @@ pub mod parallel_migration {
 	}
 }
 
+/// TEMPORARY DIAGNOSTIC: batch-size histograms for tier migrations and
+/// evictions, to decide whether parallelising the migration copies is
+/// worthwhile on a given trace. Buckets are log2: [0]=0, [1]=1, [2]=2-3,
+/// [3]=4-7 ... [15]=16384+. Dumped to stderr periodically.
 pub mod migstats {
 	use std::sync::atomic::{AtomicU64, Ordering};
 	use std::sync::OnceLock;
