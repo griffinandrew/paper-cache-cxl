@@ -54,27 +54,27 @@ jemalloc_cxl = { path = "jemalloc_cxl", optional = true, default-features = fals
 
 [features]
 # Core feature to enable key and value storage in PMEM
-key_value_pmem = []
+key_value_pmem = ["numa_jemalloc"]
 
 # Extended PMEM feature: places BOTH key bytes AND value bytes each in their own
 # BufferPMEM (Hybrid-allocated persistent memory).  Implies key_value_pmem so
 # that the Hybrid allocator and all other PMEM infrastructure are available.
-key_pmem_value_pmem = ["key_value_pmem"]
+key_pmem_value_pmem = ["key_value_pmem", "numa_jemalloc"]
 
 # All data structures in DRAM (no PMEM usage)
-all_dram = []
+all_dram = ["numa_jemalloc"]
 
 # Enable the tiering manager functionality
 enable_tiering_manager = []
 
 # Place tiering manager's hashtable in PMEM (requires enable_tiering_manager + key_value_pmem)
-tiering_hashtable_pmem = []
+tiering_hashtable_pmem = ["numa_jemalloc"]
 
 # Place global hashtable in PMEM (requires key_value_pmem)
-global_hashtable_pmem = []
+global_hashtable_pmem = ["numa_jemalloc"]
 
 # Use hashbrown HashMap as global hashtable in DRAM (for performance comparison)
-hashbrown_dram = []
+hashbrown_dram = ["numa_jemalloc"]
 
 # Enable PMEM-backed eviction stacks. Eviction-stack metadata
 # (PmemHashList/PmemVecList/EntryMap in worker/policy/policy_stack/) is
@@ -85,7 +85,7 @@ hashbrown_dram = []
 # separate jemalloc_cxl-backed `EvictionStackAllocator` (removed, then
 # brought back gated on `jemalloc_cxl_slow_tier` instead, currently unused
 # by this feature -- see `CLAUDE.md`).
-eviction_stacks_pmem = []
+eviction_stacks_pmem = ["numa_jemalloc"]
 
 #to emnable 3 tier based data movement
 hashtable_tiering = []

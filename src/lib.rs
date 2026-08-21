@@ -513,7 +513,13 @@ pub mod numa_alloc;
 use std::arch::x86_64::{_mm_clflush, _mm_sfence};
 
 // `Hybrid` is the crate-wide PMEM allocator alias: every PMEM feature routes
-// through UMF's TBB-backed pool (`HybridObjects`, see `allocator.rs`).
+// through node-1-bound jemalloc arenas (`numa_alloc::SlowAlloc`).
+//
+// This was UMF's TBB-backed pool. Both place memory on NUMA node 1 -- the
+// "PMEM" features were never using persistent-memory hardware, only far
+// memory -- so the swap is an equivalent placement, not an approximation.
+// jemalloc measured 16% lower SET latency and 17% lower peak RSS on
+// cluster12, and TBB retained ~1.75x the memory in use without returning it.
 #[cfg(any(
     feature = "key_value_pmem",
     feature = "key_pmem_value_pmem",
@@ -521,7 +527,7 @@ use std::arch::x86_64::{_mm_clflush, _mm_sfence};
     feature = "tiering_hashtable_pmem",
     feature = "eviction_stacks_pmem",
 ))]
-pub(crate) use crate::allocator::HybridObjects as Hybrid;
+pub(crate) use crate::numa_alloc::SlowObjects as Hybrid;
 
 // UMF bindings are always needed when any PMEM feature is active.
 // The build script guarantees that the UMF C symbols are always present:

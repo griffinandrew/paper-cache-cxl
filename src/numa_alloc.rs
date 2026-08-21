@@ -790,6 +790,81 @@ pub struct NumaAlloc<const NODE: u32>;
 pub type FastAlloc = NumaAlloc<NODE_FAST>;
 pub type SlowAlloc = NumaAlloc<NODE_SLOW>;
 
+/// The node-1 allocator as a plain unit struct.
+///
+/// `SlowAlloc` is a type alias to a generic struct, and an alias lives only in
+/// the type namespace -- so `Box<[u8], SlowAlloc>` resolves but
+/// `Box::new_in(x, SlowAlloc)` does not. The crate-wide `Hybrid` name is used
+/// in both positions (it replaced `HybridObjects`, an ordinary unit struct),
+/// so the replacement has to occupy both namespaces too. Delegates
+/// everything to `NumaAlloc<NODE_SLOW>`.
+#[derive(Clone, Copy, Default)]
+pub struct SlowObjects;
+
+unsafe impl std::alloc::GlobalAlloc for SlowObjects {
+	unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+		unsafe { std::alloc::GlobalAlloc::alloc(&NumaAlloc::<NODE_SLOW>, layout) }
+	}
+
+	unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+		unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&NumaAlloc::<NODE_SLOW>, layout) }
+	}
+
+	unsafe fn realloc(
+		&self,
+		ptr: *mut u8,
+		layout: std::alloc::Layout,
+		new_size: usize,
+	) -> *mut u8 {
+		unsafe { std::alloc::GlobalAlloc::realloc(&NumaAlloc::<NODE_SLOW>, ptr, layout, new_size) }
+	}
+
+	unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+		unsafe { std::alloc::GlobalAlloc::dealloc(&NumaAlloc::<NODE_SLOW>, ptr, layout) }
+	}
+}
+
+unsafe impl std::alloc::Allocator for SlowObjects {
+	fn allocate(
+		&self,
+		layout: std::alloc::Layout,
+	) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
+		std::alloc::Allocator::allocate(&NumaAlloc::<NODE_SLOW>, layout)
+	}
+
+	fn allocate_zeroed(
+		&self,
+		layout: std::alloc::Layout,
+	) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
+		std::alloc::Allocator::allocate_zeroed(&NumaAlloc::<NODE_SLOW>, layout)
+	}
+
+	unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: std::alloc::Layout) {
+		unsafe { std::alloc::Allocator::deallocate(&NumaAlloc::<NODE_SLOW>, ptr, layout) }
+	}
+}
+
+unsafe impl allocator_api2::alloc::Allocator for SlowObjects {
+	fn allocate(
+		&self,
+		layout: std::alloc::Layout,
+	) -> Result<std::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+		allocator_api2::alloc::Allocator::allocate(&NumaAlloc::<NODE_SLOW>, layout)
+	}
+
+	fn allocate_zeroed(
+		&self,
+		layout: std::alloc::Layout,
+	) -> Result<std::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+		allocator_api2::alloc::Allocator::allocate_zeroed(&NumaAlloc::<NODE_SLOW>, layout)
+	}
+
+	unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: std::alloc::Layout) {
+		unsafe { allocator_api2::alloc::Allocator::deallocate(&NumaAlloc::<NODE_SLOW>, ptr, layout) }
+	}
+}
+
+
 impl<const NODE: u32> NumaAlloc<NODE> {
 	#[inline]
 	unsafe fn raw_alloc(&self, layout: std::alloc::Layout, zeroed: bool) -> *mut u8 {
@@ -904,6 +979,38 @@ unsafe impl<const NODE: u32> std::alloc::Allocator for NumaAlloc<NODE> {
 		std::ptr::NonNull::new(ptr)
 			.map(|p| std::ptr::NonNull::slice_from_raw_parts(p, layout.size()))
 			.ok_or(std::alloc::AllocError)
+	}
+
+	unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: std::alloc::Layout) {
+		unsafe { std::alloc::GlobalAlloc::dealloc(self, ptr.as_ptr(), layout) }
+	}
+}
+
+/// The same allocator through `allocator_api2`'s trait.
+///
+/// The PMEM collections (`hashbrown` maps and vectors parameterised by an
+/// allocator) take `allocator_api2::alloc::Allocator`, not the unstable std
+/// one, so serving them requires both. This is the trait `HybridObjects`
+/// implemented for the UMF/TBB pool.
+unsafe impl<const NODE: u32> allocator_api2::alloc::Allocator for NumaAlloc<NODE> {
+	fn allocate(
+		&self,
+		layout: std::alloc::Layout,
+	) -> Result<std::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+		let ptr = unsafe { self.raw_alloc(layout, false) };
+		std::ptr::NonNull::new(ptr)
+			.map(|p| std::ptr::NonNull::slice_from_raw_parts(p, layout.size()))
+			.ok_or(allocator_api2::alloc::AllocError)
+	}
+
+	fn allocate_zeroed(
+		&self,
+		layout: std::alloc::Layout,
+	) -> Result<std::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+		let ptr = unsafe { self.raw_alloc(layout, true) };
+		std::ptr::NonNull::new(ptr)
+			.map(|p| std::ptr::NonNull::slice_from_raw_parts(p, layout.size()))
+			.ok_or(allocator_api2::alloc::AllocError)
 	}
 
 	unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: std::alloc::Layout) {
