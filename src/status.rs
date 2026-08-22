@@ -42,8 +42,6 @@ use crate::hybrid_stats::HybridStats;
 /// fields directly is deliberate: it means `hybrid_stats()` can never
 /// disagree with `{design}_hybrid_stats()` about the same counter, because
 /// there is only one place either value is loaded from.
-#[cfg(feature = "hybrid_cache_common")]
-
 #[derive(Debug)]
 pub struct Status {
 	pid: u32,
@@ -508,6 +506,7 @@ impl AtomicStatus {
 		self.hybrid_slow_objects.store(slow_objects, Ordering::Relaxed);
 	}
 
+	#[cfg(feature = "hybrid_cache_common")]
 	/// The size-split (`lru_sized`) design's four-segment gauges. Writes only
 	/// the granular small/large fields; the two-tier totals stay owned by
 	/// [`Self::set_hybrid_gauges`], which every hybrid design calls.
@@ -532,6 +531,7 @@ impl AtomicStatus {
 		self.hybrid_large_slow_objects.store(large_slow_objects, Ordering::Relaxed);
 	}
 
+	#[cfg(feature = "hybrid_cache_common")]
 	/// Point-in-time snapshot of the hybrid tier counters and gauges,
 	/// whichever hybrid design is running.
 	#[must_use]
