@@ -22,14 +22,16 @@ feature.
 
 ```
 src/
-  lib.rs                      PaperCache<K, V, S> — the core cache type (~4400 lines). Repeated
-                               per storage combination behind #[cfg(feature = ...)] impl blocks;
-                               grep for `impl<K, S> PaperCache<K, TieredBuffer` to find each
-                               hybrid design's own new/with_hasher/stats block. Also carries the
-                               compile_error! guards making the hybrid features mutually
-                               exclusive -- one per pair of the 18 designs, covering 152 of the
-                               153 (fifo + two_q_fast_admission has a malformed cfg and is
-                               unguarded).
+  lib.rs                      PaperCache<K, V, S> — the core cache type (~2900 lines). Repeated
+                               per storage combination behind #[cfg(feature = ...)] impl blocks.
+                               Grepping `impl<K, S> PaperCache<K, TieredBuffer` finds exactly
+                               TWO blocks, both gated only on hybrid_cache_common and shared by
+                               all 18 designs: the engine (new(max_size, fast_tier_size,
+                               policy), with_hasher, the cache operations, hybrid_stats()) and
+                               a second holding the size-split design's new_sized/
+                               with_hasher_sized. Carries exactly one compile_error!, rejecting
+                               hashbrown_dram + global_hashtable_pmem -- unrelated to the
+                               designs. The 153 pairwise hybrid guards are gone.
   policy.rs                   PaperPolicy — the plain policies (Lfu, Fifo, Clock, Sieve, Lru,
                                Mru, TwoQ, Arc, SThreeFifo) plus one variant per hybrid design
                                (LruHybrid, LfuHybrid, TwoQHybrid(f64), S3FifoHybrid(f64), ...),
@@ -41,11 +43,14 @@ src/
   tiered_buffer.rs            TieredBuffer — Fast(Box<[u8]>) / Slow(Box<[u8], Hybrid>), the
                                value type every hybrid design stores. Tier is a property of the
                                value; a live object's bytes are in exactly one tier.
-  hybrid_policy.rs            HybridPolicy trait — the per-design marker (admission_tier,
-                               seed_policy, stats_from_status) parameterizing the one shared
-                               generic impl block in lib.rs.
-  hybrid_stats.rs             HybridStats — feature-neutral 3-counter/4-gauge snapshot, so a
-                               consumer need not cfg-cascade over all 18 designs.
+  hybrid_policy.rs            No trait, no marker types: exports HybridObjectMap<K> and the free
+                               function admission_tier(policy, hashed_key, status, objects)
+                               -> Tier, a runtime match over PaperPolicy with one arm per
+                               design's admission rule, called from set() in lib.rs.
+  hybrid_stats.rs             HybridStats — design-neutral snapshot: 3 counters and 12 gauges
+                               (4 tier gauges plus 8 size-split gauges that only LruSizedHybrid
+                               populates). The single stats accessor for every design; the
+                               per-design *_hybrid_stats() methods are gone.
   numa_alloc.rs               Node-bound jemalloc arenas. NumaAlloc<NODE_FAST> is the crate's
                                #[global_allocator]; SlowObjects (aliased crate-wide as `Hybrid`)
                                backs the slow tier. Extents are mmap'd then mbind'd before
@@ -56,8 +61,11 @@ src/
                                fast_capacity).
   object_store.rs             ObjectStore trait over the object map.
   value_buffer.rs             ValueBuffer.
-  <design>_hybrid_cache/      One module per hybrid design (18), each holding its marker type,
-                               its HybridPolicy impl, and its own Stats struct.
+  <design>_hybrid_cache/      18 name-compatibility shims, three lines of code each: a
+                               re-export of TieredBuffer and a type alias
+                               <Design>HybridStats = HybridStats. No marker type, no impl block,
+                               no distinct stats struct. NOTE their module doc comments still
+                               describe the pre-unification per-design architecture.
   tiering/                    LEGACY copy-based tiering manager (enable_tiering_manager /
                                tiering / multitiering). Keeps a *second* physical copy of hot
                                objects in a DRAM side-cache — the opposite data-movement model
@@ -105,8 +113,10 @@ tests/
 Nearly everything is gated by Cargo features, because the point of the branch is comparing
 placement strategies. Current state:
 
-- `numa_jemalloc` — node-bound jemalloc arenas (`src/numa_alloc.rs`). Pulled in by everything
-  below. The global allocator is wired up unconditionally; `Hybrid` exists only under one of the
+- `numa_jemalloc` — node-bound jemalloc arenas (`src/numa_alloc.rs`). Pulled in by every feature
+  below except `enable_tiering_manager` and `hashtable_tiering`, whose dependency lists are
+  empty. It does not gate the arenas themselves: `pub mod numa_alloc` and the
+  `#[global_allocator]` are unconditional; `Hybrid` exists only under one of the
   PMEM features (`cfg(any(key_value_pmem, key_pmem_value_pmem, global_hashtable_pmem,
   tiering_hashtable_pmem, eviction_stacks_pmem))`) — notably *not* under `all_dram` alone, or
   under the empty default feature set.
@@ -116,11 +126,15 @@ placement strategies. Current state:
 - `global_hashtable_pmem`, `tiering_hashtable_pmem`, `hashbrown_dram` — hashtable placement.
 - `enable_tiering_manager`, `tiering`, `multitiering`, `hashtable_tiering` — the legacy
   copy-based tiering manager (`src/tiering/`).
-- **The 18 `*_hybrid_cache` features** — one per design. Each implies `key_value_pmem` and
-  `hybrid_cache_common`, and they are **mutually exclusive**: all define an inherent impl block
-  on the identical `PaperCache<K, TieredBuffer, S>` type. `hybrid_cache_common` is an internal
-  marker every design turns on, so code common to all of them needs one `cfg` rather than an
-  `any(...)` list that is silently wrong whenever someone forgets to extend it.
+- **The 18 `*_hybrid_cache` features** — each implies `key_value_pmem` and
+  `hybrid_cache_common`. They are **not** mutually exclusive: none defines an impl block, so any
+  subset may be enabled. What a feature still does: ungates its `<design>_hybrid_cache` shim
+  module and `<Design>HybridStats` alias, ungates its integration-test file, and contributes one
+  per-object DRAM-overhead accounting term. It does **not** select the design -- that is the
+  runtime `PaperPolicy` argument, and any hybrid build hosts all 18.
+- `hybrid_cache_common` gates the entire hybrid subsystem (both impl blocks, the migration
+  queue). A build with none of the 18 has no hybrid API, though hybrid policies still parse and
+  still build stacks.
 
 `BufferDRAM = Box<[u8]>` and `BufferPMEM = Box<[u8], Hybrid>` (see `lib.rs`) are the two value
 types; `TieredBuffer` is the tagged union of them that the hybrid designs actually store.
@@ -135,8 +149,14 @@ removal entries near the end of this file.
 **Everything below this line is a chronological work log**, not current reference material.
 Entries record investigations, measurements and decisions in the order they happened, so a later
 entry supersedes an earlier one wherever they disagree — several describe code that was
-subsequently removed or replaced. The two sections above, `HYBRID_CACHES.md`, and the module doc
-comments in the source are the current-state documentation.
+subsequently removed or replaced. The two sections above and `HYBRID_CACHES.md` are the
+current-state documentation.
+
+Do NOT treat the module doc comments in `src/` as current. The runtime-policy unification left
+many of them describing per-design impl blocks, per-design stats accessors and mutually-exclusive
+features that no longer exist -- including the docs on all 18 `<design>_hybrid_cache` shim
+modules, and `lib.rs`'s own comments citing `compile_error!` guards that are gone. Cargo.toml's
+feature table has the same drift. Read the code.
 
 ## Investigation: real DRAM usage vs. `fast_tier_size` — two confirmed bugs, one open hypothesis
 

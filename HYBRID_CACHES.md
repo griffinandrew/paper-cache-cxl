@@ -1,8 +1,9 @@
 # The hybrid caches
 
-This crate builds the same two-tier cache 18 different ways, one Cargo feature per design, to
-compare how eviction disciplines use a small DRAM tier in front of a large CXL/PMEM tier.
-Exactly one design is compiled into any build.
+This crate hosts 18 two-tier cache designs, to compare how eviction disciplines use a small DRAM
+tier in front of a large CXL/PMEM tier. Every hybrid build compiles all 18; which one a given
+cache runs is chosen at construction time by the `PaperPolicy` value passed to the constructor,
+and is fixed for that cache's lifetime. Two caches in one process may run different designs.
 
 This document covers the machinery all 18 share, then each design individually. For the
 feature-flag matrix see `FEATURE_FLAGS.md`; for one design end to end in maximum detail see
@@ -28,11 +29,22 @@ A live object's bytes exist in **exactly one** tier. Promotion and demotion repl
 `TieredBuffer` in place (`Object::set_data`), so a migration is a byte *move*. Contrast
 `src/tiering/`, the legacy manager, which deliberately keeps a copy in both tiers at once.
 
-Because each design defines its own inherent `impl<K, S> PaperCache<K, TieredBuffer, S>` block
-and two such blocks cannot coexist for one concrete type, the designs are mutually exclusive.
-`lib.rs` carries a `compile_error!` guard per conflicting pair, covering 152 of the 153. The
-exception is `fifo_hybrid_cache` + `two_q_fast_admission_hybrid_cache`, whose guard's `cfg`
-carries a spurious third feature and so never fires for that pair alone.
+All 18 share one implementation. There are exactly two inherent
+`impl<K, S> PaperCache<K, TieredBuffer, S>` blocks — the shared engine, and a second carrying the
+size-split design's three-scalar constructor — both gated only on `hybrid_cache_common`. The
+per-design behaviour that survives is dispatched at runtime: `hybrid_policy::admission_tier`
+matches on the policy to pick a placement, and `init_policy_stack` builds the matching
+`PolicyStack`.
+
+The 18 `*_hybrid_cache` features are consequently **not** mutually exclusive; any subset may be
+enabled. Each now gates only a name-compatibility shim — a `pub mod <design>_hybrid_cache`
+re-exporting `TieredBuffer` plus a `<Design>HybridStats` type alias — its integration-test file,
+and one per-object DRAM-overhead accounting term. `lib.rs`'s single `compile_error!` rejects
+`hashbrown_dram` with `global_hashtable_pmem`, unrelated to the designs.
+
+> Earlier revisions gave each design its own impl block, forcing mutual exclusion and 153
+> pairwise guards. Both are gone. Many module doc comments in `src/` — including those on the 18
+> shim modules — still describe that older world.
 
 ## How a stack decides, without ever touching a byte
 
@@ -142,7 +154,8 @@ The stats count **tier decisions**, not byte copies. They diverge in three legit
   `#[cfg(test)]`-gated, so test assertions on buffer contents stay deterministic while still
   exercising the real queue path.
 - **Declined migrations are normal.** `PaperCache::set()` picks a placement of its own via
-  `HybridPolicy::admission_tier`, so an object can already be where the stack is about to say it
+  the free function `hybrid_policy::admission_tier(policy, ...)` -- a runtime `match` carrying
+  each design's rule -- so an object can already be where the stack is about to say it
   belongs. `TwoQHybridStack` hits this by design: `admission_tier` returns `Fast` for a re-set
   (correct — the key is now most-recently-used), so the value is already in DRAM by the time
   `touch_main_fast` emits its promotion.
@@ -243,7 +256,7 @@ lru_lfu                                                │       │   └──
 
 ### `lru_hybrid_cache`
 
-`LruHybridStack` · `PaperPolicy::LruHybrid` · `new(max_size, fast_tier_size)`
+`LruHybridStack` · `PaperPolicy::LruHybrid` — selected at runtime by passing this policy to `new()`
 
 One recency-ordered list backs both tiers. The fast tier is the maximal prefix from the MRU end
 whose cumulative size fits `fast_capacity`; everything behind is slow.
@@ -267,7 +280,7 @@ code, and every design gets the same behaviour from the shared watermark pair ab
 
 ### `lfu_hybrid_cache`
 
-`LfuHybridStack` · `PaperPolicy::LfuHybrid` · `new(max_size, fast_tier_size)`
+`LfuHybridStack` · `PaperPolicy::LfuHybrid` — selected at runtime by passing this policy to `new()`
 
 Two independent `FrequencyChain`s (the classic O(1) LFU bucket structure) back the two tiers.
 LFU's boundary is a *frequency* threshold, not a list position, so two chains — each queryable
@@ -291,7 +304,7 @@ brand-new-key fast admission the first time capacity is genuinely reached. It re
 
 ### `fifo_hybrid_cache`
 
-`FifoHybridStack` · `PaperPolicy::FifoHybrid` · `new(max_size, fast_tier_size)`
+`FifoHybridStack` · `PaperPolicy::FifoHybrid` — selected at runtime by passing this policy to `new()`
 
 One insertion-ordered list. **No promotion policy at all** — this is the defining difference
 from every sibling.
@@ -307,8 +320,9 @@ from every sibling.
 
 ### `lru_sized_hybrid_cache`
 
-`LruSizedHybridStack` · `PaperPolicy::LruSizedHybrid` ·
-`new(max_size, small_fast, large_fast, size_threshold)`
+`LruSizedHybridStack` · `PaperPolicy::LruSizedHybrid` — the one design with its own
+constructor: `new_sized(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold)`,
+which takes no policy argument. Passing `LruSizedHybrid` to `new()` returns `InvalidPolicy`.
 
 `lru_hybrid_cache`'s semantics with each tier's bookkeeping split into two size-routed segments
 by a runtime-configurable byte threshold. Four homogeneous lists (`small_fast`, `large_fast`,
@@ -330,12 +344,14 @@ destination is a shape a cursor does not generalise to.
 - The shared overhead is split *proportionally* between the two fast segments, not charged in
   full against each — the per-object metadata cost is real only once.
 
-Exposes an extra `set_large_fast_tier_size()` alongside the usual `set_fast_tier_size()`.
+`set_large_fast_tier_size()`/`large_fast_tier_size()` and `set_size_threshold()`/
+`size_threshold()` live on every hybrid cache -- they sit on the shared impl block -- but take
+effect only when the cache is running this design.
 
 ### `lru_lfu_hybrid_cache`
 
-`LruLfuHybridStack` · `PaperPolicy::LruLfuHybrid(u16)` ·
-`new(max_size, fast_tier_size, promote_k)`
+`LruLfuHybridStack` · `PaperPolicy::LruLfuHybrid(promote_k)` — selected at runtime by passing
+this policy to `new()`; `promote_k` is a `u16` and is rejected if zero.
 
 The first design whose two tiers rank by *different* metrics: a recency list for the fast tier, a
 frequency chain for the slow tier. In one line: **frequency is the admission control into DRAM;
@@ -381,8 +397,9 @@ overwrite of a slow key is written straight to PMEM rather than to DRAM and corr
 
 ## 2Q family
 
-A one-access FIFO queue feeding a segmented main LRU queue. All take
-`new(max_size, fast_tier_size, k_in)`, where `k_in * max_size` is the FIFO queue's byte budget.
+A one-access FIFO queue feeding a segmented main LRU queue. All four carry `k_in` in their policy
+payload -- `PaperPolicy::TwoQHybrid(k_in)` and siblings, validated into `0.0..=1.0` -- where
+`k_in * max_size` is the FIFO queue's byte budget.
 
 ### `two_q_hybrid_cache`
 
@@ -430,8 +447,9 @@ the recency-durable part of the cache. Only its bytes are in DRAM *while on prob
 **The accounting had to change, not just the label.** With the FIFO queue also in DRAM, both
 budgets draw on the same physical pool, and leaving them independent would let real DRAM grow to
 `fast_capacity + fifo_capacity`. Fixed by treating `fifo_capacity` as a reservation carved out
-first — `effective_main_fast_capacity = fast_capacity.saturating_sub(fifo_capacity)` — with the
-watermarks applied to that reduced number. The net result is
+first — `effective_main_fast_capacity =
+fast_capacity.saturating_sub(fifo_capacity).saturating_sub(reserved_overhead())`, so the FIFO
+carve-out and the shared per-object DRAM reservation both come out before the watermarks apply. The net result is
 `fast_used (main) + fifo_used <= fast_capacity` by construction.
 
 ### `two_q_fast_admission_reprieve_hybrid_cache`
@@ -482,7 +500,8 @@ costs one extra migration rather than a synchronous PMEM-vs-DRAM decision at the
 
 ## S3-FIFO family
 
-All take `new(max_size, fast_tier_size, one_access_ratio)`.
+All nine carry `one_access_ratio` in their policy payload -- `PaperPolicy::S3FifoHybrid(ratio)`
+and siblings, validated into `0.0..=1.0`.
 
 ### `s3_fifo_hybrid_cache`
 

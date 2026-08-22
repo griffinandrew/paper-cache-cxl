@@ -6,9 +6,10 @@ DRAM (the *fast* tier, NUMA node 0) or in PMEM/CXL (the *slow* tier, NUMA node 1
 cache moves them between the two as the access pattern changes.
 
 The research question the fork exists to answer is *which eviction discipline makes the best
-use of a small DRAM tier in front of a large CXL tier*. It is answered by building the same
-cache 18 different ways — one Cargo feature per design — and measuring them against identical
-traces. Only one design is compiled into any given build.
+use of a small DRAM tier in front of a large CXL tier*. It is answered by running the same
+cache 18 different ways — one `PaperPolicy` variant per design — and measuring them against
+identical traces. Every hybrid build compiles all 18; the design is chosen at runtime, by the
+`PaperPolicy` value handed to the constructor, and is then fixed for that cache's lifetime.
 
 > This crate is a library and is not meant to be used directly by application code; the
 > intended consumer is the separate `paper-server` crate. The benchmark harness is
@@ -29,17 +30,19 @@ traces. Only one design is compiled into any given build.
 cargo +nightly build --release --features lru_hybrid_cache
 ```
 
-Selecting a hybrid design is all you need: `lru_hybrid_cache` pulls in `key_value_pmem` and
-`hybrid_cache_common`, and `hybrid_cache_common` pulls in `numa_jemalloc`. Naming those
-explicitly is harmless but redundant.
+Enabling any one hybrid feature is all you need to get the hybrid API: `lru_hybrid_cache` pulls
+in `key_value_pmem` and `hybrid_cache_common`, and `hybrid_cache_common` pulls in
+`numa_jemalloc`. Naming those explicitly is harmless but redundant. The feature does **not**
+select the design — that is a runtime argument, and any hybrid build hosts all 18.
 
 ```rust
-use paper_cache::{PaperCache, CacheTierSize, TieredBuffer, Tier};
+use paper_cache::{PaperCache, CacheTierSize, TieredBuffer, Tier, PaperPolicy};
 
-// 24 GB total cache, of which 4 GB is the DRAM fast tier.
+// 24 GB total cache, of which 4 GB is the DRAM fast tier, running segmented LRU.
 let cache = PaperCache::<u64, TieredBuffer>::new(
     24_000_000_000,
     CacheTierSize::Gb(4),
+    PaperPolicy::LruHybrid,
 )?;
 
 cache.set(1u64, b"hello world", None)?;
@@ -47,7 +50,7 @@ cache.set(1u64, b"hello world", None)?;
 let value: Vec<u8> = cache.get(&1u64)?;
 assert_eq!(cache.tier_of(&1u64), Some(Tier::Fast));
 
-// Feature-neutral counters: works whichever design was compiled in.
+// Design-neutral counters: works whichever policy the cache was built with.
 let stats = cache.hybrid_stats();
 println!("promotions={} demotions={} evictions={}",
     stats.promotions, stats.demotions, stats.evictions);
@@ -76,13 +79,17 @@ into a second map. This is the opposite of the legacy `tiering/` module (see
 [Legacy](#legacy-the-copy-based-tiering-manager)), which deliberately keeps a copy in both
 tiers.
 
-Because each design defines its own inherent `impl<K, S> PaperCache<K, TieredBuffer, S>`
-block, and two such blocks cannot coexist for one concrete type, **the hybrid features are
-mutually exclusive**, and `lib.rs` carries a `compile_error!` guard per conflicting pair so that
-enabling two surfaces as a sentence naming both rather than as a duplicate-definition error deep
-in a generic impl. 152 of the 153 pairs are covered. The exception is
-`fifo_hybrid_cache` + `two_q_fast_admission_hybrid_cache`: its guard's `cfg` carries a spurious
-third feature, so that combination compiles past it and fails with `E0428`/`E0592` instead.
+All 18 designs share **one** implementation. There are exactly two inherent
+`impl<K, S> PaperCache<K, TieredBuffer, S>` blocks — the shared engine, and a second holding the
+size-split design's three-scalar constructor — and both are gated only on `hybrid_cache_common`.
+The per-design behaviour that remains is dispatched at runtime: one `match` over the cache's
+`PaperPolicy` selects the admission rule, and `init_policy_stack` builds the corresponding
+`PolicyStack`.
+
+The hybrid features are therefore **not mutually exclusive** — enable any subset. `lib.rs`
+carries a single `compile_error!`, rejecting `hashbrown_dram` together with
+`global_hashtable_pmem`; it has nothing to do with the designs. (Earlier revisions gave each
+design its own impl block, which forced mutual exclusion and 153 pairwise guards. Both are gone.)
 
 ### Who decides, and who moves the bytes
 
@@ -145,16 +152,16 @@ the counters record what was *requested*, the kernel reports where pages actuall
 
 ### Migration counters vs physical copies
 
-The hybrid stats (`hybrid_stats()`, the per-design `*_hybrid_stats()`, and the `MIGSTATS`
-instrumentation) count **tier decisions made by the policy stack**, not physical byte copies.
+The hybrid stats (`hybrid_stats()` and the `MIGSTATS` instrumentation) count **tier decisions made by the policy stack**, not physical byte copies.
 The two are normally identical, but they are not the same quantity, and the distinction
 matters when reading the numbers.
 
 A migration is emitted whenever a stack changes an object's tier tag. The worker then asks the
 migrate closure to move the bytes — and the closure returns `None`, skipping the copy, when the
 value is **already** in the requested tier. That happens because the API thread chooses a
-placement of its own: `PaperCache::set()` consults each design's `HybridPolicy::admission_tier`
-and builds the value with `TieredBuffer::new_fast` or `new_slow` accordingly, so an object can
+placement of its own: `PaperCache::set()` calls the free function
+`hybrid_policy::admission_tier(policy, ...)` — one runtime `match` carrying each design's
+admission rule — and builds the value with `TieredBuffer::new_fast` or `new_slow` accordingly, so an object can
 already be where the stack is about to say it should be.
 
 Consequences when interpreting stats:
@@ -186,24 +193,34 @@ Consequences when interpreting stats:
 
 ## Choosing a design
 
-All 18 take `max_size` (total bytes across both tiers) followed by the fast tier's capacity --
-a single `fast_tier_size` for every design except `lru_sized_hybrid_cache`, which splits it in
-two. Any further argument is that design's own tuning knob.
+Seventeen of the 18 are built with the one shared constructor,
+`new(max_size, fast_tier_size, policy)`, where `policy` is the design's `PaperPolicy` variant and
+carries that design's tuning knob in its payload — `PaperPolicy::TwoQHybrid(k_in)`,
+`PaperPolicy::LruLfuHybrid(promote_k)`, and so on. Four variants take no payload.
+
+The eighteenth, the size-split design, has its own constructor `new_sized(...)`: it needs three
+sizing scalars rather than one, and it takes no policy argument (it hardcodes
+`PaperPolicy::LruSizedHybrid`). Passing `LruSizedHybrid` to `new()` returns
+`CacheError::InvalidPolicy`.
+
+`PaperPolicy` also round-trips through `FromStr`/`Display` (`"lru-hybrid"`, `"2q-hybrid-0.2"`,
+`"s3-fifo-ghost-lazy-demotion-fast-admission-hybrid-0.1"`, ...) and deserializes via serde, so a
+design and its parameter can come from a config file or a command line with no rebuild.
 
 ### Base designs
 
-| Feature | Constructor | Fast/slow boundary |
+| Feature (re-export/test gate) | Policy value | Fast/slow boundary |
 |---|---|---|
-| `lru_hybrid_cache` | `new(max_size, fast_tier_size)` | One LRU queue, segmented by byte budget |
-| `lfu_hybrid_cache` | `new(max_size, fast_tier_size)` | Frequency-ordered, admission gated on capacity |
-| `fifo_hybrid_cache` | `new(max_size, fast_tier_size)` | Insertion order; no promotion at all |
-| `lru_sized_hybrid_cache` | `new(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold)` | LRU, with each tier's bookkeeping split small/large by object size |
-| `lru_lfu_hybrid_cache` | `new(max_size, fast_tier_size, promote_k)` | LRU fast tier, LFU slow tier — promotion is a fixed access-count threshold |
+| `lru_hybrid_cache` | `PaperPolicy::LruHybrid` | One LRU queue, segmented by byte budget |
+| `lfu_hybrid_cache` | `PaperPolicy::LfuHybrid` | Frequency-ordered, admission gated on capacity |
+| `fifo_hybrid_cache` | `PaperPolicy::FifoHybrid` | Insertion order; no promotion at all |
+| `lru_sized_hybrid_cache` | `PaperPolicy::LruSizedHybrid` — via `new_sized(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold)` | LRU, with each tier's bookkeeping split small/large by object size |
+| `lru_lfu_hybrid_cache` | `PaperPolicy::LruLfuHybrid(promote_k)` | LRU fast tier, LFU slow tier — promotion is a fixed access-count threshold |
 
 ### 2Q family — a one-access FIFO queue feeding a segmented main queue
 
-All take `new(max_size, fast_tier_size, k_in)`, where `k_in * max_size` is the FIFO queue's
-byte budget.
+All four carry `k_in` in their policy payload — e.g. `PaperPolicy::TwoQHybrid(k_in)` — where
+`k_in * max_size` is the FIFO queue's byte budget. `k_in` must lie in `0.0..=1.0`.
 
 | Feature | Builds on | Change |
 |---|---|---|
@@ -214,9 +231,10 @@ byte budget.
 
 ### S3-FIFO family — lazy, reference-bit-gated promotion
 
-All take `new(max_size, fast_tier_size, one_access_ratio)`. Rows are in the order the designs
-were built, each described against the one above it — note that the later ones *remove* as
-much as they add.
+All nine carry `one_access_ratio` in their policy payload — e.g.
+`PaperPolicy::S3FifoHybrid(one_access_ratio)` — validated into `0.0..=1.0`. Rows are in the order
+the designs were built, each described against the one above it — note that the later ones
+*remove* as much as they add.
 
 | Feature | Change from the row above |
 |---|---|
@@ -242,14 +260,14 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | Method | Notes |
 |---|---|
 | `get(&key) -> Result<Vec<u8>>` | May trigger a promotion decision |
-| `set(key, &[u8], ttl: Option<u32>)` | Placement chosen by the design's `admission_tier` |
+| `set(key, &[u8], ttl: Option<u32>)` | Placement chosen by `hybrid_policy::admission_tier` for the active policy |
 | `del(&key)`, `has(&key)`, `size(&key)` | |
 | `peek(&key) -> Result<Arc<TieredBuffer>>` | No access recorded, so no promotion |
 | `ttl(&key, Option<u32>)` | |
 | `tier_of(&key) -> Option<Tier>` | Where the bytes are right now |
-| `hybrid_stats() -> HybridStats` | Feature-neutral; 3 counters + 4 gauges |
-| `<design>_hybrid_stats()` | Design-specific struct, with any extra gauges |
+| `hybrid_stats() -> HybridStats` | The only stats accessor: 3 counters + 4 tier gauges + 8 size-split gauges (the latter zero unless running `LruSizedHybrid`) |
 | `fast_tier_size()`, `set_fast_tier_size(CacheTierSize)` | Boundary is movable at runtime |
+| `large_fast_tier_size()`, `set_large_fast_tier_size()`, `size_threshold()`, `set_size_threshold()` | Present on every hybrid cache; take effect only under `LruSizedHybrid` |
 | `resize(max_size)`, `wipe()`, `status()`, `version()` | |
 
 `CacheTierSize` is `Bytes`/`Mb`/`Gb`, decimal (1 MB = 1,000,000 bytes).
@@ -288,11 +306,11 @@ contents are deterministic while still exercising the real queue path.
 
 ## Benchmarking
 
-`scripts/run_hybrid_benchmark_matrix.sh` builds `paper-benchmark-cxl` once per (paper-cache
-feature, benchmark feature) pair and runs it against every trace in `$TRACES_DIR`, capturing
-GET/SET latency per run. It rewrites the `features=[...]` line in the benchmark's `Cargo.toml`
-in place, so it assumes that crate is path-pointed at a local checkout of this one. Paths at
-the top of the script are absolute and need editing for another host.
+There is no longer a `scripts/` directory in this repo. The old
+`run_hybrid_benchmark_matrix.sh` rebuilt `paper-benchmark-cxl` once per design, rewriting the
+`features=[...]` line in its `Cargo.toml` between runs — a premise the unification removed. A
+single build now hosts all 18 designs, so a sweep is a loop over `PaperPolicy` values (or over
+their string forms, via `FromStr`) with no rebuild between cells.
 
 `paper_cache::jemalloc_stats()` samples allocated/active/resident/mapped/retained at peak,
 which `stats_print:true` cannot do — that runs from an atexit handler, long after the cache

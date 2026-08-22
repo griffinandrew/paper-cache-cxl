@@ -2,12 +2,18 @@
 
 This document explains the implementation of separate configuration options for persistent memory (PMEM) placement in PaperCache.
 
-> **Scope note.** The `*_hybrid_cache` sections below cover only the first six designs, in the
-> detail they were written up with at the time. There are now **18**, and this file has not
-> kept pace. For the complete set — what each one does, and how they relate — see
-> `HYBRID_CACHES.md`; `Cargo.toml` carries a comment on every feature. The placement flags in
-> this file (`all_dram`, `key_value_pmem`, the hashtable flags, `eviction_stacks_pmem`) are
-> current.
+> **Scope note.** The `*_hybrid_cache` sections below are both incomplete and structurally out
+> of date. They cover six of the eighteen designs, and they describe an architecture that no
+> longer exists: per-design constructors, per-design `<design>_hybrid_stats()` accessors,
+> per-design impl blocks, and `compile_error!` mutual-exclusion guards. Since the runtime-policy
+> unification, all 18 designs share one implementation, the features are not mutually exclusive,
+> and the design is chosen by the `PaperPolicy` passed to `new()`. See `HYBRID_CACHES.md` for the
+> current picture. Cargo.toml's per-feature comments carry the same stale mutual-exclusion
+> claims.
+>
+> The `all_dram`, `key_value_pmem` and hashtable-placement sections here are still accurate. The
+> `eviction_stacks_pmem` section understates its reach: besides `LfuStack`/`LruStack`, the flag
+> now also relocates all 18 hybrid stacks' lists and entry maps to PMEM.
 
 ## Overview
 
