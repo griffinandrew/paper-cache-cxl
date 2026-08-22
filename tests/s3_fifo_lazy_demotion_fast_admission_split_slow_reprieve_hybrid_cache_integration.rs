@@ -10,7 +10,7 @@
 //! feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test hybrid_cache_integration --features s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache
+//!   cargo +nightly test --test s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache_integration --features s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture, fast-tier one-access
 //! queue, one-access reprieve, demotion-time reprieve, and eviction-time

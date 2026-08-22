@@ -161,6 +161,11 @@ pub mod migration_queue {
 				let handle = std::thread::Builder::new()
 					.name(format!("mig-{index}"))
 					.spawn(move || {
+						// Same opt-in binding as the policy worker: these threads do
+						// the allocate-copy-swap for every migration.
+						#[cfg(feature = "numa_jemalloc")]
+						crate::numa_alloc::bind_worker_thread_if_configured();
+
 						while let Ok((key, tier)) = receiver.recv() {
 							// Counted on every path out of this iteration.
 							let _done = CountOnDrop(&processed);
@@ -2680,10 +2685,16 @@ mod hybrid_tests {
 		assert_eq!(objects.len() as u64, 2 - evictions);
 	}
 
-	/// `hybrid_stats()` (the design-neutral accessor) must agree with this
-	/// design's own named accessor.
+	/// `hybrid_stats()` must report the tier movement the worker actually
+	/// performed.
+	///
+	/// This once compared the design-neutral accessor against that design's
+	/// own named accessor. The named accessors were removed by the
+	/// runtime-policy unification, which left both sides of every comparison
+	/// reading `hybrid_stats()` -- so the assertions held trivially. Only the
+	/// checks that still mean something are kept.
 	#[test]
-	fn hybrid_stats_mirrors_the_named_accessor() {
+	fn hybrid_stats_reports_tier_movement() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000);
 
 		worker.handle_resize_fast_tier(base_size_of(&overhead_manager, 15) as CacheSize + 1);
@@ -2695,17 +2706,10 @@ mod hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let named = status.hybrid_stats();
-		let common = status.hybrid_stats();
+		let stats = status.hybrid_stats();
 
-		assert_eq!(common.promotions, named.promotions);
-		assert_eq!(common.demotions, named.demotions);
-		assert_eq!(common.evictions, named.evictions);
-		assert_eq!(common.fast_bytes_used, named.fast_bytes_used);
-		assert_eq!(common.slow_bytes_used, named.slow_bytes_used);
-		assert_eq!(common.fast_objects, named.fast_objects);
-		assert_eq!(common.slow_objects, named.slow_objects);
-		assert!(common.demotions > 0, "test should have produced a demotion to compare");
+		assert!(stats.demotions > 0, "test should have produced a demotion");
+		assert_eq!(stats.fast_objects + stats.slow_objects, stats.total_objects());
 	}
 }
 
@@ -3132,10 +3136,16 @@ mod hybrid_tests {
 		assert_eq!(status.hybrid_stats().evictions, 0);
 	}
 
-	/// `hybrid_stats()` (the design-neutral accessor) must agree with this
-	/// design's own named accessor.
+	/// `hybrid_stats()` must report the tier movement the worker actually
+	/// performed.
+	///
+	/// This once compared the design-neutral accessor against that design's
+	/// own named accessor. The named accessors were removed by the
+	/// runtime-policy unification, which left both sides of every comparison
+	/// reading `hybrid_stats()` -- so the assertions held trivially. Only the
+	/// checks that still mean something are kept.
 	#[test]
-	fn hybrid_stats_mirrors_the_named_accessor() {
+	fn hybrid_stats_reports_tier_movement() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(TEST_MAX_SIZE);
 
 		set_main_fast_capacity(&mut worker, base_size_of(&overhead_manager, 15) as CacheSize + 1);
@@ -3147,17 +3157,10 @@ mod hybrid_tests {
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 
-		let named = status.hybrid_stats();
-		let common = status.hybrid_stats();
+		let stats = status.hybrid_stats();
 
-		assert_eq!(common.promotions, named.promotions);
-		assert_eq!(common.demotions, named.demotions);
-		assert_eq!(common.evictions, named.evictions);
-		assert_eq!(common.fast_bytes_used, named.fast_bytes_used);
-		assert_eq!(common.slow_bytes_used, named.slow_bytes_used);
-		assert_eq!(common.fast_objects, named.fast_objects);
-		assert_eq!(common.slow_objects, named.slow_objects);
-		assert!(common.demotions > 0, "test should have produced a demotion to compare");
+		assert!(stats.demotions > 0, "test should have produced a demotion");
+		assert_eq!(stats.fast_objects + stats.slow_objects, stats.total_objects());
 	}
 }
 

@@ -9,22 +9,11 @@
 #![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem"), feature(allocator_api), feature(clone_from_ref))]
 
 
-// `lru_hybrid_cache`, `lfu_hybrid_cache`, `two_q_hybrid_cache`, and
-// `fifo_hybrid_cache` each define their own inherent methods (`new`, `get`,
-// `set`, ...) on `PaperCache<K, TieredBuffer, S>`. Two such impl blocks for
-// the identical concrete type cannot coexist, so only one of these
-// hybrid-cache flavors may be enabled at a time.
-
 // Validate that hashbrown_dram is not enabled with other global hashtable features
 #[cfg(all(feature = "hashbrown_dram", feature = "global_hashtable_pmem"))]
 compile_error!("Cannot enable both 'hashbrown_dram' and 'global_hashtable_pmem' features simultaneously. Please choose only one global hashtable mode.");
 
 
-// Pairwise mutual-exclusion guards for the new `two_q_fast_admission_hybrid_cache`
-// design against every existing one, matching this file's established
-// pairwise-guard style (rather than a single N-way check).
-
-// Pairwise mutual-exclusion guards for `two_q_fast_admission_reprieve_hybrid_cache`.
 /// Node-0-bound jemalloc arenas as the process allocator.
 ///
 /// Covers everything Rust allocates. It does NOT cover glibc's heap, the C
@@ -92,20 +81,18 @@ mod size;
 #[cfg(feature = "hybrid_cache_common")]
 pub use crate::size::CacheTierSize;
 
-// Shared value type for the segmented hybrid-cache features. `lru_hybrid_cache`,
-// `lfu_hybrid_cache`, `two_q_hybrid_cache`, and `fifo_hybrid_cache` are
-// mutually exclusive (see the `compile_error!` guards above) and all
-// re-export it from their own module for source compatibility
-// (`paper_cache::TieredBuffer` works either way).
+// Shared value type for every hybrid design. Each design's module also
+// re-exports it for source compatibility, so `paper_cache::TieredBuffer` and
+// `paper_cache::<design>_hybrid_cache::TieredBuffer` both work.
 #[cfg(feature = "hybrid_cache_common")]
 mod tiered_buffer;
 
 #[cfg(feature = "hybrid_cache_common")]
 pub use crate::tiered_buffer::TieredBuffer;
 
-// Feature-neutral view of whichever hybrid design this build selected, so a
-// consumer that just wants demotion/promotion/eviction totals doesn't need
-// its own 15-arm `#[cfg]` cascade over the per-design accessor names. See
+// Design-neutral view of whichever hybrid design a cache is running. The only
+// stats accessor: the per-design `<design>_hybrid_stats()` methods are gone and
+// the `<Design>HybridStats` names are aliases of this one struct. See
 // `hybrid_stats.rs`'s module doc.
 #[cfg(feature = "hybrid_cache_common")]
 mod hybrid_stats;
@@ -294,10 +281,9 @@ pub use crate::s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_c
 #[cfg(feature = "hybrid_cache_common")]
 pub use crate::worker::Tier;
 
-// Trait abstracting the behavior that differs between the four hybrid-cache
-// designs, plus the compile-time selection of exactly one concrete
-// implementation -- see `hybrid_policy.rs`'s module doc for why this stays
-// a compile-time (not runtime) dispatch.
+// The one thing that still differs per design on the `set()` path: which tier
+// a value is built in. A runtime `match` over the cache's `PaperPolicy` -- see
+// `hybrid_policy.rs`'s module doc.
 #[cfg(feature = "hybrid_cache_common")]
 mod hybrid_policy;
 
@@ -1698,17 +1684,16 @@ fn new_hybrid_object_map<K, V>() -> ObjectMapRef<K, V> {
 	}
 }
 
-/// Shared engine behind every hybrid-cache feature's own inherent methods
-/// (`new`/`with_hasher`/`get`/`set`/.../the `{name}_hybrid_stats()`
-/// accessor). Confirmed via direct diff that the four original per-feature
-/// impl blocks this replaces differed only in: which `PaperPolicy` variant
-/// gets seeded; the `Stats` type and its accessor method's name; one
-/// admission-rule branch inside `set()`; and `two_q_hybrid_cache`'s extra
-/// `k_in: f64` constructor parameter -- all captured by `ActiveHybridPolicy`
-/// (see `hybrid_policy.rs`). The four small per-feature impl blocks below
-/// this one exist only to preserve each feature's distinct public
-/// constructor/stats-accessor names and signatures for source
-/// compatibility with existing callers (`paper-server`/`paper-benchmark-cxl`).
+/// The engine every hybrid design runs on: `new`/`with_hasher`, the cache
+/// operations, and the single `hybrid_stats()` accessor. The design is not
+/// chosen here -- it arrives as the `PaperPolicy` argument to `new`, is stored
+/// in `AtomicStatus`, and is consulted at runtime for the two things that
+/// still vary: which stack `init_policy_stack` builds, and which arm
+/// `hybrid_policy::admission_tier` takes inside `set()`.
+///
+/// Only one other impl block on this type exists, below: the size-split
+/// design's `new_sized`/`with_hasher_sized`, which take three sizing scalars
+/// instead of one and so cannot share this block's constructor.
 #[cfg(feature = "hybrid_cache_common")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
 where
@@ -1752,9 +1737,7 @@ where
 	// scalars (two independent fast-segment capacities + a threshold)
 	// threaded to three different places rather than this method's single
 	// `CacheTierSize`, so it has its own bespoke `new_sized_hybrid` instead
-	// (see that feature's own small impl block below). Gated narrower than
-	// the outer block so an `lru_sized_hybrid_cache`-only build doesn't
-	// compile (and warn about) an unused method.
+	// (see the size-split impl block below).
 	#[cfg(feature = "hybrid_cache_common")]
 	fn new_hybrid(
 		max_size: CacheSize,
@@ -1932,9 +1915,9 @@ where
 	}
 
 	/// Sets the supplied key and value in the cache. Which tier the value's
-	/// bytes are built in is decided by `ActiveHybridPolicy::admission_tier`
-	/// -- see each hybrid-cache feature's marker-type doc comment (in its
-	/// own `mod.rs`) for its specific admission rule. Returns a
+	/// bytes are built in is decided by `hybrid_policy::admission_tier`, whose
+	/// match arm for the cache's policy carries that design's admission rule.
+	/// Returns a
 	/// [`CacheError`] if the value size is zero or larger than the cache's
 	/// maximum size.
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
@@ -2138,12 +2121,11 @@ where
 	/// Returns the active hybrid design's tier-movement counters and live
 	/// tier gauges, in a design-neutral shape.
 	///
-	/// This is the same data as this build's own
-	/// `{design}_hybrid_stats()` accessor — read from those same counters,
-	/// via that same accessor (see `AtomicStatus::hybrid_stats`) — minus any
-	/// design-specific extra fields. Use it when the caller is generic over
-	/// which hybrid feature the crate was built with (e.g. a benchmark
-	/// harness built once per design); use the named accessor when you know
+	/// The only stats accessor there is: the per-design
+	/// `<design>_hybrid_stats()` methods were removed with the runtime-policy
+	/// unification, and the 18 `<Design>HybridStats` names are aliases of the
+	/// one `HybridStats` struct. The 8 size-split gauges read zero unless the
+	/// cache is running `LruSizedHybrid`. Read from
 	/// the design and want its extras.
 	#[must_use]
 	pub fn hybrid_stats(&self) -> HybridStats {
@@ -2182,10 +2164,6 @@ where
 /// but each tier's bookkeeping is split into two independently-tracked
 /// segments ("small"/"large") by object size. See the
 /// `lru_sized_hybrid_cache` module docs.
-///
-/// Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
-/// `two_q_hybrid_cache`/`fifo_hybrid_cache` (see `lib.rs`'s `compile_error!`
-/// guards).
 ///
 /// Sizing knobs: [`Self::set_fast_tier_size`]/[`Self::fast_tier_size`]
 /// (defined on the shared generic block above) resize/read the SMALL fast

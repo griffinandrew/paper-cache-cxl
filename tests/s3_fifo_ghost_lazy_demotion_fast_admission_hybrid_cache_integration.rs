@@ -9,7 +9,7 @@
 //! `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test hybrid_cache_integration --features s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache
+//!   cargo +nightly test --test s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache_integration --features s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture, ghost-queue
 //! lifecycle, demotion-time reprieve, and eviction-time second-chance
@@ -40,7 +40,7 @@ mod hybrid_cache_tests {
     }
 
     /// Unlike the other hybrid designs' equivalent helper, admission here
-    /// is always Fast (see `S3FifoGhostLazyDemotionFastAdmissionHybridPolicy::admission_tier`),
+    /// is always Fast (see `hybrid_policy::admission_tier`),
     /// so a warm-up key just sitting in the one-access queue never touches
     /// PMEM at all. Force a real demotion instead (a tiny effective
     /// main-fast budget makes a single promoted key self-demote

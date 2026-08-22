@@ -5,21 +5,21 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Abstracts over the four mutually-exclusive `TieredBuffer`-based
-//! hybrid-cache designs (`lru_hybrid_cache`, `lfu_hybrid_cache`,
-//! `two_q_hybrid_cache`, `fifo_hybrid_cache`) behind one trait, so `lib.rs`
-//! needs only one generic `impl<K, S> PaperCache<K, TieredBuffer, S>` block
-//! instead of four nearly-identical ones.
+//! Where each hybrid design's admission rule lives.
 //!
-//! This stays a *compile-time* dispatch, not a runtime one: exactly one of
-//! the four features is ever enabled at once (see `lib.rs`'s
-//! `compile_error!` guards), and `lib.rs` selects a single concrete
-//! `ActiveHybridPolicy` type alias per build (mirroring the existing
-//! `ObjectMapRef`/`Hybrid`/`BufferDRAM` pattern). The four impl blocks this
-//! replaces were confirmed (via direct diff) to differ only in: which
-//! `PaperPolicy` variant gets seeded; the `Stats` type and its accessor
-//! method's name; one admission-rule branch inside `set()`; and
-//! `two_q_hybrid_cache`'s extra `k_in: f64` constructor parameter.
+//! All 18 `TieredBuffer`-based designs share the two
+//! `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks in `lib.rs`, gated only
+//! on `hybrid_cache_common`. The one thing that still genuinely differs
+//! between them on the `set()` path is which tier a value is built in, so
+//! that is all this module holds: [`admission_tier`], a runtime `match` over
+//! the cache's [`PaperPolicy`] with one arm per design.
+//!
+//! Dispatch is *runtime*, not compile-time. Every hybrid build compiles all 18
+//! designs; the policy is chosen when the cache is constructed and stored in
+//! `AtomicStatus`, so two caches in one process can run different designs.
+//! An earlier revision dispatched through a `HybridPolicy` trait with one
+//! marker type per feature, selected by an `ActiveHybridPolicy` alias and
+//! kept unambiguous by `compile_error!` guards; all of that is gone.
 
 use crate::{HashedKey, ObjectMapRef, Tier};
 use crate::status::AtomicStatus;
@@ -39,8 +39,9 @@ pub type HybridObjectMap<K> = ObjectMapRef<K, TieredBuffer>;
 /// Which tier a `set()` builds the value's bytes in, for the given hybrid
 /// policy.
 ///
-/// Runtime replacement for the compile-time `HybridPolicy::admission_tier`
-/// markers: one match, with each arm carrying its design's admission rule
+/// Runtime replacement for the per-design `HybridPolicy` marker types this
+/// crate used to dispatch through at compile time: one match, with each arm
+/// carrying its design's admission rule
 /// verbatim. Non-hybrid policies never reach `set()` on a hybrid cache
 /// (construction rejects them), so the catch-all admits fast, which is also
 /// every design's default for a brand-new key except the ghost variants.

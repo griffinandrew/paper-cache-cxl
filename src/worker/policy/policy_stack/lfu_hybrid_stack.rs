@@ -652,7 +652,7 @@ impl PolicyStack for LfuHybridStack {
 			self.slow_used += size as CacheSize;
 
 			// No migration is emitted here. Once the latch is shut,
-			// `LfuHybridPolicy::admission_tier` already returns `Tier::Slow`
+			// `hybrid_policy::admission_tier` already returns `Tier::Slow`
 			// for a brand-new key, so `PaperCache::set` builds the value with
 			// `TieredBuffer::new_slow` -- the bytes are allocated in PMEM by
 			// the API thread and are already where this branch wants them.

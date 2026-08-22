@@ -8,7 +8,7 @@
 //! Integration tests for the `lfu_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test hybrid_cache_integration --features lfu_hybrid_cache
+//!   cargo +nightly test --test lfu_hybrid_cache_integration --features lfu_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture as
 //! `hybrid_cache_integration.rs` — `tier_of` reads the tier directly off

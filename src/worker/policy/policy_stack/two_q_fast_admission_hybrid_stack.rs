@@ -157,7 +157,7 @@
 //! key's bytes as Slow (per the always-slow admission rule), so the migration
 //! was the only thing that ever physically moved them into fast DRAM. Here,
 //! admission already builds every brand-new key's bytes as Fast (see
-//! `TwoQFastAdmissionHybridPolicy::admission_tier` in this feature's
+//! `hybrid_policy::admission_tier` in this feature's
 //! `mod.rs`), and the FIFO→main promotion is Fast→Fast — the bytes are
 //! already exactly where they need to be, so emitting a migration would copy
 //! a value onto itself.

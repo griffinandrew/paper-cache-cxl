@@ -8,7 +8,7 @@
 //! Integration tests for the `lru_sized_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test hybrid_cache_integration --features lru_sized_hybrid_cache
+//!   cargo +nightly test --test lru_sized_hybrid_cache_integration --features lru_sized_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture as `lru_hybrid_cache`
 //! (see that feature's own integration test file for the base pattern this

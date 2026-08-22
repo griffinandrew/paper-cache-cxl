@@ -124,7 +124,7 @@
 //! anything. Keeping writes inside the gate is what makes "frequency is the
 //! admission control into DRAM" true rather than aspirational.
 //!
-//! Consequence for the API layer: `LruLfuHybridPolicy::admission_tier` must
+//! Consequence for the API layer: `hybrid_policy::admission_tier` must
 //! look up an *existing* key's current tier (like `fifo_hybrid_cache`'s does)
 //! rather than answering purely from "is this key new", so an overwrite of a
 //! slow-tier key is written straight to PMEM instead of being written to DRAM

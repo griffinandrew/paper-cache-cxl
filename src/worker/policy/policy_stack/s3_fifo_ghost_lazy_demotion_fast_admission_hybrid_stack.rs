@@ -160,7 +160,7 @@
 //! the base design that push was load-bearing: the API layer had just
 //! built the key's bytes as Slow (per the always-Slow admission rule), so
 //! the migration was the ONLY thing that ever physically moved them to
-//! Fast DRAM. Here, admission (see `S3FifoGhostLazyDemotionFastAdmissionHybridPolicy::admission_tier`
+//! Fast DRAM. Here, admission (see `hybrid_policy::admission_tier`
 //! in this feature's `mod.rs`) already builds every brand-new key's bytes
 //! as Fast unconditionally -- including ghost hits, which are
 //! indistinguishable from any other fresh `set()` at the API layer -- so a

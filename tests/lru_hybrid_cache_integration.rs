@@ -8,7 +8,7 @@
 //! Integration tests for the `lru_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test hybrid_cache_integration --features lru_hybrid_cache
+//!   cargo +nightly test --test lru_hybrid_cache_integration --features lru_hybrid_cache
 //!
 //! This feature is **one** `PaperCache<K, TieredBuffer>` instance (not two
 //! composed `PaperCache`s), so `tier_of` reads the tier directly off the
@@ -541,7 +541,7 @@ mod hybrid_cache_tests {
     /// the same code path can be run at different scales in separate,
     /// uncontaminated processes for comparison:
     ///   REPRO_OBJECT_COUNT=50000 cargo +nightly test --release \
-    ///     --test hybrid_cache_integration --features lru_hybrid_cache \
+    ///     --test lru_hybrid_cache_integration --features lru_hybrid_cache \
     ///     repro_real_dram_usage_at_scale -- --ignored --nocapture
     ///
     /// Not part of the default suite (`#[ignore]` -- allocates real value

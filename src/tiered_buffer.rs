@@ -19,12 +19,9 @@
 //! live object's bytes exist in exactly one tier's allocation at any given
 //! time.
 //!
-//! Shared (rather than duplicated per feature) because each of the four
-//! hybrid-cache features defines its own inherent-method `impl<K, S>
-//! PaperCache<K, TieredBuffer, S>` block — two such blocks for the same
-//! concrete type cannot coexist, so the four features are mutually
-//! exclusive (see the `compile_error!` guards in `lib.rs`) and share this
-//! one buffer type rather than each defining their own.
+//! One buffer type serves every hybrid design: all 18 share the same two
+//! `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks in `lib.rs`, and each
+//! design's module re-exports this type for source compatibility.
 //!
 //! ## Fast tier: ordinary heap allocation; slow tier: node-1 arenas
 //!

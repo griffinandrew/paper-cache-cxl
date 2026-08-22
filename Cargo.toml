@@ -105,10 +105,20 @@ multitiering = ["key_pmem_value_pmem", "enable_tiering_manager", "hashtable_tier
 # feature flags, and this feature only needs to migrate *value* bytes between
 # tiers, not force the key into PMEM.
 #
-# Mutually exclusive with `lfu_hybrid_cache`/`two_q_hybrid_cache`/
-# `fifo_hybrid_cache`/`lru_sized_hybrid_cache` below: all define their own
-# inherent-method impl block on the identical PaperCache<K, TieredBuffer, S>
-# type (see lib.rs's compile_error! guard).
+# ---------------------------------------------------------------------------
+# The 18 *_hybrid_cache features below are NOT mutually exclusive; any subset
+# may be enabled together. They no longer select a design either -- every hybrid
+# build hosts all 18, and the design is chosen at runtime by the PaperPolicy
+# passed to PaperCache::new(max_size, fast_tier_size, policy).
+#
+# What enabling one still does: ungates its `<design>_hybrid_cache` shim module
+# and the `<Design>HybridStats` alias, ungates its integration-test file, and
+# contributes that design's per-object DRAM-overhead reservation term.
+#
+# The descriptions on each feature below document what that DESIGN does; they
+# are not statements about build configuration.
+# ---------------------------------------------------------------------------
+
 lru_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance, segmented-LFU hybrid cache: same one-PaperCache<K,
@@ -118,8 +128,6 @@ lru_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # has the algorithm). Same dependency reasoning as `lru_hybrid_cache`: only
 # needs `key_value_pmem`, not `key_pmem_value_pmem`.
 #
-# Mutually exclusive with `lru_hybrid_cache`/`two_q_hybrid_cache`/
-# `fifo_hybrid_cache`/`lru_sized_hybrid_cache`.
 lfu_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance, segmented-2Q hybrid cache: same one-PaperCache<K,
@@ -132,8 +140,6 @@ lfu_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # dependency reasoning as the other two hybrids: only needs `key_value_pmem`,
 # not `key_pmem_value_pmem`.
 #
-# Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
-# `fifo_hybrid_cache`/`lru_sized_hybrid_cache`.
 two_q_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Two-tier segmented-2Q hybrid cache with the one-access FIFO queue in the
@@ -148,7 +154,6 @@ two_q_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` makes for the
 # s3-fifo family. Same dependency reasoning as the other hybrids.
 #
-# Mutually exclusive with every other hybrid-cache feature.
 two_q_fast_admission_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # As `two_q_fast_admission_hybrid_cache`, but a one-access object that ages out
@@ -159,7 +164,6 @@ two_q_fast_admission_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # PMEM write volume and slow-tier occupancy. Same dependency reasoning as the
 # other hybrids.
 #
-# Mutually exclusive with every other hybrid-cache feature.
 two_q_fast_admission_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance, segmented-FIFO hybrid cache: same one-PaperCache<K,
@@ -173,8 +177,6 @@ two_q_fast_admission_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_co
 # dependency reasoning as the other three: only needs `key_value_pmem`, not
 # `key_pmem_value_pmem`.
 #
-# Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
-# `two_q_hybrid_cache`/`lru_sized_hybrid_cache`.
 fifo_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance, segmented-LRU hybrid cache with a size-split fast AND slow
@@ -196,8 +198,6 @@ fifo_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # Same dependency reasoning as the other four hybrids: only needs
 # `key_value_pmem`, not `key_pmem_value_pmem`.
 #
-# Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
-# `two_q_hybrid_cache`/`fifo_hybrid_cache` above.
 lru_sized_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance hybrid cache with a DIFFERENT eviction discipline per tier:
@@ -217,7 +217,6 @@ lru_sized_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # Same dependency reasoning as the other hybrids: only needs
 # `key_value_pmem`, not `key_pmem_value_pmem`.
 #
-# Mutually exclusive with every other hybrid-cache feature.
 lru_lfu_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance, segmented-S3-FIFO hybrid cache: same one-PaperCache<K,
@@ -231,8 +230,6 @@ lru_lfu_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # Same dependency reasoning as the other five: only needs `key_value_pmem`,
 # not `key_pmem_value_pmem`.
 #
-# Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/
-# `two_q_hybrid_cache`/`fifo_hybrid_cache`/`lru_sized_hybrid_cache` above.
 s3_fifo_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # `two_q_hybrid_cache` plus a bare-key ghost queue: objects that age out of
@@ -245,7 +242,6 @@ s3_fifo_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # (worker/policy/policy_stack/two_q_ghost_hybrid_stack.rs has the ghost
 # mechanics). Same dependency reasoning as the other hybrids.
 #
-# Mutually exclusive with every other hybrid-cache feature above.
 two_q_ghost_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # `s3_fifo_hybrid_cache` plus the same bare-key ghost queue described above,
@@ -253,7 +249,6 @@ two_q_ghost_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # module docs (worker/policy/policy_stack/s3_fifo_ghost_hybrid_stack.rs has
 # the ghost mechanics).
 #
-# Mutually exclusive with every other hybrid-cache feature above.
 s3_fifo_ghost_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # `s3_fifo_ghost_hybrid_cache` plus one more change: demotion (moving a fast
@@ -266,7 +261,6 @@ s3_fifo_ghost_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # (worker/policy/policy_stack/s3_fifo_ghost_lazy_demotion_hybrid_stack.rs has
 # the mechanics).
 #
-# Mutually exclusive with every other hybrid-cache feature above.
 s3_fifo_ghost_lazy_demotion_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # `s3_fifo_ghost_lazy_demotion_hybrid_cache` plus one more change: the
@@ -279,7 +273,6 @@ s3_fifo_ghost_lazy_demotion_hybrid_cache = ["key_value_pmem", "hybrid_cache_comm
 # (worker/policy/policy_stack/s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack.rs
 # has the shared-DRAM-budget accounting).
 #
-# Mutually exclusive with every other hybrid-cache feature above.
 s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` plus one more
@@ -292,7 +285,6 @@ s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache = ["key_value_pmem", "hy
 # (worker/policy/policy_stack/s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack.rs
 # has the full mechanics).
 #
-# Mutually exclusive with every other hybrid-cache feature above.
 s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache: same
@@ -308,7 +300,6 @@ s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache = ["key_value_p
 # has the full mechanics, including the O(number of currently-fast keys)
 # splice technique).
 #
-# Mutually exclusive with every other hybrid-cache feature above.
 s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache: the reprieve design with
@@ -321,7 +312,6 @@ s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache = ["key_valu
 # throughput. This variant keeps only the checks that pay for themselves:
 # the demotion boundary and the eviction tail.
 #
-# Mutually exclusive with every other hybrid-cache feature above.
 s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Fills the s3-fifo family's one empty design cell: the one-access queue lives
@@ -333,7 +323,6 @@ s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache = ["key_value_pmem", 
 # per aged-out object. Lazy demotion retained; no ghost queue (nothing would
 # populate it -- no key is ever evicted from the one-access queue).
 #
-# Mutually exclusive with every other hybrid-cache feature above.
 s3_fifo_lazy_demotion_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache: same as
@@ -348,7 +337,6 @@ s3_fifo_lazy_demotion_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_c
 # (worker/policy/policy_stack/s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_stack.rs
 # has the full mechanics).
 #
-# Mutually exclusive with every other hybrid-cache feature above.
 s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Internal marker feature, not meant to be enabled directly: every

@@ -8,7 +8,7 @@
 //! Integration tests for the `two_q_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test hybrid_cache_integration --features two_q_hybrid_cache
+//!   cargo +nightly test --test two_q_hybrid_cache_integration --features two_q_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture as
 //! `hybrid_cache_integration.rs`/`hybrid_cache_integration.rs` —

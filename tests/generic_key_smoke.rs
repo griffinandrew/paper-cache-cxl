@@ -1,4 +1,4 @@
-// Constructor signatures differ per hybrid feature; this suite pins the
+// This suite pins the
 // genericity claims on the lru design.
 #![cfg(feature = "lru_hybrid_cache")]
 

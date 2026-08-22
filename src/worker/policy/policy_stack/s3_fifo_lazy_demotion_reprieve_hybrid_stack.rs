@@ -1020,7 +1020,7 @@ mod tests {
 		// The inverse of the fast-admission variants' equivalent test. Two
 		// keys sitting in the one-access queue are PMEM-resident here, so
 		// they must show up in the slow gauges and leave the DRAM gauges at
-		// zero -- otherwise `*_hybrid_stats()` would report a fast tier that
+		// zero -- otherwise `hybrid_stats()` would report a fast tier that
 		// is entirely PMEM.
 		let mut stack = S3FifoLazyDemotionReprieveHybridStack::new(1.0, 1_000, 1_000);
 

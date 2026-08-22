@@ -8,7 +8,7 @@
 //! Integration tests for the `two_q_fast_admission_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test hybrid_cache_integration --features two_q_fast_admission_hybrid_cache
+//!   cargo +nightly test --test two_q_fast_admission_hybrid_cache_integration --features two_q_fast_admission_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture as the other hybrid
 //! integration suites — `tier_of` reads the tier directly off the single
@@ -516,7 +516,7 @@ mod hybrid_cache_tests {
     // ── stats ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn hybrid_stats_agrees_with_the_named_accessor() {
+    fn hybrid_stats_reports_tier_movement() {
         ensure_pmem_allocator_warm();
 
         let cache = make_cache();
@@ -533,16 +533,11 @@ mod hybrid_cache_tests {
             "should have produced a demotion to compare",
         );
 
-        // Read the neutral view first, then the named one: the counters are
-        // monotonic and the worker may still be running, so the neutral
-        // reading must fall at or below the later named reading rather than
-        // being compared for strict equality against a moving target.
+        // This once compared the design-neutral accessor against the design's
+        // own named accessor. The named accessors are gone, so that comparison
+        // read `hybrid_stats()` on both sides and held trivially; only the
+        // checks that still mean something are kept.
         let common = cache.hybrid_stats();
-        let named = cache.hybrid_stats();
-
-        assert!(common.demotions <= named.demotions);
-        assert!(common.promotions <= named.promotions);
-        assert!(common.evictions <= named.evictions);
         assert!(common.demotions > 0);
 
         // The object-count invariant should hold exactly at any instant.

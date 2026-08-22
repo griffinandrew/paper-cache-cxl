@@ -209,7 +209,14 @@ where
 }
 
 pub fn register_worker(mut worker: impl Worker) -> JoinHandle<Result<(), CacheError>> {
-	thread::spawn(move || worker.run())
+	thread::spawn(move || {
+		// Opt-in: bind this worker's own allocations and stack growth to a node
+		// (`PAPER_BIND_WORKERS=0|1`). Per-thread, so no other thread is affected.
+		#[cfg(feature = "numa_jemalloc")]
+		crate::numa_alloc::bind_worker_thread_if_configured();
+
+		worker.run()
+	})
 }
 
 pub use crate::worker::{
@@ -223,8 +230,7 @@ pub use crate::worker::tiering::TieringWorker;
 
 // Flattens `worker::policy::Tier` (itself a `pub(crate)` re-export of the
 // private `policy_stack` submodule's `Tier`, see `worker/policy/mod.rs`) so
-// `lib.rs` can re-export it further as a fully public `PaperCache::tier_of`/
-// `lru_hybrid_cache`/`lfu_hybrid_cache`/`two_q_hybrid_cache`/
-// `fifo_hybrid_cache`/`lru_sized_hybrid_cache` return type.
+// `lib.rs` can re-export it further as the fully public `PaperCache::tier_of`
+// return type, shared by every hybrid design.
 #[cfg(feature = "hybrid_cache_common")]
 pub use crate::worker::policy::Tier;

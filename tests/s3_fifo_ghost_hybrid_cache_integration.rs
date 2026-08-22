@@ -8,7 +8,7 @@
 //! Integration tests for the `s3_fifo_ghost_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test hybrid_cache_integration --features s3_fifo_ghost_hybrid_cache
+//!   cargo +nightly test --test s3_fifo_ghost_hybrid_cache_integration --features s3_fifo_ghost_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture and admission/
 //! demotion/promotion/eviction rules as `s3_fifo_hybrid_cache` — see that

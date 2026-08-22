@@ -8,7 +8,7 @@
 //! Integration tests for the `lru_lfu_hybrid_cache` feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test hybrid_cache_integration --features lru_lfu_hybrid_cache
+//!   cargo +nightly test --test lru_lfu_hybrid_cache_integration --features lru_lfu_hybrid_cache
 //!
 //! This design is **one** `PaperCache<K, TieredBuffer>` whose two tiers rank
 //! by *different* metrics — recency (LRU) in the fast tier, frequency (LFU)

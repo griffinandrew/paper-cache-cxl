@@ -32,16 +32,13 @@ use crate::{
 #[cfg(feature = "hybrid_cache_common")]
 use crate::hybrid_stats::HybridStats;
 
-/// Projects one of the 15 per-design `*_hybrid_stats()` accessors onto the
-/// shared seven-field [`HybridStats`]. Every design's own stats struct
-/// carries these seven names identically (some carry more —
-/// `LruSizedHybridStats` adds 8 per-size-segment gauges — which is exactly
-/// why this projects rather than converts).
+/// Loads the active design's tier counters and gauges into [`HybridStats`].
 ///
-/// Reading through the per-design accessor rather than the underlying atomic
-/// fields directly is deliberate: it means `hybrid_stats()` can never
-/// disagree with `{design}_hybrid_stats()` about the same counter, because
-/// there is only one place either value is loaded from.
+/// One accessor serves every design: the per-design `<design>_hybrid_stats()`
+/// methods were removed by the runtime-policy unification, and the 18
+/// `<Design>HybridStats` names are aliases of the one struct. Of its 15
+/// fields, the 8 size-split gauges are populated only under
+/// `PaperPolicy::LruSizedHybrid` and read zero elsewhere.
 #[derive(Debug)]
 pub struct Status {
 	pid: u32,
@@ -84,9 +81,8 @@ pub struct AtomicStatus {
 	/// Runtime-configurable fast-tier byte budget for `PaperPolicy::LruHybrid`
 	/// / `PaperPolicy::LfuHybrid` / `PaperPolicy::TwoQHybrid` /
 	/// `PaperPolicy::FifoHybrid` (`lru_hybrid_cache` / `lfu_hybrid_cache` /
-	/// `two_q_hybrid_cache` / `fifo_hybrid_cache` — mutually exclusive
-	/// features, see `lib.rs`'s `compile_error!` guards, so this single field
-	/// serves whichever one is active). Written by
+	/// `two_q_hybrid_cache` / `fifo_hybrid_cache` — one field serving whichever
+	/// design the cache was constructed with). Written by
 	/// `PaperCache::set_fast_tier_size`, read back by both
 	/// `PaperCache::fast_tier_size` and `PolicyWorker` (via the
 	/// `WorkerEvent::ResizeFastTier` broadcast, not by reading this field

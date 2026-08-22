@@ -5,32 +5,24 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! A single, feature-neutral stats snapshot shared by every hybrid-cache
-//! design, plus `PaperCache::hybrid_stats()` / `AtomicStatus::hybrid_stats()`
-//! to read it.
+//! The single stats snapshot every hybrid design reports through, plus
+//! `PaperCache::hybrid_stats()` / `AtomicStatus::hybrid_stats()` to read it.
 //!
-//! Every one of the hybrid designs already exposes its own accessor
-//! (`hybrid_stats()`, `hybrid_stats()`, ...) returning its
-//! own named struct (`LruHybridStats`, `S3FifoGhostHybridStats`, ...). Those
-//! stay exactly as they are — `paper-server` and existing callers keep the
-//! names they already use, and designs that track *extra* fields keep them
-//! (`LruSizedHybridStats` carries 8 per-size-segment gauges on top of the
-//! shared 7).
+//! There is one accessor, not one per design. The 18 `<Design>HybridStats`
+//! names each design's module re-exports are type *aliases* of the struct
+//! below, kept so existing callers (`paper-server`, `paper-benchmark-cxl`)
+//! compile unchanged; they are the same type and carry no extra fields.
 //!
-//! The problem this solves is for a *consumer* that doesn't care which design
-//! it was built against: `paper-benchmark-cxl` builds one binary per hybrid
-//! feature and wants to report demotions/promotions/evictions from whichever
-//! one is active. Without this, every such consumer needs its own
-//! 15-arm `#[cfg]` cascade naming all 15 accessors and all 15 struct types,
-//! duplicated at every call site, and needs a new arm added every time a
-//! design is added here. With it, the cascade lives once, in
+//! That matters for a consumer that does not care which design it is talking
+//! to. Before the runtime-policy unification, reporting
+//! demotions/promotions/evictions meant a `#[cfg]` cascade naming every
+//! accessor and every struct type, repeated at each call site and needing a
+//! new arm per design added. Now the cascade lives once, in
 //! `AtomicStatus::hybrid_stats` (`status.rs`), next to the fields it reads.
 //!
-//! The seven fields below are exactly the set every design tracks — verified
-//! against all 15 `*_hybrid_cache/stats.rs` structs, which share these seven
-//! names identically. Design-specific extras are deliberately *not* here;
-//! read them from the design's own accessor when you know which design you
-//! have.
+//! The 15 fields below are 3 monotonic counters, 4 two-tier gauges, and 8
+//! size-split gauges that only `LruSizedHybrid` ever populates -- they read
+//! zero under every other design.
 
 /// Feature-neutral snapshot of the active hybrid cache's tier-movement
 /// counters and live tier gauges.

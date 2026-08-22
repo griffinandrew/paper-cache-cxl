@@ -33,16 +33,19 @@
 //! see [`crate::tiered_buffer::TieredBuffer`] and `Object::set_data`, which
 //! together make promotion/demotion an in-place data move rather than a
 //! copy. `TieredBuffer` itself lives in the crate-root `tiered_buffer`
-//! module, shared with `lru_hybrid_cache`/`lfu_hybrid_cache` (all three
-//! hybrid-cache features are mutually exclusive — see `lib.rs`'s
-//! `compile_error!` guards — since each defines its own inherent-method
-//! `PaperCache<K, TieredBuffer, S>` impl block).
+//! module, shared unchanged by every hybrid design.
 //!
 //! The policy stack lives at
 //! `worker::policy::policy_stack::two_q_hybrid_stack::TwoQHybridStack`
 //! (`PaperPolicy::TwoQHybrid`) and `PolicyWorker` performs the actual tier
 //! migrations it reports, recording counters directly on `AtomicStatus`
 //! (see `stats` module docs for why).
+//!
+//! NOTE: this module is now only a shim -- a `TieredBuffer` re-export and a
+//! `<Design>HybridStats` alias of `HybridStats`. All 18 designs share the two
+//! `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks in `lib.rs` and are
+//! selected at runtime by the `PaperPolicy` passed to `new()`. The design
+//! description above is still accurate; the module structure it implies is not.
 
 mod stats;
 

@@ -9,7 +9,7 @@
 //! feature.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test hybrid_cache_integration --features s3_fifo_ghost_lazy_demotion_hybrid_cache
+//!   cargo +nightly test --test s3_fifo_ghost_lazy_demotion_hybrid_cache_integration --features s3_fifo_ghost_lazy_demotion_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture, ghost-queue
 //! lifecycle, and eviction-time second-chance mechanic as
@@ -217,7 +217,7 @@ mod hybrid_cache_tests {
         // Note: `tier_of(&2u32)` is NOT a usable signal for "key 2 was
         // demoted" here -- admission for this design always builds a
         // brand-new key's bytes as Slow at the API layer to begin with (see
-        // `S3FifoGhostLazyDemotionHybridPolicy::admission_tier`), and key
+        // `hybrid_policy::admission_tier`), and key
         // 2's promotion-then-immediate-re-demotion happens entirely within
         // one worker batch, so its physical buffer never visibly passes
         // through Fast at all -- `tier_of(&2u32) == Some(Tier::Slow)` would
