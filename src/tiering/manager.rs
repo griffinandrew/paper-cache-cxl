@@ -856,11 +856,11 @@ use crate::PaperCache;
 #[cfg(feature = "key_value_pmem")]
 pub type BufferPMEM = Box<[u8], Hybrid>;
 
-#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem"))]
+#[cfg(any(feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem"))]
 use crate::Hybrid;
 
 
-#[cfg(any(feature = "key_value_pmem", feature = "alloc_api_exp"))]
+#[cfg(any(feature = "key_value_pmem"))]
 use hashbrown::HashMap as hashtable;
 
 
@@ -1014,18 +1014,6 @@ pub struct TieringManager<K, V> {
     #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", feature = "hashtable_tiering"))]
     dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
     
-    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>>>>,
-    
-    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem"), feature = "hashtable_tiering"))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>>>>,
-    
-    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
-    
-    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem", feature = "hashtable_tiering"))]
-    dram_cache: Arc<RwLock<hashtable<HashedKey, TieringObject<K, V>, BuildHasherDefault<NoHashHasher<u64>>, Hybrid>>>,
-    
 
     _phantom: std::marker::PhantomData<(K, V)>,
 }
@@ -1067,30 +1055,6 @@ where
     }
 
     #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
-    pub fn new(config: TieringConfig) -> Self {
-        TieringManager {
-            config: Arc::new(RwLock::new(config)),
-            stats: Arc::new(RwLock::new(TieringStats::default())),
-            object_info: Arc::new(RwLock::new(HashMap::new())),
-            dram_objects: Arc::new(RwLock::new(HashSet::new())),
-            dram_cache: Arc::new(RwLock::new(hashtable::with_hasher_in(NoHasher::default(), Hybrid))),
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    #[cfg(all(feature = "alloc_api_exp", not(feature = "tiering_hashtable_pmem")))]
-    pub fn new(config: TieringConfig) -> Self {
-        TieringManager {
-            config: Arc::new(RwLock::new(config)),
-            stats: Arc::new(RwLock::new(TieringStats::default())),
-            object_info: Arc::new(RwLock::new(HashMap::new())),
-            dram_objects: Arc::new(RwLock::new(HashSet::new())),
-            dram_cache: Arc::new(RwLock::new(hashtable::with_hasher(NoHasher::default()))),
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    #[cfg(all(feature = "alloc_api_exp", feature = "tiering_hashtable_pmem"))]
     pub fn new(config: TieringConfig) -> Self {
         TieringManager {
             config: Arc::new(RwLock::new(config)),
@@ -1379,10 +1343,7 @@ where
         false
     }
 
-    #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")),
-        all(feature = "alloc_api_exp", not(feature = "hashtable_tiering"))
-    ))]
+    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")))]
     pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
     where
         V: AsRef<[u8]>,
@@ -1488,10 +1449,7 @@ where
         false
     }
 
-    #[cfg(any(
-        all(feature = "hashtable_tiering", feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
-        all(feature = "hashtable_tiering", feature = "alloc_api_exp")
-    ))]
+    #[cfg(all(feature = "hashtable_tiering", feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
     /// Promotes an object to warm tier (pointer-only) or hot tier (physical copy)
     /// Returns true if promotion was successful
     pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
@@ -1653,10 +1611,7 @@ where
         false
     }
 
-    #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")),
-        all(feature = "alloc_api_exp", not(feature = "hashtable_tiering"))
-    ))]
+    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")))]
     pub fn demote_from_dram(&self, key: HashedKey) -> bool {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -1736,10 +1691,7 @@ where
         false
     }
 
-    #[cfg(any(
-        all(feature = "hashtable_tiering", feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
-        all(feature = "hashtable_tiering", feature = "alloc_api_exp")
-    ))]
+    #[cfg(all(feature = "hashtable_tiering", feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
     /// Demotes an object from DRAM (hashtable_tiering version)
     /// Handles both warm tier (pointer-only) and hot tier (physical copy)
     pub fn demote_from_dram(&self, key: HashedKey) -> bool {
@@ -1812,10 +1764,7 @@ where
         self.dram_cache.get(key)
     }
 
-    #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")),
-        all(feature = "alloc_api_exp", not(feature = "hashtable_tiering"))
-    ))]
+    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")))]
     pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K>>> {
         self.dram_cache
             .read()
@@ -1824,10 +1773,7 @@ where
             .map(|obj| Arc::new(obj.clone()))
     }
 
-    #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", feature = "hashtable_tiering"),
-        all(feature = "alloc_api_exp", feature = "hashtable_tiering")
-    ))]
+    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", feature = "hashtable_tiering"))]
     pub fn get_from_dram(&self, key: &HashedKey) -> Option<Arc<TieringObject<K, V>>> {
         self.dram_cache
             .read()
@@ -1868,10 +1814,7 @@ where
         }
     }
 
-    #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
-        feature = "alloc_api_exp"
-    ))]
+    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
     pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
     where
         V: AsRef<[u8]>,
@@ -2020,10 +1963,7 @@ where
         }
     }
 
-    #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")),
-        all(feature = "alloc_api_exp", not(feature = "hashtable_tiering"))
-    ))]
+    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")))]
     pub fn remove_object(&self, key: HashedKey) {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -2048,10 +1988,7 @@ where
         }
     }
 
-    #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", feature = "hashtable_tiering"),
-        all(feature = "alloc_api_exp", feature = "hashtable_tiering")
-    ))]
+    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", feature = "hashtable_tiering"))]
     pub fn remove_object(&self, key: HashedKey) {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -2153,10 +2090,7 @@ where
         *stats = TieringStats::default();
     }
 
-    #[cfg(any(
-        all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
-        feature = "alloc_api_exp"
-    ))]
+    #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
     pub fn clear(&self) {
         let mut info_map = self.object_info.write().unwrap();
         info_map.clear();
