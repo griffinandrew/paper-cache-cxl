@@ -786,6 +786,7 @@ mod tests {
 		assert_eq!(drain(&mut stack), Vec::new(), "and moves no bytes");
 	}
 
+	#[test]
 	fn admission_always_lands_in_one_access_queue_slow() {
 		let mut stack = S3FifoLazyDemotionReprieveHybridStack::new(1.0, 1_000, 1_000);
 

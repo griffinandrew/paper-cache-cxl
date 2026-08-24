@@ -345,23 +345,16 @@ mod hybrid_cache_tests {
     // ── DRAM cap accounts for shared metadata (hashtable + eviction stacks) ──
 
     #[test]
-    fn dram_cap_reserves_shared_metadata_and_demotes_without_evicting() {
+    fn fast_tier_value_pressure_demotes_without_evicting() {
         ensure_pmem_allocator_warm();
 
-        // A big overall cache (so `max_size` never triggers eviction) with a
-        // fast tier whose raw byte budget (2 KB) would comfortably hold all of
-        // these tiny (~13-byte) values at once. The fast-tier budget, however,
-        // now also reserves an approximate per-object DRAM cost for the shared
-        // object hashtable (and the eviction stacks too, when those are also
-        // DRAM-resident -- excluded here under `eviction_stacks_pmem`, so this
-        // test only needs to rely on the smaller hashtable-only term); across
-        // *enough* objects that reservation exceeds the budget regardless of
-        // which terms apply, so the DRAM cap forces demotions even though the
-        // values alone would fit. Crucially, the DRAM cap responds only with
-        // demotions — it never evicts. 300 objects gives comfortable margin
-        // under the hashtable-only reservation alone (roughly 11 bytes/object
-        // -- see `object/overhead.rs::HASHTABLE_ENTRY_OVERHEAD` -- so >180
-        // objects already exceeds the 2 KB budget on that term by itself).
+        // NOTE: this binary's `ensure_pmem_allocator_warm()` sets
+        // `PAPER_DISABLE_SHARED_OVERHEAD=1` process-wide, so the metadata
+        // reservation is OFF here and plays no part in this test. What forces
+        // the behaviour is plain value pressure: 300 objects at ~41
+        // stack-accounted bytes each (~12.3 KB) against a 2 KB fast budget.
+        // The reservation itself is covered, with the reservation ON, in the
+        // per-process binary tests/lru_hybrid_cache_shared_overhead.rs.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
             CacheTierSize::Bytes(2_000), PaperPolicy::LruHybrid).expect("cache should construct");
@@ -375,7 +368,7 @@ mod hybrid_cache_tests {
         let demoted = wait_until(MIGRATION_TIMEOUT, || {
             cache.hybrid_stats().demotions >= 1
         });
-        assert!(demoted, "shared-metadata reservation should force demotions");
+        assert!(demoted, "value pressure alone should force demotions here");
 
         // Let the worker settle, then confirm the DRAM cap never evicted: every
         // key is still present (only demoted, not dropped), and the evictions
@@ -881,35 +874,5 @@ mod hybrid_cache_tests {
         assert_eq!(cache.get(&1u32).unwrap(), value(0xD4));
     }
 
-    /// The DRAM metadata reservation must stay ON by default: with a fast
-    /// budget smaller than one object's metadata overhead, nothing may ever
-    /// be promoted. Runs in its own process-visible env state by explicitly
-    /// clearing the mechanics-test switch first.
-    #[test]
-    fn shared_overhead_reservation_is_active_by_default() {
-        unsafe { std::env::remove_var("PAPER_DISABLE_SHARED_OVERHEAD") };
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(40),
-            PaperPolicy::LruHybrid,
-        )
-        .expect("cache should construct");
-
-        for key in 1u32..=3 {
-            cache.set(key, b"tiny value bytes", None).expect("set");
-        }
-        cache.get(&1u32).expect("get");
-
-        // Give a would-be promotion ample time, then require it did NOT
-        // happen: 40 bytes cannot hold ~75 B of per-object metadata.
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        let stats = cache.hybrid_stats();
-        assert_eq!(
-            stats.fast_bytes_used, 0,
-            "fast tier admitted bytes despite a budget below one object's metadata overhead"
-        );
-
-        unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
-    }
 }

@@ -729,6 +729,16 @@ impl AtomicStatus {
 		self.total_sets.store(0, Ordering::Relaxed);
 		self.total_dels.store(0, Ordering::Relaxed);
 
+		// `HybridStats` documents the three tier-movement counters as totals
+		// since creation or the last `wipe()`, so a wipe resets them along
+		// with the request counters above.
+		#[cfg(feature = "hybrid_cache_common")]
+		self.hybrid_promotions.store(0, Ordering::Relaxed);
+		#[cfg(feature = "hybrid_cache_common")]
+		self.hybrid_demotions.store(0, Ordering::Relaxed);
+		#[cfg(feature = "hybrid_cache_common")]
+		self.hybrid_evictions.store(0, Ordering::Relaxed);
+
 		// Reset synchronously here (called from `wipe()` on the API-calling
 		// thread) rather than waiting for `PolicyWorker` to process the
 		// corresponding `WorkerEvent::Wipe` and resync via
@@ -835,5 +845,31 @@ mod tests {
 		assert_eq!(status.total_hits.load(Ordering::Relaxed), 0);
 		assert_eq!(status.total_sets.load(Ordering::Relaxed), 0);
 		assert_eq!(status.total_dels.load(Ordering::Relaxed), 0);
+	}
+
+	#[cfg(feature = "hybrid_cache_common")]
+	#[test]
+	fn it_clears_hybrid_counters() {
+		let status = AtomicStatus::new(
+			1000,
+			&[PaperPolicy::Lfu],
+			PaperPolicy::Lfu,
+		).expect("Could not initialize atomic status");
+
+		status.record_hybrid_promotion();
+		status.record_hybrid_demotion();
+		status.record_hybrid_eviction();
+
+		let stats = status.hybrid_stats();
+		assert_ne!(stats.promotions, 0);
+		assert_ne!(stats.demotions, 0);
+		assert_ne!(stats.evictions, 0);
+
+		status.clear();
+
+		let stats = status.hybrid_stats();
+		assert_eq!(stats.promotions, 0);
+		assert_eq!(stats.demotions, 0);
+		assert_eq!(stats.evictions, 0);
 	}
 }

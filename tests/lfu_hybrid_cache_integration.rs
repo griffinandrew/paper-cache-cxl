@@ -485,26 +485,16 @@ mod hybrid_cache_tests {
     // ── DRAM cap accounts for shared metadata (hashtable + eviction stacks) ──
 
     #[test]
-    fn dram_cap_reserves_shared_metadata_and_routes_to_slow_without_evicting() {
+    fn fast_tier_value_pressure_routes_to_slow_without_evicting() {
         ensure_pmem_allocator_warm();
 
-        // A big overall cache (so `max_size` never triggers eviction) with a
-        // fast tier whose raw byte budget (2 KB) would comfortably hold all of
-        // these tiny (~13-byte) values at once. The fast-tier budget, however,
-        // now also reserves an approximate per-object DRAM cost for the shared
-        // object hashtable (and the eviction stacks too, when those are also
-        // DRAM-resident -- excluded here under `eviction_stacks_pmem`, so this
-        // test only needs to rely on the smaller hashtable-only term); across
-        // *enough* objects that reservation fills the budget regardless of
-        // which terms apply, so once the fast tier is full every further
-        // admission is routed straight to the slow tier -- even though the
-        // values alone would all fit. Crucially, this never evicts. 300
-        // objects gives comfortable margin under the hashtable-only
-        // reservation alone (roughly 11 bytes/object -- see
-        // `object/overhead.rs::HASHTABLE_ENTRY_OVERHEAD` -- so >180 objects
-        // already exceeds the 2 KB budget on that term by itself); once the
-        // admission latch trips (see `LfuHybridStack`'s module doc), every
-        // later admission stays routed to slow regardless.
+        // NOTE: this binary's `ensure_pmem_allocator_warm()` sets
+        // `PAPER_DISABLE_SHARED_OVERHEAD=1` process-wide, so the metadata
+        // reservation is OFF here and plays no part in this test. What forces
+        // the behaviour is plain value pressure: 300 objects at ~41
+        // stack-accounted bytes each (~12.3 KB) against a 2 KB fast budget.
+        // The reservation itself is covered, with the reservation ON, in the
+        // per-process binary tests/lfu_hybrid_cache_shared_overhead.rs.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
             CacheTierSize::Bytes(2_000), PaperPolicy::LfuHybrid).expect("cache should construct");

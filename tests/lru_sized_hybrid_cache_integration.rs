@@ -403,15 +403,16 @@ mod hybrid_cache_tests {
     // ── DRAM cap accounts for shared metadata (hashtable + eviction stacks) ──
 
     #[test]
-    fn dram_cap_reserves_shared_metadata_and_demotes_without_evicting() {
+    fn small_segment_value_pressure_demotes_without_evicting() {
         ensure_pmem_allocator_warm();
 
-        // A minimal (but non-zero, since 0 is rejected) large-segment
-        // capacity keeps the shared-metadata reservation concentrated
-        // almost entirely on the small segment (see
-        // `LruSizedHybridStack::reserved_shares` -- the split is
-        // proportional to each segment's *capacity*), matching
-        // `hybrid_cache_integration.rs`'s equivalent single-tier test.
+        // NOTE: this binary's `ensure_pmem_allocator_warm()` sets
+        // `PAPER_DISABLE_SHARED_OVERHEAD=1` process-wide, so the metadata
+        // reservation is OFF here and plays no part in this test. What forces
+        // the behaviour is plain value pressure: 300 objects at ~41
+        // stack-accounted bytes each (~12.3 KB) against a 2 KB fast budget.
+        // The reservation itself is covered, with the reservation ON, in the
+        // per-process binary tests/lru_sized_hybrid_cache_shared_overhead.rs.
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_000_000,
             CacheTierSize::Bytes(2_000),
@@ -426,7 +427,7 @@ mod hybrid_cache_tests {
         let demoted = wait_until(MIGRATION_TIMEOUT, || {
             cache.hybrid_stats().demotions >= 1
         });
-        assert!(demoted, "shared-metadata reservation should force demotions");
+        assert!(demoted, "value pressure alone should force demotions here");
 
         std::thread::sleep(std::time::Duration::from_millis(300));
 

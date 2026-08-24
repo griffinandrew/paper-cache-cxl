@@ -1599,6 +1599,221 @@ where
 	V: TypeSize,
 {}
 
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod migration_queue_tests {
+	use super::*;
+
+	use super::migration_queue::MigrationQueue;
+	use crate::object::Object;
+	use crate::object_store::ObjectStore;
+
+	type TestBuffer = Box<[u8]>;
+
+	/// Byte stamped into the buffer's last position by `marker_migrate`, so a
+	/// buffer's physical tier is readable back out of its bytes.
+	const FAST_MARKER: u8 = 0xFA;
+	const SLOW_MARKER: u8 = 0x50;
+
+	/// A buffer whose *first* byte is this sentinel is declined by
+	/// `marker_migrate` (it returns `None`), mimicking the production
+	/// closure's already-in-tier case.
+	const DECLINE_SENTINEL: u8 = 0xDE;
+
+	const BUFFER_LEN: usize = 8;
+
+	// Same idiom as the hybrid_tests harnesses' migrate closure: tag the last
+	// byte per tier without changing the buffer's length, so Fast-vs-Slow
+	// outcomes are distinguishable in the bytes themselves.
+	fn marker_migrate() -> Arc<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> {
+		Arc::new(|bytes: &TestBuffer, tier: Tier| {
+			if bytes.first() == Some(&DECLINE_SENTINEL) {
+				return None;
+			}
+
+			let marker: u8 = match tier {
+				Tier::Fast => FAST_MARKER,
+				Tier::Slow => SLOW_MARKER,
+			};
+
+			let mut v = bytes.to_vec();
+			if let Some(last) = v.last_mut() {
+				*last = marker;
+			}
+
+			Some(v.into_boxed_slice())
+		})
+	}
+
+	fn make_objects() -> ObjectMapRef<u32, TestBuffer> {
+		crate::new_hybrid_object_map()
+	}
+
+	fn insert(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey, fill: u8) {
+		let object = Object::new(key as u32, vec![fill; BUFFER_LEN].into_boxed_slice(), None);
+		objects.insert(key, object);
+	}
+
+	fn last_byte(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) -> u8 {
+		*objects.get_ref(&key).unwrap().data().last().unwrap()
+	}
+
+	#[test]
+	fn per_key_demote_then_promote_applies_in_order() {
+		let objects = make_objects();
+		let key: HashedKey = 1;
+		insert(&objects, key, 0);
+
+		// Two consumers, so the per-key channel sharding is actually in play
+		// (a single consumer preserves global order trivially).
+		let queue = MigrationQueue::spawn(objects.clone(), marker_migrate(), 2).unwrap();
+
+		// Demote then promote: the promote is the newer decision, so the
+		// buffer must physically end Fast. Both land in the same shard's
+		// FIFO channel, which is exactly the ordering the sharding exists
+		// to guarantee.
+		queue.push((key, Tier::Slow));
+		queue.push((key, Tier::Fast));
+		queue.flush();
+		assert_eq!(last_byte(&objects, key), FAST_MARKER);
+
+		// Mirror: promote then demote must end Slow.
+		queue.push((key, Tier::Fast));
+		queue.push((key, Tier::Slow));
+		queue.flush();
+		assert_eq!(last_byte(&objects, key), SLOW_MARKER);
+	}
+
+	#[test]
+	fn flush_returns_only_after_every_disposition() {
+		let objects = make_objects();
+
+		insert(&objects, 1, 0);
+		insert(&objects, 2, DECLINE_SENTINEL); // marker_migrate declines this one
+		// Key 3 is deliberately never inserted.
+
+		let queue =
+			Arc::new(MigrationQueue::spawn(objects.clone(), marker_migrate(), 2).unwrap());
+
+		queue.push((1, Tier::Slow)); // applied
+		queue.push((3, Tier::Fast)); // object absent from the map: skipped, still counted
+		queue.push((2, Tier::Fast)); // declined by the closure: still counted
+
+		// Run `flush` on its own thread so a completion count missed on the
+		// skipped or declined path shows up as a clean assertion failure
+		// rather than a test process spinning forever. The timeout is a
+		// failure detector only: on a correct queue the send arrives as soon
+		// as the three dispositions are counted, with no timing dependence.
+		let (done_tx, done_rx) = unbounded::<()>();
+
+		let flusher = {
+			let queue = queue.clone();
+
+			thread::spawn(move || {
+				queue.flush();
+				let _ = done_tx.send(());
+			})
+		};
+
+		assert!(
+			done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+			"flush() never returned: a skipped or declined migration was not counted",
+		);
+		flusher.join().unwrap();
+
+		// The applied migration landed...
+		assert_eq!(last_byte(&objects, 1), SLOW_MARKER);
+
+		// ...and the declined object's bytes are untouched.
+		let data = objects.get_ref(&2).unwrap().data();
+		assert_eq!(&**data, &[DECLINE_SENTINEL; BUFFER_LEN][..]);
+	}
+
+	#[test]
+	fn a_stale_migration_is_dropped_by_the_ptr_eq_guard() {
+		let objects = make_objects();
+		let key: HashedKey = 1;
+		insert(&objects, key, 0);
+
+		// A migrate closure that parks the consumer between its data
+		// snapshot and its compare-and-swap: the consumer takes the `Arc`
+		// snapshot *before* calling `migrate`, so once `entered` fires the
+		// snapshot is guaranteed taken, and the closure then blocks until
+		// `release`. The consumer holds no map guard while parked here.
+		let (entered_tx, entered_rx) = unbounded::<()>();
+		let (release_tx, release_rx) = unbounded::<()>();
+
+		let migrate: Arc<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
+			Arc::new(move |bytes: &TestBuffer, _tier: Tier| {
+				entered_tx.send(()).unwrap();
+				release_rx.recv().unwrap();
+
+				let mut v = bytes.to_vec();
+				if let Some(last) = v.last_mut() {
+					*last = FAST_MARKER;
+				}
+
+				Some(v.into_boxed_slice())
+			});
+
+		let queue = MigrationQueue::spawn(objects.clone(), migrate, 1).unwrap();
+
+		queue.push((key, Tier::Fast));
+
+		// The consumer has snapshotted the old data and is parked inside the
+		// closure; replacing the object's data here is exactly the
+		// interleaving of a concurrent `set()` racing an in-flight copy.
+		entered_rx.recv().unwrap();
+		objects
+			.get_mut_ref(&key)
+			.unwrap()
+			.set_data(vec![0x99u8; BUFFER_LEN].into_boxed_slice());
+
+		release_tx.send(()).unwrap();
+		queue.flush();
+
+		// The migration's output was computed from a superseded snapshot, so
+		// the `Arc::ptr_eq` identity check must discard it: the replacement
+		// survives, not the Fast-stamped copy.
+		let data = objects.get_ref(&key).unwrap().data();
+		assert_eq!(&**data, &[0x99u8; BUFFER_LEN][..]);
+	}
+
+	#[test]
+	fn migrations_for_different_keys_all_complete_across_shards() {
+		let objects = make_objects();
+
+		let keys: Vec<HashedKey> = (0..32).collect();
+
+		for &key in &keys {
+			insert(&objects, key, 0);
+		}
+
+		// With two consumers the shard index is the key's parity, so both
+		// channels are used; the requested tier flips every *two* keys, so
+		// each shard also sees both tiers.
+		let queue = MigrationQueue::spawn(objects.clone(), marker_migrate(), 2).unwrap();
+
+		let requested_tier = |key: HashedKey| {
+			if (key / 2) % 2 == 0 { Tier::Fast } else { Tier::Slow }
+		};
+
+		for &key in &keys {
+			queue.push((key, requested_tier(key)));
+		}
+
+		queue.flush();
+
+		for &key in &keys {
+			let expected = match requested_tier(key) {
+				Tier::Fast => FAST_MARKER,
+				Tier::Slow => SLOW_MARKER,
+			};
+
+			assert_eq!(last_byte(&objects, key), expected, "key {key}");
+		}
+	}
+}
+
 #[cfg(all(test, feature = "lru_hybrid_cache"))]
 mod hybrid_tests {
 	use super::*;
@@ -2710,7 +2925,11 @@ mod hybrid_tests {
 		let stats = status.hybrid_stats();
 
 		assert!(stats.demotions > 0, "test should have produced a demotion");
-		assert_eq!(stats.fast_objects + stats.slow_objects, stats.total_objects());
+		// Cross-check the gauges against the independent object map instead
+		// of against their own sum: both inserted keys are still present
+		// (nothing here calls apply_evictions), so the tiers must account
+		// for exactly the objects the map holds.
+		assert_eq!(stats.total_objects(), objects.len() as u64);
 	}
 }
 
@@ -3161,7 +3380,11 @@ mod hybrid_tests {
 		let stats = status.hybrid_stats();
 
 		assert!(stats.demotions > 0, "test should have produced a demotion");
-		assert_eq!(stats.fast_objects + stats.slow_objects, stats.total_objects());
+		// Cross-check the gauges against the independent object map instead
+		// of against their own sum: both inserted keys are still present
+		// (nothing here calls apply_evictions), so the tiers must account
+		// for exactly the objects the map holds.
+		assert_eq!(stats.total_objects(), objects.len() as u64);
 	}
 }
 

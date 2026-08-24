@@ -600,10 +600,17 @@ mod hybrid_cache_tests {
         assert!(common.demotions > 0);
 
         // The object-count invariant should hold exactly at any instant.
-        let neutral = cache.hybrid_stats();
-        assert_eq!(
-            neutral.fast_objects + neutral.slow_objects,
-            neutral.total_objects(),
+        // Cross-check the gauges against an independent count of the live
+        // keys. (`total_objects()` is DEFINED as fast + slow, so comparing
+        // the sum against it -- as this test once did -- was a tautology.)
+        let live = (1..=10u32).filter(|key| cache.has(key)).count() as u64;
+        assert_eq!(live, 10, "no eviction should have occurred at this scale");
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || {
+                let stats = cache.hybrid_stats();
+                stats.fast_objects + stats.slow_objects == live
+            }),
+            "tier gauges never converged to the number of live objects",
         );
     }
 

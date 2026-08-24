@@ -801,8 +801,15 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// budget and no promotion can ever fit. Those tests predate the
 	// reservation and test policy mechanics, not DRAM accounting, so
 	// `PAPER_DISABLE_SHARED_OVERHEAD=1` restores their value-only
-	// semantics. `shared_overhead_reservation_is_active_by_default` in the
-	// lru integration suite pins the production default.
+	// semantics, and those binaries set it from their own
+	// `ensure_pmem_allocator_warm()`.
+	//
+	// The reservation itself is therefore covered by separate test binaries
+	// -- tests/{lru,lfu,lru_sized}_hybrid_cache_shared_overhead.rs -- which
+	// never set the variable, so every cache they build gets the production
+	// default. They are separate PROCESSES on purpose: this is read at every
+	// cache construction, so a test flipping the variable back would race
+	// every sibling test constructing a cache on another thread.
 	if std::env::var_os("PAPER_DISABLE_SHARED_OVERHEAD").is_some_and(|v| v == "1") {
 		return 0;
 	}
