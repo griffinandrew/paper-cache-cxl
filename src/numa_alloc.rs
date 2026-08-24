@@ -632,16 +632,28 @@ static TCACHES_CREATED: AtomicU64 = AtomicU64::new(0);
 ///   RSS      +0.13%  not resolved    +5.49%  p=0.056
 /// ```
 ///
-/// So it buys no measurable latency at either concurrency, and the one effect
-/// approaching significance is a ~5.5% RSS increase under concurrency -- the
-/// retention a thread cache exists to create. In a cache whose binding
-/// constraint is resident memory that is a bad trade, hence the default.
+/// Re-measured later on 8 arenas per node with the `dalloc`-under-retain fix
+/// in place (cluster12, 4M accesses, 15 GB / 1 GB, n=3 per arm):
 ///
-/// Kept rather than deleted because the correctness work is the expensive
-/// part and is done (see `tcache_hits_preserve_node_placement` and
-/// `concurrent_tcache_creation_is_safe`): a workload that is allocation-bound
-/// rather than migration-bound could flip this, and re-deriving the
-/// node-isolation argument later would cost more than the flag does.
+/// ```text
+///            1 client              8 clients
+///   GET      +0.41%  p=0.30        -2.31%  p=0.20
+///   SET      +0.18%  p=0.50        -3.45%  p=0.50
+///   RSS      +0.00%  p=1.00        +0.35%  p=1.00
+/// ```
+///
+/// Directionally better than the first measurement -- the RSS cost is gone
+/// and the concurrent latencies favour it -- but nothing clears significance
+/// (n=3v3 floors p at 0.10).
+///
+/// It also does not compose with worker binding, which is on by default: at
+/// 8 clients binding alone moves SET -7.00%, while binding plus this knob
+/// moves it only -2.52%. Whatever binding gains, caching gives most of it
+/// back. Left off for that reason; `PAPER_NUMA_SLOW_TCACHE=1` enables it.
+///
+/// Correctness is settled independently of the performance question, see
+/// `tcache_hits_preserve_node_placement` and
+/// `concurrent_tcache_creation_is_safe`.
 ///
 /// Read with `getenv` rather than `std::env::var` because this is reached from
 /// inside allocation and must not itself allocate.
@@ -1084,6 +1096,108 @@ unsafe impl<const NODE: u32> allocator_api2::alloc::Allocator for NumaAlloc<NODE
 // ---------------------------------------------------------------------------
 // environment checks and observability
 // ---------------------------------------------------------------------------
+
+/// Binds the **calling thread** to `node` for everything it subsequently
+/// faults -- its own stack growth included -- without touching any other
+/// thread's policy.
+///
+/// `set_mempolicy` is per-thread in Linux, not per-process, so this is a
+/// scalpel rather than the `numactl --membind` hammer: verified with a
+/// three-thread probe where a self-bound thread's stack landed on node 1
+/// while the main thread's policy and stack stayed on node 0.
+///
+/// Two limits worth knowing. It governs *faults*, so pages this thread has
+/// already touched do not move (the first few stack pages fault during
+/// pthread startup, before any of this runs). And it applies to allocations
+/// that reach the kernel through this thread -- memory served from a
+/// jemalloc arena was already bound by that arena's extent hooks, and is
+/// unaffected.
+///
+/// That second point is what makes binding safe for the migration workers: an
+/// explicit VMA policy from `mbind` overrides a thread's `set_mempolicy`
+/// default, so a consumer bound to node 0 still writes node-1 memory when it
+/// migrates. Verified: slow-tier bytes were identical to seven significant
+/// figures across unbound, bound-to-0 and bound-to-1 runs, at 2.58M
+/// demotions each.
+///
+/// Installs the policy unconditionally for `node` and returns whether the
+/// kernel accepted it. The `PAPER_BIND_WORKERS` gating lives in
+/// `worker_bind_node`, not here.
+pub fn bind_current_thread(node: u32) -> bool {
+	let mut nodemask = [0 as c_ulong_alias; NODEMASK_WORDS];
+	nodemask[(node as usize) / 64] |= 1 << ((node as usize) % 64);
+
+	let rc = unsafe {
+		libc::syscall(
+			libc::SYS_set_mempolicy,
+			(libc::MPOL_BIND | libc::MPOL_F_STATIC_NODES) as c_int,
+			nodemask.as_ptr(),
+			NODEMASK_BITS,
+		)
+	};
+
+	if rc == 0 {
+		THREADS_BOUND.fetch_add(1, Ordering::Relaxed);
+		true
+	} else {
+		false
+	}
+}
+
+/// Which node the cache's own threads bind themselves to.
+///
+/// Node 0 by default. Measured at n=6 per configuration on cluster7 and
+/// cluster23 (20M accesses, 15 GB / 1 GB, configurations interleaved within
+/// each rep, exact permutation test): binding to node 0 costs nothing at any
+/// percentile -- every effect is under 1% with sign counts at chance, at one
+/// and at eight clients.
+///
+/// Binding to node 1 is a different story: client GET p90/p95/p99 rise by
+/// 3.4-8.7%, all six reps separating, p=0.002 at the design floor, at both
+/// client counts. Node 1 is CPU-less here, so a thread bound to it takes every
+/// allocation and stack fault across the interconnect. The cost appears only
+/// in the tail -- p50 does not move at all -- so a median-and-mean reading of
+/// the very same runs looks like a null.
+///
+/// An earlier n=3 measurement recorded a ~7% SET *improvement* at 8 clients,
+/// equal for either node. That does not survive. At n=3v3 the exact
+/// permutation p-floor is 0.10, so the reported p=0.10 was the smallest value
+/// the test could emit and carried no evidence; the effect did not reproduce
+/// at n=6, and reversed sign between traces.
+///
+/// Node 0 is the default because that is where these threads' own scratch and
+/// stack growth belong; migrations are unaffected either way (see below).
+///
+/// `PAPER_BIND_WORKERS=1` targets node 1; any other value disables binding.
+///
+/// Note this is `MPOL_BIND`, a hard constraint: if node 0 fills, an unpolicied
+/// allocation on a bound thread is OOM-killed rather than spilling
+/// (`CONSTRAINT_MEMORY_POLICY`). The exposure is small -- stacks and glibc
+/// only, since arena memory carries its own VMA policy -- but it is not zero.
+pub fn worker_bind_node() -> Option<u32> {
+	static NODE: OnceLock<Option<u32>> = OnceLock::new();
+	*NODE.get_or_init(|| unsafe {
+		let raw = libc::getenv(c"PAPER_BIND_WORKERS".as_ptr());
+		if raw.is_null() {
+			return Some(NODE_FAST);
+		}
+		match *raw as u8 {
+			b'0' => Some(NODE_FAST),
+			b'1' => Some(NODE_SLOW),
+			_ => None,
+		}
+	})
+}
+
+/// Convenience for thread entry points: bind if configured, else do nothing.
+pub fn bind_worker_thread_if_configured() {
+	if let Some(node) = worker_bind_node() {
+		bind_current_thread(node);
+	}
+}
+
+/// Threads that installed a policy, for observability.
+pub static THREADS_BOUND: AtomicU64 = AtomicU64::new(0);
 
 /// Kernel settings that can silently move pages off the node they were bound to.
 ///
@@ -1589,9 +1703,13 @@ node0_grew={grew0} node1_grew={grew1} -> on_target={target} elsewhere={other}"
 			stats()
 		);
 		assert_eq!(misplaced, 0, "{misplaced} blocks landed on the wrong node");
-		assert_eq!(
-			created, THREADS as u64,
-			"expected one tcache per thread, got {created}"
+		// `>=`, not `==`: the counter is process-global and slow-tier caching
+		// is now on by default, so any other test running concurrently also
+		// creates tcaches. What this test needs is that each of its own
+		// threads got one.
+		assert!(
+			created >= THREADS as u64,
+			"expected at least one tcache per thread ({THREADS}), got {created}"
 		);
 	}
 
@@ -1653,7 +1771,12 @@ node0_grew={grew0} node1_grew={grew1} -> on_target={target} elsewhere={other}"
 
 		// Documents the behaviour rather than asserting it away: one tcache
 		// per departed thread, never reclaimed.
-		assert_eq!(created, CHURN as u64, "expected one tcache per churned thread");
+		// `>=` for the same reason as `concurrent_tcache_creation_is_safe`:
+		// the counter is process-global.
+		assert!(
+			created >= CHURN as u64,
+			"expected at least one tcache per churned thread ({CHURN}), got {created}"
+		);
 	}
 
 }
