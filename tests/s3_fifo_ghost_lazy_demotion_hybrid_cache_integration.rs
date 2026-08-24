@@ -199,6 +199,7 @@ mod hybrid_cache_tests {
 
         let promotions_before = cache.hybrid_stats().promotions;
         let demotions_before = cache.hybrid_stats().demotions;
+        let slow_objects_before = cache.hybrid_stats().slow_objects;
 
         // Touch key 1 again while it's still Fast -- sets its reference bit,
         // no reorder, no migration (same lazy-bit convention proven by
@@ -228,8 +229,16 @@ mod hybrid_cache_tests {
         cache.set(2u32, b"payload bytes B", None).expect("set should succeed");
         cache.get(&2u32).expect("get should succeed");
 
+        // Wait on the slow-tier GAUGE, not on the demotions counter. Since
+        // the counters were narrowed to count only migrations that are
+        // physically completed, this event does not move `demotions` at all:
+        // key 2's bytes are built Slow at admission, and its promotion and
+        // re-demotion happen inside one worker batch, so the buffer never
+        // physically becomes Fast and the Fast->Slow demotion is declined as
+        // already-in-tier. The gauge does move -- 0 slow objects to 1 -- and
+        // it is the state being asserted rather than a proxy for it.
         let demoted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.hybrid_stats().demotions > demotions_before
+            cache.hybrid_stats().slow_objects > slow_objects_before
         });
         assert!(demoted, "key 2 should have been demoted in key 1's place");
 
@@ -245,9 +254,23 @@ mod hybrid_cache_tests {
         // A reprieve is not a promotion (key 1 was already Fast) and key 2's
         // own promotion-then-immediate-demotion nets out to exactly one
         // real demotion, zero new promotions.
+        // Neither counter moves, and that is the correct outcome rather than
+        // a missed event. The counters record migrations that were physically
+        // COMPLETED. A reprieve copies nothing (key 1 was already Fast, and
+        // stays), and key 2's demotion copies nothing either: its bytes were
+        // built Slow at admission and its promotion never physically landed,
+        // so the Fast->Slow migration is declined as already-in-tier. The
+        // move that did happen is visible in the gauge, not the counters.
         let stats = cache.hybrid_stats();
-        assert_eq!(stats.promotions, promotions_before, "reprieve must not count as a promotion");
-        assert_eq!(stats.demotions, demotions_before + 1, "exactly key 2 should have been demoted");
+        assert_eq!(stats.promotions, promotions_before, "a reprieve copies nothing, so it cannot count as a promotion");
+        assert_eq!(
+            stats.demotions, demotions_before,
+            "key 2's bytes were already Slow, so its demotion moves nothing and must not be counted",
+        );
+        assert_eq!(
+            stats.slow_objects, slow_objects_before + 1,
+            "the demotion itself is real and must show up in the slow-tier gauge",
+        );
 
         assert_eq!(cache.get(&1u32).unwrap(), b"payload bytes A");
         assert_eq!(cache.get(&2u32).unwrap(), b"payload bytes B");
