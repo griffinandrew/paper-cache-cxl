@@ -147,6 +147,16 @@ pub mod two_q_fast_admission_reprieve_hybrid_cache;
 #[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
 pub use crate::two_q_fast_admission_reprieve_hybrid_cache::TwoQFastAdmissionReprieveHybridStats;
 
+// The FULL three-queue 2Q with fast-tier admission -- the only design here
+// whose queue algorithm matches `PaperPolicy::TwoQ`'s. `a1_out` holds real
+// resident objects in the slow tier rather than ghosts, and `k_out` is a
+// live parameter; see that module's docs.
+#[cfg(feature = "two_q_full_fast_admission_hybrid_cache")]
+pub mod two_q_full_fast_admission_hybrid_cache;
+
+#[cfg(feature = "two_q_full_fast_admission_hybrid_cache")]
+pub use crate::two_q_full_fast_admission_hybrid_cache::TwoQFullFastAdmissionHybridStats;
+
 // Single-instance, segmented-FIFO hybrid cache. Same one-PaperCache<K,
 // TieredBuffer> architecture as the other three, but with no promotion
 // policy at all — an object's position and tier are fixed for life once
@@ -1763,6 +1773,12 @@ where
 		let params_ok = match policy {
 			PaperPolicy::LruLfuHybrid(promote_k) => promote_k != 0,
 
+			// The one two-ratio design: BOTH must be in range, so it cannot
+			// join the single-ratio group below.
+			PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out) => {
+				(0.0..=1.0).contains(&k_in) && (0.0..=1.0).contains(&k_out)
+			},
+
 			PaperPolicy::TwoQHybrid(r)
 			| PaperPolicy::TwoQFastAdmissionHybrid(r)
 			| PaperPolicy::TwoQFastAdmissionReprieveHybrid(r)
@@ -2123,7 +2139,7 @@ where
 	///
 	/// The only stats accessor there is: the per-design
 	/// `<design>_hybrid_stats()` methods were removed with the runtime-policy
-	/// unification, and the 18 `<Design>HybridStats` names are aliases of the
+	/// unification, and the 19 `<Design>HybridStats` names are aliases of the
 	/// one `HybridStats` struct. The 8 size-split gauges read zero unless the
 	/// cache is running `LruSizedHybrid`. Read from
 	/// the design and want its extras.

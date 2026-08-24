@@ -144,6 +144,13 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// aged-out one-access key goes, not what is tracked per key.
 		PaperPolicy::TwoQFastAdmissionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
 
+		// Structurally identical again, despite the third queue: a key is
+		// resident in exactly one of `a1_in`/`a1_out`/`am` at any moment, so
+		// it still costs one HashList entry plus one combined `entries` row
+		// (queue tag + Option<Tier> tag + size). No reference bit, and no
+		// ghost list -- `a1_out` holds the real objects.
+		PaperPolicy::TwoQFullFastAdmissionHybrid(_, _) => (48 + 8) + (24 + 1 + 1 + 4),
+
 		// Structurally identical to LruHybrid: 48 bytes for the HashList
 		// entry, 8 bytes for the HashedKey, 24 bytes for the single
 		// combined per-key `entries` HashMap entry (tier + size, one map —
@@ -482,6 +489,23 @@ const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 
 /// block flags).
 #[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
 const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+
+/// Per-object DRAM cost of `TwoQFullFastAdmissionHybridStack`'s eviction-stack bookkeeping.
+///
+/// 44 + 20, unchanged from its two-queue siblings despite the third queue:
+/// one `HashList<HashedKey>` node for the single queue the key occupies at
+/// any one time (24-byte heap `Entry` + `cost(16) = 20` internal index slot
+/// = 44), plus one slot in the combined `entries` map (20 — the entry
+/// struct packs to 8 bytes, so `cost(16)` for the `(HashedKey, Entry)`
+/// pair).
+///
+/// The single-node term stays correct: `a1_in`, `a1_out` and `am` are
+/// disjoint, and a key is removed from one before being pushed to the next,
+/// so it is never resident in two at once. There is no ghost list to charge
+/// for either — `a1_out` holds real resident objects, which are already
+/// counted as tracked keys.
+#[cfg(feature = "two_q_full_fast_admission_hybrid_cache")]
+const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `TwoQGhostHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -858,6 +882,11 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 		#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
 		if matches!(policy, PaperPolicy::TwoQFastAdmissionReprieveHybrid(_)) {
 			overhead += TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
+		}
+
+		#[cfg(feature = "two_q_full_fast_admission_hybrid_cache")]
+		if matches!(policy, PaperPolicy::TwoQFullFastAdmissionHybrid(_, _)) {
+			overhead += TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
 		}
 
 		#[cfg(feature = "two_q_ghost_hybrid_cache")]

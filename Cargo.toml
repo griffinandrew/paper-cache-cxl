@@ -106,9 +106,9 @@ multitiering = ["key_pmem_value_pmem", "enable_tiering_manager", "hashtable_tier
 # tiers, not force the key into PMEM.
 #
 # ---------------------------------------------------------------------------
-# The 18 *_hybrid_cache features below are NOT mutually exclusive; any subset
+# The 19 *_hybrid_cache features below are NOT mutually exclusive; any subset
 # may be enabled together. They no longer select a design either -- every hybrid
-# build hosts all 18, and the design is chosen at runtime by the PaperPolicy
+# build hosts all 19, and the design is chosen at runtime by the PaperPolicy
 # passed to PaperCache::new(max_size, fast_tier_size, policy).
 #
 # What enabling one still does: ungates its `<design>_hybrid_cache` shim module
@@ -165,6 +165,22 @@ two_q_fast_admission_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # other hybrids.
 #
 two_q_fast_admission_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
+
+# The FULL (three-queue) 2Q with fast-tier admission -- the only design in
+# the tree whose queue algorithm matches `PaperPolicy::TwoQ`'s. The other
+# 2Q hybrids implement Simplified 2Q (a one-hit FIFO filter in front of an
+# LRU). Three live queues: a probation FIFO `a1_in` in the FAST tier, an
+# overflow FIFO `a1_out` in the SLOW tier holding REAL RESIDENT OBJECTS
+# (not ghosts), and a tier-segmented main LRU `am`. A hit in `a1_in` is a
+# complete no-op (2Q's central rule, and exactly where `two_q_hybrid_cache`
+# diverges); a hit in `a1_out` promotes to `am` at Fast. `a1_in` overflow
+# DEMOTES into `a1_out`; only `a1_out` overflow evicts. This is the first
+# design in which `k_out` is a live parameter, hence the only two-parameter
+# policy string: `2q-full-fast-admission-hybrid-<k_in>-<k_out>`. See
+# `worker/policy/policy_stack/two_q_full_fast_admission_hybrid_stack.rs`.
+# Same dependency reasoning as the other hybrids.
+#
+two_q_full_fast_admission_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance, segmented-FIFO hybrid cache: same one-PaperCache<K,
 # TieredBuffer> architecture as `lru_hybrid_cache`/`lfu_hybrid_cache`/
@@ -349,7 +365,7 @@ s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache = ["key_va
 # reservation, or fails to compile) whenever that edit is forgotten.
 #
 # It also selects the tier allocator for every hybrid variant: enabling it
-# turns on `numa_jemalloc`, so all 18 designs get NUMA-bound jemalloc arenas
+# turns on `numa_jemalloc`, so all 19 designs get NUMA-bound jemalloc arenas
 # rather than an ordinary unbound heap.
 hybrid_cache_common = ["numa_jemalloc"]
 

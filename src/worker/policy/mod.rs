@@ -30,26 +30,35 @@
 /// key is the same situation -- one swap wins, the other's `ptr_eq` fails and
 /// it drops its copy.
 ///
-/// Demotion/promotion counters stay on the worker rather than moving to the
-/// consumers: they are single atomic increments (never a bottleneck), and
-/// keeping them at enqueue time preserves their existing meaning relative to
-/// the policy stack, which is already updated by the time a batch is drained.
-/// The counts therefore lead the physical copies slightly; they converge once
-/// the queue drains.
+/// Demotion/promotion counters live on the consumers, not on the worker.
+/// Counting at enqueue time counted *intents*: every entry bumped a counter
+/// and then still had three ways to move nothing at all -- the object was
+/// gone, `migrate` declined, or the `Arc::ptr_eq` guard rejected a copy taken
+/// from a superseded value. One measured run reported 17,946,549 demotions
+/// against the 3,894,278 `migstats` saw drained, a 4.6x overstatement. The
+/// consumer is the only thread that knows whether `Object::set_data` ran, so
+/// the consumer is the thread that counts.
+///
+/// That costs less, not more: each consumer accumulates completions in plain
+/// local `u64`s and flushes them with a single `fetch_add` whenever its
+/// channel momentarily drains (plus once when the loop exits), so a burst of
+/// N migrations pays one atomic instead of N. Dropping the worker's per-entry
+/// increment on top of that makes the whole change a net *removal* of atomic
+/// operations.
 ///
 /// On by default: `MIGRATION_QUEUE_THREADS` sets the consumer count, and 0
 /// disables the queue entirely, in which case migrations apply inline on the
 /// worker exactly as before.
 #[cfg(feature = "hybrid_cache_common")]
 pub mod migration_queue {
-	use std::sync::atomic::{AtomicU64, Ordering};
+	use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	use std::sync::{Arc, OnceLock};
 	use std::thread::JoinHandle;
 
 	use crossbeam_channel::{Sender, unbounded};
 
 	use crate::object_store::ObjectStore;
-	use crate::{HashedKey, ObjectMapRef};
+	use crate::{HashedKey, ObjectMapRef, StatusRef};
 	use crate::worker::policy::policy_stack::Tier;
 
 	/// Default consumer count.
@@ -94,6 +103,51 @@ pub mod migration_queue {
 		}
 	}
 
+	/// Performs one physical tier migration: snapshot, rebuild, swap.
+	///
+	/// Returns `true` if and only if `Object::set_data` actually ran -- the one
+	/// point at which a migration has moved anything. The three ways it returns
+	/// `false` (the object is gone, `migrate` declined because the value is
+	/// already in the requested tier, or the value was replaced while the copy
+	/// was in flight) are all legitimate no-ops that displaced nothing, so none
+	/// of them may be counted as a promotion or a demotion.
+	///
+	/// Shared by the consumer threads and by `apply_tier_migrations`'
+	/// synchronous path (`MIGRATION_QUEUE_THREADS=0`) so the two cannot drift
+	/// apart on either the swap or what counts as a completion.
+	pub(crate) fn apply_migration<K, V>(
+		objects: &ObjectMapRef<K, V>,
+		migrate: &(dyn Fn(&V, Tier) -> Option<V> + Send + Sync),
+		key: HashedKey,
+		tier: Tier,
+	) -> bool {
+		// Snapshot the source bytes with no guard held -- `data()` is an `Arc`
+		// refcount bump and the `Arc` keeps them alive independently of the
+		// map. That same strong reference also makes the identity check below
+		// immune to ABA: the allocation cannot be freed, so its address cannot
+		// be recycled.
+		let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
+			return false;
+		};
+
+		// Declined: already in the requested tier, nothing to move.
+		let Some(new_data) = migrate(&old_data, tier) else {
+			return false;
+		};
+
+		// Check-and-act under one shard write lock: any writer must take the
+		// same lock, so nothing can replace the value between the comparison
+		// and the swap.
+		if let Some(mut object) = objects.get_mut_ref(&key) {
+			if Arc::ptr_eq(&object.data(), &old_data) {
+				object.set_data(new_data);
+				return true;
+			}
+		}
+
+		false
+	}
+
 	pub struct MigrationQueue {
 		/// One channel per consumer, indexed by `key % senders.len()`.
 		///
@@ -127,6 +181,22 @@ pub mod migration_queue {
 		/// so it must be counted or `flush` would never return.
 		enqueued: AtomicU64,
 		processed: Arc<AtomicU64>,
+
+		/// Whether a *completed* `Tier::Slow` migration is a demotion for the
+		/// policy currently running, i.e. `PolicyStack::
+		/// inline_demotion_accounting`. Mirrored here because the consumers have
+		/// no access to the stack, and the answer is a property of the policy
+		/// rather than of the move: the LFU-style design lands new objects fast
+		/// unconditionally and corrects them to slow, which needs the same
+		/// physical `set_data` but displaces nothing, so it is not a demotion in
+		/// the paper's sense (that design reports its real demotions through
+		/// `PolicyStack::drain_demotions` instead).
+		///
+		/// Written once per `apply_tier_migrations` pass by the worker and read
+		/// once per completed slow move by a consumer, both `Relaxed`: a single
+		/// hot, uncontended cache line, and the channel send/recv the value
+		/// travels alongside already orders the two.
+		demotion_accounting: Arc<AtomicBool>,
 	}
 
 	impl MigrationQueue {
@@ -135,6 +205,7 @@ pub mod migration_queue {
 			objects: ObjectMapRef<K, V>,
 			migrate: Arc<dyn Fn(&V, Tier) -> Option<V> + Send + Sync>,
 			threads: usize,
+			status: StatusRef,
 		) -> Option<Self>
 		where
 			K: 'static + Eq + Send + Sync,
@@ -145,6 +216,11 @@ pub mod migration_queue {
 			}
 
 			let processed = Arc::new(AtomicU64::new(0));
+
+			// Seeded with the `PolicyStack` trait default; the first
+			// `apply_tier_migrations` pass overwrites it before it can push
+			// anything, so this value is never actually read.
+			let demotion_accounting = Arc::new(AtomicBool::new(true));
 
 			let mut senders = Vec::with_capacity(threads);
 			let mut handles = Vec::with_capacity(threads);
@@ -157,6 +233,8 @@ pub mod migration_queue {
 				let objects = objects.clone();
 				let migrate = migrate.clone();
 				let processed = processed.clone();
+				let status = status.clone();
+				let demotion_accounting = demotion_accounting.clone();
 
 				let handle = std::thread::Builder::new()
 					.name(format!("mig-{index}"))
@@ -167,37 +245,61 @@ pub mod migration_queue {
 						#[cfg(feature = "numa_jemalloc")]
 						crate::numa_alloc::bind_worker_thread_if_configured();
 
+						// Completions are tallied here rather than at enqueue
+						// time on the worker: `apply_migration` returns `true`
+						// only when `Object::set_data` actually ran, so a
+						// migration whose object vanished, whose `migrate`
+						// declined, or whose `Arc::ptr_eq` guard rejected a
+						// superseded copy contributes nothing.
+						//
+						// Plain non-atomic locals, flushed once per burst. The
+						// loop already pays one atomic per item for
+						// `CountOnDrop`; a second per-item `fetch_add` would
+						// double that, which is exactly what this avoids.
+						let mut completed_promotions: u64 = 0;
+						let mut completed_demotions: u64 = 0;
+
 						while let Ok((key, tier)) = receiver.recv() {
 							// Counted on every path out of this iteration.
 							let _done = CountOnDrop(&processed);
 
-							// Snapshot the source bytes with no guard held --
-							// `data()` is an `Arc` refcount bump and the `Arc`
-							// keeps them alive independently of the map. That
-							// same strong reference also makes the identity
-							// check below immune to ABA: the allocation cannot
-							// be freed, so its address cannot be recycled.
-							let Some(old_data) =
-								objects.get_ref(&key).map(|object| object.data())
-							else {
-								continue;
-							};
+							if apply_migration(&objects, migrate.as_ref(), key, tier) {
+								match tier {
+									Tier::Fast => completed_promotions += 1,
 
-							// Declined: already in the requested tier, nothing to move.
-							let Some(new_data) = migrate(&old_data, tier) else {
-								continue;
-							};
-
-							// Check-and-act under one shard write lock: any
-							// writer must take the same lock, so nothing can
-							// replace the value between the comparison and the
-							// swap.
-							if let Some(mut object) = objects.get_mut_ref(&key) {
-								if Arc::ptr_eq(&object.data(), &old_data) {
-									object.set_data(new_data);
+									// Not every completed slow move is a demotion
+									// -- see `demotion_accounting`'s doc on the
+									// struct. A `Relaxed` load off a line this
+									// thread already owns.
+									Tier::Slow => {
+										if demotion_accounting.load(Ordering::Relaxed) {
+											completed_demotions += 1;
+										}
+									},
 								}
 							}
+
+							// Flush when the burst momentarily drains.
+							// `is_empty` is only consulted when there is
+							// something to flush, so a burst that completes
+							// nothing adds no work at all.
+							//
+							// Placed before `_done` drops, so the `Release`
+							// increment of `processed` publishes these counters
+							// too: a `flush()` that has observed `processed`
+							// (`Acquire`) is guaranteed to see them.
+							if (completed_promotions | completed_demotions) != 0 && receiver.is_empty() {
+								status.record_hybrid_promotions(completed_promotions);
+								status.record_hybrid_demotions(completed_demotions);
+
+								completed_promotions = 0;
+								completed_demotions = 0;
+							}
 						}
+
+						// Channel closed: publish whatever the last burst left.
+						status.record_hybrid_promotions(completed_promotions);
+						status.record_hybrid_demotions(completed_demotions);
 					});
 
 				match handle {
@@ -221,6 +323,7 @@ pub mod migration_queue {
 				handles,
 				enqueued: AtomicU64::new(0),
 				processed,
+				demotion_accounting,
 			})
 		}
 
@@ -258,6 +361,18 @@ pub mod migration_queue {
 			let depth = enqueued.saturating_sub(self.processed.load(Ordering::Acquire));
 
 			DEPTH_MAX.fetch_max(depth, Ordering::Relaxed);
+		}
+
+		/// Tells the consumers whether a completed `Tier::Slow` move counts as a
+		/// demotion for the policy stack that is about to hand them work -- see
+		/// `demotion_accounting`'s doc on the struct.
+		///
+		/// One `Relaxed` store per `apply_tier_migrations` pass, not per
+		/// migration. The value is constant for the life of a hybrid cache (a
+		/// hybrid cache exposes no way to switch policy), so this is a cheap way
+		/// to keep the consumers policy-agnostic rather than a hot write.
+		pub fn set_demotion_accounting(&self, enabled: bool) {
+			self.demotion_accounting.store(enabled, Ordering::Relaxed);
 		}
 
 		/// Blocks until every migration handed to the pool so far has been
@@ -383,24 +498,28 @@ pub mod parallel_migration {
 
 	/// Applies `apply` to every entry of `batch`, on the pool when the batch
 	/// is large enough to be worth the fan-out and inline otherwise.
-	pub fn apply_batch<F>(batch: Vec<(HashedKey, Tier)>, apply: F)
+	///
+	/// Returns how many entries `apply` reported as *completed* (`true`).
+	/// Tallied by the iterator rather than by a shared counter the closure
+	/// bumps: the serial path adds up a plain local and rayon's `count`
+	/// reduces per-thread partials, so counting costs no atomic per entry on
+	/// either path -- the caller pays one `fetch_add` for the whole batch.
+	pub fn apply_batch<F>(batch: Vec<(HashedKey, Tier)>, apply: F) -> u64
 	where
-		F: Fn((HashedKey, Tier)) + Send + Sync,
+		F: Fn((HashedKey, Tier)) -> bool + Send + Sync,
 	{
 		let parallel_threshold = threshold();
 
 		if parallel_threshold == 0 || batch.len() < parallel_threshold {
-			batch.into_iter().for_each(apply);
-			return;
+			return batch.into_iter().filter(|entry| apply(*entry)).count() as u64;
 		}
 
 		let Some(pool) = pool() else {
-			batch.into_iter().for_each(apply);
-			return;
+			return batch.into_iter().filter(|entry| apply(*entry)).count() as u64;
 		};
 
 		use rayon::prelude::*;
-		pool.install(|| batch.into_par_iter().for_each(apply));
+		pool.install(|| batch.into_par_iter().filter(|entry| apply(*entry)).count() as u64)
 	}
 }
 
@@ -929,6 +1048,7 @@ where
 			objects.clone(),
 			migrate.clone(),
 			migration_queue::threads(),
+			status.clone(),
 		);
 
 		let worker = PolicyWorker {
@@ -1167,73 +1287,109 @@ where
 	/// the same per-entry path rather than by special case.
 	#[cfg(feature = "hybrid_cache_common")]
 	fn apply_tier_migrations(&mut self) {
-		let Some(stack) = &mut self.policy_stack else { return };
-		let inline_demotion_accounting = stack.inline_demotion_accounting();
-		let migrations = stack.drain_tier_migrations();
+		let (inline_demotion_accounting, migrations) = {
+			let Some(stack) = &mut self.policy_stack else { return };
+
+			(stack.inline_demotion_accounting(), stack.drain_tier_migrations())
+		};
 
 		if !migrations.is_empty() {
-			if let Some(migrate) = &self.tier_migration_fn {
-				let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-					.into_iter()
-					.partition(|(_, tier)| *tier == Tier::Slow);
-				migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
-				migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
-				migstats::tick();
+			let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
+				.into_iter()
+				.partition(|(_, tier)| *tier == Tier::Slow);
 
-				let objects = &self.objects;
-				let status = &self.status;
-				let migration_queue = self.migration_queue.as_ref();
-
-				// Build the destination buffer with NO object-map guard
-				// held -- see the pre-unification history for the full
-				// latency reasoning; `Object::data()` is an `Arc` refcount
-				// bump and keeps the source bytes alive unlocked.
-				let apply_physical = |(key, tier): (HashedKey, Tier)| {
-					if let Some(queue) = migration_queue {
-						queue.push((key, tier));
-						return;
-					}
-
-					let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
-						return;
-					};
-
-					let Some(new_data) = migrate(&old_data, tier) else {
-						return;
-					};
-
-					if let Some(mut object) = objects.get_mut_ref(&key) {
-						if Arc::ptr_eq(&object.data(), &old_data) {
-							object.set_data(new_data);
-						}
-					}
-				};
-
-				parallel_migration::apply_batch(demotions, |entry| {
-					apply_physical(entry);
-					if inline_demotion_accounting {
-						status.record_hybrid_demotion();
-					}
-				});
-
-				parallel_migration::apply_batch(promotions, |entry| {
-					apply_physical(entry);
-					status.record_hybrid_promotion();
-				});
-
-				// Tests assert on tier residency right after triggering a
-				// migration; the standing consumer pool applies
-				// asynchronously, so drain it before returning.
-				#[cfg(test)]
-				if let Some(queue) = migration_queue {
-					queue.flush();
-				}
-			}
+			self.apply_migration_batches(demotions, promotions, inline_demotion_accounting);
 		}
 
-		let drained_demotions = stack.drain_demotions();
+		let drained_demotions = match &mut self.policy_stack {
+			Some(stack) => stack.drain_demotions(),
+			None => 0,
+		};
+
 		if drained_demotions > 0 {
 			self.status.record_hybrid_demotions(drained_demotions);
+		}
+	}
+
+	/// Applies one pass's worth of drained migrations and records the ones
+	/// that physically completed.
+	///
+	/// A migration is counted if and only if `Object::set_data` ran. The
+	/// counters used to fire once per entry handed to `apply_physical`, which
+	/// with the standing queue on (the default) meant they counted *enqueued
+	/// intents*: the entry had not moved a byte yet, and had three remaining
+	/// ways never to (see `migration_queue::apply_migration`). Measured
+	/// overstatement on one benchmark run was 4.6x. So the queued path leaves
+	/// the counting to the consumer that performs the swap, and the
+	/// synchronous path takes the completion count back from `apply_batch`.
+	///
+	/// Split out of [`Self::apply_tier_migrations`] so this accounting can be
+	/// unit-tested against hand-built batches, instead of having to coax a
+	/// real policy stack into emitting each of the four outcomes.
+	#[cfg(feature = "hybrid_cache_common")]
+	fn apply_migration_batches(
+		&self,
+		demotions: Vec<(HashedKey, Tier)>,
+		promotions: Vec<(HashedKey, Tier)>,
+		inline_demotion_accounting: bool,
+	) {
+		let Some(migrate) = &self.tier_migration_fn else { return };
+
+		migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
+		migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
+		migstats::tick();
+
+		let objects = &self.objects;
+		let status = &self.status;
+		let migration_queue = self.migration_queue.as_ref();
+
+		// The consumers cannot see the policy stack, so mirror the one bit of
+		// it they need before handing them anything to count.
+		if let Some(queue) = migration_queue {
+			queue.set_demotion_accounting(inline_demotion_accounting);
+		}
+
+		// Build the destination buffer with NO object-map guard held -- see
+		// the pre-unification history for the full latency reasoning;
+		// `Object::data()` is an `Arc` refcount bump and keeps the source
+		// bytes alive unlocked.
+		let apply_physical = |(key, tier): (HashedKey, Tier)| -> bool {
+			if let Some(queue) = migration_queue {
+				queue.push((key, tier));
+
+				// Handed off, not applied: nothing has moved yet, and the
+				// consumer that eventually moves it does the counting.
+				return false;
+			}
+
+			migration_queue::apply_migration(objects, migrate.as_ref(), key, tier)
+		};
+
+		let completed_demotions = parallel_migration::apply_batch(
+			demotions,
+			|entry| apply_physical(entry),
+		);
+
+		let completed_promotions = parallel_migration::apply_batch(
+			promotions,
+			|entry| apply_physical(entry),
+		);
+
+		// At most one atomic per direction per pass (and none at all when the
+		// count is zero, which with the queue on is every pass), where the old
+		// code paid one per entry regardless of outcome.
+		if inline_demotion_accounting {
+			status.record_hybrid_demotions(completed_demotions);
+		}
+
+		status.record_hybrid_promotions(completed_promotions);
+
+		// Tests assert on tier residency and on the counters right after
+		// triggering a migration; the standing consumer pool applies
+		// asynchronously, so drain it before returning.
+		#[cfg(test)]
+		if let Some(queue) = migration_queue {
+			queue.flush();
 		}
 	}
 
@@ -1606,6 +1762,7 @@ mod migration_queue_tests {
 	use super::migration_queue::MigrationQueue;
 	use crate::object::Object;
 	use crate::object_store::ObjectStore;
+	use crate::status::AtomicStatus;
 
 	type TestBuffer = Box<[u8]>;
 
@@ -1644,6 +1801,13 @@ mod migration_queue_tests {
 		})
 	}
 
+	fn make_status() -> crate::StatusRef {
+		Arc::new(
+			AtomicStatus::new(1_000_000, &[PaperPolicy::LruHybrid], PaperPolicy::LruHybrid)
+				.unwrap(),
+		)
+	}
+
 	fn make_objects() -> ObjectMapRef<u32, TestBuffer> {
 		crate::new_hybrid_object_map()
 	}
@@ -1665,7 +1829,7 @@ mod migration_queue_tests {
 
 		// Two consumers, so the per-key channel sharding is actually in play
 		// (a single consumer preserves global order trivially).
-		let queue = MigrationQueue::spawn(objects.clone(), marker_migrate(), 2).unwrap();
+		let queue = MigrationQueue::spawn(objects.clone(), marker_migrate(), 2, make_status()).unwrap();
 
 		// Demote then promote: the promote is the newer decision, so the
 		// buffer must physically end Fast. Both land in the same shard's
@@ -1692,7 +1856,7 @@ mod migration_queue_tests {
 		// Key 3 is deliberately never inserted.
 
 		let queue =
-			Arc::new(MigrationQueue::spawn(objects.clone(), marker_migrate(), 2).unwrap());
+			Arc::new(MigrationQueue::spawn(objects.clone(), marker_migrate(), 2, make_status()).unwrap());
 
 		queue.push((1, Tier::Slow)); // applied
 		queue.push((3, Tier::Fast)); // object absent from the map: skipped, still counted
@@ -1755,7 +1919,7 @@ mod migration_queue_tests {
 				Some(v.into_boxed_slice())
 			});
 
-		let queue = MigrationQueue::spawn(objects.clone(), migrate, 1).unwrap();
+		let queue = MigrationQueue::spawn(objects.clone(), migrate, 1, make_status()).unwrap();
 
 		queue.push((key, Tier::Fast));
 
@@ -1791,7 +1955,7 @@ mod migration_queue_tests {
 		// With two consumers the shard index is the key's parity, so both
 		// channels are used; the requested tier flips every *two* keys, so
 		// each shard also sees both tiers.
-		let queue = MigrationQueue::spawn(objects.clone(), marker_migrate(), 2).unwrap();
+		let queue = MigrationQueue::spawn(objects.clone(), marker_migrate(), 2, make_status()).unwrap();
 
 		let requested_tier = |key: HashedKey| {
 			if (key / 2) % 2 == 0 { Tier::Fast } else { Tier::Slow }
@@ -3937,5 +4101,224 @@ mod hybrid_tests {
 		// invisible to the promotion/demotion counters.
 		assert_eq!(after.promotions, before.promotions);
 		assert_eq!(after.demotions, before.demotions);
+	}
+}
+
+/// Completion accounting for tier migrations.
+///
+/// Exercised against hand-built batches rather than through a policy stack:
+/// the property under test -- a promotion or demotion is counted if and only
+/// if `Object::set_data` actually ran -- belongs to the application path, and
+/// coaxing a real stack into emitting each of the four possible outcomes
+/// (completed, object gone, `migrate` declined, guard rejected) would be far
+/// more fragile than handing them over directly.
+///
+/// Every test runs both ways round: `queued = true` keeps the standing
+/// consumer pool (the default configuration, and where the enqueued-intent
+/// overcount came from), `queued = false` drops it so migrations apply
+/// synchronously exactly as `MIGRATION_QUEUE_THREADS=0` would.
+///
+/// Gated on `hybrid_cache_common` rather than on one design's feature so the
+/// cases run under whichever hybrid design is compiled in. The worker's own
+/// policy stack is deliberately a plain `Lru` one: it is never consulted
+/// here, and it is the one policy `init_policy_stack` builds under every
+/// feature combination.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod migration_accounting_tests {
+	use super::*;
+
+	use crate::{
+		object::Object,
+		object::overhead::OverheadManager,
+		status::AtomicStatus,
+	};
+
+	type TestBuffer = Box<[u8]>;
+
+	const FAST_MARKER: u8 = 0xFA;
+	const SLOW_MARKER: u8 = 0x50;
+
+	/// `decline` makes `migrate` return `None` for everything, standing in for
+	/// "the value is already in the requested tier".
+	fn make_worker(queued: bool, decline: bool) -> (
+		PolicyWorker<u32, TestBuffer>,
+		ObjectMapRef<u32, TestBuffer>,
+		StatusRef,
+	) {
+		let (_tx, rx) = unbounded::<WorkerEvent>();
+
+		let objects: ObjectMapRef<u32, TestBuffer> = crate::new_hybrid_object_map();
+
+		let status = Arc::new(
+			AtomicStatus::new(1_000, &[PaperPolicy::Lru], PaperPolicy::Lru).unwrap(),
+		);
+
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		// Tags the buffer's last byte so a test can tell a real swap from a
+		// counter that merely fired. Never changes the length, for the same
+		// accounting reason the other hybrid test modules note.
+		let migrate: Box<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
+			Box::new(move |bytes, tier| {
+				if decline {
+					return None;
+				}
+
+				let marker = match tier {
+					Tier::Fast => FAST_MARKER,
+					Tier::Slow => SLOW_MARKER,
+				};
+
+				let mut value = bytes.to_vec();
+
+				if let Some(last) = value.last_mut() {
+					*last = marker;
+				}
+
+				Some(value.into_boxed_slice())
+			});
+
+		let mut worker = PolicyWorker::new_with_tier_migration(
+			rx,
+			objects.clone(),
+			status.clone(),
+			overhead_manager,
+			migrate,
+		).unwrap();
+
+		if !queued {
+			// Dropping the queue joins its consumers, so nothing is left in
+			// flight and `apply_migration_batches` takes the synchronous path.
+			worker.migration_queue = None;
+		}
+
+		(worker, objects, status)
+	}
+
+	fn insert(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) {
+		objects.insert(
+			key,
+			Object::new(key as u32, vec![0u8; 8].into_boxed_slice(), None),
+		);
+	}
+
+	fn last_byte(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) -> u8 {
+		let data = objects.get_ref(&key).unwrap().data();
+		*data.last().unwrap()
+	}
+
+	#[test]
+	fn completed_migrations_are_counted_once_in_the_right_direction() {
+		for queued in [true, false] {
+			let (worker, objects, status) = make_worker(queued, false);
+
+			insert(&objects, 1);
+			insert(&objects, 2);
+
+			worker.apply_migration_batches(
+				vec![(1, Tier::Slow)],
+				vec![(2, Tier::Fast)],
+				true,
+			);
+
+			let stats = status.hybrid_stats();
+
+			assert_eq!(stats.demotions, 1, "queued = {queued}");
+			assert_eq!(stats.promotions, 1, "queued = {queued}");
+
+			// Both swaps really happened, so both counters describe a physical
+			// copy rather than an intent to make one.
+			assert_eq!(last_byte(&objects, 1), SLOW_MARKER, "queued = {queued}");
+			assert_eq!(last_byte(&objects, 2), FAST_MARKER, "queued = {queued}");
+		}
+	}
+
+	#[test]
+	fn migration_whose_object_was_removed_is_not_counted() {
+		for queued in [true, false] {
+			let (worker, objects, status) = make_worker(queued, false);
+
+			insert(&objects, 1);
+			insert(&objects, 2);
+
+			// Removed between the stack emitting the migration and the copy
+			// being applied -- the `objects.get_ref` miss.
+			objects.clear();
+
+			worker.apply_migration_batches(
+				vec![(1, Tier::Slow)],
+				vec![(2, Tier::Fast)],
+				true,
+			);
+
+			let stats = status.hybrid_stats();
+
+			assert_eq!(stats.demotions, 0, "queued = {queued}");
+			assert_eq!(stats.promotions, 0, "queued = {queued}");
+		}
+	}
+
+	#[test]
+	fn declined_migration_is_not_counted() {
+		for queued in [true, false] {
+			let (worker, objects, status) = make_worker(queued, true);
+
+			insert(&objects, 1);
+			insert(&objects, 2);
+
+			worker.apply_migration_batches(
+				vec![(1, Tier::Slow)],
+				vec![(2, Tier::Fast)],
+				true,
+			);
+
+			let stats = status.hybrid_stats();
+
+			assert_eq!(stats.demotions, 0, "queued = {queued}");
+			assert_eq!(stats.promotions, 0, "queued = {queued}");
+
+			// `migrate` declined, so the bytes were never touched either.
+			assert_eq!(last_byte(&objects, 1), 0, "queued = {queued}");
+			assert_eq!(last_byte(&objects, 2), 0, "queued = {queued}");
+		}
+	}
+
+	/// The LFU-style design's `inline_demotion_accounting() == false`: its
+	/// `Tier::Slow` entries include admission corrections, which need the same
+	/// physical `set_data` but displace nothing. A completed slow move must
+	/// therefore leave the demotion counter alone, and the real count must
+	/// still arrive through `drain_demotions` without being double-counted.
+	#[test]
+	fn slow_moves_are_not_demotions_when_inline_accounting_is_off() {
+		for queued in [true, false] {
+			let (worker, objects, status) = make_worker(queued, false);
+
+			insert(&objects, 1);
+			insert(&objects, 2);
+
+			worker.apply_migration_batches(
+				vec![(1, Tier::Slow)],
+				vec![(2, Tier::Fast)],
+				false,
+			);
+
+			let stats = status.hybrid_stats();
+
+			// The slow move physically happened...
+			assert_eq!(last_byte(&objects, 1), SLOW_MARKER, "queued = {queued}");
+
+			// ...and still was not counted as a demotion.
+			assert_eq!(stats.demotions, 0, "queued = {queued}");
+
+			// Promotions carry no such ambiguity.
+			assert_eq!(stats.promotions, 1, "queued = {queued}");
+
+			// `drain_demotions` is that design's only source of demotions;
+			// `apply_tier_migrations` forwards it verbatim through this same
+			// counter, and the completed slow move above has not inflated it.
+			status.record_hybrid_demotions(3);
+
+			assert_eq!(status.hybrid_stats().demotions, 3, "queued = {queued}");
+		}
 	}
 }

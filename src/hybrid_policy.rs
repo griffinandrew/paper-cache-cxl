@@ -7,14 +7,14 @@
 
 //! Where each hybrid design's admission rule lives.
 //!
-//! All 18 `TieredBuffer`-based designs share the two
+//! All 19 `TieredBuffer`-based designs share the two
 //! `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks in `lib.rs`, gated only
 //! on `hybrid_cache_common`. The one thing that still genuinely differs
 //! between them on the `set()` path is which tier a value is built in, so
 //! that is all this module holds: [`admission_tier`], a runtime `match` over
 //! the cache's [`PaperPolicy`] with one arm per design.
 //!
-//! Dispatch is *runtime*, not compile-time. Every hybrid build compiles all 18
+//! Dispatch is *runtime*, not compile-time. Every hybrid build compiles all 19
 //! designs; the policy is chosen when the cache is constructed and stored in
 //! `AtomicStatus`, so two caches in one process can run different designs.
 //! An earlier revision dispatched through a `HybridPolicy` trait with one
@@ -75,7 +75,14 @@ pub fn admission_tier<K>(
 				None => crate::Tier::Fast,
 			}
 		},
-		PaperPolicy::LruHybrid | PaperPolicy::LruSizedHybrid | PaperPolicy::TwoQFastAdmissionHybrid(..) | PaperPolicy::TwoQFastAdmissionReprieveHybrid(..) => {
+		PaperPolicy::LruHybrid | PaperPolicy::LruSizedHybrid | PaperPolicy::TwoQFastAdmissionHybrid(..) | PaperPolicy::TwoQFastAdmissionReprieveHybrid(..) | PaperPolicy::TwoQFullFastAdmissionHybrid(..) => {
+			// Unconditionally Fast, and correct for every case: a brand-new
+			// key lands in `a1_in`, which is structurally Fast; a re-set of an
+			// `a1_out` key falls through to `promote_from_a1_out`, which makes
+			// it Fast; a re-set of an `am`-slow key falls through to `touch_am`,
+			// which does the same. Deliberately NOT the `Some(_) => Fast,
+			// None => Slow` arm the plain 2Q hybrids use -- that would defeat
+			// fast admission.
 			crate::Tier::Fast
 		},
 		PaperPolicy::S3FifoGhostHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionHybrid(..) | PaperPolicy::S3FifoHybrid(..) => {

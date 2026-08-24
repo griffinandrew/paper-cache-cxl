@@ -20,6 +20,7 @@ mod lfu_hybrid_stack;
 mod two_q_hybrid_stack;
 mod two_q_fast_admission_hybrid_stack;
 mod two_q_fast_admission_reprieve_hybrid_stack;
+mod two_q_full_fast_admission_hybrid_stack;
 mod fifo_hybrid_stack;
 mod lru_sized_hybrid_stack;
 mod s3_fifo_hybrid_stack;
@@ -56,6 +57,7 @@ use crate::{
 		two_q_hybrid_stack::TwoQHybridStack,
 		two_q_fast_admission_hybrid_stack::TwoQFastAdmissionHybridStack,
 		two_q_fast_admission_reprieve_hybrid_stack::TwoQFastAdmissionReprieveHybridStack,
+		two_q_full_fast_admission_hybrid_stack::TwoQFullFastAdmissionHybridStack,
 		fifo_hybrid_stack::FifoHybridStack,
 		lru_sized_hybrid_stack::LruSizedHybridStack,
 		s3_fifo_hybrid_stack::S3FifoHybridStack,
@@ -420,6 +422,21 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 			),
 		),
 
+		// The full three-queue 2Q -- the only design here whose queue
+		// algorithm matches `PaperPolicy::TwoQ`'s (the other 2Q hybrids are
+		// Simplified 2Q). Two parameters, not one: `k_out` sizes the live
+		// `a1_out` overflow queue and is a real, read parameter here, unlike
+		// in `TwoQStack`. Same default fast-tier budget and the same
+		// k_in-vs-fast-tier caveat as `TwoQFastAdmissionHybrid` above -- more
+		// acutely so, since `a1_in`'s reservation is carved out of the same
+		// DRAM budget `am`'s fast segment draws on.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out) => Box::new(
+			TwoQFullFastAdmissionHybridStack::new(k_in, k_out, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
+				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+			),
+		),
+
 		// Now carries the same `with_shared_overhead` reservation and the same
 		// high/low fast-tier watermarks as `LruHybrid`/`LfuHybrid`, in the
 		// same two-arm with/without-feature shape this comment used to ask
@@ -587,6 +604,8 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		PaperPolicy::TwoQFastAdmissionHybrid(k_in) => Box::new(TwoQFastAdmissionHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::TwoQFastAdmissionReprieveHybrid(k_in) => Box::new(TwoQFastAdmissionReprieveHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
+		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out) => Box::new(TwoQFullFastAdmissionHybridStack::new(k_in, k_out, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::FifoHybrid => Box::new(FifoHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]

@@ -42,7 +42,7 @@
 //! (see `stats` module docs for why).
 //!
 //! NOTE: this module is now only a shim -- a `TieredBuffer` re-export and a
-//! `<Design>HybridStats` alias of `HybridStats`. All 18 designs share the two
+//! `<Design>HybridStats` alias of `HybridStats`. All 19 designs share the two
 //! `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks in `lib.rs` and are
 //! selected at runtime by the `PaperPolicy` passed to `new()`. The design
 //! description above is still accurate; the module structure it implies is not.

@@ -34,6 +34,15 @@ pub enum PaperPolicy {
 	TwoQHybrid(f64),
 	TwoQFastAdmissionHybrid(f64),
 	TwoQFastAdmissionReprieveHybrid(f64),
+	/// The full (three-queue) 2Q with fast-tier admission -- the only
+	/// hybrid design whose queue algorithm matches [`PaperPolicy::TwoQ`]'s,
+	/// and the only hybrid carrying TWO parameters: `k_in` sizes the
+	/// fast-tier probation FIFO and `k_out` sizes the slow-tier `a1_out`
+	/// overflow FIFO, which holds real resident objects rather than ghosts.
+	/// `k_out` is a live parameter here; `TwoQ` writes its equivalent and
+	/// never reads it. See
+	/// `worker::policy::policy_stack::two_q_full_fast_admission_hybrid_stack`.
+	TwoQFullFastAdmissionHybrid(f64, f64),
 	FifoHybrid,
 	LruSizedHybrid,
 	/// Recency (LRU) in the fast tier, frequency (LFU) in the slow tier.
@@ -58,7 +67,7 @@ impl PaperPolicy {
 	/// Whether this policy is one of the tiered (hybrid) designs.
 	#[must_use]
 	pub fn is_hybrid(&self) -> bool {
-		matches!(self, PaperPolicy::FifoHybrid { .. } | PaperPolicy::LfuHybrid { .. } | PaperPolicy::LruHybrid { .. } | PaperPolicy::LruLfuHybrid { .. } | PaperPolicy::LruSizedHybrid { .. } | PaperPolicy::S3FifoGhostHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionHybrid { .. } | PaperPolicy::S3FifoHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveHybrid { .. } | PaperPolicy::TwoQFastAdmissionHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveHybrid { .. } | PaperPolicy::TwoQGhostHybrid { .. } | PaperPolicy::TwoQHybrid { .. })
+		matches!(self, PaperPolicy::FifoHybrid { .. } | PaperPolicy::LfuHybrid { .. } | PaperPolicy::LruHybrid { .. } | PaperPolicy::LruLfuHybrid { .. } | PaperPolicy::LruSizedHybrid { .. } | PaperPolicy::S3FifoGhostHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionHybrid { .. } | PaperPolicy::S3FifoHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveHybrid { .. } | PaperPolicy::TwoQFastAdmissionHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionHybrid { .. } | PaperPolicy::TwoQGhostHybrid { .. } | PaperPolicy::TwoQHybrid { .. })
 	}
 
 	pub fn is_auto(&self) -> bool {
@@ -84,6 +93,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::TwoQHybrid(k_in) => write!(f, "2q-hybrid-{k_in}"),
 			PaperPolicy::TwoQFastAdmissionHybrid(k_in) => write!(f, "2q-fast-admission-hybrid-{k_in}"),
 			PaperPolicy::TwoQFastAdmissionReprieveHybrid(k_in) => write!(f, "2q-fast-admission-reprieve-hybrid-{k_in}"),
+			PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out) => write!(f, "2q-full-fast-admission-hybrid-{k_in}-{k_out}"),
 			PaperPolicy::FifoHybrid => write!(f, "fifo-hybrid"),
 			PaperPolicy::LruSizedHybrid => write!(f, "lru-sized-hybrid"),
 			PaperPolicy::LruLfuHybrid(promote_k) => write!(f, "lru-lfu-hybrid-{promote_k}"),
@@ -119,6 +129,7 @@ impl FromStr for PaperPolicy {
 			// specific prefix has to be tested first or a more general guard
 			// silently swallows it. See
 			// `hybrid_does_not_collide_with_other_2q_forms`.
+			value if value.starts_with("2q-full-fast-admission-hybrid-") => parse_two_q_full_fast_admission_hybrid(value)?,
 			value if value.starts_with("2q-fast-admission-reprieve-hybrid-") => parse_two_q_fast_admission_reprieve_hybrid(value)?,
 			value if value.starts_with("2q-fast-admission-hybrid-") => parse_two_q_fast_admission_hybrid(value)?,
 			value if value.starts_with("2q-ghost-hybrid-") => parse_two_q_ghost_hybrid(value)?,
@@ -295,6 +306,39 @@ fn parse_two_q_fast_admission_reprieve_hybrid(value: &str) -> Result<PaperPolicy
 	}
 
 	Ok(PaperPolicy::TwoQFastAdmissionReprieveHybrid(k_in))
+}
+
+/// The only two-token hybrid parser. Modelled on [`parse_two_q`] rather
+/// than on the one-token hybrid parsers: `k_in` sizes the fast-tier
+/// probation FIFO, `k_out` the slow-tier `a1_out` overflow FIFO.
+///
+/// Unlike `parse_two_q` there is no `k_in + k_out <= 1.0` constraint: the
+/// two budgets are denominated against different physical tiers here
+/// (`k_in` against DRAM, `k_out` against PMEM), so their sum is not a
+/// fraction of any one thing.
+fn parse_two_q_full_fast_admission_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "2q-full-fast-admission-hybrid-"
+	let tokens = value[30..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 2 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(k_in) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	let Ok(k_out) = tokens[1].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&k_in) || !(0.0..=1.0).contains(&k_out) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out))
 }
 
 fn parse_s_three_fifo(value: &str) -> Result<PaperPolicy, CacheError> {
@@ -673,10 +717,93 @@ mod tests {
 			Ok(PaperPolicy::TwoQFastAdmissionHybrid(0.2)),
 		);
 
+		// The longest form of all, and the only two-token one. It shares
+		// nothing with the others past "2q-f", but it is tested first in
+		// `FromStr` and pinned here so a future, shorter guard cannot
+		// swallow it.
+		assert_eq!(
+			"2q-full-fast-admission-hybrid-0.2-0.5".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::TwoQFullFastAdmissionHybrid(0.2, 0.5)),
+		);
+
 		assert_ne!(
 			"2q-hybrid-0.2".parse::<PaperPolicy>().unwrap(),
 			"2q-fast-admission-hybrid-0.2".parse::<PaperPolicy>().unwrap(),
 		);
+
+		assert_ne!(
+			"2q-fast-admission-hybrid-0.2".parse::<PaperPolicy>().unwrap(),
+			"2q-full-fast-admission-hybrid-0.2-0.5".parse::<PaperPolicy>().unwrap(),
+		);
+	}
+
+	/// The only TWO-parameter policy string in the tree, hybrid or not.
+	#[test]
+	fn two_q_full_fast_admission_hybrid_round_trips_through_display_and_from_str() {
+		assert_eq!(
+			PaperPolicy::TwoQFullFastAdmissionHybrid(0.25, 0.5).to_string(),
+			"2q-full-fast-admission-hybrid-0.25-0.5",
+		);
+
+		assert_eq!(
+			"2q-full-fast-admission-hybrid-0.25-0.5".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::TwoQFullFastAdmissionHybrid(0.25, 0.5)),
+		);
+	}
+
+	/// Two ratios means two range checks. A parser that validated only
+	/// `k_in` -- the shape every other hybrid parser here has -- would pass
+	/// the second of these.
+	#[test]
+	fn two_q_full_fast_admission_hybrid_rejects_out_of_range_ratios() {
+		assert_eq!(
+			"2q-full-fast-admission-hybrid-1.5-0.5".parse::<PaperPolicy>(),
+			Err(CacheError::InvalidPolicy),
+		);
+
+		assert_eq!(
+			"2q-full-fast-admission-hybrid-0.25-1.5".parse::<PaperPolicy>(),
+			Err(CacheError::InvalidPolicy),
+		);
+	}
+
+	/// Exactly two tokens, no more and no fewer -- the failure mode of
+	/// having copied a one-token parser and only changed the byte offset.
+	/// The double-dash cases are how a negative ratio arrives: the format
+	/// is dash-separated, so it lands here as a token-count error rather
+	/// than a range error. Either way it must not parse.
+	#[test]
+	fn two_q_full_fast_admission_hybrid_rejects_the_wrong_token_count() {
+		assert!("2q-full-fast-admission-hybrid-0.25".parse::<PaperPolicy>().is_err());
+		assert!("2q-full-fast-admission-hybrid-0.25-0.5-0.75".parse::<PaperPolicy>().is_err());
+		assert!("2q-full-fast-admission-hybrid-".parse::<PaperPolicy>().is_err());
+		assert!("2q-full-fast-admission-hybrid".parse::<PaperPolicy>().is_err());
+		assert!("2q-full-fast-admission-hybrid-abc-0.5".parse::<PaperPolicy>().is_err());
+		assert!("2q-full-fast-admission-hybrid-0.25-abc".parse::<PaperPolicy>().is_err());
+		assert!("2q-full-fast-admission-hybrid--0.1-0.5".parse::<PaperPolicy>().is_err());
+		assert!("2q-full-fast-admission-hybrid-0.25--0.1".parse::<PaperPolicy>().is_err());
+	}
+
+	/// Unlike `parse_two_q`, the two ratios are budgets against different
+	/// physical tiers (`k_in` DRAM, `k_out` PMEM), so their sum is not a
+	/// fraction of anything and is deliberately NOT constrained to <= 1.
+	#[test]
+	fn two_q_full_fast_admission_hybrid_allows_ratios_summing_past_one() {
+		assert_eq!(
+			"2q-full-fast-admission-hybrid-0.8-0.8".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::TwoQFullFastAdmissionHybrid(0.8, 0.8)),
+		);
+
+		// ...whereas plain `2q-` still is.
+		assert_eq!("2q-0.8-0.8".parse::<PaperPolicy>(), Err(CacheError::InvalidPolicy));
+	}
+
+	/// It is a hybrid, so `new_hybrid` must accept it rather than
+	/// rejecting it with `InvalidPolicy` at the `is_hybrid()` gate.
+	#[test]
+	fn two_q_full_fast_admission_hybrid_is_reported_as_a_hybrid() {
+		assert!(PaperPolicy::TwoQFullFastAdmissionHybrid(0.25, 0.5).is_hybrid());
+		assert!(!PaperPolicy::TwoQ(0.25, 0.5).is_hybrid());
 	}
 
 	#[test]

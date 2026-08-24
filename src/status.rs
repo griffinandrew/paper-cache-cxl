@@ -572,6 +572,18 @@ impl AtomicStatus {
 		}
 	}
 
+	/// Records `count` promotions at once — the batched form of
+	/// [`Self::record_hybrid_promotion`]. Used by the migration consumers,
+	/// which tally completed promotions in a plain local `u64` and flush the
+	/// total with a single atomic when their channel drains, rather than
+	/// paying one atomic per migration.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub fn record_hybrid_promotions(&self, count: u64) {
+		if count > 0 {
+			self.hybrid_promotions.fetch_add(count, Ordering::Relaxed);
+		}
+	}
+
 
 
 	/// Mirrors `LfuHybridStack::admission_latched()`'s current value. Written

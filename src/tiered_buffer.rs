@@ -19,7 +19,7 @@
 //! live object's bytes exist in exactly one tier's allocation at any given
 //! time.
 //!
-//! One buffer type serves every hybrid design: all 18 share the same two
+//! One buffer type serves every hybrid design: all 19 share the same two
 //! `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks in `lib.rs`, and each
 //! design's module re-exports this type for source compatibility.
 //!
