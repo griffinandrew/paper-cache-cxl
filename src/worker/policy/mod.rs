@@ -161,11 +161,6 @@ pub mod migration_queue {
 				let handle = std::thread::Builder::new()
 					.name(format!("mig-{index}"))
 					.spawn(move || {
-						// Same opt-in binding as the policy worker: these threads do
-						// the allocate-copy-swap for every migration.
-						#[cfg(feature = "numa_jemalloc")]
-						crate::numa_alloc::bind_worker_thread_if_configured();
-
 						while let Ok((key, tier)) = receiver.recv() {
 							// Counted on every path out of this iteration.
 							let _done = CountOnDrop(&processed);

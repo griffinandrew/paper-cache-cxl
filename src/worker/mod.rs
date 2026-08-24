@@ -209,14 +209,7 @@ where
 }
 
 pub fn register_worker(mut worker: impl Worker) -> JoinHandle<Result<(), CacheError>> {
-	thread::spawn(move || {
-		// Opt-in: bind this worker's own allocations and stack growth to a node
-		// (`PAPER_BIND_WORKERS=0|1`). Per-thread, so no other thread is affected.
-		#[cfg(feature = "numa_jemalloc")]
-		crate::numa_alloc::bind_worker_thread_if_configured();
-
-		worker.run()
-	})
+	thread::spawn(move || worker.run())
 }
 
 pub use crate::worker::{
