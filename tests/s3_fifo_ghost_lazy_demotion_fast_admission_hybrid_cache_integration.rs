@@ -192,14 +192,65 @@ mod hybrid_cache_tests {
     fn a_key_with_no_ghost_history_still_lands_in_the_one_access_queue_fast() {
         ensure_pmem_allocator_warm();
 
+        // Admission here is Fast for *every* key absent from the object map
+        // (`hybrid_policy::admission_tier`), so both assertions below are
+        // "trivially true either way" in the same sense
+        // `a_key_that_ages_out_and_is_readmitted_lands_directly_in_main_queue`
+        // flags -- and in this variant the tier can never separate a ghost
+        // HIT from a ghost MISS at all, since the main queue's fast segment
+        // and the one-access queue are both DRAM. What separates them is
+        // WHICH DRAM queue the key is in, and one-access aging pressure is
+        // what makes that observable.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ONE_ACCESS_RATIO)).expect("cache should construct");
 
+        // Fat on purpose: ten of these overflow the one-access budget
+        // (`ONE_ACCESS_RATIO * max_size` = 1000 bytes) outright, so the aging
+        // below doesn't lean on this policy's measured 122-byte per-object
+        // accounting.
+        const FILLER: &[u8; 200] = &[b'f'; 200];
+
+        // Give key 1 -- and only key 1 -- a ghost record. An aged-out
+        // one-access key in this variant is removed outright and remembered
+        // only as a bare ghost key (see this file's `ONE_ACCESS_RATIO` doc).
+        cache.set(1u32, b"first value 123", None).expect("set should succeed");
+        for filler in 100u32..110 {
+            cache.set(filler, FILLER, None).expect("filler set should succeed");
+        }
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || !cache.has(&1u32)),
+            "key 1 should have aged out of the one-access queue into the ghost queue",
+        );
+
+        // Re-admit key 1 (ghost HIT) BEFORE admitting key 9 for the first
+        // time (ghost MISS), so key 1 is the older of the two in one-access
+        // FIFO order: were the ghost lookup to miss and put key 1 back in the
+        // one-access queue, the pressure below would take key 1 out first,
+        // and key 1 would not be there for the final assertion.
+        cache.set(1u32, b"first value 123", None).expect("re-set should succeed");
         cache.set(9u32, b"brand new value", None).expect("set should succeed");
 
-        assert_eq!(cache.tier_of(&9u32), Some(Tier::Fast));
-        assert_eq!(cache.get(&9u32).unwrap(), b"brand new value");
+        assert_eq!(cache.tier_of(&9u32), Some(Tier::Fast)); // trivially true either way
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast)); // trivially true either way
+
+        // The discriminating half: a second burst ages the one-access queue
+        // exactly as the first one did. Key 9 has no ghost record, so it is a
+        // one-access resident and goes; key 1 had one, so it is a main-queue
+        // resident and stays.
+        for filler in 110u32..120 {
+            cache.set(filler, FILLER, None).expect("filler set should succeed");
+        }
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || !cache.has(&9u32)),
+            "a key with no ghost record should be a one-access resident and age out",
+        );
+
+        assert!(
+            cache.has(&1u32),
+            "a ghost-queue hit should land in the main queue, immune to one-access aging",
+        );
+        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
     }
 
     // ── main-queue behavior (unaffected by the fast-tier one-access queue) ─

@@ -243,10 +243,19 @@ mod hybrid_cache_tests {
         // The payoff of carrying frequency across a demotion: an object that
         // was genuinely hot while in DRAM must outlive a one-hit-wonder that
         // was demoted alongside it, even though LRU order would say
-        // otherwise.
+        // otherwise. Note which way "otherwise" points here -- the six reads
+        // below leave key 1 at the recency head, so key 2's admission makes
+        // key 1 the LRU tail and key 1 demotes FIRST. In the slow tier key 1
+        // is therefore the older, less recently touched of the two: recency
+        // order would evict it first, and only its carried frequency saves
+        // it.
         let cache = make_cache();
 
         cache.set(1u32, &value(0xA1), None).expect("set should succeed");
+
+        // One object's accounted size, measured rather than assumed --
+        // `set()` updates `used_size` synchronously on the API thread.
+        let object_size = cache.status().expect("status").used_size();
 
         // Make key 1 hot while it is still fast. Reads only — a read never
         // changes tier for a fast key, it just bumps the carried counter.
@@ -256,31 +265,36 @@ mod hybrid_cache_tests {
 
         cache.set(2u32, &value(0xB2), None).expect("set should succeed");
 
-        let mut filler = force_into_slow(&cache, 2u32, 3u32);
-        filler = force_into_slow(&cache, 1u32, filler);
+        let filler = force_into_slow(&cache, 2u32, 3u32);
+        force_into_slow(&cache, 1u32, filler);
 
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
         assert_eq!(cache.tier_of(&2u32), Some(Tier::Slow));
+        assert_eq!(cache.hybrid_stats().evictions, 0, "nothing should have been evicted yet");
 
-        // Drive the cache past max_size so terminal eviction runs.
-        for _ in 0..1_400 {
-            cache.set(filler, &value(0xC3), None).expect("filler set should succeed");
-            filler += 1;
+        // Overshoot `max_size` by half an object, so terminal eviction has to
+        // remove exactly one -- and the test is about *which* one. The old
+        // version flooded the cache with 1_400 fillers, which evicts key 2
+        // under any eviction order at all and so proved nothing; a
+        // single-victim shrink cannot be satisfied by volume.
+        let resident = cache.status().expect("status").used_size();
+        cache.resize(resident - object_size / 2).expect("resize should succeed");
 
-            wait_until(std::time::Duration::from_secs(5), || {
-                cache.status().expect("status").used_size() <= MAX_SIZE
-            });
-        }
-
-        let stats = cache.hybrid_stats();
-        assert!(stats.evictions > 0, "expected terminal evictions; got {stats:?}");
-
-        // Key 2 (frequency 1) should have been evicted before key 1
-        // (frequency 7 when it demoted).
+        let evicted = wait_until(MIGRATION_TIMEOUT, || !cache.has(&2u32));
         assert!(
-            !cache.has(&2u32) || cache.has(&1u32),
-            "the once-hot object should not be evicted while the one-hit-wonder survives",
+            evicted,
+            "the one-hit-wonder (frequency 1) should be the single eviction victim",
         );
+
+        assert!(
+            cache.has(&1u32),
+            "the once-hot object (frequency 7 when it demoted) must outlive it",
+        );
+        assert_eq!(
+            cache.hybrid_stats().evictions, 1,
+            "exactly one object should have been evicted",
+        );
+        assert_eq!(cache.get(&1u32).unwrap(), value(0xA1), "and its bytes must be intact in PMEM");
     }
 
     // ── ttl across a tier move ────────────────────────────────────────────

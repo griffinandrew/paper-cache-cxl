@@ -637,3 +637,355 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 
 	}
 }
+
+#[cfg(test)]
+mod init_policy_stack_tests {
+	//! Runtime-dispatch tests for `init_policy_stack`.
+	//!
+	//! The "every design in every build, chosen at runtime" architecture rests
+	//! entirely on the match above: all 28 policies (18 of them tiered) are
+	//! compiled into every binary, and the design that actually runs is picked
+	//! by the `PaperPolicy` value handed to `PaperCache::new`. Nothing else in
+	//! the crate checks that the match returns the stack it was asked for. The
+	//! arms are 28 near-identical one-expression lines, several of which differ
+	//! by a single word inside a 60-character type name
+	//! (`S3FifoGhostLazyDemotionHybridStack` vs.
+	//! `S3FifoGhostLazyDemotionFastAdmissionHybridStack`), so a copy-paste slip
+	//! between two of them would silently run a different eviction design for
+	//! the lifetime of the process and misattribute every number measured from
+	//! it.
+	//!
+	//! One suite covers both cfg branches. The
+	//! `feature = "hybrid_cache_common"` arms and the
+	//! `not(feature = "hybrid_cache_common")` fallbacks construct the *same*
+	//! stack types -- the feature only adds the `with_shared_overhead`
+	//! reservation, which changes a fast-tier budget, not a stack's identity --
+	//! and every one of the 18 hybrid policies has an arm in both sets, so no
+	//! variant is unreachable in either build and no gate is needed here. (A
+	//! hybrid design added to only one of the two sets makes the match
+	//! non-exhaustive in the other build, which is a compile error rather than
+	//! something a test could observe.)
+	//!
+	//! Everything here is construction-only: no key is ever inserted, so
+	//! nothing allocates through the `Hybrid` allocator and these tests need no
+	//! warmed PMEM pool under `eviction_stacks_pmem`.
+
+	use std::collections::HashSet;
+
+	use super::*;
+
+	/// Every arm derives its sub-budgets from `max_size`: `max_size * 0.2` for
+	/// the hybrids' fast tier, `max_size * 0.1` per segment for
+	/// `LruSizedHybrid`, `k_in * max_size` for the 2Q family and
+	/// `ratio * max_size` for the S3-FIFO family. 1 MB is the scale the hybrid
+	/// integration suites build their caches at, and it keeps every one of
+	/// those derived budgets comfortably non-zero -- below ~5 bytes the 20%
+	/// fast-tier budget truncates to 0, which is a degenerate stack rather than
+	/// a dispatch question.
+	const TEST_MAX_SIZE: CacheSize = 1_000_000;
+
+	/// Number of `PaperPolicy` variants, and therefore the number of rows the
+	/// table below must have. Kept as a named constant so a mismatch reads as
+	/// "a design is missing from the table", not as an off-by-one.
+	const POLICY_VARIANT_COUNT: usize = 29;
+
+	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the 18
+	/// tiered designs this crate exists to compare.
+	const HYBRID_DESIGN_COUNT: usize = 19;
+
+	/// Every `PaperPolicy` variant, listed explicitly, in declaration order.
+	///
+	/// Column 0 is the value handed to `init_policy_stack`. Column 1 is a
+	/// *different value of the same variant* -- a different `k_in`, `ratio` or
+	/// `promote_k` -- used to pin down that `is_policy` discriminates on the
+	/// variant and not on the payload. For the payload-free variants the two
+	/// columns are necessarily the same value.
+	///
+	/// The list is written out rather than derived: `variant_name` below is an
+	/// exhaustive match with no `_` arm, so adding a variant to `PaperPolicy`
+	/// stops this file compiling until the new design is added here too.
+	const POLICY_DISPATCH_TABLE: [(PaperPolicy, PaperPolicy); POLICY_VARIANT_COUNT] = [
+		(PaperPolicy::Auto, PaperPolicy::Auto),
+		(PaperPolicy::Lfu, PaperPolicy::Lfu),
+		(PaperPolicy::Fifo, PaperPolicy::Fifo),
+		(PaperPolicy::Clock, PaperPolicy::Clock),
+		(PaperPolicy::Sieve, PaperPolicy::Sieve),
+		(PaperPolicy::Lru, PaperPolicy::Lru),
+		(PaperPolicy::Mru, PaperPolicy::Mru),
+		(PaperPolicy::TwoQ(0.25, 0.25), PaperPolicy::TwoQ(0.5, 0.4)),
+		(PaperPolicy::Arc, PaperPolicy::Arc),
+		(PaperPolicy::SThreeFifo(0.1), PaperPolicy::SThreeFifo(0.9)),
+		(PaperPolicy::LruHybrid, PaperPolicy::LruHybrid),
+		(PaperPolicy::LfuHybrid, PaperPolicy::LfuHybrid),
+		(PaperPolicy::TwoQHybrid(0.1), PaperPolicy::TwoQHybrid(0.9)),
+		(PaperPolicy::TwoQFastAdmissionHybrid(0.1), PaperPolicy::TwoQFastAdmissionHybrid(0.9)),
+		(PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.9)),
+		(PaperPolicy::TwoQFullFastAdmissionHybrid(0.25, 0.25), PaperPolicy::TwoQFullFastAdmissionHybrid(0.5, 0.4)),
+		(PaperPolicy::FifoHybrid, PaperPolicy::FifoHybrid),
+		(PaperPolicy::LruSizedHybrid, PaperPolicy::LruSizedHybrid),
+		(PaperPolicy::LruLfuHybrid(3), PaperPolicy::LruLfuHybrid(7)),
+		(PaperPolicy::S3FifoHybrid(0.1), PaperPolicy::S3FifoHybrid(0.9)),
+		(PaperPolicy::TwoQGhostHybrid(0.1), PaperPolicy::TwoQGhostHybrid(0.9)),
+		(PaperPolicy::S3FifoGhostHybrid(0.1), PaperPolicy::S3FifoGhostHybrid(0.9)),
+		(PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.1), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.9)),
+		(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(0.1), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(0.9)),
+		(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(0.1), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(0.9)),
+		(PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.1), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.9)),
+		(PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.1), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.9)),
+		(PaperPolicy::S3FifoLazyDemotionReprieveHybrid(0.1), PaperPolicy::S3FifoLazyDemotionReprieveHybrid(0.9)),
+		(PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(0.1), PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(0.9)),
+	];
+
+	/// The variant's name, ignoring any payload.
+	///
+	/// Deliberately exhaustive with no `_` arm: adding a variant to
+	/// `PaperPolicy` breaks this match at compile time, and that is the signal
+	/// to add the new design to `POLICY_DISPATCH_TABLE` (and to bump
+	/// `POLICY_VARIANT_COUNT`) so it is dispatch-tested like every other one.
+	fn variant_name(policy: &PaperPolicy) -> &'static str {
+		match policy {
+			PaperPolicy::Auto => "Auto",
+			PaperPolicy::Lfu => "Lfu",
+			PaperPolicy::Fifo => "Fifo",
+			PaperPolicy::Clock => "Clock",
+			PaperPolicy::Sieve => "Sieve",
+			PaperPolicy::Lru => "Lru",
+			PaperPolicy::Mru => "Mru",
+			PaperPolicy::TwoQ(..) => "TwoQ",
+			PaperPolicy::Arc => "Arc",
+			PaperPolicy::SThreeFifo(_) => "SThreeFifo",
+			PaperPolicy::LruHybrid => "LruHybrid",
+			PaperPolicy::LfuHybrid => "LfuHybrid",
+			PaperPolicy::TwoQHybrid(_) => "TwoQHybrid",
+			PaperPolicy::TwoQFastAdmissionHybrid(_) => "TwoQFastAdmissionHybrid",
+			PaperPolicy::TwoQFastAdmissionReprieveHybrid(_) => "TwoQFastAdmissionReprieveHybrid",
+			PaperPolicy::TwoQFullFastAdmissionHybrid(..) => "TwoQFullFastAdmissionHybrid",
+			PaperPolicy::FifoHybrid => "FifoHybrid",
+			PaperPolicy::LruSizedHybrid => "LruSizedHybrid",
+			PaperPolicy::LruLfuHybrid(_) => "LruLfuHybrid",
+			PaperPolicy::S3FifoHybrid(_) => "S3FifoHybrid",
+			PaperPolicy::TwoQGhostHybrid(_) => "TwoQGhostHybrid",
+			PaperPolicy::S3FifoGhostHybrid(_) => "S3FifoGhostHybrid",
+			PaperPolicy::S3FifoGhostLazyDemotionHybrid(_) => "S3FifoGhostLazyDemotionHybrid",
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_) => "S3FifoGhostLazyDemotionFastAdmissionHybrid",
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(_) => "S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid",
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(_) => "S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid",
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(_) => "S3FifoLazyDemotionFastAdmissionReprieveHybrid",
+			PaperPolicy::S3FifoLazyDemotionReprieveHybrid(_) => "S3FifoLazyDemotionReprieveHybrid",
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(_) => "S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid",
+		}
+	}
+
+	/// The group of policy values that share one constructed stack.
+	///
+	/// The match above has exactly one such collision: `Auto` and `Lfu` both
+	/// build a bare `LfuStack` (`Auto` means "let the cache choose", and it is
+	/// resolved to LFU right there in the dispatch). A single `LfuStack` cannot
+	/// report two different identities, so those two are one family and the
+	/// too-loose-`is_policy` cross-check below skips that pair -- and only that
+	/// pair. Every other variant is its own family, so every other pairing is
+	/// checked.
+	fn dispatch_family(policy: &PaperPolicy) -> &'static str {
+		match policy {
+			PaperPolicy::Auto | PaperPolicy::Lfu => "Lfu",
+			other => variant_name(other),
+		}
+	}
+
+	/// The premise of the architecture: asking for a design gets you that
+	/// design, for all 28 of them.
+	#[test]
+	fn every_policy_variant_dispatches_to_a_stack_that_claims_it() {
+		for (policy, _) in POLICY_DISPATCH_TABLE {
+			let stack = init_policy_stack(policy, TEST_MAX_SIZE);
+
+			if policy.is_auto() {
+				// `Auto` is resolved to LFU by the dispatch itself, so the
+				// stack it hands back is a plain `LfuStack` and may answer to
+				// either name; which one it answers to is not this test's
+				// business. That the two arms stay in lockstep is pinned by
+				// `auto_dispatches_to_the_same_stack_as_lfu` below.
+				assert!(
+					stack.is_policy(&PaperPolicy::Auto) || stack.is_policy(&PaperPolicy::Lfu),
+					"the stack built for `{policy}` claims to be neither `auto` nor the LFU design `auto` resolves to",
+				);
+
+				continue;
+			}
+
+			assert!(
+				stack.is_policy(&policy),
+				"`init_policy_stack` built a stack for `{policy}` that does not report itself as `{policy}`: that arm constructs some other design",
+			);
+		}
+	}
+
+	/// The other half of the premise, and the half a positive-only test cannot
+	/// see: a stack that says yes to everything would pass the test above while
+	/// making every runtime policy decision meaningless.
+	///
+	/// Foils are compared by *variant*, never by value, because `is_policy` is
+	/// deliberately payload-blind (see
+	/// `is_policy_matches_on_the_variant_not_its_payload`) -- asking a
+	/// `TwoQHybrid(0.1)` stack about `TwoQHybrid(0.9)` is not a cross-check.
+	#[test]
+	fn no_stack_claims_a_policy_it_was_not_built_for() {
+		for (policy, _) in POLICY_DISPATCH_TABLE {
+			let stack = init_policy_stack(policy, TEST_MAX_SIZE);
+
+			for (foil, _) in POLICY_DISPATCH_TABLE {
+				if dispatch_family(&foil) == dispatch_family(&policy) {
+					continue;
+				}
+
+				assert!(
+					!stack.is_policy(&foil),
+					"the stack built for `{policy}` also claims to be `{foil}`: `is_policy` is too loose, so a switch between those two designs would be treated as a no-op and the old design would keep running",
+				);
+			}
+		}
+	}
+
+	/// `is_policy` discriminates on the variant, not on the payload. Every
+	/// stack that carries a `k_in`/`ratio`/`promote_k` keeps it as its own
+	/// field; the identity question it answers is "which design am I", not
+	/// "which parameterisation am I".
+	///
+	/// This is the contract the cross-check above depends on, and it is what
+	/// stops a `k_in` that round-tripped through the policy string from making
+	/// a stack disown itself.
+	#[test]
+	fn is_policy_discriminates_on_the_payload_of_a_parameterised_policy() {
+		// A parameterised policy names both a design AND its tuning, so a
+		// stack built for one payload must not answer to another: that is
+		// what makes `MiniStackManager` rebuild rather than silently keep a
+		// stack tuned to the old value (mini_stack/manager.rs:50, :125).
+		// `TwoQStack::is_policy` is the clearest statement of the rule --
+		// `self.k_in == *k_in && self.k_out == *k_out`.
+		//
+		// `LruLfuHybrid` is the one exception in the crate: it matches
+		// `LruLfuHybrid(_)` and ignores `promote_k`, so a change to that
+		// knob alone does not read as a different policy. It is pinned here
+		// rather than papered over, so that if it is ever brought in line
+		// this test fails and says so.
+		for (policy, same_variant_other_payload) in POLICY_DISPATCH_TABLE {
+			if policy == same_variant_other_payload {
+				continue; // payload-free variant: nothing to discriminate
+			}
+
+			let stack = init_policy_stack(policy, TEST_MAX_SIZE);
+
+			if matches!(policy, PaperPolicy::LruLfuHybrid(_)) {
+				assert!(
+					stack.is_policy(&same_variant_other_payload),
+					"`{policy}` is documented as the one payload-insensitive \
+					 design, but its stack now rejects \
+					 `{same_variant_other_payload}` -- if `is_policy` was \
+					 deliberately tightened to compare `promote_k`, move it \
+					 in with the others and delete this branch",
+				);
+
+				continue;
+			}
+
+			assert!(
+				!stack.is_policy(&same_variant_other_payload),
+				"the stack built for `{policy}` also claims to be \
+				 `{same_variant_other_payload}`: `is_policy` ignores the \
+				 payload, so a retune would not rebuild the stack",
+			);
+		}
+	}
+
+	/// Guards the three tests above from silently shrinking: they are only
+	/// exhaustive if the table is.
+	#[test]
+	fn the_dispatch_table_covers_every_policy_variant_exactly_once() {
+		let names = POLICY_DISPATCH_TABLE
+			.into_iter()
+			.map(|(policy, _)| variant_name(&policy))
+			.collect::<HashSet<&'static str>>();
+
+		assert_eq!(
+			names.len(),
+			POLICY_VARIANT_COUNT,
+			"the dispatch table has {} rows but only {} distinct variants: a row is duplicated, so some design is not dispatch-tested at all",
+			POLICY_DISPATCH_TABLE.len(),
+			names.len(),
+		);
+
+		for (policy, same_variant_other_payload) in POLICY_DISPATCH_TABLE {
+			assert_eq!(
+				variant_name(&policy),
+				variant_name(&same_variant_other_payload),
+				"the second column of the `{policy}` row is a different variant (`{same_variant_other_payload}`), which would turn the payload check into an accidental cross-variant check",
+			);
+		}
+	}
+
+	/// `PaperPolicy::is_hybrid` is a hand-written `matches!` over 18 variants
+	/// with no exhaustiveness check of its own, and it is what decides whether
+	/// a cache gets a fast tier at all. Anchor it to the one list that *is*
+	/// compiler-checked against the enum.
+	#[test]
+	fn every_tiered_design_is_reported_as_hybrid() {
+		let hybrids = POLICY_DISPATCH_TABLE
+			.into_iter()
+			.filter(|(policy, _)| policy.is_hybrid())
+			.count();
+
+		assert_eq!(
+			hybrids, HYBRID_DESIGN_COUNT,
+			"`is_hybrid` recognises {hybrids} of the {POLICY_VARIANT_COUNT} designs, expected {HYBRID_DESIGN_COUNT}",
+		);
+
+		for (policy, _) in POLICY_DISPATCH_TABLE {
+			assert_eq!(
+				policy.is_hybrid(),
+				variant_name(&policy).ends_with("Hybrid"),
+				"`{policy}`: `is_hybrid` disagrees with the variant's own name",
+			);
+		}
+	}
+
+	/// A freshly dispatched stack tracks nothing, for every design. The object
+	/// map it will be paired with is empty at that moment, and `apply_evictions`
+	/// trusts the stack's view: a stack that arrives holding keys of its own
+	/// would have `evict_one` hand back a key the map has never heard of.
+	#[test]
+	fn every_freshly_built_stack_is_empty() {
+		for (policy, _) in POLICY_DISPATCH_TABLE {
+			let stack = init_policy_stack(policy, TEST_MAX_SIZE);
+			let tracked = stack.len();
+
+			assert_eq!(
+				tracked, 0,
+				"the stack built for `{policy}` reports {tracked} tracked keys before anything was inserted",
+			);
+
+			assert!(
+				!stack.contains(1),
+				"the stack built for `{policy}` claims to contain a key that was never inserted",
+			);
+		}
+	}
+
+	/// `Auto` and `Lfu` are the only two policies that share a stack. Pin that
+	/// down directly, rather than leaving it as an unstated exception in the
+	/// cross-check above: `Auto` is what a caller passes when it does not want
+	/// to name a design, so if its arm ever drifted, those callers would
+	/// quietly get different eviction behaviour with nothing else to notice.
+	#[test]
+	fn auto_dispatches_to_the_same_stack_as_lfu() {
+		let auto = init_policy_stack(PaperPolicy::Auto, TEST_MAX_SIZE);
+		let lfu = init_policy_stack(PaperPolicy::Lfu, TEST_MAX_SIZE);
+
+		for (candidate, _) in POLICY_DISPATCH_TABLE {
+			assert_eq!(
+				auto.is_policy(&candidate),
+				lfu.is_policy(&candidate),
+				"the stacks built for `auto` and `lfu` disagree about `{candidate}`, so `auto` is no longer resolving to the LFU design",
+			);
+		}
+	}
+}

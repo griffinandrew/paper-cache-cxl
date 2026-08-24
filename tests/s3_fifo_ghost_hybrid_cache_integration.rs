@@ -111,14 +111,69 @@ mod hybrid_cache_tests {
     fn a_key_with_no_ghost_history_still_lands_in_the_one_access_queue_slow() {
         ensure_pmem_allocator_warm();
 
+        // `admission_tier` answers `Slow` for *every* key absent from the
+        // object map, ghost record or not, so the tier of a lone brand-new
+        // key says nothing about the ghost queue -- which is all the old
+        // version of this test asserted. What separates a ghost MISS from a
+        // ghost HIT is what the worker does next: a hit is spliced into the
+        // main queue and promoted, a miss goes into the one-access queue and
+        // stays there. Both cases run through one cache below.
+        //
+        // The one-access queue gets 0.001 * 1_000_000 = 1000 bytes: several
+        // objects, so an admission never immediately self-evicts (contrast
+        // the near-zero ratio in the aging test above, where one object
+        // already exceeds the budget), but a burst of fat fillers ages its
+        // tail out.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostHybrid(0.001)).expect("cache should construct");
 
+        // Fat on purpose: ten of these overflow the 1000-byte one-access
+        // budget outright, so the aging below doesn't depend on this policy's
+        // exact per-object accounting.
+        const FILLER: &[u8; 200] = &[b'f'; 200];
+
+        // Give key 1 -- and only key 1 -- a ghost record.
+        cache.set(1u32, b"first value 123", None).expect("set should succeed");
+        for filler in 100u32..110 {
+            cache.set(filler, FILLER, None).expect("filler set should succeed");
+        }
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || !cache.has(&1u32)),
+            "key 1 should have aged out of the one-access queue into the ghost queue",
+        );
+
+        // Key 9 (never seen -> ghost MISS) is admitted BEFORE key 1 (aged out
+        // above -> ghost HIT) so that waiting on key 1's placement also
+        // proves key 9's has already been applied: the worker drains its
+        // events, and `apply_tier_migrations` its batch, in order. That is
+        // what makes the assertion about key 9 sound without a blind sleep.
         cache.set(9u32, b"brand new value", None).expect("set should succeed");
+        cache.set(1u32, b"first value 123", None).expect("re-set should succeed");
 
-        assert_eq!(cache.tier_of(&9u32), Some(Tier::Slow));
-        assert_eq!(cache.get(&9u32).unwrap(), b"brand new value");
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)),
+            "the ghost-hit key should have been spliced into the main queue and promoted",
+        );
+        assert_eq!(
+            cache.tier_of(&9u32), Some(Tier::Slow),
+            "a key with no ghost record must not be given the ghost-hit treatment",
+        );
+
+        // "One-access queue", not merely "slow tier", is the claim: key 9 is
+        // subject to exactly the aging that produced key 1's ghost record,
+        // while key 1 -- a main-queue resident now -- is immune to it.
+        for filler in 110u32..120 {
+            cache.set(filler, FILLER, None).expect("filler set should succeed");
+        }
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || !cache.has(&9u32)),
+            "the ghost-miss key should have aged out of the one-access queue",
+        );
+
+        assert!(cache.has(&1u32), "a main-queue key should survive one-access aging");
+        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
+        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
     }
 
     // ── main-queue behavior (unaffected by the ghost queue) ────────────────

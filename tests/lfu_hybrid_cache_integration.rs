@@ -154,31 +154,77 @@ mod hybrid_cache_tests {
     fn fast_tier_pressure_demotes_the_lowest_frequency_key() {
         ensure_pmem_allocator_warm();
 
-        // Fits exactly one value (same capacity proven to do so in
-        // `admission_once_fast_is_full_goes_directly_to_slow`).
+        // Demotion pressure in this stack comes from a promotion or an
+        // explicit `resize_fast_tier`, never from a plain admission -- a new
+        // key that doesn't fit is routed straight to slow and leaves every
+        // fast resident where it is (see
+        // `admission_once_fast_is_full_goes_directly_to_slow`). So this test
+        // seats three residents at distinct frequencies in a roomy fast tier
+        // and then shrinks the tier, which is the deterministic way to make
+        // `settle_fast_tier` pick a victim.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(DEMOTES_ONE_OF_TWO), PaperPolicy::LfuHybrid).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::LfuHybrid).expect("cache should construct");
 
-        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-
-        // Bump key 1's frequency well above 1 -- doesn't matter for
-        // admission itself (which only checks capacity, not frequency),
-        // but demonstrates a higher-frequency resident stays untouched.
-        for _ in 0..5 {
-            let _ = cache.get(&1u32);
+        for key in 1u32..=3 {
+            cache.set(key, &value(key as u8), None).expect("set should succeed");
+            assert_eq!(cache.tier_of(&key), Some(Tier::Fast));
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
 
-        // Fast tier is full -> key 2 is admitted directly to slow.
-        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
+        // Frequencies afterwards: key 1 = 4, key 2 = 3, key 3 = 2. Key 3 is
+        // deliberately both the NEWEST resident and the MOST RECENTLY
+        // accessed one, so nothing but genuine minimum-frequency selection
+        // picks it as the victim: insertion order would demote key 1, and
+        // recency order would demote key 2 (whose last access is older than
+        // key 1's and key 3's). No two consecutive accesses touch the same
+        // key, so no adjacent-duplicate coalescing can collapse the bumps.
+        for key in [1u32, 2, 1, 2, 1, 3] {
+            cache.get(&key).expect("get should succeed");
+        }
 
-        let admitted_slow = wait_until(MIGRATION_TIMEOUT, || {
-            cache.tier_of(&2u32) == Some(Tier::Slow)
-        });
-        assert!(admitted_slow, "key 2 should have been admitted directly to the slow tier");
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
+        // Wait for the three admissions to be published rather than assuming
+        // it, then measure one object's stack-accounted size instead of
+        // hardcoding it -- the ~1 KB payload dominates it, but the exact
+        // per-object bookkeeping is not this test's business.
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || cache.hybrid_stats().fast_objects == 3),
+            "all three keys should be resident in the fast tier",
+        );
+        let per_object = cache.hybrid_stats().fast_bytes_used / 3;
+        assert_eq!(cache.hybrid_stats().demotions, 0, "nothing should have demoted yet");
+
+        // Room for 2.5 objects: three residents put `fast_used` above the
+        // high watermark (0.98 x 2.5 = 2.45 objects), so a pass runs; it
+        // drains to the low watermark (0.95 x 2.5 = 2.375 objects), which
+        // the two survivors already satisfy -- exactly one demotion.
+        cache.set_fast_tier_size(CacheTierSize::Bytes(per_object * 5 / 2))
+            .expect("resize should succeed");
+
+        let demoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&3u32) == Some(Tier::Slow));
+        assert!(
+            demoted,
+            "the lowest-frequency resident should have been demoted; tiers were {:?}",
+            [cache.tier_of(&1u32), cache.tier_of(&2u32), cache.tier_of(&3u32)],
+        );
+
+        assert_eq!(
+            cache.tier_of(&1u32), Some(Tier::Fast),
+            "the highest-frequency resident must stay fast",
+        );
+        assert_eq!(
+            cache.tier_of(&2u32), Some(Tier::Fast),
+            "only the single lowest-frequency resident should have been demoted",
+        );
+        assert_eq!(
+            cache.hybrid_stats().demotions, 1,
+            "the shrink should have cost exactly one demotion",
+        );
+
+        // The demoted bytes really moved and survived the move intact. This
+        // read bumps key 3 to 3, which only ties the fast minimum (key 2 is
+        // also 3) and so cannot promote it back -- see
+        // `tie_with_fast_minimum_does_not_promote`.
+        assert_eq!(cache.get(&3u32).unwrap(), value(3));
     }
 
     // ── promotion ─────────────────────────────────────────────────────────
