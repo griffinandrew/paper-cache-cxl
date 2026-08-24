@@ -82,6 +82,65 @@ mod hybrid_cache_tests {
         ).expect("cache should construct")
     }
 
+
+    /// Sets keys `1..=count` as 64-byte objects, then blocks until at least
+    /// `expect_aged` of them have actually aged out of `a1_in` into `a1_out`,
+    /// returning those keys oldest-first (= ascending, since `a1_in` demotes
+    /// its tail and the tail is the earliest-admitted key).
+    ///
+    /// The wait is the whole point: `settle_a1_in` runs synchronously inside
+    /// the policy worker's `insert`, but the `(key, Tier::Slow)` migrations it
+    /// emits are applied off-thread, so a check made immediately after the
+    /// `set` loop sees ZERO aged keys.
+    ///
+    /// Only the returned keys can be promoted into `am`: an `a1_in` hit is a
+    /// complete no-op in this design, so re-`get`ting a key that never aged
+    /// out moves nothing.
+    fn set_and_age_out(
+        cache: &PaperCache<u32, TieredBuffer>,
+        count: u32,
+        expect_aged: usize,
+    ) -> Vec<u32> {
+        for key in 1..=count {
+            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+        }
+
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || {
+                (1..=count).filter(|key| cache.tier_of(key) == Some(Tier::Slow)).count() >= expect_aged
+            }),
+            "expected at least {expect_aged} of {count} keys to age out of a1_in into a1_out",
+        );
+
+        (1..=count)
+            .filter(|key| cache.tier_of(key) == Some(Tier::Slow))
+            .collect()
+    }
+
+    /// Re-accesses each of `keys` — which must currently be sitting in
+    /// `a1_out` — and blocks until every one of those promotions has been
+    /// applied.
+    ///
+    /// This is the ONLY route into `am`: an `a1_in` hit is a complete no-op,
+    /// so the `set` + `get` + `get` shape borrowed from the Simplified-2Q
+    /// suites promotes nothing at all. `keys` is consumed in order, so it is
+    /// also `am`'s LRU order afterwards: `keys[0]` ends up deepest and is the
+    /// first demotion candidate.
+    fn promote_out_of_a1_out(cache: &PaperCache<u32, TieredBuffer>, keys: &[u32]) {
+        let before = cache.hybrid_stats().promotions as usize;
+
+        for key in keys {
+            cache.get(key).expect("a get on an a1_out key should HIT, not miss");
+        }
+
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || {
+                cache.hybrid_stats().promotions as usize >= before + keys.len()
+            }),
+            "every a1_out hit should have promoted its key into am at Tier::Fast",
+        );
+    }
+
     /// Forces the one-time PMEM allocator pool init/prewarm to complete
     /// before a test's own timing-sensitive assertions begin.
     ///
@@ -297,43 +356,80 @@ mod hybrid_cache_tests {
     fn eviction_prefers_a1_out_over_the_main_queue() {
         ensure_pmem_allocator_warm();
 
+        // a1_in reservation = 0.0002 × 1_000_000 = 200 bytes, which holds two
+        // 84-byte objects, so the THIRD set is the one that ages key 1 out —
+        // the original two-set fixture never overflowed a1_in at all. a1_out's
+        // budget = 0.0005 × 1_000_000 = 500 bytes = 5 objects, so the churn
+        // below overruns it repeatedly. The 500_000-byte fast tier leaves am
+        // an effective 499_800, so nothing in `am` is ever under pressure:
+        // a1_out overflow is the only eviction driver in this fixture.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
             CacheTierSize::Bytes(500_000),
-            PaperPolicy::TwoQFullFastAdmissionHybrid(0.0002, 0.0002),
+            PaperPolicy::TwoQFullFastAdmissionHybrid(0.0002, 0.0005),
         ).expect("cache should construct");
 
-        // Key 1 ages into a1_out, then proves itself and lands in `am`.
-        cache.set(1u32, &[1u8; 64], None).expect("set should succeed");
-        cache.set(2u32, &[2u8; 64], None).expect("set should succeed");
+        // Key 1 has to AGE OUT and then be hit to reach `am`. Hitting it while
+        // it is still in `a1_in` is a complete no-op, which would leave `am`
+        // empty and make the eviction-priority claim untestable.
+        let aged = set_and_age_out(&cache, 3, 1);
 
-        assert!(
-            wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)),
-            "key 1 should have aged into a1_out",
-        );
+        assert_eq!(aged, vec![1u32], "the a1_in tail — the oldest key — is the one that ages out");
 
-        cache.get(&1u32).expect("get should hit");
+        promote_out_of_a1_out(&cache, &aged);
 
         assert!(
             wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)),
-            "key 1 should have been promoted into am",
+            "an a1_out hit should have promoted key 1 into am at Tier::Fast",
         );
 
         // Everything after this churns through a1_in into a1_out, which
-        // overflows its tiny budget and is drained first.
-        for key in 3..=40u32 {
+        // overruns its 500-byte budget; `evict_one` drains a1_out first.
+        for key in 4..=40u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
         }
 
         assert!(
             wait_until(MIGRATION_TIMEOUT, || cache.hybrid_stats().evictions > 0),
-            "should have evicted from a1_out",
+            "a1_out capacity pressure should have produced evictions",
         );
 
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let stats = cache.hybrid_stats();
+
+        // 37 keys are pushed through a 5-object a1_out, so ~32 of them are
+        // evicted; the bound is loose, but it has to be well past "one".
+        assert!(
+            stats.evictions >= 10,
+            "the churn should have drained a1_out repeatedly, not once: {} evictions",
+            stats.evictions,
+        );
+
+        // The proven, DRAM-resident key outlives every unproven a1_out key,
+        // even though it is the OLDEST key in the cache.
         assert!(
             cache.has(&1u32),
             "the proven main-queue key should outlive unproven a1_out keys",
         );
+
+        assert_eq!(
+            cache.tier_of(&1u32),
+            Some(Tier::Fast),
+            "and it should still be sitting in am's fast segment",
+        );
+
+        // Nothing leaked: every departure is accounted for by an eviction, and
+        // every eviction came out of a1_out (key 1, in `am`, is still here).
+        let present = (1..=40u32).filter(|key| cache.has(key)).count() as u64;
+
+        assert_eq!(
+            present,
+            40 - stats.evictions,
+            "objects still present should equal admissions minus evictions",
+        );
+
+        assert_eq!(cache.get(&1u32).unwrap(), vec![1u8; 64]);
     }
 
     // ── am behaves like lru_hybrid_cache ──────────────────────────────────
@@ -344,32 +440,84 @@ mod hybrid_cache_tests {
 
         let cache = make_cache();
 
-        // Each key is admitted, aged into a1_out by the next few admissions,
-        // then re-accessed to promote it into `am`, where it competes for the
-        // (reduced) fast budget.
-        for key in 1..=12u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
-        }
+        // An `a1_in` hit is a COMPLETE no-op here, so the `set` + `get` +
+        // `get` shape that promotes in the Simplified-2Q siblings would leave
+        // all 24 keys in `a1_in` and put NOTHING in `am`. The only route in is
+        // to age out of `a1_in` first and take the hit in `a1_out`.
+        //
+        // 24 sets against an 800-byte `a1_in` (K_IN * MAX_SIZE, 84 bytes per
+        // 64-byte object) keeps 9 resident and ages the other 15 out.
+        let aged = set_and_age_out(&cache, 24, 15);
 
-        for key in 1..=12u32 {
-            let _ = cache.get(&key);
-            let _ = cache.get(&key);
-        }
+        assert_eq!(aged.len(), 15, "sizing: 24 sets should age exactly 15 keys into a1_out");
+
+        let ageing_demotions = cache.hybrid_stats().demotions;
+
+        // 15 × 84 = 1_260 bytes of promoted objects against am's effective
+        // fast budget of FAST_TIER - K_IN * MAX_SIZE = 800: `am` has to shed
+        // its LRU tail into PMEM. No further `set` happens after this point,
+        // so every demotion past `ageing_demotions` came out of `am`.
+        promote_out_of_a1_out(&cache, &aged);
 
         assert!(
-            wait_until(MIGRATION_TIMEOUT, || cache.hybrid_stats().demotions > 0),
-            "main-queue pressure should have demoted something",
+            wait_until(MIGRATION_TIMEOUT, || {
+                cache.hybrid_stats().demotions > ageing_demotions
+                    && aged.iter().any(|key| cache.tier_of(key) == Some(Tier::Slow))
+            }),
+            "promoting 1_260 bytes into an 800-byte am fast budget must demote from am",
         );
 
-        let slow: Vec<u32> = (1..=12u32)
-            .filter(|key| cache.tier_of(key) == Some(Tier::Slow))
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Snapshot every tier BEFORE reading any value back: a `get` on a slow
+        // `am` key is an `am` hit, which re-promotes it and would erase the
+        // very ordering being asserted.
+        let tiers: Vec<Option<Tier>> = aged.iter().map(|key| cache.tier_of(key)).collect();
+
+        assert!(
+            tiers.iter().all(|tier| tier.is_some()),
+            "am pressure demotes, it must never drop a key: {tiers:?}",
+        );
+
+        let demoted: Vec<u32> = aged
+            .iter()
+            .zip(&tiers)
+            .filter(|(_, tier)| **tier == Some(Tier::Slow))
+            .map(|(key, _)| *key)
             .collect();
 
-        assert!(!slow.is_empty(), "at least one key should be slow");
+        assert!(!demoted.is_empty(), "am should have demoted at least one key");
 
-        for key in &slow {
+        assert!(
+            tiers.iter().any(|tier| *tier == Some(Tier::Fast)),
+            "am should still have a fast segment — the budget sheds bytes, it does not empty",
+        );
+
+        // THE LRU TAIL, and only the tail: fast keys are a contiguous prefix
+        // of `am` from the MRU end, and `aged` was promoted in ascending
+        // order, so the demoted keys must be a contiguous PREFIX of `aged`
+        // with no fast key sitting deeper than a slow one.
+        let last_slow = tiers.iter().rposition(|tier| *tier == Some(Tier::Slow)).expect("checked above");
+        let first_fast = tiers.iter().position(|tier| *tier == Some(Tier::Fast)).expect("checked above");
+
+        assert!(
+            last_slow < first_fast,
+            "demotion must take am's LRU tail, in order: {:?}",
+            aged.iter().zip(&tiers).collect::<Vec<_>>(),
+        );
+
+        // Real data movement: every demoted object still reads back
+        // byte-for-byte out of PMEM. These gets re-promote, so they come last.
+        for key in &demoted {
+            assert!(cache.has(key), "a demotion must not drop the object");
             assert_eq!(cache.get(key).unwrap(), vec![*key as u8; 64]);
         }
+
+        assert_eq!(
+            cache.hybrid_stats().evictions,
+            0,
+            "am pressure demotes into PMEM; only a1_out overflow evicts",
+        );
     }
 
     #[test]
@@ -456,30 +604,82 @@ mod hybrid_cache_tests {
     fn set_fast_tier_size_takes_effect_at_runtime() {
         ensure_pmem_allocator_warm();
 
+        // `make_cache`'s queue sizing (a1_in = K_IN × MAX_SIZE = 800 bytes = 9
+        // resident 84-byte objects; a1_out = 4_000 bytes, roomy) but with a
+        // deliberately generous 4_000-byte fast tier: am's effective fast
+        // budget is 4_000 - 800 = 3_200, which holds all 15 promotions
+        // (15 × 84 = 1_260) with room to spare. `am` therefore demotes NOTHING
+        // until the fast tier itself is resized, so every demotion after
+        // `before` is attributable to `set_fast_tier_size` alone.
+        //
+        // The original fixture's a1_in was 0.001 × 1_000_000 = 1_000 bytes,
+        // which holds 11 objects — its 10 sets never aged a single key out, so
+        // `am` was empty and shrinking the fast tier had nothing to demote.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(500_000),
-            PaperPolicy::TwoQFullFastAdmissionHybrid(0.001, 0.5),
+            MAX_SIZE,
+            CacheTierSize::Bytes(4_000),
+            PaperPolicy::TwoQFullFastAdmissionHybrid(K_IN, K_OUT),
         ).expect("cache should construct");
 
-        for key in 1..=10u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
-        }
+        // An a1_in hit is a no-op, so `get`ting a key twice right after
+        // `set`ting it promotes nothing: `am` is reachable only by ageing into
+        // a1_out and taking the hit there.
+        let aged = set_and_age_out(&cache, 24, 15);
+        promote_out_of_a1_out(&cache, &aged);
 
-        for key in 1..=10u32 {
-            let _ = cache.get(&key);
-            let _ = cache.get(&key);
-        }
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || {
+                aged.iter().all(|key| cache.tier_of(key) == Some(Tier::Fast))
+            }),
+            "a 3_200-byte am fast budget should hold all 15 promoted objects",
+        );
 
         let before = cache.hybrid_stats().demotions;
 
-        cache.set_fast_tier_size(CacheTierSize::Bytes(400))
+        // 1_200 - 800 = 400 bytes left for `am`, against 1_260 bytes resident.
+        cache.set_fast_tier_size(CacheTierSize::Bytes(1_200))
             .expect("resize should succeed");
 
         assert!(
-            wait_until(MIGRATION_TIMEOUT, || cache.hybrid_stats().demotions > before),
-            "shrinking the fast tier should have demoted something",
+            wait_until(MIGRATION_TIMEOUT, || {
+                cache.hybrid_stats().demotions > before
+                    && aged.iter().any(|key| cache.tier_of(key) == Some(Tier::Slow))
+            }),
+            "shrinking the fast tier should have demoted am's LRU tail into PMEM",
         );
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let stats = cache.hybrid_stats();
+
+        // The new budget is actually respected — a1_in's 756 bytes plus what
+        // is left of am's fast segment — rather than merely producing one
+        // token migration.
+        assert!(
+            stats.fast_bytes_used <= 1_200,
+            "fast_bytes_used {} exceeded the newly configured budget 1_200",
+            stats.fast_bytes_used,
+        );
+
+        assert_eq!(
+            stats.evictions,
+            0,
+            "a fast-tier shrink demotes into PMEM; it must not evict",
+        );
+
+        // Snapshot before reading, since a get on a slow `am` key re-promotes.
+        let demoted: Vec<u32> = aged
+            .iter()
+            .copied()
+            .filter(|key| cache.tier_of(key) == Some(Tier::Slow))
+            .collect();
+
+        assert!(!demoted.is_empty(), "the wait above already found one; pin it before reading back");
+
+        for key in &demoted {
+            assert!(cache.has(key), "a demotion must not drop the object");
+            assert_eq!(cache.get(key).unwrap(), vec![*key as u8; 64]);
+        }
     }
 
     /// `resize` rescales BOTH budgets — `a1_in`'s DRAM reservation and
@@ -489,29 +689,94 @@ mod hybrid_cache_tests {
     fn resize_rescales_both_budgets_and_re_settles() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            2_000,
-            CacheTierSize::Bytes(1_500),
-            PaperPolicy::TwoQFullFastAdmissionHybrid(0.5, 0.25),
-        ).expect("cache should construct");
+        // The old fixture (max_size 2_000, k_in 0.5) gave a1_in a 1_000-byte
+        // reservation — 11 of these 84-byte objects — while the whole 2_000-
+        // byte cache could not even hold 12 of them, so no key could ever age
+        // into a1_out and `am` stayed empty through both resizes. `make_cache`
+        // is sized for exactly this: a1_in 800 bytes (9 objects), am's
+        // effective fast budget FAST_TIER - 800 = 800 bytes.
+        let cache = make_cache();
 
-        for key in 1..=6u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
-            let _ = cache.get(&key);
-            let _ = cache.get(&key);
-        }
+        // An a1_in hit is a complete no-op, so `am` has to be populated the
+        // long way round — age out into a1_out, then hit it there — before a
+        // resize can be seen to squeeze it.
+        let aged = set_and_age_out(&cache, 24, 15);
+        promote_out_of_a1_out(&cache, &aged);
+
+        // Keys that never aged out were never promoted either, so they are
+        // exactly a1_in's 9 residents: 9 × 84 = 756 bytes against the 800-byte
+        // reservation.
+        let a1_in_residents: Vec<u32> = (1..=24u32).filter(|key| !aged.contains(key)).collect();
+
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || {
+                a1_in_residents.iter().all(|key| cache.tier_of(key) == Some(Tier::Fast))
+                    && aged.iter().any(|key| cache.tier_of(key) == Some(Tier::Fast))
+            }),
+            "before the resize: a1_in is fast by construction and am has a fast segment",
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let before = cache.hybrid_stats().demotions;
+        // ── half one: `a1_in_capacity` is carved out of the SAME fast tier
+        //    `am` uses, so growing max_size shrinks am's share and `resize`
+        //    must re-settle the fast tier there and then.
+        let fast_in_am: Vec<u32> = aged
+            .iter()
+            .copied()
+            .filter(|key| cache.tier_of(key) == Some(Tier::Fast))
+            .collect();
 
-        // Growing max_size grows a1_in's reservation (0.5 * max_size),
-        // squeezing am's share of the same 1_500-byte fast tier.
-        cache.resize(2_800).expect("resize should succeed");
+        assert!(!fast_in_am.is_empty(), "am needs a fast segment to squeeze");
+
+        let before_growth = cache.hybrid_stats().demotions;
+
+        // K_IN × 30_000 = 1_200 of the 1_600-byte fast tier, leaving `am` 400
+        // where it had 800.
+        cache.resize(30_000).expect("resize should succeed");
 
         assert!(
-            wait_until(MIGRATION_TIMEOUT, || cache.hybrid_stats().demotions > before),
-            "growing max_size should have grown the a1_in reservation and demoted",
+            wait_until(MIGRATION_TIMEOUT, || {
+                cache.hybrid_stats().demotions > before_growth
+                    && fast_in_am.iter().any(|key| cache.tier_of(key) == Some(Tier::Slow))
+            }),
+            "growing max_size grows a1_in's reservation and must demote from am immediately",
+        );
+
+        // ── half two: the `a1_in` invariant is re-established by `resize`
+        //    itself, not lazily at the next insert — nothing is set, got or
+        //    deleted between the call and the assertion.
+        let before_shrink = cache.hybrid_stats().demotions;
+
+        // K_IN × 10_000 = 400 bytes of a1_in against 756 bytes resident, so
+        // a1_in's tail must drain into a1_out unprompted.
+        cache.resize(10_000).expect("resize should succeed");
+
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || {
+                a1_in_residents.iter().any(|key| cache.tier_of(key) == Some(Tier::Slow))
+            }),
+            "shrinking max_size must drain a1_in into a1_out with no intervening insert",
+        );
+
+        assert!(
+            cache.hybrid_stats().demotions > before_shrink,
+            "the a1_in drain is a demotion and must be counted as one",
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Both halves demote; neither evicts. a1_out's rescaled budget
+        // (K_OUT × 10_000 = 2_000 bytes) still covers what was drained into
+        // it, so `needs_capacity_eviction` stays quiet.
+        for key in 1..=24u32 {
+            assert!(cache.has(&key), "key {key} was re-settled out of DRAM, not evicted");
+        }
+
+        assert_eq!(
+            cache.hybrid_stats().evictions,
+            0,
+            "resize re-settles by demoting; only an a1_out overrun evicts",
         );
     }
 
