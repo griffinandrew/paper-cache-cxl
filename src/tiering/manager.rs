@@ -2110,9 +2110,18 @@ where
 mod tests {
     use super::*;
 
+    /// Concrete stand-in for the manager's two type parameters.
+    ///
+    /// `TieringManager<K, V>` needs `K: TypeSize + Clone` and
+    /// `V: TypeSize + Clone`, and none of the behaviour exercised below --
+    /// registration, promotion, demotion, eviction bookkeeping -- reads either
+    /// one, so the choice is arbitrary and only has to be inhabited. Without
+    /// it every `with_defaults()` call is an inference error (E0283).
+    type TestManager = TieringManager<u32, Vec<u8>>;
+
     #[test]
     fn test_tiering_manager_creation() {
-        let manager = TieringManager::with_defaults();
+        let manager = TestManager::with_defaults();
         let stats = manager.stats();
 
         assert_eq!(stats.dram_objects, 0);
@@ -2123,7 +2132,7 @@ mod tests {
 
     #[test]
     fn test_register_object() {
-        let manager = TieringManager::with_defaults();
+        let manager = TestManager::with_defaults();
 
         manager.register_object(1, 100);
 
@@ -2134,7 +2143,7 @@ mod tests {
 
     #[test]
     fn test_promote_to_dram() {
-        let manager = TieringManager::with_defaults();
+        let manager = TestManager::with_defaults();
 
         manager.register_object(1, 100);
         assert!(manager.promote_to_dram(1));
@@ -2148,7 +2157,7 @@ mod tests {
 
     #[test]
     fn test_demote_from_dram() {
-        let manager = TieringManager::with_defaults();
+        let manager = TestManager::with_defaults();
 
         manager.register_object(1, 100);
         manager.promote_to_dram(1);
@@ -2168,8 +2177,9 @@ mod tests {
             high_water_mark: 0.9,
             low_water_mark: 0.7,
             hotness_threshold: 1,
+            ..Default::default()
         };
-        let manager = TieringManager::new(config);
+        let manager = TestManager::new(config);
 
         // Promote two objects, total 200 bytes (at threshold)
         manager.register_object(1, 100);
@@ -2188,7 +2198,7 @@ mod tests {
 
     #[test]
     fn test_remove_object() {
-        let manager = TieringManager::with_defaults();
+        let manager = TestManager::with_defaults();
 
         manager.register_object(1, 100);
         manager.promote_to_dram(1);
@@ -2201,22 +2211,43 @@ mod tests {
 
     #[test]
     fn test_access_recording() {
-        let manager = TieringManager::with_defaults();
+        let manager = TestManager::with_defaults();
 
+        // Set the threshold this test needs instead of assuming the
+        // default. It previously assumed 2 while the default is 3, which
+        // went unnoticed for as long as this module failed to compile.
+        manager.set_hotness_threshold(2);
         manager.register_object(1, 100);
 
-        // First access - should not promote yet (threshold is 2)
+        // First access - below the threshold, so no promotion suggested.
         assert!(!manager.record_access(1));
 
-        // Second access - should suggest promotion
+        // Second access - reaches the threshold, so promotion suggested.
         assert!(manager.record_access(1));
     }
 
     #[test]
     fn test_configurable_hotness_threshold() {
+        // Set whichever knob the active build actually consults.
+        // `record_access` reads `hotness_threshold` normally, but under
+        // `hashtable_tiering` it reads `warm_threshold`/`hot_threshold`
+        // instead and ignores `hotness_threshold` entirely -- so setting
+        // only the latter made this test assert against the untouched
+        // default of 2 under `multitiering`.
         let mut config = TieringConfig::default();
-        config.hotness_threshold = 3;
-        let manager = TieringManager::new(config);
+
+        #[cfg(not(feature = "hashtable_tiering"))]
+        {
+            config.hotness_threshold = 3;
+        }
+
+        #[cfg(feature = "hashtable_tiering")]
+        {
+            // Promotion out of PmemOnly is gated on `warm_threshold`.
+            config.warm_threshold = 3;
+        }
+
+        let manager = TestManager::new(config);
 
         manager.register_object(1, 100);
 
@@ -2235,8 +2266,9 @@ mod tests {
             high_water_mark: 0.9,
             low_water_mark: 0.6,
             hotness_threshold: 1,
+            ..Default::default()
         };
-        let manager = TieringManager::new(config);
+        let manager = TestManager::new(config);
 
         // Register and promote 4 objects
         for i in 1..=4 {
@@ -2256,9 +2288,16 @@ mod tests {
 
     #[test]
     fn test_set_and_get_hotness_threshold() {
-        let manager = TieringManager::with_defaults();
+        let manager = TestManager::with_defaults();
         
-        assert_eq!(manager.hotness_threshold(), 2);
+        // Compare against the config's own default rather than a
+        // literal: this asserted 2 while the default was 3, and could
+        // not fail because the module did not compile.
+        assert_eq!(
+            manager.hotness_threshold(),
+            TieringConfig::default().hotness_threshold,
+            "with_defaults() must agree with TieringConfig::default()",
+        );
         
         manager.set_hotness_threshold(5);
         assert_eq!(manager.hotness_threshold(), 5);
