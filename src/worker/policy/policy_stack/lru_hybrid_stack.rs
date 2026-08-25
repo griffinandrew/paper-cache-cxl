@@ -154,6 +154,14 @@ impl LruEntry {
 	}
 }
 
+/// `dram_resident` was meant to occupy padding the entry already had.
+/// If this ever fails, the field is costing 4 more bytes on *every* tracked
+/// object in both tiers, which defeats the point of storing it per entry.
+const _: () = assert!(
+	std::mem::size_of::<LruEntry>() == 8,
+	"LruEntry grew past 8 bytes",
+);
+
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 type EntryMap = HashMap<HashedKey, LruEntry, NoHasher>;
 #[cfg(feature = "eviction_stacks_pmem")]

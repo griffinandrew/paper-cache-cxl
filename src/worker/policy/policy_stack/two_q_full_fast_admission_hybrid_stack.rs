@@ -196,7 +196,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
-	worker::policy::policy_stack::{PolicyStack, Tier, watermarks},
+	worker::policy::policy_stack::{PolicyStack, Tier, narrow_resident, watermarks},
 };
 
 /// Which of the three live queues a key currently belongs to.
@@ -217,11 +217,37 @@ enum Queue {
 /// exactly one of the three lists, which is what keeps the six byte counters
 /// and three object counters honest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TwoQEntry {
-	queue: Queue,
+struct TwoQEntry {queue: Queue,
 	tier: Option<Tier>,
+	/// Part of `size` that stays in DRAM in either tier; see `migrating`.
+	dram_resident: u8,
+
 	size: ObjectSize,
 }
+
+impl TwoQEntry {
+/// The bytes that actually move between tiers when this object migrates.
+	///
+	/// `size` is `base_size`, which also counts the DRAM-resident remainder --
+	/// the key and expiry field (inline in the object map) plus the `Expiries`
+	/// entry when a TTL is set. `Object::set_data` replaces the value buffer
+	/// alone, so none of that moves, and the key and expiry are already inside
+	/// `shared_overhead`. Charging them to the tier counters double-counted
+	/// every fast-tier object and made demotion appear to free DRAM it did not.
+	#[inline]
+	fn migrating(&self) -> CacheSize {
+		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+	}
+}
+
+/// `dram_resident` was meant to occupy padding the entry already had.
+/// If this ever fails, the field is costing 4 more bytes on *every* tracked
+/// object in both tiers, which defeats the point of storing it per entry.
+const _: () = assert!(
+	std::mem::size_of::<TwoQEntry>() == 8,
+	"TwoQEntry grew past 8 bytes",
+);
+
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 type QueueList = HashList<HashedKey, NoHasher>;
@@ -423,9 +449,9 @@ impl TwoQFullFastAdmissionHybridStack {
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
-		let old_size = entry.size;
+		let old_migrating = entry.migrating();
 		entry.size = new_size;
-		let delta = new_size as i64 - old_size as i64;
+		let delta = entry.migrating() as i64 - old_migrating as i64;
 
 		match (entry.queue, entry.tier) {
 			(Queue::A1In, _) => {
@@ -485,7 +511,7 @@ impl TwoQFullFastAdmissionHybridStack {
 
 		while self.a1_in_used + incoming > self.a1_in_capacity {
 			let Some(key) = self.a1_in.pop_back() else { break };
-			let Some(size) = self.entries.get(&key).map(|entry| entry.size as CacheSize) else { continue };
+			let Some(size) = self.entries.get(&key).map(|entry| entry.migrating()) else { continue };
 
 			if let Some(entry) = self.entries.get_mut(&key) {
 				entry.queue = Queue::A1Out;
@@ -510,14 +536,18 @@ impl TwoQFullFastAdmissionHybridStack {
 	/// Fast->Fast bookkeeping move. Here the bytes really do live in PMEM
 	/// beforehand, because `a1_out` is the slow tier.
 	fn promote_from_a1_out(&mut self, key: HashedKey) {
-		let Some(size) = self.entries.get(&key).map(|entry| entry.size) else { return };
-		let size_bytes = size as CacheSize;
+		let Some((size, dram_resident)) = self.entries
+			.get(&key)
+			.map(|entry| (entry.size, entry.dram_resident))
+		else { return };
+		// Tier arithmetic moves only what migrates; `size` still rebuilds the entry.
+		let size_bytes = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 
 		self.a1_out.remove(&key);
 		self.a1_out_used = self.a1_out_used.saturating_sub(size_bytes);
 
 		self.am.push_front(key);
-		self.entries.insert(key, TwoQEntry { queue: Queue::Am, tier: Some(Tier::Fast), size });
+		self.entries.insert(key, TwoQEntry { dram_resident, queue: Queue::Am, tier: Some(Tier::Fast), size });
 
 		self.am_fast_used += size_bytes;
 		self.am_fast_count += 1;
@@ -566,7 +596,7 @@ impl TwoQFullFastAdmissionHybridStack {
 
 		if previous_tier != Some(Tier::Fast) {
 			if previous_tier == Some(Tier::Slow) {
-				let size = self.entries.get(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+				let size = self.entries.get(&key).map(|entry| entry.migrating()).unwrap_or(0);
 
 				self.am_slow_used = self.am_slow_used.saturating_sub(size);
 				self.am_fast_used += size;
@@ -619,7 +649,7 @@ impl TwoQFullFastAdmissionHybridStack {
 		while self.am_fast_used > drain_target {
 			let Some(demote_key) = self.am_boundary else { break };
 
-			let size = self.entries.get(&demote_key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.get(&demote_key).map(|entry| entry.migrating()).unwrap_or(0);
 			let new_boundary = self.am.before(&demote_key).copied();
 
 			if let Some(entry) = self.entries.get_mut(&demote_key) {
@@ -639,7 +669,7 @@ impl TwoQFullFastAdmissionHybridStack {
 	/// bookkeeping. The FIRST eviction victim, per `TwoQStack::evict_one`.
 	fn evict_a1_out_tail(&mut self) -> Option<HashedKey> {
 		let key = self.a1_out.pop_back()?;
-		let size = self.entries.remove(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 
 		self.a1_out_used = self.a1_out_used.saturating_sub(size);
 
@@ -651,7 +681,7 @@ impl TwoQFullFastAdmissionHybridStack {
 	/// `a1_out` by [`Self::settle_a1_in`] long before it can be evicted here.
 	fn evict_a1_in_tail(&mut self) -> Option<HashedKey> {
 		let key = self.a1_in.pop_back()?;
-		let size = self.entries.remove(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 
 		self.a1_in_used = self.a1_in_used.saturating_sub(size);
 
@@ -663,7 +693,7 @@ impl TwoQFullFastAdmissionHybridStack {
 	fn evict_am_tail(&mut self) -> Option<HashedKey> {
 		let key = self.am.pop_back()?;
 		let removed = self.entries.remove(&key);
-		let size = removed.map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = removed.map(|entry| entry.migrating()).unwrap_or(0);
 		let tier = removed.and_then(|entry| entry.tier);
 
 		self.am_count = self.am_count.saturating_sub(1);
@@ -717,6 +747,11 @@ impl PolicyStack for TwoQFullFastAdmissionHybridStack {
 	}
 
 	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
+		self.insert_resident(key, size, 0);
+	}
+
+	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
+		let dram_resident = narrow_resident(dram_resident);
 		if self.entries.contains_key(&key) {
 			// Existing key: track any size change, then treat as an access —
 			// exactly what `TwoQStack::insert` does (three `Stack::update`
@@ -731,8 +766,8 @@ impl PolicyStack for TwoQFullFastAdmissionHybridStack {
 		self.settle_a1_in(size);
 
 		self.a1_in.push_front(key);
-		self.entries.insert(key, TwoQEntry { queue: Queue::A1In, tier: None, size });
-		self.a1_in_used += size as CacheSize;
+		self.entries.insert(key, TwoQEntry { dram_resident, queue: Queue::A1In, tier: None, size });
+		self.a1_in_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 
 		// Deliberately does NOT re-settle the fast tier: the reservation
 		// carved out of `fast_capacity` is the fixed `a1_in_capacity`, not
@@ -750,7 +785,7 @@ impl PolicyStack for TwoQFullFastAdmissionHybridStack {
 
 	fn remove(&mut self, key: HashedKey) {
 		let Some(entry) = self.entries.remove(&key) else { return };
-		let size = entry.size as CacheSize;
+		let size = entry.migrating();
 
 		match entry.queue {
 			Queue::A1In => {

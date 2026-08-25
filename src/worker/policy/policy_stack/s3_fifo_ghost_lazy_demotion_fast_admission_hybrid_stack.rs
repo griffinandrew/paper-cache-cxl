@@ -245,7 +245,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::{ObjectSize, overhead::GHOST_ENTRY_DRAM_OVERHEAD},
-	worker::policy::policy_stack::{PolicyStack, Tier, watermarks},
+	worker::policy::policy_stack::{PolicyStack, Tier, narrow_resident, watermarks},
 };
 
 /// Which live queue a key currently belongs to.
@@ -258,12 +258,38 @@ enum Queue {
 /// Combined per-key bookkeeping. `tier`/`accessed` are only meaningful
 /// while `queue == Main`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct S3FifoEntry {
-	queue: Queue,
+struct S3FifoEntry {queue: Queue,
 	tier: Option<Tier>,
+	/// Part of `size` that stays in DRAM in either tier; see `migrating`.
+	dram_resident: u8,
+
 	size: ObjectSize,
 	accessed: bool,
 }
+
+impl S3FifoEntry {
+/// The bytes that actually move between tiers when this object migrates.
+	///
+	/// `size` is `base_size`, which also counts the DRAM-resident remainder --
+	/// the key and expiry field (inline in the object map) plus the `Expiries`
+	/// entry when a TTL is set. `Object::set_data` replaces the value buffer
+	/// alone, so none of that moves, and the key and expiry are already inside
+	/// `shared_overhead`. Charging them to the tier counters double-counted
+	/// every fast-tier object and made demotion appear to free DRAM it did not.
+	#[inline]
+	fn migrating(&self) -> CacheSize {
+		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+	}
+}
+
+/// `dram_resident` was meant to occupy padding the entry already had.
+/// If this ever fails, the field is costing 4 more bytes on *every* tracked
+/// object in both tiers, which defeats the point of storing it per entry.
+const _: () = assert!(
+	std::mem::size_of::<S3FifoEntry>() == 8,
+	"S3FifoEntry grew past 8 bytes",
+);
+
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 type QueueList = HashList<HashedKey, NoHasher>;
@@ -485,9 +511,9 @@ impl S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
-		let old_size = entry.size;
+		let old_migrating = entry.migrating();
 		entry.size = new_size;
-		let delta = new_size as i64 - old_size as i64;
+		let delta = entry.migrating() as i64 - old_migrating as i64;
 
 		match (entry.queue, entry.tier) {
 			(Queue::OneAccess, _) => {
@@ -530,14 +556,15 @@ impl S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 	fn promote_from_one_access(&mut self, key: HashedKey) {
 		let Some(entry) = self.entries.get(&key) else { return };
 		let size = entry.size;
-		let size_bytes = size as CacheSize;
+		let dram_resident = entry.dram_resident;
+		// Tier arithmetic moves only what migrates; `size` still rebuilds the entry.
+		let size_bytes = entry.migrating();
 
 		self.one_access_queue.remove(&key);
 		self.one_access_used = self.one_access_used.saturating_sub(size_bytes);
 
 		self.main_queue.push_front(key);
-		self.entries.insert(key, S3FifoEntry {
-			queue: Queue::Main,
+		self.entries.insert(key, S3FifoEntry { dram_resident, queue: Queue::Main,
 			tier: Some(Tier::Fast),
 			size,
 			accessed: false,
@@ -561,15 +588,14 @@ impl S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 	/// Fast in this variant), so there's nothing to migrate unless
 	/// `settle_fast_tier` demotes it right back out, which pushes its own
 	/// migration.
-	fn admit_via_ghost_hit(&mut self, key: HashedKey, size: ObjectSize) {
+	fn admit_via_ghost_hit(&mut self, key: HashedKey, size: ObjectSize, dram_resident: u8) {
 		self.main_queue.push_front(key);
-		self.entries.insert(key, S3FifoEntry {
-			queue: Queue::Main,
+		self.entries.insert(key, S3FifoEntry { dram_resident, queue: Queue::Main,
 			tier: Some(Tier::Fast),
 			size,
 			accessed: false,
 		});
-		self.fast_used += size as CacheSize;
+		self.fast_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 		self.fast_count += 1;
 		self.main_count += 1;
 
@@ -588,7 +614,7 @@ impl S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 	/// to Fast is a real physical move, not a relabeling.
 	fn give_second_chance(&mut self, key: HashedKey) {
 		let Some(entry) = self.entries.get(&key).copied() else { return };
-		let size = entry.size as CacheSize;
+		let size = entry.migrating();
 		let was_fast = entry.tier == Some(Tier::Fast);
 		let was_boundary = was_fast && self.main_boundary == Some(key);
 
@@ -691,7 +717,7 @@ impl S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 				continue;
 			}
 
-			let size = self.entries.get(&candidate).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.get(&candidate).map(|entry| entry.migrating()).unwrap_or(0);
 			let new_boundary = self.main_queue.before(&candidate).copied();
 
 			if let Some(entry) = self.entries.get_mut(&candidate) {
@@ -712,7 +738,7 @@ impl S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 	/// `evict_one`.
 	fn evict_one_access_tail(&mut self) -> Option<HashedKey> {
 		let key = self.one_access_queue.pop_back()?;
-		let size = self.entries.remove(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 
 		self.one_access_used = self.one_access_used.saturating_sub(size);
 		self.ghost.push_front(key);
@@ -759,6 +785,11 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 	}
 
 	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
+		self.insert_resident(key, size, 0);
+	}
+
+	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
+		let dram_resident = narrow_resident(dram_resident);
 		if self.entries.contains_key(&key) {
 			self.resize_key(key, size);
 			self.touch(key);
@@ -766,18 +797,17 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 		}
 
 		if self.ghost.contains(&key) {
-			self.admit_via_ghost_hit(key, size);
+			self.admit_via_ghost_hit(key, size, dram_resident);
 			return;
 		}
 
 		self.one_access_queue.push_front(key);
-		self.entries.insert(key, S3FifoEntry {
-			queue: Queue::OneAccess,
+		self.entries.insert(key, S3FifoEntry { dram_resident, queue: Queue::OneAccess,
 			tier: None,
 			size,
 			accessed: false,
 		});
-		self.one_access_used += size as CacheSize;
+		self.one_access_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 	}
 
 	fn update(&mut self, key: HashedKey) {
@@ -792,7 +822,7 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 		self.ghost.remove(&key);
 
 		let Some(entry) = self.entries.remove(&key) else { return };
-		let size = entry.size as CacheSize;
+		let size = entry.migrating();
 
 		match entry.queue {
 			Queue::OneAccess => {
@@ -879,7 +909,7 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 
 			self.main_queue.pop_back();
 			let removed = self.entries.remove(&key);
-			let size = removed.map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = removed.map(|entry| entry.migrating()).unwrap_or(0);
 			let tier = removed.and_then(|entry| entry.tier);
 
 			self.main_count = self.main_count.saturating_sub(1);

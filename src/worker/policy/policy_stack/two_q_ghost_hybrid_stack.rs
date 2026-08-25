@@ -74,7 +74,7 @@
 //! whole rather than split proportionally the way `LruSizedHybridStack` (two
 //! independently-capacitied fast segments) has to. `fifo_capacity` is not a
 //! second fast segment: it bounds `fifo_queue`, which is slow-tier
-//! throughout -- `insert` tags a fresh key `TwoQEntry { queue: Queue::Fifo,
+//! throughout -- `insert` tags a fresh key `TwoQEntry { dram_resident, queue: Queue::Fifo,
 //! tier: None, .. }`, `tier_of` reports such a key as `Tier::Slow`, and
 //! `slow_bytes_used` is `fifo_used + slow_used`.
 //!
@@ -128,7 +128,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::{ObjectSize, overhead::GHOST_ENTRY_DRAM_OVERHEAD},
-	worker::policy::policy_stack::{PolicyStack, Tier, watermarks},
+	worker::policy::policy_stack::{PolicyStack, Tier, narrow_resident, watermarks},
 };
 
 /// Which live queue a key currently belongs to.
@@ -141,11 +141,37 @@ enum Queue {
 /// Combined per-key bookkeeping — see `TwoQHybridStack`'s "One combined
 /// per-key map" module doc section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TwoQEntry {
-	queue: Queue,
+struct TwoQEntry {queue: Queue,
 	tier: Option<Tier>,
+	/// Part of `size` that stays in DRAM in either tier; see `migrating`.
+	dram_resident: u8,
+
 	size: ObjectSize,
 }
+
+impl TwoQEntry {
+/// The bytes that actually move between tiers when this object migrates.
+	///
+	/// `size` is `base_size`, which also counts the DRAM-resident remainder --
+	/// the key and expiry field (inline in the object map) plus the `Expiries`
+	/// entry when a TTL is set. `Object::set_data` replaces the value buffer
+	/// alone, so none of that moves, and the key and expiry are already inside
+	/// `shared_overhead`. Charging them to the tier counters double-counted
+	/// every fast-tier object and made demotion appear to free DRAM it did not.
+	#[inline]
+	fn migrating(&self) -> CacheSize {
+		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+	}
+}
+
+/// `dram_resident` was meant to occupy padding the entry already had.
+/// If this ever fails, the field is costing 4 more bytes on *every* tracked
+/// object in both tiers, which defeats the point of storing it per entry.
+const _: () = assert!(
+	std::mem::size_of::<TwoQEntry>() == 8,
+	"TwoQEntry grew past 8 bytes",
+);
+
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 type QueueList = HashList<HashedKey, NoHasher>;
@@ -312,9 +338,9 @@ impl TwoQGhostHybridStack {
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
-		let old_size = entry.size;
+		let old_migrating = entry.migrating();
 		entry.size = new_size;
-		let delta = new_size as i64 - old_size as i64;
+		let delta = entry.migrating() as i64 - old_migrating as i64;
 
 		match (entry.queue, entry.tier) {
 			(Queue::Fifo, _) => {
@@ -344,13 +370,15 @@ impl TwoQGhostHybridStack {
 	fn promote_from_fifo(&mut self, key: HashedKey) {
 		let Some(entry) = self.entries.get(&key) else { return };
 		let size = entry.size;
-		let size_bytes = size as CacheSize;
+		let dram_resident = entry.dram_resident;
+		// Tier arithmetic moves only what migrates; `size` still rebuilds the entry.
+		let size_bytes = entry.migrating();
 
 		self.fifo_queue.remove(&key);
 		self.fifo_used = self.fifo_used.saturating_sub(size_bytes);
 
 		self.main_stack.push_front(key);
-		self.entries.insert(key, TwoQEntry { queue: Queue::Main, tier: Some(Tier::Fast), size });
+		self.entries.insert(key, TwoQEntry { dram_resident, queue: Queue::Main, tier: Some(Tier::Fast), size });
 		self.fast_used += size_bytes;
 		self.fast_count += 1;
 		self.main_count += 1;
@@ -371,10 +399,10 @@ impl TwoQGhostHybridStack {
 	/// minus the "remove from `fifo_queue`" step, since the key was never
 	/// there this time. See the module doc's "Where a ghost hit lands"
 	/// section for why `Tier::Fast` specifically, and how to flip it.
-	fn admit_via_ghost_hit(&mut self, key: HashedKey, size: ObjectSize) {
+	fn admit_via_ghost_hit(&mut self, key: HashedKey, size: ObjectSize, dram_resident: u8) {
 		self.main_stack.push_front(key);
-		self.entries.insert(key, TwoQEntry { queue: Queue::Main, tier: Some(Tier::Fast), size });
-		self.fast_used += size as CacheSize;
+		self.entries.insert(key, TwoQEntry { dram_resident, queue: Queue::Main, tier: Some(Tier::Fast), size });
+		self.fast_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 		self.fast_count += 1;
 		self.main_count += 1;
 
@@ -411,7 +439,7 @@ impl TwoQGhostHybridStack {
 
 		if previous_tier != Some(Tier::Fast) {
 			if previous_tier == Some(Tier::Slow) {
-				let size = self.entries.get(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+				let size = self.entries.get(&key).map(|entry| entry.migrating()).unwrap_or(0);
 
 				self.slow_used = self.slow_used.saturating_sub(size);
 				self.fast_used += size;
@@ -478,7 +506,7 @@ impl TwoQGhostHybridStack {
 		while self.fast_used > drain_target {
 			let Some(demote_key) = self.main_boundary else { break };
 
-			let size = self.entries.get(&demote_key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.get(&demote_key).map(|entry| entry.migrating()).unwrap_or(0);
 			let new_boundary = self.main_stack.before(&demote_key).copied();
 
 			if let Some(entry) = self.entries.get_mut(&demote_key) {
@@ -501,7 +529,7 @@ impl TwoQGhostHybridStack {
 	/// `evict_one`.
 	fn evict_fifo_tail(&mut self) -> Option<HashedKey> {
 		let key = self.fifo_queue.pop_back()?;
-		let size = self.entries.remove(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 
 		self.fifo_used = self.fifo_used.saturating_sub(size);
 		self.ghost.push_front(key);
@@ -536,6 +564,11 @@ impl PolicyStack for TwoQGhostHybridStack {
 	}
 
 	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
+		self.insert_resident(key, size, 0);
+	}
+
+	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
+		let dram_resident = narrow_resident(dram_resident);
 		if self.entries.contains_key(&key) {
 			self.resize_key(key, size);
 			self.touch(key);
@@ -543,13 +576,13 @@ impl PolicyStack for TwoQGhostHybridStack {
 		}
 
 		if self.ghost.contains(&key) {
-			self.admit_via_ghost_hit(key, size);
+			self.admit_via_ghost_hit(key, size, dram_resident);
 			return;
 		}
 
 		self.fifo_queue.push_front(key);
-		self.entries.insert(key, TwoQEntry { queue: Queue::Fifo, tier: None, size });
-		self.fifo_used += size as CacheSize;
+		self.entries.insert(key, TwoQEntry { dram_resident, queue: Queue::Fifo, tier: None, size });
+		self.fifo_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 	}
 
 	fn update(&mut self, key: HashedKey) {
@@ -569,7 +602,7 @@ impl PolicyStack for TwoQGhostHybridStack {
 		self.ghost.remove(&key);
 
 		let Some(entry) = self.entries.remove(&key) else { return };
-		let size = entry.size as CacheSize;
+		let size = entry.migrating();
 
 		match entry.queue {
 			Queue::Fifo => {
@@ -633,7 +666,7 @@ impl PolicyStack for TwoQGhostHybridStack {
 
 		let key = self.main_stack.pop_back()?;
 		let removed = self.entries.remove(&key);
-		let size = removed.map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = removed.map(|entry| entry.migrating()).unwrap_or(0);
 		let tier = removed.and_then(|entry| entry.tier);
 
 		self.main_count = self.main_count.saturating_sub(1);

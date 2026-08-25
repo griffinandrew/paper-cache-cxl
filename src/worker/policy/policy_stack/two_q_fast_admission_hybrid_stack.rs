@@ -192,7 +192,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
-	worker::policy::policy_stack::{PolicyStack, Tier, watermarks},
+	worker::policy::policy_stack::{PolicyStack, Tier, narrow_resident, watermarks},
 };
 
 /// Which live queue a key currently belongs to.
@@ -206,11 +206,37 @@ enum Queue {
 /// while `queue == Main` — a `Fifo` key is always physically Fast in this
 /// design, so it needs no stored tier), and the object's size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TwoQEntry {
-	queue: Queue,
+struct TwoQEntry {queue: Queue,
 	tier: Option<Tier>,
+	/// Part of `size` that stays in DRAM in either tier; see `migrating`.
+	dram_resident: u8,
+
 	size: ObjectSize,
 }
+
+impl TwoQEntry {
+/// The bytes that actually move between tiers when this object migrates.
+	///
+	/// `size` is `base_size`, which also counts the DRAM-resident remainder --
+	/// the key and expiry field (inline in the object map) plus the `Expiries`
+	/// entry when a TTL is set. `Object::set_data` replaces the value buffer
+	/// alone, so none of that moves, and the key and expiry are already inside
+	/// `shared_overhead`. Charging them to the tier counters double-counted
+	/// every fast-tier object and made demotion appear to free DRAM it did not.
+	#[inline]
+	fn migrating(&self) -> CacheSize {
+		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+	}
+}
+
+/// `dram_resident` was meant to occupy padding the entry already had.
+/// If this ever fails, the field is costing 4 more bytes on *every* tracked
+/// object in both tiers, which defeats the point of storing it per entry.
+const _: () = assert!(
+	std::mem::size_of::<TwoQEntry>() == 8,
+	"TwoQEntry grew past 8 bytes",
+);
+
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 type QueueList = HashList<HashedKey, NoHasher>;
@@ -373,9 +399,9 @@ impl TwoQFastAdmissionHybridStack {
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
-		let old_size = entry.size;
+		let old_migrating = entry.migrating();
 		entry.size = new_size;
-		let delta = new_size as i64 - old_size as i64;
+		let delta = entry.migrating() as i64 - old_migrating as i64;
 
 		match (entry.queue, entry.tier) {
 			(Queue::Fifo, _) => {
@@ -422,13 +448,15 @@ impl TwoQFastAdmissionHybridStack {
 	fn promote_from_fifo(&mut self, key: HashedKey) {
 		let Some(entry) = self.entries.get(&key) else { return };
 		let size = entry.size;
-		let size_bytes = size as CacheSize;
+		let dram_resident = entry.dram_resident;
+		// Tier arithmetic moves only what migrates; `size` still rebuilds the entry.
+		let size_bytes = entry.migrating();
 
 		self.fifo_queue.remove(&key);
 		self.fifo_used = self.fifo_used.saturating_sub(size_bytes);
 
 		self.main_stack.push_front(key);
-		self.entries.insert(key, TwoQEntry { queue: Queue::Main, tier: Some(Tier::Fast), size });
+		self.entries.insert(key, TwoQEntry { dram_resident, queue: Queue::Main, tier: Some(Tier::Fast), size });
 		self.fast_used += size_bytes;
 		self.fast_count += 1;
 		self.main_count += 1;
@@ -466,7 +494,7 @@ impl TwoQFastAdmissionHybridStack {
 
 		if previous_tier != Some(Tier::Fast) {
 			if previous_tier == Some(Tier::Slow) {
-				let size = self.entries.get(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+				let size = self.entries.get(&key).map(|entry| entry.migrating()).unwrap_or(0);
 
 				self.slow_used = self.slow_used.saturating_sub(size);
 				self.fast_used += size;
@@ -541,7 +569,7 @@ impl TwoQFastAdmissionHybridStack {
 		while self.fast_used > drain_target {
 			let Some(demote_key) = self.main_boundary else { break };
 
-			let size = self.entries.get(&demote_key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.get(&demote_key).map(|entry| entry.migrating()).unwrap_or(0);
 			let new_boundary = self.main_stack.before(&demote_key).copied();
 
 			if let Some(entry) = self.entries.get_mut(&demote_key) {
@@ -573,7 +601,7 @@ impl TwoQFastAdmissionHybridStack {
 	/// `TwoQHybridStack` — see `CLAUDE.md`.)
 	fn evict_fifo_tail(&mut self) -> Option<HashedKey> {
 		let key = self.fifo_queue.pop_back()?;
-		let size = self.entries.remove(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 
 		self.fifo_used = self.fifo_used.saturating_sub(size);
 
@@ -595,6 +623,11 @@ impl PolicyStack for TwoQFastAdmissionHybridStack {
 	}
 
 	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
+		self.insert_resident(key, size, 0);
+	}
+
+	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
+		let dram_resident = narrow_resident(dram_resident);
 		if self.entries.contains_key(&key) {
 			// Existing key: track any size change, then treat as an access.
 			// `touch` settles the fast tier on every path, so a FIFO-resident
@@ -609,8 +642,8 @@ impl PolicyStack for TwoQFastAdmissionHybridStack {
 		// reports it and `apply_evictions` drains it via `evict_one` (see
 		// `evict_fifo_tail`'s doc for why eviction can't happen here).
 		self.fifo_queue.push_front(key);
-		self.entries.insert(key, TwoQEntry { queue: Queue::Fifo, tier: None, size });
-		self.fifo_used += size as CacheSize;
+		self.entries.insert(key, TwoQEntry { dram_resident, queue: Queue::Fifo, tier: None, size });
+		self.fifo_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 
 		// Deliberately does NOT re-settle the fast tier, despite admission
 		// now consuming DRAM. The reservation carved out of `fast_capacity`
@@ -633,7 +666,7 @@ impl PolicyStack for TwoQFastAdmissionHybridStack {
 
 	fn remove(&mut self, key: HashedKey) {
 		let Some(entry) = self.entries.remove(&key) else { return };
-		let size = entry.size as CacheSize;
+		let size = entry.migrating();
 
 		match entry.queue {
 			Queue::Fifo => {
@@ -707,7 +740,7 @@ impl PolicyStack for TwoQFastAdmissionHybridStack {
 
 		let key = self.main_stack.pop_back()?;
 		let removed = self.entries.remove(&key);
-		let size = removed.map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = removed.map(|entry| entry.migrating()).unwrap_or(0);
 		let tier = removed.and_then(|entry| entry.tier);
 
 		self.main_count = self.main_count.saturating_sub(1);

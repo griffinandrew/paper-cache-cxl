@@ -99,7 +99,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
-	worker::policy::policy_stack::{PolicyStack, Tier, watermarks},
+	worker::policy::policy_stack::{PolicyStack, Tier, narrow_resident, watermarks},
 };
 
 /// SUPERSEDED by the shared `super::watermarks` high/low pair, and
@@ -143,8 +143,33 @@ enum SizeQueue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SizedEntry {
 	queue: SizeQueue,
+
+	/// Part of `size` that stays in DRAM in either tier; see `migrating`.
+	dram_resident: u8,
+
 	size: ObjectSize,
 }
+
+impl SizedEntry {
+	/// The bytes that actually move between tiers when this object migrates.
+	///
+	/// Deliberately distinct from `size` (`base_size`), which remains the input
+	/// to `classify`: the small/large split is a property of the whole object
+	/// as the cache accounts for it, not of its value alone -- see the module
+	/// doc's "Classification input" section. Only the byte counters change.
+	#[inline]
+	fn migrating(&self) -> CacheSize {
+		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+	}
+}
+
+/// `dram_resident` was meant to occupy padding the entry already had.
+/// If this ever fails, the field is costing 4 more bytes on *every* tracked
+/// object in both tiers, which defeats the point of storing it per entry.
+const _: () = assert!(
+	std::mem::size_of::<SizedEntry>() == 8,
+	"SizedEntry grew past 8 bytes",
+);
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 type EntryMap = HashMap<HashedKey, SizedEntry, NoHasher>;
@@ -313,11 +338,12 @@ impl LruSizedHybridStack {
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
-		let old_size = entry.size;
+		let old_migrating = entry.migrating();
 		entry.size = new_size;
-		let delta = new_size as i64 - old_size as i64;
+		let delta = entry.migrating() as i64 - old_migrating as i64;
+		let queue = entry.queue;
 
-		match entry.queue {
+		match queue {
 			SizeQueue::SmallFast => {
 				self.small_fast_used = (self.small_fast_used as i64 + delta).max(0) as CacheSize;
 			},
@@ -333,39 +359,39 @@ impl LruSizedHybridStack {
 		}
 	}
 
-	fn remove_from_small_fast(&mut self, key: HashedKey, size: ObjectSize) {
+	fn remove_from_small_fast(&mut self, key: HashedKey, size: CacheSize) {
 		self.small_fast.remove(&key);
-		self.small_fast_used = self.small_fast_used.saturating_sub(size as CacheSize);
+		self.small_fast_used = self.small_fast_used.saturating_sub(size);
 		self.small_fast_count = self.small_fast_count.saturating_sub(1);
 	}
 
-	fn remove_from_large_fast(&mut self, key: HashedKey, size: ObjectSize) {
+	fn remove_from_large_fast(&mut self, key: HashedKey, size: CacheSize) {
 		self.large_fast.remove(&key);
-		self.large_fast_used = self.large_fast_used.saturating_sub(size as CacheSize);
+		self.large_fast_used = self.large_fast_used.saturating_sub(size);
 		self.large_fast_count = self.large_fast_count.saturating_sub(1);
 	}
 
-	fn remove_from_small_slow(&mut self, key: HashedKey, size: ObjectSize) {
+	fn remove_from_small_slow(&mut self, key: HashedKey, size: CacheSize) {
 		self.small_slow.remove(&key);
-		self.small_slow_used = self.small_slow_used.saturating_sub(size as CacheSize);
+		self.small_slow_used = self.small_slow_used.saturating_sub(size);
 		self.small_slow_count = self.small_slow_count.saturating_sub(1);
 	}
 
-	fn remove_from_large_slow(&mut self, key: HashedKey, size: ObjectSize) {
+	fn remove_from_large_slow(&mut self, key: HashedKey, size: CacheSize) {
 		self.large_slow.remove(&key);
-		self.large_slow_used = self.large_slow_used.saturating_sub(size as CacheSize);
+		self.large_slow_used = self.large_slow_used.saturating_sub(size);
 		self.large_slow_count = self.large_slow_count.saturating_sub(1);
 	}
 
-	fn add_to_small_fast(&mut self, key: HashedKey, size: ObjectSize) {
+	fn add_to_small_fast(&mut self, key: HashedKey, size: CacheSize) {
 		self.small_fast.push_front(key);
-		self.small_fast_used += size as CacheSize;
+		self.small_fast_used += size;
 		self.small_fast_count += 1;
 	}
 
-	fn add_to_large_fast(&mut self, key: HashedKey, size: ObjectSize) {
+	fn add_to_large_fast(&mut self, key: HashedKey, size: CacheSize) {
 		self.large_fast.push_front(key);
-		self.large_fast_used += size as CacheSize;
+		self.large_fast_used += size;
 		self.large_fast_count += 1;
 	}
 
@@ -393,18 +419,18 @@ impl LruSizedHybridStack {
 				return;
 			},
 
-			(SizeQueue::SmallFast, false) => self.remove_from_small_fast(key, entry.size),
-			(SizeQueue::LargeFast, true) => self.remove_from_large_fast(key, entry.size),
-			(SizeQueue::SmallSlow, _) => self.remove_from_small_slow(key, entry.size),
-			(SizeQueue::LargeSlow, _) => self.remove_from_large_slow(key, entry.size),
+			(SizeQueue::SmallFast, false) => self.remove_from_small_fast(key, entry.migrating()),
+			(SizeQueue::LargeFast, true) => self.remove_from_large_fast(key, entry.migrating()),
+			(SizeQueue::SmallSlow, _) => self.remove_from_small_slow(key, entry.migrating()),
+			(SizeQueue::LargeSlow, _) => self.remove_from_large_slow(key, entry.migrating()),
 		}
 
 		let target_queue = if target_small { SizeQueue::SmallFast } else { SizeQueue::LargeFast };
 
 		if target_small {
-			self.add_to_small_fast(key, entry.size);
+			self.add_to_small_fast(key, entry.migrating());
 		} else {
-			self.add_to_large_fast(key, entry.size);
+			self.add_to_large_fast(key, entry.migrating());
 		}
 
 		if let Some(entry) = self.entries.get_mut(&key) {
@@ -459,7 +485,7 @@ impl LruSizedHybridStack {
 
 		while self.small_fast_used > drain_target {
 			let Some(demote_key) = self.small_fast.pop_back() else { break };
-			let size = self.entries.get(&demote_key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.get(&demote_key).map(|entry| entry.migrating()).unwrap_or(0);
 
 			self.small_fast_used = self.small_fast_used.saturating_sub(size);
 			self.small_fast_count = self.small_fast_count.saturating_sub(1);
@@ -490,7 +516,7 @@ impl LruSizedHybridStack {
 
 		while self.large_fast_used > drain_target {
 			let Some(demote_key) = self.large_fast.pop_back() else { break };
-			let size = self.entries.get(&demote_key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.get(&demote_key).map(|entry| entry.migrating()).unwrap_or(0);
 
 			self.large_fast_used = self.large_fast_used.saturating_sub(size);
 			self.large_fast_count = self.large_fast_count.saturating_sub(1);
@@ -536,13 +562,13 @@ impl LruSizedHybridStack {
 
 		if pick_small {
 			let key = self.small_fast.pop_back()?;
-			let size = self.entries.remove(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 			self.small_fast_used = self.small_fast_used.saturating_sub(size);
 			self.small_fast_count = self.small_fast_count.saturating_sub(1);
 			Some(key)
 		} else {
 			let key = self.large_fast.pop_back()?;
-			let size = self.entries.remove(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 			self.large_fast_used = self.large_fast_used.saturating_sub(size);
 			self.large_fast_count = self.large_fast_count.saturating_sub(1);
 			Some(key)
@@ -564,6 +590,12 @@ impl PolicyStack for LruSizedHybridStack {
 	}
 
 	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
+		self.insert_resident(key, size, 0);
+	}
+
+	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
+		let dram_resident = narrow_resident(dram_resident);
+		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 		if self.entries.contains_key(&key) {
 			// Existing key: track any size change, then treat as an
 			// access -- a `set()` always re-admits to fast, reclassifying
@@ -575,14 +607,14 @@ impl PolicyStack for LruSizedHybridStack {
 
 		if self.classify(size) {
 			self.small_fast.push_front(key);
-			self.entries.insert(key, SizedEntry { queue: SizeQueue::SmallFast, size });
-			self.small_fast_used += size as CacheSize;
+			self.entries.insert(key, SizedEntry { queue: SizeQueue::SmallFast, dram_resident, size });
+			self.small_fast_used += migrating;
 			self.small_fast_count += 1;
 			self.settle_small_fast();
 		} else {
 			self.large_fast.push_front(key);
-			self.entries.insert(key, SizedEntry { queue: SizeQueue::LargeFast, size });
-			self.large_fast_used += size as CacheSize;
+			self.entries.insert(key, SizedEntry { queue: SizeQueue::LargeFast, dram_resident, size });
+			self.large_fast_used += migrating;
 			self.large_fast_count += 1;
 			self.settle_large_fast();
 		}
@@ -600,22 +632,22 @@ impl PolicyStack for LruSizedHybridStack {
 		match entry.queue {
 			SizeQueue::SmallFast => {
 				self.small_fast.remove(&key);
-				self.small_fast_used = self.small_fast_used.saturating_sub(entry.size as CacheSize);
+				self.small_fast_used = self.small_fast_used.saturating_sub(entry.migrating());
 				self.small_fast_count = self.small_fast_count.saturating_sub(1);
 			},
 			SizeQueue::LargeFast => {
 				self.large_fast.remove(&key);
-				self.large_fast_used = self.large_fast_used.saturating_sub(entry.size as CacheSize);
+				self.large_fast_used = self.large_fast_used.saturating_sub(entry.migrating());
 				self.large_fast_count = self.large_fast_count.saturating_sub(1);
 			},
 			SizeQueue::SmallSlow => {
 				self.small_slow.remove(&key);
-				self.small_slow_used = self.small_slow_used.saturating_sub(entry.size as CacheSize);
+				self.small_slow_used = self.small_slow_used.saturating_sub(entry.migrating());
 				self.small_slow_count = self.small_slow_count.saturating_sub(1);
 			},
 			SizeQueue::LargeSlow => {
 				self.large_slow.remove(&key);
-				self.large_slow_used = self.large_slow_used.saturating_sub(entry.size as CacheSize);
+				self.large_slow_used = self.large_slow_used.saturating_sub(entry.migrating());
 				self.large_slow_count = self.large_slow_count.saturating_sub(1);
 			},
 		}
@@ -656,13 +688,13 @@ impl PolicyStack for LruSizedHybridStack {
 
 		if pick_small {
 			let key = self.small_slow.pop_back()?;
-			let size = self.entries.remove(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 			self.small_slow_used = self.small_slow_used.saturating_sub(size);
 			self.small_slow_count = self.small_slow_count.saturating_sub(1);
 			Some(key)
 		} else {
 			let key = self.large_slow.pop_back()?;
-			let size = self.entries.remove(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 			self.large_slow_used = self.large_slow_used.saturating_sub(size);
 			self.large_slow_count = self.large_slow_count.saturating_sub(1);
 			Some(key)

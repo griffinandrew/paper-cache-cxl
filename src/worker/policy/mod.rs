@@ -2130,6 +2130,17 @@ mod hybrid_tests {
 		overhead_manager.base_size(&probe)
 	}
 
+	/// The migrating (value) bytes of a representative object.
+	///
+	/// The tier counters charge this, not `base_size_of`: `base_size` also
+	/// counts the key and expiry field, which stay in DRAM in either tier and
+	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
+	/// therefore over-provisions it by the DRAM-resident remainder per object.
+	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
+		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
+	}
+
 	#[test]
 	fn demotion_physically_replaces_object_bytes_and_updates_stats() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000);
@@ -2143,7 +2154,7 @@ mod hybrid_tests {
 		// watermarks apply. Admitting the second object therefore crosses the
 		// high watermark, and the drain stops after demoting exactly one.
 		worker.handle_resize_fast_tier(
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1)
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize + 1)
 				+ 2 * shared_overhead(),
 		);
 
@@ -2176,7 +2187,7 @@ mod hybrid_tests {
 		// single key this scenario expects to survive the promotion isn't
 		// swept out along with it.
 		worker.handle_resize_fast_tier(
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1)
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize + 1)
 				+ 2 * shared_overhead(),
 		);
 
@@ -2378,6 +2389,17 @@ mod hybrid_tests {
 		overhead_manager.base_size(&probe)
 	}
 
+	/// The migrating (value) bytes of a representative object.
+	///
+	/// The tier counters charge this, not `base_size_of`: `base_size` also
+	/// counts the key and expiry field, which stay in DRAM in either tier and
+	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
+	/// therefore over-provisions it by the DRAM-resident remainder per object.
+	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
+		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
+	}
+
 	#[test]
 	fn admission_once_fast_is_full_goes_directly_to_slow_and_updates_stats() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000);
@@ -2429,7 +2451,7 @@ mod hybrid_tests {
 		// effective budget past three values, letting key 3 be admitted fast
 		// and skipping the promotion this test is named for.
 		worker.handle_resize_fast_tier(
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize * 2)
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize * 2)
 				+ 3 * shared_overhead(),
 		);
 
@@ -2646,6 +2668,18 @@ mod hybrid_tests {
 		overhead_manager.base_size(&probe)
 	}
 
+	/// The migrating (value) bytes of a representative object.
+	///
+	/// The tier counters charge this, not `base_size_of`: `base_size` also
+	/// counts the key and expiry field, which stay in DRAM in either tier and
+	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
+	/// therefore over-provisions it by the DRAM-resident remainder per object.
+	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
+		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
+	}
+
+
 	#[test]
 	fn demotion_physically_replaces_object_bytes_and_updates_stats() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000);
@@ -2660,7 +2694,7 @@ mod hybrid_tests {
 		// object therefore crosses the high watermark, and the drain stops
 		// after demoting exactly one.
 		worker.handle_resize_fast_tier(
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1)
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize + 1)
 				+ 2 * shared_overhead(),
 		);
 
@@ -2694,7 +2728,7 @@ mod hybrid_tests {
 		// watermark, plus the unscaled shared-metadata reservation for both
 		// tracked objects, so admitting key 2 demotes exactly key 1.
 		worker.handle_resize_fast_tier(
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1)
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize + 1)
 				+ 2 * shared_overhead(),
 		);
 
@@ -2924,6 +2958,17 @@ mod hybrid_tests {
 		overhead_manager.base_size(&probe)
 	}
 
+	/// The migrating (value) bytes of a representative object.
+	///
+	/// The tier counters charge this, not `base_size_of`: `base_size` also
+	/// counts the key and expiry field, which stay in DRAM in either tier and
+	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
+	/// therefore over-provisions it by the DRAM-resident remainder per object.
+	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
+		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
+	}
+
 	/// The whole point of this design: a brand-new key is admitted fast and
 	/// stays fast, with no migration to correct it. Contrast
 	/// `hybrid_tests::admission_lands_slow_and_promotion_physically_moves_bytes`.
@@ -2964,7 +3009,7 @@ mod hybrid_tests {
 		// term the corrected (measurement-calibrated) per-object overhead
 		// exceeds the whole budget, and the key demotes straight back out.
 		worker.handle_resize_fast_tier(
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize * 4)
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize * 4)
 				+ shared_overhead(),
 		);
 
@@ -2993,7 +3038,7 @@ mod hybrid_tests {
 		// takes off the top (the FIFO reservation, plus shared metadata for
 		// the two keys tracked when the pass runs) are added back unscaled.
 		worker.handle_resize_fast_tier(
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1)
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize + 1)
 				+ fifo_reservation(MAX_SIZE)
 				+ 2 * shared_overhead(),
 		);
@@ -3028,7 +3073,7 @@ mod hybrid_tests {
 		// below and when it is promoted back, or the drain that follows the
 		// promotion would immediately undo it.
 		worker.handle_resize_fast_tier(
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1)
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize + 1)
 				+ fifo_reservation(MAX_SIZE)
 				+ 2 * shared_overhead(),
 		);
@@ -3198,6 +3243,17 @@ mod hybrid_tests {
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
 		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
 		overhead_manager.base_size(&probe)
+	}
+
+	/// The migrating (value) bytes of a representative object.
+	///
+	/// The tier counters charge this, not `base_size_of`: `base_size` also
+	/// counts the key and expiry field, which stay in DRAM in either tier and
+	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
+	/// therefore over-provisions it by the DRAM-resident remainder per object.
+	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
+		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
 	}
 
 	/// `max_size` used by every test below except the eviction one, chosen so
@@ -3391,7 +3447,7 @@ mod hybrid_tests {
 		// for the two keys tracked when the pass runs.
 		set_effective_main_fast_capacity(
 			&mut worker,
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1),
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize + 1),
 			2,
 		);
 
@@ -3427,7 +3483,7 @@ mod hybrid_tests {
 		// just-promoted key straight back out and undo the promotion.
 		set_effective_main_fast_capacity(
 			&mut worker,
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1),
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize + 1),
 			2,
 		);
 
@@ -3694,6 +3750,17 @@ mod hybrid_tests {
 		overhead_manager.base_size(&probe)
 	}
 
+	/// The migrating (value) bytes of a representative object.
+	///
+	/// The tier counters charge this, not `base_size_of`: `base_size` also
+	/// counts the key and expiry field, which stay in DRAM in either tier and
+	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
+	/// therefore over-provisions it by the DRAM-resident remainder per object.
+	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
+		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
+	}
+
 	#[test]
 	fn admission_lands_slow_and_promotion_physically_moves_bytes() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000);
@@ -3706,7 +3773,7 @@ mod hybrid_tests {
 		// `promote_from_fifo`'s own `settle_fast_tier` demotes the key it
 		// just promoted and suppresses the promotion migration altogether.
 		worker.handle_resize_fast_tier(
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1)
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize + 1)
 				+ shared_overhead(),
 		);
 
@@ -3749,7 +3816,7 @@ mod hybrid_tests {
 		// watermark (so that promotion survives), promoting key 2 crosses
 		// it, and the triggered pass stops after demoting exactly one.
 		worker.handle_resize_fast_tier(
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1)
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize + 1)
 				+ 2 * shared_overhead(),
 		);
 
@@ -3943,6 +4010,17 @@ mod hybrid_tests {
 		overhead_manager.base_size(&probe)
 	}
 
+	/// The migrating (value) bytes of a representative object.
+	///
+	/// The tier counters charge this, not `base_size_of`: `base_size` also
+	/// counts the key and expiry field, which stay in DRAM in either tier and
+	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
+	/// therefore over-provisions it by the DRAM-resident remainder per object.
+	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
+		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
+	}
+
 	#[test]
 	fn demotion_physically_replaces_object_bytes_and_updates_stats() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(1_000_000);
@@ -3955,7 +4033,7 @@ mod hybrid_tests {
 		worker.handle_resize_size_threshold(1_000_000);
 		worker.handle_resize_large_fast_tier(1_000_000);
 		worker.handle_resize_fast_tier(
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1),
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize + 1),
 		);
 
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15); // fast
@@ -3985,7 +4063,7 @@ mod hybrid_tests {
 		worker.handle_resize_size_threshold(1_000_000);
 		worker.handle_resize_large_fast_tier(1_000_000);
 		worker.handle_resize_fast_tier(
-			low_water_safe(base_size_of(&overhead_manager, 15) as CacheSize + 1),
+			low_water_safe(migrating_size_of(&overhead_manager, 15) as CacheSize + 1),
 		);
 
 		insert(&objects, &status, &overhead_manager, &mut worker, 1, 15);

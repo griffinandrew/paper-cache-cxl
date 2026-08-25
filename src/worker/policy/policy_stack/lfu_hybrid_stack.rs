@@ -87,7 +87,7 @@
 //! Every tracked key needs both a tier and a size, and nearly every
 //! operation here touches both together. An earlier version kept these in
 //! two separate maps (`tiers`, `sizes`); they're now one
-//! `entries: HashMap<HashedKey, LfuEntry>` (`LfuEntry { tier, size }`),
+//! `entries: HashMap<HashedKey, LfuEntry>` (`LfuEntry { dram_resident, tier, size }`),
 //! matching `LruHybridStack`'s and `TwoQHybridStack`'s equivalent
 //! consolidation. This removes one of the two hashtable-structural-overhead
 //! charges per tracked object (see `object/overhead.rs`'s `LfuHybrid` arm)
@@ -122,7 +122,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
-	worker::policy::policy_stack::{PolicyStack, Tier, watermarks},
+	worker::policy::policy_stack::{PolicyStack, Tier, narrow_resident, watermarks},
 };
 
 // The two frequency-bucket chains and the per-key map are DRAM-backed by
@@ -140,10 +140,36 @@ type ChainIndex = PmemIndex;
 /// Combined per-key bookkeeping: tier and size. See the module doc's "One
 /// combined per-key map" section for why this replaced two separate maps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LfuEntry {
-	tier: Tier,
+struct LfuEntry {tier: Tier,
+	/// Part of `size` that stays in DRAM in either tier; see `migrating`.
+	dram_resident: u8,
+
 	size: ObjectSize,
 }
+
+impl LfuEntry {
+/// The bytes that actually move between tiers when this object migrates.
+	///
+	/// `size` is `base_size`, which also counts the DRAM-resident remainder --
+	/// the key and expiry field (inline in the object map) plus the `Expiries`
+	/// entry when a TTL is set. `Object::set_data` replaces the value buffer
+	/// alone, so none of that moves, and the key and expiry are already inside
+	/// `shared_overhead`. Charging them to the tier counters double-counted
+	/// every fast-tier object and made demotion appear to free DRAM it did not.
+	#[inline]
+	fn migrating(&self) -> CacheSize {
+		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+	}
+}
+
+/// `dram_resident` was meant to occupy padding the entry already had.
+/// If this ever fails, the field is costing 4 more bytes on *every* tracked
+/// object in both tiers, which defeats the point of storing it per entry.
+const _: () = assert!(
+	std::mem::size_of::<LfuEntry>() == 8,
+	"LfuEntry grew past 8 bytes",
+);
+
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 type EntryMap = HashMap<HashedKey, LfuEntry, NoHasher>;
@@ -480,9 +506,9 @@ impl LfuHybridStack {
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
-		let old_size = entry.size;
+		let old_migrating = entry.migrating();
 		entry.size = new_size;
-		let delta = new_size as i64 - old_size as i64;
+		let delta = entry.migrating() as i64 - old_migrating as i64;
 
 		match entry.tier {
 			Tier::Fast => {
@@ -522,7 +548,7 @@ impl LfuHybridStack {
 			return None;
 		}
 
-		let size = self.entries.get(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = self.entries.get(&key).map(|entry| entry.migrating()).unwrap_or(0);
 
 		self.slow_chain.remove(key);
 		self.slow_used = self.slow_used.saturating_sub(size);
@@ -569,7 +595,7 @@ impl LfuHybridStack {
 		while self.fast_used > target {
 			let Some((demote_key, count)) = self.fast_chain.pop_min() else { break };
 
-			let size = self.entries.get(&demote_key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.get(&demote_key).map(|entry| entry.migrating()).unwrap_or(0);
 
 			self.slow_chain.insert_at(demote_key, count);
 			if let Some(entry) = self.entries.get_mut(&demote_key) {
@@ -608,6 +634,11 @@ impl PolicyStack for LfuHybridStack {
 	}
 
 	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
+		self.insert_resident(key, size, 0);
+	}
+
+	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
+		let dram_resident = narrow_resident(dram_resident);
 		if self.entries.contains_key(&key) {
 			// Existing key: track any size change, then treat as an access
 			// (matches `LfuStack::insert`'s existing-key delegation to
@@ -648,8 +679,8 @@ impl PolicyStack for LfuHybridStack {
 		// would otherwise let a frequency-1 newcomer bypass promotion).
 		if self.fast_tier_latched {
 			self.slow_chain.insert_new(key);
-			self.entries.insert(key, LfuEntry { tier: Tier::Slow, size });
-			self.slow_used += size as CacheSize;
+			self.entries.insert(key, LfuEntry { dram_resident, tier: Tier::Slow, size });
+			self.slow_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 
 			// No migration is emitted here. Once the latch is shut,
 			// `hybrid_policy::admission_tier` already returns `Tier::Slow`
@@ -681,12 +712,12 @@ impl PolicyStack for LfuHybridStack {
 
 		if self.fast_used + size as CacheSize <= admit_effective {
 			self.fast_chain.insert_new(key);
-			self.entries.insert(key, LfuEntry { tier: Tier::Fast, size });
-			self.fast_used += size as CacheSize;
+			self.entries.insert(key, LfuEntry { dram_resident, tier: Tier::Fast, size });
+			self.fast_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 		} else {
 			self.slow_chain.insert_new(key);
-			self.entries.insert(key, LfuEntry { tier: Tier::Slow, size });
-			self.slow_used += size as CacheSize;
+			self.entries.insert(key, LfuEntry { dram_resident, tier: Tier::Slow, size });
+			self.slow_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 
 			self.migrations.push((key, Tier::Slow));
 
@@ -722,7 +753,7 @@ impl PolicyStack for LfuHybridStack {
 
 	fn remove(&mut self, key: HashedKey) {
 		let entry = self.entries.remove(&key);
-		let size = entry.map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = entry.map(|entry| entry.migrating()).unwrap_or(0);
 
 		match entry.map(|entry| entry.tier) {
 			Some(Tier::Fast) => {
@@ -753,7 +784,7 @@ impl PolicyStack for LfuHybridStack {
 
 	fn evict_one(&mut self) -> Option<HashedKey> {
 		if let Some((key, _count)) = self.slow_chain.pop_min() {
-			let size = self.entries.remove(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 			self.slow_used = self.slow_used.saturating_sub(size);
 			return Some(key);
 		}
@@ -762,7 +793,7 @@ impl PolicyStack for LfuHybridStack {
 		// ever been demoted): fall back to the fast chain's minimum, mirrors
 		// `LruHybridStack::evict_one`'s fallback for the same situation.
 		let (key, _count) = self.fast_chain.pop_min()?;
-		let size = self.entries.remove(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 		self.fast_used = self.fast_used.saturating_sub(size);
 
 		Some(key)
@@ -907,7 +938,7 @@ mod tests {
 		// admission (which would land it fast, not slow) so the promotion
 		// path can be exercised directly and deterministically.
 		stack.slow_chain.insert_new(2);
-		stack.entries.insert(2, LfuEntry { tier: Tier::Slow, size: 10 });
+		stack.entries.insert(2, LfuEntry { dram_resident: 0, tier: Tier::Slow, size: 10 });
 		stack.slow_used += 10;
 
 		assert_eq!(stack.fast_chain.min_count(), Some(1));
@@ -933,7 +964,7 @@ mod tests {
 		// real `update` bump (1 -> 2) lands it exactly on the fast
 		// minimum (2), not strictly past it.
 		stack.slow_chain.insert_new(2);
-		stack.entries.insert(2, LfuEntry { tier: Tier::Slow, size: 10 });
+		stack.entries.insert(2, LfuEntry { dram_resident: 0, tier: Tier::Slow, size: 10 });
 		stack.slow_used += 10;
 
 		assert_eq!(stack.fast_chain.min_count(), Some(2));

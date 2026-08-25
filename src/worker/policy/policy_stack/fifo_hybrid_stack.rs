@@ -91,7 +91,7 @@
 //!
 //! Every tracked key needs both a tier and a size, and nearly every
 //! operation here touches both together — matching `LruHybridStack`'s
-//! `entries: HashMap<HashedKey, FifoEntry>` (`FifoEntry { tier, size }`)
+//! `entries: HashMap<HashedKey, FifoEntry>` (`FifoEntry { dram_resident, tier, size }`)
 //! consolidation (see that stack's module doc for the history of why this
 //! collapsed from two separate maps).
 
@@ -118,7 +118,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
-	worker::policy::policy_stack::{PolicyStack, Tier, watermarks},
+	worker::policy::policy_stack::{PolicyStack, Tier, narrow_resident, watermarks},
 };
 
 // The insertion-ordered queue and per-key map are DRAM-backed by default.
@@ -138,10 +138,36 @@ type QueueList = PmemHashList<HashedKey, NoHasher>;
 /// Combined per-key bookkeeping: tier and size. See the module doc's "One
 /// combined per-key map" section for why this is a single map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FifoEntry {
-	tier: Tier,
+struct FifoEntry {tier: Tier,
+	/// Part of `size` that stays in DRAM in either tier; see `migrating`.
+	dram_resident: u8,
+
 	size: ObjectSize,
 }
+
+impl FifoEntry {
+/// The bytes that actually move between tiers when this object migrates.
+	///
+	/// `size` is `base_size`, which also counts the DRAM-resident remainder --
+	/// the key and expiry field (inline in the object map) plus the `Expiries`
+	/// entry when a TTL is set. `Object::set_data` replaces the value buffer
+	/// alone, so none of that moves, and the key and expiry are already inside
+	/// `shared_overhead`. Charging them to the tier counters double-counted
+	/// every fast-tier object and made demotion appear to free DRAM it did not.
+	#[inline]
+	fn migrating(&self) -> CacheSize {
+		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+	}
+}
+
+/// `dram_resident` was meant to occupy padding the entry already had.
+/// If this ever fails, the field is costing 4 more bytes on *every* tracked
+/// object in both tiers, which defeats the point of storing it per entry.
+const _: () = assert!(
+	std::mem::size_of::<FifoEntry>() == 8,
+	"FifoEntry grew past 8 bytes",
+);
+
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 type EntryMap = HashMap<HashedKey, FifoEntry, NoHasher>;
@@ -258,9 +284,9 @@ impl FifoHybridStack {
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
-		let old_size = entry.size;
+		let old_migrating = entry.migrating();
 		entry.size = new_size;
-		let delta = new_size as i64 - old_size as i64;
+		let delta = entry.migrating() as i64 - old_migrating as i64;
 
 		match entry.tier {
 			Tier::Fast => {
@@ -304,7 +330,7 @@ impl FifoHybridStack {
 		while self.fast_used > drain_target {
 			let Some(demote_key) = self.fast_boundary else { break };
 
-			let size = self.entries.get(&demote_key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.get(&demote_key).map(|entry| entry.migrating()).unwrap_or(0);
 			let new_boundary = self.queue.before(&demote_key).copied();
 
 			if let Some(entry) = self.entries.get_mut(&demote_key) {
@@ -335,7 +361,12 @@ impl PolicyStack for FifoHybridStack {
 	}
 
 	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
-		if let Some(&FifoEntry { tier, size: old_size }) = self.entries.get(&key) {
+		self.insert_resident(key, size, 0);
+	}
+
+	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
+		let dram_resident = narrow_resident(dram_resident);
+		if let Some(&FifoEntry { tier, size: old_size , .. }) = self.entries.get(&key) {
 			// Existing key: FIFO has no promotion/reordering at all — a
 			// `set()` overwrite must never move this key's position in
 			// `queue` and must never change its tier. Only correct
@@ -360,8 +391,8 @@ impl PolicyStack for FifoHybridStack {
 		// Brand-new key: admitted at the bottom of the fast tier (newest
 		// end of the queue), per the paper's admission rule.
 		self.queue.push_front(key);
-		self.entries.insert(key, FifoEntry { tier: Tier::Fast, size });
-		self.fast_used += size as CacheSize;
+		self.entries.insert(key, FifoEntry { dram_resident, tier: Tier::Fast, size });
+		self.fast_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 		self.fast_count += 1;
 
 		if self.fast_boundary.is_none() {
@@ -380,7 +411,7 @@ impl PolicyStack for FifoHybridStack {
 
 	fn remove(&mut self, key: HashedKey) {
 		let entry = self.entries.remove(&key);
-		let size = entry.map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = entry.map(|entry| entry.migrating()).unwrap_or(0);
 		let tier = entry.map(|entry| entry.tier);
 
 		let new_boundary_if_needed = if tier == Some(Tier::Fast) && self.fast_boundary == Some(key) {
@@ -423,7 +454,7 @@ impl PolicyStack for FifoHybridStack {
 	fn evict_one(&mut self) -> Option<HashedKey> {
 		let key = self.queue.pop_back()?;
 		let entry = self.entries.remove(&key);
-		let size = entry.map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = entry.map(|entry| entry.migrating()).unwrap_or(0);
 
 		match entry.map(|entry| entry.tier) {
 			Some(Tier::Fast) => {

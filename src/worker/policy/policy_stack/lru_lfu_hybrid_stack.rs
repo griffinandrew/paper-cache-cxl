@@ -177,7 +177,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
-	worker::policy::policy_stack::{PolicyStack, Tier, watermarks},
+	worker::policy::policy_stack::{PolicyStack, Tier, narrow_resident, watermarks},
 };
 
 /// Superseded by [`watermarks`]: `settle_fast_tier` now triggers at
@@ -221,7 +221,9 @@ type ChainIndex = PmemIndex;
 /// 8 bytes (`u32` + `u16` + `u8` = 7, padded to 8), keeping the
 /// `(HashedKey, LruLfuEntry)` pair at 16 — see the module doc.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LruLfuEntry {
+struct LruLfuEntry {/// Part of `size` that stays in DRAM in either tier; see `migrating`.
+	dram_resident: u8,
+
 	size: ObjectSize,
 	/// Accesses accumulated, saturating at [`FREQUENCY_CAP`]. Meaningful in
 	/// both tiers: it ranks the key while slow, and is carried across on
@@ -229,6 +231,30 @@ struct LruLfuEntry {
 	freq: u16,
 	tier: Tier,
 }
+
+impl LruLfuEntry {
+/// The bytes that actually move between tiers when this object migrates.
+	///
+	/// `size` is `base_size`, which also counts the DRAM-resident remainder --
+	/// the key and expiry field (inline in the object map) plus the `Expiries`
+	/// entry when a TTL is set. `Object::set_data` replaces the value buffer
+	/// alone, so none of that moves, and the key and expiry are already inside
+	/// `shared_overhead`. Charging them to the tier counters double-counted
+	/// every fast-tier object and made demotion appear to free DRAM it did not.
+	#[inline]
+	fn migrating(&self) -> CacheSize {
+		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+	}
+}
+
+/// `dram_resident` was meant to occupy padding the entry already had.
+/// If this ever fails, the field is costing 4 more bytes on *every* tracked
+/// object in both tiers, which defeats the point of storing it per entry.
+const _: () = assert!(
+	std::mem::size_of::<LruLfuEntry>() == 8,
+	"LruLfuEntry grew past 8 bytes",
+);
+
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 type EntryMap = HashMap<HashedKey, LruLfuEntry, NoHasher>;
@@ -513,9 +539,9 @@ impl LruLfuHybridStack {
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
-		let old_size = entry.size;
+		let old_migrating = entry.migrating();
 		entry.size = new_size;
-		let delta = new_size as i64 - old_size as i64;
+		let delta = entry.migrating() as i64 - old_migrating as i64;
 
 		match entry.tier {
 			Tier::Fast => {
@@ -563,7 +589,7 @@ impl LruLfuHybridStack {
 	fn promote(&mut self, key: HashedKey) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
-		let size = entry.size as CacheSize;
+		let size = entry.migrating();
 		entry.tier = Tier::Fast;
 		entry.freq = 1;
 
@@ -618,7 +644,7 @@ impl LruLfuHybridStack {
 			let (size, freq) = match self.entries.get_mut(&demote_key) {
 				Some(entry) => {
 					entry.tier = Tier::Slow;
-					(entry.size as CacheSize, entry.freq)
+					(entry.migrating(), entry.freq)
 				},
 
 				// Untracked key in the recency list should be impossible;
@@ -649,6 +675,11 @@ impl PolicyStack for LruLfuHybridStack {
 	}
 
 	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
+		self.insert_resident(key, size, 0);
+	}
+
+	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
+		let dram_resident = narrow_resident(dram_resident);
 		if self.entries.contains_key(&key) {
 			// An overwrite is an access, not an automatic promotion — see
 			// the module doc's "A `set()` is an access" section.
@@ -658,8 +689,8 @@ impl PolicyStack for LruLfuHybridStack {
 		}
 
 		self.fast_stack.push_front(key);
-		self.entries.insert(key, LruLfuEntry { size, freq: 1, tier: Tier::Fast });
-		self.fast_used += size as CacheSize;
+		self.entries.insert(key, LruLfuEntry { dram_resident, size, freq: 1, tier: Tier::Fast });
+		self.fast_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 
 		self.settle_fast_tier();
 	}
@@ -675,7 +706,7 @@ impl PolicyStack for LruLfuHybridStack {
 	fn remove(&mut self, key: HashedKey) {
 		let Some(entry) = self.entries.remove(&key) else { return };
 
-		let size = entry.size as CacheSize;
+		let size = entry.migrating();
 
 		match entry.tier {
 			Tier::Fast => {
@@ -710,7 +741,7 @@ impl PolicyStack for LruLfuHybridStack {
 		};
 
 		if let Some(entry) = self.entries.remove(&key) {
-			let size = entry.size as CacheSize;
+			let size = entry.migrating();
 
 			match entry.tier {
 				Tier::Fast => {
