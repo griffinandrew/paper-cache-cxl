@@ -325,11 +325,16 @@ impl TwoQHybridStack {
 
 	/// Records a size change for an already-tracked key without altering its
 	/// queue/tier, adjusting whichever counter currently applies.
-	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
+	/// `new_resident` refreshes the entry's DRAM-resident remainder: a re-set
+	/// can add or drop a TTL, which changes it by the `Expiries` entry's cost.
+	/// Without this the entry keeps its old remainder and every later
+	/// migration moves the wrong number of bytes.
+	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize, new_resident: u8) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
 		let old_migrating = entry.migrating();
 		entry.size = new_size;
+		entry.dram_resident = new_resident;
 		let delta = entry.migrating() as i64 - old_migrating as i64;
 
 		match (entry.queue, entry.tier) {
@@ -571,7 +576,7 @@ impl PolicyStack for TwoQHybridStack {
 		let dram_resident = narrow_resident(dram_resident);
 		if self.entries.contains_key(&key) {
 			// Existing key: track any size change, then treat as an access.
-			self.resize_key(key, size);
+			self.resize_key(key, size, dram_resident);
 			self.touch(key);
 			return;
 		}

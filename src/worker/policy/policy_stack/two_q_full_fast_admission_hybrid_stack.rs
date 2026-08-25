@@ -446,11 +446,16 @@ impl TwoQFullFastAdmissionHybridStack {
 	/// grew, unlike `TwoQFastAdmissionHybridStack::resize_key`: the
 	/// reservation `am`'s budget is computed against is the *fixed*
 	/// `a1_in_capacity`, so live `a1_in_used` does not move it.
-	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
+	/// `new_resident` refreshes the entry's DRAM-resident remainder: a re-set
+	/// can add or drop a TTL, which changes it by the `Expiries` entry's cost.
+	/// Without this the entry keeps its old remainder and every later
+	/// migration moves the wrong number of bytes.
+	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize, new_resident: u8) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
 		let old_migrating = entry.migrating();
 		entry.size = new_size;
+		entry.dram_resident = new_resident;
 		let delta = entry.migrating() as i64 - old_migrating as i64;
 
 		match (entry.queue, entry.tier) {
@@ -756,7 +761,7 @@ impl PolicyStack for TwoQFullFastAdmissionHybridStack {
 			// Existing key: track any size change, then treat as an access —
 			// exactly what `TwoQStack::insert` does (three `Stack::update`
 			// calls, then falling through to `update`).
-			self.resize_key(key, size);
+			self.resize_key(key, size, dram_resident);
 			self.touch(key);
 			return;
 		}

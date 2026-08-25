@@ -598,6 +598,41 @@ mod tests {
 		);
 	}
 
+	/// A re-set can add or drop a TTL, which changes the DRAM-resident
+	/// remainder by the `Expiries` entry's cost without touching the value.
+	/// `resize_key` must refresh it, or the entry keeps its stale remainder and
+	/// every later migration moves the wrong number of bytes.
+	#[test]
+	fn re_setting_with_a_ttl_refreshes_the_dram_resident_remainder() {
+		const VALUE: ObjectSize = 100;
+		const NO_TTL: ObjectSize = 24;   // u64 key + inline expiry field
+		const WITH_TTL: ObjectSize = 88; // the same, plus the Expiries entry
+
+		let mut stack = LruHybridStack::new(VALUE as CacheSize * 10);
+
+		stack.insert_resident(1, VALUE + NO_TTL, NO_TTL);
+		assert_eq!(
+			stack.fast_bytes_used(),
+			VALUE as CacheSize,
+			"admission must charge the value alone",
+		);
+
+		// Same key, same value, now carrying a TTL: `base_size` grows by the
+		// index entry, but nothing migrating changed.
+		stack.insert_resident(1, VALUE + WITH_TTL, WITH_TTL);
+		assert_eq!(
+			stack.fast_bytes_used(),
+			VALUE as CacheSize,
+			"adding a TTL grew only DRAM-resident bytes, so the tier counter \
+			 must not move; a stale remainder would report {}",
+			(VALUE + WITH_TTL - NO_TTL) as CacheSize,
+		);
+
+		// And dropping it again is symmetric.
+		stack.insert_resident(1, VALUE + NO_TTL, NO_TTL);
+		assert_eq!(stack.fast_bytes_used(), VALUE as CacheSize);
+	}
+
 	/// `dram_resident` was meant to occupy padding the entry already had.
 	#[test]
 	fn entry_still_fits_in_eight_bytes() {

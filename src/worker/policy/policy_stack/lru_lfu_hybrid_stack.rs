@@ -536,11 +536,16 @@ impl LruLfuHybridStack {
 
 	/// Records a size change for an already-tracked key without altering its
 	/// tier, adjusting whichever tier's used-bytes counter applies.
-	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
+	/// `new_resident` refreshes the entry's DRAM-resident remainder: a re-set
+	/// can add or drop a TTL, which changes it by the `Expiries` entry's cost.
+	/// Without this the entry keeps its old remainder and every later
+	/// migration moves the wrong number of bytes.
+	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize, new_resident: u8) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
 		let old_migrating = entry.migrating();
 		entry.size = new_size;
+		entry.dram_resident = new_resident;
 		let delta = entry.migrating() as i64 - old_migrating as i64;
 
 		match entry.tier {
@@ -683,7 +688,7 @@ impl PolicyStack for LruLfuHybridStack {
 		if self.entries.contains_key(&key) {
 			// An overwrite is an access, not an automatic promotion — see
 			// the module doc's "A `set()` is an access" section.
-			self.resize_key(key, size);
+			self.resize_key(key, size, dram_resident);
 			self.update(key);
 			return;
 		}

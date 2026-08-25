@@ -396,11 +396,16 @@ impl TwoQFastAdmissionHybridStack {
 	/// `Fifo`-resident and grew: `fifo_used` is a DRAM reservation here, so
 	/// growing it shrinks the main queue's effective budget. Both current
 	/// callers do (`insert` explicitly, `update` via `touch`).
-	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
+	/// `new_resident` refreshes the entry's DRAM-resident remainder: a re-set
+	/// can add or drop a TTL, which changes it by the `Expiries` entry's cost.
+	/// Without this the entry keeps its old remainder and every later
+	/// migration moves the wrong number of bytes.
+	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize, new_resident: u8) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
 		let old_migrating = entry.migrating();
 		entry.size = new_size;
+		entry.dram_resident = new_resident;
 		let delta = entry.migrating() as i64 - old_migrating as i64;
 
 		match (entry.queue, entry.tier) {
@@ -632,7 +637,7 @@ impl PolicyStack for TwoQFastAdmissionHybridStack {
 			// Existing key: track any size change, then treat as an access.
 			// `touch` settles the fast tier on every path, so a FIFO-resident
 			// key that grew is covered without an extra call here.
-			self.resize_key(key, size);
+			self.resize_key(key, size, dram_resident);
 			self.touch(key);
 			return;
 		}
