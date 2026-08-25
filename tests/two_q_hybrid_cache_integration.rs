@@ -70,7 +70,7 @@ mod hybrid_cache_tests {
         // Mechanics tests at toy scales: metadata reservation off (see
         // `get_hybrid_dram_shared_overhead`).
         unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::TwoQHybrid(1.0))
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::TwoQHybrid(1.0))
             .expect("warm-up cache should construct");
 
         cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
@@ -86,8 +86,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
 
@@ -105,8 +105,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
@@ -129,8 +129,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            200,
-            CacheTierSize::Bytes(200), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
+            256,
+            CacheTierSize::Bytes(256), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
@@ -154,12 +154,12 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         // Overall cache is huge, but k_in caps the FIFO queue's own byte
-        // budget tightly (0.00004 * 1_000_000 = 40 bytes, fitting one
+        // budget tightly (0.00004 * 1_048_576 = 41 bytes, fitting one
         // ~15-byte value) -- eviction should trigger from fifo_capacity
         // pressure alone, nowhere near the global max_size.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::TwoQHybrid(0.00004)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::TwoQHybrid(0.00004)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
@@ -184,7 +184,7 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(40), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
@@ -208,7 +208,7 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(40), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
@@ -249,7 +249,7 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
         let ttl_secs = 5u32;
@@ -287,8 +287,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
@@ -314,8 +314,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            200,
-            CacheTierSize::Bytes(200), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
+            256,
+            CacheTierSize::Bytes(256), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
         // Promote key 1 into the main queue (fast) so it's "proven" and
         // should survive eviction pressure that FIFO objects wouldn't.
@@ -347,13 +347,13 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
-        assert_eq!(cache.fast_tier_size(), 1_000_000);
+        assert_eq!(cache.fast_tier_size(), 1_048_576);
 
         cache.set_fast_tier_size(CacheTierSize::Bytes(1)).expect("resize should succeed");
         assert_eq!(cache.fast_tier_size(), 1);
@@ -366,7 +366,7 @@ mod hybrid_cache_tests {
     fn resize_rescales_fifo_capacity() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(1_000), PaperPolicy::TwoQHybrid(0.5))
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(1_024), PaperPolicy::TwoQHybrid(0.5))
             .expect("cache should construct");
         // fifo_capacity = 0.5 * 1_000 = 500
 
@@ -386,13 +386,13 @@ mod hybrid_cache_tests {
 
     #[test]
     fn zero_fast_tier_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(0), PaperPolicy::TwoQHybrid(0.5));
+        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(0), PaperPolicy::TwoQHybrid(0.5));
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
 
     #[test]
     fn fast_tier_size_exceeding_max_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(2_000), PaperPolicy::TwoQHybrid(0.5));
+        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(2_048), PaperPolicy::TwoQHybrid(0.5));
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
 
@@ -405,12 +405,12 @@ mod hybrid_cache_tests {
     #[test]
     fn invalid_k_in_is_rejected() {
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(500), PaperPolicy::TwoQHybrid(1.5)),
+            PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(512), PaperPolicy::TwoQHybrid(1.5)),
             Err(CacheError::InvalidPolicy),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(500), PaperPolicy::TwoQHybrid(-0.1)),
+            PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(512), PaperPolicy::TwoQHybrid(-0.1)),
             Err(CacheError::InvalidPolicy),
         ));
     }
@@ -423,7 +423,7 @@ mod hybrid_cache_tests {
         // governs the main queue's split), so even a 1-byte fast tier
         // should admit and store a real value fine.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(1), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
         cache.set(1u32, b"a value", None).expect("set should succeed");
@@ -436,8 +436,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.set(2u32, b"second value 45", None).expect("set should succeed");
@@ -458,8 +458,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.set(2u32, b"second value 45", None).expect("set should succeed");

@@ -66,7 +66,7 @@ mod hybrid_cache_tests {
     //   effective am fast   = FAST_TIER - 800  = 800 bytes (~8 test objects)
     //   a1_out budget       = K_OUT * MAX_SIZE = 4_000 bytes (roomy, so the
     //                         demote-don't-evict path is what gets exercised)
-    const MAX_SIZE: u64 = 20_000;
+    const MAX_SIZE: u64 = 20_480;
     const FAST_TIER: u64 = 1_600;
     const K_IN: f64 = 0.04;
     const K_OUT: f64 = 0.2;
@@ -155,7 +155,7 @@ mod hybrid_cache_tests {
         unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(400),
             PaperPolicy::TwoQFullFastAdmissionHybrid(0.0005, 0.5),
         ).expect("warm-up cache should construct");
@@ -182,8 +182,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(500_000),
+            1_048_576,
+            CacheTierSize::Bytes(524_288),
             PaperPolicy::TwoQFullFastAdmissionHybrid(0.1, 0.2),
         ).expect("cache should construct");
 
@@ -238,8 +238,8 @@ mod hybrid_cache_tests {
         // Roomy `k_out` so nothing is under capacity pressure, and a total
         // cache far larger than the working set.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(100_000),
+            1_048_576,
+            CacheTierSize::Bytes(131_072),
             PaperPolicy::TwoQFullFastAdmissionHybrid(0.001, 0.5),
         ).expect("cache should construct");
 
@@ -280,8 +280,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(100_000),
+            1_048_576,
+            CacheTierSize::Bytes(131_072),
             PaperPolicy::TwoQFullFastAdmissionHybrid(0.001, 0.5),
         ).expect("cache should construct");
 
@@ -321,8 +321,8 @@ mod hybrid_cache_tests {
         // Both budgets tiny, so objects race through a1_in into a1_out and
         // out the far end.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(500_000),
+            1_048_576,
+            CacheTierSize::Bytes(524_288),
             PaperPolicy::TwoQFullFastAdmissionHybrid(0.0002, 0.0002),
         ).expect("cache should construct");
 
@@ -356,16 +356,16 @@ mod hybrid_cache_tests {
     fn eviction_prefers_a1_out_over_the_main_queue() {
         ensure_pmem_allocator_warm();
 
-        // a1_in reservation = 0.0002 × 1_000_000 = 200 bytes, which holds two
+        // a1_in reservation = 0.0002 × 1_048_576 = 200 bytes, which holds two
         // 84-byte objects, so the THIRD set is the one that ages key 1 out —
         // the original two-set fixture never overflowed a1_in at all. a1_out's
-        // budget = 0.0005 × 1_000_000 = 500 bytes = 5 objects, so the churn
-        // below overruns it repeatedly. The 500_000-byte fast tier leaves am
+        // budget = 0.0005 × 1_048_576 = 500 bytes = 5 objects, so the churn
+        // below overruns it repeatedly. The 524_288-byte fast tier leaves am
         // an effective 499_800, so nothing in `am` is ever under pressure:
         // a1_out overflow is the only eviction driver in this fixture.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(500_000),
+            1_048_576,
+            CacheTierSize::Bytes(524_288),
             PaperPolicy::TwoQFullFastAdmissionHybrid(0.0002, 0.0005),
         ).expect("cache should construct");
 
@@ -527,7 +527,7 @@ mod hybrid_cache_tests {
         const FAST_TIER_BYTES: u64 = 2_000;
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(FAST_TIER_BYTES),
             PaperPolicy::TwoQFullFastAdmissionHybrid(0.001, 0.5),
         ).expect("cache should construct");
@@ -612,12 +612,12 @@ mod hybrid_cache_tests {
         // until the fast tier itself is resized, so every demotion after
         // `before` is attributable to `set_fast_tier_size` alone.
         //
-        // The original fixture's a1_in was 0.001 × 1_000_000 = 1_000 bytes,
+        // The original fixture's a1_in was 0.001 × 1_048_576 = 1_000 bytes,
         // which holds 11 objects — its 10 sets never aged a single key out, so
         // `am` was empty and shrinking the fast tier had nothing to demote.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             MAX_SIZE,
-            CacheTierSize::Bytes(4_000),
+            CacheTierSize::Bytes(4_096),
             PaperPolicy::TwoQFullFastAdmissionHybrid(K_IN, K_OUT),
         ).expect("cache should construct");
 
@@ -750,7 +750,7 @@ mod hybrid_cache_tests {
 
         // K_IN × 10_000 = 400 bytes of a1_in against 756 bytes resident, so
         // a1_in's tail must drain into a1_out unprompted.
-        cache.resize(10_000).expect("resize should succeed");
+        cache.resize(10_240).expect("resize should succeed");
 
         assert!(
             wait_until(MIGRATION_TIMEOUT, || {
@@ -854,12 +854,12 @@ mod hybrid_cache_tests {
     #[test]
     fn invalid_construction_parameters_are_rejected() {
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(0), PaperPolicy::TwoQFullFastAdmissionHybrid(0.1, 0.2)),
+            PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(0), PaperPolicy::TwoQFullFastAdmissionHybrid(0.1, 0.2)),
             Err(CacheError::InvalidFastTierSize),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(2_000), PaperPolicy::TwoQFullFastAdmissionHybrid(0.1, 0.2)),
+            PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(2_048), PaperPolicy::TwoQFullFastAdmissionHybrid(0.1, 0.2)),
             Err(CacheError::InvalidFastTierSize),
         ));
 
@@ -870,23 +870,23 @@ mod hybrid_cache_tests {
 
         // k_in out of range.
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000), PaperPolicy::TwoQFullFastAdmissionHybrid(1.5, 0.2)),
+            PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_024), PaperPolicy::TwoQFullFastAdmissionHybrid(1.5, 0.2)),
             Err(CacheError::InvalidPolicy),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000), PaperPolicy::TwoQFullFastAdmissionHybrid(-0.1, 0.2)),
+            PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_024), PaperPolicy::TwoQFullFastAdmissionHybrid(-0.1, 0.2)),
             Err(CacheError::InvalidPolicy),
         ));
 
         // k_out out of range -- the half a single-ratio check would miss.
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000), PaperPolicy::TwoQFullFastAdmissionHybrid(0.1, 1.5)),
+            PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_024), PaperPolicy::TwoQFullFastAdmissionHybrid(0.1, 1.5)),
             Err(CacheError::InvalidPolicy),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000), PaperPolicy::TwoQFullFastAdmissionHybrid(0.1, -0.1)),
+            PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_024), PaperPolicy::TwoQFullFastAdmissionHybrid(0.1, -0.1)),
             Err(CacheError::InvalidPolicy),
         ));
     }
@@ -898,8 +898,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            10_000,
-            CacheTierSize::Bytes(1_000),
+            10_240,
+            CacheTierSize::Bytes(1_024),
             PaperPolicy::TwoQFullFastAdmissionHybrid(1.0, 0.5),
         ).expect("cache should construct");
 

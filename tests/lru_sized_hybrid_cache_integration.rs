@@ -69,7 +69,7 @@ mod hybrid_cache_tests {
         // `get_hybrid_dram_shared_overhead`).
         unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(1),
             CacheTierSize::Bytes(1),
             CacheTierSize::Bytes(1),
@@ -108,9 +108,9 @@ mod hybrid_cache_tests {
     #[test]
     fn admission_routes_small_and_large_values_to_their_respective_segments() {
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            CacheTierSize::Bytes(1_000_000),
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576),
+            CacheTierSize::Bytes(1_048_576),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
 
@@ -133,9 +133,9 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(160),       // fits ~1 of the 100-byte values
-            CacheTierSize::Bytes(1_000_000), // large: huge, never demotes
+            CacheTierSize::Bytes(1_048_576), // large: huge, never demotes
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
 
@@ -162,8 +162,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), // small: huge, never demotes
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), // small: huge, never demotes
             CacheTierSize::Bytes(3_200),      // fits ~1 of the 2000-byte values
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
@@ -193,9 +193,9 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(160),
-            CacheTierSize::Bytes(1_000_000),
+            CacheTierSize::Bytes(1_048_576),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
 
@@ -218,9 +218,9 @@ mod hybrid_cache_tests {
     #[test]
     fn overwrite_reclassifies_an_existing_key_into_the_other_segment() {
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            CacheTierSize::Bytes(1_000_000),
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576),
+            CacheTierSize::Bytes(1_048_576),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
 
@@ -253,9 +253,9 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(TTL_SMALL_FAST_TIER),
-            CacheTierSize::Bytes(1_000_000),
+            CacheTierSize::Bytes(1_048_576),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
 
@@ -286,9 +286,9 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(TTL_SMALL_FAST_TIER),
-            CacheTierSize::Bytes(1_000_000),
+            CacheTierSize::Bytes(1_048_576),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
 
@@ -321,7 +321,7 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            200,
+            256,
             CacheTierSize::Bytes(10),
             CacheTierSize::Bytes(10),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
@@ -375,8 +375,8 @@ mod hybrid_cache_tests {
         // objects at all.
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
             1_150,
-            CacheTierSize::Bytes(1_000),
-            CacheTierSize::Bytes(1_000),
+            CacheTierSize::Bytes(1_024),
+            CacheTierSize::Bytes(1_024),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
 
@@ -414,8 +414,8 @@ mod hybrid_cache_tests {
         // The reservation itself is covered, with the reservation ON, in the
         // per-process binary tests/lru_sized_hybrid_cache_shared_overhead.rs.
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
-            CacheTierSize::Bytes(2_000),
+            1_048_576,
+            CacheTierSize::Bytes(2_048),
             CacheTierSize::Bytes(1),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
@@ -447,15 +447,15 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), // huge: nothing demotes initially
-            CacheTierSize::Bytes(1_000_000),
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), // huge: nothing demotes initially
+            CacheTierSize::Bytes(1_048_576),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
 
         cache.set(1u32, &small_value(0xA1), None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-        assert_eq!(cache.fast_tier_size(), 1_000_000);
+        assert_eq!(cache.fast_tier_size(), 1_048_576);
 
         cache.set_fast_tier_size(CacheTierSize::Bytes(1)).expect("resize should succeed");
         assert_eq!(cache.fast_tier_size(), 1);
@@ -471,15 +471,15 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            CacheTierSize::Bytes(1_000_000), // huge: nothing demotes initially
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576),
+            CacheTierSize::Bytes(1_048_576), // huge: nothing demotes initially
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
 
         cache.set(1u32, &large_value(0xA1), None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-        assert_eq!(cache.large_fast_tier_size(), 1_000_000);
+        assert_eq!(cache.large_fast_tier_size(), 1_048_576);
 
         cache.set_large_fast_tier_size(CacheTierSize::Bytes(1)).expect("resize should succeed");
         assert_eq!(cache.large_fast_tier_size(), 1);
@@ -493,9 +493,9 @@ mod hybrid_cache_tests {
     #[test]
     fn set_size_threshold_changes_future_routing_at_runtime() {
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            CacheTierSize::Bytes(1_000_000),
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576),
+            CacheTierSize::Bytes(1_048_576),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
 
@@ -523,7 +523,7 @@ mod hybrid_cache_tests {
     #[test]
     fn zero_small_fast_tier_size_is_rejected() {
         let result = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000, CacheTierSize::Bytes(0), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
+            1_024, CacheTierSize::Bytes(0), CacheTierSize::Bytes(512), CacheTierSize::Bytes(100),
         );
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
@@ -531,7 +531,7 @@ mod hybrid_cache_tests {
     #[test]
     fn zero_large_fast_tier_size_is_rejected() {
         let result = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000, CacheTierSize::Bytes(500), CacheTierSize::Bytes(0), CacheTierSize::Bytes(100),
+            1_024, CacheTierSize::Bytes(512), CacheTierSize::Bytes(0), CacheTierSize::Bytes(100),
         );
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
@@ -539,7 +539,7 @@ mod hybrid_cache_tests {
     #[test]
     fn small_fast_tier_size_exceeding_max_size_is_rejected() {
         let result = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000, CacheTierSize::Bytes(2_000), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
+            1_024, CacheTierSize::Bytes(2_048), CacheTierSize::Bytes(512), CacheTierSize::Bytes(100),
         );
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
@@ -547,7 +547,7 @@ mod hybrid_cache_tests {
     #[test]
     fn large_fast_tier_size_exceeding_max_size_is_rejected() {
         let result = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000, CacheTierSize::Bytes(500), CacheTierSize::Bytes(2_000), CacheTierSize::Bytes(100),
+            1_024, CacheTierSize::Bytes(512), CacheTierSize::Bytes(2_048), CacheTierSize::Bytes(100),
         );
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
@@ -565,9 +565,9 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(160),
-            CacheTierSize::Bytes(1_000_000),
+            CacheTierSize::Bytes(1_048_576),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
 
@@ -595,9 +595,9 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(160),
-            CacheTierSize::Bytes(1_000_000),
+            CacheTierSize::Bytes(1_048_576),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         ).expect("cache should construct");
 

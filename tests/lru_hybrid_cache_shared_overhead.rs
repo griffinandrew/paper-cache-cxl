@@ -57,8 +57,8 @@ mod shared_overhead_tests {
     /// calibrating on anything else makes the 85% claim below false.
     fn accounted_size() -> u64 {
         let probe = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(100_000),
+            1_048_576,
+            CacheTierSize::Bytes(131_072),
             PaperPolicy::LruHybrid,
         )
         .expect("probe cache should construct");
@@ -76,7 +76,7 @@ mod shared_overhead_tests {
     #[test]
     fn reservation_is_active_by_default() {
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(40),
             PaperPolicy::LruHybrid,
         )
@@ -112,7 +112,7 @@ mod shared_overhead_tests {
         );
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(budget),
             PaperPolicy::LruHybrid,
         )

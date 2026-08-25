@@ -51,9 +51,9 @@ mod shared_overhead_tests {
     /// calibrating on anything else makes the 85% claim below false.
     fn accounted_size() -> u64 {
         let probe = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
-            CacheTierSize::Bytes(100_000),
-            CacheTierSize::Bytes(100_000),
+            1_048_576,
+            CacheTierSize::Bytes(131_072),
+            CacheTierSize::Bytes(131_072),
             CacheTierSize::Bytes(SIZE_THRESHOLD),
         )
         .expect("probe cache should construct");
@@ -84,7 +84,7 @@ mod shared_overhead_tests {
         // segment (`LruSizedHybridStack::reserved_shares` splits it in
         // proportion to each segment's capacity).
         let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(budget),
             CacheTierSize::Bytes(1),
             CacheTierSize::Bytes(SIZE_THRESHOLD),

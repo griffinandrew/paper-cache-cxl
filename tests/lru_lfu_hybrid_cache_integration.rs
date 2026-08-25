@@ -54,7 +54,7 @@ mod hybrid_cache_tests {
         // Mechanics tests at toy scales: metadata reservation off (see
         // `get_hybrid_dram_shared_overhead`).
         unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1), PaperPolicy::LruLfuHybrid(2))
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1), PaperPolicy::LruLfuHybrid(2))
             .expect("warm-up cache should construct");
 
         cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
@@ -71,7 +71,7 @@ mod hybrid_cache_tests {
     /// (tens of bytes — see `object/overhead.rs`) stays a small fraction of
     /// the byte budgets below rather than dominating them.
     const VALUE_LEN: usize = 1024;
-    const MAX_SIZE: u64 = 1_000_000;
+    const MAX_SIZE: u64 = 1_048_576;
     /// Holds ~2 of the values above, so a third admission forces a demotion.
     const FAST_TIER: u64 = 2_600;
     /// The promotion threshold under test.

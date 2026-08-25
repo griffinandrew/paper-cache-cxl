@@ -73,7 +73,7 @@ mod hybrid_cache_tests {
     //   effective main fast = FAST_TIER - 800 = 800 bytes (~8 test objects)
     // which is small enough that a handful of promotions forces demotion,
     // while leaving the FIFO queue enough room not to be evicting constantly.
-    const MAX_SIZE: u64 = 20_000;
+    const MAX_SIZE: u64 = 20_480;
     const FAST_TIER: u64 = 1_600;
     const K_IN: f64 = 0.04;
 
@@ -104,7 +104,7 @@ mod hybrid_cache_tests {
         // `get_hybrid_dram_shared_overhead`).
         unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(400), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)).expect("warm-up cache should construct");
 
         for key in 0..8u32 {
@@ -130,8 +130,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(500_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(524_288), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)).expect("cache should construct");
 
         cache.set(1u32, b"hello", None).expect("set should succeed");
 
@@ -148,8 +148,8 @@ mod hybrid_cache_tests {
         // it never promotes anything, so the fact that this `k_in` leaves
         // zero effective main-queue capacity is irrelevant here.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(500_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.5)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(524_288), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.5)).expect("cache should construct");
 
         for key in 1..=20u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -242,7 +242,7 @@ mod hybrid_cache_tests {
         const FAST_TIER_BYTES: u64 = 2_000;
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(FAST_TIER_BYTES), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.001)).expect("cache should construct");
 
         for key in 1..=40u32 {
@@ -324,8 +324,8 @@ mod hybrid_cache_tests {
         // continuously; max_size large enough that global capacity eviction
         // never fires, isolating the reprieve path.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            10_000_000,
-            CacheTierSize::Bytes(500_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.0001)).expect("cache should construct");
+            10_485_760,
+            CacheTierSize::Bytes(524_288), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.0001)).expect("cache should construct");
 
         for key in 1..=30u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -358,8 +358,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            10_000_000,
-            CacheTierSize::Bytes(500_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.0001)).expect("cache should construct");
+            10_485_760,
+            CacheTierSize::Bytes(524_288), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.0001)).expect("cache should construct");
 
         for key in 1..=30u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -388,8 +388,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            10_000_000,
-            CacheTierSize::Bytes(500_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.0001)).expect("cache should construct");
+            10_485_760,
+            CacheTierSize::Bytes(524_288), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.0001)).expect("cache should construct");
 
         for key in 1..=30u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -426,8 +426,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            8_000,
-            CacheTierSize::Bytes(4_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.05)).expect("cache should construct");
+            8_192,
+            CacheTierSize::Bytes(4_096), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.05)).expect("cache should construct");
 
         for key in 1..=60u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -514,8 +514,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(500_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.001)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(524_288), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.001)).expect("cache should construct");
 
         for key in 1..=10u32 {
             cache.set(key, &[key as u8; 64], None).expect("set should succeed");
@@ -548,7 +548,7 @@ mod hybrid_cache_tests {
         // k_in 0.5 makes fifo_capacity track max_size closely, so growing
         // max_size meaningfully shrinks what the main queue may keep fast.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            2_000,
+            2_048,
             CacheTierSize::Bytes(1_500), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.5)).expect("cache should construct");
 
         for key in 1..=6u32 {
@@ -665,13 +665,13 @@ mod hybrid_cache_tests {
     fn invalid_construction_parameters_are_rejected() {
         // Zero fast tier.
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(0), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)),
+            PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(0), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)),
             Err(CacheError::InvalidFastTierSize),
         ));
 
         // Fast tier larger than the whole cache.
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(2_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)),
+            PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(2_048), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1)),
             Err(CacheError::InvalidFastTierSize),
         ));
 
@@ -683,12 +683,12 @@ mod hybrid_cache_tests {
 
         // k_in outside [0.0, 1.0].
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(1.5)),
+            PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_024), PaperPolicy::TwoQFastAdmissionReprieveHybrid(1.5)),
             Err(CacheError::InvalidPolicy),
         ));
 
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(-0.1)),
+            PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_024), PaperPolicy::TwoQFastAdmissionReprieveHybrid(-0.1)),
             Err(CacheError::InvalidPolicy),
         ));
     }
@@ -702,8 +702,8 @@ mod hybrid_cache_tests {
         // fifo_capacity = 1.0 * 10_000 = 10_000 >= the 1_000-byte fast tier,
         // so the main queue's effective capacity saturates to zero.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            10_000,
-            CacheTierSize::Bytes(1_000), PaperPolicy::TwoQFastAdmissionReprieveHybrid(1.0)).expect("cache should construct");
+            10_240,
+            CacheTierSize::Bytes(1_024), PaperPolicy::TwoQFastAdmissionReprieveHybrid(1.0)).expect("cache should construct");
 
         cache.set(1u32, &[1u8; 64], None).expect("set should succeed");
 

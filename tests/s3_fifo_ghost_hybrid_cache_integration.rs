@@ -38,11 +38,11 @@ mod hybrid_cache_tests {
         // Mechanics tests at toy scales: metadata reservation off (see
         // `get_hybrid_dram_shared_overhead`).
         unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
-        // 0.5 * 1_000_000 = 500_000 B for each of the one-access and main
+        // 0.5 * 1_048_576 = 524_288 B for each of the one-access and main
         // queues -- both far past this one 24 B object. (Ratio 1.0 is
         // rejected now: it leaves the main queue 0 B, and `used >= max`
         // reads an empty 0-byte queue as full.)
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostHybrid(0.5))
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5))
             .expect("warm-up cache should construct");
 
         cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
@@ -55,12 +55,12 @@ mod hybrid_cache_tests {
     fn admission_always_lands_in_slow_tier() {
         ensure_pmem_allocator_warm();
 
-        // 0.5 * 1_000_000 = 500_000 B one-access / 500_000 B main; the
+        // 0.5 * 1_048_576 = 524_288 B one-access / 524_288 B main; the
         // single 31 B object (11 B payload + 20 B key/expiry) is nowhere
         // near either budget.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
 
@@ -72,12 +72,12 @@ mod hybrid_cache_tests {
     fn reaccessing_a_one_access_key_promotes_it_eagerly_to_fast_tier() {
         ensure_pmem_allocator_warm();
 
-        // 0.5 * 1_000_000 = 500_000 B per queue; the one 31 B object
+        // 0.5 * 1_048_576 = 524_288 B per queue; the one 31 B object
         // crosses from the one-access queue to the main queue with both
         // budgets untouched.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -95,7 +95,7 @@ mod hybrid_cache_tests {
     fn a_key_that_ages_out_and_is_readmitted_lands_directly_in_fast_tier() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostHybrid(0.00004)).expect("cache should construct");
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.00004)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
@@ -129,14 +129,14 @@ mod hybrid_cache_tests {
         // main queue and promoted, a miss goes into the one-access queue and
         // stays there. Both cases run through one cache below.
         //
-        // The one-access queue gets 0.001 * 1_000_000 = 1000 bytes: several
+        // The one-access queue gets 0.001 * 1_048_576 = 1_048 bytes: several
         // objects, so an admission never immediately self-evicts (contrast
         // the near-zero ratio in the aging test above, where one object
         // already exceeds the budget), but a burst of fat fillers ages its
         // tail out.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostHybrid(0.001)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.001)).expect("cache should construct");
 
         // Fat on purpose: ten of these overflow the 1000-byte one-access
         // budget outright, so the aging below doesn't depend on this policy's
@@ -192,12 +192,12 @@ mod hybrid_cache_tests {
     fn a_plain_access_on_a_fast_main_queue_key_does_not_migrate_or_reorder() {
         ensure_pmem_allocator_warm();
 
-        // 0.5 * 1_000_000 = 500_000 B per queue; the single 35 B object
+        // 0.5 * 1_048_576 = 524_288 B per queue; the single 35 B object
         // sits far under the main budget `main_is_full` reads, so the
         // eviction gate never fires here.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -216,12 +216,12 @@ mod hybrid_cache_tests {
     fn an_accessed_key_at_the_main_queue_tail_gets_a_second_chance_instead_of_eviction() {
         ensure_pmem_allocator_warm();
 
-        // 0.5 * 1_000_000 = 500_000 B per queue -- and 90 B each after the
+        // 0.5 * 1_048_576 = 524_288 B per queue -- and 90 B each after the
         // resize(180) below, still comfortably over the 70 B (2 x 35 B)
         // this test parks in the main queue. The one-access queue is empty
         // by then either way, so the resize's trigger is unchanged.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(40), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
@@ -259,11 +259,11 @@ mod hybrid_cache_tests {
     fn ttl_survives_a_demotion() {
         ensure_pmem_allocator_warm();
 
-        // 0.5 * 1_000_000 = 500_000 B per queue; the six objects total
+        // 0.5 * 1_048_576 = 524_288 B per queue; the six objects total
         // 195 B (35 + 5 x 32), so neither queue budget ever binds and only
         // the 200 B fast tier drives the demotion under test.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
 
         let ttl_secs = 5u32;
@@ -308,8 +308,8 @@ mod hybrid_cache_tests {
         // (Ratio 1.0 gives the main queue 0 B, i.e. permanently "full",
         // and would evict key 1 instead.)
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            200,
-            CacheTierSize::Bytes(200), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            256,
+            CacheTierSize::Bytes(256), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes 1", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -338,11 +338,11 @@ mod hybrid_cache_tests {
     fn set_fast_tier_size_takes_effect_at_runtime() {
         ensure_pmem_allocator_warm();
 
-        // 0.5 * 1_000_000 = 500_000 B per queue; the single 35 B object is
+        // 0.5 * 1_048_576 = 524_288 B per queue; the single 35 B object is
         // far under both, so only the fast-tier resize below moves it.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -358,14 +358,14 @@ mod hybrid_cache_tests {
 
     #[test]
     fn zero_fast_tier_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(0), PaperPolicy::S3FifoGhostHybrid(0.5));
+        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(0), PaperPolicy::S3FifoGhostHybrid(0.5));
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
 
     #[test]
     fn invalid_one_access_ratio_is_rejected() {
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(500), PaperPolicy::S3FifoGhostHybrid(1.5)),
+            PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(512), PaperPolicy::S3FifoGhostHybrid(1.5)),
             Err(CacheError::InvalidPolicy),
         ));
     }
@@ -374,11 +374,11 @@ mod hybrid_cache_tests {
     fn del_removes_key_from_whichever_tier_it_is_in() {
         ensure_pmem_allocator_warm();
 
-        // 0.5 * 1_000_000 = 500_000 B per queue; the one 35 B object is
+        // 0.5 * 1_048_576 = 524_288 B per queue; the one 35 B object is
         // nowhere near either budget.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -393,11 +393,11 @@ mod hybrid_cache_tests {
     fn wipe_clears_both_tiers() {
         ensure_pmem_allocator_warm();
 
-        // 0.5 * 1_000_000 = 500_000 B per queue; the two 35 B objects are
+        // 0.5 * 1_048_576 = 524_288 B per queue; the two 35 B objects are
         // nowhere near either budget.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.set(2u32, b"second value 45", None).expect("set should succeed");

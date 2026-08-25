@@ -65,7 +65,7 @@ mod hybrid_cache_tests {
         // Mechanics tests at toy scales: metadata reservation off (see
         // `get_hybrid_dram_shared_overhead`).
         unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1), PaperPolicy::LruHybrid)
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1), PaperPolicy::LruHybrid)
             .expect("warm-up cache should construct");
 
         cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
@@ -96,8 +96,8 @@ mod hybrid_cache_tests {
     #[test]
     fn admission_always_lands_in_fast_tier() {
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::LruHybrid).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::LruHybrid).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
 
@@ -118,7 +118,7 @@ mod hybrid_cache_tests {
         // per-object shared-metadata reservation) guarantees the first key
         // demotes once the second is admitted.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(1_600), PaperPolicy::LruHybrid).expect("cache should construct");
 
         cache.set(1u32, &value(0xA1), None).expect("set should succeed");
@@ -151,7 +151,7 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(1_600), PaperPolicy::LruHybrid).expect("cache should construct");
 
         cache.set(1u32, &value(0xA1), None).expect("set should succeed");
@@ -187,7 +187,7 @@ mod hybrid_cache_tests {
         // one migration per call" path (`LruHybridStack::settle_fast_tier`'s
         // loop), not just the common one-in-one-out case.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(1_600), PaperPolicy::LruHybrid).expect("cache should construct");
 
         cache.set(1u32, &value(0xA1), None).expect("set should succeed");
@@ -230,7 +230,7 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::LruHybrid).expect("cache should construct");
 
         // Note: a *short* TTL here (comparable to `MIGRATION_TIMEOUT`) would
@@ -272,7 +272,7 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::LruHybrid).expect("cache should construct");
 
         // See `ttl_survives_a_demotion` and `TTL_FAST_TIER` for why this
@@ -311,7 +311,7 @@ mod hybrid_cache_tests {
         // the slow-tier LRU tail must be evicted (never the fast tier,
         // which by construction holds only the most-recently-touched key).
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            200,
+            256,
             CacheTierSize::Bytes(10), PaperPolicy::LruHybrid).expect("cache should construct");
 
         for key in 1u32..=10 {
@@ -356,8 +356,8 @@ mod hybrid_cache_tests {
         // The reservation itself is covered, with the reservation ON, in the
         // per-process binary tests/lru_hybrid_cache_shared_overhead.rs.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(2_000), PaperPolicy::LruHybrid).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(2_048), PaperPolicy::LruHybrid).expect("cache should construct");
 
         for key in 1u32..=300 {
             cache.set(key, b"payload bytes", None).expect("set should succeed");
@@ -391,11 +391,11 @@ mod hybrid_cache_tests {
     fn set_fast_tier_size_takes_effect_at_runtime() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::LruHybrid).expect("cache should construct");
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::LruHybrid).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-        assert_eq!(cache.fast_tier_size(), 1_000_000);
+        assert_eq!(cache.fast_tier_size(), 1_048_576);
 
         // Shrink the fast tier drastically; the existing key should demote
         // even without any further access, once the worker applies the
@@ -414,13 +414,13 @@ mod hybrid_cache_tests {
 
     #[test]
     fn zero_fast_tier_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(0), PaperPolicy::LruHybrid);
+        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(0), PaperPolicy::LruHybrid);
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
 
     #[test]
     fn fast_tier_size_exceeding_max_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(2_000), PaperPolicy::LruHybrid);
+        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(2_048), PaperPolicy::LruHybrid);
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
 
@@ -435,7 +435,7 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(1), PaperPolicy::LruHybrid).expect("cache should construct");
 
         cache.set(1u32, b"a value", None).expect("set should succeed");
@@ -452,7 +452,7 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(40), PaperPolicy::LruHybrid).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
@@ -473,7 +473,7 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
+            1_048_576,
             CacheTierSize::Bytes(40), PaperPolicy::LruHybrid).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
@@ -551,19 +551,20 @@ mod hybrid_cache_tests {
             .unwrap_or(1_000_000);
 
         const VALUE_LEN: usize = 16 * 1024; // 16 KB
-        const FAST_TIER_GB: u64 = 1;
-        const MAX_SIZE_GB: u64 = 24; // comfortably over ~16 GB of raw value bytes
+        const FAST_TIER_GIB: u64 = 1;
+        const MAX_SIZE_GIB: u64 = 24; // comfortably over ~16 GiB of raw value bytes
 
         let cache = PaperCache::<u64, TieredBuffer>::new(
-            MAX_SIZE_GB * 1_073_741_824,
-            CacheTierSize::Gb(FAST_TIER_GB), PaperPolicy::LruHybrid).expect("cache should construct");
+            MAX_SIZE_GIB * 1_073_741_824,
+            CacheTierSize::Gib(FAST_TIER_GIB), PaperPolicy::LruHybrid).expect("cache should construct");
 
-        // `CacheTierSize::Gb` is decimal SI (10^9 bytes), documented in
-        // `size.rs` -- not binary GiB (2^30). Confirmed via this test: an
-        // earlier version of this assertion expected the binary value and
-        // failed, catching a real (if minor, ~7%) unit gotcha worth knowing
-        // about, distinct from the much larger gap under investigation here.
-        assert_eq!(cache.fast_tier_size(), FAST_TIER_GB * 1_000_000_000);
+        // `CacheTierSize::Gib` is binary (2^30), matching `max_size` just
+        // above and every other byte budget in the cache. It was decimal SI
+        // once, and this assertion is where that bit: an earlier version
+        // expected the binary value and failed against the 10^9 one, a ~7%
+        // gap distinct from the much larger one under investigation here.
+        // Now that both operands are binary, the two agree by construction.
+        assert_eq!(cache.fast_tier_size(), FAST_TIER_GIB * 1_073_741_824);
 
         let start = std::time::Instant::now();
 
@@ -707,7 +708,7 @@ mod hybrid_cache_tests {
         const VALUE_LEN: usize = 16 * 1024;
 
         let cache = std::sync::Arc::new(
-            PaperCache::<u64, TieredBuffer>::new(24 * 1_073_741_824, CacheTierSize::Gb(1), PaperPolicy::LruHybrid)
+            PaperCache::<u64, TieredBuffer>::new(24 * 1_073_741_824, CacheTierSize::Gib(1), PaperPolicy::LruHybrid)
                 .expect("cache should construct"),
         );
 
@@ -781,8 +782,8 @@ mod hybrid_cache_tests {
         // about expiry, not demotion. Keeping every object in the fast tier
         // leaves `fast_bytes_used` as the single gauge that has to move.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::LruHybrid).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::LruHybrid).expect("cache should construct");
 
         const KEYS: u32 = 8;
         // Long enough that the admission gauges are comfortably observable
@@ -843,8 +844,8 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::LruHybrid).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::LruHybrid).expect("cache should construct");
 
         cache.set(1u32, &value(0xD4), Some(1)).expect("set should succeed");
 

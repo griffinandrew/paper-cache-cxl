@@ -41,7 +41,7 @@ use paper_cache::{PaperCache, CacheTierSize, TieredBuffer, Tier, PaperPolicy};
 // 24 GB total cache, of which 4 GB is the DRAM fast tier, running segmented LRU.
 let cache = PaperCache::<u64, TieredBuffer>::new(
     24_000_000_000,
-    CacheTierSize::Gb(4),
+    CacheTierSize::Gib(4),
     PaperPolicy::LruHybrid,
 )?;
 
@@ -56,7 +56,7 @@ println!("promotions={} demotions={} evictions={}",
     stats.promotions, stats.demotions, stats.evictions);
 
 // The fast/slow boundary can be moved at runtime.
-cache.set_fast_tier_size(CacheTierSize::Gb(2))?;
+cache.set_fast_tier_size(CacheTierSize::Gib(2))?;
 ```
 
 ## How it works

@@ -84,8 +84,8 @@ mod real_dram_tests {
         // pre-map pages the measured workload would then reuse.
         {
             let warm = PaperCache::<u32, TieredBuffer>::new(
-                1_000_000,
-                CacheTierSize::Bytes(1_000),
+                1_048_576,
+                CacheTierSize::Bytes(1_024),
                 PaperPolicy::LruHybrid,
             )
             .expect("warm-up cache should construct");

@@ -226,6 +226,8 @@ num_objects` exactly, not just a plausible-looking gauge snapshot), real DRAM (n
 `CacheTierSize::Gb(1)` — note `Gb` is decimal SI, 10^9 bytes, ~7% smaller than a binary GiB; the
 stack's own `fast_bytes_used` correctly stayed under budget throughout, ~848 MB).
 
+> **Superseded:** `CacheTierSize` is binary now — `Gb`/`Mb` were renamed `Gib`/`Mib` and redefined as 2^30/2^20. The ~7% decimal/binary gap described here no longer exists; the figures above are the measurements as taken at the time.
+
 Confirmed via a **peak-vs-settled, multi-scale comparison** added to the same reproduction test
 (`repro_real_dram_usage_at_scale` now reads `REPRO_OBJECT_COUNT` from the environment, sampling
 `numa_maps` both immediately after the insert burst — before the worker has caught up — and again
@@ -2453,8 +2455,9 @@ mismeasure.)
 Fixed at all 13 sites, mirroring the two already-correct ones: parse `f64`, convert via
 `CacheTierSize::Mb((gb * 1000.0).round() as u64)` instead of `CacheTierSize::Gb(gb)`.
 `hybrid_lru_sized`'s even split needed its own variant (`(gb * 1000.0 / 2.0).round() as u64`).
-**Behavior-preserving for whole-GB values**: `CacheTierSize` is decimal in both units (`Mb` = 10^6,
-`Gb` = 10^9), so `Mb(gb * 1000)` is byte-identical to the old `Gb(gb)` — existing whole-GB sweep
+**Behavior-preserving for whole-GB values**: `CacheTierSize` was decimal in both units at the time
+(`Mb` = 10^6, `Gb` = 10^9), so `Mb(gb * 1000)` was byte-identical to the old `Gb(gb)` — existing
+whole-GB sweep
 results stay directly comparable. Verified by re-running all 15 designs at `FAST_TIER_GB=0.75`
 against a 2 GB cache (a value unparseable as `u64`, with the old 4 GB fallback exceeding
 `max_size`, so any unconverted design would fail outright rather than mismeasure): all 15 built,
