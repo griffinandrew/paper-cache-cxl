@@ -18,7 +18,7 @@ use crate::{
 #[derive(Clone)]
 pub enum StackEvent {
 	Get(HashedKey),
-	Set(HashedKey, ObjectSize),
+	Set(HashedKey, ObjectSize, ObjectSize),
 	Del(HashedKey),
 	Wipe,
 	Resize(CacheSize),
@@ -44,7 +44,7 @@ impl StackEvent {
 	pub fn maybe_from_worker_event(worker_event: &WorkerEvent) -> Option<Self> {
 		let event = match worker_event {
 			WorkerEvent::Get(key, hit) if *hit => StackEvent::Get(*key),
-			WorkerEvent::Set(key, size, _, _) => StackEvent::Set(*key, *size),
+			WorkerEvent::Set(key, size, resident, _, _) => StackEvent::Set(*key, *size, *resident),
 			WorkerEvent::Del(key, _) => StackEvent::Del(*key),
 			WorkerEvent::Wipe => StackEvent::Wipe,
 			WorkerEvent::Resize(size) => StackEvent::Resize(*size),
@@ -60,7 +60,7 @@ impl TraceEvent {
 	pub fn maybe_from_stack_event(stack_event: &StackEvent) -> Option<Self> {
 		let event = match stack_event {
 			StackEvent::Get(key) => TraceEvent::Get(*key),
-			StackEvent::Set(key, size) => TraceEvent::Set(*key, *size),
+			StackEvent::Set(key, size, _) => TraceEvent::Set(*key, *size),
 			StackEvent::Del(key) => TraceEvent::Del(*key),
 			StackEvent::Resize(size) => TraceEvent::Resize(*size),
 

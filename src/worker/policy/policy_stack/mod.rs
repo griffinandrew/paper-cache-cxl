@@ -159,6 +159,19 @@ pub enum Tier {
 	Slow,
 }
 
+/// Narrows a DRAM-resident remainder so it fits an entry's spare padding byte.
+///
+/// The remainder is `key + expiry field (16) + Expiries entry (64 with a TTL)`,
+/// so `u8` covers every key up to 175 bytes -- and the benchmark's keys are
+/// pre-hashed `u64`s. Saturating is safe rather than merely convenient: any
+/// excess is then treated as migrating, which is exactly the behaviour before
+/// this accounting existed, so it degrades toward the old over-charge instead
+/// of going wrong in a new way.
+#[inline]
+pub(crate) fn narrow_resident(resident: ObjectSize) -> u8 {
+	resident.min(u8::MAX as ObjectSize) as u8
+}
+
 pub trait PolicyStack
 where
 	Self: Send,
@@ -168,6 +181,18 @@ where
 
 	fn contains(&self, key: HashedKey) -> bool;
 	fn insert(&mut self, key: HashedKey, size: ObjectSize);
+
+	/// `insert`, plus the part of `size` that stays in DRAM whichever tier the
+	/// object lands in (key, expiry field, and the `Expiries` entry when a TTL
+	/// is set -- see `OverheadManager::dram_resident_size`).
+	///
+	/// Only the hybrid stacks care: they must keep `fast_used` / `slow_used` to
+	/// bytes that actually migrate, since `Object::set_data` moves the value
+	/// buffer alone. All-DRAM stacks have no tiers and ignore it.
+	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
+		let _ = dram_resident;
+		self.insert(key, size);
+	}
 	fn update(&mut self, _key: HashedKey) {}
 	fn record_access(&mut self, key: HashedKey, hit: bool) -> AccessOutcome {
 		if hit {

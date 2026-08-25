@@ -791,8 +791,8 @@ where
 				match event {
 					WorkerEvent::Get(key, hit) => self.handle_get(key, hit),
 
-					WorkerEvent::Set(key, size, _, _) => {
-						self.handle_set(key, size);
+					WorkerEvent::Set(key, size, resident, _, _) => {
+						self.handle_set(key, size, resident);
 						has_current_set = true;
 					},
 
@@ -1099,9 +1099,13 @@ where
 		self.mini_stack_manager.handle_get(key);
 	}
 
-	fn handle_set(&mut self, key: HashedKey, size: ObjectSize) {
+	/// `dram_resident` is the part of `size` that never migrates; the policy
+	/// stack needs it to keep `fast_used` / `slow_used` to migrating bytes.
+	/// The mini stacks model policy behaviour, not tier occupancy, so they
+	/// keep taking the full `base_size`.
+	fn handle_set(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
 		if let Some(stack) = &mut self.policy_stack {
-			stack.insert(key, size);
+			stack.insert_resident(key, size, dram_resident);
 		}
 
 		self.mini_stack_manager.handle_set(key, size);
@@ -1436,7 +1440,8 @@ where
 			for event in buffered_events {
 				match event {
 					StackEvent::Get(key) => stack.update(*key),
-					StackEvent::Set(key, size) => stack.insert(*key, *size),
+					StackEvent::Set(key, size, resident) =>
+						stack.insert_resident(*key, *size, *resident),
 					StackEvent::Del(key) => stack.remove(*key),
 					StackEvent::Wipe => stack.clear(),
 					StackEvent::Resize(size) => stack.resize(*size),
@@ -2106,11 +2111,12 @@ mod hybrid_tests {
 	) {
 		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
 		let base_size = overhead_manager.base_size(&object);
+		let dram_resident = overhead_manager.dram_resident_size(&object);
 
 		objects.insert(key, object);
 		status.update_base_used_size(base_size as i64);
 		status.incr_num_objects();
-		worker.handle_set(key, base_size);
+		worker.handle_set(key, base_size, dram_resident);
 	}
 
 	// `overhead_manager.base_size` includes fixed key/expiry overhead on top
@@ -2359,11 +2365,12 @@ mod hybrid_tests {
 	) {
 		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
 		let base_size = overhead_manager.base_size(&object);
+		let dram_resident = overhead_manager.dram_resident_size(&object);
 
 		objects.insert(key, object);
 		status.update_base_used_size(base_size as i64);
 		status.incr_num_objects();
-		worker.handle_set(key, base_size);
+		worker.handle_set(key, base_size, dram_resident);
 	}
 
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
@@ -2626,11 +2633,12 @@ mod hybrid_tests {
 	) {
 		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
 		let base_size = overhead_manager.base_size(&object);
+		let dram_resident = overhead_manager.dram_resident_size(&object);
 
 		objects.insert(key, object);
 		status.update_base_used_size(base_size as i64);
 		status.incr_num_objects();
-		worker.handle_set(key, base_size);
+		worker.handle_set(key, base_size, dram_resident);
 	}
 
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
@@ -2903,11 +2911,12 @@ mod hybrid_tests {
 	) {
 		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
 		let base_size = overhead_manager.base_size(&object);
+		let dram_resident = overhead_manager.dram_resident_size(&object);
 
 		objects.insert(key, object);
 		status.update_base_used_size(base_size as i64);
 		status.incr_num_objects();
-		worker.handle_set(key, base_size);
+		worker.handle_set(key, base_size, dram_resident);
 	}
 
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
@@ -3178,11 +3187,12 @@ mod hybrid_tests {
 	) {
 		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
 		let base_size = overhead_manager.base_size(&object);
+		let dram_resident = overhead_manager.dram_resident_size(&object);
 
 		objects.insert(key, object);
 		status.update_base_used_size(base_size as i64);
 		status.incr_num_objects();
-		worker.handle_set(key, base_size);
+		worker.handle_set(key, base_size, dram_resident);
 	}
 
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
@@ -3671,11 +3681,12 @@ mod hybrid_tests {
 	) {
 		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
 		let base_size = overhead_manager.base_size(&object);
+		let dram_resident = overhead_manager.dram_resident_size(&object);
 
 		objects.insert(key, object);
 		status.update_base_used_size(base_size as i64);
 		status.incr_num_objects();
-		worker.handle_set(key, base_size);
+		worker.handle_set(key, base_size, dram_resident);
 	}
 
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
@@ -3918,11 +3929,12 @@ mod hybrid_tests {
 	) {
 		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
 		let base_size = overhead_manager.base_size(&object);
+		let dram_resident = overhead_manager.dram_resident_size(&object);
 
 		objects.insert(key, object);
 		status.update_base_used_size(base_size as i64);
 		status.incr_num_objects();
-		worker.handle_set(key, base_size);
+		worker.handle_set(key, base_size, dram_resident);
 	}
 
 	// Mirrors `hybrid_tests::base_size_of` exactly.
@@ -4090,7 +4102,7 @@ mod hybrid_tests {
 		// `PaperCache::set()` does on a real overwrite (recompute base_size,
 		// call handle_set again) -- reclassifies key 1 into the large
 		// segment.
-		worker.handle_set(1, large_base as ObjectSize);
+		worker.handle_set(1, large_base as ObjectSize, 0);
 		worker.apply_tier_migrations();
 		worker.refresh_tier_gauges();
 

@@ -30,6 +30,36 @@ impl OverheadManager {
 	}
 
 	/// Returns the size of the object including non-policy-related overheads.
+	/// The part of `base_size` that stays in DRAM whichever tier the object is in.
+	///
+	/// `Object::set_data` replaces only the value buffer, so a migration moves the
+	/// value and nothing else. The key and the expiry live inline in the object map
+	/// -- which is DRAM -- and a set TTL additionally owns an entry in `Expiries`,
+	/// also DRAM. None of that moves, so none of it belongs in `fast_used` /
+	/// `slow_used`.
+	///
+	/// The key and expiry are moreover already inside `shared_overhead`: the
+	/// empirically fitted `OBJECT_MAP_ENTRY_OVERHEAD` was derived from the 40-byte
+	/// `(HashedKey, Object)` pair, and `Object` is `{key, Arc ptr, expiry}`. Before
+	/// this existed they were charged twice -- once here, once there.
+	///
+	/// Equals `base_size(object) - value bytes`, computed without touching the
+	/// value so the set path does not pay an `Arc` clone.
+	pub fn dram_resident_size<K, V>(&self, object: &Object<K, V>) -> ObjectSize
+	where
+		K: TypeSize,
+		V: TypeSize,
+	{
+		let mut resident =
+			object.key_size() + mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
+
+		if object.expiry().is_some() {
+			resident += get_ttl_overhead();
+		}
+
+		resident
+	}
+
 	pub fn base_size<K, V>(&self, object: &Object<K, V>) -> ObjectSize
 	where
 		K: TypeSize,

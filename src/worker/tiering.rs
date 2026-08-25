@@ -107,7 +107,7 @@ where
                 }
             }
             
-            WorkerEvent::Set(hashed_key, base_size, _expiry, old_object_info) => {
+            WorkerEvent::Set(hashed_key, base_size, _resident, _expiry, old_object_info) => {
                 if old_object_info.is_none() {
                     // New object - register it in PMEM tier
                     self.tiering_manager.register_object(hashed_key, base_size);
@@ -208,7 +208,7 @@ where
                 }
             }
             
-            WorkerEvent::Set(hashed_key, base_size, _expiry, old_object_info) => {
+            WorkerEvent::Set(hashed_key, base_size, _resident, _expiry, old_object_info) => {
                 if old_object_info.is_none() {
                     // New object - register it in PMEM tier
                     self.tiering_manager.register_object(hashed_key, base_size);

@@ -96,7 +96,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::ObjectSize,
-	worker::policy::policy_stack::{PolicyStack, Tier, watermarks},
+	worker::policy::policy_stack::{PolicyStack, Tier, narrow_resident, watermarks},
 };
 
 /// Superseded by the shared `super::watermarks` pair — `settle_fast_tier`
@@ -129,7 +129,29 @@ type RecencyList = PmemHashList<HashedKey, NoHasher>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LruEntry {
 	tier: Tier,
+
+	/// The part of `size` that stays in DRAM whichever tier this entry is in:
+	/// the key and the expiry field, both inline in the object map, plus the
+	/// `Expiries` entry when a TTL is set. `Object::set_data` replaces only the
+	/// value buffer, so none of it migrates.
+	///
+	/// Rides free in what was padding -- `LruEntry` is still 8 bytes.
+	dram_resident: u8,
+
 	size: ObjectSize,
+}
+
+impl LruEntry {
+	/// The bytes that actually move between tiers when this object migrates.
+	///
+	/// `size` is `base_size`, which also counts the DRAM-resident remainder.
+	/// Charging that remainder to `fast_used` double-counted it -- the key and
+	/// expiry are already inside `shared_overhead` -- and made a demotion
+	/// appear to free bytes that never left DRAM.
+	#[inline]
+	fn migrating(&self) -> CacheSize {
+		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+	}
 }
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
@@ -234,14 +256,16 @@ impl LruHybridStack {
 
 	/// Records a size change for an already-tracked key without altering its
 	/// tier, adjusting whichever tier's used-bytes counter currently applies.
-	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize) {
+	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize, new_resident: u8) {
 		let Some(entry) = self.entries.get_mut(&key) else { return };
 
-		let old_size = entry.size;
+		let old_migrating = entry.migrating();
 		entry.size = new_size;
-		let delta = new_size as i64 - old_size as i64;
+		entry.dram_resident = new_resident;
+		let delta = entry.migrating() as i64 - old_migrating as i64;
+		let tier = entry.tier;
 
-		match entry.tier {
+		match tier {
 			Tier::Fast => {
 				self.fast_used = (self.fast_used as i64 + delta).max(0) as CacheSize;
 			},
@@ -284,7 +308,7 @@ impl LruHybridStack {
 
 		if previous_tier != Some(Tier::Fast) {
 			if previous_tier == Some(Tier::Slow) {
-				let size = self.entries.get(&key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+				let size = self.entries.get(&key).map(|entry| entry.migrating()).unwrap_or(0);
 
 				self.slow_used = self.slow_used.saturating_sub(size);
 				self.fast_used += size;
@@ -351,7 +375,7 @@ impl LruHybridStack {
 		while self.fast_used > drain_target {
 			let Some(demote_key) = self.fast_boundary else { break };
 
-			let size = self.entries.get(&demote_key).map(|entry| entry.size).unwrap_or(0) as CacheSize;
+			let size = self.entries.get(&demote_key).map(|entry| entry.migrating()).unwrap_or(0);
 			let new_boundary = self.stack.before(&demote_key).copied();
 
 			if let Some(entry) = self.entries.get_mut(&demote_key) {
@@ -382,18 +406,24 @@ impl PolicyStack for LruHybridStack {
 	}
 
 	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
+		self.insert_resident(key, size, 0);
+	}
+
+	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
+		let dram_resident = narrow_resident(dram_resident);
+
 		if self.stack.contains(&key) {
 			// Existing key: track any size change, then treat as an access.
 			// Per the admission policy, a `set()` always places the object
 			// at the top of the fast tier, promoting it if it was slow.
-			self.resize_key(key, size);
+			self.resize_key(key, size, dram_resident);
 			self.touch_fast_key(key);
 			return;
 		}
 
 		self.stack.push_front(key);
-		self.entries.insert(key, LruEntry { tier: Tier::Fast, size });
-		self.fast_used += size as CacheSize;
+		self.entries.insert(key, LruEntry { tier: Tier::Fast, dram_resident, size });
+		self.fast_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 		self.fast_count += 1;
 
 		if self.fast_boundary.is_none() {
@@ -411,7 +441,7 @@ impl PolicyStack for LruHybridStack {
 
 	fn remove(&mut self, key: HashedKey) {
 		let entry = self.entries.remove(&key);
-		let size = entry.map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = entry.map(|entry| entry.migrating()).unwrap_or(0);
 		let tier = entry.map(|entry| entry.tier);
 
 		let new_boundary_if_needed = if tier == Some(Tier::Fast) && self.fast_boundary == Some(key) {
@@ -454,7 +484,7 @@ impl PolicyStack for LruHybridStack {
 	fn evict_one(&mut self) -> Option<HashedKey> {
 		let key = self.stack.pop_back()?;
 		let entry = self.entries.remove(&key);
-		let size = entry.map(|entry| entry.size).unwrap_or(0) as CacheSize;
+		let size = entry.map(|entry| entry.migrating()).unwrap_or(0);
 
 		match entry.map(|entry| entry.tier) {
 			Some(Tier::Fast) => {
@@ -512,6 +542,63 @@ mod tests {
 
 	fn drain(stack: &mut LruHybridStack) -> Vec<(HashedKey, Tier)> {
 		stack.drain_tier_migrations()
+	}
+
+	/// The tier counters must track only the bytes that actually migrate.
+	///
+	/// `base_size` also counts the key, the expiry field, and -- when a TTL is
+	/// set -- the object's `Expiries` entry. None of that moves: `set_data`
+	/// replaces the value buffer alone. The key and expiry are moreover already
+	/// inside `shared_overhead`, whose map-entry term was fitted from the
+	/// 40-byte `(HashedKey, Object)` pair. Charging them here too double-counted
+	/// every fast-tier object, and made each demotion appear to free bytes that
+	/// never left DRAM.
+	///
+	/// Asserted as an invariant rather than against a specific watermark, so
+	/// the test does not encode the demotion trigger.
+	#[test]
+	fn tier_counters_track_only_migrating_bytes() {
+		const VALUE: ObjectSize = 100;
+		const RESIDENT: ObjectSize = 88; // u64 key + expiry field + Expiries entry
+		const BASE: ObjectSize = VALUE + RESIDENT;
+		const N: HashedKey = 20;
+
+		// Room for a handful of objects, so demotions are forced.
+		let mut stack = LruHybridStack::new(VALUE as CacheSize * 5);
+
+		for key in 1..=N {
+			stack.insert_resident(key, BASE, RESIDENT);
+		}
+
+		assert_eq!(
+			stack.fast_bytes_used() + stack.slow_bytes_used(),
+			N as CacheSize * VALUE as CacheSize,
+			"counters must sum to migrating bytes; charging base_size would give {}",
+			N as CacheSize * BASE as CacheSize,
+		);
+
+		assert!(
+			stack.slow_bytes_used() > 0,
+			"no demotion happened, so this asserts nothing about migration",
+		);
+
+		assert_eq!(
+			stack.slow_bytes_used() % VALUE as CacheSize,
+			0,
+			"a demotion moved a quantity that is not a whole number of values, \
+			 so some non-migrating remainder was moved with it",
+		);
+	}
+
+	/// `dram_resident` was meant to occupy padding the entry already had.
+	#[test]
+	fn entry_still_fits_in_eight_bytes() {
+		assert_eq!(
+			std::mem::size_of::<LruEntry>(),
+			8,
+			"LruEntry grew: that is 4 more bytes on every tracked object, in \
+			 both tiers, which defeats the point of the change",
+		);
 	}
 
 	/// Smallest `fast_capacity` whose high watermark is at least `bytes`, so a

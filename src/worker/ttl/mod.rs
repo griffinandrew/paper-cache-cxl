@@ -66,7 +66,7 @@ where
 
 			for event in self.listener.try_iter() {
 				match event {
-					WorkerEvent::Set(key, _, expiry, old_info) => {
+					WorkerEvent::Set(key, _, _, expiry, old_info) => {
 						if let Some((_, old_expiry)) = old_info {
 							self.expiries.remove(key, old_expiry);
 						}

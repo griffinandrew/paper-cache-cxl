@@ -37,7 +37,12 @@ pub type WorkerHandles = Vec<JoinHandle<Result<(), CacheError>>>;
 pub enum WorkerEvent {
 	Get(HashedKey, bool),
 	Promote(HashedKey),
-	Set(HashedKey, ObjectSize, ExpireTime, Option<(ObjectSize, ExpireTime)>),
+	/// `(key, base_size, dram_resident, expiry, previous (base_size, expiry))`
+	///
+	/// `dram_resident` is the part of `base_size` that never migrates (see
+	/// `OverheadManager::dram_resident_size`). It travels with the event because
+	/// only the caller holds the `Object` it is derived from.
+	Set(HashedKey, ObjectSize, ObjectSize, ExpireTime, Option<(ObjectSize, ExpireTime)>),
 	Del(HashedKey, ExpireTime),
 
 	/// A `TtlWorker` reap: the object at this key expired, and that worker has

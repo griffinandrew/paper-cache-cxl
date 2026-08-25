@@ -123,6 +123,14 @@ impl<K, V> Object<K, V> {
 	/// Without `key_pmem_value_pmem` the key lives in DRAM.
 	/// With `key_pmem_value_pmem` the key lives in PMEM and is accessed via
 	/// the `_key_pmem` box; no DRAM copy exists.
+	/// The key's own byte cost, as `base_size` counts it.
+	pub fn key_size(&self) -> ObjectSize
+	where
+		K: TypeSize,
+	{
+		self.key().get_size() as ObjectSize
+	}
+
 	#[cfg(not(feature = "key_pmem_value_pmem"))]
 	pub fn key(&self) -> &K {
 		&self.key

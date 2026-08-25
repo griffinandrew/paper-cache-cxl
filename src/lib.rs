@@ -871,6 +871,7 @@ where
 		let val_buf: V = V::from_bytes(value);
 		let object = Object::new(key, val_buf, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
+		let dram_resident = self.overhead_manager.dram_resident_size(&object);
 		let expiry = object.expiry();
 
 		if base_size == 0 {
@@ -901,7 +902,13 @@ where
 		};
 
 		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+		self.broadcast(WorkerEvent::Set(
+			hashed_key,
+			base_size,
+			dram_resident,
+			expiry,
+			old_object_info,
+		))?;
 
 		Ok(())
 	}
@@ -1417,6 +1424,7 @@ where
 		let object = Object::new(key, val_buf, ttl);
 
 		let base_size = self.overhead_manager.base_size(&object);
+		let dram_resident = self.overhead_manager.dram_resident_size(&object);
 		let expiry = object.expiry();
 
 		if base_size == 0 {
@@ -1445,7 +1453,13 @@ where
 		};
 
 		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+		self.broadcast(WorkerEvent::Set(
+			hashed_key,
+			base_size,
+			dram_resident,
+			expiry,
+			old_object_info,
+		))?;
 
 		Ok(())
 	}
@@ -2108,6 +2122,7 @@ where
 
 		let object = Object::new(key, val_buf, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
+		let dram_resident = self.overhead_manager.dram_resident_size(&object);
 		let expiry = object.expiry();
 
 		if base_size == 0 {
@@ -2137,7 +2152,13 @@ where
 		};
 
 		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(hashed_key, base_size, expiry, old_object_info))?;
+		self.broadcast(WorkerEvent::Set(
+			hashed_key,
+			base_size,
+			dram_resident,
+			expiry,
+			old_object_info,
+		))?;
 
 		Ok(())
 	}
