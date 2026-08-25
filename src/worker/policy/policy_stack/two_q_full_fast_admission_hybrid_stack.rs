@@ -913,6 +913,10 @@ impl PolicyStack for TwoQFullFastAdmissionHybridStack {
 
 	/// Both DRAM-resident structures, summed: the probation FIFO plus `am`'s
 	/// fast segment. `a1_out` is PMEM and is excluded.
+	fn dram_reserved_bytes(&self) -> CacheSize {
+		self.reserved_overhead()
+	}
+
 	fn fast_bytes_used(&self) -> CacheSize {
 		self.a1_in_used + self.am_fast_used
 	}

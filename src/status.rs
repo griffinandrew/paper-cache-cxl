@@ -112,6 +112,7 @@ pub struct AtomicStatus {
 	hybrid_fast_bytes_used: AtomicCacheSize,
 	#[cfg(feature = "hybrid_cache_common")]
 	hybrid_slow_bytes_used: AtomicCacheSize,
+	hybrid_fast_metadata_bytes: AtomicCacheSize,
 	#[cfg(feature = "hybrid_cache_common")]
 	hybrid_fast_objects: AtomicU64,
 	#[cfg(feature = "hybrid_cache_common")]
@@ -315,6 +316,7 @@ impl AtomicStatus {
 			hybrid_fast_bytes_used: AtomicCacheSize::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			hybrid_slow_bytes_used: AtomicCacheSize::default(),
+			hybrid_fast_metadata_bytes: AtomicCacheSize::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			hybrid_fast_objects: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
@@ -495,7 +497,9 @@ impl AtomicStatus {
 		slow_bytes_used: CacheSize,
 		fast_objects: u64,
 		slow_objects: u64,
+		fast_metadata_bytes: CacheSize,
 	) {
+		self.hybrid_fast_metadata_bytes.store(fast_metadata_bytes, Ordering::Relaxed);
 		self.hybrid_fast_bytes_used.store(fast_bytes_used, Ordering::Relaxed);
 		self.hybrid_slow_bytes_used.store(slow_bytes_used, Ordering::Relaxed);
 		self.hybrid_fast_objects.store(fast_objects, Ordering::Relaxed);
@@ -538,6 +542,7 @@ impl AtomicStatus {
 			evictions: self.hybrid_evictions.load(Ordering::Relaxed),
 			fast_bytes_used: self.hybrid_fast_bytes_used.load(Ordering::Relaxed),
 			slow_bytes_used: self.hybrid_slow_bytes_used.load(Ordering::Relaxed),
+			fast_metadata_bytes: self.hybrid_fast_metadata_bytes.load(Ordering::Relaxed),
 			fast_objects: self.hybrid_fast_objects.load(Ordering::Relaxed),
 			slow_objects: self.hybrid_slow_objects.load(Ordering::Relaxed),
 			small_fast_bytes_used: self.hybrid_small_fast_bytes_used.load(Ordering::Relaxed),

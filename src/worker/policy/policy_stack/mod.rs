@@ -225,6 +225,14 @@ where
 
 	/// Current bytes accounted to the fast tier. `0` for every stack except
 	/// the hybrid stacks.
+	/// DRAM reserved for shared per-object metadata across *both* tiers
+	/// (`tracked objects x shared_overhead`). `fast_bytes_used` counts object
+	/// bytes only, so the fast tier's true DRAM footprint is the two summed.
+	/// `0` on all-DRAM stacks, which have no tiers and reserve nothing.
+	fn dram_reserved_bytes(&self) -> CacheSize {
+		0
+	}
+
 	fn fast_bytes_used(&self) -> CacheSize {
 		0
 	}

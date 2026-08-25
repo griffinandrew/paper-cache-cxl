@@ -726,6 +726,12 @@ impl PolicyStack for LruSizedHybridStack {
 		std::mem::take(&mut self.migrations)
 	}
 
+	fn dram_reserved_bytes(&self) -> CacheSize {
+		// The undivided total `reserved_shares` proportions between the two
+		// fast segments; shared metadata scales with everything tracked.
+		self.entries.len() as CacheSize * self.shared_overhead
+	}
+
 	fn fast_bytes_used(&self) -> CacheSize {
 		self.small_fast_used + self.large_fast_used
 	}

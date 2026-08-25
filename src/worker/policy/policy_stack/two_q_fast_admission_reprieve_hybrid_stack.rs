@@ -866,6 +866,10 @@ impl PolicyStack for TwoQFastAdmissionReprieveHybridStack {
 	/// Both DRAM-resident structures, summed: the FIFO queue plus the main
 	/// queue's fast segment. The mirror image of `TwoQHybridStack`, where
 	/// `fifo_used` counts toward the *slow* total instead.
+	fn dram_reserved_bytes(&self) -> CacheSize {
+		self.reserved_overhead()
+	}
+
 	fn fast_bytes_used(&self) -> CacheSize {
 		self.fifo_used + self.fast_used
 	}

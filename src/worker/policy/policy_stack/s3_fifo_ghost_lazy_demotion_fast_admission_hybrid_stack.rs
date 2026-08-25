@@ -951,6 +951,10 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 		std::mem::take(&mut self.migrations)
 	}
 
+	fn dram_reserved_bytes(&self) -> CacheSize {
+		self.reserved_overhead()
+	}
+
 	fn fast_bytes_used(&self) -> CacheSize {
 		// Total DRAM: main queue's fast segment + the one-access queue,
 		// both physically Fast in this variant.

@@ -1416,6 +1416,7 @@ where
 				stack.slow_bytes_used(),
 				stack.fast_object_count() as u64,
 				stack.slow_object_count() as u64,
+				stack.dram_reserved_bytes(),
 			);
 
 			self.status.set_hybrid_sized_gauges(

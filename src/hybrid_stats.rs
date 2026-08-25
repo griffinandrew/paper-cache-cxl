@@ -50,6 +50,16 @@ pub struct HybridStats {
 	/// Bytes currently accounted to the slow (PMEM) tier.
 	pub slow_bytes_used: u64,
 
+	/// DRAM reserved for shared per-object metadata -- the object hashtable,
+	/// eviction stacks and `Arc` headers -- across *both* tiers, since that
+	/// metadata is DRAM-resident whichever tier an object's value is in.
+	///
+	/// `fast_bytes_used` counts object bytes only. The fast tier's real DRAM
+	/// footprint is the two added together, and it is this term that decides
+	/// how many objects fit: at 196 B/object a 4 GiB tier saturates on
+	/// metadata alone at ~21.9 M objects, whatever their size.
+	pub fast_metadata_bytes: u64,
+
 	/// Objects currently in the fast (DRAM) tier.
 	pub fast_objects: u64,
 

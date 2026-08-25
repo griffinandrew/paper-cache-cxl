@@ -704,6 +704,10 @@ impl PolicyStack for S3FifoLazyDemotionReprieveHybridStack {
 	// DRAM usage by the whole one-access budget and under-report PMEM by the
 	// same amount. `tier_of` already reports `Tier::Slow` for these keys --
 	// these gauges must agree with it.
+	fn dram_reserved_bytes(&self) -> CacheSize {
+		self.reserved_overhead()
+	}
+
 	fn fast_bytes_used(&self) -> CacheSize {
 		self.fast_used
 	}

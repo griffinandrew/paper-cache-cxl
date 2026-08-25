@@ -701,6 +701,10 @@ impl PolicyStack for TwoQHybridStack {
 		std::mem::take(&mut self.migrations)
 	}
 
+	fn dram_reserved_bytes(&self) -> CacheSize {
+		self.reserved_overhead()
+	}
+
 	fn fast_bytes_used(&self) -> CacheSize {
 		self.fast_used
 	}
