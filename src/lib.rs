@@ -6,7 +6,7 @@
  * correct
  */
 
-#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem"), feature(allocator_api), feature(clone_from_ref))]
+#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem"), feature(allocator_api), feature(clone_from_ref), feature(btreemap_alloc))]
 
 
 // Validate that hashbrown_dram is not enabled with other global hashtable features
