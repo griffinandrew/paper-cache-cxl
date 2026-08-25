@@ -501,7 +501,7 @@ costs one extra migration rather than a synchronous PMEM-vs-DRAM decision at the
 ## S3-FIFO family
 
 All nine carry `one_access_ratio` in their policy payload -- `PaperPolicy::S3FifoHybrid(ratio)`
-and siblings, validated into `0.0..=1.0`.
+and siblings, validated into `0.0..1.0` (1.0 excluded).
 
 ### `s3_fifo_hybrid_cache`
 

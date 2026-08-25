@@ -87,6 +87,54 @@
 //! below, mirroring the equivalent documented behavior in
 //! `lru_sized_hybrid_cache`.
 //!
+//! ## Eviction order: the one-access tail goes first, but only while the
+//! main queue has room
+//!
+//! `evict_one` drains the one-access queue's tail before it will touch the
+//! main queue -- but that priority is CONDITIONAL, and now says so: it
+//! applies only while the main queue is below its own byte budget. Once the
+//! main queue is full, `evict_one` skips the one-access tail entirely and
+//! goes straight to the main-queue eviction loop. This mirrors
+//! `SThreeFifoStack::evict_one`, the crate's non-tiered S3-FIFO, exactly.
+//! Previously the one-access tail was drained unconditionally -- an
+//! unexamined divergence from the policy this stack is a tiering of, never
+//! argued for anywhere, unlike `TwoQHybridStack`'s deliberately documented
+//! eviction priority.
+//!
+//! The budget the gate reads is `main_capacity` -- `(1 - one_access_ratio) *
+//! max_size`, the exact complement of `one_access_capacity`, computed beside
+//! it in both `new` and `resize`. `is_main_full` compares it against
+//! `fast_used + slow_used`, which is precisely the main queue's byte total
+//! and nothing else: a one-access resident is tracked with `tier: None` and
+//! moves only `one_access_used`, while `fast_used` / `slow_used` are touched
+//! only by main-queue admission (`promote_from_one_access`,
+//! `admit_via_ghost_hit`), demotion (`settle_fast_tier`), promotion back to
+//! fast (`give_second_chance`), `remove`, and `evict_one`'s own main-queue
+//! path.
+//!
+//! That sum is deliberately NOT `fast_bytes_used()`. This variant's
+//! one-access queue is physically DRAM -- the whole point of it -- so that
+//! trait method adds `one_access_used` back in to report total DRAM. Using
+//! it here would charge the one-access queue against the main queue's budget
+//! as well as its own, double-counting it and declaring the main queue full
+//! far too early, which would quietly change eviction for every workload.
+//! `main_capacity` is likewise unrelated to `raw_main_fast_capacity()` /
+//! `effective_main_fast_capacity()`, which bound only the main queue's FAST
+//! segment out of `fast_capacity`: a demotion shifts bytes from `fast_used`
+//! to `slow_used` and leaves this gate's reading untouched, which is exactly
+//! why a whole-queue budget is the right thing to compare against.
+//!
+//! Nothing else about eviction moves: the demotion-time reference-bit
+//! reprieve, the eviction-time second chance, and the eager promotion out of
+//! the one-access queue are all precisely as they were.
+//!
+//! Degenerate case, inherited verbatim from the plain stack: at
+//! `one_access_ratio == 1.0` the complement is `0`, so the main queue reads
+//! as full from the outset and `evict_one` can never reach the one-access
+//! tail -- a cache configured that way cannot evict at all.
+//! `SThreeFifoStack` behaves identically at that ratio, so this is a
+//! property of the rule being mirrored, not of this stack's accounting.
+//!
 //! ## Shared-structure DRAM reservation
 //!
 //! On top of the split above, the fast-tier budget also has to cover the
@@ -238,6 +286,18 @@ pub struct S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 	one_access_capacity: CacheSize,
 	one_access_used: CacheSize,
 
+	/// The MAIN queue's total byte budget, spanning both tiers --
+	/// `(1 - one_access_ratio) * max_size`, the exact complement of
+	/// `one_access_capacity` and recomputed beside it in `resize`. Read only by
+	/// `is_main_full`, which gates `evict_one`'s one-access-tail priority; see
+	/// the module doc's "Eviction order" section.
+	///
+	/// Not to be confused with the main queue's FAST-segment budget
+	/// (`raw_main_fast_capacity()` / `effective_main_fast_capacity()`):
+	/// those are carved out of `fast_capacity` and govern demotion, this is
+	/// carved out of `max_size` and governs eviction order.
+	main_capacity: CacheSize,
+
 	/// The configured total fast-tier (DRAM) budget. Shared between the
 	/// one-access queue and the main queue's fast segment -- see the
 	/// module doc's "Accounting" section. The main queue's own trigger
@@ -296,6 +356,7 @@ impl S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 			one_access_ratio,
 			one_access_capacity: (one_access_ratio * max_size as f64) as CacheSize,
 			one_access_used: 0,
+			main_capacity: ((1.0 - one_access_ratio) * max_size as f64) as CacheSize,
 
 			fast_capacity,
 			fast_used: 0,
@@ -659,6 +720,20 @@ impl S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 		Some(key)
 	}
 
+	/// Whether the main queue has reached its own byte budget -- the gate on
+	/// `evict_one`'s one-access-tail priority, mirroring
+	/// `SThreeFifoStack`'s `Stack::is_full` (`used >= max`, so a `0` budget
+	/// reads as permanently full).
+	///
+	/// `fast_used + slow_used` IS the main queue's byte total: one-access
+	/// residents carry `tier: None` and move `one_access_used` alone, so
+	/// neither counter ever includes them. Deliberately not `fast_bytes_used()`,
+	/// which folds `one_access_used` back in because this variant's one-access
+	/// queue is DRAM too -- see the module doc's "Eviction order" section.
+	fn is_main_full(&self) -> bool {
+		self.fast_used + self.slow_used >= self.main_capacity
+	}
+
 	/// Trims `ghost` down to `main_count` entries — called only from a
 	/// genuine main-queue eviction, never from a second chance, a
 	/// demotion-time reprieve, or `evict_one_access_tail` (which is what
@@ -757,6 +832,7 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 
 	fn resize(&mut self, max_size: CacheSize) {
 		self.one_access_capacity = (self.one_access_ratio * max_size as f64) as CacheSize;
+		self.main_capacity = ((1.0 - self.one_access_ratio) * max_size as f64) as CacheSize;
 
 		// Growing `one_access_capacity` shrinks the room left for the main
 		// queue's fast segment (see the module doc's "Accounting"
@@ -782,8 +858,14 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 	}
 
 	fn evict_one(&mut self) -> Option<HashedKey> {
-		if let Some(key) = self.evict_one_access_tail() {
-			return Some(key);
+		// The one-access tail is only prioritized while the main queue still
+		// has room, exactly as `SThreeFifoStack::evict_one` prioritizes its
+		// small queue -- see the module doc's "Eviction order" section. With
+		// the main queue full, fall straight through to the main-queue loop.
+		if !self.is_main_full() {
+			if let Some(key) = self.evict_one_access_tail() {
+				return Some(key);
+			}
 		}
 
 		loop {
@@ -962,7 +1044,13 @@ mod tests {
 
 	#[test]
 	fn a_key_aging_out_without_reaccess_becomes_a_ghost_entry() {
-		let mut stack = S3FifoGhostLazyDemotionFastAdmissionHybridStack::new(1.0, 1_000, 1_000);
+		// `one_access_ratio` 0.5 rather than 1.0: `evict_one` only reaches the
+		// one-access tail while the main queue is below `main_capacity`
+		// (`(1 - ratio) * max_size` -- see the module doc's "Eviction order"
+		// section), and at ratio 1.0 that budget is `0`, so the main queue reads
+		// as full from the outset. The ghost-on-ageing-out behaviour under test
+		// here is indifferent to the ratio.
+		let mut stack = S3FifoGhostLazyDemotionFastAdmissionHybridStack::new(0.5, 1_000, 1_000);
 
 		stack.insert(1, 10);
 		drain(&mut stack);
@@ -1121,7 +1209,9 @@ mod tests {
 
 	#[test]
 	fn remove_clears_ghost_entry_too() {
-		let mut stack = S3FifoGhostLazyDemotionFastAdmissionHybridStack::new(1.0, 1_000, 1_000);
+		// `one_access_ratio` 0.5 rather than 1.0, for the reason spelled out on
+		// `a_key_aging_out_without_reaccess_becomes_a_ghost_entry` above.
+		let mut stack = S3FifoGhostLazyDemotionFastAdmissionHybridStack::new(0.5, 1_000, 1_000);
 
 		stack.insert(1, 10);
 		drain(&mut stack);
@@ -1792,5 +1882,62 @@ mod tests {
 
 		assert_eq!(tagged_fast as CacheSize, fast_objects);
 		assert_eq!(tagged_slow as CacheSize, slow_objects);
+	}
+
+	/// `evict_one`'s one-access-tail priority is CONDITIONAL on the main queue
+	/// having room, exactly as `SThreeFifoStack::evict_one`'s small-queue
+	/// priority is -- see the module doc's "Eviction order" section.
+	///
+	/// Both halves have the same shape: one key promoted into the main queue,
+	/// one key left sitting in the one-access queue, one `evict_one` call. What
+	/// separates them is the promoted key's size, which is what moves the main
+	/// queue from "has room" to "full"; the one-access key's size only varies to
+	/// keep half (a) sensitive to a gate that double-counts it.
+	#[test]
+	fn one_access_tail_is_evicted_first_only_while_the_main_queue_has_room() {
+		// ratio 0.5 of max_size 100 -> one_access_capacity 50, main_capacity 50.
+		// `fast_capacity` is far larger than either so no demotion pass can fire
+		// and muddy the trace; the gate reads whole-queue bytes anyway, so a
+		// demotion would not move it either way.
+
+		// (a) Main queue below its budget: the one-access tail goes first. The
+		// one-access resident is deliberately fat enough (45 of a 50-byte main
+		// budget) that a gate reading `fast_bytes_used()` -- which folds
+		// `one_access_used` in -- would wrongly see 10 + 45 >= 50 and call the
+		// main queue full.
+		let mut roomy = S3FifoGhostLazyDemotionFastAdmissionHybridStack::new(0.5, 100, 10_000);
+
+		roomy.insert(1, 10);
+		roomy.update(1); // promotes key 1 out of the one-access queue into main
+		roomy.insert(2, 45); // key 2 stays in the one-access queue
+		drain(&mut roomy);
+
+		assert!(
+			!roomy.is_main_full(),
+			"10 bytes of MAIN queue against a 50-byte budget -- the 45 one-access bytes are not the main queue's",
+		);
+
+		assert_eq!(roomy.evict_one(), Some(2), "the one-access tail must go first");
+		assert!(roomy.is_ghost(2), "an aged-out one-access key becomes a ghost entry");
+		assert!(roomy.contains(1), "the main queue must be left alone");
+
+		// (b) Same shape, but the promoted key alone fills main_capacity, so the
+		// one-access tail is off limits and the main queue is evicted instead.
+		let mut full = S3FifoGhostLazyDemotionFastAdmissionHybridStack::new(0.5, 100, 10_000);
+
+		full.insert(1, 50);
+		full.update(1);
+		full.insert(2, 10);
+		drain(&mut full);
+
+		assert!(full.is_main_full(), "50 bytes of main queue against a 50-byte budget");
+
+		assert_eq!(
+			full.evict_one(),
+			Some(1),
+			"a full main queue must be evicted before the one-access tail",
+		);
+		assert!(full.contains(2), "the one-access resident must survive");
+		assert!(!full.is_ghost(1), "a main-queue eviction does not create a ghost entry");
 	}
 }

@@ -40,6 +40,49 @@
 //! evaluated "after objects have traversed through both portions... and
 //! are about to be evicted" (lazy, at the point of eviction).
 //!
+//! ## Eviction priority: the one-access tail first, but only while the
+//! main queue has room
+//!
+//! `evict_one` mirrors `SThreeFifoStack::evict_one` exactly:
+//!
+//! ```text
+//! if !main_is_full() {
+//!     // prioritize evicting from the one-access queue when possible
+//!     if let Some(key) = evict_one_access_tail() { return Some(key) }
+//! }
+//! // ...otherwise the main-queue CLOCK sweep below
+//! ```
+//!
+//! "Full" is `main_used >= main_capacity`, where `main_capacity` is
+//! `(1 - one_access_ratio) * max_size` — the exact complement of
+//! `one_access_capacity`, recomputed alongside it in `resize` — and
+//! `main_used` is `fast_used + slow_used`. That is the same `used >= max`
+//! test `SThreeFifoStack`'s per-queue `Stack::is_full` applies to its own
+//! `main`, over the same quantity; see `main_is_full` for why
+//! `fast_used + slow_used` is exactly the main queue's byte total here.
+//!
+//! This gate was previously absent: the one-access tail was drained
+//! *unconditionally* and there was no main-queue capacity concept at all.
+//! Unlike `TwoQHybridStack`, which documents and argues its own eviction
+//! priority, nothing here ever justified that divergence — it was
+//! unexamined inheritance, and it is now corrected to match the plain,
+//! non-hybrid policy this stack is the hybrid of.
+//!
+//! One consequence, now closed off: `one_access_ratio == 1.0` would leave
+//! `main_capacity` at `0`, and since `Stack::is_full` is `used >= max` an
+//! empty main queue then reads as full -- the one-access tail is never
+//! preferred, `evict_main` pops nothing, and `apply_evictions` spins.
+//! `SThreeFifoStack::new(1.0, _)` degenerates identically, which is why the
+//! bound was tightened for the plain design too rather than only here.
+//!
+//! Both routes are now rejected before a stack is ever built: the ten
+//! s3-fifo parsers bound the ratio `0.0..1.0`, and `PaperCache::new` and
+//! `resize` additionally reject a `(ratio, max_size)` pair whose main
+//! budget truncates to zero -- which the ratio bound alone cannot catch,
+//! since it depends on a `max_size` the parser never sees. A zero-length
+//! ONE-ACCESS queue stays legal: that is what `ratio == 0.0` asks for, and
+//! it degrades cleanly, with every insert going straight to main.
+//!
 //! ## The "contiguous front run" invariant
 //!
 //! `main_queue` is never reordered except by two operations, both of which
@@ -165,6 +208,14 @@ pub struct S3FifoHybridStack {
 	one_access_capacity: CacheSize,
 	one_access_used: CacheSize,
 
+	/// Byte budget for `main_queue`, `(1 - one_access_ratio) * max_size` —
+	/// the exact complement of `one_access_capacity`, computed the same way
+	/// in both `new` and `resize`. Mirrors `SThreeFifoStack`'s
+	/// `main.max_size`. Read only by `main_is_full`, which gates
+	/// `evict_one`'s one-access-first priority; unlike
+	/// `one_access_capacity` it never drives `needs_capacity_eviction`.
+	main_capacity: CacheSize,
+
 	fast_capacity: CacheSize,
 	fast_used: CacheSize,
 	slow_used: CacheSize,
@@ -225,6 +276,7 @@ impl S3FifoHybridStack {
 			one_access_ratio,
 			one_access_capacity: (one_access_ratio * max_size as f64) as CacheSize,
 			one_access_used: 0,
+			main_capacity: ((1.0 - one_access_ratio) * max_size as f64) as CacheSize,
 
 			fast_capacity,
 			fast_used: 0,
@@ -481,6 +533,26 @@ impl S3FifoHybridStack {
 		}
 	}
 
+	/// Whether `main_queue` is at or over its byte budget — the gate on
+	/// `evict_one`'s one-access-first priority. Mirrors
+	/// `SThreeFifoStack::Stack::is_full`'s `used_size >= max_size`, applied
+	/// to the same quantity.
+	///
+	/// `main_used` is exactly `fast_used + slow_used`. A `one_access_queue`
+	/// resident is admitted with `tier: None` and its bytes go to
+	/// `one_access_used` alone (`insert`); `resize_key` keeps them there
+	/// while the key stays in that queue. `fast_used`/`slow_used` are
+	/// touched only on the main-queue paths — `promote_from_one_access`
+	/// (which hands the bytes over from `one_access_used` to `fast_used`),
+	/// `give_second_chance`, `settle_fast_tier`, `remove`'s `Queue::Main`
+	/// arm and `evict_one`'s own main-queue arm — so no one-access byte is
+	/// ever counted here, and every main-queue byte is, on exactly one side
+	/// of the fast/slow line (`tier` is `Some` for every `Queue::Main`
+	/// entry).
+	fn main_is_full(&self) -> bool {
+		self.fast_used + self.slow_used >= self.main_capacity
+	}
+
 	/// Pops and fully removes `one_access_queue`'s tail from this stack's
 	/// own bookkeeping, if any — unconditional, since anything still here
 	/// has (by construction of the eager-promotion rule) never been
@@ -582,6 +654,7 @@ impl PolicyStack for S3FifoHybridStack {
 
 	fn resize(&mut self, max_size: CacheSize) {
 		self.one_access_capacity = (self.one_access_ratio * max_size as f64) as CacheSize;
+		self.main_capacity = ((1.0 - self.one_access_ratio) * max_size as f64) as CacheSize;
 		// A shrink may push one_access_used over the new, smaller capacity;
 		// `needs_capacity_eviction` reports it, `apply_evictions` drains it.
 	}
@@ -600,16 +673,22 @@ impl PolicyStack for S3FifoHybridStack {
 		self.migrations.clear();
 	}
 
-	/// Priority: `one_access_queue`'s tail first (unconditional — see
-	/// `evict_one_access_tail`'s doc); otherwise sweeps `main_queue`'s tail,
+	/// Priority: `one_access_queue`'s tail first, but only while
+	/// `main_queue` is not full (`main_is_full`) — exactly
+	/// `SThreeFifoStack::evict_one`'s gate, see the module doc's "Eviction
+	/// priority" section. Within that branch the pop is unconditional (see
+	/// `evict_one_access_tail`'s doc). Otherwise sweeps `main_queue`'s tail,
 	/// giving repeated second chances to accessed keys (classic CLOCK sweep
 	/// — bounded by `main_queue`'s length, since each second chance clears
 	/// that key's bit and moves it to the front, so it can't be
 	/// re-examined again until a full lap) until it finds one with a clear
 	/// reference bit to actually evict, or the queue is exhausted.
 	fn evict_one(&mut self) -> Option<HashedKey> {
-		if let Some(key) = self.evict_one_access_tail() {
-			return Some(key);
+		if !self.main_is_full() {
+			// prioritize evicting from the one-access queue when possible
+			if let Some(key) = self.evict_one_access_tail() {
+				return Some(key);
+			}
 		}
 
 		loop {
@@ -785,7 +864,12 @@ mod tests {
 
 	#[test]
 	fn one_access_capacity_pressure_is_reported_not_self_evicted() {
-		let mut stack = S3FifoHybridStack::new(1.0, 15, 1_000);
+		// `one_access_capacity` is 0.5 * 30 = 15, exactly as the original
+		// `new(1.0, 15, _)` gave it -- but with a non-degenerate
+		// `main_capacity` of 15 rather than the 0 a ratio of 1.0 implies,
+		// which would make `main_is_full()` true from the outset and put the
+		// one-access tail permanently out of `evict_one`'s reach.
+		let mut stack = S3FifoHybridStack::new(0.5, 30, 1_000);
 
 		stack.insert(1, 10);
 		drain(&mut stack);
@@ -908,17 +992,66 @@ mod tests {
 		assert_eq!(stack.tier_of(2), Some(Tier::Fast));
 	}
 
+	/// The one-access-first half of `evict_one`'s priority rule: while
+	/// `main_queue` is under its budget, the one-access tail goes first even
+	/// though `main_queue` also has an evictable key.
+	///
+	/// Paired with `evict_one_evicts_the_main_tail_once_the_main_queue_is_full`
+	/// below: same ratio, same capacities, same key sizes -- the *only*
+	/// difference is how many bytes sit in `main_queue`. Together they pin the
+	/// gate itself rather than either branch in isolation, which a stack that
+	/// ignored `main_is_full()` in either direction would still pass one of.
 	#[test]
-	fn evict_one_prefers_one_access_queue_over_main_queue() {
-		let mut stack = S3FifoHybridStack::new(1.0, 1_000, 1_000);
+	fn evict_one_prefers_one_access_queue_while_the_main_queue_has_room() {
+		// one_access_capacity = 20, main_capacity = 20.
+		let mut stack = S3FifoHybridStack::new(0.5, 40, 1_000);
 
 		stack.insert(1, 10); // one-access
 		stack.insert(2, 10);
 		stack.update(2); // promote 2 -> Main/Fast
 		drain(&mut stack);
 
+		// main_used = 10 < main_capacity = 20 -- not full.
+		assert!(!stack.main_is_full());
+
 		assert_eq!(stack.evict_one(), Some(1));
 		assert_eq!(stack.tier_of(2), Some(Tier::Fast));
+	}
+
+	/// The other half: once `main_queue` is at its budget the gate closes and
+	/// `evict_one` goes straight to the main-queue sweep, leaving the
+	/// one-access tail alone -- exactly what `SThreeFifoStack::evict_one` does
+	/// when `self.main.is_full()`.
+	///
+	/// Before this gate existed, `evict_one` drained the one-access tail
+	/// unconditionally and this test would have evicted key 3 (the only
+	/// one-access resident) instead of key 1.
+	#[test]
+	fn evict_one_evicts_the_main_tail_once_the_main_queue_is_full() {
+		// Same fixture as the test above: one_access_capacity = 20,
+		// main_capacity = 20, and a fast tier far too slack to demote.
+		let mut stack = S3FifoHybridStack::new(0.5, 40, 1_000);
+
+		stack.insert(1, 10);
+		stack.update(1); // promote 1 -> Main/Fast (main_queue tail)
+		stack.insert(2, 10);
+		stack.update(2); // promote 2 -> Main/Fast (main_queue front)
+		stack.insert(3, 10); // one-access
+		drain(&mut stack);
+
+		// main_used = fast_used + slow_used = 20 >= main_capacity = 20.
+		assert!(stack.main_is_full());
+		assert_eq!(stack.tier_of(3), Some(Tier::Slow));
+
+		// The main queue's oldest key, not the one-access tail.
+		assert_eq!(stack.evict_one(), Some(1));
+		assert!(stack.contains(3), "the one-access tail must be left alone while main is full");
+		assert_eq!(stack.tier_of(2), Some(Tier::Fast));
+
+		// And once that eviction has taken main back under its budget, the
+		// gate reopens and the one-access tail is preferred again.
+		assert!(!stack.main_is_full());
+		assert_eq!(stack.evict_one(), Some(3));
 	}
 
 	#[test]

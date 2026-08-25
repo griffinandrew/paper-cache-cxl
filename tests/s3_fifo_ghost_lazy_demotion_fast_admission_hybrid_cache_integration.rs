@@ -100,6 +100,12 @@ mod hybrid_cache_tests {
     /// `effective_main_fast_capacity` is `fast_capacity - one_access_capacity`,
     /// each test below adds `ONE_ACCESS_RESERVE` to its fast-tier size so the
     /// main queue's own budget stays exactly the value that test intends.
+    ///
+    /// Do not raise it to dodge a `resize()` rejection (`resize` re-derives
+    /// both budgets against the new size and refuses one that rounds to zero).
+    /// `a_key_with_no_ghost_history_still_lands_in_the_one_access_queue_fast`
+    /// needs this 1000-byte budget to be overflowed by ~2200 bytes of filler,
+    /// so the resizing test below states its own `max_size`/ratio pair instead.
     const ONE_ACCESS_RATIO: f64 = 0.001;
     const ONE_ACCESS_RESERVE: u64 = 1_000;
 
@@ -107,9 +113,16 @@ mod hybrid_cache_tests {
     fn admission_always_lands_in_fast_tier() {
         ensure_pmem_allocator_warm();
 
+        // ONE_ACCESS_RATIO, not 1.0: ratio 1.0 is now rejected outright, since
+        // `main_capacity` is `(1 - ratio) * max_size` and would be zero. The
+        // fixture only needs the one-access queue to hold the single admitted
+        // key: 0.001 * 1_000_000 = 1000 bytes (~8 objects at this policy's
+        // 122-byte accounted size), leaving the main queue the other 999_000 --
+        // both budgets dwarf this one-key workload, so the main-queue gate is
+        // transparent and the test keeps its original meaning.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ONE_ACCESS_RATIO)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
 
@@ -296,9 +309,22 @@ mod hybrid_cache_tests {
         // specifically about main-queue eviction priority, not the one-access
         // budget) -- see ONE_ACCESS_RATIO for why that reservation is added on
         // top rather than the ratio simply being 0.0.
+        //
+        // max_size 100_000 with an explicit 0.01, not 1_000_000 with
+        // ONE_ACCESS_RATIO: the PRODUCT is what this fixture depends on and it
+        // is unchanged -- 0.01 * 100_000 is the same 1_000-byte one-access
+        // reservation `ONE_ACCESS_RESERVE` adds back to the fast tier below, so
+        // the main queue's effective fast budget is still exactly 40 bytes, one
+        // key. The ratio has to move because `resize()` now re-derives both
+        // budgets against the NEW size and rejects one that rounds to zero:
+        // ONE_ACCESS_RATIO * 180 is 0, while 0.01 * 180 is 1 byte (main 179).
+        // Raising ONE_ACCESS_RATIO itself is not an option -- see its doc --
+        // hence the local pair. 100_000 is still ~400x what this test admits,
+        // so the global `used_size() > max_size` trigger stays quiet until the
+        // resize fires it, exactly as before.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(40 + ONE_ACCESS_RESERVE), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ONE_ACCESS_RATIO)).expect("cache should construct");
+            100_000,
+            CacheTierSize::Bytes(40 + ONE_ACCESS_RESERVE), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(0.01)).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");

@@ -39,7 +39,13 @@ mod hybrid_cache_tests {
         // Mechanics tests at toy scales: metadata reservation off (see
         // `get_hybrid_dram_shared_overhead`).
         unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(1.0))
+        // 0.5, not 1.0: ratio 1.0 is now rejected by the parser and by
+        // `PaperCache::new` for the whole s3-fifo family, since
+        // `main_capacity` is `(1 - ratio) * max_size` and would be zero. The
+        // warm-up admits one 4-byte value (24 accounted bytes); 0.5 * 1_000_000
+        // = 500_000 bytes on each side dwarfs that, so the one-access queue is
+        // still effectively unbounded and the main-queue gate is transparent.
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.5))
             .expect("warm-up cache should construct");
 
         cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
@@ -52,9 +58,13 @@ mod hybrid_cache_tests {
     fn admission_always_lands_in_slow_tier() {
         ensure_pmem_allocator_warm();
 
+        // 0.5, not 1.0: 1.0 is now rejected, `main_capacity` being
+        // `(1 - ratio) * max_size`. This fixture needs nothing but room for its
+        // single "hello world" key (31 accounted bytes), and 0.5 * 1_000_000 =
+        // 500_000 bytes per side dwarfs it, so the change is behaviour-neutral.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
 
@@ -66,9 +76,13 @@ mod hybrid_cache_tests {
     fn reaccessing_a_one_access_key_promotes_it_eagerly_to_fast_tier() {
         ensure_pmem_allocator_warm();
 
+        // 0.5, not 1.0 (rejected now: `main_capacity` would be 0). One
+        // 31-accounted-byte key moves one-access -> main here; both budgets are
+        // 0.5 * 1_000_000 = 500_000 bytes, so neither queue is ever near full
+        // and the eviction path is never entered at all.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -112,9 +126,12 @@ mod hybrid_cache_tests {
     fn a_key_with_no_ghost_history_still_lands_in_the_one_access_queue_slow() {
         ensure_pmem_allocator_warm();
 
+        // 0.5, not 1.0 (rejected now: `main_capacity` would be 0). The single
+        // "brand new value" key accounts for 35 bytes against a 500_000-byte
+        // one-access budget, so it stays put exactly as before.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.5)).expect("cache should construct");
 
         cache.set(9u32, b"brand new value", None).expect("set should succeed");
 
@@ -128,9 +145,13 @@ mod hybrid_cache_tests {
     fn a_plain_access_on_a_fast_main_queue_key_does_not_migrate_or_reorder() {
         ensure_pmem_allocator_warm();
 
+        // 0.5, not 1.0 (rejected now: `main_capacity` would be 0). One
+        // 35-accounted-byte key sits in the main queue against a 0.5 * 1_000_000
+        // = 500_000-byte main budget, so `main_is_full()` is never true and the
+        // no-migration/no-reorder behaviour under test is untouched.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -149,9 +170,16 @@ mod hybrid_cache_tests {
     fn an_accessed_key_at_the_main_queue_tail_gets_a_second_chance_instead_of_eviction() {
         ensure_pmem_allocator_warm();
 
+        // 0.5, not 1.0 (rejected now: `main_capacity` would be 0). The ratio is
+        // load-bearing here because `cache.resize(180)` below recomputes both
+        // budgets against the new max size: 0.5 * 180 = 90 bytes each. The two
+        // promoted "payload bytes N" keys account for 35 bytes apiece, so the
+        // main queue holds 70 < 90, `main_is_full()` stays false, and
+        // `evict_one` falls through the (empty) one-access tail into the
+        // main-queue sweep -- the same path it took before the gate existed.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(40), PaperPolicy::S3FifoGhostLazyDemotionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(40), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -189,9 +217,14 @@ mod hybrid_cache_tests {
         // Fast tier fits comfortably one "payload bytes N"-sized value but
         // not two (same 40-byte budget the eviction-time second-chance test
         // above already relies on for "exactly one slot").
+        //
+        // 0.5, not 1.0 (rejected now: `main_capacity` would be 0). Nothing is
+        // ever evicted in this test -- 2 x 35 accounted bytes against a
+        // 1_000_000-byte max size -- so both 500_000-byte budgets are pure
+        // headroom and only the demotion-time reprieve is exercised.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(40), PaperPolicy::S3FifoGhostLazyDemotionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(40), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -284,9 +317,14 @@ mod hybrid_cache_tests {
     fn ttl_survives_a_demotion() {
         ensure_pmem_allocator_warm();
 
+        // 0.5, not 1.0 (rejected now: `main_capacity` would be 0). The six keys
+        // account for 35 + 5 * 32 = 195 bytes, all of which end up in the main
+        // queue; against 0.5 * 1_000_000 = 500_000 bytes per side neither budget
+        // is approached, so the fast-tier demotion this test turns on is driven
+        // by `TTL_FAST_TIER` alone, exactly as before.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::S3FifoGhostLazyDemotionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.5)).expect("cache should construct");
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
@@ -320,9 +358,18 @@ mod hybrid_cache_tests {
     fn terminal_eviction_prefers_one_access_queue_over_main_queue() {
         ensure_pmem_allocator_warm();
 
+        // 0.5 over the SAME 200-byte max size, not 1.0. max_size has to stay
+        // 200 because this fixture drives the global eviction trigger
+        // (`used_size() > max_size`); only the split moves. 0.5 * 200 = 100
+        // bytes for the one-access queue and 100 for the main queue. Key 1 is
+        // the main queue's only resident (35 accounted bytes), so main_used =
+        // 35 < 100, `main_is_full()` is false, and `evict_one` keeps preferring
+        // the one-access tail -- which is the priority this test asserts. At
+        // ratio 1.0 `main_capacity` would be 0, the main queue would read full
+        // from the outset, and the sweep would evict key 1 instead.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             200,
-            CacheTierSize::Bytes(200), PaperPolicy::S3FifoGhostLazyDemotionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(200), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes 1", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -351,9 +398,12 @@ mod hybrid_cache_tests {
     fn set_fast_tier_size_takes_effect_at_runtime() {
         ensure_pmem_allocator_warm();
 
+        // 0.5, not 1.0 (rejected now: `main_capacity` would be 0). One
+        // 35-accounted-byte key against two 500_000-byte budgets: only
+        // `set_fast_tier_size` drives the demotion under test.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -385,9 +435,12 @@ mod hybrid_cache_tests {
     fn del_removes_key_from_whichever_tier_it_is_in() {
         ensure_pmem_allocator_warm();
 
+        // 0.5, not 1.0 (rejected now: `main_capacity` would be 0). One
+        // 35-accounted-byte key against two 500_000-byte budgets, so `del` is
+        // the only thing that ever removes it.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -402,9 +455,12 @@ mod hybrid_cache_tests {
     fn wipe_clears_both_tiers() {
         ensure_pmem_allocator_warm();
 
+        // 0.5, not 1.0 (rejected now: `main_capacity` would be 0). Two keys,
+        // 35 accounted bytes each, against two 500_000-byte budgets -- nothing
+        // is evicted before `wipe`.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.set(2u32, b"second value 45", None).expect("set should succeed");

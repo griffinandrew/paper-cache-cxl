@@ -232,7 +232,7 @@ All four carry `k_in` in their policy payload — e.g. `PaperPolicy::TwoQHybrid(
 ### S3-FIFO family — lazy, reference-bit-gated promotion
 
 All nine carry `one_access_ratio` in their policy payload — e.g.
-`PaperPolicy::S3FifoHybrid(one_access_ratio)` — validated into `0.0..=1.0`. Rows are in the order
+`PaperPolicy::S3FifoHybrid(one_access_ratio)` — validated into `0.0..1.0` (1.0 excluded). Rows are in the order
 the designs were built, each described against the one above it — note that the later ones
 *remove* as much as they add.
 

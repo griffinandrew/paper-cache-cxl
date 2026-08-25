@@ -677,6 +677,19 @@ where
 			return Err(CacheError::UnconfiguredPolicy);
 		}
 
+		// Every CONFIGURED policy is checked, not just the active one:
+		// `PaperPolicy::Auto` can promote any of them later, and the runtime
+		// `policy` setter only accepts policies already on this list -- so
+		// validating the list here is what makes that setter safe by
+		// construction.
+		if policies
+			.iter()
+			.any(|configured| s_three_fifo_starves_main(*configured, max_size))
+			|| s_three_fifo_starves_main(policy, max_size)
+		{
+			return Err(CacheError::InvalidPolicy);
+		}
+
 		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
@@ -1111,6 +1124,17 @@ where
 			return Err(CacheError::ZeroCacheSize);
 		}
 
+		// `Stack::resize` recomputes the main budget against the NEW size, so
+		// a resize can starve a queue that was fine at construction.
+		if self
+			.status
+			.policies()
+			.iter()
+			.any(|configured| s_three_fifo_starves_main(*configured, max_size))
+		{
+			return Err(CacheError::InvalidPolicy);
+		}
+
 		let current_max_size = self.status.max_size();
 
 		if max_size == current_max_size {
@@ -1259,6 +1283,19 @@ where
 
 		if !policy.is_auto() && !policies.contains(&policy) {
 			return Err(CacheError::UnconfiguredPolicy);
+		}
+
+		// Every CONFIGURED policy is checked, not just the active one:
+		// `PaperPolicy::Auto` can promote any of them later, and the runtime
+		// `policy` setter only accepts policies already on this list -- so
+		// validating the list here is what makes that setter safe by
+		// construction.
+		if policies
+			.iter()
+			.any(|configured| s_three_fifo_starves_main(*configured, max_size))
+			|| s_three_fifo_starves_main(policy, max_size)
+		{
+			return Err(CacheError::InvalidPolicy);
 		}
 
 		// Global hashtable in PMEM (Hybrid allocator) when
@@ -1495,6 +1532,17 @@ where
 			return Err(CacheError::ZeroCacheSize);
 		}
 
+		// `Stack::resize` recomputes the main budget against the NEW size, so
+		// a resize can starve a queue that was fine at construction.
+		if self
+			.status
+			.policies()
+			.iter()
+			.any(|configured| s_three_fifo_starves_main(*configured, max_size))
+		{
+			return Err(CacheError::InvalidPolicy);
+		}
+
 		let current_max_size = self.status.max_size();
 
 		if max_size == current_max_size {
@@ -1694,6 +1742,53 @@ fn new_hybrid_object_map<K, V>() -> ObjectMapRef<K, V> {
 	}
 }
 
+/// True when `policy` sizes its main queue from `1 - ratio` and that budget
+/// truncates to zero at `max_size` -- the configuration that spins
+/// `apply_evictions`, since `Stack::is_full` is `used >= max` and so an empty
+/// zero-capacity queue reports itself full.
+///
+/// Covers the non-tiered `SThreeFifo` design only. The hybrid designs go
+/// through `s3_fifo_queue_budgets`, which additionally has to tell the stacks
+/// that size a main queue apart from the reprieve stacks that do not.
+fn s_three_fifo_starves_main(policy: PaperPolicy, max_size: CacheSize) -> bool {
+	let PaperPolicy::SThreeFifo(ratio) = policy else {
+		return false;
+	};
+
+	((1.0 - ratio) * max_size as f64) as CacheSize == 0
+}
+
+/// For an s3-fifo design: its one-access ratio, and whether it also sizes a
+/// main queue at `(1 - ratio) * max_size`. `None` for anything else.
+///
+/// Exists so `new_hybrid` can reject a config whose computed queue budget
+/// rounds to zero. The second field is not cosmetic: the four reprieve stacks
+/// size `one_access_capacity` and nothing else -- they derive no budget from
+/// `1 - ratio` and never gate eviction on main fullness -- so a main budget
+/// truncating to zero means nothing to them, and checking it would refuse a
+/// config that works. The 2Q designs are absent for the same reason, one step
+/// further: they derive no budget from `1 - k_in` at all.
+#[cfg(feature = "hybrid_cache_common")]
+fn s3_fifo_queue_budgets(policy: PaperPolicy) -> Option<(f64, bool)> {
+	match policy {
+		// These five size main at `(1 - ratio) * max_size`, mirroring
+		// `SThreeFifoStack`, and gate eviction on its fullness.
+		PaperPolicy::S3FifoHybrid(r)
+		| PaperPolicy::S3FifoGhostHybrid(r)
+		| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
+		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
+		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(r) => Some((r, true)),
+
+		// The reprieve stacks: one-access budget only.
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(r)
+		| PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(r)
+		| PaperPolicy::S3FifoLazyDemotionReprieveHybrid(r)
+		| PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(r) => Some((r, false)),
+
+		_ => None,
+	}
+}
+
 /// The engine every hybrid design runs on: `new`/`with_hasher`, the cache
 /// operations, and the single `hybrid_stats()` accessor. The design is not
 /// chosen here -- it arrives as the `PaperPolicy` argument to `new`, is stored
@@ -1722,7 +1817,13 @@ where
 	/// # Errors
 	///
 	/// [`CacheError::InvalidPolicy`] if `policy` is not a hybrid design (or
-	/// is `LruSizedHybrid`, which `new_sized` serves);
+	/// is `LruSizedHybrid`, which `new_sized` serves), if its parameters are
+	/// out of range, or -- for the s3-fifo designs that size a main queue at
+	/// `(1 - ratio) * max_size` -- if that budget truncates to zero at this
+	/// `max_size`, which would leave the eviction loop unable to free
+	/// anything. Note the ratio bound alone cannot catch the last case, since
+	/// it depends on a `max_size` the policy never sees; a zero-length
+	/// ONE-ACCESS queue is legal, being exactly what `ratio == 0.0` asks for.
 	/// [`CacheError::ZeroCacheSize`]/[`CacheError::InvalidFastTierSize`] as
 	/// for every other constructor.
 	pub fn new(
@@ -1779,11 +1880,29 @@ where
 				(0.0..=1.0).contains(&k_in) && (0.0..=1.0).contains(&k_out)
 			},
 
+			// The 2Q family keeps an INCLUSIVE upper bound. No 2Q stack
+			// derives a budget from `1 - k_in`: `fifo_capacity` is
+			// `k_in * max_size` and the main queue is bounded by the
+			// cache's overall `max_size`, so `k_in == 1.0` gives the FIFO
+			// queue the whole cache -- extreme, but every queue still has
+			// capacity and eviction drains the FIFO tail unconditionally.
 			PaperPolicy::TwoQHybrid(r)
 			| PaperPolicy::TwoQFastAdmissionHybrid(r)
 			| PaperPolicy::TwoQFastAdmissionReprieveHybrid(r)
-			| PaperPolicy::TwoQGhostHybrid(r)
-			| PaperPolicy::S3FifoHybrid(r)
+			| PaperPolicy::TwoQGhostHybrid(r) => (0.0..=1.0).contains(&r),
+
+			// The s3-fifo family EXCLUDES 1.0. These stacks size the main
+			// queue at `(1 - ratio) * max_size`, mirroring
+			// `SThreeFifoStack`, so a ratio of exactly 1 leaves it zero
+			// bytes. `Stack::is_full` is `used >= max`, so an *empty* main
+			// queue then reports itself full: `evict_one` skips the
+			// one-access queue and `evict_main` pops nothing, returning
+			// `None` while the cache is still over budget, and
+			// `apply_evictions` spins on it. Rejecting the endpoint makes
+			// that unreachable rather than guarding it after the fact.
+			// (`SThreeFifoStack` has the same degeneracy at 1.0; its own
+			// parser is tightened to match.)
+			PaperPolicy::S3FifoHybrid(r)
 			| PaperPolicy::S3FifoGhostHybrid(r)
 			| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
 			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
@@ -1792,7 +1911,7 @@ where
 			| PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(r)
 			| PaperPolicy::S3FifoLazyDemotionReprieveHybrid(r)
 			| PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(r) => {
-				(0.0..=1.0).contains(&r)
+				(0.0..1.0).contains(&r)
 			},
 
 			_ => true,
@@ -1806,6 +1925,30 @@ where
 
 		if fast_capacity == 0 || fast_capacity > max_size {
 			return Err(CacheError::InvalidFastTierSize);
+		}
+
+		// The main budget is a truncating cast, so a ratio well inside (0, 1)
+		// still rounds it to zero when `max_size` is small enough: 1 - 0.9995
+		// of 1_000 is 0.5, which truncates to 0. That is the same
+		// zero-capacity main queue the endpoint exclusion above prevents,
+		// reached by a different route, and no bound on the ratio alone can
+		// catch it -- whether a ratio is too extreme depends on `max_size`,
+		// which the policy parser never sees. This is the only place both are
+		// known.
+		//
+		// Only the MAIN budget is checked. A one-access budget of zero is not
+		// a failure: it is what `ratio == 0.0` asks for, it is documented and
+		// tested as legal, and it degrades cleanly -- every insert goes
+		// straight to main, which holds the entire budget. Rejecting it here
+		// would have made this contradict the parser.
+		//
+		// Deliberately after the `max_size == 0` and fast-tier checks, so a
+		// zero-sized cache still reports `ZeroCacheSize`/`InvalidFastTierSize`
+		// rather than being re-diagnosed as a bad ratio.
+		if let Some((ratio, sizes_main)) = s3_fifo_queue_budgets(policy) {
+			if sizes_main && ((1.0 - ratio) * max_size as f64) as CacheSize == 0 {
+				return Err(CacheError::InvalidPolicy);
+			}
 		}
 
 		let policies = [policy];
@@ -2085,9 +2228,29 @@ where
 	/// fast-tier budget — see [`Self::set_fast_tier_size`]. (`two_q_hybrid_cache`
 	/// additionally rescales its FIFO queue's byte budget proportionally,
 	/// inside `TwoQHybridStack::resize` -- not this method.)
+	///
+	/// # Errors
+	///
+	/// [`CacheError::ZeroCacheSize`] if `max_size` is zero, and
+	/// [`CacheError::InvalidPolicy`] if the active s3-fifo design's queue
+	/// budgets would not survive the new size -- the same condition `new`
+	/// rejects, reported the same way.
 	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
 		if max_size == 0 {
 			return Err(CacheError::ZeroCacheSize);
+		}
+
+		// `Stack::resize` recomputes both s3-fifo budgets against the NEW
+		// max_size, so a resize can reintroduce exactly the zero-capacity
+		// main queue the constructor refuses -- a ratio of 0.9995 is fine at
+		// max_size 1_000_000 (main = 500 B) and degenerate at 1_000
+		// (main = 0 B), which spins the eviction loop. The size is legal and
+		// the policy is legal; it is the pair that is not, so this has to be
+		// checked here as well as in `new`.
+		if let Some((ratio, sizes_main)) = s3_fifo_queue_budgets(self.status.policy()) {
+			if sizes_main && ((1.0 - ratio) * max_size as f64) as CacheSize == 0 {
+				return Err(CacheError::InvalidPolicy);
+			}
 		}
 
 		let current_max_size = self.status.max_size();
@@ -2906,4 +3069,46 @@ mod test_lru_sized_hybrid_cache {
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
         assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
     }
+}
+
+#[cfg(test)]
+mod s_three_fifo_budget_tests {
+	use super::*;
+
+	/// The non-tiered design sizes main at `(1 - ratio) * max_size`, so an
+	/// extreme ratio starves it. This is the predicate the non-hybrid
+	/// constructor and `resize` gate on; the livelock it prevents is an
+	/// eviction loop that can never bring the cache under budget.
+	#[test]
+	fn a_main_budget_that_truncates_to_zero_is_detected() {
+		// (1 - 1.0) * 1_000 == 0 -- the endpoint.
+		assert!(s_three_fifo_starves_main(PaperPolicy::SThreeFifo(1.0), 1_000));
+
+		// (1 - 0.9995) * 1_000 == 0.5, truncated to 0 -- inside the open
+		// range, and reachable only because `max_size` is small.
+		assert!(s_three_fifo_starves_main(PaperPolicy::SThreeFifo(0.9995), 1_000));
+
+		// The same ratio is fine once main gets a byte: 500 here.
+		assert!(!s_three_fifo_starves_main(PaperPolicy::SThreeFifo(0.9995), 1_000_000));
+	}
+
+	/// A zero-length ONE-ACCESS queue is legal and must not be caught here:
+	/// it is what `ratio == 0.0` asks for, and it degrades cleanly because
+	/// main then holds the entire budget.
+	#[test]
+	fn a_zero_length_one_access_queue_is_not_flagged() {
+		assert!(!s_three_fifo_starves_main(PaperPolicy::SThreeFifo(0.0), 1_000));
+		assert!(!s_three_fifo_starves_main(PaperPolicy::SThreeFifo(0.0005), 1_000));
+	}
+
+	/// Only the s3-fifo design derives a budget from `1 - ratio`. 2Q sizes
+	/// its FIFO queue at `k_in * max_size` and bounds its main queue by the
+	/// cache's overall `max_size`, so `k_in == 1.0` starves nothing there and
+	/// must not be rejected.
+	#[test]
+	fn other_policies_are_never_flagged() {
+		assert!(!s_three_fifo_starves_main(PaperPolicy::TwoQ(1.0, 0.0), 1_000));
+		assert!(!s_three_fifo_starves_main(PaperPolicy::Lru, 1_000));
+		assert!(!s_three_fifo_starves_main(PaperPolicy::Lfu, 1_000));
+	}
 }

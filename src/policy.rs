@@ -355,7 +355,7 @@ fn parse_s_three_fifo(value: &str) -> Result<PaperPolicy, CacheError> {
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..=1.0).contains(&ratio) {
+	if !(0.0..1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -376,7 +376,7 @@ fn parse_s_three_fifo_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..=1.0).contains(&ratio) {
+	if !(0.0..1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -418,7 +418,7 @@ fn parse_s_three_fifo_ghost_hybrid(value: &str) -> Result<PaperPolicy, CacheErro
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..=1.0).contains(&ratio) {
+	if !(0.0..1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -439,7 +439,7 @@ fn parse_s_three_fifo_ghost_lazy_demotion_hybrid(value: &str) -> Result<PaperPol
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..=1.0).contains(&ratio) {
+	if !(0.0..1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -460,7 +460,7 @@ fn parse_s_three_fifo_ghost_lazy_demotion_fast_admission_hybrid(value: &str) -> 
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..=1.0).contains(&ratio) {
+	if !(0.0..1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -481,7 +481,7 @@ fn parse_s_three_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid(value: 
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..=1.0).contains(&ratio) {
+	if !(0.0..1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -502,7 +502,7 @@ fn parse_s_three_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid(valu
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..=1.0).contains(&ratio) {
+	if !(0.0..1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -523,7 +523,7 @@ fn parse_s_three_fifo_lazy_demotion_fast_admission_reprieve_hybrid(value: &str) 
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..=1.0).contains(&ratio) {
+	if !(0.0..1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -544,7 +544,7 @@ fn parse_s_three_fifo_lazy_demotion_reprieve_hybrid(value: &str) -> Result<Paper
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..=1.0).contains(&ratio) {
+	if !(0.0..1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -565,7 +565,7 @@ fn parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid(va
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..=1.0).contains(&ratio) {
+	if !(0.0..1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -1142,4 +1142,97 @@ mod tests {
 			Err(CacheError::InvalidPolicy),
 		);
 	}
+
+	/// Every prefix whose parser sizes a queue at `(1 - ratio) * max_size`.
+	///
+	/// Enumerated rather than spot-checked because the bound lives in ten
+	/// separately hand-written parsers; the realistic mistake is tightening
+	/// nine of them.
+	#[cfg(test)]
+	const S3_FIFO_PREFIXES: &[&str] = &[
+		"s3-fifo-",
+		"s3-fifo-hybrid-",
+		"s3-fifo-ghost-hybrid-",
+		"s3-fifo-ghost-lazy-demotion-hybrid-",
+		"s3-fifo-ghost-lazy-demotion-fast-admission-hybrid-",
+		"s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-",
+		"s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-",
+		"s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-",
+		"s3-fifo-lazy-demotion-reprieve-hybrid-",
+		"s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-",
+	];
+
+	/// A ratio of exactly 1 gives the main queue `(1 - 1) * max_size == 0`
+	/// bytes. `Stack::is_full` is `used >= max`, so an *empty* main queue
+	/// reports itself full, `evict_one` declines to touch the one-access
+	/// queue, `evict_main` pops nothing, and the eviction loop spins on a
+	/// cache it can never bring under budget. Rejecting the endpoint at parse
+	/// time makes that state unreachable.
+	#[test]
+	fn s3_fifo_family_rejects_a_ratio_of_exactly_one() {
+		for prefix in S3_FIFO_PREFIXES {
+			let policy = format!("{prefix}1.0");
+
+			assert_eq!(
+				policy.parse::<PaperPolicy>(),
+				Err(CacheError::InvalidPolicy),
+				"{policy} should be rejected: it leaves the main queue zero bytes",
+			);
+		}
+	}
+
+	/// The exclusion has to be an endpoint exclusion and nothing more -- a
+	/// `<` accidentally written where `<=` was meant elsewhere in the guard
+	/// would also reject everything below 1, and the test above would still
+	/// pass.
+	#[test]
+	fn s3_fifo_family_still_accepts_ratios_just_below_one() {
+		for prefix in S3_FIFO_PREFIXES {
+			let policy = format!("{prefix}0.999");
+
+			assert!(
+				policy.parse::<PaperPolicy>().is_ok(),
+				"{policy} should parse: 0.999 leaves both queues a real budget",
+			);
+		}
+	}
+
+	/// 0 stays legal. It means "no one-access queue", which is a coherent
+	/// request -- every insert goes straight to main -- and unlike 1 it
+	/// starves no queue that eviction depends on.
+	#[test]
+	fn s3_fifo_family_still_accepts_a_ratio_of_zero() {
+		for prefix in S3_FIFO_PREFIXES {
+			let policy = format!("{prefix}0.0");
+
+			assert!(policy.parse::<PaperPolicy>().is_ok(), "{policy} should parse");
+		}
+	}
+
+	/// The 2Q family deliberately keeps the INCLUSIVE bound. No 2Q stack
+	/// derives a budget from `1 - k_in`: `fifo_capacity` is `k_in * max_size`
+	/// and the main queue is bounded by the cache's overall `max_size`, so
+	/// `k_in == 1.0` hands the FIFO queue the whole cache -- extreme, but
+	/// every queue still has capacity and nothing spins. Tightening these to
+	/// match s3-fifo would break working call sites to fix nothing.
+	#[test]
+	fn two_q_family_still_accepts_a_ratio_of_exactly_one() {
+		for policy in [
+			// Plain `2q-` takes both k_in and k_out, and separately
+			// requires they sum to at most 1 -- so k_out is 0 here to
+			// isolate k_in at its upper bound.
+			"2q-1.0-0.0",
+			"2q-hybrid-1.0",
+			"2q-fast-admission-hybrid-1.0",
+			"2q-fast-admission-reprieve-hybrid-1.0",
+			"2q-ghost-hybrid-1.0",
+			"2q-full-fast-admission-hybrid-1.0-1.0",
+		] {
+			assert!(
+				policy.parse::<PaperPolicy>().is_ok(),
+				"{policy} should still parse: 2Q sizes no queue at (1 - k_in)",
+			);
+		}
+	}
+
 }

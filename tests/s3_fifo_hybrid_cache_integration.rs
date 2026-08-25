@@ -43,6 +43,21 @@
 mod hybrid_cache_tests {
     use paper_cache::{PaperPolicy, PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
+    /// One-access share for every fixture whose `max_size` (`1_000_000`) is
+    /// large enough that both s3-fifo queue budgets are meant to stay out of
+    /// the way: one_access_capacity = 0.9 * 1_000_000 = 900_000 and
+    /// main_capacity = (1 - 0.9) * 1_000_000 = 100_000, both four orders of
+    /// magnitude above the few hundred bytes any of these tests stores, so
+    /// neither the one-access budget nor `evict_one`'s main-queue-full gate
+    /// is ever reached.
+    ///
+    /// These fixtures used to pass `1.0` for that same "one-access queue
+    /// effectively unbounded" intent, which is no longer expressible:
+    /// main_capacity would be (1 - 1.0) * max_size = 0, an *empty* main
+    /// queue would report itself full (`used >= max`), and `PaperCache::new`
+    /// now rejects the endpoint outright with `CacheError::InvalidPolicy`.
+    const SLACK_RATIO: f64 = 0.9;
+
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -65,7 +80,7 @@ mod hybrid_cache_tests {
         // Mechanics tests at toy scales: metadata reservation off (see
         // `get_hybrid_dram_shared_overhead`).
         unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(1.0))
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(SLACK_RATIO))
             .expect("warm-up cache should construct");
 
         cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
@@ -82,7 +97,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
 
@@ -100,7 +115,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
@@ -122,9 +137,20 @@ mod hybrid_cache_tests {
     fn one_access_key_aging_out_without_reaccess_is_evicted() {
         ensure_pmem_allocator_warm();
 
+        // Still sized so the GLOBAL trigger (`used_size() > max_size`) is
+        // what fires, as it was at ratio 1.0: one 15-byte value accounts
+        // for 15 + 4 (key) + 16 (ExpireTime) = 35 stack bytes and
+        // 35 + 87 (policy overhead) = 122 cache bytes, so the second
+        // `set()` alone already puts `used_size` past 200.
+        // one_access_capacity = 0.9 * 200 = 180 stays above anything the
+        // one-access queue holds between eviction passes, so it remains the
+        // passive budget it was. main_capacity = (1 - 0.9) * 200 = 20 only
+        // has to be non-zero here: nothing is ever re-accessed, so the main
+        // queue stays empty and `evict_one` keeps preferring the one-access
+        // tail.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             200,
-            CacheTierSize::Bytes(200), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(200), PaperPolicy::S3FifoHybrid(0.9)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
@@ -179,7 +205,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(40), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(40), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.set(2u32, b"second value 45", None).expect("set should succeed");
@@ -203,7 +229,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -227,7 +253,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(40), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(40), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.set(2u32, b"second value 45", None).expect("set should succeed");
@@ -254,7 +280,7 @@ mod hybrid_cache_tests {
         // carries zero risk of a premature eviction.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(40), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(40), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -282,6 +308,13 @@ mod hybrid_cache_tests {
         // empty (both keys left it when promoted), the resulting eviction
         // pressure is forced straight into the main queue's tail
         // deterministically, regardless of event-batching timing.
+        //
+        // After the resize `main_capacity` is (1 - 0.9) * 180 = 18 against
+        // the two promoted keys' 2 * (15 + 4 + 16) = 70 stack bytes, so
+        // `main_is_full()` is true and `evict_one` skips straight to the
+        // main-queue CLOCK sweep -- exactly the path this test is about.
+        // The gate is moot either way here (the one-access queue is empty
+        // by this point); it just makes reaching the sweep unconditional.
         cache.resize(180).expect("resize should succeed");
 
         let survived_and_promoted = wait_until(MIGRATION_TIMEOUT, || {
@@ -314,7 +347,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
@@ -352,7 +385,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
@@ -377,9 +410,19 @@ mod hybrid_cache_tests {
     fn terminal_eviction_prefers_one_access_queue_over_main_queue() {
         ensure_pmem_allocator_warm();
 
+        // The one preference under test only exists while `evict_one`'s
+        // one-access-first gate is open, so `main_capacity` has to stay
+        // clear of what the main queue actually holds: key 1 accounts for
+        // 15 + 4 (key) + 16 (ExpireTime) = 35 stack bytes once promoted,
+        // against main_capacity = (1 - 0.5) * 200 = 100. The complementary
+        // one_access_capacity = 0.5 * 200 = 100 stays above the 13 + 20 =
+        // 33 stack bytes per filler that the one-access queue holds between
+        // eviction passes, so the pressure driving this test is still the
+        // global one it always was (each filler is 33 + 87 bytes of policy
+        // overhead = 120 cache bytes, against max_size 200).
         let cache = PaperCache::<u32, TieredBuffer>::new(
             200,
-            CacheTierSize::Bytes(200), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(200), PaperPolicy::S3FifoHybrid(0.5)).expect("cache should construct");
 
         // Promote key 1 into the main queue (fast) so it's "proven" and
         // should survive eviction pressure that one-access objects wouldn't.
@@ -412,7 +455,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -466,6 +509,71 @@ mod hybrid_cache_tests {
         assert!(matches!(result, Err(CacheError::ZeroCacheSize)));
     }
 
+    /// A zero-length one-access queue is legal, and has to be: it is exactly
+    /// what `ratio == 0.0` asks for, and it degrades cleanly -- every insert
+    /// goes straight to the main queue, which holds the whole budget. Nothing
+    /// spins, because the eviction loop only stalls when MAIN has no capacity.
+    ///
+    /// Worth pinning at the constructor and not just the parser: an earlier
+    /// cut of this guard rejected `one_access == 0` alongside the main-queue
+    /// case, which left `"s3-fifo-hybrid-0.0"` parsing successfully and then
+    /// failing to construct at every possible size.
+    #[test]
+    fn a_zero_length_one_access_queue_is_accepted() {
+        // Explicitly, via ratio 0.0.
+        assert!(
+            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(500), PaperPolicy::S3FifoHybrid(0.0))
+                .is_ok(),
+        );
+
+        // And incidentally, via a ratio that truncates to the same thing:
+        // 0.0005 * 1_000 = 0.5 -> 0 bytes of one-access queue, 999 of main.
+        assert!(
+            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(500), PaperPolicy::S3FifoHybrid(0.0005))
+                .is_ok(),
+        );
+    }
+
+    /// The mirror of the two rejections in `invalid_one_access_ratio_is_rejected`:
+    /// 0.9995 is refused at `max_size` 1_000 because main truncates to 0 B,
+    /// and accepted here at 1_000_000 because it does not (main = 500 B).
+    /// Without this, a guard that simply banned extreme ratios outright would
+    /// pass both of those and still be wrong -- the constraint is a property
+    /// of the (ratio, max_size) pair, not of the ratio.
+    #[test]
+    fn an_extreme_ratio_is_accepted_when_max_size_leaves_both_queues_a_byte() {
+        assert!(
+            PaperCache::<u32, TieredBuffer>::new(
+                1_000_000,
+                CacheTierSize::Bytes(500_000),
+                PaperPolicy::S3FifoHybrid(0.9995),
+            )
+            .is_ok(),
+        );
+    }
+
+    /// `resize` recomputes both budgets against the NEW size, so without its
+    /// own check it reopens what the constructor closed -- the cache below is
+    /// constructed at a size where 0.9995 is fine (main = 500 B) and then
+    /// shrunk to one where it is not (main = 0 B).
+    #[test]
+    fn a_resize_that_would_starve_a_queue_is_rejected() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            1_000_000,
+            CacheTierSize::Bytes(500_000),
+            PaperPolicy::S3FifoHybrid(0.9995),
+        )
+        .expect("cache should construct");
+
+        assert!(matches!(cache.resize(1_000), Err(CacheError::InvalidPolicy)));
+
+        // Rejected, not half-applied: a resize the pair does survive still
+        // works afterwards.
+        assert!(cache.resize(500_000).is_ok());
+    }
+
     #[test]
     fn invalid_one_access_ratio_is_rejected() {
         assert!(matches!(
@@ -475,6 +583,24 @@ mod hybrid_cache_tests {
 
         assert!(matches!(
             PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(500), PaperPolicy::S3FifoHybrid(-0.1)),
+            Err(CacheError::InvalidPolicy),
+        ));
+
+        // The upper endpoint is excluded too, unlike the 2Q family's
+        // inclusive `0.0..=1.0`: it leaves main_capacity = (1 - 1.0) * 1_000
+        // = 0, so an empty main queue reads as full, `evict_one` never
+        // reaches the one-access tail and the eviction loop spins.
+        assert!(matches!(
+            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(500), PaperPolicy::S3FifoHybrid(1.0)),
+            Err(CacheError::InvalidPolicy),
+        ));
+
+        // Same zero-budget failure reached from inside the open range: the
+        // budgets are truncating casts, and (1 - 0.9995) * 1_000 = 0.5 -> 0.
+        // Only `PaperCache::new` can catch this one, since it depends on
+        // `max_size`, which the ratio bound alone never sees.
+        assert!(matches!(
+            PaperCache::<u32, TieredBuffer>::new(1_000, CacheTierSize::Bytes(500), PaperPolicy::S3FifoHybrid(0.9995)),
             Err(CacheError::InvalidPolicy),
         ));
     }
@@ -488,7 +614,7 @@ mod hybrid_cache_tests {
         // should admit and store a real value fine.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
         cache.set(1u32, b"a value", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
@@ -501,7 +627,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.set(2u32, b"second value 45", None).expect("set should succeed");
@@ -523,7 +649,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(1.0)).expect("cache should construct");
+            CacheTierSize::Bytes(1_000_000), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.set(2u32, b"second value 45", None).expect("set should succeed");
