@@ -1906,12 +1906,25 @@ where
 			| PaperPolicy::S3FifoGhostHybrid(r)
 			| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
 			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
-			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(r)
-			| PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(r)
+			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(r) => {
+				(0.0..1.0).contains(&r)
+			},
+
+			// The four reprieve designs keep the INCLUSIVE bound, for the
+			// same reason the 2Q family does: they derive no budget from
+			// `1 - ratio`. Their `evict_one` is purely the main queue's tail
+			// loop -- the one-access queue never reaches it, being drained
+			// synchronously by `settle_one_access()` against its own
+			// capacity -- so the `!main.is_full()` dispatch gate that
+			// `main_capacity` exists to serve is absent here, and no queue
+			// can report itself full at zero capacity. Their real budgets
+			// (`one_access_capacity` and `fast_capacity`) partition the
+			// DRAM/PMEM axis instead, which `1 - ratio` says nothing about.
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(r)
 			| PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(r)
 			| PaperPolicy::S3FifoLazyDemotionReprieveHybrid(r)
 			| PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(r) => {
-				(0.0..1.0).contains(&r)
+				(0.0..=1.0).contains(&r)
 			},
 
 			_ => true,

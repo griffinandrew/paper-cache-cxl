@@ -75,8 +75,10 @@
 //! `SThreeFifoStack::new(1.0, _)` degenerates identically, which is why the
 //! bound was tightened for the plain design too rather than only here.
 //!
-//! Both routes are now rejected before a stack is ever built: the ten
-//! s3-fifo parsers bound the ratio `0.0..1.0`, and `PaperCache::new` and
+//! Both routes are now rejected before a stack is ever built: the six
+//! parsers whose designs size a main queue from the remainder -- the plain
+//! stack and the five corrected hybrids -- bound the ratio `0.0..1.0`, and
+//! `PaperCache::new` and
 //! `resize` additionally reject a `(ratio, max_size)` pair whose main
 //! budget truncates to zero -- which the ratio bound alone cannot catch,
 //! since it depends on a `max_size` the parser never sees. A zero-length

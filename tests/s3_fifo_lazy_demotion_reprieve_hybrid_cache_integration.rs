@@ -578,6 +578,62 @@ mod hybrid_cache_tests {
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
 
+    /// A ratio of exactly 1 is legal for this design, and has to actually
+    /// WORK -- not merely parse.
+    ///
+    /// The six designs that size a main queue at `(1 - ratio) * max_size`
+    /// reject 1.0, because it leaves that queue zero bytes and `is_full()` is
+    /// `used >= max`, so an empty main queue reads as full and the eviction
+    /// loop spins without ever freeing anything. This design derives no such
+    /// budget: `evict_one` is purely the main queue's tail loop, and the
+    /// one-access queue never reaches it -- `settle_one_access()` drains that
+    /// synchronously against `one_access_capacity`. So there is nothing for a
+    /// zero `1 - ratio` to starve.
+    ///
+    /// Asserting eviction rather than construction is the point. A livelock
+    /// constructs perfectly happily; what it cannot do is ever get the cache
+    /// back under budget, so a fixture that overfills and then waits for a
+    /// key to disappear is exactly the shape that catches it.
+    #[test]
+    fn a_one_access_ratio_of_exactly_one_still_evicts() {
+        ensure_pmem_allocator_warm();
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            2_048,
+            CacheTierSize::Bytes(470), PaperPolicy::S3FifoLazyDemotionReprieveHybrid(1.0))
+            .expect("ratio 1.0 should construct: this design sizes no queue at (1 - ratio)");
+
+        for key in 1u32..=6 {
+            cache.set(key, b"payload bytes A", None).expect("set should succeed");
+            cache.get(&key).expect("get should succeed");
+        }
+
+        // Well past a 2_048-byte budget, so eviction has to run repeatedly.
+        for key in 7u32..=30 {
+            cache.set(key, b"payload bytes A", None).expect("set should succeed");
+            cache.get(&key).expect("get should succeed");
+        }
+
+        let evicted = wait_until(MIGRATION_TIMEOUT, || !cache.has(&1u32));
+        assert!(
+            evicted,
+            "at ratio 1.0 the oldest key should still be evicted -- if it is not, \
+             the eviction loop is failing to free anything, which is the livelock \
+             the exclusive bound exists to prevent on the main-sized designs",
+        );
+
+        // And eviction kept RUNNING, rather than freeing one key and
+        // stalling. 30 keys of ~35 accounted bytes each went into a
+        // 2_048-byte budget, so most of the early ones must be gone; a loop
+        // that seized up after a single success would leave them resident.
+        let survivors = (1u32..=10).filter(|key| cache.has(key)).count();
+        assert!(
+            survivors <= 3,
+            "expected most of keys 1-10 to have been evicted, but {survivors} survived -- \
+             eviction is not keeping up, which is what a stalled loop looks like",
+        );
+    }
+
     #[test]
     fn invalid_one_access_ratio_is_rejected() {
         assert!(matches!(

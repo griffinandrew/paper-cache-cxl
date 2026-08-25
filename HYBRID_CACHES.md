@@ -501,7 +501,7 @@ costs one extra migration rather than a synchronous PMEM-vs-DRAM decision at the
 ## S3-FIFO family
 
 All nine carry `one_access_ratio` in their policy payload -- `PaperPolicy::S3FifoHybrid(ratio)`
-and siblings, validated into `0.0..1.0` (1.0 excluded).
+and siblings, validated into `0.0..1.0` for the six designs that size a main queue at `(1 - one_access_ratio) * max_size` (the plain `s3-fifo` stack and the five non-reprieve hybrids), where a ratio of 1 would leave that queue zero bytes and stall eviction; `0.0..=1.0` for the four reprieve designs, which derive no budget from `1 - ratio` and so cannot be starved by it.
 
 ### `s3_fifo_hybrid_cache`
 

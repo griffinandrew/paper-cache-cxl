@@ -502,7 +502,7 @@ fn parse_s_three_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid(valu
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..1.0).contains(&ratio) {
+	if !(0.0..=1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -523,7 +523,7 @@ fn parse_s_three_fifo_lazy_demotion_fast_admission_reprieve_hybrid(value: &str) 
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..1.0).contains(&ratio) {
+	if !(0.0..=1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -544,7 +544,7 @@ fn parse_s_three_fifo_lazy_demotion_reprieve_hybrid(value: &str) -> Result<Paper
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..1.0).contains(&ratio) {
+	if !(0.0..=1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -565,7 +565,7 @@ fn parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid(va
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..1.0).contains(&ratio) {
+	if !(0.0..=1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
@@ -1143,19 +1143,29 @@ mod tests {
 		);
 	}
 
-	/// Every prefix whose parser sizes a queue at `(1 - ratio) * max_size`.
+	/// The prefixes whose designs size a main queue at `(1 - ratio) * max_size`
+	/// -- the plain stack and the five corrected hybrids. These EXCLUDE 1.0.
 	///
 	/// Enumerated rather than spot-checked because the bound lives in ten
 	/// separately hand-written parsers; the realistic mistake is tightening
-	/// nine of them.
+	/// five of six, or tightening one of the reprieve four by copy-paste.
 	#[cfg(test)]
-	const S3_FIFO_PREFIXES: &[&str] = &[
+	const S3_FIFO_MAIN_SIZED_PREFIXES: &[&str] = &[
 		"s3-fifo-",
 		"s3-fifo-hybrid-",
 		"s3-fifo-ghost-hybrid-",
 		"s3-fifo-ghost-lazy-demotion-hybrid-",
 		"s3-fifo-ghost-lazy-demotion-fast-admission-hybrid-",
 		"s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-",
+	];
+
+	/// The four reprieve designs, which derive no budget from `1 - ratio` and
+	/// so keep the INCLUSIVE bound. Their `evict_one` is purely the main
+	/// queue's tail loop; the one-access queue is drained by
+	/// `settle_one_access()` and never reaches eviction, so the
+	/// `!main.is_full()` dispatch gate `main_capacity` serves is absent.
+	#[cfg(test)]
+	const S3_FIFO_REPRIEVE_PREFIXES: &[&str] = &[
 		"s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-",
 		"s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-",
 		"s3-fifo-lazy-demotion-reprieve-hybrid-",
@@ -1170,7 +1180,7 @@ mod tests {
 	/// time makes that state unreachable.
 	#[test]
 	fn s3_fifo_family_rejects_a_ratio_of_exactly_one() {
-		for prefix in S3_FIFO_PREFIXES {
+		for prefix in S3_FIFO_MAIN_SIZED_PREFIXES {
 			let policy = format!("{prefix}1.0");
 
 			assert_eq!(
@@ -1187,7 +1197,7 @@ mod tests {
 	/// pass.
 	#[test]
 	fn s3_fifo_family_still_accepts_ratios_just_below_one() {
-		for prefix in S3_FIFO_PREFIXES {
+		for prefix in S3_FIFO_MAIN_SIZED_PREFIXES {
 			let policy = format!("{prefix}0.999");
 
 			assert!(
@@ -1202,11 +1212,45 @@ mod tests {
 	/// starves no queue that eviction depends on.
 	#[test]
 	fn s3_fifo_family_still_accepts_a_ratio_of_zero() {
-		for prefix in S3_FIFO_PREFIXES {
+		for prefix in S3_FIFO_MAIN_SIZED_PREFIXES.iter().chain(S3_FIFO_REPRIEVE_PREFIXES) {
 			let policy = format!("{prefix}0.0");
 
 			assert!(policy.parse::<PaperPolicy>().is_ok(), "{policy} should parse");
 		}
+	}
+
+	/// The reprieve designs accept the upper endpoint the other six refuse.
+	/// Nothing in them computes `1 - ratio`, so a ratio of 1 starves no queue
+	/// -- `settle_one_access()` still drains the one-access queue against its
+	/// own capacity, and `evict_one` still drains the main tail.
+	#[test]
+	fn reprieve_designs_accept_a_ratio_of_exactly_one() {
+		for prefix in S3_FIFO_REPRIEVE_PREFIXES {
+			let policy = format!("{prefix}1.0");
+
+			assert!(
+				policy.parse::<PaperPolicy>().is_ok(),
+				"{policy} should parse: this design sizes no queue at (1 - ratio)",
+			);
+		}
+	}
+
+	/// ...and the split is exactly where it should be: no design appears on
+	/// both lists, and between them they cover all ten parsers.
+	#[test]
+	fn every_s3_fifo_prefix_is_on_exactly_one_side_of_the_split() {
+		for prefix in S3_FIFO_REPRIEVE_PREFIXES {
+			assert!(
+				!S3_FIFO_MAIN_SIZED_PREFIXES.contains(prefix),
+				"{prefix} is on both sides of the bound split",
+			);
+		}
+
+		assert_eq!(
+			S3_FIFO_MAIN_SIZED_PREFIXES.len() + S3_FIFO_REPRIEVE_PREFIXES.len(),
+			10,
+			"the two lists should account for all ten s3-fifo parsers",
+		);
 	}
 
 	/// The 2Q family deliberately keeps the INCLUSIVE bound. No 2Q stack
