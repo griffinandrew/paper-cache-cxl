@@ -453,10 +453,16 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(40), PaperPolicy::LruHybrid).expect("cache should construct");
+            // 1_600 with ~1 KB values, matching every other demotion test in
+            // this file. These two used to pass 15-byte values against a
+            // 40-byte budget, from before the fast tier reserved per-object
+            // metadata. At ~16 B migrating per object two of them FIT in 40
+            // bytes, so nothing demoted and the wait below timed out -- the
+            // tests were stale, not the product.
+            CacheTierSize::Bytes(1_600), PaperPolicy::LruHybrid).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
+        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
 
         cache.del(&1u32).expect("del should succeed");
@@ -474,10 +480,16 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(40), PaperPolicy::LruHybrid).expect("cache should construct");
+            // 1_600 with ~1 KB values, matching every other demotion test in
+            // this file. These two used to pass 15-byte values against a
+            // 40-byte budget, from before the fast tier reserved per-object
+            // metadata. At ~16 B migrating per object two of them FIT in 40
+            // bytes, so nothing demoted and the wait below timed out -- the
+            // tests were stale, not the product.
+            CacheTierSize::Bytes(1_600), PaperPolicy::LruHybrid).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
+        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
 
         cache.wipe().expect("wipe should succeed");
