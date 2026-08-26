@@ -1501,21 +1501,55 @@ mod trace_chain_bench {
 	}
 
 	fn run(name: &str, keys: &[HashedKey]) {
+		// Insert and bump are timed apart because the hypothesis under test is
+		// that skew sensitivity comes from the *insert* path -- the original
+		// allocates a heap list node per new key, the compact one pops a free
+		// slab index -- and skew is what sets the insert share.
 		let mut old = FrequencyChain::default();
-		let t = Instant::now();
+		let (mut old_ins, mut old_bmp) = (0u128, 0u128);
+		let mut inserts = 0u64;
+
 		for &k in keys {
-			if old.bump(k) == 0 { old.insert_new(k); }
+			let t = Instant::now();
+			let hit = old.bump(k) != 0;
+			old_bmp += t.elapsed().as_nanos();
+
+			if !hit {
+				let t = Instant::now();
+				old.insert_new(k);
+				old_ins += t.elapsed().as_nanos();
+				inserts += 1;
+			}
 		}
-		let old_t = t.elapsed();
+		let old_t = std::time::Duration::from_nanos((old_ins + old_bmp) as u64);
 		let old_len = old.len();
 
 		let mut new = CompactFrequencyChain::default();
-		let t = Instant::now();
+		let (mut new_ins, mut new_bmp) = (0u128, 0u128);
+
 		for &k in keys {
-			if new.bump(k) == 0 { new.insert(k, 100, 24, Tier::Fast); }
+			let t = Instant::now();
+			let hit = new.bump(k) != 0;
+			new_bmp += t.elapsed().as_nanos();
+
+			if !hit {
+				let t = Instant::now();
+				new.insert(k, 100, 24, Tier::Fast);
+				new_ins += t.elapsed().as_nanos();
+			}
 		}
-		let new_t = t.elapsed();
+		let new_t = std::time::Duration::from_nanos((new_ins + new_bmp) as u64);
 		let new_len = new.len();
+
+		let bumps = keys.len() as u64 - inserts;
+		println!(
+			"SPLIT {:<18} inserts={:>8} ({:>4.1}%)  bumps={:>9}   			 insert ns/op old={:>7.0} new={:>7.0} ({:.1}x)   			 bump ns/op old={:>6.0} new={:>6.0} ({:.1}x)",
+			name, inserts, 100.0 * inserts as f64 / keys.len() as f64, bumps,
+			old_ins as f64 / inserts as f64, new_ins as f64 / inserts as f64,
+			old_ins as f64 / new_ins.max(1) as f64,
+			old_bmp as f64 / bumps as f64, new_bmp as f64 / bumps as f64,
+			old_bmp as f64 / new_bmp.max(1) as f64,
+		);
 
 		assert_eq!(old_len, new_len, "{name}: both must track the same key set");
 

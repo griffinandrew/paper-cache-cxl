@@ -65,7 +65,22 @@ impl OverheadManager {
 		K: TypeSize,
 		V: TypeSize,
 	{
-		let mut total_size = object.total_size();
+		// The value is scaled to what the allocator actually holds, not what
+		// was asked for. Measured on a live lfu-hybrid run over standard_web:
+		// the slow tier accounted 8.24 GiB while node1 held 9.90 GiB -- 20%
+		// more -- because size-class rounding and retained pages were never
+		// corrected for on the value side. `resident_factor` had only ever
+		// been applied to metadata, so a tier sized to its accounted bytes
+		// overran by a fifth.
+		//
+		// The key and expiry are deliberately NOT scaled here: they are inside
+		// `shared_overhead`, which applies its own factor to them already, and
+		// scaling them twice is exactly the double-charge this module has been
+		// untangling elsewhere.
+		let value = (object.data_size() as f64 * value_resident_factor()) as ObjectSize;
+		let mut total_size = object.key_size()
+			+ value
+			+ mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
 
 		if object.expiry().is_some() {
 			total_size += get_ttl_overhead();
@@ -851,6 +866,27 @@ const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 63;
 #[cfg(feature = "hybrid_cache_common")]
 const DEFAULT_RESIDENT_FACTOR: f64 = 1.12;
 
+/// Requested -> resident for *value buffers*, as distinct from metadata.
+///
+/// Measured 1.20 on a live `lfu-hybrid` run over `standard_web`: 8.24 GiB of
+/// accounted slow-tier bytes against 9.90 GiB resident on node1. Higher than
+/// metadata's 1.12 because values are variable-sized, so size-class rounding
+/// wastes more of each allocation -- metadata objects are a handful of fixed
+/// shapes that land near their class boundaries.
+///
+/// One trace, one policy. It is a correction from "no correction at all",
+/// which was demonstrably wrong by 20%, not a precisely characterised
+/// constant; `PAPER_VALUE_RESIDENT_FACTOR` overrides it.
+const DEFAULT_VALUE_RESIDENT_FACTOR: f64 = 1.20;
+
+fn value_resident_factor() -> f64 {
+	std::env::var("PAPER_VALUE_RESIDENT_FACTOR")
+		.ok()
+		.and_then(|v| v.parse::<f64>().ok())
+		.filter(|v| *v >= 1.0)
+		.unwrap_or(DEFAULT_VALUE_RESIDENT_FACTOR)
+}
+
 #[cfg(feature = "hybrid_cache_common")]
 fn resident_factor() -> f64 {
 	use std::sync::OnceLock;
@@ -1005,5 +1041,53 @@ mod shared_overhead_is_feature_independent {
 		);
 		assert_eq!(fifo, lru, "fifo and lru have the same 44+20 stack shape");
 		assert_eq!(s3, lru, "s3-fifo and lru have the same 44+20 stack shape");
+	}
+}
+
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod value_resident_factor_applies {
+	use std::sync::Arc;
+
+	use super::*;
+	use crate::{policy::PaperPolicy, status::AtomicStatus};
+
+	/// `base_size` must report what the allocator holds, not what was asked
+	/// for. Before this, only metadata carried a resident factor; a live run
+	/// showed the slow tier accounting 8.24 GiB while node1 held 9.90 GiB.
+	///
+	/// Every existing test derives its expectations from `base_size` itself,
+	/// so all of them stayed green through this change -- good design on their
+	/// part, but it means not one of them would have caught the omission.
+	#[test]
+	fn the_value_is_scaled_and_the_key_is_not() {
+		let status: crate::StatusRef = Arc::new(
+			AtomicStatus::new(1_000_000, &[PaperPolicy::LruHybrid], PaperPolicy::LruHybrid)
+				.expect("status"),
+		);
+		let manager = OverheadManager::new(&status);
+		let object = Object::new(0u32, vec![0u8; 1000].into_boxed_slice(), None);
+
+		let got = manager.base_size(&object);
+		let key = object.key_size();
+		let expiry = mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
+		// `data_size` for a `Box<[u8]>` counts the 16-byte fat pointer as well
+		// as the 1000 payload bytes. On the hybrid path V is `TieredBuffer`,
+		// whose `get_size` is the length exactly.
+		let raw = object.data_size();
+		let scaled = (raw as f64 * value_resident_factor()) as ObjectSize;
+
+		assert_eq!(
+			got, key + scaled + expiry,
+			"the value is scaled by {:.2}; the key and expiry are left alone, \
+			 since shared_overhead already applies its own factor to them",
+			value_resident_factor(),
+		);
+
+		assert!(
+			got > key + raw + expiry,
+			"a {raw}-byte value must account for more than {raw} bytes: got {got}, \
+			 unscaled would be {}",
+			key + raw + expiry,
+		);
 	}
 }

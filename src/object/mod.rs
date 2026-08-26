@@ -123,6 +123,18 @@ impl<K, V> Object<K, V> {
 	/// Without `key_pmem_value_pmem` the key lives in DRAM.
 	/// With `key_pmem_value_pmem` the key lives in PMEM and is accessed via
 	/// the `_key_pmem` box; no DRAM copy exists.
+	/// The value buffer's own byte cost.
+	///
+	/// Separated from `key_size` because the two are corrected differently:
+	/// the key and expiry are already inside `shared_overhead`, which applies
+	/// its own resident factor, while the value is scaled in `base_size`.
+	pub fn data_size(&self) -> ObjectSize
+	where
+		V: TypeSize,
+	{
+		self.data.get_size() as ObjectSize
+	}
+
 	/// The key's own byte cost, as `base_size` counts it.
 	pub fn key_size(&self) -> ObjectSize
 	where
