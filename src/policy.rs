@@ -37,6 +37,7 @@ pub enum PaperPolicy {
 	/// `LfuCompactHybridStack`.
 	LruCompactHybrid,
 	LfuCompactHybrid,
+	TwoQCompactHybrid(f64),
 	TwoQHybrid(f64),
 	TwoQFastAdmissionHybrid(f64),
 	TwoQFastAdmissionReprieveHybrid(f64),
@@ -73,7 +74,7 @@ impl PaperPolicy {
 	/// Whether this policy is one of the tiered (hybrid) designs.
 	#[must_use]
 	pub fn is_hybrid(&self) -> bool {
-		matches!(self, PaperPolicy::FifoHybrid { .. } | PaperPolicy::LfuHybrid { .. } | PaperPolicy::LfuCompactHybrid { .. } | PaperPolicy::LruCompactHybrid { .. } | PaperPolicy::LruHybrid { .. } | PaperPolicy::LruLfuHybrid { .. } | PaperPolicy::LruSizedHybrid { .. } | PaperPolicy::S3FifoGhostHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionHybrid { .. } | PaperPolicy::S3FifoHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveHybrid { .. } | PaperPolicy::TwoQFastAdmissionHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionHybrid { .. } | PaperPolicy::TwoQGhostHybrid { .. } | PaperPolicy::TwoQHybrid { .. })
+		matches!(self, PaperPolicy::FifoHybrid { .. } | PaperPolicy::LfuHybrid { .. } | PaperPolicy::LfuCompactHybrid { .. } | PaperPolicy::LruCompactHybrid { .. } | PaperPolicy::LruHybrid { .. } | PaperPolicy::LruLfuHybrid { .. } | PaperPolicy::LruSizedHybrid { .. } | PaperPolicy::S3FifoGhostHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionHybrid { .. } | PaperPolicy::S3FifoHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveHybrid { .. } | PaperPolicy::TwoQFastAdmissionHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionHybrid { .. } | PaperPolicy::TwoQGhostHybrid { .. } | PaperPolicy::TwoQHybrid { .. } | PaperPolicy::TwoQCompactHybrid { .. })
 	}
 
 	pub fn is_auto(&self) -> bool {
@@ -96,6 +97,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::SThreeFifo(ratio) => write!(f, "s3-fifo-{ratio}"),
 			PaperPolicy::LruHybrid => write!(f, "lru-hybrid"),
 			PaperPolicy::LfuHybrid => write!(f, "lfu-hybrid"),
+			PaperPolicy::TwoQCompactHybrid(k_in) => write!(f, "2q-compact-hybrid-{k_in}"),
 			PaperPolicy::TwoQHybrid(k_in) => write!(f, "2q-hybrid-{k_in}"),
 			PaperPolicy::TwoQFastAdmissionHybrid(k_in) => write!(f, "2q-fast-admission-hybrid-{k_in}"),
 			PaperPolicy::TwoQFastAdmissionReprieveHybrid(k_in) => write!(f, "2q-fast-admission-reprieve-hybrid-{k_in}"),
@@ -141,6 +143,7 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("2q-fast-admission-reprieve-hybrid-") => parse_two_q_fast_admission_reprieve_hybrid(value)?,
 			value if value.starts_with("2q-fast-admission-hybrid-") => parse_two_q_fast_admission_hybrid(value)?,
 			value if value.starts_with("2q-ghost-hybrid-") => parse_two_q_ghost_hybrid(value)?,
+			value if value.starts_with("2q-compact-hybrid-") => parse_two_q_compact_hybrid(value)?,
 			value if value.starts_with("2q-hybrid-") => parse_two_q_hybrid(value)?,
 			value if value.starts_with("2q-") => parse_two_q(value)?,
 			"arc" => PaperPolicy::Arc,
@@ -253,6 +256,27 @@ fn parse_lru_lfu_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
 	}
 
 	Ok(PaperPolicy::LruLfuHybrid(promote_k))
+}
+
+fn parse_two_q_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "2q-compact-hybrid-"
+	let tokens = value[18..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(k_in) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&k_in) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::TwoQCompactHybrid(k_in))
 }
 
 fn parse_two_q_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {

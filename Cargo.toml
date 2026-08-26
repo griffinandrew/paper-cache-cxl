@@ -164,6 +164,7 @@ lfu_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # dependency reasoning as the other two hybrids: only needs `key_value_pmem`,
 # not `key_pmem_value_pmem`.
 #
+two_q_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 two_q_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Two-tier segmented-2Q hybrid cache with the one-access FIFO queue in the

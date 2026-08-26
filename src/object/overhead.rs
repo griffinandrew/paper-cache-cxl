@@ -179,6 +179,7 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// three separate maps) — 24 bytes for the entry, 1 byte for the
 		// Queue tag, 1 byte for the Option<Tier> tag (only meaningful for
 		// keys currently in Main), 4 bytes for the object size
+		PaperPolicy::TwoQCompactHybrid(_) => 16 + 24,
 		PaperPolicy::TwoQHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
 
 		// Structurally identical to TwoQHybrid: `TwoQFastAdmissionHybridStack`
@@ -627,6 +628,25 @@ pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
 const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
+
+/// Per-object DRAM cost of `TwoQCompactHybridStack`'s eviction stack.
+///
+/// MEASURED: jemalloc `stats.allocated`, one point per process at 2^20..2^23
+/// objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// 72 B against `TwoQHybridStack`'s 112 -- a 35.7% reduction. `TwoQHybridStack`
+/// keeps THREE indexes for a population where every key is in exactly one of
+/// its two queues: a FIFO `HashList` and an LRU `HashList`, each owning its own
+/// key-to-node map, plus the separate `entries` map. This keeps one.
+///
+/// 8 B above `LruCompactHybridStack`'s 64, and that gap is the layout choice
+/// rather than the policy: this stack carries the payload in the index value
+/// (layout B) where the LRU list carries it in the slab slot (layout A). The
+/// standalone comparison measured layout B at +8.01 B/object, so the two
+/// results agree to within a byte. B is right here because `mark_accessed` and
+/// the queue-dispatch read in `touch` are hot AND touch no queue order.
+#[cfg(feature = "hybrid_cache_common")]
+const TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `TwoQHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -1348,6 +1368,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			PaperPolicy::LruSizedHybrid => LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruLfuHybrid(..) => LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::FifoHybrid => FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::TwoQCompactHybrid(..) => TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQHybrid(..) => TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQFastAdmissionHybrid(..) => TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQFastAdmissionReprieveHybrid(..) => TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
