@@ -28,11 +28,44 @@ use crate::worker::policy::policy_stack::init_policy_stack;
 use crate::PaperPolicy;
 use core::str::FromStr;
 
-/// Resident set size in bytes, from field 2 of `/proc/self/statm` (pages).
-fn rss_bytes() -> u64 {
-	let s = std::fs::read_to_string("/proc/self/statm").expect("/proc/self/statm");
-	let pages: u64 = s.split_whitespace().nth(1).unwrap().parse().unwrap();
-	pages * 4096
+/// Bytes jemalloc has handed to the application, from `stats.allocated`.
+///
+/// This is the ALLOCATED figure, not the resident one: size-class-rounded
+/// usable bytes, the same quantity `malloc_usable_size` returns and therefore
+/// the same quantity Redis reports as `used_memory`. Retained-but-freed pages
+/// are excluded -- they belong in a fragmentation ratio, not in a per-object
+/// cost. An earlier version of this measurement read RSS instead, which
+/// conflated the two and inflated every constant by the growth slack of every
+/// doubling structure.
+///
+/// The `epoch` write is required: jemalloc caches these statistics per epoch,
+/// and a read without advancing it returns whatever the previous read saw.
+fn allocated_bytes() -> u64 {
+	unsafe {
+		let mut e: u64 = 1;
+		let mut elen = core::mem::size_of::<u64>();
+		tikv_jemalloc_sys::mallctl(
+			c"epoch".as_ptr(),
+			&mut e as *mut u64 as *mut core::ffi::c_void,
+			&mut elen as *mut usize,
+			&mut e as *mut u64 as *mut core::ffi::c_void,
+			core::mem::size_of::<u64>(),
+		);
+		let mut allocated: usize = 0;
+		let mut len = core::mem::size_of::<usize>();
+		let rc = tikv_jemalloc_sys::mallctl(
+			c"stats.allocated".as_ptr(),
+			&mut allocated as *mut usize as *mut core::ffi::c_void,
+			&mut len as *mut usize,
+			core::ptr::null_mut(),
+			0,
+		);
+		assert_eq!(
+			rc, 0,
+			"stats.allocated unavailable -- tikv-jemalloc-sys needs features = [\"stats\"]"
+		);
+		allocated as u64
+	}
 }
 
 /// One measurement, one process.
@@ -70,14 +103,14 @@ fn measure_one_point() {
 	// literally the policy the sweep runs -- including its parameters.
 	let policy: PaperPolicy = want.parse().expect("policy string");
 
-	let base = rss_bytes();
+	let base = allocated_bytes();
 	let mut stack = init_policy_stack(policy, u64::MAX / 4);
 	for i in 0..n {
 		// sizes vary across a range: the LFU family keys its buckets on
 		// frequency, and an all-identical input collapses the bucket map
 		stack.insert(i.wrapping_mul(0x9E37_79B9_7F4A_7C15), 64 + (i % 512) as u32);
 	}
-	let after = rss_bytes();
+	let after = allocated_bytes();
 	core::hint::black_box(&stack);
 	println!("MEASURED {} {} {}", want, n, after.saturating_sub(base));
 }

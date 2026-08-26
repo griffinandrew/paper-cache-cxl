@@ -29,7 +29,15 @@ libc = "0.2.177"
 # Direct dependency so `numa_jemalloc` actually links libjemalloc: the
 # `_rjem_*` symbols its arenas call come from this crate's build script, and
 # reaching it only transitively leaves them undefined at link time.
-tikv-jemalloc-sys = "0.6.1"
+# `stats` builds jemalloc with --enable-stats, which exposes
+# `stats.allocated` (bytes handed to the application, size-class rounded --
+# the same quantity `malloc_usable_size` returns and therefore the same
+# quantity Redis reports as `used_memory`) and `stats.resident`. Those two
+# replace the fitted residency multiplier this crate used to apply: memory
+# accounting is now a measurement plus a separately reported fragmentation
+# ratio, which is how Redis and memcached report it, rather than an
+# allocated figure scaled by a constant nobody can check.
+tikv-jemalloc-sys = { version = "0.6.1", features = ["stats"] }
 hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"
 sysinfo = "=0.33"

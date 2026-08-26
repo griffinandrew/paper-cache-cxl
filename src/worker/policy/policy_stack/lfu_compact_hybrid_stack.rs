@@ -98,6 +98,18 @@ impl LfuCompactHybridStack {
 
 	pub fn with_shared_overhead(mut self, overhead: CacheSize) -> Self {
 		self.shared_overhead = overhead;
+
+		// The DRAM budget bounds how many objects can ever be tracked: every
+		// object costs `overhead` bytes of fast-tier metadata whichever tier its
+		// value sits in, so `fast_capacity / overhead` is a hard ceiling on the
+		// entry count, not a guess. Reserving it up front means the slab never
+		// reallocates and never pays the copy; untouched pages are not resident,
+		// so an over-estimate costs address space rather than memory.
+		if overhead > 0 {
+			let ceiling = (self.fast_capacity / overhead) as usize;
+			self.chain.reserve(ceiling);
+		}
+
 		self
 	}
 
@@ -317,11 +329,21 @@ impl PolicyStack for LfuCompactHybridStack {
 	}
 
 	fn resize_fast_tier(&mut self, size: CacheSize) {
-		self.fast_capacity = size;
+		// Faithful to `LfuHybridStack::resize_fast_tier`, INCLUDING the guard.
+		// Growing the budget is a deliberate decision to make more capacity
+		// available, and the fresh room should be usable by new admissions
+		// rather than gated behind promotions, so a grow unlatches. A shrink
+		// (or a no-op resize) leaves the latch alone -- `settle_fast_tier`
+		// re-latches naturally if the shrink forces a demotion.
+		//
+		// This method previously unlatched unconditionally, which reopened
+		// admission on a SHRINK -- exactly when capacity had been taken away.
+		// No fidelity test caught it because none of them resized.
+		if size > self.fast_capacity {
+			self.fast_tier_latched = false;
+		}
 
-		// Growing the budget reopens admission: the latch records that capacity
-		// was once reached, and it no longer has been.
-		self.fast_tier_latched = false;
+		self.fast_capacity = size;
 		self.settle_fast_tier();
 	}
 
@@ -612,6 +634,66 @@ mod fidelity_tests {
 		// baseline's reservation and the difference disappears entirely
 		let (ma2, mb2, _, _) = replay_with(131_072, 271, 271, &ops);
 		assert_eq!(promos(&ma2), promos(&mb2));
+	}
+
+	/// Resizing must match too, in BOTH directions.
+	///
+	/// This caught a real divergence: this stack unlatched admission on ANY
+	/// resize, where the baseline unlatches only on a grow, so a shrink or a
+	/// no-op resize reopened admission here and not there.
+	///
+	/// The shape of this test is load-bearing and a first version of it had NONE
+	/// of it, so it passed with the bug present. The latch governs BRAND-NEW key
+	/// admission only, so the divergence is invisible unless new keys arrive
+	/// AFTER the resize -- and the shared skewed workload draws from a fixed 200
+	/// keys, all of which exist well before the midpoint. A shrink also re-latches
+	/// on its own, because the demotions it forces set the latch again; the
+	/// no-op resize is the case that actually separates the two.
+	#[test]
+	fn resizes_like_lfu_hybrid() {
+		for (start_cap, resized) in [(65_536u64, 65_536u64), (131_072, 32_768), (32_768, 131_072)] {
+			let mut a = LfuHybridStack::new(start_cap).with_shared_overhead(190);
+			let mut b = LfuCompactHybridStack::new(start_cap).with_shared_overhead(190);
+			let (mut ma, mut mb) = (Vec::new(), Vec::new());
+
+			let mut step = |a: &mut LfuHybridStack, b: &mut LfuCompactHybridStack,
+			                ma: &mut Vec<(HashedKey, Tier)>, mb: &mut Vec<(HashedKey, Tier)>,
+			                k: HashedKey, size: ObjectSize| {
+				if a.contains(k) { a.update(k); } else { a.insert(k, size); }
+				if b.contains(k) { b.update(k); } else { b.insert(k, size); }
+				ma.extend(a.drain_tier_migrations());
+				mb.extend(b.drain_tier_migrations());
+			};
+
+			// Phase 1: fill and churn until the fast tier latches.
+			for i in 0..4_000u64 {
+				step(&mut a, &mut b, &mut ma, &mut mb, (i % 200) + 1, 1024);
+			}
+			assert!(a.admission_latched(), "baseline should be latched before the resize");
+
+			a.resize_fast_tier(resized);
+			b.resize_fast_tier(resized);
+			assert_eq!(
+				a.admission_latched(),
+				b.admission_latched(),
+				"admission latch diverges immediately after {start_cap} -> {resized}"
+			);
+
+			// Phase 2: BRAND-NEW keys, which is the only traffic the latch governs.
+			for i in 0..2_000u64 {
+				step(&mut a, &mut b, &mut ma, &mut mb, 10_000 + i, 1024);
+			}
+
+			assert_eq!(ma, mb, "migrations diverge resizing {start_cap} -> {resized}");
+			for k in 0..2_000u64 {
+				assert_eq!(
+					a.tier_of(10_000 + k),
+					b.chain.get(10_000 + k).map(|e| e.tier),
+					"tier of new key {} diverges resizing {start_cap} -> {resized}",
+					10_000 + k
+				);
+			}
+		}
 	}
 
 	/// Shared skewed workload: 200 keys biased toward low ids, enough pressure

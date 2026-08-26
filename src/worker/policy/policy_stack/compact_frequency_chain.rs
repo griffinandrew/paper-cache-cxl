@@ -121,6 +121,22 @@ impl Default for CompactFrequencyChain {
 }
 
 impl CompactFrequencyChain {
+	/// Pre-sizes the slab and index for `objects` entries.
+	///
+	/// The slab is a `Vec`, so growth is never in place: every doubling
+	/// reallocates and COPIES every entry. At eval-trace scale that is one
+	/// multi-hundred-millisecond stall on the policy worker -- measured at
+	/// 827 ms -- and it would never have surfaced as a regression, because the
+	/// policy stack runs behind an unbounded channel on its own thread and the
+	/// client latency columns structurally cannot observe it.
+	///
+	/// Reserving costs no resident memory: the pages are not touched until
+	/// entries occupy them.
+	pub fn reserve(&mut self, objects: usize) {
+		self.slots.reserve(objects);
+		self.index.reserve(objects);
+	}
+
 	pub fn len(&self) -> usize { self.fast_len + self.slow_len }
 	pub fn is_empty(&self) -> bool { self.len() == 0 }
 	pub fn fast_len(&self) -> usize { self.fast_len }
