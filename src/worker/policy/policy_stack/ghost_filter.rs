@@ -53,6 +53,28 @@
 
 use crate::{CacheSize, HashedKey};
 
+// The ghost table follows the eviction stacks: under `eviction_stacks_pmem` it
+// is allocated through the crate-wide `Hybrid` allocator on the far
+// (CXL/PMEM) node. Without this it stayed in DRAM while
+// `GHOST_ENTRY_DRAM_OVERHEAD` was gated to 0 on the premise it had moved --
+// physically resident in DRAM and charged nothing.
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type SlotVec = Vec<GhostSlot>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type SlotVec = Vec<GhostSlot, crate::Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+fn new_slots(capacity: usize) -> SlotVec {
+	vec![GhostSlot::default(); capacity]
+}
+
+#[cfg(feature = "eviction_stacks_pmem")]
+fn new_slots(capacity: usize) -> SlotVec {
+	let mut v = Vec::with_capacity_in(capacity, crate::Hybrid);
+	v.resize(capacity, GhostSlot::default());
+	v
+}
+
 /// One ghost slot: a fingerprint and the insertion counter value at which the
 /// key entered the ghost. Eight bytes, no allocation, no pointers.
 #[derive(Clone, Copy, Default)]
@@ -69,7 +91,7 @@ struct GhostSlot {
 }
 
 pub struct GhostFilter {
-	slots: Vec<GhostSlot>,
+	slots: SlotVec,
 
 	/// `slots.len() - 1`; `slots.len()` is always a power of two.
 	mask: usize,
@@ -108,7 +130,7 @@ impl GhostFilter {
 		let n = hint.max(1024).next_power_of_two();
 
 		GhostFilter {
-			slots: vec![GhostSlot::default(); n],
+			slots: new_slots(n),
 			mask: n - 1,
 			inserted: 0,
 			window: n as u32,
@@ -203,7 +225,14 @@ impl GhostFilter {
 	/// run away the way the `HashList` did.
 	#[inline]
 	pub fn dram_bytes(&self) -> CacheSize {
-		(self.len() * core::mem::size_of::<GhostSlot>()) as CacheSize
+		// Charges `GHOST_ENTRY_DRAM_OVERHEAD`, not `size_of::<GhostSlot>()`. The
+		// two differ under `eviction_stacks_pmem`: the constant becomes 0 because
+		// the table is no longer in DRAM, while the struct is still 8 bytes wide.
+		// This previously hardcoded the width, so a PMEM build charged the fast
+		// tier for a table that was not in it -- the opposite of the placement
+		// bug fixed above, and in the same function.
+		(self.len() as CacheSize)
+			* (crate::object::overhead::GHOST_ENTRY_DRAM_OVERHEAD as CacheSize)
 	}
 }
 

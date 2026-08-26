@@ -232,14 +232,13 @@ pub struct TwoQGhostHybridStack {
 
 impl TwoQGhostHybridStack {
 	#[cfg(not(feature = "eviction_stacks_pmem"))]
-	fn new_collections() -> (QueueList, QueueList, QueueList, EntryMap) {
-		(HashList::default(), HashList::default(), HashList::default(), HashMap::default())
+	fn new_collections() -> (QueueList, QueueList, EntryMap) {
+		(HashList::default(), HashList::default(), HashMap::default())
 	}
 
 	#[cfg(feature = "eviction_stacks_pmem")]
-	fn new_collections() -> (QueueList, QueueList, QueueList, EntryMap) {
+	fn new_collections() -> (QueueList, QueueList, EntryMap) {
 		(
-			PmemHashList::with_hasher(NoHasher::default()),
 			PmemHashList::with_hasher(NoHasher::default()),
 			PmemHashList::with_hasher(NoHasher::default()),
 			HashMap::with_hasher_in(NoHasher::default(), Hybrid),
@@ -247,7 +246,7 @@ impl TwoQGhostHybridStack {
 	}
 
 	pub fn new(k_in: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
-		let (fifo_queue, main_stack, _unused_ghost, entries) = Self::new_collections();
+		let (fifo_queue, main_stack, entries) = Self::new_collections();
 		// Sized from the cache's own capacity, assuming a 512-byte nominal
 		// object and capped at 8 Mi slots (64 MB). Under-sizing only makes
 		// slot collisions more frequent, and a collision forgets a ghost
