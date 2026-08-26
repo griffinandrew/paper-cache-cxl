@@ -30,6 +30,7 @@ pub(crate) mod ghost_filter;
 /// the remaining copies are few.
 pub(crate) const MAX_PREALLOC_ENTRIES: usize = 1 << 22;
 
+pub(crate) mod compact_queue_set;
 pub(crate) mod compact_recency_list;
 pub(crate) mod compact_frequency_chain;
 #[cfg(test)]
