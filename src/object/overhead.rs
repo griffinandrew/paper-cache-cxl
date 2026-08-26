@@ -427,6 +427,14 @@ const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// [`HASHTABLE_ENTRY_OVERHEAD`]. The owning stacks multiply it by
 /// `ghost.len()` inside their own `reserved_overhead`.
 ///
+/// **8 bytes**, not 44: the ghost is a `GhostFilter` — a 4-byte fingerprint
+/// plus a 4-byte insertion timestamp, per S3-FIFO's own description of G as
+/// "part of the indexing structure". It was a `HashList<HashedKey>`, whose
+/// heap `Entry { key, prev, next }` (24) plus index slot (20) cost 44 bytes to
+/// hold an 8-byte key, and whose capacity bound was unreachable from the path
+/// that populated it: on a no-reuse trace the ghost grew without limit, to
+/// 1.94 GB — 45% of a 4 GiB fast tier — on Twitter cluster38.
+///
 /// Gated on `eviction_stacks_pmem` **only** (never `global_hashtable_pmem`,
 /// per the no-hashtable-slot point above): when that feature moves the
 /// eviction stacks — ghost list included — to PMEM, the ghost costs the
@@ -437,7 +445,7 @@ const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// unconditionally (see `worker::policy::policy_stack`), so they compile —
 /// and reference this — under every feature combination, including none.
 #[cfg(not(feature = "eviction_stacks_pmem"))]
-pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 44;
+pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 8;
 
 /// PMEM-resident ghost list: costs the fast/DRAM tier nothing. See the
 /// `not(eviction_stacks_pmem)` arm above for the derivation and rationale.
@@ -544,11 +552,13 @@ const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize 
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// Excludes the bare-key ghost queue, which is charged separately via
-/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`: its length is
-/// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
-/// eviction, while one-access-queue evictions are what grow it), so it is
-/// not expressible as a per-tracked-key term.
+/// Excludes the ghost queue, which is charged separately via
+/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`. That is now an
+/// 8-byte fingerprint + timestamp bounded by its insertion window, not a
+/// 44-byte `HashList` node bounded only by a `trim_ghost` the populating
+/// path never called -- which is how a ghost reached 1.94 GB, 45% of a
+/// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
+/// ghost entries outlive the tracked keys they came from.
 const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoHybridStack`'s eviction-stack bookkeeping.
@@ -584,11 +594,13 @@ const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// Excludes the bare-key ghost queue, which is charged separately via
-/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`: its length is
-/// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
-/// eviction, while one-access-queue evictions are what grow it), so it is
-/// not expressible as a per-tracked-key term.
+/// Excludes the ghost queue, which is charged separately via
+/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`. That is now an
+/// 8-byte fingerprint + timestamp bounded by its insertion window, not a
+/// 44-byte `HashList` node bounded only by a `trim_ghost` the populating
+/// path never called -- which is how a ghost reached 1.94 GB, 45% of a
+/// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
+/// ghost entries outlive the tracked keys they came from.
 const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionHybridStack`'s eviction-stack bookkeeping.
@@ -607,11 +619,13 @@ const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// Excludes the bare-key ghost queue, which is charged separately via
-/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`: its length is
-/// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
-/// eviction, while one-access-queue evictions are what grow it), so it is
-/// not expressible as a per-tracked-key term.
+/// Excludes the ghost queue, which is charged separately via
+/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`. That is now an
+/// 8-byte fingerprint + timestamp bounded by its insertion window, not a
+/// 44-byte `HashList` node bounded only by a `trim_ghost` the populating
+/// path never called -- which is how a ghost reached 1.94 GB, 45% of a
+/// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
+/// ghost entries outlive the tracked keys they came from.
 const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionHybridStack`'s eviction-stack bookkeeping.
@@ -630,11 +644,13 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSiz
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// Excludes the bare-key ghost queue, which is charged separately via
-/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`: its length is
-/// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
-/// eviction, while one-access-queue evictions are what grow it), so it is
-/// not expressible as a per-tracked-key term.
+/// Excludes the ghost queue, which is charged separately via
+/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`. That is now an
+/// 8-byte fingerprint + timestamp bounded by its insertion window, not a
+/// 44-byte `HashList` node bounded only by a `trim_ghost` the populating
+/// path never called -- which is how a ghost reached 1.94 GB, 45% of a
+/// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
+/// ghost entries outlive the tracked keys they came from.
 const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack`'s eviction-stack bookkeeping.
@@ -653,11 +669,13 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVER
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// Excludes the bare-key ghost queue, which is charged separately via
-/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`: its length is
-/// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
-/// eviction, while one-access-queue evictions are what grow it), so it is
-/// not expressible as a per-tracked-key term.
+/// Excludes the ghost queue, which is charged separately via
+/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`. That is now an
+/// 8-byte fingerprint + timestamp bounded by its insertion window, not a
+/// 44-byte `HashList` node bounded only by a `trim_ghost` the populating
+/// path never called -- which is how a ghost reached 1.94 GB, 45% of a
+/// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
+/// ghost entries outlive the tracked keys they came from.
 const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionReprieveHybridStack`'s eviction-stack bookkeeping.

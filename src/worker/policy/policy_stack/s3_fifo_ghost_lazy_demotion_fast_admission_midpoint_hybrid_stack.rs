@@ -232,7 +232,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::{ObjectSize, overhead::GHOST_ENTRY_DRAM_OVERHEAD},
-	worker::policy::policy_stack::{PolicyStack, Tier, narrow_resident, watermarks},
+	worker::policy::policy_stack::{PolicyStack, Tier, ghost_filter::GhostFilter, narrow_resident, watermarks},
 };
 
 /// Which live queue a key currently belongs to.
@@ -291,7 +291,11 @@ type EntryMap = HashMap<HashedKey, S3FifoEntry, NoHasher, Hybrid>;
 pub struct S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack {
 	one_access_queue: QueueList,
 	main_queue: QueueList,
-	ghost: QueueList,
+	/// Paper-faithful ghost: fingerprints + insertion timestamps in a fixed
+	/// table, not a `HashList`. 8 B/slot against 44, and it cannot grow past
+	/// its allocation -- the old cap was only reachable from the main-eviction
+	/// path, never from the one-access eviction that populates the ghost.
+	ghost: GhostFilter,
 
 	entries: EntryMap,
 
@@ -359,7 +363,15 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack {
 	}
 
 	pub fn new(one_access_ratio: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
-		let (one_access_queue, main_queue, ghost, entries) = Self::new_collections();
+		let (one_access_queue, main_queue, _unused_ghost, entries) = Self::new_collections();
+		// Sized from the cache's own capacity, assuming a 512-byte nominal
+		// object and capped at 8 Mi slots (64 MB). Under-sizing only makes
+		// slot collisions more frequent, and a collision forgets a ghost
+		// early -- which is exactly the reclamation the paper prescribes --
+		// so it degrades gracefully rather than breaking.
+		let ghost = GhostFilter::with_capacity(
+			((max_size / 512) as usize).min(8 << 20),
+		);
 
 		S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack {
 			one_access_queue,
@@ -421,7 +433,7 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack {
 	/// nothing is charged twice.
 	fn reserved_overhead(&self) -> CacheSize {
 		self.entries.len() as CacheSize * self.shared_overhead
-			+ self.ghost.len() as CacheSize * (GHOST_ENTRY_DRAM_OVERHEAD as CacheSize)
+			+ self.ghost.dram_bytes()
 	}
 
 	/// Splits [`Self::reserved_overhead`] between this stack's two
@@ -483,7 +495,7 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack {
 
 	/// Returns `true` if `key` currently has a ghost entry. Exposed for tests.
 	pub fn is_ghost(&self, key: HashedKey) -> bool {
-		self.ghost.contains(&key)
+		self.ghost.contains(key)
 	}
 
 	/// Returns `true` if `key` is the current midpoint cursor target.
@@ -784,7 +796,7 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack {
 		let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 
 		self.one_access_used = self.one_access_used.saturating_sub(size);
-		self.ghost.push_front(key);
+		self.ghost.insert(key);
 
 		Some(key)
 	}
@@ -804,9 +816,10 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack {
 	}
 
 	fn trim_ghost(&mut self) {
-		while self.ghost.len() > self.main_count {
-			self.ghost.pop_back();
-		}
+		// No trimming: |G| = |M| is enforced by the insertion-count window,
+		// so this only keeps that window tracking the main queue. Retained
+		// under its old name because the call sites' intent is unchanged.
+		self.ghost.set_window(self.main_count);
 	}
 }
 
@@ -835,7 +848,7 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack {
 			return;
 		}
 
-		if self.ghost.contains(&key) {
+		if self.ghost.contains(key) {
 			self.admit_via_ghost_hit(key, size, dram_resident);
 			return;
 		}
@@ -856,7 +869,7 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack {
 	}
 
 	fn remove(&mut self, key: HashedKey) {
-		self.ghost.remove(&key);
+		self.ghost.remove(key);
 
 		let Some(entry) = self.entries.remove(&key) else { return };
 		let size = entry.migrating();

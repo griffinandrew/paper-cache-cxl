@@ -128,7 +128,7 @@ use crate::{
 	NoHasher,
 	policy::PaperPolicy,
 	object::{ObjectSize, overhead::GHOST_ENTRY_DRAM_OVERHEAD},
-	worker::policy::policy_stack::{PolicyStack, Tier, narrow_resident, watermarks},
+	worker::policy::policy_stack::{PolicyStack, Tier, ghost_filter::GhostFilter, narrow_resident, watermarks},
 };
 
 /// Which live queue a key currently belongs to.
@@ -186,7 +186,11 @@ type EntryMap = HashMap<HashedKey, TwoQEntry, NoHasher, Hybrid>;
 pub struct TwoQGhostHybridStack {
 	fifo_queue: QueueList,
 	main_stack: QueueList,
-	ghost: QueueList,
+	/// Paper-faithful ghost: fingerprints + insertion timestamps in a fixed
+	/// table, not a `HashList`. 8 B/slot against 44, and it cannot grow past
+	/// its allocation -- the old cap was only reachable from the main-eviction
+	/// path, never from the one-access eviction that populates the ghost.
+	ghost: GhostFilter,
 
 	entries: EntryMap,
 
@@ -243,7 +247,15 @@ impl TwoQGhostHybridStack {
 	}
 
 	pub fn new(k_in: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
-		let (fifo_queue, main_stack, ghost, entries) = Self::new_collections();
+		let (fifo_queue, main_stack, _unused_ghost, entries) = Self::new_collections();
+		// Sized from the cache's own capacity, assuming a 512-byte nominal
+		// object and capped at 8 Mi slots (64 MB). Under-sizing only makes
+		// slot collisions more frequent, and a collision forgets a ghost
+		// early -- which is exactly the reclamation the paper prescribes --
+		// so it degrades gracefully rather than breaking.
+		let ghost = GhostFilter::with_capacity(
+			((max_size / 512) as usize).min(8 << 20),
+		);
 
 		TwoQGhostHybridStack {
 			fifo_queue,
@@ -309,7 +321,7 @@ impl TwoQGhostHybridStack {
 	/// did -- silently under-reserved for them.
 	fn reserved_overhead(&self) -> CacheSize {
 		self.entries.len() as CacheSize * self.shared_overhead
-			+ self.ghost.len() as CacheSize * (GHOST_ENTRY_DRAM_OVERHEAD as CacheSize)
+			+ self.ghost.dram_bytes()
 	}
 
 	/// `fast_capacity` minus [`Self::reserved_overhead`] -- the effective
@@ -332,7 +344,7 @@ impl TwoQGhostHybridStack {
 
 	/// Returns `true` if `key` currently has a ghost entry. Exposed for tests.
 	pub fn is_ghost(&self, key: HashedKey) -> bool {
-		self.ghost.contains(&key)
+		self.ghost.contains(key)
 	}
 
 	/// `new_resident` refreshes the entry's DRAM-resident remainder: a re-set
@@ -537,7 +549,7 @@ impl TwoQGhostHybridStack {
 		let size = self.entries.remove(&key).map(|entry| entry.migrating()).unwrap_or(0);
 
 		self.fifo_used = self.fifo_used.saturating_sub(size);
-		self.ghost.push_front(key);
+		self.ghost.insert(key);
 
 		Some(key)
 	}
@@ -549,9 +561,10 @@ impl TwoQGhostHybridStack {
 	/// len() > self.main.stack.len()` cap exactly, using `main_count` as
 	/// the size reference this stack already tracks.
 	fn trim_ghost(&mut self) {
-		while self.ghost.len() > self.main_count {
-			self.ghost.pop_back();
-		}
+		// No trimming: |G| = |M| is enforced by the insertion-count window,
+		// so this only keeps that window tracking the main queue. Retained
+		// under its old name because the call sites' intent is unchanged.
+		self.ghost.set_window(self.main_count);
 	}
 }
 
@@ -580,7 +593,7 @@ impl PolicyStack for TwoQGhostHybridStack {
 			return;
 		}
 
-		if self.ghost.contains(&key) {
+		if self.ghost.contains(key) {
 			self.admit_via_ghost_hit(key, size, dram_resident);
 			return;
 		}
@@ -604,7 +617,7 @@ impl PolicyStack for TwoQGhostHybridStack {
 		// legitimately does) would silently skip clearing a stale ghost
 		// entry for exactly that case. Mirrors `SThreeFifoStack::remove`,
 		// which also clears its ghost queue unconditionally.
-		self.ghost.remove(&key);
+		self.ghost.remove(key);
 
 		let Some(entry) = self.entries.remove(&key) else { return };
 		let size = entry.migrating();
@@ -1223,16 +1236,23 @@ mod tests {
 		assert_eq!(stack.tier_of(1), Some(Tier::Fast));
 		assert_eq!(stack.reserved_overhead(), 0);
 
-		// Ten keys admitted into `fifo_queue` and aged straight back out of it.
-		for key in 2..=11 {
+		// Enough ghost entries to reserve all but ~60 bytes of the budget,
+		// derived from GHOST_COST rather than hard-coded. The ghost's
+		// representation changed from a 44-byte `HashList` node to an 8-byte
+		// fingerprint+timestamp, and a literal 10 silently stopped applying
+		// any pressure -- the test passed for years, then tested nothing.
+		const GHOST_KEYS: HashedKey = ((CAPACITY - 60) / GHOST_COST) as HashedKey;
+
+		// Admitted into `fifo_queue` and aged straight back out of it.
+		for key in 2..=(1 + GHOST_KEYS) {
 			stack.insert(key, 10);
 			assert_eq!(stack.evict_one(), Some(key));
 		}
 
 		assert_eq!(stack.len(), 1);
-		assert_eq!(stack.reserved_overhead(), 10 * GHOST_COST);
+		assert_eq!(stack.reserved_overhead(), GHOST_KEYS as CacheSize * GHOST_COST);
 
-		// 500 - 440 = 60 bytes of effective budget left for 100 bytes of
+		// CAPACITY - GHOST_KEYS*GHOST_COST = ~60 bytes of effective budget left for 100 bytes of
 		// fast-tier value. `high_bytes(e) <= e` for any configured ratio, so
 		// this is over the trigger whatever the watermarks are set to.
 		let effective = stack.effective_fast_capacity();
@@ -1254,8 +1274,8 @@ mod tests {
 
 	/// A ghost backlog on its own -- with only a single tracked key, charged a
 	/// single byte -- is enough DRAM to push the fast tier past its reserved
-	/// budget. `trim_ghost` runs only on a *main-queue* eviction, so a run of
-	/// `fifo_queue` evictions grows `ghost` unopposed.
+	/// budget. The ghost is bounded by its insertion window rather than by a
+	/// trim, but within that window it still reserves real DRAM.
 	///
 	/// Behavioural, so it is scoped to the DRAM-resident configuration: under
 	/// `eviction_stacks_pmem` the ghost list costs the fast tier nothing and
@@ -1273,23 +1293,30 @@ mod tests {
 		assert_eq!(drain(&mut stack), vec![(1, Tier::Fast)]);
 		assert_eq!(stack.tier_of(1), Some(Tier::Fast));
 
-		// Ten keys admitted into `fifo_queue` and aged straight back out of it.
-		for key in 2..=11 {
+		// Enough ghost entries to reserve all but ~60 bytes of the budget,
+		// derived from GHOST_COST rather than hard-coded. The ghost's
+		// representation changed from a 44-byte `HashList` node to an 8-byte
+		// fingerprint+timestamp, and a literal 10 silently stopped applying
+		// any pressure -- the test passed for years, then tested nothing.
+		const GHOST_KEYS: HashedKey = ((CAPACITY - 60) / GHOST_COST) as HashedKey;
+
+		// Admitted into `fifo_queue` and aged straight back out of it.
+		for key in 2..=(1 + GHOST_KEYS) {
 			stack.insert(key, 10);
 			assert_eq!(stack.evict_one(), Some(key));
 		}
 
 		assert_eq!(stack.len(), 1);
-		assert_eq!(stack.reserved_overhead(), 1 + 10 * GHOST_COST);
+		assert_eq!(stack.reserved_overhead(), 1 + GHOST_KEYS as CacheSize * GHOST_COST);
 
-		// 500 - (1 + 440) = 59 bytes of effective budget left for 100 bytes of
+		// CAPACITY - (1 + GHOST_KEYS*GHOST_COST) = ~59 bytes of effective budget left for 100 bytes of
 		// fast-tier value. `high_bytes(e) <= e` for any configured ratio, so
 		// this is over the trigger whatever the watermarks are set to.
 		let effective = stack.effective_fast_capacity();
 
 		assert!(
 			stack.fast_bytes_used() > watermarks::high_bytes(effective),
-			"a 10-entry ghost backlog should reserve the fast tier out from under key 1",
+			"a ghost backlog should reserve the fast tier out from under key 1",
 		);
 
 		// Growing `ghost` is not itself a fast-tier event, so nothing has
