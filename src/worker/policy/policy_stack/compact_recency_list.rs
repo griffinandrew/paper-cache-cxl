@@ -30,13 +30,56 @@
 //! design and would become measurably slower. Those stacks should carry the
 //! payload in the index value instead.
 
+#[cfg(not(feature = "eviction_stacks_pmem"))]
 use std::collections::HashMap;
+#[cfg(feature = "eviction_stacks_pmem")]
+use hashbrown::HashMap;
 
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{CacheSize, HashedKey, Tier},
 	NoHasher,
 };
+
+// Under `eviction_stacks_pmem` the whole structure is allocated through the
+// crate-wide `Hybrid` allocator, which binds to the far (CXL/PMEM) NUMA node.
+// The logic is identical either way -- only the backing memory moves.
+//
+// A slab is a better shape for this than the design it replaces: `HashList`
+// puts every node in its own small allocation, so relocating it scatters
+// thousands of individual objects across the far node, whereas the slab is ONE
+// contiguous region. `get_hybrid_dram_shared_overhead` already drops the
+// eviction-stack term to zero under this feature, on the premise the stack is
+// not in DRAM -- so a compact stack WITHOUT these gates would sit in DRAM and
+// be charged nothing, which is silently wrong rather than merely unoptimised.
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type SlotVec = Vec<RecencySlot>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type SlotVec = Vec<RecencySlot, crate::Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type FreeVec = Vec<u32>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type FreeVec = Vec<u32, crate::Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type SlotIndex = HashMap<HashedKey, u32, NoHasher>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type SlotIndex = HashMap<HashedKey, u32, NoHasher, crate::Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+fn new_collections() -> (SlotVec, SlotIndex, FreeVec) {
+	(Vec::new(), HashMap::default(), Vec::new())
+}
+
+#[cfg(feature = "eviction_stacks_pmem")]
+fn new_collections() -> (SlotVec, SlotIndex, FreeVec) {
+	(
+		Vec::new_in(crate::Hybrid),
+		HashMap::with_hasher_in(NoHasher::default(), crate::Hybrid),
+		Vec::new_in(crate::Hybrid),
+	)
+}
 
 /// Sentinel for "no slot". `u32::MAX` rather than `Option<u32>` so a slot stays
 /// 16 bytes: an `Option<u32>` would take 8 with padding and add 8 per entry
@@ -75,9 +118,9 @@ impl RecencySlot {
 
 /// Doubly-linked recency order over a slab, MRU at `head`.
 pub struct CompactRecencyList {
-	slots: Vec<RecencySlot>,
-	index: HashMap<HashedKey, u32, NoHasher>,
-	free: Vec<u32>,
+	slots: SlotVec,
+	index: SlotIndex,
+	free: FreeVec,
 	head: u32,
 	tail: u32,
 	len: usize,
@@ -85,10 +128,11 @@ pub struct CompactRecencyList {
 
 impl Default for CompactRecencyList {
 	fn default() -> Self {
+		let (slots, index, free) = new_collections();
 		CompactRecencyList {
-			slots: Vec::new(),
-			index: HashMap::default(),
-			free: Vec::new(),
+			slots,
+			index,
+			free,
 			head: NIL,
 			tail: NIL,
 			len: 0,

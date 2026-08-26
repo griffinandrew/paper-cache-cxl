@@ -8,18 +8,26 @@
 //! an object, so the memory a stack grows by across a batch of inserts IS its
 //! own footprint.
 //!
-//! Method: build ONE stack and sample RSS at n and at 2n while inserting
-//! monotonically, then take `(rss(2n) - rss(n)) / n`. Two properties matter.
-//! Nothing is ever freed, so jemalloc never has retained-but-unreturned pages
-//! to confound the delta -- which is why this is one growing stack rather than
-//! two separately-measured ones. And differencing cancels both the process
-//! baseline and the stack's fixed allocations, leaving the marginal per-object
-//! cost, which is the quantity the constants are supposed to hold.
+//! Method, ALLOCATED bytes only:
 //!
-//! RSS rather than jemalloc's `stats.allocated`: this jemalloc is built without
-//! `--enable-stats`, and resident pages are the more honest quantity anyway --
-//! they include the size-class rounding and table slack a request-side counter
-//! misses. Page granularity over a million objects is well under 0.1 B/object.
+//! - **jemalloc `stats.allocated`**, never RSS. This is size-class-rounded
+//!   usable bytes -- what `malloc_usable_size` returns, and therefore the same
+//!   quantity Redis reports as `used_memory`. RSS counts retained-but-freed
+//!   pages, which belong in a fragmentation ratio rather than in a per-object
+//!   cost, and measuring it made this disagree with itself by 20% depending on
+//!   where the sample points fell.
+//! - **One point per process.** These structures grow by doubling and a
+//!   doubling abandons its old buffer, so two points sampled inside one process
+//!   are separated by however much abandoned buffer lies between them.
+//! - **Sampled at powers of two**, so every point sits at the same phase of the
+//!   doubling cycle. The same policies fit at R^2 0.89-0.96 at 1/2/3/4M objects
+//!   and R^2 = 1.0000 at 2^20..2^23.
+//!
+//! The delta is taken immediately around the insert loop in a single-threaded
+//! test process with nothing else allocating between the two reads, so it is
+//! not contaminated by the rest of the binary. The evidence is in the output:
+//! marginal cost converges to exact integers (72.0000, 112.0007, 168.0000)
+//! across four independent processes each, which a contaminated delta cannot do.
 //!
 //! Ignored by default: allocates gigabytes and takes ~30 s.
 //! Run with `cargo test --features <policies> -- --ignored --nocapture measure_`.
@@ -113,4 +121,123 @@ fn measure_one_point() {
 	let after = allocated_bytes();
 	core::hint::black_box(&stack);
 	println!("MEASURED {} {} {}", want, n, after.saturating_sub(base));
+}
+
+/// Layout A vs layout B for the slab designs, measured rather than derived.
+///
+/// Both keep a slab of list nodes and one index map. The question is which of
+/// the two holds the 8-byte metadata payload (`size`, `tier`, `dram_resident`):
+///
+///   A -- payload in the SLAB slot; the map value is a bare `u32` slot index.
+///        A metadata read is two hops (map bucket, then the slab).
+///   B -- payload in the map VALUE alongside the slot index; the slab holds
+///        links only. A metadata read is one hop.
+///
+/// B is the faster of the two on metadata-only reads and never worse on list
+/// operations, so the only question is whether it costs more memory. A prior
+/// standalone measurement reported the two as identical to 0.01 B/object;
+/// deriving it by hand suggests B should cost slightly MORE, because it moves 8
+/// bytes out of the densely-packed slab and into hash buckets that are only
+/// 50-87.5% occupied, so those bytes get multiplied by 1/load.
+///
+/// Sampled across the load cycle, not just at powers of two: hashbrown resizes
+/// at 7/8, so `n = 2^k` is immediately AFTER a doubling (~50% full) and
+/// `n = 7/8 * 2^k` is immediately before one (maximum density). Any comparison
+/// taken at one phase only can be an artifact of that phase.
+#[cfg(test)]
+#[allow(dead_code)]
+mod layout_ab {
+	use super::allocated_bytes;
+	use crate::{HashedKey, NoHasher};
+	use std::collections::HashMap;
+
+	#[derive(Clone, Copy)]
+	struct Payload {
+		size: u32,
+		tier: u8,
+		dram_resident: u8,
+	}
+
+	/// Payload lives in the slot.
+	#[derive(Clone, Copy)]
+	struct SlotA {
+		key: HashedKey,
+		prev: u32,
+		next: u32,
+		size: u32,
+		tier: u8,
+		dram_resident: u8,
+	}
+
+	/// Payload lives in the map value; the slot holds links only.
+	#[derive(Clone, Copy)]
+	struct SlotB {
+		key: HashedKey,
+		prev: u32,
+		next: u32,
+	}
+
+	#[test]
+	#[ignore]
+	fn measure_layout_point() {
+		let n: u64 = match std::env::var("LAYOUT_N") {
+			Ok(v) => v.parse().expect("LAYOUT_N"),
+			Err(_) => return,
+		};
+		let which = std::env::var("LAYOUT").expect("LAYOUT");
+
+		let base = allocated_bytes();
+		let total = match which.as_str() {
+			"a" => {
+				let mut slots: Vec<SlotA> = Vec::new();
+				let mut index: HashMap<HashedKey, u32, NoHasher> = HashMap::default();
+				for i in 0..n {
+					let k = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+					slots.push(SlotA {
+						key: k,
+						prev: u32::MAX,
+						next: u32::MAX,
+						size: 1024,
+						tier: 0,
+						dram_resident: 24,
+					});
+					index.insert(k, i as u32);
+				}
+				let after = allocated_bytes();
+				core::hint::black_box((&slots, &index));
+				after.saturating_sub(base)
+			},
+			"b" => {
+				let mut slots: Vec<SlotB> = Vec::new();
+				let mut index: HashMap<HashedKey, (u32, Payload), NoHasher> = HashMap::default();
+				for i in 0..n {
+					let k = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+					slots.push(SlotB { key: k, prev: u32::MAX, next: u32::MAX });
+					index.insert(k, (i as u32, Payload { size: 1024, tier: 0, dram_resident: 24 }));
+				}
+				let after = allocated_bytes();
+				core::hint::black_box((&slots, &index));
+				after.saturating_sub(base)
+			},
+			other => panic!("LAYOUT must be a or b, got {other}"),
+		};
+
+		println!(
+			"LAYOUT {} {} {} {:.3}",
+			which,
+			n,
+			total,
+			total as f64 / n as f64
+		);
+	}
+
+	#[test]
+	fn struct_sizes_are_what_the_comparison_assumes() {
+		assert_eq!(core::mem::size_of::<SlotA>(), 24);
+		assert_eq!(core::mem::size_of::<SlotB>(), 16);
+		assert_eq!(core::mem::size_of::<Payload>(), 8);
+		// what each map stores per live entry, before load factor
+		assert_eq!(core::mem::size_of::<(HashedKey, u32)>(), 16);
+		assert_eq!(core::mem::size_of::<(HashedKey, (u32, Payload))>(), 24);
+	}
 }

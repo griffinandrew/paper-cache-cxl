@@ -377,17 +377,24 @@ pub const HASHTABLE_ENTRY_OVERHEAD: ObjectSize = 11;
 /// roughly canceled out there, but isn't a reliable basis to build on for a
 /// *different* budget with its own correctness requirements.
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Dedicated per-object DRAM cost of `LfuHybridStack`'s eviction-stack
 /// bookkeeping: this key's entry in its current chain's internal
@@ -407,17 +414,42 @@ const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 /// per-key would model the rare worst case (one key per frequency) as the
 /// typical one.
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 147;
+const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 168;
+
+/// Per-object DRAM cost of `LruCompactHybridStack`'s eviction stack.
+///
+/// MEASURED: jemalloc `stats.allocated`, one point per process at 2^20..2^23
+/// objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// 64 B against `LruHybridStack`'s 112 -- a 42.9% reduction, and below even the
+/// 72 B that NON-tiered all-DRAM LRU costs, because a 24-byte slab entry beats
+/// a `kwik::HashList` node that jemalloc rounds to the 32-byte size class. The
+/// saving is the elimination of the second index: a `HashList` carries its own
+/// key->node map AND a separate `entries` map holds the 8-byte payload, one row
+/// each per object.
+///
+/// Measured with `PAPER_DISABLE_SHARED_OVERHEAD=1` so the stack's own
+/// pre-reservation stays out of the figure; with it active the slab doubles out
+/// of the reservation partway through the range and the fit drops to R^2 0.84.
+#[cfg(feature = "hybrid_cache_common")]
+const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 64;
 
 /// Per-object DRAM cost of `LfuCompactHybridStack`'s eviction-stack
 /// bookkeeping.
@@ -433,35 +465,24 @@ const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 147;
 /// 47.4 B/key as an RSS delta over two million keys, against this model's
 /// 48. `FrequencyChain` measured 95.9 against its model of 93.
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// Per-object DRAM cost of `LruCompactHybridStack`'s eviction stack.
-///
-/// MEASURED, not derived: jemalloc `stats.allocated`, one point per process at
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
 /// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
 ///
-/// 64 B against `LruHybridStack`'s measured 112 -- a 42.9% reduction, and
-/// below even the 72 B that NON-tiered all-DRAM LRU costs, because a 24-byte
-/// slab entry beats a `kwik::HashList` node that jemalloc rounds to the 32-byte
-/// size class. The saving is the elimination of the second index: today a
-/// `HashList` carries its own key->node map AND a separate `entries` map holds
-/// the 8-byte payload, both one row per object.
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
 ///
-/// Measured with `PAPER_DISABLE_SHARED_OVERHEAD=1`, so the stack's own
-/// pre-reservation does not enter the figure. With the reservation active the
-/// slab doubles out of it partway through the sample range, which puts a step
-/// in the curve and drops the fit to R^2 0.84.
-const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 64;
-
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 66;
+const LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Dedicated per-object DRAM cost of `LruSizedHybridStack`'s eviction-stack
 /// bookkeeping. Identical derivation and identical value to
@@ -474,17 +495,24 @@ const LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 66;
 /// splitting it proportionally between its two independently-capacitied
 /// fast segments (the two slow lists have no capacity to reserve against).
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Dedicated per-object DRAM cost of `LruLfuHybridStack`'s eviction-stack
 /// bookkeeping. A key is resident in exactly one tier's structure at a time,
@@ -505,17 +533,24 @@ const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 /// move to PMEM). Charged at the fast-tier figure, which is what the
 /// reservation is actually protecting.
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-*ghost-entry* DRAM cost shared by every hybrid design that keeps a
 /// bare-key ghost queue (`TwoQGhostHybrid`, and the four `S3Fifo*Ghost*`
@@ -574,17 +609,24 @@ pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -602,17 +644,24 @@ const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -630,17 +679,24 @@ const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -658,17 +714,24 @@ const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQFullFastAdmissionHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -685,17 +748,24 @@ const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectS
 /// for either — `a1_out` holds real resident objects, which are already
 /// counted as tracked keys.
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQGhostHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -721,17 +791,24 @@ const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize 
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -749,17 +826,24 @@ const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoGhostHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -785,17 +869,24 @@ const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -821,17 +912,24 @@ const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -857,17 +955,24 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSiz
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -893,17 +998,24 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVER
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionReprieveHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -921,17 +1033,24 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -949,17 +1068,24 @@ const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: Object
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -977,17 +1103,24 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_O
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -1005,17 +1138,24 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STA
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
 ///
-/// MEASURED, not derived. The figure is the least-squares slope of resident
-/// bytes against object count, sampled one-point-per-process at 2^20..2^23
-/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
-/// field-by-field derivation that used to sit here understated this stack by
-/// roughly a third, because it counted struct fields and not what the
-/// allocator actually resides: size-class rounding, index-map load factor and
-/// the growth slack of every doubling structure. Being measured resident, it
-/// is NOT multiplied by `resident_factor()` -- see the split in
-/// `get_hybrid_dram_shared_overhead`.
+/// MEASURED, not derived: the least-squares slope of jemalloc
+/// `stats.allocated` against object count, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
+/// `malloc_usable_size` returns and therefore the same quantity Redis reports
+/// as `used_memory`. An earlier revision measured RSS instead, which counts
+/// retained-but-freed pages that belong in a fragmentation ratio rather than in
+/// a per-object cost, and which disagreed with itself by 20% depending on where
+/// the sample points fell.
+///
+/// The field-by-field derivation that used to sit here understated this stack
+/// by roughly a third: it counted struct fields and not size-class rounding,
+/// index-map load factor, or the growth slack of every doubling structure.
+/// Being a measured allocation figure it is NOT multiplied by
+/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
+const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 
 /// Approximate per-object DRAM cost of the *shared* structures (the object
