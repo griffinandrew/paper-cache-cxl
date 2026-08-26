@@ -65,19 +65,16 @@ impl OverheadManager {
 		K: TypeSize,
 		V: TypeSize,
 	{
-		// The value is scaled to what the allocator actually holds, not what
-		// was asked for. Measured on a live lfu-hybrid run over standard_web:
-		// the slow tier accounted 8.24 GiB while node1 held 9.90 GiB -- 20%
-		// more -- because size-class rounding and retained pages were never
-		// corrected for on the value side. `resident_factor` had only ever
-		// been applied to metadata, so a tier sized to its accounted bytes
-		// overran by a fifth.
+		// The value is counted as the bytes jemalloc actually commits, asked of
+		// the allocator rather than estimated -- see `resident_value_bytes`.
+		// Before this it was counted as the bytes *requested*, so a tier sized
+		// to its accounted bytes overran.
 		//
 		// The key and expiry are deliberately NOT scaled here: they are inside
 		// `shared_overhead`, which applies its own factor to them already, and
 		// scaling them twice is exactly the double-charge this module has been
 		// untangling elsewhere.
-		let value = (object.data_size() as f64 * value_resident_factor()) as ObjectSize;
+		let value = resident_value_bytes(object.data_size());
 		let mut total_size = object.key_size()
 			+ value
 			+ mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
@@ -866,25 +863,44 @@ const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 63;
 #[cfg(feature = "hybrid_cache_common")]
 const DEFAULT_RESIDENT_FACTOR: f64 = 1.12;
 
-/// Requested -> resident for *value buffers*, as distinct from metadata.
+/// Bytes jemalloc will actually commit for a value of this requested size.
 ///
-/// Measured 1.20 on a live `lfu-hybrid` run over `standard_web`: 8.24 GiB of
-/// accounted slow-tier bytes against 9.90 GiB resident on node1. Higher than
-/// metadata's 1.12 because values are variable-sized, so size-class rounding
-/// wastes more of each allocation -- metadata objects are a handful of fixed
-/// shapes that land near their class boundaries.
+/// Asked of the allocator rather than estimated. This is what Redis does --
+/// `used_memory` is the sum of `malloc_usable_size` per allocation, never a
+/// scaled request -- and `nallocx` answers the same question without
+/// allocating, so it costs a size-class lookup.
 ///
-/// One trace, one policy. It is a correction from "no correction at all",
-/// which was demonstrably wrong by 20%, not a precisely characterised
-/// constant; `PAPER_VALUE_RESIDENT_FACTOR` overrides it.
-const DEFAULT_VALUE_RESIDENT_FACTOR: f64 = 1.20;
+/// A flat factor was tried first and was wrong in both directions. Measured
+/// against jemalloc's real classes: 8 -> 8 (1.000x), 24 -> 32 (1.333x),
+/// 194 -> 224 (1.155x), 1024 -> 1024 (1.000x), 4096 -> 4096 (1.000x). The
+/// ratio is 1.0 for anything landing on a class and up to 1.33 just above one;
+/// no constant models that.
+///
+/// It also mis-attributed process-level waste. A live run showed the slow tier
+/// accounting 8.24 GiB against 9.90 GiB resident on node1 -- 20% -- so 1.20 was
+/// adopted. But size-class rounding over these corpora's object-size mix is
+/// only **1.081x**; the rest is jemalloc's retained dirty pages and arena
+/// fragmentation, which are properties of the process, not of an object.
+/// Charging them per object over-reserved every small value by ~11%.
+///
+/// Process-level waste belongs in a reported ratio, the way Redis reports
+/// `mem_fragmentation_ratio`, not inside a per-object budget. See
+/// `AtomicStatus::fragmentation_ratio`.
+#[cfg(feature = "numa_jemalloc")]
+fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
+	// SAFETY: `nallocx` is a pure size-class computation. It allocates
+	// nothing, dereferences nothing, and cannot fail for a non-zero size.
+	match requested {
+		0 => 0,
+		n => unsafe { tikv_jemalloc_sys::nallocx(n as usize, 0) as ObjectSize },
+	}
+}
 
-fn value_resident_factor() -> f64 {
-	std::env::var("PAPER_VALUE_RESIDENT_FACTOR")
-		.ok()
-		.and_then(|v| v.parse::<f64>().ok())
-		.filter(|v| *v >= 1.0)
-		.unwrap_or(DEFAULT_VALUE_RESIDENT_FACTOR)
+/// Without jemalloc there is no allocator to ask, so the request stands.
+/// Estimating here would reintroduce exactly the error described above.
+#[cfg(not(feature = "numa_jemalloc"))]
+fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
+	requested
 }
 
 #[cfg(feature = "hybrid_cache_common")]
@@ -1059,7 +1075,7 @@ mod value_resident_factor_applies {
 	/// so all of them stayed green through this change -- good design on their
 	/// part, but it means not one of them would have caught the omission.
 	#[test]
-	fn the_value_is_scaled_and_the_key_is_not() {
+	fn the_value_is_counted_at_its_allocated_size() {
 		let status: crate::StatusRef = Arc::new(
 			AtomicStatus::new(1_000_000, &[PaperPolicy::LruHybrid], PaperPolicy::LruHybrid)
 				.expect("status"),
@@ -1074,13 +1090,12 @@ mod value_resident_factor_applies {
 		// as the 1000 payload bytes. On the hybrid path V is `TieredBuffer`,
 		// whose `get_size` is the length exactly.
 		let raw = object.data_size();
-		let scaled = (raw as f64 * value_resident_factor()) as ObjectSize;
+		let scaled = resident_value_bytes(raw);
 
 		assert_eq!(
 			got, key + scaled + expiry,
-			"the value is scaled by {:.2}; the key and expiry are left alone, \
-			 since shared_overhead already applies its own factor to them",
-			value_resident_factor(),
+			"the value is counted at jemalloc's committed size; the key and \
+			 expiry are left alone, since shared_overhead covers them",
 		);
 
 		assert!(
@@ -1089,5 +1104,50 @@ mod value_resident_factor_applies {
 			 unscaled would be {}",
 			key + raw + expiry,
 		);
+	}
+}
+
+/// What jemalloc would actually commit for a given request, versus the flat
+/// factor this module estimates with.
+///
+/// Redis answers this question by calling `malloc_usable_size` per allocation;
+/// memcached sidesteps it by budgeting slab pages, so its rounding waste is
+/// explicit. This crate estimates instead, which is why the value side was out
+/// by 20% until it was measured. `nallocx` gives the exact size class for a
+/// request without allocating -- the same information Redis uses.
+///
+///   cargo +nightly test --release --features lru_hybrid_cache --lib \
+///       what_jemalloc -- --ignored --nocapture
+#[cfg(all(test, feature = "numa_jemalloc"))]
+mod what_jemalloc_actually_rounds_to {
+	#[test]
+	#[ignore]
+	fn what_jemalloc_rounds_to() {
+		use tikv_jemalloc_sys::nallocx;
+
+		println!("NX  requested   jemalloc    ratio");
+		let mut worst: f64 = 0.0;
+		for s in [8usize, 13, 24, 29, 64, 100, 130, 194, 225, 500, 1000,
+		          1024, 1497, 1500, 4096, 5607, 8392, 60103] {
+			let a = unsafe { nallocx(s, 0) };
+			let r = a as f64 / s as f64;
+			if r > worst { worst = r; }
+			println!("NX  {:>9} {:>10}   {:.3}x", s, a, r);
+		}
+		println!("NX  worst single-size ratio: {:.3}x", worst);
+
+		// Weighted by the object-size mix actually measured in these corpora:
+		// Meta kvcache medians are 13-132 B, Twitter clusters 77-8392 B.
+		let mix: [(usize, f64); 7] = [
+			(13, 25.0), (29, 20.0), (77, 15.0), (132, 15.0),
+			(194, 10.0), (1497, 10.0), (5607, 5.0),
+		];
+		let (mut req, mut act) = (0.0, 0.0);
+		for (s, w) in mix {
+			req += s as f64 * w;
+			act += unsafe { nallocx(s, 0) } as f64 * w;
+		}
+		println!("NX  trace-weighted mix: {:.3}x  (the flat estimate in use: 1.20)",
+			act / req);
 	}
 }
