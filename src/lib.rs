@@ -1788,6 +1788,7 @@ fn s3_fifo_queue_budgets(policy: PaperPolicy) -> Option<(f64, bool)> {
 		// These five size main at `(1 - ratio) * max_size`, mirroring
 		// `SThreeFifoStack`, and gate eviction on its fullness.
 		PaperPolicy::S3FifoHybrid(r)
+		| PaperPolicy::S3FifoCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
@@ -1901,6 +1902,8 @@ where
 			// queue the whole cache -- extreme, but every queue still has
 			// capacity and eviction drains the FIFO tail unconditionally.
 			PaperPolicy::TwoQHybrid(r)
+			| PaperPolicy::TwoQCompactHybrid(r)
+			| PaperPolicy::TwoQFastAdmissionCompactHybrid(r)
 			| PaperPolicy::TwoQFastAdmissionHybrid(r)
 			| PaperPolicy::TwoQFastAdmissionReprieveHybrid(r)
 			| PaperPolicy::TwoQGhostHybrid(r) => (0.0..=1.0).contains(&r),
@@ -1917,6 +1920,7 @@ where
 			// (`SThreeFifoStack` has the same degeneracy at 1.0; its own
 			// parser is tightened to match.)
 			PaperPolicy::S3FifoHybrid(r)
+			| PaperPolicy::S3FifoCompactHybrid(r)
 			| PaperPolicy::S3FifoGhostHybrid(r)
 			| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
 			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
