@@ -5,8 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Slab-backed set of intrusive queues: the 2Q and S3-FIFO counterpart of
-//! [`CompactRecencyList`](super::compact_recency_list).
+//! Slab-backed set of intrusive queues, shared by every converted hybrid
+//! stack that orders its keys by position rather than by frequency: LRU
+//! (one queue), 2Q and S3-FIFO (two).
 //!
 //! Every stack in those two families keeps one `kwik::HashList` PER QUEUE --
 //! each owning its own key-to-node index -- plus a separate `entries` map
@@ -33,11 +34,24 @@
 //! because those 8 bytes move from the densely packed slab into hash buckets
 //! that are only 50-87.5% occupied.
 //!
-//! `CompactRecencyList` makes the opposite choice, and both are right.
-//! `mark_accessed` here is the hottest per-get operation in the S3-FIFO family
-//! AND touches no queue order, so it pays that dereference on every single get
-//! for nothing. LRU has no such path: every `update` reorders the list, so it
-//! would be buying speed it cannot use and paying bytes for it.
+//! Measured on a quiet machine, this layout is faster on BOTH paths, not only
+//! the metadata-only one:
+//!
+//! ```text
+//! metadata read   77.3 ns -> 41.0 ns   (-47%)
+//! move_front      392.6   -> 344.1     (-12%)
+//! ```
+//!
+//! The list operation gets faster because removing the payload makes the slab
+//! denser -- 16-byte slots against 24 -- so the pointer chase touches fewer
+//! cache lines. That was the number nobody had established: an earlier attempt
+//! on a loaded machine reported no separation above noise, and the byte cost
+//! was assumed to buy nothing on list operations.
+//!
+//! The byte side depends on payload width, and the sign flips. For an 8-byte
+//! payload (LRU, 2Q, S3-FIFO) this layout costs 0 to 8 B/object more. For the
+//! 12-byte LFU payload it SAVES 9 to 11, because removing it from the slot also
+//! recovers alignment padding, and that saving outweighs the wider bucket.
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 use std::collections::HashMap;

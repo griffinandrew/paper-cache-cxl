@@ -177,6 +177,84 @@ mod layout_ab {
 		next: u32,
 	}
 
+	/// The LFU payload, which is LARGER than the 2Q/S3-FIFO one: it carries a
+	/// frequency as well. That changes the sign of the comparison, because the
+	/// slab saving grows with payload size while the per-bucket cost does not.
+	#[derive(Clone, Copy)]
+	struct LfuPayload {
+		freq: u32,
+		size: u32,
+		tier: u8,
+		dram_resident: u8,
+	}
+
+	/// LFU payload in the slot.
+	#[derive(Clone, Copy)]
+	struct SlotLfuA {
+		key: HashedKey,
+		prev: u32,
+		next: u32,
+		freq: u32,
+		size: u32,
+		tier: u8,
+		dram_resident: u8,
+	}
+
+	#[test]
+	#[ignore]
+	fn measure_lfu_layout_point() {
+		let n: u64 = match std::env::var("LAYOUT_N") {
+			Ok(v) => v.parse().expect("LAYOUT_N"),
+			Err(_) => return,
+		};
+		let which = std::env::var("LAYOUT").expect("LAYOUT");
+
+		let base = allocated_bytes();
+		let total = match which.as_str() {
+			"a" => {
+				let mut slots: Vec<SlotLfuA> = Vec::new();
+				let mut index: HashMap<HashedKey, u32, NoHasher> = HashMap::default();
+				for i in 0..n {
+					let k = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+					slots.push(SlotLfuA {
+						key: k, prev: u32::MAX, next: u32::MAX,
+						freq: 1, size: 1024, tier: 0, dram_resident: 24,
+					});
+					index.insert(k, i as u32);
+				}
+				let after = allocated_bytes();
+				core::hint::black_box((&slots, &index));
+				after.saturating_sub(base)
+			},
+			"b" => {
+				let mut slots: Vec<SlotB> = Vec::new();
+				let mut index: HashMap<HashedKey, (u32, LfuPayload), NoHasher> = HashMap::default();
+				for i in 0..n {
+					let k = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+					slots.push(SlotB { key: k, prev: u32::MAX, next: u32::MAX });
+					index.insert(
+						k,
+						(i as u32, LfuPayload { freq: 1, size: 1024, tier: 0, dram_resident: 24 }),
+					);
+				}
+				let after = allocated_bytes();
+				core::hint::black_box((&slots, &index));
+				after.saturating_sub(base)
+			},
+			other => panic!("LAYOUT must be a or b, got {other}"),
+		};
+
+		println!("LAYOUT {} {} {} {:.3}", which, n, total, total as f64 / n as f64);
+	}
+
+	#[test]
+	fn lfu_struct_sizes_are_what_the_comparison_assumes() {
+		assert_eq!(core::mem::size_of::<SlotLfuA>(), 32);
+		assert_eq!(core::mem::size_of::<LfuPayload>(), 12);
+		assert_eq!(core::mem::size_of::<(HashedKey, u32)>(), 16);
+		assert_eq!(core::mem::size_of::<(HashedKey, (u32, LfuPayload))>(), 24);
+	}
+
 	#[test]
 	#[ignore]
 	fn measure_layout_point() {
@@ -239,5 +317,260 @@ mod layout_ab {
 		// what each map stores per live entry, before load factor
 		assert_eq!(core::mem::size_of::<(HashedKey, u32)>(), 16);
 		assert_eq!(core::mem::size_of::<(HashedKey, (u32, Payload))>(), 24);
+	}
+}
+
+/// Layout A vs layout B on TIME, not bytes.
+///
+/// The byte comparison is settled. What was never established is whether B
+/// costs anything on LIST-TOUCHING operations, which is the question that
+/// decides LRU: `move_front` is its hot path, and unlike `mark_accessed` it
+/// cannot be served from the index alone.
+///
+/// A prior standalone attempt reported `cur 446-541, a 429-446, b 434-572 ns`
+/// and concluded there was no separation above noise, on a machine with a load
+/// average of 3.83. This runs on a quiet box, interleaves the two layouts
+/// within each repeat so any drift hits both equally, and reports every repeat
+/// rather than a mean, so the spread is visible.
+///
+/// Both layouts here are real doubly-linked lists over a slab, differing only
+/// in where the payload sits. Timing a structure that does not maintain the
+/// links would measure nothing.
+#[cfg(test)]
+#[allow(dead_code)]
+mod layout_timing {
+	use crate::{HashedKey, NoHasher};
+	use std::collections::HashMap;
+	use std::time::Instant;
+
+	const NIL: u32 = u32::MAX;
+
+	#[derive(Clone, Copy, Default)]
+	struct Payload {
+		size: u32,
+		tier: u8,
+		dram_resident: u8,
+	}
+
+	#[derive(Clone, Copy)]
+	struct SlotA {
+		key: HashedKey,
+		prev: u32,
+		next: u32,
+		payload: Payload,
+	}
+
+	#[derive(Clone, Copy)]
+	struct SlotB {
+		key: HashedKey,
+		prev: u32,
+		next: u32,
+	}
+
+	struct ListA {
+		slots: Vec<SlotA>,
+		index: HashMap<HashedKey, u32, NoHasher>,
+		head: u32,
+		tail: u32,
+	}
+
+	struct ListB {
+		slots: Vec<SlotB>,
+		index: HashMap<HashedKey, (u32, Payload), NoHasher>,
+		head: u32,
+		tail: u32,
+	}
+
+	macro_rules! impl_list {
+		($name:ident, $slot:ident, $get_slot:expr) => {
+			impl $name {
+				fn unlink(&mut self, i: u32) {
+					let (p, n) = (self.slots[i as usize].prev, self.slots[i as usize].next);
+					match p {
+						NIL => self.head = n,
+						p => self.slots[p as usize].next = n,
+					}
+					match n {
+						NIL => self.tail = p,
+						n => self.slots[n as usize].prev = p,
+					}
+				}
+
+				fn link_front(&mut self, i: u32) {
+					let old = self.head;
+					self.slots[i as usize].prev = NIL;
+					self.slots[i as usize].next = old;
+					match old {
+						NIL => self.tail = i,
+						o => self.slots[o as usize].prev = i,
+					}
+					self.head = i;
+				}
+			}
+		};
+	}
+
+	impl_list!(ListA, SlotA, ());
+	impl_list!(ListB, SlotB, ());
+
+	impl ListA {
+		fn build(n: u64) -> Self {
+			let mut l = ListA {
+				slots: Vec::with_capacity(n as usize),
+				index: HashMap::default(),
+				head: NIL,
+				tail: NIL,
+			};
+			l.index.reserve(n as usize);
+			for i in 0..n {
+				let k = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+				l.slots.push(SlotA {
+					key: k,
+					prev: NIL,
+					next: NIL,
+					payload: Payload { size: 1024, tier: 0, dram_resident: 24 },
+				});
+				l.index.insert(k, i as u32);
+				l.link_front(i as u32);
+			}
+			l
+		}
+
+		/// Metadata read: probe, then dereference into the slab.
+		fn read_meta(&self, k: HashedKey) -> u32 {
+			match self.index.get(&k) {
+				Some(&i) => self.slots[i as usize].payload.size,
+				None => 0,
+			}
+		}
+
+		fn move_front(&mut self, k: HashedKey) {
+			let Some(&i) = self.index.get(&k) else { return };
+			if self.head == i {
+				return;
+			}
+			self.unlink(i);
+			self.link_front(i);
+		}
+	}
+
+	impl ListB {
+		fn build(n: u64) -> Self {
+			let mut l = ListB {
+				slots: Vec::with_capacity(n as usize),
+				index: HashMap::default(),
+				head: NIL,
+				tail: NIL,
+			};
+			l.index.reserve(n as usize);
+			for i in 0..n {
+				let k = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+				l.slots.push(SlotB { key: k, prev: NIL, next: NIL });
+				l.index.insert(k, (i as u32, Payload { size: 1024, tier: 0, dram_resident: 24 }));
+				l.link_front(i as u32);
+			}
+			l
+		}
+
+		/// Metadata read: one probe, payload already in the bucket.
+		fn read_meta(&self, k: HashedKey) -> u32 {
+			match self.index.get(&k) {
+				Some(&(_, p)) => p.size,
+				None => 0,
+			}
+		}
+
+		fn move_front(&mut self, k: HashedKey) {
+			let Some(&(i, _)) = self.index.get(&k) else { return };
+			if self.head == i {
+				return;
+			}
+			self.unlink(i);
+			self.link_front(i);
+		}
+	}
+
+	/// Fixed pseudo-random probe order, identical for both layouts.
+	fn probe_order(n: u64, probes: usize) -> Vec<HashedKey> {
+		let mut out = Vec::with_capacity(probes);
+		let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+		for _ in 0..probes {
+			x ^= x << 13;
+			x ^= x >> 7;
+			x ^= x << 17;
+			out.push((x % n).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+		}
+		out
+	}
+
+	#[test]
+	#[ignore]
+	fn measure_layout_timing() {
+		let n: u64 = std::env::var("TIME_N").map(|v| v.parse().unwrap()).unwrap_or(4_194_304);
+		let probes: usize =
+			std::env::var("TIME_PROBES").map(|v| v.parse().unwrap()).unwrap_or(4_000_000);
+		let repeats: usize = std::env::var("TIME_REPEATS").map(|v| v.parse().unwrap()).unwrap_or(3);
+
+		let order = probe_order(n, probes);
+		let mut a = ListA::build(n);
+		let mut b = ListB::build(n);
+
+		// warm both before timing either
+		let mut sink = 0u64;
+		for k in order.iter().take(200_000) {
+			sink += a.read_meta(*k) as u64 + b.read_meta(*k) as u64;
+		}
+		core::hint::black_box(sink);
+
+		println!("\nn={n} probes={probes}  (ns/op; A and B interleaved within each repeat)");
+		println!("{:<10} {:>12} {:>12} {:>10}", "op", "A", "B", "B vs A");
+
+		for r in 0..repeats {
+			// --- metadata-only read ---
+			let t = Instant::now();
+			let mut s = 0u64;
+			for k in &order {
+				s += a.read_meta(*k) as u64;
+			}
+			let ra = t.elapsed().as_nanos() as f64 / probes as f64;
+			core::hint::black_box(s);
+
+			let t = Instant::now();
+			let mut s = 0u64;
+			for k in &order {
+				s += b.read_meta(*k) as u64;
+			}
+			let rb = t.elapsed().as_nanos() as f64 / probes as f64;
+			core::hint::black_box(s);
+
+			// --- move_front: the list-touching path, LRU's hot one ---
+			let t = Instant::now();
+			for k in &order {
+				a.move_front(*k);
+			}
+			let ma = t.elapsed().as_nanos() as f64 / probes as f64;
+
+			let t = Instant::now();
+			for k in &order {
+				b.move_front(*k);
+			}
+			let mb = t.elapsed().as_nanos() as f64 / probes as f64;
+
+			println!(
+				"{:<10} {:>12.2} {:>12.2} {:>9.1}%",
+				format!("read[{r}]"),
+				ra,
+				rb,
+				(rb - ra) / ra * 100.0
+			);
+			println!(
+				"{:<10} {:>12.2} {:>12.2} {:>9.1}%",
+				format!("move[{r}]"),
+				ma,
+				mb,
+				(mb - ma) / ma * 100.0
+			);
+		}
+		println!();
 	}
 }

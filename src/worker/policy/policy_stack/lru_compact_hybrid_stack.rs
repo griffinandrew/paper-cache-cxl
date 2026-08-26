@@ -14,35 +14,64 @@
 //! second map is measured at **40 B/object**: all-DRAM LRU, which has one list
 //! and no `entries`, costs 72 B/object, and hybrid LRU costs 112.
 //!
-//! Here a single [`CompactRecencyList`] carries the payload in the slot, so
-//! there is one index instead of two, entries are linked by `u32` slot indices
-//! instead of 8-byte pointers, and the slab is one allocation rather than one
-//! `malloc` per node.
+//! The payload lives in the INDEX MAP'S VALUE, not in the slab slot, so a
+//! metadata read is one probe with the payload already in the bucket rather
+//! than a probe plus a dereference into the slab.
 //!
-//! The tier mechanics are unchanged and deliberately so. One list spans both
-//! tiers with the MRU end fast; `fast_boundary` names the least-recently-used
-//! fast key; promotion is implicit in `move_front`, because the front of the
-//! list IS the fast region; demotion walks the boundary one step toward the MRU
-//! end per victim. No candidate is ever searched for.
+//! This reverses an earlier choice here. The slot layout was picked on the
+//! grounds that it was smaller, and for LRU'''s 8-byte payload it is, by 0 to 8
+//! B/object depending on hash load. But measured on a quiet machine, the index
+//! layout is faster on BOTH paths, not just the metadata-only one:
 //!
-//! `fast_boundary` stays a `HashedKey` rather than becoming a `u32` slot index,
-//! even though a slot index would save the lookup in `settle_fast_tier`. A slot
-//! index is only sound while every path that frees the boundary slot also
-//! updates the boundary, and slot reuse makes a stale index silently name a
-//! DIFFERENT key rather than fail. Fidelity first; that optimisation is worth
-//! doing once the fidelity tests are established, not before.
+//! ```text
+//! metadata read   77.3 ns -> 41.0 ns   (-47%)
+//! move_front      392.6   -> 344.1     (-12%)
+//! ```
+//!
+//! The list operation was the one that mattered and the one nobody had
+//! measured -- an earlier attempt on a loaded machine reported no separation
+//! above noise. `move_front` gets faster because the slab is denser with the
+//! payload removed (16-byte slots against 24), so the pointer chase touches
+//! fewer cache lines. Paying up to 8 B/object for 12% on the hot path is the
+//! right trade.
+//!
+//! Sharing `CompactQueueSet` rather than keeping a second primitive follows
+//! from that: it is already a layout-B slab, and LRU is its one-queue case.
 
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		compact_recency_list::CompactRecencyList, narrow_resident, watermarks, CacheSize,
+		compact_queue_set::CompactQueueSet, narrow_resident, watermarks, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
 };
 
+/// The single recency order, in the shared queue set's slot 0.
+const Q_LRU: usize = 0;
+
+/// Per-key bookkeeping, carried in the index value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LruPayload {
+	tier: Tier,
+	/// The part of `size` that stays in DRAM in either tier; see `migrating`.
+	dram_resident: u8,
+	size: ObjectSize,
+}
+
+const _: () = assert!(
+	std::mem::size_of::<LruPayload>() == 8,
+	"LruPayload grew past 8 bytes",
+);
+
+impl LruPayload {
+	fn migrating(&self) -> CacheSize {
+		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+	}
+}
+
 pub struct LruCompactHybridStack {
-	list: CompactRecencyList,
+	list: CompactQueueSet<LruPayload>,
 
 	fast_capacity: CacheSize,
 	fast_used: CacheSize,
@@ -62,7 +91,7 @@ pub struct LruCompactHybridStack {
 impl LruCompactHybridStack {
 	pub fn new(fast_capacity: CacheSize) -> Self {
 		LruCompactHybridStack {
-			list: CompactRecencyList::default(),
+			list: CompactQueueSet::default(),
 			fast_capacity,
 			fast_used: 0,
 			slow_used: 0,
@@ -105,11 +134,11 @@ impl LruCompactHybridStack {
 	}
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
-		self.list.get(key).map(|slot| slot.tier)
+		self.list.payload(key).map(|p| p.tier)
 	}
 
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize, new_resident: u8) {
-		let Some(slot) = self.list.get_mut(key) else { return };
+		let Some(slot) = self.list.payload_mut(key) else { return };
 
 		let old_migrating = slot.migrating();
 		slot.size = new_size;
@@ -130,9 +159,9 @@ impl LruCompactHybridStack {
 
 	/// Faithful port of `LruHybridStack::touch_fast_key`.
 	fn touch_fast_key(&mut self, key: HashedKey) {
-		let previous_tier = self.list.get(key).map(|slot| slot.tier);
+		let previous_tier = self.list.payload(key).map(|p| p.tier);
 
-		let already_at_front = self.list.front() == Some(key);
+		let already_at_front = self.list.front(Q_LRU) == Some(key);
 		let is_boundary = self.fast_boundary == Some(key);
 
 		// Read the neighbour BEFORE moving: once the key is at the front its
@@ -144,7 +173,7 @@ impl LruCompactHybridStack {
 			None
 		};
 
-		self.list.move_front(key);
+		self.list.move_front(Q_LRU, key);
 
 		if is_boundary && !already_at_front {
 			self.fast_boundary = new_boundary_if_moved;
@@ -154,14 +183,14 @@ impl LruCompactHybridStack {
 
 		if previous_tier != Some(Tier::Fast) {
 			if previous_tier == Some(Tier::Slow) {
-				let size = self.list.get(key).map(|slot| slot.migrating()).unwrap_or(0);
+				let size = self.list.payload(key).map(|p| p.migrating()).unwrap_or(0);
 				self.slow_used = self.slow_used.saturating_sub(size);
 				self.fast_used += size;
 				self.fast_count += 1;
 				promoted = true;
 			}
 
-			if let Some(slot) = self.list.get_mut(key) {
+			if let Some(slot) = self.list.payload_mut(key) {
 				slot.tier = Tier::Fast;
 			}
 
@@ -175,7 +204,7 @@ impl LruCompactHybridStack {
 		// Pushed after settling and guarded on the key still being fast: a
 		// tight budget can demote it straight back out within the same settle,
 		// in which case that call already pushed the correct final entry.
-		if promoted && self.list.get(key).map(|slot| slot.tier) == Some(Tier::Fast) {
+		if promoted && self.list.payload(key).map(|p| p.tier) == Some(Tier::Fast) {
 			self.migrations.push((key, Tier::Fast));
 		}
 	}
@@ -194,10 +223,10 @@ impl LruCompactHybridStack {
 
 		while self.fast_used > drain_target {
 			let Some(demote_key) = self.fast_boundary else { break };
-			let size = self.list.get(demote_key).map(|slot| slot.migrating()).unwrap_or(0);
+			let size = self.list.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
 			let new_boundary = self.list.before(demote_key);
 
-			if let Some(slot) = self.list.get_mut(demote_key) {
+			if let Some(slot) = self.list.payload_mut(demote_key) {
 				slot.tier = Tier::Slow;
 			}
 
@@ -237,7 +266,7 @@ impl PolicyStack for LruCompactHybridStack {
 			return;
 		}
 
-		self.list.insert_front(key, size, dram_resident, Tier::Fast);
+		self.list.push_front(Q_LRU, key, LruPayload { tier: Tier::Fast, dram_resident, size });
 		self.fast_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 		self.fast_count += 1;
 
@@ -255,7 +284,7 @@ impl PolicyStack for LruCompactHybridStack {
 	}
 
 	fn remove(&mut self, key: HashedKey) {
-		let Some(slot) = self.list.get(key).copied() else { return };
+		let Some(slot) = self.list.payload(key) else { return };
 		let size = slot.migrating();
 		let tier = slot.tier;
 
@@ -265,7 +294,7 @@ impl PolicyStack for LruCompactHybridStack {
 			None
 		};
 
-		self.list.remove(key);
+		self.list.remove(Q_LRU, key);
 
 		match tier {
 			Tier::Fast => {
@@ -294,8 +323,8 @@ impl PolicyStack for LruCompactHybridStack {
 	}
 
 	fn evict_one(&mut self) -> Option<HashedKey> {
-		let key = self.list.back()?;
-		let slot = self.list.remove(key)?;
+		let key = self.list.back(Q_LRU)?;
+		let slot = self.list.remove(Q_LRU, key)?;
 		let size = slot.migrating();
 
 		match slot.tier {
@@ -304,7 +333,7 @@ impl PolicyStack for LruCompactHybridStack {
 				self.fast_count = self.fast_count.saturating_sub(1);
 
 				if self.fast_boundary == Some(key) {
-					self.fast_boundary = self.list.back();
+					self.fast_boundary = self.list.back(Q_LRU);
 				}
 			},
 

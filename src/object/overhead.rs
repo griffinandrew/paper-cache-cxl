@@ -440,18 +440,20 @@ const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 168;
 /// MEASURED: jemalloc `stats.allocated`, one point per process at 2^20..2^23
 /// objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
 ///
-/// 64 B against `LruHybridStack`'s 112 -- a 42.9% reduction, and below even the
-/// 72 B that NON-tiered all-DRAM LRU costs, because a 24-byte slab entry beats
-/// a `kwik::HashList` node that jemalloc rounds to the 32-byte size class. The
-/// saving is the elimination of the second index: a `HashList` carries its own
-/// key->node map AND a separate `entries` map holds the 8-byte payload, one row
-/// each per object.
+/// 72 B against `LruHybridStack`'s 112 -- a 35.7% reduction. `LruHybridStack`
+/// keeps a `kwik::HashList`, which owns its own key-to-node index, PLUS a
+/// separate `entries` map for the 8-byte payload: two indexes, one row each per
+/// object. This keeps one.
 ///
-/// Measured with `PAPER_DISABLE_SHARED_OVERHEAD=1` so the stack's own
-/// pre-reservation stays out of the figure; with it active the slab doubles out
-/// of the reservation partway through the range and the fit drops to R^2 0.84.
+/// It was 64 while the payload lived in the slab slot. Moving it into the index
+/// value costs 8 B/object and buys 12% on `move_front` -- LRU's hot path -- and
+/// 47% on metadata reads, measured on an idle machine. The list operation gets
+/// faster because the slab is denser without the payload (16-byte slots against
+/// 24), so the pointer chase touches fewer cache lines. Equal to
+/// `TwoQCompactHybridStack` and `S3FifoCompactHybridStack`, which is expected:
+/// all three now share `CompactQueueSet` and all three payloads are 8 bytes.
 #[cfg(feature = "hybrid_cache_common")]
-const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 64;
+const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `LfuCompactHybridStack`'s eviction-stack
 /// bookkeeping.
