@@ -244,7 +244,7 @@ use crate::{
 	HashedKey,
 	NoHasher,
 	policy::PaperPolicy,
-	object::{ObjectSize, overhead::GHOST_ENTRY_DRAM_OVERHEAD},
+	object::ObjectSize,
 	worker::policy::policy_stack::{PolicyStack, Tier, ghost_filter::GhostFilter, narrow_resident, watermarks},
 };
 
@@ -1002,6 +1002,7 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionHybridStack {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::object::overhead::GHOST_ENTRY_DRAM_OVERHEAD;
 
 	/// The per-ghost-entry DRAM price, straight from the shared constant --
 	/// `44`, or `0` under `eviction_stacks_pmem`, where the ghost list is not

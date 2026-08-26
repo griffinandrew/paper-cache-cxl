@@ -358,6 +358,7 @@ pub const HASHTABLE_ENTRY_OVERHEAD: ObjectSize = 11;
 /// double-charges the key (see the derivation block above) — an error that
 /// roughly canceled out there, but isn't a reliable basis to build on for a
 /// *different* budget with its own correctness requirements.
+#[cfg(feature = "hybrid_cache_common")]
 const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Dedicated per-object DRAM cost of `LfuHybridStack`'s eviction-stack
@@ -377,6 +378,7 @@ const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// making that marginal cost amortize toward zero in aggregate; charging it
 /// per-key would model the rare worst case (one key per frequency) as the
 /// typical one.
+#[cfg(feature = "hybrid_cache_common")]
 const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 29 + 20;
 
 /// Dedicated per-object DRAM cost of `LruSizedHybridStack`'s eviction-stack
@@ -389,6 +391,7 @@ const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 29 + 20;
 /// as a single total here; `LruSizedHybridStack` is responsible for
 /// splitting it proportionally between its two independently-capacitied
 /// fast segments (the two slow lists have no capacity to reserve against).
+#[cfg(feature = "hybrid_cache_common")]
 const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Dedicated per-object DRAM cost of `LruLfuHybridStack`'s eviction-stack
@@ -409,6 +412,7 @@ const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// `eviction_stacks_pmem` the whole term drops out anyway (both structures
 /// move to PMEM). Charged at the fast-tier figure, which is what the
 /// reservation is actually protecting.
+#[cfg(feature = "hybrid_cache_common")]
 const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-*ghost-entry* DRAM cost shared by every hybrid design that keeps a
@@ -467,6 +471,7 @@ pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+#[cfg(feature = "hybrid_cache_common")]
 const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `TwoQHybridStack`'s eviction-stack bookkeeping.
@@ -484,6 +489,7 @@ const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+#[cfg(feature = "hybrid_cache_common")]
 const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionHybridStack`'s eviction-stack bookkeeping.
@@ -501,6 +507,7 @@ const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+#[cfg(feature = "hybrid_cache_common")]
 const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -518,6 +525,7 @@ const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+#[cfg(feature = "hybrid_cache_common")]
 const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `TwoQFullFastAdmissionHybridStack`'s eviction-stack bookkeeping.
@@ -534,6 +542,7 @@ const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectS
 /// so it is never resident in two at once. There is no ghost list to charge
 /// for either — `a1_out` holds real resident objects, which are already
 /// counted as tracked keys.
+#[cfg(feature = "hybrid_cache_common")]
 const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `TwoQGhostHybridStack`'s eviction-stack bookkeeping.
@@ -559,6 +568,7 @@ const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize 
 /// path never called -- which is how a ghost reached 1.94 GB, 45% of a
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
+#[cfg(feature = "hybrid_cache_common")]
 const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoHybridStack`'s eviction-stack bookkeeping.
@@ -576,6 +586,7 @@ const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+#[cfg(feature = "hybrid_cache_common")]
 const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoGhostHybridStack`'s eviction-stack bookkeeping.
@@ -601,6 +612,7 @@ const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// path never called -- which is how a ghost reached 1.94 GB, 45% of a
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
+#[cfg(feature = "hybrid_cache_common")]
 const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionHybridStack`'s eviction-stack bookkeeping.
@@ -626,6 +638,7 @@ const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// path never called -- which is how a ghost reached 1.94 GB, 45% of a
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
+#[cfg(feature = "hybrid_cache_common")]
 const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionHybridStack`'s eviction-stack bookkeeping.
@@ -651,6 +664,7 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSiz
 /// path never called -- which is how a ghost reached 1.94 GB, 45% of a
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
+#[cfg(feature = "hybrid_cache_common")]
 const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack`'s eviction-stack bookkeeping.
@@ -676,6 +690,7 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVER
 /// path never called -- which is how a ghost reached 1.94 GB, 45% of a
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
+#[cfg(feature = "hybrid_cache_common")]
 const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -693,6 +708,7 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+#[cfg(feature = "hybrid_cache_common")]
 const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -710,6 +726,7 @@ const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: Object
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+#[cfg(feature = "hybrid_cache_common")]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -727,6 +744,7 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_O
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+#[cfg(feature = "hybrid_cache_common")]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -744,6 +762,7 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STA
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+#[cfg(feature = "hybrid_cache_common")]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 

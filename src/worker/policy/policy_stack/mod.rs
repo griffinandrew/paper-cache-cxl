@@ -15,6 +15,7 @@ mod two_q_stack;
 mod arc_stack;
 mod s_three_fifo_stack;
 pub(crate) mod ghost_filter;
+pub(crate) mod compact_frequency_chain;
 mod lru_hybrid_stack;
 mod lru_lfu_hybrid_stack;
 mod lfu_hybrid_stack;

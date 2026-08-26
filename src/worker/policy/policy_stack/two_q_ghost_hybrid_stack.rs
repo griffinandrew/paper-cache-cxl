@@ -127,7 +127,7 @@ use crate::{
 	HashedKey,
 	NoHasher,
 	policy::PaperPolicy,
-	object::{ObjectSize, overhead::GHOST_ENTRY_DRAM_OVERHEAD},
+	object::ObjectSize,
 	worker::policy::policy_stack::{PolicyStack, Tier, ghost_filter::GhostFilter, narrow_resident, watermarks},
 };
 
@@ -748,6 +748,7 @@ impl PolicyStack for TwoQGhostHybridStack {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::object::overhead::GHOST_ENTRY_DRAM_OVERHEAD;
 
 	/// The shared per-ghost-entry DRAM charge in `CacheSize` units, so the
 	/// reservation tests below can state their expectations against the

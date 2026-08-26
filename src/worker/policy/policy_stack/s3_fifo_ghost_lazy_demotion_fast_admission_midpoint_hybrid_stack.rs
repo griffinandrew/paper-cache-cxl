@@ -231,7 +231,7 @@ use crate::{
 	HashedKey,
 	NoHasher,
 	policy::PaperPolicy,
-	object::{ObjectSize, overhead::GHOST_ENTRY_DRAM_OVERHEAD},
+	object::ObjectSize,
 	worker::policy::policy_stack::{PolicyStack, Tier, ghost_filter::GhostFilter, narrow_resident, watermarks},
 };
 
@@ -1092,6 +1092,7 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::object::overhead::GHOST_ENTRY_DRAM_OVERHEAD;
 
 	fn drain(stack: &mut S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack) -> Vec<(HashedKey, Tier)> {
 		stack.drain_tier_migrations()
