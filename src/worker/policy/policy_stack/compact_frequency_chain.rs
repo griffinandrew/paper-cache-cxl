@@ -91,11 +91,19 @@ pub struct CompactFrequencyChain {
 	/// Freed slab slots, reused before the slab grows.
 	free: Vec<u32>,
 
-	/// frequency -> (head, tail) of that bucket's intrusive list. Ordered, so
-	/// the minimum frequency is the first entry.
-	buckets: BTreeMap<u32, (u32, u32)>,
+	/// frequency -> (head, tail) of that bucket's intrusive list, one map per
+	/// tier. Ordered, so a tier's minimum frequency is its first entry.
+	///
+	/// Two bucket sets over *one* slab is what lets this replace both
+	/// `FrequencyChain`s **and** the `entries` map they were paired with: a key
+	/// is located in a single probe, and the slot that probe returns already
+	/// carries its tier, size and frequency. `LfuHybridStack` needs three
+	/// lookups across three structures for the same information.
+	fast_buckets: BTreeMap<u32, (u32, u32)>,
+	slow_buckets: BTreeMap<u32, (u32, u32)>,
 
-	len: usize,
+	fast_len: usize,
+	slow_len: usize,
 }
 
 impl Default for CompactFrequencyChain {
@@ -104,15 +112,19 @@ impl Default for CompactFrequencyChain {
 			slots: Vec::new(),
 			index: HashMap::default(),
 			free: Vec::new(),
-			buckets: BTreeMap::new(),
-			len: 0,
+			fast_buckets: BTreeMap::new(),
+			slow_buckets: BTreeMap::new(),
+			fast_len: 0,
+			slow_len: 0,
 		}
 	}
 }
 
 impl CompactFrequencyChain {
-	pub fn len(&self) -> usize { self.len }
-	pub fn is_empty(&self) -> bool { self.len == 0 }
+	pub fn len(&self) -> usize { self.fast_len + self.slow_len }
+	pub fn is_empty(&self) -> bool { self.len() == 0 }
+	pub fn fast_len(&self) -> usize { self.fast_len }
+	pub fn slow_len(&self) -> usize { self.slow_len }
 
 	pub fn contains(&self, key: HashedKey) -> bool {
 		self.index.contains_key(&key)
@@ -138,27 +150,43 @@ impl CompactFrequencyChain {
 		};
 
 		self.index.insert(key, slot);
-		self.link(slot, 1);
-		self.len += 1;
+		self.link(slot, 1, tier);
+
+		match tier {
+			Tier::Fast => self.fast_len += 1,
+			Tier::Slow => self.slow_len += 1,
+		}
 	}
 
 	/// Moves a key to the next frequency bucket. O(1): unlink, relink.
 	pub fn bump(&mut self, key: HashedKey) -> u32 {
 		let Some(&slot) = self.index.get(&key) else { return 0 };
 
-		let freq = self.slots[slot as usize].freq;
-		self.unlink(slot, freq);
+		let (freq, tier) = {
+			let e = &self.slots[slot as usize];
+			(e.freq, e.tier)
+		};
+
+		self.unlink(slot, freq, tier);
 
 		let next_freq = freq.saturating_add(1);
 		self.slots[slot as usize].freq = next_freq;
-		self.link(slot, next_freq);
+		self.link(slot, next_freq, tier);
 
 		next_freq
 	}
 
-	/// The least-frequently-used key: head of the lowest-frequency bucket.
-	pub fn min_key(&self) -> Option<HashedKey> {
-		let (_, &(head, _)) = self.buckets.iter().next()?;
+	/// The least-frequently-used key in a tier: head of its lowest-frequency
+	/// bucket. O(log D) in the number of distinct frequencies present -- the
+	/// original's `VecList::front` is O(1), which is headroom this design has
+	/// not taken yet.
+	pub fn min_key(&self, tier: Tier) -> Option<HashedKey> {
+		let buckets = match tier {
+			Tier::Fast => &self.fast_buckets,
+			Tier::Slow => &self.slow_buckets,
+		};
+
+		let (_, &(head, _)) = buckets.iter().next()?;
 		Some(self.slots[head as usize].key)
 	}
 
@@ -166,16 +194,39 @@ impl CompactFrequencyChain {
 		let slot = self.index.remove(&key)?;
 		let entry = self.slots[slot as usize];
 
-		self.unlink(slot, entry.freq);
+		self.unlink(slot, entry.freq, entry.tier);
 		self.free.push(slot);
-		self.len -= 1;
+
+		match entry.tier {
+			Tier::Fast => self.fast_len -= 1,
+			Tier::Slow => self.slow_len -= 1,
+		}
 
 		Some(entry)
 	}
 
+	/// Moves a key between tiers, preserving its frequency. Relinks it from one
+	/// bucket set into the other -- the key never moves in the slab, so its
+	/// index entry and every link to it stay valid.
 	pub fn set_tier(&mut self, key: HashedKey, tier: Tier) {
-		if let Some(&slot) = self.index.get(&key) {
-			self.slots[slot as usize].tier = tier;
+		let Some(&slot) = self.index.get(&key) else { return };
+
+		let (freq, old_tier) = {
+			let e = &self.slots[slot as usize];
+			(e.freq, e.tier)
+		};
+
+		if old_tier == tier {
+			return;
+		}
+
+		self.unlink(slot, freq, old_tier);
+		self.slots[slot as usize].tier = tier;
+		self.link(slot, freq, tier);
+
+		match tier {
+			Tier::Fast => { self.fast_len += 1; self.slow_len -= 1; },
+			Tier::Slow => { self.slow_len += 1; self.fast_len -= 1; },
 		}
 	}
 
@@ -190,29 +241,36 @@ impl CompactFrequencyChain {
 		self.slots.clear();
 		self.index.clear();
 		self.free.clear();
-		self.buckets.clear();
-		self.len = 0;
+		self.fast_buckets.clear();
+		self.slow_buckets.clear();
+		self.fast_len = 0;
+		self.slow_len = 0;
 	}
 
-	fn link(&mut self, slot: u32, freq: u32) {
-		match self.buckets.get_mut(&freq) {
+	fn link(&mut self, slot: u32, freq: u32, tier: Tier) {
+		let buckets = match tier {
+			Tier::Fast => &mut self.fast_buckets,
+			Tier::Slow => &mut self.slow_buckets,
+		};
+
+		match buckets.get_mut(&freq) {
 			Some((_, tail)) => {
 				let old_tail = *tail;
+				*tail = slot;
 				self.slots[old_tail as usize].next = slot;
 				self.slots[slot as usize].prev = old_tail;
 				self.slots[slot as usize].next = NIL;
-				*tail = slot;
 			},
 
 			None => {
+				buckets.insert(freq, (slot, slot));
 				self.slots[slot as usize].prev = NIL;
 				self.slots[slot as usize].next = NIL;
-				self.buckets.insert(freq, (slot, slot));
 			},
 		}
 	}
 
-	fn unlink(&mut self, slot: u32, freq: u32) {
+	fn unlink(&mut self, slot: u32, freq: u32, tier: Tier) {
 		let (prev, next) = {
 			let e = &self.slots[slot as usize];
 			(e.prev, e.next)
@@ -221,12 +279,17 @@ impl CompactFrequencyChain {
 		if prev != NIL { self.slots[prev as usize].next = next; }
 		if next != NIL { self.slots[next as usize].prev = prev; }
 
-		if let Some((head, tail)) = self.buckets.get_mut(&freq) {
+		let buckets = match tier {
+			Tier::Fast => &mut self.fast_buckets,
+			Tier::Slow => &mut self.slow_buckets,
+		};
+
+		if let Some((head, tail)) = buckets.get_mut(&freq) {
 			if *head == slot { *head = next; }
 			if *tail == slot { *tail = prev; }
 
 			if *head == NIL {
-				self.buckets.remove(&freq);
+				buckets.remove(&freq);
 			}
 		}
 	}
@@ -270,13 +333,13 @@ mod tests {
 		// key 1 accessed twice, key 2 once, key 3 not at all
 		c.bump(1); c.bump(1); c.bump(2);
 
-		assert_eq!(c.min_key(), Some(3), "key 3 is the least frequently used");
+		assert_eq!(c.min_key(Tier::Fast), Some(3), "key 3 is the least frequently used");
 
 		c.remove(3);
-		assert_eq!(c.min_key(), Some(2));
+		assert_eq!(c.min_key(Tier::Fast), Some(2));
 
 		c.remove(2);
-		assert_eq!(c.min_key(), Some(1));
+		assert_eq!(c.min_key(Tier::Fast), Some(1));
 	}
 
 	#[test]
@@ -284,9 +347,9 @@ mod tests {
 		let mut c = CompactFrequencyChain::default();
 		for key in 1..=3u64 { c.insert(key, 10, 0, Tier::Fast); }
 
-		assert_eq!(c.min_key(), Some(1), "all at frequency 1, so oldest first");
+		assert_eq!(c.min_key(Tier::Fast), Some(1), "all at frequency 1, so oldest first");
 		c.remove(1);
-		assert_eq!(c.min_key(), Some(2));
+		assert_eq!(c.min_key(Tier::Fast), Some(2));
 	}
 
 	#[test]
@@ -300,7 +363,7 @@ mod tests {
 
 		// everything still reachable, and 3 is no longer the minimum
 		for key in 1..=5u64 { assert!(c.contains(key)); }
-		assert_ne!(c.min_key(), Some(3));
+		assert_ne!(c.min_key(Tier::Fast), Some(3));
 	}
 
 	#[test]
@@ -328,9 +391,37 @@ mod tests {
 
 		assert_eq!(c.len(), 4);
 		let mut seen = Vec::new();
-		while let Some(k) = c.min_key() { seen.push(k); c.remove(k); }
+		while let Some(k) = c.min_key(Tier::Fast) { seen.push(k); c.remove(k); }
 
 		assert_eq!(seen, vec![1, 2, 4, 5], "the chain must survive a middle removal");
+	}
+
+	/// Two bucket sets over one slab: a tier move relinks the key without
+	/// touching the slab or the index, so every other link stays valid.
+	#[test]
+	fn moving_a_key_between_tiers_preserves_its_frequency_and_position() {
+		let mut c = CompactFrequencyChain::default();
+		for key in 1..=3u64 { c.insert(key, 100, 24, Tier::Fast); }
+		c.bump(2); c.bump(2);
+
+		assert_eq!(c.fast_len(), 3);
+		assert_eq!(c.slow_len(), 0);
+		assert_eq!(c.min_key(Tier::Fast), Some(1));
+
+		c.set_tier(2, Tier::Slow);
+
+		assert_eq!(c.fast_len(), 2);
+		assert_eq!(c.slow_len(), 1);
+		assert_eq!(c.get(2).unwrap().freq, 3, "frequency must survive the move");
+		assert_eq!(c.get(2).unwrap().tier, Tier::Slow);
+		assert_eq!(c.min_key(Tier::Slow), Some(2));
+		assert_eq!(c.min_key(Tier::Fast), Some(1), "the fast chain is intact");
+
+		// and back again
+		c.set_tier(2, Tier::Fast);
+		assert_eq!(c.fast_len(), 3);
+		assert_eq!(c.slow_len(), 0);
+		assert_eq!(c.min_key(Tier::Slow), None);
 	}
 
 	#[test]

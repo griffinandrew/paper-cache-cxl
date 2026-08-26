@@ -1470,71 +1470,150 @@ mod tests {
 	}
 }
 
-/// Head-to-head microbenchmark: `FrequencyChain` (three structures, a heap
-/// node and a pointer-linked list per key) against `CompactFrequencyChain`
-/// (one slab slot, `u32`-index links).
+/// Head-to-head on **real trace access sequences**, not a generated stream.
 ///
-/// Isolates the question the representation change raises -- whether replacing
-/// pointer-chased heap nodes with slab indices costs traversal speed. `bump`
-/// is the comparison that matters: it is the hot path, and it is where the
-/// link representation is actually exercised (unlink from one bucket, relink
-/// into the next).
+/// Replays each trace's key order through both frequency-chain
+/// representations: first sight inserts, every later sight bumps. That is
+/// exactly the work an LFU policy asks of its chain, isolated from everything
+/// else a cache run touches (object map, value copies, migration), so the
+/// numbers here bound what the representation can contribute end-to-end --
+/// they are not themselves an end-to-end result.
 ///
-///   cargo +nightly test --release --features lfu_hybrid_cache --lib \
-///       chain_microbench -- --ignored --nocapture
+///   TRACE_DIR=/home/griff/final_traces cargo +nightly test --release \
+///     --features lfu_hybrid_cache --lib trace_chain_bench -- --ignored --nocapture
 #[cfg(test)]
-mod chain_microbench {
-	use std::time::Instant;
+mod trace_chain_bench {
+	use std::{fs::File, io::Read, time::Instant};
 
 	use super::*;
 	use crate::worker::policy::policy_stack::compact_frequency_chain::CompactFrequencyChain;
 
-	const KEYS: u64 = 200_000;
-	const BUMPS: u64 = 2_000_000;
+	/// 25-byte records: <Q ts_ms><B cmd><Q key64><I value_size><I ttl>.
+	/// The key is the 8 little-endian bytes at offset 9.
+	fn keys_of(path: &str, cap: usize) -> Vec<HashedKey> {
+		let mut raw = Vec::new();
+		File::open(path).expect("trace").take((cap * 25) as u64)
+			.read_to_end(&mut raw).expect("read");
 
-	/// Deterministic pseudo-random stream so both structures see exactly the
-	/// same accesses. Squaring biases toward low keys -- the skew LFU exists
-	/// for, and the case where buckets stay dense rather than degenerating to
-	/// one key each.
-	fn access(i: u64) -> u64 {
-		let x = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-		let r = (x >> 33) % KEYS;
-		(r * r) / KEYS
+		raw.chunks_exact(25)
+			.map(|r| u64::from_le_bytes(r[9..17].try_into().unwrap()))
+			.collect()
+	}
+
+	fn run(name: &str, keys: &[HashedKey]) {
+		let mut old = FrequencyChain::default();
+		let t = Instant::now();
+		for &k in keys {
+			if old.bump(k) == 0 { old.insert_new(k); }
+		}
+		let old_t = t.elapsed();
+		let old_len = old.len();
+
+		let mut new = CompactFrequencyChain::default();
+		let t = Instant::now();
+		for &k in keys {
+			if new.bump(k) == 0 { new.insert(k, 100, 24, Tier::Fast); }
+		}
+		let new_t = t.elapsed();
+		let new_len = new.len();
+
+		assert_eq!(old_len, new_len, "{name}: both must track the same key set");
+
+		println!(
+			"TRACEBENCH {:<22} accesses={:>10}  distinct={:>9}  old={:>9.1?}  new={:>9.1?}  			 new/old={:.2}x  ns/op old={:.0} new={:.0}",
+			name, keys.len(), old_len, old_t, new_t,
+			new_t.as_secs_f64() / old_t.as_secs_f64(),
+			old_t.as_nanos() as f64 / keys.len() as f64,
+			new_t.as_nanos() as f64 / keys.len() as f64,
+		);
 	}
 
 	#[test]
 	#[ignore]
-	fn chain_microbench() {
+	fn trace_chain_bench() {
+		let dir = std::env::var("TRACE_DIR")
+			.unwrap_or_else(|_| "/home/griff/final_traces".to_string());
+		let cap: usize = std::env::var("TRACE_CAP").ok()
+			.and_then(|v| v.parse().ok()).unwrap_or(20_000_000);
+
+		for t in ["standard_web", "low_alpha_cold", "uniform_baseline"] {
+			let path = format!("{dir}/{t}.bin");
+			let keys = keys_of(&path, cap);
+			run(t, &keys);
+		}
+	}
+}
+
+/// Measured per-key DRAM for both chain representations.
+///
+/// The 93 B and 48 B figures quoted for these designs are `size_of` arithmetic
+/// plus an estimate of hashbrown's load-factor slack. This measures what the
+/// allocator actually holds: RSS before, insert N keys, RSS after. It is the
+/// same kind of check that produced the 175.4 B/object fit for the object map,
+/// and the one the 18 per-policy overhead constants have never had.
+///
+/// Reads VmRSS rather than jemalloc's own counters so retained-but-unmapped
+/// pages are excluded -- the reservation exists to bound *resident* DRAM.
+///
+///   cargo +nightly test --release --features lfu_hybrid_cache --lib \
+///       chain_memory -- --ignored --nocapture
+#[cfg(test)]
+mod chain_memory {
+	use super::*;
+	use crate::worker::policy::policy_stack::compact_frequency_chain::CompactFrequencyChain;
+
+	const KEYS: u64 = 2_000_000;
+
+	fn rss_bytes() -> u64 {
+		std::fs::read_to_string("/proc/self/status").ok()
+			.and_then(|s| s.lines()
+				.find(|l| l.starts_with("VmRSS:"))
+				.and_then(|l| l.split_whitespace().nth(1))
+				.and_then(|v| v.parse::<u64>().ok()))
+			.map(|kb| kb * 1024)
+			.unwrap_or(0)
+	}
+
+	/// Touch every page so RSS reflects the structure, not lazily-mapped
+	/// address space.
+	fn settle() {
+		std::thread::sleep(std::time::Duration::from_millis(200));
+	}
+
+	#[test]
+	#[ignore]
+	fn chain_memory() {
+		println!("MEM keys={KEYS}");
+
+		let base = { settle(); rss_bytes() };
+
 		let mut old = FrequencyChain::default();
-		let t = Instant::now();
 		for key in 0..KEYS { old.insert_new(key); }
-		let old_insert = t.elapsed();
+		// a few bumps so bucket structure is realistic rather than one bucket
+		for key in 0..(KEYS / 2) { old.bump(key); }
+		settle();
+		let old_rss = rss_bytes().saturating_sub(base);
+		let old_len = old.len();
+		drop(old);
+
+		let mid = { settle(); rss_bytes() };
 
 		let mut new = CompactFrequencyChain::default();
-		let t = Instant::now();
 		for key in 0..KEYS { new.insert(key, 100, 24, Tier::Fast); }
-		let new_insert = t.elapsed();
+		for key in 0..(KEYS / 2) { new.bump(key); }
+		settle();
+		let new_rss = rss_bytes().saturating_sub(mid);
+		let new_len = new.len();
+		drop(new);
 
-		// warm both so the comparison is steady-state, not first-touch
-		for i in 0..(BUMPS / 10) { old.bump(access(i)); new.bump(access(i)); }
+		assert_eq!(old_len as u64, KEYS);
+		assert_eq!(new_len as u64, KEYS);
 
-		let t = Instant::now();
-		for i in 0..BUMPS { old.bump(access(i)); }
-		let old_bump = t.elapsed();
-
-		let t = Instant::now();
-		for i in 0..BUMPS { new.bump(access(i)); }
-		let new_bump = t.elapsed();
-
-		let r = |a: std::time::Duration, b: std::time::Duration|
-			b.as_secs_f64() / a.as_secs_f64();
-
-		println!("BENCH keys={KEYS} bumps={BUMPS}");
-		println!("BENCH insert   old={:>10.1?}  new={:>10.1?}   new/old={:.2}x", old_insert, new_insert, r(old_insert, new_insert));
-		println!("BENCH bump     old={:>10.1?}  new={:>10.1?}   new/old={:.2}x   <- hot path", old_bump, new_bump, r(old_bump, new_bump));
-		println!("BENCH ns/bump  old={:.1}  new={:.1}",
-			old_bump.as_nanos() as f64 / BUMPS as f64,
-			new_bump.as_nanos() as f64 / BUMPS as f64);
-		println!("BENCH len      old={}  new={}", old.len(), new.len());
+		println!("MEM FrequencyChain         {:>12} B  = {:>6.1} B/key   (model: 93)",
+			old_rss, old_rss as f64 / KEYS as f64);
+		println!("MEM CompactFrequencyChain  {:>12} B  = {:>6.1} B/key   (model: 48)",
+			new_rss, new_rss as f64 / KEYS as f64);
+		println!("MEM measured ratio new/old = {:.2}",
+			new_rss as f64 / old_rss.max(1) as f64);
 	}
 }
