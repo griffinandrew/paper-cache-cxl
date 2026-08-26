@@ -94,7 +94,7 @@ pub fn admission_tier<K>(
 			// fast admission.
 			crate::Tier::Fast
 		},
-		PaperPolicy::S3FifoGhostHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionHybrid(..) | PaperPolicy::S3FifoHybrid(..) => {
+		PaperPolicy::S3FifoGhostHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionHybrid(..) | PaperPolicy::S3FifoHybrid(..) | PaperPolicy::S3FifoCompactHybrid(..) => {
 			match objects.get_ref(&hashed_key) {
 				Some(object) => match object.data().is_fast() {
 					true => crate::Tier::Fast,
