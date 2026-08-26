@@ -39,7 +39,11 @@
 //! moves a key to the adjacent bucket in O(1), and the minimum frequency is
 //! still O(1) to find. This is a representation change only.
 
-use std::collections::{BTreeMap, HashMap};
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+use std::collections::HashMap;
+#[cfg(feature = "eviction_stacks_pmem")]
+use hashbrown::HashMap;
+use std::collections::BTreeMap;
 
 use crate::{
 	HashedKey,
@@ -81,15 +85,68 @@ impl CompactEntry {
 	}
 }
 
+// Under `eviction_stacks_pmem` every structure here is allocated through the
+// crate-wide `Hybrid` allocator, which binds to the far (CXL/PMEM) NUMA node,
+// exactly as the stacks this one replaces do. The logic is identical either
+// way; only the backing memory moves.
+//
+// Not optional: `get_hybrid_dram_shared_overhead` drops the eviction-stack term
+// to ZERO under this feature, on the premise the stack is not in DRAM. A slab
+// stack without these gates would sit in DRAM and be charged nothing -- silently
+// wrong rather than merely unoptimised, and it would invalidate any experiment
+// measuring what far-memory index placement costs.
+//
+// A slab is also a better shape for far memory than what it replaces: a
+// `HashList` puts every node in its own small allocation, so relocating it
+// scatters thousands of separate objects across the far node, where the slab is
+// ONE contiguous region.
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type SlotVec = Vec<CompactEntry>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type SlotVec = Vec<CompactEntry, crate::Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type FreeVec = Vec<u32>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type FreeVec = Vec<u32, crate::Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type SlotIndex = HashMap<HashedKey, u32, NoHasher>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type SlotIndex = HashMap<HashedKey, u32, NoHasher, crate::Hybrid>;
+
+/// One entry per DISTINCT frequency rather than per object, so this stays small.
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type BucketMap = BTreeMap<u32, (u32, u32)>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type BucketMap = BTreeMap<u32, (u32, u32), crate::Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+fn new_collections() -> (SlotVec, SlotIndex, FreeVec, BucketMap, BucketMap) {
+	(Vec::new(), HashMap::default(), Vec::new(), BTreeMap::new(), BTreeMap::new())
+}
+
+#[cfg(feature = "eviction_stacks_pmem")]
+fn new_collections() -> (SlotVec, SlotIndex, FreeVec, BucketMap, BucketMap) {
+	(
+		Vec::new_in(crate::Hybrid),
+		HashMap::with_hasher_in(NoHasher::default(), crate::Hybrid),
+		Vec::new_in(crate::Hybrid),
+		BTreeMap::new_in(crate::Hybrid),
+		BTreeMap::new_in(crate::Hybrid),
+	)
+}
+
+
 pub struct CompactFrequencyChain {
-	slots: Vec<CompactEntry>,
+	slots: SlotVec,
 	/// `NoHasher`: `HashedKey` is already a hash, so a lookup is mask, probe,
 	/// compare -- no hashing. `buckets` stays a `BTreeMap` because the minimum
 	/// frequency must be ordered; this one only needs point lookups.
-	index: HashMap<HashedKey, u32, NoHasher>,
+	index: SlotIndex,
 
 	/// Freed slab slots, reused before the slab grows.
-	free: Vec<u32>,
+	free: FreeVec,
 
 	/// frequency -> (head, tail) of that bucket's intrusive list, one map per
 	/// tier. Ordered, so a tier's minimum frequency is its first entry.
@@ -99,8 +156,8 @@ pub struct CompactFrequencyChain {
 	/// is located in a single probe, and the slot that probe returns already
 	/// carries its tier, size and frequency. `LfuHybridStack` needs three
 	/// lookups across three structures for the same information.
-	fast_buckets: BTreeMap<u32, (u32, u32)>,
-	slow_buckets: BTreeMap<u32, (u32, u32)>,
+	fast_buckets: BucketMap,
+	slow_buckets: BucketMap,
 
 	fast_len: usize,
 	slow_len: usize,
@@ -108,12 +165,13 @@ pub struct CompactFrequencyChain {
 
 impl Default for CompactFrequencyChain {
 	fn default() -> Self {
+		let (slots, index, free, fast_buckets, slow_buckets) = new_collections();
 		CompactFrequencyChain {
-			slots: Vec::new(),
-			index: HashMap::default(),
-			free: Vec::new(),
-			fast_buckets: BTreeMap::new(),
-			slow_buckets: BTreeMap::new(),
+			slots,
+			index,
+			free,
+			fast_buckets,
+			slow_buckets,
 			fast_len: 0,
 			slow_len: 0,
 		}
