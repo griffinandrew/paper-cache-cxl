@@ -1469,3 +1469,72 @@ mod tests {
 		assert!(stack.admission_latched());
 	}
 }
+
+/// Head-to-head microbenchmark: `FrequencyChain` (three structures, a heap
+/// node and a pointer-linked list per key) against `CompactFrequencyChain`
+/// (one slab slot, `u32`-index links).
+///
+/// Isolates the question the representation change raises -- whether replacing
+/// pointer-chased heap nodes with slab indices costs traversal speed. `bump`
+/// is the comparison that matters: it is the hot path, and it is where the
+/// link representation is actually exercised (unlink from one bucket, relink
+/// into the next).
+///
+///   cargo +nightly test --release --features lfu_hybrid_cache --lib \
+///       chain_microbench -- --ignored --nocapture
+#[cfg(test)]
+mod chain_microbench {
+	use std::time::Instant;
+
+	use super::*;
+	use crate::worker::policy::policy_stack::compact_frequency_chain::CompactFrequencyChain;
+
+	const KEYS: u64 = 200_000;
+	const BUMPS: u64 = 2_000_000;
+
+	/// Deterministic pseudo-random stream so both structures see exactly the
+	/// same accesses. Squaring biases toward low keys -- the skew LFU exists
+	/// for, and the case where buckets stay dense rather than degenerating to
+	/// one key each.
+	fn access(i: u64) -> u64 {
+		let x = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+		let r = (x >> 33) % KEYS;
+		(r * r) / KEYS
+	}
+
+	#[test]
+	#[ignore]
+	fn chain_microbench() {
+		let mut old = FrequencyChain::default();
+		let t = Instant::now();
+		for key in 0..KEYS { old.insert_new(key); }
+		let old_insert = t.elapsed();
+
+		let mut new = CompactFrequencyChain::default();
+		let t = Instant::now();
+		for key in 0..KEYS { new.insert(key, 100, 24, Tier::Fast); }
+		let new_insert = t.elapsed();
+
+		// warm both so the comparison is steady-state, not first-touch
+		for i in 0..(BUMPS / 10) { old.bump(access(i)); new.bump(access(i)); }
+
+		let t = Instant::now();
+		for i in 0..BUMPS { old.bump(access(i)); }
+		let old_bump = t.elapsed();
+
+		let t = Instant::now();
+		for i in 0..BUMPS { new.bump(access(i)); }
+		let new_bump = t.elapsed();
+
+		let r = |a: std::time::Duration, b: std::time::Duration|
+			b.as_secs_f64() / a.as_secs_f64();
+
+		println!("BENCH keys={KEYS} bumps={BUMPS}");
+		println!("BENCH insert   old={:>10.1?}  new={:>10.1?}   new/old={:.2}x", old_insert, new_insert, r(old_insert, new_insert));
+		println!("BENCH bump     old={:>10.1?}  new={:>10.1?}   new/old={:.2}x   <- hot path", old_bump, new_bump, r(old_bump, new_bump));
+		println!("BENCH ns/bump  old={:.1}  new={:.1}",
+			old_bump.as_nanos() as f64 / BUMPS as f64,
+			new_bump.as_nanos() as f64 / BUMPS as f64);
+		println!("BENCH len      old={}  new={}", old.len(), new.len());
+	}
+}

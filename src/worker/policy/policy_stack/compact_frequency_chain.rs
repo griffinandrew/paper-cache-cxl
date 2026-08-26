@@ -39,10 +39,11 @@
 //! moves a key to the adjacent bucket in O(1), and the minimum frequency is
 //! still O(1) to find. This is a representation change only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::{
 	HashedKey,
+	NoHasher,
 	object::ObjectSize,
 	worker::policy::policy_stack::Tier,
 };
@@ -82,7 +83,10 @@ impl CompactEntry {
 
 pub struct CompactFrequencyChain {
 	slots: Vec<CompactEntry>,
-	index: BTreeMap<HashedKey, u32>,
+	/// `NoHasher`: `HashedKey` is already a hash, so a lookup is mask, probe,
+	/// compare -- no hashing. `buckets` stays a `BTreeMap` because the minimum
+	/// frequency must be ordered; this one only needs point lookups.
+	index: HashMap<HashedKey, u32, NoHasher>,
 
 	/// Freed slab slots, reused before the slab grows.
 	free: Vec<u32>,
@@ -98,7 +102,7 @@ impl Default for CompactFrequencyChain {
 	fn default() -> Self {
 		CompactFrequencyChain {
 			slots: Vec::new(),
-			index: BTreeMap::new(),
+			index: HashMap::default(),
 			free: Vec::new(),
 			buckets: BTreeMap::new(),
 			len: 0,
