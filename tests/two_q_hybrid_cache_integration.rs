@@ -159,7 +159,15 @@ mod hybrid_cache_tests {
         // pressure alone, nowhere near the global max_size.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_048_576), PaperPolicy::TwoQHybrid(0.00004)).expect("cache should construct");
+            // k_in gives fifo_capacity = 0.00002 * 1_048_576 = 20 bytes, so one
+            // object (~16 migrating bytes) fits and the second forces the
+            // eviction this test is about. It was 0.00004 -> 41 bytes, which
+            // holds BOTH, so nothing was ever evicted.
+            //
+            // Small values are deliberate here and must stay: the assertion
+            // below is that overall usage is still nowhere near max_size, which
+            // ~1 KB values would break.
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::TwoQHybrid(0.00002)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
@@ -185,10 +193,13 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(40), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
+            // 1_600 holds one ~1 KB value, not two. Was Bytes(40) with 15-byte
+            // values, where TWO objects (~16 migrating bytes each) fit and
+            // nothing ever demoted.
+            CacheTierSize::Bytes(1_600), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
+        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
         assert_eq!(cache.tier_of(&2u32), Some(Tier::Slow));
 
@@ -209,10 +220,13 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(40), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
+            // 1_600 holds one ~1 KB value, not two. Was Bytes(40) with 15-byte
+            // values, where TWO objects (~16 migrating bytes each) fit and
+            // nothing ever demoted.
+            CacheTierSize::Bytes(1_600), PaperPolicy::TwoQHybrid(1.0)).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
+        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
 
         cache.get(&1u32).expect("get should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
@@ -222,8 +236,8 @@ mod hybrid_cache_tests {
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
 
         // Both values remain intact and reachable regardless of tier.
-        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
-        assert_eq!(cache.get(&2u32).unwrap(), b"second value 45");
+        assert_eq!(cache.get(&1u32).unwrap(), value(0xA1));
+        assert_eq!(cache.get(&2u32).unwrap(), value(0xB2));
     }
 
     // ── TTL ───────────────────────────────────────────────────────────────
@@ -242,7 +256,25 @@ mod hybrid_cache_tests {
     // pressure with several small filler keys instead of a second
     // same-sized key. Same lesson already documented for `lru_hybrid_cache`/
     // `lfu_hybrid_cache` in CLAUDE.md.
-    const TTL_FAST_TIER: u64 = 200;
+    // ~1 KB values for the tier-pressure tests. They need a fast tier that
+    // holds ONE object and not two, and with 15-byte values that window is a
+    // handful of bytes wide -- narrower than the per-object DRAM reservation
+    // the fast tier now also carries. At 1 KB the reservation is a small
+    // fraction and the budgets have a wide margin. Same idiom as the `lru_`
+    // and `lfu_` suites.
+    //
+    // Deliberately NOT applied to every test in this file: `fifo_key_aging_out`
+    // runs a 256-byte TOTAL cache and `fifo_capacity_pressure` asserts
+    // `used_size() < 1_000`, so both need small values and both already pass.
+    const VALUE_LEN: usize = 1024;
+
+    fn value(seed: u8) -> Vec<u8> {
+        vec![seed; VALUE_LEN]
+    }
+
+    // Holds one ~1 KB value but not two, so the second promotion demotes the
+    // first. Was 200, sized for 15-byte values.
+    const TTL_FAST_TIER: u64 = 1_600;
 
     #[test]
     fn ttl_survives_a_demotion() {
@@ -254,10 +286,10 @@ mod hybrid_cache_tests {
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
-        cache.set(1u32, b"first value 123", Some(ttl_secs)).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), Some(ttl_secs)).expect("set should succeed");
 
         for key in 2u32..=6 {
-            cache.set(key, b"filler bytes", None).expect("set should succeed");
+            cache.set(key, &value(0xC3), None).expect("set should succeed");
         }
 
         // Promote key 1 to fast first.

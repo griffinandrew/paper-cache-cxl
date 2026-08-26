@@ -58,6 +58,21 @@ mod hybrid_cache_tests {
     /// now rejects the endpoint outright with `CacheError::InvalidPolicy`.
     const SLACK_RATIO: f64 = 0.9;
 
+    // ~1 KB values for the tier-pressure tests. They need a fast tier that holds
+    // ONE object and not two, and with 15-byte values that window is a few bytes
+    // wide -- narrower than the per-object DRAM reservation the fast tier now
+    // also carries, so nothing demoted and every such test timed out. Same idiom
+    // as the `lru_` and `lfu_` suites.
+    //
+    // Deliberately NOT applied file-wide: `one_access_capacity_pressure` asserts
+    // `used_size() < 1_000`, and the tests that run tiny TOTAL caches need small
+    // values. Those already pass.
+    const VALUE_LEN: usize = 1024;
+
+    fn value(seed: u8) -> Vec<u8> {
+        vec![seed; VALUE_LEN]
+    }
+
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -179,7 +194,13 @@ mod hybrid_cache_tests {
         // alone, nowhere near the global max_size.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoHybrid(0.00004)).expect("cache should construct");
+            // 0.00002 * 1_048_576 = 20 bytes, so one object (~16 migrating
+            // bytes) fits and the second forces the eviction under test. It was
+            // 0.00004 -> 41 bytes, which holds BOTH.
+            //
+            // Small values are deliberate and must stay: the assertion below is
+            // that overall usage is nowhere near max_size.
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoHybrid(0.00002)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
@@ -205,10 +226,12 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(40), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
+            // 1_600 holds one ~1 KB value, not two. Was Bytes(40) with 15-byte
+            // values, where TWO objects fit and nothing ever demoted.
+            CacheTierSize::Bytes(1_600), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
+        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
         assert_eq!(cache.tier_of(&2u32), Some(Tier::Slow));
 
@@ -253,10 +276,12 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(40), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
+            // 1_600 holds one ~1 KB value, not two. Was Bytes(40) with 15-byte
+            // values, where TWO objects fit and nothing ever demoted.
+            CacheTierSize::Bytes(1_600), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
+        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
 
         cache.get(&1u32).expect("get should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
@@ -266,8 +291,8 @@ mod hybrid_cache_tests {
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
 
         // Both values remain intact and reachable regardless of tier.
-        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
-        assert_eq!(cache.get(&2u32).unwrap(), b"second value 45");
+        assert_eq!(cache.get(&1u32).unwrap(), value(0xA1));
+        assert_eq!(cache.get(&2u32).unwrap(), value(0xB2));
     }
 
     // ── the signature mechanic: second chance at eviction time ────────────
@@ -280,13 +305,13 @@ mod hybrid_cache_tests {
         // carries zero risk of a premature eviction.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(40), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
+            CacheTierSize::Bytes(1_600), PaperPolicy::S3FifoHybrid(SLACK_RATIO)).expect("cache should construct");
 
-        cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
+        cache.set(1u32, &value(0xD4), None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
 
-        cache.set(2u32, b"payload bytes B", None).expect("set should succeed");
+        cache.set(2u32, &value(0xE5), None).expect("set should succeed");
         cache.get(&2u32).expect("get should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&2u32) == Some(Tier::Fast)));
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
@@ -315,7 +340,11 @@ mod hybrid_cache_tests {
         // main-queue CLOCK sweep -- exactly the path this test is about.
         // The gate is moot either way here (the one-access queue is empty
         // by this point); it just makes reaching the sweep unconditional.
-        cache.resize(180).expect("resize should succeed");
+        // Scaled with the payloads: one ~1 KB object costs roughly 1.1 KB of
+        // accounted size, so 1_400 holds one and forces the eviction this test
+        // is about. Was 180, sized for 15-byte values -- against 1 KB values it
+        // would evict everything and the second chance could not be observed.
+        cache.resize(1_400).expect("resize should succeed");
 
         let survived_and_promoted = wait_until(MIGRATION_TIMEOUT, || {
             cache.has(&1u32) && cache.tier_of(&1u32) == Some(Tier::Fast)
@@ -327,7 +356,7 @@ mod hybrid_cache_tests {
             cache.tier_of(&1u32), cache.has(&1u32),
         );
 
-        assert_eq!(cache.get(&1u32).unwrap(), b"payload bytes A");
+        assert_eq!(cache.get(&1u32).unwrap(), value(0xD4));
         assert!(!cache.has(&2u32), "key 2 should have been evicted in key 1's place");
     }
 
@@ -339,7 +368,8 @@ mod hybrid_cache_tests {
     // capacity comfortably larger than one ttl'd object, and force demotion
     // pressure with several small filler keys instead of a second
     // same-sized key.
-    const TTL_FAST_TIER: u64 = 200;
+    // Holds one ~1 KB value but not two. Was 200, sized for 15-byte values.
+    const TTL_FAST_TIER: u64 = 1_600;
 
     #[test]
     fn ttl_survives_a_demotion() {
@@ -351,10 +381,10 @@ mod hybrid_cache_tests {
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
-        cache.set(1u32, b"first value 123", Some(ttl_secs)).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), Some(ttl_secs)).expect("set should succeed");
 
         for key in 2u32..=6 {
-            cache.set(key, b"filler bytes", None).expect("set should succeed");
+            cache.set(key, &value(0xC3), None).expect("set should succeed");
         }
 
         // Promote key 1 to fast first.
