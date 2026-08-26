@@ -358,7 +358,6 @@ pub const HASHTABLE_ENTRY_OVERHEAD: ObjectSize = 11;
 /// double-charges the key (see the derivation block above) — an error that
 /// roughly canceled out there, but isn't a reliable basis to build on for a
 /// *different* budget with its own correctness requirements.
-#[cfg(feature = "lru_hybrid_cache")]
 const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Dedicated per-object DRAM cost of `LfuHybridStack`'s eviction-stack
@@ -378,7 +377,6 @@ const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// making that marginal cost amortize toward zero in aggregate; charging it
 /// per-key would model the rare worst case (one key per frequency) as the
 /// typical one.
-#[cfg(feature = "lfu_hybrid_cache")]
 const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 29 + 20;
 
 /// Dedicated per-object DRAM cost of `LruSizedHybridStack`'s eviction-stack
@@ -391,7 +389,6 @@ const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 29 + 20;
 /// as a single total here; `LruSizedHybridStack` is responsible for
 /// splitting it proportionally between its two independently-capacitied
 /// fast segments (the two slow lists have no capacity to reserve against).
-#[cfg(feature = "lru_sized_hybrid_cache")]
 const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Dedicated per-object DRAM cost of `LruLfuHybridStack`'s eviction-stack
@@ -412,7 +409,6 @@ const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// `eviction_stacks_pmem` the whole term drops out anyway (both structures
 /// move to PMEM). Charged at the fast-tier figure, which is what the
 /// reservation is actually protecting.
-#[cfg(feature = "lru_lfu_hybrid_cache")]
 const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-*ghost-entry* DRAM cost shared by every hybrid design that keeps a
@@ -463,7 +459,6 @@ pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
-#[cfg(feature = "fifo_hybrid_cache")]
 const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `TwoQHybridStack`'s eviction-stack bookkeeping.
@@ -481,7 +476,6 @@ const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
-#[cfg(feature = "two_q_hybrid_cache")]
 const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionHybridStack`'s eviction-stack bookkeeping.
@@ -499,7 +493,6 @@ const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
-#[cfg(feature = "two_q_fast_admission_hybrid_cache")]
 const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -517,7 +510,6 @@ const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
-#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
 const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `TwoQFullFastAdmissionHybridStack`'s eviction-stack bookkeeping.
@@ -534,7 +526,6 @@ const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectS
 /// so it is never resident in two at once. There is no ghost list to charge
 /// for either — `a1_out` holds real resident objects, which are already
 /// counted as tracked keys.
-#[cfg(feature = "two_q_full_fast_admission_hybrid_cache")]
 const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `TwoQGhostHybridStack`'s eviction-stack bookkeeping.
@@ -558,7 +549,6 @@ const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize 
 /// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
 /// eviction, while one-access-queue evictions are what grow it), so it is
 /// not expressible as a per-tracked-key term.
-#[cfg(feature = "two_q_ghost_hybrid_cache")]
 const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoHybridStack`'s eviction-stack bookkeeping.
@@ -576,7 +566,6 @@ const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
-#[cfg(feature = "s3_fifo_hybrid_cache")]
 const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoGhostHybridStack`'s eviction-stack bookkeeping.
@@ -600,7 +589,6 @@ const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
 /// eviction, while one-access-queue evictions are what grow it), so it is
 /// not expressible as a per-tracked-key term.
-#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
 const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionHybridStack`'s eviction-stack bookkeeping.
@@ -624,7 +612,6 @@ const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
 /// eviction, while one-access-queue evictions are what grow it), so it is
 /// not expressible as a per-tracked-key term.
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
 const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionHybridStack`'s eviction-stack bookkeeping.
@@ -648,7 +635,6 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSiz
 /// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
 /// eviction, while one-access-queue evictions are what grow it), so it is
 /// not expressible as a per-tracked-key term.
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
 const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack`'s eviction-stack bookkeeping.
@@ -672,7 +658,6 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVER
 /// bounded only lazily (`trim_ghost` runs solely on a genuine main-queue
 /// eviction, while one-access-queue evictions are what grow it), so it is
 /// not expressible as a per-tracked-key term.
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
 const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -690,7 +675,6 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
-#[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
 const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -708,7 +692,6 @@ const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: Object
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -726,7 +709,6 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_O
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -744,7 +726,6 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STA
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 
 
@@ -872,102 +853,53 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	let mut overhead: ObjectSize = 0;
 
 	// Eviction stacks live in DRAM unless `eviction_stacks_pmem` relocates them.
+	//
+	// Selected by a runtime `match`, not by `cfg`. These are integers: nothing
+	// about a policy's constant requires its stack module to be compiled, and
+	// gating them meant a build without that feature silently contributed 0 --
+	// no error, no warning, no failing test. That is not hypothetical: a binary
+	// built with only `lru_hybrid_cache` charged every other policy
+	// Arc(48) + map(63) = 111 -> 124 B/object instead of its real 196 or 228,
+	// so each non-LRU policy was handed a larger effective fast tier than it
+	// should have had, for a whole sweep, before anyone noticed.
+	//
+	// The match is exhaustive deliberately: adding a policy without giving it an
+	// overhead term is now a compile error rather than a silent zero.
 	#[cfg(not(feature = "eviction_stacks_pmem"))]
 	{
-		#[cfg(feature = "lru_hybrid_cache")]
-		if matches!(policy, PaperPolicy::LruHybrid) {
-			overhead += LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
+		overhead += match policy {
+			PaperPolicy::LruHybrid => LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::LfuHybrid => LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::LruSizedHybrid => LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::LruLfuHybrid(..) => LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::FifoHybrid => FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::TwoQHybrid(..) => TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::TwoQFastAdmissionHybrid(..) => TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::TwoQFastAdmissionReprieveHybrid(..) => TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::TwoQFullFastAdmissionHybrid(..) => TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::TwoQGhostHybrid(..) => TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoHybrid(..) => S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoGhostHybrid(..) => S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoGhostLazyDemotionHybrid(..) => S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(..) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(..) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoLazyDemotionReprieveHybrid(..) => S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(..) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(..) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(..) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 
-		#[cfg(feature = "lfu_hybrid_cache")]
-		if matches!(policy, PaperPolicy::LfuHybrid) {
-			overhead += LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "lru_sized_hybrid_cache")]
-		if matches!(policy, PaperPolicy::LruSizedHybrid) {
-			overhead += LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "lru_lfu_hybrid_cache")]
-		if matches!(policy, PaperPolicy::LruLfuHybrid(_)) {
-			overhead += LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "fifo_hybrid_cache")]
-		if matches!(policy, PaperPolicy::FifoHybrid) {
-			overhead += FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "two_q_hybrid_cache")]
-		if matches!(policy, PaperPolicy::TwoQHybrid(_)) {
-			overhead += TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "two_q_fast_admission_hybrid_cache")]
-		if matches!(policy, PaperPolicy::TwoQFastAdmissionHybrid(_)) {
-			overhead += TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
-		if matches!(policy, PaperPolicy::TwoQFastAdmissionReprieveHybrid(_)) {
-			overhead += TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "two_q_full_fast_admission_hybrid_cache")]
-		if matches!(policy, PaperPolicy::TwoQFullFastAdmissionHybrid(_, _)) {
-			overhead += TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "two_q_ghost_hybrid_cache")]
-		if matches!(policy, PaperPolicy::TwoQGhostHybrid(_)) {
-			overhead += TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "s3_fifo_hybrid_cache")]
-		if matches!(policy, PaperPolicy::S3FifoHybrid(_)) {
-			overhead += S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
-		if matches!(policy, PaperPolicy::S3FifoGhostHybrid(_)) {
-			overhead += S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
-		if matches!(policy, PaperPolicy::S3FifoGhostLazyDemotionHybrid(_)) {
-			overhead += S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
-		if matches!(policy, PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_)) {
-			overhead += S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
-		if matches!(policy, PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(_)) {
-			overhead += S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
-		if matches!(policy, PaperPolicy::S3FifoLazyDemotionReprieveHybrid(_)) {
-			overhead += S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
-		if matches!(policy, PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(_)) {
-			overhead += S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
-		if matches!(policy, PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(_)) {
-			overhead += S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
-
-		#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
-		if matches!(policy, PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(_)) {
-			overhead += S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD;
-		}
+			// All-DRAM policies have no tiers and reserve no fast-tier metadata.
+			PaperPolicy::Auto
+			| PaperPolicy::Lfu
+			| PaperPolicy::Fifo
+			| PaperPolicy::Clock
+			| PaperPolicy::Sieve
+			| PaperPolicy::Lru
+			| PaperPolicy::Mru
+			| PaperPolicy::TwoQ(..)
+			| PaperPolicy::Arc
+			| PaperPolicy::SThreeFifo(..) => 0,
+		};
 	}
 
 	// The value's Arc header is DRAM-resident regardless of which tier the
@@ -985,4 +917,56 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// DRAM, and the allocator holds more than was requested (size-class
 	// rounding plus retained freed pages; see `DEFAULT_RESIDENT_FACTOR`).
 	(overhead as f64 * resident_factor()) as ObjectSize
+}
+
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod shared_overhead_is_feature_independent {
+	use super::*;
+
+	/// A policy's DRAM term must not depend on which *other* stack modules were
+	/// compiled.
+	///
+	/// This is a regression test for a silent, whole-sweep measurement error.
+	/// The terms used to be `cfg`-gated per policy, so a binary built with only
+	/// `lru_hybrid_cache` -- which is how the benchmark was configured --
+	/// charged every non-LRU policy `Arc(48) + map(63) = 111 -> 124` B/object
+	/// instead of its real 196 or 228. Each of those policies was therefore
+	/// handed a larger effective fast tier than it should have had, and nothing
+	/// failed: no error, no warning, no test.
+	///
+	/// This test runs under whatever feature set the build has, so it fails if
+	/// anyone reintroduces the gating.
+	#[test]
+	fn every_hybrid_policy_keeps_its_own_term() {
+		if std::env::var_os("PAPER_DISABLE_SHARED_OVERHEAD").is_some() {
+			return; // the escape hatch zeroes everything by design
+		}
+
+		let lru = get_hybrid_dram_shared_overhead(&PaperPolicy::LruHybrid);
+		let lfu = get_hybrid_dram_shared_overhead(&PaperPolicy::LfuHybrid);
+		let fifo = get_hybrid_dram_shared_overhead(&PaperPolicy::FifoHybrid);
+		let s3 = get_hybrid_dram_shared_overhead(&PaperPolicy::S3FifoHybrid(0.1));
+
+		// The value with NO eviction-stack term -- what a gated-out policy used
+		// to collapse to. No hybrid policy may equal it.
+		let no_stack_term =
+			((ARC_VALUE_HEADER_OVERHEAD + OBJECT_MAP_ENTRY_OVERHEAD) as f64
+				* resident_factor()) as ObjectSize;
+
+		for (name, got) in [("lru", lru), ("lfu", lfu), ("fifo", fifo), ("s3-fifo", s3)] {
+			assert_ne!(
+				got, no_stack_term,
+				"{name} lost its eviction-stack term and collapsed to {no_stack_term} \
+				 B/object -- the per-policy cfg gating is back",
+			);
+		}
+
+		// LFU carries a frequency structure the others do not (44+29+20 vs 44+20).
+		assert!(
+			lfu > lru,
+			"lfu ({lfu}) must exceed lru ({lru}): it has the extra frequency term",
+		);
+		assert_eq!(fifo, lru, "fifo and lru have the same 44+20 stack shape");
+		assert_eq!(s3, lru, "s3-fifo and lru have the same 44+20 stack shape");
+	}
 }
