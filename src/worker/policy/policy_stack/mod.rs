@@ -41,6 +41,7 @@ mod lru_compact_hybrid_stack;
 mod lfu_compact_hybrid_stack;
 mod two_q_compact_hybrid_stack;
 mod two_q_hybrid_stack;
+mod two_q_fast_admission_compact_hybrid_stack;
 mod two_q_fast_admission_hybrid_stack;
 mod two_q_fast_admission_reprieve_hybrid_stack;
 mod two_q_full_fast_admission_hybrid_stack;
@@ -82,6 +83,7 @@ use crate::{
 		lfu_compact_hybrid_stack::LfuCompactHybridStack,
 		two_q_compact_hybrid_stack::TwoQCompactHybridStack,
 		two_q_hybrid_stack::TwoQHybridStack,
+		two_q_fast_admission_compact_hybrid_stack::TwoQFastAdmissionCompactHybridStack,
 		two_q_fast_admission_hybrid_stack::TwoQFastAdmissionHybridStack,
 		two_q_fast_admission_reprieve_hybrid_stack::TwoQFastAdmissionReprieveHybridStack,
 		two_q_full_fast_admission_hybrid_stack::TwoQFullFastAdmissionHybridStack,
@@ -508,6 +510,15 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// the budget via `ResizeFastTier` immediately after construction
 		// anyway, but it is worth knowing when picking k_in.
 		#[cfg(feature = "hybrid_cache_common")]
+		// Same construction as `TwoQFastAdmissionHybrid`.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::TwoQFastAdmissionCompactHybrid(k_in) => Box::new(
+			TwoQFastAdmissionCompactHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)
+				.with_shared_overhead(
+					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+				),
+		),
+
 		PaperPolicy::TwoQFastAdmissionHybrid(k_in) => Box::new(
 			TwoQFastAdmissionHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
@@ -715,6 +726,8 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::TwoQHybrid(k_in) => Box::new(TwoQHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::TwoQFastAdmissionCompactHybrid(k_in) => Box::new(TwoQFastAdmissionCompactHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
+		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::TwoQFastAdmissionHybrid(k_in) => Box::new(TwoQFastAdmissionHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::TwoQFastAdmissionReprieveHybrid(k_in) => Box::new(TwoQFastAdmissionReprieveHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
@@ -803,11 +816,11 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 33;
+	const POLICY_VARIANT_COUNT: usize = 34;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the 18
 	/// tiered designs this crate exists to compare.
-	const HYBRID_DESIGN_COUNT: usize = 23;
+	const HYBRID_DESIGN_COUNT: usize = 24;
 
 	/// Every `PaperPolicy` variant, listed explicitly, in declaration order.
 	///
@@ -837,6 +850,7 @@ mod init_policy_stack_tests {
 		(PaperPolicy::LfuCompactHybrid, PaperPolicy::LfuCompactHybrid),
 		(PaperPolicy::TwoQCompactHybrid(0.1), PaperPolicy::TwoQCompactHybrid(0.9)),
 		(PaperPolicy::TwoQHybrid(0.1), PaperPolicy::TwoQHybrid(0.9)),
+		(PaperPolicy::TwoQFastAdmissionCompactHybrid(0.1), PaperPolicy::TwoQFastAdmissionCompactHybrid(0.9)),
 		(PaperPolicy::TwoQFastAdmissionHybrid(0.1), PaperPolicy::TwoQFastAdmissionHybrid(0.9)),
 		(PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.9)),
 		(PaperPolicy::TwoQFullFastAdmissionHybrid(0.25, 0.25), PaperPolicy::TwoQFullFastAdmissionHybrid(0.5, 0.4)),
@@ -880,6 +894,7 @@ mod init_policy_stack_tests {
 			PaperPolicy::LfuCompactHybrid => "LfuCompactHybrid",
 			PaperPolicy::TwoQCompactHybrid(_) => "TwoQCompactHybrid",
 			PaperPolicy::TwoQHybrid(_) => "TwoQHybrid",
+			PaperPolicy::TwoQFastAdmissionCompactHybrid(_) => "TwoQFastAdmissionCompactHybrid",
 			PaperPolicy::TwoQFastAdmissionHybrid(_) => "TwoQFastAdmissionHybrid",
 			PaperPolicy::TwoQFastAdmissionReprieveHybrid(_) => "TwoQFastAdmissionReprieveHybrid",
 			PaperPolicy::TwoQFullFastAdmissionHybrid(..) => "TwoQFullFastAdmissionHybrid",

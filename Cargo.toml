@@ -179,6 +179,7 @@ two_q_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` makes for the
 # s3-fifo family. Same dependency reasoning as the other hybrids.
 #
+two_q_fast_admission_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 two_q_fast_admission_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # As `two_q_fast_admission_hybrid_cache`, but a one-access object that ages out

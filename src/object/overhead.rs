@@ -187,6 +187,7 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// which physical tier the one-access FIFO queue's bytes live in (fast
 		// rather than slow) — a placement decision that costs no extra
 		// per-key metadata.
+		PaperPolicy::TwoQFastAdmissionCompactHybrid(_) => 16 + 24,
 		PaperPolicy::TwoQFastAdmissionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
 
 		// Structurally identical again: the reprieve variant changes where an
@@ -685,6 +686,13 @@ const TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
 const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
+
+/// Per-object DRAM cost of `TwoQFastAdmissionCompactHybridStack`.
+///
+/// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
+/// payload with the compact 2Q and S3-FIFO stacks, both MEASURED at 72.
+#[cfg(feature = "hybrid_cache_common")]
+const TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -1385,6 +1393,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			PaperPolicy::FifoHybrid => FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQCompactHybrid(..) => TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQHybrid(..) => TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::TwoQFastAdmissionCompactHybrid(..) => TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQFastAdmissionHybrid(..) => TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQFastAdmissionReprieveHybrid(..) => TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQFullFastAdmissionHybrid(..) => TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
