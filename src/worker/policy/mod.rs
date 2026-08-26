@@ -1985,7 +1985,7 @@ mod migration_queue_tests {
 }
 
 #[cfg(all(test, feature = "lru_hybrid_cache"))]
-mod hybrid_tests {
+mod lru_hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -2263,7 +2263,7 @@ mod hybrid_tests {
 }
 
 #[cfg(all(test, feature = "lfu_hybrid_cache"))]
-mod hybrid_tests {
+mod lfu_hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -2539,7 +2539,7 @@ mod hybrid_tests {
 }
 
 #[cfg(all(test, feature = "fifo_hybrid_cache"))]
-mod hybrid_tests {
+mod fifo_hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -2808,7 +2808,7 @@ mod hybrid_tests {
 }
 
 #[cfg(all(test, feature = "two_q_fast_admission_hybrid_cache"))]
-mod hybrid_tests {
+mod two_q_fast_admission_hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -3153,7 +3153,7 @@ mod hybrid_tests {
 }
 
 #[cfg(all(test, feature = "two_q_fast_admission_reprieve_hybrid_cache"))]
-mod hybrid_tests {
+mod two_q_fast_admission_reprieve_hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -3620,7 +3620,7 @@ mod hybrid_tests {
 }
 
 #[cfg(all(test, feature = "two_q_hybrid_cache"))]
-mod hybrid_tests {
+mod two_q_hybrid_tests {
 	use super::*;
 
 	use crate::{
@@ -3890,7 +3890,7 @@ mod hybrid_tests {
 }
 
 #[cfg(all(test, feature = "lru_sized_hybrid_cache"))]
-mod hybrid_tests {
+mod lru_sized_hybrid_tests {
 	use super::*;
 
 	use crate::{

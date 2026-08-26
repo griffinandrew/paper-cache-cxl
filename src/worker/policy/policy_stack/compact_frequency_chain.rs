@@ -190,6 +190,30 @@ impl CompactFrequencyChain {
 		Some(self.slots[head as usize].key)
 	}
 
+	/// The lowest frequency present in a tier, or `None` if it is empty.
+	///
+	/// The promotion rule compares a slow key's new count against this: a slow
+	/// key overtakes the fast tier only by *strictly* exceeding its minimum.
+	pub fn min_count(&self, tier: Tier) -> Option<u32> {
+		let buckets = match tier {
+			Tier::Fast => &self.fast_buckets,
+			Tier::Slow => &self.slow_buckets,
+		};
+
+		buckets.keys().next().copied()
+	}
+
+	/// The least-frequently-used key in a tier together with its count.
+	pub fn min_with_count(&self, tier: Tier) -> Option<(HashedKey, u32)> {
+		let buckets = match tier {
+			Tier::Fast => &self.fast_buckets,
+			Tier::Slow => &self.slow_buckets,
+		};
+
+		let (&freq, &(head, _)) = buckets.iter().next()?;
+		Some((self.slots[head as usize].key, freq))
+	}
+
 	pub fn remove(&mut self, key: HashedKey) -> Option<CompactEntry> {
 		let slot = self.index.remove(&key)?;
 		let entry = self.slots[slot as usize];
@@ -398,6 +422,33 @@ mod tests {
 
 	/// Two bucket sets over one slab: a tier move relinks the key without
 	/// touching the slab or the index, so every other link stays valid.
+
+	/// A tier move is the *only* thing that happens on promotion or demotion.
+	///
+	/// `FrequencyChain` has to `remove` from one chain and `insert_at` into the
+	/// other, carrying the count across by hand. Here the entry never moves in
+	/// the slab, so its frequency, size and links are all preserved by
+	/// construction -- there is no count to carry and nothing to get wrong.
+	#[test]
+	fn promotion_is_a_tier_move_and_nothing_else() {
+		let mut c = CompactFrequencyChain::default();
+		c.insert(1, 100, 24, Tier::Fast);
+		c.insert(2, 200, 24, Tier::Slow);
+		for _ in 0..5 { c.bump(2); }
+
+		assert_eq!(c.min_count(Tier::Fast), Some(1));
+		assert_eq!(c.min_count(Tier::Slow), Some(6));
+
+		// key 2 strictly exceeds the fast minimum, so it promotes
+		c.set_tier(2, Tier::Fast);
+
+		assert_eq!(c.get(2).unwrap().freq, 6, "count survives the move");
+		assert_eq!(c.get(2).unwrap().size, 200, "size survives the move");
+		assert_eq!(c.min_count(Tier::Slow), None);
+		assert_eq!(c.min_with_count(Tier::Fast), Some((1, 1)),
+			"key 1 is still the fast minimum at count 1");
+	}
+
 	#[test]
 	fn moving_a_key_between_tiers_preserves_its_frequency_and_position() {
 		let mut c = CompactFrequencyChain::default();

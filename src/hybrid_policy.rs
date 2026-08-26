@@ -65,7 +65,16 @@ pub fn admission_tier<K>(
 				Some(crate::Tier::Fast) | None => crate::Tier::Fast,
 			}
 		},
-		PaperPolicy::LfuHybrid => {
+		// LfuCompactHybrid shares LfuHybrid's admission contract exactly: it
+		// admits to fast until the tier fills, then latches shut. Omitting it
+		// here did not fail to compile -- it fell through to the catch-all
+		// below and every brand-new key was built in DRAM regardless of the
+		// latch, while the stack recorded it as slow and emitted no migration
+		// (the latched path deliberately emits none, because it trusts this
+		// function to have placed the bytes already). The fast tier then
+		// physically held objects the stack believed were in PMEM, and 63% of
+		// promotions were declined as "already in the requested tier".
+		PaperPolicy::LfuHybrid | PaperPolicy::LfuCompactHybrid => {
 			match objects.get_ref(&hashed_key) {
 				Some(object) => match object.data().is_fast() {
 					true => crate::Tier::Fast,
@@ -122,6 +131,23 @@ pub fn admission_tier<K>(
 				None => crate::Tier::Slow,
 			}
 		},
-		_ => crate::Tier::Fast,
+		// Exhaustive on purpose -- NO catch-all. Every arm above is a
+		// deliberate admission contract, and a policy that reaches this
+		// function without one gets whatever the fallback happened to be,
+		// silently. That is exactly how `LfuCompactHybrid` spent a full
+		// evaluation admitting into the wrong tier. Adding a policy is now a
+		// compile error until its admission tier is stated.
+		// All-DRAM policies never reach here (no tiers), but the match must
+		// still name them.
+		PaperPolicy::Auto
+		| PaperPolicy::Lfu
+		| PaperPolicy::Fifo
+		| PaperPolicy::Clock
+		| PaperPolicy::Sieve
+		| PaperPolicy::Lru
+		| PaperPolicy::Mru
+		| PaperPolicy::TwoQ(..)
+		| PaperPolicy::Arc
+		| PaperPolicy::SThreeFifo(..) => crate::Tier::Fast,
 	}
 }

@@ -166,6 +166,11 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// TwoQ/Arc/SThreeFifo)
 		PaperPolicy::LfuHybrid => (24 + 48 + 8 + 4) + (24 + 1 + 4),
 
+		// One 32-byte slab slot plus a 16-byte index entry. No `entries` map
+		// and no per-key list node: the slot the index returns already carries
+		// tier, size and frequency. Measured 47.4 B/key against this 48.
+		PaperPolicy::LfuCompactHybrid => 32 + 16,
+
 		// Worst-case charge for a key resident in main_stack as Fast:
 		// 48-byte HashList entry + 8-byte HashedKey + a single combined
 		// per-key `entries` HashMap entry (queue + tier + size, one map —
@@ -370,8 +375,18 @@ pub const HASHTABLE_ENTRY_OVERHEAD: ObjectSize = 11;
 /// double-charges the key (see the derivation block above) — an error that
 /// roughly canceled out there, but isn't a reliable basis to build on for a
 /// *different* budget with its own correctness requirements.
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Dedicated per-object DRAM cost of `LfuHybridStack`'s eviction-stack
 /// bookkeeping: this key's entry in its current chain's internal
@@ -390,8 +405,44 @@ const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// making that marginal cost amortize toward zero in aggregate; charging it
 /// per-key would model the rare worst case (one key per frequency) as the
 /// typical one.
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 29 + 20;
+const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 147;
+
+/// Per-object DRAM cost of `LfuCompactHybridStack`'s eviction-stack
+/// bookkeeping.
+///
+/// One slab slot (32 -- key 8, prev/next 4 each, freq 4, size 4, tier and
+/// resident 1 each, padded) plus one `HashMap<HashedKey, u32>` index entry
+/// (16 with hashbrown's slack). There is no third structure: the slot the
+/// index returns already carries tier and size, so the `entries` map that
+/// `LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`'s trailing `20` pays for does
+/// not exist here.
+///
+/// Unlike every other constant in this block, this one is **measured**:
+/// 47.4 B/key as an RSS delta over two million keys, against this model's
+/// 48. `FrequencyChain` measured 95.9 against its model of 93.
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
+#[cfg(feature = "hybrid_cache_common")]
+const LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 66;
 
 /// Dedicated per-object DRAM cost of `LruSizedHybridStack`'s eviction-stack
 /// bookkeeping. Identical derivation and identical value to
@@ -403,8 +454,18 @@ const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 29 + 20;
 /// as a single total here; `LruSizedHybridStack` is responsible for
 /// splitting it proportionally between its two independently-capacitied
 /// fast segments (the two slow lists have no capacity to reserve against).
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Dedicated per-object DRAM cost of `LruLfuHybridStack`'s eviction-stack
 /// bookkeeping. A key is resident in exactly one tier's structure at a time,
@@ -424,8 +485,18 @@ const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// `eviction_stacks_pmem` the whole term drops out anyway (both structures
 /// move to PMEM). Charged at the fast-tier figure, which is what the
 /// reservation is actually protecting.
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-*ghost-entry* DRAM cost shared by every hybrid design that keeps a
 /// bare-key ghost queue (`TwoQGhostHybrid`, and the four `S3Fifo*Ghost*`
@@ -483,8 +554,18 @@ pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `TwoQHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -501,8 +582,18 @@ const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -519,8 +610,18 @@ const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -537,8 +638,18 @@ const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `TwoQFullFastAdmissionHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -554,8 +665,18 @@ const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectS
 /// so it is never resident in two at once. There is no ghost list to charge
 /// for either — `a1_out` holds real resident objects, which are already
 /// counted as tracked keys.
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `TwoQGhostHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -580,8 +701,18 @@ const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize 
 /// path never called -- which is how a ghost reached 1.94 GB, 45% of a
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `S3FifoHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -598,8 +729,18 @@ const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `S3FifoGhostHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -624,8 +765,18 @@ const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// path never called -- which is how a ghost reached 1.94 GB, 45% of a
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -650,8 +801,18 @@ const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
 /// path never called -- which is how a ghost reached 1.94 GB, 45% of a
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -676,8 +837,18 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSiz
 /// path never called -- which is how a ghost reached 1.94 GB, 45% of a
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -702,8 +873,18 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVER
 /// path never called -- which is how a ghost reached 1.94 GB, 45% of a
 /// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
 /// ghost entries outlive the tracked keys they came from.
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionReprieveHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -720,8 +901,18 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -738,8 +929,18 @@ const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: Object
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -756,8 +957,18 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_O
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -774,8 +985,18 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STA
 /// stored once, inside the heap node, and is not charged again (the
 /// double-charge [`get_policy_overhead`] makes and this module's derivation
 /// block flags).
+///
+/// MEASURED, not derived. The figure is the least-squares slope of resident
+/// bytes against object count, sampled one-point-per-process at 2^20..2^23
+/// objects (R^2 >= 0.9999); see `policy_stack::measure_overhead`. The
+/// field-by-field derivation that used to sit here understated this stack by
+/// roughly a third, because it counted struct fields and not what the
+/// allocator actually resides: size-class rounding, index-map load factor and
+/// the growth slack of every doubling structure. Being measured resident, it
+/// is NOT multiplied by `resident_factor()` -- see the split in
+/// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
-const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 44 + 20;
+const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 100;
 
 
 /// Approximate per-object DRAM cost of the *shared* structures (the object
@@ -954,11 +1175,16 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	//
 	// The match is exhaustive deliberately: adding a policy without giving it an
 	// overhead term is now a compile error rather than a silent zero.
+	// Measured resident, kept separate from the derived terms below.
+	#[allow(unused_mut)]
+	let mut stack_resident: ObjectSize = 0;
+
 	#[cfg(not(feature = "eviction_stacks_pmem"))]
 	{
-		overhead += match policy {
+		stack_resident = match policy {
 			PaperPolicy::LruHybrid => LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LfuHybrid => LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::LfuCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruSizedHybrid => LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruLfuHybrid(..) => LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::FifoHybrid => FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
@@ -989,6 +1215,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			| PaperPolicy::Arc
 			| PaperPolicy::SThreeFifo(..) => 0,
 		};
+		overhead += stack_resident;
 	}
 
 	// The value's Arc header is DRAM-resident regardless of which tier the
@@ -1005,7 +1232,14 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// Requested -> resident: what this reservation is protecting is real
 	// DRAM, and the allocator holds more than was requested (size-class
 	// rounding plus retained freed pages; see `DEFAULT_RESIDENT_FACTOR`).
-	(overhead as f64 * resident_factor()) as ObjectSize
+	//
+	// This applies to the Arc header and map entry only. The eviction-stack
+	// term is subtracted out first and added back afterwards, because it is
+	// MEASURED RESIDENT -- it comes from RSS (see `measure_overhead`), so it
+	// already contains the size-class rounding and retained pages this factor
+	// exists to model. Multiplying it again would charge that rounding twice.
+	let derived = overhead - stack_resident;
+	stack_resident + (derived as f64 * resident_factor()) as ObjectSize
 }
 
 #[cfg(all(test, feature = "hybrid_cache_common"))]
