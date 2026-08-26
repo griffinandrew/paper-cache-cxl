@@ -689,8 +689,13 @@ const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionCompactHybridStack`.
 ///
-/// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
-/// payload with the compact 2Q and S3-FIFO stacks, both MEASURED at 72.
+/// MEASURED: jemalloc `stats.allocated`, one point per process at 2^20..2^23
+/// objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// 72 B against `TwoQFastAdmissionHybridStack`'s 112 -- a 35.7% reduction, and
+/// equal to the compact 2Q, S3-FIFO and LRU stacks. All four share
+/// `CompactQueueSet` and an 8-byte payload, so equality was the prediction and
+/// the measurement confirms it.
 #[cfg(feature = "hybrid_cache_common")]
 const TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
