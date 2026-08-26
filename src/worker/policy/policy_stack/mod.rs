@@ -15,12 +15,29 @@ mod two_q_stack;
 mod arc_stack;
 mod s_three_fifo_stack;
 pub(crate) mod ghost_filter;
+/// Upper bound on how many slab entries a compact stack pre-reserves.
+///
+/// `fast_capacity / shared_overhead` is a sound ceiling on the entry count, but
+/// it is not a BOUNDED one: with a large `max_size` it runs to billions, and
+/// reserving it outright asks the allocator for petabytes. That is not
+/// hypothetical -- it aborted with "memory allocation of 122978293824730344
+/// bytes failed" the first time a compact stack was constructed with
+/// `u64::MAX / 4` as the budget.
+///
+/// 2^22 entries is ~100 MB of slab, which removes essentially every doubling
+/// at realistic cache sizes while staying an amount an allocator will actually
+/// hand over. Growth past it still doubles, but from a base large enough that
+/// the remaining copies are few.
+pub(crate) const MAX_PREALLOC_ENTRIES: usize = 1 << 22;
+
+pub(crate) mod compact_recency_list;
 pub(crate) mod compact_frequency_chain;
 #[cfg(test)]
 mod measure_overhead;
 mod lru_hybrid_stack;
 mod lru_lfu_hybrid_stack;
 mod lfu_hybrid_stack;
+mod lru_compact_hybrid_stack;
 mod lfu_compact_hybrid_stack;
 mod two_q_hybrid_stack;
 mod two_q_fast_admission_hybrid_stack;
@@ -59,6 +76,7 @@ use crate::{
 		lru_hybrid_stack::LruHybridStack,
 		lru_lfu_hybrid_stack::LruLfuHybridStack,
 		lfu_hybrid_stack::LfuHybridStack,
+		lru_compact_hybrid_stack::LruCompactHybridStack,
 		lfu_compact_hybrid_stack::LfuCompactHybridStack,
 		two_q_hybrid_stack::TwoQHybridStack,
 		two_q_fast_admission_hybrid_stack::TwoQFastAdmissionHybridStack,
@@ -432,6 +450,19 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// gets a larger effective fast tier than every policy it is compared
 		// against, which is exactly how the first run of this variant produced
 		// a flattering and meaningless result.
+		// Same construction as `LruHybrid` -- same budget, same reservation.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::LruCompactHybrid => Box::new(
+			LruCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)
+				.with_shared_overhead(
+					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+				),
+		),
+
+		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::LruCompactHybrid =>
+			Box::new(LruCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
+
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::LfuCompactHybrid => Box::new(
 			LfuCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)
@@ -743,11 +774,11 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 30;
+	const POLICY_VARIANT_COUNT: usize = 31;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the 18
 	/// tiered designs this crate exists to compare.
-	const HYBRID_DESIGN_COUNT: usize = 20;
+	const HYBRID_DESIGN_COUNT: usize = 21;
 
 	/// Every `PaperPolicy` variant, listed explicitly, in declaration order.
 	///
@@ -773,6 +804,7 @@ mod init_policy_stack_tests {
 		(PaperPolicy::SThreeFifo(0.1), PaperPolicy::SThreeFifo(0.9)),
 		(PaperPolicy::LruHybrid, PaperPolicy::LruHybrid),
 		(PaperPolicy::LfuHybrid, PaperPolicy::LfuHybrid),
+		(PaperPolicy::LruCompactHybrid, PaperPolicy::LruCompactHybrid),
 		(PaperPolicy::LfuCompactHybrid, PaperPolicy::LfuCompactHybrid),
 		(PaperPolicy::TwoQHybrid(0.1), PaperPolicy::TwoQHybrid(0.9)),
 		(PaperPolicy::TwoQFastAdmissionHybrid(0.1), PaperPolicy::TwoQFastAdmissionHybrid(0.9)),
@@ -813,6 +845,7 @@ mod init_policy_stack_tests {
 			PaperPolicy::SThreeFifo(_) => "SThreeFifo",
 			PaperPolicy::LruHybrid => "LruHybrid",
 			PaperPolicy::LfuHybrid => "LfuHybrid",
+			PaperPolicy::LruCompactHybrid => "LruCompactHybrid",
 			PaperPolicy::LfuCompactHybrid => "LfuCompactHybrid",
 			PaperPolicy::TwoQHybrid(_) => "TwoQHybrid",
 			PaperPolicy::TwoQFastAdmissionHybrid(_) => "TwoQFastAdmissionHybrid",

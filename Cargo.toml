@@ -151,6 +151,7 @@ lfu_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # LFU over a slab-backed frequency chain: identical policy to
 # lfu_hybrid_cache, one structure instead of three. Measured 47.4 B/key
 # against 95.9, and faster on every trace tested.
+lru_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 lfu_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance, segmented-2Q hybrid cache: same one-PaperCache<K,

@@ -169,6 +169,7 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// One 32-byte slab slot plus a 16-byte index entry. No `entries` map
 		// and no per-key list node: the slot the index returns already carries
 		// tier, size and frequency. Measured 47.4 B/key against this 48.
+		PaperPolicy::LruCompactHybrid => 24 + 16,
 		PaperPolicy::LfuCompactHybrid => 32 + 16,
 
 		// Worst-case charge for a key resident in main_stack as Fast:
@@ -439,6 +440,24 @@ const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 147;
 /// roughly a third, because it counted struct fields and not what the
 /// allocator actually resides: size-class rounding, index-map load factor and
 /// the growth slack of every doubling structure. Being measured resident, it
+/// Per-object DRAM cost of `LruCompactHybridStack`'s eviction stack.
+///
+/// MEASURED, not derived: jemalloc `stats.allocated`, one point per process at
+/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+///
+/// 64 B against `LruHybridStack`'s measured 112 -- a 42.9% reduction, and
+/// below even the 72 B that NON-tiered all-DRAM LRU costs, because a 24-byte
+/// slab entry beats a `kwik::HashList` node that jemalloc rounds to the 32-byte
+/// size class. The saving is the elimination of the second index: today a
+/// `HashList` carries its own key->node map AND a separate `entries` map holds
+/// the 8-byte payload, both one row per object.
+///
+/// Measured with `PAPER_DISABLE_SHARED_OVERHEAD=1`, so the stack's own
+/// pre-reservation does not enter the figure. With the reservation active the
+/// slab doubles out of it partway through the sample range, which puts a step
+/// in the curve and drops the fit to R^2 0.84.
+const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 64;
+
 /// is NOT multiplied by `resident_factor()` -- see the split in
 /// `get_hybrid_dram_shared_overhead`.
 #[cfg(feature = "hybrid_cache_common")]
@@ -1184,6 +1203,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 		stack_resident = match policy {
 			PaperPolicy::LruHybrid => LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LfuHybrid => LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::LruCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LfuCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruSizedHybrid => LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruLfuHybrid(..) => LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
