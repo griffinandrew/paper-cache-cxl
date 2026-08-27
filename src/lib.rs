@@ -1783,6 +1783,88 @@ fn s_three_fifo_starves_main(policy: PaperPolicy, max_size: CacheSize) -> bool {
 /// config that works. The 2Q designs are absent for the same reason, one step
 /// further: they derive no budget from `1 - k_in` at all.
 #[cfg(feature = "hybrid_cache_common")]
+/// Parameter ranges the per-design constructors used to enforce. Extracted
+/// from `new_hybrid` so it can be CALLED: the `_ => true` arm below fails
+/// OPEN, so a design missing from it is silently ACCEPTED with parameters
+/// its baseline rejects, and as a `let` inside the constructor that could
+/// not be asserted on. `compact_parity` now checks every baseline/compact
+/// pair agrees here.
+fn params_ok(policy: PaperPolicy) -> bool {
+	match policy {
+		PaperPolicy::LruLfuHybrid(promote_k)
+		| PaperPolicy::LruLfuCompactHybrid(promote_k) => promote_k != 0,
+
+		// The one two-ratio design: BOTH must be in range, so it cannot
+		// join the single-ratio group below.
+		PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out)
+		| PaperPolicy::TwoQFullFastAdmissionCompactHybrid(k_in, k_out) => {
+			(0.0..=1.0).contains(&k_in) && (0.0..=1.0).contains(&k_out)
+		},
+
+		// The 2Q family keeps an INCLUSIVE upper bound. No 2Q stack
+		// derives a budget from `1 - k_in`: `fifo_capacity` is
+		// `k_in * max_size` and the main queue is bounded by the
+		// cache's overall `max_size`, so `k_in == 1.0` gives the FIFO
+		// queue the whole cache -- extreme, but every queue still has
+		// capacity and eviction drains the FIFO tail unconditionally.
+		PaperPolicy::TwoQHybrid(r)
+		| PaperPolicy::TwoQCompactHybrid(r)
+		| PaperPolicy::TwoQFastAdmissionCompactHybrid(r)
+		| PaperPolicy::TwoQFastAdmissionHybrid(r)
+		| PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(r)
+		| PaperPolicy::TwoQFastAdmissionReprieveHybrid(r)
+		| PaperPolicy::TwoQGhostCompactHybrid(r)
+		| PaperPolicy::TwoQGhostHybrid(r) => (0.0..=1.0).contains(&r),
+
+		// The s3-fifo family EXCLUDES 1.0. These stacks size the main
+		// queue at `(1 - ratio) * max_size`, mirroring
+		// `SThreeFifoStack`, so a ratio of exactly 1 leaves it zero
+		// bytes. `Stack::is_full` is `used >= max`, so an *empty* main
+		// queue then reports itself full: `evict_one` skips the
+		// one-access queue and `evict_main` pops nothing, returning
+		// `None` while the cache is still over budget, and
+		// `apply_evictions` spins on it. Rejecting the endpoint makes
+		// that unreachable rather than guarding it after the fact.
+		// (`SThreeFifoStack` has the same degeneracy at 1.0; its own
+		// parser is tightened to match.)
+		PaperPolicy::S3FifoHybrid(r)
+		| PaperPolicy::S3FifoCompactHybrid(r)
+		| PaperPolicy::S3FifoGhostCompactHybrid(r)
+		| PaperPolicy::S3FifoGhostHybrid(r)
+		| PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(r)
+		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(r)
+		| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
+		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
+		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(r)
+		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(r) => {
+			(0.0..1.0).contains(&r)
+		},
+
+		// The four reprieve designs keep the INCLUSIVE bound, for the
+		// same reason the 2Q family does: they derive no budget from
+		// `1 - ratio`. Their `evict_one` is purely the main queue's tail
+		// loop -- the one-access queue never reaches it, being drained
+		// synchronously by `settle_one_access()` against its own
+		// capacity -- so the `!main.is_full()` dispatch gate that
+		// `main_capacity` exists to serve is absent here, and no queue
+		// can report itself full at zero capacity. Their real budgets
+		// (`one_access_capacity` and `fast_capacity`) partition the
+		// DRAM/PMEM axis instead, which `1 - ratio` says nothing about.
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(r)
+		| PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(r)
+		| PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(r)
+		| PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(r)
+		| PaperPolicy::S3FifoLazyDemotionReprieveHybrid(r)
+		| PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(r)
+		| PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(r)
+		| PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(r) => {
+			(0.0..=1.0).contains(&r)
+		},
+
+		_ => true,
+	}
+}
+
 fn s3_fifo_queue_budgets(policy: PaperPolicy) -> Option<(f64, bool)> {
 	match policy {
 		// These five size main at `(1 - ratio) * max_size`, mirroring
@@ -1897,81 +1979,7 @@ where
 		// every ratio-shaped parameter lives in [0, 1], and a promotion
 		// threshold of zero degenerates to plain LRU and is rejected rather
 		// than silently meaning something else.
-		let params_ok = match policy {
-			PaperPolicy::LruLfuHybrid(promote_k)
-			| PaperPolicy::LruLfuCompactHybrid(promote_k) => promote_k != 0,
-
-			// The one two-ratio design: BOTH must be in range, so it cannot
-			// join the single-ratio group below.
-			PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out)
-			| PaperPolicy::TwoQFullFastAdmissionCompactHybrid(k_in, k_out) => {
-				(0.0..=1.0).contains(&k_in) && (0.0..=1.0).contains(&k_out)
-			},
-
-			// The 2Q family keeps an INCLUSIVE upper bound. No 2Q stack
-			// derives a budget from `1 - k_in`: `fifo_capacity` is
-			// `k_in * max_size` and the main queue is bounded by the
-			// cache's overall `max_size`, so `k_in == 1.0` gives the FIFO
-			// queue the whole cache -- extreme, but every queue still has
-			// capacity and eviction drains the FIFO tail unconditionally.
-			PaperPolicy::TwoQHybrid(r)
-			| PaperPolicy::TwoQCompactHybrid(r)
-			| PaperPolicy::TwoQFastAdmissionCompactHybrid(r)
-			| PaperPolicy::TwoQFastAdmissionHybrid(r)
-			| PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(r)
-			| PaperPolicy::TwoQFastAdmissionReprieveHybrid(r)
-			| PaperPolicy::TwoQGhostCompactHybrid(r)
-			| PaperPolicy::TwoQGhostHybrid(r) => (0.0..=1.0).contains(&r),
-
-			// The s3-fifo family EXCLUDES 1.0. These stacks size the main
-			// queue at `(1 - ratio) * max_size`, mirroring
-			// `SThreeFifoStack`, so a ratio of exactly 1 leaves it zero
-			// bytes. `Stack::is_full` is `used >= max`, so an *empty* main
-			// queue then reports itself full: `evict_one` skips the
-			// one-access queue and `evict_main` pops nothing, returning
-			// `None` while the cache is still over budget, and
-			// `apply_evictions` spins on it. Rejecting the endpoint makes
-			// that unreachable rather than guarding it after the fact.
-			// (`SThreeFifoStack` has the same degeneracy at 1.0; its own
-			// parser is tightened to match.)
-			PaperPolicy::S3FifoHybrid(r)
-			| PaperPolicy::S3FifoCompactHybrid(r)
-			| PaperPolicy::S3FifoGhostCompactHybrid(r)
-			| PaperPolicy::S3FifoGhostHybrid(r)
-			| PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(r)
-			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(r)
-			| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
-			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
-			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(r)
-			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(r) => {
-				(0.0..1.0).contains(&r)
-			},
-
-			// The four reprieve designs keep the INCLUSIVE bound, for the
-			// same reason the 2Q family does: they derive no budget from
-			// `1 - ratio`. Their `evict_one` is purely the main queue's tail
-			// loop -- the one-access queue never reaches it, being drained
-			// synchronously by `settle_one_access()` against its own
-			// capacity -- so the `!main.is_full()` dispatch gate that
-			// `main_capacity` exists to serve is absent here, and no queue
-			// can report itself full at zero capacity. Their real budgets
-			// (`one_access_capacity` and `fast_capacity`) partition the
-			// DRAM/PMEM axis instead, which `1 - ratio` says nothing about.
-			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(r)
-			| PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(r)
-			| PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(r)
-			| PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(r)
-			| PaperPolicy::S3FifoLazyDemotionReprieveHybrid(r)
-			| PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(r)
-			| PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(r)
-			| PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(r) => {
-				(0.0..=1.0).contains(&r)
-			},
-
-			_ => true,
-		};
-
-		if !params_ok {
+		if !params_ok(policy) {
 			return Err(CacheError::InvalidPolicy);
 		}
 
@@ -3335,5 +3343,200 @@ mod s_three_fifo_budget_tests {
 		assert!(!s_three_fifo_starves_main(PaperPolicy::TwoQ(1.0, 0.0), 1_000));
 		assert!(!s_three_fifo_starves_main(PaperPolicy::Lru, 1_000));
 		assert!(!s_three_fifo_starves_main(PaperPolicy::Lfu, 1_000));
+	}
+}
+
+/// Every compact stack must be behaviourally indistinguishable from the
+/// baseline it compacts. Four crate-level predicates decide how a policy is
+/// treated, and **all four fail OPEN** -- a design missing from them is not a
+/// compile error, it is a plausible default:
+///
+/// | predicate | missing arm yields |
+/// |---|---|
+/// | `params_ok` | `true` -- ACCEPTS parameters the baseline rejects |
+/// | `s3_fifo_queue_budgets` | `None` -- skips the queue-starvation check |
+/// | `PaperPolicy::is_hybrid` | `false` -- no fast tier at all |
+/// | `Display`/`FromStr` | a policy that cannot be named or parsed |
+///
+/// Every conversion in this series missed at least one, and none of them
+/// failed to build. This module pins each compact twin to its baseline, so
+/// the next conversion that forgets a site fails here instead of silently
+/// running a different algorithm than the one it is being compared against.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod compact_parity {
+	use crate::{PaperPolicy, params_ok, s3_fifo_queue_budgets};
+
+	/// Deliberately includes both endpoints and beyond: the 2Q family and the
+	/// reprieve designs take an INCLUSIVE upper bound while the s3-fifo family
+	/// EXCLUDES 1.0 (those size a main queue at `(1 - ratio) * max_size`, so
+	/// 1.0 leaves it zero bytes and the eviction loop spins). A twin placed in
+	/// the wrong group agrees everywhere except at exactly 1.0.
+	const RATIOS: [f64; 10] =
+		[-1.0, -0.001, 0.0, 0.001, 0.5, 0.999, 1.0, 1.001, 2.0, f64::NAN];
+
+	/// `promote_k == 0` degenerates to plain LRU and is rejected; the cap is
+	/// 16, so values far above it must still round-trip.
+	const THRESHOLDS: [u16; 6] = [0, 1, 2, 3, 16, u16::MAX];
+
+	fn pairs() -> Vec<(PaperPolicy, PaperPolicy)> {
+		let mut v = Vec::new();
+
+		macro_rules! ratio_pair {
+			($b:ident, $c:ident) => {
+				for r in RATIOS {
+					v.push((PaperPolicy::$b(r), PaperPolicy::$c(r)));
+				}
+			};
+		}
+		ratio_pair!(TwoQHybrid, TwoQCompactHybrid);
+		ratio_pair!(TwoQFastAdmissionHybrid, TwoQFastAdmissionCompactHybrid);
+		ratio_pair!(TwoQFastAdmissionReprieveHybrid, TwoQFastAdmissionReprieveCompactHybrid);
+		ratio_pair!(TwoQGhostHybrid, TwoQGhostCompactHybrid);
+		ratio_pair!(S3FifoHybrid, S3FifoCompactHybrid);
+		ratio_pair!(S3FifoGhostHybrid, S3FifoGhostCompactHybrid);
+		ratio_pair!(S3FifoGhostLazyDemotionHybrid, S3FifoGhostLazyDemotionCompactHybrid);
+		ratio_pair!(S3FifoGhostLazyDemotionFastAdmissionHybrid, S3FifoGhostLazyDemotionFastAdmissionCompactHybrid);
+		ratio_pair!(S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid, S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid);
+		ratio_pair!(S3FifoLazyDemotionReprieveHybrid, S3FifoLazyDemotionReprieveCompactHybrid);
+		ratio_pair!(S3FifoLazyDemotionFastAdmissionReprieveHybrid, S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid);
+		ratio_pair!(S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid, S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid);
+		ratio_pair!(S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid, S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid);
+
+		// The one two-ratio design: BOTH parameters must be in range, so it
+		// cannot join the single-ratio group.
+		for a in RATIOS {
+			for b in RATIOS {
+				v.push((
+					PaperPolicy::TwoQFullFastAdmissionHybrid(a, b),
+					PaperPolicy::TwoQFullFastAdmissionCompactHybrid(a, b),
+				));
+			}
+		}
+
+		for k in THRESHOLDS {
+			v.push((PaperPolicy::LruLfuHybrid(k), PaperPolicy::LruLfuCompactHybrid(k)));
+		}
+
+		v.push((PaperPolicy::LruHybrid, PaperPolicy::LruCompactHybrid));
+		v.push((PaperPolicy::LfuHybrid, PaperPolicy::LfuCompactHybrid));
+		v.push((PaperPolicy::FifoHybrid, PaperPolicy::FifoCompactHybrid));
+		v.push((PaperPolicy::LruSizedHybrid, PaperPolicy::LruSizedCompactHybrid));
+
+		v
+	}
+
+	/// The table is only exhaustive if it names every design. Anchor it to the
+	/// compiler-checked variant list rather than to a number typed by hand.
+	#[test]
+	fn the_pair_table_covers_every_hybrid_design() {
+		use std::collections::HashSet;
+		use std::mem::discriminant;
+
+		let mut designs = HashSet::new();
+		for (base, compact) in pairs() {
+			designs.insert(discriminant(&base));
+			designs.insert(discriminant(&compact));
+		}
+
+		assert_eq!(
+			designs.len(),
+			38,
+			"the pair table names {} enum variants, expected 38 (19 baselines + \
+			 19 compact twins). A design missing here is a design whose twin is \
+			 never checked against it at all.",
+			designs.len(),
+		);
+	}
+
+	/// `params_ok` ends in `_ => true`. A twin missing from it, or placed in a
+	/// group with the wrong bound, ACCEPTS a configuration its baseline
+	/// rejects -- and the two then run at different capacities while being
+	/// reported as the same experiment.
+	#[test]
+	fn every_compact_twin_agrees_with_its_baseline_on_params_ok() {
+		for (base, compact) in pairs() {
+			assert_eq!(
+				params_ok(base),
+				params_ok(compact),
+				"`{base}` and `{compact}` disagree on parameter validity: \
+				 baseline={}, compact={}. Either the twin is missing from \
+				 `params_ok` (and fell to `_ => true`), or it was put in a \
+				 group whose upper bound differs from its baseline's.",
+				params_ok(base),
+				params_ok(compact),
+			);
+		}
+	}
+
+	/// `s3_fifo_queue_budgets` returns `None` for an unlisted policy, which
+	/// skips the zero-capacity queue check entirely rather than failing.
+	#[test]
+	fn every_compact_twin_agrees_with_its_baseline_on_queue_budgets() {
+		for (base, compact) in pairs() {
+			let (b, c) = (s3_fifo_queue_budgets(base), s3_fifo_queue_budgets(compact));
+			match (b, c) {
+				(None, None) => {},
+				(Some((br, bmain)), Some((cr, cmain))) => assert!(
+					(br == cr || (br.is_nan() && cr.is_nan())) && bmain == cmain,
+					"`{base}` and `{compact}` disagree on queue budgets: {b:?} vs {c:?}",
+				),
+				_ => panic!(
+					"`{base}` and `{compact}` disagree on queue budgets: {b:?} vs {c:?} -- \
+					 an unlisted policy yields `None`, silently skipping the \
+					 queue-starvation check the baseline gets",
+				),
+			}
+		}
+	}
+
+	/// `is_hybrid` is a hand-written `matches!` and cannot fire a compile
+	/// error. A twin missing from it gets no fast tier at all.
+	#[test]
+	fn every_compact_twin_agrees_with_its_baseline_on_is_hybrid() {
+		for (base, compact) in pairs() {
+			assert!(base.is_hybrid(), "`{base}` is not reported as hybrid");
+			assert!(
+				compact.is_hybrid(),
+				"`{compact}` is not reported as hybrid but its baseline `{base}` is: \
+				 missing from the `is_hybrid` `matches!`, so it would run with no fast tier",
+			);
+		}
+	}
+
+	/// A twin whose `FromStr` prefix guard is ordered after a baseline it is a
+	/// superstring of parses as the WRONG policy rather than failing.
+	#[test]
+	fn every_compact_twin_round_trips_through_display_and_from_str() {
+		for (base, compact) in pairs() {
+			let (bt, ct) = (format!("{base}"), format!("{compact}"));
+			let (bp, cp) = (bt.parse::<PaperPolicy>(), ct.parse::<PaperPolicy>());
+
+			// Parity first: the twin must accept exactly what its baseline
+			// accepts. A NaN ratio renders but is not a parseable policy, and
+			// that has to be true of BOTH or the pair is not interchangeable.
+			assert_eq!(
+				bp.is_ok(),
+				cp.is_ok(),
+				"`{bt}` parses={} but `{ct}` parses={} -- the twin disagrees with \
+				 its baseline about what is a valid policy string",
+				bp.is_ok(),
+				cp.is_ok(),
+			);
+
+			// Where the baseline round-trips, the twin must too -- and must not
+			// be captured by another design\'s prefix guard on the way back.
+			if let (Ok(bv), Ok(cv)) = (bp, cp) {
+				assert_eq!(
+					format!("{bv}"), bt,
+					"`{bt}` round-trips to `{bv}` -- a prefix guard matched the wrong design",
+				);
+				assert_eq!(
+					format!("{cv}"), ct,
+					"`{ct}` round-trips to `{cv}` -- a prefix guard matched the wrong design. \
+					 Compact policy strings are SUPERSTRINGS of their baselines, so an \
+					 arm ordered after the baseline\'s captures them.",
+				);
+			}
+		}
 	}
 }

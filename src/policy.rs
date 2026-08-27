@@ -548,7 +548,14 @@ fn parse_s_three_fifo_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheEr
 		return Err(CacheError::InvalidPolicy);
 	};
 
-	if !(0.0..=1.0).contains(&ratio) {
+	// EXCLUSIVE of 1.0, matching `parse_s_three_fifo_hybrid`. This stack
+	// sizes its main queue at `(1 - ratio) * max_size`, so a ratio of
+	// exactly 1 leaves it zero bytes; `Stack::is_full` is `used >= max`,
+	// so an EMPTY main queue then reports itself full, `evict_main` pops
+	// nothing while the cache is still over budget, and `apply_evictions`
+	// spins. The baseline parser was tightened for this; the clone kept
+	// the old inclusive bound.
+	if !(0.0..1.0).contains(&ratio) {
 		return Err(CacheError::InvalidPolicy);
 	}
 
