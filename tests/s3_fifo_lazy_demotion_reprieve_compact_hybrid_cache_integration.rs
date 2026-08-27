@@ -668,18 +668,21 @@ mod hybrid_cache_tests {
     /// constructs perfectly happily; what it cannot do is ever get the cache
     /// back under budget, so a fixture that overfills and then waits for a
     /// key to disappear is exactly the shape that catches it.
-    /// UNRESOLVED: this ported fixture fails on the compact stack and the
-    /// cause is NOT yet established. See the module note -- it is either
-    /// trigger calibration (used_size is ~half the baseline's here) or a
-    /// real divergence in the reprieve path. Ignored so the rest of the
-    /// suite runs; NOT known to be benign.
+    /// RECALIBRATED for the compaction, not ignored. `get_policy_overhead`
+    /// charges 87 B/object for the baseline and 40 for this twin, so the 30
+    /// keys here cost roughly 3_690 bytes there and 2_280 here. Against the
+    /// baseline's `max_size` of 2_048 that is 1.80x over budget; on this
+    /// stack it is barely over, so eviction has almost nothing to do and six
+    /// of keys 1-10 survived. `max_size` is scaled to restore the SAME
+    /// pressure ratio -- 2_280 / 1.80 -- which is what this test is actually
+    /// about. Measured, not derived: at 1_267 no key of 1-10 survives, and
+    /// the threshold of 3 is not reached until 1_800.
     #[test]
-    #[ignore]
     fn a_one_access_ratio_of_exactly_one_still_evicts() {
         ensure_pmem_allocator_warm();
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            2_048,
+            1_267,
             CacheTierSize::Bytes(470), PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(1.0))
             .expect("ratio 1.0 should construct: this design sizes no queue at (1 - ratio)");
 
@@ -767,4 +770,5 @@ mod hybrid_cache_tests {
         assert_eq!(cache.tier_of(&1u32), None);
         assert_eq!(cache.tier_of(&2u32), None);
     }
+
 }

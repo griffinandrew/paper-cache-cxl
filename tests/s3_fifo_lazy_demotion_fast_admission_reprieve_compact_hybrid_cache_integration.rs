@@ -143,13 +143,13 @@ mod hybrid_cache_tests {
         assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
     }
 
-    /// UNRESOLVED: this ported fixture fails on the compact stack and the
-    /// cause is NOT yet established. See the module note -- it is either
-    /// trigger calibration (used_size is ~half the baseline's here) or a
-    /// real divergence in the reprieve path. Ignored so the rest of the
-    /// suite runs; NOT known to be benign.
+    /// RECALIBRATED for the compaction, not ignored: `get_policy_overhead`
+    /// charges 87 B/object for the baseline and 40 for this twin, so the two
+    /// keys here reach `used_size` 246 there and 152 here. The baseline's
+    /// `resize(180)` trigger therefore never fires on this stack and the
+    /// eviction pass under test never ran. With the trigger lowered the two
+    /// stacks agree exactly: demoted, one eviction, key 1 reprieved.
     #[test]
-    #[ignore]
     fn a_reprieved_key_can_be_promoted_by_a_later_access() {
         ensure_pmem_allocator_warm();
 
@@ -187,7 +187,7 @@ mod hybrid_cache_tests {
         cache.get(&1u32).expect("get should succeed");
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        cache.resize(180).expect("resize should succeed");
+        cache.resize(130).expect("resize should succeed");
 
         let promoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast));
         assert!(promoted, "a reprieved key should still be promotable via the ordinary second chance");
@@ -258,13 +258,13 @@ mod hybrid_cache_tests {
     }
 
 
-    /// UNRESOLVED: this ported fixture fails on the compact stack and the
-    /// cause is NOT yet established. See the module note -- it is either
-    /// trigger calibration (used_size is ~half the baseline's here) or a
-    /// real divergence in the reprieve path. Ignored so the rest of the
-    /// suite runs; NOT known to be benign.
+    /// RECALIBRATED for the compaction, not ignored: `get_policy_overhead`
+    /// charges 87 B/object for the baseline and 40 for this twin, so the two
+    /// keys here reach `used_size` 246 there and 152 here. The baseline's
+    /// `resize(180)` trigger therefore never fires on this stack and the
+    /// eviction pass under test never ran. With the trigger lowered the two
+    /// stacks agree exactly: demoted, one eviction, key 1 reprieved.
     #[test]
-    #[ignore]
     fn an_accessed_key_at_the_main_queue_tail_gets_a_second_chance_instead_of_eviction() {
         ensure_pmem_allocator_warm();
 
@@ -316,7 +316,7 @@ mod hybrid_cache_tests {
 
         // Deterministic trigger, not a filler set() -- see
         // hybrid_cache_integration.rs's equivalent test for why.
-        cache.resize(180).expect("resize should succeed");
+        cache.resize(130).expect("resize should succeed");
 
         let survived_and_promoted = wait_until(MIGRATION_TIMEOUT, || {
             cache.has(&1u32) && cache.tier_of(&1u32) == Some(Tier::Fast)
@@ -559,4 +559,5 @@ mod hybrid_cache_tests {
         assert_eq!(cache.tier_of(&1u32), None);
         assert_eq!(cache.tier_of(&2u32), None);
     }
+
 }

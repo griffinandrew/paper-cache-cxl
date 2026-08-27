@@ -1340,5 +1340,4 @@ mod fidelity_tests {
 		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
 		assert_eq!(a.len(), b.len());
 	}
-
 }
