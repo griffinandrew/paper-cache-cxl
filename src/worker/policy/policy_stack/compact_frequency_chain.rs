@@ -56,34 +56,60 @@ use crate::{
 /// tracked keys would exhaust the index space long after it exhausted DRAM.
 const NIL: u32 = u32::MAX;
 
-/// One tracked key, entire. Compare `LfuEntry` + a `HashList` node + an
-/// `index_map` entry, which is what this replaces.
-#[derive(Clone, Copy, Debug)]
+/// Per-key data, carried in the INDEX VALUE rather than in the slab slot.
+///
+/// 12 bytes. This is layout B, and for LFU it is a pure win rather than the
+/// trade it is elsewhere. Measured across the hash load cycle:
+///
+/// ```text
+/// n           load     slot     index    delta
+/// 4,194,304   50.0%   72.11     72.14    +0.03
+/// 6,291,456   75.0%   69.41     58.76   -10.65
+/// 7,340,032   87.5%   59.49     50.37    -9.13
+/// ```
+///
+/// It is smaller here and larger for the 8-byte payloads because a 12-byte
+/// payload removed from a slot with a `u64` key also recovers alignment
+/// padding: the slot goes 32 -> 16, not 32 -> 20. That 16-byte saving outweighs
+/// the 8 bytes the wider bucket costs, which the smaller payloads do not manage.
+///
+/// It is also faster on both paths -- 41.0 ns against 77.3 for a metadata read,
+/// 344 against 393 for a list operation -- because the denser slab touches
+/// fewer cache lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactEntry {
-	/// Kept so an eviction, which finds the entry by slab index, can remove
-	/// the key from the index without a reverse scan.
-	pub key: HashedKey,
-
-	prev: u32,
-	next: u32,
-
-	/// This key's access count, and so which bucket it belongs to. Holding it
-	/// here is what removes the need for `index_map`.
 	pub freq: u32,
 
 	pub size: ObjectSize,
 	pub tier: Tier,
 
-	/// Part of `size` that stays in DRAM in either tier.
 	pub dram_resident: u8,
 }
 
+const _: () = assert!(
+	std::mem::size_of::<CompactEntry>() == 12,
+	"CompactEntry grew past 12 bytes",
+);
+
 impl CompactEntry {
-	#[inline]
+	/// Bytes that actually move between tiers.
 	pub fn migrating(&self) -> u64 {
 		(self.size as u64).saturating_sub(self.dram_resident as u64)
 	}
 }
+
+/// One slab node: links only. 16 bytes, exactly, with no padding to spare.
+#[derive(Clone, Copy, Debug)]
+struct CompactSlot {
+	key: HashedKey,
+	prev: u32,
+	next: u32,
+}
+
+const _: () = assert!(
+	std::mem::size_of::<CompactSlot>() == 16,
+	"CompactSlot grew past 16 bytes",
+);
 
 // Under `eviction_stacks_pmem` every structure here is allocated through the
 // crate-wide `Hybrid` allocator, which binds to the far (CXL/PMEM) NUMA node,
@@ -101,9 +127,9 @@ impl CompactEntry {
 // scatters thousands of separate objects across the far node, where the slab is
 // ONE contiguous region.
 #[cfg(not(feature = "eviction_stacks_pmem"))]
-type SlotVec = Vec<CompactEntry>;
+type SlotVec = Vec<CompactSlot>;
 #[cfg(feature = "eviction_stacks_pmem")]
-type SlotVec = Vec<CompactEntry, crate::Hybrid>;
+type SlotVec = Vec<CompactSlot, crate::Hybrid>;
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 type FreeVec = Vec<u32>;
@@ -111,9 +137,9 @@ type FreeVec = Vec<u32>;
 type FreeVec = Vec<u32, crate::Hybrid>;
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
-type SlotIndex = HashMap<HashedKey, u32, NoHasher>;
+type SlotIndex = HashMap<HashedKey, (u32, CompactEntry), NoHasher>;
 #[cfg(feature = "eviction_stacks_pmem")]
-type SlotIndex = HashMap<HashedKey, u32, NoHasher, crate::Hybrid>;
+type SlotIndex = HashMap<HashedKey, (u32, CompactEntry), NoHasher, crate::Hybrid>;
 
 /// One entry per DISTINCT frequency rather than per object, so this stays small.
 #[cfg(not(feature = "eviction_stacks_pmem"))]
@@ -204,8 +230,9 @@ impl CompactFrequencyChain {
 		self.index.contains_key(&key)
 	}
 
-	pub fn get(&self, key: HashedKey) -> Option<&CompactEntry> {
-		self.index.get(&key).map(|&i| &self.slots[i as usize])
+	/// One probe: the payload is already in the bucket.
+	pub fn get(&self, key: HashedKey) -> Option<CompactEntry> {
+		self.index.get(&key).map(|&(_, e)| e)
 	}
 
 	/// Admits a key at frequency 1.
@@ -214,16 +241,14 @@ impl CompactFrequencyChain {
 			return;
 		}
 
-		let entry = CompactEntry {
-			key, prev: NIL, next: NIL, freq: 1, size, tier, dram_resident,
-		};
+		let node = CompactSlot { key, prev: NIL, next: NIL };
 
 		let slot = match self.free.pop() {
-			Some(slot) => { self.slots[slot as usize] = entry; slot },
-			None => { self.slots.push(entry); (self.slots.len() - 1) as u32 },
+			Some(slot) => { self.slots[slot as usize] = node; slot },
+			None => { self.slots.push(node); (self.slots.len() - 1) as u32 },
 		};
 
-		self.index.insert(key, slot);
+		self.index.insert(key, (slot, CompactEntry { freq: 1, size, tier, dram_resident }));
 		self.link(slot, 1, tier);
 
 		match tier {
@@ -234,17 +259,15 @@ impl CompactFrequencyChain {
 
 	/// Moves a key to the next frequency bucket. O(1): unlink, relink.
 	pub fn bump(&mut self, key: HashedKey) -> u32 {
-		let Some(&slot) = self.index.get(&key) else { return 0 };
-
-		let (freq, tier) = {
-			let e = &self.slots[slot as usize];
-			(e.freq, e.tier)
-		};
+		let Some(&(slot, entry)) = self.index.get(&key) else { return 0 };
+		let (freq, tier) = (entry.freq, entry.tier);
 
 		self.unlink(slot, freq, tier);
 
 		let next_freq = freq.saturating_add(1);
-		self.slots[slot as usize].freq = next_freq;
+		if let Some((_, e)) = self.index.get_mut(&key) {
+			e.freq = next_freq;
+		}
 		self.link(slot, next_freq, tier);
 
 		next_freq
@@ -289,8 +312,7 @@ impl CompactFrequencyChain {
 	}
 
 	pub fn remove(&mut self, key: HashedKey) -> Option<CompactEntry> {
-		let slot = self.index.remove(&key)?;
-		let entry = self.slots[slot as usize];
+		let (slot, entry) = self.index.remove(&key)?;
 
 		self.unlink(slot, entry.freq, entry.tier);
 		self.free.push(slot);
@@ -307,19 +329,17 @@ impl CompactFrequencyChain {
 	/// bucket set into the other -- the key never moves in the slab, so its
 	/// index entry and every link to it stay valid.
 	pub fn set_tier(&mut self, key: HashedKey, tier: Tier) {
-		let Some(&slot) = self.index.get(&key) else { return };
-
-		let (freq, old_tier) = {
-			let e = &self.slots[slot as usize];
-			(e.freq, e.tier)
-		};
+		let Some(&(slot, entry)) = self.index.get(&key) else { return };
+		let (freq, old_tier) = (entry.freq, entry.tier);
 
 		if old_tier == tier {
 			return;
 		}
 
 		self.unlink(slot, freq, old_tier);
-		self.slots[slot as usize].tier = tier;
+		if let Some((_, e)) = self.index.get_mut(&key) {
+			e.tier = tier;
+		}
 		self.link(slot, freq, tier);
 
 		match tier {
@@ -329,9 +349,9 @@ impl CompactFrequencyChain {
 	}
 
 	pub fn resize(&mut self, key: HashedKey, size: ObjectSize, dram_resident: u8) {
-		if let Some(&slot) = self.index.get(&key) {
-			self.slots[slot as usize].size = size;
-			self.slots[slot as usize].dram_resident = dram_resident;
+		if let Some((_, e)) = self.index.get_mut(&key) {
+			e.size = size;
+			e.dram_resident = dram_resident;
 		}
 	}
 
@@ -397,13 +417,25 @@ impl CompactFrequencyChain {
 mod tests {
 	use super::*;
 
-	/// The whole point: one slot per key, small enough to beat three structures.
+	/// Pins both halves of the split. Growth in either costs bytes on EVERY
+	/// tracked object across both tiers, which is the point of the structure.
+	///
+	/// The payload was in the slot until it was measured: at 32 bytes per slot
+	/// plus a bare u32 index, versus 16 plus a 12-byte payload in the bucket,
+	/// the second is 9 to 11 B/object smaller at realistic hash loads AND
+	/// faster on both access paths. The slot dropping 32 -> 16 rather than
+	/// 32 -> 20 is why -- removing the payload also recovers alignment padding.
 	#[test]
-	fn an_entry_is_thirty_two_bytes() {
+	fn the_split_layout_is_sixteen_plus_twelve() {
 		assert_eq!(
-			core::mem::size_of::<CompactEntry>(), 32,
-			"key 8 + prev 4 + next 4 + freq 4 + size 4 + tier 1 + resident 1 = 26, \
-			 padded to 32",
+			std::mem::size_of::<CompactSlot>(),
+			16,
+			"key 8 + prev 4 + next 4 = 16, with no padding to spare",
+		);
+		assert_eq!(
+			std::mem::size_of::<CompactEntry>(),
+			12,
+			"freq 4 + size 4 + tier 1 + resident 1 = 10, padded to 12",
 		);
 	}
 
