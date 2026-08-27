@@ -1015,4 +1015,381 @@ mod fidelity_tests {
 		assert_eq!(a.fast_object_count(), b.fast_object_count());
 		assert_eq!(a.slow_object_count(), b.slow_object_count());
 	}
+
+	// ---------------------------------------------------------------------
+	// Gap closures. Each of these pins a behaviour that a real mutation
+	// changed without a single test above noticing -- the mutation it kills
+	// is named in its doc comment.
+	// ---------------------------------------------------------------------
+
+	/// `settle_one_access`'s trigger is a strict `>`: a one-access queue
+	/// filled to EXACTLY its budget is not over it, so nothing may be
+	/// reprieved. Relaxing that loop to `>=` splices the tail into the main
+	/// queue anyway, and `one_access_overflow_is_reprieved_not_evicted` above
+	/// only ever runs the queue far past its budget, so it cannot see the
+	/// difference.
+	#[test]
+	fn nothing_is_reprieved_at_exactly_the_one_access_budget() {
+		// ratio 0.01 of 1_000_000 is a 10_000-byte one-access budget, and ten
+		// 1_000-byte objects fill it to the byte.
+		const SIZE: ObjectSize = 1_000;
+		const COUNT: u64 = 10;
+
+		let mut a =
+			S3FifoLazyDemotionReprieveHybridStack::new(0.01, MAX, 1_000_000).with_shared_overhead(0);
+		let mut b = S3FifoLazyDemotionReprieveCompactHybridStack::new(0.01, MAX, 1_000_000)
+			.with_shared_overhead(0);
+
+		assert_eq!(
+			b.one_access_capacity,
+			COUNT * SIZE as CacheSize,
+			"the construction depends on filling the budget to the byte",
+		);
+
+		for k in 1..=COUNT {
+			a.insert(k, SIZE);
+			b.insert(k, SIZE);
+		}
+
+		// Sitting exactly ON the budget: everything is still in the one-access
+		// queue, the main queue is empty, and the whole charge is on the slow
+		// side (the one-access queue is PMEM in this design).
+		assert_eq!(a.slow_bytes_used(), COUNT * SIZE as CacheSize);
+		assert_eq!(b.slow_bytes_used(), a.slow_bytes_used());
+		assert_eq!(b.one_access_used, b.one_access_capacity);
+		assert_eq!(a.fast_object_count(), 0);
+		assert_eq!(b.fast_object_count(), a.fast_object_count());
+
+		let ma = a.drain_tier_migrations();
+		let mb = b.drain_tier_migrations();
+		assert_eq!(ma, mb);
+		assert!(mb.is_empty(), "nothing moved, so nothing to migrate");
+
+		// `evict_one` drains the MAIN queue only, so with nothing reprieved
+		// there is nothing for it to find at all.
+		assert_eq!(a.evict_one(), None, "baseline reprieved at the budget rather than past it");
+		assert_eq!(
+			b.evict_one(),
+			None,
+			"a key was reprieved into the main queue while the one-access queue sat exactly on its budget",
+		);
+		assert_eq!(a.len(), COUNT as usize);
+		assert_eq!(b.len(), a.len());
+
+		// One byte more IS over the budget: the oldest key is reprieved and
+		// becomes the main queue's eviction candidate. Without this the
+		// assertions above would hold just as well against a stack that never
+		// reprieved anything.
+		a.insert(COUNT + 1, 1);
+		b.insert(COUNT + 1, 1);
+		assert_eq!(a.evict_one(), Some(1), "one byte past the budget must reprieve the tail");
+		assert_eq!(b.evict_one(), Some(1), "one byte past the budget must reprieve the tail");
+		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
+		assert_eq!(a.len(), b.len());
+	}
+
+	/// `settle_fast_tier`'s guard is `fast_used <= high_bytes(...)`: usage
+	/// sitting exactly ON the high watermark must fire no pass. Tightening it
+	/// to `<` makes the boundary itself trigger a full drain to the low
+	/// watermark. `demotion_is_reference_bit_gated` above stays strictly under
+	/// the watermark and then jumps clear past it, so it never lands on it.
+	#[test]
+	fn no_demotion_pass_at_exactly_the_high_watermark() {
+		const FAST: CacheSize = 1_000;
+
+		// Computed, not assumed: the watermarks are env-tunable, so the number
+		// of one-byte objects that lands usage exactly on the threshold is
+		// whatever `high_bytes` says it is at the configured ratio.
+		let high = watermarks::high_bytes(FAST);
+		assert!(high >= 2, "test needs room for at least two fast objects");
+
+		// ratio 1.0 keeps the one-access budget out of the way entirely --
+		// nothing is ever reprieved, so the only pressure is the fast tier's.
+		let mut a = S3FifoLazyDemotionReprieveHybridStack::new(1.0, MAX, FAST).with_shared_overhead(0);
+		let mut b =
+			S3FifoLazyDemotionReprieveCompactHybridStack::new(1.0, MAX, FAST).with_shared_overhead(0);
+
+		// `insert` then `update` is this variant's only route into the fast
+		// tier, and the promotion clears the reference bit, so every key built
+		// this way is genuinely demotable.
+		for k in 1..=high {
+			a.insert(k, 1);
+			b.insert(k, 1);
+			a.update(k);
+			b.update(k);
+		}
+
+		assert_eq!(b.fast_bytes_used(), high, "usage must land exactly on the high watermark");
+		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
+
+		let ma = a.drain_tier_migrations();
+		let mb = b.drain_tier_migrations();
+		assert_eq!(ma, mb, "migrations diverge at the high watermark");
+		assert!(
+			!mb.iter().any(|(_, tier)| *tier == Tier::Slow),
+			"usage at the high watermark must not trigger a demotion pass, got {mb:?}",
+		);
+		assert_eq!(a.fast_object_count(), high as usize);
+		assert_eq!(b.fast_object_count(), a.fast_object_count());
+		assert_eq!(a.slow_object_count(), 0, "`promote` empties the one-access queue");
+		assert_eq!(b.slow_object_count(), a.slow_object_count());
+		assert_eq!(b.slow_bytes_used(), a.slow_bytes_used());
+
+		// One byte past it does fire, so the assertion above is about the
+		// boundary rather than about a tier that never demotes at all.
+		a.insert(high + 1, 1);
+		b.insert(high + 1, 1);
+		a.update(high + 1);
+		b.update(high + 1);
+
+		let ma = a.drain_tier_migrations();
+		let mb = b.drain_tier_migrations();
+		assert_eq!(ma, mb, "migrations diverge one byte past the high watermark");
+		assert!(
+			mb.iter().any(|(_, tier)| *tier == Tier::Slow),
+			"one byte past the high watermark must fire a pass, got {mb:?}",
+		);
+		assert!(b.fast_bytes_used() <= watermarks::low_bytes(FAST));
+		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
+		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
+	}
+
+	/// `give_second_chance` pushes its `Tier::Fast` migration only if the key
+	/// actually ENDED UP fast: the `settle_fast_tier()` inside it can demote
+	/// the just-reprieved key straight back out in the same call, and that
+	/// call has already pushed the correct `Tier::Slow`. Dropping the guard
+	/// leaves the stack claiming a DRAM promotion that never happened -- and
+	/// `apply_tier_migrations` runs every demotion before any promotion, so
+	/// the spurious `Tier::Fast` would land last and strand the bytes.
+	///
+	/// The guard only arms when the effective fast budget is at rock bottom,
+	/// and both existing `evict_one` tests run with room to spare. So starve
+	/// it deliberately: `shared_overhead` reserving more DRAM than
+	/// `fast_capacity` holds drives `effective_main_fast_capacity()` to 0,
+	/// which puts every watermark computed on top of it at 0 too, whatever
+	/// ratios are configured.
+	#[test]
+	fn a_second_chance_undone_in_the_same_call_emits_no_promotion_migration() {
+		const SIZE: ObjectSize = 112;
+		const OVERHEAD: CacheSize = 112;
+		const FAST: CacheSize = 2_048;
+		const COUNT: u64 = 30;
+
+		// ratio 0.0 is a zero-byte one-access budget, so every admitted key is
+		// reprieved into `Q_MAIN_SLOW` on the spot -- the shortest route to a
+		// populated main queue with an empty fast list.
+		let mut a =
+			S3FifoLazyDemotionReprieveHybridStack::new(0.0, MAX, FAST).with_shared_overhead(OVERHEAD);
+		let mut b = S3FifoLazyDemotionReprieveCompactHybridStack::new(0.0, MAX, FAST)
+			.with_shared_overhead(OVERHEAD);
+
+		for k in 1..=COUNT {
+			a.insert(k, SIZE);
+			b.insert(k, SIZE);
+		}
+		a.drain_tier_migrations();
+		b.drain_tier_migrations();
+
+		assert_eq!(
+			b.effective_main_fast_capacity(),
+			0,
+			"{COUNT} keys of {OVERHEAD}-byte shared overhead must swallow the whole {FAST}-byte budget",
+		);
+		assert_eq!(b.slow_object_count(), COUNT as usize);
+		assert_eq!(b.slow_object_count(), a.slow_object_count());
+		assert_eq!(b.fast_object_count(), 0);
+		assert_eq!(b.fast_object_count(), a.fast_object_count());
+
+		// Key 1 is the oldest reprieved key, so it is the slow tail --
+		// `evict_one`'s candidate. Setting its bit sends it into
+		// `give_second_chance`, whose `settle_fast_tier` then finds a
+		// zero-byte budget and demotes it straight back out.
+		a.update(1);
+		b.update(1);
+
+		let ea = a.evict_one();
+		let eb = b.evict_one();
+		let ma = a.drain_tier_migrations();
+		let mb = b.drain_tier_migrations();
+
+		assert_eq!(ea, eb, "eviction diverges across an undone second chance");
+		assert_eq!(ea, Some(2), "key 1 was spared, so the next-oldest goes instead");
+
+		assert_eq!(ma, mb, "migrations diverge across an undone second chance");
+		assert_eq!(
+			mb,
+			vec![(1, Tier::Slow)],
+			"an undone second chance emits the demotion and nothing else, got {mb:?}",
+		);
+		assert!(
+			!mb.contains(&(1, Tier::Fast)),
+			"the key never stayed in DRAM, so no promotion migration may be recorded",
+		);
+
+		assert_eq!(b.tier_of(1), Some(Tier::Slow));
+		assert_eq!(b.tier_of(1), a.tier_of(1));
+		assert_eq!(b.fast_bytes_used(), 0, "the fast list must be empty again");
+		assert_eq!(b.fast_bytes_used(), a.fast_bytes_used());
+		assert_eq!(b.slow_bytes_used(), a.slow_bytes_used());
+		assert_eq!(b.len(), a.len());
+	}
+
+	/// `resize` settles the fast tier on the way out, and `resize_key` --
+	/// reached by RE-SETTING an already-tracked key -- is the one path that
+	/// raises `fast_used` without settling behind it. Every other route into
+	/// the fast tier (`promote_from_one_access`, `give_second_chance`) settles
+	/// itself, which is why dropping `resize`'s trailing `settle_fast_tier()`
+	/// went unnoticed: `resizes_like_the_baseline` above re-sets keys only at
+	/// one fixed size, so its tier is always already settled by the time
+	/// `resize` is reached.
+	#[test]
+	fn resize_settles_a_fast_tier_grown_since_the_last_pass() {
+		const FAST: CacheSize = 1_000;
+
+		let mut a = S3FifoLazyDemotionReprieveHybridStack::new(1.0, MAX, FAST).with_shared_overhead(0);
+		let mut b =
+			S3FifoLazyDemotionReprieveCompactHybridStack::new(1.0, MAX, FAST).with_shared_overhead(0);
+
+		// A tiny fast key, well under the high watermark.
+		a.insert(1, 8);
+		b.insert(1, 8);
+		a.update(1);
+		b.update(1);
+		assert_eq!(a.tier_of(1), Some(Tier::Fast));
+		assert_eq!(b.tier_of(1), a.tier_of(1));
+		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
+
+		// Re-set it to the whole budget. That runs `resize_key`, which moves
+		// `fast_used` and returns WITHOUT settling -- so the tier is now over
+		// the high watermark with no pass having fired.
+		let grown = FAST as ObjectSize;
+		a.insert(1, grown);
+		b.insert(1, grown);
+
+		let ma = a.drain_tier_migrations();
+		let mb = b.drain_tier_migrations();
+		assert_eq!(ma, mb);
+		assert!(mb.is_empty(), "a re-set settles nothing by itself");
+		assert_eq!(b.fast_bytes_used(), FAST);
+		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
+		assert!(
+			b.fast_bytes_used() > watermarks::high_bytes(FAST),
+			"the re-set must leave the tier genuinely over the high watermark",
+		);
+		assert_eq!(b.tier_of(1), Some(Tier::Fast));
+
+		// `resize` must run the pass. (`resize_fast_tier` would too -- this is
+		// specifically `resize`'s trailing settle, which the replay only ever
+		// reaches with an already-settled tier.)
+		a.resize(MAX);
+		b.resize(MAX);
+
+		let ma = a.drain_tier_migrations();
+		let mb = b.drain_tier_migrations();
+		assert_eq!(ma, mb, "migrations diverge across the settling resize");
+		assert_eq!(
+			mb,
+			vec![(1, Tier::Slow)],
+			"resize must settle a fast tier grown since the last pass, got {mb:?}",
+		);
+		assert_eq!(a.tier_of(1), Some(Tier::Slow));
+		assert_eq!(b.tier_of(1), a.tier_of(1));
+		assert!(b.fast_bytes_used() <= watermarks::low_bytes(FAST));
+		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
+		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
+		assert_eq!(a.fast_object_count(), b.fast_object_count());
+		assert_eq!(a.slow_object_count(), b.slow_object_count());
+	}
+
+	/// Two byte-accounting paths the replay above cannot reach. It admits at
+	/// one fixed size with a ZERO DRAM-resident remainder, which makes
+	/// `insert_resident`'s `size - dram_resident` charge indistinguishable
+	/// from a plain `size`, and it only ever calls `update` on a key it
+	/// already holds -- so `resize_key` is never called at all and
+	/// `migrating()` is always just `size`.
+	///
+	/// This walks every charging arm in one go: admission carrying a real
+	/// remainder, then a re-set of a one-access key (whose charge is handed on
+	/// by the promoting touch that follows it), of a fast key, and of a
+	/// reprieved -- main-queue SLOW -- key.
+	#[test]
+	fn resident_remainder_and_re_sets_are_charged_like_the_baseline() {
+		// ratio 0.01 of 1_000_000 is a 10_000-byte one-access budget: small
+		// enough that a handful of admissions produces a reprieved key to
+		// re-set, large enough that the earlier steps are undisturbed.
+		let mut a =
+			S3FifoLazyDemotionReprieveHybridStack::new(0.01, MAX, 131_072).with_shared_overhead(0);
+		let mut b = S3FifoLazyDemotionReprieveCompactHybridStack::new(0.01, MAX, 131_072)
+			.with_shared_overhead(0);
+
+		// (1) Admission carrying a DRAM-resident remainder. Only the migrating
+		// part -- `size - dram_resident` -- is charged, to the one-access
+		// queue, which this design gauges on the SLOW side.
+		a.insert_resident(1, 1_024, 64);
+		b.insert_resident(1, 1_024, 64);
+		assert_eq!(a.slow_bytes_used(), 1_024 - 64, "only the migrating remainder is charged");
+		assert_eq!(b.slow_bytes_used(), a.slow_bytes_used(), "admission charge diverges");
+		assert_eq!(a.fast_bytes_used(), 0);
+		assert_eq!(b.fast_bytes_used(), a.fast_bytes_used());
+
+		// (2) `resize_key`'s one-access arm. The re-set adjusts the one-access
+		// charge and the touch that follows it promotes the key, handing
+		// exactly that charge to the fast tier -- so a wrong delta here shows
+		// in BOTH gauges.
+		a.insert_resident(1, 2_048, 32);
+		b.insert_resident(1, 2_048, 32);
+		assert_eq!(a.tier_of(1), Some(Tier::Fast), "the re-set's touch promotes a one-access key");
+		assert_eq!(b.tier_of(1), a.tier_of(1));
+		assert_eq!(a.fast_bytes_used(), 2_048 - 32);
+		assert_eq!(b.fast_bytes_used(), a.fast_bytes_used(), "one-access re-set charge diverges");
+		assert_eq!(a.slow_bytes_used(), 0);
+		assert_eq!(b.slow_bytes_used(), a.slow_bytes_used());
+
+		// (3) `resize_key`'s fast arm, shrinking: a negative delta off
+		// `fast_used`.
+		a.insert_resident(1, 512, 12);
+		b.insert_resident(1, 512, 12);
+		assert_eq!(a.fast_bytes_used(), 512 - 12);
+		assert_eq!(b.fast_bytes_used(), a.fast_bytes_used(), "fast re-set charge diverges");
+		assert_eq!(a.slow_bytes_used(), 0);
+		assert_eq!(b.slow_bytes_used(), a.slow_bytes_used());
+
+		// Fill the one-access queue past its 10_000-byte budget so that key 2
+		// -- the oldest -- is reprieved into the main queue's slow segment.
+		for k in 2..=12u64 {
+			a.insert_resident(k, 1_024, 64);
+			b.insert_resident(k, 1_024, 64);
+		}
+		assert_eq!(a.tier_of(2), Some(Tier::Slow));
+		assert_eq!(b.tier_of(2), a.tier_of(2));
+		assert_eq!(a.fast_object_count(), 1);
+		assert_eq!(b.fast_object_count(), a.fast_object_count());
+		assert_eq!(b.slow_bytes_used(), a.slow_bytes_used());
+
+		let fast_before = a.fast_bytes_used();
+
+		// (4) `resize_key`'s slow arm. A reprieved key is in the main queue,
+		// but its bytes never left PMEM: growing it must move the SLOW gauge
+		// and leave the DRAM gauge exactly where it was.
+		a.insert_resident(2, 4_096, 16);
+		b.insert_resident(2, 4_096, 16);
+		assert_eq!(
+			a.fast_bytes_used(),
+			fast_before,
+			"a slow key's re-set must not touch the DRAM gauge",
+		);
+		assert_eq!(
+			b.fast_bytes_used(),
+			a.fast_bytes_used(),
+			"a slow key's re-set charge landed on the wrong gauge",
+		);
+		assert_eq!(b.slow_bytes_used(), a.slow_bytes_used(), "slow re-set charge diverges");
+		assert_eq!(b.tier_of(2), a.tier_of(2));
+
+		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
+		assert_eq!(a.len(), b.len());
+		assert_eq!(a.fast_object_count(), b.fast_object_count());
+		assert_eq!(a.slow_object_count(), b.slow_object_count());
+		assert_eq!(a.dram_reserved_bytes(), b.dram_reserved_bytes());
+	}
 }

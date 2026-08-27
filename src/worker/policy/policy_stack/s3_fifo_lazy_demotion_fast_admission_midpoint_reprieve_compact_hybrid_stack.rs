@@ -1305,4 +1305,263 @@ mod fidelity_tests {
 		assert_eq!(a.len(), b.len());
 		assert_eq!(a.is_midpoint(2), b.is_midpoint(2));
 	}
+
+	/// THE HIGH WATERMARK IS A CEILING, NOT A TRIGGER-AT-EQUAL: usage resting
+	/// exactly ON `high_bytes(effective)` is still inside the budget, so
+	/// `settle_fast_tier` must return without demoting anything. One byte past
+	/// it is what trips the pass.
+	#[test]
+	fn usage_resting_exactly_on_the_high_watermark_does_not_demote() {
+		// ratio 1.0 of 1_000 carves the whole 1_000 out for the one-access
+		// queue, and no shared overhead leaves the reservation split at
+		// (0, 0) -- so `effective_main_fast_capacity()` is exactly
+		// `fast - 1_000`, with no rounding anywhere near the boundary.
+		const EFFECTIVE: CacheSize = 1_000;
+		let fast = 1_000 + EFFECTIVE;
+
+		// Derived from the watermarks, never a hard-coded ratio: they are
+		// process-global `OnceLock`s, so a reconfigured pair has to move this
+		// fixture with it.
+		let resting = watermarks::high_bytes(EFFECTIVE);
+		assert!(resting > 0, "watermark config leaves no room for this fixture");
+
+		let mut a = Baseline::new(1.0, 1_000, fast);
+		let mut b = Compact::new(1.0, 1_000, fast);
+
+		// Exactly `resting` ONE-BYTE keys promoted into main_fast: the insert
+		// lands in the one-access queue, the update promotes it out.
+		for k in 1..=resting {
+			a.insert(k, 1); a.update(k);
+			b.insert(k, 1); b.update(k);
+		}
+
+		assert_eq!(b.effective_main_fast_capacity(), EFFECTIVE);
+		assert_eq!(
+			b.fast_used,
+			watermarks::high_bytes(b.effective_main_fast_capacity()),
+			"the fixture must come to rest exactly ON the high watermark",
+		);
+
+		assert_eq!(
+			b.drain_tier_migrations(),
+			Vec::new(),
+			"usage resting exactly on the high watermark must not demote",
+		);
+		assert_eq!(a.drain_tier_migrations(), Vec::new());
+		assert_eq!(b.slow_object_count(), 0);
+		assert_eq!(b.slow_bytes_used(), 0);
+		assert_eq!(a.slow_object_count(), b.slow_object_count());
+		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
+		assert_eq!(a.fast_object_count(), b.fast_object_count());
+		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
+
+		// ...and one byte PAST it does demote, so the fixture is sitting on the
+		// real boundary rather than somewhere harmlessly below it.
+		a.insert(resting + 1, 1); a.update(resting + 1);
+		b.insert(resting + 1, 1); b.update(resting + 1);
+		let ma = a.drain_tier_migrations();
+		let mb = b.drain_tier_migrations();
+
+		assert!(!mb.is_empty(), "one byte past the high watermark must demote");
+		assert_eq!(ma, mb, "migrations diverge one byte past the watermark");
+		assert_eq!(a.slow_object_count(), b.slow_object_count());
+		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
+	}
+
+	/// THE RESERVATION SPLIT IS EXACT: `reserved_shares` floors the ONE-ACCESS
+	/// share only and hands the remainder to the MAIN share, so the pair
+	/// re-sums to `reserved_overhead()` and the identity
+	/// `effective_one_access + effective_main_fast + reserved == fast_capacity`
+	/// holds at every tracked count. Flooring both sides independently drops
+	/// the odd byte and silently widens the main fast segment by one.
+	#[test]
+	fn the_reservation_split_hands_its_remainder_to_the_main_share() {
+		// ratio 0.5 of 1_000 gives a one-access carve-out of 500 against a
+		// fast_capacity of 1_000, so the split is `reserved * 500 / 1_000` --
+		// inexact at every odd `reserved`, which a 3-byte-per-key overhead
+		// produces at every odd tracked count.
+		const FAST: CacheSize = 1_000;
+
+		let mut a = Baseline::new(0.5, 1_000, FAST).with_shared_overhead(3);
+		let mut b = Compact::new(0.5, 1_000, FAST).with_shared_overhead(3);
+		let (mut ma, mut mb) = (Vec::new(), Vec::new());
+		let mut inexact = 0usize;
+
+		for k in 1..=280u64 {
+			a.insert(k, 1); a.update(k);
+			b.insert(k, 1); b.update(k);
+			ma.extend(a.drain_tier_migrations());
+			mb.extend(b.drain_tier_migrations());
+
+			let reserved = b.reserved_overhead();
+			let (one_share, main_share) = b.reserved_shares();
+
+			assert_eq!(
+				one_share + main_share,
+				reserved,
+				"the split lost a byte at {k} tracked keys",
+			);
+			assert_eq!(
+				b.effective_one_access_capacity() + b.effective_main_fast_capacity() + reserved,
+				FAST,
+				"the two effective budgets plus the reservation must re-sum to \
+				 fast_capacity at {k} tracked keys",
+			);
+
+			if reserved % 2 == 1 {
+				assert_eq!(
+					main_share,
+					one_share + 1,
+					"the odd byte must land on the MAIN share at {k} tracked keys",
+				);
+				inexact += 1;
+			}
+		}
+
+		assert!(inexact > 100, "the fixture never really exercised an inexact split ({inexact} of 280)");
+		assert!(!mb.is_empty(), "the tightening main-fast budget should have demoted something");
+		assert_eq!(ma, mb, "migrations diverge under the proportional split");
+
+		for k in 1..=280u64 {
+			assert_eq!(a.tier_of(k), b.tier_of(k), "key {k}");
+			assert_eq!(a.is_midpoint(k), b.is_midpoint(k), "key {k}");
+		}
+
+		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
+		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
+		assert_eq!(a.fast_object_count(), b.fast_object_count());
+		assert_eq!(a.slow_object_count(), b.slow_object_count());
+		assert_eq!(a.dram_reserved_bytes(), b.dram_reserved_bytes());
+	}
+
+	/// `resize_fast_tier` settles the ONE-ACCESS queue FIRST and the main fast
+	/// segment SECOND. Both settles append to the same migration log and both
+	/// drive the midpoint cursor, so the order is observable -- but only when
+	/// both actually have work to do, which shrinking `fast_capacity` is the
+	/// only event to arrange: it tightens both fast segments at once, the
+	/// one-access one through its re-proportioned share of the reservation.
+	///
+	/// `resize_fast_tier_alone_settles_the_one_access_queue` above cannot see
+	/// this: its 300 keys are never re-accessed, so main_fast is empty and
+	/// `settle_fast_tier` is a no-op -- only one of the two calls ever emits.
+	#[test]
+	fn resize_fast_tier_settles_the_one_access_queue_before_the_main_segment() {
+		// ratio 0.01 of 1_000_000 -> one_access_capacity 10_000.
+		let mut a = Baseline::new(0.01, MAX, 1_000_000).with_shared_overhead(112);
+		let mut b = Compact::new(0.01, MAX, 1_000_000).with_shared_overhead(112);
+
+		// 300 hot keys, promoted straight out of the one-access queue into
+		// main_fast...
+		for k in 1..=300u64 {
+			a.insert(k, 100); a.update(k);
+			b.insert(k, 100); b.update(k);
+		}
+
+		// ...and 50 cold ones left sitting in the one-access queue.
+		for k in 1_001..=1_050u64 {
+			a.insert(k, 100);
+			b.insert(k, 100);
+		}
+
+		a.drain_tier_migrations();
+		b.drain_tier_migrations();
+
+		assert_eq!(b.queues.queue_len(Q_MAIN_FAST), 300, "the hot set must be in main_fast");
+		assert_eq!(b.queues.queue_len(Q_ONE_ACCESS), 50, "the cold set must still be in the one-access queue");
+		assert_eq!(b.slow_object_count(), 0, "nothing should have settled yet");
+
+		a.resize_fast_tier(60_000);
+		b.resize_fast_tier(60_000);
+
+		let ma = a.drain_tier_migrations();
+		let mb = b.drain_tier_migrations();
+
+		// Both segments must have emitted, or the ordering assertion below is
+		// vacuous -- which is exactly the state the existing test is in.
+		let first_hot = mb
+			.iter()
+			.position(|(k, _)| *k <= 300)
+			.expect("the main fast segment must have demoted");
+		let last_cold = mb
+			.iter()
+			.rposition(|(k, _)| *k > 1_000)
+			.expect("the one-access queue must have been reprieved");
+
+		assert!(
+			last_cold < first_hot,
+			"every one-access reprieve must be logged before the first main-fast demotion \
+			 (last cold at {last_cold}, first hot at {first_hot})",
+		);
+
+		assert_eq!(ma, mb, "resize_fast_tier migrations diverge");
+
+		for k in (1..=300u64).chain(1_001..=1_050u64) {
+			assert_eq!(a.tier_of(k), b.tier_of(k), "key {k}");
+			assert_eq!(a.is_midpoint(k), b.is_midpoint(k), "key {k}");
+		}
+
+		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
+		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
+		assert_eq!(a.fast_object_count(), b.fast_object_count());
+		assert_eq!(a.slow_object_count(), b.slow_object_count());
+	}
+
+	/// The split's numerator is `reserved_overhead() * one_access_capacity`,
+	/// and both factors are FAST-tier byte counts -- a CXL-sized fast tier with
+	/// a per-object metadata reservation pushes their product past u64 long
+	/// before either factor gets anywhere near it. The `u128` intermediate is
+	/// load-bearing, not decorative.
+	#[test]
+	fn the_reservation_split_survives_a_product_that_overflows_u64() {
+		// one_access_capacity 2^33 out of a fast_capacity of 2^34, at 2^30 of
+		// shared overhead per tracked key. At TWO tracked keys
+		// `reserved_overhead()` is 2^31 and the numerator is exactly 2^64 --
+		// one step past what u64 can hold.
+		const FAST: CacheSize = 1 << 34;
+		const ONE_ACCESS: CacheSize = 1 << 33;
+		const OVERHEAD: CacheSize = 1 << 30;
+		const SIZE: ObjectSize = 4_000_000_000;
+
+		let mut a = Baseline::new(0.5, FAST, FAST).with_shared_overhead(OVERHEAD);
+		let mut b = Compact::new(0.5, FAST, FAST).with_shared_overhead(OVERHEAD);
+
+		a.insert(1, SIZE);
+		b.insert(1, SIZE);
+		a.drain_tier_migrations();
+		b.drain_tier_migrations();
+
+		assert_eq!(b.tier_of(1), Some(Tier::Fast), "one key alone fits the one-access budget");
+		assert_eq!(a.tier_of(1), b.tier_of(1));
+
+		a.insert(2, SIZE);
+		b.insert(2, SIZE);
+
+		// Widened: 2^31 * 2^33 / 2^34 == 2^30, leaving the queue an effective
+		// budget of 2^33 - 2^30 == 7_516_192_768 -- under the 8_000_000_000
+		// bytes now sitting in it, so its tail is reprieved into main_slow.
+		// Taken in u64 the product wraps to zero (or traps outright under
+		// debug overflow checks), the share is 0, the queue keeps its whole
+		// 2^33, and nothing moves.
+		assert_eq!(b.reserved_overhead(), 1 << 31);
+		assert_eq!(b.reserved_shares(), (1 << 30, 1 << 30));
+		assert_eq!(b.effective_one_access_capacity(), ONE_ACCESS - (1 << 30));
+
+		let ma = a.drain_tier_migrations();
+		let mb = b.drain_tier_migrations();
+
+		assert_eq!(mb, vec![(1, Tier::Slow)], "the one-access tail must be reprieved");
+		assert_eq!(ma, mb);
+		assert_eq!(b.tier_of(1), Some(Tier::Slow));
+		assert_eq!(b.tier_of(2), Some(Tier::Fast));
+		assert_eq!(a.tier_of(1), b.tier_of(1));
+		assert_eq!(a.tier_of(2), b.tier_of(2));
+		assert!(b.contains(1), "reprieved, not evicted");
+
+		assert_eq!(b.slow_object_count(), 1);
+		assert_eq!(b.fast_object_count(), 1);
+		assert_eq!(a.slow_object_count(), b.slow_object_count());
+		assert_eq!(a.fast_object_count(), b.fast_object_count());
+		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
+		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
+	}
 }

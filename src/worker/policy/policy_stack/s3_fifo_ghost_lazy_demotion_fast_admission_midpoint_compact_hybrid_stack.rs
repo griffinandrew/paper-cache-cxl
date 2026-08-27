@@ -1420,4 +1420,394 @@ mod fidelity_tests {
 		let (ca, cb) = cursors(&a, &b, 5);
 		assert_eq!(ca, cb, "midpoint cursor diverges after a clear-and-refill");
 	}
+
+	/// The neighbor-still-Slow filter on the DRIFT-CORRECTION path.
+	///
+	/// `nudge_midpoint_toward_front` and `evict_one`'s redirect apply the
+	/// identical filter, but only the redirect is covered above (by
+	/// `evicting_the_only_slow_key_clears_the_midpoint_cursor`). The nudge's
+	/// copy only matters when a drift correction fires while the cursor is
+	/// ALREADY the frontmost slow object, so `before(cursor)` is the fast/slow
+	/// boundary object rather than another slow one. `churn_ops` never reaches
+	/// that state: new demotions land at the slow front faster than the cursor
+	/// -- one step per two events -- walks up to it, so `before(cursor)` is
+	/// always Slow and the filter is a formality there. Dropping it leaves the
+	/// cursor pointing into the fast segment, where the mid-segment check then
+	/// promotes an object that never left DRAM.
+	#[test]
+	fn the_drift_correction_never_walks_the_cursor_into_the_fast_segment() {
+		// The `build_five_key_pair` sizing -- a fast segment holding exactly
+		// two 10-byte objects across a settled pass -- run out to nine keys, so
+		// the slow segment is long enough to walk the cursor up to its own
+		// front by hand.
+		let capacity = capacity_holding(20, 10);
+		let mut a = Baseline::new(0.0, 1_000, capacity);
+		let mut b = Compact::new(0.0, 1_000, capacity);
+
+		for key in 1..=9u64 {
+			a.insert(key, 10);
+			b.insert(key, 10);
+			a.update(key);
+			b.update(key);
+		}
+		a.drain_tier_migrations();
+		b.drain_tier_migrations();
+
+		// Slow segment [7, 6, 5, 4, 3, 2, 1] boundary-to-tail, fast [9, 8]; the
+		// seeding demotion plus six drift events settle the cursor on key 4.
+		assert_eq!(b.tier_of(7), Some(Tier::Slow), "key 7 is the frontmost slow object");
+		assert_eq!(b.tier_of(8), Some(Tier::Fast), "key 8 is the fast/slow boundary object");
+		assert!(b.is_midpoint(4), "expected key 4, the middle of slow segment [7 ..= 1]");
+		assert_eq!(a.is_midpoint(4), b.is_midpoint(4), "midpoint of 4 diverges");
+
+		// Two removals from the FRONT of the slow segment: each shortens the
+		// segment ahead of the cursor and bumps the drift counter, and the
+		// second one's correction steps the cursor onto key 5 -- now the
+		// frontmost slow object, with the fast boundary directly before it.
+		for key in [7u64, 6] {
+			a.remove(key);
+			b.remove(key);
+		}
+
+		assert!(b.is_midpoint(5), "the cursor should have reached the front of the slow segment");
+		assert_eq!(a.is_midpoint(5), b.is_midpoint(5), "midpoint of 5 diverges");
+		assert_eq!(
+			b.queues.before(5),
+			Some(8),
+			"the object before the cursor must be the fast/slow boundary, or this fixture \
+			 does not reach the guard",
+		);
+
+		// Two more drift events, this time from BEHIND the cursor so it stays
+		// the frontmost slow object: the second fires the correction with
+		// `before(cursor)` pointing squarely at the fast segment.
+		for key in [1u64, 2] {
+			a.remove(key);
+			b.remove(key);
+		}
+
+		assert!(b.is_midpoint(5), "the correction must leave the cursor where it was");
+		assert!(!b.is_midpoint(8), "the cursor must never be walked into the fast segment");
+		assert_eq!(b.tier_of(8), Some(Tier::Fast));
+		for key in 1..=9u64 {
+			assert_eq!(a.tier_of(key), b.tier_of(key), "tier of {key} diverges");
+			assert_eq!(a.is_midpoint(key), b.is_midpoint(key), "midpoint of {key} diverges");
+		}
+		gauges(&a, &b);
+
+		// And the consequence, so this pins behaviour and not just the cursor's
+		// identity: a cursor sitting on a FAST object turns the mid-segment
+		// check into a spurious `Tier::Fast` migration of an object that is
+		// already in DRAM.
+		a.update(8);
+		b.update(8);
+		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations(), "an access must emit nothing");
+
+		let ea = a.evict_one();
+		let eb = b.evict_one();
+
+		assert_eq!(ea, eb, "eviction diverges");
+		assert_eq!(
+			a.drain_tier_migrations(),
+			b.drain_tier_migrations(),
+			"the mid-segment check ran against an out-of-segment cursor",
+		);
+		assert_eq!(b.tier_of(8), Some(Tier::Fast), "key 8 never left the fast segment");
+		for key in 1..=9u64 {
+			assert_eq!(a.tier_of(key), b.tier_of(key), "tier of {key} diverges");
+			assert_eq!(a.is_midpoint(key), b.is_midpoint(key), "midpoint of {key} diverges");
+		}
+		gauges(&a, &b);
+	}
+
+	/// `is_main_full` is `>=`, not `>`: a main queue sitting EXACTLY on
+	/// `main_capacity` is full, so `evict_one` goes straight to the main tail
+	/// instead of draining the one-access tail first.
+	///
+	/// Nothing above can land on that byte. Every workload here uses 1024-byte
+	/// objects while `main_capacity` is `(1 - ratio) * 1_000_000`, never a
+	/// multiple of 1024, so `fast_used + slow_used` always steps OVER the
+	/// budget rather than onto it and the two comparisons agree on every call
+	/// the module ever makes.
+	#[test]
+	fn main_exactly_on_its_budget_counts_as_full() {
+		const SMALL_MAX: CacheSize = 1_000;
+		const RATIO: f64 = 0.5;
+		const OBJECT: ObjectSize = 10;
+
+		// A main budget of exactly 500 bytes, filled by exactly 50 objects.
+		let main_capacity = ((1.0 - RATIO) * SMALL_MAX as f64) as CacheSize;
+		let count = main_capacity / OBJECT as CacheSize;
+		assert_eq!(
+			count * OBJECT as CacheSize,
+			main_capacity,
+			"the fixture must land ON the budget, not near it",
+		);
+
+		// A fast budget far above anything this fixture uses, so no demotion
+		// interferes and the whole main total stays on the fast side.
+		const ROOMY_FAST: CacheSize = 1_000_000;
+
+		let mut a = Baseline::new(RATIO, SMALL_MAX, ROOMY_FAST).with_shared_overhead(0);
+		let mut b = Compact::new(RATIO, SMALL_MAX, ROOMY_FAST).with_shared_overhead(0);
+
+		for key in 1..=count {
+			a.insert(key, OBJECT);
+			b.insert(key, OBJECT);
+			a.update(key);
+			b.update(key);
+		}
+
+		// One key left resident in the one-access queue -- what `evict_one`
+		// takes first, and only, while main is judged not-full.
+		let resident = count + 1;
+		a.insert(resident, OBJECT);
+		b.insert(resident, OBJECT);
+		a.drain_tier_migrations();
+		b.drain_tier_migrations();
+
+		assert_eq!(a.slow_bytes_used(), 0, "no demotion should have happened");
+		assert_eq!(b.slow_bytes_used(), a.slow_bytes_used());
+		assert_eq!(
+			a.fast_bytes_used(),
+			main_capacity + OBJECT as CacheSize,
+			"main should sit exactly on its budget, with one object beside it in one-access",
+		);
+		assert_eq!(b.fast_bytes_used(), a.fast_bytes_used());
+
+		let ea = a.evict_one();
+		let eb = b.evict_one();
+
+		assert_eq!(ea, eb, "eviction diverges");
+		assert_eq!(eb, Some(1), "a main queue exactly on its budget is full: the main tail goes first");
+		assert!(b.contains(resident), "the one-access resident must not have been taken instead");
+		assert!(!b.is_ghost(resident), "and so must not have been ghosted");
+		assert_eq!(a.contains(resident), b.contains(resident));
+		assert_eq!(a.is_ghost(resident), b.is_ghost(resident));
+		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
+		gauges(&a, &b);
+
+		// The control, one object short of the budget: main is genuinely not
+		// full and the same call takes the one-access tail, which is what makes
+		// the assertion above about the boundary rather than about the route.
+		let mut c = Baseline::new(RATIO, SMALL_MAX, ROOMY_FAST).with_shared_overhead(0);
+		let mut d = Compact::new(RATIO, SMALL_MAX, ROOMY_FAST).with_shared_overhead(0);
+
+		for key in 1..count {
+			c.insert(key, OBJECT);
+			d.insert(key, OBJECT);
+			c.update(key);
+			d.update(key);
+		}
+		c.insert(resident, OBJECT);
+		d.insert(resident, OBJECT);
+		c.drain_tier_migrations();
+		d.drain_tier_migrations();
+
+		// Total fast bytes less the single one-access resident IS the main
+		// total, and here it is one object short of the budget.
+		assert_eq!(
+			c.fast_bytes_used() - OBJECT as CacheSize,
+			main_capacity - OBJECT as CacheSize,
+			"the control must sit one object BELOW the budget",
+		);
+		assert_eq!(d.fast_bytes_used(), c.fast_bytes_used());
+
+		let ec = c.evict_one();
+		let ed = d.evict_one();
+
+		assert_eq!(ec, ed, "eviction diverges below the budget");
+		assert_eq!(ed, Some(resident), "below its budget, the one-access tail goes first");
+		assert!(d.contains(1), "the main tail must be untouched below the budget");
+		gauges(&c, &d);
+	}
+
+	/// The smallest `(budget, size)` pair whose single object lands `fast_used`
+	/// EXACTLY on the main fast segment's high watermark, with
+	/// `low_bytes(budget)` strictly below it -- so a pass that does fire has
+	/// somewhere to drain to -- and `high_bytes(budget - 1)` strictly below it
+	/// too, so the landing belongs to this budget alone and a byte of slack
+	/// anywhere cannot reproduce it. Searched upward from the smallest budget
+	/// at which the two watermarks can be a whole byte apart at all. Same shape
+	/// as `capacity_holding`: derived from the configured watermarks, so the
+	/// fixture below holds at any watermark config. At the defaults this is
+	/// `(34, 33)`.
+	fn budget_landing_exactly_on_the_high_watermark() -> (CacheSize, ObjectSize) {
+		assert!(
+			watermarks::high() > watermarks::low(),
+			"watermark config collapses the two marks; nothing can land between them",
+		);
+
+		let mut budget = (1.0 / (watermarks::high() - watermarks::low())).ceil() as CacheSize;
+
+		loop {
+			let size = watermarks::high_bytes(budget);
+
+			if size > 0
+				&& size <= ObjectSize::MAX as CacheSize
+				&& watermarks::low_bytes(budget) < size
+				&& watermarks::high_bytes(budget - 1) < size
+			{
+				return (budget, size as ObjectSize);
+			}
+
+			budget += 1;
+
+			assert!(budget < 1 << 20, "watermark config admits no exact landing");
+		}
+	}
+
+	/// The `settle_fast_tier` TRIGGER is `<=`, not `<`: a main fast segment
+	/// sitting exactly ON its high watermark has not crossed it and must not
+	/// start a demotion pass.
+	///
+	/// No fixture above can see that byte. `churn_ops` steps `fast_used` in
+	/// 1024-byte jumps against multi-kilobyte budgets, and the hand-traced
+	/// 10-byte fixtures go through `capacity_holding`, which deliberately picks
+	/// a capacity whose watermark falls clear of every total those fixtures
+	/// reach. The two comparisons therefore agree on every call ever made.
+	#[test]
+	fn usage_exactly_on_the_high_watermark_does_not_demote() {
+		let (budget, size) = budget_landing_exactly_on_the_high_watermark();
+
+		// `one_access_ratio` 0.0, so the carve-out is zero and the main fast
+		// segment gets `budget` whole; no shared overhead and an empty ghost,
+		// so the reservation is zero too and `effective_main_fast_capacity()`
+		// is exactly `budget`.
+		let mut a = Baseline::new(0.0, 1_000, budget).with_shared_overhead(0);
+		let mut b = Compact::new(0.0, 1_000, budget).with_shared_overhead(0);
+
+		a.insert(1, size);
+		b.insert(1, size);
+		a.update(1);
+		b.update(1);
+
+		let (ma, mb) = (a.drain_tier_migrations(), b.drain_tier_migrations());
+
+		assert_eq!(
+			a.fast_bytes_used(),
+			watermarks::high_bytes(budget),
+			"the fixture did not land on the watermark",
+		);
+		assert_eq!(b.fast_bytes_used(), a.fast_bytes_used());
+		assert!(ma.is_empty(), "sitting exactly ON the high watermark must not trigger a pass");
+		assert_eq!(ma, mb, "a demotion pass ran at exactly the high watermark");
+		assert_eq!(a.tier_of(1), Some(Tier::Fast));
+		assert_eq!(b.tier_of(1), a.tier_of(1));
+		assert_eq!(a.slow_object_count(), 0);
+		assert_eq!(b.slow_object_count(), a.slow_object_count());
+		assert!(!b.is_midpoint(1), "nothing was demoted, so nothing seeded the cursor");
+		assert_eq!(a.is_midpoint(1), b.is_midpoint(1));
+		gauges(&a, &b);
+
+		// The control: a second object of the same size is well past the
+		// watermark, and the pass must now fire on both stacks -- proving the
+		// first object really was parked ON the trigger rather than nowhere
+		// near it.
+		a.insert(2, size);
+		b.insert(2, size);
+		a.update(2);
+		b.update(2);
+
+		let (ma, mb) = (a.drain_tier_migrations(), b.drain_tier_migrations());
+
+		assert!(!ma.is_empty(), "crossing the watermark demoted nothing; the fixture proves nothing");
+		assert_eq!(ma, mb, "the demotion pass past the watermark diverges");
+		assert_eq!(a.tier_of(1), Some(Tier::Slow), "the oldest fast object should have been demoted");
+		assert_eq!(b.tier_of(1), a.tier_of(1));
+		gauges(&a, &b);
+
+		let (ca, cb) = cursors(&a, &b, 2);
+		assert_eq!(ca, cb, "midpoint cursor diverges after the pass");
+	}
+
+	/// The `(fast_capacity, size)` pair that separates the two ways of
+	/// splitting the shared-metadata reservation. Against a one-byte
+	/// one-access carve-out and a one-byte reservation the one-access share
+	/// floors to zero, so the whole byte is REMAINDER: charging it to the main
+	/// fast segment, as `reserved.saturating_sub(one_access_share)` does,
+	/// leaves that segment a byte tighter than handing it its own floored
+	/// share would. `size` is picked to sit in the one-byte window between the
+	/// two resulting high watermarks, with `low_bytes` of the tighter budget
+	/// below it so the pass that fires has somewhere to drain to. At the
+	/// default watermarks this is `(4, 2)`.
+	fn budget_separating_the_reservation_remainder() -> (CacheSize, ObjectSize) {
+		let mut fast_capacity: CacheSize = 4;
+
+		loop {
+			// The main fast segment's budget with the remainder charged to it,
+			// and without -- the one-access carve-out is one byte in both.
+			let charged = fast_capacity - 1 - 1;
+			let uncharged = fast_capacity - 1;
+			let size = watermarks::high_bytes(uncharged);
+
+			if size > watermarks::high_bytes(charged)
+				&& size <= ObjectSize::MAX as CacheSize
+				&& watermarks::low_bytes(charged) < size
+			{
+				return (fast_capacity, size as ObjectSize);
+			}
+
+			fast_capacity += 1;
+
+			assert!(fast_capacity < 1 << 20, "watermark config never separates the two splittings");
+		}
+	}
+
+	/// `reserved_shares` hands the main fast segment the whole REMAINDER of the
+	/// proportional split rather than its own floored share, so the two shares
+	/// re-sum to the reservation exactly. Taking the floor on both sides
+	/// instead leaves the main fast segment up to a byte LOOSER than the
+	/// reservation it is supposed to be paying for.
+	///
+	/// Every reservation fixture above runs a 112-byte overhead against
+	/// kilobyte-scale capacities, where both splittings land on the same byte
+	/// and the difference is arithmetically invisible. It only surfaces when
+	/// the one-access share floors to zero while a whole byte of remainder is
+	/// still outstanding.
+	#[test]
+	fn the_reservation_remainder_is_charged_to_the_main_fast_segment() {
+		let (fast_capacity, size) = budget_separating_the_reservation_remainder();
+
+		// A `one_access_capacity` of exactly one byte, so its proportional
+		// share of a one-byte reservation floors to zero.
+		const SMALL_MAX: CacheSize = 1_000;
+		const RATIO: f64 = 0.001;
+
+		assert_eq!(
+			(RATIO * SMALL_MAX as f64) as CacheSize,
+			1,
+			"the fixture needs a one-byte one-access carve-out",
+		);
+
+		// One tracked key at a shared overhead of one byte, and an empty ghost:
+		// `reserved_overhead()` is exactly one byte.
+		let mut a = Baseline::new(RATIO, SMALL_MAX, fast_capacity).with_shared_overhead(1);
+		let mut b = Compact::new(RATIO, SMALL_MAX, fast_capacity).with_shared_overhead(1);
+
+		a.insert(1, size);
+		b.insert(1, size);
+
+		assert_eq!(a.dram_reserved_bytes(), 1, "one tracked key at one byte, ghost empty");
+		assert_eq!(b.dram_reserved_bytes(), a.dram_reserved_bytes());
+
+		a.update(1);
+		b.update(1);
+
+		let (ma, mb) = (a.drain_tier_migrations(), b.drain_tier_migrations());
+
+		assert_eq!(
+			ma,
+			vec![(1u64, Tier::Slow)],
+			"the remainder must tighten the main fast segment enough to demote this object",
+		);
+		assert_eq!(ma, mb, "the reservation split diverges");
+		assert_eq!(a.tier_of(1), Some(Tier::Slow));
+		assert_eq!(b.tier_of(1), a.tier_of(1));
+		assert_eq!(a.fast_bytes_used(), 0);
+		assert_eq!(b.fast_bytes_used(), a.fast_bytes_used());
+		assert!(b.is_midpoint(1), "the demotion seeds the cursor");
+		assert_eq!(a.is_midpoint(1), b.is_midpoint(1));
+		gauges(&a, &b);
+	}
 }
