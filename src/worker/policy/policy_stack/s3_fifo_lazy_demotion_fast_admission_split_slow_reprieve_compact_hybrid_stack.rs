@@ -1326,4 +1326,285 @@ mod fidelity_tests {
 		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
 		gauges(&a, &b);
 	}
+
+	// ── boundaries and paths the replays above never reach ─────────────────
+
+	/// One-access budget the two watermark fixtures below are built with,
+	/// sized so `settle_one_access` never fires: a key sits in the one-access
+	/// queue only until its `update()` promotes it into the main fast list,
+	/// which is the segment the watermarks actually govern.
+	const WM_ONE_ACCESS: CacheSize = 1_000;
+
+	/// Effective main-fast budget those fixtures size against. Deliberately
+	/// paired with the 1-byte objects `fill_fast_pair` admits: that makes the
+	/// fill byte-exact, so usage can be landed on precisely `high_bytes()` at
+	/// any configured watermark pair rather than only at the defaults. (The
+	/// watermarks are process-global `OnceLock`s, so a test cannot pin them
+	/// via env vars without racing every other test in the binary --
+	/// expectations are computed from `watermarks::` instead, exactly as the
+	/// baseline's own watermark tests do.)
+	const WM_CAPACITY: CacheSize = 1_000;
+
+	/// A Baseline/Compact pair whose `effective_main_fast_capacity()` is
+	/// exactly `WM_CAPACITY`.
+	fn watermark_pair() -> (Baseline, Compact) {
+		(
+			Baseline::new(1.0, WM_ONE_ACCESS, WM_ONE_ACCESS + WM_CAPACITY),
+			Compact::new(1.0, WM_ONE_ACCESS, WM_ONE_ACCESS + WM_CAPACITY),
+		)
+	}
+
+	/// Admits `count` 1-byte keys numbered from `first` into BOTH stacks and
+	/// re-accesses each one, promoting it out of the one-access queue into
+	/// the main fast list with a CLEAR reference bit
+	/// (`promote_from_one_access` clears it), so nothing in the fill is
+	/// eligible for a demotion-time reprieve.
+	fn fill_fast_pair(a: &mut Baseline, b: &mut Compact, first: HashedKey, count: CacheSize) {
+		for offset in 0..count {
+			let key = first + offset;
+
+			a.insert(key, 1);
+			b.insert(key, 1);
+			a.update(key);
+			b.update(key);
+		}
+	}
+
+	/// `settle_fast_tier` triggers on usage EXCEEDING the high watermark, not
+	/// on reaching it, so usage sitting exactly ON the mark must demote
+	/// nothing.
+	///
+	/// Nothing else in this module ever lands `fast_used` on that boundary.
+	/// The replays use 1024-byte objects against budgets whose 98% is not a
+	/// multiple of 1024, and every small fixture picks a ratio whose
+	/// one-access carve-out swallows `fast_capacity` whole, leaving
+	/// `main_fast_capacity()` at 0 -- where high and low watermarks are both
+	/// 0 and the drain loop cannot run whichever way the comparison points.
+	/// So a `<=` mis-ported as `<` survives all of them.
+	#[test]
+	fn usage_exactly_on_the_fast_high_watermark_demotes_nothing() {
+		let (mut a, mut b) = watermark_pair();
+		let on_the_mark = watermarks::high_bytes(WM_CAPACITY);
+
+		fill_fast_pair(&mut a, &mut b, 1, on_the_mark);
+
+		let (ma, mb) = (a.drain_tier_migrations(), b.drain_tier_migrations());
+		assert_eq!(ma, mb, "on-the-watermark migrations diverge");
+		assert!(ma.is_empty(), "baseline: nothing crosses a tier boundary at the mark");
+		assert!(mb.is_empty(), "usage exactly on the high watermark must demote nothing");
+		assert_eq!(a.fast_bytes_used(), on_the_mark, "baseline: the fill landed on the mark");
+		assert_eq!(b.fast_bytes_used(), a.fast_bytes_used());
+		assert_eq!(a.slow_object_count(), 0, "baseline: the whole fill is still in DRAM");
+		assert_eq!(b.slow_object_count(), a.slow_object_count());
+		gauges(&a, &b);
+
+		// One byte over, and the pass does fire -- so the assertions above
+		// pin the boundary rather than an inert stack.
+		fill_fast_pair(&mut a, &mut b, on_the_mark + 1, 1);
+
+		let (ma, mb) = (a.drain_tier_migrations(), b.drain_tier_migrations());
+		assert_eq!(ma, mb, "one-byte-over migrations diverge");
+		assert!(
+			ma.iter().any(|(_, tier)| *tier == Tier::Slow),
+			"baseline: a single byte over the high watermark triggers a pass",
+		);
+		assert!(a.slow_object_count() > 0, "baseline: the pass demoted something");
+		assert_eq!(b.slow_object_count(), a.slow_object_count());
+		gauges(&a, &b);
+	}
+
+	/// `resize` settles the ONE-ACCESS queue first and the fast tier second.
+	/// Both passes emit `Tier::Slow` migrations, so swapping the two leaves
+	/// every gauge identical and changes nothing but the ORDER of the
+	/// recorded migration sequence -- which is precisely what `PolicyWorker`
+	/// replays, and precisely what this module exists to pin.
+	///
+	/// No other test reaches a `resize` with both segments over budget at
+	/// once. `resizes_like_the_baseline` runs at a ratio whose one-access
+	/// carve-out already swallows `fast_capacity`, and its workload
+	/// re-accesses every key, so by the time it resizes the one-access queue
+	/// is empty and `settle_one_access` has nothing to reprieve.
+	#[test]
+	fn a_resize_settles_the_one_access_queue_before_the_fast_tier() {
+		// one_access_capacity = 0.1 * 1_000_000 = 100_000, so
+		// main_fast_capacity = 120_000 - 100_000 = 20_000.
+		let mut a = Baseline::new(0.1, MAX, 120_000);
+		let mut b = Compact::new(0.1, MAX, 120_000);
+
+		// Five keys promoted into the main fast list, well under its budget.
+		for k in 1..=5u64 {
+			a.insert(k, 1_000);
+			b.insert(k, 1_000);
+			a.update(k);
+			b.update(k);
+		}
+
+		// Twenty keys left sitting in the one-access queue, well under its.
+		for k in 101..=120u64 {
+			a.insert(k, 1_000);
+			b.insert(k, 1_000);
+		}
+
+		// Re-set the fast list's FRONT to a size that puts `fast_used` far
+		// over budget. A re-set of a main-fast key only marks the reference
+		// bit -- `touch` is lazy there -- so nothing settles until the resize.
+		a.insert(5, 116_000);
+		b.insert(5, 116_000);
+		a.drain_tier_migrations();
+		b.drain_tier_migrations();
+		assert_eq!(a.slow_object_count(), 0, "baseline: nothing has settled yet");
+		assert_eq!(b.slow_object_count(), a.slow_object_count());
+
+		// Shrinks the one-access budget to 10_000 -- so `settle_one_access`
+		// must reprieve ten of its twenty keys -- while `fast_used` is still
+		// far above the fast tier's own budget.
+		a.resize(100_000);
+		b.resize(100_000);
+
+		let (ma, mb) = (a.drain_tier_migrations(), b.drain_tier_migrations());
+		assert_eq!(ma, mb, "resize settle-order migrations diverge");
+
+		let first_one_access = ma.iter().position(|(key, _)| *key >= 101);
+		let first_fast = ma.iter().position(|(key, _)| *key <= 5);
+		assert!(
+			first_one_access.is_some(),
+			"the resize must reprieve one-access keys: {ma:?}",
+		);
+		assert!(
+			first_fast.is_some(),
+			"and demote main-fast keys, in the same call: {ma:?}",
+		);
+		assert!(
+			first_one_access < first_fast,
+			"baseline: `settle_one_access` runs before `settle_fast_tier`, so every \
+			 one-access reprieve is recorded ahead of every demotion: {ma:?}",
+		);
+		gauges(&a, &b);
+	}
+
+	/// `evict_one`'s FAST-tail fallback -- reached only when nothing has ever
+	/// been demoted, so both slow segments are empty -- must take the fast
+	/// list's LRU BACK, like every other eviction source in the stack.
+	///
+	/// The one existing test that reaches that fallback,
+	/// `a_second_chance_inside_the_fast_list_emits_no_migration`, holds
+	/// exactly two keys and reprieves the older one to the front first, so
+	/// both ends of the list name the same victim and a `back`/`front`
+	/// mix-up is invisible there. Every other eviction test sizes
+	/// `main_fast_capacity()` to 0, which keeps the fast list empty and the
+	/// fallback unreached.
+	#[test]
+	fn the_fast_tail_fallback_evicts_from_the_lru_end() {
+		// Fast tier far larger than the workload, so `settle_fast_tier` never
+		// demotes and both slow segments stay empty.
+		let mut a = Baseline::new(0.5, MAX, MAX);
+		let mut b = Compact::new(0.5, MAX, MAX);
+
+		// Promoted in order, so the fast list is 3 (front) .. 1 (back) with
+		// every reference bit clear -- three distinct keys, so the LRU end
+		// and the MRU end name different victims.
+		for k in 1..=3u64 {
+			a.insert(k, 10);
+			b.insert(k, 10);
+			a.update(k);
+			b.update(k);
+		}
+
+		assert_eq!(a.slow_bytes_used(), 0, "baseline: nothing was ever demoted");
+		assert_eq!(b.slow_bytes_used(), a.slow_bytes_used());
+		assert_eq!(a.fast_object_count(), 3);
+		a.drain_tier_migrations();
+		b.drain_tier_migrations();
+
+		let (mut ea, mut eb) = (Vec::new(), Vec::new());
+		let (mut ma, mut mb) = (Vec::new(), Vec::new());
+
+		while let Some(k) = a.evict_one() {
+			ea.push(k);
+			ma.extend(a.drain_tier_migrations());
+		}
+		while let Some(k) = b.evict_one() {
+			eb.push(k);
+			mb.extend(b.drain_tier_migrations());
+		}
+
+		assert_eq!(ea, eb, "fast-tail fallback eviction order diverges");
+		assert_eq!(
+			ea, vec![1u64, 2, 3],
+			"baseline: oldest first, out of the fast list's back",
+		);
+		assert_eq!(ma, mb, "fast-tail fallback migrations diverge");
+		assert!(mb.is_empty(), "evicting out of the fast list migrates nothing");
+		gauges(&a, &b);
+	}
+
+	/// `insert_resident`'s DRAM-resident remainder is subtracted from the
+	/// bytes that actually migrate: `size` is the object's base size, and the
+	/// part of it that stays in DRAM in either tier (key + expiry field) is
+	/// already counted inside `shared_overhead`, so charging it to the tier
+	/// gauges as well would double-count every object.
+	///
+	/// No other test in this module calls `insert_resident`, so every
+	/// `migrating()` above is exercised only at `dram_resident == 0` -- where
+	/// dropping the subtraction, or dropping `narrow_resident`'s clamp, is
+	/// completely invisible.
+	#[test]
+	fn the_dram_resident_remainder_is_excluded_from_the_migrating_bytes() {
+		let mut a = Baseline::new(0.5, MAX, MAX);
+		let mut b = Compact::new(0.5, MAX, MAX);
+
+		a.insert_resident(1, 1_000, 40);
+		b.insert_resident(1, 1_000, 40);
+
+		assert_eq!(
+			a.fast_bytes_used(), 960,
+			"baseline: only the migrating bytes are charged to the tier",
+		);
+		assert_eq!(b.fast_bytes_used(), a.fast_bytes_used());
+		gauges(&a, &b);
+
+		// `narrow_resident` clamps the remainder to a `u8` before it is
+		// stored, in both stacks.
+		a.insert_resident(2, 1_000, 4_000);
+		b.insert_resident(2, 1_000, 4_000);
+
+		assert_eq!(
+			a.fast_bytes_used(), 960 + 745,
+			"baseline: a remainder over 255 clamps to 255",
+		);
+		assert_eq!(b.fast_bytes_used(), a.fast_bytes_used());
+		gauges(&a, &b);
+
+		// And the remainder has to hold all the way through demotion, the
+		// crossing check and eviction, since the byte counters it feeds are
+		// exactly what the split ratio and the watermarks are computed from.
+		let ops = skewed_ops();
+		let mut a = Baseline::new(0.25, MAX, 32_768).with_shared_overhead(112);
+		let mut b = Compact::new(0.25, MAX, 32_768).with_shared_overhead(112);
+		let (mut ma, mut mb) = (Vec::new(), Vec::new());
+
+		for (i, (k, size)) in ops.iter().enumerate() {
+			let resident = ((i % 300) + 1) as ObjectSize;
+
+			if a.contains(*k) { a.update(*k); } else { a.insert_resident(*k, *size, resident); }
+			if b.contains(*k) { b.update(*k); } else { b.insert_resident(*k, *size, resident); }
+
+			ma.extend(a.drain_tier_migrations());
+			mb.extend(b.drain_tier_migrations());
+		}
+
+		assert_eq!(ma, mb, "migrations diverge with a DRAM-resident remainder");
+		gauges(&a, &b);
+
+		for k in 1..=200u64 {
+			assert_eq!(
+				a.tier_of(k), b.tier_of(k),
+				"tier of {k} diverges with a resident remainder",
+			);
+			assert_eq!(
+				a.is_in_slow_tail(k), b.is_in_slow_tail(k),
+				"segment of {k} diverges with a resident remainder",
+			);
+		}
+	}
 }
