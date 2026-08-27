@@ -177,20 +177,9 @@ impl LruSizedCompactHybridStack {
 
 	/// Per-object DRAM reserved from the fast segments for shared metadata.
 	///
-	/// Also pre-sizes the slab, on the same reasoning
-	/// `LruCompactHybridStack::with_shared_overhead` documents: every tracked
-	/// object costs `overhead` bytes of fast-tier metadata whichever queue it
-	/// sits in, so the COMBINED fast budget divided by `overhead` is a hard
-	/// ceiling on the entry count. Capped, because the ceiling is sound but
-	/// unbounded and reserving it outright asks for petabytes at large budgets.
 	pub fn with_shared_overhead(mut self, overhead: CacheSize) -> Self {
 		self.shared_overhead = overhead;
 
-		if overhead > 0 {
-			let budget = self.small_capacity.saturating_add(self.large_capacity);
-			let ceiling = (budget / overhead) as usize;
-			self.queues.reserve(ceiling.min(super::MAX_PREALLOC_ENTRIES));
-		}
 
 		self
 	}
@@ -668,30 +657,6 @@ impl PolicyStack for LruSizedCompactHybridStack {
 	}
 }
 
-#[cfg(test)]
-mod prealloc_tests {
-	use super::*;
-
-	/// Constructing with a very large budget must not try to pre-allocate the
-	/// whole theoretical ceiling.
-	#[test]
-	fn a_huge_budget_does_not_preallocate_the_ceiling() {
-		let stack = LruSizedCompactHybridStack::new(u64::MAX / 4, u64::MAX / 4, 4_096)
-			.with_shared_overhead(190);
-		assert_eq!(stack.len(), 0);
-		assert_eq!(stack.small_capacity(), u64::MAX / 4);
-		assert_eq!(stack.large_capacity(), u64::MAX / 4);
-		assert_eq!(stack.size_threshold(), 4_096);
-	}
-
-	#[test]
-	fn a_realistic_budget_still_reserves() {
-		let stack =
-			LruSizedCompactHybridStack::new(2 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 4_096)
-				.with_shared_overhead(224);
-		assert_eq!(stack.len(), 0);
-	}
-}
 
 /// Fidelity against `LruSizedHybridStack`, which this stack is a compaction of.
 ///

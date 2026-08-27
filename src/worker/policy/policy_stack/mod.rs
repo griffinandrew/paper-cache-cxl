@@ -15,20 +15,6 @@ mod two_q_stack;
 mod arc_stack;
 mod s_three_fifo_stack;
 pub(crate) mod ghost_filter;
-/// Upper bound on how many slab entries a compact stack pre-reserves.
-///
-/// `fast_capacity / shared_overhead` is a sound ceiling on the entry count, but
-/// it is not a BOUNDED one: with a large `max_size` it runs to billions, and
-/// reserving it outright asks the allocator for petabytes. That is not
-/// hypothetical -- it aborted with "memory allocation of 122978293824730344
-/// bytes failed" the first time a compact stack was constructed with
-/// `u64::MAX / 4` as the budget.
-///
-/// 2^22 entries is ~100 MB of slab, which removes essentially every doubling
-/// at realistic cache sizes while staying an amount an allocator will actually
-/// hand over. Growth past it still doubles, but from a base large enough that
-/// the remaining copies are few.
-pub(crate) const MAX_PREALLOC_ENTRIES: usize = 1 << 22;
 
 pub(crate) mod compact_queue_set;
 pub(crate) mod compact_frequency_chain;

@@ -165,23 +165,9 @@ impl LruLfuCompactHybridStack {
 
 	/// Per-object DRAM reserved from the fast tier for shared metadata.
 	///
-	/// Also pre-sizes the slab, because this is the first point at which both
-	/// the budget and the per-object cost are known. Every object costs
-	/// `overhead` bytes of fast-tier metadata whichever tier its value sits
-	/// in, so `fast_capacity / overhead` is a hard ceiling on the entry count,
-	/// not an estimate. Reserving it means the slab never reallocates and
-	/// never pays the copy; untouched pages are not resident, so an
-	/// over-estimate costs address space rather than memory.
 	pub fn with_shared_overhead(mut self, overhead: CacheSize) -> Self {
 		self.shared_overhead = overhead;
 
-		if overhead > 0 {
-			// Capped: the ceiling is sound but unbounded, and reserving it
-			// outright asks for petabytes at large budgets. See
-			// `MAX_PREALLOC_ENTRIES`.
-			let ceiling = (self.fast_capacity / overhead) as usize;
-			self.chain.reserve(ceiling.min(super::MAX_PREALLOC_ENTRIES));
-		}
 
 		self
 	}

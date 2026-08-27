@@ -104,23 +104,9 @@ impl LruCompactHybridStack {
 
 	/// Per-object DRAM reserved from the fast tier for shared metadata.
 	///
-	/// Also pre-sizes the slab, because this is the first point at which both
-	/// the budget and the per-object cost are known. Every object costs
-	/// `overhead` bytes of fast-tier metadata whichever tier its value sits in,
-	/// so `fast_capacity / overhead` is a hard ceiling on the entry count, not
-	/// an estimate. Reserving it means the slab never reallocates and never
-	/// pays the copy; untouched pages are not resident, so an over-estimate
-	/// costs address space rather than memory.
 	pub fn with_shared_overhead(mut self, overhead: CacheSize) -> Self {
 		self.shared_overhead = overhead;
 
-		if overhead > 0 {
-			// Capped: the ceiling is sound but unbounded, and reserving it
-			// outright asks for petabytes at large budgets. See
-			// `MAX_PREALLOC_ENTRIES`.
-			let ceiling = (self.fast_capacity / overhead) as usize;
-			self.list.reserve(ceiling.min(super::MAX_PREALLOC_ENTRIES));
-		}
 
 		self
 	}
@@ -376,22 +362,47 @@ impl PolicyStack for LruCompactHybridStack {
 }
 
 #[cfg(test)]
-mod prealloc_tests {
+mod growth_tests {
 	use super::*;
 
-	/// Constructing with a very large budget must not try to pre-allocate the
-	/// whole theoretical ceiling. The first version of `with_shared_overhead`
-	/// did, and aborted the process asking for 123 PB.
+	/// These stacks grow dynamically and must not allocate from the cache
+	/// budget at construction. An eager reservation sized from capacity was
+	/// removed: at the standing 4 GiB fast tier it reserved 4.19M slots, which
+	/// is 16x what the 16.5 KB-object eval trace can hold there, while on the
+	/// real Twitter traces (~180 B objects, ~11.4M resident) it was too small
+	/// to prevent doubling anyway. It also meant the shipped stack allocated
+	/// something other than the 72 B/object that was measured and reported,
+	/// since the measurement runs with the reservation disabled.
+	///
+	/// The old tests here asserted only `len() == 0`, which is true either
+	/// way; neither observed capacity.
 	#[test]
-	fn a_huge_budget_does_not_preallocate_the_ceiling() {
-		let stack = LruCompactHybridStack::new(u64::MAX / 4).with_shared_overhead(190);
-		assert_eq!(stack.len(), 0);
+	fn construction_does_not_allocate_from_the_budget() {
+		for budget in [u64::MAX / 4, 4 * 1024 * 1024 * 1024, 1_024] {
+			let stack = LruCompactHybridStack::new(budget).with_shared_overhead(224);
+			assert_eq!(stack.len(), 0, "budget {budget}: nothing is tracked yet");
+			assert_eq!(
+				stack.list.slab_capacity(),
+				0,
+				"budget {budget}: the slab must be empty at construction -- a stack \
+				 that pre-sizes from capacity allocates for objects that may never \
+				 arrive, and reserves a different amount than it was measured at",
+			);
+		}
 	}
 
+	/// The counterpart: growth still happens, it is just demand-driven.
 	#[test]
-	fn a_realistic_budget_still_reserves() {
-		let stack = LruCompactHybridStack::new(4 * 1024 * 1024 * 1024).with_shared_overhead(224);
-		assert_eq!(stack.len(), 0);
+	fn the_slab_grows_on_demand() {
+		let mut stack = LruCompactHybridStack::new(u64::MAX / 4).with_shared_overhead(224);
+		for i in 0..1_000u64 {
+			stack.insert(i, 64);
+		}
+		assert_eq!(stack.len(), 1_000);
+		assert!(
+			stack.list.slab_capacity() >= 1_000,
+			"the slab must have grown to hold what was inserted",
+		);
 	}
 }
 

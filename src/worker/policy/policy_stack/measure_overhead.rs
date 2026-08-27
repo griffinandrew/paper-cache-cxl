@@ -123,6 +123,102 @@ fn measure_one_point() {
 	println!("MEASURED {} {} {}", want, n, after.saturating_sub(base));
 }
 
+/// One measurement of the WHOLE cache, one process.
+///
+/// `measure_one_point` above measures a bare eviction stack, which is what
+/// `*_EVICTION_STACK_DRAM_OVERHEAD` needs. `get_policy_overhead` is a
+/// different quantity: it is added to `Object::base_size` to give the bytes a
+/// cached object is CHARGED against `max_size`, so it must account for
+/// everything the cache allocates per object beyond the object's own bytes --
+/// the object-map row and its hashtable slot, the eviction-stack entry, and
+/// the expiry entry. Only a real `PaperCache` allocates all of those.
+///
+/// Its current values are, by the table's own admission, "just rough estimates
+/// of the number of bytes per object": hand-counted struct sizes like 48 for a
+/// `HashList` entry. Every compact variant carries a flat `16 + 24` written by
+/// the registration helper and never checked against anything.
+///
+/// Same methodology as `measure_one_point`, for the same reasons: jemalloc
+/// `stats.allocated` rather than RSS, ONE point per process, and the caller
+/// samples at POWERS OF TWO so every point sits at the same phase of every
+/// structure's resize cycle.
+///
+/// The fast tier is set to `max_size` and `max_size` far above the batch, so
+/// nothing evicts and nothing demotes: this is the cost of HOLDING n objects
+/// entirely in DRAM, which is what the charge against `max_size` describes.
+///
+/// The slope across n is `value_allocation + overhead`, so the caller
+/// subtracts the size-class-rounded value cost -- NOT the nominal value size.
+/// `nallocx(15)` is 16, and getting that wrong is what made a 15-byte value
+/// look free against a 40-byte tier earlier in this work.
+#[test]
+#[ignore]
+fn measure_cache_point() {
+	let n: u64 = match std::env::var("MEASURE_CACHE_N") {
+		Ok(v) => v.parse().expect("MEASURE_CACHE_N"),
+		Err(_) => return,
+	};
+	let want = std::env::var("MEASURE_CACHE_POLICY").expect("MEASURE_CACHE_POLICY");
+	let vsize: usize = std::env::var("MEASURE_VALUE")
+		.map(|v| v.parse().expect("MEASURE_VALUE"))
+		.unwrap_or(64);
+	let policy: PaperPolicy = want.parse().expect("policy string");
+
+	// Far above the batch: nothing may evict, or this measures a steady state
+	// rather than the cost of holding n.
+	let max_size: crate::CacheSize = 1 << 40;
+	let value = vec![0u8; vsize];
+
+	let base = allocated_bytes();
+	let cache = crate::PaperCache::<u64, crate::TieredBuffer>::new(
+		max_size,
+		crate::CacheTierSize::Bytes(max_size),
+		policy,
+	)
+	.expect("cache should construct");
+
+	for i in 0..n {
+		let key = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+		cache.set(key, &value, None).expect("set should succeed");
+	}
+
+	// The policy worker consumes inserts asynchronously; measuring before it
+	// has drained would count an arbitrary prefix of the eviction-stack cost.
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+	while cache.status().map(|st| st.num_objects()).unwrap_or(0) < n
+		&& std::time::Instant::now() < deadline
+	{
+		std::thread::sleep(std::time::Duration::from_millis(20));
+	}
+	std::thread::sleep(std::time::Duration::from_millis(500));
+
+	let after = allocated_bytes();
+	let st = cache.status().expect("status");
+	let held = st.num_objects();
+	let charged = st.used_size();
+	core::hint::black_box(&cache);
+	// `charged` is what the cache BELIEVES it is using -- base_size plus
+	// get_policy_overhead, summed over every object. `allocated` is what
+	// jemalloc actually handed out. The gap between them IS the error in
+	// the table, reported per point rather than inferred afterwards.
+	println!(
+		"MEASURED_CACHE {} {} {} {} {} {}",
+		want, n, vsize, after.saturating_sub(base), held, charged,
+	);
+}
+
+/// The size-class-rounded cost of one value allocation, which the caller must
+/// subtract from the measured slope. Printed rather than derived so the driver
+/// never has to guess a jemalloc size class.
+#[test]
+#[ignore]
+fn measure_value_class() {
+	for v in [15usize, 16, 32, 64, 100, 128, 512, 1024] {
+		let rounded = unsafe { tikv_jemalloc_sys::nallocx(v, 0) };
+		println!("VALUE_CLASS {} {}", v, rounded);
+	}
+}
+
 /// Layout A vs layout B for the slab designs, measured rather than derived.
 ///
 /// Both keep a slab of list nodes and one index map. The question is which of

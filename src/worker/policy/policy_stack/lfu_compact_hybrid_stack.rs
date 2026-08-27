@@ -105,13 +105,6 @@ impl LfuCompactHybridStack {
 		// entry count, not a guess. Reserving it up front means the slab never
 		// reallocates and never pays the copy; untouched pages are not resident,
 		// so an over-estimate costs address space rather than memory.
-		if overhead > 0 {
-			// Capped: the ceiling is sound but unbounded, and reserving it
-			// outright asks for petabytes at large budgets. See
-			// `MAX_PREALLOC_ENTRIES`.
-			let ceiling = (self.fast_capacity / overhead) as usize;
-			self.chain.reserve(ceiling.min(super::MAX_PREALLOC_ENTRIES));
-		}
 
 		self
 	}

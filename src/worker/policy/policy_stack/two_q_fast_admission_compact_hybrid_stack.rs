@@ -111,17 +111,9 @@ impl TwoQFastAdmissionCompactHybridStack {
 		}
 	}
 
-	/// Also pre-sizes the slab: every object costs `overhead` bytes of
-	/// fast-tier metadata whichever tier its value sits in, so
-	/// `fast_capacity / overhead` bounds the entry count. Capped, because that
-	/// ceiling is sound but unbounded -- see `MAX_PREALLOC_ENTRIES`.
 	pub fn with_shared_overhead(mut self, overhead: CacheSize) -> Self {
 		self.shared_overhead = overhead;
 
-		if overhead > 0 {
-			let ceiling = (self.fast_capacity / overhead) as usize;
-			self.queues.reserve(ceiling.min(super::MAX_PREALLOC_ENTRIES));
-		}
 
 		self
 	}
