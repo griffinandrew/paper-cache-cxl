@@ -1068,4 +1068,277 @@ mod fidelity_tests {
 		assert_eq!(a.len(), b.len());
 		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
 	}
+
+	/// The `settle_fast_tier` TRIGGER is `<=`, not `<`: a main fast segment
+	/// sitting *exactly* on its high watermark is not over it and must not
+	/// start a demotion pass.
+	///
+	/// Nothing above can see that boundary. Every test in this module uses
+	/// 1 KiB objects against multi-kilobyte budgets, so `fast_used` steps
+	/// over the watermark in 1024-byte jumps and never lands on it -- the
+	/// two comparisons then agree on every call ever made. This walks
+	/// `fast_used` up one byte at a time so it has to pass through the
+	/// watermark exactly.
+	#[test]
+	fn fast_used_exactly_on_the_high_watermark_does_not_demote() {
+		// 0.25 * 400 = a 100-byte one-access carve-out of a 200-byte fast
+		// budget, leaving the main fast segment exactly 100 bytes, and no
+		// reservation to complicate the arithmetic.
+		const SMALL_MAX: CacheSize = 400;
+		const SMALL_FAST: CacheSize = 200;
+
+		let effective = SMALL_FAST - (0.25 * SMALL_MAX as f64) as CacheSize;
+		let target = watermarks::high_bytes(effective);
+		assert!(target > 1, "the configured watermark leaves no room to ramp up to");
+
+		let mut a =
+			S3FifoLazyDemotionFastAdmissionReprieveHybridStack::new(0.25, SMALL_MAX, SMALL_FAST)
+				.with_shared_overhead(0);
+		let mut b =
+			S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack::new(0.25, SMALL_MAX, SMALL_FAST)
+				.with_shared_overhead(0);
+
+		// One-byte objects, each promoted straight back out of the one-access
+		// queue, so `fast_used` climbs 1, 2, 3, ... and stops dead ON the
+		// watermark rather than stepping across it.
+		for k in 1..=target {
+			a.insert(k, 1);
+			b.insert(k, 1);
+			a.update(k);
+			b.update(k);
+		}
+
+		let (ma, mb) = (a.drain_tier_migrations(), b.drain_tier_migrations());
+		assert_eq!(a.fast_bytes_used(), target, "the ramp did not land on the watermark");
+		assert_eq!(b.fast_bytes_used(), a.fast_bytes_used());
+		assert!(ma.is_empty(), "sitting exactly ON the high watermark must not trigger a pass");
+		assert_eq!(ma, mb, "a demotion pass ran at exactly the high watermark");
+		assert_eq!(a.slow_object_count(), 0);
+		assert_eq!(b.slow_object_count(), a.slow_object_count());
+
+		// One byte past it, and both stacks must now drain to the low
+		// watermark together -- proving the ramp really was parked on the
+		// trigger rather than nowhere near it.
+		a.insert(target + 1, 1);
+		b.insert(target + 1, 1);
+		a.update(target + 1);
+		b.update(target + 1);
+
+		let (ma, mb) = (a.drain_tier_migrations(), b.drain_tier_migrations());
+		assert!(!ma.is_empty(), "crossing the watermark demoted nothing; the test proves nothing");
+		assert_eq!(ma, mb, "the demotion pass one byte past the watermark diverges");
+		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
+		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
+		assert_eq!(a.fast_object_count(), b.fast_object_count());
+		assert_eq!(a.slow_object_count(), b.slow_object_count());
+	}
+
+	/// DELTA 9, sharpened: `resize` settles the one-access boundary BEFORE
+	/// the fast-tier one, and the migration record has to show it.
+	///
+	/// `resize_settles_both_boundaries_synchronously` cannot see the order,
+	/// only that both settles happen. Shrinking `one_access_capacity` GROWS
+	/// `main_fast_capacity` -- the main fast segment is whatever is left of
+	/// `fast_capacity` after the carve-out -- and growing it shrinks the
+	/// segment, so on any single resize there only ever *is* work for one of
+	/// the two. Swapping them is invisible.
+	///
+	/// Making both fire on ONE resize needs the fast segment to be over
+	/// budget already when the call arrives. The stack has a documented way
+	/// in: re-inserting an existing `main_fast` key at a larger size runs
+	/// `resize_key` (which raises `fast_used`) and then `touch`, and neither
+	/// settles the fast tier.
+	#[test]
+	fn resize_settles_the_one_access_boundary_before_the_fast_one() {
+		// 0.1 * 100_000 = a 10_000-byte one-access carve-out; the main fast
+		// segment gets the remaining 10_480 bytes of the 20_480 fast budget.
+		let mut a = S3FifoLazyDemotionFastAdmissionReprieveHybridStack::new(0.1, MAX, 20_480)
+			.with_shared_overhead(0);
+		let mut b = S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack::new(0.1, MAX, 20_480)
+			.with_shared_overhead(0);
+
+		// Eight promoted keys in `main_fast`, comfortably inside its budget.
+		for k in 1..=8u64 {
+			a.insert(k, 1024);
+			b.insert(k, 1024);
+			a.update(k);
+			b.update(k);
+		}
+
+		// Fill the one-access queue right up against its own budget.
+		for k in 100..=109u64 {
+			a.insert(k, 1024);
+			b.insert(k, 1024);
+		}
+		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
+
+		// Re-insert key 1 at a larger size: `fast_used` jumps well past the
+		// fast segment high watermark with nothing settling it.
+		a.insert(1, 8_000);
+		b.insert(1, 8_000);
+		let (ma, mb) = (a.drain_tier_migrations(), b.drain_tier_migrations());
+		assert_eq!(ma, mb);
+		assert!(ma.is_empty(), "the re-insert settled the fast tier; the overrun is gone");
+
+		let spill_tail = b.queues.back(Q_ONE_ACCESS).expect("no one-access tail left to spill");
+		assert!(b.queues.queue_len(Q_MAIN_FAST) > 1, "not enough fast keys left to demote");
+
+		// One resize, both boundaries with real work: the one-access
+		// carve-out shrinks 10_000 -> 9_000, spilling its tail, while the
+		// main fast segment is ALREADY over budget and must demote.
+		a.resize(90_000);
+		b.resize(90_000);
+		let (ma, mb) = (a.drain_tier_migrations(), b.drain_tier_migrations());
+
+		assert!(ma.len() >= 2, "the resize did not leave both boundaries with work to do");
+		assert_eq!(
+			ma[0],
+			(spill_tail, Tier::Slow),
+			"the one-access spill must be recorded before the fast-tier demotions",
+		);
+		assert!(
+			ma[1..].iter().all(|(k, _)| *k <= 8),
+			"everything after the spill must be a main_fast demotion",
+		);
+		assert_eq!(ma, mb, "resize migration order diverges");
+
+		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
+		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
+		assert_eq!(a.fast_object_count(), b.fast_object_count());
+		assert_eq!(a.slow_object_count(), b.slow_object_count());
+		assert_eq!(a.len(), b.len());
+
+		// Running the two settles the other way round also leaves `main_slow`
+		// in a different order, so drain it and compare that too.
+		let mut ea = Vec::new();
+		let mut eb = Vec::new();
+		while let Some(k) = a.evict_one() { ea.push(k); }
+		while let Some(k) = b.evict_one() { eb.push(k); }
+		assert!(!ea.is_empty(), "nothing was evictable; the ordering claim is untested");
+		assert_eq!(ea, eb, "eviction order after the resize diverges");
+	}
+
+	/// `evict_one` debits the tier the victim actually came out of:
+	/// `slow_used` for a `main_slow` tail, `fast_used` for the `main_fast`
+	/// fallback.
+	///
+	/// The two eviction tests above compare the victim SEQUENCE, `len()` and
+	/// migrations, and `removal_matches_across_all_three_queues` compares the
+	/// byte counters -- but only across `remove()`, never across
+	/// `evict_one()`. So no test in this module ever reads
+	/// `fast_bytes_used()`/`slow_bytes_used()` after an eviction, and
+	/// crossing the two debits leaves every assertion satisfied.
+	#[test]
+	fn eviction_debits_the_same_tier_counter_as_the_baseline() {
+		let mut a = S3FifoLazyDemotionFastAdmissionReprieveHybridStack::new(0.1, MAX, 20_480)
+			.with_shared_overhead(0);
+		let mut b = S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack::new(0.1, MAX, 20_480)
+			.with_shared_overhead(0);
+
+		for k in 1..=40u64 {
+			a.insert(k, 1024);
+			b.insert(k, 1024);
+			a.update(k);
+			b.update(k);
+		}
+		a.drain_tier_migrations();
+		b.drain_tier_migrations();
+
+		assert!(b.slow_object_count() > 0, "nothing reached main_slow");
+		assert!(b.queues.queue_len(Q_MAIN_FAST) > 0, "main_fast emptied; the fallback is untested");
+		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
+		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
+
+		let mut saw_slow_debit = false;
+		let mut saw_fast_debit = false;
+
+		for step in 0..64 {
+			let (fast_before, slow_before) = (a.fast_bytes_used(), a.slow_bytes_used());
+			let (ka, kb) = (a.evict_one(), b.evict_one());
+			assert_eq!(ka, kb, "eviction order diverges at step {step}");
+
+			if ka.is_none() {
+				break;
+			}
+
+			assert_eq!(
+				a.fast_bytes_used(),
+				b.fast_bytes_used(),
+				"fast byte counter diverges after eviction {step}",
+			);
+			assert_eq!(
+				a.slow_bytes_used(),
+				b.slow_bytes_used(),
+				"slow byte counter diverges after eviction {step}",
+			);
+			assert_eq!(a.slow_object_count(), b.slow_object_count());
+			assert_eq!(a.fast_object_count(), b.fast_object_count());
+			assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
+
+			saw_slow_debit |= a.slow_bytes_used() < slow_before;
+			saw_fast_debit |= a.fast_bytes_used() < fast_before;
+		}
+
+		assert!(saw_slow_debit, "no victim ever came out of main_slow; the slow debit is untested");
+		assert!(saw_fast_debit, "no victim ever came out of main_fast; the fallback debit is untested");
+		assert_eq!(a.len(), b.len());
+	}
+
+	/// `give_second_chance`'s already-Fast branch -- the one path that spares a
+	/// key at the tail without changing its tier. It must still move that key
+	/// to the FRONT of `main_fast`: otherwise the eviction loop comes straight
+	/// back to the same tail, now with the bit cleared, and evicts the very
+	/// key it just spared.
+	///
+	/// The branch is only reachable from `evict_one`'s fast-tail fallback,
+	/// i.e. while `main_slow` is empty, and only shows up in behaviour when
+	/// that fast tail's reference bit is set at that moment.
+	/// `eviction_prefers_the_slow_tail_and_falls_back_to_the_fast_tail`
+	/// exercises the fallback, but every `main_fast` key there was just
+	/// promoted, so its bit is clear and the branch is never entered.
+	#[test]
+	fn a_spared_fast_tail_moves_to_the_front_instead_of_being_evicted_next() {
+		let mut a = S3FifoLazyDemotionFastAdmissionReprieveHybridStack::new(0.1, MAX, 20_480)
+			.with_shared_overhead(0);
+		let mut b = S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack::new(0.1, MAX, 20_480)
+			.with_shared_overhead(0);
+
+		// Three promoted keys and nothing demoted, so `main_slow` is empty
+		// and `evict_one` has to fall back to the `main_fast` tail.
+		for k in 1..=3u64 {
+			a.insert(k, 1024);
+			b.insert(k, 1024);
+			a.update(k);
+			b.update(k);
+		}
+		a.drain_tier_migrations();
+		b.drain_tier_migrations();
+		assert_eq!(a.slow_object_count(), 0, "main_slow must be empty for the fallback");
+		assert_eq!(b.slow_object_count(), a.slow_object_count());
+		assert_eq!(b.queues.back(Q_MAIN_FAST), Some(1), "key 1 should be the oldest fast key");
+
+		// Set the reference bit on that tail, and only on that tail.
+		a.update(1);
+		b.update(1);
+		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
+
+		// The spared tail must not be the victim -- the next-oldest is.
+		let (ka, kb) = (a.evict_one(), b.evict_one());
+		assert_eq!(ka, Some(2), "the spared fast tail was evicted instead of the next-oldest");
+		assert_eq!(kb, ka, "eviction victim diverges after a fast-tail second chance");
+		assert!(a.contains(1) && b.contains(1), "the spared key must still be resident");
+		assert_eq!(a.tier_of(1), Some(Tier::Fast));
+		assert_eq!(b.tier_of(1), a.tier_of(1));
+		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
+
+		// And it went to the FRONT, so the next victim is the key that was
+		// standing behind it rather than the spared key itself.
+		let (ka, kb) = (a.evict_one(), b.evict_one());
+		assert_eq!(ka, Some(3), "the spared key did not move to the front of main_fast");
+		assert_eq!(kb, ka, "eviction order diverges after the reordering");
+		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
+		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
+		assert_eq!(a.len(), b.len());
+	}
+
 }

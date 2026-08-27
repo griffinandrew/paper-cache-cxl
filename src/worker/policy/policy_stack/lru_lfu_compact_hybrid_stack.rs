@@ -1349,4 +1349,162 @@ mod fidelity_tests {
 			assert_eq!(b.frequency_of(1), a.frequency_of(1));
 		}
 	}
+
+	/// A workload of pure `set`s at changing sizes.
+	///
+	/// Every other harness in this module routes an already-tracked key to
+	/// `update`, which never calls `resize_key` -- so `insert_resident`'s
+	/// OVERWRITE branch is unreached by all of them, and the whole of
+	/// `resize_key` with it. Here every op is a write, so a tracked key takes
+	/// that branch.
+	fn overwriting_ops() -> Vec<(HashedKey, ObjectSize)> {
+		let mut ops = Vec::new();
+		let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+		for _ in 0..20_000 {
+			x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+			let u = (x >> 11) as f64 / (1u64 << 53) as f64;
+			ops.push((((u * u * 200.0) as u64) + 1, 256 + (x % 2_048) as ObjectSize));
+		}
+		ops
+	}
+
+	/// A `set` over a tracked key is an overwrite, and an overwrite resizes.
+	///
+	/// `resize_key` is reachable only from `insert_resident`'s overwrite
+	/// branch, and no other test here enters it -- so a `resize_key` that
+	/// charges the size delta to the wrong tier's counter passes every one of
+	/// them. The per-tier byte gauges are compared on every op because a
+	/// mischarge shows there first: it only becomes a placement divergence
+	/// once the corrupted `fast_used` drifts across a watermark.
+	#[test]
+	fn matches_lru_lfu_hybrid_when_a_set_overwrites_an_existing_key() {
+		let ops = overwriting_ops();
+
+		for cap in [16_384u64, 65_536] {
+			for k in [2u16, 3, 5] {
+				let mut a = LruLfuHybridStack::new(cap, k).with_shared_overhead(112);
+				let mut b = LruLfuCompactHybridStack::new(cap, k).with_shared_overhead(112);
+				let (mut ma, mut mb) = (Vec::new(), Vec::new());
+
+				let (mut overwrote_fast, mut overwrote_slow) = (0usize, 0usize);
+
+				for (i, (key, size)) in ops.iter().enumerate() {
+					match a.tier_of(*key) {
+						Some(Tier::Fast) => overwrote_fast += 1,
+						Some(Tier::Slow) => overwrote_slow += 1,
+						None => {},
+					}
+
+					// Unconditionally a write: a tracked key takes the
+					// overwrite branch, a new one takes admission.
+					a.insert(*key, *size);
+					b.insert(*key, *size);
+
+					ma.extend(a.drain_tier_migrations());
+					mb.extend(b.drain_tier_migrations());
+
+					assert_eq!(
+						(a.fast_bytes_used(), a.slow_bytes_used()),
+						(b.fast_bytes_used(), b.slow_bytes_used()),
+						"tier byte gauges diverge at op {i}, cap {cap}, k {k}",
+					);
+				}
+
+				assert_eq!(ma, mb, "migrations diverge at cap {cap}, k {k}");
+
+				for key in 1..=200u64 {
+					assert_eq!(
+						(a.tier_of(key), a.frequency_of(key)),
+						(b.tier_of(key), b.frequency_of(key)),
+						"key {key} diverges at cap {cap}, k {k}",
+					);
+				}
+
+				assert_eq!(a.fast_object_count(), b.fast_object_count());
+				assert_eq!(a.slow_object_count(), b.slow_object_count());
+
+				// Both arms of `resize_key`'s tier match have to be reached, or
+				// the equalities above say nothing about it.
+				assert!(overwrote_fast > 0, "no fast-tier overwrite at cap {cap}, k {k}");
+				assert!(overwrote_slow > 0, "no slow-tier overwrite at cap {cap}, k {k}");
+			}
+		}
+	}
+
+	/// The DRAM-resident remainder, which every other harness leaves at zero.
+	///
+	/// `insert` hard-codes `dram_resident = 0` and it is the only admission
+	/// call the rest of this module makes, so `narrow_resident`, the
+	/// `size - dram_resident` subtraction at admission and the remainder
+	/// refresh on a re-set are all unobservable to them. A real run carries a
+	/// nonzero remainder on every object with a TTL, and re-setting one can
+	/// add or drop it, so this drives `insert_resident` directly with a
+	/// remainder that moves.
+	#[test]
+	fn matches_lru_lfu_hybrid_with_a_dram_resident_remainder() {
+		let ops = overwriting_ops();
+
+		// Well under `narrow_resident`'s 255-byte ceiling, so both designs
+		// narrow identically and this stays a test of the arithmetic rather
+		// than of the narrowing.
+		let residents: [ObjectSize; 3] = [0, 16, 80];
+
+		for cap in [16_384u64, 65_536] {
+			for k in [2u16, 4] {
+				let mut a = LruLfuHybridStack::new(cap, k).with_shared_overhead(112);
+				let mut b = LruLfuCompactHybridStack::new(cap, k).with_shared_overhead(112);
+				let (mut ma, mut mb) = (Vec::new(), Vec::new());
+
+				let (mut admitted_with_remainder, mut overwrote_with_remainder) = (0usize, 0usize);
+
+				for (i, (key, size)) in ops.iter().enumerate() {
+					let resident = residents[i % residents.len()];
+
+					if resident > 0 {
+						if a.contains(*key) {
+							overwrote_with_remainder += 1;
+						} else {
+							admitted_with_remainder += 1;
+						}
+					}
+
+					a.insert_resident(*key, *size, resident);
+					b.insert_resident(*key, *size, resident);
+
+					ma.extend(a.drain_tier_migrations());
+					mb.extend(b.drain_tier_migrations());
+
+					assert_eq!(
+						(a.fast_bytes_used(), a.slow_bytes_used()),
+						(b.fast_bytes_used(), b.slow_bytes_used()),
+						"tier byte gauges diverge at op {i}, cap {cap}, k {k}",
+					);
+				}
+
+				assert_eq!(ma, mb, "migrations diverge at cap {cap}, k {k}");
+
+				for key in 1..=200u64 {
+					assert_eq!(
+						(a.tier_of(key), a.frequency_of(key)),
+						(b.tier_of(key), b.frequency_of(key)),
+						"key {key} diverges at cap {cap}, k {k}",
+					);
+				}
+
+				assert_eq!(a.fast_object_count(), b.fast_object_count());
+				assert_eq!(a.slow_object_count(), b.slow_object_count());
+
+				// Both the admission path and the overwrite path have to have
+				// seen a nonzero remainder, or neither subtraction is pinned.
+				assert!(
+					admitted_with_remainder > 0,
+					"nothing was admitted carrying a remainder at cap {cap}, k {k}",
+				);
+				assert!(
+					overwrote_with_remainder > 0,
+					"nothing was re-set carrying a remainder at cap {cap}, k {k}",
+				);
+			}
+		}
+	}
 }
