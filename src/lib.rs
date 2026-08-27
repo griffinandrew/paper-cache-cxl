@@ -1789,6 +1789,7 @@ fn s3_fifo_queue_budgets(policy: PaperPolicy) -> Option<(f64, bool)> {
 		// `SThreeFifoStack`, and gate eviction on its fullness.
 		PaperPolicy::S3FifoHybrid(r)
 		| PaperPolicy::S3FifoCompactHybrid(r)
+		| PaperPolicy::S3FifoGhostCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
@@ -1922,6 +1923,7 @@ where
 			// parser is tightened to match.)
 			PaperPolicy::S3FifoHybrid(r)
 			| PaperPolicy::S3FifoCompactHybrid(r)
+			| PaperPolicy::S3FifoGhostCompactHybrid(r)
 			| PaperPolicy::S3FifoGhostHybrid(r)
 			| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
 			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)

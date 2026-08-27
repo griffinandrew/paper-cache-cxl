@@ -243,6 +243,7 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// object's overhead to add to in the first place.
 		PaperPolicy::TwoQGhostCompactHybrid(_) => 16 + 24,
 		PaperPolicy::TwoQGhostHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
+		PaperPolicy::S3FifoGhostCompactHybrid(_) => 16 + 24,
 		PaperPolicy::S3FifoGhostHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
 
 		// Identical entry shape to S3FifoGhostHybrid (same S3FifoEntry
@@ -909,6 +910,13 @@ const S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 #[cfg(feature = "hybrid_cache_common")]
 const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
+/// Per-object DRAM cost of `S3FifoGhostCompactHybridStack`.
+///
+/// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
+/// payload with the other converted queue stacks, all MEASURED at 72.
+#[cfg(feature = "hybrid_cache_common")]
+const S3_FIFO_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+
 /// Per-object DRAM cost of `S3FifoGhostHybridStack`'s eviction-stack bookkeeping.
 ///
 /// 44 + 20, the same two-term shape (and, as it happens, the same total) as
@@ -1423,6 +1431,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			PaperPolicy::TwoQGhostHybrid(..) => TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoCompactHybrid(..) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoHybrid(..) => S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoGhostCompactHybrid(..) => S3_FIFO_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoGhostHybrid(..) => S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoGhostLazyDemotionHybrid(..) => S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(..) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,

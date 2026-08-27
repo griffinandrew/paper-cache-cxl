@@ -294,6 +294,7 @@ two_q_ghost_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # module docs (worker/policy/policy_stack/s3_fifo_ghost_hybrid_stack.rs has
 # the ghost mechanics).
 #
+s3_fifo_ghost_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 s3_fifo_ghost_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # `s3_fifo_ghost_hybrid_cache` plus one more change: demotion (moving a fast
