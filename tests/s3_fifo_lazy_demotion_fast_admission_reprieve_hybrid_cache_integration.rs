@@ -108,7 +108,17 @@ mod hybrid_cache_tests {
     fn a_key_that_ages_out_lands_directly_in_the_main_queues_slow_tier() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.00004)).expect("cache should construct");
+        // 0.00002, not 0.00004: the one-access queue is charged only the
+        // bytes that actually MIGRATE -- `S3FifoEntry::migrating` subtracts
+        // the DRAM-resident remainder (the key and the expiry, which stay in
+        // DRAM in either tier) -- so a 15-byte payload costs it ~16 bytes,
+        // not the ~36 of the whole `base_size` this fixture was sized
+        // against. 0.00004 * 1_048_576 = 41 bytes therefore holds BOTH keys:
+        // `one_access_used` never exceeded the budget, `settle_one_access`
+        // never ran, and the wait below timed out with key 1 still Fast.
+        // 0.00002 * 1_048_576 = 20 holds exactly one, so admitting key 2
+        // ages key 1 out -- the reprieve this test is about.
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.00002)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
@@ -128,18 +138,24 @@ mod hybrid_cache_tests {
     fn a_reprieved_key_can_be_promoted_by_a_later_access() {
         ensure_pmem_allocator_warm();
 
-        // max_size 4_000 at ratio 0.01, not 1_048_576 at 0.00004: the
-        // one-access budget is `ratio * max_size` either way, and 0.01 * 4_000
-        // is the same 40 bytes this fixture has always sized against. What
-        // changed is `resize()`, which re-derives that budget against the NEW
-        // size and now rejects a config that rounds it to zero -- 0.00004 * 180
-        // is 0, so the resize below failed with `InvalidPolicy`; 0.01 * 180 is
-        // 1 byte, which it accepts. 4_000 still dwarfs the two keys this test
-        // admits, so the global `used_size() > max_size` trigger stays quiet
-        // until the resize fires it, exactly as before.
+        // max_size 2_048 at ratio 0.01, not 1_048_576 at 0.00004: the
+        // one-access budget is `ratio * max_size` either way. What that
+        // pairing buys is `resize()`, which re-derives the budget against the
+        // NEW size -- 0.00004 * 180 is 0 bytes, which rounds the one-access
+        // queue out of existence; 0.01 * 180 is 1, which does not.
+        //
+        // 2_048, not the 4_096 that pairing first used: the queue is charged
+        // only the bytes that actually MIGRATE (`S3FifoEntry::migrating`
+        // subtracts the key and the expiry, which stay in DRAM in either
+        // tier), so a 15-byte payload costs it ~16 bytes rather than the ~36
+        // of its whole `base_size`. 0.01 * 4_096 = 40 bytes therefore holds
+        // BOTH keys, so key 1 was never aged out and the wait below timed
+        // out; 0.01 * 2_048 = 20 holds exactly one. 2_048 still dwarfs the
+        // two keys this test admits, so the global `used_size() > max_size`
+        // trigger stays quiet until the resize fires it, exactly as before.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            4_096,
-            CacheTierSize::Bytes(4_096), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.01)).expect("cache should construct");
+            2_048,
+            CacheTierSize::Bytes(2_048), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.01)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.set(2u32, b"second value 45", None).expect("set should succeed");
@@ -230,15 +246,16 @@ mod hybrid_cache_tests {
     fn an_accessed_key_at_the_main_queue_tail_gets_a_second_chance_instead_of_eviction() {
         ensure_pmem_allocator_warm();
 
-        // one_access_capacity = 0.01 * 4_000 = 40, comfortably above
+        // one_access_capacity = 0.01 * 4_096 = 40, comfortably above
         // one payload's stack-level size, so a set()+get() in immediate
         // succession promotes normally via touch() instead of racing
         // settle_one_access's synchronous reprieve (which would otherwise
         // fire from within the set() event itself, before the get() event
-        // is even processed -- see the module doc). fast_capacity is
-        // bumped by that same 40 so the MAIN queue's effective budget
-        // (fast_capacity - one_access_capacity) stays 40, matching the
-        // dynamics this test was originally built around.
+        // is even processed -- see the module doc). fast_capacity is 60:
+        // that same 40, plus 20 for the MAIN queue's effective budget
+        // (fast_capacity - one_access_capacity), which is what has to hold
+        // exactly ONE object here.
+        //
         // max_size 4_000 at ratio 0.01, not 1_048_576 at 0.00004: the
         // one-access budget is `ratio * max_size` either way, and 0.01 * 4_000
         // is the same 40 bytes this fixture has always sized against. What
@@ -248,9 +265,20 @@ mod hybrid_cache_tests {
         // 1 byte, which it accepts. 4_000 still dwarfs the two keys this test
         // admits, so the global `used_size() > max_size` trigger stays quiet
         // until the resize fires it, exactly as before.
+        //
+        // 60, not the 80 this used to be: a tier counter is charged only the
+        // bytes that MIGRATE (`S3FifoEntry::migrating` subtracts the key and
+        // the expiry, which are DRAM-resident in either tier), so a 15-byte
+        // payload costs 16 rather than the ~36 of its whole `base_size`. A
+        // main budget of 40 therefore held BOTH keys -- 32 bytes never
+        // crossed the 0.98 high watermark -- so promoting key 2 demoted
+        // nothing and the wait for key 1 to reach Slow timed out. At 20 the
+        // watermarks land where the fixture always assumed: one 16-byte
+        // object sits under the 19-byte high mark, two do not, and the pass
+        // drains back to one.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             4_096,
-            CacheTierSize::Bytes(80), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.01)).expect("cache should construct");
+            CacheTierSize::Bytes(60), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.01)).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -289,13 +317,24 @@ mod hybrid_cache_tests {
         // succession promotes normally via touch() instead of racing
         // settle_one_access's synchronous reprieve (which would otherwise
         // fire from within the set() event itself, before the get() event
-        // is even processed -- see the module doc). fast_capacity is
-        // bumped by that same 40 so the MAIN queue's effective budget
-        // (fast_capacity - one_access_capacity) stays 40, matching the
-        // dynamics this test was originally built around.
+        // is even processed -- see the module doc). fast_capacity is 61:
+        // that same 41, plus 20 for the MAIN queue's effective budget
+        // (fast_capacity - one_access_capacity), which is what has to hold
+        // exactly ONE object -- the whole point of this test being that the
+        // SECOND one forces a demotion decision at the boundary.
+        //
+        // 61, not the 80 this used to be: a tier counter is charged only the
+        // bytes that MIGRATE (`S3FifoEntry::migrating` subtracts the key and
+        // the expiry, which are DRAM-resident in either tier), so a 15-byte
+        // payload costs 16 rather than the ~36 of its whole `base_size`. A
+        // main budget of 39 therefore held BOTH keys -- 32 bytes never
+        // crossed the 0.98 high watermark -- so nothing was demoted at all
+        // and key 2 stayed Fast. At 20 the second promotion crosses the
+        // 19-byte high mark, `settle_fast_tier` walks the tail, finds key 1's
+        // reference bit set and reprieves it, and demotes key 2 instead.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(80), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.00004)).expect("cache should construct");
+            CacheTierSize::Bytes(61), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.00004)).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -395,7 +434,16 @@ mod hybrid_cache_tests {
     fn ttl_survives_a_reprieve() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.00004)).expect("cache should construct");
+        // 0.00002, not 0.00004: same arithmetic as
+        // `a_key_that_ages_out_lands_directly_in_the_main_queues_slow_tier`
+        // -- only value bytes migrate, so a 41-byte one-access budget holds
+        // both ~16-byte keys, nothing is ever aged out, and the wait below
+        // timed out. A TTL does not change the count: the `Expiries` entry it
+        // adds is DRAM-resident in either tier, so it lands in the entry's
+        // `dram_resident` remainder and `migrating()` still returns ~16.
+        // 0.00002 * 1_048_576 = 20 holds exactly one key, so setting key 2
+        // reprieves key 1 -- which is what has to preserve its TTL.
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.00002)).expect("cache should construct");
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();

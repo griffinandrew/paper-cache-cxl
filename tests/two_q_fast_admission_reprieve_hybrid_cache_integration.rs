@@ -77,6 +77,29 @@ mod hybrid_cache_tests {
     const FAST_TIER: u64 = 1_600;
     const K_IN: f64 = 0.04;
 
+    // Payload for the tests that need to CREATE main-queue pressure.
+    //
+    // `make_cache` gives a 1_600-byte fast tier of which K_IN reserves 819 for
+    // the FIFO -- admission is a DRAM write in this design, so that reservation
+    // is carved out of the same budget -- leaving the main queue about 781, and
+    // a high watermark near 765. Ten 64-byte objects total 640 migrating bytes
+    // (the value alone; key and expiry never move), which sits UNDER it, so
+    // `settle_fast_tier` never triggered, nothing demoted, and every test
+    // asserting a demotion timed out.
+    //
+    // 256 puts ten objects at 2_560, unambiguously over: the pass drains to the
+    // low watermark near 741, leaving two objects fast and eight slow. The FIFO
+    // never sees more than one at a time (each set is followed by a get, which
+    // promotes it straight out), so this does not trip `fifo_capacity` and
+    // reprieve them instead of demoting them.
+    //
+    // Scoped to the four tests that want main-queue pressure, NOT applied
+    // file-wide: `many_admissions_all_land_fast_without_any_migration` asserts
+    // that nothing migrates, `global_capacity_pressure_still_evicts_and_loses_nothing`
+    // runs an 8_192-byte TOTAL cache, and `resize_rescales_the_fifo_reservation_and_re_settles`
+    // a 2_048-byte one. All three pass precisely because their values are small.
+    const PRESSURE_LEN: usize = 256;
+
     /// Cache sized by the constants above -- use this for any test that
     /// needs a *reachable* fast main queue (demotion, promotion, TTL
     /// survival). Tests deliberately exercising a degenerate configuration
@@ -206,8 +229,10 @@ mod hybrid_cache_tests {
 
         // Each key is admitted fast, then re-accessed to move it into the
         // main queue where it competes for the (reduced) fast budget.
+        // PRESSURE_LEN rather than 64: ten 64-byte objects fit under the
+        // main queue's high watermark, so there was no pressure to demote.
         for key in 1..=10u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; PRESSURE_LEN], None).expect("set should succeed");
             cache.get(&key).expect("get should hit");
         }
 
@@ -227,7 +252,7 @@ mod hybrid_cache_tests {
         assert!(!demoted.is_empty(), "at least one key should be slow");
 
         for key in &demoted {
-            assert_eq!(cache.get(key).unwrap(), vec![*key as u8; 64]);
+            assert_eq!(cache.get(key).unwrap(), vec![*key as u8; PRESSURE_LEN]);
         }
     }
 
@@ -278,8 +303,11 @@ mod hybrid_cache_tests {
 
         let cache = make_cache();
 
+        // PRESSURE_LEN rather than 64: this test needs a key to have been
+        // demoted before it can promote one back, and ten 64-byte objects
+        // never exceeded the main queue's high watermark.
         for key in 1..=10u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; PRESSURE_LEN], None).expect("set should succeed");
             cache.get(&key).expect("get should hit");
         }
 
@@ -309,7 +337,7 @@ mod hybrid_cache_tests {
         );
 
         assert!(cache.hybrid_stats().promotions > 0);
-        assert_eq!(cache.get(&slow_key).unwrap(), vec![slow_key as u8; 64]);
+        assert_eq!(cache.get(&slow_key).unwrap(), vec![slow_key as u8; PRESSURE_LEN]);
     }
 
     // ── eviction ──────────────────────────────────────────────────────────
@@ -580,8 +608,12 @@ mod hybrid_cache_tests {
 
         let cache = make_cache();
 
+        // PRESSURE_LEN rather than 64: the gauges can only report tier
+        // movement that happened, and ten 64-byte objects fit inside the
+        // main queue's fast budget, so none ever moved. Still far below
+        // MAX_SIZE, so the `live == 10` assertion below is unaffected.
         for key in 1..=10u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; PRESSURE_LEN], None).expect("set should succeed");
             cache.get(&key).expect("get should hit");
         }
 
@@ -622,8 +654,11 @@ mod hybrid_cache_tests {
 
         let cache = make_cache();
 
+        // PRESSURE_LEN rather than 64: this test needs a key in EACH tier,
+        // and ten 64-byte objects all stayed fast. At 256 the drain leaves
+        // two fast and eight slow, so both `find`s below succeed.
         for key in 1..=10u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; PRESSURE_LEN], None).expect("set should succeed");
             cache.get(&key).expect("get should hit");
         }
 

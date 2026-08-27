@@ -98,19 +98,75 @@ mod hybrid_cache_tests {
     /// (~8 objects at this policy's measured 122-byte accounted size), enough
     /// that admission never self-evicts. Because
     /// `effective_main_fast_capacity` is `fast_capacity - one_access_capacity`,
-    /// each test below adds `ONE_ACCESS_RESERVE` to its fast-tier size so the
-    /// main queue's own budget stays exactly the value that test intends.
+    /// every test that cares about the main queue's own budget adds its
+    /// one-access reservation back on top of its fast-tier size, so that
+    /// budget stays exactly the value the test intends.
     ///
     /// Do not raise it to dodge a `resize()` rejection (`resize` re-derives
     /// both budgets against the new size and refuses one that rounds to zero).
     /// `a_key_with_no_ghost_history_still_lands_in_the_one_access_queue_fast`
     /// needs this 1024-byte budget to be overflowed by ~2200 bytes of filler,
-    /// so the resizing test below states its own `max_size`/ratio pair instead.
+    /// so the ~1 KB tier-pressure tests state their own ratio/reserve pair
+    /// (`KB_ONE_ACCESS_RATIO`/`KB_ONE_ACCESS_RESERVE`) instead.
     /// 1/1024 exactly, so `ratio * max_size` is 2^20 / 2^10 = 1024 with
-    /// no truncation -- the reserve below is the exact product, not a
-    /// rounded stand-in for it.
+    /// no truncation.
     const ONE_ACCESS_RATIO: f64 = 0.000_976_562_5;
-    const ONE_ACCESS_RESERVE: u64 = 1_024;
+
+    /// ~1 KB values for the three fast-tier-pressure tests below
+    /// (`an_accessed_key_at_the_main_queue_tail_gets_a_second_chance_instead_of_eviction`,
+    /// `an_accessed_fast_boundary_key_is_reprieved_at_demotion_time_instead_of_the_newcomer`
+    /// and `ttl_survives_a_demotion`).
+    ///
+    /// Each of those needs a main-queue fast budget that holds ONE object and
+    /// not two, and the tier counters charge only what MIGRATES -- an entry's
+    /// `base_size` minus its DRAM-resident remainder (`S3FifoEntry::migrating`;
+    /// the key and the expiry stay in DRAM whichever tier the value is in, so
+    /// they never move). A 15-byte value migrates 16 bytes -- one jemalloc
+    /// size class -- so the old 40-byte budget held TWO of them under the
+    /// 0.98 high watermark (32 <= 39) and nothing ever demoted: every one of
+    /// these tests timed out waiting for a demotion that could not happen.
+    /// The whole band of budgets that hold one 16-byte value and not two is
+    /// 17..=32 bytes wide at that scale; at ~1 KB the same band runs
+    /// 1_078..=2_089, so which side of it a budget lands on no longer turns on
+    /// a handful of accounted bytes.
+    ///
+    /// Deliberately NOT applied file-wide -- scoped to those three functions.
+    /// `a_key_with_no_ghost_history_still_lands_in_the_one_access_queue_fast`
+    /// passes because ten 200-byte fillers overflow a 1024-byte one-access
+    /// queue, and `terminal_eviction_prefers_one_access_queue_over_main_queue`
+    /// runs a 512-byte TOTAL cache; ~1 KB values would break both. Same idiom,
+    /// and the same scoping caveat, as the `lru_`, `lfu_` and `s3_fifo_`
+    /// suites.
+    const VALUE_LEN: usize = 1024;
+
+    fn value(seed: u8) -> Vec<u8> {
+        vec![seed; VALUE_LEN]
+    }
+
+    /// The one-access ratio/reserve pair those same three tests use in place
+    /// of `ONE_ACCESS_RATIO`/1_024, which is sized for 15-byte values.
+    ///
+    /// `ttl_survives_a_demotion` parks SIX ~1 KB objects in the one-access
+    /// queue at once (6 * 1024 = 6144 migrating bytes) before promoting any of
+    /// them, so a 1024-byte one-access budget would `evict_one_access_tail`
+    /// five of them into the ghost queue before the test could promote them at
+    /// all. The other two hold one at a time and would otherwise sit exactly
+    /// ON a 1024-byte cap, with `needs_capacity_eviction`'s strict `>` as the
+    /// only thing keeping them admitted.
+    ///
+    /// 1/128 exactly, so `ratio * max_size` is 2^20 / 2^7 = 8192 with no
+    /// truncation -- the reserve is the exact product, which is why every test
+    /// using the pair also uses `max_size` 1_048_576.
+    const KB_ONE_ACCESS_RATIO: f64 = 0.007_812_5;
+    const KB_ONE_ACCESS_RESERVE: u64 = 8_192;
+
+    /// A main-queue fast budget that holds one ~1 KB value and not two:
+    /// `watermarks::high_bytes(1_600)` is 1_568 -- above one object's 1_024
+    /// migrating bytes, below two objects' 2_048 -- and
+    /// `watermarks::low_bytes(1_600)` is 1_520, so a triggered pass demotes
+    /// exactly one object and stops. Same figure as the `s3_fifo_` and `lru_`
+    /// suites use for the same purpose.
+    const KB_FAST_TIER: u64 = 1_600;
 
     #[test]
     fn admission_always_lands_in_fast_tier() {
@@ -174,7 +230,18 @@ mod hybrid_cache_tests {
     fn a_key_that_ages_out_and_is_readmitted_lands_directly_in_main_queue() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(0.00004)).expect("cache should construct");
+        // 0.00002, not 0.00004: the one-access budget is `ratio * max_size`,
+        // and it is charged only what MIGRATES -- 16 bytes for a 15-byte value
+        // (one jemalloc size class), the key and expiry never moving between
+        // tiers. 0.00004 gives 41 bytes, which holds BOTH of the two objects
+        // below (32 <= 41), so `needs_capacity_eviction` never fired and key 1
+        // never aged out: the wait below timed out. 0.00002 gives 20 -- one
+        // object fits (16 <= 20), the second overflows it (32 > 20) -- so
+        // admitting key 2 forces exactly the one-access eviction this test is
+        // about. The budget is what was wrong here, not the payloads: the main
+        // queue is left the other ~1 MB either way, so the fillers at the end
+        // still evict from the one-access queue and never touch key 1.
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(0.00002)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast)); // admission is always Fast now
@@ -308,35 +375,34 @@ mod hybrid_cache_tests {
     fn an_accessed_key_at_the_main_queue_tail_gets_a_second_chance_instead_of_eviction() {
         ensure_pmem_allocator_warm();
 
-        // Leaves 40 bytes of effective room for the main queue (this test is
-        // specifically about main-queue eviction priority, not the one-access
-        // budget) -- see ONE_ACCESS_RATIO for why that reservation is added on
-        // top rather than the ratio simply being 0.0.
+        // Leaves `KB_FAST_TIER` (1_600) bytes of effective room for the main
+        // queue -- one ~1 KB object and not two (this test is specifically
+        // about main-queue eviction priority, not the one-access budget) --
+        // with the one-access reservation added back on top, since
+        // `effective_main_fast_capacity` is `fast_capacity -
+        // one_access_capacity`. See ONE_ACCESS_RATIO for why a reservation is
+        // added rather than the ratio simply being 0.0.
         //
-        // max_size 131_072 with an explicit 1/128, not 1_048_576 with
-        // ONE_ACCESS_RATIO: the PRODUCT is what this fixture depends on and it
-        // is unchanged -- 0.0078125 * 131_072 is the same 1024-byte one-access
-        // reservation `ONE_ACCESS_RESERVE` adds back to the fast tier below, so
-        // the main queue's effective fast budget is still exactly 40 bytes, one
-        // key. (`effective_main_fast_capacity` is `fast_capacity -
-        // one_access_capacity`, so a product ABOVE the reserve would saturate
-        // that subtraction to zero rather than merely shrinking it.) The ratio
-        // has to move because `resize()` re-derives both budgets against the
-        // NEW size and rejects one that rounds to zero: ONE_ACCESS_RATIO * 180
-        // is 0, while 0.0078125 * 180 is 1 byte (main 178).
-        // Raising ONE_ACCESS_RATIO itself is not an option -- see its doc --
-        // hence the local pair. 131_072 is still ~400x what this test admits,
-        // so the global `used_size() > max_size` trigger stays quiet until the
-        // resize fires it, exactly as before.
+        // Was `Bytes(40 + ONE_ACCESS_RESERVE)` against 15-byte payloads, which
+        // could not work: 40 bytes of effective main budget holds TWO 16-byte
+        // migrating values under the 0.98 high watermark (32 <= 39), so
+        // promoting key 2 demoted nothing and the wait below timed out. See
+        // VALUE_LEN.
+        //
+        // max_size is back to 1_048_576 (it was 131_072 to keep
+        // `ONE_ACCESS_RATIO * 180` from truncating to zero at the `resize()`
+        // below). `KB_ONE_ACCESS_RATIO` is 1/128, so the resize target of
+        // 1_400 -- itself scaled with the payloads, see below -- still leaves
+        // the one-access budget 10 bytes and the main budget 1_389.
         let cache = PaperCache::<u32, TieredBuffer>::new(
-            131_072,
-            CacheTierSize::Bytes(40 + ONE_ACCESS_RESERVE), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(0.007_812_5)).expect("cache should construct");
+            1_048_576,
+            CacheTierSize::Bytes(KB_FAST_TIER + KB_ONE_ACCESS_RESERVE), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(KB_ONE_ACCESS_RATIO)).expect("cache should construct");
 
-        cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
+        cache.set(1u32, &value(0xD4), None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        cache.set(2u32, b"payload bytes B", None).expect("set should succeed");
+        cache.set(2u32, &value(0xE5), None).expect("set should succeed");
         cache.get(&2u32).expect("get should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
 
@@ -346,7 +412,14 @@ mod hybrid_cache_tests {
 
         // Deterministic trigger, not a filler set() -- see
         // hybrid_cache_integration.rs's equivalent test for why.
-        cache.resize(180).expect("resize should succeed");
+        //
+        // Scaled with the payloads: one ~1 KB object accounts for ~1_131 bytes
+        // (`base_size` 1_044 plus this policy's 87-byte per-object overhead),
+        // so 1_400 holds one and forces exactly one eviction. Was 180, sized
+        // for 15-byte values -- against ~1 KB values that would evict
+        // everything, key 1 included, and the second chance could not be
+        // observed at all.
+        cache.resize(1_400).expect("resize should succeed");
 
         let survived_and_promoted = wait_until(MIGRATION_TIMEOUT, || {
             cache.has(&1u32) && cache.tier_of(&1u32) == Some(Tier::Fast)
@@ -355,7 +428,7 @@ mod hybrid_cache_tests {
             survived_and_promoted,
             "key 1 should have been given a second chance and promoted back to fast",
         );
-        assert_eq!(cache.get(&1u32).unwrap(), b"payload bytes A");
+        assert_eq!(cache.get(&1u32).unwrap(), value(0xD4));
     }
 
     // ── the inherited signature mechanic: reprieve at DEMOTION time ────────
@@ -364,13 +437,18 @@ mod hybrid_cache_tests {
     fn an_accessed_fast_boundary_key_is_reprieved_at_demotion_time_instead_of_the_newcomer() {
         ensure_pmem_allocator_warm();
 
-        // Same 40 bytes of effective main-queue room, and the same one-access
-        // reservation on top, as the second-chance test above.
+        // Same `KB_FAST_TIER` of effective main-queue room -- one ~1 KB object
+        // and not two -- and the same one-access reservation on top, as the
+        // second-chance test above. Was `Bytes(40 + ONE_ACCESS_RESERVE)` with
+        // 15-byte payloads, which held BOTH keys' 16 migrating bytes (32 <= the
+        // 0.98 watermark's 39), so promoting key 2 never reached the demotion
+        // boundary and neither the reprieve nor the demotion under test could
+        // happen. See VALUE_LEN.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(40 + ONE_ACCESS_RESERVE), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ONE_ACCESS_RATIO)).expect("cache should construct");
+            CacheTierSize::Bytes(KB_FAST_TIER + KB_ONE_ACCESS_RESERVE), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(KB_ONE_ACCESS_RATIO)).expect("cache should construct");
 
-        cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
@@ -392,7 +470,7 @@ mod hybrid_cache_tests {
         // worker's real demotion physically runs, so waiting on it
         // directly is valid -- still cross-checked against the demotion
         // counter for extra rigor.
-        cache.set(2u32, b"payload bytes B", None).expect("set should succeed");
+        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
         cache.get(&2u32).expect("get should succeed");
 
         let demoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&2u32) == Some(Tier::Slow));
@@ -408,8 +486,8 @@ mod hybrid_cache_tests {
         assert_eq!(stats.promotions, promotions_before, "reprieve must not count as a promotion");
         assert_eq!(stats.demotions, demotions_before + 1, "exactly key 2 should have been demoted");
 
-        assert_eq!(cache.get(&1u32).unwrap(), b"payload bytes A");
-        assert_eq!(cache.get(&2u32).unwrap(), b"payload bytes B");
+        assert_eq!(cache.get(&1u32).unwrap(), value(0xA1));
+        assert_eq!(cache.get(&2u32).unwrap(), value(0xB2));
     }
 
     // ── the signature new accounting mechanic: shared DRAM budget ──────────
@@ -444,22 +522,35 @@ mod hybrid_cache_tests {
 
     // ── TTL ───────────────────────────────────────────────────────────────
 
-    const TTL_FAST_TIER: u64 = 200;
+    /// Holds one ~1 KB value but not two, exactly like the two tier-pressure
+    /// tests above -- `KB_FAST_TIER`, restated here because this is the knob
+    /// the TTL fixture turns. Was 200, sized for 15-byte values: six of those
+    /// migrate 16 bytes each, so all six sat inside the 0.98 watermark's 196
+    /// and key 1 was never demoted -- the wait below timed out. A TTL changes
+    /// nothing about the migrating figure (the `Expiries` entry is part of the
+    /// DRAM-resident remainder, which never moves), only about the accounted
+    /// total.
+    const TTL_FAST_TIER: u64 = KB_FAST_TIER;
 
     #[test]
     fn ttl_survives_a_demotion() {
         ensure_pmem_allocator_warm();
 
+        // `KB_ONE_ACCESS_RESERVE`, not `ONE_ACCESS_RESERVE`: all six objects
+        // below are admitted before any of them is promoted, so the one-access
+        // queue has to hold 6 * 1024 = 6_144 migrating bytes at once. 1_024
+        // would evict five of them into the ghost queue before the promotions
+        // even start; 8_192 holds all six with room to spare.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(TTL_FAST_TIER + ONE_ACCESS_RESERVE), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ONE_ACCESS_RATIO)).expect("cache should construct");
+            CacheTierSize::Bytes(TTL_FAST_TIER + KB_ONE_ACCESS_RESERVE), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(KB_ONE_ACCESS_RATIO)).expect("cache should construct");
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
-        cache.set(1u32, b"first value 123", Some(ttl_secs)).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), Some(ttl_secs)).expect("set should succeed");
 
         for key in 2u32..=6 {
-            cache.set(key, b"filler bytes", None).expect("set should succeed");
+            cache.set(key, &value(0xC3), None).expect("set should succeed");
         }
 
         cache.get(&1u32).expect("get should succeed");

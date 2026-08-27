@@ -87,7 +87,17 @@ mod hybrid_cache_tests {
         // FIFO capacity fits exactly one small value, so a second, distinct
         // key's admission evicts the first (into the ghost queue) before it
         // is ever re-accessed.
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::TwoQGhostHybrid(0.00004)).expect("cache should construct");
+        //
+        // k_in gives fifo_capacity = 0.00002 * 1_048_576 = 20 bytes, so one
+        // object (~16 migrating bytes) fits and the second forces the ageing
+        // out this test is about. It was 0.00004 -> 41 bytes, which holds
+        // BOTH 15-byte values, so key 1 never aged out and never reached the
+        // ghost queue -- there was no ghost hit left to observe.
+        //
+        // Small values are deliberate here and must stay: a FIFO budget this
+        // tight is the whole source of the pressure, and a ~1 KB value would
+        // not fit in it at all.
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::TwoQGhostHybrid(0.00002)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
@@ -137,14 +147,20 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(40), PaperPolicy::TwoQGhostHybrid(1.0)).expect("cache should construct");
+            // 1_600 holds one ~1 KB value, not two. Was Bytes(40) with 15-byte
+            // values, where TWO objects (~16 migrating bytes each, size minus
+            // the key and expiry that never migrate) fit and nothing ever
+            // demoted, so the wait below simply timed out.
+            CacheTierSize::Bytes(1_600), PaperPolicy::TwoQGhostHybrid(1.0)).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
+        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
 
         cache.get(&1u32).expect("get should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast)));
 
+        // The fast tier only fits one ~1 KB value, so promoting key 2 must
+        // demote key 1 back down.
         cache.get(&2u32).expect("get should succeed");
         let demoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow));
         assert!(demoted, "key 1 should have been demoted once key 2 was promoted");
@@ -153,7 +169,27 @@ mod hybrid_cache_tests {
 
     // ── TTL ───────────────────────────────────────────────────────────────
 
-    const TTL_FAST_TIER: u64 = 200;
+    // ~1 KB payloads for the tests that need one object to fill the fast
+    // tier on its own, now that the fast tier also carries per-object DRAM
+    // metadata. At 1 KB that reservation is a small fraction and the budgets
+    // have a wide margin. Same idiom as the `two_q_`, `lru_` and `lfu_`
+    // suites.
+    //
+    // Deliberately NOT applied to every test in this file: the ghost-queue
+    // ageing test runs a 20-byte FIFO budget and
+    // `terminal_eviction_prefers_fifo_queue_over_main_queue` runs a 256-byte
+    // TOTAL cache with nine fillers, so both need small values and both
+    // already pass.
+    const VALUE_LEN: usize = 1024;
+
+    fn value(seed: u8) -> Vec<u8> {
+        vec![seed; VALUE_LEN]
+    }
+
+    // Holds one ~1 KB value but not two, so promoting a filler demotes key 1.
+    // Was 200, sized for 15-byte values: at ~16 migrating bytes per object a
+    // dozen of them fit, so key 1 was never pushed back out of the fast tier.
+    const TTL_FAST_TIER: u64 = 1_600;
 
     #[test]
     fn ttl_survives_a_demotion() {
@@ -165,10 +201,10 @@ mod hybrid_cache_tests {
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
-        cache.set(1u32, b"first value 123", Some(ttl_secs)).expect("set should succeed");
+        cache.set(1u32, &value(0xA1), Some(ttl_secs)).expect("set should succeed");
 
         for key in 2u32..=6 {
-            cache.set(key, b"filler bytes", None).expect("set should succeed");
+            cache.set(key, &value(0xC3), None).expect("set should succeed");
         }
 
         cache.get(&1u32).expect("get should succeed");

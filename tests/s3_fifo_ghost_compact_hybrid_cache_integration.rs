@@ -5,10 +5,19 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Integration tests for the `s3_fifo_ghost_hybrid_cache` feature.
+//! Integration tests for the `s3_fifo_ghost_compact_hybrid_cache` feature.
+//!
+//! A deliberate near-copy of the baseline suite. This stack is a compaction of
+//! that one and must be behaviourally indistinguishable from it, so it answers
+//! the same behavioural questions rather than a reduced set.
+//!
+//! Unit tests cannot substitute: they drive the stack directly and never place
+//! any bytes, so they cannot see a placement or validation bug. Porting these
+//! suites to the first four conversions immediately found four real defects
+//! that every unit and fidelity test had passed.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test s3_fifo_ghost_hybrid_cache_integration --features s3_fifo_ghost_hybrid_cache
+//!   cargo +nightly test --test s3_fifo_ghost_compact_hybrid_cache_integration --features s3_fifo_ghost_compact_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture and admission/
 //! demotion/promotion/eviction rules as `s3_fifo_hybrid_cache` — see that
@@ -17,7 +26,7 @@
 //! resize, edge cases); this file focuses on what's actually new here: the
 //! ghost queue.
 
-#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
+#[cfg(feature = "s3_fifo_ghost_compact_hybrid_cache")]
 mod hybrid_cache_tests {
     use paper_cache::{PaperPolicy, PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
@@ -61,7 +70,7 @@ mod hybrid_cache_tests {
         // queues -- both far past this one 24 B object. (Ratio 1.0 is
         // rejected now: it leaves the main queue 0 B, and `used >= max`
         // reads an empty 0-byte queue as full.)
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5))
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostCompactHybrid(0.5))
             .expect("warm-up cache should construct");
 
         cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
@@ -79,7 +88,7 @@ mod hybrid_cache_tests {
         // near either budget.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostCompactHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
 
@@ -96,7 +105,7 @@ mod hybrid_cache_tests {
         // budgets untouched.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostCompactHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -125,7 +134,7 @@ mod hybrid_cache_tests {
         //
         // The small values stay: this fixture is about the ghost queue, and the
         // budget -- not the payload -- is the knob that drives it.
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.00002)).expect("cache should construct");
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostCompactHybrid(0.00002)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
@@ -166,7 +175,7 @@ mod hybrid_cache_tests {
         // tail out.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.001)).expect("cache should construct");
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostCompactHybrid(0.001)).expect("cache should construct");
 
         // Fat on purpose: ten of these overflow the 1000-byte one-access
         // budget outright, so the aging below doesn't depend on this policy's
@@ -227,7 +236,7 @@ mod hybrid_cache_tests {
         // eviction gate never fires here.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostCompactHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -259,7 +268,7 @@ mod hybrid_cache_tests {
         // key 1 to reach Slow timed out.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_600), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            CacheTierSize::Bytes(1_600), PaperPolicy::S3FifoGhostCompactHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, &value(0xA4), None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -313,7 +322,7 @@ mod hybrid_cache_tests {
         // TTL_FAST_TIER-byte fast tier drives the demotion under test.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::S3FifoGhostCompactHybrid(0.5)).expect("cache should construct");
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
@@ -358,7 +367,7 @@ mod hybrid_cache_tests {
         // and would evict key 1 instead.)
         let cache = PaperCache::<u32, TieredBuffer>::new(
             256,
-            CacheTierSize::Bytes(256), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            CacheTierSize::Bytes(256), PaperPolicy::S3FifoGhostCompactHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"payload bytes 1", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -391,7 +400,7 @@ mod hybrid_cache_tests {
         // far under both, so only the fast-tier resize below moves it.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostCompactHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -407,14 +416,14 @@ mod hybrid_cache_tests {
 
     #[test]
     fn zero_fast_tier_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(0), PaperPolicy::S3FifoGhostHybrid(0.5));
+        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(0), PaperPolicy::S3FifoGhostCompactHybrid(0.5));
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
 
     #[test]
     fn invalid_one_access_ratio_is_rejected() {
         assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(512), PaperPolicy::S3FifoGhostHybrid(1.5)),
+            PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(512), PaperPolicy::S3FifoGhostCompactHybrid(1.5)),
             Err(CacheError::InvalidPolicy),
         ));
     }
@@ -427,7 +436,7 @@ mod hybrid_cache_tests {
         // nowhere near either budget.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostCompactHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -446,7 +455,7 @@ mod hybrid_cache_tests {
         // nowhere near either budget.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostHybrid(0.5)).expect("cache should construct");
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoGhostCompactHybrid(0.5)).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         cache.set(2u32, b"second value 45", None).expect("set should succeed");

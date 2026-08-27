@@ -49,6 +49,34 @@ mod hybrid_cache_tests {
     /// `effective_main_fast_capacity`, now one byte lower.
     const NO_ONE_ACCESS_RATIO: f64 = 0.000001;
 
+    /// Value length every tier-mechanics fixture below writes.
+    ///
+    /// The tier gauges charge only the bytes that actually MIGRATE between
+    /// DRAM and PMEM -- an object's accounted `size` minus its DRAM-resident
+    /// remainder (the key and the expiry field, which live inline in the
+    /// object map and never move). The 15-byte literals these fixtures were
+    /// originally written with therefore move just 16 bytes each (jemalloc
+    /// rounds a 15-byte value up to its 16-byte size class), and TWO of those
+    /// fit inside every toy budget here -- the 40/41-byte one-access queue and
+    /// the 39/40-byte main-fast remainder alike. Nothing was ever pushed past
+    /// a budget, so no reprieve, demotion or second chance could be observed
+    /// and the fixtures' `wait_until`s simply timed out.
+    ///
+    /// 32 is the next jemalloc size class up, so a value of this length is
+    /// accounted exactly as asked rather than rounded: ONE object fits each of
+    /// those budgets with room to spare, two do not. It is deliberately no
+    /// larger -- the tightest budget in this file is the 39-byte main-fast
+    /// remainder of the demotion-boundary test, whose low watermark is 37, so
+    /// the next size class up (48) would demote the very first key on its own
+    /// and break the tests that need one key to sit in the fast tier.
+    const PAYLOAD_BYTES: usize = 32;
+
+    /// A `PAYLOAD_BYTES`-long value, `tag`ged so a test can tell one key's
+    /// value from another's when it reads it back.
+    fn payload(tag: u8) -> Vec<u8> {
+        vec![tag; PAYLOAD_BYTES]
+    }
+
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -114,10 +142,16 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(0.00004)).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
+        // 32-byte payloads, not the 15-byte literals this fixture was written
+        // with: the tier gauges charge only the bytes that actually MIGRATE
+        // (`size` minus the DRAM-resident key and expiry), and a 15-byte value
+        // migrates 16. Two of those sit inside the 41-byte one-access budget
+        // this ratio buys at once, so key 2's arrival never aged key 1 out and
+        // the wait below timed out. See `PAYLOAD_BYTES`.
+        cache.set(1u32, &payload(1), None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(2u32, &payload(2), None).expect("set should succeed");
 
         // Unlike the ghost-queue predecessor (where key 1 would be evicted
         // here), key 1 must remain alive throughout, migrating straight to
@@ -125,7 +159,7 @@ mod hybrid_cache_tests {
         let reprieved = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow));
         assert!(reprieved, "key 1 should have been spliced into the slow tier, not evicted");
         assert!(cache.has(&1u32), "key 1 must still be a live entry");
-        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
+        assert_eq!(cache.get(&1u32).unwrap(), payload(1));
     }
 
     #[test]
@@ -145,8 +179,12 @@ mod hybrid_cache_tests {
             4_096,
             CacheTierSize::Bytes(4_096), PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(0.01)).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        // 32-byte payloads -- see `PAYLOAD_BYTES`. At the 15 bytes this fixture
+        // used to write, both keys' 16 migrating bytes fit the 40-byte
+        // one-access budget at once, so key 1 was never reprieved into the slow
+        // tier and the wait below timed out with nothing to promote back.
+        cache.set(1u32, &payload(1), None).expect("set should succeed");
+        cache.set(2u32, &payload(2), None).expect("set should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
 
         // Re-access the reprieved key. With one-access-queue pressure no
@@ -164,7 +202,7 @@ mod hybrid_cache_tests {
 
         let promoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast));
         assert!(promoted, "a reprieved key should still be promotable via the ordinary second chance");
-        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
+        assert_eq!(cache.get(&1u32).unwrap(), payload(1));
     }
 
     #[test]
@@ -256,11 +294,18 @@ mod hybrid_cache_tests {
             4_096,
             CacheTierSize::Bytes(80), PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(0.01)).expect("cache should construct");
 
-        cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
+        // 32-byte payloads -- see `PAYLOAD_BYTES`. The main queue's fast budget
+        // here is `fast_capacity - one_access_capacity` = 80 - 40 = 40 bytes,
+        // whose high watermark is 39, and the 15-byte values this fixture used
+        // to write migrate only 16 bytes each: BOTH keys fit under that
+        // watermark, so key 1 was never demoted and never reached the
+        // main-queue tail this test is about. One 32-byte object fits, two do
+        // not, and demoting one lands back under the 38-byte low watermark.
+        cache.set(1u32, &payload(1), None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        cache.set(2u32, b"payload bytes B", None).expect("set should succeed");
+        cache.set(2u32, &payload(2), None).expect("set should succeed");
         cache.get(&2u32).expect("get should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
 
@@ -279,7 +324,7 @@ mod hybrid_cache_tests {
             survived_and_promoted,
             "key 1 should have been given a second chance and promoted back to fast",
         );
-        assert_eq!(cache.get(&1u32).unwrap(), b"payload bytes A");
+        assert_eq!(cache.get(&1u32).unwrap(), payload(1));
     }
 
     // ── the inherited signature mechanic: reprieve at DEMOTION time ────────
@@ -301,7 +346,14 @@ mod hybrid_cache_tests {
             1_048_576,
             CacheTierSize::Bytes(80), PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(0.00004)).expect("cache should construct");
 
-        cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
+        // 32-byte payloads -- see `PAYLOAD_BYTES`. This test's main-fast budget
+        // is 80 - 41 = 39 bytes (high watermark 38, low 37), and two 15-byte
+        // values migrate only 32 bytes between them, so promoting key 2 never
+        // triggered a demotion pass at all and the demotion-boundary reprieve
+        // this test exists to observe never ran. One 32-byte object fits under
+        // the high watermark, two do not, and demoting exactly one lands back
+        // under the low watermark.
+        cache.set(1u32, &payload(1), None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
@@ -312,7 +364,7 @@ mod hybrid_cache_tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        cache.set(2u32, b"payload bytes B", None).expect("set should succeed");
+        cache.set(2u32, &payload(2), None).expect("set should succeed");
         cache.get(&2u32).expect("get should succeed");
 
         let demoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&2u32) == Some(Tier::Slow));
@@ -328,8 +380,8 @@ mod hybrid_cache_tests {
         assert_eq!(stats.promotions, promotions_before, "reprieve must not count as a promotion");
         assert_eq!(stats.demotions, demotions_before + 1, "exactly key 2 should have been demoted");
 
-        assert_eq!(cache.get(&1u32).unwrap(), b"payload bytes A");
-        assert_eq!(cache.get(&2u32).unwrap(), b"payload bytes B");
+        assert_eq!(cache.get(&1u32).unwrap(), payload(1));
+        assert_eq!(cache.get(&2u32).unwrap(), payload(2));
     }
 
     // ── the signature new mechanic: a real slow-segment crossing check ────
@@ -462,12 +514,17 @@ mod hybrid_cache_tests {
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
-        cache.set(1u32, b"first value 123", Some(ttl_secs)).expect("set should succeed");
+        // 32-byte payloads -- see `PAYLOAD_BYTES`. A TTL adds its `Expiries`
+        // entry to key 1's DRAM-RESIDENT remainder, not to what migrates, so at
+        // the old 15-byte value both keys still migrated just 16 bytes each,
+        // both fit the 41-byte one-access budget, and no reprieve ever happened
+        // for the TTL to survive.
+        cache.set(1u32, &payload(1), Some(ttl_secs)).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
         // Pushes key 1 past the one-access budget, reprieving it into the
         // main queue's slow tier -- must not disturb its TTL.
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(2u32, &payload(2), None).expect("set should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
         assert!(cache.has(&1u32), "key should still be alive right after the reprieve");
 

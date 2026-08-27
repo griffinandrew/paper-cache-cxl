@@ -106,10 +106,25 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.00004)).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
+        // Padded to 32 bytes because only the VALUE migrates: a tier
+        // counter charges `migrating()`, which is `base_size` minus the key
+        // and the expiry field (neither ever moves), so a 15-byte value
+        // charges 16 bytes -- jemalloc's size class for 15 -- not the ~36 it
+        // charged when this fixture was written. At 16 bytes apiece TWO of
+        // these fit under this fixture's 41-byte `one_access_capacity`
+        // (0.00004 * 1_048_576), so key 2's admission never pushed key 1 out
+        // of the one-access queue, nothing was reprieved, and the wait below
+        // timed out. At the next size class up one fits (32 <= 41) and two do
+        // not (64 > 41), which is the pressure this test is about. The
+        // `&[u8; 32]` annotation keeps the padding honest: a miscount is a
+        // compile error rather than a silently re-broken fixture.
+        let first: &[u8; 32] = b"first value 123 ................";
+        let second: &[u8; 32] = b"second value 45 ................";
+
+        cache.set(1u32, first, None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(2u32, second, None).expect("set should succeed");
 
         // Unlike the ghost-queue predecessor (where key 1 would be evicted
         // here), key 1 must remain alive throughout, migrating straight to
@@ -117,7 +132,7 @@ mod hybrid_cache_tests {
         let reprieved = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow));
         assert!(reprieved, "key 1 should have been spliced into the slow tier, not evicted");
         assert!(cache.has(&1u32), "key 1 must still be a live entry");
-        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
+        assert_eq!(cache.get(&1u32).unwrap(), first);
     }
 
     #[test]
@@ -137,8 +152,27 @@ mod hybrid_cache_tests {
             4_096,
             CacheTierSize::Bytes(4_096), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.01)).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        // Padded to 32 bytes because only the VALUE migrates: a tier
+        // counter charges `migrating()`, which is `base_size` minus the key
+        // and the expiry field (neither ever moves), so a 15-byte value
+        // charges 16 bytes -- jemalloc's size class for 15 -- not the ~36 it
+        // charged when this fixture was written. At 16 bytes apiece TWO of
+        // these fit under this fixture's 40-byte `one_access_capacity`
+        // (0.01 * 4_096), so key 2's admission never aged key 1 out and the
+        // wait below timed out before the test could get to the promotion it
+        // is actually about. At the next size class up one fits (32 <= 40)
+        // and two do not (64 > 40). The `resize(180)` further down still
+        // forces exactly one terminal eviction with the larger payload: a
+        // padded object accounts 139 bytes (`base_size` 4 + 32 + 16, plus 87
+        // of policy overhead), so two exceed 180 and one does not -- and that
+        // one eviction is what runs `check_slow_midpoint()`. The `&[u8; 32]`
+        // annotation keeps the padding honest: a miscount is a compile error
+        // rather than a silently re-broken fixture.
+        let first: &[u8; 32] = b"first value 123 ................";
+        let second: &[u8; 32] = b"second value 45 ................";
+
+        cache.set(1u32, first, None).expect("set should succeed");
+        cache.set(2u32, second, None).expect("set should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
 
         // Re-access the reprieved key. With one-access-queue pressure no
@@ -156,7 +190,7 @@ mod hybrid_cache_tests {
 
         let promoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast));
         assert!(promoted, "a reprieved key should still be promotable via the ordinary second chance");
-        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
+        assert_eq!(cache.get(&1u32).unwrap(), first);
     }
 
     #[test]
@@ -248,11 +282,33 @@ mod hybrid_cache_tests {
             4_096,
             CacheTierSize::Bytes(80), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.01)).expect("cache should construct");
 
-        cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
+        // Padded to 32 bytes because only the VALUE migrates: a tier
+        // counter charges `migrating()`, which is `base_size` minus the key
+        // and the expiry field (neither ever moves), so a 15-byte value
+        // charges 16 bytes -- jemalloc's size class for 15 -- not the ~36 it
+        // charged when this fixture was written. The budget under test here
+        // is the MAIN queue's `effective_main_fast_capacity`: `fast_capacity`
+        // 80 minus `one_access_capacity` 40 = 40. At 16 bytes apiece TWO
+        // promoted objects sat inside it: promoting key 2 left `fast_used` at
+        // 32, under the high watermark of floor(0.98 * 40) = 39, so nothing
+        // demoted and key 1 never reached the tail this test is about. At the
+        // next size class up one object fits (32 <= 39), two do not
+        // (64 > 39), and one demotion drains back under the low watermark
+        // (32 <= floor(0.95 * 40) = 38), so exactly key 1 moves. The
+        // `resize(180)` further down still forces exactly one terminal
+        // eviction: a padded object accounts 139 bytes (`base_size`
+        // 4 + 32 + 16, plus 87 of policy overhead), so two exceed 180 and one
+        // does not. The `&[u8; 32]` annotation keeps the padding honest: a
+        // miscount is a compile error rather than a silently re-broken
+        // fixture.
+        let first: &[u8; 32] = b"payload bytes A ................";
+        let second: &[u8; 32] = b"payload bytes B ................";
+
+        cache.set(1u32, first, None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        cache.set(2u32, b"payload bytes B", None).expect("set should succeed");
+        cache.set(2u32, second, None).expect("set should succeed");
         cache.get(&2u32).expect("get should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
 
@@ -271,7 +327,7 @@ mod hybrid_cache_tests {
             survived_and_promoted,
             "key 1 should have been given a second chance and promoted back to fast",
         );
-        assert_eq!(cache.get(&1u32).unwrap(), b"payload bytes A");
+        assert_eq!(cache.get(&1u32).unwrap(), first);
     }
 
     // ── the inherited signature mechanic: reprieve at DEMOTION time ────────
@@ -293,7 +349,28 @@ mod hybrid_cache_tests {
             1_048_576,
             CacheTierSize::Bytes(80), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.00004)).expect("cache should construct");
 
-        cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
+        // Padded to 32 bytes because only the VALUE migrates: a tier
+        // counter charges `migrating()`, which is `base_size` minus the key
+        // and the expiry field (neither ever moves), so a 15-byte value
+        // charges 16 bytes -- jemalloc's size class for 15 -- not the ~36 it
+        // charged when this fixture was written. The budget under test here
+        // is the MAIN queue's `effective_main_fast_capacity`: `fast_capacity`
+        // 80 minus `one_access_capacity` 41 = 39. At 16 bytes apiece TWO
+        // promoted objects sat inside it: promoting key 2 left `fast_used` at
+        // 32, under the high watermark of floor(0.98 * 39) = 38, so
+        // `settle_fast_tier` never ran and there was no demotion boundary at
+        // which to observe key 1's reprieve -- key 2 stayed Fast and the wait
+        // below timed out. At the next size class up one object fits
+        // (32 <= 38) and two do not (64 > 38), and a single demotion drains
+        // back under the low watermark (32 <= floor(0.95 * 39) = 37), so
+        // exactly ONE object moves -- which is what the `demotions` assertion
+        // at the end of this test is counting. The `&[u8; 32]` annotation
+        // keeps the padding honest: a miscount is a compile error rather than
+        // a silently re-broken fixture.
+        let first: &[u8; 32] = b"payload bytes A ................";
+        let second: &[u8; 32] = b"payload bytes B ................";
+
+        cache.set(1u32, first, None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
@@ -304,7 +381,7 @@ mod hybrid_cache_tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        cache.set(2u32, b"payload bytes B", None).expect("set should succeed");
+        cache.set(2u32, second, None).expect("set should succeed");
         cache.get(&2u32).expect("get should succeed");
 
         let demoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&2u32) == Some(Tier::Slow));
@@ -320,8 +397,8 @@ mod hybrid_cache_tests {
         assert_eq!(stats.promotions, promotions_before, "reprieve must not count as a promotion");
         assert_eq!(stats.demotions, demotions_before + 1, "exactly key 2 should have been demoted");
 
-        assert_eq!(cache.get(&1u32).unwrap(), b"payload bytes A");
-        assert_eq!(cache.get(&2u32).unwrap(), b"payload bytes B");
+        assert_eq!(cache.get(&1u32).unwrap(), first);
+        assert_eq!(cache.get(&2u32).unwrap(), second);
     }
 
     // ── the mid-segment checkpoint ─────────────────────────────────────────
@@ -450,14 +527,30 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.00004)).expect("cache should construct");
 
+        // Padded to 32 bytes because only the VALUE migrates: a tier
+        // counter charges `migrating()`, which is `base_size` minus the key
+        // and the expiry field (neither ever moves), so a 15-byte value
+        // charges 16 bytes -- jemalloc's size class for 15 -- not the ~36 it
+        // charged when this fixture was written. The TTL does not change
+        // that: its `Expiries` entry is DRAM-resident too, so it lands in
+        // the subtracted remainder rather than in the migrating bytes. At 16
+        // bytes apiece TWO of these fit under this fixture's 41-byte
+        // `one_access_capacity` (0.00004 * 1_048_576), so key 2's admission
+        // never reprieved key 1 and the wait below timed out. At the next
+        // size class up one fits (32 <= 41) and two do not (64 > 41). The
+        // `&[u8; 32]` annotation keeps the padding honest: a miscount is a
+        // compile error rather than a silently re-broken fixture.
+        let first: &[u8; 32] = b"first value 123 ................";
+        let second: &[u8; 32] = b"second value 45 ................";
+
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
-        cache.set(1u32, b"first value 123", Some(ttl_secs)).expect("set should succeed");
+        cache.set(1u32, first, Some(ttl_secs)).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
         // Pushes key 1 past the one-access budget, reprieving it into the
         // main queue's slow tier -- must not disturb its TTL.
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(2u32, second, None).expect("set should succeed");
         assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
         assert!(cache.has(&1u32), "key should still be alive right after the reprieve");
 

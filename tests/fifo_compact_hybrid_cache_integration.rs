@@ -5,10 +5,19 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Integration tests for the `fifo_hybrid_cache` feature.
+//! Integration tests for the `fifo_compact_hybrid_cache` feature.
+//!
+//! A deliberate near-copy of the baseline suite. This stack is a compaction of
+//! that one and must be behaviourally indistinguishable from it, so it answers
+//! the same behavioural questions rather than a reduced set.
+//!
+//! Unit tests cannot substitute: they drive the stack directly and never place
+//! any bytes, so they cannot see a placement or validation bug. Porting these
+//! suites to the first four conversions immediately found four real defects
+//! that every unit and fidelity test had passed.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
-//!   cargo +nightly test --test fifo_hybrid_cache_integration --features fifo_hybrid_cache
+//!   cargo +nightly test --test fifo_compact_hybrid_cache_integration --features fifo_compact_hybrid_cache
 //!
 //! This feature is **one** `PaperCache<K, TieredBuffer>` instance (not two
 //! composed `PaperCache`s), so `tier_of` reads the tier directly off the
@@ -43,7 +52,7 @@
 //! first call actually waits ~45s; every other call returns almost
 //! immediately once the allocator is warm.
 
-#[cfg(feature = "fifo_hybrid_cache")]
+#[cfg(feature = "fifo_compact_hybrid_cache")]
 mod hybrid_cache_tests {
     use paper_cache::{PaperPolicy, PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
 
@@ -67,7 +76,7 @@ mod hybrid_cache_tests {
         // Mechanics tests at toy scales: metadata reservation off (see
         // `get_hybrid_dram_shared_overhead`).
         unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1), PaperPolicy::FifoHybrid)
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1), PaperPolicy::FifoCompactHybrid)
             .expect("warm-up cache should construct");
 
         cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
@@ -95,7 +104,7 @@ mod hybrid_cache_tests {
     fn admission_always_lands_in_fast_tier() {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_048_576), PaperPolicy::FifoHybrid).expect("cache should construct");
+            CacheTierSize::Bytes(1_048_576), PaperPolicy::FifoCompactHybrid).expect("cache should construct");
 
         cache.set(1u32, b"hello world", None).expect("set should succeed");
 
@@ -116,7 +125,7 @@ mod hybrid_cache_tests {
         // first (oldest) key demotes once the second is admitted.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_600), PaperPolicy::FifoHybrid).expect("cache should construct");
+            CacheTierSize::Bytes(1_600), PaperPolicy::FifoCompactHybrid).expect("cache should construct");
 
         cache.set(1u32, &value(0xA1), None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
@@ -149,10 +158,10 @@ mod hybrid_cache_tests {
         // FIFO has no promotion to cascade a demotion from — cascades here
         // come from repeated *new-key* admission into a fast tier sized for
         // ~1 object instead. Exercises the "more than one migration per
-        // call" path (`FifoHybridStack::settle_fast_tier`'s loop).
+        // call" path (`FifoCompactHybridStack::settle_fast_tier`'s loop).
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_600), PaperPolicy::FifoHybrid).expect("cache should construct");
+            CacheTierSize::Bytes(1_600), PaperPolicy::FifoCompactHybrid).expect("cache should construct");
 
         for key in 1u32..=4 {
             cache.set(key, &value(key as u8), None).expect("set should succeed");
@@ -180,7 +189,7 @@ mod hybrid_cache_tests {
         // regardless of subsequent accesses").
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_600), PaperPolicy::FifoHybrid).expect("cache should construct");
+            CacheTierSize::Bytes(1_600), PaperPolicy::FifoCompactHybrid).expect("cache should construct");
 
         cache.set(1u32, &value(0xA1), None).expect("set should succeed");
         cache.set(2u32, &value(0xB2), None).expect("set should succeed");
@@ -210,7 +219,7 @@ mod hybrid_cache_tests {
         // overwritten.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(3_400), PaperPolicy::FifoHybrid).expect("cache should construct");
+            CacheTierSize::Bytes(3_400), PaperPolicy::FifoCompactHybrid).expect("cache should construct");
 
         cache.set(1u32, &value(0x11), None).expect("set should succeed"); // oldest
         cache.set(2u32, &value(0x22), None).expect("set should succeed");
@@ -249,7 +258,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::FifoHybrid).expect("cache should construct");
+            CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::FifoCompactHybrid).expect("cache should construct");
 
         // A TTL comfortably longer than any plausible migration latency
         // avoids ambiguity between "never migrated" and "migrated but
@@ -291,7 +300,7 @@ mod hybrid_cache_tests {
         // which by construction holds only the most-recently-admitted key).
         let cache = PaperCache::<u32, TieredBuffer>::new(
             256,
-            CacheTierSize::Bytes(10), PaperPolicy::FifoHybrid).expect("cache should construct");
+            CacheTierSize::Bytes(10), PaperPolicy::FifoCompactHybrid).expect("cache should construct");
 
         for key in 1u32..=10 {
             let _ = cache.set(key, b"payload bytes", None);
@@ -327,7 +336,7 @@ mod hybrid_cache_tests {
     fn set_fast_tier_size_takes_effect_at_runtime() {
         ensure_pmem_allocator_warm();
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::FifoHybrid).expect("cache should construct");
+        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::FifoCompactHybrid).expect("cache should construct");
 
         cache.set(1u32, b"first value 123", None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
@@ -335,7 +344,7 @@ mod hybrid_cache_tests {
 
         // Shrink the fast tier drastically; the existing key should demote
         // even without any further access, once the worker applies the
-        // resize (mirrors `FifoHybridStack::resize_fast_tier`'s eager
+        // resize (mirrors `FifoCompactHybridStack::resize_fast_tier`'s eager
         // `settle_fast_tier` call).
         cache.set_fast_tier_size(CacheTierSize::Bytes(1)).expect("resize should succeed");
         assert_eq!(cache.fast_tier_size(), 1);
@@ -350,19 +359,19 @@ mod hybrid_cache_tests {
 
     #[test]
     fn zero_fast_tier_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(0), PaperPolicy::FifoHybrid);
+        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(0), PaperPolicy::FifoCompactHybrid);
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
 
     #[test]
     fn fast_tier_size_exceeding_max_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(2_048), PaperPolicy::FifoHybrid);
+        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(2_048), PaperPolicy::FifoCompactHybrid);
         assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
     }
 
     #[test]
     fn zero_max_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(0, CacheTierSize::Bytes(100), PaperPolicy::FifoHybrid);
+        let result = PaperCache::<u32, TieredBuffer>::new(0, CacheTierSize::Bytes(100), PaperPolicy::FifoCompactHybrid);
         assert!(matches!(result, Err(CacheError::ZeroCacheSize)));
     }
 
@@ -372,7 +381,7 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1), PaperPolicy::FifoHybrid).expect("cache should construct");
+            CacheTierSize::Bytes(1), PaperPolicy::FifoCompactHybrid).expect("cache should construct");
 
         cache.set(1u32, b"a value", None).expect("set should succeed");
 
@@ -397,7 +406,7 @@ mod hybrid_cache_tests {
         // fast tier, which holds one such object and not two.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_600), PaperPolicy::FifoHybrid).expect("cache should construct");
+            CacheTierSize::Bytes(1_600), PaperPolicy::FifoCompactHybrid).expect("cache should construct");
 
         cache.set(1u32, &value(0xD1), None).expect("set should succeed");
         cache.set(2u32, &value(0xD2), None).expect("set should succeed");
@@ -424,7 +433,7 @@ mod hybrid_cache_tests {
         // tier force key 1 out.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(1_600), PaperPolicy::FifoHybrid).expect("cache should construct");
+            CacheTierSize::Bytes(1_600), PaperPolicy::FifoCompactHybrid).expect("cache should construct");
 
         cache.set(1u32, &value(0xE1), None).expect("set should succeed");
         cache.set(2u32, &value(0xE2), None).expect("set should succeed");
