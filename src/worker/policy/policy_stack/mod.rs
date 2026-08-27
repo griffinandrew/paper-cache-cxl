@@ -45,6 +45,7 @@ mod two_q_fast_admission_compact_hybrid_stack;
 mod two_q_fast_admission_hybrid_stack;
 mod two_q_fast_admission_reprieve_hybrid_stack;
 mod two_q_full_fast_admission_hybrid_stack;
+mod fifo_compact_hybrid_stack;
 mod fifo_hybrid_stack;
 mod lru_sized_hybrid_stack;
 mod s3_fifo_compact_hybrid_stack;
@@ -88,6 +89,7 @@ use crate::{
 		two_q_fast_admission_hybrid_stack::TwoQFastAdmissionHybridStack,
 		two_q_fast_admission_reprieve_hybrid_stack::TwoQFastAdmissionReprieveHybridStack,
 		two_q_full_fast_admission_hybrid_stack::TwoQFullFastAdmissionHybridStack,
+		fifo_compact_hybrid_stack::FifoCompactHybridStack,
 		fifo_hybrid_stack::FifoHybridStack,
 		lru_sized_hybrid_stack::LruSizedHybridStack,
 		s3_fifo_compact_hybrid_stack::S3FifoCompactHybridStack,
@@ -558,6 +560,14 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// (metadata is DRAM-resident but is not counted in `fast_used`, so
 		// the fast tier overshot its budget).
 		#[cfg(feature = "hybrid_cache_common")]
+		// Same construction as `FifoHybrid`.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::FifoCompactHybrid => Box::new(
+			FifoCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
+				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+			),
+		),
+
 		PaperPolicy::FifoHybrid => Box::new(
 			FifoHybridStack::new((max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
@@ -744,6 +754,8 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out) => Box::new(TwoQFullFastAdmissionHybridStack::new(k_in, k_out, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::FifoCompactHybrid => Box::new(FifoCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
+		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::FifoHybrid => Box::new(FifoHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::LruSizedHybrid => Box::new(LruSizedHybridStack::new(
@@ -828,11 +840,11 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 35;
+	const POLICY_VARIANT_COUNT: usize = 36;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the 18
 	/// tiered designs this crate exists to compare.
-	const HYBRID_DESIGN_COUNT: usize = 25;
+	const HYBRID_DESIGN_COUNT: usize = 26;
 
 	/// Every `PaperPolicy` variant, listed explicitly, in declaration order.
 	///
@@ -866,6 +878,7 @@ mod init_policy_stack_tests {
 		(PaperPolicy::TwoQFastAdmissionHybrid(0.1), PaperPolicy::TwoQFastAdmissionHybrid(0.9)),
 		(PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.9)),
 		(PaperPolicy::TwoQFullFastAdmissionHybrid(0.25, 0.25), PaperPolicy::TwoQFullFastAdmissionHybrid(0.5, 0.4)),
+		(PaperPolicy::FifoCompactHybrid, PaperPolicy::FifoCompactHybrid),
 		(PaperPolicy::FifoHybrid, PaperPolicy::FifoHybrid),
 		(PaperPolicy::LruSizedHybrid, PaperPolicy::LruSizedHybrid),
 		(PaperPolicy::LruLfuHybrid(3), PaperPolicy::LruLfuHybrid(7)),
@@ -911,6 +924,7 @@ mod init_policy_stack_tests {
 			PaperPolicy::TwoQFastAdmissionHybrid(_) => "TwoQFastAdmissionHybrid",
 			PaperPolicy::TwoQFastAdmissionReprieveHybrid(_) => "TwoQFastAdmissionReprieveHybrid",
 			PaperPolicy::TwoQFullFastAdmissionHybrid(..) => "TwoQFullFastAdmissionHybrid",
+			PaperPolicy::FifoCompactHybrid => "FifoCompactHybrid",
 			PaperPolicy::FifoHybrid => "FifoHybrid",
 			PaperPolicy::LruSizedHybrid => "LruSizedHybrid",
 			PaperPolicy::LruLfuHybrid(_) => "LruLfuHybrid",

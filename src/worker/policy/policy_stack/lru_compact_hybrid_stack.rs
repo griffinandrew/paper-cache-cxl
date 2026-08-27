@@ -375,13 +375,6 @@ impl PolicyStack for LruCompactHybridStack {
 	}
 }
 
-/// Fidelity against `LruHybridStack`, which this stack is a compaction of.
-///
-/// The two must be indistinguishable: same tier for every key, same migration
-/// sequence in the same order, same eviction order. A miss ratio matching on a
-/// trace is necessary but not sufficient -- it would not catch a counter firing
-/// on the wrong path, which is the class of defect that produced a doubled
-/// demotion count on the LFU conversion.
 #[cfg(test)]
 mod prealloc_tests {
 	use super::*;
@@ -402,6 +395,13 @@ mod prealloc_tests {
 	}
 }
 
+/// Fidelity against `LruHybridStack`, which this stack is a compaction of.
+///
+/// The two must be indistinguishable: same tier for every key, same migration
+/// sequence in the same order, same eviction order. A miss ratio matching on a
+/// trace is necessary but not sufficient -- it would not catch a counter firing
+/// on the wrong path, which is the class of defect that produced a doubled
+/// demotion count on the LFU conversion.
 #[cfg(all(test, feature = "lru_hybrid_cache"))]
 mod fidelity_tests {
 	use super::*;

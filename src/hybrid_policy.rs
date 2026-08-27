@@ -57,7 +57,7 @@ pub fn admission_tier<K>(
 	let _ = (&hashed_key, &status, &objects);
 
 	match policy {
-		PaperPolicy::FifoHybrid | PaperPolicy::LruLfuHybrid(..) => {
+		PaperPolicy::FifoHybrid | PaperPolicy::FifoCompactHybrid | PaperPolicy::LruLfuHybrid(..) => {
 			let existing_tier = objects.get_ref(&hashed_key)
 				.map(|object| if object.data().is_fast() { crate::Tier::Fast } else { crate::Tier::Slow });
 			match existing_tier {

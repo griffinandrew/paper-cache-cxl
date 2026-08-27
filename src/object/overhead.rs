@@ -206,6 +206,7 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// combined per-key `entries` HashMap entry (tier + size, one map —
 		// see `FifoHybridStack`'s module doc), 1 byte for the Tier tag,
 		// 4 bytes for the object size.
+		PaperPolicy::FifoCompactHybrid => 16 + 24,
 		PaperPolicy::FifoHybrid => 48 + 8 + 24 + 1 + 4,
 
 		// Structurally identical to LruHybrid despite having 4 recency
@@ -598,6 +599,13 @@ pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 8;
 /// `not(eviction_stacks_pmem)` arm above for the derivation and rationale.
 #[cfg(feature = "eviction_stacks_pmem")]
 pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
+
+/// Per-object DRAM cost of `FifoCompactHybridStack`.
+///
+/// PLACEHOLDER pending measurement: shares `CompactQueueSet` and an 8-byte
+/// payload with the other converted queue stacks, all MEASURED at 72.
+#[cfg(feature = "hybrid_cache_common")]
+const FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `FifoHybridStack`'s eviction-stack bookkeeping.
 ///
@@ -1403,6 +1411,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			PaperPolicy::LfuCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruSizedHybrid => LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruLfuHybrid(..) => LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::FifoCompactHybrid => FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::FifoHybrid => FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQCompactHybrid(..) => TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQHybrid(..) => TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,

@@ -219,6 +219,7 @@ two_q_full_fast_admission_hybrid_cache = ["key_value_pmem", "hybrid_cache_common
 # dependency reasoning as the other three: only needs `key_value_pmem`, not
 # `key_pmem_value_pmem`.
 #
+fifo_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 fifo_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance, segmented-LRU hybrid cache with a size-split fast AND slow
