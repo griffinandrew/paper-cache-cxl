@@ -1906,6 +1906,7 @@ where
 			| PaperPolicy::TwoQFastAdmissionCompactHybrid(r)
 			| PaperPolicy::TwoQFastAdmissionHybrid(r)
 			| PaperPolicy::TwoQFastAdmissionReprieveHybrid(r)
+			| PaperPolicy::TwoQGhostCompactHybrid(r)
 			| PaperPolicy::TwoQGhostHybrid(r) => (0.0..=1.0).contains(&r),
 
 			// The s3-fifo family EXCLUDES 1.0. These stacks size the main

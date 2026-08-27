@@ -125,7 +125,7 @@ pub fn admission_tier<K>(
 				None => crate::Tier::Slow,
 			}
 		},
-		PaperPolicy::TwoQGhostHybrid(..) | PaperPolicy::TwoQHybrid(..) | PaperPolicy::TwoQCompactHybrid(..) => {
+		PaperPolicy::TwoQGhostHybrid(..) | PaperPolicy::TwoQGhostCompactHybrid(..) | PaperPolicy::TwoQHybrid(..) | PaperPolicy::TwoQCompactHybrid(..) => {
 			match objects.get_ref(&hashed_key) {
 				Some(_) => crate::Tier::Fast,
 				None => crate::Tier::Slow,

@@ -285,6 +285,7 @@ s3_fifo_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # (worker/policy/policy_stack/two_q_ghost_hybrid_stack.rs has the ghost
 # mechanics). Same dependency reasoning as the other hybrids.
 #
+two_q_ghost_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 two_q_ghost_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # `s3_fifo_hybrid_cache` plus the same bare-key ghost queue described above,
