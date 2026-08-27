@@ -1791,6 +1791,8 @@ fn s3_fifo_queue_budgets(policy: PaperPolicy) -> Option<(f64, bool)> {
 		| PaperPolicy::S3FifoCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostHybrid(r)
+		| PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(r)
+		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(r) => Some((r, true)),
@@ -1892,7 +1894,8 @@ where
 
 			// The one two-ratio design: BOTH must be in range, so it cannot
 			// join the single-ratio group below.
-			PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out) => {
+			PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out)
+			| PaperPolicy::TwoQFullFastAdmissionCompactHybrid(k_in, k_out) => {
 				(0.0..=1.0).contains(&k_in) && (0.0..=1.0).contains(&k_out)
 			},
 
@@ -1906,6 +1909,7 @@ where
 			| PaperPolicy::TwoQCompactHybrid(r)
 			| PaperPolicy::TwoQFastAdmissionCompactHybrid(r)
 			| PaperPolicy::TwoQFastAdmissionHybrid(r)
+			| PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(r)
 			| PaperPolicy::TwoQFastAdmissionReprieveHybrid(r)
 			| PaperPolicy::TwoQGhostCompactHybrid(r)
 			| PaperPolicy::TwoQGhostHybrid(r) => (0.0..=1.0).contains(&r),
@@ -1925,6 +1929,8 @@ where
 			| PaperPolicy::S3FifoCompactHybrid(r)
 			| PaperPolicy::S3FifoGhostCompactHybrid(r)
 			| PaperPolicy::S3FifoGhostHybrid(r)
+			| PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(r)
+			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(r)
 			| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
 			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
 			| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(r) => {

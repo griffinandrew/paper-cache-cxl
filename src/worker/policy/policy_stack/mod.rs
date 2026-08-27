@@ -43,7 +43,9 @@ mod two_q_compact_hybrid_stack;
 mod two_q_hybrid_stack;
 mod two_q_fast_admission_compact_hybrid_stack;
 mod two_q_fast_admission_hybrid_stack;
+mod two_q_fast_admission_reprieve_compact_hybrid_stack;
 mod two_q_fast_admission_reprieve_hybrid_stack;
+mod two_q_full_fast_admission_compact_hybrid_stack;
 mod two_q_full_fast_admission_hybrid_stack;
 mod fifo_compact_hybrid_stack;
 mod fifo_hybrid_stack;
@@ -54,7 +56,9 @@ mod two_q_ghost_compact_hybrid_stack;
 mod two_q_ghost_hybrid_stack;
 mod s3_fifo_ghost_compact_hybrid_stack;
 mod s3_fifo_ghost_hybrid_stack;
+mod s3_fifo_ghost_lazy_demotion_compact_hybrid_stack;
 mod s3_fifo_ghost_lazy_demotion_hybrid_stack;
+mod s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_stack;
 mod s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack;
 mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack;
 mod s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stack;
@@ -88,7 +92,9 @@ use crate::{
 		two_q_hybrid_stack::TwoQHybridStack,
 		two_q_fast_admission_compact_hybrid_stack::TwoQFastAdmissionCompactHybridStack,
 		two_q_fast_admission_hybrid_stack::TwoQFastAdmissionHybridStack,
+		two_q_fast_admission_reprieve_compact_hybrid_stack::TwoQFastAdmissionReprieveCompactHybridStack,
 		two_q_fast_admission_reprieve_hybrid_stack::TwoQFastAdmissionReprieveHybridStack,
+		two_q_full_fast_admission_compact_hybrid_stack::TwoQFullFastAdmissionCompactHybridStack,
 		two_q_full_fast_admission_hybrid_stack::TwoQFullFastAdmissionHybridStack,
 		fifo_compact_hybrid_stack::FifoCompactHybridStack,
 		fifo_hybrid_stack::FifoHybridStack,
@@ -99,7 +105,9 @@ use crate::{
 		two_q_ghost_hybrid_stack::TwoQGhostHybridStack,
 		s3_fifo_ghost_compact_hybrid_stack::S3FifoGhostCompactHybridStack,
 		s3_fifo_ghost_hybrid_stack::S3FifoGhostHybridStack,
+		s3_fifo_ghost_lazy_demotion_compact_hybrid_stack::S3FifoGhostLazyDemotionCompactHybridStack,
 		s3_fifo_ghost_lazy_demotion_hybrid_stack::S3FifoGhostLazyDemotionHybridStack,
+		s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack,
 		s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionHybridStack,
 		s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack,
 		s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stack::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack,
@@ -531,11 +539,27 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 			),
 		),
 
+		// Same construction as `TwoQFastAdmissionReprieveHybrid`.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(k_in) => Box::new(
+			TwoQFastAdmissionReprieveCompactHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
+				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+			),
+		),
+
 		// Same construction shape and the same k_in-vs-fast-tier caveat as
 		// `TwoQFastAdmissionHybrid` above.
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::TwoQFastAdmissionReprieveHybrid(k_in) => Box::new(
 			TwoQFastAdmissionReprieveHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
+				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+			),
+		),
+
+		// Same construction as `TwoQFullFastAdmissionHybrid`.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::TwoQFullFastAdmissionCompactHybrid(k_in, k_out) => Box::new(
+			TwoQFullFastAdmissionCompactHybridStack::new(k_in, k_out, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
@@ -655,6 +679,14 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 			),
 		),
 
+		// Same construction as `S3FifoGhostLazyDemotionHybrid`.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(ratio) => Box::new(
+			S3FifoGhostLazyDemotionCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
+				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+			),
+		),
+
 		// Same construction/default-fast-tier-budget shape as
 		// S3FifoGhostHybrid above -- see
 		// s3_fifo_ghost_lazy_demotion_hybrid_stack.rs's module doc for the
@@ -662,6 +694,14 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoGhostLazyDemotionHybrid(ratio) => Box::new(
 			S3FifoGhostLazyDemotionHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
+				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+			),
+		),
+
+		// Same construction as `S3FifoGhostLazyDemotionFastAdmissionHybrid`.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(ratio) => Box::new(
+			S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
@@ -760,7 +800,11 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::TwoQFastAdmissionHybrid(k_in) => Box::new(TwoQFastAdmissionHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(k_in) => Box::new(TwoQFastAdmissionReprieveCompactHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
+		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::TwoQFastAdmissionReprieveHybrid(k_in) => Box::new(TwoQFastAdmissionReprieveHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
+		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::TwoQFullFastAdmissionCompactHybrid(k_in, k_out) => Box::new(TwoQFullFastAdmissionCompactHybridStack::new(k_in, k_out, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out) => Box::new(TwoQFullFastAdmissionHybridStack::new(k_in, k_out, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
@@ -786,7 +830,11 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::S3FifoGhostHybrid(ratio) => Box::new(S3FifoGhostHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(ratio) => Box::new(S3FifoGhostLazyDemotionCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
+		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::S3FifoGhostLazyDemotionHybrid(ratio) => Box::new(S3FifoGhostLazyDemotionHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
+		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(ratio) => Box::new(S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ratio) => Box::new(S3FifoGhostLazyDemotionFastAdmissionHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
@@ -852,11 +900,11 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 37;
+	const POLICY_VARIANT_COUNT: usize = 41;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the 18
 	/// tiered designs this crate exists to compare.
-	const HYBRID_DESIGN_COUNT: usize = 27;
+	const HYBRID_DESIGN_COUNT: usize = 31;
 
 	/// Every `PaperPolicy` variant, listed explicitly, in declaration order.
 	///
@@ -888,7 +936,9 @@ mod init_policy_stack_tests {
 		(PaperPolicy::TwoQHybrid(0.1), PaperPolicy::TwoQHybrid(0.9)),
 		(PaperPolicy::TwoQFastAdmissionCompactHybrid(0.1), PaperPolicy::TwoQFastAdmissionCompactHybrid(0.9)),
 		(PaperPolicy::TwoQFastAdmissionHybrid(0.1), PaperPolicy::TwoQFastAdmissionHybrid(0.9)),
+		(PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.1), PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.9)),
 		(PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.1), PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.9)),
+		(PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.25), PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.5, 0.4)),
 		(PaperPolicy::TwoQFullFastAdmissionHybrid(0.25, 0.25), PaperPolicy::TwoQFullFastAdmissionHybrid(0.5, 0.4)),
 		(PaperPolicy::FifoCompactHybrid, PaperPolicy::FifoCompactHybrid),
 		(PaperPolicy::FifoHybrid, PaperPolicy::FifoHybrid),
@@ -900,7 +950,9 @@ mod init_policy_stack_tests {
 		(PaperPolicy::TwoQGhostHybrid(0.1), PaperPolicy::TwoQGhostHybrid(0.9)),
 		(PaperPolicy::S3FifoGhostCompactHybrid(0.1), PaperPolicy::S3FifoGhostCompactHybrid(0.9)),
 		(PaperPolicy::S3FifoGhostHybrid(0.1), PaperPolicy::S3FifoGhostHybrid(0.9)),
+		(PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(0.1), PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(0.9)),
 		(PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.1), PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.9)),
+		(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(0.1), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(0.9)),
 		(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(0.1), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(0.9)),
 		(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(0.1), PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(0.9)),
 		(PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.1), PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.9)),
@@ -935,7 +987,9 @@ mod init_policy_stack_tests {
 			PaperPolicy::TwoQHybrid(_) => "TwoQHybrid",
 			PaperPolicy::TwoQFastAdmissionCompactHybrid(_) => "TwoQFastAdmissionCompactHybrid",
 			PaperPolicy::TwoQFastAdmissionHybrid(_) => "TwoQFastAdmissionHybrid",
+			PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(_) => "TwoQFastAdmissionReprieveCompactHybrid",
 			PaperPolicy::TwoQFastAdmissionReprieveHybrid(_) => "TwoQFastAdmissionReprieveHybrid",
+			PaperPolicy::TwoQFullFastAdmissionCompactHybrid(..) => "TwoQFullFastAdmissionCompactHybrid",
 			PaperPolicy::TwoQFullFastAdmissionHybrid(..) => "TwoQFullFastAdmissionHybrid",
 			PaperPolicy::FifoCompactHybrid => "FifoCompactHybrid",
 			PaperPolicy::FifoHybrid => "FifoHybrid",
@@ -947,7 +1001,9 @@ mod init_policy_stack_tests {
 			PaperPolicy::TwoQGhostHybrid(_) => "TwoQGhostHybrid",
 			PaperPolicy::S3FifoGhostCompactHybrid(_) => "S3FifoGhostCompactHybrid",
 			PaperPolicy::S3FifoGhostHybrid(_) => "S3FifoGhostHybrid",
+			PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(_) => "S3FifoGhostLazyDemotionCompactHybrid",
 			PaperPolicy::S3FifoGhostLazyDemotionHybrid(_) => "S3FifoGhostLazyDemotionHybrid",
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(_) => "S3FifoGhostLazyDemotionFastAdmissionCompactHybrid",
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_) => "S3FifoGhostLazyDemotionFastAdmissionHybrid",
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(_) => "S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid",
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(_) => "S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid",
