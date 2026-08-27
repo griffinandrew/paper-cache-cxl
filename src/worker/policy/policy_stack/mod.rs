@@ -515,7 +515,6 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// configuration (see the stack's module doc), and callers override
 		// the budget via `ResizeFastTier` immediately after construction
 		// anyway, but it is worth knowing when picking k_in.
-		#[cfg(feature = "hybrid_cache_common")]
 		// Same construction as `TwoQFastAdmissionHybrid`.
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::TwoQFastAdmissionCompactHybrid(k_in) => Box::new(
@@ -525,6 +524,7 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 				),
 		),
 
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::TwoQFastAdmissionHybrid(k_in) => Box::new(
 			TwoQFastAdmissionHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
@@ -561,7 +561,6 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// for: a follow-up DRAM-usage measurement did show the same issue
 		// (metadata is DRAM-resident but is not counted in `fast_used`, so
 		// the fast tier overshot its budget).
-		#[cfg(feature = "hybrid_cache_common")]
 		// Same construction as `FifoHybrid`.
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::FifoCompactHybrid => Box::new(
@@ -570,6 +569,7 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 			),
 		),
 
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::FifoHybrid => Box::new(
 			FifoHybridStack::new((max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
@@ -607,7 +607,6 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// one too: admission being always-slow does not avoid the cost, since
 		// the hashtable and eviction-stack entries are DRAM-resident for
 		// slow-tier objects just as much as for fast-tier ones.
-		#[cfg(feature = "hybrid_cache_common")]
 		// Same construction as `S3FifoHybrid` -- same ratio, same reservation.
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoCompactHybrid(ratio) => Box::new(
@@ -617,6 +616,7 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 				),
 		),
 
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoHybrid(ratio) => Box::new(
 			S3FifoHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
@@ -626,7 +626,6 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// Same construction/default-fast-tier-budget shape as TwoQHybrid/
 		// S3FifoHybrid above -- see two_q_ghost_hybrid_stack.rs's module doc
 		// for the ghost-queue mechanics these add on top.
-		#[cfg(feature = "hybrid_cache_common")]
 		// Same construction as `TwoQGhostHybrid`.
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::TwoQGhostCompactHybrid(k_in) => Box::new(
@@ -635,12 +634,12 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 			),
 		),
 
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::TwoQGhostHybrid(k_in) => Box::new(
 			TwoQGhostHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 			),
 		),
-		#[cfg(feature = "hybrid_cache_common")]
 		// Same construction as `S3FifoGhostHybrid`.
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoGhostCompactHybrid(ratio) => Box::new(
@@ -649,6 +648,7 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 			),
 		),
 
+		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoGhostHybrid(ratio) => Box::new(
 			S3FifoGhostHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
