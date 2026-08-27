@@ -187,6 +187,22 @@ pub struct CompactFrequencyChain {
 
 	fast_len: usize,
 	slow_len: usize,
+
+	/// Head and tail of the DISTINGUISHED RECENCY LIST: a third intrusive list
+	/// over the SAME slab, ordered by recency rather than by frequency.
+	///
+	/// `LruLfuCompactHybridStack` needs a recency-ordered fast tier beside a
+	/// frequency-ordered slow one. Those two populations are disjoint -- a key
+	/// is in the fast tier or the slow tier, never both -- so one `prev`/`next`
+	/// pair per slot serves either, and `fast_len`/`slow_len` keep counting
+	/// tier membership exactly as they do for LFU. That is what lets one slab
+	/// and one index carry a policy whose tiers rank by different metrics.
+	///
+	/// The frequency-bucket stacks (`LfuCompactHybridStack`) never call a
+	/// `recency_*` method, so for them these stay `NIL` for the structure's
+	/// whole life and every other method behaves exactly as it did before.
+	recency_head: u32,
+	recency_tail: u32,
 }
 
 impl Default for CompactFrequencyChain {
@@ -200,6 +216,8 @@ impl Default for CompactFrequencyChain {
 			slow_buckets,
 			fast_len: 0,
 			slow_len: 0,
+			recency_head: NIL,
+			recency_tail: NIL,
 		}
 	}
 }
@@ -241,12 +259,7 @@ impl CompactFrequencyChain {
 			return;
 		}
 
-		let node = CompactSlot { key, prev: NIL, next: NIL };
-
-		let slot = match self.free.pop() {
-			Some(slot) => { self.slots[slot as usize] = node; slot },
-			None => { self.slots.push(node); (self.slots.len() - 1) as u32 },
-		};
+		let slot = self.alloc_slot(key);
 
 		self.index.insert(key, (slot, CompactEntry { freq: 1, size, tier, dram_resident }));
 		self.link(slot, 1, tier);
@@ -363,6 +376,201 @@ impl CompactFrequencyChain {
 		self.slow_buckets.clear();
 		self.fast_len = 0;
 		self.slow_len = 0;
+		self.recency_head = NIL;
+		self.recency_tail = NIL;
+	}
+
+	/// Takes a free slab slot, or grows the slab by one. Extracted from
+	/// `insert` unchanged so the recency admissions below allocate the same
+	/// way -- one slab, one free list, whichever list the key joins.
+	fn alloc_slot(&mut self, key: HashedKey) -> u32 {
+		let node = CompactSlot { key, prev: NIL, next: NIL };
+
+		match self.free.pop() {
+			Some(slot) => { self.slots[slot as usize] = node; slot },
+			None => { self.slots.push(node); (self.slots.len() - 1) as u32 },
+		}
+	}
+
+	// ── the distinguished recency list ────────────────────────────────────
+	//
+	// Everything below is additive: it maintains `recency_head`/`recency_tail`
+	// over the same slots the frequency buckets use, and touches
+	// `fast_buckets` never. `LfuCompactHybridStack` calls none of it.
+
+	fn recency_link_front(&mut self, slot: u32) {
+		let old = self.recency_head;
+
+		{
+			let s = &mut self.slots[slot as usize];
+			s.prev = NIL;
+			s.next = old;
+		}
+
+		match old {
+			NIL => self.recency_tail = slot,
+			o => self.slots[o as usize].prev = slot,
+		}
+
+		self.recency_head = slot;
+	}
+
+	fn recency_unlink(&mut self, slot: u32) {
+		let (prev, next) = {
+			let s = &self.slots[slot as usize];
+			(s.prev, s.next)
+		};
+
+		match prev {
+			NIL => self.recency_head = next,
+			p => self.slots[p as usize].next = next,
+		}
+
+		match next {
+			NIL => self.recency_tail = prev,
+			n => self.slots[n as usize].prev = prev,
+		}
+	}
+
+	/// Admits a NEW key at the recency head, in the fast tier, at `freq`.
+	///
+	/// The frequency is carried metadata here, not a ranking key: nothing in
+	/// the recency list is ordered by it. It exists so a later demotion can
+	/// enter the slow tier at the count the key actually earned.
+	pub fn recency_push_front(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: u8,
+		freq: u32,
+	) {
+		if self.contains(key) {
+			return;
+		}
+
+		let slot = self.alloc_slot(key);
+
+		self.index.insert(key, (slot, CompactEntry { freq, size, tier: Tier::Fast, dram_resident }));
+		self.recency_link_front(slot);
+
+		self.fast_len += 1;
+	}
+
+	/// Moves an existing recency-list key to the head. O(1).
+	pub fn recency_move_front(&mut self, key: HashedKey) {
+		let Some(&(slot, _)) = self.index.get(&key) else { return };
+
+		if self.recency_head == slot {
+			return;
+		}
+
+		self.recency_unlink(slot);
+		self.recency_link_front(slot);
+	}
+
+	/// The LRU end of the recency list: the demotion (and last-resort
+	/// eviction) candidate.
+	pub fn recency_back(&self) -> Option<HashedKey> {
+		(self.recency_tail != NIL).then(|| self.slots[self.recency_tail as usize].key)
+	}
+
+	/// Removes a recency-list key outright, freeing its slot.
+	pub fn recency_remove(&mut self, key: HashedKey) -> Option<CompactEntry> {
+		let (slot, entry) = self.index.remove(&key)?;
+
+		self.recency_unlink(slot);
+		self.free.push(slot);
+		self.fast_len -= 1;
+
+		Some(entry)
+	}
+
+	/// Moves the recency tail into the slow tier, into the bucket for the
+	/// frequency it already carries. Returns the demoted key and its entry as
+	/// it now stands.
+	///
+	/// This is the whole of a demotion. `FrequencyChain` needs a `pop_back`
+	/// from one structure and an `insert_at` into another with the count
+	/// passed across by hand; here the entry never moves in the slab, so the
+	/// count is carried by construction and there is nothing to drop.
+	pub fn demote_recency_back(&mut self) -> Option<(HashedKey, CompactEntry)> {
+		if self.recency_tail == NIL {
+			return None;
+		}
+
+		let slot = self.recency_tail;
+		let key = self.slots[slot as usize].key;
+
+		let Some((_, e)) = self.index.get_mut(&key) else { return None };
+		e.tier = Tier::Slow;
+		let entry = *e;
+
+		self.recency_unlink(slot);
+		self.link(slot, entry.freq, Tier::Slow);
+
+		self.fast_len -= 1;
+		self.slow_len += 1;
+
+		Some((key, entry))
+	}
+
+	/// Moves a slow-tier key to the recency head, setting its frequency to
+	/// `freq`. The whole of a promotion; `None` if the key is untracked or is
+	/// not in the slow tier.
+	pub fn promote_to_recency_front(&mut self, key: HashedKey, freq: u32) -> Option<CompactEntry> {
+		let &(slot, entry) = self.index.get(&key)?;
+
+		if entry.tier != Tier::Slow {
+			return None;
+		}
+
+		self.unlink(slot, entry.freq, Tier::Slow);
+
+		let (_, e) = self.index.get_mut(&key)?;
+		e.tier = Tier::Fast;
+		e.freq = freq;
+		let entry = *e;
+
+		self.recency_link_front(slot);
+
+		self.slow_len -= 1;
+		self.fast_len += 1;
+
+		Some(entry)
+	}
+
+	/// Sets a key's frequency and touches no list.
+	///
+	/// For a recency-list key only: its counter is carried metadata that ranks
+	/// nothing, so there is no bucket to move it between. Calling this on a
+	/// bucketed key would leave the buckets keyed on a stale frequency.
+	pub fn set_freq(&mut self, key: HashedKey, freq: u32) {
+		if let Some((_, e)) = self.index.get_mut(&key) {
+			e.freq = freq;
+		}
+	}
+
+	/// Sets a SLOW key's frequency and relinks it into that bucket.
+	///
+	/// Relinks even when `freq` is unchanged, which moves the key to the
+	/// newest position within its bucket. That is deliberate and matches
+	/// `FrequencyChain::move_to`'s unconditional remove-then-insert: at the
+	/// frequency cap a further access cannot raise the count, but it still
+	/// refreshes the key's standing against its equally-frequent peers.
+	pub fn slow_relink_at(&mut self, key: HashedKey, freq: u32) {
+		let Some(&(slot, entry)) = self.index.get(&key) else { return };
+
+		if entry.tier != Tier::Slow {
+			return;
+		}
+
+		self.unlink(slot, entry.freq, Tier::Slow);
+
+		if let Some((_, e)) = self.index.get_mut(&key) {
+			e.freq = freq;
+		}
+
+		self.link(slot, freq, Tier::Slow);
 	}
 
 	fn link(&mut self, slot: u32, freq: u32, tier: Tier) {
@@ -594,5 +802,181 @@ mod tests {
 
 		assert_eq!(c.get(9).unwrap().tier, Tier::Slow);
 		assert_eq!(c.get(9).unwrap().migrating(), 712);
+	}
+
+	// ── the distinguished recency list ────────────────────────────────────
+
+	#[test]
+	fn the_recency_list_orders_by_recency_not_frequency() {
+		let mut c = CompactFrequencyChain::default();
+		for key in 1..=3u64 { c.recency_push_front(key, 10, 0, 1); }
+
+		// 3 was pushed last, so 1 is the LRU tail regardless of counts.
+		assert_eq!(c.recency_back(), Some(1));
+		assert_eq!(c.fast_len(), 3);
+		assert_eq!(c.slow_len(), 0);
+
+		c.set_freq(1, 9);
+		assert_eq!(c.recency_back(), Some(1), "frequency must not reorder the recency list");
+
+		c.recency_move_front(1);
+		assert_eq!(c.recency_back(), Some(2), "a touch moves the key off the tail");
+	}
+
+	#[test]
+	fn moving_the_recency_head_to_the_front_is_a_no_op() {
+		let mut c = CompactFrequencyChain::default();
+		for key in 1..=3u64 { c.recency_push_front(key, 10, 0, 1); }
+
+		c.recency_move_front(3);
+
+		assert_eq!(c.recency_back(), Some(1));
+		assert_eq!(c.fast_len(), 3);
+	}
+
+	#[test]
+	fn demotion_carries_the_count_into_the_slow_buckets() {
+		let mut c = CompactFrequencyChain::default();
+		c.recency_push_front(1, 100, 24, 1);
+		c.recency_push_front(2, 200, 24, 1);
+		c.set_freq(2, 7);
+		c.recency_move_front(2);
+
+		// 1 is the tail; demoting it must land it at ITS count, not 2's.
+		let (key, entry) = c.demote_recency_back().unwrap();
+
+		assert_eq!(key, 1);
+		assert_eq!(entry.tier, Tier::Slow);
+		assert_eq!(entry.freq, 1);
+		assert_eq!(entry.size, 100, "size survives the move");
+		assert_eq!(c.min_with_count(Tier::Slow), Some((1, 1)));
+		assert_eq!(c.fast_len(), 1);
+		assert_eq!(c.slow_len(), 1);
+		assert_eq!(c.recency_back(), Some(2), "the recency list closed over the gap");
+
+		// and a hot key demotes into a HIGHER bucket than a cold one
+		let (key, entry) = c.demote_recency_back().unwrap();
+		assert_eq!(key, 2);
+		assert_eq!(entry.freq, 7);
+		assert_eq!(c.min_with_count(Tier::Slow), Some((1, 1)), "the cold key still ranks lowest");
+		assert_eq!(c.recency_back(), None);
+		assert_eq!(c.fast_len(), 0);
+		assert_eq!(c.slow_len(), 2);
+	}
+
+	#[test]
+	fn promotion_leaves_the_slow_buckets_and_enters_the_recency_head() {
+		let mut c = CompactFrequencyChain::default();
+		c.recency_push_front(1, 10, 0, 1);
+		c.recency_push_front(2, 10, 0, 1);
+		c.demote_recency_back().unwrap(); // 1 -> slow
+
+		let entry = c.promote_to_recency_front(1, 1).unwrap();
+
+		assert_eq!(entry.tier, Tier::Fast);
+		assert_eq!(entry.freq, 1, "the counter resets on the way in");
+		assert_eq!(c.min_key(Tier::Slow), None, "the slow bucket is gone");
+		assert_eq!(c.recency_back(), Some(2), "1 entered at the head, so 2 is now the tail");
+		assert_eq!(c.fast_len(), 2);
+		assert_eq!(c.slow_len(), 0);
+
+		// promoting something that is not slow is a no-op
+		assert_eq!(c.promote_to_recency_front(1, 1), None);
+		assert_eq!(c.promote_to_recency_front(999, 1), None);
+	}
+
+	#[test]
+	fn relinking_a_slow_key_at_an_unchanged_count_still_refreshes_it() {
+		let mut c = CompactFrequencyChain::default();
+		for key in 1..=3u64 { c.recency_push_front(key, 10, 0, 4); }
+		for _ in 0..3 { c.demote_recency_back().unwrap(); }
+
+		// all three sit in bucket 4, oldest-demoted first
+		assert_eq!(c.min_with_count(Tier::Slow), Some((1, 4)));
+
+		c.slow_relink_at(1, 4);
+
+		assert_eq!(
+			c.min_key(Tier::Slow), Some(2),
+			"an unchanged relink must still move the key to the back of its bucket",
+		);
+
+		c.slow_relink_at(2, 9);
+		assert_eq!(c.get(2).unwrap().freq, 9);
+		assert_eq!(c.min_key(Tier::Slow), Some(3), "2 left the minimum bucket");
+	}
+
+	#[test]
+	fn the_recency_list_and_the_slow_buckets_share_one_slab_and_one_index() {
+		let mut c = CompactFrequencyChain::default();
+		for key in 1..=100u64 { c.recency_push_front(key, 10, 0, 1); }
+		for _ in 0..50 { c.demote_recency_back().unwrap(); }
+
+		assert_eq!(c.len(), 100, "one index, so one count");
+		assert_eq!(c.fast_len() + c.slow_len(), 100);
+		assert_eq!(c.slots.len(), 100, "one slab, one slot per key");
+
+		// every key is reachable through the single index
+		for key in 1..=100u64 { assert!(c.contains(key)); }
+
+		// removing through the right door frees the slot for reuse
+		let before = c.slots.len();
+		for key in 1..=50u64 { c.remove(key); }             // slow half
+		for key in 51..=100u64 { c.recency_remove(key); }   // fast half
+
+		assert_eq!(c.len(), 0);
+		assert_eq!(c.fast_len(), 0);
+		assert_eq!(c.slow_len(), 0);
+		assert_eq!(c.recency_back(), None);
+
+		for key in 201..=300u64 { c.recency_push_front(key, 10, 0, 1); }
+		assert_eq!(c.slots.len(), before, "the freed slots must be reused");
+	}
+
+	#[test]
+	fn removing_from_the_middle_of_the_recency_list_relinks_neighbours() {
+		let mut c = CompactFrequencyChain::default();
+		for key in 1..=5u64 { c.recency_push_front(key, 10, 0, 1); }
+
+		c.recency_remove(3);
+
+		let mut seen = Vec::new();
+		while let Some(k) = c.recency_back() { seen.push(k); c.recency_remove(k); }
+
+		assert_eq!(seen, vec![1, 2, 4, 5], "the recency list must survive a middle removal");
+	}
+
+	#[test]
+	fn clear_resets_the_recency_list_too() {
+		let mut c = CompactFrequencyChain::default();
+		for key in 1..=5u64 { c.recency_push_front(key, 10, 0, 1); }
+		c.demote_recency_back().unwrap();
+
+		c.clear();
+
+		assert_eq!(c.len(), 0);
+		assert_eq!(c.recency_back(), None);
+
+		// and it is usable again afterwards
+		c.recency_push_front(9, 10, 0, 1);
+		assert_eq!(c.recency_back(), Some(9));
+		assert_eq!(c.fast_len(), 1);
+	}
+
+	/// The recency list must be invisible to the frequency-bucket stacks: a
+	/// chain driven only through `insert`/`bump`/`set_tier`/`remove` -- which
+	/// is exactly what `LfuCompactHybridStack` does -- must leave it empty.
+	#[test]
+	fn the_frequency_only_path_never_touches_the_recency_list() {
+		let mut c = CompactFrequencyChain::default();
+		for key in 1..=10u64 { c.insert(key, 10, 0, Tier::Fast); }
+		for key in 1..=5u64 { c.bump(key); }
+		c.set_tier(3, Tier::Slow);
+		c.remove(7);
+
+		assert_eq!(c.recency_back(), None, "no recency link may exist on the LFU path");
+		assert_eq!(c.recency_head, NIL);
+		assert_eq!(c.recency_tail, NIL);
+		assert_eq!(c.fast_len() + c.slow_len(), 9);
 	}
 }

@@ -55,12 +55,14 @@ pub enum PaperPolicy {
 	TwoQFullFastAdmissionHybrid(f64, f64),
 	FifoCompactHybrid,
 	FifoHybrid,
+	LruSizedCompactHybrid,
 	LruSizedHybrid,
 	/// Recency (LRU) in the fast tier, frequency (LFU) in the slow tier.
 	/// The parameter is `promote_k`: how many accesses a slow-tier object
 	/// must accumulate to earn promotion into the fast tier. Carried in the
 	/// policy string (like `TwoQHybrid`'s `k_in`) rather than being runtime-
 	/// configurable, because it is a policy parameter, not a size.
+	LruLfuCompactHybrid(u16),
 	LruLfuHybrid(u16),
 	S3FifoCompactHybrid(f64),
 	S3FifoHybrid(f64),
@@ -72,10 +74,15 @@ pub enum PaperPolicy {
 	S3FifoGhostLazyDemotionHybrid(f64),
 	S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(f64),
 	S3FifoGhostLazyDemotionFastAdmissionHybrid(f64),
+	S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(f64),
 	S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(f64),
+	S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(f64),
 	S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(f64),
+	S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(f64),
 	S3FifoLazyDemotionFastAdmissionReprieveHybrid(f64),
+	S3FifoLazyDemotionReprieveCompactHybrid(f64),
 	S3FifoLazyDemotionReprieveHybrid(f64),
+	S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(f64),
 	S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(f64),
 }
 
@@ -83,7 +90,7 @@ impl PaperPolicy {
 	/// Whether this policy is one of the tiered (hybrid) designs.
 	#[must_use]
 	pub fn is_hybrid(&self) -> bool {
-		matches!(self, PaperPolicy::FifoHybrid { .. } | PaperPolicy::FifoCompactHybrid { .. } | PaperPolicy::LfuHybrid { .. } | PaperPolicy::LfuCompactHybrid { .. } | PaperPolicy::LruCompactHybrid { .. } | PaperPolicy::LruHybrid { .. } | PaperPolicy::LruLfuHybrid { .. } | PaperPolicy::LruSizedHybrid { .. } | PaperPolicy::S3FifoGhostHybrid { .. } | PaperPolicy::S3FifoGhostCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid { .. } | PaperPolicy::S3FifoHybrid { .. } | PaperPolicy::S3FifoCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveHybrid { .. } | PaperPolicy::TwoQFastAdmissionHybrid { .. } | PaperPolicy::TwoQFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQGhostHybrid { .. } | PaperPolicy::TwoQGhostCompactHybrid { .. } | PaperPolicy::TwoQHybrid { .. } | PaperPolicy::TwoQCompactHybrid { .. })
+		matches!(self, PaperPolicy::FifoHybrid { .. } | PaperPolicy::FifoCompactHybrid { .. } | PaperPolicy::LfuHybrid { .. } | PaperPolicy::LfuCompactHybrid { .. } | PaperPolicy::LruCompactHybrid { .. } | PaperPolicy::LruHybrid { .. } | PaperPolicy::LruLfuHybrid { .. } | PaperPolicy::LruLfuCompactHybrid { .. } | PaperPolicy::LruSizedHybrid { .. } | PaperPolicy::LruSizedCompactHybrid { .. } | PaperPolicy::S3FifoGhostHybrid { .. } | PaperPolicy::S3FifoGhostCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid { .. } | PaperPolicy::S3FifoHybrid { .. } | PaperPolicy::S3FifoCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionHybrid { .. } | PaperPolicy::TwoQFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQGhostHybrid { .. } | PaperPolicy::TwoQGhostCompactHybrid { .. } | PaperPolicy::TwoQHybrid { .. } | PaperPolicy::TwoQCompactHybrid { .. })
 	}
 
 	pub fn is_auto(&self) -> bool {
@@ -116,9 +123,11 @@ impl Display for PaperPolicy {
 			PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out) => write!(f, "2q-full-fast-admission-hybrid-{k_in}-{k_out}"),
 			PaperPolicy::FifoCompactHybrid => write!(f, "fifo-compact-hybrid"),
 			PaperPolicy::FifoHybrid => write!(f, "fifo-hybrid"),
+			PaperPolicy::LruSizedCompactHybrid => write!(f, "lru-sized-compact-hybrid"),
 			PaperPolicy::LruSizedHybrid => write!(f, "lru-sized-hybrid"),
 			PaperPolicy::LruCompactHybrid => write!(f, "lru-compact-hybrid"),
 			PaperPolicy::LfuCompactHybrid => write!(f, "lfu-compact-hybrid"),
+			PaperPolicy::LruLfuCompactHybrid(promote_k) => write!(f, "lru-lfu-compact-hybrid-{promote_k}"),
 			PaperPolicy::LruLfuHybrid(promote_k) => write!(f, "lru-lfu-hybrid-{promote_k}"),
 			PaperPolicy::S3FifoCompactHybrid(ratio) => write!(f, "s3-fifo-compact-hybrid-{ratio}"),
 			PaperPolicy::S3FifoHybrid(ratio) => write!(f, "s3-fifo-hybrid-{ratio}"),
@@ -130,10 +139,15 @@ impl Display for PaperPolicy {
 			PaperPolicy::S3FifoGhostLazyDemotionHybrid(ratio) => write!(f, "s3-fifo-ghost-lazy-demotion-hybrid-{ratio}"),
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(ratio) => write!(f, "s3-fifo-ghost-lazy-demotion-fast-admission-compact-hybrid-{ratio}"),
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ratio) => write!(f, "s3-fifo-ghost-lazy-demotion-fast-admission-hybrid-{ratio}"),
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(ratio) => write!(f, "s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-compact-hybrid-{ratio}"),
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(ratio) => write!(f, "s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-{ratio}"),
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-compact-hybrid-{ratio}"),
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-{ratio}"),
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-fast-admission-reprieve-compact-hybrid-{ratio}"),
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-{ratio}"),
+			PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-reprieve-compact-hybrid-{ratio}"),
 			PaperPolicy::S3FifoLazyDemotionReprieveHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-reprieve-hybrid-{ratio}"),
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-compact-hybrid-{ratio}"),
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(ratio) => write!(f, "s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-{ratio}"),
 		}
 	}
@@ -169,6 +183,7 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("2q-hybrid-") => parse_two_q_hybrid(value)?,
 			value if value.starts_with("2q-") => parse_two_q(value)?,
 			"arc" => PaperPolicy::Arc,
+			value if value.starts_with("s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-compact-hybrid-") => parse_s_three_fifo_ghost_lazy_demotion_fast_admission_midpoint_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-") => parse_s_three_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid(value)?,
 			value if value.starts_with("s3-fifo-ghost-lazy-demotion-fast-admission-compact-hybrid-") => parse_s_three_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-ghost-lazy-demotion-fast-admission-hybrid-") => parse_s_three_fifo_ghost_lazy_demotion_fast_admission_hybrid(value)?,
@@ -178,9 +193,13 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("s3-fifo-ghost-hybrid-") => parse_s_three_fifo_ghost_hybrid(value)?,
 			value if value.starts_with("s3-fifo-compact-hybrid-") => parse_s_three_fifo_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-hybrid-") => parse_s_three_fifo_hybrid(value)?,
+			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-compact-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_midpoint_reprieve_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid(value)?,
+			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-reprieve-compact-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_reprieve_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_reprieve_hybrid(value)?,
+			value if value.starts_with("s3-fifo-lazy-demotion-reprieve-compact-hybrid-") => parse_s_three_fifo_lazy_demotion_reprieve_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-lazy-demotion-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_reprieve_hybrid(value)?,
+			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-compact-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid(value)?,
 			value if value.starts_with("s3-fifo-") => parse_s_three_fifo(value)?,
 			// Prefix guard, so it must be tested before any *exact* arm it
@@ -189,6 +208,7 @@ impl FromStr for PaperPolicy {
 			// since no other guard starts with "lru-lfu-hybrid-". Kept beside
 			// the other lru forms for readability. See
 			// `hybrid_does_not_collide_with_other_lru_forms`.
+			value if value.starts_with("lru-lfu-compact-hybrid-") => parse_lru_lfu_compact_hybrid(value)?,
 			value if value.starts_with("lru-lfu-hybrid-") => parse_lru_lfu_hybrid(value)?,
 			"lru-hybrid" => PaperPolicy::LruHybrid,
 			"lfu-hybrid" => PaperPolicy::LfuHybrid,
@@ -196,6 +216,7 @@ impl FromStr for PaperPolicy {
 			"lfu-compact-hybrid" => PaperPolicy::LfuCompactHybrid,
 			"fifo-compact-hybrid" => PaperPolicy::FifoCompactHybrid,
 			"fifo-hybrid" => PaperPolicy::FifoHybrid,
+			"lru-sized-compact-hybrid" => PaperPolicy::LruSizedCompactHybrid,
 			"lru-sized-hybrid" => PaperPolicy::LruSizedHybrid,
 
 			_ => return Err(CacheError::InvalidPolicy),
@@ -258,6 +279,31 @@ fn parse_two_q(value: &str) -> Result<PaperPolicy, CacheError> {
 	}
 
 	Ok(PaperPolicy::TwoQ(k_in, k_out))
+}
+
+fn parse_lru_lfu_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "lru-lfu-compact-hybrid-"
+	let tokens = value[23..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(promote_k) = tokens[0].parse::<u16>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	// 0 would make every slow object promotable before it was ever accessed.
+	// The upper bound is enforced by the stack itself (clamped to its
+	// frequency cap), not here, so the policy string stays a faithful record
+	// of what was asked for.
+	if promote_k == 0 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::LruLfuCompactHybrid(promote_k))
 }
 
 fn parse_lru_lfu_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
@@ -698,6 +744,27 @@ fn parse_s_three_fifo_ghost_lazy_demotion_fast_admission_hybrid(value: &str) -> 
 	Ok(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(ratio))
 }
 
+fn parse_s_three_fifo_ghost_lazy_demotion_fast_admission_midpoint_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-compact-hybrid-"
+	let tokens = value[67..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(ratio) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..1.0).contains(&ratio) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(ratio))
+}
+
 fn parse_s_three_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
 	// skip the "s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-hybrid-"
 	let tokens = value[59..]
@@ -717,6 +784,27 @@ fn parse_s_three_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid(value: 
 	}
 
 	Ok(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(ratio))
+}
+
+fn parse_s_three_fifo_lazy_demotion_fast_admission_midpoint_reprieve_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-compact-hybrid-"
+	let tokens = value[70..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(ratio) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&ratio) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(ratio))
 }
 
 fn parse_s_three_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
@@ -740,6 +828,27 @@ fn parse_s_three_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid(valu
 	Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(ratio))
 }
 
+fn parse_s_three_fifo_lazy_demotion_fast_admission_reprieve_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "s3-fifo-lazy-demotion-fast-admission-reprieve-compact-hybrid-"
+	let tokens = value[61..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(ratio) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&ratio) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(ratio))
+}
+
 fn parse_s_three_fifo_lazy_demotion_fast_admission_reprieve_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
 	// skip the "s3-fifo-lazy-demotion-fast-admission-reprieve-hybrid-"
 	let tokens = value[53..]
@@ -761,6 +870,27 @@ fn parse_s_three_fifo_lazy_demotion_fast_admission_reprieve_hybrid(value: &str) 
 	Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(ratio))
 }
 
+fn parse_s_three_fifo_lazy_demotion_reprieve_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "s3-fifo-lazy-demotion-reprieve-compact-hybrid-"
+	let tokens = value[46..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(ratio) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&ratio) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(ratio))
+}
+
 fn parse_s_three_fifo_lazy_demotion_reprieve_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
 	// skip the "s3-fifo-lazy-demotion-reprieve-hybrid-"
 	let tokens = value[38..]
@@ -780,6 +910,27 @@ fn parse_s_three_fifo_lazy_demotion_reprieve_hybrid(value: &str) -> Result<Paper
 	}
 
 	Ok(PaperPolicy::S3FifoLazyDemotionReprieveHybrid(ratio))
+}
+
+fn parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-compact-hybrid-"
+	let tokens = value[72..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(ratio) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..=1.0).contains(&ratio) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(ratio))
 }
 
 fn parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {

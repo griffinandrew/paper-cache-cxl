@@ -205,7 +205,7 @@ const FAST_TIER_LOW_WATER_RATIO: f64 = 0.98;
 /// 16 is generous for the discrimination LFU actually needs — S3-FIFO caps
 /// its equivalent counter at 3 — while leaving room for a `promote_k` well
 /// above the useful range.
-const FREQUENCY_CAP: u16 = 16;
+pub(super) const FREQUENCY_CAP: u16 = 16;
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 type RecencyList = HashList<HashedKey, NoHasher>;

@@ -243,6 +243,7 @@ fifo_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # Same dependency reasoning as the other four hybrids: only needs
 # `key_value_pmem`, not `key_pmem_value_pmem`.
 #
+lru_sized_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 lru_sized_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance hybrid cache with a DIFFERENT eviction discipline per tier:
@@ -262,6 +263,7 @@ lru_sized_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # Same dependency reasoning as the other hybrids: only needs
 # `key_value_pmem`, not `key_pmem_value_pmem`.
 #
+lru_lfu_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 lru_lfu_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance, segmented-S3-FIFO hybrid cache: same one-PaperCache<K,
@@ -335,6 +337,7 @@ s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache = ["key_value_pmem", "hy
 # (worker/policy/policy_stack/s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_stack.rs
 # has the full mechanics).
 #
+s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache: same
@@ -350,6 +353,7 @@ s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache = ["key_value_p
 # has the full mechanics, including the O(number of currently-fast keys)
 # splice technique).
 #
+s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache: the reprieve design with
@@ -362,6 +366,7 @@ s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache = ["key_valu
 # throughput. This variant keeps only the checks that pay for themselves:
 # the demotion boundary and the eviction tail.
 #
+s3_fifo_lazy_demotion_fast_admission_reprieve_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Fills the s3-fifo family's one empty design cell: the one-access queue lives
@@ -373,6 +378,7 @@ s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache = ["key_value_pmem", 
 # per aged-out object. Lazy demotion retained; no ghost queue (nothing would
 # populate it -- no key is ever evicted from the one-access queue).
 #
+s3_fifo_lazy_demotion_reprieve_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 s3_fifo_lazy_demotion_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache: same as
@@ -387,6 +393,7 @@ s3_fifo_lazy_demotion_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_c
 # (worker/policy/policy_stack/s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_stack.rs
 # has the full mechanics).
 #
+s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Internal marker feature, not meant to be enabled directly: every
