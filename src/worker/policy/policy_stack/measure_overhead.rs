@@ -169,6 +169,22 @@ fn measure_cache_point() {
 	let max_size: crate::CacheSize = 1 << 40;
 	let value = vec![0u8; vsize];
 
+	// Warm-up: the first cache built in a process is measurably cheaper than
+	// every later one, so build and drop one BEFORE taking `base`.
+	{
+		let warm = crate::PaperCache::<u64, crate::TieredBuffer>::new(
+			max_size,
+			crate::CacheTierSize::Bytes(max_size),
+			policy,
+		)
+		.expect("warm-up cache should construct");
+		for i in 0..4_096u64 {
+			let _ = warm.set(i, &value, None);
+		}
+		std::thread::sleep(std::time::Duration::from_millis(200));
+	}
+	std::thread::sleep(std::time::Duration::from_millis(200));
+
 	let base = allocated_bytes();
 	let cache = crate::PaperCache::<u64, crate::TieredBuffer>::new(
 		max_size,
@@ -217,6 +233,81 @@ fn measure_value_class() {
 		let rounded = unsafe { tikv_jemalloc_sys::nallocx(v, 0) };
 		println!("VALUE_CLASS {} {}", v, rounded);
 	}
+}
+
+/// The object map alone, one point per process.
+///
+/// This is the missing half of the decomposition. `measure_one_point` gives the
+/// eviction stack cleanly (R2 = 1.0000, a single structure with deterministic
+/// growth). `measure_cache_point` gives the whole cache but is noisy enough
+/// (R2 0.99, a systematic dip at 2^20) that it cannot resolve the 40 B/object
+/// the compaction is supposed to save, and it reports compact and baseline as
+/// costing the same 342 B/object -- which cannot be right.
+///
+/// Measuring the map on its own turns that into an arithmetic check:
+///
+///     whole cache  ==  object map  +  eviction stack
+///
+/// The map is identical for every policy, so if the identity holds then the
+/// whole-cache figures must differ by exactly the stack difference (40 B), and
+/// if it does not hold then the whole-cache measurement is what is wrong.
+///
+/// The map is the DEFAULT `ObjectMapRef` shape -- `DashMap` on the GLOBAL
+/// allocator. Not the `global_hashtable_pmem` variant: copying the wrong cfg
+/// arm here once put the map in PMEM and measured a different structure
+/// entirely.
+///
+/// Same rules as every other measurement in this module: jemalloc
+/// `stats.allocated` rather than RSS, ONE point per process, and the caller
+/// samples at POWERS OF TWO.
+#[cfg(not(any(feature = "global_hashtable_pmem", feature = "key_pmem_value_pmem")))]
+#[test]
+#[ignore]
+fn measure_object_map_point() {
+	let n: u64 = match std::env::var("MEASURE_MAP_N") {
+		Ok(v) => v.parse().expect("MEASURE_MAP_N"),
+		Err(_) => return,
+	};
+	let vsize: usize = std::env::var("MEASURE_VALUE")
+		.map(|v| v.parse().expect("MEASURE_VALUE"))
+		.unwrap_or(64);
+
+	let value = vec![0u8; vsize];
+
+	let base = allocated_bytes();
+	let map: crate::ObjectMapRef<u64, crate::TieredBuffer> = std::sync::Arc::new(
+		dashmap::DashMap::with_hasher(crate::NoHasher::default()),
+	);
+	for i in 0..n {
+		let key = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+		let buf = crate::TieredBuffer::new_fast(&value);
+		map.insert(key, crate::object::Object::new(key, buf, None));
+	}
+	let after = allocated_bytes();
+	let held = map.len() as u64;
+	core::hint::black_box(&map);
+	println!("MEASURED_MAP {} {} {} {}", n, vsize, after.saturating_sub(base), held);
+}
+
+/// Exact struct layout behind the measured object-map row.
+///
+/// The measured 96 B/object for the DashMap row is an ALLOCATION figure; this
+/// prints the sizes it is built from, so the share that is the inline key and
+/// expiry -- both of which `base_size` ALREADY counts -- can be separated from
+/// the container overhead proper. Adding the whole 96 on top of `base_size`
+/// would double-charge whatever part of it `base_size` covers.
+#[test]
+#[ignore]
+fn print_row_layout() {
+	use core::mem::size_of;
+	type Obj = crate::object::Object<u64, crate::TieredBuffer>;
+	println!("LAYOUT HashedKey                {}", size_of::<crate::HashedKey>());
+	println!("LAYOUT key u64                  {}", size_of::<u64>());
+	println!("LAYOUT ExpireTime               {}", size_of::<crate::object::ExpireTime>());
+	println!("LAYOUT Arc<TieredBuffer> ptr    {}", size_of::<std::sync::Arc<crate::TieredBuffer>>());
+	println!("LAYOUT TieredBuffer             {}", size_of::<crate::TieredBuffer>());
+	println!("LAYOUT Object<u64,TieredBuffer> {}", size_of::<Obj>());
+	println!("LAYOUT (HashedKey, Object) pair {}", size_of::<(crate::HashedKey, Obj)>());
 }
 
 /// Layout A vs layout B for the slab designs, measured rather than derived.

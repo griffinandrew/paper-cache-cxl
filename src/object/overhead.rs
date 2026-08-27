@@ -1365,7 +1365,7 @@ const ARC_VALUE_HEADER_OVERHEAD: ObjectSize = 48;
 /// 1.2M objects the same arithmetic yields 989 B/object, which is what made
 /// the contamination obvious.
 #[cfg(feature = "hybrid_cache_common")]
-const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 63;
+const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 96;
 
 /// Requested-to-resident multiplier for the DRAM metadata reserved above.
 ///
@@ -1558,26 +1558,33 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 
 	// The value's Arc header is DRAM-resident regardless of which tier the
 	// buffer itself occupies, and regardless of any hashtable-PMEM feature.
+	// MEASURED at 48.0 B/object, R2 = 1.000000 -- which is exactly what this
+	// constant already said.
 	overhead += ARC_VALUE_HEADER_OVERHEAD;
 
 	// The object map lives in DRAM unless a hashtable-PMEM feature
 	// relocates it (`global_hashtable_pmem`).
+	//
+	// MEASURED at 96.0 B/object for the default `DashMap` shape, as the
+	// difference between the whole map (144.0) and the Arc alone (48.0). Both
+	// fits R2 = 1.000000, and the 144 is identical at 64-byte and 512-byte
+	// values, so it is a container cost rather than a mis-attributed value
+	// cost. The previous hand-counted 63 was 33 bytes low.
 	#[cfg(not(feature = "global_hashtable_pmem"))]
 	{
 		overhead += OBJECT_MAP_ENTRY_OVERHEAD;
 	}
 
-	// Requested -> resident: what this reservation is protecting is real
-	// DRAM, and the allocator holds more than was requested (size-class
-	// rounding plus retained freed pages; see `DEFAULT_RESIDENT_FACTOR`).
+	// No resident factor. Every term above is now MEASURED from jemalloc
+	// `stats.allocated`, which is the size-class-rounded usable figure -- the
+	// same quantity Redis reports as `used_memory`. The factor modelled
+	// "requested -> resident", so applying it to an already-rounded
+	// measurement charges the rounding twice.
 	//
-	// This applies to the Arc header and map entry only. The eviction-stack
-	// term is subtracted out first and added back afterwards, because it is
-	// MEASURED RESIDENT -- it comes from RSS (see `measure_overhead`), so it
-	// already contains the size-class rounding and retained pages this factor
-	// exists to model. Multiplying it again would charge that rounding twice.
-	let derived = overhead - stack_resident;
-	stack_resident + (derived as f64 * resident_factor()) as ObjectSize
+	// (The comment this replaces claimed the eviction-stack term "comes from
+	// RSS". It did once; the measurement was moved to `stats.allocated`, and
+	// the comment was not.)
+	overhead
 }
 
 #[cfg(all(test, feature = "hybrid_cache_common"))]
