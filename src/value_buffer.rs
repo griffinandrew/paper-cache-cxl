@@ -26,9 +26,20 @@ pub trait ValueBuffer: TypeSize + AsRef<[u8]> + Clone + Send + Sync + 'static {
 	fn from_bytes(bytes: &[u8]) -> Self;
 }
 
+#[cfg(not(feature = "segregated_value_arena"))]
 impl ValueBuffer for BufferDRAM {
 	fn from_bytes(bytes: &[u8]) -> Self {
 		Box::clone_from_ref(bytes)
+	}
+}
+
+/// Builds the value in the segregated DRAM pool rather than the process-wide
+/// default one, so this long-lived allocation never shares bins or a tcache
+/// with the transient `to_vec()` destination `get()` hands back.
+#[cfg(feature = "segregated_value_arena")]
+impl ValueBuffer for BufferDRAM {
+	fn from_bytes(bytes: &[u8]) -> Self {
+		Box::clone_from_ref_in(bytes, crate::numa_alloc::FastValues)
 	}
 }
 

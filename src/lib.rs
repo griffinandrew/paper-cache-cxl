@@ -42,11 +42,21 @@ use std::arch::x86_64::{_mm_clflush, _mm_sfence};
     feature = "global_hashtable_pmem",
     feature = "tiering_hashtable_pmem",
     feature = "eviction_stacks_pmem",
+    feature = "segregated_value_arena",
 ))]
 pub(crate) use crate::numa_alloc::SlowObjects as Hybrid;
 
 #[cfg(feature = "key_value_pmem")]
 impl typesize::TypeSize for BufferPMEM {
+    fn get_size(&self) -> usize {
+        self.len()
+    }
+}
+
+// `typesize` blankets `Box<[T]>` only for the default allocator, so the
+// segregated-pool boxed slice needs its own impl, exactly as `BufferPMEM` does.
+#[cfg(feature = "segregated_value_arena")]
+impl typesize::TypeSize for BufferDRAM {
     fn get_size(&self) -> usize {
         self.len()
     }
@@ -479,7 +489,16 @@ use std::alloc::{Layout, Allocator}; // Essential imports
 
 
 //#[cfg(feature = "all_dram")]
+#[cfg(not(feature = "segregated_value_arena"))]
 pub type BufferDRAM = Box<[u8]>;
+
+/// With `segregated_value_arena`, DRAM value buffers carry their own allocator
+/// in the type -- exactly as `BufferPMEM = Box<[u8], Hybrid>` does -- so that
+/// `dealloc` routes back to the same pool no matter which thread frees them.
+/// That matters here: values are allocated on the client thread and freed on
+/// the policy worker during eviction.
+#[cfg(feature = "segregated_value_arena")]
+pub type BufferDRAM = Box<[u8], numa_alloc::FastValues>;
 
 
 /// Initial capacity (in entries) for the hashbrown-backed object map used

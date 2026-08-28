@@ -44,10 +44,23 @@ use typesize::TypeSize;
 use crate::Hybrid;
 
 /// A value buffer that is physically stored in exactly one tier at a time.
+/// Backing type of the fast (DRAM) tier's byte buffer.
+///
+/// Plain global-allocator storage by default. Under `segregated_value_arena`
+/// it moves to the dedicated value pool, for the same reason `BufferDRAM`
+/// does: fast-tier values are the value-lifetime stream, and without this the
+/// hybrid build was only HALF-separated -- `Slow` went through `Hybrid` but
+/// pre-latch admissions and every promotion still built `Fast` buffers in the
+/// default tcache the per-GET `to_vec()` destination draws from.
+#[cfg(not(feature = "segregated_value_arena"))]
+type FastBuf = Box<[u8]>;
+#[cfg(feature = "segregated_value_arena")]
+type FastBuf = Box<[u8], crate::numa_alloc::FastValues>;
+
 pub enum TieredBuffer {
 	/// Fast tier: an ordinary DRAM allocation through this crate's active
 	/// global allocator.
-	Fast(Box<[u8]>),
+	Fast(FastBuf),
 
 	/// Slow tier: PMEM/CXL allocation. Backend selected at compile time --
 	/// see the module doc comment above.
@@ -57,7 +70,10 @@ pub enum TieredBuffer {
 impl TieredBuffer {
 	/// Creates a new fast-tier (DRAM) buffer by copying the given bytes.
 	pub fn new_fast(bytes: &[u8]) -> Self {
-		TieredBuffer::Fast(Box::from(bytes))
+		#[cfg(not(feature = "segregated_value_arena"))]
+		return TieredBuffer::Fast(Box::from(bytes));
+		#[cfg(feature = "segregated_value_arena")]
+		return TieredBuffer::Fast(Box::clone_from_ref_in(bytes, crate::numa_alloc::FastValues));
 	}
 
 	/// Creates a new slow-tier (PMEM/CXL) buffer by copying the given bytes.

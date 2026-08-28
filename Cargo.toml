@@ -424,6 +424,33 @@ hybrid_cache_common = ["numa_jemalloc"]
 numa_jemalloc = []
 
 
+# Routes all-DRAM value buffers (`BufferDRAM`) to their own jemalloc arenas and
+# their own explicit per-thread tcache, instead of the process-wide default.
+#
+# WHY THIS EXISTS. Measured 2026-08-27/28 on Twitter cluster13: the flat
+# (all_dram) build was ~250 ns/GET slower at the median than the tiered build,
+# and the cause was NOT tiering, NUMA placement, or the extent hooks. In the
+# flat build `set()`'s long-lived value buffer and `get()`'s transient
+# `to_vec()` destination are THE SAME SIZE by construction, so they land in the
+# same jemalloc size class, the same bins, and the same per-thread tcache. The
+# long-lived buffers (freed later, from the policy worker) fragment those bins
+# -- 342 near-empty slabs in the 32 B class alone -- so every tcache refill
+# hands the GET destination a region on a cold page.
+#
+# The tiered build never had this problem, because `TieredBuffer::Slow` uses the
+# `Hybrid` allocator, which is a different allocator with different bins. That
+# separation, not CXL, is what made tiered's GET p50 look 2x better.
+#
+# Enabling this gives the flat build the same separation, so a flat-vs-tiered
+# comparison measures tiering rather than allocator-stream overlap.
+#
+# NOT A FREE WIN: separation buys GET latency and charges the SET path. Measured
+# on the tiered build, an explicit tcache vs the default gave GET p50 356 ns
+# (vs 351 with TCACHE_NONE, vs 612 unsegregated) but SET p50 915 ns (vs flat's
+# 846). Expect flat to gain ~250 ns on GET p50 and give back ~70-100 ns on SET.
+segregated_value_arena = []
+
+
 
 
 default = []
