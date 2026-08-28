@@ -1158,3 +1158,79 @@ mod tests {
 		assert_eq!(stack.evict_one(), None);
 	}
 }
+
+#[cfg(test)]
+mod count_invariants {
+    use super::*;
+
+    /// `slow_object_count()` is `entries.len() - fast_count`, unguarded. If
+    /// `fast_count` can exceed `entries.len()` this underflows -- in release
+    /// that wraps to ~2^64 rather than panicking, and the corrupted gauge
+    /// feeds the reservation and watermark logic.
+    ///
+    /// Also pins `stack.len() == entries.len()`: `len()` reports the former
+    /// while `slow_object_count()` subtracts from the latter, so a divergence
+    /// between the two collections silently mixes counts from different
+    /// sources.
+    #[test]
+    fn fast_count_never_exceeds_entries_and_the_two_collections_agree() {
+        let mut stack = LruHybridStack::new(64 * 1024).with_shared_overhead(112);
+        let mut x: u64 = 0x243F_6A88_85A3_08D3;
+
+        for step in 0..300_000u64 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let u = (x >> 11) as f64 / (1u64 << 53) as f64;
+            let key = ((u * u * 3_000.0) as u64) + 1;
+            let size = 64 + (step % 512) as ObjectSize;
+
+            match step % 32 {
+                31 => { let s: &mut dyn PolicyStack = &mut stack; s.remove(key); },
+                30 => { let s: &mut dyn PolicyStack = &mut stack; let _ = s.evict_one(); },
+                29 => { let s: &mut dyn PolicyStack = &mut stack; s.update(key); },
+                _  => { let s: &mut dyn PolicyStack = &mut stack; s.insert_resident(key, size, 0); },
+            }
+
+            assert!(
+                stack.fast_count <= stack.entries.len(),
+                "step {step}: fast_count {} > entries.len() {} -- \
+                 slow_object_count() would underflow to ~2^64 in release",
+                stack.fast_count, stack.entries.len(),
+            );
+            assert_eq!(
+                stack.stack.len(), stack.entries.len(),
+                "step {step}: recency list holds {} but entries holds {} -- \
+                 len() and slow_object_count() read different collections",
+                stack.stack.len(), stack.entries.len(),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod slow_tier_accounting {
+    use super::*;
+
+    /// After enough inserts to overflow the fast tier, demotions must be
+    /// VISIBLE in the slow tier. The production run recorded 58M demotions
+    /// with slow_object_count()==0 and slow_bytes_used()==0.
+    #[test]
+    fn demotions_land_in_the_slow_tier() {
+        for resident in [0u32, 24, 32] {
+            let mut stack = LruHybridStack::new(256 * 1024).with_shared_overhead(112);
+            for i in 0..20_000u64 {
+                let s: &mut dyn PolicyStack = &mut stack;
+                s.insert_resident(i, 1_024, resident as ObjectSize);
+            }
+            let s: &dyn PolicyStack = &stack;
+            let (fo, so) = (s.fast_object_count(), s.slow_object_count());
+            let (fb, sb) = (s.fast_bytes_used(), s.slow_bytes_used());
+            assert!(
+                so > 0 && sb > 0,
+                "resident={resident}: fast={fo} obj/{fb} B, slow={so} obj/{sb} B -- \
+                 the fast tier cannot hold 20k objects at this capacity, so \
+                 demotions must have occurred and must be visible in the slow tier",
+            );
+            assert_eq!(fo + so, s.len(), "resident={resident}: tier counts must sum to len()");
+        }
+    }
+}

@@ -300,7 +300,9 @@ impl FrequencyChain {
 
 			if next_count_stack.count == prev_count + 1 {
 				next_count_stack.push(key);
-				self.index_map.insert(key, next_count_stack_index);
+				if let Some(slot) = self.index_map.get_mut(&key) {
+					*slot = next_count_stack_index;
+				}
 
 				if prev_is_empty {
 					self.count_stacks.remove(count_stack_index);
@@ -314,7 +316,9 @@ impl FrequencyChain {
 		new_count_stack.push(key);
 
 		let new_count_stack_index = self.count_stacks.insert_after(count_stack_index, new_count_stack);
-		self.index_map.insert(key, new_count_stack_index);
+		if let Some(slot) = self.index_map.get_mut(&key) {
+			*slot = new_count_stack_index;
+		}
 
 		if prev_is_empty {
 			self.count_stacks.remove(count_stack_index);
@@ -1649,5 +1653,77 @@ mod chain_memory {
 			new_rss, new_rss as f64 / KEYS as f64);
 		println!("MEM measured ratio new/old = {:.2}",
 			new_rss as f64 / old_rss.max(1) as f64);
+	}
+}
+
+/// Does the frequency chain ever lose a key it is supposed to track?
+///
+/// Motivated by a real run: cluster13 under `eviction_stacks_pmem` finished
+/// with 2,760,563 objects in the object map and 882,110 in the chain. Keys the
+/// chain has forgotten can never be returned by `evict_one`, so the cache
+/// cannot free them and runs past `max_size` (133%) or dies. cluster53, same
+/// build, same policy, was exact -- so whatever this is, it needs pressure.
+///
+/// The invariant checked here is the one the production code never checks:
+/// every key with an `entries` row is in exactly one chain, and neither chain
+/// holds a key without one.
+#[cfg(test)]
+mod chain_tracking_invariant {
+	use super::*;
+
+	fn tracked(stack: &LfuHybridStack) -> usize {
+		stack.fast_chain.len() + stack.slow_chain.len()
+	}
+
+	/// Mirrors the shape of the workload that broke: many keys, heavy reuse
+	/// (so `bump` runs constantly and buckets churn), varied sizes, and a fast
+	/// tier far too small to hold them -- which keeps `settle_fast_tier`
+	/// demoting and `evict_one` draining throughout.
+	#[test]
+	fn the_chain_never_loses_a_key_under_migration_pressure() {
+		let mut stack = LfuHybridStack::new(64 * 1024).with_shared_overhead(112);
+		let mut x: u64 = 0x243F_6A88_85A3_08D3;
+		let mut live: std::collections::HashSet<HashedKey> = std::collections::HashSet::new();
+
+		for step in 0..200_000u64 {
+			x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+			// skewed key choice: a small hot set bumped repeatedly, which is
+			// what drives bucket creation and removal
+			let u = (x >> 11) as f64 / (1u64 << 53) as f64;
+			let key = ((u * u * 2_000.0) as u64) + 1;
+			let size = 64 + (step % 512) as ObjectSize;
+
+			match step % 16 {
+				15 => {
+					let s: &mut dyn PolicyStack = &mut stack;
+					s.remove(key);
+					live.remove(&key);
+				},
+				_ => {
+					let s: &mut dyn PolicyStack = &mut stack;
+					s.insert_resident(key, size, 0);
+					live.insert(key);
+				},
+			}
+
+			// drain like the worker does
+			loop {
+				let s: &mut dyn PolicyStack = &mut stack;
+				if s.len() <= 400 { break }
+				match s.evict_one() {
+					Some(k) => { live.remove(&k); },
+					None => break,
+				}
+			}
+
+			let s: &dyn PolicyStack = &stack;
+			assert_eq!(
+				tracked(&stack), s.len(),
+				"step {step}: chain tracks {} keys but the stack reports len() {} \
+				 -- the difference is unevictable and is what let a real run reach \
+				 133% of max_size",
+				tracked(&stack), s.len(),
+			);
+		}
 	}
 }

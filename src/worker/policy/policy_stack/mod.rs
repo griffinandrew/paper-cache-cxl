@@ -5,10 +5,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+mod lfu_compact_stack;
 mod lfu_stack;
 mod fifo_stack;
 mod clock_stack;
 mod sieve_stack;
+mod lru_compact_stack;
 mod lru_stack;
 mod mru_stack;
 mod two_q_stack;
@@ -67,10 +69,12 @@ use crate::{
 	policy::PaperPolicy,
 	object::ObjectSize,
 	worker::policy::policy_stack::{
+		lfu_compact_stack::LfuCompactStack,
 		lfu_stack::LfuStack,
 		fifo_stack::FifoStack,
 		clock_stack::ClockStack,
 		sieve_stack::SieveStack,
+		lru_compact_stack::LruCompactStack,
 		lru_stack::LruStack,
 		mru_stack::MruStack,
 		two_q_stack::TwoQStack,
@@ -420,10 +424,12 @@ where
 pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn PolicyStack> {
 	match policy {
 		PaperPolicy::Auto => Box::new(LfuStack::default()),
+		PaperPolicy::LfuCompact => Box::new(LfuCompactStack::default()),
 		PaperPolicy::Lfu => Box::new(LfuStack::default()),
 		PaperPolicy::Fifo => Box::new(FifoStack::default()),
 		PaperPolicy::Clock => Box::new(ClockStack::default()),
 		PaperPolicy::Sieve => Box::new(SieveStack::default()),
+		PaperPolicy::LruCompact => Box::new(LruCompactStack::default()),
 		PaperPolicy::Lru => Box::new(LruStack::default()),
 		PaperPolicy::Mru => Box::new(MruStack::default()),
 		PaperPolicy::TwoQ(k_in, k_out) => Box::new(TwoQStack::new(k_in, k_out, max_size)),
@@ -981,7 +987,7 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 48;
+	const POLICY_VARIANT_COUNT: usize = 50;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the 18
 	/// tiered designs this crate exists to compare.
@@ -1000,10 +1006,12 @@ mod init_policy_stack_tests {
 	/// stops this file compiling until the new design is added here too.
 	const POLICY_DISPATCH_TABLE: [(PaperPolicy, PaperPolicy); POLICY_VARIANT_COUNT] = [
 		(PaperPolicy::Auto, PaperPolicy::Auto),
+		(PaperPolicy::LfuCompact, PaperPolicy::LfuCompact),
 		(PaperPolicy::Lfu, PaperPolicy::Lfu),
 		(PaperPolicy::Fifo, PaperPolicy::Fifo),
 		(PaperPolicy::Clock, PaperPolicy::Clock),
 		(PaperPolicy::Sieve, PaperPolicy::Sieve),
+		(PaperPolicy::LruCompact, PaperPolicy::LruCompact),
 		(PaperPolicy::Lru, PaperPolicy::Lru),
 		(PaperPolicy::Mru, PaperPolicy::Mru),
 		(PaperPolicy::TwoQ(0.25, 0.25), PaperPolicy::TwoQ(0.5, 0.4)),
@@ -1058,10 +1066,12 @@ mod init_policy_stack_tests {
 	fn variant_name(policy: &PaperPolicy) -> &'static str {
 		match policy {
 			PaperPolicy::Auto => "Auto",
+			PaperPolicy::LfuCompact => "LfuCompact",
 			PaperPolicy::Lfu => "Lfu",
 			PaperPolicy::Fifo => "Fifo",
 			PaperPolicy::Clock => "Clock",
 			PaperPolicy::Sieve => "Sieve",
+			PaperPolicy::LruCompact => "LruCompact",
 			PaperPolicy::Lru => "Lru",
 			PaperPolicy::Mru => "Mru",
 			PaperPolicy::TwoQ(..) => "TwoQ",

@@ -878,6 +878,27 @@ where
 			self.flush_buffered_events(&mut buffered_events)?;
 			self.apply_evictions(&mut buffered_events)?;
 
+			// INSTRUMENTATION: the invariant the failing run violated. Sampled on
+			// the same cadence as MIGSTATS so the two can be correlated.
+			{
+				use std::sync::atomic::Ordering;
+				static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+				if TICK.fetch_add(1, Ordering::Relaxed) % 4_096 == 0 {
+					let stack_len = self.policy_stack.as_ref().map_or(0, |s| s.len());
+					let map_len = self.status.live_num_objects() as usize;
+					let (fo, so, fb, sb) = self.policy_stack.as_ref()
+						.map_or((0, 0, 0, 0), |s| (
+							s.fast_object_count(), s.slow_object_count(),
+							s.fast_bytes_used(), s.slow_bytes_used(),
+						));
+					eprintln!(
+						"DIVERGE map={map_len} stack={stack_len} delta={} fallback={} fast_obj={fo} slow_obj={so} fast_b={fb} slow_b={sb}",
+						map_len as i64 - stack_len as i64,
+						crate::ERASE_FALLBACK.load(Ordering::Relaxed),
+					);
+				}
+			}
+
 			// `apply_evictions` runs every outer-loop iteration regardless
 			// of whether `events` was non-empty (unlike the per-event call
 			// above, gated on there being an event to process at all) --

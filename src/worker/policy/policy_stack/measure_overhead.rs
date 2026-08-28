@@ -151,6 +151,7 @@ fn measure_one_point() {
 /// subtracts the size-class-rounded value cost -- NOT the nominal value size.
 /// `nallocx(15)` is 16, and getting that wrong is what made a 15-byte value
 /// look free against a 40-byte tier earlier in this work.
+#[cfg(feature = "hybrid_cache_common")]
 #[test]
 #[ignore]
 fn measure_cache_point() {
@@ -261,6 +262,7 @@ fn measure_value_class() {
 /// `stats.allocated` rather than RSS, ONE point per process, and the caller
 /// samples at POWERS OF TWO.
 #[cfg(not(any(feature = "global_hashtable_pmem", feature = "key_pmem_value_pmem")))]
+#[cfg(feature = "hybrid_cache_common")]
 #[test]
 #[ignore]
 fn measure_object_map_point() {
@@ -288,6 +290,7 @@ fn measure_object_map_point() {
 	core::hint::black_box(&map);
 	println!("MEASURED_MAP {} {} {} {}", n, vsize, after.saturating_sub(base), held);
 }
+#[cfg(feature = "hybrid_cache_common")]
 
 /// Exact struct layout behind the measured object-map row.
 ///

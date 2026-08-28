@@ -410,6 +410,12 @@ impl AtomicStatus {
 		}
 	}
 
+	/// INSTRUMENTATION: live object count on the atomic status, for the
+	/// map-vs-stack divergence sampler in the policy worker.
+	pub fn live_num_objects(&self) -> u64 {
+		self.num_objects.load(Ordering::Acquire)
+	}
+
 	pub fn incr_num_objects(&self) {
 		self.num_objects.fetch_add(1, Ordering::AcqRel);
 	}

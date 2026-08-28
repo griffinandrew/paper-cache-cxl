@@ -20,10 +20,12 @@ use crate::error::CacheError;
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum PaperPolicy {
 	Auto,
+	LfuCompact,
 	Lfu,
 	Fifo,
 	Clock,
 	Sieve,
+	LruCompact,
 	Lru,
 	Mru,
 	TwoQ(f64, f64),
@@ -102,10 +104,12 @@ impl Display for PaperPolicy {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			PaperPolicy::Auto => write!(f, "auto"),
+			PaperPolicy::LfuCompact => write!(f, "lfu-compact"),
 			PaperPolicy::Lfu => write!(f, "lfu"),
 			PaperPolicy::Fifo => write!(f, "fifo"),
 			PaperPolicy::Clock => write!(f, "clock"),
 			PaperPolicy::Sieve => write!(f, "sieve"),
+			PaperPolicy::LruCompact => write!(f, "lru-compact"),
 			PaperPolicy::Lru => write!(f, "lru"),
 			PaperPolicy::Mru => write!(f, "mru"),
 			PaperPolicy::TwoQ(k_in, k_out) => write!(f, "2q-{k_in}-{k_out}"),
@@ -159,10 +163,12 @@ impl FromStr for PaperPolicy {
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
 		let policy = match value {
 			"auto" => PaperPolicy::Auto,
+			"lfu-compact" => PaperPolicy::LfuCompact,
 			"lfu" => PaperPolicy::Lfu,
 			"fifo" => PaperPolicy::Fifo,
 			"clock" => PaperPolicy::Clock,
 			"sieve" => PaperPolicy::Sieve,
+			"lru-compact" => PaperPolicy::LruCompact,
 			"lru" => PaperPolicy::Lru,
 			"mru" => PaperPolicy::Mru,
 			// Order matters and is load-bearing: every guard below also starts

@@ -98,6 +98,17 @@ impl OverheadManager {
 }
 
 /// Returns the per-object policy overhead.
+/// Per-object cost every design pays regardless of policy or tiering: one
+/// object-map row plus the value `Arc` header.
+///
+/// MEASURED at 144.0 B/object (96 map + 48 Arc), R2 = 1.000000, and identical
+/// at 64-byte and 512-byte values. The hybrid designs charge this against the
+/// fast tier via `get_hybrid_dram_shared_overhead`; a non-tiered design has no
+/// fast tier, so without this it went uncharged entirely and `used_size`
+/// understated real DRAM by ~144 B per object.
+const OBJECT_MAP_AND_ARC_OVERHEAD: ObjectSize =
+	OBJECT_MAP_ENTRY_OVERHEAD + ARC_VALUE_HEADER_OVERHEAD;
+
 pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// the overheads are just rough estimates of the number of bytes per object
 
@@ -106,36 +117,46 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 
 		// 24 bytes for the HashMap entry 48 bytes for the HashList entry,
 		// 8 bytes for the HashedKey, 4 bytes for the count
-		PaperPolicy::Lfu => 24 + 48 + 8 + 4,
+		// Slab layout: 16-byte link-only slot plus one index entry
+		// (8-byte key + 4-byte slot + 4-byte frequency), against `Lfu`s
+		// index_map entry + HashList node + key + count, each bucket
+		// carrying its own key-to-node index.
+		PaperPolicy::LfuCompact => 16 + 16 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::Lfu => 24 + 48 + 8 + 4 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
-		PaperPolicy::Fifo => 48 + 8,
+		PaperPolicy::Fifo => 48 + 8 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 1 byte for the visited flag
-		PaperPolicy::Clock => 48 + 8 + 1,
+		PaperPolicy::Clock => 48 + 8 + 1 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 1 byte for the visited flag
-		PaperPolicy::Sieve => 48 + 8 + 1,
+		PaperPolicy::Sieve => 48 + 8 + 1 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
-		PaperPolicy::Lru => 48 + 8,
+		// Slab layout: a 16-byte link-only slot plus one index entry
+		// (8-byte key + 4-byte slot number, no payload), against
+		// `Lru`s 48-byte HashList node + 8-byte key + the HashLists own
+		// separate key-to-node index.
+		PaperPolicy::LruCompact => 16 + 12 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::Lru => 48 + 8 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
-		PaperPolicy::Mru => 48 + 8,
+		PaperPolicy::Mru => 48 + 8 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size
-		PaperPolicy::TwoQ(_, _) => 48 + 8 + 4,
+		PaperPolicy::TwoQ(_, _) => 48 + 8 + 4 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size
-		PaperPolicy::Arc => 48 + 8 + 4,
+		PaperPolicy::Arc => 48 + 8 + 4 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size, 1 byte for the frequency count
-		PaperPolicy::SThreeFifo(_) => 48 + 8 + 4 + 1,
+		PaperPolicy::SThreeFifo(_) => 48 + 8 + 4 + 1 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 24 bytes for the single combined per-key `entries` HashMap entry
@@ -1337,7 +1358,9 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_S
 /// class. Fixed-size, so independent of the trace's value distribution.
 /// Always DRAM-resident: the `Arc` itself is allocated by the global
 /// allocator even when the buffer it points at lives in PMEM.
-#[cfg(feature = "hybrid_cache_common")]
+// Not cfg-gated: every design allocates one object-map row and one value
+// Arc per object, tiered or not, so this term is charged in
+// get_policy_overhead for non-hybrid policies as well.
 const ARC_VALUE_HEADER_OVERHEAD: ObjectSize = 48;
 
 /// Per-object DRAM cost of the object map (`DashMap<HashedKey, Object>`):
@@ -1364,7 +1387,9 @@ const ARC_VALUE_HEADER_OVERHEAD: ObjectSize = 48;
 /// which silently amortised that fixed cost into the per-object term -- at
 /// 1.2M objects the same arithmetic yields 989 B/object, which is what made
 /// the contamination obvious.
-#[cfg(feature = "hybrid_cache_common")]
+// Not cfg-gated: every design allocates one object-map row and one value
+// Arc per object, tiered or not, so this term is charged in
+// get_policy_overhead for non-hybrid policies as well.
 const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 96;
 
 /// Requested-to-resident multiplier for the DRAM metadata reserved above.
@@ -1548,6 +1573,8 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			| PaperPolicy::Clock
 			| PaperPolicy::Sieve
 			| PaperPolicy::Lru
+			| PaperPolicy::LruCompact
+			| PaperPolicy::LfuCompact
 			| PaperPolicy::Mru
 			| PaperPolicy::TwoQ(..)
 			| PaperPolicy::Arc

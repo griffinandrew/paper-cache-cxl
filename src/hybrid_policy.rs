@@ -145,6 +145,8 @@ pub fn admission_tier<K>(
 		| PaperPolicy::Clock
 		| PaperPolicy::Sieve
 		| PaperPolicy::Lru
+		| PaperPolicy::LruCompact
+		| PaperPolicy::LfuCompact
 		| PaperPolicy::Mru
 		| PaperPolicy::TwoQ(..)
 		| PaperPolicy::Arc

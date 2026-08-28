@@ -333,6 +333,12 @@ use typesize::TypeSize;
 use nohash_hasher::NoHashHasher;
 use log::{info, error};
 
+/// INSTRUMENTATION: times the eviction loop fell back to evicting a random
+/// object because the policy stack had no candidate. That path drops the
+/// object from the map WITHOUT removing it from the stack.
+pub static ERASE_FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+
 
 use kwik::{
 	fmt,
@@ -1619,6 +1625,11 @@ where
 		Some(EraseKey::Hashed(hashed_key)) => hashed_key,
 
 		None => {
+			// INSTRUMENTATION: this path removes an object from the MAP without
+			// informing the eviction STACK, which is exactly the shape of the
+			// observed map>stack divergence. Counted so the hypothesis is
+			// testable rather than plausible.
+			crate::ERASE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 			// the policy has run out of keys to evict (either it's a mini stack or
 			// something went wrong during policy reconstruction) so we fall back
 			// to evicting a random object
@@ -1688,6 +1699,11 @@ where
 		Some(EraseKey::Hashed(hashed_key)) => hashed_key,
 
 		None => {
+			// INSTRUMENTATION: this path removes an object from the MAP without
+			// informing the eviction STACK, which is exactly the shape of the
+			// observed map>stack divergence. Counted so the hypothesis is
+			// testable rather than plausible.
+			crate::ERASE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 			// the policy has run out of keys to evict (either it's a mini stack or
 			// something went wrong during policy reconstruction) so we fall back
 			// to evicting a random object

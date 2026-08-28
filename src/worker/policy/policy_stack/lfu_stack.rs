@@ -145,7 +145,9 @@ impl PolicyStack for LfuStack {
 
 			if next_count_stack.count == prev_count + 1 {
 				next_count_stack.push(key);
-				self.index_map.insert(key, next_count_stack_index);
+				if let Some(slot) = self.index_map.get_mut(&key) {
+					*slot = next_count_stack_index;
+				}
 
 				if prev_is_empty {
 					self.count_stacks.remove(prev_count_stack_index);
@@ -159,7 +161,9 @@ impl PolicyStack for LfuStack {
 		count_stack.push(key);
 
 		let count_stack_index = self.count_stacks.insert_after(prev_count_stack_index, count_stack);
-		self.index_map.insert(key, count_stack_index);
+		if let Some(slot) = self.index_map.get_mut(&key) {
+			*slot = count_stack_index;
+		}
 
 		if prev_is_empty {
 			self.count_stacks.remove(prev_count_stack_index);

@@ -358,15 +358,56 @@ where
         })
     }
 
-    /// Moves an existing value to the front of the list. `push_front` already
-    /// performs a remove-then-prepend for a value that is already present, so
-    /// this is a thin wrapper over it (a no-op if `value` isn't present).
+    /// Moves an existing value to the front of the list by SPLICING the node
+    /// in place. A no-op if `value` is absent or already at the front.
     /// Matches `kwik::collections::HashList::move_front`'s `&T` signature.
+    ///
+    /// Deliberately NOT `remove` + `push_front` (which an earlier version
+    /// was): that pattern costs two hash probes, a free-list round trip and a
+    /// node rewrite per call, and this method runs once per GET hit on the
+    /// stacks that use this type. With the list in far memory those are
+    /// dependent CXL round trips, and the measured effect was the policy
+    /// worker falling to 48.0k demotions/s against 91.5k in DRAM (-47.5%),
+    /// which let the cache overrun its budget -- 133% of max_size on the LFU
+    /// baseline, an oom-kill on the LRU baseline. The splice touches at most
+    /// four nodes and neither the hash map nor the free list.
     pub fn move_front(&mut self, value: &T) {
-        if self.lookup.contains_key(value) {
-            let owned = value.clone();
-            self.push_front(owned);
+        let Some(&idx) = self.lookup.get(value) else { return };
+        if self.head == Some(idx) {
+            return;
         }
+
+        // Unlink from the current position.
+        let (prev, next) = {
+            let Some(Some(node)) = self.entries.get(idx) else { return };
+            (node.prev, node.next)
+        };
+        if let Some(prev_idx) = prev {
+            if let Some(Some(prev_node)) = self.entries.get_mut(prev_idx) {
+                prev_node.next = next;
+            }
+        }
+        if let Some(next_idx) = next {
+            if let Some(Some(next_node)) = self.entries.get_mut(next_idx) {
+                next_node.prev = prev;
+            }
+        } else {
+            // The node was the tail; its predecessor is the tail now.
+            self.tail = prev;
+        }
+
+        // Relink at the front.
+        let old_head = self.head;
+        if let Some(Some(node)) = self.entries.get_mut(idx) {
+            node.prev = None;
+            node.next = old_head;
+        }
+        if let Some(old_head_idx) = old_head {
+            if let Some(Some(old_head_node)) = self.entries.get_mut(old_head_idx) {
+                old_head_node.prev = Some(idx);
+            }
+        }
+        self.head = Some(idx);
     }
 
     /// Pushes a value to the front of the list
@@ -751,5 +792,63 @@ mod tests {
         assert!(!list.contains(&1));
         assert!(!list.contains(&2));
         assert!(!list.contains(&3));
+    }
+}
+
+#[cfg(test)]
+mod structural_invariants {
+    use super::*;
+    use crate::NoHasher;
+
+    /// Walks the list and checks it against `lookup`. Returns (forward, backward).
+    fn walk(l: &PmemHashList<crate::HashedKey, NoHasher>) -> (usize, usize) {
+        let mut n = 0usize;
+        let mut cur = l.head;
+        let mut seen = std::collections::HashSet::new();
+        while let Some(i) = cur {
+            assert!(seen.insert(i), "cycle in forward links at slot {i}");
+            let node = l.entries[i].as_ref().expect("forward link into a freed slot");
+            n += 1;
+            cur = node.next;
+        }
+        let mut m = 0usize;
+        let mut cur = l.tail;
+        let mut seen2 = std::collections::HashSet::new();
+        while let Some(i) = cur {
+            assert!(seen2.insert(i), "cycle in backward links at slot {i}");
+            let node = l.entries[i].as_ref().expect("backward link into a freed slot");
+            m += 1;
+            cur = node.prev;
+        }
+        (n, m)
+    }
+
+    /// Randomised push_front / move_front / remove / pop_back, checking after
+    /// every operation that the links and the lookup map still agree.
+    #[test]
+    fn links_and_lookup_stay_consistent_under_churn() {
+        let mut l: PmemHashList<crate::HashedKey, NoHasher> = PmemHashList::with_hasher(NoHasher::default());
+        let mut x: u64 = 0x243F_6A88_85A3_08D3;
+        for step in 0..50_000u64 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let key = (x >> 11) % 500;
+            match step % 8 {
+                0..=3 => l.push_front(key),
+                4..=5 => l.move_front(&key),
+                6 => { let _ = l.remove(&key); },
+                _ => { let _ = l.pop_back(); },
+            }
+            let (fwd, bwd) = walk(&l);
+            assert_eq!(
+                fwd, l.len(),
+                "step {step}: {fwd} nodes reachable from head but lookup holds {} \
+                 -- keys in lookup that are not in the list can never be evicted",
+                l.len(),
+            );
+            assert_eq!(bwd, l.len(), "step {step}: backward walk sees {bwd}, lookup {}", l.len());
+            for k in l.lookup.keys() {
+                assert!(l.contains(k), "step {step}: key {k} in lookup but not findable");
+            }
+        }
     }
 }
