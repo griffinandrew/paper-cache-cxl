@@ -423,6 +423,11 @@ hybrid_cache_common = ["numa_jemalloc"]
 # with `numactl --membind=0` if the whole process must be bound.
 numa_jemalloc = []
 
+# Installs plain tikv-jemalloc as `#[global_allocator]` instead of
+# `numa_alloc::FastAlloc`. Diagnostic only: isolates the cost of the custom
+# NUMA arena/extent-hook allocator from the cache itself. The slow-tier
+# `Hybrid` allocator is untouched, so tiering still works.
+stock_jemalloc = []
 
 # Routes all-DRAM value buffers (`BufferDRAM`) to their own jemalloc arenas and
 # their own explicit per-thread tcache, instead of the process-wide default.

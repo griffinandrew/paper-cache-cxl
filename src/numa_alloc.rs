@@ -1816,6 +1816,53 @@ node0_grew={grew0} node1_grew={grew1} -> on_target={target} elsewhere={other}"
 }
 
 
+/// Plain jemalloc: no arena binding, no NUMA extent hooks, no tcache flags --
+/// exactly what `raw_alloc`'s unbound fallback path already does. Exists to
+/// answer whether the custom allocator is itself the per-operation cost.
+#[cfg(feature = "stock_jemalloc")]
+pub struct StockAlloc;
+
+#[cfg(feature = "stock_jemalloc")]
+impl StockAlloc {
+	#[inline]
+	fn align_flags(layout: std::alloc::Layout) -> c_int {
+		if layout.align() > 1 {
+			mallocx_lg_align(layout.align().trailing_zeros())
+		} else {
+			0
+		}
+	}
+}
+
+#[cfg(feature = "stock_jemalloc")]
+unsafe impl std::alloc::GlobalAlloc for StockAlloc {
+	#[inline]
+	unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+		if layout.size() == 0 {
+			return layout.align() as *mut u8;
+		}
+		unsafe { mallocx(layout.size(), Self::align_flags(layout)) as *mut u8 }
+	}
+
+	#[inline]
+	unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+		if layout.size() == 0 {
+			return layout.align() as *mut u8;
+		}
+		let flags = Self::align_flags(layout) | MALLOCX_ZERO;
+		unsafe { mallocx(layout.size(), flags) as *mut u8 }
+	}
+
+	#[inline]
+	unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+		if layout.size() == 0 {
+			return;
+		}
+		unsafe { sdallocx(ptr as *mut c_void, layout.size(), Self::align_flags(layout)) }
+	}
+}
+
+
 // ---------------------------------------------------------------------------
 // segregated value pool
 // ---------------------------------------------------------------------------

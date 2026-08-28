@@ -21,8 +21,13 @@ compile_error!("Cannot enable both 'hashbrown_dram' and 'global_hashtable_pmem' 
 /// jemalloc is built `JEMALLOC_PREFIX=_rjem_` and so does not interpose
 /// `malloc`. Pair with `numactl --membind=0` when the whole process must be
 /// bound.
+#[cfg(not(feature = "stock_jemalloc"))]
 #[global_allocator]
 static GLOBAL: numa_alloc::FastAlloc = numa_alloc::NumaAlloc;
+
+#[cfg(feature = "stock_jemalloc")]
+#[global_allocator]
+static GLOBAL_STOCK: numa_alloc::StockAlloc = numa_alloc::StockAlloc;
 
 pub mod numa_alloc;
 
@@ -561,6 +566,81 @@ impl<K, V, S> Drop for PaperCache<K, V, S> {
 		// Best-effort: if a worker thread already exited on its own for some
 		// other reason, its channel is already disconnected; `send` returning
 		// `Err` here just means there's nothing left to signal, not a bug.
+		if GI_N.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+			use std::sync::atomic::Ordering::Relaxed;
+			let n = GI_N.load(Relaxed).max(1);
+			eprintln!(
+				"GIPROF n={} hash={} lookup={} copy={} bcast={} (avg ns/hit; Instant overhead ~20-40ns/step, equal across configs)",
+				n,
+				GI_HASH.load(Relaxed) / n,
+				GI_LOOKUP.load(Relaxed) / n,
+				GI_COPY.load(Relaxed) / n,
+				GI_BCAST.load(Relaxed) / n,
+			);
+			if let Ok(v) = GI_SAMPLES.lock() {
+				let pct = |xs: &mut Vec<u64>, f: f64| -> u64 {
+					if xs.is_empty() {
+						return 0;
+					}
+					xs.sort_unstable();
+					xs[(((xs.len() - 1) as f64) * f).round() as usize]
+				};
+				// (label, payload cap, tier filter: 2 = any, 1 = fast only, 0 = slow only)
+				for (label, keep, tier) in [
+					("ALL", usize::MAX, 2u64),
+					("SMALL<=256B", 256, 2),
+					("SMALL-FAST", 256, 1),
+					("SMALL-SLOW", 256, 0),
+				] {
+					let sel: Vec<&[u64; 6]> = v
+						.iter()
+						.filter(|s| (s[0] as usize) <= keep && (tier == 2 || s[5] == tier))
+						.collect();
+					if sel.is_empty() {
+						continue;
+					}
+					let mut cols: [Vec<u64>; 5] = Default::default();
+					for s in &sel {
+						for k in 0..4 {
+							cols[k].push(s[k + 1]);
+						}
+						// Per-op total: the quantity whose median the benchmark reports.
+						cols[4].push(s[1] + s[2] + s[3] + s[4]);
+					}
+					let mut line = format!("GIPCT {} n={}", label, sel.len());
+					for (name, col) in ["hash", "lookup", "copy", "bcast", "TOTAL"].iter().zip(cols.iter_mut()) {
+						line += &format!(
+							" {}[p25={} p50={} p75={} p90={}]",
+							name,
+							pct(col, 0.25),
+							pct(col, 0.50),
+							pct(col, 0.75),
+							pct(col, 0.90),
+						);
+					}
+					eprintln!("{}", line);
+				}
+				// Joint stall structure on the median population. Equal step
+				// MARGINALS with unequal TOTAL medians means the difference is in
+				// co-occurrence: scattered stalls push the median op over a stall;
+				// concentrated stalls leave the median op clean.
+				let small: Vec<&[u64; 6]> = v.iter().filter(|s| (s[0] as usize) <= 256).collect();
+				if !small.is_empty() {
+					let n = small.len() as f64;
+					let p = |c: usize| c as f64 / n;
+					let ls = small.iter().filter(|s| s[2] > 250).count();
+					let cs = small.iter().filter(|s| s[3] > 150).count();
+					let bs = small.iter().filter(|s| s[4] > 150).count();
+					let lc = small.iter().filter(|s| s[2] > 250 && s[3] > 150).count();
+					let any = small.iter().filter(|s| s[2] > 250 || s[3] > 150 || s[4] > 150).count();
+					eprintln!(
+						"GICORR SMALL n={} P(lookup>250)={:.3} P(copy>150)={:.3} P(bcast>150)={:.3} P(lookup&copy)={:.3} P(any)={:.3}",
+						small.len(), p(ls), p(cs), p(bs), p(lc), p(any),
+					);
+				}
+			}
+		}
+
 		let _ = self.workers.send(WorkerEvent::Shutdown);
 
 		for handle in self.worker_handles.drain(..) {
@@ -867,6 +947,88 @@ where
 		};
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+
+		result
+	}
+
+	/// Diagnostic twin of [`Self::get`] that copies a hit into a caller-owned
+	/// buffer instead of allocating a fresh `Vec` per call.
+	///
+	/// `get()` fuses two independent costs: locating and reading the value --
+	/// which is what a tiering design changes -- and allocating the buffer to
+	/// return it in, which is what the allocator configuration changes. Measured
+	/// on Twitter cluster13 (2026-08-28) the second term dominated the first at
+	/// the median, because the median value is 123 B while the mean is 4.9 KB.
+	/// Comparing two cache designs through `get()` therefore compares their
+	/// allocator behaviour as much as their cache behaviour; this method exists
+	/// to measure them apart. See the `segregated_value_arena` feature.
+	#[cfg(not(feature = "enable_tiering_manager"))]
+	pub fn get_into(&self, key: &K, out: &mut Vec<u8>) -> Result<(), CacheError> {
+		// Sampled step profiler -- see the GI_* statics at the bottom of this
+		// file. One call in 64; hits only, matching what GET latency measures.
+		let prof = gi_prof_enabled()
+			&& GI_TICK.with(|c| {
+				let t = c.get();
+				c.set(t.wrapping_add(1));
+				t & 63 == 0
+			});
+		let t0 = if prof { Some(std::time::Instant::now()) } else { None };
+
+		let hashed_key = self.hash_key(key);
+		let t1 = if prof { Some(std::time::Instant::now()) } else { None };
+
+		let maybe_data = match self.objects.get_ref(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => Some(object.data()),
+			_ => None,
+		};
+		let t2 = if prof { Some(std::time::Instant::now()) } else { None };
+
+		// Which tier served this hit (1 = fast/DRAM; the all-DRAM shape never
+		// reassigns it). Read only by the sampled profiler below.
+		#[allow(unused_mut)]
+		let mut gi_fast: u64 = 1;
+
+		let result = match maybe_data {
+			Some(arc_val) => {
+				self.status.incr_hits();
+				out.clear();
+				out.extend_from_slice(AsRef::<[u8]>::as_ref(&*arc_val));
+				Ok(())
+			},
+
+			None => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
+		let t3 = if prof { Some(std::time::Instant::now()) } else { None };
+
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+
+		if let (Some(t0), Some(t1), Some(t2), Some(t3), true) = (t0, t1, t2, t3, result.is_ok()) {
+			let t4 = std::time::Instant::now();
+			use std::sync::atomic::Ordering::Relaxed;
+			let (h, l, c, b) = (
+				(t1 - t0).as_nanos() as u64,
+				(t2 - t1).as_nanos() as u64,
+				(t3 - t2).as_nanos() as u64,
+				(t4 - t3).as_nanos() as u64,
+			);
+			GI_N.fetch_add(1, Relaxed);
+			GI_HASH.fetch_add(h, Relaxed);
+			GI_LOOKUP.fetch_add(l, Relaxed);
+			GI_COPY.fetch_add(c, Relaxed);
+			GI_BCAST.fetch_add(b, Relaxed);
+			// Off the timed steps (after t4); the lock is uncontended at 1-in-64.
+			if let Ok(mut v) = GI_SAMPLES.lock() {
+				if v.capacity() == 0 {
+					v.reserve_exact(1 << 20);
+				}
+				if v.len() < (1 << 20) {
+					v.push([out.len() as u64, h, l, c, b, gi_fast]);
+				}
+			}
+		}
 
 		result
 	}
@@ -2166,6 +2328,89 @@ where
 		};
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+
+		result
+	}
+
+	/// Diagnostic twin of [`Self::get`] that copies a hit into a caller-owned
+	/// buffer instead of allocating a fresh `Vec` per call.
+	///
+	/// `get()` fuses two independent costs: locating and reading the value --
+	/// which is what a tiering design changes -- and allocating the buffer to
+	/// return it in, which is what the allocator configuration changes. Measured
+	/// on Twitter cluster13 (2026-08-28) the second term dominated the first at
+	/// the median, because the median value is 123 B while the mean is 4.9 KB.
+	/// Comparing two cache designs through `get()` therefore compares their
+	/// allocator behaviour as much as their cache behaviour; this method exists
+	/// to measure them apart. See the `segregated_value_arena` feature.
+	#[cfg(not(feature = "enable_tiering_manager"))]
+	pub fn get_into(&self, key: &K, out: &mut Vec<u8>) -> Result<(), CacheError> {
+		// Sampled step profiler -- see the GI_* statics at the bottom of this
+		// file. One call in 64; hits only, matching what GET latency measures.
+		let prof = gi_prof_enabled()
+			&& GI_TICK.with(|c| {
+				let t = c.get();
+				c.set(t.wrapping_add(1));
+				t & 63 == 0
+			});
+		let t0 = if prof { Some(std::time::Instant::now()) } else { None };
+
+		let hashed_key = self.hash_key(key);
+		let t1 = if prof { Some(std::time::Instant::now()) } else { None };
+
+		let maybe_data = match self.objects.get_ref(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() => Some(object.data()),
+			_ => None,
+		};
+		let t2 = if prof { Some(std::time::Instant::now()) } else { None };
+
+		// Which tier served this hit (1 = fast/DRAM; the all-DRAM shape never
+		// reassigns it). Read only by the sampled profiler below.
+		#[allow(unused_mut)]
+		let mut gi_fast: u64 = 1;
+
+		let result = match maybe_data {
+			Some(arc_val) => {
+				self.status.incr_hits();
+				out.clear();
+				gi_fast = if arc_val.is_fast() { 1 } else { 0 };
+				out.extend_from_slice(arc_val.as_ref().as_ref());
+				Ok(())
+			},
+
+			None => {
+				self.status.incr_misses();
+				Err(CacheError::KeyNotFound)
+			},
+		};
+		let t3 = if prof { Some(std::time::Instant::now()) } else { None };
+
+		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+
+		if let (Some(t0), Some(t1), Some(t2), Some(t3), true) = (t0, t1, t2, t3, result.is_ok()) {
+			let t4 = std::time::Instant::now();
+			use std::sync::atomic::Ordering::Relaxed;
+			let (h, l, c, b) = (
+				(t1 - t0).as_nanos() as u64,
+				(t2 - t1).as_nanos() as u64,
+				(t3 - t2).as_nanos() as u64,
+				(t4 - t3).as_nanos() as u64,
+			);
+			GI_N.fetch_add(1, Relaxed);
+			GI_HASH.fetch_add(h, Relaxed);
+			GI_LOOKUP.fetch_add(l, Relaxed);
+			GI_COPY.fetch_add(c, Relaxed);
+			GI_BCAST.fetch_add(b, Relaxed);
+			// Off the timed steps (after t4); the lock is uncontended at 1-in-64.
+			if let Ok(mut v) = GI_SAMPLES.lock() {
+				if v.capacity() == 0 {
+					v.reserve_exact(1 << 20);
+				}
+				if v.len() < (1 << 20) {
+					v.push([out.len() as u64, h, l, c, b, gi_fast]);
+				}
+			}
+		}
 
 		result
 	}
@@ -3574,4 +3819,33 @@ mod compact_parity {
 			}
 		}
 	}
+}
+
+
+// ---------------------------------------------------------------------------
+// Sampled step profiler for `get_into` (diagnostic; GETINTO_PROFILE=1).
+//
+// Exists to ATTRIBUTE a measured per-GET latency contrast to a specific step
+// of the read path -- hash, map lookup + Arc clone, copy, event send -- after
+// a 199 ns p50 difference between the all-DRAM and hybrid builds survived the
+// removal of every allocation from the measured region (2026-08-28).
+// ---------------------------------------------------------------------------
+
+static GI_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GI_HASH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GI_LOOKUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GI_COPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GI_BCAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+	static GI_TICK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Sampled per-hit tuples: [payload_len, hash_ns, lookup_ns, copy_ns, bcast_ns, served_from_fast].
+/// Bounded at 2^20 entries; reported as per-step percentiles at Drop.
+static GI_SAMPLES: std::sync::Mutex<Vec<[u64; 6]>> = std::sync::Mutex::new(Vec::new());
+
+fn gi_prof_enabled() -> bool {
+	static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*FLAG.get_or_init(|| std::env::var("GETINTO_PROFILE").map(|v| v == "1").unwrap_or(false))
 }
