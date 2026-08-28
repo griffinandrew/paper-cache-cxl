@@ -125,6 +125,15 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		PaperPolicy::Lfu => 24 + 48 + 8 + 4 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
+		// Slab layout: a 16-byte link-only slot plus one index entry, against
+		// the original's 48-byte HashList node, key, and separate index. The
+		// CLOCK/SIEVE visited bit and MRU's held key live in the index value,
+		// so they cost nothing beyond it.
+		PaperPolicy::FifoCompact => 16 + 12 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::ClockCompact => 16 + 13 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::SieveCompact => 16 + 13 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::MruCompact => 16 + 12 + OBJECT_MAP_AND_ARC_OVERHEAD,
+
 		PaperPolicy::Fifo => 48 + 8 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
@@ -1575,6 +1584,10 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			| PaperPolicy::Lru
 			| PaperPolicy::LruCompact
 			| PaperPolicy::LfuCompact
+			| PaperPolicy::FifoCompact
+			| PaperPolicy::ClockCompact
+			| PaperPolicy::SieveCompact
+			| PaperPolicy::MruCompact
 			| PaperPolicy::Mru
 			| PaperPolicy::TwoQ(..)
 			| PaperPolicy::Arc

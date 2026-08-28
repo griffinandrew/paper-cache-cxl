@@ -57,6 +57,10 @@ mod s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stack;
 mod s3_fifo_lazy_demotion_fast_admission_reprieve_compact_hybrid_stack;
 mod s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stack;
 mod s3_fifo_lazy_demotion_reprieve_compact_hybrid_stack;
+mod fifo_compact_stack;
+mod clock_compact_stack;
+mod sieve_compact_stack;
+mod mru_compact_stack;
 mod s3_fifo_lazy_demotion_reprieve_hybrid_stack;
 mod s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_compact_hybrid_stack;
 mod s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_stack;
@@ -70,6 +74,10 @@ use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
 		lfu_compact_stack::LfuCompactStack,
+		fifo_compact_stack::FifoCompactStack,
+		clock_compact_stack::ClockCompactStack,
+		sieve_compact_stack::SieveCompactStack,
+		mru_compact_stack::MruCompactStack,
 		lfu_stack::LfuStack,
 		fifo_stack::FifoStack,
 		clock_stack::ClockStack,
@@ -425,6 +433,10 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 	match policy {
 		PaperPolicy::Auto => Box::new(LfuStack::default()),
 		PaperPolicy::LfuCompact => Box::new(LfuCompactStack::default()),
+		PaperPolicy::FifoCompact => Box::new(FifoCompactStack::default()),
+		PaperPolicy::ClockCompact => Box::new(ClockCompactStack::default()),
+		PaperPolicy::SieveCompact => Box::new(SieveCompactStack::default()),
+		PaperPolicy::MruCompact => Box::new(MruCompactStack::default()),
 		PaperPolicy::Lfu => Box::new(LfuStack::default()),
 		PaperPolicy::Fifo => Box::new(FifoStack::default()),
 		PaperPolicy::Clock => Box::new(ClockStack::default()),
@@ -987,7 +999,7 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 50;
+	const POLICY_VARIANT_COUNT: usize = 54;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the 18
 	/// tiered designs this crate exists to compare.
@@ -1007,6 +1019,10 @@ mod init_policy_stack_tests {
 	const POLICY_DISPATCH_TABLE: [(PaperPolicy, PaperPolicy); POLICY_VARIANT_COUNT] = [
 		(PaperPolicy::Auto, PaperPolicy::Auto),
 		(PaperPolicy::LfuCompact, PaperPolicy::LfuCompact),
+		(PaperPolicy::FifoCompact, PaperPolicy::FifoCompact),
+		(PaperPolicy::ClockCompact, PaperPolicy::ClockCompact),
+		(PaperPolicy::SieveCompact, PaperPolicy::SieveCompact),
+		(PaperPolicy::MruCompact, PaperPolicy::MruCompact),
 		(PaperPolicy::Lfu, PaperPolicy::Lfu),
 		(PaperPolicy::Fifo, PaperPolicy::Fifo),
 		(PaperPolicy::Clock, PaperPolicy::Clock),
@@ -1067,6 +1083,10 @@ mod init_policy_stack_tests {
 		match policy {
 			PaperPolicy::Auto => "Auto",
 			PaperPolicy::LfuCompact => "LfuCompact",
+			PaperPolicy::FifoCompact => "FifoCompact",
+			PaperPolicy::ClockCompact => "ClockCompact",
+			PaperPolicy::SieveCompact => "SieveCompact",
+			PaperPolicy::MruCompact => "MruCompact",
 			PaperPolicy::Lfu => "Lfu",
 			PaperPolicy::Fifo => "Fifo",
 			PaperPolicy::Clock => "Clock",

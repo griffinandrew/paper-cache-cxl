@@ -25,6 +25,10 @@
 //! `LfuStack` ignores the size argument, so this does too: byte accounting
 //! belongs to the cache.
 
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+use std::collections::HashMap;
+#[cfg(feature = "eviction_stacks_pmem")]
+use hashbrown::HashMap;
 use std::collections::BTreeMap;
 
 use crate::{
@@ -50,25 +54,72 @@ const _: () = assert!(
 	"Slot must stay 16 bytes: it is the per-object cost this design exists to minimise",
 );
 
+// Under `eviction_stacks_pmem` every structure here is allocated through the
+// crate-wide `Hybrid` allocator (the far CXL/PMEM node), matching
+// `CompactQueueSet` and `CompactFrequencyChain`.
+//
+// Without this the feature was a SILENT NO-OP for this stack. `LruCompactStack`
+// is a thin wrapper over `CompactQueueSet` and inherited the relocation for
+// free; this one owns its collections directly and kept them in DRAM, so a
+// `lfu-compact` run built with the feature measured an unchanged stack while
+// `get_policy_overhead` was (separately) still charging its bytes to the DRAM
+// budget.
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type SlotVec = Vec<Slot>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type SlotVec = Vec<Slot, crate::Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type FreeVec = Vec<u32>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type FreeVec = Vec<u32, crate::Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type Index = HashMap<HashedKey, (u32, u32), crate::NoHasher>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type Index = HashMap<HashedKey, (u32, u32), crate::NoHasher, crate::Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type BucketMap = BTreeMap<u32, (u32, u32)>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type BucketMap = BTreeMap<u32, (u32, u32), crate::Hybrid>;
+
+/// The four empty collections, built in whichever allocator the feature selects.
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+fn empty_collections() -> (SlotVec, FreeVec, Index, BucketMap) {
+	(
+		Vec::new(),
+		Vec::new(),
+		HashMap::with_hasher(crate::NoHasher::default()),
+		BTreeMap::new(),
+	)
+}
+
+#[cfg(feature = "eviction_stacks_pmem")]
+fn empty_collections() -> (SlotVec, FreeVec, Index, BucketMap) {
+	(
+		Vec::new_in(crate::Hybrid),
+		Vec::new_in(crate::Hybrid),
+		HashMap::with_hasher_in(crate::NoHasher::default(), crate::Hybrid),
+		BTreeMap::new_in(crate::Hybrid),
+	)
+}
+
 pub struct LfuCompactStack {
-	slots: Vec<Slot>,
-	free: Vec<u32>,
+	slots: SlotVec,
+	free: FreeVec,
 	/// key -> (slot, frequency). One probe returns both, which is the whole
 	/// point: `LfuStack` needs index_map -> count_stacks -> node.
-	index: std::collections::HashMap<HashedKey, (u32, u32), crate::NoHasher>,
+	index: Index,
 	/// frequency -> (head, tail) of that bucket's intrusive list. Ordered, so
 	/// the minimum frequency is the first entry — that is the eviction victim.
-	buckets: BTreeMap<u32, (u32, u32)>,
+	buckets: BucketMap,
 }
 
 impl Default for LfuCompactStack {
 	fn default() -> Self {
-		LfuCompactStack {
-			slots: Vec::new(),
-			free: Vec::new(),
-			index: std::collections::HashMap::with_hasher(crate::NoHasher::default()),
-			buckets: BTreeMap::new(),
-		}
+		let (slots, free, index, buckets) = empty_collections();
+		LfuCompactStack { slots, free, index, buckets }
 	}
 }
 

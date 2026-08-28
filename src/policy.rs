@@ -21,6 +21,15 @@ use crate::error::CacheError;
 pub enum PaperPolicy {
 	Auto,
 	LfuCompact,
+
+	/// Slab-layout counterparts of the single-queue designs. Same policy,
+	/// different storage -- and unlike the `HashList` originals these honour
+	/// `eviction_stacks_pmem`, because `CompactQueueSet` is
+	/// allocator-parameterised.
+	FifoCompact,
+	ClockCompact,
+	SieveCompact,
+	MruCompact,
 	Lfu,
 	Fifo,
 	Clock,
@@ -105,6 +114,10 @@ impl Display for PaperPolicy {
 		match self {
 			PaperPolicy::Auto => write!(f, "auto"),
 			PaperPolicy::LfuCompact => write!(f, "lfu-compact"),
+			PaperPolicy::FifoCompact => write!(f, "fifo-compact"),
+			PaperPolicy::ClockCompact => write!(f, "clock-compact"),
+			PaperPolicy::SieveCompact => write!(f, "sieve-compact"),
+			PaperPolicy::MruCompact => write!(f, "mru-compact"),
 			PaperPolicy::Lfu => write!(f, "lfu"),
 			PaperPolicy::Fifo => write!(f, "fifo"),
 			PaperPolicy::Clock => write!(f, "clock"),
@@ -164,6 +177,10 @@ impl FromStr for PaperPolicy {
 		let policy = match value {
 			"auto" => PaperPolicy::Auto,
 			"lfu-compact" => PaperPolicy::LfuCompact,
+			"fifo-compact" => PaperPolicy::FifoCompact,
+			"clock-compact" => PaperPolicy::ClockCompact,
+			"sieve-compact" => PaperPolicy::SieveCompact,
+			"mru-compact" => PaperPolicy::MruCompact,
 			"lfu" => PaperPolicy::Lfu,
 			"fifo" => PaperPolicy::Fifo,
 			"clock" => PaperPolicy::Clock,
