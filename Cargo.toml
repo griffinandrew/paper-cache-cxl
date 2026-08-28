@@ -43,7 +43,15 @@ allocator-api2 =  "0.2.21"
 sysinfo = "=0.33"
 
 
+# The cache served over TCP. Behind `server` so a library consumer never
+# builds it, and so the binary's argument handling stays out of the lib.
+[[bin]]
+name = "paper-server"
+path = "src/bin/paper_server.rs"
+required-features = ["server"]
+
 [features]
+server = ["hybrid_cache_common"]
 # Core feature to enable key and value storage in PMEM
 key_value_pmem = ["numa_jemalloc"]
 
