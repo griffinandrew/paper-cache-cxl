@@ -30,6 +30,12 @@ pub enum PaperPolicy {
 	ClockCompact,
 	SieveCompact,
 	MruCompact,
+
+	/// Faithful three-queue 2Q over the compact slab layout. Takes the
+	/// same two ratios as [`PaperPolicy::TwoQ`] and evicts in exactly the
+	/// same order; only the per-object bookkeeping is cheaper.
+	/// `2q-compact-<k_in>-<k_out>`.
+	TwoQCompact(f64, f64),
 	Lfu,
 	Fifo,
 	Clock,
@@ -40,6 +46,11 @@ pub enum PaperPolicy {
 	TwoQ(f64, f64),
 	Arc,
 	SThreeFifo(f64),
+
+	/// S3-FIFO over the compact slab layout. Same ratio as
+	/// [`PaperPolicy::SThreeFifo`] and the same eviction order; only the
+	/// per-object bookkeeping is cheaper. `s3-fifo-compact-<ratio>`.
+	SThreeFifoCompact(f64),
 	LruHybrid,
 	LfuHybrid,
 
@@ -126,8 +137,10 @@ impl Display for PaperPolicy {
 			PaperPolicy::Lru => write!(f, "lru"),
 			PaperPolicy::Mru => write!(f, "mru"),
 			PaperPolicy::TwoQ(k_in, k_out) => write!(f, "2q-{k_in}-{k_out}"),
+			PaperPolicy::TwoQCompact(k_in, k_out) => write!(f, "2q-compact-{k_in}-{k_out}"),
 			PaperPolicy::Arc => write!(f, "arc"),
 			PaperPolicy::SThreeFifo(ratio) => write!(f, "s3-fifo-{ratio}"),
+			PaperPolicy::SThreeFifoCompact(ratio) => write!(f, "s3-fifo-compact-{ratio}"),
 			PaperPolicy::LruHybrid => write!(f, "lru-hybrid"),
 			PaperPolicy::LfuHybrid => write!(f, "lfu-hybrid"),
 			PaperPolicy::TwoQCompactHybrid(k_in) => write!(f, "2q-compact-hybrid-{k_in}"),
@@ -203,6 +216,8 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("2q-ghost-compact-hybrid-") => parse_two_q_ghost_compact_hybrid(value)?,
 			value if value.starts_with("2q-ghost-hybrid-") => parse_two_q_ghost_hybrid(value)?,
 			value if value.starts_with("2q-compact-hybrid-") => parse_two_q_compact_hybrid(value)?,
+			// Must follow "2q-compact-hybrid-", which it is a prefix of.
+			value if value.starts_with("2q-compact-") => parse_two_q_compact(value)?,
 			value if value.starts_with("2q-hybrid-") => parse_two_q_hybrid(value)?,
 			value if value.starts_with("2q-") => parse_two_q(value)?,
 			"arc" => PaperPolicy::Arc,
@@ -215,6 +230,8 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("s3-fifo-ghost-compact-hybrid-") => parse_s_three_fifo_ghost_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-ghost-hybrid-") => parse_s_three_fifo_ghost_hybrid(value)?,
 			value if value.starts_with("s3-fifo-compact-hybrid-") => parse_s_three_fifo_compact_hybrid(value)?,
+			// Must follow "s3-fifo-compact-hybrid-", which it is a prefix of.
+			value if value.starts_with("s3-fifo-compact-") => parse_s_three_fifo_compact(value)?,
 			value if value.starts_with("s3-fifo-hybrid-") => parse_s_three_fifo_hybrid(value)?,
 			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-compact-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_midpoint_reprieve_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-midpoint-reprieve-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid(value)?,
@@ -274,6 +291,34 @@ impl Visitor<'_> for PaperPolicyVisitor {
 		PaperPolicy::from_str(value)
 			.map_err(|err| E::custom(err.to_string()))
 	}
+}
+
+fn parse_two_q_compact(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "2q-compact-"
+	let tokens = value[11..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 2 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(k_in) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	let Ok(k_out) = tokens[1].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if k_in + k_out > 1.0
+		|| !(0.0..=1.0).contains(&k_in)
+		|| !(0.0..=1.0).contains(&k_out)
+	{
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::TwoQCompact(k_in, k_out))
 }
 
 fn parse_two_q(value: &str) -> Result<PaperPolicy, CacheError> {
@@ -534,6 +579,27 @@ fn parse_two_q_full_fast_admission_hybrid(value: &str) -> Result<PaperPolicy, Ca
 	}
 
 	Ok(PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out))
+}
+
+fn parse_s_three_fifo_compact(value: &str) -> Result<PaperPolicy, CacheError> {
+	// skip the "s3-fifo-compact-"
+	let tokens = value[16..]
+		.split('-')
+		.collect::<Vec<&str>>();
+
+	if tokens.len() != 1 {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	let Ok(ratio) = tokens[0].parse::<f64>() else {
+		return Err(CacheError::InvalidPolicy);
+	};
+
+	if !(0.0..1.0).contains(&ratio) {
+		return Err(CacheError::InvalidPolicy);
+	}
+
+	Ok(PaperPolicy::SThreeFifoCompact(ratio))
 }
 
 fn parse_s_three_fifo(value: &str) -> Result<PaperPolicy, CacheError> {
@@ -1112,6 +1178,74 @@ mod tests {
 			"2q-fast-admission-hybrid-0.2".parse::<PaperPolicy>(),
 			Ok(PaperPolicy::TwoQFastAdmissionHybrid(0.2)),
 		);
+	}
+
+	/// Locks in `FromStr`'s guard ordering for the compact forms. Both new
+	/// strings start with a stem an existing guard already claims:
+	/// `"2q-compact-0.25-0.5"` starts with `"2q-"`, and
+	/// `"2q-compact-hybrid-0.2"` starts with `"2q-compact-"`. Get the order
+	/// wrong in either direction and one of the two parses as the other
+	/// policy with no error, which a run would report under the wrong name.
+	#[test]
+	fn compact_does_not_collide_with_other_2q_forms() {
+		assert_eq!(
+			"2q-compact-0.25-0.5".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::TwoQCompact(0.25, 0.5)),
+		);
+
+		// The hybrid is the longer form and must still win its own string.
+		assert_eq!(
+			"2q-compact-hybrid-0.2".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::TwoQCompactHybrid(0.2)),
+		);
+
+		// Unchanged by the new guard.
+		assert_eq!("2q-0.25-0.5".parse::<PaperPolicy>(), Ok(PaperPolicy::TwoQ(0.25, 0.5)));
+
+		assert_eq!(PaperPolicy::TwoQCompact(0.25, 0.5).to_string(), "2q-compact-0.25-0.5");
+
+		assert_eq!(
+			PaperPolicy::TwoQCompact(0.25, 0.5).to_string().parse::<PaperPolicy>(),
+			Ok(PaperPolicy::TwoQCompact(0.25, 0.5)),
+		);
+
+		// The compact stack is all-DRAM, not a tiered design.
+		assert!(!PaperPolicy::TwoQCompact(0.25, 0.5).is_hybrid());
+
+		// A one-token argument is 2Q's other arity and must be rejected, not
+		// silently accepted with a defaulted second ratio.
+		assert!("2q-compact-0.25".parse::<PaperPolicy>().is_err());
+	}
+
+	/// Same guard-ordering hazard as `compact_does_not_collide_with_other_2q_forms`,
+	/// for S3-FIFO: `"s3-fifo-compact-0.1"` starts with `"s3-fifo-"`, and
+	/// `"s3-fifo-compact-hybrid-0.1"` starts with `"s3-fifo-compact-"`.
+	#[test]
+	fn compact_does_not_collide_with_other_s3_fifo_forms() {
+		assert_eq!(
+			"s3-fifo-compact-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::SThreeFifoCompact(0.1)),
+		);
+
+		assert_eq!(
+			"s3-fifo-compact-hybrid-0.1".parse::<PaperPolicy>(),
+			Ok(PaperPolicy::S3FifoCompactHybrid(0.1)),
+		);
+
+		// Unchanged by the new guard.
+		assert_eq!("s3-fifo-0.1".parse::<PaperPolicy>(), Ok(PaperPolicy::SThreeFifo(0.1)));
+
+		assert_eq!(PaperPolicy::SThreeFifoCompact(0.1).to_string(), "s3-fifo-compact-0.1");
+
+		assert_eq!(
+			PaperPolicy::SThreeFifoCompact(0.1).to_string().parse::<PaperPolicy>(),
+			Ok(PaperPolicy::SThreeFifoCompact(0.1)),
+		);
+
+		assert!(!PaperPolicy::SThreeFifoCompact(0.1).is_hybrid());
+
+		// `ratio` is a fraction of the cache; 1.0 would leave `main` empty.
+		assert!("s3-fifo-compact-1.0".parse::<PaperPolicy>().is_err());
 	}
 
 	/// Locks in `FromStr`'s guard ordering. Every one of these strings also

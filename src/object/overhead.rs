@@ -157,6 +157,11 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size
+		// Slab layout: one 16-byte `QueueSlot` plus the index entry that
+		// finds it (8-byte key + 4-byte slot index + the 8-byte payload
+		// carrying the queue tag and the object size), against the
+		// original's 48-byte `HashList` node + 8-byte key + 4-byte size.
+		PaperPolicy::TwoQCompact(_, _) => 16 + 20 + OBJECT_MAP_AND_ARC_OVERHEAD,
 		PaperPolicy::TwoQ(_, _) => 48 + 8 + 4 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
@@ -165,6 +170,14 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size, 1 byte for the frequency count
+		// Slab layout: one 16-byte `QueueSlot` plus the index entry that
+		// finds it (8-byte key + 4-byte slot index + the 8-byte payload
+		// carrying the size, the queue tag and the frequency counter),
+		// against the original's 48-byte `HashList` node + 8-byte key +
+		// 4-byte size + 1-byte freq. Like `SThreeFifo` above, neither
+		// charge covers the bare-key ghost queue, so the two stay
+		// directly comparable.
+		PaperPolicy::SThreeFifoCompact(_) => 16 + 20 + OBJECT_MAP_AND_ARC_OVERHEAD,
 		PaperPolicy::SThreeFifo(_) => 48 + 8 + 4 + 1 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
@@ -1590,8 +1603,10 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			| PaperPolicy::MruCompact
 			| PaperPolicy::Mru
 			| PaperPolicy::TwoQ(..)
+			| PaperPolicy::TwoQCompact(..)
 			| PaperPolicy::Arc
-			| PaperPolicy::SThreeFifo(..) => 0,
+			| PaperPolicy::SThreeFifo(..)
+			| PaperPolicy::SThreeFifoCompact(..) => 0,
 		};
 		overhead += stack_resident;
 	}

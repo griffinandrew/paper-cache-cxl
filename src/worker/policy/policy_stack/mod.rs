@@ -57,6 +57,8 @@ mod s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_stack;
 mod s3_fifo_lazy_demotion_fast_admission_reprieve_compact_hybrid_stack;
 mod s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stack;
 mod s3_fifo_lazy_demotion_reprieve_compact_hybrid_stack;
+mod two_q_compact_stack;
+mod s_three_fifo_compact_stack;
 mod fifo_compact_stack;
 mod clock_compact_stack;
 mod sieve_compact_stack;
@@ -78,6 +80,8 @@ use crate::{
 		clock_compact_stack::ClockCompactStack,
 		sieve_compact_stack::SieveCompactStack,
 		mru_compact_stack::MruCompactStack,
+		two_q_compact_stack::TwoQCompactStack,
+		s_three_fifo_compact_stack::SThreeFifoCompactStack,
 		lfu_stack::LfuStack,
 		fifo_stack::FifoStack,
 		clock_stack::ClockStack,
@@ -445,8 +449,10 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		PaperPolicy::Lru => Box::new(LruStack::default()),
 		PaperPolicy::Mru => Box::new(MruStack::default()),
 		PaperPolicy::TwoQ(k_in, k_out) => Box::new(TwoQStack::new(k_in, k_out, max_size)),
+		PaperPolicy::TwoQCompact(k_in, k_out) => Box::new(TwoQCompactStack::new(k_in, k_out, max_size)),
 		PaperPolicy::Arc => Box::new(ArcStack::new(max_size)),
 		PaperPolicy::SThreeFifo(ratio) => Box::new(SThreeFifoStack::new(ratio, max_size)),
+		PaperPolicy::SThreeFifoCompact(ratio) => Box::new(SThreeFifoCompactStack::new(ratio, max_size)),
 
 		// Default fast-tier budget is 20% of the overall cache size, matching
 		// the tiering manager's default `dram_threshold` ratio (see
@@ -999,7 +1005,7 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 54;
+	const POLICY_VARIANT_COUNT: usize = 56;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the 18
 	/// tiered designs this crate exists to compare.
@@ -1023,6 +1029,7 @@ mod init_policy_stack_tests {
 		(PaperPolicy::ClockCompact, PaperPolicy::ClockCompact),
 		(PaperPolicy::SieveCompact, PaperPolicy::SieveCompact),
 		(PaperPolicy::MruCompact, PaperPolicy::MruCompact),
+		(PaperPolicy::TwoQCompact(0.25, 0.5), PaperPolicy::TwoQCompact(0.25, 0.5)),
 		(PaperPolicy::Lfu, PaperPolicy::Lfu),
 		(PaperPolicy::Fifo, PaperPolicy::Fifo),
 		(PaperPolicy::Clock, PaperPolicy::Clock),
@@ -1033,6 +1040,7 @@ mod init_policy_stack_tests {
 		(PaperPolicy::TwoQ(0.25, 0.25), PaperPolicy::TwoQ(0.5, 0.4)),
 		(PaperPolicy::Arc, PaperPolicy::Arc),
 		(PaperPolicy::SThreeFifo(0.1), PaperPolicy::SThreeFifo(0.9)),
+		(PaperPolicy::SThreeFifoCompact(0.1), PaperPolicy::SThreeFifoCompact(0.9)),
 		(PaperPolicy::LruHybrid, PaperPolicy::LruHybrid),
 		(PaperPolicy::LfuHybrid, PaperPolicy::LfuHybrid),
 		(PaperPolicy::LruCompactHybrid, PaperPolicy::LruCompactHybrid),
@@ -1087,6 +1095,7 @@ mod init_policy_stack_tests {
 			PaperPolicy::ClockCompact => "ClockCompact",
 			PaperPolicy::SieveCompact => "SieveCompact",
 			PaperPolicy::MruCompact => "MruCompact",
+			PaperPolicy::TwoQCompact(..) => "TwoQCompact",
 			PaperPolicy::Lfu => "Lfu",
 			PaperPolicy::Fifo => "Fifo",
 			PaperPolicy::Clock => "Clock",
@@ -1097,6 +1106,7 @@ mod init_policy_stack_tests {
 			PaperPolicy::TwoQ(..) => "TwoQ",
 			PaperPolicy::Arc => "Arc",
 			PaperPolicy::SThreeFifo(_) => "SThreeFifo",
+			PaperPolicy::SThreeFifoCompact(_) => "SThreeFifoCompact",
 			PaperPolicy::LruHybrid => "LruHybrid",
 			PaperPolicy::LfuHybrid => "LfuHybrid",
 			PaperPolicy::LruCompactHybrid => "LruCompactHybrid",

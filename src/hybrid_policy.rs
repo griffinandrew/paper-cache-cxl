@@ -153,7 +153,9 @@ pub fn admission_tier<K>(
 		| PaperPolicy::MruCompact
 		| PaperPolicy::Mru
 		| PaperPolicy::TwoQ(..)
+		| PaperPolicy::TwoQCompact(..)
 		| PaperPolicy::Arc
-		| PaperPolicy::SThreeFifo(..) => crate::Tier::Fast,
+		| PaperPolicy::SThreeFifo(..)
+		| PaperPolicy::SThreeFifoCompact(..) => crate::Tier::Fast,
 	}
 }
