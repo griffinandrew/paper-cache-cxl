@@ -114,9 +114,25 @@ impl PolicyStack for LruStack {
 	}
 
 	fn update(&mut self, key: HashedKey) {
-		// Move-to-front: push_front removes existing entry then prepends.
-		// Same reasoning as insert() above.
-		self.stack.push_front(key);
+		// Move-to-front, and ONLY for a key already in the stack.
+		//
+		// The membership test is load-bearing and is the one place this
+		// implementation cannot mirror `insert`. The DRAM variant's
+		// `HashList::move_front` is a no-op on an absent key;
+		// `PmemHashList::push_front` INSERTS one. Without the guard, a
+		// `StackEvent::Get` for a key the worker has already evicted (the
+		// client hit it, then eviction ran before the event was drained --
+		// both happen on the policy worker, in that order) silently
+		// resurrects it as a phantom: `len()` counts an entry with no object
+		// behind it, and a later `evict_one` hands back a key the cache
+		// cannot erase.
+		//
+		// Caught by `lru_compact_stack`'s fidelity test, which only runs this
+		// path under `eviction_stacks_pmem`: `len` diverged 1 vs 0 on the
+		// first `update` of an unseen key.
+		if self.stack.contains(&key) {
+			self.stack.push_front(key);
+		}
 	}
 
 	fn remove(&mut self, key: HashedKey) {

@@ -1492,6 +1492,14 @@ fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
 }
 
 #[cfg(feature = "hybrid_cache_common")]
+/// NOTE: nothing applies this any more. `get_hybrid_dram_shared_overhead`
+/// dropped it when its terms moved to measured jemalloc `stats.allocated`
+/// figures, which are already size-class-rounded (see that function's closing
+/// comment); the per-policy doc comments above still reference the concept.
+/// Retained rather than deleted because `DRAM_OVERHEAD_RESIDENT_FACTOR` is a
+/// documented knob -- but it is currently INERT, and setting it changes
+/// nothing.
+#[allow(dead_code)]
 fn resident_factor() -> f64 {
 	use std::sync::OnceLock;
 	static FACTOR: OnceLock<f64> = OnceLock::new();
@@ -1670,27 +1678,51 @@ mod shared_overhead_is_feature_independent {
 		let fifo = get_hybrid_dram_shared_overhead(&PaperPolicy::FifoHybrid);
 		let s3 = get_hybrid_dram_shared_overhead(&PaperPolicy::S3FifoHybrid(0.1));
 
-		// The value with NO eviction-stack term -- what a gated-out policy used
-		// to collapse to. No hybrid policy may equal it.
-		let no_stack_term =
-			((ARC_VALUE_HEADER_OVERHEAD + OBJECT_MAP_ENTRY_OVERHEAD) as f64
-				* resident_factor()) as ObjectSize;
+		// The value with NO eviction-stack term -- what a gated-out policy
+		// collapses to.
+		//
+		// This was `* resident_factor()`, which made the guard DEAD: the
+		// function applies no resident factor (see its closing comment), so a
+		// collapsed policy returns 144 while this expression produced 161, and
+		// `assert_ne!` could never fire. The one thing this test exists to
+		// catch was the one thing it could not catch.
+		let no_stack_term = ARC_VALUE_HEADER_OVERHEAD + OBJECT_MAP_ENTRY_OVERHEAD;
 
+		// Under `eviction_stacks_pmem` the stacks live in CXL, so they are
+		// deliberately absent from the FAST-TIER reservation -- while still
+		// counting toward the aggregate budget in `get_policy_overhead`. Every
+		// policy therefore collapses to exactly `no_stack_term` ON PURPOSE, and
+		// the assertions below invert. Same property, checked from the other
+		// side: the split is what makes both directions meaningful.
+		#[cfg(feature = "eviction_stacks_pmem")]
 		for (name, got) in [("lru", lru), ("lfu", lfu), ("fifo", fifo), ("s3-fifo", s3)] {
-			assert_ne!(
+			assert_eq!(
 				got, no_stack_term,
-				"{name} lost its eviction-stack term and collapsed to {no_stack_term} \
-				 B/object -- the per-policy cfg gating is back",
+				"{name} still reserves fast-tier DRAM for an eviction stack that \
+				 lives in CXL -- the pmem accounting split is broken",
 			);
 		}
 
-		// LFU carries a frequency structure the others do not (44+29+20 vs 44+20).
-		assert!(
-			lfu > lru,
-			"lfu ({lfu}) must exceed lru ({lru}): it has the extra frequency term",
-		);
-		assert_eq!(fifo, lru, "fifo and lru have the same 44+20 stack shape");
-		assert_eq!(s3, lru, "s3-fifo and lru have the same 44+20 stack shape");
+		#[cfg(not(feature = "eviction_stacks_pmem"))]
+		{
+			for (name, got) in [("lru", lru), ("lfu", lfu), ("fifo", fifo), ("s3-fifo", s3)] {
+				assert_ne!(
+					got, no_stack_term,
+					"{name} lost its eviction-stack term and collapsed to {no_stack_term} \
+					 B/object -- the per-policy cfg gating is back",
+				);
+			}
+
+			// LFU carries a frequency structure the others do not
+			// (44+29+20 vs 44+20). Only meaningful while the stack terms are
+			// actually included, hence the gate.
+			assert!(
+				lfu > lru,
+				"lfu ({lfu}) must exceed lru ({lru}): it has the extra frequency term",
+			);
+			assert_eq!(fifo, lru, "fifo and lru have the same 44+20 stack shape");
+			assert_eq!(s3, lru, "s3-fifo and lru have the same 44+20 stack shape");
+		}
 	}
 }
 
