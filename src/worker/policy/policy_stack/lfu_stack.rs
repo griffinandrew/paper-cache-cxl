@@ -59,16 +59,52 @@ pub struct LfuStack {
 
 #[cfg(feature = "eviction_stacks_pmem")]
 impl Default for LfuStack {
-    fn default() -> Self {
-        // Capacity can be tuned via env var.
-        let default_capacity = std::env::var("PAPER_CACHE_EVICTION_STACK_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(50_000_000);
+	/// Allocate nothing, matching the DRAM arm's `#[derive(Default)]`. Both
+	/// structures grow on demand.
+	///
+	/// This used to presize to 50,000,000 entries, which was wrong three ways.
+	///
+	/// 1. The number is arbitrary and unrelated to the cache. Nothing here
+	///    sees `max_size`, so a 1 MB cache and a 1 TB cache reserved the same
+	///    amount.
+	/// 2. It was applied to `count_stacks`, which is a `PmemVecList<CountStack>`
+	///    holding ONE NODE PER DISTINCT FREQUENCY -- hundreds of entries in
+	///    practice, never millions. `PmemVecList::with_capacity` reserves both
+	///    `entries` and `free_list`, so the misapplied number was paid twice.
+	///    With `Node<CountStack>` at ~152 B that is ~7.6 GB of entries, 400 MB
+	///    of free list, and ~1.1 GB for the 50M-bucket index map: ~9 GB
+	///    committed to the node-1 arena at construction.
+	/// 3. It fired on shadow caches too. `MiniStackManager` builds one stack
+	///    per configured policy at roughly 0.1% of the cache size, and this
+	///    `Default` ignores the size argument entirely, so every mini stack
+	///    reserved the same ~9 GB.
+	///
+	/// It also did not buy what its comment claimed. The containers that
+	/// actually grow per key are the per-bucket `PmemHashList`s inside each
+	/// `CountStack`, and `CountStack::new` builds those with
+	/// `PmemHashList::with_hasher` -- no capacity -- so the reallocation the
+	/// presizing was meant to prevent happened anyway.
+	///
+	/// Any experiment reading far-node footprint or jemalloc `stats.allocated`
+	/// under this feature was measuring the reservation, not the stack.
+	///
+	/// `PAPER_CACHE_EVICTION_STACK_CAPACITY` is still honoured when set, so the
+	/// escape hatch survives if a reallocation problem is ever demonstrated.
+	/// Unset -- the normal case -- nothing is reserved.
+	fn default() -> Self {
+		match std::env::var("PAPER_CACHE_EVICTION_STACK_CAPACITY")
+			.ok()
+			.and_then(|v| v.parse::<usize>().ok())
+			.filter(|v| *v > 0)
+		{
+			Some(capacity) => Self::with_capacity(capacity),
 
-        Self::with_capacity(default_capacity)
-    }
+			None => LfuStack {
+				index_map: HashMap::with_hasher_in(NoHasher::default(), Hybrid),
+				count_stacks: PmemVecList::new(),
+			},
+		}
+	}
 }
 
 
