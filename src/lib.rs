@@ -689,9 +689,9 @@ where
 	/// # Examples
 	///
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -700,7 +700,7 @@ where
 	/// assert!(cache.is_ok());
 	///
 	/// // Supplying a maximum size of zero will return a `CacheError`.
-	/// let cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let cache = PaperCache::<u32, BufferDRAM>::new(
 	///     0,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -709,7 +709,7 @@ where
 	/// assert!(cache.is_err());
 	///
 	/// // Supplying duplicate policies will return a `CacheError`.
-	/// let cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu, PaperPolicy::Lru, PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -718,7 +718,7 @@ where
 	/// assert!(cache.is_err());
 	///
 	/// // Supplying a non-configured policy will return a `CacheError`.
-	/// let cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lru,
@@ -745,9 +745,9 @@ where
 	///
 	/// ```
 	/// use std::hash::RandomState;
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let cache = PaperCache::<u32, Box<[u8]>>::with_hasher(
+	/// let cache = PaperCache::<u32, BufferDRAM>::with_hasher(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -843,9 +843,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu
@@ -862,9 +862,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -884,9 +884,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1042,9 +1042,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1105,9 +1105,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1140,9 +1140,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1167,9 +1167,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1205,9 +1205,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1243,9 +1243,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1274,9 +1274,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1300,9 +1300,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -1351,9 +1351,9 @@ where
 	///
 	/// # Examples
 	/// ```
-	/// use paper_cache::{PaperCache, PaperPolicy};
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
 	///
-	/// let mut cache = PaperCache::<u32, Box<[u8]>>::new(
+	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
 	///     &[PaperPolicy::Lfu],
 	///     PaperPolicy::Lfu,
@@ -2901,13 +2901,13 @@ where
 #[cfg(all(feature = "global_hashtable_pmem", not(feature = "key_value_pmem")))]
 #[cfg(all(test, feature = "global_hashtable_pmem"))]
 mod test_global_hashtable_pmem_alone {
-    use crate::{PaperCache, PaperPolicy};
+    use crate::{BufferDRAM, PaperCache, PaperPolicy};
     use std::hash::RandomState;
 
     #[test]
     fn test_basic_operations() {
         // Create cache with global hashtable in PMEM, values in DRAM
-        let cache: PaperCache<u32, Box<[u8]>, RandomState> = PaperCache::new(
+        let cache: PaperCache<u32, BufferDRAM, RandomState> = PaperCache::new(
             1000000,
             &[PaperPolicy::Lfu],
             PaperPolicy::Lfu,
@@ -2932,7 +2932,7 @@ mod test_global_hashtable_pmem_alone {
 
     #[test]
     fn test_multiple_keys() {
-        let cache: PaperCache<u32, Box<[u8]>, RandomState> = PaperCache::new(
+        let cache: PaperCache<u32, BufferDRAM, RandomState> = PaperCache::new(
             10000000,
             &[PaperPolicy::Lru],
             PaperPolicy::Lru,
@@ -2954,7 +2954,7 @@ mod test_global_hashtable_pmem_alone {
 
     #[test]
     fn test_wipe() {
-        let cache: PaperCache<String, Box<[u8]>, RandomState> = PaperCache::new(
+        let cache: PaperCache<String, BufferDRAM, RandomState> = PaperCache::new(
             1000000,
             &[PaperPolicy::Lfu],
             PaperPolicy::Lfu,
@@ -2985,7 +2985,7 @@ mod test_global_hashtable_pmem_alone {
 /// tested separately via its own test module in lfu_stack.rs.
 #[cfg(all(test, feature = "all_dram"))]
 mod test_new_features {
-    use crate::{PaperCache, PaperPolicy};
+    use crate::{BufferDRAM, PaperCache, PaperPolicy};
     use std::hash::RandomState;
 
     /// Verify that the cache initializes and operates correctly with the LFU policy.
@@ -2993,7 +2993,7 @@ mod test_new_features {
     /// `eviction_stacks_pmem` feature flag — both paths must initialize correctly.
     #[test]
     fn test_cache_init_with_lfu_eviction() {
-        let cache: PaperCache<u32, Box<[u8]>, RandomState> = PaperCache::new(
+        let cache: PaperCache<u32, BufferDRAM, RandomState> = PaperCache::new(
             1_000_000,
             &[PaperPolicy::Lfu],
             PaperPolicy::Lfu,
@@ -3013,7 +3013,7 @@ mod test_new_features {
     /// Verify multiple policies work at initialization.
     #[test]
     fn test_cache_init_with_multiple_policies() {
-        let cache: PaperCache<u32, Box<[u8]>, RandomState> = PaperCache::new(
+        let cache: PaperCache<u32, BufferDRAM, RandomState> = PaperCache::new(
             1_000_000,
             &[PaperPolicy::Lfu, PaperPolicy::Lru],
             PaperPolicy::Lfu,

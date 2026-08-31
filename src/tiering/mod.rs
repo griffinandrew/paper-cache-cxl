@@ -53,9 +53,9 @@
 //! # Example
 //! 
 //! ```no_run
-//! use paper_cache::{PaperCache, PaperPolicy, TieringStats};
+//! use paper_cache::{BufferDRAM, PaperCache, PaperPolicy, TieringStats};
 //! 
-//! let cache = PaperCache::<u32, Box<[u8]>>::new(
+//! let cache = PaperCache::<u32, BufferDRAM>::new(
 //!     10_000_000,
 //!     &[PaperPolicy::Lfu],
 //!     PaperPolicy::Lfu,
