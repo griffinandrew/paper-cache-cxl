@@ -79,6 +79,8 @@ mod status;
 // be one impl block per (object-map shape, value-buffer type) combination.
 #[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 mod object_store;
+
+pub mod merged_store;
 #[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 mod value_buffer;
 

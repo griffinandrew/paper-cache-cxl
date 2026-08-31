@@ -48,7 +48,7 @@ use core::str::FromStr;
 ///
 /// The `epoch` write is required: jemalloc caches these statistics per epoch,
 /// and a read without advancing it returns whatever the previous read saw.
-fn allocated_bytes() -> u64 {
+pub(crate) fn allocated_bytes() -> u64 {
 	unsafe {
 		let mut e: u64 = 1;
 		let mut elen = core::mem::size_of::<u64>();
