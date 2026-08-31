@@ -278,6 +278,13 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// than TwoQHybrid for the `accessed: bool` reference bit (only
 		// meaningful for keys currently in Main — see that field's doc).
 		PaperPolicy::S3FifoCompactHybrid(_) => 16 + 24,
+		// The faithful family: same 8-byte payload, since `freq: u8`
+		// replaces `accessed: bool` one-for-one. Like every other ghost
+		// design here, the ghost queue's own memory is not charged.
+		PaperPolicy::S3FifoFaithfulCompactHybrid(_) => 16 + 24,
+		PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(_) => 16 + 24,
+		PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(_) => 16 + 24,
+		PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(_) => 16 + 24,
 		PaperPolicy::S3FifoHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
 
 		// Ghost-hybrid variants: identical per-*tracked*-object charge to
@@ -664,10 +671,33 @@ const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 8;
 
+/// Per-entry DRAM cost of an EXACT ghost queue -- a `CompactQueueSet<()>` of
+/// bare keys, as the faithful S3-FIFO family carries.
+///
+/// Distinct from [`GHOST_ENTRY_DRAM_OVERHEAD`] above, which sizes a `GhostSlot`
+/// FINGERPRINT (8 bytes, approximate, fixed-capacity). An exact ghost costs a
+/// 16-byte `QueueSlot` plus the 12-byte index entry that finds it -- the same
+/// 16 + 12 shape charged for `LruCompact` -- because flat `SThreeFifoStack`'s
+/// ghost is exact and a faithful port cannot substitute an approximate filter
+/// without changing which keys get admitted to main.
+///
+/// 3.5x the fingerprint's cost per entry, and that is the real price of
+/// fidelity here; it is bounded by the main queue's length, which the ghost is
+/// trimmed against.
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+pub const EXACT_GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 16 + 12;
+
 /// PMEM-resident ghost list: costs the fast/DRAM tier nothing. See the
 /// `not(eviction_stacks_pmem)` arm above for the derivation and rationale.
 #[cfg(feature = "eviction_stacks_pmem")]
 pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
+
+/// Zero under `eviction_stacks_pmem` for the same reason as
+/// [`GHOST_ENTRY_DRAM_OVERHEAD`]: `CompactQueueSet` is allocator-parameterised,
+/// so the exact ghost follows the eviction stacks to the far node and stops
+/// occupying fast-tier DRAM.
+#[cfg(feature = "eviction_stacks_pmem")]
+pub const EXACT_GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 
 /// Per-object DRAM cost of `FifoCompactHybridStack`.
 ///
@@ -1578,6 +1608,10 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			PaperPolicy::TwoQGhostCompactHybrid(..) => TWO_Q_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQGhostHybrid(..) => TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoCompactHybrid(..) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoFaithfulCompactHybrid(..) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(..) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(..) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(..) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoHybrid(..) => S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoGhostCompactHybrid(..) => S3_FIFO_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoGhostHybrid(..) => S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,

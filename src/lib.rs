@@ -2025,6 +2025,10 @@ fn params_ok(policy: PaperPolicy) -> bool {
 		// (`SThreeFifoStack` has the same degeneracy at 1.0; its own
 		// parser is tightened to match.)
 		PaperPolicy::S3FifoHybrid(r)
+		| PaperPolicy::S3FifoFaithfulCompactHybrid(r)
+		| PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(r)
+		| PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(r)
+		| PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(r)
 		| PaperPolicy::S3FifoCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostHybrid(r)
@@ -2075,6 +2079,10 @@ fn s3_fifo_queue_budgets(policy: PaperPolicy) -> Option<(f64, bool)> {
 		| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(r)
+		| PaperPolicy::S3FifoFaithfulCompactHybrid(r)
+		| PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(r)
+		| PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(r)
+		| PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(r) => Some((r, true)),
 
 		// The reprieve stacks: one-access budget only.

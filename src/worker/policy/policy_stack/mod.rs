@@ -41,6 +41,7 @@ mod fifo_hybrid_stack;
 mod lru_sized_compact_hybrid_stack;
 mod lru_sized_hybrid_stack;
 mod s3_fifo_compact_hybrid_stack;
+mod s3_fifo_faithful_compact_hybrid_stack;
 mod s3_fifo_hybrid_stack;
 mod two_q_ghost_compact_hybrid_stack;
 mod two_q_ghost_hybrid_stack;
@@ -82,6 +83,10 @@ use crate::{
 		mru_compact_stack::MruCompactStack,
 		two_q_compact_stack::TwoQCompactStack,
 		s_three_fifo_compact_stack::SThreeFifoCompactStack,
+		s3_fifo_faithful_compact_hybrid_stack::S3FifoFaithfulCompactHybridStack,
+		s3_fifo_faithful_compact_hybrid_stack::S3FifoFaithfulFastAdmissionCompactHybridStack,
+		s3_fifo_faithful_compact_hybrid_stack::S3FifoFaithfulReprieveCompactHybridStack,
+		s3_fifo_faithful_compact_hybrid_stack::S3FifoFaithfulFastAdmissionReprieveCompactHybridStack,
 		lfu_stack::LfuStack,
 		fifo_stack::FifoStack,
 		clock_stack::ClockStack,
@@ -685,6 +690,46 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 				),
 		),
 
+		// Faithful tier-segmented S3-FIFO: 0..=3 counter, lazy promotion, lazy
+		// eviction. Same construction as `S3FifoCompactHybrid` above.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::S3FifoFaithfulCompactHybrid(ratio) => Box::new(
+			S3FifoFaithfulCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)
+				.with_shared_overhead(
+					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+				),
+		),
+
+		// Faithful tier-segmented S3-FIFO: 0..=3 counter, lazy promotion, lazy
+		// eviction. Same construction as `S3FifoCompactHybrid` above.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(ratio) => Box::new(
+			S3FifoFaithfulFastAdmissionCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)
+				.with_shared_overhead(
+					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+				),
+		),
+
+		// Faithful tier-segmented S3-FIFO: 0..=3 counter, lazy promotion, lazy
+		// eviction. Same construction as `S3FifoCompactHybrid` above.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(ratio) => Box::new(
+			S3FifoFaithfulReprieveCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)
+				.with_shared_overhead(
+					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+				),
+		),
+
+		// Faithful tier-segmented S3-FIFO: 0..=3 counter, lazy promotion, lazy
+		// eviction. Same construction as `S3FifoCompactHybrid` above.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(ratio) => Box::new(
+			S3FifoFaithfulFastAdmissionReprieveCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)
+				.with_shared_overhead(
+					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+				),
+		),
+
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoHybrid(ratio) => Box::new(
 			S3FifoHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
@@ -915,6 +960,14 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::S3FifoCompactHybrid(ratio) => Box::new(S3FifoCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::S3FifoFaithfulCompactHybrid(ratio) => Box::new(S3FifoFaithfulCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
+		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(ratio) => Box::new(S3FifoFaithfulFastAdmissionCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
+		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(ratio) => Box::new(S3FifoFaithfulReprieveCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
+		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(ratio) => Box::new(S3FifoFaithfulFastAdmissionReprieveCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
+		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::S3FifoHybrid(ratio) => Box::new(S3FifoHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::TwoQGhostCompactHybrid(k_in) => Box::new(TwoQGhostCompactHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
@@ -1005,11 +1058,11 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 56;
+	const POLICY_VARIANT_COUNT: usize = 60;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the 18
 	/// tiered designs this crate exists to compare.
-	const HYBRID_DESIGN_COUNT: usize = 38;
+	const HYBRID_DESIGN_COUNT: usize = 42;
 
 	/// Every `PaperPolicy` variant, listed explicitly, in declaration order.
 	///
@@ -1041,6 +1094,10 @@ mod init_policy_stack_tests {
 		(PaperPolicy::Arc, PaperPolicy::Arc),
 		(PaperPolicy::SThreeFifo(0.1), PaperPolicy::SThreeFifo(0.9)),
 		(PaperPolicy::SThreeFifoCompact(0.1), PaperPolicy::SThreeFifoCompact(0.9)),
+		(PaperPolicy::S3FifoFaithfulCompactHybrid(0.1), PaperPolicy::S3FifoFaithfulCompactHybrid(0.9)),
+		(PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.1), PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.9)),
+		(PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(0.1), PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(0.9)),
+		(PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(0.1), PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(0.9)),
 		(PaperPolicy::LruHybrid, PaperPolicy::LruHybrid),
 		(PaperPolicy::LfuHybrid, PaperPolicy::LfuHybrid),
 		(PaperPolicy::LruCompactHybrid, PaperPolicy::LruCompactHybrid),
@@ -1107,6 +1164,10 @@ mod init_policy_stack_tests {
 			PaperPolicy::Arc => "Arc",
 			PaperPolicy::SThreeFifo(_) => "SThreeFifo",
 			PaperPolicy::SThreeFifoCompact(_) => "SThreeFifoCompact",
+			PaperPolicy::S3FifoFaithfulCompactHybrid(_) => "S3FifoFaithfulCompactHybrid",
+			PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(_) => "S3FifoFaithfulFastAdmissionCompactHybrid",
+			PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(_) => "S3FifoFaithfulReprieveCompactHybrid",
+			PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(_) => "S3FifoFaithfulFastAdmissionReprieveCompactHybrid",
 			PaperPolicy::LruHybrid => "LruHybrid",
 			PaperPolicy::LfuHybrid => "LfuHybrid",
 			PaperPolicy::LruCompactHybrid => "LruCompactHybrid",

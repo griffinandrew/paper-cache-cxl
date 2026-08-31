@@ -94,7 +94,7 @@ pub fn admission_tier<K>(
 			// fast admission.
 			crate::Tier::Fast
 		},
-		PaperPolicy::S3FifoGhostHybrid(..) | PaperPolicy::S3FifoGhostCompactHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(..) | PaperPolicy::S3FifoHybrid(..) | PaperPolicy::S3FifoCompactHybrid(..) => {
+		PaperPolicy::S3FifoGhostHybrid(..) | PaperPolicy::S3FifoGhostCompactHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(..) | PaperPolicy::S3FifoHybrid(..) | PaperPolicy::S3FifoCompactHybrid(..) | PaperPolicy::S3FifoFaithfulCompactHybrid(..) | PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(..) => {
 			match objects.get_ref(&hashed_key) {
 				Some(object) => match object.data().is_fast() {
 					true => crate::Tier::Fast,
@@ -103,7 +103,7 @@ pub fn admission_tier<K>(
 				None => crate::Tier::Slow,
 			}
 		},
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(..) => {
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(..) | PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(..) | PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(..) => {
 			match objects.get_ref(&hashed_key) {
 				Some(object) => match object.data().is_fast() {
 					true => crate::Tier::Fast,

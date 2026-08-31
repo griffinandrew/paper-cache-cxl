@@ -278,6 +278,24 @@ lru_lfu_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # not `key_pmem_value_pmem`.
 #
 s3_fifo_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
+
+# The FAITHFUL tier-segmented S3-FIFO family. Every other s3-fifo hybrid here
+# diverges from flat `SThreeFifoStack` in three ways at once -- an `accessed`
+# reference bit rather than the 0..=3 saturating counter, EAGER promotion on
+# access rather than lazy promotion at eviction gated on freq > 1, and a
+# one-shot second chance rather than a decrement-and-requeue sweep. These four
+# restore all three, so `s3-fifo-<r>` and `s3-fifo-faithful-compact-hybrid-<r>`
+# differ only by tiering and are a fair pair.
+#
+# Two orthogonal axes over one core: where the small queue lives (slow, or
+# fast via *_fast_admission_*), and what happens to a key aged out of it
+# (ghosted and evicted, or spliced into main's slow segment via *_reprieve_*).
+# The reprieve variants carry no ghost queue -- nothing would populate one, and
+# building it from main-tail evictions would invert the admission signal.
+s3_fifo_faithful_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
+s3_fifo_faithful_fast_admission_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
+s3_fifo_faithful_reprieve_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
+s3_fifo_faithful_fast_admission_reprieve_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 s3_fifo_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # `two_q_hybrid_cache` plus a bare-key ghost queue: objects that age out of
