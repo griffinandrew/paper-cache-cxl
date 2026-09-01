@@ -156,6 +156,30 @@ const EMPTY_TAIL: u64 = u64::MAX;
 /// and the table doubles from there.
 const INITIAL_BUCKETS: usize = 16;
 
+/// The slab grows by this fraction of its current capacity instead of doubling.
+///
+/// `Vec` doubles, so its capacity always sits somewhere in [n, 2n) and averages
+/// well above n. Measured on the allocation harness it lands at **1.40x the
+/// live object count**, which at a 64-byte slot is 25.6 B/object of slab that
+/// is simply empty -- more than the entire bucket array costs.
+///
+/// Growing by a quarter instead puts capacity in [n, 1.25n). The trade is more
+/// frequent reallocations, each of which copies the slab; at 25% steps that is
+/// ~3.1x as many growth events over the life of a shard as doubling, all of
+/// them during warm-up, and none once the working set is resident.
+///
+/// NOT a `reserve` sized from the cache budget. That was tried and removed: at
+/// a 4 GiB fast tier it reserved 4.19M slots, 16x what the 16.5 KB-object trace
+/// could hold there, and `construction_does_not_allocate_from_the_budget` pins
+/// that it must not come back. This changes only the GROWTH FACTOR, so the slab
+/// still tracks demand.
+const SLAB_GROWTH_NUMER: usize = 1;
+const SLAB_GROWTH_DENOM: usize = 4;
+
+/// Below this, grow in fixed steps -- a quarter of a tiny slab is a pointless
+/// number of reallocations.
+const SLAB_MIN_GROWTH: usize = 64;
+
 /// Live entries per bucket before the table doubles. 1.0, not hashbrown's 7/8:
 /// a chain degrades linearly with load where a probe sequence degrades sharply,
 /// so chaining can be run full and spend the difference on memory instead.
@@ -889,6 +913,16 @@ impl<K, V> MergedStore<K, V> {
 			},
 
 			None => {
+				// Reserve explicitly before pushing, so `Vec`'s doubling never
+				// gets a chance to run. `reserve_exact` asks for precisely this
+				// much rather than rounding up to a growth curve of its own.
+				if g.slots.len() == g.slots.capacity() {
+					let step = (g.slots.capacity() * SLAB_GROWTH_NUMER / SLAB_GROWTH_DENOM)
+						.max(SLAB_MIN_GROWTH);
+
+					g.slots.reserve_exact(step);
+				}
+
 				g.slots.push(fresh);
 				(g.slots.len() - 1) as u32
 			},
@@ -1377,6 +1411,31 @@ mod tests {
 		exact.touch(hot);
 
 		assert_eq!(exact.tail_key(), Some(cold), "exact mode must relink");
+	}
+
+	/// The slab must not overshoot the way `Vec` doubling does.
+	///
+	/// This is the 25.6 B/object of empty slab measured on the allocation
+	/// harness, and it is the largest single remaining item in the merged
+	/// store's per-object cost -- larger than the whole bucket array.
+	#[test]
+	fn the_slab_does_not_double() {
+		let s = tiered(CacheSize::MAX);
+
+		for i in 1..=200_000u64 {
+			put(&s, mix(i), 64);
+		}
+
+		let (slab_cap, _, _) = s.capacities();
+		let live = s.len();
+		let ratio = slab_cap as f64 / live as f64;
+
+		assert!(
+			ratio < 1.30,
+			"slab capacity is {ratio:.3}x the live count ({slab_cap} for {live}); \
+			 doubling gives ~1.40x and the growth factor is meant to hold it \
+			 under 1.25 plus the per-shard rounding",
+		);
 	}
 
 	/// Every live slot must be reachable from its own bucket, exactly once,

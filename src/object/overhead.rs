@@ -143,19 +143,23 @@ const OBJECT_MAP_AND_ARC_OVERHEAD: ObjectSize =
 /// with no residual:
 ///
 /// ```text
-///   slab   64 B/slot   x 1.398 fill = 89.5
+///   slab   64 B/slot   x 1.101 fill = 70.5
 ///   index   4 B/bucket x 1.398 fill =  5.6
+///   jemalloc large-class rounding    =  7.8
 ///                                    -----
-///                                     95.1
+///                                     83.9
 /// ```
 ///
-/// The 1.398 is `Vec` doubling slack, measured (slab capacity 8,388,608 for
-/// 6,000,000 objects), not assumed. A chunked slab would recover most of it.
+/// The slab fill was 1.398 under `Vec` doubling and is 1.101 since the growth
+/// factor went to 25% -- measured (capacity 6,607,040 for 6,000,000 objects),
+/// not assumed. The bucket array still doubles, and must: its index is a mask,
+/// so its length has to stay a power of two. The 7.8 is jemalloc rounding each
+/// shard's 13.2 MB slab up to its 14 MiB large class.
 ///
 /// Against this, the split design costs 67.1 (DashMap row) + 72 (measured
 /// `LruCompactHybridStack`) = 139.1, or + 56 (`LruCompactStack`) = 123.1 flat.
 #[cfg(feature = "merged_object_store")]
-const MERGED_STORE_STRUCTURE_OVERHEAD: ObjectSize = 95;
+const MERGED_STORE_STRUCTURE_OVERHEAD: ObjectSize = 84;
 
 /// Under `merged_object_store` the object map IS the eviction stack, so the
 /// per-policy stack terms below do not apply at all -- there is no second
