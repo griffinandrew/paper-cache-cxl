@@ -69,6 +69,10 @@ impl typesize::TypeSize for BufferDRAM {
 
 mod error;
 mod worker;
+/// Strong-count-only refcounted pointer for value buffers -- `Arc` without
+/// the weak count nothing in this tree uses. See `shared`.
+pub mod shared;
+
 mod object;
 mod policy;
 mod status;
@@ -1211,7 +1215,7 @@ where
 	/// assert!(cache.peek(&1).is_ok());
 	/// assert!(cache.peek(&2).is_ok());
 	/// ```
-	pub fn peek(&self, key: &K) -> Result<Arc<V>, CacheError> {
+	pub fn peek(&self, key: &K) -> Result<crate::shared::Shared<V>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
 		match self.objects.get_ref(&hashed_key) {
@@ -1697,7 +1701,7 @@ where
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
 	}
 
-	pub fn peek(&self, key: &K) -> Result<Arc<V>, CacheError> {
+	pub fn peek(&self, key: &K) -> Result<crate::shared::Shared<V>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
 		match self.objects.get_ref(&hashed_key) {
@@ -2614,7 +2618,7 @@ where
 	/// altering any of the cache's internal queues (including tier — a peek
 	/// never triggers a promotion). If the key was not found in the cache,
 	/// returns a [`CacheError`].
-	pub fn peek(&self, key: &K) -> Result<Arc<TieredBuffer>, CacheError> {
+	pub fn peek(&self, key: &K) -> Result<crate::shared::Shared<TieredBuffer>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
 		match self.objects.get_ref(&hashed_key) {

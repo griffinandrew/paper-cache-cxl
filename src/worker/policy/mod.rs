@@ -239,7 +239,7 @@ pub mod migration_queue {
 		// same lock, so nothing can replace the value between the comparison
 		// and the swap.
 		if let Some(mut object) = objects.get_mut_ref(&key) {
-			if Arc::ptr_eq(&object.data(), &old_data) {
+			if crate::shared::Shared::ptr_eq(&object.data(), &old_data) {
 				object.set_data(new_data);
 				MIG_APPLIED.fetch_add(1, Ordering::Relaxed);
 				return true;

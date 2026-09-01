@@ -1481,16 +1481,24 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_S
 /// terms that are actually DRAM-resident: the eviction-stack term is dropped
 /// when `eviction_stacks_pmem` moves those stacks to PMEM, and the hashtable
 /// entry is dropped when a hashtable-PMEM feature moves the object map to PMEM.
-/// Per-object DRAM cost of the value's `Arc` header: the `Arc` inner
-/// allocation (two 8-byte refcounts) plus the `TieredBuffer` enum it wraps
-/// (16-byte fat pointer + discriminant, padded), landing in the 48-byte size
-/// class. Fixed-size, so independent of the trace's value distribution.
-/// Always DRAM-resident: the `Arc` itself is allocated by the global
-/// allocator even when the buffer it points at lives in PMEM.
+/// Per-object DRAM cost of the value's refcount header.
+///
+/// Was 48. `Arc`'s inner allocation carries a strong AND a weak count, and with
+/// the 24-byte `TieredBuffer` it wraps (16-byte fat pointer plus a padded
+/// discriminant) that is 40 bytes, which jemalloc rounds to its 48-byte class.
+///
+/// Nothing in this crate ever creates a `Weak`, so that second count was pure
+/// cost. `shared::Shared` drops it: 8 + 24 = 32, landing exactly on the 32-byte
+/// class one step down. Measured, not assumed -- see `shared::tests` and
+/// `tiered_buffer::layout`.
+///
+/// Fixed-size, so independent of the trace's value distribution. Always
+/// DRAM-resident: the header is allocated by the global allocator even when the
+/// buffer it points at lives in PMEM.
 // Not cfg-gated: every design allocates one object-map row and one value
-// Arc per object, tiered or not, so this term is charged in
+// header per object, tiered or not, so this term is charged in
 // get_policy_overhead for non-hybrid policies as well.
-const ARC_VALUE_HEADER_OVERHEAD: ObjectSize = 48;
+const ARC_VALUE_HEADER_OVERHEAD: ObjectSize = 32;
 
 /// Per-object DRAM cost of the object map (`DashMap<HashedKey, Object>`):
 /// the `(u64, Object{key, Arc ptr, expiry})` pair plus hashbrown's control

@@ -9,7 +9,6 @@ pub mod overhead;
 
 use std::{
 	mem,
-	sync::Arc,
 	time::{Instant, Duration},
 };
 
@@ -32,7 +31,7 @@ pub struct Object<K, V> {
 	#[cfg(feature = "key_pmem_value_pmem")]
 	_key_pmem: Box<K, crate::Hybrid>,
 
-	data: Arc<V>,
+	data: crate::shared::Shared<V>,
 	expiry: ExpireTime,
 }
 
@@ -50,7 +49,7 @@ impl<K, V> Object<K, V> {
 
 		Object {
 			key,
-			data: Arc::new(data),
+			data: crate::shared::Shared::new(data),
 			expiry,
 		}
 	}
@@ -71,7 +70,7 @@ impl<K, V> Object<K, V> {
 
 		Object {
 			_key_pmem: Box::new_in(key, Hybrid),
-			data: Arc::new(data),
+			data: crate::shared::Shared::new(data),
 			expiry,
 		}
 	}
@@ -84,7 +83,7 @@ impl<K, V> Object<K, V> {
 	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self {
 		Object {
 			key,
-			data: Arc::new(data),
+			data: crate::shared::Shared::new(data),
 			expiry,
 		}
 	}
@@ -99,12 +98,12 @@ impl<K, V> Object<K, V> {
 
 		Object {
 			_key_pmem: Box::new_in(key, Hybrid),
-			data: Arc::new(data),
+			data: crate::shared::Shared::new(data),
 			expiry,
 		}
 	}
 
-	pub fn data(&self) -> Arc<V> {
+	pub fn data(&self) -> crate::shared::Shared<V> {
 		self.data.clone()
 	}
 
@@ -115,7 +114,7 @@ impl<K, V> Object<K, V> {
 	/// between tiers (e.g. `TieredBuffer::Fast` <-> `TieredBuffer::Slow`)
 	/// without disturbing its TTL or key.
 	pub fn set_data(&mut self, data: V) {
-		self.data = Arc::new(data);
+		self.data = crate::shared::Shared::new(data);
 	}
 
 	/// Return a reference to the key.
