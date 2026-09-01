@@ -95,6 +95,17 @@ pub mod migration_queue {
 	/// report whether the queue ever actually backed up.
 	pub static DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
 
+	/// Largest single batch ever handed to the consumers, in entries.
+	///
+	/// `DEPTH_MAX` alone cannot separate the two ways a queue gets deep: one
+	/// big slug, or sustained overproduction. When the consumers keep up,
+	/// `DEPTH_MAX` is set by the largest BURST and this is the number that
+	/// explains it; when they do not, `DEPTH_MAX` runs far past any burst and
+	/// the queue is throughput-bound instead. Mean batch size cannot tell them
+	/// apart -- it was identical (2.8) across two designs whose `DEPTH_MAX`
+	/// differed 3.4x.
+	pub static BURST_MAX: AtomicU64 = AtomicU64::new(0);
+
 	struct CountOnDrop<'a>(&'a Arc<AtomicU64>);
 
 	impl Drop for CountOnDrop<'_> {
@@ -610,8 +621,9 @@ pub mod migstats {
 			.collect::<Vec<_>>().join(",");
 		#[cfg(feature = "hybrid_cache_common")]
 		eprintln!(
-			"MIGSTATS queue_depth_max={}",
-			super::migration_queue::DEPTH_MAX.load(Ordering::Relaxed)
+			"MIGSTATS queue_depth_max={} burst_max={}",
+			super::migration_queue::DEPTH_MAX.load(Ordering::Relaxed),
+			super::migration_queue::BURST_MAX.load(Ordering::Relaxed),
 		);
 
 		eprintln!("MIGSTATS mig_calls={} evict_calls={} demo_tot={} promo_tot={} evict_tot={}",
@@ -1538,6 +1550,11 @@ where
 		inline_demotion_accounting: bool,
 	) {
 		let Some(migrate) = &self.tier_migration_fn else { return };
+
+		migration_queue::BURST_MAX.fetch_max(
+			(demotions.len() + promotions.len()) as u64,
+			std::sync::atomic::Ordering::Relaxed,
+		);
 
 		migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len());
 		migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len());
