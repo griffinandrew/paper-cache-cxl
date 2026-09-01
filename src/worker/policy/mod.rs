@@ -624,6 +624,129 @@ pub mod migstats {
 	}
 }
 
+/// Capacity-eviction watermarks, for `apply_evictions`' `over_max_size` loop.
+///
+/// That loop drains to exactly `max_size` one object at a time, so a cache
+/// sitting at capacity re-enters the whole eviction machinery on *every*
+/// subsequent set to free a single object -- the same batch-of-one shape the
+/// fast-tier watermarks (`policy_stack::watermarks`) were introduced to fix
+/// for demotions. With watermarks a pass arms only once usage crosses
+/// `high * max_size`, and then drains to `low * max_size` in one go.
+///
+/// THE DEFAULTS ARE 1.0/1.0 AND MUST STAY THAT WAY. Both thresholds are then
+/// `max_size` exactly and the loop is the pre-watermark
+/// `while used_size > max_size`, object for object. Every published sweep
+/// (`results/policy_sweep_110_cells.md` and the others beside it) was measured
+/// against a cache that settles exactly at the cap; a default that evicted
+/// deeper would leave those numbers parsing perfectly and describing code that
+/// no longer exists. The feature is strictly opt-in, via
+/// `EVICTION_HIGH_WATERMARK` / `EVICTION_LOW_WATERMARK`.
+///
+/// Deliberately a separate pair from `policy_stack::watermarks`, whose shape
+/// this mirrors: that one governs fast-tier demotion *inside* a hybrid stack
+/// (defaults 0.98/0.95) and says nothing about how far past `max_size` the
+/// cache as a whole may be trimmed. Sharing the values would hand the
+/// published-sweep guarantee above to a knob tuned for migration batch size.
+pub mod eviction_watermarks {
+	use std::sync::OnceLock;
+
+	use crate::CacheSize;
+
+	pub const DEFAULT_HIGH: f64 = 1.0;
+	pub const DEFAULT_LOW: f64 = 1.0;
+
+	static HIGH: OnceLock<f64> = OnceLock::new();
+	static LOW: OnceLock<f64> = OnceLock::new();
+
+	fn read(var: &str, default: f64) -> f64 {
+		std::env::var(var)
+			.ok()
+			.and_then(|v| v.parse::<f64>().ok())
+			.filter(|v| *v > 0.0 && *v <= 1.0)
+			.unwrap_or(default)
+	}
+
+	/// Fraction of `max_size` above which a capacity-eviction pass arms.
+	/// `1.0` (the default) arms at the cap, exactly as before this existed.
+	pub fn high() -> f64 {
+		*HIGH.get_or_init(|| read("EVICTION_HIGH_WATERMARK", DEFAULT_HIGH))
+	}
+
+	/// Fraction of `max_size` an armed pass drains down to. Clamped to at
+	/// most `high()` -- see `clamped_low`.
+	pub fn low() -> f64 {
+		*LOW.get_or_init(|| clamped_low(high(), read("EVICTION_LOW_WATERMARK", DEFAULT_LOW)))
+	}
+
+	/// Clamps the drain target to the trigger point so a misconfigured pair
+	/// cannot invert. Inverted, a pass would arm at the high mark and
+	/// immediately find itself already under its own drain target: it would
+	/// evict nothing at all and the cache would sit permanently above
+	/// `high * max_size` with no way back down.
+	///
+	/// Factored out of `low()` rather than written inline the way the
+	/// fast-tier pair does it because `OnceLock` memoises the env read for the
+	/// life of the process, which leaves the clamp itself unreachable from a
+	/// test that does not want to configure every other test in the binary.
+	pub(crate) fn clamped_low(high: f64, low: f64) -> f64 {
+		if low > high { high } else { low }
+	}
+
+	/// Turns a watermark into a byte threshold on `max_size`.
+	///
+	/// `>= 1.0` returns `max_size` untouched instead of round-tripping it
+	/// through `f64`, and that short-circuit is the whole 1.0-default
+	/// guarantee: an unconfigured build must perform *the same comparison* it
+	/// performed before this module existed, not one that agrees with it up to
+	/// a rounding step. `u64 -> f64` is lossy above 2^53 bytes, and the `as`
+	/// truncation could otherwise land a threshold a byte under the cap --
+	/// either of which is a silent change in eviction depth.
+	pub(crate) fn scaled(max_size: CacheSize, watermark: f64) -> CacheSize {
+		if watermark >= 1.0 {
+			return max_size;
+		}
+
+		(max_size as f64 * watermark) as CacheSize
+	}
+
+	/// A `(high, low)` pair, snapshotted per `PolicyWorker`.
+	///
+	/// Snapshotted rather than read from the statics at each call so a test
+	/// can drive a non-default pair: `OnceLock` memoises the first env read
+	/// for the whole test binary, so a test that set the vars itself would
+	/// silently configure -- or be configured by -- every other test in the
+	/// process, depending on which one ran first.
+	#[derive(Clone, Copy, Debug, PartialEq)]
+	pub struct Watermarks {
+		high: f64,
+		low: f64,
+	}
+
+	impl Watermarks {
+		/// Builds a pair with `low` clamped to at most `high`.
+		pub fn new(high: f64, low: f64) -> Self {
+			Watermarks {
+				high,
+				low: clamped_low(high, low),
+			}
+		}
+
+		/// The process-wide pair, from the environment or the 1.0 defaults.
+		/// Goes through `new` so the configured path and the test path cannot
+		/// drift apart on the clamp (`low()` has already applied it, and the
+		/// clamp is idempotent).
+		pub fn from_env() -> Self {
+			Watermarks::new(high(), low())
+		}
+
+		/// `(trigger, drain target)` in bytes. Both are exactly `max_size` at
+		/// the defaults.
+		pub fn bytes(&self, max_size: CacheSize) -> (CacheSize, CacheSize) {
+			(scaled(max_size, self.high), scaled(max_size, self.low))
+		}
+	}
+}
+
 mod policy_stack;
 mod mini_stack;
 mod event;
@@ -707,6 +830,13 @@ pub struct PolicyWorker<K, V> {
 	overhead_manager: OverheadManagerRef,
 
 	policy_stack: Option<Box<dyn PolicyStack>>,
+
+	/// Capacity-eviction watermarks for `apply_evictions`, snapshotted at
+	/// construction (see `eviction_watermarks::Watermarks`). `1.0`/`1.0`
+	/// unless `EVICTION_HIGH_WATERMARK`/`EVICTION_LOW_WATERMARK` say
+	/// otherwise, which is the pre-watermark drain-to-exactly-`max_size`
+	/// loop.
+	eviction_watermarks: eviction_watermarks::Watermarks,
 
 	trace_fragments: Arc<RwLock<VecDeque<TraceFragment>>>,
 	/// Sender into `TraceWorker`, or `None` when access tracing is switched
@@ -996,6 +1126,7 @@ where
 			overhead_manager,
 
 			policy_stack: Some(policy_stack),
+			eviction_watermarks: eviction_watermarks::Watermarks::from_env(),
 
 			trace_fragments,
 			trace_worker,
@@ -1113,6 +1244,7 @@ where
 			overhead_manager,
 
 			policy_stack: Some(policy_stack),
+			eviction_watermarks: eviction_watermarks::Watermarks::from_env(),
 
 			trace_fragments,
 			trace_worker,
@@ -1572,10 +1704,36 @@ where
 
 		let policy = self.current_policy.read();
 		let max_cache_size = self.status.max_size();
+
+		// `trigger_size` arms a capacity pass; `drain_target` is how far that
+		// pass then goes. Both are `max_cache_size` at the 1.0/1.0 default,
+		// which is what keeps an unconfigured build on the exact loop that
+		// predates the watermarks.
+		let (trigger_size, drain_target) = self.eviction_watermarks.bytes(max_cache_size);
+
 		let mut _evicted_this_call: usize = 0;
 
+		// Hysteresis latch. Without it the pass would re-check its own trigger
+		// every iteration and stop the moment usage fell a byte back under the
+		// high mark -- which is not a batch at all, it is the old
+		// evict-exactly-one behaviour wearing a threshold, and it would
+		// oscillate across the high mark once per set.
+		//
+		// Armed by the capacity condition alone, never by
+		// `needs_capacity_eviction`: a stack draining its own internal
+		// sub-budget (`TwoQHybridStack`'s `k_in`-derived fifo budget) must not
+		// drag the whole cache down to the low mark as a side effect.
+		let mut draining = false;
+
 		loop {
-			let over_max_size = self.status.used_size(&policy) > max_cache_size;
+			let used_size = self.status.used_size(&policy);
+
+			let over_max_size = match draining {
+				false => used_size > trigger_size,
+				true => used_size > drain_target,
+			};
+
+			draining |= over_max_size;
 
 			// `len() > 0` guards against ever looping forever on a stack
 			// whose `needs_capacity_eviction` stays true despite having
@@ -4491,5 +4649,313 @@ mod migration_accounting_tests {
 
 			assert_eq!(status.hybrid_stats().demotions, 3, "queued = {queued}");
 		}
+	}
+}
+
+/// The capacity-eviction watermark (`eviction_watermarks`), against the real
+/// `apply_evictions` loop.
+///
+/// Gated on `hybrid_cache_common` for the same reason
+/// `migration_accounting_tests` is -- the object-map constructor these build
+/// on lives behind it -- but nothing here is hybrid. The stack is a plain
+/// `Lru` one: the policy `init_policy_stack` builds under every feature
+/// combination, and the one whose `needs_capacity_eviction` is always
+/// `false`, so the capacity cases below isolate the `over_max_size`
+/// condition. The one case that does need the other condition brings its own
+/// stack.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod capacity_watermark_tests {
+	use super::*;
+
+	use super::eviction_watermarks::{DEFAULT_HIGH, DEFAULT_LOW, Watermarks, clamped_low};
+
+	use crate::{
+		object::Object,
+		object::overhead::{OverheadManager, get_policy_overhead},
+		status::AtomicStatus,
+	};
+
+	type TestBuffer = Box<[u8]>;
+
+	const TEST_POLICY: PaperPolicy = PaperPolicy::Lru;
+	const VALUE_BYTES: usize = 16;
+
+	/// Cap the status is constructed with, replaced by `make_worker` as soon
+	/// as it can measure one object -- see there.
+	const PLACEHOLDER_MAX_SIZE: CacheSize = 1_000_000;
+
+	/// What one test object actually costs `used_size`: its `base_size` plus
+	/// the per-object policy overhead `used_size` adds on top of every object
+	/// it counts. Measured rather than hardcoded, because both terms are
+	/// tuned constants elsewhere in the tree and have moved before.
+	fn per_object_size(overhead_manager: &OverheadManagerRef) -> CacheSize {
+		let probe = Object::new(0u32, vec![0u8; VALUE_BYTES].into_boxed_slice(), None);
+		(overhead_manager.base_size(&probe) + get_policy_overhead(&TEST_POLICY)) as CacheSize
+	}
+
+	fn used(status: &StatusRef) -> CacheSize {
+		status.used_size(&TEST_POLICY)
+	}
+
+	/// Builds a worker whose cap is exactly `objects_at_max` objects' worth of
+	/// accounted bytes, so every threshold below is an exact object count
+	/// instead of a rounded byte figure that could hide an off-by-one
+	/// settling point.
+	///
+	/// The cap can only be sized once an `OverheadManager` exists to measure
+	/// an object with, and that needs a status that already carries a cap --
+	/// hence the placeholder, then `set_max_size`. Nothing goes stale:
+	/// `apply_evictions` reads `max_size()` on entry, and `LruStack` ignores
+	/// `resize` altogether.
+	fn make_worker(objects_at_max: u64) -> (
+		PolicyWorker<u32, TestBuffer>,
+		ObjectMapRef<u32, TestBuffer>,
+		StatusRef,
+		OverheadManagerRef,
+	) {
+		let (_tx, rx) = unbounded::<WorkerEvent>();
+
+		let objects: ObjectMapRef<u32, TestBuffer> = crate::new_hybrid_object_map();
+
+		let status = Arc::new(
+			AtomicStatus::new(PLACEHOLDER_MAX_SIZE, &[TEST_POLICY], TEST_POLICY).unwrap(),
+		);
+
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		status.set_max_size(objects_at_max * per_object_size(&overhead_manager));
+
+		let worker = PolicyWorker::<u32, TestBuffer>::new(
+			rx,
+			objects.clone(),
+			status.clone(),
+			overhead_manager.clone(),
+			None,
+		).unwrap();
+
+		(worker, objects, status, overhead_manager)
+	}
+
+	/// Mirrors what `PaperCache::set()` does to shared state before calling
+	/// `handle_set`, exactly as the other test modules in this file do, so
+	/// `status.used_size()` and the policy stack's own bookkeeping agree.
+	fn insert(
+		objects: &ObjectMapRef<u32, TestBuffer>,
+		status: &StatusRef,
+		overhead_manager: &OverheadManagerRef,
+		worker: &mut PolicyWorker<u32, TestBuffer>,
+		key: HashedKey,
+	) {
+		let object = Object::new(key as u32, vec![0u8; VALUE_BYTES].into_boxed_slice(), None);
+		let base_size = overhead_manager.base_size(&object);
+		let dram_resident = overhead_manager.dram_resident_size(&object);
+
+		objects.insert(key, object);
+		status.update_base_used_size(base_size as i64);
+		status.incr_num_objects();
+		worker.handle_set(key, base_size, dram_resident);
+	}
+
+	fn fill(
+		objects: &ObjectMapRef<u32, TestBuffer>,
+		status: &StatusRef,
+		overhead_manager: &OverheadManagerRef,
+		worker: &mut PolicyWorker<u32, TestBuffer>,
+		keys: std::ops::RangeInclusive<HashedKey>,
+	) {
+		for key in keys {
+			insert(objects, status, overhead_manager, worker, key);
+		}
+	}
+
+	/// A stack whose *internal* sub-structure is over its own budget -- the
+	/// `needs_capacity_eviction` case. It insists on draining to `budget`
+	/// objects however much room the cache as a whole still has.
+	/// `TwoQHybridStack`'s `k_in`-derived fifo budget is the real instance;
+	/// this stands in for it because that one needs a hybrid design compiled
+	/// in and a fast tier configured, neither of which this condition (or the
+	/// watermark that must stay off it) has anything to do with.
+	struct SubBudgetStack {
+		keys: VecDeque<HashedKey>,
+		budget: usize,
+	}
+
+	impl PolicyStack for SubBudgetStack {
+		fn is_policy(&self, policy: &PaperPolicy) -> bool {
+			matches!(policy, PaperPolicy::Lru)
+		}
+
+		fn len(&self) -> usize {
+			self.keys.len()
+		}
+
+		fn contains(&self, key: HashedKey) -> bool {
+			self.keys.contains(&key)
+		}
+
+		fn insert(&mut self, key: HashedKey, _size: ObjectSize) {
+			self.keys.push_back(key);
+		}
+
+		fn remove(&mut self, key: HashedKey) {
+			self.keys.retain(|existing| *existing != key);
+		}
+
+		fn clear(&mut self) {
+			self.keys.clear();
+		}
+
+		fn evict_one(&mut self) -> Option<HashedKey> {
+			self.keys.pop_front()
+		}
+
+		fn needs_capacity_eviction(&self) -> bool {
+			self.keys.len() > self.budget
+		}
+	}
+
+	#[test]
+	fn default_watermarks_are_exactly_max_size_at_every_cache_size() {
+		assert_eq!(DEFAULT_HIGH, 1.0);
+		assert_eq!(DEFAULT_LOW, 1.0);
+
+		let defaults = Watermarks::new(DEFAULT_HIGH, DEFAULT_LOW);
+
+		// Includes caps past f64's exact-integer range: a `u64 -> f64 -> u64`
+		// round trip loses the low bits above 2^53, and a threshold a single
+		// byte off `max_size` is a silent change in eviction depth -- the one
+		// thing the default may never be.
+		for max_size in [0u64, 1, 1_000, (1u64 << 53) + 1, u64::MAX] {
+			assert_eq!(defaults.bytes(max_size), (max_size, max_size));
+		}
+	}
+
+	#[test]
+	fn default_watermarks_settle_the_cache_at_exactly_max_size() {
+		let (mut worker, objects, status, overhead_manager) = make_worker(16);
+		let per_object = per_object_size(&overhead_manager);
+		let max_size = status.max_size();
+
+		// The wiring half of the 1.0 guarantee: a worker built with neither
+		// var set carries the defaults. Skipped rather than failed when the
+		// run itself exports an override, which is a deliberate configuration
+		// and not a regression.
+		if std::env::var("EVICTION_HIGH_WATERMARK").is_err()
+			&& std::env::var("EVICTION_LOW_WATERMARK").is_err()
+		{
+			assert_eq!(
+				worker.eviction_watermarks,
+				Watermarks::new(DEFAULT_HIGH, DEFAULT_LOW),
+			);
+		}
+
+		// Pinned so the case still tests 1.0/1.0 semantics under such a run.
+		worker.eviction_watermarks = Watermarks::new(DEFAULT_HIGH, DEFAULT_LOW);
+
+		fill(&objects, &status, &overhead_manager, &mut worker, 1..=18);
+		assert_eq!(used(&status), 18 * per_object);
+
+		let mut buffered_events = Vec::new();
+		worker.apply_evictions(&mut buffered_events).unwrap();
+
+		// Exactly at the cap, not one object under it: the pre-watermark loop
+		// stops the instant `used_size` is no longer *over* `max_size`, and
+		// every published sweep in `results/` was measured against a cache
+		// that settles right there.
+		assert_eq!(used(&status), max_size);
+		assert_eq!(used(&status), 16 * per_object);
+		assert_eq!(objects.len() as u64, 16);
+	}
+
+	#[test]
+	fn a_triggered_pass_drains_past_max_size_and_does_not_rearm_under_the_high_mark() {
+		let (mut worker, objects, status, overhead_manager) = make_worker(16);
+		let per_object = per_object_size(&overhead_manager);
+		let max_size = status.max_size();
+
+		// 0.75 and 0.5 are exact in binary floating point, so the marks are
+		// exactly 12 and 8 objects' worth and no rounding step can hide an
+		// off-by-one settling point.
+		worker.eviction_watermarks = Watermarks::new(0.75, 0.5);
+		assert_eq!(
+			worker.eviction_watermarks.bytes(max_size),
+			(12 * per_object, 8 * per_object),
+		);
+
+		fill(&objects, &status, &overhead_manager, &mut worker, 1..=18);
+		assert!(used(&status) > max_size);
+
+		let mut buffered_events = Vec::new();
+		worker.apply_evictions(&mut buffered_events).unwrap();
+
+		// One pass, and it went well past `max_size` -- the pre-watermark loop
+		// would have stopped at exactly 16 objects' worth.
+		assert_eq!(used(&status), 8 * per_object);
+		assert_eq!(objects.len() as u64, 8);
+		assert!(used(&status) < max_size);
+
+		// Back up to 11 objects: above the drain target, below the trigger.
+		fill(&objects, &status, &overhead_manager, &mut worker, 19..=21);
+		worker.apply_evictions(&mut buffered_events).unwrap();
+
+		// Nothing evicted at all. A pass that re-armed anywhere under the high
+		// mark would drain to 8 again on every set, which is the batch-of-one
+		// behaviour the watermark exists to get rid of.
+		assert_eq!(used(&status), 11 * per_object);
+		assert_eq!(objects.len() as u64, 11);
+	}
+
+	#[test]
+	fn an_inverted_watermark_pair_is_clamped_to_the_high_mark() {
+		assert_eq!(clamped_low(0.75, 0.875), 0.75);
+		assert_eq!(clamped_low(0.75, 0.5), 0.5);
+
+		let (mut worker, objects, status, overhead_manager) = make_worker(16);
+		let per_object = per_object_size(&overhead_manager);
+		let max_size = status.max_size();
+
+		// `low > high`. Unclamped, a pass would arm at 12 objects' worth and
+		// find itself already under a 14-objects'-worth drain target: it would
+		// evict nothing and leave the cache parked above the high mark with no
+		// way back down.
+		worker.eviction_watermarks = Watermarks::new(0.75, 0.875);
+		assert_eq!(
+			worker.eviction_watermarks.bytes(max_size),
+			(12 * per_object, 12 * per_object),
+		);
+
+		fill(&objects, &status, &overhead_manager, &mut worker, 1..=18);
+
+		let mut buffered_events = Vec::new();
+		worker.apply_evictions(&mut buffered_events).unwrap();
+
+		assert_eq!(used(&status), 12 * per_object);
+		assert_eq!(objects.len() as u64, 12);
+	}
+
+	#[test]
+	fn an_internal_capacity_eviction_is_not_extended_to_the_low_watermark() {
+		let (mut worker, objects, status, overhead_manager) = make_worker(16);
+		let per_object = per_object_size(&overhead_manager);
+
+		// Marks that would drain to 8 objects' worth if the internal condition
+		// were ever allowed to arm them.
+		worker.eviction_watermarks = Watermarks::new(0.75, 0.5);
+		worker.policy_stack = Some(Box::new(SubBudgetStack {
+			keys: VecDeque::new(),
+			budget: 2,
+		}));
+
+		fill(&objects, &status, &overhead_manager, &mut worker, 1..=4);
+
+		let mut buffered_events = Vec::new();
+		worker.apply_evictions(&mut buffered_events).unwrap();
+
+		// Four objects is far below even the low mark, so the capacity
+		// condition never fires: the stack drains to its own budget and stops
+		// there, instead of being pulled all the way down to `low * max_size`
+		// by a watermark that has nothing to say about its sub-structure.
+		assert_eq!(objects.len() as u64, 2);
+		assert_eq!(used(&status), 2 * per_object);
 	}
 }
