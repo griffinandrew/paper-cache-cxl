@@ -33,6 +33,42 @@
 //! inside `erase`'s `take`, which unlinks it from the recency order and
 //! reverses its tier accounting in the same operation.
 //!
+//! # The other two, which are the same mistake in reverse
+//!
+//! `remove` and `clear` are no-ops.
+//!
+//! For every other stack these drop the stack's OWN bookkeeping while the
+//! object map keeps its entry, and the worker calls them AFTER the API thread
+//! has already erased from the map -- `PaperCache::del` erases synchronously
+//! and only then broadcasts `Del`; `PaperCache::wipe` calls `objects.clear()`
+//! synchronously and only then broadcasts `Wipe`. Two structures, two removals,
+//! one per structure.
+//!
+//! Here the map IS the stack, so the API thread's erase already did the whole
+//! job and the worker's call is a SECOND removal of the same thing. That is not
+//! merely redundant. Both events are queued, and the worker may not drain them
+//! for up to a poll interval, so a `set()` landing in the window is destroyed:
+//!
+//! ```text
+//!   API thread:     wipe()          -> map emptied, Wipe queued
+//!   API thread:     set(k, v)       -> k live in the map, status counts it
+//!   worker thread:  handle_wipe()   -> stack.clear() -> k DESTROYED
+//!   API thread:     get(k)          -> KeyNotFound, though set() returned Ok
+//! ```
+//!
+//! and `status` can never be corrected, because `del(k)` now finds nothing to
+//! erase -- so `used_size` climbs permanently toward `max_size` on a cache that
+//! is holding less than it thinks. `handle_expire` already carries exactly this
+//! guard (`object_exists`) for exactly this race against the TTL worker;
+//! `handle_del` and `handle_wipe` did not need one until the map and the stack
+//! became the same structure.
+//!
+//! So the rule for this handle is uniform: a method that would MUTATE the map
+//! does nothing, because the caller already mutated it. `evict_one` nominates
+//! rather than removes; `remove` and `clear` do nothing at all. Only the
+//! methods that add information the map does not already have --
+//! `insert_resident`'s size and tier accounting, `update`'s relink -- do work.
+//!
 //! # Tiering
 //!
 //! The seven tiering methods forward to the store rather than taking their
@@ -148,13 +184,11 @@ where
 		self.store.touch(key);
 	}
 
-	fn remove(&mut self, key: HashedKey) {
-		self.store.remove_key(key);
-	}
+	/// Deliberate no-op -- see the module doc's second surprising-method note.
+	fn remove(&mut self, _key: HashedKey) {}
 
-	fn clear(&mut self) {
-		self.store.clear();
-	}
+	/// Deliberate no-op, for the same reason as `remove`.
+	fn clear(&mut self) {}
 
 	/// Nominates the victim WITHOUT removing it -- see the module doc. The
 	/// removal is `erase`'s `take`, which is the same operation on the same

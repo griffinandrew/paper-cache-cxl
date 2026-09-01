@@ -1599,6 +1599,18 @@ where
 				.evict_one()
 				.map(|key| EraseKey::Hashed(key));
 
+			// A split design can legitimately have an empty stack over a
+			// non-empty map -- that divergence is what `erase`'s `None`
+			// fallback exists to clean up, by evicting an arbitrary map entry.
+			// The merged store cannot diverge, so `None` here means the store
+			// is genuinely empty and `erase` can only fail. Without this the
+			// loop `continue`s on unchanged state forever.
+			#[cfg(feature = "merged_object_store")]
+			if maybe_key.is_none() {
+				error!("Nothing left to evict with used_size still over max");
+				break;
+			}
+
 			let erase_result = erase(
 				&self.objects,
 				&self.status,
