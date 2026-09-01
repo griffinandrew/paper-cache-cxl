@@ -62,7 +62,7 @@ where
 {
 	fn run(&mut self) -> Result<(), CacheError> {
 		loop {
-			let now = Instant::now();
+			let now = crate::object::now_ticks();
 
 			for event in self.listener.try_iter() {
 				match event {

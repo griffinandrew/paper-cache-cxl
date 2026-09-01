@@ -68,7 +68,7 @@ struct MergedSlot {
 }
 
 const _: () = assert!(
-	std::mem::size_of::<MergedSlot>() == 48,
+	std::mem::size_of::<MergedSlot>() <= 48,
 	"MergedSlot grew past 48 bytes",
 );
 

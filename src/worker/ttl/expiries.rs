@@ -22,14 +22,14 @@ use crate::{
 	feature = "key_value_pmem",
 	not(feature = "ttl_index_dram"),
 ))]
-type ExpirySet = BTreeSet<(Instant, HashedKey), crate::Hybrid>;
+type ExpirySet = BTreeSet<(u32, HashedKey), crate::Hybrid>;
 
 #[cfg(not(all(
 	feature = "hybrid_cache_common",
 	feature = "key_value_pmem",
 	not(feature = "ttl_index_dram"),
 )))]
-type ExpirySet = BTreeSet<(Instant, HashedKey)>;
+type ExpirySet = BTreeSet<(u32, HashedKey)>;
 
 #[cfg(all(
 	feature = "hybrid_cache_common",
@@ -84,7 +84,7 @@ impl Expiries {
 			return false;
 		};
 
-		*nearest_expiry <= get_expiry_from_ttl(ttl)
+		*nearest_expiry <= get_expiry_from_ttl(ttl).get()
 	}
 
 	pub fn insert(&mut self, key: HashedKey, expiry: ExpireTime) {
@@ -92,7 +92,7 @@ impl Expiries {
 			return;
 		};
 
-		self.set.insert((expiry, key));
+		self.set.insert((expiry.get(), key));
 	}
 
 	/// Removes this key's deadline, if it is still pending.
@@ -106,10 +106,10 @@ impl Expiries {
 			return;
 		};
 
-		self.set.remove(&(expiry, key));
+		self.set.remove(&(expiry.get(), key));
 	}
 
-	pub fn pop_expired(&mut self, now: Instant) -> Option<HashedKey> {
+	pub fn pop_expired(&mut self, now: u32) -> Option<HashedKey> {
 		let (first_expiry, _) = self.set.first()?;
 
 		if *first_expiry > now {
@@ -126,9 +126,10 @@ impl Expiries {
 
 #[cfg(test)]
 mod tests {
-	use std::time::{Duration, Instant};
+	use std::num::NonZeroU32;
 
 	use super::Expiries;
+	use crate::object::now_ticks;
 
 	/// Two live objects that happen to share an expiry `Instant` must both be
 	/// reaped.
@@ -142,20 +143,22 @@ mod tests {
 	/// `base_size` in `used_size` and its eviction-stack entry, until capacity
 	/// eviction happens to pick it.
 	///
-	/// Reaching this in production needs two client threads to read the same
-	/// nanosecond and pick the same integer TTL (`CLOCK_MONOTONIC` resolves to
-	/// 1 ns here and a single thread cannot repeat a value -- the call costs
-	/// ~28 ns). The defect itself is structural, so this test provokes it
-	/// directly rather than racing for it.
+	/// This used to be nearly unreachable: expiry was an `Instant`, so two
+	/// objects had to be set in the same NANOSECOND with the same integer TTL.
+	/// Expiry is now a tick of one SECOND, so sharing a deadline is the common
+	/// case rather than a race -- any two objects set in the same second with
+	/// the same TTL collide. The index keys on `(tick, key)` precisely so the
+	/// key disambiguates them; a `BTreeMap<tick, HashedKey>` would now lose
+	/// keys constantly rather than rarely.
 	#[test]
 	fn both_keys_sharing_an_expiry_instant_are_reaped() {
 		let mut expiries = Expiries::default();
-		let deadline = Instant::now() + Duration::from_secs(60);
+		let deadline = NonZeroU32::new(now_ticks() + 60).unwrap();
 
 		expiries.insert(1, Some(deadline));
 		expiries.insert(2, Some(deadline));
 
-		let after_deadline = deadline + Duration::from_secs(1);
+		let after_deadline = deadline.get() + 1;
 
 		let mut reaped = Vec::new();
 
@@ -178,13 +181,13 @@ mod tests {
 	#[test]
 	fn distinct_deadlines_are_reaped_in_chronological_order() {
 		let mut expiries = Expiries::default();
-		let base = Instant::now() + Duration::from_secs(60);
+		let base = now_ticks() + 60;
 
-		expiries.insert(30, Some(base + Duration::from_secs(30)));
-		expiries.insert(10, Some(base + Duration::from_secs(10)));
-		expiries.insert(20, Some(base + Duration::from_secs(20)));
+		expiries.insert(30, NonZeroU32::new(base + 30));
+		expiries.insert(10, NonZeroU32::new(base + 10));
+		expiries.insert(20, NonZeroU32::new(base + 20));
 
-		let after_all = base + Duration::from_secs(120);
+		let after_all = base + 120;
 
 		let mut reaped = Vec::new();
 

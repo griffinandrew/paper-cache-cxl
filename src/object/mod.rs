@@ -15,7 +15,35 @@ use std::{
 use typesize::TypeSize;
 
 pub type ObjectSize = u32;
-pub type ExpireTime = Option<Instant>;
+/// Expiry as a tick count, where one tick is one second since a process-global
+/// base instant, plus one.
+///
+/// Was `Option<Instant>` -- **16 bytes**, a quarter of the merged store's
+/// 64-byte slot, carrying nanosecond precision that a cache TTL has no use for:
+/// the smallest TTL the API accepts is one second, and no trace in the corpus
+/// sets a TTL at all.
+///
+/// The `+1` is what buys the 4 bytes: `Option<NonZeroU32>` uses zero as its
+/// `None`, so a stored tick must never be zero -- and an object set during the
+/// first second of process life otherwise would be.
+///
+/// u32 seconds is 136 years of uptime, against a base taken once per process.
+pub type ExpireTime = Option<std::num::NonZeroU32>;
+
+/// The instant tick 1 corresponds to. Taken once, on first use.
+fn tick_base() -> Instant {
+	static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+	*BASE.get_or_init(Instant::now)
+}
+
+/// The current tick. Never zero, so it is always a valid `NonZeroU32`.
+pub fn now_ticks() -> u32 {
+	// Saturating rather than wrapping: at 136 years of uptime this pins every
+	// object as already expired, which is wrong but bounded. Wrapping would
+	// make old objects look freshly set.
+	tick_base().elapsed().as_secs().min(u32::MAX as u64 - 1) as u32 + 1
+}
 
 #[derive(Clone)]
 pub struct Object<K, V> {
@@ -204,7 +232,7 @@ impl<K, V> Object<K, V> {
 	}
 
 	pub fn is_expired(&self) -> bool {
-		self.expiry.is_some_and(|expiry| expiry <= Instant::now())
+		self.expiry.is_some_and(|expiry| expiry.get() <= now_ticks())
 	}
 
 	pub fn expires(&mut self, ttl: Option<u32>) {
@@ -215,7 +243,10 @@ impl<K, V> Object<K, V> {
 	}
 }
 
-pub fn get_expiry_from_ttl(ttl: u32) -> Instant {
-	Instant::now() + Duration::from_secs(ttl.into())
+pub fn get_expiry_from_ttl(ttl: u32) -> std::num::NonZeroU32 {
+	// `now_ticks()` is >= 1 and `saturating_add` cannot reach zero from it, so
+	// the `NonZeroU32` is always valid.
+	std::num::NonZeroU32::new(now_ticks().saturating_add(ttl))
+		.expect("now_ticks() is never zero")
 }
 

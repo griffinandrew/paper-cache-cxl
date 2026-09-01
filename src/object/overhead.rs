@@ -143,11 +143,11 @@ const OBJECT_MAP_AND_ARC_OVERHEAD: ObjectSize =
 /// with no residual:
 ///
 /// ```text
-///   slab   64 B/slot   x 1.101 fill = 70.5
+///   slab   56 B/slot   x 1.101 fill = 61.7
 ///   index   4 B/bucket x 1.398 fill =  5.6
-///   jemalloc large-class rounding    =  7.8
+///   jemalloc large-class rounding    =  5.4
 ///                                    -----
-///                                     83.9
+///                                     72.7
 /// ```
 ///
 /// The slab fill was 1.398 under `Vec` doubling and is 1.101 since the growth
@@ -159,7 +159,7 @@ const OBJECT_MAP_AND_ARC_OVERHEAD: ObjectSize =
 /// Against this, the split design costs 67.1 (DashMap row) + 72 (measured
 /// `LruCompactHybridStack`) = 139.1, or + 56 (`LruCompactStack`) = 123.1 flat.
 #[cfg(feature = "merged_object_store")]
-const MERGED_STORE_STRUCTURE_OVERHEAD: ObjectSize = 84;
+const MERGED_STORE_STRUCTURE_OVERHEAD: ObjectSize = 73;
 
 /// Under `merged_object_store` the object map IS the eviction stack, so the
 /// per-policy stack terms below do not apply at all -- there is no second
@@ -443,8 +443,11 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 }
 
 pub fn get_ttl_overhead() -> ObjectSize {
-	// the size of an Option<Instant> plus 48 bytes for the BTreeMap entry
-	mem::size_of::<Option<Instant>>() as ObjectSize + 48
+	// The index stores `(tick, HashedKey)` -- 16 bytes with alignment -- plus
+	// 48 for the BTree node slot. Was `(Instant, HashedKey)` at 24 before
+	// expiry shrank to a 4-byte tick; the tuple pads back to 16 either way, so
+	// the total is unchanged, but the expression now names the real type.
+	mem::size_of::<(u32, crate::HashedKey)>() as ObjectSize + 48
 }
 
 // ── Measured building blocks for the hybrid-cache DRAM reservation below ───

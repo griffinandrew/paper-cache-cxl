@@ -68,7 +68,7 @@ impl<K> TieringObject<K> {
 
     /// Check if the object is expired
     pub fn is_expired(&self) -> bool {
-        self.expiry.is_some_and(|expiry| expiry <= Instant::now())
+        self.expiry.is_some_and(|expiry| expiry.get() <= crate::object::now_ticks())
     }
 }
 
@@ -163,7 +163,7 @@ impl<K> TieringObject<K> {
 
     /// Check if the object is expired
     pub fn is_expired(&self) -> bool {
-        self.expiry.is_some_and(|expiry| expiry <= Instant::now())
+        self.expiry.is_some_and(|expiry| expiry.get() <= crate::object::now_ticks())
     }
 }
 
@@ -236,6 +236,6 @@ impl<K, V> TieringObject<K, V> {
 
     /// Check if the object is expired
     pub fn is_expired(&self) -> bool {
-        self.expiry.is_some_and(|expiry| expiry <= Instant::now())
+        self.expiry.is_some_and(|expiry| expiry.get() <= crate::object::now_ticks())
     }
 }
