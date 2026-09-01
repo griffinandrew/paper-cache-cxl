@@ -80,6 +80,15 @@ mod status;
 #[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 mod object_store;
 
+/// Object map, recency order and tier placement in ONE structure.
+///
+/// Gated, which it was not originally. Compiled unconditionally, a syntax error
+/// in this module broke EVERY configuration -- including builds that do not use
+/// it at all. That is not hypothetical: a refactor of this file took out an
+/// unrelated `lru_compact_hybrid_cache` build mid-flight. Nothing outside the
+/// feature references it, so there was never a reason for it to be reachable
+/// from a build that has the feature off.
+#[cfg(feature = "merged_object_store")]
 pub mod merged_store;
 #[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 mod value_buffer;
