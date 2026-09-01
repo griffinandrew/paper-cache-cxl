@@ -287,6 +287,10 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// and no per-key list node: the slot the index returns already carries
 		// tier, size and frequency. Measured 47.4 B/key against this 48.
 		PaperPolicy::LruCompactHybrid => 24 + 16,
+
+		// Same 8-byte payload as `LruCompactHybrid`: `phys` was paid for out
+		// of padding `LruPayload` already carried, so the layout is unchanged.
+		PaperPolicy::LruLazyCopyCompactHybrid => 24 + 16,
 		PaperPolicy::LfuCompactHybrid => 32 + 16,
 
 		// Worst-case charge for a key resident in main_stack as Fast:
@@ -1686,6 +1690,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			PaperPolicy::LruHybrid => LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LfuHybrid => LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::LruLazyCopyCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LfuCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruSizedCompactHybrid => LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruSizedHybrid => LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,

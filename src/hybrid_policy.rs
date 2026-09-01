@@ -84,7 +84,7 @@ pub fn admission_tier<K>(
 				None => crate::Tier::Fast,
 			}
 		},
-		PaperPolicy::LruHybrid | PaperPolicy::LruCompactHybrid | PaperPolicy::LruSizedHybrid | PaperPolicy::LruSizedCompactHybrid | PaperPolicy::TwoQFastAdmissionHybrid(..) | PaperPolicy::TwoQFastAdmissionCompactHybrid(..) | PaperPolicy::TwoQFastAdmissionReprieveHybrid(..) | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(..) | PaperPolicy::TwoQFullFastAdmissionHybrid(..) | PaperPolicy::TwoQFullFastAdmissionCompactHybrid(..) => {
+		PaperPolicy::LruHybrid | PaperPolicy::LruCompactHybrid | PaperPolicy::LruLazyCopyCompactHybrid | PaperPolicy::LruSizedHybrid | PaperPolicy::LruSizedCompactHybrid | PaperPolicy::TwoQFastAdmissionHybrid(..) | PaperPolicy::TwoQFastAdmissionCompactHybrid(..) | PaperPolicy::TwoQFastAdmissionReprieveHybrid(..) | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(..) | PaperPolicy::TwoQFullFastAdmissionHybrid(..) | PaperPolicy::TwoQFullFastAdmissionCompactHybrid(..) => {
 			// Unconditionally Fast, and correct for every case: a brand-new
 			// key lands in `a1_in`, which is structurally Fast; a re-set of an
 			// `a1_out` key falls through to `promote_from_a1_out`, which makes

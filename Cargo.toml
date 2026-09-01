@@ -188,6 +188,14 @@ lfu_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # lfu_hybrid_cache, one structure instead of three. Measured 47.4 B/key
 # against 95.9, and faster on every trace tested.
 lru_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
+
+# LRU hybrid whose tier COPY is deferred until DRAM pressure demands it. Same
+# eviction policy as lru_compact_hybrid_cache -- identical tier assignment,
+# eviction order and miss ratio -- but a demoted object's bytes stay in DRAM as
+# a CANDIDATE until reclaim reaches them, so a candidate promoted back is a
+# relabel rather than two 16.5 KB crossings. Measured: 66% of that baseline's
+# migration bandwidth is round trips of exactly that shape.
+lru_lazy_copy_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 lfu_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance, segmented-2Q hybrid cache: same one-PaperCache<K,

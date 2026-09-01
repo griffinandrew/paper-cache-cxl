@@ -58,6 +58,10 @@ pub enum PaperPolicy {
 	/// algorithm, one structure instead of three. See
 	/// `LfuCompactHybridStack`.
 	LruCompactHybrid,
+
+	/// Same policy as `LruCompactHybrid`, with the tier copy deferred --
+	/// see `LruLazyCopyCompactHybridStack`.
+	LruLazyCopyCompactHybrid,
 	LfuCompactHybrid,
 	TwoQCompactHybrid(f64),
 	TwoQHybrid(f64),
@@ -125,7 +129,7 @@ impl PaperPolicy {
 	/// Whether this policy is one of the tiered (hybrid) designs.
 	#[must_use]
 	pub fn is_hybrid(&self) -> bool {
-		matches!(self, PaperPolicy::FifoHybrid { .. } | PaperPolicy::FifoCompactHybrid { .. } | PaperPolicy::LfuHybrid { .. } | PaperPolicy::LfuCompactHybrid { .. } | PaperPolicy::LruCompactHybrid { .. } | PaperPolicy::LruHybrid { .. } | PaperPolicy::LruLfuHybrid { .. } | PaperPolicy::LruLfuCompactHybrid { .. } | PaperPolicy::LruSizedHybrid { .. } | PaperPolicy::LruSizedCompactHybrid { .. } | PaperPolicy::S3FifoGhostHybrid { .. } | PaperPolicy::S3FifoGhostCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid { .. } | PaperPolicy::S3FifoHybrid { .. } | PaperPolicy::S3FifoCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionHybrid { .. } | PaperPolicy::TwoQFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQGhostHybrid { .. } | PaperPolicy::TwoQGhostCompactHybrid { .. } | PaperPolicy::TwoQHybrid { .. } | PaperPolicy::S3FifoFaithfulCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulReprieveCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQCompactHybrid { .. })
+		matches!(self, PaperPolicy::FifoHybrid { .. } | PaperPolicy::FifoCompactHybrid { .. } | PaperPolicy::LfuHybrid { .. } | PaperPolicy::LfuCompactHybrid { .. } | PaperPolicy::LruCompactHybrid { .. } | PaperPolicy::LruLazyCopyCompactHybrid { .. } | PaperPolicy::LruHybrid { .. } | PaperPolicy::LruLfuHybrid { .. } | PaperPolicy::LruLfuCompactHybrid { .. } | PaperPolicy::LruSizedHybrid { .. } | PaperPolicy::LruSizedCompactHybrid { .. } | PaperPolicy::S3FifoGhostHybrid { .. } | PaperPolicy::S3FifoGhostCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid { .. } | PaperPolicy::S3FifoHybrid { .. } | PaperPolicy::S3FifoCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionHybrid { .. } | PaperPolicy::TwoQFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQGhostHybrid { .. } | PaperPolicy::TwoQGhostCompactHybrid { .. } | PaperPolicy::TwoQHybrid { .. } | PaperPolicy::S3FifoFaithfulCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulReprieveCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQCompactHybrid { .. })
 	}
 
 	pub fn is_auto(&self) -> bool {
@@ -169,6 +173,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::LruSizedCompactHybrid => write!(f, "lru-sized-compact-hybrid"),
 			PaperPolicy::LruSizedHybrid => write!(f, "lru-sized-hybrid"),
 			PaperPolicy::LruCompactHybrid => write!(f, "lru-compact-hybrid"),
+			PaperPolicy::LruLazyCopyCompactHybrid => write!(f, "lru-lazy-copy-compact-hybrid"),
 			PaperPolicy::LfuCompactHybrid => write!(f, "lfu-compact-hybrid"),
 			PaperPolicy::LruLfuCompactHybrid(promote_k) => write!(f, "lru-lfu-compact-hybrid-{promote_k}"),
 			PaperPolicy::LruLfuHybrid(promote_k) => write!(f, "lru-lfu-hybrid-{promote_k}"),
@@ -276,6 +281,7 @@ impl FromStr for PaperPolicy {
 			"lru-hybrid" => PaperPolicy::LruHybrid,
 			"lfu-hybrid" => PaperPolicy::LfuHybrid,
 			"lru-compact-hybrid" => PaperPolicy::LruCompactHybrid,
+			"lru-lazy-copy-compact-hybrid" => PaperPolicy::LruLazyCopyCompactHybrid,
 			"lfu-compact-hybrid" => PaperPolicy::LfuCompactHybrid,
 			"fifo-compact-hybrid" => PaperPolicy::FifoCompactHybrid,
 			"fifo-hybrid" => PaperPolicy::FifoHybrid,

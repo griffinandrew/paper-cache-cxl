@@ -27,6 +27,7 @@ mod lru_lfu_compact_hybrid_stack;
 mod lru_lfu_hybrid_stack;
 mod lfu_hybrid_stack;
 mod lru_compact_hybrid_stack;
+mod lru_lazy_copy_compact_hybrid_stack;
 mod lfu_compact_hybrid_stack;
 mod two_q_compact_hybrid_stack;
 mod two_q_hybrid_stack;
@@ -109,6 +110,7 @@ use crate::{
 		lru_lfu_hybrid_stack::LruLfuHybridStack,
 		lfu_hybrid_stack::LfuHybridStack,
 		lru_compact_hybrid_stack::LruCompactHybridStack,
+		lru_lazy_copy_compact_hybrid_stack::LruLazyCopyCompactHybridStack,
 		lfu_compact_hybrid_stack::LfuCompactHybridStack,
 		two_q_compact_hybrid_stack::TwoQCompactHybridStack,
 		two_q_hybrid_stack::TwoQHybridStack,
@@ -527,6 +529,21 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::LruCompactHybrid =>
 			Box::new(LruCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
+
+		// The budget handed here is the DRAM allowance; this stack derives its
+		// smaller LOGICAL fast capacity from it, holding back `LAZY_COPY_WINDOW`
+		// as room for candidates.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::LruLazyCopyCompactHybrid => Box::new(
+			LruLazyCopyCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)
+				.with_shared_overhead(
+					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+				),
+		),
+
+		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::LruLazyCopyCompactHybrid =>
+			Box::new(LruLazyCopyCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::LfuCompactHybrid => Box::new(
@@ -1065,11 +1082,11 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 60;
+	const POLICY_VARIANT_COUNT: usize = 61;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the 18
 	/// tiered designs this crate exists to compare.
-	const HYBRID_DESIGN_COUNT: usize = 42;
+	const HYBRID_DESIGN_COUNT: usize = 43;
 
 	/// Every `PaperPolicy` variant, listed explicitly, in declaration order.
 	///
@@ -1108,6 +1125,7 @@ mod init_policy_stack_tests {
 		(PaperPolicy::LruHybrid, PaperPolicy::LruHybrid),
 		(PaperPolicy::LfuHybrid, PaperPolicy::LfuHybrid),
 		(PaperPolicy::LruCompactHybrid, PaperPolicy::LruCompactHybrid),
+		(PaperPolicy::LruLazyCopyCompactHybrid, PaperPolicy::LruLazyCopyCompactHybrid),
 		(PaperPolicy::LfuCompactHybrid, PaperPolicy::LfuCompactHybrid),
 		(PaperPolicy::TwoQCompactHybrid(0.1), PaperPolicy::TwoQCompactHybrid(0.9)),
 		(PaperPolicy::TwoQHybrid(0.1), PaperPolicy::TwoQHybrid(0.9)),
@@ -1178,6 +1196,7 @@ mod init_policy_stack_tests {
 			PaperPolicy::LruHybrid => "LruHybrid",
 			PaperPolicy::LfuHybrid => "LfuHybrid",
 			PaperPolicy::LruCompactHybrid => "LruCompactHybrid",
+			PaperPolicy::LruLazyCopyCompactHybrid => "LruLazyCopyCompactHybrid",
 			PaperPolicy::LfuCompactHybrid => "LfuCompactHybrid",
 			PaperPolicy::TwoQCompactHybrid(_) => "TwoQCompactHybrid",
 			PaperPolicy::TwoQHybrid(_) => "TwoQHybrid",
