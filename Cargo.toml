@@ -67,6 +67,42 @@ global_hashtable_pmem = ["numa_jemalloc"]
 # Use hashbrown HashMap as global hashtable in DRAM (for performance comparison)
 hashbrown_dram = ["numa_jemalloc"]
 
+# Object map, recency order AND tier placement in ONE structure
+# (src/merged_store.rs). 32 shards on the hash's HIGH bits (the index is
+# NoHasher'd and hashbrown buckets on the LOW bits), memcached's
+# ITEM_UPDATE_INTERVAL in accesses via MERGED_UPDATE_INTERVAL, and
+# LruCompactHybridStack's fast_boundary cursor per shard.
+#
+# A FEATURE and not a PaperPolicy variant because the object store is a
+# compile-time choice here: ObjectStore::get_ref returns `impl Deref`, so the
+# trait is not object-safe and `objects` cannot be `dyn`.
+#
+# DOES NOT CURRENTLY SAVE MEMORY. Measured with jemalloc stats.allocated, one
+# point per process, against a DashMap control holding the SAME objects under
+# the same allocator so the value buffer and its Arc cancel. At N = 6,000,000
+# and N = 12,000,000, agreeing to 0.02%:
+#
+#   DashMap alone                 179.1 B/object
+#   MergedStore, sharded+tiered   251.8 B/object   (+72.7)
+#
+# The merge REMOVES an eviction stack measured at 72 B/object
+# (LruCompactHybridStack) or 56 (LruCompactStack) and ADDS 72.7. Against the
+# tiered split design that is a wash; against the flat one it is a loss.
+#
+# An earlier note here claimed 144 B of overhead against 216, a 33% reduction.
+# That was the UNTIERED, UNSHARDED prototype compared against a TIERED stack,
+# which is not a comparison. Two things then made the real figure worse: the
+# slot grew from 24 B of structure to 40 (size, dram_resident, tier for
+# tiering; last_access for cross-shard ordering), and the Vec-backed slab
+# carries its doubling slack on all 72 B of it -- measured slab capacity is
+# 1.40x the object count, so ~29 of the slot's 100.7 B/object is empty.
+#
+# Kept because the STRUCTURAL claims hold and are tested (one lookup reaches
+# object, position and tier; map and stack cannot desynchronise; eviction is
+# exact LRU across shards), and because the remaining cost is attributable
+# rather than mysterious. Not because it is smaller. It is not.
+merged_object_store = ["numa_jemalloc"]
+
 # Enable PMEM-backed eviction stacks. Eviction-stack metadata
 # (PmemHashList/PmemVecList/EntryMap in worker/policy/policy_stack/) is
 # allocated via `crate::Hybrid` (`numa_alloc::SlowObjects`, node-1-bound

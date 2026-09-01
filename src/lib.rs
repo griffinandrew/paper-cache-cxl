@@ -6,7 +6,7 @@
  * correct
  */
 
-#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem"), feature(allocator_api), feature(clone_from_ref), feature(btreemap_alloc))]
+#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "merged_object_store"), feature(allocator_api), feature(clone_from_ref), feature(btreemap_alloc))]
 
 
 // Validate that hashbrown_dram is not enabled with other global hashtable features
@@ -517,8 +517,13 @@ pub type BufferDRAM = Box<[u8], numa_alloc::FastValues>;
 #[cfg(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 const HASHBROWN_INITIAL_CAPACITY: usize = 1_500_000;
 
-#[cfg(all(not(feature = "global_hashtable_pmem"), not(feature = "hashbrown_dram")))]
+#[cfg(all(not(feature = "global_hashtable_pmem"), not(feature = "hashbrown_dram"), not(feature = "merged_object_store")))]
 pub type ObjectMapRef<K, V> = Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>;
+
+/// Object map and LRU eviction order in ONE structure -- see `merged_store`.
+/// Measured 208 B/object against the split design's 280.
+#[cfg(feature = "merged_object_store")]
+pub type ObjectMapRef<K, V> = Arc<crate::merged_store::MergedStore<K, V>>;
 
 #[cfg(feature = "global_hashtable_pmem")]
 pub type ObjectMapRef<K, V> = Arc<RwLock<HashMap<HashedKey, Object<K, V>, BuildHasherDefault<NoHashHasher<HashedKey>>, Hybrid>>>;
@@ -797,7 +802,13 @@ where
 			return Err(CacheError::InvalidPolicy);
 		}
 
+		#[cfg(not(feature = "merged_object_store"))]
 		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+
+		// The merged store is both the object map and the eviction order; the
+		// worker builds its `PolicyStack` from this same `Arc`.
+		#[cfg(feature = "merged_object_store")]
+		let objects = Arc::new(crate::merged_store::MergedStore::new());
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
@@ -1866,7 +1877,76 @@ where
 
 
 
-#[cfg(not(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram")))]
+// merged_erase_marker
+/// `erase` for the merged store.
+///
+/// Two differences from the DashMap version below, both consequences of the
+/// map and the eviction order being one structure:
+///
+///   * removal cannot desynchronise them. `MergedStore::take` unlinks from the
+///     LRU in the same operation that removes from the index, so the
+///     map-greater-than-stack divergence `ERASE_FALLBACK` counts has no way to
+///     occur here.
+///   * the no-key fallback evicts the LRU TAIL rather than an arbitrary object.
+///     The DashMap version takes `objects.iter().next()` because it has no
+///     access to the eviction order; this store IS the eviction order, so the
+///     correct victim is right there.
+#[cfg(feature = "merged_object_store")]
+pub fn erase<K, V>(
+	objects: &ObjectMapRef<K, V>,
+	status: &StatusRef,
+	overhead_manager: &OverheadManagerRef,
+	maybe_key: Option<EraseKey<K>>,
+) -> Result<(HashedKey, Object<K, V>), CacheError>
+where
+	K: Eq + TypeSize,
+	V: TypeSize,
+{
+	let hashed_key = match maybe_key {
+		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
+		Some(EraseKey::Hashed(hashed_key)) => hashed_key,
+
+		None => {
+			crate::ERASE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+			let Some(key) = objects.tail_key() else {
+				error!("Object store is empty with non-zero used size");
+				return Err(CacheError::Internal);
+			};
+
+			key
+		},
+	};
+
+	// Validate before removing, so a hash collision does not evict the wrong
+	// object -- same reason the DashMap version holds an occupied entry.
+	if let Some(EraseKey::Original(ref key, _)) = maybe_key {
+		let matches = objects
+			.get_ref(&hashed_key)
+			.map(|object| object.key_matches(key))
+			.unwrap_or(false);
+
+		if !matches {
+			return Err(CacheError::KeyNotFound);
+		}
+	}
+
+	let Some(object) = objects.take(&hashed_key) else {
+		return Err(CacheError::KeyNotFound);
+	};
+
+	let base_size = overhead_manager.base_size(&object) as i64;
+
+	status.update_base_used_size(-base_size);
+	status.decr_num_objects();
+
+	match !object.is_expired() {
+		true => Ok((hashed_key, object)),
+		false => Err(CacheError::KeyNotFound),
+	}
+}
+
+#[cfg(not(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram", feature = "merged_object_store")))]
 pub fn erase<K, V>(
 	objects: &ObjectMapRef<K, V>,
 	status: &StatusRef,
@@ -1949,9 +2029,14 @@ fn new_hybrid_object_map<K, V>() -> ObjectMapRef<K, V> {
 		)))
 	}
 
-	#[cfg(not(feature = "hashbrown_dram"))]
+	#[cfg(all(not(feature = "hashbrown_dram"), not(feature = "merged_object_store")))]
 	{
 		Arc::new(DashMap::with_hasher(NoHasher::default()))
+	}
+
+	#[cfg(feature = "merged_object_store")]
+	{
+		Arc::new(crate::merged_store::MergedStore::new())
 	}
 }
 

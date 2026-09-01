@@ -686,6 +686,11 @@ use crate::{
 #[cfg(feature = "hybrid_cache_common")]
 pub use policy_stack::Tier;
 
+// Same flattening for the merged store, which needs `Tier` at the crate
+// root without any hybrid feature on -- see `worker/mod.rs`.
+#[cfg(all(feature = "merged_object_store", not(feature = "hybrid_cache_common")))]
+pub(crate) use policy_stack::Tier;
+
 // the polling value must be a power of 2
 const RECONSTRUCT_POLICY_POLLING: usize = 1_048_576;
 
@@ -960,7 +965,21 @@ where
 		);
 
 		let policy = status.policy();
+		#[cfg(not(feature = "merged_object_store"))]
 		let policy_stack = init_policy_stack(policy, max_cache_size);
+
+		// The merged store is both the object map and the eviction stack, so
+		// the stack is built over the SAME `Arc` rather than allocated
+		// alongside it. `init_policy_stack` is bypassed entirely: there is no
+		// second structure for it to construct.
+		#[cfg(feature = "merged_object_store")]
+		let policy_stack: Box<dyn PolicyStack> = Box::new(
+			policy_stack::merged_stack::MergedStackHandle::new(
+				objects.clone(),
+				policy,
+				max_cache_size,
+			),
+		);
 
 		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
 		let (trace_worker, trace_handle) = spawn_trace_worker(
@@ -1052,7 +1071,21 @@ where
 		let mini_stacks = MiniStackManager::new(&[], max_cache_size);
 
 		let policy = status.policy();
+		#[cfg(not(feature = "merged_object_store"))]
 		let policy_stack = init_policy_stack(policy, max_cache_size);
+
+		// The merged store is both the object map and the eviction stack, so
+		// the stack is built over the SAME `Arc` rather than allocated
+		// alongside it. `init_policy_stack` is bypassed entirely: there is no
+		// second structure for it to construct.
+		#[cfg(feature = "merged_object_store")]
+		let policy_stack: Box<dyn PolicyStack> = Box::new(
+			policy_stack::merged_stack::MergedStackHandle::new(
+				objects.clone(),
+				policy,
+				max_cache_size,
+			),
+		);
 
 		// A hybrid cache is always constructed with a single fixed policy and
 		// exposes no way to switch it, so `trace_is_useful` is always false
@@ -1224,11 +1257,25 @@ where
 		}
 	}
 
+	#[cfg_attr(feature = "merged_object_store", allow(unreachable_code))]
 	fn handle_policy(
 		&mut self,
 		policy: PaperPolicy,
 		policy_reconstruct_tx: Arc<Sender<Box<dyn PolicyStack>>>,
 	) {
+		#[cfg(feature = "merged_object_store")]
+		{
+			// Reconstruction replays a trace into a NEW stack and swaps it in.
+			// There is nothing to swap here: the stack is a handle on the object
+			// map, and a second one would be a second view of the same data, not
+			// a rebuilt structure. Unreachable in practice anyway -- a merged
+			// build runs one fixed policy -- but silent divergence is exactly
+			// what this design exists to make impossible, so it is refused
+			// rather than left to the trace-worker guard below.
+			let _ = policy_reconstruct_tx;
+			warn!("Ignoring switch to {policy}: the merged store has one policy");
+			return;
+		}
 		if policy.is_auto() || policy == *self.current_policy.read() {
 			return;
 		}

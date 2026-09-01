@@ -61,6 +61,11 @@ mod s3_fifo_lazy_demotion_reprieve_compact_hybrid_stack;
 mod two_q_compact_stack;
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod merged_prototype;
+
+/// `PolicyStack` over the merged object store -- the store IS the
+/// eviction stack, so this forwards rather than owning anything.
+#[cfg(feature = "merged_object_store")]
+pub(crate) mod merged_stack;
 mod s_three_fifo_compact_stack;
 mod fifo_compact_stack;
 mod clock_compact_stack;

@@ -106,8 +106,33 @@ impl OverheadManager {
 /// fast tier via `get_hybrid_dram_shared_overhead`; a non-tiered design has no
 /// fast tier, so without this it went uncharged entirely and `used_size`
 /// understated real DRAM by ~144 B per object.
+/// Bytes `get_policy_overhead` adds ON TOP of `base_size`.
+///
+/// NOT simply map + Arc. `OBJECT_MAP_ENTRY_OVERHEAD` is an ALLOCATION figure
+/// for the whole `(HashedKey, Object)` row, and `Object` is
+/// `{key, Arc ptr, expiry}` -- so the row already contains the key and the
+/// expiry that `base_size` counts separately. Adding the whole row on top
+/// charged those 24 bytes twice, and `used_size` over-charged every object by
+/// exactly that much: measured, a 64-byte-value object allocates 208 B
+/// (96 row + 48 Arc + 64 value) while `total_size` computed 232.
+///
+/// The error scaled inversely with object size -- ~0.4% on cluster13's 5.6 KB
+/// objects, ~8.8% on cluster19's 100 B ones, where the cache held ~9% fewer
+/// objects than the budget intended.
+const DOUBLE_COUNTED_IN_BASE_SIZE: ObjectSize =
+	core::mem::size_of::<crate::HashedKey>() as ObjectSize
+		+ core::mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
+
 const OBJECT_MAP_AND_ARC_OVERHEAD: ObjectSize =
-	OBJECT_MAP_ENTRY_OVERHEAD + ARC_VALUE_HEADER_OVERHEAD;
+	OBJECT_MAP_ENTRY_OVERHEAD + ARC_VALUE_HEADER_OVERHEAD - DOUBLE_COUNTED_IN_BASE_SIZE;
+
+/// MEASURED_STACK marker: the per-policy terms below are measured, not
+/// hand-counted. See results/measured_stack_allocation.txt -- jemalloc
+/// `stats.allocated`, one process per point, 2^20..2^23, R^2 = 1.000000 on all
+/// seventeen. The previous values were, per this module's own harness comment,
+/// "just rough estimates", and every compact variant carried a flat `16 + 24`
+/// "written by the registration helper and never checked against anything".
+/// Every one understated its stack by 18-100%.
 
 pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// the overheads are just rough estimates of the number of bytes per object
@@ -121,39 +146,39 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// (8-byte key + 4-byte slot + 4-byte frequency), against `Lfu`s
 		// index_map entry + HashList node + key + count, each bucket
 		// carrying its own key-to-node index.
-		PaperPolicy::LfuCompact => 16 + 16 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::Lfu => 24 + 48 + 8 + 4 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::LfuCompact => 56 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::Lfu => 128 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
 		// Slab layout: a 16-byte link-only slot plus one index entry, against
 		// the original's 48-byte HashList node, key, and separate index. The
 		// CLOCK/SIEVE visited bit and MRU's held key live in the index value,
 		// so they cost nothing beyond it.
-		PaperPolicy::FifoCompact => 16 + 12 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::ClockCompact => 16 + 13 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::SieveCompact => 16 + 13 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::MruCompact => 16 + 12 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::FifoCompact => 56 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::ClockCompact => 56 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::SieveCompact => 56 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::MruCompact => 56 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
-		PaperPolicy::Fifo => 48 + 8 + OBJECT_MAP_AND_ARC_OVERHEAD,
-
-		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
-		// 1 byte for the visited flag
-		PaperPolicy::Clock => 48 + 8 + 1 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::Fifo => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 1 byte for the visited flag
-		PaperPolicy::Sieve => 48 + 8 + 1 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::Clock => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
+
+		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
+		// 1 byte for the visited flag
+		PaperPolicy::Sieve => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
 		// Slab layout: a 16-byte link-only slot plus one index entry
 		// (8-byte key + 4-byte slot number, no payload), against
 		// `Lru`s 48-byte HashList node + 8-byte key + the HashLists own
 		// separate key-to-node index.
-		PaperPolicy::LruCompact => 16 + 12 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::Lru => 48 + 8 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::LruCompact => 56 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::Lru => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
-		PaperPolicy::Mru => 48 + 8 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::Mru => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size
@@ -161,12 +186,12 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// finds it (8-byte key + 4-byte slot index + the 8-byte payload
 		// carrying the queue tag and the object size), against the
 		// original's 48-byte `HashList` node + 8-byte key + 4-byte size.
-		PaperPolicy::TwoQCompact(_, _) => 16 + 20 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::TwoQ(_, _) => 48 + 8 + 4 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::TwoQCompact(_, _) => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::TwoQ(_, _) => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size
-		PaperPolicy::Arc => 48 + 8 + 4 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::Arc => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size, 1 byte for the frequency count
@@ -177,8 +202,8 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// 4-byte size + 1-byte freq. Like `SThreeFifo` above, neither
 		// charge covers the bare-key ghost queue, so the two stay
 		// directly comparable.
-		PaperPolicy::SThreeFifoCompact(_) => 16 + 20 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::SThreeFifo(_) => 48 + 8 + 4 + 1 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::SThreeFifoCompact(_) => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::SThreeFifo(_) => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 24 bytes for the single combined per-key `entries` HashMap entry

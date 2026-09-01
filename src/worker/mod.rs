@@ -240,3 +240,9 @@ pub use crate::worker::tiering::TieringWorker;
 // return type, shared by every hybrid design.
 #[cfg(feature = "hybrid_cache_common")]
 pub use crate::worker::policy::Tier;
+
+// The same flattening, crate-visible only, for the merged store: it lives
+// at the crate root and so cannot see through the private `worker::policy`,
+// and it tags every slot with a `Tier` whether or not a hybrid feature is on.
+#[cfg(all(feature = "merged_object_store", not(feature = "hybrid_cache_common")))]
+pub(crate) use crate::worker::policy::Tier;
