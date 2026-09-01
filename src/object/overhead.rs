@@ -126,6 +126,53 @@ const DOUBLE_COUNTED_IN_BASE_SIZE: ObjectSize =
 const OBJECT_MAP_AND_ARC_OVERHEAD: ObjectSize =
 	OBJECT_MAP_ENTRY_OVERHEAD + ARC_VALUE_HEADER_OVERHEAD - DOUBLE_COUNTED_IN_BASE_SIZE;
 
+/// The merged store's structural cost per object, replacing BOTH the map row
+/// and the eviction stack.
+///
+/// Measured on the same harness as everything else here -- jemalloc
+/// `stats.allocated`, one point per process -- at N = 6,000,000 and
+/// N = 12,000,000, agreeing to within 0.01%:
+///
+/// ```text
+///   DashMap alone                          179.11 B/object
+///   MergedStore (chained index, 64 B slot) 207.07 B/object
+/// ```
+///
+/// Both figures include the 64-byte value and its `Arc` (112 B), which is
+/// common to the two designs and cancels. What is left is attributable exactly,
+/// with no residual:
+///
+/// ```text
+///   slab   64 B/slot   x 1.398 fill = 89.5
+///   index   4 B/bucket x 1.398 fill =  5.6
+///                                    -----
+///                                     95.1
+/// ```
+///
+/// The 1.398 is `Vec` doubling slack, measured (slab capacity 8,388,608 for
+/// 6,000,000 objects), not assumed. A chunked slab would recover most of it.
+///
+/// Against this, the split design costs 67.1 (DashMap row) + 72 (measured
+/// `LruCompactHybridStack`) = 139.1, or + 56 (`LruCompactStack`) = 123.1 flat.
+#[cfg(feature = "merged_object_store")]
+const MERGED_STORE_STRUCTURE_OVERHEAD: ObjectSize = 95;
+
+/// Under `merged_object_store` the object map IS the eviction stack, so the
+/// per-policy stack terms below do not apply at all -- there is no second
+/// structure to charge for. Charging them anyway is what left the measured
+/// saving entirely unrealized: `used_size` kept billing every object for a
+/// stack row that no longer exists, so the cache held fewer objects than its
+/// budget allowed and the saving showed up nowhere.
+///
+/// Same shape as `OBJECT_MAP_AND_ARC_OVERHEAD`: the slot embeds the `Object`,
+/// hence contains the key and expiry that `base_size` counts separately, so
+/// those 24 bytes come back off.
+#[cfg(feature = "merged_object_store")]
+pub fn get_policy_overhead(_policy: &PaperPolicy) -> ObjectSize {
+	MERGED_STORE_STRUCTURE_OVERHEAD + ARC_VALUE_HEADER_OVERHEAD
+		- DOUBLE_COUNTED_IN_BASE_SIZE
+}
+
 /// MEASURED_STACK marker: the per-policy terms below are measured, not
 /// hand-counted. See results/measured_stack_allocation.txt -- jemalloc
 /// `stats.allocated`, one process per point, 2^20..2^23, R^2 = 1.000000 on all
@@ -134,6 +181,7 @@ const OBJECT_MAP_AND_ARC_OVERHEAD: ObjectSize =
 /// "written by the registration helper and never checked against anything".
 /// Every one understated its stack by 18-100%.
 
+#[cfg(not(feature = "merged_object_store"))]
 pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// the overheads are just rough estimates of the number of bytes per object
 
@@ -1587,6 +1635,29 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// every sibling test constructing a cache on another thread.
 	if std::env::var_os("PAPER_DISABLE_SHARED_OVERHEAD").is_some_and(|v| v == "1") {
 		return 0;
+	}
+
+	// Under `merged_object_store` there is no eviction stack to reserve DRAM
+	// for, and the map row is the merged store's slot -- so the whole
+	// per-policy match below names structures that do not exist in this build.
+	// The merged store reserves its OWN structure instead: the measured
+	// slot+bucket cost plus the `Arc` header, all of which is DRAM-resident in
+	// either tier because only the value buffer migrates.
+	//
+	// Without this the fast tier is charged the split design's ~192 B/object
+	// for metadata it does not have, so it demotes far earlier than it should
+	// and the merged build would be measured on a smaller effective fast tier
+	// than the baseline it is being compared against.
+	#[cfg(feature = "merged_object_store")]
+	{
+		let _ = policy;
+		return MERGED_STORE_STRUCTURE_OVERHEAD + ARC_VALUE_HEADER_OVERHEAD;
+	}
+
+	#[cfg(feature = "merged_object_store")]
+	#[allow(unreachable_code)]
+	{
+		unreachable!()
 	}
 
 	#[allow(unused_mut)]

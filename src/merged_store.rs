@@ -29,6 +29,27 @@
 //! this key, and which tier is it in?". Merging answers both for free: finding
 //! the object IS finding its position and its tier.
 //!
+//! # The index is chained, not a second HashMap
+//!
+//! The first sharded revision kept a `HashMap<HashedKey, u32, NoHasher>` per
+//! shard and measured 251.8 B/object against a DashMap control's 179.1 -- it
+//! removed a 72 B/object eviction stack and added 72.7, which is not a saving.
+//! The reason was structural: a `HashMap` index does not remove a hash table,
+//! it MOVES one. DashMap stores the object in the bucket (41 B/bucket); that
+//! design stored a `u32` in a hashbrown bucket (17 B) AND the object in a slab
+//! slot, so it paid for both.
+//!
+//! So the index is now CacheLib's `ChainedHashTable`: a flat `Vec<u32>` of slot
+//! ids, one per bucket, with the chain threaded through a `hash_next` field in
+//! the slot itself -- CacheLib's `hashHook_`. 4 bytes per bucket instead of 17,
+//! no second copy of the key, and no second allocation to keep sized.
+//!
+//! Chaining rather than open addressing is what makes this composable at all:
+//! the chain link lives in a slot that already exists, so the table's marginal
+//! cost is the bucket array alone. Load factor 1.0 -- mean chain length 1 --
+//! rather than hashbrown's 7/8, because a chain does not degrade at high load
+//! the way a probe sequence does.
+//!
 //! # Sharding, and memcached's two tricks
 //!
 //! The first revision used one `RwLock` over the whole store, on the reasoning
@@ -50,11 +71,11 @@
 //!
 //! ## Sharding on the HIGH bits
 //!
-//! The index is `HashMap<HashedKey, _, NoHasher>`: the key IS the hash. hashbrown
-//! selects a bucket with the LOW bits of that hash, so sharding on the low bits
-//! would hold them constant inside a shard and drive every key in it to one
-//! bucket. Shard on the high bits, which is what DashMap does and why DashMap
-//! and `NoHasher` compose in the first place.
+//! The key IS the hash -- the store is `NoHasher`d -- and a bucket is selected
+//! with the LOW bits of it. Sharding on the low bits too would hold them
+//! constant inside a shard and drive every key in it to one bucket. Shard on
+//! the high bits, which is what DashMap does and why DashMap and `NoHasher`
+//! compose in the first place.
 //!
 //! ## Sharding without losing the order
 //!
@@ -85,9 +106,11 @@
 //!
 //! # Slot recycling
 //!
-//! `generation` bumps on every free, so a stale index fails loudly rather than
-//! silently addressing whatever now occupies the slot -- the failure
-//! `pmem_collections.rs` shipped when it dropped `dlv_list`'s equivalent.
+//! A freed slot goes on `free` and is reused whole. The `generation` counter an
+//! earlier revision carried is gone: it guarded against a stale `u32` outliving
+//! its slot, and with the index chained there is no `u32` handed out to anyone
+//! -- `MergedRef` holds one only for as long as it holds the shard guard, which
+//! is exactly as long as the slot cannot be recycled.
 
 use std::{
 	collections::HashMap,
@@ -126,8 +149,18 @@ fn shard_of(key: HashedKey) -> usize {
 #[repr(align(64))]
 struct TailSeq(AtomicU64);
 
-/// Empty shard: sorts after every real counter, so `min` skips it.
+/// A shard with nothing in it, distinguishable from a real `last_access` of 0.
 const EMPTY_TAIL: u64 = u64::MAX;
+
+/// Buckets a fresh shard starts with. 32 shards x 16 x 4 B = 2 KB of baseline,
+/// and the table doubles from there.
+const INITIAL_BUCKETS: usize = 16;
+
+/// Live entries per bucket before the table doubles. 1.0, not hashbrown's 7/8:
+/// a chain degrades linearly with load where a probe sequence degrades sharply,
+/// so chaining can be run full and spend the difference on memory instead.
+const MAX_LOAD_NUMER: usize = 1;
+const MAX_LOAD_DENOM: usize = 1;
 
 struct Slot<K, V> {
 	/// `Option` so `take` can move the object out without disturbing the slab.
@@ -139,16 +172,28 @@ struct Slot<K, V> {
 	hashed: HashedKey,
 	prev: u32,
 	next: u32,
-	generation: u32,
+	/// Next slot in this key's hash-bucket chain, `NIL` at the end --
+	/// CacheLib's `hashHook_`. Threading the chain through the slot is what
+	/// lets the index cost 4 bytes a bucket instead of a whole hashbrown row.
+	hash_next: u32,
 	size: ObjectSize,
+	/// Access counter at the last relink, TRUNCATED to 32 bits. Double duty:
+	/// the update-interval check, and the cross-shard comparison that keeps
+	/// eviction picking the true LRU tail. Both are done on the wrapping
+	/// difference against the current clock, so truncation is exact as long as
+	/// no live slot goes un-relinked for 2^32 accesses -- four billion, against
+	/// a 306M-record trace.
+	last_access: u32,
 	/// Part of `size` that stays in DRAM whichever tier holds the object.
 	dram_resident: u8,
 	tier: Tier,
-	/// Access counter at the last relink. Double duty: the update-interval
-	/// check, and the cross-shard comparison that keeps eviction picking the
-	/// true LRU tail.
-	last_access: u64,
 }
+
+const _: () = assert!(
+	core::mem::size_of::<Slot<u64, std::sync::Arc<[u8]>>>() <= 64,
+	"Slot grew past 64 bytes -- the whole point is that it is smaller than a \
+	 DashMap row plus an eviction-stack row",
+);
 
 impl<K, V> Slot<K, V> {
 	/// Bytes that actually move between tiers. `Object::set_data` migrates the
@@ -160,7 +205,12 @@ impl<K, V> Slot<K, V> {
 }
 
 struct Inner<K, V> {
-	index: HashMap<HashedKey, u32, NoHasher>,
+	/// One slot id per bucket, `NIL` when empty; the rest of the chain is in
+	/// each slot's `hash_next`. Always a power of two so a bucket is a mask.
+	buckets: Vec<u32>,
+	/// Live entries, which `buckets.len()` is grown to keep up with. Not
+	/// derivable from `slots.len()`, which counts recycled slots too.
+	live: usize,
 	slots: Vec<Slot<K, V>>,
 	free: Vec<u32>,
 
@@ -183,7 +233,8 @@ struct Inner<K, V> {
 impl<K, V> Inner<K, V> {
 	fn new() -> Self {
 		Inner {
-			index: HashMap::with_hasher(NoHasher::default()),
+			buckets: vec![NIL; INITIAL_BUCKETS],
+			live: 0,
 			slots: Vec::new(),
 			free: Vec::new(),
 			head: NIL,
@@ -193,6 +244,107 @@ impl<K, V> Inner<K, V> {
 			slow_used: 0,
 			fast_count: 0,
 			migrations: Vec::new(),
+		}
+	}
+
+	/// The LOW bits pick the bucket; the shard already took the high ones, so
+	/// the two selections are independent and every bucket stays reachable.
+	#[inline]
+	fn bucket_of(&self, key: HashedKey) -> usize {
+		(key as usize) & (self.buckets.len() - 1)
+	}
+
+	/// Walk one bucket chain. Mean length 1 at load factor 1.0.
+	#[inline]
+	fn find(&self, key: HashedKey) -> Option<u32> {
+		let mut i = self.buckets[self.bucket_of(key)];
+
+		while i != NIL {
+			let slot = &self.slots[i as usize];
+
+			if slot.hashed == key {
+				return Some(i);
+			}
+
+			i = slot.hash_next;
+		}
+
+		None
+	}
+
+	/// Push onto the front of the key's chain, and double the table if that
+	/// took it past the load factor.
+	///
+	/// Front insertion is deliberate: a freshly inserted key is the one most
+	/// likely to be looked up next, so it should be the first link walked.
+	fn bucket_link(&mut self, i: u32) {
+		let b = self.bucket_of(self.slots[i as usize].hashed);
+
+		self.slots[i as usize].hash_next = self.buckets[b];
+		self.buckets[b] = i;
+		self.live += 1;
+
+		if self.live * MAX_LOAD_DENOM > self.buckets.len() * MAX_LOAD_NUMER {
+			self.grow_buckets();
+		}
+	}
+
+	/// Unlink by key, repairing the predecessor's `hash_next`.
+	fn bucket_unlink(&mut self, key: HashedKey) -> Option<u32> {
+		let b = self.bucket_of(key);
+		let mut i = self.buckets[b];
+		let mut prev = NIL;
+
+		while i != NIL {
+			let (hashed, next) = {
+				let slot = &self.slots[i as usize];
+				(slot.hashed, slot.hash_next)
+			};
+
+			if hashed == key {
+				match prev {
+					NIL => self.buckets[b] = next,
+					prev => self.slots[prev as usize].hash_next = next,
+				}
+
+				self.slots[i as usize].hash_next = NIL;
+				self.live -= 1;
+
+				return Some(i);
+			}
+
+			prev = i;
+			i = next;
+		}
+
+		None
+	}
+
+	/// Double the table and re-thread every chain.
+	///
+	/// Rehashing walks the RECENCY list rather than the old buckets, because
+	/// that list holds exactly the live slots -- `slots` also holds recycled
+	/// ones, and reading a recycled slot's stale `hashed` would resurrect a
+	/// dead key into a chain.
+	fn grow_buckets(&mut self) {
+		let n = self.buckets.len() * 2;
+
+		self.buckets.clear();
+		self.buckets.resize(n, NIL);
+
+		let mut i = self.head;
+
+		while i != NIL {
+			let (key, next) = {
+				let slot = &self.slots[i as usize];
+				(slot.hashed, slot.next)
+			};
+
+			let b = (key as usize) & (n - 1);
+			self.slots[i as usize].hash_next = self.buckets[b];
+			self.buckets[b] = i;
+
+			i = next;
 		}
 	}
 
@@ -267,10 +419,7 @@ impl<K, V> Inner<K, V> {
 		self.detach_tier(i);
 		self.unlink(i);
 
-		let s = &mut self.slots[i as usize];
-		s.generation = s.generation.wrapping_add(1);
-		s.object = None;
-
+		self.slots[i as usize].object = None;
 		self.free.push(i);
 	}
 
@@ -299,7 +448,7 @@ impl<K, V> Inner<K, V> {
 			}
 		}
 
-		self.slots[i as usize].last_access = now;
+		self.slots[i as usize].last_access = now as u32;
 
 		let mut promoted = false;
 
@@ -335,7 +484,7 @@ impl<K, V> Inner<K, V> {
 	fn settle_fast_tier(&mut self, budget: TierBudget) {
 		let effective = budget
 			.per_shard_capacity
-			.saturating_sub(self.index.len() as CacheSize * budget.shared_overhead);
+			.saturating_sub(self.live as CacheSize * budget.shared_overhead);
 
 		if self.fast_used <= scale(effective, budget.high_ppm) {
 			return;
@@ -369,7 +518,7 @@ impl<K, V> Inner<K, V> {
 	fn tail_seq(&self) -> u64 {
 		match self.tail {
 			NIL => EMPTY_TAIL,
-			t => self.slots[t as usize].last_access,
+			t => self.slots[t as usize].last_access as u64,
 		}
 	}
 }
@@ -532,9 +681,14 @@ impl<K, V> MergedStore<K, V> {
 		if self.update_interval > 0 {
 			let g = self.shards[s].read().unwrap();
 
-			let Some(&i) = g.index.get(&key) else { return };
+			let Some(i) = g.find(key) else { return };
 
-			if now.saturating_sub(g.slots[i as usize].last_access) < self.update_interval {
+			// Wrapping, because `last_access` is the clock truncated to 32
+			// bits: the difference is what matters and it is exact until a slot
+			// goes 2^32 accesses without a relink.
+			let age = (now as u32).wrapping_sub(g.slots[i as usize].last_access) as u64;
+
+			if age < self.update_interval {
 				return;
 			}
 		}
@@ -542,7 +696,7 @@ impl<K, V> MergedStore<K, V> {
 		let budget = self.budget();
 		let mut g = self.shards[s].write().unwrap();
 
-		let Some(&i) = g.index.get(&key) else { return };
+		let Some(i) = g.find(key) else { return };
 
 		g.touch_slot(i, now, budget);
 		self.note_migrations(&g);
@@ -568,7 +722,7 @@ impl<K, V> MergedStore<K, V> {
 		let s = shard_of(key);
 		let mut g = self.shards[s].write().unwrap();
 
-		let Some(&i) = g.index.get(&key) else { return };
+		let Some(i) = g.find(key) else { return };
 
 		// Re-size first so the tier accounting below moves the right number of
 		// bytes, exactly as `LruCompactHybridStack::resize_key` does.
@@ -601,14 +755,25 @@ impl<K, V> MergedStore<K, V> {
 	/// within itself, so the global LRU object is necessarily some shard's
 	/// tail, and the oldest of those tails is it.
 	pub fn tail_key(&self) -> Option<HashedKey> {
-		let mut best = EMPTY_TAIL;
+		// Compared as AGE against the current clock rather than as a raw
+		// counter, because `last_access` is truncated to 32 bits and raw values
+		// stop being ordered once the clock wraps. The difference stays exact.
+		let now = self.clock.load(Ordering::Relaxed) as u32;
+
+		let mut best_age = 0u32;
 		let mut best_shard = usize::MAX;
 
 		for (s, t) in self.tails.iter().enumerate() {
-			let seq = t.0.load(Ordering::Relaxed);
+			let raw = t.0.load(Ordering::Relaxed);
 
-			if seq < best {
-				best = seq;
+			if raw == EMPTY_TAIL {
+				continue;
+			}
+
+			let age = now.wrapping_sub(raw as u32);
+
+			if best_shard == usize::MAX || age > best_age {
+				best_age = age;
 				best_shard = s;
 			}
 		}
@@ -626,7 +791,7 @@ impl<K, V> MergedStore<K, V> {
 	}
 
 	pub fn contains_key(&self, key: &HashedKey) -> bool {
-		self.shards[shard_of(*key)].read().unwrap().index.contains_key(key)
+		self.shards[shard_of(*key)].read().unwrap().find(*key).is_some()
 	}
 
 	pub fn contains(&self, key: HashedKey) -> bool {
@@ -644,15 +809,12 @@ impl<K, V> MergedStore<K, V> {
 	pub fn take(&self, key: &HashedKey) -> Option<Object<K, V>> {
 		let s = shard_of(*key);
 		let mut g = self.shards[s].write().unwrap();
-		let i = g.index.remove(key)?;
+		let i = g.bucket_unlink(*key)?;
 
 		g.detach_tier(i);
 		g.unlink(i);
 
-		let slot = &mut g.slots[i as usize];
-		slot.generation = slot.generation.wrapping_add(1);
-		let taken = slot.object.take();
-
+		let taken = g.slots[i as usize].object.take();
 		g.free.push(i);
 		self.publish_tail(s, &g);
 		self.tracked.fetch_sub(1, Ordering::Relaxed);
@@ -664,7 +826,7 @@ impl<K, V> MergedStore<K, V> {
 		let s = shard_of(key);
 		let mut g = self.shards[s].write().unwrap();
 
-		let Some(i) = g.index.remove(&key) else { return false };
+		let Some(i) = g.bucket_unlink(key) else { return false };
 
 		g.retire(i);
 		self.publish_tail(s, &g);
@@ -675,14 +837,14 @@ impl<K, V> MergedStore<K, V> {
 
 	pub fn get_ref(&self, key: &HashedKey) -> Option<MergedRef<'_, K, V>> {
 		let guard = self.shards[shard_of(*key)].read().unwrap();
-		let slot = *guard.index.get(key)?;
+		let slot = guard.find(*key)?;
 
 		Some(MergedRef { guard, slot })
 	}
 
 	pub fn get_mut_ref(&self, key: &HashedKey) -> Option<MergedRefMut<'_, K, V>> {
 		let guard = self.shards[shard_of(*key)].write().unwrap();
-		let slot = *guard.index.get(key)?;
+		let slot = guard.find(*key)?;
 
 		Some(MergedRefMut { guard, slot })
 	}
@@ -698,7 +860,7 @@ impl<K, V> MergedStore<K, V> {
 		let s = shard_of(key);
 		let mut g = self.shards[s].write().unwrap();
 
-		if let Some(&i) = g.index.get(&key) {
+		if let Some(i) = g.find(key) {
 			let old = g.slots[i as usize].object.replace(object);
 
 			g.touch_slot(i, now, budget);
@@ -713,17 +875,16 @@ impl<K, V> MergedStore<K, V> {
 			hashed: key,
 			prev: NIL,
 			next: NIL,
-			generation: 0,
+			hash_next: NIL,
 			size: 0,
+			last_access: now as u32,
 			dram_resident: 0,
 			tier: Tier::Fast,
-			last_access: now,
 		};
 
 		let i = match g.free.pop() {
 			Some(i) => {
-				let prev_gen = g.slots[i as usize].generation;
-				g.slots[i as usize] = Slot { generation: prev_gen, ..fresh };
+				g.slots[i as usize] = fresh;
 				i
 			},
 
@@ -734,7 +895,10 @@ impl<K, V> MergedStore<K, V> {
 		};
 
 		g.link_front(i);
-		g.index.insert(key, i);
+
+		// AFTER `link_front`: `bucket_link` can trigger a grow, and a grow
+		// rehashes by walking the recency list, so the slot has to be on it.
+		g.bucket_link(i);
 		g.fast_count += 1;
 
 		if g.fast_boundary == NIL {
@@ -757,7 +921,9 @@ impl<K, V> MergedStore<K, V> {
 		for (s, lock) in self.shards.iter().enumerate() {
 			let mut g = lock.write().unwrap();
 
-			g.index.clear();
+			g.buckets.clear();
+			g.buckets.resize(INITIAL_BUCKETS, NIL);
+			g.live = 0;
 			g.slots.clear();
 			g.free.clear();
 			g.head = NIL;
@@ -851,7 +1017,7 @@ impl<K, V> MergedStore<K, V> {
 			.iter()
 			.map(|lock| {
 				let g = lock.read().unwrap();
-				(g.slots.capacity(), g.index.capacity(), g.free.capacity())
+				(g.slots.capacity(), g.buckets.len(), g.free.capacity())
 			})
 			.fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
 	}
@@ -859,7 +1025,7 @@ impl<K, V> MergedStore<K, V> {
 	/// The tier `key` is currently placed in, for tests and fidelity checks.
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
 		let g = self.shards[shard_of(key)].read().unwrap();
-		let i = *g.index.get(&key)?;
+		let i = g.find(key)?;
 
 		Some(g.slots[i as usize].tier)
 	}
@@ -938,7 +1104,15 @@ mod tests {
 			.iter()
 			.map(|lock| {
 				let g = lock.read().unwrap();
-				g.index.values().map(|&i| g.slots[i as usize].migrating()).sum::<CacheSize>()
+				let mut total = 0;
+				let mut i = g.head;
+
+				while i != NIL {
+					total += g.slots[i as usize].migrating();
+					i = g.slots[i as usize].next;
+				}
+
+				total
 			})
 			.sum()
 	}
@@ -1205,30 +1379,203 @@ mod tests {
 		assert_eq!(exact.tail_key(), Some(cold), "exact mode must relink");
 	}
 
-	/// A recycled slot must not be silently addressable through a stale index.
+	/// Every live slot must be reachable from its own bucket, exactly once,
+	/// and no recycled slot may be reachable at all.
+	///
+	/// The invariant a chained table lives or dies on. A dangling `hash_next`
+	/// into a recycled slot would resurrect a dead key -- `find` would return a
+	/// slot whose `hashed` happens to still match, handing the caller an object
+	/// that was deleted.
 	#[test]
-	fn recycled_slots_bump_their_generation() {
+	fn bucket_chains_hold_exactly_the_live_slots() {
 		let s = tiered(CacheSize::MAX);
-		let k = mix(9);
+		let mut alive: Vec<HashedKey> = Vec::new();
 
-		put(&s, k, 64);
+		// Churn hard enough to recycle slots and to force several doublings.
+		for i in 1..=4_000u64 {
+			let k = mix(i);
+			put(&s, k, 128);
+			alive.push(k);
 
-		let before = {
-			let g = s.shards[shard_of(k)].read().unwrap();
-			let i = g.index[&k];
-			g.slots[i as usize].generation
+			if i % 3 == 0 {
+				let victim = alive.remove(i as usize % alive.len());
+				assert!(s.remove_key(victim), "remove of a live key failed");
+			}
+		}
+
+		for &k in &alive {
+			assert!(s.contains(k), "live key {k:#x} is not reachable from its bucket");
+		}
+
+		let mut chained = 0usize;
+
+		for lock in s.shards.iter() {
+			let g = lock.read().unwrap();
+
+			// Everything on a chain must also be on the recency list.
+			let mut on_list = std::collections::HashSet::new();
+			let mut i = g.head;
+
+			while i != NIL {
+				assert!(on_list.insert(i), "the recency list contains a cycle");
+				i = g.slots[i as usize].next;
+			}
+
+			for b in 0..g.buckets.len() {
+				let mut i = g.buckets[b];
+				let mut walked = 0usize;
+
+				while i != NIL {
+					assert!(
+						on_list.contains(&i),
+						"slot {i} is on a chain but not on the recency list -- it \
+						 is recycled and would resurrect a deleted key",
+					);
+					assert_eq!(
+						g.bucket_of(g.slots[i as usize].hashed),
+						b,
+						"slot {i} is in the wrong bucket",
+					);
+
+					chained += 1;
+					walked += 1;
+					assert!(walked <= g.live + 1, "bucket {b} chain does not terminate");
+					i = g.slots[i as usize].hash_next;
+				}
+			}
+
+			assert_eq!(on_list.len(), g.live, "live count disagrees with the list");
+		}
+
+		assert_eq!(chained, s.len(), "chain membership disagrees with the tracked total");
+		assert_eq!(chained, alive.len(), "chain membership disagrees with what was kept");
+	}
+
+	/// The table must actually double, and carry every key across each rehash.
+	#[test]
+	fn growth_rehashes_without_losing_a_key() {
+		let s = tiered(CacheSize::MAX);
+
+		let start: usize = {
+			let g = s.shards[0].read().unwrap();
+			g.buckets.len()
 		};
 
-		s.take(&k);
-		put(&s, k, 64);
+		let keys: Vec<HashedKey> = (1..=20_000u64).map(mix).collect();
 
-		let after = {
-			let g = s.shards[shard_of(k)].read().unwrap();
-			let i = g.index[&k];
-			g.slots[i as usize].generation
+		for &k in &keys {
+			put(&s, k, 64);
+		}
+
+		let grown: usize = {
+			let g = s.shards[0].read().unwrap();
+			g.buckets.len()
 		};
 
-		assert_eq!(after, before.wrapping_add(1), "the freed slot kept its generation");
+		assert!(grown > start, "the table never grew: {start} -> {grown}");
+
+		for &k in &keys {
+			assert!(s.contains(k), "key {k:#x} was lost across a rehash");
+		}
+
+		// Load factor 1.0 means buckets never exceed 2x the live count -- one
+		// doubling past the trigger -- which is the memory claim being made.
+		for lock in s.shards.iter() {
+			let g = lock.read().unwrap();
+			assert!(
+				g.buckets.len() <= 2 * g.live.max(INITIAL_BUCKETS),
+				"a shard over-provisioned its table: {} buckets for {} entries",
+				g.buckets.len(),
+				g.live,
+			);
+		}
+	}
+
+	/// A taken key must leave no trace on its chain.
+	#[test]
+	fn taking_a_key_clears_its_chain_entry() {
+		let s = tiered(CacheSize::MAX);
+
+		// Three keys deliberately sharing one bucket, so removal has to repair
+		// a predecessor link rather than just a bucket head.
+		let g0 = s.shards[0].read().unwrap();
+		let nb = g0.buckets.len() as u64;
+		drop(g0);
+
+		let collide: Vec<HashedKey> = (0..3u64).map(|i| (i + 1) * nb).collect();
+
+		for &k in &collide {
+			assert_eq!(shard_of(k), shard_of(collide[0]), "keys must share a shard");
+			put(&s, k, 64);
+		}
+
+		{
+			let g = s.shards[shard_of(collide[0])].read().unwrap();
+			let b = g.bucket_of(collide[0]);
+			assert_eq!(
+				collide.iter().filter(|k| g.bucket_of(**k) == b).count(),
+				3,
+				"the keys did not actually collide",
+			);
+		}
+
+		// Remove the MIDDLE of the chain.
+		assert!(s.take(&collide[1]).is_some());
+		assert!(!s.contains(collide[1]), "a taken key is still reachable");
+		assert!(s.contains(collide[0]), "removing the middle broke the chain head");
+		assert!(s.contains(collide[2]), "removing the middle orphaned the tail");
+
+		// And reinserting it must not double-link.
+		put(&s, collide[1], 64);
+
+		let g = s.shards[shard_of(collide[0])].read().unwrap();
+		let b = g.bucket_of(collide[1]);
+		let mut i = g.buckets[b];
+		let mut hits = 0;
+
+		while i != NIL {
+			if g.slots[i as usize].hashed == collide[1] {
+				hits += 1;
+			}
+
+			i = g.slots[i as usize].hash_next;
+		}
+
+		assert_eq!(hits, 1, "the reinserted key appears {hits} times on its chain");
+	}
+
+	/// `last_access` is the clock truncated to 32 bits, so cross-shard ordering
+	/// is done on the wrapping difference. Raw comparison would invert here.
+	#[test]
+	fn cross_shard_ordering_survives_the_32_bit_wrap() {
+		let s = tiered(CacheSize::MAX);
+
+		let older = 0u64;
+		let newer = u64::MAX;
+
+		assert_ne!(shard_of(older), shard_of(newer), "the keys must be in different shards");
+
+		put(&s, older, 64);
+		put(&s, newer, 64);
+
+		// Clock sits just past a wrap; `older` was last touched 116 accesses
+		// ago and `newer` 84, but `older`'s RAW counter is the larger of the
+		// two. A raw `min` picks the wrong victim.
+		s.clock.store((1u64 << 32) + 100, Ordering::Relaxed);
+
+		for (k, raw) in [(older, 0xFFFF_FFF0u32), (newer, 0x0000_0010u32)] {
+			let sh = shard_of(k);
+			let mut g = s.shards[sh].write().unwrap();
+			let i = g.find(k).expect("key present");
+			g.slots[i as usize].last_access = raw;
+			s.publish_tail(sh, &g);
+		}
+
+		assert_eq!(
+			s.tail_key(),
+			Some(older),
+			"eviction picked the newer key -- the wrap was compared raw",
+		);
 	}
 
 	/// Shrinking the fast tier at runtime must demote immediately, the way
