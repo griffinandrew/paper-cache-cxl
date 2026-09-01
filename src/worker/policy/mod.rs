@@ -106,6 +106,57 @@ pub mod migration_queue {
 	/// differed 3.4x.
 	pub static BURST_MAX: AtomicU64 = AtomicU64::new(0);
 
+	/// Migrations enqueued but not yet applied, split by destination tier.
+	///
+	/// These are the PHYSICAL mis-placement: a pending `Tier::Slow` entry is an
+	/// object the policy stack already counts as slow and has already removed
+	/// from `fast_used`, whose bytes are still in DRAM. A pending `Tier::Fast`
+	/// is the reverse.
+	///
+	/// The stack cannot account any other way -- `settle_fast_tier` reads
+	/// `fast_used` to decide whether to keep demoting, so completion-time
+	/// accounting would make it drain the entire fast tier in one pass, never
+	/// seeing its own decisions register. So `fast_used` is INTENT by
+	/// necessity, and these two counters are the gap between intent and
+	/// placement.
+	///
+	/// That gap is not only a reporting error. It biases latency: an object the
+	/// stack believes is in Optane but which is physically still in DRAM is
+	/// SERVED FROM DRAM, so a tiered run reports more fast-tier-speed hits than
+	/// its own tier assignment implies, and the bias grows with the backlog.
+	pub static PENDING_DEMOTE: AtomicU64 = AtomicU64::new(0);
+	pub static PENDING_PROMOTE: AtomicU64 = AtomicU64::new(0);
+	pub static PENDING_DEMOTE_MAX: AtomicU64 = AtomicU64::new(0);
+	pub static PENDING_PROMOTE_MAX: AtomicU64 = AtomicU64::new(0);
+
+	/// Decrements the pending counter for `tier` however the consumer loop body
+	/// exits. Same reasoning as `CountOnDrop`: an entry leaves the queue whether
+	/// or not `apply_migration` moved anything, and a leaked increment here
+	/// would make the backlog look permanent.
+	struct PendingOnDrop(Tier);
+
+	impl Drop for PendingOnDrop {
+		fn drop(&mut self) {
+			let counter = match self.0 {
+				Tier::Fast => &PENDING_PROMOTE,
+				Tier::Slow => &PENDING_DEMOTE,
+			};
+
+			counter.fetch_sub(1, Ordering::Release);
+		}
+	}
+
+	/// Records one enqueued migration against its tier and updates that tier's
+	/// high-water mark.
+	fn record_pending(tier: Tier) {
+		let (counter, peak) = match tier {
+			Tier::Fast => (&PENDING_PROMOTE, &PENDING_PROMOTE_MAX),
+			Tier::Slow => (&PENDING_DEMOTE, &PENDING_DEMOTE_MAX),
+		};
+
+		peak.fetch_max(counter.fetch_add(1, Ordering::Release) + 1, Ordering::Relaxed);
+	}
+
 	struct CountOnDrop<'a>(&'a Arc<AtomicU64>);
 
 	impl Drop for CountOnDrop<'_> {
@@ -273,6 +324,7 @@ pub mod migration_queue {
 						while let Ok((key, tier)) = receiver.recv() {
 							// Counted on every path out of this iteration.
 							let _done = CountOnDrop(&processed);
+							let _pending = PendingOnDrop(tier);
 
 							if apply_migration(&objects, migrate.as_ref(), key, tier) {
 								match tier {
@@ -355,6 +407,7 @@ pub mod migration_queue {
 			// distribute across.
 			if self.senders.len() == 1 {
 				if first.send(item).is_ok() {
+					record_pending(item.1);
 					self.record_depth(self.enqueued.fetch_add(1, Ordering::Release) + 1);
 				}
 				return;
@@ -363,6 +416,7 @@ pub mod migration_queue {
 			let shard = (item.0 % self.senders.len() as HashedKey) as usize;
 
 			if self.senders[shard].send(item).is_ok() {
+				record_pending(item.1);
 				self.record_depth(self.enqueued.fetch_add(1, Ordering::Release) + 1);
 			}
 		}
@@ -621,9 +675,11 @@ pub mod migstats {
 			.collect::<Vec<_>>().join(",");
 		#[cfg(feature = "hybrid_cache_common")]
 		eprintln!(
-			"MIGSTATS queue_depth_max={} burst_max={}",
+			"MIGSTATS queue_depth_max={} burst_max={} pending_demote_max={} pending_promote_max={}",
 			super::migration_queue::DEPTH_MAX.load(Ordering::Relaxed),
 			super::migration_queue::BURST_MAX.load(Ordering::Relaxed),
+			super::migration_queue::PENDING_DEMOTE_MAX.load(Ordering::Relaxed),
+			super::migration_queue::PENDING_PROMOTE_MAX.load(Ordering::Relaxed),
 		);
 
 		eprintln!("MIGSTATS mig_calls={} evict_calls={} demo_tot={} promo_tot={} evict_tot={}",
