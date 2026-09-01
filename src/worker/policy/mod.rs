@@ -129,6 +129,34 @@ pub mod migration_queue {
 	pub static PENDING_DEMOTE_MAX: AtomicU64 = AtomicU64::new(0);
 	pub static PENDING_PROMOTE_MAX: AtomicU64 = AtomicU64::new(0);
 
+	/// Peak of `PENDING_DEMOTE - PENDING_PROMOTE`, sampled together.
+	///
+	/// The DRAM overrun is the NET mis-placement -- pending demotions are bytes
+	/// still in DRAM, pending promotions are bytes still in Optane, and they
+	/// cancel. Subtracting the two separate high-water marks is wrong: they
+	/// need not peak at the same instant, so their difference is neither the
+	/// peak of the difference nor the difference at any single moment. This
+	/// samples both counters at one point and takes the maximum of the result.
+	pub static PENDING_NET_MAX: AtomicU64 = AtomicU64::new(0);
+
+	/// The three ways `apply_migration` moves nothing, counted separately.
+	///
+	/// Together they measure how much of the queue is WASTED work -- entries
+	/// the consumers pay a dequeue, a lock and a lookup for, and which copy no
+	/// bytes. `GONE` is an object evicted while its migration sat in the queue;
+	/// `DECLINED` is one already in the tier the entry asks for, which happens
+	/// when an earlier entry for the same key already moved it; `SUPERSEDED` is
+	/// a value replaced by a `set` mid-copy.
+	///
+	/// GONE and DECLINED are precisely what a key-keyed pending map would drop
+	/// before ever dispatching, so their sum is the floor on what coalescing
+	/// would save.
+	pub static MIG_GONE: AtomicU64 = AtomicU64::new(0);
+	pub static MIG_DECLINED: AtomicU64 = AtomicU64::new(0);
+	pub static MIG_SUPERSEDED: AtomicU64 = AtomicU64::new(0);
+	pub static MIG_APPLIED: AtomicU64 = AtomicU64::new(0);
+
+
 	/// Decrements the pending counter for `tier` however the consumer loop body
 	/// exits. Same reasoning as `CountOnDrop`: an entry leaves the queue whether
 	/// or not `apply_migration` moved anything, and a leaked increment here
@@ -155,6 +183,14 @@ pub mod migration_queue {
 		};
 
 		peak.fetch_max(counter.fetch_add(1, Ordering::Release) + 1, Ordering::Relaxed);
+
+		// Both counters read at one point, so the difference is a real
+		// instantaneous net rather than a difference of two unrelated peaks.
+		let net = PENDING_DEMOTE
+			.load(Ordering::Acquire)
+			.saturating_sub(PENDING_PROMOTE.load(Ordering::Acquire));
+
+		PENDING_NET_MAX.fetch_max(net, Ordering::Relaxed);
 	}
 
 	struct CountOnDrop<'a>(&'a Arc<AtomicU64>);
@@ -189,11 +225,13 @@ pub mod migration_queue {
 		// immune to ABA: the allocation cannot be freed, so its address cannot
 		// be recycled.
 		let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
+			MIG_GONE.fetch_add(1, Ordering::Relaxed);
 			return false;
 		};
 
 		// Declined: already in the requested tier, nothing to move.
 		let Some(new_data) = migrate(&old_data, tier) else {
+			MIG_DECLINED.fetch_add(1, Ordering::Relaxed);
 			return false;
 		};
 
@@ -203,10 +241,12 @@ pub mod migration_queue {
 		if let Some(mut object) = objects.get_mut_ref(&key) {
 			if Arc::ptr_eq(&object.data(), &old_data) {
 				object.set_data(new_data);
+				MIG_APPLIED.fetch_add(1, Ordering::Relaxed);
 				return true;
 			}
 		}
 
+		MIG_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
 		false
 	}
 
@@ -680,6 +720,21 @@ pub mod migstats {
 			super::migration_queue::BURST_MAX.load(Ordering::Relaxed),
 			super::migration_queue::PENDING_DEMOTE_MAX.load(Ordering::Relaxed),
 			super::migration_queue::PENDING_PROMOTE_MAX.load(Ordering::Relaxed),
+		);
+
+		#[cfg(feature = "hybrid_cache_common")]
+		eprintln!(
+			"MIGSTATS pending_net_max={}",
+			super::migration_queue::PENDING_NET_MAX.load(Ordering::Relaxed),
+		);
+
+		#[cfg(feature = "hybrid_cache_common")]
+		eprintln!(
+			"MIGSTATS applied={} gone={} declined={} superseded={}",
+			super::migration_queue::MIG_APPLIED.load(Ordering::Relaxed),
+			super::migration_queue::MIG_GONE.load(Ordering::Relaxed),
+			super::migration_queue::MIG_DECLINED.load(Ordering::Relaxed),
+			super::migration_queue::MIG_SUPERSEDED.load(Ordering::Relaxed),
 		);
 
 		eprintln!("MIGSTATS mig_calls={} evict_calls={} demo_tot={} promo_tot={} evict_tot={}",

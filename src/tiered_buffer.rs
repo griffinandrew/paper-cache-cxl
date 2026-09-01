@@ -153,3 +153,22 @@ mod tests {
 		assert_eq!(cloned.as_ref(), b"xyz");
 	}
 }
+
+
+#[cfg(test)]
+mod layout {
+	use super::*;
+
+	/// What an `Arc<TieredBuffer>` actually costs, and where.
+	#[test]
+	fn print_arc_layout() {
+		use std::sync::Arc;
+		println!(
+			"ARCLAYOUT TieredBuffer={} Box<[u8]>={} Arc_handle={} ArcInner={}",
+			core::mem::size_of::<TieredBuffer>(),
+			core::mem::size_of::<Box<[u8]>>(),
+			core::mem::size_of::<Arc<TieredBuffer>>(),
+			2 * core::mem::size_of::<usize>() + core::mem::size_of::<TieredBuffer>(),
+		);
+	}
+}
