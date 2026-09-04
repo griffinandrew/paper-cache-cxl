@@ -929,13 +929,7 @@ use crate::{
 // `policy_stack` submodule directly, *and* so it can flow all the way out
 // to `PaperCache::tier_of`'s public return type via `worker::Tier` /
 // `crate::Tier` (see `worker/mod.rs` and `lib.rs`).
-#[cfg(feature = "hybrid_cache_common")]
 pub use policy_stack::Tier;
-
-// Same flattening for the merged store, which needs `Tier` at the crate
-// root without any hybrid feature on -- see `worker/mod.rs`.
-#[cfg(all(feature = "merged_object_store", not(feature = "hybrid_cache_common")))]
-pub(crate) use policy_stack::Tier;
 
 // the polling value must be a power of 2
 const RECONSTRUCT_POLICY_POLLING: usize = 1_048_576;

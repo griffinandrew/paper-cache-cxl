@@ -73,6 +73,19 @@ mod worker;
 /// the weak count nothing in this tree uses. See `shared`.
 pub mod shared;
 
+/// The v5 value representation: an entire cached value in one eight-byte
+/// tagged pointer, with no refcount and no per-value allocation header. The
+/// ONLY module in this crate holding unsafe value code -- see `value`.
+///
+/// Compiled in every configuration on purpose. A partial feature list is how
+/// this tree loses test coverage silently, and the one module that owns every
+/// `alloc`, `dealloc` and pointer reinterpretation for values is the last one
+/// that should be skippable.
+pub mod value;
+
+/// `paper_cache::TieredValue`, alongside `paper_cache::TieredBuffer`.
+pub use crate::value::TieredValue;
+
 mod object;
 mod policy;
 mod status;
@@ -318,7 +331,11 @@ pub use crate::s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_c
 
 // Re-exported so `PaperCache::tier_of`'s return type is nameable by callers
 // without reaching into the private `worker` module tree directly.
-#[cfg(feature = "hybrid_cache_common")]
+//
+// Unconditional, where it used to be gated on `hybrid_cache_common`:
+// `value::TieredValue::tier()` is `pub`, is compiled in every configuration,
+// and returns this type, so it must be publicly nameable in every
+// configuration too.
 pub use crate::worker::Tier;
 
 // The one thing that still differs per design on the `set()` path: which tier

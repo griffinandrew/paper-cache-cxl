@@ -16,6 +16,11 @@ kwik = "=1.18.7"
 thiserror = "2.0.16"
 dashmap = "6.1.0"
 crossbeam-channel = "0.5.15"
+# Epoch-based reclamation for value buffers: it replaces the per-object
+# refcount `Shared` carried, so a reader can copy a value's bytes with no
+# lock and no atomic on the value itself, and a writer defers the free
+# until every pin that could have observed the old pointer has ended.
+crossbeam-epoch = "0.9"
 typesize = "0.1.14"
 byteorder = "1.5.0"
 tempfile = "3.21.0"

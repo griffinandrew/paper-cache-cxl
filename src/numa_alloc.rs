@@ -1331,7 +1331,7 @@ pub fn resident_pages_per_node() -> Result<(u64, u64), std::io::Error> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use super::*;
 	use std::alloc::{Allocator, Layout};
 
@@ -1553,7 +1553,9 @@ node0_grew={grew0} node1_grew={grew1} -> on_target={target} elsewhere={other}"
 	/// `numa_maps` is per-mapping and far too coarse for tcache-sized blocks,
 	/// which live inside a shared extent; `get_mempolicy` answers for one
 	/// address.
-	fn node_of(ptr: *const u8) -> i32 {
+	/// `pub(crate)`: `value`'s placement test asks the same question of value
+	/// buffers, and one `get_mempolicy` call site is better than two.
+	pub(crate) fn node_of(ptr: *const u8) -> i32 {
 		const MPOL_F_NODE: c_int = 1 << 0;
 		const MPOL_F_ADDR: c_int = 1 << 1;
 		let mut node: c_int = -1;
@@ -1568,6 +1570,107 @@ node0_grew={grew0} node1_grew={grew1} -> on_target={target} elsewhere={other}"
 			)
 		};
 		if rc != 0 { -1 } else { node }
+	}
+
+	/// Which jemalloc arena owns `ptr`, via the `arenas.lookup` mallctl.
+	///
+	/// [`node_of`] answers where memory PHYSICALLY landed, and that cannot tell
+	/// a `NODE_FAST_VALUES` block from a `NODE_FAST` one: both pools are
+	/// `mbind`ed to physical node 0 (see [`physical_node`]), so both answer 0.
+	/// This answers which POOL served the block instead, which is exactly the
+	/// distinction `segregated_value_arena` exists to make -- and the one
+	/// `value`'s routing test needs, because under that feature the fast
+	/// allocator is [`FastValues`] and NOT the global allocator.
+	///
+	/// `pub(crate)` for the same reason as [`node_of`]: one FFI call site.
+	///
+	/// Returns `None` if the mallctl fails, which is how a jemalloc build
+	/// without `arenas.lookup` reports itself -- a caller must skip rather than
+	/// assert on `None`.
+	pub(crate) fn arena_of(ptr: *const u8) -> Option<c_uint> {
+		let mut ind: c_uint = 0;
+		let mut len = std::mem::size_of::<c_uint>() as size_t;
+
+		// `arenas.lookup` takes the pointer to look up as `newp`, which is why
+		// it needs a mutable local to point at rather than `ptr` itself.
+		let mut arg = ptr;
+
+		let rc = unsafe {
+			mallctl(
+				c"arenas.lookup".as_ptr(),
+				(&raw mut ind).cast::<c_void>(),
+				&raw mut len,
+				(&raw mut arg).cast::<c_void>(),
+				std::mem::size_of::<*const u8>() as size_t,
+			)
+		};
+
+		if rc == 0 { Some(ind) } else { None }
+	}
+
+	/// The arena indices making up one logical pool, empty if it was never
+	/// built. Pair with [`arena_of`] to assert an allocation came from the pool
+	/// its tier names.
+	pub(crate) fn pool_arenas(node: u32) -> Vec<c_uint> {
+		match node_arenas(node) {
+			Some(arenas) => arenas.indices[..arenas.count].to_vec(),
+			None => Vec::new(),
+		}
+	}
+
+	/// `arenas.lookup` must work at all, or every test leaning on it is
+	/// silently vacuous.
+	#[test]
+	fn arena_lookup_answers_for_each_pool() {
+		assert!(init(), "the node-0 and node-1 arena pools must build");
+		assert!(init_node(NODE_FAST_VALUES), "the value pool must build");
+
+		let layout = Layout::from_size_align(4096, 8).unwrap();
+
+		for node in [NODE_FAST, NODE_SLOW, NODE_FAST_VALUES] {
+			let indices = pool_arenas(node);
+			assert!(!indices.is_empty(), "pool {node} reported no arenas");
+
+			let block = match node {
+				NODE_FAST => FastAlloc::default().allocate(layout),
+				NODE_SLOW => SlowAlloc::default().allocate(layout),
+				_ => std::alloc::Allocator::allocate(&FastValues, layout),
+			}
+			.expect("pool allocation");
+
+			let ind = arena_of(block.as_ptr().cast::<u8>())
+				.expect("arenas.lookup must be available in this jemalloc build");
+
+			assert!(
+				indices.contains(&ind),
+				"pool {node} served arena {ind}, which is not one of its own {indices:?}",
+			);
+
+			unsafe {
+				match node {
+					NODE_FAST => FastAlloc::default().deallocate(block.cast(), layout),
+					NODE_SLOW => SlowAlloc::default().deallocate(block.cast(), layout),
+					_ => std::alloc::Allocator::deallocate(&FastValues, block.cast(), layout),
+				}
+			}
+		}
+
+		// The three pools must not share arenas, or `arena_of` cannot
+		// distinguish them and the assertion above is trivially true.
+		let fast = pool_arenas(NODE_FAST);
+		let slow = pool_arenas(NODE_SLOW);
+		let values = pool_arenas(NODE_FAST_VALUES);
+
+		for (a, an, b, bn) in [
+			(&fast, "fast", &slow, "slow"),
+			(&fast, "fast", &values, "values"),
+			(&slow, "slow", &values, "values"),
+		] {
+			assert!(
+				!a.iter().any(|i| b.contains(i)),
+				"the {an} pool {a:?} and the {bn} pool {b:?} share an arena",
+			);
+		}
 	}
 
 	/// Blocks served *from* a tcache must still be on the right node.

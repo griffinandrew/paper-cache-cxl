@@ -234,15 +234,13 @@ pub use crate::worker::{
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 pub use crate::worker::tiering::TieringWorker;
 
-// Flattens `worker::policy::Tier` (itself a `pub(crate)` re-export of the
-// private `policy_stack` submodule's `Tier`, see `worker/policy/mod.rs`) so
-// `lib.rs` can re-export it further as the fully public `PaperCache::tier_of`
-// return type, shared by every hybrid design.
-#[cfg(feature = "hybrid_cache_common")]
+// Flattens `worker::policy::Tier` (itself a re-export of the private
+// `policy_stack` submodule's `Tier`, see `worker/policy/mod.rs`) so `lib.rs`
+// can re-export it further as the fully public `PaperCache::tier_of` return
+// type, shared by every hybrid design.
+//
+// Unconditional: the merged store tags every slot with a `Tier` whether or
+// not a hybrid feature is on, and `value::TieredValue` -- which is compiled
+// in every configuration -- carries one in the low bit of its pointer. There
+// is no configuration left that does not need the name.
 pub use crate::worker::policy::Tier;
-
-// The same flattening, crate-visible only, for the merged store: it lives
-// at the crate root and so cannot see through the private `worker::policy`,
-// and it tags every slot with a `Tier` whether or not a hybrid feature is on.
-#[cfg(all(feature = "merged_object_store", not(feature = "hybrid_cache_common")))]
-pub(crate) use crate::worker::policy::Tier;
