@@ -1194,6 +1194,11 @@ where
 	pub fn has(&self, key: &K) -> bool {
 		let hashed_key = self.hash_key(key);
 
+		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
+		// never dereferences the value allocation: it reads fields that live
+		// INSIDE the object (the key, the expiry, the length, the tag bit),
+		// and the shard guard it holds while doing so is what keeps the object
+		// itself alive. A pin would protect nothing that is read here.
 		self.objects
 			.get_ref(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
@@ -1322,6 +1327,11 @@ where
 	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
 		let hashed_key = self.hash_key(key);
 
+		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
+		// never dereferences the value allocation: it reads fields that live
+		// INSIDE the object (the key, the expiry, the length, the tag bit),
+		// and the shard guard it holds while doing so is what keeps the object
+		// itself alive. A pin would protect nothing that is read here.
 		match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
 				Ok(self.overhead_manager.total_size(&object)),
@@ -1746,6 +1756,11 @@ where
 	pub fn has(&self, key: &K) -> bool {
 		let hashed_key = self.hash_key(key);
 
+		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
+		// never dereferences the value allocation: it reads fields that live
+		// INSIDE the object (the key, the expiry, the length, the tag bit),
+		// and the shard guard it holds while doing so is what keeps the object
+		// itself alive. A pin would protect nothing that is read here.
 		self.objects
 			.get_ref(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
@@ -1810,6 +1825,11 @@ where
 	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
 		let hashed_key = self.hash_key(key);
 
+		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
+		// never dereferences the value allocation: it reads fields that live
+		// INSIDE the object (the key, the expiry, the length, the tag bit),
+		// and the shard guard it holds while doing so is what keeps the object
+		// itself alive. A pin would protect nothing that is read here.
 		match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
 				Ok(self.overhead_manager.total_size(&object)),
@@ -2702,6 +2722,11 @@ where
 	pub fn has(&self, key: &K) -> bool {
 		let hashed_key = self.hash_key(key);
 
+		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
+		// never dereferences the value allocation: it reads fields that live
+		// INSIDE the object (the key, the expiry, the length, the tag bit),
+		// and the shard guard it holds while doing so is what keeps the object
+		// itself alive. A pin would protect nothing that is read here.
 		self.objects
 			.get_ref(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
@@ -2774,6 +2799,11 @@ where
 	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
 		let hashed_key = self.hash_key(key);
 
+		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
+		// never dereferences the value allocation: it reads fields that live
+		// INSIDE the object (the key, the expiry, the length, the tag bit),
+		// and the shard guard it holds while doing so is what keeps the object
+		// itself alive. A pin would protect nothing that is read here.
 		match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
 				Ok(self.overhead_manager.total_size(&object)),
@@ -2905,6 +2935,8 @@ where
 				return None;
 			}
 
+			// The tag bit, read off the word inside the object under the shard
+			// guard. No pin: nothing here follows the pointer.
 			Some(object.value().tier())
 		})
 	}
