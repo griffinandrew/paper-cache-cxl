@@ -51,27 +51,9 @@ use std::arch::x86_64::{_mm_clflush, _mm_sfence};
 ))]
 pub(crate) use crate::numa_alloc::SlowObjects as Hybrid;
 
-#[cfg(feature = "key_value_pmem")]
-impl typesize::TypeSize for BufferPMEM {
-    fn get_size(&self) -> usize {
-        self.len()
-    }
-}
-
-// `typesize` blankets `Box<[T]>` only for the default allocator, so the
-// segregated-pool boxed slice needs its own impl, exactly as `BufferPMEM` does.
-#[cfg(feature = "segregated_value_arena")]
-impl typesize::TypeSize for BufferDRAM {
-    fn get_size(&self) -> usize {
-        self.len()
-    }
-}
 
 mod error;
 mod worker;
-/// Strong-count-only refcounted pointer for value buffers -- `Arc` without
-/// the weak count nothing in this tree uses. See `shared`.
-pub mod shared;
 
 /// The v5 value representation: an entire cached value in one eight-byte
 /// tagged pointer, with no refcount and no per-value allocation header. The
@@ -85,6 +67,14 @@ pub mod value;
 
 /// `paper_cache::TieredValue`, alongside `paper_cache::TieredBuffer`.
 pub use crate::value::TieredValue;
+
+/// The two non-hybrid cache SHAPES. Since v5 both store a `TieredValue`; the
+/// marker only says which tier `set()` allocates in -- see `value::ValueShape`.
+pub use crate::value::{BufferDRAM, BufferPMEM};
+
+/// A value plus the epoch pin that keeps it alive, which is how every read
+/// path touches value bytes with the shard guard already released.
+pub use crate::value::ValueRef;
 
 mod object;
 mod policy;
@@ -107,13 +97,11 @@ mod object_store;
 /// from a build that has the feature off.
 #[cfg(feature = "merged_object_store")]
 pub mod merged_store;
-#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
-mod value_buffer;
 
 #[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 use crate::object_store::ObjectStore;
 #[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
-use crate::value_buffer::ValueBuffer;
+use crate::value::ValueShape;
 
 // Shared tier-size unit type (bytes/Mb/Gb), used by `lru_hybrid_cache`,
 // `lfu_hybrid_cache`, `two_q_hybrid_cache`, and `fifo_hybrid_cache` so none
@@ -420,8 +408,6 @@ pub type AtomicCacheSize = AtomicU64;
 pub type HashedKey = u64;
 pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 
-#[cfg(feature = "key_value_pmem")]
-pub type BufferPMEM = Box<[u8], Hybrid>;
 
 
 // Both tiers are allocated by `numa_alloc` (src/numa_alloc.rs): node-0-bound
@@ -525,17 +511,6 @@ pub fn jemalloc_stats() -> Option<String> {
 use std::alloc::{Layout, Allocator}; // Essential imports
 
 
-//#[cfg(feature = "all_dram")]
-#[cfg(not(feature = "segregated_value_arena"))]
-pub type BufferDRAM = Box<[u8]>;
-
-/// With `segregated_value_arena`, DRAM value buffers carry their own allocator
-/// in the type -- exactly as `BufferPMEM = Box<[u8], Hybrid>` does -- so that
-/// `dealloc` routes back to the same pool no matter which thread frees them.
-/// That matters here: values are allocated on the client thread and freed on
-/// the policy worker during eviction.
-#[cfg(feature = "segregated_value_arena")]
-pub type BufferDRAM = Box<[u8], numa_alloc::FastValues>;
 
 
 /// Initial capacity (in entries) for the hashbrown-backed object map used
@@ -687,6 +662,15 @@ impl<K, V, S> Drop for PaperCache<K, V, S> {
 			// it, which is this loop's entire purpose.
 			let _ = handle.join();
 		}
+
+		// The object map goes next, in the compiler-generated field drops
+		// after this body returns, and every object it holds defers its
+		// value's free. Advancing the epoch here first retires whatever the
+		// workers left behind, so that the last flush -- from a thread with
+		// no pins outstanding, all workers joined -- has the best chance of
+		// actually running the deferrals rather than parking them in a bag
+		// that nothing will ever drain again.
+		crate::value::flush();
 	}
 }
 
@@ -716,7 +700,7 @@ impl<K, V, S> Drop for PaperCache<K, V, S> {
 impl<K, V, S> PaperCache<K, V, S>
 where
 	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	V: ValueBuffer,
+	V: ValueShape,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` with maximum size `max_size` and
@@ -967,20 +951,23 @@ where
 			}
 		}
 
-		// Guard released before the copy -- see the `TieredBuffer` `get()`
-		// below for the full rationale. `Object::data()` is only an `Arc`
-		// refcount bump, and the `Arc` keeps the bytes alive on its own, so
-		// the shard lock is not needed for the (potentially multi-KB,
-		// potentially PMEM-backed) copy itself.
-		let maybe_data = match self.objects.get_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => Some(object.data()),
+		// Pin BEFORE the shard guard, release the shard guard BEFORE the copy
+		// -- see the hybrid `get()` further down for the full rationale. The
+		// order is the whole safety argument: any writer that unpublishes this
+		// pointer defers its free strictly after we read it, so our pin is
+		// live at the moment of that deferral and the free waits for us.
+		let guard = crossbeam_epoch::pin();
+
+		let snapshot = match self.objects.get_ref(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Some(object.snapshot(&guard)),
 			_ => None,
 		};
 
-		let result = match maybe_data {
-			Some(arc_val) => {
+		let result = match snapshot {
+			Some(value) => {
 				self.status.incr_hits();
-				Ok(AsRef::<[u8]>::as_ref(&*arc_val).to_vec())
+				Ok(value.bytes().to_vec())
 			},
 
 			None => {
@@ -988,6 +975,8 @@ where
 				Err(CacheError::KeyNotFound)
 			},
 		};
+
+		drop(guard);
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
@@ -1020,8 +1009,11 @@ where
 		let hashed_key = self.hash_key(key);
 		let t1 = if prof { Some(std::time::Instant::now()) } else { None };
 
-		let maybe_data = match self.objects.get_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => Some(object.data()),
+		let guard = crossbeam_epoch::pin();
+
+		let snapshot = match self.objects.get_ref(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Some(object.snapshot(&guard)),
 			_ => None,
 		};
 		let t2 = if prof { Some(std::time::Instant::now()) } else { None };
@@ -1031,11 +1023,11 @@ where
 		#[allow(unused_mut)]
 		let mut gi_fast: u64 = 1;
 
-		let result = match maybe_data {
-			Some(arc_val) => {
+		let result = match snapshot {
+			Some(value) => {
 				self.status.incr_hits();
 				out.clear();
-				out.extend_from_slice(AsRef::<[u8]>::as_ref(&*arc_val));
+				out.extend_from_slice(value.bytes());
 				Ok(())
 			},
 
@@ -1044,6 +1036,7 @@ where
 				Err(CacheError::KeyNotFound)
 			},
 		};
+		drop(guard);
 		let t3 = if prof { Some(std::time::Instant::now()) } else { None };
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
@@ -1098,8 +1091,10 @@ where
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
-		let val_buf: V = V::from_bytes(value);
-		let object = Object::new(key, val_buf, ttl);
+		// The one thing the shape still decides: which allocator the value
+		// comes from. `BufferDRAM` names the fast tier, `BufferPMEM` the slow
+		// one -- see `value::ValueShape`.
+		let object = Object::new_in(key, value, V::TIER, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
 		let dram_resident = self.overhead_manager.dram_resident_size(&object);
 		let expiry = object.expiry();
@@ -1232,15 +1227,38 @@ where
 	/// assert!(cache.peek(&1).is_ok());
 	/// assert!(cache.peek(&2).is_ok());
 	/// ```
-	pub fn peek(&self, key: &K) -> Result<crate::shared::Shared<V>, CacheError> {
+	/// # API change (v5)
+	///
+	/// This returned a `Shared<V>` -- a refcounted handle onto the value --
+	/// until the refcount was removed. It now returns an owned `Vec<u8>`, the
+	/// same thing [`Self::get`] returns.
+	///
+	/// It cannot return a borrow. A value is now a bare pointer whose lifetime
+	/// is managed by epoch reclamation, so the only two honest return types
+	/// are a copy or a guard object holding the pin open -- and a guard held by
+	/// a caller that then blocks would pin the epoch and stall reclamation for
+	/// every thread, which is the one failure mode this design has to avoid.
+	/// A copy has the same semantics the `Shared` did anyway: a snapshot that
+	/// was live at the moment of the lookup.
+	pub fn peek(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
+		let guard = crossbeam_epoch::pin();
 
-		match self.objects.get_ref(&hashed_key) {
+		let snapshot = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
+				Some(object.snapshot(&guard)),
 
-			_ => Err(CacheError::KeyNotFound),
-		}
+			_ => None,
+		};
+
+		let result = match snapshot {
+			Some(value) => Ok(value.bytes().to_vec()),
+			None => Err(CacheError::KeyNotFound),
+		};
+
+		drop(guard);
+
+		result
 	}
 
 	/// Sets the TTL associated with the supplied key.
@@ -1331,6 +1349,14 @@ where
 		info!("Wiping cache");
 
 		self.objects.clear();
+
+		// `clear` drops every object, and each drop DEFERS its value's free
+		// rather than performing it (see `value::defer_free`). Without this,
+		// a whole cache's worth of garbage sits in this thread's local bag
+		// until it happens to pin enough more times to fill it -- so a wipe
+		// followed by an idle period would return no memory at all.
+		crate::value::flush();
+
 		self.status.clear();
 
 		self.broadcast(WorkerEvent::Wipe)?;
@@ -1476,7 +1502,7 @@ where
 	// threads. Every other `PaperCache` impl carries these; this shape was
 	// merged without them, so the two features that select it never built.
 	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	V: ValueBuffer,
+	V: ValueShape,
 	S: Default + Clone + BuildHasher,
 {
 	/// Creates an empty `PaperCache` with maximum size `max_size` and
@@ -1617,20 +1643,23 @@ where
 			}
 		}
 
-		// Guard released before the copy -- see the `TieredBuffer` `get()`
-		// below for the full rationale. `Object::data()` is only an `Arc`
-		// refcount bump, and the `Arc` keeps the bytes alive on its own, so
-		// the shard lock is not needed for the (potentially multi-KB,
-		// potentially PMEM-backed) copy itself.
-		let maybe_data = match self.objects.get_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => Some(object.data()),
+		// Pin BEFORE the shard guard, release the shard guard BEFORE the copy
+		// -- see the hybrid `get()` further down for the full rationale. The
+		// order is the whole safety argument: any writer that unpublishes this
+		// pointer defers its free strictly after we read it, so our pin is
+		// live at the moment of that deferral and the free waits for us.
+		let guard = crossbeam_epoch::pin();
+
+		let snapshot = match self.objects.get_ref(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Some(object.snapshot(&guard)),
 			_ => None,
 		};
 
-		let result = match maybe_data {
-			Some(arc_val) => {
+		let result = match snapshot {
+			Some(value) => {
 				self.status.incr_hits();
-				Ok(AsRef::<[u8]>::as_ref(&*arc_val).to_vec())
+				Ok(value.bytes().to_vec())
 			},
 
 			None => {
@@ -1638,6 +1667,8 @@ where
 				Err(CacheError::KeyNotFound)
 			},
 		};
+
+		drop(guard);
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
@@ -1650,8 +1681,10 @@ where
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
-		let val_buf: V = V::from_bytes(value);
-		let object = Object::new(key, val_buf, ttl);
+		// The one thing the shape still decides: which allocator the value
+		// comes from. `BufferDRAM` names the fast tier, `BufferPMEM` the slow
+		// one -- see `value::ValueShape`.
+		let object = Object::new_in(key, value, V::TIER, ttl);
 
 		let base_size = self.overhead_manager.base_size(&object);
 		let dram_resident = self.overhead_manager.dram_resident_size(&object);
@@ -1718,14 +1751,38 @@ where
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
 	}
 
-	pub fn peek(&self, key: &K) -> Result<crate::shared::Shared<V>, CacheError> {
+	/// # API change (v5)
+	///
+	/// This returned a `Shared<V>` -- a refcounted handle onto the value --
+	/// until the refcount was removed. It now returns an owned `Vec<u8>`, the
+	/// same thing [`Self::get`] returns.
+	///
+	/// It cannot return a borrow. A value is now a bare pointer whose lifetime
+	/// is managed by epoch reclamation, so the only two honest return types
+	/// are a copy or a guard object holding the pin open -- and a guard held by
+	/// a caller that then blocks would pin the epoch and stall reclamation for
+	/// every thread, which is the one failure mode this design has to avoid.
+	/// A copy has the same semantics the `Shared` did anyway: a snapshot that
+	/// was live at the moment of the lookup.
+	pub fn peek(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
+		let guard = crossbeam_epoch::pin();
 
-		match self.objects.get_ref(&hashed_key) {
+		let snapshot = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
-			_ => Err(CacheError::KeyNotFound),
-		}
+				Some(object.snapshot(&guard)),
+
+			_ => None,
+		};
+
+		let result = match snapshot {
+			Some(value) => Ok(value.bytes().to_vec()),
+			None => Err(CacheError::KeyNotFound),
+		};
+
+		drop(guard);
+
+		result
 	}
 
 	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
@@ -1764,6 +1821,14 @@ where
 		info!("Wiping cache");
 
 		self.objects.clear();
+
+		// `clear` drops every object, and each drop DEFERS its value's free
+		// rather than performing it (see `value::defer_free`). Without this,
+		// a whole cache's worth of garbage sits in this thread's local bag
+		// until it happens to pin enough more times to fill it -- so a wipe
+		// followed by an idle period would return no memory at all.
+		crate::value::flush();
+
 		self.status.clear();
 
 		self.broadcast(WorkerEvent::Wipe)?;
@@ -1842,7 +1907,6 @@ pub fn erase<K, V>(
 ) -> Result<(HashedKey, Object<K, V>), CacheError>
 where
 	K: Eq + TypeSize,
-	V: TypeSize,
 {
 	let hashed_key = match maybe_key {
 		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
@@ -1930,7 +1994,6 @@ pub fn erase<K, V>(
 ) -> Result<(HashedKey, Object<K, V>), CacheError>
 where
 	K: Eq + TypeSize,
-	V: TypeSize,
 {
 	let hashed_key = match maybe_key {
 		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
@@ -1985,7 +2048,6 @@ pub fn erase<K, V>(
 ) -> Result<(HashedKey, Object<K, V>), CacheError>
 where
 	K: Eq + TypeSize,
-	V: TypeSize,
 {
 	let hashed_key = match maybe_key {
 		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
@@ -2367,11 +2429,16 @@ where
 		// correct, since the key is now MRU -- so `set()` has already built
 		// the bytes in DRAM by the time `touch_main_fast` emits its
 		// `(key, Tier::Fast)` promotion.
-		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> Option<TieredBuffer> + Send + Sync> =
-			Box::new(|buffer, tier| match (tier, buffer.is_fast()) {
+		// Takes a `ValueRef` rather than a bare value: the length is no longer
+		// inside the value, and the epoch pin the ref carries is what makes
+		// reading the source bytes with no lock held sound. The destination is
+		// the same length by construction, which is the byte-length-preserving
+		// contract the accounting relies on.
+		let migrate: Box<dyn Fn(ValueRef<'_>, Tier) -> Option<TieredBuffer> + Send + Sync> =
+			Box::new(|value, tier| match (tier, value.is_fast()) {
 				(Tier::Fast, true) | (Tier::Slow, false) => None,
-				(Tier::Fast, false) => Some(TieredBuffer::new_fast(buffer.as_ref())),
-				(Tier::Slow, true) => Some(TieredBuffer::new_slow(buffer.as_ref())),
+				(Tier::Fast, false) => Some(TieredBuffer::new_fast(value.bytes())),
+				(Tier::Slow, true) => Some(TieredBuffer::new_slow(value.bytes())),
 			});
 
 		let (worker_fanout, worker_handles) = WorkerFanout::new_with_tier_migration(
@@ -2381,7 +2448,14 @@ where
 			migrate,
 		)?;
 
-		let cache = PaperCache {
+		// Annotated, and load-bearing. `migrate` no longer mentions `V` -- it
+		// takes a `ValueRef` and returns a `TieredValue` -- so nothing else in
+		// this function pins `V` before the `broadcast` call below, and an
+		// unresolved `V` makes that call ambiguous between this block and the
+		// flat `impl<K, V, S> ... where V: ValueShape` one (E0034: both are
+		// inherent candidates, and the where-clause can only rule one out once
+		// `V` is known).
+		let cache: Self = PaperCache {
 			objects,
 			status,
 			workers: Arc::new(worker_fanout),
@@ -2434,16 +2508,18 @@ where
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		let maybe_data = match self.objects.get_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => Some(object.data()),
+		let guard = crossbeam_epoch::pin();
+
+		let snapshot = match self.objects.get_ref(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Some(object.snapshot(&guard)),
 			_ => None,
 		};
 
-		let result = match maybe_data {
-			Some(arc_val) => {
+		let result = match snapshot {
+			Some(value) => {
 				self.status.incr_hits();
-				let bytes: &[u8] = arc_val.as_ref().as_ref();
-				Ok(bytes.to_vec())
+				Ok(value.bytes().to_vec())
 			},
 
 			None => {
@@ -2451,6 +2527,8 @@ where
 				Err(CacheError::KeyNotFound)
 			},
 		};
+
+		drop(guard);
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
@@ -2483,23 +2561,25 @@ where
 		let hashed_key = self.hash_key(key);
 		let t1 = if prof { Some(std::time::Instant::now()) } else { None };
 
-		let maybe_data = match self.objects.get_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => Some(object.data()),
+		let guard = crossbeam_epoch::pin();
+
+		let snapshot = match self.objects.get_ref(&hashed_key) {
+			Some(object) if object.key_matches(key) && !object.is_expired() =>
+				Some(object.snapshot(&guard)),
 			_ => None,
 		};
 		let t2 = if prof { Some(std::time::Instant::now()) } else { None };
 
-		// Which tier served this hit (1 = fast/DRAM; the all-DRAM shape never
-		// reassigns it). Read only by the sampled profiler below.
+		// Which tier served this hit. Read only by the sampled profiler below.
 		#[allow(unused_mut)]
 		let mut gi_fast: u64 = 1;
 
-		let result = match maybe_data {
-			Some(arc_val) => {
+		let result = match snapshot {
+			Some(value) => {
 				self.status.incr_hits();
 				out.clear();
-				gi_fast = if arc_val.is_fast() { 1 } else { 0 };
-				out.extend_from_slice(arc_val.as_ref().as_ref());
+				gi_fast = if value.is_fast() { 1 } else { 0 };
+				out.extend_from_slice(value.bytes());
 				Ok(())
 			},
 
@@ -2508,6 +2588,7 @@ where
 				Err(CacheError::KeyNotFound)
 			},
 		};
+		drop(guard);
 		let t3 = if prof { Some(std::time::Instant::now()) } else { None };
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
@@ -2555,12 +2636,7 @@ where
 			&self.status,
 			&self.objects,
 		);
-		let val_buf = match tier {
-			Tier::Fast => TieredBuffer::new_fast(value),
-			Tier::Slow => TieredBuffer::new_slow(value),
-		};
-
-		let object = Object::new(key, val_buf, ttl);
+		let object = Object::new_in(key, value, tier, ttl);
 		let base_size = self.overhead_manager.base_size(&object);
 		let dram_resident = self.overhead_manager.dram_resident_size(&object);
 		let expiry = object.expiry();
@@ -2635,15 +2711,38 @@ where
 	/// altering any of the cache's internal queues (including tier — a peek
 	/// never triggers a promotion). If the key was not found in the cache,
 	/// returns a [`CacheError`].
-	pub fn peek(&self, key: &K) -> Result<crate::shared::Shared<TieredBuffer>, CacheError> {
+	/// # API change (v5)
+	///
+	/// This returned a `Shared<V>` -- a refcounted handle onto the value --
+	/// until the refcount was removed. It now returns an owned `Vec<u8>`, the
+	/// same thing [`Self::get`] returns.
+	///
+	/// It cannot return a borrow. A value is now a bare pointer whose lifetime
+	/// is managed by epoch reclamation, so the only two honest return types
+	/// are a copy or a guard object holding the pin open -- and a guard held by
+	/// a caller that then blocks would pin the epoch and stall reclamation for
+	/// every thread, which is the one failure mode this design has to avoid.
+	/// A copy has the same semantics the `Shared` did anyway: a snapshot that
+	/// was live at the moment of the lookup.
+	pub fn peek(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
+		let guard = crossbeam_epoch::pin();
 
-		match self.objects.get_ref(&hashed_key) {
+		let snapshot = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(object.data()),
+				Some(object.snapshot(&guard)),
 
-			_ => Err(CacheError::KeyNotFound),
-		}
+			_ => None,
+		};
+
+		let result = match snapshot {
+			Some(value) => Ok(value.bytes().to_vec()),
+			None => Err(CacheError::KeyNotFound),
+		};
+
+		drop(guard);
+
+		result
 	}
 
 	/// Sets the TTL associated with the supplied key.
@@ -2688,6 +2787,14 @@ where
 		info!("Wiping cache");
 
 		self.objects.clear();
+
+		// `clear` drops every object, and each drop DEFERS its value's free
+		// rather than performing it (see `value::defer_free`). Without this,
+		// a whole cache's worth of garbage sits in this thread's local bag
+		// until it happens to pin enough more times to fill it -- so a wipe
+		// followed by an idle period would return no memory at all.
+		crate::value::flush();
+
 		self.status.clear();
 
 		self.broadcast(WorkerEvent::Wipe)?;
@@ -2798,7 +2905,7 @@ where
 				return None;
 			}
 
-			Some(if object.data().is_fast() { Tier::Fast } else { Tier::Slow })
+			Some(object.value().tier())
 		})
 	}
 
@@ -2951,11 +3058,16 @@ where
 		// correct, since the key is now MRU -- so `set()` has already built
 		// the bytes in DRAM by the time `touch_main_fast` emits its
 		// `(key, Tier::Fast)` promotion.
-		let migrate: Box<dyn Fn(&TieredBuffer, Tier) -> Option<TieredBuffer> + Send + Sync> =
-			Box::new(|buffer, tier| match (tier, buffer.is_fast()) {
+		// Takes a `ValueRef` rather than a bare value: the length is no longer
+		// inside the value, and the epoch pin the ref carries is what makes
+		// reading the source bytes with no lock held sound. The destination is
+		// the same length by construction, which is the byte-length-preserving
+		// contract the accounting relies on.
+		let migrate: Box<dyn Fn(ValueRef<'_>, Tier) -> Option<TieredBuffer> + Send + Sync> =
+			Box::new(|value, tier| match (tier, value.is_fast()) {
 				(Tier::Fast, true) | (Tier::Slow, false) => None,
-				(Tier::Fast, false) => Some(TieredBuffer::new_fast(buffer.as_ref())),
-				(Tier::Slow, true) => Some(TieredBuffer::new_slow(buffer.as_ref())),
+				(Tier::Fast, false) => Some(TieredBuffer::new_fast(value.bytes())),
+				(Tier::Slow, true) => Some(TieredBuffer::new_slow(value.bytes())),
 			});
 
 		let (worker_fanout, worker_handles) = WorkerFanout::new_with_tier_migration(
@@ -2965,7 +3077,14 @@ where
 			migrate,
 		)?;
 
-		let cache = PaperCache {
+		// Annotated, and load-bearing. `migrate` no longer mentions `V` -- it
+		// takes a `ValueRef` and returns a `TieredValue` -- so nothing else in
+		// this function pins `V` before the `broadcast` call below, and an
+		// unresolved `V` makes that call ambiguous between this block and the
+		// flat `impl<K, V, S> ... where V: ValueShape` one (E0034: both are
+		// inherent candidates, and the where-clause can only rule one out once
+		// `V` is known).
+		let cache: Self = PaperCache {
 			objects,
 			status,
 			workers: Arc::new(worker_fanout),

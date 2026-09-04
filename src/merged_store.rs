@@ -439,6 +439,14 @@ impl<K, V> Inner<K, V> {
 	}
 
 	/// Unlink, drop the object and return the slot to the free list.
+	///
+	/// Dropping the object is what RETIRES its value: `Object::drop` defers the
+	/// free under an epoch pin rather than performing it, so a reader that
+	/// lifted this value's pointer out from under the shard guard a moment ago
+	/// and is still copying its bytes is safe. Nothing extra is needed here --
+	/// and deliberately so, since this runs on the policy worker, `take` runs
+	/// on the API thread, and the TTL reaper runs on a third; a per-site rule
+	/// would have to be repeated at all of them.
 	fn retire(&mut self, i: u32) {
 		self.detach_tier(i);
 		self.unlink(i);
@@ -838,6 +846,9 @@ impl<K, V> MergedStore<K, V> {
 		g.detach_tier(i);
 		g.unlink(i);
 
+		// Handed to the caller rather than dropped here, so the value's
+		// retirement happens wherever the caller drops it -- still under a pin,
+		// via `Object::drop`.
 		let taken = g.slots[i as usize].object.take();
 		g.free.push(i);
 		self.publish_tail(s, &g);
@@ -970,6 +981,13 @@ impl<K, V> MergedStore<K, V> {
 
 			self.publish_tail(s, &g);
 		}
+
+		// Every slot vector dropped above retired its objects' values into this
+		// thread's epoch bag. Push them out now: a `clear` is the one moment
+		// the whole cache's worth of garbage appears at once, and leaving it in
+		// a local bag would keep it resident until this thread happened to pin
+		// enough more times to fill it.
+		crate::value::flush();
 
 		self.tracked.store(0, Ordering::Relaxed);
 		self.pending_migrations.store(0, Ordering::Relaxed);
@@ -1114,7 +1132,7 @@ impl<K, V> MergedStore<K, V> {
 mod tests {
 	use super::*;
 
-	type Store = MergedStore<u64, Vec<u8>>;
+	type Store = MergedStore<u64, crate::BufferDRAM>;
 
 	/// Spreads the HIGH bits, which is what selects a shard.
 	fn mix(i: u64) -> HashedKey {
@@ -1128,7 +1146,7 @@ mod tests {
 	}
 
 	fn put(s: &Store, key: HashedKey, size: ObjectSize) {
-		s.insert(key, Object::new(key, Vec::new(), None));
+		s.insert(key, Object::new(key, &[], None));
 		s.record_size(key, size, 0);
 	}
 
@@ -1719,11 +1737,11 @@ mod measure {
 			.unwrap_or(64);
 
 		let base = allocated_bytes();
-		let store: MergedStore<u64, Vec<u8>> = MergedStore::new();
+		let store: MergedStore<u64, crate::BufferDRAM> = MergedStore::new();
 
 		for i in 0..n {
 			let k = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-			store.insert(k, Object::new(k, vec![0u8; vsize], None));
+			store.insert(k, Object::new(k, &vec![0u8; vsize], None));
 			store.record_size(k, (vsize + 16) as ObjectSize, 16);
 		}
 
@@ -1740,10 +1758,10 @@ mod measure {
 			after.saturating_sub(base),
 			held,
 			slab,
-			slab * core::mem::size_of::<Slot<u64, Vec<u8>>>(),
+			slab * core::mem::size_of::<Slot<u64, crate::BufferDRAM>>(),
 			index,
 			free,
-			core::mem::size_of::<Slot<u64, Vec<u8>>>(),
+			core::mem::size_of::<Slot<u64, crate::BufferDRAM>>(),
 		);
 	}
 
@@ -1769,12 +1787,12 @@ mod measure {
 			.unwrap_or(64);
 
 		let base = allocated_bytes();
-		let map: dashmap::DashMap<HashedKey, Object<u64, Vec<u8>>, NoHasher> =
+		let map: dashmap::DashMap<HashedKey, Object<u64, crate::BufferDRAM>, NoHasher> =
 			dashmap::DashMap::with_hasher(NoHasher::default());
 
 		for i in 0..n {
 			let k = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-			map.insert(k, Object::new(k, vec![0u8; vsize], None));
+			map.insert(k, Object::new(k, &vec![0u8; vsize], None));
 		}
 
 		let after = allocated_bytes();
@@ -1790,8 +1808,8 @@ mod measure {
 	#[test]
 	fn the_option_in_a_slot_is_free() {
 		assert_eq!(
-			core::mem::size_of::<Option<Object<u64, Vec<u8>>>>(),
-			core::mem::size_of::<Object<u64, Vec<u8>>>(),
+			core::mem::size_of::<Option<Object<u64, crate::BufferDRAM>>>(),
+			core::mem::size_of::<Object<u64, crate::BufferDRAM>>(),
 			"Option<Object> grew: the Arc niche is no longer absorbing the discriminant",
 		);
 	}
@@ -1801,10 +1819,10 @@ mod measure {
 	fn print_slot_layout() {
 		println!(
 			"SLOTLAYOUT slot={} object={} overhead={}",
-			core::mem::size_of::<Slot<u64, Vec<u8>>>(),
-			core::mem::size_of::<Object<u64, Vec<u8>>>(),
-			core::mem::size_of::<Slot<u64, Vec<u8>>>()
-				- core::mem::size_of::<Object<u64, Vec<u8>>>(),
+			core::mem::size_of::<Slot<u64, crate::BufferDRAM>>(),
+			core::mem::size_of::<Object<u64, crate::BufferDRAM>>(),
+			core::mem::size_of::<Slot<u64, crate::BufferDRAM>>()
+				- core::mem::size_of::<Object<u64, crate::BufferDRAM>>(),
 		);
 	}
 }

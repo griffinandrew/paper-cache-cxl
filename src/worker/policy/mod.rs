@@ -215,36 +215,67 @@ pub mod migration_queue {
 	/// apart on either the swap or what counts as a completion.
 	pub(crate) fn apply_migration<K, V>(
 		objects: &ObjectMapRef<K, V>,
-		migrate: &(dyn Fn(&V, Tier) -> Option<V> + Send + Sync),
+		migrate: &(dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue>
+			+ Send
+			+ Sync),
 		key: HashedKey,
 		tier: Tier,
 	) -> bool {
-		// Snapshot the source bytes with no guard held -- `data()` is an `Arc`
-		// refcount bump and the `Arc` keeps them alive independently of the
-		// map. That same strong reference also makes the identity check below
-		// immune to ABA: the allocation cannot be freed, so its address cannot
-		// be recycled.
-		let Some(old_data) = objects.get_ref(&key).map(|object| object.data()) else {
+		// ONE pin, spanning the whole snapshot-copy-swap. It is what makes
+		// every step below sound, and it replaces the strong reference the old
+		// `Shared` handle contributed:
+		//
+		//   * the source bytes stay readable with NO shard guard held, which
+		//     is what stops a multi-KB (possibly PMEM) copy from serialising
+		//     against readers;
+		//   * the identity check stays immune to ABA. The old allocation
+		//     cannot be freed while this pin is live -- every free is deferred
+		//     behind a pin taken no later -- so its address cannot be recycled
+		//     into a different value, and raw-pointer equality is therefore
+		//     EXACT rather than merely probable. Comparing bytes would not be:
+		//     a `set` that wrote identical content is a different value and
+		//     must be rejected.
+		let guard = crossbeam_epoch::pin();
+
+		let Some(old_value) = objects.get_ref(&key).map(|object| object.snapshot(&guard)) else {
 			MIG_GONE.fetch_add(1, Ordering::Relaxed);
 			return false;
 		};
 
 		// Declined: already in the requested tier, nothing to move.
-		let Some(new_data) = migrate(&old_data, tier) else {
+		let Some(new_value) = migrate(old_value, tier) else {
 			MIG_DECLINED.fetch_add(1, Ordering::Relaxed);
 			return false;
 		};
+
+		let len = old_value.len();
 
 		// Check-and-act under one shard write lock: any writer must take the
 		// same lock, so nothing can replace the value between the comparison
 		// and the swap.
 		if let Some(mut object) = objects.get_mut_ref(&key) {
-			if crate::shared::Shared::ptr_eq(&object.data(), &old_data) {
-				object.set_data(new_data);
+			if object.value().raw() == old_value.raw() {
+				let (superseded, superseded_len) = object.set_data(new_value, len);
+
+				// Unpublished under the write guard, retired immediately
+				// after: a reader that lifted this pointer out a moment ago is
+				// still pinned, so the free waits for it.
+				crate::value::defer_free(superseded, superseded_len);
+
 				MIG_APPLIED.fetch_add(1, Ordering::Relaxed);
 				return true;
 			}
 		}
+
+		// Superseded, or the object vanished between the two lookups. The copy
+		// was NEVER PUBLISHED -- no other thread has ever seen this pointer --
+		// so it is freed outright rather than deferred. Deferring it would
+		// also be correct but would hold a whole copy of the value until the
+		// next epoch advance, for no reader that can exist.
+		//
+		// SAFETY: `new_value` was created by `migrate` from `len` bytes and
+		// was never stored anywhere, so this is its only handle.
+		unsafe { new_value.free(len) };
 
 		MIG_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
 		false
@@ -305,7 +336,11 @@ pub mod migration_queue {
 		/// Returns `None` when `threads == 0`, i.e. the queue is disabled.
 		pub fn spawn<K, V>(
 			objects: ObjectMapRef<K, V>,
-			migrate: Arc<dyn Fn(&V, Tier) -> Option<V> + Send + Sync>,
+			migrate: Arc<
+				dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue>
+					+ Send
+					+ Sync,
+			>,
 			threads: usize,
 			status: StatusRef,
 		) -> Option<Self>
@@ -1001,7 +1036,9 @@ pub struct PolicyWorker<K, V> {
 	/// counters and gauges are recorded directly on the shared `status`
 	/// (see `apply_tier_migrations`), not a separate field.
 	#[cfg(feature = "hybrid_cache_common")]
-	tier_migration_fn: Option<Arc<dyn Fn(&V, Tier) -> Option<V> + Send + Sync>>,
+	tier_migration_fn: Option<
+		Arc<dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync>,
+	>,
 
 	/// Standing pool draining physical tier copies off the worker thread.
 	/// `None` unless `MIGRATION_QUEUE_THREADS` is non-zero -- see
@@ -1014,7 +1051,7 @@ impl<K, V> Worker for PolicyWorker<K, V>
 where
 	Self: 'static + Send,
 	K: Eq + TypeSize + Send + Sync,
-	V: TypeSize + Send + Sync,
+	V: Send + Sync,
 {
 	fn run(&mut self) -> Result<(), CacheError> {
 		let (
@@ -1176,6 +1213,19 @@ where
 			#[cfg(feature = "hybrid_cache_common")]
 			self.refresh_tier_gauges();
 
+			// Once per pass: push this thread's retired values into the global
+			// garbage queue and try to advance the epoch.
+			//
+			// This worker is where most values die -- every eviction and every
+			// superseded migration retires one -- and a deferral sits in the
+			// LOCAL bag of the thread that made it until that thread pins
+			// enough more times to fill the bag. Between two bursts of
+			// evictions this thread sleeps in `delay_event_loop`, so without
+			// this the cache's real footprint would stay a whole burst above
+			// what it reports, for as long as the lull lasts. Cheap when there
+			// is nothing to flush.
+			crate::value::flush();
+
 			let now = Instant::now();
 
 			if let Some(policy) = self.perform_auto_policy(now, has_current_set) {
@@ -1195,7 +1245,7 @@ where
 	// every real instantiation, since the worker owns the object map on its
 	// own thread.
 	K: 'static + Eq + TypeSize + Send + Sync,
-	V: 'static + TypeSize + Send + Sync,
+	V: 'static + Send + Sync,
 {
 	pub fn new(
 		listener: WorkerReceiver,
@@ -1287,11 +1337,15 @@ where
 		objects: ObjectMapRef<K, V>,
 		status: StatusRef,
 		overhead_manager: OverheadManagerRef,
-		migrate: Box<dyn Fn(&V, Tier) -> Option<V> + Send + Sync>,
+		migrate: Box<
+			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
+		>,
 	) -> Result<Self, CacheError> {
 		// Shared rather than owned so the standing migration pool (if it is
 		// enabled) can run the same closure on its own threads.
-		let migrate: Arc<dyn Fn(&V, Tier) -> Option<V> + Send + Sync> = Arc::from(migrate);
+		let migrate: Arc<
+			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
+		> = Arc::from(migrate);
 
 		let max_cache_size = status.max_size();
 
@@ -2118,7 +2172,6 @@ fn reconstruct_policy_stack(
 unsafe impl<K, V> Send for PolicyWorker<K, V>
 where
 	K: TypeSize,
-	V: TypeSize,
 {}
 
 #[cfg(all(test, feature = "hybrid_cache_common"))]
@@ -2130,7 +2183,10 @@ mod migration_queue_tests {
 	use crate::object_store::ObjectStore;
 	use crate::status::AtomicStatus;
 
-	type TestBuffer = Box<[u8]>;
+	/// The cache SHAPE under test. Never `Box<[u8]>`: that is a
+	/// feature-dependent alias, and since v5 `V` is a zero-sized marker
+	/// rather than the value type -- every value is a `TieredValue`.
+	type TestBuffer = crate::TieredBuffer;
 
 	/// Byte stamped into the buffer's last position by `marker_migrate`, so a
 	/// buffer's physical tier is readable back out of its bytes.
@@ -2147,9 +2203,11 @@ mod migration_queue_tests {
 	// Same idiom as the hybrid_tests harnesses' migrate closure: tag the last
 	// byte per tier without changing the buffer's length, so Fast-vs-Slow
 	// outcomes are distinguishable in the bytes themselves.
-	fn marker_migrate() -> Arc<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> {
-		Arc::new(|bytes: &TestBuffer, tier: Tier| {
-			if bytes.first() == Some(&DECLINE_SENTINEL) {
+	fn marker_migrate() -> Arc<
+			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
+		> {
+		Arc::new(|value: crate::value::ValueRef<'_>, tier: Tier| {
+			if value.bytes().first() == Some(&DECLINE_SENTINEL) {
 				return None;
 			}
 
@@ -2158,12 +2216,12 @@ mod migration_queue_tests {
 				Tier::Slow => SLOW_MARKER,
 			};
 
-			let mut v = bytes.to_vec();
+			let mut v = value.bytes().to_vec();
 			if let Some(last) = v.last_mut() {
 				*last = marker;
 			}
 
-			Some(v.into_boxed_slice())
+			Some(crate::TieredValue::new_in(&v, tier))
 		})
 	}
 
@@ -2179,12 +2237,12 @@ mod migration_queue_tests {
 	}
 
 	fn insert(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey, fill: u8) {
-		let object = Object::new(key as u32, vec![fill; BUFFER_LEN].into_boxed_slice(), None);
+		let object = Object::new(key as u32, &vec![fill; BUFFER_LEN], None);
 		objects.insert(key, object);
 	}
 
 	fn last_byte(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) -> u8 {
-		*objects.get_ref(&key).unwrap().data().last().unwrap()
+		*objects.get_ref(&key).unwrap().bytes().last().unwrap()
 	}
 
 	#[test]
@@ -2254,12 +2312,12 @@ mod migration_queue_tests {
 		assert_eq!(last_byte(&objects, 1), SLOW_MARKER);
 
 		// ...and the declined object's bytes are untouched.
-		let data = objects.get_ref(&2).unwrap().data();
-		assert_eq!(&**data, &[DECLINE_SENTINEL; BUFFER_LEN][..]);
+		let data = objects.get_ref(&2).unwrap().bytes().to_vec();
+		assert_eq!(data.as_slice(), &[DECLINE_SENTINEL; BUFFER_LEN][..]);
 	}
 
 	#[test]
-	fn a_stale_migration_is_dropped_by_the_ptr_eq_guard() {
+	fn a_stale_migration_is_dropped_by_the_identity_guard() {
 		let objects = make_objects();
 		let key: HashedKey = 1;
 		insert(&objects, key, 0);
@@ -2272,17 +2330,19 @@ mod migration_queue_tests {
 		let (entered_tx, entered_rx) = unbounded::<()>();
 		let (release_tx, release_rx) = unbounded::<()>();
 
-		let migrate: Arc<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
-			Arc::new(move |bytes: &TestBuffer, _tier: Tier| {
+		let migrate: Arc<
+			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
+		> =
+			Arc::new(move |value: crate::value::ValueRef<'_>, _tier: Tier| {
 				entered_tx.send(()).unwrap();
 				release_rx.recv().unwrap();
 
-				let mut v = bytes.to_vec();
+				let mut v = value.bytes().to_vec();
 				if let Some(last) = v.last_mut() {
 					*last = FAST_MARKER;
 				}
 
-				Some(v.into_boxed_slice())
+				Some(crate::TieredValue::new_fast(&v))
 			});
 
 		let queue = MigrationQueue::spawn(objects.clone(), migrate, 1, make_status()).unwrap();
@@ -2293,19 +2353,28 @@ mod migration_queue_tests {
 		// closure; replacing the object's data here is exactly the
 		// interleaving of a concurrent `set()` racing an in-flight copy.
 		entered_rx.recv().unwrap();
-		objects
-			.get_mut_ref(&key)
-			.unwrap()
-			.set_data(vec![0x99u8; BUFFER_LEN].into_boxed_slice());
+		{
+			let replacement = crate::TieredValue::new_fast(&[0x99u8; BUFFER_LEN]);
+			let (old, old_len) = objects
+				.get_mut_ref(&key)
+				.unwrap()
+				.set_data(replacement, BUFFER_LEN as u32);
+
+			// Exactly what `set()` does with the value it displaces: RETIRE it
+			// rather than free it, because the parked consumer is still holding
+			// a snapshot of this very pointer. Freeing here would recycle the
+			// address and make the identity check below meaningless.
+			crate::value::defer_free(old, old_len);
+		}
 
 		release_tx.send(()).unwrap();
 		queue.flush();
 
 		// The migration's output was computed from a superseded snapshot, so
-		// the `Arc::ptr_eq` identity check must discard it: the replacement
+		// the raw-pointer identity check must discard it: the replacement
 		// survives, not the Fast-stamped copy.
-		let data = objects.get_ref(&key).unwrap().data();
-		assert_eq!(&**data, &[0x99u8; BUFFER_LEN][..]);
+		let data = objects.get_ref(&key).unwrap().bytes().to_vec();
+		assert_eq!(data.as_slice(), &[0x99u8; BUFFER_LEN][..]);
 	}
 
 	#[test]
@@ -2356,7 +2425,10 @@ mod lru_hybrid_tests {
 		worker::policy::policy_stack::watermarks,
 	};
 
-	type TestBuffer = Box<[u8]>;
+	/// The cache SHAPE under test. Never `Box<[u8]>`: that is a
+	/// feature-dependent alias, and since v5 `V` is a zero-sized marker
+	/// rather than the value type -- every value is a `TieredValue`.
+	type TestBuffer = crate::TieredBuffer;
 
 	// The per-object shared-structure DRAM overhead `init_policy_stack` now
 	// reserves out of the fast-tier budget (via `with_shared_overhead`). Tests
@@ -2425,24 +2497,26 @@ mod lru_hybrid_tests {
 		// previously desynced `base_used_size` between insert-time and
 		// erase-time, wrapping it to a huge value and hanging
 		// `apply_evictions`'s eviction loop forever.
-		let migrate: Box<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
-			Box::new(|bytes, tier| {
+		let migrate: Box<
+			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
+		> =
+			Box::new(|value, tier| {
 				let marker: u8 = match tier {
 					Tier::Fast => 0xFA,
 					Tier::Slow => 0x50,
 				};
 
-				let mut v = bytes.to_vec();
+				let mut v = value.bytes().to_vec();
 				if let Some(last) = v.last_mut() {
 					*last = marker;
 				}
 
-				// Always `Some`: a plain `Box<[u8]>` carries no tier of its
-				// own, so there is no already-in-tier case to decline. Keeping
-				// it unconditional means the byte-marker assertions below still
-				// exercise the full copy-and-swap path rather than silently
-				// testing a declined migration.
-				Some(v.into_boxed_slice())
+				// Always `Some`, even though a `TieredValue` now DOES carry a tier
+				// of its own and the production closure declines an
+				// already-correctly-placed value. Keeping it unconditional is
+				// what makes the byte-marker assertions below exercise the full
+				// copy-and-swap path rather than silently testing a decline.
+				Some(crate::TieredValue::new_in(&v, tier))
 			});
 
 		let worker = PolicyWorker::new_with_tier_migration(
@@ -2470,7 +2544,7 @@ mod lru_hybrid_tests {
 		key: HashedKey,
 		size: usize,
 	) {
-		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
+		let object = Object::<u32, TestBuffer>::new(key as u32, &vec![0u8; size], None);
 		let base_size = overhead_manager.base_size(&object);
 		let dram_resident = overhead_manager.dram_resident_size(&object);
 
@@ -2487,7 +2561,7 @@ mod lru_hybrid_tests {
 	// (via `handle_resize_fast_tier`, bypassing the 20%-of-max_size default)
 	// without depending on the precise overhead constant.
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe)
 	}
 
@@ -2498,7 +2572,7 @@ mod lru_hybrid_tests {
 	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
 	/// therefore over-provisions it by the DRAM-resident remainder per object.
 	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
 	}
 
@@ -2533,7 +2607,7 @@ mod lru_hybrid_tests {
 
 		// The demoted key's bytes were physically replaced by `migrate`
 		// with the Slow-tagged version.
-		let data = objects.get_ref(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data.last(), Some(&0x50));
 	}
 
@@ -2567,7 +2641,7 @@ mod lru_hybrid_tests {
 		assert_eq!(snapshot.promotions, 1);
 		assert_eq!(snapshot.demotions, 2);
 
-		let data_1 = objects.get_ref(&1).unwrap().data();
+		let data_1 = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data_1.last(), Some(&0xFA));
 	}
 
@@ -2634,7 +2708,10 @@ mod lfu_hybrid_tests {
 		worker::policy::policy_stack::watermarks,
 	};
 
-	type TestBuffer = Box<[u8]>;
+	/// The cache SHAPE under test. Never `Box<[u8]>`: that is a
+	/// feature-dependent alias, and since v5 `V` is a zero-sized marker
+	/// rather than the value type -- every value is a `TieredValue`.
+	type TestBuffer = crate::TieredBuffer;
 
 	// Per-object shared-structure DRAM overhead reserved out of the fast-tier
 	// budget by `init_policy_stack` (`with_shared_overhead`). Tests sizing the
@@ -2696,24 +2773,26 @@ mod lfu_hybrid_tests {
 		// See `hybrid_tests::make_worker` for why this must never change
 		// the buffer's byte length (a migration that does desyncs
 		// `base_used_size` and can hang `apply_evictions`'s loop forever).
-		let migrate: Box<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
-			Box::new(|bytes, tier| {
+		let migrate: Box<
+			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
+		> =
+			Box::new(|value, tier| {
 				let marker: u8 = match tier {
 					Tier::Fast => 0xFA,
 					Tier::Slow => 0x50,
 				};
 
-				let mut v = bytes.to_vec();
+				let mut v = value.bytes().to_vec();
 				if let Some(last) = v.last_mut() {
 					*last = marker;
 				}
 
-				// Always `Some`: a plain `Box<[u8]>` carries no tier of its
-				// own, so there is no already-in-tier case to decline. Keeping
-				// it unconditional means the byte-marker assertions below still
-				// exercise the full copy-and-swap path rather than silently
-				// testing a declined migration.
-				Some(v.into_boxed_slice())
+				// Always `Some`, even though a `TieredValue` now DOES carry a tier
+				// of its own and the production closure declines an
+				// already-correctly-placed value. Keeping it unconditional is
+				// what makes the byte-marker assertions below exercise the full
+				// copy-and-swap path rather than silently testing a decline.
+				Some(crate::TieredValue::new_in(&v, tier))
 			});
 
 		let worker = PolicyWorker::new_with_tier_migration(
@@ -2735,7 +2814,7 @@ mod lfu_hybrid_tests {
 		key: HashedKey,
 		size: usize,
 	) {
-		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
+		let object = Object::<u32, TestBuffer>::new(key as u32, &vec![0u8; size], None);
 		let base_size = overhead_manager.base_size(&object);
 		let dram_resident = overhead_manager.dram_resident_size(&object);
 
@@ -2746,7 +2825,7 @@ mod lfu_hybrid_tests {
 	}
 
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe)
 	}
 
@@ -2757,7 +2836,7 @@ mod lfu_hybrid_tests {
 	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
 	/// therefore over-provisions it by the DRAM-resident remainder per object.
 	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
 	}
 
@@ -2789,7 +2868,7 @@ mod lfu_hybrid_tests {
 
 		// Key 2's bytes were physically built as Slow via the migration;
 		// key 1 was never migrated (correctly Fast from the start).
-		let data_2 = objects.get_ref(&2).unwrap().data();
+		let data_2 = objects.get_ref(&2).unwrap().bytes().to_vec();
 		assert_eq!(data_2.last(), Some(&0x50));
 	}
 
@@ -2841,10 +2920,10 @@ mod lfu_hybrid_tests {
 		assert_eq!(snapshot.promotions, 1);
 		assert_eq!(snapshot.demotions, 1);
 
-		let data_3 = objects.get_ref(&3).unwrap().data();
+		let data_3 = objects.get_ref(&3).unwrap().bytes().to_vec();
 		assert_eq!(data_3.last(), Some(&0xFA));
 
-		let data_2 = objects.get_ref(&2).unwrap().data();
+		let data_2 = objects.get_ref(&2).unwrap().bytes().to_vec();
 		assert_eq!(data_2.last(), Some(&0x50));
 	}
 
@@ -2910,7 +2989,10 @@ mod fifo_hybrid_tests {
 		worker::policy::policy_stack::watermarks,
 	};
 
-	type TestBuffer = Box<[u8]>;
+	/// The cache SHAPE under test. Never `Box<[u8]>`: that is a
+	/// feature-dependent alias, and since v5 `V` is a zero-sized marker
+	/// rather than the value type -- every value is a `TieredValue`.
+	type TestBuffer = crate::TieredBuffer;
 
 	// The per-object shared-structure DRAM overhead `init_policy_stack`
 	// reserves out of the fast-tier budget (via `with_shared_overhead`) is
@@ -2975,24 +3057,26 @@ mod fifo_hybrid_tests {
 		// See `hybrid_tests::make_worker` for why this must never change
 		// the buffer's byte length (a migration that does desyncs
 		// `base_used_size` and can hang `apply_evictions`'s loop forever).
-		let migrate: Box<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
-			Box::new(|bytes, tier| {
+		let migrate: Box<
+			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
+		> =
+			Box::new(|value, tier| {
 				let marker: u8 = match tier {
 					Tier::Fast => 0xFA,
 					Tier::Slow => 0x50,
 				};
 
-				let mut v = bytes.to_vec();
+				let mut v = value.bytes().to_vec();
 				if let Some(last) = v.last_mut() {
 					*last = marker;
 				}
 
-				// Always `Some`: a plain `Box<[u8]>` carries no tier of its
-				// own, so there is no already-in-tier case to decline. Keeping
-				// it unconditional means the byte-marker assertions below still
-				// exercise the full copy-and-swap path rather than silently
-				// testing a declined migration.
-				Some(v.into_boxed_slice())
+				// Always `Some`, even though a `TieredValue` now DOES carry a tier
+				// of its own and the production closure declines an
+				// already-correctly-placed value. Keeping it unconditional is
+				// what makes the byte-marker assertions below exercise the full
+				// copy-and-swap path rather than silently testing a decline.
+				Some(crate::TieredValue::new_in(&v, tier))
 			});
 
 		let worker = PolicyWorker::new_with_tier_migration(
@@ -3014,7 +3098,7 @@ mod fifo_hybrid_tests {
 		key: HashedKey,
 		size: usize,
 	) {
-		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
+		let object = Object::<u32, TestBuffer>::new(key as u32, &vec![0u8; size], None);
 		let base_size = overhead_manager.base_size(&object);
 		let dram_resident = overhead_manager.dram_resident_size(&object);
 
@@ -3025,7 +3109,7 @@ mod fifo_hybrid_tests {
 	}
 
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe)
 	}
 
@@ -3036,7 +3120,7 @@ mod fifo_hybrid_tests {
 	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
 	/// therefore over-provisions it by the DRAM-resident remainder per object.
 	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
 	}
 
@@ -3073,7 +3157,7 @@ mod fifo_hybrid_tests {
 
 		// The demoted key's bytes were physically replaced by `migrate`
 		// with the Slow-tagged version.
-		let data = objects.get_ref(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data.last(), Some(&0x50));
 	}
 
@@ -3113,7 +3197,7 @@ mod fifo_hybrid_tests {
 		assert_eq!(snapshot_after.slow_objects, snapshot_before.slow_objects);
 
 		// Bytes are still tagged Slow -- never re-migrated back to Fast.
-		let data_1 = objects.get_ref(&1).unwrap().data();
+		let data_1 = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data_1.last(), Some(&0x50));
 	}
 
@@ -3179,7 +3263,10 @@ mod two_q_fast_admission_hybrid_tests {
 		worker::policy::policy_stack::watermarks,
 	};
 
-	type TestBuffer = Box<[u8]>;
+	/// The cache SHAPE under test. Never `Box<[u8]>`: that is a
+	/// feature-dependent alias, and since v5 `V` is a zero-sized marker
+	/// rather than the value type -- every value is a `TieredValue`.
+	type TestBuffer = crate::TieredBuffer;
 
 	/// The `max_size` every test in this module builds its worker with.
 	const MAX_SIZE: CacheSize = 1_000;
@@ -3265,24 +3352,26 @@ mod two_q_fast_admission_hybrid_tests {
 
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		let migrate: Box<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
-			Box::new(|bytes, tier| {
+		let migrate: Box<
+			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
+		> =
+			Box::new(|value, tier| {
 				let marker: u8 = match tier {
 					Tier::Fast => 0xFA,
 					Tier::Slow => 0x50,
 				};
 
-				let mut v = bytes.to_vec();
+				let mut v = value.bytes().to_vec();
 				if let Some(last) = v.last_mut() {
 					*last = marker;
 				}
 
-				// Always `Some`: a plain `Box<[u8]>` carries no tier of its
-				// own, so there is no already-in-tier case to decline. Keeping
-				// it unconditional means the byte-marker assertions below still
-				// exercise the full copy-and-swap path rather than silently
-				// testing a declined migration.
-				Some(v.into_boxed_slice())
+				// Always `Some`, even though a `TieredValue` now DOES carry a tier
+				// of its own and the production closure declines an
+				// already-correctly-placed value. Keeping it unconditional is
+				// what makes the byte-marker assertions below exercise the full
+				// copy-and-swap path rather than silently testing a decline.
+				Some(crate::TieredValue::new_in(&v, tier))
 			});
 
 		let worker = PolicyWorker::new_with_tier_migration(
@@ -3304,7 +3393,7 @@ mod two_q_fast_admission_hybrid_tests {
 		key: HashedKey,
 		size: usize,
 	) {
-		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
+		let object = Object::<u32, TestBuffer>::new(key as u32, &vec![0u8; size], None);
 		let base_size = overhead_manager.base_size(&object);
 		let dram_resident = overhead_manager.dram_resident_size(&object);
 
@@ -3315,7 +3404,7 @@ mod two_q_fast_admission_hybrid_tests {
 	}
 
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe)
 	}
 
@@ -3326,7 +3415,7 @@ mod two_q_fast_admission_hybrid_tests {
 	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
 	/// therefore over-provisions it by the DRAM-resident remainder per object.
 	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
 	}
 
@@ -3351,7 +3440,7 @@ mod two_q_fast_admission_hybrid_tests {
 
 		// The API layer built these bytes Fast and nothing rewrote them, so
 		// the migrate closure's marker was never applied.
-		let data = objects.get_ref(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_ne!(data.last(), Some(&0x50));
 		assert_ne!(data.last(), Some(&0xFA));
 	}
@@ -3384,7 +3473,7 @@ mod two_q_fast_admission_hybrid_tests {
 		assert_eq!(snapshot.demotions, 0);
 		assert_eq!(snapshot.fast_objects, 1);
 
-		let data = objects.get_ref(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_ne!(data.last(), Some(&0xFA));
 	}
 
@@ -3418,7 +3507,7 @@ mod two_q_fast_admission_hybrid_tests {
 		assert_eq!(snapshot.slow_objects, 1);
 
 		// Key 1 was the main queue's LRU tail, so it took the demotion.
-		let data = objects.get_ref(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data.last(), Some(&0x50));
 	}
 
@@ -3455,7 +3544,7 @@ mod two_q_fast_admission_hybrid_tests {
 		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 1);
 
-		let data_1 = objects.get_ref(&1).unwrap().data();
+		let data_1 = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data_1.last(), Some(&0xFA));
 	}
 
@@ -3524,7 +3613,10 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		worker::policy::policy_stack::watermarks,
 	};
 
-	type TestBuffer = Box<[u8]>;
+	/// The cache SHAPE under test. Never `Box<[u8]>`: that is a
+	/// feature-dependent alias, and since v5 `V` is a zero-sized marker
+	/// rather than the value type -- every value is a `TieredValue`.
+	type TestBuffer = crate::TieredBuffer;
 
 	/// `k_in` is deliberately tiny (not `1.0`, unlike `hybrid_tests`):
 	/// here the FIFO budget is carved *out of* the fast tier, so a large
@@ -3552,24 +3644,26 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		let migrate: Box<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
-			Box::new(|bytes, tier| {
+		let migrate: Box<
+			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
+		> =
+			Box::new(|value, tier| {
 				let marker: u8 = match tier {
 					Tier::Fast => 0xFA,
 					Tier::Slow => 0x50,
 				};
 
-				let mut v = bytes.to_vec();
+				let mut v = value.bytes().to_vec();
 				if let Some(last) = v.last_mut() {
 					*last = marker;
 				}
 
-				// Always `Some`: a plain `Box<[u8]>` carries no tier of its
-				// own, so there is no already-in-tier case to decline. Keeping
-				// it unconditional means the byte-marker assertions below still
-				// exercise the full copy-and-swap path rather than silently
-				// testing a declined migration.
-				Some(v.into_boxed_slice())
+				// Always `Some`, even though a `TieredValue` now DOES carry a tier
+				// of its own and the production closure declines an
+				// already-correctly-placed value. Keeping it unconditional is
+				// what makes the byte-marker assertions below exercise the full
+				// copy-and-swap path rather than silently testing a decline.
+				Some(crate::TieredValue::new_in(&v, tier))
 			});
 
 		let worker = PolicyWorker::new_with_tier_migration(
@@ -3591,7 +3685,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		key: HashedKey,
 		size: usize,
 	) {
-		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
+		let object = Object::<u32, TestBuffer>::new(key as u32, &vec![0u8; size], None);
 		let base_size = overhead_manager.base_size(&object);
 		let dram_resident = overhead_manager.dram_resident_size(&object);
 
@@ -3602,7 +3696,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 	}
 
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe)
 	}
 
@@ -3613,7 +3707,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
 	/// therefore over-provisions it by the DRAM-resident remainder per object.
 	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
 	}
 
@@ -3768,7 +3862,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 
 		// The API layer built these bytes Fast and nothing rewrote them, so
 		// the migrate closure's marker was never applied.
-		let data = objects.get_ref(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_ne!(data.last(), Some(&0x50));
 		assert_ne!(data.last(), Some(&0xFA));
 	}
@@ -3791,7 +3885,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		assert_eq!(snapshot.demotions, 0);
 		assert_eq!(snapshot.fast_objects, 1);
 
-		let data = objects.get_ref(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_ne!(data.last(), Some(&0xFA));
 	}
 
@@ -3826,7 +3920,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		assert_eq!(snapshot.slow_objects, 1);
 
 		// Key 1 was the main queue's LRU tail, so it took the demotion.
-		let data = objects.get_ref(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data.last(), Some(&0x50));
 	}
 
@@ -3864,7 +3958,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 1);
 
-		let data_1 = objects.get_ref(&1).unwrap().data();
+		let data_1 = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data_1.last(), Some(&0xFA));
 	}
 
@@ -3919,7 +4013,7 @@ mod two_q_fast_admission_reprieve_hybrid_tests {
 		assert_eq!(objects.len(), 40);
 
 		// The reprieved (oldest) key's bytes carry the Slow marker.
-		let data = objects.get_ref(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data.last(), Some(&0x50));
 	}
 
@@ -3991,7 +4085,10 @@ mod two_q_hybrid_tests {
 		worker::policy::policy_stack::watermarks,
 	};
 
-	type TestBuffer = Box<[u8]>;
+	/// The cache SHAPE under test. Never `Box<[u8]>`: that is a
+	/// feature-dependent alias, and since v5 `V` is a zero-sized marker
+	/// rather than the value type -- every value is a `TieredValue`.
+	type TestBuffer = crate::TieredBuffer;
 
 	// The per-object shared-structure DRAM overhead `init_policy_stack` now
 	// reserves out of the fast-tier budget (via `with_shared_overhead`).
@@ -4057,24 +4154,26 @@ mod two_q_hybrid_tests {
 
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		let migrate: Box<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
-			Box::new(|bytes, tier| {
+		let migrate: Box<
+			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
+		> =
+			Box::new(|value, tier| {
 				let marker: u8 = match tier {
 					Tier::Fast => 0xFA,
 					Tier::Slow => 0x50,
 				};
 
-				let mut v = bytes.to_vec();
+				let mut v = value.bytes().to_vec();
 				if let Some(last) = v.last_mut() {
 					*last = marker;
 				}
 
-				// Always `Some`: a plain `Box<[u8]>` carries no tier of its
-				// own, so there is no already-in-tier case to decline. Keeping
-				// it unconditional means the byte-marker assertions below still
-				// exercise the full copy-and-swap path rather than silently
-				// testing a declined migration.
-				Some(v.into_boxed_slice())
+				// Always `Some`, even though a `TieredValue` now DOES carry a tier
+				// of its own and the production closure declines an
+				// already-correctly-placed value. Keeping it unconditional is
+				// what makes the byte-marker assertions below exercise the full
+				// copy-and-swap path rather than silently testing a decline.
+				Some(crate::TieredValue::new_in(&v, tier))
 			});
 
 		let worker = PolicyWorker::new_with_tier_migration(
@@ -4096,7 +4195,7 @@ mod two_q_hybrid_tests {
 		key: HashedKey,
 		size: usize,
 	) {
-		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
+		let object = Object::<u32, TestBuffer>::new(key as u32, &vec![0u8; size], None);
 		let base_size = overhead_manager.base_size(&object);
 		let dram_resident = overhead_manager.dram_resident_size(&object);
 
@@ -4107,7 +4206,7 @@ mod two_q_hybrid_tests {
 	}
 
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe)
 	}
 
@@ -4118,7 +4217,7 @@ mod two_q_hybrid_tests {
 	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
 	/// therefore over-provisions it by the DRAM-resident remainder per object.
 	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
 	}
 
@@ -4150,7 +4249,7 @@ mod two_q_hybrid_tests {
 		let snapshot = status.hybrid_stats();
 		assert_eq!(snapshot.promotions, 0);
 
-		let data = objects.get_ref(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data.last(), Some(&0u8)); // untouched: admission builds no migration
 
 		// Accessing the FIFO key promotes it straight to Main/Fast.
@@ -4162,7 +4261,7 @@ mod two_q_hybrid_tests {
 		assert_eq!(snapshot.promotions, 1);
 		assert_eq!(snapshot.fast_objects, 1);
 
-		let data = objects.get_ref(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data.last(), Some(&0xFA));
 	}
 
@@ -4200,7 +4299,7 @@ mod two_q_hybrid_tests {
 		assert_eq!(snapshot.promotions, 2);
 		assert_eq!(snapshot.demotions, 1);
 
-		let data_2 = objects.get_ref(&2).unwrap().data();
+		let data_2 = objects.get_ref(&2).unwrap().bytes().to_vec();
 		assert_eq!(data_2.last(), Some(&0xFA));
 	}
 
@@ -4261,7 +4360,10 @@ mod lru_sized_hybrid_tests {
 		worker::policy::policy_stack::watermarks,
 	};
 
-	type TestBuffer = Box<[u8]>;
+	/// The cache SHAPE under test. Never `Box<[u8]>`: that is a
+	/// feature-dependent alias, and since v5 `V` is a zero-sized marker
+	/// rather than the value type -- every value is a `TieredValue`.
+	type TestBuffer = crate::TieredBuffer;
 
 	// See `hybrid_tests::shared_overhead`'s identical rationale.
 	#[allow(dead_code)]
@@ -4315,24 +4417,26 @@ mod lru_sized_hybrid_tests {
 
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		let migrate: Box<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
-			Box::new(|bytes, tier| {
+		let migrate: Box<
+			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
+		> =
+			Box::new(|value, tier| {
 				let marker: u8 = match tier {
 					Tier::Fast => 0xFA,
 					Tier::Slow => 0x50,
 				};
 
-				let mut v = bytes.to_vec();
+				let mut v = value.bytes().to_vec();
 				if let Some(last) = v.last_mut() {
 					*last = marker;
 				}
 
-				// Always `Some`: a plain `Box<[u8]>` carries no tier of its
-				// own, so there is no already-in-tier case to decline. Keeping
-				// it unconditional means the byte-marker assertions below still
-				// exercise the full copy-and-swap path rather than silently
-				// testing a declined migration.
-				Some(v.into_boxed_slice())
+				// Always `Some`, even though a `TieredValue` now DOES carry a tier
+				// of its own and the production closure declines an
+				// already-correctly-placed value. Keeping it unconditional is
+				// what makes the byte-marker assertions below exercise the full
+				// copy-and-swap path rather than silently testing a decline.
+				Some(crate::TieredValue::new_in(&v, tier))
 			});
 
 		let worker = PolicyWorker::new_with_tier_migration(
@@ -4355,7 +4459,7 @@ mod lru_sized_hybrid_tests {
 		key: HashedKey,
 		size: usize,
 	) {
-		let object = Object::new(key as u32, vec![0u8; size].into_boxed_slice(), None);
+		let object = Object::<u32, TestBuffer>::new(key as u32, &vec![0u8; size], None);
 		let base_size = overhead_manager.base_size(&object);
 		let dram_resident = overhead_manager.dram_resident_size(&object);
 
@@ -4367,7 +4471,7 @@ mod lru_sized_hybrid_tests {
 
 	// Mirrors `hybrid_tests::base_size_of` exactly.
 	fn base_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe)
 	}
 
@@ -4378,7 +4482,7 @@ mod lru_sized_hybrid_tests {
 	/// are already inside `shared_overhead`. Sizing a fast tier in `base_size`
 	/// therefore over-provisions it by the DRAM-resident remainder per object.
 	fn migrating_size_of(overhead_manager: &OverheadManagerRef, size: usize) -> ObjectSize {
-		let probe = Object::new(0u32, vec![0u8; size].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; size], None);
 		overhead_manager.base_size(&probe) - overhead_manager.dram_resident_size(&probe)
 	}
 
@@ -4413,7 +4517,7 @@ mod lru_sized_hybrid_tests {
 		assert_eq!(snapshot.large_fast_objects, 0);
 		assert_eq!(snapshot.large_slow_objects, 0);
 
-		let data = objects.get_ref(&1).unwrap().data();
+		let data = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data.last(), Some(&0x50));
 	}
 
@@ -4440,7 +4544,7 @@ mod lru_sized_hybrid_tests {
 		assert_eq!(snapshot.promotions, 1);
 		assert_eq!(snapshot.demotions, 2);
 
-		let data_1 = objects.get_ref(&1).unwrap().data();
+		let data_1 = objects.get_ref(&1).unwrap().bytes().to_vec();
 		assert_eq!(data_1.last(), Some(&0xFA));
 	}
 
@@ -4584,7 +4688,10 @@ mod migration_accounting_tests {
 		status::AtomicStatus,
 	};
 
-	type TestBuffer = Box<[u8]>;
+	/// The cache SHAPE under test. Never `Box<[u8]>`: that is a
+	/// feature-dependent alias, and since v5 `V` is a zero-sized marker
+	/// rather than the value type -- every value is a `TieredValue`.
+	type TestBuffer = crate::TieredBuffer;
 
 	const FAST_MARKER: u8 = 0xFA;
 	const SLOW_MARKER: u8 = 0x50;
@@ -4609,8 +4716,10 @@ mod migration_accounting_tests {
 		// Tags the buffer's last byte so a test can tell a real swap from a
 		// counter that merely fired. Never changes the length, for the same
 		// accounting reason the other hybrid test modules note.
-		let migrate: Box<dyn Fn(&TestBuffer, Tier) -> Option<TestBuffer> + Send + Sync> =
-			Box::new(move |bytes, tier| {
+		let migrate: Box<
+			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
+		> =
+			Box::new(move |source, tier| {
 				if decline {
 					return None;
 				}
@@ -4620,13 +4729,13 @@ mod migration_accounting_tests {
 					Tier::Slow => SLOW_MARKER,
 				};
 
-				let mut value = bytes.to_vec();
+				let mut value = source.bytes().to_vec();
 
 				if let Some(last) = value.last_mut() {
 					*last = marker;
 				}
 
-				Some(value.into_boxed_slice())
+				Some(crate::TieredValue::new_in(&value, tier))
 			});
 
 		let mut worker = PolicyWorker::new_with_tier_migration(
@@ -4649,12 +4758,12 @@ mod migration_accounting_tests {
 	fn insert(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) {
 		objects.insert(
 			key,
-			Object::new(key as u32, vec![0u8; 8].into_boxed_slice(), None),
+			Object::new(key as u32, &vec![0u8; 8], None),
 		);
 	}
 
 	fn last_byte(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) -> u8 {
-		let data = objects.get_ref(&key).unwrap().data();
+		let data = objects.get_ref(&key).unwrap().bytes().to_vec();
 		*data.last().unwrap()
 	}
 
@@ -4797,7 +4906,10 @@ mod capacity_watermark_tests {
 		status::AtomicStatus,
 	};
 
-	type TestBuffer = Box<[u8]>;
+	/// The cache SHAPE under test. Never `Box<[u8]>`: that is a
+	/// feature-dependent alias, and since v5 `V` is a zero-sized marker
+	/// rather than the value type -- every value is a `TieredValue`.
+	type TestBuffer = crate::TieredBuffer;
 
 	const TEST_POLICY: PaperPolicy = PaperPolicy::Lru;
 	const VALUE_BYTES: usize = 16;
@@ -4811,7 +4923,7 @@ mod capacity_watermark_tests {
 	/// it counts. Measured rather than hardcoded, because both terms are
 	/// tuned constants elsewhere in the tree and have moved before.
 	fn per_object_size(overhead_manager: &OverheadManagerRef) -> CacheSize {
-		let probe = Object::new(0u32, vec![0u8; VALUE_BYTES].into_boxed_slice(), None);
+		let probe = Object::<u32, TestBuffer>::new(0u32, &vec![0u8; VALUE_BYTES], None);
 		(overhead_manager.base_size(&probe) + get_policy_overhead(&TEST_POLICY)) as CacheSize
 	}
 
@@ -4868,7 +4980,7 @@ mod capacity_watermark_tests {
 		worker: &mut PolicyWorker<u32, TestBuffer>,
 		key: HashedKey,
 	) {
-		let object = Object::new(key as u32, vec![0u8; VALUE_BYTES].into_boxed_slice(), None);
+		let object = Object::new(key as u32, &vec![0u8; VALUE_BYTES], None);
 		let base_size = overhead_manager.base_size(&object);
 		let dram_resident = overhead_manager.dram_resident_size(&object);
 

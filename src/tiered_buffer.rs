@@ -5,170 +5,42 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `TieredBuffer` — the value type stored in all four hybrid-cache
-//! features' (`lru_hybrid_cache`, `lfu_hybrid_cache`, `two_q_hybrid_cache`,
-//! `fifo_hybrid_cache`) single, unified object table.
+//! `TieredBuffer` -- the value type every hybrid-cache design stores, and
+//! since v5 nothing but a name for [`crate::value::TieredValue`].
 //!
-//! Unlike a design that gets two tiers by running two independent
-//! `PaperCache` instances (one `BufferDRAM`, one `BufferPMEM`) side by side,
-//! the hybrid-cache features built around `TieredBuffer` store every object
-//! in one `PaperCache<K, TieredBuffer>`. `TieredBuffer` is a tagged union
-//! recording *where this particular object's bytes currently live*.
-//! Promotion and demotion replace an `Object`'s `TieredBuffer` in place (via
-//! `Object::set_data`) rather than copying bytes into a second map, so a
-//! live object's bytes exist in exactly one tier's allocation at any given
-//! time.
+//! ## What used to be here
 //!
-//! One buffer type serves every hybrid design: all 19 share the same two
-//! `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks in `lib.rs`, and each
-//! design's module re-exports this type for source compatibility.
+//! A two-variant enum, `Fast(Box<[u8]>) | Slow(Box<[u8], Hybrid>)`, boxed
+//! behind a `Shared` refcount. Measured on the base commit with
+//! `-Zprint-type-sizes`, that cost 64 bytes of DRAM per object before a single
+//! value byte:
 //!
-//! ## Fast tier: ordinary heap allocation; slow tier: node-1 arenas
+//! ```text
+//!   Shared<TieredBuffer> handle in the Object      8
+//!   Shared inner: strong count                     8
+//!   TieredBuffer discriminant (2 variants, 8 B!)   8
+//!   Box<[u8]> fat-pointer length                   8
+//!   the Inner allocation's own size class         32
+//! ```
 //!
-//! `Fast` is a plain `Box<[u8]>` -- an ordinary heap allocation through this
-//! crate's `#[global_allocator]` (`numa_alloc::FastAlloc`, node-0-bound
-//! jemalloc arenas). `Fast` needing nothing beyond `Box::from` follows from
-//! that: "ordinary heap allocation" and "the fast tier" are the same thing
-//! once the global allocator is installed.
+//! `TieredValue` replaces all of it with one eight-byte word: the address of
+//! the bytes, with the tier in bit 0. The discriminant becomes a tag bit that
+//! is free because every value is 8-aligned; the fat-pointer length moves into
+//! `Object::len`, which fits in padding the struct already had; and the strong
+//! count and its allocation go away entirely, replaced by crossbeam-epoch
+//! reclamation (see [`crate::value::defer_free`]).
 //!
-//! The slow tier is `Box<[u8], Hybrid>` -- node-1-bound jemalloc arenas
-//! (`numa_alloc::SlowObjects`). Earlier revisions selected between a jemalloc
-//! pool and a custom-extent-hooks arena here; both are gone.
+//! ## Why the name survives
 //!
-//! `new_fast`/`new_slow`/`is_fast`/`is_slow`/`AsRef<[u8]>`/`TypeSize`/
-//! `Clone` keep the same signatures regardless of which slow-tier backend
-//! is selected, so no other file in this crate needs to change either way.
+//! `PaperCache<K, TieredBuffer>` is the type every one of the ~20 hybrid design
+//! modules names, re-exports, and documents. Keeping the alias makes the
+//! representation change invisible to all of them, and to their tests, which is
+//! why the enum could be deleted in one step instead of ~20.
+//!
+//! It is also load-bearing for the impl blocks: `TieredBuffer` is what tells
+//! the hybrid `impl<K, S> PaperCache<K, TieredBuffer, S>` apart from the flat
+//! `impl<K, V, S> ... where V: ValueShape`. See `ValueShape`'s documentation
+//! for why those two must stay disjoint.
 
-use typesize::TypeSize;
-
-use crate::Hybrid;
-
-/// A value buffer that is physically stored in exactly one tier at a time.
-/// Backing type of the fast (DRAM) tier's byte buffer.
-///
-/// Plain global-allocator storage by default. Under `segregated_value_arena`
-/// it moves to the dedicated value pool, for the same reason `BufferDRAM`
-/// does: fast-tier values are the value-lifetime stream, and without this the
-/// hybrid build was only HALF-separated -- `Slow` went through `Hybrid` but
-/// pre-latch admissions and every promotion still built `Fast` buffers in the
-/// default tcache the per-GET `to_vec()` destination draws from.
-#[cfg(not(feature = "segregated_value_arena"))]
-type FastBuf = Box<[u8]>;
-#[cfg(feature = "segregated_value_arena")]
-type FastBuf = Box<[u8], crate::numa_alloc::FastValues>;
-
-pub enum TieredBuffer {
-	/// Fast tier: an ordinary DRAM allocation through this crate's active
-	/// global allocator.
-	Fast(FastBuf),
-
-	/// Slow tier: PMEM/CXL allocation. Backend selected at compile time --
-	/// see the module doc comment above.
-	Slow(Box<[u8], Hybrid>),
-}
-
-impl TieredBuffer {
-	/// Creates a new fast-tier (DRAM) buffer by copying the given bytes.
-	pub fn new_fast(bytes: &[u8]) -> Self {
-		#[cfg(not(feature = "segregated_value_arena"))]
-		return TieredBuffer::Fast(Box::from(bytes));
-		#[cfg(feature = "segregated_value_arena")]
-		return TieredBuffer::Fast(Box::clone_from_ref_in(bytes, crate::numa_alloc::FastValues));
-	}
-
-	/// Creates a new slow-tier (PMEM/CXL) buffer by copying the given bytes.
-	pub fn new_slow(bytes: &[u8]) -> Self {
-		TieredBuffer::Slow(Box::clone_from_ref_in(bytes, Hybrid))
-	}
-
-	/// Returns `true` if this buffer currently lives in the fast (DRAM) tier.
-	pub fn is_fast(&self) -> bool {
-		matches!(self, TieredBuffer::Fast(_))
-	}
-
-	/// Returns `true` if this buffer currently lives in the slow (PMEM) tier.
-	pub fn is_slow(&self) -> bool {
-		matches!(self, TieredBuffer::Slow(_))
-	}
-}
-
-impl Clone for TieredBuffer {
-	fn clone(&self) -> Self {
-		match self {
-			TieredBuffer::Fast(buffer) => TieredBuffer::Fast(buffer.clone()),
-			TieredBuffer::Slow(buffer) => TieredBuffer::Slow(buffer.clone()),
-		}
-	}
-}
-
-impl AsRef<[u8]> for TieredBuffer {
-	fn as_ref(&self) -> &[u8] {
-		match self {
-			TieredBuffer::Fast(bytes) => bytes.as_ref(),
-			TieredBuffer::Slow(bytes) => bytes.as_ref(),
-		}
-	}
-}
-
-impl TypeSize for TieredBuffer {
-	fn get_size(&self) -> usize {
-		self.as_ref().len()
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn fast_and_slow_round_trip_bytes() {
-		let fast = TieredBuffer::new_fast(b"hello");
-		assert!(fast.is_fast());
-		assert!(!fast.is_slow());
-		assert_eq!(fast.as_ref(), b"hello");
-		assert_eq!(fast.get_size(), 5);
-
-		let slow = TieredBuffer::new_slow(b"world!");
-		assert!(slow.is_slow());
-		assert!(!slow.is_fast());
-		assert_eq!(slow.as_ref(), b"world!");
-		assert_eq!(slow.get_size(), 6);
-	}
-
-	#[test]
-	fn clone_preserves_tier_and_bytes() {
-		let slow = TieredBuffer::new_slow(b"abc");
-		let cloned = slow.clone();
-
-		assert!(cloned.is_slow());
-		assert_eq!(cloned.as_ref(), b"abc");
-	}
-
-	#[test]
-	fn clone_preserves_fast_tier_and_bytes() {
-		let fast = TieredBuffer::new_fast(b"xyz");
-		let cloned = fast.clone();
-
-		assert!(cloned.is_fast());
-		assert_eq!(cloned.as_ref(), b"xyz");
-	}
-}
-
-
-#[cfg(test)]
-mod layout {
-	use super::*;
-
-	/// What an `Arc<TieredBuffer>` actually costs, and where.
-	#[test]
-	fn print_arc_layout() {
-		use std::sync::Arc;
-		println!(
-			"ARCLAYOUT TieredBuffer={} Box<[u8]>={} Arc_handle={} ArcInner={}",
-			core::mem::size_of::<TieredBuffer>(),
-			core::mem::size_of::<Box<[u8]>>(),
-			core::mem::size_of::<Arc<TieredBuffer>>(),
-			2 * core::mem::size_of::<usize>() + core::mem::size_of::<TieredBuffer>(),
-		);
-	}
-}
+/// The hybrid designs' value type. See the module documentation.
+pub type TieredBuffer = crate::value::TieredValue;

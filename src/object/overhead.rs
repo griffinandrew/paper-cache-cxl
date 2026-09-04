@@ -48,7 +48,6 @@ impl OverheadManager {
 	pub fn dram_resident_size<K, V>(&self, object: &Object<K, V>) -> ObjectSize
 	where
 		K: TypeSize,
-		V: TypeSize,
 	{
 		let mut resident =
 			object.key_size() + mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
@@ -63,7 +62,6 @@ impl OverheadManager {
 	pub fn base_size<K, V>(&self, object: &Object<K, V>) -> ObjectSize
 	where
 		K: TypeSize,
-		V: TypeSize,
 	{
 		// The value is counted as the bytes jemalloc actually commits, asked of
 		// the allocator rather than estimated -- see `resident_value_bytes`.
@@ -90,7 +88,6 @@ impl OverheadManager {
 	pub fn total_size<K, V>(&self, object: &Object<K, V>) -> ObjectSize
 	where
 		K: TypeSize,
-		V: TypeSize,
 	{
 		let policy = self.status.policy();
 		self.base_size(object) + get_policy_overhead(&policy)
@@ -1897,14 +1894,13 @@ mod value_resident_factor_applies {
 				.expect("status"),
 		);
 		let manager = OverheadManager::new(&status);
-		let object = Object::new(0u32, vec![0u8; 1000].into_boxed_slice(), None);
+		let object = Object::<u32, crate::BufferDRAM>::new(0u32, &vec![0u8; 1000], None);
 
 		let got = manager.base_size(&object);
 		let key = object.key_size();
 		let expiry = mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
-		// `data_size` for a `Box<[u8]>` counts the 16-byte fat pointer as well
-		// as the 1000 payload bytes. On the hybrid path V is `TieredBuffer`,
-		// whose `get_size` is the length exactly.
+		// `data_size` is now the value's length and nothing else -- there is no
+		// fat pointer left to count, in any shape.
 		let raw = object.data_size();
 		let scaled = resident_value_bytes(raw);
 

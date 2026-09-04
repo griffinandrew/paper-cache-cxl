@@ -5,14 +5,48 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! The cached object: a key, its value, and its expiry, in 24 bytes.
+//!
+//! ## v5 variant B: the value is one word, and its length lives here
+//!
+//! The value used to be a `Shared<TieredBuffer>` -- an 8-byte handle onto a
+//! 32-byte refcounted allocation wrapping a 24-byte two-variant enum wrapping
+//! a 16-byte fat `Box<[u8]>`. It is now a [`TieredValue`]: eight bytes,
+//! pointing straight at the value's bytes, with the tier in bit 0.
+//!
+//! That moves the length out of the value and into this struct, which is
+//! variant B and costs nothing: `Object` already had a four-byte hole after
+//! `expiry` (verified with `-Zprint-type-sizes` on the base commit), and
+//! `len: u32` lands in it. The struct stays 24 bytes, and `Option<Object>`
+//! stays 24 bytes because the `NonNull` inside `TieredValue` is still the
+//! niche -- which is what keeps the merged store's slot at 56.
+//!
+//! ## This type OWNS its value, and dropping it defers the free
+//!
+//! [`TieredValue`] is `Copy` and has no destructor: a copy of one is a BORROW
+//! of the allocation, which is exactly what lets a reader lift the pointer out
+//! from under a shard lock and copy the bytes with the lock released. The
+//! owner is this struct, and there is exactly one owner per allocation.
+//!
+//! So `Object`'s `Drop` is where a value's life ends, and it ends by DEFERRAL
+//! under a crossbeam-epoch pin rather than by an immediate free -- see
+//! [`crate::value::defer_free`]. Putting it here rather than at each removal
+//! site is what makes the trap in the brief ("every path that drops a value
+//! ... THE TTL WORKER REAPS FROM ITS OWN THREAD AND MUST PIN TOO") unreachable
+//! by construction: a set overwrite, an eviction, a TTL reap, a `wipe`, a
+//! `MergedStore::take`/`retire`/`clear`, and dropping the cache itself all
+//! destroy an `Object`, and all of them therefore pin and defer. There is no
+//! site to forget.
+//!
+//! The one value that leaves without its `Object` being dropped is the one
+//! [`Object::set_data`] hands back, which is the migration swap; that caller
+//! defers it under the pin it already holds.
+
 pub mod overhead;
 
-use std::{
-	mem,
-	time::{Instant, Duration},
-};
+use std::{marker::PhantomData, time::Instant};
 
-use typesize::TypeSize;
+use crate::{Tier, value::TieredValue};
 
 pub type ObjectSize = u32;
 /// Expiry as a tick count, where one tick is one second since a process-global
@@ -45,7 +79,6 @@ pub fn now_ticks() -> u32 {
 	tick_base().elapsed().as_secs().min(u32::MAX as u64 - 1) as u32 + 1
 }
 
-#[derive(Clone)]
 pub struct Object<K, V> {
 	/// The key stored in DRAM.  Present only when `key_pmem_value_pmem` is
 	/// **not** enabled; when the feature is active the key lives exclusively
@@ -59,114 +92,168 @@ pub struct Object<K, V> {
 	#[cfg(feature = "key_pmem_value_pmem")]
 	_key_pmem: Box<K, crate::Hybrid>,
 
-	data: crate::shared::Shared<V>,
+	/// The value's bytes, and its tier, in one word. OWNED: see the module
+	/// documentation on `Drop`.
+	value: TieredValue,
+
+	/// The value's length in bytes.
+	///
+	/// `TieredValue` is only the pointer half, so this is the half that makes
+	/// `bytes()` and the deallocation layout well defined. It lives in the
+	/// padding `expiry` used to leave behind, so it is free.
+	len: u32,
+
 	expiry: ExpireTime,
+
+	/// Which cache SHAPE this object belongs to (`BufferDRAM`, `BufferPMEM`,
+	/// or `TieredBuffer`). Zero-sized: since v5 every shape stores the same
+	/// `TieredValue`, and `V` survives only to keep the shape-specific
+	/// `PaperCache` impl blocks disjoint and to pick the admission tier at
+	/// compile time -- see `crate::value::ValueShape`.
+	///
+	/// `fn() -> V` rather than `V` so this is unconditionally `Send + Sync`
+	/// and covariant, whatever `V` is.
+	_shape: PhantomData<fn() -> V>,
 }
 
 impl<K, V> Object<K, V> {
-	/// Create a new Object.
+	/// Creates an object whose value is copied into the FAST tier.
 	///
-	/// When `key_pmem_value_pmem` is **not** enabled this method has no
-	/// additional bounds.
-	#[cfg(not(feature = "key_pmem_value_pmem"))]
-	pub fn new(key: K, data: V, ttl: Option<u32>) -> Self {
+	/// The default tier rather than a required argument because that is what
+	/// every all-DRAM shape and every test wants; the two callers that choose
+	/// use [`Object::new_in`].
+	pub fn new(key: K, bytes: &[u8], ttl: Option<u32>) -> Self {
+		Self::new_in(key, bytes, Tier::Fast, ttl)
+	}
+
+	/// Creates an object whose value is copied into `tier`.
+	pub fn new_in(key: K, bytes: &[u8], tier: Tier, ttl: Option<u32>) -> Self {
 		let expiry = match ttl {
 			Some(0) | None => None,
 			Some(ttl) => Some(get_expiry_from_ttl(ttl)),
 		};
 
+		Self::with_expiry_in(key, bytes, tier, expiry)
+	}
+
+	/// Creates an object with an explicit expiry time, value in the fast tier.
+	pub fn with_expiry(key: K, bytes: &[u8], expiry: ExpireTime) -> Self {
+		Self::with_expiry_in(key, bytes, Tier::Fast, expiry)
+	}
+
+	/// Creates an object with an explicit expiry time and an explicit tier.
+	///
+	/// The one constructor: every other one funnels here, so there is exactly
+	/// one place a value allocation is paired with the `len` that will later
+	/// free it.
+	pub fn with_expiry_in(key: K, bytes: &[u8], tier: Tier, expiry: ExpireTime) -> Self {
+		// `TieredValue::new_in` refuses a length that does not fit a `u32`, so
+		// this cast cannot truncate.
+		let len = bytes.len() as u32;
+		let value = TieredValue::new_in(bytes, tier);
+
 		Object {
+			#[cfg(not(feature = "key_pmem_value_pmem"))]
 			key,
-			data: crate::shared::Shared::new(data),
+			#[cfg(feature = "key_pmem_value_pmem")]
+			_key_pmem: Box::new_in(key, crate::Hybrid),
+
+			value,
+			len,
 			expiry,
+			_shape: PhantomData,
 		}
 	}
 
-	/// Create a new Object.
+	/// This object's value: the pointer and its tier, nothing else.
 	///
-	/// When `key_pmem_value_pmem` is enabled the key is moved directly into a
-	/// `Box` allocated in persistent memory via the Hybrid allocator.  No DRAM
-	/// copy of the key is retained.
-	#[cfg(feature = "key_pmem_value_pmem")]
-	pub fn new(key: K, data: V, ttl: Option<u32>) -> Self {
-		use crate::Hybrid;
-
-		let expiry = match ttl {
-			Some(0) | None => None,
-			Some(ttl) => Some(get_expiry_from_ttl(ttl)),
-		};
-
-		Object {
-			_key_pmem: Box::new_in(key, Hybrid),
-			data: crate::shared::Shared::new(data),
-			expiry,
-		}
+	/// A `&TieredValue` rather than a copy so the borrow checker keeps the
+	/// handle tied to the object that owns it; call [`TieredValue::raw`] on it
+	/// for the migration identity check.
+	pub fn value(&self) -> &TieredValue {
+		&self.value
 	}
 
-	/// Create a new Object with an explicit expiry time.
-	///
-	/// When `key_pmem_value_pmem` is **not** enabled this method has no
-	/// additional bounds.
-	#[cfg(not(feature = "key_pmem_value_pmem"))]
-	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self {
-		Object {
-			key,
-			data: crate::shared::Shared::new(data),
-			expiry,
-		}
+	/// The value's length in bytes.
+	pub fn len(&self) -> u32 {
+		self.len
 	}
 
-	/// Create a new Object with an explicit expiry time.
+	/// The value's bytes.
 	///
-	/// When `key_pmem_value_pmem` is enabled the key is moved directly into
-	/// PMEM; no DRAM copy is retained.
-	#[cfg(feature = "key_pmem_value_pmem")]
-	pub fn with_expiry(key: K, data: V, expiry: ExpireTime) -> Self {
-		use crate::Hybrid;
-
-		Object {
-			_key_pmem: Box::new_in(key, Hybrid),
-			data: crate::shared::Shared::new(data),
-			expiry,
-		}
+	/// Safe, unlike [`TieredValue::as_slice`], because this object owns the
+	/// allocation and supplies the matching length itself. The returned slice
+	/// borrows `self`, so a caller holding a shard guard keeps the guard for
+	/// as long as it is copying -- which is why the read paths in `lib.rs`
+	/// take the pointer and the length out FIRST and then drop the guard,
+	/// rather than calling this across the copy.
+	pub fn bytes(&self) -> &[u8] {
+		// SAFETY: `self.len` is the length `self.value` was created with (both
+		// are written together in `with_expiry_in` and replaced together in
+		// `set_data`), and the value cannot have been freed while `self` is
+		// alive -- `Drop` is the only thing that frees it.
+		unsafe { self.value.as_slice(self.len) }
 	}
 
-	pub fn data(&self) -> crate::shared::Shared<V> {
-		self.data.clone()
+	/// Lifts this object's value out from under the shard guard, tying it to
+	/// an epoch pin instead.
+	///
+	/// This is the read path's whole trick, and it is SAFE. The returned
+	/// [`ValueRef`] borrows `guard` rather than `self`, so the caller can drop
+	/// the shard guard -- ending a critical section that would otherwise span
+	/// a multi-kilobyte, possibly PMEM-backed copy -- and still read the bytes
+	/// afterwards.
+	///
+	/// Sound because of what the two arguments prove between them. `&self`
+	/// proves the value has not been retired: retirement is `Object::drop`,
+	/// which cannot run while this borrow is live. `guard` proves that once it
+	/// IS retired, the free is deferred behind a pin taken no later than this
+	/// one, so it cannot run until the caller drops the guard.
+	pub fn snapshot<'g>(&self, guard: &'g crossbeam_epoch::Guard) -> crate::value::ValueRef<'g> {
+		// SAFETY: per the paragraph above -- `self.len` is this value's exact
+		// length, and `self` being borrowed means the value is live now, so
+		// `guard` covers it from here on.
+		unsafe { crate::value::ValueRef::new(guard, self.value, self.len) }
 	}
 
-	/// Replaces this object's data in place, leaving `key` and `expiry`
-	/// untouched.
+	/// Replaces this object's value in place, leaving `key` and `expiry`
+	/// untouched, and RETURNS the old value and its length.
 	///
-	/// Used by `lru_hybrid_cache` to physically migrate an object's bytes
-	/// between tiers (e.g. `TieredBuffer::Fast` <-> `TieredBuffer::Slow`)
-	/// without disturbing its TTL or key.
-	pub fn set_data(&mut self, data: V) {
-		self.data = crate::shared::Shared::new(data);
+	/// Used to physically migrate an object's bytes between tiers without
+	/// disturbing its TTL or key.
+	///
+	/// The old value is handed back rather than freed here because freeing it
+	/// is not this type's decision to make: a reader may be copying those
+	/// bytes right now with no lock held, so the free has to be DEFERRED under
+	/// the caller's epoch guard -- the same guard whose pin is what makes the
+	/// caller's identity check immune to ABA. Returning it also makes the
+	/// obligation impossible to overlook: the value is `#[must_use]`, so
+	/// dropping it on the floor is a warning rather than a silent leak.
+	#[must_use = "the old value must be freed -- defer it under an epoch guard"]
+	pub fn set_data(&mut self, value: TieredValue, len: u32) -> (TieredValue, u32) {
+		let old = (self.value, self.len);
+
+		self.value = value;
+		self.len = len;
+
+		old
 	}
 
-	/// Return a reference to the key.
-	///
-	/// Without `key_pmem_value_pmem` the key lives in DRAM.
-	/// With `key_pmem_value_pmem` the key lives in PMEM and is accessed via
-	/// the `_key_pmem` box; no DRAM copy exists.
 	/// The value buffer's own byte cost.
 	///
 	/// Separated from `key_size` because the two are corrected differently:
 	/// the key and expiry are already inside `shared_overhead`, which applies
 	/// its own resident factor, while the value is scaled in `base_size`.
-	pub fn data_size(&self) -> ObjectSize
-	where
-		V: TypeSize,
-	{
-		self.data.get_size() as ObjectSize
+	pub fn data_size(&self) -> ObjectSize {
+		self.len
 	}
 
 	/// The key's own byte cost, as `base_size` counts it.
 	pub fn key_size(&self) -> ObjectSize
 	where
-		K: TypeSize,
+		K: typesize::TypeSize,
 	{
+		use typesize::TypeSize;
 		self.key().get_size() as ObjectSize
 	}
 
@@ -201,32 +288,6 @@ impl<K, V> Object<K, V> {
 		(*self._key_pmem).eq(key)
 	}
 
-	#[cfg(not(feature = "key_pmem_value_pmem"))]
-	fn total_size(&self) -> ObjectSize
-	where
-		K: TypeSize,
-		V: TypeSize,
-	{
-		(
-			self.key.get_size()
-				+ self.data.get_size()
-				+ mem::size_of::<ExpireTime>()
-		) as ObjectSize
-	}
-
-	#[cfg(feature = "key_pmem_value_pmem")]
-	fn total_size(&self) -> ObjectSize
-	where
-		K: TypeSize,
-		V: TypeSize,
-	{
-		(
-			(*self._key_pmem).get_size()
-				+ self.data.get_size()
-				+ mem::size_of::<ExpireTime>()
-		) as ObjectSize
-	}
-
 	pub fn expiry(&self) -> ExpireTime {
 		self.expiry
 	}
@@ -243,6 +304,36 @@ impl<K, V> Object<K, V> {
 	}
 }
 
+/// Deep copy: a clone is a SEPARATE allocation in the same tier.
+///
+/// It has to be. The value is a bare pointer with no reference count, so a
+/// shallow copy would hand two owners the same allocation and the second drop
+/// would be a double free. Written by hand rather than derived for exactly
+/// that reason -- `#[derive(Clone)]` on this struct would compile and would be
+/// wrong.
+///
+/// `V` carries no bound: it is `PhantomData`.
+impl<K: Clone, V> Clone for Object<K, V> {
+	fn clone(&self) -> Self {
+		Self::with_expiry_in(
+			self.key().clone(),
+			self.bytes(),
+			self.value.tier(),
+			self.expiry,
+		)
+	}
+}
+
+/// Ends the value's life, by deferral rather than by freeing.
+///
+/// See the module documentation: this is the single point every removal path
+/// funnels through, which is why none of them has to remember to pin.
+impl<K, V> Drop for Object<K, V> {
+	fn drop(&mut self) {
+		crate::value::defer_free(self.value, self.len);
+	}
+}
+
 pub fn get_expiry_from_ttl(ttl: u32) -> std::num::NonZeroU32 {
 	// `now_ticks()` is >= 1 and `saturating_add` cannot reach zero from it, so
 	// the `NonZeroU32` is always valid.
@@ -250,3 +341,108 @@ pub fn get_expiry_from_ttl(ttl: u32) -> std::num::NonZeroU32 {
 		.expect("now_ticks() is never zero")
 }
 
+#[cfg(test)]
+mod layout {
+	use super::*;
+
+	/// The whole point of variant B, asserted rather than assumed.
+	///
+	/// 24 bytes for `{ key: u64, value: TieredValue, len: u32, expiry }`, and
+	/// `Option<Object>` the same 24 -- the `NonNull` inside `TieredValue` is
+	/// the niche. The second assertion is the one the merged store's 56-byte
+	/// slot depends on; lose the niche and every slot grows by 8.
+	#[test]
+	fn an_object_is_twenty_four_bytes_and_the_option_is_free() {
+		type O = Object<u64, crate::value::BufferDRAM>;
+
+		assert_eq!(
+			core::mem::size_of::<O>(),
+			24,
+			"Object must be {{key 8, value 8, len 4, expiry 4}} with no padding",
+		);
+
+		assert_eq!(
+			core::mem::size_of::<Option<O>>(),
+			core::mem::size_of::<O>(),
+			"Option<Object> must be niche-optimised into the value pointer",
+		);
+	}
+
+	/// The length is free: it lives in the hole `expiry` left behind, so
+	/// adding it did not grow the struct past the key + pointer + expiry it
+	/// held before.
+	#[test]
+	fn the_length_costs_nothing() {
+		type O = Object<u64, crate::value::BufferDRAM>;
+
+		let without_len = core::mem::size_of::<u64>()
+			+ core::mem::size_of::<crate::value::TieredValue>()
+			+ core::mem::size_of::<ExpireTime>();
+
+		assert_eq!(
+			core::mem::size_of::<O>(),
+			without_len.next_multiple_of(8),
+			"len: u32 must fit the alignment padding, not add to it",
+		);
+	}
+
+	/// A round trip through the accessors the read paths use.
+	#[test]
+	fn an_object_round_trips_its_bytes_and_length() {
+		let object = Object::<u64, crate::value::BufferDRAM>::new(7, b"hello world", None);
+
+		assert_eq!(object.len(), 11);
+		assert_eq!(object.bytes(), b"hello world");
+		assert_eq!(object.data_size(), 11);
+		assert!(object.value().is_fast());
+	}
+
+	/// A clone must be a DIFFERENT allocation, or the second drop double-frees.
+	#[test]
+	fn a_clone_is_a_separate_allocation() {
+		let a = Object::<u64, crate::value::BufferDRAM>::new(1, b"abcd", None);
+		let b = a.clone();
+
+		assert_eq!(a.bytes(), b.bytes(), "the bytes must match");
+		assert_ne!(
+			a.value().raw(),
+			b.value().raw(),
+			"but they must not be the same allocation",
+		);
+		assert_eq!(a.value().tier(), b.value().tier(), "and the tier must survive");
+	}
+
+	/// `set_data` must hand the old value back rather than leaking or freeing
+	/// it, and must leave the key and expiry alone.
+	#[test]
+	fn set_data_returns_the_old_value_and_keeps_the_rest() {
+		let mut object = Object::<u64, crate::value::BufferDRAM>::new(3, b"old", Some(60));
+		let expiry = object.expiry();
+		let old_raw = object.value().raw();
+
+		let replacement = TieredValue::new_slow(b"newer");
+		let (old, old_len) = object.set_data(replacement, 5);
+
+		assert_eq!(old.raw(), old_raw, "the handle handed back must be the old one");
+		assert_eq!(old_len, 3);
+		assert_eq!(object.bytes(), b"newer");
+		assert_eq!(object.len(), 5);
+		assert!(object.value().is_slow(), "the new tier must stick");
+		assert_eq!(*object.key(), 3, "the key must not move");
+		assert_eq!(object.expiry(), expiry, "nor the expiry");
+
+		// This test owns the old value now, exactly as `apply_migration` does.
+		crate::value::defer_free(old, old_len);
+	}
+
+	/// A zero-length value is still a real, unique, freeable allocation --
+	/// `TieredValue` rounds the layout up to one byte for precisely this.
+	#[test]
+	fn an_empty_value_is_still_an_object() {
+		let object = Object::<u64, crate::value::BufferDRAM>::new(9, b"", None);
+
+		assert_eq!(object.len(), 0);
+		assert!(object.bytes().is_empty());
+		assert!(!object.value().raw().is_null());
+	}
+}

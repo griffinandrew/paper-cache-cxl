@@ -58,7 +58,6 @@ impl<K, V> Worker for TtlWorker<K, V>
 where
 	Self: 'static + Send,
 	K: Eq + TypeSize,
-	V: TypeSize,
 {
 	fn run(&mut self) -> Result<(), CacheError> {
 		loop {

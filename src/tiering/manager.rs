@@ -149,7 +149,7 @@ pub struct TieringManager<K, V> {
 impl<K, V> TieringManager<K, V>
 where
     K: TypeSize + Clone,
-    V: TypeSize + Clone,
+    V: Send + Sync,
 {
     /// Creates a new TieringManager with the given configuration
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
@@ -235,17 +235,16 @@ where
     fn create_dram_object(&self, object: &Object<K, V>) -> TieringObject<K>
     where
         K: Clone,
-        V: AsRef<[u8]>,
     {
-        // Extract bytes from source (which may be PMEM-allocated)
-        let source_data = object.data();
-        // First .as_ref() dereferences Arc<V> -> &V
-        // Second .as_ref() calls AsRef<[u8]> trait on V -> &[u8]
-        let bytes: &[u8] = source_data.as_ref().as_ref();
-        
-        // Create new DRAM-allocated Box<[u8]> (physical copy)
-        let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
-        
+        // Copy straight out of the source object. `Object::bytes()` is safe --
+        // the object owns its value and supplies the matching length -- so this
+        // legacy path needs no epoch pin of its own: the shard guard the caller
+        // holds across `&Object` is what keeps the value alive here.
+        //
+        // This replaces `object.data().as_ref().as_ref()`, the `Shared<V>` +
+        // `AsRef<[u8]>` double-deref that is gone with the refcount.
+        let dram_data: Box<[u8]> = object.bytes().to_vec().into_boxed_slice();
+
         // Create new TieringObject with key, data, and expiry
         TieringObject::with_expiry(object.key().clone(), dram_data, object.expiry())
     }
@@ -255,8 +254,6 @@ where
     /// The object parameter is the Object from the main cache to copy to DRAM
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
     pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
-    where
-        V: AsRef<[u8]>,
     {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -296,8 +293,6 @@ where
         all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
     ))]
     pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
-    where
-        V: AsRef<[u8]>,
     {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -335,8 +330,6 @@ where
 
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
     pub fn promote_object(&self, key: HashedKey, object: &Object<K, V>) -> bool
-    where
-        V: AsRef<[u8]>,
     {
         self.promote_to_dram_with_object(key, object)
     }
@@ -345,8 +338,6 @@ where
         all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
     ))]
     pub fn promote_object(&self, key: HashedKey, object: &Object<K, V>) -> bool
-    where
-        V: AsRef<[u8]>,
     {
         self.promote_to_dram_with_object(key, object)
     }
@@ -468,8 +459,6 @@ where
     /// This creates a new physical copy with DRAM-allocated data
     #[cfg(all(feature = "key_value_pmem", not(feature = "tiering_hashtable_pmem")))]
     pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
-    where
-        V: AsRef<[u8]>,
     {
         // Only update if object is currently in DRAM
         if self.is_in_dram(&key) {
@@ -483,8 +472,6 @@ where
         all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"),
     ))]
     pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
-    where
-        V: AsRef<[u8]>,
     {
         // Only update if object is currently in DRAM
         if self.is_in_dram(&key) {
@@ -1021,7 +1008,7 @@ pub struct TieringManager<K, V> {
 impl<K, V> TieringManager<K, V>
 where
     K: TypeSize + Clone,
-    V: TypeSize + Clone,
+    V: Send + Sync,
 {
     /// Creates a new TieringManager with the given configuration.
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
@@ -1208,17 +1195,16 @@ where
     fn create_dram_object(&self, object: &Object<K, V>) -> TieringObject<K>
     where
         K: Clone,
-        V: AsRef<[u8]>,
     {
-        // Extract bytes from source (which may be PMEM-allocated)
-        let source_data = object.data();
-        // First .as_ref() dereferences Arc<V> -> &V
-        // Second .as_ref() calls AsRef<[u8]> trait on V -> &[u8]
-        let bytes: &[u8] = source_data.as_ref().as_ref();
-        
-        // Create new DRAM-allocated Box<[u8]> (physical copy)
-        let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
-        
+        // Copy straight out of the source object. `Object::bytes()` is safe --
+        // the object owns its value and supplies the matching length -- so this
+        // legacy path needs no epoch pin of its own: the shard guard the caller
+        // holds across `&Object` is what keeps the value alive here.
+        //
+        // This replaces `object.data().as_ref().as_ref()`, the `Shared<V>` +
+        // `AsRef<[u8]>` double-deref that is gone with the refcount.
+        let dram_data: Box<[u8]> = object.bytes().to_vec().into_boxed_slice();
+
         // Create new TieringObject with key, data, and expiry
         TieringObject::with_expiry(object.key().clone(), dram_data, object.expiry())
     }
@@ -1228,17 +1214,16 @@ where
     fn create_dram_object(&self, object: &Object<K, V>) -> TieringObject<K, V>
     where
         K: Clone,
-        V: AsRef<[u8]>,
     {
-        // Extract bytes from source (which may be PMEM-allocated)
-        let source_data = object.data();
-        // First .as_ref() dereferences Arc<V> -> &V
-        // Second .as_ref() calls AsRef<[u8]> trait on V -> &[u8]
-        let bytes: &[u8] = source_data.as_ref().as_ref();
-        
-        // Create new DRAM-allocated Box<[u8]> (physical copy)
-        let dram_data: Box<[u8]> = bytes.to_vec().into_boxed_slice();
-        
+        // Copy straight out of the source object. `Object::bytes()` is safe --
+        // the object owns its value and supplies the matching length -- so this
+        // legacy path needs no epoch pin of its own: the shard guard the caller
+        // holds across `&Object` is what keeps the value alive here.
+        //
+        // This replaces `object.data().as_ref().as_ref()`, the `Shared<V>` +
+        // `AsRef<[u8]>` double-deref that is gone with the refcount.
+        let dram_data: Box<[u8]> = object.bytes().to_vec().into_boxed_slice();
+
         // Create new TieringObject with key, data, and expiry
         TieringObject::with_expiry(object.key().clone(), dram_data, object.expiry())
     }
@@ -1261,8 +1246,6 @@ where
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
     #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
     pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
-    where
-        V: AsRef<[u8]>,
     {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -1305,8 +1288,6 @@ where
     /// value bytes into a DRAM-resident `TieringObject<K>`.
     #[cfg(all(feature = "key_pmem_value_pmem", not(feature = "tiering_hashtable_pmem"), not(feature = "hashtable_tiering")))]
     pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
-    where
-        V: AsRef<[u8]>,
     {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -1345,8 +1326,6 @@ where
 
     #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem", not(feature = "hashtable_tiering")))]
     pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
-    where
-        V: AsRef<[u8]>,
     {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -1386,8 +1365,6 @@ where
     /// Promotes an object to warm tier (pointer-only) or hot tier (physical copy)
     /// Returns true if promotion was successful
     pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
-    where
-        V: AsRef<[u8]>,
     {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -1453,8 +1430,6 @@ where
     /// Promotes an object to warm tier (pointer-only) or hot tier (physical copy)
     /// Returns true if promotion was successful
     pub fn promote_to_dram_with_object(&self, key: HashedKey, object: &Object<K, V>) -> bool 
-    where
-        V: AsRef<[u8]>,
     {
         let mut info_map = self.object_info.write().unwrap();
 
@@ -1786,8 +1761,6 @@ where
     /// Used when key lives in DRAM and value lives in PMEM (`key_value_pmem` only).
     #[cfg(all(feature = "key_value_pmem", not(feature = "key_pmem_value_pmem"), not(feature = "tiering_hashtable_pmem")))]
     pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
-    where
-        V: AsRef<[u8]>,
     {
         // Only update if object is currently in DRAM
         if self.is_in_dram(&key) {
@@ -1803,8 +1776,6 @@ where
     /// PMEM and stores a fresh DRAM-allocated copy in the dram_cache.
     #[cfg(all(feature = "key_pmem_value_pmem", not(feature = "tiering_hashtable_pmem")))]
     pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
-    where
-        V: AsRef<[u8]>,
     {
         // Only update if object is currently in DRAM
         if self.is_in_dram(&key) {
@@ -1816,8 +1787,6 @@ where
 
     #[cfg(all(feature = "key_value_pmem", feature = "tiering_hashtable_pmem"))]
     pub fn update_dram_copy(&self, key: HashedKey, object: &Object<K, V>) 
-    where
-        V: AsRef<[u8]>,
     {
         // Only update if object is currently in DRAM
         if self.is_in_dram(&key) {

@@ -282,8 +282,7 @@ fn measure_object_map_point() {
 	);
 	for i in 0..n {
 		let key = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-		let buf = crate::TieredBuffer::new_fast(&value);
-		map.insert(key, crate::object::Object::new(key, buf, None));
+		map.insert(key, crate::object::Object::new(key, &value, None));
 	}
 	let after = allocated_bytes();
 	let held = map.len() as u64;

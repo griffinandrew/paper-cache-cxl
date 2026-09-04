@@ -92,7 +92,11 @@
 //!    landed on. Ground truth about physical placement, which the arena index
 //!    only implies.
 
-use std::{alloc::Layout, ptr::NonNull};
+use std::{
+	alloc::Layout,
+	ptr::NonNull,
+	sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::Tier;
 
@@ -333,7 +337,7 @@ fn tag(ptr: NonNull<u8>, tier: Tier) -> NonNull<u8> {
 #[inline]
 unsafe fn fast_alloc(layout: Layout) -> *mut u8 {
 	#[cfg(test)]
-	route_counts::FAST_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	route_counts::bump(&route_counts::FAST_ALLOCS);
 
 	// SAFETY: non-zero size, per the contract above.
 	#[cfg(not(feature = "segregated_value_arena"))]
@@ -351,7 +355,7 @@ unsafe fn fast_alloc(layout: Layout) -> *mut u8 {
 #[inline]
 unsafe fn fast_dealloc(ptr: *mut u8, layout: Layout) {
 	#[cfg(test)]
-	route_counts::FAST_FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	route_counts::bump(&route_counts::FAST_FREES);
 
 	// SAFETY: per the contract above.
 	#[cfg(not(feature = "segregated_value_arena"))]
@@ -372,7 +376,7 @@ unsafe fn fast_dealloc(ptr: *mut u8, layout: Layout) {
 #[inline]
 unsafe fn slow_alloc(layout: Layout) -> *mut u8 {
 	#[cfg(test)]
-	route_counts::SLOW_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	route_counts::bump(&route_counts::SLOW_ALLOCS);
 
 	// SAFETY: non-zero size, per the contract above.
 	unsafe { std::alloc::GlobalAlloc::alloc(&crate::numa_alloc::SlowObjects, layout) }
@@ -384,10 +388,239 @@ unsafe fn slow_alloc(layout: Layout) -> *mut u8 {
 #[inline]
 unsafe fn slow_dealloc(ptr: *mut u8, layout: Layout) {
 	#[cfg(test)]
-	route_counts::SLOW_FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	route_counts::bump(&route_counts::SLOW_FREES);
 
 	// SAFETY: per the contract above.
 	unsafe { std::alloc::GlobalAlloc::dealloc(&crate::numa_alloc::SlowObjects, ptr, layout) }
+}
+
+// ---------------------------------------------------------------------------
+// lifetime: epoch-based reclamation
+// ---------------------------------------------------------------------------
+
+/// Values whose free has been HANDED to crossbeam-epoch.
+///
+/// Deferred garbage is memory the cache no longer counts but the process still
+/// holds, so the gap between these two counters is the cache's un-reclaimed
+/// footprint. It is bounded rather than merely small: a thread that pins and
+/// never unpins pins the whole epoch and therefore every bag, which is why
+/// readers must never sleep or block while pinned, and why the policy worker
+/// calls [`flush`] once per event-loop pass -- otherwise garbage produced by a
+/// busy thread can sit in an IDLE thread's local bag indefinitely.
+pub static VALUE_FREES_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// Values actually returned to an allocator, i.e. deferrals that have run.
+pub static VALUE_FREES_RUN: AtomicU64 = AtomicU64::new(0);
+
+/// Retires a value: the bytes are freed once every reader that could still be
+/// looking at them has finished.
+///
+/// This is the ONLY way a value is freed outside this module, and
+/// `Object::drop` is its only unconditional caller -- so every removal path in
+/// the cache (set overwrite, eviction, TTL reap, `wipe`, `MergedStore::take`/
+/// `retire`/`clear`, dropping the cache) reaches it without having to know it
+/// exists. The migration swap is the one caller that reaches it explicitly,
+/// because `Object::set_data` hands the old value back rather than dropping it.
+///
+/// ## Why deferral, and what it buys
+///
+/// A reader takes the pointer and the length under the shard guard, DROPS the
+/// guard, and only then copies the bytes -- which is what stops a multi-KB
+/// (and possibly PMEM-backed) copy from stalling the writers queued behind it.
+/// So at the moment a writer unpublishes a pointer, some reader may still be
+/// reading it, and an immediate free would be a use-after-free. crossbeam-epoch
+/// closes exactly that window: the closure below runs only once every pin that
+/// was live when it was deferred has ended.
+///
+/// It buys the migration check too. `apply_migration` compares raw pointers to
+/// decide whether the value it copied is still the published one; that
+/// comparison is exact -- immune to ABA -- precisely because the old allocation
+/// cannot be freed, and so its address cannot be recycled into a different
+/// value, while the migrating consumer's own pin is live.
+///
+/// Pinning here rather than taking a `&Guard` argument keeps the obligation
+/// impossible to get wrong at the ~15 call sites that reach it through `Drop`.
+/// A pin is a thread-local increment on an already-pinned thread, so a caller
+/// that is already inside a guard pays nothing extra for the nested pin.
+pub fn defer_free(value: TieredValue, len: u32) {
+	let guard = crossbeam_epoch::pin();
+
+	VALUE_FREES_DEFERRED.fetch_add(1, Ordering::Relaxed);
+
+	// SAFETY: three obligations, all discharged here.
+	//
+	// * The closure is `Send` -- it captures a `TieredValue` (which is `Send`,
+	//   see the impl above) and a `u32` -- and it must be, since the epoch
+	//   advance can run it on any thread. `TieredValue::free` routes on the
+	//   TAG rather than on thread-local state precisely so that is correct.
+	// * The value is unpublished BEFORE this runs: `Object::drop` runs after
+	//   the object has left the map, and `set_data` returns the old value only
+	//   after the new one is in place. So no thread can newly obtain this
+	//   pointer, and any thread that already holds it is pinned, hence waited
+	//   for.
+	// * `len` is the length the value was allocated with -- `Object` keeps the
+	//   two together and replaces them together.
+	unsafe {
+		guard.defer_unchecked(move || {
+			VALUE_FREES_RUN.fetch_add(1, Ordering::Relaxed);
+			value.free(len);
+		});
+	}
+}
+
+/// A value lifted out from under a shard guard, with the epoch pin that keeps
+/// it alive attached to it in the type.
+///
+/// This is what lets the rest of the crate touch value bytes with NO unsafe
+/// code of its own. The read paths all want the same thing -- take the pointer
+/// and the length under the shard lock, release the lock, then copy -- and the
+/// only reason that is sound is the pin. Tying the two together in one type
+/// makes the argument structural: a `ValueRef<'g>` cannot outlive the `Guard`
+/// it borrows, so [`ValueRef::bytes`] is a safe function.
+///
+/// Obtained from `Object::snapshot`, which is itself safe: holding a `&Object`
+/// proves the value has not been retired (retirement is `Object::drop`), and
+/// holding the guard proves that once it is, the free waits for this thread.
+#[derive(Clone, Copy)]
+pub struct ValueRef<'g> {
+	value: TieredValue,
+	len: u32,
+
+	/// Borrows the epoch guard without holding a reference to it, so this is
+	/// still `Copy` and still one word plus a length at runtime.
+	_pin: std::marker::PhantomData<&'g crossbeam_epoch::Guard>,
+}
+
+impl<'g> ValueRef<'g> {
+	/// # Safety
+	///
+	/// `value` must be a live value of exactly `len` bytes at the moment of
+	/// the call, and `guard` must be a pin that was live at that moment --
+	/// which is what makes it live for the whole of `'g`, since any free of
+	/// `value` is deferred behind a pin taken no earlier.
+	///
+	/// The only caller is `Object::snapshot`, which discharges both from
+	/// `&self`.
+	#[inline]
+	pub unsafe fn new(_guard: &'g crossbeam_epoch::Guard, value: TieredValue, len: u32) -> Self {
+		ValueRef { value, len, _pin: std::marker::PhantomData }
+	}
+
+	/// The value's bytes. Safe: see the type's documentation.
+	#[inline]
+	pub fn bytes(&self) -> &'g [u8] {
+		// SAFETY: `new`'s contract -- `len` is this value's length, and the
+		// allocation cannot be freed for the whole of `'g`.
+		unsafe { std::slice::from_raw_parts(self.value.raw(), self.len as usize) }
+	}
+
+	/// The underlying handle, for the migration identity check.
+	#[inline]
+	pub fn value(&self) -> TieredValue {
+		self.value
+	}
+
+	#[inline]
+	pub fn len(&self) -> u32 {
+		self.len
+	}
+
+	#[inline]
+	pub fn is_empty(&self) -> bool {
+		self.len == 0
+	}
+
+	#[inline]
+	pub fn tier(&self) -> Tier {
+		self.value.tier()
+	}
+
+	#[inline]
+	pub fn is_fast(&self) -> bool {
+		self.value.is_fast()
+	}
+
+	#[inline]
+	pub fn is_slow(&self) -> bool {
+		self.value.is_slow()
+	}
+
+	/// The value's identity -- the untagged address. See [`TieredValue::raw`].
+	#[inline]
+	pub fn raw(&self) -> *mut u8 {
+		self.value.raw()
+	}
+}
+
+/// Pushes this thread's deferred frees into the global garbage queue and tries
+/// to advance the epoch.
+///
+/// Called once per policy-worker event-loop pass. Without it, garbage stays in
+/// the local bag of whichever thread deferred it until that thread pins enough
+/// more times to fill the bag -- so a thread that retires a burst of values and
+/// then goes idle holds them all, and the cache's real footprint stays above
+/// what it reports for as long as the idle lasts.
+pub fn flush() {
+	crossbeam_epoch::pin().flush();
+}
+
+// ---------------------------------------------------------------------------
+// value shapes -- what is left of the old `ValueBuffer`
+// ---------------------------------------------------------------------------
+
+/// Which tier a non-hybrid cache shape builds its values in.
+///
+/// This is all that survives of the `ValueBuffer` trait. That trait existed to
+/// abstract over two DIFFERENT value types -- `BufferDRAM = Box<[u8]>` and
+/// `BufferPMEM = Box<[u8], Hybrid>` -- so `set()` could build one without
+/// knowing which. Since v5 there is only one value type, [`TieredValue`], and
+/// the two shapes differ in exactly one bit: which allocator their values come
+/// from. So the trait collapses to a single associated constant, and
+/// `from_bytes` collapses to `TieredValue::new_in(bytes, V::TIER)`.
+///
+/// The marker types below have no values and no fields; `V` survives purely as
+/// a compile-time selector.
+///
+/// ## Why the shapes are still distinct types
+///
+/// The brief's preferred route was to delete this trait outright and let every
+/// shape name `TieredValue` directly. That does not compile in the
+/// all-features build, and the reason is structural rather than incidental:
+/// `PaperCache`'s flat impl block is `impl<K, V, S> PaperCache<K, V, S> where
+/// V: ValueShape` and the hybrid one is `impl<K, S> PaperCache<K, TieredBuffer,
+/// S>`, and EVERY hybrid feature enables `key_value_pmem`, so both blocks are
+/// compiled together in any build that has one. Collapsing the two `V`s to one
+/// type makes those two blocks overlap -- a duplicate-inherent-impl error on
+/// `get`, `set`, `peek` and the rest -- and merging them is not a rename: the
+/// flat `new` accepts an all-DRAM policy that the hybrid `new` rejects, so the
+/// 43-feature test suite would start failing at construction. Keeping one
+/// zero-sized marker per shape preserves the disjointness for free, and the
+/// value type really is single: both shapes store a `TieredValue`.
+pub trait ValueShape: 'static + Send + Sync {
+	/// The tier this shape's values are allocated in.
+	const TIER: Tier;
+}
+
+/// The all-DRAM cache shape: values in the fast tier.
+///
+/// Under `segregated_value_arena` that means `numa_alloc::FastValues` rather
+/// than the global allocator -- the routing lives in [`TieredValue`], so this
+/// marker does not have to know, which is the whole reason the old
+/// `BufferDRAM` type alias was feature-dependent and this one is not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BufferDRAM;
+
+impl ValueShape for BufferDRAM {
+	const TIER: Tier = Tier::Fast;
+}
+
+/// The PMEM/CXL cache shape: values in the slow tier (`numa_alloc::
+/// SlowObjects`), matching what `BufferPMEM = Box<[u8], Hybrid>` allocated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BufferPMEM;
+
+impl ValueShape for BufferPMEM {
+	const TIER: Tier = Tier::Slow;
 }
 
 /// The counting wrapper the routing tests assert against.
@@ -402,13 +635,25 @@ unsafe fn slow_dealloc(ptr: *mut u8, layout: Layout) {
 /// from the extent, so returning a node-1 block through the node-0 entry point
 /// is silently tolerated rather than reported.
 #[cfg(test)]
+///
+/// PER THREAD, not process-global. They were global until `Object` started
+/// storing a `TieredValue`, at which point every other test in the crate began
+/// allocating and freeing values too -- concurrently, on the default test
+/// runner -- and the two counting tests here started failing about one run in
+/// three on a delta of exactly one. Thread-local counters make the assertions
+/// exact again regardless of what the rest of the suite is doing, and they
+/// make the off-thread test STRONGER rather than weaker: it now reads the
+/// counters on the thread that actually performed the free, which is the
+/// thread whose routing decision is in question.
 pub(crate) mod route_counts {
-	use std::sync::atomic::{AtomicU64, Ordering};
+	use std::cell::Cell;
 
-	pub(crate) static FAST_ALLOCS: AtomicU64 = AtomicU64::new(0);
-	pub(crate) static FAST_FREES: AtomicU64 = AtomicU64::new(0);
-	pub(crate) static SLOW_ALLOCS: AtomicU64 = AtomicU64::new(0);
-	pub(crate) static SLOW_FREES: AtomicU64 = AtomicU64::new(0);
+	thread_local! {
+		pub(crate) static FAST_ALLOCS: Cell<u64> = const { Cell::new(0) };
+		pub(crate) static FAST_FREES: Cell<u64> = const { Cell::new(0) };
+		pub(crate) static SLOW_ALLOCS: Cell<u64> = const { Cell::new(0) };
+		pub(crate) static SLOW_FREES: Cell<u64> = const { Cell::new(0) };
+	}
 
 	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 	pub(crate) struct Counts {
@@ -418,12 +663,24 @@ pub(crate) mod route_counts {
 		pub slow_frees: u64,
 	}
 
+	/// One more on this thread's counter.
+	pub(crate) fn bump(counter: &'static std::thread::LocalKey<Cell<u64>>) {
+		// `try_with`: a value can be freed during thread teardown, after this
+		// thread's locals have been destroyed. Counting is diagnostic, so
+		// losing the increment there is correct behaviour, not a reason to
+		// abort the free.
+		let _ = counter.try_with(|c| c.set(c.get() + 1));
+	}
+
+	/// This thread's counters.
 	pub(crate) fn snapshot() -> Counts {
+		let read = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
+
 		Counts {
-			fast_allocs: FAST_ALLOCS.load(Ordering::Relaxed),
-			fast_frees: FAST_FREES.load(Ordering::Relaxed),
-			slow_allocs: SLOW_ALLOCS.load(Ordering::Relaxed),
-			slow_frees: SLOW_FREES.load(Ordering::Relaxed),
+			fast_allocs: read(&FAST_ALLOCS),
+			fast_frees: read(&FAST_FREES),
+			slow_allocs: read(&SLOW_ALLOCS),
+			slow_frees: read(&SLOW_FREES),
 		}
 	}
 }
@@ -697,30 +954,36 @@ mod tests {
 	fn free_routes_correctly_from_a_foreign_thread() {
 		let _guard = routing_lock();
 
-		let before = route_counts::snapshot();
-
 		let fast = TieredValue::new_fast(b"made here, freed there");
 		let slow = TieredValue::new_slow(b"made here, freed there");
 		let len = "made here, freed there".len() as u32;
 
-		std::thread::spawn(move || unsafe {
-			slow.free(len);
-			fast.free(len);
+		// The counters are read INSIDE the freeing thread -- they are
+		// thread-local, and that thread is the one whose routing decision is
+		// under test. A fresh thread starts at zero, so the deltas are the
+		// absolute counts.
+		let counted = std::thread::spawn(move || {
+			let before = route_counts::snapshot();
+
+			// SAFETY: both values were created just above, are `len` bytes
+			// long, and no other copy of either exists.
+			unsafe {
+				slow.free(len);
+				fast.free(len);
+			}
+
+			let after = route_counts::snapshot();
+
+			(after.fast_frees - before.fast_frees, after.slow_frees - before.slow_frees)
 		})
 		.join()
 		.expect("the freeing thread must not panic");
 
-		let after = route_counts::snapshot();
-
 		assert_eq!(
-			after.fast_frees,
-			before.fast_frees + 1,
-			"the fast value must still go back to the fast allocator off-thread",
-		);
-		assert_eq!(
-			after.slow_frees,
-			before.slow_frees + 1,
-			"the slow value must still go back to the slow allocator off-thread",
+			counted,
+			(1, 1),
+			"off-thread, each value must still be returned to the allocator its \
+			 TAG names -- one fast free and one slow free, not two of either",
 		);
 	}
 
