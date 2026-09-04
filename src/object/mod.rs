@@ -435,6 +435,63 @@ mod layout {
 		crate::value::defer_free(old, old_len);
 	}
 
+	/// Dropping an object must RETIRE its value, not free it and not leak it.
+	///
+	/// Asserted through the global counter with `>=` rather than `==`: the
+	/// counter is process-wide and every other test in the suite retires values
+	/// too. What is deterministic is that our own drop contributes at least
+	/// one, and that is exactly the claim -- a leak would contribute none.
+	#[test]
+	fn dropping_an_object_retires_its_value() {
+		use std::sync::atomic::Ordering::Relaxed;
+
+		let before = crate::value::VALUE_FREES_DEFERRED.load(Relaxed);
+
+		drop(Object::<u64, crate::value::BufferDRAM>::new(11, b"retire me", None));
+
+		assert!(
+			crate::value::VALUE_FREES_DEFERRED.load(Relaxed) > before,
+			"Object::drop must hand the value to the epoch; a value dropped \
+			 without one of these is leaked outright",
+		);
+	}
+
+	/// Deferral is not enough on its own: the garbage has to actually come
+	/// back. This drops objects and flushes until the RUN counter moves,
+	/// which is the end-to-end claim that epoch reclamation is wired up
+	/// rather than merely invoked.
+	///
+	/// The bound is enormous relative to what it needs (crossbeam's local bag
+	/// holds a few dozen deferrals and an epoch advances in three steps), so a
+	/// slow collector still passes and only a broken one fails. It cannot hang.
+	#[test]
+	fn retired_values_are_eventually_reclaimed() {
+		use std::sync::atomic::Ordering::Relaxed;
+
+		let before = crate::value::VALUE_FREES_RUN.load(Relaxed);
+
+		for _ in 0..200 {
+			for key in 0..100u64 {
+				drop(Object::<u64, crate::value::BufferDRAM>::new(
+					key,
+					&[0u8; 64],
+					None,
+				));
+			}
+
+			crate::value::flush();
+
+			if crate::value::VALUE_FREES_RUN.load(Relaxed) > before {
+				return;
+			}
+		}
+
+		panic!(
+			"20,000 retired values and 200 flushes ran none of them -- deferred \
+			 frees are accumulating without ever being collected",
+		);
+	}
+
 	/// A zero-length value is still a real, unique, freeable allocation --
 	/// `TieredValue` rounds the layout up to one byte for precisely this.
 	#[test]

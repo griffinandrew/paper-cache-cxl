@@ -96,32 +96,34 @@ impl OverheadManager {
 
 /// Returns the per-object policy overhead.
 /// Per-object cost every design pays regardless of policy or tiering: one
-/// object-map row plus the value `Arc` header.
+/// object-map row, and since v5 nothing else -- the value's separate
+/// refcounted allocation is gone.
 ///
-/// MEASURED at 144.0 B/object (96 map + 48 Arc), R2 = 1.000000, and identical
-/// at 64-byte and 512-byte values. The hybrid designs charge this against the
-/// fast tier via `get_hybrid_dram_shared_overhead`; a non-tiered design has no
-/// fast tier, so without this it went uncharged entirely and `used_size`
-/// understated real DRAM by ~144 B per object.
+/// MEASURED at 80.0 B/object, R2 = 1.000000, and identical at 16-, 32-, 64-
+/// and 128-byte values. The hybrid designs charge this against the fast tier
+/// via `get_hybrid_dram_shared_overhead`; a non-tiered design has no fast
+/// tier, so without this it went uncharged entirely.
 /// Bytes `get_policy_overhead` adds ON TOP of `base_size`.
 ///
-/// NOT simply map + Arc. `OBJECT_MAP_ENTRY_OVERHEAD` is an ALLOCATION figure
-/// for the whole `(HashedKey, Object)` row, and `Object` is
-/// `{key, Arc ptr, expiry}` -- so the row already contains the key and the
-/// expiry that `base_size` counts separately. Adding the whole row on top
-/// charged those 24 bytes twice, and `used_size` over-charged every object by
-/// exactly that much: measured, a 64-byte-value object allocates 208 B
-/// (96 row + 48 Arc + 64 value) while `total_size` computed 232.
+/// NOT simply the row. `OBJECT_MAP_ENTRY_OVERHEAD` is an ALLOCATION figure for
+/// the whole `(HashedKey, Object)` row, and `Object` holds the key and the
+/// expiry INLINE -- so the row already contains the two things `base_size`
+/// counts separately. Adding the whole row on top charged them twice.
 ///
 /// The error scaled inversely with object size -- ~0.4% on cluster13's 5.6 KB
 /// objects, ~8.8% on cluster19's 100 B ones, where the cache held ~9% fewer
 /// objects than the budget intended.
+///
+/// The value's `len: u32` is inside the row too and is NOT subtracted, because
+/// `base_size` does not count it separately: it is bookkeeping the row pays
+/// for, like the control byte.
 const DOUBLE_COUNTED_IN_BASE_SIZE: ObjectSize =
 	core::mem::size_of::<crate::HashedKey>() as ObjectSize
 		+ core::mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
 
-const OBJECT_MAP_AND_ARC_OVERHEAD: ObjectSize =
-	OBJECT_MAP_ENTRY_OVERHEAD + ARC_VALUE_HEADER_OVERHEAD - DOUBLE_COUNTED_IN_BASE_SIZE;
+/// 80 + 0 - 12 = **68**. Was 96 + 32 - 12 = 116.
+const OBJECT_MAP_ROW_OVERHEAD: ObjectSize =
+	OBJECT_MAP_ENTRY_OVERHEAD + VALUE_ALLOCATION_OVERHEAD - DOUBLE_COUNTED_IN_BASE_SIZE;
 
 /// The merged store's structural cost per object, replacing BOTH the map row
 /// and the eviction stack.
@@ -165,12 +167,12 @@ const MERGED_STORE_STRUCTURE_OVERHEAD: ObjectSize = 73;
 /// stack row that no longer exists, so the cache held fewer objects than its
 /// budget allowed and the saving showed up nowhere.
 ///
-/// Same shape as `OBJECT_MAP_AND_ARC_OVERHEAD`: the slot embeds the `Object`,
+/// Same shape as `OBJECT_MAP_ROW_OVERHEAD`: the slot embeds the `Object`,
 /// hence contains the key and expiry that `base_size` counts separately, so
 /// those 24 bytes come back off.
 #[cfg(feature = "merged_object_store")]
 pub fn get_policy_overhead(_policy: &PaperPolicy) -> ObjectSize {
-	MERGED_STORE_STRUCTURE_OVERHEAD + ARC_VALUE_HEADER_OVERHEAD
+	MERGED_STORE_STRUCTURE_OVERHEAD + VALUE_ALLOCATION_OVERHEAD
 		- DOUBLE_COUNTED_IN_BASE_SIZE
 }
 
@@ -182,9 +184,28 @@ pub fn get_policy_overhead(_policy: &PaperPolicy) -> ObjectSize {
 /// "written by the registration helper and never checked against anything".
 /// Every one understated its stack by 18-100%.
 
+/// EVERY arm carries `OBJECT_MAP_ROW_OVERHEAD`, including the hybrid ones.
+///
+/// The hybrid arms did not, until now: they returned their eviction-stack term
+/// and nothing else, so a hybrid design was charged ~40 B/object against a real
+/// cost near 200. `used_size` is what `max_size` bounds, so the effect was that
+/// `max_size` did not bound memory for any tiered design -- the cache admitted
+/// objects until its accounted total hit the cap while its actual DRAM footprint
+/// ran ~4x that per object of metadata. The flat arms have always included the
+/// term; this only makes the hybrids agree with them.
+///
+/// The two functions in this module now name the same three quantities -- the
+/// stack, the map row, and the (zero) value allocation -- so they can be read
+/// against each other. They still differ in one deliberate way:
+/// `get_hybrid_dram_shared_overhead` does NOT subtract
+/// `DOUBLE_COUNTED_IN_BASE_SIZE`, because it is a fast-tier RESERVATION rather
+/// than an addition on top of `base_size`, so it has nothing to double-count
+/// against.
 #[cfg(not(feature = "merged_object_store"))]
 pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
-	// the overheads are just rough estimates of the number of bytes per object
+	// Each arm is <this policy's eviction-stack cost> + the object-map row.
+	// The stack terms are measured (see the MEASURED_STACK note above); the row
+	// term is measured too (see `OBJECT_MAP_ENTRY_OVERHEAD`).
 
 	match policy {
 		PaperPolicy::Auto => 0,
@@ -195,39 +216,39 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// (8-byte key + 4-byte slot + 4-byte frequency), against `Lfu`s
 		// index_map entry + HashList node + key + count, each bucket
 		// carrying its own key-to-node index.
-		PaperPolicy::LfuCompact => 56 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::Lfu => 128 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::LfuCompact => 56 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::Lfu => 128 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
 		// Slab layout: a 16-byte link-only slot plus one index entry, against
 		// the original's 48-byte HashList node, key, and separate index. The
 		// CLOCK/SIEVE visited bit and MRU's held key live in the index value,
 		// so they cost nothing beyond it.
-		PaperPolicy::FifoCompact => 56 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::ClockCompact => 56 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::SieveCompact => 56 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::MruCompact => 56 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::FifoCompact => 56 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::ClockCompact => 56 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::SieveCompact => 56 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::MruCompact => 56 + OBJECT_MAP_ROW_OVERHEAD,
 
-		PaperPolicy::Fifo => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
-
-		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
-		// 1 byte for the visited flag
-		PaperPolicy::Clock => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::Fifo => 72 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 1 byte for the visited flag
-		PaperPolicy::Sieve => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::Clock => 72 + OBJECT_MAP_ROW_OVERHEAD,
+
+		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
+		// 1 byte for the visited flag
+		PaperPolicy::Sieve => 72 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
 		// Slab layout: a 16-byte link-only slot plus one index entry
 		// (8-byte key + 4-byte slot number, no payload), against
 		// `Lru`s 48-byte HashList node + 8-byte key + the HashLists own
 		// separate key-to-node index.
-		PaperPolicy::LruCompact => 56 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::Lru => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::LruCompact => 56 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::Lru => 72 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
-		PaperPolicy::Mru => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::Mru => 72 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size
@@ -235,12 +256,12 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// finds it (8-byte key + 4-byte slot index + the 8-byte payload
 		// carrying the queue tag and the object size), against the
 		// original's 48-byte `HashList` node + 8-byte key + 4-byte size.
-		PaperPolicy::TwoQCompact(_, _) => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::TwoQ(_, _) => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::TwoQCompact(_, _) => 72 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQ(_, _) => 72 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size
-		PaperPolicy::Arc => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::Arc => 72 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size, 1 byte for the frequency count
@@ -251,15 +272,15 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// 4-byte size + 1-byte freq. Like `SThreeFifo` above, neither
 		// charge covers the bare-key ghost queue, so the two stay
 		// directly comparable.
-		PaperPolicy::SThreeFifoCompact(_) => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
-		PaperPolicy::SThreeFifo(_) => 72 + OBJECT_MAP_AND_ARC_OVERHEAD,
+		PaperPolicy::SThreeFifoCompact(_) => 72 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::SThreeFifo(_) => 72 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 24 bytes for the single combined per-key `entries` HashMap entry
 		// (tier + size, one map — see `LruHybridStack`'s module doc for why
 		// this collapsed from two separate maps), 1 byte for the Tier tag,
 		// 4 bytes for the object size
-		PaperPolicy::LruHybrid => 48 + 8 + 24 + 1 + 4,
+		PaperPolicy::LruHybrid => 48 + 8 + 24 + 1 + 4 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to LruHybrid, and deliberately so: the fast
 		// tier is the same 48-byte HashList entry + 8-byte HashedKey, and a
@@ -272,8 +293,8 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// already measured. See `lru_lfu_hybrid_stack.rs`'s "Why the counter
 		// is capped" section and its `entry_packs_to_eight_bytes` test, which
 		// is what keeps this arm honest.
-		PaperPolicy::LruLfuCompactHybrid(_) => 16 + 24,
-		PaperPolicy::LruLfuHybrid(_) => 48 + 8 + 24 + 1 + 4,
+		PaperPolicy::LruLfuCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::LruLfuHybrid(_) => 48 + 8 + 24 + 1 + 4 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Base LFU overhead (24 HashMap entry + 48 bucket-list entry + 8
 		// HashedKey + 4 count = 84) plus what LfuHybridStack needs beyond
@@ -282,17 +303,17 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// bytes for the entry, 1 byte for the Tier tag, 4 bytes for the
 		// object size (matching the "+4" charge already used for
 		// TwoQ/Arc/SThreeFifo)
-		PaperPolicy::LfuHybrid => (24 + 48 + 8 + 4) + (24 + 1 + 4),
+		PaperPolicy::LfuHybrid => (24 + 48 + 8 + 4) + (24 + 1 + 4) + OBJECT_MAP_ROW_OVERHEAD,
 
 		// One 32-byte slab slot plus a 16-byte index entry. No `entries` map
 		// and no per-key list node: the slot the index returns already carries
 		// tier, size and frequency. Measured 47.4 B/key against this 48.
-		PaperPolicy::LruCompactHybrid => 24 + 16,
+		PaperPolicy::LruCompactHybrid => 24 + 16 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Same 8-byte payload as `LruCompactHybrid`: `phys` was paid for out
 		// of padding `LruPayload` already carried, so the layout is unchanged.
-		PaperPolicy::LruLazyCopyCompactHybrid => 24 + 16,
-		PaperPolicy::LfuCompactHybrid => 32 + 16,
+		PaperPolicy::LruLazyCopyCompactHybrid => 24 + 16 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::LfuCompactHybrid => 32 + 16 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Worst-case charge for a key resident in main_stack as Fast:
 		// 48-byte HashList entry + 8-byte HashedKey + a single combined
@@ -301,37 +322,37 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// three separate maps) — 24 bytes for the entry, 1 byte for the
 		// Queue tag, 1 byte for the Option<Tier> tag (only meaningful for
 		// keys currently in Main), 4 bytes for the object size
-		PaperPolicy::TwoQCompactHybrid(_) => 16 + 24,
-		PaperPolicy::TwoQHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
+		PaperPolicy::TwoQCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4) + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to TwoQHybrid: `TwoQFastAdmissionHybridStack`
 		// is the same two-list/one-combined-entry-map shape, differing only in
 		// which physical tier the one-access FIFO queue's bytes live in (fast
 		// rather than slow) — a placement decision that costs no extra
 		// per-key metadata.
-		PaperPolicy::TwoQFastAdmissionCompactHybrid(_) => 16 + 24,
-		PaperPolicy::TwoQFastAdmissionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
+		PaperPolicy::TwoQFastAdmissionCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQFastAdmissionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4) + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical again: the reprieve variant changes where an
 		// aged-out one-access key goes, not what is tracked per key.
-		PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(_) => 16 + 24,
-		PaperPolicy::TwoQFastAdmissionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
+		PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQFastAdmissionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4) + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical again, despite the third queue: a key is
 		// resident in exactly one of `a1_in`/`a1_out`/`am` at any moment, so
 		// it still costs one HashList entry plus one combined `entries` row
 		// (queue tag + Option<Tier> tag + size). No reference bit, and no
 		// ghost list -- `a1_out` holds the real objects.
-		PaperPolicy::TwoQFullFastAdmissionCompactHybrid(_, _) => 16 + 24,
-		PaperPolicy::TwoQFullFastAdmissionHybrid(_, _) => (48 + 8) + (24 + 1 + 1 + 4),
+		PaperPolicy::TwoQFullFastAdmissionCompactHybrid(_, _) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQFullFastAdmissionHybrid(_, _) => (48 + 8) + (24 + 1 + 1 + 4) + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to LruHybrid: 48 bytes for the HashList
 		// entry, 8 bytes for the HashedKey, 24 bytes for the single
 		// combined per-key `entries` HashMap entry (tier + size, one map —
 		// see `FifoHybridStack`'s module doc), 1 byte for the Tier tag,
 		// 4 bytes for the object size.
-		PaperPolicy::FifoCompactHybrid => 16 + 24,
-		PaperPolicy::FifoHybrid => 48 + 8 + 24 + 1 + 4,
+		PaperPolicy::FifoCompactHybrid => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::FifoHybrid => 48 + 8 + 24 + 1 + 4 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to LruHybrid despite having 4 recency
 		// lists instead of 1: a key is only ever resident in exactly ONE of
@@ -343,8 +364,8 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// single combined `entries: HashMap<HashedKey, SizedEntry>` entry
 		// (SizedEntry { queue: SizeQueue, size: ObjectSize }), 1 byte for
 		// the SizeQueue tag, 4 bytes for the object size.
-		PaperPolicy::LruSizedCompactHybrid => 16 + 24,
-		PaperPolicy::LruSizedHybrid => 48 + 8 + 24 + 1 + 4,
+		PaperPolicy::LruSizedCompactHybrid => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::LruSizedHybrid => 48 + 8 + 24 + 1 + 4 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to TwoQHybrid's charge (same shape: a
 		// one-access queue + a segmented main FIFO queue, one combined
@@ -355,15 +376,15 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// currently in Main), 4 bytes for the object size, plus 1 more byte
 		// than TwoQHybrid for the `accessed: bool` reference bit (only
 		// meaningful for keys currently in Main — see that field's doc).
-		PaperPolicy::S3FifoCompactHybrid(_) => 16 + 24,
+		PaperPolicy::S3FifoCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
 		// The faithful family: same 8-byte payload, since `freq: u8`
 		// replaces `accessed: bool` one-for-one. Like every other ghost
 		// design here, the ghost queue's own memory is not charged.
-		PaperPolicy::S3FifoFaithfulCompactHybrid(_) => 16 + 24,
-		PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(_) => 16 + 24,
-		PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(_) => 16 + 24,
-		PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(_) => 16 + 24,
-		PaperPolicy::S3FifoHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+		PaperPolicy::S3FifoFaithfulCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Ghost-hybrid variants: identical per-*tracked*-object charge to
 		// their non-ghost counterparts. The ghost list's own memory isn't
@@ -373,33 +394,33 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// (no longer counted in `num_objects`, which is what this whole
 		// function's result gets multiplied by), so it isn't a *tracked*
 		// object's overhead to add to in the first place.
-		PaperPolicy::TwoQGhostCompactHybrid(_) => 16 + 24,
-		PaperPolicy::TwoQGhostHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4),
-		PaperPolicy::S3FifoGhostCompactHybrid(_) => 16 + 24,
-		PaperPolicy::S3FifoGhostHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+		PaperPolicy::TwoQGhostCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQGhostHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Identical entry shape to S3FifoGhostHybrid (same S3FifoEntry
 		// fields: queue, tier, size, accessed) -- the reference-bit gate
 		// this variant adds only changes when the bit is read, not
 		// anything about the per-entry bookkeeping shape.
-		PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(_) => 16 + 24,
-		PaperPolicy::S3FifoGhostLazyDemotionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+		PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostLazyDemotionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
 
 
 		// Identical entry shape to S3FifoGhostLazyDemotionHybrid (same
 		// S3FifoEntry fields) -- moving the one-access queue into the fast
 		// tier is a placement/accounting change, not a bookkeeping-shape
 		// change.
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(_) => 16 + 24,
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
 
 
 		// Identical entry shape to S3FifoGhostLazyDemotionFastAdmissionHybrid
 		// (same S3FifoEntry fields) -- the midpoint cursor is a
 		// stack-level field (like main_boundary), not a per-object one, so
 		// it doesn't change this per-tracked-object charge.
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(_) => 16 + 24,
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Same S3FifoEntry shape as S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid,
 		// minus the ghost list -- this variant removes it entirely (a
@@ -411,22 +432,22 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// TwoQGhostHybrid/S3FifoGhostHybrid above), so the number is
 		// identical; only the removed list's fixed struct-level cost
 		// (irrelevant here, this function is purely per-object) is gone.
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(_) => 16 + 24,
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Same per-object charge as the midpoint variant -- dropping the
 		// mid-slow checkpoint removes stack-level fields (a cursor and a
 		// drift counter), not per-object ones.
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(_) => 16 + 24,
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Identical per-object bookkeeping to the fast-admission reprieve
 		// variant above: same `S3FifoEntry { queue, tier, size, accessed }`,
 		// same two-list main queue. Moving the one-access queue to the slow
 		// tier changes which allocator backs an object's bytes, not what the
 		// stack records per key.
-		PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(_) => 16 + 24,
-		PaperPolicy::S3FifoLazyDemotionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+		PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoLazyDemotionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Same per-object charge as the predecessor. The slow tier being
 		// two physical lists instead of one doesn't change what a tracked
@@ -434,8 +455,8 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// entry -- and this variant actually drops the separate
 		// `Option<Tier>` field (the queue tag now carries the tier), so
 		// if anything this is a slight over-estimate rather than under.
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(_) => 16 + 24,
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1),
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
 	}
 }
 
@@ -1485,53 +1506,68 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_S
 /// terms that are actually DRAM-resident: the eviction-stack term is dropped
 /// when `eviction_stacks_pmem` moves those stacks to PMEM, and the hashtable
 /// entry is dropped when a hashtable-PMEM feature moves the object map to PMEM.
-/// Per-object DRAM cost of the value's refcount header.
+/// Per-object DRAM cost of the value's own allocation, over and above its
+/// bytes. **Zero since v5**, and measured to be zero.
 ///
-/// Was 48. `Arc`'s inner allocation carries a strong AND a weak count, and with
-/// the 24-byte `TieredBuffer` it wraps (16-byte fat pointer plus a padded
-/// discriminant) that is 40 bytes, which jemalloc rounds to its 48-byte class.
+/// It was 48, then 32, and it is now nothing at all. `Arc`'s inner allocation
+/// carried a strong AND a weak count around the 24-byte `TieredBuffer` enum --
+/// 40 bytes, rounded to jemalloc's 48-byte class. `shared::Shared` dropped the
+/// weak count nothing in this tree ever used: 8 + 24 = 32, one class down.
+/// v5 removes the refcount entirely: a value IS its bytes, addressed by an
+/// eight-byte word that lives inside the `Object`, so there is no second
+/// allocation to charge for and nothing that could be called a header.
 ///
-/// Nothing in this crate ever creates a `Weak`, so that second count was pure
-/// cost. `shared::Shared` drops it: 8 + 24 = 32, landing exactly on the 32-byte
-/// class one step down. Measured, not assumed -- see `shared::tests` and
-/// `tiered_buffer::layout`.
+/// MEASURED, not asserted by inspection. `measure_object_map_point` at
+/// MEASURE_VALUE = 64, 2^20..2^23, one process per point:
 ///
-/// Fixed-size, so independent of the trace's value distribution. Always
-/// DRAM-resident: the header is allocated by the global allocator even when the
-/// buffer it points at lives in PMEM.
-// Not cfg-gated: every design allocates one object-map row and one value
-// header per object, tiered or not, so this term is charged in
-// get_policy_overhead for non-hybrid policies as well.
-const ARC_VALUE_HEADER_OVERHEAD: ObjectSize = 32;
+/// ```text
+///   before (Shared<TieredBuffer>)   176.0000 B/object   R2 = 1.000000
+///   after  (TieredValue)            144.0000 B/object   R2 = 1.000000
+/// ```
+///
+/// and sweeping the value size at n = 2^22 puts the whole remainder in the map
+/// row rather than leaving any third term behind:
+///
+/// ```text
+///   value  16 ->  95.998 B/object   non-value remainder 79.998
+///   value  32 -> 111.998                                79.998
+///   value  64 -> 143.998                                79.998
+///   value 128 -> 207.998                                79.998
+/// ```
+///
+/// A constant that is zero is kept rather than deleted so the arithmetic below
+/// still NAMES the term: `used_size` charging a value-allocation header is a
+/// decision, and a build that reintroduces one (variant A's four-byte length
+/// prefix, say) has a single place to say so.
+// Not cfg-gated: the term applies to every design, tiered or not.
+const VALUE_ALLOCATION_OVERHEAD: ObjectSize = 0;
 
 /// Per-object DRAM cost of the object map (`DashMap<HashedKey, Object>`):
-/// the `(u64, Object{key, Arc ptr, expiry})` pair plus hashbrown's control
-/// byte and load-factor slack.
+/// the `(u64, Object{key, value word, len, expiry})` pair -- 8 + 24 = 32 bytes
+/// -- plus hashbrown's control byte and load-factor slack.
 ///
-/// Measured by fitting node-0 live requested bytes against object count over
-/// three steady-state runs (cluster12, fifo, 2/6/15 GB caches, all at their
-/// cap), then subtracting the two analytically-known terms:
+/// **80**, MEASURED. `measure_object_map_point`, jemalloc `stats.allocated`,
+/// one process per point, 2^20..2^23 at MEASURE_VALUE = 64: 144.0000 B/object
+/// at R2 = 1.000000, of which 64 is the size-class-rounded value. Sweeping the
+/// value size at n = 2^22 pins it independently -- the non-value remainder is
+/// 79.998 at 16, 32, 64 AND 128 byte values, i.e. a container cost rather than
+/// a mis-attributed value cost.
 ///
-///   metadata = 175.4 B/object x objects + 1.016 GB fixed
-///   175.4 - 64 (eviction stack) - 48 (`Arc` header) = 63
+/// Was 96, and 96 was already 16 too high BEFORE v5: the same harness measured
+/// 80 on the base commit. So the drop from 96 to 80 is a correction, not a
+/// saving -- the v5 saving is the separate 32-byte value allocation
+/// disappearing, which is `VALUE_ALLOCATION_OVERHEAD` above. Both errors ran in
+/// the same direction (over-charging, so the cache held fewer objects than its
+/// budget allowed), which is why neither showed up as a crash.
 ///
-/// The 63 agrees with an independent analytic estimate of ~72 (a 40-byte
-/// pair, hashbrown's 7/8 load factor and its power-of-two table slack), which
-/// is the main reason to trust it.
-///
-/// The 1.016 GB intercept is deliberately NOT reserved: it is benchmark-side,
-/// not cache metadata. `Access::from_chunk` synthesises a value buffer per
-/// trace record (`[0u8].repeat(value_size)`) and the reader prefetches
-/// `PREFETCH_RECORDS` (256K) of them, so ~440 MB of node 0 belongs to the
-/// harness, plus its channels and client state. An earlier estimate of 165 B
-/// came from dividing total metadata by object count at a single cache size,
-/// which silently amortised that fixed cost into the per-object term -- at
-/// 1.2M objects the same arithmetic yields 989 B/object, which is what made
-/// the contamination obvious.
-// Not cfg-gated: every design allocates one object-map row and one value
-// Arc per object, tiered or not, so this term is charged in
-// get_policy_overhead for non-hybrid policies as well.
-const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 96;
+/// The row did not change size in v5: `Object` was 24 bytes with a `Shared`
+/// handle and is 24 bytes with a `TieredValue` and a `len`. That the measured
+/// row is unchanged at 80 is therefore a check on the layout claim, not a
+/// coincidence.
+// Not cfg-gated: every design allocates one object-map row per object, tiered
+// or not, so this term is charged in get_policy_overhead for non-hybrid
+// policies as well.
+const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 80;
 
 /// Requested-to-resident multiplier for the DRAM metadata reserved above.
 ///
@@ -1657,8 +1693,8 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// for, and the map row is the merged store's slot -- so the whole
 	// per-policy match below names structures that do not exist in this build.
 	// The merged store reserves its OWN structure instead: the measured
-	// slot+bucket cost plus the `Arc` header, all of which is DRAM-resident in
-	// either tier because only the value buffer migrates.
+	// slot+bucket cost plus the (now zero) value-allocation term, all of which
+	// is DRAM-resident in either tier because only the value bytes migrate.
 	//
 	// Without this the fast tier is charged the split design's ~192 B/object
 	// for metadata it does not have, so it demotes far earlier than it should
@@ -1667,7 +1703,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	#[cfg(feature = "merged_object_store")]
 	{
 		let _ = policy;
-		return MERGED_STORE_STRUCTURE_OVERHEAD + ARC_VALUE_HEADER_OVERHEAD;
+		return MERGED_STORE_STRUCTURE_OVERHEAD + VALUE_ALLOCATION_OVERHEAD;
 	}
 
 	#[cfg(feature = "merged_object_store")]
@@ -1766,20 +1802,21 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 		overhead += stack_resident;
 	}
 
-	// The value's Arc header is DRAM-resident regardless of which tier the
-	// buffer itself occupies, and regardless of any hashtable-PMEM feature.
-	// MEASURED at 48.0 B/object, R2 = 1.000000 -- which is exactly what this
-	// constant already said.
-	overhead += ARC_VALUE_HEADER_OVERHEAD;
+	// The value's own allocation used to cost a DRAM-resident refcounted
+	// header regardless of which tier the bytes themselves occupied. Since v5
+	// there is no such allocation, so this term is ZERO -- kept, rather than
+	// deleted, so that this reservation and `get_policy_overhead` name the
+	// same terms and can be compared line for line. MEASURED zero: see the
+	// constant's own doc for the before/after fits.
+	overhead += VALUE_ALLOCATION_OVERHEAD;
 
 	// The object map lives in DRAM unless a hashtable-PMEM feature
 	// relocates it (`global_hashtable_pmem`).
 	//
-	// MEASURED at 96.0 B/object for the default `DashMap` shape, as the
-	// difference between the whole map (144.0) and the Arc alone (48.0). Both
-	// fits R2 = 1.000000, and the 144 is identical at 64-byte and 512-byte
-	// values, so it is a container cost rather than a mis-attributed value
-	// cost. The previous hand-counted 63 was 33 bytes low.
+	// MEASURED at 80.0 B/object for the default `DashMap` shape: the whole
+	// map measures 144.0 at a 64-byte value (R2 = 1.000000), and the non-value
+	// remainder is 79.998 at 16-, 32-, 64- AND 128-byte values, so it is a
+	// container cost rather than a mis-attributed value cost.
 	#[cfg(not(feature = "global_hashtable_pmem"))]
 	{
 		overhead += OBJECT_MAP_ENTRY_OVERHEAD;
@@ -1833,7 +1870,7 @@ mod shared_overhead_is_feature_independent {
 		// collapsed policy returns 144 while this expression produced 161, and
 		// `assert_ne!` could never fire. The one thing this test exists to
 		// catch was the one thing it could not catch.
-		let no_stack_term = ARC_VALUE_HEADER_OVERHEAD + OBJECT_MAP_ENTRY_OVERHEAD;
+		let no_stack_term = VALUE_ALLOCATION_OVERHEAD + OBJECT_MAP_ENTRY_OVERHEAD;
 
 		// Under `eviction_stacks_pmem` the stacks live in CXL, so they are
 		// deliberately absent from the FAST-TIER reservation -- while still
