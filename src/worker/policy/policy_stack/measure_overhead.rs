@@ -261,7 +261,19 @@ fn measure_value_class() {
 /// Same rules as every other measurement in this module: jemalloc
 /// `stats.allocated` rather than RSS, ONE point per process, and the caller
 /// samples at POWERS OF TWO.
-#[cfg(not(any(feature = "global_hashtable_pmem", feature = "key_pmem_value_pmem")))]
+///
+/// NOT compiled under `merged_object_store`: there `ObjectMapRef` is
+/// `Arc<MergedStore>`, so the `Arc<DashMap>` this builds does not typecheck at
+/// all -- one E0308, and it was the only thing keeping the
+/// `lru_compact_hybrid_cache,merged_object_store` pair from building its test
+/// target. The merged store's own equivalent is
+/// `merged_store::measure::measure_merged_store_point`, and its DashMap
+/// control is `measure_dashmap_point` in the same module.
+#[cfg(not(any(
+	feature = "global_hashtable_pmem",
+	feature = "key_pmem_value_pmem",
+	feature = "merged_object_store",
+)))]
 #[cfg(feature = "hybrid_cache_common")]
 #[test]
 #[ignore]
