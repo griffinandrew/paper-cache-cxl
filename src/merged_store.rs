@@ -1923,17 +1923,36 @@ mod tests {
 			 chunk per shard ({bound})",
 		);
 
-		// And every chunk is really committed whole, so the figure the
-		// measurement harness reports is chunks x SLAB_CHUNK exactly.
-		for lock in s.shards.iter() {
-			let g = lock.read().unwrap();
+		// The bound above is the store-wide consequence. The per-shard
+		// statement is the exact one, and it is what makes the slab's cost
+		// predictable rather than merely bounded: a shard commits its live
+		// count ROUNDED UP to a whole chunk, and not one slot more.
+		//
+		// Asserted as an equality, not an inequality. A `<=` would still hold
+		// if growth started over-committing -- appending two chunks at a time,
+		// say -- which is the `Vec` doubling this replaced, wearing a
+		// different constant.
+		let mut committed = 0usize;
 
-			assert_eq!(g.slots.capacity() % SLAB_CHUNK, 0, "a chunk was part-committed");
-			assert!(
-				g.slots.len() <= g.slots.capacity(),
-				"more slots handed out than the chunks hold",
+		for (i, lock) in s.shards.iter().enumerate() {
+			let g = lock.read().unwrap();
+			let live = g.slots.len();
+			let want = live.div_ceil(SLAB_CHUNK) * SLAB_CHUNK;
+
+			assert_eq!(
+				g.slots.capacity(),
+				want,
+				"shard {i} holds {live} slots but committed {} -- a shard commits \
+				 its live count rounded up to one chunk, and nothing else",
+				g.slots.capacity(),
 			);
+
+			committed += g.slots.capacity();
 		}
+
+		// And the harness reads the same figure the shards do, so a slope
+		// measured through `capacities()` is measuring these chunks.
+		assert_eq!(committed, slab_cap, "capacities() disagrees with the shards");
 	}
 
 	/// Growth must never move a slot: a chunk is boxed, so its address is fixed
