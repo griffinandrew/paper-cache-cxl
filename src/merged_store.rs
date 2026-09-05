@@ -2299,6 +2299,81 @@ mod tests {
 		assert_eq!(evicted, expected, "cross-shard order is not exact");
 	}
 
+	/// The settle loop holds NO shard lock while it chooses, and takes exactly
+	/// one while it demotes -- so touchers, inserters and settlers running at
+	/// once cannot form a lock-order cycle. A regression would show up here as
+	/// a hang rather than a failure, which is why the shape of this test is
+	/// "everything finishes".
+	///
+	/// It also exercises the one thing the single-threaded tests cannot: the
+	/// store-level `fast_used` being maintained correctly under contention,
+	/// where two settlers may each demote an object the other has already
+	/// accounted for.
+	#[test]
+	fn concurrent_touches_and_settles_do_not_deadlock() {
+		use std::sync::Arc;
+
+		let s = Arc::new(Store::new());
+		s.configure_tiering(64 * 1_024, 0, DEFAULT_HIGH_PPM, DEFAULT_LOW_PPM);
+
+		let threads: Vec<_> = (0..8u64)
+			.map(|t| {
+				let s = Arc::clone(&s);
+
+				std::thread::spawn(move || {
+					for i in 1..=2_000u64 {
+						let key = mix(t * 1_000_000 + i);
+
+						s.insert(key, Object::new(key, &[0u8; 128], None));
+						s.record_size(key, 128, 0);
+						s.touch(mix(t * 1_000_000 + (i / 2).max(1)));
+
+						if i % 13 == 0 {
+							s.remove_key(mix(t * 1_000_000 + i / 13));
+						}
+
+						if i % 101 == 0 {
+							s.resize_fast_tier(32 * 1_024 * (1 + i % 3));
+						}
+					}
+				})
+			})
+			.collect();
+
+		for t in threads {
+			t.join().expect("a worker panicked -- or the settle loop deadlocked");
+		}
+
+		assert_eq!(
+			s.fast_bytes_used(),
+			s.sum_shards(|g| g.fast_used),
+			"the store-level fast_used drifted from the shards under contention",
+		);
+
+		assert_eq!(
+			s.fast_object_count() + s.slow_object_count(),
+			s.len(),
+			"the tier counts lost track of objects under contention",
+		);
+
+		// Every shard's fast region is still a prefix of its own list, which is
+		// what makes the boundary mirror mean anything.
+		for lock in s.shards.iter() {
+			let g = lock.read().unwrap();
+			let mut i = g.head;
+			let mut seen_slow = false;
+
+			while i != NIL {
+				match g.slots[i as usize].tier {
+					Tier::Fast => assert!(!seen_slow, "a fast slot sits behind a slow one"),
+					Tier::Slow => seen_slow = true,
+				}
+
+				i = g.slots[i as usize].next;
+			}
+		}
+	}
+
 	/// The tier boundary is GLOBAL: the fast tier holds the globally most
 	/// recently used objects, not each shard's own most recent.
 	///
