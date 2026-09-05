@@ -1630,7 +1630,7 @@ const DEFAULT_RESIDENT_FACTOR: f64 = 1.12;
 /// `mem_fragmentation_ratio`, not inside a per-object budget. See
 /// `AtomicStatus::fragmentation_ratio`.
 #[cfg(feature = "numa_jemalloc")]
-fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
+pub(crate) fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
 	// SAFETY: `nallocx` is a pure size-class computation. It allocates
 	// nothing, dereferences nothing, and cannot fail for a non-zero size.
 	match requested {
@@ -1642,7 +1642,7 @@ fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
 /// Without jemalloc there is no allocator to ask, so the request stands.
 /// Estimating here would reintroduce exactly the error described above.
 #[cfg(not(feature = "numa_jemalloc"))]
-fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
+pub(crate) fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
 	requested
 }
 
@@ -1870,6 +1870,7 @@ mod shared_overhead_is_feature_independent {
 		// collapsed policy returns 144 while this expression produced 161, and
 		// `assert_ne!` could never fire. The one thing this test exists to
 		// catch was the one thing it could not catch.
+		#[allow(unused_variables)] // named by two of the three arms below
 		let no_stack_term = VALUE_ALLOCATION_OVERHEAD + OBJECT_MAP_ENTRY_OVERHEAD;
 
 		// Under `eviction_stacks_pmem` the stacks live in CXL, so they are
@@ -1878,7 +1879,7 @@ mod shared_overhead_is_feature_independent {
 		// policy therefore collapses to exactly `no_stack_term` ON PURPOSE, and
 		// the assertions below invert. Same property, checked from the other
 		// side: the split is what makes both directions meaningful.
-		#[cfg(feature = "eviction_stacks_pmem")]
+		#[cfg(all(feature = "eviction_stacks_pmem", not(feature = "merged_object_store")))]
 		for (name, got) in [("lru", lru), ("lfu", lfu), ("fifo", fifo), ("s3-fifo", s3)] {
 			assert_eq!(
 				got, no_stack_term,
@@ -1887,7 +1888,23 @@ mod shared_overhead_is_feature_independent {
 			);
 		}
 
-		#[cfg(not(feature = "eviction_stacks_pmem"))]
+		// Under `merged_object_store` there is no per-policy eviction stack to
+		// carry a term: the object map IS the eviction structure, so every
+		// policy reserves the merged store's own measured structural cost and
+		// nothing else. The assertions invert here for the same reason they do
+		// under `eviction_stacks_pmem` -- the term is deliberately absent, not
+		// lost to cfg gating -- so the check becomes that they all collapse to
+		// exactly that one figure.
+		#[cfg(feature = "merged_object_store")]
+		for (name, got) in [("lru", lru), ("lfu", lfu), ("fifo", fifo), ("s3-fifo", s3)] {
+			assert_eq!(
+				got,
+				MERGED_STORE_STRUCTURE_OVERHEAD + VALUE_ALLOCATION_OVERHEAD,
+				"{name} reserves fast-tier DRAM for a split-design eviction stack 				 this build does not have",
+			);
+		}
+
+		#[cfg(not(any(feature = "eviction_stacks_pmem", feature = "merged_object_store")))]
 		{
 			for (name, got) in [("lru", lru), ("lfu", lfu), ("fifo", fifo), ("s3-fifo", s3)] {
 				assert_ne!(

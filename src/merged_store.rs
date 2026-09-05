@@ -98,10 +98,31 @@
 //! one-step walk of the cursor and never touches the list, which is why tier
 //! placement here can never reorder and never evict.
 //!
-//! The fast budget is split evenly across shards and each settles its own
-//! against the same high/low watermarks the split stacks use. Migrations
-//! accumulate per shard and `drain_tier_migrations` concatenates them, so
-//! `PolicyWorker::apply_tier_migrations` performs the physical
+//! ## The tier boundary is global, by the same trick eviction uses
+//!
+//! An earlier revision split `fast_capacity` EVENLY across the shards and let
+//! each settle its own boundary. That is not a global order: a shard holding
+//! large recent objects demoted things MORE RECENT than fast objects idling in
+//! another shard, and the fast tier went under-used whenever recency skewed
+//! across shards.
+//!
+//! So the boundary is chosen the way the eviction victim is. Each shard
+//! mirrors the stamp of its `fast_boundary` slot into a second padded array,
+//! `fast_tails`, and the store keeps one `fast_used` total. Settling runs with
+//! NO shard lock held: while the total is over the high watermark, `SHARDS`
+//! relaxed loads name the shard whose boundary is oldest, that ONE shard's
+//! write lock is taken, its boundary steps back one slot, the mirror is
+//! republished and the lock released -- repeat until under the low watermark.
+//!
+//! That is exact, not approximate: every shard's fast set is a contiguous MRU
+//! PREFIX of its own list, so the oldest boundary across shards IS the globally
+//! least-recently-used fast object. It cannot deadlock, because a toucher
+//! releases its own shard before settling and no thread ever holds two shard
+//! locks. Concurrent settlers may each demote one extra object, which the
+//! 0.98/0.95 hysteresis absorbs.
+//!
+//! Migrations accumulate per shard and `drain_tier_migrations` concatenates
+//! them, so `PolicyWorker::apply_tier_migrations` performs the physical
 //! `Object::set_data` moves exactly as it does for every other hybrid stack.
 //!
 //! # Slot recycling
@@ -111,6 +132,26 @@
 //! its slot, and with the index chained there is no `u32` handed out to anyone
 //! -- `MergedRef` holds one only for as long as it holds the shard guard, which
 //! is exactly as long as the slot cannot be recycled.
+//!
+//! # Nothing under the shard lock is O(n)
+//!
+//! Two paths used to be, and both stalled the API THREAD, since in this design
+//! the API thread is what inserts:
+//!
+//!   * the slab was one `Vec<Slot>` per shard, so a growth `realloc`ed and
+//!     copied every live slot;
+//!   * `grow_buckets` doubled the index and re-threaded every chain by walking
+//!     the WHOLE recency list.
+//!
+//! The slab is now a `Vec` of fixed 4096-slot CHUNKS. Growth appends a chunk;
+//! nothing is copied, no slot ever moves, and a slot id is just
+//! `chunk << 12 | offset`. At 56 B a slot that is 224 KiB per chunk, so an
+//! empty 32-shard store costs ~7 MiB rather than the 112 MiB a 64K chunk would.
+//!
+//! The index grows by LINEAR HASHING: a `split` cursor and two masks, one
+//! bucket rehashed per insert past the load factor. The cost of a growth step
+//! is one bucket's chain -- mean length 1 -- instead of the entire list, so
+//! there is no stall to move off the API thread in the first place.
 
 use std::{
 	collections::HashMap,
@@ -156,29 +197,23 @@ const EMPTY_TAIL: u64 = u64::MAX;
 /// and the table doubles from there.
 const INITIAL_BUCKETS: usize = 16;
 
-/// The slab grows by this fraction of its current capacity instead of doubling.
+/// Slots per slab chunk, and the width of a slot id's offset field.
 ///
-/// `Vec` doubles, so its capacity always sits somewhere in [n, 2n) and averages
-/// well above n. Measured on the allocation harness it lands at **1.40x the
-/// live object count**, which at a 64-byte slot is 25.6 B/object of slab that
-/// is simply empty -- more than the entire bucket array costs.
+/// The slab is a `Vec` of these chunks, so growth APPENDS one and nothing is
+/// ever copied or reallocated -- the `Vec<Slot>` this replaced `realloc`ed
+/// under the shard lock, on the API thread, which is the stall the chunking
+/// exists to remove. A slot id is `chunk << SLAB_CHUNK_BITS | offset`, which
+/// for a linearly allocated slab is just the slot's ordinal.
 ///
-/// Growing by a quarter instead puts capacity in [n, 1.25n). The trade is more
-/// frequent reallocations, each of which copies the slab; at 25% steps that is
-/// ~3.1x as many growth events over the life of a shard as doubling, all of
-/// them during warm-up, and none once the working set is resident.
-///
-/// NOT a `reserve` sized from the cache budget. That was tried and removed: at
-/// a 4 GiB fast tier it reserved 4.19M slots, 16x what the 16.5 KB-object trace
-/// could hold there, and `construction_does_not_allocate_from_the_budget` pins
-/// that it must not come back. This changes only the GROWTH FACTOR, so the slab
-/// still tracks demand.
-const SLAB_GROWTH_NUMER: usize = 1;
-const SLAB_GROWTH_DENOM: usize = 4;
-
-/// Below this, grow in fixed steps -- a quarter of a tiny slab is a pointless
-/// number of reallocations.
-const SLAB_MIN_GROWTH: usize = 64;
+/// 4096 is picked from both ends. At 56 B a slot that is 224 KiB per chunk, so
+/// 32 shards start at ~7 MiB of committed slab -- a 64K-slot chunk would make
+/// an EMPTY store cost 112 MiB. And the worst-case waste is one partly-filled
+/// chunk per shard, 4095 slots, bounded and independent of how large the cache
+/// grows, where `Vec` doubling measured 1.40x the live count and 25% growth
+/// steps 1.10x -- both proportional, both unbounded.
+const SLAB_CHUNK_BITS: u32 = 12;
+const SLAB_CHUNK: usize = 1 << SLAB_CHUNK_BITS;
+const SLAB_OFFSET_MASK: usize = SLAB_CHUNK - 1;
 
 /// Live entries per bucket before the table doubles. 1.0, not hashbrown's 7/8:
 /// a chain degrades linearly with load where a probe sequence degrades sharply,
@@ -188,8 +223,9 @@ const MAX_LOAD_DENOM: usize = 1;
 
 struct Slot<K, V> {
 	/// `Option` so `take` can move the object out without disturbing the slab.
-	/// Free: `Object` holds an `Arc`, whose non-null niche absorbs the
-	/// discriminant, so `Option<Object>` is the same size as `Object`.
+	/// Free: the `NonNull` inside the object's `TieredValue` is the niche that
+	/// absorbs the discriminant, so `Option<Object>` is the same size as
+	/// `Object` -- 24 bytes. `object/mod.rs::layout` asserts it.
 	object: Option<Object<K, V>>,
 	/// The store is keyed by hash; `Object::key()` is the real key, which
 	/// `key_matches` needs to make collisions safe.
@@ -200,43 +236,194 @@ struct Slot<K, V> {
 	/// CacheLib's `hashHook_`. Threading the chain through the slot is what
 	/// lets the index cost 4 bytes a bucket instead of a whole hashbrown row.
 	hash_next: u32,
-	size: ObjectSize,
-	/// Access counter at the last relink, TRUNCATED to 32 bits. Double duty:
-	/// the update-interval check, and the cross-shard comparison that keeps
-	/// eviction picking the true LRU tail. Both are done on the wrapping
-	/// difference against the current clock, so truncation is exact as long as
-	/// no live slot goes un-relinked for 2^32 accesses -- four billion, against
-	/// a 306M-record trace.
-	last_access: u32,
-	/// Part of `size` that stays in DRAM whichever tier holds the object.
-	dram_resident: u8,
+	/// The store clock at the last relink, FULL WIDTH. Double duty: the
+	/// update-interval check, and the cross-shard comparison that keeps
+	/// eviction and the tier boundary picking the true LRU slot.
+	///
+	/// It was a truncated `u32` and compared as a wrapping difference, which
+	/// is exact only while no live slot goes un-relinked for 2^32 accesses.
+	/// That is four billion -- reachable by a long replay of a 306M-record
+	/// trace, and silently wrong when reached. At 64 bits, one relaxed
+	/// `fetch_add` per relink, a billion accesses a second would take 584
+	/// years to wrap, so the stamps are simply ordered and compared as such.
+	last_access: u64,
 	tier: Tier,
 }
 
+/// 24 object + 8 hashed + 4 prev + 4 next + 4 hash_next + 8 last_access +
+/// 1 tier = 53, padded to 56 by the object's 8-byte alignment.
+///
+/// The `<= 56` bound is the claim being made against the split design; the
+/// EXACT assert is what catches a field silently landing in the padding and
+/// then, later, pushing the slot over. `size` (u32) and `dram_resident` (u8)
+/// used to sit here and are gone: both are now derived from the object, which
+/// holds the value's length already -- see `Slot::migrating`.
 const _: () = assert!(
-	core::mem::size_of::<Slot<u64, std::sync::Arc<[u8]>>>() <= 64,
-	"Slot grew past 64 bytes -- the whole point is that it is smaller than a \
+	core::mem::size_of::<Slot<u64, std::sync::Arc<[u8]>>>() <= 56,
+	"Slot grew past 56 bytes -- the whole point is that it is smaller than a \
 	 DashMap row plus an eviction-stack row",
 );
 
+const _: () = assert!(
+	core::mem::size_of::<Slot<u64, std::sync::Arc<[u8]>>>() == 56,
+	"Slot is no longer exactly 56 bytes -- re-measure \
+	 MERGED_STORE_STRUCTURE_OVERHEAD before changing this number",
+);
+
 impl<K, V> Slot<K, V> {
+	/// A recycled or never-used slot. Linked nowhere, holding nothing.
+	fn empty() -> Self {
+		Slot {
+			object: None,
+			hashed: 0,
+			prev: NIL,
+			next: NIL,
+			hash_next: NIL,
+			last_access: 0,
+			tier: Tier::Fast,
+		}
+	}
+
 	/// Bytes that actually move between tiers. `Object::set_data` migrates the
 	/// value buffer alone, so the key, the expiry field and the `Expiries` row
 	/// stay in DRAM in either tier and must not be charged to a tier's budget.
+	///
+	/// DERIVED, not stored. It used to be `size - dram_resident`, two fields
+	/// filled in by the worker one event after the API thread inserted the
+	/// object -- so a freshly inserted object was accounted as ZERO bytes until
+	/// the worker caught up. The object carries its value's length, and
+	/// `size - dram_resident` was by construction `resident_value_bytes(len)`:
+	/// `base_size` is `key + value + expiry (+ ttl)` and `dram_resident_size`
+	/// is the same sum without the value. So this asks the allocator the same
+	/// question `base_size` asks, and the two cannot drift apart.
 	fn migrating(&self) -> CacheSize {
-		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+		match &self.object {
+			Some(object) => {
+				crate::object::overhead::resident_value_bytes(object.data_size()) as CacheSize
+			},
+
+			None => 0,
+		}
+	}
+}
+
+/// The chunked slab: a `Vec` of fixed-size chunks, indexed as one flat array.
+///
+/// `Index`/`IndexMut` on the slot id keep every call site reading like the
+/// `Vec<Slot>` this replaced, which is the point -- the change is where the
+/// memory comes from, not how slots are reached. Growth appends a chunk, so a
+/// slot's address is stable for as long as the slot lives and no `realloc`
+/// ever runs under the shard lock.
+struct Slab<K, V> {
+	chunks: Vec<Box<[Slot<K, V>; SLAB_CHUNK]>>,
+
+	/// Slot ids ever handed out. Ids are allocated linearly, so this is both
+	/// the next id and the high-water mark; recycled ids come off `Inner::free`
+	/// and never move it.
+	allocated: usize,
+}
+
+impl<K, V> Slab<K, V> {
+	fn new() -> Self {
+		Slab {
+			chunks: Vec::new(),
+			allocated: 0,
+		}
+	}
+
+	/// Slots handed out so far.
+	#[cfg(test)]
+	fn len(&self) -> usize {
+		self.allocated
+	}
+
+	/// Slots the committed chunks can hold. What `capacities()` reports as the
+	/// slab's cost, since a chunk is committed whole.
+	fn capacity(&self) -> usize {
+		self.chunks.len() * SLAB_CHUNK
+	}
+
+	/// Takes the next id, appending a chunk when the last one is full.
+	fn alloc(&mut self, fresh: Slot<K, V>) -> u32 {
+		if self.allocated == self.capacity() {
+			self.push_chunk();
+		}
+
+		let i = self.allocated as u32;
+		self.allocated += 1;
+		self[i as usize] = fresh;
+
+		i
+	}
+
+	/// Built through a `Vec` rather than as an array literal: a
+	/// `Box::new([Slot::empty(); N])` would materialise 224 KiB on the STACK
+	/// first and only then move it to the heap, which is a stack overflow
+	/// waiting for a thread with a small stack.
+	fn push_chunk(&mut self) {
+		let mut slots = Vec::with_capacity(SLAB_CHUNK);
+
+		for _ in 0..SLAB_CHUNK {
+			slots.push(Slot::empty());
+		}
+
+		let chunk: Box<[Slot<K, V>; SLAB_CHUNK]> = slots
+			.into_boxed_slice()
+			.try_into()
+			.unwrap_or_else(|_| unreachable!("built with exactly SLAB_CHUNK slots"));
+
+		self.chunks.push(chunk);
+	}
+
+	fn clear(&mut self) {
+		self.chunks.clear();
+		self.allocated = 0;
+	}
+}
+
+impl<K, V> std::ops::Index<usize> for Slab<K, V> {
+	type Output = Slot<K, V>;
+
+	#[inline]
+	fn index(&self, i: usize) -> &Slot<K, V> {
+		debug_assert!(i < self.allocated, "slot id {i} was never handed out");
+
+		&self.chunks[i >> SLAB_CHUNK_BITS][i & SLAB_OFFSET_MASK]
+	}
+}
+
+impl<K, V> std::ops::IndexMut<usize> for Slab<K, V> {
+	#[inline]
+	fn index_mut(&mut self, i: usize) -> &mut Slot<K, V> {
+		debug_assert!(i < self.allocated, "slot id {i} was never handed out");
+
+		&mut self.chunks[i >> SLAB_CHUNK_BITS][i & SLAB_OFFSET_MASK]
 	}
 }
 
 struct Inner<K, V> {
 	/// One slot id per bucket, `NIL` when empty; the rest of the chain is in
-	/// each slot's `hash_next`. Always a power of two so a bucket is a mask.
+	/// each slot's `hash_next`. `base + split` long -- NOT a power of two, see
+	/// `bucket_of`.
 	buckets: Vec<u32>,
+	/// The power of two the low mask is taken against. `buckets.len()` sits in
+	/// `[base, 2 * base)`.
+	base: usize,
+	/// The next bucket to split. Buckets below it have already been split this
+	/// round and so are addressed with the WIDE mask.
+	split: usize,
 	/// Live entries, which `buckets.len()` is grown to keep up with. Not
 	/// derivable from `slots.len()`, which counts recycled slots too.
 	live: usize,
-	slots: Vec<Slot<K, V>>,
+	slots: Slab<K, V>,
 	free: Vec<u32>,
+
+	/// Test-only: chain links walked. The linear-hashing claim -- an insert
+	/// walks its own bucket's chain plus, at most, the one bucket it splits --
+	/// is a cost claim, so it is asserted against a count rather than argued
+	/// from the code shape.
+	#[cfg(test)]
+	walk: AtomicUsize,
 
 	/// MRU end.
 	head: u32,
@@ -258,9 +445,14 @@ impl<K, V> Inner<K, V> {
 	fn new() -> Self {
 		Inner {
 			buckets: vec![NIL; INITIAL_BUCKETS],
+			base: INITIAL_BUCKETS,
+			split: 0,
 			live: 0,
-			slots: Vec::new(),
+			slots: Slab::new(),
 			free: Vec::new(),
+
+			#[cfg(test)]
+			walk: AtomicUsize::new(0),
 			head: NIL,
 			tail: NIL,
 			fast_boundary: NIL,
@@ -273,9 +465,20 @@ impl<K, V> Inner<K, V> {
 
 	/// The LOW bits pick the bucket; the shard already took the high ones, so
 	/// the two selections are independent and every bucket stays reachable.
+	///
+	/// Two masks, because the table grows one bucket at a time: buckets below
+	/// `split` have already been re-partitioned this round and answer to the
+	/// WIDE mask, the rest still answer to the narrow one. Litwin's linear
+	/// hashing, and the reason the table can be a length that is not a power
+	/// of two.
 	#[inline]
 	fn bucket_of(&self, key: HashedKey) -> usize {
-		(key as usize) & (self.buckets.len() - 1)
+		let b = (key as usize) & (self.base - 1);
+
+		match b < self.split {
+			true => (key as usize) & (self.base * 2 - 1),
+			false => b,
+		}
 	}
 
 	/// Walk one bucket chain. Mean length 1 at load factor 1.0.
@@ -284,6 +487,9 @@ impl<K, V> Inner<K, V> {
 		let mut i = self.buckets[self.bucket_of(key)];
 
 		while i != NIL {
+			#[cfg(test)]
+			self.walk.fetch_add(1, Ordering::Relaxed);
+
 			let slot = &self.slots[i as usize];
 
 			if slot.hashed == key {
@@ -296,8 +502,23 @@ impl<K, V> Inner<K, V> {
 		None
 	}
 
-	/// Push onto the front of the key's chain, and double the table if that
-	/// took it past the load factor.
+	/// Links on one bucket's chain, for the tests that bound what an insert is
+	/// allowed to walk.
+	#[cfg(test)]
+	fn chain_len(&self, b: usize) -> usize {
+		let mut i = self.buckets[b];
+		let mut n = 0;
+
+		while i != NIL {
+			n += 1;
+			i = self.slots[i as usize].hash_next;
+		}
+
+		n
+	}
+
+	/// Push onto the front of the key's chain, and split ONE bucket if that
+	/// took the table past the load factor.
 	///
 	/// Front insertion is deliberate: a freshly inserted key is the one most
 	/// likely to be looked up next, so it should be the first link walked.
@@ -309,7 +530,7 @@ impl<K, V> Inner<K, V> {
 		self.live += 1;
 
 		if self.live * MAX_LOAD_DENOM > self.buckets.len() * MAX_LOAD_NUMER {
-			self.grow_buckets();
+			self.split_one_bucket();
 		}
 	}
 
@@ -344,31 +565,69 @@ impl<K, V> Inner<K, V> {
 		None
 	}
 
-	/// Double the table and re-thread every chain.
+	/// Grow the table by ONE bucket, re-partitioning one chain.
 	///
-	/// Rehashing walks the RECENCY list rather than the old buckets, because
-	/// that list holds exactly the live slots -- `slots` also holds recycled
-	/// ones, and reading a recycled slot's stale `hashed` would resurrect a
-	/// dead key into a chain.
-	fn grow_buckets(&mut self) {
-		let n = self.buckets.len() * 2;
+	/// This replaces a `grow_buckets` that doubled the table and re-threaded
+	/// every chain by walking the whole recency list -- under the shard write
+	/// lock, on the API thread, so a shard holding a million objects stalled
+	/// every request to it for the length of a million-node pointer chase.
+	/// Here the work is one bucket's chain, mean length 1, and it is paid by
+	/// the insert that crossed the load factor.
+	///
+	/// Splitting bucket `split` under the wide mask sends each of its keys to
+	/// either `split` or `split + base` and nowhere else, which is the whole
+	/// trick: no other bucket's contents can be affected, so no other bucket
+	/// has to be visited. Once every bucket of the round has been split the
+	/// wide mask becomes the narrow one and the round starts again.
+	///
+	/// Recycled slots cannot be dragged in: only the chain is walked, and a
+	/// recycled slot is off every chain -- `bucket_unlink` takes it off before
+	/// it reaches the free list.
+	fn split_one_bucket(&mut self) {
+		let from = self.split;
+		let wide = self.base * 2 - 1;
 
-		self.buckets.clear();
-		self.buckets.resize(n, NIL);
+		// `push` rather than a resize: the table grows by one bucket, and the
+		// `Vec`'s own amortised doubling copies a flat array of `u32`s, which
+		// is a memcpy and not a walk of anything.
+		self.buckets.push(NIL);
 
-		let mut i = self.head;
+		let mut i = self.buckets[from];
+		let mut stay = NIL;
+		let mut moved = NIL;
 
 		while i != NIL {
+			#[cfg(test)]
+			self.walk.fetch_add(1, Ordering::Relaxed);
+
 			let (key, next) = {
 				let slot = &self.slots[i as usize];
-				(slot.hashed, slot.next)
+				(slot.hashed, slot.hash_next)
 			};
 
-			let b = (key as usize) & (n - 1);
-			self.slots[i as usize].hash_next = self.buckets[b];
-			self.buckets[b] = i;
+			match (key as usize) & wide == from {
+				true => {
+					self.slots[i as usize].hash_next = stay;
+					stay = i;
+				},
+
+				false => {
+					self.slots[i as usize].hash_next = moved;
+					moved = i;
+				},
+			}
 
 			i = next;
+		}
+
+		self.buckets[from] = stay;
+		self.buckets[from + self.base] = moved;
+
+		self.split += 1;
+
+		if self.split == self.base {
+			self.split = 0;
+			self.base *= 2;
 		}
 	}
 
@@ -457,8 +716,14 @@ impl<K, V> Inner<K, V> {
 
 	/// Move to the MRU end and make fast, promoting from slow if needed.
 	///
-	/// Faithful port of `LruCompactHybridStack::touch_fast_key`.
-	fn touch_slot(&mut self, i: u32, now: u64, budget: TierBudget) {
+	/// Faithful port of `LruCompactHybridStack::touch_fast_key`, minus the
+	/// settle: the tier boundary is now settled globally, with no shard lock
+	/// held, so the caller drops this shard's guard and then calls
+	/// `MergedStore::settle_tier`. A promotion that a tight budget immediately
+	/// undoes therefore reports BOTH transitions, in order, rather than
+	/// suppressing the first -- per-key order is preserved, so the consumer
+	/// applies promote-then-demote and lands on the same final placement.
+	fn touch_slot(&mut self, i: u32, now: u64) {
 		let previous_tier = self.slots[i as usize].tier;
 		let already_at_front = self.head == i;
 		let is_boundary = self.fast_boundary == i;
@@ -480,9 +745,7 @@ impl<K, V> Inner<K, V> {
 			}
 		}
 
-		self.slots[i as usize].last_access = now as u32;
-
-		let mut promoted = false;
+		self.slots[i as usize].last_access = now;
 
 		if previous_tier != Tier::Fast {
 			let migrating = self.slots[i as usize].migrating();
@@ -491,75 +754,81 @@ impl<K, V> Inner<K, V> {
 			self.fast_used += migrating;
 			self.fast_count += 1;
 			self.slots[i as usize].tier = Tier::Fast;
-			promoted = true;
 
 			if self.fast_boundary == NIL {
 				self.fast_boundary = i;
 			}
-		}
 
-		self.settle_fast_tier(budget);
-
-		// Pushed after settling and guarded on the slot still being fast: a
-		// tight budget can demote it straight back out within the same settle,
-		// in which case that call already pushed the correct final entry.
-		if promoted && self.slots[i as usize].tier == Tier::Fast {
 			let key = self.slots[i as usize].hashed;
 			self.migrations.push((key, Tier::Fast));
 		}
 	}
 
-	/// Demotes from the tier boundary until `fast_used` is back under the low
-	/// watermark. The victim is always `fast_boundary` -- the least-recently-
-	/// used fast slot -- so nothing is searched, and because the boundary only
-	/// walks along a list this never reorders anything.
-	fn settle_fast_tier(&mut self, budget: TierBudget) {
-		let effective = budget
-			.per_shard_capacity
-			.saturating_sub(self.live as CacheSize * budget.shared_overhead);
+	/// Demotes exactly ONE slot -- the boundary, the least-recently-used fast
+	/// slot in this shard -- and steps the boundary back off it.
+	///
+	/// Nothing is searched, and because the boundary only walks along a list
+	/// this never reorders anything. Returns the bytes that left the fast tier,
+	/// or `None` when the shard holds nothing fast.
+	///
+	/// One step per call, rather than a drain loop, because the loop now lives
+	/// in `MergedStore::settle_tier` and re-chooses the shard after every step:
+	/// the next victim is whichever shard's boundary is now oldest, which is
+	/// what makes the demotion order global rather than per shard.
+	fn demote_boundary(&mut self) -> Option<CacheSize> {
+		let d = self.fast_boundary;
 
-		if self.fast_used <= scale(effective, budget.high_ppm) {
-			return;
+		if d == NIL {
+			return None;
 		}
 
-		let drain_target = scale(effective, budget.low_ppm);
+		let (key, migrating, prev) = {
+			let s = &self.slots[d as usize];
+			(s.hashed, s.migrating(), s.prev)
+		};
 
-		while self.fast_used > drain_target {
-			let d = self.fast_boundary;
+		self.slots[d as usize].tier = Tier::Slow;
 
-			if d == NIL {
-				break;
-			}
+		self.fast_used = self.fast_used.saturating_sub(migrating);
+		self.fast_count = self.fast_count.saturating_sub(1);
+		self.slow_used += migrating;
+		self.fast_boundary = prev;
 
-			let (key, migrating, prev) = {
-				let s = &self.slots[d as usize];
-				(s.hashed, s.migrating(), s.prev)
-			};
+		self.migrations.push((key, Tier::Slow));
 
-			self.slots[d as usize].tier = Tier::Slow;
-
-			self.fast_used = self.fast_used.saturating_sub(migrating);
-			self.fast_count = self.fast_count.saturating_sub(1);
-			self.slow_used += migrating;
-			self.fast_boundary = prev;
-
-			self.migrations.push((key, Tier::Slow));
-		}
+		Some(migrating)
 	}
 
 	fn tail_seq(&self) -> u64 {
 		match self.tail {
 			NIL => EMPTY_TAIL,
-			t => self.slots[t as usize].last_access as u64,
+			t => self.slots[t as usize].last_access,
+		}
+	}
+
+	/// The stamp of the least-recently-used FAST slot, for the second mirror.
+	/// `EMPTY_TAIL` when the shard holds nothing fast, which reads as "never a
+	/// candidate" in the settle loop's minimum.
+	fn fast_tail_seq(&self) -> u64 {
+		match self.fast_boundary {
+			NIL => EMPTY_TAIL,
+			b => self.slots[b as usize].last_access,
 		}
 	}
 }
 
-/// The tiering configuration a shard needs to settle itself, resolved once by
-/// the caller so no shard has to touch the store's atomics under its lock.
+/// The tiering configuration the settle loop needs, resolved once so the loop
+/// reads the store's atomics once rather than per demotion.
+///
+/// `per_shard_capacity` is GONE. It was `fast_capacity / SHARDS`, and settling
+/// each shard against its own share is precisely what made the demotion order
+/// per-shard rather than global: a shard whose recent objects are large demoted
+/// objects more recent than fast objects idling in another shard, and the fast
+/// tier went under-used whenever recency skewed across shards. The capacity is
+/// now the whole store's, checked against one `fast_used` total.
 #[derive(Clone, Copy)]
 struct TierBudget {
-	per_shard_capacity: CacheSize,
+	capacity: CacheSize,
 	shared_overhead: CacheSize,
 	high_ppm: u64,
 	low_ppm: u64,
@@ -582,8 +851,22 @@ pub struct MergedStore<K, V> {
 	/// lock so an eviction victim can be chosen with atomic loads alone.
 	tails: Box<[TailSeq]>,
 
+	/// The same trick for the TIER boundary: each shard mirrors the stamp of
+	/// its `fast_boundary` slot, so the globally least-recently-used FAST
+	/// object is found with `SHARDS` relaxed loads and no lock at all.
+	///
+	/// Exact, not approximate: a shard's fast set is a contiguous MRU prefix
+	/// of its own list, so the oldest boundary across shards is the global LRU
+	/// fast object.
+	fast_tails: Box<[TailSeq]>,
+
 	clock: AtomicU64,
 	tracked: AtomicUsize,
+
+	/// `sum(shard.fast_used)`, maintained by every locked section that changes
+	/// one, so the settle loop can test the budget without taking a lock.
+	/// `fast_used_matches_the_shards` pins the two together.
+	fast_used: AtomicU64,
 
 	/// Non-zero when at least one shard has migrations waiting, so the worker's
 	/// per-pass drain costs one atomic load instead of `SHARDS` lock
@@ -594,7 +877,7 @@ pub struct MergedStore<K, V> {
 	/// every time, which is exact LRU. memcached's equivalent is 60 seconds.
 	update_interval: u64,
 
-	/// Fast-tier byte budget across ALL shards; each settles against its share.
+	/// Fast-tier byte budget across ALL shards, settled against globally.
 	fast_capacity: AtomicU64,
 	shared_overhead: AtomicU64,
 	high_ppm: AtomicU64,
@@ -613,11 +896,18 @@ impl<K, V> Default for MergedStore<K, V> {
 			.collect::<Vec<_>>()
 			.into_boxed_slice();
 
+		let fast_tails = (0..SHARDS)
+			.map(|_| TailSeq(AtomicU64::new(EMPTY_TAIL)))
+			.collect::<Vec<_>>()
+			.into_boxed_slice();
+
 		MergedStore {
 			shards,
 			tails,
+			fast_tails,
 			clock: AtomicU64::new(0),
 			tracked: AtomicUsize::new(0),
+			fast_used: AtomicU64::new(0),
 			pending_migrations: AtomicUsize::new(0),
 			update_interval: std::env::var("MERGED_UPDATE_INTERVAL")
 				.ok()
@@ -625,8 +915,8 @@ impl<K, V> Default for MergedStore<K, V> {
 				.unwrap_or(0),
 
 			// Untiered until the worker configures it: nothing can ever exceed
-			// this, so `settle_fast_tier` returns at its first comparison and a
-			// flat build pays no tiering cost at all.
+			// this, so `settle_tier` returns at its first comparison -- one
+			// relaxed load -- and a flat build pays no tiering cost at all.
 			fast_capacity: AtomicU64::new(CacheSize::MAX),
 			shared_overhead: AtomicU64::new(0),
 			high_ppm: AtomicU64::new(DEFAULT_HIGH_PPM),
@@ -664,10 +954,7 @@ impl<K, V> MergedStore<K, V> {
 
 	fn budget(&self) -> TierBudget {
 		TierBudget {
-			// Saturating rather than wrapping at `CacheSize::MAX`, which is the
-			// untiered sentinel: MAX / SHARDS is still far past anything a
-			// shard can hold, so the settle still short-circuits.
-			per_shard_capacity: self.fast_capacity.load(Ordering::Relaxed) / SHARDS as CacheSize,
+			capacity: self.fast_capacity.load(Ordering::Relaxed),
 			shared_overhead: self.shared_overhead.load(Ordering::Relaxed),
 			high_ppm: self.high_ppm.load(Ordering::Relaxed),
 			low_ppm: self.low_ppm.load(Ordering::Relaxed),
@@ -680,21 +967,130 @@ impl<K, V> MergedStore<K, V> {
 	}
 
 	#[inline]
+	fn publish_fast_tail(&self, shard: usize, inner: &Inner<K, V>) {
+		self.fast_tails[shard].0.store(inner.fast_tail_seq(), Ordering::Relaxed);
+	}
+
+	/// Both mirrors at once. Every locked section that can move a shard's tail
+	/// or its tier boundary ends with this, so the two lock-free choices --
+	/// which key to evict and which shard to demote from -- are always reading
+	/// the shard's real state.
+	#[inline]
+	fn publish_mirrors(&self, shard: usize, inner: &Inner<K, V>) {
+		self.publish_tail(shard, inner);
+		self.publish_fast_tail(shard, inner);
+	}
+
+	#[inline]
 	fn note_migrations(&self, inner: &Inner<K, V>) {
 		if !inner.migrations.is_empty() {
 			self.pending_migrations.store(1, Ordering::Relaxed);
 		}
 	}
 
-	fn settle_all(&self) {
+	/// Applies a shard's change in `fast_used` to the store-level total.
+	///
+	/// Taken as a before/after pair rather than as a delta computed by each
+	/// call site: the shard's own counter is the authority, so the total
+	/// cannot drift from it by anyone forgetting which way a particular
+	/// operation moved the bytes.
+	#[inline]
+	fn apply_fast_delta(&self, before: CacheSize, after: CacheSize) {
+		match after.cmp(&before) {
+			std::cmp::Ordering::Greater => {
+				self.fast_used.fetch_add(after - before, Ordering::Relaxed);
+			},
+
+			std::cmp::Ordering::Less => {
+				// Saturating: a concurrent settler may have subtracted the same
+				// bytes a moment earlier, and an underflow here would wrap to
+				// `u64::MAX` and demote the entire fast tier.
+				let _ = self.fast_used.fetch_update(
+					Ordering::Relaxed,
+					Ordering::Relaxed,
+					|v| Some(v.saturating_sub(before - after)),
+				);
+			},
+
+			std::cmp::Ordering::Equal => {},
+		}
+	}
+
+	/// The shard whose fast boundary is oldest -- the globally least-recently-
+	/// used fast object -- from `SHARDS` relaxed loads and no lock.
+	fn oldest_fast_shard(&self) -> Option<usize> {
+		let mut best = None;
+		let mut best_seq = EMPTY_TAIL;
+
+		for (s, t) in self.fast_tails.iter().enumerate() {
+			let seq = t.0.load(Ordering::Relaxed);
+
+			if seq == EMPTY_TAIL {
+				continue;
+			}
+
+			// A plain minimum: the clock is 64 bits and never wraps, so an
+			// older slot's stamp is simply the smaller number.
+			if best.is_none() || seq < best_seq {
+				best_seq = seq;
+				best = Some(s);
+			}
+		}
+
+		best
+	}
+
+	/// Demote, globally, until the fast tier is back under the low watermark.
+	///
+	/// Runs with NO shard lock held. Each step is: 32 relaxed loads to name the
+	/// shard holding the oldest fast object, that ONE shard's write lock, one
+	/// boundary step, republish, unlock. So no thread ever holds two shard
+	/// locks and no lock-order cycle can form -- a toucher releases its own
+	/// shard before calling this.
+	///
+	/// Two settlers running at once may each demote one extra object, which is
+	/// what the 0.98/0.95 hysteresis is for. The cost is paid by the API thread
+	/// that caused the overshoot.
+	fn settle_tier(&self) {
 		let budget = self.budget();
 
-		for (s, lock) in self.shards.iter().enumerate() {
-			let mut g = lock.write().unwrap();
-			g.settle_fast_tier(budget);
-			self.note_migrations(&g);
-			self.publish_tail(s, &g);
+		// The reservation is per LIVE object and applies across both tiers, so
+		// it comes off the budget before the watermarks are taken.
+		let effective = budget
+			.capacity
+			.saturating_sub(self.len() as CacheSize * budget.shared_overhead);
+
+		if self.fast_used.load(Ordering::Relaxed) <= scale(effective, budget.high_ppm) {
+			return;
 		}
+
+		let target = scale(effective, budget.low_ppm);
+
+		while self.fast_used.load(Ordering::Relaxed) > target {
+			let Some(s) = self.oldest_fast_shard() else {
+				// Nothing anywhere is fast. Whatever is left over the target is
+				// the shared-overhead reservation, not value bytes.
+				break;
+			};
+
+			let mut g = self.shards[s].write().unwrap();
+			let before = g.fast_used;
+
+			// `None` when that shard's boundary went away between the load and
+			// the lock -- another settler took it. Republish and re-choose.
+			g.demote_boundary();
+
+			self.apply_fast_delta(before, g.fast_used);
+			self.note_migrations(&g);
+			self.publish_fast_tail(s, &g);
+		}
+	}
+
+	/// The worker's per-pass settle, and what `configure_tiering` and
+	/// `resize_fast_tier` call. The SAME loop as an API thread's -- there is
+	/// only one, so there is only one demotion order.
+	fn settle_all(&self) {
+		self.settle_tier();
 	}
 
 	/// Move `key` to the MRU end and make it fast.
@@ -715,70 +1111,59 @@ impl<K, V> MergedStore<K, V> {
 
 			let Some(i) = g.find(key) else { return };
 
-			// Wrapping, because `last_access` is the clock truncated to 32
-			// bits: the difference is what matters and it is exact until a slot
-			// goes 2^32 accesses without a relink.
-			let age = (now as u32).wrapping_sub(g.slots[i as usize].last_access) as u64;
+			// A plain subtraction: the clock is 64 bits and monotonic, so the
+			// stamp can only be at or behind it.
+			let age = now.saturating_sub(g.slots[i as usize].last_access);
 
 			if age < self.update_interval {
 				return;
 			}
 		}
 
-		let budget = self.budget();
-		let mut g = self.shards[s].write().unwrap();
-
-		let Some(i) = g.find(key) else { return };
-
-		g.touch_slot(i, now, budget);
-		self.note_migrations(&g);
-		self.publish_tail(s, &g);
-	}
-
-	/// Records `key`'s size and tier-migrating remainder, admitting it to the
-	/// fast tier and settling the shard.
-	///
-	/// The object is already in the map by the time this runs -- the API thread
-	/// inserted it and the worker is now processing the `Set` event -- so this
-	/// fills in the accounting the map insert had no size to do. A key evicted
-	/// in between is simply absent, and is skipped.
-	pub fn record_size(&self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		// Saturating, matching `narrow_resident`: any excess is then treated as
-		// migrating, which is the behaviour before this accounting existed, so
-		// it degrades toward the old over-charge instead of going wrong in a
-		// new way.
-		let dram_resident = dram_resident.min(u8::MAX as ObjectSize) as u8;
-
-		let now = self.clock.fetch_add(1, Ordering::Relaxed);
-		let budget = self.budget();
-		let s = shard_of(key);
-		let mut g = self.shards[s].write().unwrap();
-
-		let Some(i) = g.find(key) else { return };
-
-		// Re-size first so the tier accounting below moves the right number of
-		// bytes, exactly as `LruCompactHybridStack::resize_key` does.
 		{
-			let old_migrating = g.slots[i as usize].migrating();
+			let mut g = self.shards[s].write().unwrap();
 
-			let (tier, new_migrating) = {
-				let slot = &mut g.slots[i as usize];
-				slot.size = size;
-				slot.dram_resident = dram_resident;
-				(slot.tier, slot.migrating())
-			};
+			let Some(i) = g.find(key) else { return };
 
-			let delta = new_migrating as i64 - old_migrating as i64;
+			let before = g.fast_used;
 
-			match tier {
-				Tier::Fast => g.fast_used = (g.fast_used as i64 + delta).max(0) as CacheSize,
-				Tier::Slow => g.slow_used = (g.slow_used as i64 + delta).max(0) as CacheSize,
-			}
+			g.touch_slot(i, now);
+
+			self.apply_fast_delta(before, g.fast_used);
+			self.note_migrations(&g);
+			self.publish_mirrors(s, &g);
 		}
 
-		g.touch_slot(i, now, budget);
-		self.note_migrations(&g);
-		self.publish_tail(s, &g);
+		// AFTER the guard is dropped -- see `settle_tier`. Holding it here
+		// would let the settle take a second shard lock while holding this one.
+		self.settle_tier();
+	}
+
+	/// The worker has finished processing the `Set` event for `key`: settle the
+	/// tier against the bytes the insert already accounted.
+	///
+	/// This used to do three more things, and each was wrong once the slot
+	/// stopped storing a size:
+	///
+	///   * it wrote `size` and `dram_resident` into the slot. Both are gone --
+	///     `Slot::migrating` derives them from the object, which has held the
+	///     value's length since the value became one word, so the bytes are
+	///     accounted by `insert` at the moment they become reachable rather
+	///     than one worker event later;
+	///   * it RELINKED the slot to the MRU end, which `insert` had already
+	///     done a moment earlier. Two relinks per set, the second of them
+	///     redundant, both taking the shard write lock;
+	///   * it bumped the clock a SECOND time, so one set consumed two stamps
+	///     and a set looked, to the recency order, more recent than a get of
+	///     the same age.
+	///
+	/// The parameters stay to match `PolicyStack::insert_resident`, whose other
+	/// implementations do keep a size of their own. A key evicted between the
+	/// insert and this call is simply gone, and settling is still correct.
+	pub fn record_size(&self, key: HashedKey, _size: ObjectSize, _dram_resident: ObjectSize) {
+		let _ = key;
+
+		self.settle_tier();
 	}
 
 	/// The globally least-recently-used key: the minimum over the shard tails.
@@ -787,12 +1172,12 @@ impl<K, V> MergedStore<K, V> {
 	/// within itself, so the global LRU object is necessarily some shard's
 	/// tail, and the oldest of those tails is it.
 	pub fn tail_key(&self) -> Option<HashedKey> {
-		// Compared as AGE against the current clock rather than as a raw
-		// counter, because `last_access` is truncated to 32 bits and raw values
-		// stop being ordered once the clock wraps. The difference stays exact.
-		let now = self.clock.load(Ordering::Relaxed) as u32;
-
-		let mut best_age = 0u32;
+		// A plain minimum over the stamps. This was a wrapping-difference AGE
+		// comparison because `last_access` was the clock truncated to 32 bits,
+		// where raw values stop being ordered once the clock wraps; at 64 bits
+		// the clock does not wrap, so the older stamp is simply the smaller
+		// number and the comparison is exact by construction.
+		let mut best_seq = EMPTY_TAIL;
 		let mut best_shard = usize::MAX;
 
 		for (s, t) in self.tails.iter().enumerate() {
@@ -802,10 +1187,8 @@ impl<K, V> MergedStore<K, V> {
 				continue;
 			}
 
-			let age = now.wrapping_sub(raw as u32);
-
-			if best_shard == usize::MAX || age > best_age {
-				best_age = age;
+			if best_shard == usize::MAX || raw < best_seq {
+				best_seq = raw;
 				best_shard = s;
 			}
 		}
@@ -842,6 +1225,7 @@ impl<K, V> MergedStore<K, V> {
 		let s = shard_of(*key);
 		let mut g = self.shards[s].write().unwrap();
 		let i = g.bucket_unlink(*key)?;
+		let before = g.fast_used;
 
 		g.detach_tier(i);
 		g.unlink(i);
@@ -851,7 +1235,9 @@ impl<K, V> MergedStore<K, V> {
 		// via `Object::drop`.
 		let taken = g.slots[i as usize].object.take();
 		g.free.push(i);
-		self.publish_tail(s, &g);
+
+		self.apply_fast_delta(before, g.fast_used);
+		self.publish_mirrors(s, &g);
 		self.tracked.fetch_sub(1, Ordering::Relaxed);
 
 		taken
@@ -863,8 +1249,12 @@ impl<K, V> MergedStore<K, V> {
 
 		let Some(i) = g.bucket_unlink(key) else { return false };
 
+		let before = g.fast_used;
+
 		g.retire(i);
-		self.publish_tail(s, &g);
+
+		self.apply_fast_delta(before, g.fast_used);
+		self.publish_mirrors(s, &g);
 		self.tracked.fetch_sub(1, Ordering::Relaxed);
 
 		true
@@ -891,75 +1281,91 @@ impl<K, V> MergedStore<K, V> {
 	/// `admission_latched` is false for this store.
 	pub fn insert(&self, key: HashedKey, object: Object<K, V>) -> Option<Object<K, V>> {
 		let now = self.clock.fetch_add(1, Ordering::Relaxed);
-		let budget = self.budget();
 		let s = shard_of(key);
-		let mut g = self.shards[s].write().unwrap();
 
-		if let Some(i) = g.find(key) {
-			let old = g.slots[i as usize].object.replace(object);
+		let old = {
+			let mut g = self.shards[s].write().unwrap();
+			let before = g.fast_used;
 
-			g.touch_slot(i, now, budget);
+			let old = match g.find(key) {
+				Some(i) => {
+					// An overwrite can change the value's length, so the tier
+					// accounting moves by the DIFFERENCE, charged to whichever
+					// tier the slot is in at this instant. `touch_slot` then
+					// moves the new figure to the fast tier if it was slow.
+					let was = g.slots[i as usize].migrating();
+					let old = g.slots[i as usize].object.replace(object);
+					let now_bytes = g.slots[i as usize].migrating();
+
+					match g.slots[i as usize].tier {
+						Tier::Fast => {
+							g.fast_used = (g.fast_used + now_bytes).saturating_sub(was)
+						},
+
+						Tier::Slow => {
+							g.slow_used = (g.slow_used + now_bytes).saturating_sub(was)
+						},
+					}
+
+					g.touch_slot(i, now);
+
+					old
+				},
+
+				None => {
+					let fresh = Slot {
+						object: Some(object),
+						hashed: key,
+						prev: NIL,
+						next: NIL,
+						hash_next: NIL,
+						last_access: now,
+						tier: Tier::Fast,
+					};
+
+					let i = match g.free.pop() {
+						Some(i) => {
+							g.slots[i as usize] = fresh;
+							i
+						},
+
+						// Appends a chunk when the last one is full. Nothing is
+						// copied and no slot moves, so this cannot stall the
+						// shard the way the old `reserve_exact` growth did.
+						None => g.slots.alloc(fresh),
+					};
+
+					g.link_front(i);
+					g.bucket_link(i);
+					g.fast_count += 1;
+
+					// The bytes are accounted HERE, not one worker event later:
+					// the object carries its own length, so admitting it to the
+					// fast tier and charging it are the same moment.
+					g.fast_used += g.slots[i as usize].migrating();
+
+					if g.fast_boundary == NIL {
+						g.fast_boundary = i;
+					}
+
+					self.tracked.fetch_add(1, Ordering::Relaxed);
+
+					None
+				},
+			};
+
+			self.apply_fast_delta(before, g.fast_used);
 			self.note_migrations(&g);
-			self.publish_tail(s, &g);
+			self.publish_mirrors(s, &g);
 
-			return old;
-		}
-
-		let fresh = Slot {
-			object: Some(object),
-			hashed: key,
-			prev: NIL,
-			next: NIL,
-			hash_next: NIL,
-			size: 0,
-			last_access: now as u32,
-			dram_resident: 0,
-			tier: Tier::Fast,
+			old
 		};
 
-		let i = match g.free.pop() {
-			Some(i) => {
-				g.slots[i as usize] = fresh;
-				i
-			},
+		// Outside the guard: the settle takes one shard lock at a time and
+		// this thread must not be holding another one.
+		self.settle_tier();
 
-			None => {
-				// Reserve explicitly before pushing, so `Vec`'s doubling never
-				// gets a chance to run. `reserve_exact` asks for precisely this
-				// much rather than rounding up to a growth curve of its own.
-				if g.slots.len() == g.slots.capacity() {
-					let step = (g.slots.capacity() * SLAB_GROWTH_NUMER / SLAB_GROWTH_DENOM)
-						.max(SLAB_MIN_GROWTH);
-
-					g.slots.reserve_exact(step);
-				}
-
-				g.slots.push(fresh);
-				(g.slots.len() - 1) as u32
-			},
-		};
-
-		g.link_front(i);
-
-		// AFTER `link_front`: `bucket_link` can trigger a grow, and a grow
-		// rehashes by walking the recency list, so the slot has to be on it.
-		g.bucket_link(i);
-		g.fast_count += 1;
-
-		if g.fast_boundary == NIL {
-			g.fast_boundary = i;
-		}
-
-		// Size is still 0 here -- the worker fills it in via `record_size` when
-		// it processes the `Set` event -- so this settle can only demote on
-		// bytes already accounted, never on this insert's own.
-		g.settle_fast_tier(budget);
-
-		self.note_migrations(&g);
-		self.publish_tail(s, &g);
-		self.tracked.fetch_add(1, Ordering::Relaxed);
-
-		None
+		old
 	}
 
 	pub fn clear(&self) {
@@ -968,6 +1374,8 @@ impl<K, V> MergedStore<K, V> {
 
 			g.buckets.clear();
 			g.buckets.resize(INITIAL_BUCKETS, NIL);
+			g.base = INITIAL_BUCKETS;
+			g.split = 0;
 			g.live = 0;
 			g.slots.clear();
 			g.free.clear();
@@ -979,7 +1387,7 @@ impl<K, V> MergedStore<K, V> {
 			g.fast_count = 0;
 			g.migrations.clear();
 
-			self.publish_tail(s, &g);
+			self.publish_mirrors(s, &g);
 		}
 
 		// Every slot vector dropped above retired its objects' values into this
@@ -991,6 +1399,7 @@ impl<K, V> MergedStore<K, V> {
 
 		self.tracked.store(0, Ordering::Relaxed);
 		self.pending_migrations.store(0, Ordering::Relaxed);
+		self.fast_used.store(0, Ordering::Relaxed);
 	}
 
 	pub fn len(&self) -> usize {
@@ -1032,8 +1441,11 @@ impl<K, V> MergedStore<K, V> {
 		self.len() as CacheSize * self.shared_overhead.load(Ordering::Relaxed)
 	}
 
+	/// The store-level total the settle loop tests, rather than a sum over the
+	/// shards: the two are the same number -- `fast_used_matches_the_shards`
+	/// asserts it -- and this one costs a relaxed load instead of 32 locks.
 	pub fn fast_bytes_used(&self) -> CacheSize {
-		self.sum_shards(|g| g.fast_used)
+		self.fast_used.load(Ordering::Relaxed)
 	}
 
 	pub fn slow_bytes_used(&self) -> CacheSize {
@@ -1062,14 +1474,21 @@ impl<K, V> MergedStore<K, V> {
 	/// attributing a measured allocation to the three things that hold it.
 	///
 	/// Sharding makes this worth reporting rather than deriving: 32 slabs and
-	/// 32 hashmaps each round up to their own size class independently, so the
-	/// slack is real and is not visible from the object count alone.
+	/// 32 bucket arrays each round up to their own size class independently, so
+	/// the slack is real and is not visible from the object count alone.
+	///
+	/// The slab figure is chunks x `SLAB_CHUNK` -- a chunk is committed whole,
+	/// so that is what it costs. The index figure is the bucket `Vec`'s
+	/// CAPACITY, not its length: linear hashing pushes one bucket at a time, so
+	/// the `Vec`'s own doubling leaves it holding between 1x and 2x the buckets
+	/// in use, and that spare is allocated memory like any other. Measuring at
+	/// powers of two samples the 1x end of that range.
 	pub fn capacities(&self) -> (usize, usize, usize) {
 		self.shards
 			.iter()
 			.map(|lock| {
 				let g = lock.read().unwrap();
-				(g.slots.capacity(), g.buckets.len(), g.free.capacity())
+				(g.slots.capacity(), g.buckets.capacity(), g.free.capacity())
 			})
 			.fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
 	}
@@ -1145,9 +1564,19 @@ mod tests {
 		s
 	}
 
+	/// The value is `size` bytes of real allocation, because the tier
+	/// accounting is now DERIVED from the object rather than reported
+	/// separately -- an object built with an empty value migrates zero bytes
+	/// whatever `record_size` is told.
 	fn put(s: &Store, key: HashedKey, size: ObjectSize) {
-		s.insert(key, Object::new(key, &[], None));
+		s.insert(key, Object::new(key, &vec![0u8; size as usize], None));
 		s.record_size(key, size, 0);
+	}
+
+	/// What a slot of `size` bytes of value contributes to a tier, as the store
+	/// counts it: the allocator's rounded figure, not the request.
+	fn migrating_bytes(size: ObjectSize) -> CacheSize {
+		crate::object::overhead::resident_value_bytes(size) as CacheSize
 	}
 
 	/// Sum of what every live slot claims to be migrating, walked directly.
@@ -1293,18 +1722,55 @@ mod tests {
 			"tier object counts do not add up to the tracked total",
 		);
 
-		// Each shard settles against its own share, so the bound is per shard
-		// and the global one follows by summing.
-		for lock in s.shards.iter() {
-			let g = lock.read().unwrap();
+		// The budget is GLOBAL -- there is no per-shard share to overrun -- so
+		// the bound is on the store's total.
+		let capacity = per_shard * SHARDS as CacheSize;
 
-			assert!(
-				g.fast_used <= scale(per_shard, DEFAULT_HIGH_PPM),
-				"a shard overran its fast budget: {} > {}",
-				g.fast_used,
-				scale(per_shard, DEFAULT_HIGH_PPM),
-			);
+		assert!(
+			s.fast_bytes_used() <= scale(capacity, DEFAULT_HIGH_PPM),
+			"the store overran its fast budget: {} > {}",
+			s.fast_bytes_used(),
+			scale(capacity, DEFAULT_HIGH_PPM),
+		);
+	}
+
+	/// The store-level `fast_used` is what the settle loop tests without a
+	/// lock, so it has to be the sum of what the shards actually hold. Every
+	/// locked section that moves a shard's counter reports the difference; this
+	/// is what catches one that forgets.
+	#[test]
+	fn fast_used_matches_the_shards() {
+		let s = tiered(4_096 * SHARDS as CacheSize);
+
+		for i in 1..=3_000u64 {
+			put(&s, mix(i), 256);
+
+			if i % 6 == 0 {
+				s.touch(mix(i / 6));
+			}
+
+			if i % 11 == 0 {
+				s.remove_key(mix(i / 11));
+			}
+
+			if i % 17 == 0 {
+				// An overwrite with a DIFFERENT length, which is the case the
+				// delta accounting in `insert` exists for.
+				put(&s, mix(i / 17), 1_024);
+			}
+
+			if i % 29 == 0 {
+				s.take(&mix(i / 29));
+			}
 		}
+
+		let summed: CacheSize = s.sum_shards(|g| g.fast_used);
+
+		assert_eq!(
+			s.fast_bytes_used(),
+			summed,
+			"the store-level fast_used has drifted from the shards it mirrors",
+		);
 	}
 
 	/// The fast region must stay a PREFIX of the list: head..=fast_boundary
@@ -1431,13 +1897,16 @@ mod tests {
 		assert_eq!(exact.tail_key(), Some(cold), "exact mode must relink");
 	}
 
-	/// The slab must not overshoot the way `Vec` doubling does.
+	/// The slab's waste is ONE PARTLY-FILLED CHUNK per shard, and no more --
+	/// bounded, rather than proportional to the cache like the 1.40x `Vec`
+	/// doubling gave and the 1.10x a 25% growth factor gave.
 	///
-	/// This is the 25.6 B/object of empty slab measured on the allocation
-	/// harness, and it is the largest single remaining item in the merged
-	/// store's per-object cost -- larger than the whole bucket array.
+	/// This was `the_slab_does_not_double`, which asserted a RATIO. A ratio is
+	/// the wrong shape for a chunked slab: it is dominated by the fixed 4095
+	/// slots per shard, so it is loose at 200k objects and vanishes at 20M,
+	/// while the real guarantee -- bounded absolute slack -- holds at both.
 	#[test]
-	fn the_slab_does_not_double() {
+	fn the_slab_wastes_at_most_one_chunk_per_shard() {
 		let s = tiered(CacheSize::MAX);
 
 		for i in 1..=200_000u64 {
@@ -1446,13 +1915,126 @@ mod tests {
 
 		let (slab_cap, _, _) = s.capacities();
 		let live = s.len();
-		let ratio = slab_cap as f64 / live as f64;
+		let bound = live + SHARDS * SLAB_CHUNK;
 
 		assert!(
-			ratio < 1.30,
-			"slab capacity is {ratio:.3}x the live count ({slab_cap} for {live}); \
-			 doubling gives ~1.40x and the growth factor is meant to hold it \
-			 under 1.25 plus the per-shard rounding",
+			slab_cap <= bound,
+			"slab capacity {slab_cap} exceeds live {live} by more than one \
+			 chunk per shard ({bound})",
+		);
+
+		// And every chunk is really committed whole, so the figure the
+		// measurement harness reports is chunks x SLAB_CHUNK exactly.
+		for lock in s.shards.iter() {
+			let g = lock.read().unwrap();
+
+			assert_eq!(g.slots.capacity() % SLAB_CHUNK, 0, "a chunk was part-committed");
+			assert!(
+				g.slots.len() <= g.slots.capacity(),
+				"more slots handed out than the chunks hold",
+			);
+		}
+	}
+
+	/// Growth must never move a slot: a chunk is boxed, so its address is fixed
+	/// for as long as it lives, and appending more chunks cannot disturb it.
+	/// The `Vec<Slot>` this replaced `realloc`ed -- under the shard write lock,
+	/// on the API thread -- which is the stall being removed.
+	#[test]
+	fn appending_a_chunk_moves_no_slot() {
+		let s = tiered(CacheSize::MAX);
+
+		// Keys with a zero top five bits all land in shard 0, so one chunk
+		// boundary is crossed after 4096 inserts rather than after 4096 x 32.
+		let one_shard = |i: u64| mix(i) >> SHARD_BITS;
+		let first = one_shard(1);
+
+		put(&s, first, 64);
+		assert_eq!(shard_of(first), 0);
+
+		let address = {
+			let g = s.shards[0].read().unwrap();
+			let i = g.find(first).expect("just inserted");
+			&g.slots[i as usize] as *const Slot<u64, crate::BufferDRAM> as usize
+		};
+
+		for i in 2..=(SLAB_CHUNK as u64 * 2 + 8) {
+			put(&s, one_shard(i), 8);
+		}
+
+		let g = s.shards[0].read().unwrap();
+
+		assert!(g.slots.capacity() >= SLAB_CHUNK * 2, "the shard never grew");
+
+		let i = g.find(first).expect("still present");
+
+		assert_eq!(
+			&g.slots[i as usize] as *const Slot<u64, crate::BufferDRAM> as usize,
+			address,
+			"a slot moved when the slab grew",
+		);
+	}
+
+	/// The cost claim linear hashing is here to make: an insert walks its OWN
+	/// bucket's chain, plus -- when it crosses the load factor -- the one
+	/// bucket it splits. Nothing else. The `grow_buckets` this replaced walked
+	/// the whole recency list under the shard write lock, so a shard holding
+	/// half a million keys stalled every request to it for half a million
+	/// pointer chases.
+	#[test]
+	fn an_insert_walks_one_chain_plus_the_split_bucket() {
+		let s = tiered(CacheSize::MAX);
+
+		let mut splits = 0usize;
+		let mut worst = 0usize;
+
+		// `insert` alone, not `put`: `record_size` no longer looks the key up,
+		// but keeping the measurement to the one call makes what is counted
+		// unambiguous.
+		for i in 1..=20_000u64 {
+			let key = mix(i);
+			let sh = shard_of(key);
+
+			// The two chains this insert is ALLOWED to walk, measured before it
+			// runs: its own bucket, and whichever bucket is next to split.
+			let (allowed, before, buckets_before) = {
+				let g = s.shards[sh].read().unwrap();
+				let bucket = g.bucket_of(key);
+				let own = g.chain_len(bucket);
+
+				// The bucket a split would take, plus the new slot itself when
+				// the insert links it onto that same chain before splitting it.
+				let split = g.chain_len(g.split) + usize::from(bucket == g.split);
+
+				(own + split, g.walk.load(Ordering::Relaxed), g.buckets.len())
+			};
+
+			s.insert(key, Object::new(key, &[0u8; 8], None));
+
+			let g = s.shards[sh].read().unwrap();
+			let walked = g.walk.load(Ordering::Relaxed) - before;
+
+			assert!(
+				walked <= allowed,
+				"an insert walked {walked} links with only {allowed} available \
+				 in its own bucket and the split bucket",
+			);
+
+			if g.buckets.len() > buckets_before {
+				splits += 1;
+			}
+
+			worst = worst.max(walked);
+		}
+
+		assert!(splits > 100, "the table barely grew ({splits} splits); the bound is untested");
+
+		// The absolute claim: the per-insert cost does not scale with the
+		// table. Mean chain length is 1 at load factor 1.0, so both chains are
+		// short no matter how many keys the shard holds.
+		assert!(
+			worst < 32,
+			"the worst insert walked {worst} links -- that is a stall, not a chain",
 		);
 	}
 
@@ -1621,37 +2203,163 @@ mod tests {
 		assert_eq!(hits, 1, "the reinserted key appears {hits} times on its chain");
 	}
 
-	/// `last_access` is the clock truncated to 32 bits, so cross-shard ordering
-	/// is done on the wrapping difference. Raw comparison would invert here.
+	/// `last_access` is the FULL clock, so cross-shard ordering is a plain
+	/// comparison of stamps -- and stays exact across the 2^32 boundary that
+	/// used to be the truncation's wrap point.
+	///
+	/// Two claims, because widening the field is only half of it:
+	///
+	///   1. the clock does not wrap within the test, and cannot wrap in
+	///      practice -- one `fetch_add` per relink, so a billion accesses a
+	///      second would take 584 years;
+	///   2. the order the store reports is exactly the order keys were touched
+	///      in, across shards, with stamps straddling 2^32.
+	///
+	/// This replaces `cross_shard_ordering_survives_the_32_bit_wrap`, which
+	/// hand-wrote truncated stamps either side of the wrap and asserted the
+	/// wrapping difference picked the older one. There is no wrap left to
+	/// survive; what has to be shown now is that there is none.
 	#[test]
-	fn cross_shard_ordering_survives_the_32_bit_wrap() {
+	fn cross_shard_ordering_is_exact_and_the_clock_never_wraps() {
 		let s = tiered(CacheSize::MAX);
 
-		let older = 0u64;
-		let newer = u64::MAX;
+		// Start just below the old truncation boundary, so the run crosses it.
+		let start = (1u64 << 32) - 64;
+		s.clock.store(start, Ordering::Relaxed);
 
-		assert_ne!(shard_of(older), shard_of(newer), "the keys must be in different shards");
+		let keys: Vec<HashedKey> = (1..=400u64).map(mix).collect();
 
-		put(&s, older, 64);
-		put(&s, newer, 64);
-
-		// Clock sits just past a wrap; `older` was last touched 116 accesses
-		// ago and `newer` 84, but `older`'s RAW counter is the larger of the
-		// two. A raw `min` picks the wrong victim.
-		s.clock.store((1u64 << 32) + 100, Ordering::Relaxed);
-
-		for (k, raw) in [(older, 0xFFFF_FFF0u32), (newer, 0x0000_0010u32)] {
-			let sh = shard_of(k);
-			let mut g = s.shards[sh].write().unwrap();
-			let i = g.find(k).expect("key present");
-			g.slots[i as usize].last_access = raw;
-			s.publish_tail(sh, &g);
+		for &k in &keys {
+			put(&s, k, 64);
 		}
 
-		assert_eq!(
-			s.tail_key(),
-			Some(older),
-			"eviction picked the newer key -- the wrap was compared raw",
+		// Re-touch everything EXCEPT the first 32, in an order unrelated to
+		// insertion. The untouched ones keep stamps from below 2^32 while the
+		// rest are above it, so the final order the store has to report spans
+		// the old truncation boundary.
+		let (kept, rest) = keys.split_at(32);
+		let mut order = rest.to_vec();
+		order.rotate_left(197);
+
+		for &k in &order {
+			s.touch(k);
+		}
+
+		let spanned: std::collections::HashSet<usize> =
+			order.iter().map(|k| shard_of(*k)).collect();
+
+		assert!(spanned.len() > 1, "the keys must span several shards for this to say anything");
+
+		// The stamps really do straddle the old 32-bit boundary...
+		let stamps: Vec<u64> = {
+			let mut v = Vec::new();
+
+			for lock in s.shards.iter() {
+				let g = lock.read().unwrap();
+				let mut i = g.head;
+
+				while i != NIL {
+					v.push(g.slots[i as usize].last_access);
+					i = g.slots[i as usize].next;
+				}
+			}
+
+			v
+		};
+
+		assert!(
+			stamps.iter().any(|v| *v < (1 << 32)) && stamps.iter().any(|v| *v >= (1 << 32)),
+			"the run did not cross 2^32, so the old truncation would not have \
+			 been exercised either",
+		);
+
+		// ...and the clock is nowhere near wrapping.
+		let clock = s.clock.load(Ordering::Relaxed);
+
+		assert!(clock > start, "the clock did not advance");
+		assert!(
+			clock < u64::MAX / 2,
+			"the clock is within a factor of two of wrapping, which the stamp \
+			 comparison assumes cannot happen",
+		);
+
+		// Exact global order: drain by the store's own victim choice and get
+		// back the never-touched keys in insert order, then the rest in touch
+		// order -- across shards, and across 2^32.
+		let mut expected = kept.to_vec();
+		expected.extend_from_slice(&order);
+
+		let mut evicted = Vec::new();
+
+		while let Some(k) = s.tail_key() {
+			assert!(s.take(&k).is_some(), "nominated victim must be present");
+			evicted.push(k);
+		}
+
+		assert_eq!(evicted, expected, "cross-shard order is not exact");
+	}
+
+	/// The tier boundary is GLOBAL: the fast tier holds the globally most
+	/// recently used objects, not each shard's own most recent.
+	///
+	/// The property is stated as a separation -- every fast stamp is newer than
+	/// every slow stamp -- because that is what "global" means here and it is
+	/// checkable without reconstructing the whole order. Under the per-shard
+	/// budget this fails outright: each shard demotes to its own share, so a
+	/// quiet shard keeps old fast objects while a busy one demotes new ones.
+	#[test]
+	fn the_tier_boundary_is_global_across_shards() {
+		let s = tiered(CacheSize::MAX);
+
+		// Deliberately skewed: a third of the keys go to one shard, so the
+		// per-shard split would give that shard far too little room and the
+		// others far too much.
+		let mut keys: Vec<HashedKey> = Vec::new();
+
+		for i in 1..=1_200u64 {
+			keys.push(match i % 3 {
+				0 => mix(i) >> SHARD_BITS,
+				_ => mix(i),
+			});
+		}
+
+		for &k in &keys {
+			put(&s, k, 256);
+		}
+
+		// Room for about a quarter of them.
+		s.resize_fast_tier(migrating_bytes(256) * 300);
+
+		let mut newest_slow = 0u64;
+		let mut oldest_fast = u64::MAX;
+		let mut fast = 0usize;
+
+		for lock in s.shards.iter() {
+			let g = lock.read().unwrap();
+			let mut i = g.head;
+
+			while i != NIL {
+				let slot = &g.slots[i as usize];
+
+				match slot.tier {
+					Tier::Fast => {
+						oldest_fast = oldest_fast.min(slot.last_access);
+						fast += 1;
+					},
+
+					Tier::Slow => newest_slow = newest_slow.max(slot.last_access),
+				}
+
+				i = g.slots[i as usize].next;
+			}
+		}
+
+		assert!(fast > 0 && fast < keys.len(), "the budget demoted everything or nothing");
+
+		assert!(
+			newest_slow < oldest_fast,
+			"a slow object (stamp {newest_slow}) is more recent than a fast one \
+			 (stamp {oldest_fast}) -- the boundary is per shard, not global",
 		);
 	}
 
@@ -1721,9 +2429,13 @@ mod measure {
 		}
 	}
 
-	/// One point per process: the slab and both hashmaps grow by doubling, so a
-	/// second point in the same process would be read off a different point on
-	/// a step function. `MSTORE_N` powers of two, least-squares slope outside.
+	/// One point per process: the slab grows a chunk at a time and the bucket
+	/// array a bucket at a time, so a second point in the same process would be
+	/// read off a different point on a step function. `MSTORE_N` powers of two,
+	/// least-squares slope outside.
+	///
+	/// The slope is what `MERGED_STORE_STRUCTURE_OVERHEAD` is set from, with
+	/// the size-class-rounded value cost subtracted.
 	#[test]
 	#[ignore]
 	fn measure_merged_store_point() {
@@ -1803,8 +2515,8 @@ mod measure {
 	}
 
 	/// The layout claim the saving rests on, asserted rather than asserted-in-
-	/// prose: `Option<Object>` must be free, because `Object` holds an `Arc`
-	/// and the niche absorbs the discriminant.
+	/// prose: `Option<Object>` must be free, because the `NonNull` inside the
+	/// object's `TieredValue` is a niche the discriminant fits in.
 	#[test]
 	fn the_option_in_a_slot_is_free() {
 		assert_eq!(
