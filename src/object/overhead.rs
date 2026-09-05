@@ -128,37 +128,47 @@ const OBJECT_MAP_ROW_OVERHEAD: ObjectSize =
 /// The merged store's structural cost per object, replacing BOTH the map row
 /// and the eviction stack.
 ///
-/// Measured on the same harness as everything else here -- jemalloc
-/// `stats.allocated`, one point per process -- at N = 6,000,000 and
-/// N = 12,000,000, agreeing to within 0.01%:
+/// RE-MEASURED for the v3 slot -- jemalloc `stats.allocated`, ONE point per
+/// process, `MSTORE_VALUE=64` (a jemalloc class exactly, so no rounding
+/// correction), least squares over 2^20..2^23:
 ///
 /// ```text
-///   DashMap alone                          179.11 B/object
-///   MergedStore (chained index, 64 B slot) 207.07 B/object
+///   MergedStore  125.3041 B/object   R^2 = 0.999999
+///   less the value                    64
+///                                   ------
+///   structural                       61.30
 /// ```
 ///
-/// Both figures include the 64-byte value and its `Arc` (112 B), which is
-/// common to the two designs and cancels. What is left is attributable exactly,
-/// with no residual:
+/// It was 73, measured at 165.35 - 64 = 69.35 on a slab that grew by `Vec`
+/// reallocation and an index that doubled. Where the 8 B/object went:
 ///
 /// ```text
-///   slab   56 B/slot   x 1.101 fill = 61.7
-///   index   4 B/bucket x 1.398 fill =  5.6
-///   jemalloc large-class rounding    =  5.4
+///   slab   56 B/slot   x 1.005 fill = 56.27   (was 56 x 1.101 = 61.7)
+///   index   4 B/bucket x 1.313 fill =  5.25   (was  4 x 1.398 =  5.6)
 ///                                    -----
-///                                     72.7
+///                                    61.52
 /// ```
 ///
-/// The slab fill was 1.398 under `Vec` doubling and is 1.101 since the growth
-/// factor went to 25% -- measured (capacity 6,607,040 for 6,000,000 objects),
-/// not assumed. The bucket array still doubles, and must: its index is a mask,
-/// so its length has to stay a power of two. The 7.8 is jemalloc rounding each
-/// shard's 13.2 MB slab up to its 14 MiB large class.
+/// The slab fill is 1.005 because a chunked slab wastes at most one partly
+/// filled 4096-slot chunk per shard -- bounded, where a growth factor is
+/// proportional. The index fill is the bucket `Vec`'s own doubling: linear
+/// hashing keeps `buckets.len()` equal to the live count, so the only slack
+/// left is the `Vec` sitting mid-double, 1x to 2x, and the shards straddle a
+/// power of two at every scale.
 ///
-/// Against this, the split design costs 67.1 (DashMap row) + 72 (measured
-/// `LruCompactHybridStack`) = 139.1, or + 56 (`LruCompactStack`) = 123.1 flat.
+/// Set to **62** rather than 61: the slope is asymptotic, and every measured
+/// point above 2^20 sits between 61.5 and 62.1 B/object structural (the
+/// mid-round points 3 x 2^20 and 6 x 2^20 included, where the bucket `Vec` is
+/// furthest from full). Rounding up keeps the charge on the conservative side
+/// -- the cache holds slightly fewer objects than the budget allows, rather
+/// than overrunning it.
+///
+/// Against this, the split design costs 144.00 (DashMap alone, re-measured on
+/// this same tree, R^2 = 1.000000, less the same 64-byte value: 80.00) + 72
+/// (measured `LruCompactHybridStack`) = 152 B/object of structure, against
+/// 61.3 here.
 #[cfg(feature = "merged_object_store")]
-const MERGED_STORE_STRUCTURE_OVERHEAD: ObjectSize = 73;
+const MERGED_STORE_STRUCTURE_OVERHEAD: ObjectSize = 62;
 
 /// Under `merged_object_store` the object map IS the eviction stack, so the
 /// per-policy stack terms below do not apply at all -- there is no second
@@ -169,7 +179,11 @@ const MERGED_STORE_STRUCTURE_OVERHEAD: ObjectSize = 73;
 ///
 /// Same shape as `OBJECT_MAP_ROW_OVERHEAD`: the slot embeds the `Object`,
 /// hence contains the key and expiry that `base_size` counts separately, so
-/// those 24 bytes come back off.
+/// those 12 bytes come back off. 62 + 0 - 12 = **50**, from 73 + 0 - 12 = 61.
+///
+/// The two functions agree here in a way they do not for the split designs:
+/// both name `MERGED_STORE_STRUCTURE_OVERHEAD`, and they differ by exactly
+/// `DOUBLE_COUNTED_IN_BASE_SIZE` and nothing else.
 #[cfg(feature = "merged_object_store")]
 pub fn get_policy_overhead(_policy: &PaperPolicy) -> ObjectSize {
 	MERGED_STORE_STRUCTURE_OVERHEAD + VALUE_ALLOCATION_OVERHEAD
@@ -1700,6 +1714,11 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// for metadata it does not have, so it demotes far earlier than it should
 	// and the merged build would be measured on a smaller effective fast tier
 	// than the baseline it is being compared against.
+	//
+	// 62 since the v3 slot, re-measured at 61.30 B/object structural -- see
+	// `MERGED_STORE_STRUCTURE_OVERHEAD`. The reservation is per LIVE object and
+	// `MergedStore::settle_tier` takes it off the fast budget before the
+	// watermarks, so this number directly sets how many objects fit in DRAM.
 	#[cfg(feature = "merged_object_store")]
 	{
 		let _ = policy;
