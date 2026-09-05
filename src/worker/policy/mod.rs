@@ -432,6 +432,20 @@ pub mod migration_queue {
 
 								completed_promotions = 0;
 								completed_demotions = 0;
+
+								// And push this thread's epoch bag out, for the same
+								// reason the policy worker flushes once per event-loop
+								// pass: a completed migration retires the value it
+								// displaced, and this thread then blocks in `recv()`
+								// holding up to a bag's worth of it (62 objects) until
+								// its next burst. Bounded, so it was never a leak -- but
+								// at 8 KiB values that is half a megabyte of garbage
+								// sitting in an idle thread, which is what `flush` is for.
+								//
+								// The condition is already exactly right: nothing
+								// completed means nothing was retired, and a declined
+								// migration frees its copy outright rather than deferring.
+								crate::value::flush();
 							}
 						}
 
