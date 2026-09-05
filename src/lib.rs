@@ -76,6 +76,16 @@ pub use crate::value::{BufferDRAM, BufferPMEM};
 /// path touches value bytes with the shard guard already released.
 pub use crate::value::ValueRef;
 
+/// The concurrency gate for epoch-based value reclamation: eight readers
+/// copying while a flapper migrates and an overwriter frees underneath them.
+/// Single-threaded tests cannot see the window this design closes.
+///
+/// `#[ignore]`d and gated on one hybrid feature, so it neither changes any
+/// suite's count nor runs alongside tests that would pollute the process-wide
+/// jemalloc statistics it reads.
+#[cfg(all(test, feature = "lru_compact_hybrid_cache"))]
+mod value_stress;
+
 mod object;
 mod policy;
 mod status;
