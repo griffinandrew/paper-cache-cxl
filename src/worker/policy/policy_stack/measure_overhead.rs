@@ -210,6 +210,54 @@ fn measure_cache_point() {
 	std::thread::sleep(std::time::Duration::from_millis(500));
 
 	let after = allocated_bytes();
+
+	// `after` is taken the moment the object COUNT reaches n, which is the last
+	// thing the policy worker updates for a `Set` but not the last thing it
+	// frees: every `set` also broadcast a `WorkerEvent` down an unbounded
+	// channel, and some may still be queued here. So take a SECOND reading once
+	// `allocated` has stopped falling, bounded, on a cache nothing is touching.
+	//
+	// What that settling is actually worth, MEASURED (release, 64-byte values,
+	// lru-compact-hybrid, merged store): nothing at 2^20, 2^22, 2^23 and 2^24
+	// -- under 0.1% each -- and 26 MB at 2^21. So the queue is NOT why this
+	// harness reads high at small n, and the settled reading must not be
+	// presented as though it were.
+	//
+	// The real shape is a FIXED term. Fitting the settled points 2^20..2^24
+	// gives 127.43 B/object with an intercept of 70 MB (R^2 = 0.9996), against
+	// `charged`, which is exactly 126.00 B/object with no intercept at all. The
+	// SLOPES agree to 1.1%, and to 0.04% over 2^22..2^24 where the fixed term
+	// is small. Per point the gap runs -25.7% at 2^20 down to -4.0% at 2^24,
+	// purely because that ~70-98 MB is spread over more objects.
+	//
+	// So compare SLOPES here, never a single point. A single point at 2^20 is a
+	// measurement of the fixed term, not of the per-object accounting. What the
+	// fixed term IS remains unidentified: it is not the event queue, it does not
+	// scale with n, and it is outside the merged store, whose own harness fits
+	// 125.30 B/object with a 1.7 MB intercept over the same range.
+	//
+	// Both readings are printed, so the original line keeps its meaning.
+	let settled = {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+		let mut last = after;
+		let mut stable = 0;
+
+		loop {
+			std::thread::sleep(std::time::Duration::from_millis(250));
+
+			let now = allocated_bytes();
+
+			// Only a FALL counts as draining. A rise is the worker's own
+			// bookkeeping and must not restart the clock forever.
+			stable = if now < last { 0 } else { stable + 1 };
+			last = now;
+
+			if stable >= 8 || std::time::Instant::now() >= deadline {
+				break now.min(last);
+			}
+		}
+	};
+
 	let st = cache.status().expect("status");
 	let held = st.num_objects();
 	let charged = st.used_size();
@@ -221,6 +269,10 @@ fn measure_cache_point() {
 	println!(
 		"MEASURED_CACHE {} {} {} {} {} {}",
 		want, n, vsize, after.saturating_sub(base), held, charged,
+	);
+	println!(
+		"MEASURED_CACHE_SETTLED {} {} {} {} {} {}",
+		want, n, vsize, settled.saturating_sub(base), held, charged,
 	);
 }
 
