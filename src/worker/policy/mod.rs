@@ -484,23 +484,47 @@ pub mod migration_queue {
 				return;
 			};
 
+			// Charge the pending counter BEFORE publishing, not after.
+			//
+			// `send` is the publication point: the instant it returns, a
+			// consumer parked in `recv` owns the item and can run its entire
+			// iteration -- including `PendingOnDrop`'s `fetch_sub` -- before
+			// this thread reaches the next statement. Charging afterwards let
+			// that decrement run before its own increment, which took the
+			// counter from 0 to `u64::MAX` and made the `+ 1` inside
+			// `record_pending` panic on the checked add in a debug build (and
+			// wrap silently in release). The panic killed the policy worker,
+			// and a dead policy worker is what strands the TTL worker's
+			// `Shutdown` and hangs `PaperCache::drop` in `join` -- the two
+			// defects are one chain, not two independent ones.
+			//
+			// The counters were never mismatched: one increment site, one
+			// decrement site, exactly one of each per accepted item. Only the
+			// order was wrong. A refused send therefore has to refund the
+			// charge, which `PendingOnDrop`'s own `Drop` already knows how to
+			// do -- constructing and dropping one is the decrement.
+			record_pending(item.1);
+
 			// Single consumer: one FIFO channel already preserves global
 			// order, so there is nothing to shard and the modulo is skipped.
 			// Sharding only does work when there is more than one consumer to
 			// distribute across.
 			if self.senders.len() == 1 {
-				if first.send(item).is_ok() {
-					record_pending(item.1);
-					self.record_depth(self.enqueued.fetch_add(1, Ordering::Release) + 1);
+				match first.send(item).is_ok() {
+					true => self
+						.record_depth(self.enqueued.fetch_add(1, Ordering::Release) + 1),
+					false => drop(PendingOnDrop(item.1)),
 				}
+
 				return;
 			}
 
 			let shard = (item.0 % self.senders.len() as HashedKey) as usize;
 
-			if self.senders[shard].send(item).is_ok() {
-				record_pending(item.1);
-				self.record_depth(self.enqueued.fetch_add(1, Ordering::Release) + 1);
+			match self.senders[shard].send(item).is_ok() {
+				true => self
+					.record_depth(self.enqueued.fetch_add(1, Ordering::Release) + 1),
+				false => drop(PendingOnDrop(item.1)),
 			}
 		}
 
@@ -551,6 +575,87 @@ pub mod migration_queue {
 			}
 		}
 	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+		use crossbeam_channel::bounded;
+
+		/// A rendezvous channel parks the producer inside `push` at exactly the
+		/// send, which makes the charge-then-publish ordering observable with no
+		/// race at all: while the producer is parked, the item is not yet visible
+		/// to any consumer, so the pending counter must already show it.
+		///
+		/// Against a `push` that charges AFTER the send this fails on the first
+		/// assertion, and it fails deterministically rather than flakily.
+		#[test]
+		fn push_charges_pending_before_the_item_can_reach_a_consumer() {
+			let (sender, receiver) = bounded::<(HashedKey, Tier)>(0);
+
+			let queue = MigrationQueue {
+				senders: vec![sender],
+				handles: Vec::new(),
+				enqueued: AtomicU64::new(0),
+				processed: Arc::new(AtomicU64::new(0)),
+				demotion_accounting: Arc::new(AtomicBool::new(true)),
+			};
+
+			// These counters are process-global, so measure this push as a delta
+			// and take the baseline while the queue is quiescent.
+			let before = PENDING_DEMOTE.load(Ordering::Acquire);
+
+			let parked = Arc::new(AtomicBool::new(false));
+			let signal = parked.clone();
+
+			let producer = std::thread::spawn(move || {
+				signal.store(true, Ordering::Release);
+				queue.push((7, Tier::Slow))
+			});
+
+			// The producer signals immediately before `push`, and the rendezvous
+			// nothing has received from is the only place `push` can block, so
+			// once the flag is up it is parked at the send within a few hundred
+			// nanoseconds. The sleep is many orders of magnitude more than that.
+			while !parked.load(Ordering::Acquire) {
+				std::thread::yield_now();
+			}
+
+			std::thread::sleep(std::time::Duration::from_millis(250));
+
+			let charged = PENDING_DEMOTE.load(Ordering::Acquire);
+
+			// Checked BEFORE the decrement below, so an unfixed `push` is reported
+			// as the ordering bug it is rather than as a mystery panic on the
+			// producer thread -- and so a failing run does not leave the global
+			// counter wrapped underneath every other test in this binary.
+			assert_eq!(
+				charged,
+				before + 1,
+				"`push` published the item before charging it: a consumer that \
+				 dequeues inside that window decrements a counter which was never \
+				 incremented, wrapping it to u64::MAX and panicking the next enqueue",
+			);
+
+			// Now take the item and pay the charge back exactly as the consumer
+			// loop does. This is the unmatched-decrement sequence itself: against
+			// the unfixed `push` it wraps the counter and the producer's own
+			// `record_pending` panics on the checked add, so the join below fails
+			// too. Against the fixed one the pair is balanced and the counter is
+			// left exactly as this test found it.
+			let (key, tier) = receiver
+				.recv()
+				.expect("the producer must still be parked in `send`");
+
+			drop(PendingOnDrop(tier));
+
+			producer.join().expect("`push` must not panic");
+
+			assert_eq!(key, 7);
+			assert_eq!(tier, Tier::Slow);
+			assert_eq!(PENDING_DEMOTE.load(Ordering::Acquire), before);
+		}
+	}
+
 }
 
 /// Optional parallel application of tier-migration batches.

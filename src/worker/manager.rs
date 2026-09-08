@@ -107,20 +107,42 @@ impl WorkerFanout {
 		// subscriber count up front.
 		let mut pending: Option<&WorkerSender> = None;
 
+		// A failed delivery must not abandon the subscribers after it.
+		//
+		// `deliver` can only fail with `Disconnected` -- every worker channel is
+		// `unbounded`, so a send never blocks and never fills -- which means that
+		// worker is already dead. Propagating the first failure with `?` used to
+		// return before the remaining subscribers were served, and `workers` puts
+		// the policy worker FIRST, so one dead policy worker silently swallowed
+		// the TTL worker's `Shutdown`. `PaperCache::drop` then joined a TTL worker
+		// that had not been told to stop and never would be -- a permanent hang at
+		// teardown, with every thread parked and nothing holding a lock.
+		//
+		// So attempt every subscriber and report afterwards: a worker that has
+		// died is exactly when the others most need their event.
+		let mut result = Ok(());
+
 		for (worker, mask) in self.workers.iter() {
 			if bit & mask == 0 {
 				continue;
 			}
 
 			if let Some(previous) = pending.replace(worker) {
-				Self::deliver(previous, event.clone())?;
+				if Self::deliver(previous, event.clone()).is_err() {
+					result = Err(CacheError::Internal);
+				}
 			}
 		}
 
-		match pending {
-			Some(last) => Self::deliver(last, event),
-			None => Ok(()),
+		// Still a plain move for the last subscriber, so the hot path -- a `Get`,
+		// which after the mask filter has exactly one -- is unchanged.
+		if let Some(last) = pending {
+			if Self::deliver(last, event).is_err() {
+				result = Err(CacheError::Internal);
+			}
 		}
+
+		result
 	}
 
 	fn deliver(worker: &WorkerSender, event: WorkerEvent) -> Result<(), CacheError> {
