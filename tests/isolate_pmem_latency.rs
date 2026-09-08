@@ -6,7 +6,7 @@
 // crate's real demotion size (~16 KB) and volume, matching how real objects
 // are physically written to the slow tier. If the same multi-millisecond
 // stalls show up here, the anomaly is in the allocator/NUMA path itself, not
-// in `lru_hybrid_cache`'s logic sitting on top of it.
+// in `lru_compact_hybrid_cache`'s logic sitting on top of it.
 //
 // Run with: cargo +nightly test --release --test isolate_pmem_latency
 //   --features key_value_pmem -- --ignored --nocapture

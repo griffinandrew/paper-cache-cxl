@@ -1,11 +1,12 @@
 # The hybrid caches
 
-This crate hosts 18 two-tier cache designs, to compare how eviction disciplines use a small DRAM
-tier in front of a large CXL/PMEM tier. Every hybrid build compiles all 18; which one a given
+This crate hosts 24 two-tier cache designs, to compare how eviction disciplines use a small DRAM
+tier in front of a large CXL/PMEM tier. Every hybrid build compiles all 24; which one a given
 cache runs is chosen at construction time by the `PaperPolicy` value passed to the constructor,
 and is fixed for that cache's lifetime. Two caches in one process may run different designs.
 
-This document covers the machinery all 18 share, then each design individually. For the
+This document covers the machinery all 24 share, then each catalogued design individually --
+Part 2 has a written entry for 18 of the 24. For the
 feature-flag matrix see `FEATURE_FLAGS.md`; for one design end to end in maximum detail see
 `LRU_HYBRID_CACHE.md`.
 
@@ -29,22 +30,23 @@ A live object's bytes exist in **exactly one** tier. Promotion and demotion repl
 `TieredBuffer` in place (`Object::set_data`), so a migration is a byte *move*. Contrast
 `src/tiering/`, the legacy manager, which deliberately keeps a copy in both tiers at once.
 
-All 18 share one implementation. There are exactly two inherent
+All 24 share one implementation. There are exactly two inherent
 `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks — the shared engine, and a second carrying the
 size-split design's three-scalar constructor — both gated only on `hybrid_cache_common`. The
 per-design behaviour that survives is dispatched at runtime: `hybrid_policy::admission_tier`
 matches on the policy to pick a placement, and `init_policy_stack` builds the matching
 `PolicyStack`.
 
-The 18 `*_hybrid_cache` features are consequently **not** mutually exclusive; any subset may be
-enabled. Each now gates only a name-compatibility shim — a `pub mod <design>_hybrid_cache`
-re-exporting `TieredBuffer` plus a `<Design>HybridStats` type alias — its integration-test file,
-and one per-object DRAM-overhead accounting term. `lib.rs`'s single `compile_error!` rejects
-`hashbrown_dram` with `global_hashtable_pmem`, unrelated to the designs.
+The 24 `*_hybrid_cache` features are consequently **not** mutually exclusive; any subset may be
+enabled. Each now gates only its integration-test file and one per-object DRAM-overhead
+accounting term. `lib.rs`'s single `compile_error!` rejects `hashbrown_dram` with
+`global_hashtable_pmem`, unrelated to the designs.
 
 > Earlier revisions gave each design its own impl block, forcing mutual exclusion and 153
-> pairwise guards. Both are gone. Many module doc comments in `src/` — including those on the 18
-> shim modules — still describe that older world.
+> pairwise guards, plus a per-design `<design>_hybrid_cache` shim module aliasing a per-design
+> stats struct. All of that is gone — there is one `HybridStats` (`src/hybrid_stats.rs`), read
+> through one `hybrid_stats()` accessor. Some module doc comments in `src/` still describe that
+> older world.
 
 ## How a stack decides, without ever touching a byte
 
@@ -156,13 +158,13 @@ The stats count **tier decisions**, not byte copies. They diverge in three legit
 - **Declined migrations are normal.** `PaperCache::set()` picks a placement of its own via
   the free function `hybrid_policy::admission_tier(policy, ...)` -- a runtime `match` carrying
   each design's rule -- so an object can already be where the stack is about to say it
-  belongs. `TwoQHybridStack` hits this by design: `admission_tier` returns `Fast` for a re-set
+  belongs. `TwoQCompactHybridStack` hits this by design: `admission_tier` returns `Fast` for a re-set
   (correct — the key is now most-recently-used), so the value is already in DRAM by the time
   `touch_main_fast` emits its promotion.
-- **A persistent gap is a defect signal.** `LfuHybridStack` once emitted a `Tier::Slow`
+- **A persistent gap is a defect signal.** `LfuCompactHybridStack` once emitted a `Tier::Slow`
   migration on every latched admission whose bytes `admission_tier` had *already* placed in
   PMEM — 445,465,067 migrations against ~448M sets on cluster12, ~99% of its reported demotions.
-  Any `lfu_hybrid_cache` demotion figure from before that fix is inflated and not comparable.
+  Any `lfu_compact_hybrid_cache` demotion figure from before that fix is inflated and not comparable.
 
 The four tier gauges (`fast_objects`/`slow_objects`/`fast_bytes_used`/`slow_bytes_used`) are
 republished by `refresh_tier_gauges` once per event-loop pass, so they are up to one pass stale.
@@ -181,7 +183,7 @@ original drain-to-the-ceiling behaviour exactly.
 
 The pair exists because draining to exactly the ceiling pinned the tier at 100% utilisation and
 made almost every pass a single-object migration batch. It trades a slice of resident fast
-capacity for larger, less frequent batches, and it is tuned in one place for all 18 stacks.
+capacity for larger, less frequent batches, and it is tuned in one place for all 24 stacks.
 
 > `watermarks::DEFAULT_HIGH` / `DEFAULT_LOW` are authoritative. Both are read once through a
 > `OnceLock` on first use, so the env vars are startup configuration rather than runtime
@@ -220,24 +222,24 @@ entire class of desync bug (a key present in one map but not another) by constru
 
 `LruEntry { tier, size }` is 8 bytes (`u8` + `u32`), pairing with the 8-byte `HashedKey` to
 exactly 16 — the figure `object/overhead.rs`'s DRAM constants are derived from. This is why
-`LruLfuHybridStack`'s frequency counter is a `u16`: a `u32` would push the entry to 12 bytes and
+`LruLfuCompactHybridStack`'s frequency counter is a `u16`: a `u32` would push the entry to 12 bytes and
 add 8 bytes to *every* object in *both* tiers.
 
 ### Boundary cursor vs homogeneous lists
 
 Two structural idioms recur:
 
-- **One list plus a cursor.** `LruHybridStack` keeps a single recency list with a
+- **One list plus a cursor.** `LruCompactHybridStack` keeps a single recency list with a
   `fast_boundary` cursor marking where the fast prefix ends. Cheap, but every operation that
   can move the boundary has to repair it.
-- **Homogeneous per-tier lists.** `LruSizedHybridStack` (four lists) and `LruLfuHybridStack`
+- **Homogeneous per-tier lists.** `LruSizedCompactHybridStack` (four lists) and `LruLfuCompactHybridStack`
   (a recency list plus a frequency chain) give each tier its own structure, so each list's own
   tail is directly its own candidate and no cursor exists. Both arrived at this independently,
   and in both cases it came out *simpler* than the cursor.
 
 ---
 
-# Part 2: The 18 designs
+# Part 2: The designs
 
 ```
 BASE                    2Q FAMILY                      S3-FIFO FAMILY
@@ -254,9 +256,9 @@ lru_lfu                                                │       │   └──
 
 ## Base designs
 
-### `lru_hybrid_cache`
+### `lru_compact_hybrid_cache`
 
-`LruHybridStack` · `PaperPolicy::LruHybrid` — selected at runtime by passing this policy to `new()`
+`LruCompactHybridStack` · `PaperPolicy::LruCompactHybrid` — selected at runtime by passing this policy to `new()`
 
 One recency-ordered list backs both tiers. The fast tier is the maximal prefix from the MRU end
 whose cumulative size fits `fast_capacity`; everything behind is slow.
@@ -278,9 +280,9 @@ stack that re-settles on every admission.
 The headroom is no longer stack-local, though: the old `FAST_TIER_LOW_WATER_RATIO` is now dead
 code, and every design gets the same behaviour from the shared watermark pair above.
 
-### `lfu_hybrid_cache`
+### `lfu_compact_hybrid_cache`
 
-`LfuHybridStack` · `PaperPolicy::LfuHybrid` — selected at runtime by passing this policy to `new()`
+`LfuCompactHybridStack` · `PaperPolicy::LfuCompactHybrid` — selected at runtime by passing this policy to `new()`
 
 Two independent `FrequencyChain`s (the classic O(1) LFU bucket structure) back the two tiers.
 LFU's boundary is a *frequency* threshold, not a list position, so two chains — each queryable
@@ -302,9 +304,9 @@ every fast resident already has frequency ≥ 2. So `fast_tier_latched` permanen
 brand-new-key fast admission the first time capacity is genuinely reached. It resets on
 `clear()` and on `resize_fast_tier` *growing* the budget.
 
-### `fifo_hybrid_cache`
+### `fifo_compact_hybrid_cache`
 
-`FifoHybridStack` · `PaperPolicy::FifoHybrid` — selected at runtime by passing this policy to `new()`
+`FifoCompactHybridStack` · `PaperPolicy::FifoCompactHybrid` — selected at runtime by passing this policy to `new()`
 
 One insertion-ordered list. **No promotion policy at all** — this is the defining difference
 from every sibling.
@@ -318,13 +320,13 @@ from every sibling.
   for whichever tier it already occupies is corrected.
 - **Demotion** — the oldest fast key. **Eviction** — the absolute tail.
 
-### `lru_sized_hybrid_cache`
+### `lru_sized_compact_hybrid_cache`
 
-`LruSizedHybridStack` · `PaperPolicy::LruSizedHybrid` — the one design with its own
-constructor: `new_sized(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold)`,
-which takes no policy argument. Passing `LruSizedHybrid` to `new()` returns `InvalidPolicy`.
+`LruSizedCompactHybridStack` · `PaperPolicy::LruSizedCompactHybrid` — the one design with its own
+constructor: `new_sized_compact(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold)`,
+which takes no policy argument. Passing `LruSizedCompactHybrid` to `new()` returns `InvalidPolicy`.
 
-`lru_hybrid_cache`'s semantics with each tier's bookkeeping split into two size-routed segments
+`lru_compact_hybrid_cache`'s semantics with each tier's bookkeeping split into two size-routed segments
 by a runtime-configurable byte threshold. Four homogeneous lists (`small_fast`, `large_fast`,
 `small_slow`, `large_slow`), no cursor — two independent fast sources each feeding their own slow
 destination is a shape a cursor does not generalise to.
@@ -340,7 +342,7 @@ destination is a shape a cursor does not generalise to.
   the older tail"); only if both are empty does it fall back to whichever fast segment is
   furthest over budget by ratio.
 - Only the two fast segments have capacities. The slow lists are governed by the overall
-  `max_size` trigger, exactly like the single slow tier in `lru_hybrid_cache`.
+  `max_size` trigger, exactly like the single slow tier in `lru_compact_hybrid_cache`.
 - The shared overhead is split *proportionally* between the two fast segments, not charged in
   full against each — the per-object metadata cost is real only once.
 
@@ -348,9 +350,9 @@ destination is a shape a cursor does not generalise to.
 `size_threshold()` live on every hybrid cache -- they sit on the shared impl block -- but take
 effect only when the cache is running this design.
 
-### `lru_lfu_hybrid_cache`
+### `lru_lfu_compact_hybrid_cache`
 
-`LruLfuHybridStack` · `PaperPolicy::LruLfuHybrid(promote_k)` — selected at runtime by passing
+`LruLfuCompactHybridStack` · `PaperPolicy::LruLfuCompactHybrid(promote_k)` — selected at runtime by passing
 this policy to `new()`; `promote_k` is a `u16` and is rejected if zero.
 
 The first design whose two tiers rank by *different* metrics: a recency list for the fast tier, a
@@ -390,7 +392,7 @@ reset-on-promotion, without which a repeatedly-promoted object accumulates an un
 and becomes effectively un-evictable.
 
 **A `set()` is an access, not an automatic promotion** — a deliberate divergence from
-`lru_hybrid_cache`. On an 80–94% SET trace, "any set promotes" would push nearly everything into
+`lru_compact_hybrid_cache`. On an 80–94% SET trace, "any set promotes" would push nearly everything into
 DRAM without demonstrating reuse, and the slow tier's frequency ordering would never filter
 anything. Consequently `admission_tier` must look up an existing key's current tier, so an
 overwrite of a slow key is written straight to PMEM rather than to DRAM and corrected afterward.
@@ -398,25 +400,25 @@ overwrite of a slow key is written straight to PMEM rather than to DRAM and corr
 ## 2Q family
 
 A one-access FIFO queue feeding a segmented main LRU queue. All four carry `k_in` in their policy
-payload -- `PaperPolicy::TwoQHybrid(k_in)` and siblings, validated into `0.0..=1.0` -- where
+payload -- `PaperPolicy::TwoQCompactHybrid(k_in)` and siblings, validated into `0.0..=1.0` -- where
 `k_in * max_size` is the FIFO queue's byte budget.
 
-### `two_q_hybrid_cache`
+### `two_q_compact_hybrid_cache`
 
-`TwoQHybridStack` · `PaperPolicy::TwoQHybrid(f64)`
+`TwoQCompactHybridStack` · `PaperPolicy::TwoQCompactHybrid(f64)`
 
 Two live queues, matching the paper text directly — unlike this crate's plain `TwoQStack`, which
 carries a heavier three-live-queue shape with a real-object `a1_out` overflow queue.
 
 - `fifo_queue` — one-access, holds real objects, **always entirely in the slow tier**.
-- `main_stack` — recency-ordered, segmented fast/slow exactly like `LruHybridStack::stack`.
+- `main_stack` — recency-ordered, segmented fast/slow exactly like `LruCompactHybridStack::stack`.
 
 - **Admission** — a brand-new key lands in `fifo_queue`, so a first `set()` is a synchronous
   PMEM write. A re-`set()` of an already-tracked key is built in DRAM instead: `admission_tier`
   returns `Tier::Fast` once the key is in the object map, because `touch()` always ends with the
   key in the fast tier.
 - **Promotion** — a hit on a `fifo_queue` key moves it straight to the top of `main_stack` at
-  `Tier::Fast`. Once inside `main_stack` an object behaves exactly like `lru_hybrid_cache`.
+  `Tier::Fast`. Once inside `main_stack` an object behaves exactly like `lru_compact_hybrid_cache`.
 - **Ageing out** — a `fifo_queue` object reaching the tail without a second access is evicted
   outright. No ghost queue: an exact-membership check on every admission was judged an unwelcome
   cost given admission already pays a synchronous PMEM write. A probabilistic structure is the
@@ -435,11 +437,11 @@ a `PolicyStack` has no reference to the object map.
 `entries` holds `TwoQEntry { queue, tier: Option<Tier>, size }`, with `tier: None` iff the key is
 in the FIFO queue.
 
-### `two_q_fast_admission_hybrid_cache`
+### `two_q_fast_admission_compact_hybrid_cache`
 
-`TwoQFastAdmissionHybridStack` · `PaperPolicy::TwoQFastAdmissionHybrid(f64)`
+`TwoQFastAdmissionCompactHybridStack` · `PaperPolicy::TwoQFastAdmissionCompactHybrid(f64)`
 
-`two_q_hybrid_cache` with the one-access queue in the **fast** tier, so admission is a cheap DRAM
+`two_q_compact_hybrid_cache` with the one-access queue in the **fast** tier, so admission is a cheap DRAM
 write instead of a synchronous PMEM allocation. Only the physical placement changes; the logical
 queue structure is untouched, and a key still has to prove itself with a second access to reach
 the recency-durable part of the cache. Only its bytes are in DRAM *while on probation*.
@@ -452,9 +454,9 @@ fast_capacity.saturating_sub(fifo_capacity).saturating_sub(reserved_overhead())`
 carve-out and the shared per-object DRAM reservation both come out before the watermarks apply. The net result is
 `fast_used (main) + fifo_used <= fast_capacity` by construction.
 
-### `two_q_fast_admission_reprieve_hybrid_cache`
+### `two_q_fast_admission_reprieve_compact_hybrid_cache`
 
-`TwoQFastAdmissionReprieveHybridStack` · `PaperPolicy::TwoQFastAdmissionReprieveHybrid(f64)`
+`TwoQFastAdmissionReprieveCompactHybridStack` · `PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(f64)`
 
 As above, but a one-access key ageing out **without** a second access is reprieved into the slow
 tier rather than evicted. `settle_fifo_queue` splices it onto the **back** of `main_stack` — the
@@ -475,11 +477,11 @@ The tradeoff when reading results: a reprieved key at the LRU tail may be evicte
 pressure, having cost a real DRAM→PMEM copy on the way there. Whether that buys enough extra hits
 is exactly what this variant exists to measure — a null result is a finding, not a bug.
 
-### `two_q_ghost_hybrid_cache`
+### `two_q_ghost_compact_hybrid_cache`
 
-`TwoQGhostHybridStack` · `PaperPolicy::TwoQGhostHybrid(f64)`
+`TwoQGhostCompactHybridStack` · `PaperPolicy::TwoQGhostCompactHybrid(f64)`
 
-`two_q_hybrid_cache` plus a bare-key ghost queue, adding what that stack deliberately left out.
+`two_q_compact_hybrid_cache` plus a bare-key ghost queue, adding what that stack deliberately left out.
 Mirrors `s_three_fifo_stack.rs`'s `ghost: HashList<HashedKey>` shape — a lightweight membership
 list, not a third place bytes can live (explicitly chosen over plain `TwoQStack`'s heavier
 `a1_out`, which holds real objects).
@@ -500,14 +502,14 @@ costs one extra migration rather than a synchronous PMEM-vs-DRAM decision at the
 
 ## S3-FIFO family
 
-All nine carry `one_access_ratio` in their policy payload -- `PaperPolicy::S3FifoHybrid(ratio)`
+All nine carry `one_access_ratio` in their policy payload -- `PaperPolicy::S3FifoCompactHybrid(ratio)`
 and siblings, validated into `0.0..1.0` for the six designs that size a main queue at `(1 - one_access_ratio) * max_size` (the plain `s3-fifo` stack and the five non-reprieve hybrids), where a ratio of 1 would leave that queue zero bytes and stall eviction; `0.0..=1.0` for the four reprieve designs, which derive no budget from `1 - ratio` and so cannot be starved by it.
 
-### `s3_fifo_hybrid_cache`
+### `s3_fifo_compact_hybrid_cache`
 
-`S3FifoHybridStack` · `PaperPolicy::S3FifoHybrid(f64)`
+`S3FifoCompactHybridStack` · `PaperPolicy::S3FifoCompactHybrid(f64)`
 
-Structurally close to `two_q_hybrid_cache` — a one-access queue in the slow tier feeding a main
+Structurally close to `two_q_compact_hybrid_cache` — a one-access queue in the slow tier feeding a main
 queue segmented fast/slow — but the mechanism deciding who stays is different.
 
 - `one_access_queue` behaves like 2Q's: a re-access promotes **eagerly** to the front of
@@ -534,17 +536,17 @@ keys are exactly the `Tier::Fast` ones" always holds. A key given a second chanc
 the front, deliberately scrambling true insertion age in exchange for matching the paper's
 wording — exactly how a real CLOCK sweep works.
 
-### `s3_fifo_ghost_hybrid_cache`
+### `s3_fifo_ghost_compact_hybrid_cache`
 
-`S3FifoGhostHybridStack` · `PaperPolicy::S3FifoGhostHybrid(f64)`
+`S3FifoGhostCompactHybridStack` · `PaperPolicy::S3FifoGhostCompactHybrid(f64)`
 
-Adds a bare-key ghost queue with the same lifecycle as `two_q_ghost_hybrid_cache`'s, bringing the
+Adds a bare-key ghost queue with the same lifecycle as `two_q_ghost_compact_hybrid_cache`'s, bringing the
 hybrid design in line with this crate's plain `SThreeFifoStack`, which already has a ghost queue
 of exactly this shape.
 
-### `s3_fifo_ghost_lazy_demotion_hybrid_cache`
+### `s3_fifo_ghost_lazy_demotion_compact_hybrid_cache`
 
-`S3FifoGhostLazyDemotionHybridStack` · `PaperPolicy::S3FifoGhostLazyDemotionHybrid(f64)`
+`S3FifoGhostLazyDemotionCompactHybridStack` · `PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(f64)`
 
 One change: **demotion is now reference-bit gated too.** Before demoting the key anchoring
 `main_boundary`, its `accessed` bit is checked.
@@ -561,18 +563,18 @@ protect different things (an unfairly *demoted* fast key here, an unfairly *evic
 there) and compose naturally. Termination is guaranteed because each reprieve clears the bit and
 moves the key to the front, so it cannot be re-examined until every other fast key has had a turn.
 
-### `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache`
+### `s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_cache`
 
-`S3FifoGhostLazyDemotionFastAdmissionHybridStack`
+`S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack`
 
 Moves the one-access queue to the **fast** tier, so admission is a cheap DRAM write. Same change,
 same motivation, and same shared-DRAM-budget accounting as
-`two_q_fast_admission_hybrid_cache`: `one_access_capacity` becomes a reservation carved out of
+`two_q_fast_admission_compact_hybrid_cache`: `one_access_capacity` becomes a reservation carved out of
 `fast_capacity` rather than an independent budget.
 
-### `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache`
+### `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_compact_hybrid_cache`
 
-`S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack`
+`S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack`
 
 Adds a checkpoint roughly halfway through the **slow** portion of the main queue. The slow
 portion was previously a passive holding area — nothing looked at an object there until it
@@ -589,9 +591,9 @@ Locating "the middle" uses an incrementally-maintained cursor with a drift count
 the slow segment holds hundreds of thousands of objects at benchmark scale, and an O(n) scan once
 per eviction would be O(n²) over a cache's lifetime.
 
-### `s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache`
+### `s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_compact_hybrid_cache`
 
-`S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack`
+`S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack`
 
 Two changes from the midpoint variant:
 
@@ -609,17 +611,17 @@ evicting a **random** object. A reprieve is neither of those, and `over_max_size
 be true at that moment. So `evict_one()` here is purely about the main queue, and
 `needs_capacity_eviction()` stays at the trait's default `false`.
 
-### `s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache`
+### `s3_fifo_lazy_demotion_fast_admission_reprieve_compact_hybrid_cache`
 
-`S3FifoLazyDemotionFastAdmissionReprieveHybridStack`
+`S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack`
 
 The reprieve design with **no mid-slow checkpoint at all**. Keeps only the checks that pay for
 themselves: the demotion boundary and the eviction tail. See "Recorded negative results" below
 for why both checkpoint attempts were dropped.
 
-### `s3_fifo_lazy_demotion_reprieve_hybrid_cache`
+### `s3_fifo_lazy_demotion_reprieve_compact_hybrid_cache`
 
-`S3FifoLazyDemotionReprieveHybridStack`
+`S3FifoLazyDemotionReprieveCompactHybridStack`
 
 Fills the family's one empty design cell — a **slow**-tier one-access queue whose aged-out keys
 are **reprieved**:
@@ -639,7 +641,7 @@ eviction it replaces.
 
 The cost is on the other side of the ledger — the paper-literal admission rule it keeps means a
 brand-new key's `set()` is a synchronous PMEM write, which is exactly what the fast-admission
-branch exists to avoid. (As in `two_q_hybrid_cache`, a re-`set()` is not: `admission_tier` keeps
+branch exists to avoid. (As in `two_q_compact_hybrid_cache`, a re-`set()` is not: `admission_tier` keeps
 an existing key in whichever tier it already occupies, so a re-`set()` of a fast-resident key is
 built in DRAM. Here that is load-bearing rather than an optimisation — this stack records no tier
 transition for a `set()` on a tracked key, so building in the wrong tier would strand the object
@@ -650,9 +652,9 @@ migration on promotion from the one-access queue because the bytes were already 
 one-access key really is in PMEM, so promotion is a genuine PMEM→DRAM move and must emit the
 migration — guarded, since `settle_fast_tier` may demote it straight back out in the same call.
 
-### `s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache`
+### `s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_compact_hybrid_cache`
 
-`S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack`
+`S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack`
 
 Replaces the approximate midpoint cursor with a **real structural boundary**: the slow tier is
 split into two physical FIFO segments, and every object's reference bit is checked at the moment

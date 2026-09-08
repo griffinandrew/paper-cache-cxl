@@ -346,7 +346,8 @@ where
 
     /// Returns the value immediately before `value` — i.e. its neighbor toward
     /// the head — or `None` if `value` is absent or is itself the head. Matches
-    /// `kwik::collections::HashList::before` as used by `LruHybridStack`.
+    /// `kwik::collections::HashList::before` as used by
+    /// `LruCompactHybridStack`.
     pub fn before(&self, value: &T) -> Option<&T> {
         let idx = *self.lookup.get(value)?;
         let prev = self.entries.get(idx)
@@ -457,8 +458,8 @@ where
     /// Pushes a value onto the back (tail) of the list.
     ///
     /// The mirror of `push_front`, added for
-    /// `TwoQFastAdmissionReprieveHybridStack`, which splices a reprieved
-    /// one-access key onto the LRU tail of its main queue -- the DRAM
+    /// `TwoQFastAdmissionReprieveCompactHybridStack`, which splices a
+    /// reprieved one-access key onto the LRU tail of its main queue -- the DRAM
     /// `kwik::collections::HashList` this type shadows already has one, so
     /// without it that stack could not compile under `eviction_stacks_pmem`.
     ///

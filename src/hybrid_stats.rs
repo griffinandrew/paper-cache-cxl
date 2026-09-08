@@ -8,10 +8,9 @@
 //! The single stats snapshot every hybrid design reports through, plus
 //! `PaperCache::hybrid_stats()` / `AtomicStatus::hybrid_stats()` to read it.
 //!
-//! There is one accessor, not one per design. The 18 `<Design>HybridStats`
-//! names each design's module re-exports are type *aliases* of the struct
-//! below, kept so existing callers (`paper-server`, `paper-benchmark-cxl`)
-//! compile unchanged; they are the same type and carry no extra fields.
+//! There is one accessor, not one per design. Every design reports through
+//! the single struct below; the per-design `<Design>HybridStats` aliases that
+//! each design's own module used to re-export are gone.
 //!
 //! That matters for a consumer that does not care which design it is talking
 //! to. Before the runtime-policy unification, reporting
@@ -21,8 +20,8 @@
 //! `AtomicStatus::hybrid_stats` (`status.rs`), next to the fields it reads.
 //!
 //! The 15 fields below are 3 monotonic counters, 4 two-tier gauges, and 8
-//! size-split gauges that only `LruSizedHybrid` ever populates -- they read
-//! zero under every other design.
+//! size-split gauges that only `LruSizedCompactHybrid` ever populates -- they
+//! read zero under every other design.
 
 /// Feature-neutral snapshot of the active hybrid cache's tier-movement
 /// counters and live tier gauges.

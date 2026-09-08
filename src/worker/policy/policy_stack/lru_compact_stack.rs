@@ -1,20 +1,24 @@
 //! `LruCompactStack` — `LruStack`'s policy over the slab design.
 //!
 //! Exists to separate two effects the existing matrix confounds. Comparing
-//! `Lru` (all-DRAM, `HashList`) against `LruHybrid` (tiered, `HashList`)
-//! measures TIERING. Comparing `LruHybrid` against `LruCompactHybrid`
-//! measures LAYOUT. But comparing all-DRAM against a tiered compact stack
-//! measures both at once, which is how a 23% throughput gap on cluster13 LRU
-//! and a *reversed* 24% gap on cluster13 LFU both appeared without either
-//! being attributable.
+//! `Lru` (all-DRAM, `HashList`) against a tiered `HashList` stack measures
+//! TIERING; comparing that against `LruCompactHybrid` measures LAYOUT. But
+//! comparing all-DRAM against a tiered compact stack measures both at once,
+//! which is how a 23% throughput gap on cluster13 LRU and a *reversed* 24%
+//! gap on cluster13 LFU both appeared without either being attributable.
 //!
 //! This is the missing cell: the compact LAYOUT with no tiering at all.
 //!
 //! ```text
 //!                    HashList layout        slab layout
 //!   no tiering       LruStack               LruCompactStack   <- this
-//!   tiered           LruHybridStack         LruCompactHybridStack
+//!   tiered           (removed)              LruCompactHybridStack
 //! ```
+//!
+//! The `HashList`-tiered cell is empty because `LruHybridStack` has been
+//! removed from the crate: it was behaviourally identical to
+//! `LruCompactHybridStack` and cost 112 B/object of eviction stack against
+//! its 72. The layout comparison it anchored lives in git history.
 //!
 //! Deliberately carries NO payload. `LruStack` ignores the size argument
 //! entirely (`fn insert(&mut self, key, _: ObjectSize)`) because a non-tiered

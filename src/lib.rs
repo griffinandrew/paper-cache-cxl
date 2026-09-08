@@ -113,18 +113,17 @@ use crate::object_store::ObjectStore;
 #[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 use crate::value::ValueShape;
 
-// Shared tier-size unit type (bytes/Mb/Gb), used by `lru_hybrid_cache`,
-// `lfu_hybrid_cache`, `two_q_hybrid_cache`, and `fifo_hybrid_cache` so none
-// of them has to depend on any of the others for it.
+// Shared tier-size unit type (bytes/Mb/Gb), used by every hybrid design so
+// none of them has to depend on any of the others for it.
 #[cfg(feature = "hybrid_cache_common")]
 mod size;
 
 #[cfg(feature = "hybrid_cache_common")]
 pub use crate::size::CacheTierSize;
 
-// Shared value type for every hybrid design. Each design's module also
-// re-exports it for source compatibility, so `paper_cache::TieredBuffer` and
-// `paper_cache::<design>_hybrid_cache::TieredBuffer` both work.
+// Shared value type for every hybrid design: `paper_cache::TieredBuffer`.
+// The per-design `<design>_hybrid_cache` shim modules that used to re-export
+// it are gone, along with the designs they named.
 #[cfg(feature = "hybrid_cache_common")]
 mod tiered_buffer;
 
@@ -132,9 +131,8 @@ mod tiered_buffer;
 pub use crate::tiered_buffer::TieredBuffer;
 
 // Design-neutral view of whichever hybrid design a cache is running. The only
-// stats accessor: the per-design `<design>_hybrid_stats()` methods are gone and
-// the `<Design>HybridStats` names are aliases of this one struct. See
-// `hybrid_stats.rs`'s module doc.
+// stats accessor: the per-design `<design>_hybrid_stats()` methods and the
+// `<Design>HybridStats` aliases are gone. See `hybrid_stats.rs`'s module doc.
 #[cfg(feature = "hybrid_cache_common")]
 mod hybrid_stats;
 
@@ -143,189 +141,6 @@ pub use crate::hybrid_stats::HybridStats;
 
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 pub mod tiering;
-
-// Single-instance, segmented-LRU hybrid cache: one PaperCache<K, TieredBuffer>.
-#[cfg(feature = "lru_hybrid_cache")]
-pub mod lru_hybrid_cache;
-
-#[cfg(feature = "lru_hybrid_cache")]
-pub use crate::lru_hybrid_cache::LruHybridStats;
-
-// Single-instance, segmented-LFU hybrid cache. Same architecture as
-// `lru_hybrid_cache` (one PaperCache<K, TieredBuffer>, not two composed
-// instances) but the fast/slow boundary is frequency-ordered rather than
-// recency-ordered — see the `lfu_hybrid_cache` module docs.
-#[cfg(feature = "lfu_hybrid_cache")]
-pub mod lfu_hybrid_cache;
-
-#[cfg(feature = "lfu_hybrid_cache")]
-pub use crate::lfu_hybrid_cache::LfuHybridStats;
-
-// Single-instance, segmented-2Q hybrid cache. Same one-PaperCache<K,
-// TieredBuffer> architecture as `lru_hybrid_cache`/`lfu_hybrid_cache`, but
-// admission always lands in a one-access FIFO queue in the slow tier —
-// see the `two_q_hybrid_cache` module docs.
-#[cfg(feature = "two_q_hybrid_cache")]
-pub mod two_q_hybrid_cache;
-
-#[cfg(feature = "two_q_hybrid_cache")]
-pub use crate::two_q_hybrid_cache::TwoQHybridStats;
-
-// Two-tier segmented-2Q hybrid cache with the one-access FIFO queue in the
-// FAST tier — same design as `two_q_hybrid_cache` except admission is a DRAM
-// write rather than a synchronous PMEM allocation; see that module's docs.
-#[cfg(feature = "two_q_fast_admission_hybrid_cache")]
-pub mod two_q_fast_admission_hybrid_cache;
-
-#[cfg(feature = "two_q_fast_admission_hybrid_cache")]
-pub use crate::two_q_fast_admission_hybrid_cache::TwoQFastAdmissionHybridStats;
-
-// As above, but a one-access object that ages out without a second access is
-// reprieved into the slow tier instead of evicted; see that module's docs.
-#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
-pub mod two_q_fast_admission_reprieve_hybrid_cache;
-
-#[cfg(feature = "two_q_fast_admission_reprieve_hybrid_cache")]
-pub use crate::two_q_fast_admission_reprieve_hybrid_cache::TwoQFastAdmissionReprieveHybridStats;
-
-// The FULL three-queue 2Q with fast-tier admission -- the only design here
-// whose queue algorithm matches `PaperPolicy::TwoQ`'s. `a1_out` holds real
-// resident objects in the slow tier rather than ghosts, and `k_out` is a
-// live parameter; see that module's docs.
-#[cfg(feature = "two_q_full_fast_admission_hybrid_cache")]
-pub mod two_q_full_fast_admission_hybrid_cache;
-
-#[cfg(feature = "two_q_full_fast_admission_hybrid_cache")]
-pub use crate::two_q_full_fast_admission_hybrid_cache::TwoQFullFastAdmissionHybridStats;
-
-// Single-instance, segmented-FIFO hybrid cache. Same one-PaperCache<K,
-// TieredBuffer> architecture as the other three, but with no promotion
-// policy at all — an object's position and tier are fixed for life once
-// admitted — see the `fifo_hybrid_cache` module docs.
-#[cfg(feature = "fifo_hybrid_cache")]
-pub mod fifo_hybrid_cache;
-
-#[cfg(feature = "fifo_hybrid_cache")]
-pub use crate::fifo_hybrid_cache::FifoHybridStats;
-
-// Single-instance, segmented-LRU hybrid cache with a size-split fast AND
-// slow tier. Same one-PaperCache<K, TieredBuffer> architecture and LRU
-// admission/promotion/demotion/eviction semantics as `lru_hybrid_cache`, but
-// both tiers' bookkeeping are each further split into two size-routed
-// segments — see the `lru_sized_hybrid_cache` module docs.
-#[cfg(feature = "lru_sized_hybrid_cache")]
-pub mod lru_sized_hybrid_cache;
-
-#[cfg(feature = "lru_sized_hybrid_cache")]
-pub use crate::lru_sized_hybrid_cache::LruSizedHybridStats;
-
-// Single-instance hybrid cache with a DIFFERENT eviction discipline per tier:
-// recency (LRU) in the fast tier, frequency (LFU) in the slow tier. The first
-// design here whose two tiers do not rank by the same metric -- see the
-// `lru_lfu_hybrid_cache` module docs.
-#[cfg(feature = "lru_lfu_hybrid_cache")]
-pub mod lru_lfu_hybrid_cache;
-
-#[cfg(feature = "lru_lfu_hybrid_cache")]
-pub use crate::lru_lfu_hybrid_cache::LruLfuHybridStats;
-
-// Single-instance, segmented-S3-FIFO hybrid cache. Same one-PaperCache<K,
-// TieredBuffer> architecture as the other hybrids. Structurally closest to
-// `two_q_hybrid_cache` (a one-access FIFO queue always in the slow tier
-// feeding a segmented main queue), but the main queue's promotion is the
-// classic S3-FIFO/CLOCK lazy, reference-bit-gated mechanism rather than
-// `two_q_hybrid_cache`'s eager, reorder-on-every-touch LRU one — see the
-// `s3_fifo_hybrid_cache` module docs.
-#[cfg(feature = "s3_fifo_hybrid_cache")]
-pub mod s3_fifo_hybrid_cache;
-
-#[cfg(feature = "s3_fifo_hybrid_cache")]
-pub use crate::s3_fifo_hybrid_cache::S3FifoHybridStats;
-
-// Single-instance, segmented-2Q hybrid cache with a ghost queue. Same
-// architecture as `two_q_hybrid_cache` plus a bare-key ghost queue -- see
-// the `two_q_ghost_hybrid_cache` module docs.
-#[cfg(feature = "two_q_ghost_hybrid_cache")]
-pub mod two_q_ghost_hybrid_cache;
-
-#[cfg(feature = "two_q_ghost_hybrid_cache")]
-pub use crate::two_q_ghost_hybrid_cache::TwoQGhostHybridStats;
-
-// Single-instance, segmented-S3-FIFO hybrid cache with a ghost queue. Same
-// architecture as `s3_fifo_hybrid_cache` plus a bare-key ghost queue -- see
-// the `s3_fifo_ghost_hybrid_cache` module docs.
-#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
-pub mod s3_fifo_ghost_hybrid_cache;
-
-#[cfg(feature = "s3_fifo_ghost_hybrid_cache")]
-pub use crate::s3_fifo_ghost_hybrid_cache::S3FifoGhostHybridStats;
-
-// `s3_fifo_ghost_hybrid_cache` plus one more change: demotion is now
-// reference-bit gated too, not just eviction -- see the
-// `s3_fifo_ghost_lazy_demotion_hybrid_cache` module docs.
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
-pub mod s3_fifo_ghost_lazy_demotion_hybrid_cache;
-
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache")]
-pub use crate::s3_fifo_ghost_lazy_demotion_hybrid_cache::S3FifoGhostLazyDemotionHybridStats;
-
-// `s3_fifo_ghost_lazy_demotion_hybrid_cache` plus one more change: the
-// one-access queue now lives in the FAST tier instead of the slow tier --
-// see the `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` module
-// docs.
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
-pub mod s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache;
-
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache")]
-pub use crate::s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache::S3FifoGhostLazyDemotionFastAdmissionHybridStats;
-
-// `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` plus one more
-// addition: a checkpoint roughly halfway through the SLOW portion of the
-// main queue -- see the
-// `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache` module
-// docs.
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
-pub mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache;
-
-#[cfg(feature = "s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache")]
-pub use crate::s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache::S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStats;
-
-// `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache` minus
-// the ghost queue (removed entirely) -- a one-access-queue key that ages
-// out is spliced into the slow tier of the main queue instead of being
-// evicted. See the
-// `s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache`
-// module docs.
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
-pub mod s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache;
-
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache")]
-pub use crate::s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStats;
-
-// The reprieve design with NO mid-slow-tier checkpoint -- see the
-// `s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache` module docs for
-// why both earlier checkpoint designs were dropped.
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
-pub mod s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache;
-
-#[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
-pub mod s3_fifo_lazy_demotion_reprieve_hybrid_cache;
-
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache")]
-pub use crate::s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_cache::S3FifoLazyDemotionFastAdmissionReprieveHybridStats;
-
-#[cfg(feature = "s3_fifo_lazy_demotion_reprieve_hybrid_cache")]
-pub use crate::s3_fifo_lazy_demotion_reprieve_hybrid_cache::S3FifoLazyDemotionReprieveHybridStats;
-
-// `s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_hybrid_cache` with the
-// approximate mid-slow-segment cursor replaced by a real two-segment slow
-// tier, checking every object's reference bit as it crosses -- see the
-// `s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache` module docs.
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
-pub mod s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache;
-
-#[cfg(feature = "s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache")]
-pub use crate::s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_hybrid_cache::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStats;
 
 // Re-exported so `PaperCache::tier_of`'s return type is nameable by callers
 // without reaching into the private `worker` module tree directly.
@@ -2132,9 +1947,8 @@ unsafe impl<K, V, S> Send for PaperCache<K, V, S> {}
 // is exposed, so sharing a `&PaperCache` across threads is safe.
 unsafe impl<K, V, S> Sync for PaperCache<K, V, S> {}
 
-/// Builds the object map every hybrid-cache design (`lru_hybrid_cache`/
-/// `lfu_hybrid_cache`/`two_q_hybrid_cache`/`fifo_hybrid_cache`/
-/// `lru_sized_hybrid_cache`) stores its objects in -- mirrors Shape B's
+/// Builds the object map every hybrid-cache design stores its objects in --
+/// mirrors Shape B's
 /// `with_hasher` (see above) rather than hardcoding `DashMap`, so
 /// `hashbrown_dram` gets the same plain-DRAM `hashbrown::HashMap` object
 /// table it already gives the non-hybrid storage combos, instead of always
@@ -2193,17 +2007,14 @@ fn s_three_fifo_starves_main(policy: PaperPolicy, max_size: CacheSize) -> bool {
 /// from `new_hybrid` so it can be CALLED: the `_ => true` arm below fails
 /// OPEN, so a design missing from it is silently ACCEPTED with parameters
 /// its baseline rejects, and as a `let` inside the constructor that could
-/// not be asserted on. `compact_parity` now checks every baseline/compact
-/// pair agrees here.
+/// not be asserted on.
 fn params_ok(policy: PaperPolicy) -> bool {
 	match policy {
-		PaperPolicy::LruLfuHybrid(promote_k)
-		| PaperPolicy::LruLfuCompactHybrid(promote_k) => promote_k != 0,
+		PaperPolicy::LruLfuCompactHybrid(promote_k) => promote_k != 0,
 
 		// The one two-ratio design: BOTH must be in range, so it cannot
 		// join the single-ratio group below.
-		PaperPolicy::TwoQFullFastAdmissionHybrid(k_in, k_out)
-		| PaperPolicy::TwoQFullFastAdmissionCompactHybrid(k_in, k_out) => {
+		PaperPolicy::TwoQFullFastAdmissionCompactHybrid(k_in, k_out) => {
 			(0.0..=1.0).contains(&k_in) && (0.0..=1.0).contains(&k_out)
 		},
 
@@ -2213,14 +2024,10 @@ fn params_ok(policy: PaperPolicy) -> bool {
 		// cache's overall `max_size`, so `k_in == 1.0` gives the FIFO
 		// queue the whole cache -- extreme, but every queue still has
 		// capacity and eviction drains the FIFO tail unconditionally.
-		PaperPolicy::TwoQHybrid(r)
-		| PaperPolicy::TwoQCompactHybrid(r)
+		PaperPolicy::TwoQCompactHybrid(r)
 		| PaperPolicy::TwoQFastAdmissionCompactHybrid(r)
-		| PaperPolicy::TwoQFastAdmissionHybrid(r)
 		| PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(r)
-		| PaperPolicy::TwoQFastAdmissionReprieveHybrid(r)
-		| PaperPolicy::TwoQGhostCompactHybrid(r)
-		| PaperPolicy::TwoQGhostHybrid(r) => (0.0..=1.0).contains(&r),
+		| PaperPolicy::TwoQGhostCompactHybrid(r) => (0.0..=1.0).contains(&r),
 
 		// The s3-fifo family EXCLUDES 1.0. These stacks size the main
 		// queue at `(1 - ratio) * max_size`, mirroring
@@ -2233,19 +2040,14 @@ fn params_ok(policy: PaperPolicy) -> bool {
 		// that unreachable rather than guarding it after the fact.
 		// (`SThreeFifoStack` has the same degeneracy at 1.0; its own
 		// parser is tightened to match.)
-		PaperPolicy::S3FifoHybrid(r)
-		| PaperPolicy::S3FifoFaithfulCompactHybrid(r)
+		PaperPolicy::S3FifoFaithfulCompactHybrid(r)
 		| PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(r)
 		| PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(r)
 		| PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(r)
 		| PaperPolicy::S3FifoCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostCompactHybrid(r)
-		| PaperPolicy::S3FifoGhostHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(r)
-		| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
-		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
-		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(r) => {
 			(0.0..1.0).contains(&r)
 		},
@@ -2260,13 +2062,9 @@ fn params_ok(policy: PaperPolicy) -> bool {
 		// can report itself full at zero capacity. Their real budgets
 		// (`one_access_capacity` and `fast_capacity`) partition the
 		// DRAM/PMEM axis instead, which `1 - ratio` says nothing about.
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(r)
-		| PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(r)
-		| PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(r)
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(r)
 		| PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(r)
-		| PaperPolicy::S3FifoLazyDemotionReprieveHybrid(r)
 		| PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(r)
-		| PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(r)
 		| PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(r) => {
 			(0.0..=1.0).contains(&r)
 		},
@@ -2277,17 +2075,12 @@ fn params_ok(policy: PaperPolicy) -> bool {
 
 fn s3_fifo_queue_budgets(policy: PaperPolicy) -> Option<(f64, bool)> {
 	match policy {
-		// These five size main at `(1 - ratio) * max_size`, mirroring
+		// These nine size main at `(1 - ratio) * max_size`, mirroring
 		// `SThreeFifoStack`, and gate eviction on its fullness.
-		PaperPolicy::S3FifoHybrid(r)
-		| PaperPolicy::S3FifoCompactHybrid(r)
+		PaperPolicy::S3FifoCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostCompactHybrid(r)
-		| PaperPolicy::S3FifoGhostHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(r)
-		| PaperPolicy::S3FifoGhostLazyDemotionHybrid(r)
-		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(r)
-		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(r)
 		| PaperPolicy::S3FifoFaithfulCompactHybrid(r)
 		| PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(r)
 		| PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(r)
@@ -2295,13 +2088,9 @@ fn s3_fifo_queue_budgets(policy: PaperPolicy) -> Option<(f64, bool)> {
 		| PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(r) => Some((r, true)),
 
 		// The reprieve stacks: one-access budget only.
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(r)
-		| PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(r)
-		| PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(r)
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(r)
 		| PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(r)
-		| PaperPolicy::S3FifoLazyDemotionReprieveHybrid(r)
 		| PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(r)
-		| PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(r)
 		| PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(r) => Some((r, false)),
 
 		_ => None,
@@ -2316,7 +2105,7 @@ fn s3_fifo_queue_budgets(policy: PaperPolicy) -> Option<(f64, bool)> {
 /// `hybrid_policy::admission_tier` takes inside `set()`.
 ///
 /// Only one other impl block on this type exists, below: the size-split
-/// design's `new_sized`/`with_hasher_sized`, which take three sizing scalars
+/// design's `new_sized_compact`/`with_hasher_sized_compact`, which take three sizing scalars
 /// instead of one and so cannot share this block's constructor.
 #[cfg(feature = "hybrid_cache_common")]
 impl<K, S> PaperCache<K, TieredBuffer, S>
@@ -2330,14 +2119,15 @@ where
 	/// [`Self::set_fast_tier_size`]). Policy parameters (`k_in`, ghost
 	/// ratios, `promote_k`, ...) travel inside the [`PaperPolicy`] value.
 	///
-	/// The size-split design has its own constructor, [`Self::new_sized`],
-	/// because it takes three sizing scalars rather than one.
+	/// The size-split design has its own constructor,
+	/// [`Self::new_sized_compact`], because it takes three sizing scalars
+	/// rather than one.
 	///
 	/// # Errors
 	///
 	/// [`CacheError::InvalidPolicy`] if `policy` is not a hybrid design (or
-	/// is one of the two size-split designs, which `new_sized`/
-	/// `new_sized_compact` serve), if its parameters are
+	/// is the size-split design, which `new_sized_compact` serves), if its
+	/// parameters are
 	/// out of range, or -- for the s3-fifo designs that size a main queue at
 	/// `(1 - ratio) * max_size` -- if that budget truncates to zero at this
 	/// `max_size`, which would leave the eviction loop unable to free
@@ -2364,7 +2154,7 @@ where
 		Self::new_hybrid(max_size, fast_tier_size, policy, hasher)
 	}
 
-	// `lru_sized_hybrid_cache` doesn't call this: it needs three sizing
+	// The size-split design doesn't call this: it needs three sizing
 	// scalars (two independent fast-segment capacities + a threshold)
 	// threaded to three different places rather than this method's single
 	// `CacheTierSize`, so it has its own bespoke `new_sized_hybrid` instead
@@ -2381,10 +2171,10 @@ where
 		}
 
 		// The size-split design needs three sizing scalars and has its own
-		// constructor (`new_sized`); everything non-hybrid is simply not a
-		// tiered design.
+		// constructor (`new_sized_compact`); everything non-hybrid is simply
+		// not a tiered design.
 		if !policy.is_hybrid()
-			|| matches!(policy, PaperPolicy::LruSizedHybrid | PaperPolicy::LruSizedCompactHybrid)
+			|| matches!(policy, PaperPolicy::LruSizedCompactHybrid)
 		{
 			return Err(CacheError::InvalidPolicy);
 		}
@@ -2451,10 +2241,10 @@ where
 		// over `V` and cannot ask an arbitrary value which tier it occupies,
 		// which is why a stack emitting a migration for an already-correctly
 		// -placed object used to cost a full allocate-and-memcpy that produced
-		// a byte-identical object at a new address. `LfuHybridStack` did
-		// exactly that on every latched admission (445,465,067 migrations
+		// a byte-identical object at a new address. `LfuCompactHybridStack`
+		// did exactly that on every latched admission (445,465,067 migrations
 		// against ~448M sets on cluster12 before it was fixed at source), and
-		// `TwoQHybridStack` still reaches this case legitimately under a
+		// `TwoQCompactHybridStack` still reaches this case legitimately under a
 		// lookaside workload: `admission_tier` returns `Fast` for a re-set --
 		// correct, since the key is now MRU -- so `set()` has already built
 		// the bytes in DRAM by the time `touch_main_fast` emits its
@@ -2846,9 +2636,9 @@ where
 	/// If the supplied size is zero, returns a [`CacheError`].
 	///
 	/// Note this is the *overall* cache capacity, independent of the
-	/// fast-tier budget — see [`Self::set_fast_tier_size`]. (`two_q_hybrid_cache`
-	/// additionally rescales its FIFO queue's byte budget proportionally,
-	/// inside `TwoQHybridStack::resize` -- not this method.)
+	/// fast-tier budget — see [`Self::set_fast_tier_size`]. (The 2Q designs
+	/// additionally rescale their FIFO queue's byte budget proportionally,
+	/// inside `TwoQCompactHybridStack::resize` -- not this method.)
 	///
 	/// # Errors
 	///
@@ -2922,11 +2712,10 @@ where
 	/// tier gauges, in a design-neutral shape.
 	///
 	/// The only stats accessor there is: the per-design
-	/// `<design>_hybrid_stats()` methods were removed with the runtime-policy
-	/// unification, and the 19 `<Design>HybridStats` names are aliases of the
-	/// one `HybridStats` struct. The 8 size-split gauges read zero unless the
-	/// cache is running `LruSizedHybrid`. Read from
-	/// the design and want its extras.
+	/// `<design>_hybrid_stats()` methods and the `<Design>HybridStats` aliases
+	/// were removed with the runtime-policy unification, leaving this one
+	/// `HybridStats` struct. The 8 size-split gauges read zero unless the
+	/// cache is running `LruSizedCompactHybrid`.
 	#[must_use]
 	pub fn hybrid_stats(&self) -> HybridStats {
 		self.status.hybrid_stats()
@@ -2962,10 +2751,10 @@ where
 
 /// Single-instance, segmented-LRU hybrid cache with a size-split fast AND
 /// slow tier: same `PaperCache<K, TieredBuffer>` architecture and LRU
-/// admission/promotion/demotion/eviction semantics as `lru_hybrid_cache`,
-/// but each tier's bookkeeping is split into two independently-tracked
-/// segments ("small"/"large") by object size. See the
-/// `lru_sized_hybrid_cache` module docs.
+/// admission/promotion/demotion/eviction semantics as the plain segmented-LRU
+/// design, but each tier's bookkeeping is split into two independently-tracked
+/// segments ("small"/"large") by object size. See
+/// `lru_sized_compact_hybrid_stack.rs`'s module doc.
 ///
 /// Sizing knobs: [`Self::set_fast_tier_size`]/[`Self::fast_tier_size`]
 /// (defined on the shared generic block above) resize/read the SMALL fast
@@ -2981,14 +2770,14 @@ where
 	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
 	S: Default + Clone + BuildHasher,
 {
-	/// Creates an empty `PaperCache` running `PaperPolicy::LruSizedHybrid`,
-	/// with the given overall `max_size` and initial small/large fast-segment
-	/// byte budgets and size-classification threshold (each independently
-	/// adjustable afterward via [`Self::set_fast_tier_size`]/
-	/// [`Self::set_large_fast_tier_size`]/[`Self::set_size_threshold`]). An
-	/// object whose size is strictly below `size_threshold` routes to the
-	/// small segment on admission, promotion, or a reclassifying overwrite;
-	/// at or above routes to the large segment.
+	/// Creates an empty `PaperCache` running
+	/// `PaperPolicy::LruSizedCompactHybrid`, with the given overall `max_size`
+	/// and initial small/large fast-segment byte budgets and
+	/// size-classification threshold (each independently adjustable afterward
+	/// via [`Self::set_fast_tier_size`]/[`Self::set_large_fast_tier_size`]/
+	/// [`Self::set_size_threshold`]). An object whose size is strictly below
+	/// `size_threshold` routes to the small segment on admission, promotion,
+	/// or a reclassifying overwrite; at or above routes to the large segment.
 	///
 	/// # Errors
 	///
@@ -2997,30 +2786,6 @@ where
 	/// or `large_fast_tier_size` resolves to zero bytes or exceeds
 	/// `max_size` (checked independently -- there is no requirement that
 	/// their sum stay under `max_size`). `size_threshold` is never rejected.
-	pub fn new_sized(
-		max_size: CacheSize,
-		small_fast_tier_size: CacheTierSize,
-		large_fast_tier_size: CacheTierSize,
-		size_threshold: CacheTierSize,
-	) -> Result<Self, CacheError> {
-		Self::with_hasher_sized(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold, Default::default())
-	}
-
-	/// Creates an empty size-split cache with the supplied hasher. See [`Self::new_sized`].
-	pub fn with_hasher_sized(
-		max_size: CacheSize,
-		small_fast_tier_size: CacheTierSize,
-		large_fast_tier_size: CacheTierSize,
-		size_threshold: CacheTierSize,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		Self::new_sized_hybrid(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold, PaperPolicy::LruSizedHybrid, hasher)
-	}
-
-	/// Creates an empty `PaperCache` running
-	/// `PaperPolicy::LruSizedCompactHybrid` -- the slab-backed compaction of
-	/// `PaperPolicy::LruSizedHybrid`, behaviourally identical to it. Same
-	/// arguments, same errors, same runtime accessors as [`Self::new_sized`].
 	pub fn new_sized_compact(
 		max_size: CacheSize,
 		small_fast_tier_size: CacheTierSize,
@@ -3092,10 +2857,10 @@ where
 		// over `V` and cannot ask an arbitrary value which tier it occupies,
 		// which is why a stack emitting a migration for an already-correctly
 		// -placed object used to cost a full allocate-and-memcpy that produced
-		// a byte-identical object at a new address. `LfuHybridStack` did
-		// exactly that on every latched admission (445,465,067 migrations
+		// a byte-identical object at a new address. `LfuCompactHybridStack`
+		// did exactly that on every latched admission (445,465,067 migrations
 		// against ~448M sets on cluster12 before it was fixed at source), and
-		// `TwoQHybridStack` still reaches this case legitimately under a
+		// `TwoQCompactHybridStack` still reaches this case legitimately under a
 		// lookaside workload: `admission_tier` returns `Fast` for a re-set --
 		// correct, since the key is now MRU -- so `set()` has already built
 		// the bytes in DRAM by the time `touch_main_fast` emits its
@@ -3310,434 +3075,12 @@ mod test_new_features {
     }
 }
 
-/// Exercises the real public `PaperCache<K, TieredBuffer>` API end to end.
-///
-/// Deliberately stays on the fast-tier-only path (fast_tier_size == max_size,
-/// tiny values) so no object ever demotes to the slow tier: `TieredBuffer::
-/// new_slow` allocates through the `Hybrid` slow-tier allocator, which
-/// requires real PMEM/DAX
-/// hardware and aborts ("memory allocation ... failed") in a plain dev
-/// sandbox. A full integration test covering demotion/promotion/eviction
-/// belongs in `tests/hybrid_cache_integration.rs` (not yet written —
-/// see `CLAUDE.md`'s `lru_hybrid_cache` plan, step 12) and should be run on
-/// PMEM-capable hardware.
-#[cfg(all(test, feature = "lru_hybrid_cache"))]
-mod test_lru_hybrid_cache {
-	use crate::PaperPolicy;
-    use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
-
-    #[test]
-    fn basic_construction_and_fast_tier_only_roundtrip() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::LruHybrid).expect("cache should construct");
-
-        cache.set(1u32, b"hello world", None).expect("set should succeed");
-        assert!(cache.has(&1u32));
-        assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-
-        let stats = cache.hybrid_stats();
-        assert_eq!(stats.demotions, 0);
-        assert_eq!(stats.promotions, 0);
-        assert_eq!(stats.evictions, 0);
-
-        assert_eq!(cache.fast_tier_size(), 1_000_000);
-        cache.set_fast_tier_size(CacheTierSize::Bytes(500_000)).expect("resize should succeed");
-        assert_eq!(cache.fast_tier_size(), 500_000);
-
-        cache.del(&1u32).expect("del should succeed");
-        assert!(!cache.has(&1u32));
-        assert_eq!(cache.tier_of(&1u32), None);
-    }
-
-    #[test]
-    fn invalid_fast_tier_size_is_rejected() {
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000), PaperPolicy::LruHybrid),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0), PaperPolicy::LruHybrid),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-
-        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), PaperPolicy::LruHybrid)
-            .expect("cache should construct");
-
-        assert!(matches!(
-            cache.set_fast_tier_size(CacheTierSize::Bytes(2000)),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-    }
-
-    #[test]
-    fn ttl_is_preserved_across_a_set() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::LruHybrid).expect("cache should construct");
-
-        cache.set(1u32, b"value", Some(60)).expect("set should succeed");
-        assert!(cache.ttl(&1u32, Some(120)).is_ok());
-        assert_eq!(cache.get(&1u32).unwrap(), b"value");
-    }
-}
-
-/// Exercises the real public `PaperCache<K, TieredBuffer>` API end to end
-/// for `lfu_hybrid_cache`. See `test_lru_hybrid_cache`'s doc comment for why
-/// this deliberately stays on the fast-tier-only path (no PMEM allocation) —
-/// the full tier-crossing coverage lives in
-/// `tests/hybrid_cache_integration.rs`.
-#[cfg(all(test, feature = "lfu_hybrid_cache"))]
-mod test_lfu_hybrid_cache {
-	use crate::PaperPolicy;
-    use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
-
-    #[test]
-    fn basic_construction_and_fast_tier_only_roundtrip() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::LfuHybrid).expect("cache should construct");
-
-        cache.set(1u32, b"hello world", None).expect("set should succeed");
-        assert!(cache.has(&1u32));
-        assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-
-        let stats = cache.hybrid_stats();
-        assert_eq!(stats.demotions, 0);
-        assert_eq!(stats.promotions, 0);
-        assert_eq!(stats.evictions, 0);
-
-        assert_eq!(cache.fast_tier_size(), 1_000_000);
-        cache.set_fast_tier_size(CacheTierSize::Bytes(500_000)).expect("resize should succeed");
-        assert_eq!(cache.fast_tier_size(), 500_000);
-
-        cache.del(&1u32).expect("del should succeed");
-        assert!(!cache.has(&1u32));
-        assert_eq!(cache.tier_of(&1u32), None);
-    }
-
-    #[test]
-    fn invalid_fast_tier_size_is_rejected() {
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000), PaperPolicy::LfuHybrid),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0), PaperPolicy::LfuHybrid),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-
-        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), PaperPolicy::LfuHybrid)
-            .expect("cache should construct");
-
-        assert!(matches!(
-            cache.set_fast_tier_size(CacheTierSize::Bytes(2000)),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-    }
-
-    #[test]
-    fn ttl_is_preserved_across_a_set() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::LfuHybrid).expect("cache should construct");
-
-        cache.set(1u32, b"value", Some(60)).expect("set should succeed");
-        assert!(cache.ttl(&1u32, Some(120)).is_ok());
-        assert_eq!(cache.get(&1u32).unwrap(), b"value");
-    }
-}
-
-/// Exercises the real public `PaperCache<K, TieredBuffer>` API end to end
-/// for `two_q_hybrid_cache`. Unlike `test_lru_hybrid_cache`/
-/// `test_lfu_hybrid_cache`, this module cannot avoid the real `Hybrid`
-/// PMEM allocator: `set()` always admits via `TieredBuffer::new_slow`
-/// regardless of `fast_tier_size`, so even a single `set()` call here pays
-/// the one-time PMEM pool warm-up cost (see `tests/hybrid_cache_integration.rs`'s
-/// module doc for details). The full tier-crossing coverage lives there.
-#[cfg(all(test, feature = "two_q_hybrid_cache"))]
-mod test_two_q_hybrid_cache {
-	use crate::PaperPolicy;
-    use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
-
-    #[test]
-    fn basic_construction_and_slow_tier_admission_roundtrip() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::TwoQHybrid(0.5)).expect("cache should construct");
-
-        cache.set(1u32, b"hello world", None).expect("set should succeed");
-        assert!(cache.has(&1u32));
-        assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
-
-        let stats = cache.hybrid_stats();
-        assert_eq!(stats.demotions, 0);
-        assert_eq!(stats.evictions, 0);
-
-        assert_eq!(cache.fast_tier_size(), 1_000_000);
-        cache.set_fast_tier_size(CacheTierSize::Bytes(500_000)).expect("resize should succeed");
-        assert_eq!(cache.fast_tier_size(), 500_000);
-
-        cache.del(&1u32).expect("del should succeed");
-        assert!(!cache.has(&1u32));
-        assert_eq!(cache.tier_of(&1u32), None);
-    }
-
-    #[test]
-    fn invalid_fast_tier_size_is_rejected() {
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000), PaperPolicy::TwoQHybrid(0.5)),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0), PaperPolicy::TwoQHybrid(0.5)),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-
-        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), PaperPolicy::TwoQHybrid(0.5))
-            .expect("cache should construct");
-
-        assert!(matches!(
-            cache.set_fast_tier_size(CacheTierSize::Bytes(2000)),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-    }
-
-    #[test]
-    fn invalid_k_in_is_rejected() {
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), PaperPolicy::TwoQHybrid(1.5)),
-            Err(CacheError::InvalidPolicy),
-        ));
-
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), PaperPolicy::TwoQHybrid(-0.1)),
-            Err(CacheError::InvalidPolicy),
-        ));
-    }
-
-    #[test]
-    fn ttl_is_preserved_across_a_set() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::TwoQHybrid(0.5)).expect("cache should construct");
-
-        cache.set(1u32, b"value", Some(60)).expect("set should succeed");
-        assert!(cache.ttl(&1u32, Some(120)).is_ok());
-        assert_eq!(cache.get(&1u32).unwrap(), b"value");
-    }
-}
-
-/// Exercises the real public `PaperCache<K, TieredBuffer>` API end to end
-/// for `fifo_hybrid_cache`. See `test_lru_hybrid_cache`'s doc comment for why
-/// this deliberately stays on the fast-tier-only path (no PMEM allocation) —
-/// the full tier-crossing coverage (including Correction 2's slow-tier
-/// overwrite path) lives in `tests/hybrid_cache_integration.rs`.
-#[cfg(all(test, feature = "fifo_hybrid_cache"))]
-mod test_fifo_hybrid_cache {
-	use crate::PaperPolicy;
-    use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
-
-    #[test]
-    fn basic_construction_and_fast_tier_only_roundtrip() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::FifoHybrid).expect("cache should construct");
-
-        cache.set(1u32, b"hello world", None).expect("set should succeed");
-        assert!(cache.has(&1u32));
-        assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-
-        let stats = cache.hybrid_stats();
-        assert_eq!(stats.demotions, 0);
-        assert_eq!(stats.promotions, 0);
-        assert_eq!(stats.evictions, 0);
-
-        assert_eq!(cache.fast_tier_size(), 1_000_000);
-        cache.set_fast_tier_size(CacheTierSize::Bytes(500_000)).expect("resize should succeed");
-        assert_eq!(cache.fast_tier_size(), 500_000);
-
-        cache.del(&1u32).expect("del should succeed");
-        assert!(!cache.has(&1u32));
-        assert_eq!(cache.tier_of(&1u32), None);
-    }
-
-    #[test]
-    fn invalid_fast_tier_size_is_rejected() {
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(2000), PaperPolicy::FifoHybrid),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(0), PaperPolicy::FifoHybrid),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-
-        let cache = PaperCache::<u32, TieredBuffer>::new(1000, CacheTierSize::Bytes(500), PaperPolicy::FifoHybrid)
-            .expect("cache should construct");
-
-        assert!(matches!(
-            cache.set_fast_tier_size(CacheTierSize::Bytes(2000)),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-    }
-
-    #[test]
-    fn ttl_is_preserved_across_a_set() {
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::FifoHybrid).expect("cache should construct");
-
-        cache.set(1u32, b"value", Some(60)).expect("set should succeed");
-        assert!(cache.ttl(&1u32, Some(120)).is_ok());
-        assert_eq!(cache.get(&1u32).unwrap(), b"value");
-    }
-
-    #[test]
-    fn overwrite_of_a_still_fast_key_stays_fast_and_keeps_working() {
-        // Sanity check for Correction 2's tier-aware `set()`: the common
-        // (both-Fast) case must not regress — overwriting a key that's
-        // still in the fast tier should stay fast and just work.
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), PaperPolicy::FifoHybrid).expect("cache should construct");
-
-        cache.set(1u32, b"hello", None).expect("set should succeed");
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-
-        cache.set(1u32, b"hello world", None).expect("overwrite should succeed");
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-        assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
-    }
-}
-
 /// Exercises the real public `PaperCache<K, TieredBuffer>` API for
-/// `lru_sized_hybrid_cache` end to end. Deliberately stays on the
-/// fast-tier-only path (both fast-segment capacities == max_size, tiny
-/// values) so no object ever demotes -- see `test_lru_hybrid_cache`'s
-/// identical rationale. A full integration test covering demotion/
-/// promotion/eviction across both segments and both tiers belongs in
-/// `tests/hybrid_cache_integration.rs` and should be run on
-/// PMEM-capable hardware.
-#[cfg(all(test, feature = "lru_sized_hybrid_cache"))]
-mod test_lru_sized_hybrid_cache {
-    use crate::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
-
-    #[test]
-    fn basic_construction_and_fast_tier_only_roundtrip() {
-        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000), // small segment == whole cache
-            CacheTierSize::Bytes(1_000_000), // large segment == whole cache
-            CacheTierSize::Bytes(1_000_000), // threshold huge -> everything classifies small
-        ).expect("cache should construct");
-
-        cache.set(1u32, b"hello world", None).expect("set should succeed");
-        assert!(cache.has(&1u32));
-        assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-
-        let stats = cache.hybrid_stats();
-        assert_eq!(stats.demotions, 0);
-        assert_eq!(stats.promotions, 0);
-        assert_eq!(stats.evictions, 0);
-
-        assert_eq!(cache.fast_tier_size(), 1_000_000);
-        cache.set_fast_tier_size(CacheTierSize::Bytes(500_000)).expect("resize should succeed");
-        assert_eq!(cache.fast_tier_size(), 500_000);
-
-        assert_eq!(cache.large_fast_tier_size(), 1_000_000);
-        cache.set_large_fast_tier_size(CacheTierSize::Bytes(500_000)).expect("resize should succeed");
-        assert_eq!(cache.large_fast_tier_size(), 500_000);
-
-        assert_eq!(cache.size_threshold(), 1_000_000);
-        cache.set_size_threshold(CacheTierSize::Bytes(4_096)).expect("threshold change should succeed");
-        assert_eq!(cache.size_threshold(), 4_096);
-
-        cache.del(&1u32).expect("del should succeed");
-        assert!(!cache.has(&1u32));
-        assert_eq!(cache.tier_of(&1u32), None);
-    }
-
-    #[test]
-    fn invalid_fast_tier_size_is_rejected() {
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new_sized(
-                1000, CacheTierSize::Bytes(2000), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
-            ),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new_sized(
-                1000, CacheTierSize::Bytes(0), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
-            ),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new_sized(
-                1000, CacheTierSize::Bytes(500), CacheTierSize::Bytes(2000), CacheTierSize::Bytes(100),
-            ),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-
-        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1000, CacheTierSize::Bytes(500), CacheTierSize::Bytes(500), CacheTierSize::Bytes(100),
-        ).expect("cache should construct");
-
-        assert!(matches!(
-            cache.set_fast_tier_size(CacheTierSize::Bytes(2000)),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-
-        assert!(matches!(
-            cache.set_large_fast_tier_size(CacheTierSize::Bytes(2000)),
-            Err(CacheError::InvalidFastTierSize),
-        ));
-    }
-
-    #[test]
-    fn ttl_is_preserved_across_a_set() {
-        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            CacheTierSize::Bytes(1_000_000),
-            CacheTierSize::Bytes(1_000_000),
-        ).expect("cache should construct");
-
-        cache.set(1u32, b"value", Some(60)).expect("set should succeed");
-        assert!(cache.ttl(&1u32, Some(120)).is_ok());
-        assert_eq!(cache.get(&1u32).unwrap(), b"value");
-    }
-
-    #[test]
-    fn overwrite_of_a_still_fast_key_stays_fast_and_keeps_working() {
-        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
-            1_000_000,
-            CacheTierSize::Bytes(1_000_000),
-            CacheTierSize::Bytes(1_000_000),
-            CacheTierSize::Bytes(1_000_000),
-        ).expect("cache should construct");
-
-        cache.set(1u32, b"hello", None).expect("set should succeed");
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-
-        cache.set(1u32, b"hello world", None).expect("overwrite should succeed");
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-        assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
-    }
-}
-
-/// Exercises the real public `PaperCache<K, TieredBuffer>` API for
-/// `lru_sized_compact_hybrid_cache` end to end, mirroring
-/// `test_lru_sized_hybrid_cache` one for one: the compact stack is a
-/// compaction of the size-split one, so the public surface has to be
-/// indistinguishable. Deliberately stays on the fast-tier-only path (both
-/// fast-segment capacities == max_size, tiny values) so no object ever
-/// demotes -- same rationale as the module it mirrors.
+/// `lru_sized_compact_hybrid_cache` end to end. Deliberately stays on the
+/// fast-tier-only path (both fast-segment capacities == max_size, tiny values)
+/// so no object ever demotes: `TieredBuffer::new_slow` allocates through the
+/// `Hybrid` slow-tier allocator, which needs real far-memory hardware. Full
+/// tier-crossing coverage lives in this design's integration test.
 #[cfg(all(test, feature = "lru_sized_compact_hybrid_cache"))]
 mod test_lru_sized_compact_hybrid_cache {
     use crate::{PaperCache, PaperPolicy, TieredBuffer, CacheTierSize, Tier, CacheError};
@@ -3778,23 +3121,15 @@ mod test_lru_sized_compact_hybrid_cache {
         assert_eq!(cache.tier_of(&1u32), None);
     }
 
-    /// Both size-split designs need three sizing scalars, so the generic
-    /// hybrid constructor must refuse them rather than quietly building one
+    /// The size-split design needs three sizing scalars, so the generic
+    /// hybrid constructor must refuse it rather than quietly building one
     /// from a single `CacheTierSize` (and a default second segment it was
-    /// never told about). The compact variant was added to that rejection
-    /// alongside the baseline; this pins both.
+    /// never told about). This pins that rejection.
     #[test]
-    fn the_generic_hybrid_constructor_rejects_both_size_split_designs() {
+    fn the_generic_hybrid_constructor_rejects_the_size_split_design() {
         assert!(matches!(
             PaperCache::<u32, TieredBuffer>::new(
                 1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::LruSizedCompactHybrid,
-            ),
-            Err(CacheError::InvalidPolicy),
-        ));
-
-        assert!(matches!(
-            PaperCache::<u32, TieredBuffer>::new(
-                1_000_000, CacheTierSize::Bytes(1_000_000), PaperPolicy::LruSizedHybrid,
             ),
             Err(CacheError::InvalidPolicy),
         ));
@@ -3909,201 +3244,6 @@ mod s_three_fifo_budget_tests {
 		assert!(!s_three_fifo_starves_main(PaperPolicy::TwoQ(1.0, 0.0), 1_000));
 		assert!(!s_three_fifo_starves_main(PaperPolicy::Lru, 1_000));
 		assert!(!s_three_fifo_starves_main(PaperPolicy::Lfu, 1_000));
-	}
-}
-
-/// Every compact stack must be behaviourally indistinguishable from the
-/// baseline it compacts. Four crate-level predicates decide how a policy is
-/// treated, and **all four fail OPEN** -- a design missing from them is not a
-/// compile error, it is a plausible default:
-///
-/// | predicate | missing arm yields |
-/// |---|---|
-/// | `params_ok` | `true` -- ACCEPTS parameters the baseline rejects |
-/// | `s3_fifo_queue_budgets` | `None` -- skips the queue-starvation check |
-/// | `PaperPolicy::is_hybrid` | `false` -- no fast tier at all |
-/// | `Display`/`FromStr` | a policy that cannot be named or parsed |
-///
-/// Every conversion in this series missed at least one, and none of them
-/// failed to build. This module pins each compact twin to its baseline, so
-/// the next conversion that forgets a site fails here instead of silently
-/// running a different algorithm than the one it is being compared against.
-#[cfg(all(test, feature = "hybrid_cache_common"))]
-mod compact_parity {
-	use crate::{PaperPolicy, params_ok, s3_fifo_queue_budgets};
-
-	/// Deliberately includes both endpoints and beyond: the 2Q family and the
-	/// reprieve designs take an INCLUSIVE upper bound while the s3-fifo family
-	/// EXCLUDES 1.0 (those size a main queue at `(1 - ratio) * max_size`, so
-	/// 1.0 leaves it zero bytes and the eviction loop spins). A twin placed in
-	/// the wrong group agrees everywhere except at exactly 1.0.
-	const RATIOS: [f64; 10] =
-		[-1.0, -0.001, 0.0, 0.001, 0.5, 0.999, 1.0, 1.001, 2.0, f64::NAN];
-
-	/// `promote_k == 0` degenerates to plain LRU and is rejected; the cap is
-	/// 16, so values far above it must still round-trip.
-	const THRESHOLDS: [u16; 6] = [0, 1, 2, 3, 16, u16::MAX];
-
-	fn pairs() -> Vec<(PaperPolicy, PaperPolicy)> {
-		let mut v = Vec::new();
-
-		macro_rules! ratio_pair {
-			($b:ident, $c:ident) => {
-				for r in RATIOS {
-					v.push((PaperPolicy::$b(r), PaperPolicy::$c(r)));
-				}
-			};
-		}
-		ratio_pair!(TwoQHybrid, TwoQCompactHybrid);
-		ratio_pair!(TwoQFastAdmissionHybrid, TwoQFastAdmissionCompactHybrid);
-		ratio_pair!(TwoQFastAdmissionReprieveHybrid, TwoQFastAdmissionReprieveCompactHybrid);
-		ratio_pair!(TwoQGhostHybrid, TwoQGhostCompactHybrid);
-		ratio_pair!(S3FifoHybrid, S3FifoCompactHybrid);
-		ratio_pair!(S3FifoGhostHybrid, S3FifoGhostCompactHybrid);
-		ratio_pair!(S3FifoGhostLazyDemotionHybrid, S3FifoGhostLazyDemotionCompactHybrid);
-		ratio_pair!(S3FifoGhostLazyDemotionFastAdmissionHybrid, S3FifoGhostLazyDemotionFastAdmissionCompactHybrid);
-		ratio_pair!(S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid, S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid);
-		ratio_pair!(S3FifoLazyDemotionReprieveHybrid, S3FifoLazyDemotionReprieveCompactHybrid);
-		ratio_pair!(S3FifoLazyDemotionFastAdmissionReprieveHybrid, S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid);
-		ratio_pair!(S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid, S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid);
-		ratio_pair!(S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid, S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid);
-
-		// The one two-ratio design: BOTH parameters must be in range, so it
-		// cannot join the single-ratio group.
-		for a in RATIOS {
-			for b in RATIOS {
-				v.push((
-					PaperPolicy::TwoQFullFastAdmissionHybrid(a, b),
-					PaperPolicy::TwoQFullFastAdmissionCompactHybrid(a, b),
-				));
-			}
-		}
-
-		for k in THRESHOLDS {
-			v.push((PaperPolicy::LruLfuHybrid(k), PaperPolicy::LruLfuCompactHybrid(k)));
-		}
-
-		v.push((PaperPolicy::LruHybrid, PaperPolicy::LruCompactHybrid));
-		v.push((PaperPolicy::LfuHybrid, PaperPolicy::LfuCompactHybrid));
-		v.push((PaperPolicy::FifoHybrid, PaperPolicy::FifoCompactHybrid));
-		v.push((PaperPolicy::LruSizedHybrid, PaperPolicy::LruSizedCompactHybrid));
-
-		v
-	}
-
-	/// The table is only exhaustive if it names every design. Anchor it to the
-	/// compiler-checked variant list rather than to a number typed by hand.
-	#[test]
-	fn the_pair_table_covers_every_hybrid_design() {
-		use std::collections::HashSet;
-		use std::mem::discriminant;
-
-		let mut designs = HashSet::new();
-		for (base, compact) in pairs() {
-			designs.insert(discriminant(&base));
-			designs.insert(discriminant(&compact));
-		}
-
-		assert_eq!(
-			designs.len(),
-			38,
-			"the pair table names {} enum variants, expected 38 (19 baselines + \
-			 19 compact twins). A design missing here is a design whose twin is \
-			 never checked against it at all.",
-			designs.len(),
-		);
-	}
-
-	/// `params_ok` ends in `_ => true`. A twin missing from it, or placed in a
-	/// group with the wrong bound, ACCEPTS a configuration its baseline
-	/// rejects -- and the two then run at different capacities while being
-	/// reported as the same experiment.
-	#[test]
-	fn every_compact_twin_agrees_with_its_baseline_on_params_ok() {
-		for (base, compact) in pairs() {
-			assert_eq!(
-				params_ok(base),
-				params_ok(compact),
-				"`{base}` and `{compact}` disagree on parameter validity: \
-				 baseline={}, compact={}. Either the twin is missing from \
-				 `params_ok` (and fell to `_ => true`), or it was put in a \
-				 group whose upper bound differs from its baseline's.",
-				params_ok(base),
-				params_ok(compact),
-			);
-		}
-	}
-
-	/// `s3_fifo_queue_budgets` returns `None` for an unlisted policy, which
-	/// skips the zero-capacity queue check entirely rather than failing.
-	#[test]
-	fn every_compact_twin_agrees_with_its_baseline_on_queue_budgets() {
-		for (base, compact) in pairs() {
-			let (b, c) = (s3_fifo_queue_budgets(base), s3_fifo_queue_budgets(compact));
-			match (b, c) {
-				(None, None) => {},
-				(Some((br, bmain)), Some((cr, cmain))) => assert!(
-					(br == cr || (br.is_nan() && cr.is_nan())) && bmain == cmain,
-					"`{base}` and `{compact}` disagree on queue budgets: {b:?} vs {c:?}",
-				),
-				_ => panic!(
-					"`{base}` and `{compact}` disagree on queue budgets: {b:?} vs {c:?} -- \
-					 an unlisted policy yields `None`, silently skipping the \
-					 queue-starvation check the baseline gets",
-				),
-			}
-		}
-	}
-
-	/// `is_hybrid` is a hand-written `matches!` and cannot fire a compile
-	/// error. A twin missing from it gets no fast tier at all.
-	#[test]
-	fn every_compact_twin_agrees_with_its_baseline_on_is_hybrid() {
-		for (base, compact) in pairs() {
-			assert!(base.is_hybrid(), "`{base}` is not reported as hybrid");
-			assert!(
-				compact.is_hybrid(),
-				"`{compact}` is not reported as hybrid but its baseline `{base}` is: \
-				 missing from the `is_hybrid` `matches!`, so it would run with no fast tier",
-			);
-		}
-	}
-
-	/// A twin whose `FromStr` prefix guard is ordered after a baseline it is a
-	/// superstring of parses as the WRONG policy rather than failing.
-	#[test]
-	fn every_compact_twin_round_trips_through_display_and_from_str() {
-		for (base, compact) in pairs() {
-			let (bt, ct) = (format!("{base}"), format!("{compact}"));
-			let (bp, cp) = (bt.parse::<PaperPolicy>(), ct.parse::<PaperPolicy>());
-
-			// Parity first: the twin must accept exactly what its baseline
-			// accepts. A NaN ratio renders but is not a parseable policy, and
-			// that has to be true of BOTH or the pair is not interchangeable.
-			assert_eq!(
-				bp.is_ok(),
-				cp.is_ok(),
-				"`{bt}` parses={} but `{ct}` parses={} -- the twin disagrees with \
-				 its baseline about what is a valid policy string",
-				bp.is_ok(),
-				cp.is_ok(),
-			);
-
-			// Where the baseline round-trips, the twin must too -- and must not
-			// be captured by another design\'s prefix guard on the way back.
-			if let (Ok(bv), Ok(cv)) = (bp, cp) {
-				assert_eq!(
-					format!("{bv}"), bt,
-					"`{bt}` round-trips to `{bv}` -- a prefix guard matched the wrong design",
-				);
-				assert_eq!(
-					format!("{cv}"), ct,
-					"`{ct}` round-trips to `{cv}` -- a prefix guard matched the wrong design. \
-					 Compact policy strings are SUPERSTRINGS of their baselines, so an \
-					 arm ordered after the baseline\'s captures them.",
-				);
-			}
-		}
 	}
 }
 

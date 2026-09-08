@@ -7,10 +7,12 @@
 
 //! Shared tier-size unit type.
 //!
-//! Used by `lru_hybrid_cache`/`lfu_hybrid_cache`/`two_q_hybrid_cache`/
-//! `fifo_hybrid_cache` (fast-tier capacity, including the runtime-adjustable
-//! `PaperCache::set_fast_tier_size`) so that tier capacities can be specified in
-//! bytes, mebibytes, or gibibytes without any of them depending on the others.
+//! Used by every hybrid design (`lru_compact_hybrid_cache`,
+//! `lfu_compact_hybrid_cache`, `two_q_compact_hybrid_cache`,
+//! `fifo_compact_hybrid_cache` and the rest) for the fast-tier capacity,
+//! including the runtime-adjustable `PaperCache::set_fast_tier_size`, so that
+//! tier capacities can be specified in bytes, mebibytes, or gibibytes without
+//! any of them depending on the others.
 
 /// A size specification for a cache tier, in bytes, mebibytes, or gibibytes.
 ///

@@ -38,6 +38,14 @@
 //! The algorithm. Buckets are still one-per-distinct-frequency, `bump` still
 //! moves a key to the adjacent bucket in O(1), and the minimum frequency is
 //! still O(1) to find. This is a representation change only.
+//!
+//! **The baseline named above no longer exists in this crate.** Every
+//! non-compact hybrid stack was removed once its compact twin was shown
+//! behaviourally identical at 72 B/object of eviction stack instead of 112.
+//! References to it here are historical: they say what this design is a
+//! compaction OF, and they are the reason the structure looks the way it
+//! does. Git history holds the baseline and the differential tests that
+//! proved the two agreed.
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 use std::collections::HashMap;

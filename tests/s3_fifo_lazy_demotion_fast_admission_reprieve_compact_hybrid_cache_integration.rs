@@ -24,7 +24,7 @@
 //! Same one-`PaperCache<K, TieredBuffer>` architecture, fast-tier one-access
 //! queue, demotion-time reprieve, mid-segment checkpoint, and eviction-time
 //! second-chance mechanic as
-//! `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_hybrid_cache` — see
+//! `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_compact_hybrid_cache` — see
 //! that feature's integration test file for the shared coverage; this file
 //! mirrors it end to end, minus the ghost-queue tests (there is no ghost
 //! queue in this variant), plus tests specific to the new behavior: a

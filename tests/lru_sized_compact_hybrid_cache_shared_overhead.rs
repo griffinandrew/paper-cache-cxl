@@ -5,7 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Tests of the shared-metadata DRAM reservation under `LruSizedHybrid`, with
+//! Tests of the shared-metadata DRAM reservation under
+//! `LruSizedCompactHybrid`, with the reservation ON. Separate binary/process
+//! on purpose -- see `lru_compact_hybrid_cache_shared_overhead.rs`'s module
+//! doc for why this cannot live in the main integration binary.
 //!
 //! A deliberate near-copy of the baseline suite. This stack is a compaction of
 //! that one and must be behaviourally indistinguishable from it, so it answers
@@ -13,12 +16,10 @@
 //!
 //! Constructed through `new_sized_compact` rather than `new_sized`: the
 //! size-split designs take three sizing scalars and are rejected by
-//! `PaperCache::new`, so each has its own constructor. `new_sized_hybrid`
-//! previously HARDCODED `PaperPolicy::LruSizedHybrid`, which would have left
-//! this variant registered at every dispatch site and still unconstructible.
-//! the reservation ON. Separate binary/process on purpose -- see
-//! `lru_hybrid_cache_shared_overhead.rs`'s module doc for why this cannot
-//! live in the main integration binary.
+//! `PaperCache::new`, so each has its own constructor -- and that constructor
+//! has to seed the policy this feature actually registers. One that hardcoded
+//! some other size-split policy would leave this variant registered at every
+//! dispatch site and still unconstructible.
 //!
 //! Run with:
 //!   cargo +nightly test --test lru_sized_compact_hybrid_cache_shared_overhead --features lru_sized_compact_hybrid_cache

@@ -22,6 +22,14 @@
 //!   and therefore changes the main queue's budget. Plain 2Q's `resize` does
 //!   not need to.
 //! - The byte and object counters swap sides: the FIFO counts toward fast.
+//!
+//! **The baseline named above no longer exists in this crate.** Every
+//! non-compact hybrid stack was removed once its compact twin was shown
+//! behaviourally identical at 72 B/object of eviction stack instead of 112.
+//! References to it here are historical: they say what this design is a
+//! compaction OF, and they are the reason the structure looks the way it
+//! does. Git history holds the baseline and the differential tests that
+//! proved the two agreed.
 
 use crate::{
 	object::ObjectSize,
@@ -454,166 +462,5 @@ impl PolicyStack for TwoQFastAdmissionCompactHybridStack {
 
 	fn needs_capacity_eviction(&self) -> bool {
 		self.fifo_used > self.fifo_capacity
-	}
-}
-
-
-/// Fidelity against `TwoQFastAdmissionHybridStack`.
-#[cfg(all(test, feature = "two_q_fast_admission_hybrid_cache"))]
-mod fidelity_tests {
-	use super::*;
-	use crate::worker::policy::policy_stack::two_q_fast_admission_hybrid_stack::TwoQFastAdmissionHybridStack;
-
-	const MAX: CacheSize = 1_000_000;
-
-	fn skewed_ops() -> Vec<(HashedKey, ObjectSize)> {
-		let mut ops = Vec::new();
-		let mut x: u64 = 0x243F_6A88_85A3_08D3;
-		for _ in 0..20_000 {
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-			let u = (x >> 11) as f64 / (1u64 << 53) as f64;
-			ops.push((((u * u * 200.0) as u64) + 1, 1024));
-		}
-		ops
-	}
-
-	#[test]
-	fn matches_the_baseline_migration_for_migration() {
-		let ops = skewed_ops();
-		for k_in in [0.1f64, 0.25, 0.5] {
-			for fast in [8_192u64, 32_768, 131_072] {
-				for overhead in [0u64, 112] {
-					let mut a = TwoQFastAdmissionHybridStack::new(k_in, MAX, fast)
-						.with_shared_overhead(overhead);
-					let mut b = TwoQFastAdmissionCompactHybridStack::new(k_in, MAX, fast)
-						.with_shared_overhead(overhead);
-					let (mut ma, mut mb) = (Vec::new(), Vec::new());
-
-					for (k, size) in &ops {
-						if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-						if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-						ma.extend(a.drain_tier_migrations());
-						mb.extend(b.drain_tier_migrations());
-					}
-
-					assert_eq!(ma, mb, "migrations diverge k_in {k_in} fast {fast} oh {overhead}");
-					for (k, _) in &ops {
-						assert_eq!(a.tier_of(*k), b.tier_of(*k), "tier of {k} diverges");
-					}
-					// the counters that swap sides in this variant
-					assert_eq!(a.fast_bytes_used(), b.fast_bytes_used(), "fast bytes");
-					assert_eq!(a.slow_bytes_used(), b.slow_bytes_used(), "slow bytes");
-					assert_eq!(a.fast_object_count(), b.fast_object_count(), "fast objects");
-					assert_eq!(a.slow_object_count(), b.slow_object_count(), "slow objects");
-				}
-			}
-		}
-	}
-
-	/// The defining difference from plain 2Q: admission lands in DRAM, so a key
-	/// in the FIFO reports Fast.
-	///
-	/// The capacities here are load-bearing. With `k_in = 0.25` against a
-	/// 1,000,000 max_size, `fifo_capacity` is 250,000 -- larger than a 131,072
-	/// fast tier -- so `effective_main_fast_capacity` saturates to ZERO and the
-	/// baseline demotes the key straight back out on promotion. That is real
-	/// behaviour of this variant, not a defect: its FIFO reservation is carved
-	/// out of the fast tier and can swallow all of it. An earlier version of
-	/// this test asserted no migration was emitted and failed against the
-	/// BASELINE for exactly that reason.
-	///
-	/// So the assertion is equality, which is the fidelity claim, and the
-	/// capacities are chosen to leave the main queue a real budget.
-	#[test]
-	fn admission_is_fast_and_promotion_matches_the_baseline() {
-		const BIG_FAST: CacheSize = 900_000;
-		let mut a = TwoQFastAdmissionHybridStack::new(0.1, MAX, BIG_FAST).with_shared_overhead(0);
-		let mut b = TwoQFastAdmissionCompactHybridStack::new(0.1, MAX, BIG_FAST).with_shared_overhead(0);
-
-		a.insert(1, 1024);
-		b.insert(1, 1024);
-		assert_eq!(a.tier_of(1), Some(Tier::Fast), "admission should land fast");
-		assert_eq!(b.tier_of(1), a.tier_of(1));
-		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
-
-		a.update(1);
-		b.update(1);
-		let (ma, mb) = (a.drain_tier_migrations(), b.drain_tier_migrations());
-		assert_eq!(ma, mb, "promotion migrations diverge");
-		assert!(ma.is_empty(), "with a real main budget, promotion moves no bytes");
-		assert_eq!(a.tier_of(1), b.tier_of(1));
-		assert_eq!(a.fast_object_count(), b.fast_object_count());
-	}
-
-	/// And the saturating case itself, since it is this variant's sharpest
-	/// edge: when the FIFO reservation exceeds the fast tier the main budget
-	/// goes to zero and everything promoted is demoted straight back.
-	#[test]
-	fn a_fifo_reservation_larger_than_the_fast_tier_matches_too() {
-		let mut a = TwoQFastAdmissionHybridStack::new(0.25, MAX, 131_072).with_shared_overhead(0);
-		let mut b = TwoQFastAdmissionCompactHybridStack::new(0.25, MAX, 131_072).with_shared_overhead(0);
-
-		a.insert(1, 1024);
-		b.insert(1, 1024);
-		a.update(1);
-		b.update(1);
-
-		let (ma, mb) = (a.drain_tier_migrations(), b.drain_tier_migrations());
-		assert_eq!(ma, mb, "migrations diverge under a saturated main budget");
-		assert!(!ma.is_empty(), "expected the saturated budget to force a demotion");
-		assert_eq!(a.tier_of(1), b.tier_of(1));
-	}
-
-	/// `resize` here changes the main queue's budget, because `fifo_capacity`
-	/// is carved out of the fast tier. Plain 2Q's does not.
-	#[test]
-	fn resize_rescales_and_resettles_like_the_baseline() {
-		let ops = skewed_ops();
-		let mut a = TwoQFastAdmissionHybridStack::new(0.25, MAX, 65_536).with_shared_overhead(112);
-		let mut b = TwoQFastAdmissionCompactHybridStack::new(0.25, MAX, 65_536).with_shared_overhead(112);
-		let (mut ma, mut mb) = (Vec::new(), Vec::new());
-
-		for (k, size) in ops.iter().take(8_000) {
-			if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-			if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-			ma.extend(a.drain_tier_migrations());
-			mb.extend(b.drain_tier_migrations());
-		}
-
-		a.resize(MAX / 4);
-		b.resize(MAX / 4);
-		ma.extend(a.drain_tier_migrations());
-		mb.extend(b.drain_tier_migrations());
-
-		for i in 0..2_000u64 {
-			a.insert(10_000 + i, 1024);
-			b.insert(10_000 + i, 1024);
-			ma.extend(a.drain_tier_migrations());
-			mb.extend(b.drain_tier_migrations());
-		}
-
-		assert_eq!(ma, mb, "migrations diverge across resize");
-		assert_eq!(a.needs_capacity_eviction(), b.needs_capacity_eviction());
-		assert_eq!(a.fast_object_count(), b.fast_object_count());
-	}
-
-	#[test]
-	fn evicts_in_the_same_order() {
-		let ops = skewed_ops();
-		let mut a = TwoQFastAdmissionHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		let mut b = TwoQFastAdmissionCompactHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		for (k, size) in &ops {
-			if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-			if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-			a.drain_tier_migrations();
-			b.drain_tier_migrations();
-		}
-		let mut ea = Vec::new();
-		let mut eb = Vec::new();
-		while let Some(k) = a.evict_one() { ea.push(k); }
-		while let Some(k) = b.evict_one() { eb.push(k); }
-		assert_eq!(ea, eb, "eviction order diverges");
 	}
 }

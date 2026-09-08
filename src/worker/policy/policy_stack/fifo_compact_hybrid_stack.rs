@@ -22,6 +22,14 @@
 //! Everything else is shared: one queue spanning both tiers with the newest end
 //! fast, `fast_boundary` naming the oldest fast key, and demotion stepping that
 //! boundary one place toward the newest end per victim.
+//!
+//! **The baseline named above no longer exists in this crate.** Every
+//! non-compact hybrid stack was removed once its compact twin was shown
+//! behaviourally identical at 72 B/object of eviction stack instead of 112.
+//! References to it here are historical: they say what this design is a
+//! compaction OF, and they are the reason the structure looks the way it
+//! does. Git history holds the baseline and the differential tests that
+//! proved the two agreed.
 
 use crate::{
 	object::ObjectSize,
@@ -293,148 +301,5 @@ impl PolicyStack for FifoCompactHybridStack {
 
 	fn slow_object_count(&self) -> usize {
 		self.list.len().saturating_sub(self.fast_count)
-	}
-}
-
-/// Fidelity against `FifoHybridStack`, which this stack is a compaction of.
-#[cfg(all(test, feature = "fifo_hybrid_cache"))]
-mod fidelity_tests {
-	use super::*;
-	use crate::worker::policy::policy_stack::fifo_hybrid_stack::FifoHybridStack;
-
-	fn skewed_ops() -> Vec<(HashedKey, ObjectSize)> {
-		let mut ops = Vec::new();
-		let mut x: u64 = 0x243F_6A88_85A3_08D3;
-		for _ in 0..20_000 {
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-			let u = (x >> 11) as f64 / (1u64 << 53) as f64;
-			ops.push((((u * u * 200.0) as u64) + 1, 1024));
-		}
-		ops
-	}
-
-	#[test]
-	fn matches_fifo_hybrid_migration_for_migration() {
-		let ops = skewed_ops();
-		for cap in [8_192u64, 32_768, 131_072] {
-			for overhead in [0u64, 112] {
-				let mut a = FifoHybridStack::new(cap).with_shared_overhead(overhead);
-				let mut b = FifoCompactHybridStack::new(cap).with_shared_overhead(overhead);
-				let (mut ma, mut mb) = (Vec::new(), Vec::new());
-
-				for (k, size) in &ops {
-					if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-					if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-					ma.extend(a.drain_tier_migrations());
-					mb.extend(b.drain_tier_migrations());
-				}
-
-				assert_eq!(ma, mb, "migrations diverge at cap {cap} overhead {overhead}");
-				for (k, _) in ops.iter().take(500) {
-					assert_eq!(a.tier_of(*k), b.tier_of(*k), "tier of {k} diverges");
-				}
-				assert_eq!(a.fast_object_count(), b.fast_object_count());
-				assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
-				assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
-			}
-		}
-	}
-
-	/// The defining FIFO property, and the one an over-eager port would break:
-	/// a hit must NOT reorder. `PolicyStack::update` has a no-op default and
-	/// this stack deliberately does not override it -- overriding it would
-	/// silently turn this into LRU, and every migration test above would still
-	/// pass on a workload without eviction pressure.
-	#[test]
-	fn a_hit_does_not_reorder_or_promote() {
-		let mut a = FifoHybridStack::new(4_096).with_shared_overhead(0);
-		let mut b = FifoCompactHybridStack::new(4_096).with_shared_overhead(0);
-		for k in 1..=4u64 {
-			a.insert(k, 1024);
-			b.insert(k, 1024);
-		}
-		a.drain_tier_migrations();
-		b.drain_tier_migrations();
-
-		// touch the oldest key repeatedly; FIFO must not rescue it
-		for _ in 0..10 {
-			a.update(1);
-			b.update(1);
-		}
-		assert!(a.drain_tier_migrations().is_empty(), "baseline reordered on a hit");
-		assert!(b.drain_tier_migrations().is_empty(), "compact reordered on a hit");
-
-		// the oldest key is still the first evicted, despite being the hottest
-		assert_eq!(a.evict_one(), Some(1), "baseline did not evict the oldest");
-		assert_eq!(b.evict_one(), Some(1), "compact did not evict the oldest");
-	}
-
-	#[test]
-	fn evicts_in_the_same_order() {
-		let ops = skewed_ops();
-		let mut a = FifoHybridStack::new(32_768).with_shared_overhead(112);
-		let mut b = FifoCompactHybridStack::new(32_768).with_shared_overhead(112);
-		for (k, size) in &ops {
-			if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-			if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-			a.drain_tier_migrations();
-			b.drain_tier_migrations();
-		}
-		let mut ea = Vec::new();
-		let mut eb = Vec::new();
-		while let Some(k) = a.evict_one() { ea.push(k); }
-		while let Some(k) = b.evict_one() { eb.push(k); }
-		assert_eq!(ea, eb, "eviction order diverges");
-	}
-
-	/// Re-inserting an existing key resizes it in place without moving it, and
-	/// re-settles only when it is fast.
-	#[test]
-	fn reinsert_resizes_without_reordering() {
-		let mut a = FifoHybridStack::new(8_192).with_shared_overhead(0);
-		let mut b = FifoCompactHybridStack::new(8_192).with_shared_overhead(0);
-		for k in 1..=4u64 {
-			a.insert(k, 512);
-			b.insert(k, 512);
-		}
-		a.drain_tier_migrations();
-		b.drain_tier_migrations();
-
-		a.insert(1, 4096);
-		b.insert(1, 4096);
-		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
-		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used(), "resize accounting diverges");
-		assert_eq!(a.evict_one(), Some(1), "the resized key should still be oldest");
-		assert_eq!(b.evict_one(), Some(1));
-	}
-
-	#[test]
-	fn removal_and_resize_match() {
-		let ops = skewed_ops();
-		let mut a = FifoHybridStack::new(32_768).with_shared_overhead(112);
-		let mut b = FifoCompactHybridStack::new(32_768).with_shared_overhead(112);
-		let (mut ma, mut mb) = (Vec::new(), Vec::new());
-
-		for (i, (k, size)) in ops.iter().enumerate() {
-			if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-			if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-			if i % 97 == 0 {
-				let victim = (i as u64 % 200) + 1;
-				a.remove(victim);
-				b.remove(victim);
-			}
-			if i == ops.len() / 2 {
-				a.resize_fast_tier(8_192);
-				b.resize_fast_tier(8_192);
-			}
-			ma.extend(a.drain_tier_migrations());
-			mb.extend(b.drain_tier_migrations());
-		}
-
-		assert_eq!(ma, mb, "migrations diverge under removal and resize");
-		assert_eq!(a.len(), b.len());
-		assert_eq!(a.fast_object_count(), b.fast_object_count());
 	}
 }

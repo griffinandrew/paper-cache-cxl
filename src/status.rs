@@ -35,10 +35,10 @@ use crate::hybrid_stats::HybridStats;
 /// Loads the active design's tier counters and gauges into [`HybridStats`].
 ///
 /// One accessor serves every design: the per-design `<design>_hybrid_stats()`
-/// methods were removed by the runtime-policy unification, and the 18
+/// methods were removed by the runtime-policy unification, and the
 /// `<Design>HybridStats` names are aliases of the one struct. Of its 15
 /// fields, the 8 size-split gauges are populated only under
-/// `PaperPolicy::LruSizedHybrid` and read zero elsewhere.
+/// `PaperPolicy::LruSizedCompactHybrid` and read zero elsewhere.
 #[derive(Debug)]
 pub struct Status {
 	pid: u32,
@@ -78,25 +78,26 @@ pub struct AtomicStatus {
 
 	start_time: AtomicU64,
 
-	/// Runtime-configurable fast-tier byte budget for `PaperPolicy::LruHybrid`
-	/// / `PaperPolicy::LfuHybrid` / `PaperPolicy::TwoQHybrid` /
-	/// `PaperPolicy::FifoHybrid` (`lru_hybrid_cache` / `lfu_hybrid_cache` /
-	/// `two_q_hybrid_cache` / `fifo_hybrid_cache` — one field serving whichever
-	/// design the cache was constructed with). Written by
+	/// Runtime-configurable fast-tier byte budget, shared by every hybrid
+	/// design (`PaperPolicy::LruCompactHybrid`,
+	/// `PaperPolicy::LfuCompactHybrid`, `PaperPolicy::TwoQCompactHybrid`,
+	/// `PaperPolicy::FifoCompactHybrid` and the rest — one field serving
+	/// whichever design the cache was constructed with). Written by
 	/// `PaperCache::set_fast_tier_size`, read back by both
 	/// `PaperCache::fast_tier_size` and `PolicyWorker` (via the
 	/// `WorkerEvent::ResizeFastTier` broadcast, not by reading this field
 	/// directly — mirrors how `max_size` and `resize()`/`Resize` work).
 	///
-	/// For `PaperPolicy::LruSizedHybrid` (`lru_sized_hybrid_cache`)
-	/// specifically, this field means the SMALL fast segment's capacity —
-	/// that design has a second, independent fast segment ("large") with its
-	/// own dedicated `hybrid_large_fast_capacity` field below,
-	/// since a single shared field can't represent two independent budgets.
+	/// For `PaperPolicy::LruSizedCompactHybrid`
+	/// (`lru_sized_compact_hybrid_cache`) specifically, this field means the
+	/// SMALL fast segment's capacity — that design has a second, independent
+	/// fast segment ("large") with its own dedicated
+	/// `hybrid_large_fast_capacity` field below, since a single shared field
+	/// can't represent two independent budgets.
 	#[cfg(feature = "hybrid_cache_common")]
 	fast_tier_capacity: AtomicCacheSize,
 
-	/// `lru_hybrid_cache` counters/gauges, updated by `PolicyWorker` as it
+	/// The hybrid tier counters/gauges, updated by `PolicyWorker` as it
 	/// processes tier migrations and evictions; read via `hybrid_stats`.
 	/// Lives here (rather than as a field on `PaperCache` itself) so that
 	/// adding this feature doesn't require touching every other value type's
@@ -120,8 +121,8 @@ pub struct AtomicStatus {
 
 
 
-	/// Mirrors `LfuHybridStack::admission_latched()` (see that trait method's
-	/// doc). Written by `PolicyWorker` every time it runs
+	/// Mirrors `LfuCompactHybridStack::admission_latched()` (see that trait
+	/// method's doc). Written by `PolicyWorker` every time it runs
 	/// `apply_tier_migrations`, read by `PaperCache::set()` — running on the
 	/// API-calling thread, which has no direct access to the worker-owned
 	/// policy stack — so a brand-new key can be built as
@@ -461,10 +462,9 @@ impl AtomicStatus {
 		size.as_() > self.max_size.load(Ordering::Relaxed)
 	}
 
-	/// Current fast-tier byte budget (`PaperPolicy::LruHybrid` /
-	/// `PaperPolicy::LfuHybrid` / `PaperPolicy::TwoQHybrid` /
-	/// `PaperPolicy::FifoHybrid` / `PaperPolicy::LruSizedHybrid`'s SMALL
-	/// segment — see the field's doc on the struct).
+	/// Current fast-tier byte budget (every hybrid design's whole fast tier,
+	/// or `PaperPolicy::LruSizedCompactHybrid`'s SMALL segment — see the
+	/// field's doc on the struct).
 	#[cfg(feature = "hybrid_cache_common")]
 	#[must_use]
 	pub fn fast_tier_capacity(&self) -> CacheSize {
@@ -571,7 +571,7 @@ impl AtomicStatus {
 
 
 	/// Records `count` demotions at once — used when draining
-	/// `LfuHybridStack::drain_demotions`, which reports genuine
+	/// `LfuCompactHybridStack::drain_demotions`, which reports genuine
 	/// `settle_fast_tier` demotions in a single batch per
 	/// `apply_tier_migrations` pass, distinct from admission-to-slow
 	/// corrections (see that method's doc comment for why the two aren't
@@ -597,19 +597,20 @@ impl AtomicStatus {
 
 
 
-	/// Mirrors `LfuHybridStack::admission_latched()`'s current value. Written
-	/// by `PolicyWorker::apply_tier_migrations` every time it runs, read by
-	/// `PaperCache::set()` on the API-calling thread — see the field's doc
-	/// on the struct for why this needs to cross threads via an atomic
-	/// rather than a direct call into the stack.
+	/// Mirrors `LfuCompactHybridStack::admission_latched()`'s current value.
+	/// Written by `PolicyWorker::apply_tier_migrations` every time it runs,
+	/// read by `PaperCache::set()` on the API-calling thread — see the
+	/// field's doc on the struct for why this needs to cross threads via an
+	/// atomic rather than a direct call into the stack.
 	#[cfg(feature = "hybrid_cache_common")]
 	pub fn set_hybrid_admission_latched(&self, latched: bool) {
 		self.hybrid_admission_latched.store(latched, Ordering::Relaxed);
 	}
 
-	/// Current best-known value of `LfuHybridStack::admission_latched()`.
-	/// May be up to one worker event-loop iteration stale relative to the
-	/// stack's true internal state — see `set_hybrid_admission_latched`.
+	/// Current best-known value of
+	/// `LfuCompactHybridStack::admission_latched()`. May be up to one worker
+	/// event-loop iteration stale relative to the stack's true internal
+	/// state — see `set_hybrid_admission_latched`.
 	#[cfg(feature = "hybrid_cache_common")]
 	#[must_use]
 	pub fn hybrid_admission_latched(&self) -> bool {
@@ -628,8 +629,8 @@ impl AtomicStatus {
 
 
 	// `record_hybrid_promotion` intentionally does not exist:
-	// `FifoHybridStack` never emits a `Tier::Fast` migration (no promotion
-	// policy at all — see that stack's module doc), so
+	// `FifoCompactHybridStack` never emits a `Tier::Fast` migration (no
+	// promotion policy at all — see that stack's module doc), so
 	// `hybrid_promotions` is only ever read (always 0), never written.
 
 

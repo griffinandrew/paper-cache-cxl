@@ -7,7 +7,7 @@
 
 //! Integration tests for the `lru_lfu_compact_hybrid_cache` feature.
 //!
-//! A deliberate near-copy of `lru_lfu_hybrid_cache_integration.rs`. This stack
+//! A deliberate near-copy of the baseline suite. This stack
 //! is a compaction of that one and must be behaviourally indistinguishable
 //! from it, so it has to answer the same behavioural questions -- not a
 //! reduced set chosen by whoever wrote the new stack.
@@ -33,7 +33,7 @@
 //!   * Admission always lands fast, at frequency 1
 //!   * Fast-tier pressure demotes the LRU tail with real data movement
 //!   * A single slow-tier access does NOT promote when `promote_k > 1` —
-//!     the property that separates this from `lru_hybrid_cache`
+//!     the property that separates this from `lru_compact_hybrid_cache`
 //!   * Crossing `promote_k` promotes, with real data movement back to DRAM
 //!   * An overwrite goes through the same frequency gate a read does
 //!   * Eviction takes the slow tier's least-frequent object, so an object
@@ -95,7 +95,7 @@ mod hybrid_cache_tests {
     /// demotion (see `lru_lfu_compact_hybrid_stack.rs`'s module doc). A key admitted
     /// and never accessed demotes carrying frequency 1, so `2` would be
     /// reached by a single slow access — behaving exactly like
-    /// `lru_hybrid_cache` and making the feature under test invisible. `3` is
+    /// `lru_compact_hybrid_cache` and making the feature under test invisible. `3` is
     /// the smallest value that actually filters, requiring two slow accesses.
     const PROMOTE_K: u16 = 3;
     /// Slow accesses a never-accessed demoted key needs to reach PROMOTE_K.
@@ -171,13 +171,13 @@ mod hybrid_cache_tests {
         assert!(stats.demotions > 0, "expected a real demotion; got {stats:?}");
     }
 
-    // ── promotion: the property that separates this from lru_hybrid_cache ──
+    // ── promotion: the property that separates this from lru_compact_hybrid_cache ──
 
     #[test]
     fn a_single_slow_access_does_not_promote() {
         ensure_pmem_allocator_warm();
 
-        // The whole point of the frequency gate: under `lru_hybrid_cache`
+        // The whole point of the frequency gate: under `lru_compact_hybrid_cache`
         // this same access would promote immediately.
         let cache = make_cache();
 
@@ -237,7 +237,7 @@ mod hybrid_cache_tests {
         force_into_slow(&cache, 1u32, 2u32);
 
         // A single overwrite is one access — not an automatic re-admission
-        // to the fast tier, which is what `lru_hybrid_cache` would do.
+        // to the fast tier, which is what `lru_compact_hybrid_cache` would do.
         cache.set(1u32, &value(0xB2), None).expect("overwrite should succeed");
         std::thread::sleep(std::time::Duration::from_millis(500));
 

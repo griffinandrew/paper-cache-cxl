@@ -197,9 +197,13 @@ pub fn get_policy_overhead(_policy: &PaperPolicy) -> ObjectSize {
 /// flat `16 + 24` "written by the registration helper and never checked against
 /// anything". Every one understated its stack by 18-100%.
 ///
-/// RE-MEASURED with `measure_one_point` for all 43 hybrid policies, not a
-/// sample of them: every compact family fits 71.995-71.998 B/object, every
-/// split family 112.0003, `LfuHybrid` 168.0003, R^2 = 1.000000 on all 43. The
+/// RE-MEASURED with `measure_one_point` for all 43 hybrid policies of that
+/// sweep, not a sample of them: every compact family fits 71.995-71.998
+/// B/object, R^2 = 1.000000 on all 43. The split families fit 112.0003 (168.0003
+/// for the split LFU) and have since been REMOVED -- each was proven
+/// behaviourally identical to its compact twin by a differential test, so the
+/// tree keeps only the 72 B/object shape, and the 24 policies that remain here
+/// are all compact. The
 /// constants below stand unchanged; what was wrong was the hand count in
 /// `get_policy_overhead`, which is why that function now names these constants
 /// instead of repeating a number.
@@ -229,10 +233,11 @@ pub fn get_policy_overhead(_policy: &PaperPolicy) -> ObjectSize {
 /// `get_hybrid_dram_shared_overhead` reserved the measured 72 while this
 /// function charged 40, so `used_size` under-billed every compact hybrid by
 /// 32 B/object and `max_size` let in ~30% more metadata than it meant to. The
-/// split hybrids were out by 25-27, `LfuHybrid` by 55.
+/// split hybrids, since removed, were out by 25-27, and the split LFU by 55.
 ///
 /// The constants were not the problem -- re-measured with `measure_one_point`
-/// across all 43 hybrid policies, they are right to four decimal places (see
+/// across all 43 hybrid policies of that sweep, they are right to four decimal
+/// places (see
 /// the MEASURED_STACK note above). The hand counts were. Naming the constant
 /// rather than restating its value is the fix that lasts: the two tables can no
 /// longer drift, and `the_two_overhead_tables_agree_on_every_hybrid` asserts
@@ -326,36 +331,6 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		PaperPolicy::SThreeFifoCompact(_) => 72 + OBJECT_MAP_ROW_OVERHEAD,
 		PaperPolicy::SThreeFifo(_) => 72 + OBJECT_MAP_ROW_OVERHEAD,
 
-		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
-		// 24 bytes for the single combined per-key `entries` HashMap entry
-		// (tier + size, one map — see `LruHybridStack`'s module doc for why
-		// this collapsed from two separate maps), 1 byte for the Tier tag,
-		// 4 bytes for the object size
-		PaperPolicy::LruHybrid => LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-
-		// Structurally identical to LruHybrid, and deliberately so: the fast
-		// tier is the same 48-byte HashList entry + 8-byte HashedKey, and a
-		// slow-tier key occupies one CountStack HashList entry instead --
-		// never both, since a key is in exactly one tier's structure at a
-		// time. The single combined `entries` map charge (24) is unchanged,
-		// and the added frequency counter is a u16 that packs into the
-		// existing padding of `LruLfuEntry { size: u32, freq: u16, tier: u8 }`
-		// -- 7 bytes padded to 8, exactly what `LruEntry { tier, size }`
-		// already measured. See `lru_lfu_hybrid_stack.rs`'s "Why the counter
-		// is capped" section and its `entry_packs_to_eight_bytes` test, which
-		// is what keeps this arm honest.
-		PaperPolicy::LruLfuCompactHybrid(_) => LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::LruLfuHybrid(_) => LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-
-		// Base LFU overhead (24 HashMap entry + 48 bucket-list entry + 8
-		// HashedKey + 4 count = 84) plus what LfuHybridStack needs beyond
-		// plain LfuStack: a single combined per-key `entries` HashMap entry
-		// (tier + size, one map — see `LfuHybridStack`'s module doc) — 24
-		// bytes for the entry, 1 byte for the Tier tag, 4 bytes for the
-		// object size (matching the "+4" charge already used for
-		// TwoQ/Arc/SThreeFifo)
-		PaperPolicy::LfuHybrid => LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-
 		// One 32-byte slab slot plus a 16-byte index entry. No `entries` map
 		// and no per-key list node: the slot the index returns already carries
 		// tier, size and frequency. Measured 47.4 B/key against this 48.
@@ -366,28 +341,32 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		PaperPolicy::LruLazyCopyCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 		PaperPolicy::LfuCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
-		// Worst-case charge for a key resident in main_stack as Fast:
-		// 48-byte HashList entry + 8-byte HashedKey + a single combined
-		// per-key `entries` HashMap entry (queue + tier + size, one map —
-		// see `TwoQHybridStack`'s module doc for why this collapsed from
-		// three separate maps) — 24 bytes for the entry, 1 byte for the
-		// Queue tag, 1 byte for the Option<Tier> tag (only meaningful for
-		// keys currently in Main), 4 bytes for the object size
-		PaperPolicy::TwoQCompactHybrid(_) => TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::TwoQHybrid(_) => TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		// Structurally identical to `LruCompactHybrid`, and deliberately so:
+		// one slab slot plus one index row either way, since a key is in
+		// exactly one tier's structure at a time and is never charged twice.
+		// The frequency counter rides inside the 8-byte payload
+		// `CompactFrequencyChain`'s index row already carries -- it is
+		// capped at `FREQUENCY_CAP`, which is what keeps it inside the
+		// payload rather than growing a field of its own. See
+		// `lru_lfu_compact_hybrid_stack.rs`'s module doc.
+		PaperPolicy::LruLfuCompactHybrid(_) => LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
-		// Structurally identical to TwoQHybrid: `TwoQFastAdmissionHybridStack`
-		// is the same two-list/one-combined-entry-map shape, differing only in
-		// which physical tier the one-access FIFO queue's bytes live in (fast
-		// rather than slow) — a placement decision that costs no extra
-		// per-key metadata.
+		// Worst-case charge for a key resident in main_stack as Fast: one
+		// 16-byte `QueueSlot` plus the index entry that finds it (8-byte key
+		// + 4-byte slot index + the 8-byte payload carrying the queue tag,
+		// the tier and the object size). One structure, not three -- see
+		// `two_q_compact_hybrid_stack.rs`'s module doc.
+		PaperPolicy::TwoQCompactHybrid(_) => TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+
+		// Structurally identical to `TwoQCompactHybrid`: the same
+		// one-slot/one-index-row shape, differing only in which physical tier
+		// the one-access FIFO queue's bytes live in (fast rather than slow) —
+		// a placement decision that costs no extra per-key metadata.
 		PaperPolicy::TwoQFastAdmissionCompactHybrid(_) => TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::TwoQFastAdmissionHybrid(_) => TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical again: the reprieve variant changes where an
 		// aged-out one-access key goes, not what is tracked per key.
 		PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(_) => TWO_Q_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::TwoQFastAdmissionReprieveHybrid(_) => TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical again, despite the third queue: a key is
 		// resident in exactly one of `a1_in`/`a1_out`/`am` at any moment, so
@@ -395,38 +374,27 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// (queue tag + Option<Tier> tag + size). No reference bit, and no
 		// ghost list -- `a1_out` holds the real objects.
 		PaperPolicy::TwoQFullFastAdmissionCompactHybrid(_, _) => TWO_Q_FULL_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::TwoQFullFastAdmissionHybrid(_, _) => TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
-		// Structurally identical to LruHybrid: 48 bytes for the HashList
-		// entry, 8 bytes for the HashedKey, 24 bytes for the single
-		// combined per-key `entries` HashMap entry (tier + size, one map —
-		// see `FifoHybridStack`'s module doc), 1 byte for the Tier tag,
-		// 4 bytes for the object size.
+		// Structurally identical to `LruCompactHybrid`: one slab slot plus one
+		// index row, the payload carrying tier and size — see
+		// `fifo_compact_hybrid_stack.rs`'s module doc.
 		PaperPolicy::FifoCompactHybrid => FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::FifoHybrid => FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
-		// Structurally identical to LruHybrid despite having 4 recency
-		// lists instead of 1: a key is only ever resident in exactly ONE of
-		// {small_fast, large_fast, small_slow, large_slow} at a time, so
-		// only one 48-byte HashList entry is ever charged, and the
-		// 4-variant `SizeQueue` tag still fits in the same 1 byte `Tier`'s
-		// 2-variant tag did. 48 bytes for the one HashList entry the key
-		// currently occupies, 8 bytes for the HashedKey, 24 bytes for the
-		// single combined `entries: HashMap<HashedKey, SizedEntry>` entry
-		// (SizedEntry { queue: SizeQueue, size: ObjectSize }), 1 byte for
-		// the SizeQueue tag, 4 bytes for the object size.
+		// Structurally identical to `LruCompactHybrid` despite having 4
+		// recency lists instead of 1: a key is only ever resident in exactly
+		// ONE of {small_fast, large_fast, small_slow, large_slow} at a time,
+		// so only one slab slot is ever charged, and the 4-variant
+		// `SizeQueue` tag still fits in the same 1 byte `Tier`'s 2-variant
+		// tag did.
 		PaperPolicy::LruSizedCompactHybrid => LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::LruSizedHybrid => LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
-		// Structurally identical to TwoQHybrid's charge (same shape: a
-		// one-access queue + a segmented main FIFO queue, one combined
-		// per-key `entries` HashMap entry — see `S3FifoHybridStack`'s
-		// module doc): 48 bytes for the HashList entry, 8 bytes for the
-		// HashedKey, 24 bytes for the combined entry, 1 byte for the Queue
-		// tag, 1 byte for the Option<Tier> tag (only meaningful for keys
-		// currently in Main), 4 bytes for the object size, plus 1 more byte
-		// than TwoQHybrid for the `accessed: bool` reference bit (only
-		// meaningful for keys currently in Main — see that field's doc).
+		// Structurally identical to `TwoQCompactHybrid`'s charge (same shape:
+		// a one-access queue + a segmented main FIFO queue, one slab slot and
+		// one index row — see `s3_fifo_compact_hybrid_stack.rs`'s module
+		// doc). The `accessed: bool` reference bit rides inside the 8-byte
+		// payload the index row already carries, so it costs nothing beyond
+		// it (only meaningful for keys currently in Main — see that field's
+		// doc).
 		PaperPolicy::S3FifoCompactHybrid(_) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 		// The faithful family: same 8-byte payload, since `freq: u8`
 		// replaces `accessed: bool` one-for-one. Like every other ghost
@@ -435,7 +403,6 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(_) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 		PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(_) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 		PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(_) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoHybrid(_) => S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Ghost-hybrid variants: identical per-*tracked*-object charge to
 		// their non-ghost counterparts. The ghost list's own memory isn't
@@ -446,51 +413,39 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// function's result gets multiplied by), so it isn't a *tracked*
 		// object's overhead to add to in the first place.
 		PaperPolicy::TwoQGhostCompactHybrid(_) => TWO_Q_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::TwoQGhostHybrid(_) => TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 		PaperPolicy::S3FifoGhostCompactHybrid(_) => S3_FIFO_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoGhostHybrid(_) => S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
-		// Identical entry shape to S3FifoGhostHybrid (same S3FifoEntry
-		// fields: queue, tier, size, accessed) -- the reference-bit gate
-		// this variant adds only changes when the bit is read, not
-		// anything about the per-entry bookkeeping shape.
+		// Identical entry shape to `S3FifoGhostCompactHybrid` (same
+		// `S3FifoEntry` fields: queue, tier, size, accessed) -- the
+		// reference-bit gate this variant adds only changes when the bit is
+		// read, not anything about the per-entry bookkeeping shape.
 		PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(_) => S3_FIFO_GHOST_LAZY_DEMOTION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoGhostLazyDemotionHybrid(_) => S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
-
-		// Identical entry shape to S3FifoGhostLazyDemotionHybrid (same
-		// S3FifoEntry fields) -- moving the one-access queue into the fast
-		// tier is a placement/accounting change, not a bookkeeping-shape
+		// Identical entry shape again -- moving the one-access queue into the
+		// fast tier is a placement/accounting change, not a bookkeeping-shape
 		// change.
 		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(_) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
-
-		// Identical entry shape to S3FifoGhostLazyDemotionFastAdmissionHybrid
-		// (same S3FifoEntry fields) -- the midpoint cursor is a
+		// Identical entry shape again -- the midpoint cursor is a
 		// stack-level field (like main_boundary), not a per-object one, so
 		// it doesn't change this per-tracked-object charge.
 		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(_) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(_) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
-		// Same S3FifoEntry shape as S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid,
-		// minus the ghost list -- this variant removes it entirely (a
-		// one-access key that ages out is spliced into the slow tier of
-		// the main queue instead of being evicted, so there's no longer
-		// any event that ever populates a ghost entry). No per-tracked-
-		// object charge changes either way (the ghost list was never
-		// charged per-object to begin with -- see the comment on
-		// TwoQGhostHybrid/S3FifoGhostHybrid above), so the number is
+		// Same `S3FifoEntry` shape as the midpoint variant above, minus the
+		// ghost list -- this variant removes it entirely (a one-access key
+		// that ages out is spliced into the slow tier of the main queue
+		// instead of being evicted, so there's no longer any event that ever
+		// populates a ghost entry). No per-tracked-object charge changes
+		// either way (the ghost list was never charged per-object to begin
+		// with -- see the ghost-hybrid comment above), so the number is
 		// identical; only the removed list's fixed struct-level cost
 		// (irrelevant here, this function is purely per-object) is gone.
 		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(_) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(_) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Same per-object charge as the midpoint variant -- dropping the
 		// mid-slow checkpoint removes stack-level fields (a cursor and a
 		// drift counter), not per-object ones.
 		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(_) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(_) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Identical per-object bookkeeping to the fast-admission reprieve
 		// variant above: same `S3FifoEntry { queue, tier, size, accessed }`,
@@ -498,7 +453,6 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// tier changes which allocator backs an object's bytes, not what the
 		// stack records per key.
 		PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(_) => S3_FIFO_LAZY_DEMOTION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoLazyDemotionReprieveHybrid(_) => S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Same per-object charge as the predecessor. The slow tier being
 		// two physical lists instead of one doesn't change what a tracked
@@ -507,7 +461,6 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// `Option<Tier>` field (the queue tag now carries the tier), so
 		// if anything this is a slight over-estimate rather than under.
 		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(_) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(_) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 	}
 }
 
@@ -573,95 +526,24 @@ pub fn get_ttl_overhead() -> ObjectSize {
 /// under-estimate for large objects (their slack is real DRAM cost this
 /// reservation doesn't see), not a safety margin — acceptable given the
 /// fast-tier budget is a demotion target, not a hard data-dropping ceiling
-/// (see the `lru_hybrid_cache`/`lfu_hybrid_cache` design notes). TODO: if an
-/// exact DRAM ceiling is ever needed, thread a `size_of::<Object<K,V>>()`
+/// (see the `lru_compact_hybrid_cache`/`lfu_compact_hybrid_cache` design
+/// notes). TODO: if an exact DRAM ceiling is ever needed, thread a
+/// `size_of::<Object<K,V>>()`
 /// hint through from the generic `PaperCache::new` call site instead.
 #[cfg(feature = "hybrid_cache_common")]
 #[allow(dead_code)] // superseded by OBJECT_MAP_ENTRY_OVERHEAD; kept for the derivation notes above
 pub const HASHTABLE_ENTRY_OVERHEAD: ObjectSize = 11;
-
-/// Dedicated per-object DRAM cost of `LruHybridStack`'s eviction-stack
-/// bookkeeping (see the derivation block above): the shared recency list's
-/// per-key entry (44) + the combined `entries: HashMap<HashedKey, LruEntry>`
-/// entry (20 — `LruEntry { tier, size }` is one `hashbrown`-measured 8-byte
-/// value, `cost(16)` for the `(HashedKey, LruEntry)` pair, same as either of
-/// the two separate maps this replaced individually cost — see
-/// `LruHybridStack`'s module doc for why `tiers`/`sizes` collapsed into one
-/// map. That collapse is what dropped this constant from 84 to 64: one of
-/// the two 20-byte map-entry charges is simply gone, not re-derived smaller).
-///
-/// Computed independently of [`get_policy_overhead`]'s `LruHybrid` arm
-/// rather than reusing it: that arm is tuned for `used_size`'s DRAM+PMEM
-/// budget (where reuse was previously convenient) but, on inspection,
-/// double-charges the key (see the derivation block above) — an error that
-/// roughly canceled out there, but isn't a reliable basis to build on for a
-/// *different* budget with its own correctness requirements.
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
-
-/// Dedicated per-object DRAM cost of `LfuHybridStack`'s eviction-stack
-/// bookkeeping: this key's entry in its current chain's internal
-/// `HashList<HashedKey>` (44, same derivation as the LRU recency list) + its
-/// `index_map: HashMap<HashedKey, Index<CountStack>>` entry (29) + the
-/// combined `entries: HashMap<HashedKey, LfuEntry>` entry (20 — same
-/// `cost(16)` measurement as LRU's, since `LfuEntry { tier, size }` is also
-/// an 8-byte value; see `LfuHybridStack`'s module doc for why `tiers`/
-/// `sizes` collapsed into one map, which is what dropped this constant from
-/// 113 to 93).
-///
-/// Does **not** additionally charge for a brand-new `CountStack`/`VecList`
-/// bucket node (which would apply if this key were the *only* one at its
-/// frequency) — realistic access-frequency distributions are heavily skewed
-/// (Zipfian), so most keys share a bucket with others at the same count,
-/// making that marginal cost amortize toward zero in aggregate; charging it
-/// per-key would model the rare worst case (one key per frequency) as the
-/// typical one.
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 168;
 
 /// Per-object DRAM cost of `LruCompactHybridStack`'s eviction stack.
 ///
 /// MEASURED: jemalloc `stats.allocated`, one point per process at 2^20..2^23
 /// objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
 ///
-/// 72 B against `LruHybridStack`'s 112 -- a 35.7% reduction. `LruHybridStack`
-/// keeps a `kwik::HashList`, which owns its own key-to-node index, PLUS a
-/// separate `entries` map for the 8-byte payload: two indexes, one row each per
-/// object. This keeps one.
+/// 72 B against the 112 of the split LRU hybrid this replaced -- a 35.7%
+/// reduction, and the reason that design was removed rather than kept beside
+/// this one. It kept a `kwik::HashList`, which owns its own key-to-node index,
+/// PLUS a separate `entries` map for the 8-byte payload: two indexes, one row
+/// each per object. This keeps one.
 ///
 /// It was 64 while the payload lived in the slab slot. Moving it into the index
 /// value costs 8 B/object and buys 12% on `move_front` -- LRU's hot path -- and
@@ -679,9 +561,9 @@ const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// One slab slot (32 -- key 8, prev/next 4 each, freq 4, size 4, tier and
 /// resident 1 each, padded) plus one `HashMap<HashedKey, u32>` index entry
 /// (16 with hashbrown's slack). There is no third structure: the slot the
-/// index returns already carries tier and size, so the `entries` map that
-/// `LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`'s trailing `20` pays for does
-/// not exist here.
+/// index returns already carries tier and size, so the separate `entries` map
+/// that the split LFU hybrid paid a further 20 B/object for does not exist
+/// here.
 ///
 /// Unlike every other constant in this block, this one is **measured**:
 /// 47.4 B/key as an RSS delta over two million keys, against this model's
@@ -713,36 +595,6 @@ const LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
-/// Dedicated per-object DRAM cost of `LruSizedHybridStack`'s eviction-stack
-/// bookkeeping. Identical derivation and identical value to
-/// `LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD` despite tracking 4 recency
-/// lists instead of 1: a key occupies exactly one list at a time (44 — the
-/// list entry it currently sits in) plus its one combined `entries:
-/// HashMap<HashedKey, SizedEntry>` entry (20 — `SizedEntry { queue, size }`
-/// is, like `LruEntry`, an 8-byte value, `cost(16)` for the pair). Returned
-/// as a single total here; `LruSizedHybridStack` is responsible for
-/// splitting it proportionally between its two independently-capacitied
-/// fast segments (the two slow lists have no capacity to reserve against).
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
-
 /// Per-object DRAM cost of `LruLfuCompactHybridStack`.
 ///
 /// MEASURED, not derived: jemalloc `stats.allocated`, one point per
@@ -750,46 +602,8 @@ const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
-/// Dedicated per-object DRAM cost of `LruLfuHybridStack`'s eviction-stack
-/// bookkeeping. A key is resident in exactly one tier's structure at a time,
-/// so this is a worst-case charge over the two:
-///
-/// - **Fast tier**: the recency list's per-key entry (44) + the combined
-///   `entries` map entry (20) = 64, identical to
-///   `LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD` (the added frequency counter
-///   is free — it packs into `LruLfuEntry`'s existing padding).
-/// - **Slow tier**: its `CountStack` list entry (44) + the chain's
-///   `index_map` entry (29) + the combined `entries` entry (20) = 93,
-///   matching `LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`'s derivation.
-///
-/// The slow-tier figure is the larger, but charging it would over-reserve:
-/// this constant is subtracted from the *fast-tier* budget, and the DRAM it
-/// is reserving against is dominated by fast-tier residents. Under
-/// `eviction_stacks_pmem` the whole term drops out anyway (both structures
-/// move to PMEM). Charged at the fast-tier figure, which is what the
-/// reservation is actually protecting.
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
-
 /// Per-*ghost-entry* DRAM cost shared by every hybrid design that keeps a
-/// bare-key ghost queue (`TwoQGhostHybrid`, and the four `S3Fifo*Ghost*`
+/// bare-key ghost queue (`TwoQGhostCompactHybrid`, and the `S3Fifo*Ghost*`
 /// variants).
 ///
 /// One `HashList<HashedKey>` node: 24-byte heap `Entry<HashedKey>` (8 data +
@@ -859,50 +673,16 @@ pub const EXACT_GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
-/// Per-object DRAM cost of `FifoHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
-
 /// Per-object DRAM cost of `TwoQCompactHybridStack`'s eviction stack.
 ///
 /// MEASURED: jemalloc `stats.allocated`, one point per process at 2^20..2^23
 /// objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
 ///
-/// 72 B against `TwoQHybridStack`'s 112 -- a 35.7% reduction. `TwoQHybridStack`
-/// keeps THREE indexes for a population where every key is in exactly one of
-/// its two queues: a FIFO `HashList` and an LRU `HashList`, each owning its own
-/// key-to-node map, plus the separate `entries` map. This keeps one.
+/// 72 B against the 112 of the split 2Q hybrid this replaced -- a 35.7%
+/// reduction. That design kept THREE indexes for a population where every key
+/// is in exactly one of its two queues: a FIFO `HashList` and an LRU
+/// `HashList`, each owning its own key-to-node map, plus the separate
+/// `entries` map. This keeps one.
 ///
 /// 8 B above `LruCompactHybridStack`'s 64, and that gap is the layout choice
 /// rather than the policy: this stack carries the payload in the index value
@@ -913,87 +693,17 @@ const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
-/// Per-object DRAM cost of `TwoQHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
-
 /// Per-object DRAM cost of `TwoQFastAdmissionCompactHybridStack`.
 ///
 /// MEASURED: jemalloc `stats.allocated`, one point per process at 2^20..2^23
 /// objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
 ///
-/// 72 B against `TwoQFastAdmissionHybridStack`'s 112 -- a 35.7% reduction, and
+/// 72 B against the split fast-admission 2Q's 112 -- a 35.7% reduction, and
 /// equal to the compact 2Q, S3-FIFO and LRU stacks. All four share
 /// `CompactQueueSet` and an 8-byte payload, so equality was the prediction and
 /// the measurement confirms it.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
-
-/// Per-object DRAM cost of `TwoQFastAdmissionHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionReprieveCompactHybridStack`.
 ///
@@ -1001,41 +711,6 @@ const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
-
-/// Per-object DRAM cost of `TwoQFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQFullFastAdmissionCompactHybridStack`.
 ///
@@ -1045,40 +720,6 @@ const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectS
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_FULL_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
-/// Per-object DRAM cost of `TwoQFullFastAdmissionHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, unchanged from its two-queue siblings despite the third queue:
-/// one `HashList<HashedKey>` node for the single queue the key occupies at
-/// any one time (24-byte heap `Entry` + `cost(16) = 20` internal index slot
-/// = 44), plus one slot in the combined `entries` map (20 — the entry
-/// struct packs to 8 bytes, so `cost(16)` for the `(HashedKey, Entry)`
-/// pair).
-///
-/// The single-node term stays correct: `a1_in`, `a1_out` and `am` are
-/// disjoint, and a key is removed from one before being pushed to the next,
-/// so it is never resident in two at once. There is no ghost list to charge
-/// for either — `a1_out` holds real resident objects, which are already
-/// counted as tracked keys.
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
-
 /// Per-object DRAM cost of `TwoQGhostCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
@@ -1086,95 +727,17 @@ const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize 
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
-/// Per-object DRAM cost of `TwoQGhostHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// Excludes the ghost queue, which is charged separately via
-/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`. That is now an
-/// 8-byte fingerprint + timestamp bounded by its insertion window, not a
-/// 44-byte `HashList` node bounded only by a `trim_ghost` the populating
-/// path never called -- which is how a ghost reached 1.94 GB, 45% of a
-/// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
-/// ghost entries outlive the tracked keys they came from.
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
-
 /// Per-object DRAM cost of `S3FifoCompactHybridStack`'s eviction stack.
 ///
 /// MEASURED: jemalloc `stats.allocated`, one point per process at 2^20..2^23
 /// objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
 ///
-/// 72 B against `S3FifoHybridStack`'s 112 -- a 35.7% reduction -- and identical
+/// 72 B against the split S3-FIFO hybrid's 112 -- a 35.7% reduction -- and identical
 /// to the measured `TwoQCompactHybridStack`, which is the expected result:
 /// the two share the primitive and both payloads are 8 bytes. Predicted before
 /// the run and confirmed by it.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
-
-/// Per-object DRAM cost of `S3FifoHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoGhostCompactHybridStack`.
 ///
@@ -1183,98 +746,12 @@ const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
-/// Per-object DRAM cost of `S3FifoGhostHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// Excludes the ghost queue, which is charged separately via
-/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`. That is now an
-/// 8-byte fingerprint + timestamp bounded by its insertion window, not a
-/// 44-byte `HashList` node bounded only by a `trim_ghost` the populating
-/// path never called -- which is how a ghost reached 1.94 GB, 45% of a
-/// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
-/// ghost entries outlive the tracked keys they came from.
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
-
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_GHOST_LAZY_DEMOTION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
-
-/// Per-object DRAM cost of `S3FifoGhostLazyDemotionHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// Excludes the ghost queue, which is charged separately via
-/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`. That is now an
-/// 8-byte fingerprint + timestamp bounded by its insertion window, not a
-/// 44-byte `HashList` node bounded only by a `trim_ghost` the populating
-/// path never called -- which is how a ghost reached 1.94 GB, 45% of a
-/// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
-/// ghost entries outlive the tracked keys they came from.
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack`.
 ///
@@ -1283,98 +760,12 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSiz
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
-/// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// Excludes the ghost queue, which is charged separately via
-/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`. That is now an
-/// 8-byte fingerprint + timestamp bounded by its insertion window, not a
-/// 44-byte `HashList` node bounded only by a `trim_ghost` the populating
-/// path never called -- which is how a ghost reached 1.94 GB, 45% of a
-/// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
-/// ghost entries outlive the tracked keys they came from.
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
-
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
-
-/// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// Excludes the ghost queue, which is charged separately via
-/// [`GHOST_ENTRY_DRAM_OVERHEAD`] against `ghost.len()`. That is now an
-/// 8-byte fingerprint + timestamp bounded by its insertion window, not a
-/// 44-byte `HashList` node bounded only by a `trim_ghost` the populating
-/// path never called -- which is how a ghost reached 1.94 GB, 45% of a
-/// 4 GiB fast tier, on Twitter cluster38. It stays a separate term because
-/// ghost entries outlive the tracked keys they came from.
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionReprieveCompactHybridStack`.
 ///
@@ -1383,82 +774,12 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_LAZY_DEMOTION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
-/// Per-object DRAM cost of `S3FifoLazyDemotionReprieveHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
-
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
-
-/// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack`.
 ///
@@ -1467,82 +788,12 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_O
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
-/// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
-
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
-
-/// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack`'s eviction-stack bookkeeping.
-///
-/// 44 + 20, the same two-term shape (and, as it happens, the same total) as
-/// [`LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD`]: one `HashList<HashedKey>`
-/// node for the single queue the key occupies at any one time (24-byte heap
-/// `Entry` + `cost(16) = 20` internal index slot = 44), plus one slot in the
-/// combined `entries` map (20 — the entry struct packs to 8 bytes, so
-/// `cost(16)` for the `(HashedKey, Entry)` pair).
-///
-/// The single-node term is correct rather than an undercount: this design's
-/// queues are disjoint and a key is removed from one before being pushed to
-/// the other, so it is never resident in two at once. The key itself is
-/// stored once, inside the heap node, and is not charged again (the
-/// double-charge [`get_policy_overhead`] makes and this module's derivation
-/// block flags).
-///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
-/// `malloc_usable_size` returns and therefore the same quantity Redis reports
-/// as `used_memory`. An earlier revision measured RSS instead, which counts
-/// retained-but-freed pages that belong in a fragmentation ratio rather than in
-/// a per-object cost, and which disagreed with itself by 20% depending on where
-/// the sample points fell.
-///
-/// The field-by-field derivation that used to sit here understated this stack
-/// by roughly a third: it counted struct fields and not size-class rounding,
-/// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 
 /// Approximate per-object DRAM cost of the *shared* structures (the object
@@ -1731,7 +982,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// `ensure_pmem_allocator_warm()`.
 	//
 	// The reservation itself is therefore covered by separate test binaries
-	// -- tests/{lru,lfu,lru_sized}_hybrid_cache_shared_overhead.rs -- which
+	// -- the tests/*_shared_overhead.rs family -- which
 	// never set the variable, so every cache they build gets the production
 	// default. They are separate PROCESSES on purpose: this is read at every
 	// cache construction, so a test flipping the variable back would race
@@ -1777,7 +1028,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// about a policy's constant requires its stack module to be compiled, and
 	// gating them meant a build without that feature silently contributed 0 --
 	// no error, no warning, no failing test. That is not hypothetical: a binary
-	// built with only `lru_hybrid_cache` charged every other policy
+	// built with only one hybrid feature charged every other policy
 	// Arc(48) + map(63) = 111 -> 124 B/object instead of its real 196 or 228,
 	// so each non-LRU policy was handed a larger effective fast tier than it
 	// should have had, for a whole sweep, before anyone noticed.
@@ -1791,49 +1042,30 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	#[cfg(not(feature = "eviction_stacks_pmem"))]
 	{
 		stack_resident = match policy {
-			PaperPolicy::LruHybrid => LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::LfuHybrid => LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruLazyCopyCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LfuCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruSizedCompactHybrid => LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::LruSizedHybrid => LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruLfuCompactHybrid(..) => LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::LruLfuHybrid(..) => LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::FifoCompactHybrid => FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::FifoHybrid => FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQCompactHybrid(..) => TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::TwoQHybrid(..) => TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQFastAdmissionCompactHybrid(..) => TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::TwoQFastAdmissionHybrid(..) => TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(..) => TWO_Q_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::TwoQFastAdmissionReprieveHybrid(..) => TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQFullFastAdmissionCompactHybrid(..) => TWO_Q_FULL_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::TwoQFullFastAdmissionHybrid(..) => TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQGhostCompactHybrid(..) => TWO_Q_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::TwoQGhostHybrid(..) => TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoCompactHybrid(..) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoFaithfulCompactHybrid(..) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(..) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(..) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(..) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::S3FifoHybrid(..) => S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoGhostCompactHybrid(..) => S3_FIFO_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::S3FifoGhostHybrid(..) => S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(..) => S3_FIFO_GHOST_LAZY_DEMOTION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::S3FifoGhostLazyDemotionHybrid(..) => S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(..) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(..) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(..) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(..) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(..) => S3_FIFO_LAZY_DEMOTION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::S3FifoLazyDemotionReprieveHybrid(..) => S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(..) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(..) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(..) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(..) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(..) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(..) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 
 			// All-DRAM policies have no tiers and reserve no fast-tier metadata.
 			PaperPolicy::Auto
@@ -1899,7 +1131,7 @@ mod shared_overhead_is_feature_independent {
 	///
 	/// This is a regression test for a silent, whole-sweep measurement error.
 	/// The terms used to be `cfg`-gated per policy, so a binary built with only
-	/// `lru_hybrid_cache` -- which is how the benchmark was configured --
+	/// a single hybrid feature -- which is how the benchmark was configured --
 	/// charged every non-LRU policy `Arc(48) + map(63) = 111 -> 124` B/object
 	/// instead of its real 196 or 228. Each of those policies was therefore
 	/// handed a larger effective fast tier than it should have had, and nothing
@@ -1913,10 +1145,10 @@ mod shared_overhead_is_feature_independent {
 			return; // the escape hatch zeroes everything by design
 		}
 
-		let lru = get_hybrid_dram_shared_overhead(&PaperPolicy::LruHybrid);
-		let lfu = get_hybrid_dram_shared_overhead(&PaperPolicy::LfuHybrid);
-		let fifo = get_hybrid_dram_shared_overhead(&PaperPolicy::FifoHybrid);
-		let s3 = get_hybrid_dram_shared_overhead(&PaperPolicy::S3FifoHybrid(0.1));
+		let lru = get_hybrid_dram_shared_overhead(&PaperPolicy::LruCompactHybrid);
+		let lfu = get_hybrid_dram_shared_overhead(&PaperPolicy::LfuCompactHybrid);
+		let fifo = get_hybrid_dram_shared_overhead(&PaperPolicy::FifoCompactHybrid);
+		let s3 = get_hybrid_dram_shared_overhead(&PaperPolicy::S3FifoCompactHybrid(0.1));
 
 		// The value with NO eviction-stack term -- what a gated-out policy
 		// collapses to.
@@ -1970,15 +1202,19 @@ mod shared_overhead_is_feature_independent {
 				);
 			}
 
-			// LFU carries a frequency structure the others do not
-			// (44+29+20 vs 44+20). Only meaningful while the stack terms are
-			// actually included, hence the gate.
-			assert!(
-				lfu > lru,
-				"lfu ({lfu}) must exceed lru ({lru}): it has the extra frequency term",
-			);
-			assert_eq!(fifo, lru, "fifo and lru have the same 44+20 stack shape");
-			assert_eq!(s3, lru, "s3-fifo and lru have the same 44+20 stack shape");
+			// All four compact stacks share `CompactQueueSet` and an 8-byte
+			// payload, so all four measure the same 72 B/object -- one slab
+			// slot plus one index row, with no second index and no separate
+			// `entries` map for any of them. LFU no longer carries an extra
+			// frequency term: its counter rides in the slot it already has.
+			//
+			// Equality is therefore the claim now, and it is a real one: if a
+			// stack ever grows a structure the others lack, this fails.
+			// Only meaningful while the stack terms are actually included,
+			// hence the gate.
+			assert_eq!(lfu, lru, "lfu and lru have the same compact slot shape");
+			assert_eq!(fifo, lru, "fifo and lru have the same compact slot shape");
+			assert_eq!(s3, lru, "s3-fifo and lru have the same compact slot shape");
 		}
 	}
 }
@@ -2000,8 +1236,12 @@ mod value_resident_factor_applies {
 	#[test]
 	fn the_value_is_counted_at_its_allocated_size() {
 		let status: crate::StatusRef = Arc::new(
-			AtomicStatus::new(1_000_000, &[PaperPolicy::LruHybrid], PaperPolicy::LruHybrid)
-				.expect("status"),
+			AtomicStatus::new(
+				1_000_000,
+				&[PaperPolicy::LruCompactHybrid],
+				PaperPolicy::LruCompactHybrid,
+			)
+			.expect("status"),
 		);
 		let manager = OverheadManager::new(&status);
 		let object = Object::<u32, crate::BufferDRAM>::new(0u32, &vec![0u8; 1000], None);
@@ -2038,7 +1278,7 @@ mod value_resident_factor_applies {
 /// by 20% until it was measured. `nallocx` gives the exact size class for a
 /// request without allocating -- the same information Redis uses.
 ///
-///   cargo +nightly test --release --features lru_hybrid_cache --lib \
+///   cargo +nightly test --release --features lru_compact_hybrid_cache --lib \
 ///       what_jemalloc -- --ignored --nocapture
 #[cfg(all(test, feature = "numa_jemalloc"))]
 mod what_jemalloc_actually_rounds_to {
@@ -2101,49 +1341,30 @@ mod the_two_overhead_tables_agree {
 	/// read against the two matches above.
 	fn every_hybrid_policy() -> Vec<PaperPolicy> {
 		vec![
-			PaperPolicy::LruHybrid,
-			PaperPolicy::LfuHybrid,
 			PaperPolicy::LruCompactHybrid,
 			PaperPolicy::LruLazyCopyCompactHybrid,
 			PaperPolicy::LfuCompactHybrid,
 			PaperPolicy::LruSizedCompactHybrid,
-			PaperPolicy::LruSizedHybrid,
 			PaperPolicy::LruLfuCompactHybrid(2),
-			PaperPolicy::LruLfuHybrid(2),
 			PaperPolicy::FifoCompactHybrid,
-			PaperPolicy::FifoHybrid,
 			PaperPolicy::TwoQCompactHybrid(0.25),
-			PaperPolicy::TwoQHybrid(0.25),
 			PaperPolicy::TwoQFastAdmissionCompactHybrid(0.25),
-			PaperPolicy::TwoQFastAdmissionHybrid(0.25),
 			PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.25),
-			PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.25),
 			PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.5),
-			PaperPolicy::TwoQFullFastAdmissionHybrid(0.25, 0.5),
 			PaperPolicy::TwoQGhostCompactHybrid(0.25),
-			PaperPolicy::TwoQGhostHybrid(0.25),
 			PaperPolicy::S3FifoCompactHybrid(0.1),
-			PaperPolicy::S3FifoHybrid(0.1),
 			PaperPolicy::S3FifoFaithfulCompactHybrid(0.1),
 			PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.1),
 			PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(0.1),
 			PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(0.1),
 			PaperPolicy::S3FifoGhostCompactHybrid(0.1),
-			PaperPolicy::S3FifoGhostHybrid(0.1),
 			PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(0.1),
-			PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.1),
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(0.1),
-			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(0.1),
 			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(0.1),
-			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(0.1),
 			PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(0.1),
-			PaperPolicy::S3FifoLazyDemotionReprieveHybrid(0.1),
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(0.1),
-			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.1),
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(0.1),
-			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.1),
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(0.1),
-			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(0.1),
 		]
 	}
 
@@ -2180,8 +1401,8 @@ mod the_two_overhead_tables_agree {
 	fn every_hybrid_policy_is_actually_covered() {
 		assert_eq!(
 			every_hybrid_policy().len(),
-			43,
-			"the hybrid policy list has drifted from the 43 arms the two \
+			24,
+			"the hybrid policy list has drifted from the 24 arms the two \
 			 overhead tables carry",
 		);
 	}

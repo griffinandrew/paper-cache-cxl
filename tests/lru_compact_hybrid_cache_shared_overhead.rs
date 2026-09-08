@@ -8,7 +8,7 @@
 //! Tests of the shared-metadata DRAM reservation, with the reservation ON.
 //!
 //! Run with:
-//!   cargo +nightly test --test lru_hybrid_cache_shared_overhead --features lru_hybrid_cache
+//!   cargo +nightly test --test lru_compact_hybrid_cache_shared_overhead --features lru_compact_hybrid_cache
 //!
 //! This is a separate test binary -- and therefore a separate PROCESS -- on
 //! purpose. `get_hybrid_dram_shared_overhead` reads the process-global
@@ -27,7 +27,7 @@
 //! occur. Any demotion the test then observes is attributable only to the
 //! per-object metadata reservation.
 
-#[cfg(feature = "lru_hybrid_cache")]
+#[cfg(feature = "lru_compact_hybrid_cache")]
 mod shared_overhead_tests {
     use paper_cache::{PaperCache, PaperPolicy, TieredBuffer, CacheTierSize};
 
@@ -59,7 +59,7 @@ mod shared_overhead_tests {
         let probe = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
             CacheTierSize::Bytes(131_072),
-            PaperPolicy::LruHybrid,
+            PaperPolicy::LruCompactHybrid,
         )
         .expect("probe cache should construct");
         probe.set(1u32, PAYLOAD, None).expect("probe set");
@@ -78,7 +78,7 @@ mod shared_overhead_tests {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
             CacheTierSize::Bytes(40),
-            PaperPolicy::LruHybrid,
+            PaperPolicy::LruCompactHybrid,
         )
         .expect("cache should construct");
 
@@ -114,7 +114,7 @@ mod shared_overhead_tests {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
             CacheTierSize::Bytes(budget),
-            PaperPolicy::LruHybrid,
+            PaperPolicy::LruCompactHybrid,
         )
         .expect("cache should construct");
 

@@ -13,14 +13,15 @@
 //!
 //! Constructed through `new_sized_compact` rather than `new_sized`: the
 //! size-split designs take three sizing scalars and are rejected by
-//! `PaperCache::new`, so each has its own constructor. `new_sized_hybrid`
-//! previously HARDCODED `PaperPolicy::LruSizedHybrid`, which would have left
-//! this variant registered at every dispatch site and still unconstructible.
+//! `PaperCache::new`, so each has its own constructor -- and that constructor
+//! has to seed the policy this feature actually registers. One that hardcoded
+//! some other size-split policy would leave this variant registered at every
+//! dispatch site and still unconstructible.
 //!
 //! Run with nightly (required for `allocator_api` via `key_value_pmem`):
 //!   cargo +nightly test --test lru_sized_compact_hybrid_cache_integration --features lru_sized_compact_hybrid_cache
 //!
-//! Same one-`PaperCache<K, TieredBuffer>` architecture as `lru_hybrid_cache`
+//! Same one-`PaperCache<K, TieredBuffer>` architecture as `lru_compact_hybrid_cache`
 //! (see that feature's own integration test file for the base pattern this
 //! mirrors) -- `tier_of` reads the tier directly off the single object map,
 //! synchronously reflecting `TieredBuffer::Fast`/`Slow`. What's specific to
@@ -29,7 +30,7 @@
 //! byte threshold, so tests here additionally check the granular
 //! `small_fast_objects`/`large_fast_objects`/`small_slow_objects`/
 //! `large_slow_objects` gauges on `hybrid_stats()`, not just the
-//! combined `fast_objects`/`slow_objects` totals `lru_hybrid_cache` has.
+//! combined `fast_objects`/`slow_objects` totals `lru_compact_hybrid_cache` has.
 //!
 //! What is tested:
 //!   * Admission routes a small/large value to its matching fast segment
@@ -371,7 +372,7 @@ mod hybrid_cache_tests {
     /// `get_hybrid_dram_shared_overhead`, reserved out of the fast segments.
     ///
     ///                       policy_overhead   shared_dram
-    ///     LruSizedHybrid                 85           236
+    ///     LruSizedCompactHybrid                 85           236
     ///     LruSizedCompactHybrid          40           196
     ///
     /// The window exists only while the `max_size` charge fills the budget
@@ -399,7 +400,7 @@ mod hybrid_cache_tests {
         // Capacities confirmed via direct measurement, not derived from
         // first principles. RECALIBRATED for the compaction: the baseline
         // settles at 1180 here, this stack at 760, because
-        // `get_policy_overhead` charges 85 B/object for `LruSizedHybrid` and
+        // `get_policy_overhead` charges 85 B/object for `LruSizedCompactHybrid` and
         // 40 for this twin. Ported unchanged, the test passed a max_size of
         // 1150 that this stack never reaches, so nothing ever evicted and the
         // fallback path under test was never entered -- a smaller stack, not

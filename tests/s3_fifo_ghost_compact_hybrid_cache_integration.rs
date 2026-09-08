@@ -20,7 +20,7 @@
 //!   cargo +nightly test --test s3_fifo_ghost_compact_hybrid_cache_integration --features s3_fifo_ghost_compact_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture and admission/
-//! demotion/promotion/eviction rules as `s3_fifo_hybrid_cache` — see that
+//! demotion/promotion/eviction rules as `s3_fifo_compact_hybrid_cache` — see that
 //! feature's integration test file for the shared coverage (the
 //! lazy/reference-bit second-chance mechanic, TTL survival, runtime
 //! resize, edge cases); this file focuses on what's actually new here: the
@@ -36,7 +36,7 @@ mod hybrid_cache_tests {
     // the key and the expiry stay in DRAM whichever tier the value is in. A
     // 15-byte value therefore migrates ~16 bytes, making the window between
     // "one fits" and "two fit" a few bytes wide; at ~1 KB it is hundreds of
-    // bytes wide. Same idiom as the `s3_fifo_hybrid_cache` suite this file is
+    // bytes wide. Same idiom as the `s3_fifo_compact_hybrid_cache` suite this file is
     // the ghost variant of.
     //
     // Deliberately NOT applied file-wide, by function only:

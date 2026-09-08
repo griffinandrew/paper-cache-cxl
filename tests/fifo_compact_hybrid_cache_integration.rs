@@ -32,7 +32,7 @@
 //!     `tier_of` confirms it is gone from the fast tier (real data movement,
 //!     not a copy)
 //!   * A slow-tier hit does **not** promote the key — it stays slow (the
-//!     defining difference from `lru_hybrid_cache`)
+//!     defining difference from `lru_compact_hybrid_cache`)
 //!   * Overwriting an existing key never repositions it or changes its tier
 //!     (exercises the tier-aware `set()` fix needed since FIFO's overwrite
 //!     rule differs from LRU's)
@@ -183,7 +183,7 @@ mod hybrid_cache_tests {
     fn slow_tier_hit_does_not_promote_and_object_stays_slow() {
         ensure_pmem_allocator_warm();
 
-        // The defining difference from `lru_hybrid_cache`: a hit on a
+        // The defining difference from `lru_compact_hybrid_cache`: a hit on a
         // slow-tier key must never migrate it back to fast, since FIFO has
         // no promotion policy at all ("objects are never reordered
         // regardless of subsequent accesses").

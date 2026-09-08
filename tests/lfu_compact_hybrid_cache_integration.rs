@@ -7,12 +7,13 @@
 
 //! Integration tests for the `lfu_compact_hybrid_cache` feature.
 //!
-//! A deliberate near-copy of `lfu_hybrid_cache_integration.rs`. This stack is a
-//! compaction of `LfuHybridStack` and must be behaviourally indistinguishable
-//! from it, so it has to answer the same behavioural questions -- not a reduced
-//! set chosen by whoever wrote the new stack.
+//! A deliberate near-copy of the baseline suite. This stack is a slab
+//! compaction of the classic two-chain LFU hybrid design and must be
+//! behaviourally indistinguishable from it, so it has to answer the same
+//! behavioural questions -- not a reduced set chosen by whoever wrote the new
+//! stack.
 //!
-//! Having no such file is what let a real bug through. `hybrid_policy::
+//! Having no such suite is what let a real bug through. `hybrid_policy::
 //! admission_tier` had no arm for `LfuCompactHybrid`, so it fell to a
 //! catch-all returning `Tier::Fast` and every brand-new key was built in DRAM
 //! regardless of the admission latch, while the stack recorded it as slow. The
@@ -638,7 +639,7 @@ mod hybrid_cache_tests {
 
         // Shrink the fast tier drastically; the existing key should demote
         // even without any further access, once the worker applies the
-        // resize (mirrors `LfuHybridStack::resize_fast_tier`'s eager
+        // resize (mirrors `LfuCompactHybridStack::resize_fast_tier`'s eager
         // `settle_fast_tier` call).
         cache.set_fast_tier_size(CacheTierSize::Bytes(1)).expect("resize should succeed");
         assert_eq!(cache.fast_tier_size(), 1);

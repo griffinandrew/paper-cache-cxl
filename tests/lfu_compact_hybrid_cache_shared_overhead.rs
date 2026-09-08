@@ -5,29 +5,29 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Tests of the shared-metadata DRAM reservation under `LruSizedHybrid`, with
-//! the reservation ON. Separate binary/process on purpose -- see
-//! `lru_hybrid_cache_shared_overhead.rs`'s module doc for why this cannot
-//! live in the main integration binary.
+//! Tests of the shared-metadata DRAM reservation under `LfuCompactHybrid`, with the
+//! reservation ON. Separate binary/process on purpose -- see
+//! `lru_compact_hybrid_cache_shared_overhead.rs`'s module doc for why this cannot
+//! live in the main integration binary (its warm-up helper sets
+//! `PAPER_DISABLE_SHARED_OVERHEAD=1` process-wide).
 //!
 //! Run with:
-//!   cargo +nightly test --test lru_sized_hybrid_cache_shared_overhead --features lru_sized_hybrid_cache
+//!   cargo +nightly test --test lfu_compact_hybrid_cache_shared_overhead --features lfu_compact_hybrid_cache
 //!
-//! The reservation is split proportionally between the two fast segments by
-//! capacity (`LruSizedHybridStack::reserved_shares`), so the fixture gives
-//! the large segment a minimal 1-byte capacity to concentrate the
-//! reservation on the small segment, whose values alone sit at ~85% of its
-//! budget.
+//! LFU differs from LRU here: admission checks fast-tier capacity directly,
+//! so reservation pressure shows up as brand-new keys ROUTED straight to the
+//! slow tier (and the admission latch closing), not as demotions of existing
+//! residents. The self-calibrating fixture puts value bytes at ~85% of the
+//! budget, so with the reservation zeroed every key would fit fast and
+//! `slow_objects` would stay 0 forever.
 
-#[cfg(feature = "lru_sized_hybrid_cache")]
+#[cfg(feature = "lfu_compact_hybrid_cache")]
 mod shared_overhead_tests {
-    use paper_cache::{PaperCache, TieredBuffer, CacheTierSize};
+    use paper_cache::{PaperCache, PaperPolicy, TieredBuffer, CacheTierSize};
 
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
     const PAYLOAD: &[u8] = b"shared overhead probe";
     const N: u32 = 400;
-    // Far above the payload's accounted size, so every object classifies small.
-    const SIZE_THRESHOLD: u64 = 1_000;
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + timeout;
@@ -50,11 +50,10 @@ mod shared_overhead_tests {
     /// compares the stack's own value-byte accounting against the budget --
     /// calibrating on anything else makes the 85% claim below false.
     fn accounted_size() -> u64 {
-        let probe = PaperCache::<u32, TieredBuffer>::new_sized(
+        let probe = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
             CacheTierSize::Bytes(131_072),
-            CacheTierSize::Bytes(131_072),
-            CacheTierSize::Bytes(SIZE_THRESHOLD),
+            PaperPolicy::LfuCompactHybrid,
         )
         .expect("probe cache should construct");
         probe.set(1u32, PAYLOAD, None).expect("probe set");
@@ -65,29 +64,22 @@ mod shared_overhead_tests {
         probe.hybrid_stats().fast_bytes_used
     }
 
-    /// With small-segment values alone at ~85% of the small budget, only the
-    /// reservation share carried by that segment can force demotion -- and it
-    /// must demote, never evict.
+    /// With values alone at ~85% of the budget, only the metadata reservation
+    /// can fill the fast tier -- so some admissions must be routed straight
+    /// to the slow tier, and nothing may be evicted.
     #[test]
-    fn reservation_forces_demotion_values_alone_would_not() {
+    fn reservation_routes_admissions_to_slow_values_alone_would_fit() {
         let s = accounted_size();
-        assert!(s < SIZE_THRESHOLD, "payload must classify small for this fixture");
-
         let budget = (u64::from(N) * s * 100).div_ceil(85);
         assert!(
             u64::from(N) * s * 100 <= budget * 85,
             "fixture arithmetic drifted: {N} objects of {s} accounted bytes exceed 85% of {budget}"
         );
 
-        // A minimal (but non-zero, since 0 is rejected) large-segment
-        // capacity concentrates the reservation almost entirely on the small
-        // segment (`LruSizedHybridStack::reserved_shares` splits it in
-        // proportion to each segment's capacity).
-        let cache = PaperCache::<u32, TieredBuffer>::new_sized(
+        let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
             CacheTierSize::Bytes(budget),
-            CacheTierSize::Bytes(1),
-            CacheTierSize::Bytes(SIZE_THRESHOLD),
+            PaperPolicy::LfuCompactHybrid,
         )
         .expect("cache should construct");
 
@@ -96,14 +88,14 @@ mod shared_overhead_tests {
         }
 
         assert!(
-            wait_until(TIMEOUT, || cache.hybrid_stats().demotions >= 1),
-            "small-segment values sit at 85% of that segment's budget, so only \
-             the metadata reservation can trigger demotion -- none was observed"
+            wait_until(TIMEOUT, || cache.hybrid_stats().slow_objects >= 1),
+            "values sit at 85% of the fast budget, so only the metadata \
+             reservation can fill the fast tier -- yet no key was routed slow"
         );
 
         let stats = cache.hybrid_stats();
-        assert_eq!(stats.evictions, 0, "the DRAM cap must demote, never evict");
+        assert_eq!(stats.evictions, 0, "reservation pressure must route/demote, never evict");
         let present = (1u32..=N).filter(|key| cache.has(key)).count();
-        assert_eq!(present, N as usize, "every key must survive a reservation-driven demotion");
+        assert_eq!(present, N as usize, "every key must survive reservation pressure");
     }
 }

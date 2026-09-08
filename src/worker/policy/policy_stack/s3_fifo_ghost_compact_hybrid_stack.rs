@@ -18,6 +18,14 @@
 //! design the S3-FIFO paper describes -- so it cannot live in a structure keyed
 //! by slot. It is charged as a separate term alongside the per-object one, and
 //! therefore does not enter this stack's per-object figure at all.
+//!
+//! **The baseline named above no longer exists in this crate.** Every
+//! non-compact hybrid stack was removed once its compact twin was shown
+//! behaviourally identical at 72 B/object of eviction stack instead of 112.
+//! References to it here are historical: they say what this design is a
+//! compaction OF, and they are the reason the structure looks the way it
+//! does. Git history holds the baseline and the differential tests that
+//! proved the two agreed.
 
 use crate::{
 	object::ObjectSize,
@@ -518,129 +526,5 @@ impl PolicyStack for S3FifoGhostCompactHybridStack {
 
 	fn needs_capacity_eviction(&self) -> bool {
 		self.one_access_used > self.one_access_capacity
-	}
-}
-
-
-/// Fidelity against `S3FifoGhostHybridStack`.
-#[cfg(all(test, feature = "s3_fifo_ghost_hybrid_cache"))]
-mod fidelity_tests {
-	use super::*;
-	use crate::worker::policy::policy_stack::s3_fifo_ghost_hybrid_stack::S3FifoGhostHybridStack;
-
-	const MAX: CacheSize = 1_000_000;
-
-	/// Wide enough to evict from the one-access tail, which is the only thing
-	/// that populates a ghost. A narrower workload would leave it empty and
-	/// exercise none of this variant's behaviour.
-	fn churn_ops() -> Vec<(HashedKey, ObjectSize)> {
-		let mut ops = Vec::new();
-		let mut x: u64 = 0x243F_6A88_85A3_08D3;
-		for _ in 0..20_000 {
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-			let u = (x >> 11) as f64 / (1u64 << 53) as f64;
-			ops.push((((u * u * 2_000.0) as u64) + 1, 1024));
-		}
-		ops
-	}
-
-	#[test]
-	fn matches_the_baseline_migration_for_migration() {
-		let ops = churn_ops();
-		for ratio in [0.1f64, 0.25] {
-			for fast in [8_192u64, 65_536] {
-				for overhead in [0u64, 112] {
-					let mut a = S3FifoGhostHybridStack::new(ratio, MAX, fast).with_shared_overhead(overhead);
-					let mut b = S3FifoGhostCompactHybridStack::new(ratio, MAX, fast).with_shared_overhead(overhead);
-					let (mut ma, mut mb) = (Vec::new(), Vec::new());
-
-					for (k, size) in &ops {
-						if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-						if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-						while a.needs_capacity_eviction() { if a.evict_one().is_none() { break } }
-						while b.needs_capacity_eviction() { if b.evict_one().is_none() { break } }
-						ma.extend(a.drain_tier_migrations());
-						mb.extend(b.drain_tier_migrations());
-					}
-
-					assert_eq!(ma, mb, "migrations diverge ratio {ratio} fast {fast} oh {overhead}");
-					assert_eq!(a.len(), b.len(), "lengths diverge");
-					for (k, _) in ops.iter().take(500) {
-						assert_eq!(a.tier_of(*k), b.tier_of(*k), "tier of {k} diverges");
-						assert_eq!(a.is_ghost(*k), b.is_ghost(*k), "ghost membership of {k} diverges");
-					}
-				}
-			}
-		}
-	}
-
-	/// A key evicted from the one-access tail leaves a fingerprint, and
-	/// re-admitting it skips that queue and lands in main/fast.
-	#[test]
-	fn a_ghost_hit_admits_straight_to_main_and_fast() {
-		let mut a = S3FifoGhostHybridStack::new(0.0001, MAX, 131_072).with_shared_overhead(0);
-		let mut b = S3FifoGhostCompactHybridStack::new(0.0001, MAX, 131_072).with_shared_overhead(0);
-
-		for k in 1..=32u64 {
-			a.insert(k, 1024);
-			b.insert(k, 1024);
-			while a.needs_capacity_eviction() { if a.evict_one().is_none() { break } }
-			while b.needs_capacity_eviction() { if b.evict_one().is_none() { break } }
-		}
-		assert!(a.is_ghost(1), "baseline should have ghosted the evicted key");
-		assert_eq!(b.is_ghost(1), a.is_ghost(1));
-
-		a.drain_tier_migrations();
-		b.drain_tier_migrations();
-
-		a.insert(1, 1024);
-		b.insert(1, 1024);
-		assert_eq!(a.tier_of(1), Some(Tier::Fast), "a ghost hit should admit to fast");
-		assert_eq!(b.tier_of(1), a.tier_of(1));
-		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
-	}
-
-	/// `remove` must clear the ghost even with no entry row -- the state a key
-	/// is in after a one-access eviction.
-	#[test]
-	fn remove_clears_a_ghost_with_no_entry_row() {
-		let mut a = S3FifoGhostHybridStack::new(0.0001, MAX, 131_072).with_shared_overhead(0);
-		let mut b = S3FifoGhostCompactHybridStack::new(0.0001, MAX, 131_072).with_shared_overhead(0);
-		for k in 1..=32u64 {
-			a.insert(k, 1024);
-			b.insert(k, 1024);
-			while a.needs_capacity_eviction() { if a.evict_one().is_none() { break } }
-			while b.needs_capacity_eviction() { if b.evict_one().is_none() { break } }
-		}
-		assert!(a.is_ghost(1));
-		assert!(!a.contains(1), "the key should have no entry row at this point");
-
-		a.remove(1);
-		b.remove(1);
-		assert!(!a.is_ghost(1));
-		assert_eq!(b.is_ghost(1), a.is_ghost(1));
-	}
-
-	/// Second chances must not trim the ghost window -- only a genuine
-	/// main-queue eviction does.
-	#[test]
-	fn eviction_order_matches_including_second_chances() {
-		let ops = churn_ops();
-		let mut a = S3FifoGhostHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		let mut b = S3FifoGhostCompactHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		for (k, size) in &ops {
-			if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-			if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-			a.drain_tier_migrations();
-			b.drain_tier_migrations();
-		}
-		let mut ea = Vec::new();
-		let mut eb = Vec::new();
-		while let Some(k) = a.evict_one() { ea.push(k); }
-		while let Some(k) = b.evict_one() { eb.push(k); }
-		assert_eq!(ea, eb, "eviction order diverges");
-		assert_eq!(b.len(), 0);
 	}
 }

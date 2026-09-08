@@ -273,7 +273,7 @@ mod hybrid_cache_tests {
         let promotions_before = cache.hybrid_stats().promotions;
 
         // A second access while already Fast should be a pure no-op from
-        // the tiering machinery's point of view -- unlike two_q_hybrid_cache
+        // the tiering machinery's point of view -- unlike two_q_compact_hybrid_cache
         // (LRU main queue), this must never register as another migration.
         cache.get(&1u32).expect("get should succeed");
         std::thread::sleep(std::time::Duration::from_millis(300));

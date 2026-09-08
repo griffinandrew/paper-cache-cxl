@@ -22,7 +22,7 @@
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture, ghost-queue
 //! lifecycle, and eviction-time second-chance mechanic as
-//! `s3_fifo_ghost_hybrid_cache` — see that feature's integration test file
+//! `s3_fifo_ghost_compact_hybrid_cache` — see that feature's integration test file
 //! for the shared coverage; this file mirrors it end to end and adds one
 //! test specific to the new behavior: a demotion-time reference-bit gate
 //! (`an_accessed_fast_boundary_key_is_reprieved_at_demotion_time_instead_of_the_newcomer`).
@@ -125,7 +125,7 @@ mod hybrid_cache_tests {
         assert!(stats.promotions >= 1);
     }
 
-    // ── ghost queue: unchanged from s3_fifo_ghost_hybrid_cache ─────────────
+    // ── ghost queue: unchanged from s3_fifo_ghost_compact_hybrid_cache ─────────────
 
     #[test]
     fn a_key_that_ages_out_and_is_readmitted_lands_directly_in_fast_tier() {
@@ -303,7 +303,7 @@ mod hybrid_cache_tests {
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
         // Promoting key 2 forces fast-tier pressure. In
-        // `s3_fifo_ghost_hybrid_cache` (unconditional demotion) this would
+        // `s3_fifo_ghost_compact_hybrid_cache` (unconditional demotion) this would
         // demote key 1. Here, key 1's bit is set, so it must be reprieved
         // (stay Fast) and key 2 -- the only other candidate, with a clear
         // bit -- must be demoted in its place instead.

@@ -6,8 +6,13 @@
 //! ```text
 //!                    multi-map layout       slab layout
 //!   no tiering       LfuStack               LfuCompactStack   <- this
-//!   tiered           LfuHybridStack         LfuCompactHybridStack
+//!   tiered           (removed)              LfuCompactHybridStack
 //! ```
+//!
+//! The multi-map-tiered cell is empty because `LfuHybridStack` has been
+//! removed from the crate: it was behaviourally identical to
+//! `LfuCompactHybridStack` and cost 112 B/object of eviction stack against
+//! its 72. The layout comparison it anchored lives in git history.
 //!
 //! Without it, comparing all-DRAM LFU against a tiered compact LFU moves two
 //! variables at once — which is how cluster13 produced an all-DRAM LFU that

@@ -3,17 +3,17 @@
 This document explains the implementation of separate configuration options for persistent memory (PMEM) placement in PaperCache.
 
 > **Scope note.** The `*_hybrid_cache` sections below are both incomplete and structurally out
-> of date. They cover six of the eighteen designs, and they describe an architecture that no
+> of date. They cover six of the twenty-four designs, and they describe an architecture that no
 > longer exists: per-design constructors, per-design `<design>_hybrid_stats()` accessors,
 > per-design impl blocks, and `compile_error!` mutual-exclusion guards. Since the runtime-policy
-> unification, all 18 designs share one implementation, the features are not mutually exclusive,
+> unification, all 24 designs share one implementation, the features are not mutually exclusive,
 > and the design is chosen by the `PaperPolicy` passed to `new()`. See `HYBRID_CACHES.md` for the
 > current picture. Cargo.toml's per-feature comments carry the same stale mutual-exclusion
 > claims.
 >
 > The `all_dram`, `key_value_pmem` and hashtable-placement sections here are still accurate. The
 > `eviction_stacks_pmem` section understates its reach: besides `LfuStack`/`LruStack`, the flag
-> now also relocates all 18 hybrid stacks' lists and entry maps to PMEM.
+> now also relocates all 24 hybrid stacks' lists and entry maps to PMEM.
 
 ## Overview
 
@@ -71,18 +71,18 @@ The implementation provides explicit feature flags to control:
 - **Performance**: Same hashbrown HashMap implementation as `global_hashtable_pmem` but allocated in DRAM instead of PMEM
 - **Requirements**: Mutually exclusive with `global_hashtable_pmem`
 
-### `lru_hybrid_cache`
+### `lru_compact_hybrid_cache`
 - **Purpose**: Single-instance, segmented-LRU hybrid cache — implements the paper design where the LRU
   eviction queue is segmented across a fast (DRAM) tier and a slow (PMEM) tier as two zones of *one*
   logical queue, rather than composing two independent `PaperCache` instances
-- **When enabled**: Adds `PaperPolicy::LruHybrid` and a new `PaperCache<K, TieredBuffer, S>` impl block
+- **When enabled**: Adds `PaperPolicy::LruCompactHybrid` and a new `PaperCache<K, TieredBuffer, S>` impl block
   (`new(max_size, fast_tier_size)`, `get`/`set`/`del`/`has`/`peek`/`ttl`/`size`/`wipe`/`resize`, plus
   `set_fast_tier_size`/`fast_tier_size`, `lru_hybrid_stats`, and a `tier_of` diagnostic accessor). Also
-  exports `TieredBuffer`, `LruHybridStats`, and `Tier` from the crate root, and shares both the
-  `CacheTierSize` unit type and the `TieredBuffer` value type with `lfu_hybrid_cache`/
-  `two_q_hybrid_cache`/`fifo_hybrid_cache` — see `src/size.rs`/`src/tiered_buffer.rs`, each gated
-  `any(lru_hybrid_cache, lfu_hybrid_cache, two_q_hybrid_cache, fifo_hybrid_cache)`
-- **When disabled**: None of the above types/methods are compiled; `PaperPolicy::LruHybrid` doesn't exist
+  exports `TieredBuffer`, `LruCompactHybridStats`, and `Tier` from the crate root, and shares both the
+  `CacheTierSize` unit type and the `TieredBuffer` value type with `lfu_compact_hybrid_cache`/
+  `two_q_compact_hybrid_cache`/`fifo_compact_hybrid_cache` — see `src/size.rs`/`src/tiered_buffer.rs`, each gated
+  `any(lru_compact_hybrid_cache, lfu_compact_hybrid_cache, two_q_compact_hybrid_cache, fifo_compact_hybrid_cache)`
+- **When disabled**: None of the above types/methods are compiled; `PaperPolicy::LruCompactHybrid` doesn't exist
 - **Behavior**: Every `set()` admits (or re-admits) the object at the top of the fast tier. Whenever
   fast-tier usage exceeds the configured fast-tier byte budget, the least-recently-used fast-tier object
   is demoted to the slow tier. Accessing (`get()`) a slow-tier object promotes it back to the top of the
@@ -97,23 +97,23 @@ The implementation provides explicit feature flags to control:
   already allocates through the crate's global DRAM allocator (`numa_alloc::FastAlloc`, node-0-bound jemalloc arenas) regardless of feature
   flags, and this feature only needs to migrate *value* bytes between tiers, so the smaller
   `key_value_pmem` dependency (which makes `BufferPMEM`/`Hybrid` available without forcing the *key*
-  into PMEM) is sufficient and keeps keys DRAM-resident. **Mutually exclusive with `lfu_hybrid_cache`**
-  (both define their own inherent-method impl block on the identical `PaperCache<K, TieredBuffer, S>`
-  type; `lib.rs` has a `compile_error!` guard rejecting both enabled together)
+  into PMEM) is sufficient and keeps keys DRAM-resident. Enabling it alongside any other
+  hybrid-cache feature is fine: they share one impl block, and the design is picked at runtime
+  by the `PaperPolicy` passed to the constructor
 - **Use case**: A single unified cache whose "two tiers" are a property of where each object's bytes
   currently live, with real (non-copying) data movement between them, for the same fast-DRAM/
   slow-PMEM workload shape
 
-### `lfu_hybrid_cache`
+### `lfu_compact_hybrid_cache`
 - **Purpose**: Single-instance, segmented-LFU hybrid cache — same one-`PaperCache<K, TieredBuffer>`
-  architecture as `lru_hybrid_cache` above, but the fast/slow boundary is *frequency*-ordered rather
+  architecture as `lru_compact_hybrid_cache` above, but the fast/slow boundary is *frequency*-ordered rather
   than recency-ordered: the most-frequently-accessed objects belong in the fast tier
-- **When enabled**: Adds `PaperPolicy::LfuHybrid` and a new `PaperCache<K, TieredBuffer, S>` impl block
-  — identical method surface to `lru_hybrid_cache`'s (`new`, `get`/`set`/`del`/`has`/`peek`/`ttl`/`size`/
+- **When enabled**: Adds `PaperPolicy::LfuCompactHybrid` and a new `PaperCache<K, TieredBuffer, S>` impl block
+  — identical method surface to `lru_compact_hybrid_cache`'s (`new`, `get`/`set`/`del`/`has`/`peek`/`ttl`/`size`/
   `wipe`/`resize`, `set_fast_tier_size`/`fast_tier_size`, `tier_of`), plus `lfu_hybrid_stats`. Also
-  exports `LfuHybridStats` from the crate root; shares `TieredBuffer`/`Tier`/`CacheTierSize` with
-  `lru_hybrid_cache` rather than duplicating them
-- **When disabled**: None of the above types/methods are compiled; `PaperPolicy::LfuHybrid` doesn't exist
+  exports `LfuCompactHybridStats` from the crate root; shares `TieredBuffer`/`Tier`/`CacheTierSize` with
+  `lru_compact_hybrid_cache` rather than duplicating them
+- **When disabled**: None of the above types/methods are compiled; `PaperPolicy::LfuCompactHybrid` doesn't exist
 - **Behavior**: Admission does an explicit capacity check before touching the fast chain: while
   `fast_used + size <= fast_capacity`, a new object is admitted to the fast tier; once the fast tier
   is full, every subsequent new object is admitted directly to the slow tier instead — matching the
@@ -132,12 +132,12 @@ The implementation provides explicit feature flags to control:
   a further demotion. A tie does not promote. Eviction: once the cache's overall `max_size` is exceeded,
   the lowest-frequency *slow-tier* object is evicted (falling back to the fast tier's own minimum if the
   slow tier happens to be empty), counted in `lfu_hybrid_stats().evictions`. Every promotion/demotion is
-  actual data movement, same as `lru_hybrid_cache` — a live object's bytes exist in exactly one tier's
+  actual data movement, same as `lru_compact_hybrid_cache` — a live object's bytes exist in exactly one tier's
   allocation at a time. TTL survives every tier move unmodified for the same reason (`Object::set_data`
   only ever replaces `data`, never `key` or `expiry`)
-- **Requirements**: `["key_value_pmem"]` only, same reasoning as `lru_hybrid_cache`. **Mutually exclusive
-  with `lru_hybrid_cache`/`two_q_hybrid_cache`** (see above / below)
-- **Use case**: Same "single unified cache" shape as `lru_hybrid_cache`, for workloads where recency
+- **Requirements**: `["key_value_pmem"]` only, same reasoning as `lru_compact_hybrid_cache`, and
+  combinable with it and every other hybrid-cache feature
+- **Use case**: Same "single unified cache" shape as `lru_compact_hybrid_cache`, for workloads where recency
   alone is a poor eviction signal and access-frequency skew should determine what stays in the fast tier
 - **A subtlety worth knowing**: `fast_capacity` (the policy stack's internal fast/slow byte budget) and
   `max_size` (the overall eviction budget) are tracked in different units — `fast_capacity` only counts
@@ -146,30 +146,30 @@ The implementation provides explicit feature flags to control:
   `fast_tier_size == max_size` at construction does *not* guarantee nothing ever demotes: enough small
   objects can accumulate in raw bytes to exceed `fast_capacity` well before their overhead-inclusive
   total exceeds `max_size`. This is a general property of the accounting design (applies to
-  `lru_hybrid_cache` too), not a bug — see `tests/lfu_hybrid_cache_integration.rs`'s
+  `lru_compact_hybrid_cache` too), not a bug — see `tests/lfu_compact_hybrid_cache_integration.rs`'s
   `terminal_eviction_falls_back_to_fast_tier_when_slow_tier_is_empty` test for how to reliably construct
   a "slow tier stays empty" scenario (pace admissions so eviction keeps up, rather than relying on the
   capacity numbers alone)
 
-### `two_q_hybrid_cache`
+### `two_q_compact_hybrid_cache`
 - **Purpose**: Single-instance, segmented-2Q hybrid cache — same one-`PaperCache<K, TieredBuffer>`
-  architecture as `lru_hybrid_cache`/`lfu_hybrid_cache` above, but new objects are never admitted
+  architecture as `lru_compact_hybrid_cache`/`lfu_compact_hybrid_cache` above, but new objects are never admitted
   directly to the fast tier at all: every `set()` places the object in a one-access FIFO queue that
   lives entirely in the slow tier, and only a re-access promotes it into a main LRU queue segmented
-  fast/slow (which then behaves exactly like `lru_hybrid_cache`)
-- **When enabled**: Adds `PaperPolicy::TwoQHybrid(f64)` (carries `k_in`, the FIFO queue's own byte
-  budget as a fraction of `max_size` — unlike `LruHybrid`/`LfuHybrid`, which take no embedded params)
+  fast/slow (which then behaves exactly like `lru_compact_hybrid_cache`)
+- **When enabled**: Adds `PaperPolicy::TwoQCompactHybrid(f64)` (carries `k_in`, the FIFO queue's own byte
+  budget as a fraction of `max_size` — unlike `LruCompactHybrid`/`LfuCompactHybrid`, which take no embedded params)
   and a new `PaperCache<K, TieredBuffer, S>` impl block. Method surface matches the other two hybrids
   except `new`/`with_hasher` take an extra `k_in: f64` parameter (`new(max_size, fast_tier_size,
-  k_in)`). Also exports `TwoQHybridStats` from the crate root; shares `TieredBuffer`/`Tier`/
+  k_in)`). Also exports `TwoQCompactHybridStats` from the crate root; shares `TieredBuffer`/`Tier`/
   `CacheTierSize` with the other two hybrids rather than duplicating them
-- **When disabled**: None of the above types/methods are compiled; `PaperPolicy::TwoQHybrid` doesn't exist
+- **When disabled**: None of the above types/methods are compiled; `PaperPolicy::TwoQCompactHybrid` doesn't exist
 - **Behavior**: Admission: every new object → the FIFO queue, always slow tier — this is a real,
   synchronous PMEM write on every single `set()` call (`TieredBuffer::new_slow` built directly at the
   API layer), not an async/eventual placement like the other two hybrids' fast-first admission.
   Promotion: a re-access to a FIFO-queue object moves it straight to the top of the main queue's fast
   tier; once inside the main queue, a slow-tier access promotes it back to fast the same way
-  `lru_hybrid_cache` does, possibly cascading a further demotion. Demotion: the main queue's fast-tier
+  `lru_compact_hybrid_cache` does, possibly cascading a further demotion. Demotion: the main queue's fast-tier
   LRU tail moves to its slow-tier portion under fast-tier pressure — never touches the FIFO queue.
   Eviction: prefers the FIFO queue's tail (an object that aged out without a second access) before ever
   touching the main queue's slow tail — this single priority rule reconciles both of the paper's stated
@@ -180,58 +180,58 @@ The implementation provides explicit feature flags to control:
   PMEM write; a probabilistic structure (e.g. a counting Bloom filter) is the right tool to revisit this
   and is left as future work
 - **Requirements**: `["key_value_pmem"]` only, same reasoning as the other two hybrids. **Mutually
-  exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`**
+  exclusive with `lru_compact_hybrid_cache`/`lfu_compact_hybrid_cache`**
 - **Use case**: Same "single unified cache" shape as the other two hybrids, for workloads with a large
   fraction of one-time/scan-like accesses that should be filtered out before ever touching DRAM — the
   literal cost of every write landing in PMEM first is the point, not a side effect
 - **A design/correctness note worth knowing**: a `PolicyStack` has no reference to the shared object map
   or `AtomicStatus`, so it can never safely evict an object on its own — only `PolicyWorker::apply_evictions`'s
   `evict_one()` + `erase()` pairing can (this already correctly happens for overall-`max_size` pressure on
-  every hybrid stack). `TwoQHybridStack`'s FIFO queue has its *own* independent capacity budget
+  every hybrid stack). `TwoQCompactHybridStack`'s FIFO queue has its *own* independent capacity budget
   (`fifo_capacity = k_in * max_size`) that can be exceeded well before overall `max_size` is — to trigger
   a real eviction for that case too, the `PolicyStack` trait has a `needs_capacity_eviction()` method
-  (default `false`, overridden by `TwoQHybridStack` to report `fifo_used > fifo_capacity`) that
+  (default `false`, overridden by `TwoQCompactHybridStack` to report `fifo_used > fifo_capacity`) that
   `apply_evictions`'s loop condition also checks, so FIFO-capacity-driven pressure drains through the
   same, correct removal path as global eviction. An earlier draft called a stack-only eviction routine
   directly from `insert()`/`resize()`; that dropped the key from the stack's own bookkeeping without
   ever removing it from the real object map, permanently desyncing the two (`has()` kept returning
   `true` for an object the stack had already "forgotten") — caught by
-  `tests/two_q_hybrid_cache_integration.rs`'s FIFO-eviction tests failing outright, not merely flaking
+  `tests/two_q_compact_hybrid_cache_integration.rs`'s FIFO-eviction tests failing outright, not merely flaking
 
-### `two_q_fast_admission_hybrid_cache`
-- **Purpose**: `two_q_hybrid_cache` with the one-access FIFO queue relocated to the **fast (DRAM)
+### `two_q_fast_admission_compact_hybrid_cache`
+- **Purpose**: `two_q_compact_hybrid_cache` with the one-access FIFO queue relocated to the **fast (DRAM)
   tier**, so `set()` is a plain DRAM write rather than a synchronous PMEM allocation on the
-  calling thread. The same trade `s3_fifo_ghost_lazy_demotion_fast_admission_hybrid_cache` makes for
+  calling thread. The same trade `s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_cache` makes for
   the s3-fifo family. The logical 2Q structure is unchanged — only the physical placement of the
   one-access queue's bytes differs
-- **When enabled**: Adds `PaperPolicy::TwoQFastAdmissionHybrid(f64)` (string form
-  `"2q-fast-admission-hybrid-{k_in}"`) and a new `PaperCache<K, TieredBuffer, S>` impl block with the
-  same `new(max_size, fast_tier_size, k_in)` signature as `two_q_hybrid_cache`. Exports
-  `TwoQFastAdmissionHybridStats`; shares `TieredBuffer`/`Tier`/`CacheTierSize` with every other hybrid
+- **When enabled**: Adds `PaperPolicy::TwoQFastAdmissionCompactHybrid(f64)` (string form
+  `"2q-fast-admission-compact-hybrid-{k_in}"`) and a new `PaperCache<K, TieredBuffer, S>` impl block with the
+  same `new(max_size, fast_tier_size, k_in)` signature as `two_q_compact_hybrid_cache`. Exports
+  `TwoQFastAdmissionCompactHybridStats`; shares `TieredBuffer`/`Tier`/`CacheTierSize` with every other hybrid
 - **When disabled**: None of the above types/methods are compiled
 - **Behavior**: Admission: every new object → the one-access FIFO queue, in the **fast** tier
   (`admission_tier` is unconditionally `Tier::Fast`, needing no object-map probe at all — one fewer
-  `DashMap` lookup per `set()` than `two_q_hybrid_cache`, on top of the avoided PMEM allocation).
+  `DashMap` lookup per `set()` than `two_q_compact_hybrid_cache`, on top of the avoided PMEM allocation).
   Promotion: a re-accessed FIFO object moves into the main queue's fast portion — a bookkeeping move
   that emits **no migration**, since the bytes are already in DRAM (so `promotions` counts only
   genuine PMEM→DRAM moves in this design, never FIFO→main). Demotion, eviction priority, and the
-  no-ghost-queue decision are all identical to `two_q_hybrid_cache`
+  no-ghost-queue decision are all identical to `two_q_compact_hybrid_cache`
 - **The one accounting difference that matters**: `fifo_capacity = k_in * max_size` is now a DRAM
   reservation **carved out of `fast_tier_size`**, not an independent PMEM budget:
   `effective_main_fast_capacity = fast_tier_size − k_in * max_size`. Since `k_in` is denominated in
   `max_size` while the budget it consumes is `fast_tier_size` (typically a small fraction of
-  `max_size`), a `k_in` that is unremarkable under `two_q_hybrid_cache` can swallow the whole fast
+  `max_size`), a `k_in` that is unremarkable under `two_q_compact_hybrid_cache` can swallow the whole fast
   tier here — at a 24 GB cache with a 4 GB fast tier, `k_in = 0.1` reserves 2.4 GB (60%) for objects
   with no demonstrated reuse. If the reservation meets or exceeds `fast_tier_size`, the main queue
   gets zero fast capacity and every promotion self-demotes immediately: legitimate, but rarely
-  intended. **Sweep `k_in` down here in a way that is unnecessary for `two_q_hybrid_cache`.** The
+  intended. **Sweep `k_in` down here in a way that is unnecessary for `two_q_compact_hybrid_cache`.** The
   reservation is the *fixed* `fifo_capacity`, not live `fifo_used`, so the main queue's budget stays
   stable as the FIFO queue fills and drains (and admission therefore never demotes anyone by itself);
-  `resize()` re-settles, which `TwoQHybridStack::resize` need not
-- **Requirements**: `["key_value_pmem"]`, same as every other hybrid. **Mutually exclusive with every
-  other hybrid-cache feature**
+  `resize()` re-settles, which `TwoQCompactHybridStack::resize` need not
+- **Requirements**: `["key_value_pmem"]`, same as every other hybrid, and combinable with all of
+  them
 - **Use case**: Workloads where SET latency matters and there is DRAM headroom to spend on unproven
-  objects — the inverse of `two_q_hybrid_cache`'s tradeoff, which spends SET latency to keep DRAM
+  objects — the inverse of `two_q_compact_hybrid_cache`'s tradeoff, which spends SET latency to keep DRAM
   exclusively for proven-hot objects
 - **Measured** (800K accesses of `standard_web.bin`, `-c 1`, 2 GB cache / 1 GB fast tier, `k_in`
   0.1, same binary otherwise): SET mean **7.11 µs → 3.30 µs (2.15x)**, SET p99 **25.48 µs → 9.36 µs
@@ -239,18 +239,18 @@ The implementation provides explicit feature flags to control:
   queue structure is identical. GET mean also improved (4.09 → 3.34 µs), but that is **specific to
   this configuration**, not a general property: at this scale the whole retained working set fit
   inside the effective fast budget, so nothing was ever demoted (slow tier empty, 0 demotions) while
-  `two_q_hybrid_cache` had 200 MB in PMEM by construction. The cost side shows in the same numbers:
+  `two_q_compact_hybrid_cache` had 200 MB in PMEM by construction. The cost side shows in the same numbers:
   624 MB of DRAM used versus 374 MB for the same workload
 
-### `two_q_fast_admission_reprieve_hybrid_cache`
-- **Purpose**: `two_q_fast_admission_hybrid_cache` with one change — a one-access object that ages
+### `two_q_fast_admission_reprieve_compact_hybrid_cache`
+- **Purpose**: `two_q_fast_admission_compact_hybrid_cache` with one change — a one-access object that ages
   out of the FIFO queue without a second access is **reprieved into the slow tier** (spliced onto
   the bottom of the main queue) rather than evicted outright
-- **When enabled**: Adds `PaperPolicy::TwoQFastAdmissionReprieveHybrid(f64)` (string form
-  `"2q-fast-admission-reprieve-hybrid-{k_in}"`), a `PaperCache<K, TieredBuffer, S>` impl block with
-  the same `new(max_size, fast_tier_size, k_in)` signature, and `TwoQFastAdmissionReprieveHybridStats`
+- **When enabled**: Adds `PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(f64)` (string form
+  `"2q-fast-admission-reprieve-compact-hybrid-{k_in}"`), a `PaperCache<K, TieredBuffer, S>` impl block with
+  the same `new(max_size, fast_tier_size, k_in)` signature, and `TwoQFastAdmissionReprieveCompactHybridStats`
 - **Behavior**: Admission, promotion, main-queue demotion and the fast-tier accounting are all
-  identical to `two_q_fast_admission_hybrid_cache`. The difference is `settle_fifo_queue`, which runs
+  identical to `two_q_fast_admission_compact_hybrid_cache`. The difference is `settle_fifo_queue`, which runs
   **synchronously from `insert`/`resize`** (never through `evict_one`) and moves the FIFO tail to the
   back of the main queue tagged `Tier::Slow`. `needs_capacity_eviction()` therefore returns to the
   trait default `false`, and `evict_one` becomes purely about the main queue's LRU tail — with a
@@ -264,11 +264,11 @@ The implementation provides explicit feature flags to control:
 - **Counter semantics**: a reprieve is counted in `demotions` (it is a real DRAM→PMEM copy), **not**
   `evictions`. So `evictions` here means only "removed from the cache", which is a narrower thing
   than the same field in the non-reprieve variant
-- **Requirements**: `["key_value_pmem"]`. **Mutually exclusive with every other hybrid-cache feature**
+- **Requirements**: `["key_value_pmem"]`, and combinable with every other hybrid-cache feature
 - **Measured** (800K accesses of `standard_web.bin`, `-c 1`, 2 GB cache / 1 GB fast tier, `k_in` 0.1,
   same binary otherwise, all three 2Q designs run back to back):
 
-  | | `2q-hybrid` | `2q-fast-admission` | `2q-fast-admission-reprieve` |
+  | | `2q-compact-hybrid` | `2q-fast-admission` | `2q-fast-admission-reprieve` |
   |---|---|---|---|
   | miss ratio | 0.3308 | 0.3211 | **0.2673** |
   | SET mean | 7.11 µs | **3.30 µs** | 4.35 µs |
@@ -295,28 +295,28 @@ The implementation provides explicit feature flags to control:
   of `max_size` unused (compare `used_size` against `max_size` in the summary CSV), that is the
   signal this variant is worth trying
 
-### `lru_sized_hybrid_cache`
+### `lru_sized_compact_hybrid_cache`
 - **Purpose**: Single-instance, segmented-LRU hybrid cache with a *size-split* fast AND slow tier — same
-  LRU admission/promotion/demotion/eviction semantics as `lru_hybrid_cache`, but the fast (DRAM) tier's
+  LRU admission/promotion/demotion/eviction semantics as `lru_compact_hybrid_cache`, but the fast (DRAM) tier's
   and the slow (PMEM) tier's bookkeeping are each further split into two independently-tracked segments
   ("small"/"large") by a runtime-configurable byte threshold, so a handful of large objects can't
   dominate/starve many small ones (or vice versa) in either tier's recency order purely because of size
-- **When enabled**: Adds `PaperPolicy::LruSizedHybrid` and a new `PaperCache<K, TieredBuffer, S>` impl
+- **When enabled**: Adds `PaperPolicy::LruSizedCompactHybrid` and a new `PaperCache<K, TieredBuffer, S>` impl
   block — `new(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold)`,
   `get`/`set`/`del`/`has`/`peek`/`ttl`/`size`/`wipe`/`resize`/`tier_of` (shared with the other hybrids),
   plus `set_fast_tier_size`/`fast_tier_size` (reused from the shared block to mean the SMALL segment's
   capacity specifically — this design is the only hybrid with a second, independent fast segment with no
   shared-block equivalent), `set_large_fast_tier_size`/`large_fast_tier_size`,
   `set_size_threshold`/`size_threshold`, and `lru_sized_hybrid_stats`. Also exports
-  `LruSizedHybridStats` from the crate root; shares `TieredBuffer`/`Tier`/`CacheTierSize` with the other
+  `LruSizedCompactHybridStats` from the crate root; shares `TieredBuffer`/`Tier`/`CacheTierSize` with the other
   four hybrids rather than duplicating them — still exactly one physical DRAM allocator path and one
   physical PMEM allocator path (`Tier` stays 2 variants, `TieredBuffer` is unchanged); the size split is
   purely which of four internal recency lists a key's bookkeeping is tracked in, invisible at the
   `TieredBuffer`/physical-allocation level
-- **When disabled**: None of the above types/methods are compiled; `PaperPolicy::LruSizedHybrid` doesn't exist
+- **When disabled**: None of the above types/methods are compiled; `PaperPolicy::LruSizedCompactHybrid` doesn't exist
 - **Behavior**: Admission/re-admission-on-overwrite/promotion all route through one rule: classify by the
   object's current size against `size_threshold` (`size < size_threshold` → small, else large) and land
-  in the matching FAST segment — mirrors `lru_hybrid_cache`'s existing "any touch always promotes to
+  in the matching FAST segment — mirrors `lru_compact_hybrid_cache`'s existing "any touch always promotes to
   fast" rule, just adding "which of the two fast segments" on top of it, so a reclassifying overwrite
   (a `set()` whose new size crosses the threshold) moves between the two fast segments directly with
   **no migration emitted** (both segments are physically `TieredBuffer::Fast`). Demotion: each fast
@@ -326,20 +326,20 @@ The implementation provides explicit feature flags to control:
   lists is non-empty; if both are non-empty, whichever currently holds more objects (a cheap proxy for
   "probably has the older tail," avoiding real cross-list timestamps). Only if *both* slow lists are
   empty (nothing has ever been demoted) does eviction fall back to whichever fast segment is furthest
-  over its own budget by ratio — a direct port of `lru_hybrid_cache`'s own documented last-resort
+  over its own budget by ratio — a direct port of `lru_compact_hybrid_cache`'s own documented last-resort
   fallback for the equivalent single-fast-tier case, not a new behavior invented for this design. Every
   promotion/demotion that does cross the fast/slow boundary is actual data movement, same as
-  `lru_hybrid_cache` — a live object's bytes exist in exactly one tier's allocation at a time. TTL
+  `lru_compact_hybrid_cache` — a live object's bytes exist in exactly one tier's allocation at a time. TTL
   survives every tier/segment move unmodified for the same reason (`Object::set_data` only ever replaces
   `data`, never `key` or `expiry`)
-- **Requirements**: `["key_value_pmem"]` only, same reasoning as the other four hybrids. **Mutually
-  exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache`/`two_q_hybrid_cache`/`fifo_hybrid_cache`**
+- **Requirements**: `["key_value_pmem"]` only, same reasoning as the other hybrids, and combinable
+  with all of them
 - **Use case**: Same "single unified cache" shape as the other hybrids, for workloads with a real mix of
   small and large object sizes where a single shared recency budget would otherwise let size (rather
   than actual access pattern) dictate which objects survive in DRAM/hot PMEM
 - **A design note worth knowing**: only the two fast segments carry independent, configurable capacities
   — the two slow lists carry no capacity of their own and stay governed purely by the overall `max_size`
-  terminal-eviction trigger, exactly like `lru_hybrid_cache`'s single slow tier today. The slow-tier
+  terminal-eviction trigger, exactly like `lru_compact_hybrid_cache`'s single slow tier today. The slow-tier
   split is entirely about eviction-order fairness (which recency list a demoted object's eviction
   candidacy is tracked in), not a new capacity dimension — confirmed as the intended scope during design
   (a physically-separate-PMEM-arenas-per-size-class alternative was considered and explicitly rejected,
@@ -462,26 +462,25 @@ The code uses `#[cfg(...)]` attributes extensively to:
 - **Worker manager integration**: `src/worker/manager.rs`
 - **PMEM eviction collections**: `src/worker/policy/policy_stack/pmem_collections.rs`
 - **LFU policy stack**: `src/worker/policy/policy_stack/lfu_stack.rs`
-- **lru_hybrid_cache (single-instance hybrid cache)**: `src/lru_hybrid_cache/` (`stats.rs` for
-  `LruHybridStats`), `src/worker/policy/policy_stack/lru_hybrid_stack.rs`
-  (`LruHybridStack`), `src/policy.rs` (`PaperPolicy::LruHybrid`), `src/status.rs` (counters/gauges +
-  fast-tier capacity), `PaperCache<K, TieredBuffer, S>` impl block in `src/lib.rs`. Shared tier-size
-  unit type: `src/size.rs` (`CacheTierSize`). Shared value type: `src/tiered_buffer.rs`
-  (`TieredBuffer`). See `CLAUDE.md` and `LRU_HYBRID_CACHE.md` for the full design writeup.
-- **lfu_hybrid_cache (single-instance, frequency-segmented hybrid cache)**: `src/lfu_hybrid_cache/`
-  (`stats.rs` for `LfuHybridStats`), `src/worker/policy/policy_stack/lfu_hybrid_stack.rs`
-  (`LfuHybridStack` + its internal `FrequencyChain` helper), `src/policy.rs` (`PaperPolicy::LfuHybrid`),
-  `src/status.rs` (`lfu_hybrid_*` counters/gauges), `PaperCache<K, TieredBuffer, S>` impl block in
-  `src/lib.rs`. Reuses `src/tiered_buffer.rs`/`src/size.rs` from `lru_hybrid_cache` rather than
-  duplicating them (all three hybrid-cache features are mutually exclusive).
-- **two_q_hybrid_cache (single-instance, 2Q-segmented hybrid cache)**: `src/two_q_hybrid_cache/`
-  (`stats.rs` for `TwoQHybridStats`), `src/worker/policy/policy_stack/two_q_hybrid_stack.rs`
-  (`TwoQHybridStack`), `src/policy.rs` (`PaperPolicy::TwoQHybrid(f64)`), `src/status.rs`
-  (`two_q_hybrid_*` counters/gauges), `PaperCache<K, TieredBuffer, S>` impl block in `src/lib.rs`.
-  Also the source of the `PolicyStack::needs_capacity_eviction` trait method (default `false`) and
-  `PolicyWorker::apply_evictions`'s loop-condition change in `src/worker/policy/mod.rs` — both are
-  generic additions the other two hybrids don't need. Reuses `src/tiered_buffer.rs`/`src/size.rs`
-  rather than duplicating them.
+- **Every hybrid design, shared machinery**: the one `PaperCache<K, TieredBuffer, S>` impl block
+  in `src/lib.rs`; `src/hybrid_policy.rs` (`admission_tier`, the runtime placement rule);
+  `src/hybrid_stats.rs` (`HybridStats`, the single stats snapshot every design reports through);
+  `src/status.rs` (tier counters/gauges + fast-tier capacity); `src/size.rs` (`CacheTierSize`);
+  `src/tiered_buffer.rs` (`TieredBuffer`). There are no per-design cache modules or per-design
+  stats structs any more.
+- **lru_compact_hybrid_cache (segmented-LRU hybrid)**:
+  `src/worker/policy/policy_stack/lru_compact_hybrid_stack.rs` (`LruCompactHybridStack`),
+  `src/policy.rs` (`PaperPolicy::LruCompactHybrid`). See `CLAUDE.md` and `LRU_HYBRID_CACHE.md`
+  for the full design writeup.
+- **lfu_compact_hybrid_cache (frequency-segmented hybrid)**:
+  `src/worker/policy/policy_stack/lfu_compact_hybrid_stack.rs` (`LfuCompactHybridStack` + its
+  internal frequency-chain helper), `src/policy.rs` (`PaperPolicy::LfuCompactHybrid`).
+- **two_q_compact_hybrid_cache (2Q-segmented hybrid)**:
+  `src/worker/policy/policy_stack/two_q_compact_hybrid_stack.rs` (`TwoQCompactHybridStack`),
+  `src/policy.rs` (`PaperPolicy::TwoQCompactHybrid(f64)`). Also the source of the
+  `PolicyStack::needs_capacity_eviction` trait method (default `false`) and
+  `PolicyWorker::apply_evictions`'s loop-condition change in `src/worker/policy/mod.rs` — both
+  generic additions the other designs don't need.
 
 ## Testing
 
@@ -512,38 +511,37 @@ cargo +nightly check --features "eviction_stacks_pmem,key_value_pmem"
 # Verify full feature combination
 cargo +nightly check --features "enable_tiering_manager,eviction_stacks_pmem,key_value_pmem"
 
-# Check lru_hybrid_cache (single-instance hybrid cache)
-cargo +nightly check --features lru_hybrid_cache
+# Check lru_compact_hybrid_cache (single-instance hybrid cache)
+cargo +nightly check --features lru_compact_hybrid_cache
 
-# Run lru_hybrid_cache's unit + inline tests
-cargo +nightly test --lib --features lru_hybrid_cache
+# Run lru_compact_hybrid_cache's unit + inline tests
+cargo +nightly test --lib --features lru_compact_hybrid_cache
 
-# Run lru_hybrid_cache's PMEM integration tests (requires a second NUMA node)
-cargo +nightly test --test lru_hybrid_cache_integration --features lru_hybrid_cache
+# Run lru_compact_hybrid_cache's PMEM integration tests (requires a second NUMA node)
+cargo +nightly test --test lru_compact_hybrid_cache_integration --features lru_compact_hybrid_cache
 
-# Check lfu_hybrid_cache (single-instance, frequency-segmented hybrid cache)
-cargo +nightly check --features lfu_hybrid_cache
+# Check lfu_compact_hybrid_cache (single-instance, frequency-segmented hybrid cache)
+cargo +nightly check --features lfu_compact_hybrid_cache
 
-# Run lfu_hybrid_cache's unit + inline tests
-cargo +nightly test --lib --features lfu_hybrid_cache
+# Run lfu_compact_hybrid_cache's unit + inline tests
+cargo +nightly test --lib --features lfu_compact_hybrid_cache
 
-# Run lfu_hybrid_cache's PMEM integration tests (requires a second NUMA node)
-cargo +nightly test --test lfu_hybrid_cache_integration --features lfu_hybrid_cache
+# Run lfu_compact_hybrid_cache's PMEM integration tests (requires a second NUMA node)
+cargo +nightly test --test lfu_compact_hybrid_cache_integration --features lfu_compact_hybrid_cache
 
-# Check two_q_hybrid_cache (single-instance, 2Q-segmented hybrid cache)
-cargo +nightly check --features two_q_hybrid_cache
+# Check two_q_compact_hybrid_cache (single-instance, 2Q-segmented hybrid cache)
+cargo +nightly check --features two_q_compact_hybrid_cache
 
-# Run two_q_hybrid_cache's unit + inline tests
-cargo +nightly test --lib --features two_q_hybrid_cache
+# Run two_q_compact_hybrid_cache's unit + inline tests
+cargo +nightly test --lib --features two_q_compact_hybrid_cache
 
-# Run two_q_hybrid_cache's PMEM integration tests (requires a second NUMA node)
-cargo +nightly test --test two_q_hybrid_cache_integration --features two_q_hybrid_cache
+# Run two_q_compact_hybrid_cache's PMEM integration tests (requires a second NUMA node)
+cargo +nightly test --test two_q_compact_hybrid_cache_integration --features two_q_compact_hybrid_cache
 
-# Confirm every pairwise combination of the three hybrid-cache features is
-# mutually exclusive (each expected to fail to compile)
-cargo +nightly check --features lru_hybrid_cache,lfu_hybrid_cache
-cargo +nightly check --features lru_hybrid_cache,two_q_hybrid_cache
-cargo +nightly check --features lfu_hybrid_cache,two_q_hybrid_cache
+# The hybrid-cache features are NOT mutually exclusive any more (see the scope
+# note at the top): any subset compiles together, and the design a given cache
+# runs is the `PaperPolicy` passed to its constructor.
+cargo +nightly check --features lru_compact_hybrid_cache,lfu_compact_hybrid_cache,two_q_compact_hybrid_cache
 ```
 
 **Note**: The tiering worker module is only compiled when BOTH an allocator feature 
@@ -561,18 +559,15 @@ used at all when disabled, allowing the cache to operate as a single global cach
 ✅ Global hashtable can use pmem even when tiering is disabled
 ✅ `alloc_api_exp` removed; Hybrid allocator still functional for `key_value_pmem`
 ✅ `eviction_stacks_pmem` correctly allocates LFU/LRU stacks via `Hybrid` (node-1-bound jemalloc arenas)
-✅ `lru_hybrid_cache` implements a single unified `PaperCache<K, TieredBuffer>` with a segmented-LRU
+✅ `lru_compact_hybrid_cache` implements a single unified `PaperCache<K, TieredBuffer>` with a segmented-LRU
   fast/slow boundary; promotion/demotion verified as real data movement (never present in both tiers)
-  end to end on real PMEM hardware (`tests/lru_hybrid_cache_integration.rs`, 14/14 passing)
-✅ `lfu_hybrid_cache` implements the same single-unified-instance architecture with a segmented-LFU
+  end to end on real PMEM hardware (`tests/lru_compact_hybrid_cache_integration.rs`, 14/14 passing)
+✅ `lfu_compact_hybrid_cache` implements the same single-unified-instance architecture with a segmented-LFU
   (frequency-ordered, not recency-ordered) fast/slow boundary; promotion/demotion verified as real data
-  movement end to end on real PMEM hardware (`tests/lfu_hybrid_cache_integration.rs`, 17/17 passing).
-  Mutually exclusive with `lru_hybrid_cache` at compile time (verified via `compile_error!`)
-✅ `two_q_hybrid_cache` implements the same single-unified-instance architecture with a 2Q-segmented
+  movement end to end on real PMEM hardware (`tests/lfu_compact_hybrid_cache_integration.rs`, 17/17 passing).
+✅ `two_q_compact_hybrid_cache` implements the same single-unified-instance architecture with a 2Q-segmented
   boundary — admission always to a slow-tier FIFO queue, promotion to the main queue's fast tier only on
   re-access; terminal eviction correctly prioritizes the FIFO queue over the main queue, and FIFO-capacity
   pressure (`k_in`) correctly triggers real evictions through the same `evict_one()`/`erase()` path as
   global `max_size` pressure (`PolicyStack::needs_capacity_eviction`) — verified end to end on real PMEM
-  hardware (`tests/two_q_hybrid_cache_integration.rs`, 18/18 passing, run twice to confirm not flaky).
-  Mutually exclusive with `lru_hybrid_cache`/`lfu_hybrid_cache` at compile time (verified via
-  `compile_error!`)
+  hardware (`tests/two_q_compact_hybrid_cache_integration.rs`, 18/18 passing, run twice to confirm not flaky).

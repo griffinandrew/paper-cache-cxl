@@ -7,14 +7,14 @@
 
 //! Where each hybrid design's admission rule lives.
 //!
-//! All 19 `TieredBuffer`-based designs share the two
+//! All 24 `TieredBuffer`-based designs share the two
 //! `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks in `lib.rs`, gated only
 //! on `hybrid_cache_common`. The one thing that still genuinely differs
 //! between them on the `set()` path is which tier a value is built in, so
 //! that is all this module holds: [`admission_tier`], a runtime `match` over
 //! the cache's [`PaperPolicy`] with one arm per design.
 //!
-//! Dispatch is *runtime*, not compile-time. Every hybrid build compiles all 19
+//! Dispatch is *runtime*, not compile-time. Every hybrid build compiles all 24
 //! designs; the policy is chosen when the cache is constructed and stored in
 //! `AtomicStatus`, so two caches in one process can run different designs.
 //! An earlier revision dispatched through a `HybridPolicy` trait with one
@@ -57,7 +57,7 @@ pub fn admission_tier<K>(
 	let _ = (&hashed_key, &status, &objects);
 
 	match policy {
-		PaperPolicy::FifoHybrid | PaperPolicy::FifoCompactHybrid | PaperPolicy::LruLfuHybrid(..) | PaperPolicy::LruLfuCompactHybrid(..) => {
+		PaperPolicy::FifoCompactHybrid | PaperPolicy::LruLfuCompactHybrid(..) => {
 			let existing_tier = objects.get_ref(&hashed_key)
 				.map(|object| if object.value().is_fast() { crate::Tier::Fast } else { crate::Tier::Slow });
 			match existing_tier {
@@ -65,16 +65,16 @@ pub fn admission_tier<K>(
 				Some(crate::Tier::Fast) | None => crate::Tier::Fast,
 			}
 		},
-		// LfuCompactHybrid shares LfuHybrid's admission contract exactly: it
-		// admits to fast until the tier fills, then latches shut. Omitting it
-		// here did not fail to compile -- it fell through to the catch-all
+		// LfuCompactHybrid admits to fast until the tier fills, then latches
+		// shut. Stating that here is load-bearing: when this arm was missing,
+		// it did not fail to compile -- it fell through to the catch-all
 		// below and every brand-new key was built in DRAM regardless of the
 		// latch, while the stack recorded it as slow and emitted no migration
 		// (the latched path deliberately emits none, because it trusts this
 		// function to have placed the bytes already). The fast tier then
 		// physically held objects the stack believed were in PMEM, and 63% of
 		// promotions were declined as "already in the requested tier".
-		PaperPolicy::LfuHybrid | PaperPolicy::LfuCompactHybrid => {
+		PaperPolicy::LfuCompactHybrid => {
 			match objects.get_ref(&hashed_key) {
 				Some(object) => match object.value().is_fast() {
 					true => crate::Tier::Fast,
@@ -84,17 +84,17 @@ pub fn admission_tier<K>(
 				None => crate::Tier::Fast,
 			}
 		},
-		PaperPolicy::LruHybrid | PaperPolicy::LruCompactHybrid | PaperPolicy::LruLazyCopyCompactHybrid | PaperPolicy::LruSizedHybrid | PaperPolicy::LruSizedCompactHybrid | PaperPolicy::TwoQFastAdmissionHybrid(..) | PaperPolicy::TwoQFastAdmissionCompactHybrid(..) | PaperPolicy::TwoQFastAdmissionReprieveHybrid(..) | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(..) | PaperPolicy::TwoQFullFastAdmissionHybrid(..) | PaperPolicy::TwoQFullFastAdmissionCompactHybrid(..) => {
+		PaperPolicy::LruCompactHybrid | PaperPolicy::LruLazyCopyCompactHybrid | PaperPolicy::LruSizedCompactHybrid | PaperPolicy::TwoQFastAdmissionCompactHybrid(..) | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(..) | PaperPolicy::TwoQFullFastAdmissionCompactHybrid(..) => {
 			// Unconditionally Fast, and correct for every case: a brand-new
 			// key lands in `a1_in`, which is structurally Fast; a re-set of an
 			// `a1_out` key falls through to `promote_from_a1_out`, which makes
 			// it Fast; a re-set of an `am`-slow key falls through to `touch_am`,
 			// which does the same. Deliberately NOT the `Some(_) => Fast,
-			// None => Slow` arm the plain 2Q hybrids use -- that would defeat
+			// None => Slow` arm the plain 2Q designs use -- that would defeat
 			// fast admission.
 			crate::Tier::Fast
 		},
-		PaperPolicy::S3FifoGhostHybrid(..) | PaperPolicy::S3FifoGhostCompactHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(..) | PaperPolicy::S3FifoHybrid(..) | PaperPolicy::S3FifoCompactHybrid(..) | PaperPolicy::S3FifoFaithfulCompactHybrid(..) | PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(..) => {
+		PaperPolicy::S3FifoGhostCompactHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(..) | PaperPolicy::S3FifoCompactHybrid(..) | PaperPolicy::S3FifoFaithfulCompactHybrid(..) | PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(..) => {
 			match objects.get_ref(&hashed_key) {
 				Some(object) => match object.value().is_fast() {
 					true => crate::Tier::Fast,
@@ -103,7 +103,7 @@ pub fn admission_tier<K>(
 				None => crate::Tier::Slow,
 			}
 		},
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(..) | PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(..) | PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(..) => {
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(..) | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(..) | PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(..) | PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(..) => {
 			match objects.get_ref(&hashed_key) {
 				Some(object) => match object.value().is_fast() {
 					true => crate::Tier::Fast,
@@ -112,20 +112,20 @@ pub fn admission_tier<K>(
 				None => crate::Tier::Fast,
 			}
 		},
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(..) | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(..) | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(..) | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(..) | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(..) | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(..) => {
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(..) | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(..) | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(..) => {
 			match objects.get_ref(&hashed_key) {
 				Some(object) if object.value().is_slow() => crate::Tier::Slow,
 				_ => crate::Tier::Fast,
 			}
 		},
-		PaperPolicy::S3FifoLazyDemotionReprieveHybrid(..) | PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(..) => {
+		PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(..) => {
 			match objects.get_ref(&hashed_key) {
 				Some(object) if object.value().is_slow() => crate::Tier::Slow,
 				Some(_) => crate::Tier::Fast,
 				None => crate::Tier::Slow,
 			}
 		},
-		PaperPolicy::TwoQGhostHybrid(..) | PaperPolicy::TwoQGhostCompactHybrid(..) | PaperPolicy::TwoQHybrid(..) | PaperPolicy::TwoQCompactHybrid(..) => {
+		PaperPolicy::TwoQGhostCompactHybrid(..) | PaperPolicy::TwoQCompactHybrid(..) => {
 			match objects.get_ref(&hashed_key) {
 				Some(_) => crate::Tier::Fast,
 				None => crate::Tier::Slow,

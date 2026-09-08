@@ -22,7 +22,7 @@
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture, ghost-queue
 //! lifecycle, demotion-time reprieve, and eviction-time second-chance
-//! mechanic as `s3_fifo_ghost_lazy_demotion_hybrid_cache` — see that
+//! mechanic as `s3_fifo_ghost_lazy_demotion_compact_hybrid_cache` — see that
 //! feature's integration test file for the shared coverage; this file
 //! mirrors it end to end with tests adapted for the one change: the
 //! one-access queue is now DRAM-resident, so admission is Fast, not Slow.
@@ -224,7 +224,7 @@ mod hybrid_cache_tests {
         // queue did NOT get counted, since the key's bytes never actually
         // moved (see this feature's stack module doc's "no more redundant
         // Fast→Fast copies" section). Contrast with
-        // `s3_fifo_ghost_lazy_demotion_hybrid_cache`'s equivalent test,
+        // `s3_fifo_ghost_lazy_demotion_compact_hybrid_cache`'s equivalent test,
         // which asserts `promotions >= 1` for the same access.
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
         assert_eq!(
@@ -616,7 +616,7 @@ mod hybrid_cache_tests {
         // while the stack still knows only about key 1 -- so `evict_one` finds
         // nothing in the one-access queue and takes the main-queue key this test
         // is asserting about. Same lockstep fix already documented for
-        // `lfu_hybrid_cache`'s equivalent burst-admission test.
+        // `lfu_compact_hybrid_cache`'s equivalent burst-admission test.
         for key in 2u32..=10 {
             let _ = cache.set(key, b"payload bytes", None);
             assert!(

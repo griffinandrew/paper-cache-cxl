@@ -225,15 +225,13 @@ impl WorkerFanout {
 	}
 
 	/// Creates a `WorkerFanout` whose policy worker physically migrates
-	/// object bytes between tiers whenever `PaperPolicy::LruHybrid`,
-	/// `PaperPolicy::LfuHybrid`, `PaperPolicy::TwoQHybrid`, or
-	/// `PaperPolicy::FifoHybrid` reports a promotion or demotion. `migrate`
-	/// reallocates a value into the target tier's representation (e.g.
-	/// `TieredBuffer::new_fast`/`new_slow`). Promotion/demotion/eviction
-	/// counters and gauges are recorded directly on the shared `status`
-	/// (backing `PaperCache::hybrid_stats`/`hybrid_stats`/
-	/// `hybrid_stats`/`hybrid_stats`), so no separate stats
-	/// parameter is needed here.
+	/// object bytes between tiers whenever the active hybrid policy (any of
+	/// the `*CompactHybrid` `PaperPolicy` variants) reports a promotion or a
+	/// demotion. `migrate` reallocates a value into the target tier's
+	/// representation (e.g. `TieredBuffer::new_fast`/`new_slow`).
+	/// Promotion/demotion/eviction counters and gauges are recorded directly
+	/// on the shared `status` (backing `PaperCache::hybrid_stats`), so no
+	/// separate stats parameter is needed here.
 	#[cfg(feature = "hybrid_cache_common")]
 	pub fn new_with_tier_migration<K, V>(
 		objects: &ObjectMapRef<K, V>,

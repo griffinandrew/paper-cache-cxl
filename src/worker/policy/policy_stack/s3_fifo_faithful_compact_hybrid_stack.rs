@@ -31,9 +31,11 @@
 //! It also removes `main_boundary`, the cursor the other hybrids maintain in
 //! six places: the boundary IS `Q_MAIN_FAST`'s back. And it makes the reprieve
 //! splice an O(1) `move_to_front_of` rather than the O(number of fast keys)
-//! walk that made an earlier reprieve design unrunnable (see
-//! `s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stack`'s module doc:
-//! ~18 minutes of CPU without completing a run).
+//! walk that made an earlier reprieve design unrunnable (~18 minutes of CPU
+//! without completing a run; that stack,
+//! `s3_fifo_lazy_demotion_fast_admission_reprieve_hybrid_stack`, has since
+//! been removed along with the rest of the non-compact family, so the
+//! writeup is in git history).
 //!
 //! # The four variants
 //!

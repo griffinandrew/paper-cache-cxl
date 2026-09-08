@@ -68,7 +68,7 @@ use crate::{
 pub const NIL: u32 = u32::MAX;
 
 /// Queues a single stack may hold. 2Q uses 2 (a1_in, am) or 3 with a live
-/// a1_out, S3-FIFO uses 2, `LruSizedHybridStack` uses 4.
+/// a1_out, S3-FIFO uses 2, `LruSizedCompactHybridStack` uses 4.
 pub const MAX_QUEUES: usize = 4;
 
 /// One node. 16 bytes: links only -- the payload is in the index.

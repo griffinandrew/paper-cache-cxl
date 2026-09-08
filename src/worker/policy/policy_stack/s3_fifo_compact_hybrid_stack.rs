@@ -6,7 +6,7 @@
  */
 
 //! Slab-backed S3-FIFO hybrid: behaviourally identical to
-//! [`S3FifoHybridStack`], with one structure where that has three.
+//! `S3FifoHybridStack`, with one structure where that has three.
 //!
 //! `S3FifoHybridStack` keeps a one-access `HashList` and a main `HashList` --
 //! each owning its OWN key-to-node index -- plus a separate `entries` map
@@ -26,6 +26,14 @@
 //! is eviction that acts on it -- an accessed key at the main tail is
 //! reinserted at the front with the bit cleared instead of being evicted.
 //! `main_boundary` names the least-recently-used fast key in main.
+//!
+//! **The baseline named above no longer exists in this crate.** Every
+//! non-compact hybrid stack was removed once its compact twin was shown
+//! behaviourally identical at 72 B/object of eviction stack instead of 112.
+//! References to it here are historical: they say what this design is a
+//! compaction OF, and they are the reason the structure looks the way it
+//! does. Git history holds the baseline and the differential tests that
+//! proved the two agreed.
 
 use crate::{
 	object::ObjectSize,
@@ -464,189 +472,5 @@ impl PolicyStack for S3FifoCompactHybridStack {
 
 	fn needs_capacity_eviction(&self) -> bool {
 		self.one_access_used > self.one_access_capacity
-	}
-}
-
-/// Fidelity against `S3FifoHybridStack`, which this stack is a compaction of.
-#[cfg(all(test, feature = "s3_fifo_hybrid_cache"))]
-mod fidelity_tests {
-	use super::*;
-	use crate::worker::policy::policy_stack::s3_fifo_hybrid_stack::S3FifoHybridStack;
-
-	const MAX: CacheSize = 1_000_000;
-
-	/// Repeats are essential here: a key only leaves the one-access queue on a
-	/// SECOND access, and the reference bit only matters on a third, so a
-	/// workload without reuse would exercise neither the main queue nor the
-	/// second-chance path.
-	fn skewed_ops() -> Vec<(HashedKey, ObjectSize)> {
-		let mut ops = Vec::new();
-		let mut x: u64 = 0x243F_6A88_85A3_08D3;
-		for _ in 0..20_000 {
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-			let u = (x >> 11) as f64 / (1u64 << 53) as f64;
-			ops.push((((u * u * 200.0) as u64) + 1, 1024));
-		}
-		ops
-	}
-
-	fn replay(
-		ratio: f64,
-		fast: CacheSize,
-		overhead: CacheSize,
-		ops: &[(HashedKey, ObjectSize)],
-	) -> (Vec<(HashedKey, Tier)>, Vec<(HashedKey, Tier)>, Vec<Option<Tier>>, Vec<Option<Tier>>) {
-		let mut a = S3FifoHybridStack::new(ratio, MAX, fast).with_shared_overhead(overhead);
-		let mut b = S3FifoCompactHybridStack::new(ratio, MAX, fast).with_shared_overhead(overhead);
-		let (mut ma, mut mb) = (Vec::new(), Vec::new());
-
-		for (k, size) in ops {
-			if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-			if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-			ma.extend(a.drain_tier_migrations());
-			mb.extend(b.drain_tier_migrations());
-		}
-
-		let keys: Vec<HashedKey> = ops.iter().map(|(k, _)| *k).collect();
-		let ta = keys.iter().map(|k| a.tier_of(*k)).collect();
-		let tb = keys.iter().map(|k| b.tier_of(*k)).collect();
-		(ma, mb, ta, tb)
-	}
-
-	#[test]
-	fn matches_s3_fifo_hybrid_migration_for_migration() {
-		let ops = skewed_ops();
-		for ratio in [0.1f64, 0.25, 0.5] {
-			for fast in [8_192u64, 32_768, 131_072] {
-				for overhead in [0u64, 112] {
-					let (ma, mb, ta, tb) = replay(ratio, fast, overhead, &ops);
-					assert_eq!(ta, tb, "tiers diverge at ratio {ratio} fast {fast} overhead {overhead}");
-					assert_eq!(ma, mb, "migrations diverge at ratio {ratio} fast {fast} overhead {overhead}");
-				}
-			}
-		}
-	}
-
-	/// Eviction is where the reference bit is acted on: an accessed key at the
-	/// main tail is reinserted at the front instead of evicted, which reorders
-	/// the queue mid-eviction. Nothing above exercises that.
-	#[test]
-	fn evicts_in_the_same_order_including_second_chances() {
-		let ops = skewed_ops();
-		let mut a = S3FifoHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		let mut b = S3FifoCompactHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		for (k, size) in &ops {
-			if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-			if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-			a.drain_tier_migrations();
-			b.drain_tier_migrations();
-		}
-		assert_eq!(a.needs_capacity_eviction(), b.needs_capacity_eviction());
-
-		let mut ea = Vec::new();
-		let mut eb = Vec::new();
-		while let Some(k) = a.evict_one() { ea.push(k); }
-		while let Some(k) = b.evict_one() { eb.push(k); }
-		assert_eq!(ea, eb, "eviction order diverges");
-		assert_eq!(b.len(), 0);
-	}
-
-	#[test]
-	fn removal_matches_including_boundary_maintenance() {
-		let ops = skewed_ops();
-		let mut a = S3FifoHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		let mut b = S3FifoCompactHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		let (mut ma, mut mb) = (Vec::new(), Vec::new());
-
-		for (i, (k, size)) in ops.iter().enumerate() {
-			if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-			if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-			if i % 97 == 0 {
-				let victim = (i as u64 % 200) + 1;
-				a.remove(victim);
-				b.remove(victim);
-			}
-			ma.extend(a.drain_tier_migrations());
-			mb.extend(b.drain_tier_migrations());
-		}
-
-		assert_eq!(ma, mb, "migrations diverge under removal");
-		assert_eq!(a.len(), b.len());
-		assert_eq!(a.fast_object_count(), b.fast_object_count());
-		assert_eq!(a.slow_object_count(), b.slow_object_count());
-		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used());
-		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used());
-	}
-
-	/// Resize in both directions with BRAND-NEW keys afterwards. The shape is
-	/// load-bearing: the equivalent test on the LFU conversion passed with a
-	/// real bug present because the workload had no new keys after the resize.
-	/// `resize` here rescales BOTH sub-capacities, which `resize_fast_tier`
-	/// does not.
-	#[test]
-	fn resizes_like_s3_fifo_hybrid() {
-		for (start, resized) in [(65_536u64, 65_536u64), (131_072, 32_768), (32_768, 131_072)] {
-			let mut a = S3FifoHybridStack::new(0.25, MAX, start).with_shared_overhead(112);
-			let mut b = S3FifoCompactHybridStack::new(0.25, MAX, start).with_shared_overhead(112);
-			let (mut ma, mut mb) = (Vec::new(), Vec::new());
-
-			for i in 0..4_000u64 {
-				let k = (i % 200) + 1;
-				if a.contains(k) { a.update(k); } else { a.insert(k, 1024); }
-				if b.contains(k) { b.update(k); } else { b.insert(k, 1024); }
-				ma.extend(a.drain_tier_migrations());
-				mb.extend(b.drain_tier_migrations());
-			}
-
-			a.resize_fast_tier(resized);
-			b.resize_fast_tier(resized);
-			a.resize(MAX / 2);
-			b.resize(MAX / 2);
-			ma.extend(a.drain_tier_migrations());
-			mb.extend(b.drain_tier_migrations());
-			assert_eq!(a.needs_capacity_eviction(), b.needs_capacity_eviction());
-
-			for i in 0..2_000u64 {
-				let k = 10_000 + i;
-				a.insert(k, 1024);
-				b.insert(k, 1024);
-				ma.extend(a.drain_tier_migrations());
-				mb.extend(b.drain_tier_migrations());
-			}
-
-			assert_eq!(ma, mb, "migrations diverge resizing {start} -> {resized}");
-			for i in 0..2_000u64 {
-				assert_eq!(a.tier_of(10_000 + i), b.tier_of(10_000 + i));
-			}
-		}
-	}
-
-	/// The defining S3-FIFO behaviours: a first access admits to the one-access
-	/// queue (slow), a second promotes to main and fast, and a third only sets
-	/// the reference bit -- it must NOT reorder or migrate.
-	#[test]
-	fn admission_promotion_and_reference_bit() {
-		let mut a = S3FifoHybridStack::new(0.25, MAX, 131_072).with_shared_overhead(0);
-		let mut b = S3FifoCompactHybridStack::new(0.25, MAX, 131_072).with_shared_overhead(0);
-
-		a.insert(1, 1024);
-		b.insert(1, 1024);
-		assert_eq!(a.tier_of(1), Some(Tier::Slow));
-		assert_eq!(b.tier_of(1), a.tier_of(1));
-
-		a.update(1);
-		b.update(1);
-		assert_eq!(a.tier_of(1), Some(Tier::Fast));
-		assert_eq!(b.tier_of(1), a.tier_of(1));
-		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
-
-		// third access: reference bit only
-		a.update(1);
-		b.update(1);
-		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
-		assert!(a.drain_tier_migrations().is_empty());
-		assert_eq!(a.fast_object_count(), b.fast_object_count());
 	}
 }

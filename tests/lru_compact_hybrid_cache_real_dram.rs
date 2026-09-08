@@ -8,7 +8,7 @@
 //! Does a demotion actually move bytes onto the slow NUMA node?
 //!
 //! Run with:
-//!   cargo +nightly test --test lru_hybrid_cache_real_dram --features lru_hybrid_cache
+//!   cargo +nightly test --test lru_compact_hybrid_cache_real_dram --features lru_compact_hybrid_cache
 //!
 //! Every other capacity assertion in the suite reads the policy stack's own
 //! `fast_used` counter back through `hybrid_stats().fast_bytes_used` and
@@ -36,7 +36,7 @@
 //!   third                  0.498                       0.000
 //! ```
 //!
-//! Two things follow. The node-0 figure is not assertable at all: LruHybrid
+//! Two things follow. The node-0 figure is not assertable at all: LruCompactHybrid
 //! admits every object to DRAM before demoting it, so the whole payload
 //! passes through node 0, and jemalloc's retention means node-0 residency
 //! does not fall back afterwards -- it ranged 0.00x to 1.34x of the payload
@@ -53,7 +53,7 @@
 //! which is the intended behaviour: a green run must mean the tiering was
 //! observed, never that the observation was unavailable.
 
-#[cfg(feature = "lru_hybrid_cache")]
+#[cfg(feature = "lru_compact_hybrid_cache")]
 mod real_dram_tests {
     use paper_cache::{PaperCache, PaperPolicy, TieredBuffer, CacheTierSize};
     use paper_cache::numa_alloc::resident_pages_per_node;
@@ -86,7 +86,7 @@ mod real_dram_tests {
             let warm = PaperCache::<u32, TieredBuffer>::new(
                 1_048_576,
                 CacheTierSize::Bytes(1_024),
-                PaperPolicy::LruHybrid,
+                PaperPolicy::LruCompactHybrid,
             )
             .expect("warm-up cache should construct");
             warm.set(1u32, &[0u8; 64], None).expect("warm-up set");
@@ -99,7 +99,7 @@ mod real_dram_tests {
         let cache = PaperCache::<u32, TieredBuffer>::new(
             200_000_000, // far above the payload: nothing is evicted, only demoted
             CacheTierSize::Bytes(FAST_TIER_BYTES),
-            PaperPolicy::LruHybrid,
+            PaperPolicy::LruCompactHybrid,
         )
         .expect("cache should construct");
 

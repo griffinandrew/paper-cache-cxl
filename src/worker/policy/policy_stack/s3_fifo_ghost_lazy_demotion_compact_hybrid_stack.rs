@@ -54,6 +54,14 @@
 //! insertion-count window -- so it cannot live in a structure keyed by slot.
 //! It is charged as a separate term alongside the per-object one and therefore
 //! does not enter this stack's per-object figure at all.
+//!
+//! **The baseline named above no longer exists in this crate.** Every
+//! non-compact hybrid stack was removed once its compact twin was shown
+//! behaviourally identical at 72 B/object of eviction stack instead of 112.
+//! References to it here are historical: they say what this design is a
+//! compaction OF, and they are the reason the structure looks the way it
+//! does. Git history holds the baseline and the differential tests that
+//! proved the two agreed.
 
 use crate::{
 	object::ObjectSize,
@@ -597,160 +605,26 @@ impl PolicyStack for S3FifoGhostLazyDemotionCompactHybridStack {
 }
 
 
-/// Fidelity against `S3FifoGhostLazyDemotionHybridStack`.
-#[cfg(all(test, feature = "s3_fifo_ghost_lazy_demotion_hybrid_cache"))]
-mod fidelity_tests {
+/// What survives of this stack's original `fidelity_tests` module.
+///
+/// That module replayed an op stream through this stack and through
+/// `S3FifoGhostLazyDemotionHybridStack`, the non-compact baseline it is a
+/// compaction of, and asserted the two were indistinguishable. The baseline
+/// has since been removed from the crate, so the oracle is gone and the
+/// differential cases went with it -- git history keeps them.
+///
+/// These two do not need the baseline. The first pins the registration
+/// surface, which is easy for a copied parser to get subtly wrong; the second
+/// compares this stack against the NON-lazy compact ghost stack, which is very
+/// much alive, and is what proves the lazy-demotion delta was actually applied
+/// rather than copied across unchanged.
+#[cfg(all(test, feature = "s3_fifo_ghost_lazy_demotion_compact_hybrid_cache"))]
+mod compact_tests {
 	use super::*;
-	use crate::worker::policy::policy_stack::{
-		s3_fifo_ghost_compact_hybrid_stack::S3FifoGhostCompactHybridStack,
-		s3_fifo_ghost_lazy_demotion_hybrid_stack::S3FifoGhostLazyDemotionHybridStack,
-	};
+	use crate::worker::policy::policy_stack::s3_fifo_ghost_compact_hybrid_stack::S3FifoGhostCompactHybridStack;
 
-	const MAX: CacheSize = 1_000_000;
-
-	/// Wide enough to evict from the one-access tail, which is the only thing
-	/// that populates a ghost. A narrower workload would leave it empty and
-	/// exercise none of this variant's ghost behaviour. It also re-touches keys
-	/// heavily enough for main-queue reference bits to be set, which is what
-	/// the demotion-time reprieve needs to fire at all.
-	fn churn_ops() -> Vec<(HashedKey, ObjectSize)> {
-		let mut ops = Vec::new();
-		let mut x: u64 = 0x243F_6A88_85A3_08D3;
-		for _ in 0..20_000 {
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-			let u = (x >> 11) as f64 / (1u64 << 53) as f64;
-			ops.push((((u * u * 2_000.0) as u64) + 1, 1024));
-		}
-		ops
-	}
-
-	/// `insert` + `update`: this stack never admits a fresh (non-ghost) key
-	/// straight into main's fast tier, so a fast-tier test has to promote.
-	fn promote_pair(
-		a: &mut S3FifoGhostLazyDemotionHybridStack,
-		b: &mut S3FifoGhostLazyDemotionCompactHybridStack,
-		key: HashedKey,
-		size: ObjectSize,
-	) {
-		a.insert(key, size);
-		a.update(key);
-		b.insert(key, size);
-		b.update(key);
-	}
-
-	#[test]
-	fn matches_the_baseline_migration_for_migration() {
-		let ops = churn_ops();
-		for ratio in [0.1f64, 0.25] {
-			for fast in [8_192u64, 65_536] {
-				for overhead in [0u64, 112] {
-					let mut a = S3FifoGhostLazyDemotionHybridStack::new(ratio, MAX, fast)
-						.with_shared_overhead(overhead);
-					let mut b = S3FifoGhostLazyDemotionCompactHybridStack::new(ratio, MAX, fast)
-						.with_shared_overhead(overhead);
-					let (mut ma, mut mb) = (Vec::new(), Vec::new());
-
-					for (k, size) in &ops {
-						if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-						if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-						while a.needs_capacity_eviction() { if a.evict_one().is_none() { break } }
-						while b.needs_capacity_eviction() { if b.evict_one().is_none() { break } }
-						ma.extend(a.drain_tier_migrations());
-						mb.extend(b.drain_tier_migrations());
-					}
-
-					assert_eq!(ma, mb, "migrations diverge ratio {ratio} fast {fast} oh {overhead}");
-					assert_eq!(a.len(), b.len(), "lengths diverge");
-					assert_eq!(a.fast_bytes_used(), b.fast_bytes_used(), "fast bytes diverge");
-					assert_eq!(a.slow_bytes_used(), b.slow_bytes_used(), "slow bytes diverge");
-					assert_eq!(a.fast_object_count(), b.fast_object_count(), "fast count diverges");
-					assert_eq!(a.slow_object_count(), b.slow_object_count(), "slow count diverges");
-					assert_eq!(
-						a.effective_fast_capacity(), b.effective_fast_capacity(),
-						"effective fast capacity diverges",
-					);
-					assert_eq!(a.fast_capacity(), b.fast_capacity());
-					for (k, _) in ops.iter().take(500) {
-						assert_eq!(a.tier_of(*k), b.tier_of(*k), "tier of {k} diverges");
-						assert_eq!(a.is_ghost(*k), b.is_ghost(*k), "ghost membership of {k} diverges");
-					}
-				}
-			}
-		}
-	}
-
-	/// A key evicted from the one-access tail leaves a fingerprint, and
-	/// re-admitting it skips that queue and lands in main/fast.
-	#[test]
-	fn a_ghost_hit_admits_straight_to_main_and_fast() {
-		let mut a = S3FifoGhostLazyDemotionHybridStack::new(0.0001, MAX, 131_072).with_shared_overhead(0);
-		let mut b = S3FifoGhostLazyDemotionCompactHybridStack::new(0.0001, MAX, 131_072).with_shared_overhead(0);
-
-		for k in 1..=32u64 {
-			a.insert(k, 1024);
-			b.insert(k, 1024);
-			while a.needs_capacity_eviction() { if a.evict_one().is_none() { break } }
-			while b.needs_capacity_eviction() { if b.evict_one().is_none() { break } }
-		}
-		assert!(a.is_ghost(1), "baseline should have ghosted the evicted key");
-		assert_eq!(b.is_ghost(1), a.is_ghost(1));
-
-		a.drain_tier_migrations();
-		b.drain_tier_migrations();
-
-		a.insert(1, 1024);
-		b.insert(1, 1024);
-		assert_eq!(a.tier_of(1), Some(Tier::Fast), "a ghost hit should admit to fast");
-		assert_eq!(b.tier_of(1), a.tier_of(1));
-		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
-	}
-
-	/// `remove` must clear the ghost even with no entry row -- the state a key
-	/// is in after a one-access eviction.
-	#[test]
-	fn remove_clears_a_ghost_with_no_entry_row() {
-		let mut a = S3FifoGhostLazyDemotionHybridStack::new(0.0001, MAX, 131_072).with_shared_overhead(0);
-		let mut b = S3FifoGhostLazyDemotionCompactHybridStack::new(0.0001, MAX, 131_072).with_shared_overhead(0);
-		for k in 1..=32u64 {
-			a.insert(k, 1024);
-			b.insert(k, 1024);
-			while a.needs_capacity_eviction() { if a.evict_one().is_none() { break } }
-			while b.needs_capacity_eviction() { if b.evict_one().is_none() { break } }
-		}
-		assert!(a.is_ghost(1));
-		assert!(!a.contains(1), "the key should have no entry row at this point");
-
-		a.remove(1);
-		b.remove(1);
-		assert!(!a.is_ghost(1));
-		assert_eq!(b.is_ghost(1), a.is_ghost(1));
-	}
-
-	/// Second chances must not trim the ghost window -- only a genuine
-	/// main-queue eviction does.
-	#[test]
-	fn eviction_order_matches_including_second_chances() {
-		let ops = churn_ops();
-		let mut a = S3FifoGhostLazyDemotionHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		let mut b = S3FifoGhostLazyDemotionCompactHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		for (k, size) in &ops {
-			if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-			if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-			a.drain_tier_migrations();
-			b.drain_tier_migrations();
-		}
-		let mut ea = Vec::new();
-		let mut eb = Vec::new();
-		while let Some(k) = a.evict_one() { ea.push(k); }
-		while let Some(k) = b.evict_one() { eb.push(k); }
-		assert_eq!(ea, eb, "eviction order diverges");
-		assert_eq!(b.len(), 0);
-	}
-
-	/// The policy string round-trips, is distinct from the baseline's, and
-	/// rejects the ratio that would starve the main queue.
+	/// The policy string round-trips and rejects the ratio that would starve
+	/// the main queue.
 	///
 	/// `policy.rs`'s own `S3_FIFO_MAIN_SIZED_PREFIXES` would be the natural
 	/// home for this, but its companion test asserts the two prefix lists
@@ -767,17 +641,9 @@ mod fidelity_tests {
 		assert_eq!(parsed.to_string(), "s3-fifo-ghost-lazy-demotion-compact-hybrid-0.25");
 		assert!(parsed.is_hybrid(), "the compact variant is still a tiered design");
 
-		// Not the baseline: the two prefixes must not alias each other.
-		assert_ne!(
-			parsed,
-			"s3-fifo-ghost-lazy-demotion-hybrid-0.25".parse::<PaperPolicy>().unwrap(),
-			"the compact prefix parsed as the baseline policy",
-		);
-
 		// This stack sizes `main_capacity` at `(1 - ratio) * max_size` and
 		// gates `evict_one` on `main_is_full`, so a ratio of exactly 1 leaves
-		// the main queue zero bytes and the eviction loop spins. Same
-		// exclusion the baseline's parser applies.
+		// the main queue zero bytes and the eviction loop spins.
 		assert!(
 			"s3-fifo-ghost-lazy-demotion-compact-hybrid-1.0".parse::<PaperPolicy>().is_err(),
 			"a ratio of 1 leaves the main queue zero bytes and must be rejected",
@@ -792,72 +658,11 @@ mod fidelity_tests {
 		);
 	}
 
-	/// This variant's signature mechanic, checked against the baseline rather
-	/// than only in the abstract: a demotion candidate whose reference bit is
-	/// set is reprieved (front, bit cleared, tier and accounting untouched, no
-	/// migration) and the sweep moves on to the next-oldest fast key.
-	#[test]
-	fn a_drain_reprieves_accessed_boundary_keys_exactly_like_the_baseline() {
-		let fast_capacity: CacheSize = 1_000;
-		let size: ObjectSize = 10;
-		let bytes = size as CacheSize;
-
-		let high = watermarks::high_bytes(fast_capacity);
-		let low = watermarks::low_bytes(fast_capacity);
-
-		let mut a = S3FifoGhostLazyDemotionHybridStack::new(1.0, 100_000, fast_capacity);
-		let mut b = S3FifoGhostLazyDemotionCompactHybridStack::new(1.0, 100_000, fast_capacity);
-
-		let count = high / bytes + 1;
-
-		// Fill to the high watermark without tripping it.
-		for key in 1..count {
-			promote_pair(&mut a, &mut b, key, size);
-		}
-		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
-
-		// Set the reference bit on the three oldest fast keys -- the first
-		// three demotion candidates the pass will reach. Marking is lazy: no
-		// reorder, no tier change, no migration.
-		for key in 1..=3 {
-			a.update(key);
-			b.update(key);
-		}
-		assert_eq!(a.drain_tier_migrations(), Vec::new());
-		assert_eq!(b.drain_tier_migrations(), Vec::new());
-
-		// One more object trips the high watermark and fires the pass.
-		promote_pair(&mut a, &mut b, count, size);
-		let ma = a.drain_tier_migrations();
-		let mb = b.drain_tier_migrations();
-
-		assert_eq!(ma, mb, "reprieve-bearing drain diverges from the baseline");
-
-		for key in 1..=3 {
-			assert_eq!(
-				b.tier_of(key), Some(Tier::Fast),
-				"key {key} should have been reprieved, not demoted",
-			);
-			assert_eq!(a.tier_of(key), b.tier_of(key));
-			assert!(
-				!mb.contains(&(key, Tier::Slow)),
-				"a reprieve is not a tier change and must not emit a migration, got {mb:?}",
-			);
-		}
-
-		// The first candidate with a clear bit is demoted for real, and the
-		// pass still runs all the way down to the low watermark.
-		assert!(mb.contains(&(4, Tier::Slow)));
-		assert_eq!(b.fast_bytes_used(), a.fast_bytes_used());
-		assert_eq!(b.fast_bytes_used(), low - low % bytes);
-		assert!(b.fast_bytes_used() <= low);
-	}
-
-	/// The delta really was applied. Under the identical marked-bit workload
-	/// above, the NON-lazy compact ghost stack demotes the reprieved keys --
-	/// so if this stack's `settle_fast_tier` had been copied across unchanged,
-	/// this assertion would fail and the fidelity test above would be
-	/// comparing two copies of the wrong behaviour.
+	/// The lazy-demotion delta really was applied. Under a workload that leaves
+	/// the demotion candidates' reference bits SET, the non-lazy compact ghost
+	/// stack demotes them anyway; this stack must reprieve them. If
+	/// `settle_fast_tier` had been copied across from the non-lazy stack
+	/// unchanged, this is the assertion that would catch it.
 	#[test]
 	fn lazy_demotion_actually_diverges_from_the_non_lazy_compact_stack() {
 		let fast_capacity: CacheSize = 1_000;

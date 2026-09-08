@@ -1,6 +1,6 @@
 // This suite pins the
 // genericity claims on the lru design.
-#![cfg(feature = "lru_hybrid_cache")]
+#![cfg(feature = "lru_compact_hybrid_cache")]
 
 // Does the library actually accept a non-integer key type end to end?
 use paper_cache::{PaperCache, CacheTierSize, PaperPolicy, TieredBuffer};
@@ -10,7 +10,7 @@ fn string_keys_work_end_to_end() {
     let cache = PaperCache::<String, TieredBuffer>::new(
         10_000_000,
         CacheTierSize::Bytes(2_000_000),
-        PaperPolicy::LruHybrid,
+        PaperPolicy::LruCompactHybrid,
     )
     .expect("construct");
 
@@ -31,7 +31,7 @@ fn string_keys_work_end_to_end() {
 #[test]
 fn byte_vec_keys_work_too() {
     let cache =
-        PaperCache::<Vec<u8>, TieredBuffer>::new(10_000_000, CacheTierSize::Bytes(2_000_000), PaperPolicy::LruHybrid)
+        PaperCache::<Vec<u8>, TieredBuffer>::new(10_000_000, CacheTierSize::Bytes(2_000_000), PaperPolicy::LruCompactHybrid)
             .expect("construct");
 
     cache.set(vec![0xDE, 0xAD], b"beef".as_slice(), None).expect("set");
@@ -48,7 +48,7 @@ impl typesize::TypeSize for OpaqueKey {}
 #[test]
 fn keys_need_no_debug_impl() {
     let cache =
-        PaperCache::<OpaqueKey, TieredBuffer>::new(10_000_000, CacheTierSize::Bytes(2_000_000), PaperPolicy::LruHybrid)
+        PaperCache::<OpaqueKey, TieredBuffer>::new(10_000_000, CacheTierSize::Bytes(2_000_000), PaperPolicy::LruCompactHybrid)
             .expect("construct");
     let k = OpaqueKey(*b"0123456789abcdef");
     cache.set(k.clone(), b"v".as_slice(), None).expect("set");

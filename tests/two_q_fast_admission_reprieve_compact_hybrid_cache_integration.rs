@@ -7,9 +7,9 @@
 
 //! Integration tests for the `two_q_fast_admission_reprieve_compact_hybrid_cache` feature.
 //!
-//! A rename of `two_q_fast_admission_reprieve_hybrid_cache_integration.rs` and
-//! nothing else, deliberately: the slab conversion is supposed to be
-//! behaviour-preserving, so the baseline's assertions are exactly the ones
+//! A rename of the baseline suite and nothing else, deliberately: the slab
+//! conversion is supposed to be behaviour-preserving, so the baseline's
+//! assertions are exactly the ones
 //! that have to still hold. Divergence shows up here as a failing baseline
 //! assertion rather than as a test written to match whatever the new stack
 //! happens to do.
@@ -25,7 +25,7 @@
 //! integration suites — `tier_of` reads the tier directly off the single
 //! object map.
 //!
-//! The defining difference from `two_q_fast_admission_hybrid_cache`: a
+//! The defining difference from `two_q_fast_admission_compact_hybrid_cache`: a
 //! one-access object that ages out of the FIFO queue without a second access
 //! is **reprieved into the slow tier** (spliced onto the bottom of the main
 //! queue) rather than evicted outright. Admission is still a plain DRAM write,
@@ -124,7 +124,7 @@ mod hybrid_cache_tests {
     /// Forces the one-time PMEM allocator pool init/prewarm to complete
     /// before a test's own timing-sensitive assertions begin.
     ///
-    /// Unlike `two_q_hybrid_cache`'s analog — where the very first `set()`
+    /// Unlike `two_q_compact_hybrid_cache`'s analog — where the very first `set()`
     /// pays this cost synchronously, because admission itself allocates in
     /// PMEM — admission here is pure DRAM, so nothing touches the PMEM pool
     /// until a real demotion occurs. This therefore has to *drive* a
@@ -270,7 +270,7 @@ mod hybrid_cache_tests {
     /// The FIFO reservation is carved out of `fast_tier_size`, so the main
     /// queue starts demoting while total fast-tier usage is still below the
     /// configured budget. This is the accounting difference from
-    /// `two_q_hybrid_cache`, where the FIFO queue costs no DRAM at all.
+    /// `two_q_compact_hybrid_cache`, where the FIFO queue costs no DRAM at all.
     #[test]
     fn fast_tier_usage_stays_within_the_configured_budget() {
         ensure_pmem_allocator_warm();
@@ -384,7 +384,7 @@ mod hybrid_cache_tests {
         );
 
         // Every key survives and reads back -- the whole point of a reprieve.
-        // In two_q_fast_admission_hybrid_cache these same admissions drive
+        // In two_q_fast_admission_compact_hybrid_cache these same admissions drive
         // real evictions instead.
         for key in 1..=30u32 {
             assert!(cache.has(&key), "key {key} should have survived the reprieve");
@@ -595,7 +595,7 @@ mod hybrid_cache_tests {
 
     /// `resize` rescales `fifo_capacity` (`k_in * max_size`), which moves the
     /// main queue's effective budget — the reason this stack re-settles on
-    /// `resize` where `TwoQHybridStack` need not.
+    /// `resize` where `TwoQCompactHybridStack` need not.
     #[test]
     fn resize_rescales_the_fifo_reservation_and_re_settles() {
         ensure_pmem_allocator_warm();

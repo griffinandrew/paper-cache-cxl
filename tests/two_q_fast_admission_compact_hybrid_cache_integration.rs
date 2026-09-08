@@ -43,7 +43,7 @@
 //!   * The FIFO queue's budget is a reservation carved out of
 //!     `fast_tier_size`, so the main queue demotes earlier than its raw
 //!     fast-tier budget alone would suggest
-//!   * Once in the main queue, an object behaves like `lru_hybrid_cache`:
+//!   * Once in the main queue, an object behaves like `lru_compact_hybrid_cache`:
 //!     fast-tier pressure demotes the LRU tail; a slow-tier access promotes
 //!     it back, possibly cascading a further demotion
 //!   * A FIFO object that ages out without a second access is evicted
@@ -125,7 +125,7 @@ mod hybrid_cache_tests {
     /// Forces the one-time PMEM allocator pool init/prewarm to complete
     /// before a test's own timing-sensitive assertions begin.
     ///
-    /// Unlike `two_q_hybrid_cache`'s analog — where the very first `set()`
+    /// Unlike `two_q_compact_hybrid_cache`'s analog — where the very first `set()`
     /// pays this cost synchronously, because admission itself allocates in
     /// PMEM — admission here is pure DRAM, so nothing touches the PMEM pool
     /// until a real demotion occurs. This therefore has to *drive* a
@@ -269,7 +269,7 @@ mod hybrid_cache_tests {
     /// The FIFO reservation is carved out of `fast_tier_size`, so the main
     /// queue starts demoting while total fast-tier usage is still below the
     /// configured budget. This is the accounting difference from
-    /// `two_q_hybrid_cache`, where the FIFO queue costs no DRAM at all.
+    /// `two_q_compact_hybrid_cache`, where the FIFO queue costs no DRAM at all.
     #[test]
     fn fast_tier_usage_stays_within_the_configured_budget() {
         ensure_pmem_allocator_warm();
@@ -511,7 +511,7 @@ mod hybrid_cache_tests {
 
     /// `resize` rescales `fifo_capacity` (`k_in * max_size`), which moves the
     /// main queue's effective budget — the reason this stack re-settles on
-    /// `resize` where `TwoQHybridStack` need not.
+    /// `resize` where `TwoQCompactHybridStack` need not.
     #[test]
     fn resize_rescales_the_fifo_reservation_and_re_settles() {
         ensure_pmem_allocator_warm();

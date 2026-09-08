@@ -26,7 +26,7 @@
 //! integration suites — `tier_of` reads the tier directly off the single
 //! object map.
 //!
-//! What distinguishes this design from `two_q_fast_admission_hybrid_cache`,
+//! What distinguishes this design from `two_q_fast_admission_compact_hybrid_cache`,
 //! and therefore what this suite is actually for:
 //!
 //!   * Admission lands in `a1_in`, in the **fast** tier, on `set()` itself
@@ -38,7 +38,7 @@
 //!     into `am`
 //!   * Only `a1_out` overflow (`k_out`) drives capacity eviction, and
 //!     eviction drains `a1_out` before `a1_in` and `am`
-//!   * Once in `am`, an object behaves like `lru_hybrid_cache`
+//!   * Once in `am`, an object behaves like `lru_compact_hybrid_cache`
 //!   * TTL survives a tier move; `set_fast_tier_size` / `resize` take effect
 //!     at runtime; both ratios are range-checked at construction
 
@@ -64,7 +64,7 @@ mod hybrid_cache_tests {
     // ── sizing ────────────────────────────────────────────────────────────
     //
     // The arithmetic trap this design inherits from
-    // `two_q_fast_admission_hybrid_cache`, and sharpens: `k_in` is
+    // `two_q_fast_admission_compact_hybrid_cache`, and sharpens: `k_in` is
     // denominated in `max_size` but the budget it consumes is
     // `fast_tier_size`, because `a1_in` is DRAM. `effective_am_fast_capacity
     // = fast_tier_size - k_in * max_size`, so a `k_in` that looks tiny
@@ -466,7 +466,7 @@ mod hybrid_cache_tests {
         assert_eq!(cache.get(&1u32).unwrap(), vec![1u8; 64]);
     }
 
-    // ── am behaves like lru_hybrid_cache ──────────────────────────────────
+    // ── am behaves like lru_compact_hybrid_cache ──────────────────────────────────
 
     #[test]
     fn main_queue_pressure_demotes_the_lru_tail_with_real_data_movement() {
@@ -722,7 +722,7 @@ mod hybrid_cache_tests {
 
     /// `resize` rescales BOTH budgets — `a1_in`'s DRAM reservation and
     /// `a1_out`'s PMEM cap — and re-settles both immediately, which
-    /// `TwoQHybridStack::resize` need not do.
+    /// `TwoQCompactHybridStack::resize` need not do.
     #[test]
     fn resize_rescales_both_budgets_and_re_settles() {
         ensure_pmem_allocator_warm();

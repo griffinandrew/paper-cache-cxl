@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Slab-backed 2Q hybrid: behaviourally identical to [`TwoQHybridStack`], with
+//! Slab-backed 2Q hybrid: behaviourally identical to `TwoQHybridStack`, with
 //! one structure where that has three.
 //!
 //! `TwoQHybridStack` keeps two `kwik::HashList`s -- a FIFO admission queue and
@@ -24,6 +24,14 @@
 //! fast key in main, and demotion steps it one place toward the MRU end per
 //! victim. Terminal eviction prefers the FIFO tail, falling back to the main
 //! tail. Nothing is searched for.
+//!
+//! **The baseline named above no longer exists in this crate.** Every
+//! non-compact hybrid stack was removed once its compact twin was shown
+//! behaviourally identical at 72 B/object of eviction stack instead of 112.
+//! References to it here are historical: they say what this design is a
+//! compaction OF, and they are the reason the structure looks the way it
+//! does. Git history holds the baseline and the differential tests that
+//! proved the two agreed.
 
 use crate::{
 	object::ObjectSize,
@@ -444,197 +452,5 @@ impl PolicyStack for TwoQCompactHybridStack {
 
 	fn needs_capacity_eviction(&self) -> bool {
 		self.fifo_used > self.fifo_capacity
-	}
-}
-
-/// Fidelity against `TwoQHybridStack`, which this stack is a compaction of.
-///
-/// The two must be indistinguishable: same queue for every key, same tier, same
-/// migration sequence in the same order, same eviction order. Agreeing on a
-/// miss ratio is necessary but not sufficient -- it would not catch a counter
-/// firing on the wrong path, which is the class of defect that produced a
-/// doubled demotion count on the LFU conversion.
-#[cfg(all(test, feature = "two_q_hybrid_cache"))]
-mod fidelity_tests {
-	use super::*;
-	use crate::worker::policy::policy_stack::two_q_hybrid_stack::TwoQHybridStack;
-
-	const MAX: CacheSize = 1_000_000;
-
-	/// 200 keys biased toward low ids. Repeats matter especially here: a key is
-	/// only promoted out of the FIFO on its SECOND access, so a workload
-	/// without reuse would never exercise the main queue at all.
-	fn skewed_ops() -> Vec<(HashedKey, ObjectSize)> {
-		let mut ops = Vec::new();
-		let mut x: u64 = 0x243F_6A88_85A3_08D3;
-		for _ in 0..20_000 {
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-			let u = (x >> 11) as f64 / (1u64 << 53) as f64;
-			ops.push((((u * u * 200.0) as u64) + 1, 1024));
-		}
-		ops
-	}
-
-	fn replay(
-		k_in: f64,
-		fast: CacheSize,
-		overhead: CacheSize,
-		ops: &[(HashedKey, ObjectSize)],
-	) -> (Vec<(HashedKey, Tier)>, Vec<(HashedKey, Tier)>, Vec<Option<Tier>>, Vec<Option<Tier>>) {
-		let mut a = TwoQHybridStack::new(k_in, MAX, fast).with_shared_overhead(overhead);
-		let mut b = TwoQCompactHybridStack::new(k_in, MAX, fast).with_shared_overhead(overhead);
-		let (mut ma, mut mb) = (Vec::new(), Vec::new());
-
-		for (k, size) in ops {
-			if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-			if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-			ma.extend(a.drain_tier_migrations());
-			mb.extend(b.drain_tier_migrations());
-		}
-
-		let keys: Vec<HashedKey> = ops.iter().map(|(k, _)| *k).collect();
-		let ta = keys.iter().map(|k| a.tier_of(*k)).collect();
-		let tb = keys.iter().map(|k| b.tier_of(*k)).collect();
-		(ma, mb, ta, tb)
-	}
-
-	#[test]
-	fn matches_two_q_hybrid_migration_for_migration() {
-		let ops = skewed_ops();
-		for k_in in [0.1f64, 0.25, 0.5] {
-			for fast in [8_192u64, 32_768, 131_072] {
-				for overhead in [0u64, 112] {
-					let (ma, mb, ta, tb) = replay(k_in, fast, overhead, &ops);
-					assert_eq!(ta, tb, "tiers diverge at k_in {k_in} fast {fast} overhead {overhead}");
-					assert_eq!(ma, mb, "migrations diverge at k_in {k_in} fast {fast} overhead {overhead}");
-				}
-			}
-		}
-	}
-
-	/// Eviction order is separate from migration order: `evict_one` drains the
-	/// FIFO tail first and only then falls back to the main tail.
-	#[test]
-	fn evicts_in_the_same_order() {
-		let ops = skewed_ops();
-		let mut a = TwoQHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		let mut b = TwoQCompactHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		for (k, size) in &ops {
-			if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-			if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-			a.drain_tier_migrations();
-			b.drain_tier_migrations();
-		}
-		assert_eq!(a.needs_capacity_eviction(), b.needs_capacity_eviction());
-
-		let mut ea = Vec::new();
-		let mut eb = Vec::new();
-		while let Some(k) = a.evict_one() { ea.push(k); }
-		while let Some(k) = b.evict_one() { eb.push(k); }
-		assert_eq!(ea, eb, "eviction order diverges");
-		assert_eq!(b.len(), 0);
-	}
-
-	/// Removal maintains the main-queue tier boundary; nothing above removes.
-	#[test]
-	fn removal_matches_including_boundary_maintenance() {
-		let ops = skewed_ops();
-		let mut a = TwoQHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		let mut b = TwoQCompactHybridStack::new(0.25, MAX, 32_768).with_shared_overhead(112);
-		let (mut ma, mut mb) = (Vec::new(), Vec::new());
-
-		for (i, (k, size)) in ops.iter().enumerate() {
-			if a.contains(*k) { a.update(*k); } else { a.insert(*k, *size); }
-			if b.contains(*k) { b.update(*k); } else { b.insert(*k, *size); }
-			if i % 97 == 0 {
-				let victim = (i as u64 % 200) + 1;
-				a.remove(victim);
-				b.remove(victim);
-			}
-			ma.extend(a.drain_tier_migrations());
-			mb.extend(b.drain_tier_migrations());
-		}
-
-		assert_eq!(ma, mb, "migrations diverge under removal");
-		assert_eq!(a.len(), b.len(), "lengths diverge");
-		assert_eq!(a.fast_object_count(), b.fast_object_count(), "fast counts diverge");
-		assert_eq!(a.slow_object_count(), b.slow_object_count(), "slow counts diverge");
-		assert_eq!(a.fast_bytes_used(), b.fast_bytes_used(), "fast bytes diverge");
-		assert_eq!(a.slow_bytes_used(), b.slow_bytes_used(), "slow bytes diverge");
-	}
-
-	/// Resizing, both directions, with BRAND-NEW keys arriving afterwards.
-	///
-	/// The shape is load-bearing: on the LFU conversion the equivalent test
-	/// passed with a real bug present because the workload drew from a fixed
-	/// key set, so by the resize point nothing a resize affects was observable.
-	/// `resize` here also rescales `fifo_capacity`, which `resize_fast_tier`
-	/// does not.
-	#[test]
-	fn resizes_like_two_q_hybrid() {
-		for (start, resized) in [(65_536u64, 65_536u64), (131_072, 32_768), (32_768, 131_072)] {
-			let mut a = TwoQHybridStack::new(0.25, MAX, start).with_shared_overhead(112);
-			let mut b = TwoQCompactHybridStack::new(0.25, MAX, start).with_shared_overhead(112);
-			let (mut ma, mut mb) = (Vec::new(), Vec::new());
-
-			for i in 0..4_000u64 {
-				let k = (i % 200) + 1;
-				if a.contains(k) { a.update(k); } else { a.insert(k, 1024); }
-				if b.contains(k) { b.update(k); } else { b.insert(k, 1024); }
-				ma.extend(a.drain_tier_migrations());
-				mb.extend(b.drain_tier_migrations());
-			}
-
-			a.resize_fast_tier(resized);
-			b.resize_fast_tier(resized);
-			a.resize(MAX / 2);
-			b.resize(MAX / 2);
-			ma.extend(a.drain_tier_migrations());
-			mb.extend(b.drain_tier_migrations());
-			assert_eq!(
-				a.needs_capacity_eviction(),
-				b.needs_capacity_eviction(),
-				"fifo pressure diverges after resize {start} -> {resized}"
-			);
-
-			for i in 0..2_000u64 {
-				let k = 10_000 + i;
-				a.insert(k, 1024);
-				b.insert(k, 1024);
-				ma.extend(a.drain_tier_migrations());
-				mb.extend(b.drain_tier_migrations());
-			}
-
-			assert_eq!(ma, mb, "migrations diverge resizing {start} -> {resized}");
-			for i in 0..2_000u64 {
-				assert_eq!(
-					a.tier_of(10_000 + i),
-					b.tier_of(10_000 + i),
-					"tier of new key {} diverges",
-					10_000 + i
-				);
-			}
-		}
-	}
-
-	/// The defining 2Q behaviour: a first access admits to the FIFO (slow), and
-	/// only a SECOND access promotes to main and to fast.
-	#[test]
-	fn first_access_admits_slow_and_second_promotes() {
-		let mut a = TwoQHybridStack::new(0.25, MAX, 131_072).with_shared_overhead(0);
-		let mut b = TwoQCompactHybridStack::new(0.25, MAX, 131_072).with_shared_overhead(0);
-		a.insert(1, 1024);
-		b.insert(1, 1024);
-		assert_eq!(a.tier_of(1), Some(Tier::Slow));
-		assert_eq!(b.tier_of(1), a.tier_of(1));
-		assert_eq!(b.fast_object_count(), a.fast_object_count());
-
-		a.update(1);
-		b.update(1);
-		assert_eq!(a.tier_of(1), Some(Tier::Fast));
-		assert_eq!(b.tier_of(1), a.tier_of(1));
-		assert_eq!(a.drain_tier_migrations(), b.drain_tier_migrations());
 	}
 }

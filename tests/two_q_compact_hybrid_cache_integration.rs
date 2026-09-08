@@ -43,7 +43,7 @@
 //!   * A FIFO object that ages out without a second access is evicted
 //!     (both via `k_in`-driven FIFO-capacity pressure and via the global
 //!     capacity-exhausted eviction loop)
-//!   * Once in the main queue, an object behaves like `lru_hybrid_cache`:
+//!   * Once in the main queue, an object behaves like `lru_compact_hybrid_cache`:
 //!     fast-tier pressure demotes the LRU tail; a slow-tier access promotes
 //!     it back, possibly cascading a further demotion
 //!   * Terminal eviction prefers the FIFO queue over the main queue
@@ -197,7 +197,7 @@ mod hybrid_cache_tests {
         );
     }
 
-    // ── main-queue behavior (mirrors lru_hybrid_cache once promoted) ──────
+    // ── main-queue behavior (mirrors lru_compact_hybrid_cache once promoted) ──────
 
     #[test]
     fn fast_tier_pressure_within_main_queue_demotes_lru_tail() {
@@ -266,8 +266,8 @@ mod hybrid_cache_tests {
     // no window to observe the intermediate state). Use a capacity
     // comfortably larger than one ttl'd object alone, and force demotion
     // pressure with several small filler keys instead of a second
-    // same-sized key. Same lesson already documented for `lru_hybrid_cache`/
-    // `lfu_hybrid_cache` in CLAUDE.md.
+    // same-sized key. Same lesson already documented for `lru_compact_hybrid_cache`/
+    // `lfu_compact_hybrid_cache` in CLAUDE.md.
     // ~1 KB values for the tier-pressure tests. They need a fast tier that
     // holds ONE object and not two, and with 15-byte values that window is a
     // handful of bytes wide -- narrower than the per-object DRAM reservation

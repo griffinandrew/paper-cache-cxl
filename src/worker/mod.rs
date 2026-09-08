@@ -74,20 +74,22 @@ pub enum WorkerEvent {
 	Wipe,
 
 	Resize(CacheSize),
-	/// Runtime-adjusts the fast-tier byte budget for `lru_hybrid_cache`
-	/// (`PaperPolicy::LruHybrid`) / `lfu_hybrid_cache` (`PaperPolicy::LfuHybrid`)
-	/// / `two_q_hybrid_cache` (`PaperPolicy::TwoQHybrid`) / `fifo_hybrid_cache`
-	/// (`PaperPolicy::FifoHybrid`). No-op for every other policy stack; see
+	/// Runtime-adjusts the fast-tier byte budget for every hybrid design --
+	/// `lru_compact_hybrid_cache` (`PaperPolicy::LruCompactHybrid`),
+	/// `lfu_compact_hybrid_cache` (`PaperPolicy::LfuCompactHybrid`),
+	/// `two_q_compact_hybrid_cache` (`PaperPolicy::TwoQCompactHybrid`),
+	/// `fifo_compact_hybrid_cache` (`PaperPolicy::FifoCompactHybrid`) and the
+	/// rest. No-op for every other policy stack; see
 	/// `PolicyStack::resize_fast_tier`.
 	ResizeFastTier(CacheSize),
 	/// Runtime-adjusts the LARGE fast segment's byte budget for
-	/// `lru_sized_hybrid_cache` (`PaperPolicy::LruSizedHybrid`) specifically
-	/// -- the SMALL segment reuses `ResizeFastTier` above. No-op for every
-	/// other policy stack; see `PolicyStack::resize_large_fast_tier`.
+	/// `lru_sized_compact_hybrid_cache` (`PaperPolicy::LruSizedCompactHybrid`)
+	/// specifically -- the SMALL segment reuses `ResizeFastTier` above. No-op
+	/// for every other policy stack; see `PolicyStack::resize_large_fast_tier`.
 	ResizeLargeFastTier(CacheSize),
 	/// Runtime-adjusts the small/large size-classification threshold for
-	/// `lru_sized_hybrid_cache`. No-op for every other policy stack; see
-	/// `PolicyStack::resize_size_threshold`.
+	/// `lru_sized_compact_hybrid_cache`. No-op for every other policy stack;
+	/// see `PolicyStack::resize_size_threshold`.
 	ResizeSizeThreshold(CacheSize),
 	Policy(PaperPolicy),
 

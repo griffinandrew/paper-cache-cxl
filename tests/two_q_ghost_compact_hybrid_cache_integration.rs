@@ -20,7 +20,7 @@
 //!   cargo +nightly test --test two_q_ghost_compact_hybrid_cache_integration --features two_q_ghost_compact_hybrid_cache
 //!
 //! Same one-`PaperCache<K, TieredBuffer>` architecture and admission/
-//! demotion/promotion/eviction rules as `two_q_hybrid_cache` — see that
+//! demotion/promotion/eviction rules as `two_q_compact_hybrid_cache` — see that
 //! feature's integration test file for the shared coverage (fifo-queue
 //! demotion cascades, TTL survival, runtime resize, edge cases); this file
 //! focuses on what's actually new here: the ghost queue.
