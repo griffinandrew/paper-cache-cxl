@@ -127,6 +127,7 @@
 //!    only implies.
 
 use std::{
+	marker::PhantomData,
 	alloc::Layout,
 	ptr::NonNull,
 	sync::atomic::{AtomicU32, AtomicU64, Ordering},
@@ -136,7 +137,6 @@ use std::{
 /// carries a `weak` count this design never uses, and those 8 bytes are the
 /// difference between the header fitting jemalloc's 32-byte class exactly and
 /// spilling into the 48. See the module documentation.
-use triomphe::Arc;
 
 use crate::{Tier, object::ExpireTime};
 
@@ -148,51 +148,203 @@ const SLOW_BIT: usize = 0b1;
 const VALUE_ALIGN: usize = 8;
 
 // ---------------------------------------------------------------------------
-// the bytes: a tagged pointer, owned by the header
+// the item: ONE allocation holding the header and the value bytes
 // ---------------------------------------------------------------------------
 
-/// The value's bytes: a pointer to them, with their tier in the low bit.
+/// Everything about a cached value except its bytes -- which follow it in the
+/// SAME allocation, at [`bytes_offset`].
 ///
-/// Not public API. Exactly one [`ValueHeader`] owns each of these, and that
-/// header's `Drop` is the only thing that frees it -- so unlike v5 phase 1's
-/// bare pointer there is no deferral obligation to discharge anywhere else.
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-pub(crate) struct ValueBytes {
-	/// The address of the bytes, with the tier OR-ed into bit 0. Never
-	/// dereference directly -- go through [`ValueBytes::raw`].
-	word: NonNull<u8>,
+/// `#[repr(C)]` so the field order below is the field order the compiler uses,
+/// which is what lets `bytes_offset` be a function of `size_of` alone rather
+/// than a `Layout::extend` on every read.
+///
+/// ## Why the count lives here rather than in an `Arc`
+///
+/// The whole item -- count, key, expiry and bytes -- is allocated on one tier
+/// and has to be freed back to *that* tier's allocator. `triomphe::Arc`
+/// allocates through the global allocator, which is node-0-bound
+/// (`numa_alloc::FastAlloc`), so an `Arc`-owned header could never travel to
+/// the slow tier with the bytes it owns. That is not a limitation of triomphe;
+/// it is what `ThinArc` would inherit too. Owning the count here is the price
+/// of a tierable item, and it buys back the second allocation the header used
+/// to point at.
+///
+/// One consequence worth stating plainly: a slow-tier item's refcount is on
+/// the far node, so a `get` that hits it does an atomic read-modify-write
+/// across the interconnect. That is one cache line against the multiple
+/// kilobytes the same hit already reads from there, and the policy promotes
+/// anything hot enough for it to matter.
+#[repr(C)]
+pub struct ValueHeader<K> {
+	/// Handles naming this allocation. It lives until this reaches zero.
+	count: AtomicU32,
+
+	/// The value's length in bytes. The half that makes the tail slice and the
+	/// deallocation layout well defined.
+	len: u32,
+
+	/// The expiry tick, or `0` for "never expires" -- the same encoding
+	/// [`ExpireTime`]'s `Option<NonZeroU32>` niche uses.
+	///
+	/// Atomic because the item is SHARED and `PaperCache::ttl` sets a TTL on a
+	/// live object. A four-byte store is the whole operation, so this costs
+	/// nothing over a plain field -- and rebuilding the item instead would now
+	/// mean copying the value, since the bytes share this allocation.
+	expiry: AtomicU32,
+
+	/// The real key, kept for the hash-collision check. The object map is
+	/// keyed on a 64-bit hash, so this is what distinguishes two keys that
+	/// collide.
+	#[cfg(not(feature = "key_pmem_value_pmem"))]
+	key: K,
+
+	/// Under `key_pmem_value_pmem` the key is owned in persistent memory
+	/// instead, with no DRAM copy -- only the key's own allocation moves.
+	#[cfg(feature = "key_pmem_value_pmem")]
+	key: Box<K, crate::Hybrid>,
+	// The value's bytes follow, at `bytes_offset::<K>()`.
 }
 
-// The bytes are immutable for the whole life of the allocation (a
-// "modification" allocates a new value), so sharing one across threads hands
-// out `&[u8]` and nothing more. The free may run on whichever thread drops the
-// last `Arc`, which is precisely why `free` routes on the tag rather than on
-// thread state.
-unsafe impl Send for ValueBytes {}
-unsafe impl Sync for ValueBytes {}
+/// Where the value bytes start, measured from the head of the allocation.
+///
+/// Rounded up to `VALUE_ALIGN` so the bytes keep the eight-byte alignment they
+/// had when they were their own allocation. The tag discipline asserts on that
+/// alignment, and the tail is `u8`, so nothing else would enforce it.
+#[inline]
+fn bytes_offset<K>() -> usize {
+	let header = std::mem::size_of::<ValueHeader<K>>();
 
-impl ValueBytes {
-	/// Allocates `tier` bytes and copies `bytes` into them.
+	(header + VALUE_ALIGN - 1) & !(VALUE_ALIGN - 1)
+}
+
+/// The layout of one whole item: header, padding, then `len` bytes.
+///
+/// Never zero-sized, because the header alone is several words. That removes
+/// the old `len.max(1)` dance: two zero-length values still get distinct
+/// addresses, because each still gets its own header.
+fn item_layout<K>(len: u32) -> Layout {
+	let align = std::mem::align_of::<ValueHeader<K>>().max(VALUE_ALIGN);
+
+	// `len` is a `u32` and the header is a handful of words, so the sum cannot
+	// overflow an `isize` on any target this crate builds for; the `expect`
+	// documents that rather than guarding a reachable case.
+	Layout::from_size_align(bytes_offset::<K>() + len as usize, align)
+		.expect("a u32 length can always be laid out behind a header")
+		.pad_to_align()
+}
+
+// ---------------------------------------------------------------------------
+// the handle
+// ---------------------------------------------------------------------------
+
+/// A cached value: an eight-byte handle onto one allocation holding the strong
+/// count, the key, the expiry and the bytes.
+///
+/// Cloning is a refcount bump, not a copy -- which is what lets a reader lift
+/// the value out from under the shard lock and copy the bytes with the lock
+/// released.
+///
+/// The tier is in bit 0 of this word, exactly where it used to be in the bytes
+/// pointer, and `Drop` routes the deallocation on it. That has to be carried by
+/// the value rather than looked up, because the free runs on whichever thread
+/// happens to drop the last handle.
+// Not `repr(transparent)`: a generic `PhantomData` counts as a second field
+// for that attribute even though it is zero-sized. The struct is still exactly
+// one word, and `Option<TieredValue<K>>` is still one word, because `NonNull`
+// supplies the niche either way -- both are asserted in the tests below.
+pub struct TieredValue<K> {
+	/// The address of the header, with the tier OR-ed into bit 0. Never
+	/// dereference directly -- go through [`TieredValue::raw_ptr`].
+	word: NonNull<u8>,
+
+	_owns: PhantomData<ValueHeader<K>>,
+}
+
+// The key and the bytes are immutable for the whole life of the allocation (a
+// "modification" allocates a new item), and every mutable field is an atomic,
+// so handing a handle to another thread hands out shared reads and nothing
+// more. The free may run on whichever thread drops the last handle, which is
+// exactly why `Drop` routes on the tag rather than on thread state.
+unsafe impl<K: Send + Sync> Send for TieredValue<K> {}
+unsafe impl<K: Send + Sync> Sync for TieredValue<K> {}
+
+impl<K> Clone for TieredValue<K> {
+	/// A refcount bump. SHALLOW, and correct: the bytes are immutable, so two
+	/// handles onto one allocation observe the same value forever.
+	#[inline]
+	fn clone(&self) -> Self {
+		// `Relaxed` is what `Arc` uses here: this thread already holds a strong
+		// reference, so the allocation cannot go away underneath the bump, and
+		// the bump publishes no other data.
+		let previous = self.header().count.fetch_add(1, Ordering::Relaxed);
+
+		assert!(
+			previous < u32::MAX / 2,
+			"cached value refcount overflowed at {previous} handles onto one item",
+		);
+
+		TieredValue { word: self.word, _owns: PhantomData }
+	}
+}
+
+impl<K> Drop for TieredValue<K> {
+	fn drop(&mut self) {
+		// `Release` so everything this thread did with the item happens-before
+		// the destructor; the `Acquire` fence below pairs with every other
+		// handle's release, so the thread that actually frees sees all of them.
+		if self.header().count.fetch_sub(1, Ordering::Release) != 1 {
+			return;
+		}
+
+		std::sync::atomic::fence(Ordering::Acquire);
+
+		// Read everything the deallocation needs BEFORE running the header's
+		// own destructor: `drop_in_place` drops the key and leaves the header
+		// uninitialised, so `len` and the tag are unreadable afterwards.
+		let tier = self.tier();
+		let layout = item_layout::<K>(self.header().len);
+		let ptr = self.raw_ptr();
+
+		VALUE_FREES.fetch_add(1, Ordering::Relaxed);
+
+		// SAFETY: the count reached zero, so no other handle names this
+		// allocation and nothing can observe it again. `ptr` came from the
+		// allocator this tier names, with exactly `layout` -- `new_in` is the
+		// only constructor and the tag has not changed since.
+		unsafe {
+			std::ptr::drop_in_place(ptr.cast::<ValueHeader<K>>());
+
+			match tier {
+				Tier::Fast => fast_dealloc(ptr, layout),
+				Tier::Slow => slow_dealloc(ptr, layout),
+			}
+		}
+	}
+}
+
+impl<K> TieredValue<K> {
+	/// Builds an item: one allocation on `tier` holding the header and a copy
+	/// of `bytes`.
 	///
 	/// # Panics
 	///
-	/// If `bytes.len()` does not fit a `u32`. The length is stored in the
-	/// header as a `u32` and is what [`free`](ValueBytes::free) is handed
-	/// later, so a length that cannot round-trip has to be refused HERE, where
-	/// it is still a panic, rather than silently truncated into a mismatched
-	/// deallocation layout.
-	fn new_in(bytes: &[u8], tier: Tier) -> Self {
+	/// If `bytes.len()` does not fit a `u32`. The length is stored as a `u32`
+	/// and is what the deallocation layout is rebuilt from, so a length that
+	/// cannot round-trip has to be refused HERE, where it is still a panic,
+	/// rather than silently truncated into a mismatched free.
+	pub fn new_in(key: K, bytes: &[u8], tier: Tier, expiry: ExpireTime) -> Self {
 		assert!(
 			u32::try_from(bytes.len()).is_ok(),
 			"a cached value must fit a u32 length; got {} bytes",
 			bytes.len(),
 		);
 
-		let layout = value_layout(bytes.len() as u32);
+		let len = bytes.len() as u32;
+		let layout = item_layout::<K>(len);
 
-		// SAFETY: `value_layout` never yields a zero-sized layout, which is
-		// the only precondition either allocator entry point has.
+		// SAFETY: `item_layout` is never zero-sized -- the header alone is
+		// several words -- which is the only precondition either allocator
+		// entry point has.
 		let raw = unsafe {
 			match tier {
 				Tier::Fast => fast_alloc(layout),
@@ -201,193 +353,39 @@ impl ValueBytes {
 		};
 
 		let Some(ptr) = NonNull::new(raw) else {
-			std::alloc::handle_alloc_error(layout);
+			std::alloc::handle_alloc_error(layout)
 		};
 
 		debug_assert_eq!(
 			ptr.as_ptr().addr() % VALUE_ALIGN,
 			0,
 			"the allocator returned an address that is not {VALUE_ALIGN}-aligned, \
-			 so the tier tag would alias the address itself",
+			 so bit 0 is not free for the tier tag",
 		);
 
-		// SAFETY: `ptr` owns at least `bytes.len()` freshly allocated bytes
-		// (`value_layout` only ever rounds a length UP, to 1), and a fresh
-		// allocation cannot overlap the caller's slice.
+		// SAFETY: `ptr` names `layout.size()` writable bytes, which is at least
+		// `bytes_offset::<K>() + len`. The header is written before anything
+		// can observe it, and the tail is written before the handle exists.
 		unsafe {
-			std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), bytes.len());
-		}
+			ptr.as_ptr().cast::<ValueHeader<K>>().write(ValueHeader {
+				count: AtomicU32::new(1),
+				len,
+				expiry: AtomicU32::new(expiry.map_or(0, |tick| tick.get())),
 
-		ValueBytes { word: tag(ptr, tier) }
-	}
-
-	/// Which tier these bytes physically live in.
-	#[inline]
-	fn tier(&self) -> Tier {
-		if self.word.as_ptr().addr() & SLOW_BIT == 0 {
-			Tier::Fast
-		} else {
-			Tier::Slow
-		}
-	}
-
-	/// The address of the bytes, with the tier tag stripped.
-	#[inline]
-	fn raw(&self) -> *mut u8 {
-		let untagged = self.word.as_ptr().map_addr(|addr| addr & !SLOW_BIT);
-
-		debug_assert_eq!(
-			untagged.addr() % VALUE_ALIGN,
-			0,
-			"a value address must stay {VALUE_ALIGN}-aligned; bits 1-2 of the \
-			 word are reserved and must never be set",
-		);
-
-		untagged
-	}
-
-	/// # Safety
-	///
-	/// `len` must be the exact length these bytes were created with, and they
-	/// must not have been freed.
-	#[inline]
-	unsafe fn as_slice(&self, len: u32) -> &[u8] {
-		// SAFETY: by the contract above, `raw()` points at `len` initialised
-		// bytes in one allocation. `raw()` is non-null and 8-aligned even when
-		// `len` is 0, which is what `from_raw_parts` requires for that case.
-		unsafe { std::slice::from_raw_parts(self.raw(), len as usize) }
-	}
-
-	/// Returns the bytes to the allocator their TIER names.
-	///
-	/// # Safety
-	///
-	/// `len` must be the exact length these bytes were created with, or the
-	/// deallocation layout will not match the allocation layout, and nothing
-	/// may use this `ValueBytes` afterwards. The only caller is
-	/// `ValueHeader::drop`, which owns both halves and runs exactly once.
-	#[inline]
-	unsafe fn free(self, len: u32) {
-		let layout = value_layout(len);
-		let ptr = self.raw();
-
-		VALUE_FREES.fetch_add(1, Ordering::Relaxed);
-
-		// SAFETY: by the contract above `ptr` came from the allocator this arm
-		// names, with exactly `layout`.
-		unsafe {
-			match self.tier() {
-				Tier::Fast => fast_dealloc(ptr, layout),
-				Tier::Slow => slow_dealloc(ptr, layout),
-			}
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// the header: DRAM, refcounted, owns the bytes
-// ---------------------------------------------------------------------------
-
-/// Everything about a cached value except its bytes.
-///
-/// Allocated in DRAM by `Arc`, and freed -- along with the bytes it owns --
-/// when the last [`TieredValue`] handle drops. `#[repr(C)]` so the field order
-/// above the size assertions is the field order the compiler uses.
-#[repr(C)]
-pub struct ValueHeader<K> {
-	/// The real key, kept for the hash-collision check. The object map is
-	/// keyed on a 64-bit hash, so this is what distinguishes two keys that
-	/// collide.
-	#[cfg(not(feature = "key_pmem_value_pmem"))]
-	key: K,
-
-	/// Under `key_pmem_value_pmem` the key is owned in persistent memory
-	/// instead, with no DRAM copy -- the header itself stays in DRAM, only the
-	/// key's own allocation moves.
-	#[cfg(feature = "key_pmem_value_pmem")]
-	key: Box<K, crate::Hybrid>,
-
-	/// The value's bytes and their tier. Owned: see `Drop`.
-	bytes: ValueBytes,
-
-	/// The bytes' length. The half that makes `as_slice` and the deallocation
-	/// layout well defined.
-	len: u32,
-
-	/// The expiry tick, or `0` for "never expires" -- the same encoding
-	/// [`ExpireTime`]'s `Option<NonZeroU32>` niche uses.
-	///
-	/// Atomic because the header is SHARED and `PaperCache::ttl` sets a TTL on
-	/// a live object. A four-byte store is the whole operation, so this costs
-	/// nothing over a plain field and avoids rebuilding the header -- which,
-	/// since the header owns the bytes, would mean copying the value to change
-	/// its TTL.
-	expiry: AtomicU32,
-}
-
-/// Frees the bytes. The header itself is freed by `Arc`.
-///
-/// This is the single point every removal path funnels through -- a set
-/// overwrite, an eviction, a TTL reap, a `wipe`, dropping the cache -- because
-/// all of them drop an `Object`, which drops its handle. There is no site to
-/// forget, and no deferral to get wrong: the refcount decides when.
-impl<K> Drop for ValueHeader<K> {
-	fn drop(&mut self) {
-		// SAFETY: `bytes` and `len` are written together in
-		// `TieredValue::new_in` and never separately afterwards, and this runs
-		// exactly once, when the last handle drops.
-		unsafe { self.bytes.free(self.len) }
-	}
-}
-
-// ---------------------------------------------------------------------------
-// the handle
-// ---------------------------------------------------------------------------
-
-/// A cached value: an eight-byte handle onto a DRAM header that owns tiered
-/// bytes. See the module documentation.
-///
-/// Cloning is a refcount bump, not a copy -- which is what lets a reader lift
-/// the value out from under the shard lock and copy the bytes with the lock
-/// released.
-pub struct TieredValue<K> {
-	/// `triomphe::Arc`: strong count only, so the header allocation is 32
-	/// bytes rather than 40. See the module doc.
-	inner: Arc<ValueHeader<K>>,
-}
-
-impl<K> Clone for TieredValue<K> {
-	/// A refcount bump. SHALLOW, and correct: the bytes are immutable, so two
-	/// handles onto one allocation observe the same value forever.
-	///
-	/// This is the opposite of the pre-Arc `Object::clone`, which had to deep
-	/// copy because the value was a bare pointer with no count and a shallow
-	/// copy would have been a double free.
-	#[inline]
-	fn clone(&self) -> Self {
-		TieredValue { inner: Arc::clone(&self.inner) }
-	}
-}
-
-impl<K> TieredValue<K> {
-	/// Builds a value: a DRAM header, and `bytes` copied into `tier`.
-	pub fn new_in(key: K, bytes: &[u8], tier: Tier, expiry: ExpireTime) -> Self {
-		// `ValueBytes::new_in` refuses a length that does not fit a `u32`, so
-		// this cast cannot truncate.
-		let len = bytes.len() as u32;
-
-		TieredValue {
-			inner: Arc::new(ValueHeader {
 				#[cfg(not(feature = "key_pmem_value_pmem"))]
 				key,
 				#[cfg(feature = "key_pmem_value_pmem")]
 				key: Box::new_in(key, crate::Hybrid),
+			});
 
-				bytes: ValueBytes::new_in(bytes, tier),
-				len,
-				expiry: AtomicU32::new(expiry.map_or(0, |tick| tick.get())),
-			}),
+			std::ptr::copy_nonoverlapping(
+				bytes.as_ptr(),
+				ptr.as_ptr().add(bytes_offset::<K>()),
+				len as usize,
+			);
 		}
+
+		TieredValue { word: tag(ptr, tier), _owns: PhantomData }
 	}
 
 	/// Builds a value in the fast (DRAM) tier.
@@ -402,14 +400,37 @@ impl<K> TieredValue<K> {
 		Self::new_in(key, bytes, Tier::Slow, expiry)
 	}
 
+	/// The address of the item, with the tier tag stripped.
+	#[inline]
+	fn raw_ptr(&self) -> *mut u8 {
+		let untagged = self.word.as_ptr().map_addr(|addr| addr & !SLOW_BIT);
+
+		debug_assert_eq!(
+			untagged.addr() % VALUE_ALIGN,
+			0,
+			"an item address must stay {VALUE_ALIGN}-aligned; bits 1-2 of the \
+			 word are reserved and must never be set",
+		);
+
+		untagged
+	}
+
+	/// The header, borrowed for as long as this handle lives.
+	#[inline]
+	fn header(&self) -> &ValueHeader<K> {
+		// SAFETY: `self` is a live handle, so the count is at least one and the
+		// allocation has not been freed. The header was fully initialised by
+		// `new_in` before any handle onto it existed.
+		unsafe { &*self.raw_ptr().cast::<ValueHeader<K>>() }
+	}
+
 	/// The same value's bytes, re-copied into `tier`, carrying the key and the
 	/// CURRENT expiry across.
 	///
-	/// This is a physical tier migration: a fresh header around fresh bytes,
-	/// which the caller then swaps in under the shard guard after checking
-	/// [`TieredValue::ptr_eq`] against the handle it snapshotted. Building it
-	/// OUTSIDE the guard is the point -- the byte copy is the expensive part
-	/// and may be a CXL write.
+	/// This is a physical tier migration: a fresh item, which the caller then
+	/// swaps in under the shard guard after checking [`TieredValue::ptr_eq`]
+	/// against the handle it snapshotted. Building it OUTSIDE the guard is the
+	/// point -- the byte copy is the expensive part and may be a CXL write.
 	pub fn migrated_to(&self, tier: Tier) -> Self
 	where
 		K: Clone,
@@ -421,17 +442,17 @@ impl<K> TieredValue<K> {
 	#[inline]
 	pub fn key(&self) -> &K {
 		#[cfg(not(feature = "key_pmem_value_pmem"))]
-		return &self.inner.key;
+		{
+			&self.header().key
+		}
 
-		// Under `key_pmem_value_pmem` the key is a `Box<K, Hybrid>`, so the
-		// comparison reads it from persistent memory -- which is the point of
-		// that feature, and the reason this deref is not elided.
 		#[cfg(feature = "key_pmem_value_pmem")]
-		return &self.inner.key;
+		{
+			&self.header().key
+		}
 	}
 
-	/// Whether this value's key is `key`. The check that makes a 64-bit hash
-	/// collision harmless.
+	/// Whether this item's key is the one asked for.
 	#[inline]
 	pub fn key_matches(&self, key: &K) -> bool
 	where
@@ -442,31 +463,44 @@ impl<K> TieredValue<K> {
 
 	/// The value's bytes.
 	///
-	/// Safe, because the header owns both the pointer and the length and this
-	/// borrow keeps the header alive.
+	/// Safe, because the header owns both the length and the tail and this
+	/// borrow keeps the allocation alive.
 	#[inline]
 	pub fn bytes(&self) -> &[u8] {
-		// SAFETY: `len` is the length `bytes` was created with -- they are
-		// written together in `new_in` and never separately -- and the header
-		// cannot have been dropped while `self` holds a strong reference.
-		unsafe { self.inner.bytes.as_slice(self.inner.len) }
+		let len = self.header().len;
+
+		// SAFETY: the tail was written with exactly `len` bytes in `new_in` and
+		// is never written again, and it lives in the same allocation as the
+		// header this handle keeps alive. The pointer is non-null and
+		// `VALUE_ALIGN`-aligned even when `len` is 0, which is what
+		// `from_raw_parts` requires for that case.
+		unsafe {
+			std::slice::from_raw_parts(
+				self.raw_ptr().add(bytes_offset::<K>()),
+				len as usize,
+			)
+		}
 	}
 
 	/// The value's length in bytes.
 	#[inline]
 	pub fn len(&self) -> u32 {
-		self.inner.len
+		self.header().len
 	}
 
 	#[inline]
 	pub fn is_empty(&self) -> bool {
-		self.inner.len == 0
+		self.header().len == 0
 	}
 
-	/// Which tier the BYTES live in. The header is always DRAM.
+	/// Which tier the WHOLE item lives in -- header, key and bytes together.
 	#[inline]
 	pub fn tier(&self) -> Tier {
-		self.inner.bytes.tier()
+		if self.word.as_ptr().addr() & SLOW_BIT == 0 {
+			Tier::Fast
+		} else {
+			Tier::Slow
+		}
 	}
 
 	#[inline]
@@ -482,22 +516,22 @@ impl<K> TieredValue<K> {
 	/// The expiry tick, or `None` if this value never expires.
 	#[inline]
 	pub fn expiry(&self) -> ExpireTime {
-		std::num::NonZeroU32::new(self.inner.expiry.load(Ordering::Relaxed))
+		std::num::NonZeroU32::new(self.header().expiry.load(Ordering::Relaxed))
 	}
 
-	/// Sets the expiry. Visible to every handle onto this header, which is
+	/// Sets the expiry. Visible to every handle onto this item, which is
 	/// correct: they are the same object.
 	#[inline]
 	pub fn set_expiry(&self, expiry: ExpireTime) {
-		self.inner
+		self.header()
 			.expiry
 			.store(expiry.map_or(0, |tick| tick.get()), Ordering::Relaxed);
 	}
 
-	/// Whether the two handles name the SAME header allocation.
+	/// Whether the two handles name the SAME allocation.
 	///
-	/// This is the migration identity check, and it is exact rather than
-	/// merely likely: the caller holds a strong reference to the handle it
+	/// This is the migration identity check, and it is exact rather than merely
+	/// likely: the caller holds a strong reference to the handle it
 	/// snapshotted, so that allocation cannot be freed and its address cannot
 	/// be recycled into a different value. Compare these, never the bytes --
 	/// two distinct allocations holding equal content are NOT the same value,
@@ -505,28 +539,27 @@ impl<K> TieredValue<K> {
 	/// concurrent `set`.
 	#[inline]
 	pub fn ptr_eq(a: &Self, b: &Self) -> bool {
-		Arc::ptr_eq(&a.inner, &b.inner)
+		a.raw_ptr() == b.raw_ptr()
 	}
 
-	/// The header's address, as an opaque identity for logging and tests.
+	/// The item's address, as an opaque identity for logging and tests.
 	#[inline]
 	pub fn raw(&self) -> *const ValueHeader<K> {
-		Arc::as_ptr(&self.inner)
+		self.raw_ptr() as *const ValueHeader<K>
 	}
 
-	/// The raw tagged word naming this value's BYTES -- address with the tier
-	/// in bit 0. Test-only: the tag discipline is asserted against it, and
-	/// nothing in the release path should ever need the tagged form.
+	/// The raw tagged word naming this item -- address with the tier in bit 0.
+	/// Test-only: the tag discipline is asserted against it, and nothing in the
+	/// release path should ever need the tagged form.
 	#[cfg(test)]
 	pub(crate) fn tagged_word(&self) -> usize {
-		self.inner.bytes.word.as_ptr().addr()
+		self.word.as_ptr().addr()
 	}
 
-	/// How many handles currently name this header. Tests and diagnostics
-	/// only.
+	/// How many handles currently name this item. Tests and diagnostics only.
 	#[inline]
 	pub fn strong_count(&self) -> usize {
-		Arc::count(&self.inner)
+		self.header().count.load(Ordering::Relaxed) as usize
 	}
 }
 
@@ -543,15 +576,6 @@ impl<K> std::fmt::Debug for TieredValue<K> {
 /// The layout every value of `len` bytes is allocated and freed with.
 ///
 /// `len.max(1)` keeps the allocation addressable and, more importantly,
-/// UNIQUE. `VALUE_ALIGN` is what reserves the low bits for the tag.
-#[inline]
-fn value_layout(len: u32) -> Layout {
-	// `len` is a `u32` and `VALUE_ALIGN` is 8, so the rounded size cannot
-	// overflow an `isize` on any target this crate builds for; the `expect`
-	// documents that rather than guarding a reachable case.
-	Layout::from_size_align((len as usize).max(1), VALUE_ALIGN)
-		.expect("a u32 length can always be laid out with 8-byte alignment")
-}
 
 /// Folds `tier` into bit 0 of an 8-aligned value address.
 #[inline]
@@ -900,10 +924,21 @@ mod tests {
 					Tier::Slow => SLOW_BIT,
 				};
 
+				// The tag rides on the ITEM address now, not the bytes address:
+				// one allocation, tagged once at its head, and the bytes are a
+				// fixed offset into it. Under the two-allocation design these
+				// were the same pointer, which is why this assertion moved.
 				assert_eq!(
 					value.tagged_word(),
-					value.bytes().as_ptr().addr() | expected_tag,
+					value.raw().addr() | expected_tag,
 					"len {len} in {tier:?}: the word is not exactly address | tag",
+				);
+
+				assert_eq!(
+					value.bytes().as_ptr().addr(),
+					value.raw().addr() + bytes_offset::<u64>(),
+					"len {len} in {tier:?}: the bytes must sit at a FIXED offset \
+					 into the item, or `bytes()` and the allocation disagree",
 				);
 				assert_eq!(
 					value.tagged_word() & 0b110,
@@ -1050,7 +1085,6 @@ mod tests {
 
 		let fast = TieredValue::new_fast(KEY, b"made here, freed there", None);
 		let slow = TieredValue::new_slow(KEY, b"made here, freed there", None);
-		let len = "made here, freed there".len() as u32;
 
 		// The counters are read INSIDE the freeing thread -- they are
 		// thread-local, and that thread is the one whose routing decision is
@@ -1179,9 +1213,10 @@ mod tests {
 	/// that no longer matches the one `new_in` allocated with the moment either
 	/// side is edited independently. Hence the layout itself is the assertion.
 	#[test]
-	fn the_value_layout_always_demands_eight_byte_alignment() {
+	fn the_item_layout_always_demands_eight_byte_alignment() {
 		for len in [0u32, 1, 2, 3, 7, 8, 9, 15, 16, 100, 4096, u32::MAX] {
-			let layout = value_layout(len);
+			let layout = item_layout::<u64>(len);
+			let offset = bytes_offset::<u64>();
 
 			assert_eq!(
 				layout.align(),
@@ -1190,12 +1225,39 @@ mod tests {
 				 the low bits are reserved by contract rather than by luck",
 			);
 
-			// `len.max(1)`: a zero-sized allocation need not return a unique
-			// address, and the address IS the migration identity.
 			assert_eq!(
-				layout.size(),
-				(len as usize).max(1),
-				"len {len}: a value's layout is len.max(1), never len",
+				offset % VALUE_ALIGN,
+				0,
+				"len {len}: the bytes must start {VALUE_ALIGN}-aligned, or the tail \
+				 loses the alignment the standalone allocation used to give it",
+			);
+
+			// Padded up to the alignment, so the size is the smallest multiple
+			// of `VALUE_ALIGN` that holds the header and the tail.
+			assert!(
+				layout.size() >= offset + len as usize,
+				"len {len}: the layout must hold the header AND the bytes",
+			);
+
+			assert!(
+				layout.size() - (offset + len as usize) < VALUE_ALIGN,
+				"len {len}: the layout must not waste a whole alignment unit",
+			);
+
+			assert_eq!(
+				layout.size() % VALUE_ALIGN,
+				0,
+				"len {len}: `pad_to_align` must leave a whole number of units, or \
+				 the deallocation layout will not match the allocation layout",
+			);
+
+			// No `len.max(1)` any more: the header alone is several words, so a
+			// zero-length value still gets a non-zero allocation and therefore
+			// still gets a unique address -- and the address IS the migration
+			// identity.
+			assert!(
+				layout.size() > 0,
+				"len {len}: an item is never zero-sized, so addresses stay unique",
 			);
 		}
 	}
