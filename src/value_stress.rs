@@ -5,14 +5,27 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The concurrency gate for v5's epoch-based value reclamation.
+//! The concurrency gate for v5's value lifetime -- now the refcount's, and it
+//! matters MORE than it did under the epoch pin, not less.
 //!
 //! Every other test in the tree checks a value's bytes from one thread, and so
 //! cannot see the defect this design exists to prevent: a reader that has
 //! dropped the shard guard and is part-way through copying a value while a
-//! writer unpublishes and frees it. That window is the whole reason values are
-//! retired through [`crate::value::defer_free`] rather than freed inline, and
-//! it is invisible to a single-threaded test.
+//! writer unpublishes it and a migration swaps it. That window is the whole
+//! reason `Object::snapshot` hands back an OWNED
+//! [`crate::value::TieredValue`] -- a strong reference -- rather than a borrow
+//! of the map row, and it is invisible to a single-threaded test.
+//!
+//! The mechanism changed under this harness; the window did not. It used to be
+//! held open by a `crossbeam_epoch` pin and closed by `defer_free`; it is now
+//! held open by a refcount and closed by the last handle's drop. Both designs
+//! stand or fall on the same question -- can a reader that let go of the shard
+//! lock still be reading bytes some other thread has freed -- and this is the
+//! only test in the tree that asks it concurrently. What a refcount buys is
+//! that the answer is now structural rather than disciplinary: the proof is the
+//! handle itself, not a rule every call site has to remember. What it does not
+//! buy is exemption from being checked, because "the read path takes a strong
+//! reference" is a claim about the read path, not about `Arc`.
 //!
 //! So this harness runs the window continuously for ten seconds:
 //!
@@ -26,18 +39,36 @@
 //! were recycled under it. That is the torn read. A buffer that is uniform but
 //! whose byte is not a marker at all (zeroed pages, say) is caught too.
 //!
-//! The second half of the gate is the opposite failure: garbage that is
-//! deferred and never runs. After the threads join, the harness quiesces, calls
-//! [`crate::value::flush`], and requires both that every deferral has executed
-//! (`VALUE_FREES_DEFERRED == VALUE_FREES_RUN`) and that jemalloc
-//! `stats.allocated` is back within 1% of where it was before the run.
+//! The second half of the gate is the opposite failure: a value that is retired
+//! and never freed. That half is where the bookkeeping changed, and it changed
+//! by getting SIMPLER and STRICTER at once:
+//!
+//!   * There is no deferral gap left to bound. Under epoch reclamation a
+//!     retirement and its free were two events with an unbounded-looking
+//!     interval between them, so the gate could only assert that the pair of
+//!     counters had converged after a flush and that whatever remained fitted
+//!     inside a per-thread bag (62 objects). A refcount frees on the thread
+//!     that drops the last handle, synchronously, so once the load stops and
+//!     the threads have joined there is no residue to allow for at all --
+//!     `crate::value::VALUE_FREES` is the one counter, and the bound is zero.
+//!   * What replaces "deferred == ran" is a RETIREMENT LEDGER, which the old
+//!     shape could not have asserted. Every successful `set` displaces exactly
+//!     one published value, and every migration that `Object::set_data`
+//!     actually applied displaces exactly one more; both are unreachable
+//!     afterwards, so both must have been freed by the time the round comes to
+//!     rest. See [`check_round`] for why this is stated as `>=` and what
+//!     accounts for the excess.
+//!   * The `stats.allocated` criterion is kept exactly as it was. It is the
+//!     only thing here that would catch a leak with no counter attached to it
+//!     -- a reference cycle, or a handle parked somewhere that never drops.
 //!
 //! ## Why `#[ignore]`
 //!
-//! `stats.allocated` and the two free counters are PROCESS-WIDE. Cargo runs the
-//! lib tests concurrently in one process, so any other test running alongside
-//! this one would allocate into the same numbers. This harness therefore owns
-//! its process, the same rule every `measure_*` harness in the tree follows:
+//! `stats.allocated` and `VALUE_FREES` are PROCESS-WIDE. Cargo runs the lib
+//! tests concurrently in one process, so any other test running alongside this
+//! one would allocate and free into the same numbers. This harness therefore
+//! owns its process, the same rule every `measure_*` harness in the tree
+//! follows:
 //!
 //! ```text
 //! cargo +nightly test --lib --features lru_compact_hybrid_cache -- \
@@ -48,21 +79,57 @@
 //! ## A pre-existing panic this harness surfaces
 //!
 //! In a DEBUG build the policy worker's migration consumer panics with
-//! `attempt to add with overflow` at `worker/policy/mod.rs:185` under this load.
-//! `MigrationQueue::push` calls `record_pending` AFTER `send` succeeds, so a
-//! consumer can receive the item and run `PendingOnDrop` -- the decrement --
-//! before the producer's increment, wrapping the counter to `u64::MAX`. It is
-//! instrumentation only, it is not v5's, and it reproduces unchanged on the
-//! base commit 9480852 with this same harness. Release builds do not check the
-//! overflow, so the gate run uses `--release`; a debug run loses its migration
-//! consumer part-way and its memory figures are not comparable.
+//! `attempt to add with overflow` inside `PendingOnDrop` (`worker/policy/
+//! mod.rs`) under this load. `MigrationQueue::push` calls `record_pending`
+//! AFTER `send` succeeds, so a consumer can receive the item and run the
+//! decrement before the producer's increment, wrapping the counter to
+//! `u64::MAX`. It is instrumentation only, it is not v5's, and it reproduced
+//! unchanged on the base commit 9480852 with this same harness. Release builds
+//! do not check the overflow, so the gate run uses `--release`; a debug run
+//! loses its migration consumer part-way and its memory figures are not
+//! comparable.
 //!
 //! ## Proving it can fail
 //!
-//! A stress test that has never failed proves nothing. This one was verified by
-//! changing `Object::drop` (src/object/mod.rs) from `defer_free(..)` to an
-//! inline `unsafe { self.value.free(self.len) }` and re-running: see the gate
-//! report for what it caught. Revert before trusting a green run.
+//! A stress test that has never failed proves nothing, and "the refcount makes
+//! tearing impossible" is a reason to keep the test rather than to retire it:
+//! it is the claim under test, not a premise. Two one-line mutations, each
+//! outside `src/value.rs`, break a different half of the gate.
+//!
+//! TEARING. Make the read path's snapshot stop being a strong reference --
+//! `Object::snapshot` (src/object/mod.rs) returning a forged handle rather
+//! than a clone:
+//!
+//! ```ignore
+//! pub fn snapshot(&self) -> TieredValue<K> {
+//!     // MUTATION: a bitwise copy of the handle, with NO increment.
+//!     unsafe { std::ptr::read(&self.value) }
+//! }
+//! ```
+//!
+//! This is the exact analogue of the mutation the epoch version was verified
+//! with (`Object::drop` freeing inline instead of deferring), and it fails the
+//! same way: the snapshot's drop decrements a count it never incremented, so
+//! the header and its bytes go back to the allocator while the map still
+//! publishes them and while a reader is still copying them. `SCRATCH_BUFFERS`
+//! then dirties the block, and round 3 reports `torn` and `alien` reads.
+//!
+//! LEAKING. Make a retirement not retire -- in `migration_queue::
+//! apply_migration` (src/worker/policy/mod.rs), where the superseded value is
+//! unpublished under the write guard:
+//!
+//! ```ignore
+//! // MUTATION: was `drop(superseded)`.
+//! std::mem::forget(superseded);
+//! ```
+//!
+//! The count never reaches zero, so `VALUE_FREES` stops tracking the
+//! migrations the cache reports having applied -- the retirement ledger below
+//! fails first, on the round in which it happens, naming the shortfall -- and
+//! `stats.allocated` climbs by a round's worth of leaked values, which the 1%
+//! criterion fails on independently.
+//!
+//! Revert either before trusting a green run.
 
 use std::sync::{
 	Arc,
@@ -160,8 +227,12 @@ const SCRATCH_BYTE: u8 = 0xab;
 /// each `set`.
 ///
 /// Without this the harness cannot see a use-after-free at all, and that is a
-/// measured statement rather than a worry: with `Object::drop` deliberately
-/// changed to free inline, a full run reported `torn=0`. The reason is timing.
+/// measured statement rather than a worry: with the epoch design's `Object::
+/// drop` deliberately changed to free inline, a full run reported `torn=0`.
+/// The same holds for the refcount's equivalent mutation (a `snapshot` that
+/// forges a handle instead of cloning one -- see the module doc), because the
+/// failure it produces is the same one: a live block freed early. The reason
+/// is timing.
 /// An 8 KiB copy takes well under a microsecond; the freed block goes to the
 /// freeing thread's tcache and is not handed out again until that thread's next
 /// allocation, ~20 us later. By then every reader has finished, so the stale
@@ -185,18 +256,59 @@ const FAST_BIG: u64 = 128 * 1024 * 1024;
 /// `FAST_BIG` migrates most of the population each way.
 const FAST_SMALL: u64 = 256 * 1024;
 
-/// The most retired values that may still be un-run once the cache is idle.
+/// What the value allocator has actually freed, and what the cache says it
+/// retired, sampled so that the difference is meaningful.
 ///
-/// crossbeam-epoch keeps deferrals in a per-thread bag and only pushes that bag
-/// to the global queue when it fills (62 objects on a 64-bit target) or when
-/// that thread calls `flush`. So every thread that retires values but does not
-/// flush can be sitting on up to a bag of them for as long as it stays idle.
-/// That is a BOUNDED residue, which is what `defer_free`'s contract promises;
-/// a genuine leak grows without limit and blows straight through this.
+/// The ORDER of the two reads is the whole content of this function, and it is
+/// the reason it exists rather than two inline loads at each end of a round.
+/// The invariant [`check_round`] asserts is one-directional -- frees must not
+/// fall SHORT of retirements -- so each sample is biased in the direction that
+/// cannot manufacture a false failure:
 ///
-/// Sized for a handful of such threads. The observed residue and which thread
-/// holds it are printed either way.
-const OUTSTANDING_BOUND: u64 = 62 * 8;
+///   * At the START of a window, read `VALUE_FREES` FIRST and the migration
+///     counters second. A migration completing in between contributes its free
+///     to the window's delta and its count to the baseline, so the delta gains
+///     a free and no retirement.
+///   * At the END, read the migration counters FIRST and `VALUE_FREES` second,
+///     for the mirror-image reason.
+///
+/// Either way is only sound because `apply_migration` drops the superseded
+/// value BEFORE it increments its counter, never after: at any instant, frees
+/// already performed are ahead of migrations already counted, never behind. A
+/// sampler that read them the other way round would see a straggler as a
+/// shortfall, and the gate would fail on timing rather than on a leak.
+fn ledger(cache: &PaperCache<u32, TieredBuffer>, at: Sample) -> (u64, u64) {
+	let read_frees = || crate::value::VALUE_FREES.load(Ordering::Relaxed);
+
+	let read_migrations = || {
+		let stats = cache.hybrid_stats();
+		stats.promotions + stats.demotions
+	};
+
+	match at {
+		Sample::Start => {
+			let frees = read_frees();
+
+			(frees, read_migrations())
+		},
+
+		Sample::End => {
+			let migrations = read_migrations();
+
+			(read_frees(), migrations)
+		},
+	}
+}
+
+/// Which end of a round a [`ledger`] reading is being taken at. A named pair
+/// rather than a `bool`, because the two differ only in the order of two
+/// loads and a caller passing the wrong one would be invisible at the call
+/// site.
+#[derive(Clone, Copy)]
+enum Sample {
+	Start,
+	End,
+}
 
 /// A uniform buffer of a known marker.
 fn value(marker: u8) -> Vec<u8> {
@@ -272,6 +384,19 @@ struct Seen {
 	quiesced: bool,
 	/// `stats.allocated` once the round had come to rest.
 	allocated: u64,
+
+	/// Value byte-allocations returned to an allocator during the round --
+	/// `crate::value::VALUE_FREES`, differenced across it.
+	frees: u64,
+
+	/// Tier migrations the cache reports as PHYSICALLY APPLIED during the
+	/// round (promotions + demotions), differenced across it.
+	///
+	/// Each one ran `Object::set_data` and therefore displaced exactly one
+	/// published value -- the counters are incremented if and only if the swap
+	/// happened, which is what makes them usable as a retirement count rather
+	/// than as an intent count. See `apply_migration_batches`.
+	migrations: u64,
 }
 
 /// One pass of the load: spawn, run, stop, join, drain the backlog, put the
@@ -284,6 +409,8 @@ fn run_round(
 	scratch: bool,
 ) -> Seen {
 	println!("ROUND {round} pacing read={read_pace}us set={set_pace}us");
+
+	let (frees_before, migrations_before) = ledger(cache, Sample::Start);
 
 	let tally = Arc::new(Tally::default());
 	let stop = Arc::new(AtomicBool::new(false));
@@ -442,8 +569,10 @@ fn run_round(
 	let (rested, allocated) = settle(cache, Duration::from_secs(120));
 	let quiesced = drained && rested;
 
-	let (rested, allocated) = settle(cache, Duration::from_secs(120));
-	let quiesced = drained && rested;
+	// After the join and after the settle, so every value this round retired
+	// has had its last handle dropped: the readers that were holding snapshots
+	// are gone, and the migration queue has drained.
+	let (frees_after, migrations_after) = ledger(cache, Sample::End);
 
 	let seen = Seen {
 		reads: tally.reads.load(Ordering::Relaxed),
@@ -457,11 +586,13 @@ fn run_round(
 		census: census(cache),
 		quiesced,
 		allocated,
+		frees: frees_after - frees_before,
+		migrations: migrations_after - migrations_before,
 	};
 
 	println!(
 		"ROUND {round} reads={} misses={} torn={} alien={} wrong_len={} sets={} flaps={} \
-		 waves={} census={:?} quiesced={} allocated={}",
+		 waves={} census={:?} quiesced={} allocated={} frees={} migrations={}",
 		seen.reads,
 		seen.misses,
 		seen.torn,
@@ -473,6 +604,8 @@ fn run_round(
 		seen.census,
 		seen.quiesced,
 		seen.allocated,
+		seen.frees,
+		seen.migrations,
 	);
 
 	seen
@@ -500,6 +633,45 @@ fn check_round(seen: &Seen, round: u32, census_before: (u32, u32)) {
 	assert_eq!(
 		seen.census, census_before,
 		"round {round}: the population is not where the baseline found it"
+	);
+
+	// THE RETIREMENT LEDGER, which is what "deferred == ran once settled" turned
+	// into once there was no deferral to account for.
+	//
+	// Every successful `set` overwrote a key that was already populated -- the
+	// census assertion just above is what underwrites that, since it says the
+	// whole key space survived the round -- so each one displaced exactly one
+	// published value. Every applied migration displaced exactly one more. None
+	// of those values is reachable afterwards and no thread that could have
+	// been holding a snapshot of one is still alive, so every one of them must
+	// have been freed.
+	//
+	// `>=` rather than `==` because two further things legitimately free a
+	// value without any counter here naming it, and both are real work rather
+	// than slack in the assertion:
+	//
+	//   * a migration copy that lost the `ptr_eq` identity check. It was built
+	//     and then never published, so it is freed by the thread that built it
+	//     and counted as a migration by nobody -- that is `MIG_SUPERSEDED`,
+	//     which lives under a private `mod worker` and is not readable here.
+	//   * the last handle on a value some other path retired, e.g. one the
+	//     settle loop's own reads had lifted out.
+	//
+	// The direction that matters is the one that is closed: a leak can only
+	// make frees fall SHORT, and it does so proportionally to the load, so a
+	// single forgotten handle per migration is thousands of frees missing here
+	// long before it is a percent of `stats.allocated`.
+	let retired = seen.sets + seen.migrations;
+
+	assert!(
+		seen.frees >= retired,
+		"round {round}: {} values were freed but {retired} were retired ({} sets + {} \
+		 applied migrations) -- {} retirements never reached their allocator, so a handle \
+		 outlived the value it named",
+		seen.frees,
+		seen.sets,
+		seen.migrations,
+		retired - seen.frees,
 	);
 }
 
@@ -572,10 +744,6 @@ fn concurrent_readers_never_see_a_torn_value_and_nothing_leaks() {
 	let second = run_round(&cache, 2, read_pace, set_pace, false);
 	let allocated_after_second = second.allocated;
 
-	let deferred = crate::value::VALUE_FREES_DEFERRED.load(Ordering::Relaxed);
-	let ran = crate::value::VALUE_FREES_RUN.load(Ordering::Relaxed);
-	let outstanding = deferred - ran;
-
 	let first_delta = allocated_after_first as i64 - allocated_before as i64;
 	let second_delta = allocated_after_second as i64 - allocated_after_first as i64;
 	let budget = (allocated_after_first / 100) as i64;
@@ -588,26 +756,31 @@ fn concurrent_readers_never_see_a_torn_value_and_nothing_leaks() {
 		"STRESS one_time_delta={first_delta} leak_delta={second_delta} budget(1%)={budget}"
 	);
 	println!(
-		"STRESS deferred={deferred} ran={ran} outstanding={outstanding} \
-		 outstanding_bytes={}",
-		outstanding * VALUE_LEN as u64
+		"STRESS retired r1={} r2={} frees r1={} r2={}",
+		first.sets + first.migrations,
+		second.sets + second.migrations,
+		first.frees,
+		second.frees,
 	);
 
 	check_round(&first, 1, census_before);
 	check_round(&second, 2, census_before);
 
-	// Whatever is still outstanding is a bounded bag residue, not a leak.
-	assert!(
-		outstanding <= OUTSTANDING_BOUND,
-		"{outstanding} deferred frees are still outstanding, past the {OUTSTANDING_BOUND} \
-		 that a bounded per-thread bag residue can account for -- that is a leak"
-	);
-
-	// THE LEAK CRITERION. An identical second round adds essentially nothing:
-	// round 1's deferred garbage was reclaimed before round 2 ran, so the
-	// figure does not CLIMB. Retained garbage would put another round's worth
-	// on top -- round 2 alone retires over five gigabytes of values, so even a
-	// hundredth of a percent of retention is far past this budget.
+	// THE LEAK CRITERION, and the reason there are two rounds rather than one.
+	//
+	// Round 1 raises `stats.allocated` by roughly 5 MB whatever the run length
+	// -- the same figure at 5s, 10s and 20s, which is what `STRESS_SECS` is for
+	// -- because the first pass through this load faults in per-thread caches,
+	// shard tables and channel blocks that then stay. That is a one-time
+	// high-water mark and not a leak, so it is PRINTED (`one_time_delta`) and
+	// not asserted on; holding round 1 to 1% would be asserting that jemalloc's
+	// steady state is reached before it has been reached.
+	//
+	// An identical second round adds essentially nothing on top: round 1's
+	// garbage was reclaimed before round 2 ran, so the figure does not CLIMB.
+	// Retained garbage would put another round's worth on it -- round 2 alone
+	// retires over five gigabytes of values, so even a hundredth of a percent
+	// of retention is far past this budget.
 	//
 	// One-directional on purpose. A leak can only push the figure up; a round
 	// that comes to rest slightly BELOW the previous one has simply shed more
@@ -633,6 +806,24 @@ fn concurrent_readers_never_see_a_torn_value_and_nothing_leaks() {
 	assert_eq!(torn_hunt.wrong_len, 0, "round 3: a read returned a buffer of the wrong length");
 	assert!(torn_hunt.reads > 1_000_000, "round 3: only {} reads", torn_hunt.reads);
 	assert!(torn_hunt.sets > u64::from(KEYS), "round 3: the overwriter did not lap the key space");
+
+	// The ledger holds here too, and is worth asserting even though this round's
+	// bytes are not. It needs only that the load has stopped and its threads
+	// have been joined -- not that the cache has come to rest -- because a
+	// migration still sitting in the queue has not incremented a counter
+	// either, so an undrained backlog can only make `retired` smaller. This is
+	// the round with by far the most retirements, so it is the round where a
+	// forgotten handle shows up largest.
+	let retired = torn_hunt.sets + torn_hunt.migrations;
+
+	assert!(
+		torn_hunt.frees >= retired,
+		"round 3: {} values were freed but {retired} were retired ({} sets + {} applied \
+		 migrations)",
+		torn_hunt.frees,
+		torn_hunt.sets,
+		torn_hunt.migrations,
+	);
 }
 
 /// Polls `predicate` until it holds or the timeout expires. Bounded by
@@ -655,15 +846,14 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
 
 /// Runs the cache forward until it is QUIESCENT, or the budget expires.
 ///
-/// Quiescent means two separate things, and both are needed.
+/// Quiescent used to mean two separate things. The first of them is gone with
+/// the epoch pin: there is no `flush` to call and no per-thread bag of
+/// deferrals to push, because the last handle to drop frees on the spot. An
+/// idle worker sitting on un-run garbage was a real hazard of that design and
+/// is not a state this one has.
 ///
-/// First, every deferral has executed. [`crate::value::flush`] pushes THIS
-/// thread's bag and tries to advance the global epoch; the `get` pokes the
-/// policy worker into an event-loop pass, which is what makes the worker flush
-/// ITS bag. An idle worker never pins again on its own, so its garbage would
-/// otherwise sit there -- exactly the hazard `flush` exists for.
-///
-/// Second, `stats.allocated` has stopped moving. Eight readers spin far faster
+/// What is left is the second: `stats.allocated` has stopped moving. Eight
+/// readers spin far faster
 /// than the single policy worker consumes, so at the moment they stop there is
 /// a large backlog of `WorkerEvent`s sitting in an unbounded channel. That
 /// backlog is transient -- the worker drains it -- but it is hundreds of
@@ -681,31 +871,24 @@ fn settle(cache: &PaperCache<u32, TieredBuffer>, budget: Duration) -> (bool, u64
 
 	loop {
 		// A burst rather than a single get, so the worker gets a full pass in.
+		// It still pokes the worker into an event-loop pass -- which is what
+		// drains the migration queue -- even though there is no longer a bag of
+		// deferrals for that pass to flush.
 		for _ in 0..64 {
 			let _ = cache.get(&0u32);
 		}
 
-		crate::value::flush();
-
 		if Instant::now() >= next_sample {
 			let allocated = allocated_bytes();
-			let deferred = crate::value::VALUE_FREES_DEFERRED.load(Ordering::Relaxed);
-			let ran = crate::value::VALUE_FREES_RUN.load(Ordering::Relaxed);
+			let frees = crate::value::VALUE_FREES.load(Ordering::Relaxed);
 
 			println!(
-				"SETTLE t={:.0}s allocated={allocated} outstanding={}",
+				"SETTLE t={:.0}s allocated={allocated} frees={frees}",
 				started.elapsed().as_secs_f64(),
-				deferred - ran,
 			);
 
 			samples.push(allocated);
 			next_sample = Instant::now() + Duration::from_secs(1);
-
-			// Three consecutive one-second samples within 0.1% of one
-			// another. Deliberately NOT "and nothing outstanding": a small
-			// residue is expected and is measured separately below -- see
-			// `OUTSTANDING_BOUND`.
-			let _ = (deferred, ran);
 
 			// Five one-second samples, the last three of them within 0.1% of
 			// one another. The figure the caller gets is the MINIMUM of them,

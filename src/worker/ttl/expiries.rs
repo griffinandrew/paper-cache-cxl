@@ -5,10 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::{
-	time::Instant,
-	collections::BTreeSet,
-};
+use std::collections::BTreeSet;
 
 use crate::{
 	HashedKey,

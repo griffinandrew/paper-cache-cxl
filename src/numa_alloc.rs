@@ -426,10 +426,10 @@ unsafe extern "C" fn numa_extent_commit(
 
 unsafe extern "C" fn numa_extent_decommit(
 	_hooks: *mut ExtentHooks,
-	addr: *mut c_void,
+	_addr: *mut c_void,
 	_size: size_t,
-	offset: size_t,
-	length: size_t,
+	_offset: size_t,
+	_length: size_t,
 	_arena_ind: c_uint,
 ) -> bool {
 	// Refuse. Decommitting via munmap or PROT_NONE would drop the VMA and its

@@ -5,10 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::{
-	mem,
-	time::Instant,
-};
+use std::mem;
 
 use typesize::TypeSize;
 

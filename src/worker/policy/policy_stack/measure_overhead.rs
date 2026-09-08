@@ -34,7 +34,6 @@
 
 use crate::worker::policy::policy_stack::init_policy_stack;
 use crate::PaperPolicy;
-use core::str::FromStr;
 
 /// Bytes jemalloc has handed to the application, from `stats.allocated`.
 ///
@@ -236,6 +235,16 @@ fn measure_cache_point() {
 	// scale with n, and it is outside the merged store, whose own harness fits
 	// 125.30 B/object with a 1.7 MB intercept over the same range.
 	//
+	// Every figure in the four paragraphs above was taken against the PRE-ARC
+	// value representation -- a 24-byte `Object` inline in the map row, with
+	// the value reclaimed by epoch. The key, length and expiry have since
+	// moved into a separate refcounted header (`crate::value`), so both sides
+	// of that comparison moved: `charged` changed because
+	// `OBJECT_MAP_ENTRY_OVERHEAD` was fitted to the old row, and `allocated`
+	// changed because there is a second allocation per object again. The
+	// METHOD stands -- compare slopes, never a single point -- but re-run the
+	// fit before quoting 127.43 or 126.00 as this build's numbers.
+	//
 	// Both readings are printed, so the original line keeps its meaning.
 	let settled = {
 		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -358,10 +367,21 @@ fn measure_object_map_point() {
 /// Exact struct layout behind the measured object-map row.
 ///
 /// The measured 96 B/object for the DashMap row is an ALLOCATION figure; this
-/// prints the sizes it is built from, so the share that is the inline key and
-/// expiry -- both of which `base_size` ALREADY counts -- can be separated from
-/// the container overhead proper. Adding the whole 96 on top of `base_size`
-/// would double-charge whatever part of it `base_size` covers.
+/// prints the sizes it is built from, so the container overhead proper can be
+/// separated from what the row genuinely stores.
+///
+/// It used to exist to separate out the row's INLINE key and expiry -- both of
+/// which `base_size` already counts, so adding the whole 96 on top of
+/// `base_size` would have double-charged them. Neither is in the row any more:
+/// since `crate::value` the row holds one eight-byte `TieredValue` handle, and
+/// the key, the length and the expiry live in a `ValueHeader` that is its own
+/// allocation. So the double-charge question moved with them, and this prints
+/// the header's size too -- the row and the header are now two numbers, and
+/// the accounting has to name which one it is charging.
+///
+/// The header size printed here is the STRUCT, not the allocation: `triomphe
+/// ::Arc` puts an eight-byte strong count in front of it, and jemalloc then
+/// rounds. Take the allocation figure from `measure_value_class`.
 #[test]
 #[ignore]
 fn print_row_layout() {
@@ -370,9 +390,11 @@ fn print_row_layout() {
 	println!("LAYOUT HashedKey                {}", size_of::<crate::HashedKey>());
 	println!("LAYOUT key u64                  {}", size_of::<u64>());
 	println!("LAYOUT ExpireTime               {}", size_of::<crate::object::ExpireTime>());
-	println!("LAYOUT Arc<TieredBuffer> ptr    {}", size_of::<std::sync::Arc<crate::TieredBuffer>>());
-	println!("LAYOUT TieredBuffer             {}", size_of::<crate::TieredBuffer>());
+	println!("LAYOUT TieredValue<u64>         {}", size_of::<crate::TieredValue<u64>>());
+	println!("LAYOUT ValueHeader<u64>         {}", size_of::<crate::value::ValueHeader<u64>>());
+	println!("LAYOUT TieredBuffer (ZST shape) {}", size_of::<crate::TieredBuffer>());
 	println!("LAYOUT Object<u64,TieredBuffer> {}", size_of::<Obj>());
+	println!("LAYOUT Option<Object>           {}", size_of::<Option<Obj>>());
 	println!("LAYOUT (HashedKey, Object) pair {}", size_of::<(crate::HashedKey, Obj)>());
 }
 

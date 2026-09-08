@@ -35,9 +35,6 @@ use crate::{
 	worker::TieringWorker,
 };
 
-#[cfg(feature = "hybrid_cache_common")]
-use crate::worker::policy::Tier;
-
 /// Routes each `WorkerEvent` to the background workers that consume it.
 ///
 /// This used to be a background thread of its own: `PaperCache` pushed every
@@ -192,7 +189,7 @@ impl WorkerFanout {
 		overhead_manager: &OverheadManagerRef,
 	) -> Result<(Self, WorkerHandles), CacheError>
 	where
-		K: 'static + Eq + TypeSize + Send + Sync,
+		K: 'static + Eq + Clone + TypeSize + Send + Sync,
 		V: 'static + Send + Sync,
 	{
 		let (policy_worker, policy_listener) = unbounded();
@@ -227,8 +224,8 @@ impl WorkerFanout {
 	/// Creates a `WorkerFanout` whose policy worker physically migrates
 	/// object bytes between tiers whenever the active hybrid policy (any of
 	/// the `*CompactHybrid` `PaperPolicy` variants) reports a promotion or a
-	/// demotion. `migrate` reallocates a value into the target tier's
-	/// representation (e.g. `TieredBuffer::new_fast`/`new_slow`).
+	/// demotion. The copy itself is `TieredValue::migrated_to`, which a value
+	/// performs on itself -- this used to take a boxed per-shape closure.
 	/// Promotion/demotion/eviction counters and gauges are recorded directly
 	/// on the shared `status` (backing `PaperCache::hybrid_stats`), so no
 	/// separate stats parameter is needed here.
@@ -237,12 +234,9 @@ impl WorkerFanout {
 		objects: &ObjectMapRef<K, V>,
 		status: &StatusRef,
 		overhead_manager: &OverheadManagerRef,
-		migrate: Box<
-			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
-		>,
 	) -> Result<(Self, WorkerHandles), CacheError>
 	where
-		K: 'static + Eq + TypeSize + Send + Sync,
+		K: 'static + Eq + Clone + TypeSize + Send + Sync,
 		V: 'static + Send + Sync,
 	{
 		let (policy_worker, policy_listener) = unbounded();
@@ -255,7 +249,6 @@ impl WorkerFanout {
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
-			migrate,
 		)?));
 
 		handles.push(register_worker(TtlWorker::<K, V>::new(

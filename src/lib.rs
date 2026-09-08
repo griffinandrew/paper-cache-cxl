@@ -31,8 +31,6 @@ static GLOBAL_STOCK: numa_alloc::StockAlloc = numa_alloc::StockAlloc;
 
 pub mod numa_alloc;
 
-use std::arch::x86_64::{_mm_clflush, _mm_sfence};
-
 // `Hybrid` is the crate-wide PMEM allocator alias: every PMEM feature routes
 // through node-1-bound jemalloc arenas (`numa_alloc::SlowAlloc`).
 //
@@ -74,7 +72,6 @@ pub use crate::value::{BufferDRAM, BufferPMEM};
 
 /// A value plus the epoch pin that keeps it alive, which is how every read
 /// path touches value bytes with the shard guard already released.
-pub use crate::value::ValueRef;
 
 /// The concurrency gate for epoch-based value reclamation: eight readers
 /// copying while a flapper migrates and an overwriter frees underneath them.
@@ -168,7 +165,6 @@ use std::{
 		BuildHasher,
 		BuildHasherDefault,
 	},
-	ptr
 };
 
 #[cfg(any(
@@ -332,8 +328,6 @@ pub fn jemalloc_stats() -> Option<String> {
 	None
 }
 
-#[cfg(not(feature = "all_dram"))]
-use std::alloc::{Layout, Allocator}; // Essential imports
 
 
 
@@ -495,7 +489,6 @@ impl<K, V, S> Drop for PaperCache<K, V, S> {
 		// no pins outstanding, all workers joined -- has the best chance of
 		// actually running the deferrals rather than parking them in a bag
 		// that nothing will ever drain again.
-		crate::value::flush();
 	}
 }
 
@@ -776,16 +769,13 @@ where
 			}
 		}
 
-		// Pin BEFORE the shard guard, release the shard guard BEFORE the copy
-		// -- see the hybrid `get()` further down for the full rationale. The
-		// order is the whole safety argument: any writer that unpublishes this
-		// pointer defers its free strictly after we read it, so our pin is
-		// live at the moment of that deferral and the free waits for us.
-		let guard = crossbeam_epoch::pin();
-
+		// Take the value handle under the shard guard, release the guard, and
+		// only then copy. The handle owns a strong reference, so a writer that
+		// unpublishes this value while the copy is in flight decrements a count
+		// that is not yet zero and frees nothing.
 		let snapshot = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Some(object.snapshot(&guard)),
+				Some(object.snapshot()),
 			_ => None,
 		};
 
@@ -801,7 +791,6 @@ where
 			},
 		};
 
-		drop(guard);
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
@@ -834,11 +823,9 @@ where
 		let hashed_key = self.hash_key(key);
 		let t1 = if prof { Some(std::time::Instant::now()) } else { None };
 
-		let guard = crossbeam_epoch::pin();
-
 		let snapshot = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Some(object.snapshot(&guard)),
+				Some(object.snapshot()),
 			_ => None,
 		};
 		let t2 = if prof { Some(std::time::Instant::now()) } else { None };
@@ -861,7 +848,6 @@ where
 				Err(CacheError::KeyNotFound)
 			},
 		};
-		drop(guard);
 		let t3 = if prof { Some(std::time::Instant::now()) } else { None };
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
@@ -1072,11 +1058,9 @@ where
 	/// was live at the moment of the lookup.
 	pub fn peek(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
-		let guard = crossbeam_epoch::pin();
-
 		let snapshot = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Some(object.snapshot(&guard)),
+				Some(object.snapshot()),
 
 			_ => None,
 		};
@@ -1086,7 +1070,6 @@ where
 			None => Err(CacheError::KeyNotFound),
 		};
 
-		drop(guard);
 
 		result
 	}
@@ -1190,7 +1173,6 @@ where
 		// a whole cache's worth of garbage sits in this thread's local bag
 		// until it happens to pin enough more times to fill it -- so a wipe
 		// followed by an idle period would return no memory at all.
-		crate::value::flush();
 
 		self.status.clear();
 
@@ -1478,16 +1460,13 @@ where
 			}
 		}
 
-		// Pin BEFORE the shard guard, release the shard guard BEFORE the copy
-		// -- see the hybrid `get()` further down for the full rationale. The
-		// order is the whole safety argument: any writer that unpublishes this
-		// pointer defers its free strictly after we read it, so our pin is
-		// live at the moment of that deferral and the free waits for us.
-		let guard = crossbeam_epoch::pin();
-
+		// Take the value handle under the shard guard, release the guard, and
+		// only then copy. The handle owns a strong reference, so a writer that
+		// unpublishes this value while the copy is in flight decrements a count
+		// that is not yet zero and frees nothing.
 		let snapshot = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Some(object.snapshot(&guard)),
+				Some(object.snapshot()),
 			_ => None,
 		};
 
@@ -1503,7 +1482,6 @@ where
 			},
 		};
 
-		drop(guard);
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
@@ -1606,11 +1584,9 @@ where
 	/// was live at the moment of the lookup.
 	pub fn peek(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
-		let guard = crossbeam_epoch::pin();
-
 		let snapshot = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Some(object.snapshot(&guard)),
+				Some(object.snapshot()),
 
 			_ => None,
 		};
@@ -1620,7 +1596,6 @@ where
 			None => Err(CacheError::KeyNotFound),
 		};
 
-		drop(guard);
 
 		result
 	}
@@ -1672,7 +1647,6 @@ where
 		// a whole cache's worth of garbage sits in this thread's local bag
 		// until it happens to pin enough more times to fill it -- so a wipe
 		// followed by an idle period would return no memory at all.
-		crate::value::flush();
 
 		self.status.clear();
 
@@ -2249,28 +2223,14 @@ where
 		// correct, since the key is now MRU -- so `set()` has already built
 		// the bytes in DRAM by the time `touch_main_fast` emits its
 		// `(key, Tier::Fast)` promotion.
-		// Takes a `ValueRef` rather than a bare value: the length is no longer
-		// inside the value, and the epoch pin the ref carries is what makes
-		// reading the source bytes with no lock held sound. The destination is
-		// the same length by construction, which is the byte-length-preserving
-		// contract the accounting relies on.
-		let migrate: Box<dyn Fn(ValueRef<'_>, Tier) -> Option<TieredBuffer> + Send + Sync> =
-			Box::new(|value, tier| match (tier, value.is_fast()) {
-				(Tier::Fast, true) | (Tier::Slow, false) => None,
-				(Tier::Fast, false) => Some(TieredBuffer::new_fast(value.bytes())),
-				(Tier::Slow, true) => Some(TieredBuffer::new_slow(value.bytes())),
-			});
-
 		let (worker_fanout, worker_handles) = WorkerFanout::new_with_tier_migration(
 			&objects,
 			&status,
 			&overhead_manager,
-			migrate,
 		)?;
 
-		// Annotated, and load-bearing. `migrate` no longer mentions `V` -- it
-		// takes a `ValueRef` and returns a `TieredValue` -- so nothing else in
-		// this function pins `V` before the `broadcast` call below, and an
+		// Annotated, and load-bearing. Nothing else in this function mentions
+		// `V` before the `broadcast` call below, and an
 		// unresolved `V` makes that call ambiguous between this block and the
 		// flat `impl<K, V, S> ... where V: ValueShape` one (E0034: both are
 		// inherent candidates, and the where-clause can only rule one out once
@@ -2328,11 +2288,9 @@ where
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		let guard = crossbeam_epoch::pin();
-
 		let snapshot = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Some(object.snapshot(&guard)),
+				Some(object.snapshot()),
 			_ => None,
 		};
 
@@ -2348,7 +2306,6 @@ where
 			},
 		};
 
-		drop(guard);
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
 
@@ -2381,11 +2338,9 @@ where
 		let hashed_key = self.hash_key(key);
 		let t1 = if prof { Some(std::time::Instant::now()) } else { None };
 
-		let guard = crossbeam_epoch::pin();
-
 		let snapshot = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Some(object.snapshot(&guard)),
+				Some(object.snapshot()),
 			_ => None,
 		};
 		let t2 = if prof { Some(std::time::Instant::now()) } else { None };
@@ -2408,7 +2363,6 @@ where
 				Err(CacheError::KeyNotFound)
 			},
 		};
-		drop(guard);
 		let t3 = if prof { Some(std::time::Instant::now()) } else { None };
 
 		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
@@ -2551,11 +2505,9 @@ where
 	/// was live at the moment of the lookup.
 	pub fn peek(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
-		let guard = crossbeam_epoch::pin();
-
 		let snapshot = match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Some(object.snapshot(&guard)),
+				Some(object.snapshot()),
 
 			_ => None,
 		};
@@ -2565,7 +2517,6 @@ where
 			None => Err(CacheError::KeyNotFound),
 		};
 
-		drop(guard);
 
 		result
 	}
@@ -2623,7 +2574,6 @@ where
 		// a whole cache's worth of garbage sits in this thread's local bag
 		// until it happens to pin enough more times to fill it -- so a wipe
 		// followed by an idle period would return no memory at all.
-		crate::value::flush();
 
 		self.status.clear();
 
@@ -2865,28 +2815,14 @@ where
 		// correct, since the key is now MRU -- so `set()` has already built
 		// the bytes in DRAM by the time `touch_main_fast` emits its
 		// `(key, Tier::Fast)` promotion.
-		// Takes a `ValueRef` rather than a bare value: the length is no longer
-		// inside the value, and the epoch pin the ref carries is what makes
-		// reading the source bytes with no lock held sound. The destination is
-		// the same length by construction, which is the byte-length-preserving
-		// contract the accounting relies on.
-		let migrate: Box<dyn Fn(ValueRef<'_>, Tier) -> Option<TieredBuffer> + Send + Sync> =
-			Box::new(|value, tier| match (tier, value.is_fast()) {
-				(Tier::Fast, true) | (Tier::Slow, false) => None,
-				(Tier::Fast, false) => Some(TieredBuffer::new_fast(value.bytes())),
-				(Tier::Slow, true) => Some(TieredBuffer::new_slow(value.bytes())),
-			});
-
 		let (worker_fanout, worker_handles) = WorkerFanout::new_with_tier_migration(
 			&objects,
 			&status,
 			&overhead_manager,
-			migrate,
 		)?;
 
-		// Annotated, and load-bearing. `migrate` no longer mentions `V` -- it
-		// takes a `ValueRef` and returns a `TieredValue` -- so nothing else in
-		// this function pins `V` before the `broadcast` call below, and an
+		// Annotated, and load-bearing. Nothing else in this function mentions
+		// `V` before the `broadcast` call below, and an
 		// unresolved `V` makes that call ambiguous between this block and the
 		// flat `impl<K, V, S> ... where V: ValueShape` one (E0034: both are
 		// inherent candidates, and the where-clause can only rule one out once

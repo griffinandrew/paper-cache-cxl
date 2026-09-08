@@ -250,23 +250,35 @@ struct Slot<K, V> {
 	tier: Tier,
 }
 
-/// 24 object + 8 hashed + 4 prev + 4 next + 4 hash_next + 8 last_access +
-/// 1 tier = 53, padded to 56 by the object's 8-byte alignment.
+/// 8 object + 8 hashed + 4 prev + 4 next + 4 hash_next + 8 last_access +
+/// 1 tier = 37, padded to 40 by the object's 8-byte alignment.
 ///
-/// The `<= 56` bound is the claim being made against the split design; the
+/// It was 56, with a 24-byte `Object` holding the key, the value pointer, the
+/// length and the expiry inline. Those three moved into the refcounted value
+/// header, leaving the `Object` as one pointer -- see `crate::value`. `size`
+/// (u32) and `dram_resident` (u8) used to sit here too and are gone: both are
+/// derived from the object, which reaches the value's length already -- see
+/// `Slot::migrating`.
+///
+/// The `<= 40` bound is the claim being made against the split design; the
 /// EXACT assert is what catches a field silently landing in the padding and
-/// then, later, pushing the slot over. `size` (u32) and `dram_resident` (u8)
-/// used to sit here and are gone: both are now derived from the object, which
-/// holds the value's length already -- see `Slot::migrating`.
+/// then, later, pushing the slot over.
+///
+/// NOTE: `MERGED_STORE_STRUCTURE_OVERHEAD` (62) was measured against the
+/// 56-byte slot and is now WRONG -- it has to be re-measured with
+/// `merged_store::measure::measure_merged_store_point` before any figure that
+/// depends on it is quoted. The 16 bytes this slot lost do not simply come off
+/// it, because the value header they moved into is a new allocation with its
+/// own size class.
 const _: () = assert!(
-	core::mem::size_of::<Slot<u64, std::sync::Arc<[u8]>>>() <= 56,
-	"Slot grew past 56 bytes -- the whole point is that it is smaller than a \
+	core::mem::size_of::<Slot<u64, std::sync::Arc<[u8]>>>() <= 40,
+	"Slot grew past 40 bytes -- the whole point is that it is smaller than a \
 	 DashMap row plus an eviction-stack row",
 );
 
 const _: () = assert!(
-	core::mem::size_of::<Slot<u64, std::sync::Arc<[u8]>>>() == 56,
-	"Slot is no longer exactly 56 bytes -- re-measure \
+	core::mem::size_of::<Slot<u64, std::sync::Arc<[u8]>>>() == 40,
+	"Slot is no longer exactly 40 bytes -- re-measure \
 	 MERGED_STORE_STRUCTURE_OVERHEAD before changing this number",
 );
 
@@ -1395,7 +1407,6 @@ impl<K, V> MergedStore<K, V> {
 		// the whole cache's worth of garbage appears at once, and leaving it in
 		// a local bag would keep it resident until this thread happened to pin
 		// enough more times to fill it.
-		crate::value::flush();
 
 		self.tracked.store(0, Ordering::Relaxed);
 		self.pending_migrations.store(0, Ordering::Relaxed);

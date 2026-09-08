@@ -213,54 +213,60 @@ pub mod migration_queue {
 	/// Shared by the consumer threads and by `apply_tier_migrations`'
 	/// synchronous path (`MIGRATION_QUEUE_THREADS=0`) so the two cannot drift
 	/// apart on either the swap or what counts as a completion.
-	pub(crate) fn apply_migration<K, V>(
+	pub(crate) fn apply_migration<K: Clone, V>(
 		objects: &ObjectMapRef<K, V>,
-		migrate: &(dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue>
-			+ Send
-			+ Sync),
 		key: HashedKey,
 		tier: Tier,
 	) -> bool {
-		// ONE pin, spanning the whole snapshot-copy-swap. It is what makes
-		// every step below sound, and it replaces the strong reference the old
-		// `Shared` handle contributed:
+		// The snapshot is a STRONG REFERENCE, and it is what makes every step
+		// below sound. It replaces the epoch pin this function used to take,
+		// and it is strictly simpler because the proof is the handle itself
+		// rather than a discipline the caller has to maintain:
 		//
 		//   * the source bytes stay readable with NO shard guard held, which
-		//     is what stops a multi-KB (possibly PMEM) copy from serialising
-		//     against readers;
-		//   * the identity check stays immune to ABA. The old allocation
-		//     cannot be freed while this pin is live -- every free is deferred
-		//     behind a pin taken no later -- so its address cannot be recycled
-		//     into a different value, and raw-pointer equality is therefore
-		//     EXACT rather than merely probable. Comparing bytes would not be:
-		//     a `set` that wrote identical content is a different value and
-		//     must be rejected.
-		let guard = crossbeam_epoch::pin();
-
-		let Some(old_value) = objects.get_ref(&key).map(|object| object.snapshot(&guard)) else {
+		//     is what stops a multi-KB (possibly CXL) copy from serialising
+		//     against readers. Whoever replaces this object meanwhile
+		//     decrements a count that is not yet zero, and frees nothing.
+		//   * the identity check is immune to ABA for the same reason. The old
+		//     header cannot be freed while this handle is live, so its address
+		//     cannot be recycled into a different value, and `ptr_eq` is
+		//     therefore EXACT rather than merely probable. Comparing bytes
+		//     would not be: a `set` that wrote identical content is a
+		//     different value and must be rejected.
+		let Some(old_value) = objects.get_ref(&key).map(|object| object.snapshot()) else {
 			MIG_GONE.fetch_add(1, Ordering::Relaxed);
 			return false;
 		};
 
 		// Declined: already in the requested tier, nothing to move.
-		let Some(new_value) = migrate(old_value, tier) else {
+		//
+		// This used to be a caller-supplied `migrate` closure, boxed into the
+		// worker and cloned into the migration queue, because building the
+		// replacement needed the shape-specific `TieredBuffer::new_fast` /
+		// `new_slow`. It does not any more: a value knows its own tier and can
+		// copy itself into another one, carrying its key and its current
+		// expiry, so the whole plumbing collapses to these four lines.
+		if old_value.tier() == tier {
 			MIG_DECLINED.fetch_add(1, Ordering::Relaxed);
 			return false;
-		};
+		}
 
-		let len = old_value.len();
+		let new_value = old_value.migrated_to(tier);
 
 		// Check-and-act under one shard write lock: any writer must take the
 		// same lock, so nothing can replace the value between the comparison
 		// and the swap.
 		if let Some(mut object) = objects.get_mut_ref(&key) {
-			if object.value().raw() == old_value.raw() {
-				let (superseded, superseded_len) = object.set_data(new_value, len);
+			if crate::TieredValue::ptr_eq(object.value(), &old_value) {
+				let superseded = object.set_data(new_value);
 
-				// Unpublished under the write guard, retired immediately
-				// after: a reader that lifted this pointer out a moment ago is
-				// still pinned, so the free waits for it.
-				crate::value::defer_free(superseded, superseded_len);
+				// Unpublished under the write guard. Dropping the handle is
+				// the whole retirement: if a reader lifted this value out a
+				// moment ago it still holds a reference and the free waits for
+				// it, and if not the count reaches zero here and the header and
+				// its bytes go back to their allocators immediately. No
+				// deferral, and nothing for a later epoch advance to run.
+				drop(superseded);
 
 				MIG_APPLIED.fetch_add(1, Ordering::Relaxed);
 				return true;
@@ -268,14 +274,9 @@ pub mod migration_queue {
 		}
 
 		// Superseded, or the object vanished between the two lookups. The copy
-		// was NEVER PUBLISHED -- no other thread has ever seen this pointer --
-		// so it is freed outright rather than deferred. Deferring it would
-		// also be correct but would hold a whole copy of the value until the
-		// next epoch advance, for no reader that can exist.
-		//
-		// SAFETY: `new_value` was created by `migrate` from `len` bytes and
-		// was never stored anywhere, so this is its only handle.
-		unsafe { new_value.free(len) };
+		// was NEVER PUBLISHED -- no other thread has ever seen it -- so
+		// dropping it here is its only decrement and frees it outright.
+		drop(new_value);
 
 		MIG_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
 		false
@@ -336,16 +337,11 @@ pub mod migration_queue {
 		/// Returns `None` when `threads == 0`, i.e. the queue is disabled.
 		pub fn spawn<K, V>(
 			objects: ObjectMapRef<K, V>,
-			migrate: Arc<
-				dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue>
-					+ Send
-					+ Sync,
-			>,
 			threads: usize,
 			status: StatusRef,
 		) -> Option<Self>
 		where
-			K: 'static + Eq + Send + Sync,
+			K: 'static + Eq + Clone + Send + Sync,
 			V: 'static + Send + Sync,
 		{
 			if threads == 0 {
@@ -368,7 +364,6 @@ pub mod migration_queue {
 				let (sender, receiver) = unbounded::<(HashedKey, Tier)>();
 
 				let objects = objects.clone();
-				let migrate = migrate.clone();
 				let processed = processed.clone();
 				let status = status.clone();
 				let demotion_accounting = demotion_accounting.clone();
@@ -401,7 +396,7 @@ pub mod migration_queue {
 							let _done = CountOnDrop(&processed);
 							let _pending = PendingOnDrop(tier);
 
-							if apply_migration(&objects, migrate.as_ref(), key, tier) {
+							if apply_migration(&objects, key, tier) {
 								match tier {
 									Tier::Fast => completed_promotions += 1,
 
@@ -445,7 +440,6 @@ pub mod migration_queue {
 								// The condition is already exactly right: nothing
 								// completed means nothing was retired, and a declined
 								// migration frees its copy outright rather than deferring.
-								crate::value::flush();
 							}
 						}
 
@@ -1049,10 +1043,17 @@ pub struct PolicyWorker<K, V> {
 	/// migration; `None` for every other policy/value type. Promotion,
 	/// demotion and eviction counters and gauges are recorded directly on the
 	/// shared `status` (see `apply_tier_migrations`), not a separate field.
+
+	/// Whether this worker physically migrates object bytes between tiers.
+	///
+	/// Was `tier_migration_fn: Option<Arc<dyn Fn(..) -> Option<TieredValue>>>` --
+	/// a boxed per-shape constructor for the destination buffer, cloned into
+	/// the migration queue so both paths built values the same way. A value can
+	/// now copy itself into another tier (`TieredValue::migrated_to`), so all
+	/// that survives of it is the question it also answered: is this a hybrid
+	/// build, or a policy with no tiers to move anything between?
 	#[cfg(feature = "hybrid_cache_common")]
-	tier_migration_fn: Option<
-		Arc<dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync>,
-	>,
+	tier_migration: bool,
 
 	/// Standing pool draining physical tier copies off the worker thread.
 	/// `None` unless `MIGRATION_QUEUE_THREADS` is non-zero -- see
@@ -1064,7 +1065,7 @@ pub struct PolicyWorker<K, V> {
 impl<K, V> Worker for PolicyWorker<K, V>
 where
 	Self: 'static + Send,
-	K: Eq + TypeSize + Send + Sync,
+	K: Eq + Clone + TypeSize + Send + Sync,
 	V: Send + Sync,
 {
 	fn run(&mut self) -> Result<(), CacheError> {
@@ -1238,7 +1239,6 @@ where
 			// this the cache's real footprint would stay a whole burst above
 			// what it reports, for as long as the lull lasts. Cheap when there
 			// is nothing to flush.
-			crate::value::flush();
 
 			let now = Instant::now();
 
@@ -1257,8 +1257,10 @@ where
 	// `Send + Sync` are required by `parallel_migration::apply_batch`, which
 	// fans a large migration batch out across a pool; they hold already for
 	// every real instantiation, since the worker owns the object map on its
-	// own thread.
-	K: 'static + Eq + TypeSize + Send + Sync,
+	// own thread. `Clone` is required because a tier migration now rebuilds the
+	// value header around the key it copies from the old one -- see
+	// `TieredValue::migrated_to`.
+	K: 'static + Eq + Clone + TypeSize + Send + Sync,
 	V: 'static + Send + Sync,
 {
 	pub fn new(
@@ -1324,7 +1326,8 @@ where
 			promotion_tx,
 
 			#[cfg(feature = "hybrid_cache_common")]
-			tier_migration_fn: None,
+			#[cfg(feature = "hybrid_cache_common")]
+			tier_migration: false,
 
 			#[cfg(feature = "hybrid_cache_common")]
 			migration_queue: None,
@@ -1352,16 +1355,7 @@ where
 		objects: ObjectMapRef<K, V>,
 		status: StatusRef,
 		overhead_manager: OverheadManagerRef,
-		migrate: Box<
-			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
-		>,
 	) -> Result<Self, CacheError> {
-		// Shared rather than owned so the standing migration pool (if it is
-		// enabled) can run the same closure on its own threads.
-		let migrate: Arc<
-			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
-		> = Arc::from(migrate);
-
 		let max_cache_size = status.max_size();
 
 		// Hybrid caches (the only callers of this constructor) are always
@@ -1417,7 +1411,6 @@ where
 		#[cfg(feature = "hybrid_cache_common")]
 		let migration_queue = migration_queue::MigrationQueue::spawn(
 			objects.clone(),
-			migrate.clone(),
 			migration_queue::threads(),
 			status.clone(),
 		);
@@ -1450,7 +1443,7 @@ where
 			// channel is needed for any of them.
 			promotion_tx: None,
 
-			tier_migration_fn: Some(migrate),
+			tier_migration: true,
 
 			#[cfg(feature = "hybrid_cache_common")]
 			migration_queue,
@@ -1725,7 +1718,9 @@ where
 		promotions: Vec<(HashedKey, Tier)>,
 		inline_demotion_accounting: bool,
 	) {
-		let Some(migrate) = &self.tier_migration_fn else { return };
+		if !self.tier_migration {
+			return;
+		}
 
 		migration_queue::BURST_MAX.fetch_max(
 			(demotions.len() + promotions.len()) as u64,
@@ -1759,7 +1754,7 @@ where
 				return false;
 			}
 
-			migration_queue::apply_migration(objects, migrate.as_ref(), key, tier)
+			migration_queue::apply_migration(objects, key, tier)
 		};
 
 		let completed_demotions = parallel_migration::apply_batch(
@@ -2192,11 +2187,78 @@ where
 	K: TypeSize,
 {}
 
+/// Serialises every test in this file that performs a tier migration.
+///
+/// The `MIG_*` dispositions in [`migration_queue`] are process-global
+/// `AtomicU64`s and the test runner is parallel by default, so a sibling test
+/// applying one migration between a snapshot and its successor moves the
+/// count under the reader and an exact-delta assertion fails by one. Both
+/// migration modules below hold this, not just the ones that read the
+/// counters -- a module that only *perturbs* them is exactly as damaging as
+/// one that reads them.
+///
+/// Nothing else in the crate's unit tests drives a migration: `apply_migration`
+/// is reached only from a `MigrationQueue` consumer or from
+/// `apply_migration_batches`, and the hybrid caches `lib.rs` builds in its own
+/// tests are all configured with a fast tier as large as the whole cache, so
+/// they never demote. When something does, it will need its own answer.
+///
+/// Poisoning is stepped over on purpose: a panicking test is already a
+/// failure, and letting it cascade into every other test's error message only
+/// hides which one broke.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod migration_test_lock {
+	use std::sync::{Mutex, MutexGuard};
+
+	pub(super) fn lock() -> MutexGuard<'static, ()> {
+		static LOCK: Mutex<()> = Mutex::new(());
+
+		LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+	}
+}
+
+/// What a migration is now observable BY.
+///
+/// These tests used to hand the queue a `marker_migrate` closure that stamped
+/// the destination buffer's last byte, so "which copy won" could be read back
+/// out of the bytes, and a `DECLINE_SENTINEL` first byte to make that closure
+/// return `None`. There is no such hook any more: the copy is
+/// [`crate::TieredValue::migrated_to`], which a value performs on itself, and
+/// it is a faithful copy with nowhere to stamp a marker.
+///
+/// Nothing is lost, and two things are gained:
+///
+///   * the destination TIER (`value.tier()`) is a migration's entire
+///     observable effect, and it is the property the marker byte was standing
+///     in for in the first place;
+///   * HEADER IDENTITY ([`crate::TieredValue::ptr_eq`]) is strictly sharper
+///     than the marker was. A marker could only say "some copy tagged for this
+///     tier is here"; `ptr_eq` says exactly *which allocation* is installed, so
+///     "an applied migration installs a new header" and "a declined one leaves
+///     the original in place" become assertions rather than inferences. It is
+///     exact rather than merely likely, too: a test holding a handle to the
+///     header it snapshotted keeps that allocation alive, so its address cannot
+///     be recycled underneath the comparison.
+///   * the declined path needs no sentinel at all -- asking for the tier a
+///     value is already in is precisely what production declines.
+///
+/// The value bytes are still asserted on every path, because a migration that
+/// moved the tier but corrupted the payload would otherwise pass.
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod migration_queue_tests {
 	use super::*;
 
-	use super::migration_queue::MigrationQueue;
+	use std::sync::atomic::Ordering;
+
+	use super::migration_queue::{
+		MIG_APPLIED,
+		MIG_DECLINED,
+		MIG_GONE,
+		MIG_SUPERSEDED,
+		MigrationQueue,
+	};
+	use super::migration_test_lock;
+	use crate::TieredValue;
 	use crate::object::Object;
 	use crate::object_store::ObjectStore;
 	use crate::status::AtomicStatus;
@@ -2206,41 +2268,38 @@ mod migration_queue_tests {
 	/// rather than the value type -- every value is a `TieredValue`.
 	type TestBuffer = crate::TieredBuffer;
 
-	/// Byte stamped into the buffer's last position by `marker_migrate`, so a
-	/// buffer's physical tier is readable back out of its bytes.
-	const FAST_MARKER: u8 = 0xFA;
-	const SLOW_MARKER: u8 = 0x50;
-
-	/// A buffer whose *first* byte is this sentinel is declined by
-	/// `marker_migrate` (it returns `None`), mimicking the production
-	/// closure's already-in-tier case.
-	const DECLINE_SENTINEL: u8 = 0xDE;
-
 	const BUFFER_LEN: usize = 8;
 
-	// Same idiom as the hybrid_tests harnesses' migrate closure: tag the last
-	// byte per tier without changing the buffer's length, so Fast-vs-Slow
-	// outcomes are distinguishable in the bytes themselves.
-	fn marker_migrate() -> Arc<
-			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
-		> {
-		Arc::new(|value: crate::value::ValueRef<'_>, tier: Tier| {
-			if value.bytes().first() == Some(&DECLINE_SENTINEL) {
-				return None;
-			}
+	/// The four ways `apply_migration` can finish, read together so a test can
+	/// assert the whole disposition of a batch rather than one arm of it.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	struct Dispositions {
+		applied: u64,
+		gone: u64,
+		declined: u64,
+		superseded: u64,
+	}
 
-			let marker: u8 = match tier {
-				Tier::Fast => FAST_MARKER,
-				Tier::Slow => SLOW_MARKER,
-			};
+	fn dispositions() -> Dispositions {
+		Dispositions {
+			applied: MIG_APPLIED.load(Ordering::Relaxed),
+			gone: MIG_GONE.load(Ordering::Relaxed),
+			declined: MIG_DECLINED.load(Ordering::Relaxed),
+			superseded: MIG_SUPERSEDED.load(Ordering::Relaxed),
+		}
+	}
 
-			let mut v = value.bytes().to_vec();
-			if let Some(last) = v.last_mut() {
-				*last = marker;
-			}
+	/// The dispositions recorded since `before`. Exact, because every test
+	/// that touches these counters holds `migration_test_lock`.
+	fn since(before: Dispositions) -> Dispositions {
+		let now = dispositions();
 
-			Some(crate::TieredValue::new_in(&v, tier))
-		})
+		Dispositions {
+			applied: now.applied - before.applied,
+			gone: now.gone - before.gone,
+			declined: now.declined - before.declined,
+			superseded: now.superseded - before.superseded,
+		}
 	}
 
 	fn make_status() -> crate::StatusRef {
@@ -2258,55 +2317,133 @@ mod migration_queue_tests {
 		crate::new_hybrid_object_map()
 	}
 
-	fn insert(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey, fill: u8) {
-		let object = Object::new(key as u32, &vec![fill; BUFFER_LEN], None);
+	/// Admits `key` into `tier` with every byte set to `fill`.
+	///
+	/// The fill is per-key in the multi-key cases, so a migration that copied
+	/// the wrong object's bytes into the right object's slot is caught rather
+	/// than passing as "the tier is correct".
+	fn insert(
+		objects: &ObjectMapRef<u32, TestBuffer>,
+		key: HashedKey,
+		tier: Tier,
+		fill: u8,
+	) {
+		let object = Object::new_in(key as u32, &vec![fill; BUFFER_LEN], tier, None);
 		objects.insert(key, object);
 	}
 
-	fn last_byte(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) -> u8 {
-		*objects.get_ref(&key).unwrap().bytes().last().unwrap()
+	fn tier_of(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) -> Tier {
+		objects.get_ref(&key).unwrap().value().tier()
 	}
 
+	fn bytes_of(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) -> Vec<u8> {
+		objects.get_ref(&key).unwrap().bytes().to_vec()
+	}
+
+	/// A handle onto whatever header is installed for `key` right now.
+	///
+	/// Owning it is the point: it keeps that allocation alive, so a later
+	/// `ptr_eq` against it cannot be fooled by a recycled address.
+	fn header_of(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) -> TieredValue<u32> {
+		objects.get_ref(&key).unwrap().snapshot()
+	}
+
+	/// Per-key ordering, which is the entire reason the queue shards by key
+	/// rather than sharing one channel across its consumers.
+	///
+	/// Both halves are sharp because the second entry of each pair only has an
+	/// effect in one of the two possible orders: a demote-then-promote pair
+	/// applied backwards leaves the value Slow (the promote is declined
+	/// against a still-Fast value, then the demote moves it), and a
+	/// promote-then-demote pair applied backwards leaves it Fast. So the final
+	/// tier alone distinguishes the orders, and the disposition counts say
+	/// which entry did the work.
 	#[test]
 	fn per_key_demote_then_promote_applies_in_order() {
+		let _serialised = migration_test_lock::lock();
+
 		let objects = make_objects();
 		let key: HashedKey = 1;
-		insert(&objects, key, 0);
+		insert(&objects, key, Tier::Fast, 0xA1);
+
+		let admitted = header_of(&objects, key);
 
 		// Two consumers, so the per-key channel sharding is actually in play
 		// (a single consumer preserves global order trivially).
-		let queue = MigrationQueue::spawn(objects.clone(), marker_migrate(), 2, make_status()).unwrap();
+		let queue = MigrationQueue::spawn(objects.clone(), 2, make_status()).unwrap();
 
-		// Demote then promote: the promote is the newer decision, so the
-		// buffer must physically end Fast. Both land in the same shard's
-		// FIFO channel, which is exactly the ordering the sharding exists
-		// to guarantee.
+		// Demote then promote: the promote is the newer decision, so the value
+		// must physically end Fast. Both land in the same shard's FIFO
+		// channel, which is exactly the ordering the sharding exists to
+		// guarantee.
+		let before = dispositions();
+
 		queue.push((key, Tier::Slow));
 		queue.push((key, Tier::Fast));
 		queue.flush();
-		assert_eq!(last_byte(&objects, key), FAST_MARKER);
 
-		// Mirror: promote then demote must end Slow.
+		assert_eq!(tier_of(&objects, key), Tier::Fast);
+		assert_eq!(
+			since(before),
+			Dispositions { applied: 2, gone: 0, declined: 0, superseded: 0 },
+			"both entries moved the value; neither was declined, which is what \
+			 the reverse order would have produced",
+		);
+
+		// Two real copies happened, so neither header can be the admitted one.
+		let after_promote = header_of(&objects, key);
+		assert!(
+			!TieredValue::ptr_eq(&after_promote, &admitted),
+			"an applied migration installs a NEW header -- it does not edit the \
+			 one that was there",
+		);
+
+		// A migration is a faithful copy: the tier moved, the payload did not.
+		assert_eq!(bytes_of(&objects, key), vec![0xA1; BUFFER_LEN]);
+
+		// Mirror: promote then demote must end Slow, and this time the first
+		// entry is the declined one.
+		let before = dispositions();
+
 		queue.push((key, Tier::Fast));
 		queue.push((key, Tier::Slow));
 		queue.flush();
-		assert_eq!(last_byte(&objects, key), SLOW_MARKER);
+
+		assert_eq!(tier_of(&objects, key), Tier::Slow);
+		assert_eq!(
+			since(before),
+			Dispositions { applied: 1, gone: 0, declined: 1, superseded: 0 },
+			"the promote is a no-op against an already-Fast value and the demote \
+			 does the work; the reverse order would have applied both",
+		);
+		assert_eq!(bytes_of(&objects, key), vec![0xA1; BUFFER_LEN]);
 	}
 
+	/// `flush` counts *dispositions*, not successful swaps. All three ways a
+	/// migration can finish without moving a byte must still be counted, or
+	/// `flush` would never return.
+	///
+	/// The declined case is where the identity check earns its keep: a
+	/// declined entry must leave the ORIGINAL header in place, not an
+	/// identical-looking copy of it.
 	#[test]
 	fn flush_returns_only_after_every_disposition() {
+		let _serialised = migration_test_lock::lock();
+
 		let objects = make_objects();
 
-		insert(&objects, 1, 0);
-		insert(&objects, 2, DECLINE_SENTINEL); // marker_migrate declines this one
+		insert(&objects, 1, Tier::Fast, 0x11);
+		insert(&objects, 2, Tier::Fast, 0x22);
 		// Key 3 is deliberately never inserted.
 
-		let queue =
-			Arc::new(MigrationQueue::spawn(objects.clone(), marker_migrate(), 2, make_status()).unwrap());
+		let untouched = header_of(&objects, 2);
+		let before = dispositions();
+
+		let queue = Arc::new(MigrationQueue::spawn(objects.clone(), 2, make_status()).unwrap());
 
 		queue.push((1, Tier::Slow)); // applied
 		queue.push((3, Tier::Fast)); // object absent from the map: skipped, still counted
-		queue.push((2, Tier::Fast)); // declined by the closure: still counted
+		queue.push((2, Tier::Fast)); // already Fast: declined, still counted
 
 		// Run `flush` on its own thread so a completion count missed on the
 		// skipped or declined path shows up as a clean assertion failure
@@ -2330,93 +2467,231 @@ mod migration_queue_tests {
 		);
 		flusher.join().unwrap();
 
-		// The applied migration landed...
-		assert_eq!(last_byte(&objects, 1), SLOW_MARKER);
+		assert_eq!(
+			since(before),
+			Dispositions { applied: 1, gone: 1, declined: 1, superseded: 0 },
+			"one of each: the migration that moved a value, the one whose object \
+			 had gone, and the one already in the tier it was asked for",
+		);
 
-		// ...and the declined object's bytes are untouched.
-		let data = objects.get_ref(&2).unwrap().bytes().to_vec();
-		assert_eq!(data.as_slice(), &[DECLINE_SENTINEL; BUFFER_LEN][..]);
+		// The applied migration landed, payload intact...
+		assert_eq!(tier_of(&objects, 1), Tier::Slow);
+		assert_eq!(bytes_of(&objects, 1), vec![0x11; BUFFER_LEN]);
+
+		// ...and the declined object was not merely left with equal bytes, it
+		// was left with the SAME header. A decline that had gone on to build a
+		// copy and swap it in would be invisible to a bytes comparison and is
+		// caught here.
+		assert!(
+			TieredValue::ptr_eq(&header_of(&objects, 2), &untouched),
+			"a declined migration must not install anything",
+		);
+		assert_eq!(tier_of(&objects, 2), Tier::Fast);
+		assert_eq!(bytes_of(&objects, 2), vec![0x22; BUFFER_LEN]);
 	}
 
-	#[test]
-	fn a_stale_migration_is_dropped_by_the_identity_guard() {
-		let objects = make_objects();
-		let key: HashedKey = 1;
-		insert(&objects, key, 0);
+	/// A key whose `Clone` parks the thread cloning it -- see
+	/// [`a_superseded_migration_is_dropped_by_the_identity_guard`].
+	struct ParkingKey(u32);
 
-		// A migrate closure that parks the consumer between its data
-		// snapshot and its compare-and-swap: the consumer takes the `Arc`
-		// snapshot *before* calling `migrate`, so once `entered` fires the
-		// snapshot is guaranteed taken, and the closure then blocks until
-		// `release`. The consumer holds no map guard while parked here.
-		let (entered_tx, entered_rx) = unbounded::<()>();
-		let (release_tx, release_rx) = unbounded::<()>();
+	/// Identity is the id alone; the parking is a side channel, not part of
+	/// what makes two keys equal.
+	impl PartialEq for ParkingKey {
+		fn eq(&self, other: &Self) -> bool {
+			self.0 == other.0
+		}
+	}
 
-		let migrate: Arc<
-			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
-		> =
-			Arc::new(move |value: crate::value::ValueRef<'_>, _tier: Tier| {
-				entered_tx.send(()).unwrap();
-				release_rx.recv().unwrap();
+	impl Eq for ParkingKey {}
 
-				let mut v = value.bytes().to_vec();
-				if let Some(last) = v.last_mut() {
-					*last = FAST_MARKER;
-				}
+	impl Clone for ParkingKey {
+		fn clone(&self) -> Self {
+			park::arrive();
+			ParkingKey(self.0)
+		}
+	}
 
-				Some(crate::TieredValue::new_fast(&v))
-			});
+	/// A one-shot rendezvous the next `ParkingKey::clone` walks into.
+	mod park {
+		use std::sync::Mutex;
 
-		let queue = MigrationQueue::spawn(objects.clone(), migrate, 1, make_status()).unwrap();
+		use crossbeam_channel::{Receiver, Sender, unbounded};
 
-		queue.push((key, Tier::Fast));
+		static PARK: Mutex<Option<(Sender<()>, Receiver<()>)>> = Mutex::new(None);
 
-		// The consumer has snapshotted the old data and is parked inside the
-		// closure; replacing the object's data here is exactly the
-		// interleaving of a concurrent `set()` racing an in-flight copy.
-		entered_rx.recv().unwrap();
-		{
-			let replacement = crate::TieredValue::new_fast(&[0x99u8; BUFFER_LEN]);
-			let (old, old_len) = objects
-				.get_mut_ref(&key)
-				.unwrap()
-				.set_data(replacement, BUFFER_LEN as u32);
+		/// Arms the next clone to park. Returns the "it arrived" receiver and
+		/// the "carry on" sender.
+		pub(super) fn arm() -> (Receiver<()>, Sender<()>) {
+			let (entered_tx, entered_rx) = unbounded();
+			let (release_tx, release_rx) = unbounded();
 
-			// Exactly what `set()` does with the value it displaces: RETIRE it
-			// rather than free it, because the parked consumer is still holding
-			// a snapshot of this very pointer. Freeing here would recycle the
-			// address and make the identity check below meaningless.
-			crate::value::defer_free(old, old_len);
+			*PARK.lock().unwrap() = Some((entered_tx, release_rx));
+
+			(entered_rx, release_tx)
 		}
 
-		release_tx.send(()).unwrap();
-		queue.flush();
+		/// Parks if armed, disarming as it goes so only the FIRST clone stops.
+		/// The lock is held only long enough to take the rendezvous out, never
+		/// across the wait.
+		pub(super) fn arrive() {
+			let armed = PARK.lock().unwrap().take();
 
-		// The migration's output was computed from a superseded snapshot, so
-		// the raw-pointer identity check must discard it: the replacement
-		// survives, not the Fast-stamped copy.
-		let data = objects.get_ref(&key).unwrap().bytes().to_vec();
-		assert_eq!(data.as_slice(), &[0x99u8; BUFFER_LEN][..]);
+			if let Some((entered, release)) = armed {
+				let _ = entered.send(());
+				let _ = release.recv();
+			}
+		}
 	}
 
+	/// A migration computed from a value that was replaced mid-copy must be
+	/// discarded -- the concurrent `set` wins, not the older copy.
+	///
+	/// This is the most valuable case in this module, so it is worth being
+	/// precise about what changed underneath it and what did not.
+	///
+	/// The SHAPE is unchanged: park a consumer between its snapshot and its
+	/// swap, replace the value from the test thread while it is parked, then
+	/// let it finish and check which value survived.
+	///
+	/// The MECHANISM had to change, because the parking used to hang off the
+	/// `migrate` closure the queue was handed, and there is no such closure any
+	/// more. It now hangs off `K::clone`: [`crate::TieredValue::migrated_to`]
+	/// rebuilds the header around a clone of the key, and it does so after the
+	/// snapshot and before the swap, which is exactly the window. If that ever
+	/// stops being true the rendezvous below times out with a message saying
+	/// so, rather than hanging.
+	///
+	/// The GUARANTEE is stronger than it was. The snapshot is now a strong
+	/// reference rather than an epoch pin, so the header the consumer
+	/// snapshotted cannot be freed while it is parked and its address cannot be
+	/// recycled into a different value -- `ptr_eq` is therefore exact rather
+	/// than merely improbable to fool. The old test had to be careful to
+	/// `defer_free` the displaced value for precisely that reason; here
+	/// dropping the displaced handle is the whole retirement, and it frees
+	/// nothing while the parked consumer still holds a reference.
+	#[test]
+	fn a_superseded_migration_is_dropped_by_the_identity_guard() {
+		let _serialised = migration_test_lock::lock();
+
+		const KEY: HashedKey = 1;
+		const ID: u32 = 1;
+
+		let objects: ObjectMapRef<ParkingKey, TestBuffer> = crate::new_hybrid_object_map();
+
+		objects.insert(
+			KEY,
+			Object::new_in(ParkingKey(ID), &[0x11u8; BUFFER_LEN], Tier::Fast, None),
+		);
+
+		let snapshotted = objects.get_ref(&KEY).unwrap().snapshot();
+		let before = dispositions();
+
+		let (entered, release) = park::arm();
+
+		// One consumer, so exactly one thread can be parked and the entry
+		// cannot be picked up by a second.
+		let queue = MigrationQueue::spawn(objects.clone(), 1, make_status()).unwrap();
+
+		queue.push((KEY, Tier::Slow));
+
+		entered.recv_timeout(Duration::from_secs(10)).expect(
+			"the migration never reached the parked key clone: if \
+			 TieredValue::migrated_to no longer clones the key between the \
+			 snapshot and the swap, this test needs a new parking point -- the \
+			 window it is testing still exists either way",
+		);
+
+		// The consumer holds its snapshot and is building the copy, with no
+		// map guard held. Replacing the value here is exactly the interleaving
+		// of a concurrent `set()` racing an in-flight migration.
+		let replacement = TieredValue::new_fast(ParkingKey(ID), &[0x99u8; BUFFER_LEN], None);
+		let installed = replacement.clone();
+
+		{
+			let displaced = objects.get_mut_ref(&KEY).unwrap().set_data(replacement);
+
+			// Exactly what `set()` does with the value it displaces. Dropping
+			// the handle is the complete retirement now -- the parked consumer
+			// still holds a strong reference, so nothing is freed and the
+			// address it is about to be compared against cannot be recycled.
+			drop(displaced);
+		}
+
+		release.send(()).unwrap();
+		queue.flush();
+
+		let current = header_of_parking(&objects, KEY);
+
+		assert!(
+			TieredValue::ptr_eq(&current, &installed),
+			"the concurrent set's value must survive; the migration was computed \
+			 from a superseded snapshot",
+		);
+		assert!(
+			!TieredValue::ptr_eq(&current, &snapshotted),
+			"and the value the consumer snapshotted is gone from the map",
+		);
+		assert_eq!(current.bytes(), &[0x99u8; BUFFER_LEN][..]);
+		assert_eq!(
+			current.tier(),
+			Tier::Fast,
+			"the Slow copy must never have been published",
+		);
+
+		assert_eq!(
+			since(before),
+			Dispositions { applied: 0, gone: 0, declined: 0, superseded: 1 },
+			"the guard rejected it, which is a superseded disposition and not an \
+			 applied one",
+		);
+	}
+
+	/// `header_of` for the parking-key map. Same one-liner, different `K`.
+	fn header_of_parking(
+		objects: &ObjectMapRef<ParkingKey, TestBuffer>,
+		key: HashedKey,
+	) -> TieredValue<ParkingKey> {
+		objects.get_ref(&key).unwrap().snapshot()
+	}
+
+	/// Every entry reaches its own key's consumer and moves that key's own
+	/// bytes.
+	///
+	/// Each key is admitted into one tier and asked for the other, so all 32
+	/// entries are genuine moves rather than declines. The admitted tier flips
+	/// every *two* keys while the shard is the key's parity, so each of the two
+	/// consumers sees both directions. Each key's fill byte is its own, so a
+	/// migration that copied the wrong object's bytes fails here rather than
+	/// passing on the tier alone.
 	#[test]
 	fn migrations_for_different_keys_all_complete_across_shards() {
+		let _serialised = migration_test_lock::lock();
+
 		let objects = make_objects();
 
 		let keys: Vec<HashedKey> = (0..32).collect();
 
-		for &key in &keys {
-			insert(&objects, key, 0);
-		}
-
-		// With two consumers the shard index is the key's parity, so both
-		// channels are used; the requested tier flips every *two* keys, so
-		// each shard also sees both tiers.
-		let queue = MigrationQueue::spawn(objects.clone(), marker_migrate(), 2, make_status()).unwrap();
-
-		let requested_tier = |key: HashedKey| {
+		let admitted_tier = |key: HashedKey| {
 			if (key / 2) % 2 == 0 { Tier::Fast } else { Tier::Slow }
 		};
+
+		let requested_tier = |key: HashedKey| match admitted_tier(key) {
+			Tier::Fast => Tier::Slow,
+			Tier::Slow => Tier::Fast,
+		};
+
+		let fill = |key: HashedKey| (key as u8).wrapping_add(1);
+
+		for &key in &keys {
+			insert(&objects, key, admitted_tier(key), fill(key));
+		}
+
+		let admitted: Vec<TieredValue<u32>> =
+			keys.iter().map(|&key| header_of(&objects, key)).collect();
+
+		let before = dispositions();
+
+		let queue = MigrationQueue::spawn(objects.clone(), 2, make_status()).unwrap();
 
 		for &key in &keys {
 			queue.push((key, requested_tier(key)));
@@ -2424,13 +2699,19 @@ mod migration_queue_tests {
 
 		queue.flush();
 
-		for &key in &keys {
-			let expected = match requested_tier(key) {
-				Tier::Fast => FAST_MARKER,
-				Tier::Slow => SLOW_MARKER,
-			};
+		assert_eq!(
+			since(before),
+			Dispositions { applied: 32, gone: 0, declined: 0, superseded: 0 },
+			"every entry was a real move",
+		);
 
-			assert_eq!(last_byte(&objects, key), expected, "key {key}");
+		for (index, &key) in keys.iter().enumerate() {
+			assert_eq!(tier_of(&objects, key), requested_tier(key), "key {key}");
+			assert_eq!(bytes_of(&objects, key), vec![fill(key); BUFFER_LEN], "key {key}");
+			assert!(
+				!TieredValue::ptr_eq(&header_of(&objects, key), &admitted[index]),
+				"key {key}: a completed migration installs a new header",
+			);
 		}
 	}
 }
@@ -2441,8 +2722,8 @@ mod migration_queue_tests {
 /// the property under test -- a promotion or demotion is counted if and only
 /// if `Object::set_data` actually ran -- belongs to the application path, and
 /// coaxing a real stack into emitting each of the four possible outcomes
-/// (completed, object gone, `migrate` declined, guard rejected) would be far
-/// more fragile than handing them over directly.
+/// (completed, object gone, already in the requested tier, guard rejected)
+/// would be far more fragile than handing them over directly.
 ///
 /// Every test runs both ways round: `queued = true` keeps the standing
 /// consumer pool (the default configuration, and where the enqueued-intent
@@ -2454,10 +2735,21 @@ mod migration_queue_tests {
 /// policy stack is deliberately a plain `Lru` one: it is never consulted
 /// here, and it is the one policy `init_policy_stack` builds under every
 /// feature combination.
+///
+/// These used to build the worker with a `migrate` closure that stamped the
+/// destination buffer, and set `decline = true` to make that closure return
+/// `None` for everything. Neither exists: the copy is
+/// `TieredValue::migrated_to` and the declined case is reached by asking for
+/// the tier the value is already in, which is what production declines on. So
+/// the "did the swap really happen" assertion is now the object's TIER, and
+/// -- for the declined case, where the tier does not change by definition --
+/// its header identity.
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod migration_accounting_tests {
 	use super::*;
 
+	use super::migration_test_lock;
+	use crate::TieredValue;
 	use crate::{
 		object::Object,
 		object::overhead::OverheadManager,
@@ -2469,12 +2761,9 @@ mod migration_accounting_tests {
 	/// rather than the value type -- every value is a `TieredValue`.
 	type TestBuffer = crate::TieredBuffer;
 
-	const FAST_MARKER: u8 = 0xFA;
-	const SLOW_MARKER: u8 = 0x50;
+	const BUFFER_LEN: usize = 8;
 
-	/// `decline` makes `migrate` return `None` for everything, standing in for
-	/// "the value is already in the requested tier".
-	fn make_worker(queued: bool, decline: bool) -> (
+	fn make_worker(queued: bool) -> (
 		PolicyWorker<u32, TestBuffer>,
 		ObjectMapRef<u32, TestBuffer>,
 		StatusRef,
@@ -2489,37 +2778,11 @@ mod migration_accounting_tests {
 
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
-		// Tags the buffer's last byte so a test can tell a real swap from a
-		// counter that merely fired. Never changes the length, for the same
-		// accounting reason the other hybrid test modules note.
-		let migrate: Box<
-			dyn Fn(crate::value::ValueRef<'_>, Tier) -> Option<crate::TieredValue> + Send + Sync,
-		> =
-			Box::new(move |source, tier| {
-				if decline {
-					return None;
-				}
-
-				let marker = match tier {
-					Tier::Fast => FAST_MARKER,
-					Tier::Slow => SLOW_MARKER,
-				};
-
-				let mut value = source.bytes().to_vec();
-
-				if let Some(last) = value.last_mut() {
-					*last = marker;
-				}
-
-				Some(crate::TieredValue::new_in(&value, tier))
-			});
-
 		let mut worker = PolicyWorker::new_with_tier_migration(
 			rx,
 			objects.clone(),
 			status.clone(),
 			overhead_manager,
-			migrate,
 		).unwrap();
 
 		if !queued {
@@ -2531,25 +2794,32 @@ mod migration_accounting_tests {
 		(worker, objects, status)
 	}
 
-	fn insert(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) {
+	fn insert(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey, tier: Tier) {
 		objects.insert(
 			key,
-			Object::new(key as u32, &vec![0u8; 8], None),
+			Object::new_in(key as u32, &vec![0u8; BUFFER_LEN], tier, None),
 		);
 	}
 
-	fn last_byte(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) -> u8 {
-		let data = objects.get_ref(&key).unwrap().bytes().to_vec();
-		*data.last().unwrap()
+	fn tier_of(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) -> Tier {
+		objects.get_ref(&key).unwrap().value().tier()
+	}
+
+	fn header_of(objects: &ObjectMapRef<u32, TestBuffer>, key: HashedKey) -> TieredValue<u32> {
+		objects.get_ref(&key).unwrap().snapshot()
 	}
 
 	#[test]
 	fn completed_migrations_are_counted_once_in_the_right_direction() {
 		for queued in [true, false] {
-			let (worker, objects, status) = make_worker(queued, false);
+			let _serialised = migration_test_lock::lock();
 
-			insert(&objects, 1);
-			insert(&objects, 2);
+			let (worker, objects, status) = make_worker(queued);
+
+			// Admitted into the tier each is about to be moved OUT of, so
+			// neither entry can be declined.
+			insert(&objects, 1, Tier::Fast);
+			insert(&objects, 2, Tier::Slow);
 
 			worker.apply_migration_batches(
 				vec![(1, Tier::Slow)],
@@ -2564,18 +2834,20 @@ mod migration_accounting_tests {
 
 			// Both swaps really happened, so both counters describe a physical
 			// copy rather than an intent to make one.
-			assert_eq!(last_byte(&objects, 1), SLOW_MARKER, "queued = {queued}");
-			assert_eq!(last_byte(&objects, 2), FAST_MARKER, "queued = {queued}");
+			assert_eq!(tier_of(&objects, 1), Tier::Slow, "queued = {queued}");
+			assert_eq!(tier_of(&objects, 2), Tier::Fast, "queued = {queued}");
 		}
 	}
 
 	#[test]
 	fn migration_whose_object_was_removed_is_not_counted() {
 		for queued in [true, false] {
-			let (worker, objects, status) = make_worker(queued, false);
+			let _serialised = migration_test_lock::lock();
 
-			insert(&objects, 1);
-			insert(&objects, 2);
+			let (worker, objects, status) = make_worker(queued);
+
+			insert(&objects, 1, Tier::Fast);
+			insert(&objects, 2, Tier::Slow);
 
 			// Removed between the stack emitting the migration and the copy
 			// being applied -- the `objects.get_ref` miss.
@@ -2594,13 +2866,26 @@ mod migration_accounting_tests {
 		}
 	}
 
+	/// A migration into the tier the value is already in moves nothing, and so
+	/// counts as nothing.
+	///
+	/// This is the case the old `decline` flag stood in for, reached now the
+	/// way production reaches it. The tier cannot change by definition here, so
+	/// the assertion that nothing happened has to be header identity: a
+	/// "decline" that had gone on to build a copy and swap it in would leave
+	/// the tier and the bytes looking exactly right.
 	#[test]
-	fn declined_migration_is_not_counted() {
+	fn a_migration_into_the_tier_the_value_is_already_in_is_not_counted() {
 		for queued in [true, false] {
-			let (worker, objects, status) = make_worker(queued, true);
+			let _serialised = migration_test_lock::lock();
 
-			insert(&objects, 1);
-			insert(&objects, 2);
+			let (worker, objects, status) = make_worker(queued);
+
+			insert(&objects, 1, Tier::Slow);
+			insert(&objects, 2, Tier::Fast);
+
+			let untouched_demotion = header_of(&objects, 1);
+			let untouched_promotion = header_of(&objects, 2);
 
 			worker.apply_migration_batches(
 				vec![(1, Tier::Slow)],
@@ -2613,9 +2898,18 @@ mod migration_accounting_tests {
 			assert_eq!(stats.demotions, 0, "queued = {queued}");
 			assert_eq!(stats.promotions, 0, "queued = {queued}");
 
-			// `migrate` declined, so the bytes were never touched either.
-			assert_eq!(last_byte(&objects, 1), 0, "queued = {queued}");
-			assert_eq!(last_byte(&objects, 2), 0, "queued = {queued}");
+			// Nothing was installed for either key.
+			assert!(
+				TieredValue::ptr_eq(&header_of(&objects, 1), &untouched_demotion),
+				"queued = {queued}",
+			);
+			assert!(
+				TieredValue::ptr_eq(&header_of(&objects, 2), &untouched_promotion),
+				"queued = {queued}",
+			);
+
+			assert_eq!(tier_of(&objects, 1), Tier::Slow, "queued = {queued}");
+			assert_eq!(tier_of(&objects, 2), Tier::Fast, "queued = {queued}");
 		}
 	}
 
@@ -2627,10 +2921,12 @@ mod migration_accounting_tests {
 	#[test]
 	fn slow_moves_are_not_demotions_when_inline_accounting_is_off() {
 		for queued in [true, false] {
-			let (worker, objects, status) = make_worker(queued, false);
+			let _serialised = migration_test_lock::lock();
 
-			insert(&objects, 1);
-			insert(&objects, 2);
+			let (worker, objects, status) = make_worker(queued);
+
+			insert(&objects, 1, Tier::Fast);
+			insert(&objects, 2, Tier::Slow);
 
 			worker.apply_migration_batches(
 				vec![(1, Tier::Slow)],
@@ -2641,7 +2937,7 @@ mod migration_accounting_tests {
 			let stats = status.hybrid_stats();
 
 			// The slow move physically happened...
-			assert_eq!(last_byte(&objects, 1), SLOW_MARKER, "queued = {queued}");
+			assert_eq!(tier_of(&objects, 1), Tier::Slow, "queued = {queued}");
 
 			// ...and still was not counted as a demotion.
 			assert_eq!(stats.demotions, 0, "queued = {queued}");
@@ -2658,6 +2954,7 @@ mod migration_accounting_tests {
 		}
 	}
 }
+
 
 /// The capacity-eviction watermark (`eviction_watermarks`), against the real
 /// `apply_evictions` loop.

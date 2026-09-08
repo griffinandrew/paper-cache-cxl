@@ -9,7 +9,7 @@ mod expiries;
 
 use std::{
 	thread,
-	time::{Instant, Duration},
+	time::Duration,
 };
 
 use typesize::TypeSize;

@@ -33,7 +33,6 @@
 //! separate key-to-node index.
 
 use crate::{
-	CacheSize,
 	HashedKey,
 	ObjectSize,
 	PaperPolicy,

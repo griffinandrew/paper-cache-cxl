@@ -15,6 +15,17 @@
 //!                                                  (slab + index, key TWICE)
 //! ```
 //!
+//! Those three figures were measured against the PRE-ARC value
+//! representation, where `Object` was `{ key, value, len, expiry }` inline in
+//! the map row and the value was a `Shared<TieredBuffer>`. Since
+//! `crate::value` the row holds one eight-byte handle and the key, length and
+//! expiry live in a 32-byte refcounted DRAM header instead. So the split
+//! design's own numbers have moved and the three above must be re-measured
+//! (`measure_object_map_point`, `measure_one_point`) before this prototype's
+//! output is quoted against them. What has NOT changed is what this prototype
+//! is for: the split design still keys the same object three times, and this
+//! one keys it once.
+//!
 //! The stack stores the key twice purely to answer "where in the LRU order is
 //! this key?" -- a question that disappears when the object and its links share
 //! a slot, because finding the object IS finding its position.
@@ -43,23 +54,33 @@
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
 use crate::{
-	object::{ExpireTime, ObjectSize},
+	object::ObjectSize,
+	value::TieredValue,
 	worker::policy::policy_stack::Tier,
-	CacheSize, HashedKey, NoHasher, TieredBuffer,
+	CacheSize, HashedKey, NoHasher,
 };
 
 const NIL: u32 = u32::MAX;
 
 /// Object, eviction links and tier payload in ONE slot.
 ///
-/// Pinned so a regression is a build failure: 8 key + 8 Arc ptr + 16 expiry
-/// + 4 size + 4 prev + 4 next + 1 tier + 1 dram_resident, padded to 48.
+/// Pinned so a regression is a build failure: 8 key + 8 value handle + 4 size
+/// + 4 prev + 4 next + 1 tier + 1 dram_resident, padded to 32.
+///
+/// It was 48, carrying an `expiry: ExpireTime` (16 B as an `Option<Instant>`,
+/// then 4 as a tick) and an eight-byte `Arc<TieredBuffer>` whose own inner
+/// allocation held the buffer handle. The expiry field is GONE from the slot
+/// rather than shrunk: it lives in the value header now, which the slot
+/// reaches through its handle -- see `crate::value::ValueHeader`. That is the
+/// same move `merged_store::Slot` made, and this prototype has to make it too
+/// or it measures a slot shape the real store no longer has.
 struct MergedSlot {
+	/// The HASHED key -- what both variants' index is keyed on, and what
+	/// variant B resolves a probe candidate against. The REAL key is inside
+	/// the value header, where `key_matches` reads it.
 	key: HashedKey,
-	data: Arc<TieredBuffer>,
-	expiry: ExpireTime,
+	value: TieredValue<HashedKey>,
 	size: ObjectSize,
 	prev: u32,
 	next: u32,
@@ -68,8 +89,15 @@ struct MergedSlot {
 }
 
 const _: () = assert!(
-	std::mem::size_of::<MergedSlot>() <= 48,
-	"MergedSlot grew past 48 bytes",
+	std::mem::size_of::<MergedSlot>() <= 32,
+	"MergedSlot grew past 32 bytes",
+);
+
+const _: () = assert!(
+	std::mem::size_of::<MergedSlot>() == 32,
+	"MergedSlot is no longer exactly 32 bytes -- a field has landed in padding \
+	 that will later push the slot into the next size class, and every figure \
+	 this prototype prints is denominated in this number",
 );
 
 /// Variant A: slab + a conventional key-bearing index.
@@ -162,15 +190,14 @@ impl MergedLruHybrid {
 		while self.fast_used > self.fast_capacity && self.demote_one() {}
 	}
 
-	pub fn insert(&mut self, key: HashedKey, data: Arc<TieredBuffer>, size: ObjectSize) {
+	pub fn insert(&mut self, key: HashedKey, value: TieredValue<HashedKey>, size: ObjectSize) {
 		if let Some(&i) = self.index.get(&key) {
-			self.slots[i as usize].data = data;
+			self.slots[i as usize].value = value;
 			return;
 		}
 		let slot = MergedSlot {
 			key,
-			data,
-			expiry: None,
+			value,
 			size,
 			prev: NIL,
 			next: NIL,
@@ -195,9 +222,9 @@ impl MergedLruHybrid {
 
 	/// The whole point: one lookup lands on the object AND its LRU position.
 	/// No second structure, no second key comparison, no second cache miss.
-	pub fn touch(&mut self, key: HashedKey) -> Option<&Arc<TieredBuffer>> {
+	pub fn touch(&mut self, key: HashedKey) -> Option<&TieredValue<HashedKey>> {
 		let i = *self.index.get(&key)?;
-		Some(&self.slots[i as usize].data)
+		Some(&self.slots[i as usize].value)
 	}
 }
 
@@ -242,15 +269,14 @@ impl MergedLruHybridThin {
 		}
 	}
 
-	pub fn insert(&mut self, key: HashedKey, data: Arc<TieredBuffer>, size: ObjectSize) {
+	pub fn insert(&mut self, key: HashedKey, value: TieredValue<HashedKey>, size: ObjectSize) {
 		let b = self.probe(key);
 		if self.table[b] != NIL {
 			return;
 		}
 		self.slots.push(MergedSlot {
 			key,
-			data,
-			expiry: None,
+			value,
 			size,
 			prev: NIL,
 			next: self.head,
@@ -273,9 +299,11 @@ impl MergedLruHybridThin {
 /// Same method as every other measurement here: jemalloc `stats.allocated`,
 /// ONE point per process, caller samples at powers of two.
 ///
-/// Baselines measured by the same harness, for the same 64-byte value:
+/// Baselines measured by the same harness, for the same 64-byte value, all
+/// four against the PRE-ARC value representation and therefore all four now
+/// stale -- see the module doc:
 ///   object map row  96 B  (`measure_object_map_point`)
-///   Arc header      48 B
+///   Arc header      48 B  (now a 32-byte `triomphe` value header)
 ///   flat lru-compact stack 56 B; the compact HYBRID analog measured 66 B
 #[cfg(test)]
 mod measure {
@@ -300,7 +328,7 @@ mod measure {
 			let mut m = MergedLruHybridThin::with_capacity(n as usize);
 			for i in 0..n {
 				let k = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-				m.insert(k, Arc::new(TieredBuffer::new_fast(&value)), vsize as ObjectSize);
+				m.insert(k, TieredValue::new_fast(k, &value, None), vsize as ObjectSize);
 			}
 			let after = allocated_bytes();
 			core::hint::black_box(&m);
@@ -309,7 +337,7 @@ mod measure {
 			let mut m = MergedLruHybrid::new(CacheSize::MAX / 4);
 			for i in 0..n {
 				let k = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-				m.insert(k, Arc::new(TieredBuffer::new_fast(&value)), vsize as ObjectSize);
+				m.insert(k, TieredValue::new_fast(k, &value, None), vsize as ObjectSize);
 			}
 			let after = allocated_bytes();
 			core::hint::black_box(&m);
