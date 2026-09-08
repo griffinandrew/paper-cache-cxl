@@ -172,7 +172,23 @@ mod hybrid_cache_tests {
         cache.get(&1u32).expect("get should succeed");
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        cache.resize(180).expect("resize should succeed");
+        // 300, not the 180 this was: the eviction pass this resize fires
+        // drains `while used_size > max_size`, one object at a time, so the
+        // target has to sit between ONE charged object and TWO or the pass
+        // cannot stop with key 1 alive. A 15-byte payload under a u32 key is
+        // `base_size` = 4 (key) + nallocx(15) = 16 + 4 (ExpireTime) = 24, and
+        // `get_policy_overhead` for this policy is now the MEASURED stack
+        // (112) + the map row (68) = 180, so one object is charged 204 and two
+        // are charged 408: the window is [204, 408), and 300 sits in it.
+        //
+        // 180 was the same window's floor under the old, hand-counted charge:
+        // 87 + 68 = 155 made one object 179, and 180 was 179 + 1. The arm was
+        // wrong -- every compact hybrid reserved 72 for its stack and charged
+        // 40 -- so correcting it moved the floor from 179 to 204 and left this
+        // fixture one byte under it, at which point the pass could not stop
+        // until it had evicted everything. Picked mid-window rather than at
+        // the new floor so the next re-measurement does not land on it again.
+        cache.resize(300).expect("resize should succeed");
 
         let promoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast));
         assert!(promoted, "a reprieved key should still be promotable via the ordinary second chance");
@@ -294,7 +310,23 @@ mod hybrid_cache_tests {
 
         // Deterministic trigger, not a filler set() -- see
         // hybrid_cache_integration.rs's equivalent test for why.
-        cache.resize(180).expect("resize should succeed");
+        // 300, not the 180 this was: the eviction pass this resize fires
+        // drains `while used_size > max_size`, one object at a time, so the
+        // target has to sit between ONE charged object and TWO or the pass
+        // cannot stop with key 1 alive. A 15-byte payload under a u32 key is
+        // `base_size` = 4 (key) + nallocx(15) = 16 + 4 (ExpireTime) = 24, and
+        // `get_policy_overhead` for this policy is now the MEASURED stack
+        // (112) + the map row (68) = 180, so one object is charged 204 and two
+        // are charged 408: the window is [204, 408), and 300 sits in it.
+        //
+        // 180 was the same window's floor under the old, hand-counted charge:
+        // 87 + 68 = 155 made one object 179, and 180 was 179 + 1. The arm was
+        // wrong -- every compact hybrid reserved 72 for its stack and charged
+        // 40 -- so correcting it moved the floor from 179 to 204 and left this
+        // fixture one byte under it, at which point the pass could not stop
+        // until it had evicted everything. Picked mid-window rather than at
+        // the new floor so the next re-measurement does not land on it again.
+        cache.resize(300).expect("resize should succeed");
 
         let survived_and_promoted = wait_until(MIGRATION_TIMEOUT, || {
             cache.has(&1u32) && cache.tier_of(&1u32) == Some(Tier::Fast)
