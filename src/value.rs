@@ -925,7 +925,11 @@ mod tests {
 		let fast = TieredValue::new_fast(KEY, &[], None);
 		let slow = TieredValue::new_slow(KEY, &[], None);
 
-		for (value, tier) in [(fast, Tier::Fast), (slow, Tier::Slow)] {
+		// Cloned, not moved: `TieredValue` is an owning Arc handle now, and
+		// the assertions below still need `fast` and `slow`. A clone is a
+		// refcount bump onto the same allocation, so the addresses compared
+		// afterwards are the same addresses this loop checked.
+		for (value, tier) in [(fast.clone(), Tier::Fast), (slow.clone(), Tier::Slow)] {
 			assert!(!value.bytes().as_ptr().is_null(), "{tier:?}: a zero-length value must not be null");
 			assert_eq!(value.bytes().as_ptr().addr() % VALUE_ALIGN, 0, "{tier:?}: must stay 8-aligned");
 			assert_eq!(value.tier(), tier, "{tier:?}: the tag must survive a zero length");
@@ -1126,10 +1130,10 @@ mod tests {
 			"a slow value must be on node {NODE_SLOW}, not node {slow_node}",
 		);
 
-		unsafe {
-			fast.free(bytes.len() as u32);
-			slow.free(bytes.len() as u32);
-		}
+		// No manual free. `free` moved onto the private `ValueBytes` and is
+		// called by `ValueHeader::drop`, so `fast` and `slow` going out of
+		// scope here IS the teardown -- and freeing by hand as well would be
+		// a double free. This block predates the Arc and did not survive it.
 	}
 
 	/// Interleaving equal-sized allocations across tiers on one thread is the
