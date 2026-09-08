@@ -217,6 +217,37 @@ fn bytes_offset<K>() -> usize {
 	(header + VALUE_ALIGN - 1) & !(VALUE_ALIGN - 1)
 }
 
+/// ## KNOWN COST, measured -- a candidate for redesign
+///
+/// Putting the header inside the allocation interacts with jemalloc size
+/// classes, and for a value whose size is already class-aligned it costs a
+/// WHOLE CLASS rather than the header's 24 bytes. `nallocx(4096)` is 4096, but
+/// `nallocx(24 + 4096)` is 5120.
+///
+/// Measured, one process per point, `measure_object_map_point` at n = 2^20,
+/// against the two-allocation shape (row 80 + `nallocx(value)`):
+///
+/// ```text
+///   value    before    after     delta
+///      64       144      136        -8
+///     100       192      168       -24
+///     256       336      360       +24
+///    1000      1104     1064       -40
+///    1024      1104     1320      +216
+///    4096      4176     5160      +984
+///    4890      5200     5160       -40
+///    8192      8272    10280     +2008
+/// ```
+///
+/// The row is a flat -40 B/object and is value-size independent; everything
+/// above is the rounding. So this shape wins on arbitrary sizes -- including
+/// cluster13's 4,890-byte mean -- and loses badly on powers of two, which are
+/// common in both benchmarks and real workloads.
+///
+/// Kept deliberately: the single allocation is the property being tested here.
+/// The escape, if the penalty proves to matter, is a size threshold above
+/// which the bytes go back to their own allocation -- taking the -40
+/// everywhere and the rounding nowhere, at the cost of two code paths.
 /// The layout of one whole item: header, padding, then `len` bytes.
 ///
 /// Never zero-sized, because the header alone is several words. That removes
