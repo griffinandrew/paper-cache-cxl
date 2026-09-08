@@ -191,12 +191,27 @@ pub fn get_policy_overhead(_policy: &PaperPolicy) -> ObjectSize {
 }
 
 /// MEASURED_STACK marker: the per-policy terms below are measured, not
-/// hand-counted. See results/measured_stack_allocation.txt -- jemalloc
-/// `stats.allocated`, one process per point, 2^20..2^23, R^2 = 1.000000 on all
-/// seventeen. The previous values were, per this module's own harness comment,
-/// "just rough estimates", and every compact variant carried a flat `16 + 24`
-/// "written by the registration helper and never checked against anything".
-/// Every one understated its stack by 18-100%.
+/// hand-counted -- jemalloc `stats.allocated`, ONE process per point,
+/// 2^20..2^23, least squares. The previous values were, per this module's own
+/// harness comment, "just rough estimates", and every compact variant carried a
+/// flat `16 + 24` "written by the registration helper and never checked against
+/// anything". Every one understated its stack by 18-100%.
+///
+/// RE-MEASURED with `measure_one_point` for all 43 hybrid policies, not a
+/// sample of them: every compact family fits 71.995-71.998 B/object, every
+/// split family 112.0003, `LfuHybrid` 168.0003, R^2 = 1.000000 on all 43. The
+/// constants below stand unchanged; what was wrong was the hand count in
+/// `get_policy_overhead`, which is why that function now names these constants
+/// instead of repeating a number.
+///
+/// The FLAT arms were re-measured in the same pass and are all correct: lru,
+/// fifo, clock, sieve, mru, 2q, arc and s3-fifo (compact and not) each fit
+/// their hand-written term to within 0.01 B/object, R^2 = 1.000000 on all
+/// seventeen. Only the hybrid arms were wrong, which is why only they change.
+///
+/// (The note this replaces cited results/measured_stack_allocation.txt for the
+/// seventeen. That file is not in the tree -- there is no results/ directory --
+/// so the provenance now lives here, where it cannot go missing.)
 
 /// EVERY arm carries `OBJECT_MAP_ROW_OVERHEAD`, including the hybrid ones.
 ///
@@ -208,10 +223,24 @@ pub fn get_policy_overhead(_policy: &PaperPolicy) -> ObjectSize {
 /// ran ~4x that per object of metadata. The flat arms have always included the
 /// term; this only makes the hybrids agree with them.
 ///
-/// The two functions in this module now name the same three quantities -- the
-/// stack, the map row, and the (zero) value allocation -- so they can be read
-/// against each other. They still differ in one deliberate way:
-/// `get_hybrid_dram_shared_overhead` does NOT subtract
+/// The hybrid arms name the MEASURED eviction-stack constant. They used to
+/// carry the registration helper's flat `16 + 24`, and THAT is where the two
+/// functions in this module disagreed: for every compact hybrid
+/// `get_hybrid_dram_shared_overhead` reserved the measured 72 while this
+/// function charged 40, so `used_size` under-billed every compact hybrid by
+/// 32 B/object and `max_size` let in ~30% more metadata than it meant to. The
+/// split hybrids were out by 25-27, `LfuHybrid` by 55.
+///
+/// The constants were not the problem -- re-measured with `measure_one_point`
+/// across all 43 hybrid policies, they are right to four decimal places (see
+/// the MEASURED_STACK note above). The hand counts were. Naming the constant
+/// rather than restating its value is the fix that lasts: the two tables can no
+/// longer drift, and `the_two_overhead_tables_agree_on_every_hybrid` asserts
+/// that what is left between them is exactly `DOUBLE_COUNTED_IN_BASE_SIZE`.
+///
+/// The two functions now name the same three quantities -- the stack, the map
+/// row, and the (zero) value allocation -- and they differ in one deliberate
+/// way: `get_hybrid_dram_shared_overhead` does NOT subtract
 /// `DOUBLE_COUNTED_IN_BASE_SIZE`, because it is a fast-tier RESERVATION rather
 /// than an addition on top of `base_size`, so it has nothing to double-count
 /// against.
@@ -220,6 +249,14 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// Each arm is <this policy's eviction-stack cost> + the object-map row.
 	// The stack terms are measured (see the MEASURED_STACK note above); the row
 	// term is measured too (see `OBJECT_MAP_ENTRY_OVERHEAD`).
+	//
+	// READ THE HYBRID COMMENTS AS STRUCTURE, NOT AS ARITHMETIC. Each one argues
+	// which structures a key occupies -- one list node, one combined entry, one
+	// slab slot -- and that argument is still what makes two policies share a
+	// constant. The field-by-field byte counts inside them are the SUPERSEDED
+	// hand derivation, kept only because the structural argument is written
+	// around them; the number an arm returns comes from the named measured
+	// constant, and every one of those hand counts was low.
 
 	match policy {
 		PaperPolicy::Auto => 0,
@@ -294,7 +331,7 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// (tier + size, one map — see `LruHybridStack`'s module doc for why
 		// this collapsed from two separate maps), 1 byte for the Tier tag,
 		// 4 bytes for the object size
-		PaperPolicy::LruHybrid => 48 + 8 + 24 + 1 + 4 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::LruHybrid => LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to LruHybrid, and deliberately so: the fast
 		// tier is the same 48-byte HashList entry + 8-byte HashedKey, and a
@@ -307,8 +344,8 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// already measured. See `lru_lfu_hybrid_stack.rs`'s "Why the counter
 		// is capped" section and its `entry_packs_to_eight_bytes` test, which
 		// is what keeps this arm honest.
-		PaperPolicy::LruLfuCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::LruLfuHybrid(_) => 48 + 8 + 24 + 1 + 4 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::LruLfuCompactHybrid(_) => LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::LruLfuHybrid(_) => LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Base LFU overhead (24 HashMap entry + 48 bucket-list entry + 8
 		// HashedKey + 4 count = 84) plus what LfuHybridStack needs beyond
@@ -317,17 +354,17 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// bytes for the entry, 1 byte for the Tier tag, 4 bytes for the
 		// object size (matching the "+4" charge already used for
 		// TwoQ/Arc/SThreeFifo)
-		PaperPolicy::LfuHybrid => (24 + 48 + 8 + 4) + (24 + 1 + 4) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::LfuHybrid => LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// One 32-byte slab slot plus a 16-byte index entry. No `entries` map
 		// and no per-key list node: the slot the index returns already carries
 		// tier, size and frequency. Measured 47.4 B/key against this 48.
-		PaperPolicy::LruCompactHybrid => 24 + 16 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::LruCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Same 8-byte payload as `LruCompactHybrid`: `phys` was paid for out
 		// of padding `LruPayload` already carried, so the layout is unchanged.
-		PaperPolicy::LruLazyCopyCompactHybrid => 24 + 16 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::LfuCompactHybrid => 32 + 16 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::LruLazyCopyCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::LfuCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Worst-case charge for a key resident in main_stack as Fast:
 		// 48-byte HashList entry + 8-byte HashedKey + a single combined
@@ -336,37 +373,37 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// three separate maps) — 24 bytes for the entry, 1 byte for the
 		// Queue tag, 1 byte for the Option<Tier> tag (only meaningful for
 		// keys currently in Main), 4 bytes for the object size
-		PaperPolicy::TwoQCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::TwoQHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQCompactHybrid(_) => TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQHybrid(_) => TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to TwoQHybrid: `TwoQFastAdmissionHybridStack`
 		// is the same two-list/one-combined-entry-map shape, differing only in
 		// which physical tier the one-access FIFO queue's bytes live in (fast
 		// rather than slow) — a placement decision that costs no extra
 		// per-key metadata.
-		PaperPolicy::TwoQFastAdmissionCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::TwoQFastAdmissionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQFastAdmissionCompactHybrid(_) => TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQFastAdmissionHybrid(_) => TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical again: the reprieve variant changes where an
 		// aged-out one-access key goes, not what is tracked per key.
-		PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::TwoQFastAdmissionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(_) => TWO_Q_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQFastAdmissionReprieveHybrid(_) => TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical again, despite the third queue: a key is
 		// resident in exactly one of `a1_in`/`a1_out`/`am` at any moment, so
 		// it still costs one HashList entry plus one combined `entries` row
 		// (queue tag + Option<Tier> tag + size). No reference bit, and no
 		// ghost list -- `a1_out` holds the real objects.
-		PaperPolicy::TwoQFullFastAdmissionCompactHybrid(_, _) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::TwoQFullFastAdmissionHybrid(_, _) => (48 + 8) + (24 + 1 + 1 + 4) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQFullFastAdmissionCompactHybrid(_, _) => TWO_Q_FULL_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQFullFastAdmissionHybrid(_, _) => TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to LruHybrid: 48 bytes for the HashList
 		// entry, 8 bytes for the HashedKey, 24 bytes for the single
 		// combined per-key `entries` HashMap entry (tier + size, one map —
 		// see `FifoHybridStack`'s module doc), 1 byte for the Tier tag,
 		// 4 bytes for the object size.
-		PaperPolicy::FifoCompactHybrid => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::FifoHybrid => 48 + 8 + 24 + 1 + 4 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::FifoCompactHybrid => FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::FifoHybrid => FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to LruHybrid despite having 4 recency
 		// lists instead of 1: a key is only ever resident in exactly ONE of
@@ -378,8 +415,8 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// single combined `entries: HashMap<HashedKey, SizedEntry>` entry
 		// (SizedEntry { queue: SizeQueue, size: ObjectSize }), 1 byte for
 		// the SizeQueue tag, 4 bytes for the object size.
-		PaperPolicy::LruSizedCompactHybrid => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::LruSizedHybrid => 48 + 8 + 24 + 1 + 4 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::LruSizedCompactHybrid => LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::LruSizedHybrid => LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to TwoQHybrid's charge (same shape: a
 		// one-access queue + a segmented main FIFO queue, one combined
@@ -390,15 +427,15 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// currently in Main), 4 bytes for the object size, plus 1 more byte
 		// than TwoQHybrid for the `accessed: bool` reference bit (only
 		// meaningful for keys currently in Main — see that field's doc).
-		PaperPolicy::S3FifoCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoCompactHybrid(_) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 		// The faithful family: same 8-byte payload, since `freq: u8`
 		// replaces `accessed: bool` one-for-one. Like every other ghost
 		// design here, the ghost queue's own memory is not charged.
-		PaperPolicy::S3FifoFaithfulCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoFaithfulCompactHybrid(_) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(_) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(_) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(_) => S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoHybrid(_) => S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Ghost-hybrid variants: identical per-*tracked*-object charge to
 		// their non-ghost counterparts. The ghost list's own memory isn't
@@ -408,33 +445,33 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// (no longer counted in `num_objects`, which is what this whole
 		// function's result gets multiplied by), so it isn't a *tracked*
 		// object's overhead to add to in the first place.
-		PaperPolicy::TwoQGhostCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::TwoQGhostHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4) + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoGhostCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoGhostHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQGhostCompactHybrid(_) => TWO_Q_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::TwoQGhostHybrid(_) => TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostCompactHybrid(_) => S3_FIFO_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostHybrid(_) => S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Identical entry shape to S3FifoGhostHybrid (same S3FifoEntry
 		// fields: queue, tier, size, accessed) -- the reference-bit gate
 		// this variant adds only changes when the bit is read, not
 		// anything about the per-entry bookkeeping shape.
-		PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoGhostLazyDemotionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(_) => S3_FIFO_GHOST_LAZY_DEMOTION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostLazyDemotionHybrid(_) => S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 
 		// Identical entry shape to S3FifoGhostLazyDemotionHybrid (same
 		// S3FifoEntry fields) -- moving the one-access queue into the fast
 		// tier is a placement/accounting change, not a bookkeeping-shape
 		// change.
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(_) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(_) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 
 		// Identical entry shape to S3FifoGhostLazyDemotionFastAdmissionHybrid
 		// (same S3FifoEntry fields) -- the midpoint cursor is a
 		// stack-level field (like main_boundary), not a per-object one, so
 		// it doesn't change this per-tracked-object charge.
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(_) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(_) => S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Same S3FifoEntry shape as S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid,
 		// minus the ghost list -- this variant removes it entirely (a
@@ -446,22 +483,22 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// TwoQGhostHybrid/S3FifoGhostHybrid above), so the number is
 		// identical; only the removed list's fixed struct-level cost
 		// (irrelevant here, this function is purely per-object) is gone.
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(_) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(_) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Same per-object charge as the midpoint variant -- dropping the
 		// mid-slow checkpoint removes stack-level fields (a cursor and a
 		// drift counter), not per-object ones.
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(_) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(_) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Identical per-object bookkeeping to the fast-admission reprieve
 		// variant above: same `S3FifoEntry { queue, tier, size, accessed }`,
 		// same two-list main queue. Moving the one-access queue to the slow
 		// tier changes which allocator backs an object's bytes, not what the
 		// stack records per key.
-		PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoLazyDemotionReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(_) => S3_FIFO_LAZY_DEMOTION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoLazyDemotionReprieveHybrid(_) => S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Same per-object charge as the predecessor. The slow tier being
 		// two physical lists instead of one doesn't change what a tracked
@@ -469,8 +506,8 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// entry -- and this variant actually drops the separate
 		// `Option<Tier>` field (the queue tag now carries the tier), so
 		// if anything this is a slight over-estimate rather than under.
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(_) => 16 + 24 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(_) => (48 + 8) + (24 + 1 + 1 + 4 + 1) + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(_) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(_) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 	}
 }
 
@@ -576,7 +613,7 @@ pub const HASHTABLE_ENTRY_OVERHEAD: ObjectSize = 11;
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Dedicated per-object DRAM cost of `LfuHybridStack`'s eviction-stack
@@ -613,7 +650,7 @@ const LRU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 168;
 
 /// Per-object DRAM cost of `LruCompactHybridStack`'s eviction stack.
@@ -633,7 +670,7 @@ const LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 168;
 /// 24), so the pointer chase touches fewer cache lines. Equal to
 /// `TwoQCompactHybridStack` and `S3FifoCompactHybridStack`, which is expected:
 /// all three now share `CompactQueueSet` and all three payloads are 8 bytes.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `LfuCompactHybridStack`'s eviction-stack
@@ -666,14 +703,14 @@ const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `LruSizedCompactHybridStack`.
 ///
 /// MEASURED, not derived: jemalloc `stats.allocated`, one point per
 /// process, sampled at powers of two. 72 B/object, R2 = 1.0000.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Dedicated per-object DRAM cost of `LruSizedHybridStack`'s eviction-stack
@@ -703,14 +740,14 @@ const LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const LRU_SIZED_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `LruLfuCompactHybridStack`.
 ///
 /// MEASURED, not derived: jemalloc `stats.allocated`, one point per
 /// process, sampled at powers of two. 72 B/object, R2 = 1.0000.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Dedicated per-object DRAM cost of `LruLfuHybridStack`'s eviction-stack
@@ -748,7 +785,7 @@ const LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const LRU_LFU_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-*ghost-entry* DRAM cost shared by every hybrid design that keeps a
@@ -819,7 +856,7 @@ pub const EXACT_GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 ///
 /// PLACEHOLDER pending measurement: shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `FifoHybridStack`'s eviction-stack bookkeeping.
@@ -854,7 +891,7 @@ const FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQCompactHybridStack`'s eviction stack.
@@ -873,7 +910,7 @@ const FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 /// standalone comparison measured layout B at +8.01 B/object, so the two
 /// results agree to within a byte. B is right here because `mark_accessed` and
 /// the queue-dispatch read in `touch` are hot AND touch no queue order.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `TwoQHybridStack`'s eviction-stack bookkeeping.
@@ -908,7 +945,7 @@ const TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionCompactHybridStack`.
@@ -920,7 +957,7 @@ const TWO_Q_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 /// equal to the compact 2Q, S3-FIFO and LRU stacks. All four share
 /// `CompactQueueSet` and an 8-byte payload, so equality was the prediction and
 /// the measurement confirms it.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionHybridStack`'s eviction-stack bookkeeping.
@@ -955,14 +992,14 @@ const TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSi
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionReprieveCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -997,7 +1034,7 @@ const TWO_Q_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD:
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQFullFastAdmissionCompactHybridStack`.
@@ -1005,7 +1042,7 @@ const TWO_Q_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectS
 /// MEASURED at 72 by the converting agent, matching every other stack sharing
 /// `CompactQueueSet` and an 8-byte payload. Three queues rather than two makes
 /// no difference: a key is in exactly one of them at a time.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_FULL_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `TwoQFullFastAdmissionHybridStack`'s eviction-stack bookkeeping.
@@ -1039,14 +1076,14 @@ const TWO_Q_FULL_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: Obj
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_FULL_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `TwoQGhostCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `TwoQGhostHybridStack`'s eviction-stack bookkeeping.
@@ -1089,7 +1126,7 @@ const TWO_Q_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoCompactHybridStack`'s eviction stack.
@@ -1101,7 +1138,7 @@ const TWO_Q_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 /// to the measured `TwoQCompactHybridStack`, which is the expected result:
 /// the two share the primitive and both payloads are 8 bytes. Predicted before
 /// the run and confirmed by it.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `S3FifoHybridStack`'s eviction-stack bookkeeping.
@@ -1136,14 +1173,14 @@ const S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoGhostCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `S3FifoGhostHybridStack`'s eviction-stack bookkeeping.
@@ -1186,14 +1223,14 @@ const S3_FIFO_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_GHOST_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_GHOST_LAZY_DEMOTION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionHybridStack`'s eviction-stack bookkeeping.
@@ -1236,14 +1273,14 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: O
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_GHOST_LAZY_DEMOTION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionHybridStack`'s eviction-stack bookkeeping.
@@ -1286,14 +1323,14 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_D
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionMidpointHybridStack`'s eviction-stack bookkeeping.
@@ -1336,14 +1373,14 @@ const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_COMPACT_HYBRID_EVICTIO
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionReprieveCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_LAZY_DEMOTION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -1378,14 +1415,14 @@ const S3_FIFO_LAZY_DEMOTION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_LAZY_DEMOTION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -1420,14 +1457,14 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STAC
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionMidpointReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -1462,14 +1499,14 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_COMPACT_HYBRID_EVIC
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybridStack`'s eviction-stack bookkeeping.
@@ -1504,7 +1541,7 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EV
 /// index-map load factor, or the growth slack of every doubling structure.
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
-#[cfg(feature = "hybrid_cache_common")]
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 112;
 
 
@@ -2037,4 +2074,115 @@ mod what_jemalloc_actually_rounds_to {
 	}
 }
 
+/// The two tables in this module describe the same structures from two sides:
+/// `get_policy_overhead` is added to `base_size` to give what an object is
+/// CHARGED against `max_size`, and `get_hybrid_dram_shared_overhead` is what the
+/// fast tier RESERVES for that object's metadata. Nothing keeps them in step
+/// except this test.
+///
+/// They were out of step. Every compact hybrid reserved the measured 72 B/object
+/// for its eviction stack and charged the hand-counted 40, and `used_size` is
+/// what drives eviction, so `max_size` bounded 32 B/object less metadata than
+/// the cache actually holds -- 30% of a compact hybrid's per-object metadata,
+/// silently.
+#[cfg(all(
+	test,
+	feature = "hybrid_cache_common",
+	not(feature = "merged_object_store"),
+	not(feature = "eviction_stacks_pmem"),
+	not(feature = "global_hashtable_pmem")
+))]
+mod the_two_overhead_tables_agree {
+	use super::*;
 
+	/// Every hybrid policy, parameterised the way the sweep runs them. Written
+	/// out rather than derived: a policy added to `PaperPolicy` without being
+	/// added here would silently escape the check, so the list is meant to be
+	/// read against the two matches above.
+	fn every_hybrid_policy() -> Vec<PaperPolicy> {
+		vec![
+			PaperPolicy::LruHybrid,
+			PaperPolicy::LfuHybrid,
+			PaperPolicy::LruCompactHybrid,
+			PaperPolicy::LruLazyCopyCompactHybrid,
+			PaperPolicy::LfuCompactHybrid,
+			PaperPolicy::LruSizedCompactHybrid,
+			PaperPolicy::LruSizedHybrid,
+			PaperPolicy::LruLfuCompactHybrid(2),
+			PaperPolicy::LruLfuHybrid(2),
+			PaperPolicy::FifoCompactHybrid,
+			PaperPolicy::FifoHybrid,
+			PaperPolicy::TwoQCompactHybrid(0.25),
+			PaperPolicy::TwoQHybrid(0.25),
+			PaperPolicy::TwoQFastAdmissionCompactHybrid(0.25),
+			PaperPolicy::TwoQFastAdmissionHybrid(0.25),
+			PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.25),
+			PaperPolicy::TwoQFastAdmissionReprieveHybrid(0.25),
+			PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.5),
+			PaperPolicy::TwoQFullFastAdmissionHybrid(0.25, 0.5),
+			PaperPolicy::TwoQGhostCompactHybrid(0.25),
+			PaperPolicy::TwoQGhostHybrid(0.25),
+			PaperPolicy::S3FifoCompactHybrid(0.1),
+			PaperPolicy::S3FifoHybrid(0.1),
+			PaperPolicy::S3FifoFaithfulCompactHybrid(0.1),
+			PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.1),
+			PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(0.1),
+			PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(0.1),
+			PaperPolicy::S3FifoGhostCompactHybrid(0.1),
+			PaperPolicy::S3FifoGhostHybrid(0.1),
+			PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(0.1),
+			PaperPolicy::S3FifoGhostLazyDemotionHybrid(0.1),
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(0.1),
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionHybrid(0.1),
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(0.1),
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointHybrid(0.1),
+			PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(0.1),
+			PaperPolicy::S3FifoLazyDemotionReprieveHybrid(0.1),
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(0.1),
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveHybrid(0.1),
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(0.1),
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveHybrid(0.1),
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(0.1),
+			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveHybrid(0.1),
+		]
+	}
+
+	/// The charge and the reservation must differ by exactly
+	/// `DOUBLE_COUNTED_IN_BASE_SIZE` -- the key and the expiry, which live
+	/// inside the map row but which `base_size` already counts separately, so
+	/// the charge takes them back off and the reservation does not.
+	///
+	/// Anything else means the two tables name different structures for the
+	/// same policy, which is the failure this exists to catch.
+	#[test]
+	fn the_two_overhead_tables_agree_on_every_hybrid() {
+		if std::env::var_os("PAPER_DISABLE_SHARED_OVERHEAD").is_some() {
+			return; // the escape hatch zeroes the reservation by design
+		}
+
+		for policy in every_hybrid_policy() {
+			let charged = get_policy_overhead(&policy);
+			let reserved = get_hybrid_dram_shared_overhead(&policy);
+
+			assert_eq!(
+				charged,
+				reserved - DOUBLE_COUNTED_IN_BASE_SIZE,
+				"{policy}: used_size charges {charged} B/object while the fast \
+				 tier reserves {reserved} for the same structures",
+			);
+		}
+	}
+
+	/// The whole list, not just the four the older feature-independence test
+	/// samples: a policy left out of `every_hybrid_policy` would make the check
+	/// above vacuous for that policy without failing anything.
+	#[test]
+	fn every_hybrid_policy_is_actually_covered() {
+		assert_eq!(
+			every_hybrid_policy().len(),
+			43,
+			"the hybrid policy list has drifted from the 43 arms the two \
+			 overhead tables carry",
+		);
+	}
+}
