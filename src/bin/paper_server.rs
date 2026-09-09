@@ -242,6 +242,14 @@ fn timed<T>(stats: &SelfStats, cmd: u8, call: impl FnOnce() -> T) -> T {
 	out
 }
 
+/// Slot for GET misses, outside the command range so it needs no command byte.
+///
+/// A miss does no copy and no allocation, so folding it into the GET average
+/// deflates that average in proportion to the miss ratio. The in-process
+/// benchmark times only hits (`handle_read_through` calls `store_get_time`
+/// solely on `Ok`), and these figures exist to be compared against those.
+const SLOT_GET_MISS: u8 = 14;
+
 /// The command byte the server answers its OWN statistics on.
 ///
 /// Deliberately outside the upstream protocol's 0..=13 range: a stock
@@ -257,7 +265,8 @@ fn render_self_stats(stats: &SelfStats, cache: &Cache) -> String {
 	out.push_str("op      count            mean       p50       p90       p99      p999\n");
 
 	for (name, cmd) in [
-		("get", command::GET),
+		("get(hit)", command::GET),
+		("get(miss)", SLOT_GET_MISS),
 		("set", command::SET),
 		("del", command::DEL),
 		("has", command::HAS),
@@ -282,6 +291,11 @@ fn render_self_stats(stats: &SelfStats, cache: &Cache) -> String {
 	}
 
 	out.push_str("\npercentiles are bucket LOWER BOUNDS (~25% wide); the mean is exact.\n");
+	out.push_str(
+		"get(hit) is the figure comparable with the in-process benchmark, which times\n\
+		 only hits. A miss neither copies nor allocates, so averaging the two together\n\
+		 would understate the cost of a get by the miss ratio.\n",
+	);
 
 	// The tier figures are the whole point of reporting here rather than over
 	// the wire: the protocol's STATS frame has no room for them, so a stock
@@ -471,12 +485,26 @@ fn serve(
 				let key = read_string(&mut reader)?;
 
 				match parse_key(&key) {
-					Some(key) => match timed(stats, command::GET, || cache.get(&key)) {
-						Ok(value) => {
-							write_bool(&mut writer, true)?;
-							write_buf(&mut writer, &value)?;
-						},
-						Err(err) => write_cache_error(&mut writer, &err)?,
+					Some(key) => {
+						// Timed inline rather than through `timed` so the
+						// outcome can pick the slot: hits and misses are
+						// different operations and must not share an average.
+						let started = Instant::now();
+						let outcome = cache.get(&key);
+						let nanos = started.elapsed().as_nanos() as u64;
+
+						stats.record(
+							if outcome.is_ok() { command::GET } else { SLOT_GET_MISS },
+							nanos,
+						);
+
+						match outcome {
+							Ok(value) => {
+								write_bool(&mut writer, true)?;
+								write_buf(&mut writer, &value)?;
+							},
+							Err(err) => write_cache_error(&mut writer, &err)?,
+						}
 					},
 					None => write_cache_error(&mut writer, &CacheError::KeyNotFound)?,
 				}
