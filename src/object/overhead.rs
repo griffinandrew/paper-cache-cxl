@@ -118,7 +118,7 @@ const DOUBLE_COUNTED_IN_BASE_SIZE: ObjectSize =
 	core::mem::size_of::<crate::HashedKey>() as ObjectSize
 		+ core::mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
 
-/// 80 + 0 - 12 = **68**. Was 96 + 32 - 12 = 116.
+/// 40 + 32 - 12 = **60**. Was 80 + 0 - 12 = 68, and 96 + 32 - 12 = 116 before that.
 const OBJECT_MAP_ROW_OVERHEAD: ObjectSize =
 	OBJECT_MAP_ENTRY_OVERHEAD + VALUE_ALLOCATION_OVERHEAD - DOUBLE_COUNTED_IN_BASE_SIZE;
 
@@ -862,7 +862,19 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EV
 /// decision, and a build that reintroduces one (variant A's four-byte length
 /// prefix, say) has a single place to say so.
 // Not cfg-gated: the term applies to every design, tiered or not.
-const VALUE_ALLOCATION_OVERHEAD: ObjectSize = 0;
+/// The value's own separate allocation header, which EXISTS AGAIN.
+///
+/// Zero was correct for v5, where the value was a bare tagged pointer with no
+/// header at all. The arc-value-header work reintroduced one: a
+/// `triomphe::Arc<ValueHeader<K>>` is an 8-byte strong count in front of a
+/// 24-byte header, and jemalloc's 32-byte class holds it exactly. Measured as
+/// the residue of 136.00 B/object less the 40-byte row and the 64-byte value.
+///
+/// Leaving it at zero under-charged every object by 32 bytes. Note the row
+/// constant above was simultaneously 40 too high, so the two errors largely
+/// cancelled and the net was an 8 B/object OVER-charge -- which is exactly why
+/// neither showed up as a crash or an obvious mis-sizing.
+const VALUE_ALLOCATION_OVERHEAD: ObjectSize = 32;
 
 /// Per-object DRAM cost of the object map (`DashMap<HashedKey, Object>`):
 /// the `(u64, Object{key, value word, len, expiry})` pair -- 8 + 24 = 32 bytes
@@ -889,7 +901,17 @@ const VALUE_ALLOCATION_OVERHEAD: ObjectSize = 0;
 // Not cfg-gated: every design allocates one object-map row per object, tiered
 // or not, so this term is charged in get_policy_overhead for non-hybrid
 // policies as well.
-const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 80;
+/// MEASURED on this branch: `measure_object_map_point`, release, one process
+/// per point, value 64, converging 135.9963 / 135.9985 / 135.9992 B/object at
+/// 2^21..2^23. That total decomposes as this row plus a 64-byte value plus a
+/// 32-byte header allocation, so the row is 40.
+///
+/// It was 80, measured against a THIRTY-THREE byte row: v5 stored a 24-byte
+/// `Object` inline in the map, so the pair was 8 + 24 plus a control byte. The
+/// entry is now 8 (hashed key) + 8 (one handle) + control, and the measured
+/// allocation halved with it -- which is also the evidence that the 80 was
+/// tracking content rather than shard-doubling slack.
+const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 40;
 
 /// Requested-to-resident multiplier for the DRAM metadata reserved above.
 ///
