@@ -12,14 +12,16 @@
 //! `small_slow`, `large_slow`, each owning its own key-to-node index -- plus a
 //! separate `entries` map holding `queue`, `size` and `dram_resident`. A key is
 //! resident in exactly one of those four lists at a time, which is precisely
-//! the condition [`CompactQueueSet`] exists for: four intrusive orders over one
-//! slab of 16-byte link-only slots, with ONE index whose value carries the
-//! payload. `MAX_QUEUES` is 4, and this is the design that uses all four.
+//! the condition [`ArenaQueueSet`] exists for: four intrusive orders over one
+//! slab of slots, with ONE index. `MAX_QUEUES` is 4, and this is the design
+//! that uses all four.
 //!
-//! The payload lives in the INDEX MAP'S VALUE, not in the slab slot, so a
-//! metadata read is one probe with the payload already in the bucket rather
-//! than a probe plus a dereference into the slab. See `compact_queue_set`'s
-//! module doc for the measurements behind that choice.
+//! The payload lives in the SLAB SLOT, beside the links and the key, and the
+//! index is a bare table of slot numbers holding neither keys nor payloads.
+//! A metadata read is therefore one probe into that table plus one dereference
+//! into the slab -- a probe into a table small enough to be worth the
+//! dereference. See `arena_queue_set`'s module doc for the measurements behind
+//! that choice.
 //!
 //! ## What the four queues buy, and why there is no boundary cursor
 //!
@@ -38,11 +40,16 @@
 //! The baseline's `SizedEntry` carries a 4-variant `SizeQueue` tag and NO
 //! `Tier` field: the tier is derivable from which queue a key is in
 //! (`Small/LargeFast` -> `Tier::Fast`, `Small/LargeSlow` -> `Tier::Slow`), so
-//! `tier_of` reads the tag. That is unchanged here; the tag doubles as the
-//! `CompactQueueSet` slot number through `SizeQueue::slot`.
+//! `tier_of` reads the tag. That is unchanged here: the shared [`NodePayload`]
+//! stores the tag as a `u8`, so the enum survives as the readable form and is
+//! converted at the boundary by `SizeQueue::tag` and `SizeQueue::from_u8`, and
+//! the tag still doubles as the `ArenaQueueSet` slot number through
+//! `SizeQueue::slot`. `NodePayload::tier` is kept in step with the tag for the
+//! policies that read it, but the TAG REMAINS THE AUTHORITY here -- `tier_of`
+//! still derives from it rather than reading the field.
 //!
 //! The baseline also keeps four `usize` object counters alongside the four
-//! lists. Those are dropped: `CompactQueueSet::queue_len` is the same number by
+//! lists. Those are dropped: `ArenaQueueSet::queue_len` is the same number by
 //! construction, because a key is in exactly one queue and every push/pop the
 //! baseline pairs with a counter update is the same push/pop here. The four
 //! BYTE counters are kept -- they are sums, not cardinalities.
@@ -69,7 +76,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		compact_queue_set::CompactQueueSet, narrow_resident, watermarks, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -93,7 +100,7 @@ enum SizeQueue {
 }
 
 impl SizeQueue {
-	/// The `CompactQueueSet` slot this queue occupies.
+	/// The `ArenaQueueSet` slot this queue occupies.
 	#[inline]
 	fn slot(self) -> usize {
 		match self {
@@ -104,43 +111,59 @@ impl SizeQueue {
 		}
 	}
 
+	/// The tag as [`NodePayload`] stores it. Deliberately `slot()` narrowed
+	/// rather than an independent discriminant, so the stored tag and the
+	/// queue slot cannot drift apart.
+	#[inline]
+	fn tag(self) -> u8 {
+		self.slot() as u8
+	}
+
+	/// Inverse of [`SizeQueue::tag`]. Only this stack ever writes the tag, and
+	/// it writes nothing but `tag()`, so any other value means the node was
+	/// corrupted -- which is worth a panic rather than a silent fourth queue.
+	#[inline]
+	fn from_u8(tag: u8) -> SizeQueue {
+		match tag as usize {
+			Q_SMALL_FAST => SizeQueue::SmallFast,
+			Q_LARGE_FAST => SizeQueue::LargeFast,
+			Q_SMALL_SLOW => SizeQueue::SmallSlow,
+			Q_LARGE_SLOW => SizeQueue::LargeSlow,
+			other => unreachable!("queue tag {other} is not one of the four size queues"),
+		}
+	}
+
+	/// The tier this queue IS. The tier lives in the tag, which is why the
+	/// baseline stored no tier field, and why this is the one place
+	/// `NodePayload::tier` is derived from.
+	#[inline]
+	fn tier(self) -> Tier {
+		match self {
+			SizeQueue::SmallFast | SizeQueue::LargeFast => Tier::Fast,
+			SizeQueue::SmallSlow | SizeQueue::LargeSlow => Tier::Slow,
+		}
+	}
+
 	#[inline]
 	fn is_slow(self) -> bool {
 		matches!(self, SizeQueue::SmallSlow | SizeQueue::LargeSlow)
 	}
 }
 
-/// Per-key bookkeeping, carried in the index value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SizedPayload {
-	queue: SizeQueue,
-
-	/// The part of `size` that stays in DRAM in either tier; see `migrating`.
-	dram_resident: u8,
-
-	size: ObjectSize,
-}
-
-const _: () = assert!(
-	std::mem::size_of::<SizedPayload>() == 8,
-	"SizedPayload grew past 8 bytes",
-);
-
-impl SizedPayload {
-	/// The bytes that actually move between tiers when this object migrates.
-	///
-	/// Deliberately distinct from `size` (`base_size`), which remains the input
-	/// to `classify`: the small/large split is a property of the whole object
-	/// as the cache accounts for it, not of its value alone. Only the byte
-	/// counters use this.
-	#[inline]
-	fn migrating(&self) -> CacheSize {
-		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
-	}
-}
-
+/// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
+/// This stack reads `queue` -- its `SizeQueue` tag, narrowed to `u8` -- along
+/// with `size` and `dram_resident`, and writes `tier` as a mirror of the tag
+/// for the policies that read it. `freq`, `ts` and `phys` belong to other
+/// policies and keep the values they were constructed with, which is what
+/// `LruCompactHybridStack` does with them too.
+///
+/// `NodePayload::migrating` is the bytes that actually move between tiers when
+/// an object migrates, deliberately distinct from `size` (`base_size`), which
+/// remains the input to `classify`: the small/large split is a property of the
+/// whole object as the cache accounts for it, not of its value alone. Only the
+/// byte counters use `migrating`.
 pub struct LruSizedCompactHybridStack {
-	queues: CompactQueueSet<SizedPayload>,
+	queues: ArenaQueueSet<NodePayload>,
 
 	small_capacity: CacheSize,
 	large_capacity: CacheSize,
@@ -167,7 +190,7 @@ impl LruSizedCompactHybridStack {
 		size_threshold: CacheSize,
 	) -> Self {
 		LruSizedCompactHybridStack {
-			queues: CompactQueueSet::default(),
+			queues: ArenaQueueSet::default(),
 
 			small_capacity,
 			large_capacity,
@@ -208,17 +231,16 @@ impl LruSizedCompactHybridStack {
 	}
 
 	/// The tier the given (currently tracked) key is in, or `None` if the key
-	/// isn't tracked. Derived from the queue tag; there is no tier field.
+	/// isn't tracked. Derived from the queue tag, which is where the tier
+	/// actually lives here: the shared node HAS a `tier` field and this stack
+	/// keeps it in step, but the tag is what it is kept in step WITH.
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
-		self.queue_of(key).map(|queue| match queue {
-			SizeQueue::SmallFast | SizeQueue::LargeFast => Tier::Fast,
-			SizeQueue::SmallSlow | SizeQueue::LargeSlow => Tier::Slow,
-		})
+		self.queue_of(key).map(SizeQueue::tier)
 	}
 
 	/// Which of the four queues the given (currently tracked) key is in.
 	fn queue_of(&self, key: HashedKey) -> Option<SizeQueue> {
-		self.queues.payload(key).map(|p| p.queue)
+		self.queues.payload(key).map(|p| SizeQueue::from_u8(p.queue))
 	}
 
 	/// `true` if `size` classifies as the SMALL segment (`size <
@@ -300,7 +322,7 @@ impl LruSizedCompactHybridStack {
 		payload.size = new_size;
 		payload.dram_resident = new_resident;
 		let delta = payload.migrating() as i64 - old_migrating as i64;
-		let queue = payload.queue;
+		let queue = SizeQueue::from_u8(payload.queue);
 
 		match queue {
 			SizeQueue::SmallFast => {
@@ -333,11 +355,12 @@ impl LruSizedCompactHybridStack {
 	fn touch_fast(&mut self, key: HashedKey) {
 		let Some(payload) = self.queues.payload(key) else { return };
 
+		let queue = SizeQueue::from_u8(payload.queue);
 		let target_small = self.classify(payload.size);
-		let was_slow = payload.queue.is_slow();
+		let was_slow = queue.is_slow();
 		let migrating = payload.migrating();
 
-		match (payload.queue, target_small) {
+		match (queue, target_small) {
 			(SizeQueue::SmallFast, true) => {
 				self.queues.move_front(Q_SMALL_FAST, key);
 				self.settle_small_fast();
@@ -355,12 +378,13 @@ impl LruSizedCompactHybridStack {
 
 		let target_queue = if target_small { SizeQueue::SmallFast } else { SizeQueue::LargeFast };
 
-		self.sub_used(payload.queue, migrating);
-		self.queues.move_to_front_of(payload.queue.slot(), target_queue.slot(), key);
+		self.sub_used(queue, migrating);
+		self.queues.move_to_front_of(queue.slot(), target_queue.slot(), key);
 		self.add_used(target_queue, migrating);
 
 		if let Some(slot) = self.queues.payload_mut(key) {
-			slot.queue = target_queue;
+			slot.queue = target_queue.tag();
+			slot.tier = Some(target_queue.tier());
 		}
 
 		if target_small {
@@ -377,7 +401,7 @@ impl LruSizedCompactHybridStack {
 		// can demote this same key straight back out within the settle call
 		// above, in which case that call already pushed the correct final
 		// entry.
-		if was_slow && self.queues.payload(key).map(|p| p.queue) == Some(target_queue) {
+		if was_slow && self.queues.payload(key).map(|p| p.queue) == Some(target_queue.tag()) {
 			self.migrations.push((key, Tier::Fast));
 		}
 	}
@@ -391,7 +415,7 @@ impl LruSizedCompactHybridStack {
 	/// proportional share of the reserved shared-structure overhead -- remains
 	/// the budget in play, and is loop-invariant: `reserved_shares()` counts
 	/// TRACKED entries, and a demotion only changes which queue an entry is in,
-	/// never whether it is tracked (`CompactQueueSet::len` is the sum over all
+	/// never whether it is tracked (`ArenaQueueSet::len` is the sum over all
 	/// four queues, so a cross-queue move leaves it alone).
 	fn settle_small_fast(&mut self) {
 		let effective = self.effective_small();
@@ -411,7 +435,8 @@ impl LruSizedCompactHybridStack {
 			self.small_slow_used += size;
 
 			if let Some(slot) = self.queues.payload_mut(demote_key) {
-				slot.queue = SizeQueue::SmallSlow;
+				slot.queue = SizeQueue::SmallSlow.tag();
+				slot.tier = Some(Tier::Slow);
 			}
 
 			self.migrations.push((demote_key, Tier::Slow));
@@ -439,7 +464,8 @@ impl LruSizedCompactHybridStack {
 			self.large_slow_used += size;
 
 			if let Some(slot) = self.queues.payload_mut(demote_key) {
-				slot.queue = SizeQueue::LargeSlow;
+				slot.queue = SizeQueue::LargeSlow.tag();
+				slot.tier = Some(Tier::Slow);
 			}
 
 			self.migrations.push((demote_key, Tier::Slow));
@@ -522,7 +548,15 @@ impl PolicyStack for LruSizedCompactHybridStack {
 			self.queues.push_front(
 				Q_SMALL_FAST,
 				key,
-				SizedPayload { queue: SizeQueue::SmallFast, dram_resident, size },
+				NodePayload {
+					size,
+					dram_resident,
+					queue: SizeQueue::SmallFast.tag(),
+					tier: Some(Tier::Fast),
+					phys: Some(Tier::Fast),
+					freq: 0,
+					ts: 0,
+				},
 			);
 			self.small_fast_used += migrating;
 			self.settle_small_fast();
@@ -530,7 +564,15 @@ impl PolicyStack for LruSizedCompactHybridStack {
 			self.queues.push_front(
 				Q_LARGE_FAST,
 				key,
-				SizedPayload { queue: SizeQueue::LargeFast, dram_resident, size },
+				NodePayload {
+					size,
+					dram_resident,
+					queue: SizeQueue::LargeFast.tag(),
+					tier: Some(Tier::Fast),
+					phys: Some(Tier::Fast),
+					freq: 0,
+					ts: 0,
+				},
 			);
 			self.large_fast_used += migrating;
 			self.settle_large_fast();
@@ -545,7 +587,7 @@ impl PolicyStack for LruSizedCompactHybridStack {
 
 	fn remove(&mut self, key: HashedKey) {
 		let Some(payload) = self.queues.payload(key) else { return };
-		let queue = payload.queue;
+		let queue = SizeQueue::from_u8(payload.queue);
 		let size = payload.migrating();
 
 		self.queues.remove(queue.slot(), key);

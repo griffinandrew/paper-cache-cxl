@@ -68,7 +68,7 @@
 //! scan resistance S3-FIFO exists for. So variants 1 and 2 carry an exact
 //! ghost and variants 3 and 4 carry none, deliberately.
 //!
-//! The ghost is a SEPARATE `CompactQueueSet`, not a fourth queue in the same
+//! The ghost is a SEPARATE `ArenaQueueSet`, not a fourth queue in the same
 //! slab, because flat's `insert` does not retire a ghost entry when it admits
 //! through it: a key can be in the ghost AND in main at once, which one
 //! key-indexed slab cannot represent. Exact bare keys, not the fingerprint
@@ -77,8 +77,8 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		compact_queue_set::CompactQueueSet, narrow_resident, watermarks, CacheSize, HashedKey,
-		PolicyStack, Tier,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
 };
@@ -91,53 +91,45 @@ const Q_MAIN_SLOW: usize = 2;
 const Q_GHOST: usize = 0;
 
 /// S3-FIFO's frequency counter saturates at 3, matching `Object::incr_freq`
-/// in `s_three_fifo_stack.rs`.
-const MAX_FREQ: u8 = 3;
+/// in `s_three_fifo_stack.rs`. `u32` because that is [`NodePayload::freq`]'s
+/// width; the saturation, not the width, is what is faithful to flat.
+const MAX_FREQ: u32 = 3;
 
+/// Which of the two LOGICAL queues a key is in. Kept as an enum for
+/// readability -- `NodePayload::queue` is a `u8`, so this converts at the
+/// boundary with `as u8` on the way in and [`Queue::from_u8`] on the way out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum Queue {
-	Small,
-	Main,
+	Small = 0,
+	Main = 1,
 }
 
-/// Per-key bookkeeping, carried in the index value rather than the slab slot.
-///
-/// `freq` REPLACES the `accessed: bool` every other stack in this family
-/// carries -- one byte for one byte. That is the only reason this still fits in
-/// eight bytes, and there is no slack left: adding a field trips the assert
-/// below and invalidates the 72 B/object eviction-stack constant the whole
-/// compact family shares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct S3FifoFaithfulPayload {
-	queue: Queue,
-	/// Which physical main list holds the key. `None` only while
-	/// `queue == Small` and the small queue is slow-resident.
-	tier: Option<Tier>,
-	/// The part of `size` that stays in DRAM in either tier; see `migrating`.
-	dram_resident: u8,
-	/// 0..=3, saturating. Bumped by a hit, read by both eviction paths.
-	freq: u8,
-	size: ObjectSize,
-}
-
-const _: () = assert!(
-	std::mem::size_of::<S3FifoFaithfulPayload>() == 8,
-	"S3FifoFaithfulPayload grew past 8 bytes",
-);
-
-impl S3FifoFaithfulPayload {
-	fn migrating(&self) -> CacheSize {
-		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+impl Queue {
+	/// Total, because the field is a `u8` and only this file ever writes it.
+	fn from_u8(raw: u8) -> Queue {
+		match raw {
+			0 => Queue::Small,
+			_ => Queue::Main,
+		}
 	}
 }
 
+/// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
+///
+/// This stack reads `queue` (as [`Queue`]), `tier`, `freq`, `size` and
+/// `dram_resident`. `freq` is the 0..=3 SATURATING COUNTER that makes this
+/// family faithful, and it is the same field the other S3-FIFO stacks use for
+/// their one-bit reference flag -- a reference bit being a one-bit frequency
+/// counter, the shared node carries one field, not two. `ts` and `phys` belong
+/// to other policies and stay at their defaults here.
 pub struct S3FifoFaithfulCore<const SMALL_IS_FAST: bool, const REPRIEVE: bool> {
 	ratio: f64,
 
-	queues: CompactQueueSet<S3FifoFaithfulPayload>,
+	queues: ArenaQueueSet<NodePayload>,
 
 	/// Exact, FIFO-ordered bare keys. Always empty when `REPRIEVE`.
-	ghost: CompactQueueSet<()>,
+	ghost: ArenaQueueSet<()>,
 
 	small_used: CacheSize,
 	fast_used: CacheSize,
@@ -165,8 +157,8 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 	pub fn new(ratio: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
 		S3FifoFaithfulCore {
 			ratio,
-			queues: CompactQueueSet::default(),
-			ghost: CompactQueueSet::default(),
+			queues: ArenaQueueSet::default(),
+			ghost: ArenaQueueSet::default(),
 			small_used: 0,
 			fast_used: 0,
 			slow_used: 0,
@@ -197,7 +189,7 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
 		let payload = self.queues.payload(key)?;
 
-		match payload.queue {
+		match Queue::from_u8(payload.queue) {
 			Queue::Small if SMALL_IS_FAST => Some(Tier::Fast),
 			Queue::Small => Some(Tier::Slow),
 			Queue::Main => payload.tier,
@@ -242,8 +234,8 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 		raw.saturating_sub(self.reserved_overhead())
 	}
 
-	fn queue_index(payload: &S3FifoFaithfulPayload) -> usize {
-		match payload.queue {
+	fn queue_index(payload: &NodePayload) -> usize {
+		match Queue::from_u8(payload.queue) {
 			Queue::Small => Q_SMALL,
 			Queue::Main => match payload.tier {
 				Some(Tier::Fast) => Q_MAIN_FAST,
@@ -263,7 +255,7 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 	}
 
 	/// `HashList::push_front` de-duplicates because it is key-indexed;
-	/// `CompactQueueSet::push_front` appends unconditionally. Re-queue instead,
+	/// `ArenaQueueSet::push_front` appends unconditionally. Re-queue instead,
 	/// which is the same fix MRU needed in 01d3e62.
 	fn ghost_push(&mut self, key: HashedKey) {
 		if self.ghost.contains(key) {
@@ -309,7 +301,7 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 		}
 
 		if let Some(p) = self.queues.payload_mut(key) {
-			p.queue = Queue::Main;
+			p.queue = Queue::Main as u8;
 			p.tier = Some(Tier::Fast);
 		}
 
@@ -432,7 +424,7 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 				self.slow_used += bytes;
 
 				if let Some(p) = self.queues.payload_mut(key) {
-					p.queue = Queue::Main;
+					p.queue = Queue::Main as u8;
 					p.tier = Some(Tier::Slow);
 				}
 
@@ -545,12 +537,14 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> PolicyStack
 			self.queues.push_front(
 				Q_MAIN_FAST,
 				key,
-				S3FifoFaithfulPayload {
-					queue: Queue::Main,
-					tier: Some(Tier::Fast),
-					dram_resident,
-					freq: 0,
+				NodePayload {
 					size,
+					freq: 0,
+					ts: 0,
+					queue: Queue::Main as u8,
+					tier: Some(Tier::Fast),
+					phys: Some(Tier::Fast),
+					dram_resident,
 				},
 			);
 			self.fast_used += bytes;
@@ -566,12 +560,14 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> PolicyStack
 		self.queues.push_front(
 			Q_SMALL,
 			key,
-			S3FifoFaithfulPayload {
-				queue: Queue::Small,
-				tier: Self::small_tier(),
-				dram_resident,
-				freq: 0,
+			NodePayload {
 				size,
+				freq: 0,
+				ts: 0,
+				queue: Queue::Small as u8,
+				tier: Self::small_tier(),
+				phys: Self::small_tier(),
+				dram_resident,
 			},
 		);
 
@@ -788,7 +784,7 @@ mod fidelity_tests {
 		let evicted = s.evict_one();
 		assert_ne!(evicted, Some(0), "a twice-seen key was evicted rather than promoted");
 		assert!(s.contains(0));
-		assert_eq!(s.queues.payload(0).unwrap().queue, Queue::Main);
+		assert_eq!(Queue::from_u8(s.queues.payload(0).unwrap().queue), Queue::Main);
 		assert_eq!(s.queues.payload(0).unwrap().freq, MAX_FREQ, "freq lost across promotion");
 	}
 
@@ -810,7 +806,7 @@ mod fidelity_tests {
 			assert_eq!(s.evict_one(), Some(key));
 			assert!(s.is_ghost(key));
 			s.insert(key, 1_024);
-			assert_eq!(s.queues.payload(key).unwrap().queue, Queue::Main);
+			assert_eq!(Queue::from_u8(s.queues.payload(key).unwrap().queue), Queue::Main);
 		}
 
 		// Main front-to-back is now [10, 11], so 11 is the tail and is swept
@@ -852,7 +848,11 @@ mod fidelity_tests {
 
 		s.insert(7, 1_024);
 		let p = s.queues.payload(7).unwrap();
-		assert_eq!(p.queue, Queue::Main, "a ghost hit should skip probation");
+		assert_eq!(
+			Queue::from_u8(p.queue),
+			Queue::Main,
+			"a ghost hit should skip probation",
+		);
 		assert_eq!(p.freq, 0, "a ghost hit should not confer frequency");
 		assert!(s.is_ghost(7), "flat does not retire the ghost entry on admission");
 	}
@@ -918,7 +918,7 @@ mod fidelity_tests {
 			}
 			assert!(rep.contains(key), "key {key} was lost rather than reprieved");
 			assert_eq!(
-				rep.queues.payload(key).unwrap().queue,
+				Queue::from_u8(rep.queues.payload(key).unwrap().queue),
 				Queue::Main,
 				"key {key} should have been spliced into main",
 			);

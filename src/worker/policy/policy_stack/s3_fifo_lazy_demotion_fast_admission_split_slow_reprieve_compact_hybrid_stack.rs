@@ -93,8 +93,8 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		compact_queue_set::CompactQueueSet, narrow_resident, watermarks, CacheSize, HashedKey,
-		PolicyStack, Tier,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
 };
@@ -110,15 +110,21 @@ const Q_SLOW_TAIL: usize = 3;
 const SLOW_HEAD_RATIO: f64 = 0.5;
 
 /// Which of the four live orders a key currently sits in. Doubles as the tier
-/// tag: with the slow tier physically split there is no longer any need for a
-/// separate `Option<Tier>` field alongside a coarser queue tag, which is why
-/// this payload has one fewer field than `S3FifoPayload` and still packs to 8.
+/// tag: with the slow tier physically split, the queue alone says which tier a
+/// key is in, which is why this stack never needed a tier field of its own.
+///
+/// The shared node stores this as a plain `u8`, so the enum is kept purely for
+/// readability and converted at that one boundary: `Queue as u8` on the way in,
+/// [`Queue::from_u8`] on the way out. The discriminants are pinned to the `Q_*`
+/// queue indices they name, so the tag and the slot it is threaded into are the
+/// same number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum Queue {
-	OneAccess,
-	Fast,
-	SlowHead,
-	SlowTail,
+	OneAccess = Q_ONE_ACCESS as u8,
+	Fast = Q_FAST as u8,
+	SlowHead = Q_SLOW_HEAD as u8,
+	SlowTail = Q_SLOW_TAIL as u8,
 }
 
 impl Queue {
@@ -132,38 +138,37 @@ impl Queue {
 	fn is_slow(self) -> bool {
 		matches!(self, Queue::SlowHead | Queue::SlowTail)
 	}
-}
 
-/// Combined per-key bookkeeping, carried in the index value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SplitSlowPayload {
-	queue: Queue,
-	/// The part of `size` that stays in DRAM in either tier; see `migrating`.
-	dram_resident: u8,
-	accessed: bool,
-	size: ObjectSize,
-}
-
-/// Pinned, exactly as `S3FifoEntry` is in the stack this replaces.
-const _: () = assert!(
-	std::mem::size_of::<SplitSlowPayload>() == 8,
-	"SplitSlowPayload grew past 8 bytes",
-);
-
-impl SplitSlowPayload {
-	/// The bytes that actually move between tiers when this object migrates.
-	/// `size` is `base_size`, which also counts the DRAM-resident remainder
-	/// (key + expiry field, already inside `shared_overhead`); charging those
-	/// to the tier counters double-counted every fast-tier object.
-	fn migrating(&self) -> CacheSize {
-		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+	/// The inverse of `as u8`. `NodePayload::queue` is only ever written here
+	/// from a `Queue as u8`, so the catch-all arm is unreachable and `SlowTail`
+	/// is the only value it could stand for.
+	fn from_u8(tag: u8) -> Queue {
+		match tag {
+			0 => Queue::OneAccess,
+			1 => Queue::Fast,
+			2 => Queue::SlowHead,
+			_ => Queue::SlowTail,
+		}
 	}
 }
 
+/// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
+///
+/// This stack reads `queue` (as [`Queue`]), `freq`, `size` and `dram_resident`.
+/// `freq` carries the S3-FIFO REFERENCE BIT: set is `freq = 1` and tested as
+/// `freq != 0`, since a reference bit is a one-bit frequency counter.
+///
+/// The QUEUE remains the tier's single source of truth here -- this design's
+/// whole point is that the split slow tier makes a separate tier field
+/// redundant -- but `tier` and `phys` are kept in step with it at every queue
+/// write (`Some(queue.tier())`), so the shared node never carries a tier that
+/// contradicts the order the key is actually threaded into. `tier` is therefore
+/// never `None` in this stack, and no match here has a `None` arm to spell out.
+/// `ts` belongs to other policies and stays at its default.
 pub struct S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	/// All four orders -- one-access, main-fast, slow-head, slow-tail -- over a
 	/// single slab. `MAX_QUEUES` is 4, which this uses in full.
-	queues: CompactQueueSet<SplitSlowPayload>,
+	queues: ArenaQueueSet<NodePayload>,
 
 	one_access_ratio: f64,
 	one_access_capacity: CacheSize,
@@ -185,7 +190,7 @@ pub struct S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	pub fn new(one_access_ratio: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
 		S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
-			queues: CompactQueueSet::default(),
+			queues: ArenaQueueSet::default(),
 			one_access_ratio,
 			one_access_capacity: (one_access_ratio * max_size as f64) as CacheSize,
 			one_access_used: 0,
@@ -258,14 +263,14 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	}
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
-		self.queues.payload(key).map(|payload| payload.queue.tier())
+		self.queues.payload(key).map(|payload| Queue::from_u8(payload.queue).tier())
 	}
 
 	/// Returns `true` if `key` currently sits in the older (`slow_tail`) slow
 	/// segment -- i.e. it has already survived a crossing check. Exposed for
 	/// tests, exactly as on the baseline.
 	pub fn is_in_slow_tail(&self, key: HashedKey) -> bool {
-		self.queues.payload(key).map(|payload| payload.queue) == Some(Queue::SlowTail)
+		self.queues.payload(key).map(|payload| payload.queue) == Some(Queue::SlowTail as u8)
 	}
 
 	/// `new_resident` refreshes the entry's DRAM-resident remainder: a re-set
@@ -277,7 +282,7 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 		payload.size = new_size;
 		payload.dram_resident = new_resident;
 		let delta = payload.migrating() as i64 - old_migrating as i64;
-		let queue = payload.queue;
+		let queue = Queue::from_u8(payload.queue);
 
 		let counter = match queue {
 			Queue::OneAccess => &mut self.one_access_used,
@@ -290,7 +295,7 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	}
 
 	fn touch(&mut self, key: HashedKey) {
-		match self.queues.payload(key).map(|p| p.queue) {
+		match self.queues.payload(key).map(|p| Queue::from_u8(p.queue)) {
 			Some(Queue::OneAccess) => self.promote_from_one_access(key),
 
 			// Lazy: a hit on any main-queue key only sets the reference bit.
@@ -307,7 +312,7 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	/// lives in the index value: one probe, no slab access, no queue movement.
 	fn mark_accessed(&mut self, key: HashedKey) {
 		if let Some(p) = self.queues.payload_mut(key) {
-			p.accessed = true;
+			p.freq = 1;
 		}
 	}
 
@@ -322,8 +327,10 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 		self.one_access_used = self.one_access_used.saturating_sub(size_bytes);
 
 		if let Some(p) = self.queues.payload_mut(key) {
-			p.queue = Queue::Fast;
-			p.accessed = false;
+			p.queue = Queue::Fast as u8;
+			p.tier = Some(Queue::Fast.tier());
+			p.phys = Some(Queue::Fast.tier());
+			p.freq = 0;
 		}
 
 		self.fast_used += size_bytes;
@@ -338,9 +345,9 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	fn give_second_chance(&mut self, key: HashedKey) {
 		let Some(payload) = self.queues.payload(key) else { return };
 		let size = payload.migrating();
-		let was_slow = payload.queue.is_slow();
+		let was_slow = Queue::from_u8(payload.queue).is_slow();
 
-		match payload.queue {
+		match Queue::from_u8(payload.queue) {
 			// Only reachable from `evict_one`'s fast-tail fallback (nothing has
 			// ever been demoted): reorder within the fast list, no tier change
 			// and no byte movement.
@@ -364,8 +371,10 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 		}
 
 		if let Some(p) = self.queues.payload_mut(key) {
-			p.queue = Queue::Fast;
-			p.accessed = false;
+			p.queue = Queue::Fast as u8;
+			p.tier = Some(Queue::Fast.tier());
+			p.phys = Some(Queue::Fast.tier());
+			p.freq = 0;
 		}
 
 		self.settle_fast_tier();
@@ -377,7 +386,7 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 		// all -- a redundant Fast->Fast entry would make `PolicyWorker` rebuild
 		// an identical buffer for nothing, and `give_second_chance` fires far
 		// more often in this variant (every crossing).
-		if was_slow && self.queues.payload(key).map(|p| p.queue) == Some(Queue::Fast) {
+		if was_slow && self.queues.payload(key).map(|p| p.queue) == Some(Queue::Fast as u8) {
 			self.migrations.push((key, Tier::Fast));
 		}
 	}
@@ -408,13 +417,13 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 		while self.fast_used > low_water {
 			let Some(candidate) = self.queues.back(Q_FAST) else { break };
 
-			let accessed = self.queues.payload(candidate).map(|p| p.accessed).unwrap_or(false);
+			let accessed = self.queues.payload(candidate).map(|p| p.freq != 0).unwrap_or(false);
 
 			if accessed {
 				self.queues.move_front(Q_FAST, candidate);
 
 				if let Some(p) = self.queues.payload_mut(candidate) {
-					p.accessed = false;
+					p.freq = 0;
 				}
 
 				continue;
@@ -425,7 +434,9 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 			self.queues.move_to_front_of(Q_FAST, Q_SLOW_HEAD, candidate);
 
 			if let Some(p) = self.queues.payload_mut(candidate) {
-				p.queue = Queue::SlowHead;
+				p.queue = Queue::SlowHead as u8;
+				p.tier = Some(Queue::SlowHead.tier());
+				p.phys = Some(Queue::SlowHead.tier());
 			}
 
 			self.fast_used = self.fast_used.saturating_sub(size);
@@ -456,7 +467,7 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 
 			let Some(candidate) = self.queues.back(Q_SLOW_HEAD) else { break };
 
-			let accessed = self.queues.payload(candidate).map(|p| p.accessed).unwrap_or(false);
+			let accessed = self.queues.payload(candidate).map(|p| p.freq != 0).unwrap_or(false);
 
 			if accessed {
 				self.give_second_chance(candidate);
@@ -468,7 +479,9 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 			self.queues.move_to_front_of(Q_SLOW_HEAD, Q_SLOW_TAIL, candidate);
 
 			if let Some(p) = self.queues.payload_mut(candidate) {
-				p.queue = Queue::SlowTail;
+				p.queue = Queue::SlowTail as u8;
+				p.tier = Some(Queue::SlowTail.tier());
+				p.phys = Some(Queue::SlowTail.tier());
 			}
 
 			self.slow_head_used = self.slow_head_used.saturating_sub(size);
@@ -501,8 +514,10 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 			self.queues.move_to_front_of(Q_ONE_ACCESS, Q_SLOW_HEAD, key);
 
 			if let Some(p) = self.queues.payload_mut(key) {
-				p.queue = Queue::SlowHead;
-				p.accessed = false;
+				p.queue = Queue::SlowHead as u8;
+				p.tier = Some(Queue::SlowHead.tier());
+				p.phys = Some(Queue::SlowHead.tier());
+				p.freq = 0;
 			}
 
 			self.slow_head_used += size;
@@ -542,11 +557,14 @@ impl PolicyStack for S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybr
 		self.queues.push_front(
 			Q_ONE_ACCESS,
 			key,
-			SplitSlowPayload {
-				queue: Queue::OneAccess,
-				dram_resident,
-				accessed: false,
+			NodePayload {
 				size,
+				freq: 0,
+				ts: 0,
+				queue: Queue::OneAccess as u8,
+				tier: Some(Queue::OneAccess.tier()),
+				phys: Some(Queue::OneAccess.tier()),
+				dram_resident,
 			},
 		);
 		self.one_access_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
@@ -566,7 +584,7 @@ impl PolicyStack for S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybr
 		let Some(payload) = self.queues.payload(key) else { return };
 		let size = payload.migrating();
 
-		match payload.queue {
+		match Queue::from_u8(payload.queue) {
 			Queue::OneAccess => {
 				self.queues.remove(Q_ONE_ACCESS, key);
 				self.one_access_used = self.one_access_used.saturating_sub(size);
@@ -624,7 +642,7 @@ impl PolicyStack for S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybr
 				(self.queues.back(Q_FAST)?, Queue::Fast)
 			};
 
-			let accessed = self.queues.payload(key).map(|p| p.accessed).unwrap_or(false);
+			let accessed = self.queues.payload(key).map(|p| p.freq != 0).unwrap_or(false);
 
 			if accessed {
 				self.give_second_chance(key);

@@ -66,7 +66,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		compact_queue_set::CompactQueueSet, narrow_resident, watermarks, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -93,30 +93,14 @@ fn lazy_window() -> f64 {
 	})
 }
 
-/// Per-key bookkeeping. `tier` is what the POLICY believes; `phys` is where the
-/// bytes actually are. They differ exactly for candidates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LazyCopyPayload {
-	tier: Tier,
-	phys: Tier,
-	dram_resident: u8,
-	size: ObjectSize,
-}
-
-const _: () = assert!(
-	std::mem::size_of::<LazyCopyPayload>() == 8,
-	"LazyCopyPayload grew past 8 bytes -- `phys` was meant to fit the padding \
-	 `LruPayload` already had",
-);
-
-impl LazyCopyPayload {
-	fn migrating(&self) -> CacheSize {
-		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
-	}
-}
-
+/// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
+///
+/// This stack is the only one that reads `phys`: `tier` is what the POLICY
+/// believes and `phys` is where the bytes actually are, and they differ exactly
+/// for candidates. It also reads `size` and `dram_resident`; `freq`, `ts` and
+/// `queue` belong to other policies and stay at their defaults here.
 pub struct LruLazyCopyCompactHybridStack {
-	list: CompactQueueSet<LazyCopyPayload>,
+	list: ArenaQueueSet<NodePayload>,
 
 	/// The HARDWARE budget: bytes of value data allowed on the fast node.
 	dram_capacity: CacheSize,
@@ -156,7 +140,7 @@ pub struct LruLazyCopyCompactHybridStack {
 impl LruLazyCopyCompactHybridStack {
 	pub fn new(dram_capacity: CacheSize) -> Self {
 		LruLazyCopyCompactHybridStack {
-			list: CompactQueueSet::default(),
+			list: ArenaQueueSet::default(),
 			dram_capacity,
 			fast_used: 0,
 			slow_used: 0,
@@ -208,12 +192,12 @@ impl LruLazyCopyCompactHybridStack {
 	}
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
-		self.list.payload(key).map(|p| p.tier)
+		self.list.payload(key).and_then(|p| p.tier)
 	}
 
 	/// Where the bytes actually are, as against `tier_of`'s belief.
 	pub fn physical_tier_of(&self, key: HashedKey) -> Option<Tier> {
-		self.list.payload(key).map(|p| p.phys)
+		self.list.payload(key).and_then(|p| p.phys)
 	}
 
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize, new_resident: u8) {
@@ -226,11 +210,23 @@ impl LruLazyCopyCompactHybridStack {
 		let (tier, phys) = (slot.tier, slot.phys);
 
 		match tier {
-			Tier::Fast => self.fast_used = (self.fast_used as i64 + delta).max(0) as CacheSize,
-			Tier::Slow => self.slow_used = (self.slow_used as i64 + delta).max(0) as CacheSize,
+			Some(Tier::Fast) => {
+				self.fast_used = (self.fast_used as i64 + delta).max(0) as CacheSize
+			},
+
+			Some(Tier::Slow) => {
+				self.slow_used = (self.slow_used as i64 + delta).max(0) as CacheSize
+			},
+
+			// The shared node makes `tier` optional because the 2Q and S3-FIFO
+			// families have queues with no tier of their own. This stack writes a
+			// tier on admission and never clears it, so this arm is unreachable --
+			// and it is spelled out rather than papered over with `unwrap_or`,
+			// which would silently pick a tier if that ever stopped being true.
+			None => {},
 		}
 
-		if phys == Tier::Fast {
+		if phys == Some(Tier::Fast) {
 			self.dram_used = (self.dram_used as i64 + delta).max(0) as CacheSize;
 		}
 	}
@@ -270,14 +266,14 @@ impl LruLazyCopyCompactHybridStack {
 
 		let mut promoted_physically = false;
 
-		if before.tier != Tier::Fast {
+		if before.tier != Some(Tier::Fast) {
 			let size = before.migrating();
 			self.slow_used = self.slow_used.saturating_sub(size);
 			self.fast_used += size;
 			self.fast_count += 1;
 
 			if let Some(slot) = self.list.payload_mut(key) {
-				slot.tier = Tier::Fast;
+				slot.tier = Some(Tier::Fast);
 			}
 
 			if self.fast_boundary.is_none() {
@@ -288,12 +284,12 @@ impl LruLazyCopyCompactHybridStack {
 				// Candidate: the bytes are still in DRAM. Relabel and skip the
 				// crossing entirely -- this is the round trip that does not
 				// happen.
-				Tier::Fast => self.copies_avoided += 1,
+				Some(Tier::Fast) => self.copies_avoided += 1,
 
 				// Genuinely in the slow tier; it has to be copied back.
-				Tier::Slow => {
+				Some(Tier::Slow) => {
 					if let Some(slot) = self.list.payload_mut(key) {
-						slot.phys = Tier::Fast;
+						slot.phys = Some(Tier::Fast);
 					}
 
 					self.dram_used += size;
@@ -303,6 +299,11 @@ impl LruLazyCopyCompactHybridStack {
 						self.phys_boundary = Some(key);
 					}
 				},
+
+				// `phys` is optional only because every other policy leaves it
+				// unset. This stack writes it on admission alongside `tier` and
+				// never clears it, so this arm is unreachable here.
+				None => {},
 			}
 		}
 
@@ -313,7 +314,7 @@ impl LruLazyCopyCompactHybridStack {
 		// can reclaim it straight back out within the same pass, in which case
 		// `reclaim_dram` already pushed the correct final entry.
 		if promoted_physically
-			&& self.list.payload(key).map(|p| p.phys) == Some(Tier::Fast)
+			&& self.list.payload(key).and_then(|p| p.phys) == Some(Tier::Fast)
 		{
 			self.migrations.push((key, Tier::Fast));
 		}
@@ -336,7 +337,7 @@ impl LruLazyCopyCompactHybridStack {
 			let next = self.list.before(key);
 
 			if let Some(slot) = self.list.payload_mut(key) {
-				slot.tier = Tier::Slow;
+				slot.tier = Some(Tier::Slow);
 			}
 
 			self.fast_used = self.fast_used.saturating_sub(size);
@@ -363,7 +364,7 @@ impl LruLazyCopyCompactHybridStack {
 			let next = self.list.before(key);
 
 			if let Some(slot) = self.list.payload_mut(key) {
-				slot.phys = Tier::Slow;
+				slot.phys = Some(Tier::Slow);
 			}
 
 			self.dram_used = self.dram_used.saturating_sub(size);
@@ -388,15 +389,19 @@ impl LruLazyCopyCompactHybridStack {
 		}
 
 		match p.tier {
-			Tier::Fast => {
+			Some(Tier::Fast) => {
 				self.fast_used = self.fast_used.saturating_sub(size);
 				self.fast_count = self.fast_count.saturating_sub(1);
 			},
 
-			Tier::Slow => self.slow_used = self.slow_used.saturating_sub(size),
+			Some(Tier::Slow) => self.slow_used = self.slow_used.saturating_sub(size),
+
+			// Unreachable here for the reason given in `resize_key`: this stack
+			// always records a tier.
+			None => {},
 		}
 
-		if p.phys == Tier::Fast {
+		if p.phys == Some(Tier::Fast) {
 			self.dram_used = self.dram_used.saturating_sub(size);
 		}
 	}
@@ -433,7 +438,15 @@ impl PolicyStack for LruLazyCopyCompactHybridStack {
 		self.list.push_front(
 			Q_LRU,
 			key,
-			LazyCopyPayload { tier: Tier::Fast, phys: Tier::Fast, dram_resident, size },
+			NodePayload {
+				size,
+				dram_resident,
+				tier: Some(Tier::Fast),
+				phys: Some(Tier::Fast),
+				freq: 0,
+				ts: 0,
+				queue: 0,
+			},
 		);
 
 		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);

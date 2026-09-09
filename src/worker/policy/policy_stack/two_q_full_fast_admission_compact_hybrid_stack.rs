@@ -14,8 +14,8 @@
 //! `entries` map holding the combined payload. Four indexes, for a population
 //! where every key is in exactly one of the three queues.
 //!
-//! Here a single [`CompactQueueSet`] holds all three orders over one slab, with
-//! the payload in the index value. The two transitions this design is built
+//! Here a single [`ArenaQueueSet`] holds all three orders over one slab, with
+//! the payload in the slot itself. The two transitions this design is built
 //! around -- `a1_in -> a1_out` (a DRAM->PMEM demotion) and `a1_out -> am` (a
 //! PMEM->DRAM promotion) -- become an unlink and a relink of the SAME slot
 //! rather than a hash-indexed removal from one list and an insertion into
@@ -63,8 +63,8 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		compact_queue_set::CompactQueueSet, narrow_resident, watermarks, CacheSize, HashedKey,
-		PolicyStack, Tier,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
 };
@@ -81,43 +81,38 @@ const Q_AM: usize = 2;
 /// `A1Out` is Slow *structurally*, so neither stores a tier. Only `Am` is
 /// segmented and therefore carries one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum Queue {
-	A1In,
-	A1Out,
-	Am,
+	A1In = 0,
+	A1Out = 1,
+	Am = 2,
 }
 
-/// Combined per-key bookkeeping, carried in the index value.
-///
-/// Invariant: `tier.is_some()` iff `queue == Queue::Am`. A key is resident in
-/// exactly one of the three queues, which is what keeps the four byte counters
-/// and two object counters honest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TwoQFullFaPayload {
-	queue: Queue,
-	tier: Option<Tier>,
-	/// The part of `size` that stays in DRAM in either tier; see `migrating`.
-	dram_resident: u8,
-	size: ObjectSize,
-}
-
-/// Pinned, exactly as `TwoQEntry` is in the stack this replaces. The payload
-/// rides in the index bucket, so growth here costs bytes on every tracked key.
-/// A third `Queue` variant is free: the tag was already a byte.
-const _: () = assert!(
-	std::mem::size_of::<TwoQFullFaPayload>() == 8,
-	"TwoQFullFaPayload grew past 8 bytes",
-);
-
-impl TwoQFullFaPayload {
-	/// Bytes that actually move between tiers.
-	fn migrating(&self) -> CacheSize {
-		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+impl Queue {
+	/// The shared node stores `queue` as a bare `u8`, so this is the one
+	/// place the tag becomes an enum again. Every write goes the other way
+	/// through `Queue as u8`, which is why the last arm cannot be reached.
+	#[inline]
+	fn from_u8(tag: u8) -> Queue {
+		match tag {
+			0 => Queue::A1In,
+			1 => Queue::A1Out,
+			2 => Queue::Am,
+			_ => unreachable!("2q-full-fast-admission-compact-hybrid queue tag out of range: {tag}"),
+		}
 	}
 }
 
+/// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
+/// This stack reads `queue`, `tier`, `size` and `dram_resident`; `freq`, `ts`
+/// and `phys` belong to other policies and stay at their defaults here.
+///
+/// Invariant: `tier.is_some()` iff `queue == Queue::Am`. A key is resident in
+/// exactly one of the three queues, which is what keeps the four byte counters
+/// and two object counters honest. `queue` is a bare `u8` in the shared node,
+/// so [`Queue`] converts at the boundary.
 pub struct TwoQFullFastAdmissionCompactHybridStack {
-	queues: CompactQueueSet<TwoQFullFaPayload>,
+	queues: ArenaQueueSet<NodePayload>,
 
 	k_in: f64,
 	k_out: f64,
@@ -163,7 +158,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 		fast_capacity: CacheSize,
 	) -> Self {
 		TwoQFullFastAdmissionCompactHybridStack {
-			queues: CompactQueueSet::default(),
+			queues: ArenaQueueSet::default(),
 			k_in,
 			k_out,
 			a1_in_capacity: (k_in * max_size as f64) as CacheSize,
@@ -216,7 +211,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
 		let payload = self.queues.payload(key)?;
 
-		match payload.queue {
+		match Queue::from_u8(payload.queue) {
 			Queue::A1In => Some(Tier::Fast),
 			Queue::A1Out => Some(Tier::Slow),
 			Queue::Am => payload.tier,
@@ -235,7 +230,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 		payload.size = new_size;
 		payload.dram_resident = new_resident;
 		let delta = payload.migrating() as i64 - old_migrating as i64;
-		let (queue, tier) = (payload.queue, payload.tier);
+		let (queue, tier) = (Queue::from_u8(payload.queue), payload.tier);
 
 		match (queue, tier) {
 			(Queue::A1In, _) => {
@@ -266,7 +261,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 	/// silent no-op; and the key is already Fast, so there is nothing to
 	/// migrate either.
 	fn touch(&mut self, key: HashedKey) {
-		match self.queues.payload(key).map(|p| p.queue) {
+		match self.queues.payload(key).map(|p| Queue::from_u8(p.queue)) {
 			Some(Queue::A1In) => {},
 			Some(Queue::A1Out) => self.promote_from_a1_out(key),
 			Some(Queue::Am) => self.touch_am(key),
@@ -296,7 +291,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 			self.queues.move_to_front_of(Q_A1_IN, Q_A1_OUT, key);
 
 			if let Some(p) = self.queues.payload_mut(key) {
-				p.queue = Queue::A1Out;
+				p.queue = Queue::A1Out as u8;
 				p.tier = None;
 			}
 
@@ -322,7 +317,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 		self.a1_out_used = self.a1_out_used.saturating_sub(size_bytes);
 
 		if let Some(p) = self.queues.payload_mut(key) {
-			p.queue = Queue::Am;
+			p.queue = Queue::Am as u8;
 			p.tier = Some(Tier::Fast);
 		}
 
@@ -519,11 +514,15 @@ impl PolicyStack for TwoQFullFastAdmissionCompactHybridStack {
 		// Brand-new key: `a1_in` first, which is FAST here.
 		self.settle_a1_in(size);
 
-		self.queues.push_front(
-			Q_A1_IN,
-			key,
-			TwoQFullFaPayload { queue: Queue::A1In, tier: None, dram_resident, size },
-		);
+		self.queues.push_front(Q_A1_IN, key, NodePayload {
+			size,
+			dram_resident,
+			tier: None,
+			phys: None,
+			freq: 0,
+			ts: 0,
+			queue: Queue::A1In as u8,
+		});
 		self.a1_in_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 
 		// Deliberately does NOT re-settle the fast tier: the reservation carved
@@ -543,7 +542,7 @@ impl PolicyStack for TwoQFullFastAdmissionCompactHybridStack {
 		let Some(payload) = self.queues.payload(key) else { return };
 		let size = payload.migrating();
 
-		match payload.queue {
+		match Queue::from_u8(payload.queue) {
 			Queue::A1In => {
 				self.queues.remove(Q_A1_IN, key);
 				self.a1_in_used = self.a1_in_used.saturating_sub(size);

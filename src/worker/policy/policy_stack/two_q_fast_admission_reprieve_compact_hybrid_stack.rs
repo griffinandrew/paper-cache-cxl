@@ -47,8 +47,8 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		compact_queue_set::CompactQueueSet, narrow_resident, watermarks, CacheSize, HashedKey,
-		PolicyStack, Tier,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
 };
@@ -59,40 +59,35 @@ const Q_FIFO: usize = 0;
 const Q_MAIN: usize = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum Queue {
-	Fifo,
-	Main,
+	Fifo = 0,
+	Main = 1,
 }
 
-/// Combined per-key bookkeeping, carried in the index value.
-///
-/// `tier` is `None` while `queue == Fifo`: the FIFO is entirely slow-tier, so a
-/// key there has no tier of its own to record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TwoQFaReprievePayload {
-	queue: Queue,
-	tier: Option<Tier>,
-	/// The part of `size` that stays in DRAM in either tier; see `migrating`.
-	dram_resident: u8,
-	size: ObjectSize,
-}
-
-/// Pinned, exactly as `TwoQEntry` is in the stack this replaces. The payload
-/// rides in the index bucket, so growth here costs bytes on every tracked key.
-const _: () = assert!(
-	std::mem::size_of::<TwoQFaReprievePayload>() == 8,
-	"TwoQFaReprievePayload grew past 8 bytes",
-);
-
-impl TwoQFaReprievePayload {
-	/// Bytes that actually move between tiers.
-	fn migrating(&self) -> CacheSize {
-		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+impl Queue {
+	/// The shared node stores `queue` as a bare `u8`, so this is the one
+	/// place the tag becomes an enum again. Every write goes the other way
+	/// through `Queue as u8`, which is why the last arm cannot be reached.
+	#[inline]
+	fn from_u8(tag: u8) -> Queue {
+		match tag {
+			0 => Queue::Fifo,
+			1 => Queue::Main,
+			_ => unreachable!("2q-fast-admission-reprieve-compact-hybrid queue tag out of range: {tag}"),
+		}
 	}
 }
 
+/// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
+/// This stack reads `queue`, `tier`, `size` and `dram_resident`; `freq`, `ts`
+/// and `phys` belong to other policies and stay at their defaults here.
+///
+/// `tier` is `None` while `queue == Fifo`: the FIFO is entirely slow-tier, so a
+/// key there has no tier of its own to record. `queue` is a bare `u8` in the
+/// shared node, so [`Queue`] converts at the boundary.
 pub struct TwoQFastAdmissionReprieveCompactHybridStack {
-	queues: CompactQueueSet<TwoQFaReprievePayload>,
+	queues: ArenaQueueSet<NodePayload>,
 
 	k_in: f64,
 
@@ -117,7 +112,7 @@ pub struct TwoQFastAdmissionReprieveCompactHybridStack {
 impl TwoQFastAdmissionReprieveCompactHybridStack {
 	pub fn new(k_in: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
 		TwoQFastAdmissionReprieveCompactHybridStack {
-			queues: CompactQueueSet::default(),
+			queues: ArenaQueueSet::default(),
 			k_in,
 			fifo_capacity: (k_in * max_size as f64) as CacheSize,
 			fifo_used: 0,
@@ -193,7 +188,7 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
 		let payload = self.queues.payload(key)?;
-		match payload.queue {
+		match Queue::from_u8(payload.queue) {
 			Queue::Fifo => Some(Tier::Fast),
 			Queue::Main => payload.tier,
 		}
@@ -206,7 +201,7 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 		payload.size = new_size;
 		payload.dram_resident = new_resident;
 		let delta = payload.migrating() as i64 - old_migrating as i64;
-		let (queue, tier) = (payload.queue, payload.tier);
+		let (queue, tier) = (Queue::from_u8(payload.queue), payload.tier);
 
 		match (queue, tier) {
 			(Queue::Fifo, _) => {
@@ -226,7 +221,7 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 	}
 
 	fn touch(&mut self, key: HashedKey) {
-		match self.queues.payload(key).map(|p| p.queue) {
+		match self.queues.payload(key).map(|p| Queue::from_u8(p.queue)) {
 			Some(Queue::Fifo) => self.promote_from_fifo(key),
 			Some(Queue::Main) => self.touch_main_fast(key),
 			None => {},
@@ -246,7 +241,7 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 		self.fifo_used = self.fifo_used.saturating_sub(size_bytes);
 
 		if let Some(p) = self.queues.payload_mut(key) {
-			p.queue = Queue::Main;
+			p.queue = Queue::Main as u8;
 			p.tier = Some(Tier::Fast);
 		}
 
@@ -373,7 +368,7 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 			self.fifo_used = self.fifo_used.saturating_sub(size);
 
 			if let Some(p) = self.queues.payload_mut(key) {
-				p.queue = Queue::Main;
+				p.queue = Queue::Main as u8;
 				p.tier = Some(Tier::Slow);
 			}
 
@@ -417,11 +412,15 @@ impl PolicyStack for TwoQFastAdmissionReprieveCompactHybridStack {
 			return;
 		}
 
-		self.queues.push_front(
-			Q_FIFO,
-			key,
-			TwoQFaReprievePayload { queue: Queue::Fifo, tier: None, dram_resident, size },
-		);
+		self.queues.push_front(Q_FIFO, key, NodePayload {
+			size,
+			dram_resident,
+			tier: None,
+			phys: None,
+			freq: 0,
+			ts: 0,
+			queue: Queue::Fifo as u8,
+		});
 		self.fifo_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 
 		// The reprieve: an admission that pushes the FIFO over budget spills
@@ -439,7 +438,7 @@ impl PolicyStack for TwoQFastAdmissionReprieveCompactHybridStack {
 		let Some(payload) = self.queues.payload(key) else { return };
 		let size = payload.migrating();
 
-		match payload.queue {
+		match Queue::from_u8(payload.queue) {
 			Queue::Fifo => {
 				self.queues.remove(Q_FIFO, key);
 				self.fifo_used = self.fifo_used.saturating_sub(size);

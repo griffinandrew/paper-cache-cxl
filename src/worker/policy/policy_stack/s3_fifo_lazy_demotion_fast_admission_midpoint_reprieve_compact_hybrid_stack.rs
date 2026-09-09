@@ -86,8 +86,8 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		compact_queue_set::CompactQueueSet, narrow_resident, watermarks, CacheSize, HashedKey,
-		PolicyStack, Tier,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
 };
@@ -99,45 +99,45 @@ const Q_MAIN_SLOW: usize = 2;
 
 /// Which live queue a key currently belongs to. `Main` covers both physical
 /// main lists; `tier` says which one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Queue {
-	OneAccess,
-	Main,
-}
-
-/// Combined per-key bookkeeping, carried in the index value.
 ///
-/// `tier`/`accessed` are only meaningful while `queue == Main`. `tier` is
-/// redundant with which of the two main lists the key is physically in, but
-/// kept because `tier_of()` and the `PolicyWorker` migration path both want it
-/// as a cheap single-probe lookup rather than a pair of `contains()` probes --
-/// which is exactly what the index-value layout makes it here.
+/// The shared node stores this as a plain `u8`, so the enum is kept purely for
+/// readability and converted at that one boundary: `Queue as u8` on the way in,
+/// [`Queue::from_u8`] on the way out. Every match below still reads as the enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct S3FifoMidpointReprievePayload {
-	queue: Queue,
-	tier: Option<Tier>,
-	/// The part of `size` that stays in DRAM in either tier; see `migrating`.
-	dram_resident: u8,
-	accessed: bool,
-	size: ObjectSize,
+#[repr(u8)]
+enum Queue {
+	OneAccess = 0,
+	Main = 1,
 }
 
-/// Pinned, exactly as `S3FifoEntry` is in the stack this replaces. The payload
-/// rides in the index bucket, so growth here costs bytes on every tracked key.
-const _: () = assert!(
-	std::mem::size_of::<S3FifoMidpointReprievePayload>() == 8,
-	"S3FifoMidpointReprievePayload grew past 8 bytes",
-);
-
-impl S3FifoMidpointReprievePayload {
-	/// The bytes that actually move between tiers when this object migrates.
-	fn migrating(&self) -> CacheSize {
-		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
+impl Queue {
+	/// The inverse of `as u8`. `NodePayload::queue` is only ever written here
+	/// from a `Queue as u8`, so the catch-all arm is unreachable and `Main` is
+	/// the only value it could stand for.
+	fn from_u8(tag: u8) -> Queue {
+		match tag {
+			0 => Queue::OneAccess,
+			_ => Queue::Main,
+		}
 	}
 }
 
+/// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
+///
+/// This stack reads `queue` (as [`Queue`]), `tier`, `freq`, `size` and
+/// `dram_resident`. `freq` carries the S3-FIFO REFERENCE BIT: set is `freq = 1`
+/// and tested as `freq != 0`, since a reference bit is a one-bit frequency
+/// counter. `tier`/`freq` are only meaningful while `queue == Main`; a
+/// one-access key leaves `tier` at `None`, which is one of the reasons the
+/// shared node made that field an `Option`. `tier` is redundant with which of
+/// the two main lists the key is physically in, but kept because `tier_of()`
+/// and the `PolicyWorker` migration path both want it as a cheap single-probe
+/// lookup rather than a pair of `contains()` probes.
+///
+/// `ts` and `phys` belong to other policies; `phys` is set once at admission to
+/// match `tier` and never read here.
 pub struct S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
-	queues: CompactQueueSet<S3FifoMidpointReprievePayload>,
+	queues: ArenaQueueSet<NodePayload>,
 
 	one_access_ratio: f64,
 	one_access_capacity: CacheSize,
@@ -163,7 +163,7 @@ pub struct S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 	pub fn new(one_access_ratio: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
 		S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
-			queues: CompactQueueSet::default(),
+			queues: ArenaQueueSet::default(),
 			one_access_ratio,
 			one_access_capacity: (one_access_ratio * max_size as f64) as CacheSize,
 			one_access_used: 0,
@@ -230,7 +230,7 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
 		let payload = self.queues.payload(key)?;
 
-		match payload.queue {
+		match Queue::from_u8(payload.queue) {
 			// The one-access queue is DRAM-resident in this variant.
 			Queue::OneAccess => Some(Tier::Fast),
 			Queue::Main => payload.tier,
@@ -248,7 +248,7 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 		payload.size = new_size;
 		payload.dram_resident = new_resident;
 		let delta = payload.migrating() as i64 - old_migrating as i64;
-		let (queue, tier) = (payload.queue, payload.tier);
+		let (queue, tier) = (Queue::from_u8(payload.queue), payload.tier);
 
 		match (queue, tier) {
 			(Queue::OneAccess, _) => {
@@ -263,12 +263,17 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 				self.slow_used = (self.slow_used as i64 + delta).max(0) as CacheSize;
 			},
 
+			// A one-access key really does carry `tier == None` here, but a
+			// MAIN-queue key never does: it reaches `Queue::Main` only through
+			// `promote_from_one_access` (Fast) or `settle_one_access` (Slow),
+			// each of which sets a tier. Unreachable, and spelled out rather
+			// than folded into the `_` above.
 			(Queue::Main, None) => {},
 		}
 	}
 
 	fn touch(&mut self, key: HashedKey) {
-		match self.queues.payload(key).map(|p| p.queue) {
+		match self.queues.payload(key).map(|p| Queue::from_u8(p.queue)) {
 			Some(Queue::OneAccess) => self.promote_from_one_access(key),
 			Some(Queue::Main) => self.mark_accessed(key),
 			None => {},
@@ -279,7 +284,7 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 	/// lives in the index value: one probe, no slab access, no queue movement.
 	fn mark_accessed(&mut self, key: HashedKey) {
 		if let Some(p) = self.queues.payload_mut(key) {
-			p.accessed = true;
+			p.freq = 1;
 		}
 	}
 
@@ -294,9 +299,9 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 		self.one_access_used = self.one_access_used.saturating_sub(size_bytes);
 
 		if let Some(p) = self.queues.payload_mut(key) {
-			p.queue = Queue::Main;
+			p.queue = Queue::Main as u8;
 			p.tier = Some(Tier::Fast);
-			p.accessed = false;
+			p.freq = 0;
 		}
 
 		self.fast_used += size_bytes;
@@ -339,7 +344,7 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 	fn check_slow_midpoint(&mut self) {
 		let Some(candidate) = self.slow_midpoint else { return };
 
-		let accessed = self.queues.payload(candidate).map(|p| p.accessed).unwrap_or(false);
+		let accessed = self.queues.payload(candidate).map(|p| p.freq != 0).unwrap_or(false);
 
 		if accessed {
 			self.give_second_chance(candidate);
@@ -362,7 +367,7 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 				self.queues.move_front(Q_MAIN_FAST, key);
 
 				if let Some(p) = self.queues.payload_mut(key) {
-					p.accessed = false;
+					p.freq = 0;
 				}
 			},
 
@@ -372,7 +377,7 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 
 				if let Some(p) = self.queues.payload_mut(key) {
 					p.tier = Some(Tier::Fast);
-					p.accessed = false;
+					p.freq = 0;
 				}
 
 				self.slow_used = self.slow_used.saturating_sub(size);
@@ -381,6 +386,10 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 				self.bump_midpoint_drift();
 			},
 
+			// Only a one-access key carries `tier == None`, and this is only
+			// ever called on a main-queue key, so it is unreachable. The
+			// baseline returns here without settling or pushing a migration,
+			// so this does too.
 			None => return,
 		}
 
@@ -408,14 +417,14 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 		while self.fast_used > drain_target {
 			let Some(candidate) = self.queues.back(Q_MAIN_FAST) else { break };
 
-			let accessed = self.queues.payload(candidate).map(|p| p.accessed).unwrap_or(false);
+			let accessed = self.queues.payload(candidate).map(|p| p.freq != 0).unwrap_or(false);
 
 			if accessed {
 				// Reprieve: fresh start at the front instead of demotion.
 				self.queues.move_front(Q_MAIN_FAST, candidate);
 
 				if let Some(p) = self.queues.payload_mut(candidate) {
-					p.accessed = false;
+					p.freq = 0;
 				}
 
 				continue;
@@ -467,9 +476,9 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 			self.queues.move_to_front_of(Q_ONE_ACCESS, Q_MAIN_SLOW, key);
 
 			if let Some(p) = self.queues.payload_mut(key) {
-				p.queue = Queue::Main;
+				p.queue = Queue::Main as u8;
 				p.tier = Some(Tier::Slow);
-				p.accessed = false;
+				p.freq = 0;
 			}
 
 			self.slow_used += size;
@@ -514,12 +523,14 @@ impl PolicyStack for S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybri
 		self.queues.push_front(
 			Q_ONE_ACCESS,
 			key,
-			S3FifoMidpointReprievePayload {
-				queue: Queue::OneAccess,
-				tier: None,
-				dram_resident,
-				accessed: false,
+			NodePayload {
 				size,
+				freq: 0,
+				ts: 0,
+				queue: Queue::OneAccess as u8,
+				tier: None,
+				phys: None,
+				dram_resident,
 			},
 		);
 		self.one_access_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
@@ -544,7 +555,7 @@ impl PolicyStack for S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybri
 		let Some(payload) = self.queues.payload(key) else { return };
 		let size = payload.migrating();
 
-		match payload.queue {
+		match Queue::from_u8(payload.queue) {
 			Queue::OneAccess => {
 				self.queues.remove(Q_ONE_ACCESS, key);
 				self.one_access_used = self.one_access_used.saturating_sub(size);
@@ -603,7 +614,7 @@ impl PolicyStack for S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybri
 				None => (self.queues.back(Q_MAIN_FAST)?, false),
 			};
 
-			let accessed = self.queues.payload(key).map(|p| p.accessed).unwrap_or(false);
+			let accessed = self.queues.payload(key).map(|p| p.freq != 0).unwrap_or(false);
 
 			if accessed {
 				self.give_second_chance(key);
