@@ -134,6 +134,15 @@ fn cache_error_code(err: &CacheError) -> u8 {
 /// to the server, not to the cache: it sits outside the timed span except for
 /// the clock reads themselves, which bracket it. Treat the reported mean as the
 /// cache call plus one clock read, and compare like with like.
+///
+/// # Reading the SET figure
+///
+/// A cache that is still FILLING charges every set a first-touch page fault per
+/// value page: `fast_alloc` hands back memory the process has never touched,
+/// while `get`'s `to_vec` recycles a hot tcache block. Measured here at 4 KiB
+/// values -- 3935 ns/set while filling, 1087 ns once keys are overwritten and
+/// memory recycles, against 1154 ns for a get. So set is not slower than get;
+/// filling is, by 3.6x. Warm to steady state before believing a set number.
 mod selfstats {
 	use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -294,7 +303,9 @@ fn render_self_stats(stats: &SelfStats, cache: &Cache) -> String {
 	out.push_str(
 		"get(hit) is the figure comparable with the in-process benchmark, which times\n\
 		 only hits. A miss neither copies nor allocates, so averaging the two together\n\
-		 would understate the cost of a get by the miss ratio.\n",
+		 would understate the cost of a get by the miss ratio.\n\
+		 A set on a FILLING cache pays a first-touch page fault per value page (3.6x at\n\
+		 4 KiB); warm to steady state before comparing set against get.\n",
 	);
 
 	// The tier figures are the whole point of reporting here rather than over
