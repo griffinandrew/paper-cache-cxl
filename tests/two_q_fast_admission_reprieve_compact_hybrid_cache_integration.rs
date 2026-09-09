@@ -98,8 +98,9 @@ mod hybrid_cache_tests {
     // `settle_fast_tier` never triggered, nothing demoted, and every test
     // asserting a demotion timed out.
     //
-    // 256 puts ten objects at 2_560, unambiguously over: the settle drains to
-    // the ~781-byte budget, leaving two objects fast and eight slow. The FIFO
+    // 256 puts ten objects at 2_560, unambiguously over: the settle holds the
+    // tier at ~765 (0.98 of the ~781-byte budget), leaving two objects fast and
+    // eight slow. The FIFO
     // never sees more than one at a time (each set is followed by a get, which
     // promotes it straight out), so this does not trip `fifo_capacity` and
     // reprieve them instead of demoting them.
@@ -513,11 +514,12 @@ mod hybrid_cache_tests {
     fn ttl_survives_a_demotion() {
         ensure_pmem_allocator_warm();
 
-        // `PRESSURE_LEN`, not 64: the main queue's budget is ~781 bytes and
-        // twelve 64-byte objects come to 768 migrating bytes, which does not
-        // reach it. This test asserts a demotion, so it belongs with the
-        // file's other pressure tests rather than with the ones that assert
-        // everything stays fast.
+        // `PRESSURE_LEN`, not 64: the main queue's budget is ~781 bytes, so the
+        // drain target sits near 765, and twelve 64-byte objects come to 768
+        // migrating bytes -- a three-byte margin. This test asserts a demotion
+        // and should not rest on three bytes, so it belongs with the file's
+        // other pressure tests rather than with the ones that assert everything
+        // stays fast.
         let cache = make_cache();
 
         cache

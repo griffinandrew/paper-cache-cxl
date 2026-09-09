@@ -107,7 +107,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -392,8 +392,9 @@ impl S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack {
 	/// the reservation and the target -- cannot move underneath the pass.
 	fn settle_fast_tier(&mut self) {
 		let effective_capacity = self.effective_main_fast_capacity();
+		let target = drain_target::bytes(effective_capacity);
 
-		while self.fast_used > effective_capacity {
+		while self.fast_used > target {
 			let Some(candidate) = self.queues.back(Q_MAIN_FAST) else { break };
 
 			let accessed = self.queues.payload(candidate).map(|p| p.freq != 0).unwrap_or(false);

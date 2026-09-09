@@ -70,7 +70,7 @@ use crate::{
 		PolicyStack,
 		Tier,
 		arena_frequency_chain::ArenaFrequencyChain,
-		narrow_resident,
+		narrow_resident, drain_target,
 	},
 };
 
@@ -167,8 +167,9 @@ impl LfuCompactHybridStack {
 	/// effective budget, draining to exactly it.
 	fn settle_fast_tier(&mut self) {
 		let effective = self.effective_fast_capacity();
+		let target = drain_target::bytes(effective);
 
-		while self.fast_used > effective {
+		while self.fast_used > target {
 			let Some((demote_key, _count)) = self.chain.min_with_count(Tier::Fast) else {
 				break;
 			};

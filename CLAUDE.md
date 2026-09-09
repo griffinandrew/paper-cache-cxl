@@ -90,8 +90,10 @@ src/
                                  The 18 *_hybrid_stack.rs files carry each design's algorithm
                                  and its full derivation in the module doc — those are the
                                  authoritative description of what each design does.
-                                 Every settle_fast_tier drains to exactly its effective
-                                 budget on every settle; there is no high/low band.
+                                 `drain_target` (in mod.rs) holds the single fast-tier
+                                 level every settle maintains: 0.98 of the effective
+                                 budget, overridable via FAST_TIER_DRAIN_TARGET. One
+                                 threshold, not a high/low band.
       mini_stack/               Lightweight per-policy stacks for PaperCache's "auto" mode.
       trace/                    Access-trace recording/replay, replayed to rebuild a different
                                  policy's stack after a live switch. Only spawned when more than

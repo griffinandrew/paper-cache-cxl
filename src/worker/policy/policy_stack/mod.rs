@@ -134,6 +134,62 @@ pub enum AccessOutcome {
 	GhostHit,
 }
 
+/// The level the fast tier is continuously held at, as a fraction of its
+/// effective budget.
+///
+/// `settle_fast_tier` demotes whenever `fast_used` is above
+/// `ratio * effective_capacity` and stops the moment it is back at it. ONE
+/// threshold, not a band: there is no arm-here / drain-to-there gap, so a
+/// settle moves only what the admission or promotion that triggered it
+/// displaced, and the tier steady-states just under its budget rather than
+/// sawtoothing between two marks.
+///
+/// The margin is burst headroom, and it is the whole reason the ratio is not
+/// 1.0. `PaperCache::set()` writes a new object's bytes to DRAM synchronously
+/// at the API layer, before the event reaches `PolicyWorker` at all; and a
+/// demotion this function decides is not physically applied until a
+/// `migration_queue` consumer runs it. Real DRAM therefore sits above what the
+/// stack believes for as long as those two windows last. Held at exactly its
+/// ceiling, a tier has nowhere for that overshoot to go but outside the
+/// budget; held at 0.98, it lands inside.
+///
+/// 0.98 is where this tree's own burst margin sat before a 0.98/0.95 high/low
+/// pair replaced it (`FAST_TIER_LOW_WATER_RATIO`; see `LRU_HYBRID_CACHE.md`).
+/// It is the band that is gone, not the margin. The band ARMED at 0.98 and
+/// only then drained to 0.95, which cost 5% of the allocation at the bottom of
+/// every sawtooth and emitted the drop as one burst of demotions -- ~3% of the
+/// budget in a single `apply_tier_migrations` batch. This keeps the headroom
+/// and pays for it once, not per pass.
+///
+/// `FAST_TIER_DRAIN_TARGET=1.0` holds the tier at exactly its ceiling, which is
+/// the no-headroom behaviour.
+pub mod drain_target {
+	use std::sync::OnceLock;
+
+	pub const DEFAULT_RATIO: f64 = 0.98;
+
+	static RATIO: OnceLock<f64> = OnceLock::new();
+
+	/// Read once through a `OnceLock`, so the env var is startup configuration
+	/// rather than runtime adjustable. A value that fails to parse or falls
+	/// outside `(0.0, 1.0]` is silently replaced by the default.
+	pub fn ratio() -> f64 {
+		*RATIO.get_or_init(|| {
+			std::env::var("FAST_TIER_DRAIN_TARGET")
+				.ok()
+				.and_then(|v| v.parse::<f64>().ok())
+				.filter(|v| *v > 0.0 && *v <= 1.0)
+				.unwrap_or(DEFAULT_RATIO)
+		})
+	}
+
+	/// The byte level a settle holds the tier at: both the point above which it
+	/// demotes and the point it stops at.
+	pub fn bytes(effective_capacity: u64) -> u64 {
+		(effective_capacity as f64 * ratio()) as u64
+	}
+}
+
 /// Which tier an object currently lives in, for policy stacks that track a
 /// segmented (fast/slow) queue. Used by `LruCompactHybridStack`
 /// (`PaperPolicy::LruCompactHybrid`, recency-segmented),
@@ -505,7 +561,7 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		),
 
 		// Now carries the same `with_shared_overhead` reservation and the same
-		// drain-to-budget settle as `LruCompactHybrid`/`LfuCompactHybrid`,
+		// continuous drain-target settle as `LruCompactHybrid`/`LfuCompactHybrid`,
 		// in the same two-arm with/without-feature shape this comment used to
 		// ask for: a follow-up DRAM-usage measurement did show the same issue
 		// (metadata is DRAM-resident but is not counted in `fast_used`, so

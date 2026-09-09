@@ -66,7 +66,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -324,8 +324,9 @@ impl LruLazyCopyCompactHybridStack {
 	/// entire difference from the baseline.
 	fn settle_fast_tier(&mut self) {
 		let effective = self.logical_capacity();
+		let target = drain_target::bytes(effective);
 
-		while self.fast_used > effective {
+		while self.fast_used > target {
 			let Some(key) = self.fast_boundary else { break };
 			let size = self.list.payload(key).map(|p| p.migrating()).unwrap_or(0);
 			let next = self.list.before(key);
@@ -345,8 +346,9 @@ impl LruLazyCopyCompactHybridStack {
 	/// demotion. Driven by measured DRAM, never by the policy.
 	fn reclaim_dram(&mut self) {
 		let effective = self.physical_capacity();
+		let target = drain_target::bytes(effective);
 
-		while self.dram_used > effective {
+		while self.dram_used > target {
 			let Some(key) = self.phys_boundary else { break };
 			let size = self.list.payload(key).map(|p| p.migrating()).unwrap_or(0);
 			let next = self.list.before(key);

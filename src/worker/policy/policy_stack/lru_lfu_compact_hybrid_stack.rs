@@ -112,7 +112,7 @@ use crate::{
 		PolicyStack,
 		Tier,
 		arena_frequency_chain::ArenaFrequencyChain,
-		narrow_resident,
+		narrow_resident, drain_target,
 	},
 };
 
@@ -333,8 +333,9 @@ impl LruLfuCompactHybridStack {
 	/// stays governed solely by `max_size`).
 	fn settle_fast_tier(&mut self) {
 		let effective = self.fast_capacity.saturating_sub(self.reserved_overhead());
+		let target = drain_target::bytes(effective);
 
-		while self.fast_used > effective {
+		while self.fast_used > target {
 			// The baseline pops the recency tail, then looks the key up in
 			// `entries` and `continue`s past it if it is missing -- a state it
 			// documents as impossible. It is not merely impossible here but
@@ -504,6 +505,14 @@ mod tests {
 
 	const K: u16 = 2;
 
+	/// A fast-tier capacity that leaves `target` bytes sitting comfortably
+	/// below `settle_fast_tier`'s drain target. Sizing a test's capacity to
+	/// exactly what should survive cascades a demotion the test never meant to
+	/// exercise, because the tier is held at a fraction of its budget.
+	fn target_safe(target: CacheSize) -> CacheSize {
+		(target as f64 / drain_target::ratio()).ceil() as CacheSize + 1
+	}
+
 	fn drain(stack: &mut LruLfuCompactHybridStack) -> Vec<(HashedKey, Tier)> {
 		stack.drain_tier_migrations()
 	}
@@ -525,7 +534,7 @@ mod tests {
 
 	#[test]
 	fn fast_pressure_demotes_the_lru_tail() {
-		let mut stack = LruLfuCompactHybridStack::new(100, K);
+		let mut stack = LruLfuCompactHybridStack::new(target_safe(100), K);
 
 		stack.insert(1, 50);
 		stack.insert(2, 50);
@@ -634,7 +643,7 @@ mod tests {
 
 	#[test]
 	fn promotion_can_cascade_a_demotion() {
-		let mut stack = LruLfuCompactHybridStack::new(100, 2);
+		let mut stack = LruLfuCompactHybridStack::new(target_safe(100), 2);
 
 		stack.insert(1, 50);
 		stack.insert(2, 50);
@@ -714,7 +723,7 @@ mod tests {
 
 	#[test]
 	fn remove_updates_the_right_tier_counters() {
-		let mut stack = LruLfuCompactHybridStack::new(100, 99);
+		let mut stack = LruLfuCompactHybridStack::new(target_safe(100), 99);
 
 		stack.insert(1, 50);
 		stack.insert(2, 50);
@@ -814,7 +823,7 @@ mod tests {
 	/// strictest threshold there is, where promotion is hardest to earn.
 	#[test]
 	fn a_saturated_key_stops_counting_and_promotes_on_its_next_access() {
-		let mut stack = LruLfuCompactHybridStack::new(100, FREQUENCY_CAP);
+		let mut stack = LruLfuCompactHybridStack::new(target_safe(100), FREQUENCY_CAP);
 
 		stack.insert(1, 50);
 		for _ in 0..(FREQUENCY_CAP as usize * 2) { stack.update(1); }
@@ -874,39 +883,57 @@ mod tests {
 	const SETTLE_CAPACITY: CacheSize = 10_000;
 	const SETTLE_UNIT: ObjectSize = 10;
 
-	/// There is no hysteresis band: a settle drains to exactly the effective
-	/// budget and stops, so the admission that overflows the tier by one unit
-	/// demotes exactly one unit.
+	/// One continuous threshold, not a band. The tier is held at
+	/// `drain_target` of its budget -- strictly below the ceiling, which is
+	/// the burst headroom -- and the admission that pushes it over demotes
+	/// exactly enough to come straight back to it, never further.
 	#[test]
-	fn a_settle_drains_to_exactly_the_effective_budget() {
+	fn a_settle_holds_the_tier_at_the_drain_target() {
 		let mut stack = LruLfuCompactHybridStack::new(SETTLE_CAPACITY, K);
 
+		let target = drain_target::bytes(SETTLE_CAPACITY);
 		let unit = SETTLE_UNIT as CacheSize;
+
+		assert!(
+			target < SETTLE_CAPACITY,
+			"the default ratio must leave headroom, or this test proves nothing",
+		);
 
 		let mut key: HashedKey = 0;
 
-		while stack.fast_bytes_used() + unit <= SETTLE_CAPACITY {
+		while stack.fast_bytes_used() + unit <= target {
 			key += 1;
 			stack.insert(key, SETTLE_UNIT);
 		}
 
-		assert_eq!(stack.fast_bytes_used(), SETTLE_CAPACITY, "the tier fills to its ceiling exactly");
-		assert_eq!(stack.slow_object_count(), 0, "nothing is demoted at the ceiling");
+		assert_eq!(stack.slow_object_count(), 0, "nothing has crossed the target yet");
 		assert!(drain(&mut stack).is_empty());
 
-		key += 1;
-		stack.insert(key, SETTLE_UNIT); // one unit over
+		let before = stack.fast_bytes_used();
 
-		assert_eq!(
+		key += 1;
+		stack.insert(key, SETTLE_UNIT); // crosses the target
+
+		assert!(
+			stack.fast_bytes_used() <= target,
+			"a settle must bring the tier back to the target ({target}); fast_used = {}",
 			stack.fast_bytes_used(),
-			SETTLE_CAPACITY,
-			"a settle drains back to the ceiling and no further",
+		);
+		assert!(
+			stack.fast_bytes_used() + unit > target,
+			"and must stop the moment it reaches it rather than over-draining",
 		);
 
+		let expected = (before + unit - target).div_ceil(unit);
+
 		let migrations = drain(&mut stack);
-		assert_eq!(migrations.len(), 1, "exactly one demotion; got {migrations:?}");
-		assert_eq!(migrations[0].1, Tier::Slow);
-		assert_eq!(stack.slow_object_count(), 1);
+		let demoted = migrations
+			.iter()
+			.filter(|(_, tier)| *tier == Tier::Slow)
+			.count() as CacheSize;
+
+		assert_eq!(demoted, expected, "got {} migrations", migrations.len());
+		assert_eq!(stack.slow_object_count() as CacheSize, expected);
 	}
 
 	/// The baseline's second "every tracked key is in exactly one structure"
@@ -949,8 +976,8 @@ mod tests {
 			"slow bytes must equal the slow object count times the unit size",
 		);
 		assert!(
-			stack.fast_bytes_used() <= SETTLE_CAPACITY,
-			"the tier must be settled within its budget after the last insert",
+			stack.fast_bytes_used() <= drain_target::bytes(SETTLE_CAPACITY),
+			"the tier must be settled back to its drain target after the last insert",
 		);
 	}
 }

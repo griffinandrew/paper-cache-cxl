@@ -36,7 +36,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -258,8 +258,9 @@ impl TwoQCompactHybridStack {
 	/// effective budget. The victim is always `main_boundary`, so nothing is searched.
 	fn settle_fast_tier(&mut self) {
 		let effective = self.fast_capacity.saturating_sub(self.reserved_overhead());
+		let target = drain_target::bytes(effective);
 
-		while self.fast_used > effective {
+		while self.fast_used > target {
 			let Some(demote_key) = self.main_boundary else { break };
 			let size = self.queues.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
 			let new_boundary = self.queues.before(demote_key);

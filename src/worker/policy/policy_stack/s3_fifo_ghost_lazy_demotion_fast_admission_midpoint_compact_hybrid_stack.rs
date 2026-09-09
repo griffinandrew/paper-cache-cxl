@@ -78,7 +78,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, ghost_filter::GhostFilter, narrow_resident,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, ghost_filter::GhostFilter, narrow_resident, drain_target,
 		CacheSize, HashedKey,
 		PolicyStack, Tier,
 	},
@@ -510,8 +510,9 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack {
 	/// underneath the pass.
 	fn settle_fast_tier(&mut self) {
 		let effective_capacity = self.effective_main_fast_capacity();
+		let target = drain_target::bytes(effective_capacity);
 
-		while self.fast_used > effective_capacity {
+		while self.fast_used > target {
 			let Some(candidate) = self.main_boundary else { break };
 
 			let accessed = self.queues.payload(candidate).map(|p| p.freq != 0).unwrap_or(false);

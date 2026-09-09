@@ -173,24 +173,40 @@ once let the gauges go stale indefinitely.
 
 ## Shared machinery
 
-### Continuous draining
+### The drain target
 
-`settle_fast_tier` demotes while `fast_used` exceeds the effective budget and stops the moment
-it is back within it. There is no high/low band: the tier sits at exactly its budget, and a
-demotion pass moves whatever the admission or promotion that triggered it displaced. A high/low
-pair (0.98 / 0.95, `FAST_TIER_HIGH_WATERMARK` / `FAST_TIER_LOW_WATERMARK`) existed for a while
-to batch demotions; it and its env vars are gone.
+`settle_fast_tier` holds the fast tier at **`drain_target::ratio()` of its effective budget**
+— `DEFAULT_RATIO = 0.98`, overridable at startup via `FAST_TIER_DRAIN_TARGET`. It demotes
+whenever `fast_used` is above that level and stops the moment it is back at it.
 
-What the band bought, and why it is not worth reintroducing: draining to exactly the ceiling
-pins the tier at 100% utilisation and makes almost every pass a single-object migration batch
-(measured at the time: >99% of `apply_tier_migrations` calls carried 0-1 entries). That shape is
-real — it is what `parallel_migration` was written for, and why that module was then turned off
-again, since a fan-out cannot pay for itself at batch-of-one. But `migration_queue` takes the
-same win without depending on batch size: a standing pool of consumers sharded by key hash
-drains migrations as they are produced. So the band was paying resident fast-tier capacity for a
-batching effect the consumer pool already provides, and it made the tier's occupancy a function
-of two tunables rather than of the budget — which is the thing the fast-tier accounting exists
-to enforce.
+**One threshold, not a band.** There is no arm-here / drain-to-there gap, so a settle moves only
+what the admission or promotion that triggered it displaced, and the tier steady-states just
+under its budget instead of sawtoothing between two marks.
+
+**The 2% is burst headroom, and it is the whole reason the ratio is not 1.0.** `PaperCache::set()`
+writes a new object's bytes to DRAM synchronously at the API layer, before the event reaches
+`PolicyWorker` at all; and a demotion the stack decides is not physically applied until a
+`migration_queue` consumer runs it. Real DRAM therefore sits above what the stack believes for
+as long as those two windows last — `MIGSTATS pending_demote_max` measures the second one
+directly. Held at exactly its ceiling, a tier has nowhere for that overshoot to go but *outside*
+the budget. Held at 0.98, it lands inside.
+
+**What was removed is the band, not the margin.** A 0.98 / 0.95 pair
+(`FAST_TIER_HIGH_WATERMARK` / `FAST_TIER_LOW_WATERMARK`) armed at 0.98 and only then drained to
+0.95. That cost 5% of the allocation at the bottom of every sawtooth — headroom the workload
+never got to use — and emitted the drop as one burst: ~3% of the budget in a single
+`apply_tier_migrations` batch. The batching was the point (drain-to-ceiling makes almost every
+pass a single-object batch; measured at the time, >99% of calls carried 0-1 entries, which is
+why `parallel_migration` was written and then turned off again — a fan-out cannot pay for itself
+at batch-of-one). But `migration_queue` already takes that win without depending on batch size:
+a standing pool of consumers sharded by key hash drains migrations as they are produced. So the
+band was buying a batching effect the consumer pool provides anyway, and charging 5% of the
+tier for it. 0.98 keeps the headroom and pays for it once.
+
+> 0.98 is also where this tree's burst margin sat before the band replaced it
+> (`FAST_TIER_LOW_WATER_RATIO`, see `LRU_HYBRID_CACHE.md`). `FAST_TIER_DRAIN_TARGET` is read once
+> through a `OnceLock`, so it is startup configuration; a value that fails to parse or falls
+> outside `(0.0, 1.0]` is silently replaced by the default. `1.0` gives no headroom at all.
 
 `eviction_watermarks` in `worker/policy/mod.rs` is a separate, opt-in pair for capacity eviction
 whose defaults were always 1.0 / 1.0.
@@ -203,8 +219,8 @@ is exactly what was observed in practice.
 
 `get_hybrid_dram_shared_overhead` gives a per-tracked-key byte figure; `reserved_overhead()`
 multiplies it by the tracked key count; `settle_fast_tier` subtracts that from `fast_capacity`
-**before** draining. The composition order is load-bearing: the reservation comes out of
-capacity first, and the drain runs against what is left.
+**before** the drain target is taken. The composition order is load-bearing: the reservation
+comes out of capacity first, and the ratio applies to what is left.
 
 The multiplier is *every* tracked key, not just fast ones — a slow-tier object still has a
 hashtable entry, a list node and an `entries` slot in DRAM.
@@ -270,7 +286,7 @@ whose cumulative size fits `fast_capacity`; everything behind is slow.
 - **Admission** — front of the list, `Tier::Fast`, unconditionally.
 - **Promotion** — every access *and every overwrite* moves the key to the front and tags it
   `Fast`. A `set()` on an existing key is treated exactly like a hit.
-- **Demotion** — while `fast_used` exceeds the effective budget, the LRU-most fast key (found via
+- **Demotion** — while `fast_used` is above the drain target, the LRU-most fast key (found via
   `fast_boundary`, no scan) is demoted.
 - **Eviction** — the absolute LRU tail, which after any demotion is always slow.
 
@@ -281,9 +297,9 @@ can transiently push real DRAM above what the stack's bookkeeping shows, and dra
 ceiling leaves that burst somewhere to land. The pressure is sharpest here because this is the
 stack that re-settles on every admission.
 
-That headroom has since been removed everywhere: every design drains to exactly its effective
-budget (*Continuous draining* above), and the transient the margin was meant to absorb is
-measured instead, as `pending_demote_max` in `MIGSTATS`.
+That headroom is now shared by every design and expressed as a single continuously-maintained
+level rather than a band (*The drain target* above). The transient it absorbs is also measured
+rather than guessed at: `MIGSTATS pending_demote_max` is the demotion backlog, in objects.
 
 ### `lfu_compact_hybrid_cache`
 
@@ -456,7 +472,7 @@ budgets draw on the same physical pool, and leaving them independent would let r
 `fast_capacity + fifo_capacity`. Fixed by treating `fifo_capacity` as a reservation carved out
 first — `effective_main_fast_capacity =
 fast_capacity.saturating_sub(fifo_capacity).saturating_sub(reserved_overhead())`, so the FIFO
-carve-out and the shared per-object DRAM reservation both come out before the drain applies. The net result is
+carve-out and the shared per-object DRAM reservation both come out before the drain target applies. The net result is
 `fast_used (main) + fifo_used <= fast_capacity` by construction.
 
 ### `two_q_fast_admission_reprieve_compact_hybrid_cache`

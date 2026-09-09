@@ -176,16 +176,19 @@ at the user's explicit request: keeping idle capacity in reserve costs usable fa
 marginal reduction in demotion-pass frequency, and the user judged that trade not worth it. For a
 while, `settle_fast_tier` drained exactly back down to `fast_capacity` and no lower.
 
-**A small floor was later reintroduced for an unrelated reason, and later removed again.**
+**A small floor was later reintroduced for an unrelated reason, and it is still there.**
 `PaperCache::set()` writes a new object's `TieredBuffer` to DRAM *synchronously*, at the API layer,
 before the corresponding event even reaches `PolicyWorker` — so a burst of concurrent `set()` calls
 can transiently push real DRAM usage above what the stack's own bookkeeping shows, in the window
-between that physical write and the worker processing it. For a while `settle_fast_tier` drained
-to 98% of the effective budget (`FAST_TIER_LOW_WATER_RATIO`) to leave such a burst room to land, and
-a shared 0.98 / 0.95 high/low pair later replaced that. Both are gone: every settle now drains to
-exactly the effective budget (see `HYBRID_CACHES.md`'s "Continuous draining"). The
-demote-decision-to-physical-DRAM-free window is shrunk by `apply_tier_migrations` running per-event
-rather than per-batch, and is measured rather than padded: `MIGSTATS pending_demote_max` reports it.
+between that physical write and the worker processing it. `settle_fast_tier` drained to 98% of the
+effective budget (`FAST_TIER_LOW_WATER_RATIO`) to leave such a burst room to land; a shared
+0.98 / 0.95 high/low pair then replaced that, and has since been replaced in turn by a single
+continuously-maintained level at the same 98% — see `HYBRID_CACHES.md`'s "The drain target". The
+margin has therefore survived all three shapes, because the reason for it never went away. What
+changed is that it is no longer paired with a separate arming threshold, so the tier holds at 98%
+instead of sawtoothing down to 95%. The window itself is shrunk by `apply_tier_migrations` running
+per-event rather than per-batch, and is measured rather than guessed at: `MIGSTATS
+pending_demote_max` reports the backlog in objects.
 
 ## Turning "this key changed tier" into an actual byte move
 

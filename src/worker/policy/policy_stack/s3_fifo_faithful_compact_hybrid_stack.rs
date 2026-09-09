@@ -77,7 +77,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -338,8 +338,9 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 	/// seam, so the concatenated main order is unchanged.
 	fn settle_fast_tier(&mut self) {
 		let effective = self.effective_main_fast_capacity();
+		let target = drain_target::bytes(effective);
 
-		while self.fast_used > effective {
+		while self.fast_used > target {
 			let Some(key) = self.queues.back(Q_MAIN_FAST) else { break };
 			let bytes = self.queues.payload(key).map(|p| p.migrating()).unwrap_or(0);
 

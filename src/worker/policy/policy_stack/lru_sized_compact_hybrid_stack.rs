@@ -76,7 +76,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -417,8 +417,9 @@ impl LruSizedCompactHybridStack {
 	/// four queues, so a cross-queue move leaves it alone).
 	fn settle_small_fast(&mut self) {
 		let effective = self.effective_small();
+		let target = drain_target::bytes(effective);
 
-		while self.small_fast_used > effective {
+		while self.small_fast_used > target {
 			let Some(demote_key) = self.queues.back(Q_SMALL_FAST) else { break };
 			let size = self.queues.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
 
@@ -439,8 +440,9 @@ impl LruSizedCompactHybridStack {
 	/// `large_slow` and draining against `effective_large()` instead.
 	fn settle_large_fast(&mut self) {
 		let effective = self.effective_large();
+		let target = drain_target::bytes(effective);
 
-		while self.large_fast_used > effective {
+		while self.large_fast_used > target {
 			let Some(demote_key) = self.queues.back(Q_LARGE_FAST) else { break };
 			let size = self.queues.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
 

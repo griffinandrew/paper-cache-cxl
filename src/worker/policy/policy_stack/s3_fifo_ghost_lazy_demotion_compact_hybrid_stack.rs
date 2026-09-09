@@ -66,7 +66,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, ghost_filter::GhostFilter, narrow_resident,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, ghost_filter::GhostFilter, narrow_resident, drain_target,
 		CacheSize, HashedKey,
 		PolicyStack, Tier,
 	},
@@ -366,8 +366,9 @@ impl S3FifoGhostLazyDemotionCompactHybridStack {
 	/// still changes none of them. A pass simply walks further before it stops.
 	fn settle_fast_tier(&mut self) {
 		let effective_capacity = self.effective_fast_capacity();
+		let target = drain_target::bytes(effective_capacity);
 
-		while self.fast_used > effective_capacity {
+		while self.fast_used > target {
 			let Some(candidate) = self.main_boundary else { break };
 			let accessed = self.queues.payload(candidate).map(|p| p.freq != 0).unwrap_or(false);
 
@@ -678,7 +679,7 @@ mod compact_tests {
 		let fast_capacity: CacheSize = 1_000;
 		let size: ObjectSize = 10;
 		let bytes = size as CacheSize;
-		let count = fast_capacity / bytes + 1;
+		let count = drain_target::bytes(fast_capacity) / bytes + 1;
 
 		let mut lazy = S3FifoGhostLazyDemotionCompactHybridStack::new(1.0, 100_000, fast_capacity);
 		let mut eager = S3FifoGhostCompactHybridStack::new(1.0, 100_000, fast_capacity);

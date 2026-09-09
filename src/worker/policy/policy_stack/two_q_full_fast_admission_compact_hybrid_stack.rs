@@ -63,7 +63,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -399,8 +399,9 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 	/// come off first, and the drain runs against the remainder.
 	fn settle_fast_tier(&mut self) {
 		let effective = self.effective_am_fast_capacity();
+		let target = drain_target::bytes(effective);
 
-		while self.am_fast_used > effective {
+		while self.am_fast_used > target {
 			let Some(demote_key) = self.am_boundary else { break };
 			let size = self.queues.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
 			let new_boundary = self.queues.before(demote_key);
