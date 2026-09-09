@@ -49,7 +49,18 @@ sysinfo = "=0.33"
 triomphe = { version = "0.1.16", default-features = false, features = ["std"] }
 
 
+# The cache served over TCP. Behind `server` so a library consumer never
+# builds it, and so the binary's argument handling stays out of the lib.
+[[bin]]
+name = "paper-server"
+path = "src/bin/paper_server.rs"
+required-features = ["server"]
+
 [features]
+# Serves the tiered cache over a socket. Pulls in `hybrid_cache_common` for the
+# tiering machinery; the caller still picks which hybrid DESIGN to compile, e.g.
+# `--features server,lru_compact_hybrid_cache`.
+server = ["hybrid_cache_common"]
 # Core feature to enable key and value storage in PMEM
 key_value_pmem = ["numa_jemalloc"]
 
