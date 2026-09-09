@@ -693,8 +693,9 @@ pub mod migration_queue {
 /// dedicated pool.
 ///
 /// Compiled in unconditionally and gated at run time on batch length, since
-/// the win is entirely batch-size dependent: with the drain-to-ceiling
-/// cadence every hybrid stack uses, the overwhelming majority of calls carry
+/// the win is entirely batch-size dependent: every hybrid stack holds its fast
+/// tier at a single continuous threshold, so a settle moves only what the event
+/// that triggered it displaced and the overwhelming majority of calls carry
 /// 0 or 1 object, where a fan-out would be pure overhead. Only batches at or above
 /// [`threshold`] go to the pool; everything else runs inline exactly as
 /// before.
@@ -918,8 +919,9 @@ pub mod migstats {
 /// That loop drains to exactly `max_size` one object at a time, so a cache
 /// sitting at capacity re-enters the whole eviction machinery on *every*
 /// subsequent set to free a single object -- the same batch-of-one shape a
-/// high/low band once batched for fast-tier demotions (that band is gone;
-/// the hybrid stacks drain to exactly their budget). With watermarks a pass
+/// high/low band once batched for fast-tier demotions (that band is gone; the
+/// hybrid stacks now hold one continuous threshold, `policy_stack::drain_target`,
+/// at 0.98 of their budget). With watermarks a pass
 /// arms only once usage crosses `high * max_size`, and then drains to
 /// `low * max_size` in one go.
 ///
@@ -933,9 +935,11 @@ pub mod migstats {
 /// `EVICTION_HIGH_WATERMARK` / `EVICTION_LOW_WATERMARK`.
 ///
 /// Deliberately its own pair, and not shared with the hybrid stacks'
-/// fast-tier settle: that drains to exactly its budget with no band at all,
-/// and says nothing about how far past `max_size` the cache as a whole may
-/// be trimmed.
+/// fast-tier settle. That settle is a SINGLE threshold -- `drain_target`, 0.98
+/// of the effective fast-tier budget -- armed and drained to the same number,
+/// so the tier steady-states just under its budget with 2% of burst headroom.
+/// It is not a band, and it says nothing about how far past `max_size` the
+/// cache as a whole may be trimmed.
 pub mod eviction_watermarks {
 	use std::sync::OnceLock;
 
