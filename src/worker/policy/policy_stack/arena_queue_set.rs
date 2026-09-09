@@ -210,10 +210,13 @@ pub struct NodePayload {
 	/// Bytes of the whole object: its header, its key and its value.
 	pub size: ObjectSize,
 
-	/// Frequency, for the policies that rank by it. `u32` because
-	/// `CompactFrequencyChain` already needs that width to bucket by exact
-	/// frequency; the S3-FIFO family saturates far below it and simply does
-	/// not use the range.
+	/// Frequency, for the policies that rank or admit by it.
+	///
+	/// Also carries the S3-FIFO family's REFERENCE BIT, as `freq != 0`: a
+	/// reference bit is a one-bit frequency counter, and no stack in the tree
+	/// wants both. `u32` because `CompactFrequencyChain` needs that width to
+	/// bucket by exact frequency; the S3-FIFO variants saturate at 3 and
+	/// simply do not use the range.
 	pub freq: u32,
 
 	/// A COARSE AGING EPOCH, and deliberately not a recency order.
@@ -224,6 +227,10 @@ pub struct NodePayload {
 	/// used as an ordering key: `MergedStore::Slot::last_access` was a `u32`
 	/// wrapping difference and had to be widened to `u64` for a silent
 	/// corruption reachable on a 306M-record replay.
+	///
+	/// No stack reads it today. It is here because the node is meant to be the
+	/// one shape every policy shares, and an aging policy that had to add a
+	/// field would defeat that.
 	pub ts: u32,
 
 	/// Which queue this key is in, for the multi-queue policies. Zero for the
@@ -233,7 +240,18 @@ pub struct NodePayload {
 	/// Which tier the POLICY believes this object is in. Distinct from the
 	/// tier bit the value carries, which says which allocator frees its bytes:
 	/// this one is a decision, that one is a physical fact.
-	pub tier: Tier,
+	///
+	/// `Option` because the 2Q and S3-FIFO families leave it `None` while a key
+	/// sits in a queue that is entirely slow-tier and so has no tier of its
+	/// own to record. The niche makes that free.
+	pub tier: Option<Tier>,
+
+	/// Where the bytes PHYSICALLY are, when that can differ from `tier`.
+	///
+	/// Only the lazy-copy design uses it: it promotes logically and defers the
+	/// byte copy, so for a window the two disagree. Everyone else leaves it
+	/// equal to `tier` and never reads it.
+	pub phys: Option<Tier>,
 
 	/// The part of `size` that stays in DRAM whichever tier the object is in.
 	pub dram_resident: u8,
@@ -1724,6 +1742,45 @@ mod tests {
 	/// Run with:
 	/// `V4_MEASURE_N=8388608 V4_MEASURE_SET=v4 cargo test --release --lib -- \
 	///  --ignored --nocapture measure_bytes_per_object`
+	/// The figure that actually matters: the arena carrying the shared node,
+	/// not the eight-byte stand-in the test above uses.
+	///
+	/// `ARENA_MEASURE_N=$((1<<22))`, one process per point, release.
+	#[test]
+	#[ignore]
+	fn measure_node_bytes_per_object() {
+		let Ok(n) = std::env::var("ARENA_MEASURE_N") else {
+			println!("ARENABYTES skipped -- set ARENA_MEASURE_N");
+			return;
+		};
+		let n: usize = n.parse().expect("ARENA_MEASURE_N");
+
+		let base = crate::worker::policy::policy_stack::measure_overhead::allocated_bytes();
+
+		let mut set: ArenaQueueSet<NodePayload> = ArenaQueueSet::default();
+		for i in 0..n as u64 {
+			set.push_front(
+				0,
+				i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+				NodePayload {
+					size: 64,
+					freq: 0,
+					ts: 0,
+					queue: 0,
+					tier: Some(Tier::Fast),
+					phys: Some(Tier::Fast),
+					dram_resident: 0,
+				},
+			);
+		}
+
+		let after = crate::worker::policy::policy_stack::measure_overhead::allocated_bytes();
+		core::hint::black_box(&set);
+
+		let used = after.saturating_sub(base);
+		println!("ARENABYTES {} {} {:.4}", n, used, used as f64 / n as f64);
+	}
+
 	#[test]
 	#[ignore]
 	fn measure_bytes_per_object() {

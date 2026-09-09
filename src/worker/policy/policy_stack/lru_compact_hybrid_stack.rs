@@ -49,7 +49,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		compact_queue_set::CompactQueueSet, narrow_resident, watermarks, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -58,28 +58,11 @@ use crate::{
 /// The single recency order, in the shared queue set's slot 0.
 const Q_LRU: usize = 0;
 
-/// Per-key bookkeeping, carried in the index value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LruPayload {
-	tier: Tier,
-	/// The part of `size` that stays in DRAM in either tier; see `migrating`.
-	dram_resident: u8,
-	size: ObjectSize,
-}
-
-const _: () = assert!(
-	std::mem::size_of::<LruPayload>() == 8,
-	"LruPayload grew past 8 bytes",
-);
-
-impl LruPayload {
-	fn migrating(&self) -> CacheSize {
-		(self.size as CacheSize).saturating_sub(self.dram_resident as CacheSize)
-	}
-}
-
+/// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
+/// This stack reads `tier`, `size` and `dram_resident`; `freq`, `ts`, `queue`
+/// and `phys` belong to other policies and stay at their defaults here.
 pub struct LruCompactHybridStack {
-	list: CompactQueueSet<LruPayload>,
+	list: ArenaQueueSet<NodePayload>,
 
 	fast_capacity: CacheSize,
 	fast_used: CacheSize,
@@ -99,7 +82,7 @@ pub struct LruCompactHybridStack {
 impl LruCompactHybridStack {
 	pub fn new(fast_capacity: CacheSize) -> Self {
 		LruCompactHybridStack {
-			list: CompactQueueSet::default(),
+			list: ArenaQueueSet::default(),
 			fast_capacity,
 			fast_used: 0,
 			slow_used: 0,
@@ -128,7 +111,7 @@ impl LruCompactHybridStack {
 	}
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
-		self.list.payload(key).map(|p| p.tier)
+		self.list.payload(key).and_then(|p| p.tier)
 	}
 
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize, new_resident: u8) {
@@ -141,19 +124,25 @@ impl LruCompactHybridStack {
 		let tier = slot.tier;
 
 		match tier {
-			Tier::Fast => {
+			Some(Tier::Fast) => {
 				self.fast_used = (self.fast_used as i64 + delta).max(0) as CacheSize;
 			},
 
-			Tier::Slow => {
+			Some(Tier::Slow) => {
 				self.slow_used = (self.slow_used as i64 + delta).max(0) as CacheSize;
 			},
+			// The shared node makes `tier` optional because the 2Q and S3-FIFO
+			// families legitimately have a queue with no tier of its own. This
+			// stack always records one, so this arm is unreachable -- and it is
+			// spelled out rather than papered over with `unwrap_or`, which
+			// would silently pick a tier if that ever stopped being true.
+			None => {},
 		}
 	}
 
 	/// Faithful port of `LruHybridStack::touch_fast_key`.
 	fn touch_fast_key(&mut self, key: HashedKey) {
-		let previous_tier = self.list.payload(key).map(|p| p.tier);
+		let previous_tier = self.list.payload(key).and_then(|p| p.tier);
 
 		let already_at_front = self.list.front(Q_LRU) == Some(key);
 		let is_boundary = self.fast_boundary == Some(key);
@@ -185,7 +174,7 @@ impl LruCompactHybridStack {
 			}
 
 			if let Some(slot) = self.list.payload_mut(key) {
-				slot.tier = Tier::Fast;
+				slot.tier = Some(Tier::Fast);
 			}
 
 			if self.fast_boundary.is_none() {
@@ -198,7 +187,7 @@ impl LruCompactHybridStack {
 		// Pushed after settling and guarded on the key still being fast: a
 		// tight budget can demote it straight back out within the same settle,
 		// in which case that call already pushed the correct final entry.
-		if promoted && self.list.payload(key).map(|p| p.tier) == Some(Tier::Fast) {
+		if promoted && self.list.payload(key).and_then(|p| p.tier) == Some(Tier::Fast) {
 			self.migrations.push((key, Tier::Fast));
 		}
 	}
@@ -221,7 +210,7 @@ impl LruCompactHybridStack {
 			let new_boundary = self.list.before(demote_key);
 
 			if let Some(slot) = self.list.payload_mut(demote_key) {
-				slot.tier = Tier::Slow;
+				slot.tier = Some(Tier::Slow);
 			}
 
 			self.fast_used = self.fast_used.saturating_sub(size);
@@ -260,7 +249,15 @@ impl PolicyStack for LruCompactHybridStack {
 			return;
 		}
 
-		self.list.push_front(Q_LRU, key, LruPayload { tier: Tier::Fast, dram_resident, size });
+		self.list.push_front(Q_LRU, key, NodePayload {
+			size,
+			dram_resident,
+			tier: Some(Tier::Fast),
+			phys: Some(Tier::Fast),
+			freq: 0,
+			ts: 0,
+			queue: 0,
+		});
 		self.fast_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
 		self.fast_count += 1;
 
@@ -282,7 +279,7 @@ impl PolicyStack for LruCompactHybridStack {
 		let size = slot.migrating();
 		let tier = slot.tier;
 
-		let new_boundary_if_needed = if tier == Tier::Fast && self.fast_boundary == Some(key) {
+		let new_boundary_if_needed = if tier == Some(Tier::Fast) && self.fast_boundary == Some(key) {
 			self.list.before(key)
 		} else {
 			None
@@ -291,7 +288,7 @@ impl PolicyStack for LruCompactHybridStack {
 		self.list.remove(Q_LRU, key);
 
 		match tier {
-			Tier::Fast => {
+			Some(Tier::Fast) => {
 				self.fast_used = self.fast_used.saturating_sub(size);
 				self.fast_count = self.fast_count.saturating_sub(1);
 
@@ -300,9 +297,15 @@ impl PolicyStack for LruCompactHybridStack {
 				}
 			},
 
-			Tier::Slow => {
+			Some(Tier::Slow) => {
 				self.slow_used = self.slow_used.saturating_sub(size);
 			},
+			// The shared node makes `tier` optional because the 2Q and S3-FIFO
+			// families legitimately have a queue with no tier of its own. This
+			// stack always records one, so this arm is unreachable -- and it is
+			// spelled out rather than papered over with `unwrap_or`, which
+			// would silently pick a tier if that ever stopped being true.
+			None => {},
 		}
 	}
 
@@ -322,7 +325,7 @@ impl PolicyStack for LruCompactHybridStack {
 		let size = slot.migrating();
 
 		match slot.tier {
-			Tier::Fast => {
+			Some(Tier::Fast) => {
 				self.fast_used = self.fast_used.saturating_sub(size);
 				self.fast_count = self.fast_count.saturating_sub(1);
 
@@ -331,9 +334,15 @@ impl PolicyStack for LruCompactHybridStack {
 				}
 			},
 
-			Tier::Slow => {
+			Some(Tier::Slow) => {
 				self.slow_used = self.slow_used.saturating_sub(size);
 			},
+			// The shared node makes `tier` optional because the 2Q and S3-FIFO
+			// families legitimately have a queue with no tier of its own. This
+			// stack always records one, so this arm is unreachable -- and it is
+			// spelled out rather than papered over with `unwrap_or`, which
+			// would silently pick a tier if that ever stopped being true.
+			None => {},
 		}
 
 		Some(key)
