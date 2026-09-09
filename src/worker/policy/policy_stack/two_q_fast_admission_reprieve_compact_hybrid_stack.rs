@@ -138,6 +138,29 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 		self.fast_capacity
 	}
 
+	/// The FIFO's carve-out from the fast tier: its configured capacity, but
+	/// never more of the tier than the tier itself holds.
+	///
+	/// `fifo_capacity` is a fraction of the CACHE size (`k_in * max_size`) and
+	/// nothing ties it to `fast_capacity` -- the factory hands this stack
+	/// `0.2 * max_size` of fast tier, which every `k_in` above 0.2
+	/// over-subscribes on its own. The FIFO is DRAM-resident here, so without
+	/// this clamp the admission queue alone would be entitled to more DRAM than
+	/// the whole fast tier: `effective_main_fast_capacity` saturates to 0 and
+	/// the real ceiling becomes `max(fast_capacity, k_in * max_size)`.
+	///
+	/// The clamp lives in an accessor rather than at either assignment site
+	/// because the two sides move independently: `resize` rewrites
+	/// `fifo_capacity` and `resize_fast_tier` rewrites `fast_capacity`, each
+	/// without touching the other, so a value fixed at assignment time goes
+	/// stale the moment the other one runs.
+	///
+	/// A no-op for every configuration that already fits: when
+	/// `fifo_capacity <= fast_capacity` this IS `fifo_capacity`.
+	fn fifo_carve_out(&self) -> CacheSize {
+		self.fifo_capacity.min(self.fast_capacity)
+	}
+
 	/// The main queue's share of the fast tier. The FIFO is DRAM-resident here,
 	/// so its reservation is carved out of the same budget the main queue
 	/// settles against -- the two compete, where in plain 2Q the FIFO is in
@@ -147,24 +170,45 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 	/// the whole of it: in this variant the FIFO settles against a budget of
 	/// its own and pays the remainder. The non-reprieve stack, whose FIFO is
 	/// unpoliced, charges the entire reservation here.
+	///
+	/// Subtracting the CLAMPED carve-out is arithmetically identical to
+	/// subtracting the raw one -- `saturating_sub` already floors at zero --
+	/// and is written this way so both DRAM segments name one carve-out.
 	fn effective_main_fast_capacity(&self) -> CacheSize {
 		self.fast_capacity
-			.saturating_sub(self.fifo_capacity)
+			.saturating_sub(self.fifo_carve_out())
 			.saturating_sub(self.reserved_shares().1)
 	}
 
 	/// The FIFO's budget net of its share of the metadata reservation. What
 	/// `settle_fifo_queue` settles against.
+	///
+	/// Built on the CLAMPED carve-out, and that is what holds the two
+	/// DRAM-resident segments inside one budget whatever `k_in * max_size`
+	/// is: this one is at most `fifo_carve_out()`, the main segment's is at
+	/// most `fast_capacity - fifo_carve_out()`, so their sum can never exceed
+	/// `fast_capacity` -- and while the reservation itself fits in the tier,
+	/// `effective_fifo_capacity() + effective_main_fast_capacity() +
+	/// reserved_overhead() == fast_capacity` exactly.
+	///
+	/// A FIFO over that budget is not stranded: `settle_fifo_queue` reprieves
+	/// the excess into main as `Tier::Slow`. That is why the clamp is
+	/// actionable in THIS variant, where a fast-admission stack that only
+	/// settles its main segment would have nothing left to demote.
 	fn effective_fifo_capacity(&self) -> CacheSize {
-		self.fifo_capacity.saturating_sub(self.reserved_shares().0)
+		self.fifo_carve_out().saturating_sub(self.reserved_shares().0)
 	}
 
 	/// Splits `reserved_overhead` between the two queues in proportion to
 	/// their fast-tier capacities: `(fifo_share, main_share)`.
 	///
-	/// `fifo_capacity` is clamped to `fast_capacity` first, so a FIFO
+	/// It proportions against [`Self::fifo_carve_out`] -- the same clamped
+	/// carve-out both effective capacities are built on -- so a FIFO
 	/// reservation larger than the whole fast tier takes ALL of the overhead
-	/// and leaves main none, rather than producing a share above 1. Widened to
+	/// and leaves main none, rather than producing a share above 1. One clamp
+	/// in one place: the split and the budgets cannot disagree about how big
+	/// the carve-out is, which is what makes the two shares re-sum to exactly
+	/// the reservation the segments then subtract one apiece. Widened to
 	/// `u128` for the multiply: `reserved * fifo_capacity` overflows `u64` at
 	/// realistic entry counts.
 	fn reserved_shares(&self) -> (CacheSize, CacheSize) {
@@ -174,7 +218,7 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 			return (0, 0);
 		}
 
-		let fifo_capacity = self.fifo_capacity.min(self.fast_capacity);
+		let fifo_capacity = self.fifo_carve_out();
 		let fifo_share =
 			((reserved as u128 * fifo_capacity as u128) / self.fast_capacity as u128) as CacheSize;
 		let main_share = reserved.saturating_sub(fifo_share);
@@ -562,4 +606,90 @@ impl PolicyStack for TwoQFastAdmissionReprieveCompactHybridStack {
 	// NO `needs_capacity_eviction` override, matching the baseline: the FIFO
 	// settles itself, so the trait default (`false`) is correct. The
 	// non-reprieve stack overrides it with `fifo_used > fifo_capacity`.
+}
+
+/// The DRAM ceiling. Both of this stack's fast segments -- the admission FIFO,
+/// which `tier_of` reports as `Fast` structurally, and the main queue's fast
+/// portion -- are budgeted out of one `fast_capacity`, but the FIFO's own cap
+/// is `k_in * max_size`, a fraction of the CACHE that nothing ties to the DRAM
+/// budget. These pin the clamp that reconciles them, including that it is
+/// invisible to configurations that already fit.
+#[cfg(test)]
+mod dram_ceiling_tests {
+	use super::*;
+
+	/// The invariant itself, on the config the clamp exists for: 0.6 * 1_000 =
+	/// 600 B of FIFO against a 400 B fast tier. Before the clamp the FIFO's
+	/// budget was 600 while main saturated to 0, for a real ceiling of 600.
+	#[test]
+	fn dram_segments_never_over_subscribe_the_fast_tier() {
+		let stack = TwoQFastAdmissionReprieveCompactHybridStack::new(0.6, 1_000, 400);
+
+		assert_eq!(
+			stack.effective_fifo_capacity() + stack.effective_main_fast_capacity(),
+			stack.fast_capacity(),
+			"the two DRAM segments must fill the fast tier exactly, never exceed it",
+		);
+	}
+
+	/// The clamp must not double-charge the metadata reservation: each segment
+	/// subtracts only its OWN share and the two shares re-sum to
+	/// `reserved_overhead()`. Checked in the clamped regime, where the FIFO's
+	/// share is the whole reservation and main's is nothing.
+	#[test]
+	fn clamped_segments_still_split_one_reservation() {
+		let mut stack = TwoQFastAdmissionReprieveCompactHybridStack::new(0.6, 1_000, 400)
+			.with_shared_overhead(10);
+
+		for key in 1..=5 {
+			stack.insert(key, 20);
+		}
+
+		assert_eq!(stack.reserved_overhead(), 50, "five tracked keys at 10 B each");
+		assert_eq!(
+			stack.effective_fifo_capacity()
+				+ stack.effective_main_fast_capacity()
+				+ stack.reserved_overhead(),
+			stack.fast_capacity(),
+			"both data budgets plus ONE reservation, never the reservation twice",
+		);
+	}
+
+	/// The clamp must be invisible to every configuration that already fits --
+	/// which is every published sweep, and those runs have to stay identical.
+	/// 0.25 * 1_000 = 250 sits inside a 400 B tier, so both budgets are the raw
+	/// pre-clamp arithmetic.
+	#[test]
+	fn a_fitting_carve_out_is_untouched() {
+		let stack = TwoQFastAdmissionReprieveCompactHybridStack::new(0.25, 1_000, 400);
+
+		assert_eq!(stack.effective_fifo_capacity(), 250);
+		assert_eq!(stack.effective_main_fast_capacity(), 150);
+	}
+
+	/// Why the clamp is an accessor and not a value fixed at construction: only
+	/// `fast_capacity` moves here, and the FIFO's budget has to move with it.
+	/// The reprieve is what makes that enforceable -- the overflow splices into
+	/// main as `Tier::Slow` rather than waiting on an eviction that this stack
+	/// never asks for.
+	#[test]
+	fn shrinking_the_fast_tier_spills_the_admission_queue() {
+		let mut stack = TwoQFastAdmissionReprieveCompactHybridStack::new(0.25, 1_000, 400);
+
+		for key in 1..=5 {
+			stack.insert(key, 50);
+		}
+
+		assert_eq!(stack.fast_bytes_used(), 250, "all five admitted straight to DRAM");
+
+		stack.resize_fast_tier(100);
+
+		assert!(
+			stack.fast_bytes_used() <= stack.fast_capacity(),
+			"fast tier holds {} B on a {} B budget",
+			stack.fast_bytes_used(),
+			stack.fast_capacity(),
+		);
+		assert_eq!(stack.slow_object_count(), 3, "the excess is reprieved into PMEM");
+	}
 }

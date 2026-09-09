@@ -20,16 +20,24 @@
 //!    on the calling thread (`hybrid_policy::admission_tier` returns `Fast`
 //!    for a brand-new key under this policy).
 //!
-//! 2. **The two fast segments share one budget.** `one_access_capacity` is a
-//!    fixed carve-out of `fast_capacity` (`raw_main_fast_capacity()`), and the
-//!    shared-metadata reservation is split *proportionally* between the two
-//!    segments (`reserved_shares`, following `LruSizedHybridStack`) so that
+//! 2. **The two fast segments share one budget.** `one_access_capacity` is
+//!    sized from `max_size` -- the CACHE budget -- so it is taken as a
+//!    carve-out of `fast_capacity` only up to what the fast tier can pay for
+//!    (`raw_one_access_capacity()`); whatever is left over is the main
+//!    queue's fast segment (`raw_main_fast_capacity()`). The shared-metadata
+//!    reservation is then split *proportionally* between the two segments
+//!    (`reserved_shares`, following `LruSizedHybridStack`) so that
 //!    `effective_one_access_capacity() + effective_main_fast_capacity() +
-//!    reserved_overhead() == fast_capacity`. The main queue's demotion trigger
-//!    reads `effective_main_fast_capacity()`; the one-access queue's eviction
-//!    trigger reads `effective_one_access_capacity()`. `resize` re-runs
-//!    `settle_fast_tier` because growing `one_access_capacity` shrinks what is
-//!    left for the main queue's fast segment.
+//!    reserved_overhead() == fast_capacity`. That holds for EVERY
+//!    `(one_access_ratio, max_size, fast_capacity)`, including the ones where
+//!    `one_access_ratio * max_size` on its own would exceed the whole fast
+//!    tier: both segments are DRAM here, so a queue capped from the cache
+//!    budget would otherwise let this stack hold `max(fast_capacity,
+//!    one_access_ratio * max_size)` bytes of DRAM. The main queue's demotion
+//!    trigger reads `effective_main_fast_capacity()`; the one-access queue's
+//!    eviction trigger reads `effective_one_access_capacity()`. `resize`
+//!    re-runs `settle_fast_tier` because growing `one_access_capacity`
+//!    shrinks what is left for the main queue's fast segment.
 //!
 //! 3. **Demotion is lazy.** `settle_fast_tier` gives a `main_boundary`
 //!    candidate whose reference bit is set a reprieve -- move to the front of
@@ -179,13 +187,42 @@ impl S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
 		self.queues.len() as CacheSize * self.shared_overhead + self.ghost.dram_bytes()
 	}
 
+	/// The one-access queue's carve-out as the FAST TIER can pay for it, before
+	/// the shared-metadata reservation.
+	///
+	/// The `one_access_capacity` field is `one_access_ratio * max_size`: a slice
+	/// of the CACHE budget, which says nothing about how much DRAM this stack
+	/// was given. Every admission lands in the one-access queue and that queue
+	/// is DRAM in this variant (point 1 in the module doc), so charging it
+	/// against the cache budget lets it draw DRAM that `fast_capacity` never
+	/// granted: `raw_main_fast_capacity()` saturates to 0, `settle_fast_tier`
+	/// duly drains the main queue's fast segment to nothing, and then nothing
+	/// at all bounds the segment that is actually over -- `settle_fast_tier`
+	/// governs only the main queue, and `needs_capacity_eviction` compares
+	/// `one_access_used` against a cap bigger than the whole tier. Clamping is
+	/// what makes the two DRAM-resident segments sum to `fast_capacity` in that
+	/// configuration instead of to `max(fast_capacity, ratio * max_size)`.
+	///
+	/// Computed here rather than clamped where the field is assigned because
+	/// `resize_fast_tier` moves `fast_capacity` at runtime; a value fixed in
+	/// `new`/`resize` would go stale the moment the budget changed. A pure
+	/// no-op whenever the carve-out already fits
+	/// (`one_access_ratio * max_size <= fast_capacity`), which is every
+	/// configuration swept to date -- `min` returns the raw field unchanged,
+	/// equality included.
+	fn raw_one_access_capacity(&self) -> CacheSize {
+		self.one_access_capacity.min(self.fast_capacity)
+	}
+
 	/// The main queue's fast-segment budget *before* the shared-metadata
-	/// reservation -- `fast_capacity` minus the one-access queue's fixed
-	/// carve-out. Kept separate from `effective_main_fast_capacity` so
+	/// reservation -- `fast_capacity` minus the one-access queue's carve-out.
+	/// Reads `raw_one_access_capacity()`, which is already clamped to the
+	/// budget, so this stays a genuine remainder rather than a saturation to
+	/// zero. Kept separate from `effective_main_fast_capacity` so
 	/// `reserved_shares` has a reservation-free capacity to proportion against
 	/// (using the effective one would be circular).
 	fn raw_main_fast_capacity(&self) -> CacheSize {
-		self.fast_capacity.saturating_sub(self.one_access_capacity)
+		self.fast_capacity.saturating_sub(self.raw_one_access_capacity())
 	}
 
 	/// Splits `reserved_overhead()` proportionally between this stack's two
@@ -197,7 +234,12 @@ impl S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
 	fn reserved_shares(&self) -> (CacheSize, CacheSize) {
 		let reserved = self.reserved_overhead();
 
-		let one_access_capacity = self.one_access_capacity;
+		// Both terms are slices of `fast_capacity` -- the first clamped to it,
+		// the second its remainder -- so `total_capacity` IS the fast tier and
+		// the split apportions the real budget. Proportioning against the raw
+		// `one_access_capacity` field would divide the reservation by a
+		// cache-sized number that can exceed the DRAM this stack holds.
+		let one_access_capacity = self.raw_one_access_capacity();
 		let main_capacity = self.raw_main_fast_capacity();
 		let total_capacity = one_access_capacity + main_capacity;
 
@@ -214,9 +256,13 @@ impl S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
 
 	/// The one-access queue's own byte cap after giving up its share of the
 	/// shared-metadata reservation. With no reservation wired in this is the
-	/// raw cap.
+	/// raw cap -- `raw_one_access_capacity()`, the carve-out the fast tier can
+	/// pay for, never the cache-sized `one_access_capacity` field. This is the
+	/// number `needs_capacity_eviction` polices a DRAM-resident queue with, so
+	/// reading the field here is what would let that queue outgrow
+	/// `fast_capacity` entirely.
 	fn effective_one_access_capacity(&self) -> CacheSize {
-		self.one_access_capacity.saturating_sub(self.reserved_shares().0)
+		self.raw_one_access_capacity().saturating_sub(self.reserved_shares().0)
 	}
 
 	/// The budget actually available to the main queue's fast segment: raw
@@ -670,5 +716,90 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
 		// Against `effective_one_access_capacity()`, i.e. this segment's own cap
 		// minus its proportional share of the shared-metadata reservation.
 		self.one_access_used > self.effective_one_access_capacity()
+	}
+}
+
+#[cfg(test)]
+mod fast_budget_tests {
+	use super::*;
+
+	/// Both of this stack's segments are DRAM (the one-access queue is
+	/// `Tier::Fast` in this variant), so their effective caps plus the
+	/// reservation they were jointly charged for ARE the fast tier -- the
+	/// invariant the module doc states. An admission into a DRAM-resident queue
+	/// has to draw down the DRAM budget, not the cache budget.
+	///
+	/// The configurations that matter are the ones where
+	/// `one_access_ratio * max_size` alone exceeds `fast_capacity`:
+	/// `one_access_capacity` is sized from the cache budget and nothing in
+	/// `new`/`resize` relates it to the DRAM budget, so without the clamp in
+	/// `raw_one_access_capacity()` the one-access queue is capped ABOVE the
+	/// whole tier while `raw_main_fast_capacity()` saturates to 0 -- and
+	/// `settle_fast_tier`, which governs only the main queue, cannot pull any
+	/// of it back.
+	#[test]
+	fn the_two_fast_segments_never_exceed_the_fast_budget() {
+		const MAX_SIZE: CacheSize = 12_000_000_000;
+		const FAST_CAPACITY: CacheSize = 4 * 1024 * 1024 * 1024;
+
+		for ratio in [0.0f64, 0.1, 0.25, 0.3, 0.5, 1.0] {
+			let mut stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(
+				ratio,
+				MAX_SIZE,
+				FAST_CAPACITY,
+			).with_shared_overhead(224);
+
+			// A populated stack, so `reserved_overhead()` is a real number and
+			// the proportional split is actually exercised rather than trivially
+			// zero.
+			for i in 0..1_000u64 {
+				stack.insert(i, 4_096);
+			}
+
+			let total = stack.effective_one_access_capacity()
+				+ stack.effective_main_fast_capacity()
+				+ stack.reserved_overhead();
+
+			assert!(
+				total <= FAST_CAPACITY,
+				"ratio {ratio}: the DRAM-resident caps sum to {total}, over the \
+				 {FAST_CAPACITY} byte fast tier",
+			);
+
+			// And exactly, not merely under: `reserved_shares` hands the
+			// remainder to main so the two shares re-sum to the reservation, and
+			// the `saturating_sub`s in the effective accessors lose nothing
+			// until a share outgrows its own segment.
+			assert_eq!(
+				total, FAST_CAPACITY,
+				"ratio {ratio}: the split must account for the budget exactly",
+			);
+		}
+	}
+
+	/// The clamp must be invisible to every configuration that already fits --
+	/// which is every published sweep -- so those results stay bit-identical.
+	#[test]
+	fn a_carve_out_that_fits_is_untouched() {
+		const MAX_SIZE: CacheSize = 12_000_000_000;
+		const FAST_CAPACITY: CacheSize = 4 * 1024 * 1024 * 1024;
+
+		// 0.1 * MAX_SIZE = 1.2e9, comfortably inside the 4 GiB budget.
+		let stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(
+			0.1,
+			MAX_SIZE,
+			FAST_CAPACITY,
+		).with_shared_overhead(224);
+
+		assert_eq!(
+			stack.raw_one_access_capacity(),
+			stack.one_access_capacity,
+			"a carve-out under the budget must pass through unchanged",
+		);
+		assert_eq!(
+			stack.effective_main_fast_capacity(),
+			FAST_CAPACITY - stack.one_access_capacity - stack.reserved_shares().1,
+			"and the main segment must still get the plain remainder",
+		);
 	}
 }
