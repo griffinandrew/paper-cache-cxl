@@ -19,6 +19,7 @@ mod s_three_fifo_stack;
 pub(crate) mod ghost_filter;
 
 pub(crate) mod compact_queue_set;
+pub mod arena_queue_set;
 pub(crate) mod compact_frequency_chain;
 #[cfg(test)]
 mod measure_overhead;
