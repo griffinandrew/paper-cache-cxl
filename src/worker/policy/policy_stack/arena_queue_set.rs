@@ -127,61 +127,26 @@
 //! the slot to 24 rather than staying at 16. That costs 8 B/object in the slab
 //! and still saves far more than it costs in the index.
 //!
-//! # Deletion, which is where the bugs live
+//! # Where the index went
 //!
-//! Open addressing cannot blank a bucket on removal: every entry after it in
-//! the same probe run becomes unreachable. The two repairs are tombstones plus
-//! a rehash policy, or **backward-shift deletion**, and this uses the latter.
+//! Into [`arena_index`], and the two sections that used to close this doc went
+//! with it -- why a removal is a backward shift rather than a tombstone, and
+//! what the Fibonacci mix does and does not buy on a real trace.
 //!
-//! The reason is the workload. A cache at capacity performs one removal per
-//! admission, forever. Under tombstones that is one tombstone per admission
-//! forever: the table's effective load rises with no bound on the count, probe
-//! runs lengthen monotonically between rehashes, and the rehash -- when its
-//! threshold finally trips -- is a full-table stall on the policy worker,
-//! repeated for the life of the process. It also introduces a tuning knob
-//! nobody can set from first principles. Backward-shift deletion restores the
-//! table to precisely the state it would have been in had the removed key never
-//! been inserted, so steady-state churn has no drift and no periodic stall, at
-//! the cost of a short bounded shift on the delete itself. See `erase_at`.
+//! It moved because there are now TWO structures over this node. This one holds
+//! `MAX_QUEUES` queues in a fixed `[u32; 4]` of heads and tails.
+//! [`ArenaFrequencyChain`] holds one ordered bucket per DISTINCT FREQUENCY,
+//! because LFU eviction has to find the minimum and a four-queue tag cannot
+//! express that. The orders differ; the index does not, and one copy of
+//! backward-shift deletion is enough.
 //!
-//! # Hash distribution
-//!
-//! `HashedKey` is already a hash, which is why `CompactQueueSet` indexes it
-//! under `NoHasher` -- but hashbrown still mixes internally to derive its
-//! control byte, and a bare `key & mask` here would not. The bucket is taken
-//! from the HIGH bits of a Fibonacci multiply (`key * 2^64/phi >> shift`),
-//! which is one `imul` and one shift and makes every input bit reach the
-//! bucket.
-//!
-//! MEASURED on cluster26 rather than on `0..n`, which is the one input any
-//! mixer looks perfect on. Successful-lookup probe lengths, `1` meaning the
-//! key was in its own home bucket:
-//!
-//! ```text
-//!                        load   mean   p50  p90  p99  p999  max
-//! 2.16M keys / 2^23      0.258  1.174   1    2    3     6    16
-//! 4.19M keys / 2^23      0.500  1.500   1    3    7    13    53
-//! ```
-//!
-//! Access-weighted over 20.1M and 41.9M accesses respectively the means are
-//! 1.158 and 1.453 -- slightly better than per-key, so the hot keys are not the
-//! displaced ones. Both means are the closed form for linear probing,
-//! `(1 + 1/(1-a))/2`, to three decimals, which says the mix leaves nothing
-//! clustered on this trace.
-//!
-//! It also says the mix buys nothing HERE. Running the same keys through a bare
-//! `key & mask` in the same table gives 1.173 and 1.500 -- indistinguishable --
-//! whether the key is `RandomState::hash_one`'d as the shipped cache does it or
-//! the trace's raw `u64` is used directly. cluster26's keys are already spread
-//! in their low bits. The mix is kept anyway: it costs one `imul` on a path
-//! that then misses to DRAM, and it is the difference between a bound that
-//! holds for any key distribution and one that holds for this trace.
+//! [`arena_index`]: super::arena_index
+//! [`ArenaFrequencyChain`]: super::arena_frequency_chain::ArenaFrequencyChain
 
 use crate::{ObjectSize, worker::policy::policy_stack::{HashedKey, Tier}};
 
-/// Sentinel for "no slot", and for "empty bucket" in the index. `u32::MAX`
-/// rather than `Option<u32>` so a slot stays 16 bytes plus its payload.
-pub const NIL: u32 = u32::MAX;
+pub use super::arena_index::{ArenaSlot, NIL};
+use super::arena_index::{KeylessIndex, SlotVec, U32Vec, new_slot_vec, new_u32_vec};
 
 // ---------------------------------------------------------------------------
 // the one node payload
@@ -284,56 +249,6 @@ impl NodePayload {
 /// `LruSizedHybridStack` uses 4.
 pub const MAX_QUEUES: usize = 4;
 
-/// 2^64 / phi, rounded to an odd integer. Odd is what makes the multiply a
-/// bijection on `u64`, so distinct keys stay distinct before the shift.
-const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// Smallest index table. Below this the shift arithmetic buys nothing and the
-/// table is a rounding error anyway.
-const MIN_BUCKETS: usize = 16;
-
-/// One node: the links, the key that names the victim on eviction, AND the
-/// payload the index used to carry.
-///
-/// 16 bytes for a ZST payload, 24 for every 8-byte hybrid payload in this
-/// crate.
-#[derive(Clone, Copy, Debug)]
-pub struct ArenaSlot<P> {
-	pub key: HashedKey,
-	pub prev: u32,
-	pub next: u32,
-	pub payload: P,
-}
-
-// Under `eviction_stacks_pmem` the whole structure is allocated through the
-// crate-wide `Hybrid` allocator (the far CXL/PMEM node), exactly as
-// `CompactQueueSet` is. Not optional: `get_hybrid_dram_shared_overhead` drops
-// the eviction-stack term to zero under that feature on the premise the stack
-// is not in DRAM.
-#[cfg(not(feature = "eviction_stacks_pmem"))]
-type SlotVec<P> = Vec<ArenaSlot<P>>;
-#[cfg(feature = "eviction_stacks_pmem")]
-type SlotVec<P> = Vec<ArenaSlot<P>, crate::Hybrid>;
-
-#[cfg(not(feature = "eviction_stacks_pmem"))]
-type U32Vec = Vec<u32>;
-#[cfg(feature = "eviction_stacks_pmem")]
-type U32Vec = Vec<u32, crate::Hybrid>;
-
-#[cfg(not(feature = "eviction_stacks_pmem"))]
-fn new_collections<P>() -> (SlotVec<P>, U32Vec, U32Vec) {
-	(Vec::new(), Vec::new(), Vec::new())
-}
-
-#[cfg(feature = "eviction_stacks_pmem")]
-fn new_collections<P>() -> (SlotVec<P>, U32Vec, U32Vec) {
-	(
-		Vec::new_in(crate::Hybrid),
-		Vec::new_in(crate::Hybrid),
-		Vec::new_in(crate::Hybrid),
-	)
-}
-
 /// `MAX_QUEUES` intrusive doubly-linked queues over one slab, indexed by a
 /// keyless open-addressed table of slot numbers.
 ///
@@ -347,14 +262,10 @@ pub struct ArenaQueueSet<P: Copy> {
 	free: U32Vec,
 
 	/// Open-addressed, linear-probed table of slot numbers. `NIL` is empty.
-	/// Holds NO keys: a probe verifies against `slots[i].key`.
-	buckets: U32Vec,
-	/// `64 - log2(buckets.len())`, so the bucket is the high bits of the mix.
-	/// Meaningless, and never used, while `buckets` is empty.
-	bucket_shift: u32,
-	/// Occupied buckets. Equal to `len()`, kept separately so the index does
-	/// not depend on the order in which a caller links and indexes a slot.
-	live: usize,
+	/// Holds NO keys: a probe verifies against `slots[i].key`. Shared with
+	/// [`ArenaFrequencyChain`](super::arena_frequency_chain::ArenaFrequencyChain),
+	/// which needs the same index under different orders.
+	index: KeylessIndex,
 
 	heads: [u32; MAX_QUEUES],
 	tails: [u32; MAX_QUEUES],
@@ -363,13 +274,10 @@ pub struct ArenaQueueSet<P: Copy> {
 
 impl<P: Copy> Default for ArenaQueueSet<P> {
 	fn default() -> Self {
-		let (slots, buckets, free) = new_collections();
 		ArenaQueueSet {
-			slots,
-			free,
-			buckets,
-			bucket_shift: 63,
-			live: 0,
+			slots: new_slot_vec(),
+			free: new_u32_vec(),
+			index: KeylessIndex::default(),
 			heads: [NIL; MAX_QUEUES],
 			tails: [NIL; MAX_QUEUES],
 			lens: [0; MAX_QUEUES],
@@ -378,224 +286,28 @@ impl<P: Copy> Default for ArenaQueueSet<P> {
 }
 
 // ---------------------------------------------------------------------------
-// The keyless index.
-//
-// Everything in this block is private. The only thing the rest of the structure
-// knows about it is `index_get`, `index_insert` and `index_remove`.
+// The keyless index, which lives in `arena_index` because the frequency chain
+// needs the same one. These three forward to it; nothing else here knows it
+// exists.
 // ---------------------------------------------------------------------------
 
 impl<P: Copy> ArenaQueueSet<P> {
-	/// Bucket a key belongs in: the high bits of a Fibonacci multiply.
-	///
-	/// The high bits and not the low ones because the multiply carries
-	/// information upward -- bit 63 of the product depends on every bit of the
-	/// key, bit 0 depends only on bit 0.
-	#[inline(always)]
-	fn home(&self, key: HashedKey) -> usize {
-		(key.wrapping_mul(GOLDEN) >> self.bucket_shift) as usize
-	}
-
 	/// Slot holding `key`, or `NIL`.
 	#[inline]
 	fn index_get(&self, key: HashedKey) -> u32 {
-		if self.buckets.is_empty() {
-			return NIL;
-		}
-
-		let mask = self.buckets.len() - 1;
-		let mut b = self.home(key);
-
-		loop {
-			let slot = self.buckets[b];
-
-			if slot == NIL {
-				return NIL;
-			}
-
-			if self.slots[slot as usize].key == key {
-				return slot;
-			}
-
-			b = (b + 1) & mask;
-		}
-	}
-
-	/// The bucket holding `key`, or `None`. Separate from `index_get` because
-	/// removal needs the bucket and lookup needs the slot.
-	#[inline]
-	fn index_bucket_of(&self, key: HashedKey) -> Option<usize> {
-		if self.buckets.is_empty() {
-			return None;
-		}
-
-		let mask = self.buckets.len() - 1;
-		let mut b = self.home(key);
-
-		loop {
-			let slot = self.buckets[b];
-
-			if slot == NIL {
-				return None;
-			}
-
-			if self.slots[slot as usize].key == key {
-				return Some(b);
-			}
-
-			b = (b + 1) & mask;
-		}
+		self.index.get(&self.slots, key)
 	}
 
 	/// Places an ALREADY-ALLOCATED slot in the index. `slots[slot].key` must
 	/// already be written, since that is the only copy of the key there is.
 	fn index_insert(&mut self, slot: u32) {
-		self.grow_for_one_more();
-
-		let key = self.slots[slot as usize].key;
-		let mask = self.buckets.len() - 1;
-		let mut b = self.home(key);
-
-		loop {
-			let occupant = self.buckets[b];
-
-			if occupant == NIL {
-				self.buckets[b] = slot;
-				self.live += 1;
-				return;
-			}
-
-			debug_assert!(
-				self.slots[occupant as usize].key != key,
-				"ArenaQueueSet indexed the same key twice",
-			);
-
-			b = (b + 1) & mask;
-		}
+		self.index.insert(&self.slots, slot);
 	}
 
 	/// Removes `key` from the index, returning its slot.
 	fn index_remove(&mut self, key: HashedKey) -> Option<u32> {
-		let bucket = self.index_bucket_of(key)?;
-		let slot = self.buckets[bucket];
-
-		self.erase_at(bucket);
-		self.live -= 1;
-
-		Some(slot)
+		self.index.remove(&self.slots, key)
 	}
-
-	/// Backward-shift deletion (Knuth's Algorithm R for linear probing).
-	///
-	/// Blanking `hole` would strand every entry after it whose probe run passes
-	/// through `hole`. So the run is walked forward, and each entry is pulled
-	/// back into the hole when doing so does not put it BEFORE its own home
-	/// bucket -- which is exactly the condition that its displacement from home
-	/// is at least the distance from the hole. The hole travels with it. The
-	/// walk stops at the first genuinely empty bucket, which bounds the work by
-	/// the length of one probe run.
-	///
-	/// The result is the table that would have existed had the key never been
-	/// inserted, so there is no tombstone to accumulate and no rehash to
-	/// schedule.
-	fn erase_at(&mut self, bucket: usize) {
-		let mask = self.buckets.len() - 1;
-
-		let mut hole = bucket;
-		let mut probe = hole;
-
-		loop {
-			probe = (probe + 1) & mask;
-
-			let slot = self.buckets[probe];
-
-			if slot == NIL {
-				break;
-			}
-
-			let home = self.home(self.slots[slot as usize].key);
-
-			// Displacement of the probed entry from its home, against the
-			// distance it would have to travel back. Both measured cyclically,
-			// which is what makes this correct across the table's wrap point.
-			let displaced = probe.wrapping_sub(home) & mask;
-			let distance = probe.wrapping_sub(hole) & mask;
-
-			if displaced >= distance {
-				self.buckets[hole] = slot;
-				hole = probe;
-			}
-		}
-
-		self.buckets[hole] = NIL;
-	}
-
-	/// Doubles the table when the next insertion would take it past half full.
-	///
-	/// Half full and not the 87.5% hashbrown uses, because the load factor here
-	/// buys two different things at once: it is the whole memory cost of the
-	/// index (4 bytes per bucket, so 8 B/object at 2x slack) AND the thing that
-	/// keeps linear-probe runs short. 8 B/object is cheap enough that trading
-	/// it for short runs is not a close call.
-	fn grow_for_one_more(&mut self) {
-		let capacity = self.buckets.len();
-
-		if capacity != 0 && (self.live + 1) * 2 <= capacity {
-			return;
-		}
-
-		let wanted = if capacity == 0 { MIN_BUCKETS } else { capacity * 2 };
-		self.rehash_into(wanted);
-	}
-
-	/// Rebuilds the index at `capacity` buckets, which must be a power of two.
-	fn rehash_into(&mut self, capacity: usize) {
-		debug_assert!(capacity.is_power_of_two());
-		debug_assert!(self.live * 2 <= capacity);
-
-		let old = core::mem::replace(&mut self.buckets, new_buckets(capacity));
-		self.bucket_shift = 64 - capacity.trailing_zeros();
-
-		let mask = capacity - 1;
-
-		for slot in old.iter().copied() {
-			if slot == NIL {
-				continue;
-			}
-
-			let key = self.slots[slot as usize].key;
-			let mut b = self.home(key);
-
-			while self.buckets[b] != NIL {
-				b = (b + 1) & mask;
-			}
-
-			self.buckets[b] = slot;
-		}
-	}
-
-	/// Sizes the index so `additional` more keys fit without a rehash.
-	fn index_reserve(&mut self, additional: usize) {
-		let wanted = (self.live + additional)
-			.saturating_mul(2)
-			.max(MIN_BUCKETS)
-			.next_power_of_two();
-
-		if wanted > self.buckets.len() {
-			self.rehash_into(wanted);
-		}
-	}
-}
-
-#[cfg(not(feature = "eviction_stacks_pmem"))]
-fn new_buckets(capacity: usize) -> U32Vec {
-	vec![NIL; capacity]
-}
-
-#[cfg(feature = "eviction_stacks_pmem")]
-fn new_buckets(capacity: usize) -> U32Vec {
-	let mut buckets = Vec::with_capacity_in(capacity, crate::Hybrid);
-	buckets.resize(capacity, NIL);
-	buckets
 }
 
 // ---------------------------------------------------------------------------
@@ -615,7 +327,7 @@ impl<P: Copy> ArenaQueueSet<P> {
 	/// Buckets in the index. Exposed for the probe-length measurement, which
 	/// has to know the table size to reason about a run.
 	pub fn index_capacity(&self) -> usize {
-		self.buckets.len()
+		self.index.capacity()
 	}
 
 	/// Pre-sizes the slab and the index. Growth is never in place: every `Vec`
@@ -624,7 +336,7 @@ impl<P: Copy> ArenaQueueSet<P> {
 	/// latency percentiles structurally cannot observe.
 	pub fn reserve(&mut self, objects: usize) {
 		self.slots.reserve(objects);
-		self.index_reserve(objects);
+		self.index.reserve(&self.slots, objects);
 	}
 
 	pub fn len(&self) -> usize {
@@ -837,8 +549,7 @@ impl<P: Copy> ArenaQueueSet<P> {
 
 		// The table keeps its capacity, exactly as `HashMap::clear` does, so a
 		// cleared-and-refilled stack does not pay the doubling ladder twice.
-		self.buckets.fill(NIL);
-		self.live = 0;
+		self.index.clear();
 
 		self.heads = [NIL; MAX_QUEUES];
 		self.tails = [NIL; MAX_QUEUES];
@@ -849,6 +560,7 @@ impl<P: Copy> ArenaQueueSet<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::worker::policy::policy_stack::arena_index::GOLDEN;
 	use crate::worker::policy::policy_stack::compact_queue_set::CompactQueueSet;
 
 	/// Stand-in for a real stack payload: LRU, 2Q and S3-FIFO entries are all
@@ -1179,7 +891,7 @@ mod tests {
 			s.push_back(0, k, p(i as u8));
 		}
 		for &k in &run {
-			assert_eq!(s.home(k), 300, "test key did not land in the intended bucket");
+			assert_eq!(s.index.home(k), 300, "test key did not land in the intended bucket");
 		}
 
 		s.remove(0, run[4]);
@@ -1463,15 +1175,17 @@ mod tests {
 	/// Buckets examined by a successful lookup of `key`. One means the key was
 	/// found in its own home bucket.
 	fn probe_length(set: &ArenaQueueSet<P>, key: HashedKey) -> Option<usize> {
-		if set.buckets.is_empty() {
+		let capacity = set.index.capacity();
+
+		if capacity == 0 {
 			return None;
 		}
 
-		let mask = set.buckets.len() - 1;
-		let mut b = set.home(key);
+		let mask = capacity - 1;
+		let mut b = set.index.home(key);
 
 		for probes in 1usize.. {
-			let slot = set.buckets[b];
+			let slot = set.index.bucket(b);
 
 			if slot == NIL {
 				return None;

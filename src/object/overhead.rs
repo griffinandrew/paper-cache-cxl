@@ -341,10 +341,9 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// Structurally identical to `LruCompactHybrid`, and deliberately so:
 		// one slab slot plus one index row either way, since a key is in
 		// exactly one tier's structure at a time and is never charged twice.
-		// The frequency counter rides inside the 8-byte payload
-		// `CompactFrequencyChain`'s index row already carries -- it is
-		// capped at `FREQUENCY_CAP`, which is what keeps it inside the
-		// payload rather than growing a field of its own. See
+		// The frequency counter rides inside the 16-byte `NodePayload` the
+		// arena node already carries, which every converted hybrid carries
+		// whether or not it reads the field. See
 		// `lru_lfu_compact_hybrid_stack.rs`'s module doc.
 		PaperPolicy::LruLfuCompactHybrid(_) => LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
@@ -567,31 +566,65 @@ pub const HASHTABLE_ENTRY_OVERHEAD: ObjectSize = 11;
 /// residue above 40 is a fixed intercept, not a per-object term, which is why
 /// it shrinks with n.
 ///
-/// `lfu-compact-hybrid` is the control and it did not move. It ranks by
-/// frequency through `CompactFrequencyChain`'s ordered bucket maps -- one
-/// bucket per distinct frequency, because eviction has to find the minimum --
-/// which a fixed four-queue tag cannot express, so it was not converted and
-/// keeps 72. That it still measures 72 is the evidence the harness did not
-/// move underneath the other four.
+/// `lfu-compact-hybrid` was the control in THAT run and did not move, because
+/// it had not been converted. It has been converted since. `CompactQueueSet`
+/// could not hold it -- LFU needs one ordered bucket per DISTINCT FREQUENCY,
+/// because eviction has to find the minimum, which a fixed four-queue tag
+/// cannot express -- so it moved to `ArenaFrequencyChain` instead, which keeps
+/// the ordered bucket maps and puts the arena's 32-byte node and keyless index
+/// underneath them. Re-measured the same way:
+///
+/// ```text
+///   policy                            2^20      2^21      2^22      2^23
+///   lfu-compact-hybrid             40.2252   40.1126   40.0556   40.0263
+///   lru-lfu-compact-hybrid-2       40.2274   40.1137   40.0561   40.0266
+///   lru-compact-hybrid (control)   40.2100   40.1050   40.0518   40.0244
+/// ```
+///
+/// The control role passed to this constant's own policy, and it reproduced
+/// 40.2100 / 40.1050 / 40.0518 / 40.0244 to four decimal places on the
+/// converted tree -- which is the evidence the harness did not move underneath
+/// LFU. The same binaries put the unconverted LFU at 72.5952 / 72.2962 /
+/// 72.1451 / 72.0707, measured from a `git archive` of the pre-conversion
+/// commit.
+///
+/// LFU sits ~0.002 B/object above LRU at every point because
+/// `ArenaFrequencyChain` also carries two ordered bucket maps. Those are
+/// O(DISTINCT FREQUENCIES), not O(objects): the gap is a fixed ~15 KB at every
+/// population measured, which is why it shrinks with n rather than holding.
 const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `LfuCompactHybridStack`'s eviction-stack
 /// bookkeeping.
 ///
-/// One slab slot (32 -- key 8, prev/next 4 each, freq 4, size 4, tier and
-/// resident 1 each, padded) plus one `HashMap<HashedKey, u32>` index entry
-/// (16 with hashbrown's slack). There is no third structure: the slot the
-/// index returns already carries tier and size, so the separate `entries` map
-/// that the split LFU hybrid paid a further 20 B/object for does not exist
-/// here.
+/// One `ArenaFrequencyChain` node -- key 8, prev 4, next 4, `NodePayload` 16 --
+/// plus the keyless index that finds it, four bytes a bucket at the half load
+/// it grows to, so 8 B/object. There is no third structure and no `entries`
+/// map: the slot the index returns already carries tier, size and count.
 ///
-/// Unlike every other constant in this block, this one is **measured**:
-/// 47.4 B/key as an RSS delta over two million keys, against this model's
-/// 48. `FrequencyChain` measured 95.9 against its model of 93.
+/// It was 72 while the chain kept a `HashMap<HashedKey, (u32, CompactEntry)>`
+/// index, which stored every key a SECOND time so a probe could compare it --
+/// the same eight bytes the slot already carried so an eviction could name its
+/// victim. That index was 56 B/object. Replacing it with bare `u32` slot
+/// numbers verified against the slot's own key costs 16 bytes of node (the
+/// payload moves in, and it is the shared 16-byte `NodePayload` rather than a
+/// 12-byte `CompactEntry`) and saves 48 of index.
 ///
-/// MEASURED, not derived: the least-squares slope of jemalloc
-/// `stats.allocated` against object count, one point per process at
-/// 2^20..2^23 objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
+/// MEASURED, not derived: jemalloc `stats.allocated`, ONE PROCESS PER POINT, at
+/// powers of two, `MEASURE_POLICY=lfu-compact-hybrid`. Before is a `git
+/// archive` of the pre-conversion commit, built and run the same way:
+///
+/// ```text
+///   n         before    after
+///   2^20     72.5952  40.2252
+///   2^21     72.2962  40.1126
+///   2^22     72.1451  40.0556
+///   2^23     72.0707  40.0263
+/// ```
+///
+/// Forty is PREDICTED and not merely fitted -- 32 of node and 8 of index -- and
+/// the residue above it is a fixed intercept, which is why it shrinks with n.
+/// See `policy_stack::measure_overhead`.
 ///
 /// ALLOCATED, not resident -- size-class-rounded usable bytes, the quantity
 /// `malloc_usable_size` returns and therefore the same quantity Redis reports
@@ -606,7 +639,7 @@ const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 /// Being a measured allocation figure it is NOT multiplied by
 /// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `LruSizedCompactHybridStack`.
 ///
@@ -617,10 +650,25 @@ const LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `LruLfuCompactHybridStack`.
 ///
-/// MEASURED, not derived: jemalloc `stats.allocated`, one point per
-/// process, sampled at powers of two. 72 B/object, R2 = 1.0000.
+/// The same `ArenaFrequencyChain` as `LfuCompactHybridStack`, so the same term:
+/// this design puts its recency-ordered fast tier in the chain's distinguished
+/// recency list and its frequency-ordered slow tier in the chain's buckets, and
+/// a key is in exactly one of them at a time, so one node per key covers both.
+///
+/// MEASURED separately rather than inferred from that argument -- jemalloc
+/// `stats.allocated`, one process per point, powers of two,
+/// `MEASURE_POLICY=lru-lfu-compact-hybrid-2`, against a `git archive` of the
+/// pre-conversion commit:
+///
+/// ```text
+///   n         before    after
+///   2^20     72.5760  40.2274
+///   2^21     72.2866  40.1137
+///   2^22     72.1403  40.0561
+///   2^23     72.0698  40.0266
+/// ```
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-*ghost-entry* DRAM cost shared by every hybrid design that keeps a
 /// bare-key ghost queue (`TwoQGhostCompactHybrid`, and the `S3Fifo*Ghost*`
@@ -1244,31 +1292,74 @@ mod shared_overhead_is_feature_independent {
 				);
 			}
 
-			// The queue-set stacks all moved to `ArenaQueueSet`: a 32-byte
-			// node plus a KEYLESS 8-byte bucket array, measured at 40
-			// B/object. They share one node, so they must agree exactly.
+			// Every stack here is on the arena node now -- a 32-byte node plus
+			// a KEYLESS 8-byte bucket array, measured at 40 B/object -- LFU
+			// included. It could not use `ArenaQueueSet`, whose orders are a
+			// fixed `[u32; MAX_QUEUES]`, because LFU needs one ordered bucket
+			// per DISTINCT frequency; it uses `ArenaFrequencyChain`, which
+			// keeps those bucket maps over the arena's node and index.
 			//
-			// LFU did not move, and cannot: it ranks by frequency through
-			// `CompactFrequencyChain`'s ordered bucket maps -- one bucket per
-			// DISTINCT frequency, because eviction has to find the minimum --
-			// which a fixed four-queue tag cannot express. It keeps
-			// `CompactQueueSet` and its 72.
+			// So LFU is INSIDE the group now rather than the control outside
+			// it, and equality is the claim across all four.
 			//
-			// So equality WITHIN the converted group is one claim and
-			// inequality ACROSS the two designs is the other, and the gap is
-			// pinned to the exact figure the conversion buys. If LFU were ever
-			// converted, or a converted stack regressed to the compact set, or
-			// the arena's index grew, one of these three fails rather than all
-			// of them silently agreeing on a new wrong number.
+			// This assertion used to read `lfu - lru == 32`, and it was true
+			// only BECAUSE lfu was unconverted. Changing that 32 to 0 would
+			// have said nothing at all: four values that must be equal are
+			// already asserted equal below, and a gap of zero adds no claim.
 			assert_eq!(fifo, lru, "fifo and lru share the arena node");
 			assert_eq!(s3, lru, "s3-fifo and lru share the arena node");
+			assert_eq!(
+				lfu, lru,
+				"lfu moved to `ArenaFrequencyChain` and must now carry the \
+				 same arena node as the queue stacks",
+			);
+
+			// Equality alone would survive all four regressing TOGETHER, which
+			// is exactly what the old assertion's cross-design gap guarded
+			// against. There is no unconverted design left to measure a gap
+			// to, so the term is pinned to the STRUCTURE it charges for
+			// instead, and stated as a DECOMPOSITION rather than as a total:
+			// 40 is the node and the index, and each half is pinned where it
+			// is built.
+			//
+			// The two halves cannot be `size_of`d here -- `worker::policy` is
+			// a private module and this file is in `object` -- but they are
+			// not free-floating either, and their own checks fire FIRST:
+			//
+			//   32  `const _: () = assert!(size_of::<ArenaSlot<NodePayload>>()
+			//       == 32)`, beside `NodePayload` in `arena_queue_set`. A
+			//       compile error, not a test failure.
+			//    8  `the_index_costs_eight_bytes_per_object_at_a_power_of_two_
+			//       population`, in both of `arena_index`'s consumers. Four
+			//       bytes a bucket at the half load `KeylessIndex` grows to.
+			//
+			// So adding a field to `NodePayload`, widening the index's bucket
+			// or loosening its load factor breaks the structure's own check
+			// first and this one second, which is the order that reads
+			// correctly: the structure moved, so the CHARGE is now unmeasured.
+			// The fix is to re-run `measure_one_point`, not to adjust one side
+			// of this assertion to fit the other.
+			const ARENA_NODE: ObjectSize = 32;
+			const KEYLESS_INDEX_PER_OBJECT: ObjectSize = 8;
 
 			assert_eq!(
-				lfu - lru,
-				32,
-				"lfu is on CompactQueueSet and lru on the arena, so lfu must \
-				 cost exactly the 56-byte index the arena replaces with 8, \
-				 less the 16 the node grew: 32 B/object",
+				LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+				ARENA_NODE + KEYLESS_INDEX_PER_OBJECT,
+				"the arena term stopped matching the node and index it charges \
+				 for",
+			);
+
+			// `LruLfuCompactHybrid` is not one of the four queried above and
+			// would otherwise be pinned by nothing. It shares
+			// `ArenaFrequencyChain` with `LfuCompactHybrid`, so it shares the
+			// cost: one node per key whichever tier the key is in, because the
+			// recency list and the frequency buckets are threaded through the
+			// same slots and a key is in exactly one of them.
+			assert_eq!(
+				LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+				LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+				"both LFU-ranked stacks are on `ArenaFrequencyChain` and must \
+				 carry one term",
 			);
 		}
 	}

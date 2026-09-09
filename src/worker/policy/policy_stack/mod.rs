@@ -19,7 +19,24 @@ mod s_three_fifo_stack;
 pub(crate) mod ghost_filter;
 
 pub(crate) mod compact_queue_set;
+pub mod arena_index;
 pub mod arena_queue_set;
+pub(crate) mod arena_frequency_chain;
+
+/// The frequency chain `ArenaFrequencyChain` replaces, kept ONLY as the
+/// reference implementation that pins it.
+///
+/// It has no production caller left: both LFU-ranked stacks moved to the arena,
+/// which stores the key once instead of twice and measures 40 B/object against
+/// this one's 72. It stays in the tree, test-gated, because
+/// `arena_frequency_chain`'s two differential tests --
+/// `the_frequency_face_agrees_with_the_compact_chain_it_replaces` and
+/// `the_recency_face_agrees_with_the_compact_chain_it_replaces` -- drive the
+/// two through the same random operation streams and require identical
+/// observable state at every step. That is the evidence that the conversion
+/// was a representation change and not an algorithm change, and it is worth
+/// more in the tree than the module is worth out of it.
+#[cfg(test)]
 pub(crate) mod compact_frequency_chain;
 #[cfg(test)]
 mod measure_overhead;

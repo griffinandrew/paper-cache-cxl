@@ -29,11 +29,21 @@
 //! and a promotion has to `remove` from one chain and `insert_at` into the
 //! other, carrying the frequency across by hand.
 //!
-//! This holds one `CompactFrequencyChain`: a slab of 32-byte entries with
+//! This holds one [`ArenaFrequencyChain`]: a slab of 32-byte nodes with
 //! `u32`-index links and a bucket set per tier. A promotion is a `set_tier` —
 //! the entry never moves, so its frequency, size and links survive by
 //! construction. There is no `entries` map because the slot the index lookup
 //! returns already carries tier, size and count.
+//!
+//! The chain it replaced, `CompactFrequencyChain`, kept that slab but paid a
+//! `HashMap<HashedKey, (u32, CompactEntry)>` for its index -- which stored the
+//! key a SECOND time, so a probe could compare it, alongside the copy the slot
+//! already had to carry so an eviction could name its victim. The arena's index
+//! is bare `u32` slot numbers verified against the slot's own key, which takes
+//! it from 56 B/object to 8. MEASURED end to end through this stack,
+//! `measure_one_point`, release, one process per point: 72.5952 -> 40.2252 at
+//! 2^20 and 72.0707 -> 40.0263 at 2^23, against `lru-compact-hybrid`'s 40.2100
+//! and 40.0244 on the same binaries.
 //!
 //! Measured against `FrequencyChain`: **95.9 → 47.4 B/key** (RSS delta over two
 //! million keys), and on real trace access orders 1.7× faster on
@@ -48,6 +58,8 @@
 //! compaction OF, and they are the reason the structure looks the way it
 //! does. Git history holds the baseline and the differential tests that
 //! proved the two agreed.
+//!
+//! [`ArenaFrequencyChain`]: super::arena_frequency_chain::ArenaFrequencyChain
 
 use crate::{
 	CacheSize,
@@ -57,7 +69,7 @@ use crate::{
 	worker::policy::policy_stack::{
 		PolicyStack,
 		Tier,
-		compact_frequency_chain::CompactFrequencyChain,
+		arena_frequency_chain::ArenaFrequencyChain,
 		narrow_resident,
 		watermarks,
 	},
@@ -66,7 +78,7 @@ use crate::{
 pub struct LfuCompactHybridStack {
 	/// Both tiers, one slab. Replaces `LfuHybridStack`'s `fast_chain`,
 	/// `slow_chain` and `entries` together.
-	chain: CompactFrequencyChain,
+	chain: ArenaFrequencyChain,
 
 	fast_capacity: CacheSize,
 	fast_used: CacheSize,
@@ -93,7 +105,7 @@ pub struct LfuCompactHybridStack {
 impl LfuCompactHybridStack {
 	pub fn new(fast_capacity: CacheSize) -> Self {
 		LfuCompactHybridStack {
-			chain: CompactFrequencyChain::default(),
+			chain: ArenaFrequencyChain::default(),
 			fast_capacity,
 			fast_used: 0,
 			slow_used: 0,
@@ -194,8 +206,20 @@ impl LfuCompactHybridStack {
 		let delta = new_migrating as i64 - old_migrating as i64;
 
 		match tier {
-			Tier::Fast => self.fast_used = (self.fast_used as i64 + delta).max(0) as CacheSize,
-			Tier::Slow => self.slow_used = (self.slow_used as i64 + delta).max(0) as CacheSize,
+			Some(Tier::Fast) => {
+				self.fast_used = (self.fast_used as i64 + delta).max(0) as CacheSize;
+			},
+
+			Some(Tier::Slow) => {
+				self.slow_used = (self.slow_used as i64 + delta).max(0) as CacheSize;
+			},
+
+			// The shared node makes `tier` optional because the 2Q and S3-FIFO
+			// families legitimately have a queue with no tier of its own. This
+			// stack always records one, so this arm is unreachable -- and it is
+			// spelled out rather than papered over with `unwrap_or`, which would
+			// silently charge the resize to whichever tier the default named.
+			None => {},
 		}
 	}
 }
@@ -224,7 +248,7 @@ impl PolicyStack for LfuCompactHybridStack {
 			// Existing key: track any size change, then treat as an access.
 			self.resize_key(key, size, dram_resident);
 
-			let promoted_key = match self.chain.get(key).map(|e| e.tier) {
+			let promoted_key = match self.chain.get(key).and_then(|e| e.tier) {
 				Some(Tier::Fast) => { self.chain.bump(key); None },
 				Some(Tier::Slow) => self.maybe_promote(key),
 				None => None,
@@ -236,7 +260,7 @@ impl PolicyStack for LfuCompactHybridStack {
 			// budget can demote it straight back out within the same settle,
 			// which already pushed the correct final `(key, Slow)` entry.
 			if let Some(k) = promoted_key {
-				if self.chain.get(k).map(|e| e.tier) == Some(Tier::Fast) {
+				if self.chain.get(k).and_then(|e| e.tier) == Some(Tier::Fast) {
 					self.migrations.push((k, Tier::Fast));
 				}
 			}
@@ -274,7 +298,7 @@ impl PolicyStack for LfuCompactHybridStack {
 	}
 
 	fn update(&mut self, key: HashedKey) {
-		match self.chain.get(key).map(|e| e.tier) {
+		match self.chain.get(key).and_then(|e| e.tier) {
 			Some(Tier::Fast) => { self.chain.bump(key); },
 
 			Some(Tier::Slow) => {
@@ -282,7 +306,7 @@ impl PolicyStack for LfuCompactHybridStack {
 				self.settle_fast_tier();
 
 				if let Some(k) = promoted_key {
-					if self.chain.get(k).map(|e| e.tier) == Some(Tier::Fast) {
+					if self.chain.get(k).and_then(|e| e.tier) == Some(Tier::Fast) {
 						self.migrations.push((k, Tier::Fast));
 					}
 				}
@@ -297,8 +321,10 @@ impl PolicyStack for LfuCompactHybridStack {
 		let size = entry.migrating();
 
 		match entry.tier {
-			Tier::Fast => self.fast_used = self.fast_used.saturating_sub(size),
-			Tier::Slow => self.slow_used = self.slow_used.saturating_sub(size),
+			Some(Tier::Fast) => self.fast_used = self.fast_used.saturating_sub(size),
+			Some(Tier::Slow) => self.slow_used = self.slow_used.saturating_sub(size),
+			// Unreachable: see `resize_key`.
+			None => {},
 		}
 	}
 
@@ -436,7 +462,7 @@ mod tests {
 
 		// count 2 vs fast minimum 1 -> strictly greater, promotes
 		stack.update(3);
-		assert_eq!(stack.chain.get(3).unwrap().tier, Tier::Fast);
+		assert_eq!(stack.chain.get(3).unwrap().tier, Some(Tier::Fast));
 	}
 
 	#[test]
@@ -449,7 +475,7 @@ mod tests {
 
 		// bump key 1 so the fast minimum is 1 (key 2), then bring key 3 to 2
 		stack.update(3);       // count 2 > min 1 -> promotes
-		assert_eq!(stack.chain.get(3).unwrap().tier, Tier::Fast);
+		assert_eq!(stack.chain.get(3).unwrap().tier, Some(Tier::Fast));
 	}
 
 	#[test]

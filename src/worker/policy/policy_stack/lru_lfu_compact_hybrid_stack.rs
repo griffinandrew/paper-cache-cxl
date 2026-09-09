@@ -46,17 +46,17 @@
 //! exactly one of the two — which is precisely what lets both collapse into
 //! one structure.
 //!
-//! This holds a single [`CompactFrequencyChain`]: one slab of 16-byte
-//! link-only slots, one index whose VALUE carries the payload, the slow tier's
-//! frequency buckets, and a distinguished recency list over the SAME slots for
-//! the fast tier. A key occupies one slot whichever tier it is in; a demotion
-//! is an unlink from the recency list and a link into a bucket, with the
-//! frequency carried across by construction rather than passed by hand.
+//! This holds a single [`ArenaFrequencyChain`]: one slab of 32-byte nodes, a
+//! KEYLESS index of bare slot numbers, the slow tier's frequency buckets, and a
+//! distinguished recency list over the SAME slots for the fast tier. A key
+//! occupies one slot whichever tier it is in; a demotion is an unlink from the
+//! recency list and a link into a bucket, with the frequency carried across by
+//! construction rather than passed by hand.
 //!
 //! # Why extend the LFU primitive rather than fork it
 //!
-//! `CompactFrequencyChain` already had everything the slow tier needs — slab,
-//! free list, layout-B index, ordered bucket map, full `eviction_stacks_pmem`
+//! `ArenaFrequencyChain` already had everything the slow tier needs — slab,
+//! free list, keyless index, ordered bucket map, full `eviction_stacks_pmem`
 //! gating. What it lacked was a list that is not a frequency bucket. Adding
 //! `recency_head`/`recency_tail` and the `recency_*` operations makes the fast
 //! tier one more list over the same storage and leaves every existing method
@@ -64,16 +64,18 @@
 //! the two new fields `NIL` for the structure's whole life. One tested
 //! primitive now serves both designs.
 //!
-//! # Why the 12-byte payload, and why the wider counter is safe
+//! # Why the counter's width is free, and why widening it is safe
 //!
 //! `LruLfuEntry` is 8 bytes because its counter is a `u16` that packs into the
 //! padding `{ size: u32, tier: u8 }` already had; widening it to `u32` would
 //! have pushed the ORIGINAL design's `(HashedKey, LruLfuEntry)` pair from 16
 //! bytes to 24, on every object in both tiers. That constraint does not carry
-//! over. Here the payload sits in the index value beside a `u32` slot number,
-//! where `CompactEntry`'s 12 bytes are what the tested primitive already
-//! stores and what LFU already measured; reusing it unchanged keeps one
-//! payload type for one primitive.
+//! over. The counter now sits in the shared [`NodePayload`], which is 16 bytes
+//! and pinned there by a static assertion — the SAME node every converted
+//! hybrid stack carries, so a `u32` count costs this design nothing over an
+//! LRU key that never reads the field at all.
+//!
+//! [`NodePayload`]: super::arena_queue_set::NodePayload
 //!
 //! The widening cannot change ranking. [`FREQUENCY_CAP`] is applied on every
 //! bump, so a counter here takes values in `1..=16` and only those — the
@@ -85,7 +87,7 @@
 //! at most the cap, so an access that would leave a slow key's count *pinned*
 //! has by definition already met the threshold, and promotes rather than
 //! reordering. Neither design ever reorders a slow key at an unchanged count.
-//! [`CompactFrequencyChain::slow_relink_at`] relinks unconditionally anyway,
+//! [`ArenaFrequencyChain::slow_relink_at`] relinks unconditionally anyway,
 //! because that is `FrequencyChain::move_to`'s contract and the primitive is
 //! shared — the case is unreachable from this stack, not merely unused.
 //!
@@ -109,7 +111,7 @@ use crate::{
 	worker::policy::policy_stack::{
 		PolicyStack,
 		Tier,
-		compact_frequency_chain::CompactFrequencyChain,
+		arena_frequency_chain::ArenaFrequencyChain,
 		narrow_resident,
 		watermarks,
 	},
@@ -131,15 +133,15 @@ use crate::{
 /// design that reads it.
 pub(super) const FREQUENCY_CAP: u16 = 16;
 
-/// [`FREQUENCY_CAP`] in the width [`CompactFrequencyChain`] stores counts at.
+/// [`FREQUENCY_CAP`] in the width [`ArenaFrequencyChain`] stores counts at.
 const CAP: u32 = FREQUENCY_CAP as u32;
 
 pub struct LruLfuCompactHybridStack {
 	/// Both tiers, one slab. Replaces `LruLfuHybridStack`'s `fast_stack`,
 	/// `slow_chain` and `entries` together: the recency list is the fast tier,
-	/// the frequency buckets are the slow tier, and the index value is the
-	/// payload.
-	chain: CompactFrequencyChain,
+	/// the frequency buckets are the slow tier, and the payload rides in the
+	/// node beside the links, where the index used to carry it.
+	chain: ArenaFrequencyChain,
 
 	/// Absolute frequency a slow-tier key must reach to earn the fast tier —
 	/// *not* a count of accesses since it was demoted. Values below 3 do not
@@ -168,7 +170,7 @@ impl LruLfuCompactHybridStack {
 	/// to the same input.
 	pub fn new(fast_capacity: CacheSize, promote_k: u16) -> Self {
 		LruLfuCompactHybridStack {
-			chain: CompactFrequencyChain::default(),
+			chain: ArenaFrequencyChain::default(),
 
 			promote_k: promote_k.clamp(1, FREQUENCY_CAP) as u32,
 
@@ -207,7 +209,7 @@ impl LruLfuCompactHybridStack {
 	/// Returns the tier the given (currently tracked) key is in, or `None`
 	/// if the key isn't tracked. Exposed for tests/diagnostics.
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
-		self.chain.get(key).map(|entry| entry.tier)
+		self.chain.get(key).and_then(|entry| entry.tier)
 	}
 
 	/// Returns the key's current frequency counter, in the baseline's width.
@@ -232,8 +234,20 @@ impl LruLfuCompactHybridStack {
 		let delta = new_migrating as i64 - old_migrating as i64;
 
 		match tier {
-			Tier::Fast => self.fast_used = (self.fast_used as i64 + delta).max(0) as CacheSize,
-			Tier::Slow => self.slow_used = (self.slow_used as i64 + delta).max(0) as CacheSize,
+			Some(Tier::Fast) => {
+				self.fast_used = (self.fast_used as i64 + delta).max(0) as CacheSize;
+			},
+
+			Some(Tier::Slow) => {
+				self.slow_used = (self.slow_used as i64 + delta).max(0) as CacheSize;
+			},
+
+			// The shared node makes `tier` optional because the 2Q and S3-FIFO
+			// families legitimately have a queue with no tier of its own. This
+			// stack always records one, so this arm is unreachable -- and it is
+			// spelled out rather than papered over with `unwrap_or`, which would
+			// silently charge the resize to whichever tier the default named.
+			None => {},
 		}
 	}
 
@@ -304,7 +318,7 @@ impl LruLfuCompactHybridStack {
 		// in the same settle, in which case `settle_fast_tier` has already
 		// pushed the correct final `(key, Tier::Slow)` entry and no `Fast`
 		// entry should follow it.
-		if self.chain.get(key).map(|e| e.tier) == Some(Tier::Fast) {
+		if self.chain.get(key).and_then(|e| e.tier) == Some(Tier::Fast) {
 			self.migrations.push((key, Tier::Fast));
 		}
 	}
@@ -387,7 +401,7 @@ impl PolicyStack for LruLfuCompactHybridStack {
 	}
 
 	fn update(&mut self, key: HashedKey) {
-		match self.chain.get(key).map(|entry| entry.tier) {
+		match self.chain.get(key).and_then(|entry| entry.tier) {
 			Some(Tier::Fast) => self.touch_fast(key),
 			Some(Tier::Slow) => self.touch_slow(key),
 			None => {},
@@ -395,7 +409,7 @@ impl PolicyStack for LruLfuCompactHybridStack {
 	}
 
 	fn remove(&mut self, key: HashedKey) {
-		let Some(tier) = self.chain.get(key).map(|entry| entry.tier) else { return };
+		let Some(tier) = self.chain.get(key).and_then(|entry| entry.tier) else { return };
 
 		// Which door the key leaves by is the tier: the recency list for a
 		// fast key, its frequency bucket for a slow one. Exactly the
