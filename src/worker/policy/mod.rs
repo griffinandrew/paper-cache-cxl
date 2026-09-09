@@ -264,8 +264,8 @@ pub mod migration_queue {
 				// the whole retirement: if a reader lifted this value out a
 				// moment ago it still holds a reference and the free waits
 				// for it, and if not the count reaches zero here and the
-				// whole item -- header, key and bytes in ONE allocation --
-				// goes back to its own tier's allocator immediately. No
+				// header and its bytes go back to their allocators
+				// immediately. No
 				// deferral, and nothing for a later epoch advance to run.
 				drop(superseded);
 
