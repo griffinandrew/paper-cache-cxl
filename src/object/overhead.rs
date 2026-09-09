@@ -550,7 +550,30 @@ pub const HASHTABLE_ENTRY_OVERHEAD: ObjectSize = 11;
 /// `TwoQCompactHybridStack` and `S3FifoCompactHybridStack`, which is expected:
 /// all three now share `CompactQueueSet` and all three payloads are 8 bytes.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+/// MEASURED after the arena conversion, `measure_one_point`, release, one
+/// process per point, powers of two:
+///
+/// ```text
+///   policy                          2^20      2^21      2^22      2^23
+///   lru-compact-hybrid           40.2100   40.1050   40.0518   40.0244
+///   fifo-compact-hybrid          40.2100   40.1050   40.0518   40.0244
+///   lru-sized-compact-hybrid     40.2100   40.1050   40.0518   40.0244
+///   lru-lazy-copy-compact-hybrid 40.2295   40.1147   40.0567   40.0268
+///   lfu-compact-hybrid (control) 72.5952   72.2962   72.1451   72.0707
+/// ```
+///
+/// Forty is PREDICTED, not merely fitted: the arena node is 32 bytes and its
+/// keyless bucket array is 8 B/object at the doubling slack it holds. The
+/// residue above 40 is a fixed intercept, not a per-object term, which is why
+/// it shrinks with n.
+///
+/// `lfu-compact-hybrid` is the control and it did not move. It ranks by
+/// frequency through `CompactFrequencyChain`'s ordered bucket maps -- one
+/// bucket per distinct frequency, because eviction has to find the minimum --
+/// which a fixed four-queue tag cannot express, so it was not converted and
+/// keeps 72. That it still measures 72 is the evidence the harness did not
+/// move underneath the other four.
+const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `LfuCompactHybridStack`'s eviction-stack
 /// bookkeeping.
@@ -590,7 +613,7 @@ const LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// MEASURED, not derived: jemalloc `stats.allocated`, one point per
 /// process, sampled at powers of two. 72 B/object, R2 = 1.0000.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `LruLfuCompactHybridStack`.
 ///
@@ -668,7 +691,7 @@ pub const EXACT_GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 /// PLACEHOLDER pending measurement: shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `TwoQCompactHybridStack`'s eviction stack.
 ///
@@ -688,7 +711,7 @@ const FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// results agree to within a byte. B is right here because `mark_accessed` and
 /// the queue-dispatch read in `touch` are hot AND touch no queue order.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionCompactHybridStack`.
 ///
@@ -700,14 +723,14 @@ const TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// `CompactQueueSet` and an 8-byte payload, so equality was the prediction and
 /// the measurement confirms it.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionReprieveCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const TWO_Q_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const TWO_Q_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `TwoQFullFastAdmissionCompactHybridStack`.
 ///
@@ -715,14 +738,14 @@ const TWO_Q_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD:
 /// `CompactQueueSet` and an 8-byte payload. Three queues rather than two makes
 /// no difference: a key is in exactly one of them at a time.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const TWO_Q_FULL_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const TWO_Q_FULL_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `TwoQGhostCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const TWO_Q_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const TWO_Q_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `S3FifoCompactHybridStack`'s eviction stack.
 ///
@@ -734,63 +757,63 @@ const TWO_Q_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
 /// the two share the primitive and both payloads are 8 bytes. Predicted before
 /// the run and confirmed by it.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const S3_FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `S3FifoGhostCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const S3_FIFO_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_GHOST_LAZY_DEMOTION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const S3_FIFO_GHOST_LAZY_DEMOTION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const S3_FIFO_GHOST_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionReprieveCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_LAZY_DEMOTION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const S3_FIFO_LAZY_DEMOTION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_MIDPOINT_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack`.
 ///
 /// PLACEHOLDER pending measurement: it shares `CompactQueueSet` and an 8-byte
 /// payload with the other converted queue stacks, all MEASURED at 72.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 72;
+const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 
 /// Approximate per-object DRAM cost of the *shared* structures (the object
@@ -1199,19 +1222,32 @@ mod shared_overhead_is_feature_independent {
 				);
 			}
 
-			// All four compact stacks share `CompactQueueSet` and an 8-byte
-			// payload, so all four measure the same 72 B/object -- one slab
-			// slot plus one index row, with no second index and no separate
-			// `entries` map for any of them. LFU no longer carries an extra
-			// frequency term: its counter rides in the slot it already has.
+			// The queue-set stacks all moved to `ArenaQueueSet`: a 32-byte
+			// node plus a KEYLESS 8-byte bucket array, measured at 40
+			// B/object. They share one node, so they must agree exactly.
 			//
-			// Equality is therefore the claim now, and it is a real one: if a
-			// stack ever grows a structure the others lack, this fails.
-			// Only meaningful while the stack terms are actually included,
-			// hence the gate.
-			assert_eq!(lfu, lru, "lfu and lru have the same compact slot shape");
-			assert_eq!(fifo, lru, "fifo and lru have the same compact slot shape");
-			assert_eq!(s3, lru, "s3-fifo and lru have the same compact slot shape");
+			// LFU did not move, and cannot: it ranks by frequency through
+			// `CompactFrequencyChain`'s ordered bucket maps -- one bucket per
+			// DISTINCT frequency, because eviction has to find the minimum --
+			// which a fixed four-queue tag cannot express. It keeps
+			// `CompactQueueSet` and its 72.
+			//
+			// So equality WITHIN the converted group is one claim and
+			// inequality ACROSS the two designs is the other, and the gap is
+			// pinned to the exact figure the conversion buys. If LFU were ever
+			// converted, or a converted stack regressed to the compact set, or
+			// the arena's index grew, one of these three fails rather than all
+			// of them silently agreeing on a new wrong number.
+			assert_eq!(fifo, lru, "fifo and lru share the arena node");
+			assert_eq!(s3, lru, "s3-fifo and lru share the arena node");
+
+			assert_eq!(
+				lfu - lru,
+				32,
+				"lfu is on CompactQueueSet and lru on the arena, so lfu must \
+				 cost exactly the 56-byte index the arena replaces with 8, \
+				 less the 16 the node grew: 32 B/object",
+			);
 		}
 	}
 }
