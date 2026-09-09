@@ -86,7 +86,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -219,8 +219,8 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 
 	/// The budget actually available to the main queue's fast segment: raw
 	/// `fast_capacity`, minus the one-access queue's fixed carve-out, minus
-	/// this segment's share of the shared-metadata reservation. The watermarks
-	/// sit on top of this number, never in place of any part of it.
+	/// this segment's share of the shared-metadata reservation. The settle
+	/// drains to this number, never to any part of it alone.
 	fn effective_main_fast_capacity(&self) -> CacheSize {
 		self.fast_capacity
 			.saturating_sub(self.one_access_capacity)
@@ -400,21 +400,14 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 		}
 	}
 
-	/// Demotes the `Q_MAIN_FAST` tail into the front of `Q_MAIN_SLOW` once
-	/// `fast_used` crosses the HIGH watermark of
-	/// `effective_main_fast_capacity()`, and keeps going until it is back at or
-	/// below the LOW watermark -- reference-bit gated, so an accessed candidate
-	/// is reprieved to the front of its own queue instead.
+	/// Demotes the `Q_MAIN_FAST` tail into the front of `Q_MAIN_SLOW` while
+	/// `fast_used` exceeds `effective_main_fast_capacity()` -- reference-bit
+	/// gated, so an accessed candidate is reprieved to the front of its own
+	/// queue instead.
 	fn settle_fast_tier(&mut self) {
 		let effective_capacity = self.effective_main_fast_capacity();
 
-		if self.fast_used <= watermarks::high_bytes(effective_capacity) {
-			return;
-		}
-
-		let drain_target = watermarks::low_bytes(effective_capacity);
-
-		while self.fast_used > drain_target {
+		while self.fast_used > effective_capacity {
 			let Some(candidate) = self.queues.back(Q_MAIN_FAST) else { break };
 
 			let accessed = self.queues.payload(candidate).map(|p| p.freq != 0).unwrap_or(false);
@@ -453,9 +446,8 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 
 	/// The one-access reprieve. Splices the one-access tail into the FRONT of
 	/// `Q_MAIN_SLOW` as `Tier::Slow` until the queue is back inside its
-	/// effective budget. Deliberately not watermarked: `one_access_capacity`
-	/// is a queue-length rule of the S3-FIFO design, not a tier-pressure
-	/// threshold.
+	/// effective budget. `one_access_capacity` is a queue-length rule of the
+	/// S3-FIFO design, not a tier-pressure threshold.
 	fn settle_one_access(&mut self) {
 		let effective_capacity = self.effective_one_access_capacity();
 

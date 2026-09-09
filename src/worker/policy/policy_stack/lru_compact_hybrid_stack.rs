@@ -49,7 +49,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -192,19 +192,13 @@ impl LruCompactHybridStack {
 		}
 	}
 
-	/// Demotes from the tier boundary until `fast_used` is back under the low
-	/// watermark. The victim is always `fast_boundary` -- the least-recently-
-	/// used fast key -- so nothing is searched.
+	/// Demotes from the tier boundary until `fast_used` is back within the
+	/// effective budget. The victim is always `fast_boundary` -- the least-
+	/// recently-used fast key -- so nothing is searched.
 	fn settle_fast_tier(&mut self) {
 		let effective = self.fast_capacity.saturating_sub(self.reserved_overhead());
 
-		if self.fast_used <= watermarks::high_bytes(effective) {
-			return;
-		}
-
-		let drain_target = watermarks::low_bytes(effective);
-
-		while self.fast_used > drain_target {
+		while self.fast_used > effective {
 			let Some(demote_key) = self.fast_boundary else { break };
 			let size = self.list.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
 			let new_boundary = self.list.before(demote_key);

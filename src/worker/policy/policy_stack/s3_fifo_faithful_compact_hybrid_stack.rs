@@ -77,7 +77,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -339,13 +339,7 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 	fn settle_fast_tier(&mut self) {
 		let effective = self.effective_main_fast_capacity();
 
-		if self.fast_used <= watermarks::high_bytes(effective) {
-			return;
-		}
-
-		let drain_target = watermarks::low_bytes(effective);
-
-		while self.fast_used > drain_target {
+		while self.fast_used > effective {
 			let Some(key) = self.queues.back(Q_MAIN_FAST) else { break };
 			let bytes = self.queues.payload(key).map(|p| p.migrating()).unwrap_or(0);
 

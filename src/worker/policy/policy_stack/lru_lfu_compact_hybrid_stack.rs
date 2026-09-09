@@ -15,7 +15,7 @@
 //! to a slow key bumps its counter and promotes it — resetting that counter to
 //! 1 — the moment it *reaches* `promote_k`, which is an ABSOLUTE frequency and
 //! not a count of accesses since demotion. `settle_fast_tier` demotes the LRU
-//! tail from the high watermark down to the low one in a batch, each demoted
+//! tail until the fast tier is back within its effective budget, each demoted
 //! key entering the slow tier at the frequency it accumulated. `evict_one`
 //! takes the slow tier's minimum-frequency key, ties broken
 //! least-recently-touched, and falls back to the fast tier's LRU tail only when
@@ -113,7 +113,6 @@ use crate::{
 		Tier,
 		arena_frequency_chain::ArenaFrequencyChain,
 		narrow_resident,
-		watermarks,
 	},
 };
 
@@ -323,11 +322,10 @@ impl LruLfuCompactHybridStack {
 		}
 	}
 
-	/// Demotes the least-recently-used fast key(s) into the slow tier,
-	/// *triggered* once `fast_used` exceeds [`watermarks::high_bytes`] of the
-	/// effective value budget (`fast_capacity` minus the DRAM reserved for
-	/// shared per-object metadata across both tiers) but *drained* all the way
-	/// down to [`watermarks::low_bytes`] of it.
+	/// Demotes the least-recently-used fast key(s) into the slow tier until
+	/// `fast_used` is back within the effective value budget (`fast_capacity`
+	/// minus the DRAM reserved for shared per-object metadata across both
+	/// tiers).
 	///
 	/// Each demoted key enters the slow tier at its accumulated frequency, not
 	/// at 1 — that carry is the whole reason the fast tier counts. Demotion is
@@ -336,13 +334,7 @@ impl LruLfuCompactHybridStack {
 	fn settle_fast_tier(&mut self) {
 		let effective = self.fast_capacity.saturating_sub(self.reserved_overhead());
 
-		if self.fast_used <= watermarks::high_bytes(effective) {
-			return;
-		}
-
-		let drain_target = watermarks::low_bytes(effective);
-
-		while self.fast_used > drain_target {
+		while self.fast_used > effective {
 			// The baseline pops the recency tail, then looks the key up in
 			// `entries` and `continue`s past it if it is missing -- a state it
 			// documents as impossible. It is not merely impossible here but
@@ -516,16 +508,6 @@ mod tests {
 		stack.drain_tier_migrations()
 	}
 
-	/// A fast-tier capacity that leaves `target` bytes sitting comfortably
-	/// *above* `settle_fast_tier`'s low-water drain floor. Same helper, and
-	/// same reason, as the baseline's: sizing a test's capacity to exactly
-	/// what should survive cascades an extra demotion the test never meant to
-	/// exercise, because a pass triggers at the high watermark and drains to
-	/// the low one.
-	fn low_water_safe(target: CacheSize) -> CacheSize {
-		(target as f64 / watermarks::low()).ceil() as CacheSize + 1
-	}
-
 	// ── admission ─────────────────────────────────────────────────────────
 
 	#[test]
@@ -543,7 +525,7 @@ mod tests {
 
 	#[test]
 	fn fast_pressure_demotes_the_lru_tail() {
-		let mut stack = LruLfuCompactHybridStack::new(low_water_safe(100), K);
+		let mut stack = LruLfuCompactHybridStack::new(100, K);
 
 		stack.insert(1, 50);
 		stack.insert(2, 50);
@@ -652,7 +634,7 @@ mod tests {
 
 	#[test]
 	fn promotion_can_cascade_a_demotion() {
-		let mut stack = LruLfuCompactHybridStack::new(low_water_safe(100), 2);
+		let mut stack = LruLfuCompactHybridStack::new(100, 2);
 
 		stack.insert(1, 50);
 		stack.insert(2, 50);
@@ -732,7 +714,7 @@ mod tests {
 
 	#[test]
 	fn remove_updates_the_right_tier_counters() {
-		let mut stack = LruLfuCompactHybridStack::new(low_water_safe(100), 99);
+		let mut stack = LruLfuCompactHybridStack::new(100, 99);
 
 		stack.insert(1, 50);
 		stack.insert(2, 50);
@@ -832,7 +814,7 @@ mod tests {
 	/// strictest threshold there is, where promotion is hardest to earn.
 	#[test]
 	fn a_saturated_key_stops_counting_and_promotes_on_its_next_access() {
-		let mut stack = LruLfuCompactHybridStack::new(low_water_safe(100), FREQUENCY_CAP);
+		let mut stack = LruLfuCompactHybridStack::new(100, FREQUENCY_CAP);
 
 		stack.insert(1, 50);
 		for _ in 0..(FREQUENCY_CAP as usize * 2) { stack.update(1); }
@@ -887,73 +869,63 @@ mod tests {
 		);
 	}
 
-	// ── watermarks ────────────────────────────────────────────────────────
+	// ── settling ──────────────────────────────────────────────────────────
 
-	const WM_CAPACITY: CacheSize = 10_000;
-	const WM_UNIT: ObjectSize = 10;
+	const SETTLE_CAPACITY: CacheSize = 10_000;
+	const SETTLE_UNIT: ObjectSize = 10;
 
+	/// There is no hysteresis band: a settle drains to exactly the effective
+	/// budget and stops, so the admission that overflows the tier by one unit
+	/// demotes exactly one unit.
 	#[test]
-	fn a_triggered_pass_drains_to_the_low_watermark() {
-		let mut stack = LruLfuCompactHybridStack::new(WM_CAPACITY, K);
+	fn a_settle_drains_to_exactly_the_effective_budget() {
+		let mut stack = LruLfuCompactHybridStack::new(SETTLE_CAPACITY, K);
 
-		let high = watermarks::high_bytes(WM_CAPACITY);
-		let low = watermarks::low_bytes(WM_CAPACITY);
-		let unit = WM_UNIT as CacheSize;
+		let unit = SETTLE_UNIT as CacheSize;
 
 		let mut key: HashedKey = 0;
 
-		while stack.fast_bytes_used() + unit <= high {
+		while stack.fast_bytes_used() + unit <= SETTLE_CAPACITY {
 			key += 1;
-			stack.insert(key, WM_UNIT);
+			stack.insert(key, SETTLE_UNIT);
 		}
 
-		assert_eq!(stack.slow_object_count(), 0, "nothing has crossed the trigger yet");
+		assert_eq!(stack.fast_bytes_used(), SETTLE_CAPACITY, "the tier fills to its ceiling exactly");
+		assert_eq!(stack.slow_object_count(), 0, "nothing is demoted at the ceiling");
 		assert!(drain(&mut stack).is_empty());
 
-		let before = stack.fast_bytes_used();
-
 		key += 1;
-		stack.insert(key, WM_UNIT); // crosses the high watermark
+		stack.insert(key, SETTLE_UNIT); // one unit over
 
-		assert!(
-			stack.fast_bytes_used() <= low,
-			"a triggered pass must drain to the low watermark ({low}), not merely back to the ceiling ({high}); fast_used = {}",
+		assert_eq!(
 			stack.fast_bytes_used(),
+			SETTLE_CAPACITY,
+			"a settle drains back to the ceiling and no further",
 		);
-		assert!(
-			stack.fast_bytes_used() + unit > low,
-			"and must stop the moment it reaches it rather than over-draining",
-		);
-
-		let expected = (before + unit - low).div_ceil(unit);
 
 		let migrations = drain(&mut stack);
-		let demoted = migrations
-			.iter()
-			.filter(|(_, tier)| *tier == Tier::Slow)
-			.count() as CacheSize;
-
-		assert_eq!(demoted, expected, "got {} migrations", migrations.len());
-		assert_eq!(stack.slow_object_count() as CacheSize, expected);
+		assert_eq!(migrations.len(), 1, "exactly one demotion; got {migrations:?}");
+		assert_eq!(migrations[0].1, Tier::Slow);
+		assert_eq!(stack.slow_object_count(), 1);
 	}
 
 	/// The baseline's second "every tracked key is in exactly one structure"
-	/// assertion, ported. Several watermark passes run, so the invariant is
+	/// assertion, ported. Several settles run, so the invariant is
 	/// checked after real churn rather than after three inserts.
 	#[test]
-	fn counters_stay_consistent_across_a_watermark_pass() {
-		let count: HashedKey = WM_CAPACITY / WM_UNIT as CacheSize + 200;
+	fn counters_stay_consistent_across_settles() {
+		let count: HashedKey = SETTLE_CAPACITY / SETTLE_UNIT as CacheSize + 200;
 
-		let mut stack = LruLfuCompactHybridStack::new(WM_CAPACITY, K);
+		let mut stack = LruLfuCompactHybridStack::new(SETTLE_CAPACITY, K);
 
 		for key in 1..=count {
-			stack.insert(key, WM_UNIT);
+			stack.insert(key, SETTLE_UNIT);
 		}
 		drain(&mut stack);
 
-		let unit = WM_UNIT as CacheSize;
+		let unit = SETTLE_UNIT as CacheSize;
 
-		assert!(stack.slow_object_count() > 0, "the run must have triggered a pass");
+		assert!(stack.slow_object_count() > 0, "the run must have demoted");
 
 		assert_eq!(stack.len(), count as usize);
 		assert_eq!(
@@ -977,8 +949,8 @@ mod tests {
 			"slow bytes must equal the slow object count times the unit size",
 		);
 		assert!(
-			stack.fast_bytes_used() <= watermarks::high_bytes(WM_CAPACITY),
-			"the tier must be settled below the trigger after the last insert",
+			stack.fast_bytes_used() <= SETTLE_CAPACITY,
+			"the tier must be settled within its budget after the last insert",
 		);
 	}
 }

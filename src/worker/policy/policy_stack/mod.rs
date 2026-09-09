@@ -134,71 +134,6 @@ pub enum AccessOutcome {
 	GhostHit,
 }
 
-/// Fast-tier watermarks, shared by every hybrid stack's `settle_fast_tier`.
-///
-/// Historically each stack drained back to exactly its fast-tier ceiling, so
-/// the tier sat pinned at 100% utilisation and *every* admission triggered a
-/// demotion of exactly one object. That produces migration batches of one,
-/// which maximises per-batch worker overhead and makes the copies impossible
-/// to parallelise (measured: >99% of `apply_tier_migrations` calls carried
-/// 0-1 entries).
-///
-/// With watermarks, `settle_fast_tier` only triggers once usage exceeds
-/// `high * capacity`, then drains to `low * capacity` in one pass -- trading
-/// a slice of resident fast-tier capacity for larger, less frequent demotion
-/// batches.
-///
-/// NOTE: a 90% low-water floor previously existed in the LRU hybrid stack and
-/// was removed at the user's explicit request for hurting performance; a 2%
-/// version (`FAST_TIER_LOW_WATER_RATIO = 0.98`) replaced it as a burst
-/// margin. These defaults are deliberately more aggressive and are tunable at
-/// runtime so the tradeoff can be measured rather than assumed. Set
-/// `FAST_TIER_HIGH_WATERMARK=1.0` and `FAST_TIER_LOW_WATERMARK=1.0` to
-/// restore the original drain-to-ceiling behaviour exactly.
-pub mod watermarks {
-	use std::sync::OnceLock;
-
-	pub const DEFAULT_HIGH: f64 = 0.98;
-	pub const DEFAULT_LOW: f64 = 0.95;
-
-	static HIGH: OnceLock<f64> = OnceLock::new();
-	static LOW: OnceLock<f64> = OnceLock::new();
-
-	fn read(var: &str, default: f64) -> f64 {
-		std::env::var(var)
-			.ok()
-			.and_then(|v| v.parse::<f64>().ok())
-			.filter(|v| *v > 0.0 && *v <= 1.0)
-			.unwrap_or(default)
-	}
-
-	/// Fraction of the effective fast-tier budget above which a demotion pass
-	/// is triggered. `1.0` restores trigger-at-ceiling.
-	pub fn high() -> f64 {
-		*HIGH.get_or_init(|| read("FAST_TIER_HIGH_WATERMARK", DEFAULT_HIGH))
-	}
-
-	/// Fraction of the effective fast-tier budget a triggered pass drains down
-	/// to. Clamped to at most `high()` so a misconfiguration cannot invert the
-	/// pair (which would make every pass a no-op and let the tier overrun).
-	pub fn low() -> f64 {
-		*LOW.get_or_init(|| {
-			let l = read("FAST_TIER_LOW_WATERMARK", DEFAULT_LOW);
-			if l > high() { high() } else { l }
-		})
-	}
-
-	/// The byte threshold at which a demotion pass triggers.
-	pub fn high_bytes(effective_capacity: u64) -> u64 {
-		(effective_capacity as f64 * high()) as u64
-	}
-
-	/// The byte target a triggered demotion pass drains down to.
-	pub fn low_bytes(effective_capacity: u64) -> u64 {
-		(effective_capacity as f64 * low()) as u64
-	}
-}
-
 /// Which tier an object currently lives in, for policy stacks that track a
 /// segmented (fast/slow) queue. Used by `LruCompactHybridStack`
 /// (`PaperPolicy::LruCompactHybrid`, recency-segmented),
@@ -570,7 +505,7 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		),
 
 		// Now carries the same `with_shared_overhead` reservation and the same
-		// high/low fast-tier watermarks as `LruCompactHybrid`/`LfuCompactHybrid`,
+		// drain-to-budget settle as `LruCompactHybrid`/`LfuCompactHybrid`,
 		// in the same two-arm with/without-feature shape this comment used to
 		// ask for: a follow-up DRAM-usage measurement did show the same issue
 		// (metadata is DRAM-resident but is not counted in `fast_used`, so

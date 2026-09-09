@@ -18,8 +18,8 @@
 //! it is not a scheduling artefact: 99.99% of every promotion the stack issues
 //! is undoing its own earlier demotion of that same key.
 //!
-//! The waste is structural. `settle_fast_tier` demotes the moment the watermark
-//! trips, and demoting means COPYING, so an object that will be read again
+//! The waste is structural. `settle_fast_tier` demotes the moment the budget is
+//! exceeded, and demoting means COPYING, so an object that will be read again
 //! shortly pays two crossings for nothing.
 //!
 //! # What this changes, and what it deliberately does not
@@ -66,7 +66,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -325,13 +325,7 @@ impl LruLazyCopyCompactHybridStack {
 	fn settle_fast_tier(&mut self) {
 		let effective = self.logical_capacity();
 
-		if self.fast_used <= watermarks::high_bytes(effective) {
-			return;
-		}
-
-		let target = watermarks::low_bytes(effective);
-
-		while self.fast_used > target {
+		while self.fast_used > effective {
 			let Some(key) = self.fast_boundary else { break };
 			let size = self.list.payload(key).map(|p| p.migrating()).unwrap_or(0);
 			let next = self.list.before(key);
@@ -352,13 +346,7 @@ impl LruLazyCopyCompactHybridStack {
 	fn reclaim_dram(&mut self) {
 		let effective = self.physical_capacity();
 
-		if self.dram_used <= watermarks::high_bytes(effective) {
-			return;
-		}
-
-		let target = watermarks::low_bytes(effective);
-
-		while self.dram_used > target {
+		while self.dram_used > effective {
 			let Some(key) = self.phys_boundary else { break };
 			let size = self.list.payload(key).map(|p| p.migrating()).unwrap_or(0);
 			let next = self.list.before(key);

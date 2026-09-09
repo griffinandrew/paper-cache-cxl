@@ -173,23 +173,27 @@ once let the gauges go stale indefinitely.
 
 ## Shared machinery
 
-### High/low watermarks
+### Continuous draining
 
-`settle_fast_tier` triggers once `fast_used` exceeds `watermarks::high_bytes` of the effective
-budget, then drains in one pass down to `watermarks::low_bytes` rather than back to exactly the
-ceiling. Defaults are **`DEFAULT_HIGH = 0.98` / `DEFAULT_LOW = 0.95`**, overridable at runtime
-via `FAST_TIER_HIGH_WATERMARK` / `FAST_TIER_LOW_WATERMARK`. Setting both to `1.0` restores the
-original drain-to-the-ceiling behaviour exactly.
+`settle_fast_tier` demotes while `fast_used` exceeds the effective budget and stops the moment
+it is back within it. There is no high/low band: the tier sits at exactly its budget, and a
+demotion pass moves whatever the admission or promotion that triggered it displaced. A high/low
+pair (0.98 / 0.95, `FAST_TIER_HIGH_WATERMARK` / `FAST_TIER_LOW_WATERMARK`) existed for a while
+to batch demotions; it and its env vars are gone.
 
-The pair exists because draining to exactly the ceiling pinned the tier at 100% utilisation and
-made almost every pass a single-object migration batch. It trades a slice of resident fast
-capacity for larger, less frequent batches, and it is tuned in one place for all 24 stacks.
+What the band bought, and why it is not worth reintroducing: draining to exactly the ceiling
+pins the tier at 100% utilisation and makes almost every pass a single-object migration batch
+(measured at the time: >99% of `apply_tier_migrations` calls carried 0-1 entries). That shape is
+real — it is what `parallel_migration` was written for, and why that module was then turned off
+again, since a fan-out cannot pay for itself at batch-of-one. But `migration_queue` takes the
+same win without depending on batch size: a standing pool of consumers sharded by key hash
+drains migrations as they are produced. So the band was paying resident fast-tier capacity for a
+batching effect the consumer pool already provides, and it made the tier's occupancy a function
+of two tunables rather than of the budget — which is the thing the fast-tier accounting exists
+to enforce.
 
-> `watermarks::DEFAULT_HIGH` / `DEFAULT_LOW` are authoritative. Both are read once through a
-> `OnceLock` on first use, so the env vars are startup configuration rather than runtime
-> adjustable, and a value that fails to parse or falls outside `(0.0, 1.0]` is silently
-> replaced by the default. `low()` is clamped to at most `high()` so a misconfigured pair
-> cannot invert and turn every pass into a no-op.
+`eviction_watermarks` in `worker/policy/mod.rs` is a separate, opt-in pair for capacity eviction
+whose defaults were always 1.0 / 1.0.
 
 ### The shared-DRAM-overhead reservation
 
@@ -199,8 +203,8 @@ is exactly what was observed in practice.
 
 `get_hybrid_dram_shared_overhead` gives a per-tracked-key byte figure; `reserved_overhead()`
 multiplies it by the tracked key count; `settle_fast_tier` subtracts that from `fast_capacity`
-**before** applying the watermarks. The composition order is load-bearing: the reservation comes
-out of capacity first, and the watermarks are ratios of what is left.
+**before** draining. The composition order is load-bearing: the reservation comes out of
+capacity first, and the drain runs against what is left.
 
 The multiplier is *every* tracked key, not just fast ones — a slow-tier object still has a
 hashtable entry, a list node and an `entries` slot in DRAM.
@@ -266,19 +270,20 @@ whose cumulative size fits `fast_capacity`; everything behind is slow.
 - **Admission** — front of the list, `Tier::Fast`, unconditionally.
 - **Promotion** — every access *and every overwrite* moves the key to the front and tags it
   `Fast`. A `set()` on an existing key is treated exactly like a hit.
-- **Demotion** — when `fast_used` crosses the high watermark, the LRU-most fast key (found via
-  `fast_boundary`, no scan) is demoted, repeating down to the low watermark.
+- **Demotion** — while `fast_used` exceeds the effective budget, the LRU-most fast key (found via
+  `fast_boundary`, no scan) is demoted.
 - **Eviction** — the absolute LRU tail, which after any demotion is always slow.
 
-This stack is where sub-ceiling headroom was first needed, for a specific reason:
+This stack is where sub-ceiling headroom was first tried, for a specific reason:
 `PaperCache::set()` writes a new object's `TieredBuffer` to DRAM synchronously at the API layer,
 before the stack running on `PolicyWorker` sees the event. A burst of concurrent `set()` calls
 can transiently push real DRAM above what the stack's bookkeeping shows, and draining below the
 ceiling leaves that burst somewhere to land. The pressure is sharpest here because this is the
 stack that re-settles on every admission.
 
-The headroom is no longer stack-local, though: the old `FAST_TIER_LOW_WATER_RATIO` is now dead
-code, and every design gets the same behaviour from the shared watermark pair above.
+That headroom has since been removed everywhere: every design drains to exactly its effective
+budget (*Continuous draining* above), and the transient the margin was meant to absorb is
+measured instead, as `pending_demote_max` in `MIGSTATS`.
 
 ### `lfu_compact_hybrid_cache`
 
@@ -451,7 +456,7 @@ budgets draw on the same physical pool, and leaving them independent would let r
 `fast_capacity + fifo_capacity`. Fixed by treating `fifo_capacity` as a reservation carved out
 first — `effective_main_fast_capacity =
 fast_capacity.saturating_sub(fifo_capacity).saturating_sub(reserved_overhead())`, so the FIFO
-carve-out and the shared per-object DRAM reservation both come out before the watermarks apply. The net result is
+carve-out and the shared per-object DRAM reservation both come out before the drain applies. The net result is
 `fast_used (main) + fifo_used <= fast_capacity` by construction.
 
 ### `two_q_fast_admission_reprieve_compact_hybrid_cache`

@@ -73,7 +73,7 @@
 //!
 //! The seven tiering methods forward to the store rather than taking their
 //! trait defaults, so the merged store is a genuine hybrid: it demotes at the
-//! same watermarks, emits the same `(key, Tier)` migrations for
+//! same ceiling, emits the same `(key, Tier)` migrations for
 //! `apply_tier_migrations` to physically perform, and publishes the same
 //! gauges. Comparing it against `lru-compact-hybrid` is therefore
 //! like-for-like, which comparing the untiered prototype against a tiered
@@ -87,6 +87,11 @@ use crate::{
 };
 
 use std::sync::Arc;
+
+/// `MergedStore::configure_tiering` still takes a high/low pair in parts per
+/// million. The split stacks drain to exactly their ceiling, so the merged
+/// store is configured the same way: both marks at the ceiling.
+const DRAIN_TO_CEILING_PPM: u64 = 1_000_000;
 
 pub struct MergedStackHandle<K, V> {
 	store: Arc<MergedStore<K, V>>,
@@ -113,18 +118,14 @@ impl<K, V> MergedStackHandle<K, V> {
 	) -> Self {
 		#[cfg(feature = "hybrid_cache_common")]
 		if policy.is_hybrid() {
-			use crate::worker::policy::policy_stack::watermarks;
-
-			let to_ppm = |f: f64| (f * 1_000_000.0) as u64;
-
 			store.configure_tiering(
 				// Same default fast-tier budget as every hybrid stack: 20% of
 				// the overall cache size, runtime-adjustable afterward through
 				// `resize_fast_tier`.
 				(max_size as f64 * 0.2) as CacheSize,
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
-				to_ppm(watermarks::high()),
-				to_ppm(watermarks::low()),
+				DRAIN_TO_CEILING_PPM,
+				DRAIN_TO_CEILING_PPM,
 			);
 		}
 
@@ -257,8 +258,8 @@ where
 ///
 /// Both are fed the identical `(key, size, dram_resident)` calls through
 /// `PolicyStack`, both settle at the same points (unconditional fast admission,
-/// then a settle), and both take their watermarks from `watermarks::high/low`,
-/// so nothing but the boundary rule differs. The sizes are exact jemalloc size
+/// then a settle), and both drain to exactly the same ceiling, so nothing
+/// but the boundary rule differs. The sizes are exact jemalloc size
 /// classes, so the merged store's size-class-rounded `migrating()` and the
 /// split stack's raw `size - dram_resident` are the same number and the
 /// accounting cannot drift for a reason unrelated to tiering.
@@ -270,7 +271,6 @@ mod global_demotion_fidelity {
 		object::Object,
 		worker::policy::policy_stack::{
 			lru_compact_hybrid_stack::LruCompactHybridStack,
-			watermarks,
 		},
 		BufferDRAM,
 	};
@@ -310,10 +310,6 @@ mod global_demotion_fidelity {
 	fn in_shard(s: u64, i: u64) -> HashedKey {
 		assert!(s < SHARDS);
 		(mix(i) >> SHARD_BITS) | (s << (64 - SHARD_BITS))
-	}
-
-	fn to_ppm(f: f64) -> u64 {
-		(f * 1_000_000.0) as u64
 	}
 
 	/// Feeds ONE sequence to both structures.
@@ -374,8 +370,8 @@ mod global_demotion_fidelity {
 		store.configure_tiering(
 			FAST_CAPACITY,
 			0,
-			to_ppm(watermarks::high()),
-			to_ppm(watermarks::low()),
+			DRAIN_TO_CEILING_PPM,
+			DRAIN_TO_CEILING_PPM,
 		);
 
 		let mut split = LruCompactHybridStack::new(FAST_CAPACITY);
@@ -471,8 +467,8 @@ mod global_demotion_fidelity {
 		store.configure_tiering(
 			FAST_CAPACITY,
 			0,
-			to_ppm(watermarks::high()),
-			to_ppm(watermarks::low()),
+			DRAIN_TO_CEILING_PPM,
+			DRAIN_TO_CEILING_PPM,
 		);
 
 		let mut split = LruCompactHybridStack::new(FAST_CAPACITY);

@@ -90,9 +90,8 @@ src/
                                  The 18 *_hybrid_stack.rs files carry each design's algorithm
                                  and its full derivation in the module doc — those are the
                                  authoritative description of what each design does.
-                                 `watermarks` (in mod.rs) holds the shared fast-tier high/low
-                                 ratios: defaults 0.98 / 0.95, overridable via
-                                 FAST_TIER_HIGH_WATERMARK / FAST_TIER_LOW_WATERMARK.
+                                 Every settle_fast_tier drains to exactly its effective
+                                 budget on every settle; there is no high/low band.
       mini_stack/               Lightweight per-policy stacks for PaperCache's "auto" mode.
       trace/                    Access-trace recording/replay, replayed to rebuild a different
                                  policy's stack after a live switch. Only spawned when more than

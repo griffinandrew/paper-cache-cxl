@@ -114,10 +114,10 @@ set(k, v) ──WorkerEvent──> policy stack decides tiers
   before anything moves into it. With the queue enabled it is an ordering of *enqueues* — per-key
   order is guaranteed by the hash sharding, but a promotion for one key can be physically applied
   before an unrelated key's demotion has run.
-- **Watermarks.** Demotion triggers at `FAST_TIER_HIGH_WATERMARK` of the effective fast-tier
-  budget and then drains in one pass down to `FAST_TIER_LOW_WATERMARK` (0.98 / 0.95), rather
-  than trimming back to exactly the ceiling. Draining to the ceiling pinned the tier at 100%
-  utilisation and made almost every pass a single-object migration batch.
+- **Continuous draining.** `settle_fast_tier` demotes while `fast_used` exceeds the effective
+  fast-tier budget and stops the moment it is back within it — no high/low band. The tier sits
+  at exactly its budget, and a demotion pass moves whatever the admission or promotion that
+  triggered it displaced.
 - **`migration_queue`** (`worker/policy/mod.rs`) is a standing pool of consumer threads that
   perform the allocate-copy-swap off the worker. It has **one channel per consumer, indexed by
   key hash**, so two migrations for the same key can never be applied out of order. On by
@@ -279,8 +279,6 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | `MIGRATION_QUEUE_THREADS` | `2` | Migration consumer count. `0` disables the queue and applies migrations inline on the worker. |
 | `PARALLEL_MIGRATION_THRESHOLD` | `0` (off) | Batch size at or above which batch fan-out engages. Off because it was measured not to pay; see `parallel_migration`. |
 | `PARALLEL_MIGRATION_THREADS` | `4` | Pool size if the above is enabled. |
-| `FAST_TIER_HIGH_WATERMARK` | `0.98` | Fast-tier fraction at which demotion triggers. |
-| `FAST_TIER_LOW_WATERMARK` | `0.95` | Fraction a triggered demotion pass drains down to. Set both to `1.0` to restore drain-to-the-ceiling. |
 | `NUMA_ARENAS_PER_NODE` | `8` | jemalloc arenas per node (clamped to 32). Swept on cluster12: a single arena costs 5% of SET latency at one client and 27% at sixteen, while 8→32 buys 1–2%, inside the run-to-run spread. |
 | `PAPER_NUMA_SLOW_TCACHE` | off | Per-thread cache for slow-tier allocations. Correct but measured not worth enabling. |
 | `DRAM_OVERHEAD_RESIDENT_FACTOR` | `1.12` | Recalibrates the per-object DRAM overhead reservation. Recalibrate when the workload or allocator changes. |

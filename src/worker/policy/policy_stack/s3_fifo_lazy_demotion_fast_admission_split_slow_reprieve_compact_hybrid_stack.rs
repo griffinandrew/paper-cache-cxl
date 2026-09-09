@@ -72,8 +72,8 @@
 //! * Its tail is *reprieved into `slow_head`* rather than evicted
 //!   (`settle_one_access`), synchronously from `insert`/`resize`, never through
 //!   `evict_one`.
-//! * Demotion is lazy and reference-bit gated, under the shared fast-tier
-//!   watermarks.
+//! * Demotion is lazy and reference-bit gated, draining to the effective
+//!   fast-tier budget.
 //! * The shared per-tracked-key metadata reservation is split PROPORTIONALLY
 //!   between the two independently-capacitied fast segments (`reserved_shares`),
 //!   never charged in full to each. The two slow segments carry no capacity of
@@ -93,7 +93,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -257,7 +257,7 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	}
 
 	/// The main queue's fast-portion byte budget once its share of the shared
-	/// metadata reservation is carved out. The watermarks sit on top of this.
+	/// metadata reservation is carved out. The settle drains to this.
 	fn effective_main_fast_capacity(&self) -> CacheSize {
 		self.main_fast_capacity().saturating_sub(self.reserved_shares().1)
 	}
@@ -391,8 +391,8 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 		}
 	}
 
-	/// Demotes oldest-first out of the fast list into `slow_head` under the
-	/// shared fast-tier watermarks, reprieving any key whose bit is set instead.
+	/// Demotes oldest-first out of the fast list into `slow_head` while the
+	/// fast list exceeds its budget, reprieving any key whose bit is set instead.
 	/// Terminates even when every fast key's bit is set, since each reprieve
 	/// clears one bit.
 	///
@@ -408,13 +408,7 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	fn settle_fast_tier(&mut self) {
 		let effective_capacity = self.effective_main_fast_capacity();
 
-		if self.fast_used <= watermarks::high_bytes(effective_capacity) {
-			return;
-		}
-
-		let low_water = watermarks::low_bytes(effective_capacity);
-
-		while self.fast_used > low_water {
+		while self.fast_used > effective_capacity {
 			let Some(candidate) = self.queues.back(Q_FAST) else { break };
 
 			let accessed = self.queues.payload(candidate).map(|p| p.freq != 0).unwrap_or(false);
@@ -498,9 +492,8 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	/// from the cache here, and routing it through eviction would make
 	/// `apply_evictions` erase a live object.
 	///
-	/// No watermarks here, deliberately: this segment relieves pressure
-	/// synchronously rather than through a `PolicyWorker` migration batch, so
-	/// there is no batch-of-one cost for a low-water drain to amortise away.
+	/// This segment relieves pressure synchronously rather than through a
+	/// `PolicyWorker` migration batch.
 	fn settle_one_access(&mut self) {
 		let effective_capacity = self.effective_one_access_capacity();
 

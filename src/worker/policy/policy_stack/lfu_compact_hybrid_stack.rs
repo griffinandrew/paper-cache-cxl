@@ -13,7 +13,7 @@
 //! effective budget has room and the latch is open, and goes straight to slow
 //! once capacity has genuinely been reached. A slow key promotes only by
 //! *strictly* exceeding the fast tier's minimum frequency. `settle_fast_tier`
-//! drains from the high watermark to the low one in a batch. `evict_one`
+//! drains to exactly the effective budget on every settle. `evict_one`
 //! prefers the slow chain and falls back to fast. Migration entries are pushed
 //! after settling and guarded on the key still being fast.
 //!
@@ -71,7 +71,6 @@ use crate::{
 		Tier,
 		arena_frequency_chain::ArenaFrequencyChain,
 		narrow_resident,
-		watermarks,
 	},
 };
 
@@ -164,18 +163,12 @@ impl LfuCompactHybridStack {
 		Some(key)
 	}
 
-	/// Demotes lowest-frequency fast keys once usage crosses the high
-	/// watermark, draining in one batch down to the low one.
+	/// Demotes lowest-frequency fast keys the moment usage exceeds the
+	/// effective budget, draining to exactly it.
 	fn settle_fast_tier(&mut self) {
 		let effective = self.effective_fast_capacity();
 
-		if self.fast_used <= watermarks::high_bytes(effective) {
-			return;
-		}
-
-		let target = watermarks::low_bytes(effective);
-
-		while self.fast_used > target {
+		while self.fast_used > effective {
 			let Some((demote_key, _count)) = self.chain.min_with_count(Tier::Fast) else {
 				break;
 			};

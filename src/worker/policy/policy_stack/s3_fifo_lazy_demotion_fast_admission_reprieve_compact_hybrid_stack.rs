@@ -107,7 +107,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -245,8 +245,8 @@ impl S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack {
 
 	/// The budget actually available to the main queue's fast segment: raw
 	/// `fast_capacity`, minus the one-access carve-out, minus this segment's
-	/// share of the shared-metadata reservation. The watermarks sit on top of
-	/// this number, never in place of any part of it.
+	/// share of the shared-metadata reservation. The settle drains to this
+	/// number, never to any part of it alone.
 	fn effective_main_fast_capacity(&self) -> CacheSize {
 		self.main_fast_capacity().saturating_sub(self.reserved_shares().1)
 	}
@@ -379,9 +379,8 @@ impl S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack {
 		}
 	}
 
-	/// Demotes the `main_fast` tail once `fast_used` crosses the HIGH
-	/// watermark of `effective_main_fast_capacity()`, then keeps going until
-	/// it is back at or below the LOW watermark -- reference-bit gated.
+	/// Demotes the `main_fast` tail while `fast_used` exceeds
+	/// `effective_main_fast_capacity()` -- reference-bit gated.
 	///
 	/// The reference-bit gate is the "lazy demotion": a candidate whose bit
 	/// is set is moved to the FRONT of `main_fast` with the bit cleared and
@@ -394,13 +393,7 @@ impl S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack {
 	fn settle_fast_tier(&mut self) {
 		let effective_capacity = self.effective_main_fast_capacity();
 
-		if self.fast_used <= watermarks::high_bytes(effective_capacity) {
-			return;
-		}
-
-		let drain_target = watermarks::low_bytes(effective_capacity);
-
-		while self.fast_used > drain_target {
+		while self.fast_used > effective_capacity {
 			let Some(candidate) = self.queues.back(Q_MAIN_FAST) else { break };
 
 			let accessed = self.queues.payload(candidate).map(|p| p.freq != 0).unwrap_or(false);
@@ -444,8 +437,7 @@ impl S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack {
 	///
 	/// Budget hoisted out of the loop for the same reason as in
 	/// `settle_fast_tier`: a reprieve moves a key between lists, it never
-	/// adds or removes one, so the reservation is fixed for the pass. No
-	/// watermarks here -- this boundary was never given a high/low pair.
+	/// adds or removes one, so the reservation is fixed for the pass.
 	fn settle_one_access(&mut self) {
 		let effective_capacity = self.effective_one_access_capacity();
 

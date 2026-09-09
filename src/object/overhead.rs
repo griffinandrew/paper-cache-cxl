@@ -1095,8 +1095,8 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	//
 	// 62 since the v3 slot, re-measured at 61.30 B/object structural -- see
 	// `MERGED_STORE_STRUCTURE_OVERHEAD`. The reservation is per LIVE object and
-	// `MergedStore::settle_tier` takes it off the fast budget before the
-	// watermarks, so this number directly sets how many objects fit in DRAM.
+	// `MergedStore::settle_tier` takes it off the fast budget before it
+	// drains, so this number directly sets how many objects fit in DRAM.
 	#[cfg(feature = "merged_object_store")]
 	{
 		let _ = policy;

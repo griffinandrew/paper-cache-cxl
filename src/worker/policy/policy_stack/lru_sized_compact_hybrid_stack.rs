@@ -57,8 +57,8 @@
 //! ## Everything else is `LruSizedHybridStack`, verbatim
 //!
 //! Size classification against `ObjectSize` (`classify`), admission/promotion/
-//! reclassification funnelled through `touch_fast`, per-segment high/low
-//! watermark settling against a capacity net of that segment's PROPORTIONAL
+//! reclassification funnelled through `touch_fast`, per-segment settling
+//! against a capacity net of that segment's PROPORTIONAL
 //! share of the shared metadata reservation (`reserved_shares`), slow-tier
 //! eviction preferring whichever slow list holds more objects, and the
 //! ratio-ranked fast fallback for when nothing has ever been demoted. The
@@ -76,7 +76,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -406,10 +406,8 @@ impl LruSizedCompactHybridStack {
 		}
 	}
 
-	/// Demotes the SMALL fast queue's LRU tail(s) into `small_slow`, triggered
-	/// only once `small_fast_used` crosses the shared HIGH watermark of its
-	/// effective budget, then drained in one pass down to the shared LOW
-	/// watermark of that same budget.
+	/// Demotes the SMALL fast queue's LRU tail(s) into `small_slow` while
+	/// `small_fast_used` exceeds its effective budget.
 	///
 	/// `effective_small()` -- the configured capacity minus this segment's
 	/// proportional share of the reserved shared-structure overhead -- remains
@@ -420,13 +418,7 @@ impl LruSizedCompactHybridStack {
 	fn settle_small_fast(&mut self) {
 		let effective = self.effective_small();
 
-		if self.small_fast_used <= watermarks::high_bytes(effective) {
-			return;
-		}
-
-		let drain_target = watermarks::low_bytes(effective);
-
-		while self.small_fast_used > drain_target {
+		while self.small_fast_used > effective {
 			let Some(demote_key) = self.queues.back(Q_SMALL_FAST) else { break };
 			let size = self.queues.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
 
@@ -444,18 +436,11 @@ impl LruSizedCompactHybridStack {
 	}
 
 	/// LARGE-segment counterpart of `settle_small_fast`, demoting into
-	/// `large_slow`. Same shared high/low watermark pair, taken against
-	/// `effective_large()` instead.
+	/// `large_slow` and draining against `effective_large()` instead.
 	fn settle_large_fast(&mut self) {
 		let effective = self.effective_large();
 
-		if self.large_fast_used <= watermarks::high_bytes(effective) {
-			return;
-		}
-
-		let drain_target = watermarks::low_bytes(effective);
-
-		while self.large_fast_used > drain_target {
+		while self.large_fast_used > effective {
 			let Some(demote_key) = self.queues.back(Q_LARGE_FAST) else { break };
 			let size = self.queues.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
 

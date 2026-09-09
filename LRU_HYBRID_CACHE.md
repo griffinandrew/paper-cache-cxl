@@ -176,18 +176,16 @@ at the user's explicit request: keeping idle capacity in reserve costs usable fa
 marginal reduction in demotion-pass frequency, and the user judged that trade not worth it. For a
 while, `settle_fast_tier` drained exactly back down to `fast_capacity` and no lower.
 
-**This was later revisited for an unrelated reason and a small floor was reintroduced.**
+**A small floor was later reintroduced for an unrelated reason, and later removed again.**
 `PaperCache::set()` writes a new object's `TieredBuffer` to DRAM *synchronously*, at the API layer,
 before the corresponding event even reaches `PolicyWorker` — so a burst of concurrent `set()` calls
 can transiently push real DRAM usage above what the stack's own bookkeeping shows, in the window
-between that physical write and the worker processing it. `settle_fast_tier` now drains to 98% of
-the effective budget (`FAST_TIER_LOW_WATER_RATIO`), not back to exactly the ceiling — a small margin
-that leaves a concurrent burst some room to land in before the next settle needs to trigger again.
-This is much smaller than the original 90% floor and exists for a different reason (burst safety,
-not thrashing reduction); it's paired with (not a substitute for) `apply_tier_migrations` running
-per-event rather than per-batch, which is what actually shrinks the demote-decision-to-physical-
-DRAM-free window. See `HYBRID_CACHES.md`'s "Low-water headroom" section for the current, precise
-description, and `CLAUDE.md` for the full back-and-forth.
+between that physical write and the worker processing it. For a while `settle_fast_tier` drained
+to 98% of the effective budget (`FAST_TIER_LOW_WATER_RATIO`) to leave such a burst room to land, and
+a shared 0.98 / 0.95 high/low pair later replaced that. Both are gone: every settle now drains to
+exactly the effective budget (see `HYBRID_CACHES.md`'s "Continuous draining"). The
+demote-decision-to-physical-DRAM-free window is shrunk by `apply_tier_migrations` running per-event
+rather than per-batch, and is measured rather than padded: `MIGSTATS pending_demote_max` reports it.
 
 ## Turning "this key changed tier" into an actual byte move
 

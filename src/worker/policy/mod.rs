@@ -693,9 +693,9 @@ pub mod migration_queue {
 /// dedicated pool.
 ///
 /// Compiled in unconditionally and gated at run time on batch length, since
-/// the win is entirely batch-size dependent: with the pre-watermark
-/// drain-to-ceiling cadence the overwhelming majority of calls carry 0 or 1
-/// object, where a fan-out would be pure overhead. Only batches at or above
+/// the win is entirely batch-size dependent: with the drain-to-ceiling
+/// cadence every hybrid stack uses, the overwhelming majority of calls carry
+/// 0 or 1 object, where a fan-out would be pure overhead. Only batches at or above
 /// [`threshold`] go to the pool; everything else runs inline exactly as
 /// before.
 pub mod parallel_migration {
@@ -716,8 +716,8 @@ pub mod parallel_migration {
 	/// arrives as single-object batches, so a threshold low enough to
 	/// engage at all would mostly have the pool paying dispatch cost to
 	/// hand one object to one thread. The ~626K-object passes this
-	/// module was built for only appear under a wide watermark band, and
-	/// are far too rare to pay back the machinery -- so the value is 0,
+	/// module was built for only appeared under a wide high/low drain band
+	/// (since removed), and were far too rare to pay back the machinery -- so the value is 0,
 	/// not a compromise picked somewhere between 1 and that size.
 	///
 	/// Superseded by the `migration_queue` module above, which takes the
@@ -917,10 +917,11 @@ pub mod migstats {
 ///
 /// That loop drains to exactly `max_size` one object at a time, so a cache
 /// sitting at capacity re-enters the whole eviction machinery on *every*
-/// subsequent set to free a single object -- the same batch-of-one shape the
-/// fast-tier watermarks (`policy_stack::watermarks`) were introduced to fix
-/// for demotions. With watermarks a pass arms only once usage crosses
-/// `high * max_size`, and then drains to `low * max_size` in one go.
+/// subsequent set to free a single object -- the same batch-of-one shape a
+/// high/low band once batched for fast-tier demotions (that band is gone;
+/// the hybrid stacks drain to exactly their budget). With watermarks a pass
+/// arms only once usage crosses `high * max_size`, and then drains to
+/// `low * max_size` in one go.
 ///
 /// THE DEFAULTS ARE 1.0/1.0 AND MUST STAY THAT WAY. Both thresholds are then
 /// `max_size` exactly and the loop is the pre-watermark
@@ -931,11 +932,10 @@ pub mod migstats {
 /// no longer exists. The feature is strictly opt-in, via
 /// `EVICTION_HIGH_WATERMARK` / `EVICTION_LOW_WATERMARK`.
 ///
-/// Deliberately a separate pair from `policy_stack::watermarks`, whose shape
-/// this mirrors: that one governs fast-tier demotion *inside* a hybrid stack
-/// (defaults 0.98/0.95) and says nothing about how far past `max_size` the
-/// cache as a whole may be trimmed. Sharing the values would hand the
-/// published-sweep guarantee above to a knob tuned for migration batch size.
+/// Deliberately its own pair, and not shared with the hybrid stacks'
+/// fast-tier settle: that drains to exactly its budget with no band at all,
+/// and says nothing about how far past `max_size` the cache as a whole may
+/// be trimmed.
 pub mod eviction_watermarks {
 	use std::sync::OnceLock;
 
@@ -2019,7 +2019,7 @@ where
 		// `trigger_size` arms a capacity pass; `drain_target` is how far that
 		// pass then goes. Both are `max_cache_size` at the 1.0/1.0 default,
 		// which is what keeps an unconfigured build on the exact loop that
-		// predates the watermarks.
+		// predates the eviction watermarks.
 		let (trigger_size, drain_target) = self.eviction_watermarks.bytes(max_cache_size);
 
 		let mut _evicted_this_call: usize = 0;

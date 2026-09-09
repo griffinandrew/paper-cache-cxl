@@ -98,18 +98,18 @@ mod hybrid_cache_tests {
     //
     // `make_cache` gives a 1_600-byte fast tier of which K_IN reserves 819 for
     // the FIFO -- this variant admits into DRAM, so that reservation is carved
-    // out of the same budget -- leaving the main queue about 781, and a high
-    // watermark near 703. Ten 64-byte objects total 640 migrating bytes, which
-    // sits just UNDER that, so nothing demoted and every test asserting a
-    // demotion timed out.
+    // out of the same budget -- leaving the main queue about 781, which is what
+    // `settle_fast_tier` drains to. Ten 64-byte objects total 640 migrating
+    // bytes, which sits UNDER that, so nothing demoted and every test asserting
+    // a demotion timed out.
     //
     // 256 puts ten objects at 2_560, unambiguously over. The FIFO never sees
     // more than one at a time (each set is followed by a get, which promotes
     // it straight out), so this does not trip `fifo_capacity` eviction instead.
     //
-    // Scoped to the four tests that want pressure:
-    // `many_admissions_all_land_fast_without_any_migration` asserts the exact
-    // opposite and keeps the 64-byte payload.
+    // Used by every test that wants main-queue pressure, the two TTL ones
+    // included: `many_admissions_all_land_fast_without_any_migration` asserts
+    // the exact opposite and keeps the 64-byte payload.
     const PRESSURE_LEN: usize = 256;
 
     /// Cache sized by the constants above -- use this for any test that
@@ -429,17 +429,20 @@ mod hybrid_cache_tests {
     fn ttl_survives_a_demotion() {
         ensure_pmem_allocator_warm();
 
-        // Fast tier sized comfortably larger than one ttl'd object (whose
-        // base_size carries a fixed TTL bookkeeping cost), with small filler
-        // keys creating the pressure instead -- the same sizing trap the
-        // other hybrids' equivalent tests hit.
+        // `PRESSURE_LEN`, not 64: the main queue's budget is ~781 bytes and
+        // twelve 64-byte objects come to 768 migrating bytes, which does not
+        // reach it. This test asserts a demotion, so it belongs with the
+        // file's other pressure tests rather than with the ones that assert
+        // everything stays fast.
         let cache = make_cache();
 
-        cache.set(1u32, &[7u8; 64], Some(60)).expect("set with ttl should succeed");
+        cache
+            .set(1u32, &[7u8; PRESSURE_LEN], Some(60))
+            .expect("set with ttl should succeed");
         cache.get(&1u32).expect("get should hit");
 
         for key in 2..=12u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; PRESSURE_LEN], None).expect("set should succeed");
             cache.get(&key).expect("get should hit");
         }
 
@@ -455,7 +458,7 @@ mod hybrid_cache_tests {
         // "still has a TTL" is verified by the companion test below, which
         // watches a short TTL actually fire after a move.)
         assert!(cache.has(&1u32));
-        assert_eq!(cache.get(&1u32).unwrap(), vec![7u8; 64]);
+        assert_eq!(cache.get(&1u32).unwrap(), vec![7u8; PRESSURE_LEN]);
     }
 
     #[test]
@@ -464,11 +467,15 @@ mod hybrid_cache_tests {
 
         let cache = make_cache();
 
-        cache.set(1u32, &[7u8; 64], Some(1)).expect("set with ttl should succeed");
+        // Same `PRESSURE_LEN` reasoning as `ttl_survives_a_demotion`: at 64
+        // bytes no tier move happens at all, and this test's name claims one.
+        cache
+            .set(1u32, &[7u8; PRESSURE_LEN], Some(1))
+            .expect("set with ttl should succeed");
         cache.get(&1u32).expect("get should hit");
 
         for key in 2..=12u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; PRESSURE_LEN], None).expect("set should succeed");
             cache.get(&key).expect("get should hit");
         }
 

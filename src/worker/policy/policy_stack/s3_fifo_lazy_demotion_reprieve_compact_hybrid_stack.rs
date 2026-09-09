@@ -89,7 +89,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -348,8 +348,7 @@ impl S3FifoLazyDemotionReprieveCompactHybridStack {
 	}
 
 	/// Demotes oldest-first from `Q_MAIN_FAST` into the front of `Q_MAIN_SLOW`
-	/// until the fast tier is back under the shared *low* watermark -- but only
-	/// once usage has crossed the shared *high* watermark in the first place.
+	/// until the fast tier is back within its effective budget.
 	///
 	/// Lazy demotion: a candidate whose reference bit is set is given a
 	/// reprieve (moved to the front of `Q_MAIN_FAST`, bit cleared) instead of
@@ -364,13 +363,7 @@ impl S3FifoLazyDemotionReprieveCompactHybridStack {
 	fn settle_fast_tier(&mut self) {
 		let effective_capacity = self.effective_main_fast_capacity();
 
-		if self.fast_used <= watermarks::high_bytes(effective_capacity) {
-			return;
-		}
-
-		let drain_target = watermarks::low_bytes(effective_capacity);
-
-		while self.fast_used > drain_target {
+		while self.fast_used > effective_capacity {
 			let Some(candidate) = self.queues.back(Q_MAIN_FAST) else { break };
 
 			let accessed = self.queues.payload(candidate).map(|p| p.freq != 0).unwrap_or(false);

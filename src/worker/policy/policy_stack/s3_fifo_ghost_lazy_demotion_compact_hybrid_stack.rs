@@ -67,7 +67,7 @@ use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
 		arena_queue_set::{ArenaQueueSet, NodePayload}, ghost_filter::GhostFilter, narrow_resident,
-		watermarks, CacheSize, HashedKey,
+		CacheSize, HashedKey,
 		PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -182,7 +182,7 @@ impl S3FifoGhostLazyDemotionCompactHybridStack {
 
 	/// The fast-tier *value*-byte budget actually available: `fast_capacity`
 	/// minus [`Self::reserved_overhead`], saturating at 0. This is the value
-	/// `settle_fast_tier` applies the watermarks to. Exposed for tests.
+	/// `settle_fast_tier` drains to. Exposed for tests.
 	pub fn effective_fast_capacity(&self) -> CacheSize {
 		self.fast_capacity.saturating_sub(self.reserved_overhead())
 	}
@@ -355,9 +355,8 @@ impl S3FifoGhostLazyDemotionCompactHybridStack {
 	}
 
 	/// Demotes key(s) anchoring `main_boundary` until the fast tier is back
-	/// under the shared *low* watermark -- but only once usage has crossed the
-	/// shared *high* watermark, and still reference-bit gated per candidate
-	/// rather than unconditional. That gate is the one mechanic that differs
+	/// within its effective budget, reference-bit gated per candidate rather
+	/// than unconditional. That gate is the one mechanic that differs
 	/// from [`S3FifoGhostCompactHybridStack`]; see the module doc.
 	///
 	/// Per-demotion bookkeeping is untouched: a demoted object still retags its
@@ -368,13 +367,7 @@ impl S3FifoGhostLazyDemotionCompactHybridStack {
 	fn settle_fast_tier(&mut self) {
 		let effective_capacity = self.effective_fast_capacity();
 
-		if self.fast_used <= watermarks::high_bytes(effective_capacity) {
-			return;
-		}
-
-		let drain_target = watermarks::low_bytes(effective_capacity);
-
-		while self.fast_used > drain_target {
+		while self.fast_used > effective_capacity {
 			let Some(candidate) = self.main_boundary else { break };
 			let accessed = self.queues.payload(candidate).map(|p| p.freq != 0).unwrap_or(false);
 
@@ -685,7 +678,7 @@ mod compact_tests {
 		let fast_capacity: CacheSize = 1_000;
 		let size: ObjectSize = 10;
 		let bytes = size as CacheSize;
-		let count = watermarks::high_bytes(fast_capacity) / bytes + 1;
+		let count = fast_capacity / bytes + 1;
 
 		let mut lazy = S3FifoGhostLazyDemotionCompactHybridStack::new(1.0, 100_000, fast_capacity);
 		let mut eager = S3FifoGhostCompactHybridStack::new(1.0, 100_000, fast_capacity);

@@ -63,7 +63,7 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, watermarks, CacheSize,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, CacheSize,
 		HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
@@ -392,24 +392,15 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 		}
 	}
 
-	/// Demotes from the tier boundary until `am_fast_used` is back under the
-	/// low watermark. The victim is always `am_boundary`, so nothing is
-	/// searched.
+	/// Demotes from the tier boundary until `am_fast_used` is back within the
+	/// budget. The victim is always `am_boundary`, so nothing is searched.
 	///
 	/// The ceiling is [`Self::effective_am_fast_capacity`] -- reservations
-	/// first, watermarks on the remainder.
+	/// come off first, and the drain runs against the remainder.
 	fn settle_fast_tier(&mut self) {
 		let effective = self.effective_am_fast_capacity();
 
-		// Trigger only once usage is past the high watermark...
-		if self.am_fast_used <= watermarks::high_bytes(effective) {
-			return;
-		}
-
-		// ...but once triggered, drain all the way down to the low one.
-		let drain_target = watermarks::low_bytes(effective);
-
-		while self.am_fast_used > drain_target {
+		while self.am_fast_used > effective {
 			let Some(demote_key) = self.am_boundary else { break };
 			let size = self.queues.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
 			let new_boundary = self.queues.before(demote_key);
