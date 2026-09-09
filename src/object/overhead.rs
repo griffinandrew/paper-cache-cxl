@@ -46,14 +46,29 @@ impl OverheadManager {
 	where
 		K: TypeSize,
 	{
-		let mut resident =
-			object.key_size() + mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
-
-		if object.expiry().is_some() {
-			resident += get_ttl_overhead();
+		// Under `fused_value` the key and the expiry live INSIDE the one
+		// allocation that tiers, so they travel with the bytes and NONE of the
+		// object stays in DRAM once it is slow. `NodePayload::migrating()` is
+		// `size - dram_resident`, so reporting the split layout's figure here
+		// would under-charge every migration by exactly the key and expiry --
+		// and the stack would believe a demotion freed less DRAM than it did.
+		#[cfg(feature = "fused_value")]
+		{
+			let _ = object;
+			return 0;
 		}
 
-		resident
+		#[cfg(not(feature = "fused_value"))]
+		{
+			let mut resident =
+				object.key_size() + mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
+
+			if object.expiry().is_some() {
+				resident += get_ttl_overhead();
+			}
+
+			resident
+		}
 	}
 
 	pub fn base_size<K, V>(&self, object: &Object<K, V>) -> ObjectSize
@@ -508,27 +523,10 @@ pub fn get_ttl_overhead() -> ObjectSize {
 //                                     (internal map slot: two 8-byte
 //                                     pointers) = 24 + 20 = 44
 
-/// Approximate per-entry structural overhead of the shared object hashtable
-/// (`DashMap`), *beyond* the stored `Object` itself (which `base_size`
-/// already accounts for, including any key `K` the `Object` stores
-/// internally — see `object/mod.rs`). The map's own key is a *separate*
-/// `HashedKey` (the hash of `K`, not `K` itself), so this charges that
-/// 8-byte key's own storage plus its amortized hashbrown overhead: `cost(8)
-/// = 11` (see the derivation above).
-///
-/// This deliberately does **not** add load-factor slack proportional to the
-/// stored `Object<K, V>`'s own size: this function isn't generic over `K`/
-/// `V`, so that size is unknowable here. This makes the hashtable term an
-/// under-estimate for large objects (their slack is real DRAM cost this
-/// reservation doesn't see), not a safety margin — acceptable given the
-/// fast-tier budget is a demotion target, not a hard data-dropping ceiling
-/// (see the `lru_compact_hybrid_cache`/`lfu_compact_hybrid_cache` design
-/// notes). TODO: if an exact DRAM ceiling is ever needed, thread a
-/// `size_of::<Object<K,V>>()`
-/// hint through from the generic `PaperCache::new` call site instead.
-#[cfg(feature = "hybrid_cache_common")]
-#[allow(dead_code)] // superseded by OBJECT_MAP_ENTRY_OVERHEAD; kept for the derivation notes above
-pub const HASHTABLE_ENTRY_OVERHEAD: ObjectSize = 11;
+// HASHTABLE_ENTRY_OVERHEAD (11) was deleted: already dead, superseded by
+// OBJECT_MAP_ENTRY_OVERHEAD, which is an ALLOCATION figure for the whole row
+// rather than a hand-derived slot estimate. Its derivation notes went with it;
+// `numa_alloc::measured` counts the row directly under `measured_accounting`.
 
 /// Per-object DRAM cost of `LruCompactHybridStack`'s eviction stack.
 ///
@@ -636,8 +634,9 @@ const LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 /// The field-by-field derivation that used to sit here understated this stack
 /// by roughly a third: it counted struct fields and not size-class rounding,
 /// index-map load factor, or the growth slack of every doubling structure.
-/// Being a measured allocation figure it is NOT multiplied by
-/// `resident_factor()` -- see the split in `get_hybrid_dram_shared_overhead`.
+/// Being a measured allocation figure it is already size-class rounded, which
+/// is why the resident factor that once scaled it was inert and has been
+/// deleted -- applying it would have charged the rounding twice.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
@@ -682,8 +681,8 @@ const LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 /// part of [`get_hybrid_dram_shared_overhead`]'s return value: a ghost entry
 /// exists precisely for a key that is *no longer in the cache*, so there is
 /// no tracked-object count to multiply it by and — critically — it has **no
-/// object-hashtable slot**, which is why it must never carry
-/// [`HASHTABLE_ENTRY_OVERHEAD`]. The owning stacks multiply it by
+/// object-hashtable slot**, which is why it must never carry the
+/// object-map row term. The owning stacks multiply it by
 /// `ghost.len()` inside their own `reserved_overhead`.
 ///
 /// **8 bytes**, not 44: the ghost is a `GhostFilter` — a 4-byte fingerprint
@@ -961,42 +960,6 @@ const VALUE_ALLOCATION_OVERHEAD: ObjectSize = 32;
 /// tracking content rather than shard-doubling slack.
 const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 40;
 
-/// Requested-to-resident multiplier for the DRAM metadata reserved above.
-///
-/// The terms above count bytes the cache *requests*; the fast-tier budget is
-/// meant to bound bytes actually *resident*, and an allocator holds more than
-/// was asked for -- size-class rounding plus whatever it retains rather than
-/// returning to the OS. Measured at peak on cluster12:
-///
-/// | allocator                    | rounding | retention | total |
-/// |------------------------------|----------|-----------|-------|
-/// | jemalloc (default)            | 1.064    | 1.29      | ~1.37 |
-/// | jemalloc (`numa_jemalloc`) | 1.061 | 1.017-1.056 | 1.08-1.12 |
-///
-/// Rounding is near-identical between them; the entire difference is
-/// retention, because TBB's per-thread and large-object caches have no purge
-/// discipline while jemalloc decays dirty pages back.
-///
-/// # This is an allocator property, not a workload constant
-///
-/// It is a *ratio*, so unlike the per-object terms it is not inflated by the
-/// harness's own allocations -- those bytes pay the same multiplier. What it
-/// does depend on is churn, which depends on the fast-tier size, which this
-/// number helps determine: measured values on TBB ranged 1.29-2.75 across
-/// configurations for exactly that reason. Treat the constants as starting
-/// points for the shipped configurations and recalibrate with
-/// `DRAM_OVERHEAD_RESIDENT_FACTOR` when the workload or allocator changes;
-/// `jemalloc_stats()` reports the inputs.
-///
-/// A second-order caveat: the ratio is measured process-wide, so a workload
-/// whose non-cache allocations have a very different size profile from the
-/// cache's metadata will skew it slightly.
-/// Measured 1.08-1.12 resident/allocated on the NUMA-bound jemalloc arenas
-/// that back every build. The jemalloc pairing this replaced needed 1.37, and
-/// carrying TBB's number into a jemalloc build over-reserved by ~22%,
-/// shrinking the effective fast tier for no reason.
-#[cfg(feature = "hybrid_cache_common")]
-const DEFAULT_RESIDENT_FACTOR: f64 = 1.12;
 
 /// Bytes jemalloc will actually commit for a value of this requested size.
 ///
@@ -1038,27 +1001,9 @@ pub(crate) fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
 	requested
 }
 
-#[cfg(feature = "hybrid_cache_common")]
-/// NOTE: nothing applies this any more. `get_hybrid_dram_shared_overhead`
-/// dropped it when its terms moved to measured jemalloc `stats.allocated`
-/// figures, which are already size-class-rounded (see that function's closing
-/// comment); the per-policy doc comments above still reference the concept.
-/// Retained rather than deleted because `DRAM_OVERHEAD_RESIDENT_FACTOR` is a
-/// documented knob -- but it is currently INERT, and setting it changes
-/// nothing.
-#[allow(dead_code)]
-fn resident_factor() -> f64 {
-	use std::sync::OnceLock;
-	static FACTOR: OnceLock<f64> = OnceLock::new();
-
-	*FACTOR.get_or_init(|| {
-		std::env::var("DRAM_OVERHEAD_RESIDENT_FACTOR")
-			.ok()
-			.and_then(|value| value.parse::<f64>().ok())
-			.filter(|factor| (1.0..=4.0).contains(factor))
-			.unwrap_or(DEFAULT_RESIDENT_FACTOR)
-	})
-}
+// resident_factor() / DRAM_OVERHEAD_RESIDENT_FACTOR were deleted: INERT, by
+// their own doc. Every term they scaled now comes from size-class-rounded
+// jemalloc figures, so applying the factor would charge the rounding twice.
 
 #[cfg(feature = "hybrid_cache_common")]
 pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
@@ -1366,7 +1311,7 @@ mod shared_overhead_is_feature_independent {
 }
 
 #[cfg(all(test, feature = "hybrid_cache_common"))]
-mod value_resident_factor_applies {
+mod value_counted_at_its_allocated_size {
 	use std::sync::Arc;
 
 	use super::*;

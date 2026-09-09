@@ -283,7 +283,6 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | `FAST_TIER_DRAIN_TARGET` | `0.98` | Fraction of the effective fast-tier budget the tier is continuously held at. `1.0` leaves no burst headroom. |
 | `NUMA_ARENAS_PER_NODE` | `8` | jemalloc arenas per node (clamped to 32). Swept on cluster12: a single arena costs 5% of SET latency at one client and 27% at sixteen, while 8→32 buys 1–2%, inside the run-to-run spread. |
 | `PAPER_NUMA_SLOW_TCACHE` | off | Per-thread cache for slow-tier allocations. Correct but measured not worth enabling. |
-| `DRAM_OVERHEAD_RESIDENT_FACTOR` | `1.12` | Recalibrates the per-object DRAM overhead reservation. Recalibrate when the workload or allocator changes. |
 | `PAPER_CACHE_EVICTION_STACK_CAPACITY` | — | Pre-sizes the eviction stack's backing collections. |
 
 ## Testing

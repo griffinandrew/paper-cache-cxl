@@ -963,6 +963,145 @@ unsafe impl allocator_api2::alloc::Allocator for SlowObjects {
 }
 
 
+/// Live allocated bytes per pool, counted the way Redis's `zmalloc` counts --
+/// per allocation, not sampled.
+///
+/// # Why not `mallctl`
+///
+/// `stats.arenas.<i>.small.allocated` is `curregs * size_class`, and `curregs`
+/// moves when a TCACHE BATCH is filled or flushed, not when the application
+/// allocates. The fast tier here runs on the default tcache and the slow tier
+/// on `MALLOCX_TCACHE_NONE`, so sampling is exact for node 1 and inexact for
+/// node 0 -- the tier being bounded. The error scales with thread count and
+/// free burstiness, so it cannot be calibrated away. Refreshing `epoch` also
+/// takes a process-global lock and walks every arena's bins.
+///
+/// # What it counts
+///
+/// Size-class-rounded usable bytes, via `nallocx`. Because that is a pure
+/// function of `(size, align)`, the add and the subtract cancel exactly with
+/// no per-pointer side table -- `dealloc` recomputes it from the `Layout` it
+/// already holds.
+///
+/// # Scope
+///
+/// RUST-allocated bytes through these allocators, not process RSS and not
+/// resident DRAM. jemalloc is built `JEMALLOC_PREFIX=_rjem_` and does not
+/// interpose malloc, so glibc's heap and pthread stacks are outside it. The
+/// gap to residency is jemalloc's retained dirty pages and fragmentation.
+#[cfg(feature = "measured_accounting")]
+pub mod measured {
+	use std::sync::atomic::{AtomicI64, Ordering};
+
+	use super::{mallocx_lg_align, NODE_FAST, NODE_FAST_VALUES, NODE_SLOW, SLOT};
+
+	/// One per pool: fast (node 0), slow (node 1), fast values (node 0 too --
+	/// a separate ARENA set, not a separate node; see `physical_node`).
+	const POOLS: usize = 3;
+
+	/// Sharded so concurrent connections do not serialise on one line.
+	const SHARDS: usize = 16;
+
+	/// Cache-line isolated: without this, sixteen shards share two lines and
+	/// the sharding buys nothing.
+	#[repr(align(64))]
+	struct Padded(AtomicI64);
+
+	/// SIGNED, and only the SUM is meaningful. Allocate-on-A / free-on-B is
+	/// ordinary here (a migration consumer frees what a worker allocated), so
+	/// an individual shard legitimately goes negative.
+	static POOL_BYTES: [[Padded; SHARDS]; POOLS] = [
+		[const { Padded(AtomicI64::new(0)) }; SHARDS],
+		[const { Padded(AtomicI64::new(0)) }; SHARDS],
+		[const { Padded(AtomicI64::new(0)) }; SHARDS],
+	];
+
+	/// What jemalloc will actually hand back for this request.
+	///
+	/// Takes `(size, align)` rather than a `Layout` so `realloc` can ask about
+	/// its new size without constructing one that might not be valid.
+	///
+	/// NOTE the align bits. `object::overhead::resident_value_bytes` calls
+	/// `nallocx(n, 0)`, which is correct only for `align <= 8`; copying that
+	/// here would mis-round every over-aligned allocation.
+	#[inline]
+	pub fn usable(size: usize, align: usize) -> usize {
+		if size == 0 {
+			return 0;
+		}
+
+		let flags = if align > 1 {
+			mallocx_lg_align(align.trailing_zeros())
+		} else {
+			0
+		};
+
+		unsafe { tikv_jemalloc_sys::nallocx(size, flags) }
+	}
+
+	/// Reuses the arena slot the allocator already assigns per thread rather
+	/// than adding a second thread-local. An unassigned thread (one that only
+	/// ever frees) reads `u32::MAX` and lands in the last shard, which is
+	/// fine: the shard choice affects contention, never the sum.
+	#[inline]
+	fn shard() -> usize {
+		(SLOT.with(|s| s.get()) as usize) % SHARDS
+	}
+
+	#[inline]
+	const fn pool_of(node: u32) -> usize {
+		match node {
+			NODE_FAST => 0,
+			NODE_SLOW => 1,
+			_ => 2,
+		}
+	}
+
+	#[inline]
+	pub fn charge<const NODE: u32>(delta: i64) {
+		POOL_BYTES[pool_of(NODE)][shard()].0.fetch_add(delta, Ordering::Relaxed);
+	}
+
+	/// Live bytes in one pool. Clamped at zero: a torn read across shards can
+	/// momentarily show a negative sum, which is a reporting artifact rather
+	/// than a real state.
+	pub fn allocated(node: u32) -> u64 {
+		let sum: i64 = POOL_BYTES[pool_of(node)]
+			.iter()
+			.map(|p| p.0.load(Ordering::Relaxed))
+			.sum();
+
+		sum.max(0) as u64
+	}
+
+	/// Live DRAM bytes: node 0 plus the segregated value pool, which is a
+	/// different arena set on the SAME physical node.
+	pub fn dram_allocated() -> u64 {
+		allocated(NODE_FAST) + allocated(NODE_FAST_VALUES)
+	}
+
+	/// Live slow-tier bytes.
+	pub fn slow_allocated() -> u64 {
+		allocated(NODE_SLOW)
+	}
+
+	/// The RAW signed sum, unclamped.
+	///
+	/// `allocated` clamps at zero because a torn read across shards can
+	/// momentarily show a negative total, which is a reporting artifact. That
+	/// clamp also hides a PERSISTENT negative drift -- the exact failure an
+	/// uninstrumented `realloc` produces -- so the drift tests read this
+	/// instead. Verified by removing the realloc charge: against `allocated`
+	/// the test stayed green, against this one it fails.
+	#[cfg(test)]
+	pub fn raw_sum(node: u32) -> i64 {
+		POOL_BYTES[pool_of(node)]
+			.iter()
+			.map(|p| p.0.load(Ordering::Relaxed))
+			.sum()
+	}
+}
+
 impl<const NODE: u32> NumaAlloc<NODE> {
 	#[inline]
 	unsafe fn raw_alloc(&self, layout: std::alloc::Layout, zeroed: bool) -> *mut u8 {
@@ -970,7 +1109,7 @@ impl<const NODE: u32> NumaAlloc<NODE> {
 			return layout.align() as *mut u8;
 		}
 
-		match flags_for(NODE, layout.align()) {
+		let ptr = match flags_for(NODE, layout.align()) {
 			Some(mut flags) => {
 				if zeroed {
 					flags |= MALLOCX_ZERO;
@@ -985,7 +1124,18 @@ impl<const NODE: u32> NumaAlloc<NODE> {
 				let flags = if zeroed { MALLOCX_ZERO } else { 0 };
 				unsafe { mallocx(layout.size(), flags) as *mut u8 }
 			},
+		};
+
+		// Both arms, and only on success: a failed allocation owns nothing.
+		// Every allocating method in all three trait impls delegates here, and
+		// `SlowObjects`/`FastValues` are one-line forwards, so this one site
+		// covers the whole add side.
+		#[cfg(feature = "measured_accounting")]
+		if !ptr.is_null() {
+			measured::charge::<NODE>(measured::usable(layout.size(), layout.align()) as i64);
 		}
+
+		ptr
 	}
 }
 
@@ -1029,6 +1179,14 @@ unsafe impl<const NODE: u32> std::alloc::GlobalAlloc for NumaAlloc<NODE> {
 			flags |= mallocx_lg_align(layout.align().trailing_zeros());
 		}
 
+		// Mirror of the add in `raw_alloc`: `usable` is a pure function of
+		// (size, align), so this cancels the birth charge exactly without any
+		// per-pointer bookkeeping. Both `Allocator::deallocate` impls forward
+		// here rather than duplicating the sdallocx logic, so this one site
+		// covers the whole subtract side.
+		#[cfg(feature = "measured_accounting")]
+		measured::charge::<NODE>(-(measured::usable(layout.size(), layout.align()) as i64));
+
 		unsafe { sdallocx(ptr as *mut c_void, layout.size(), flags) }
 	}
 
@@ -1057,13 +1215,33 @@ unsafe impl<const NODE: u32> std::alloc::GlobalAlloc for NumaAlloc<NODE> {
 			return fresh;
 		}
 
-		match flags_for(NODE, layout.align()) {
+		// THE THIRD POINT, and the one whose absence is silent. `rallocx` frees
+		// the old block and returns a new one without going through either
+		// `raw_alloc` or `dealloc`, so a counter that instruments only those
+		// two drifts NEGATIVE without bound -- a Vec growing 32 -> 64 is
+		// charged nallocx(32) at birth and credited nallocx(64) at death.
+		//
+		// Charged INSIDE these two arms rather than at function entry: the
+		// degenerate branch above already routes through `raw_alloc` and
+		// `self.dealloc`, so an entry hook would double count it.
+		let new_ptr = match flags_for(NODE, layout.align()) {
 			Some(flags) => unsafe { rallocx(ptr as *mut c_void, new_size, flags) as *mut u8 },
 			None => {
 				UNBOUND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 				unsafe { rallocx(ptr as *mut c_void, new_size, 0) as *mut u8 }
 			},
+		};
+
+		// Only on success: a failed `rallocx` leaves the OLD block live and
+		// owned, so its charge must stand.
+		#[cfg(feature = "measured_accounting")]
+		if !new_ptr.is_null() {
+			let before = measured::usable(layout.size(), layout.align()) as i64;
+			let after = measured::usable(new_size, layout.align()) as i64;
+			measured::charge::<NODE>(after - before);
 		}
+
+		new_ptr
 	}
 }
 
@@ -1332,6 +1510,139 @@ pub fn resident_pages_per_node() -> Result<(u64, u64), std::io::Error> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+	/// `realloc` is the third instrumentation point, and the only one whose
+	/// absence is silent.
+	///
+	/// `rallocx` frees the old block and returns a new one without passing
+	/// through `raw_alloc` or `dealloc`, so a counter that hooks only those two
+	/// is charged `nallocx(old)` at birth and credited `nallocx(new)` at death.
+	/// Every grow leaks the difference NEGATIVE, unboundedly, on every `Vec`
+	/// and `String` growth in the process.
+	///
+	/// Asserted as a BOUND rather than an equality, and over many cycles: the
+	/// counter is process-global and every other test in the binary allocates
+	/// against it, so an exact before/after would be the same flake
+	/// `dropping_the_last_handle_frees_the_value` had to be rewritten to avoid.
+	/// Uninstrumented, this leaks ~4 KiB per cycle and blows the bound by three
+	/// orders of magnitude; instrumented, the residual is other threads' noise.
+	///
+	/// IGNORED BY DEFAULT, for the same reason as
+	/// `fast_tier_allocations_land_on_node_0` and the placement checks: the
+	/// counter is process-global and every other test in this binary allocates
+	/// against it, so under the default parallel runner the delta is dominated
+	/// by foreign traffic -- measured at 1.3 MB and 0.9 MB against signatures
+	/// of 4.0 MB and ~3 KB. `global_counter_lock` does not help; it serialises
+	/// test BODIES, not the threads they spawn. Run with the process to itself:
+	///
+	/// ```text
+	/// cargo +nightly test --lib --features <cache>,measured_accounting \
+	///     -- --ignored --test-threads=1 numa_alloc::tests
+	/// ```
+	#[test]
+	#[ignore = "process-global counter; needs --test-threads=1"]
+	#[cfg(feature = "measured_accounting")]
+	fn realloc_does_not_drift_the_counter() {
+		use std::alloc::{GlobalAlloc, Layout};
+
+		use super::measured;
+
+		assert!(super::init(), "the node-0 and node-1 arena pools must build");
+
+		const CYCLES: usize = 1_000;
+		const SMALL: usize = 64;
+		const LARGE: usize = 4096;
+		const ALIGN: usize = 8;
+
+		// If `realloc` is uncounted each cycle leaks
+		// `usable(SMALL) - usable(LARGE)`, so the drift is CYCLES times that.
+		let leak_per_cycle =
+			measured::usable(LARGE, ALIGN) as i64 - measured::usable(SMALL, ALIGN) as i64;
+		assert!(leak_per_cycle > 0, "the test sizes must span a size class");
+
+		let allocator = NumaAlloc::<NODE_FAST>;
+		let small = Layout::from_size_align(SMALL, ALIGN).expect("small layout");
+		let large = Layout::from_size_align(LARGE, ALIGN).expect("large layout");
+
+		// RAW, not `allocated`: the clamp at zero hides exactly the negative
+		// drift this test exists to find.
+		let before = measured::raw_sum(NODE_FAST);
+
+		for _ in 0..CYCLES {
+			unsafe {
+				let ptr = GlobalAlloc::alloc(&allocator, small);
+				assert!(!ptr.is_null(), "allocation failed");
+
+				let grown = GlobalAlloc::realloc(&allocator, ptr, small, LARGE);
+				assert!(!grown.is_null(), "realloc failed");
+
+				GlobalAlloc::dealloc(&allocator, grown, large);
+			}
+		}
+
+		let after = measured::raw_sum(NODE_FAST);
+		let drift = (after - before).abs();
+		let would_leak = leak_per_cycle * CYCLES as i64;
+
+		assert!(
+			drift < would_leak / 8,
+			"the counter drifted {drift} B over {CYCLES} grow/free cycles; an \
+			 uninstrumented realloc would drift about {would_leak} B, so this \
+			 looks like realloc is not carrying its delta",
+		);
+	}
+
+	/// The add and the subtract must cancel EXACTLY for a plain alloc/free,
+	/// which is what lets the counter work with no per-pointer side table.
+	/// Same bound-not-equality reasoning as above.
+	///
+	/// IGNORED BY DEFAULT, for the same reason as
+	/// `fast_tier_allocations_land_on_node_0` and the placement checks: the
+	/// counter is process-global and every other test in this binary allocates
+	/// against it, so under the default parallel runner the delta is dominated
+	/// by foreign traffic -- measured at 1.3 MB and 0.9 MB against signatures
+	/// of 4.0 MB and ~3 KB. `global_counter_lock` does not help; it serialises
+	/// test BODIES, not the threads they spawn. Run with the process to itself:
+	///
+	/// ```text
+	/// cargo +nightly test --lib --features <cache>,measured_accounting \
+	///     -- --ignored --test-threads=1 numa_alloc::tests
+	/// ```
+	#[test]
+	#[ignore = "process-global counter; needs --test-threads=1"]
+	#[cfg(feature = "measured_accounting")]
+	fn alloc_and_free_cancel() {
+		use std::alloc::{GlobalAlloc, Layout};
+
+		use super::measured;
+
+		assert!(super::init(), "the node-0 and node-1 arena pools must build");
+
+		const CYCLES: usize = 1_000;
+		// Over-aligned on purpose: `usable` must apply the `mallocx_lg_align`
+		// bits, and `resident_value_bytes`'s `nallocx(n, 0)` -- correct only
+		// for align <= 8 -- must not have been copied into it.
+		let layout = Layout::from_size_align(3000, 64).expect("layout");
+
+		let before = measured::raw_sum(NODE_FAST);
+
+		for _ in 0..CYCLES {
+			unsafe {
+				let ptr = GlobalAlloc::alloc(&NumaAlloc::<NODE_FAST>, layout);
+				assert!(!ptr.is_null(), "allocation failed");
+				GlobalAlloc::dealloc(&NumaAlloc::<NODE_FAST>, ptr, layout);
+			}
+		}
+
+		let drift = (measured::raw_sum(NODE_FAST) - before).abs();
+		let one_object = measured::usable(3000, 64) as i64;
+
+		assert!(
+			drift < one_object * 8,
+			"alloc/free left {drift} B behind over {CYCLES} cycles at \
+			 {one_object} B each -- the two sides are not cancelling",
+		);
+	}
 	use super::*;
 	use std::alloc::{Allocator, Layout};
 

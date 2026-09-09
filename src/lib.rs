@@ -61,6 +61,31 @@ mod worker;
 /// this tree loses test coverage silently, and the one module that owns every
 /// `alloc`, `dealloc` and pointer reinterpretation for values is the last one
 /// that should be skippable.
+/// The cached value. Two layouts, chosen at compile time; the public surface
+/// is identical, so nothing outside this module changes with the choice.
+///
+/// * default -- a DRAM-resident refcounted header pointing at bytes that live
+///   in their own allocation, on whichever tier the policy put them.
+/// * `fused_value` -- one allocation holding the count, the metadata, the key
+///   AND the bytes, tiering as a unit.
+///
+/// The default is not an accident: see `value.rs`'s "Why the bytes are a
+/// SECOND allocation" for the measurements that chose it.
+#[cfg(not(feature = "fused_value"))]
+#[path = "value.rs"]
+pub mod value;
+
+// Under `stock_jemalloc` the global allocator is not `NumaAlloc`, so the fast
+// pool would read ZERO while the slow one still worked -- a green build with
+// the measurement silently disabled on exactly the tier being bounded.
+#[cfg(all(feature = "measured_accounting", feature = "stock_jemalloc"))]
+compile_error!(
+	"measured_accounting requires the NUMA allocator; under stock_jemalloc the \
+	 fast-pool counter would silently read zero"
+);
+
+#[cfg(feature = "fused_value")]
+#[path = "value_fused.rs"]
 pub mod value;
 
 /// `paper_cache::TieredValue`, alongside `paper_cache::TieredBuffer`.
