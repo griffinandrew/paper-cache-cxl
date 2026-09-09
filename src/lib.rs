@@ -226,6 +226,27 @@ pub use crate::tiering::{TieringManager, TieringConfig, TieringStats};
 pub type CacheSize = u64;
 pub type AtomicCacheSize = AtomicU64;
 
+
+/// Serialises every test that reads a process-global counter as a delta.
+///
+/// `VALUE_FREES`, `PENDING_DEMOTE` and the allocator-routing counters are all
+/// process-global, and cargo runs tests in parallel by default, so a test that
+/// samples one, does an operation, and asserts the difference is racing every
+/// other test that touches the same counter. Both `VALUE_FREES` and
+/// `PENDING_DEMOTE` were observed failing that way in a six-run sweep -- two
+/// flakes in six, on tests that are individually correct.
+///
+/// One lock rather than one per module, because the races are BETWEEN modules:
+/// a value dropped by a `value` test moves the counter an `object` test is
+/// asserting on. Poisoning is ignored -- a panic in one such test must not
+/// convert every other one into a failure that hides it.
+#[cfg(test)]
+pub(crate) fn global_counter_lock() -> std::sync::MutexGuard<'static, ()> {
+	static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+	LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub type HashedKey = u64;
 pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 

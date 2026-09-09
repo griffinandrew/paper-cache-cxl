@@ -854,8 +854,10 @@ mod tests {
 	/// failure, and letting it cascade into every other test's error message
 	/// only hides which one broke.
 	fn routing_lock() -> MutexGuard<'static, ()> {
-		static LOCK: Mutex<()> = Mutex::new(());
-		LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+		// The crate-wide lock, not a private one: these tests race the
+		// `VALUE_FREES` and `PENDING_DEMOTE` delta tests in other modules, and
+		// a lock only they take would not serialise against those at all.
+		crate::global_counter_lock()
 	}
 
 	/// The saving this whole type exists for, asserted rather than assumed.

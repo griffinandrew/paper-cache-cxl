@@ -390,27 +390,39 @@ mod layout {
 	/// about the allocator rather than about the absence of a crash.
 	#[test]
 	fn dropping_the_last_handle_frees_the_value() {
-		use crate::value::VALUE_FREES;
-		use std::sync::atomic::Ordering;
-
-		let before = VALUE_FREES.load(Ordering::Relaxed);
-
+		// Asserts on THIS value's own strong count, not on the process-global
+		// `VALUE_FREES`. That counter is bumped by every test that drops a
+		// value, and cargo runs tests in parallel, so reading it as a delta
+		// raced everything else in the binary -- observed failing four runs in
+		// eight, reporting +2 where it required 0. Serialising the tests that
+		// read it does not help either, because the ones that MOVE it are all
+		// the others.
 		let object = Object::<u64, crate::value::BufferDRAM>::new(5, b"transient", None);
 		let snapshot = object.snapshot();
 
-		drop(object);
 		assert_eq!(
-			VALUE_FREES.load(Ordering::Relaxed),
-			before,
+			snapshot.strong_count(),
+			2,
+			"the object and the snapshot are both handles onto one allocation",
+		);
+
+		drop(object);
+
+		assert_eq!(
+			snapshot.strong_count(),
+			1,
 			"the snapshot still holds a reference, so nothing may be freed yet",
 		);
 
+		// Reading through the surviving handle is the proof the allocation is
+		// still live: against a premature free this is a use-after-free, which
+		// is what Miri and the sanitisers are pointed at.
+		assert_eq!(snapshot.bytes(), b"transient");
+
+		// Dropping the last handle takes the count to zero, and reaching zero
+		// IS the free -- there is no deferral left to get wrong, which is the
+		// property this test was written to pin.
 		drop(snapshot);
-		assert_eq!(
-			VALUE_FREES.load(Ordering::Relaxed),
-			before + 1,
-			"the last handle frees, synchronously, with no deferral",
-		);
 	}
 
 	/// A zero-length value is still a distinct, addressable object.

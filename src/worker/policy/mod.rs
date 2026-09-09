@@ -589,7 +589,20 @@ pub mod migration_queue {
 		///
 		/// Against a `push` that charges AFTER the send this fails on the first
 		/// assertion, and it fails deterministically rather than flakily.
+		/// NEEDS THE PROCESS TO ITSELF, and is `#[ignore]`d for it. Run with
+		/// `--ignored --exact --test-threads=1`.
+		///
+		/// `PENDING_DEMOTE` is process-global and this reads it as a delta, but
+		/// the threads that move it are other tests' migration CONSUMERS, not
+		/// their test bodies -- so a shared lock between tests does not
+		/// serialise anything that matters. Observed failing four runs in ten
+		/// with `left: 1, right: 2`: a consumer elsewhere decremented between
+		/// the baseline read and the check. The assertion is exact on purpose,
+		/// because a `>=` form would pass against the unfixed `push` whenever
+		/// another test happened to leave the counter non-zero, which is the
+		/// entire discrimination this test exists for.
 		#[test]
+		#[ignore]
 		fn push_charges_pending_before_the_item_can_reach_a_consumer() {
 			let (sender, receiver) = bounded::<(HashedKey, Tier)>(0);
 
@@ -602,7 +615,11 @@ pub mod migration_queue {
 			};
 
 			// These counters are process-global, so measure this push as a delta
-			// and take the baseline while the queue is quiescent.
+			// and take the baseline while the queue is quiescent -- which means
+			// holding off every other test that moves them, since cargo runs
+			// them in parallel.
+			let _serial = crate::global_counter_lock();
+
 			let before = PENDING_DEMOTE.load(Ordering::Acquire);
 
 			let parked = Arc::new(AtomicBool::new(false));
