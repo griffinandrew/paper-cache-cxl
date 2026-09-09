@@ -211,6 +211,58 @@ tier for it. 0.98 keeps the headroom and pays for it once.
 `eviction_watermarks` in `worker/policy/mod.rs` is a separate, opt-in pair for capacity eviction
 whose defaults were always 1.0 / 1.0.
 
+#### Measured
+
+cluster13, 750 MB slice, 30M records, 12 GB cache, 4 GiB fast tier, `-c 1`, `USE_GET_INTO=0`.
+The four ratio arms are ONE binary driven by `FAST_TIER_DRAIN_TARGET`, so nothing separates them
+but the threshold; only the band arm is a separate build (09b138c), and that comparison carries
+the usual ~1.7% binary-layout floor.
+
+`lru-compact-hybrid` — `settle_fast_tier` re-runs on every admission and is the only migration
+source, so this is where the drain shape is fully exposed:
+
+| arm | fast objects | vs 1.00 | `burst_max` | GET mean | SET mean |
+|---|---|---|---|---|---|
+| band 0.98/0.95 | 491,682 | 0.958 | **20,631** | **1988 ns** | 4330 ns |
+| 1.00 | 513,138 | 1.000 | 88 | 1510 ns | 3473 ns |
+| **0.98** | **503,180** | **0.981** | **94** | **1506 ns** | **3466 ns** |
+| 0.97 | 497,583 | 0.970 | 92 | 1506 ns | 3462 ns |
+| 0.95 | 487,048 | 0.949 | 100 | 1509 ns | 3460 ns |
+
+Three things to read off it:
+
+1. **The band cost 24% of GET mean and bought nothing.** Demotions completed were 14,131,435
+   under the band against 14,119,934 at 0.98 — 0.08% apart. It moved the same objects; it only
+   clumped them into ~20K-entry `apply_tier_migrations` calls, and that clumping is the 1988 vs
+   1506 ns. The batching was the band's whole justification (see above); it delivered the
+   batches and they were a cost, not a saving.
+2. **The burst came from the GAP, not the level.** `burst_max` is 88-100 at every ratio from
+   1.00 to 0.95. A single threshold never accumulates anything to dump, wherever it sits.
+3. **The headroom costs exactly its nominal value.** Occupancy tracks the ratio to within 0.1%
+   (0.9806 / 0.9697 / 0.9492), and latency is flat across all four. So 0.98 dominates the band
+   on every axis at once: 2.3% MORE objects retained than the band's sawtooth average, 24% lower
+   GET, 219x smaller worst-case batch.
+
+#### Where it does nothing, and why
+
+The same sweep is flat or inert on the other two families, and the reasons are structural:
+
+- **`s3-fifo-faithful-compact-hybrid`** — occupancy tracks the ratio linearly (0.9835 / 0.9654 /
+  0.9452) but nothing else moves: `burst_max` stays at ~8.5M and `declined` at ~5.9M across every
+  arm including the band. Those come from `evict_main`'s lazy sweep, which re-queues every key
+  with `freq > 0` and pushes a migration per step. That volume dwarfs anything the settle does,
+  so the drain shape is invisible here.
+- **`2q-full-fast-admission-compact-hybrid`** — every arm came back BYTE-IDENTICAL: 238
+  promotions, 14,251,923 demotions, 371,279 fast objects, `burst_max` 92. `settle_fast_tier`
+  governs `am`, and `am` is empty, because the fast tier pins at `a1_in_capacity = k_in *
+  max_size` = 3,002,645,632 B — using 2.80 of the 4.00 GiB budget. That carve-out is a
+  CACHE-size fraction and is not clamped to `fast_capacity`, so for this family the drain target
+  cannot reach the binding constraint at all.
+
+The last point is a defect rather than a limitation of the drain target: at `k_in >
+fast_capacity / max_size` (0.358 for this configuration) the DRAM admission queue alone exceeds
+the whole fast tier, and no settle can pull it back.
+
 ### The shared-DRAM-overhead reservation
 
 The object hashtable and each stack's own bookkeeping live in DRAM but are not part of
