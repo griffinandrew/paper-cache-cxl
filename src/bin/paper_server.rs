@@ -70,9 +70,13 @@ use std::{
 	time::{Duration, Instant},
 };
 
+#[cfg(not(feature = "all_dram"))]
 use paper_cache::{
 	CacheError, CacheSize, CacheTierSize, PaperCache, PaperPolicy, TieredBuffer,
 };
+
+#[cfg(feature = "all_dram")]
+use paper_cache::{BufferDRAM, CacheError, CacheSize, PaperCache, PaperPolicy};
 
 /// Command bytes, from `paper_utils::command::CommandByte`.
 mod command {
@@ -322,19 +326,31 @@ fn render_self_stats(stats: &SelfStats, cache: &Cache) -> String {
 		let _ = writeln!(out, "rss            {} B (hwm {} B)", status.rss(), status.hwm());
 	}
 
-	let tier = cache.hybrid_stats();
+	#[cfg(not(feature = "all_dram"))]
+	{
+		let tier = cache.hybrid_stats();
 
-	let _ = writeln!(out, "\n*** TIERS ***\n");
-	let _ = writeln!(out, "fast tier size {} B", cache.fast_tier_size());
-	let _ = writeln!(out, "fast           {} objects, {} B",
-		tier.fast_objects, tier.fast_bytes_used);
-	let _ = writeln!(out, "               + {} B reserved for per-object metadata",
-		tier.fast_metadata_bytes);
-	let _ = writeln!(out, "slow           {} objects, {} B",
-		tier.slow_objects, tier.slow_bytes_used);
-	let _ = writeln!(out, "promotions     {}", tier.promotions);
-	let _ = writeln!(out, "demotions      {}", tier.demotions);
-	let _ = writeln!(out, "evictions      {}", tier.evictions);
+		let _ = writeln!(out, "\n*** TIERS ***\n");
+		let _ = writeln!(out, "fast tier size {} B", cache.fast_tier_size());
+		let _ = writeln!(out, "fast           {} objects, {} B",
+			tier.fast_objects, tier.fast_bytes_used);
+		let _ = writeln!(out, "               + {} B reserved for per-object metadata",
+			tier.fast_metadata_bytes);
+		let _ = writeln!(out, "slow           {} objects, {} B",
+			tier.slow_objects, tier.slow_bytes_used);
+		let _ = writeln!(out, "promotions     {}", tier.promotions);
+		let _ = writeln!(out, "demotions      {}", tier.demotions);
+		let _ = writeln!(out, "evictions      {}", tier.evictions);
+	}
+
+	// A flat build has no tiers to report, and says so rather than printing
+	// a table of zeroes that reads like a tiered run that never migrated.
+	#[cfg(feature = "all_dram")]
+	{
+		let _ = writeln!(out, "\n*** TIERS ***\n");
+		let _ = writeln!(out, "flat all-DRAM build: no tiers, no migrations, \
+			nothing on the slow node.");
+	}
 
 	// SHADOW. What the fitted constants predict, beside what the allocator
 	// actually handed out. Nothing reads these to make a decision -- the whole
@@ -354,8 +370,31 @@ fn render_self_stats(stats: &SelfStats, cache: &Cache) -> String {
 		let measured_dram = measured::dram_allocated();
 		let measured_slow = measured::slow_allocated();
 
-		let modelled_dram = tier.fast_bytes_used + tier.fast_metadata_bytes;
-		let modelled_slow = tier.slow_bytes_used;
+		// The modelled side is shape-dependent; the measured side is not,
+		// which is exactly why the two arms are comparable at all. For a flat
+		// build the model IS `used_size`, and the slow pool must read zero --
+		// if it does not, something placed bytes off-node and the build is not
+		// the all-DRAM baseline it claims to be.
+		#[cfg(not(feature = "all_dram"))]
+		let (modelled_dram, modelled_slow, tracked, object_bytes, metadata_bytes) = {
+			let tier = cache.hybrid_stats();
+			(
+				(tier.fast_bytes_used + tier.fast_metadata_bytes) as u64,
+				tier.slow_bytes_used as u64,
+				(tier.fast_objects + tier.slow_objects) as u64,
+				tier.fast_bytes_used as u64,
+				tier.fast_metadata_bytes as u64,
+			)
+		};
+
+		#[cfg(feature = "all_dram")]
+		let (modelled_dram, modelled_slow, tracked, object_bytes, metadata_bytes) = {
+			let (objects, used) = cache
+				.status()
+				.map(|s| (s.num_objects() as u64, s.used_size() as u64))
+				.unwrap_or((0, 0));
+			(used, 0u64, objects, used, 0u64)
+		};
 
 		let _ = writeln!(out, "\n*** MEASURED vs MODELLED (nothing acts on this) ***\n");
 		let _ = writeln!(
@@ -382,15 +421,13 @@ fn render_self_stats(stats: &SelfStats, cache: &Cache) -> String {
 
 		// Per-object, which is the form the fitted constants are written in and
 		// therefore the only form in which the two are directly comparable.
-		let tracked = tier.fast_objects + tier.slow_objects;
-
 		if tracked > 0 {
 			let _ = writeln!(
 				out,
 				"\nper tracked object ({tracked}): modelled metadata {:.1} B, \
 				 measured DRAM less object bytes {:.1} B",
-				tier.fast_metadata_bytes as f64 / tracked as f64,
-				(measured_dram as f64 - tier.fast_bytes_used as f64) / tracked as f64,
+				metadata_bytes as f64 / tracked as f64,
+				(measured_dram as f64 - object_bytes as f64) / tracked as f64,
 			);
 		}
 
@@ -405,7 +442,11 @@ fn render_self_stats(stats: &SelfStats, cache: &Cache) -> String {
 	out
 }
 
+#[cfg(not(feature = "all_dram"))]
 type Cache = PaperCache<u64, TieredBuffer>;
+
+#[cfg(feature = "all_dram")]
+type Cache = PaperCache<u64, BufferDRAM>;
 
 fn main() {
 	let config = match Config::from_args() {
@@ -416,11 +457,25 @@ fn main() {
 		},
 	};
 
-	let cache = match PaperCache::<u64, TieredBuffer>::new(
+	// The flat constructor takes the set of CONFIGURED policies rather than a
+	// tier size -- there is no tier to size. Only the running policy is
+	// configured, so a POLICY command still has nothing to switch to, and the
+	// two arms refuse it identically.
+	#[cfg(feature = "all_dram")]
+	let built = PaperCache::<u64, BufferDRAM>::new(
+		config.max_size,
+		&[config.policy],
+		config.policy,
+	);
+
+	#[cfg(not(feature = "all_dram"))]
+	let built = PaperCache::<u64, TieredBuffer>::new(
 		config.max_size,
 		CacheTierSize::Bytes(config.fast_tier_size),
 		config.policy,
-	) {
+	);
+
+	let cache = match built {
 		Ok(cache) => Arc::new(cache),
 		Err(err) => {
 			eprintln!("could not construct cache: {err}");
@@ -894,9 +949,32 @@ impl Config {
 			.parse::<PaperPolicy>()
 			.map_err(|_| format!("invalid policy {policy_str:?}"))?;
 
+		// A flat design is allowed, and is the ONLY honest all-DRAM baseline.
+		//
+		// Setting a hybrid policy's fast tier equal to its max size does NOT
+		// give a DRAM-only cache. The fast tier is drained continuously to
+		// drain_target::ratio() of its capacity while eviction only fires at
+		// 1.00, so the slow tier becomes a victim queue holding the last 2%
+		// and every eviction is routed through a demotion. Measured on
+		// low_alpha_cold at 6 GB with lru-compact-hybrid: 119 MB and 6,684
+		// objects left on node 1, and demotions 2,515,180 == evictions
+		// 2,484,317 + promotions 30,863, an exact conservation identity.
+		//
+		// So the guard is a warning, not an error. PaperCache::new accepts any
+		// policy; the tier report just shows an empty slow tier for a flat one.
+		#[cfg(not(feature = "all_dram"))]
 		if !policy.is_hybrid() {
 			return Err(format!(
-				"{policy_str:?} is not a hybrid design; this server serves the tiered cache",
+				"{policy_str:?} is not a hybrid design; build with --features \
+				all_dram to serve it as a flat DRAM cache",
+			));
+		}
+
+		#[cfg(feature = "all_dram")]
+		if policy.is_hybrid() {
+			return Err(format!(
+				"{policy_str:?} is a hybrid design; this all_dram build has no \
+				slow tier to place anything in",
 			));
 		}
 
