@@ -336,6 +336,72 @@ fn render_self_stats(stats: &SelfStats, cache: &Cache) -> String {
 	let _ = writeln!(out, "demotions      {}", tier.demotions);
 	let _ = writeln!(out, "evictions      {}", tier.evictions);
 
+	// SHADOW. What the fitted constants predict, beside what the allocator
+	// actually handed out. Nothing reads these to make a decision -- the whole
+	// point is to characterise the drift before anything depends on it.
+	//
+	// Expect measured > modelled on DRAM, and by a knowable amount: the counter
+	// sees every node-0 allocation in the process, which is the object map's
+	// bucket arrays, the eviction-stack arenas, the value headers, ghost
+	// entries, the expiry index AND this server's own per-connection buffers.
+	// The modelled figure is `fast_bytes_used + fast_metadata_bytes`, where the
+	// second term is a per-object constant times the tracked count. The gap
+	// between them IS the question.
+	#[cfg(feature = "measured_accounting")]
+	{
+		use paper_cache::numa_alloc::measured;
+
+		let measured_dram = measured::dram_allocated();
+		let measured_slow = measured::slow_allocated();
+
+		let modelled_dram = tier.fast_bytes_used + tier.fast_metadata_bytes;
+		let modelled_slow = tier.slow_bytes_used;
+
+		let _ = writeln!(out, "\n*** MEASURED vs MODELLED (nothing acts on this) ***\n");
+		let _ = writeln!(
+			out,
+			"{:<10} {:>18} {:>18} {:>14} {:>8}",
+			"pool", "modelled B", "measured B", "drift B", "ratio",
+		);
+
+		for (name, modelled, measured_bytes) in [
+			("dram", modelled_dram, measured_dram),
+			("slow", modelled_slow, measured_slow),
+		] {
+			let drift = measured_bytes as i64 - modelled as i64;
+			let ratio = match modelled {
+				0 => 0.0,
+				m => measured_bytes as f64 / m as f64,
+			};
+
+			let _ = writeln!(
+				out,
+				"{name:<10} {modelled:>18} {measured_bytes:>18} {drift:>+14} {ratio:>8.3}",
+			);
+		}
+
+		// Per-object, which is the form the fitted constants are written in and
+		// therefore the only form in which the two are directly comparable.
+		let tracked = tier.fast_objects + tier.slow_objects;
+
+		if tracked > 0 {
+			let _ = writeln!(
+				out,
+				"\nper tracked object ({tracked}): modelled metadata {:.1} B, \
+				 measured DRAM less object bytes {:.1} B",
+				tier.fast_metadata_bytes as f64 / tracked as f64,
+				(measured_dram as f64 - tier.fast_bytes_used as f64) / tracked as f64,
+			);
+		}
+
+		let _ = writeln!(
+			out,
+			"\nmeasured counts EVERY node-0 allocation in this process, including \
+			 this\nserver's own connection buffers -- it is an upper bound on the \
+			 cache's DRAM,\nnot an attribution of it.",
+		);
+	}
+
 	out
 }
 
