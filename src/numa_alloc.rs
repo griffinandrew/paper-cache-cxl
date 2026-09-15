@@ -962,6 +962,10 @@ unsafe impl allocator_api2::alloc::Allocator for SlowObjects {
 	}
 }
 
+// SAFETY: a stateless handle to the process-wide slow arenas, so any copy can free what
+// another allocated, and cloning or dropping one can neither unwind nor free anything.
+unsafe impl std::alloc::AllocatorClone for SlowObjects {}
+
 
 /// Live allocated bytes per pool, counted the way Redis's `zmalloc` counts --
 /// per allocation, not sampled.
