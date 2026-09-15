@@ -99,6 +99,16 @@
 //! `tail_key`, `fast_boundary`, the mirrors and the settle loop are all
 //! untouched by it. See [`MergedOrder`] for why the choice is a runtime field.
 //!
+//! CLOCK is that same FIFO queue plus a second chance, and it is the order this
+//! design is actually FOR. Under LRU a hit relinks, which means the policy
+//! worker takes a shard WRITE lock on every hit -- measured as the merged
+//! store degrading to 1.24x the DashMap arm's service time at sixteen clients.
+//! A CLOCK hit takes the READ lock and does one relaxed store into a reference
+//! bit, and the second chance that bit buys is paid for later, by the eviction
+//! path, which was holding the write lock anyway. The bit is one byte in the
+//! slot's existing TAIL PADDING, so CLOCK costs no bytes either: the slot is
+//! still exactly 40.
+//!
 //! # Tiering
 //!
 //! Ported from [`LruCompactHybridStack`], whose structure this can reproduce
@@ -203,9 +213,11 @@ const NIL: u32 = u32::MAX;
 /// read on every hit: a branch on a value that never changes is predicted
 /// perfectly, and it sits next to a shard lock acquisition in any case.
 ///
-/// FIFO is the first of several wanted here -- CLOCK, SIEVE, LFU, 2Q and
-/// S3-FIFO are all on the list -- so adding one is adding a variant and an arm
-/// at the two sites below, not a new seam.
+/// FIFO was the first of several wanted here -- SIEVE, LFU, 2Q and S3-FIFO are
+/// still on the list -- so adding one is adding a variant and an arm at the
+/// sites below, not a new seam. CLOCK was the second, and it is the one that
+/// pays for the seam: it is the only order here whose hit path does not take
+/// the shard WRITE lock.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum MergedOrder {
@@ -217,6 +229,37 @@ pub enum MergedOrder {
 	/// written once, at insert, and never again -- including on an overwrite,
 	/// which resizes in place and keeps the object's original queue position.
 	Fifo = 1,
+
+	/// FIFO plus a second chance: a hit sets the slot's REFERENCE BIT and does
+	/// nothing else, and the eviction hand clears that bit and recycles the
+	/// slot to the head instead of evicting it.
+	///
+	/// # Where the hand is
+	///
+	/// There is no hand cursor, because the list already is one. `tail_key`
+	/// nominates the globally oldest slot, which is exactly where a circular
+	/// CLOCK's hand would be pointing; a slot that gets its second chance is
+	/// relinked to the head, which is exactly where a circular CLOCK's hand
+	/// would next reach it -- one full revolution away. That is the standard
+	/// linked-list rendering of CLOCK, and it is what the flat
+	/// `ClockCompactStack` and `ClockStack` in this tree both implement:
+	/// `pop_back`, and on a set bit `push_front` with the bit cleared.
+	///
+	/// It is NOT SIEVE. SIEVE leaves the second-chance object where it is and
+	/// advances a separate hand, so the object keeps its place in insertion
+	/// order; CLOCK moves it to the front. The two are different policies and
+	/// the flat stack this must match implements the second.
+	///
+	/// # Why the second chance promotes
+	///
+	/// `fast_boundary` requires the fast set to be a contiguous PREFIX of its
+	/// shard's list. A second chance moves the slot to the head, which IS in
+	/// that prefix, so the slot has to become fast in the same step -- leaving
+	/// it slow at the head would put a slow object in front of a fast one and
+	/// break the cursor. So the second chance is `touch_slot`, the same relink
+	/// -restamp-promote an LRU hit performs, moved off the hit path and onto
+	/// the eviction path where the write lock is already held.
+	Clock = 2,
 }
 
 impl MergedOrder {
@@ -240,6 +283,10 @@ impl MergedOrder {
 			| PaperPolicy::FifoCompact
 			| PaperPolicy::FifoCompactHybrid => Some(MergedOrder::Fifo),
 
+			PaperPolicy::Clock
+			| PaperPolicy::ClockCompact
+			| PaperPolicy::ClockCompactHybrid => Some(MergedOrder::Clock),
+
 			_ => None,
 		}
 	}
@@ -248,6 +295,7 @@ impl MergedOrder {
 	fn from_repr(v: u8) -> MergedOrder {
 		match v {
 			1 => MergedOrder::Fifo,
+			2 => MergedOrder::Clock,
 			_ => MergedOrder::Lru,
 		}
 	}
@@ -331,10 +379,30 @@ struct Slot<K, V> {
 	/// years to wrap, so the stamps are simply ordered and compared as such.
 	last_access: u64,
 	tier: Tier,
+
+	/// CLOCK's reference bit -- see [`MergedOrder::Clock`]. 1 after a hit,
+	/// cleared by the hand when it grants the second chance.
+	///
+	/// FREE, and that is the point. Bytes 37-39 of this slot were pure tail
+	/// padding, so this field costs nothing: the slot still measures exactly
+	/// 40 and both asserts below still hold. Meaningless under `Lru` and
+	/// `Fifo`, which never read it.
+	///
+	/// An `AtomicU8` rather than a `bool` because the whole reason CLOCK is
+	/// here is that its hit path must not take the shard WRITE lock: the hit
+	/// writes this field through a `&Slot` obtained under the READ lock, which
+	/// only an atomic makes sound. Relaxed on both sides -- the bit is a hint,
+	/// a lost update costs one object one second chance, and there is no other
+	/// datum whose visibility is being ordered against it.
+	referenced: AtomicU8,
 }
 
 /// 8 object + 8 hashed + 4 prev + 4 next + 4 hash_next + 8 last_access +
-/// 1 tier = 37, padded to 40 by the object's 8-byte alignment.
+/// 1 tier + 1 referenced = 38, padded to 40 by the object's 8-byte alignment.
+///
+/// `referenced` went into that padding: the slot measured 40 with 37 bytes of
+/// fields before it and measures 40 now. CLOCK's reference bit is genuinely
+/// free, which is the claim the EXACT assert below is guarding.
 ///
 /// It was 56, with a 24-byte `Object` holding the key, the value pointer, the
 /// length and the expiry inline. Those three moved into the refcounted value
@@ -376,6 +444,7 @@ impl<K, V> Slot<K, V> {
 			hash_next: NIL,
 			last_access: 0,
 			tier: Tier::Fast,
+			referenced: AtomicU8::new(0),
 		}
 	}
 
@@ -1232,8 +1301,16 @@ impl<K, V> MergedStore<K, V> {
 	/// `tail_key` nominate the wrong victim, silently, and the result would
 	/// still look like a plausible miss ratio.
 	pub fn touch(&self, key: HashedKey) {
-		if self.order() == MergedOrder::Fifo {
-			return;
+		match self.order() {
+			MergedOrder::Fifo => return,
+
+			// The whole of a CLOCK hit. It is split out rather than written
+			// here because it shares NOTHING with the body below -- no clock
+			// tick, no write lock, no relink, no promotion and no settle -- and
+			// running any of that would be the bug. See `mark_referenced`.
+			MergedOrder::Clock => return self.mark_referenced(key),
+
+			MergedOrder::Lru => {},
 		}
 
 		let now = self.clock.fetch_add(1, Ordering::Relaxed);
@@ -1276,6 +1353,33 @@ impl<K, V> MergedStore<K, V> {
 		self.settle_tier();
 	}
 
+	/// A CLOCK hit: set the slot's reference bit, and do nothing else.
+	///
+	/// **This is where the hit path ends under `MergedOrder::Clock`.** One
+	/// shard READ lock, one chain walk, one relaxed `store`, return. No
+	/// `clock.fetch_add`, no relink, no `last_access`, no tier change, no
+	/// mirror republish and no `settle_tier` -- and, the point of the whole
+	/// exercise, NO SHARD WRITE LOCK. Under `Lru` the same hit runs
+	/// `touch_slot` under `shards[s].write()`, which serialises every reader of
+	/// that shard behind one relink and is the measured cause of the merged
+	/// store's service time reaching 1.24x the DashMap arm's at sixteen
+	/// clients. Here concurrent hits to the same shard proceed in parallel,
+	/// and two hits racing on the SAME slot both write 1.
+	///
+	/// The work that relink represented has not vanished, it has MOVED: the
+	/// hand pays for it in `clock_victim`, under a write lock the eviction path
+	/// was taking anyway, and only for the slots that actually reach the tail.
+	///
+	/// `pub` so `MergedStackHandle::update` can reach it directly instead of
+	/// going through `touch` and re-testing the order.
+	pub fn mark_referenced(&self, key: HashedKey) {
+		let g = self.shards[shard_of(key)].read().unwrap();
+
+		let Some(i) = g.find(key) else { return };
+
+		g.slots[i as usize].referenced.store(1, Ordering::Relaxed);
+	}
+
 	/// The worker has finished processing the `Set` event for `key`: settle the
 	/// tier against the bytes the insert already accounted.
 	///
@@ -1309,6 +1413,18 @@ impl<K, V> MergedStore<K, V> {
 	/// within itself, so the global LRU object is necessarily some shard's
 	/// tail, and the oldest of those tails is it.
 	pub fn tail_key(&self) -> Option<HashedKey> {
+		match self.order() {
+			// LRU and FIFO read the oldest tail and are done. CLOCK may have to
+			// walk past a run of referenced slots first, and that walk MUTATES
+			// -- see `clock_victim`.
+			MergedOrder::Lru | MergedOrder::Fifo => self.oldest_tail_key(),
+			MergedOrder::Clock => self.clock_victim(),
+		}
+	}
+
+	/// The shard whose list tail is oldest, from `SHARDS` relaxed loads and no
+	/// lock. `None` when every shard is empty.
+	fn oldest_tail_shard(&self) -> Option<usize> {
 		// A plain minimum over the stamps. This was a wrapping-difference AGE
 		// comparison because `last_access` was the clock truncated to 32 bits,
 		// where raw values stop being ordered once the clock wraps; at 64 bits
@@ -1330,15 +1446,110 @@ impl<K, V> MergedStore<K, V> {
 			}
 		}
 
-		if best_shard == usize::MAX {
-			return None;
+		match best_shard {
+			usize::MAX => None,
+			s => Some(s),
 		}
+	}
 
-		let g = self.shards[best_shard].read().unwrap();
+	fn oldest_tail_key(&self) -> Option<HashedKey> {
+		let s = self.oldest_tail_shard()?;
+		let g = self.shards[s].read().unwrap();
 
 		match g.tail {
 			NIL => None,
 			t => Some(g.slots[t as usize].hashed),
+		}
+	}
+
+	/// CLOCK's hand: the oldest slot whose reference bit is CLEAR, granting a
+	/// second chance to every referenced slot it passes.
+	///
+	/// The hand is the existing nomination path and not a cursor of its own.
+	/// `oldest_tail_shard` already names the globally oldest slot, which is
+	/// where a circular CLOCK's hand would be pointing; a second chance is
+	/// `touch_slot`, which relinks that slot to its shard's head and restamps
+	/// it as the newest thing in the store, which is where a circular CLOCK
+	/// would next reach it -- one full revolution later. So the 32 per-shard
+	/// lists still reconstruct one global CLOCK order out of the stamps, for
+	/// exactly the reason they reconstruct one global FIFO order: the stamp is
+	/// the position, and a second chance is a re-insertion.
+	///
+	/// Unlike the other two orders this WRITES, so it takes the shard's write
+	/// lock rather than its read lock. That costs nothing that was not already
+	/// being paid: `evict_one` nominates and `erase`'s `take` immediately takes
+	/// the same shard's write lock to remove the victim. The hit path is what
+	/// CLOCK keeps clean -- see `mark_referenced`.
+	///
+	/// # The budget
+	///
+	/// Sequentially this terminates in at most `len()` chances, since each one
+	/// clears a bit and nothing else sets one. Concurrently an API thread can
+	/// set a bit the hand just cleared, so a hot enough shard could in
+	/// principle keep the hand spinning; `budget` bounds that and then evicts
+	/// whatever is at the tail. It cannot fire on a quiesced store, which is
+	/// what the differential test replays, so it changes no compared behaviour
+	/// -- it is a liveness guard for the server, not a policy.
+	fn clock_victim(&self) -> Option<HashedKey> {
+		enum Step {
+			Victim(HashedKey),
+			Chance,
+			Retry,
+		}
+
+		let mut budget = self.len().saturating_mul(2).saturating_add(8);
+
+		loop {
+			let s = self.oldest_tail_shard()?;
+
+			let step = {
+				let mut g = self.shards[s].write().unwrap();
+
+				match g.tail {
+					// The shard emptied between the relaxed load and the lock.
+					// Republish so the next choice cannot pick it again.
+					NIL => {
+						self.publish_mirrors(s, &g);
+						Step::Retry
+					},
+
+					t if budget == 0
+						|| g.slots[t as usize].referenced.load(Ordering::Relaxed) == 0 =>
+					{
+						Step::Victim(g.slots[t as usize].hashed)
+					},
+
+					t => {
+						let now = self.clock.fetch_add(1, Ordering::Relaxed);
+						let before = g.fast_used;
+
+						// Clear THEN relink, so a hit racing this one is
+						// recorded against the slot's new position rather than
+						// being wiped by the clear.
+						g.slots[t as usize].referenced.store(0, Ordering::Relaxed);
+						g.touch_slot(t, now);
+
+						self.apply_fast_delta(before, g.fast_used);
+						self.note_migrations(&g);
+						self.publish_mirrors(s, &g);
+
+						Step::Chance
+					},
+				}
+			};
+
+			match step {
+				Step::Victim(key) => return Some(key),
+
+				// Outside the guard -- `settle_tier` takes one shard lock at a
+				// time and must not find this thread holding another.
+				Step::Chance => {
+					self.settle_tier();
+					budget = budget.saturating_sub(1);
+				},
+
+				Step::Retry => budget = budget.saturating_sub(1),
+			}
 		}
 	}
 
@@ -1459,8 +1670,22 @@ impl<K, V> MergedStore<K, V> {
 					// other side -- there the API thread's write never touches
 					// the stack at all; here the map IS the stack, so the
 					// restraint has to be spelled out.
-					if self.order() == MergedOrder::Lru {
-						g.touch_slot(i, now);
+					//
+					// Under CLOCK it is FIFO's restraint PLUS the reference
+					// bit, because the flat stack this must match treats a
+					// re-insert as a hit: `ClockCompactStack::insert` forwards
+					// an existing key straight to `update`, which sets the bit.
+					// So an overwrite earns the object a second chance without
+					// moving it, and forgetting the bit here would make a
+					// written-and-then-evicted key leave in the wrong place.
+					match self.order() {
+						MergedOrder::Lru => g.touch_slot(i, now),
+
+						MergedOrder::Clock => {
+							g.slots[i as usize].referenced.store(1, Ordering::Relaxed);
+						},
+
+						MergedOrder::Fifo => {},
 					}
 
 					old
@@ -1475,6 +1700,7 @@ impl<K, V> MergedStore<K, V> {
 						hash_next: NIL,
 						last_access: now,
 						tier: Tier::Fast,
+						referenced: AtomicU8::new(0),
 					};
 
 					let i = match g.free.pop() {
@@ -1730,6 +1956,182 @@ mod tests {
 	/// counts it: the allocator's rounded figure, not the request.
 	fn migrating_bytes(size: ObjectSize) -> CacheSize {
 		crate::object::overhead::resident_value_bytes(size) as CacheSize
+	}
+
+	/// A live key's queue-position stamp, straight out of the slot. The CLOCK
+	/// tests assert on this because "did not relink" and "did not restamp" are
+	/// the same claim: the stamp IS the position.
+	fn stamp(s: &Store, key: HashedKey) -> u64 {
+		let g = s.shards[shard_of(key)].read().unwrap();
+		let i = g.find(key).expect("live key");
+
+		g.slots[i as usize].last_access
+	}
+
+	/// A live key's CLOCK reference bit.
+	fn referenced(s: &Store, key: HashedKey) -> bool {
+		let g = s.shards[shard_of(key)].read().unwrap();
+		let i = g.find(key).expect("live key");
+
+		g.slots[i as usize].referenced.load(Ordering::Relaxed) != 0
+	}
+
+	/// **The point of `MergedOrder::Clock`.** A hit takes the shard's READ
+	/// lock, so it cannot be blocked by -- and cannot block -- a concurrent
+	/// reader of the same shard.
+	///
+	/// Under `Lru` the same hit runs `touch_slot` under `shards[s].write()`,
+	/// which serialises every reader of that shard behind one relink; that is
+	/// the measured cause of the merged store reaching 1.24x the DashMap arm's
+	/// service time at sixteen clients. This test is that difference, made
+	/// observable: a `MergedRef` -- the guard a concurrent GET holds -- is kept
+	/// alive on this thread while another thread performs the hit. A read lock
+	/// joins it immediately; a write lock waits for it.
+	///
+	/// The hit runs on its OWN thread rather than this one, because taking a
+	/// second read guard on a thread that already holds one is not something
+	/// `std::sync::RwLock` promises to allow. And it is bounded by
+	/// `recv_timeout` rather than by `join`, so a regression FAILS here instead
+	/// of hanging the suite.
+	#[test]
+	fn a_clock_hit_does_not_take_the_shard_write_lock() {
+		use std::{sync::{mpsc, Arc}, time::Duration};
+
+		let s = Arc::new(Store::new());
+		s.set_order(MergedOrder::Clock);
+
+		// Two keys in ONE shard, so the queue order is unambiguous: `a` is
+		// older, `b` is newer.
+		let shard = shard_of(mix(1));
+		let mut keys = (1u64..).map(mix).filter(|&k| shard_of(k) == shard);
+		let a = keys.next().unwrap();
+		let b = keys.next().unwrap();
+
+		put(&s, a, 128);
+		put(&s, b, 128);
+
+		assert_eq!(s.tail_key(), Some(a), "the older key is not the victim");
+
+		// The guard a concurrent GET of `a` would be holding: `get_ref` takes
+		// `shards[shard_of(key)].read()`, which is this exact lock.
+		let reader = s.get_ref(&a).expect("the key was just inserted");
+
+		let (tx, rx) = mpsc::channel();
+
+		let hit = {
+			let s = Arc::clone(&s);
+
+			std::thread::spawn(move || {
+				s.touch(a);
+				let _ = tx.send(());
+			})
+		};
+
+		let finished = rx.recv_timeout(Duration::from_secs(10)).is_ok();
+
+		// Released before the assert so the worker can finish either way and
+		// `join` cannot hang on a failure.
+		drop(reader);
+		hit.join().expect("the hit thread panicked");
+
+		assert!(
+			finished,
+			"a CLOCK hit blocked behind a live reader of its own shard, so it \
+			 took the shard WRITE lock -- which is the whole cost this order \
+			 exists to avoid",
+		);
+
+		assert!(referenced(&s, a), "the hit did not set the reference bit");
+
+		// And the second chance that bit bought: the hand clears it, recycles
+		// `a` to the front, and evicts `b` instead.
+		assert_eq!(s.tail_key(), Some(b), "the hand did not spare the referenced key");
+		assert!(!referenced(&s, a), "the hand did not clear the bit it passed");
+	}
+
+	/// A CLOCK hit moves nothing. Not the links, not the stamp, not the tier --
+	/// the bit, and only the bit.
+	///
+	/// This is the guard against the easy mistake, which is to reach for
+	/// `touch_slot` on the hit path because it is right there. A hit that
+	/// restamped would make `tail_key` nominate the wrong victim silently and
+	/// the run would still report a plausible miss ratio; a hit that promoted
+	/// would make CLOCK cost a PMEM->DRAM copy per access, which is exactly the
+	/// cost it exists to avoid.
+	#[test]
+	fn a_clock_hit_does_not_relink_restamp_or_promote() {
+		// A tight fast tier, so the older keys really are demoted and a
+		// promotion would be visible.
+		let s = tiered(4 * migrating_bytes(128));
+		s.set_order(MergedOrder::Clock);
+
+		// ONE shard, so the fast prefix and the demotion boundary are both
+		// unambiguous and the assertions below cannot depend on how 16 keys
+		// happened to scatter over 32 shards.
+		let shard = shard_of(mix(1));
+		let keys: Vec<HashedKey> =
+			(1u64..).map(mix).filter(|&k| shard_of(k) == shard).take(16).collect();
+
+		for &k in &keys {
+			put(&s, k, 128);
+		}
+
+		let victim = s.tail_key().expect("something must be evictable");
+		assert_eq!(s.tier_of(victim), Some(Tier::Slow), "the budget never bit");
+
+		let before: Vec<u64> = keys.iter().map(|&k| stamp(&s, k)).collect();
+		let clock_before = s.clock.load(Ordering::Relaxed);
+
+		// Hit the oldest key, which is the one a relink or a promotion would
+		// move the furthest.
+		s.touch(victim);
+
+		let after: Vec<u64> = keys.iter().map(|&k| stamp(&s, k)).collect();
+
+		assert_eq!(before, after, "a CLOCK hit restamped a slot");
+		assert_eq!(
+			s.clock.load(Ordering::Relaxed),
+			clock_before,
+			"a CLOCK hit consumed a stamp, so it went through the LRU path",
+		);
+		assert_eq!(
+			s.tier_of(victim),
+			Some(Tier::Slow),
+			"a CLOCK hit promoted a slow key -- promotion is the hand's job, \
+			 not the hit's",
+		);
+		assert!(referenced(&s, victim), "the hit did not set the reference bit");
+
+		// The hand is where the work happens: it clears the bit, recycles the
+		// key to the front -- which under this store means restamping it as
+		// the newest thing there is -- and promotes it.
+		let spared = s.tail_key().expect("something must still be evictable");
+
+		assert_ne!(spared, victim, "the hand did not spare the referenced key");
+		assert!(
+			stamp(&s, victim) > *before.iter().max().unwrap(),
+			"the second chance did not restamp the key as the newest, so the \
+			 32 shard lists no longer reconstruct one global order",
+		);
+		assert_eq!(
+			s.tier_of(victim),
+			Some(Tier::Fast),
+			"the second chance moved the key to the head without promoting it, \
+			 which leaves a slow key inside the fast prefix",
+		);
+	}
+
+	/// The slot did not grow. Both const asserts at the top of this file are
+	/// compile-time, so this is here to say WHY the number is 40 and to fail
+	/// readably if someone reads the asserts as a formality.
+	#[test]
+	fn the_reference_bit_cost_no_bytes() {
+		assert_eq!(
+			core::mem::size_of::<Slot<u64, std::sync::Arc<[u8]>>>(),
+			40,
+			"the CLOCK reference bit was supposed to fit in the slot's tail \
+			 padding",
+		);
 	}
 
 	/// Sum of what every live slot claims to be migrating, walked directly.

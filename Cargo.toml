@@ -284,6 +284,24 @@ two_q_full_fast_admission_compact_hybrid_cache = ["key_value_pmem", "hybrid_cach
 #
 fifo_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
+# Single-instance, segmented-CLOCK hybrid cache: `fifo_compact_hybrid_cache`'s
+# queue plus a reference bit. A hit does not move the object; it sets the bit,
+# and the bit buys the object one pass of the eviction hand -- the hand clears
+# it and recycles the object to the newest end of the queue (CLOCK, which
+# relinks; NOT SIEVE, which leaves the object in place). Because the fast/slow
+# boundary is a cursor over that one queue, a recycled object is promoted in the
+# same step. The policy is `clock-compact-hybrid`, the flat reference it is
+# defined against is `clock-compact`, and the algorithm is in
+# worker/policy/policy_stack/clock_compact_hybrid_stack.rs.
+#
+# It costs nothing per key that `fifo_compact_hybrid_cache` does not: the
+# reference bit rides in the `NodePayload::freq` field the shared arena node
+# already carries. Under `merged_object_store` it costs nothing per slot either
+# -- the bit goes in the slot's tail padding -- and it is the one order whose
+# HIT PATH does not take a shard write lock.
+#
+clock_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
+
 # Single-instance, segmented-LRU hybrid cache with a size-split fast AND slow
 # tier: same one-PaperCache<K, TieredBuffer> architecture and LRU
 # admission/promotion/demotion/eviction semantics as

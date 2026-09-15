@@ -49,6 +49,7 @@ mod two_q_fast_admission_compact_hybrid_stack;
 mod two_q_fast_admission_reprieve_compact_hybrid_stack;
 mod two_q_full_fast_admission_compact_hybrid_stack;
 mod fifo_compact_hybrid_stack;
+mod clock_compact_hybrid_stack;
 mod lru_sized_compact_hybrid_stack;
 mod s3_fifo_compact_hybrid_stack;
 mod s3_fifo_faithful_compact_hybrid_stack;
@@ -113,6 +114,7 @@ use crate::{
 		two_q_fast_admission_reprieve_compact_hybrid_stack::TwoQFastAdmissionReprieveCompactHybridStack,
 		two_q_full_fast_admission_compact_hybrid_stack::TwoQFullFastAdmissionCompactHybridStack,
 		fifo_compact_hybrid_stack::FifoCompactHybridStack,
+		clock_compact_hybrid_stack::ClockCompactHybridStack,
 		lru_sized_compact_hybrid_stack::LruSizedCompactHybridStack,
 		s3_fifo_compact_hybrid_stack::S3FifoCompactHybridStack,
 		two_q_ghost_compact_hybrid_stack::TwoQGhostCompactHybridStack,
@@ -573,6 +575,16 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 			),
 		),
 
+		// Same construction as `FifoCompactHybrid` above, which is the design
+		// this is a second chance bolted onto -- see
+		// `clock_compact_hybrid_stack.rs`'s module doc.
+		#[cfg(feature = "hybrid_cache_common")]
+		PaperPolicy::ClockCompactHybrid => Box::new(
+			ClockCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
+				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+			),
+		),
+
 		// Default small/large fast-segment budgets: 10% of max_size each
 		// (totaling the same 20% aggregate default the other four hybrids
 		// use for their single fast tier), immediately overridden by the
@@ -776,6 +788,8 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::FifoCompactHybrid => Box::new(FifoCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
+		PaperPolicy::ClockCompactHybrid => Box::new(ClockCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
+		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::LruSizedCompactHybrid => Box::new(LruSizedCompactHybridStack::new(
 			(max_size as f64 * 0.1) as CacheSize,
 			(max_size as f64 * 0.1) as CacheSize,
@@ -864,11 +878,11 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 42;
+	const POLICY_VARIANT_COUNT: usize = 43;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the
 	/// tiered designs this crate exists to compare.
-	const HYBRID_DESIGN_COUNT: usize = 24;
+	const HYBRID_DESIGN_COUNT: usize = 25;
 
 	/// Every `PaperPolicy` variant, listed explicitly, in declaration order.
 	///
@@ -912,6 +926,7 @@ mod init_policy_stack_tests {
 		(PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.1), PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.9)),
 		(PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.25), PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.5, 0.4)),
 		(PaperPolicy::FifoCompactHybrid, PaperPolicy::FifoCompactHybrid),
+		(PaperPolicy::ClockCompactHybrid, PaperPolicy::ClockCompactHybrid),
 		(PaperPolicy::LruSizedCompactHybrid, PaperPolicy::LruSizedCompactHybrid),
 		(PaperPolicy::LruLfuCompactHybrid(3), PaperPolicy::LruLfuCompactHybrid(7)),
 		(PaperPolicy::S3FifoCompactHybrid(0.1), PaperPolicy::S3FifoCompactHybrid(0.9)),
@@ -964,6 +979,7 @@ mod init_policy_stack_tests {
 			PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(_) => "TwoQFastAdmissionReprieveCompactHybrid",
 			PaperPolicy::TwoQFullFastAdmissionCompactHybrid(..) => "TwoQFullFastAdmissionCompactHybrid",
 			PaperPolicy::FifoCompactHybrid => "FifoCompactHybrid",
+			PaperPolicy::ClockCompactHybrid => "ClockCompactHybrid",
 			PaperPolicy::LruSizedCompactHybrid => "LruSizedCompactHybrid",
 			PaperPolicy::LruLfuCompactHybrid(_) => "LruLfuCompactHybrid",
 			PaperPolicy::S3FifoCompactHybrid(_) => "S3FifoCompactHybrid",

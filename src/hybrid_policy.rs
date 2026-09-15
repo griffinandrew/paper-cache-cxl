@@ -57,7 +57,11 @@ pub fn admission_tier<K>(
 	let _ = (&hashed_key, &status, &objects);
 
 	match policy {
-		PaperPolicy::FifoCompactHybrid | PaperPolicy::LruLfuCompactHybrid(..) => {
+		// CLOCK shares FIFO's contract exactly: a re-set does not move the key,
+		// so a key already demoted stays slow and its bytes must be rebuilt in
+		// PMEM, while a brand-new key is inserted at the head -- inside the
+		// fast prefix -- and is built in DRAM.
+		PaperPolicy::FifoCompactHybrid | PaperPolicy::ClockCompactHybrid | PaperPolicy::LruLfuCompactHybrid(..) => {
 			let existing_tier = objects.get_ref(&hashed_key)
 				.map(|object| if object.value().is_fast() { crate::Tier::Fast } else { crate::Tier::Slow });
 			match existing_tier {

@@ -391,6 +391,13 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// `fifo_compact_hybrid_stack.rs`'s module doc.
 		PaperPolicy::FifoCompactHybrid => FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
+		// Structurally identical to `FifoCompactHybrid`, which is the point:
+		// CLOCK is that queue plus a reference bit, and the bit rides in the
+		// `freq` field `NodePayload` already carries for the S3-FIFO family.
+		// No extra slab slot, no extra index row, no extra byte — see
+		// `clock_compact_hybrid_stack.rs`'s module doc.
+		PaperPolicy::ClockCompactHybrid => CLOCK_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+
 		// Structurally identical to `LruCompactHybrid` despite having 4
 		// recency lists instead of 1: a key is only ever resident in exactly
 		// ONE of {small_fast, large_fast, small_slow, large_slow} at a time,
@@ -740,6 +747,18 @@ pub const EXACT_GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
+/// Per-object DRAM cost of `ClockCompactHybridStack`.
+///
+/// The same number as `FifoCompactHybridStack`'s, and not by coincidence or by
+/// laziness: it is the same `ArenaQueueSet<NodePayload>` holding the same one
+/// slab slot and one index row per key, and CLOCK's reference bit is stored in
+/// the `NodePayload::freq` field that node already carries for every policy.
+/// A design that costs a policy nothing per key has to be charged nothing
+/// extra, or it is handed a larger effective fast tier than the policy it is
+/// being compared against.
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
+const CLOCK_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
+
 /// Per-object DRAM cost of `TwoQCompactHybridStack`'s eviction stack.
 ///
 /// MEASURED: jemalloc `stats.allocated`, one point per process at 2^20..2^23
@@ -1083,6 +1102,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			PaperPolicy::LruSizedCompactHybrid => LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruLfuCompactHybrid(..) => LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::FifoCompactHybrid => FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::ClockCompactHybrid => CLOCK_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQCompactHybrid(..) => TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQFastAdmissionCompactHybrid(..) => TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(..) => TWO_Q_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
@@ -1438,6 +1458,7 @@ mod the_two_overhead_tables_agree {
 			PaperPolicy::LruSizedCompactHybrid,
 			PaperPolicy::LruLfuCompactHybrid(2),
 			PaperPolicy::FifoCompactHybrid,
+			PaperPolicy::ClockCompactHybrid,
 			PaperPolicy::TwoQCompactHybrid(0.25),
 			PaperPolicy::TwoQFastAdmissionCompactHybrid(0.25),
 			PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.25),
@@ -1492,8 +1513,8 @@ mod the_two_overhead_tables_agree {
 	fn every_hybrid_policy_is_actually_covered() {
 		assert_eq!(
 			every_hybrid_policy().len(),
-			24,
-			"the hybrid policy list has drifted from the 24 arms the two \
+			25,
+			"the hybrid policy list has drifted from the 25 arms the two \
 			 overhead tables carry",
 		);
 	}
