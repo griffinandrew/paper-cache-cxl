@@ -1301,6 +1301,28 @@ where
 				// 3959.0/3983.3 MB — within normal run-to-run noise). The
 				// allocator-level retention behavior responsible for that gap
 				// is independent of this loop's migration granularity.
+				//
+				// STAYS PER-EVENT, and not only for the latency reason above.
+				// Hoisting it out of this loop would widen the batch each
+				// `apply_tier_migrations` call hands to
+				// `apply_migration_batches`, and that function PARTITIONS its
+				// batch into demotions and promotions and applies all of the
+				// first before any of the second. Per-key emission order does
+				// not survive that partition: a key promoted by event 3 and
+				// demoted by event 40 arrives as demote-then-promote and ends
+				// up physically in DRAM while the policy stack records it as
+				// slow. `MigrationQueue`'s own doc comment spells out why that
+				// does not self-heal -- the stack already believes the newer
+				// tier, so it never re-emits -- which is why that queue is
+				// sharded BY KEY in the first place. Draining once per event
+				// bounds the batch to one event's worth of decisions and keeps
+				// the window at what it has always been.
+				//
+				// The reason it was expensive is gone regardless:
+				// `MergedStore::drain_migrations` used to take a WRITE lock on
+				// all 32 shards whenever anything anywhere was pending. It now
+				// consults a per-shard dirty bitmask and locks only the shards
+				// that actually migrated -- one relaxed load when nothing has.
 				#[cfg(feature = "hybrid_cache_common")]
 				self.apply_tier_migrations();
 			}

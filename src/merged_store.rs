@@ -180,7 +180,7 @@ use std::{
 	collections::HashMap,
 	ops::{Deref, DerefMut},
 	sync::{
-		atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+		atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 		RwLock, RwLockReadGuard, RwLockWriteGuard,
 	},
 };
@@ -305,6 +305,14 @@ impl MergedOrder {
 /// the comparison against it is like-for-like.
 const SHARD_BITS: u32 = 5;
 const SHARDS: usize = 1 << SHARD_BITS;
+
+/// `MergedStore::dirty_migrations` carries one bit per shard in a `u32`, so the
+/// shard count has to fit in one. At `SHARD_BITS = 5` it is exactly 32.
+const _: () = assert!(
+	SHARDS <= u32::BITS as usize,
+	"SHARDS no longer fits the u32 dirty-shard mask -- widen dirty_migrations \
+	 along with SHARD_BITS",
+);
 
 /// Sharded on the HIGH bits -- see the module doc. The store is `NoHasher`d, so
 /// low-bit sharding would collapse each shard onto one hashbrown bucket.
@@ -963,6 +971,22 @@ impl<K, V> Inner<K, V> {
 		Some(migrating)
 	}
 
+	/// This shard's three tier totals, read as a group.
+	///
+	/// Taken together rather than one accessor per counter so that a
+	/// before/after bracket cannot cover one of them and silently miss the
+	/// others: every locked section that moves ANY of the three was already
+	/// bracketed for `fast_used`, and reading all three through one accessor is
+	/// what extends those proven brackets to the other two.
+	#[inline]
+	fn totals(&self) -> ShardTotals {
+		ShardTotals {
+			fast_used: self.fast_used,
+			slow_used: self.slow_used,
+			fast_count: self.fast_count as CacheSize,
+		}
+	}
+
 	fn tail_seq(&self) -> u64 {
 		match self.tail {
 			NIL => EMPTY_TAIL,
@@ -1008,6 +1032,40 @@ fn scale(bytes: CacheSize, ppm: u64) -> CacheSize {
 const DEFAULT_HIGH_PPM: u64 = 980_000;
 const DEFAULT_LOW_PPM: u64 = 950_000;
 
+/// A snapshot of one shard's tier totals, as the before/after bracket pair
+/// that every locked section reports its mutations through.
+#[derive(Clone, Copy)]
+struct ShardTotals {
+	fast_used: CacheSize,
+	slow_used: CacheSize,
+	fast_count: CacheSize,
+}
+
+/// Applies one counter's before/after change to the store-level total that
+/// mirrors it.
+///
+/// Saturating on the way down: a concurrent settler may have subtracted the
+/// same bytes a moment earlier, and an underflow here would wrap to `u64::MAX`
+/// -- which on `fast_used` would demote the entire fast tier.
+#[inline]
+fn apply_delta(total: &AtomicU64, before: CacheSize, after: CacheSize) {
+	match after.cmp(&before) {
+		std::cmp::Ordering::Greater => {
+			total.fetch_add(after - before, Ordering::Relaxed);
+		},
+
+		std::cmp::Ordering::Less => {
+			let _ = total.fetch_update(
+				Ordering::Relaxed,
+				Ordering::Relaxed,
+				|v| Some(v.saturating_sub(before - after)),
+			);
+		},
+
+		std::cmp::Ordering::Equal => {},
+	}
+}
+
 pub struct MergedStore<K, V> {
 	shards: Box<[RwLock<Inner<K, V>>]>,
 
@@ -1032,10 +1090,29 @@ pub struct MergedStore<K, V> {
 	/// `fast_used_matches_the_shards` pins the two together.
 	fast_used: AtomicU64,
 
-	/// Non-zero when at least one shard has migrations waiting, so the worker's
-	/// per-pass drain costs one atomic load instead of `SHARDS` lock
-	/// acquisitions on the overwhelmingly common empty pass.
-	pending_migrations: AtomicUsize,
+	/// `sum(shard.slow_used)` and `sum(shard.fast_count)`, on exactly the same
+	/// footing as `fast_used` above and maintained by the same brackets.
+	///
+	/// These exist because `refresh_tier_gauges` reads all three gauges once per
+	/// worker pass, and reading them by sweeping cost 96 shard read locks a pass
+	/// (32 per gauge, plus 32 more recomputing `slow_object_count` from a
+	/// `fast_object_count` taken one line earlier). A gauge feeds the fast-tier
+	/// budget, so the price of mirroring them is that a path which moves a shard
+	/// counter without reporting it makes the cache admit the wrong number of
+	/// objects, silently -- `gauges_match_the_shards` and `verify_gauges` are
+	/// what turn that into a failing test instead.
+	slow_used: AtomicU64,
+	fast_count: AtomicU64,
+
+	/// One bit per shard, set while that shard's write lock is held whenever it
+	/// has migration records waiting and cleared only by `drain_migrations`.
+	///
+	/// A single global flag meant that one migrated shard cost the drain a WRITE
+	/// lock on all 32, and `apply_tier_migrations` calls it once per worker
+	/// EVENT. With the mask the drain locks only the shards that actually
+	/// migrated -- normally the one the settle loop just demoted from -- and an
+	/// event with nothing pending costs a single relaxed load.
+	dirty_migrations: AtomicU32,
 
 	/// Accesses that must elapse before a key is relinked again. 0 relinks
 	/// every time, which is exact LRU. memcached's equivalent is 60 seconds.
@@ -1083,7 +1160,9 @@ impl<K, V> Default for MergedStore<K, V> {
 			clock: AtomicU64::new(0),
 			tracked: AtomicUsize::new(0),
 			fast_used: AtomicU64::new(0),
-			pending_migrations: AtomicUsize::new(0),
+			slow_used: AtomicU64::new(0),
+			fast_count: AtomicU64::new(0),
+			dirty_migrations: AtomicU32::new(0),
 			update_interval: std::env::var("MERGED_UPDATE_INTERVAL")
 				.ok()
 				.and_then(|v| v.parse().ok())
@@ -1176,38 +1255,37 @@ impl<K, V> MergedStore<K, V> {
 	}
 
 	#[inline]
-	fn note_migrations(&self, inner: &Inner<K, V>) {
-		if !inner.migrations.is_empty() {
-			self.pending_migrations.store(1, Ordering::Relaxed);
+	fn note_migrations(&self, shard: usize, inner: &Inner<K, V>) {
+		if inner.migrations.is_empty() {
+			return;
+		}
+
+		let bit = 1u32 << shard;
+
+		// Load before the read-modify-write. A shard under a steady demotion
+		// stream sets its bit once and then only reads it until the next drain,
+		// so the common case does not bounce the line between API threads.
+		if self.dirty_migrations.load(Ordering::Relaxed) & bit == 0 {
+			self.dirty_migrations.fetch_or(bit, Ordering::Relaxed);
 		}
 	}
 
-	/// Applies a shard's change in `fast_used` to the store-level total.
+	/// Applies a shard's change in ALL THREE tier totals to the store-level
+	/// totals that mirror them.
 	///
 	/// Taken as a before/after pair rather than as a delta computed by each
-	/// call site: the shard's own counter is the authority, so the total
-	/// cannot drift from it by anyone forgetting which way a particular
-	/// operation moved the bytes.
+	/// call site: the shard's own counters are the authority, so a total
+	/// cannot drift from them by anyone forgetting which way a particular
+	/// operation moved the bytes -- or, now, by remembering for the bytes and
+	/// forgetting for the count. `insert`'s overwrite branch is exactly that
+	/// case: a resize of a slow object moves `slow_used` and touches neither
+	/// of the other two, and it reports through this one call like every other
+	/// path because the bracket reads the group.
 	#[inline]
-	fn apply_fast_delta(&self, before: CacheSize, after: CacheSize) {
-		match after.cmp(&before) {
-			std::cmp::Ordering::Greater => {
-				self.fast_used.fetch_add(after - before, Ordering::Relaxed);
-			},
-
-			std::cmp::Ordering::Less => {
-				// Saturating: a concurrent settler may have subtracted the same
-				// bytes a moment earlier, and an underflow here would wrap to
-				// `u64::MAX` and demote the entire fast tier.
-				let _ = self.fast_used.fetch_update(
-					Ordering::Relaxed,
-					Ordering::Relaxed,
-					|v| Some(v.saturating_sub(before - after)),
-				);
-			},
-
-			std::cmp::Ordering::Equal => {},
-		}
+	fn apply_totals_delta(&self, before: ShardTotals, after: ShardTotals) {
+		apply_delta(&self.fast_used, before.fast_used, after.fast_used);
+		apply_delta(&self.slow_used, before.slow_used, after.slow_used);
+		apply_delta(&self.fast_count, before.fast_count, after.fast_count);
 	}
 
 	/// The shard whose fast boundary is oldest -- the globally least-recently-
@@ -1268,14 +1346,14 @@ impl<K, V> MergedStore<K, V> {
 			};
 
 			let mut g = self.shards[s].write().unwrap();
-			let before = g.fast_used;
+			let before = g.totals();
 
 			// `None` when that shard's boundary went away between the load and
 			// the lock -- another settler took it. Republish and re-choose.
 			g.demote_boundary();
 
-			self.apply_fast_delta(before, g.fast_used);
-			self.note_migrations(&g);
+			self.apply_totals_delta(before, g.totals());
+			self.note_migrations(s, &g);
 			self.publish_fast_tail(s, &g);
 		}
 	}
@@ -1339,12 +1417,12 @@ impl<K, V> MergedStore<K, V> {
 
 			let Some(i) = g.find(key) else { return };
 
-			let before = g.fast_used;
+			let before = g.totals();
 
 			g.touch_slot(i, now);
 
-			self.apply_fast_delta(before, g.fast_used);
-			self.note_migrations(&g);
+			self.apply_totals_delta(before, g.totals());
+			self.note_migrations(s, &g);
 			self.publish_mirrors(s, &g);
 		}
 
@@ -1521,7 +1599,7 @@ impl<K, V> MergedStore<K, V> {
 
 					t => {
 						let now = self.clock.fetch_add(1, Ordering::Relaxed);
-						let before = g.fast_used;
+						let before = g.totals();
 
 						// Clear THEN relink, so a hit racing this one is
 						// recorded against the slot's new position rather than
@@ -1529,8 +1607,8 @@ impl<K, V> MergedStore<K, V> {
 						g.slots[t as usize].referenced.store(0, Ordering::Relaxed);
 						g.touch_slot(t, now);
 
-						self.apply_fast_delta(before, g.fast_used);
-						self.note_migrations(&g);
+						self.apply_totals_delta(before, g.totals());
+						self.note_migrations(s, &g);
 						self.publish_mirrors(s, &g);
 
 						Step::Chance
@@ -1573,7 +1651,7 @@ impl<K, V> MergedStore<K, V> {
 		let s = shard_of(*key);
 		let mut g = self.shards[s].write().unwrap();
 		let i = g.bucket_unlink(*key)?;
-		let before = g.fast_used;
+		let before = g.totals();
 
 		g.detach_tier(i);
 		g.unlink(i);
@@ -1584,7 +1662,7 @@ impl<K, V> MergedStore<K, V> {
 		let taken = g.slots[i as usize].object.take();
 		g.free.push(i);
 
-		self.apply_fast_delta(before, g.fast_used);
+		self.apply_totals_delta(before, g.totals());
 		self.publish_mirrors(s, &g);
 		self.tracked.fetch_sub(1, Ordering::Relaxed);
 
@@ -1597,11 +1675,11 @@ impl<K, V> MergedStore<K, V> {
 
 		let Some(i) = g.bucket_unlink(key) else { return false };
 
-		let before = g.fast_used;
+		let before = g.totals();
 
 		g.retire(i);
 
-		self.apply_fast_delta(before, g.fast_used);
+		self.apply_totals_delta(before, g.totals());
 		self.publish_mirrors(s, &g);
 		self.tracked.fetch_sub(1, Ordering::Relaxed);
 
@@ -1633,7 +1711,7 @@ impl<K, V> MergedStore<K, V> {
 
 		let old = {
 			let mut g = self.shards[s].write().unwrap();
-			let before = g.fast_used;
+			let before = g.totals();
 
 			let old = match g.find(key) {
 				Some(i) => {
@@ -1734,8 +1812,8 @@ impl<K, V> MergedStore<K, V> {
 				},
 			};
 
-			self.apply_fast_delta(before, g.fast_used);
-			self.note_migrations(&g);
+			self.apply_totals_delta(before, g.totals());
+			self.note_migrations(s, &g);
 			self.publish_mirrors(s, &g);
 
 			old
@@ -1777,8 +1855,10 @@ impl<K, V> MergedStore<K, V> {
 		// enough more times to fill it.
 
 		self.tracked.store(0, Ordering::Relaxed);
-		self.pending_migrations.store(0, Ordering::Relaxed);
+		self.dirty_migrations.store(0, Ordering::Relaxed);
 		self.fast_used.store(0, Ordering::Relaxed);
+		self.slow_used.store(0, Ordering::Relaxed);
+		self.fast_count.store(0, Ordering::Relaxed);
 	}
 
 	pub fn len(&self) -> usize {
@@ -1792,14 +1872,31 @@ impl<K, V> MergedStore<K, V> {
 	/// Drains every (key, new tier) pair that crossed the fast/slow boundary
 	/// since the last call, across all shards.
 	pub fn drain_migrations(&self) -> Vec<(HashedKey, Tier)> {
-		if self.pending_migrations.swap(0, Ordering::Relaxed) == 0 {
+		// A plain load first, and the read-modify-write only once there is
+		// something to collect. `PolicyWorker::apply_tier_migrations` calls this
+		// once per EVENT and the overwhelmingly common answer is "nothing", so an
+		// unconditional `swap` would write a shared line on every event and
+		// invalidate it under every API thread trying to set its own bit.
+		if self.dirty_migrations.load(Ordering::Relaxed) == 0 {
 			return Vec::new();
 		}
 
+		let mut dirty = self.dirty_migrations.swap(0, Ordering::Relaxed);
 		let mut out = Vec::new();
 
-		for lock in self.shards.iter() {
-			let mut g = lock.write().unwrap();
+		// Only the shards that actually migrated, not all 32.
+		//
+		// Nothing is lost to the race with a concurrent push: a shard sets its
+		// bit while holding its own write lock, and the bit is cleared only by
+		// the `swap` above. A push that lands before this loop reaches that
+		// shard is taken by this call (the lock orders them); one that lands
+		// after leaves the bit set for the next call. The bit outliving an
+		// already-drained shard costs one wasted lock and nothing else.
+		while dirty != 0 {
+			let s = dirty.trailing_zeros() as usize;
+			dirty &= dirty - 1;
+
+			let mut g = self.shards[s].write().unwrap();
 
 			if !g.migrations.is_empty() {
 				out.append(&mut g.migrations);
@@ -1827,21 +1924,55 @@ impl<K, V> MergedStore<K, V> {
 		self.fast_used.load(Ordering::Relaxed)
 	}
 
+	/// Mirrored, like `fast_bytes_used` above: one relaxed load rather than 32
+	/// shard read locks.
 	pub fn slow_bytes_used(&self) -> CacheSize {
-		self.sum_shards(|g| g.slow_used)
+		self.slow_used.load(Ordering::Relaxed)
 	}
 
 	pub fn fast_object_count(&self) -> usize {
-		self.sum_shards(|g| g.fast_count as CacheSize) as usize
+		self.fast_count.load(Ordering::Relaxed) as usize
 	}
 
+	/// Every live object is in exactly one tier, so the slow count is the
+	/// tracked total less the fast one -- two relaxed loads, and no third
+	/// counter that could drift on its own.
 	pub fn slow_object_count(&self) -> usize {
 		self.len().saturating_sub(self.fast_object_count())
 	}
 
-	/// Gauges are read once per event-loop pass by `refresh_tier_gauges`, so
-	/// they are summed under read locks rather than mirrored into atomics that
-	/// every insert and demotion would then have to contend on.
+	/// Re-derives all three mirrored gauges from the shards and asserts the
+	/// store-level atomics agree.
+	///
+	/// The gauges feed the fast-tier budget, so a path that moves a shard
+	/// counter without reporting it does not announce itself -- the cache just
+	/// admits the wrong number of objects. This is what makes that fail loudly:
+	/// it is the sweep the accessors used to do, kept as the oracle the
+	/// counters are checked against.
+	#[cfg(test)]
+	pub(crate) fn verify_gauges(&self) {
+		assert_eq!(
+			self.fast_bytes_used(),
+			self.sum_shards(|g| g.fast_used),
+			"the store-level fast_used drifted from the shards it mirrors",
+		);
+
+		assert_eq!(
+			self.slow_bytes_used(),
+			self.sum_shards(|g| g.slow_used),
+			"the store-level slow_used drifted from the shards it mirrors",
+		);
+
+		assert_eq!(
+			self.fast_object_count() as CacheSize,
+			self.sum_shards(|g| g.fast_count as CacheSize),
+			"the store-level fast_count drifted from the shards it mirrors",
+		);
+	}
+
+	/// The sweep the three gauges above used to be, kept as the oracle
+	/// `verify_gauges` checks the mirrored counters against.
+	#[cfg(test)]
 	fn sum_shards<F>(&self, f: F) -> CacheSize
 	where
 		F: Fn(&Inner<K, V>) -> CacheSize,
@@ -2271,11 +2402,16 @@ mod tests {
 			"tier byte totals do not add up to what the live slots hold",
 		);
 
+		// `slow_object_count` is `len - fast_object_count`, so this identity
+		// holds by construction. `verify_gauges` is the one with teeth: it
+		// re-derives the fast count from the shards themselves.
 		assert_eq!(
 			s.fast_object_count() + s.slow_object_count(),
 			s.len(),
 			"tier object counts do not add up to the tracked total",
 		);
+
+		s.verify_gauges();
 
 		// The budget is GLOBAL -- there is no per-shard share to overrun -- so
 		// the bound is on the store's total.
@@ -2326,6 +2462,135 @@ mod tests {
 			summed,
 			"the store-level fast_used has drifted from the shards it mirrors",
 		);
+
+		// `slow_used` and `fast_count` are mirrored on exactly the same terms.
+		s.verify_gauges();
+	}
+
+	/// The drift test for the two gauges `refresh_tier_gauges` stopped sweeping
+	/// for: `slow_bytes_used` and `fast_object_count`.
+	///
+	/// These feed the fast-tier budget, so a counter that misses an update path
+	/// does not announce itself -- the cache simply admits the wrong number of
+	/// objects. So the workload below is written from the enumerated list of
+	/// every path that moves a shard's `fast_used`, `slow_used` or `fast_count`,
+	/// and `verify_gauges` re-derives all three from the shards after each one:
+	///
+	///   * insert of a NEW key                    (`insert`, the `None` arm)
+	///   * overwrite with a DIFFERENT size, while the slot is FAST
+	///   * overwrite with a different size while the slot is SLOW -- the one
+	///     path that moves `slow_used` and neither of the other two
+	///   * promotion                              (`touch_slot`)
+	///   * demotion                               (`demote_boundary`)
+	///   * removal                                (`remove_key` -> `retire`)
+	///   * removal returning the object           (`take` -> `detach_tier`)
+	///   * a fast-tier resize, which demotes in bulk
+	///   * `clear`, which zeroes every shard and every mirror at once
+	#[test]
+	fn gauges_match_the_shards() {
+		// Tight enough that inserting pushes objects over the boundary, so the
+		// slow tier is populated and the slow-side paths are actually reached.
+		let s = tiered(2_048 * SHARDS as CacheSize);
+
+		// TWO key families, so the two removal paths cannot cannibalise each
+		// other's targets. The first draft of this test walked one family with
+		// `remove_key(mix(i / 11))` and `take(&mix(i / 13))`, and `remove_key`
+		// reached every key first -- 11k always lands before 13k -- so `take`
+		// returned `None` three thousand times and the test was blind to that
+		// path completely. Deleting `take`'s call to `apply_totals_delta` still
+		// passed. The reached-counters below are what stop that recurring.
+		let a = |i: u64| mix(i);
+		let b = |i: u64| mix(i + 10_000_000);
+
+		let mut removed = 0usize;
+		let mut taken = 0usize;
+		let mut resized = 0usize;
+		let mut promotions = 0usize;
+		let mut demotions = 0usize;
+
+		for i in 1..=3_000u64 {
+			put(&s, a(i), 256);
+			put(&s, b(i), 256);
+
+			// Promotion out of the slow tier, and a relink.
+			if i % 5 == 0 {
+				s.touch(a(i / 5));
+			}
+
+			// An overwrite with a DIFFERENT length. Whichever tier the slot is
+			// in at this instant is charged the difference, so over 3,000
+			// iterations this reaches both the fast branch and the slow one --
+			// and the slow branch is the only path in the store that moves
+			// `slow_used` while touching neither of the other two counters.
+			if i % 7 == 0 {
+				put(&s, a(i / 7), 1_024);
+			}
+
+			if i % 11 == 0 && s.remove_key(a(i / 11)) {
+				removed += 1;
+			}
+
+			if i % 13 == 0 && s.take(&b(i / 13)).is_some() {
+				taken += 1;
+			}
+
+			// Bulk demotion, then bulk headroom.
+			if i % 199 == 0 {
+				s.resize_fast_tier(1_024 * SHARDS as CacheSize);
+				s.verify_gauges();
+				s.resize_fast_tier(2_048 * SHARDS as CacheSize);
+				resized += 1;
+			}
+
+			// Which transitions actually fired, straight from the records the
+			// store emitted rather than inferred from the totals.
+			for (_, tier) in s.drain_migrations() {
+				match tier {
+					Tier::Fast => promotions += 1,
+					Tier::Slow => demotions += 1,
+				}
+			}
+
+			// Every iteration, not just at the end: a drift that a later
+			// operation happens to cancel out would otherwise pass.
+			s.verify_gauges();
+		}
+
+		// Every enumerated path was actually REACHED. Without these the
+		// workload can stop exercising one and the sweep above still agrees
+		// with itself, which is exactly how the first draft went blind.
+		assert!(removed > 0, "remove_key never removed a live key");
+		assert!(taken > 0, "take never took a live key -- that path went unchecked");
+		assert!(resized > 0, "the fast tier was never resized");
+		assert!(promotions > 0, "nothing was ever promoted");
+		assert!(demotions > 0, "nothing was ever demoted");
+
+		// The slow tier really was exercised -- otherwise this whole test would
+		// be checking `slow_used == 0` three thousand times.
+		assert!(
+			s.slow_bytes_used() > 0,
+			"the budget was not tight enough to demote anything, so the slow-side \
+			 paths went unchecked",
+		);
+
+		assert!(s.slow_object_count() > 0, "nothing ended up in the slow tier");
+
+		// And `clear` zeroes the mirrors along with the shards.
+		s.clear();
+		s.verify_gauges();
+
+		assert_eq!(s.slow_bytes_used(), 0, "clear left slow bytes behind");
+		assert_eq!(s.fast_bytes_used(), 0, "clear left fast bytes behind");
+		assert_eq!(s.fast_object_count(), 0, "clear left fast objects behind");
+		assert_eq!(s.slow_object_count(), 0, "clear left slow objects behind");
+
+		// Still correct after a clear -- the mirrors and the shards resumed from
+		// zero together.
+		for i in 1..=500u64 {
+			put(&s, mix(i), 256);
+		}
+
+		s.verify_gauges();
 	}
 
 	/// The fast region must stay a PREFIX of the list: head..=fast_boundary
@@ -2382,6 +2647,66 @@ mod tests {
 		}
 	}
 
+	/// `drain_migrations` visits only the shards whose dirty bit is set, so
+	/// "every migration is eventually drained" is now a claim about that mask
+	/// rather than about a loop over all 32 shards.
+	///
+	/// `migrations_agree_with_final_placement` below CANNOT check this, and
+	/// that is not a guess: making shard 0 skip setting its bit leaves it
+	/// stranding records forever and that test still passes, because a key
+	/// whose migrations are never drained simply never enters its comparison.
+	/// An absence is invisible to a test that only inspects what it was given,
+	/// so this one inspects the shards directly.
+	#[test]
+	fn the_drain_leaves_no_shard_holding_migrations() {
+		let s = tiered(2_048 * SHARDS as CacheSize);
+		let mut shards_seen = [false; SHARDS];
+
+		let mut note = |drained: Vec<(HashedKey, Tier)>| {
+			for (k, _) in drained {
+				shards_seen[shard_of(k)] = true;
+			}
+		};
+
+		for i in 1..=4_000u64 {
+			put(&s, mix(i), 256);
+
+			if i % 3 == 0 {
+				s.touch(mix(i / 3));
+			}
+
+			// Interleaved, so the mask is cleared and re-set many times over
+			// rather than accumulating into one final sweep.
+			if i % 50 == 0 {
+				note(s.drain_migrations());
+			}
+		}
+
+		note(s.drain_migrations());
+
+		// Multi-shard, or the sweep below proves nothing.
+		assert!(
+			shards_seen.iter().filter(|seen| **seen).count() > SHARDS / 2,
+			"the workload migrated across too few shards to be a test of the mask",
+		);
+
+		// The claim itself: nothing is left stranded behind a bit that never
+		// got set.
+		for (i, lock) in s.shards.iter().enumerate() {
+			assert!(
+				lock.read().unwrap().migrations.is_empty(),
+				"shard {i} still holds migrations after a drain -- its dirty bit \
+				 was never set, so the drain never visited it",
+			);
+		}
+
+		assert_eq!(
+			s.dirty_migrations.load(Ordering::Relaxed),
+			0,
+			"the dirty mask outlived the records it points at",
+		);
+	}
+
 	/// Every drained migration must name a real transition, and the last
 	/// migration for a key must agree with where that key actually ended up.
 	#[test]
@@ -2407,6 +2732,12 @@ mod tests {
 		}
 
 		assert!(!last.is_empty(), "a budget this tight must have produced migrations");
+
+		// This workload is the most migration-heavy in the file, so it is also
+		// worth asking the gauges here. Whether the DRAIN stranded anything is a
+		// different question and this test cannot answer it -- see
+		// `the_drain_leaves_no_shard_holding_migrations`.
+		s.verify_gauges();
 
 		let mut checked = 0usize;
 
@@ -2923,6 +3254,10 @@ mod tests {
 			s.sum_shards(|g| g.fast_used),
 			"the store-level fast_used drifted from the shards under contention",
 		);
+
+		// The gauges `refresh_tier_gauges` reads are maintained by the same
+		// brackets, so they have to survive the same contention.
+		s.verify_gauges();
 
 		assert_eq!(
 			s.fast_object_count() + s.slow_object_count(),
