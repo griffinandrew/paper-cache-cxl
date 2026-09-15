@@ -423,12 +423,15 @@ struct Slot<K, V> {
 /// EXACT assert is what catches a field silently landing in the padding and
 /// then, later, pushing the slot over.
 ///
-/// NOTE: `MERGED_STORE_STRUCTURE_OVERHEAD` (62) was measured against the
-/// 56-byte slot and is now WRONG -- it has to be re-measured with
-/// `merged_store::measure::measure_merged_store_point` before any figure that
-/// depends on it is quoted. The 16 bytes this slot lost do not simply come off
-/// it, because the value header they moved into is a new allocation with its
-/// own size class.
+/// `MERGED_STORE_STRUCTURE_OVERHEAD` was re-measured against THIS slot with
+/// `merged_store::measure::measure_merged_store_point` and is 46, from a fitted
+/// 45.2966 B/object structural (R^2 = 0.999999, and identical under both value
+/// layouts). It was 62, fitted against the 56-byte slot. The 16 bytes this slot
+/// lost did not simply come off that figure -- both fill factors multiply the
+/// slot -- which is why it was re-measured rather than adjusted.
+///
+/// The exact assert below is what makes that number falsifiable: change the
+/// slot and the build stops, rather than quietly charging a stale constant.
 const _: () = assert!(
 	core::mem::size_of::<Slot<u64, std::sync::Arc<[u8]>>>() <= 40,
 	"Slot grew past 40 bytes -- the whole point is that it is smaller than a \
@@ -464,14 +467,21 @@ impl<K, V> Slot<K, V> {
 	/// filled in by the worker one event after the API thread inserted the
 	/// object -- so a freshly inserted object was accounted as ZERO bytes until
 	/// the worker caught up. The object carries its value's length, and
-	/// `size - dram_resident` was by construction `resident_value_bytes(len)`:
+	/// `size - dram_resident` was by construction the object's own allocation:
 	/// `base_size` is `key + value + expiry (+ ttl)` and `dram_resident_size`
-	/// is the same sum without the value. So this asks the allocator the same
-	/// question `base_size` asks, and the two cannot drift apart.
+	/// is the same sum without the value.
+	///
+	/// It calls `resident_object_bytes` -- the SAME accessor `base_size` calls,
+	/// and deliberately not a second rounding of `data_size()`. The two used to
+	/// round `nallocx(len)` independently, which was right under the split
+	/// layout and wrong under `fused_value`, where the item is
+	/// `bytes_offset::<K>() + len` and the whole of it travels. One accessor is
+	/// what stops a third caller repeating the mistake.
 	fn migrating(&self) -> CacheSize {
 		match &self.object {
 			Some(object) => {
-				crate::object::overhead::resident_value_bytes(object.data_size()) as CacheSize
+				crate::object::overhead::resident_object_bytes::<K>(object.data_size())
+					as CacheSize
 			},
 
 			None => 0,
@@ -2084,9 +2094,14 @@ mod tests {
 	}
 
 	/// What a slot of `size` bytes of value contributes to a tier, as the store
-	/// counts it: the allocator's rounded figure, not the request.
+	/// counts it: the allocator's rounded figure for the object's whole
+	/// allocation, not the request and not the value bytes alone.
+	///
+	/// Routed through the same accessor `Slot::migrating` uses, so a test
+	/// cannot pass by agreeing with a formula the store no longer applies --
+	/// which is exactly what would have happened here under `fused_value`.
 	fn migrating_bytes(size: ObjectSize) -> CacheSize {
-		crate::object::overhead::resident_value_bytes(size) as CacheSize
+		crate::object::overhead::resident_object_bytes::<u64>(size) as CacheSize
 	}
 
 	/// A live key's queue-position stamp, straight out of the slot. The CLOCK

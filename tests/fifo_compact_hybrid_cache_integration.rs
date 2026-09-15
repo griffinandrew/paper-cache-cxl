@@ -92,7 +92,17 @@ mod hybrid_cache_tests {
     // ~1 KB values, same rationale as `hybrid_cache_integration.rs`'s
     // `VALUE_LEN`: keeps the byte-sized fast-tier budgets behaving
     // intuitively (~value-sized) for the demotion tests below.
-    const VALUE_LEN: usize = 1024;
+    //
+    // 1008 and not 1024, so that an object COSTS exactly 1 KiB rather than
+    // merely containing 1 KiB. The tier is charged the object's whole
+    // allocation, and under `fused_value` the count, key, length and expiry
+    // share it: `bytes_offset::<u32>()` is 16, so a 1024-byte value is a
+    // 1040-byte item that jemalloc rounds to 1280 -- 25% more than the budgets
+    // below were written against, which left the three-object test with room
+    // for two. At 1008 the item is 1024 exactly under fusing and `nallocx`
+    // rounds 1008 to the same 1024 under the split layout, so every budget in
+    // this file means what it meant before, in both builds.
+    const VALUE_LEN: usize = 1008;
 
     fn value(seed: u8) -> Vec<u8> {
         vec![seed; VALUE_LEN]
@@ -217,6 +227,11 @@ mod hybrid_cache_tests {
         // would move it to MRU), and a subsequent demotion must still pick
         // the same oldest key, not whichever key was most recently
         // overwritten.
+        //
+        // The budget holds exactly three objects and refuses a fourth. It is
+        // expressed in what an object COSTS, which is why `VALUE_LEN` is sized
+        // to make that cost a round 1 KiB in both value layouts -- see its
+        // definition above.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
             CacheTierSize::Bytes(3_400), PaperPolicy::FifoCompactHybrid).expect("cache should construct");

@@ -224,8 +224,14 @@ pub struct ValueHeader<K> {
 /// Rounded up to `VALUE_ALIGN` so the bytes keep the eight-byte alignment they
 /// had when they were their own allocation. The tag discipline asserts on that
 /// alignment, and the tail is `u8`, so nothing else would enforce it.
+///
+/// `pub(crate)` because it is also the ACCOUNTING's business: the item is one
+/// allocation of `bytes_offset::<K>() + len`, so this is what separates what
+/// the cache charges for an object from what the allocator commits for it. See
+/// `object::overhead::resident_object_bytes`, which is the only other caller
+/// and the one place the two are reconciled.
 #[inline]
-fn bytes_offset<K>() -> usize {
+pub(crate) fn bytes_offset<K>() -> usize {
 	let header = std::mem::size_of::<ValueHeader<K>>();
 
 	(header + VALUE_ALIGN - 1) & !(VALUE_ALIGN - 1)

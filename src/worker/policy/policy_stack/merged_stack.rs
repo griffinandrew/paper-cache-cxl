@@ -350,6 +350,9 @@ mod global_demotion_fidelity {
 
 	/// Both are exact jemalloc size classes, so `nallocx` rounds neither and
 	/// the two structures charge the identical number of bytes per object.
+	///
+	/// These are ITEM sizes -- what the object COSTS -- and `value_len` below
+	/// turns each into the value length that produces it.
 	const SMALL: ObjectSize = 512;
 	const LARGE: ObjectSize = 8192;
 
@@ -387,12 +390,40 @@ mod global_demotion_fidelity {
 		seq: &[(HashedKey, ObjectSize)],
 	) {
 		for &(key, size) in seq {
-			let value = vec![0u8; size as usize];
+			let value = vec![0u8; value_len(size) as usize];
 
 			store.insert(key, Object::new(key, &value, None));
 			merged.insert_resident(key, size, 0);
 			split.insert_resident(key, size, 0);
 		}
+	}
+
+	/// The value LENGTH whose WHOLE ITEM costs exactly `item` bytes.
+	///
+	/// The constants above name what each object must be CHARGED, because the
+	/// budget is expressed in those bytes and the scenario is built on them.
+	/// The merged store does not take that figure from the caller: it derives
+	/// it from the object, through `Slot::migrating` -> `resident_object_bytes`
+	/// -- so under `fused_value` a 512-BYTE VALUE is a 536-byte item that
+	/// rounds to 640, and feeding the reference stack 512 charged the two
+	/// structures differently. The tier comparison then stopped being about
+	/// ORDER, which is the only thing it exists to check.
+	///
+	/// Subtracting the header makes the item land back on the class in BOTH
+	/// layouts: 488 + 24 = 512 fused, and 488 rounds to 512 split. Every
+	/// capacity and count in this module is therefore unchanged.
+	fn value_len(item: ObjectSize) -> ObjectSize {
+		let len = item - crate::object::overhead::value_header_bytes::<u64>();
+
+		assert_eq!(
+			crate::object::overhead::resident_object_bytes::<u64>(len),
+			item,
+			"a {len}-byte value does not make an item of exactly {item} bytes, \
+			 so the merged store and the reference stack are being charged \
+			 different numbers and this fixture is not comparing orders",
+		);
+
+		len
 	}
 
 	#[test]
@@ -645,6 +676,9 @@ mod fifo_order_fidelity {
 
 	/// All exact jemalloc size classes, so `nallocx` rounds none of them and
 	/// the two structures charge the identical number of bytes per object.
+	///
+	/// These are ITEM sizes -- what the object COSTS -- and `value_len` below
+	/// turns each into the value length that produces it.
 	const SMALL: ObjectSize = 512;
 	const MEDIUM: ObjectSize = 1024;
 	const LARGE: ObjectSize = 8192;
@@ -670,6 +704,34 @@ mod fifo_order_fidelity {
 	/// The n-th key of the sequence, round-robin over three shards.
 	fn key_at(n: u64) -> HashedKey {
 		in_shard(n % 3, n)
+	}
+
+	/// The value LENGTH whose WHOLE ITEM costs exactly `item` bytes.
+	///
+	/// The constants above name what each object must be CHARGED, because the
+	/// budget is expressed in those bytes and the scenario is built on them.
+	/// The merged store does not take that figure from the caller: it derives
+	/// it from the object, through `Slot::migrating` -> `resident_object_bytes`
+	/// -- so under `fused_value` a 512-BYTE VALUE is a 536-byte item that
+	/// rounds to 640, and feeding the reference stack 512 charged the two
+	/// structures differently. The tier comparison then stopped being about
+	/// ORDER, which is the only thing it exists to check.
+	///
+	/// Subtracting the header makes the item land back on the class in BOTH
+	/// layouts: 488 + 24 = 512 fused, and 488 rounds to 512 split. Every
+	/// capacity and count in this module is therefore unchanged.
+	fn value_len(item: ObjectSize) -> ObjectSize {
+		let len = item - crate::object::overhead::value_header_bytes::<u64>();
+
+		assert_eq!(
+			crate::object::overhead::resident_object_bytes::<u64>(len),
+			item,
+			"a {len}-byte value does not make an item of exactly {item} bytes, \
+			 so the merged store and the reference stack are being charged \
+			 different numbers and this fixture is not comparing orders",
+		);
+
+		len
 	}
 
 	/// Spelled out rather than inferred from whether the key happens to be
@@ -701,7 +763,7 @@ mod fifo_order_fidelity {
 				assert!(!store.contains(key), "Insert of a key already present");
 				assert!(!split.contains(key), "Insert of a key already present");
 
-				store.insert(key, Object::new(key, &vec![0u8; size as usize], None));
+				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
 				merged.insert_resident(key, size, 0);
 				split.insert_resident(key, size, 0);
 			},
@@ -718,7 +780,7 @@ mod fifo_order_fidelity {
 				assert!(store.contains(key), "Overwrite of a key that is not present");
 				assert!(split.contains(key), "Overwrite of a key that is not present");
 
-				store.insert(key, Object::new(key, &vec![0u8; size as usize], None));
+				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
 				merged.insert_resident(key, size, 0);
 				split.insert_resident(key, size, 0);
 			},
@@ -993,6 +1055,9 @@ mod clock_order_fidelity {
 	/// All exact jemalloc size classes, so `nallocx` rounds none of them and
 	/// the two tiered structures charge the identical number of bytes per
 	/// object.
+	///
+	/// These are ITEM sizes -- what the object COSTS -- and `value_len` below
+	/// turns each into the value length that produces it.
 	const SMALL: ObjectSize = 512;
 	const MEDIUM: ObjectSize = 1024;
 	const LARGE: ObjectSize = 8192;
@@ -1061,6 +1126,34 @@ mod clock_order_fidelity {
 		in_shard(n % 3, n)
 	}
 
+	/// The value LENGTH whose WHOLE ITEM costs exactly `item` bytes.
+	///
+	/// The constants above name what each object must be CHARGED, because the
+	/// budget is expressed in those bytes and the scenario is built on them.
+	/// The merged store does not take that figure from the caller: it derives
+	/// it from the object, through `Slot::migrating` -> `resident_object_bytes`
+	/// -- so under `fused_value` a 512-BYTE VALUE is a 536-byte item that
+	/// rounds to 640, and feeding the reference stack 512 charged the two
+	/// structures differently. The tier comparison then stopped being about
+	/// ORDER, which is the only thing it exists to check.
+	///
+	/// Subtracting the header makes the item land back on the class in BOTH
+	/// layouts: 488 + 24 = 512 fused, and 488 rounds to 512 split. Every
+	/// capacity and count in this module is therefore unchanged.
+	fn value_len(item: ObjectSize) -> ObjectSize {
+		let len = item - crate::object::overhead::value_header_bytes::<u64>();
+
+		assert_eq!(
+			crate::object::overhead::resident_object_bytes::<u64>(len),
+			item,
+			"a {len}-byte value does not make an item of exactly {item} bytes, \
+			 so the merged store and the reference stack are being charged \
+			 different numbers and this fixture is not comparing orders",
+		);
+
+		len
+	}
+
 	/// Spelled out rather than inferred from whether the key happens to be
 	/// present: an `Insert` that silently became an overwrite, or an
 	/// `Overwrite` whose key had gone, would quietly delete the case the
@@ -1091,7 +1184,7 @@ mod clock_order_fidelity {
 				assert!(!store.contains(key), "Insert of a key already present");
 				assert!(!split.contains(key), "Insert of a key already present");
 
-				store.insert(key, Object::new(key, &vec![0u8; size as usize], None));
+				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
 				merged.insert_resident(key, size, 0);
 				split.insert_resident(key, size, 0);
 				flat.insert(key, size);
@@ -1110,7 +1203,7 @@ mod clock_order_fidelity {
 				assert!(store.contains(key), "Overwrite of a key that is not present");
 				assert!(split.contains(key), "Overwrite of a key that is not present");
 
-				store.insert(key, Object::new(key, &vec![0u8; size as usize], None));
+				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
 				merged.insert_resident(key, size, 0);
 				split.insert_resident(key, size, 0);
 				flat.insert(key, size);
