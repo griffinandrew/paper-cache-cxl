@@ -28,9 +28,9 @@
 //! decrementing `status`. The loop would then spin on a cache it believes is
 //! still over capacity, freeing nothing.
 //!
-//! So `evict_one` NOMINATES the victim -- the globally least-recently-used key,
-//! `SHARDS` atomic loads and no lock -- and the removal happens exactly once,
-//! inside `erase`'s `take`, which unlinks it from the recency order and
+//! So `evict_one` NOMINATES the victim -- the globally oldest key by the
+//! store's order, `SHARDS` atomic loads and no lock -- and the removal happens
+//! exactly once, inside `erase`'s `take`, which unlinks it from that order and
 //! reverses its tier accounting in the same operation.
 //!
 //! # The other two, which are the same mistake in reverse
@@ -69,6 +69,16 @@
 //! methods that add information the map does not already have --
 //! `insert_resident`'s size and tier accounting, `update`'s relink -- do work.
 //!
+//! # The order
+//!
+//! `update` is also where the eviction ORDER lives, because the order is
+//! nothing but what a hit does to the map's own list. This handle resolves the
+//! configured policy to a `MergedOrder` once, in `new`, installs it on the
+//! store and keeps a copy: under `Lru` a hit relinks and promotes, under `Fifo`
+//! it does nothing, which is the same nothing `FifoCompactHybridStack` gets
+//! from not overriding `PolicyStack::update`. A policy whose order the store
+//! does not implement is reported on stderr and run as LRU -- see `new`.
+//!
 //! # Tiering
 //!
 //! The seven tiering methods forward to the store rather than taking their
@@ -80,7 +90,7 @@
 //! stack was not.
 
 use crate::{
-	merged_store::MergedStore,
+	merged_store::{MergedOrder, MergedStore},
 	object::ObjectSize,
 	worker::policy::policy_stack::{CacheSize, HashedKey, PolicyStack, Tier},
 	PaperPolicy,
@@ -105,6 +115,12 @@ pub struct MergedStackHandle<K, V> {
 	/// answers to whichever policy the cache was configured with and never
 	/// triggers a stack reconstruction.
 	policy: PaperPolicy,
+
+	/// The order the store was actually put into, which is the same value the
+	/// store holds. Kept here as well so `update` -- the hottest method on this
+	/// type, one call per cache hit -- answers from a plain field instead of an
+	/// atomic load through the `Arc`.
+	order: MergedOrder,
 }
 
 impl<K, V> MergedStackHandle<K, V> {
@@ -135,23 +151,37 @@ impl<K, V> MergedStackHandle<K, V> {
 
 		let _ = max_size;
 
-		// The merged store implements ONE eviction order -- recency -- because
-		// that order is the object map's own link structure. `is_policy` still
+		// The merged store's eviction order IS the object map's own link
+		// structure, so it implements the orders it has been taught and no
+		// others -- today recency and insertion order. `is_policy` still
 		// answers to the configured policy so nothing tries to reconstruct a
-		// stack that has no separate existence, which means a merged build asked
-		// for, say, `lfu-compact-hybrid` would run LRU under an LFU label. Say so
-		// loudly rather than reporting a miss ratio against the wrong name.
-		if !matches!(
-			policy,
-			PaperPolicy::Lru | PaperPolicy::LruCompact,
-		) && !format!("{policy}").starts_with("lru") {
-			log::warn!(
-				"merged_object_store implements LRU; running it as {policy} will \
-				 report LRU behaviour under that policy's name",
-			);
-		}
+		// stack that has no separate existence, which means a merged build
+		// asked for, say, `lfu-compact-hybrid` runs LRU under an LFU label.
+		//
+		// `MergedOrder::from_policy` returning `None` is exactly that case, and
+		// it is reported on STDERR rather than through `log`: the warning that
+		// used to be here was a `log::warn!`, the server installs no logger, so
+		// in the one binary where this mislabelling can actually happen the
+		// warning had never once been printed. A mislabelled run is worse than
+		// a failed one -- it produces a plausible miss ratio filed under the
+		// wrong policy name -- so it is worth a line the user cannot miss.
+		let order = match MergedOrder::from_policy(&policy) {
+			Some(order) => order,
 
-		MergedStackHandle { store, policy }
+			None => {
+				eprintln!(
+					"WARNING: merged_object_store implements LRU and FIFO only; \
+					 running it as {policy} executes LRU and reports LRU \
+					 behaviour under that policy's name",
+				);
+
+				MergedOrder::Lru
+			},
+		};
+
+		store.set_order(order);
+
+		MergedStackHandle { store, policy, order }
 	}
 }
 
@@ -185,8 +215,18 @@ where
 		self.store.record_size(key, size, dram_resident);
 	}
 
+	/// A cache hit.
+	///
+	/// Under FIFO this is a no-op, which is the whole of the policy -- and it
+	/// is the same no-op `FifoCompactHybridStack` gets by NOT overriding
+	/// `PolicyStack::update`, whose default body is empty. The store's `touch`
+	/// refuses under FIFO as well; the check is repeated here so the hot path
+	/// does not pay for a call through the `Arc` to find that out.
 	fn update(&mut self, key: HashedKey) {
-		self.store.touch(key);
+		match self.order {
+			MergedOrder::Lru => self.store.touch(key),
+			MergedOrder::Fifo => {},
+		}
 	}
 
 	/// Deliberate no-op -- see the module doc's second surprising-method note.
@@ -507,5 +547,349 @@ mod global_demotion_fidelity {
 			split.fast_bytes_used(),
 			"the two stacks disagree about fast bytes after the touches",
 		);
+	}
+}
+
+/// The acceptance test for `MergedOrder::Fifo`: it is the SAME order
+/// [`FifoCompactHybridStack`] implements, key for key, step for step.
+///
+/// # Why this test and not a property of the merged store alone
+///
+/// "FIFO" is not a property a single structure can be checked against -- any
+/// self-consistent order looks fine from inside. It is a claim that this store
+/// and the reference FIFO stack, fed one sequence, agree. So the sequence is
+/// replayed into both and the two are compared at every step on tier placement,
+/// and at the end on the whole eviction order and on the gauges the tiering
+/// manager reads.
+///
+/// # What each ingredient of the sequence is for
+///
+/// * **Hits, on fast keys AND on demoted slow ones.** This is the whole of
+///   FIFO, and the only thing that can break it. Under recency a hit relinks to
+///   the MRU end and promotes out of the slow tier; either one diverges from
+///   the reference stack immediately -- a promotion shows up in `tier_of` at
+///   the next step, a relink in the eviction order at the end. The reference
+///   stack does not override `PolicyStack::update` at all, so on its side a hit
+///   is the trait's empty default; the merged store has to arrive at that same
+///   nothing from the other direction, by refusing to do what its own link
+///   structure makes easy.
+///
+/// * **An overwrite of a key that is still fast, to a larger size.** The subtle
+///   one. An overwrite has to do HALF of what a touch does -- the bytes really
+///   did change and some tier has to be charged for them -- and none of the
+///   other half: no relink, no promotion, and above all no new `last_access`,
+///   which under FIFO is not a recency stamp but this object's POSITION in the
+///   queue. Growing a fast key also pushes the fast tier over its budget, so
+///   the settle that follows demotes older objects and the boundary has to
+///   land in the same place on both sides.
+///
+/// * **An overwrite of a key that has already been demoted.** The same delta,
+///   charged to the SLOW tier this time, and still no promotion -- the case
+///   where forgetting the order costs a wrong tier rather than a wrong
+///   position.
+///
+/// * **An overwrite that does not change the size.** The reference stack
+///   returns early without even re-settling; the merged store cannot, because
+///   the object was physically replaced. The two must still agree.
+///
+/// * **Keys spread over three shards.** A single-shard sequence would compare
+///   one list against one list and never exercise `tail_key`'s minimum over the
+///   shard tails, which is the part of the merged store that has to reconstruct
+///   a global FIFO order out of 32 independent ones.
+///
+/// # Why the two are comparable at all
+///
+/// Identical `(key, size, dram_resident)` calls through `PolicyStack`, the same
+/// unconditional fast admission, the same `drain_target`, and no per-object
+/// shared overhead on either side. The sizes are exact jemalloc size classes,
+/// so the merged store's size-class-rounded `migrating()` and the reference
+/// stack's raw `size - dram_resident` are the same number and the accounting
+/// cannot drift for a reason unrelated to the order.
+#[cfg(all(test, feature = "fifo_compact_hybrid_cache"))]
+mod fifo_order_fidelity {
+	use super::*;
+
+	use crate::{
+		object::Object,
+		worker::policy::policy_stack::{
+			fifo_compact_hybrid_stack::FifoCompactHybridStack,
+		},
+		BufferDRAM,
+	};
+
+	use std::collections::HashSet;
+
+	type Store = MergedStore<u64, BufferDRAM>;
+	type Handle = MergedStackHandle<u64, BufferDRAM>;
+
+	/// `MergedStore::shard_of` reads the top five bits of the key.
+	const SHARD_BITS: u32 = 5;
+	const SHARDS: u64 = 1 << SHARD_BITS;
+
+	/// All exact jemalloc size classes, so `nallocx` rounds none of them and
+	/// the two structures charge the identical number of bytes per object.
+	const SMALL: ObjectSize = 512;
+	const MEDIUM: ObjectSize = 1024;
+	const LARGE: ObjectSize = 8192;
+
+	const N_KEYS: u64 = 240;
+
+	/// Room for roughly 117 of the 240 small objects, so the budget bites in
+	/// the MIDDLE of the sequence: a capacity that demoted all or none of them
+	/// would let a wrong order agree by accident.
+	const FAST_CAPACITY: CacheSize = 60_000;
+
+	fn mix(i: u64) -> HashedKey {
+		i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+	}
+
+	/// A key that lands in shard `s`: the mixed value shifted clear of the
+	/// shard field, then the shard written into it.
+	fn in_shard(s: u64, i: u64) -> HashedKey {
+		assert!(s < SHARDS);
+		(mix(i) >> SHARD_BITS) | (s << (64 - SHARD_BITS))
+	}
+
+	/// The n-th key of the sequence, round-robin over three shards.
+	fn key_at(n: u64) -> HashedKey {
+		in_shard(n % 3, n)
+	}
+
+	/// Spelled out rather than inferred from whether the key happens to be
+	/// present: an `Insert` that silently became an overwrite, or an
+	/// `Overwrite` whose key had gone, would quietly delete the case the
+	/// sequence exists to cover.
+	#[derive(Clone, Copy, Debug)]
+	enum Op {
+		Insert(HashedKey, ObjectSize),
+		Hit(HashedKey),
+		Overwrite(HashedKey, ObjectSize),
+	}
+
+	/// One op, to both structures.
+	///
+	/// The merged handle needs the object in the map first: in that design
+	/// inserting into the map IS inserting into the stack, and
+	/// `insert_resident` only settles. The split stack owns its own row, so
+	/// `insert_resident` is the whole insert. An overwrite is the same pair of
+	/// calls -- which is the point, since neither side is told which it is.
+	fn apply(
+		store: &Arc<Store>,
+		merged: &mut Handle,
+		split: &mut FifoCompactHybridStack,
+		op: Op,
+	) {
+		match op {
+			Op::Insert(key, size) => {
+				assert!(!store.contains(key), "Insert of a key already present");
+				assert!(!split.contains(key), "Insert of a key already present");
+
+				store.insert(key, Object::new(key, &vec![0u8; size as usize], None));
+				merged.insert_resident(key, size, 0);
+				split.insert_resident(key, size, 0);
+			},
+
+			Op::Hit(key) => {
+				assert!(store.contains(key), "Hit on a key that is not present");
+				assert!(split.contains(key), "Hit on a key that is not present");
+
+				merged.update(key);
+				split.update(key);
+			},
+
+			Op::Overwrite(key, size) => {
+				assert!(store.contains(key), "Overwrite of a key that is not present");
+				assert!(split.contains(key), "Overwrite of a key that is not present");
+
+				store.insert(key, Object::new(key, &vec![0u8; size as usize], None));
+				merged.insert_resident(key, size, 0);
+				split.insert_resident(key, size, 0);
+			},
+		}
+	}
+
+	/// The sequence. Built rather than written out so the interesting ops sit
+	/// at positions the budget has already bitten at.
+	fn sequence() -> (Vec<HashedKey>, Vec<Op>) {
+		let keys: Vec<HashedKey> = (0..N_KEYS).map(key_at).collect();
+
+		let distinct: HashSet<HashedKey> = keys.iter().copied().collect();
+		assert_eq!(distinct.len(), keys.len(), "two keys collided");
+
+		let mut ops = Vec::new();
+
+		for (n, &key) in keys.iter().enumerate() {
+			ops.push(Op::Insert(key, SMALL));
+
+			// Hits on keys already in the cache, from both ends of the queue:
+			// `n / 4` is old enough to have been demoted once the budget bites,
+			// `n` is the newest object there is. Under recency the first would
+			// be PROMOTED and the second RELINKED; under FIFO neither moves.
+			if n % 3 == 0 {
+				ops.push(Op::Hit(keys[n / 4]));
+				ops.push(Op::Hit(key));
+			}
+		}
+
+		// A fast key -- one of the newest -- grown to 16x its size. Charged to
+		// the fast tier, and large enough that the settle that follows demotes
+		// a run of older objects.
+		ops.push(Op::Overwrite(keys[(N_KEYS - 3) as usize], LARGE));
+
+		// A key demoted long ago, resized. Charged to the SLOW tier, and it
+		// must not be promoted by having been written.
+		ops.push(Op::Overwrite(keys[2], MEDIUM));
+
+		// And an overwrite that changes nothing, which the reference stack
+		// short-circuits and the merged store cannot.
+		ops.push(Op::Overwrite(keys[5], SMALL));
+
+		// Hits after the overwrites, so a relink introduced by an overwrite
+		// cannot be masked by the sequence ending there.
+		ops.push(Op::Hit(keys[(N_KEYS - 3) as usize]));
+		ops.push(Op::Hit(keys[2]));
+
+		(keys, ops)
+	}
+
+	fn build() -> (Arc<Store>, Handle, FifoCompactHybridStack) {
+		let store = Arc::new(Store::new());
+		let merged =
+			Handle::new(store.clone(), PaperPolicy::FifoCompactHybrid, FAST_CAPACITY * 5);
+
+		// Override whatever `Handle::new` derived from `max_size`: the
+		// experiment needs an exact budget and no per-object reservation on
+		// either side, and `FifoCompactHybridStack::new` leaves its own shared
+		// overhead at zero.
+		store.configure_tiering(FAST_CAPACITY, 0, drain_target_ppm(), drain_target_ppm());
+
+		let split = FifoCompactHybridStack::new(FAST_CAPACITY);
+
+		(store, merged, split)
+	}
+
+	/// The policy string really does reach the store's order, rather than
+	/// being stored and compared and never dispatched on -- which is what it
+	/// did before FIFO existed.
+	#[test]
+	fn the_policy_selects_the_order() {
+		let store = Arc::new(Store::new());
+		let _fifo = Handle::new(store.clone(), PaperPolicy::FifoCompactHybrid, 1 << 20);
+
+		assert_eq!(
+			store.order(),
+			crate::merged_store::MergedOrder::Fifo,
+			"fifo-compact-hybrid did not select the FIFO order",
+		);
+
+		let store = Arc::new(Store::new());
+		let _lru = Handle::new(store.clone(), PaperPolicy::LruCompactHybrid, 1 << 20);
+
+		assert_eq!(
+			store.order(),
+			crate::merged_store::MergedOrder::Lru,
+			"lru-compact-hybrid did not select the LRU order",
+		);
+
+		// An order the merged store does not implement falls back to recency --
+		// loudly, on stderr, which is the part that cannot be asserted here.
+		let store = Arc::new(Store::new());
+		let _mislabelled = Handle::new(store.clone(), PaperPolicy::LfuCompactHybrid, 1 << 20);
+
+		assert_eq!(
+			store.order(),
+			crate::merged_store::MergedOrder::Lru,
+			"an unimplemented policy must fall back to recency, not to nothing",
+		);
+	}
+
+	#[test]
+	fn fifo_matches_the_reference_stack_key_for_key() {
+		let (keys, ops) = sequence();
+		let (store, mut merged, mut split) = build();
+
+		// 1. Tier placement, after EVERY op, so a failure names the step that
+		//    introduced the divergence rather than the end state.
+		for (n, &op) in ops.iter().enumerate() {
+			apply(&store, &mut merged, &mut split, op);
+
+			for &key in &keys {
+				if !store.contains(key) {
+					continue;
+				}
+
+				assert_eq!(
+					store.tier_of(key),
+					split.tier_of(key),
+					"after step {n} ({op:?}) key {key:#018x} is in a different \
+					 tier in the merged store than in the reference FIFO stack",
+				);
+			}
+		}
+
+		// The sequence has to have actually demoted things, or every tier
+		// comparison above was `Some(Fast) == Some(Fast)` and said nothing.
+		assert!(
+			store.slow_object_count() > 0 && store.fast_object_count() > 0,
+			"the budget demoted everything or nothing, so the order is untested",
+		);
+
+		// 2. The gauges the tiering manager reads, which is what makes the two
+		//    interchangeable to the worker rather than merely agreeing about
+		//    tiers.
+		assert_eq!(
+			store.fast_bytes_used(),
+			split.fast_bytes_used(),
+			"the two stacks disagree about how many fast bytes they hold",
+		);
+		assert_eq!(
+			store.slow_bytes_used(),
+			split.slow_bytes_used(),
+			"the two stacks disagree about how many slow bytes they hold",
+		);
+		assert_eq!(
+			store.fast_object_count(),
+			split.fast_object_count(),
+			"the two stacks disagree about how many fast objects they hold",
+		);
+		assert_eq!(
+			store.slow_object_count(),
+			split.slow_object_count(),
+			"the two stacks disagree about how many slow objects they hold",
+		);
+
+		// 3. The eviction order, to the last key. `evict_one` on the merged
+		//    handle only NOMINATES -- the removal is `take`, exactly as
+		//    `apply_evictions` pairs them -- where the reference stack's
+		//    `evict_one` removes.
+		let mut merged_order = Vec::new();
+
+		while let Some(key) = merged.evict_one() {
+			assert!(store.take(&key).is_some(), "nominated victim was not present");
+			merged_order.push(key);
+		}
+
+		let mut split_order = Vec::new();
+
+		while let Some(key) = split.evict_one() {
+			split_order.push(key);
+		}
+
+		assert_eq!(
+			merged_order, split_order,
+			"the merged store and the reference FIFO stack evict in different \
+			 orders",
+		);
+
+		// 4. And that shared order is insertion order, stated directly rather
+		//    than only relative to the reference stack -- so the test still
+		//    means something if both were wrong in the same way.
+		assert_eq!(
+			merged_order, keys,
+			"eviction order is not insertion order, so something reordered on a \
+			 hit or on an overwrite",
+		);
+
+		assert_eq!(store.len(), 0, "the drain left objects behind");
 	}
 }

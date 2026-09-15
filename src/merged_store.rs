@@ -89,6 +89,16 @@
 //! quantised by the interval, which is exactly the trade memcached makes and
 //! the only approximation here.
 //!
+//! # More than one order
+//!
+//! The list above is a RECENCY list only because of what a hit does to it. Make
+//! a hit do nothing and the identical structure is a FIFO queue: `last_access`
+//! stops being "the stamp of the last relink" and becomes "the stamp of the
+//! insert", which is precisely the ordering key a FIFO victim is chosen by. So
+//! [`MergedOrder`] costs no bytes -- not one per slot, not one per shard -- and
+//! `tail_key`, `fast_boundary`, the mirrors and the settle loop are all
+//! untouched by it. See [`MergedOrder`] for why the choice is a runtime field.
+//!
 //! # Tiering
 //!
 //! Ported from [`LruCompactHybridStack`], whose structure this can reproduce
@@ -116,10 +126,13 @@
 //!
 //! That is exact, not approximate: every shard's fast set is a contiguous MRU
 //! PREFIX of its own list, so the oldest boundary across shards IS the globally
-//! least-recently-used fast object. It cannot deadlock, because a toucher
-//! releases its own shard before settling and no thread ever holds two shard
-//! locks. Concurrent settlers may each demote one extra object, which the
-//! 0.98/0.95 hysteresis absorbs.
+//! least-recently-used fast object. (The prefix property is what the boundary
+//! needs, and it does not depend on the order: under `MergedOrder::Fifo` the
+//! fast set is the newest-INSERTED prefix, held by the same cursor, and the
+//! oldest boundary is the global FIFO demotion victim.) It cannot deadlock,
+//! because a toucher releases its own shard before settling and no thread ever
+//! holds two shard locks. Concurrent settlers may each demote one extra object,
+//! which the 0.98/0.95 hysteresis absorbs.
 //!
 //! Migrations accumulate per shard and `drain_tier_migrations` concatenates
 //! them, so `PolicyWorker::apply_tier_migrations` performs the physical
@@ -157,7 +170,7 @@ use std::{
 	collections::HashMap,
 	ops::{Deref, DerefMut},
 	sync::{
-		atomic::{AtomicU64, AtomicUsize, Ordering},
+		atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
 		RwLock, RwLockReadGuard, RwLockWriteGuard,
 	},
 };
@@ -165,10 +178,80 @@ use std::{
 use crate::{
 	object::{Object, ObjectSize},
 	worker::Tier,
-	CacheSize, HashedKey, NoHasher,
+	CacheSize, HashedKey, NoHasher, PaperPolicy,
 };
 
 const NIL: u32 = u32::MAX;
+
+/// Which eviction order the store imposes on its OWN link structure.
+///
+/// The store is the eviction stack, so "which policy" is not a second
+/// structure to swap out -- it is a rule about what a HIT does to the list, and
+/// nothing else. LRU relinks to the front and promotes; FIFO does nothing at
+/// all. That is the entire difference, and it is why FIFO needs no extra byte
+/// per slot and no extra mirror: `last_access` is already stamped at insert, so
+/// under FIFO it simply IS the insertion stamp, and `tail_key`'s
+/// minimum-over-shard-tails already yields the exact global FIFO victim.
+///
+/// # Why a runtime field and not a `cfg`
+///
+/// The server picks its policy from `--policy` at startup, so one binary has to
+/// be able to run any of them; a `cfg` would mean one binary per policy and an
+/// A/B between two policies would then also be an A/B between two builds --
+/// which this project has already measured as a ~1.7% shift on binary layout
+/// alone. The field is written once, before the cache serves a request, and
+/// read on every hit: a branch on a value that never changes is predicted
+/// perfectly, and it sits next to a shard lock acquisition in any case.
+///
+/// FIFO is the first of several wanted here -- CLOCK, SIEVE, LFU, 2Q and
+/// S3-FIFO are all on the list -- so adding one is adding a variant and an arm
+/// at the two sites below, not a new seam.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum MergedOrder {
+	/// A hit moves the slot to the MRU end, restamps `last_access` and
+	/// promotes it to the fast tier if it was slow.
+	Lru = 0,
+
+	/// A hit does NOTHING: insertion order is eviction order. `last_access` is
+	/// written once, at insert, and never again -- including on an overwrite,
+	/// which resizes in place and keeps the object's original queue position.
+	Fifo = 1,
+}
+
+impl MergedOrder {
+	/// The order `policy` asks for, or `None` when the merged store does not
+	/// implement that policy's order at all.
+	///
+	/// `None` does not mean LRU. It means the caller is about to run something
+	/// other than what it was asked for and has to say so -- see
+	/// `MergedStackHandle::new`.
+	///
+	/// A policy's flat and hybrid spellings map to the same order: the tier
+	/// boundary is settled separately, by byte budget, and does not change what
+	/// a hit does to the queue.
+	pub fn from_policy(policy: &PaperPolicy) -> Option<MergedOrder> {
+		match policy {
+			PaperPolicy::Lru
+			| PaperPolicy::LruCompact
+			| PaperPolicy::LruCompactHybrid => Some(MergedOrder::Lru),
+
+			PaperPolicy::Fifo
+			| PaperPolicy::FifoCompact
+			| PaperPolicy::FifoCompactHybrid => Some(MergedOrder::Fifo),
+
+			_ => None,
+		}
+	}
+
+	#[inline]
+	fn from_repr(v: u8) -> MergedOrder {
+		match v {
+			1 => MergedOrder::Fifo,
+			_ => MergedOrder::Lru,
+		}
+	}
+}
 
 /// 32 shards on an 8-core box matches DashMap's own `4 * ncpus` default, so
 /// the comparison against it is like-for-like.
@@ -887,7 +970,18 @@ pub struct MergedStore<K, V> {
 
 	/// Accesses that must elapse before a key is relinked again. 0 relinks
 	/// every time, which is exact LRU. memcached's equivalent is 60 seconds.
+	///
+	/// Meaningless under `MergedOrder::Fifo`, which never relinks at all.
 	update_interval: u64,
+
+	/// The eviction order -- see [`MergedOrder`].
+	///
+	/// An atomic only because the store is built before the policy worker
+	/// builds its `PolicyStack` over the same `Arc`, so the order arrives
+	/// through a `&self` exactly as the tiering configuration does. It is
+	/// written once, by `MergedStackHandle::new`, before the cache has served
+	/// anything, and is a relaxed load on the read side.
+	order: AtomicU8,
 
 	/// Fast-tier byte budget across ALL shards, settled against globally.
 	fast_capacity: AtomicU64,
@@ -926,6 +1020,10 @@ impl<K, V> Default for MergedStore<K, V> {
 				.and_then(|v| v.parse().ok())
 				.unwrap_or(0),
 
+			// Recency until told otherwise, which is what every caller that
+			// never mentions an order was already getting.
+			order: AtomicU8::new(MergedOrder::Lru as u8),
+
 			// Untiered until the worker configures it: nothing can ever exceed
 			// this, so `settle_tier` returns at its first comparison -- one
 			// relaxed load -- and a flat build pays no tiering cost at all.
@@ -940,6 +1038,21 @@ impl<K, V> Default for MergedStore<K, V> {
 impl<K, V> MergedStore<K, V> {
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// Installs the eviction order.
+	///
+	/// Called once, by `MergedStackHandle::new`, at the moment the policy
+	/// worker builds its stack over this same `Arc` -- the same point and the
+	/// same reason as `configure_tiering`. Not called at all by a caller that
+	/// wants recency, which is the default.
+	pub fn set_order(&self, order: MergedOrder) {
+		self.order.store(order as u8, Ordering::Relaxed);
+	}
+
+	#[inline]
+	pub fn order(&self) -> MergedOrder {
+		MergedOrder::from_repr(self.order.load(Ordering::Relaxed))
 	}
 
 	/// Installs the fast-tier budget and the per-object DRAM reservation, and
@@ -1110,7 +1223,19 @@ impl<K, V> MergedStore<K, V> {
 	/// The operation the design exists for: one lookup reaches the object, its
 	/// position AND its tier, where the split design needs a second keyed
 	/// lookup into a separate eviction stack for the last two.
+	///
+	/// Under `MergedOrder::Fifo` this is the whole of the policy difference and
+	/// it does NOTHING -- not even advance the clock, since the clock exists to
+	/// stamp relinks and FIFO has none. The guard is here rather than only at
+	/// the caller so that no present or future caller of `touch` can smuggle
+	/// recency into a FIFO run: a hit that restamped `last_access` would make
+	/// `tail_key` nominate the wrong victim, silently, and the result would
+	/// still look like a plausible miss ratio.
 	pub fn touch(&self, key: HashedKey) {
+		if self.order() == MergedOrder::Fifo {
+			return;
+		}
+
 		let now = self.clock.fetch_add(1, Ordering::Relaxed);
 		let s = shard_of(key);
 
@@ -1303,8 +1428,9 @@ impl<K, V> MergedStore<K, V> {
 				Some(i) => {
 					// An overwrite can change the value's length, so the tier
 					// accounting moves by the DIFFERENCE, charged to whichever
-					// tier the slot is in at this instant. `touch_slot` then
-					// moves the new figure to the fast tier if it was slow.
+					// tier the slot is in at this instant. Under LRU
+					// `touch_slot` then moves the new figure to the fast tier
+					// if it was slow.
 					let was = g.slots[i as usize].migrating();
 					let old = g.slots[i as usize].object.replace(object);
 					let now_bytes = g.slots[i as usize].migrating();
@@ -1319,7 +1445,23 @@ impl<K, V> MergedStore<K, V> {
 						},
 					}
 
-					g.touch_slot(i, now);
+					// The accounting above runs under BOTH orders -- the bytes
+					// really did change and somebody has to be charged for
+					// them. Only the relink is conditional.
+					//
+					// Under FIFO an overwrite is a resize in place and nothing
+					// else: no move to the front, no promotion out of the slow
+					// tier, and above all no new `last_access`, since that
+					// stamp is this object's position in the queue and the
+					// object has not been re-inserted. This is
+					// `FifoCompactHybridStack::insert_resident`'s "an existing
+					// key is resized in place and NOT moved", reached from the
+					// other side -- there the API thread's write never touches
+					// the stack at all; here the map IS the stack, so the
+					// restraint has to be spelled out.
+					if self.order() == MergedOrder::Lru {
+						g.touch_slot(i, now);
+					}
 
 					old
 				},
