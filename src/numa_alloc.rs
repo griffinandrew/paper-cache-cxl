@@ -632,6 +632,14 @@ std::thread_local! {
 	static IN_TCACHE_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+std::thread_local! {
+	/// Makes `node_arenas` report every pool as unbuilt on this thread, so a
+	/// test can reach the unbound fallback after the pools exist. See
+	/// `tests::ForceUnbound`.
+	static FORCE_UNBOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Number of explicit tcaches created, for observability.
 static TCACHES_CREATED: AtomicU64 = AtomicU64::new(0);
 
@@ -794,6 +802,11 @@ fn build_node_arenas(node: u32) -> Option<NodeArenas> {
 /// Arenas for `node`, built on first use.
 #[inline]
 fn node_arenas(node: u32) -> Option<&'static NodeArenas> {
+	#[cfg(test)]
+	if FORCE_UNBOUND.with(|f| f.get()) {
+		return None;
+	}
+
 	let cell = if node == NODE_FAST {
 		&FAST_ARENAS
 	} else if node == NODE_FAST_VALUES {
@@ -1131,7 +1144,13 @@ impl<const NODE: u32> NumaAlloc<NODE> {
 			// construction). Counted, never silent -- see UNBOUND_FALLBACKS.
 			None => {
 				UNBOUND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-				let flags = if zeroed { MALLOCX_ZERO } else { 0 };
+				let mut flags = if zeroed { MALLOCX_ZERO } else { 0 };
+				// `dealloc` always frees with the alignment flag, so the fallback
+				// must allocate with it too, or the block is freed under another
+				// size class.
+				if layout.align() > 1 {
+					flags |= mallocx_lg_align(layout.align().trailing_zeros());
+				}
 				unsafe { mallocx(layout.size(), flags) as *mut u8 }
 			},
 		};
@@ -1238,7 +1257,13 @@ unsafe impl<const NODE: u32> std::alloc::GlobalAlloc for NumaAlloc<NODE> {
 			Some(flags) => unsafe { rallocx(ptr as *mut c_void, new_size, flags) as *mut u8 },
 			None => {
 				UNBOUND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-				unsafe { rallocx(ptr as *mut c_void, new_size, 0) as *mut u8 }
+				// Same reason as the fallback in `raw_alloc`.
+				let flags = if layout.align() > 1 {
+					mallocx_lg_align(layout.align().trailing_zeros())
+				} else {
+					0
+				};
+				unsafe { rallocx(ptr as *mut c_void, new_size, flags) as *mut u8 }
 			},
 		};
 
@@ -1781,6 +1806,133 @@ fast_grew={grew_fast} slow_grew={grew_slow} -> on_target={target} elsewhere={oth
 			FastAlloc::default().deallocate(fast.cast(), layout);
 			SlowAlloc::default().deallocate(slow.cast(), layout);
 		}
+	}
+
+	/// Makes `node_arenas` report every pool as unbuilt on this thread until
+	/// dropped.
+	///
+	/// The unbound fallback is otherwise unreachable from a test: the global
+	/// allocator builds the fast pool before any test body runs, and `IN_INIT`
+	/// is only consulted while a pool is still unbuilt.
+	struct ForceUnbound;
+
+	impl ForceUnbound {
+		fn new() -> Self {
+			FORCE_UNBOUND.with(|f| f.set(true));
+			ForceUnbound
+		}
+	}
+
+	impl Drop for ForceUnbound {
+		fn drop(&mut self) {
+			FORCE_UNBOUND.with(|f| f.set(false));
+		}
+	}
+
+	fn unbound_fallback_alignment_check<const NODE: u32>() {
+		use std::alloc::GlobalAlloc;
+
+		const N: usize = 256;
+		const ALIGN: usize = 64;
+		// Unaligned, 1 B is the 8 B class, where only one region in eight sits
+		// on a 64 B boundary, and 100 B is the 112 B class. Aligned to 64 they
+		// are the 64 B and 128 B classes, so a batch cannot pass by luck and the
+		// grow has to move the block.
+		const SIZE: usize = 1;
+		const GROWN: usize = 100;
+
+		let allocator = NumaAlloc::<NODE>;
+		let small = Layout::from_size_align(SIZE, ALIGN).unwrap();
+		let grown = Layout::from_size_align(GROWN, ALIGN).unwrap();
+		let lg_align = mallocx_lg_align(ALIGN.trailing_zeros());
+
+		// The class `dealloc` tells `sdallocx` a block is in, against the class
+		// jemalloc actually carved it from.
+		let class = |size| unsafe { tikv_jemalloc_sys::nallocx(size, lg_align) };
+		let actual = |ptr: *mut u8| unsafe { tikv_jemalloc_sys::sallocx(ptr.cast_const().cast(), 0) };
+
+		let mut blocks = Vec::with_capacity(N);
+		let fallbacks_before = UNBOUND_FALLBACKS.load(Ordering::Relaxed);
+
+		{
+			let _unbound = ForceUnbound::new();
+
+			for i in 0..N {
+				let zeroed = i % 2 == 1;
+				let ptr = unsafe {
+					if zeroed {
+						GlobalAlloc::alloc_zeroed(&allocator, small)
+					} else {
+						GlobalAlloc::alloc(&allocator, small)
+					}
+				};
+				assert!(!ptr.is_null(), "node {NODE}: fallback allocation failed");
+				assert_eq!(ptr as usize % ALIGN, 0, "node {NODE}: fallback alloc returned {ptr:p}");
+				assert_eq!(
+					actual(ptr),
+					class(SIZE),
+					"node {NODE}: fallback alloc's size class is not the one dealloc frees it as",
+				);
+				if zeroed {
+					assert_eq!(unsafe { *ptr }, 0, "node {NODE}: fallback alloc_zeroed was not zeroed");
+				}
+				blocks.push(ptr);
+			}
+
+			for ptr in &mut blocks {
+				let moved = unsafe { GlobalAlloc::realloc(&allocator, *ptr, small, GROWN) };
+				assert!(!moved.is_null(), "node {NODE}: fallback realloc failed");
+				assert_eq!(moved as usize % ALIGN, 0, "node {NODE}: fallback realloc returned {moved:p}");
+				assert_eq!(
+					actual(moved),
+					class(GROWN),
+					"node {NODE}: fallback realloc's size class is not the one dealloc frees it as",
+				);
+				*ptr = moved;
+			}
+		}
+
+		// `>=`: the counter is process-global. Anything less means the loops
+		// above ran on the bound path and tested nothing.
+		let fallbacks = UNBOUND_FALLBACKS.load(Ordering::Relaxed) - fallbacks_before;
+		assert!(
+			fallbacks >= 2 * N as u64,
+			"node {NODE}: {fallbacks} fallbacks counted for {N} allocs and {N} reallocs",
+		);
+
+		for ptr in blocks {
+			unsafe { GlobalAlloc::dealloc(&allocator, ptr, grown) };
+		}
+
+		// A block freed under the wrong size class is filed in that class's
+		// cache bin and handed straight back out from there. Refill the class
+		// through the bound path and check nothing misfiled comes back.
+		let mut refill = Vec::with_capacity(N);
+		for _ in 0..N {
+			let ptr = unsafe { GlobalAlloc::alloc(&allocator, grown) };
+			assert!(!ptr.is_null(), "node {NODE}: bound allocation failed");
+			assert_eq!(ptr as usize % ALIGN, 0, "node {NODE}: refill returned {ptr:p}");
+			assert_eq!(actual(ptr), class(GROWN), "node {NODE}: refill got a misfiled block");
+			refill.push(ptr);
+		}
+		for ptr in refill {
+			unsafe { GlobalAlloc::dealloc(&allocator, ptr, grown) };
+		}
+	}
+
+	/// The unbound fallback must honour `layout.align()` like the bound path.
+	///
+	/// `dealloc` always passes `mallocx_lg_align` to `sdallocx`, so a fallback
+	/// that drops it returns misaligned memory AND frees it under the size
+	/// class of the aligned request, which for a small size is a different
+	/// class from the one the block came from. Nothing fails at the free; the
+	/// block is filed in the wrong bin.
+	#[test]
+	fn unbound_fallback_honours_alignment() {
+		assert!(init(), "the node-0 and node-1 arena pools must build");
+
+		unbound_fallback_alignment_check::<NODE_FAST>();
+		unbound_fallback_alignment_check::<NODE_SLOW>();
 	}
 
 	/// Cross-thread free must not move a block between nodes.
