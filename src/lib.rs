@@ -32,7 +32,7 @@ static GLOBAL_STOCK: numa_alloc::StockAlloc = numa_alloc::StockAlloc;
 pub mod numa_alloc;
 
 // `Hybrid` is the crate-wide PMEM allocator alias: every PMEM feature routes
-// through node-1-bound jemalloc arenas (`numa_alloc::SlowAlloc`).
+// through `NODE_SLOW`-bound jemalloc arenas (`numa_alloc::SlowAlloc`).
 //
 // This was UMF's TBB-backed pool. Both place memory on NUMA node 1 -- the
 // "PMEM" features were never using persistent-memory hardware, only far
@@ -278,7 +278,7 @@ pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 
 
 // Both tiers are allocated by `numa_alloc` (src/numa_alloc.rs): node-0-bound
-// jemalloc arenas back the fast tier and the process allocator, node-1-bound
+// jemalloc arenas back the fast tier and the process allocator, `NODE_SLOW`-bound
 // arenas back `Hybrid`/`TieredBuffer::Slow`. This replaced a jemalloc pool per
 // node, which held ~1.75x the memory in use and would not return it; see the
 // numa_alloc module doc for the placement guarantee and its failure modes.

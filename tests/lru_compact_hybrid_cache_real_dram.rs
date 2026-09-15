@@ -56,7 +56,7 @@
 #[cfg(feature = "lru_compact_hybrid_cache")]
 mod real_dram_tests {
     use paper_cache::{PaperCache, PaperPolicy, TieredBuffer, CacheTierSize};
-    use paper_cache::numa_alloc::resident_pages_per_node;
+    use paper_cache::numa_alloc::{resident_pages_per_node, NODE_FAST, NODE_SLOW};
 
     const PAGE_BYTES: u64 = 4096;
     const OBJECTS: u32 = 4_000;
@@ -93,7 +93,7 @@ mod real_dram_tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        let (node0_before, node1_before) =
+        let (fast_before, slow_before) =
             resident_pages_per_node().expect("should read /proc/self/numa_maps");
 
         let cache = PaperCache::<u32, TieredBuffer>::new(
@@ -118,12 +118,12 @@ mod real_dram_tests {
         // Let the standing pool drain the tail of the batch.
         std::thread::sleep(std::time::Duration::from_millis(2_000));
 
-        let (node0_after, node1_after) =
+        let (fast_after, slow_after) =
             resident_pages_per_node().expect("should read /proc/self/numa_maps");
         let stats = cache.hybrid_stats();
 
-        let node1_delta = node1_after.saturating_sub(node1_before) * PAGE_BYTES;
-        let node0_delta = node0_after.saturating_sub(node0_before) * PAGE_BYTES;
+        let slow_delta = slow_after.saturating_sub(slow_before) * PAGE_BYTES;
+        let fast_delta = fast_after.saturating_sub(fast_before) * PAGE_BYTES;
 
         assert_eq!(stats.evictions, 0, "fixture should demote, not evict");
         assert!(
@@ -147,15 +147,15 @@ mod real_dram_tests {
         // The second is the one that matters: it is the whole premise of the
         // fork silently not happening, and nothing else notices.
         assert!(
-            node1_delta >= stats.slow_bytes_used / 2,
-            "stack reports {} slow bytes but node 1 only gained {} bytes \
+            slow_delta >= stats.slow_bytes_used / 2,
+            "stack reports {} slow bytes but node {NODE_SLOW} only gained {} bytes \
              ({} pages): the slow tier is not physically on the slow node -- \
              the demotions were either counted without being performed, or \
-             performed into the wrong node (node 0 gained {} bytes)",
+             performed into the wrong node (node {NODE_FAST} gained {} bytes)",
             stats.slow_bytes_used,
-            node1_delta,
-            node1_delta / PAGE_BYTES,
-            node0_delta,
+            slow_delta,
+            slow_delta / PAGE_BYTES,
+            fast_delta,
         );
     }
 }

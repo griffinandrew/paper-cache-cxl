@@ -551,15 +551,21 @@ fn arenas_per_node() -> usize {
 }
 
 /// Node hosting DRAM (the fast tier), and node hosting PMEM/CXL (the slow tier).
+///
+/// Machine-specific: on mlsys-03 the CXL expander is the CPU-less node 2.
 pub const NODE_FAST: u32 = 0;
-pub const NODE_SLOW: u32 = 1;
+pub const NODE_SLOW: u32 = 2;
 
 /// Logical index for the segregated value pool. Its arenas are `mbind`ed to
 /// the *physical* fast node (`NODE_FAST`) -- this is a DRAM pool, not a third
 /// NUMA node -- but it keeps its own arena set and its own explicit tcache so
 /// long-lived value buffers never share allocator structures with the transient
 /// per-GET `to_vec()` destinations. See the `segregated_value_arena` feature.
-pub const NODE_FAST_VALUES: u32 = 2;
+///
+/// Must never equal a physical node id: `physical_node` remaps this index to
+/// DRAM, so a collision would silently put that node's pool on node 0. No
+/// node id reaches the nodemask's width.
+pub const NODE_FAST_VALUES: u32 = NODEMASK_BITS as u32;
 
 /// The physical NUMA node backing a logical pool index.
 #[inline]
@@ -888,7 +894,7 @@ pub struct NumaAlloc<const NODE: u32>;
 pub type FastAlloc = NumaAlloc<NODE_FAST>;
 pub type SlowAlloc = NumaAlloc<NODE_SLOW>;
 
-/// The node-1 allocator as a plain unit struct.
+/// The slow-tier allocator as a plain unit struct.
 ///
 /// `SlowAlloc` is a type alias to a generic struct, and an alias lives only in
 /// the type namespace -- so `Box<[u8], SlowAlloc>` resolves but
@@ -999,7 +1005,7 @@ pub mod measured {
 
 	use super::{mallocx_lg_align, NODE_FAST, NODE_FAST_VALUES, NODE_SLOW, SLOT};
 
-	/// One per pool: fast (node 0), slow (node 1), fast values (node 0 too --
+	/// One per pool: fast (node 0), slow (`NODE_SLOW`), fast values (node 0 too --
 	/// a separate ARENA set, not a separate node; see `physical_node`).
 	const POOLS: usize = 3;
 
@@ -1382,7 +1388,7 @@ pub fn bind_current_thread(node: u32) -> bool {
 /// Node 0 is the default because that is where these threads' own scratch and
 /// stack growth belong; migrations are unaffected either way (see below).
 ///
-/// `PAPER_BIND_WORKERS=1` targets node 1; any other value disables binding.
+/// `PAPER_BIND_WORKERS=1` targets `NODE_SLOW`; any other value disables binding.
 ///
 /// Note this is `MPOL_BIND`, a hard constraint: if node 0 fills, an unpolicied
 /// allocation on a bound thread is OOM-killed rather than spilling
@@ -1487,25 +1493,27 @@ unbound_fallbacks={} slow_tcache={} slow_tcaches={}",
 /// Ground-truth placement, read from the kernel rather than inferred.
 ///
 /// Walks `/proc/self/numa_maps` and totals the resident pages this process has
-/// on each node. Unlike the counters above -- which record what was *asked
-/// for* -- this reports where pages actually are, so the two disagreeing is
-/// itself the signal.
+/// on the fast and slow nodes, returned as `(fast, slow)`. Unlike the counters
+/// above -- which record what was *asked for* -- this reports where pages
+/// actually are, so the two disagreeing is itself the signal.
 pub fn resident_pages_per_node() -> Result<(u64, u64), std::io::Error> {
 	let maps = std::fs::read_to_string("/proc/self/numa_maps")?;
-	let mut node0 = 0u64;
-	let mut node1 = 0u64;
+	let fast_prefix = format!("N{NODE_FAST}=");
+	let slow_prefix = format!("N{NODE_SLOW}=");
+	let mut fast = 0u64;
+	let mut slow = 0u64;
 
 	for line in maps.lines() {
 		for field in line.split_whitespace() {
-			if let Some(count) = field.strip_prefix("N0=") {
-				node0 += count.parse::<u64>().unwrap_or(0);
-			} else if let Some(count) = field.strip_prefix("N1=") {
-				node1 += count.parse::<u64>().unwrap_or(0);
+			if let Some(count) = field.strip_prefix(fast_prefix.as_str()) {
+				fast += count.parse::<u64>().unwrap_or(0);
+			} else if let Some(count) = field.strip_prefix(slow_prefix.as_str()) {
+				slow += count.parse::<u64>().unwrap_or(0);
 			}
 		}
 	}
 
-	Ok((node0, node1))
+	Ok((fast, slow))
 }
 
 // ---------------------------------------------------------------------------
@@ -1665,7 +1673,7 @@ pub(crate) mod tests {
 
 		assert!(init(), "arena pool must build");
 
-		let (before0, before1) = resident_pages_per_node().expect("numa_maps readable");
+		let (before_fast, before_slow) = resident_pages_per_node().expect("numa_maps readable");
 
 		let layout = Layout::from_size_align(BYTES, page).unwrap();
 		let ptr = alloc(layout);
@@ -1678,16 +1686,17 @@ pub(crate) mod tests {
 			}
 		}
 
-		let (after0, after1) = resident_pages_per_node().expect("numa_maps readable");
-		let grew0 = after0.saturating_sub(before0);
-		let grew1 = after1.saturating_sub(before1);
+		let (after_fast, after_slow) = resident_pages_per_node().expect("numa_maps readable");
+		let grew_fast = after_fast.saturating_sub(before_fast);
+		let grew_slow = after_slow.saturating_sub(before_slow);
 		let expected = (BYTES / page) as u64;
 
-		let (target, other) = if node == NODE_FAST { (grew0, grew1) } else { (grew1, grew0) };
+		let (target, other) =
+			if node == NODE_FAST { (grew_fast, grew_slow) } else { (grew_slow, grew_fast) };
 
 		println!(
 			"PLACEMENT node={node} requested={BYTES}B expected_pages={expected} \
-node0_grew={grew0} node1_grew={grew1} -> on_target={target} elsewhere={other}"
+fast_grew={grew_fast} slow_grew={grew_slow} -> on_target={target} elsewhere={other}"
 		);
 
 		// Allow slack for unrelated activity, but the split must be decisive:
@@ -1739,7 +1748,7 @@ node0_grew={grew0} node1_grew={grew1} -> on_target={target} elsewhere={other}"
 	/// ```
 	#[test]
 	#[ignore = "measures process-wide numa_maps; needs --test-threads=1 (see doc comment)"]
-	fn slow_tier_allocations_land_on_node_1() {
+	fn slow_tier_allocations_land_on_the_slow_node() {
 		placement_check(NODE_SLOW, &|layout| {
 			SlowAlloc::default()
 				.allocate(layout)
