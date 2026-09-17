@@ -196,7 +196,10 @@ impl S3FifoLazyDemotionReprieveCompactHybridStack {
 	/// charged too. There is no ghost-queue term: this variant has no ghost
 	/// queue at all, since no key is ever evicted from the one-access queue.
 	fn reserved_overhead(&self) -> CacheSize {
-		self.queues.len() as CacheSize * self.shared_overhead
+		// Only FAST-tier keys draw on the fast-tier budget; the container
+		// tracks both tiers. Charging all of them floored the effective
+		// capacity to zero at high object counts.
+		self.fast_object_count() as CacheSize * self.shared_overhead
 	}
 
 	/// The whole `fast_capacity`, less the shared per-object metadata

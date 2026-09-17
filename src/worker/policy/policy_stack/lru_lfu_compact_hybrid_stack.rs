@@ -202,7 +202,10 @@ impl LruLfuCompactHybridStack {
 	}
 
 	fn reserved_overhead(&self) -> CacheSize {
-		self.chain.len() as CacheSize * self.shared_overhead
+		// Only FAST-tier keys draw on the fast-tier budget; the container
+		// tracks both tiers. Charging all of them floored the effective
+		// capacity to zero at high object counts.
+		self.fast_object_count() as CacheSize * self.shared_overhead
 	}
 
 	/// Returns the tier the given (currently tracked) key is in, or `None`

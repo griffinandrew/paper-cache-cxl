@@ -116,6 +116,17 @@ pub struct LruLazyCopyCompactHybridStack {
 	shared_overhead: CacheSize,
 	fast_count: usize,
 
+	/// Objects whose bytes are physically in DRAM: logical-fast PLUS candidates
+	/// (logically slow, not yet copied out). This is what the DRAM budget must
+	/// be charged against -- `fast_count` alone undercounts by the whole
+	/// candidate window, and `list.len()` overcharges by the entire slow tier.
+	///
+	/// It moves with every change to the SET of DRAM-resident objects, not with
+	/// `dram_used`: `resize_key` adjusts the byte total for an object whose size
+	/// changed without changing how many objects are resident, so it is
+	/// deliberately not hooked there.
+	phys_fast_count: usize,
+
 	/// Least-recently-used LOGICALLY fast key.
 	fast_boundary: Option<HashedKey>,
 
@@ -147,6 +158,7 @@ impl LruLazyCopyCompactHybridStack {
 			dram_used: 0,
 			shared_overhead: 0,
 			fast_count: 0,
+			phys_fast_count: 0,
 			fast_boundary: None,
 			phys_boundary: None,
 			migrations: Vec::new(),
@@ -176,7 +188,10 @@ impl LruLazyCopyCompactHybridStack {
 	}
 
 	fn reserved_overhead(&self) -> CacheSize {
-		self.list.len() as CacheSize * self.shared_overhead
+		// The DRAM budget covers logical-fast AND candidates, so charge the
+		// PHYSICAL count. `list.len()` charged both tiers and floored the
+		// effective capacity to zero at high object counts.
+		self.phys_fast_count as CacheSize * self.shared_overhead
 	}
 
 	/// Budget the PHYSICAL cursor enforces: the whole DRAM allowance, net of
@@ -293,6 +308,7 @@ impl LruLazyCopyCompactHybridStack {
 					}
 
 					self.dram_used += size;
+					self.phys_fast_count += 1;
 					promoted_physically = true;
 
 					if self.phys_boundary.is_none() {
@@ -358,6 +374,7 @@ impl LruLazyCopyCompactHybridStack {
 			}
 
 			self.dram_used = self.dram_used.saturating_sub(size);
+			self.phys_fast_count = self.phys_fast_count.saturating_sub(1);
 			self.phys_boundary = next;
 
 			self.migrations.push((key, Tier::Slow));
@@ -393,6 +410,7 @@ impl LruLazyCopyCompactHybridStack {
 
 		if p.phys == Some(Tier::Fast) {
 			self.dram_used = self.dram_used.saturating_sub(size);
+			self.phys_fast_count = self.phys_fast_count.saturating_sub(1);
 		}
 	}
 }
@@ -443,6 +461,7 @@ impl PolicyStack for LruLazyCopyCompactHybridStack {
 		self.fast_used += migrating;
 		self.dram_used += migrating;
 		self.fast_count += 1;
+		self.phys_fast_count += 1;
 
 		if self.fast_boundary.is_none() {
 			self.fast_boundary = Some(key);
@@ -473,6 +492,7 @@ impl PolicyStack for LruLazyCopyCompactHybridStack {
 		self.slow_used = 0;
 		self.dram_used = 0;
 		self.fast_count = 0;
+		self.phys_fast_count = 0;
 		self.fast_boundary = None;
 		self.phys_boundary = None;
 		self.migrations.clear();

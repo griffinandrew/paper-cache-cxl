@@ -135,7 +135,10 @@ impl TwoQGhostCompactHybridStack {
 	}
 
 	fn reserved_overhead(&self) -> CacheSize {
-		self.queues.len() as CacheSize * self.shared_overhead + self.ghost.dram_bytes()
+		// Only FAST-tier keys draw on the fast-tier budget; the container
+		// tracks both tiers. Charging all of them floored the effective
+		// capacity to zero at high object counts.
+		self.fast_object_count() as CacheSize * self.shared_overhead + self.ghost.dram_bytes()
 	}
 
 	fn effective_fast_capacity(&self) -> CacheSize {

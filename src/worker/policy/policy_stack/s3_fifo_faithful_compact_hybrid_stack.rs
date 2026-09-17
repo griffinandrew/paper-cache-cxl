@@ -215,7 +215,9 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 		let ghost_entry =
 			crate::object::overhead::EXACT_GHOST_ENTRY_DRAM_OVERHEAD as CacheSize;
 
-		self.queues.len() as CacheSize * self.shared_overhead
+		// Only FAST-tier keys draw on the fast-tier budget; queues track both
+		// tiers. The ghost term stays: ghost entries ARE DRAM-resident.
+		self.fast_object_count() as CacheSize * self.shared_overhead
 			+ self.ghost.queue_len(Q_GHOST) as CacheSize * ghost_entry
 	}
 
