@@ -76,9 +76,11 @@
 //! configured policy to a `MergedOrder` once, in `new`, installs it on the
 //! store and keeps a copy: under `Lru` a hit relinks and promotes, under `Fifo`
 //! it does nothing, which is the same nothing `FifoCompactHybridStack` gets
-//! from not overriding `PolicyStack::update`, and under `Clock` it sets a
-//! reference bit and nothing else. A policy whose order the store does not
-//! implement is reported on stderr and run as LRU -- see `new`.
+//! from not overriding `PolicyStack::update`, under `Clock` it sets a reference
+//! bit and nothing else, and under `Lfu` it bumps a frequency counter and may
+//! promote. A policy whose order the store does not implement is an ERROR: it
+//! is refused, `new` returns `CacheError::PolicyNotImplemented`, and the cache
+//! fails to construct -- see `new`.
 //!
 //! `Clock` is the one that changes the LOCK a hit takes. `Lru` runs
 //! `MergedStore::touch`, which takes the shard WRITE lock to relink -- measured
@@ -96,8 +98,22 @@
 //! gauges. Comparing it against `lru-compact-hybrid` is therefore
 //! like-for-like, which comparing the untiered prototype against a tiered
 //! stack was not.
+//!
+//! One order pays a cost the others do not, and it should be measured rather
+//! than hidden. Under `Lfu` the store decides a brand-new key's tier itself
+//! (`MergedStore::lfu_admission_tier`) while `PaperCache::set` has already
+//! BUILT the bytes in DRAM -- `admission_latched()` here is deliberately false,
+//! so `hybrid_policy::admission_tier` returns `Fast` for every new key. So a
+//! latched merged-LFU run emits one corrective `(key, Slow)` migration per
+//! admission. That is a real throughput cost on the SET path, of exactly the
+//! kind the split stack's latched branch avoids by trusting a mirror -- and
+//! trusting that mirror is what makes the split stack wrong under a burst. If
+//! the cost proves dominant the fix is to let `admission_tier` read this
+//! store's own latch directly (it already receives the store as `objects`),
+//! which removes the mirror from the path rather than tolerating it.
 
 use crate::{
+	error::CacheError,
 	merged_store::{MergedOrder, MergedStore},
 	object::ObjectSize,
 	worker::policy::policy_stack::{CacheSize, HashedKey, PolicyStack, Tier},
@@ -143,7 +159,7 @@ impl<K, V> MergedStackHandle<K, V> {
 		store: Arc<MergedStore<K, V>>,
 		policy: PaperPolicy,
 		max_size: CacheSize,
-	) -> Self {
+	) -> Result<Self, CacheError> {
 		#[cfg(feature = "hybrid_cache_common")]
 		if policy.is_hybrid() {
 			store.configure_tiering(
@@ -161,35 +177,30 @@ impl<K, V> MergedStackHandle<K, V> {
 
 		// The merged store's eviction order IS the object map's own link
 		// structure, so it implements the orders it has been taught and no
-		// others -- today recency and insertion order. `is_policy` still
-		// answers to the configured policy so nothing tries to reconstruct a
-		// stack that has no separate existence, which means a merged build
-		// asked for, say, `lfu-compact-hybrid` runs LRU under an LFU label.
+		// others -- recency, insertion order, CLOCK and now LFU. `is_policy`
+		// still answers to the configured policy so nothing tries to
+		// reconstruct a stack that has no separate existence.
 		//
-		// `MergedOrder::from_policy` returning `None` is exactly that case, and
-		// it is reported on STDERR rather than through `log`: the warning that
-		// used to be here was a `log::warn!`, the server installs no logger, so
-		// in the one binary where this mislabelling can actually happen the
-		// warning had never once been printed. A mislabelled run is worse than
-		// a failed one -- it produces a plausible miss ratio filed under the
-		// wrong policy name -- so it is worth a line the user cannot miss.
-		let order = match MergedOrder::from_policy(&policy) {
-			Some(order) => order,
-
-			None => {
-				eprintln!(
-					"WARNING: merged_object_store implements LRU and FIFO only; \
-					 running it as {policy} executes LRU and reports LRU \
-					 behaviour under that policy's name",
-				);
-
-				MergedOrder::Lru
-			},
-		};
+		// Anything else is REFUSED. There used to be a fallback here: a
+		// `eprintln!` and then `MergedOrder::Lru`, so a merged build asked for
+		// `lfu-compact-hybrid` ran LRU under an LFU label and reported a
+		// plausible miss ratio filed under the wrong policy name. That is
+		// deleted. A policy this build cannot honour is an error and the cache
+		// does not come up.
+		//
+		// The reasoning that put the old warning on STDERR rather than through
+		// `log` is worth keeping, because it is the argument for an error: the
+		// warning before it was a `log::warn!`, and this crate installs no
+		// logger anywhere (`log` is a dependency and `warn!` is used across the
+		// tree, but nothing ever calls `set_logger`), so in the one binary
+		// where this mislabelling could actually happen the warning had never
+		// once been printed. A channel nobody reads cannot carry a warning that
+		// matters -- so this one is not a warning at all.
+		let order = MergedOrder::from_policy(&policy)?;
 
 		store.set_order(order);
 
-		MergedStackHandle { store, policy, order }
+		Ok(MergedStackHandle { store, policy, order })
 	}
 }
 
@@ -241,6 +252,14 @@ where
 			// and `touch` refuses under CLOCK in any case, for the same reason
 			// it refuses under FIFO.
 			MergedOrder::Clock => self.store.mark_referenced(key),
+
+			// LFU's hit, called directly for the same reason CLOCK's is. It is
+			// the OPPOSITE trade: `bump` takes the shard WRITE lock, because a
+			// frequency bump moves the slot between two bucket chains and there
+			// is no read-lock formulation that leaves the buckets truthful.
+			// LFU therefore does not inherit CLOCK's win, and this arm is where
+			// that cost is paid -- see `MergedOrder::Lfu`.
+			MergedOrder::Lfu => self.store.bump(key),
 
 			MergedOrder::Fifo => {},
 		}
@@ -453,7 +472,8 @@ mod global_demotion_fidelity {
 
 		let store = Arc::new(Store::new());
 		let mut merged =
-			Handle::new(store.clone(), PaperPolicy::LruCompactHybrid, FAST_CAPACITY * 5);
+			Handle::new(store.clone(), PaperPolicy::LruCompactHybrid, FAST_CAPACITY * 5)
+				.expect("lru-compact-hybrid is implemented");
 
 		// Override whatever `Handle::new` derived from `max_size`. The
 		// experiment needs an exact budget and no per-object reservation, on
@@ -554,7 +574,8 @@ mod global_demotion_fidelity {
 
 		let store = Arc::new(Store::new());
 		let mut merged =
-			Handle::new(store.clone(), PaperPolicy::LruCompactHybrid, FAST_CAPACITY * 5);
+			Handle::new(store.clone(), PaperPolicy::LruCompactHybrid, FAST_CAPACITY * 5)
+				.expect("lru-compact-hybrid is implemented");
 
 		store.configure_tiering(
 			FAST_CAPACITY,
@@ -834,7 +855,8 @@ mod fifo_order_fidelity {
 	fn build() -> (Arc<Store>, Handle, FifoCompactHybridStack) {
 		let store = Arc::new(Store::new());
 		let merged =
-			Handle::new(store.clone(), PaperPolicy::FifoCompactHybrid, FAST_CAPACITY * 5);
+			Handle::new(store.clone(), PaperPolicy::FifoCompactHybrid, FAST_CAPACITY * 5)
+				.expect("fifo-compact-hybrid is implemented");
 
 		// Override whatever `Handle::new` derived from `max_size`: the
 		// experiment needs an exact budget and no per-object reservation on
@@ -853,7 +875,8 @@ mod fifo_order_fidelity {
 	#[test]
 	fn the_policy_selects_the_order() {
 		let store = Arc::new(Store::new());
-		let _fifo = Handle::new(store.clone(), PaperPolicy::FifoCompactHybrid, 1 << 20);
+		let _fifo = Handle::new(store.clone(), PaperPolicy::FifoCompactHybrid, 1 << 20)
+			.expect("fifo-compact-hybrid is implemented");
 
 		assert_eq!(
 			store.order(),
@@ -862,7 +885,8 @@ mod fifo_order_fidelity {
 		);
 
 		let store = Arc::new(Store::new());
-		let _lru = Handle::new(store.clone(), PaperPolicy::LruCompactHybrid, 1 << 20);
+		let _lru = Handle::new(store.clone(), PaperPolicy::LruCompactHybrid, 1 << 20)
+			.expect("lru-compact-hybrid is implemented");
 
 		assert_eq!(
 			store.order(),
@@ -870,15 +894,47 @@ mod fifo_order_fidelity {
 			"lru-compact-hybrid did not select the LRU order",
 		);
 
-		// An order the merged store does not implement falls back to recency --
-		// loudly, on stderr, which is the part that cannot be asserted here.
+		// A policy the merged store does not implement is an ERROR, not a quiet
+		// substitution.
+		//
+		// This assertion used to be the opposite of itself -- "an unimplemented
+		// policy must fall back to recency, not to nothing" -- and it was wrong
+		// by POLICY rather than by accident: what it pinned was a run that
+		// produced a plausible miss ratio filed under a policy name it was not
+		// honouring. `from_policy` has no fallback now and `new` is fallible,
+		// so a mislabelled run cannot be constructed at all.
+		//
+		// The probe had to change with it. It was `LfuCompactHybrid`, which is
+		// exactly the policy that stopped being unimplemented, so leaving it
+		// would have made this test pass for the wrong reason.
+		// `TwoQCompactHybrid` is the right replacement: still unimplemented,
+		// and still HYBRID, so it keeps exercising the `policy.is_hybrid()` /
+		// `configure_tiering` path that runs in `new` before the order is
+		// resolved.
 		let store = Arc::new(Store::new());
-		let _mislabelled = Handle::new(store.clone(), PaperPolicy::LfuCompactHybrid, 1 << 20);
+
+		// Pre-set to something that is NOT the old fallback, so "the refusal
+		// installed nothing" is checkable. Against the default this assertion
+		// could not tell an untouched store from one the fallback had just set
+		// to recency.
+		store.set_order(crate::merged_store::MergedOrder::Fifo);
+
+		let refused = Handle::new(store.clone(), PaperPolicy::TwoQCompactHybrid(0.2), 1 << 20);
+
+		assert!(
+			matches!(
+				refused,
+				Err(CacheError::PolicyNotImplemented(PaperPolicy::TwoQCompactHybrid(..))),
+			),
+			"an unimplemented policy must fail to construct AND name itself, \
+			 rather than falling back to another order",
+		);
 
 		assert_eq!(
 			store.order(),
-			crate::merged_store::MergedOrder::Lru,
-			"an unimplemented policy must fall back to recency, not to nothing",
+			crate::merged_store::MergedOrder::Fifo,
+			"the refused construction installed an order anyway -- `set_order` \
+			 must not run when `from_policy` fails",
 		);
 	}
 
@@ -1305,7 +1361,8 @@ mod clock_order_fidelity {
 	fn build() -> (Arc<Store>, Handle, ClockCompactHybridStack, ClockCompactStack) {
 		let store = Arc::new(Store::new());
 		let merged =
-			Handle::new(store.clone(), PaperPolicy::ClockCompactHybrid, FAST_CAPACITY * 5);
+			Handle::new(store.clone(), PaperPolicy::ClockCompactHybrid, FAST_CAPACITY * 5)
+				.expect("clock-compact-hybrid is implemented");
 
 		// Override whatever `Handle::new` derived from `max_size`: the
 		// experiment needs an exact budget and no per-object reservation on
@@ -1323,7 +1380,8 @@ mod clock_order_fidelity {
 	#[test]
 	fn the_policy_selects_the_clock_order() {
 		let store = Arc::new(Store::new());
-		let _clock = Handle::new(store.clone(), PaperPolicy::ClockCompactHybrid, 1 << 20);
+		let _clock = Handle::new(store.clone(), PaperPolicy::ClockCompactHybrid, 1 << 20)
+			.expect("clock-compact-hybrid is implemented");
 
 		assert_eq!(
 			store.order(),
@@ -1332,7 +1390,8 @@ mod clock_order_fidelity {
 		);
 
 		let store = Arc::new(Store::new());
-		let _fifo = Handle::new(store.clone(), PaperPolicy::FifoCompactHybrid, 1 << 20);
+		let _fifo = Handle::new(store.clone(), PaperPolicy::FifoCompactHybrid, 1 << 20)
+			.expect("fifo-compact-hybrid is implemented");
 
 		assert_eq!(
 			store.order(),
@@ -1341,7 +1400,8 @@ mod clock_order_fidelity {
 		);
 
 		let store = Arc::new(Store::new());
-		let _lru = Handle::new(store.clone(), PaperPolicy::LruCompactHybrid, 1 << 20);
+		let _lru = Handle::new(store.clone(), PaperPolicy::LruCompactHybrid, 1 << 20)
+			.expect("lru-compact-hybrid is implemented");
 
 		assert_eq!(
 			store.order(),
@@ -1538,5 +1598,599 @@ mod clock_order_fidelity {
 			"the repeatedly-hit key outlived the once-hit key, which means \
 			 something is counting hits -- CLOCK has one bit, not a counter",
 		);
+	}
+}
+
+/// The acceptance test for `MergedOrder::Lfu`: it is the SAME order
+/// [`LfuCompactHybridStack`] implements, key for key, step for step.
+///
+/// # Two claims, and -- unlike CLOCK's -- they cannot be checked together
+///
+/// * [`LfuCompactHybridStack`] -- the split-structure statement of this policy.
+///   Fed the identical `PolicyStack` calls it must agree with the merged store
+///   on the tier of every live key after every step, on the four gauges the
+///   tiering manager reads, and on the whole eviction order. This is the claim
+///   that 32 shards of frequency buckets reconstruct one global LFU order.
+///
+/// * `LfuCompactStack` -- the FLAT stack serving `PaperPolicy::LfuCompact`,
+///   with no tiers and no shards, which is the arbiter of what the order IS.
+///
+/// The CLOCK module checks both against ONE sequence. That is not available
+/// here, and the reason is worth stating because it looks like a gap. Tiered
+/// LFU evicts SLOW FIRST (`LfuCompactHybridStack::evict_one`), and under this
+/// policy that genuinely reorders against untiered LFU: once admission latches,
+/// newcomers enter the slow tier at frequency 1 while earlier keys sit fast at
+/// frequency 1, so the tiered stacks evict the slow one and the flat stack
+/// evicts the older fast one. For CLOCK the two never diverge -- tiering moves
+/// a cursor along the queue and the globally oldest object is already a slow
+/// one whenever anything is slow -- which is why that module can compare all
+/// three at once and this one cannot.
+///
+/// So the flat comparison is made on its own, UNTIERED, in
+/// `an_untiered_merged_store_evicts_in_the_flat_lfu_order`. That splits the two
+/// questions cleanly: is the order LFU (flat, untiered), and does tiering place
+/// and demote the way the reference does (tiered, against the hybrid stack).
+/// Folding them together would have meant asserting something false.
+///
+/// # What each ingredient of the sequence is for
+///
+/// * **A key hit over and over, and a key hit exactly once.** The pair that
+///   distinguishes a COUNTER from a bit. The CLOCK module asserts the opposite
+///   of what this one does on the same fixture shape -- there the
+///   repeatedly-hit key leaves FIRST, because one bit spares a key exactly as
+///   often however many times it was hit -- and getting the two tests to
+///   contradict each other is the clearest available statement that the order
+///   really is dispatched on.
+///
+/// * **An overwrite of a key that is never otherwise accessed.** Both
+///   references treat a re-insert as a hit, so the overwrite is the only thing
+///   that can raise this key's count, and its control was inserted immediately
+///   after it.
+///
+/// * **Hits on demoted slow keys.** The promotion rule: a slow key rejoins the
+///   fast tier only by STRICTLY exceeding the fast minimum, so a tie must not
+///   promote.
+///
+/// * **Overwrites that grow a fast key, resize a long-demoted one, and change
+///   no bytes at all.** The byte accounting is order-independent and has to
+///   stay so while the access it also represents is counted.
+///
+/// * **Keys spread over three shards.** A single-shard sequence would never
+///   exercise the cross-shard `(freq, stamp)` minimum, which is the part of
+///   this order that has to reconstruct one global answer out of 32.
+///
+/// # Why the two are comparable at all
+///
+/// Identical `(key, size, dram_resident)` calls through `PolicyStack`, the same
+/// `drain_target`, no per-object shared overhead on either side, and sizes that
+/// are exact jemalloc size classes -- so the merged store's size-class-rounded
+/// `migrating()` and the reference's raw `size - dram_resident` are the same
+/// number and the accounting cannot drift for a reason unrelated to the order.
+///
+/// [`LfuCompactHybridStack`]: super::lfu_compact_hybrid_stack::LfuCompactHybridStack
+#[cfg(all(test, feature = "lfu_compact_hybrid_cache"))]
+mod lfu_order_fidelity {
+	use super::*;
+
+	use crate::{
+		object::Object,
+		worker::policy::policy_stack::{
+			lfu_compact_hybrid_stack::LfuCompactHybridStack,
+			lfu_compact_stack::LfuCompactStack,
+		},
+		BufferDRAM,
+	};
+
+	use std::collections::HashSet;
+
+	type Store = MergedStore<u64, BufferDRAM>;
+	type Handle = MergedStackHandle<u64, BufferDRAM>;
+
+	/// `MergedStore::shard_of` reads the top five bits of the key.
+	const SHARD_BITS: u32 = 5;
+	const SHARDS: u64 = 1 << SHARD_BITS;
+
+	/// All exact jemalloc size classes -- see `value_len`.
+	const SMALL: ObjectSize = 512;
+	const MEDIUM: ObjectSize = 1024;
+	const LARGE: ObjectSize = 8192;
+
+	const N_KEYS: u64 = 240;
+
+	/// Room for roughly 117 of the 240 small objects, so the budget bites in
+	/// the MIDDLE of the sequence: a capacity that demoted all or none of them
+	/// would let a wrong order agree by accident.
+	const FAST_CAPACITY: CacheSize = 60_000;
+
+	/// Hit at every opportunity, so its count climbs far above everything
+	/// else's and it must leave LAST. This is the key whose position the CLOCK
+	/// module asserts the opposite about.
+	const MANY_HITS: usize = 3;
+
+	/// Hit exactly ONCE, immediately after it is inserted, and never mentioned
+	/// again -- so its count is 2 for the whole run.
+	const ONE_HIT: usize = 7;
+
+	/// Never hit at all, and inserted immediately after `ONE_HIT` -- the
+	/// control for it. Count 1 forever, so it must leave first of the two.
+	const NEVER_HIT: usize = 8;
+
+	/// Never HIT, but overwritten exactly once. Both references forward an
+	/// existing key to `update`, so the overwrite is the only thing in the
+	/// whole run that can raise this key's count.
+	const OVERWRITE_ONLY: usize = 9;
+
+	/// Never hit and never overwritten, inserted immediately after
+	/// `OVERWRITE_ONLY` -- its control.
+	const NEVER_TOUCHED: usize = 10;
+
+	/// Indices the generic hit rule must leave alone, or none of the claims
+	/// above would be true of them: `keys[n / 4]` reaches EVERY index
+	/// eventually, since any four consecutive integers contain a multiple of
+	/// three.
+	fn reserved(i: usize) -> bool {
+		i == MANY_HITS
+			|| i == ONE_HIT
+			|| i == NEVER_HIT
+			|| i == OVERWRITE_ONLY
+			|| i == NEVER_TOUCHED
+	}
+
+	fn mix(i: u64) -> HashedKey {
+		i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+	}
+
+	/// A key that lands in shard `s`: the mixed value shifted clear of the
+	/// shard field, then the shard written into it.
+	fn in_shard(s: u64, i: u64) -> HashedKey {
+		assert!(s < SHARDS);
+		(mix(i) >> SHARD_BITS) | (s << (64 - SHARD_BITS))
+	}
+
+	/// The n-th key of the sequence, round-robin over three shards.
+	fn key_at(n: u64) -> HashedKey {
+		in_shard(n % 3, n)
+	}
+
+	/// The value LENGTH whose WHOLE ITEM costs exactly `item` bytes.
+	///
+	/// The merged store derives what to charge from the object, through
+	/// `Slot::migrating` -> `resident_object_bytes`, while the reference stack
+	/// is told a figure -- so feeding the reference `item` while the store
+	/// rounded something else would charge the two differently and the
+	/// comparison would stop being about ORDER.
+	fn value_len(item: ObjectSize) -> ObjectSize {
+		let len = item - crate::object::overhead::value_header_bytes::<u64>();
+
+		assert_eq!(
+			crate::object::overhead::resident_object_bytes::<u64>(len),
+			item,
+			"a {len}-byte value does not make an item of exactly {item} bytes, \
+			 so the merged store and the reference stack are being charged \
+			 different numbers and this fixture is not comparing orders",
+		);
+
+		len
+	}
+
+	/// Spelled out rather than inferred from whether the key happens to be
+	/// present: an `Insert` that silently became an overwrite, or an
+	/// `Overwrite` whose key had gone, would quietly delete the case the
+	/// sequence exists to cover.
+	#[derive(Clone, Copy, Debug)]
+	enum Op {
+		Insert(HashedKey, ObjectSize),
+		Hit(HashedKey),
+		Overwrite(HashedKey, ObjectSize),
+	}
+
+	/// One op, to both structures.
+	///
+	/// The merged handle needs the object in the map first: in that design
+	/// inserting into the map IS inserting into the stack, and
+	/// `insert_resident` only settles. The split stack owns its own row, so
+	/// `insert_resident` is the whole insert. An overwrite is the same pair of
+	/// calls -- which is the point, since neither side is told which it is.
+	fn apply(
+		store: &Arc<Store>,
+		merged: &mut Handle,
+		split: &mut LfuCompactHybridStack,
+		op: Op,
+	) {
+		match op {
+			Op::Insert(key, size) => {
+				assert!(!store.contains(key), "Insert of a key already present");
+				assert!(!split.contains(key), "Insert of a key already present");
+
+				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
+				merged.insert_resident(key, size, 0);
+				split.insert_resident(key, size, 0);
+			},
+
+			Op::Hit(key) => {
+				assert!(store.contains(key), "Hit on a key that is not present");
+				assert!(split.contains(key), "Hit on a key that is not present");
+
+				merged.update(key);
+				split.update(key);
+			},
+
+			Op::Overwrite(key, size) => {
+				assert!(store.contains(key), "Overwrite of a key that is not present");
+				assert!(split.contains(key), "Overwrite of a key that is not present");
+
+				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
+				merged.insert_resident(key, size, 0);
+				split.insert_resident(key, size, 0);
+			},
+		}
+	}
+
+	/// The sequence. Built rather than written out so the interesting ops sit
+	/// at positions the budget has already bitten at.
+	fn sequence() -> (Vec<HashedKey>, Vec<Op>) {
+		let keys: Vec<HashedKey> = (0..N_KEYS).map(key_at).collect();
+
+		let distinct: HashSet<HashedKey> = keys.iter().copied().collect();
+		assert_eq!(distinct.len(), keys.len(), "two keys collided");
+
+		let mut ops = Vec::new();
+
+		for (n, &key) in keys.iter().enumerate() {
+			ops.push(Op::Insert(key, SMALL));
+
+			// The key that is hit exactly once, as early as it can be.
+			if n == ONE_HIT {
+				ops.push(Op::Hit(key));
+			}
+
+			// Hits on keys already in the cache, from both ends of the order:
+			// `n / 4` is old enough to have been demoted once the budget bites
+			// -- so it exercises the promotion rule -- and `n` is the newest
+			// object there is.
+			if n % 3 == 0 {
+				if !reserved(n / 4) {
+					ops.push(Op::Hit(keys[n / 4]));
+				}
+
+				if !reserved(n) {
+					ops.push(Op::Hit(key));
+				}
+
+				if n > MANY_HITS {
+					ops.push(Op::Hit(keys[MANY_HITS]));
+				}
+			}
+		}
+
+		// A fast key -- one of the newest -- grown to 16x its size. Charged to
+		// the fast tier, and large enough that the settle that follows demotes
+		// a run of lower-frequency objects.
+		ops.push(Op::Overwrite(keys[(N_KEYS - 3) as usize], LARGE));
+
+		// A key demoted long ago, resized. Charged to the SLOW tier, and its
+		// count rises, so it may or may not promote -- both sides have to reach
+		// the same answer.
+		ops.push(Op::Overwrite(keys[2], MEDIUM));
+
+		// An overwrite that changes nothing, which the reference stack
+		// short-circuits on size and the merged store cannot. It still counts.
+		ops.push(Op::Overwrite(keys[5], SMALL));
+
+		// The overwrite that is the ONLY access its key ever gets.
+		ops.push(Op::Overwrite(keys[OVERWRITE_ONLY], MEDIUM));
+
+		// Hits after the overwrites, so a count introduced by an overwrite
+		// cannot be masked by the sequence ending there.
+		ops.push(Op::Hit(keys[(N_KEYS - 3) as usize]));
+		ops.push(Op::Hit(keys[2]));
+
+		// The reserved keys really are what they are called. Asserted rather
+		// than read off the loop above, because the generic rule reaches far
+		// more keys than it looks like it does.
+		let hits_on = |i: usize| {
+			ops.iter().filter(|op| matches!(op, Op::Hit(k) if *k == keys[i])).count()
+		};
+
+		let writes_on = |i: usize| {
+			ops.iter().filter(|op| matches!(op, Op::Overwrite(k, _) if *k == keys[i])).count()
+		};
+
+		assert_eq!(hits_on(ONE_HIT), 1, "the hit-once key was hit a different number of times");
+		assert_eq!(hits_on(NEVER_HIT), 0, "the never-hit key was hit");
+		assert_eq!(hits_on(OVERWRITE_ONLY), 0, "the overwrite-only key was hit");
+		assert_eq!(
+			writes_on(OVERWRITE_ONLY), 1,
+			"the overwrite-only key was not overwritten exactly once",
+		);
+		assert_eq!(hits_on(NEVER_TOUCHED), 0, "the untouched key was hit");
+		assert_eq!(writes_on(NEVER_TOUCHED), 0, "the untouched key was overwritten");
+		assert!(
+			hits_on(MANY_HITS) > 10,
+			"the repeatedly-hit key was hit {} times, which is not repeatedly",
+			hits_on(MANY_HITS),
+		);
+
+		(keys, ops)
+	}
+
+	fn build() -> (Arc<Store>, Handle, LfuCompactHybridStack) {
+		let store = Arc::new(Store::new());
+		let merged = Handle::new(store.clone(), PaperPolicy::LfuCompactHybrid, FAST_CAPACITY * 5)
+			.expect("lfu-compact-hybrid is implemented");
+
+		// Override whatever `Handle::new` derived from `max_size`: the
+		// experiment needs an exact budget and no per-object reservation on
+		// either side, and `LfuCompactHybridStack::new` leaves its own shared
+		// overhead at zero.
+		store.configure_tiering(FAST_CAPACITY, 0, drain_target_ppm(), drain_target_ppm());
+
+		let split = LfuCompactHybridStack::new(FAST_CAPACITY);
+
+		(store, merged, split)
+	}
+
+	/// All three LFU spellings reach the store's order, and the three orders
+	/// that were already there are untouched by its arrival.
+	#[test]
+	fn the_policy_selects_the_lfu_order() {
+		for policy in [
+			PaperPolicy::Lfu,
+			PaperPolicy::LfuCompact,
+			PaperPolicy::LfuCompactHybrid,
+		] {
+			let store = Arc::new(Store::new());
+			let _lfu = Handle::new(store.clone(), policy, 1 << 20)
+				.expect("every lfu spelling is implemented");
+
+			assert_eq!(
+				store.order(),
+				crate::merged_store::MergedOrder::Lfu,
+				"{policy} did not select the LFU order",
+			);
+		}
+
+		for (policy, want) in [
+			(PaperPolicy::LruCompactHybrid, crate::merged_store::MergedOrder::Lru),
+			(PaperPolicy::FifoCompactHybrid, crate::merged_store::MergedOrder::Fifo),
+			(PaperPolicy::ClockCompactHybrid, crate::merged_store::MergedOrder::Clock),
+		] {
+			let store = Arc::new(Store::new());
+			let _other = Handle::new(store.clone(), policy, 1 << 20)
+				.expect("the three earlier orders are implemented");
+
+			assert_eq!(store.order(), want, "adding LFU moved {policy} off its order");
+		}
+	}
+
+	#[test]
+	fn lfu_matches_the_reference_stack_key_for_key() {
+		let (keys, ops) = sequence();
+		let (store, mut merged, mut split) = build();
+
+		// 1. Tier placement, after EVERY op, so a failure names the step that
+		//    introduced the divergence rather than the end state. This is what
+		//    catches an admission rule that differs: the merged store decides a
+		//    new key's tier itself, and getting that wrong shows up here one op
+		//    after it happens.
+		for (n, &op) in ops.iter().enumerate() {
+			apply(&store, &mut merged, &mut split, op);
+
+			for &key in &keys {
+				if !store.contains(key) {
+					continue;
+				}
+
+				assert_eq!(
+					store.tier_of(key),
+					split.tier_of(key),
+					"after step {n} ({op:?}) key {key:#018x} is in a different \
+					 tier in the merged store than in the reference LFU stack",
+				);
+			}
+		}
+
+		// The sequence has to have actually demoted things, or every tier
+		// comparison above was `Some(Fast) == Some(Fast)` and said nothing.
+		assert!(
+			store.slow_object_count() > 0 && store.fast_object_count() > 0,
+			"the budget demoted everything or nothing, so the order is untested",
+		);
+
+		// 2. The gauges the tiering manager reads, which is what makes the two
+		//    interchangeable to the worker rather than merely agreeing about
+		//    tiers.
+		assert_eq!(
+			store.fast_bytes_used(),
+			split.fast_bytes_used(),
+			"the two stacks disagree about how many fast bytes they hold",
+		);
+		assert_eq!(
+			store.slow_bytes_used(),
+			split.slow_bytes_used(),
+			"the two stacks disagree about how many slow bytes they hold",
+		);
+		assert_eq!(
+			store.fast_object_count(),
+			split.fast_object_count(),
+			"the two stacks disagree about how many fast objects they hold",
+		);
+		assert_eq!(
+			store.slow_object_count(),
+			split.slow_object_count(),
+			"the two stacks disagree about how many slow objects they hold",
+		);
+
+		// 3. The eviction order, to the last key, with the tier of every
+		//    survivor checked after every eviction.
+		//
+		//    `evict_one` on the merged handle only NOMINATES -- the removal is
+		//    `take`, exactly as `apply_evictions` pairs them -- where the
+		//    reference stack's `evict_one` removes.
+		let mut merged_order = Vec::new();
+		let mut split_order = Vec::new();
+
+		loop {
+			let m = merged.evict_one();
+			let s = split.evict_one();
+
+			assert_eq!(
+				m, s,
+				"the merged store and the reference LFU stack nominated \
+				 different victims at position {}",
+				merged_order.len(),
+			);
+
+			let Some(key) = m else { break };
+
+			assert!(store.take(&key).is_some(), "nominated victim was not present");
+
+			merged_order.push(key);
+			split_order.push(s.expect("checked equal to m"));
+
+			for &k in &keys {
+				if !store.contains(k) {
+					continue;
+				}
+
+				assert_eq!(
+					store.tier_of(k),
+					split.tier_of(k),
+					"after evicting {key:#018x} key {k:#018x} is in a different \
+					 tier in the merged store than in the reference LFU stack",
+				);
+			}
+
+			assert_eq!(
+				store.fast_bytes_used(),
+				split.fast_bytes_used(),
+				"fast bytes diverged after evicting {key:#018x}",
+			);
+			assert_eq!(
+				store.fast_object_count(),
+				split.fast_object_count(),
+				"fast object count diverged after evicting {key:#018x}",
+			);
+		}
+
+		assert_eq!(merged_order, split_order, "the two orders diverged");
+		assert_eq!(store.len(), 0, "the drain left objects behind");
+
+		// 4. The order is NOT insertion order, which is what it would collapse
+		//    to if `freq` were never read -- i.e. if this were FIFO wearing an
+		//    LFU label, which is the substitution this whole commit deletes.
+		assert_ne!(
+			merged_order, keys,
+			"eviction order is exactly insertion order, so no count was ever \
+			 consulted and LFU ran as FIFO",
+		);
+
+		// 5. What a COUNTER buys, on the keys the sequence reserved for it.
+		let pos = |k: HashedKey| merged_order.iter().position(|&x| x == k).unwrap();
+
+		// The claim that separates this order from CLOCK, and the CLOCK module
+		// asserts its exact opposite on the same fixture shape: there the
+		// repeatedly-hit key leaves FIRST, because one bit spares a key as
+		// often whether it was hit once or two hundred times.
+		assert!(
+			pos(keys[MANY_HITS]) > pos(keys[ONE_HIT]),
+			"the repeatedly-hit key did not outlive the key hit once, so hits \
+			 are not being COUNTED -- that is CLOCK's single bit, not LFU",
+		);
+
+		// One hit is still worth something: `ONE_HIT` was inserted BEFORE
+		// `NEVER_HIT`, so under insertion order it would leave first.
+		assert!(
+			pos(keys[ONE_HIT]) > pos(keys[NEVER_HIT]),
+			"the key hit once did not outlive the key inserted after it, so its \
+			 count bought it nothing",
+		);
+
+		// And the same claim for a WRITE, which both references say is an
+		// access too.
+		assert!(
+			pos(keys[OVERWRITE_ONLY]) > pos(keys[NEVER_TOUCHED]),
+			"the overwritten key did not outlive the key inserted after it, so \
+			 an overwrite did not count as an access",
+		);
+	}
+
+	/// The flat comparison, UNTIERED -- see the module doc for why it cannot be
+	/// folded into the test above.
+	///
+	/// With no fast-tier budget nothing is ever demoted, so slow-preference
+	/// never fires and the merged store's order must be exactly the order the
+	/// flat `LfuCompactStack` produces from the same accesses. That stack is
+	/// the arbiter of what LFU's order IS: it has no tiers and no shards, so
+	/// agreeing with it is the claim that neither of the tiered structures
+	/// quietly invented a policy.
+	///
+	/// It also pins the tie-break, which is the half of exactness that a
+	/// single-shard fixture could not test: every key that is never hit stays
+	/// at frequency 1, so the whole of that bucket has to come out in
+	/// insertion order ACROSS SHARDS, ordered by the `(freq, stamp)` pair the
+	/// mirrors carry.
+	#[test]
+	fn an_untiered_merged_store_evicts_in_the_flat_lfu_order() {
+		let (keys, ops) = sequence();
+
+		let store = Arc::new(Store::new());
+
+		// `LfuCompact` is the FLAT spelling, so `Handle::new` skips
+		// `configure_tiering` entirely and the store keeps its untiered
+		// sentinel capacity -- which is also the check that a flat LFU policy
+		// resolves to the same order as the hybrid one.
+		let mut merged = Handle::new(store.clone(), PaperPolicy::LfuCompact, 1 << 30)
+			.expect("lfu-compact is implemented");
+
+		let mut flat = LfuCompactStack::default();
+
+		for &op in &ops {
+			match op {
+				Op::Insert(key, size) | Op::Overwrite(key, size) => {
+					store.insert(
+						key,
+						Object::new(key, &vec![0u8; value_len(size) as usize], None),
+					);
+					merged.insert_resident(key, size, 0);
+					flat.insert(key, size);
+				},
+
+				Op::Hit(key) => {
+					merged.update(key);
+					flat.update(key);
+				},
+			}
+		}
+
+		// Nothing was demoted, which is the precondition for this comparison
+		// to mean what it says.
+		assert_eq!(
+			store.slow_object_count(), 0,
+			"an untiered store demoted something, so slow-preference is in play \
+			 and the flat stack is no longer the right reference",
+		);
+
+		let mut merged_order = Vec::new();
+
+		while let Some(key) = merged.evict_one() {
+			assert!(store.take(&key).is_some(), "nominated victim was not present");
+			merged_order.push(key);
+		}
+
+		let mut flat_order = Vec::new();
+
+		while let Some(key) = flat.evict_one() {
+			flat_order.push(key);
+		}
+
+		assert_eq!(
+			merged_order, flat_order,
+			"the merged store under LFU does not evict in the order the flat \
+			 LfuCompactStack does",
+		);
+
+		assert_ne!(merged_order, keys, "eviction order is exactly insertion order");
+		assert_eq!(store.len(), 0, "the drain left objects behind");
 	}
 }

@@ -139,6 +139,20 @@ impl LfuCompactHybridStack {
 		self.fast_capacity.saturating_sub(self.reserved_overhead())
 	}
 
+	/// The tier this stack has `key` in, or `None` if it does not track it.
+	///
+	/// Present on every other hybrid stack in this directory --
+	/// `LruCompactHybridStack:113`, `ClockCompactHybridStack:123`,
+	/// `FifoCompactHybridStack:98`, the 2Q and S3-FIFO families -- and missing
+	/// only here, because nothing had needed it: the differential tests that
+	/// exist for LFU drive `chain` directly, from inside this module. The
+	/// merged store's `lfu_order_fidelity` test compares
+	/// `MergedStore::tier_of` against this stack from ANOTHER module, where
+	/// `chain` is private and unreachable, so the accessor has to exist.
+	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
+		self.chain.get(key).and_then(|e| e.tier)
+	}
+
 	/// Bumps a slow key and promotes it if its new count strictly exceeds the
 	/// fast tier's minimum. Returns the key if it moved.
 	///

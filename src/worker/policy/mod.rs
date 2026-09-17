@@ -1434,13 +1434,20 @@ where
 		// the stack is built over the SAME `Arc` rather than allocated
 		// alongside it. `init_policy_stack` is bypassed entirely: there is no
 		// second structure for it to construct.
+		// Fallible, and the `?` is the whole of the ripple: a merged build asked
+		// for a policy whose order the store does not implement now fails to
+		// CONSTRUCT rather than quietly running a different order. Both
+		// enclosing constructors already returned `Result<Self, CacheError>`,
+		// and every caller above them -- `WorkerFanout::new`,
+		// `PaperCache::new` / `new_sized_compact` -- already propagates, so the
+		// error surfaces where the cache is built and never at first use.
 		#[cfg(feature = "merged_object_store")]
 		let policy_stack: Box<dyn PolicyStack> = Box::new(
 			policy_stack::merged_stack::MergedStackHandle::new(
 				objects.clone(),
 				policy,
 				max_cache_size,
-			),
+			)?,
 		);
 
 		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
@@ -1538,13 +1545,20 @@ where
 		// the stack is built over the SAME `Arc` rather than allocated
 		// alongside it. `init_policy_stack` is bypassed entirely: there is no
 		// second structure for it to construct.
+		// Fallible, and the `?` is the whole of the ripple: a merged build asked
+		// for a policy whose order the store does not implement now fails to
+		// CONSTRUCT rather than quietly running a different order. Both
+		// enclosing constructors already returned `Result<Self, CacheError>`,
+		// and every caller above them -- `WorkerFanout::new`,
+		// `PaperCache::new` / `new_sized_compact` -- already propagates, so the
+		// error surfaces where the cache is built and never at first use.
 		#[cfg(feature = "merged_object_store")]
 		let policy_stack: Box<dyn PolicyStack> = Box::new(
 			policy_stack::merged_stack::MergedStackHandle::new(
 				objects.clone(),
 				policy,
 				max_cache_size,
-			),
+			)?,
 		);
 
 		// A hybrid cache is always constructed with a single fixed policy and

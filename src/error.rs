@@ -44,4 +44,22 @@ pub enum CacheError {
 
 	#[error("the fast tier size must be greater than zero and cannot exceed the cache size")]
 	InvalidFastTierSize,
+
+	/// This BUILD cannot honour the policy, which is not the same thing as the
+	/// policy being unparseable -- `InvalidPolicy` already means that, and
+	/// conflating the two would report a typo and an unimplemented eviction
+	/// order identically.
+	///
+	/// Raised only by `merged_object_store`, whose object map IS its eviction
+	/// stack: it implements the orders it has been taught and no others, and it
+	/// must never substitute one for another. It carries the policy so the
+	/// message can name what was asked for rather than leaving the operator to
+	/// guess which of several configured names was refused.
+	#[error(
+		"the merged object store does not implement {0}; it implements lru, \
+		 fifo, clock and lfu (each in its plain, -compact and -compact-hybrid \
+		 spelling). Rebuild without --features merged_object_store to run this \
+		 policy."
+	)]
+	PolicyNotImplemented(crate::PaperPolicy),
 }

@@ -168,8 +168,8 @@
 //!
 //! The slab is now a `Vec` of fixed 4096-slot CHUNKS. Growth appends a chunk;
 //! nothing is copied, no slot ever moves, and a slot id is just
-//! `chunk << 12 | offset`. At 56 B a slot that is 224 KiB per chunk, so an
-//! empty 32-shard store costs ~7 MiB rather than the 112 MiB a 64K chunk would.
+//! `chunk << 12 | offset`. At 40 B a slot that is 160 KiB per chunk, so an
+//! empty 32-shard store costs ~5 MiB rather than the 80 MiB a 64K chunk would.
 //!
 //! The index grows by LINEAR HASHING: a `split` cursor and two masks, one
 //! bucket rehashed per insert past the load factor. The cost of a growth step
@@ -180,16 +180,38 @@ use std::{
 	collections::HashMap,
 	ops::{Deref, DerefMut},
 	sync::{
-		atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+		atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 		RwLock, RwLockReadGuard, RwLockWriteGuard,
 	},
 };
 
 use crate::{
+	error::CacheError,
 	object::{Object, ObjectSize},
 	worker::Tier,
 	CacheSize, HashedKey, NoHasher, PaperPolicy,
 };
+
+/// `frequency -> (head, tail)` of that bucket's intrusive list, one map per
+/// tier per shard, under [`MergedOrder::Lfu`] only.
+///
+/// Ordered, so a tier's minimum frequency is its first entry -- the same
+/// structure, and the same reason, as `ArenaFrequencyChain`'s `fast_buckets` /
+/// `slow_buckets`. One entry per DISTINCT frequency rather than per object, so
+/// it does not scale with the cache: `BTreeMap::new()` does not allocate, so
+/// under the other three orders a shard carries two empty maps and nothing
+/// else.
+///
+/// NOT allocator-gated on `eviction_stacks_pmem`, unlike the split path's
+/// identical maps. That gate exists because
+/// `get_hybrid_dram_shared_overhead` drops the eviction-stack DRAM charge to
+/// zero when the stack is supposed to be on the far node -- but under
+/// `merged_object_store` that function ignores the feature entirely and
+/// charges `MERGED_STORE_STRUCTURE_OVERHEAD`, and this store's slab, bucket
+/// array and free list are all plain DRAM allocations. Gating only these two
+/// maps would put one structure of the merged store on the far node while the
+/// slot it points into stayed in DRAM, and would be charged as neither.
+type FreqBuckets = std::collections::BTreeMap<u16, (u32, u32)>;
 
 const NIL: u32 = u32::MAX;
 
@@ -213,11 +235,20 @@ const NIL: u32 = u32::MAX;
 /// read on every hit: a branch on a value that never changes is predicted
 /// perfectly, and it sits next to a shard lock acquisition in any case.
 ///
-/// FIFO was the first of several wanted here -- SIEVE, LFU, 2Q and S3-FIFO are
-/// still on the list -- so adding one is adding a variant and an arm at the
-/// sites below, not a new seam. CLOCK was the second, and it is the one that
-/// pays for the seam: it is the only order here whose hit path does not take
-/// the shard WRITE lock.
+/// FIFO was the first of several wanted here -- SIEVE, 2Q and S3-FIFO are still
+/// on the list -- so adding one is adding a variant and an arm at the sites
+/// below. CLOCK was the second, and it is the one that pays for the seam: it is
+/// the only order here whose hit path does not take the shard WRITE lock.
+///
+/// LFU was the third, and it is the one that shows the seam is not free. The
+/// first three orders are all the SAME structure -- one list per shard, ordered
+/// by one monotonic stamp -- so each was a variant and a handful of arms. LFU
+/// is not: a frequency count is not monotonic and is not unique, so "the
+/// minimum over 32 shard tails" does not name its victim. It brings two
+/// `BTreeMap` bucket sets per shard (empty, and therefore free, under the other
+/// three orders), a second word in each shard's mirror, and its own meaning for
+/// `prev`/`next` -- which are bucket chains under `Lfu` and a recency list
+/// under everything else. See [`MergedOrder::Lfu`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum MergedOrder {
@@ -260,43 +291,142 @@ pub enum MergedOrder {
 	/// -restamp-promote an LRU hit performs, moved off the hit path and onto
 	/// the eviction path where the write lock is already held.
 	Clock = 2,
+
+	/// Least-frequently-used, EXACTLY -- and the only order here that is not
+	/// the one recency list wearing a different rule.
+	///
+	/// # What a hit does
+	///
+	/// Unlinks the slot from its frequency bucket, increments `Slot::freq`,
+	/// restamps `last_access` and relinks it at the TAIL of the next bucket. A
+	/// slow key whose new count STRICTLY exceeds the fast tier's global minimum
+	/// is promoted in the same step, which is
+	/// `LfuCompactHybridStack::maybe_promote`'s rule verbatim.
+	///
+	/// So the hit path takes the shard WRITE lock. There is no read-lock
+	/// formulation that leaves the buckets truthful, and stale buckets mean a
+	/// wrong minimum, which is to say not LFU -- so this order does NOT inherit
+	/// CLOCK's win, and should be expected to measure like `Lru` on service
+	/// time rather than like `Clock`. A "lazy" variant that incremented an
+	/// atomic under the read lock and re-bucketed at eviction time would be a
+	/// different policy, with stale minima, and must not be run under this
+	/// label.
+	///
+	/// # Where the order lives
+	///
+	/// NOT in `head`/`tail`, which stay `NIL` for a shard's whole life under
+	/// this order. `prev`/`next` are instead the chains of the per-tier
+	/// frequency buckets (`Inner::fast_buckets` / `slow_buckets`), which is
+	/// sound because a key is in exactly one bucket of one tier at a time --
+	/// the same argument `ArenaFrequencyChain` makes for sharing one link pair
+	/// between its recency list and its slow buckets. So LFU costs no link
+	/// bytes, and `Slot::freq` fits the slot's remaining tail padding: the
+	/// whole order is free per slot, exactly as FIFO and CLOCK were.
+	///
+	/// # How 32 shards still give the EXACT global order
+	///
+	/// By the same argument as the other three, one level down. The
+	/// load-bearing part of "the global LRU object is some shard's tail" is not
+	/// the stamp -- it is that each shard is ordered WITHIN ITSELF, so a global
+	/// extremum is necessarily one of 32 per-shard extrema. Keep each shard's
+	/// keys frequency-bucketed per tier and the globally least-frequent object
+	/// is necessarily some shard's own least-frequent object. So the victim is a
+	/// lexicographic minimum over 32 mirrored `(freq, stamp)` pairs and then ONE
+	/// shard lock -- the same shape as today, with no global frequency
+	/// structure and no cross-shard lock. Per-shard approximation was the
+	/// alternative and it is not taken: it would change which key is evicted,
+	/// hence the miss ratio, so the merged arm would no longer differ from the
+	/// DashMap arm by the object store alone -- and the confound would be
+	/// invisible in the results, which is the same failure the deleted LRU
+	/// fallback produced.
+	///
+	/// # The tie-break, which is where exactness is won or lost
+	///
+	/// Many keys share a count, so the secondary key is `last_access`, read
+	/// under this order as "the stamp at which this key entered its CURRENT
+	/// bucket" -- it is restamped on every bump and on every tier move, which
+	/// is exactly when the bucket changes. Earliest entrant leaves first, and
+	/// both references agree on that from opposite ends: `ArenaFrequencyChain`
+	/// appends at the bucket tail and takes `min_key` from its head, while the
+	/// flat `LfuCompactStack` pushes at the head and evicts the tail.
+	///
+	/// # Eviction prefers SLOW, and that is not free here
+	///
+	/// Under the other three orders "globally oldest" IS "oldest slow object"
+	/// whenever anything is slow, because the fast set is the newest prefix --
+	/// so `tail_key` got slow-preference without anyone having to write it.
+	/// Under LFU it does not: a freshly admitted key sits at frequency 1 while
+	/// demoted keys sit higher, so the global minimum is very often a FAST
+	/// newcomer. `LfuCompactHybridStack::evict_one` checks the slow chain first
+	/// and falls back to fast, and `lfu_victim` has to do the same
+	/// deliberately. Missing it would quietly evict hot new keys and report a
+	/// worse miss ratio that looked like a property of the merged store.
+	Lfu = 3,
 }
 
 impl MergedOrder {
-	/// The order `policy` asks for, or `None` when the merged store does not
-	/// implement that policy's order at all.
+	/// The order `policy` asks for, or [`CacheError::PolicyNotImplemented`]
+	/// when the merged store does not implement that policy's order at all.
 	///
-	/// `None` does not mean LRU. It means the caller is about to run something
-	/// other than what it was asked for and has to say so -- see
-	/// `MergedStackHandle::new`.
+	/// **The error is the contract.** It does not mean LRU and it does not mean
+	/// "warn and carry on": it means the caller was asked for something this
+	/// build cannot do, and the cache must fail to construct rather than run a
+	/// different policy under the requested name. This function used to return
+	/// `Option` and its own doc already said as much -- "`None` does not mean
+	/// LRU. It means the caller is about to run something other than what it
+	/// was asked for and has to say so" -- but saying so was left to a
+	/// `eprintln!` at the one caller, which then ran LRU anyway. Now it is
+	/// enforced, so there is no path on which a merged build serves a policy it
+	/// is not honouring.
 	///
 	/// A policy's flat and hybrid spellings map to the same order: the tier
 	/// boundary is settled separately, by byte budget, and does not change what
 	/// a hit does to the queue.
-	pub fn from_policy(policy: &PaperPolicy) -> Option<MergedOrder> {
+	///
+	/// `PaperPolicy::Auto` is deliberately NOT here. A merged build cannot
+	/// honour the *auto* part at all -- `handle_policy` refuses every switch
+	/// under `merged_object_store`, before it ever reaches the `is_auto` check
+	/// -- so resolving it to some fixed order would be exactly the silent
+	/// mislabelling this error exists to delete.
+	pub fn from_policy(policy: &PaperPolicy) -> Result<MergedOrder, CacheError> {
 		match policy {
 			PaperPolicy::Lru
 			| PaperPolicy::LruCompact
-			| PaperPolicy::LruCompactHybrid => Some(MergedOrder::Lru),
+			| PaperPolicy::LruCompactHybrid => Ok(MergedOrder::Lru),
 
 			PaperPolicy::Fifo
 			| PaperPolicy::FifoCompact
-			| PaperPolicy::FifoCompactHybrid => Some(MergedOrder::Fifo),
+			| PaperPolicy::FifoCompactHybrid => Ok(MergedOrder::Fifo),
 
 			PaperPolicy::Clock
 			| PaperPolicy::ClockCompact
-			| PaperPolicy::ClockCompactHybrid => Some(MergedOrder::Clock),
+			| PaperPolicy::ClockCompactHybrid => Ok(MergedOrder::Clock),
 
-			_ => None,
+			PaperPolicy::Lfu
+			| PaperPolicy::LfuCompact
+			| PaperPolicy::LfuCompactHybrid => Ok(MergedOrder::Lfu),
+
+			other => Err(CacheError::PolicyNotImplemented(*other)),
 		}
 	}
 
+	/// Decodes the `AtomicU8` the store keeps the order in.
+	///
+	/// Exhaustive over the reprs that exist, with `unreachable!` rather than a
+	/// catch-all. The catch-all this replaces was `_ => MergedOrder::Lru`, and
+	/// it was the one site in the whole change that a new variant could reach
+	/// WITHOUT a compile error: a stored repr of 3 decoded as LRU, on the hit
+	/// path, via `order()`. A fourth order that silently ran as the first is
+	/// the precise failure this commit exists to remove, so the fallback is
+	/// gone from here too.
 	#[inline]
 	fn from_repr(v: u8) -> MergedOrder {
 		match v {
+			0 => MergedOrder::Lru,
 			1 => MergedOrder::Fifo,
 			2 => MergedOrder::Clock,
-			_ => MergedOrder::Lru,
+			3 => MergedOrder::Lfu,
+			other => unreachable!("MergedOrder repr {other} was never stored"),
 		}
 	}
 }
@@ -327,7 +457,29 @@ fn shard_of(key: HashedKey) -> usize {
 /// tail would invalidate the line under seven other shards -- false sharing on
 /// precisely the value that exists to be read without a lock.
 #[repr(align(64))]
-struct TailSeq(AtomicU64);
+struct TailSeq {
+	/// `Lru`/`Fifo`/`Clock`: the shard tail's `last_access`. `Lfu`: the
+	/// `last_access` of the HEAD of this tier's lowest-frequency bucket, which
+	/// is the stamp that separates two shards tied at the same frequency.
+	seq: AtomicU64,
+
+	/// `Lfu` only: this tier's minimum frequency, `EMPTY_TAIL` when the tier
+	/// holds nothing in this shard. Never read under the other three orders.
+	///
+	/// In the SAME cache line as `seq`, deliberately: the victim is a
+	/// lexicographic minimum over `(freq, seq)`, so widening the mirror rather
+	/// than adding a second array keeps the whole choice to the same 32 lines
+	/// this already touched, and a shard still occupies exactly one line.
+	///
+	/// Not packed into ONE `u64` with the stamp, though it would make the
+	/// choice a single pass: that means truncating the stamp to 48 bits, and
+	/// `last_access` was deliberately widened from `u32` for precisely this
+	/// class of bug -- "exact only while no live slot goes un-relinked for 2^32
+	/// accesses ... silently wrong when reached". 2^48 is out of reach here,
+	/// but reintroducing a bounded-but-silent truncation is the wrong trade to
+	/// make for one pass over warm cache lines.
+	freq: AtomicU64,
+}
 
 /// A shard with nothing in it, distinguishable from a real `last_access` of 0.
 const EMPTY_TAIL: u64 = u64::MAX;
@@ -344,9 +496,9 @@ const INITIAL_BUCKETS: usize = 16;
 /// exists to remove. A slot id is `chunk << SLAB_CHUNK_BITS | offset`, which
 /// for a linearly allocated slab is just the slot's ordinal.
 ///
-/// 4096 is picked from both ends. At 56 B a slot that is 224 KiB per chunk, so
-/// 32 shards start at ~7 MiB of committed slab -- a 64K-slot chunk would make
-/// an EMPTY store cost 112 MiB. And the worst-case waste is one partly-filled
+/// 4096 is picked from both ends. At 40 B a slot that is 160 KiB per chunk, so
+/// 32 shards start at ~5 MiB of committed slab -- a 64K-slot chunk would make
+/// an EMPTY store cost 80 MiB. And the worst-case waste is one partly-filled
 /// chunk per shard, 4095 slots, bounded and independent of how large the cache
 /// grows, where `Vec` doubling measured 1.40x the live count and 25% growth
 /// steps 1.10x -- both proportional, both unbounded.
@@ -403,14 +555,55 @@ struct Slot<K, V> {
 	/// a lost update costs one object one second chance, and there is no other
 	/// datum whose visibility is being ordered against it.
 	referenced: AtomicU8,
+
+	/// LFU's access count -- see [`MergedOrder::Lfu`]. 1 at admission, then
+	/// `saturating_add(1)` per hit. Meaningless under the other three orders,
+	/// which never read it.
+	///
+	/// FREE, like `referenced` before it and for the same reason: `tier` sits
+	/// at offset 36 and `referenced` at 37, so bytes 38-39 were the last of the
+	/// slot's tail padding and a 2-byte-aligned `u16` fits them exactly. The
+	/// fields become 40, `size_of` stays 40, and both asserts below still hold.
+	///
+	/// # Why `u16` and not `u8`, and not `u32`
+	///
+	/// A `u8` caps at 255, which is reachable by ordinary warm keys on these
+	/// traces, and saturation there would collapse the fast set's internal
+	/// ordering -- promotion compares against the fast tier's MINIMUM and
+	/// demotion takes it, so a pile-up at the ceiling changes tier placement.
+	/// The S3-FIFO family's 0..=3 counter is not a precedent for that: it is a
+	/// reinsertion counter, not a ranking key.
+	///
+	/// A `u32` -- the split path's width (`NodePayload::freq`) -- would take
+	/// the fields to 42 and the slot to 48, breaking both asserts by design,
+	/// costing 8 B per slot (56.8 MB at 7.1M objects, 582.4 MB at 72.8M), and
+	/// invalidating `MERGED_STORE_STRUCTURE_OVERHEAD`. That last one is the
+	/// real objection: under `merged_object_store`
+	/// `get_hybrid_dram_shared_overhead` ignores the policy, so a re-measured
+	/// constant would shrink the effective fast tier for LRU, FIFO and CLOCK
+	/// too and make the already-completed comparison matrix incomparable.
+	///
+	/// At `u16` the cap is 65,535 and it cannot change a victim choice:
+	/// victims are drawn from the MINIMUM, so keys pinned at the ceiling are
+	/// the last things ever evicted and saturation reorders only the hottest
+	/// keys relative to each other, after everything colder has gone. That is
+	/// a documented divergence from the reference's `u32`, not a hidden one.
+	///
+	/// A plain `u16` rather than an atomic: unlike CLOCK's bit, every write to
+	/// this happens under the shard WRITE lock, so there is no
+	/// `&Slot`-under-a-read-lock soundness requirement to satisfy.
+	freq: u16,
 }
 
 /// 8 object + 8 hashed + 4 prev + 4 next + 4 hash_next + 8 last_access +
-/// 1 tier + 1 referenced = 38, padded to 40 by the object's 8-byte alignment.
+/// 1 tier + 1 referenced + 2 freq = 40, exactly filling the padding the
+/// object's 8-byte alignment imposes. `size_of` is unchanged at 40.
 ///
-/// `referenced` went into that padding: the slot measured 40 with 37 bytes of
-/// fields before it and measures 40 now. CLOCK's reference bit is genuinely
-/// free, which is the claim the EXACT assert below is guarding.
+/// `referenced` and `freq` both went into that padding: the slot measured 40
+/// with 37 bytes of fields before either existed and measures 40 with both.
+/// CLOCK's reference bit and LFU's counter are genuinely free, which is the
+/// claim the EXACT assert below is guarding -- and the padding is now FULL, so
+/// the next order to want per-slot state will grow the slot and trip it.
 ///
 /// It was 56, with a 24-byte `Object` holding the key, the value pointer, the
 /// length and the expiry inline. Those three moved into the refcounted value
@@ -456,6 +649,7 @@ impl<K, V> Slot<K, V> {
 			last_access: 0,
 			tier: Tier::Fast,
 			referenced: AtomicU8::new(0),
+			freq: 0,
 		}
 	}
 
@@ -620,6 +814,21 @@ struct Inner<K, V> {
 	slow_used: CacheSize,
 	fast_count: usize,
 
+	/// `MergedOrder::Lfu` only: `frequency -> (head, tail)` per tier, with the
+	/// chains threaded through the slots' own `prev`/`next`. See
+	/// [`FreqBuckets`] and [`MergedOrder::Lfu`].
+	///
+	/// Deliberately NOT `cfg`'d. The order is a runtime field so that a policy
+	/// A/B is not also a binary A/B -- this project has measured binary layout
+	/// alone as a ~1.7% shift -- and `BTreeMap::new()` does not allocate, so
+	/// under the other three orders these are two empty maps per shard, 64 in
+	/// total, and nothing else. Under `Lfu` they are O(distinct frequencies per
+	/// shard per tier), not O(objects), which is the property the split path
+	/// measured when `lfu-compact-hybrid` came out at the same per-object cost
+	/// as `lru-compact-hybrid` (40.2100 both, at 2^20).
+	fast_buckets: FreqBuckets,
+	slow_buckets: FreqBuckets,
+
 	migrations: Vec<(HashedKey, Tier)>,
 }
 
@@ -641,6 +850,8 @@ impl<K, V> Inner<K, V> {
 			fast_used: 0,
 			slow_used: 0,
 			fast_count: 0,
+			fast_buckets: FreqBuckets::new(),
+			slow_buckets: FreqBuckets::new(),
 			migrations: Vec::new(),
 		}
 	}
@@ -853,18 +1064,30 @@ impl<K, V> Inner<K, V> {
 
 	/// Reverses this slot's contribution to the tier accounting and steps the
 	/// boundary back off it. Must run BEFORE `unlink`, which clears `prev`.
-	fn detach_tier(&mut self, i: u32) {
-		let (tier, migrating, prev) = {
+	fn detach_tier(&mut self, i: u32, lfu: bool) {
+		let (tier, migrating, prev, freq) = {
 			let s = &self.slots[i as usize];
-			(s.tier, s.migrating(), s.prev)
+			(s.tier, s.migrating(), s.prev, s.freq)
 		};
 
-		// If the departing slot was the boundary, the new least-recently-used
-		// fast slot is the one in front of it. When the boundary was also the
-		// list tail -- every slot fast -- that is the new tail, which is the
-		// same answer.
-		if self.fast_boundary == i {
-			self.fast_boundary = prev;
+		match lfu {
+			// Under `Lfu` there is no prefix cursor to step: the slot leaves
+			// the frequency bucket it is in, and that ALSO repairs its
+			// neighbours' `prev`/`next`, because those are bucket chains here.
+			// So the recency-list `unlink` the callers run under the other
+			// three orders must not run -- it would walk `head`/`tail`, which
+			// are `NIL`, and corrupt the bucket.
+			true => self.freq_unlink(i, freq, tier),
+
+			// If the departing slot was the boundary, the new least-recently-
+			// used fast slot is the one in front of it. When the boundary was
+			// also the list tail -- every slot fast -- that is the new tail,
+			// which is the same answer.
+			false => {
+				if self.fast_boundary == i {
+					self.fast_boundary = prev;
+				}
+			},
 		}
 
 		match tier {
@@ -888,9 +1111,14 @@ impl<K, V> Inner<K, V> {
 	/// and deliberately so, since this runs on the policy worker, `take` runs
 	/// on the API thread, and the TTL reaper runs on a third; a per-site rule
 	/// would have to be repeated at all of them.
-	fn retire(&mut self, i: u32) {
-		self.detach_tier(i);
-		self.unlink(i);
+	fn retire(&mut self, i: u32, lfu: bool) {
+		self.detach_tier(i, lfu);
+
+		// `detach_tier` already took the slot off its frequency bucket under
+		// `Lfu`, and that is the only list it was on.
+		if !lfu {
+			self.unlink(i);
+		}
 
 		self.slots[i as usize].object = None;
 		self.free.push(i);
@@ -1012,6 +1240,233 @@ impl<K, V> Inner<K, V> {
 			NIL => EMPTY_TAIL,
 			b => self.slots[b as usize].last_access,
 		}
+	}
+
+	// ── MergedOrder::Lfu ─────────────────────────────────────────────────
+	//
+	// Everything below maintains the two frequency bucket sets. Ported method
+	// for method from `ArenaFrequencyChain`, which is the structure
+	// `LfuCompactHybridStack` drives, so the two agree on bucket order by
+	// construction rather than by intention.
+	//
+	// Named `freq_link`/`freq_unlink` and NOT `bucket_link`/`bucket_unlink`:
+	// those names are taken by the HASH chain a dozen lines up, and confusing
+	// the two would corrupt the index.
+
+	/// The frequency buckets for `tier`.
+	#[inline]
+	fn freq_buckets(&self, tier: Tier) -> &FreqBuckets {
+		match tier {
+			Tier::Fast => &self.fast_buckets,
+			Tier::Slow => &self.slow_buckets,
+		}
+	}
+
+	/// Appends slot `i` at the TAIL of bucket `freq` in `tier`'s bucket set.
+	///
+	/// The tail rather than the head, because that is where
+	/// `ArenaFrequencyChain::link` puts it while `min_key` reads the head -- so
+	/// the key that entered a bucket EARLIEST leaves first. The flat
+	/// `LfuCompactStack` states the same order from the other end (`link_front`
+	/// at the head, `evict_one` from the tail), and matching both is what makes
+	/// the differential tests passable at all.
+	fn freq_link(&mut self, i: u32, freq: u16, tier: Tier) {
+		// The tripwire for the one mistake this order can make silently.
+		// `head`/`tail` and `link_front`/`unlink` are the RECENCY list, shared
+		// by the other three orders; under `Lfu` `prev`/`next` are bucket
+		// chains instead, so a shared path that relinked the recency list would
+		// corrupt a bucket and produce a plausible-but-wrong victim with no
+		// compile error anywhere. Nothing links the recency list under `Lfu`,
+		// so it must still be empty every time a bucket is touched.
+		debug_assert!(
+			self.head == NIL && self.tail == NIL,
+			"the recency list is not empty under Lfu -- some shared path called \
+			 link_front, and prev/next are bucket chains here",
+		);
+
+		let buckets = match tier {
+			Tier::Fast => &mut self.fast_buckets,
+			Tier::Slow => &mut self.slow_buckets,
+		};
+
+		match buckets.get_mut(&freq) {
+			Some((_, tail)) => {
+				let old_tail = *tail;
+				*tail = i;
+
+				self.slots[old_tail as usize].next = i;
+				self.slots[i as usize].prev = old_tail;
+				self.slots[i as usize].next = NIL;
+			},
+
+			None => {
+				buckets.insert(freq, (i, i));
+
+				self.slots[i as usize].prev = NIL;
+				self.slots[i as usize].next = NIL;
+			},
+		}
+	}
+
+	/// Unlinks slot `i` from bucket `freq` in `tier`, dropping the bucket when
+	/// it empties -- so the maps stay O(distinct frequencies PRESENT) rather
+	/// than accumulating an entry per frequency ever seen.
+	fn freq_unlink(&mut self, i: u32, freq: u16, tier: Tier) {
+		let (prev, next) = {
+			let s = &self.slots[i as usize];
+			(s.prev, s.next)
+		};
+
+		if prev != NIL {
+			self.slots[prev as usize].next = next;
+		}
+
+		if next != NIL {
+			self.slots[next as usize].prev = prev;
+		}
+
+		let buckets = match tier {
+			Tier::Fast => &mut self.fast_buckets,
+			Tier::Slow => &mut self.slow_buckets,
+		};
+
+		if let Some((head, tail)) = buckets.get_mut(&freq) {
+			if *head == i {
+				*head = next;
+			}
+
+			if *tail == i {
+				*tail = prev;
+			}
+
+			if *head == NIL {
+				buckets.remove(&freq);
+			}
+		}
+
+		let s = &mut self.slots[i as usize];
+		s.prev = NIL;
+		s.next = NIL;
+	}
+
+	/// `(minimum frequency, that bucket head's stamp)` for `tier`, or `None`
+	/// when this shard holds nothing in it.
+	///
+	/// The PAIR is what the cross-shard minimum is taken over: frequency
+	/// first, then the stamp at which that bucket's head entered the bucket, so
+	/// two shards tied at a frequency are separated exactly the way two keys
+	/// inside one bucket are. O(log D) in the distinct frequencies present.
+	fn min_freq(&self, tier: Tier) -> Option<(u16, u64)> {
+		let (&freq, &(head, _)) = self.freq_buckets(tier).iter().next()?;
+
+		Some((freq, self.slots[head as usize].last_access))
+	}
+
+	/// The slot holding this tier's least-frequently-used key: the head of its
+	/// lowest-frequency bucket.
+	fn freq_min_slot(&self, tier: Tier) -> Option<u32> {
+		let (_, &(head, _)) = self.freq_buckets(tier).iter().next()?;
+
+		Some(head)
+	}
+
+	/// A frequency bump: unlink, increment, restamp, relink at the tail of the
+	/// next bucket. Returns the new count.
+	///
+	/// The restamp is not cosmetic. Under this order `last_access` means "when
+	/// this key entered its current bucket", which is what orders two keys of
+	/// equal frequency -- so a bump that moved the key without restamping it
+	/// would leave it ranked against its new peers by a stale position.
+	fn bump_slot(&mut self, i: u32, now: u64) -> u16 {
+		let (freq, tier) = {
+			let s = &self.slots[i as usize];
+			(s.freq, s.tier)
+		};
+
+		// Saturating at 65,535 -- see `Slot::freq` for why that cap cannot
+		// change a victim choice.
+		let next = freq.saturating_add(1);
+
+		self.freq_unlink(i, freq, tier);
+
+		{
+			let s = &mut self.slots[i as usize];
+			s.freq = next;
+			s.last_access = now;
+		}
+
+		self.freq_link(i, next, tier);
+
+		next
+	}
+
+	/// Promotes a SLOW slot into the fast tier at its current frequency.
+	///
+	/// `ArenaFrequencyChain::set_tier`: the key keeps its count, and because
+	/// `set_tier` relinks by APPENDING at the destination bucket's tail, the
+	/// stamp is refreshed here too.
+	fn promote_freq(&mut self, i: u32, now: u64) {
+		let (key, freq, migrating) = {
+			let s = &self.slots[i as usize];
+			(s.hashed, s.freq, s.migrating())
+		};
+
+		self.freq_unlink(i, freq, Tier::Slow);
+
+		{
+			let s = &mut self.slots[i as usize];
+			s.tier = Tier::Fast;
+			s.last_access = now;
+		}
+
+		self.freq_link(i, freq, Tier::Fast);
+
+		self.slow_used = self.slow_used.saturating_sub(migrating);
+		self.fast_used += migrating;
+		self.fast_count += 1;
+
+		// Pushed unconditionally, exactly as `touch_slot`'s promotion is, and
+		// NOT guarded on the key still being fast after the settle the way
+		// `LfuCompactHybridStack` guards its own. This store's convention is
+		// already the other one: "a promotion that a tight budget immediately
+		// undoes reports BOTH transitions, in order, rather than suppressing
+		// the first -- per-key order is preserved, so the consumer applies
+		// promote-then-demote and lands on the same final placement." The
+		// placement the two reach is identical; only the record stream differs.
+		self.migrations.push((key, Tier::Fast));
+	}
+
+	/// Demotes this shard's least-frequently-used FAST key, at its own count.
+	///
+	/// `LfuCompactHybridStack::settle_fast_tier` demotes `min_with_count(Fast)`
+	/// and carries the count across, which is what
+	/// `ArenaFrequencyChain::set_tier` does for free. Returns the bytes that
+	/// left the fast tier, or `None` when this shard holds nothing fast.
+	fn demote_freq_min(&mut self, now: u64) -> Option<CacheSize> {
+		let d = self.freq_min_slot(Tier::Fast)?;
+
+		let (key, freq, migrating) = {
+			let s = &self.slots[d as usize];
+			(s.hashed, s.freq, s.migrating())
+		};
+
+		self.freq_unlink(d, freq, Tier::Fast);
+
+		{
+			let s = &mut self.slots[d as usize];
+			s.tier = Tier::Slow;
+			s.last_access = now;
+		}
+
+		self.freq_link(d, freq, Tier::Slow);
+
+		self.fast_used = self.fast_used.saturating_sub(migrating);
+		self.fast_count = self.fast_count.saturating_sub(1);
+		self.slow_used += migrating;
+
+		self.migrations.push((key, Tier::Slow));
+
+		Some(migrating)
 	}
 }
 
@@ -1139,6 +1594,24 @@ pub struct MergedStore<K, V> {
 	/// anything, and is a relaxed load on the read side.
 	order: AtomicU8,
 
+	/// `MergedOrder::Lfu` only: once shut, every brand-new key is admitted
+	/// straight to the SLOW tier regardless of byte slack.
+	///
+	/// `LfuCompactHybridStack::fast_tier_latched`, for the same reason it
+	/// exists there: byte slack freed by an object-granular demotion would
+	/// otherwise let a frequency-1 newcomer take the room back and bypass the
+	/// promotion rule entirely.
+	///
+	/// Deliberately the store's OWN field, and deliberately not published into
+	/// `status`. `status`'s `hybrid_admission_latched` gauge is written once
+	/// per worker pass by `refresh_tier_gauges`, and it is what
+	/// `hybrid_policy::admission_tier` misreads under a burst; this flag is
+	/// written under the shard lock of the settle that demoted and read on the
+	/// thread that admits, so it cannot lag. `admission_latched()` on the
+	/// handle therefore stays FALSE -- publishing this would recreate exactly
+	/// the lagging mirror the split stack is bitten by.
+	lfu_latched: AtomicBool,
+
 	/// Fast-tier byte budget across ALL shards, settled against globally.
 	fast_capacity: AtomicU64,
 	shared_overhead: AtomicU64,
@@ -1153,15 +1626,18 @@ impl<K, V> Default for MergedStore<K, V> {
 			.collect::<Vec<_>>()
 			.into_boxed_slice();
 
-		let tails = (0..SHARDS)
-			.map(|_| TailSeq(AtomicU64::new(EMPTY_TAIL)))
-			.collect::<Vec<_>>()
-			.into_boxed_slice();
+		let new_mirrors = || {
+			(0..SHARDS)
+				.map(|_| TailSeq {
+					seq: AtomicU64::new(EMPTY_TAIL),
+					freq: AtomicU64::new(EMPTY_TAIL),
+				})
+				.collect::<Vec<_>>()
+				.into_boxed_slice()
+		};
 
-		let fast_tails = (0..SHARDS)
-			.map(|_| TailSeq(AtomicU64::new(EMPTY_TAIL)))
-			.collect::<Vec<_>>()
-			.into_boxed_slice();
+		let tails = new_mirrors();
+		let fast_tails = new_mirrors();
 
 		MergedStore {
 			shards,
@@ -1181,6 +1657,8 @@ impl<K, V> Default for MergedStore<K, V> {
 			// Recency until told otherwise, which is what every caller that
 			// never mentions an order was already getting.
 			order: AtomicU8::new(MergedOrder::Lru as u8),
+
+			lfu_latched: AtomicBool::new(false),
 
 			// Untiered until the worker configures it: nothing can ever exceed
 			// this, so `settle_tier` returns at its first comparison -- one
@@ -1246,12 +1724,42 @@ impl<K, V> MergedStore<K, V> {
 
 	#[inline]
 	fn publish_tail(&self, shard: usize, inner: &Inner<K, V>) {
-		self.tails[shard].0.store(inner.tail_seq(), Ordering::Relaxed);
+		match self.order() {
+			// Under `Lfu` the recency list is unused, so there is no tail to
+			// mirror: `tails` carries the SLOW tier's
+			// `(minimum frequency, head stamp)` instead -- the pair
+			// `lfu_victim` takes its lexicographic minimum over, and the slow
+			// tier because that is the one eviction prefers.
+			MergedOrder::Lfu => Self::publish_freq(&self.tails[shard], inner, Tier::Slow),
+			_ => self.tails[shard].seq.store(inner.tail_seq(), Ordering::Relaxed),
+		}
 	}
 
 	#[inline]
 	fn publish_fast_tail(&self, shard: usize, inner: &Inner<K, V>) {
-		self.fast_tails[shard].0.store(inner.fast_tail_seq(), Ordering::Relaxed);
+		match self.order() {
+			// The FAST tier's minimum, which under this order serves three
+			// callers: the demotion victim, the promotion rule's `min_count`,
+			// and `lfu_victim`'s fallback when nothing is slow.
+			MergedOrder::Lfu => Self::publish_freq(&self.fast_tails[shard], inner, Tier::Fast),
+			_ => self.fast_tails[shard].seq.store(inner.fast_tail_seq(), Ordering::Relaxed),
+		}
+	}
+
+	/// Publishes one tier's `(minimum frequency, head stamp)` into one mirror.
+	#[inline]
+	fn publish_freq(mirror: &TailSeq, inner: &Inner<K, V>, tier: Tier) {
+		let (freq, seq) = match inner.min_freq(tier) {
+			Some((freq, seq)) => (freq as u64, seq),
+			None => (EMPTY_TAIL, EMPTY_TAIL),
+		};
+
+		// Stamp first, frequency second. Every reader tests `freq` against
+		// `EMPTY_TAIL` and only then reads `seq`, so publishing in this order
+		// means a reader can never pair a live frequency with a stamp from the
+		// shard's previous state.
+		mirror.seq.store(seq, Ordering::Relaxed);
+		mirror.freq.store(freq, Ordering::Relaxed);
 	}
 
 	/// Both mirrors at once. Every locked section that can move a shard's tail
@@ -1305,7 +1813,7 @@ impl<K, V> MergedStore<K, V> {
 		let mut best_seq = EMPTY_TAIL;
 
 		for (s, t) in self.fast_tails.iter().enumerate() {
-			let seq = t.0.load(Ordering::Relaxed);
+			let seq = t.seq.load(Ordering::Relaxed);
 
 			if seq == EMPTY_TAIL {
 				continue;
@@ -1348,23 +1856,60 @@ impl<K, V> MergedStore<K, V> {
 
 		let target = scale(effective, budget.low_ppm);
 
+		let order = self.order();
+
 		while self.fast_used.load(Ordering::Relaxed) > target {
-			let Some(s) = self.oldest_fast_shard() else {
+			// Under `Lfu` the demotion victim is the fast tier's LOWEST
+			// FREQUENCY rather than its oldest boundary, chosen globally by the
+			// same trick: a lexicographic minimum over the 32 `(freq, stamp)`
+			// mirrors, with no lock held. That is
+			// `LfuCompactHybridStack::settle_fast_tier`'s
+			// `min_with_count(Tier::Fast)`, taken across shards.
+			let chosen = match order {
+				MergedOrder::Lfu => self.lfu_min_shard(&self.fast_tails),
+				_ => self.oldest_fast_shard(),
+			};
+
+			let Some(s) = chosen else {
 				// Nothing anywhere is fast. Whatever is left over the target is
 				// the shared-overhead reservation, not value bytes.
 				break;
 			};
 
+			// A demotion carries the key into a slow bucket at its own count,
+			// as the newest entrant of that frequency, so it needs a stamp --
+			// see `Inner::demote_freq_min`.
+			let now = match order {
+				MergedOrder::Lfu => self.clock.fetch_add(1, Ordering::Relaxed),
+				_ => 0,
+			};
+
 			let mut g = self.shards[s].write().unwrap();
 			let before = g.totals();
 
-			// `None` when that shard's boundary went away between the load and
+			// `None` when that shard's fast set went away between the load and
 			// the lock -- another settler took it. Republish and re-choose.
-			g.demote_boundary();
+			let demoted = match order {
+				MergedOrder::Lfu => g.demote_freq_min(now),
+				_ => g.demote_boundary(),
+			};
+
+			// A demotion firing at all means fast-tier capacity was genuinely
+			// reached, which is what shuts admission -- the same rule, and the
+			// same reason, as `settle_fast_tier`'s `fast_tier_latched = true`.
+			if order == MergedOrder::Lfu && demoted.is_some() {
+				self.lfu_latched.store(true, Ordering::Relaxed);
+			}
 
 			self.apply_totals_delta(before, g.totals());
 			self.note_migrations(s, &g);
-			self.publish_fast_tail(s, &g);
+
+			// BOTH mirrors, not just the fast one: under `Lfu` a demotion takes
+			// the key out of a fast bucket AND puts it into a slow one, so the
+			// victim mirror moved too. Under the other three orders the list
+			// tail is untouched and republishing it stores the value it already
+			// held.
+			self.publish_mirrors(s, &g);
 		}
 	}
 
@@ -1391,6 +1936,14 @@ impl<K, V> MergedStore<K, V> {
 	pub fn touch(&self, key: HashedKey) {
 		match self.order() {
 			MergedOrder::Fifo => return,
+
+			// The whole of an LFU hit, split out for the same reason CLOCK's
+			// is: it shares nothing with the body below. In particular it must
+			// NOT reach the `update_interval` probe -- skipping a relink is a
+			// recency approximation memcached makes deliberately, but skipping
+			// a BUMP loses a count, which changes the policy rather than
+			// quantising it.
+			MergedOrder::Lfu => return self.bump(key),
 
 			// The whole of a CLOCK hit. It is split out rather than written
 			// here because it shares NOTHING with the body below -- no clock
@@ -1468,6 +2021,213 @@ impl<K, V> MergedStore<K, V> {
 		g.slots[i as usize].referenced.store(1, Ordering::Relaxed);
 	}
 
+	/// An LFU hit: bump the frequency, and promote out of the slow tier if the
+	/// new count STRICTLY exceeds the fast tier's global minimum.
+	///
+	/// `LfuCompactHybridStack::maybe_promote`, with `min_count(Tier::Fast)`
+	/// taken across the 32 shards instead of out of one chain.
+	///
+	/// Takes the shard WRITE lock, and that is inherent rather than lazy: the
+	/// bump moves the slot between two bucket chains and mutates the shard's
+	/// bucket map. This is the cost `MergedOrder::Clock` exists to avoid and
+	/// LFU cannot avoid -- see [`MergedOrder::Lfu`].
+	///
+	/// `pub` so `MergedStackHandle::update` can reach it directly instead of
+	/// going through `touch` and re-testing the order.
+	pub fn bump(&self, key: HashedKey) {
+		let now = self.clock.fetch_add(1, Ordering::Relaxed);
+		let s = shard_of(key);
+
+		// Read with NO lock held, before this shard's is taken: the fast
+		// tier's minimum frequency is `SHARDS` relaxed loads over the mirror,
+		// and every locked section republishes before it releases, so on entry
+		// the mirror agrees with the shards it mirrors.
+		let fast_min = self.lfu_min_freq(&self.fast_tails);
+
+		let was_slow = {
+			let mut g = self.shards[s].write().unwrap();
+
+			let Some(i) = g.find(key) else { return };
+
+			let before = g.totals();
+
+			// Read before anything moves: a promotion below makes the slot
+			// fast, and it is the tier the hit ARRIVED at that decides whether
+			// this hit settles.
+			let was_slow = g.slots[i as usize].tier == Tier::Slow;
+
+			let new_freq = g.bump_slot(i, now);
+
+			// STRICTLY greater, and an empty fast tier promotes: the reference
+			// rule verbatim, so a TIE with the fast minimum does not promote.
+			let promote = match fast_min {
+				None => true,
+				Some(min) => new_freq > min,
+			};
+
+			if promote && was_slow {
+				let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
+				g.promote_freq(i, stamp);
+			}
+
+			self.apply_totals_delta(before, g.totals());
+			self.note_migrations(s, &g);
+			self.publish_mirrors(s, &g);
+
+			was_slow
+		};
+
+		// Only a hit that arrived on a SLOW key settles, and that is the
+		// reference's asymmetry rather than a shortcut.
+		// `LfuCompactHybridStack::update` settles in its `Some(Tier::Slow)` arm
+		// alone -- unconditionally there, whether or not the promotion actually
+		// fired -- while a hit on a fast key is a bare `chain.bump` that
+		// returns without settling.
+		//
+		// Same underlying reason as `insert`'s guard: admission is byte-gated
+		// at the full effective capacity while the drain target sits at
+		// `drain_target::ratio()` of it, so a tier legitimately rests in the
+		// band between the two. Settling on a FAST hit would drain it out of
+		// that band and demote keys the reference keeps fast -- which is
+		// exactly how the differential test caught this, one step after the
+		// admission guard fixed the same mistake on the insert path.
+		//
+		// AFTER the guard is dropped, as `touch` does it: the settle takes one
+		// shard lock at a time and must not find this thread holding another.
+		if was_slow {
+			self.settle_tier();
+		}
+	}
+
+	/// The shard holding the lexicographic minimum of `(freq, stamp)` over a
+	/// mirror array. `SHARDS` relaxed loads, no lock.
+	///
+	/// This is the `Lfu` counterpart of `oldest_tail_shard` and
+	/// `oldest_fast_shard`, and it is exact for the same reason: each shard is
+	/// frequency-ordered within itself, so the global least-frequent object is
+	/// one of 32 per-shard minima. The stamp is the tie-break, without which
+	/// two shards holding equally-frequent keys would be separated arbitrarily
+	/// and the differential test could not pass.
+	fn lfu_min_shard(&self, mirrors: &[TailSeq]) -> Option<usize> {
+		let mut best: Option<(u64, u64, usize)> = None;
+
+		for (s, t) in mirrors.iter().enumerate() {
+			let freq = t.freq.load(Ordering::Relaxed);
+
+			if freq == EMPTY_TAIL {
+				continue;
+			}
+
+			let seq = t.seq.load(Ordering::Relaxed);
+
+			let better = match best {
+				None => true,
+				Some((best_freq, best_seq, _)) => (freq, seq) < (best_freq, best_seq),
+			};
+
+			if better {
+				best = Some((freq, seq, s));
+			}
+		}
+
+		best.map(|(_, _, s)| s)
+	}
+
+	/// The lowest frequency present in a tier across every shard, or `None`
+	/// when no shard holds anything in it. The promotion rule's `min_count`.
+	fn lfu_min_freq(&self, mirrors: &[TailSeq]) -> Option<u16> {
+		let mut best: Option<u64> = None;
+
+		for t in mirrors.iter() {
+			let freq = t.freq.load(Ordering::Relaxed);
+
+			if freq == EMPTY_TAIL {
+				continue;
+			}
+
+			let better = match best {
+				None => true,
+				Some(best_freq) => freq < best_freq,
+			};
+
+			if better {
+				best = Some(freq);
+			}
+		}
+
+		// Lossless: only `publish_freq` writes this field, and it writes a
+		// widened `u16`.
+		best.map(|freq| freq as u16)
+	}
+
+	/// The globally least-frequently-used key, PREFERRING THE SLOW TIER.
+	///
+	/// The slow preference is `LfuCompactHybridStack::evict_one`'s -- "slow
+	/// first; fall back to fast when nothing has ever been demoted" -- and
+	/// under this order it has to be written out. The other three get it for
+	/// free because their fast set is the newest prefix, so the globally oldest
+	/// object is already a slow one whenever anything is slow. Under LFU a
+	/// freshly admitted key sits at frequency 1 while demoted keys sit higher,
+	/// so the unqualified global minimum is very often a FAST newcomer, and
+	/// evicting it would be a different policy that still reported a plausible
+	/// miss ratio.
+	fn lfu_victim(&self) -> Option<HashedKey> {
+		for tier in [Tier::Slow, Tier::Fast] {
+			let mirrors: &[TailSeq] = match tier {
+				Tier::Slow => &self.tails,
+				Tier::Fast => &self.fast_tails,
+			};
+
+			let Some(s) = self.lfu_min_shard(mirrors) else { continue };
+
+			let g = self.shards[s].read().unwrap();
+
+			if let Some(i) = g.freq_min_slot(tier) {
+				return Some(g.slots[i as usize].hashed);
+			}
+		}
+
+		None
+	}
+
+	/// Where a brand-new key is admitted under `Lfu`.
+	///
+	/// `LfuCompactHybridStack::insert_resident`'s rule, in this store's byte
+	/// terms: FAST while the effective budget has room and the latch is open,
+	/// SLOW once it does not -- and the first refusal LATCHES, so every later
+	/// newcomer goes straight to slow whatever slack an object-granular
+	/// demotion has since freed.
+	///
+	/// This store's other three orders admit unconditionally fast and let the
+	/// settle sort it out, and under LFU that would be WRONG rather than
+	/// merely different: the settle demotes the lowest frequency, which is some
+	/// older frequency-1 key, not the newcomer that caused the overflow. The
+	/// reference would have left that older key alone and put the newcomer in
+	/// the slow tier.
+	///
+	/// `+ 1` on the object count reserves the new object's own shared metadata,
+	/// which is DRAM-resident whichever tier its value lands in.
+	fn lfu_admission_tier(&self, migrating: CacheSize) -> Tier {
+		if self.lfu_latched.load(Ordering::Relaxed) {
+			return Tier::Slow;
+		}
+
+		let budget = self.budget();
+
+		let admit_effective = budget.capacity.saturating_sub(
+			(self.len() as CacheSize + 1) * budget.shared_overhead,
+		);
+
+		match self.fast_used.load(Ordering::Relaxed) + migrating <= admit_effective {
+			true => Tier::Fast,
+
+			false => {
+				self.lfu_latched.store(true, Ordering::Relaxed);
+				Tier::Slow
+			},
+		}
+	}
+
 	/// The worker has finished processing the `Set` event for `key`: settle the
 	/// tier against the bytes the insert already accounted.
 	///
@@ -1492,6 +2252,24 @@ impl<K, V> MergedStore<K, V> {
 	pub fn record_size(&self, key: HashedKey, _size: ObjectSize, _dram_resident: ObjectSize) {
 		let _ = key;
 
+		// Under `Lfu` this settles NOTHING, for the reason spelled out at the
+		// end of `insert`: admission is byte-gated there, so the settle points
+		// are an overwrite, a hit and a resize -- exactly the three
+		// `LfuCompactHybridStack` has. Leaving the settle here would undo
+		// `insert`'s restraint one call later, since the worker reaches this
+		// through `MergedStackHandle::insert_resident` for every Set.
+		//
+		// The budget is still bounded without it: the admission gate is the
+		// whole effective capacity, so `fast_used` can reach that capacity and
+		// never exceed it. What CAN drift is the per-object DRAM reservation --
+		// `effective` shrinks as objects are admitted, so a tier admitted when
+		// the reservation was smaller may sit above the current target until
+		// the next hit or resize settles it. The reference has precisely the
+		// same property, and matching it is the point.
+		if self.order() == MergedOrder::Lfu {
+			return;
+		}
+
 		self.settle_tier();
 	}
 
@@ -1507,6 +2285,9 @@ impl<K, V> MergedStore<K, V> {
 			// -- see `clock_victim`.
 			MergedOrder::Lru | MergedOrder::Fifo => self.oldest_tail_key(),
 			MergedOrder::Clock => self.clock_victim(),
+
+			// The minimum over 32 `(freq, stamp)` mirrors, slow tier first.
+			MergedOrder::Lfu => self.lfu_victim(),
 		}
 	}
 
@@ -1522,7 +2303,7 @@ impl<K, V> MergedStore<K, V> {
 		let mut best_shard = usize::MAX;
 
 		for (s, t) in self.tails.iter().enumerate() {
-			let raw = t.0.load(Ordering::Relaxed);
+			let raw = t.seq.load(Ordering::Relaxed);
 
 			if raw == EMPTY_TAIL {
 				continue;
@@ -1662,9 +2443,13 @@ impl<K, V> MergedStore<K, V> {
 		let mut g = self.shards[s].write().unwrap();
 		let i = g.bucket_unlink(*key)?;
 		let before = g.totals();
+		let lfu = self.order() == MergedOrder::Lfu;
 
-		g.detach_tier(i);
-		g.unlink(i);
+		g.detach_tier(i, lfu);
+
+		if !lfu {
+			g.unlink(i);
+		}
 
 		// Handed to the caller rather than dropped here, so the value's
 		// retirement happens wherever the caller drops it -- still under a pin,
@@ -1687,7 +2472,7 @@ impl<K, V> MergedStore<K, V> {
 
 		let before = g.totals();
 
-		g.retire(i);
+		g.retire(i, self.order() == MergedOrder::Lfu);
 
 		self.apply_totals_delta(before, g.totals());
 		self.publish_mirrors(s, &g);
@@ -1718,6 +2503,16 @@ impl<K, V> MergedStore<K, V> {
 	pub fn insert(&self, key: HashedKey, object: Object<K, V>) -> Option<Object<K, V>> {
 		let now = self.clock.fetch_add(1, Ordering::Relaxed);
 		let s = shard_of(key);
+		let order = self.order();
+
+		// `Lfu` only, and read before the shard lock for the same reason `bump`
+		// reads it there: it is `SHARDS` relaxed loads over the fast-tier
+		// mirror, and an overwrite is an ACCESS under this order, so it can
+		// promote. Never consulted under the other three.
+		let lfu_fast_min = match order {
+			MergedOrder::Lfu => self.lfu_min_freq(&self.fast_tails),
+			_ => None,
+		};
 
 		let old = {
 			let mut g = self.shards[s].write().unwrap();
@@ -1766,11 +2561,34 @@ impl<K, V> MergedStore<K, V> {
 					// So an overwrite earns the object a second chance without
 					// moving it, and forgetting the bit here would make a
 					// written-and-then-evicted key leave in the wrong place.
-					match self.order() {
+					//
+					// Under LFU an overwrite IS an access, and both references
+					// agree: `LfuCompactStack::insert` forwards an existing key
+					// to `update`, and
+					// `LfuCompactHybridStack::insert_resident` records the size
+					// change and then bumps it -- promoting it if the bump
+					// carries it past the fast tier's minimum. So the count
+					// moves and the position within the new bucket is refreshed,
+					// exactly as on a GET hit.
+					match order {
 						MergedOrder::Lru => g.touch_slot(i, now),
 
 						MergedOrder::Clock => {
 							g.slots[i as usize].referenced.store(1, Ordering::Relaxed);
+						},
+
+						MergedOrder::Lfu => {
+							let new_freq = g.bump_slot(i, now);
+
+							let promote = match lfu_fast_min {
+								None => true,
+								Some(min) => new_freq > min,
+							};
+
+							if promote && g.slots[i as usize].tier == Tier::Slow {
+								let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
+								g.promote_freq(i, stamp);
+							}
 						},
 
 						MergedOrder::Fifo => {},
@@ -1780,6 +2598,50 @@ impl<K, V> MergedStore<K, V> {
 				},
 
 				None => {
+					// What this object will charge to whichever tier it lands
+					// in. Computed from the object rather than from the slot,
+					// because the admission decision below needs it BEFORE
+					// there is a slot -- it is the same accessor
+					// `Slot::migrating` uses, so the two cannot disagree.
+					let migrating = crate::object::overhead::resident_object_bytes::<K>(
+						object.data_size(),
+					) as CacheSize;
+
+					// The tier the POLICY decides. Unconditionally fast under
+					// the three queue orders, which is what
+					// `LruCompactHybridStack` does; under `Lfu` it is the
+					// reference stack's admission rule, which can genuinely
+					// choose slow -- see `lfu_admission_tier`.
+					let decided = match order {
+						MergedOrder::Lfu => self.lfu_admission_tier(migrating),
+						_ => Tier::Fast,
+					};
+
+					// The tier the bytes are ACTUALLY in, read off the value
+					// this store was just handed.
+					//
+					// This is the whole defence against the class of bug the
+					// split LFU stack's latched branch has: that branch records
+					// a tier and emits NO migration, trusting
+					// `hybrid_policy::admission_tier` to have built the bytes
+					// there -- and `admission_tier` consults a mirror that
+					// `refresh_tier_gauges` publishes once per worker pass, so
+					// under a burst it is stale and nothing ever repairs the
+					// placement. Measured, on the split path: 7,999 of 8,000
+					// objects physically in DRAM while the stack reported 5,966
+					// slow and `fast_bytes_used` reported a compliant 31.78
+					// MiB.
+					//
+					// Here the comparison is against the object itself, not
+					// against a prediction, so a stale `admission_tier` costs
+					// one corrective migration and never a wrong placement.
+					// It is symmetric, so it also covers the mirror-image case
+					// a grow produces -- bytes built slow, policy decides fast.
+					// And it needs no new trait bound: `Object::value` and
+					// `TieredValue::tier` are both inherent on the UNBOUNDED
+					// impls, under both value layouts.
+					let built = object.value().tier();
+
 					let fresh = Slot {
 						object: Some(object),
 						hashed: key,
@@ -1787,8 +2649,12 @@ impl<K, V> MergedStore<K, V> {
 						next: NIL,
 						hash_next: NIL,
 						last_access: now,
-						tier: Tier::Fast,
+						tier: decided,
 						referenced: AtomicU8::new(0),
+						// Frequency 1, matching `ArenaFrequencyChain::insert`
+						// ("admits a key at frequency 1") and
+						// `LfuCompactStack::insert`'s `link_front(1, i)`.
+						freq: 1,
 					};
 
 					let i = match g.free.pop() {
@@ -1803,17 +2669,45 @@ impl<K, V> MergedStore<K, V> {
 						None => g.slots.alloc(fresh),
 					};
 
-					g.link_front(i);
+					// Under `Lfu` the slot joins a frequency BUCKET, not the
+					// recency list -- `prev`/`next` are bucket chains there, so
+					// `link_front` must not run at all.
+					match order {
+						MergedOrder::Lfu => g.freq_link(i, 1, decided),
+						_ => g.link_front(i),
+					}
+
 					g.bucket_link(i);
-					g.fast_count += 1;
 
 					// The bytes are accounted HERE, not one worker event later:
-					// the object carries its own length, so admitting it to the
-					// fast tier and charging it are the same moment.
-					g.fast_used += g.slots[i as usize].migrating();
+					// the object carries its own length, so admitting it and
+					// charging it are the same moment. Charged to the tier the
+					// policy decided, which under `Lfu` may be the slow one.
+					match decided {
+						Tier::Fast => {
+							g.fast_count += 1;
+							g.fast_used += g.slots[i as usize].migrating();
+						},
 
-					if g.fast_boundary == NIL {
+						Tier::Slow => {
+							g.slow_used += g.slots[i as usize].migrating();
+						},
+					}
+
+					// `fast_boundary` is the prefix cursor the other three
+					// orders' tiering runs on. Under `Lfu` tier membership is
+					// the slot's own `tier` field and the two bucket sets are
+					// already per-tier, so the cursor has no meaning and is
+					// left at `NIL` for the shard's whole life.
+					if order != MergedOrder::Lfu && g.fast_boundary == NIL {
 						g.fast_boundary = i;
+					}
+
+					// A corrective migration exactly when the policy's tier and
+					// the bytes' tier disagree, in either direction. Under the
+					// queue orders they never do, so this costs nothing there.
+					if built != decided {
+						g.migrations.push((key, decided));
 					}
 
 					self.tracked.fetch_add(1, Ordering::Relaxed);
@@ -1831,7 +2725,34 @@ impl<K, V> MergedStore<K, V> {
 
 		// Outside the guard: the settle takes one shard lock at a time and
 		// this thread must not be holding another one.
-		self.settle_tier();
+		//
+		// Under `Lfu` a brand-new key does NOT settle, and that asymmetry is
+		// the reference's, not an optimisation. `LfuCompactHybridStack::
+		// insert_resident`'s new-key path returns from BOTH of its branches
+		// without calling `settle_fast_tier` at all, because admission there is
+		// byte-gated and so cannot overshoot: it admits fast only while
+		// `fast_used + size <= admit_effective`.
+		//
+		// That gate is the FULL effective capacity, while the drain target is
+		// `drain_target::ratio()` of it -- 0.98 by default -- so there is a
+		// legitimate band between them. Settling after an admission would drain
+		// the tier down into that band and demote keys the reference keeps
+		// fast: at a 60,000-byte budget and 512-byte items the gate admits 117
+		// objects (59,904 B) while the target is 58,800, so an unconditional
+		// settle here demoted three keys per fill and the differential test
+		// diverged on the first admission past 58,800 -- which is exactly how
+		// this was found.
+		//
+		// An overwrite DOES settle, because the reference's existing-key path
+		// does: the bytes can grow in place, and nothing gates that.
+		let settle = match order {
+			MergedOrder::Lfu => old.is_some(),
+			_ => true,
+		};
+
+		if settle {
+			self.settle_tier();
+		}
 
 		old
 	}
@@ -1853,6 +2774,8 @@ impl<K, V> MergedStore<K, V> {
 			g.fast_used = 0;
 			g.slow_used = 0;
 			g.fast_count = 0;
+			g.fast_buckets.clear();
+			g.slow_buckets.clear();
 			g.migrations.clear();
 
 			self.publish_mirrors(s, &g);
@@ -1866,6 +2789,11 @@ impl<K, V> MergedStore<K, V> {
 
 		self.tracked.store(0, Ordering::Relaxed);
 		self.dirty_migrations.store(0, Ordering::Relaxed);
+
+		// An empty cache has reached no capacity, so admission reopens --
+		// `LfuCompactHybridStack::clear` resets `fast_tier_latched` for the
+		// same reason.
+		self.lfu_latched.store(false, Ordering::Relaxed);
 		self.fast_used.store(0, Ordering::Relaxed);
 		self.slow_used.store(0, Ordering::Relaxed);
 		self.fast_count.store(0, Ordering::Relaxed);
@@ -1917,6 +2845,20 @@ impl<K, V> MergedStore<K, V> {
 	}
 
 	pub fn resize_fast_tier(&self, size: CacheSize) {
+		// A GROW reopens LFU admission; a shrink, or a no-op resize, does not.
+		//
+		// Faithful to `LfuCompactHybridStack::resize_fast_tier` INCLUDING the
+		// guard, and the guard is the part with history: growing the budget is
+		// a deliberate decision to make more capacity available and the fresh
+		// room should be usable by new admissions rather than gated behind
+		// promotions, while unlatching on a SHRINK would reopen admission at
+		// exactly the moment capacity was taken away. The reference did that
+		// unconditionally once, and no fidelity test caught it because none of
+		// them resized.
+		if size > self.fast_capacity.load(Ordering::Relaxed) {
+			self.lfu_latched.store(false, Ordering::Relaxed);
+		}
+
 		self.fast_capacity.store(size, Ordering::Relaxed);
 		self.settle_all();
 	}
@@ -3387,6 +4329,477 @@ mod tests {
 			s.len(),
 			"the resize lost track of objects",
 		);
+	}
+
+	// ── MergedOrder::Lfu ─────────────────────────────────────────────────
+
+	/// A store whose order is LFU, set BEFORE anything is inserted.
+	///
+	/// The order before the data, deliberately: under `Lfu` `prev`/`next` are
+	/// bucket chains, so a store that admitted keys under `Lru` and was then
+	/// switched would be holding a recency list the bucket code has no business
+	/// touching. `MergedStackHandle::new` installs the order once at startup
+	/// for exactly this reason, and `freq_link`'s `debug_assert!` is what
+	/// catches the mistake.
+	fn lfu(fast_capacity: CacheSize) -> Store {
+		let s = Store::new();
+
+		s.set_order(MergedOrder::Lfu);
+		s.configure_tiering(fast_capacity, 0, DEFAULT_HIGH_PPM, DEFAULT_LOW_PPM);
+
+		s
+	}
+
+	/// A live key's frequency count, straight out of the slot.
+	fn freq(s: &Store, key: HashedKey) -> u16 {
+		let g = s.shards[shard_of(key)].read().unwrap();
+		let i = g.find(key).expect("live key");
+
+		g.slots[i as usize].freq
+	}
+
+	/// A key that lands in shard `sh`: the mixed value shifted clear of the
+	/// shard field, then the shard written into it.
+	fn in_test_shard(sh: u64, i: u64) -> HashedKey {
+		(mix(i) >> SHARD_BITS) | (sh << (64 - SHARD_BITS))
+	}
+
+	/// Sum of what every live slot claims to be migrating, walked through the
+	/// FREQUENCY BUCKETS.
+	///
+	/// `live_migrating` walks the recency list, which is empty under `Lfu` --
+	/// so it would report zero here, and that is the invariant rather than a
+	/// limitation.
+	fn live_migrating_lfu(s: &Store) -> CacheSize {
+		s.shards
+			.iter()
+			.map(|lock| {
+				let g = lock.read().unwrap();
+				let mut total = 0;
+
+				for tier in [Tier::Fast, Tier::Slow] {
+					for (_, &(head, _)) in g.freq_buckets(tier).iter() {
+						let mut i = head;
+
+						while i != NIL {
+							total += g.slots[i as usize].migrating();
+							i = g.slots[i as usize].next;
+						}
+					}
+				}
+
+				total
+			})
+			.sum()
+	}
+
+	/// The slot did not grow. Both const asserts at the top of this file are
+	/// compile-time, so this is here to say WHY the number is still 40 and to
+	/// fail readably if someone reads the asserts as a formality.
+	///
+	/// This is the assertion the `u32` frequency counter the split path uses
+	/// would have failed: 38 + 4 = 42 rounds the slot to 48.
+	#[test]
+	fn the_lfu_counter_costs_no_bytes() {
+		assert_eq!(
+			core::mem::size_of::<Slot<u64, std::sync::Arc<[u8]>>>(),
+			40,
+			"LFU's frequency counter was supposed to fit the slot's remaining \
+			 tail padding",
+		);
+	}
+
+	/// An LFU hit bumps the count and refreshes the key's position within its
+	/// new bucket. It does NOT touch the recency list, which is what the other
+	/// three orders live on and what this order leaves empty.
+	#[test]
+	fn an_lfu_hit_bumps_the_count_and_nothing_else() {
+		let s = lfu(CacheSize::MAX);
+		let a = mix(1);
+		let b = mix(2);
+
+		put(&s, a, 128);
+		put(&s, b, 128);
+
+		assert_eq!(freq(&s, a), 1, "admission is at frequency 1");
+		assert_eq!(freq(&s, b), 1, "admission is at frequency 1");
+
+		// Both sit at frequency 1 and `a` entered that bucket first, so `a` is
+		// the victim -- the tie-break, on the one case where it is the only
+		// thing deciding.
+		assert_eq!(s.tail_key(), Some(a), "the earliest entrant at a frequency leaves first");
+
+		s.touch(a);
+
+		assert_eq!(freq(&s, a), 2, "a hit did not bump the count");
+		assert_eq!(freq(&s, b), 1, "a hit bumped the wrong key");
+
+		// `b` is now the only key at frequency 1, so the victim switched -- and
+		// it switched because something COUNTED, not because something moved.
+		assert_eq!(s.tail_key(), Some(b), "the bumped key is still the victim");
+
+		for lock in s.shards.iter() {
+			let g = lock.read().unwrap();
+
+			assert_eq!(g.head, NIL, "Lfu linked the recency list");
+			assert_eq!(g.tail, NIL, "Lfu linked the recency list");
+			assert_eq!(g.fast_boundary, NIL, "Lfu moved the tier prefix cursor");
+		}
+
+		s.verify_gauges();
+	}
+
+	/// An overwrite is an ACCESS under this order, which is what both
+	/// references do: `LfuCompactStack::insert` forwards an existing key to
+	/// `update`, and `LfuCompactHybridStack::insert_resident` bumps it.
+	#[test]
+	fn an_lfu_overwrite_counts_as_an_access() {
+		let s = lfu(CacheSize::MAX);
+		let a = mix(1);
+		let b = mix(2);
+
+		put(&s, a, 128);
+		put(&s, b, 128);
+
+		assert_eq!(s.tail_key(), Some(a), "`a` entered frequency 1 first");
+
+		put(&s, a, 128);
+
+		assert_eq!(freq(&s, a), 2, "an overwrite did not count as an access");
+		assert_eq!(s.tail_key(), Some(b), "the overwritten key is still the victim");
+
+		s.verify_gauges();
+	}
+
+	/// The claim sharding has to earn for THIS order: per-shard frequency
+	/// buckets still yield the exact global LFU order, because each shard is
+	/// frequency-ordered within itself and the lowest of the 32 minima is the
+	/// global minimum.
+	///
+	/// The expected order is written out rather than read back off the store,
+	/// so this compares the store against LFU and not against itself: keys
+	/// still at frequency 1 leave first in INSERTION order, then the once-hit
+	/// keys in the order they were hit, then the twice-hit keys in the order of
+	/// their SECOND hit -- because a bump restamps, so a key's position inside
+	/// its new bucket is when it arrived there.
+	#[test]
+	fn eviction_order_is_exact_lfu_across_shards() {
+		let s = lfu(CacheSize::MAX);
+		let keys: Vec<HashedKey> = (1..=300u64).map(mix).collect();
+
+		for &k in &keys {
+			put(&s, k, 128);
+		}
+
+		let once: Vec<HashedKey> = keys.iter().copied().skip(10).step_by(7).collect();
+		let twice: Vec<HashedKey> = once.iter().copied().step_by(3).collect();
+
+		for &k in &once {
+			s.touch(k);
+		}
+
+		for &k in &twice {
+			s.touch(k);
+		}
+
+		let spanned: std::collections::HashSet<usize> =
+			keys.iter().map(|k| shard_of(*k)).collect();
+
+		assert!(spanned.len() > 1, "the keys must span several shards to say anything");
+
+		let untouched: Vec<HashedKey> =
+			keys.iter().copied().filter(|k| !once.contains(k)).collect();
+
+		let hit_once: Vec<HashedKey> =
+			once.iter().copied().filter(|k| !twice.contains(k)).collect();
+
+		let mut expected = untouched;
+		expected.extend_from_slice(&hit_once);
+		expected.extend_from_slice(&twice);
+
+		let mut evicted = Vec::new();
+
+		while let Some(k) = s.tail_key() {
+			assert!(s.take(&k).is_some(), "nominated victim must be present");
+			evicted.push(k);
+		}
+
+		assert_eq!(evicted, expected, "eviction order is not exact LFU");
+
+		// And it is NOT insertion order, which is what this whole sequence
+		// would collapse to if `freq` were never read.
+		assert_ne!(evicted, keys, "eviction order is exactly insertion order");
+		assert_eq!(s.len(), 0);
+	}
+
+	/// The tier boundary is GLOBAL under this order too: demotion takes the
+	/// least-frequent FAST keys across the whole store, not each shard's own.
+	///
+	/// This is the LFU analogue of `the_tier_boundary_is_global_across_shards`.
+	/// The separation it asserts is the honest one -- every fast key's
+	/// frequency is at least every slow key's -- and it holds here because
+	/// nothing is admitted after the shrink. It is NOT a general invariant of
+	/// the order: once admission latches, newcomers enter the slow tier at
+	/// frequency 1 while fast keys sit above them.
+	#[test]
+	fn demotion_picks_the_lowest_frequencies_globally() {
+		let s = lfu(CacheSize::MAX);
+
+		// Two keys in each of two shards, so the demotion order is a statement
+		// about the GLOBAL minimum and not about either shard's own: the two
+		// lowest frequencies are in a different shard from the two highest, so
+		// a per-shard rule cannot agree by accident.
+		let a0 = in_test_shard(0, 1);
+		let a1 = in_test_shard(0, 2);
+		let b0 = in_test_shard(1, 3);
+		let b1 = in_test_shard(1, 4);
+
+		for &k in &[a0, a1, b0, b1] {
+			put(&s, k, 128);
+		}
+
+		for _ in 0..4 {
+			s.touch(a0);
+		}
+
+		for _ in 0..3 {
+			s.touch(a1);
+		}
+
+		for _ in 0..2 {
+			s.touch(b0);
+		}
+
+		s.touch(b1);
+
+		assert_eq!(
+			(freq(&s, a0), freq(&s, a1), freq(&s, b0), freq(&s, b1)),
+			(5, 4, 3, 2),
+			"the fixture did not produce four distinct frequencies",
+		);
+
+		s.resize_fast_tier(migrating_bytes(128) * 2);
+
+		let counted = |want: Tier| -> Vec<(HashedKey, u16)> {
+			[a0, a1, b0, b1]
+				.into_iter()
+				.filter(|&k| s.tier_of(k) == Some(want))
+				.map(|k| (k, freq(&s, k)))
+				.collect()
+		};
+
+		let fast = counted(Tier::Fast);
+		let slow = counted(Tier::Slow);
+
+		assert!(
+			!fast.is_empty() && !slow.is_empty(),
+			"the resize demoted everything or nothing, so the order is untested",
+		);
+
+		for &(fast_key, fast_freq) in &fast {
+			for &(slow_key, slow_freq) in &slow {
+				assert!(
+					fast_freq >= slow_freq,
+					"fast key {fast_key:#x} sits at frequency {fast_freq} while \
+					 slow key {slow_key:#x} sits at {slow_freq} -- demotion did \
+					 not take the globally least-frequent fast key",
+				);
+			}
+		}
+
+		s.verify_gauges();
+
+		// A genuine demotion shuts admission, exactly as
+		// `LfuCompactHybridStack::settle_fast_tier` latches.
+		assert!(
+			s.lfu_latched.load(Ordering::Relaxed),
+			"a demotion did not latch admission, so a frequency-1 newcomer can \
+			 take back the room it freed",
+		);
+
+		// A grow reopens it. A shrink must not -- that guard is the one the
+		// reference got wrong once.
+		s.resize_fast_tier(migrating_bytes(128) * 8);
+		assert!(!s.lfu_latched.load(Ordering::Relaxed), "a grow did not unlatch admission");
+
+		s.resize_fast_tier(migrating_bytes(128));
+		assert!(s.lfu_latched.load(Ordering::Relaxed), "a shrink reopened admission");
+	}
+
+	/// The gauge drift test, for this order's own mutation sites.
+	///
+	/// Every path below goes through the same `totals()` bracket the other
+	/// three orders use, so `verify_gauges` covers LFU with no changes -- this
+	/// is what proves a new site did not skip the bracket. Written from the
+	/// enumerated list: admission (fast AND slow), overwrite-as-access,
+	/// promotion, demotion, `remove_key` and `take`.
+	#[test]
+	fn lfu_gauges_match_the_shards_under_churn() {
+		let s = lfu(2_048 * SHARDS as CacheSize);
+
+		let a = |i: u64| mix(i);
+		let b = |i: u64| mix(i + 10_000_000);
+
+		let mut removed = 0usize;
+		let mut taken = 0usize;
+		let mut promotions = 0usize;
+		let mut demotions = 0usize;
+
+		for i in 1..=1_200u64 {
+			put(&s, a(i), 256);
+			put(&s, b(i), 256);
+
+			if i % 5 == 0 {
+				s.touch(a(i / 5));
+			}
+
+			// An overwrite with a DIFFERENT length: the byte delta is charged
+			// to whichever tier the slot is in, and the access is counted.
+			if i % 7 == 0 {
+				put(&s, a(i / 7), 1_024);
+			}
+
+			if i % 11 == 0 && s.remove_key(a(i / 11)) {
+				removed += 1;
+			}
+
+			if i % 13 == 0 && s.take(&b(i / 13)).is_some() {
+				taken += 1;
+			}
+
+			for (_, tier) in s.drain_migrations() {
+				match tier {
+					Tier::Fast => promotions += 1,
+					Tier::Slow => demotions += 1,
+				}
+			}
+
+			// Every iteration, not just at the end: a drift a later operation
+			// happens to cancel out would otherwise pass.
+			s.verify_gauges();
+		}
+
+		assert!(removed > 0, "remove_key never removed a live key");
+		assert!(taken > 0, "take never took a live key -- that path went unchecked");
+		assert!(demotions > 0, "nothing was ever demoted");
+		assert!(promotions > 0, "nothing was ever promoted");
+
+		assert!(s.slow_object_count() > 0, "nothing ended up in the slow tier");
+		assert!(s.fast_object_count() > 0, "everything ended up in the slow tier");
+
+		assert_eq!(
+			s.fast_bytes_used() + s.slow_bytes_used(),
+			live_migrating_lfu(&s),
+			"tier byte totals do not add up to what the live slots hold",
+		);
+
+		// The recency list stayed empty through all of that, which is the
+		// invariant every shared removal path could have broken silently.
+		for (n, lock) in s.shards.iter().enumerate() {
+			let g = lock.read().unwrap();
+
+			assert_eq!(g.head, NIL, "shard {n} linked the recency list under Lfu");
+			assert_eq!(g.tail, NIL, "shard {n} linked the recency list under Lfu");
+		}
+
+		s.clear();
+		s.verify_gauges();
+
+		assert!(!s.lfu_latched.load(Ordering::Relaxed), "clear left admission latched");
+	}
+
+	/// Concurrent bumps, admissions and settles must not deadlock, and the
+	/// mirrored gauges must survive the contention -- the LFU counterpart of
+	/// `concurrent_touches_and_settles_do_not_deadlock`, and the only test that
+	/// exercises two settlers racing on the new `(freq, stamp)` mirror.
+	#[test]
+	fn concurrent_lfu_bumps_and_settles_do_not_deadlock() {
+		use std::sync::Arc;
+
+		let s = Arc::new(Store::new());
+		s.set_order(MergedOrder::Lfu);
+		s.configure_tiering(64 * 1_024, 0, DEFAULT_HIGH_PPM, DEFAULT_LOW_PPM);
+
+		let threads: Vec<_> = (0..8u64)
+			.map(|t| {
+				let s = Arc::clone(&s);
+
+				std::thread::spawn(move || {
+					for i in 1..=1_000u64 {
+						let key = mix(t * 1_000_000 + i);
+
+						s.insert(key, Object::new(key, &[0u8; 128], None));
+						s.record_size(key, 128, 0);
+						s.touch(mix(t * 1_000_000 + (i / 2).max(1)));
+
+						if i % 13 == 0 {
+							s.remove_key(mix(t * 1_000_000 + i / 13));
+						}
+
+						if i % 101 == 0 {
+							s.resize_fast_tier(32 * 1_024 * (1 + i % 3));
+						}
+					}
+				})
+			})
+			.collect();
+
+		for t in threads {
+			t.join().expect("a worker panicked -- or the settle loop deadlocked");
+		}
+
+		s.verify_gauges();
+
+		assert_eq!(
+			s.fast_object_count() + s.slow_object_count(),
+			s.len(),
+			"the tier counts lost track of objects under contention",
+		);
+
+		// Every live slot is on exactly one frequency bucket of its own tier.
+		// The hash-chain analogue of this is
+		// `bucket_chains_hold_exactly_the_live_slots`; the frequency chains
+		// need their own, because a corrupted bucket would still answer
+		// `find` correctly and only produce a wrong victim.
+		let mut bucketed = 0usize;
+
+		for lock in s.shards.iter() {
+			let g = lock.read().unwrap();
+			let mut seen = std::collections::HashSet::new();
+
+			for tier in [Tier::Fast, Tier::Slow] {
+				for (&bucket_freq, &(head, tail)) in g.freq_buckets(tier).iter() {
+					let mut i = head;
+					let mut last = NIL;
+
+					while i != NIL {
+						assert!(seen.insert(i), "slot {i} is on two frequency buckets");
+						assert_eq!(
+							g.slots[i as usize].freq, bucket_freq,
+							"slot {i} is in the bucket for a frequency it does not hold",
+						);
+						assert_eq!(
+							g.slots[i as usize].tier, tier,
+							"slot {i} is in the wrong tier's bucket set",
+						);
+						assert!(
+							g.slots[i as usize].object.is_some(),
+							"slot {i} is bucketed but holds no object -- it is recycled",
+						);
+
+						bucketed += 1;
+						last = i;
+						i = g.slots[i as usize].next;
+
+						assert!(bucketed <= s.len() + 1, "a bucket chain does not terminate");
+					}
+
+					assert_eq!(tail, last, "a bucket's tail is not the end of its chain");
+				}
+			}
+		}
+
+		assert_eq!(bucketed, s.len(), "bucket membership disagrees with the tracked total");
 	}
 }
 

@@ -114,6 +114,22 @@ fn cache_error_code(err: &CacheError) -> u8 {
 		CacheError::ZeroCacheSize => 4,
 		CacheError::UnconfiguredPolicy => 5,
 		CacheError::InvalidPolicy => 6,
+
+		// A merged build refusing a policy whose eviction order it does not
+		// implement. Spelled out deliberately: this function ends in `_ => 0`,
+		// so a new variant COMPILES FINE and silently reports "no code" -- the
+		// same silent-substitution shape, one layer down, as the LRU fallback
+		// that raised this error in the first place.
+		//
+		// The frame cannot desync: `write_cache_error` writes a bool `false`, a
+		// literal `0u8` meaning "a cache error code follows", then one code
+		// byte, so a 7 is exactly the same shape as a 6. The decoder
+		// (`PaperCacheError::from_code`) is upstream of this repo and will not
+		// recognise 7 until it is taught it -- but in practice this error is a
+		// refusal to START: the cache is constructed before any connection is
+		// accepted, so it is reported on the console and the process exits.
+		CacheError::PolicyNotImplemented(..) => 7,
+
 		_ => 0,
 	}
 }
@@ -1003,6 +1019,14 @@ impl Config {
 		//
 		// So the guard is a warning, not an error. PaperCache::new accepts any
 		// policy; the tier report just shows an empty slow tier for a flat one.
+		//
+		// One exception, and it is a build-time one: under
+		// `merged_object_store` the object map IS the eviction stack, so it
+		// serves only the orders it implements -- lru, fifo, clock and lfu --
+		// and `PaperCache::new` returns `CacheError::PolicyNotImplemented` for
+		// anything else. That surfaces below, as a refusal to construct the
+		// cache, which is deliberate: the alternative was running one policy
+		// under another's name.
 		#[cfg(not(feature = "all_dram"))]
 		if !policy.is_hybrid() {
 			return Err(format!(
