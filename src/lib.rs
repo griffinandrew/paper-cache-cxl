@@ -1758,8 +1758,26 @@ where
 
 
 pub enum EraseKey<'a, K> {
+	/// Remove the object stored under this key, after checking that the
+	/// object at the hash really is this key's -- a hash collision is not.
 	Original(&'a K, HashedKey),
+
+	/// Remove whatever object is stored at this hash, live or not. Capacity
+	/// eviction's path: the stack chose the victim and it must go.
 	Hashed(HashedKey),
+
+	/// Remove the object at this hash only if it has expired; otherwise leave
+	/// it in place and answer `KeyNotFound`. The TTL reaper's path.
+	///
+	/// A due index entry can be stale. `set` writes the object map and only
+	/// then sends the event that retires the old entry, and `ttl` extends the
+	/// object's expiry in place before its event moves the entry. In between,
+	/// the index still holds the old deadline while the map already holds a
+	/// live object -- a re-set with no TTL or a later one, or the same object
+	/// with its TTL extended. `Hashed` would delete it. The expiry is tested
+	/// under the same lock as the removal, so nothing can replace the object
+	/// between the check and the erase.
+	Expired(HashedKey),
 }
 
 
@@ -1776,6 +1794,7 @@ where
 	let hashed_key = match maybe_key {
 		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
 		Some(EraseKey::Hashed(hashed_key)) => hashed_key,
+		Some(EraseKey::Expired(hashed_key)) => hashed_key,
 
 		None => {
 			// INSTRUMENTATION: this path removes an object from the MAP without
@@ -1811,6 +1830,13 @@ where
 
 	//if let Some(EraseKey::Original(key, _)) = maybe_key && !entry.get().key_matches(key) {
 	if let Some(EraseKey::Original(key, _)) = maybe_key && !entry.get().key_matches(key) {
+		return Err(CacheError::KeyNotFound);
+	};
+
+	// A reap must not take an object that is live again -- see
+	// `EraseKey::Expired`. Tested on the occupied entry, under the lock the
+	// removal below also holds.
+	if matches!(maybe_key, Some(EraseKey::Expired(_))) && !entry.get().is_expired() {
 		return Err(CacheError::KeyNotFound);
 	};
 
@@ -1863,6 +1889,7 @@ where
 	let hashed_key = match maybe_key {
 		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
 		Some(EraseKey::Hashed(hashed_key)) => hashed_key,
+		Some(EraseKey::Expired(hashed_key)) => hashed_key,
 
 		None => {
 			crate::ERASE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1876,20 +1903,22 @@ where
 		},
 	};
 
-	// Validate before removing, so a hash collision does not evict the wrong
-	// object -- same reason the DashMap version holds an occupied entry.
-	if let Some(EraseKey::Original(ref key, _)) = maybe_key {
-		let matches = objects
-			.get_ref(&hashed_key)
-			.map(|object| object.key_matches(key))
-			.unwrap_or(false);
+	// Validate and remove under ONE shard write guard, so a hash collision
+	// does not evict the wrong object and a reap does not take an object that
+	// is live again (`EraseKey::Expired`). Checking through `get_ref` and then
+	// calling `take` would release the lock in between, and a `set` landing
+	// there would have its new object removed.
+	let taken = match maybe_key {
+		Some(EraseKey::Original(key, _)) =>
+			objects.take_if(&hashed_key, |object| object.key_matches(key)),
 
-		if !matches {
-			return Err(CacheError::KeyNotFound);
-		}
-	}
+		Some(EraseKey::Expired(_)) =>
+			objects.take_if(&hashed_key, |object| object.is_expired()),
 
-	let Some(object) = objects.take(&hashed_key) else {
+		Some(EraseKey::Hashed(_)) | None => objects.take(&hashed_key),
+	};
+
+	let Some(object) = taken else {
 		return Err(CacheError::KeyNotFound);
 	};
 
@@ -1917,6 +1946,7 @@ where
 	let hashed_key = match maybe_key {
 		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
 		Some(EraseKey::Hashed(hashed_key)) => hashed_key,
+		Some(EraseKey::Expired(hashed_key)) => hashed_key,
 
 		None => {
 			// INSTRUMENTATION: this path removes an object from the MAP without
@@ -1945,6 +1975,13 @@ where
 	};
 
 	if let Some(EraseKey::Original(key, _)) = maybe_key && !entry.get().key_matches(key) {
+		return Err(CacheError::KeyNotFound);
+	};
+
+	// A reap must not take an object that is live again -- see
+	// `EraseKey::Expired`. Tested on the occupied entry, under the lock the
+	// removal below also holds.
+	if matches!(maybe_key, Some(EraseKey::Expired(_))) && !entry.get().is_expired() {
 		return Err(CacheError::KeyNotFound);
 	};
 

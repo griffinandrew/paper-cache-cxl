@@ -1672,8 +1672,9 @@ where
 	/// the stack state this worker is about to produce.
 	fn handle_expire(&mut self, key: HashedKey) {
 		if self.object_exists(key) {
-			// Re-set between the reap and this notification -- the key is
-			// live again, and its `Set` event owns the stack entry now.
+			// Live: re-set between the reap and this notification, or live
+			// all along and left in place by the reap (`EraseKey::Expired`).
+			// Either way the stack entry belongs to that live object.
 			return;
 		}
 

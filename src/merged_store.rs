@@ -2442,6 +2442,43 @@ impl<K, V> MergedStore<K, V> {
 		let s = shard_of(*key);
 		let mut g = self.shards[s].write().unwrap();
 		let i = g.bucket_unlink(*key)?;
+
+		self.take_unlinked(s, &mut g, i)
+	}
+
+	/// `take`, but only if `pred` holds for the object stored under `key`.
+	///
+	/// The test and the removal run under one shard write guard, so no `set`
+	/// can replace the object in between -- which is the point: `erase` checks
+	/// a key match (hash collisions) and an expiry (the TTL reaper) against the
+	/// object it then removes, not against whatever was there a moment ago.
+	///
+	/// Walks the bucket chain twice, once to test and once to unlink. `take`
+	/// does not delegate here for that reason: capacity eviction has nothing to
+	/// test and keeps the single walk.
+	pub fn take_if(
+		&self,
+		key: &HashedKey,
+		pred: impl FnOnce(&Object<K, V>) -> bool,
+	) -> Option<Object<K, V>> {
+		let s = shard_of(*key);
+		let mut g = self.shards[s].write().unwrap();
+		let found = g.find(*key)?;
+
+		if !g.slots[found as usize].object.as_ref().is_some_and(pred) {
+			return None;
+		}
+
+		let i = g.bucket_unlink(*key)?;
+		debug_assert_eq!(i, found, "the write guard is held, so the slot cannot move");
+
+		self.take_unlinked(s, &mut g, i)
+	}
+
+	/// The tail of `take` and `take_if`, once slot `i` is out of its bucket:
+	/// detach it from its tier and the recency order, hand back its object and
+	/// free the slot.
+	fn take_unlinked(&self, s: usize, g: &mut Inner<K, V>, i: u32) -> Option<Object<K, V>> {
 		let before = g.totals();
 		let lfu = self.order() == MergedOrder::Lfu;
 
@@ -2458,7 +2495,7 @@ impl<K, V> MergedStore<K, V> {
 		g.free.push(i);
 
 		self.apply_totals_delta(before, g.totals());
-		self.publish_mirrors(s, &g);
+		self.publish_mirrors(s, g);
 		self.tracked.fetch_sub(1, Ordering::Relaxed);
 
 		taken
