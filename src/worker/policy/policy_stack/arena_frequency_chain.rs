@@ -16,7 +16,7 @@
 //!
 //! * `LfuCompactHybridStack` needs one ordered bucket per DISTINCT FREQUENCY,
 //!   per tier, because eviction has to find the MINIMUM frequency. That is a
-//!   `BTreeMap<u32, (head, tail)>` -- unbounded and data-dependent -- and a
+//!   `BTreeMap<u32, Bucket>` -- unbounded and data-dependent -- and a
 //!   fixed `[u32; MAX_QUEUES]` tag cannot express it.
 //!
 //! * `LruLfuCompactHybridStack` additionally threads a THIRD, recency-ordered
@@ -81,6 +81,70 @@
 //! "representation change only" is a fact about this commit rather than an
 //! intention.
 //!
+//! # Tie order across a tier move
+//!
+//! Upstream `LfuStack` breaks ties among equal counts by the order keys
+//! ENTERED the count -- `push_front` on reaching it, `pop_back` on eviction --
+//! and CLAUDE.md's LFU design decision 4 says the tiered stack means the same
+//! thing. A bucket list gets that for free as long as every key appended to it
+//! is the newest key at that count. Promotion keeps that true: it always
+//! immediately follows a `bump` of the same key. Demotion did not: `set_tier`
+//! re-appended the demoted key at the NEWEST end of the slow bucket, so a key
+//! that reached its count long ago ranked as if it had just arrived, behind
+//! slow keys that arrived after it.
+//!
+//! The fix keeps two runs per bucket. The NATIVE run (`head`/`tail`) is what
+//! there always was: every append is stamped with the chain's clock, so it is
+//! stamp-ascending. The DEMOTED run (`demoted_head`/`demoted_tail`) is appended
+//! only by [`ArenaFrequencyChain::demote_min_fast`], which keeps the key's own
+//! stamp -- the moment it reached its count. It is stamp-ascending too, by
+//! construction: fast buckets only ever take native appends, so they are
+//! stamp-ascending, and a demotion always takes the HEAD (oldest) of the fast
+//! minimum bucket, so every key still in that fast bucket, and every key that
+//! enters it later, is at least as new as the one demoted. A bucket's oldest
+//! key is therefore the older of its two run heads: O(1), no walk, no sort.
+//!
+//! A side effect worth naming: with every key's stamp meaning "when it reached
+//! its current count" in BOTH tiers, the two tiers' minima are comparable with
+//! each other, and [`ArenaFrequencyChain::min_over_both_tiers`] is exactly
+//! upstream LFU's victim. `lfu-global-compact-hybrid` evicts through it.
+//!
+//! The stamp is 40 bits wide and costs no bytes, so the node stays 32. Its low
+//! 32 bits are `NodePayload::ts`, which no other stack reads. Its high 8 are
+//! `NodePayload::queue`, which only the multi-queue stacks use, each on its own
+//! `ArenaQueueSet` slab: this chain has no queues, and before the stamp neither
+//! of its faces read or wrote the byte except to zero it in [`node`]. The
+//! clock ticks once per `insert` or `bump` -- at most once per trace record --
+//! and wraps at 2^40, and two stamps are compared by AGE, `(clock - stamp) mod
+//! 2^40`, which is exact while both keys' ages are below 2^40 (about 1.1e12)
+//! ticks: some 900 times the 1.2e9 records of the largest trace. Past that
+//! window a stale key's age aliases small and it ranks as newer than it is --
+//! the pre-fix behaviour, for that key only. The runs themselves are
+//! structural and cannot be corrupted by a wrap: the stamp only ever chooses
+//! between two heads -- a bucket's two run heads, or, in
+//! [`ArenaFrequencyChain::min_over_both_tiers`], the two tiers' minimum
+//! heads. So past the window a misranked key can also take the eviction from
+//! the wrong TIER under `lfu-global-compact-hybrid`; that changes which key
+//! goes, never what the chain holds.
+//!
+//! `ts` alone would have been a 2^32 window, and that one a long-lived cache
+//! CAN outrun -- 4.3e9 touches is under four passes of the largest trace
+//! without a wipe -- which is why the spare byte is borrowed rather than the
+//! narrower window accepted.
+//!
+//! The bucket maps grow with the fix from 8 to 16 bytes of value per entry.
+//! Still per DISTINCT count present, not per object -- and a bound, not a
+//! hope: a tier can only hold `D` distinct counts if its keys were touched at
+//! least `1 + 2 + ... + D` times, so `D <= sqrt(2N)` after `N` touches. At the
+//! 1.2e9 records of the largest trace that is under 49,000 buckets per tier,
+//! about 1 MB of keys and values per tier, before a `BTreeMap`'s node overhead
+//! (about 2.5x at worst, with every node at its minimum fill). Real traces sit
+//! far below the bound: it needs every count from 1 to `D` present at once.
+//!
+//! `LruLfuCompactHybridStack` never demotes through `demote_min_fast` -- its
+//! demotions come off the recency list -- so its buckets never hold a demoted
+//! run and every method it calls behaves exactly as before.
+//!
 //! [`ArenaQueueSet`]: super::arena_queue_set::ArenaQueueSet
 //! [`CompactFrequencyChain`]: super::compact_frequency_chain::CompactFrequencyChain
 
@@ -110,11 +174,47 @@ use crate::{
 // premise the stack is not in DRAM. A map that ignored the gate would sit in
 // DRAM and be charged nothing.
 //
-// One entry per DISTINCT frequency rather than per object, so this stays small.
+// One entry per DISTINCT frequency rather than per object, so this stays small
+// -- about 1 MB of entries per tier even at the bound for a 1.2e9-record
+// trace; see "Tie order across a tier move".
 #[cfg(not(feature = "eviction_stacks_pmem"))]
-type BucketMap = BTreeMap<u32, (u32, u32)>;
+type BucketMap = BTreeMap<u32, Bucket>;
 #[cfg(feature = "eviction_stacks_pmem")]
-type BucketMap = BTreeMap<u32, (u32, u32), crate::Hybrid>;
+type BucketMap = BTreeMap<u32, Bucket, crate::Hybrid>;
+
+/// One frequency's bucket: two intrusive runs over the slab, each `NIL`-ended.
+///
+/// Sixteen bytes per DISTINCT frequency per tier, up from eight -- not per
+/// object, so the per-object figure does not move. O(distinct counts present),
+/// which is at most `sqrt(2N)` after `N` touches: about 1 MB of entries per
+/// tier at the largest trace's 1.2e9 records (see the module doc).
+#[derive(Clone, Copy, Debug)]
+struct Bucket {
+	/// Keys that reached this count IN this tier: admission, `bump`, and the
+	/// promotion `set_tier` that follows a bump. Stamp-ascending, head oldest.
+	head: u32,
+	tail: u32,
+
+	/// Keys DEMOTED into this count by `demote_min_fast`, carrying their
+	/// original stamps. Stamp-ascending by the argument in the module doc.
+	/// Always `NIL` in a fast bucket, and in every bucket of the recency face.
+	demoted_head: u32,
+	demoted_tail: u32,
+}
+
+impl Bucket {
+	fn native(slot: u32) -> Self {
+		Bucket { head: slot, tail: slot, demoted_head: NIL, demoted_tail: NIL }
+	}
+
+	fn demoted(slot: u32) -> Self {
+		Bucket { head: NIL, tail: NIL, demoted_head: slot, demoted_tail: slot }
+	}
+
+	fn is_empty(&self) -> bool {
+		self.head == NIL && self.demoted_head == NIL
+	}
+}
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 fn new_bucket_maps() -> (BucketMap, BucketMap) {
@@ -139,8 +239,8 @@ pub struct ArenaFrequencyChain {
 	/// Freed slab slots, reused before the slab grows.
 	free: U32Vec,
 
-	/// frequency -> (head, tail) of that bucket's intrusive list, one map per
-	/// tier. Ordered, so a tier's minimum frequency is its first entry.
+	/// frequency -> that bucket's two intrusive runs (see [`Bucket`]), one map
+	/// per tier. Ordered, so a tier's minimum frequency is its first entry.
 	///
 	/// Two bucket sets over *one* slab is what lets this replace both of
 	/// `FrequencyChain`'s chains **and** the `entries` map they were paired
@@ -151,6 +251,16 @@ pub struct ArenaFrequencyChain {
 
 	fast_len: usize,
 	slow_len: usize,
+
+	/// Last-touch clock: ticks once per `insert` and per `bump`, and is written
+	/// into the touched node's 40-bit stamp (see [`stamp_of`]). Wraps at 2^40,
+	/// so it never exceeds [`STAMP_MASK`]; only ever compared as an AGE
+	/// (`clock - stamp`, mod 2^40), and only between two heads: the two run
+	/// heads of one bucket, or the two tiers' minimum heads in
+	/// `min_over_both_tiers`. Owned by the chain and touched only by the
+	/// policy worker that owns the stack, so it is a plain field: no atomic, no
+	/// lock.
+	clock: u64,
 
 	/// Head and tail of the DISTINGUISHED RECENCY LIST: a third intrusive list
 	/// over the SAME slab, ordered by recency rather than by frequency.
@@ -181,6 +291,7 @@ impl Default for ArenaFrequencyChain {
 			slow_buckets,
 			fast_len: 0,
 			slow_len: 0,
+			clock: 0,
 			recency_head: NIL,
 			recency_tail: NIL,
 		}
@@ -195,8 +306,12 @@ impl Default for ArenaFrequencyChain {
 /// node's contract is that the two are equal for everyone else, and a `phys`
 /// left behind at admission tier would quietly make that false.
 ///
-/// `ts` and `queue` stay zero: recency here is `prev`/`next` and there are no
-/// queues. They exist so the node is the one shape every policy shares.
+/// `ts` and `queue` start at zero here. There are no queues, so neither field
+/// means what it means on an `ArenaQueueSet` node: together they are the
+/// 40-bit last-touch stamp ([`stamp_of`]), which the frequency face overwrites
+/// with the chain's clock on every `insert` and `bump` (see "Tie order across a
+/// tier move"). The recency face never reads or writes either -- recency there
+/// is `prev`/`next`.
 fn node(size: ObjectSize, freq: u32, dram_resident: u8, tier: Tier) -> NodePayload {
 	NodePayload {
 		size,
@@ -207,6 +322,30 @@ fn node(size: ObjectSize, freq: u32, dram_resident: u8, tier: Tier) -> NodePaylo
 		phys: Some(tier),
 		dram_resident,
 	}
+}
+
+/// Bits in the last-touch stamp: `NodePayload::ts` (32) + `NodePayload::queue`
+/// (8). The clock wraps at this width.
+const STAMP_BITS: u32 = 40;
+
+/// The clock's range, and the modulus two stamps' ages are taken in.
+const STAMP_MASK: u64 = (1 << STAMP_BITS) - 1;
+
+/// A node's 40-bit last-touch stamp: `ts` is the low 32 bits and `queue`, a
+/// byte this chain has no other use for, the high 8.
+#[inline]
+fn stamp_of(payload: &NodePayload) -> u64 {
+	((payload.queue as u64) << 32) | payload.ts as u64
+}
+
+/// Writes a 40-bit stamp into `ts` and `queue`. `stamp` is a clock value, so
+/// it is already within [`STAMP_MASK`] and the high byte cannot truncate.
+#[inline]
+fn set_stamp(payload: &mut NodePayload, stamp: u64) {
+	debug_assert!(stamp <= STAMP_MASK, "stamp {stamp:#x} is wider than {STAMP_BITS} bits");
+
+	payload.ts = stamp as u32;
+	payload.queue = (stamp >> 32) as u8;
 }
 
 impl ArenaFrequencyChain {
@@ -261,13 +400,15 @@ impl ArenaFrequencyChain {
 		self.slot_of(key).map(|slot| self.slots[slot as usize].payload)
 	}
 
-	/// Admits a key at frequency 1.
+	/// Admits a key at frequency 1, stamped as the newest key there is.
 	pub fn insert(&mut self, key: HashedKey, size: ObjectSize, dram_resident: u8, tier: Tier) {
 		if self.contains(key) {
 			return;
 		}
 
+		let stamp = self.tick();
 		let slot = self.alloc_slot(key, node(size, 1, dram_resident, tier));
+		set_stamp(&mut self.slots[slot as usize].payload, stamp);
 
 		self.index.insert(&self.slots, slot);
 		self.link(slot, 1, tier);
@@ -278,7 +419,11 @@ impl ArenaFrequencyChain {
 		}
 	}
 
-	/// Moves a key to the next frequency bucket. O(1): unlink, relink.
+	/// Moves a key to the next frequency bucket. O(1): unlink, relink. The key
+	/// is restamped: it has just reached its new count, so it is the newest key
+	/// at that count -- which is why a native append is always in order. At the
+	/// `u32` cap the count stays put but the key is still restamped and moved
+	/// to the newest end, as before.
 	pub fn bump(&mut self, key: HashedKey) -> u32 {
 		let Some(slot) = self.slot_of(key) else { return 0 };
 		let payload = self.slots[slot as usize].payload;
@@ -287,17 +432,20 @@ impl ArenaFrequencyChain {
 		self.unlink(slot, payload.freq, tier);
 
 		let next_freq = payload.freq.saturating_add(1);
+		let stamp = self.tick();
 		self.slots[slot as usize].payload.freq = next_freq;
+		set_stamp(&mut self.slots[slot as usize].payload, stamp);
 		self.link(slot, next_freq, tier);
 
 		next_freq
 	}
 
-	/// The least-frequently-used key in a tier: head of its lowest-frequency
-	/// bucket. O(log D) in the number of distinct frequencies present.
+	/// The least-frequently-used key in a tier: the older of the two run heads
+	/// of its lowest-frequency bucket. O(log D) in the number of distinct
+	/// frequencies present, plus one stamp comparison.
 	pub fn min_key(&self, tier: Tier) -> Option<HashedKey> {
-		let (_, &(head, _)) = self.buckets(tier).iter().next()?;
-		Some(self.slots[head as usize].key)
+		let (_, bucket) = self.buckets(tier).iter().next()?;
+		Some(self.slots[self.bucket_head(bucket) as usize].key)
 	}
 
 	/// The lowest frequency present in a tier, or `None` if it is empty.
@@ -310,8 +458,62 @@ impl ArenaFrequencyChain {
 
 	/// The least-frequently-used key in a tier together with its count.
 	pub fn min_with_count(&self, tier: Tier) -> Option<(HashedKey, u32)> {
-		let (&freq, &(head, _)) = self.buckets(tier).iter().next()?;
-		Some((self.slots[head as usize].key, freq))
+		let (&freq, bucket) = self.buckets(tier).iter().next()?;
+		Some((self.slots[self.bucket_head(bucket) as usize].key, freq))
+	}
+
+	/// The least-frequently-used key across BOTH tiers, with its count and the
+	/// tier it is in: the lower of the two tier minima's counts, and between
+	/// equal counts the key that reached the count first -- the older of the
+	/// two bucket heads by stamp age, the same comparison `bucket_head` makes
+	/// between a bucket's two runs. Identical stamps go to the slow tier.
+	///
+	/// This is upstream `LfuStack`'s victim, and it is only that because of
+	/// the tie-order fix: every live key's stamp is now the moment it reached
+	/// its CURRENT count, whichever tier it is in -- a bump stamps it, a
+	/// promotion restamps it with that same bump's clock value, and a demotion
+	/// (`demote_min_fast`) keeps it -- so stamps from the two tiers are one
+	/// comparable sequence. Before the fix a demoted key carried its demotion
+	/// time, and a cross-tier comparison would have ranked it by that.
+	///
+	/// Stamps are distinct between live keys (each tick is written into one
+	/// key), so the slow-on-a-tie rule is a determinism rule, not a policy.
+	/// Two `BTreeMap` first-entry lookups and at most four stamp reads: two to
+	/// pick the slow bucket's head between its runs (a fast bucket never has a
+	/// demoted run, so its head costs none), and two to compare across tiers.
+	///
+	/// Exact while every live key's stamp is within the 2^40 window (see the
+	/// module doc). Past it, the cross-tier comparison can hand the eviction
+	/// to the wrong tier's head -- a different victim, no corruption.
+	pub fn min_over_both_tiers(&self) -> Option<(HashedKey, u32, Tier)> {
+		let head = |(&freq, bucket): (&u32, &Bucket)| (self.bucket_head(bucket), freq);
+
+		let (slot, freq, tier) = match (
+			self.slow_buckets.iter().next().map(head),
+			self.fast_buckets.iter().next().map(head),
+		) {
+			(None, None) => return None,
+			(Some((slot, freq)), None) => (slot, freq, Tier::Slow),
+			(None, Some((slot, freq))) => (slot, freq, Tier::Fast),
+
+			(Some((slow, slow_freq)), Some((fast, fast_freq))) => {
+				let slow_first = match slow_freq.cmp(&fast_freq) {
+					std::cmp::Ordering::Less => true,
+					std::cmp::Ordering::Greater => false,
+					std::cmp::Ordering::Equal => self.not_newer(
+						stamp_of(&self.slots[slow as usize].payload),
+						stamp_of(&self.slots[fast as usize].payload),
+					),
+				};
+
+				match slow_first {
+					true => (slow, slow_freq, Tier::Slow),
+					false => (fast, fast_freq, Tier::Fast),
+				}
+			},
+		};
+
+		Some((self.slots[slot as usize].key, freq, tier))
 	}
 
 	pub fn remove(&mut self, key: HashedKey) -> Option<NodePayload> {
@@ -346,6 +548,14 @@ impl ArenaFrequencyChain {
 	/// Moves a key between tiers, preserving its frequency. Relinks it from one
 	/// bucket set into the other -- the key never moves in the slab, so its
 	/// index entry and every link to it stay valid.
+	///
+	/// A RE-APPEND: the key goes to the newest end of the destination bucket's
+	/// native run and is restamped with the current clock (without ticking), so
+	/// it ranks as if it had just reached its count. That is exactly right for
+	/// a promotion, which always immediately follows a `bump` of the same key --
+	/// the restamp writes the value the bump just wrote. It is WRONG for a
+	/// demotion, which must keep the key's place among equal counts: demote
+	/// with [`demote_min_fast`](Self::demote_min_fast).
 	pub fn set_tier(&mut self, key: HashedKey, tier: Tier) {
 		let Some(slot) = self.slot_of(key) else { return };
 		let payload = self.slots[slot as usize].payload;
@@ -357,12 +567,44 @@ impl ArenaFrequencyChain {
 
 		self.unlink(slot, payload.freq, old_tier);
 		self.set_tier_fields(slot, tier);
+		set_stamp(&mut self.slots[slot as usize].payload, self.clock);
 		self.link(slot, payload.freq, tier);
 
 		match tier {
 			Tier::Fast => { self.fast_len += 1; self.slow_len -= 1; },
 			Tier::Slow => { self.slow_len += 1; self.fast_len -= 1; },
 		}
+	}
+
+	/// Demotes the fast tier's least-frequently-used key -- the head of its
+	/// lowest-frequency bucket -- into the slow bucket of the same count,
+	/// KEEPING its stamp, so it ranks among equal-count slow keys by when it
+	/// reached the count rather than by when it was demoted. Returns the key and
+	/// its entry as it now stands, or `None` if the fast tier is empty.
+	///
+	/// No index probe: the victim is found through the bucket map and moved by
+	/// slot, where `min_with_count` + `get` + `set_tier` probed twice.
+	///
+	/// Taking the head is not an optimisation but the precondition that keeps
+	/// the destination's demoted run stamp-ascending (see the module doc), which
+	/// is why there is no `demote(key)`.
+	pub fn demote_min_fast(&mut self) -> Option<(HashedKey, NodePayload)> {
+		let (freq, slot) = {
+			let (&freq, bucket) = self.fast_buckets.iter().next()?;
+			debug_assert_eq!(bucket.demoted_head, NIL, "a fast bucket never holds a demoted run");
+			(freq, bucket.head)
+		};
+
+		let key = self.slots[slot as usize].key;
+
+		self.unlink(slot, freq, Tier::Fast);
+		self.set_tier_fields(slot, Tier::Slow);
+		self.link_demoted(slot, freq);
+
+		self.fast_len -= 1;
+		self.slow_len += 1;
+
+		Some((key, self.slots[slot as usize].payload))
 	}
 
 	pub fn resize(&mut self, key: HashedKey, size: ObjectSize, dram_resident: u8) {
@@ -381,8 +623,52 @@ impl ArenaFrequencyChain {
 		self.slow_buckets.clear();
 		self.fast_len = 0;
 		self.slow_len = 0;
+		self.clock = 0;
 		self.recency_head = NIL;
 		self.recency_tail = NIL;
+	}
+
+	/// Advances the last-touch clock, wrapping at 2^40, and returns the new
+	/// stamp.
+	#[inline]
+	fn tick(&mut self) -> u64 {
+		self.clock = (self.clock + 1) & STAMP_MASK;
+		self.clock
+	}
+
+	/// How many ticks ago `stamp` was taken, modulo 2^40.
+	#[inline]
+	fn age(&self, stamp: u64) -> u64 {
+		self.clock.wrapping_sub(stamp) & STAMP_MASK
+	}
+
+	/// Whether the key stamped `a` reached its count no later than the key
+	/// stamped `b`.
+	///
+	/// Compares AGES rather than the stamps: both keys are in the past, so each
+	/// age is exact while below 2^40 ticks, twice the window of a signed
+	/// serial-number comparison. Stamps must never be compared directly -- see
+	/// `NodePayload::ts`.
+	#[inline]
+	fn not_newer(&self, a: u64, b: u64) -> bool {
+		self.age(a) >= self.age(b)
+	}
+
+	/// The oldest key of a bucket: the older of its two run heads. A tie --
+	/// possible only between two `set_tier` restamps -- goes to the demoted run.
+	#[inline]
+	fn bucket_head(&self, bucket: &Bucket) -> u32 {
+		match (bucket.head, bucket.demoted_head) {
+			(head, NIL) => head,
+			(NIL, demoted) => demoted,
+
+			(head, demoted) => {
+				let head_stamp = stamp_of(&self.slots[head as usize].payload);
+				let demoted_stamp = stamp_of(&self.slots[demoted as usize].payload);
+
+				if self.not_newer(demoted_stamp, head_stamp) { demoted } else { head }
+			},
+		}
 	}
 
 	/// The slot holding `key`, or `None`. One probe into the keyless index.
@@ -614,29 +900,81 @@ impl ArenaFrequencyChain {
 		self.link(slot, freq, Tier::Slow);
 	}
 
+	/// Appends `slot` at the newest end of the NATIVE run of bucket
+	/// `(tier, freq)`. The caller has stamped it (or, on the recency face, does
+	/// not use stamps at all).
 	fn link(&mut self, slot: u32, freq: u32, tier: Tier) {
 		let buckets = match tier {
 			Tier::Fast => &mut self.fast_buckets,
 			Tier::Slow => &mut self.slow_buckets,
 		};
 
+		self.slots[slot as usize].next = NIL;
+
 		match buckets.get_mut(&freq) {
-			Some((_, tail)) => {
-				let old_tail = *tail;
-				*tail = slot;
+			// A bucket can exist with an EMPTY native run when only demoted
+			// keys hold it, so the run's own tail decides, not the bucket.
+			Some(bucket) if bucket.tail != NIL => {
+				let old_tail = bucket.tail;
+				bucket.tail = slot;
 				self.slots[old_tail as usize].next = slot;
 				self.slots[slot as usize].prev = old_tail;
-				self.slots[slot as usize].next = NIL;
+			},
+
+			Some(bucket) => {
+				bucket.head = slot;
+				bucket.tail = slot;
+				self.slots[slot as usize].prev = NIL;
 			},
 
 			None => {
-				buckets.insert(freq, (slot, slot));
+				buckets.insert(freq, Bucket::native(slot));
 				self.slots[slot as usize].prev = NIL;
-				self.slots[slot as usize].next = NIL;
 			},
 		}
 	}
 
+	/// Appends `slot` at the newest end of the DEMOTED run of slow bucket
+	/// `freq`, keeping its stamp. Only `demote_min_fast` calls this, and only
+	/// with the head of the fast minimum bucket, which is what keeps the run
+	/// stamp-ascending; the debug assertion checks exactly that.
+	fn link_demoted(&mut self, slot: u32, freq: u32) {
+		self.slots[slot as usize].next = NIL;
+
+		match self.slow_buckets.get(&freq).map(|b| b.demoted_tail) {
+			Some(old_tail) if old_tail != NIL => {
+				debug_assert!(
+					self.not_newer(
+						stamp_of(&self.slots[old_tail as usize].payload),
+						stamp_of(&self.slots[slot as usize].payload),
+					),
+					"demoted run of bucket {freq} would go out of stamp order",
+				);
+
+				self.slots[old_tail as usize].next = slot;
+				self.slots[slot as usize].prev = old_tail;
+				self.slow_buckets.get_mut(&freq).expect("just read").demoted_tail = slot;
+			},
+
+			Some(_) => {
+				let bucket = self.slow_buckets.get_mut(&freq).expect("just read");
+				bucket.demoted_head = slot;
+				bucket.demoted_tail = slot;
+				self.slots[slot as usize].prev = NIL;
+			},
+
+			None => {
+				self.slow_buckets.insert(freq, Bucket::demoted(slot));
+				self.slots[slot as usize].prev = NIL;
+			},
+		}
+	}
+
+	/// Unlinks `slot` from whichever run of bucket `(tier, freq)` holds it.
+	///
+	/// No tag says which: a slot is in exactly one run, the runs are separately
+	/// `NIL`-ended, and a slot is never `NIL`, so comparing it against all four
+	/// endpoints fixes up exactly the ones it occupies.
 	fn unlink(&mut self, slot: u32, freq: u32, tier: Tier) {
 		let (prev, next) = {
 			let e = &self.slots[slot as usize];
@@ -651,11 +989,13 @@ impl ArenaFrequencyChain {
 			Tier::Slow => &mut self.slow_buckets,
 		};
 
-		if let Some((head, tail)) = buckets.get_mut(&freq) {
-			if *head == slot { *head = next; }
-			if *tail == slot { *tail = prev; }
+		if let Some(bucket) = buckets.get_mut(&freq) {
+			if bucket.head == slot { bucket.head = next; }
+			if bucket.tail == slot { bucket.tail = prev; }
+			if bucket.demoted_head == slot { bucket.demoted_head = next; }
+			if bucket.demoted_tail == slot { bucket.demoted_tail = prev; }
 
-			if *head == NIL {
+			if bucket.is_empty() {
 				buckets.remove(&freq);
 			}
 		}
@@ -1061,6 +1401,251 @@ mod tests {
 		assert_eq!(c.recency_head, NIL);
 		assert_eq!(c.recency_tail, NIL);
 		assert_eq!(c.fast_len() + c.slow_len(), 9);
+	}
+
+	// ── tie order across a tier move ──────────────────────────────────────
+
+	/// Every key left in a slow bucket, in the order `min_key` serves them.
+	fn drain_slow(c: &mut ArenaFrequencyChain) -> Vec<HashedKey> {
+		let mut order = Vec::new();
+		while let Some(k) = c.min_key(Tier::Slow) { order.push(k); c.remove(k); }
+		order
+	}
+
+	/// The defect this fixes, in its smallest form: a key demoted into a slow
+	/// bucket used to be RE-APPENDED at the newest end, so it ranked behind
+	/// slow keys that reached the same count after it did.
+	#[test]
+	fn a_demoted_key_keeps_its_place_among_equal_counts() {
+		let mut c = ArenaFrequencyChain::default();
+		c.insert(1, 10, 0, Tier::Fast);
+		c.insert(2, 10, 0, Tier::Slow);
+		c.insert(3, 10, 0, Tier::Slow);
+
+		let (key, entry) = c.demote_min_fast().unwrap();
+		assert_eq!((key, entry.freq, entry.tier, entry.phys), (1, 1, Some(Tier::Slow), Some(Tier::Slow)));
+		assert_eq!((c.fast_len(), c.slow_len()), (0, 3));
+
+		assert_eq!(
+			drain_slow(&mut c), vec![1, 2, 3],
+			"1 reached count 1 before 2 and 3 did, so it leaves first -- a \
+			 re-append would have made it last",
+		);
+	}
+
+	/// ...and it is an ORDER, not "demoted keys first": a key that reached its
+	/// count after some slow keys did waits behind them.
+	#[test]
+	fn a_demoted_key_newer_than_the_slow_residents_waits_behind_them() {
+		let mut c = ArenaFrequencyChain::default();
+		c.insert(1, 10, 0, Tier::Slow);
+		c.insert(2, 10, 0, Tier::Fast);
+		c.insert(3, 10, 0, Tier::Fast);
+		c.insert(4, 10, 0, Tier::Slow);
+
+		assert_eq!(c.demote_min_fast().map(|(k, _)| k), Some(2));
+		assert_eq!(c.demote_min_fast().map(|(k, _)| k), Some(3));
+		assert_eq!(c.demote_min_fast(), None, "the fast tier is empty");
+
+		assert_eq!(drain_slow(&mut c), vec![1, 2, 3, 4]);
+	}
+
+	/// The promotion path still re-appends, and that is correct: it always
+	/// follows a `bump` of the same key, so the key IS the newest at its count.
+	#[test]
+	fn a_promotion_after_a_bump_is_the_newest_key_at_its_count() {
+		let mut c = ArenaFrequencyChain::default();
+		c.insert(1, 10, 0, Tier::Fast);
+		c.insert(2, 10, 0, Tier::Slow);
+		c.insert(3, 10, 0, Tier::Fast);
+
+		c.bump(1);                      // fast, 1 -> 2
+		c.bump(2);                      // slow, 1 -> 2 ...
+		c.set_tier(2, Tier::Fast);      // ... and promoted, as maybe_promote does
+		c.bump(3);                      // fast, 1 -> 2
+
+		let mut order = Vec::new();
+		while let Some((k, _)) = c.demote_min_fast() { order.push(k); }
+		assert_eq!(order, vec![1, 2, 3], "fast bucket 2 in the order its keys reached it");
+		assert_eq!(drain_slow(&mut c), vec![1, 2, 3], "and demoted in that order");
+	}
+
+	/// The stamp wraps at 2^40; the comparison is by AGE, so a wrap between two
+	/// stamps does not reorder them.
+	#[test]
+	fn the_order_survives_the_clock_wrapping() {
+		let mut c = ArenaFrequencyChain { clock: STAMP_MASK - 1, ..Default::default() };
+
+		c.insert(1, 10, 0, Tier::Slow);   // stamp 2^40 - 1
+		c.insert(2, 10, 0, Tier::Fast);   // stamp 0
+		c.insert(3, 10, 0, Tier::Fast);   // stamp 1
+		c.insert(4, 10, 0, Tier::Slow);   // stamp 2
+
+		assert_eq!(stamp_of(&c.get(1).unwrap()), STAMP_MASK);
+		assert_eq!(stamp_of(&c.get(4).unwrap()), 2, "the clock did wrap");
+
+		c.demote_min_fast();
+		c.demote_min_fast();
+
+		assert_eq!(drain_slow(&mut c), vec![1, 2, 3, 4]);
+	}
+
+	/// The stamp's high byte is `queue`, and the clock carries into it instead
+	/// of wrapping at 2^32 -- which is the whole point of borrowing it.
+	#[test]
+	fn the_stamp_carries_past_thirty_two_bits_into_the_queue_byte() {
+		let mut c = ArenaFrequencyChain { clock: u32::MAX as u64 - 1, ..Default::default() };
+
+		c.insert(1, 10, 0, Tier::Fast);   // stamp 2^32 - 1
+		c.insert(2, 10, 0, Tier::Fast);   // stamp 2^32
+
+		let (one, two) = (c.get(1).unwrap(), c.get(2).unwrap());
+		assert_eq!((one.queue, one.ts), (0, u32::MAX));
+		assert_eq!((two.queue, two.ts), (1, 0), "bit 32 of the stamp is bit 0 of queue");
+
+		// Nothing else about the node moved: the stamp is invisible to every
+		// field a stack reads.
+		assert_eq!((two.freq, two.size, two.tier, two.phys), (1, 10, Some(Tier::Fast), Some(Tier::Fast)));
+
+		c.bump(1);                        // stamp 2^32 + 1, restamped over the old high byte
+		assert_eq!(stamp_of(&c.get(1).unwrap()), (1 << 32) + 1);
+	}
+
+	/// What the 40-bit window buys over the 32-bit one `ts` alone would give.
+	///
+	/// Key 1 is demoted with a stamp taken 2^32 + 49 ticks ago -- the clock is
+	/// moved directly, standing in for four billion touches of other keys. With
+	/// `u32` ages it would alias to 49 ticks old and rank as NEWER than key 2,
+	/// which really is younger (2^32 - 50 ticks); with 40 bits both ages are
+	/// exact.
+	#[test]
+	fn an_age_past_two_to_the_thirty_two_still_orders_exactly() {
+		let mut c = ArenaFrequencyChain::default();
+
+		c.insert(1, 10, 0, Tier::Fast);   // stamp 1
+		c.clock = 99;
+		c.insert(2, 10, 0, Tier::Slow);   // stamp 100
+		c.clock = (1 << 32) + 50;
+
+		assert_eq!(c.demote_min_fast().map(|(k, _)| k), Some(1));
+
+		let (age_1, age_2) = (c.age(1), c.age(100));
+		assert!(age_1 > u32::MAX as u64 && age_2 < u32::MAX as u64);
+		assert!(
+			(age_1 as u32) < age_2 as u32,
+			"the fixture no longer aliases at 32 bits, so it tests nothing",
+		);
+
+		assert_eq!(drain_slow(&mut c), vec![1, 2]);
+	}
+
+	#[test]
+	fn unlinking_from_either_run_keeps_both_runs_intact() {
+		let mut c = ArenaFrequencyChain::default();
+		c.insert(1, 10, 0, Tier::Slow);
+		c.insert(2, 10, 0, Tier::Fast);
+		c.insert(3, 10, 0, Tier::Fast);
+		c.insert(4, 10, 0, Tier::Slow);
+		c.insert(5, 10, 0, Tier::Slow);
+		c.insert(6, 10, 0, Tier::Fast);
+		for _ in 0..3 { c.demote_min_fast().unwrap(); }
+
+		// native run [1, 4, 5], demoted run [2, 3, 6]
+		c.remove(3);                       // middle of the demoted run
+		c.remove(1);                       // head of the native run
+		c.remove(6);                       // tail of the demoted run
+		assert_eq!(c.min_with_count(Tier::Slow), Some((2, 1)));
+
+		c.bump(2);                         // leaves the demoted run for bucket 2
+		assert_eq!(c.min_with_count(Tier::Slow), Some((4, 1)));
+		assert_eq!(drain_slow(&mut c), vec![4, 5, 2]);
+		assert!(c.slow_buckets.is_empty(), "no bucket survives its last key");
+	}
+
+	/// Random streams over the contract `LfuCompactHybridStack` uses -- insert,
+	/// bump, promote (bump then `set_tier(Fast)`), `demote_min_fast`, remove --
+	/// against an oracle that ranks by (count, order of reaching it), which is
+	/// upstream `LfuStack`'s rule within a tier. Three times: from a zero
+	/// clock, from one that carries past 2^32 into the stamp's high byte a few
+	/// thousand steps in, and from one that wraps at 2^40 as soon.
+	#[test]
+	fn every_tier_minimum_matches_an_oracle_ranked_by_when_the_count_was_reached() {
+		use std::collections::{HashMap, hash_map::Entry};
+
+		for start in [0, u32::MAX as u64 - 5_000, STAMP_MASK - 5_000] {
+			let mut c = ArenaFrequencyChain { clock: start, ..Default::default() };
+
+			// key -> (count, tier, sequence number of reaching that count)
+			let mut oracle: HashMap<HashedKey, (u32, Tier, u64)> = HashMap::new();
+			let mut seq = 0u64;
+			let mut next = stream(0xD1B5_4A32_D192_ED03 ^ start);
+
+			let oracle_min = |o: &HashMap<HashedKey, (u32, Tier, u64)>, tier: Tier| -> Option<(HashedKey, u32)> {
+				o.iter()
+					.filter(|entry| (entry.1).1 == tier)
+					.min_by_key(|entry| ((entry.1).0, (entry.1).2))
+					.map(|(&k, &(f, _, _))| (k, f))
+			};
+
+			for step in 0..40_000u32 {
+				let key = next() % KEYS;
+
+				match next() % 8 {
+					0 | 1 => if let Entry::Vacant(vacant) = oracle.entry(key) {
+						let tier = if next().is_multiple_of(2) { Tier::Fast } else { Tier::Slow };
+						c.insert(key, 64, 0, tier);
+						seq += 1;
+						vacant.insert((1, tier, seq));
+					},
+
+					2 | 3 => if let Some(entry) = oracle.get_mut(&key) {
+						c.bump(key);
+						seq += 1;
+						*entry = (entry.0 + 1, entry.1, seq);
+					},
+
+					4 => if let Some(entry) = oracle.get_mut(&key) && entry.1 == Tier::Slow {
+						c.bump(key);
+						c.set_tier(key, Tier::Fast);
+						seq += 1;
+						*entry = (entry.0 + 1, Tier::Fast, seq);
+					},
+
+					5 | 6 => {
+						let want = oracle_min(&oracle, Tier::Fast);
+						assert_eq!(
+							c.demote_min_fast().map(|(k, e)| (k, e.freq)), want,
+							"demotion picked a different key at step {step}",
+						);
+						if let Some((k, _)) = want { oracle.get_mut(&k).unwrap().1 = Tier::Slow; }
+					},
+
+					_ => {
+						assert_eq!(c.remove(key).is_some(), oracle.remove(&key).is_some());
+					},
+				}
+
+				for tier in [Tier::Fast, Tier::Slow] {
+					assert_eq!(
+						c.min_with_count(tier), oracle_min(&oracle, tier),
+						"{tier:?} minimum diverged from the oracle at step {step} (clock start {start})",
+					);
+				}
+
+				// The cross-tier minimum `lfu-global-compact-hybrid` evicts:
+				// one ranking over both tiers, which is only meaningful because
+				// a demotion keeps the stamp.
+				let global = oracle
+					.iter()
+					.min_by_key(|entry| ((entry.1).0, (entry.1).2))
+					.map(|(&k, &(f, t, _))| (k, f, t));
+
+				assert_eq!(
+					c.min_over_both_tiers(), global,
+					"the cross-tier minimum diverged from the oracle at step {step} (clock start {start})",
+				);
+			}
+		}
 	}
 
 	// ── the differential tests ────────────────────────────────────────────

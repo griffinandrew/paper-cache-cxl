@@ -7,8 +7,8 @@ cache moves them between the two as the access pattern changes.
 
 The research question the fork exists to answer is *which eviction discipline makes the best
 use of a small DRAM tier in front of a large CXL tier*. It is answered by running the same
-cache 24 different ways — one `PaperPolicy` variant per design — and measuring them against
-identical traces. Every hybrid build compiles all 24; the design is chosen at runtime, by the
+cache 26 different ways — one `PaperPolicy` variant per design — and measuring them against
+identical traces. Every hybrid build compiles all 26; the design is chosen at runtime, by the
 `PaperPolicy` value handed to the constructor, and is then fixed for that cache's lifetime.
 
 > This crate is a library and is not meant to be used directly by application code; the
@@ -33,7 +33,7 @@ cargo +nightly build --release --features lru_compact_hybrid_cache
 Enabling any one hybrid feature is all you need to get the hybrid API: `lru_compact_hybrid_cache` pulls
 in `key_value_pmem` and `hybrid_cache_common`, and `hybrid_cache_common` pulls in
 `numa_jemalloc`. Naming those explicitly is harmless but redundant. The feature does **not**
-select the design — that is a runtime argument, and any hybrid build hosts all 24.
+select the design — that is a runtime argument, and any hybrid build hosts all 26.
 
 ```rust
 use paper_cache::{PaperCache, CacheTierSize, TieredBuffer, Tier, PaperPolicy};
@@ -79,7 +79,7 @@ into a second map. This is the opposite of the legacy `tiering/` module (see
 [Legacy](#legacy-the-copy-based-tiering-manager)), which deliberately keeps a copy in both
 tiers.
 
-All 24 designs share **one** implementation. There are exactly two inherent
+All 26 designs share **one** implementation. There are exactly two inherent
 `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks — the shared engine, and a second holding the
 size-split design's three-scalar constructor — and both are gated only on `hybrid_cache_common`.
 The per-design behaviour that remains is dispatched at runtime: one `match` over the cache's
@@ -194,10 +194,10 @@ Consequences when interpreting stats:
 
 ## Choosing a design
 
-Seventeen of the 18 are built with the one shared constructor,
+Every design but one is built with the one shared constructor,
 `new(max_size, fast_tier_size, policy)`, where `policy` is the design's `PaperPolicy` variant and
 carries that design's tuning knob in its payload — `PaperPolicy::TwoQCompactHybrid(k_in)`,
-`PaperPolicy::LruLfuCompactHybrid(promote_k)`, and so on. Four variants take no payload.
+`PaperPolicy::LruLfuCompactHybrid(promote_k)`, and so on. Seven variants take no payload.
 
 The size-split design has its own constructor, `new_sized_compact(...)`: it needs three
 sizing scalars rather than one, and it takes no policy argument (it hardcodes
@@ -214,9 +214,24 @@ design and its parameter can come from a config file or a command line with no r
 |---|---|---|
 | `lru_compact_hybrid_cache` | `PaperPolicy::LruCompactHybrid` | One LRU queue, segmented by byte budget |
 | `lfu_compact_hybrid_cache` | `PaperPolicy::LfuCompactHybrid` | Frequency-ordered, admission gated on capacity |
+| `lfu_global_compact_hybrid_cache` | `PaperPolicy::LfuGlobalCompactHybrid` | As `lfu`, but eviction takes the least-frequently-used key from **either** tier, and a credit-limited refill hands evicted DRAM back to tied slow keys |
 | `fifo_compact_hybrid_cache` | `PaperPolicy::FifoCompactHybrid` | Insertion order; no promotion at all |
 | `lru_sized_compact_hybrid_cache` | `PaperPolicy::LruSizedCompactHybrid` — via `new_sized_compact(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold)` | LRU, with each tier's bookkeeping split small/large by object size |
 | `lru_lfu_compact_hybrid_cache` | `PaperPolicy::LruLfuCompactHybrid(promote_k)` | LRU fast tier, LFU slow tier — promotion is a fixed access-count threshold |
+
+**Why there are two LFU hybrids.** `lfu-compact-hybrid` follows the paper: eviction takes the slow
+tier's least-frequently-used key, and only reaches into DRAM when nothing is slow. That shields
+the fast tier — a key that reached count 1 early and was never read again sits in DRAM while
+newer slow keys at the same count are evicted around it — so its victims, and therefore its
+contents and miss ratio, differ from plain LFU's. `PaperPolicy::LfuGlobalCompactHybrid`
+(`"lfu-global-compact-hybrid"`) evicts the global minimum instead, so its victim sequence is
+flat LFU's exactly (checked victim by victim against `LfuCompactStack`) and the tiering changes
+only *where* the kept keys live, not *which* keys are kept; measured on the reference model it
+also wastes fewer demotions. Evicting from DRAM frees room the admission latch keeps new keys out
+of, so it adds a credit-limited refill: a slow key whose hit ties the fast minimum may be promoted
+into free room, up to as many bytes as fast evictions have freed since the last demotion, and never
+past the point where a demotion would follow. It departs from the paper's "evict from the slow tier" rule by design, which is why it is a
+separate policy rather than a change to the first. See `HYBRID_CACHES.md`.
 
 ### 2Q family — a one-access FIFO queue feeding a segmented main queue
 
@@ -308,7 +323,7 @@ contents are deterministic while still exercising the real queue path.
 There is no longer a `scripts/` directory in this repo. The old
 `run_hybrid_benchmark_matrix.sh` rebuilt `paper-benchmark-cxl` once per design, rewriting the
 `features=[...]` line in its `Cargo.toml` between runs — a premise the unification removed. A
-single build now hosts all 24 designs, so a sweep is a loop over `PaperPolicy` values (or over
+single build now hosts all 26 designs, so a sweep is a loop over `PaperPolicy` values (or over
 their string forms, via `FromStr`) with no rebuild between cells.
 
 `paper_cache::jemalloc_stats()` samples allocated/active/resident/mapped/retained at peak,

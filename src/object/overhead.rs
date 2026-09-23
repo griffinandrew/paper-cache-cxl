@@ -249,7 +249,7 @@ pub fn get_policy_overhead(_policy: &PaperPolicy) -> ObjectSize {
 /// B/object, R^2 = 1.000000 on all 43. The split families fit 112.0003 (168.0003
 /// for the split LFU) and have since been REMOVED -- each was proven
 /// behaviourally identical to its compact twin by a differential test, so the
-/// tree keeps only the 72 B/object shape, and the 24 policies that remain here
+/// tree keeps only the 72 B/object shape, and the 26 policies that remain here
 /// are all compact. The
 /// constants below stand unchanged; what was wrong was the hand count in
 /// `get_policy_overhead`, which is why that function now names these constants
@@ -387,6 +387,11 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// of padding `LruPayload` already carried, so the layout is unchanged.
 		PaperPolicy::LruLazyCopyCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 		PaperPolicy::LfuCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
+
+		// The same `LfuCompactHybridStack` over the same `ArenaFrequencyChain`,
+		// so the same term: global eviction is a different victim choice, and
+		// the refill credit is one `CacheSize` per stack, not per object.
+		PaperPolicy::LfuGlobalCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to `LruCompactHybrid`, and deliberately so:
 		// one slab slot plus one index row either way, since a key is in
@@ -1206,6 +1211,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			PaperPolicy::LruCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruLazyCopyCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LfuCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
+			PaperPolicy::LfuGlobalCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruSizedCompactHybrid => LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruLfuCompactHybrid(..) => LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::FifoCompactHybrid => FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
@@ -1437,6 +1443,24 @@ mod shared_overhead_is_feature_independent {
 			);
 		}
 	}
+
+	/// `lfu-global-compact-hybrid` is `LfuCompactHybridStack` with a different
+	/// victim rule, so it must reserve and charge exactly what
+	/// `lfu-compact-hybrid` does -- in every build, whatever the two tables
+	/// resolve to there. A different number would hand one of the two policies
+	/// a different effective fast tier, and a comparison between them would
+	/// measure the budget rather than the eviction rule.
+	#[test]
+	fn the_global_lfu_variant_costs_what_lfu_costs() {
+		assert_eq!(
+			get_hybrid_dram_shared_overhead(&PaperPolicy::LfuGlobalCompactHybrid),
+			get_hybrid_dram_shared_overhead(&PaperPolicy::LfuCompactHybrid),
+		);
+		assert_eq!(
+			get_policy_overhead(&PaperPolicy::LfuGlobalCompactHybrid),
+			get_policy_overhead(&PaperPolicy::LfuCompactHybrid),
+		);
+	}
 }
 
 #[cfg(all(test, feature = "hybrid_cache_common"))]
@@ -1575,6 +1599,7 @@ mod the_two_overhead_tables_agree {
 			PaperPolicy::LruCompactHybrid,
 			PaperPolicy::LruLazyCopyCompactHybrid,
 			PaperPolicy::LfuCompactHybrid,
+			PaperPolicy::LfuGlobalCompactHybrid,
 			PaperPolicy::LruSizedCompactHybrid,
 			PaperPolicy::LruLfuCompactHybrid(2),
 			PaperPolicy::FifoCompactHybrid,
@@ -1633,8 +1658,8 @@ mod the_two_overhead_tables_agree {
 	fn every_hybrid_policy_is_actually_covered() {
 		assert_eq!(
 			every_hybrid_policy().len(),
-			25,
-			"the hybrid policy list has drifted from the 25 arms the two \
+			26,
+			"the hybrid policy list has drifted from the 26 arms the two \
 			 overhead tables carry",
 		);
 	}

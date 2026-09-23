@@ -3,17 +3,17 @@
 This document explains the implementation of separate configuration options for persistent memory (PMEM) placement in PaperCache.
 
 > **Scope note.** The `*_hybrid_cache` sections below are both incomplete and structurally out
-> of date. They cover six of the twenty-four designs, and they describe an architecture that no
+> of date. They cover seven of the twenty-six designs, and they describe an architecture that no
 > longer exists: per-design constructors, per-design `<design>_hybrid_stats()` accessors,
 > per-design impl blocks, and `compile_error!` mutual-exclusion guards. Since the runtime-policy
-> unification, all 24 designs share one implementation, the features are not mutually exclusive,
+> unification, all 26 designs share one implementation, the features are not mutually exclusive,
 > and the design is chosen by the `PaperPolicy` passed to `new()`. See `HYBRID_CACHES.md` for the
 > current picture. Cargo.toml's per-feature comments carry the same stale mutual-exclusion
 > claims.
 >
 > The `all_dram`, `key_value_pmem` and hashtable-placement sections here are still accurate. The
 > `eviction_stacks_pmem` section understates its reach: besides `LfuStack`/`LruStack`, the flag
-> now also relocates all 24 hybrid stacks' lists and entry maps to PMEM.
+> now also relocates every hybrid design's stack lists and entry maps to PMEM.
 
 ## Overview
 
@@ -124,14 +124,19 @@ The implementation provides explicit feature flags to control:
   fixed by making the capacity check explicit at admission time.) Demotion: whenever fast-tier usage
   exceeds the configured byte budget as a result of a *promotion* (see below) or a `resize_fast_tier`
   call, the lowest-frequency fast-tier object is moved to the slow tier (ties within the same
-  frequency break toward whichever key is least-recently-touched, matching the plain `LfuStack`
-  policy's existing convention) — plain admission never triggers this, since it no longer touches
-  the fast chain once that chain is full. Promotion:
+  frequency break toward whichever key is least-recently-touched — under LFU, the key that
+  reached that frequency first — matching the plain `LfuStack` policy's existing convention;
+  the demoted key then KEEPS that standing among the slow keys of its count rather than being
+  re-ranked as their newest arrival) — plain admission never triggers this, since it no longer
+  touches the fast chain once that chain is full. Promotion:
   accessing (`get()`) a slow-tier object bumps its frequency; once that frequency *strictly* exceeds the
   minimum frequency among fast-tier residents, it's promoted back to the fast tier — possibly cascading
   a further demotion. A tie does not promote. Eviction: once the cache's overall `max_size` is exceeded,
   the lowest-frequency *slow-tier* object is evicted (falling back to the fast tier's own minimum if the
-  slow tier happens to be empty), counted in `lfu_hybrid_stats().evictions`. Every promotion/demotion is
+  slow tier happens to be empty), counted in `lfu_hybrid_stats().evictions`. Within a tier, ties at a
+  count are honoured exactly as plain LFU honours them, across promotions and demotions alike; the
+  one deliberate departure from plain LFU's order is the slow-first preference itself, which
+  shields a fast key tied at the slow minimum from eviction. Every promotion/demotion is
   actual data movement, same as `lru_compact_hybrid_cache` — a live object's bytes exist in exactly one tier's
   allocation at a time. TTL survives every tier move unmodified for the same reason (`Object::set_data`
   only ever replaces `data`, never `key` or `expiry`)
@@ -150,6 +155,42 @@ The implementation provides explicit feature flags to control:
   `terminal_eviction_falls_back_to_fast_tier_when_slow_tier_is_empty` test for how to reliably construct
   a "slow tier stays empty" scenario (pace admissions so eviction keeps up, rather than relying on the
   capacity numbers alone)
+
+### `lfu_global_compact_hybrid_cache`
+- **Purpose**: `lfu_compact_hybrid_cache` with GLOBAL eviction — `PaperPolicy::LfuGlobalCompactHybrid`,
+  policy string `"lfu-global-compact-hybrid"`. The victim is the least `(count, stamp)` across **both**
+  tiers, which is plain LFU's victim, so the eviction sequence (and therefore the cache's contents and
+  miss ratio) is flat LFU's exactly; tiering decides only where the kept keys live. A deliberate
+  departure from the paper's "evicted from the slow tier" rule, which is why it is a separate policy and
+  not a change to `lfu_compact_hybrid_cache`
+- **When enabled**: Ungates `tests/lfu_global_compact_hybrid_cache_integration.rs` (which targets the
+  DashMap object store, like the base LFU design's file: under `merged_object_store` its fixture does
+  not hold), the merged store's LFU fidelity tests in `merged_stack.rs`, and the global-LFU case of
+  `tests/merged_object_store_policy_refusal.rs`. Like every hybrid feature it no longer selects code:
+  every hybrid build compiles `PaperPolicy::LfuGlobalCompactHybrid`, and a cache runs it when that
+  policy is passed to `PaperCache::new`
+- **Behavior**: Admission, the admission latch (and its `admission_tier` mirror), strict promotion, the
+  continuous drain-target settle, migrations and both overhead terms are `lfu_compact_hybrid_cache`'s —
+  one stack, `LfuCompactHybridStack`, serves both, built by `new_global`. Two rules differ.
+  (1) **Eviction**: a fast victim is freed where it is — `fast_bytes_used` and `fast_objects` drop, no
+  migration or demotion is recorded, and the latch stays shut. (2) **Credit-limited refill**: the
+  migrating bytes of every fast EVICTION (not of a `del`) are credited; a `get()` or re-`set()` that
+  brings a slow key's count EQUAL to the fast tier's minimum promotes it when there is credit and it
+  covers the key's bytes, and the fast tier stays at or under its drain target including the key's own
+  shared-overhead reservation, so no demotion follows. Every promotion spends credit; any demotion
+  zeroes it; an admission does not touch it, so the credit is a byte budget rather than a claim on the
+  room it was earned in. Without the refill, room evicted from DRAM could stay empty for the rest of a
+  run, because the latch keeps new keys out and a tie cannot promote. Under `merged_object_store` the
+  same rules run on `MergedOrder::Lfu` with the store's `lfu_global` flag set: credit only for the fast
+  victim the eviction nominated and only through `take`, the eviction path's removal (never through
+  `take_if`, the delete and TTL-reaper path), and a nomination is consumed by the first removal of its
+  key, whatever the path
+- **Requirements**: `["key_value_pmem", "hybrid_cache_common"]`, like every hybrid feature, and combinable
+  with all of them
+- **Use case**: LFU's hit ratio with a DRAM tier on top — comparing tiered LFU against flat LFU without the
+  slow-first shield changing which keys are cached. On low-reuse workloads the refill has little to work
+  with (only re-accessed keys can refill), so DRAM can run under-filled after a burst of fast evictions;
+  see `HYBRID_CACHES.md` for the measurements
 
 ### `two_q_compact_hybrid_cache`
 - **Purpose**: Single-instance, segmented-2Q hybrid cache — same one-`PaperCache<K, TieredBuffer>`
@@ -475,6 +516,11 @@ The code uses `#[cfg(...)]` attributes extensively to:
 - **lfu_compact_hybrid_cache (frequency-segmented hybrid)**:
   `src/worker/policy/policy_stack/lfu_compact_hybrid_stack.rs` (`LfuCompactHybridStack` + its
   internal frequency-chain helper), `src/policy.rs` (`PaperPolicy::LfuCompactHybrid`).
+- **lfu_global_compact_hybrid_cache (frequency-segmented hybrid, global eviction)**: the same
+  `LfuCompactHybridStack` (`EvictionScope::Global`, `new_global`) over
+  `ArenaFrequencyChain::min_over_both_tiers`; `src/policy.rs`
+  (`PaperPolicy::LfuGlobalCompactHybrid`); under `merged_object_store`, `src/merged_store.rs`
+  (`lfu_global_victim`, `lfu_maybe_promote`, `refill_credit`).
 - **two_q_compact_hybrid_cache (2Q-segmented hybrid)**:
   `src/worker/policy/policy_stack/two_q_compact_hybrid_stack.rs` (`TwoQCompactHybridStack`),
   `src/policy.rs` (`PaperPolicy::TwoQCompactHybrid(f64)`). Also the source of the
@@ -528,6 +574,9 @@ cargo +nightly test --lib --features lfu_compact_hybrid_cache
 
 # Run lfu_compact_hybrid_cache's PMEM integration tests (requires a second NUMA node)
 cargo +nightly test --test lfu_compact_hybrid_cache_integration --features lfu_compact_hybrid_cache
+
+# Run lfu_global_compact_hybrid_cache's PMEM integration tests (requires a second NUMA node)
+cargo +nightly test --test lfu_global_compact_hybrid_cache_integration --features lfu_global_compact_hybrid_cache
 
 # Check two_q_compact_hybrid_cache (single-instance, 2Q-segmented hybrid cache)
 cargo +nightly check --features two_q_compact_hybrid_cache

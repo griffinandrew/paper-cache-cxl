@@ -78,9 +78,12 @@
 //! it does nothing, which is the same nothing `FifoCompactHybridStack` gets
 //! from not overriding `PolicyStack::update`, under `Clock` it sets a reference
 //! bit and nothing else, and under `Lfu` it bumps a frequency counter and may
-//! promote. A policy whose order the store does not implement is an ERROR: it
-//! is refused, `new` returns `CacheError::PolicyNotImplemented`, and the cache
-//! fails to construct -- see `new`.
+//! promote. `lfu-global-compact-hybrid` runs the `Lfu` order with the store's
+//! global-eviction flag set, which changes the victim `evict_one` nominates and
+//! lets a hit that ties the fast minimum refill DRAM an eviction freed. A
+//! policy whose order the store does not implement is an ERROR: it is refused,
+//! `new` returns `CacheError::PolicyNotImplemented`, and the cache fails to
+//! construct -- see `new`.
 //!
 //! `Clock` is the one that changes the LOCK a hit takes. `Lru` runs
 //! `MergedStore::touch`, which takes the shard WRITE lock to relink -- measured
@@ -199,6 +202,13 @@ impl<K, V> MergedStackHandle<K, V> {
 		let order = MergedOrder::from_policy(&policy)?;
 
 		store.set_order(order);
+
+		// `lfu-global-compact-hybrid` is the LFU order with a different victim
+		// rule and a refill on ties, carried as a flag beside the order rather
+		// than as an order of its own -- see `MergedStore::set_lfu_global_eviction`.
+		// Written for every policy, false included, so the store's scope is
+		// always the one this handle was built for.
+		store.set_lfu_global_eviction(matches!(policy, PaperPolicy::LfuGlobalCompactHybrid));
 
 		Ok(MergedStackHandle { store, policy, order })
 	}
@@ -1632,6 +1642,12 @@ mod clock_order_fidelity {
 /// and demote the way the reference does (tiered, against the hybrid stack).
 /// Folding them together would have meant asserting something false.
 ///
+/// `lfu-global-compact-hybrid` is the exception that proves it: it evicts the
+/// global minimum, so its victims ARE the flat stack's, and its tests --
+/// `global_lfu_matches_the_reference_stack_and_flat_lfu_key_for_key` and
+/// `global_lfu_agrees_with_both_references_over_random_histories` -- check all
+/// three at once, tiered, with capacity eviction interleaved.
+///
 /// # What each ingredient of the sequence is for
 ///
 /// * **A key hit over and over, and a key hit exactly once.** The pair that
@@ -1667,8 +1683,19 @@ mod clock_order_fidelity {
 /// `migrating()` and the reference's raw `size - dram_resident` are the same
 /// number and the accounting cannot drift for a reason unrelated to the order.
 ///
+/// # Gated on either LFU hybrid's feature
+///
+/// The `global_lfu_*` tests here are the merged store's main checks of
+/// `lfu-global-compact-hybrid`, and they share this module's fixture and
+/// builders with the slow-first ones. So the module is un-gated by
+/// `lfu_global_compact_hybrid_cache` as well as by `lfu_compact_hybrid_cache`:
+/// a run that enables only the new design's feature must not skip them.
+///
 /// [`LfuCompactHybridStack`]: super::lfu_compact_hybrid_stack::LfuCompactHybridStack
-#[cfg(all(test, feature = "lfu_compact_hybrid_cache"))]
+#[cfg(all(
+	test,
+	any(feature = "lfu_compact_hybrid_cache", feature = "lfu_global_compact_hybrid_cache"),
+))]
 mod lfu_order_fidelity {
 	use super::*;
 
@@ -1938,8 +1965,15 @@ mod lfu_order_fidelity {
 			PaperPolicy::Lfu,
 			PaperPolicy::LfuCompact,
 			PaperPolicy::LfuCompactHybrid,
+			PaperPolicy::LfuGlobalCompactHybrid,
 		] {
 			let store = Arc::new(Store::new());
+
+			// Pre-set to the wrong answer, so "the handle installed the scope"
+			// is checkable in both directions.
+			let global = policy == PaperPolicy::LfuGlobalCompactHybrid;
+			store.set_lfu_global_eviction(!global);
+
 			let _lfu = Handle::new(store.clone(), policy, 1 << 20)
 				.expect("every lfu spelling is implemented");
 
@@ -1947,6 +1981,11 @@ mod lfu_order_fidelity {
 				store.order(),
 				crate::merged_store::MergedOrder::Lfu,
 				"{policy} did not select the LFU order",
+			);
+
+			assert_eq!(
+				store.lfu_global_eviction(), global,
+				"{policy} installed the wrong eviction scope",
 			);
 		}
 
@@ -1963,6 +2002,320 @@ mod lfu_order_fidelity {
 		}
 	}
 
+	/// The cache holds this many item bytes before the global-eviction tests'
+	/// capacity loop evicts. Chosen on the reference model for this fixture:
+	/// it takes the tier through 30-odd fast evictions, about as many
+	/// demotions and ten refills, where a looser budget evicts almost nothing
+	/// from DRAM and a tighter one leaves nothing to demote.
+	const EVICTION_BUDGET: u64 = 80_000;
+
+	fn build_global() -> (Arc<Store>, Handle, LfuCompactHybridStack) {
+		let store = Arc::new(Store::new());
+		let merged = Handle::new(
+			store.clone(),
+			PaperPolicy::LfuGlobalCompactHybrid,
+			FAST_CAPACITY * 5,
+		)
+		.expect("lfu-global-compact-hybrid is implemented");
+
+		// The same override `build` makes, for the same reason.
+		store.configure_tiering(FAST_CAPACITY, 0, drain_target_ppm(), drain_target_ppm());
+
+		let split = LfuCompactHybridStack::new_global(FAST_CAPACITY);
+
+		(store, merged, split)
+	}
+
+	/// Both structures, and the flat arbiter, have to agree after every step.
+	fn assert_the_tiers_agree(
+		store: &Arc<Store>,
+		split: &LfuCompactHybridStack,
+		keys: &[HashedKey],
+		when: &str,
+	) {
+		for &k in keys {
+			assert_eq!(
+				store.tier_of(k),
+				split.tier_of(k),
+				"{when}: key {k:#018x} is in a different tier in the merged store \
+				 than in the reference LFU stack",
+			);
+		}
+
+		assert_eq!(
+			(store.fast_bytes_used(), store.fast_object_count()),
+			(split.fast_bytes_used(), split.fast_object_count()),
+			"{when}: the fast gauges diverged",
+		);
+		assert_eq!(
+			(store.slow_bytes_used(), store.slow_object_count()),
+			(split.slow_bytes_used(), split.slow_object_count()),
+			"{when}: the slow gauges diverged",
+		);
+		assert_eq!(
+			store.refill_credit(),
+			split.refill_credit(),
+			"{when}: the refill credits diverged",
+		);
+	}
+
+	/// `lfu-global-compact-hybrid` on this module's fixture, with capacity
+	/// eviction INTERLEAVED -- the way `apply_evictions` runs it, whenever the
+	/// cache holds more than `EVICTION_BUDGET` item bytes -- rather than one
+	/// drain at the end, because the refill only exists between evictions.
+	///
+	/// Unlike slow-first LFU (see the module doc), the global variant can be
+	/// checked against all three references at once: its victim IS the flat
+	/// `LfuCompactStack`'s, so every victim the merged store nominates must be
+	/// the one both the split stack and the flat stack take. Tier placement,
+	/// the four gauges and the refill credit must match the split stack after
+	/// every step -- which is what makes the tie branch in `bump` and in
+	/// `insert`'s overwrite arm, and the credit `take` grants a nominated fast
+	/// victim, the same rules as `LfuCompactHybridStack`'s. And every
+	/// mechanism must have fired, or agreeing proved little: victims from both
+	/// tiers, and refills.
+	#[test]
+	fn global_lfu_matches_the_reference_stack_and_flat_lfu_key_for_key() {
+		use std::collections::HashMap;
+
+		let (keys, ops) = sequence();
+		let (store, mut merged, mut split) = build_global();
+		let mut flat = LfuCompactStack::default();
+
+		// key -> (item bytes, count): the test's own record, which decides
+		// when the capacity loop runs and recognises a refill when one fires.
+		let mut live: HashMap<HashedKey, (ObjectSize, u32)> = HashMap::new();
+		let (mut fast_victims, mut slow_victims, mut refills) = (0, 0, 0);
+
+		for (n, &op) in ops.iter().enumerate() {
+			let (key, write) = match op {
+				Op::Insert(key, size) | Op::Overwrite(key, size) => (key, Some(size)),
+				Op::Hit(key) => (key, None),
+			};
+
+			// A hit on a key an earlier step evicted has nothing to hit.
+			if write.is_none() && !live.contains_key(&key) {
+				assert!(
+					!store.contains(key) && !split.contains(key),
+					"step {n}: an evicted key is still present",
+				);
+
+				continue;
+			}
+
+			// Read before the access: a key that was slow, is fast after it,
+			// and reached exactly the fast minimum it saw, was refilled.
+			let was_slow = store.tier_of(key) == Some(Tier::Slow);
+			let fast_min = live
+				.iter()
+				.filter(|&(k, _)| store.tier_of(*k) == Some(Tier::Fast))
+				.map(|(_, &(_, count))| count)
+				.min();
+
+			match write {
+				Some(size) => {
+					let value = vec![0u8; value_len(size) as usize];
+
+					store.insert(key, Object::new(key, &value, None));
+					merged.insert_resident(key, size, 0);
+					split.insert_resident(key, size, 0);
+					flat.insert(key, size);
+
+					let entry = live.entry(key).or_insert((size, 0));
+					*entry = (size, entry.1 + 1);
+				},
+
+				None => {
+					merged.update(key);
+					split.update(key);
+					flat.update(key);
+
+					live.get_mut(&key).expect("checked above").1 += 1;
+				},
+			}
+
+			if was_slow
+				&& store.tier_of(key) == Some(Tier::Fast)
+				&& fast_min == live.get(&key).map(|&(_, count)| count)
+			{
+				refills += 1;
+			}
+
+			while live.values().map(|&(bytes, _)| bytes as u64).sum::<u64>() > EVICTION_BUDGET {
+				let victim = merged.evict_one();
+
+				assert_eq!(
+					victim,
+					split.evict_one(),
+					"step {n}: the merged store and the split stack disagree on the victim",
+				);
+				assert_eq!(
+					victim,
+					flat.evict_one(),
+					"step {n}: the merged store and flat LFU disagree on the victim",
+				);
+
+				let victim = victim.expect("over budget with nothing to evict");
+
+				match store.tier_of(victim) {
+					Some(Tier::Fast) => fast_victims += 1,
+					_ => slow_victims += 1,
+				}
+
+				assert!(store.take(&victim).is_some(), "nominated victim was not present");
+				live.remove(&victim);
+			}
+
+			assert_the_tiers_agree(&store, &split, &keys, &format!("after step {n} ({op:?})"));
+		}
+
+		store.verify_gauges();
+
+		assert!(fast_victims > 0, "no victim came from DRAM, so global eviction is untested");
+		assert!(slow_victims > 0, "no victim came from the slow tier");
+		assert!(refills > 0, "no tie was ever refilled, so the credit is untested");
+		assert!(
+			store.slow_object_count() > 0 && store.fast_object_count() > 0,
+			"the budget demoted everything or nothing, so the order is untested",
+		);
+
+		// And the rest of the order, to the last key, all three ways.
+		loop {
+			let victim = merged.evict_one();
+
+			assert_eq!(victim, split.evict_one(), "the final drains diverged (split)");
+			assert_eq!(victim, flat.evict_one(), "the final drains diverged (flat)");
+
+			let Some(key) = victim else { break };
+			assert!(store.take(&key).is_some(), "nominated victim was not present");
+		}
+
+		assert_eq!(store.len(), 0, "the drain left objects behind");
+	}
+
+	/// The same three-way agreement over random histories: admissions and
+	/// overwrites at five size classes, hits, deletes (the API thread's `take`,
+	/// which must NOT earn refill credit, and the stacks' `remove`), and
+	/// fast-tier resizes both ways, which reopen admission on a grow. Keys
+	/// spread over every shard.
+	#[test]
+	fn global_lfu_agrees_with_both_references_over_random_histories() {
+		use std::collections::HashMap;
+
+		// Exact jemalloc size classes -- `value_len` checks each.
+		const SIZES: [ObjectSize; 5] = [512, 640, 768, 1024, 2048];
+		const KEYS: u64 = 400;
+		const BUDGET: u64 = 120_000;
+
+		for seed in [0x2545_F491_4F6C_DD1D_u64, 0x9E37_79B9_7F4A_7C15, 0xD1B5_4A32_D192_ED03] {
+			let mut state = seed;
+			let mut next = move || {
+				state ^= state << 13;
+				state ^= state >> 7;
+				state ^= state << 17;
+				state
+			};
+
+			let (store, mut merged, mut split) = build_global();
+			let mut flat = LfuCompactStack::default();
+			let mut live: HashMap<HashedKey, ObjectSize> = HashMap::new();
+			let all_keys: Vec<HashedKey> = (0..KEYS).map(mix).collect();
+			let (mut fast_victims, mut demotions) = (0, 0);
+
+			for step in 0..6_000 {
+				// A hot 40 among 400, so counts spread well past 1.
+				let key = match next() % 3 {
+					0 => mix(next() % 40),
+					_ => mix(next() % KEYS),
+				};
+
+				match next() % 16 {
+					0 => {
+						if live.remove(&key).is_some() {
+							assert!(store.take(&key).is_some(), "a live key could not be deleted");
+							merged.remove(key);
+							split.remove(key);
+							flat.remove(key);
+						}
+					},
+
+					1 => {
+						let capacity = 30_000 + next() % 60_000;
+						merged.resize_fast_tier(capacity);
+						split.resize_fast_tier(capacity);
+					},
+
+					2..=6 => {
+						let size = SIZES[(next() % SIZES.len() as u64) as usize];
+						let value = vec![0u8; value_len(size) as usize];
+
+						store.insert(key, Object::new(key, &value, None));
+						merged.insert_resident(key, size, 0);
+						split.insert_resident(key, size, 0);
+						flat.insert(key, size);
+						live.insert(key, size);
+					},
+
+					_ => {
+						if live.contains_key(&key) {
+							merged.update(key);
+							split.update(key);
+							flat.update(key);
+						}
+					},
+				}
+
+				while live.values().map(|&bytes| bytes as u64).sum::<u64>() > BUDGET {
+					let victim = merged.evict_one();
+					let when = format!("seed {seed:#x} step {step}");
+
+					assert_eq!(victim, split.evict_one(), "{when}: merged vs split victim");
+					assert_eq!(victim, flat.evict_one(), "{when}: merged vs flat victim");
+
+					let victim = victim.expect("over budget with nothing to evict");
+
+					if store.tier_of(victim) == Some(Tier::Fast) {
+						fast_victims += 1;
+					}
+
+					assert!(store.take(&victim).is_some(), "nominated victim was not present");
+					live.remove(&victim);
+				}
+
+				merged.drain_tier_migrations();
+				split.drain_tier_migrations();
+				demotions += split.drain_demotions();
+
+				let when = format!("seed {seed:#x} step {step}");
+				assert_the_tiers_agree(&store, &split, &all_keys, &when);
+			}
+
+			store.verify_gauges();
+
+			assert!(fast_victims > 0, "seed {seed:#x}: no victim came from DRAM");
+			assert!(demotions > 0, "seed {seed:#x}: nothing was demoted");
+
+			loop {
+				let victim = merged.evict_one();
+
+				assert_eq!(victim, split.evict_one(), "seed {seed:#x}: final drains diverged (split)");
+				assert_eq!(victim, flat.evict_one(), "seed {seed:#x}: final drains diverged (flat)");
+
+				let Some(key) = victim else { break };
+				assert!(store.take(&key).is_some(), "nominated victim was not present");
+			}
+		}
+	}
+
+	/// Step 3 (the eviction order) compares the two tiered stacks with EACH
+	/// OTHER, so it holds only while they break ties the same way across a tier
+	/// move. The re-append fix therefore lands in `MergedStore` and
+	/// `ArenaFrequencyChain` TOGETHER: with only the merged store fixed -- checked
+	/// by putting `LfuCompactHybridStack::settle_fast_tier` back on the old
+	/// `set_tier` demotion -- this fixture's drain diverges at position 2.
+	/// Steps 1, 2 and 4 are unaffected: the fix moves no key between tiers.
+	/// Whether the shared tie-break is the RIGHT one is
+	/// `a_tiered_drain_is_the_flat_order_split_by_tier`'s job.
 	#[test]
 	fn lfu_matches_the_reference_stack_key_for_key() {
 		let (keys, ops) = sequence();
@@ -2192,5 +2545,85 @@ mod lfu_order_fidelity {
 
 		assert_ne!(merged_order, keys, "eviction order is exactly insertion order");
 		assert_eq!(store.len(), 0, "the drain left objects behind");
+	}
+
+	/// The tie-break under TIERING, against the flat arbiter.
+	///
+	/// A drain evicts without admitting, bumping, promoting or demoting, and
+	/// removing a key never reorders the rest of an LFU order -- so the whole
+	/// drain of a tiered store is fixed by the state it starts from: every slow
+	/// key first (slow-first eviction, the deliberate shield), then every fast
+	/// key, each group in the order the FLAT `LfuCompactStack` holds those same
+	/// keys in. The flat stack saw the same accesses, so it knows every key's
+	/// count and when the key reached it; it has never heard of tiers, so it
+	/// cannot re-rank a key for changing one.
+	///
+	/// This is the property the tier-move re-append broke -- a demoted key was
+	/// restamped as the newest entrant at its count and came out behind slow
+	/// keys the flat stack puts after it; on this fixture the first wrong
+	/// victim was the third -- and the only fidelity check in this module
+	/// whose reference is not `LfuCompactHybridStack`, which shared the bug.
+	#[test]
+	fn a_tiered_drain_is_the_flat_order_split_by_tier() {
+		let (keys, ops) = sequence();
+		let (store, mut merged, _split) = build();
+		let mut flat = LfuCompactStack::default();
+
+		for &op in &ops {
+			match op {
+				Op::Insert(key, size) | Op::Overwrite(key, size) => {
+					store.insert(
+						key,
+						Object::new(key, &vec![0u8; value_len(size) as usize], None),
+					);
+					merged.insert_resident(key, size, 0);
+					flat.insert(key, size);
+				},
+
+				Op::Hit(key) => {
+					merged.update(key);
+					flat.update(key);
+				},
+			}
+		}
+
+		// Both tiers populated -- every promotion's settle, and the LARGE
+		// overwrite near the end, demote count-1 keys that reached count 1
+		// long before the latched admissions sitting beside them in the slow
+		// tier -- or the tie-break across a tier move is not exercised at all.
+		assert!(
+			store.slow_object_count() > 0 && store.fast_object_count() > 0,
+			"the budget demoted everything or nothing, so the order is untested",
+		);
+
+		let tier: std::collections::HashMap<HashedKey, Tier> = keys
+			.iter()
+			.filter_map(|&k| store.tier_of(k).map(|t| (k, t)))
+			.collect();
+
+		let mut flat_order = Vec::new();
+
+		while let Some(k) = flat.evict_one() {
+			flat_order.push(k);
+		}
+
+		let mut expected = Vec::new();
+
+		for want in [Tier::Slow, Tier::Fast] {
+			expected.extend(flat_order.iter().copied().filter(|k| tier[k] == want));
+		}
+
+		let mut drained = Vec::new();
+
+		while let Some(k) = merged.evict_one() {
+			assert!(store.take(&k).is_some(), "nominated victim was not present");
+			drained.push(k);
+		}
+
+		assert_eq!(
+			drained, expected,
+			"the tiered drain is not the flat LFU order split by tier -- a tier \
+			 move re-ranked a key among its equals",
+		);
 	}
 }

@@ -7,14 +7,14 @@
 
 //! Where each hybrid design's admission rule lives.
 //!
-//! All 24 `TieredBuffer`-based designs share the two
+//! All 26 `TieredBuffer`-based designs share the two
 //! `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks in `lib.rs`, gated only
 //! on `hybrid_cache_common`. The one thing that still genuinely differs
 //! between them on the `set()` path is which tier a value is built in, so
 //! that is all this module holds: [`admission_tier`], a runtime `match` over
 //! the cache's [`PaperPolicy`] with one arm per design.
 //!
-//! Dispatch is *runtime*, not compile-time. Every hybrid build compiles all 24
+//! Dispatch is *runtime*, not compile-time. Every hybrid build compiles all 26
 //! designs; the policy is chosen when the cache is constructed and stored in
 //! `AtomicStatus`, so two caches in one process can run different designs.
 //! An earlier revision dispatched through a `HybridPolicy` trait with one
@@ -78,7 +78,12 @@ pub fn admission_tier<K>(
 		// function to have placed the bytes already). The fast tier then
 		// physically held objects the stack believed were in PMEM, and 63% of
 		// promotions were declined as "already in the requested tier".
-		PaperPolicy::LfuCompactHybrid => {
+		//
+		// `LfuGlobalCompactHybrid` shares the contract exactly: its stack has
+		// the same latch and mirrors it the same way, and evicting from DRAM
+		// never reopens it -- a fast victim frees room only a refill
+		// PROMOTION may take, never a brand-new key.
+		PaperPolicy::LfuCompactHybrid | PaperPolicy::LfuGlobalCompactHybrid => {
 			match objects.get_ref(&hashed_key) {
 				Some(object) => match object.value().is_fast() {
 					true => crate::Tier::Fast,

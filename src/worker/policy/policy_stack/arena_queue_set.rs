@@ -156,9 +156,10 @@ use super::arena_index::{KeylessIndex, SlotVec, U32Vec, new_slot_vec, new_u32_ve
 ///
 /// Policies differ in which fields they read, not in which they have: a pure
 /// recency stack never touches `freq` or `ts`, an LFU-style one never touches
-/// `queue`, and a flat stack never touches `tier`. Carrying the union costs
-/// eight bytes over the per-policy payloads it replaces and removes the reason
-/// each policy needed its own queue set.
+/// `queue` as a queue (the frequency chain borrows it, with `ts`, for a
+/// last-touch stamp), and a flat stack never touches `tier`. Carrying the
+/// union costs eight bytes over the per-policy payloads it replaces and
+/// removes the reason each policy needed its own queue set.
 ///
 /// Sixteen bytes, which with the slot's key and links is a 32-byte node:
 ///
@@ -184,22 +185,36 @@ pub struct NodePayload {
 	/// simply do not use the range.
 	pub freq: u32,
 
-	/// A COARSE AGING EPOCH, and deliberately not a recency order.
+	/// A WRAPPING stamp, and deliberately not a recency order.
 	///
 	/// Recency is `prev`/`next`; this is for policies that age or decay on a
 	/// window. `u32` is safe for that because wrapping is harmless below 2^31,
 	/// the same argument `GhostFilter::inserted_at` rests on. It must never be
-	/// used as an ordering key: `MergedStore::Slot::last_access` was a `u32`
+	/// used as an ordering key for a STRUCTURE -- nothing may be sorted, placed
+	/// or unlinked by comparing it: `MergedStore::Slot::last_access` was a `u32`
 	/// wrapping difference and had to be widened to `u64` for a silent
 	/// corruption reachable on a 306M-record replay.
 	///
-	/// No stack reads it today. It is here because the node is meant to be the
-	/// one shape every policy shares, and an aging policy that had to add a
-	/// field would defeat that.
+	/// One reader, within that rule: `ArenaFrequencyChain` keeps a 40-bit
+	/// last-touch stamp in this field (the low 32 bits) and `queue` (the high
+	/// 8), written on every `insert` and `bump`, and compares two stamps -- as
+	/// ages, `(clock - stamp) mod 2^40`, exact below 2^40 (about 1.1e12)
+	/// ticks -- only to choose which of two HEADS is older: a bucket's two run
+	/// heads, or, for `lfu-global-compact-hybrid`'s victim, the two tiers'
+	/// minimum heads. The runs are ordered by construction, so a stamp past the
+	/// window can misrank one key against an equal-count peer -- in its own
+	/// bucket or across the tiers -- but cannot corrupt anything. This
+	/// field alone would have given a 2^32 window, which a long-lived cache can
+	/// outrun in a few passes of the largest trace; hence the borrowed byte.
+	/// Every other stack writes zero and never reads it.
 	pub ts: u32,
 
 	/// Which queue this key is in, for the multi-queue policies. Zero for the
 	/// single-queue ones, which never read it.
+	///
+	/// `ArenaFrequencyChain` has no queues and never reads this AS one: its
+	/// nodes live on its own slab, never an `ArenaQueueSet`'s, and it uses the
+	/// byte as the high 8 bits of the last-touch stamp described under `ts`.
 	pub queue: u8,
 
 	/// Which tier the POLICY believes this object is in. Distinct from the

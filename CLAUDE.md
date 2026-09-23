@@ -920,6 +920,30 @@ evictions counted) all carry over unchanged; only the tier-membership *rule* dif
    either fits in fast or is routed directly to slow, deterministically, regardless of any
    existing resident's frequency or recency.
 
+   **The tie order is honoured across tier moves, with one deliberate exception.** Under LFU a
+   key's last touch is the moment it *reached* its current count, so "least-recently-touched
+   among equal counts" is upstream `LfuStack`'s rule exactly — and a tier move changes a key's
+   tier, not its count, so it must not change its standing. Promotion always complied: it
+   immediately follows the bump that made the key the newest at its count. Demotion did not,
+   in both the tiered stack (`ArenaFrequencyChain::set_tier` from `settle_fast_tier`) and the
+   merged store's LFU order (`Inner::demote_freq_min`, which restamped `last_access`): the
+   demoted key was **re-appended** at the newest end of its slow bucket, so it outlived slow keys
+   that reached the same count after it. Fixed in both at once — `merged_stack.rs`'s
+   `lfu_matches_the_reference_stack_key_for_key` compares their eviction orders key for key, so
+   neither can move alone. Each slow bucket now holds two stamp-sorted runs: keys that arrived
+   by access (stamped now) and keys demoted into it (keeping their original stamp, and
+   arriving in stamp order because a demotion always takes the oldest key of the fast minimum
+   bucket). The bucket's oldest key is the older of the two run heads: O(1), no walk, 0
+   B/object — `ArenaFrequencyChain` keeps a 40-bit stamp in `NodePayload::ts` plus the
+   `queue` byte it never used, and the merged slot already had a `u64` `last_access`. Pinned
+   by `a_tiered_drain_is_the_flat_order_split_by_tier` in both `lfu_compact_hybrid_stack.rs`
+   and `merged_stack.rs`: a tiered drain must equal the flat `LfuCompactStack`'s order over
+   the same history, split by tier. **The exception is the slow-first shield:** `evict_one`
+   takes the slow tier's minimum whenever the slow tier is non-empty, so a fast key tied at
+   that count outlives a slow key that reached it later. That is the tiering itself, not a
+   tie-break, and is intended. (`lfu-global-compact-hybrid`, below, is the same design without
+   the shield, as a separate policy.)
+
 ### Implementation
 
 **New policy: `PaperPolicy::LfuHybrid`** (`policy.rs`), string form `"lfu-hybrid"`, a bare
@@ -1195,6 +1219,65 @@ assertion that re-setting an existing fast key stays fast (the `is_new` guard).
   small/huge object sizes (same caveat noted for `lru_hybrid_cache` above — the implementation
   already returns a `Vec` of migrations per call, so this is handled, just not yet exercised by a
   test with deliberately varied sizes).
+
+## Feature: `lfu_global_compact_hybrid_cache` — LFU with global eviction, a separate policy by design
+
+`PaperPolicy::LfuGlobalCompactHybrid`, `"lfu-global-compact-hybrid"`. Added ALONGSIDE
+`LfuCompactHybrid`, not in place of it.
+
+**The decision.** The paper's LFU rule is "the least frequently accessed object is evicted from
+the slow tier", and `lfu-compact-hybrid` implements it: slow first, fast only when nothing is slow.
+That shields DRAM — a fast key that reached count 1 early and was never read again outlives newer
+slow keys at the same count — so the tiered cache keeps different keys than plain LFU and reports a
+different miss ratio. This policy evicts the global minimum `(count, stamp)` across both tiers
+instead, which makes its victim sequence plain LFU's exactly. That DEPARTS from the paper's eviction
+rule on purpose, which is why it is its own policy and the paper-faithful one is untouched
+(`eviction_prefers_slow_and_falls_back_to_fast` still pins it).
+
+**Why it is exact.** It needs the tie-order fix recorded under design decision 4 above: with a demotion
+keeping its stamp, every live key's stamp means "reached its current count at", in either tier, so
+the two tiers' minima are comparable and the lesser is LFU's victim. Tier moves change neither count
+nor stamp, so tiering decides only where kept keys live.
+
+**The refill, and why it is credit-limited.** Evicting from DRAM frees room that nothing refills:
+the latch keeps new keys out, and a slow key tied with the fast minimum cannot promote under the
+strict rule. The reference model left DRAM holding one object for a whole run. So fast EVICTIONS
+(not deletes) earn credit; a hit or overwrite that brings a slow key's count EQUAL to the fast
+minimum promotes it if there is credit and it covers the key's bytes, and the tier stays at or under
+the drain target with its own reservation (no demotion follows); every promotion spends credit; any
+demotion zeroes it. The latch, admission, strict promotion and the settle are unchanged. The credit
+is a BYTE BUDGET, not a claim on the room it was earned in: an admission never spends it, so after a
+latch-open admission takes evicted room, leftover credit can pay for a refill into room a delete
+freed. That is the reference model's (`lfu_gp.py`) rule, which every measurement was taken on, and
+it is pinned by `the_credit_is_a_byte_budget_not_a_claim_on_the_room_it_came_from`; spending credit
+on admissions too would be a policy change, needing the model rerun and the golden trace
+regenerated. Likewise, every promotion spends credit (the model's rule), not only tie refills. An unlimited tie rule was
+measured and rejected: it mostly filled post-demotion slack and cost +59% promotions / +64%
+demotions for +0.37 pp fast-hit share.
+
+**Where it lives.** One stack serves both LFU policies: `LfuCompactHybridStack` with an
+`EvictionScope` (`new` = slow-first, `new_global` = global + refill), victim via
+`ArenaFrequencyChain::min_over_both_tiers`. The merged store runs it as `MergedOrder::Lfu` plus an
+`lfu_global` flag set in `MergedStackHandle::new` — a flag rather than a fifth `MergedOrder`, because
+every `== MergedOrder::Lfu` site guards the bucket chains and a missed site would corrupt silently.
+There the credit is an atomic, granted only by `take` (the eviction path's removal; `take_if`, the
+API delete's and TTL reaper's, never grants it) and only for the fast key `lfu_global_victim`
+nominated; the first removal of the nominated key, by any path and in either tier, consumes the
+nomination, so it cannot outlive its key and credit a later delete. The tie branch is
+`lfu_maybe_promote`, shared by `bump` and `insert`'s overwrite arm.
+
+**Pinned by** `the_global_scope_evicts_exactly_what_flat_lfu_evicts` (victim-by-victim against flat
+`LfuCompactStack`), the refill unit tests beside it, a golden trace from the Python model
+(`the_refill_matches_the_reference_model_step_for_step`), the merged store's three-way fidelity tests
+(split stack, merged store, flat stack, capacity eviction interleaved), and
+`tests/lfu_global_compact_hybrid_cache_integration.rs`. Measurements are in `HYBRID_CACHES.md`.
+
+**A pre-existing race this surfaced (not fixed here).** When the API thread gets further ahead of
+the policy worker than the whole cache holds, `apply_evictions` exhausts the stack, falls back to
+`erase(None)` (`ERASE_FALLBACK`) and removes map entries whose `Set` events are still queued; the
+stack then admits them, and tracks keys the map no longer has. Seen with `lfu-compact-hybrid` and
+`lru-compact-hybrid` alike (the excess equalled the fallback count exactly), so it is a worker
+property, not an LFU one. The new integration test paces its churn to stay clear of it.
 
 ## Feature: `two_q_hybrid_cache` (implemented — mirrors `lru_hybrid_cache`/`lfu_hybrid_cache`)
 

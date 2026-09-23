@@ -61,6 +61,16 @@ pub enum PaperPolicy {
 	/// see `LruLazyCopyCompactHybridStack`.
 	LruLazyCopyCompactHybrid,
 	LfuCompactHybrid,
+
+	/// `LfuCompactHybrid` with GLOBAL eviction: the victim is the minimum
+	/// `(count, stamp)` across both tiers -- upstream LFU's victim -- instead
+	/// of the slow tier's minimum first, plus a credit-limited refill that
+	/// lets a slow key tied with the fast minimum take back DRAM room an
+	/// eviction freed. Admission, the latch, strict promotion and the settle
+	/// are `LfuCompactHybrid`'s. A separate policy, not a change to that one,
+	/// because it departs from the paper's "evict from the slow tier" rule.
+	/// `lfu-global-compact-hybrid`; see `LfuCompactHybridStack`'s module doc.
+	LfuGlobalCompactHybrid,
 	TwoQCompactHybrid(f64),
 	TwoQFastAdmissionCompactHybrid(f64),
 	TwoQFastAdmissionReprieveCompactHybrid(f64),
@@ -120,7 +130,7 @@ impl PaperPolicy {
 	/// Whether this policy is one of the tiered (hybrid) designs.
 	#[must_use]
 	pub fn is_hybrid(&self) -> bool {
-		matches!(self, PaperPolicy::FifoCompactHybrid { .. } | PaperPolicy::ClockCompactHybrid { .. } | PaperPolicy::LfuCompactHybrid { .. } | PaperPolicy::LruCompactHybrid { .. } | PaperPolicy::LruLazyCopyCompactHybrid { .. } | PaperPolicy::LruLfuCompactHybrid { .. } | PaperPolicy::LruSizedCompactHybrid { .. } | PaperPolicy::S3FifoGhostCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid { .. } | PaperPolicy::S3FifoCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQGhostCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulReprieveCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQCompactHybrid { .. })
+		matches!(self, PaperPolicy::FifoCompactHybrid { .. } | PaperPolicy::ClockCompactHybrid { .. } | PaperPolicy::LfuCompactHybrid { .. } | PaperPolicy::LfuGlobalCompactHybrid | PaperPolicy::LruCompactHybrid { .. } | PaperPolicy::LruLazyCopyCompactHybrid { .. } | PaperPolicy::LruLfuCompactHybrid { .. } | PaperPolicy::LruSizedCompactHybrid { .. } | PaperPolicy::S3FifoGhostCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid { .. } | PaperPolicy::S3FifoCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQGhostCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulReprieveCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQCompactHybrid { .. })
 	}
 
 	pub fn is_auto(&self) -> bool {
@@ -159,6 +169,7 @@ impl Display for PaperPolicy {
 			PaperPolicy::LruCompactHybrid => write!(f, "lru-compact-hybrid"),
 			PaperPolicy::LruLazyCopyCompactHybrid => write!(f, "lru-lazy-copy-compact-hybrid"),
 			PaperPolicy::LfuCompactHybrid => write!(f, "lfu-compact-hybrid"),
+			PaperPolicy::LfuGlobalCompactHybrid => write!(f, "lfu-global-compact-hybrid"),
 			PaperPolicy::LruLfuCompactHybrid(promote_k) => write!(f, "lru-lfu-compact-hybrid-{promote_k}"),
 			PaperPolicy::S3FifoCompactHybrid(ratio) => write!(f, "s3-fifo-compact-hybrid-{ratio}"),
 			PaperPolicy::S3FifoFaithfulCompactHybrid(ratio) => write!(f, "s3-fifo-faithful-compact-hybrid-{ratio}"),
@@ -238,6 +249,7 @@ impl FromStr for PaperPolicy {
 			"lru-compact-hybrid" => PaperPolicy::LruCompactHybrid,
 			"lru-lazy-copy-compact-hybrid" => PaperPolicy::LruLazyCopyCompactHybrid,
 			"lfu-compact-hybrid" => PaperPolicy::LfuCompactHybrid,
+			"lfu-global-compact-hybrid" => PaperPolicy::LfuGlobalCompactHybrid,
 			"fifo-compact-hybrid" => PaperPolicy::FifoCompactHybrid,
 			// Both this and "clock-compact" above are EXACT arms, so neither
 			// can swallow the other however they are ordered -- unlike the
@@ -977,6 +989,33 @@ mod tests {
 			10,
 			"the two lists should account for all ten s3-fifo parsers",
 		);
+	}
+
+	/// The two LFU hybrids are two policies, not one policy and a flag: each
+	/// string parses to its own variant, prints back to itself, deserializes
+	/// the same way, and both are tiered designs. Both are EXACT arms, so
+	/// neither can swallow the other -- but a typo in one would silently run
+	/// the other design, which is what this pins.
+	#[test]
+	fn the_two_lfu_hybrids_round_trip_as_distinct_policies() {
+		for (text, policy) in [
+			("lfu-compact-hybrid", PaperPolicy::LfuCompactHybrid),
+			("lfu-global-compact-hybrid", PaperPolicy::LfuGlobalCompactHybrid),
+		] {
+			assert_eq!(text.parse::<PaperPolicy>(), Ok(policy));
+			assert_eq!(policy.to_string(), text);
+			assert!(policy.is_hybrid(), "{text} is a tiered design");
+
+			let deserialized: PaperPolicy = serde::de::Deserialize::deserialize(
+				serde::de::value::StrDeserializer::<serde::de::value::Error>::new(text),
+			)
+			.expect("a policy string deserializes");
+
+			assert_eq!(deserialized, policy);
+		}
+
+		assert_ne!(PaperPolicy::LfuCompactHybrid, PaperPolicy::LfuGlobalCompactHybrid);
+		assert!("lfu-global-compact-hybrid-0.1".parse::<PaperPolicy>().is_err(), "it takes no parameter");
 	}
 
 	/// The 2Q family deliberately keeps the INCLUSIVE bound. No 2Q stack

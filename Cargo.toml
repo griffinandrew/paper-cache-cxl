@@ -174,9 +174,9 @@ tiering = ["key_pmem_value_pmem", "enable_tiering_manager"]
 multitiering = ["key_pmem_value_pmem", "enable_tiering_manager", "hashtable_tiering"]
 
 # ---------------------------------------------------------------------------
-# The 24 *_hybrid_cache features below are NOT mutually exclusive; any subset
+# The 26 *_hybrid_cache features below are NOT mutually exclusive; any subset
 # may be enabled together. They no longer select a design either -- every hybrid
-# build hosts all 24, and the design is chosen at runtime by the PaperPolicy
+# build hosts all 26, and the design is chosen at runtime by the PaperPolicy
 # passed to PaperCache::new(max_size, fast_tier_size, policy).
 #
 # What enabling one still does: ungates that design's integration-test file, and
@@ -225,6 +225,19 @@ lru_lazy_copy_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # worker/policy/policy_stack/lfu_compact_hybrid_stack.rs for the algorithm.
 #
 lfu_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
+
+# `lfu_compact_hybrid_cache` with GLOBAL eviction: the victim is the least
+# (count, stamp) across BOTH tiers -- upstream LFU's victim -- instead of the
+# slow tier's minimum first, so the eviction sequence is flat LFU's exactly.
+# A fast victim frees DRAM that the latch keeps brand-new keys out of, so a
+# credit-limited REFILL lets a slow key whose hit ties the fast minimum take
+# room back, up to the bytes fast evictions freed. Admission, the latch, strict promotion,
+# the settle and the overheads are `lfu_compact_hybrid_cache`'s; the same
+# `LfuCompactHybridStack` serves both. A separate policy because it departs
+# from the paper's "evict from the slow tier" rule. `lfu-global-compact-hybrid`;
+# see that stack's module doc and HYBRID_CACHES.md.
+#
+lfu_global_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Single-instance, segmented-2Q hybrid cache: same one-PaperCache<K,
 # TieredBuffer> architecture as the LRU/LFU hybrids above, but admission always
@@ -478,7 +491,7 @@ s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_compact_hybrid_cache = 
 # reservation, or fails to compile) whenever that edit is forgotten.
 #
 # It also selects the tier allocator for every hybrid variant: enabling it
-# turns on `numa_jemalloc`, so all 24 designs get NUMA-bound jemalloc arenas
+# turns on `numa_jemalloc`, so all 26 designs get NUMA-bound jemalloc arenas
 # rather than an ordinary unbound heap.
 hybrid_cache_common = ["numa_jemalloc"]
 

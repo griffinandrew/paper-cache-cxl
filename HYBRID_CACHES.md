@@ -1,12 +1,12 @@
 # The hybrid caches
 
-This crate hosts 24 two-tier cache designs, to compare how eviction disciplines use a small DRAM
-tier in front of a large CXL/PMEM tier. Every hybrid build compiles all 24; which one a given
+This crate hosts 26 two-tier cache designs, to compare how eviction disciplines use a small DRAM
+tier in front of a large CXL/PMEM tier. Every hybrid build compiles all 26; which one a given
 cache runs is chosen at construction time by the `PaperPolicy` value passed to the constructor,
 and is fixed for that cache's lifetime. Two caches in one process may run different designs.
 
-This document covers the machinery all 24 share, then each catalogued design individually --
-Part 2 has a written entry for 18 of the 24. For the
+This document covers the machinery all 26 share, then each catalogued design individually --
+Part 2 has a written entry for 19 of the 26. For the
 feature-flag matrix see `FEATURE_FLAGS.md`; for one design end to end in maximum detail see
 `LRU_HYBRID_CACHE.md`.
 
@@ -30,14 +30,14 @@ A live object's bytes exist in **exactly one** tier. Promotion and demotion repl
 `TieredBuffer` in place (`Object::set_data`), so a migration is a byte *move*. Contrast
 `src/tiering/`, the legacy manager, which deliberately keeps a copy in both tiers at once.
 
-All 24 share one implementation. There are exactly two inherent
+All 26 share one implementation. There are exactly two inherent
 `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks — the shared engine, and a second carrying the
 size-split design's three-scalar constructor — both gated only on `hybrid_cache_common`. The
 per-design behaviour that survives is dispatched at runtime: `hybrid_policy::admission_tier`
 matches on the policy to pick a placement, and `init_policy_stack` builds the matching
 `PolicyStack`.
 
-The 24 `*_hybrid_cache` features are consequently **not** mutually exclusive; any subset may be
+The 26 `*_hybrid_cache` features are consequently **not** mutually exclusive; any subset may be
 enabled. Each now gates only its integration-test file and one per-object DRAM-overhead
 accounting term. `lib.rs`'s single `compile_error!` rejects `hashbrown_dram` with
 `global_hashtable_pmem`, unrelated to the designs.
@@ -368,6 +368,22 @@ for its own minimum in O(1) — are the natural fit.
   chain's current minimum (or the fast chain is empty) the key moves to the fast chain,
   **preserving its accumulated frequency** via `insert_at`.
 - **Demotion** — `settle_fast_tier` on the watermark, demoting the fast minimum.
+- **Eviction** — the slow tier's minimum-frequency key, falling back to the fast tier's when
+  nothing is slow.
+
+**Ties are honoured, except for the slow-first shield.** Among equal counts the key that
+*reached* the count first leaves first — plain `LfuStack`'s order (least-recently-touched, since
+under LFU a touch is what moves a key to its count) — in both tiers and across both kinds of
+tier move. Promotion always kept it, because it immediately follows the bump that made the key
+the newest at its count. Demotion once did not: it re-appended the key at the newest end of its
+slow bucket, so it outlived slow keys that reached the same count later. A demoted key now keeps
+its last-touch stamp and joins a second, stamp-sorted run in its slow bucket, and the bucket's
+oldest key is the older of the two run heads — O(1), 0 B/object. The merged store's LFU order
+carries the identical fix. What remains different from plain LFU is deliberate: eviction takes
+the slow minimum whenever anything is slow, so a fast key tied at that count is shielded from a
+slow key that reached it after it did. `a_tiered_drain_is_the_flat_order_split_by_tier` pins
+exactly that: a tiered drain equals the flat `LfuCompactStack` order, slow keys first.
+`lfu_global_compact_hybrid_cache` below is this design without the shield.
 
 **The admission latch.** A raw byte check is not enough to keep admission honouring frequency
 order, because demotion granularity is per-object, not per-byte: demoting a 90-byte object to
@@ -376,6 +392,112 @@ because that slack exists bypasses the "prove yourself via promotion" path entir
 every fast resident already has frequency ≥ 2. So `fast_tier_latched` permanently closes
 brand-new-key fast admission the first time capacity is genuinely reached. It resets on
 `clear()` and on `resize_fast_tier` *growing* the budget.
+
+### `lfu_global_compact_hybrid_cache`
+
+`LfuCompactHybridStack::new_global` · `PaperPolicy::LfuGlobalCompactHybrid` (`"lfu-global-compact-hybrid"`)
+— selected at runtime by passing this policy to `new()`
+
+`lfu_compact_hybrid_cache` with two rules changed and nothing else: admission, the latch, strict
+promotion, the settle, the migrations and both overhead terms are that design's, and one stack
+serves both, told apart by its `EvictionScope`. It is a separate policy because the first change
+departs from the paper's "the least frequently accessed object is evicted from the slow tier" on
+purpose.
+
+- **Eviction** — the least `(count, stamp)` across **both** tiers, not the slow minimum first
+  (`ArenaFrequencyChain::min_over_both_tiers`; equal stamps would go to slow, but no two live keys
+  share one). A fast victim is freed where it lies: the fast byte and object counts drop, no
+  migration is emitted, nothing is counted as a demotion, and the latch stays shut.
+- **Refill** — `refill_credit` gains the migrating bytes of every fast *eviction* (a `del` earns
+  nothing), loses those of every promotion, and is zeroed by any demotion. A hit or overwrite that
+  brings a slow key's count **equal** to the fast minimum promotes it when there is credit and it
+  covers the key's bytes, and the fast tier then stays at or under its drain target, the key's own
+  shared-overhead reservation included, so the settle that follows demotes nothing. Everything else
+  is the strict `>` rule.
+
+**Why the victim is exactly LFU's.** Since the tie-order fix, every live key's stamp is the moment
+it reached its *current* count, whichever tier it is in: a bump stamps it, a promotion restamps it
+with that same bump's clock value, and a demotion keeps it. So the `(count, stamp)` pairs of all live
+keys are one total order — the order plain `LfuStack` keeps (`push_front` on reaching a count,
+`pop_back` to evict). Each tier's bucket map yields that tier's least pair, and the lesser of the
+two is the least overall. A tier move changes neither the count nor the stamp, so promotions,
+demotions and refills reorder nothing: the tiering decides *where* the kept keys live and has no say
+in *which* keys are kept. That is checked victim by victim against the flat `LfuCompactStack` over
+random histories (`the_global_scope_evicts_exactly_what_flat_lfu_evicts`), three ways — split stack,
+merged store, flat stack — with capacity eviction interleaved
+(`global_lfu_matches_the_reference_stack_and_flat_lfu_key_for_key` and its random twin), and step
+for step against a golden trace from the Python reference model. On that model the victim stream
+equalled upstream LFU's in all 252 runs — 144 validation runs and the 108 grid runs below — where
+slow-first's did in 79 of the 108.
+
+The refill cannot break the tiers' own invariant either: it promotes only a key that was just
+re-accessed, at a count the fast tier already holds, so the fast minimum does not move and the slow
+tier's maximum can only fall. Wherever max(slow count) ≤ min(fast count) held under slow-first
+eviction it holds here, and it can fail here only where it already could there — for instance
+right after a budget *grow* reopens admission to brand-new count-1 keys.
+
+**Why the refill exists.** Once admission latches, only a promotion puts a key into DRAM, and a
+promotion needs a count strictly above the fast minimum. Under slow-first eviction nothing else is
+ever needed: fast bytes leave only by demotion, and a demotion is paid for by the promotion that
+caused it. Under global eviction they also leave by eviction, and then nothing refills them — a slow
+key tied with the fast minimum may not promote. On the reference model, a dead startup cohort that
+filled DRAM followed by a working set larger than the slow tier's share left plain global eviction
+holding **one** object in DRAM (0.05% of the budget) for the rest of the run; with the refill it held
+97.7%. The credit limit is what keeps the tie rule away from the sub-object slack every demotion
+leaves: an unconditioned "tie into any room" rule fired mostly there, deferring swaps rather than
+avoiding them — +59% promotions, +64% demotions and 2.8x the wasted promotions of plain global
+eviction, for +0.37 pp of fast-hit share.
+
+The credit is a byte budget, not a claim on particular room. It caps what refills bring in at what
+fast evictions freed since the last demotion, and only promotions and demotions spend it — an
+admission does not. So when the latch is open (before it first shuts, or after a budget grow) a new
+key can be admitted into evicted room without touching the credit, and the credit left over can
+later pay for a refill into room a `del` or a shrinking overwrite freed. That is the reference
+model's rule, on which every measurement here was taken, and it cannot overfill the tier: the room
+test still applies, so no demotion follows. The one deliberate difference from the model: a key that
+migrates zero bytes (its whole size DRAM-resident) cannot refill at zero credit, which the model's
+`bytes <= credit` alone would allow — the model never builds such a key.
+
+**Measured**, on the Python reference models of the three variants (slow-first, global, global +
+refill) over a 108-run grid — nine workloads (Zipf 0.6/0.9/1.2 read- and write-heavy, a
+one-hit-wonder-heavy mix with periodic scans, and shifting working sets), fast tiers of 1/3 and 1/10 of the cache, real
+and zero per-object overheads, three seeds — plus targeted adversarial workloads:
+
+| | slow-first | global | global + refill |
+|---|---|---|---|
+| victim stream equals upstream LFU | 79 / 108 | 108 / 108 | 108 / 108 |
+| miss ratio equals upstream LFU | 86 / 108 | 108 / 108 | 108 / 108 |
+| demotion copies (grid total) | 166,189 | 146,511 | 151,652 |
+| wasted demotions (copied to PMEM, then evicted unread) | 50,911 | 36,420 | 36,420 |
+| fast-hit share of hits | 83.15% | 83.06% | 83.14% |
+| post-latch DRAM utilisation, one-hit-wonder mix, 1/3 fast | 97.6% | 76.2% | 87.0% |
+
+- **Identical contents to LFU**: global eviction is LFU; slow-first's miss ratio differed from LFU's
+  by up to +0.15 pp (one-hit-wonder mix) and −0.06 pp (write-heavy shifting working set).
+- **Fewer wasted demotions**: 28% fewer demotion copies that bought nothing (the key was evicted
+  from PMEM without being read again), because a never-reused fast key is now evicted where it is
+  instead of being copied to PMEM first and evicted from there.
+- **DRAM under-fill without the refill**: 26 of the 36 grid cells never evicted from DRAM at all, and
+  there the three variants were identical. Where it did, a burst of fast evictions took plain global
+  eviction as low as 24% of the fast budget (one-hit-wonder mix) and 38–46% (write-heavy Zipf 0.6),
+  and it took 19k–106k operations to climb back to 95%; with the refill, 5k–68k.
+- **Refill limits on low-reuse workloads**: a refill needs a re-access that ties the fast minimum, so
+  it can only give back as much DRAM as the workload re-reads. On a workload built against it — a
+  DRAM-filling startup cohort re-read rarely, then only one-hit wonders — global eviction held 10% of
+  DRAM in one run, the refill 16%, slow-first 98%; and there slow-first's miss ratio was 0.418 against LFU's
+  0.839, because its shield is itself a policy, and on that workload a better one than LFU. The
+  opposite adversary (a dead cohort then a large working set) made slow-first miss every read (1.000)
+  where LFU missed none: the shield pinned the dead cohort in DRAM.
+
+Under `merged_object_store` the policy runs on `MergedOrder::Lfu` with the store's `lfu_global` flag
+set: the victim is the lexicographic minimum over both mirror arrays (`tails` for slow, `fast_tails`
+for fast), re-chosen if the chosen shard emptied between the lock-free read and the lock; the credit
+is an atomic, granted only by `take` — the eviction path's removal — and only for the fast key the
+victim choice nominated, since `take` is public and may be used to delete; `take_if`, the API
+delete's and the TTL reaper's removal, never grants it. The first removal of the nominated key, by
+any path and in either tier, consumes the nomination, so it cannot outlive its key and credit a later
+delete of it. The tie branch sits in `lfu_maybe_promote`, shared by a hit and an overwrite. Races on
+the credit are tolerated — it decides when a promotion may happen, not how bytes are counted.
 
 ### `fifo_compact_hybrid_cache`
 
@@ -444,7 +566,12 @@ promotion.
 - **Demotion** — the fast LRU tail, **carrying its accumulated frequency** into the slow chain.
 - **Promotion** — a slow object whose frequency *reaches* `promote_k` moves to the fast recency
   head, and its counter **resets**.
-- **Eviction** — the slow chain's minimum-frequency key (ties broken least-recently-touched).
+- **Eviction** — the slow chain's minimum-frequency key. Ties break by order of arrival in the
+  slow bucket, and both a slow hit and a demotion append at its newest end, so a demoted key
+  ranks by when it was *demoted*, not when it was last touched. That is not quite
+  least-recently-touched, and `lfu_compact_hybrid_cache`'s stamp-preserving demotion is not
+  applied here: this design demotes off the recency list, whose face of the chain keeps no
+  stamp.
 
 **`promote_k` is an absolute frequency, not accesses-since-demotion.** This is easy to get wrong
 (this file's own tests did): a key admitted and never accessed demotes carrying frequency 1, so
@@ -769,6 +896,7 @@ arrives as single-object batches.
 |---|---|---|---|---|---|
 | `lru` | recency | recency (same list) | fast | any access or set | — |
 | `lfu` | frequency | frequency | fast until latched | freq > fast min | — |
+| `lfu_global` | frequency | frequency | fast until latched | freq > fast min, or = with refill credit | — |
 | `fifo` | insertion | insertion (same list) | fast | **never** | — |
 | `lru_sized` | recency ×2 | recency ×2 | fast | any access or set | `size_threshold` |
 | `lru_lfu` | recency | **frequency** | fast | freq reaches `promote_k` | `promote_k` |
