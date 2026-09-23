@@ -1169,6 +1169,17 @@ impl<K, V> Inner<K, V> {
 				self.fast_boundary = i;
 			}
 
+			// Queued even when the bytes are already fast, as they are on an
+			// overwrite: `set` builds an LRU value in DRAM before `insert` gets
+			// here, so the consumer will decline this entry. The no-op is the
+			// price of a guarantee. Queued migrations carry no identity --
+			// `apply_migration` acts on whatever object holds the key when it
+			// dequeues -- so a demotion decided for the OLD object and still
+			// queued when the overwrite lands demotes the NEW one, and this
+			// entry, behind it on the key's FIFO consumer, is what restores it.
+			// Skipping it for a physically fast value strands a fresh value in
+			// the slow tier while this slot counts it fast. Pinned by
+			// `merged_overwrite_tests::an_overwrite_is_repromoted_after_a_stale_demotion`.
 			let key = self.slots[i as usize].hashed;
 			self.migrations.push((key, Tier::Fast));
 		}

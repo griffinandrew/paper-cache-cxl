@@ -2908,6 +2908,74 @@ mod migration_queue_tests {
 /// the "did the swap really happen" assertion is now the object's TIER, and
 /// -- for the declined case, where the tier does not change by definition --
 /// its header identity.
+/// The merged store's twin of `lru_compact_hybrid_stack::overwrite_tests`: the
+/// re-promotion `MergedStore::touch_slot` queues on an overwrite of a slow key
+/// is load-bearing even though `set` already built the value in DRAM.
+///
+/// Lives here rather than in `merged_store.rs` because `apply_migration` is
+/// private to this module tree.
+#[cfg(all(test, feature = "merged_object_store", feature = "hybrid_cache_common"))]
+mod merged_overwrite_tests {
+	use std::sync::Arc;
+
+	use super::{Tier, migration_queue::apply_migration};
+	use crate::{
+		HashedKey,
+		merged_store::{MergedOrder, MergedStore},
+		object::Object,
+	};
+
+	const K: HashedKey = 0x51;
+	const A: HashedKey = 0x52;
+
+	fn fresh(key: HashedKey) -> Object<u64, crate::TieredBuffer> {
+		Object::new_in(key, &[0xA5; 256], Tier::Fast, None)
+	}
+
+	/// K is demoted as the LRU tail; that demotion is still queued when an
+	/// overwrite replaces K with a value built in DRAM, so it lands on the NEW
+	/// value. The re-promotion `touch_slot` queues behind it must restore it.
+	#[test]
+	fn an_overwrite_is_repromoted_after_a_stale_demotion() {
+		// `apply_migration` bumps the process-wide migration counters that the
+		// queue tests assert exact deltas on, so this runs under their lock.
+		let _serialised = super::migration_test_lock::lock();
+
+		let objects: crate::ObjectMapRef<u64, crate::TieredBuffer> = Arc::new(MergedStore::new());
+		objects.set_order(MergedOrder::Lru);
+
+		// Measure one object's tier charge untiered, then size the fast tier
+		// to hold exactly one: the second admission demotes the first.
+		objects.insert(K, fresh(K));
+		let one = objects.fast_bytes_used();
+		objects.configure_tiering(2 * one - 1, 0, 1_000_000, 1_000_000);
+		objects.insert(A, fresh(A));
+
+		assert_eq!(objects.tier_of(K), Some(Tier::Slow), "K should be the demoted LRU tail");
+
+		let mut queue = objects.drain_migrations();
+		assert_eq!(queue, vec![(K, Tier::Slow)], "the demotion is decided, not yet applied");
+
+		// The overwrite: an LRU `set` builds the new value in DRAM, then inserts.
+		objects.insert(K, fresh(K));
+		queue.extend(objects.drain_migrations());
+
+		// The key's consumer applies its entries in emission order.
+		for (key, tier) in queue {
+			apply_migration(&objects, key, tier);
+		}
+
+		let physical = objects.get_ref(&K).map(|object| object.value().tier());
+
+		assert_eq!(objects.tier_of(K), Some(Tier::Fast), "an overwrite makes K the most recent key");
+		assert_eq!(
+			physical,
+			Some(Tier::Fast),
+			"K's new value was left in the slow tier while the store counts it fast",
+		);
+	}
+}
+
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod migration_accounting_tests {
 	use super::*;

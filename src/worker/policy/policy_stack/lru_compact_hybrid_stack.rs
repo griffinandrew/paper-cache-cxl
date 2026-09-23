@@ -190,6 +190,16 @@ impl LruCompactHybridStack {
 		// Pushed after settling and guarded on the key still being fast: a
 		// tight budget can demote it straight back out within the same settle,
 		// in which case that call already pushed the correct final entry.
+		//
+		// Pushed even when the bytes are already fast, as they are on a re-`set`
+		// of a slow key: the API thread built the new value in DRAM before this
+		// worker saw the event, so the consumer will decline the entry. It still
+		// has to be queued. Queued migrations carry no identity --
+		// `apply_migration` acts on whatever object holds the key when it
+		// dequeues -- so a demotion this stack decided for the old object, still
+		// queued when the new one replaced it, demotes the new one; this entry,
+		// behind it on the key's FIFO consumer, restores it. Pinned by
+		// `overwrite_tests::an_overwrite_is_repromoted_after_a_stale_demotion`.
 		if promoted && self.list.payload(key).and_then(|p| p.tier) == Some(Tier::Fast) {
 			self.migrations.push((key, Tier::Fast));
 		}
@@ -373,6 +383,79 @@ impl PolicyStack for LruCompactHybridStack {
 
 	fn slow_object_count(&self) -> usize {
 		self.list.len().saturating_sub(self.fast_count)
+	}
+}
+
+/// The re-promotion `touch_fast_key` queues on a re-`set` of a slow key looks
+/// redundant -- the bytes are already in DRAM -- and is not. This replays the
+/// one order in which it is load-bearing, a migration at a time, the way the
+/// key's FIFO consumer would apply them.
+///
+/// Gated on `hybrid_cache_common` for `new_hybrid_object_map`, so it runs over
+/// whichever object map the build selects; the stack is the split LRU stack in
+/// every build.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod overwrite_tests {
+	use super::*;
+	use crate::{object::Object, worker::policy::migration_queue::apply_migration};
+
+	// `MergedStore` has `insert` and `get_ref` of its own; the other maps take
+	// them from the trait.
+	#[cfg(not(feature = "merged_object_store"))]
+	use crate::object_store::ObjectStore;
+
+	const K: HashedKey = 7;
+	const A: HashedKey = 8;
+	const SIZE: ObjectSize = 1_000;
+
+	fn fresh(key: HashedKey) -> Object<u32, crate::TieredBuffer> {
+		Object::new_in(key as u32, &[0xA5; 64], Tier::Fast, None)
+	}
+
+	/// K is demoted as the LRU tail, and that demotion is decided but still
+	/// queued when a re-`set` replaces K with a value built in DRAM. The
+	/// queued demotion then lands on the NEW value, because migrations carry
+	/// no identity; the re-promotion queued behind it must bring it back, or
+	/// K's fresh value sits in the slow tier while the stack counts it fast.
+	#[test]
+	fn an_overwrite_is_repromoted_after_a_stale_demotion() {
+		// `apply_migration` bumps the process-wide migration counters that the
+		// queue tests assert exact deltas on, so this runs under their lock.
+		let _serialised = crate::worker::policy::migration_test_lock::lock();
+
+		let objects: crate::ObjectMapRef<u32, crate::TieredBuffer> = crate::new_hybrid_object_map();
+
+		// Room for one SIZE-byte object: the second admission demotes the first.
+		let mut stack = LruCompactHybridStack::new(2 * SIZE as CacheSize - 1).with_shared_overhead(0);
+
+		for key in [K, A] {
+			objects.insert(key, fresh(key)); // `set`, on the API thread
+			stack.insert_resident(key, SIZE, 0); // its `Set` event, on the worker
+		}
+
+		assert_eq!(stack.tier_of(K), Some(Tier::Slow), "K should be the demoted LRU tail");
+
+		let mut queue = stack.drain_tier_migrations();
+		assert_eq!(queue, vec![(K, Tier::Slow)], "the demotion is decided, not yet applied");
+
+		// The overwrite: an LRU `set` builds the new value in DRAM, then the
+		// worker handles its `Set`.
+		objects.insert(K, fresh(K));
+		stack.insert_resident(K, SIZE, 0);
+		queue.extend(stack.drain_tier_migrations());
+
+		for (key, tier) in queue {
+			apply_migration(&objects, key, tier);
+		}
+
+		let physical = objects.get_ref(&K).map(|object| object.value().tier());
+
+		assert_eq!(stack.tier_of(K), Some(Tier::Fast), "an overwrite makes K the most recent key");
+		assert_eq!(
+			physical,
+			Some(Tier::Fast),
+			"K's new value was left in the slow tier while the stack counts it fast",
+		);
 	}
 }
 
