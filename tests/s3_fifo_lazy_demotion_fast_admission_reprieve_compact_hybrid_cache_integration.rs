@@ -91,6 +91,29 @@ mod hybrid_cache_tests {
 
     const MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+    /// The payload length whose ITEM is exactly 32 bytes under both the
+    /// default layout and `thin_header`.
+    ///
+    /// A tier counter charges an object's own allocation. Under the default
+    /// layout that is `nallocx(len)`; under `thin_header` the length, the
+    /// expiry and the key share it, 16 bytes in front of the value for a `u32`
+    /// key. The demotion-boundary test below is sized against a 32-byte charge, so the payload gives up
+    /// exactly that prefix, and the charge -- with every "one fits, two do
+    /// not" built on it -- is the same in both.
+    ///
+    /// `fused_value` cannot express this charge at all: it also charges the
+    /// key and the expiry to the tier (its `dram_resident_size` is 0), so its
+    /// smallest object here costs 40.
+    const PAYLOAD_LEN: usize =
+        if cfg!(feature = "thin_header") { 16 } else { 32 };
+
+    /// The first `PAYLOAD_LEN` bytes of a 32-byte literal. The literals below
+    /// differ within their first 16 bytes, so each key's value stays
+    /// distinguishable in every layout.
+    fn payload(literal: &'static [u8; 32]) -> &'static [u8] {
+        &literal[..PAYLOAD_LEN]
+    }
+
     #[test]
     fn admission_always_lands_in_fast_tier() {
         ensure_pmem_allocator_warm();
@@ -339,26 +362,29 @@ mod hybrid_cache_tests {
         // succession promotes normally via touch() instead of racing
         // settle_one_access's synchronous reprieve (which would otherwise
         // fire from within the set() event itself, before the get() event
-        // is even processed -- see the module doc). fast_capacity is 61:
-        // that same 41, plus 20 for the MAIN queue's effective budget
+        // is even processed -- see the module doc). fast_capacity is 80:
+        // that same 41, plus 39 for the MAIN queue's effective budget
         // (fast_capacity - one_access_capacity), which is what has to hold
         // exactly ONE object -- the whole point of this test being that the
         // SECOND one forces a demotion decision at the boundary.
         //
-        // 61, not the 80 this used to be: a tier counter is charged only the
-        // bytes that MIGRATE (`S3FifoEntry::migrating` subtracts the key and
-        // the expiry, which are DRAM-resident in either tier), so a 15-byte
-        // payload costs 16 rather than the ~36 of its whole `base_size`. A
-        // main budget of 39 therefore held BOTH keys -- 32 bytes never
-        // crossed the 0.98 high watermark -- so nothing was demoted at all
-        // and key 2 stayed Fast. At 20 the second promotion crosses the
-        // 19-byte high mark, `settle_fast_tier` walks the tail, finds key 1's
-        // reference bit set and reprieves it, and demotes key 2 instead.
+        // The fixture this test's siblings in the midpoint and split-slow
+        // files use: each payload is charged exactly 32 bytes (`payload`), one
+        // fits under the 38-byte high watermark, two do not, and a single
+        // demotion drains back under the 37-byte low one. It used to pair a
+        // 15-byte payload, charged 16, with a 20-byte main budget -- a charge
+        // only the default layout can make. Under `thin_header` the length,
+        // the expiry and the key share the value's allocation, so the
+        // smallest non-empty item is 32 bytes and the first key crossed the
+        // watermark on its own.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
-            CacheTierSize::Bytes(61), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(0.00004)).expect("cache should construct");
+            CacheTierSize::Bytes(80), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(0.00004)).expect("cache should construct");
 
-        cache.set(1u32, b"payload bytes A", None).expect("set should succeed");
+        let first = payload(b"payload bytes A ................");
+        let second = payload(b"payload bytes B ................");
+
+        cache.set(1u32, first, None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
@@ -369,7 +395,7 @@ mod hybrid_cache_tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
 
-        cache.set(2u32, b"payload bytes B", None).expect("set should succeed");
+        cache.set(2u32, second, None).expect("set should succeed");
         cache.get(&2u32).expect("get should succeed");
 
         let demoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&2u32) == Some(Tier::Slow));
@@ -385,8 +411,8 @@ mod hybrid_cache_tests {
         assert_eq!(stats.promotions, promotions_before, "reprieve must not count as a promotion");
         assert_eq!(stats.demotions, demotions_before + 1, "exactly key 2 should have been demoted");
 
-        assert_eq!(cache.get(&1u32).unwrap(), b"payload bytes A");
-        assert_eq!(cache.get(&2u32).unwrap(), b"payload bytes B");
+        assert_eq!(cache.get(&1u32).unwrap(), first);
+        assert_eq!(cache.get(&2u32).unwrap(), second);
     }
 
     #[test]

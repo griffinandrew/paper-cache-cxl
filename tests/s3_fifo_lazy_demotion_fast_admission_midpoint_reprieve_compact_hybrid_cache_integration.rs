@@ -87,6 +87,29 @@ mod hybrid_cache_tests {
 
     const MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+    /// The payload length whose ITEM is exactly 32 bytes under both the
+    /// default layout and `thin_header`.
+    ///
+    /// A tier counter charges an object's own allocation. Under the default
+    /// layout that is `nallocx(len)`; under `thin_header` the length, the
+    /// expiry and the key share it, 16 bytes in front of the value for a `u32`
+    /// key. The budgets below were sized against a 32-byte charge, so the payload gives up
+    /// exactly that prefix, and the charge -- with every "one fits, two do
+    /// not" built on it -- is the same in both.
+    ///
+    /// `fused_value` cannot express this charge at all: it also charges the
+    /// key and the expiry to the tier (its `dram_resident_size` is 0), so its
+    /// smallest object here costs 40.
+    const PAYLOAD_LEN: usize =
+        if cfg!(feature = "thin_header") { 16 } else { 32 };
+
+    /// The first `PAYLOAD_LEN` bytes of a 32-byte literal. The literals below
+    /// differ within their first 16 bytes, so each key's value stays
+    /// distinguishable in every layout.
+    fn payload(literal: &'static [u8; 32]) -> &'static [u8] {
+        &literal[..PAYLOAD_LEN]
+    }
+
     #[test]
     fn admission_always_lands_in_fast_tier() {
         ensure_pmem_allocator_warm();
@@ -127,8 +150,8 @@ mod hybrid_cache_tests {
         // not (64 > 41), which is the pressure this test is about. The
         // `&[u8; 32]` annotation keeps the padding honest: a miscount is a
         // compile error rather than a silently re-broken fixture.
-        let first: &[u8; 32] = b"first value 123 ................";
-        let second: &[u8; 32] = b"second value 45 ................";
+        let first = payload(b"first value 123 ................");
+        let second = payload(b"second value 45 ................");
 
         cache.set(1u32, first, None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
@@ -177,8 +200,8 @@ mod hybrid_cache_tests {
         // one eviction is what runs `check_slow_midpoint()`. The `&[u8; 32]`
         // annotation keeps the padding honest: a miscount is a compile error
         // rather than a silently re-broken fixture.
-        let first: &[u8; 32] = b"first value 123 ................";
-        let second: &[u8; 32] = b"second value 45 ................";
+        let first = payload(b"first value 123 ................");
+        let second = payload(b"second value 45 ................");
 
         cache.set(1u32, first, None).expect("set should succeed");
         cache.set(2u32, second, None).expect("set should succeed");
@@ -310,8 +333,8 @@ mod hybrid_cache_tests {
         // does not. The `&[u8; 32]` annotation keeps the padding honest: a
         // miscount is a compile error rather than a silently re-broken
         // fixture.
-        let first: &[u8; 32] = b"payload bytes A ................";
-        let second: &[u8; 32] = b"payload bytes B ................";
+        let first = payload(b"payload bytes A ................");
+        let second = payload(b"payload bytes B ................");
 
         cache.set(1u32, first, None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -376,8 +399,8 @@ mod hybrid_cache_tests {
         // at the end of this test is counting. The `&[u8; 32]` annotation
         // keeps the padding honest: a miscount is a compile error rather than
         // a silently re-broken fixture.
-        let first: &[u8; 32] = b"payload bytes A ................";
-        let second: &[u8; 32] = b"payload bytes B ................";
+        let first = payload(b"payload bytes A ................");
+        let second = payload(b"payload bytes B ................");
 
         cache.set(1u32, first, None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
@@ -549,8 +572,8 @@ mod hybrid_cache_tests {
         // size class up one fits (32 <= 41) and two do not (64 > 41). The
         // `&[u8; 32]` annotation keeps the padding honest: a miscount is a
         // compile error rather than a silently re-broken fixture.
-        let first: &[u8; 32] = b"first value 123 ................";
-        let second: &[u8; 32] = b"second value 45 ................";
+        let first = payload(b"first value 123 ................");
+        let second = payload(b"second value 45 ................");
 
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();

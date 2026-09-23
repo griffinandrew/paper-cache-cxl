@@ -61,6 +61,16 @@ mod hybrid_cache_tests {
 
     const MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+    /// The value length whose ITEM is exactly 64 bytes in every value layout
+    /// -- the "64 MIGRATING bytes" every figure below is written in. Under the
+    /// default layout that is a 64-byte value. Under `thin_header` the length,
+    /// the expiry and the key share the value's allocation, 16 bytes in front
+    /// of it for a `u32` key, so it is 48; the incoming object's `base_size` is
+    /// 84 either way. (`fused_value` also charges the key and the expiry to the
+    /// tier, so no length reproduces these figures under it.)
+    const VALUE_LEN: usize =
+        if cfg!(feature = "thin_header") { 48 } else { 64 };
+
     // ── sizing ────────────────────────────────────────────────────────────
     //
     // The arithmetic trap this design inherits from
@@ -136,7 +146,7 @@ mod hybrid_cache_tests {
         expect_aged: usize,
     ) -> Vec<u32> {
         for key in 1..=count {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; VALUE_LEN], None).expect("set should succeed");
         }
 
         assert!(
@@ -195,7 +205,7 @@ mod hybrid_cache_tests {
         ).expect("warm-up cache should construct");
 
         for key in 0..16u32 {
-            cache.set(key, &[0u8; 64], None).expect("warm-up set should succeed");
+            cache.set(key, &[0u8; VALUE_LEN], None).expect("warm-up set should succeed");
         }
 
         assert!(
@@ -238,7 +248,7 @@ mod hybrid_cache_tests {
 
         let cache = make_cache();
 
-        cache.set(1u32, &[1u8; 64], None).expect("set should succeed");
+        cache.set(1u32, &[1u8; VALUE_LEN], None).expect("set should succeed");
         cache.get(&1u32).expect("get should hit");
         cache.get(&1u32).expect("second get should hit");
 
@@ -252,7 +262,7 @@ mod hybrid_cache_tests {
         // repeated hits bought it nothing, it demotes like any other unproven
         // object.
         for key in 2..=40u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; VALUE_LEN], None).expect("set should succeed");
         }
 
         assert!(
@@ -278,7 +288,7 @@ mod hybrid_cache_tests {
         ).expect("cache should construct");
 
         for key in 1..=30u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; VALUE_LEN], None).expect("set should succeed");
         }
 
         assert!(
@@ -298,7 +308,7 @@ mod hybrid_cache_tests {
         // back correctly out of PMEM.
         for key in &demoted {
             assert!(cache.has(key), "key {key} aged out of a1_in but should still be cached");
-            assert_eq!(cache.get(key).unwrap(), vec![*key as u8; 64]);
+            assert_eq!(cache.get(key).unwrap(), vec![*key as u8; VALUE_LEN]);
         }
 
         // Nothing left the cache at all.
@@ -320,7 +330,7 @@ mod hybrid_cache_tests {
         ).expect("cache should construct");
 
         for key in 1..=30u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; VALUE_LEN], None).expect("set should succeed");
         }
 
         let mut slow_key = None;
@@ -343,7 +353,7 @@ mod hybrid_cache_tests {
         );
 
         assert!(cache.hybrid_stats().promotions > 0);
-        assert_eq!(cache.get(&slow_key).unwrap(), vec![slow_key as u8; 64]);
+        assert_eq!(cache.get(&slow_key).unwrap(), vec![slow_key as u8; VALUE_LEN]);
     }
 
     // ── capacity eviction is driven by k_out ──────────────────────────────
@@ -361,7 +371,7 @@ mod hybrid_cache_tests {
         ).expect("cache should construct");
 
         for key in 1..=40u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; VALUE_LEN], None).expect("set should succeed");
         }
 
         assert!(
@@ -420,7 +430,7 @@ mod hybrid_cache_tests {
         // Everything after this churns through a1_in into a1_out, which
         // overruns its 500-byte budget; `evict_one` drains a1_out first.
         for key in 4..=40u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; VALUE_LEN], None).expect("set should succeed");
         }
 
         assert!(
@@ -463,7 +473,7 @@ mod hybrid_cache_tests {
             "objects still present should equal admissions minus evictions",
         );
 
-        assert_eq!(cache.get(&1u32).unwrap(), vec![1u8; 64]);
+        assert_eq!(cache.get(&1u32).unwrap(), vec![1u8; VALUE_LEN]);
     }
 
     // ── am behaves like lru_compact_hybrid_cache ──────────────────────────────────
@@ -547,7 +557,7 @@ mod hybrid_cache_tests {
         // byte-for-byte out of PMEM. These gets re-promote, so they come last.
         for key in &demoted {
             assert!(cache.has(key), "a demotion must not drop the object");
-            assert_eq!(cache.get(key).unwrap(), vec![*key as u8; 64]);
+            assert_eq!(cache.get(key).unwrap(), vec![*key as u8; VALUE_LEN]);
         }
 
         assert_eq!(
@@ -570,7 +580,7 @@ mod hybrid_cache_tests {
         ).expect("cache should construct");
 
         for key in 1..=40u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; VALUE_LEN], None).expect("set should succeed");
         }
 
         for key in 1..=40u32 {
@@ -602,10 +612,10 @@ mod hybrid_cache_tests {
 
         let cache = make_cache();
 
-        cache.set(1u32, &[7u8; 64], Some(60)).expect("set with ttl should succeed");
+        cache.set(1u32, &[7u8; VALUE_LEN], Some(60)).expect("set with ttl should succeed");
 
         for key in 2..=40u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; VALUE_LEN], None).expect("set should succeed");
         }
 
         assert!(
@@ -614,7 +624,7 @@ mod hybrid_cache_tests {
         );
 
         assert!(cache.has(&1u32));
-        assert_eq!(cache.get(&1u32).unwrap(), vec![7u8; 64]);
+        assert_eq!(cache.get(&1u32).unwrap(), vec![7u8; VALUE_LEN]);
     }
 
     #[test]
@@ -623,10 +633,10 @@ mod hybrid_cache_tests {
 
         let cache = make_cache();
 
-        cache.set(1u32, &[7u8; 64], Some(1)).expect("set with ttl should succeed");
+        cache.set(1u32, &[7u8; VALUE_LEN], Some(1)).expect("set with ttl should succeed");
 
         for key in 2..=40u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; VALUE_LEN], None).expect("set should succeed");
         }
 
         assert!(
@@ -716,7 +726,7 @@ mod hybrid_cache_tests {
 
         for key in &demoted {
             assert!(cache.has(key), "a demotion must not drop the object");
-            assert_eq!(cache.get(key).unwrap(), vec![*key as u8; 64]);
+            assert_eq!(cache.get(key).unwrap(), vec![*key as u8; VALUE_LEN]);
         }
     }
 
@@ -832,7 +842,7 @@ mod hybrid_cache_tests {
         // the old 819-byte reservation a1_in held twelve of them, so these
         // same 12 sets demoted NOTHING and this wait timed out.
         for key in 1..=12u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; VALUE_LEN], None).expect("set should succeed");
         }
 
         assert!(
@@ -855,7 +865,7 @@ mod hybrid_cache_tests {
         let cache = make_cache();
 
         for key in 1..=20u32 {
-            cache.set(key, &[key as u8; 64], None).expect("set should succeed");
+            cache.set(key, &[key as u8; VALUE_LEN], None).expect("set should succeed");
         }
 
         assert!(
@@ -946,11 +956,11 @@ mod hybrid_cache_tests {
             PaperPolicy::TwoQFullFastAdmissionCompactHybrid(1.0, 0.5),
         ).expect("cache should construct");
 
-        cache.set(1u32, &[1u8; 64], None).expect("set should succeed");
+        cache.set(1u32, &[1u8; VALUE_LEN], None).expect("set should succeed");
 
         // Admission is still fast: it goes into a1_in.
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-        assert_eq!(cache.get(&1u32).unwrap(), vec![1u8; 64]);
+        assert_eq!(cache.get(&1u32).unwrap(), vec![1u8; VALUE_LEN]);
     }
 
     #[test]
