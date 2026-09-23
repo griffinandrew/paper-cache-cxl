@@ -201,6 +201,48 @@ pub mod migration_queue {
 		}
 	}
 
+	/// Test-only rendezvous at the one point a concurrent `ttl()` can still be
+	/// lost: after `migrated_to` has read the expiry and built the copy, before
+	/// the write guard is taken for the swap. Keyed, because `apply_migration`
+	/// runs from every migration test in the process and an unkeyed hook would
+	/// park whichever migration reached it first.
+	#[cfg(test)]
+	pub(crate) mod after_copy {
+		use std::sync::Mutex;
+
+		use crossbeam_channel::{Receiver, Sender, unbounded};
+
+		use crate::HashedKey;
+
+		static PARK: Mutex<Option<(HashedKey, Sender<()>, Receiver<()>)>> = Mutex::new(None);
+
+		/// Arms the rendezvous for `key`: returns (entered, release).
+		pub(crate) fn arm(key: HashedKey) -> (Receiver<()>, Sender<()>) {
+			let (entered_tx, entered_rx) = unbounded();
+			let (release_tx, release_rx) = unbounded();
+
+			*PARK.lock().unwrap() = Some((key, entered_tx, release_rx));
+
+			(entered_rx, release_tx)
+		}
+
+		pub(crate) fn arrive(key: HashedKey) {
+			let armed = {
+				let mut park = PARK.lock().unwrap();
+
+				match park.as_ref() {
+					Some((armed_key, _, _)) if *armed_key == key => park.take(),
+					_ => None,
+				}
+			};
+
+			if let Some((_, entered, release)) = armed {
+				let _ = entered.send(());
+				let _ = release.recv();
+			}
+		}
+	}
+
 	/// Performs one physical tier migration: snapshot, rebuild, swap.
 	///
 	/// Returns `true` if and only if `Object::set_data` actually ran -- the one
@@ -253,11 +295,26 @@ pub mod migration_queue {
 
 		let new_value = old_value.migrated_to(tier);
 
+		#[cfg(test)]
+		after_copy::arrive(key);
+
 		// Check-and-act under one shard write lock: any writer must take the
 		// same lock, so nothing can replace the value between the comparison
 		// and the swap.
 		if let Some(mut object) = objects.get_mut_ref(&key) {
 			if crate::TieredValue::ptr_eq(object.value(), &old_value) {
+				// Carry the LIVE expiry across, here, under the guard.
+				// `migrated_to` read it before the copy with no guard held, so
+				// a `ttl()` that landed during the copy is on the old value
+				// only, and publishing the copy as built would undo it: a TTL
+				// extended mid-copy expires early, a cleared one comes back,
+				// a shortened one outlives its deadline. `ttl()` stores under
+				// this same write guard, so nothing can change the expiry
+				// between this read and the swap, and `new_value` is not yet
+				// published, so the store is private to this thread. (Review
+				// finding values-1 / correctness-lib-4.)
+				new_value.set_expiry(old_value.expiry());
+
 				let superseded = object.set_data(new_value);
 
 				// Unpublished under the write guard. Dropping the handle is
@@ -2705,6 +2762,43 @@ mod migration_queue_tests {
 				let _ = release.recv();
 			}
 		}
+	}
+
+	/// Review finding values-1: a `ttl()` that lands after the copy has read
+	/// the expiry, but before the swap, must survive the swap. Parks the
+	/// migration at exactly that point. The `ParkingKey` hook cannot reach it:
+	/// `migrated_to` clones the key BEFORE it reads the expiry, so a `ttl()`
+	/// made during that park is picked up by the copy anyway.
+	#[test]
+	fn a_ttl_set_while_a_migration_copies_survives_the_swap() {
+		let _serialised = migration_test_lock::lock();
+
+		const KEY: HashedKey = 0xA11C_E5ED;
+
+		let objects: ObjectMapRef<u32, TestBuffer> = crate::new_hybrid_object_map();
+		objects.insert(KEY, Object::new_in(KEY as u32, &[0x11u8; BUFFER_LEN], Tier::Fast, None));
+
+		let (entered, release) = super::migration_queue::after_copy::arm(KEY);
+		let migrating = objects.clone();
+		let migration = std::thread::spawn(move || {
+			super::migration_queue::apply_migration(&migrating, KEY, Tier::Slow)
+		});
+
+		entered
+			.recv_timeout(Duration::from_secs(10))
+			.expect("the migration never reached the post-copy park point");
+
+		// What `PaperCache::ttl` does: under the write guard, set a TTL on the
+		// live object. The copy already read "no TTL".
+		objects.get_mut_ref(&KEY).unwrap().expires(Some(3_600));
+
+		release.send(()).unwrap();
+		assert!(migration.join().unwrap(), "the migration should have been applied");
+
+		let live = objects.get_ref(&KEY).unwrap();
+
+		assert_eq!(live.value().tier(), Tier::Slow, "the migration moved the value");
+		assert!(live.expiry().is_some(), "the TTL set during the copy was lost by the swap");
 	}
 
 	/// A migration computed from a value that was replaced mid-copy must be
