@@ -392,6 +392,8 @@ fn print_row_layout() {
 	println!("LAYOUT ExpireTime               {}", size_of::<crate::object::ExpireTime>());
 	println!("LAYOUT TieredValue<u64>         {}", size_of::<crate::TieredValue<u64>>());
 	println!("LAYOUT ValueHeader<u64>         {}", size_of::<crate::value::ValueHeader<u64>>());
+	#[cfg(feature = "thin_header")]
+	println!("LAYOUT ItemHeader<u64>          {}", size_of::<crate::value::ItemHeader<u64>>());
 	println!("LAYOUT TieredBuffer (ZST shape) {}", size_of::<crate::TieredBuffer>());
 	println!("LAYOUT Object<u64,TieredBuffer> {}", size_of::<Obj>());
 	println!("LAYOUT Option<Object>           {}", size_of::<Option<Obj>>());

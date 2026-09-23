@@ -68,10 +68,13 @@ mod worker;
 ///   in their own allocation, on whichever tier the policy put them.
 /// * `fused_value` -- one allocation holding the count, the metadata, the key
 ///   AND the bytes, tiering as a unit.
+/// * `thin_header` -- a 16-byte DRAM header holding only the count and a
+///   tagged pointer, in front of one tiered item holding the length, the
+///   expiry, the key and the bytes.
 ///
 /// The default is not an accident: see `value.rs`'s "Why the bytes are a
 /// SECOND allocation" for the measurements that chose it.
-#[cfg(not(feature = "fused_value"))]
+#[cfg(not(any(feature = "fused_value", feature = "thin_header")))]
 #[path = "value.rs"]
 pub mod value;
 
@@ -84,9 +87,29 @@ compile_error!(
 	 fast-pool counter would silently read zero"
 );
 
-#[cfg(feature = "fused_value")]
+#[cfg(all(feature = "fused_value", not(feature = "thin_header")))]
 #[path = "value_fused.rs"]
 pub mod value;
+
+#[cfg(feature = "thin_header")]
+#[path = "value_thin.rs"]
+pub mod value;
+
+// Alternative layouts for the same type, and each moves the accounting
+// differently (`object::overhead`), so a silent precedence between them would
+// measure one while the build said the other.
+#[cfg(all(feature = "thin_header", feature = "fused_value"))]
+compile_error!("thin_header and fused_value are alternative value layouts; enable at most one");
+
+// `key_pmem_value_pmem` boxes every key into its own persistent-memory
+// allocation. Under `thin_header` the key's placement IS the layout -- it lives
+// in the item and tiers with it -- so the two would disagree about where every
+// key is.
+#[cfg(all(feature = "thin_header", feature = "key_pmem_value_pmem"))]
+compile_error!(
+	"thin_header stores the key inside the tiered item; it cannot be combined \
+	 with key_pmem_value_pmem"
+);
 
 /// `paper_cache::TieredValue`, alongside `paper_cache::TieredBuffer`.
 pub use crate::value::TieredValue;
@@ -1052,10 +1075,12 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
-		// never dereferences the value allocation: it reads fields that live
-		// INSIDE the object (the key, the expiry, the length, the tag bit),
-		// and the shard guard it holds while doing so is what keeps the object
-		// itself alive. A pin would protect nothing that is read here.
+		// reads the key, the expiry, the length and the tag bit, never the
+		// value's bytes, and the shard guard it holds while doing so keeps the
+		// object -- and through its handle everything those live in -- alive.
+		// A pin would protect nothing that is read here. (Under `thin_header`
+		// the first three are in the tiered item: one remote cache line for a
+		// slow object.)
 		self.objects
 			.get_ref(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
@@ -1182,10 +1207,12 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
-		// never dereferences the value allocation: it reads fields that live
-		// INSIDE the object (the key, the expiry, the length, the tag bit),
-		// and the shard guard it holds while doing so is what keeps the object
-		// itself alive. A pin would protect nothing that is read here.
+		// reads the key, the expiry, the length and the tag bit, never the
+		// value's bytes, and the shard guard it holds while doing so keeps the
+		// object -- and through its handle everything those live in -- alive.
+		// A pin would protect nothing that is read here. (Under `thin_header`
+		// the first three are in the tiered item: one remote cache line for a
+		// slow object.)
 		match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
 				Ok(self.overhead_manager.total_size(&object)),
@@ -1606,10 +1633,12 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
-		// never dereferences the value allocation: it reads fields that live
-		// INSIDE the object (the key, the expiry, the length, the tag bit),
-		// and the shard guard it holds while doing so is what keeps the object
-		// itself alive. A pin would protect nothing that is read here.
+		// reads the key, the expiry, the length and the tag bit, never the
+		// value's bytes, and the shard guard it holds while doing so keeps the
+		// object -- and through its handle everything those live in -- alive.
+		// A pin would protect nothing that is read here. (Under `thin_header`
+		// the first three are in the tiered item: one remote cache line for a
+		// slow object.)
 		self.objects
 			.get_ref(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
@@ -1672,10 +1701,12 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
-		// never dereferences the value allocation: it reads fields that live
-		// INSIDE the object (the key, the expiry, the length, the tag bit),
-		// and the shard guard it holds while doing so is what keeps the object
-		// itself alive. A pin would protect nothing that is read here.
+		// reads the key, the expiry, the length and the tag bit, never the
+		// value's bytes, and the shard guard it holds while doing so keeps the
+		// object -- and through its handle everything those live in -- alive.
+		// A pin would protect nothing that is read here. (Under `thin_header`
+		// the first three are in the tiered item: one remote cache line for a
+		// slow object.)
 		match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
 				Ok(self.overhead_manager.total_size(&object)),
@@ -2560,10 +2591,12 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
-		// never dereferences the value allocation: it reads fields that live
-		// INSIDE the object (the key, the expiry, the length, the tag bit),
-		// and the shard guard it holds while doing so is what keeps the object
-		// itself alive. A pin would protect nothing that is read here.
+		// reads the key, the expiry, the length and the tag bit, never the
+		// value's bytes, and the shard guard it holds while doing so keeps the
+		// object -- and through its handle everything those live in -- alive.
+		// A pin would protect nothing that is read here. (Under `thin_header`
+		// the first three are in the tiered item: one remote cache line for a
+		// slow object.)
 		self.objects
 			.get_ref(&hashed_key)
 			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
@@ -2634,10 +2667,12 @@ where
 		let hashed_key = self.hash_key(key);
 
 		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
-		// never dereferences the value allocation: it reads fields that live
-		// INSIDE the object (the key, the expiry, the length, the tag bit),
-		// and the shard guard it holds while doing so is what keeps the object
-		// itself alive. A pin would protect nothing that is read here.
+		// reads the key, the expiry, the length and the tag bit, never the
+		// value's bytes, and the shard guard it holds while doing so keeps the
+		// object -- and through its handle everything those live in -- alive.
+		// A pin would protect nothing that is read here. (Under `thin_header`
+		// the first three are in the tiered item: one remote cache line for a
+		// slow object.)
 		match self.objects.get_ref(&hashed_key) {
 			Some(object) if object.key_matches(key) && !object.is_expired() =>
 				Ok(self.overhead_manager.total_size(&object)),

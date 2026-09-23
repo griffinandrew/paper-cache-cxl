@@ -58,6 +58,19 @@ impl OverheadManager {
 			return 0;
 		}
 
+		// Under `thin_header` the key and the expiry are NOT in DRAM -- they are
+		// in the item and tier with it -- and this arm is right anyway, because
+		// what callers do with the figure is subtract it. `base_size` counts
+		// them twice there: once as `key_size + 4`, and again inside
+		// `resident_object_bytes`, which rounds `bytes_offset::<K>() + len`.
+		// Taking the first copy off leaves `size - dram_resident` equal to the
+		// item's own allocation, which is exactly what a migration moves and
+		// what `fast_used`/`slow_used` charge. What the object keeps in DRAM
+		// is the row, the 16-byte header and the stack node -- the terms the
+		// per-object reservation names. Which objects the fast tier reserves
+		// them for is the design's business, not this function's: the merged
+		// store reserves for every live object, the DashMap stacks only for
+		// fast ones (`reserved_overhead`).
 		#[cfg(not(feature = "fused_value"))]
 		{
 			let mut resident =
@@ -137,7 +150,8 @@ const DOUBLE_COUNTED_IN_BASE_SIZE: ObjectSize =
 	core::mem::size_of::<crate::HashedKey>() as ObjectSize
 		+ core::mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
 
-/// 40 + 32 - 12 = **60**. Was 80 + 0 - 12 = 68, and 96 + 32 - 12 = 116 before that.
+/// 40 + 32 - 12 = **60**, and 40 + 16 - 12 = 44 under `thin_header`. Was
+/// 80 + 0 - 12 = 68, and 96 + 32 - 12 = 116 before that.
 const OBJECT_MAP_ROW_OVERHEAD: ObjectSize =
 	OBJECT_MAP_ENTRY_OVERHEAD + VALUE_ALLOCATION_OVERHEAD - DOUBLE_COUNTED_IN_BASE_SIZE;
 
@@ -992,15 +1006,25 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EV
 /// item. Split, that 96 is `nallocx(64) = 64` plus this 32. Fused, it is a
 /// single `nallocx(bytes_offset::<u64>() + 64) = nallocx(88) = 96` with no
 /// second allocation anywhere in it. There is nothing here to charge.
-#[cfg(not(feature = "fused_value"))]
+#[cfg(not(any(feature = "fused_value", feature = "thin_header")))]
 const VALUE_ALLOCATION_OVERHEAD: ObjectSize = 32;
 
 /// Under `fused_value` the header shares the value's allocation, so there is no
 /// second allocation to charge for -- see the split-layout constant above for
 /// the measurement. Kept as a named zero rather than deleted, so both overhead
 /// tables still NAME the term and can be read line for line against each other.
-#[cfg(feature = "fused_value")]
+#[cfg(all(feature = "fused_value", not(feature = "thin_header")))]
 const VALUE_ALLOCATION_OVERHEAD: ObjectSize = 0;
+
+/// Under `thin_header` the separate DRAM allocation exists and is half the
+/// split layout's: `triomphe::Arc<ValueHeader<K>>` is an 8-byte strong count
+/// in front of ONE 8-byte tagged item pointer, 16 bytes, jemalloc's 16-byte
+/// class exactly. The length, the expiry and the key moved into the item and
+/// are charged through `resident_object_bytes` instead, as `fused_value`'s
+/// whole header is. Held to the allocator by
+/// `an_object_costs_what_the_accounting_says_it_costs`.
+#[cfg(feature = "thin_header")]
+const VALUE_ALLOCATION_OVERHEAD: ObjectSize = 16;
 
 /// Per-object DRAM cost of the object map (`DashMap<HashedKey, Object>`):
 /// the `(u64, Object{key, value word, len, expiry})` pair -- 8 + 24 = 32 bytes
@@ -1081,19 +1105,24 @@ pub(crate) fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
 }
 
 /// The header bytes that share the VALUE'S OWN allocation: `bytes_offset::<K>()`
-/// under `fused_value`, nothing under the split layout.
+/// under `fused_value` and `thin_header`, nothing under the split layout.
+///
+/// Under `thin_header` that prefix is the length, the expiry and the key; the
+/// count and the item pointer are the separate 16-byte DRAM allocation charged
+/// as `VALUE_ALLOCATION_OVERHEAD`. So both terms are non-zero there, and each
+/// names a different allocation -- the property below still holds per byte.
 ///
 /// Under the split layout the header is its own `Arc` allocation and is charged
 /// as `VALUE_ALLOCATION_OVERHEAD`; under fusing it is a prefix of the item and
 /// is charged here. Exactly one of the two is non-zero in any build, which is
 /// the property that keeps the header from being counted twice or not at all.
-#[cfg(feature = "fused_value")]
+#[cfg(any(feature = "fused_value", feature = "thin_header"))]
 #[inline]
 pub(crate) fn value_header_bytes<K>() -> ObjectSize {
 	crate::value::bytes_offset::<K>() as ObjectSize
 }
 
-#[cfg(not(feature = "fused_value"))]
+#[cfg(not(any(feature = "fused_value", feature = "thin_header")))]
 #[inline]
 pub(crate) fn value_header_bytes<K>() -> ObjectSize {
 	0
@@ -1167,7 +1196,9 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// many objects fit in DRAM. It was 62 + 32 = 94 in every build; it is now
 	// 46 + 32 = 78 split and 46 + 0 = 46 fused, and the fused arm is the one
 	// that was over-reserving twice over -- a stale slot and a header this
-	// build does not separately allocate.
+	// build does not separately allocate. Under `thin_header` it is
+	// 46 + 16 = 62: the header is back, holding only the count and the item
+	// pointer.
 	#[cfg(feature = "merged_object_store")]
 	{
 		let _ = policy;
@@ -1254,7 +1285,9 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 
 	// The value's own allocation costs a DRAM-resident refcounted header
 	// regardless of which tier the bytes themselves occupy -- 32 bytes of
-	// `Arc<ValueHeader<K>>` under the split layout. Under `fused_value` there
+	// `Arc<ValueHeader<K>>` under the split layout, 16 under `thin_header`,
+	// whose header holds only the count and the item pointer. Under
+	// `fused_value` there
 	// is no such allocation and the term is ZERO: the header is a prefix of the
 	// item and travels with it, so it is charged through
 	// `resident_object_bytes` instead, against the tier the item is actually
@@ -1657,6 +1690,8 @@ mod the_two_overhead_tables_agree {
 /// Split, the right-hand side is `nallocx(len) + 32`: the bytes, plus the
 /// `Arc<ValueHeader<K>>` that owns them. Fused, it is
 /// `nallocx(bytes_offset::<K>() + len) + 0`: one item, no second allocation.
+/// Thin (`thin_header`), it is `nallocx(bytes_offset::<K>() + len) + 16`: the
+/// item, plus the count-and-pointer header in DRAM.
 /// A build that gates either term wrongly fails here, and so does one that
 /// rounds the value's LENGTH when the allocation is the length plus a header --
 /// which is what both sides of this identity were doing before.

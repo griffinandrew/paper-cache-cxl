@@ -66,6 +66,12 @@ measured_accounting = []
 # bytes. Built and measured on this branch, then made non-default: see
 # `src/value.rs`'s module doc for the size-class and read-path numbers.
 fused_value = []
+# A 16-byte DRAM header -- the refcount and a tagged pointer, nothing else --
+# in front of ONE tiered item holding the length, the expiry, the key and the
+# bytes. The metadata demotes with the value; the refcount a read bumps stays
+# local. See `src/value_thin.rs`. Excludes `fused_value` and
+# `key_pmem_value_pmem` (compile errors in `src/lib.rs`).
+thin_header = []
 # Serves the tiered cache over a socket. Pulls in `hybrid_cache_common` for the
 # tiering machinery; the caller still picks which hybrid DESIGN to compile, e.g.
 # `--features server,lru_compact_hybrid_cache`.

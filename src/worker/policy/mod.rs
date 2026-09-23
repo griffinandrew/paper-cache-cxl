@@ -295,6 +295,11 @@ pub mod migration_queue {
 
 		let new_value = old_value.migrated_to(tier);
 
+		// The expiry the copy carried, read here -- outside the guard -- so
+		// the swap below only has to compare. `new_value` is private to this
+		// thread, so this cannot change before the swap.
+		let copied_expiry = new_value.expiry();
+
 		#[cfg(test)]
 		after_copy::arrive(key);
 
@@ -313,7 +318,19 @@ pub mod migration_queue {
 				// between this read and the swap, and `new_value` is not yet
 				// published, so the store is private to this thread. (Review
 				// finding values-1 / correctness-lib-4.)
-				new_value.set_expiry(old_value.expiry());
+				//
+				// Stored only when it differs from what the copy carried.
+				// Under `thin_header` the expiry is in the item, and the new
+				// item is on the TARGET tier, so an unconditional store would
+				// be a CXL write under the shard write lock on every
+				// demotion; only a `ttl()` that raced the copy needs one. The
+				// read of the old expiry is still a CXL read on a promotion
+				// there, and that one cannot move: it is the check.
+				let live_expiry = old_value.expiry();
+
+				if live_expiry != copied_expiry {
+					new_value.set_expiry(live_expiry);
+				}
 
 				let superseded = object.set_data(new_value);
 
