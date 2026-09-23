@@ -13,7 +13,9 @@
 //! `malloc`, so glibc's heap, every bindgen'd C library and
 //! all pthread stacks are outside its reach. Covering those needs a *task*
 //! mempolicy -- `numactl --membind=0`, or `set_mempolicy` before any thread is
-//! spawned. [`assert_numa_environment`] reports whether one is in effect.
+//! spawned. Nothing here checks for one; [`assert_numa_environment`] and
+//! [`numa_environment_warnings`] report the kernel settings that bear on
+//! placement.
 //!
 //! # Design notes
 //!
@@ -1446,36 +1448,80 @@ pub static THREADS_BOUND: AtomicU64 = AtomicU64::new(0);
 
 /// Kernel settings that can silently move pages off the node they were bound to.
 ///
-/// Neither failure is observable from inside the process, and both knobs are
-/// writable at runtime, so they are checked rather than assumed. `mbind` binds
+/// The failure is not observable from inside the process, and the knob is
+/// writable at runtime, so it is checked rather than assumed. `mbind` binds
 /// the VMA, but page *migration* is a separate mechanism that operates on
 /// already-placed pages.
+///
+/// Only settings that can move pages bound through these arenas are errors.
+/// `kernel.numa_balancing` used to be one; it cannot, and is now reported by
+/// [`numa_environment_warnings`] instead.
 pub fn assert_numa_environment() -> Result<(), String> {
-	fn read_flag(path: &str) -> Option<i32> {
-		std::fs::read_to_string(path).ok()?.trim().parse().ok()
-	}
-
 	let mut problems = Vec::new();
-
-	if read_flag("/proc/sys/kernel/numa_balancing") == Some(1) {
-		problems.push(
-			"kernel.numa_balancing=1 -- automatic balancing migrates pages between nodes, \
-			 defeating mbind placement"
-				.to_string(),
-		);
-	}
 
 	// A CPU-less node is exactly what the kernel treats as a demotion target,
 	// which makes this the relevant knob for a PMEM/CXL slow tier.
-	if read_flag("/sys/kernel/mm/numa/demotion_enabled") == Some(1) {
+	if sysfs_flag_is_on("/sys/kernel/mm/numa/demotion_enabled") {
 		problems.push(
-			"numa demotion_enabled=1 -- cold pages on node 0 may be demoted to the \
+			"numa demotion_enabled=true -- cold pages on node 0 may be demoted to the \
 			 CPU-less node under pressure"
 				.to_string(),
 		);
 	}
 
 	if problems.is_empty() { Ok(()) } else { Err(problems.join("; ")) }
+}
+
+/// Kernel settings worth reporting that do NOT move pages bound through these
+/// arenas.
+///
+/// `kernel.numa_balancing` (any mode): the balancing scanner skips every VMA
+/// whose mempolicy lacks `MPOL_F_MOF`, and an `mbind(MPOL_BIND)` without
+/// `MPOL_F_NUMA_BALANCING` -- which is how every extent here is bound -- never
+/// sets it. So the arenas' pages stay where they were bound. Measured on
+/// mlsys-03 (kernel 6.8, `numa_balancing=1`): a 128 MiB region bound to node 2
+/// with this module's flags kept all 32,768 pages there through 75 s of access
+/// from node-0 CPUs, while an unbound control region migrated from node 1 to
+/// node 0 in full; and across the unpinned cluster35 matrix runs node 1 never
+/// held more than ~74 MB of a ~16 GB process.
+///
+/// What balancing can still do is migrate memory outside these arenas (glibc's
+/// heap, pthread stacks, `unbound_fallbacks`) and move threads between nodes,
+/// which shows up as timing rather than placement. Pin the process
+/// (`numactl --cpunodebind=0`) when that matters.
+pub fn numa_environment_warnings() -> Vec<String> {
+	let mut warnings = Vec::new();
+
+	let balancing = read_sysfs("/proc/sys/kernel/numa_balancing")
+		.and_then(|value| value.parse::<i32>().ok());
+
+	if let Some(mode) = balancing && mode != 0 {
+		warnings.push(format!(
+			"kernel.numa_balancing={mode} -- does not move pages bound through these \
+			 arenas, but can migrate unbound memory and move threads between nodes"
+		));
+	}
+
+	warnings
+}
+
+/// A sysfs or procfs value, trimmed; `None` when the file is absent or unreadable.
+fn read_sysfs(path: &str) -> Option<String> {
+	Some(std::fs::read_to_string(path).ok()?.trim().to_owned())
+}
+
+/// Whether a boolean kernel knob is on.
+///
+/// Boolean knobs are not spelled consistently: procfs ones read `0`/`1`, but
+/// `/sys/kernel/mm/numa/demotion_enabled` reads `true`/`false`. The check this
+/// replaced parsed an integer, so on the kernels that spell it `true` it could
+/// never fire.
+fn sysfs_flag_is_on(path: &str) -> bool {
+	read_sysfs(path).is_some_and(|value| flag_value_is_on(&value))
+}
+
+fn flag_value_is_on(value: &str) -> bool {
+	matches!(value, "1" | "true" | "y" | "Y" | "yes")
 }
 
 /// Per-node counters, plus the number of allocations that missed the bound
@@ -2018,9 +2064,28 @@ fast_grew={grew_fast} slow_grew={grew_slow} -> on_target={target} elsewhere={oth
 	#[test]
 	fn environment_permits_a_placement_guarantee() {
 		// Not an assertion about our code -- it reports whether the kernel is
-		// configured such that a binding can hold at all.
+		// configured such that a binding can hold at all. Settings that cannot
+		// move bound pages are printed rather than failed; see
+		// `numa_environment_warnings`.
+		for warning in numa_environment_warnings() {
+			eprintln!("numa environment warning: {warning}");
+		}
+
 		if let Err(problems) = assert_numa_environment() {
 			panic!("environment defeats NUMA binding: {problems}");
+		}
+	}
+
+	/// `demotion_enabled` reads `true`/`false` while procfs knobs read `0`/`1`;
+	/// an integer-only parse made the demotion check unable to fire.
+	#[test]
+	fn boolean_knobs_are_read_in_either_spelling() {
+		for on in ["1", "true", "y", "Y", "yes"] {
+			assert!(flag_value_is_on(on), "{on:?} should read as on");
+		}
+
+		for off in ["0", "false", "n", "N", "no", ""] {
+			assert!(!flag_value_is_on(off), "{off:?} should read as off");
 		}
 	}
 
