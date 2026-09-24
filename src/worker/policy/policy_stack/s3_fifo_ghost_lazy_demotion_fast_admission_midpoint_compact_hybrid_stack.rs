@@ -10,7 +10,8 @@
 //! structure where that has three.
 //!
 //! Identical to `S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack` --
-//! the fast-tier one-access queue, the proportionally split shared-metadata
+//! the fast-tier one-access queue, its carve-out clamped to the fast tier
+//! (`raw_one_access_capacity()`), the proportionally split shared-metadata
 //! reservation, the demotion-time reference-bit reprieve, the ghost queue
 //! outside the slab, and the "a promotion out of one-access or a ghost-hit
 //! admission emits NO `Tier::Fast` migration" rule -- plus the single thing
@@ -168,6 +169,11 @@ pub struct S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack {
 	/// middle. One correcting step toward the front per two qualifying events.
 	midpoint_drift: u8,
 
+	/// Whether the last check found `one_access_capacity >= fast_capacity`,
+	/// i.e. the one warning for that crossing has been emitted. See
+	/// [`Self::warn_if_carve_out_fills_fast_tier`].
+	carve_out_fills_fast_tier: bool,
+
 	migrations: Vec<(HashedKey, Tier)>,
 }
 
@@ -193,6 +199,7 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack {
 			main_boundary: None,
 			slow_midpoint: None,
 			midpoint_drift: 0,
+			carve_out_fills_fast_tier: false,
 			migrations: Vec::new(),
 		}
 	}
@@ -212,13 +219,38 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack {
 		self.queues.len() as CacheSize * self.shared_overhead + self.ghost.dram_bytes()
 	}
 
+	/// The one-access queue's carve-out as the FAST TIER can pay for it, before
+	/// the shared-metadata reservation. The same accessor, for the same
+	/// reason, as the non-midpoint stack's `raw_one_access_capacity` -- this
+	/// file was forked from it before that clamp existed and never had it.
+	///
+	/// The `one_access_capacity` field is `one_access_ratio * max_size`: a slice
+	/// of the CACHE budget, which says nothing about how much DRAM this stack
+	/// was given. Every admission lands in the one-access queue and that queue
+	/// is DRAM in this variant, so capping it from the cache budget lets it
+	/// draw DRAM that `fast_capacity` never granted: `raw_main_fast_capacity()`
+	/// saturates to 0 and `needs_capacity_eviction` compares `one_access_used`
+	/// against a cap bigger than the whole tier. Clamping makes the two
+	/// DRAM-resident segments sum to `fast_capacity` instead of to
+	/// `max(fast_capacity, ratio * max_size)`.
+	///
+	/// Computed here rather than clamped where the field is assigned because
+	/// `resize_fast_tier` moves `fast_capacity` at runtime. A pure no-op
+	/// whenever the carve-out already fits -- `min` returns the raw field
+	/// unchanged, equality included.
+	fn raw_one_access_capacity(&self) -> CacheSize {
+		self.one_access_capacity.min(self.fast_capacity)
+	}
+
 	/// The main queue's fast-segment budget *before* the shared-metadata
-	/// reservation -- `fast_capacity` minus the one-access queue's fixed
-	/// carve-out. Kept separate from `effective_main_fast_capacity` so
-	/// `reserved_shares` has a reservation-free capacity to proportion against
-	/// (using the effective one would be circular).
+	/// reservation -- `fast_capacity` minus the one-access queue's carve-out.
+	/// Reads `raw_one_access_capacity()`, which is already clamped to the
+	/// budget, so this stays a genuine remainder. Kept separate from
+	/// `effective_main_fast_capacity` so `reserved_shares` has a
+	/// reservation-free capacity to proportion against (using the effective
+	/// one would be circular).
 	fn raw_main_fast_capacity(&self) -> CacheSize {
-		self.fast_capacity.saturating_sub(self.one_access_capacity)
+		self.fast_capacity.saturating_sub(self.raw_one_access_capacity())
 	}
 
 	/// Splits `reserved_overhead()` proportionally between this stack's two
@@ -230,7 +262,9 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack {
 	fn reserved_shares(&self) -> (CacheSize, CacheSize) {
 		let reserved = self.reserved_overhead();
 
-		let one_access_capacity = self.one_access_capacity;
+		// Both terms are slices of `fast_capacity` -- the first clamped to it,
+		// the second its remainder -- so `total_capacity` IS the fast tier.
+		let one_access_capacity = self.raw_one_access_capacity();
 		let main_capacity = self.raw_main_fast_capacity();
 		let total_capacity = one_access_capacity + main_capacity;
 
@@ -247,17 +281,50 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack {
 
 	/// The one-access queue's own byte cap after giving up its share of the
 	/// shared-metadata reservation. With no reservation wired in this is the
-	/// raw cap.
+	/// raw cap -- `raw_one_access_capacity()`, never the cache-sized
+	/// `one_access_capacity` field. This is the number
+	/// `needs_capacity_eviction` polices a DRAM-resident queue with.
 	fn effective_one_access_capacity(&self) -> CacheSize {
-		self.one_access_capacity.saturating_sub(self.reserved_shares().0)
+		self.raw_one_access_capacity().saturating_sub(self.reserved_shares().0)
 	}
 
 	/// The budget actually available to the main queue's fast segment: raw
-	/// `fast_capacity`, minus the one-access queue's fixed carve-out, minus
+	/// `fast_capacity`, minus the one-access queue's clamped carve-out, minus
 	/// this segment's share of the shared-metadata reservation. The settle
 	/// drains to this number, never to any part of it alone.
 	fn effective_main_fast_capacity(&self) -> CacheSize {
 		self.raw_main_fast_capacity().saturating_sub(self.reserved_shares().1)
+	}
+
+	/// Prints ONE warning to stderr when the configured one-access queue
+	/// (`one_access_ratio * max_size`) is at least the whole fast tier -- the
+	/// configuration `raw_one_access_capacity()` clamps, in which that queue
+	/// takes all of the tier and the main queue gets no fast segment -- and
+	/// again only when a later resize makes that NEWLY true. Returns whether it
+	/// warned.
+	///
+	/// `eprintln!`, not `log::warn!`: this crate installs no logger (see
+	/// `merged_stack.rs`), so a `log` warning would print nowhere. Stderr is
+	/// where the crate's other diagnostics go.
+	///
+	/// Checked from `resize_fast_tier` and `resize`, not `new`:
+	/// `init_policy_stack` builds this stack against a 20%-of-`max_size`
+	/// placeholder and `new_hybrid` sends the real budget through
+	/// `resize_fast_tier` straight away, so that is where it first arrives.
+	fn warn_if_carve_out_fills_fast_tier(&mut self) -> bool {
+		let fills = self.fast_capacity > 0 && self.one_access_capacity >= self.fast_capacity;
+		let newly = fills && !self.carve_out_fills_fast_tier;
+		self.carve_out_fills_fast_tier = fills;
+
+		if newly {
+			eprintln!(
+				"s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-compact-hybrid: the one-access queue's configured capacity (one_access_ratio * max_size = {} bytes) meets or exceeds the fast-tier budget ({} bytes); the queue is clamped to the whole fast tier, so the main queue gets no fast segment and every promotion will demote straight back out. Lower the ratio or raise fast_tier_size.",
+				self.one_access_capacity,
+				self.fast_capacity,
+			);
+		}
+
+		newly
 	}
 
 	pub fn is_ghost(&self, key: HashedKey) -> bool {
@@ -698,6 +765,7 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridSt
 	fn resize(&mut self, max_size: CacheSize) {
 		self.one_access_capacity = (self.one_access_ratio * max_size as f64) as CacheSize;
 		self.main_capacity = ((1.0 - self.one_access_ratio) * max_size as f64) as CacheSize;
+		self.warn_if_carve_out_fills_fast_tier();
 
 		// Growing `one_access_capacity` shrinks the room left for the main
 		// queue's fast segment -- catch it now rather than waiting for the next
@@ -784,6 +852,11 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridSt
 
 	fn resize_fast_tier(&mut self, size: CacheSize) {
 		self.fast_capacity = size;
+		self.warn_if_carve_out_fills_fast_tier();
+
+		// The main segment settles here. The one-access queue's clamp moved
+		// with the budget too; only an eviction can shrink it in this variant,
+		// so `needs_capacity_eviction` reports it on the worker's next pass.
 		self.settle_fast_tier();
 	}
 
@@ -815,8 +888,177 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridSt
 	}
 
 	fn needs_capacity_eviction(&self) -> bool {
-		// Against `effective_one_access_capacity()`, i.e. this segment's own cap
-		// minus its proportional share of the shared-metadata reservation.
+		// Against `effective_one_access_capacity()`, i.e. this segment's
+		// clamped cap minus its proportional share of the shared-metadata
+		// reservation.
 		self.one_access_used > self.effective_one_access_capacity()
+	}
+}
+
+/// The DRAM ceiling, ported with the clamp from
+/// `TwoQFastAdmissionReprieveCompactHybridStack`'s module of the same name.
+/// Both DRAM segments -- the one-access queue and the main queue's fast portion --
+/// are budgeted out of one `fast_capacity`, but the one-access queue's own capacity
+/// is `one_access_ratio * max_size`, a fraction of the CACHE.
+///
+/// `RATIOS` put that at the 4_000 B tier and above it. Only 0.6 and 0.9
+/// detect a missing clamp: 0.4 is the equality case, where `min` returns the
+/// raw capacity and the clamp is numerically inert -- it is there to show a
+/// carve-out that exactly fills the tier does not wedge. The shrink test
+/// starts inside the tier (0.25) and binds only once the tier shrinks.
+#[cfg(test)]
+mod dram_ceiling_tests {
+	use super::*;
+
+	const MAX_SIZE: CacheSize = 10_000;
+	const FAST: CacheSize = 4_000;
+	const SIZE: ObjectSize = 100;
+	const OVERHEAD: CacheSize = 8;
+	const KEYS: HashedKey = 120;
+
+	const SLACK: CacheSize = 0;
+
+	/// `one_access_ratio * MAX_SIZE` = 4_000 B (exactly the tier), 6_000 B and
+	/// 9_000 B.
+	const RATIOS: [f64; 3] = [0.4, 0.6, 0.9];
+
+	fn stack(ratio: f64) -> S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack {
+		S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack::new(ratio, MAX_SIZE, FAST).with_shared_overhead(OVERHEAD)
+	}
+
+	/// What `PolicyWorker::apply_evictions` does after every event: evict
+	/// while the stack asks for it or the cache is over `max_size`.
+	fn evict_while_asked(stack: &mut S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack) {
+		while (stack.needs_capacity_eviction()
+			|| stack.fast_bytes_used() + stack.slow_bytes_used() > MAX_SIZE)
+			&& stack.evict_one().is_some()
+		{}
+	}
+
+	/// All the DRAM this stack holds against the tier it was given: both
+	/// segments' values (`fast_bytes_used`) plus the metadata reservation it
+	/// reports.
+	fn assert_within_the_fast_tier(stack: &S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack, slack: CacheSize, context: &str) {
+		let values = stack.fast_bytes_used();
+		let reserved = stack.dram_reserved_bytes();
+
+		assert!(
+			values + reserved <= stack.fast_capacity + slack,
+			"{context}: {} B of DRAM ({values} B of values + {reserved} B reserved) on a {} B fast tier",
+			values + reserved,
+			stack.fast_capacity,
+		);
+	}
+
+	/// The budget identity: both DRAM segments' budgets plus ONE reservation
+	/// are the fast tier exactly, however far `one_access_ratio * max_size`
+	/// overshoots it. Unclamped, 0.6 gave the one-access queue a 6_000 B budget of its
+	/// own on a 4_000 B tier while the main queue's budget saturated to 0.
+	#[test]
+	fn dram_budgets_never_over_subscribe_the_fast_tier() {
+		for ratio in RATIOS {
+			let mut stack = stack(ratio);
+
+			for key in 1..=5 {
+				stack.insert(key, SIZE);
+			}
+
+			let total = stack.effective_one_access_capacity()
+				+ stack.effective_main_fast_capacity()
+				+ stack.reserved_overhead();
+
+			assert_eq!(
+				total, FAST,
+				"ratio {ratio}: the two DRAM budgets plus the reservation come to {total} B, not the {FAST} B fast tier",
+			);
+		}
+	}
+
+	/// The ceiling on live bytes, driven the way the worker drives the stack:
+	/// admissions, hits on the newest keys (promotions out of the one-access queue, into a
+	/// main queue with no fast segment left) and on older ones,
+	/// re-admissions of early keys, and every eviction the stack asks for.
+	/// Includes a carve-out exactly the size of the tier, which must not wedge
+	/// or panic.
+	#[test]
+	fn admissions_and_hits_never_hold_more_dram_than_the_fast_tier() {
+		for ratio in RATIOS {
+			let mut stack = stack(ratio);
+
+			for key in 1..=KEYS {
+				stack.insert(key, SIZE);
+				evict_while_asked(&mut stack);
+				assert_within_the_fast_tier(&stack, SLACK, &format!("ratio {ratio}, admitted {key}"));
+
+				if key % 3 == 0 {
+					for hit in [key - 1, key / 2] {
+						if stack.contains(hit) {
+							stack.update(hit);
+							evict_while_asked(&mut stack);
+							assert_within_the_fast_tier(&stack, SLACK, &format!("ratio {ratio}, hit {hit}"));
+						}
+					}
+				}
+			}
+
+			for key in 1..=KEYS / 3 {
+				stack.insert(key, SIZE);
+				evict_while_asked(&mut stack);
+				assert_within_the_fast_tier(&stack, SLACK, &format!("ratio {ratio}, re-admitted {key}"));
+			}
+
+			assert!(stack.len() > 0, "ratio {ratio}: the stack must still hold keys");
+		}
+	}
+
+	/// Why the clamp is an accessor and not a value fixed at construction: only
+	/// `fast_capacity` moves here, and the one-access queue's budget has to move with
+	/// it. The one-access queue is policed by eviction here,
+	/// so the worker evicts the excess from its tail into the ghost.
+	#[test]
+	fn shrinking_the_fast_tier_shrinks_the_admission_queue() {
+		// 0.25 * 10_000 = 2_500 B of admission queue: fits the 4_000 B tier.
+		let mut stack = stack(0.25);
+
+		for key in 1..=5 {
+			stack.insert(key, 400);
+			evict_while_asked(&mut stack);
+		}
+
+		assert_eq!(stack.fast_bytes_used(), 2_000, "all five admitted straight to DRAM");
+
+		stack.resize_fast_tier(1_000);
+		evict_while_asked(&mut stack);
+
+		assert_within_the_fast_tier(&stack, 0, "after shrinking the tier to 1_000 B");
+
+		assert_eq!(stack.len(), 2, "the admission queue's excess was evicted from its tail");
+	}
+}
+
+/// The carve-out warning: one stderr line per crossing of
+/// `one_access_capacity >= fast_capacity`, checked from both resize entry points.
+#[cfg(test)]
+mod carve_out_warning_tests {
+	use super::*;
+
+	#[test]
+	fn the_carve_out_warning_fires_once_per_crossing() {
+		// 0.6 * 1_000 = 600 B of admission queue against a 1_000 B tier: fits.
+		let mut stack = S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack::new(0.6, 1_000, 1_000);
+		assert!(!stack.warn_if_carve_out_fills_fast_tier(), "a queue that fits the tier must not warn");
+
+		stack.fast_capacity = 600;
+		assert!(stack.warn_if_carve_out_fills_fast_tier(), "a 600 B queue on a 600 B tier covers it and must warn");
+		assert!(!stack.warn_if_carve_out_fills_fast_tier(), "once per crossing, not once per check");
+
+		stack.resize_fast_tier(1_000);
+		assert!(!stack.carve_out_fills_fast_tier, "resize_fast_tier re-checks: 600 B fits 1_000 B again");
+
+		stack.resize_fast_tier(400);
+		assert!(stack.carve_out_fills_fast_tier, "resize_fast_tier re-checks: 600 B covers 400 B");
+
+		stack.resize(500);
+		assert!(!stack.carve_out_fills_fast_tier, "resize re-checks: 0.6 * 500 = 300 B fits 400 B");
 	}
 }

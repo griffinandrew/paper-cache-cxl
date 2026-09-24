@@ -730,4 +730,54 @@ mod hybrid_cache_tests {
             "the re-set key should be counted exactly once",
         );
     }
+
+    /// The review's measured symptom, end to end: `k_in * max_size` many
+    /// times the fast tier (10_240 B of FIFO against a 1_024 B tier, the
+    /// shape of the whole-tier test above) and a burst of admissions that
+    /// nothing re-accesses, so every one stays in the DRAM FIFO. Before the
+    /// FIFO's carve-out was clamped to the tier it was policed only against
+    /// the raw 10_240 B and kept all of them -- the review measured 125 MiB
+    /// in a 32 MiB tier at `k_in` 0.25 -- and `fast_bytes_used` came to
+    /// several times `fast_tier_size`. Clamped, the worker evicts the FIFO's
+    /// tail at the tier.
+    #[test]
+    fn an_overfilled_admission_fifo_never_holds_more_than_the_fast_tier() {
+        ensure_pmem_allocator_warm();
+
+        const FAST: u64 = 1_024;
+        const KEYS: u32 = 24;
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            10_240,
+            CacheTierSize::Bytes(FAST), PaperPolicy::TwoQFastAdmissionCompactHybrid(1.0)).expect("cache should construct");
+
+        for key in 1..=KEYS {
+            cache.set(key, &[key as u8; 256], None).expect("set should succeed");
+        }
+
+        // The gauges agree with the object map only once the worker has taken
+        // every admission and made every eviction it was asked for.
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || {
+                let stats = cache.hybrid_stats();
+                let live = (1..=KEYS).filter(|key| cache.has(key)).count() as u64;
+                stats.fast_objects + stats.slow_objects == live
+            }),
+            "the tier gauges never converged on the live keys",
+        );
+
+        let stats = cache.hybrid_stats();
+
+        assert!(
+            stats.fast_bytes_used <= FAST,
+            "the admission FIFO holds {} B of values in a {FAST} B fast tier ({} objects)",
+            stats.fast_bytes_used,
+            stats.fast_objects,
+        );
+        assert!(stats.evictions > 0, "the FIFO's tail must have been evicted at the tier");
+
+        for key in (1..=KEYS).filter(|key| cache.has(key)) {
+            assert_eq!(cache.get(&key).unwrap(), vec![key as u8; 256], "key {key} reads back");
+        }
+    }
 }

@@ -586,4 +586,53 @@ mod hybrid_cache_tests {
         assert_eq!(cache.tier_of(&2u32), None);
     }
 
+    /// The review's measured symptom, end to end, for the S3-FIFO reprieve
+    /// family: `one_access_ratio * max_size` many times the fast tier
+    /// (9_216 B of one-access queue against a 1_024 B tier) and a burst of
+    /// admissions that nothing re-accesses. Before the carve-out was clamped
+    /// to the tier, `settle_one_access` drained only against the raw 9_216 B,
+    /// so the queue kept every one of them in DRAM and `fast_bytes_used`
+    /// came to several times `fast_tier_size`. Clamped, the queue's tail is
+    /// reprieved into the main queue's slow segment at the tier.
+    #[test]
+    fn an_overfilled_one_access_queue_never_holds_more_than_the_fast_tier() {
+        ensure_pmem_allocator_warm();
+
+        const FAST: u64 = 1_024;
+        const KEYS: u32 = 24;
+
+        let cache = PaperCache::<u32, TieredBuffer>::new(
+            10_240,
+            CacheTierSize::Bytes(FAST), PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(0.9))
+            .expect("cache should construct");
+
+        for key in 1..=KEYS {
+            cache.set(key, &[key as u8; 256], None).expect("set should succeed");
+        }
+
+        // The gauges agree with the object map only once the worker has taken
+        // every admission and applied every reprieve.
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || {
+                let stats = cache.hybrid_stats();
+                let live = (1..=KEYS).filter(|key| cache.has(key)).count() as u64;
+                stats.fast_objects + stats.slow_objects == live
+            }),
+            "the tier gauges never converged on the live keys",
+        );
+
+        let stats = cache.hybrid_stats();
+
+        assert!(
+            stats.fast_bytes_used <= FAST,
+            "the one-access queue holds {} B of values in a {FAST} B fast tier ({} objects)",
+            stats.fast_bytes_used,
+            stats.fast_objects,
+        );
+        assert!(stats.slow_objects > 0, "the queue's tail must have been reprieved into PMEM");
+
+        for key in (1..=KEYS).filter(|key| cache.has(key)) {
+            assert_eq!(cache.get(&key).unwrap(), vec![key as u8; 256], "key {key} reads back");
+        }
+    }
 }

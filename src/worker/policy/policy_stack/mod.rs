@@ -291,12 +291,23 @@ where
 	/// budget derived from the fast tier at 0 -- every stack subtracts it
 	/// saturating. That is the true DRAM state of a metadata-bound tier, not an
 	/// accounting fault, but what follows differs by design. Most demote every
-	/// value. The S3-FIFO fast-admission designs also close admission: a
-	/// one-access queue with no budget evicts each new key to the ghost as it
-	/// arrives. And `two_q_fast_admission` / `two_q_full_fast_admission`, whose
-	/// DRAM admission queue is a fixed `k_in x max_size` the reservation does not
-	/// shrink, keep that queue's values in DRAM on top of it -- the unclamped
-	/// carve-out described in HYBRID_CACHES.md.
+	/// value. The eight 2Q/S3-FIFO fast-admission designs also close DRAM
+	/// admission: their admission queue is a carve-out of the tier clamped to
+	/// it, and it pays a share of the reservation -- in proportion to its part
+	/// of the tier in six of them, and in `two_q_fast_admission` and
+	/// `two_q_full_fast_admission`, which charge main first, whatever the main
+	/// queue cannot absorb. With no budget left it evicts each new key on
+	/// arrival where its overflow is an eviction (`two_q_fast_admission`, and
+	/// the S3-FIFO ghost variants, into the ghost) and sends it to PMEM where
+	/// its overflow is a demotion or reprieve (the reprieve variants at once,
+	/// `two_q_full_fast_admission` on the next admission). In
+	/// `two_q_fast_admission`, which has no ghost, that is permanent: a key that
+	/// comes back is new again and is evicted again, and main is never the
+	/// victim, so it admits nothing until a delete, an expiry or a resize lowers
+	/// the reservation. The S3-FIFO ghost variants lose only a key's first
+	/// arrival; its second goes from the ghost straight into main. The faithful S3-FIFO
+	/// fast-admission variants are the exception: their DRAM small queue has no
+	/// ceiling at all, so its values stay in DRAM on top of the reservation.
 	///
 	/// `fast_bytes_used` counts object bytes only, so the fast tier's true DRAM
 	/// footprint is the two summed. `0` on all-DRAM stacks, which have no tiers

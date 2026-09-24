@@ -218,13 +218,19 @@ The implementation provides explicit feature flags to control:
   no-ghost-queue decision are all identical to `two_q_compact_hybrid_cache`
 - **The one accounting difference that matters**: `fifo_capacity = k_in * max_size` is now a DRAM
   reservation **carved out of `fast_tier_size`**, not an independent PMEM budget:
-  `effective_main_fast_capacity = fast_tier_size − k_in * max_size`. Since `k_in` is denominated in
+  `effective_main_fast_capacity = fast_tier_size − min(k_in * max_size, fast_tier_size) − main_share`,
+  where `main_share` is the per-object metadata reservation up to what the carve-out leaves main
+  (main pays first; the FIFO pays the rest). Since `k_in` is denominated in
   `max_size` while the budget it consumes is `fast_tier_size` (typically a small fraction of
   `max_size`), a `k_in` that is unremarkable under `two_q_compact_hybrid_cache` can swallow the whole fast
   tier here — at a 24 GB cache with a 4 GB fast tier, `k_in = 0.1` reserves 2.4 GB (60%) for objects
   with no demonstrated reuse. If the reservation meets or exceeds `fast_tier_size`, the main queue
   gets zero fast capacity and every promotion self-demotes immediately: legitimate, but rarely
-  intended. **Sweep `k_in` down here in a way that is unnecessary for `two_q_compact_hybrid_cache`.** The
+  intended. The FIFO itself is clamped to `fast_tier_size` (it can never hold more DRAM than the
+  tier) and pays only the part of the metadata reservation main cannot absorb, so wherever the
+  carve-out and the reservation fit the tier together both budgets are what they were before the
+  clamp. The configuration is flagged once by a warning printed to stderr (`eprintln!`: the crate
+  installs no `log` logger) when the budget arrives through `resize_fast_tier`. **Sweep `k_in` down here in a way that is unnecessary for `two_q_compact_hybrid_cache`.** The
   reservation is the *fixed* `fifo_capacity`, not live `fifo_used`, so the main queue's budget stays
   stable as the FIFO queue fills and drains (and admission therefore never demotes anyone by itself);
   `resize()` re-settles, which `TwoQCompactHybridStack::resize` need not

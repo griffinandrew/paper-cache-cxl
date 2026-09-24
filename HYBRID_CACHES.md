@@ -254,14 +254,23 @@ The same sweep is flat or inert on the other two families, and the reasons are s
   so the drain shape is invisible here.
 - **`2q-full-fast-admission-compact-hybrid`** — every arm came back BYTE-IDENTICAL: 238
   promotions, 14,251,923 demotions, 371,279 fast objects, `burst_max` 92. `settle_fast_tier`
-  governs `am`, and `am` is empty, because the fast tier pins at `a1_in_capacity = k_in *
+  governs `am`, and `am` was empty, because the fast tier pinned at `a1_in_capacity = k_in *
   max_size` = 3,002,645,632 B — using 2.80 of the 4.00 GiB budget. That carve-out is a
-  CACHE-size fraction and is not clamped to `fast_capacity`, so for this family the drain target
-  cannot reach the binding constraint at all.
+  CACHE-size fraction and was not clamped to `fast_capacity` at the time of this measurement,
+  and `am` paid all of the metadata reservation while `a1_in` paid none, so for this family the
+  drain target could not reach the binding constraint at all.
 
-The last point is a defect rather than a limitation of the drain target: at `k_in >
-fast_capacity / max_size` (0.358 for this configuration) the DRAM admission queue alone exceeds
-the whole fast tier, and no settle can pull it back.
+The last point was a defect rather than a limitation of the drain target: at `k_in >
+fast_capacity / max_size` (0.358 for this configuration) the DRAM admission queue alone
+exceeded the whole fast tier, and no settle could pull it back; below that, a reservation
+larger than what the carve-out left `am` sat on top of a full `a1_in`.
+
+Since fixed in the stack, and not re-measured: `a1_in_carve_out()` clamps `a1_in` to the fast
+tier, `resize_fast_tier` re-settles it, and the reservation is charged main-first — `am` pays it
+up to the 1.20 GiB the carve-out leaves, and `a1_in` pays the rest out of its own budget, where
+it used to pay none — so `a1_in + am + reservation` is the tier. At this configuration `a1_in`
+now gives up whatever part of the reservation exceeds 1.20 GiB (the reservation was not
+recorded, so how much is not known), and the numbers above describe the old stack.
 
 ### The shared-DRAM-overhead reservation
 
@@ -280,10 +289,19 @@ hashtable entry, a list node and an `entries` slot in DRAM.
 When `tracked × shared_overhead` meets or exceeds `fast_capacity`, every value budget derived
 from the fast tier saturates at 0: the fast tier is metadata-bound, which is the true DRAM state
 rather than an accounting fault. What follows differs by design. Most demote every value. The
-S3-FIFO fast-admission designs also close admission (a one-access queue with no budget evicts
-each new key to the ghost on arrival). `two_q_fast_admission` and `two_q_full_fast_admission`
-keep their DRAM admission queue -- a fixed `k_in × max_size` the reservation does not shrink --
-on top of the reservation, so they overrun DRAM (the unclamped carve-out above). Charging only fast keys was tried and reverted — on cluster35
+2Q and S3-FIFO fast-admission designs also close DRAM admission: their admission queue is a
+carve-out of the tier clamped to it and pays a share of the reservation — its proportional share
+in six of them, and in `two_q_fast_admission` and `two_q_full_fast_admission`, which charge the
+main queue first, whatever main cannot absorb — so with no budget left each new key is evicted
+on arrival where the queue's overflow is an eviction (`two_q_fast_admission`; the S3-FIFO ghost
+variants, into the ghost) and goes to PMEM where it is a demotion or reprieve (the reprieve
+variants at once, `two_q_full_fast_admission` on the next admission). In `two_q_fast_admission`
+that closes the cache for good: it has no ghost, so a key that comes back is new again and is
+evicted again, and main is never the victim, so it admits nothing until a delete, an expiry or a
+resize brings the reservation back under the tier. The S3-FIFO ghost variants lose only a key's
+first arrival: its second finds the ghost and goes straight into main. The faithful S3-FIFO
+fast-admission variants are the exception: their DRAM small queue has no ceiling at all, so its
+values stay in DRAM on top of the reservation. Charging only fast keys was tried and reverted — on cluster35
 (DashMap LRU, 5 GiB fast tier) it reserved 313.6 MB against 896.7 MB of real metadata, so fast
 data plus metadata reached 5,851 MB in a 5,369 MB tier. The merged store charges the same
 `len() × shared_overhead`.
@@ -532,11 +550,25 @@ the recency-durable part of the cache. Only its bytes are in DRAM *while on prob
 
 **The accounting had to change, not just the label.** With the FIFO queue also in DRAM, both
 budgets draw on the same physical pool, and leaving them independent would let real DRAM grow to
-`fast_capacity + fifo_capacity`. Fixed by treating `fifo_capacity` as a reservation carved out
-first — `effective_main_fast_capacity =
-fast_capacity.saturating_sub(fifo_capacity).saturating_sub(reserved_overhead())`, so the FIFO
-carve-out and the shared per-object DRAM reservation both come out before the drain target applies. The net result is
-`fast_used (main) + fifo_used <= fast_capacity` by construction.
+`fast_capacity + fifo_capacity`. Fixed by treating the FIFO as a carve-out of the tier —
+`fifo_carve_out() = fifo_capacity.min(fast_capacity)`, since `k_in × max_size` is a fraction of
+the cache and can exceed the tier on its own — and charging the shared per-object DRAM
+reservation main-first (`reserved_shares`): main pays it out of `fast_capacity -
+fifo_carve_out()`, as it always did, and the FIFO pays only what does not fit there. Main settles
+against `fast_capacity - fifo_carve_out() - main_share`, `needs_capacity_eviction` polices the
+FIFO against `fifo_carve_out() - fifo_share`, and the two plus the reservation are the tier while
+the reservation fits in it. The first version subtracted the raw `fifo_capacity` (saturating) and
+policed the FIFO only against `fifo_capacity`, so at `k_in × max_size > fast_capacity` the FIFO
+alone overran the tier: 125 MiB in a 32 MiB tier at `k_in` 0.25 of a 1 GiB cache.
+
+Main-first, not the proportional split the reprieve variant and the S3-FIFO fast-admission designs
+use, deliberately. Those designs already split in proportion before the clamp reached them, so the
+clamp changed nothing for them that fits. This one charged the whole reservation to main; a
+proportional split would take `reservation × fifo_carve_out() / fast_capacity` of the FIFO's
+budget in every run with a reservation, which is every production run. Main-first leaves both
+budgets exactly as they were wherever `fifo_capacity + reservation <= fast_capacity`, and moves
+them only where the old ones over-subscribed the tier. `two_q_full_fast_admission` charges its
+`a1_in` the same way, for the same reason.
 
 ### `two_q_fast_admission_reprieve_compact_hybrid_cache`
 
@@ -654,7 +686,8 @@ moves the key to the front, so it cannot be re-examined until every other fast k
 Moves the one-access queue to the **fast** tier, so admission is a cheap DRAM write. Same change,
 same motivation, and same shared-DRAM-budget accounting as
 `two_q_fast_admission_compact_hybrid_cache`: `one_access_capacity` becomes a reservation carved out of
-`fast_capacity` rather than an independent budget.
+`fast_capacity` rather than an independent budget, clamped to the tier
+(`raw_one_access_capacity()`) since `one_access_ratio × max_size` is a fraction of the cache.
 
 ### `s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_compact_hybrid_cache`
 

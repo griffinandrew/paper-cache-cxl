@@ -150,6 +150,11 @@ pub struct S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
 
 	main_boundary: Option<HashedKey>,
 
+	/// Whether the last check found `one_access_capacity >= fast_capacity`,
+	/// i.e. the one warning for that crossing has been emitted. See
+	/// [`Self::warn_if_carve_out_fills_fast_tier`].
+	carve_out_fills_fast_tier: bool,
+
 	migrations: Vec<(HashedKey, Tier)>,
 }
 
@@ -173,6 +178,7 @@ impl S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
 			fast_count: 0,
 			main_count: 0,
 			main_boundary: None,
+			carve_out_fills_fast_tier: false,
 			migrations: Vec::new(),
 		}
 	}
@@ -276,6 +282,37 @@ impl S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
 	/// drains to this number, never to any part of it alone.
 	fn effective_main_fast_capacity(&self) -> CacheSize {
 		self.raw_main_fast_capacity().saturating_sub(self.reserved_shares().1)
+	}
+
+	/// Prints ONE warning to stderr when the configured one-access queue
+	/// (`one_access_ratio * max_size`) is at least the whole fast tier -- the
+	/// configuration `raw_one_access_capacity()` clamps, in which that queue
+	/// takes all of the tier and the main queue gets no fast segment -- and
+	/// again only when a later resize makes that NEWLY true. Returns whether it
+	/// warned.
+	///
+	/// `eprintln!`, not `log::warn!`: this crate installs no logger (see
+	/// `merged_stack.rs`), so a `log` warning would print nowhere. Stderr is
+	/// where the crate's other diagnostics go.
+	///
+	/// Checked from `resize_fast_tier` and `resize`, not `new`:
+	/// `init_policy_stack` builds this stack against a 20%-of-`max_size`
+	/// placeholder and `new_hybrid` sends the real budget through
+	/// `resize_fast_tier` straight away, so that is where it first arrives.
+	fn warn_if_carve_out_fills_fast_tier(&mut self) -> bool {
+		let fills = self.fast_capacity > 0 && self.one_access_capacity >= self.fast_capacity;
+		let newly = fills && !self.carve_out_fills_fast_tier;
+		self.carve_out_fills_fast_tier = fills;
+
+		if newly {
+			eprintln!(
+				"s3-fifo-ghost-lazy-demotion-fast-admission-compact-hybrid: the one-access queue's configured capacity (one_access_ratio * max_size = {} bytes) meets or exceeds the fast-tier budget ({} bytes); the queue is clamped to the whole fast tier, so the main queue gets no fast segment and every promotion will demote straight back out. Lower the ratio or raise fast_tier_size.",
+				self.one_access_capacity,
+				self.fast_capacity,
+			);
+		}
+
+		newly
 	}
 
 	pub fn is_ghost(&self, key: HashedKey) -> bool {
@@ -619,6 +656,7 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
 	fn resize(&mut self, max_size: CacheSize) {
 		self.one_access_capacity = (self.one_access_ratio * max_size as f64) as CacheSize;
 		self.main_capacity = ((1.0 - self.one_access_ratio) * max_size as f64) as CacheSize;
+		self.warn_if_carve_out_fills_fast_tier();
 
 		// Growing `one_access_capacity` shrinks the room left for the main
 		// queue's fast segment -- catch it now rather than waiting for the next
@@ -687,6 +725,7 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
 
 	fn resize_fast_tier(&mut self, size: CacheSize) {
 		self.fast_capacity = size;
+		self.warn_if_carve_out_fills_fast_tier();
 		self.settle_fast_tier();
 	}
 
@@ -806,5 +845,32 @@ mod fast_budget_tests {
 			FAST_CAPACITY - stack.one_access_capacity - stack.reserved_shares().1,
 			"and the main segment must still get the plain remainder",
 		);
+	}
+}
+
+/// The carve-out warning: one stderr line per crossing of
+/// `one_access_capacity >= fast_capacity`, checked from both resize entry points.
+#[cfg(test)]
+mod carve_out_warning_tests {
+	use super::*;
+
+	#[test]
+	fn the_carve_out_warning_fires_once_per_crossing() {
+		// 0.6 * 1_000 = 600 B of admission queue against a 1_000 B tier: fits.
+		let mut stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(0.6, 1_000, 1_000);
+		assert!(!stack.warn_if_carve_out_fills_fast_tier(), "a queue that fits the tier must not warn");
+
+		stack.fast_capacity = 600;
+		assert!(stack.warn_if_carve_out_fills_fast_tier(), "a 600 B queue on a 600 B tier covers it and must warn");
+		assert!(!stack.warn_if_carve_out_fills_fast_tier(), "once per crossing, not once per check");
+
+		stack.resize_fast_tier(1_000);
+		assert!(!stack.carve_out_fills_fast_tier, "resize_fast_tier re-checks: 600 B fits 1_000 B again");
+
+		stack.resize_fast_tier(400);
+		assert!(stack.carve_out_fills_fast_tier, "resize_fast_tier re-checks: 600 B covers 400 B");
+
+		stack.resize(500);
+		assert!(!stack.carve_out_fills_fast_tier, "resize re-checks: 0.6 * 500 = 300 B fits 400 B");
 	}
 }

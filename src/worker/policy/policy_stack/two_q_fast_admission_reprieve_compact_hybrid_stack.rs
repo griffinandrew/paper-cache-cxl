@@ -27,14 +27,17 @@
 //!   promotion out of the FIFO, which only ever lowers `fifo_used`.
 //! - `needs_capacity_eviction` is NOT overridden. The FIFO polices itself, so
 //!   the trait default (`false`) is the answer; the non-reprieve stack's
-//!   `fifo_used > fifo_capacity` override would ask the caller to evict a
-//!   queue that has already settled.
+//!   `fifo_used > effective_fifo_capacity()` override would ask the caller to
+//!   evict a queue that has already settled.
 //! - `evict_one` drains the MAIN queue first and reaches the FIFO tail only
 //!   when main is empty. The non-reprieve stack has that order reversed.
 //! - The `shared_overhead` reservation is SPLIT between the two queues in
 //!   proportion to their fast-tier capacities (`reserved_shares`), because
 //!   both now settle against a budget and each has to pay its own share. The
-//!   non-reprieve stack charges the whole reservation to the main queue.
+//!   non-reprieve stack charges it MAIN-FIRST instead -- main pays up to
+//!   what the carve-out leaves it, the FIFO only the rest -- so its budgets
+//!   stay what they were before the clamp wherever they fit, and polices its
+//!   FIFO's budget through `needs_capacity_eviction`.
 //!
 //! **The baseline named above no longer exists in this crate.** Every
 //! non-compact hybrid stack was removed once its compact twin was shown
@@ -106,6 +109,11 @@ pub struct TwoQFastAdmissionReprieveCompactHybridStack {
 	/// The least-recently-used FAST key in the main queue.
 	main_boundary: Option<HashedKey>,
 
+	/// Whether the last check found `fifo_capacity >= fast_capacity`, i.e.
+	/// the one warning for that crossing has been emitted. See
+	/// [`Self::warn_if_carve_out_fills_fast_tier`].
+	carve_out_fills_fast_tier: bool,
+
 	migrations: Vec<(HashedKey, Tier)>,
 }
 
@@ -123,6 +131,7 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 			fast_count: 0,
 			main_count: 0,
 			main_boundary: None,
+			carve_out_fills_fast_tier: false,
 			migrations: Vec::new(),
 		}
 	}
@@ -168,8 +177,9 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 	///
 	/// Only the MAIN queue's SHARE of `reserved_overhead` is subtracted, not
 	/// the whole of it: in this variant the FIFO settles against a budget of
-	/// its own and pays the remainder. The non-reprieve stack, whose FIFO is
-	/// unpoliced, charges the entire reservation here.
+	/// its own and pays the remainder. The non-reprieve stack also subtracts
+	/// only main's share, but charges main first (see its `reserved_shares`),
+	/// and polices its FIFO by eviction rather than settling it.
 	///
 	/// Subtracting the CLAMPED carve-out is arithmetically identical to
 	/// subtracting the raw one -- `saturating_sub` already floors at zero --
@@ -224,6 +234,36 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 		let main_share = reserved.saturating_sub(fifo_share);
 
 		(fifo_share, main_share)
+	}
+
+	/// Prints ONE warning to stderr when the configured FIFO (`k_in *
+	/// max_size`) is at least the whole fast tier -- the configuration
+	/// `fifo_carve_out()` clamps, in which the FIFO takes all of the tier and
+	/// the main queue gets no fast segment -- and again only when a later
+	/// resize makes that NEWLY true. Returns whether it warned.
+	///
+	/// `eprintln!`, not `log::warn!`: this crate installs no logger (see
+	/// `merged_stack.rs`), so a `log` warning would print nowhere. Stderr is
+	/// where the crate's other diagnostics go.
+	///
+	/// Checked from `resize_fast_tier` and `resize`, not `new`:
+	/// `init_policy_stack` builds this stack against a 20%-of-`max_size`
+	/// placeholder and `new_hybrid` sends the real budget through
+	/// `resize_fast_tier` straight away, so that is where it first arrives.
+	fn warn_if_carve_out_fills_fast_tier(&mut self) -> bool {
+		let fills = self.fast_capacity > 0 && self.fifo_capacity >= self.fast_capacity;
+		let newly = fills && !self.carve_out_fills_fast_tier;
+		self.carve_out_fills_fast_tier = fills;
+
+		if newly {
+			eprintln!(
+				"2q-fast-admission-reprieve-compact-hybrid: the admission FIFO's configured capacity (k_in * max_size = {} bytes) meets or exceeds the fast-tier budget ({} bytes); the FIFO is clamped to the whole fast tier, so the main queue gets no fast segment and every promotion will demote straight back out. Lower k_in or raise fast_tier_size.",
+				self.fifo_capacity,
+				self.fast_capacity,
+			);
+		}
+
+		newly
 	}
 
 	/// Metadata reservation for EVERY tracked key, fast or slow: a demotion
@@ -520,6 +560,7 @@ impl PolicyStack for TwoQFastAdmissionReprieveCompactHybridStack {
 
 	fn resize(&mut self, max_size: CacheSize) {
 		self.fifo_capacity = (self.k_in * max_size as f64) as CacheSize;
+		self.warn_if_carve_out_fills_fast_tier();
 
 		// The FIFO reservation is carved out of the fast tier, so moving it
 		// changes the main queue's budget. Plain 2Q does not need this.
@@ -576,6 +617,7 @@ impl PolicyStack for TwoQFastAdmissionReprieveCompactHybridStack {
 
 	fn resize_fast_tier(&mut self, size: CacheSize) {
 		self.fast_capacity = size;
+		self.warn_if_carve_out_fills_fast_tier();
 		self.settle_fast_tier();
 
 		// `reserved_shares` is a function of `fast_capacity`, so the FIFO's
@@ -609,7 +651,8 @@ impl PolicyStack for TwoQFastAdmissionReprieveCompactHybridStack {
 
 	// NO `needs_capacity_eviction` override, matching the baseline: the FIFO
 	// settles itself, so the trait default (`false`) is correct. The
-	// non-reprieve stack overrides it with `fifo_used > fifo_capacity`.
+	// non-reprieve stack overrides it with
+	// `fifo_used > effective_fifo_capacity()`.
 }
 
 /// The DRAM ceiling. Both of this stack's fast segments -- the admission FIFO,
@@ -695,5 +738,32 @@ mod dram_ceiling_tests {
 			stack.fast_capacity(),
 		);
 		assert_eq!(stack.slow_object_count(), 3, "the excess is reprieved into PMEM");
+	}
+}
+
+/// The carve-out warning: one stderr line per crossing of
+/// `fifo_capacity >= fast_capacity`, checked from both resize entry points.
+#[cfg(test)]
+mod carve_out_warning_tests {
+	use super::*;
+
+	#[test]
+	fn the_carve_out_warning_fires_once_per_crossing() {
+		// 0.6 * 1_000 = 600 B of admission queue against a 1_000 B tier: fits.
+		let mut stack = TwoQFastAdmissionReprieveCompactHybridStack::new(0.6, 1_000, 1_000);
+		assert!(!stack.warn_if_carve_out_fills_fast_tier(), "a queue that fits the tier must not warn");
+
+		stack.fast_capacity = 600;
+		assert!(stack.warn_if_carve_out_fills_fast_tier(), "a 600 B queue on a 600 B tier covers it and must warn");
+		assert!(!stack.warn_if_carve_out_fills_fast_tier(), "once per crossing, not once per check");
+
+		stack.resize_fast_tier(1_000);
+		assert!(!stack.carve_out_fills_fast_tier, "resize_fast_tier re-checks: 600 B fits 1_000 B again");
+
+		stack.resize_fast_tier(400);
+		assert!(stack.carve_out_fills_fast_tier, "resize_fast_tier re-checks: 600 B covers 400 B");
+
+		stack.resize(500);
+		assert!(!stack.carve_out_fills_fast_tier, "resize re-checks: 0.6 * 500 = 300 B fits 400 B");
 	}
 }
