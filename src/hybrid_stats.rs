@@ -19,9 +19,15 @@
 //! new arm per design added. Now the cascade lives once, in
 //! `AtomicStatus::hybrid_stats` (`status.rs`), next to the fields it reads.
 //!
-//! The 15 fields below are 3 monotonic counters, 4 two-tier gauges, and 8
-//! size-split gauges that only `LruSizedCompactHybrid` ever populates -- they
-//! read zero under every other design.
+//! The fields below are 3 monotonic tier-movement counters, 5 two-tier gauges
+//! (fast/slow bytes and objects, and the metadata reservation), 8 size-split
+//! gauges that only `LruSizedCompactHybrid` ever populates -- they read zero
+//! under every other design -- and, since the fast-tier backpressure plan's
+//! S2, 7 readings of the PHYSICAL fast tier and its budget: PHYS_FAST and its
+//! peak, `effective_fast_capacity`, the over-budget integral, hits by serving
+//! tier, and the live tiered-cache count. Three of those are PROCESS-GLOBAL
+//! (`phys_fast_bytes`, `phys_fast_bytes_max`, `live_tiered_caches`); see each
+//! field.
 
 /// Feature-neutral snapshot of the active hybrid cache's tier-movement
 /// counters and live tier gauges.
@@ -75,6 +81,37 @@ pub struct HybridStats {
 	pub large_fast_objects: u64,
 	pub small_slow_objects: u64,
 	pub large_slow_objects: u64,
+
+	/// PHYS_FAST (`paper_cache::phys`): bytes PHYSICALLY allocated in the fast
+	/// tier's value pool right now, in the stacks' own per-object unit --
+	/// where `fast_bytes_used` is the stacks' INTENT. Includes unsettled sets,
+	/// pending demotions, in-flight migration copies, superseded copies and
+	/// readers' snapshots. PROCESS-GLOBAL: every fast value of every cache in
+	/// the process, so it describes this cache only while
+	/// `live_tiered_caches == 1`.
+	pub phys_fast_bytes: u64,
+
+	/// Peak of `phys_fast_bytes` seen at a shard fold or a policy-worker pass:
+	/// a LOWER BOUND on the true peak. Process-global and never reset.
+	pub phys_fast_bytes_max: u64,
+
+	/// `F - L * omega`: the fast tier's budget for value bytes once the
+	/// per-object reservation is taken off. This cache's; reporting only.
+	pub effective_fast_capacity: u64,
+
+	/// The integral over time of `max(0, phys_fast_bytes + L * omega - F)`,
+	/// in whole byte-seconds, accumulated by this cache's policy worker once
+	/// per pass since the cache was built (a `wipe()` does not reset it).
+	pub over_budget_byte_seconds: u64,
+
+	/// Hits served from the fast / the slow tier: the tier of the value a
+	/// `get`/`get_into` hit copied. Together they are the status' hit count,
+	/// and `wipe()` resets them with it.
+	pub fast_hits: u64,
+	pub slow_hits: u64,
+
+	/// Tiered caches alive in this process (`phys::live_tiered_caches`).
+	pub live_tiered_caches: u64,
 }
 
 impl HybridStats {

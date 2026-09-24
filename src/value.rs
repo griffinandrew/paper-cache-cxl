@@ -389,6 +389,14 @@ pub struct ValueHeader<K> {
 /// forget, and no deferral to get wrong: the refcount decides when.
 impl<K> Drop for ValueHeader<K> {
 	fn drop(&mut self) {
+		// PHYS_FAST: the refund for `TieredValue::new_in`'s charge, on the
+		// tier the tag names -- the tag `free` routes on. Once per allocation:
+		// this is the last handle's drop. See `crate::phys`.
+		#[cfg(feature = "hybrid_cache_common")]
+		if matches!(self.bytes.tier(), Tier::Fast) {
+			crate::phys::refund(crate::phys::value_charge::<K>(self.len));
+		}
+
 		// SAFETY: `bytes` and `len` are written together in
 		// `TieredValue::new_in` and never separately afterwards, and this runs
 		// exactly once, when the last handle drops.
@@ -432,7 +440,7 @@ impl<K> TieredValue<K> {
 		// this cast cannot truncate.
 		let len = bytes.len() as u32;
 
-		TieredValue {
+		let value = TieredValue {
 			inner: Arc::new(ValueHeader {
 				#[cfg(not(feature = "key_pmem_value_pmem"))]
 				key,
@@ -443,7 +451,18 @@ impl<K> TieredValue<K> {
 				len,
 				expiry: AtomicU32::new(expiry.map_or(0, |tick| tick.get())),
 			}),
+		};
+
+		// PHYS_FAST: one charge per fast allocation, here, once the value
+		// exists; `ValueHeader::drop` refunds it. `migrated_to` builds its
+		// copy through here too, so a promotion is charged on the consumer
+		// thread that makes it. See `crate::phys`.
+		#[cfg(feature = "hybrid_cache_common")]
+		if matches!(tier, Tier::Fast) {
+			crate::phys::charge(crate::phys::value_charge::<K>(len));
 		}
+
+		value
 	}
 
 	/// Builds a value in the fast (DRAM) tier.

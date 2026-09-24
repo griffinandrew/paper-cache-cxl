@@ -246,3 +246,12 @@ pub use crate::worker::tiering::TieringWorker;
 // in every configuration -- carries one in the low bit of its pointer. There
 // is no configuration left that does not need the name.
 pub use crate::worker::policy::Tier;
+
+// The lock every unit test that drives a migration holds, for `crate::phys`'s
+// served-hit test, which builds a real demoting cache. See its doc.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+pub(crate) use crate::worker::policy::migration_test_lock;
+
+// The migration queue's pending entry counts, for `crate::phys`.
+#[cfg(feature = "hybrid_cache_common")]
+pub(crate) use crate::worker::policy::migration_queue::pending as pending_migrations;

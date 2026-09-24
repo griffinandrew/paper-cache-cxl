@@ -325,6 +325,14 @@ impl<K> Drop for TieredValue<K> {
 		let layout = item_layout::<K>(self.header().len);
 		let ptr = self.raw_ptr();
 
+		// PHYS_FAST: the refund for `new_in`'s charge, on the tier the tag
+		// names, while the header is still readable. Once per item: only the
+		// handle that took the count to zero gets here. See `crate::phys`.
+		#[cfg(feature = "hybrid_cache_common")]
+		if matches!(tier, Tier::Fast) {
+			crate::phys::refund(crate::phys::value_charge::<K>(self.header().len));
+		}
+
 		VALUE_FREES.fetch_add(1, Ordering::Relaxed);
 
 		// SAFETY: the count reached zero, so no other handle names this
@@ -405,7 +413,16 @@ impl<K> TieredValue<K> {
 			);
 		}
 
-		TieredValue { word: tag(ptr, tier), _owns: PhantomData }
+		let value = TieredValue { word: tag(ptr, tier), _owns: PhantomData };
+
+		// PHYS_FAST: one charge per fast item -- the whole value, header and
+		// bytes -- once it exists; `Drop` refunds it. See `crate::phys`.
+		#[cfg(feature = "hybrid_cache_common")]
+		if matches!(tier, Tier::Fast) {
+			crate::phys::charge(crate::phys::value_charge::<K>(len));
+		}
+
+		value
 	}
 
 	/// Builds a value in the fast (DRAM) tier.

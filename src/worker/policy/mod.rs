@@ -139,6 +139,13 @@ pub mod migration_queue {
 	/// samples both counters at one point and takes the maximum of the result.
 	pub static PENDING_NET_MAX: AtomicU64 = AtomicU64::new(0);
 
+	/// `(PENDING_DEMOTE, PENDING_PROMOTE)`: entries handed to the consumers
+	/// and not finished yet. Read by `crate::phys::pending_migrations` and the
+	/// MEMTS line's `pending_net`.
+	pub fn pending() -> (u64, u64) {
+		(PENDING_DEMOTE.load(Ordering::Acquire), PENDING_PROMOTE.load(Ordering::Acquire))
+	}
+
 	/// The three ways `apply_migration` moves nothing, counted separately.
 	///
 	/// Together they measure how much of the queue is WASTED work -- entries
@@ -903,6 +910,24 @@ pub mod migstats {
 	pub static CALLS: AtomicU64 = AtomicU64::new(0);
 	static START: OnceLock<Instant> = OnceLock::new();
 	static LAST_DUMP_MS: AtomicU64 = AtomicU64::new(0);
+
+	/// The origin of every instrumentation line's `t_ms` -- MIGSTATS here,
+	/// DIVERGE and MEMTS in the worker loop -- so the three series share one
+	/// clock. Set by the first `PolicyWorker` built in the process
+	/// (`mark_origin`), i.e. when the first cache is constructed: in the
+	/// one-cache process the server and the benchmark run, `t_ms` is the time
+	/// since that cache started. `START` above paces the periodic dump and is
+	/// left as it was.
+	static ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+	pub fn mark_origin() {
+		ORIGIN.get_or_init(Instant::now);
+	}
+
+	/// Milliseconds since `ORIGIN`.
+	pub fn t_ms() -> u64 {
+		ORIGIN.get_or_init(Instant::now).elapsed().as_millis() as u64
+	}
 	pub static ECALLS: AtomicU64 = AtomicU64::new(0);
 	fn bucket(n: usize) -> usize {
 		if n == 0 { return 0; }
@@ -970,9 +995,15 @@ pub mod migstats {
 		let f = |h: &[AtomicU64; NB]| (0..NB)
 			.map(|i| h[i].load(Ordering::Relaxed).to_string())
 			.collect::<Vec<_>>().join(",");
+
+		// One timestamp for the whole block, appended as the LAST field of
+		// every line -- the same rule `coalesced_tot` follows below, so every
+		// existing field keeps its place for a `key=value` reader.
+		let t_ms = t_ms();
+
 		#[cfg(feature = "hybrid_cache_common")]
 		eprintln!(
-			"MIGSTATS queue_depth_max={} burst_max={} pending_demote_max={} pending_promote_max={}",
+			"MIGSTATS queue_depth_max={} burst_max={} pending_demote_max={} pending_promote_max={} t_ms={t_ms}",
 			super::migration_queue::DEPTH_MAX.load(Ordering::Relaxed),
 			super::migration_queue::BURST_MAX.load(Ordering::Relaxed),
 			super::migration_queue::PENDING_DEMOTE_MAX.load(Ordering::Relaxed),
@@ -981,28 +1012,29 @@ pub mod migstats {
 
 		#[cfg(feature = "hybrid_cache_common")]
 		eprintln!(
-			"MIGSTATS pending_net_max={}",
+			"MIGSTATS pending_net_max={} t_ms={t_ms}",
 			super::migration_queue::PENDING_NET_MAX.load(Ordering::Relaxed),
 		);
 
 		#[cfg(feature = "hybrid_cache_common")]
 		eprintln!(
-			"MIGSTATS applied={} gone={} declined={} superseded={}",
+			"MIGSTATS applied={} gone={} declined={} superseded={} t_ms={t_ms}",
 			super::migration_queue::MIG_APPLIED.load(Ordering::Relaxed),
 			super::migration_queue::MIG_GONE.load(Ordering::Relaxed),
 			super::migration_queue::MIG_DECLINED.load(Ordering::Relaxed),
 			super::migration_queue::MIG_SUPERSEDED.load(Ordering::Relaxed),
 		);
 
-		// `coalesced_tot` goes LAST: scripts read this line as `key=value`
-		// pairs, and appending keeps every existing field where it was.
-		eprintln!("MIGSTATS mig_calls={} evict_calls={} demo_tot={} promo_tot={} evict_tot={} coalesced_tot={}",
+		// `coalesced_tot` goes LAST but for `t_ms`: scripts read this line as
+		// `key=value` pairs, and appending keeps every existing field where it
+		// was.
+		eprintln!("MIGSTATS mig_calls={} evict_calls={} demo_tot={} promo_tot={} evict_tot={} coalesced_tot={} t_ms={t_ms}",
 			CALLS.load(Ordering::Relaxed), ECALLS.load(Ordering::Relaxed),
 			DEMO_TOT.load(Ordering::Relaxed), PROMO_TOT.load(Ordering::Relaxed),
 			EVICT_TOT.load(Ordering::Relaxed), COALESCED_TOT.load(Ordering::Relaxed));
-		eprintln!("MIGSTATS demo={}", f(&DEMO));
-		eprintln!("MIGSTATS promo={}", f(&PROMO));
-		eprintln!("MIGSTATS evict={}", f(&EVICT));
+		eprintln!("MIGSTATS demo={} t_ms={t_ms}", f(&DEMO));
+		eprintln!("MIGSTATS promo={} t_ms={t_ms}", f(&PROMO));
+		eprintln!("MIGSTATS evict={} t_ms={t_ms}", f(&EVICT));
 	}
 }
 
@@ -1279,6 +1311,11 @@ pub struct PolicyWorker<K, V> {
 	/// [`migration_queue`].
 	#[cfg(feature = "hybrid_cache_common")]
 	migration_queue: Option<migration_queue::MigrationQueue>,
+
+	/// The per-pass PHYS instrumentation's state: the over-budget integral and
+	/// the MEMTS rate limit. See `instrument_pass`.
+	#[cfg(feature = "hybrid_cache_common")]
+	phys_pass: crate::phys::PassInstrument,
 }
 
 impl<K, V> Worker for PolicyWorker<K, V>
@@ -1448,9 +1485,10 @@ where
 							s.fast_bytes_used(), s.slow_bytes_used(),
 						));
 					eprintln!(
-						"DIVERGE map={map_len} stack={stack_len} delta={} fallback={} fast_obj={fo} slow_obj={so} fast_b={fb} slow_b={sb}",
+						"DIVERGE map={map_len} stack={stack_len} delta={} fallback={} fast_obj={fo} slow_obj={so} fast_b={fb} slow_b={sb} t_ms={}",
 						map_len as i64 - stack_len as i64,
 						crate::ERASE_FALLBACK.load(Ordering::Relaxed),
+						migstats::t_ms(),
 					);
 				}
 			}
@@ -1494,6 +1532,11 @@ where
 
 			let now = Instant::now();
 
+			// After the gauges, so the MEMTS line and the integral see this
+			// pass's migrations and evictions. See `instrument_pass`.
+			#[cfg(feature = "hybrid_cache_common")]
+			self.instrument_pass(now);
+
 			if let Some(policy) = self.perform_auto_policy(now, has_current_set) {
 				self.status.set_auto_policy(policy)?;
 				self.handle_policy(policy, policy_reconstruct_tx.clone());
@@ -1527,6 +1570,9 @@ where
 		overhead_manager: OverheadManagerRef,
 		promotion_tx: Option<WorkerSender>,
 	) -> Result<Self, CacheError> {
+		// The first worker built in the process fixes the `t_ms` origin.
+		migstats::mark_origin();
+
 		let max_cache_size = status.max_size();
 
 		let mini_stacks = MiniStackManager::new(
@@ -1595,6 +1641,9 @@ where
 
 			#[cfg(feature = "hybrid_cache_common")]
 			migration_queue: None,
+
+			#[cfg(feature = "hybrid_cache_common")]
+			phys_pass: crate::phys::PassInstrument::new(Instant::now()),
 		};
 
 		Ok(worker)
@@ -1620,6 +1669,9 @@ where
 		status: StatusRef,
 		overhead_manager: OverheadManagerRef,
 	) -> Result<Self, CacheError> {
+		// The first worker built in the process fixes the `t_ms` origin.
+		migstats::mark_origin();
+
 		let max_cache_size = status.max_size();
 
 		// Hybrid caches (the only callers of this constructor) are always
@@ -1718,6 +1770,9 @@ where
 
 			#[cfg(feature = "hybrid_cache_common")]
 			migration_queue,
+
+			#[cfg(feature = "hybrid_cache_common")]
+			phys_pass: crate::phys::PassInstrument::new(Instant::now()),
 		};
 
 		Ok(worker)
@@ -2106,6 +2161,58 @@ where
 				stack.large_slow_object_count() as u64,
 			);
 		}
+	}
+
+	/// The physical fast tier, once per pass, on a TIERED cache's worker (a
+	/// flat cache has no fast tier to measure): samples P into its peak, adds
+	/// this interval's `max(0, P + L * omega - F) * dt` to the over-budget
+	/// integral and publishes it, and -- with `PAPER_MEMTS` set -- prints a
+	/// MEMTS line at most every 250 ms. Reporting only: nothing here feeds a
+	/// decision (the gate that will is S5).
+	///
+	/// Per pass that is 17 relaxed loads for P, one `fetch_max`, a few status
+	/// loads and a multiply; the MEMTS line (a `/proc/self/status` read and
+	/// one `eprintln!`) only when enabled and due.
+	#[cfg(feature = "hybrid_cache_common")]
+	fn instrument_pass(&mut self, now: Instant) {
+		if !self.tier_migration {
+			return;
+		}
+
+		let phys = crate::phys::observe();
+
+		let over_budget_byte_seconds = self.phys_pass.pass(
+			now,
+			phys,
+			self.status.live_num_objects(),
+			self.status.hybrid_shared_overhead(),
+			self.status.whole_fast_tier_capacity(),
+		);
+
+		self.status.set_hybrid_over_budget_byte_seconds(over_budget_byte_seconds);
+
+		if !self.phys_pass.memts_due(now) {
+			return;
+		}
+
+		let stats = self.status.hybrid_stats();
+		let (pending_demote, pending_promote) = migration_queue::pending();
+
+		let sample = crate::phys::MemtsSample {
+			t_ms: migstats::t_ms(),
+			wall_ms: crate::phys::wall_ms(),
+			phys,
+			eff: self.status.effective_fast_capacity(),
+			fast_used: stats.fast_bytes_used,
+			fast_metadata_bytes: stats.fast_metadata_bytes,
+			over_budget_byte_seconds,
+			pending_net: pending_demote as i64 - pending_promote as i64,
+			backlog: self.listener.len(),
+			live_tiered_caches: crate::phys::live_tiered_caches(),
+			vmrss_kb: crate::phys::vmrss_kb(),
+		};
+
+		eprintln!("{}", crate::phys::format_memts(&sample));
 	}
 
 	fn apply_buffered_events(
@@ -2682,20 +2789,28 @@ where
 /// counters -- a module that only *perturbs* them is exactly as damaging as
 /// one that reads them.
 ///
-/// Nothing else in the crate's unit tests drives a migration: `apply_migration`
-/// is reached only from a `MigrationQueue` consumer or from
+/// Two tests outside these modules drive migrations and hold it too, for the
+/// same reason: `lru_compact_hybrid_stack`'s stale-demotion test, and
+/// `phys::tests::a_hit_is_counted_by_the_tier_it_was_served_from`, whose real
+/// FIFO cache demotes through its own queue (it reaches the lock through the
+/// `crate::worker::migration_test_lock` re-export, and holds it until the
+/// cache has dropped and joined its consumers). Without it that test's ten
+/// demotions landed inside `flush_returns_only_after_every_disposition`'s
+/// window once in twelve lib runs: `applied: 11` against the expected 1.
+/// Otherwise nothing in the crate's unit tests drives a migration:
+/// `apply_migration` is reached only from a `MigrationQueue` consumer or from
 /// `apply_migration_batches`, and the hybrid caches `lib.rs` builds in its own
 /// tests are all configured with a fast tier as large as the whole cache, so
-/// they never demote. When something does, it will need its own answer.
+/// they never demote. The next test that does needs the lock as well.
 ///
 /// Poisoning is stepped over on purpose: a panicking test is already a
 /// failure, and letting it cascade into every other test's error message only
 /// hides which one broke.
 #[cfg(all(test, feature = "hybrid_cache_common"))]
-mod migration_test_lock {
+pub(crate) mod migration_test_lock {
 	use std::sync::{Mutex, MutexGuard};
 
-	pub(super) fn lock() -> MutexGuard<'static, ()> {
+	pub(crate) fn lock() -> MutexGuard<'static, ()> {
 		static LOCK: Mutex<()> = Mutex::new(());
 
 		LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())

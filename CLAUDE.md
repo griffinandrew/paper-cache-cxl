@@ -47,10 +47,19 @@ src/
                                function admission_tier(policy, hashed_key, status, objects)
                                -> Tier, a runtime match over PaperPolicy with one arm per
                                design's admission rule, called from set() in lib.rs.
-  hybrid_stats.rs             HybridStats — design-neutral snapshot: 3 counters and 12 gauges
-                               (4 tier gauges plus 8 size-split gauges that only LruSizedHybrid
-                               populates). The single stats accessor for every design; the
-                               per-design *_hybrid_stats() methods are gone.
+  hybrid_stats.rs             HybridStats — design-neutral snapshot: 3 counters, 5 tier gauges,
+                               8 size-split gauges that only LruSizedHybrid populates, and 7
+                               physical-fast-tier readings (PHYS_FAST and its peak, the
+                               effective capacity, the over-budget integral, fast/slow hits,
+                               live tiered caches). The single stats accessor for every design;
+                               the per-design *_hybrid_stats() methods are gone.
+  phys.rs                     PHYS_FAST: bytes physically allocated in the fast tier's value
+                               pool, charged in TieredValue::new_in and refunded by the value's
+                               drop, in the stacks' own unit (resident_object_bytes). Sharded
+                               like numa_alloc::measured and PROCESS-GLOBAL: meaningful for one
+                               cache while live_tiered_caches() == 1. Also the policy worker's
+                               per-pass over-budget integral and the MEMTS line (PAPER_MEMTS).
+                               Reporting only; the fast-tier gate (S5) will read it.
   numa_alloc.rs               Node-bound jemalloc arenas. NumaAlloc<NODE_FAST> is the crate's
                                #[global_allocator]; SlowObjects (aliased crate-wide as `Hybrid`)
                                backs the slow tier. Extents are mmap'd then mbind'd before
@@ -106,6 +115,10 @@ tests/
   <design>_hybrid_cache_integration.rs   One per hybrid design (18), each gated on its own
                                          feature. Some carry #[ignore]d at-scale reproductions.
   tiering_integration.rs                 The legacy copy-based manager.
+  phys_fast_identity.rs                  PHYS_FAST == the stacks' fast_used at quiescence, and
+                                         back to its start once the cache drops, for LRU, FIFO,
+                                         CLOCK and LFU. A binary of its own (P is process-global);
+                                         runs in every unit build.
   isolate_pmem_latency.rs                Allocator-level latency probe.
 ```
 

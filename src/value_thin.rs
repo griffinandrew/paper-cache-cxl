@@ -297,11 +297,22 @@ impl<K> Drop for ValueHeader<K> {
 		// the one `item_layout` was given for the allocation, so the layout
 		// rebuilt here is the allocation's. `len` is read BEFORE
 		// `drop_in_place`, which leaves the header uninitialised.
+		let len = unsafe { (*item).len };
+
 		let free = Free {
 			ptr: item.cast::<u8>(),
-			layout: item_layout::<K>(unsafe { (*item).len }),
+			layout: item_layout::<K>(len),
 			tier: self.tier(),
 		};
+
+		// PHYS_FAST: the refund for `TieredValue::new_in`'s charge, on the
+		// tier the tag names, from the `len` read above while the item is
+		// still whole. Once per item: `Arc` runs this drop once. See
+		// `crate::phys`.
+		#[cfg(feature = "hybrid_cache_common")]
+		if matches!(free.tier, Tier::Fast) {
+			crate::phys::refund(crate::phys::value_charge::<K>(len));
+		}
 
 		// SAFETY: as above; the item is initialised and unreachable, and
 		// `free` deallocates only once this has returned or unwound.
@@ -401,9 +412,19 @@ impl<K> TieredValue<K> {
 			);
 		}
 
-		TieredValue {
+		let value = TieredValue {
 			inner: Arc::new(ValueHeader { word: tag(ptr, tier), _item: PhantomData }),
+		};
+
+		// PHYS_FAST: one charge per fast ITEM -- metadata, key and bytes, the
+		// allocation that tiers -- once the value exists; `ValueHeader::drop`
+		// refunds it. See `crate::phys`.
+		#[cfg(feature = "hybrid_cache_common")]
+		if matches!(tier, Tier::Fast) {
+			crate::phys::charge(crate::phys::value_charge::<K>(len));
 		}
+
+		value
 	}
 
 	/// Builds a value in the fast (DRAM) tier.

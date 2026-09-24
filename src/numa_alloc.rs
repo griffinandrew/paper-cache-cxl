@@ -861,6 +861,19 @@ fn slot_for_thread(count: usize) -> usize {
 	assigned % count
 }
 
+/// This thread's arena slot as `slot_for_thread` assigned it, or `u32::MAX` on
+/// a thread that has not allocated through a bound arena yet.
+///
+/// For per-thread-sharded counters outside this module (`crate::phys`), which
+/// key on the slot the allocator already assigns -- as `measured` does --
+/// rather than adding a second thread-local. The shard choice affects
+/// contention, never a sum.
+#[cfg(feature = "hybrid_cache_common")]
+#[inline]
+pub(crate) fn arena_slot() -> u32 {
+	SLOT.with(|s| s.get())
+}
+
 /// `mallocx` flags for an allocation on `node`.
 ///
 /// The fast tier uses the default per-thread cache; the slow tier disables

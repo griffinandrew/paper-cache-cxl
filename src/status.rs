@@ -169,6 +169,34 @@ pub struct AtomicStatus {
 	#[cfg(feature = "hybrid_cache_common")]
 	hybrid_size_threshold: AtomicCacheSize,
 
+	/// The per-object DRAM reservation `omega`: what
+	/// `get_hybrid_dram_shared_overhead` returns for this cache's policy, the
+	/// figure its stack reserves per live object (0 under
+	/// `PAPER_DISABLE_SHARED_OVERHEAD=1`). Written once, by
+	/// `register_tiered_cache`; read by `effective_fast_capacity`.
+	#[cfg(feature = "hybrid_cache_common")]
+	hybrid_shared_overhead: AtomicCacheSize,
+
+	/// Hits by the tier that served them: the tier of the value a hit copied,
+	/// read off the snapshot's tag at the lookup. Incremented beside
+	/// `total_hits` in the hybrid `get`/`get_into` and unsharded like it;
+	/// `peek` counts neither, as it counts no hit.
+	#[cfg(feature = "hybrid_cache_common")]
+	hybrid_fast_hits: AtomicU64,
+	#[cfg(feature = "hybrid_cache_common")]
+	hybrid_slow_hits: AtomicU64,
+
+	/// The policy worker's over-budget integral in whole byte-seconds (see
+	/// `phys::over_budget_increment`), published once per pass.
+	#[cfg(feature = "hybrid_cache_common")]
+	hybrid_over_budget_byte_seconds: AtomicU64,
+
+	/// This cache's place in `phys::live_tiered_caches`. Installed by
+	/// `register_tiered_cache`, released when the status is freed -- after
+	/// the cache has joined the workers that share it.
+	#[cfg(feature = "hybrid_cache_common")]
+	tiered_registration: std::sync::OnceLock<crate::phys::LiveRegistration>,
+
 	/// The policy worker's thread, for `kick_policy_worker`. `None` until
 	/// `PolicyWorker::run` publishes it on entry.
 	///
@@ -355,6 +383,16 @@ impl AtomicStatus {
 			hybrid_large_fast_capacity: AtomicCacheSize::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			hybrid_size_threshold: AtomicCacheSize::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			hybrid_shared_overhead: AtomicCacheSize::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			hybrid_fast_hits: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			hybrid_slow_hits: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			hybrid_over_budget_byte_seconds: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			tiered_registration: std::sync::OnceLock::new(),
 
 			policy_worker: parking_lot::Mutex::new(None),
 
@@ -538,6 +576,76 @@ impl AtomicStatus {
 		self.fast_tier_capacity.store(size, Ordering::Relaxed);
 	}
 
+	/// Marks this status as a TIERED cache's: records `omega`, the per-object
+	/// reservation its stack is built with, and counts the cache in
+	/// `phys::live_tiered_caches` until the status is freed. Called once, by
+	/// the two hybrid constructors; a second call changes nothing.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub fn register_tiered_cache(&self, shared_overhead: CacheSize) {
+		self.tiered_registration.get_or_init(|| {
+			self.hybrid_shared_overhead.store(shared_overhead, Ordering::Relaxed);
+			crate::phys::LiveRegistration::tiered_cache()
+		});
+	}
+
+	/// `omega`, the per-object DRAM reservation this cache's stack makes.
+	/// Zero on a status no hybrid constructor registered.
+	#[cfg(feature = "hybrid_cache_common")]
+	#[must_use]
+	pub fn hybrid_shared_overhead(&self) -> CacheSize {
+		self.hybrid_shared_overhead.load(Ordering::Relaxed)
+	}
+
+	/// `F`, the fast tier's whole DRAM budget: `fast_tier_capacity`, plus the
+	/// LARGE segment's for the size-split design, whose `fast_tier_capacity`
+	/// is its small segment only. Every other design leaves the large
+	/// capacity at 0, so there this is exactly `fast_tier_capacity`.
+	#[cfg(feature = "hybrid_cache_common")]
+	#[must_use]
+	pub fn whole_fast_tier_capacity(&self) -> CacheSize {
+		self.fast_tier_capacity().saturating_add(self.hybrid_large_fast_capacity())
+	}
+
+	/// The fast tier's budget for VALUE bytes, `F - L * omega`, saturating at
+	/// zero: the whole budget (`whole_fast_tier_capacity`) less the
+	/// per-object reservation `omega` for each of the `L` live objects, which
+	/// every design charges to DRAM whichever tier an object's value is in.
+	///
+	/// Meant to be THE helper for this figure. Each stack's settle still
+	/// computes its own (`fast_capacity - reserved_overhead()`, over the
+	/// stack's own object count); S5 rewires the settles onto this function
+	/// with the gate. Until then only the instrumentation reads it --
+	/// `HybridStats::effective_fast_capacity` and the MEMTS line -- and
+	/// nothing decides anything on it.
+	///
+	/// `L` is the object map's count (`live_num_objects`), which leads the
+	/// stack's by whatever the worker has not taken yet.
+	#[cfg(feature = "hybrid_cache_common")]
+	#[must_use]
+	pub fn effective_fast_capacity(&self) -> CacheSize {
+		let reserved = self.live_num_objects().saturating_mul(self.hybrid_shared_overhead());
+
+		self.whole_fast_tier_capacity().saturating_sub(reserved)
+	}
+
+	/// Counts a hit served from `tier`, the tier of the value the hit copies.
+	/// Called beside `incr_hits`, never instead of it.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub fn incr_served_hit(&self, tier: crate::Tier) {
+		let counter = match tier {
+			crate::Tier::Fast => &self.hybrid_fast_hits,
+			crate::Tier::Slow => &self.hybrid_slow_hits,
+		};
+
+		counter.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Publishes the policy worker's over-budget integral.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub(crate) fn set_hybrid_over_budget_byte_seconds(&self, byte_seconds: u64) {
+		self.hybrid_over_budget_byte_seconds.store(byte_seconds, Ordering::Relaxed);
+	}
+
 	#[cfg(feature = "hybrid_cache_common")]
 	pub fn record_hybrid_promotion(&self) {
 		self.hybrid_promotions.fetch_add(1, Ordering::Relaxed);
@@ -618,6 +726,13 @@ impl AtomicStatus {
 			large_fast_objects: self.hybrid_large_fast_objects.load(Ordering::Relaxed),
 			small_slow_objects: self.hybrid_small_slow_objects.load(Ordering::Relaxed),
 			large_slow_objects: self.hybrid_large_slow_objects.load(Ordering::Relaxed),
+			phys_fast_bytes: crate::phys::fast_bytes(),
+			phys_fast_bytes_max: crate::phys::fast_bytes_max(),
+			effective_fast_capacity: self.effective_fast_capacity(),
+			over_budget_byte_seconds: self.hybrid_over_budget_byte_seconds.load(Ordering::Relaxed),
+			fast_hits: self.hybrid_fast_hits.load(Ordering::Relaxed),
+			slow_hits: self.hybrid_slow_hits.load(Ordering::Relaxed),
+			live_tiered_caches: crate::phys::live_tiered_caches(),
 		}
 	}
 
@@ -812,6 +927,12 @@ impl AtomicStatus {
 		self.total_sets.store(0, Ordering::Relaxed);
 		self.total_dels.store(0, Ordering::Relaxed);
 
+		// The served-tier split of `total_hits`, reset with it.
+		#[cfg(feature = "hybrid_cache_common")]
+		self.hybrid_fast_hits.store(0, Ordering::Relaxed);
+		#[cfg(feature = "hybrid_cache_common")]
+		self.hybrid_slow_hits.store(0, Ordering::Relaxed);
+
 		// `HybridStats` documents the three tier-movement counters as totals
 		// since creation or the last `wipe()`, so a wipe resets them along
 		// with the request counters above.
@@ -954,5 +1075,58 @@ mod tests {
 		assert_eq!(stats.promotions, 0);
 		assert_eq!(stats.demotions, 0);
 		assert_eq!(stats.evictions, 0);
+	}
+
+	#[cfg(feature = "hybrid_cache_common")]
+	#[test]
+	fn served_hits_are_split_by_tier_and_cleared_with_the_hits() {
+		use crate::Tier;
+
+		let status = AtomicStatus::new(
+			1000,
+			&[PaperPolicy::LruCompactHybrid],
+			PaperPolicy::LruCompactHybrid,
+		).expect("Could not initialize atomic status");
+
+		status.incr_served_hit(Tier::Fast);
+		status.incr_served_hit(Tier::Fast);
+		status.incr_served_hit(Tier::Slow);
+
+		let stats = status.hybrid_stats();
+		assert_eq!((stats.fast_hits, stats.slow_hits), (2, 1));
+
+		status.clear();
+
+		let stats = status.hybrid_stats();
+		assert_eq!((stats.fast_hits, stats.slow_hits), (0, 0));
+	}
+
+	#[cfg(feature = "hybrid_cache_common")]
+	#[test]
+	fn effective_fast_capacity_takes_the_reservation_off_the_whole_budget() {
+		let status = AtomicStatus::new(
+			1_000_000,
+			&[PaperPolicy::LruCompactHybrid],
+			PaperPolicy::LruCompactHybrid,
+		).expect("Could not initialize atomic status");
+
+		status.set_fast_tier_capacity(10_000);
+		assert_eq!(status.effective_fast_capacity(), 10_000, "nothing live, nothing reserved");
+
+		status.register_tiered_cache(100);
+		status.register_tiered_cache(7);
+		assert_eq!(status.hybrid_shared_overhead(), 100, "the first registration stands");
+
+		status.add_num_objects(30);
+		assert_eq!(status.effective_fast_capacity(), 10_000 - 30 * 100);
+
+		// The size-split design's large segment is part of F.
+		status.set_hybrid_large_fast_capacity(500);
+		assert_eq!(status.effective_fast_capacity(), 10_500 - 3_000);
+
+		// Saturating: a reservation past the budget leaves nothing, not a wrap.
+		status.add_num_objects(100);
+		assert_eq!(status.effective_fast_capacity(), 0);
+		assert_eq!(status.hybrid_stats().effective_fast_capacity, 0);
 	}
 }

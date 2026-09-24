@@ -184,6 +184,13 @@ mod hybrid_stats;
 #[cfg(feature = "hybrid_cache_common")]
 pub use crate::hybrid_stats::HybridStats;
 
+// PHYS_FAST -- the bytes physically allocated in the fast tier's value pool,
+// charged and refunded by the value constructors and destructors -- and the
+// count of live tiered caches it is meaningful under. Public so a harness or
+// a test can read it directly; see `phys.rs`'s module doc.
+#[cfg(feature = "hybrid_cache_common")]
+pub mod phys;
+
 #[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 pub mod tiering;
 
@@ -2311,6 +2318,14 @@ where
 		let status = Arc::new(AtomicStatus::new(max_size, &policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
+		// A TIERED cache: counted in `phys::live_tiered_caches` until its
+		// status is freed, and its per-object reservation recorded for
+		// `effective_fast_capacity` -- the figure `init_policy_stack` hands
+		// the stack, from the same function.
+		status.register_tiered_cache(
+			crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+		);
+
 		// Requirement: fast-tier size is runtime-configurable (not baked
 		// into the policy string, unlike e.g. `TwoQ`/`SThreeFifo`), so the
 		// requested capacity is recorded on the shared status immediately;
@@ -2411,6 +2426,8 @@ where
 		let result = match snapshot {
 			Some(value) => {
 				self.status.incr_hits();
+				// The tier the copy below reads from: the snapshot's tag.
+				self.status.incr_served_hit(value.tier());
 				Ok(value.bytes().to_vec())
 			},
 
@@ -2466,6 +2483,7 @@ where
 		let result = match snapshot {
 			Some(value) => {
 				self.status.incr_hits();
+				self.status.incr_served_hit(value.tier());
 				out.clear();
 				gi_fast = if value.is_fast() { 1 } else { 0 };
 				out.extend_from_slice(value.bytes());
@@ -2776,6 +2794,15 @@ where
 		self.status.fast_tier_capacity()
 	}
 
+	/// The fast tier's budget for VALUE bytes: the whole fast-tier budget
+	/// less the per-object DRAM reservation for every live object,
+	/// `F - L * omega`, saturating at zero. Reporting only at this step --
+	/// see `AtomicStatus::effective_fast_capacity`.
+	#[must_use]
+	pub fn effective_fast_capacity(&self) -> CacheSize {
+		self.status.effective_fast_capacity()
+	}
+
 	/// Returns the active hybrid design's tier-movement counters and live
 	/// tier gauges, in a design-neutral shape.
 	///
@@ -2911,6 +2938,11 @@ where
 		let objects = new_hybrid_object_map();
 		let status = Arc::new(AtomicStatus::new(max_size, &policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		// As in `new_hybrid`: a tiered cache, and its per-object reservation.
+		status.register_tiered_cache(
+			crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
+		);
 
 		status.set_fast_tier_capacity(small_capacity);
 		status.set_hybrid_large_fast_capacity(large_capacity);

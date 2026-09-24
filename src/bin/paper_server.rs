@@ -455,6 +455,25 @@ fn render_self_stats(stats: &SelfStats, cache: &Cache) -> String {
 		);
 	}
 
+	// PHYS_FAST (`paper_cache::phys`) and the budget it is measured against,
+	// APPENDED after every existing line so no reader's anchor or position
+	// moves. None of these lines starts with a word the existing readers
+	// anchor on (run_mem.py's `^fast\s+\d+ objects`, `^slow\s+`, `^dram\s+`,
+	// `^promotions`, ...). P and its peak are process-global; the server runs
+	// one cache, which `tiered caches` confirms. Reporting only.
+	#[cfg(not(feature = "all_dram"))]
+	{
+		let tier = cache.hybrid_stats();
+
+		let _ = writeln!(out, "\n*** PHYSICAL FAST TIER (reporting only) ***\n");
+		let _ = writeln!(out, "phys fast      {} B (peak >= {} B)",
+			tier.phys_fast_bytes, tier.phys_fast_bytes_max);
+		let _ = writeln!(out, "eff fast cap   {} B", tier.effective_fast_capacity);
+		let _ = writeln!(out, "over budget    {} B*s", tier.over_budget_byte_seconds);
+		let _ = writeln!(out, "hits fast/slow {}/{}", tier.fast_hits, tier.slow_hits);
+		let _ = writeln!(out, "tiered caches  {}", tier.live_tiered_caches);
+	}
+
 	out
 }
 
