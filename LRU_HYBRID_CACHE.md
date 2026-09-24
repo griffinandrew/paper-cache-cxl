@@ -205,7 +205,9 @@ After processing *each* `Get`/`Set`/etc event (not once per batch, so a demotion
 mid-batch gets physically executed as soon as possible under concurrent load), `PolicyWorker::run()`
 calls `apply_tier_migrations()`, which drains the stack's pending migrations
 and applies them in two parallel phases — every demotion, fully complete, before any promotion
-begins — via `rayon`. See `HYBRID_CACHES.md`'s "Turning 'this key changed tier' into an actual byte
+begins — via `rayon`. (Each drain is first split by `split_tier_migrations`, which drops every
+entry that a later entry for the other tier supersedes, so that order cannot reverse a key's own
+intents.) See `HYBRID_CACHES.md`'s "Turning 'this key changed tier' into an actual byte
 move" section for the current, exact mechanism (this document previously showed a simple sequential
 `for` loop here, which was accurate at the time but has since been replaced for throughput reasons
 under demotion-heavy real workloads).

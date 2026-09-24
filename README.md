@@ -113,7 +113,10 @@ set(k, v) ──WorkerEvent──> policy stack decides tiers
   (`MIGRATION_QUEUE_THREADS=0`) that is a physical barrier: the fast tier has given back space
   before anything moves into it. With the queue enabled it is an ordering of *enqueues* — per-key
   order is guaranteed by the hash sharding, but a promotion for one key can be physically applied
-  before an unrelated key's demotion has run.
+  before an unrelated key's demotion has run. The split drops every entry that a later entry for
+  the other tier supersedes (`split_tier_migrations`), so it can never reverse a key's own
+  intents: a key promoted and demoted again in one drain used to come out demote-first and stay
+  in DRAM while the stack counted it slow.
 - **Drain target.** `settle_fast_tier` holds the fast tier at `FAST_TIER_DRAIN_TARGET` (0.98) of
   its effective budget: it demotes whenever usage is above that level and stops the moment it is
   back at it. One threshold, not a band — a settle moves only what the event that triggered it

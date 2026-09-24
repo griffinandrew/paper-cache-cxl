@@ -268,6 +268,12 @@ where
 	/// keeps the default empty `Vec`. The caller
 	/// (`PolicyWorker`) is responsible for physically migrating each
 	/// returned key's object bytes to `new_tier`.
+	///
+	/// In emission order, and the order is meaningful: the caller drops every
+	/// entry that a LATER entry of the same drain supersedes by naming the
+	/// other tier (`split_tier_migrations`), so a stack may report a
+	/// transition it then reverses within the same drain and only the
+	/// reversal is applied.
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		Vec::new()
 	}

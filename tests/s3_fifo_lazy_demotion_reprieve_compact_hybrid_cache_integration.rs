@@ -108,6 +108,25 @@ mod hybrid_cache_tests {
 
     const MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+    /// The payload length whose ITEM is exactly 32 bytes under both the
+    /// default layout and `thin_header` -- the idiom the midpoint reprieve
+    /// suite already uses for the same "one fits, two do not" budget.
+    ///
+    /// A tier counter charges an object's own allocation: `nallocx(len)` under
+    /// the default layout, `nallocx(16 + len)` under `thin_header`, where the
+    /// length, the expiry and a `u32` key sit in front of the value. So the
+    /// payload gives up exactly that prefix and the charge is the same in
+    /// both.
+    const PAYLOAD_LEN: usize =
+        if cfg!(feature = "thin_header") { 16 } else { 32 };
+
+    /// The first `PAYLOAD_LEN` bytes of a 32-byte literal. The literals below
+    /// differ within their first 16 bytes, so each key's value stays
+    /// distinguishable in every layout.
+    fn payload(literal: &'static [u8; 32]) -> &'static [u8] {
+        &literal[..PAYLOAD_LEN]
+    }
+
     /// Returns true if `key` is still in the ONE-ACCESS queue (as opposed to
     /// the main queue's slow segment).
     ///
@@ -183,18 +202,42 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(0.00004)).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
+        // 0.00004 * 1_048_576 = 41 bytes of one-access budget, and 32-byte
+        // items (`payload`): one fits, two do not (64 > 41), so admitting key
+        // 2 is what ages key 1 out. The 15-byte payloads this test used to
+        // set are charged 16 under the default layout, so BOTH fit (32 <= 41)
+        // and key 1 never aged out at all -- the probe below would promote it.
+        let first = payload(b"first value 123 ................");
+        let second = payload(b"second value 45 ................");
+
+        cache.set(1u32, first, None).expect("set should succeed");
         // Sitting in the one-access queue, which is slow-tier in this variant.
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
 
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(2u32, second, None).expect("set should succeed");
+
+        // Nothing below means anything until the policy worker has TAKEN
+        // set(2): the age-out happens inside that event. The old fixture
+        // passed with no age-out at all because this waited a fixed 300 ms:
+        // the worker took the sets and then parked on its 1 s idle poll, so
+        // the probe's own get was never processed before the probe looked,
+        // and it found key 1 unmoved either way. The gauges
+        // agree with the object map only once the worker has taken both
+        // admissions.
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || {
+                let stats = cache.hybrid_stats();
+                let live = (1u32..=2).filter(|key| cache.has(key)).count() as u64;
+                stats.fast_objects + stats.slow_objects == live
+            }),
+            "the tier gauges never converged on the live keys",
+        );
 
         // Unlike the ghost-queue predecessor (where key 1 would be evicted
         // here), key 1 must remain alive -- and must have moved OUT of the
         // one-access queue into the main queue's slow segment.
-        std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(cache.has(&1u32), "key 1 must still be a live entry, not evicted");
-        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
+        assert_eq!(cache.get(&1u32).unwrap(), first);
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
 
         // The load-bearing assertion. `tier_of` alone cannot show this: key 1
@@ -224,35 +267,53 @@ mod hybrid_cache_tests {
             4_096,
             CacheTierSize::Bytes(4_096), PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(0.01)).expect("cache should construct");
 
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
-        // Precondition: key 1 has been spliced into the main queue's slow
-        // segment. Asserting `tier_of == Slow` here would be vacuous (it was
-        // Slow from admission), so wait on the gauge that actually moves --
-        // the main queue gaining its first resident.
+        // 32-byte items (`payload`) against the 40-byte budget: one fits, two
+        // do not (64 > 40), so admitting key 2 reprieves key 1 into the main
+        // queue's slow segment. The 15-byte payloads this test used to set
+        // are charged 16 under the default layout, so BOTH fit (32 <= 40):
+        // key 1 was never reprieved there, and the get below promoted it
+        // straight out of the one-access queue -- the test passed without
+        // the mechanism its name describes.
+        let first = payload(b"first value 123 ................");
+        let second = payload(b"second value 45 ................");
+
+        cache.set(1u32, first, None).expect("set should succeed");
+        cache.set(2u32, second, None).expect("set should succeed");
+
+        // Precondition: the worker has TAKEN set(2), inside which key 1 is
+        // spliced into the main queue. `tier_of == Slow` would be vacuous (it
+        // was Slow from admission); the gauges agree with the object map only
+        // once both admissions have been processed.
         assert!(
             wait_until(MIGRATION_TIMEOUT, || {
-                cache.has(&1u32) && cache.tier_of(&1u32) == Some(Tier::Slow)
+                let stats = cache.hybrid_stats();
+                let live = (1u32..=2).filter(|key| cache.has(key)).count() as u64;
+                stats.fast_objects + stats.slow_objects == live
             }),
-            "key 1 must survive the splice",
+            "the tier gauges never converged on the live keys",
         );
+        assert!(cache.has(&1u32), "key 1 must survive the splice");
 
-        // Re-access the reprieved key. With one-access-queue pressure no
-        // longer routed through eviction at all (see the module doc), the
-        // ONLY thing that ever calls evict_one() -- and hence
-        // check_slow_midpoint(), which is what actually checks this
-        // reference bit -- is real max_size pressure. Force a real
-        // eviction pass via a deterministic resize, not a filler set()
-        // (same trigger the other main-queue-tail tests in this family
+        // Re-access the reprieved key, and prove it WAS reprieved: in the
+        // main queue a plain access only sets the reference bit, where in the
+        // one-access queue it would promote the key at once. The probe is that
+        // access. With one-access-queue pressure no longer routed through
+        // eviction at all (see the module doc), the ONLY thing that ever calls
+        // evict_one() -- and hence check_slow_midpoint(), which is what
+        // actually checks this reference bit -- is real max_size pressure.
+        // Force a real eviction pass via a deterministic resize, not a filler
+        // set() (same trigger the other main-queue-tail tests in this family
         // use), so the reference bit actually gets checked.
-        cache.get(&1u32).expect("get should succeed");
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !probe_is_in_one_access_queue(&cache, 1u32),
+            "key 1 was never reprieved: it is still in the one-access queue",
+        );
 
         cache.resize(180).expect("resize should succeed");
 
         let promoted = wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Fast));
         assert!(promoted, "a reprieved key should still be promotable via the ordinary second chance");
-        assert_eq!(cache.get(&1u32).unwrap(), b"first value 123");
+        assert_eq!(cache.get(&1u32).unwrap(), first);
     }
 
     #[test]
@@ -594,9 +655,16 @@ mod hybrid_cache_tests {
 
         let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(0.00004)).expect("cache should construct");
 
+        // 32-byte items (`payload`), so key 2's admission really does push key
+        // 1 past the 41-byte one-access budget. With the 15-byte payloads this
+        // test used to set, both fit under the default layout and nothing was
+        // reprieved at all.
+        let first = payload(b"first value 123 ................");
+        let second = payload(b"second value 45 ................");
+
         let ttl_secs = 5u32;
         let set_at = std::time::Instant::now();
-        cache.set(1u32, b"first value 123", Some(ttl_secs)).expect("set should succeed");
+        cache.set(1u32, first, Some(ttl_secs)).expect("set should succeed");
         // Slow from the outset -- the one-access queue is PMEM in this variant.
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
 
@@ -608,9 +676,25 @@ mod hybrid_cache_tests {
         // the splice with its TTL intact, which is what the rest of this test
         // checks -- still alive immediately after, and expiring on the
         // original schedule rather than being reset or dropped early.
-        cache.set(2u32, b"second value 45", None).expect("set should succeed");
+        cache.set(2u32, second, None).expect("set should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Slow));
         assert!(cache.has(&1u32), "key should still be alive right after the reprieve");
+
+        // And the reprieve did happen: once the worker has taken both
+        // admissions, key 1 is in the main queue, where an access does not
+        // promote it. A get does not touch the TTL.
+        assert!(
+            wait_until(MIGRATION_TIMEOUT, || {
+                let stats = cache.hybrid_stats();
+                let live = (1u32..=2).filter(|key| cache.has(key)).count() as u64;
+                stats.fast_objects + stats.slow_objects == live
+            }),
+            "the tier gauges never converged on the live keys",
+        );
+        assert!(
+            !probe_is_in_one_access_queue(&cache, 1u32),
+            "key 1 was never reprieved: it is still in the one-access queue",
+        );
 
         let remaining = std::time::Duration::from_millis(ttl_secs as u64 * 1000 + 500)
             .saturating_sub(set_at.elapsed());

@@ -76,9 +76,9 @@ copies" below.
 
 ### The work is done by a standing consumer pool, not by the worker
 
-`apply_tier_migrations` partitions the drained migrations into demotions and promotions, then
-hands each entry to `apply_physical`. With the migration queue enabled — the default — that
-function does one thing:
+`apply_tier_migrations` partitions the drained migrations into demotions and promotions, dropping
+any entry that a later entry for the other tier supersedes, then hands each entry to
+`apply_physical`. With the migration queue enabled — the default — that function does one thing:
 
 ```rust
 if let Some(queue) = migration_queue {
@@ -109,6 +109,20 @@ guaranteed; cross-key ordering is not.
 
 (An earlier revision did enforce a hard batch-wide barrier via two sequential
 `rayon::into_par_iter().for_each` phases. That is gone — see "The abandoned fan-out" below.)
+
+The split **drops every entry whose key has a later entry for the other tier in the same drain**
+(`split_tier_migrations`), so no key is in both halves. Without that, the split reversed a key's
+own intents: a key promoted and then demoted again in one drain (net intent slow) was enqueued
+demote-first, the demote declined against a value still in PMEM, the promote copied it into DRAM,
+and the stack counted it slow from then on with nothing left to move it back. `apply_migration`
+acts on whatever object holds the key when it runs, so a key's entries applied in order end in its
+last entry's tier; everything the split keeps for a key is in that tier, so it gets there in at
+most one copy. Same-tier duplicates are kept (the second declines). Entries dropped this way are
+counted in `MIGSTATS coalesced_tot`. A one-sided drain (all demotions or all promotions) is
+returned whole, with nothing allocated or hashed; a mixed one costs a map sized to its smaller
+half. The merged store's `touch_slot` still queues its promotion before the settle that may undo
+it, so such a promotion arrives as a `(k, Fast), (k, Slow)` pair: dropped to the Slow when both
+are in one drain, applied in order through the per-key FIFO (a round trip) when they are not.
 
 ### The copy runs with no map guard held
 

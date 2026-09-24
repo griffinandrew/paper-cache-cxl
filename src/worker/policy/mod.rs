@@ -148,9 +148,16 @@ pub mod migration_queue {
 	/// when an earlier entry for the same key already moved it; `SUPERSEDED` is
 	/// a value replaced by a `set` mid-copy.
 	///
-	/// GONE and DECLINED are precisely what a key-keyed pending map would drop
-	/// before ever dispatching, so their sum is the floor on what coalescing
-	/// would save.
+	/// DECLINED counts less than it used to. `split_tier_migrations` already
+	/// drops, inside one drain, every entry that a later entry for the other
+	/// tier supersedes, so a key reversed within a drain no longer reaches the
+	/// queue as a pair. What reaches DECLINED now is chiefly redundancy ACROSS
+	/// drains (an entry for a key that an entry from an earlier drain already
+	/// moved), same-tier duplicates within a drain (kept on purpose: the
+	/// second declines), and the overwrite-restore no-op -- a `(k, Fast)` that
+	/// finds the value a `set` built in DRAM. GONE, and the cross-drain part of
+	/// DECLINED, are what a key-keyed pending map spanning drains would still
+	/// drop before dispatch.
 	pub static MIG_GONE: AtomicU64 = AtomicU64::new(0);
 	pub static MIG_DECLINED: AtomicU64 = AtomicU64::new(0);
 	pub static MIG_SUPERSEDED: AtomicU64 = AtomicU64::new(0);
@@ -884,6 +891,15 @@ pub mod migstats {
 	pub static DEMO_TOT: AtomicU64 = AtomicU64::new(0);
 	pub static PROMO_TOT: AtomicU64 = AtomicU64::new(0);
 	pub static EVICT_TOT: AtomicU64 = AtomicU64::new(0);
+
+	/// Drained migration entries `split_tier_migrations` dropped because a
+	/// later entry in the SAME drain named the same key for the OTHER tier --
+	/// the intents that never reach `DEMO`/`PROMO` above. So a drain's entries
+	/// are `DEMO_TOT + PROMO_TOT + COALESCED_TOT`, and a promote-then-demote
+	/// pair for one key shows up here as 1 rather than as a promote copy
+	/// undone by a demote copy. A same-tier duplicate is not dropped: it is
+	/// counted in `DEMO`/`PROMO` like any other entry, and declines.
+	pub static COALESCED_TOT: AtomicU64 = AtomicU64::new(0);
 	pub static CALLS: AtomicU64 = AtomicU64::new(0);
 	static START: OnceLock<Instant> = OnceLock::new();
 	static LAST_DUMP_MS: AtomicU64 = AtomicU64::new(0);
@@ -978,10 +994,12 @@ pub mod migstats {
 			super::migration_queue::MIG_SUPERSEDED.load(Ordering::Relaxed),
 		);
 
-		eprintln!("MIGSTATS mig_calls={} evict_calls={} demo_tot={} promo_tot={} evict_tot={}",
+		// `coalesced_tot` goes LAST: scripts read this line as `key=value`
+		// pairs, and appending keeps every existing field where it was.
+		eprintln!("MIGSTATS mig_calls={} evict_calls={} demo_tot={} promo_tot={} evict_tot={} coalesced_tot={}",
 			CALLS.load(Ordering::Relaxed), ECALLS.load(Ordering::Relaxed),
 			DEMO_TOT.load(Ordering::Relaxed), PROMO_TOT.load(Ordering::Relaxed),
-			EVICT_TOT.load(Ordering::Relaxed));
+			EVICT_TOT.load(Ordering::Relaxed), COALESCED_TOT.load(Ordering::Relaxed));
 		eprintln!("MIGSTATS demo={}", f(&DEMO));
 		eprintln!("MIGSTATS promo={}", f(&PROMO));
 		eprintln!("MIGSTATS evict={}", f(&EVICT));
@@ -1270,6 +1288,13 @@ where
 	V: Send + Sync,
 {
 	fn run(&mut self) -> Result<(), CacheError> {
+		// Published before the first pass, so a kick can find this thread
+		// from the moment it could be parked -- see
+		// `AtomicStatus::kick_policy_worker`. Overwrites, rather than keeping
+		// the first, so a status ever handed to a second worker would wake
+		// the live one and not a thread that has exited.
+		self.status.set_policy_worker_thread(thread::current());
+
 		let (
 			policy_reconstruct_tx,
 			policy_reconstruct_rx,
@@ -1376,21 +1401,25 @@ where
 				// allocator-level retention behavior responsible for that gap
 				// is independent of this loop's migration granularity.
 				//
-				// STAYS PER-EVENT, and not only for the latency reason above.
-				// Hoisting it out of this loop would widen the batch each
-				// `apply_tier_migrations` call hands to
-				// `apply_migration_batches`, and that function PARTITIONS its
+				// STAYS PER-EVENT, for the latency reason above. It used to
+				// have a second one: `apply_migration_batches` PARTITIONS its
 				// batch into demotions and promotions and applies all of the
-				// first before any of the second. Per-key emission order does
-				// not survive that partition: a key promoted by event 3 and
-				// demoted by event 40 arrives as demote-then-promote and ends
-				// up physically in DRAM while the policy stack records it as
-				// slow. `MigrationQueue`'s own doc comment spells out why that
-				// does not self-heal -- the stack already believes the newer
-				// tier, so it never re-emits -- which is why that queue is
-				// sharded BY KEY in the first place. Draining once per event
-				// bounds the batch to one event's worth of decisions and keeps
-				// the window at what it has always been.
+				// first before any of the second, and per-key emission order
+				// did not survive that -- a key promoted and then demoted in
+				// one drain arrived demote-then-promote and ended up
+				// physically in DRAM while the policy stack recorded it as
+				// slow, which does not self-heal (`MigrationQueue`'s doc: the
+				// stack already believes the newer tier, so it never
+				// re-emits). Draining per event never actually closed that
+				// hole: ONE event can emit both entries for one key (the
+				// merged store's touch queues its promotion before the settle
+				// that may demote the key again), and the drain after
+				// `apply_evictions` below collects a whole eviction loop's
+				// decisions, the merged CLOCK hand's second chances among
+				// them. `split_tier_migrations` now closes it for a drain of
+				// any width: the partition drops every entry that a later
+				// entry for the other tier supersedes, so no key reaches both
+				// halves.
 				//
 				// The reason it was expensive is gone regardless:
 				// `MergedStore::drain_migrations` used to take a WRITE lock on
@@ -1469,6 +1498,11 @@ where
 				self.status.set_auto_policy(policy)?;
 				self.handle_policy(policy, policy_reconstruct_tx.clone());
 			}
+
+			// The pass is complete: what a test waits on to see that a kick
+			// reached this thread.
+			#[cfg(test)]
+			self.status.record_policy_worker_pass();
 
 			self.delay_event_loop(now, has_current_set);
 		}
@@ -1916,12 +1950,11 @@ where
 			(stack.inline_demotion_accounting(), stack.drain_tier_migrations())
 		};
 
+		// Handed over whole: `apply_migration_batches` does the split itself
+		// (`split_tier_migrations`), and taking the drain unsplit is what
+		// makes that the only way in.
 		if !migrations.is_empty() {
-			let (demotions, promotions): (Vec<_>, Vec<_>) = migrations
-				.into_iter()
-				.partition(|(_, tier)| *tier == Tier::Slow);
-
-			self.apply_migration_batches(demotions, promotions, inline_demotion_accounting);
+			self.apply_migration_batches(migrations, inline_demotion_accounting);
 		}
 
 		let drained_demotions = match &mut self.policy_stack {
@@ -1949,15 +1982,32 @@ where
 	/// Split out of [`Self::apply_tier_migrations`] so this accounting can be
 	/// unit-tested against hand-built batches, instead of having to coax a
 	/// real policy stack into emitting each of the four outcomes.
+	///
+	/// Takes one drain UNSPLIT and splits it itself, with
+	/// [`split_tier_migrations`]. It used to take the two halves already
+	/// partitioned, which left the ordering hazard with every caller: a key
+	/// promoted then demoted in one drain was applied demote-first -- the
+	/// demote declined against a value that was still slow, the promote then
+	/// copied it into DRAM -- and the stack went on counting it slow with
+	/// nothing left to move it back. The split drops every entry that a later
+	/// entry for the other tier supersedes, so no key is in both halves and
+	/// the order between them cannot matter to any key; demotions still go
+	/// first so DRAM is freed before it is claimed. Every caller, the tests
+	/// included, goes through it, because there is no other way in.
 	#[cfg(feature = "hybrid_cache_common")]
 	fn apply_migration_batches(
 		&self,
-		demotions: Vec<(HashedKey, Tier)>,
-		promotions: Vec<(HashedKey, Tier)>,
+		migrations: Vec<(HashedKey, Tier)>,
 		inline_demotion_accounting: bool,
 	) {
 		if !self.tier_migration {
 			return;
+		}
+
+		let (demotions, promotions, coalesced) = split_tier_migrations(migrations);
+
+		if coalesced > 0 {
+			migstats::COALESCED_TOT.fetch_add(coalesced as u64, std::sync::atomic::Ordering::Relaxed);
 		}
 
 		migration_queue::BURST_MAX.fetch_max(
@@ -2280,7 +2330,7 @@ where
 
 	/// Parks this thread between polls.
 	///
-	/// The sleep is unconditional, including when the poll just processed a
+	/// The wait is unconditional, including when the poll just processed a
 	/// full batch and more work is already queued. That looks like it should
 	/// be wrong -- the backlog visibly grows -- but it is load-bearing, and
 	/// measured: this thread shares its cores with the request path, and
@@ -2292,22 +2342,219 @@ where
 	/// 4.20M -> 3.17M gets/sec; `thread::yield_now()` in place of the sleep
 	/// measured the same as the spin (3.15M), because with every client
 	/// thread runnable a yield returns almost immediately.
+	///
+	/// A PARK, not a sleep: `thread::park_timeout` with nobody unparking
+	/// returns at the same timeout `thread::sleep` did, so the measured
+	/// behaviour above is unchanged, but the thread can now be woken early by
+	/// `AtomicStatus::kick_policy_worker`. Nothing in production kicks yet.
+	/// The two ways a park can return early both cost one extra pass and
+	/// nothing else: a spurious wakeup, and a stale unpark token -- a kick
+	/// that landed while this thread was mid-pass is kept by the thread and
+	/// consumed by the next park, which returns at once. Neither can lose
+	/// work: the pass it causes drains whatever is queued, exactly as a timed
+	/// wakeup would.
+	///
+	/// How long it waits is `polling_delay`'s decision, which counts the sets
+	/// THIS pass handled. It used to consult only the sets before it, so the
+	/// first pass to see a burst after SET_RECENCY_DURATION of quiet chose the
+	/// long poll again, and whatever the burst sent after that pass -- its
+	/// later sets, their demotions, their settles -- waited up to another
+	/// second. The wait BEFORE that first pass is not this function's to
+	/// shorten: a worker parked on the long poll when a burst begins sleeps
+	/// it out unless it is kicked (see `AtomicStatus::kick_policy_worker`).
 	fn delay_event_loop(&mut self, now: Instant, has_current_set: bool) {
-		let has_recent_set = self.last_set_time
-			.is_some_and(|last_set_time| now - last_set_time <= SET_RECENCY_DURATION);
+		let delay = polling_delay(now, self.last_set_time, has_current_set);
 
 		if has_current_set {
 			self.last_set_time = Some(now);
 		}
 
-		let delay = if has_recent_set {
-			SHORT_POLLING_DURATION
-		} else {
-			LONG_POLLING_DURATION
+		thread::park_timeout(delay);
+	}
+}
+
+/// How long the policy worker waits before its next pass.
+///
+/// SHORT while sets are arriving -- this pass handled one, or the last one
+/// was within SET_RECENCY_DURATION -- and LONG only once they have stopped.
+/// `has_current_set` is the half that was missing: the recency test alone
+/// reads `last_set_time` from BEFORE this pass, so the pass that first saw a
+/// burst after 5 s of quiet (or the cache's very first sets) parked on the
+/// 1 s poll again, and the rest of the burst waited another second. It
+/// cannot shorten the wait before that pass, which a worker already parked on
+/// the long poll sleeps out -- see `AtomicStatus::kick_policy_worker`.
+///
+/// Pure, and taking the clock as an argument, so the decision can be tested
+/// without a running worker or a real 5 s wait.
+fn polling_delay(now: Instant, last_set_time: Option<Instant>, has_current_set: bool) -> Duration {
+	let has_recent_set = last_set_time
+		.is_some_and(|last_set_time| now - last_set_time <= SET_RECENCY_DURATION);
+
+	match has_recent_set || has_current_set {
+		true => SHORT_POLLING_DURATION,
+		false => LONG_POLLING_DURATION,
+	}
+}
+
+/// Splits one drain into the demotions and the promotions
+/// `apply_migration_batches` applies -- every demotion, then every
+/// promotion -- dropping each entry whose key has a LATER entry for the OTHER
+/// tier in the same drain. Returns `(demotions, promotions, dropped)`.
+///
+/// Each half keeps drain order. The contract, pinned exhaustively by
+/// `migration_split_tests` over every drain of up to five entries on two
+/// keys:
+///
+///   * no key is in both halves: every entry kept for a key is in the tier
+///     of that key's last entry;
+///   * so applying the demotions and then the promotions leaves every key in
+///     the tier of its LAST entry in drain order -- where applying the whole
+///     drain in order leaves it -- in at most one copy per key;
+///   * `dropped` counts only the entries a later entry for the other tier
+///     superseded. Same-tier duplicates are kept: the partition cannot
+///     reorder them against each other, and the second one declines.
+///
+/// # Why the partition needs it
+///
+/// `apply_migration` carries no identity: it acts on whatever object holds
+/// the key when it runs, and declines when that object is already in the
+/// requested tier. So a key's entries applied in order leave its value in
+/// the last entry's tier -- and applied demotions-first they need not.
+/// `[(k, Fast), (k, Slow)]` on a slow value -- promoted, then demoted again,
+/// net intent Slow -- went out Slow-then-Fast: the demote declined against a
+/// value still in CXL, the promote copied it into DRAM, and the stack counted
+/// it slow from then on with nothing left to move it. The mirror,
+/// `[(k, Slow), (k, Fast)]` on a fast value, ended in the right tier but
+/// through a round trip to CXL and back. Only a key with entries in both
+/// halves can be reordered by the partition, and of such a key's entries
+/// this keeps only those after its last entry for the other tier.
+///
+/// The overwrite case is the same rule. A stack queues `(k, Slow)` for an OLD
+/// object; a `set` replaces it with a new one built in DRAM; the stack's
+/// re-promotion queues `(k, Fast)` so that the stale demotion, landing on the
+/// new object, is undone (`LruCompactHybridStack::touch_fast_key`, the merged
+/// store's `touch_slot`). When both are in one drain the Slow is dropped and
+/// the Fast declines against the DRAM-built value -- exactly the intended end
+/// state, with neither copy. When they are in different drains the migration
+/// queue's per-key FIFO still applies them in order, as before.
+///
+/// # What it does to the accounting
+///
+/// Completions are counted where `Object::set_data` runs, so dropping an
+/// entry that would have declined changes no counter, and dropping a pair
+/// that would have been undone removes its promotion and its demotion
+/// together -- copies that ended where they started. The exception is the
+/// LFU-style design (`inline_demotion_accounting() == false`): it never
+/// counts a completed slow move, and its demotions are tallied by
+/// `drain_demotions` when its settle DECIDES them, so a demotion dropped
+/// here because a later promotion in the same drain supersedes it stays
+/// counted although nothing moved. Lazy copy emits only PHYSICAL intents
+/// (its logical demotions queue nothing), and for those the last one is
+/// equally the answer. Dropped entries are counted in
+/// `migstats::COALESCED_TOT`; `DEMO`/`PROMO`, `BURST_MAX` and the
+/// `PENDING_*` gauges see only what is kept.
+///
+/// # Cost
+///
+/// A one-sided drain -- all demotions or all promotions, which includes
+/// every drain of 0 or 1 entries, the common case (`migration_queue`'s doc
+/// measured 99.4% of demotion volume arriving one object at a time) -- has
+/// nothing the partition could reorder. It costs one read of each entry's
+/// tier and is returned whole as the non-empty half: nothing is allocated,
+/// hashed or copied, less than the plain partition this replaced. A mixed
+/// drain pays for the two halves, ONE map sized to the SMALLER half (16
+/// bytes a bucket: the key and two `u32` positions), an insert and a lookup
+/// per entry of the smaller half, and one lookup per entry of the larger
+/// half. `HashedKey` is already a hash, so the map's hasher is the crate's
+/// pass-through `NoHasher`. Mixed bursts can still be large: the faithful
+/// S3-FIFO's main-queue sweep pushes a promotion per requeued slow key and
+/// its settle a demotion for each, so its bursts size the map to up to half
+/// the drain.
+#[cfg(feature = "hybrid_cache_common")]
+fn split_tier_migrations(
+	migrations: Vec<(HashedKey, Tier)>,
+) -> (Vec<(HashedKey, Tier)>, Vec<(HashedKey, Tier)>, usize) {
+	let slow = migrations.iter().filter(|(_, tier)| *tier == Tier::Slow).count();
+	let fast = migrations.len() - slow;
+
+	// One-sided: nothing to reorder, so nothing to drop.
+	if fast == 0 {
+		return (migrations, Vec::new(), 0);
+	}
+
+	if slow == 0 {
+		return (Vec::new(), migrations, 0);
+	}
+
+	// Positions are `u32` to keep a bucket at 16 bytes. The largest drains
+	// recorded are millions of entries (HYBRID_CACHES.md); four billion would
+	// be a 64 GiB `Vec`.
+	assert!(
+		u32::try_from(migrations.len()).is_ok(),
+		"a drain of {} entries overflows a u32 position",
+		migrations.len(),
+	);
+
+	let smaller = if slow <= fast { Tier::Slow } else { Tier::Fast };
+
+	// Per key of the smaller half: its last position there, and the end of
+	// its entries in the larger half -- one past the last of them, 0 while it
+	// has none there.
+	let mut last: std::collections::HashMap<HashedKey, (u32, u32), crate::NoHasher> =
+		std::collections::HashMap::with_capacity_and_hasher(slow.min(fast), Default::default());
+
+	for (i, &(key, tier)) in migrations.iter().enumerate() {
+		if tier == smaller {
+			last.entry(key).or_insert((0, 0)).0 = i as u32;
+		}
+	}
+
+	let mut demotions = Vec::with_capacity(slow);
+	let mut promotions = Vec::with_capacity(fast);
+
+	let (smaller_half, larger_half) = match smaller {
+		Tier::Slow => (&mut demotions, &mut promotions),
+		Tier::Fast => (&mut promotions, &mut demotions),
+	};
+
+	// The larger half, one lookup per entry, which records where the key's
+	// entries here end AND decides this one: dropped if the key has a later
+	// entry in the smaller half.
+	for (i, &(key, tier)) in migrations.iter().enumerate() {
+		if tier == smaller {
+			continue;
+		}
+
+		let i = i as u32;
+
+		let superseded = match last.get_mut(&key) {
+			Some((smaller_last, larger_end)) => {
+				*larger_end = i + 1;
+				*smaller_last > i
+			},
+			None => false,
 		};
 
-		thread::sleep(delay);
+		if !superseded {
+			larger_half.push((key, tier));
+		}
 	}
+
+	// The smaller half, now that every key's end in the larger half is known:
+	// kept if all of the key's entries there come before this one.
+	for (i, &(key, tier)) in migrations.iter().enumerate() {
+		if tier != smaller {
+			continue;
+		}
+
+		if last[&key].1 <= i as u32 {
+			smaller_half.push((key, tier));
+		}
+	}
+
+	let dropped = migrations.len() - demotions.len() - promotions.len();
+
+	(demotions, promotions, dropped)
 }
 
 /// Whether this cache can ever actually *use* an access trace.
@@ -3165,8 +3412,7 @@ mod migration_accounting_tests {
 			insert(&objects, 2, Tier::Slow);
 
 			worker.apply_migration_batches(
-				vec![(1, Tier::Slow)],
-				vec![(2, Tier::Fast)],
+				vec![(1, Tier::Slow), (2, Tier::Fast)],
 				true,
 			);
 
@@ -3197,8 +3443,7 @@ mod migration_accounting_tests {
 			objects.clear();
 
 			worker.apply_migration_batches(
-				vec![(1, Tier::Slow)],
-				vec![(2, Tier::Fast)],
+				vec![(1, Tier::Slow), (2, Tier::Fast)],
 				true,
 			);
 
@@ -3231,8 +3476,7 @@ mod migration_accounting_tests {
 			let untouched_promotion = header_of(&objects, 2);
 
 			worker.apply_migration_batches(
-				vec![(1, Tier::Slow)],
-				vec![(2, Tier::Fast)],
+				vec![(1, Tier::Slow), (2, Tier::Fast)],
 				true,
 			);
 
@@ -3272,8 +3516,7 @@ mod migration_accounting_tests {
 			insert(&objects, 2, Tier::Slow);
 
 			worker.apply_migration_batches(
-				vec![(1, Tier::Slow)],
-				vec![(2, Tier::Fast)],
+				vec![(1, Tier::Slow), (2, Tier::Fast)],
 				false,
 			);
 
@@ -3295,6 +3538,618 @@ mod migration_accounting_tests {
 
 			assert_eq!(status.hybrid_stats().demotions, 3, "queued = {queued}");
 		}
+	}
+
+	/// A stack that hands the worker ONE scripted drain and nothing else, so an
+	/// exact entry sequence can go through `apply_tier_migrations` -- the path
+	/// production takes, `split_tier_migrations` included -- without coaxing
+	/// a real stack into emitting it.
+	struct ScriptedDrain {
+		migrations: Vec<(HashedKey, Tier)>,
+	}
+
+	impl PolicyStack for ScriptedDrain {
+		fn is_policy(&self, policy: &PaperPolicy) -> bool {
+			matches!(policy, PaperPolicy::Lru)
+		}
+
+		fn len(&self) -> usize {
+			0
+		}
+
+		fn contains(&self, _key: HashedKey) -> bool {
+			false
+		}
+
+		fn insert(&mut self, _key: HashedKey, _size: ObjectSize) {}
+
+		fn remove(&mut self, _key: HashedKey) {}
+
+		fn clear(&mut self) {}
+
+		fn evict_one(&mut self) -> Option<HashedKey> {
+			None
+		}
+
+		fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
+			std::mem::take(&mut self.migrations)
+		}
+	}
+
+	/// Runs one scripted drain through `apply_tier_migrations` and reports
+	/// the copies it made: `MIG_APPLIED`'s delta, exact under
+	/// `migration_test_lock`.
+	fn apply_scripted(
+		worker: &mut PolicyWorker<u32, TestBuffer>,
+		migrations: Vec<(HashedKey, Tier)>,
+	) -> u64 {
+		use std::sync::atomic::Ordering;
+
+		let before = migration_queue::MIG_APPLIED.load(Ordering::Relaxed);
+
+		worker.policy_stack = Some(Box::new(ScriptedDrain { migrations }));
+		worker.apply_tier_migrations();
+
+		migration_queue::MIG_APPLIED.load(Ordering::Relaxed) - before
+	}
+
+	/// A slow value whose key is promoted and then demoted again in ONE drain
+	/// -- net intent Slow -- ends slow, and nothing is copied.
+	///
+	/// Without the split dropping the superseded promotion, the
+	/// demotions-first partition applied the pair backwards: the demote
+	/// declined against a value still slow, the promote copied it into DRAM,
+	/// and the stack counted it slow from then on. Run on both paths, one test
+	/// each, because the synchronous path (`MIGRATION_QUEUE_THREADS=0`) shares
+	/// the partition with the queued one.
+	fn promotion_undone_in_one_drain(queued: bool) {
+		let _serialised = migration_test_lock::lock();
+
+		let (mut worker, objects, status) = make_worker(queued);
+
+		insert(&objects, 1, Tier::Slow);
+		let admitted = header_of(&objects, 1);
+
+		let coalesced_before = migstats::COALESCED_TOT.load(std::sync::atomic::Ordering::Relaxed);
+
+		let copies = apply_scripted(&mut worker, vec![(1, Tier::Fast), (1, Tier::Slow)]);
+
+		assert_eq!(
+			tier_of(&objects, 1),
+			Tier::Slow,
+			"queued = {queued}: the value was left in DRAM while the stack's last word \
+			 on it was Slow -- stranded",
+		);
+		assert_eq!(copies, 0, "queued = {queued}: a promotion copy was made and undone");
+		assert!(
+			TieredValue::ptr_eq(&header_of(&objects, 1), &admitted),
+			"queued = {queued}: a copy was installed",
+		);
+
+		let stats = status.hybrid_stats();
+
+		assert_eq!(stats.promotions, 0, "queued = {queued}");
+		assert_eq!(stats.demotions, 0, "queued = {queued}");
+
+		// Process-global and bumped by any worker in the binary, so only a
+		// lower bound is exact.
+		assert!(
+			migstats::COALESCED_TOT.load(std::sync::atomic::Ordering::Relaxed) > coalesced_before,
+			"queued = {queued}: the dropped entry was not counted",
+		);
+	}
+
+	#[test]
+	fn a_promotion_undone_in_one_drain_leaves_the_value_slow_and_uncopied_through_the_queue() {
+		promotion_undone_in_one_drain(true);
+	}
+
+	#[test]
+	fn a_promotion_undone_in_one_drain_leaves_the_value_slow_and_uncopied_when_applied_inline() {
+		promotion_undone_in_one_drain(false);
+	}
+
+	/// The mirror: a fast value demoted and then promoted again in one drain
+	/// ends fast, with no demote copy and no promote copy back. Without the
+	/// split dropping the superseded demotion the placement came out right --
+	/// demote first was the right order here -- but through a round trip to
+	/// CXL and back.
+	fn demotion_undone_in_one_drain(queued: bool) {
+		let _serialised = migration_test_lock::lock();
+
+		let (mut worker, objects, status) = make_worker(queued);
+
+		insert(&objects, 1, Tier::Fast);
+		let admitted = header_of(&objects, 1);
+
+		let copies = apply_scripted(&mut worker, vec![(1, Tier::Slow), (1, Tier::Fast)]);
+
+		assert_eq!(tier_of(&objects, 1), Tier::Fast, "queued = {queued}");
+		assert_eq!(copies, 0, "queued = {queued}: a round trip through CXL was made");
+		assert!(
+			TieredValue::ptr_eq(&header_of(&objects, 1), &admitted),
+			"queued = {queued}: a copy was installed",
+		);
+
+		let stats = status.hybrid_stats();
+
+		assert_eq!(stats.promotions, 0, "queued = {queued}");
+		assert_eq!(stats.demotions, 0, "queued = {queued}");
+	}
+
+	#[test]
+	fn a_demotion_undone_in_one_drain_leaves_the_value_fast_and_uncopied_through_the_queue() {
+		demotion_undone_in_one_drain(true);
+	}
+
+	#[test]
+	fn a_demotion_undone_in_one_drain_leaves_the_value_fast_and_uncopied_when_applied_inline() {
+		demotion_undone_in_one_drain(false);
+	}
+}
+
+/// `split_tier_migrations` on hand-built drains: each half in drain order, no
+/// key in both, and every key ending in the tier of its last entry.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod migration_split_tests {
+	use super::*;
+
+	type Drain = Vec<(HashedKey, Tier)>;
+
+	#[test]
+	fn a_promotion_then_a_demotion_of_one_key_leaves_only_the_demotion() {
+		assert_eq!(
+			split_tier_migrations(vec![(7, Tier::Fast), (7, Tier::Slow)]),
+			(vec![(7, Tier::Slow)], vec![], 1),
+		);
+	}
+
+	#[test]
+	fn a_demotion_then_a_promotion_of_one_key_leaves_only_the_promotion() {
+		assert_eq!(
+			split_tier_migrations(vec![(7, Tier::Slow), (7, Tier::Fast)]),
+			(vec![], vec![(7, Tier::Fast)], 1),
+		);
+	}
+
+	#[test]
+	fn distinct_keys_keep_drain_order_within_each_half() {
+		assert_eq!(
+			split_tier_migrations(vec![(1, Tier::Slow), (2, Tier::Fast), (3, Tier::Slow), (4, Tier::Fast)]),
+			(vec![(1, Tier::Slow), (3, Tier::Slow)], vec![(2, Tier::Fast), (4, Tier::Fast)], 0),
+		);
+	}
+
+	#[test]
+	fn an_empty_or_single_entry_drain_is_untouched() {
+		assert_eq!(split_tier_migrations(Vec::new()), (vec![], vec![], 0));
+		assert_eq!(split_tier_migrations(vec![(9, Tier::Slow)]), (vec![(9, Tier::Slow)], vec![], 0));
+		assert_eq!(split_tier_migrations(vec![(9, Tier::Fast)]), (vec![], vec![(9, Tier::Fast)], 0));
+	}
+
+	/// All demotions or all promotions, repeated keys included: returned
+	/// whole as the one half -- the same allocation, so nothing was copied,
+	/// let alone hashed -- with nothing dropped.
+	#[test]
+	fn a_one_sided_drain_is_returned_whole_with_nothing_dropped() {
+		for tier in [Tier::Slow, Tier::Fast] {
+			let drain: Drain = vec![(1, tier), (2, tier), (1, tier), (3, tier)];
+			let expected = drain.clone();
+			let allocation = drain.as_ptr();
+
+			let (demotions, promotions, dropped) = split_tier_migrations(drain);
+
+			let (whole, other) = match tier {
+				Tier::Slow => (demotions, promotions),
+				Tier::Fast => (promotions, demotions),
+			};
+
+			assert_eq!(whole, expected, "{tier:?}");
+			assert!(std::ptr::eq(whole.as_ptr(), allocation), "{tier:?}: the drain was copied");
+			assert!(other.is_empty(), "{tier:?}");
+			assert_eq!(dropped, 0, "{tier:?}");
+		}
+	}
+
+	/// A key repeated in ONE tier of a mixed drain keeps every entry: the
+	/// partition cannot reorder them against each other, and the second
+	/// declines.
+	#[test]
+	fn same_tier_duplicates_in_a_mixed_drain_are_kept() {
+		assert_eq!(
+			split_tier_migrations(vec![(1, Tier::Fast), (2, Tier::Slow), (1, Tier::Fast)]),
+			(vec![(2, Tier::Slow)], vec![(1, Tier::Fast), (1, Tier::Fast)], 0),
+		);
+	}
+
+	/// Interleaved keys, two of them reversed within the drain: only the
+	/// entries no later entry for the other tier supersedes are kept, in
+	/// drain order. Once with the demotions the smaller half and once with
+	/// the promotions, since the map is keyed on whichever is smaller.
+	#[test]
+	fn interleaved_reversals_keep_only_what_nothing_later_supersedes() {
+		// Demotions the smaller half, 3 of 7.
+		assert_eq!(
+			split_tier_migrations(vec![
+				(1, Tier::Fast),
+				(2, Tier::Slow),
+				(1, Tier::Slow),
+				(3, Tier::Fast),
+				(2, Tier::Fast),
+				(1, Tier::Fast),
+				(4, Tier::Slow),
+			]),
+			(vec![(4, Tier::Slow)], vec![(3, Tier::Fast), (2, Tier::Fast), (1, Tier::Fast)], 3),
+		);
+
+		// Promotions the smaller half, 2 of 7.
+		assert_eq!(
+			split_tier_migrations(vec![
+				(1, Tier::Slow),
+				(2, Tier::Slow),
+				(1, Tier::Fast),
+				(3, Tier::Slow),
+				(2, Tier::Fast),
+				(1, Tier::Slow),
+				(4, Tier::Slow),
+			]),
+			(vec![(3, Tier::Slow), (1, Tier::Slow), (4, Tier::Slow)], vec![(2, Tier::Fast)], 3),
+		);
+	}
+
+	/// `apply_migration`'s rule on a two-key placement (keys 1 and 2) -- an
+	/// entry moves its key to the entry's tier, or declines if the key is
+	/// there already -- returning the final placement and each key's copies.
+	fn apply<'a>(
+		mut placement: [Tier; 2],
+		entries: impl IntoIterator<Item = &'a (HashedKey, Tier)>,
+	) -> ([Tier; 2], [u32; 2]) {
+		let mut copies = [0; 2];
+
+		for &(key, tier) in entries {
+			let k = (key - 1) as usize;
+
+			if placement[k] != tier {
+				placement[k] = tier;
+				copies[k] += 1;
+			}
+		}
+
+		(placement, copies)
+	}
+
+	/// The contract on one drain, checked from its definition rather than
+	/// against a second copy of the walk.
+	fn check(drain: &Drain) {
+		let (demotions, promotions, dropped) = split_tier_migrations(drain.clone());
+
+		assert!(demotions.iter().all(|&(_, tier)| tier == Tier::Slow), "{drain:?}: {demotions:?}");
+		assert!(promotions.iter().all(|&(_, tier)| tier == Tier::Fast), "{drain:?}: {promotions:?}");
+
+		for &(key, _) in &demotions {
+			assert!(
+				!promotions.iter().any(|&(k, _)| k == key),
+				"{drain:?}: key {key} is in both halves: {demotions:?} / {promotions:?}",
+			);
+		}
+
+		// Kept if and only if no later entry for the key names the other
+		// tier; each half in drain order, same-tier duplicates included.
+		let kept: Drain = drain
+			.iter()
+			.enumerate()
+			.filter(|&(i, &(key, tier))| !drain[i + 1..].iter().any(|&(k, t)| k == key && t != tier))
+			.map(|(_, &entry)| entry)
+			.collect();
+
+		let kept_in = |tier: Tier| -> Drain {
+			kept.iter().copied().filter(|&(_, t)| t == tier).collect()
+		};
+
+		assert_eq!(demotions, kept_in(Tier::Slow), "{drain:?}: the demotions");
+		assert_eq!(promotions, kept_in(Tier::Fast), "{drain:?}: the promotions");
+		assert_eq!(dropped, drain.len() - kept.len(), "{drain:?}: the dropped count");
+
+		for start in [
+			[Tier::Slow, Tier::Slow],
+			[Tier::Slow, Tier::Fast],
+			[Tier::Fast, Tier::Slow],
+			[Tier::Fast, Tier::Fast],
+		] {
+			let (in_order, _) = apply(start, drain);
+			let (split, copies) = apply(start, demotions.iter().chain(&promotions));
+
+			for (k, key) in [1, 2].into_iter().enumerate() {
+				// Where the key's last entry in drain order puts it.
+				let last = drain
+					.iter()
+					.rev()
+					.find(|&&(entry_key, _)| entry_key == key)
+					.map_or(start[k], |&(_, tier)| tier);
+
+				assert_eq!(in_order[k], last, "{drain:?} from {start:?}: key {key}, applied in order");
+				assert_eq!(
+					split[k],
+					last,
+					"{drain:?} from {start:?}: key {key} ended {:?}, its last entry says {last:?}",
+					split[k],
+				);
+				assert!(
+					copies[k] <= 1,
+					"{drain:?} from {start:?}: key {key} was copied {} times",
+					copies[k],
+				);
+			}
+		}
+	}
+
+	/// Every drain of up to five entries over two keys and both tiers --
+	/// 1 + 4 + 16 + 64 + 256 + 1,024 = 1,365 of them, one-sided and mixed,
+	/// with either half the smaller -- against the contract: the halves hold
+	/// only their own tier and share no key; an entry is kept if and only if
+	/// no later entry for its key names the other tier, in drain order within
+	/// its half; `dropped` counts the rest; and from every starting placement
+	/// of the two keys, applying the demotions and then the promotions ends
+	/// each key where applying the drain in order does -- its last entry's
+	/// tier -- copying it at most once.
+	#[test]
+	fn every_drain_of_up_to_five_entries_on_two_keys_keeps_the_contract() {
+		const ENTRIES: [(HashedKey, Tier); 4] = [
+			(1, Tier::Slow),
+			(1, Tier::Fast),
+			(2, Tier::Slow),
+			(2, Tier::Fast),
+		];
+
+		let mut drains = 0;
+
+		for len in 0..=5u32 {
+			for code in 0..4usize.pow(len) {
+				let drain: Drain = (0..len)
+					.map(|p| ENTRIES[code / 4usize.pow(p) % 4])
+					.collect();
+
+				check(&drain);
+				drains += 1;
+			}
+		}
+
+		assert_eq!(drains, 1_365);
+	}
+}
+
+/// `polling_delay`, the decision `delay_event_loop` parks on, with the clock
+/// supplied rather than waited for.
+#[cfg(test)]
+mod polling_delay_tests {
+	use super::*;
+
+	/// The idle trap: the first pass to see a set after a quiet spell longer
+	/// than the recency window must poll SHORT. It used to poll LONG, because
+	/// the recency test read only the sets before this pass, and the burst
+	/// then waited up to a second for its settle.
+	#[test]
+	fn the_first_pass_to_see_a_set_after_a_long_idle_polls_short() {
+		let last_set = Instant::now();
+		let now = last_set + 4 * SET_RECENCY_DURATION;
+
+		assert_eq!(polling_delay(now, Some(last_set), true), SHORT_POLLING_DURATION);
+	}
+
+	/// The same trap at start-up: a cache's very first sets.
+	#[test]
+	fn the_first_pass_to_see_any_set_at_all_polls_short() {
+		assert_eq!(polling_delay(Instant::now(), None, true), SHORT_POLLING_DURATION);
+	}
+
+	/// Inside the window, with or without a set in this pass, up to and
+	/// including its edge.
+	#[test]
+	fn a_pass_inside_the_recency_window_polls_short() {
+		let last_set = Instant::now();
+
+		for elapsed in [Duration::ZERO, SET_RECENCY_DURATION / 2, SET_RECENCY_DURATION] {
+			for has_current_set in [false, true] {
+				assert_eq!(
+					polling_delay(last_set + elapsed, Some(last_set), has_current_set),
+					SHORT_POLLING_DURATION,
+					"{elapsed:?} after the last set, has_current_set = {has_current_set}",
+				);
+			}
+		}
+	}
+
+	/// Only an idle worker -- no set in this pass, none within the window --
+	/// polls LONG.
+	#[test]
+	fn an_idle_pass_with_no_current_set_polls_long() {
+		let last_set = Instant::now();
+
+		for elapsed in [SET_RECENCY_DURATION + Duration::from_millis(1), 4 * SET_RECENCY_DURATION] {
+			assert_eq!(
+				polling_delay(last_set + elapsed, Some(last_set), false),
+				LONG_POLLING_DURATION,
+				"{elapsed:?} after the last set",
+			);
+		}
+
+		assert_eq!(polling_delay(Instant::now(), None, false), LONG_POLLING_DURATION);
+	}
+}
+
+/// `AtomicStatus::kick_policy_worker`, and the idle poll it interrupts,
+/// against a real worker thread.
+///
+/// Gated on `hybrid_cache_common` only for the object-map constructor, as
+/// `migration_accounting_tests` is; nothing here is hybrid.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod policy_worker_kick_tests {
+	use super::*;
+
+	use crate::{object::overhead::OverheadManager, status::AtomicStatus};
+
+	/// Polls `done` every 100 us until it holds, failing after `deadline`.
+	/// The deadline is a hang detector, not the measurement.
+	fn wait_for(what: &str, deadline: Duration, mut done: impl FnMut() -> bool) {
+		let start = Instant::now();
+
+		while !done() {
+			assert!(start.elapsed() < deadline, "{what} did not happen within {deadline:?}");
+			thread::sleep(Duration::from_micros(100));
+		}
+	}
+
+	type WorkerHandle = thread::JoinHandle<Result<(), CacheError>>;
+
+	/// A real worker, on its own thread, for a cache that has seen nothing.
+	fn spawn_worker() -> (Sender<WorkerEvent>, StatusRef, WorkerHandle) {
+		let (tx, rx) = unbounded::<WorkerEvent>();
+
+		let objects: ObjectMapRef<u32, crate::TieredBuffer> = crate::new_hybrid_object_map();
+
+		let status: StatusRef = Arc::new(
+			AtomicStatus::new(1_000_000, &[PaperPolicy::Lru], PaperPolicy::Lru).unwrap(),
+		);
+
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		let worker = PolicyWorker::<u32, crate::TieredBuffer>::new(
+			rx,
+			objects,
+			status.clone(),
+			overhead_manager,
+			None,
+		).unwrap();
+
+		(tx, status, register_worker(worker))
+	}
+
+	/// Waits for the worker's first pass, then CHECKS the premise both tests
+	/// rest on rather than assuming it: with nothing queued and no set ever
+	/// seen, that pass chose the LONG poll, so no other pass runs in the next
+	/// 100 ms (on the SHORT poll about a hundred would). Returns the pass
+	/// count to measure from.
+	fn parked_on_the_long_poll(status: &StatusRef) -> u64 {
+		wait_for("the worker's first pass", Duration::from_secs(10), || {
+			status.policy_worker_passes() >= 1
+		});
+
+		let passes = status.policy_worker_passes();
+
+		thread::sleep(Duration::from_millis(100));
+
+		assert_eq!(
+			status.policy_worker_passes(),
+			passes,
+			"the idle worker ran another pass within 100 ms of its first: it is not \
+			 parked on the {LONG_POLLING_DURATION:?} poll, so a kick would prove nothing",
+		);
+
+		passes
+	}
+
+	/// Stops the worker -- kicked, so the shutdown does not wait out a poll
+	/// either -- and checks that it exited cleanly.
+	fn shut_down(tx: Sender<WorkerEvent>, status: &StatusRef, handle: WorkerHandle) {
+		tx.send(WorkerEvent::Shutdown).unwrap();
+		status.kick_policy_worker();
+
+		assert!(
+			handle.join().expect("the worker thread panicked").is_ok(),
+			"the worker returned an error",
+		);
+	}
+
+	/// A worker parked on the LONG poll -- idle, no set ever seen -- runs a
+	/// pass as soon as it is kicked, not when its second is up.
+	///
+	/// Not timing-fragile in the direction that matters. That the worker is
+	/// parked is checked first: it ran no pass for 100 ms after its first. If
+	/// this thread is then descheduled and the worker is somehow not parked
+	/// when the kick lands, the kick leaves an unpark token and the park
+	/// returns at once, which is FASTER. The bound is 200 ms against a 1 s
+	/// poll, so what fails it is a worker that slept through the kick, not a
+	/// slow scheduler.
+	///
+	/// The printed `KICK_LATENCY` is an UPPER bound set by this test's own
+	/// 100 us poll of the pass counter (a sleep, which overshoots), not a
+	/// measurement of the unpark.
+	#[test]
+	fn a_kick_wakes_a_worker_parked_on_the_long_poll() {
+		let (tx, status, handle) = spawn_worker();
+
+		let passes = parked_on_the_long_poll(&status);
+		let kicked = Instant::now();
+
+		status.kick_policy_worker();
+
+		wait_for("a pass after the kick", Duration::from_secs(10), || {
+			status.policy_worker_passes() > passes
+		});
+
+		let latency = kicked.elapsed();
+
+		println!("KICK_LATENCY {latency:?} (an upper bound: the pass counter is polled every 100 us)");
+
+		shut_down(tx, &status, handle);
+
+		assert!(
+			latency < Duration::from_millis(200),
+			"the kicked worker took {latency:?} to run a pass: it slept through the \
+			 kick to the end of its {LONG_POLLING_DURATION:?} poll",
+		);
+	}
+
+	/// The idle fix's WIRING, which `polling_delay_tests` cannot see: `run`
+	/// must hand `delay_event_loop` the sets THIS pass handled, and
+	/// `delay_event_loop` must poll on them.
+	///
+	/// A worker idle on the LONG poll is given a set and kicked. The pass the
+	/// kick starts handles the set and must choose the SHORT poll, so the
+	/// pass after it follows within milliseconds: two passes, well inside
+	/// 200 ms of the kick. Choosing LONG there -- what the worker did before
+	/// the decision counted the current pass -- puts the second pass a whole
+	/// poll later.
+	#[test]
+	fn the_pass_that_handles_the_first_set_after_an_idle_spell_polls_short() {
+		let (tx, status, handle) = spawn_worker();
+
+		let passes = parked_on_the_long_poll(&status);
+
+		// Queued BEFORE the kick, so the pass the kick starts takes it.
+		tx.send(WorkerEvent::Set(1, 64, 0, None, None)).unwrap();
+
+		let kicked = Instant::now();
+
+		status.kick_policy_worker();
+
+		// Timed separately, so a failure names its cause: the first pass is
+		// the kick's (`a_kick_wakes_a_worker_parked_on_the_long_poll`), the
+		// second is the poll the set's pass chose.
+		wait_for("a pass after the kick", Duration::from_secs(10), || {
+			status.policy_worker_passes() > passes
+		});
+
+		let first = kicked.elapsed();
+
+		wait_for("a second pass after the kick", Duration::from_secs(10), || {
+			status.policy_worker_passes() >= passes + 2
+		});
+
+		let second = kicked.elapsed();
+
+		shut_down(tx, &status, handle);
+
+		assert!(
+			first < Duration::from_millis(200),
+			"the kicked worker took {first:?} to run the pass that handles the set: it \
+			 slept through the kick",
+		);
+		assert!(
+			second < Duration::from_millis(200),
+			"the pass after the one that handled the set came {second:?} after the kick: \
+			 that pass parked on the {LONG_POLLING_DURATION:?} poll",
+		);
 	}
 }
 

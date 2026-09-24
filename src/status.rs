@@ -169,15 +169,26 @@ pub struct AtomicStatus {
 	#[cfg(feature = "hybrid_cache_common")]
 	hybrid_size_threshold: AtomicCacheSize,
 
+	/// The policy worker's thread, for `kick_policy_worker`. `None` until
+	/// `PolicyWorker::run` publishes it on entry.
+	///
+	/// On the status because the status is the one per-cache object every
+	/// API-side path already holds, and it is built before the worker thread
+	/// exists. One worker thread serves a cache for its whole life -- a policy
+	/// switch swaps the worker's STACK, the mini stacks live inside it, and a
+	/// wipe clears the stack; none of them respawns the thread -- so this is
+	/// written once in practice. It is still a replaceable slot rather than a
+	/// `OnceLock`, so a status ever run by a second worker kicks the live one
+	/// and not one that has exited.
+	///
+	/// A lock, not an atomic: `Thread` is a handle, the only writer runs once
+	/// per worker, and the kick is on no per-request path.
+	policy_worker: parking_lot::Mutex<Option<std::thread::Thread>>,
 
-
-
-
-
-
-
-
-
+	/// Test-only: passes the policy worker has completed, so a test can see a
+	/// kick land without depending on what the pass did.
+	#[cfg(test)]
+	policy_worker_passes: AtomicU64,
 }
 
 /// This struct holds the basic statistical information about `PaperCache`.
@@ -345,9 +356,57 @@ impl AtomicStatus {
 			#[cfg(feature = "hybrid_cache_common")]
 			hybrid_size_threshold: AtomicCacheSize::default(),
 
+			policy_worker: parking_lot::Mutex::new(None),
+
+			#[cfg(test)]
+			policy_worker_passes: AtomicU64::default(),
 		};
 
 		Ok(status)
+	}
+
+	/// Records the thread `kick_policy_worker` wakes. Called by
+	/// `PolicyWorker::run` on entry; a later call replaces the handle.
+	pub(crate) fn set_policy_worker_thread(&self, thread: std::thread::Thread) {
+		*self.policy_worker.lock() = Some(thread);
+	}
+
+	/// Wakes the policy worker if it is parked between passes, so it runs its
+	/// next pass now rather than when its poll runs out -- up to 1 s
+	/// (`LONG_POLLING_DURATION`) once it has stopped seeing sets.
+	///
+	/// An `unpark`, so it can neither be lost nor do harm: a worker that is
+	/// mid-pass keeps the token and its next park returns at once, costing
+	/// one extra pass; a worker not yet started has no handle, so the kick is
+	/// a no-op; one that has exited ignores it.
+	///
+	/// NOTHING IN PRODUCTION CALLS THIS YET. It is for the fast-tier gate,
+	/// which will kick the worker as admissions approach the budget; until
+	/// then only tests do, which is what the `dead_code` allowance is for.
+	/// There is no kick on the set path yet, and `polling_delay`'s idle fix is
+	/// not a substitute for one. That fix makes the pass that FIRST sees a
+	/// burst choose the short poll, so the rest of the burst is taken within
+	/// milliseconds; but a worker already parked on the long poll when the
+	/// burst begins sleeps out up to `LONG_POLLING_DURATION` before that pass
+	/// runs -- as does a new cache's worker, whose first pass normally sees no
+	/// set and parks long. Only a kick closes that window: the gate's.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn kick_policy_worker(&self) {
+		if let Some(worker) = self.policy_worker.lock().as_ref() {
+			worker.unpark();
+		}
+	}
+
+	/// Test-only: see `policy_worker_passes`.
+	#[cfg(test)]
+	pub(crate) fn record_policy_worker_pass(&self) {
+		self.policy_worker_passes.fetch_add(1, Ordering::Release);
+	}
+
+	/// Test-only: passes the policy worker has completed so far.
+	#[cfg(test)]
+	pub(crate) fn policy_worker_passes(&self) -> u64 {
+		self.policy_worker_passes.load(Ordering::Acquire)
 	}
 
 	#[must_use]

@@ -1133,6 +1133,18 @@ impl<K, V> Inner<K, V> {
 	/// undoes therefore reports BOTH transitions, in order, rather than
 	/// suppressing the first -- per-key order is preserved, so the consumer
 	/// applies promote-then-demote and lands on the same final placement.
+	///
+	/// For a promotion its own settle undoes at once, that pair is
+	/// `(key, Fast), (key, Slow)`. When both land in one drain, the
+	/// worker's `split_tier_migrations` drops the Fast; otherwise the
+	/// migration queue's per-key FIFO applies both in order. Either way the
+	/// placement ends right, the second at the cost of a round trip through
+	/// DRAM. Queueing the promotion only after the settle, and only if the
+	/// slot is still fast -- the DashMap stacks' rule -- would save that round
+	/// trip, but here it costs a second shard write lock per promoting touch,
+	/// roughly every CLOCK second chance and every LRU hit on a slow key. It
+	/// is deferred to the change that moves the settle onto the policy
+	/// worker, where the push after it costs no extra lock.
 	fn touch_slot(&mut self, i: u32, now: u64) {
 		let previous_tier = self.slots[i as usize].tier;
 		let already_at_front = self.head == i;
