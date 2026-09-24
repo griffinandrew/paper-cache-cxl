@@ -40,22 +40,17 @@
 //!
 //! ## Keys
 //!
-//! The protocol carries keys as strings, but this server parses each one to a
-//! `u64` and runs `PaperCache<u64, TieredBuffer>`.
+//! The protocol carries keys as strings, and this server stores them as sent:
+//! `PaperCache<String, TieredBuffer>`, the way upstream paper-server stores its
+//! `Buffer` keys. A GET borrows the key it read off the wire; a SET moves it
+//! into the cache with no further copy.
 //!
-//! That is deliberate, and it is about comparability rather than convenience.
-//! The point of this binary is an A/B against the in-process benchmark, whose
-//! traces are `u64` keyed -- and paper-benchmark commit 0df0ba9 ("Pass the
-//! trace's u64 keys through instead of round-tripping them as strings")
-//! specifically removed string keys from that path. Running `String` keys here
-//! would change per-object metadata on the cache side, so a slower result
-//! could be the socket or could be the wider key, with no way to tell them
-//! apart. Parsing to `u64` keeps everything except the transport identical.
-//!
-//! The cost of that choice is that a non-numeric key is rejected. Serving
-//! arbitrary keys means `PaperCache<String, TieredBuffer>`, which is a change
-//! of one type parameter and the two `parse_key` call sites -- but it is not
-//! the same experiment.
+//! It used to parse every key to a `u64`, to match the in-process benchmark,
+//! whose traces were `u64` keyed. The Twitter traces now carry each request's
+//! real (anonymized) key bytes, and so does the benchmark, so both sides store
+//! keys at their real length and the per-object key cost is the real one --
+//! which is what a comparison of tiered and flat memory needs. Results from
+//! before this change charged every key a flat 8 bytes and are not comparable.
 
 use std::{
 	fmt::Write as _,
@@ -459,10 +454,10 @@ fn render_self_stats(stats: &SelfStats, cache: &Cache) -> String {
 }
 
 #[cfg(not(feature = "all_dram"))]
-type Cache = PaperCache<u64, TieredBuffer>;
+type Cache = PaperCache<String, TieredBuffer>;
 
 #[cfg(feature = "all_dram")]
-type Cache = PaperCache<u64, BufferDRAM>;
+type Cache = PaperCache<String, BufferDRAM>;
 
 fn main() {
 	let config = match Config::from_args() {
@@ -478,14 +473,14 @@ fn main() {
 	// configured, so a POLICY command still has nothing to switch to, and the
 	// two arms refuse it identically.
 	#[cfg(feature = "all_dram")]
-	let built = PaperCache::<u64, BufferDRAM>::new(
+	let built = PaperCache::<String, BufferDRAM>::new(
 		config.max_size,
 		&[config.policy],
 		config.policy,
 	);
 
 	#[cfg(not(feature = "all_dram"))]
-	let built = PaperCache::<u64, TieredBuffer>::new(
+	let built = PaperCache::<String, TieredBuffer>::new(
 		config.max_size,
 		CacheTierSize::Bytes(config.fast_tier_size),
 		config.policy,
@@ -631,28 +626,23 @@ fn serve(
 			command::GET => {
 				let key = read_string(&mut reader)?;
 
-				match parse_key(&key) {
-					Some(key) => {
-						// Timed inline rather than through `timed` so the
-						// outcome can pick the slot: hits and misses are
-						// different operations and must not share an average.
-						let started = Instant::now();
-						let outcome = cache.get(&key);
-						let nanos = started.elapsed().as_nanos() as u64;
+				// Timed inline rather than through `timed` so the outcome can
+				// pick the slot: hits and misses are different operations and
+				// must not share an average.
+				let started = Instant::now();
+				let outcome = cache.get(&key);
+				let nanos = started.elapsed().as_nanos() as u64;
 
-						stats.record(
-							if outcome.is_ok() { command::GET } else { SLOT_GET_MISS },
-							nanos,
-						);
+				stats.record(
+					if outcome.is_ok() { command::GET } else { SLOT_GET_MISS },
+					nanos,
+				);
 
-						match outcome {
-							Ok(value) => {
-								write_ok_buf(&mut writer, &value)?;
-							},
-							Err(err) => write_cache_error(&mut writer, &err)?,
-						}
+				match outcome {
+					Ok(value) => {
+						write_ok_buf(&mut writer, &value)?;
 					},
-					None => write_cache_error(&mut writer, &CacheError::KeyNotFound)?,
+					Err(err) => write_cache_error(&mut writer, &err)?,
 				}
 			},
 
@@ -664,31 +654,25 @@ fn serve(
 				// The wire has no null TTL; 0 is "no expiry".
 				let ttl = if ttl == 0 { None } else { Some(ttl) };
 
-				match parse_key(&key) {
-					Some(key) => match timed(stats, command::SET, || cache.set(key, &value, ttl)) {
-						Ok(()) => write_bool(&mut writer, true)?,
-						Err(err) => write_cache_error(&mut writer, &err)?,
-					},
-					None => write_cache_error(&mut writer, &CacheError::Internal)?,
+				// The key read off the wire moves into the cache as is.
+				match timed(stats, command::SET, || cache.set(key, &value, ttl)) {
+					Ok(()) => write_bool(&mut writer, true)?,
+					Err(err) => write_cache_error(&mut writer, &err)?,
 				}
 			},
 
 			command::DEL => {
 				let key = read_string(&mut reader)?;
 
-				match parse_key(&key) {
-					Some(key) => match timed(stats, command::DEL, || cache.del(&key)) {
-						Ok(()) => write_bool(&mut writer, true)?,
-						Err(err) => write_cache_error(&mut writer, &err)?,
-					},
-					None => write_cache_error(&mut writer, &CacheError::KeyNotFound)?,
+				match timed(stats, command::DEL, || cache.del(&key)) {
+					Ok(()) => write_bool(&mut writer, true)?,
+					Err(err) => write_cache_error(&mut writer, &err)?,
 				}
 			},
 
 			command::HAS => {
 				let key = read_string(&mut reader)?;
-				let has = parse_key(&key)
-					.is_some_and(|key| timed(stats, command::HAS, || cache.has(&key)));
+				let has = timed(stats, command::HAS, || cache.has(&key));
 
 				write_bool(&mut writer, true)?;
 				write_bool(&mut writer, has)?;
@@ -697,14 +681,11 @@ fn serve(
 			command::PEEK => {
 				let key = read_string(&mut reader)?;
 
-				match parse_key(&key) {
-					Some(key) => match timed(stats, command::PEEK, || cache.peek(&key)) {
-						Ok(value) => {
-							write_ok_buf(&mut writer, &value)?;
-						},
-						Err(err) => write_cache_error(&mut writer, &err)?,
+				match timed(stats, command::PEEK, || cache.peek(&key)) {
+					Ok(value) => {
+						write_ok_buf(&mut writer, &value)?;
 					},
-					None => write_cache_error(&mut writer, &CacheError::KeyNotFound)?,
+					Err(err) => write_cache_error(&mut writer, &err)?,
 				}
 			},
 
@@ -713,27 +694,21 @@ fn serve(
 				let ttl = read_u32(&mut reader)?;
 				let ttl = if ttl == 0 { None } else { Some(ttl) };
 
-				match parse_key(&key) {
-					Some(key) => match timed(stats, command::TTL, || cache.ttl(&key, ttl)) {
-						Ok(()) => write_bool(&mut writer, true)?,
-						Err(err) => write_cache_error(&mut writer, &err)?,
-					},
-					None => write_cache_error(&mut writer, &CacheError::KeyNotFound)?,
+				match timed(stats, command::TTL, || cache.ttl(&key, ttl)) {
+					Ok(()) => write_bool(&mut writer, true)?,
+					Err(err) => write_cache_error(&mut writer, &err)?,
 				}
 			},
 
 			command::SIZE => {
 				let key = read_string(&mut reader)?;
 
-				match parse_key(&key) {
-					Some(key) => match timed(stats, command::SIZE, || cache.size(&key)) {
-						Ok(size) => {
-							write_bool(&mut writer, true)?;
-							write_u32(&mut writer, size as u32)?;
-						},
-						Err(err) => write_cache_error(&mut writer, &err)?,
+				match timed(stats, command::SIZE, || cache.size(&key)) {
+					Ok(size) => {
+						write_bool(&mut writer, true)?;
+						write_u32(&mut writer, size as u32)?;
 					},
-					None => write_cache_error(&mut writer, &CacheError::KeyNotFound)?,
+					Err(err) => write_cache_error(&mut writer, &err)?,
 				}
 			},
 
@@ -823,12 +798,6 @@ fn serve(
 		// buffering past it would deadlock rather than batch.
 		writer.flush()?;
 	}
-}
-
-/// The protocol's keys are strings; this cache is `u64` keyed. See the module
-/// doc for why.
-fn parse_key(key: &str) -> Option<u64> {
-	key.parse::<u64>().ok()
 }
 
 // ---- wire reads ---------------------------------------------------------
