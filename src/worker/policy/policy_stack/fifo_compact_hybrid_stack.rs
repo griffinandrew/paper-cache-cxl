@@ -91,11 +91,12 @@ impl FifoCompactHybridStack {
 		self.fast_capacity
 	}
 
+	/// Metadata reservation for EVERY tracked key, fast or slow: a demotion
+	/// moves the value and leaves the key's row, stack node and header in
+	/// DRAM. See `PolicyStack::dram_reserved_bytes` for the rule, and for why
+	/// a reservation at or over `fast_capacity` is left to saturate.
 	fn reserved_overhead(&self) -> CacheSize {
-		// Only FAST-tier keys draw on the fast-tier budget; the container
-		// tracks both tiers. Charging all of them floored the effective
-		// capacity to zero at high object counts.
-		self.fast_object_count() as CacheSize * self.shared_overhead
+		self.list.len() as CacheSize * self.shared_overhead
 	}
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
@@ -308,5 +309,52 @@ impl PolicyStack for FifoCompactHybridStack {
 
 	fn slow_object_count(&self) -> usize {
 		self.list.len().saturating_sub(self.fast_count)
+	}
+}
+
+/// The fast tier is charged the metadata of EVERY tracked object, not only the
+/// fast ones. A reservation of `fast_object_count() x shared_overhead`
+/// understates DRAM by the whole slow tier's metadata and fails this test.
+#[cfg(test)]
+mod reservation_tests {
+	use super::*;
+
+	const FAST_CAPACITY: CacheSize = 10_000;
+	const OVERHEAD: CacheSize = 200;
+	const SIZE: ObjectSize = 1_000;
+	const N: HashedKey = 20;
+
+	/// 20 x 200 B of metadata leaves 6_000 B for values: five of the twenty
+	/// objects stay fast. Charging the fast ones alone would keep eight.
+	#[test]
+	fn slow_objects_are_charged_against_the_fast_tier() {
+		let mut stack = FifoCompactHybridStack::new(FAST_CAPACITY).with_shared_overhead(OVERHEAD);
+
+		for key in 1..=N {
+			stack.insert(key, SIZE);
+		}
+
+		assert!(
+			stack.slow_object_count() > 0 && stack.fast_object_count() > 0,
+			"the fixture must leave objects in both tiers to tell the rules apart",
+		);
+		assert_eq!(
+			stack.dram_reserved_bytes(),
+			N * OVERHEAD,
+			"all {N} tracked objects keep their metadata in DRAM, but the reservation \
+			 covers {} of them ({} fast, {} slow)",
+			stack.dram_reserved_bytes() / OVERHEAD,
+			stack.fast_object_count(),
+			stack.slow_object_count(),
+		);
+
+		let effective = FAST_CAPACITY - N * OVERHEAD;
+
+		assert!(
+			stack.fast_bytes_used() <= drain_target::bytes(effective),
+			"{} B of values are fast against {effective} B left once all {N} objects' \
+			 metadata is reserved",
+			stack.fast_bytes_used(),
+		);
 	}
 }

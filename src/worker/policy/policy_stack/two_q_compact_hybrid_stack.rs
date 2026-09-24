@@ -127,11 +127,12 @@ impl TwoQCompactHybridStack {
 		self.fast_capacity
 	}
 
+	/// Metadata reservation for EVERY tracked key, fast or slow: a demotion
+	/// moves the value and leaves the key's row, stack node and header in
+	/// DRAM. See `PolicyStack::dram_reserved_bytes` for the rule, and for why
+	/// a reservation at or over `fast_capacity` is left to saturate.
 	fn reserved_overhead(&self) -> CacheSize {
-		// Only FAST-tier keys draw on the fast-tier budget; the container
-		// tracks both tiers. Charging all of them floored the effective
-		// capacity to zero at high object counts.
-		self.fast_object_count() as CacheSize * self.shared_overhead
+		self.queues.len() as CacheSize * self.shared_overhead
 	}
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
@@ -449,5 +450,64 @@ impl PolicyStack for TwoQCompactHybridStack {
 
 	fn needs_capacity_eviction(&self) -> bool {
 		self.fifo_used > self.fifo_capacity
+	}
+}
+
+/// The fast tier is charged the metadata of EVERY tracked key, the slow FIFO
+/// and slow main keys as much as the fast ones. A reservation of
+/// `fast_object_count() x shared_overhead` understates DRAM by every slow
+/// key's metadata and fails this test.
+#[cfg(test)]
+mod reservation_tests {
+	use super::*;
+
+	const FAST_CAPACITY: CacheSize = 10_000;
+	const OVERHEAD: CacheSize = 200;
+	const SIZE: ObjectSize = 1_000;
+
+	/// 20 admissions and 12 hits: twenty keys x 200 B leave 6_000 B for
+	/// values, so five main keys stay fast, seven go slow and eight are still
+	/// in the FIFO. Charging the fast ones alone would keep eight fast.
+	#[test]
+	fn fifo_and_slow_main_keys_are_charged_against_the_fast_tier() {
+		let mut stack = TwoQCompactHybridStack::new(0.5, 1_000_000, FAST_CAPACITY)
+			.with_shared_overhead(OVERHEAD);
+
+		for key in 1..=20 {
+			stack.insert(key, SIZE);
+		}
+
+		for key in 1..=12 {
+			stack.update(key);
+		}
+
+		let tracked = stack.len() as CacheSize;
+		let fifo = stack.queues.queue_len(Q_FIFO);
+		let main_slow = stack.main_count - stack.fast_count;
+
+		assert_eq!(tracked, 20);
+		assert!(
+			fifo > 0 && main_slow > 0 && stack.fast_object_count() > 0,
+			"the fixture must populate every state: {fifo} in the FIFO, {} fast, \
+			 {main_slow} slow in main",
+			stack.fast_object_count(),
+		);
+		assert_eq!(
+			stack.dram_reserved_bytes(),
+			tracked * OVERHEAD,
+			"all {tracked} tracked keys keep their metadata in DRAM, but the reservation \
+			 covers {} of them ({} fast, {main_slow} slow in main, {fifo} in the FIFO)",
+			stack.dram_reserved_bytes() / OVERHEAD,
+			stack.fast_object_count(),
+		);
+
+		let effective = FAST_CAPACITY - tracked * OVERHEAD;
+
+		assert!(
+			stack.fast_bytes_used() <= drain_target::bytes(effective),
+			"{} B of values are fast against {effective} B left once all {tracked} keys' \
+			 metadata is reserved",
+			stack.fast_bytes_used(),
+		);
 	}
 }

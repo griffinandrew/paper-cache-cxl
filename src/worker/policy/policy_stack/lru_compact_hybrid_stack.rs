@@ -106,11 +106,12 @@ impl LruCompactHybridStack {
 		self.fast_capacity
 	}
 
+	/// Metadata reservation for EVERY tracked key, fast or slow: a demotion
+	/// moves the value and leaves the key's row, stack node and header in
+	/// DRAM. See `PolicyStack::dram_reserved_bytes` for the rule, and for why
+	/// a reservation at or over `fast_capacity` is left to saturate.
 	fn reserved_overhead(&self) -> CacheSize {
-		// Only FAST-tier keys draw on the fast-tier budget; the container
-		// tracks both tiers. Charging all of them floored the effective
-		// capacity to zero at high object counts.
-		self.fast_object_count() as CacheSize * self.shared_overhead
+		self.list.len() as CacheSize * self.shared_overhead
 	}
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
@@ -501,5 +502,101 @@ mod growth_tests {
 			stack.list.slab_capacity() >= 1_000,
 			"the slab must have grown to hold what was inserted",
 		);
+	}
+}
+
+/// The fast tier is charged the metadata of EVERY tracked object, not only the
+/// fast ones: a demotion moves the value and leaves the row, the stack node and
+/// the header in DRAM. A reservation of `fast_object_count() x shared_overhead`
+/// understates DRAM by the whole slow tier's metadata, and both tests fail
+/// under it.
+#[cfg(test)]
+mod reservation_tests {
+	use super::*;
+
+	const FAST_CAPACITY: CacheSize = 10_000;
+	const OVERHEAD: CacheSize = 200;
+	const SIZE: ObjectSize = 1_000;
+	const N: HashedKey = 20;
+
+	/// 20 x 200 B of metadata leaves 6_000 B for values: five of the twenty
+	/// objects stay fast. Charging the fast ones alone would keep eight.
+	#[test]
+	fn slow_objects_are_charged_against_the_fast_tier() {
+		let mut stack = LruCompactHybridStack::new(FAST_CAPACITY).with_shared_overhead(OVERHEAD);
+
+		for key in 1..=N {
+			stack.insert(key, SIZE);
+		}
+
+		assert!(
+			stack.slow_object_count() > 0 && stack.fast_object_count() > 0,
+			"the fixture must leave objects in both tiers to tell the rules apart",
+		);
+		assert_eq!(
+			stack.dram_reserved_bytes(),
+			N * OVERHEAD,
+			"all {N} tracked objects keep their metadata in DRAM, but the reservation \
+			 covers {} of them ({} fast, {} slow)",
+			stack.dram_reserved_bytes() / OVERHEAD,
+			stack.fast_object_count(),
+			stack.slow_object_count(),
+		);
+
+		let effective = FAST_CAPACITY - N * OVERHEAD;
+
+		assert!(
+			stack.fast_bytes_used() <= drain_target::bytes(effective),
+			"{} B of values are fast against {effective} B left once all {N} objects' \
+			 metadata is reserved",
+			stack.fast_bytes_used(),
+		);
+	}
+
+	/// Metadata at, then over, the whole fast tier: the effective budget
+	/// saturates at 0, every value is slow, and the stack keeps working --
+	/// hits, removal and eviction included. The reservation is reported as it
+	/// is, above `fast_capacity`, rather than clipped to it.
+	#[test]
+	fn metadata_at_or_over_the_fast_tier_leaves_no_room_for_values() {
+		const OVERHEAD: CacheSize = 1_000;
+		const SIZE: ObjectSize = 100;
+
+		for n in [10, 12] {
+			let mut stack =
+				LruCompactHybridStack::new(FAST_CAPACITY).with_shared_overhead(OVERHEAD);
+
+			for key in 1..=n {
+				stack.insert(key, SIZE);
+			}
+
+			assert_eq!(
+				stack.dram_reserved_bytes(),
+				n * OVERHEAD,
+				"{n} objects: the reservation must be every object's metadata, \
+				 even past the fast tier",
+			);
+			assert_eq!(
+				stack.fast_object_count(),
+				0,
+				"{n} objects: {} B of metadata on a {FAST_CAPACITY} B fast tier leaves \
+				 no room for a value, yet {} are fast",
+				n * OVERHEAD,
+				stack.fast_object_count(),
+			);
+			assert_eq!(stack.fast_bytes_used(), 0);
+			assert_eq!(stack.slow_object_count(), n as usize);
+
+			for key in 1..=n {
+				stack.update(key);
+			}
+
+			assert_eq!(stack.fast_object_count(), 0, "a hit cannot find fast room that is not there");
+
+			stack.remove(1);
+			assert_eq!(stack.evict_one(), Some(2), "the LRU order still holds");
+			assert_eq!(stack.len(), n as usize - 2);
+			assert_eq!(stack.dram_reserved_bytes(), (n - 2) * OVERHEAD);
+		}
 	}
 }

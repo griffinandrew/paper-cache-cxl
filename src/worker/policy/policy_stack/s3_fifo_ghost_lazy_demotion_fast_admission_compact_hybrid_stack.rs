@@ -28,7 +28,8 @@
 //!    reservation is then split *proportionally* between the two segments
 //!    (`reserved_shares`, following `LruSizedHybridStack`) so that
 //!    `effective_one_access_capacity() + effective_main_fast_capacity() +
-//!    reserved_overhead() == fast_capacity`. That holds for EVERY
+//!    reserved_overhead() == fast_capacity` while the reservation fits in
+//!    the tier. That holds for EVERY
 //!    `(one_access_ratio, max_size, fast_capacity)`, including the ones where
 //!    `one_access_ratio * max_size` on its own would exceed the whole fast
 //!    tier: both segments are DRAM here, so a queue capped from the cache
@@ -183,11 +184,12 @@ impl S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
 		self
 	}
 
+	/// Metadata reservation for EVERY tracked key, fast or slow -- a demotion
+	/// moves the value and leaves the key's row, stack node and header in
+	/// DRAM -- plus the ghost filter's entries, which are DRAM as well. See
+	/// `PolicyStack::dram_reserved_bytes`.
 	fn reserved_overhead(&self) -> CacheSize {
-		// Only FAST-tier keys draw on the fast-tier budget; the container
-		// tracks both tiers. Charging all of them floored the effective
-		// capacity to zero at high object counts.
-		self.fast_object_count() as CacheSize * self.shared_overhead + self.ghost.dram_bytes()
+		self.queues.len() as CacheSize * self.shared_overhead + self.ghost.dram_bytes()
 	}
 
 	/// The one-access queue's carve-out as the FAST TIER can pay for it, before

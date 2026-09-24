@@ -42,7 +42,8 @@
 //!    reservation is split *proportionally* between the two fast segments
 //!    (`reserved_shares`, the scheme `LruSizedHybridStack` uses), so
 //!    `effective_one_access_capacity() + effective_main_fast_capacity() +
-//!    reserved_overhead() == fast_capacity` at every settled point. Both
+//!    reserved_overhead() == fast_capacity` at every settled point while
+//!    the reservation fits in the tier. Both
 //!    resize entry points therefore settle BOTH segments.
 //!
 //! 3. **Lazy demotion as two physical lists.** Demotion is
@@ -184,11 +185,12 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 		self
 	}
 
+	/// Metadata reservation for EVERY tracked key, fast or slow: a demotion
+	/// moves the value and leaves the key's row, stack node and header in
+	/// DRAM. See `PolicyStack::dram_reserved_bytes` for the rule, and for why
+	/// a reservation at or over `fast_capacity` is left to saturate.
 	fn reserved_overhead(&self) -> CacheSize {
-		// Only FAST-tier keys draw on the fast-tier budget; the container
-		// tracks both tiers. Charging all of them floored the effective
-		// capacity to zero at high object counts.
-		self.fast_object_count() as CacheSize * self.shared_overhead
+		self.queues.len() as CacheSize * self.shared_overhead
 	}
 
 	/// Splits `reserved_overhead()` proportionally between this stack's two

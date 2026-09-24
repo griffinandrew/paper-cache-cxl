@@ -204,8 +204,9 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 		}
 	}
 
-	/// Resident objects pay the shared per-object metadata; ghost entries pay
-	/// only their own structural cost.
+	/// Every resident object pays the shared per-object metadata, a slow one
+	/// as much as a fast one (see `PolicyStack::dram_reserved_bytes`); ghost
+	/// entries pay only their own structural cost.
 	///
 	/// Charging `shared_overhead` per ghost entry -- which an earlier draft of
 	/// this file did -- overstates it by roughly 2.6x: a ghost entry is a bare
@@ -215,9 +216,7 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 		let ghost_entry =
 			crate::object::overhead::EXACT_GHOST_ENTRY_DRAM_OVERHEAD as CacheSize;
 
-		// Only FAST-tier keys draw on the fast-tier budget; queues track both
-		// tiers. The ghost term stays: ghost entries ARE DRAM-resident.
-		self.fast_object_count() as CacheSize * self.shared_overhead
+		self.queues.len() as CacheSize * self.shared_overhead
 			+ self.ghost.queue_len(Q_GHOST) as CacheSize * ghost_entry
 	}
 

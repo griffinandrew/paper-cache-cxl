@@ -187,10 +187,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 	/// index bucket and a slab slot, and `queues.len()` counts all three
 	/// queues -- including `a1_out`, whose members are ordinary resident keys.
 	fn reserved_overhead(&self) -> CacheSize {
-		// Only FAST-tier keys draw on the fast-tier budget; the container
-		// tracks both tiers. Charging all of them floored the effective
-		// capacity to zero at high object counts.
-		self.fast_object_count() as CacheSize * self.shared_overhead
+		self.queues.len() as CacheSize * self.shared_overhead
 	}
 
 	/// How much of `fast_capacity` `am`'s fast segment may use, after `a1_in`'s

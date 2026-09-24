@@ -617,6 +617,74 @@ mod global_demotion_fidelity {
 			"the two stacks disagree about fast bytes after the touches",
 		);
 	}
+
+	/// The reservation both designs take off the fast tier is the same one:
+	/// `shared_overhead` for EVERY live object, fast or slow. The merged store
+	/// charges `len()`; the split stack must too, or at one budget it keeps
+	/// fast the values whose room is really its slow objects' metadata, and
+	/// the two designs are measured on different fast tiers.
+	///
+	/// 128 B x 300 objects reserves 38_400 B: enough to move the boundary by
+	/// dozens of cold objects, not enough to reach a large one.
+	#[test]
+	fn both_designs_reserve_metadata_for_every_live_object() {
+		const OVERHEAD: CacheSize = 128;
+
+		let cold: Vec<HashedKey> = (1..=N_SMALL).map(|i| in_shard(COLD_SHARD, i)).collect();
+		let hot: Vec<HashedKey> =
+			(1..=N_LARGE).map(|i| in_shard(HOT_SHARD, 1_000_000 + i)).collect();
+
+		let mut seq: Vec<(HashedKey, ObjectSize)> =
+			cold.iter().map(|&k| (k, SMALL)).collect();
+
+		seq.extend(hot.iter().map(|&k| (k, LARGE)));
+
+		let store = Arc::new(Store::new());
+		let mut merged =
+			Handle::new(store.clone(), PaperPolicy::LruCompactHybrid, FAST_CAPACITY * 5)
+				.expect("lru-compact-hybrid is implemented");
+
+		store.configure_tiering(
+			FAST_CAPACITY,
+			OVERHEAD,
+			drain_target_ppm(),
+			drain_target_ppm(),
+		);
+
+		let mut split = LruCompactHybridStack::new(FAST_CAPACITY).with_shared_overhead(OVERHEAD);
+
+		feed(&store, &mut merged, &mut split, &seq);
+
+		let live = N_SMALL + N_LARGE;
+
+		assert!(split.slow_object_count() > 0, "the budget never bit");
+		assert_eq!(
+			store.dram_reserved_bytes(),
+			live * OVERHEAD,
+			"the merged store charges every live object",
+		);
+		assert_eq!(
+			split.dram_reserved_bytes(),
+			store.dram_reserved_bytes(),
+			"the split stack reserves for {} of the {live} objects ({} fast, {} slow), \
+			 the merged store for all of them",
+			split.dram_reserved_bytes() / OVERHEAD,
+			split.fast_object_count(),
+			split.slow_object_count(),
+		);
+
+		for &(key, _) in &seq {
+			assert_eq!(
+				store.tier_of(key),
+				split.tier_of(key),
+				"key {key:#018x} is in a different tier in the two designs under one \
+				 reservation",
+			);
+		}
+
+		assert_eq!(store.fast_bytes_used(), split.fast_bytes_used());
+		assert_eq!(store.fast_object_count(), split.fast_object_count());
+	}
 }
 
 /// The acceptance test for `MergedOrder::Fifo`: it is the SAME order

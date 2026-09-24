@@ -67,10 +67,10 @@ impl OverheadManager {
 		// item's own allocation, which is exactly what a migration moves and
 		// what `fast_used`/`slow_used` charge. What the object keeps in DRAM
 		// is the row, the 16-byte header and the stack node -- the terms the
-		// per-object reservation names. Which objects the fast tier reserves
-		// them for is the design's business, not this function's: the merged
-		// store reserves for every live object, the DashMap stacks only for
-		// fast ones (`reserved_overhead`).
+		// per-object reservation names. Every design reserves them for every
+		// live object, whichever tier its value is in, since none of them
+		// moves on a demotion: the merged store in `settle_tier`, the DashMap
+		// stacks in `reserved_overhead`.
 		#[cfg(not(feature = "fused_value"))]
 		{
 			let mut resident =

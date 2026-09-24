@@ -140,11 +140,12 @@ impl S3FifoGhostCompactHybridStack {
 		self.fast_capacity
 	}
 
+	/// Metadata reservation for EVERY tracked key, fast or slow -- a demotion
+	/// moves the value and leaves the key's row, stack node and header in
+	/// DRAM -- plus the ghost filter's entries, which are DRAM as well. See
+	/// `PolicyStack::dram_reserved_bytes`.
 	fn reserved_overhead(&self) -> CacheSize {
-		// Only FAST-tier keys draw on the fast-tier budget; the container
-		// tracks both tiers. Charging all of them floored the effective
-		// capacity to zero at high object counts.
-		self.fast_object_count() as CacheSize * self.shared_overhead + self.ghost.dram_bytes()
+		self.queues.len() as CacheSize * self.shared_overhead + self.ghost.dram_bytes()
 	}
 
 	pub fn is_ghost(&self, key: HashedKey) -> bool {
@@ -541,5 +542,82 @@ impl PolicyStack for S3FifoGhostCompactHybridStack {
 
 	fn needs_capacity_eviction(&self) -> bool {
 		self.one_access_used > self.one_access_capacity
+	}
+}
+
+/// The fast tier is charged the metadata of EVERY tracked key -- one-access,
+/// fast main and slow main alike -- and the ghost entries on top. A
+/// reservation of `fast_object_count() x shared_overhead` understates DRAM by
+/// every slow key's metadata and fails this test.
+#[cfg(test)]
+mod reservation_tests {
+	use super::*;
+
+	const FAST_CAPACITY: CacheSize = 10_000;
+	const OVERHEAD: CacheSize = 200;
+	const SIZE: ObjectSize = 1_000;
+	/// Large enough that main is never full, so an eviction always takes the
+	/// one-access tail and leaves a ghost.
+	const MAX_SIZE: CacheSize = 1_000_000;
+
+	/// 24 admissions, four one-access evictions (four ghosts), twelve hits
+	/// promoting into main. Twenty keys x 200 B plus the ghost leave ~6_000 B
+	/// for values: five main keys stay fast, seven go slow, eight are still
+	/// one-access. Charging the fast ones alone would keep eight fast.
+	#[test]
+	fn every_tracked_key_is_charged_and_the_ghost_on_top() {
+		let mut stack = S3FifoGhostCompactHybridStack::new(0.1, MAX_SIZE, FAST_CAPACITY)
+			.with_shared_overhead(OVERHEAD);
+
+		for key in 1..=24 {
+			stack.insert(key, SIZE);
+		}
+
+		for oldest in 1..=4 {
+			assert_eq!(stack.evict_one(), Some(oldest));
+		}
+
+		for key in 5..=16 {
+			stack.update(key);
+		}
+
+		let tracked = stack.len() as CacheSize;
+		let one_access = stack.queues.queue_len(Q_ONE_ACCESS);
+		let main_slow = stack.main_count - stack.fast_count;
+
+		assert_eq!(tracked, 20);
+		assert!(
+			one_access > 0 && main_slow > 0 && stack.fast_object_count() > 0,
+			"the fixture must populate every state: {one_access} one-access, {} fast, \
+			 {main_slow} slow in main",
+			stack.fast_object_count(),
+		);
+		assert!((1..=4).all(|k| stack.is_ghost(k)), "each eviction must leave a ghost");
+
+		let ghost = stack.ghost.dram_bytes();
+
+		assert_eq!(
+			ghost,
+			4 * crate::object::overhead::GHOST_ENTRY_DRAM_OVERHEAD as CacheSize,
+			"four live ghost entries",
+		);
+		assert_eq!(
+			stack.dram_reserved_bytes(),
+			tracked * OVERHEAD + ghost,
+			"all {tracked} tracked keys keep their metadata in DRAM and the ghost is \
+			 charged on top, but the reservation covers {} keys' worth ({} fast, \
+			 {main_slow} slow in main, {one_access} one-access)",
+			stack.dram_reserved_bytes().saturating_sub(ghost) / OVERHEAD,
+			stack.fast_object_count(),
+		);
+
+		let effective = FAST_CAPACITY - tracked * OVERHEAD - ghost;
+
+		assert!(
+			stack.fast_bytes_used() <= drain_target::bytes(effective),
+			"{} B of values are fast against {effective} B left once every key's \
+			 metadata and the ghost are reserved",
+			stack.fast_bytes_used(),
+		);
 	}
 }

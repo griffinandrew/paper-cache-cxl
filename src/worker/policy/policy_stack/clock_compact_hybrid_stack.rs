@@ -116,11 +116,12 @@ impl ClockCompactHybridStack {
 		self.fast_capacity
 	}
 
+	/// Metadata reservation for EVERY tracked key, fast or slow: a demotion
+	/// moves the value and leaves the key's row, stack node and header in
+	/// DRAM. See `PolicyStack::dram_reserved_bytes` for the rule, and for why
+	/// a reservation at or over `fast_capacity` is left to saturate.
 	fn reserved_overhead(&self) -> CacheSize {
-		// Only FAST-tier keys draw on the fast-tier budget; the container
-		// tracks both tiers. Charging all of them floored the effective
-		// capacity to zero at high object counts.
-		self.fast_object_count() as CacheSize * self.shared_overhead
+		self.list.len() as CacheSize * self.shared_overhead
 	}
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {

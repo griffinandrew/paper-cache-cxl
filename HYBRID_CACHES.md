@@ -277,6 +277,17 @@ comes out of capacity first, and the ratio applies to what is left.
 The multiplier is *every* tracked key, not just fast ones — a slow-tier object still has a
 hashtable entry, a list node and an `entries` slot in DRAM.
 
+When `tracked × shared_overhead` meets or exceeds `fast_capacity`, every value budget derived
+from the fast tier saturates at 0: the fast tier is metadata-bound, which is the true DRAM state
+rather than an accounting fault. What follows differs by design. Most demote every value. The
+S3-FIFO fast-admission designs also close admission (a one-access queue with no budget evicts
+each new key to the ghost on arrival). `two_q_fast_admission` and `two_q_full_fast_admission`
+keep their DRAM admission queue -- a fixed `k_in × max_size` the reservation does not shrink --
+on top of the reservation, so they overrun DRAM (the unclamped carve-out above). Charging only fast keys was tried and reverted — on cluster35
+(DashMap LRU, 5 GiB fast tier) it reserved 313.6 MB against 896.7 MB of real metadata, so fast
+data plus metadata reached 5,851 MB in a 5,369 MB tier. The merged store charges the same
+`len() × shared_overhead`.
+
 ### `eviction_stacks_pmem`
 
 Moves each stack's lists and per-key map into the slow tier via `crate::Hybrid`. The

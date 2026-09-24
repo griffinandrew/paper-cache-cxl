@@ -116,17 +116,6 @@ pub struct LruLazyCopyCompactHybridStack {
 	shared_overhead: CacheSize,
 	fast_count: usize,
 
-	/// Objects whose bytes are physically in DRAM: logical-fast PLUS candidates
-	/// (logically slow, not yet copied out). This is what the DRAM budget must
-	/// be charged against -- `fast_count` alone undercounts by the whole
-	/// candidate window, and `list.len()` overcharges by the entire slow tier.
-	///
-	/// It moves with every change to the SET of DRAM-resident objects, not with
-	/// `dram_used`: `resize_key` adjusts the byte total for an object whose size
-	/// changed without changing how many objects are resident, so it is
-	/// deliberately not hooked there.
-	phys_fast_count: usize,
-
 	/// Least-recently-used LOGICALLY fast key.
 	fast_boundary: Option<HashedKey>,
 
@@ -158,7 +147,6 @@ impl LruLazyCopyCompactHybridStack {
 			dram_used: 0,
 			shared_overhead: 0,
 			fast_count: 0,
-			phys_fast_count: 0,
 			fast_boundary: None,
 			phys_boundary: None,
 			migrations: Vec::new(),
@@ -187,11 +175,12 @@ impl LruLazyCopyCompactHybridStack {
 		self.copies_avoided
 	}
 
+	/// Metadata reservation for EVERY tracked key, logically fast, candidate
+	/// or copied out alike: only value bytes ever leave DRAM, so each key's
+	/// row, stack node and header come off `dram_capacity` in every state.
+	/// See `PolicyStack::dram_reserved_bytes`.
 	fn reserved_overhead(&self) -> CacheSize {
-		// The DRAM budget covers logical-fast AND candidates, so charge the
-		// PHYSICAL count. `list.len()` charged both tiers and floored the
-		// effective capacity to zero at high object counts.
-		self.phys_fast_count as CacheSize * self.shared_overhead
+		self.list.len() as CacheSize * self.shared_overhead
 	}
 
 	/// Budget the PHYSICAL cursor enforces: the whole DRAM allowance, net of
@@ -308,7 +297,6 @@ impl LruLazyCopyCompactHybridStack {
 					}
 
 					self.dram_used += size;
-					self.phys_fast_count += 1;
 					promoted_physically = true;
 
 					if self.phys_boundary.is_none() {
@@ -374,7 +362,6 @@ impl LruLazyCopyCompactHybridStack {
 			}
 
 			self.dram_used = self.dram_used.saturating_sub(size);
-			self.phys_fast_count = self.phys_fast_count.saturating_sub(1);
 			self.phys_boundary = next;
 
 			self.migrations.push((key, Tier::Slow));
@@ -410,7 +397,6 @@ impl LruLazyCopyCompactHybridStack {
 
 		if p.phys == Some(Tier::Fast) {
 			self.dram_used = self.dram_used.saturating_sub(size);
-			self.phys_fast_count = self.phys_fast_count.saturating_sub(1);
 		}
 	}
 }
@@ -461,7 +447,6 @@ impl PolicyStack for LruLazyCopyCompactHybridStack {
 		self.fast_used += migrating;
 		self.dram_used += migrating;
 		self.fast_count += 1;
-		self.phys_fast_count += 1;
 
 		if self.fast_boundary.is_none() {
 			self.fast_boundary = Some(key);
@@ -492,7 +477,6 @@ impl PolicyStack for LruLazyCopyCompactHybridStack {
 		self.slow_used = 0;
 		self.dram_used = 0;
 		self.fast_count = 0;
-		self.phys_fast_count = 0;
 		self.fast_boundary = None;
 		self.phys_boundary = None;
 		self.migrations.clear();
@@ -703,6 +687,104 @@ mod fidelity_tests {
 					_ => {},
 				}
 			}
+		}
+	}
+}
+
+/// The lazy copy's DRAM budget is charged the metadata of EVERY tracked
+/// object: logically fast, candidate, and copied out alike. Charging only the
+/// objects whose bytes are in DRAM understates DRAM by the copied-out
+/// objects' metadata, and both tests fail under that rule.
+#[cfg(test)]
+mod reservation_tests {
+	use super::*;
+
+	const DRAM: CacheSize = 20_000;
+	const OVERHEAD: CacheSize = 200;
+	const SIZE: ObjectSize = 1_000;
+	const N: HashedKey = 30;
+
+	/// 30 x 200 B of metadata leaves 14_000 B of DRAM for values at a 0.5
+	/// window: thirteen objects' bytes in DRAM, six of them logically fast and
+	/// seven candidates, seventeen copied out.
+	#[test]
+	fn every_tracked_object_is_charged_against_dram() {
+		let mut stack = LruLazyCopyCompactHybridStack::new(DRAM)
+			.with_shared_overhead(OVERHEAD)
+			.with_lazy_window(0.5);
+
+		for key in 1..=N {
+			stack.insert(key, SIZE);
+		}
+
+		let candidates = (1..=N)
+			.filter(|&k| {
+				stack.tier_of(k) == Some(Tier::Slow) && stack.physical_tier_of(k) == Some(Tier::Fast)
+			})
+			.count();
+		let copied_out = (1..=N).filter(|&k| stack.physical_tier_of(k) == Some(Tier::Slow)).count();
+
+		assert!(
+			stack.fast_object_count() > 0 && candidates > 0 && copied_out > 0,
+			"the fixture must populate all three states: {} fast, {candidates} candidates, \
+			 {copied_out} copied out",
+			stack.fast_object_count(),
+		);
+		assert_eq!(
+			stack.dram_reserved_bytes(),
+			N * OVERHEAD,
+			"all {N} tracked objects keep their metadata in DRAM, but the reservation \
+			 covers {} of them ({} fast, {candidates} candidates, {copied_out} copied out)",
+			stack.dram_reserved_bytes() / OVERHEAD,
+			stack.fast_object_count(),
+		);
+
+		let physical = DRAM - N * OVERHEAD;
+
+		assert!(
+			stack.fast_bytes_used() <= drain_target::bytes(physical),
+			"{} B of values are in DRAM against {physical} B left once all {N} objects' \
+			 metadata is reserved",
+			stack.fast_bytes_used(),
+		);
+	}
+
+	/// Metadata at, then over, the whole DRAM budget: nothing can be logically
+	/// fast or even a candidate, and the stack keeps working.
+	#[test]
+	fn metadata_at_or_over_dram_leaves_no_room_for_values() {
+		const DRAM: CacheSize = 10_000;
+		const OVERHEAD: CacheSize = 1_000;
+		const SIZE: ObjectSize = 100;
+
+		for n in [10, 12] {
+			let mut stack = LruLazyCopyCompactHybridStack::new(DRAM)
+				.with_shared_overhead(OVERHEAD)
+				.with_lazy_window(0.5);
+
+			for key in 1..=n {
+				stack.insert(key, SIZE);
+			}
+
+			assert_eq!(stack.dram_reserved_bytes(), n * OVERHEAD, "{n} objects");
+			assert_eq!(
+				stack.fast_bytes_used(),
+				0,
+				"{n} objects: {} B of metadata on {DRAM} B of DRAM leaves no room for \
+				 value bytes, yet {} B are there",
+				n * OVERHEAD,
+				stack.fast_bytes_used(),
+			);
+			assert_eq!(stack.fast_object_count(), 0);
+			assert!((1..=n).all(|k| stack.physical_tier_of(k) == Some(Tier::Slow)));
+
+			for key in 1..=n {
+				stack.update(key);
+			}
+
+			assert_eq!(stack.fast_bytes_used(), 0, "a hit cannot find DRAM that is not there");
+			assert_eq!(stack.evict_one(), Some(1));
+			assert_eq!(stack.dram_reserved_bytes(), (n - 1) * OVERHEAD);
 		}
 	}
 }

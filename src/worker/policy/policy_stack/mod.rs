@@ -272,16 +272,41 @@ where
 		Vec::new()
 	}
 
-	/// Current bytes accounted to the fast tier. `0` for every stack except
-	/// the hybrid stacks.
 	/// DRAM reserved for shared per-object metadata across *both* tiers
-	/// (`tracked objects x shared_overhead`). `fast_bytes_used` counts object
-	/// bytes only, so the fast tier's true DRAM footprint is the two summed.
-	/// `0` on all-DRAM stacks, which have no tiers and reserve nothing.
+	/// (`tracked objects x shared_overhead`), taken off `fast_capacity` before
+	/// the drain target is applied.
+	///
+	/// Every tracked object is charged, whichever tier its value is in. A
+	/// demotion moves the value bytes and nothing else, so a slow object's
+	/// object-map row, eviction-stack node and value header are still in DRAM
+	/// -- and `get_hybrid_dram_shared_overhead` already leaves out whichever of
+	/// those a build places in PMEM, so the count must not discount them again
+	/// by tier. `MergedStore` charges the same `len() x shared_overhead`.
+	/// Charging fast objects only was tried and reverted: on cluster35 (DashMap
+	/// LRU, 5 GiB fast tier) it reserved 313.6 MB against 896.7 MB of real
+	/// metadata, and fast data plus metadata came to 5,851 MB in a 5,369 MB
+	/// tier.
+	///
+	/// A reservation that meets or exceeds `fast_capacity` leaves every value
+	/// budget derived from the fast tier at 0 -- every stack subtracts it
+	/// saturating. That is the true DRAM state of a metadata-bound tier, not an
+	/// accounting fault, but what follows differs by design. Most demote every
+	/// value. The S3-FIFO fast-admission designs also close admission: a
+	/// one-access queue with no budget evicts each new key to the ghost as it
+	/// arrives. And `two_q_fast_admission` / `two_q_full_fast_admission`, whose
+	/// DRAM admission queue is a fixed `k_in x max_size` the reservation does not
+	/// shrink, keep that queue's values in DRAM on top of it -- the unclamped
+	/// carve-out described in HYBRID_CACHES.md.
+	///
+	/// `fast_bytes_used` counts object bytes only, so the fast tier's true DRAM
+	/// footprint is the two summed. `0` on all-DRAM stacks, which have no tiers
+	/// and reserve nothing.
 	fn dram_reserved_bytes(&self) -> CacheSize {
 		0
 	}
 
+	/// Current bytes accounted to the fast tier. `0` for every stack except
+	/// the hybrid stacks.
 	fn fast_bytes_used(&self) -> CacheSize {
 		0
 	}
@@ -1208,5 +1233,157 @@ mod init_policy_stack_tests {
 				"the stacks built for `auto` and `lfu` disagree about `{candidate}`, so `auto` is no longer resolving to the LFU design",
 			);
 		}
+	}
+}
+
+/// The fast-tier reservation, pinned across every hybrid design at once.
+///
+/// Each design is built the way the worker builds it -- `init_policy_stack`,
+/// so with its production `shared_overhead` -- and driven the way the worker
+/// drives it: every admission is followed by two hits on the same key, and
+/// every event by the evictions the worker would make -- for a sub-queue over
+/// its own capacity, or for the cache over `max_size`. That pushes every
+/// design's keys through its admission queue into main, eagerly or at
+/// eviction, so each ends up with a slow tier whose metadata is several times
+/// anything a ghost could account for. Whatever it holds there,
+/// `dram_reserved_bytes` must cover EVERY tracked key, `len() x
+/// shared_overhead`, plus -- for the designs with a ghost -- no more than the
+/// ghost entries the evictions can have left. A rule that charges fast keys
+/// alone falls short by the slow keys' metadata and cannot pass by accident.
+///
+/// Under `merged_object_store` the worker builds `MergedStackHandle` instead
+/// and refuses most of these policies, so there this still drives the split
+/// stacks, with the merged build's per-object figure: a test of the rule, not
+/// a model of that build's worker.
+///
+/// Gated off `eviction_stacks_pmem`, whose stacks allocate through the
+/// `Hybrid` allocator and would need a warmed PMEM pool.
+#[cfg(all(test, feature = "hybrid_cache_common", not(feature = "eviction_stacks_pmem")))]
+mod reservation_tests {
+	use super::*;
+
+	/// Each design's fast tier is 20% of this: 200_000 B.
+	const MAX_SIZE: CacheSize = 1_000_000;
+
+	/// 1_200_000 B of values: six times the fast tier, and enough over
+	/// `MAX_SIZE` that the designs which promote only at eviction (the
+	/// faithful S3-FIFO family) do.
+	const N: HashedKey = 3_000;
+	const SIZE: ObjectSize = 400;
+
+	/// Per-entry ghost charges: the ghost filter's slot, and the faithful
+	/// S3-FIFO's exact ghost queue entry.
+	const FILTER: CacheSize = crate::object::overhead::GHOST_ENTRY_DRAM_OVERHEAD as CacheSize;
+	const EXACT: CacheSize = crate::object::overhead::EXACT_GHOST_ENTRY_DRAM_OVERHEAD as CacheSize;
+
+	/// Every hybrid design, with what it charges per ghost entry (0: no ghost).
+	const DESIGNS: [(PaperPolicy, CacheSize); 25] = [
+		(PaperPolicy::LruCompactHybrid, 0),
+		(PaperPolicy::LruLazyCopyCompactHybrid, 0),
+		(PaperPolicy::LfuCompactHybrid, 0),
+		(PaperPolicy::LruLfuCompactHybrid(3), 0),
+		(PaperPolicy::LruSizedCompactHybrid, 0),
+		(PaperPolicy::FifoCompactHybrid, 0),
+		(PaperPolicy::ClockCompactHybrid, 0),
+		(PaperPolicy::TwoQCompactHybrid(0.1), 0),
+		(PaperPolicy::TwoQFastAdmissionCompactHybrid(0.1), 0),
+		(PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.1), 0),
+		(PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.1, 0.5), 0),
+		(PaperPolicy::TwoQGhostCompactHybrid(0.1), FILTER),
+		(PaperPolicy::S3FifoCompactHybrid(0.1), 0),
+		(PaperPolicy::S3FifoFaithfulCompactHybrid(0.1), EXACT),
+		(PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.1), EXACT),
+		(PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(0.1), EXACT),
+		(PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(0.1), EXACT),
+		(PaperPolicy::S3FifoGhostCompactHybrid(0.1), FILTER),
+		(PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(0.1), FILTER),
+		(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(0.1), FILTER),
+		(PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(0.1), FILTER),
+		(PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(0.1), 0),
+		(PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(0.1), 0),
+		(PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(0.1), 0),
+		(PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(0.1), 0),
+	];
+
+	/// What the worker does after each event: evict while a sub-queue is over
+	/// its own capacity or the cache is over `MAX_SIZE`, read here from the
+	/// stack's own byte gauges. Returns how many keys went.
+	fn evict_while_asked(stack: &mut dyn PolicyStack) -> CacheSize {
+		let mut evicted = 0;
+
+		while (stack.needs_capacity_eviction()
+			|| stack.fast_bytes_used() + stack.slow_bytes_used() > MAX_SIZE)
+			&& stack.evict_one().is_some()
+		{
+			evicted += 1;
+		}
+
+		evicted
+	}
+
+	#[test]
+	fn every_hybrid_design_charges_every_tracked_key() {
+		let mut failures = Vec::new();
+
+		for (policy, ghost_entry) in DESIGNS {
+			assert!(policy.is_hybrid(), "{policy} is not a hybrid design");
+
+			let overhead =
+				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize;
+
+			assert!(
+				overhead > 0,
+				"{policy}: no reservation to test -- is PAPER_DISABLE_SHARED_OVERHEAD set?",
+			);
+
+			let mut stack = init_policy_stack(policy, MAX_SIZE);
+			let mut evicted = 0;
+
+			for key in 1..=N {
+				stack.insert(key, SIZE);
+				evicted += evict_while_asked(stack.as_mut());
+
+				for _ in 0..2 {
+					if stack.contains(key) {
+						stack.update(key);
+						evicted += evict_while_asked(stack.as_mut());
+					}
+				}
+			}
+
+			let tracked = stack.len() as CacheSize;
+			let fast = stack.fast_object_count();
+			let slow = stack.slow_object_count() as CacheSize;
+			let reserved = stack.dram_reserved_bytes();
+			let floor = tracked * overhead;
+			let ghost_room = evicted * ghost_entry;
+
+			if slow * overhead <= ghost_room {
+				failures.push(format!(
+					"{policy}: fixture too weak -- {slow} slow keys' metadata ({} B) does \
+					 not exceed the {ghost_room} B a ghost could account for",
+					slow * overhead,
+				));
+				continue;
+			}
+
+			if !(floor..=floor + ghost_room).contains(&reserved) {
+				failures.push(format!(
+					"{policy}: reserves {reserved} B, but {tracked} tracked keys x {overhead} B \
+					 = {floor} B ({fast} fast, {slow} slow{})",
+					match ghost_room {
+						0 => String::new(),
+						room => format!(", up to {room} B of ghost on top"),
+					},
+				));
+			}
+		}
+
+		assert!(
+			failures.is_empty(),
+			"every tracked key's metadata is DRAM-resident whichever tier its value is \
+			 in, so each must be charged:\n{}",
+			failures.join("\n"),
+		);
 	}
 }
