@@ -3334,6 +3334,179 @@ mod merged_overwrite_tests {
 	}
 }
 
+/// The merged store's slow tier holds exactly the bytes it charges to the slow
+/// tier, once the worker has applied what it drained.
+///
+/// Driven through the worker the way its event loop drives it -- `handle_get`
+/// for a hit, then `apply_tier_migrations` -- with the store's own `touch` and
+/// settle producing the drain, rather than a scripted one. The stranding
+/// `split_tier_migrations` removed lived between the two: the store's
+/// migration list was right, and the worker applied it backwards. With a fast
+/// budget that cannot hold a hit key, the hit's promotion and the settle's
+/// demotion of the same key went out demote-first, and the bytes stayed in
+/// DRAM while `slow_used` counted them -- 6,877 objects, 793,088 B, the whole
+/// slow-tier drift on the cluster99 golden trace (4 MiB fast tier).
+///
+/// Each case runs with the consumer queue (the default) and without it
+/// (`MIGRATION_QUEUE_THREADS=0`); both apply the split drain.
+#[cfg(all(test, feature = "merged_object_store", feature = "hybrid_cache_common"))]
+mod merged_placement_tests {
+	use std::sync::Arc;
+
+	use crossbeam_channel::unbounded;
+
+	use super::{PolicyWorker, Tier, WorkerEvent, migration_test_lock};
+	use crate::{
+		CacheSize, HashedKey, ObjectMapRef, PaperPolicy, TieredBuffer,
+		merged_store::MergedStore,
+		object::{Object, overhead::{OverheadManager, resident_object_bytes}},
+		status::AtomicStatus,
+	};
+
+	type Objects = ObjectMapRef<u64, TieredBuffer>;
+
+	/// Spreads keys across shards, which select on the HIGH bits.
+	fn mix(i: u64) -> HashedKey {
+		i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+	}
+
+	/// A worker whose stack is the merged store's own, as a merged build
+	/// constructs it, with the fast budget then set to `fast_capacity` and no
+	/// metadata reservation, so the budget is in value bytes alone.
+	fn make_worker(queued: bool, fast_capacity: CacheSize) -> (PolicyWorker<u64, TieredBuffer>, Objects) {
+		let (_tx, rx) = unbounded::<WorkerEvent>();
+
+		let objects: Objects = Arc::new(MergedStore::new());
+		let policy = PaperPolicy::LruCompactHybrid;
+		let status = Arc::new(AtomicStatus::new(1 << 30, &[policy], policy).unwrap());
+		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		let mut worker = PolicyWorker::new_with_tier_migration(
+			rx,
+			objects.clone(),
+			status,
+			overhead_manager,
+		).unwrap();
+
+		objects.configure_tiering(fast_capacity, 0, 1_000_000, 1_000_000);
+
+		if !queued {
+			worker.migration_queue = None;
+		}
+
+		(worker, objects)
+	}
+
+	/// What `PaperCache::set` does under LRU: build the bytes in DRAM and
+	/// insert, which admits fast and settles on this thread.
+	fn set(objects: &Objects, key: HashedKey, len: usize) {
+		objects.insert(key, Object::new_in(key, &vec![key as u8; len], Tier::Fast, None));
+	}
+
+	/// Every key's bytes are in the tier the store charges it to, and each
+	/// tier's byte total is exactly what those objects cost -- the per-object
+	/// form of "modelled == measured".
+	fn assert_placement_matches_the_model(objects: &Objects, keys: &[HashedKey]) {
+		let mut fast: CacheSize = 0;
+		let mut slow: CacheSize = 0;
+
+		for &key in keys {
+			let logical = objects.tier_of(key).expect("live key");
+
+			let (physical, bytes) = objects
+				.get_ref(&key)
+				.map(|object| {
+					let bytes = resident_object_bytes::<u64>(object.data_size()) as CacheSize;
+					(object.value().tier(), bytes)
+				})
+				.expect("live key");
+
+			assert_eq!(
+				physical,
+				logical,
+				"key {key:#x}: the store charges it to {logical:?} but its bytes are {physical:?}",
+			);
+
+			match physical {
+				Tier::Fast => fast += bytes,
+				Tier::Slow => slow += bytes,
+			}
+		}
+
+		assert_eq!(objects.slow_bytes_used(), slow, "slow_used is not the slow tier's bytes");
+		assert_eq!(objects.fast_bytes_used(), fast, "fast_used is not the fast tier's bytes");
+	}
+
+	/// The minimal case: a budget that holds nothing, one key, one hit.
+	#[test]
+	fn a_promotion_undone_by_its_own_settle_leaves_the_bytes_slow() {
+		for queued in [true, false] {
+			let _serialised = migration_test_lock::lock();
+
+			let (mut worker, objects) = make_worker(queued, 0);
+			let key = mix(1);
+
+			set(&objects, key, 100);
+			worker.apply_tier_migrations();
+			assert_placement_matches_the_model(&objects, &[key]);
+
+			worker.handle_get(key, true);
+			worker.apply_tier_migrations();
+
+			assert_eq!(objects.tier_of(key), Some(Tier::Slow), "queued = {queued}");
+			assert_placement_matches_the_model(&objects, &[key]);
+		}
+	}
+
+	/// Many keys, repeated hits, and a budget that holds a few objects, so
+	/// some promotions stand and some are undone at once -- applied per event,
+	/// and every eight events, since the merged store's API threads push
+	/// migrations between the worker's drains and a batch can span events.
+	#[test]
+	fn slow_bytes_are_where_the_store_counts_them_under_churn() {
+		const KEYS: u64 = 256;
+		const LEN: usize = 200;
+
+		for queued in [true, false] {
+			for events_per_drain in [1, 8] {
+				let _serialised = migration_test_lock::lock();
+
+				let budget = 6 * resident_object_bytes::<u64>(LEN as u32) as CacheSize;
+				let (mut worker, objects) = make_worker(queued, budget);
+				let keys: Vec<HashedKey> = (1..=KEYS).map(mix).collect();
+
+				let mut events = 0;
+				let mut event = |worker: &mut PolicyWorker<u64, TieredBuffer>| {
+					events += 1;
+
+					if events % events_per_drain == 0 {
+						worker.apply_tier_migrations();
+					}
+				};
+
+				for (n, &key) in keys.iter().enumerate() {
+					set(&objects, key, LEN);
+					event(&mut worker);
+
+					// Re-hit a spread of older keys, most of them slow by now.
+					for back in [1, 7, 31] {
+						if n >= back {
+							worker.handle_get(keys[n - back], true);
+							event(&mut worker);
+						}
+					}
+				}
+
+				worker.apply_tier_migrations();
+
+				assert!(objects.slow_bytes_used() > 0, "the budget must have demoted");
+				assert!(objects.fast_bytes_used() > 0, "and must still hold something");
+				assert_placement_matches_the_model(&objects, &keys);
+			}
+		}
+	}
+}
+
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod migration_accounting_tests {
 	use super::*;
