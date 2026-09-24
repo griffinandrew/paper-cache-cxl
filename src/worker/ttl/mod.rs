@@ -102,7 +102,7 @@ where
 
 impl<K, V> TtlWorker<K, V>
 where
-	K: Eq + TypeSize,
+	K: 'static + Eq + TypeSize,
 {
 	/// Erases every object whose index entry is due by `now`, and reports each
 	/// popped key to the policy worker.

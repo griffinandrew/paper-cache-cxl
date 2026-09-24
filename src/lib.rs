@@ -1820,7 +1820,7 @@ pub fn erase<K, V>(
 	maybe_key: Option<EraseKey<K>>,
 ) -> Result<(HashedKey, Object<K, V>), CacheError>
 where
-	K: Eq + TypeSize,
+	K: 'static + Eq + TypeSize,
 {
 	let hashed_key = match maybe_key {
 		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
@@ -1915,7 +1915,7 @@ pub fn erase<K, V>(
 	maybe_key: Option<EraseKey<K>>,
 ) -> Result<(HashedKey, Object<K, V>), CacheError>
 where
-	K: Eq + TypeSize,
+	K: 'static + Eq + TypeSize,
 {
 	let hashed_key = match maybe_key {
 		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
@@ -1972,7 +1972,7 @@ pub fn erase<K, V>(
 	maybe_key: Option<EraseKey<K>>,
 ) -> Result<(HashedKey, Object<K, V>), CacheError>
 where
-	K: Eq + TypeSize,
+	K: 'static + Eq + TypeSize,
 {
 	let hashed_key = match maybe_key {
 		Some(EraseKey::Original(_, hashed_key)) => hashed_key,

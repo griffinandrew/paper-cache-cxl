@@ -228,8 +228,8 @@ pub struct ValueHeader<K> {
 /// `pub(crate)` because it is also the ACCOUNTING's business: the item is one
 /// allocation of `bytes_offset::<K>() + len`, so this is what separates what
 /// the cache charges for an object from what the allocator commits for it. See
-/// `object::overhead::resident_object_bytes`, which is the only other caller
-/// and the one place the two are reconciled.
+/// `object::overhead::resident_item_bytes`, which asks for it through
+/// `item_prefix_bytes` and is the one place the two are reconciled.
 #[inline]
 pub(crate) fn bytes_offset<K>() -> usize {
 	let header = std::mem::size_of::<ValueHeader<K>>();
@@ -479,6 +479,29 @@ impl<K> TieredValue<K> {
 		K: Eq,
 	{
 		self.key().eq(key)
+	}
+
+	/// The key, owned. A clone here; `value_thin.rs` rebuilds a key its item
+	/// holds as bytes, which is why callers ask for this rather than `key()`.
+	pub fn key_owned(&self) -> K
+	where
+		K: Clone,
+	{
+		self.key().clone()
+	}
+
+	/// The key's byte cost as `object::overhead::base_size` counts it.
+	pub fn key_accounted_size(&self) -> usize
+	where
+		K: typesize::TypeSize,
+	{
+		self.key().get_size()
+	}
+
+	/// The item's bytes in front of the value: its header, key and padding.
+	#[inline]
+	pub fn item_prefix_bytes(&self) -> usize {
+		bytes_offset::<K>()
 	}
 
 	/// The value's bytes.

@@ -422,7 +422,7 @@ mod global_demotion_fidelity {
 	/// The constants above name what each object must be CHARGED, because the
 	/// budget is expressed in those bytes and the scenario is built on them.
 	/// The merged store does not take that figure from the caller: it derives
-	/// it from the object, through `Slot::migrating` -> `resident_object_bytes`
+	/// it from the object, through `Slot::migrating` -> `resident_item_bytes`
 	/// -- so under `fused_value` a 512-BYTE VALUE is a 536-byte item that
 	/// rounds to 640, and feeding the reference stack 512 charged the two
 	/// structures differently. The tier comparison then stopped being about
@@ -732,7 +732,7 @@ mod fifo_order_fidelity {
 	/// The constants above name what each object must be CHARGED, because the
 	/// budget is expressed in those bytes and the scenario is built on them.
 	/// The merged store does not take that figure from the caller: it derives
-	/// it from the object, through `Slot::migrating` -> `resident_object_bytes`
+	/// it from the object, through `Slot::migrating` -> `resident_item_bytes`
 	/// -- so under `fused_value` a 512-BYTE VALUE is a 536-byte item that
 	/// rounds to 640, and feeding the reference stack 512 charged the two
 	/// structures differently. The tier comparison then stopped being about
@@ -1187,7 +1187,7 @@ mod clock_order_fidelity {
 	/// The constants above name what each object must be CHARGED, because the
 	/// budget is expressed in those bytes and the scenario is built on them.
 	/// The merged store does not take that figure from the caller: it derives
-	/// it from the object, through `Slot::migrating` -> `resident_object_bytes`
+	/// it from the object, through `Slot::migrating` -> `resident_item_bytes`
 	/// -- so under `fused_value` a 512-BYTE VALUE is a 536-byte item that
 	/// rounds to 640, and feeding the reference stack 512 charged the two
 	/// structures differently. The tier comparison then stopped being about
@@ -1755,7 +1755,7 @@ mod lfu_order_fidelity {
 	/// The value LENGTH whose WHOLE ITEM costs exactly `item` bytes.
 	///
 	/// The merged store derives what to charge from the object, through
-	/// `Slot::migrating` -> `resident_object_bytes`, while the reference stack
+	/// `Slot::migrating` -> `resident_item_bytes`, while the reference stack
 	/// is told a figure -- so feeding the reference `item` while the store
 	/// rounded something else would charge the two differently and the
 	/// comparison would stop being about ORDER.

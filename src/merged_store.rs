@@ -665,18 +665,15 @@ impl<K, V> Slot<K, V> {
 	/// `base_size` is `key + value + expiry (+ ttl)` and `dram_resident_size`
 	/// is the same sum without the value.
 	///
-	/// It calls `resident_object_bytes` -- the SAME accessor `base_size` calls,
+	/// It calls `resident_item_bytes` -- the SAME accessor `base_size` calls,
 	/// and deliberately not a second rounding of `data_size()`. The two used to
 	/// round `nallocx(len)` independently, which was right under the split
 	/// layout and wrong under `fused_value` and `thin_header`, where the item
-	/// is `bytes_offset::<K>() + len` and the whole of it travels. One accessor is
+	/// is its prefix plus `len` and the whole of it travels. One accessor is
 	/// what stops a third caller repeating the mistake.
 	fn migrating(&self) -> CacheSize {
 		match &self.object {
-			Some(object) => {
-				crate::object::overhead::resident_object_bytes::<K>(object.data_size())
-					as CacheSize
-			},
+			Some(object) => crate::object::overhead::resident_item_bytes(object) as CacheSize,
 
 			None => 0,
 		}
@@ -2651,9 +2648,8 @@ impl<K, V> MergedStore<K, V> {
 					// because the admission decision below needs it BEFORE
 					// there is a slot -- it is the same accessor
 					// `Slot::migrating` uses, so the two cannot disagree.
-					let migrating = crate::object::overhead::resident_object_bytes::<K>(
-						object.data_size(),
-					) as CacheSize;
+					let migrating =
+						crate::object::overhead::resident_item_bytes(&object) as CacheSize;
 
 					// The tier the POLICY decides. Unconditionally fast under
 					// the three queue orders, which is what
@@ -3087,7 +3083,8 @@ mod tests {
 	/// counts it: the allocator's rounded figure for the object's whole
 	/// allocation, not the request and not the value bytes alone.
 	///
-	/// Routed through the same accessor `Slot::migrating` uses, so a test
+	/// Routed through `resident_object_bytes`, the per-type form of the
+	/// accessor `Slot::migrating` uses and exact for these `u64` keys, so a test
 	/// cannot pass by agreeing with a formula the store no longer applies --
 	/// which is exactly what would have happened here under `fused_value`.
 	fn migrating_bytes(size: ObjectSize) -> CacheSize {
