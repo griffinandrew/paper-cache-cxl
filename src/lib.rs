@@ -2935,7 +2935,12 @@ where
 	/// and heal rules read (`migration_queue::InFlight`). The hand-offs and
 	/// the finishes balance, so this is 0 whenever the queue is idle -- at
 	/// quiescence, and after an audit's flush -- and always 0 with
-	/// `MIGRATION_QUEUE_THREADS=0`. One load per bucket (16,384).
+	/// `MIGRATION_QUEUE_THREADS=0`. The exception is a migration consumer
+	/// thread that has died: the entries still in its channel are never
+	/// finished, and stay counted here for the cache's life -- the same class
+	/// as the queue's `processed` count, which then never catches up, so a
+	/// flush (an audit's included) would not return. One load per bucket
+	/// (16,384).
 	pub fn migrations_in_flight(&self) -> u64 {
 		self.status.migration_in_flight().total_pending()
 	}

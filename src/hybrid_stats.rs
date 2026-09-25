@@ -30,9 +30,10 @@
 //! `live_tiered_caches`, `live_flat_fast_caches`); see each field. Since S3,
 //! 4 more process-global totals -- the corrective migrations the policy
 //! worker's reconcile queued, by reason (`reconcile_set_*`,
-//! `reconcile_get_to_fast`) -- and 2 counters of this cache's own: the
-//! correctives that LANDED (`reconcile_applied_*`), which are not promotions
-//! or demotions.
+//! `reconcile_get_to_fast`) -- a fifth, the slow-served hits whose heal a
+//! busy in-flight bucket skipped (`reconcile_get_heal_skipped`), and 2
+//! counters of this cache's own: the correctives that LANDED
+//! (`reconcile_applied_*`), which are not promotions or demotions.
 
 /// Feature-neutral snapshot of the active hybrid cache's tier-movement
 /// counters and live tier gauges.
@@ -154,8 +155,22 @@ pub struct HybridStats {
 	/// value was published, whose value was built where the stack places it
 	/// -- queued only to land LAST, behind any stale entry for the key. An
 	/// intent, PROCESS-GLOBAL like the three above; the MIGSTATS line's
-	/// `reconcile_set_new_key`.
+	/// `reconcile_set_new_key`. Under a BACKLOG the rule fires for most fresh
+	/// sets: with D entries in flight a bucket is busy with probability about
+	/// 1 - e^(-D/16384) (63% at D = 16k, 95% at 50k), so this then counts
+	/// mostly correctives that decline -- each handed to the consumers, and
+	/// in the `PENDING_*` gauges, like any entry.
 	pub reconcile_set_new_key: u64,
+
+	/// Hits served from the slow tier whose HEAL was skipped because
+	/// something of the key's in-flight bucket was busy: the worker read no
+	/// placement and queued nothing. An UPPER BOUND on the heals skipped -- a
+	/// hit on a key placed slow, or on a key whose own promotion is what is
+	/// in flight, needed none. PROCESS-GLOBAL like the four above; the
+	/// MIGSTATS reconcile line's `reconcile_get_heal_skipped`, its last field
+	/// but `t_ms`. Under the backlog above it is most slow-served hits, and
+	/// heals are effectively off until the backlog drains.
+	pub reconcile_get_heal_skipped: u64,
 
 	/// Reconcile-origin migrations -- the worker's correctives and the merged
 	/// store's client-side new-key push -- that LANDED, i.e. moved a value's

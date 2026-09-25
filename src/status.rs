@@ -761,8 +761,13 @@ impl AtomicStatus {
 	/// whichever hybrid design is running.
 	#[must_use]
 	pub fn hybrid_stats(&self) -> HybridStats {
-		let (reconcile_set_to_fast, reconcile_set_to_slow, reconcile_get_to_fast, reconcile_set_new_key) =
-			crate::worker::reconciled();
+		let (
+			reconcile_set_to_fast,
+			reconcile_set_to_slow,
+			reconcile_get_to_fast,
+			reconcile_set_new_key,
+			reconcile_get_heal_skipped,
+		) = crate::worker::reconciled();
 
 		HybridStats {
 			promotions: self.hybrid_promotions.load(Ordering::Relaxed),
@@ -793,6 +798,7 @@ impl AtomicStatus {
 			reconcile_set_to_slow,
 			reconcile_get_to_fast,
 			reconcile_set_new_key,
+			reconcile_get_heal_skipped,
 			reconcile_applied_to_fast: self.hybrid_reconcile_applied_to_fast.load(Ordering::Relaxed),
 			reconcile_applied_to_slow: self.hybrid_reconcile_applied_to_slow.load(Ordering::Relaxed),
 		}

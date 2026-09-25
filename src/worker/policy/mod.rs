@@ -188,7 +188,12 @@ pub mod migration_queue {
 	///     `split_tier_migrations`) and not finished. A consumer finishes an
 	///     entry once `apply_migration` has returned, however it ended --
 	///     applied, declined, gone or superseded -- so an entry being copied
-	///     still counts. Zero whenever the queue is idle;
+	///     still counts. Zero whenever the queue is idle -- unless a consumer
+	///     thread has died: the entries still in its channel are never
+	///     finished, so their buckets stay busy for the life of the cache.
+	///     That is the same class as the queue's `processed` count, which
+	///     then never catches up with `enqueued`, so a `flush` would not
+	///     return;
 	///   * high half, LANDED: entries of this bucket that MOVED a value
 	///     (`apply_migration` returned `true`), on a consumer or inline
 	///     (`MIGRATION_QUEUE_THREADS=0`, which never has anything pending but
@@ -205,6 +210,15 @@ pub mod migration_queue {
 	/// Two keys in one bucket make it look busier than either key is: a false
 	/// positive, costing one corrective that declines or one heal deferred to
 	/// a later hit -- never a missed fence.
+	///
+	/// Under a BACKLOG that is the common case, not a collision. With D
+	/// entries of distinct keys in flight, a given bucket is busy with
+	/// probability about 1 - e^(-D/16384): 63% at D = 16k, 95% at 50k. The
+	/// new-key rule's fence then fires for most fresh sets -- each a
+	/// corrective that usually declines, and that is handed to the consumers
+	/// and counted in `PENDING_*` like any entry -- and the heal is
+	/// effectively off until the backlog drains: most slow-served hits find
+	/// their bucket busy (`migstats::RECONCILE_GET_HEAL_SKIPPED` counts them).
 	pub struct InFlight {
 		words: Box<[AtomicU64]>,
 	}
@@ -282,7 +296,9 @@ pub mod migration_queue {
 
 		/// Every bucket's pending count, summed: 0 once every entry handed to
 		/// the consumers has finished, which is what a flush or a quiescent
-		/// cache must show. A diagnostic (one load per bucket).
+		/// cache must show -- unless a consumer thread has died with entries
+		/// still in its channel, which are never finished (see the struct's
+		/// doc). A diagnostic (one load per bucket).
 		pub fn total_pending(&self) -> u64 {
 			self.words.iter().map(|word| word.load(Ordering::Acquire) as u32 as u64).sum()
 		}
@@ -1115,6 +1131,20 @@ pub mod migstats {
 	#[cfg(feature = "hybrid_cache_common")]
 	pub static RECONCILE_SET_NEW_KEY: AtomicU64 = AtomicU64::new(0);
 
+	/// Hits served from the slow tier whose HEAL the worker skipped because
+	/// something of the key's in-flight bucket was busy (`Observed`'s heal
+	/// rule): no `placement_of` probe and no corrective. An UPPER BOUND on the
+	/// heals skipped, not a count of them -- the placement is not read for
+	/// these hits (not reading it is the point), so a hit on a key placed
+	/// slow, or on a key whose own promotion is what is in flight, is counted
+	/// although it needed no heal. Under a backlog it is most slow-served
+	/// hits: with D entries in flight a bucket is busy with probability about
+	/// 1 - e^(-D/16384) (`migration_queue::InFlight`), and heals are then
+	/// effectively off until the backlog drains. Not a corrective, so in no
+	/// `RECONCILE_QUEUED_*` sum.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub static RECONCILE_GET_HEAL_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
 	/// Reconcile-origin entries (`MigrationOrigin::Reconcile`: the worker's
 	/// correctives and the merged store's client-side new-key push) handed on
 	/// after `split_tier_migrations`, by destination -- their own intent
@@ -1137,14 +1167,15 @@ pub mod migstats {
 	pub static RECONCILE_APPLIED_TO_SLOW: AtomicU64 = AtomicU64::new(0);
 
 	/// `(RECONCILE_SET_TO_FAST, RECONCILE_SET_TO_SLOW, RECONCILE_GET_TO_FAST,
-	/// RECONCILE_SET_NEW_KEY)`.
+	/// RECONCILE_SET_NEW_KEY, RECONCILE_GET_HEAL_SKIPPED)`.
 	#[cfg(feature = "hybrid_cache_common")]
-	pub fn reconciled() -> (u64, u64, u64, u64) {
+	pub fn reconciled() -> (u64, u64, u64, u64, u64) {
 		(
 			RECONCILE_SET_TO_FAST.load(Ordering::Relaxed),
 			RECONCILE_SET_TO_SLOW.load(Ordering::Relaxed),
 			RECONCILE_GET_TO_FAST.load(Ordering::Relaxed),
 			RECONCILE_SET_NEW_KEY.load(Ordering::Relaxed),
+			RECONCILE_GET_HEAL_SKIPPED.load(Ordering::Relaxed),
 		)
 	}
 
@@ -1305,17 +1336,20 @@ pub mod migstats {
 		// keeps its fields and its place; `t_ms` last, as on every line. The
 		// correctives the worker queued, by reason; every reconcile-origin
 		// entry handed on after the split (the merged store's client-side
-		// pushes included), which `demo`/`promo` above no longer count; and
-		// those that landed, which are not promotions or demotions.
+		// pushes included), which `demo`/`promo` above no longer count; those
+		// that landed, which are not promotions or demotions; and, appended
+		// after them so each keeps its place, the slow-served hits whose heal
+		// a busy bucket skipped.
 		#[cfg(feature = "hybrid_cache_common")]
 		{
-			let (set_to_fast, set_to_slow, get_to_fast, set_new_key) = reconciled();
+			let (set_to_fast, set_to_slow, get_to_fast, set_new_key, get_heal_skipped) = reconciled();
 
 			eprintln!(
 				"MIGSTATS reconcile_set_to_fast={set_to_fast} reconcile_set_to_slow={set_to_slow} \
 				 reconcile_get_to_fast={get_to_fast} reconcile_set_new_key={set_new_key} \
 				 reconcile_queued_to_fast={} reconcile_queued_to_slow={} \
-				 reconcile_applied_to_fast={} reconcile_applied_to_slow={} t_ms={t_ms}",
+				 reconcile_applied_to_fast={} reconcile_applied_to_slow={} \
+				 reconcile_get_heal_skipped={get_heal_skipped} t_ms={t_ms}",
 				RECONCILE_QUEUED_TO_FAST.load(Ordering::Relaxed),
 				RECONCILE_QUEUED_TO_SLOW.load(Ordering::Relaxed),
 				RECONCILE_APPLIED_TO_FAST.load(Ordering::Relaxed),
@@ -1645,7 +1679,12 @@ const RECONSTRUCT_POLICY_POLLING: usize = 1_048_576;
 ///
 /// A quiet bucket with an unmoved mark needs nothing: no stale entry of the
 /// key exists. A collision -- another key of the bucket in flight or landed
-/// -- costs one corrective that declines.
+/// -- costs one corrective that declines. In aggregate that is not small
+/// under a BACKLOG: with D entries in flight a bucket is busy with
+/// probability about 1 - e^(-D/16384) (63% at D = 16k, 95% at 50k;
+/// `InFlight`), so the fence then fires for most fresh sets -- each a
+/// corrective that usually declines, counted in `PENDING_*` like any entry
+/// (and in `RECONCILE_SET_NEW_KEY` when only the rule asked for it).
 ///
 /// # The heal (review M2)
 ///
@@ -1662,6 +1701,13 @@ const RECONSTRUCT_POLICY_POLLING: usize = 1_048_576;
 /// declined duplicates, each lengthening the queue that made the next hit
 /// slow). A fast-served hit is not looked up at all.
 ///
+/// The backlog that fences most fresh sets (above) turns the heal
+/// effectively OFF until it drains: most slow-served hits then find their
+/// bucket busy. Each is counted in `RECONCILE_GET_HEAL_SKIPPED` -- every
+/// slow-served hit skipped for a busy bucket, so an upper bound on the heals
+/// skipped: the placement is not read for them, and a hit on a key placed
+/// slow, or on a key whose own promotion is what is in flight, needed none.
+///
 /// # Cost
 ///
 /// Two atomic RMWs per queued entry (`InFlight`: the hand-off and the
@@ -1669,8 +1715,9 @@ const RECONSTRUCT_POLICY_POLLING: usize = 1_048_576;
 /// mark, before the insert) and one on the worker (`moved_since`), plus a
 /// `placement_of` probe before the stack's insert only for a `Set` whose map
 /// insert replaced a value while its bucket moved. One load per slow-served
-/// hit (and no `placement_of` when its bucket is busy). Nothing per
-/// fast-served hit or miss.
+/// hit (and, when its bucket is busy, no `placement_of` -- one relaxed
+/// increment of the skipped-heal count instead). Nothing per fast-served hit
+/// or miss.
 #[cfg(feature = "hybrid_cache_common")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Observed {
@@ -2694,8 +2741,10 @@ where
 
 		for observed in self.observed.drain(..) {
 			// A slow hit whose bucket is busy is not healed, wherever it is
-			// placed: no probe.
+			// placed: no probe. Counted as a skipped heal -- an upper bound,
+			// the placement not being read.
 			if let Observed::ServedSlow { quiet: false, .. } = observed {
+				migstats::RECONCILE_GET_HEAL_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 				continue;
 			}
 
@@ -6287,6 +6336,50 @@ mod reconcile_tests {
 		assert_settled(&mut worker);
 	}
 
+	/// The merged store's client-side new-key corrective (review m3), pinned
+	/// on its own. The store has latched; the client inserts a new key built
+	/// fast -- `built != decided` -- and that insert, under its shard lock,
+	/// queues `(K, Slow)` tagged a corrective in the store's own list: it is
+	/// in the store's drain BEFORE the worker has taken the `Set`, so the
+	/// value waits one drain, not the worker's whole event backlog. Applied
+	/// alone, it lands the value slow; the worker's reconcile of the `Set`,
+	/// a drain later, appends a duplicate for the same tier, which declines.
+	/// Red with the push removed (`noclientpush`), which every other test
+	/// survives: the worker's reconcile covers the value a drain later.
+	#[cfg(feature = "merged_object_store")]
+	#[test]
+	fn the_merged_client_queues_a_latched_new_keys_corrective_before_the_worker_takes_its_set() {
+		let _serialised = migration_test_lock::lock();
+
+		let (mut worker, objects) = make_worker(PaperPolicy::LfuCompactHybrid);
+
+		// Twice what the fast tier holds: the store latches part-way.
+		fill(&mut worker, &objects, 1..=32, LEN);
+		assert_eq!(placement(&worker, 32), Some(Slow), "latched: a new key is placed slow");
+
+		const K: HashedKey = 100;
+		let published = publish(&worker.status, &worker.overhead_manager, &objects, K, LEN, Fast);
+		assert!(published.fresh);
+		assert_eq!(placement(&worker, K), Some(Slow), "the store decided slow at the insert");
+
+		// The worker has not taken the `Set`: the store's own drain.
+		let early = objects.drain_tagged_migrations();
+		assert_eq!(of(&early, K), vec![Slow], "the client queued the move before the worker took the Set");
+		assert_eq!(correctives(&early, K), vec![Slow], "tagged a corrective");
+
+		let accounting = worker.policy_stack.as_ref().expect("a stack").inline_demotion_accounting();
+		worker.apply_migration_batches(early, accounting);
+		assert_eq!(bytes_tier(&objects, K), Slow, "the client's corrective alone lands the value slow");
+
+		// The worker's reconcile of the `Set`, a drain later: the same move
+		// again, which declines.
+		handle(&mut worker, K, published);
+		let late = drain_and_apply(&mut worker);
+		assert_eq!(correctives(&late, K), vec![Slow], "the worker's own, a duplicate");
+		assert_eq!(bytes_tier(&objects, K), Slow);
+		assert_settled(&mut worker);
+	}
+
 	/// The heal, in both stores: a value whose bytes are in the slow tier while
 	/// the stack places it fast -- moved behind the stack's back here -- is
 	/// promoted once by a hit served from the slow tier. A hit the client
@@ -6623,6 +6716,80 @@ mod reconcile_tests {
 		assert_eq!(correctives(&drain, k), vec![Fast], "the new-key rule's corrective");
 	}
 
+	/// The new-key rule's NON-FRESH branch, in the split builds (the merged
+	/// store's map is its stack, so there `fresh` alone is exact and the
+	/// branch is never taken): a `del` on one thread races two sets on
+	/// another and reaches the worker BETWEEN their `Set`s, untracking a key
+	/// whose value is live. `K`'s v1 is placed fast. The clients delete v1,
+	/// set v2 -- fresh -- and v3 over it, NOT fresh, v3's mark read before
+	/// its insert. The worker takes Set(v2), then another client's admission
+	/// of twice the fast tier, whose settle demotes `K`: that entry lands on
+	/// v3, the value holding the key, after v3's mark. Then the `Del`, which
+	/// untracks `K` while v3 is live, then Set(v3): LRU re-admits `K` fast,
+	/// where v3 was built, with no push, and nothing is in flight. v3's
+	/// insert replaced a value, but the stack did not place `K` before the
+	/// event (`placement_of` None) and a migration of its bucket landed since
+	/// the mark, so the rule queues `(K, Fast)` last and v3 ends where the
+	/// stack placed it. Red with that `placement_of` clause removed
+	/// (`nonfresh`): `fresh` alone does not fence v3, which is left in CXL,
+	/// placed fast. No consumer is parked, so it runs inline too.
+	#[cfg(not(feature = "merged_object_store"))]
+	#[test]
+	fn a_set_that_replaced_a_value_a_racing_del_untracked_is_fenced_like_a_new_key() {
+		let _serialised = migration_test_lock::lock();
+
+		let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
+
+		const K: HashedKey = 1;
+		// Twice the fast tier: its admission demotes K and itself.
+		const X: HashedKey = 7_777;
+
+		set(&mut worker, &objects, K, LEN, Fast);
+		drain_and_apply(&mut worker);
+		assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Fast), Fast));
+
+		// The clients: `del(K)` on one thread; `set(K, v2)` and `set(K, v3)`
+		// on another, both built in DRAM as LRU admits.
+		let status = worker.status.clone();
+		let overhead_manager = worker.overhead_manager.clone();
+
+		erase(&objects, &status, &overhead_manager, Some(EraseKey::Hashed(K))).expect("K is live");
+		let v2 = publish(&status, &overhead_manager, &objects, K, LEN, Fast);
+		let v3 = publish(&status, &overhead_manager, &objects, K, LEN + 100, Fast);
+		assert!(v2.fresh && !v3.fresh, "v2 was new to the map, v3 replaced it");
+
+		// The worker: Set(v2), `K` still tracked.
+		handle(&mut worker, K, v2);
+		drain_and_apply(&mut worker);
+		assert_eq!(placement(&worker, K), Some(Fast));
+
+		// Another client's admission demotes `K`: the entry lands on v3.
+		set(&mut worker, &objects, X, 2 * FAST as usize, Fast);
+		let drain = drain_and_apply(&mut worker);
+		assert_eq!(of(&drain, K), vec![Slow], "the admission demoted K");
+		assert_eq!(bytes_tier(&objects, K), Slow, "and the demotion moved v3");
+
+		// The racing `Del`, then Set(v3).
+		worker.handle_del(K);
+		drain_and_apply(&mut worker);
+		assert_eq!(placement(&worker, K), None, "the del untracked K, v3 live");
+		assert_eq!(worker.status.migration_in_flight().pending(K), 0, "nothing in flight: the landed path");
+
+		handle(&mut worker, K, v3);
+		assert_eq!(placement(&worker, K), Some(Fast), "re-admitted fast, where v3 was built, with no push");
+		let observed = worker.observed.clone();
+
+		let drain = drain_and_apply(&mut worker);
+		assert_eq!(bytes_tier(&objects, K), Fast, "v3 is where the stack placed it");
+		assert_settled(&mut worker);
+		assert_eq!(
+			observed,
+			vec![Observed::Built { key: K, built: Fast, fence: true }],
+			"fenced: v3 replaced a value, but the stack did not place K before its Set",
+		);
+		assert_eq!(correctives(&drain, K), vec![Fast], "the new-key rule's corrective (built where placed)");
+	}
+
 	/// Review M2, in both stores: slow-served hits while a promotion of their
 	/// key's bucket is in flight queue at most ONE heal. `K` is placed fast
 	/// with its bytes slow, and the consumer that owns it is parked: its first
@@ -6632,7 +6799,9 @@ mod reconcile_tests {
 	/// slow hits after it queue no heal at all. Counted off the drains, not
 	/// off the process-global `RECONCILE_GET_TO_FAST`, which other tests'
 	/// caches move concurrently. Red with the bucket check off (`noquiet`):
-	/// 21 and 20.
+	/// 21 and 20. The 40 hits that found their bucket busy are each counted a
+	/// skipped heal -- `reconcile_get_heal_skipped`, process-global too, so
+	/// asserted as at least 40. Red with that count off (`noskipcount`).
 	#[test]
 	fn m2_slow_hits_while_their_buckets_promotion_is_in_flight_queue_at_most_one_heal() {
 		let _serialised = migration_test_lock::lock();
@@ -6659,6 +6828,8 @@ mod reconcile_tests {
 		let j_tier = bytes_tier(&objects, j);
 		let release = park(&worker, &objects, j);
 
+		let skipped_before = worker.status.hybrid_stats().reconcile_get_heal_skipped;
+
 		// K: one heal, then its own heal in flight.
 		move_bytes(&objects, k, Slow);
 
@@ -6680,6 +6851,9 @@ mod reconcile_tests {
 			heals += correctives(&drain_and_apply(&mut worker), M).len();
 		}
 		assert_eq!(heals, 0, "M's promotion is in flight: it decides");
+
+		let skipped = worker.status.hybrid_stats().reconcile_get_heal_skipped - skipped_before;
+		assert!(skipped >= 40, "the 40 slow hits on busy buckets are counted skipped heals: {skipped}");
 
 		unpark(&worker, j, j_tier, release);
 

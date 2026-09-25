@@ -56,9 +56,11 @@ src/
                                effective capacity, the over-budget integral, fast/slow hits,
                                live tiered caches, live flat caches with fast values), the
                                4 process-global reconcile intent totals (S3: set->fast,
-                               set->slow, get->fast, new-key) and the cache's own landed
-                               correctives by destination (reconcile_applied_*), which are
-                               NOT promotions or demotions. The single stats accessor for
+                               set->slow, get->fast, new-key), the process-global count of
+                               slow-served hits whose heal a busy bucket skipped, and the
+                               cache's own landed correctives by destination
+                               (reconcile_applied_*), which are NOT promotions or
+                               demotions. The single stats accessor for
                                every design;
                                the per-design *_hybrid_stats() methods are gone.
   phys.rs                     PHYS_FAST: bytes physically allocated in the fast tier's value
@@ -132,7 +134,10 @@ src/
                                  client's mark (a stale entry would otherwise land last on the
                                  fresh value). After a hit served from the slow tier, the same
                                  toward Fast only (the heal), and only while nothing of its
-                                 bucket is in flight. Per-key FIFO consumers, last intent
+                                 bucket is in flight (a skipped one is counted). Under a
+                                 backlog most buckets are busy: the fence fires for most
+                                 fresh sets and heals are effectively off until it drains
+                                 (InFlight's doc). Per-key FIFO consumers, last intent
                                  wins, a redundant one declines. The merged store also queues
                                  its new-key corrective on the client, under the shard lock.
       policy_stack/             One file per policy, all implementing the PolicyStack trait.
