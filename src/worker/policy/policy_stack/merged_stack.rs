@@ -33,41 +33,32 @@
 //! exactly once, inside `erase`'s `take`, which unlinks it from that order and
 //! reverses its tier accounting in the same operation.
 //!
-//! # The other two, which are the same mistake in reverse
+//! # `remove` retires, `clear` forgets the log
 //!
-//! `remove` and `clear` are no-ops.
+//! For every other stack `remove` drops the stack's OWN entry for the key,
+//! after the client has already erased it from the map (`PaperCache::del`
+//! erases, then broadcasts `Del`). Here the map is the stack, and a client's
+//! erase of a value the worker has linked leaves the slot DEAD on its list --
+//! its object gone, its policy state untouched -- so `remove`, the worker's
+//! handling of `Del` (and of `Expire`), RETIRES one DEAD slot of the key
+//! (`MergedStore::retire_dead`). It never touches a live slot, so it is safe
+//! whatever the key holds by then: a `set()` that landed after the delete is a
+//! different slot, and survives. (When `remove` was a no-op, the client's
+//! erase unlinked the slot itself.)
 //!
-//! For every other stack these drop the stack's OWN bookkeeping while the
-//! object map keeps its entry, and the worker calls them AFTER the API thread
-//! has already erased from the map -- `PaperCache::del` erases synchronously
-//! and only then broadcasts `Del`; `PaperCache::wipe` calls `objects.clear()`
-//! synchronously and only then broadcasts `Wipe`. Two structures, two removals,
-//! one per structure.
+//! A wipe is the worker's too (`PolicyWorker::handle_wipe`: the map -- this
+//! store's `clear` -- then the stack, then the status, before it answers the
+//! waiting `PaperCache::wipe`), so `clear` has only the undrained log left to
+//! drop. It used to be a no-op, because the client cleared the map and a
+//! worker-side clear of it would have destroyed a `set()` landing between the
+//! two; with the whole wipe on the worker, and `wipe()` returning only when it
+//! is done, there is no such window.
 //!
-//! Here the map IS the stack, so the API thread's erase already did the whole
-//! job and the worker's call is a SECOND removal of the same thing. That is not
-//! merely redundant. Both events are queued, and the worker may not drain them
-//! for up to a poll interval, so a `set()` landing in the window is destroyed:
-//!
-//! ```text
-//!   API thread:     wipe()          -> map emptied, Wipe queued
-//!   API thread:     set(k, v)       -> k live in the map, status counts it
-//!   worker thread:  handle_wipe()   -> stack.clear() -> k DESTROYED
-//!   API thread:     get(k)          -> KeyNotFound, though set() returned Ok
-//! ```
-//!
-//! and `status` can never be corrected, because `del(k)` now finds nothing to
-//! erase -- so `used_size` climbs permanently toward `max_size` on a cache that
-//! is holding less than it thinks. `handle_expire` already carries exactly this
-//! guard (`object_exists`) for exactly this race against the TTL worker;
-//! `handle_del` and `handle_wipe` did not need one until the map and the stack
-//! became the same structure.
-//!
-//! So the rule for this handle is uniform: a method that would MUTATE the map
-//! does nothing, because the caller already mutated it. `evict_one` nominates
-//! rather than removes; `remove` and `clear` do nothing at all. Only the
-//! methods that add information the map does not already have --
-//! `insert_resident`'s size and tier accounting, `update`'s relink -- do work.
+//! So the rule for this handle: the client writes the map -- publishes, swaps,
+//! takes -- and every policy decision is here, on the worker: `insert_set`
+//! links, charges, places and settles; `update` relinks, sets the bit or
+//! bumps; `evict_one` nominates (and retires a DEAD slot it passes); `remove`
+//! retires.
 //!
 //! # The order
 //!
@@ -99,27 +90,21 @@
 //! like-for-like, which comparing the untiered prototype against a tiered
 //! stack was not.
 //!
-//! One order pays a cost the others do not, and it should be measured rather
-//! than hidden. Under `Lfu` the store decides a brand-new key's tier itself
-//! (`MergedStore::lfu_admission_tier`) while `PaperCache::set` has already
-//! BUILT the bytes in DRAM -- `admission_latched()` here is deliberately false,
-//! so `hybrid_policy::admission_tier` returns `Fast` for every new key. So a
-//! latched merged-LFU run queues one corrective `(key, Slow)` migration per
-//! admission -- `MergedStore::insert` does, on the client, under the shard
-//! lock, and the policy worker's reconcile finds it in the drain (or, drained
-//! earlier, queues a duplicate its consumer declines). That is a real
-//! throughput cost, of exactly the kind the split stack's latched branch
-//! avoids by trusting a mirror -- and a stale mirror under a burst is what the
-//! reconcile now corrects for the split stack. If
-//! the cost proves dominant the fix is to let `admission_tier` read this
-//! store's own latch directly (it already receives the store as `objects`),
-//! which removes the mirror from the path rather than tolerating it.
+//! Under `Lfu` the store decides a brand-new key's tier at the worker's link
+//! (`MergedStore::lfu_admission`, the DashMap stack's rule and units), and
+//! `admission_latched()` returns the store's latch, which the worker publishes
+//! with the event that moved it -- so `hybrid_policy::admission_tier` builds a
+//! new key slow once the store has latched, as it does for the DashMap stack,
+//! and only the keys built before the worker reached the latching `Set` need a
+//! corrective, which the reconcile of each one's own `Set` queues. (The store
+//! used to publish nothing, build every new key fast, and queue a corrective
+//! per latched admission on the client.)
 
 use crate::{
 	error::CacheError,
-	merged_store::{MergedOrder, MergedStore},
+	merged_store::{MergedOrder, MergedStore, MigrationLog},
 	object::ObjectSize,
-	worker::policy::policy_stack::{CacheSize, HashedKey, PolicyStack, TaggedMigration, Tier},
+	worker::policy::policy_stack::{CacheSize, HashedKey, PolicyStack, SetEvent, TaggedMigration, Tier},
 	PaperPolicy,
 };
 
@@ -148,6 +133,12 @@ pub struct MergedStackHandle<K, V> {
 	/// type, one call per cache hit -- answers from a plain field instead of an
 	/// atomic load through the `Arc`.
 	order: MergedOrder,
+
+	/// Every tier change the store decides, in decision order, until the
+	/// worker drains it -- see `MergedStore`'s `MigrationLog`. Owned here
+	/// because the handle lives on the policy worker, the one thread that
+	/// decides.
+	log: MigrationLog,
 }
 
 impl<K, V> MergedStackHandle<K, V> {
@@ -203,7 +194,7 @@ impl<K, V> MergedStackHandle<K, V> {
 
 		store.set_order(order);
 
-		Ok(MergedStackHandle { store, policy, order })
+		Ok(MergedStackHandle { store, policy, order, log: MigrationLog::default() })
 	}
 }
 
@@ -216,25 +207,39 @@ where
 		*policy == self.policy
 	}
 
+	/// The keys the policy worker has linked -- the DashMap stacks' `len()`,
+	/// i.e. the keys whose `Set` it has handled -- not the object map's
+	/// count, which a client's insert moves first.
 	fn len(&self) -> usize {
-		self.store.len()
+		self.store.linked()
 	}
 
+	/// Placed keys only, like the DashMap stacks: an unlinked value is in the
+	/// object map and not yet in the stack.
 	fn contains(&self, key: HashedKey) -> bool {
-		self.store.contains(key)
+		self.store.tier_of(key).is_some()
 	}
 
 	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
 		self.insert_resident(key, size, 0);
 	}
 
-	/// The object is already linked at the MRU end -- the API thread's
-	/// `ObjectStore::insert` did that, since in this design inserting into the
-	/// map IS inserting into the stack. What only the worker knows is the size
-	/// and the DRAM-resident remainder, so that is what this records, and the
-	/// shard settles against its fast budget once it has them.
+	/// Without the event, a key whose slot is linked already is taken for a
+	/// RESIZED overwrite: `Lfu` handles an overwrite the same either way, and
+	/// under `Fifo` and `Clock` the extra settle finds nothing over the target
+	/// when the size did not change. The worker calls `insert_set`; the
+	/// fidelity tests call this for inserts and overwrites alike.
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		self.store.record_size(key, size, dram_resident);
+		self.insert_set(key, size, dram_resident, SetEvent::Replaced { resized: true });
+	}
+
+	/// The `Set`: the client only published the value, so this is where it
+	/// is linked, charged, placed and settled, or -- for a key already linked
+	/// -- where the overwrite's per-order work happens. See
+	/// `MergedStore::worker_set`. `dram_resident` is not needed: the store
+	/// derives a slot's bytes from its object.
+	fn insert_set(&mut self, key: HashedKey, size: ObjectSize, _dram_resident: ObjectSize, event: SetEvent) {
+		self.store.worker_set(key, size, event, &mut self.log);
 	}
 
 	/// A cache hit.
@@ -246,7 +251,7 @@ where
 	/// does not pay for a call through the `Arc` to find that out.
 	fn update(&mut self, key: HashedKey) {
 		match self.order {
-			MergedOrder::Lru => self.store.touch(key),
+			MergedOrder::Lru => self.store.touch(key, &mut self.log),
 
 			// CLOCK's hit, and the reason this seam is worth having: one
 			// relaxed store under the shard's READ lock. `mark_referenced` is
@@ -262,47 +267,75 @@ where
 			// is no read-lock formulation that leaves the buckets truthful.
 			// LFU therefore does not inherit CLOCK's win, and this arm is where
 			// that cost is paid -- see `MergedOrder::Lfu`.
-			MergedOrder::Lfu => self.store.bump(key),
+			MergedOrder::Lfu => self.store.bump(key, &mut self.log),
 
 			MergedOrder::Fifo => {},
 		}
 	}
 
-	/// Deliberate no-op -- see the module doc's second surprising-method note.
-	fn remove(&mut self, _key: HashedKey) {}
+	/// The key's `Del` (or `Expire`): retires one DEAD slot of it -- the
+	/// entry a client's delete left on the list -- and never a live one. See
+	/// `MergedStore::retire_dead` and the module doc.
+	fn remove(&mut self, key: HashedKey) {
+		self.store.retire_dead(key);
+	}
 
-	/// Deliberate no-op, for the same reason as `remove`.
-	fn clear(&mut self) {}
+	fn remove_is_retire(&self) -> bool {
+		true
+	}
+
+	/// The worker's `Wipe` clears the store itself (`MergedStore::clear`, as
+	/// the object map); what is left of the stack is the undrained log.
+	fn clear(&mut self) {
+		self.log = MigrationLog::default();
+	}
 
 	/// Nominates the victim WITHOUT removing it -- see the module doc. The
-	/// removal is `erase`'s `take`, which is the same operation on the same
-	/// structure.
+	/// removal is `erase`'s `take_evict`, which is the same operation on the
+	/// same structure.
 	fn evict_one(&mut self) -> Option<HashedKey> {
-		self.store.tail_key()
+		self.store.tail_key(&mut self.log)
 	}
 
 	fn resize_fast_tier(&mut self, size: CacheSize) {
-		self.store.resize_fast_tier(size);
+		self.store.resize_fast_tier(size, &mut self.log);
 	}
 
 	/// The slot's tier (`MergedStore::tier_of`: one shard READ lock and a
-	/// probe). Every change of it pushes its migration under the shard's write
-	/// lock; a new key built in another tier than its slot's gets its
-	/// corrective from `MergedStore::insert`, on the client, and the policy
-	/// worker reconciles every `Set`'s built tier against it too. See
-	/// `PolicyStack::placement_of`.
+	/// probe), `None` until the worker has linked the key's value. Every
+	/// change of it is decided on the policy worker and logged where it is
+	/// made (a promotion after the settle that may undo it, guarded on the
+	/// key still being fast). See `PolicyStack::placement_of`.
 	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
 		self.store.tier_of(key)
 	}
 
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
-		self.store.drain_migrations()
+		self.log.take_untagged()
 	}
 
-	/// The store's own tags: its clients' new-key correctives are
-	/// `MigrationOrigin::Reconcile`, everything else the store's decisions.
+	/// The log, in decision order, every entry the store's own decision
+	/// (`MigrationOrigin::Stack`): a `mem::take`, no lock.
 	fn drain_tagged_migrations(&mut self) -> Vec<TaggedMigration> {
-		self.store.drain_tagged_migrations()
+		self.log.take_entries()
+	}
+
+	/// `Lfu` counts its demotions where it decides them (`drain_demotions`),
+	/// as `LfuCompactHybridStack` does: a slow move under `Lfu` is not always
+	/// a demotion -- an admission refused to slow queues one too.
+	fn inline_demotion_accounting(&self) -> bool {
+		self.order != MergedOrder::Lfu
+	}
+
+	fn drain_demotions(&mut self) -> u64 {
+		self.log.take_demotions()
+	}
+
+	/// The store's own latch, which only the policy worker writes: published
+	/// into `status` by the worker right after the call that moved it, for
+	/// `hybrid_policy::admission_tier` -- as `LfuCompactHybridStack`'s.
+	fn admission_latched(&self) -> bool {
+		self.store.lfu_latched()
 	}
 
 	fn dram_reserved_bytes(&self) -> CacheSize {
@@ -761,7 +794,7 @@ mod global_demotion_fidelity {
 /// so the merged store's size-class-rounded `migrating()` and the reference
 /// stack's raw `size - dram_resident` are the same number and the accounting
 /// cannot drift for a reason unrelated to the order.
-#[cfg(all(test, feature = "fifo_compact_hybrid_cache"))]
+#[cfg(all(test, feature = "hybrid_cache_common"))]
 mod fifo_order_fidelity {
 	use super::*;
 
@@ -1087,7 +1120,7 @@ mod fifo_order_fidelity {
 		let mut merged_order = Vec::new();
 
 		while let Some(key) = merged.evict_one() {
-			assert!(store.take(&key).is_some(), "nominated victim was not present");
+			assert!(store.take_evict(&key).is_some(), "nominated victim was not present");
 			merged_order.push(key);
 		}
 
@@ -1173,7 +1206,7 @@ mod fifo_order_fidelity {
 /// key back into the fast tier and the settle that follows demotes someone
 /// else. So the tiers and the gauges are compared after every eviction too, not
 /// only at the end.
-#[cfg(all(test, feature = "clock_compact_hybrid_cache"))]
+#[cfg(all(test, feature = "hybrid_cache_common"))]
 mod clock_order_fidelity {
 	use super::*;
 
@@ -1579,7 +1612,7 @@ mod clock_order_fidelity {
 
 			let Some(key) = m else { break };
 
-			assert!(store.take(&key).is_some(), "nominated victim was not present");
+			assert!(store.take_evict(&key).is_some(), "nominated victim was not present");
 
 			merged_order.push(key);
 			split_order.push(s.expect("checked equal to m"));
@@ -1755,7 +1788,7 @@ mod clock_order_fidelity {
 /// number and the accounting cannot drift for a reason unrelated to the order.
 ///
 /// [`LfuCompactHybridStack`]: super::lfu_compact_hybrid_stack::LfuCompactHybridStack
-#[cfg(all(test, feature = "lfu_compact_hybrid_cache"))]
+#[cfg(all(test, feature = "hybrid_cache_common"))]
 mod lfu_order_fidelity {
 	use super::*;
 
@@ -2130,7 +2163,7 @@ mod lfu_order_fidelity {
 
 			let Some(key) = m else { break };
 
-			assert!(store.take(&key).is_some(), "nominated victim was not present");
+			assert!(store.take_evict(&key).is_some(), "nominated victim was not present");
 
 			merged_order.push(key);
 			split_order.push(s.expect("checked equal to m"));
@@ -2261,7 +2294,7 @@ mod lfu_order_fidelity {
 		let mut merged_order = Vec::new();
 
 		while let Some(key) = merged.evict_one() {
-			assert!(store.take(&key).is_some(), "nominated victim was not present");
+			assert!(store.take_evict(&key).is_some(), "nominated victim was not present");
 			merged_order.push(key);
 		}
 

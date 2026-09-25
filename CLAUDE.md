@@ -109,7 +109,9 @@ src/
                                 was served from (None on a miss), Set the tier the value was
                                 built in and the client's mark (its key's in-flight bucket's
                                 landed count, read before the insert); Audit (hybrid builds)
-                                asks the policy worker for a PlacementAudit.
+                                asks the policy worker for a PlacementAudit; Wipe carries the
+                                sender the policy worker answers once it has wiped (wipe()
+                                waits for it).
     policy/
       mod.rs                    PolicyWorker — drives the active PolicyStack, applies tier
                                  migrations (demotions before promotions), runs evictions. Also
@@ -138,8 +140,12 @@ src/
                                  backlog most buckets are busy: the fence fires for most
                                  fresh sets and heals are effectively off until it drains
                                  (InFlight's doc). Per-key FIFO consumers, last intent
-                                 wins, a redundant one declines. The merged store also queues
-                                 its new-key corrective on the client, under the shard lock.
+                                 wins, a redundant one declines. The merged store divides
+                                 its work as the DashMap stores do (S4): its client only
+                                 publishes, swaps and takes map entries; the policy worker
+                                 links, charges, places, settles and retires, and wipes
+                                 (a round trip wipe() waits for, in every store). The LFU
+                                 latch is published with the event that moved it (U12).
       policy_stack/             One file per policy, all implementing the PolicyStack trait.
                                  The 18 *_hybrid_stack.rs files carry each design's algorithm
                                  and its full derivation in the module doc — those are the

@@ -77,7 +77,8 @@ pub enum WorkerEvent {
 	/// Kept distinct from `Del` for two reasons: the sender is a background
 	/// worker rather than an API call that just succeeded, and the receiver
 	/// therefore has to re-check the object map before acting on it -- see
-	/// `PolicyWorker::handle_expire`.
+	/// `PolicyWorker::handle_expire`. (Not for the merged store, whose stack
+	/// retires only the DEAD slot the reap left, never a live one.)
 	///
 	/// Before this existed `TtlWorker` reaped silently. `erase` only touches
 	/// the object map and the size counters, so a reaped key stayed in the
@@ -95,7 +96,19 @@ pub enum WorkerEvent {
 
 	Ttl(HashedKey, ExpireTime, ExpireTime),
 
-	Wipe,
+	/// Empty the cache. The POLICY WORKER does it -- the object map, the
+	/// stack, the status counters and the tier gauges, in that order
+	/// (`PolicyWorker::handle_wipe`) -- and then answers on the sender, for
+	/// which `PaperCache::wipe` waits: so a `Set` the worker handled before
+	/// the `Wipe` cannot leave a live key its stack no longer tracks, and the
+	/// merged store's worker-owned state (its link count, its latch, its
+	/// retired slots) has one writer. The TTL and tiering workers clear their
+	/// own state and ignore the sender. `None` from a test that sends the raw
+	/// event.
+	///
+	/// Still `Clone` (each subscriber gets a clone of the sender), and still 40
+	/// bytes: a crossbeam `Sender` is 16, with a niche for the `None`.
+	Wipe(Option<Sender<()>>),
 
 	Resize(CacheSize),
 	/// Runtime-adjusts the fast-tier byte budget for every hybrid design --
@@ -234,7 +247,7 @@ impl WorkerEvent {
 			WorkerEvent::Del(..) => Events::DEL,
 			WorkerEvent::Expire(..) => Events::EXPIRE,
 			WorkerEvent::Ttl(..) => Events::TTL,
-			WorkerEvent::Wipe => Events::WIPE,
+			WorkerEvent::Wipe(..) => Events::WIPE,
 			WorkerEvent::Resize(..) => Events::RESIZE,
 			WorkerEvent::ResizeFastTier(..) => Events::RESIZE_FAST_TIER,
 			WorkerEvent::ResizeLargeFastTier(..) => Events::RESIZE_LARGE_FAST_TIER,
@@ -304,6 +317,7 @@ pub(crate) use crate::worker::policy::migstats::{reconcile_applied, reconciled};
 #[cfg(feature = "hybrid_cache_common")]
 pub(crate) use crate::worker::policy::migration_queue::InFlight;
 
-// The tagged drain entry, for the merged store's own migration list.
+// The tagged drain entry, for the merged store's migration log; what a `Set`
+// did to the map, for its `worker_set`; and the CLOCK hand's budget.
 #[cfg(feature = "merged_object_store")]
-pub(crate) use crate::worker::policy::{MigrationOrigin, TaggedMigration};
+pub(crate) use crate::worker::policy::{MigrationOrigin, SetEvent, TaggedMigration, clock_hand_budget};

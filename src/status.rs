@@ -141,14 +141,16 @@ pub struct AtomicStatus {
 
 
 
-	/// Mirrors `LfuCompactHybridStack::admission_latched()` (see that trait
-	/// method's doc). Written by `PolicyWorker` every time it runs
-	/// `apply_tier_migrations`, read by `PaperCache::set()` — running on the
-	/// API-calling thread, which has no direct access to the worker-owned
-	/// policy stack — so a brand-new key can be built as
-	/// `TieredBuffer::new_slow` directly once the fast tier has genuinely
-	/// filled, instead of always guessing `new_fast` and relying on an async
-	/// correction.
+	/// Mirrors the stack's `admission_latched()` -- `LfuCompactHybridStack`'s
+	/// latch, or the merged store's under its `Lfu` order (see that trait
+	/// method's doc). Written only by `PolicyWorker::publish_admission_latch`,
+	/// right after every stack call that can move the latch, and read by
+	/// `PaperCache::set()` -- running on the API-calling thread, which has no
+	/// direct access to the worker-owned policy stack -- so a brand-new key is
+	/// built as `TieredBuffer::new_slow` directly once the fast tier has
+	/// genuinely filled. It trails the stack by the worker's event backlog;
+	/// a key built fast in that window gets its corrective from the reconcile
+	/// of its own `Set`.
 	#[cfg(feature = "hybrid_cache_common")]
 	hybrid_admission_latched: AtomicBool,
 
@@ -452,17 +454,20 @@ impl AtomicStatus {
 	/// one extra pass; a worker not yet started has no handle, so the kick is
 	/// a no-op; one that has exited ignores it.
 	///
-	/// NOTHING IN PRODUCTION CALLS THIS YET. It is for the fast-tier gate,
-	/// which will kick the worker as admissions approach the budget; until
-	/// then only tests do, which is what the `dead_code` allowance is for.
-	/// There is no kick on the set path yet, and `polling_delay`'s idle fix is
-	/// not a substitute for one. That fix makes the pass that FIRST sees a
-	/// burst choose the short poll, so the rest of the burst is taken within
-	/// milliseconds; but a worker already parked on the long poll when the
-	/// burst begins sleeps out up to `LONG_POLLING_DURATION` before that pass
-	/// runs -- as does a new cache's worker, whose first pass normally sees no
-	/// set and parks long. Only a kick closes that window: the gate's.
-	#[cfg_attr(not(test), allow(dead_code))]
+	/// Called where a client WAITS for the worker: `PaperCache::wipe`, which
+	/// the worker performs and answers, and `placement_audit` -- without it
+	/// an idle cache's wipe took up to `LONG_POLLING_DURATION`. The fast-tier
+	/// gate will kick it as admissions approach the budget. There is no kick
+	/// on the set path yet, and `polling_delay`'s idle fix is not a substitute
+	/// for one. That fix makes the pass that FIRST sees a burst choose the
+	/// short poll, so the rest of the burst is taken within milliseconds; but a
+	/// worker already parked on the long poll when the burst begins sleeps out
+	/// up to `LONG_POLLING_DURATION` before that pass runs -- as does a new
+	/// cache's worker, whose first pass normally sees no set and parks long.
+	/// Only a set-path kick closes that window (S5's gate, with a worker-idle
+	/// bit). Until then a merged store's values published in that window stay
+	/// unlinked -- uncharged and unevictable -- until the worker wakes, as a
+	/// DashMap stack's are untracked.
 	pub(crate) fn kick_policy_worker(&self) {
 		if let Some(worker) = self.policy_worker.lock().as_ref() {
 			worker.unpark();
@@ -863,20 +868,17 @@ impl AtomicStatus {
 
 
 
-	/// Mirrors `LfuCompactHybridStack::admission_latched()`'s current value.
-	/// Written by `PolicyWorker::apply_tier_migrations` every time it runs,
-	/// read by `PaperCache::set()` on the API-calling thread — see the
-	/// field's doc on the struct for why this needs to cross threads via an
-	/// atomic rather than a direct call into the stack.
+	/// Publishes the stack's `admission_latched()`. Only
+	/// `PolicyWorker::publish_admission_latch` calls it -- see the field's doc
+	/// on the struct for why this crosses threads via an atomic rather than a
+	/// direct call into the stack.
 	#[cfg(feature = "hybrid_cache_common")]
 	pub fn set_hybrid_admission_latched(&self, latched: bool) {
 		self.hybrid_admission_latched.store(latched, Ordering::Relaxed);
 	}
 
-	/// Current best-known value of
-	/// `LfuCompactHybridStack::admission_latched()`. May be up to one worker
-	/// event-loop iteration stale relative to the stack's true internal
-	/// state — see `set_hybrid_admission_latched`.
+	/// The stack's `admission_latched()` as last published: stale by at most
+	/// the events the worker has not handled yet -- see the field's doc.
 	#[cfg(feature = "hybrid_cache_common")]
 	#[must_use]
 	pub fn hybrid_admission_latched(&self) -> bool {
@@ -1039,13 +1041,9 @@ impl AtomicStatus {
 		#[cfg(feature = "hybrid_cache_common")]
 		self.hybrid_reconcile_applied_to_slow.store(0, Ordering::Relaxed);
 
-		// Reset synchronously here (called from `wipe()` on the API-calling
-		// thread) rather than waiting for `PolicyWorker` to process the
-		// corresponding `WorkerEvent::Wipe` and resync via
-		// `apply_tier_migrations` — closes the window where `set()` could
-		// otherwise read a stale `true` and build a brand-new key as
-		// `TieredBuffer::new_slow` right after a wipe, before the stack
-		// itself has caught up to also being empty (and thus unlatched).
+		// An empty stack is unlatched. The policy worker clears the status in
+		// its `Wipe` handling, after the stack, and republishes the stack's
+		// latch right after; `wipe()` returns only then.
 		#[cfg(feature = "hybrid_cache_common")]
 		self.hybrid_admission_latched.store(false, Ordering::Relaxed);
 	}

@@ -124,7 +124,7 @@ where
                 self.tiering_manager.remove_object(hashed_key);
             }
             
-            WorkerEvent::Wipe => {
+            WorkerEvent::Wipe(_) => {
                 // Clear all tiering information (including DRAM cache)
                 self.tiering_manager.clear();
             }
@@ -226,7 +226,7 @@ where
                 self.tiering_manager.remove_object(hashed_key);
             }
             
-            WorkerEvent::Wipe => {
+            WorkerEvent::Wipe(_) => {
                 // Clear all tiering information (including DRAM cache)
                 self.tiering_manager.clear();
             }

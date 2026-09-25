@@ -529,9 +529,9 @@ fn set_correctives(cache: &Cache) -> (u64, u64, u64) {
 /// between its mark and its handling -- not even another key's migration
 /// sharing its bucket (the buckets are indexed by the key's hash, which the
 /// cache's `RandomState` seeds anew each run, so such collisions are real).
-/// The merged store's own client-side corrective (every latched LFU
-/// admission: its client builds new keys fast) is not a set corrective of
-/// the worker's, and is not counted here.
+/// Every build's correctives are the worker's: the merged store's client
+/// queues nothing, and builds a new LFU key where the latch the worker
+/// published says, as the DashMap stores' does.
 fn assert_no_set_correctives(cache: &Cache, label: &str, phase: &str, before: (u64, u64, u64)) {
     let now = set_correctives(cache);
 
@@ -846,14 +846,11 @@ other_designs! {
 /// burst: an overwrite racing a migration of its own key is pinned there too.
 ///
 /// That the burst OUTRAN the mirror is asserted, not assumed: phase A must
-/// leave corrective demotions behind -- `reconcile_set_to_slow` moves in the
-/// split builds, where the worker's reconcile queues them, and in every build
-/// the cache's `reconcile_applied_to_slow` (in the merged builds the store's
-/// own client-side corrective lands them).
-///
-/// Every build: the merged store's LFU admits a latched new key slow while
-/// `PaperCache::set` builds it fast, and relies on its client-side
-/// corrective, with the same reconcile behind it.
+/// leave corrective demotions behind -- `reconcile_set_to_slow` moves, the
+/// worker's reconcile queueing them, and the cache's
+/// `reconcile_applied_to_slow` counts them landing. In every build: the latch
+/// is published with the `Set` that shuts it, and the burst's later keys were
+/// built before the worker reached that `Set`.
 #[test]
 fn an_lfu_burst_strands_no_value() {
     burst(Design::Policy(PaperPolicy::LfuCompactHybrid), FULL);
@@ -927,7 +924,6 @@ fn burst(design: Design, w: Workload) {
         after.reconcile_applied_to_slow > before.reconcile_applied_to_slow,
         "{label}: no corrective demotion landed -- the burst never outran the latch mirror",
     );
-    #[cfg(not(feature = "merged_object_store"))]
     assert!(
         after.reconcile_set_to_slow > before.reconcile_set_to_slow,
         "{label}: the reconcile queued no demotion -- the burst never outran the latch mirror",

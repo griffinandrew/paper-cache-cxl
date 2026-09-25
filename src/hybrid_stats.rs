@@ -172,8 +172,8 @@ pub struct HybridStats {
 	/// heals are effectively off until the backlog drains.
 	pub reconcile_get_heal_skipped: u64,
 
-	/// Reconcile-origin migrations -- the worker's correctives and the merged
-	/// store's client-side new-key push -- that LANDED, i.e. moved a value's
+	/// Reconcile-origin migrations -- the worker's correctives, in every
+	/// store -- that LANDED, i.e. moved a value's
 	/// bytes, by destination. THIS cache's totals since its creation or its
 	/// last `wipe()`, like `promotions` and `demotions`, and never counted in
 	/// them: a corrective moves bytes to where the stack ALREADY placed the

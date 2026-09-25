@@ -120,9 +120,9 @@ last entry's tier; everything the split keeps for a key is in that tier, so it g
 most one copy. Same-tier duplicates are kept (the second declines). Entries dropped this way are
 counted in `MIGSTATS coalesced_tot`. A one-sided drain (all demotions or all promotions) is
 returned whole, with nothing allocated or hashed; a mixed one costs a map sized to its smaller
-half. The merged store's `touch_slot` still queues its promotion before the settle that may undo
-it, so such a promotion arrives as a `(k, Fast), (k, Slow)` pair: dropped to the Slow when both
-are in one drain, applied in order through the per-key FIFO (a round trip) when they are not.
+half. The merged store used to queue a promotion before the settle that could undo it, which
+produced such pairs; since its settle runs on the policy worker it queues the promotion after the
+settle, and only if the key is still fast, as the DashMap stacks do.
 
 ### The copy runs with no map guard held
 
@@ -318,7 +318,7 @@ fast-admission variants are the exception: their DRAM small queue has no ceiling
 values stay in DRAM on top of the reservation. Charging only fast keys was tried and reverted — on cluster35
 (DashMap LRU, 5 GiB fast tier) it reserved 313.6 MB against 896.7 MB of real metadata, so fast
 data plus metadata reached 5,851 MB in a 5,369 MB tier. The merged store charges the same
-`len() × shared_overhead`.
+`linked() × shared_overhead` -- the keys its policy worker has linked, a DashMap stack's `len()`.
 
 ### `eviction_stacks_pmem`
 

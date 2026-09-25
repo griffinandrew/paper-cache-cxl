@@ -140,13 +140,70 @@
 //! needs, and it does not depend on the order: under `MergedOrder::Fifo` the
 //! fast set is the newest-INSERTED prefix, held by the same cursor, and the
 //! oldest boundary is the global FIFO demotion victim.) It cannot deadlock,
-//! because a toucher releases its own shard before settling and no thread ever
-//! holds two shard locks. Concurrent settlers may each demote one extra object,
-//! which the 0.98/0.95 hysteresis absorbs.
+//! because a caller releases its own shard before settling and no thread ever
+//! holds two shard locks.
 //!
-//! Migrations accumulate per shard and `drain_tier_migrations` concatenates
-//! them, so `PolicyWorker::apply_tier_migrations` performs the physical
-//! `Object::set_data` moves exactly as it does for every other hybrid stack.
+//! Every tier change is decided on the policy worker and appended to ONE log
+//! it owns (`MigrationLog`), in decision order, which `drain_tier_migrations`
+//! takes whole -- so `PolicyWorker::apply_tier_migrations` performs the
+//! physical `Object::set_data` moves exactly as it does for every other hybrid
+//! stack, and in the order a DashMap stack's drain would have.
+//!
+//! # Who does what: the client publishes, the policy worker decides
+//!
+//! The split designs divide a `set` in two: the client writes the object map
+//! and sends `Set`; the policy worker, handling the event, inserts the key into
+//! its stack, charges it, places it and settles. This store is the map AND the
+//! stack, and it used to do all of that on the client, under the shard lock,
+//! at the insert. It now divides the work the same way (backpressure plan
+//! S4), so the two stores make the same decisions at the same points and a
+//! comparison between them measures the structure, not a different division
+//! of work (T14 is the evidence: a scripted sequence gives identical drains,
+//! victims, placements and stats in both):
+//!
+//! ```text
+//!                 client (API thread, TTL reaper)    policy worker
+//!   set, new key  publish an UNLINKED slot           link, stamp, charge, place,
+//!                 (`insert`)                         settle (`worker_set`)
+//!   set, existing swap the object; record the        per order: relink/promote,
+//!                 byte change UNFOLDED               bit, bump/promote; settle
+//!   get           read                               relink/bit/bump (`touch` ...)
+//!   del, reap     take the object; a linked slot     retire the DEAD slot
+//!                 goes DEAD (`take_if`)              (`retire_dead`)
+//!   eviction      --                                 nominate, remove (`take_evict`)
+//!   wipe          wait for the worker                clear everything, answer
+//! ```
+//!
+//! What the client still does is the object map's own work -- a chain walk, a
+//! slot write, a chain push -- which is what the DashMap map does. Every piece
+//! of policy state (the lists and buckets, stamps, tiers, tier totals, the
+//! boundary, the mirrors, the latch, the link count, the log) has one writer:
+//! the policy worker. So a shard's list order is the order in which the
+//! worker handled the events, as it is for a DashMap stack.
+//!
+//! Three slot states follow (see `UNLINKED`): a value the client published
+//! and the worker has not linked is readable, overwritable and deletable, and
+//! invisible to the policy -- not charged, not placed (`tier_of` is `None`, as
+//! a DashMap stack's is for a key whose `Set` it has not handled), never
+//! evicted, never settled. A value a client deleted after the link leaves a
+//! DEAD slot on its list until the worker retires it at the key's `Del` or
+//! `Expire` (or reaches it first in a settle or an eviction, and retires it
+//! there without queueing anything) -- as a DashMap stack keeps a deleted key
+//! until its `Del`. And the bytes a client's overwrite or delete changes in a
+//! linked slot are UNFOLDED -- recorded beside the tier totals, and folded into
+//! them at the start of every worker section that can move a slot
+//! (`write_folded`), so every move is exact.
+//!
+//! The cost of the division: every `Set` takes the policy worker one shard
+//! write lock, which a client reading the same shard queues behind (the LRU and
+//! LFU hits already did), and the worker does serially what clients used to do
+//! in parallel -- visible as its event backlog. While a backlog lasts the
+//! values in it are unlinked: uncharged and unevictable, as a DashMap stack's
+//! are untracked. And the merged store no longer has a real-time bound on the
+//! fast tier of its own: a worker parked on its idle poll (up to 1 s after 5 s
+//! without a set) links nothing until it wakes, exactly as a DashMap stack
+//! places nothing. Only a set-path kick of the worker (S5's gate) closes that
+//! window, in both stores.
 //!
 //! # Slot recycling
 //!
@@ -159,7 +216,7 @@
 //! # Nothing under the shard lock is O(n)
 //!
 //! Two paths used to be, and both stalled the API THREAD, since in this design
-//! the API thread is what inserts:
+//! the API thread is what inserts into the map:
 //!
 //!   * the slab was one `Vec<Slot>` per shard, so a growth `realloc`ed and
 //!     copied every live slot;
@@ -180,7 +237,7 @@ use std::{
 	collections::HashMap,
 	ops::{Deref, DerefMut},
 	sync::{
-		atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+		atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 		RwLock, RwLockReadGuard, RwLockWriteGuard,
 	},
 };
@@ -188,7 +245,7 @@ use std::{
 use crate::{
 	error::CacheError,
 	object::{Object, ObjectSize},
-	worker::{MigrationOrigin, TaggedMigration, Tier},
+	worker::{MigrationOrigin, SetEvent, TaggedMigration, Tier},
 	CacheSize, HashedKey, NoHasher, PaperPolicy,
 };
 
@@ -436,14 +493,6 @@ impl MergedOrder {
 const SHARD_BITS: u32 = 5;
 const SHARDS: usize = 1 << SHARD_BITS;
 
-/// `MergedStore::dirty_migrations` carries one bit per shard in a `u32`, so the
-/// shard count has to fit in one. At `SHARD_BITS = 5` it is exactly 32.
-const _: () = assert!(
-	SHARDS <= u32::BITS as usize,
-	"SHARDS no longer fits the u32 dirty-shard mask -- widen dirty_migrations \
-	 along with SHARD_BITS",
-);
-
 /// Sharded on the HIGH bits -- see the module doc. The store is `NoHasher`d, so
 /// low-bit sharding would collapse each shard onto one hashbrown bucket.
 #[inline]
@@ -483,6 +532,28 @@ struct TailSeq {
 
 /// A shard with nothing in it, distinguishable from a real `last_access` of 0.
 const EMPTY_TAIL: u64 = u64::MAX;
+
+/// `Slot::last_access` of a PUBLISHED but UNLINKED slot: in the object map --
+/// findable, readable, overwritable, deletable, migratable -- but on no list
+/// and in no frequency bucket, charged to no tier and counted in no `linked`.
+/// A value a client has inserted whose `Set` the policy worker has not
+/// handled yet; the worker's `worker_set` links it. See "Who does what" in
+/// the module doc.
+///
+/// A sentinel, because the 40-byte slot has no spare bit. Safe because the
+/// clock is a monotonic `fetch_add` from 0 that cannot reach 2^64 (see
+/// `Slot::last_access`), and every reader of a stamp reaches the slot through
+/// a list or a bucket, which an unlinked slot is on neither of -- except
+/// `touch`'s update-interval probe, which checks. It equals `EMPTY_TAIL`, so a
+/// leak into a mirror would read "empty shard", never "oldest".
+///
+/// The other state a slot on a hash chain can be in is DEAD: `object` is
+/// `None` (a client deleted or reaped a LINKED value) while it is still on its
+/// list or bucket and still counted in `linked`, until the policy worker
+/// retires it at the key's `Del`/`Expire` (`retire_dead`), or reaches it first
+/// in a settle or an eviction and retires it there. `find` never returns a
+/// DEAD slot; `find_dead` returns nothing else.
+const UNLINKED: u64 = u64::MAX;
 
 /// Buckets a fresh shard starts with. 32 shards x 16 x 4 B = 2 KB of baseline,
 /// and the table doubles from there.
@@ -638,6 +709,13 @@ const _: () = assert!(
 );
 
 impl<K, V> Slot<K, V> {
+	/// Whether the policy worker has linked this slot (see [`UNLINKED`]).
+	/// Meaningful for a slot on a hash chain: a DEAD slot is linked.
+	#[inline]
+	fn is_linked(&self) -> bool {
+		self.last_access != UNLINKED
+	}
+
 	/// A recycled or never-used slot. Linked nowhere, holding nothing.
 	fn empty() -> Self {
 		Slot {
@@ -829,12 +907,34 @@ struct Inner<K, V> {
 	fast_buckets: FreqBuckets,
 	slow_buckets: FreqBuckets,
 
-	/// Tier crossings waiting for the policy worker's drain, in order, each
-	/// tagged with its origin: a settle's or a touch's decision
-	/// (`MigrationOrigin::Stack`), or the new-key corrective `insert` queues
-	/// when the bytes were built in another tier than the store decided
-	/// (`MigrationOrigin::Reconcile`).
-	migrations: Vec<TaggedMigration>,
+	/// Bytes a CLIENT moved in this shard that the tier totals above do not
+	/// hold yet: an overwrite of a LINKED slot (`insert`: the new object's
+	/// `migrating()` less the old one's, to the slot's tier) and a delete or
+	/// reap of one (`take_if`: less its `migrating()`). Signed, since either
+	/// can be negative. The policy worker FOLDS them into `fast_used` /
+	/// `slow_used` at the start of every section of its that can move a slot
+	/// (`MergedStore::write_folded`), so every move it makes by `migrating()`
+	/// -- which reads the slot's CURRENT object -- is exact, and nothing
+	/// saturates.
+	///
+	/// Invariant I, whenever the shard lock is free: `fast_used +
+	/// unfolded_fast` is the sum of `migrating()` over the linked slots whose
+	/// tier is fast (a DEAD slot's is 0), and `slow_used + unfolded_slow` the
+	/// same over the slow ones. `verify_charges` checks it.
+	///
+	/// Not policy state: the client's bookkeeping, as the DashMap map's new
+	/// value size is until the worker's `resize_key` reads it off the event.
+	/// The one difference is when the worker sees it -- at its first write
+	/// lock of the shard rather than at the change's own event -- which only
+	/// concurrency can show.
+	unfolded_fast: i64,
+	unfolded_slow: i64,
+
+	/// Slots on this shard's list or frequency buckets: LINKED ones and DEAD
+	/// ones. Changed only by the policy worker, and mirrored into
+	/// `MergedStore::linked` through the `totals()` bracket like the three
+	/// tier totals.
+	linked: usize,
 }
 
 impl<K, V> Inner<K, V> {
@@ -857,7 +957,9 @@ impl<K, V> Inner<K, V> {
 			fast_count: 0,
 			fast_buckets: FreqBuckets::new(),
 			slow_buckets: FreqBuckets::new(),
-			migrations: Vec::new(),
+			unfolded_fast: 0,
+			unfolded_slow: 0,
+			linked: 0,
 		}
 	}
 
@@ -879,7 +981,10 @@ impl<K, V> Inner<K, V> {
 		}
 	}
 
-	/// Walk one bucket chain. Mean length 1 at load factor 1.0.
+	/// The key's LIVE slot -- linked or unlinked -- on its bucket chain.
+	/// Walks past a DEAD slot of the key: after a delete and a re-set one or
+	/// more can sit beside the live one until the policy worker retires them.
+	/// Mean chain length 1 at load factor 1.0.
 	#[inline]
 	fn find(&self, key: HashedKey) -> Option<u32> {
 		let mut i = self.buckets[self.bucket_of(key)];
@@ -890,7 +995,25 @@ impl<K, V> Inner<K, V> {
 
 			let slot = &self.slots[i as usize];
 
-			if slot.hashed == key {
+			if slot.hashed == key && slot.object.is_some() {
+				return Some(i);
+			}
+
+			i = slot.hash_next;
+		}
+
+		None
+	}
+
+	/// The first DEAD slot of `key` on its chain: what `retire_dead` retires.
+	/// Never a live slot, and never a free one, which is on no chain.
+	fn find_dead(&self, key: HashedKey) -> Option<u32> {
+		let mut i = self.buckets[self.bucket_of(key)];
+
+		while i != NIL {
+			let slot = &self.slots[i as usize];
+
+			if slot.hashed == key && slot.object.is_none() {
 				return Some(i);
 			}
 
@@ -932,35 +1055,31 @@ impl<K, V> Inner<K, V> {
 		}
 	}
 
-	/// Unlink by key, repairing the predecessor's `hash_next`.
-	fn bucket_unlink(&mut self, key: HashedKey) -> Option<u32> {
-		let b = self.bucket_of(key);
-		let mut i = self.buckets[b];
-		let mut prev = NIL;
+	/// Takes slot `i` off its bucket chain, repairing the predecessor's
+	/// `hash_next`. By SLOT, not by key: a DEAD slot and a live one of the
+	/// same key can share a chain, and only the one being removed may go.
+	fn bucket_unlink_slot(&mut self, i: u32) {
+		let b = self.bucket_of(self.slots[i as usize].hashed);
+		let next = self.slots[i as usize].hash_next;
 
-		while i != NIL {
-			let (hashed, next) = {
-				let slot = &self.slots[i as usize];
-				(slot.hashed, slot.hash_next)
-			};
+		match self.buckets[b] == i {
+			true => self.buckets[b] = next,
 
-			if hashed == key {
-				match prev {
-					NIL => self.buckets[b] = next,
-					prev => self.slots[prev as usize].hash_next = next,
+			false => {
+				let mut p = self.buckets[b];
+
+				// Slot `i` is on this chain -- the caller found it there under
+				// the same guard -- so this walk ends at its predecessor.
+				while self.slots[p as usize].hash_next != i {
+					p = self.slots[p as usize].hash_next;
 				}
 
-				self.slots[i as usize].hash_next = NIL;
-				self.live -= 1;
-
-				return Some(i);
-			}
-
-			prev = i;
-			i = next;
+				self.slots[p as usize].hash_next = next;
+			},
 		}
 
-		None
+		self.slots[i as usize].hash_next = NIL;
+		self.live -= 1;
 	}
 
 	/// Grow the table by ONE bucket, re-partitioning one chain.
@@ -1070,6 +1189,8 @@ impl<K, V> Inner<K, V> {
 	/// Reverses this slot's contribution to the tier accounting and steps the
 	/// boundary back off it. Must run BEFORE `unlink`, which clears `prev`.
 	fn detach_tier(&mut self, i: u32, lfu: bool) {
+		self.assert_folded();
+
 		let (tier, migrating, prev, freq) = {
 			let s = &self.slots[i as usize];
 			(s.tier, s.migrating(), s.prev, s.freq)
@@ -1107,16 +1228,41 @@ impl<K, V> Inner<K, V> {
 		}
 	}
 
-	/// Unlink, drop the object and return the slot to the free list.
-	///
-	/// Dropping the object is what RETIRES its value: `Object::drop` defers the
-	/// free under an epoch pin rather than performing it, so a reader that
-	/// lifted this value's pointer out from under the shard guard a moment ago
-	/// and is still copying its bytes is safe. Nothing extra is needed here --
-	/// and deliberately so, since this runs on the policy worker, `take` runs
-	/// on the API thread, and the TTL reaper runs on a third; a per-site rule
-	/// would have to be repeated at all of them.
-	fn retire(&mut self, i: u32, lfu: bool) {
+	/// Moves the clients' pending byte changes into the tier totals (see
+	/// `unfolded_fast`). Called only by `MergedStore::write_folded`.
+	fn fold(&mut self) {
+		let fast = self.fast_used as i128 + self.unfolded_fast as i128;
+		let slow = self.slow_used as i128 + self.unfolded_slow as i128;
+
+		// Invariant I: each is a sum of object sizes.
+		#[cfg(any(test, debug_assertions))]
+		assert!(fast >= 0 && slow >= 0, "a fold took a tier below zero: {fast} / {slow}");
+
+		self.fast_used = fast.max(0) as CacheSize;
+		self.slow_used = slow.max(0) as CacheSize;
+		self.unfolded_fast = 0;
+		self.unfolded_slow = 0;
+	}
+
+	/// Every policy-worker move checks it runs on a folded shard: a move by
+	/// `migrating()` against totals that miss a client's change is off by
+	/// that change, silently. Test and debug builds only.
+	#[inline]
+	fn assert_folded(&self) {
+		#[cfg(any(test, debug_assertions))]
+		assert!(
+			self.unfolded_fast == 0 && self.unfolded_slow == 0,
+			"a policy-worker move ran on a shard holding unfolded client bytes \
+			 ({} / {}) -- its section must begin with write_folded",
+			self.unfolded_fast,
+			self.unfolded_slow,
+		);
+	}
+
+	/// Takes a LINKED or DEAD slot off its list (or frequency bucket) and out
+	/// of the tier accounting -- `detach_tier`, then `unlink` -- and out of
+	/// `linked`. It stays on its hash chain and keeps its object.
+	fn unlink_linked(&mut self, i: u32, lfu: bool) {
 		self.detach_tier(i, lfu);
 
 		// `detach_tier` already took the slot off its frequency bucket under
@@ -1125,32 +1271,119 @@ impl<K, V> Inner<K, V> {
 			self.unlink(i);
 		}
 
-		self.slots[i as usize].object = None;
+		self.linked -= 1;
+	}
+
+	/// Takes slot `i` off its hash chain and returns it to the free list,
+	/// handing back its object (`None` for a DEAD slot).
+	///
+	/// Handed back rather than dropped here, so the value's retirement happens
+	/// wherever the caller drops it -- still under a pin, via `Object::drop`,
+	/// which defers the free: a reader that lifted this value's pointer out
+	/// from under the shard guard a moment ago and is still copying its bytes
+	/// is safe. That holds on every thread that removes -- the client's
+	/// delete, the TTL reaper, the policy worker's eviction.
+	fn free_slot(&mut self, i: u32) -> Option<Object<K, V>> {
+		self.bucket_unlink_slot(i);
+
+		let taken = self.slots[i as usize].object.take();
 		self.free.push(i);
+
+		taken
+	}
+
+	/// Retires a DEAD slot: off its list and its chain, and freed. The tier
+	/// totals do not move -- its bytes left them when the client's delete was
+	/// folded, and `detach_tier` charges a DEAD slot's `migrating()` of 0 --
+	/// but `fast_count`, the boundary (or its bucket) and `linked` do. Queues
+	/// nothing: a retire is an un-tracking, like the DashMap stacks' `remove`.
+	fn retire_dead_slot(&mut self, i: u32, lfu: bool) {
+		debug_assert!(self.slots[i as usize].object.is_none(), "retiring a live slot");
+
+		self.unlink_linked(i, lfu);
+		self.free_slot(i);
+	}
+
+	/// Links slot `i` at the MRU end as a new FAST key: the DashMap stacks'
+	/// `push_front` of a new key under `Lru`, `Fifo` and `Clock` --
+	/// unreferenced, stamped `now`, charged its CURRENT object's bytes, and
+	/// the boundary if nothing was fast. The caller counts it in `linked`
+	/// when it was unlinked, and settles.
+	fn link_front_fast(&mut self, i: u32, now: u64) {
+		self.assert_folded();
+
+		{
+			let s = &mut self.slots[i as usize];
+			s.tier = Tier::Fast;
+			s.last_access = now;
+			s.referenced.store(0, Ordering::Relaxed);
+		}
+
+		self.link_front(i);
+
+		self.fast_used += self.slots[i as usize].migrating();
+		self.fast_count += 1;
+
+		if self.fast_boundary == NIL {
+			self.fast_boundary = i;
+		}
+	}
+
+	/// Links slot `i` into `tier`'s frequency-1 bucket as a new key under
+	/// `Lfu`: `ArenaFrequencyChain::insert`'s "admits a key at frequency 1",
+	/// appended at the bucket's tail, stamped `now`, charged to `tier`.
+	fn link_freq(&mut self, i: u32, now: u64, tier: Tier) {
+		self.assert_folded();
+
+		{
+			let s = &mut self.slots[i as usize];
+			s.freq = 1;
+			s.last_access = now;
+			s.tier = tier;
+		}
+
+		self.freq_link(i, 1, tier);
+
+		let migrating = self.slots[i as usize].migrating();
+
+		match tier {
+			Tier::Fast => {
+				self.fast_used += migrating;
+				self.fast_count += 1;
+			},
+
+			Tier::Slow => self.slow_used += migrating,
+		}
 	}
 
 	/// Move to the MRU end and make fast, promoting from slow if needed.
+	/// Returns whether it promoted.
 	///
 	/// Faithful port of `LruCompactHybridStack::touch_fast_key`, minus the
-	/// settle: the tier boundary is now settled globally, with no shard lock
-	/// held, so the caller drops this shard's guard and then calls
-	/// `MergedStore::settle_tier`. A promotion that a tight budget immediately
-	/// undoes therefore reports BOTH transitions, in order, rather than
-	/// suppressing the first -- per-key order is preserved, so the consumer
-	/// applies promote-then-demote and lands on the same final placement.
+	/// settle and the push: the tier boundary is settled globally, with no
+	/// shard lock held, so the caller drops this shard's guard and then calls
+	/// `MergedStore::settle_tier` -- and only after that queues `(key, Fast)`
+	/// for a promotion, and only if that settle did not demote the key again
+	/// (`MigrationLog::demoted_since`). That is the DashMap stacks' rule --
+	/// "pushed after settling and guarded on the key still being fast" -- and
+	/// on the policy worker it costs no lock: the only thing between the
+	/// promotion and the check is this thread's own settle, which records
+	/// every demotion it makes in the same log. So a promotion its own settle
+	/// undoes queues only the settle's `(key, Slow)`, never a `(key, Fast),
+	/// (key, Slow)` pair.
 	///
-	/// For a promotion its own settle undoes at once, that pair is
-	/// `(key, Fast), (key, Slow)`. When both land in one drain, the
-	/// worker's `split_tier_migrations` drops the Fast; otherwise the
-	/// migration queue's per-key FIFO applies both in order. Either way the
-	/// placement ends right, the second at the cost of a round trip through
-	/// DRAM. Queueing the promotion only after the settle, and only if the
-	/// slot is still fast -- the DashMap stacks' rule -- would save that round
-	/// trip, but here it costs a second shard write lock per promoting touch,
-	/// roughly every CLOCK second chance and every LRU hit on a slow key. It
-	/// is deferred to the change that moves the settle onto the policy
-	/// worker, where the push after it costs no extra lock.
-	fn touch_slot(&mut self, i: u32, now: u64) {
+	/// The push is made even when the bytes are already fast, as they are on
+	/// an overwrite: `set` builds an LRU value in DRAM before the policy
+	/// worker handles its `Set`, so the consumer declines the entry. The
+	/// no-op is the price of a guarantee. Queued migrations carry no identity
+	/// -- `apply_migration` acts on whatever object holds the key when it
+	/// dequeues -- so a demotion decided for the OLD object and still queued
+	/// when the overwrite lands demotes the NEW one, and this entry, behind it
+	/// on the key's FIFO consumer, is what restores it. Pinned by
+	/// `merged_overwrite_tests::an_overwrite_is_repromoted_after_a_stale_demotion`.
+	fn touch_slot(&mut self, i: u32, now: u64) -> bool {
+		self.assert_folded();
+
 		let previous_tier = self.slots[i as usize].tier;
 		let already_at_front = self.head == i;
 		let is_boundary = self.fast_boundary == i;
@@ -1186,38 +1419,38 @@ impl<K, V> Inner<K, V> {
 				self.fast_boundary = i;
 			}
 
-			// Queued even when the bytes are already fast, as they are on an
-			// overwrite: `set` builds an LRU value in DRAM before `insert` gets
-			// here, so the consumer will decline this entry. The no-op is the
-			// price of a guarantee. Queued migrations carry no identity --
-			// `apply_migration` acts on whatever object holds the key when it
-			// dequeues -- so a demotion decided for the OLD object and still
-			// queued when the overwrite lands demotes the NEW one, and this
-			// entry, behind it on the key's FIFO consumer, is what restores it.
-			// Skipping it for a physically fast value strands a fresh value in
-			// the slow tier while this slot counts it fast. Pinned by
-			// `merged_overwrite_tests::an_overwrite_is_repromoted_after_a_stale_demotion`.
-			let key = self.slots[i as usize].hashed;
-			self.migrations.push((key, Tier::Fast, MigrationOrigin::Stack));
+			return true;
 		}
+
+		false
 	}
 
 	/// Demotes exactly ONE slot -- the boundary, the least-recently-used fast
 	/// slot in this shard -- and steps the boundary back off it.
 	///
 	/// Nothing is searched, and because the boundary only walks along a list
-	/// this never reorders anything. Returns the bytes that left the fast tier,
-	/// or `None` when the shard holds nothing fast.
+	/// this never reorders anything. One step per call, rather than a drain
+	/// loop, because the loop lives in `MergedStore::settle_tier` and
+	/// re-chooses the shard after every step: the next victim is whichever
+	/// shard's boundary is now oldest, which is what makes the demotion order
+	/// global rather than per shard.
 	///
-	/// One step per call, rather than a drain loop, because the loop now lives
-	/// in `MergedStore::settle_tier` and re-chooses the shard after every step:
-	/// the next victim is whichever shard's boundary is now oldest, which is
-	/// what makes the demotion order global rather than per shard.
-	fn demote_boundary(&mut self) -> Option<CacheSize> {
+	/// A DEAD boundary is RETIRED instead: its bytes already left the tier
+	/// with the client's delete, and demoting it would queue a `(key, Slow)`
+	/// that lands on whatever value holds the key next.
+	fn demote_boundary(&mut self) -> Demote {
+		self.assert_folded();
+
 		let d = self.fast_boundary;
 
 		if d == NIL {
-			return None;
+			return Demote::Empty;
+		}
+
+		if self.slots[d as usize].object.is_none() {
+			// `detach_tier` steps the boundary back off it, as below.
+			self.retire_dead_slot(d, false);
+			return Demote::Retired;
 		}
 
 		let (key, migrating, prev) = {
@@ -1232,9 +1465,7 @@ impl<K, V> Inner<K, V> {
 		self.slow_used += migrating;
 		self.fast_boundary = prev;
 
-		self.migrations.push((key, Tier::Slow, MigrationOrigin::Stack));
-
-		Some(migrating)
+		Demote::Demoted(key)
 	}
 
 	/// This shard's three tier totals, read as a group.
@@ -1250,6 +1481,7 @@ impl<K, V> Inner<K, V> {
 			fast_used: self.fast_used,
 			slow_used: self.slow_used,
 			fast_count: self.fast_count as CacheSize,
+			linked: self.linked as CacheSize,
 		}
 	}
 
@@ -1434,9 +1666,11 @@ impl<K, V> Inner<K, V> {
 	/// `set_tier` relinks by APPENDING at the destination bucket's tail, the
 	/// stamp is refreshed here too.
 	fn promote_freq(&mut self, i: u32, now: u64) {
-		let (key, freq, migrating) = {
+		self.assert_folded();
+
+		let (freq, migrating) = {
 			let s = &self.slots[i as usize];
-			(s.hashed, s.freq, s.migrating())
+			(s.freq, s.migrating())
 		};
 
 		self.freq_unlink(i, freq, Tier::Slow);
@@ -1453,25 +1687,26 @@ impl<K, V> Inner<K, V> {
 		self.fast_used += migrating;
 		self.fast_count += 1;
 
-		// Pushed unconditionally, exactly as `touch_slot`'s promotion is, and
-		// NOT guarded on the key still being fast after the settle the way
-		// `LfuCompactHybridStack` guards its own. This store's convention is
-		// already the other one: "a promotion that a tight budget immediately
-		// undoes reports BOTH transitions, in order, rather than suppressing
-		// the first -- per-key order is preserved, so the consumer applies
-		// promote-then-demote and lands on the same final placement." The
-		// placement the two reach is identical; only the record stream differs.
-		self.migrations.push((key, Tier::Fast, MigrationOrigin::Stack));
+		// Nothing queued here: the caller queues `(key, Fast)` after the
+		// settle that follows, and only if that settle left the key fast --
+		// `LfuCompactHybridStack`'s own guard, and `touch_slot`'s.
 	}
 
 	/// Demotes this shard's least-frequently-used FAST key, at its own count.
 	///
 	/// `LfuCompactHybridStack::settle_fast_tier` demotes `min_with_count(Fast)`
 	/// and carries the count across, which is what
-	/// `ArenaFrequencyChain::set_tier` does for free. Returns the bytes that
-	/// left the fast tier, or `None` when this shard holds nothing fast.
-	fn demote_freq_min(&mut self, now: u64) -> Option<CacheSize> {
-		let d = self.freq_min_slot(Tier::Fast)?;
+	/// `ArenaFrequencyChain::set_tier` does for free. A DEAD minimum is
+	/// retired instead, as in `demote_boundary`.
+	fn demote_freq_min(&mut self, now: u64) -> Demote {
+		self.assert_folded();
+
+		let Some(d) = self.freq_min_slot(Tier::Fast) else { return Demote::Empty };
+
+		if self.slots[d as usize].object.is_none() {
+			self.retire_dead_slot(d, true);
+			return Demote::Retired;
+		}
 
 		let (key, freq, migrating) = {
 			let s = &self.slots[d as usize];
@@ -1492,10 +1727,22 @@ impl<K, V> Inner<K, V> {
 		self.fast_count = self.fast_count.saturating_sub(1);
 		self.slow_used += migrating;
 
-		self.migrations.push((key, Tier::Slow, MigrationOrigin::Stack));
-
-		Some(migrating)
+		Demote::Demoted(key)
 	}
+}
+
+/// What one settle step did in the shard it chose.
+enum Demote {
+	/// A live slot left the fast tier: queue `(key, Slow)`.
+	Demoted(HashedKey),
+
+	/// The boundary (or the tier's minimum) was a DEAD slot, retired in place.
+	/// Nothing queued.
+	Retired,
+
+	/// Nothing fast in the shard: the mirror named it before another section
+	/// emptied it. Republish and re-choose.
+	Empty,
 }
 
 /// The tiering configuration the settle loop needs, resolved once so the loop
@@ -1532,6 +1779,7 @@ struct ShardTotals {
 	fast_used: CacheSize,
 	slow_used: CacheSize,
 	fast_count: CacheSize,
+	linked: CacheSize,
 }
 
 /// Applies one counter's before/after change to the store-level total that
@@ -1557,6 +1805,76 @@ fn apply_delta(total: &AtomicU64, before: CacheSize, after: CacheSize) {
 
 		std::cmp::Ordering::Equal => {},
 	}
+}
+
+/// The policy worker's record of the tier changes it decides in this store,
+/// in decision order: what the handle's `drain_tagged_migrations` hands the
+/// worker, and what every store method that can decide a tier change appends
+/// to.
+///
+/// One ordered log, owned by the one thread that decides, rather than a list
+/// per shard: the per-shard lists this replaced lost the order across shards
+/// (a settle that demoted k1 in shard 9 and then k2 in shard 3 drained as
+/// [k2, k1]), where a DashMap stack drains in decision order. With every tier
+/// change decided on the policy worker, the log is that order, and draining
+/// it is a `mem::take` -- no lock, no dirty mask. A test that drives the
+/// store directly passes its own.
+///
+/// Every entry is the store's own decision (`MigrationOrigin::Stack`): the
+/// client queues nothing any more, so the only correctives are the worker's
+/// reconcile's, as in the DashMap stores.
+#[derive(Default)]
+pub struct MigrationLog {
+	entries: Vec<TaggedMigration>,
+
+	/// `Lfu` only: settle demotions decided since the last drain -- the
+	/// merged store's `drain_demotions`, `LfuCompactHybridStack`'s
+	/// `pending_demotions`. Under `Lfu` a slow landing is not always a
+	/// demotion (an admission refused to slow queues one too), so demotions
+	/// are counted where they are decided.
+	lfu_demotions: u64,
+}
+
+impl MigrationLog {
+	#[inline]
+	fn push(&mut self, key: HashedKey, tier: Tier) {
+		self.entries.push((key, tier, MigrationOrigin::Stack));
+	}
+
+	#[inline]
+	fn len(&self) -> usize {
+		self.entries.len()
+	}
+
+	/// Whether `key` was queued slow since `mark` (a `len()` taken earlier):
+	/// the push-after rule's "still fast" check, exact because the settle only
+	/// ever demotes and records every demotion here.
+	fn demoted_since(&self, mark: usize, key: HashedKey) -> bool {
+		self.entries[mark..].iter().any(|&(k, tier, _)| k == key && tier == Tier::Slow)
+	}
+
+	/// Everything queued since the last take, in order.
+	pub fn take_entries(&mut self) -> Vec<TaggedMigration> {
+		std::mem::take(&mut self.entries)
+	}
+
+	/// `take_entries` without the origin tags (all `Stack`).
+	pub fn take_untagged(&mut self) -> Vec<(HashedKey, Tier)> {
+		self.take_entries().into_iter().map(|(key, tier, _)| (key, tier)).collect()
+	}
+
+	/// The `Lfu` settle demotions counted since the last take.
+	pub fn take_demotions(&mut self) -> u64 {
+		std::mem::take(&mut self.lfu_demotions)
+	}
+}
+
+/// What a policy-worker section leaves to do once its shard guard is dropped:
+/// nothing, or a settle -- after which a promotion the section made is queued
+/// `(key, Fast)` unless that settle demoted the key again.
+enum After {
+	Nothing,
+	Settle { promoted: bool },
 }
 
 pub struct MergedStore<K, V> {
@@ -1597,15 +1915,13 @@ pub struct MergedStore<K, V> {
 	slow_used: AtomicU64,
 	fast_count: AtomicU64,
 
-	/// One bit per shard, set while that shard's write lock is held whenever it
-	/// has migration records waiting and cleared only by `drain_migrations`.
-	///
-	/// A single global flag meant that one migrated shard cost the drain a WRITE
-	/// lock on all 32, and `apply_tier_migrations` calls it once per worker
-	/// EVENT. With the mask the drain locks only the shards that actually
-	/// migrated -- normally the one the settle loop just demoted from -- and an
-	/// event with nothing pending costs a single relaxed load.
-	dirty_migrations: AtomicU32,
+	/// `sum(shard.linked)`: the slots the policy worker has linked (and not
+	/// yet retired), on the same footing as the three totals above. What the
+	/// per-object reservation, the CLOCK hand's budget, `slow_object_count`
+	/// and the handle's `len` count -- the DashMap stacks' `len()`, i.e. the
+	/// keys whose `Set` the worker has handled. `tracked` is the object map's
+	/// count (`len()`); the two agree at quiescence.
+	linked: AtomicU64,
 
 	/// Accesses that must elapse before a key is relinked again. 0 relinks
 	/// every time, which is exact LRU. memcached's equivalent is 60 seconds.
@@ -1630,14 +1946,15 @@ pub struct MergedStore<K, V> {
 	/// otherwise let a frequency-1 newcomer take the room back and bypass the
 	/// promotion rule entirely.
 	///
-	/// Deliberately the store's OWN field, and deliberately not published into
-	/// `status`. `status`'s `hybrid_admission_latched` gauge is written once
-	/// per worker pass by `refresh_tier_gauges`, and it is what
-	/// `hybrid_policy::admission_tier` misreads under a burst; this flag is
-	/// written under the shard lock of the settle that demoted and read on the
-	/// thread that admits, so it cannot lag. `admission_latched()` on the
-	/// handle therefore stays FALSE -- publishing this would recreate exactly
-	/// the lagging mirror the split stack is bitten by.
+	/// Written only on the policy worker -- by the settle that demotes, by an
+	/// admission it refuses, by `clear` and by a grow -- which admits here too,
+	/// so the decision never lags it. The handle's `admission_latched()`
+	/// returns it, and the worker publishes it into `status` right after the
+	/// stack call that moved it, where `hybrid_policy::admission_tier` reads it
+	/// to decide which tier a client builds a NEW key in -- exactly as for
+	/// `LfuCompactHybridStack`. A key built before the worker reached the Set
+	/// that latched is built fast and placed slow, and the reconcile of its
+	/// own Set queues its corrective.
 	lfu_latched: AtomicBool,
 
 	/// Fast-tier byte budget across ALL shards, settled against globally.
@@ -1676,7 +1993,7 @@ impl<K, V> Default for MergedStore<K, V> {
 			fast_used: AtomicU64::new(0),
 			slow_used: AtomicU64::new(0),
 			fast_count: AtomicU64::new(0),
-			dirty_migrations: AtomicU32::new(0),
+			linked: AtomicU64::new(0),
 			update_interval: std::env::var("MERGED_UPDATE_INTERVAL")
 				.ok()
 				.and_then(|v| v.parse().ok())
@@ -1719,13 +2036,15 @@ impl<K, V> MergedStore<K, V> {
 		MergedOrder::from_repr(self.order.load(Ordering::Relaxed))
 	}
 
-	/// Installs the fast-tier budget and the per-object DRAM reservation, and
-	/// settles every shard against them.
+	/// Installs the fast-tier budget and the per-object DRAM reservation.
 	///
-	/// Called once by the policy worker when it builds its `PolicyStack` over
-	/// this same `Arc`, with the values `init_policy_stack` hands the split
-	/// hybrid stacks -- so the merged store is tiered on exactly the terms
-	/// `LruCompactHybridStack` is.
+	/// Called once, when the policy worker builds its `PolicyStack` over this
+	/// same `Arc` (on the constructing thread), with the values
+	/// `init_policy_stack` hands the split hybrid stacks -- so the merged store
+	/// is tiered on exactly the terms `LruCompactHybridStack` is. The store is
+	/// empty then, so there is nothing to settle; the settle runs with the
+	/// policy worker's next link. (It used to settle here, into the per-shard
+	/// lists; the log it would need now is the worker's.)
 	pub fn configure_tiering(
 		&self,
 		fast_capacity: CacheSize,
@@ -1737,8 +2056,6 @@ impl<K, V> MergedStore<K, V> {
 		self.shared_overhead.store(shared_overhead, Ordering::Relaxed);
 		self.high_ppm.store(high_ppm, Ordering::Relaxed);
 		self.low_ppm.store(low_ppm.min(high_ppm), Ordering::Relaxed);
-
-		self.settle_all();
 	}
 
 	fn budget(&self) -> TierBudget {
@@ -1800,20 +2117,26 @@ impl<K, V> MergedStore<K, V> {
 		self.publish_fast_tail(shard, inner);
 	}
 
-	#[inline]
-	fn note_migrations(&self, shard: usize, inner: &Inner<K, V>) {
-		if inner.migrations.is_empty() {
-			return;
+	/// The shard's WRITE guard, with the clients' pending byte changes
+	/// (`Inner::unfolded_fast`) folded into its tier totals AND into the store
+	/// totals -- how every policy-worker section that can move a slot begins,
+	/// which is what keeps invariant I (on `Inner`) and every move by
+	/// `migrating()` exact. The store totals follow at once, before any
+	/// decision in the section, so a budget read inside it (the LFU gate, a
+	/// settle step's loop test) sees this shard's newest bytes.
+	///
+	/// The one place a fold happens: a section that moves a slot without it
+	/// trips `Inner::assert_folded` in test builds.
+	fn write_folded(&self, s: usize) -> RwLockWriteGuard<'_, Inner<K, V>> {
+		let mut g = self.shards[s].write().unwrap();
+
+		if g.unfolded_fast != 0 || g.unfolded_slow != 0 {
+			let before = g.totals();
+			g.fold();
+			self.apply_totals_delta(before, g.totals());
 		}
 
-		let bit = 1u32 << shard;
-
-		// Load before the read-modify-write. A shard under a steady demotion
-		// stream sets its bit once and then only reads it until the next drain,
-		// so the common case does not bounce the line between API threads.
-		if self.dirty_migrations.load(Ordering::Relaxed) & bit == 0 {
-			self.dirty_migrations.fetch_or(bit, Ordering::Relaxed);
-		}
+		g
 	}
 
 	/// Applies a shard's change in ALL THREE tier totals to the store-level
@@ -1832,6 +2155,7 @@ impl<K, V> MergedStore<K, V> {
 		apply_delta(&self.fast_used, before.fast_used, after.fast_used);
 		apply_delta(&self.slow_used, before.slow_used, after.slow_used);
 		apply_delta(&self.fast_count, before.fast_count, after.fast_count);
+		apply_delta(&self.linked, before.linked, after.linked);
 	}
 
 	/// The shard whose fast boundary is oldest -- the globally least-recently-
@@ -1860,23 +2184,27 @@ impl<K, V> MergedStore<K, V> {
 
 	/// Demote, globally, until the fast tier is back under the low watermark.
 	///
-	/// Runs with NO shard lock held. Each step is: 32 relaxed loads to name the
-	/// shard holding the oldest fast object, that ONE shard's write lock, one
-	/// boundary step, republish, unlock. So no thread ever holds two shard
-	/// locks and no lock-order cycle can form -- a toucher releases its own
-	/// shard before calling this.
+	/// Runs with NO shard lock held, on the policy worker. Each step is: 32
+	/// relaxed loads to name the shard holding the oldest fast object, that
+	/// ONE shard's write lock (folded), one boundary step, republish, unlock.
+	/// So no thread ever holds two shard locks and no lock-order cycle can
+	/// form -- a caller releases its own shard before calling this.
 	///
-	/// Two settlers running at once may each demote one extra object, which is
-	/// what the 0.98/0.95 hysteresis is for. The cost is paid by the API thread
-	/// that caused the overshoot.
-	fn settle_tier(&self) {
+	/// Every demotion is appended to `log`, in the order decided. A step that
+	/// finds a DEAD slot where the victim would be retires it and queues
+	/// nothing (`Demote::Retired`); under `Lfu` such a step latches admission
+	/// as a demotion does -- the loop runs only while the tier is over its
+	/// target, which is what "capacity was reached" means, and the DashMap
+	/// stack at the same point demotes the deleted-but-unhandled key and
+	/// latches.
+	fn settle_tier(&self, log: &mut MigrationLog) {
 		let budget = self.budget();
 
-		// The reservation is per LIVE object and applies across both tiers, so
-		// it comes off the budget before the watermarks are taken.
+		// The reservation is per LINKED object and applies across both tiers,
+		// so it comes off the budget before the watermarks are taken.
 		let effective = budget
 			.capacity
-			.saturating_sub(self.len() as CacheSize * budget.shared_overhead);
+			.saturating_sub(self.linked() as CacheSize * budget.shared_overhead);
 
 		if self.fast_used.load(Ordering::Relaxed) <= scale(effective, budget.high_ppm) {
 			return;
@@ -1904,51 +2232,71 @@ impl<K, V> MergedStore<K, V> {
 				break;
 			};
 
-			// A demotion carries the key into a slow bucket at its own count,
-			// as the newest entrant of that frequency, so it needs a stamp --
-			// see `Inner::demote_freq_min`.
-			let now = match order {
-				MergedOrder::Lfu => self.clock.fetch_add(1, Ordering::Relaxed),
-				_ => 0,
-			};
-
-			let mut g = self.shards[s].write().unwrap();
+			let mut g = self.write_folded(s);
 			let before = g.totals();
 
-			// `None` when that shard's fast set went away between the load and
-			// the lock -- another settler took it. Republish and re-choose.
-			let demoted = match order {
-				MergedOrder::Lfu => g.demote_freq_min(now),
+			let step = match order {
+				// A demotion carries the key into a slow bucket at its own
+				// count, as the newest entrant of that frequency, so it needs a
+				// stamp -- see `Inner::demote_freq_min`.
+				MergedOrder::Lfu => g.demote_freq_min(self.clock.fetch_add(1, Ordering::Relaxed)),
 				_ => g.demote_boundary(),
 			};
 
-			// A demotion firing at all means fast-tier capacity was genuinely
-			// reached, which is what shuts admission -- the same rule, and the
-			// same reason, as `settle_fast_tier`'s `fast_tier_latched = true`.
-			if order == MergedOrder::Lfu && demoted.is_some() {
-				self.lfu_latched.store(true, Ordering::Relaxed);
+			match step {
+				Demote::Demoted(key) => {
+					log.push(key, Tier::Slow);
+
+					// A demotion firing at all means fast-tier capacity was
+					// genuinely reached, which is what shuts admission -- the
+					// same rule, and the same reason, as `settle_fast_tier`'s
+					// `fast_tier_latched = true`; and it is counted where it is
+					// decided, as `pending_demotions` is there.
+					if order == MergedOrder::Lfu {
+						self.lfu_latched.store(true, Ordering::Relaxed);
+						log.lfu_demotions += 1;
+					}
+				},
+
+				Demote::Retired => {
+					if order == MergedOrder::Lfu {
+						self.lfu_latched.store(true, Ordering::Relaxed);
+					}
+				},
+
+				// That shard's fast set went away between the load and the
+				// lock. Republish and re-choose.
+				Demote::Empty => {},
 			}
 
 			self.apply_totals_delta(before, g.totals());
-			self.note_migrations(s, &g);
 
 			// BOTH mirrors, not just the fast one: under `Lfu` a demotion takes
 			// the key out of a fast bucket AND puts it into a slow one, so the
-			// victim mirror moved too. Under the other three orders the list
-			// tail is untouched and republishing it stores the value it already
-			// held.
+			// victim mirror moved too. Under the other three orders a retire can
+			// move the list tail as well.
 			self.publish_mirrors(s, &g);
 		}
 	}
 
-	/// The worker's per-pass settle, and what `configure_tiering` and
-	/// `resize_fast_tier` call. The SAME loop as an API thread's -- there is
-	/// only one, so there is only one demotion order.
-	fn settle_all(&self) {
-		self.settle_tier();
+	/// After a section: the settle it asked for, then the push of a promotion
+	/// that settle left standing (`After`).
+	fn finish(&self, key: HashedKey, after: After, log: &mut MigrationLog) {
+		if let After::Settle { promoted } = after {
+			let mark = log.len();
+
+			self.settle_tier(log);
+
+			if promoted && !log.demoted_since(mark, key) {
+				log.push(key, Tier::Fast);
+			}
+		}
 	}
 
-	/// Move `key` to the MRU end and make it fast.
+	/// A hit under `Lru`: move `key` to the MRU end and make it fast; the
+	/// policy worker's `update` for this store. `log` records the promotion
+	/// (queued after the settle, if the settle left it fast) and whatever the
+	/// settle demotes.
 	///
 	/// The operation the design exists for: one lookup reaches the object, its
 	/// position AND its tier, where the split design needs a second keyed
@@ -1961,7 +2309,11 @@ impl<K, V> MergedStore<K, V> {
 	/// recency into a FIFO run: a hit that restamped `last_access` would make
 	/// `tail_key` nominate the wrong victim, silently, and the result would
 	/// still look like a plausible miss ratio.
-	pub fn touch(&self, key: HashedKey) {
+	///
+	/// A hit on an UNLINKED slot -- its `Get` handled before its `Set`, which
+	/// two client threads can arrange -- moves nothing, as the DashMap stacks'
+	/// `update` of a key they do not track moves nothing.
+	pub fn touch(&self, key: HashedKey, log: &mut MigrationLog) {
 		match self.order() {
 			MergedOrder::Fifo => return,
 
@@ -1971,7 +2323,7 @@ impl<K, V> MergedStore<K, V> {
 			// recency approximation memcached makes deliberately, but skipping
 			// a BUMP loses a count, which changes the policy rather than
 			// quantising it.
-			MergedOrder::Lfu => return self.bump(key),
+			MergedOrder::Lfu => return self.bump(key, log),
 
 			// The whole of a CLOCK hit. It is split out rather than written
 			// here because it shares NOTHING with the body below -- no clock
@@ -1994,6 +2346,12 @@ impl<K, V> MergedStore<K, V> {
 
 			let Some(i) = g.find(key) else { return };
 
+			// The one reader of a stamp that can reach an unlinked slot (see
+			// `UNLINKED`): its sentinel is not an age.
+			if !g.slots[i as usize].is_linked() {
+				return;
+			}
+
 			// A plain subtraction: the clock is 64 bits and monotonic, so the
 			// stamp can only be at or behind it.
 			let age = now.saturating_sub(g.slots[i as usize].last_access);
@@ -2003,23 +2361,28 @@ impl<K, V> MergedStore<K, V> {
 			}
 		}
 
-		{
-			let mut g = self.shards[s].write().unwrap();
+		let promoted = {
+			let mut g = self.write_folded(s);
 
 			let Some(i) = g.find(key) else { return };
 
+			if !g.slots[i as usize].is_linked() {
+				return;
+			}
+
 			let before = g.totals();
 
-			g.touch_slot(i, now);
+			let promoted = g.touch_slot(i, now);
 
 			self.apply_totals_delta(before, g.totals());
-			self.note_migrations(s, &g);
 			self.publish_mirrors(s, &g);
-		}
+
+			promoted
+		};
 
 		// AFTER the guard is dropped -- see `settle_tier`. Holding it here
 		// would let the settle take a second shard lock while holding this one.
-		self.settle_tier();
+		self.finish(key, After::Settle { promoted }, log);
 	}
 
 	/// A CLOCK hit: set the slot's reference bit, and do nothing else.
@@ -2032,21 +2395,25 @@ impl<K, V> MergedStore<K, V> {
 	/// `touch_slot` under `shards[s].write()`, which serialises every reader of
 	/// that shard behind one relink and is the measured cause of the merged
 	/// store's service time reaching 1.24x the DashMap arm's at sixteen
-	/// clients. Here concurrent hits to the same shard proceed in parallel,
-	/// and two hits racing on the SAME slot both write 1.
+	/// clients. Here concurrent hits to the same shard proceed in parallel.
 	///
 	/// The work that relink represented has not vanished, it has MOVED: the
 	/// hand pays for it in `clock_victim`, under a write lock the eviction path
 	/// was taking anyway, and only for the slots that actually reach the tail.
 	///
-	/// `pub` so `MergedStackHandle::update` can reach it directly instead of
-	/// going through `touch` and re-testing the order.
+	/// Called by the policy worker only (a hit's `update`, and `worker_set`
+	/// for an overwrite), so the hand, which also runs there, is the only
+	/// other writer of the bit. An unlinked slot is not referenced: the
+	/// DashMap stack's `set_referenced` of a key it does not track does
+	/// nothing either.
 	pub fn mark_referenced(&self, key: HashedKey) {
 		let g = self.shards[shard_of(key)].read().unwrap();
 
 		let Some(i) = g.find(key) else { return };
 
-		g.slots[i as usize].referenced.store(1, Ordering::Relaxed);
+		if g.slots[i as usize].is_linked() {
+			g.slots[i as usize].referenced.store(1, Ordering::Relaxed);
+		}
 	}
 
 	/// An LFU hit: bump the frequency, and promote out of the slow tier if the
@@ -2058,11 +2425,9 @@ impl<K, V> MergedStore<K, V> {
 	/// Takes the shard WRITE lock, and that is inherent rather than lazy: the
 	/// bump moves the slot between two bucket chains and mutates the shard's
 	/// bucket map. This is the cost `MergedOrder::Clock` exists to avoid and
-	/// LFU cannot avoid -- see [`MergedOrder::Lfu`].
-	///
-	/// `pub` so `MergedStackHandle::update` can reach it directly instead of
-	/// going through `touch` and re-testing the order.
-	pub fn bump(&self, key: HashedKey) {
+	/// LFU cannot avoid -- see [`MergedOrder::Lfu`]. An unlinked slot is not
+	/// bumped (see `touch`).
+	pub fn bump(&self, key: HashedKey, log: &mut MigrationLog) {
 		let now = self.clock.fetch_add(1, Ordering::Relaxed);
 		let s = shard_of(key);
 
@@ -2072,10 +2437,14 @@ impl<K, V> MergedStore<K, V> {
 		// the mirror agrees with the shards it mirrors.
 		let fast_min = self.lfu_min_freq(&self.fast_tails);
 
-		let was_slow = {
-			let mut g = self.shards[s].write().unwrap();
+		let (was_slow, promoted) = {
+			let mut g = self.write_folded(s);
 
 			let Some(i) = g.find(key) else { return };
+
+			if !g.slots[i as usize].is_linked() {
+				return;
+			}
 
 			let before = g.totals();
 
@@ -2093,16 +2462,17 @@ impl<K, V> MergedStore<K, V> {
 				Some(min) => new_freq > min,
 			};
 
-			if promote && was_slow {
+			let promoted = promote && was_slow;
+
+			if promoted {
 				let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
 				g.promote_freq(i, stamp);
 			}
 
 			self.apply_totals_delta(before, g.totals());
-			self.note_migrations(s, &g);
 			self.publish_mirrors(s, &g);
 
-			was_slow
+			(was_slow, promoted)
 		};
 
 		// Only a hit that arrived on a SLOW key settles, and that is the
@@ -2112,18 +2482,16 @@ impl<K, V> MergedStore<K, V> {
 		// fired -- while a hit on a fast key is a bare `chain.bump` that
 		// returns without settling.
 		//
-		// Same underlying reason as `insert`'s guard: admission is byte-gated
+		// Same underlying reason as the admission's: admission is byte-gated
 		// at the full effective capacity while the drain target sits at
 		// `drain_target::ratio()` of it, so a tier legitimately rests in the
 		// band between the two. Settling on a FAST hit would drain it out of
-		// that band and demote keys the reference keeps fast -- which is
-		// exactly how the differential test caught this, one step after the
-		// admission guard fixed the same mistake on the insert path.
+		// that band and demote keys the reference keeps fast.
 		//
 		// AFTER the guard is dropped, as `touch` does it: the settle takes one
 		// shard lock at a time and must not find this thread holding another.
 		if was_slow {
-			self.settle_tier();
+			self.finish(key, After::Settle { promoted }, log);
 		}
 	}
 
@@ -2200,119 +2568,354 @@ impl<K, V> MergedStore<K, V> {
 	/// evicting it would be a different policy that still reported a plausible
 	/// miss ratio.
 	fn lfu_victim(&self) -> Option<HashedKey> {
-		for tier in [Tier::Slow, Tier::Fast] {
-			let mirrors: &[TailSeq] = match tier {
-				Tier::Slow => &self.tails,
-				Tier::Fast => &self.fast_tails,
-			};
+		'choose: loop {
+			for tier in [Tier::Slow, Tier::Fast] {
+				let mirrors: &[TailSeq] = match tier {
+					Tier::Slow => &self.tails,
+					Tier::Fast => &self.fast_tails,
+				};
 
-			let Some(s) = self.lfu_min_shard(mirrors) else { continue };
+				let Some(s) = self.lfu_min_shard(mirrors) else { continue };
 
-			let g = self.shards[s].read().unwrap();
+				{
+					let g = self.shards[s].read().unwrap();
 
-			if let Some(i) = g.freq_min_slot(tier) {
-				return Some(g.slots[i as usize].hashed);
+					match g.freq_min_slot(tier) {
+						Some(i) if g.slots[i as usize].object.is_some() => {
+							return Some(g.slots[i as usize].hashed);
+						},
+
+						// Emptied since the mirror was read: the other tier.
+						None => continue,
+
+						// DEAD: retired below, then chosen again.
+						Some(_) => {},
+					}
+				}
+
+				// The tier's minimum is a DEAD slot -- deleted, its `Del` not
+				// handled yet. It is not a victim (its object is gone); it is
+				// retired in place, under the write lock the read lock could not
+				// be upgraded to, and the choice is made again.
+				let mut g = self.write_folded(s);
+				let before = g.totals();
+
+				if let Some(i) = g.freq_min_slot(tier) {
+					if g.slots[i as usize].object.is_none() {
+						g.retire_dead_slot(i, true);
+					}
+				}
+
+				self.apply_totals_delta(before, g.totals());
+				self.publish_mirrors(s, &g);
+
+				continue 'choose;
 			}
-		}
 
-		None
+			return None;
+		}
 	}
 
-	/// Where a brand-new key is admitted under `Lfu`.
+	/// Where a brand-new key is admitted under `Lfu`, decided on the policy
+	/// worker at its `Set`.
 	///
-	/// `LfuCompactHybridStack::insert_resident`'s rule, in this store's byte
-	/// terms: FAST while the effective budget has room and the latch is open,
-	/// SLOW once it does not -- and the first refusal LATCHES, so every later
-	/// newcomer goes straight to slow whatever slack an object-granular
-	/// demotion has since freed.
+	/// `LfuCompactHybridStack::insert_resident`'s rule, verbatim: FAST while
+	/// the effective budget has room and the latch is open, SLOW once it does
+	/// not -- and the first refusal LATCHES, so every later newcomer goes
+	/// straight to slow whatever slack an object-granular demotion has since
+	/// freed, and queues `(key, Slow)` (the one entry the DashMap stack queues
+	/// for an admission; a latched one queues nothing, trusting the client to
+	/// have built the value slow, and the reconcile corrects it when it did
+	/// not).
 	///
 	/// This store's other three orders admit unconditionally fast and let the
 	/// settle sort it out, and under LFU that would be WRONG rather than
 	/// merely different: the settle demotes the lowest frequency, which is some
-	/// older frequency-1 key, not the newcomer that caused the overflow. The
-	/// reference would have left that older key alone and put the newcomer in
-	/// the slow tier.
+	/// older frequency-1 key, not the newcomer that caused the overflow.
 	///
-	/// `+ 1` on the object count reserves the new object's own shared metadata,
-	/// which is DRAM-resident whichever tier its value lands in.
-	fn lfu_admission_tier(&self, migrating: CacheSize) -> Tier {
+	/// The gate is in the DashMap stack's units, deliberately: `fast_used +
+	/// size`, with `size` the `Set` event's BASE size, where `fast_used` is in
+	/// migrating bytes. It used to add the slot's `migrating()` instead --
+	/// consistent, but not what the reference does, so the two admitted
+	/// differently in a band of `size - migrating` bytes. Fixing the units is
+	/// S5's, for both stores at once.
+	///
+	/// `fast_used` and `others` are the tier's fast bytes and the linked keys
+	/// OTHER than this one, as the caller has them; `+ 1` reserves the new
+	/// object's own shared metadata, which is DRAM-resident whichever tier
+	/// its value lands in.
+	fn lfu_admission(
+		&self,
+		key: HashedKey,
+		size: ObjectSize,
+		fast_used: CacheSize,
+		others: usize,
+		log: &mut MigrationLog,
+	) -> Tier {
 		if self.lfu_latched.load(Ordering::Relaxed) {
 			return Tier::Slow;
 		}
 
 		let budget = self.budget();
 
-		let admit_effective = budget.capacity.saturating_sub(
-			(self.len() as CacheSize + 1) * budget.shared_overhead,
-		);
+		let admit_effective = budget
+			.capacity
+			.saturating_sub((others as CacheSize + 1) * budget.shared_overhead);
 
-		match self.fast_used.load(Ordering::Relaxed) + migrating <= admit_effective {
-			true => Tier::Fast,
+		if fast_used + size as CacheSize <= admit_effective {
+			return Tier::Fast;
+		}
 
-			false => {
-				self.lfu_latched.store(true, Ordering::Relaxed);
-				Tier::Slow
+		self.lfu_latched.store(true, Ordering::Relaxed);
+		log.push(key, Tier::Slow);
+
+		Tier::Slow
+	}
+
+	/// The policy worker's handling of a `Set` of `key` -- this store's
+	/// `PolicyStack::insert_set` -- with `size` the event's base size and
+	/// `event` whether the map insert replaced a value (and if so whether the
+	/// base size changed).
+	///
+	/// The client's `insert` only published the value; everything the DashMap
+	/// stacks do for a `Set` on the policy worker happens here, on the policy
+	/// worker:
+	///
+	///   * the slot is UNLINKED -- the value's first `Set` (or an earlier `Set`
+	///     of the key whose value this one replaced before the worker got
+	///     there): LINK it, charging its CURRENT object -- `Lru`, `Fifo` and
+	///     `Clock` fast at the MRU end and settle; `Lfu` by `lfu_admission`,
+	///     at frequency 1, with no settle (the reference's new-key path
+	///     returns unsettled from both branches);
+	///   * the slot is LINKED and the event is `Fresh` -- the map insert
+	///     replaced nothing, yet an earlier `Set` of the key already linked the
+	///     slot on its behalf (`set v1; del; set v2` all published before the
+	///     worker took `Set(v1)`): RE-ADMIT it as a new key, as the DashMap
+	///     stack does at `Set(v2)` after `Del` removed it -- relinked at the
+	///     head with a fresh stamp, unreferenced, fast (`Lfu`: back to
+	///     frequency 1 through `lfu_admission`, the slot itself not counted
+	///     among the others);
+	///   * the slot is LINKED and the event is `Replaced` -- an overwrite, per
+	///     order: `Lru` relinks, restamps and promotes (`touch_slot`) and
+	///     settles; `Fifo` settles if it resized a fast slot; `Clock` sets the
+	///     reference bit, and settles if it resized a fast slot; `Lfu` bumps,
+	///     promotes past the fast minimum, and always settles.
+	///
+	/// A promotion is queued after the settle, and only if the settle left
+	/// the key fast (`finish`). A key with no live slot -- deleted, reaped,
+	/// evicted or wiped before the worker got here -- is left alone.
+	///
+	/// The clients' byte changes in the shard are folded first
+	/// (`write_folded`), so an overwrite's bytes are in the tier the slot is
+	/// in by the time the section decides anything.
+	pub fn worker_set(&self, key: HashedKey, size: ObjectSize, event: SetEvent, log: &mut MigrationLog) {
+		let order = self.order();
+		let s = shard_of(key);
+
+		// A same-size overwrite under `Fifo` or `Clock` moves nothing -- no
+		// bytes, no link -- so a linked slot is handled under the READ lock:
+		// nothing at all under `Fifo`, the reference bit under `Clock`, which a
+		// read guard may set (`mark_referenced`). Not taking the write lock for
+		// work that moves nothing is what `Clock` is for. An unlinked slot goes
+		// on to be linked.
+		if let (SetEvent::Replaced { resized: false }, MergedOrder::Fifo | MergedOrder::Clock) = (event, order) {
+			let g = self.shards[s].read().unwrap();
+
+			match g.find(key) {
+				None => return,
+
+				Some(i) if g.slots[i as usize].is_linked() => {
+					if order == MergedOrder::Clock {
+						g.slots[i as usize].referenced.store(1, Ordering::Relaxed);
+					}
+
+					return;
+				},
+
+				Some(_) => {},
+			}
+		}
+
+		// `Lfu` only, read with no lock held, as `bump` reads it.
+		let fast_min = match order {
+			MergedOrder::Lfu => self.lfu_min_freq(&self.fast_tails),
+			_ => None,
+		};
+
+		let after = {
+			let mut g = self.write_folded(s);
+
+			let Some(i) = g.find(key) else { return };
+
+			let before = g.totals();
+
+			let after = match (g.slots[i as usize].is_linked(), event) {
+				(false, _) => self.link(&mut g, i, key, size, log),
+				(true, SetEvent::Fresh) => self.readmit(&mut g, i, key, size, log),
+				(true, SetEvent::Replaced { resized }) => self.overwrite(&mut g, i, resized, fast_min),
+			};
+
+			self.apply_totals_delta(before, g.totals());
+			self.publish_mirrors(s, &g);
+
+			after
+		};
+
+		// Outside the guard: the settle takes one shard lock at a time and
+		// this thread must not be holding another one.
+		self.finish(key, after, log);
+	}
+
+	/// `worker_set` for an UNLINKED slot: its link, under the shard's write
+	/// lock. The stamp is taken under the lock, so a shard's list order and
+	/// stamp order agree even with several threads linking (tests do).
+	fn link(&self, g: &mut Inner<K, V>, i: u32, key: HashedKey, size: ObjectSize, log: &mut MigrationLog) -> After {
+		let now = self.clock.fetch_add(1, Ordering::Relaxed);
+
+		g.linked += 1;
+
+		match self.order() {
+			MergedOrder::Lfu => {
+				// The totals bracket has not published this section yet, so the
+				// atomics are the shard's state before the link: the others.
+				let tier = self.lfu_admission(
+					key,
+					size,
+					self.fast_used.load(Ordering::Relaxed),
+					self.linked(),
+					log,
+				);
+
+				g.link_freq(i, now, tier);
+
+				After::Nothing
+			},
+
+			_ => {
+				g.link_front_fast(i, now);
+
+				After::Settle { promoted: false }
 			},
 		}
 	}
 
-	/// The worker has finished processing the `Set` event for `key`: settle the
-	/// tier against the bytes the insert already accounted.
-	///
-	/// This used to do three more things, and each was wrong once the slot
-	/// stopped storing a size:
-	///
-	///   * it wrote `size` and `dram_resident` into the slot. Both are gone --
-	///     `Slot::migrating` derives them from the object, which has held the
-	///     value's length since the value became one word, so the bytes are
-	///     accounted by `insert` at the moment they become reachable rather
-	///     than one worker event later;
-	///   * it RELINKED the slot to the MRU end, which `insert` had already
-	///     done a moment earlier. Two relinks per set, the second of them
-	///     redundant, both taking the shard write lock;
-	///   * it bumped the clock a SECOND time, so one set consumed two stamps
-	///     and a set looked, to the recency order, more recent than a get of
-	///     the same age.
-	///
-	/// The parameters stay to match `PolicyStack::insert_resident`, whose other
-	/// implementations do keep a size of their own. A key evicted between the
-	/// insert and this call is simply gone, and settling is still correct.
-	pub fn record_size(&self, key: HashedKey, _size: ObjectSize, _dram_resident: ObjectSize) {
-		let _ = key;
+	/// `worker_set` for a LINKED slot whose `Set` is `Fresh`: a re-admission
+	/// -- see `worker_set`. Nothing is queued but an `Lfu` refusal's
+	/// `(key, Slow)`; where the value was built is the reconcile's business, as
+	/// for any new key.
+	fn readmit(&self, g: &mut Inner<K, V>, i: u32, key: HashedKey, size: ObjectSize, log: &mut MigrationLog) -> After {
+		let now = self.clock.fetch_add(1, Ordering::Relaxed);
 
-		// Under `Lfu` this settles NOTHING, for the reason spelled out at the
-		// end of `insert`: admission is byte-gated there, so the settle points
-		// are an overwrite, a hit and a resize -- exactly the three
-		// `LfuCompactHybridStack` has. Leaving the settle here would undo
-		// `insert`'s restraint one call later, since the worker reaches this
-		// through `MergedStackHandle::insert_resident` for every Set.
-		//
-		// The budget is still bounded without it: the admission gate is the
-		// whole effective capacity, so `fast_used` can reach that capacity and
-		// never exceed it. What CAN drift is the per-object DRAM reservation --
-		// `effective` shrinks as objects are admitted, so a tier admitted when
-		// the reservation was smaller may sit above the current target until
-		// the next hit or resize settles it. The reference has precisely the
-		// same property, and matching it is the point.
-		if self.order() == MergedOrder::Lfu {
-			return;
+		match self.order() {
+			MergedOrder::Lfu => {
+				// The slot leaves its bucket and its tier's totals first, so the
+				// gate sees the tier without it -- as the DashMap stack's does,
+				// having removed the key at its `Del`.
+				let (tier, migrating) = {
+					let slot = &g.slots[i as usize];
+					(slot.tier, slot.migrating())
+				};
+
+				g.detach_tier(i, true);
+
+				let fast_used = match tier {
+					Tier::Fast => self.fast_used.load(Ordering::Relaxed).saturating_sub(migrating),
+					Tier::Slow => self.fast_used.load(Ordering::Relaxed),
+				};
+
+				let tier = self.lfu_admission(key, size, fast_used, self.linked() - 1, log);
+
+				g.link_freq(i, now, tier);
+
+				After::Nothing
+			},
+
+			_ => {
+				g.detach_tier(i, false);
+				g.unlink(i);
+				g.link_front_fast(i, now);
+
+				After::Settle { promoted: false }
+			},
 		}
-
-		self.settle_tier();
 	}
 
-	/// The globally least-recently-used key: the minimum over the shard tails.
+	/// `worker_set` for a LINKED slot whose `Set` replaced a value: the
+	/// overwrite, per order -- see `worker_set`. The client already swapped
+	/// the object and the fold charged its bytes to the slot's tier; `resized`
+	/// is the DashMap FIFO and CLOCK stacks' criterion for settling (their
+	/// stored size against the event's).
+	fn overwrite(&self, g: &mut Inner<K, V>, i: u32, resized: bool, fast_min: Option<u16>) -> After {
+		let fast = g.slots[i as usize].tier == Tier::Fast;
+
+		match self.order() {
+			MergedOrder::Lru => {
+				let now = self.clock.fetch_add(1, Ordering::Relaxed);
+
+				After::Settle { promoted: g.touch_slot(i, now) }
+			},
+
+			// A resize in place and nothing else: no move to the front, no
+			// promotion, no new stamp -- `FifoCompactHybridStack`'s "an existing
+			// key is resized in place and NOT moved". Re-settling matters only
+			// if it is fast, since only then can the resize have pushed the
+			// fast tier over its budget.
+			MergedOrder::Fifo => match resized && fast {
+				true => After::Settle { promoted: false },
+				false => After::Nothing,
+			},
+
+			// FIFO's restraint PLUS the reference bit: `ClockCompactStack::
+			// insert` forwards an existing key to `update`, which sets it, so a
+			// write earns the key a second chance without moving it.
+			MergedOrder::Clock => {
+				g.slots[i as usize].referenced.store(1, Ordering::Relaxed);
+
+				match resized && fast {
+					true => After::Settle { promoted: false },
+					false => After::Nothing,
+				}
+			},
+
+			// An ACCESS, as in both references: `LfuCompactStack::insert`
+			// forwards an existing key to `update`, and `LfuCompactHybridStack::
+			// insert_resident` bumps it (promoting a slow key past the fast
+			// minimum) and then settles, whatever the tier.
+			MergedOrder::Lfu => {
+				let now = self.clock.fetch_add(1, Ordering::Relaxed);
+				let new_freq = g.bump_slot(i, now);
+
+				let promoted = !fast && fast_min.is_none_or(|min| new_freq > min);
+
+				if promoted {
+					let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
+					g.promote_freq(i, stamp);
+				}
+
+				After::Settle { promoted }
+			},
+		}
+	}
+
+	/// The eviction victim by the store's order, NOMINATED, not removed: the
+	/// policy worker's `evict_one`, which `apply_evictions` pairs with
+	/// `erase` -- whose `take_evict` removes it.
 	///
-	/// `SHARDS` relaxed atomic loads and no lock. Each shard's list is ordered
-	/// within itself, so the global LRU object is necessarily some shard's
-	/// tail, and the oldest of those tails is it.
-	pub fn tail_key(&self) -> Option<HashedKey> {
+	/// `SHARDS` relaxed atomic loads and one shard lock. Each shard's list is
+	/// ordered within itself, so the global LRU object is necessarily some
+	/// shard's tail, and the oldest of those tails is it. Only linked slots
+	/// are on a list, so an unlinked value -- published, its `Set` not yet
+	/// handled -- is never nominated, as the DashMap stack cannot pop a key
+	/// it has not inserted. A DEAD slot where the victim would be is retired
+	/// in place and the choice made again. `log` records a CLOCK second
+	/// chance's promotion and its settle's demotions.
+	pub fn tail_key(&self, log: &mut MigrationLog) -> Option<HashedKey> {
 		match self.order() {
 			// LRU and FIFO read the oldest tail and are done. CLOCK may have to
 			// walk past a run of referenced slots first, and that walk MUTATES
 			// -- see `clock_victim`.
 			MergedOrder::Lru | MergedOrder::Fifo => self.oldest_tail_key(),
-			MergedOrder::Clock => self.clock_victim(),
+			MergedOrder::Clock => self.clock_victim(log),
 
 			// The minimum over 32 `(freq, stamp)` mirrors, slow tier first.
 			MergedOrder::Lfu => self.lfu_victim(),
@@ -2350,13 +2953,92 @@ impl<K, V> MergedStore<K, V> {
 	}
 
 	fn oldest_tail_key(&self) -> Option<HashedKey> {
-		let s = self.oldest_tail_shard()?;
-		let g = self.shards[s].read().unwrap();
+		loop {
+			let s = self.oldest_tail_shard()?;
 
-		match g.tail {
-			NIL => None,
-			t => Some(g.slots[t as usize].hashed),
+			{
+				let g = self.shards[s].read().unwrap();
+
+				if g.tail != NIL && g.slots[g.tail as usize].object.is_some() {
+					return Some(g.slots[g.tail as usize].hashed);
+				}
+			}
+
+			// The tail is DEAD (retired here, see `lfu_victim`), or the shard
+			// emptied since the mirror was read (republished, so it is not
+			// chosen again).
+			let mut g = self.write_folded(s);
+			let before = g.totals();
+
+			if g.tail != NIL && g.slots[g.tail as usize].object.is_none() {
+				let tail = g.tail;
+				g.retire_dead_slot(tail, false);
+			}
+
+			self.apply_totals_delta(before, g.totals());
+			self.publish_mirrors(s, &g);
 		}
+	}
+
+	/// `erase`'s no-key fallback: the oldest LIVE linked key by the store's
+	/// order, READ-ONLY -- no second chance and no retire, since the caller
+	/// has no log to record a CLOCK hand's promotion in. Walks past DEAD
+	/// slots. Reachable only from `apply_mini_evictions`, i.e. a policy
+	/// switch's reconstruction, which this store refuses; a sweep of every
+	/// shard, which is fine for that.
+	pub fn oldest_linked_key(&self) -> Option<HashedKey> {
+		let lfu = self.order() == MergedOrder::Lfu;
+
+		// `(tier rank, freq, stamp)`: under `Lfu` the slow tier first, then the
+		// lowest frequency, then the earliest entrant; otherwise the stamp.
+		let mut best: Option<((u8, u16, u64), HashedKey)> = None;
+
+		for lock in self.shards.iter() {
+			let g = lock.read().unwrap();
+
+			let mut consider = |i: u32, rank: u8| {
+				let slot = &g.slots[i as usize];
+				let order = (rank, if lfu { slot.freq } else { 0 }, slot.last_access);
+
+				if best.is_none_or(|(b, _)| order < b) {
+					best = Some((order, slot.hashed));
+				}
+			};
+
+			match lfu {
+				true => {
+					for (rank, tier) in [(0u8, Tier::Slow), (1u8, Tier::Fast)] {
+						'buckets: for (_, &(head, _)) in g.freq_buckets(tier).iter() {
+							let mut i = head;
+
+							while i != NIL {
+								if g.slots[i as usize].object.is_some() {
+									consider(i, rank);
+									break 'buckets;
+								}
+
+								i = g.slots[i as usize].next;
+							}
+						}
+					}
+				},
+
+				false => {
+					let mut i = g.tail;
+
+					while i != NIL {
+						if g.slots[i as usize].object.is_some() {
+							consider(i, 0);
+							break;
+						}
+
+						i = g.slots[i as usize].prev;
+					}
+				},
+			}
+		}
+
+		best.map(|(_, key)| key)
 	}
 
 	/// CLOCK's hand: the oldest slot whose reference bit is CLEAR, granting a
@@ -2374,33 +3056,40 @@ impl<K, V> MergedStore<K, V> {
 	///
 	/// Unlike the other two orders this WRITES, so it takes the shard's write
 	/// lock rather than its read lock. That costs nothing that was not already
-	/// being paid: `evict_one` nominates and `erase`'s `take` immediately takes
-	/// the same shard's write lock to remove the victim. The hit path is what
-	/// CLOCK keeps clean -- see `mark_referenced`.
+	/// being paid: `evict_one` nominates and `erase`'s `take_evict`
+	/// immediately takes the same shard's write lock to remove the victim.
+	/// The hit path is what CLOCK keeps clean -- see `mark_referenced`. A
+	/// second chance that promotes queues its `(key, Fast)` after the settle
+	/// behind it, and only if that settle left the key fast
+	/// (`ClockCompactHybridStack::recycle_to_front`'s rule). A DEAD tail is
+	/// retired, not passed.
 	///
 	/// # The budget
 	///
-	/// Sequentially this terminates in at most `len()` chances, since each one
-	/// clears a bit and nothing else sets one. Concurrently an API thread can
-	/// set a bit the hand just cleared, so a hot enough shard could in
-	/// principle keep the hand spinning; `budget` bounds that and then evicts
-	/// whatever is at the tail. It cannot fire on a quiesced store, which is
-	/// what the differential test replays, so it changes no compared behaviour
-	/// -- it is a liveness guard for the server, not a policy.
-	fn clock_victim(&self) -> Option<HashedKey> {
+	/// `clock_hand_budget(linked)` second chances, then whatever is at the
+	/// tail is evicted -- the same cap `ClockCompactHybridStack::evict_one`
+	/// has. It cannot fire here: each second chance clears a bit, and bits
+	/// are set only on the policy worker (a hit's `update`, an overwrite's
+	/// `worker_set`), which is also the thread running this loop -- so one
+	/// call makes at most as many second chances as there are set bits. It
+	/// used to be reachable, when the client's overwrite set bits
+	/// concurrently; it stays as a liveness guard. A retired DEAD tail does
+	/// not count against it.
+	fn clock_victim(&self, log: &mut MigrationLog) -> Option<HashedKey> {
 		enum Step {
 			Victim(HashedKey),
-			Chance,
+			Chance(HashedKey, bool),
 			Retry,
+			Retired,
 		}
 
-		let mut budget = self.len().saturating_mul(2).saturating_add(8);
+		let mut budget = crate::worker::clock_hand_budget(self.linked());
 
 		loop {
 			let s = self.oldest_tail_shard()?;
 
 			let step = {
-				let mut g = self.shards[s].write().unwrap();
+				let mut g = self.write_folded(s);
 
 				match g.tail {
 					// The shard emptied between the relaxed load and the lock.
@@ -2408,6 +3097,17 @@ impl<K, V> MergedStore<K, V> {
 					NIL => {
 						self.publish_mirrors(s, &g);
 						Step::Retry
+					},
+
+					t if g.slots[t as usize].object.is_none() => {
+						let before = g.totals();
+
+						g.retire_dead_slot(t, false);
+
+						self.apply_totals_delta(before, g.totals());
+						self.publish_mirrors(s, &g);
+
+						Step::Retired
 					},
 
 					t if budget == 0
@@ -2424,13 +3124,12 @@ impl<K, V> MergedStore<K, V> {
 						// recorded against the slot's new position rather than
 						// being wiped by the clear.
 						g.slots[t as usize].referenced.store(0, Ordering::Relaxed);
-						g.touch_slot(t, now);
+						let promoted = g.touch_slot(t, now);
 
 						self.apply_totals_delta(before, g.totals());
-						self.note_migrations(s, &g);
 						self.publish_mirrors(s, &g);
 
-						Step::Chance
+						Step::Chance(g.slots[t as usize].hashed, promoted)
 					},
 				}
 			};
@@ -2440,12 +3139,14 @@ impl<K, V> MergedStore<K, V> {
 
 				// Outside the guard -- `settle_tier` takes one shard lock at a
 				// time and must not find this thread holding another.
-				Step::Chance => {
-					self.settle_tier();
+				Step::Chance(key, promoted) => {
+					self.finish(key, After::Settle { promoted }, log);
 					budget = budget.saturating_sub(1);
 				},
 
 				Step::Retry => budget = budget.saturating_sub(1),
+
+				Step::Retired => {},
 			}
 		}
 	}
@@ -2458,92 +3159,136 @@ impl<K, V> MergedStore<K, V> {
 		self.contains_key(&key)
 	}
 
-	/// Remove and RETURN the object, unlinking it from the recency order and
-	/// reversing its tier accounting in the same operation.
+	/// The policy worker's EVICTION of `key`: remove and RETURN its object,
+	/// taking the slot off its list and its chain and out of the tier
+	/// accounting in the same operation -- the `Hashed` arm of `erase`, which
+	/// `apply_evictions` pairs with `evict_one`'s nomination (and the no-key
+	/// fallback).
 	///
 	/// This is the merge paying off directly: the split design removes from the
 	/// map and separately tells the stack, and when the second half is skipped
 	/// the two diverge -- the failure `ERASE_FALLBACK` in `lib.rs::erase`
-	/// exists to count. Here there is one structure, so the divergence has no
-	/// way to occur.
-	pub fn take(&self, key: &HashedKey) -> Option<Object<K, V>> {
+	/// exists to count. Here there is one structure.
+	///
+	/// `None` for an UNLINKED slot: a value the worker has not linked is never
+	/// evicted, as the DashMap stack cannot pop a key it has not inserted.
+	/// That covers the window between a nomination and this call, too -- a
+	/// client's delete and re-set of the nominated key leaves an unlinked
+	/// value under it, and `erase` then answers `KeyNotFound` and the loop
+	/// nominates again.
+	pub fn take_evict(&self, key: &HashedKey) -> Option<Object<K, V>> {
 		let s = shard_of(*key);
-		let mut g = self.shards[s].write().unwrap();
-		let i = g.bucket_unlink(*key)?;
+		let lfu = self.order() == MergedOrder::Lfu;
 
-		self.take_unlinked(s, &mut g, i)
+		let mut g = self.write_folded(s);
+
+		let i = g.find(*key)?;
+
+		if !g.slots[i as usize].is_linked() {
+			return None;
+		}
+
+		let before = g.totals();
+
+		g.unlink_linked(i, lfu);
+		let taken = g.free_slot(i);
+
+		self.apply_totals_delta(before, g.totals());
+		self.publish_mirrors(s, &g);
+		self.tracked.fetch_sub(1, Ordering::Relaxed);
+
+		taken
 	}
 
-	/// `take`, but only if `pred` holds for the object stored under `key`.
+	/// A CLIENT's removal of `key` -- `del`, and the TTL reaper -- if `pred`
+	/// holds for its object: returns the object, and changes no policy state.
 	///
 	/// The test and the removal run under one shard write guard, so no `set`
 	/// can replace the object in between -- which is the point: `erase` checks
 	/// a key match (hash collisions) and an expiry (the TTL reaper) against the
 	/// object it then removes, not against whatever was there a moment ago.
 	///
-	/// Walks the bucket chain twice, once to test and once to unlink. `take`
-	/// does not delegate here for that reason: capacity eviction has nothing to
-	/// test and keeps the single walk.
+	///   * an UNLINKED slot -- nothing charged, nothing linked -- is freed at
+	///     once: off its chain, onto the free list;
+	///   * a LINKED slot goes DEAD: its object is taken, its bytes leave the
+	///     tier as an unfolded change (`Inner::unfolded_fast`), and the slot
+	///     stays on its chain and its list, counted in `linked` and in
+	///     `fast_count`, until the policy worker retires it at the key's `Del`
+	///     or `Expire` (`retire_dead`) -- as the DashMap stacks keep a deleted
+	///     key until `handle_del` removes it.
+	///
+	/// No mirror moves, so nothing is republished: a DEAD slot keeps its
+	/// stamp, and whichever nominator or settle reaches it first retires it.
 	pub fn take_if(
 		&self,
 		key: &HashedKey,
 		pred: impl FnOnce(&Object<K, V>) -> bool,
 	) -> Option<Object<K, V>> {
-		let s = shard_of(*key);
-		let mut g = self.shards[s].write().unwrap();
-		let found = g.find(*key)?;
+		let mut g = self.shards[shard_of(*key)].write().unwrap();
+		let i = g.find(*key)?;
 
-		if !g.slots[found as usize].object.as_ref().is_some_and(pred) {
+		if !g.slots[i as usize].object.as_ref().is_some_and(pred) {
 			return None;
 		}
 
-		let i = g.bucket_unlink(*key)?;
-		debug_assert_eq!(i, found, "the write guard is held, so the slot cannot move");
+		let taken = match g.slots[i as usize].is_linked() {
+			true => {
+				let migrating = g.slots[i as usize].migrating() as i64;
 
-		self.take_unlinked(s, &mut g, i)
-	}
+				match g.slots[i as usize].tier {
+					Tier::Fast => g.unfolded_fast -= migrating,
+					Tier::Slow => g.unfolded_slow -= migrating,
+				}
 
-	/// The tail of `take` and `take_if`, once slot `i` is out of its bucket:
-	/// detach it from its tier and the recency order, hand back its object and
-	/// free the slot.
-	fn take_unlinked(&self, s: usize, g: &mut Inner<K, V>, i: u32) -> Option<Object<K, V>> {
-		let before = g.totals();
-		let lfu = self.order() == MergedOrder::Lfu;
+				g.slots[i as usize].object.take()
+			},
 
-		g.detach_tier(i, lfu);
+			false => g.free_slot(i),
+		};
 
-		if !lfu {
-			g.unlink(i);
-		}
-
-		// Handed to the caller rather than dropped here, so the value's
-		// retirement happens wherever the caller drops it -- still under a pin,
-		// via `Object::drop`.
-		let taken = g.slots[i as usize].object.take();
-		g.free.push(i);
-
-		self.apply_totals_delta(before, g.totals());
-		self.publish_mirrors(s, g);
 		self.tracked.fetch_sub(1, Ordering::Relaxed);
 
 		taken
 	}
 
-	pub fn remove_key(&self, key: HashedKey) -> bool {
+	/// The policy worker's retire of one DEAD slot of `key` -- its handling of
+	/// the key's `Del` or `Expire`, `MergedStackHandle::remove`. `false` when
+	/// there is none: the value was unlinked when the client deleted it, or a
+	/// settle or a nominator reached the slot first, or the `Expire` was a
+	/// reap that found the value live.
+	///
+	/// Never a live slot, so it is safe whatever the key holds now -- unlike
+	/// the DashMap stacks' `remove`, which `handle_expire` guards on the map
+	/// no longer holding the key. Each `Del` or `Expire` retires at most one:
+	/// every DEAD slot is created by a delete or a reap, each of which is
+	/// followed by its own event (a `del` whose `erase` found the value
+	/// expired sends no `Del`, but the value's due TTL entry sends its
+	/// `Expire`); a spurious `Expire`, or a settle or a nominator retiring one
+	/// first, only removes one without its event. So the DEAD slots of a key
+	/// never outnumber its outstanding events, and every one is retired by the
+	/// time they are handled.
+	pub fn retire_dead(&self, key: HashedKey) -> bool {
 		let s = shard_of(key);
-		let mut g = self.shards[s].write().unwrap();
+		let lfu = self.order() == MergedOrder::Lfu;
 
-		let Some(i) = g.bucket_unlink(key) else { return false };
+		let mut g = self.write_folded(s);
+
+		let Some(j) = g.find_dead(key) else { return false };
 
 		let before = g.totals();
 
-		g.retire(i, self.order() == MergedOrder::Lfu);
+		g.retire_dead_slot(j, lfu);
 
 		self.apply_totals_delta(before, g.totals());
 		self.publish_mirrors(s, &g);
-		self.tracked.fetch_sub(1, Ordering::Relaxed);
 
 		true
+	}
+
+	/// Test support: `take_evict`, as a bool.
+	#[cfg(test)]
+	pub fn remove_key(&self, key: HashedKey) -> bool {
+		self.take_evict(&key).is_some()
 	}
 
 	pub fn get_ref(&self, key: &HashedKey) -> Option<MergedRef<'_, K, V>> {
@@ -2560,276 +3305,102 @@ impl<K, V> MergedStore<K, V> {
 		Some(MergedRefMut { guard, slot })
 	}
 
-	/// Insert at the MRU end, replacing any existing object for `key`.
+	/// A CLIENT's insert of `key`: publishes the object, replacing any live
+	/// one, and changes no policy state.
 	///
-	/// Admission is unconditionally fast, matching `LruCompactHybridStack` --
-	/// and matching what `PaperCache::set` physically built, since
-	/// `admission_latched` is false for this store.
+	///   * no live slot: a new UNLINKED slot is put first on the key's hash
+	///     chain (a free one or a fresh one) and counted in `tracked` -- no
+	///     stamp, no link, no charge, no boundary, no mirror, no settle, no
+	///     latch read. The policy worker links it at the `Set` this insert is
+	///     followed by (`worker_set`), deciding its tier there;
+	///   * a live slot: the object is swapped, and -- for a LINKED slot -- the
+	///     change in its `migrating()` is recorded as unfolded bytes of the
+	///     slot's tier, which the worker folds before it moves anything in the
+	///     shard. An unlinked slot records nothing: its link charges whatever
+	///     object it then holds, exactly once. No relink, no reference bit, no
+	///     bump, no promotion, no settle: the `Set`'s `worker_set` does those.
+	///
+	/// So a client holds the shard's write lock for a chain walk, a slot write
+	/// and a chain push (or a swap), the DashMap map's own work, and the bytes
+	/// of a value it builds are the value's; the policy work is the worker's,
+	/// on the terms of the DashMap stacks. The old object is returned, and its
+	/// bytes are freed wherever the caller drops it, as the DashMap insert
+	/// frees them.
 	pub fn insert(&self, key: HashedKey, object: Object<K, V>) -> Option<Object<K, V>> {
-		let now = self.clock.fetch_add(1, Ordering::Relaxed);
-		let s = shard_of(key);
-		let order = self.order();
+		let mut g = self.shards[shard_of(key)].write().unwrap();
 
-		// `Lfu` only, and read before the shard lock for the same reason `bump`
-		// reads it there: it is `SHARDS` relaxed loads over the fast-tier
-		// mirror, and an overwrite is an ACCESS under this order, so it can
-		// promote. Never consulted under the other three.
-		let lfu_fast_min = match order {
-			MergedOrder::Lfu => self.lfu_min_freq(&self.fast_tails),
-			_ => None,
-		};
+		match g.find(key) {
+			Some(i) => {
+				let was = g.slots[i as usize].migrating() as i64;
+				let old = g.slots[i as usize].object.replace(object);
 
-		let old = {
-			let mut g = self.shards[s].write().unwrap();
-			let before = g.totals();
-
-			let old = match g.find(key) {
-				Some(i) => {
-					// An overwrite can change the value's length, so the tier
-					// accounting moves by the DIFFERENCE, charged to whichever
-					// tier the slot is in at this instant. Under LRU
-					// `touch_slot` then moves the new figure to the fast tier
-					// if it was slow.
-					let was = g.slots[i as usize].migrating();
-					let old = g.slots[i as usize].object.replace(object);
-					let now_bytes = g.slots[i as usize].migrating();
+				if g.slots[i as usize].is_linked() {
+					let delta = g.slots[i as usize].migrating() as i64 - was;
 
 					match g.slots[i as usize].tier {
-						Tier::Fast => {
-							g.fast_used = (g.fast_used + now_bytes).saturating_sub(was)
-						},
-
-						Tier::Slow => {
-							g.slow_used = (g.slow_used + now_bytes).saturating_sub(was)
-						},
+						Tier::Fast => g.unfolded_fast += delta,
+						Tier::Slow => g.unfolded_slow += delta,
 					}
+				}
 
-					// The accounting above runs under BOTH orders -- the bytes
-					// really did change and somebody has to be charged for
-					// them. Only the relink is conditional.
-					//
-					// Under FIFO an overwrite is a resize in place and nothing
-					// else: no move to the front, no promotion out of the slow
-					// tier, and above all no new `last_access`, since that
-					// stamp is this object's position in the queue and the
-					// object has not been re-inserted. This is
-					// `FifoCompactHybridStack::insert_resident`'s "an existing
-					// key is resized in place and NOT moved", reached from the
-					// other side -- there the API thread's write never touches
-					// the stack at all; here the map IS the stack, so the
-					// restraint has to be spelled out.
-					//
-					// Under CLOCK it is FIFO's restraint PLUS the reference
-					// bit, because the flat stack this must match treats a
-					// re-insert as a hit: `ClockCompactStack::insert` forwards
-					// an existing key straight to `update`, which sets the bit.
-					// So an overwrite earns the object a second chance without
-					// moving it, and forgetting the bit here would make a
-					// written-and-then-evicted key leave in the wrong place.
-					//
-					// Under LFU an overwrite IS an access, and both references
-					// agree: `LfuCompactStack::insert` forwards an existing key
-					// to `update`, and
-					// `LfuCompactHybridStack::insert_resident` records the size
-					// change and then bumps it -- promoting it if the bump
-					// carries it past the fast tier's minimum. So the count
-					// moves and the position within the new bucket is refreshed,
-					// exactly as on a GET hit.
-					match order {
-						MergedOrder::Lru => g.touch_slot(i, now),
+				old
+			},
 
-						MergedOrder::Clock => {
-							g.slots[i as usize].referenced.store(1, Ordering::Relaxed);
-						},
+			None => {
+				let fresh = Slot {
+					object: Some(object),
+					hashed: key,
+					prev: NIL,
+					next: NIL,
+					hash_next: NIL,
+					last_access: UNLINKED,
+					// Meaningless until the link, which writes all three.
+					tier: Tier::Fast,
+					referenced: AtomicU8::new(0),
+					freq: 1,
+				};
 
-						MergedOrder::Lfu => {
-							let new_freq = g.bump_slot(i, now);
+				let i = match g.free.pop() {
+					Some(i) => {
+						g.slots[i as usize] = fresh;
+						i
+					},
 
-							let promote = match lfu_fast_min {
-								None => true,
-								Some(min) => new_freq > min,
-							};
+					// Appends a chunk when the last one is full. Nothing is
+					// copied and no slot moves, so this cannot stall the
+					// shard the way the old `reserve_exact` growth did.
+					None => g.slots.alloc(fresh),
+				};
 
-							if promote && g.slots[i as usize].tier == Tier::Slow {
-								let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
-								g.promote_freq(i, stamp);
-							}
-						},
+				// First on its chain, so it is found before any DEAD slot of
+				// the same key left by an earlier delete.
+				g.bucket_link(i);
 
-						MergedOrder::Fifo => {},
-					}
+				self.tracked.fetch_add(1, Ordering::Relaxed);
 
-					old
-				},
-
-				None => {
-					// What this object will charge to whichever tier it lands
-					// in. Computed from the object rather than from the slot,
-					// because the admission decision below needs it BEFORE
-					// there is a slot -- it is the same accessor
-					// `Slot::migrating` uses, so the two cannot disagree.
-					let migrating = crate::object::overhead::resident_object_bytes::<K>(
-						object.data_size(),
-					) as CacheSize;
-
-					// The tier the POLICY decides. Unconditionally fast under
-					// the three queue orders, which is what
-					// `LruCompactHybridStack` does; under `Lfu` it is the
-					// reference stack's admission rule, which can genuinely
-					// choose slow -- see `lfu_admission_tier`.
-					let decided = match order {
-						MergedOrder::Lfu => self.lfu_admission_tier(migrating),
-						_ => Tier::Fast,
-					};
-
-					// The tier the bytes are ACTUALLY in, read off the value
-					// this store was just handed -- against which `decided` is
-					// checked below, under this shard's write lock.
-					//
-					// `hybrid_policy::admission_tier` built them from a MIRROR
-					// the worker publishes once per pass (the LFU latch) or
-					// from a physical read, so they can be elsewhere: a stale
-					// latch, or a grow's mirror image (built slow, decided
-					// fast). The policy worker's reconcile compares the `Set`
-					// event's built tier with this slot's tier too, for both
-					// stores alike -- and for the overwrite branch above, which
-					// has no client-side corrective. The push here is KEPT
-					// beside it (review m3 of backpressure plan S3) because it
-					// costs nothing the store does not already pay (a compare
-					// under a lock it holds) and it keeps the correction window
-					// to ONE drain: this entry is in the store's list before
-					// the `Set` is even sent, so the worker's next drain takes
-					// it, where the reconcile's own would wait for the worker to
-					// reach the `Set` through the whole event backlog -- the
-					// bytes sitting in DRAM, charged slow, meanwhile. The two
-					// cannot conflict: when this entry is in the drain of the
-					// `Set`'s own event, the reconcile finds it there and adds
-					// nothing (the drain scan); when an earlier event's drain
-					// took it, the reconcile appends a duplicate for the same
-					// tier behind it, which its consumer DECLINES -- one
-					// dequeue and one lookup. Tagged `MigrationOrigin::
-					// Reconcile`: it moves bytes to where the store already
-					// placed the key, so it is counted as a corrective, never as
-					// a promotion or a demotion.
-					let built = object.value().tier();
-
-					let fresh = Slot {
-						object: Some(object),
-						hashed: key,
-						prev: NIL,
-						next: NIL,
-						hash_next: NIL,
-						last_access: now,
-						tier: decided,
-						referenced: AtomicU8::new(0),
-						// Frequency 1, matching `ArenaFrequencyChain::insert`
-						// ("admits a key at frequency 1") and
-						// `LfuCompactStack::insert`'s `link_front(1, i)`.
-						freq: 1,
-					};
-
-					let i = match g.free.pop() {
-						Some(i) => {
-							g.slots[i as usize] = fresh;
-							i
-						},
-
-						// Appends a chunk when the last one is full. Nothing is
-						// copied and no slot moves, so this cannot stall the
-						// shard the way the old `reserve_exact` growth did.
-						None => g.slots.alloc(fresh),
-					};
-
-					// Under `Lfu` the slot joins a frequency BUCKET, not the
-					// recency list -- `prev`/`next` are bucket chains there, so
-					// `link_front` must not run at all.
-					match order {
-						MergedOrder::Lfu => g.freq_link(i, 1, decided),
-						_ => g.link_front(i),
-					}
-
-					g.bucket_link(i);
-
-					// The bytes are accounted HERE, not one worker event later:
-					// the object carries its own length, so admitting it and
-					// charging it are the same moment. Charged to the tier the
-					// policy decided, which under `Lfu` may be the slow one.
-					match decided {
-						Tier::Fast => {
-							g.fast_count += 1;
-							g.fast_used += g.slots[i as usize].migrating();
-						},
-
-						Tier::Slow => {
-							g.slow_used += g.slots[i as usize].migrating();
-						},
-					}
-
-					// `fast_boundary` is the prefix cursor the other three
-					// orders' tiering runs on. Under `Lfu` tier membership is
-					// the slot's own `tier` field and the two bucket sets are
-					// already per-tier, so the cursor has no meaning and is
-					// left at `NIL` for the shard's whole life.
-					if order != MergedOrder::Lfu && g.fast_boundary == NIL {
-						g.fast_boundary = i;
-					}
-
-					// A corrective exactly when the policy's tier and the bytes'
-					// tier disagree, in either direction (see `built` above).
-					if built != decided {
-						g.migrations.push((key, decided, MigrationOrigin::Reconcile));
-					}
-
-					self.tracked.fetch_add(1, Ordering::Relaxed);
-
-					None
-				},
-			};
-
-			self.apply_totals_delta(before, g.totals());
-			self.note_migrations(s, &g);
-			self.publish_mirrors(s, &g);
-
-			old
-		};
-
-		// Outside the guard: the settle takes one shard lock at a time and
-		// this thread must not be holding another one.
-		//
-		// Under `Lfu` a brand-new key does NOT settle, and that asymmetry is
-		// the reference's, not an optimisation. `LfuCompactHybridStack::
-		// insert_resident`'s new-key path returns from BOTH of its branches
-		// without calling `settle_fast_tier` at all, because admission there is
-		// byte-gated and so cannot overshoot: it admits fast only while
-		// `fast_used + size <= admit_effective`.
-		//
-		// That gate is the FULL effective capacity, while the drain target is
-		// `drain_target::ratio()` of it -- 0.98 by default -- so there is a
-		// legitimate band between them. Settling after an admission would drain
-		// the tier down into that band and demote keys the reference keeps
-		// fast: at a 60,000-byte budget and 512-byte items the gate admits 117
-		// objects (59,904 B) while the target is 58,800, so an unconditional
-		// settle here demoted three keys per fill and the differential test
-		// diverged on the first admission past 58,800 -- which is exactly how
-		// this was found.
-		//
-		// An overwrite DOES settle, because the reference's existing-key path
-		// does: the bytes can grow in place, and nothing gates that.
-		let settle = match order {
-			MergedOrder::Lfu => old.is_some(),
-			_ => true,
-		};
-
-		if settle {
-			self.settle_tier();
+				None
+			},
 		}
-
-		old
 	}
 
+	/// Empties the store -- the policy worker's handling of a `Wipe`
+	/// (`PolicyWorker::handle_wipe`), which acknowledges it to the client
+	/// waiting in `PaperCache::wipe`.
+	///
+	/// Shard by shard, each under its own lock and each reporting its change
+	/// to the store totals through the same before/after bracket as every
+	/// other section -- not by storing 0 into them at the end: a client's
+	/// insert into a shard already cleared is counted in `tracked` and stays
+	/// counted, and the worker's link of it (its `Set` follows the `Wipe` in
+	/// the channel) lands in `linked` and the tier totals the same way.
 	pub fn clear(&self) {
 		for (s, lock) in self.shards.iter().enumerate() {
 			let mut g = lock.write().unwrap();
+			let before = g.totals();
+
+			let objects = (0..g.slots.allocated)
+				.filter(|&i| g.slots[i].object.is_some())
+				.count();
 
 			g.buckets.clear();
 			g.buckets.resize(INITIAL_BUCKETS, NIL);
@@ -2846,31 +3417,40 @@ impl<K, V> MergedStore<K, V> {
 			g.fast_count = 0;
 			g.fast_buckets.clear();
 			g.slow_buckets.clear();
-			g.migrations.clear();
+			g.unfolded_fast = 0;
+			g.unfolded_slow = 0;
+			g.linked = 0;
 
+			self.apply_totals_delta(before, g.totals());
 			self.publish_mirrors(s, &g);
+			self.tracked.fetch_sub(objects, Ordering::Relaxed);
 		}
 
 		// Every slot vector dropped above retired its objects' values into this
-		// thread's epoch bag. Push them out now: a `clear` is the one moment
-		// the whole cache's worth of garbage appears at once, and leaving it in
-		// a local bag would keep it resident until this thread happened to pin
-		// enough more times to fill it.
-
-		self.tracked.store(0, Ordering::Relaxed);
-		self.dirty_migrations.store(0, Ordering::Relaxed);
+		// thread's epoch bag, which the policy worker's pass flushes.
 
 		// An empty cache has reached no capacity, so admission reopens --
 		// `LfuCompactHybridStack::clear` resets `fast_tier_latched` for the
 		// same reason.
 		self.lfu_latched.store(false, Ordering::Relaxed);
-		self.fast_used.store(0, Ordering::Relaxed);
-		self.slow_used.store(0, Ordering::Relaxed);
-		self.fast_count.store(0, Ordering::Relaxed);
 	}
 
+	/// Live objects in the object map: published, linked or not. The DashMap
+	/// map's `len()`.
 	pub fn len(&self) -> usize {
 		self.tracked.load(Ordering::Relaxed)
+	}
+
+	/// Slots the policy worker has linked and not yet retired -- the DashMap
+	/// stacks' `len()` (see the field).
+	pub fn linked(&self) -> usize {
+		self.linked.load(Ordering::Relaxed) as usize
+	}
+
+	/// The `Lfu` admission latch (see the field): the handle's
+	/// `admission_latched()`.
+	pub fn lfu_latched(&self) -> bool {
+		self.lfu_latched.load(Ordering::Relaxed)
 	}
 
 	/// Calls `f(key, tier, len)` for every live object: its key, the tier its
@@ -2903,52 +3483,7 @@ impl<K, V> MergedStore<K, V> {
 		self.len() == 0
 	}
 
-	/// Drains every (key, new tier) pair that crossed the fast/slow boundary
-	/// since the last call, across all shards, without the origin tags:
-	/// `drain_tagged_migrations`, as the tests and fidelity checks read it.
-	pub fn drain_migrations(&self) -> Vec<(HashedKey, Tier)> {
-		self.drain_tagged_migrations().into_iter().map(|(key, tier, _)| (key, tier)).collect()
-	}
-
-	/// Drains every tier crossing since the last call, across all shards,
-	/// each with its origin (`Inner::migrations`): the merged handle's
-	/// `PolicyStack::drain_tagged_migrations`.
-	pub fn drain_tagged_migrations(&self) -> Vec<TaggedMigration> {
-		// A plain load first, and the read-modify-write only once there is
-		// something to collect. `PolicyWorker::apply_tier_migrations` calls this
-		// once per EVENT and the overwhelmingly common answer is "nothing", so an
-		// unconditional `swap` would write a shared line on every event and
-		// invalidate it under every API thread trying to set its own bit.
-		if self.dirty_migrations.load(Ordering::Relaxed) == 0 {
-			return Vec::new();
-		}
-
-		let mut dirty = self.dirty_migrations.swap(0, Ordering::Relaxed);
-		let mut out = Vec::new();
-
-		// Only the shards that actually migrated, not all 32.
-		//
-		// Nothing is lost to the race with a concurrent push: a shard sets its
-		// bit while holding its own write lock, and the bit is cleared only by
-		// the `swap` above. A push that lands before this loop reaches that
-		// shard is taken by this call (the lock orders them); one that lands
-		// after leaves the bit set for the next call. The bit outliving an
-		// already-drained shard costs one wasted lock and nothing else.
-		while dirty != 0 {
-			let s = dirty.trailing_zeros() as usize;
-			dirty &= dirty - 1;
-
-			let mut g = self.shards[s].write().unwrap();
-
-			if !g.migrations.is_empty() {
-				out.append(&mut g.migrations);
-			}
-		}
-
-		out
-	}
-
-	pub fn resize_fast_tier(&self, size: CacheSize) {
+	pub fn resize_fast_tier(&self, size: CacheSize, log: &mut MigrationLog) {
 		// A GROW reopens LFU admission; a shrink, or a no-op resize, does not.
 		//
 		// Faithful to `LfuCompactHybridStack::resize_fast_tier` INCLUDING the
@@ -2964,13 +3499,13 @@ impl<K, V> MergedStore<K, V> {
 		}
 
 		self.fast_capacity.store(size, Ordering::Relaxed);
-		self.settle_all();
+		self.settle_tier(log);
 	}
 
 	/// DRAM reserved out of the fast tier for shared per-object metadata across
 	/// both tiers, so demotion bounds total DRAM and not just fast-tier values.
 	pub fn dram_reserved_bytes(&self) -> CacheSize {
-		self.len() as CacheSize * self.shared_overhead.load(Ordering::Relaxed)
+		self.linked() as CacheSize * self.shared_overhead.load(Ordering::Relaxed)
 	}
 
 	/// The store-level total the settle loop tests, rather than a sum over the
@@ -2990,11 +3525,11 @@ impl<K, V> MergedStore<K, V> {
 		self.fast_count.load(Ordering::Relaxed) as usize
 	}
 
-	/// Every live object is in exactly one tier, so the slow count is the
-	/// tracked total less the fast one -- two relaxed loads, and no third
+	/// Every linked slot is in exactly one tier, so the slow count is the
+	/// linked total less the fast one -- two relaxed loads, and no third
 	/// counter that could drift on its own.
 	pub fn slow_object_count(&self) -> usize {
-		self.len().saturating_sub(self.fast_object_count())
+		self.linked().saturating_sub(self.fast_object_count())
 	}
 
 	/// Re-derives all three mirrored gauges from the shards and asserts the
@@ -3024,6 +3559,171 @@ impl<K, V> MergedStore<K, V> {
 			self.sum_shards(|g| g.fast_count as CacheSize),
 			"the store-level fast_count drifted from the shards it mirrors",
 		);
+
+		assert_eq!(
+			self.linked() as CacheSize,
+			self.sum_shards(|g| g.linked as CacheSize),
+			"the store-level linked count drifted from the shards it mirrors",
+		);
+	}
+
+	/// Invariant I of `Inner`, and the counts the policy worker keeps, walked
+	/// out of every shard's slots: the tier totals plus the unfolded client
+	/// bytes are the linked slots' `migrating()` per tier, `linked` is the
+	/// slots on lists or buckets, `fast_count` the fast ones among them, and
+	/// every slot on a list is on a chain. With `quiescent` (every event
+	/// handled), also: no DEAD slot, nothing unfolded, `linked == len()`, and
+	/// no unlinked slot. Plus `verify_gauges`.
+	#[cfg(test)]
+	pub(crate) fn verify_charges(&self, quiescent: bool) {
+		let lfu = self.order() == MergedOrder::Lfu;
+
+		for (s, lock) in self.shards.iter().enumerate() {
+			let g = lock.read().unwrap();
+
+			let mut listed = Vec::new();
+
+			match lfu {
+				true => {
+					for tier in [Tier::Fast, Tier::Slow] {
+						for (_, &(head, _)) in g.freq_buckets(tier).iter() {
+							let mut i = head;
+
+							while i != NIL {
+								listed.push(i);
+								i = g.slots[i as usize].next;
+							}
+						}
+					}
+				},
+
+				false => {
+					let mut i = g.head;
+
+					while i != NIL {
+						listed.push(i);
+						i = g.slots[i as usize].next;
+					}
+				},
+			}
+
+			let (mut fast, mut slow, mut fast_count, mut dead) = (0i128, 0i128, 0usize, 0usize);
+
+			for &i in &listed {
+				let slot = &g.slots[i as usize];
+
+				assert!(slot.is_linked(), "shard {s}: an unlinked slot is on a list");
+
+				match slot.tier {
+					Tier::Fast => {
+						fast += slot.migrating() as i128;
+						fast_count += 1;
+					},
+
+					Tier::Slow => slow += slot.migrating() as i128,
+				}
+
+				dead += slot.object.is_none() as usize;
+
+				assert_eq!(g.find(slot.hashed).filter(|_| slot.object.is_some()), slot.object.is_some().then_some(i),
+					"shard {s}: a live listed slot is not what find returns for its key");
+			}
+
+			assert_eq!(fast, g.fast_used as i128 + g.unfolded_fast as i128, "shard {s}: fast_used + unfolded_fast != the fast slots' bytes");
+			assert_eq!(slow, g.slow_used as i128 + g.unfolded_slow as i128, "shard {s}: slow_used + unfolded_slow != the slow slots' bytes");
+			assert_eq!(listed.len(), g.linked, "shard {s}: linked != the slots on lists");
+			assert_eq!(fast_count, g.fast_count, "shard {s}: fast_count != the fast slots on lists");
+
+			if quiescent {
+				assert_eq!(dead, 0, "shard {s}: {dead} DEAD slots at quiescence");
+				assert_eq!((g.unfolded_fast, g.unfolded_slow), (0, 0), "shard {s}: unfolded bytes at quiescence");
+
+				let unlinked = (0..g.slots.allocated)
+					.filter(|&i| g.slots[i].object.is_some() && !g.slots[i].is_linked())
+					.count();
+
+				assert_eq!(unlinked, 0, "shard {s}: {unlinked} unlinked values at quiescence");
+			}
+		}
+
+		if quiescent {
+			assert_eq!(self.linked(), self.len(), "linked != the object map's count at quiescence");
+		}
+
+		self.verify_gauges();
+	}
+
+	/// T15's snapshot of everything that is POLICY state in the store (see
+	/// "Who does what" in the module doc): per shard the list ends, the
+	/// boundary, the tier totals, `fast_count`, `linked` and both bucket maps,
+	/// and every listed slot's `(hashed, prev, next, last_access, tier,
+	/// referenced, freq)`; store-wide the clock, the four totals, both mirror
+	/// arrays and the latch. NOT the object map's: chains, slab, free list,
+	/// `tracked`, nor the clients' unfolded bytes.
+	#[cfg(test)]
+	pub(crate) fn policy_snapshot(&self) -> Vec<String> {
+		let mut out = Vec::new();
+
+		out.push(format!(
+			"store clock={} fast_used={} slow_used={} fast_count={} linked={} latched={}",
+			self.clock.load(Ordering::Relaxed),
+			self.fast_used.load(Ordering::Relaxed),
+			self.slow_used.load(Ordering::Relaxed),
+			self.fast_count.load(Ordering::Relaxed),
+			self.linked(),
+			self.lfu_latched(),
+		));
+
+		for (s, (t, f)) in self.tails.iter().zip(self.fast_tails.iter()).enumerate() {
+			out.push(format!(
+				"mirror {s} tail=({},{}) fast=({},{})",
+				t.seq.load(Ordering::Relaxed),
+				t.freq.load(Ordering::Relaxed),
+				f.seq.load(Ordering::Relaxed),
+				f.freq.load(Ordering::Relaxed),
+			));
+		}
+
+		for (s, lock) in self.shards.iter().enumerate() {
+			let g = lock.read().unwrap();
+
+			out.push(format!(
+				"shard {s} head={} tail={} boundary={} fast_used={} slow_used={} fast_count={} linked={} fast_buckets={:?} slow_buckets={:?}",
+				g.head, g.tail, g.fast_boundary, g.fast_used, g.slow_used, g.fast_count, g.linked,
+				g.fast_buckets, g.slow_buckets,
+			));
+
+			let mut listed = Vec::new();
+			let mut i = g.head;
+
+			while i != NIL {
+				listed.push(i);
+				i = g.slots[i as usize].next;
+			}
+
+			for tier in [Tier::Fast, Tier::Slow] {
+				for (_, &(head, _)) in g.freq_buckets(tier).iter() {
+					let mut i = head;
+
+					while i != NIL {
+						listed.push(i);
+						i = g.slots[i as usize].next;
+					}
+				}
+			}
+
+			for i in listed {
+				let slot = &g.slots[i as usize];
+
+				out.push(format!(
+					"  slot {i} hashed={:#x} prev={} next={} last_access={} tier={:?} referenced={} freq={}",
+					slot.hashed, slot.prev, slot.next, slot.last_access, slot.tier,
+					slot.referenced.load(Ordering::Relaxed), slot.freq,
+				));
+			}
+		}
+
+		out
 	}
 
 	/// The sweep the three gauges above used to be, kept as the oracle
@@ -3059,14 +3759,17 @@ impl<K, V> MergedStore<K, V> {
 			.fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
 	}
 
-	/// The tier `key` is currently placed in: its slot's tier. The merged
-	/// handle's `PolicyStack::placement_of`, and what tests and fidelity checks
-	/// read. One shard read lock.
+	/// The tier `key` is placed in: its LINKED slot's tier, `None` for a key
+	/// with no live slot or an UNLINKED one -- a value the policy worker has
+	/// not placed yet, as the DashMap stacks' `tier_of` is `None` for a key
+	/// whose `Set` they have not handled. The merged handle's
+	/// `PolicyStack::placement_of`, and what tests and fidelity checks read.
+	/// One shard read lock.
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
 		let g = self.shards[shard_of(key)].read().unwrap();
-		let i = g.find(key)?;
+		let slot = &g.slots[g.find(key)? as usize];
 
-		Some(g.slots[i as usize].tier)
+		slot.is_linked().then_some(slot.tier)
 	}
 }
 
@@ -3126,19 +3829,78 @@ mod tests {
 		i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 	}
 
-	fn tiered(fast_capacity: CacheSize) -> Store {
-		let s = Store::new();
-		s.configure_tiering(fast_capacity, 0, DEFAULT_HIGH_PPM, DEFAULT_LOW_PPM);
-		s
+	/// A store driven the way the policy worker drives it: its calls go
+	/// through here with ONE migration log, which `drain_migrations` hands
+	/// back -- the handle's part, for the tests that use the store directly.
+	/// Everything else is the store's, through `Deref`.
+	struct Driven {
+		store: Store,
+		log: std::cell::RefCell<MigrationLog>,
 	}
 
+	impl Deref for Driven {
+		type Target = Store;
+
+		fn deref(&self) -> &Store {
+			&self.store
+		}
+	}
+
+	impl Driven {
+		fn new(store: Store) -> Self {
+			Driven { store, log: Default::default() }
+		}
+
+		fn touch(&self, key: HashedKey) {
+			self.store.touch(key, &mut self.log.borrow_mut());
+		}
+
+		fn tail_key(&self) -> Option<HashedKey> {
+			self.store.tail_key(&mut self.log.borrow_mut())
+		}
+
+		fn resize_fast_tier(&self, size: CacheSize) {
+			self.store.resize_fast_tier(size, &mut self.log.borrow_mut());
+		}
+
+		fn drain_migrations(&self) -> Vec<(HashedKey, Tier)> {
+			self.log.borrow_mut().take_untagged()
+		}
+
+		/// The policy worker's removal of a nominated victim.
+		fn take(&self, key: &HashedKey) -> Option<Object<u64, crate::BufferDRAM>> {
+			self.store.take_evict(key)
+		}
+	}
+
+	fn tiered(fast_capacity: CacheSize) -> Driven {
+		let s = Store::new();
+		s.configure_tiering(fast_capacity, 0, DEFAULT_HIGH_PPM, DEFAULT_LOW_PPM);
+		Driven::new(s)
+	}
+
+	/// A whole set: the client's `insert`, then the policy worker's
+	/// `worker_set` for its `Set`, told what the insert did.
+	///
 	/// The value is `size` bytes of real allocation, because the tier
-	/// accounting is now DERIVED from the object rather than reported
-	/// separately -- an object built with an empty value migrates zero bytes
-	/// whatever `record_size` is told.
-	fn put(s: &Store, key: HashedKey, size: ObjectSize) {
-		s.insert(key, Object::new(key, &vec![0u8; size as usize], None));
-		s.record_size(key, size, 0);
+	/// accounting is DERIVED from the object rather than reported separately
+	/// -- an object built with an empty value migrates zero bytes. The event's
+	/// size, which only the `Lfu` admission gate reads, is the object's
+	/// `migrating()`: what these tests' gate compared before it took the
+	/// event's base size.
+	fn put_with(s: &Store, log: &mut MigrationLog, key: HashedKey, size: ObjectSize) {
+		let old = s.insert(key, Object::new(key, &vec![0u8; size as usize], None));
+
+		let event = match old {
+			None => SetEvent::Fresh,
+			Some(old) => SetEvent::Replaced { resized: old.data_size() != size },
+		};
+
+		s.worker_set(key, migrating_bytes(size) as ObjectSize, event, log);
+	}
+
+	fn put(s: &Driven, key: HashedKey, size: ObjectSize) {
+		put_with(&s.store, &mut s.log.borrow_mut(), key, size);
 	}
 
 	/// What a slot of `size` bytes of value contributes to a tier, as the store
@@ -3194,6 +3956,8 @@ mod tests {
 		let s = Arc::new(Store::new());
 		s.set_order(MergedOrder::Clock);
 
+		let mut log = MigrationLog::default();
+
 		// Two keys in ONE shard, so the queue order is unambiguous: `a` is
 		// older, `b` is newer.
 		let shard = shard_of(mix(1));
@@ -3201,10 +3965,10 @@ mod tests {
 		let a = keys.next().unwrap();
 		let b = keys.next().unwrap();
 
-		put(&s, a, 128);
-		put(&s, b, 128);
+		put_with(&s, &mut log, a, 128);
+		put_with(&s, &mut log, b, 128);
 
-		assert_eq!(s.tail_key(), Some(a), "the older key is not the victim");
+		assert_eq!(s.tail_key(&mut log), Some(a), "the older key is not the victim");
 
 		// The guard a concurrent GET of `a` would be holding: `get_ref` takes
 		// `shards[shard_of(key)].read()`, which is this exact lock.
@@ -3216,7 +3980,7 @@ mod tests {
 			let s = Arc::clone(&s);
 
 			std::thread::spawn(move || {
-				s.touch(a);
+				s.touch(a, &mut MigrationLog::default());
 				let _ = tx.send(());
 			})
 		};
@@ -3239,7 +4003,7 @@ mod tests {
 
 		// And the second chance that bit bought: the hand clears it, recycles
 		// `a` to the front, and evicts `b` instead.
-		assert_eq!(s.tail_key(), Some(b), "the hand did not spare the referenced key");
+		assert_eq!(s.tail_key(&mut log), Some(b), "the hand did not spare the referenced key");
 		assert!(!referenced(&s, a), "the hand did not clear the bit it passed");
 	}
 
@@ -3539,13 +4303,13 @@ mod tests {
 	/// every path that moves a shard's `fast_used`, `slow_used` or `fast_count`,
 	/// and `verify_gauges` re-derives all three from the shards after each one:
 	///
-	///   * insert of a NEW key                    (`insert`, the `None` arm)
+	///   * a NEW key's link                        (`worker_set` -> `link`)
 	///   * overwrite with a DIFFERENT size, while the slot is FAST
 	///   * overwrite with a different size while the slot is SLOW -- the one
 	///     path that moves `slow_used` and neither of the other two
 	///   * promotion                              (`touch_slot`)
 	///   * demotion                               (`demote_boundary`)
-	///   * removal                                (`remove_key` -> `retire`)
+	///   * removal                                (`remove_key` -> `take_evict`)
 	///   * removal returning the object           (`take` -> `detach_tier`)
 	///   * a fast-tier resize, which demotes in bulk
 	///   * `clear`, which zeroes every shard and every mirror at once
@@ -3710,16 +4474,14 @@ mod tests {
 		}
 	}
 
-	/// `drain_migrations` visits only the shards whose dirty bit is set, so
-	/// "every migration is eventually drained" is now a claim about that mask
-	/// rather than about a loop over all 32 shards.
+	/// The drain leaves nothing behind, from any shard: the store's migrations
+	/// are ONE log the policy worker owns and takes whole (`MigrationLog`).
 	///
-	/// `migrations_agree_with_final_placement` below CANNOT check this, and
-	/// that is not a guess: making shard 0 skip setting its bit leaves it
-	/// stranding records forever and that test still passes, because a key
-	/// whose migrations are never drained simply never enters its comparison.
-	/// An absence is invisible to a test that only inspects what it was given,
-	/// so this one inspects the shards directly.
+	/// They used to be a list per shard behind a dirty mask, and a shard that
+	/// failed to set its bit stranded its records for good -- invisibly to
+	/// `migrations_agree_with_final_placement`, which only inspects what it was
+	/// given, so this test inspected the shards. What there is to inspect now
+	/// is the log, after a workload that migrated across most shards.
 	#[test]
 	fn the_drain_leaves_no_shard_holding_migrations() {
 		let s = tiered(2_048 * SHARDS as CacheSize);
@@ -3738,8 +4500,8 @@ mod tests {
 				s.touch(mix(i / 3));
 			}
 
-			// Interleaved, so the mask is cleared and re-set many times over
-			// rather than accumulating into one final sweep.
+			// Interleaved, so the log is taken many times over rather than
+			// accumulating into one final sweep.
 			if i % 50 == 0 {
 				note(s.drain_migrations());
 			}
@@ -3750,23 +4512,44 @@ mod tests {
 		// Multi-shard, or the sweep below proves nothing.
 		assert!(
 			shards_seen.iter().filter(|seen| **seen).count() > SHARDS / 2,
-			"the workload migrated across too few shards to be a test of the mask",
+			"the workload migrated across too few shards to be a test of the drain",
 		);
 
-		// The claim itself: nothing is left stranded behind a bit that never
-		// got set.
-		for (i, lock) in s.shards.iter().enumerate() {
-			assert!(
-				lock.read().unwrap().migrations.is_empty(),
-				"shard {i} still holds migrations after a drain -- its dirty bit \
-				 was never set, so the drain never visited it",
-			);
+		assert_eq!(s.log.borrow().len(), 0, "the drain left migrations in the log");
+	}
+
+	/// A settle's demotions drain in the order the settle DECIDED them, across
+	/// shards -- the order a DashMap stack's drain has. The per-shard lists
+	/// this store used to keep concatenated in shard order, so a settle that
+	/// demoted a key in a high shard and then one in a low shard drained them
+	/// the other way round.
+	#[test]
+	fn a_settle_drains_its_demotions_in_decision_order_across_shards() {
+		let s = tiered(CacheSize::MAX);
+
+		// Oldest first: shard 9, then shard 3, then two more to keep fast.
+		let keys = [
+			(mix(1) >> SHARD_BITS) | (9 << (64 - SHARD_BITS)),
+			(mix(2) >> SHARD_BITS) | (3 << (64 - SHARD_BITS)),
+			(mix(3) >> SHARD_BITS) | (5 << (64 - SHARD_BITS)),
+			(mix(4) >> SHARD_BITS) | (1 << (64 - SHARD_BITS)),
+		];
+
+		for &k in &keys {
+			put(&s, k, 256);
 		}
 
+		assert!(s.drain_migrations().is_empty(), "an unbounded tier demotes nothing");
+
+		// The settle drains to 0.95 of the budget: three objects' worth of
+		// budget keeps two of the four fast, so it demotes the two oldest,
+		// shard 9's first.
+		s.resize_fast_tier(migrating_bytes(256) * 3);
+
 		assert_eq!(
-			s.dirty_migrations.load(Ordering::Relaxed),
-			0,
-			"the dirty mask outlived the records it points at",
+			s.drain_migrations(),
+			vec![(keys[0], Tier::Slow), (keys[1], Tier::Slow)],
+			"the demotions did not drain in the order the settle decided them",
 		);
 	}
 
@@ -3819,7 +4602,7 @@ mod tests {
 	/// shard's write lock.
 	#[test]
 	fn the_update_interval_skips_relinks() {
-		let s = Store::new().with_update_interval(1_000);
+		let s = Driven::new(Store::new().with_update_interval(1_000));
 		let hot = mix(1);
 		let cold = mix(2);
 
@@ -3838,7 +4621,7 @@ mod tests {
 		);
 
 		// The same store with the interval off relinks on the first touch.
-		let exact = Store::new();
+		let exact = Driven::new(Store::new());
 		put(&exact, hot, 64);
 		put(&exact, cold, 64);
 		exact.touch(hot);
@@ -3956,7 +4739,7 @@ mod tests {
 		let mut splits = 0usize;
 		let mut worst = 0usize;
 
-		// `insert` alone, not `put`: `record_size` no longer looks the key up,
+		// `insert` alone, not `put`: the worker's `worker_set` looks the key up,
 		// but keeping the measurement to the one call makes what is counted
 		// unambiguous.
 		for i in 1..=20_000u64 {
@@ -4289,19 +5072,22 @@ mod tests {
 				let s = Arc::clone(&s);
 
 				std::thread::spawn(move || {
+					// Each thread both publishes and links -- a client and a
+					// worker in one -- with a log of its own.
+					let mut log = MigrationLog::default();
+
 					for i in 1..=2_000u64 {
 						let key = mix(t * 1_000_000 + i);
 
-						s.insert(key, Object::new(key, &[0u8; 128], None));
-						s.record_size(key, 128, 0);
-						s.touch(mix(t * 1_000_000 + (i / 2).max(1)));
+						put_with(&s, &mut log, key, 128);
+						s.touch(mix(t * 1_000_000 + (i / 2).max(1)), &mut log);
 
 						if i % 13 == 0 {
 							s.remove_key(mix(t * 1_000_000 + i / 13));
 						}
 
 						if i % 101 == 0 {
-							s.resize_fast_tier(32 * 1_024 * (1 + i % 3));
+							s.resize_fast_tier(32 * 1_024 * (1 + i % 3), &mut log);
 						}
 					}
 				})
@@ -4437,6 +5223,182 @@ mod tests {
 		);
 	}
 
+	// ── T15: a client changes no policy state ─────────────────────────────
+
+	/// A store of `order` filled past its budget through the policy worker's
+	/// path -- 64 keys of 256 B against room for 16 -- so it holds fast and
+	/// slow keys, and under `Lfu` has latched.
+	fn t15_store(order: MergedOrder) -> Driven {
+		let s = Store::new();
+		s.set_order(order);
+		s.configure_tiering(16 * migrating_bytes(256), 0, DEFAULT_HIGH_PPM, DEFAULT_LOW_PPM);
+
+		let s = Driven::new(s);
+
+		for i in 1..=64u64 {
+			put(&s, mix(i), 256);
+		}
+
+		s.drain_migrations();
+
+		assert!(s.fast_object_count() > 0 && s.slow_object_count() > 0, "{order:?}: fast and slow");
+
+		if order == MergedOrder::Lfu {
+			assert!(s.lfu_latched(), "Lfu latched");
+		}
+
+		s
+	}
+
+	/// Fails with the first line of the policy snapshot that changed.
+	fn assert_same_policy_state(before: &[String], after: &[String], what: &str) {
+		for (b, a) in before.iter().zip(after) {
+			assert_eq!(b, a, "{what}: the policy state changed");
+		}
+
+		assert_eq!(before.len(), after.len(), "{what}: the policy state changed (slots listed)");
+	}
+
+	/// A key's shard's unfolded client bytes, `(fast, slow)`.
+	fn unfolded(s: &Store, key: HashedKey) -> (i64, i64) {
+		let g = s.shards[shard_of(key)].read().unwrap();
+		(g.unfolded_fast, g.unfolded_slow)
+	}
+
+	const T15_ORDERS: [MergedOrder; 4] = [MergedOrder::Lru, MergedOrder::Fifo, MergedOrder::Clock, MergedOrder::Lfu];
+
+	/// T15: with the policy worker not running, a CLIENT's insert of a new key
+	/// changes no policy state -- no stamp, link, charge, boundary, mirror,
+	/// settle or latch (`policy_snapshot` identical) -- in every order. The key
+	/// is published: readable, counted in the map's `len`, not placed, not
+	/// linked. Before S4 the client's insert linked, stamped, charged and
+	/// settled.
+	#[test]
+	fn t15_a_client_set_of_a_new_key_changes_no_policy_state() {
+		for order in T15_ORDERS {
+			let s = t15_store(order);
+			let k = mix(1_000);
+
+			let before = s.policy_snapshot();
+			let (len, linked) = (s.len(), s.linked());
+
+			s.insert(k, Object::new(k, &[0u8; 256], None));
+
+			assert_same_policy_state(&before, &s.policy_snapshot(), &format!("{order:?} new key"));
+			assert!(s.get_ref(&k).is_some(), "{order:?}: the value is published");
+			assert_eq!(s.tier_of(k), None, "{order:?}: placed before its Set");
+			assert_eq!((s.len(), s.linked()), (len + 1, linked), "{order:?}: map and link counts");
+		}
+	}
+
+	/// T15: a CLIENT's overwrite of a linked key -- fast or slow, the same
+	/// size or resized -- changes no policy state: no relink, restamp,
+	/// reference bit, bump, promotion or settle, and no tier total. Its bytes
+	/// are recorded as unfolded bytes of the slot's tier, exactly the change,
+	/// for the worker to fold. Before S4 the client charged them, relinked
+	/// (LRU), set the bit (CLOCK), bumped (LFU) and settled.
+	#[test]
+	fn t15_a_client_overwrite_changes_no_policy_state() {
+		for order in T15_ORDERS {
+			let s = t15_store(order);
+
+			let fast = (1..=64u64).map(mix).find(|&k| s.tier_of(k) == Some(Tier::Fast)).expect("a fast key");
+			let slow = (1..=64u64).map(mix).find(|&k| s.tier_of(k) == Some(Tier::Slow)).expect("a slow key");
+
+			for (key, len) in [(fast, 256), (fast, 1_024), (slow, 256), (slow, 1_024)] {
+				let tier = s.tier_of(key).expect("linked");
+				let was = s.get_ref(&key).map(|o| migrating_bytes(o.data_size())).expect("live");
+
+				let before = s.policy_snapshot();
+				let (fast_before, slow_before) = unfolded(&s, key);
+
+				s.insert(key, Object::new(key, &vec![0u8; len as usize], None));
+
+				let what = format!("{order:?} {tier:?} overwrite to {len}");
+				assert_same_policy_state(&before, &s.policy_snapshot(), &what);
+
+				let delta = migrating_bytes(len) as i64 - was as i64;
+				let (fast_after, slow_after) = unfolded(&s, key);
+
+				match tier {
+					Tier::Fast => assert_eq!((fast_after - fast_before, slow_after - slow_before), (delta, 0), "{what}"),
+					Tier::Slow => assert_eq!((fast_after - fast_before, slow_after - slow_before), (0, delta), "{what}"),
+				}
+
+				// The worker's `Set`, so the next case starts folded.
+				s.store.worker_set(
+					key,
+					migrating_bytes(len) as ObjectSize,
+					SetEvent::Replaced { resized: was != migrating_bytes(len) },
+					&mut s.log.borrow_mut(),
+				);
+				s.drain_migrations();
+				s.verify_charges(true);
+			}
+		}
+	}
+
+	/// T15: a CLIENT's delete -- `del`'s key-matched `take_if` -- and a TTL
+	/// reap -- the reaper's expired-only `take_if` -- of a linked key change no
+	/// policy state. The value is gone to every reader, its slot is DEAD on
+	/// its list (still counted in `linked`, for the worker's `Del` or `Expire`
+	/// to retire), and its bytes are recorded unfolded, negative. Before S4 the
+	/// client unlinked it, uncharged it and republished the mirrors.
+	#[test]
+	fn t15_a_client_delete_or_ttl_reap_changes_no_policy_state() {
+		for reap in [false, true] {
+			for order in T15_ORDERS {
+				let s = t15_store(order);
+
+				let k = mix(1_000);
+
+				let object = match reap {
+					false => Object::new(k, &[0u8; 256], None),
+					true => Object::with_expiry(k, &[0u8; 256], std::num::NonZeroU32::new(1)),
+				};
+
+				s.insert(k, object);
+				s.store.worker_set(k, migrating_bytes(256) as ObjectSize, SetEvent::Fresh, &mut s.log.borrow_mut());
+				s.drain_migrations();
+
+				let tier = s.tier_of(k).expect("linked");
+				let before = s.policy_snapshot();
+				let (len, linked) = (s.len(), s.linked());
+
+				let taken = match reap {
+					false => s.take_if(&k, |_| true),
+					true => s.take_if(&k, |object| object.is_expired()),
+				};
+
+				let what = format!("{order:?} {tier:?} {}", if reap { "reap" } else { "delete" });
+
+				assert!(taken.is_some(), "{what}: nothing taken");
+				assert_same_policy_state(&before, &s.policy_snapshot(), &what);
+				assert!(s.get_ref(&k).is_none(), "{what}: the value is still readable");
+				assert_eq!((s.len(), s.linked()), (len - 1, linked), "{what}: map and link counts");
+
+				{
+					let g = s.shards[shard_of(k)].read().unwrap();
+					assert!(g.find_dead(k).is_some(), "{what}: no DEAD slot on the list");
+				}
+
+				let (fast, slow) = unfolded(&s, k);
+				let m = migrating_bytes(256) as i64;
+
+				match tier {
+					Tier::Fast => assert_eq!((fast, slow), (-m, 0), "{what}"),
+					Tier::Slow => assert_eq!((fast, slow), (0, -m), "{what}"),
+				}
+
+				s.verify_charges(false);
+
+				// The worker's `Del` / `Expire` retires it.
+				assert!(s.retire_dead(k), "{what}: nothing to retire");
+				s.verify_charges(true);
+			}
+		}
+	}
+
 	// ── MergedOrder::Lfu ─────────────────────────────────────────────────
 
 	/// A store whose order is LFU, set BEFORE anything is inserted.
@@ -4447,13 +5409,13 @@ mod tests {
 	/// touching. `MergedStackHandle::new` installs the order once at startup
 	/// for exactly this reason, and `freq_link`'s `debug_assert!` is what
 	/// catches the mistake.
-	fn lfu(fast_capacity: CacheSize) -> Store {
+	fn lfu(fast_capacity: CacheSize) -> Driven {
 		let s = Store::new();
 
 		s.set_order(MergedOrder::Lfu);
 		s.configure_tiering(fast_capacity, 0, DEFAULT_HIGH_PPM, DEFAULT_LOW_PPM);
 
-		s
+		Driven::new(s)
 	}
 
 	/// A live key's frequency count, straight out of the slot.
@@ -4831,19 +5793,22 @@ mod tests {
 				let s = Arc::clone(&s);
 
 				std::thread::spawn(move || {
+					// Each thread both publishes and links -- a client and a
+					// worker in one -- with a log of its own.
+					let mut log = MigrationLog::default();
+
 					for i in 1..=1_000u64 {
 						let key = mix(t * 1_000_000 + i);
 
-						s.insert(key, Object::new(key, &[0u8; 128], None));
-						s.record_size(key, 128, 0);
-						s.touch(mix(t * 1_000_000 + (i / 2).max(1)));
+						put_with(&s, &mut log, key, 128);
+						s.touch(mix(t * 1_000_000 + (i / 2).max(1)), &mut log);
 
 						if i % 13 == 0 {
 							s.remove_key(mix(t * 1_000_000 + i / 13));
 						}
 
 						if i % 101 == 0 {
-							s.resize_fast_tier(32 * 1_024 * (1 + i % 3));
+							s.resize_fast_tier(32 * 1_024 * (1 + i % 3), &mut log);
 						}
 					}
 				})
@@ -4968,11 +5933,12 @@ mod measure {
 
 		let base = allocated_bytes();
 		let store: MergedStore<u64, crate::BufferDRAM> = MergedStore::new();
+		let mut log = MigrationLog::default();
 
 		for i in 0..n {
 			let k = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
 			store.insert(k, Object::new(k, &vec![0u8; vsize], None));
-			store.record_size(k, (vsize + 16) as ObjectSize, 16);
+			store.worker_set(k, (vsize + 16) as ObjectSize, SetEvent::Fresh, &mut log);
 		}
 
 		let after = allocated_bytes();

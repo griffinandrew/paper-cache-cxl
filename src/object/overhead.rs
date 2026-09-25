@@ -247,8 +247,59 @@ const MERGED_STORE_STRUCTURE_OVERHEAD: ObjectSize = 46;
 /// `DOUBLE_COUNTED_IN_BASE_SIZE` and nothing else.
 #[cfg(feature = "merged_object_store")]
 pub fn get_policy_overhead(_policy: &PaperPolicy) -> ObjectSize {
+	#[cfg(all(test, feature = "hybrid_cache_common"))]
+	if let Some(overhead) = test_overheads::policy() {
+		return overhead;
+	}
+
 	MERGED_STORE_STRUCTURE_OVERHEAD + VALUE_ALLOCATION_OVERHEAD
 		- DOUBLE_COUNTED_IN_BASE_SIZE
+}
+
+/// Test support: the two per-object constants that differ between the object
+/// stores -- the fast-tier reservation, omega (`get_hybrid_dram_shared_overhead`)
+/// and the per-object overhead `used_size` adds (`get_policy_overhead`) --
+/// overridden for the calling thread while a `Guard` lives. T14 sets both, so
+/// the stores' decisions are compared with neither a data-structure cost that
+/// differs by design nor an eviction trigger that fires at a different op. A
+/// thread-local rather than the environment (`PAPER_DISABLE_SHARED_OVERHEAD`):
+/// the lib's tests run in parallel, on threads of one process.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+pub(crate) mod test_overheads {
+	use std::cell::Cell;
+
+	use super::ObjectSize;
+
+	thread_local! {
+		static OMEGA: Cell<Option<ObjectSize>> = const { Cell::new(None) };
+		static POLICY: Cell<Option<ObjectSize>> = const { Cell::new(None) };
+	}
+
+	pub(crate) fn omega() -> Option<ObjectSize> {
+		OMEGA.with(Cell::get)
+	}
+
+	pub(crate) fn policy() -> Option<ObjectSize> {
+		POLICY.with(Cell::get)
+	}
+
+	/// Both overrides, for this thread, until the guard drops.
+	#[must_use]
+	pub(crate) fn set(omega: ObjectSize, policy: ObjectSize) -> Guard {
+		OMEGA.with(|cell| cell.set(Some(omega)));
+		POLICY.with(|cell| cell.set(Some(policy)));
+
+		Guard
+	}
+
+	pub(crate) struct Guard;
+
+	impl Drop for Guard {
+		fn drop(&mut self) {
+			OMEGA.with(|cell| cell.set(None));
+			POLICY.with(|cell| cell.set(None));
+		}
+	}
 }
 
 /// MEASURED_STACK marker: the per-policy terms below are measured, not
@@ -312,6 +363,11 @@ pub fn get_policy_overhead(_policy: &PaperPolicy) -> ObjectSize {
 /// against.
 #[cfg(not(feature = "merged_object_store"))]
 pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
+	#[cfg(all(test, feature = "hybrid_cache_common"))]
+	if let Some(overhead) = test_overheads::policy() {
+		return overhead;
+	}
+
 	// Each arm is <this policy's eviction-stack cost> + the object-map row.
 	// The stack terms are measured (see the MEASURED_STACK note above); the row
 	// term is measured too (see `OBJECT_MAP_ENTRY_OVERHEAD`).
@@ -1158,6 +1214,11 @@ pub(crate) fn resident_object_bytes<K>(value_len: ObjectSize) -> ObjectSize {
 
 #[cfg(feature = "hybrid_cache_common")]
 pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
+	#[cfg(all(test, feature = "hybrid_cache_common"))]
+	if let Some(omega) = test_overheads::omega() {
+		return omega;
+	}
+
 	// Test support: the tier-mechanics integration tests choreograph
 	// promotions and demotions with fast-tier budgets of tens of bytes,
 	// where the ~75 B/object metadata reservation below exceeds the whole

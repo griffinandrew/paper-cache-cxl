@@ -79,12 +79,15 @@ pub fn admission_tier<K>(
 		// physically held objects the stack believed were in PMEM, and 63% of
 		// promotions were declined as "already in the requested tier".
 		//
-		// The latch is a MIRROR the worker refreshes once per pass, so a burst
-		// of new keys can still outrun it and be built fast after the stack
-		// has latched. The `Set` event carries the tier built here, and the
-		// policy worker's reconcile queues the correction (S3). The same holds
-		// for every arm that reads an existing key's PHYSICAL tier: a
-		// migration of the key can land between that read and the insert.
+		// The latch is the stack's, as the worker PUBLISHED it: right after
+		// the event that moved it (`PolicyWorker::publish_admission_latch`),
+		// for the DashMap LFU stack and the merged store's LFU order alike. A
+		// burst of new keys can still outrun it -- the keys set before the
+		// worker reached the `Set` that latched are built fast -- and the
+		// `Set` event carries the tier built here, so the policy worker's
+		// reconcile queues the correction (S3). The same holds for every arm
+		// that reads an existing key's PHYSICAL tier: a migration of the key
+		// can land between that read and the insert.
 		PaperPolicy::LfuCompactHybrid => {
 			match objects.get_ref(&hashed_key) {
 				Some(object) => match object.value().is_fast() {

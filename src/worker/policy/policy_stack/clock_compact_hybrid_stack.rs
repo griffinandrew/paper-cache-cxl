@@ -57,8 +57,8 @@
 use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
-		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
-		HashedKey, PolicyStack, Tier,
+		arena_queue_set::{ArenaQueueSet, NodePayload}, clock_hand_budget, narrow_resident,
+		drain_target, CacheSize, HashedKey, PolicyStack, Tier,
 	},
 	PaperPolicy,
 };
@@ -373,11 +373,20 @@ impl PolicyStack for ClockCompactHybridStack {
 	/// `ClockCompactStack::evict_one`'s loop, with the tier accounting the flat
 	/// stack has nothing to do. Terminates in at most `len()` second chances:
 	/// each one clears a bit, and nothing in the loop sets one.
+	///
+	/// Capped all the same, at `clock_hand_budget(len)` second chances, after
+	/// which the tail is evicted whatever its bit -- the cap the merged store's
+	/// hand has, so the two stop at the same point. By the argument above it
+	/// cannot fire; it changes no eviction.
 	fn evict_one(&mut self) -> Option<HashedKey> {
+		let mut budget = clock_hand_budget(self.list.len());
+
 		loop {
 			let key = self.list.back(Q_CLOCK)?;
 
-			if self.referenced(key) {
+			if budget > 0 && self.referenced(key) {
+				budget -= 1;
+
 				// Cleared and recycled to the FRONT -- CLOCK, not SIEVE. See
 				// the module doc.
 				self.set_referenced(key, false);

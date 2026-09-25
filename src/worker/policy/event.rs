@@ -50,7 +50,7 @@ impl StackEvent {
 			// policy's stack after a switch, and flat stacks have no tiers.
 			WorkerEvent::Set(key, size, resident, _, _, _, _) => StackEvent::Set(*key, *size, *resident),
 			WorkerEvent::Del(key, _) => StackEvent::Del(*key),
-			WorkerEvent::Wipe => StackEvent::Wipe,
+			WorkerEvent::Wipe(_) => StackEvent::Wipe,
 			WorkerEvent::Resize(size) => StackEvent::Resize(*size),
 
 			_ => return None,

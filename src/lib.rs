@@ -1264,6 +1264,9 @@ where
 	/// Deletes all objects in the cache and sets the cache's used size to zero.
 	/// Returns a [`CacheError`] if the objects could not be wiped.
 	///
+	/// The policy worker does it, and this returns when it has (see the tiered
+	/// cache's `wipe`).
+	///
 	/// # Examples
 	/// ```
 	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
@@ -1279,19 +1282,37 @@ where
 	pub fn wipe(&self) -> Result<(), CacheError> {
 		info!("Wiping cache");
 
-		self.objects.clear();
+		// The policy worker wipes -- the object map, its stack, the status
+		// counters and the tier gauges -- and answers when it is done
+		// (`PolicyWorker::handle_wipe`); this thread waits for the answer. It
+		// used to clear the map and the status here and leave the stack to
+		// the worker, and a `Set` the worker handled in between left a live
+		// key its stack no longer tracked. The kick wakes a worker parked on
+		// its idle poll (up to 1 s); the wait still includes the events queued
+		// ahead of the `Wipe`. The values `clear` drops retire into the
+		// worker's epoch bag, which its pass flushes.
+		let (ack, done) = crossbeam_channel::bounded(1);
+		let sent = self.broadcast(WorkerEvent::Wipe(Some(ack)));
 
-		// `clear` drops every object, and each drop DEFERS its value's free
-		// rather than performing it (see `value::defer_free`). Without this,
-		// a whole cache's worth of garbage sits in this thread's local bag
-		// until it happens to pin enough more times to fill it -- so a wipe
-		// followed by an idle period would return no memory at all.
+		self.status.kick_policy_worker();
 
-		self.status.clear();
+		match done.recv() {
+			// Wiped. A failed delivery to another subscriber (a dead TTL
+			// worker) is still reported, as it always was.
+			Ok(()) => sent,
 
-		self.broadcast(WorkerEvent::Wipe)?;
+			// Every sender is gone without an answer: the policy worker is dead
+			// (its channel dropped, with the event in it) and the other
+			// subscribers have handled or dropped their copies -- the TTL
+			// worker within its poll, 1 s at most. Wipe here so the cache is
+			// empty all the same, and say it failed.
+			Err(_) => {
+				self.objects.clear();
+				self.status.clear();
 
-		Ok(())
+				Err(CacheError::Internal)
+			},
+		}
 	}
 
 	/// Resizes the cache to the supplied maximum size.
@@ -1785,19 +1806,37 @@ where
 	pub fn wipe(&self) -> Result<(), CacheError> {
 		info!("Wiping cache");
 
-		self.objects.clear();
+		// The policy worker wipes -- the object map, its stack, the status
+		// counters and the tier gauges -- and answers when it is done
+		// (`PolicyWorker::handle_wipe`); this thread waits for the answer. It
+		// used to clear the map and the status here and leave the stack to
+		// the worker, and a `Set` the worker handled in between left a live
+		// key its stack no longer tracked. The kick wakes a worker parked on
+		// its idle poll (up to 1 s); the wait still includes the events queued
+		// ahead of the `Wipe`. The values `clear` drops retire into the
+		// worker's epoch bag, which its pass flushes.
+		let (ack, done) = crossbeam_channel::bounded(1);
+		let sent = self.broadcast(WorkerEvent::Wipe(Some(ack)));
 
-		// `clear` drops every object, and each drop DEFERS its value's free
-		// rather than performing it (see `value::defer_free`). Without this,
-		// a whole cache's worth of garbage sits in this thread's local bag
-		// until it happens to pin enough more times to fill it -- so a wipe
-		// followed by an idle period would return no memory at all.
+		self.status.kick_policy_worker();
 
-		self.status.clear();
+		match done.recv() {
+			// Wiped. A failed delivery to another subscriber (a dead TTL
+			// worker) is still reported, as it always was.
+			Ok(()) => sent,
 
-		self.broadcast(WorkerEvent::Wipe)?;
+			// Every sender is gone without an answer: the policy worker is dead
+			// (its channel dropped, with the event in it) and the other
+			// subscribers have handled or dropped their copies -- the TTL
+			// worker within its poll, 1 s at most. Wipe here so the cache is
+			// empty all the same, and say it failed.
+			Err(_) => {
+				self.objects.clear();
+				self.status.clear();
 
-		Ok(())
+				Err(CacheError::Internal)
+			},
+		}
 	}
 
 	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
@@ -1964,17 +2003,25 @@ where
 // merged_erase_marker
 /// `erase` for the merged store.
 ///
-/// Two differences from the DashMap version below, both consequences of the
-/// map and the eviction order being one structure:
+/// The arms map onto who is removing, because in this store a removal is
+/// policy work only on the policy worker:
 ///
-///   * removal cannot desynchronise them. `MergedStore::take` unlinks from the
-///     LRU in the same operation that removes from the index, so the
-///     map-greater-than-stack divergence `ERASE_FALLBACK` counts has no way to
-///     occur here.
-///   * the no-key fallback evicts the LRU TAIL rather than an arbitrary object.
-///     The DashMap version takes `objects.iter().next()` because it has no
-///     access to the eviction order; this store IS the eviction order, so the
-///     correct victim is right there.
+///   * `Original` (a client's `del`) and `Expired` (the TTL reaper) are the
+///     CLIENT's `MergedStore::take_if`: a value the worker has not linked is
+///     freed, a linked one goes DEAD -- its object gone, its slot left on the
+///     list for the worker to retire at the `Del`/`Expire` that follows, as a
+///     DashMap stack keeps a deleted key until its `Del` -- and no policy state
+///     moves;
+///   * `Hashed` (the eviction `apply_evictions` pairs with a nomination) is the
+///     WORKER's `MergedStore::take_evict`, which unlinks and uncharges in the
+///     same operation that removes from the index, so the map-greater-than-
+///     stack divergence `ERASE_FALLBACK` counts has no way to occur; it
+///     refuses a value the worker has not linked, which is then
+///     `KeyNotFound`;
+///   * the no-key fallback takes the LRU TAIL rather than an arbitrary object
+///     -- `oldest_linked_key`, read-only -- since this store IS the eviction
+///     order. Reachable only from `apply_mini_evictions`, which a merged build
+///     never runs.
 #[cfg(feature = "merged_object_store")]
 pub fn erase<K, V>(
 	objects: &ObjectMapRef<K, V>,
@@ -1993,7 +2040,7 @@ where
 		None => {
 			crate::ERASE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-			let Some(key) = objects.tail_key() else {
+			let Some(key) = objects.oldest_linked_key() else {
 				error!("Object store is empty with non-zero used size");
 				return Err(CacheError::Internal);
 			};
@@ -2014,7 +2061,7 @@ where
 		Some(EraseKey::Expired(_)) =>
 			objects.take_if(&hashed_key, |object| object.is_expired()),
 
-		Some(EraseKey::Hashed(_)) | None => objects.take(&hashed_key),
+		Some(EraseKey::Hashed(_)) | None => objects.take_evict(&hashed_key),
 	};
 
 	let Some(object) = taken else {
@@ -2780,22 +2827,48 @@ where
 	}
 
 	/// Deletes all objects in the cache and sets the cache's used size to zero.
+	///
+	/// The policy worker does it -- the object map, its stack, the status
+	/// counters and the tier gauges -- and this returns when it has: at once
+	/// after it the cache reads empty, and a set racing it cannot leave a key
+	/// in the map that the stack does not track. It waits for the events queued
+	/// ahead of the wipe; a worker idle on its long poll is kicked. `Err` if the
+	/// policy worker is gone (the cache is then wiped here), or if another
+	/// worker could not be told.
 	pub fn wipe(&self) -> Result<(), CacheError> {
 		info!("Wiping cache");
 
-		self.objects.clear();
+		// The policy worker wipes -- the object map, its stack, the status
+		// counters and the tier gauges -- and answers when it is done
+		// (`PolicyWorker::handle_wipe`); this thread waits for the answer. It
+		// used to clear the map and the status here and leave the stack to
+		// the worker, and a `Set` the worker handled in between left a live
+		// key its stack no longer tracked. The kick wakes a worker parked on
+		// its idle poll (up to 1 s); the wait still includes the events queued
+		// ahead of the `Wipe`. The values `clear` drops retire into the
+		// worker's epoch bag, which its pass flushes.
+		let (ack, done) = crossbeam_channel::bounded(1);
+		let sent = self.broadcast(WorkerEvent::Wipe(Some(ack)));
 
-		// `clear` drops every object, and each drop DEFERS its value's free
-		// rather than performing it (see `value::defer_free`). Without this,
-		// a whole cache's worth of garbage sits in this thread's local bag
-		// until it happens to pin enough more times to fill it -- so a wipe
-		// followed by an idle period would return no memory at all.
+		self.status.kick_policy_worker();
 
-		self.status.clear();
+		match done.recv() {
+			// Wiped. A failed delivery to another subscriber (a dead TTL
+			// worker) is still reported, as it always was.
+			Ok(()) => sent,
 
-		self.broadcast(WorkerEvent::Wipe)?;
+			// Every sender is gone without an answer: the policy worker is dead
+			// (its channel dropped, with the event in it) and the other
+			// subscribers have handled or dropped their copies -- the TTL
+			// worker within its poll, 1 s at most. Wipe here so the cache is
+			// empty all the same, and say it failed.
+			Err(_) => {
+				self.objects.clear();
+				self.status.clear();
 
-		Ok(())
+				Err(CacheError::Internal)
+			},
+		}
 	}
 
 	/// Resizes the cache's overall maximum size.
@@ -2926,6 +2999,10 @@ where
 		let (reply, answer) = crossbeam_channel::bounded(1);
 
 		self.broadcast(WorkerEvent::Audit(reply)).ok()?;
+
+		// A worker parked on its idle poll would otherwise take up to 1 s to
+		// see the request.
+		self.status.kick_policy_worker();
 
 		answer.recv().ok()
 	}

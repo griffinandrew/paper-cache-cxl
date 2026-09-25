@@ -211,8 +211,7 @@ pub enum Tier {
 /// promotion or a demotion in the paper's sense -- or the reconcile, as a
 /// CORRECTIVE that moves a value's bytes to where the stack already places
 /// its key (the policy worker's correctives, `Observed` in
-/// `worker/policy/mod.rs`, and the merged store's client-side push for a new
-/// key built in another tier than the store decided). The tag travels with
+/// `worker/policy/mod.rs` -- the only ones, in every store). The tag travels with
 /// the entry through `split_tier_migrations` and the migration queue, so a
 /// completed corrective is counted as `RECONCILE_APPLIED_TO_*` and never as a
 /// promotion or a demotion: it displaced nothing.
@@ -287,6 +286,58 @@ pub(crate) fn narrow_resident(resident: ObjectSize) -> u8 {
 	resident.min(u8::MAX as ObjectSize) as u8
 }
 
+/// What a `Set` did to the object map, as the policy worker tells a stack in
+/// `PolicyStack::insert_set`: the map insert replaced nothing (`Fresh`), or
+/// it replaced a value -- and whether the base size changed (`resized`), the
+/// DashMap FIFO and CLOCK stacks' criterion for settling after an overwrite
+/// (they compare their stored size, the previous value's, with the new one).
+/// Built from the event's `previous` (`PolicyWorker::handle_set`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetEvent {
+	Fresh,
+	Replaced { resized: bool },
+}
+
+/// How many second chances a CLOCK hand may grant in one `evict_one` before
+/// it evicts whatever is at the tail: `2 * len + 8`. A liveness guard, not a
+/// policy: sequentially a hand makes at most as many second chances as there
+/// are set bits, since each one clears a bit and nothing inside `evict_one`
+/// sets one -- and every stack's bits are set only on the policy worker, the
+/// thread running the hand. Shared by `ClockCompactHybridStack` and the
+/// merged store's `clock_victim`, so both stop at the same point.
+pub(crate) fn clock_hand_budget(len: usize) -> usize {
+	#[cfg(test)]
+	if let Some(budget) = hand_budget_override::get() {
+		return budget;
+	}
+
+	len.saturating_mul(2).saturating_add(8)
+}
+
+/// Test support: `clock_hand_budget`'s answer, overridden for the calling
+/// thread while `with` runs -- how a test shows a hand that stops at its
+/// budget, which no real sequence reaches.
+#[cfg(test)]
+pub(crate) mod hand_budget_override {
+	use std::cell::Cell;
+
+	thread_local! {
+		static BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
+	}
+
+	pub(crate) fn get() -> Option<usize> {
+		BUDGET.with(Cell::get)
+	}
+
+	#[cfg(feature = "hybrid_cache_common")]
+	pub(crate) fn with<R>(budget: usize, f: impl FnOnce() -> R) -> R {
+		let previous = BUDGET.with(|cell| cell.replace(Some(budget)));
+		let out = f();
+		BUDGET.with(|cell| cell.set(previous));
+		out
+	}
+}
+
 pub trait PolicyStack
 where
 	Self: Send,
@@ -308,6 +359,19 @@ where
 		let _ = dram_resident;
 		self.insert(key, size);
 	}
+
+	/// The policy worker's handling of a `Set`: `insert_resident`, told what
+	/// the map insert did (`SetEvent`). Every stack that owns its own index
+	/// already knows whether it tracks the key and its previous size, so the
+	/// default ignores `event`. The merged store's handle is the one override:
+	/// its index is the object map, which the client has already written, so
+	/// the event is how it tells a first `Set` from an overwrite -- see
+	/// `MergedStore::worker_set`.
+	fn insert_set(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, event: SetEvent) {
+		let _ = event;
+		self.insert_resident(key, size, dram_resident);
+	}
+
 	fn update(&mut self, _key: HashedKey) {}
 	fn record_access(&mut self, key: HashedKey, hit: bool) -> AccessOutcome {
 		if hit {
@@ -317,6 +381,16 @@ where
 		AccessOutcome::None
 	}
 	fn remove(&mut self, key: HashedKey);
+
+	/// Whether `remove` removes only a DELETED entry and never a live key's,
+	/// so `PolicyWorker::handle_expire` calls it whatever the object map holds
+	/// by then. `false` for every stack but the merged store's handle, whose
+	/// `remove` retires one DEAD slot of the key (`MergedStore::retire_dead`):
+	/// the others keep one entry per key, which after a re-set belongs to the
+	/// live value, so `handle_expire` guards on the map no longer holding it.
+	fn remove_is_retire(&self) -> bool {
+		false
+	}
 
 	fn resize(&mut self, _size: CacheSize) {}
 	fn clear(&mut self);
@@ -349,9 +423,8 @@ where
 	/// entry a stack drains is its own policy decision
 	/// (`MigrationOrigin::Stack`), so the default tags the drain and does
 	/// nothing else -- in place: the tagged entry is the same size. The
-	/// merged store's handle overrides it, because its drain also carries the
-	/// correctives its clients push for a new key built in another tier than
-	/// the store decided (`MigrationOrigin::Reconcile`).
+	/// merged store's handle overrides it only because its log is kept tagged
+	/// already (`MigrationLog`).
 	#[cfg(any(feature = "hybrid_cache_common", feature = "merged_object_store"))]
 	fn drain_tagged_migrations(&mut self) -> Vec<TaggedMigration> {
 		self.drain_tier_migrations().into_iter().map(|entry| entry.tagged()).collect()
@@ -418,7 +491,9 @@ where
 	/// object-map row, eviction-stack node and value header are still in DRAM
 	/// -- and `get_hybrid_dram_shared_overhead` already leaves out whichever of
 	/// those a build places in PMEM, so the count must not discount them again
-	/// by tier. `MergedStore` charges the same `len() x shared_overhead`.
+	/// by tier. `MergedStore` charges the same, `linked() x shared_overhead`:
+	/// the keys its policy worker has linked, which is what a DashMap stack's
+	/// `len()` counts.
 	/// Charging fast objects only was tried and reverted: on cluster35 (DashMap
 	/// LRU, 5 GiB fast tier) it reserved 313.6 MB against 896.7 MB of real
 	/// metadata, and fast data plus metadata came to 5,851 MB in a 5,369 MB

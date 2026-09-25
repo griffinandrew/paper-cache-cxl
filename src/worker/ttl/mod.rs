@@ -80,7 +80,7 @@ where
 						self.expiries.insert(key, new_expiry);
 					},
 
-					WorkerEvent::Wipe => self.expiries.clear(),
+					WorkerEvent::Wipe(_) => self.expiries.clear(),
 
 					WorkerEvent::Shutdown => return Ok(()),
 
