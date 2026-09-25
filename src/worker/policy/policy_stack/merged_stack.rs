@@ -47,9 +47,9 @@
 //! erase unlinked the slot itself.)
 //!
 //! A wipe is the worker's too (`PolicyWorker::handle_wipe`: the map -- this
-//! store's `clear` -- then the stack, then the status, before it answers the
-//! waiting `PaperCache::wipe`), so `clear` has only the undrained log left to
-//! drop. It used to be a no-op, because the client cleared the map and a
+//! store's `clear_counted` -- and the status, which takes off what it removed,
+//! then the stack, before it answers the waiting `PaperCache::wipe`), so
+//! `clear` has only the undrained log left to drop. It used to be a no-op, because the client cleared the map and a
 //! worker-side clear of it would have destroyed a `set()` landing between the
 //! two; with the whole wipe on the worker, and `wipe()` returning only when it
 //! is done, there is no such window.
@@ -284,8 +284,9 @@ where
 		true
 	}
 
-	/// The worker's `Wipe` clears the store itself (`MergedStore::clear`, as
-	/// the object map); what is left of the stack is the undrained log.
+	/// The worker's `Wipe` clears the store itself (`MergedStore::
+	/// clear_counted`, as the object map); what is left of the stack is the
+	/// undrained log.
 	fn clear(&mut self) {
 		self.log = MigrationLog::default();
 	}

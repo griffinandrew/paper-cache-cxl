@@ -1928,6 +1928,13 @@ pub struct PolicyWorker<K, V> {
 	#[cfg(test)]
 	evicted: Option<Vec<HashedKey>>,
 
+	/// Test builds, merged store: how many eviction passes stopped over a
+	/// REALLY empty store with `used_size` still over the cache's size -- the
+	/// error `apply_evictions` logs (`log` has no logger in this crate's own
+	/// binaries, so a test reads this instead).
+	#[cfg(all(test, feature = "merged_object_store"))]
+	nothing_left_to_evict: u32,
+
 	/// Test builds: when `Some`, every drain `apply_tier_migrations` applies,
 	/// reconcile included, in order -- T14 compares them across stores.
 	#[cfg(all(test, feature = "hybrid_cache_common"))]
@@ -2278,6 +2285,9 @@ where
 			#[cfg(test)]
 			evicted: None,
 
+			#[cfg(all(test, feature = "merged_object_store"))]
+			nothing_left_to_evict: 0,
+
 			#[cfg(all(test, feature = "hybrid_cache_common"))]
 			drained: None,
 		};
@@ -2418,6 +2428,9 @@ where
 
 			#[cfg(test)]
 			evicted: None,
+
+			#[cfg(all(test, feature = "merged_object_store"))]
+			nothing_left_to_evict: 0,
 
 			#[cfg(all(test, feature = "hybrid_cache_common"))]
 			drained: None,
@@ -2725,28 +2738,33 @@ where
 	}
 
 	/// Empties the cache, on this thread, and then answers `ack` -- which
-	/// `PaperCache::wipe` waits on. The object map, then the stack, then the
-	/// status counters (the LFU latch mirror among them), the mini stacks and,
-	/// on a tiered cache, the tier gauges and the latch, republished from the
-	/// empty stack: so when `wipe` returns, `hybrid_stats` already reads an
-	/// empty cache, and a `Set` this worker handled before the `Wipe` cannot
-	/// have left a live key its stack no longer tracks (the map is cleared
-	/// with it). Under the merged store the map IS the stack, and its
-	/// worker-owned state -- the link count, the latch, the DEAD slots -- has
-	/// one writer.
+	/// `PaperCache::wipe` waits on. The object map and, at once, the status
+	/// (`AtomicStatus::clear`: what the map's clear removed is SUBTRACTED
+	/// from the object count and the base size, so a client's insert racing
+	/// the clear stays counted exactly -- removed and taken off, or live and
+	/// kept -- and every counter reset, the LFU latch mirror among them);
+	/// then the stack, the mini stacks and, on a tiered cache, the tier gauges
+	/// and the latch, republished from the empty stack: so when `wipe`
+	/// returns, `hybrid_stats` already reads an empty cache, and a `Set` this
+	/// worker handled before the `Wipe` cannot have left a live key its stack
+	/// no longer tracks (the map is cleared with it). Under the merged store
+	/// the map IS the stack, and its worker-owned state -- the link count, the
+	/// latch, the DEAD slots -- has one writer.
 	///
 	/// What can still diverge is a value published before this clear whose
 	/// `Set` is behind the `Wipe` in the channel: cleared with the map here,
 	/// its `Set` then finds nothing in the merged store; a DashMap stack
 	/// inserts it anyway, a ghost entry evicted later as `KeyNotFound`.
 	fn handle_wipe(&mut self, ack: Option<&Sender<()>>) {
-		self.objects.clear();
+		let overhead_manager = &self.overhead_manager;
+		let cleared = self.objects.clear_counted(|object| overhead_manager.base_size(object));
+
+		self.status.clear(cleared);
 
 		if let Some(stack) = &mut self.policy_stack {
 			stack.clear();
 		}
 
-		self.status.clear();
 		self.mini_stack_manager.handle_wipe();
 
 		#[cfg(feature = "hybrid_cache_common")]
@@ -3295,12 +3313,23 @@ where
 			// LINKED is left, while `used_size` still counts what clients have
 			// published and this worker has not linked yet -- values whose
 			// `Set` arrives after this pass, which never evicts an unlinked
-			// value (`take_evict`). The pass stops; the next links them and
-			// evicts. (Or the store is genuinely empty and `erase` could only
-			// fail.) Without this the loop `continue`s on unchanged state
-			// forever.
+			// value (`take_evict`). The pass stops, silently; the next links
+			// them and evicts. Without this the loop `continue`s on unchanged
+			// state forever. A store with NOTHING in it -- no unlinked value
+			// either -- and `used_size` still over the size is an accounting
+			// bug, not a backlog: the pass stops and says so, as it did before
+			// unlinked values existed.
 			#[cfg(feature = "merged_object_store")]
 			if maybe_key.is_none() {
+				if self.objects.len() == 0 {
+					error!("Nothing left to evict with used_size still over max");
+
+					#[cfg(test)]
+					{
+						self.nothing_left_to_evict += 1;
+					}
+				}
+
 				break;
 			}
 
@@ -4733,7 +4762,7 @@ mod migration_accounting_tests {
 
 			// Removed between the stack emitting the migration and the copy
 			// being applied -- the `objects.get_ref` miss.
-			objects.clear();
+			objects.clear_counted(|_| 0);
 
 			worker.apply_migration_batches(
 				vec![(1, Tier::Slow), (2, Tier::Fast)],
@@ -6083,6 +6112,11 @@ mod phys_transient_tests {
 // and the uniform differential (T14) over both stores.
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod s4_tests;
+
+// S4's follow-ups: a flat cache over the merged store through a real worker,
+// reaper and wipe -- in every merged build, the flat-merged one included.
+#[cfg(all(test, feature = "merged_object_store"))]
+mod flat_merged_tests;
 
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod reconcile_tests {

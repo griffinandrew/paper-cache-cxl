@@ -32,6 +32,26 @@ use crate::{
 #[cfg(feature = "hybrid_cache_common")]
 use crate::hybrid_stats::HybridStats;
 
+/// What a clear of the object map removed, in the two figures the status keeps
+/// per object: the objects, and their base bytes (`OverheadManager::
+/// base_size`). Counted by the clear itself, under the lock that removes each
+/// object (`ObjectStore::clear_counted`, `MergedStore::clear_counted`), for
+/// `AtomicStatus::clear` to take off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cleared {
+	pub objects: u64,
+	pub base_bytes: CacheSize,
+}
+
+/// A figure the status keeps as a sum of signed changes, read as the signed
+/// number it is and clamped at zero. See `AtomicStatus::clear`: a change can
+/// land ahead of the one it offsets, so for that moment the sum is below zero
+/// -- a wrapped `u64` -- and it reads as nothing rather than as 2^64 less a
+/// little.
+fn signed_or_zero(value: u64) -> u64 {
+	(value as i64).max(0) as u64
+}
+
 /// Loads the active design's tier counters and gauges into [`HybridStats`].
 ///
 /// One accessor serves every design: the per-design `<design>_hybrid_stats()`
@@ -491,10 +511,13 @@ impl AtomicStatus {
 		self.max_size.load(Ordering::Relaxed)
 	}
 
+	/// The base bytes of every object plus the policy's per-object overhead,
+	/// each figure clamped at zero (`signed_or_zero`: an insert's own update
+	/// can trail a clear that already took its object off).
 	#[must_use]
 	pub fn used_size(&self, policy: &PaperPolicy) -> CacheSize {
-		let base_used_size = self.base_used_size.load(Ordering::Acquire);
-		let num_objects = self.num_objects.load(Ordering::Acquire);
+		let base_used_size = signed_or_zero(self.base_used_size.load(Ordering::Acquire));
+		let num_objects = signed_or_zero(self.num_objects.load(Ordering::Acquire));
 		let policy_overhead = get_policy_overhead(policy);
 
 		base_used_size + num_objects * policy_overhead as CacheSize
@@ -548,9 +571,10 @@ impl AtomicStatus {
 	}
 
 	/// INSTRUMENTATION: live object count on the atomic status, for the
-	/// map-vs-stack divergence sampler in the policy worker.
+	/// map-vs-stack divergence sampler in the policy worker. Clamped at zero,
+	/// as `used_size` reads it.
 	pub fn live_num_objects(&self) -> u64 {
-		self.num_objects.load(Ordering::Acquire)
+		signed_or_zero(self.num_objects.load(Ordering::Acquire))
 	}
 
 	pub fn incr_num_objects(&self) {
@@ -1012,9 +1036,28 @@ impl AtomicStatus {
 
 
 
-	pub fn clear(&self) {
-		self.base_used_size.store(0, Ordering::Release);
-		self.num_objects.store(0, Ordering::Release);
+	/// Empties the status after a wipe: takes what the object map's clear
+	/// removed (`cleared`) off the object count and the base size, and
+	/// resets every counter.
+	///
+	/// SUBTRACTED, not stored as 0. A client's insert racing the clear lands
+	/// either in a shard the clear has not reached yet -- removed with it,
+	/// and in `cleared` -- or in one it has already emptied -- live, and not
+	/// in `cleared` -- and the insert's own `incr_num_objects` and
+	/// `update_base_used_size` land whenever they land; so once the clients
+	/// are quiet the two figures are exactly the map's, in every order. Stored
+	/// as 0 they were not: an insert into an already-cleared shard whose
+	/// update came before the store was live and uncounted -- its later
+	/// removal's `fetch_sub` wrapped `base_used_size`, and `used_size` was
+	/// garbage for the rest of the cache's life -- and one the clear removed
+	/// whose update came after the store stayed counted with nothing behind
+	/// it. Until an insert the clear removed has made its own update, the two
+	/// figures are below zero (wrapped), which `used_size` and
+	/// `live_num_objects` read as zero -- as a `set` and a `del` of one key
+	/// racing could already leave them.
+	pub fn clear(&self, cleared: Cleared) {
+		self.base_used_size.fetch_sub(cleared.base_bytes, Ordering::AcqRel);
+		self.num_objects.fetch_sub(cleared.objects, Ordering::AcqRel);
 
 		self.total_hits.store(0, Ordering::Relaxed);
 		self.total_gets.store(0, Ordering::Relaxed);
@@ -1066,7 +1109,7 @@ impl AtomicStatus {
 
 			max_size: self.max_size(),
 			used_size: self.used_size(&policy),
-			num_objects: self.num_objects.load(Ordering::Acquire),
+			num_objects: self.live_num_objects(),
 
 			rss,
 			hwm,
@@ -1110,8 +1153,10 @@ mod tests {
 	use std::sync::atomic::Ordering;
 
 	use crate::{
+		CacheSize,
 		PaperPolicy,
-		status::AtomicStatus,
+		object::overhead::get_policy_overhead,
+		status::{AtomicStatus, Cleared},
 	};
 
 	#[test]
@@ -1135,7 +1180,7 @@ mod tests {
 		assert_eq!(status.total_sets.load(Ordering::Relaxed), 1);
 		assert_eq!(status.total_dels.load(Ordering::Relaxed), 1);
 
-		status.clear();
+		status.clear(Cleared { objects: 1, base_bytes: 1 });
 
 		assert_eq!(status.base_used_size.load(Ordering::Acquire), 0);
 		assert_eq!(status.num_objects.load(Ordering::Acquire), 0);
@@ -1143,6 +1188,53 @@ mod tests {
 		assert_eq!(status.total_hits.load(Ordering::Relaxed), 0);
 		assert_eq!(status.total_sets.load(Ordering::Relaxed), 0);
 		assert_eq!(status.total_dels.load(Ordering::Relaxed), 0);
+	}
+
+	/// A wipe's clear takes off what the map's clear removed, so a client's
+	/// insert racing it ends counted exactly, whichever side of the clear it
+	/// landed on; and while the insert's own update is still to come the two
+	/// figures are below zero, which the readers take as zero. Red with the
+	/// figures stored as 0 (`wipestorezero`: the removed insert's update then
+	/// leaves one object counted) and with the clamp off (`noclamp`: the
+	/// readers see 2^64 less a little).
+	#[test]
+	fn a_clear_takes_off_what_the_map_removed_and_a_racing_insert_ends_exact() {
+		let policy = PaperPolicy::Lfu;
+		let status = AtomicStatus::new(1_000_000, &[policy], policy).expect("a status");
+		let overhead = get_policy_overhead(&policy) as CacheSize;
+
+		// Two objects set and counted; a third inserted into the map, its own
+		// update not made yet.
+		for _ in 0..2 {
+			status.incr_num_objects();
+			status.update_base_used_size(100);
+		}
+
+		assert_eq!(status.used_size(&policy), 200 + 2 * overhead);
+
+		// The map's clear removed all three.
+		status.clear(Cleared { objects: 3, base_bytes: 300 });
+
+		assert_eq!(status.live_num_objects(), 0, "below zero, read as zero");
+		assert_eq!(status.used_size(&policy), 0, "below zero, read as zero");
+
+		// The third insert's update lands: nothing left counted.
+		status.incr_num_objects();
+		status.update_base_used_size(100);
+
+		assert_eq!((status.live_num_objects(), status.used_size(&policy)), (0, 0), "the removed insert is not counted");
+
+		// An insert into a shard the clear had already emptied: live, counted,
+		// and its removal brings both figures back to zero.
+		status.incr_num_objects();
+		status.update_base_used_size(100);
+
+		assert_eq!((status.live_num_objects(), status.used_size(&policy)), (1, 100 + overhead));
+
+		status.update_base_used_size(-100);
+		status.decr_num_objects();
+
+		assert_eq!((status.live_num_objects(), status.used_size(&policy)), (0, 0), "nothing wrapped");
 	}
 
 	#[cfg(feature = "hybrid_cache_common")]
@@ -1163,7 +1255,7 @@ mod tests {
 		assert_ne!(stats.demotions, 0);
 		assert_ne!(stats.evictions, 0);
 
-		status.clear();
+		status.clear(Cleared::default());
 
 		let stats = status.hybrid_stats();
 		assert_eq!(stats.promotions, 0);
@@ -1189,7 +1281,7 @@ mod tests {
 		let stats = status.hybrid_stats();
 		assert_eq!((stats.fast_hits, stats.slow_hits), (2, 1));
 
-		status.clear();
+		status.clear(Cleared::default());
 
 		let stats = status.hybrid_stats();
 		assert_eq!((stats.fast_hits, stats.slow_hits), (0, 0));

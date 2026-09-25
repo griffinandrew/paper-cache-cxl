@@ -146,6 +146,8 @@ src/
                                  links, charges, places, settles and retires, and wipes
                                  (a round trip wipe() waits for, in every store). The LFU
                                  latch is published with the event that moved it (U12).
+                                 Until S5, no DRAM-bound merged measurement is valid (see
+                                 "Merged-store measurements until S5" below).
       policy_stack/             One file per policy, all implementing the PolicyStack trait.
                                  The 18 *_hybrid_stack.rs files carry each design's algorithm
                                  and its full derivation in the module doc — those are the
@@ -222,6 +224,20 @@ types; `TieredBuffer` is the tagged union of them that the hybrid designs actual
 original two-PaperCache-instance S3-FIFO composition), `sets_dram`, `pmem_region_alloc`,
 `region_hybrid_allocator`, `devdax_bump`, `global_flatmap_dram`/`global_flatmap_pmem`. See the
 removal entries near the end of this file.
+
+## Merged-store measurements until S5 (read before benchmarking it)
+
+- **No DRAM-bound measurement of the merged store is valid from ad054e3 (S4) until S5's set-path
+  kick.** Since S4 its sets are linked -- charged, placed, settled -- by the policy worker when it
+  reaches their `Set`, as the DashMap stores' are, and until then a value is neither charged to
+  the fast tier nor evictable. A worker parked on its idle poll (up to 1 s) links nothing until it
+  wakes. The client-side link that bounded the merged fast tier in real time is gone; S5's kick
+  (a set wakes an idle worker) restores a bound, in both stores.
+- **The flat-merged matrix cells need rebaselining.** A flat cache over the merged store
+  (`merged_object_store` with no hybrid feature, `paper-benchmark-flat-merged`) builds the same
+  store handle (`PolicyWorker::new`), so S4 moved its linking and its evictions' candidates onto
+  the worker too; cells measured before ad054e3 describe the client-side link. The tiered merged
+  cells fall under the first point.
 
 ---
 

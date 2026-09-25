@@ -245,6 +245,7 @@ use std::{
 use crate::{
 	error::CacheError,
 	object::{Object, ObjectSize},
+	status::Cleared,
 	worker::{MigrationOrigin, SetEvent, TaggedMigration, Tier},
 	CacheSize, HashedKey, NoHasher, PaperPolicy,
 };
@@ -1947,8 +1948,8 @@ pub struct MergedStore<K, V> {
 	/// promotion rule entirely.
 	///
 	/// Written only on the policy worker -- by the settle that demotes, by an
-	/// admission it refuses, by `clear` and by a grow -- which admits here too,
-	/// so the decision never lags it. The handle's `admission_latched()`
+	/// admission it refuses, by `clear_counted` and by a grow -- which admits
+	/// here too, so the decision never lags it. The handle's `admission_latched()`
 	/// returns it, and the worker publishes it into `status` right after the
 	/// stack call that moved it, where `hybrid_policy::admission_tier` reads it
 	/// to decide which tier a client builds a NEW key in -- exactly as for
@@ -2196,7 +2197,8 @@ impl<K, V> MergedStore<K, V> {
 	/// as a demotion does -- the loop runs only while the tier is over its
 	/// target, which is what "capacity was reached" means, and the DashMap
 	/// stack at the same point demotes the deleted-but-unhandled key and
-	/// latches.
+	/// latches. A step whose fold brings the tier under the target stops
+	/// there, before it demotes.
 	fn settle_tier(&self, log: &mut MigrationLog) {
 		let budget = self.budget();
 
@@ -2233,6 +2235,17 @@ impl<K, V> MergedStore<K, V> {
 			};
 
 			let mut g = self.write_folded(s);
+
+			// The fold can bring the tier back under the target by itself:
+			// the clients' pending changes in this shard -- a delete, a
+			// shrinking overwrite of a fast value -- were in `fast_used` until
+			// now. A step past this point would demote one key more than the
+			// target asks for. Nothing but the totals moved, and the fold
+			// published those, so there is nothing to republish.
+			if self.fast_used.load(Ordering::Relaxed) <= target {
+				break;
+			}
+
 			let before = g.totals();
 
 			let step = match order {
@@ -3385,22 +3398,30 @@ impl<K, V> MergedStore<K, V> {
 
 	/// Empties the store -- the policy worker's handling of a `Wipe`
 	/// (`PolicyWorker::handle_wipe`), which acknowledges it to the client
-	/// waiting in `PaperCache::wipe`.
+	/// waiting in `PaperCache::wipe` -- and returns what it removed: the live
+	/// objects, and the base bytes `base_size` gives each, for
+	/// `AtomicStatus::clear` to take off (`ObjectStore::clear_counted`'s
+	/// twin).
 	///
 	/// Shard by shard, each under its own lock and each reporting its change
 	/// to the store totals through the same before/after bracket as every
 	/// other section -- not by storing 0 into them at the end: a client's
 	/// insert into a shard already cleared is counted in `tracked` and stays
 	/// counted, and the worker's link of it (its `Set` follows the `Wipe` in
-	/// the channel) lands in `linked` and the tier totals the same way.
-	pub fn clear(&self) {
+	/// the channel) lands in `linked` and the tier totals the same way; and
+	/// it is not in what this returns, so the status keeps counting it too.
+	/// A live object is an unlinked or a linked slot's; a DEAD slot's was
+	/// taken by the client's delete, which took it off the status then.
+	pub fn clear_counted(&self, base_size: impl Fn(&Object<K, V>) -> ObjectSize) -> Cleared {
+		let mut cleared = Cleared::default();
+
 		for (s, lock) in self.shards.iter().enumerate() {
 			let mut g = lock.write().unwrap();
 			let before = g.totals();
 
-			let objects = (0..g.slots.allocated)
-				.filter(|&i| g.slots[i].object.is_some())
-				.count();
+			let (objects, base_bytes) = (0..g.slots.allocated)
+				.filter_map(|i| g.slots[i].object.as_ref())
+				.fold((0usize, 0 as CacheSize), |(n, bytes), object| (n + 1, bytes + base_size(object) as CacheSize));
 
 			g.buckets.clear();
 			g.buckets.resize(INITIAL_BUCKETS, NIL);
@@ -3424,6 +3445,9 @@ impl<K, V> MergedStore<K, V> {
 			self.apply_totals_delta(before, g.totals());
 			self.publish_mirrors(s, &g);
 			self.tracked.fetch_sub(objects, Ordering::Relaxed);
+
+			cleared.objects += objects as u64;
+			cleared.base_bytes += base_bytes;
 		}
 
 		// Every slot vector dropped above retired its objects' values into this
@@ -3433,6 +3457,8 @@ impl<K, V> MergedStore<K, V> {
 		// `LfuCompactHybridStack::clear` resets `fast_tier_latched` for the
 		// same reason.
 		self.lfu_latched.store(false, Ordering::Relaxed);
+
+		cleared
 	}
 
 	/// Live objects in the object map: published, linked or not. The DashMap
@@ -4312,7 +4338,7 @@ mod tests {
 	///   * removal                                (`remove_key` -> `take_evict`)
 	///   * removal returning the object           (`take` -> `detach_tier`)
 	///   * a fast-tier resize, which demotes in bulk
-	///   * `clear`, which zeroes every shard and every mirror at once
+	///   * `clear_counted`, which zeroes every shard and every mirror at once
 	#[test]
 	fn gauges_match_the_shards() {
 		// Tight enough that inserting pushes objects over the boundary, so the
@@ -4402,8 +4428,8 @@ mod tests {
 
 		assert!(s.slow_object_count() > 0, "nothing ended up in the slow tier");
 
-		// And `clear` zeroes the mirrors along with the shards.
-		s.clear();
+		// And `clear_counted` zeroes the mirrors along with the shards.
+		s.clear_counted(|_| 0);
 		s.verify_gauges();
 
 		assert_eq!(s.slow_bytes_used(), 0, "clear left slow bytes behind");
@@ -4474,50 +4500,6 @@ mod tests {
 		}
 	}
 
-	/// The drain leaves nothing behind, from any shard: the store's migrations
-	/// are ONE log the policy worker owns and takes whole (`MigrationLog`).
-	///
-	/// They used to be a list per shard behind a dirty mask, and a shard that
-	/// failed to set its bit stranded its records for good -- invisibly to
-	/// `migrations_agree_with_final_placement`, which only inspects what it was
-	/// given, so this test inspected the shards. What there is to inspect now
-	/// is the log, after a workload that migrated across most shards.
-	#[test]
-	fn the_drain_leaves_no_shard_holding_migrations() {
-		let s = tiered(2_048 * SHARDS as CacheSize);
-		let mut shards_seen = [false; SHARDS];
-
-		let mut note = |drained: Vec<(HashedKey, Tier)>| {
-			for (k, _) in drained {
-				shards_seen[shard_of(k)] = true;
-			}
-		};
-
-		for i in 1..=4_000u64 {
-			put(&s, mix(i), 256);
-
-			if i % 3 == 0 {
-				s.touch(mix(i / 3));
-			}
-
-			// Interleaved, so the log is taken many times over rather than
-			// accumulating into one final sweep.
-			if i % 50 == 0 {
-				note(s.drain_migrations());
-			}
-		}
-
-		note(s.drain_migrations());
-
-		// Multi-shard, or the sweep below proves nothing.
-		assert!(
-			shards_seen.iter().filter(|seen| **seen).count() > SHARDS / 2,
-			"the workload migrated across too few shards to be a test of the drain",
-		);
-
-		assert_eq!(s.log.borrow().len(), 0, "the drain left migrations in the log");
-	}
-
 	/// A settle's demotions drain in the order the settle DECIDED them, across
 	/// shards -- the order a DashMap stack's drain has. The per-shard lists
 	/// this store used to keep concatenated in shard order, so a settle that
@@ -4553,6 +4535,47 @@ mod tests {
 		);
 	}
 
+	/// A settle step folds its shard before it demotes, and the fold can bring
+	/// the tier under its target by itself: a client's shrinking overwrite of a
+	/// fast value, pending in the shard, was in `fast_used` until then. The
+	/// step then stops -- a demotion past that point takes a key the target
+	/// does not ask for. Here `k`, the oldest fast key, is shrunk by a client
+	/// from 8 KiB to 256 B, and a resize puts the tier over its watermark on
+	/// the stale total; the step chooses `k`'s shard, folds it, is under the
+	/// target, and demotes nothing. Red without the re-check (`norecheck`:
+	/// `k` goes slow).
+	#[test]
+	fn a_settle_step_whose_fold_brings_the_tier_under_its_target_demotes_nothing() {
+		let s = tiered(CacheSize::MAX);
+		let k = mix(1);
+		let j = mix(2);
+
+		put(&s, k, 8_192);
+		put(&s, j, 256);
+		assert!(s.drain_migrations().is_empty(), "an unbounded tier demotes nothing");
+		assert_ne!(shard_of(k), shard_of(j), "two shards");
+
+		// The client's overwrite: pending in `k`'s shard, not in `fast_used`.
+		s.insert(k, Object::new(k, &[0u8; 256], None));
+		assert_eq!(s.fast_bytes_used(), migrating_bytes(8_192) + migrating_bytes(256), "stale until folded");
+
+		// Over the watermark on the stale total, under it once folded.
+		let capacity = 4 * 1_024;
+		assert!(s.fast_bytes_used() > scale(capacity, DEFAULT_HIGH_PPM));
+		assert!(2 * migrating_bytes(256) <= scale(capacity, DEFAULT_LOW_PPM));
+
+		s.resize_fast_tier(capacity);
+
+		assert_eq!(s.drain_migrations(), vec![], "the fold brought the tier under: nothing to demote");
+		assert_eq!((s.tier_of(k), s.tier_of(j)), (Some(Tier::Fast), Some(Tier::Fast)));
+		assert_eq!(s.fast_bytes_used(), 2 * migrating_bytes(256), "folded");
+
+		// The overwrite's `Set`.
+		s.store.worker_set(k, migrating_bytes(256) as ObjectSize, SetEvent::Replaced { resized: true }, &mut s.log.borrow_mut());
+		assert_eq!(s.drain_migrations(), vec![]);
+		s.verify_charges(true);
+	}
+
 	/// Every drained migration must name a real transition, and the last
 	/// migration for a key must agree with where that key actually ended up.
 	#[test]
@@ -4580,9 +4603,10 @@ mod tests {
 		assert!(!last.is_empty(), "a budget this tight must have produced migrations");
 
 		// This workload is the most migration-heavy in the file, so it is also
-		// worth asking the gauges here. Whether the DRAIN stranded anything is a
-		// different question and this test cannot answer it -- see
-		// `the_drain_leaves_no_shard_holding_migrations`.
+		// worth asking the gauges here. Whether the drain stranded anything is
+		// no longer a question: the migrations are one log the policy worker
+		// takes whole (`MigrationLog`, a `mem::take`), not per-shard lists
+		// behind a dirty mask.
 		s.verify_gauges();
 
 		let mut checked = 0usize;
@@ -5269,10 +5293,11 @@ mod tests {
 
 	/// T15: with the policy worker not running, a CLIENT's insert of a new key
 	/// changes no policy state -- no stamp, link, charge, boundary, mirror,
-	/// settle or latch (`policy_snapshot` identical) -- in every order. The key
-	/// is published: readable, counted in the map's `len`, not placed, not
-	/// linked. Before S4 the client's insert linked, stamped, charged and
-	/// settled.
+	/// settle or latch (`policy_snapshot` identical) -- in every order, at the
+	/// tier's target and over it. The key is published: readable, counted in
+	/// the map's `len`, not placed, not linked. Before S4 the client's insert
+	/// linked, stamped, charged and settled. Red with the client linking
+	/// (`clientlink`) and settling (`clientsettle`).
 	#[test]
 	fn t15_a_client_set_of_a_new_key_changes_no_policy_state() {
 		for order in T15_ORDERS {
@@ -5288,6 +5313,20 @@ mod tests {
 			assert!(s.get_ref(&k).is_some(), "{order:?}: the value is published");
 			assert_eq!(s.tier_of(k), None, "{order:?}: placed before its Set");
 			assert_eq!((s.len(), s.linked()), (len + 1, linked), "{order:?}: map and link counts");
+
+			// And with the tier over its watermark -- the budget cut under it
+			// and no settle run yet, as a worker's link leaves it until its
+			// settle -- the insert still settles nothing: a store at its
+			// target cannot show a settle, so this is the half a client-side
+			// settle fails (`clientsettle`).
+			s.configure_tiering(s.fast_bytes_used() / 2, 0, DEFAULT_HIGH_PPM, DEFAULT_LOW_PPM);
+
+			let before = s.policy_snapshot();
+			let k2 = mix(1_001);
+
+			s.insert(k2, Object::new(k2, &[0u8; 256], None));
+
+			assert_same_policy_state(&before, &s.policy_snapshot(), &format!("{order:?} new key, the tier over its watermark"));
 		}
 	}
 
@@ -5397,6 +5436,32 @@ mod tests {
 				s.verify_charges(true);
 			}
 		}
+	}
+
+	/// `clear_counted` returns what it removed: the LIVE objects -- linked and
+	/// unlinked -- and their base bytes as its caller's `base_size` gives them,
+	/// not a DEAD slot's, whose object the client's delete already took (and
+	/// took off the status then). The worker's wipe subtracts exactly that
+	/// from the status (`AtomicStatus::clear`).
+	#[test]
+	fn clear_counted_returns_the_live_objects_and_their_base_bytes() {
+		let s = tiered(CacheSize::MAX);
+
+		for i in 1..=10u64 {
+			put(&s, mix(i), 256 * i as ObjectSize);
+		}
+
+		// Published, not linked; and a linked value deleted by a client.
+		s.insert(mix(11), Object::new(mix(11), &[0u8; 100], None));
+		assert!(s.take_if(&mix(3), |_| true).is_some());
+		assert_eq!((s.len(), s.linked()), (10, 10), "ten live, ten on lists (one DEAD)");
+
+		let cleared = s.clear_counted(|object| object.data_size());
+
+		let bytes = (1..=10u64).filter(|&i| i != 3).map(|i| 256 * i).sum::<u64>() + 100;
+		assert_eq!(cleared, Cleared { objects: 10, base_bytes: bytes as CacheSize });
+		assert_eq!((s.len(), s.linked(), s.fast_bytes_used()), (0, 0, 0));
+		s.verify_charges(true);
 	}
 
 	// ── MergedOrder::Lfu ─────────────────────────────────────────────────
@@ -5770,7 +5835,7 @@ mod tests {
 			assert_eq!(g.tail, NIL, "shard {n} linked the recency list under Lfu");
 		}
 
-		s.clear();
+		s.clear_counted(|_| 0);
 		s.verify_gauges();
 
 		assert!(!s.lfu_latched.load(Ordering::Relaxed), "clear left admission latched");

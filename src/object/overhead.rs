@@ -1141,8 +1141,11 @@ const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 40;
 /// Charging them per object over-reserved every small value by ~11%.
 ///
 /// Process-level waste belongs in a reported ratio, the way Redis reports
-/// `mem_fragmentation_ratio`, not inside a per-object budget. See
-/// `AtomicStatus::fragmentation_ratio`.
+/// `mem_fragmentation_ratio`, not inside a per-object budget -- and that is how
+/// it is reported: the benchmark's `mem_fragmentation_ratio` column is RSS over
+/// `used_size`, and `paper_cache::jemalloc_stats()` samples the allocator's own
+/// process-wide figures (`stats.allocated`, `active`, `resident`, `mapped`,
+/// `retained`, through `mallctl`) for a diagnosis. Neither feeds a decision.
 #[cfg(feature = "numa_jemalloc")]
 pub(crate) fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
 	// SAFETY: `nallocx` is a pure size-class computation. It allocates

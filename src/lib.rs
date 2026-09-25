@@ -1289,7 +1289,7 @@ where
 		// the worker, and a `Set` the worker handled in between left a live
 		// key its stack no longer tracked. The kick wakes a worker parked on
 		// its idle poll (up to 1 s); the wait still includes the events queued
-		// ahead of the `Wipe`. The values `clear` drops retire into the
+		// ahead of the `Wipe`. The values `clear_counted` drops retire into the
 		// worker's epoch bag, which its pass flushes.
 		let (ack, done) = crossbeam_channel::bounded(1);
 		let sent = self.broadcast(WorkerEvent::Wipe(Some(ack)));
@@ -1307,8 +1307,8 @@ where
 			// worker within its poll, 1 s at most. Wipe here so the cache is
 			// empty all the same, and say it failed.
 			Err(_) => {
-				self.objects.clear();
-				self.status.clear();
+				let cleared = self.objects.clear_counted(|object| self.overhead_manager.base_size(object));
+				self.status.clear(cleared);
 
 				Err(CacheError::Internal)
 			},
@@ -1813,7 +1813,7 @@ where
 		// the worker, and a `Set` the worker handled in between left a live
 		// key its stack no longer tracked. The kick wakes a worker parked on
 		// its idle poll (up to 1 s); the wait still includes the events queued
-		// ahead of the `Wipe`. The values `clear` drops retire into the
+		// ahead of the `Wipe`. The values `clear_counted` drops retire into the
 		// worker's epoch bag, which its pass flushes.
 		let (ack, done) = crossbeam_channel::bounded(1);
 		let sent = self.broadcast(WorkerEvent::Wipe(Some(ack)));
@@ -1831,8 +1831,8 @@ where
 			// worker within its poll, 1 s at most. Wipe here so the cache is
 			// empty all the same, and say it failed.
 			Err(_) => {
-				self.objects.clear();
-				self.status.clear();
+				let cleared = self.objects.clear_counted(|object| self.overhead_manager.base_size(object));
+				self.status.clear(cleared);
 
 				Err(CacheError::Internal)
 			},
@@ -2845,7 +2845,7 @@ where
 		// the worker, and a `Set` the worker handled in between left a live
 		// key its stack no longer tracked. The kick wakes a worker parked on
 		// its idle poll (up to 1 s); the wait still includes the events queued
-		// ahead of the `Wipe`. The values `clear` drops retire into the
+		// ahead of the `Wipe`. The values `clear_counted` drops retire into the
 		// worker's epoch bag, which its pass flushes.
 		let (ack, done) = crossbeam_channel::bounded(1);
 		let sent = self.broadcast(WorkerEvent::Wipe(Some(ack)));
@@ -2863,8 +2863,8 @@ where
 			// worker within its poll, 1 s at most. Wipe here so the cache is
 			// empty all the same, and say it failed.
 			Err(_) => {
-				self.objects.clear();
-				self.status.clear();
+				let cleared = self.objects.clear_counted(|object| self.overhead_manager.base_size(object));
+				self.status.clear(cleared);
 
 				Err(CacheError::Internal)
 			},

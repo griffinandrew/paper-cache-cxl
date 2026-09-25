@@ -21,7 +21,9 @@
 //!     and stats recorded as text. With `PAPER_T14_DIR` set each test writes
 //!     its file there, and the bp-s4 runner requires the files of the
 //!     DashMap, merged and hashbrown builds to be identical (and the three
-//!     thin-header builds').
+//!     thin-header builds'). T14b (S4's follow-ups) is the same differential
+//!     without the gauge refresh after every op, with TTL reaps, bursts of
+//!     sets published before the worker takes them, and wipes.
 //!   * T15, through the worker: a client's set and delete move nothing the
 //!     stack reports until the worker takes the event (the store-level T15
 //!     is in `merged_store`'s tests).
@@ -29,7 +31,9 @@
 //!   * U12: the LFU latch is published with the event that moves it.
 //!   * U15: LFU counts its settle's demotions, not a refused admission.
 //!   * U9: the CLOCK hand stops at its budget in both stores.
-//!   * U7: `wipe` is done by the worker, and returns when it is.
+//!   * U7: `wipe` is done by the worker, and returns when it is; with the
+//!     worker gone it clears the cache itself; and a wipe racing clients
+//!     leaves the status counting exactly what the map holds.
 //!   * The races of design section 6, event orders arranged by hand.
 //!   * A concurrent workload on real caches, then every charge checked.
 
@@ -485,7 +489,9 @@ fn u7_wipe_returns_after_the_worker_cleared_everything() {
 /// U7, in both stores: the wipe of a cache whose worker is parked on its
 /// idle poll (a new cache, no set yet: up to 1 s) returns promptly -- the
 /// wait for the worker's answer kicks it -- and so does the audit. Red
-/// without the kicks (`nokick`).
+/// without the kicks (`nokick`). The bound is 600 ms: the worker has been
+/// parked for 100-200 ms when the call is made, so an unkicked call waits
+/// 800 ms or more, and a loaded machine gets room it did not have at 200.
 #[test]
 fn u7_wipe_and_audit_of_an_idle_cache_do_not_wait_out_the_idle_poll() {
 	let _serialised = migration_test_lock::lock();
@@ -517,8 +523,8 @@ fn u7_wipe_and_audit_of_an_idle_cache_do_not_wait_out_the_idle_poll() {
 	cache.placement_audit().expect("an audit");
 	let audit = start.elapsed();
 
-	assert!(wipe < Duration::from_millis(200), "wipe() of an idle cache took {wipe:?}: it waited out the worker's idle poll");
-	assert!(audit < Duration::from_millis(200), "placement_audit() of an idle cache took {audit:?}: it waited out the worker's idle poll");
+	assert!(wipe < Duration::from_millis(600), "wipe() of an idle cache took {wipe:?}: it waited out the worker's idle poll");
+	assert!(audit < Duration::from_millis(600), "placement_audit() of an idle cache took {audit:?}: it waited out the worker's idle poll");
 }
 
 /// U7, in both stores: a `Set` the worker handled before the `Wipe` cannot be
@@ -547,6 +553,170 @@ fn u7_a_set_handled_before_the_wipe_is_not_left_untracked() {
 		assert_eq!(stack(&worker).len(), 0);
 		assert_eq!(worker.status.used_size(&policy), 0, "{policy}: the status still counts it");
 		charges_exact(&objects, true);
+	}
+}
+
+/// U7's fallback, in both stores: with the policy worker gone -- ended here by
+/// a `Shutdown` and joined, as a worker that died would be -- `wipe()` does not
+/// wait for an answer that cannot come: the event is dropped with the worker's
+/// channel, and with it the answer's sender, so the wait errs at once; it then
+/// clears the map and the status itself, and reports the failure. Red with the
+/// fallback clearing nothing (`nofallbackclear`).
+#[test]
+fn wipe_clears_the_cache_itself_when_the_policy_worker_is_gone() {
+	let _serialised = migration_test_lock::lock();
+
+	let policy = PaperPolicy::LruCompactHybrid;
+	let mut cache = PaperCache::<u64, TieredBuffer>::new(1 << 20, CacheTierSize::Bytes(FAST), policy)
+		.expect("a hybrid cache");
+
+	for key in 0..40u64 {
+		cache.set(key, &[key as u8; LEN], None).expect("set");
+	}
+
+	wait_for("the worker never took the sets", Duration::from_secs(10), || {
+		let s = cache.hybrid_stats();
+		s.fast_objects + s.slow_objects == 40
+	});
+
+	// Every worker ends, the policy worker among them, and is joined: its
+	// channel is closed.
+	cache.workers.send(WorkerEvent::Shutdown).expect("the shutdown");
+
+	for handle in cache.worker_handles.drain(..) {
+		let _ = handle.join();
+	}
+
+	assert_eq!((cache.objects.len(), cache.status.live_num_objects()), (40, 40), "nothing cleared yet");
+
+	let start = Instant::now();
+	let wiped = cache.wipe();
+
+	assert!(matches!(wiped, Err(CacheError::Internal)), "the wipe reports the dead worker: {wiped:?}");
+	assert!(start.elapsed() < Duration::from_secs(5), "the wipe waited {:?} for a dead worker", start.elapsed());
+	assert_eq!(cache.objects.len(), 0, "the fallback left objects in the map");
+	assert_eq!(
+		(cache.status.live_num_objects(), cache.status.used_size(&policy)),
+		(0, 0),
+		"the fallback left the status counting them",
+	);
+}
+
+/// S4's wipe/status race, in both stores: client threads setting and
+/// deleting -- each over its own keys, so no two threads race on a key --
+/// while the cache is wiped over and over for 400 ms and its fast tier
+/// resized; then, quiet, the status counts exactly what the map holds: the
+/// object count is the map's, `used_size` its base bytes plus the per-object
+/// overhead; the merged store's charges are exact and every value linked
+/// (`verify_charges`); the audit is clean. The worker's wipe STORED 0 into the
+/// status after its clear, so a set landing in a shard the clear had emptied
+/// -- its status update before the store -- stayed live and uncounted (its
+/// removal then wrapped `base_used_size`), and one the clear removed -- its
+/// update after the store -- stayed counted. Now the wipe subtracts what the
+/// clear removed. Red with the store (`wipestorezero`).
+///
+/// The clients pause 100 us every 16 operations. Unpaced they outrun the
+/// policy worker, the event channel grows without bound (gigabytes), and every
+/// wipe waits for the whole backlog ahead of it.
+#[test]
+fn a_wipe_racing_client_sets_and_deletes_leaves_the_status_exact() {
+	let _serialised = migration_test_lock::lock();
+
+	const CLIENTS: u64 = 4;
+	const KEYS_EACH: u64 = 512;
+	const RACE: Duration = Duration::from_millis(400);
+
+	for policy in TIERED {
+		let cache = std::sync::Arc::new(
+			PaperCache::<u64, TieredBuffer>::new(1 << 20, CacheTierSize::Bytes(256 * 1024), policy)
+				.expect("a hybrid cache"),
+		);
+
+		let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+		let clients: Vec<_> = (0..CLIENTS)
+			.map(|t| {
+				let (cache, stop) = (cache.clone(), stop.clone());
+
+				std::thread::spawn(move || {
+					let mut x = 0x2545_F491_4F6C_DD1Du64 ^ (t + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+					let mut ops = 0u64;
+
+					while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+						x ^= x << 13;
+						x ^= x >> 7;
+						x ^= x << 17;
+
+						let key = t * KEYS_EACH + x % KEYS_EACH;
+						let len = 64 + (x >> 20) as usize % 960;
+
+						match (x >> 40) % 8 {
+							0..=5 => { let _ = cache.set(key, &vec![key as u8; len], None); },
+							_ => { let _ = cache.del(&key); },
+						}
+
+						ops += 1;
+
+						if ops % 16 == 0 {
+							std::thread::sleep(Duration::from_micros(100));
+						}
+					}
+
+					ops
+				})
+			})
+			.collect();
+
+		let start = Instant::now();
+		let mut wipes = 0usize;
+
+		while start.elapsed() < RACE {
+			cache.wipe().expect("wipe");
+			wipes += 1;
+
+			if wipes % 10 == 0 {
+				let size = if wipes % 20 == 0 { 128 * 1024 } else { 256 * 1024 };
+				cache.set_fast_tier_size(CacheTierSize::Bytes(size)).expect("a resize");
+			}
+		}
+
+		stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+		let ops: u64 = clients.into_iter().map(|client| client.join().expect("a client thread panicked")).sum();
+
+		// Quiet: the audit is handled after every event before it; two passes
+		// more and the worker's last eviction pass is done too.
+		cache.placement_audit().expect("an audit");
+		let passes = cache.status.policy_worker_passes();
+		wait_for("two more passes", Duration::from_secs(10), || cache.status.policy_worker_passes() >= passes + 2);
+
+		let objects = &cache.objects;
+		let (mut live, mut base) = (0u64, 0 as CacheSize);
+
+		for key in 0..CLIENTS * KEYS_EACH {
+			if let Some(object) = objects.get_ref(&cache.hash_key(&key)) {
+				live += 1;
+				base += cache.overhead_manager.base_size(&object) as CacheSize;
+			}
+		}
+
+		let what = format!("{policy}: {wipes} wipes racing {ops} client ops");
+
+		assert!(wipes >= 20, "{what}: too few wipes to race anything");
+
+		assert_eq!(objects.len() as u64, live, "{what}: the map's count is its keys'");
+		assert_eq!(cache.status.live_num_objects(), live, "{what}: the status's object count is the map's");
+		assert_eq!(
+			cache.status.used_size(&policy),
+			base + live * crate::object::overhead::get_policy_overhead(&policy) as CacheSize,
+			"{what}: used_size is the map's base bytes plus the per-object overhead",
+		);
+
+		#[cfg(feature = "merged_object_store")]
+		cache.objects.verify_charges(true);
+
+		let audit = cache.placement_audit().expect("an audit");
+		assert!(audit.is_clean(), "{what}: {audit:?}");
 	}
 }
 
@@ -739,7 +909,8 @@ fn in_shard(shard: u64, i: u64) -> HashedKey {
 /// both before the worker takes `Set(v1)`. The client records no unfolded
 /// bytes for an unlinked slot, and the link charges the slot's CURRENT object
 /// -- v2 -- once; `Set(v2)` is then an ordinary overwrite. Red with unfolded
-/// bytes recorded for an unlinked slot too (`unfoldunlinked`): charged twice.
+/// bytes recorded for an unlinked slot too (`unfoldunlinked`): charged twice;
+/// and with the link charging the event's size (`linkeventsize`): v1's.
 #[cfg(feature = "merged_object_store")]
 #[test]
 fn r2_an_overwrite_before_the_link_charges_the_newest_value_once() {
@@ -752,8 +923,8 @@ fn r2_an_overwrite_before_the_link_charges_the_newest_value_once() {
 	let v2 = publish(&worker.status, &worker.overhead_manager, &objects, K, 3 * LEN, Fast);
 
 	handle(&mut worker, K, v1);
-	charges_exact(&objects, false);
 	assert_eq!(objects.fast_bytes_used(), charge(3 * LEN), "the link charged the newest value");
+	charges_exact(&objects, false);
 
 	handle(&mut worker, K, v2);
 	drain_and_apply(&mut worker);
@@ -784,6 +955,82 @@ fn r3_sets_handled_out_of_order_link_once_and_charge_the_live_value() {
 	drain_and_apply(&mut worker);
 
 	assert_eq!((objects.linked(), objects.fast_bytes_used()), (1, charge(2 * LEN)));
+	assert_settled(&mut worker);
+	charges_exact(&objects, true);
+}
+
+/// Race R3 through the new-key rule's fence: a `Replaced` `Set` the worker
+/// handles while its slot is still UNLINKED -- the overwrite's `Set` taken
+/// before the fresh one's -- is fenced like a new key when its bucket moved
+/// since its mark, for the store does not place the key before the event
+/// (`placement_of` None) although the insert replaced a value. K's old value
+/// is demoted by another key's admission, and the worker takes that drain;
+/// before it lands, the clients delete K and set v1 (fresh) and v2 over it.
+/// The demotion then lands on v2, the value the key holds, after both marks.
+/// The worker takes the `Del` (the DEAD slot) and then Set(v2): it links the
+/// slot fast, where v2 was built, and queues nothing; fenced, the rule queues
+/// `(K, Fast)` last and v2 ends where it is placed. Then Set(v1), fresh on the
+/// linked slot: a re-admission, fenced too, whose corrective declines. Red
+/// with the fence's `placement_of` clause removed (`nonfresh`, S3's): v2 is
+/// not fresh, is not fenced, and stays in CXL, placed fast.
+#[cfg(feature = "merged_object_store")]
+#[test]
+fn r3_a_replaced_set_on_an_unlinked_slot_is_fenced_like_a_new_key() {
+	let _serialised = migration_test_lock::lock();
+
+	let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
+
+	const K: HashedKey = 1;
+	// Twice the fast tier: its admission demotes K and itself.
+	const X: HashedKey = 7_777;
+
+	set(&mut worker, &objects, K, LEN, Fast);
+	drain_and_apply(&mut worker);
+	assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Fast), Fast));
+
+	// The worker takes the admission's drain, and has not applied it yet.
+	set(&mut worker, &objects, X, 2 * FAST as usize, Fast);
+	let (inline, held) = worker.drain_reconciled().expect("a stack");
+	assert_eq!(of(&held, K), vec![Slow], "the admission demoted K");
+
+	// The clients: `del(K)`, then `set(K, v1)` -- new -- and `set(K, v2)`
+	// over it, both built in DRAM as LRU admits.
+	let status = worker.status.clone();
+	let overhead_manager = worker.overhead_manager.clone();
+
+	publish_del(&status, &overhead_manager, &objects, K);
+	let v1 = publish(&status, &overhead_manager, &objects, K, LEN, Fast);
+	let v2 = publish(&status, &overhead_manager, &objects, K, LEN + 100, Fast);
+	assert!(v1.fresh() && !v2.fresh(), "v1 was new to the map, v2 replaced it");
+
+	// The drain lands: K's demotion moves v2, after both marks.
+	worker.apply_migration_batches(held, inline);
+	assert_eq!(bytes_tier(&objects, K), Slow, "the stale demotion moved v2");
+
+	// The worker: the `Del`, then Set(v2) on the unlinked slot.
+	worker.handle_del(K);
+	drain_and_apply(&mut worker);
+	assert_eq!(placement(&worker, K), None, "v2 is unlinked: the store does not place K");
+
+	handle(&mut worker, K, v2);
+	assert_eq!(placement(&worker, K), Some(Fast), "linked fast, where v2 was built, with no push");
+	let observed = worker.observed.clone();
+
+	let drain = drain_and_apply(&mut worker);
+	assert_eq!(
+		observed,
+		vec![Observed::Built { key: K, built: Fast, fence: true }],
+		"fenced: v2 replaced a value, but the store did not place K before its Set",
+	);
+	assert_eq!(correctives(&drain, K), vec![Fast], "the new-key rule's corrective (built where placed)");
+	assert_eq!(bytes_tier(&objects, K), Fast, "v2 is where the store placed it");
+
+	// Set(v1), fresh on the linked slot: re-admitted; its corrective declines.
+	handle(&mut worker, K, v1);
+	drain_and_apply(&mut worker);
+
+	assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Fast), Fast));
+	assert_eq!(objects.get_ref(&K).map(|o| o.data_size() as usize), Some(LEN + 100), "v2 is the value");
 	assert_settled(&mut worker);
 	charges_exact(&objects, true);
 }
@@ -913,6 +1160,50 @@ fn r7_eviction_never_takes_an_unlinked_value() {
 	charges_exact(&objects, true);
 }
 
+/// The eviction pass over a merged store with nothing linked stops (R7) --
+/// silently while published, unlinked values remain, whose `Set`s are behind
+/// this pass (it never evicts them) -- and with an error when the store is
+/// REALLY empty: `used_size` over the cache's size with nothing in the map is
+/// an accounting bug, not a backlog. Red with the error dropped
+/// (`silentempty`, S4's break) and raised for unlinked values too
+/// (`loudunlinked`, the break before S4).
+#[cfg(feature = "merged_object_store")]
+#[test]
+fn an_eviction_pass_with_nothing_linked_errs_only_over_an_empty_store() {
+	let _serialised = migration_test_lock::lock();
+
+	let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
+
+	const U: HashedKey = 1;
+	publish(&worker.status, &worker.overhead_manager, &objects, U, LEN, Fast);
+
+	// Only an unlinked value, over the size: the pass stops, silently.
+	let used = worker.status.used_size(&worker.status.policy());
+	worker.status.set_max_size(used - 1);
+	worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
+
+	assert!(objects.get_ref(&U).is_some(), "the pass took an unlinked value");
+	assert_eq!(worker.nothing_left_to_evict, 0, "an unlinked value is a backlog, not an error");
+
+	// Deleted before its link, it is freed at once: the store is empty. The
+	// status says a MiB is held: the pass stops, and errs.
+	publish_del(&worker.status, &worker.overhead_manager, &objects, U);
+	assert_eq!(objects.len(), 0);
+
+	worker.status.update_base_used_size(1 << 20);
+	worker.status.set_max_size(1 << 19);
+	worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
+
+	assert_eq!(worker.nothing_left_to_evict, 1, "a store with nothing in it and used_size over the size is an error");
+
+	worker.status.update_base_used_size(-(1i64 << 20));
+	worker.status.set_max_size(1 << 30);
+	worker.handle_del(U);
+	drain_and_apply(&mut worker);
+	assert_settled(&mut worker);
+	charges_exact(&objects, true);
+}
+
 /// Race R9: a DEAD slot at the tail -- deleted by a client, its `Del` not yet
 /// handled -- is not nominated: the nominator retires it in place and names
 /// the next key. The `Del` then finds nothing to retire. Red with the DEAD
@@ -949,9 +1240,10 @@ fn r9_a_dead_slot_at_the_tail_is_retired_once_by_the_evictor() {
 }
 
 /// Race R10: a DEAD slot where the settle's victim would be -- the fast
-/// boundary, or the LFU fast minimum -- is RETIRED, not demoted: a
-/// `(k, Slow)` for it would land on whatever value holds the key next. Red
-/// with the DEAD boundary demoted (`demotedead`).
+/// boundary (LRU, FIFO), or the LFU fast minimum -- is RETIRED, not demoted:
+/// a `(k, Slow)` for it would land on whatever value holds the key next.
+/// Under LFU the retire latches admission, as a demotion does. Red with the
+/// DEAD boundary demoted (`demotedead`), and for LFU below.
 #[cfg(feature = "merged_object_store")]
 #[test]
 fn r10_a_dead_slot_at_the_tier_boundary_is_retired_not_demoted() {
@@ -985,6 +1277,62 @@ fn r10_a_dead_slot_at_the_tier_boundary_is_retired_not_demoted() {
 		assert_settled(&mut worker);
 		charges_exact(&objects, true);
 	}
+
+	// LFU: the DEAD slot is the fast MINIMUM (`demote_freq_min`). `k` at
+	// frequency 1 in one shard, `a` hit twice in another. The clients delete
+	// `k` and shrink `a`, and a resize puts the tier over its watermark on
+	// the stale totals. The settle's first step folds `k`'s shard, is still
+	// over (`a`'s shrink is pending in its own shard), and finds the DEAD
+	// minimum: it retires it, queues no `(k, Slow)` and LATCHES -- the loop
+	// runs only while the tier is over its target, and the DashMap stack
+	// demotes the deleted key there and latches. The next step folds `a`'s
+	// shard, is under the target, and stops (the re-check after the fold), so
+	// the latch is the retire's alone. Red with the DEAD minimum demoted
+	// (`demotedeadlfu`), with the retire not latching (`retirenolatch`) and
+	// without the re-check (`norecheck`: `a` is demoted).
+	let (mut worker, objects) = make_worker(PaperPolicy::LfuCompactHybrid);
+
+	let k = in_shard(3, 1);
+	let a = in_shard(5, 2);
+
+	set(&mut worker, &objects, k, LEN, Fast);
+	drain_and_apply(&mut worker);
+	set(&mut worker, &objects, a, 8 * LEN, Fast);
+	drain_and_apply(&mut worker);
+
+	for _ in 0..2 {
+		worker.handle_get(a, Some(Fast));
+		drain_and_apply(&mut worker);
+	}
+
+	assert_eq!((placement(&worker, k), placement(&worker, a)), (Some(Fast), Some(Fast)), "LFU: both fast");
+	assert!(!stack(&worker).admission_latched(), "LFU: not latched yet");
+
+	publish_del(&worker.status, &worker.overhead_manager, &objects, k);
+	let shrunk = publish(&worker.status, &worker.overhead_manager, &objects, a, LEN, Fast);
+
+	// Four of `LEN`'s items of value budget: over the watermark on the stale
+	// totals (`k`'s and `a`'s old bytes), under the target once both are
+	// folded (`a`'s new bytes alone).
+	let omega = stack(&worker).dram_reserved_bytes() / objects.linked() as CacheSize;
+	worker.handle_resize_fast_tier(4 * charge(LEN) + 2 * omega);
+
+	assert!(
+		stack(&worker).admission_latched() && worker.status.hybrid_admission_latched(),
+		"LFU: the retire of the DEAD minimum latched admission, and the latch is published",
+	);
+
+	let drain = drain_and_apply(&mut worker);
+
+	assert_eq!(of(&drain, k), vec![], "LFU: the DEAD minimum was demoted: {drain:?}");
+	assert_eq!(of(&drain, a), vec![], "LFU: the fold brought the tier under, yet `a` was demoted: {drain:?}");
+	assert_eq!(objects.linked(), 1, "LFU: the DEAD minimum was retired");
+
+	worker.handle_del(k);
+	handle(&mut worker, a, shrunk);
+	drain_and_apply(&mut worker);
+	assert_settled(&mut worker);
+	charges_exact(&objects, true);
 }
 
 /// Race R11: a `Del` -- and a reap's `Expire` -- racing a re-set. The
@@ -1213,6 +1561,9 @@ fn a_concurrent_workload_leaves_every_charge_exact_at_quiescence() {
 /// store's gate used to add the other one.
 mod t14 {
 	use super::*;
+	use super::super::reconcile_tests::Published;
+	use crate::object::Object;
+	use std::num::NonZeroU32;
 
 	const OMEGA: ObjectSize = 64;
 	const PER_OBJECT: ObjectSize = 100;
@@ -1262,14 +1613,38 @@ mod t14 {
 	struct Run {
 		policy: PaperPolicy,
 		tiered: bool,
+		/// T14b: no gauge refresh after an op -- the stack's own gauges are
+		/// recorded instead -- and TTL reaps, bursts and wipes among the ops.
+		b: bool,
 		worker: Worker,
 		objects: Objects,
 		index: HashMap<HashedKey, u64>,
 		lines: Vec<String>,
 	}
 
+	/// `publish` of a value built with `expiry` -- `PaperCache::set` with a TTL.
+	fn publish_object(worker: &Worker, objects: &Objects, key: HashedKey, len: usize, built: Tier, expiry: Option<NonZeroU32>) -> Published {
+		let object = Object::with_expiry_in(key, &vec![key as u8; len], built, expiry);
+		let base_size = worker.overhead_manager.base_size(&object);
+		let resident = worker.overhead_manager.dram_resident_size(&object);
+		let mark = worker.status.migration_in_flight().mark(key);
+
+		let previous = objects.insert(key, object).map(|old| worker.overhead_manager.base_size(&old));
+
+		match previous {
+			Some(old) => worker.status.update_base_used_size(base_size as i64 - old as i64),
+
+			None => {
+				worker.status.incr_num_objects();
+				worker.status.update_base_used_size(base_size as i64);
+			},
+		}
+
+		Published { base_size, resident, built, previous, mark }
+	}
+
 	impl Run {
-		fn new(policy: PaperPolicy, tiered: bool) -> Run {
+		fn new(policy: PaperPolicy, tiered: bool, b: bool) -> Run {
 			assert!(
 				std::env::var_os("MERGED_UPDATE_INTERVAL").is_none(),
 				"T14 compares exact orders: MERGED_UPDATE_INTERVAL must be unset",
@@ -1297,11 +1672,16 @@ mod t14 {
 
 			let index = (0..KEYS).map(|i| (key(i), i)).collect();
 
-			Run { policy, tiered, worker, objects, index, lines: Vec::new() }
+			Run { policy, tiered, b, worker, objects, index, lines: Vec::new() }
 		}
 
 		fn live(&self, i: u64) -> bool {
 			self.objects.get_ref(&key(i)).is_some()
+		}
+
+		/// In the map with its TTL passed: not reaped yet (T14b).
+		fn expired(&self, i: u64) -> bool {
+			self.objects.get_ref(&key(i)).is_some_and(|object| object.is_expired())
 		}
 
 		fn names(&self, keys: &[HashedKey]) -> String {
@@ -1338,7 +1718,10 @@ mod t14 {
 		/// The client's get, as `PaperCache::get` does it, then its event.
 		fn get(&mut self, i: u64) -> String {
 			let k = key(i);
-			let served = self.objects.get_ref(&k).map(|object| object.value().tier());
+			let served = self.objects
+				.get_ref(&k)
+				.filter(|object| !object.is_expired())
+				.map(|object| object.value().tier());
 
 			match served {
 				Some(t) => {
@@ -1366,6 +1749,67 @@ mod t14 {
 			format!("del k{i}")
 		}
 
+		/// T14b: a set whose value has ALREADY expired (its expiry is tick 1):
+		/// until the reaper takes it it is in the map and the stack, and every
+		/// get of it misses.
+		fn set_expired(&mut self, i: u64, item: ObjectSize) -> String {
+			let k = key(i);
+			let built = admission_tier(self.policy, k, &self.worker.status, &self.objects);
+			let published = publish_object(&self.worker, &self.objects, k, value_len(item), built, NonZeroU32::new(1));
+			let kind = if published.fresh() { "set" } else { "overwrite" };
+
+			handle(&mut self.worker, k, published);
+
+			format!("{kind} k{i} {item} expired built {}", tier(built))
+		}
+
+		/// T14b: the TTL reaper's take of an expired value, then the worker's
+		/// `Expire`. (Not a re-set between them: a `Set` handled before the
+		/// `Expire` it follows is an accepted difference between the stores.)
+		fn reap(&mut self, i: u64) -> String {
+			let k = key(i);
+			let _ = erase(&self.objects, &self.worker.status, &self.worker.overhead_manager, Some(EraseKey::Expired(k)));
+			self.worker.handle_expire(k);
+
+			format!("reap k{i}")
+		}
+
+		/// T14b: sets of new keys all published before the worker takes the
+		/// first -- a worker backlog, one client -- then each `Set` handled
+		/// with its own drain, as the event loop drains after every event (the
+		/// last one's is the step's). The client builds every one with the
+		/// latch and tiers published before the burst, so a `Set` inside it
+		/// that latches LFU leaves the later keys built fast and placed slow:
+		/// the reconcile's correctives. In the merged store the later keys are
+		/// UNLINKED while the earlier ones are linked, charged and settled.
+		fn burst(&mut self, keys: &[(u64, ObjectSize)]) -> String {
+			let published: Vec<(u64, ObjectSize, Tier, Published)> = keys
+				.iter()
+				.map(|&(i, item)| {
+					let k = key(i);
+					let built = admission_tier(self.policy, k, &self.worker.status, &self.objects);
+					let published = publish(&self.worker.status, &self.worker.overhead_manager, &self.objects, k, value_len(item), built);
+
+					(i, item, built, published)
+				})
+				.collect();
+
+			let mut what = Vec::new();
+			let last = published.len() - 1;
+
+			for (n, (i, item, built, published)) in published.into_iter().enumerate() {
+				handle(&mut self.worker, key(i), published);
+
+				if n < last {
+					self.worker.apply_tier_migrations();
+				}
+
+				what.push(format!("k{i} {item} built {}", tier(built)));
+			}
+
+			format!("burst {}", what.join(" "))
+		}
+
 		/// One op: `op` is its client half and handler; then the event's
 		/// drain, the batch end, and the record.
 		fn step(&mut self, n: usize, op: impl FnOnce(&mut Run) -> String, touched: Option<u64>) {
@@ -1380,7 +1824,10 @@ mod t14 {
 			self.worker.apply_tier_migrations();
 			let drain2 = self.worker.drained.replace(Vec::new()).expect("recording");
 
-			self.worker.refresh_tier_gauges();
+			// T14b leaves the gauges and the latch as the events published them.
+			if !self.b {
+				self.worker.refresh_tier_gauges();
+			}
 
 			// T8's property, on a real script: the key a hit or an overwrite
 			// touched is never promoted and then demoted in one event's drain.
@@ -1411,8 +1858,27 @@ mod t14 {
 			// A flat cache has no tiers: a flat DashMap stack places nothing
 			// and gauges nothing, while the merged store tags its slots fast
 			// either way. Its record is the order alone -- the victims, the
-			// live keys -- and the accounted size.
-			if !self.tiered {
+			// live keys -- and the accounted size. T14b records the stack's own
+			// gauges, which no refresh has copied into the status.
+			if self.b {
+				let (fb, sb, fo, so, meta) = gauges(&self.worker);
+
+				self.lines.push(format!(
+					"op {n} {what} | drain [{}] | evicted [{}] | drain2 [{}] | placement {placements} | stack fo={fo} so={so} fb={fb} sb={sb} meta={meta} | stats promo={} demo={} evict={} rafast={} raslow={} fasthits={} slowhits={} latched={} used={used} live={}",
+					self.entries(&drain),
+					self.names(&evicted),
+					self.entries(&drain2),
+					s.promotions,
+					s.demotions,
+					s.evictions,
+					s.reconcile_applied_to_fast,
+					s.reconcile_applied_to_slow,
+					s.fast_hits,
+					s.slow_hits,
+					self.worker.status.hybrid_admission_latched(),
+					live.len(),
+				));
+			} else if !self.tiered {
 				let keys = live.iter().map(|i| format!("k{i}")).collect::<Vec<_>>().join(" ");
 
 				self.lines.push(format!(
@@ -1456,14 +1922,15 @@ mod t14 {
 		}
 	}
 
-	/// The script: the LFU prefix, then `OPS` ops drawn from a fixed LCG.
-	fn script(name: &str, policy: PaperPolicy, tiered: bool, seed: u64) {
+	/// The script: the LFU prefix, then `OPS` ops drawn from a fixed LCG --
+	/// T14's mix, or with `b` T14b's (`script_b_op`).
+	fn script(name: &str, policy: PaperPolicy, tiered: bool, seed: u64, b: bool) {
 		// Its inline landings count in the process-wide migration counters,
 		// which other tests assert exact deltas on under this lock.
 		let _serialised = migration_test_lock::lock();
 		let _overheads = test_overheads::set(OMEGA, PER_OBJECT);
 
-		let mut run = Run::new(policy, tiered);
+		let mut run = Run::new(policy, tiered, b);
 		let mut rng = Rng(seed);
 		let mut n = 0;
 
@@ -1480,6 +1947,12 @@ mod t14 {
 			let r = rng.below(100);
 			let i = rng.below(KEYS);
 			let item = ITEMS[rng.below(ITEMS.len() as u64) as usize];
+
+			if b {
+				script_b_op(&mut run, &mut rng, n, r, i, item);
+				n += 1;
+				continue;
+			}
 
 			match r {
 				// A set of an absent key (or, if it is live, an overwrite).
@@ -1558,24 +2031,162 @@ mod t14 {
 		}
 	}
 
+	/// One T14b op. Over T14's mix: sets whose value has already expired, the
+	/// reaper's take of one and its `Expire`, bursts of three new keys
+	/// published before the worker takes the first, and wipes; deletes only of
+	/// unexpired values (a `del` of an expired one sends no `Del`, and until
+	/// its `Expire` the DashMap stack charges it while the merged store has
+	/// folded it out). Every op is still a sequence the stores agree on: the
+	/// burst's keys are new and distinct, and nothing is deleted or
+	/// overwritten inside it (the lag-only differences R2/R4 and (a)).
+	fn script_b_op(run: &mut Run, rng: &mut Rng, n: usize, r: u64, i: u64, item: ObjectSize) {
+		let next = |run: &Run, from: u64, want: &dyn Fn(&Run, u64) -> bool| {
+			(0..KEYS).map(|d| (from + d) % KEYS).find(|&j| want(run, j))
+		};
+
+		let live_unexpired = |run: &Run, j: u64| run.live(j) && !run.expired(j);
+
+		match r {
+			// A set: new, or an overwrite (of an expired value too).
+			0..30 => run.step(n, |run| run.set(i, item), None),
+
+			// A set whose value has already expired, of an absent key.
+			30..38 => match next(run, i, &|run, j| !run.live(j)) {
+				Some(j) => run.step(n, |run| run.set_expired(j, item), None),
+				None => run.step(n, |run| run.get(i), Some(i)),
+			},
+
+			// An overwrite of an unexpired value: half resized, half not.
+			38..48 => {
+				let resized = rng.below(2) == 0;
+
+				match next(run, i, &live_unexpired) {
+					Some(j) => {
+						let same = run.objects.get_ref(&key(j)).map(|o| {
+							crate::object::overhead::resident_object_bytes::<u64>(o.data_size() as ObjectSize)
+						});
+						let item = if resized { item } else { same.expect("live") };
+
+						run.step(n, |run| run.set(j, item), Some(j));
+					},
+
+					None => run.step(n, |run| run.set(i, item), None),
+				}
+			},
+
+			// A get: a hit if live and unexpired, else a miss.
+			48..72 => run.step(n, |run| run.get(i), Some(i)),
+
+			// A delete of an unexpired value.
+			72..79 => match next(run, i, &live_unexpired) {
+				Some(j) => run.step(n, |run| run.del(j), None),
+				None => run.step(n, |run| run.get(i), Some(i)),
+			},
+
+			// The reaper takes an expired value; its `Expire`.
+			79..87 => match next(run, i, &|run, j| run.expired(j)) {
+				Some(j) => run.step(n, |run| run.reap(j), None),
+				None => run.step(n, |run| run.get(i), Some(i)),
+			},
+
+			// Three new keys, published before the worker takes the first.
+			87..92 => {
+				let mut keys = Vec::new();
+				let mut j = i;
+
+				while keys.len() < 3 {
+					match next(run, j, &|run, k| !run.live(k) && !keys.iter().any(|&(x, _)| x == k)) {
+						Some(k) => {
+							keys.push((k, ITEMS[rng.below(ITEMS.len() as u64) as usize]));
+							j = (k + 1) % KEYS;
+						},
+
+						None => break,
+					}
+				}
+
+				match keys.is_empty() {
+					false => run.step(n, |run| run.burst(&keys), None),
+					true => run.step(n, |run| run.get(i), Some(i)),
+				}
+			},
+
+			// The fast tier resized within [12, 32] KiB.
+			92..95 => {
+				let size = (12 + rng.below(21)) * 1024;
+
+				run.step(n, |run| {
+					run.worker.handle_resize_fast_tier(size);
+					format!("resize_fast_tier {size}")
+				}, None);
+			},
+
+			// The cache's size: shrunk by up to a quarter, or restored.
+			95..99 => {
+				let size = match rng.below(2) {
+					0 => MAX_SIZE - rng.below(MAX_SIZE / 4),
+					_ => MAX_SIZE,
+				};
+
+				run.step(n, |run| {
+					run.worker.status.set_max_size(size);
+					run.worker.handle_resize(size);
+					format!("resize {size}")
+				}, None);
+			},
+
+			// A wipe, the worker's.
+			_ => run.step(n, |run| {
+				run.worker.handle_wipe(None);
+				"wipe".to_string()
+			}, None),
+		}
+	}
+
 	#[test]
 	fn t14_lru_scripts_match_across_stores() {
-		script("lru", PaperPolicy::LruCompactHybrid, true, 11);
+		script("lru", PaperPolicy::LruCompactHybrid, true, 11, false);
 	}
 
 	#[test]
 	fn t14_fifo_scripts_match_across_stores() {
-		script("fifo", PaperPolicy::FifoCompactHybrid, true, 12);
+		script("fifo", PaperPolicy::FifoCompactHybrid, true, 12, false);
 	}
 
 	#[test]
 	fn t14_clock_scripts_match_across_stores() {
-		script("clock", PaperPolicy::ClockCompactHybrid, true, 13);
+		script("clock", PaperPolicy::ClockCompactHybrid, true, 13, false);
 	}
 
 	#[test]
 	fn t14_lfu_scripts_match_across_stores() {
-		script("lfu", PaperPolicy::LfuCompactHybrid, true, 14);
+		script("lfu", PaperPolicy::LfuCompactHybrid, true, 14, false);
+	}
+
+	/// T14b (S4's follow-ups): the same differential without the gauge refresh
+	/// after every op -- so the LFU latch a client builds with is what the
+	/// events published (U12), not what a refresh copied -- and with TTL reaps
+	/// (U8's `Expire`), worker-backlog bursts (unlinked values in the merged
+	/// store at a `Set`, and the reconcile's correctives when a burst latches
+	/// LFU) and wipes (U7). Files `<order>-b.txt`.
+	#[test]
+	fn t14b_lru_scripts_match_across_stores() {
+		script("lru-b", PaperPolicy::LruCompactHybrid, true, 31, true);
+	}
+
+	#[test]
+	fn t14b_fifo_scripts_match_across_stores() {
+		script("fifo-b", PaperPolicy::FifoCompactHybrid, true, 32, true);
+	}
+
+	#[test]
+	fn t14b_clock_scripts_match_across_stores() {
+		script("clock-b", PaperPolicy::ClockCompactHybrid, true, 33, true);
+	}
+
+	#[test]
+	fn t14b_lfu_scripts_match_across_stores() {
+		script("lfu-b", PaperPolicy::LfuCompactHybrid, true, 34, true);
 	}
 
 	/// The flat caches -- the other half of the merged store's use: the same
@@ -1590,7 +2201,7 @@ mod t14 {
 			("flat-clock", PaperPolicy::ClockCompact, 23),
 			("flat-lfu", PaperPolicy::LfuCompact, 24),
 		] {
-			script(name, policy, false, seed);
+			script(name, policy, false, seed, false);
 		}
 	}
 }

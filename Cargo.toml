@@ -34,14 +34,20 @@ libc = "0.2.177"
 # Direct dependency so `numa_jemalloc` actually links libjemalloc: the
 # `_rjem_*` symbols its arenas call come from this crate's build script, and
 # reaching it only transitively leaves them undefined at link time.
-# `stats` builds jemalloc with --enable-stats, which exposes
-# `stats.allocated` (bytes handed to the application, size-class rounded --
-# the same quantity `malloc_usable_size` returns and therefore the same
-# quantity Redis reports as `used_memory`) and `stats.resident`. Those two
-# replace the fitted residency multiplier this crate used to apply: memory
-# accounting is now a measurement plus a separately reported fragmentation
-# ratio, which is how Redis and memcached report it, rather than an
-# allocated figure scaled by a constant nobody can check.
+# `stats` builds jemalloc with --enable-stats, for `jemalloc_stats()` in
+# lib.rs: a diagnostic sample of the process-wide `stats.allocated` (bytes
+# handed to the application, size-class rounded -- what Redis reports as
+# `used_memory`), `active`, `resident`, `mapped` and `retained`. The cache's
+# accounting does not read them. It charges values in jemalloc's units --
+# each value its size class, `nallocx` (`resident_object_bytes`,
+# object/overhead.rs), where a fitted residency multiplier used to scale the
+# request -- and reports process-level waste (dirty pages, arena
+# fragmentation) apart, as a fragmentation ratio, the way Redis and memcached
+# do (the benchmark's `mem_fragmentation_ratio`, RSS over `used_size`). No
+# decision reads a live allocator figure, and the per-object metadata (the
+# map row, the value header, the stack node) is a calibrated constant per
+# object (`get_policy_overhead`, `get_hybrid_dram_shared_overhead`), not a
+# measurement.
 tikv-jemalloc-sys = { version = "0.6.1", features = ["stats"] }
 hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"

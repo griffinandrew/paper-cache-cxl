@@ -43,8 +43,9 @@ use dashmap::DashMap;
 use hashbrown::HashMap;
 use nohash_hasher::NoHashHasher;
 
-use crate::{HashedKey, NoHasher, Tier};
+use crate::{CacheSize, HashedKey, NoHasher, Tier};
 use crate::object::{Object, ObjectSize};
+use crate::status::Cleared;
 
 /// Common operations `PaperCache`'s generic impl blocks need from the
 /// object map, independent of whether it's backed by a `DashMap` or an
@@ -60,8 +61,15 @@ pub trait ObjectStore<K, V> {
 	/// existed.
 	fn insert(&self, key: HashedKey, object: Object<K, V>) -> Option<Object<K, V>>;
 
-	/// Removes and returns every object, resetting the store to empty.
-	fn clear(&self);
+	/// Removes every object, resetting the store to empty, and returns what it
+	/// removed: the objects, and the base bytes `base_size` gives each
+	/// (`OverheadManager::base_size`), for `AtomicStatus::clear` to take off.
+	/// Each object is counted under the lock that removes it, so an insert
+	/// racing the clear is counted exactly when it is removed: one landing in
+	/// a part of the map the clear has already emptied stays, and is not in
+	/// the count. A different name from `DashMap`'s inherent `clear`, which
+	/// method resolution would otherwise pick, and which counts nothing.
+	fn clear_counted(&self, base_size: impl Fn(&Object<K, V>) -> ObjectSize) -> Cleared;
 
 	/// Returns the number of objects currently tracked.
 	fn len(&self) -> usize;
@@ -94,8 +102,19 @@ impl<K, V> ObjectStore<K, V> for DashMap<HashedKey, Object<K, V>, NoHasher> {
 		DashMap::insert(self, key, object)
 	}
 
-	fn clear(&self) {
-		DashMap::clear(self)
+	/// Shard by shard, each under its write lock (`retain`), each object
+	/// counted as it is dropped.
+	fn clear_counted(&self, base_size: impl Fn(&Object<K, V>) -> ObjectSize) -> Cleared {
+		let mut cleared = Cleared::default();
+
+		DashMap::retain(self, |_, object| {
+			cleared.objects += 1;
+			cleared.base_bytes += base_size(object) as CacheSize;
+
+			false
+		});
+
+		cleared
 	}
 
 	fn len(&self) -> usize {
@@ -183,8 +202,18 @@ impl<K, V, A: Allocator> ObjectStore<K, V>
 		self.write().unwrap().insert(key, object)
 	}
 
-	fn clear(&self) {
-		self.write().unwrap().clear()
+	/// Under the map's one write lock: counted, then cleared.
+	fn clear_counted(&self, base_size: impl Fn(&Object<K, V>) -> ObjectSize) -> Cleared {
+		let mut map = self.write().unwrap();
+
+		let cleared = Cleared {
+			objects: map.len() as u64,
+			base_bytes: map.values().map(|object| base_size(object) as CacheSize).sum(),
+		};
+
+		map.clear();
+
+		cleared
 	}
 
 	fn len(&self) -> usize {
