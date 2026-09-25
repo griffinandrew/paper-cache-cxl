@@ -2170,9 +2170,10 @@ where
 	/// MEMTS line at most every 250 ms. Reporting only: nothing here feeds a
 	/// decision (the gate that will is S5).
 	///
-	/// Per pass that is 17 relaxed loads for P, one `fetch_max`, a few status
-	/// loads and a multiply; the MEMTS line (a `/proc/self/status` read and
-	/// one `eprintln!`) only when enabled and due.
+	/// Per pass that is 17 loads for P (one `Acquire`, 16 relaxed), one
+	/// `fetch_max`, a few status loads and a multiply; the MEMTS line (a
+	/// `/proc/self/status` read and one `eprintln!`) only when enabled and
+	/// due.
 	#[cfg(feature = "hybrid_cache_common")]
 	fn instrument_pass(&mut self, now: Instant) {
 		if !self.tier_migration {
@@ -2210,6 +2211,7 @@ where
 			backlog: self.listener.len(),
 			live_tiered_caches: crate::phys::live_tiered_caches(),
 			vmrss_kb: crate::phys::vmrss_kb(),
+			live_flat_fast_caches: crate::phys::live_flat_fast_caches(),
 		};
 
 		eprintln!("{}", crate::phys::format_memts(&sample));
@@ -4750,5 +4752,221 @@ mod capacity_watermark_tests {
 		// by a watermark that has nothing to say about its sub-structure.
 		assert_eq!(objects.len() as u64, 2);
 		assert_eq!(used(&status), 2 * per_object);
+	}
+}
+
+/// PHYS_FAST through the transient states T9's quiescent checks cannot see: a
+/// migration parked between building its copy and swapping it in (the
+/// `migration_queue::after_copy` rendezvous), and a reader's snapshot of a
+/// value that is then overwritten. P counts ALLOCATIONS, so in both it must
+/// count every live fast copy -- published or not, installed or superseded
+/// -- and drop each one exactly when its last handle does.
+///
+/// P is PROCESS-GLOBAL, and this binary runs every lib test on parallel
+/// threads, many of them building fast values, so an exact assertion on P
+/// here would race all of them. Each test therefore re-runs ITSELF, alone,
+/// in a child copy of this test binary (`--exact`, with
+/// `PAPER_PHYS_TRANSIENT_CHILD=1` telling the child to run the body instead
+/// of spawning again), where nothing else builds a value; the parent passes
+/// only if the child ran exactly that one test and it passed. The rendezvous
+/// is a `cfg(test)` hook inside the lib, which is why these cannot move to a
+/// binary of their own the way T9 did.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod phys_transient_tests {
+	use std::time::Duration;
+
+	use super::*;
+	use super::migration_queue::{after_copy, apply_migration};
+	use crate::object::Object;
+	// The merged store answers these calls with inherent methods.
+	#[cfg(not(feature = "merged_object_store"))]
+	use crate::object_store::ObjectStore;
+	use crate::{phys, TieredValue};
+
+	const CHILD: &str = "PAPER_PHYS_TRANSIENT_CHILD";
+
+	type Objects = ObjectMapRef<u32, crate::TieredBuffer>;
+
+	/// Runs `body` in a child process in which `test` is the only test.
+	fn alone(test: &str, body: impl FnOnce()) {
+		if std::env::var_os(CHILD).is_some_and(|value| value == "1") {
+			body();
+			return;
+		}
+
+		// libtest names a test by its path without the crate.
+		let (_, module) = module_path!().split_once("::").expect("a module path");
+		let name = format!("{module}::{test}");
+
+		let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+			.args([name.as_str(), "--exact", "--test-threads=1"])
+			.env(CHILD, "1")
+			.output()
+			.expect("could not re-run this test binary");
+
+		let stdout = String::from_utf8_lossy(&out.stdout);
+		let stderr = String::from_utf8_lossy(&out.stderr);
+
+		assert!(
+			out.status.success() && stdout.contains("test result: ok. 1 passed;"),
+			"{name}, run alone in a child process ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+			out.status,
+		);
+	}
+
+	/// P, relative to `p0`.
+	fn p(p0: i64) -> i64 {
+		phys::fast_bytes_signed() - p0
+	}
+
+	fn charge(len: usize) -> i64 {
+		phys::value_charge::<u32>(len as u32) as i64
+	}
+
+	fn tier_of(objects: &Objects, key: HashedKey) -> Tier {
+		objects.get_ref(&key).unwrap().value().tier()
+	}
+
+	/// Starts `apply_migration(key -> tier)` on a thread of its own and
+	/// returns once it is parked after building its copy, before the swap.
+	fn park(
+		objects: &Objects,
+		key: HashedKey,
+		tier: Tier,
+	) -> (std::thread::JoinHandle<bool>, crossbeam_channel::Sender<()>) {
+		let (entered, release) = after_copy::arm(key);
+		let migrating = objects.clone();
+		let migration = std::thread::spawn(move || apply_migration(&migrating, key, tier));
+
+		entered
+			.recv_timeout(Duration::from_secs(10))
+			.expect("the migration never reached the post-copy park point");
+
+		(migration, release)
+	}
+
+	/// Three migrations, each parked after its copy is built:
+	///
+	///   1. a promotion, applied: its DRAM copy is counted before it is
+	///      published, while the map still holds the CXL original, and stays
+	///      the one counted copy after the swap;
+	///   2. a promotion superseded by a set while parked: the parked DRAM copy
+	///      and the set's DRAM value are BOTH counted, and the copy is
+	///      refunded when the consumer drops it unpublished;
+	///   3. a demotion: its DRAM original stays counted until the swap drops
+	///      it.
+	#[test]
+	fn a_parked_migration_keeps_every_live_fast_copy_counted() {
+		alone("a_parked_migration_keeps_every_live_fast_copy_counted", || {
+			const PROMOTED: HashedKey = 0x0001_F457;
+			const SUPERSEDED: HashedKey = 0x0002_F457;
+			const DEMOTED: HashedKey = 0x0003_F457;
+			// Distinct size classes, so a copy charged at the wrong size or
+			// refunded for the wrong value cannot cancel out.
+			const LEN: usize = 3_000;
+			const SET_LEN: usize = 5_000;
+			const DEMOTED_LEN: usize = 9_000;
+
+			let objects: Objects = crate::new_hybrid_object_map();
+			let p0 = phys::fast_bytes_signed();
+
+			// 1. A promotion, applied.
+			objects.insert(PROMOTED, Object::new_in(PROMOTED as u32, &[0x11; LEN], Tier::Slow, None));
+			assert_eq!(p(p0), 0, "a CXL value charges nothing");
+
+			let (migration, release) = park(&objects, PROMOTED, Tier::Fast);
+			assert_eq!(tier_of(&objects, PROMOTED), Tier::Slow, "parked before the swap");
+			assert_eq!(p(p0), charge(LEN), "P counts the promotion's DRAM copy before it is published");
+
+			release.send(()).unwrap();
+			assert!(migration.join().unwrap(), "the promotion was applied");
+			assert_eq!(tier_of(&objects, PROMOTED), Tier::Fast);
+			assert_eq!(p(p0), charge(LEN), "one DRAM copy, now the installed one; the CXL original's free is not P's");
+
+			let base = p(p0);
+
+			// 2. A promotion superseded by a set while it is parked.
+			objects.insert(SUPERSEDED, Object::new_in(SUPERSEDED as u32, &[0x22; LEN], Tier::Slow, None));
+			assert_eq!(p(p0), base);
+
+			let (migration, release) = park(&objects, SUPERSEDED, Tier::Fast);
+			assert_eq!(p(p0), base + charge(LEN), "the parked copy");
+
+			// What `set` does with a key it overwrites: install the new value
+			// under the write guard and drop the displaced handle.
+			let fresh = TieredValue::new_fast(SUPERSEDED as u32, &[0x33; SET_LEN], None);
+			drop(objects.get_mut_ref(&SUPERSEDED).unwrap().set_data(fresh));
+			assert_eq!(
+				p(p0),
+				base + charge(LEN) + charge(SET_LEN),
+				"BOTH DRAM copies are counted: the parked promotion's and the set's",
+			);
+
+			release.send(()).unwrap();
+			assert!(!migration.join().unwrap(), "the set superseded the promotion");
+			assert_eq!(
+				p(p0),
+				base + charge(SET_LEN),
+				"the superseded copy was refunded when the consumer dropped it unpublished",
+			);
+
+			let base = p(p0);
+
+			// 3. A demotion.
+			objects.insert(DEMOTED, Object::new_in(DEMOTED as u32, &[0x44; DEMOTED_LEN], Tier::Fast, None));
+			assert_eq!(p(p0), base + charge(DEMOTED_LEN));
+
+			let (migration, release) = park(&objects, DEMOTED, Tier::Slow);
+			assert_eq!(tier_of(&objects, DEMOTED), Tier::Fast, "parked before the swap");
+			assert_eq!(
+				p(p0),
+				base + charge(DEMOTED_LEN),
+				"a demotion's DRAM original stays counted while its CXL copy is built",
+			);
+
+			release.send(()).unwrap();
+			assert!(migration.join().unwrap(), "the demotion was applied");
+			assert_eq!(tier_of(&objects, DEMOTED), Tier::Slow);
+			assert_eq!(p(p0), base, "the swap dropped the DRAM original");
+
+			drop(objects);
+			assert_eq!(p(p0), 0, "every fast allocation was refunded");
+		});
+	}
+
+	/// What `get` does: lift a strong handle out under the shard guard, then
+	/// copy with no guard held. A set that overwrites the key meanwhile
+	/// displaces the value, but the snapshot keeps it allocated -- and P
+	/// counted -- until the reader lets go.
+	#[test]
+	fn a_readers_snapshot_keeps_an_overwritten_fast_value_counted() {
+		alone("a_readers_snapshot_keeps_an_overwritten_fast_value_counted", || {
+			const KEY: HashedKey = 0x0004_F457;
+			const OLD_LEN: usize = 3_000;
+			const NEW_LEN: usize = 5_000;
+
+			let objects: Objects = crate::new_hybrid_object_map();
+			let p0 = phys::fast_bytes_signed();
+
+			objects.insert(KEY, Object::new_in(KEY as u32, &[0x55; OLD_LEN], Tier::Fast, None));
+			assert_eq!(p(p0), charge(OLD_LEN));
+
+			let snapshot = objects.get_ref(&KEY).map(|object| object.snapshot()).unwrap();
+
+			let fresh = TieredValue::new_fast(KEY as u32, &[0x66; NEW_LEN], None);
+			drop(objects.get_mut_ref(&KEY).unwrap().set_data(fresh));
+			assert_eq!(
+				p(p0),
+				charge(OLD_LEN) + charge(NEW_LEN),
+				"the reader's snapshot keeps the overwritten value counted",
+			);
+
+			assert_eq!(snapshot.bytes(), &[0x55; OLD_LEN][..], "the reader still copies the old bytes");
+			drop(snapshot);
+			assert_eq!(p(p0), charge(NEW_LEN), "the snapshot was the last handle: its drop refunded it");
+
+			drop(objects);
+			assert_eq!(p(p0), 0);
+		});
 	}
 }

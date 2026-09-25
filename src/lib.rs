@@ -720,6 +720,15 @@ where
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
+		// A flat cache whose values are FAST builds them through the same
+		// `TieredValue::new_in` as a tiered one, so PHYS_FAST counts them:
+		// counted in `phys::live_flat_fast_caches` until the status is freed,
+		// since P describes one tiered cache only while that reads 0.
+		#[cfg(feature = "hybrid_cache_common")]
+		if matches!(V::TIER, crate::Tier::Fast) {
+			status.register_flat_fast_cache();
+		}
+
 		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 		let tiering_manager = {
 			// Create tiering manager with default DRAM threshold at 20% of max_size
@@ -1476,6 +1485,15 @@ where
 
 		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+		// A flat cache whose values are FAST builds them through the same
+		// `TieredValue::new_in` as a tiered one, so PHYS_FAST counts them:
+		// counted in `phys::live_flat_fast_caches` until the status is freed,
+		// since P describes one tiered cache only while that reads 0.
+		#[cfg(feature = "hybrid_cache_common")]
+		if matches!(V::TIER, crate::Tier::Fast) {
+			status.register_flat_fast_cache();
+		}
 
 		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
 		let tiering_manager = {

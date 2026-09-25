@@ -23,11 +23,11 @@
 //! (fast/slow bytes and objects, and the metadata reservation), 8 size-split
 //! gauges that only `LruSizedCompactHybrid` ever populates -- they read zero
 //! under every other design -- and, since the fast-tier backpressure plan's
-//! S2, 7 readings of the PHYSICAL fast tier and its budget: PHYS_FAST and its
+//! S2, 8 readings of the PHYSICAL fast tier and its budget: PHYS_FAST and its
 //! peak, `effective_fast_capacity`, the over-budget integral, hits by serving
-//! tier, and the live tiered-cache count. Three of those are PROCESS-GLOBAL
-//! (`phys_fast_bytes`, `phys_fast_bytes_max`, `live_tiered_caches`); see each
-//! field.
+//! tier, and the live tiered-cache and flat-fast-cache counts. Four of those
+//! are PROCESS-GLOBAL (`phys_fast_bytes`, `phys_fast_bytes_max`,
+//! `live_tiered_caches`, `live_flat_fast_caches`); see each field.
 
 /// Feature-neutral snapshot of the active hybrid cache's tier-movement
 /// counters and live tier gauges.
@@ -86,13 +86,17 @@ pub struct HybridStats {
 	/// tier's value pool right now, in the stacks' own per-object unit --
 	/// where `fast_bytes_used` is the stacks' INTENT. Includes unsettled sets,
 	/// pending demotions, in-flight migration copies, superseded copies and
-	/// readers' snapshots. PROCESS-GLOBAL: every fast value of every cache in
-	/// the process, so it describes this cache only while
-	/// `live_tiered_caches == 1`.
+	/// readers' snapshots. PROCESS-GLOBAL: every fast value in the process, a
+	/// flat fast cache's included, so it describes this cache only while
+	/// `live_tiered_caches == 1` and `live_flat_fast_caches == 0`.
 	pub phys_fast_bytes: u64,
 
 	/// Peak of `phys_fast_bytes` seen at a shard fold or a policy-worker pass:
-	/// a LOWER BOUND on the true peak. Process-global and never reset.
+	/// a lower bound on the true peak up to one sample's torn read -- a burst
+	/// between two samples is missed, and a sample, not being a snapshot, can
+	/// over-state by the bytes charged and refunded while it reads (see
+	/// `phys`'s `Counter::max`). Process-global, and never reset outside tests
+	/// (`phys::reset_fast_bytes_max`).
 	pub phys_fast_bytes_max: u64,
 
 	/// `F - L * omega`: the fast tier's budget for value bytes once the
@@ -101,7 +105,13 @@ pub struct HybridStats {
 
 	/// The integral over time of `max(0, phys_fast_bytes + L * omega - F)`,
 	/// in whole byte-seconds, accumulated by this cache's policy worker once
-	/// per pass since the cache was built (a `wipe()` does not reset it).
+	/// per pass since the cache was built (a `wipe()` does not reset it). A
+	/// right Riemann sum over the worker's poll intervals: it over-states an
+	/// excursion's head and can drop its tail, each by up to one interval (1
+	/// ms while sets are recent, 1 s otherwise) -- see
+	/// `phys::over_budget_increment`. Its integrand is not `phys_fast_bytes -
+	/// effective_fast_capacity` once `L * omega > F`, where the latter
+	/// saturates at 0.
 	pub over_budget_byte_seconds: u64,
 
 	/// Hits served from the fast / the slow tier: the tier of the value a
@@ -112,6 +122,11 @@ pub struct HybridStats {
 
 	/// Tiered caches alive in this process (`phys::live_tiered_caches`).
 	pub live_tiered_caches: u64,
+
+	/// Flat caches whose values are fast (`PaperCache<K, BufferDRAM>`) alive
+	/// in this process (`phys::live_flat_fast_caches`). Their values are in
+	/// `phys_fast_bytes` too.
+	pub live_flat_fast_caches: u64,
 }
 
 impl HybridStats {

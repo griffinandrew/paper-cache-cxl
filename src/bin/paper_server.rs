@@ -457,24 +457,33 @@ fn render_self_stats(stats: &SelfStats, cache: &Cache) -> String {
 
 	// PHYS_FAST (`paper_cache::phys`) and the budget it is measured against,
 	// APPENDED after every existing line so no reader's anchor or position
-	// moves. None of these lines starts with a word the existing readers
-	// anchor on (run_mem.py's `^fast\s+\d+ objects`, `^slow\s+`, `^dram\s+`,
-	// `^promotions`, ...). P and its peak are process-global; the server runs
-	// one cache, which `tiered caches` confirms. Reporting only.
+	// moves. P and its peak are process-global; the server runs one tiered
+	// cache and no flat one, which `tiered caches` and `flat caches` confirm.
+	// Reporting only.
 	#[cfg(not(feature = "all_dram"))]
-	{
-		let tier = cache.hybrid_stats();
-
-		let _ = writeln!(out, "\n*** PHYSICAL FAST TIER (reporting only) ***\n");
-		let _ = writeln!(out, "phys fast      {} B (peak >= {} B)",
-			tier.phys_fast_bytes, tier.phys_fast_bytes_max);
-		let _ = writeln!(out, "eff fast cap   {} B", tier.effective_fast_capacity);
-		let _ = writeln!(out, "over budget    {} B*s", tier.over_budget_byte_seconds);
-		let _ = writeln!(out, "hits fast/slow {}/{}", tier.fast_hits, tier.slow_hits);
-		let _ = writeln!(out, "tiered caches  {}", tier.live_tiered_caches);
-	}
+	render_physical_fast_tier(&mut out, &cache.hybrid_stats());
 
 	out
+}
+
+/// The PHYSICAL FAST TIER section, from one `HybridStats` snapshot: a
+/// function of its own so it is unit-tested without a cache or a socket.
+///
+/// None of its lines starts with a word the existing readers anchor on
+/// (run_mem.py's `^fast\s+\d+ objects`, `^slow\s+`, `^dram\s+`,
+/// `^promotions`, ...; the tests below check all fourteen). `flat caches`
+/// counts the flat caches whose values are fast -- the only flat caches whose
+/// values P counts.
+#[cfg(not(feature = "all_dram"))]
+fn render_physical_fast_tier(out: &mut String, tier: &paper_cache::HybridStats) {
+	let _ = writeln!(out, "\n*** PHYSICAL FAST TIER (reporting only) ***\n");
+	let _ = writeln!(out, "phys fast      {} B (peak >= {} B)",
+		tier.phys_fast_bytes, tier.phys_fast_bytes_max);
+	let _ = writeln!(out, "eff fast cap   {} B", tier.effective_fast_capacity);
+	let _ = writeln!(out, "over budget    {} B*s", tier.over_budget_byte_seconds);
+	let _ = writeln!(out, "hits fast/slow {}/{}", tier.fast_hits, tier.slow_hits);
+	let _ = writeln!(out, "tiered caches  {}", tier.live_tiered_caches);
+	let _ = writeln!(out, "flat caches    {} (fast values)", tier.live_flat_fast_caches);
 }
 
 #[cfg(not(feature = "all_dram"))]
@@ -1087,3 +1096,110 @@ OPTIONS:
                            on demand.
     -h, --help             Print this help
 ";
+
+#[cfg(all(test, not(feature = "all_dram")))]
+mod tests {
+	use super::*;
+
+	/// The fourteen patterns run_mem.py reads the self-stats with (the same
+	/// fourteen in all five copies under ~/paper), reduced to what a line
+	/// must START with to match one: thirteen are a keyword and then
+	/// whitespace (`^fast\s+`, `^slow\s+`, `^used size\s+`, ...; `fast` and
+	/// `slow` open two and three of them), and the fourteenth is leading
+	/// whitespace and a `+`. A section line starting like any of them could
+	/// be read as that figure.
+	const READER_KEYWORDS: [&str; 10] = [
+		"objects", "used size", "max size", "fast", "slow", "promotions",
+		"demotions", "evictions", "rss", "dram",
+	];
+
+	fn read_by_run_mem(line: &str) -> bool {
+		let keyword = READER_KEYWORDS.iter().any(|keyword| {
+			line.strip_prefix(keyword)
+				.is_some_and(|rest| rest.starts_with(char::is_whitespace))
+		});
+
+		keyword || line.trim_start().starts_with('+')
+	}
+
+	#[test]
+	fn the_physical_fast_tier_section_prints_each_reading_under_its_own_label() {
+		let tier = paper_cache::HybridStats {
+			phys_fast_bytes: 697_344,
+			phys_fast_bytes_max: 3_072_000,
+			effective_fast_capacity: 815_104,
+			over_budget_byte_seconds: 2_369_712,
+			fast_hits: 429,
+			slow_hits: 7,
+			live_tiered_caches: 1,
+			live_flat_fast_caches: 2,
+			// Everything the section must NOT print: distinct values, so a
+			// line reading the wrong field shows up in the comparison.
+			fast_bytes_used: 11,
+			slow_bytes_used: 13,
+			fast_objects: 17,
+			slow_objects: 19,
+			fast_metadata_bytes: 23,
+			..paper_cache::HybridStats::default()
+		};
+
+		let mut out = String::new();
+		render_physical_fast_tier(&mut out, &tier);
+
+		assert_eq!(
+			out,
+			"\n*** PHYSICAL FAST TIER (reporting only) ***\n\n\
+			 phys fast      697344 B (peak >= 3072000 B)\n\
+			 eff fast cap   815104 B\n\
+			 over budget    2369712 B*s\n\
+			 hits fast/slow 429/7\n\
+			 tiered caches  1\n\
+			 flat caches    2 (fast values)\n",
+		);
+
+		for line in out.lines() {
+			assert!(!read_by_run_mem(line), "run_mem.py would read {line:?} as one of its figures");
+		}
+
+		// The matcher itself, on the lines it exists to find.
+		for anchored in ["fast           3 objects, 4 B", "slow           0 objects, 0 B",
+			"               + 5 B reserved for per-object metadata", "promotions     1",
+			"dram                        1                  2", "rss            7 B (hwm 8 B)"]
+		{
+			assert!(read_by_run_mem(anchored), "{anchored:?} is a line run_mem.py reads");
+		}
+	}
+
+	/// The section is wired to the cache: appended after every other section,
+	/// and reading this process's one tiered cache.
+	#[test]
+	fn self_stats_end_with_the_physical_fast_tier_of_the_one_cache() {
+		let cache = Cache::new(
+			1 << 20,
+			CacheTierSize::Bytes(64 << 10),
+			PaperPolicy::LruCompactHybrid,
+		)
+		.expect("a tiered cache");
+
+		cache.set(1, &[1u8; 1_000], None).expect("set");
+		cache.get(&1).expect("a hit");
+
+		let full = render_self_stats(&SelfStats::new(), &cache);
+		let (before, section) = full
+			.rsplit_once("\n*** PHYSICAL FAST TIER (reporting only) ***\n\n")
+			.expect("the section is present");
+
+		assert!(before.contains("*** TIERS ***"), "it comes after the tier section");
+		assert!(!section.contains("***"), "and nothing comes after it");
+
+		let labels: Vec<&str> = section.lines().map(|line| &line[..15]).collect();
+		assert_eq!(
+			labels,
+			["phys fast      ", "eff fast cap   ", "over budget    ", "hits fast/slow ",
+				"tiered caches  ", "flat caches    "],
+		);
+		assert!(section.contains("hits fast/slow 1/0\n"), "the hit was served from DRAM: {section}");
+		assert!(section.contains("tiered caches  1\n"), "{section}");
+		assert!(section.contains("flat caches    0 (fast values)\n"), "{section}");
+	}
+}

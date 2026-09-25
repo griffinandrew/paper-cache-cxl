@@ -48,17 +48,20 @@ src/
                                -> Tier, a runtime match over PaperPolicy with one arm per
                                design's admission rule, called from set() in lib.rs.
   hybrid_stats.rs             HybridStats — design-neutral snapshot: 3 counters, 5 tier gauges,
-                               8 size-split gauges that only LruSizedHybrid populates, and 7
+                               8 size-split gauges that only LruSizedHybrid populates, and 8
                                physical-fast-tier readings (PHYS_FAST and its peak, the
                                effective capacity, the over-budget integral, fast/slow hits,
-                               live tiered caches). The single stats accessor for every design;
+                               live tiered caches, live flat caches with fast values). The
+                               single stats accessor for every design;
                                the per-design *_hybrid_stats() methods are gone.
   phys.rs                     PHYS_FAST: bytes physically allocated in the fast tier's value
                                pool, charged in TieredValue::new_in and refunded by the value's
                                drop, in the stacks' own unit (resident_object_bytes). Sharded
                                like numa_alloc::measured and PROCESS-GLOBAL: meaningful for one
-                               cache while live_tiered_caches() == 1. Also the policy worker's
-                               per-pass over-budget integral and the MEMTS line (PAPER_MEMTS).
+                               cache while live_tiered_caches() == 1 and
+                               live_flat_fast_caches() == 0 (a flat BufferDRAM cache's values
+                               are in P too). Also the policy worker's per-pass over-budget
+                               integral and the MEMTS line (PAPER_MEMTS=1).
                                Reporting only; the fast-tier gate (S5) will read it.
   numa_alloc.rs               Node-bound jemalloc arenas. NumaAlloc<NODE_FAST> is the crate's
                                #[global_allocator]; SlowObjects (aliased crate-wide as `Hybrid`)
@@ -116,9 +119,13 @@ tests/
                                          feature. Some carry #[ignore]d at-scale reproductions.
   tiering_integration.rs                 The legacy copy-based manager.
   phys_fast_identity.rs                  PHYS_FAST == the stacks' fast_used at quiescence, and
-                                         back to its start once the cache drops, for LRU, FIFO,
-                                         CLOCK and LFU. A binary of its own (P is process-global);
-                                         runs in every unit build.
+                                         back to its start once the cache drops: LRU, FIFO,
+                                         CLOCK and LFU in every unit build, and one test per
+                                         other design in the DashMap/hashbrown builds (the two
+                                         faithful S3-FIFO designs with a slow small queue are
+                                         #[ignore]d: their stack strands a promotion). Plus the
+                                         flat-fast-cache count. A binary of its own (P is
+                                         process-global); its tests hold one lock.
   isolate_pmem_latency.rs                Allocator-level latency probe.
 ```
 

@@ -74,6 +74,15 @@
 //! fast_objects * (key_size + 4)`, plus 64 per TTL'd fast object, and the
 //! identity test asserts that relation instead.
 //!
+//! One more condition, on the DashMap-family stacks in the split and thin
+//! layouts: they keep the DRAM-resident remainder of an object -- `key_size +
+//! 4` (the expiry field), `+ 64` for a TTL'd object (`get_ttl_overhead`) -- in
+//! a spare `u8` of the stack entry (`narrow_resident`), saturating at 255, and
+//! charge `base_size` less THAT. So their `fast_used` equals P only while
+//! `key_size + 4 (+ 64 with a TTL) <= 255`: a longer key leaves its saturated
+//! excess in `fast_used` on top of P, per fast object. The merged store does
+//! not narrow, and a `u64` key's remainder is 12 (76 with a TTL).
+//!
 //! The rounding is `nallocx(n, 0)`, not the `Layout`'s `(size, 8)`: identical
 //! for every non-zero size (jemalloc's classes are multiples of 8), and for a
 //! zero-length split value the stacks charge 0 where the allocator hands out
@@ -102,27 +111,45 @@
 //!
 //! Like `numa_alloc::measured`, this is one counter per PROCESS: the charge
 //! site is the value constructor, which does not know which cache it belongs
-//! to. It counts every fast `TieredValue` -- a flat (`BufferDRAM`) cache in a
-//! hybrid build builds its values through the same `new_in` and is counted
-//! too. So P describes one cache only while that cache is the only one alive.
-//! [`live_tiered_caches`] counts the tiered caches (up in the two hybrid
-//! constructors, down when the cache is dropped), and a consumer -- the S5
-//! gate in particular -- must refuse or disable itself unless it reads 1. The
-//! server builds exactly one cache, and so does the benchmark's in-process
-//! mode (one cache shared by every client); a harness that builds more sees
-//! it in this count.
+//! to. It counts every fast `TieredValue`, not only a tiered cache's: a FLAT
+//! cache whose values are fast (`PaperCache<K, BufferDRAM>` in a hybrid
+//! build) builds them through the same `new_in`. Two live counts say what
+//! else P holds:
+//!
+//!   * [`live_tiered_caches`] -- tiered caches, counted in the two hybrid
+//!     constructors and uncounted when the cache is dropped;
+//!   * [`live_flat_fast_caches`] -- flat caches whose values are fast
+//!     (`V::TIER == Tier::Fast`), counted in the two flat constructors and
+//!     uncounted when dropped. A `BufferPMEM` cache's values are slow and
+//!     charge nothing, so it is not counted.
+//!
+//! P describes ONE cache only while `live_tiered_caches() == 1` AND
+//! `live_flat_fast_caches() == 0`. A consumer -- the S5 gate in particular --
+//! must check both, and refuse or disable itself otherwise. The server builds
+//! exactly one cache, and so does the benchmark's in-process mode (one cache
+//! shared by every client); a harness that builds more sees it in these
+//! counts. A value built outside any cache (a test's `TieredValue::new_fast`)
+//! is in P and in neither count.
 //!
 //! ## Cost
 //!
 //! Per fast value allocation and per fast value free: one `nallocx` (a
 //! size-class lookup, the same call `base_size` already makes on every set),
 //! one read of the allocator's per-thread arena slot, and one relaxed
-//! `fetch_add` on a cache-line-padded shard chosen by that slot -- no lock,
-//! and no line shared by threads holding different slots. A shard is folded
-//! into the shared `approx` word only when its magnitude reaches
-//! [`FOLD_BYTES`], once per 128 KiB of one thread's net drift (every ~8
-//! allocations of a 16 KiB value, every ~128 of a 1 KiB one). A slow value
-//! pays one tier-tag branch. Arithmetic, not a measurement.
+//! `fetch_add` on a cache-line-padded shard chosen by that slot -- no lock.
+//! A shard is not one thread's line, though. `numa_alloc` hands slots out
+//! round-robin, `0..32` (`MAX_ARENAS_PER_NODE`), in the order threads first
+//! allocate through a bound arena, and the shard is the slot `% 16`
+//! ([`SHARDS`]): the 1st and the 17th thread to allocate share shard 0, the
+//! 2nd and the 18th shard 1, and so on, and a thread that has never allocated
+//! through a bound arena reads `u32::MAX`, which is shard 15, beside slots 15
+//! and 31. So at most 16 threads can have a line each, and only while no
+//! other thread's slot is congruent to theirs mod 16; past that, threads
+//! share lines -- contention, never a wrong sum. A shard is folded into the
+//! shared `approx` word only when its magnitude reaches [`FOLD_BYTES`], once
+//! per 128 KiB of one shard's net drift (every ~8 allocations of a 16 KiB
+//! value, every ~128 of a 1 KiB one). A slow value pays one tier-tag branch.
+//! Arithmetic, not a measurement.
 //!
 //! Not compiled without `hybrid_cache_common`: a build with no tiers pays
 //! nothing.
@@ -137,6 +164,9 @@ use std::{
 
 /// Shards per counter, keyed by `numa_alloc`'s per-thread arena slot -- the
 /// key `numa_alloc::measured` already shards on, so no second thread-local.
+/// Slots run `0..32` and are reduced `% SHARDS`, so slots `s` and `s + 16`
+/// share a shard, and a thread with no slot yet (`u32::MAX`) uses the last:
+/// see the module doc's Cost section.
 pub const SHARDS: usize = 16;
 
 /// A shard is folded into `approx` once its magnitude reaches this, in EITHER
@@ -185,14 +215,20 @@ impl Counter {
 
 	/// Moves a shard's whole balance into `approx`. `swap` takes everything,
 	/// adds that raced in after the one that triggered the fold included, so
-	/// nothing is lost or counted twice. A concurrent `exact` can miss the
-	/// swapped amount for the two instructions between the swap and the add
-	/// -- a torn read, like any other cross-shard sum here.
+	/// nothing is lost or counted twice in the sum.
+	///
+	/// A concurrent reader can still catch the move half done: the balance
+	/// has left the shard and not yet reached `approx`. The add is `Release`
+	/// and `exact` loads `approx` FIRST, with `Acquire`, then the shards: a
+	/// reader whose `approx` load sees this add therefore also sees the swap
+	/// when it reads the shard. So a fold in flight can be MISSED by a read
+	/// (the balance in neither place it looked), never counted twice (in
+	/// both). See `exact`.
 	#[cold]
 	#[inline(never)]
 	fn fold(&self, cell: &AtomicI64) {
 		let taken = cell.swap(0, Ordering::Relaxed);
-		self.approx.0.fetch_add(taken, Ordering::Relaxed);
+		self.approx.0.fetch_add(taken, Ordering::Release);
 		self.observe_max(self.exact());
 	}
 
@@ -200,10 +236,36 @@ impl Counter {
 	/// charge, refund or fold is in flight, a torn read otherwise (like
 	/// `measured::allocated`). Signed: a torn read can be momentarily
 	/// negative, and a test looking for drift must see a persistent one.
+	///
+	/// `approx` is loaded FIRST, with `Acquire` (paired with `fold`'s
+	/// `Release`), and the shards after it. In the other order a fold landing
+	/// between the reads was counted twice -- its balance read in the shard
+	/// before the swap and again in `approx` after the add -- an
+	/// over-statement of a whole shard's balance (>= `FOLD_BYTES`) that the
+	/// peak then kept. In this order a fold in flight can only be missed.
+	///
+	/// A read of 17 words is still not a snapshot. A value refunded on a
+	/// shard read early and another charged on a shard read late can both be
+	/// counted although they were never live at the same instant, and the
+	/// reverse can count neither. So one read can differ from P at every
+	/// instant of the read by up to the bytes charged and refunded on other
+	/// threads while it runs -- a few allocations, over 17 loads.
 	pub(crate) fn exact(&self) -> i64 {
+		self.exact_with(|| {})
+	}
+
+	/// `exact`, running `between` after `approx` is loaded and before the
+	/// shards are: the window the order is about. `exact` passes a no-op,
+	/// which compiles away; the ordering test passes a fold.
+	#[inline(always)]
+	fn exact_with(&self, between: impl FnOnce()) -> i64 {
+		let approx = self.approx.0.load(Ordering::Acquire);
+
+		between();
+
 		let shards: i64 = self.shards.iter().map(|s| s.0.load(Ordering::Relaxed)).sum();
 
-		shards + self.approx.0.load(Ordering::Relaxed)
+		approx + shards
 	}
 
 	/// One load. Differs from `exact` by the unfolded shard balances, each
@@ -218,9 +280,13 @@ impl Counter {
 	}
 
 	/// The largest value seen at a fold or an `observe_max` (the policy worker
-	/// calls it every pass). A LOWER BOUND on the true peak: a burst that
-	/// rises and falls between two observations without folding a shard is
-	/// never seen.
+	/// calls it every pass). A lower bound on the true peak, up to one
+	/// sample's torn read: a burst that rises and falls between two samples
+	/// without folding a shard is never seen, and a fold in flight during a
+	/// sample is missed rather than counted twice, but a sample is not a
+	/// snapshot and can exceed P at every instant of its own read by the
+	/// bytes charged and refunded while it reads (see `exact`). So `max <=
+	/// true peak + one read's churn`.
 	pub(crate) fn max(&self) -> i64 {
 		self.max.0.load(Ordering::Relaxed)
 	}
@@ -228,6 +294,7 @@ impl Counter {
 
 static PHYS_FAST: Counter = Counter::new();
 
+/// This thread's shard: its arena slot `% SHARDS` (see [`SHARDS`]).
 #[inline]
 fn shard() -> usize {
 	crate::numa_alloc::arena_slot() as usize % SHARDS
@@ -272,10 +339,21 @@ pub fn fast_bytes_approx() -> i64 {
 	PHYS_FAST.approx()
 }
 
-/// The peak of P seen at a fold or a policy-worker pass -- a LOWER BOUND on
-/// the true peak (see `Counter::max`). Process-global and never reset.
+/// The peak of P seen at a fold or a policy-worker pass -- a lower bound on
+/// the true peak up to one sample's torn read (see `Counter::max`).
+/// Process-global, and never reset outside tests ([`reset_fast_bytes_max`]).
 pub fn fast_bytes_max() -> u64 {
 	PHYS_FAST.max().max(0) as u64
+}
+
+/// TEST SUPPORT: forgets the peak (sets it to 0), so a test can require a
+/// fresh sample. T9 does at every check: the peak is process-global, so
+/// without this one left by an earlier cache or phase satisfies the check.
+/// Nothing in the crate calls it, and a harness must not -- the peak is the
+/// process's only while nothing does.
+#[doc(hidden)]
+pub fn reset_fast_bytes_max() {
+	PHYS_FAST.max.0.store(0, Ordering::Relaxed);
 }
 
 /// Reads P and folds it into the peak: the policy worker's per-pass sample.
@@ -300,13 +378,23 @@ pub fn pending_migrations() -> (u64, u64) {
 
 static LIVE_TIERED_CACHES: AtomicU64 = AtomicU64::new(0);
 
+static LIVE_FLAT_FAST_CACHES: AtomicU64 = AtomicU64::new(0);
+
 /// Tiered caches alive in this process. P describes one cache only while this
-/// reads 1 -- see the module doc.
+/// reads 1 and [`live_flat_fast_caches`] reads 0 -- see the module doc.
 pub fn live_tiered_caches() -> u64 {
 	LIVE_TIERED_CACHES.load(Ordering::Relaxed)
 }
 
-/// One tiered cache's place in the live count: counted when built, uncounted
+/// Flat caches whose values are FAST (`V::TIER == Tier::Fast`, i.e.
+/// `PaperCache<K, BufferDRAM>`) alive in this process. Their values are in P
+/// too, so P describes one tiered cache only while this reads 0 and
+/// [`live_tiered_caches`] reads 1 -- see the module doc.
+pub fn live_flat_fast_caches() -> u64 {
+	LIVE_FLAT_FAST_CACHES.load(Ordering::Relaxed)
+}
+
+/// One cache's place in a live count: counted when built, uncounted
 /// when dropped. Held by the cache's `AtomicStatus`, which is freed when the
 /// last owner lets go -- the cache itself, after it has joined its workers --
 /// so the count falls exactly when the cache is gone, and a constructor that
@@ -318,6 +406,10 @@ pub(crate) struct LiveRegistration {
 impl LiveRegistration {
 	pub(crate) fn tiered_cache() -> Self {
 		Self::in_count(&LIVE_TIERED_CACHES)
+	}
+
+	pub(crate) fn flat_fast_cache() -> Self {
+		Self::in_count(&LIVE_FLAT_FAST_CACHES)
 	}
 
 	fn in_count(count: &'static AtomicU64) -> Self {
@@ -342,14 +434,22 @@ impl Drop for LiveRegistration {
 ///
 /// `P + L * omega` is the fast tier's physical DRAM as the budget models it --
 /// the value bytes actually there plus the per-object reservation -- and `F`
-/// the budget. The sample is taken at the END of the interval and held across
-/// it (a right Riemann sum). The worker passes every 1 ms while sets arrive,
-/// so under load an interval is short and the error small; when idle it
-/// parks for up to 1 s, and nothing kicks it on the set path yet (S5's gate
-/// will), so the pass that first sees a burst after a quiet spell charges its
-/// whole idle interval at the burst's level. The integral therefore
-/// OVER-states by at most one long poll per burst; it never under-states an
-/// excursion that lasts past a pass.
+/// the whole budget. The integrand is defined on those three, NOT as `P -
+/// eff`: `eff = F - L * omega` saturates at 0, so once `L * omega > F` the
+/// integrand is `P + (L * omega - F)`, more than `P - eff = P`. (MEMTS prints
+/// `phys` and `eff`; their difference is the integrand only while `L * omega
+/// <= F`.)
+///
+/// A RIGHT Riemann sum: each pass samples at the END of its interval and
+/// charges that level for the whole interval. So an excursion over the budget
+/// that begins inside an interval is charged from the interval's start (its
+/// head over-stated), and one that ends inside an interval is charged nothing
+/// for that interval, since the pass closing it sees the tier back under (its
+/// tail dropped). Each error is at most one poll interval of the excursion:
+/// 1 ms while sets are recent (a set within the last 5 s), 1 s otherwise.
+/// Nothing kicks the worker on the set path yet (S5's gate will), so the pass
+/// that first sees a burst after a quiet spell may come up to 1 s after the
+/// burst began, and charges that whole second at the level it sees.
 pub(crate) fn over_budget_increment(
 	phys: i64,
 	live: u64,
@@ -421,11 +521,18 @@ impl PassInstrument {
 /// line per pass would be most of what the instrumentation costs.
 pub(crate) const MEMTS_INTERVAL: Duration = Duration::from_millis(250);
 
-/// `PAPER_MEMTS` present in the environment (any value), read once.
+/// `PAPER_MEMTS=1` in the environment, read once. Only `1` turns the line
+/// on, as only `1` sets `PAPER_DISABLE_SHARED_OVERHEAD`: `PAPER_MEMTS=0`, an
+/// empty value or any other string leaves it off.
 pub(crate) fn memts_enabled() -> bool {
 	static ENABLED: OnceLock<bool> = OnceLock::new();
 
-	*ENABLED.get_or_init(|| std::env::var_os("PAPER_MEMTS").is_some())
+	*ENABLED.get_or_init(|| memts_switch(std::env::var_os("PAPER_MEMTS").as_deref()))
+}
+
+/// Pure: whether a `PAPER_MEMTS` value (`None` when unset) turns MEMTS on.
+fn memts_switch(value: Option<&std::ffi::OsStr>) -> bool {
+	value.is_some_and(|value| value == "1")
 }
 
 /// Pure: whether a pass at `now` prints, given when the last line was printed.
@@ -446,7 +553,10 @@ pub(crate) struct MemtsSample {
 	pub wall_ms: u64,
 	/// P, exact and signed.
 	pub phys: i64,
-	/// `AtomicStatus::effective_fast_capacity`: F - L * omega.
+	/// `AtomicStatus::effective_fast_capacity`: F - L * omega, saturating at
+	/// 0. So `phys - eff` is the over-budget integrand only while `L * omega
+	/// <= F`; past that `eff` reads 0 and the integrand is larger (see
+	/// `over_budget_increment`).
 	pub eff: u64,
 	/// The stack's intent gauge.
 	pub fast_used: u64,
@@ -459,6 +569,10 @@ pub(crate) struct MemtsSample {
 	pub live_tiered_caches: u64,
 	/// `VmRSS` from `/proc/self/status`, kB; `None` if unreadable.
 	pub vmrss_kb: Option<u64>,
+	/// Flat caches with fast values alive in this process: with
+	/// `live_tiered_caches`, what says whether `phys` is one cache's. Last,
+	/// like every field added after the line's first version.
+	pub live_flat_fast_caches: u64,
 }
 
 /// Pure. `key=value` pairs after a `MEMTS ` prefix, in a fixed order, so a
@@ -471,7 +585,8 @@ pub(crate) fn format_memts(sample: &MemtsSample) -> String {
 
 	format!(
 		"MEMTS t_ms={} wall_ms={} phys={} eff={} fast_used={} fast_metadata_bytes={} \
-		 over_budget_byte_seconds={} pending_net={} backlog={} live_tiered_caches={} vmrss_kb={}",
+		 over_budget_byte_seconds={} pending_net={} backlog={} live_tiered_caches={} vmrss_kb={} \
+		 live_flat_fast_caches={}",
 		sample.t_ms,
 		sample.wall_ms,
 		sample.phys,
@@ -483,6 +598,7 @@ pub(crate) fn format_memts(sample: &MemtsSample) -> String {
 		sample.backlog,
 		sample.live_tiered_caches,
 		vmrss,
+		sample.live_flat_fast_caches,
 	)
 }
 
@@ -550,6 +666,33 @@ mod tests {
 		assert_eq!(c.exact(), -1);
 		assert_eq!(c.approx(), -5, "the unfolded remainder is in exact, not approx");
 		assert!((c.exact() - c.approx()).abs() < SHARDS as i64 * FOLD_BYTES);
+	}
+
+	/// The order `exact` reads in, pinned by running a fold in the one window
+	/// that matters: after `approx` is loaded and before the shards are. The
+	/// fold moves shard 3's balance into `approx`, so a reader that already
+	/// has `approx` and then finds the shard emptied misses the balance (in
+	/// neither place it looked). The old order -- shards, then `approx` --
+	/// found it in both: 2 * FOLD_BYTES - 1 + 100 here, above every value the
+	/// counter ever held. Single-threaded, so deterministic; the
+	/// Acquire/Release pairing that carries the same guarantee between
+	/// threads is argued in `fold`'s doc and cannot be forced here.
+	#[test]
+	fn a_fold_between_the_reads_is_missed_never_counted_twice() {
+		let c = Counter::new();
+
+		c.add(3, FOLD_BYTES - 1);
+		c.add(4, 100);
+		assert_eq!(c.approx(), 0, "nothing folded yet");
+
+		let before = c.exact();
+		let torn = c.exact_with(|| c.add(3, 1)); // reaches FOLD_BYTES: folds shard 3
+		let after = c.exact();
+
+		assert_eq!((before, after), (FOLD_BYTES + 99, FOLD_BYTES + 100));
+		assert_eq!(c.approx(), FOLD_BYTES, "the add inside the window folded shard 3");
+		assert_eq!(torn, 100, "the balance in flight is missed, not read in the shard and in approx");
+		assert!(torn <= before.max(after), "a torn read never exceeds what the counter held");
 	}
 
 	#[test]
@@ -633,17 +776,18 @@ mod tests {
 			backlog: 17,
 			live_tiered_caches: 1,
 			vmrss_kb: Some(123_456),
+			live_flat_fast_caches: 2,
 		};
 
 		assert_eq!(
 			format_memts(&sample),
 			"MEMTS t_ms=1250 wall_ms=1790000000123 phys=-64 eff=5000000 fast_used=4900000 \
 			 fast_metadata_bytes=120000 over_budget_byte_seconds=42 pending_net=-3 backlog=17 \
-			 live_tiered_caches=1 vmrss_kb=123456",
+			 live_tiered_caches=1 vmrss_kb=123456 live_flat_fast_caches=2",
 		);
 
 		let unread = MemtsSample { vmrss_kb: None, ..sample };
-		assert!(format_memts(&unread).ends_with(" vmrss_kb=na"));
+		assert!(format_memts(&unread).contains(" vmrss_kb=na "));
 		assert!(!format_memts(&sample).contains('\n'));
 	}
 
@@ -658,15 +802,29 @@ mod tests {
 		assert!(!memts_due(true, Some(now - Duration::from_millis(249)), now));
 		assert!(memts_due(true, Some(now - MEMTS_INTERVAL), now));
 
-		// The switch itself. The suites run without PAPER_MEMTS, so the
+		// The switch itself. The suites run without PAPER_MEMTS=1, so the
 		// worker's gate reads false and no pass prints. Skipped rather than
 		// failed if someone runs them with it set.
-		if std::env::var_os("PAPER_MEMTS").is_none() {
+		if !memts_switch(std::env::var_os("PAPER_MEMTS").as_deref()) {
 			assert!(!memts_enabled());
 
 			let mut pass = PassInstrument::new(now);
 			assert!(!pass.memts_due(now));
 			assert!(!pass.memts_due(now + Duration::from_secs(5)));
+		}
+	}
+
+	/// Only `PAPER_MEMTS=1` turns the line on, as only `1` sets
+	/// `PAPER_DISABLE_SHARED_OVERHEAD`.
+	#[test]
+	fn memts_is_switched_on_by_exactly_1() {
+		use std::ffi::OsStr;
+
+		assert!(memts_switch(Some(OsStr::new("1"))));
+		assert!(!memts_switch(None), "unset: off");
+
+		for off in ["", "0", "true", "yes", "on", " 1", "1 ", "01", "11"] {
+			assert!(!memts_switch(Some(OsStr::new(off))), "PAPER_MEMTS={off:?} must leave MEMTS off");
 		}
 	}
 

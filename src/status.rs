@@ -36,7 +36,7 @@ use crate::hybrid_stats::HybridStats;
 ///
 /// One accessor serves every design: the per-design `<design>_hybrid_stats()`
 /// methods were removed by the runtime-policy unification, and the
-/// `<Design>HybridStats` names are aliases of the one struct. Of its 15
+/// `<Design>HybridStats` names are aliases of the one struct. Of its
 /// fields, the 8 size-split gauges are populated only under
 /// `PaperPolicy::LruSizedCompactHybrid` and read zero elsewhere.
 #[derive(Debug)]
@@ -196,6 +196,12 @@ pub struct AtomicStatus {
 	/// the cache has joined the workers that share it.
 	#[cfg(feature = "hybrid_cache_common")]
 	tiered_registration: std::sync::OnceLock<crate::phys::LiveRegistration>,
+
+	/// This cache's place in `phys::live_flat_fast_caches`: installed by
+	/// `register_flat_fast_cache` when a FLAT cache's values are fast,
+	/// released when the status is freed, like `tiered_registration`.
+	#[cfg(feature = "hybrid_cache_common")]
+	flat_fast_registration: std::sync::OnceLock<crate::phys::LiveRegistration>,
 
 	/// The policy worker's thread, for `kick_policy_worker`. `None` until
 	/// `PolicyWorker::run` publishes it on entry.
@@ -393,6 +399,8 @@ impl AtomicStatus {
 			hybrid_over_budget_byte_seconds: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			tiered_registration: std::sync::OnceLock::new(),
+			#[cfg(feature = "hybrid_cache_common")]
+			flat_fast_registration: std::sync::OnceLock::new(),
 
 			policy_worker: parking_lot::Mutex::new(None),
 
@@ -588,6 +596,16 @@ impl AtomicStatus {
 		});
 	}
 
+	/// Marks this status as a FLAT cache's whose values are fast (`V::TIER ==
+	/// Tier::Fast`): counts it in `phys::live_flat_fast_caches` until the
+	/// status is freed, since its values are charged to PHYS_FAST like a
+	/// tiered cache's. Called once, by the two flat constructors; a second
+	/// call changes nothing.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub fn register_flat_fast_cache(&self) {
+		self.flat_fast_registration.get_or_init(crate::phys::LiveRegistration::flat_fast_cache);
+	}
+
 	/// `omega`, the per-object DRAM reservation this cache's stack makes.
 	/// Zero on a status no hybrid constructor registered.
 	#[cfg(feature = "hybrid_cache_common")]
@@ -620,6 +638,14 @@ impl AtomicStatus {
 	///
 	/// `L` is the object map's count (`live_num_objects`), which leads the
 	/// stack's by whatever the worker has not taken yet.
+	///
+	/// Not every stack reserves only `L * omega`. Seven designs'
+	/// `reserved_overhead` also counts their ghost's DRAM -- the two faithful
+	/// S3-FIFO designs that keep a ghost (not the reprieve ones), the four
+	/// S3-FIFO ghost designs and 2Q-ghost -- which this figure does not, so
+	/// there it exceeds the value budget the stack's own settle leaves by the
+	/// ghost's bytes (T9 sees up to 112 B at its size). Rewiring those settles
+	/// onto this function (S5) has to decide which figure is right first.
 	#[cfg(feature = "hybrid_cache_common")]
 	#[must_use]
 	pub fn effective_fast_capacity(&self) -> CacheSize {
@@ -733,6 +759,7 @@ impl AtomicStatus {
 			fast_hits: self.hybrid_fast_hits.load(Ordering::Relaxed),
 			slow_hits: self.hybrid_slow_hits.load(Ordering::Relaxed),
 			live_tiered_caches: crate::phys::live_tiered_caches(),
+			live_flat_fast_caches: crate::phys::live_flat_fast_caches(),
 		}
 	}
 
