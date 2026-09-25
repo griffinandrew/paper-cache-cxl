@@ -36,12 +36,21 @@
 //!     third of that workload, with every new key read twice and evicted keys
 //!     set again (see `Workload::touch_and_readmit`), in the DashMap and
 //!     hashbrown builds (the merged store refuses them at construction). One
-//!     test each, so a design whose identity fails is `#[ignore]`d with its
-//!     reason without hiding the rest. Two are: the faithful S3-FIFO designs
-//!     with a SLOW small queue, whose stack strands a promotion (see their
-//!     cases);
+//!     test each, so a design whose identity fails can be `#[ignore]`d with
+//!     its reason without hiding the rest. None is: the two faithful S3-FIFO
+//!     designs with a SLOW small queue were, until S3 fixed the promotion
+//!     their `evict_small` stranded;
 //!   * `a_flat_cache_with_fast_values_is_counted_apart_from_the_tiered_ones`
-//!     checks the second live count.
+//!     checks the second live count;
+//!   * T7 (`an_lfu_burst_strands_no_value`, every build): LFU's sets made in
+//!     BURSTS, the client far ahead of the worker, which is what outran the
+//!     latch mirror before S3's reconcile.
+//!
+//! Every quiescent check also takes the PLACEMENT AUDIT (S3,
+//! `PaperCache::placement_audit`) and requires it clean -- no value stranded,
+//! lagging or untracked -- with its bytes equal to the model's. So every
+//! design's case here is also the check that its `PolicyStack::placement_of`
+//! agrees, key by key, with where each value's bytes are at quiescence.
 //!
 //! The workload makes the stack demote (the fast tier is a small fraction of
 //! the data), promote (repeated gets on slow keys for the designs that
@@ -49,19 +58,32 @@
 //! it promotes once the cache is full and evicting), evict, overwrite (the
 //! superseded value is refunded) and delete. Sets, overwrites and deletes are
 //! made ONE AT A TIME, each followed by a wait for quiescence, and gets in
-//! bursts. That keeps the workload clear of pre-existing placement bugs that
-//! are S3's to fix and would fail the identity for reasons that are not P's.
-//! One is observed: with the per-set wait removed, the DashMap LFU stack's
-//! stale admission latch leaves every value of a burst of new keys in DRAM
-//! while the stack counts most of them slow, with nothing queued to move them
-//! -- "stack fast/slow objects 36/111 vs map 147 (147 physically fast)". Two
-//! more are timing races a burst could hit and this workload's burst variant
-//! did not: an overwrite racing a migration of its own key, and a delete and
-//! re-set racing a stale queued demotion. A burst of gets touches none of
-//! them and still exercises in-flight copies.
+//! bursts. That kept S2's workload clear of the placement bugs S3 fixed: with
+//! the per-set wait removed, the DashMap LFU stack's stale admission latch left
+//! every value of a burst of new keys in DRAM while the stack counted most of
+//! them slow, with nothing queued to move them -- "stack fast/slow objects
+//! 36/111 vs map 147 (147 physically fast)"; T7 is that burst, now clean. The
+//! two timing races -- an overwrite racing a migration of its own key, and a
+//! delete and re-set racing a stale queued migration -- are pinned
+//! deterministically by `worker::policy::reconcile_tests` in the lib (the
+//! second is now fixed at the re-set's `Set`, by the new-key rule); T7's
+//! phase D makes deletes and re-sets in a burst.
 //!
-//! At every quiescent check, beside the identity: at least one value is
-//! physically fast (an empty fast tier would make `P == 0 == fast_used`
+//! And because those phases are made one at a time with a fresh mirror and
+//! nothing in flight -- the two reads of a new key wait for quiescence too --
+//! NO set corrective may be queued in them (review m5): a
+//! `reconcile_set_to_fast`/`_to_slow` delta over a phase would be a stack
+//! placing a key without a push, or `admission_tier` building a value
+//! somewhere the stack does not place it -- both of which the reconcile would
+//! silently repair on every set, and the audit alone could not tell from a
+//! correct design -- and a `reconcile_set_new_key` delta the new-key rule
+//! fencing a key with nothing in flight. The get bursts may heal, and are
+//! not held to it.
+//!
+//! At every quiescent check, beside the identity: no migration is in flight
+//! in the cache's per-key buckets (`PaperCache::migrations_in_flight`: every
+//! hand-off to the consumers was matched by a finish, whatever the entry did);
+//! at least one value is physically fast (an empty fast tier would make `P == 0 == fast_used`
 //! vacuous); `effective_fast_capacity == F - L * omega`, the status' figure
 //! against the test's own (the map's live keys times the reservation the
 //! stack made for its first key); `effective_fast_capacity == F -
@@ -439,6 +461,33 @@ fn check(cache: &Cache, lens: &BTreeMap<u64, u32>, run: &Run, phase: &str, hits:
         "{label}: approx is within SHARDS * FOLD_BYTES of exact",
     );
 
+    // The placement audit (S3): every live value's bytes are where the stack
+    // places its key -- nothing stranded, lagging or untracked -- and the
+    // audit's bytes, in the same unit, are the model's (so its fast bytes are
+    // P). This is what makes every design's case the `placement_of`
+    // agreement check.
+    let a = cache.placement_audit().expect("a tiered cache answers the audit");
+    assert!(
+        a.is_clean(),
+        "{label}: placement audit -- {} stranded ({} B), {} lagging ({} B), {} untracked \
+         ({} B) of {} live",
+        a.stranded, a.stranded_bytes, a.lagging, a.lagging_bytes, a.untracked,
+        a.untracked_bytes, a.live,
+    );
+    assert_eq!(
+        (a.live, a.fast, a.fast_bytes, a.fast_bytes + a.slow_bytes),
+        (w.live, w.fast_live, w.fast_charge, w.total_charge),
+        "{label}: the audit's (live, fast, fast bytes, bytes) against the model's",
+    );
+
+    // The new-key and heal rules' buckets: every entry handed to the
+    // consumers finished -- applied, declined, gone or superseded alike.
+    assert_eq!(
+        cache.migrations_in_flight(),
+        0,
+        "{label}: migrations still counted in flight at quiescence -- a hand-off without its finish",
+    );
+
     // The peak: forgotten, then sampled again by this cache's worker, at
     // least up to the quiescent P (nothing is allocating, so no fold can).
     phys::reset_fast_bytes_max();
@@ -458,6 +507,38 @@ fn check(cache: &Cache, lens: &BTreeMap<u64, u32>, run: &Run, phase: &str, hits:
         measured_values() - run.m0,
         p,
         "{label}: the segregated value pool's measured bytes moved by a different amount than P",
+    );
+}
+
+/// The PROCESS-GLOBAL set correctives: `(reconcile_set_to_fast,
+/// reconcile_set_to_slow, reconcile_set_new_key)`. This binary has one cache
+/// alive at a time, so a delta is that cache's.
+fn set_correctives(cache: &Cache) -> (u64, u64, u64) {
+    let s = cache.hybrid_stats();
+
+    (s.reconcile_set_to_fast, s.reconcile_set_to_slow, s.reconcile_set_new_key)
+}
+
+/// No set corrective was queued since `before` (review m5): the phase was
+/// made one at a time -- every set, and every read of a key just set,
+/// followed by a wait for quiescence -- with a fresh mirror and nothing in
+/// flight. So a corrective toward either tier would be a stack placing a key
+/// without a push, or a value built where its stack does not place it, which
+/// the reconcile would repair unseen; and a new-key one cannot happen at all:
+/// nothing is in flight when a set's value is published, and nothing lands
+/// between its mark and its handling -- not even another key's migration
+/// sharing its bucket (the buckets are indexed by the key's hash, which the
+/// cache's `RandomState` seeds anew each run, so such collisions are real).
+/// The merged store's own client-side corrective (every latched LFU
+/// admission: its client builds new keys fast) is not a set corrective of
+/// the worker's, and is not counted here.
+fn assert_no_set_correctives(cache: &Cache, label: &str, phase: &str, before: (u64, u64, u64)) {
+    let now = set_correctives(cache);
+
+    assert_eq!(
+        (now.0 - before.0, now.1 - before.1, now.2 - before.2),
+        (0, 0, 0),
+        "{label} {phase}: set correctives (to fast, to slow, new key) queued in a one-at-a-time phase",
     );
 }
 
@@ -492,21 +573,29 @@ fn run(design: Design, w: Workload) -> HybridStats {
     };
 
     // Two reads of a key just set, when the workload asks for them.
-    let touch = |cache: &Cache, key: u64, hits: &mut u64| {
+    //
+    // Followed by a wait for quiescence, like every set: the next set is then
+    // made with nothing in flight, which the m5 check below relies on (a read
+    // promoting this key while the next key is set can land in the next key's
+    // in-flight bucket -- the buckets collide -- and fence it).
+    let touch = |cache: &Cache, lens: &BTreeMap<u64, u32>, key: u64, hits: &mut u64| {
         if w.touch_and_readmit {
             for _ in 0..2 {
                 if cache.get(&key).is_ok() {
                     *hits += 1;
                 }
             }
+
+            quiesce(cache, lens, design, &format!("{label} touch({key})"));
         }
     };
 
     // The first key: one object, nothing evicted, so what the stack reserves
     // now is omega alone.
+    let before_a = set_correctives(&cache);
     let omega = set(&cache, &mut lens, 0, 0).fast_metadata_bytes;
     assert!(omega > 0, "{label}: no per-object reservation to check eff against");
-    touch(&cache, 0, &mut hits);
+    touch(&cache, &lens, 0, &mut hits);
 
     let run = Run {
         label: &label,
@@ -533,16 +622,17 @@ fn run(design: Design, w: Workload) -> HybridStats {
     //    evicted key is set again.
     for key in 1..w.keys {
         set(&cache, &mut lens, key, 0);
-        touch(&cache, key, &mut hits);
+        touch(&cache, &lens, key, &mut hits);
     }
     if w.touch_and_readmit {
         let evicted: Vec<u64> = (0..w.keys).filter(|k| cache.tier_of(k).is_none()).collect();
         for key in evicted.into_iter().step_by(2) {
             set(&cache, &mut lens, key, 0);
-            touch(&cache, key, &mut hits);
+            touch(&cache, &lens, key, &mut hits);
         }
     }
     check(&cache, &lens, &run, "A (sets)", hits);
+    assert_no_set_correctives(&cache, &label, "A (sets)", before_a);
 
     // B. A burst of repeated gets on a third of the keys, most of them slow:
     //    the designs that promote on a hit promote (and demote to make room),
@@ -554,21 +644,27 @@ fn run(design: Design, w: Workload) -> HybridStats {
 
     // C. More new keys: every set now evicts, and CLOCK's hand recycles the
     //    keys B referenced -- a promotion for the slow ones.
+    let before = set_correctives(&cache);
     for key in w.keys..w.keys + w.evicting {
         set(&cache, &mut lens, key, 0);
-        touch(&cache, key, &mut hits);
+        touch(&cache, &lens, key, &mut hits);
     }
     check(&cache, &lens, &run, "C (evicting sets)", hits);
+    assert_no_set_correctives(&cache, &label, "C (evicting sets)", before);
 
     // D. Overwrites at new sizes, one at a time: each old value is superseded
     //    and must be refunded whichever tier it was in.
+    let before = set_correctives(&cache);
     let live: Vec<u64> = lens.keys().copied().filter(|k| cache.tier_of(k).is_some()).collect();
     for key in live.iter().copied().step_by(4) {
         set(&cache, &mut lens, key, 1);
     }
     check(&cache, &lens, &run, "D (overwrites)", hits);
+    assert_no_set_correctives(&cache, &label, "D (overwrites)", before);
 
-    // E. Deletes, one at a time.
+    // E. Deletes, one at a time. F. Re-sets of deleted keys, each after the
+    //    delete has quiesced.
+    let before = set_correctives(&cache);
     let live: Vec<u64> = lens.keys().copied().filter(|k| cache.tier_of(k).is_some()).collect();
     let deleted: Vec<u64> = live.iter().copied().skip(1).step_by(5).collect();
     for key in &deleted {
@@ -577,10 +673,10 @@ fn run(design: Design, w: Workload) -> HybridStats {
     }
     check(&cache, &lens, &run, "E (dels)", hits);
 
-    // F. Re-sets of deleted keys, each after the delete has quiesced.
     for key in deleted.iter().copied().step_by(2) {
         set(&cache, &mut lens, key, 2);
     }
+    assert_no_set_correctives(&cache, &label, "E-F (dels, re-sets)", before);
 
     // G. A last burst of gets over everything, hits and misses alike.
     let all: Vec<u64> = (0..w.keys + w.evicting).collect();
@@ -688,25 +784,19 @@ other_designs! {
         Design::Policy(PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.5));
     two_q_ghost => Design::Policy(PaperPolicy::TwoQGhostCompactHybrid(0.5));
     s3_fifo => Design::Policy(PaperPolicy::S3FifoCompactHybrid(0.1));
-    /// IGNORED -- the identity FAILS here, and the stack is at fault, not P.
-    /// `S3FifoFaithfulCore::evict_small` (slow small queue) promotes a key
-    /// seen twice to main's FAST front and, if main is then full, returns
-    /// through `evict_main` BEFORE pushing that key's `(key, Fast)`
-    /// migration: the stack counts it fast, its bytes stay in CXL, and
-    /// nothing is queued to move them. At `set(51)` in phase C: stack fast
-    /// objects 8 vs 7 physically fast, pending (0, 0), stack fast bytes
-    /// 10,560 vs P 8,512. With the push moved above the early return (a
-    /// diagnostic, not committed -- this step changes no behaviour) the whole
-    /// case passes. S5's gate would read 8,512 where the settle reads 10,560.
-    #[ignore = "stack strands a promotion: evict_small returns via evict_main before pushing its (key, Fast) migration; fast_used 10560 vs P 8512"]
+    /// Ignored until S3: `S3FifoFaithfulCore::evict_small` (slow small queue)
+    /// promoted a key seen twice to main's FAST front and, if main was then
+    /// full, returned through `evict_main` BEFORE pushing its `(key, Fast)`
+    /// -- counted fast, bytes left in CXL, nothing queued (at `set(51)`:
+    /// stack fast objects 8 vs 7 physically fast, fast_used 10,560 vs P
+    /// 8,512). The push now comes first; the audit would report the key
+    /// lagging.
     s3_fifo_faithful => Design::Policy(PaperPolicy::S3FifoFaithfulCompactHybrid(0.1));
     s3_fifo_faithful_fast_admission =>
         Design::Policy(PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.1));
-    /// IGNORED -- the same `evict_small` early return as `s3_fifo_faithful`
-    /// (the reprieve variant shares the core and its slow small queue): at
-    /// `set(50)`, stack fast objects 8 vs 7 physically fast, pending (0, 0),
-    /// stack fast bytes 10,048 vs P 9,280; passes with the push moved.
-    #[ignore = "stack strands a promotion: evict_small returns via evict_main before pushing its (key, Fast) migration; fast_used 10048 vs P 9280"]
+    /// The same `evict_small` fix as `s3_fifo_faithful` (the reprieve variant
+    /// shares the core and its slow small queue; it failed at `set(50)`,
+    /// fast_used 10,048 vs P 9,280).
     s3_fifo_faithful_reprieve =>
         Design::Policy(PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(0.1));
     s3_fifo_faithful_fast_admission_reprieve =>
@@ -726,6 +816,189 @@ other_designs! {
         Design::Policy(PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(0.1));
     s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve =>
         Design::Policy(PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(0.1));
+}
+
+/// T7 (backpressure plan S3): LFU's sets made in BURSTS -- no wait between
+/// them, the client far ahead of the worker -- the shape of S2's burst
+/// diagnostic. The stack latches part-way through the first burst while the
+/// client still reads the latch mirror open, so values the stack admits slow
+/// are built in DRAM; before S3 they stayed there ("147 physically fast", the
+/// stack counting 111 of them slow, nothing queued). The reconcile queues each
+/// one's demotion from its `Set`'s built tier.
+///
+/// After each burst the audit is taken AT ONCE, with no quiescence wait: its
+/// event queues behind every set of the burst, and the worker lands all it
+/// decided for them before it walks, so it must find nothing stranded,
+/// lagging or untracked. Then the full quiescent check -- the identity, and
+/// the audit again. Phases: A, the burst of new keys that latches (the cache
+/// fills and evicts part-way, as at FULL); B, a burst of gets over every key,
+/// twice (promotions, and hits served from both tiers); C, a burst of more
+/// new keys, every one evicting; D, gets on every third key, twice, and right
+/// behind them each of those keys deleted and set again -- the client far
+/// ahead of the worker, so the gets' promotions are decided for the OLD
+/// values and land on the fresh ones, which a latched stack re-admits slow:
+/// the new-key rule's case (review M1 (iii)), in a real cache. It is timing,
+/// not a pin -- the lib's `reconcile_tests` pin each case. D is audited at
+/// once only: in the split LFU it can leave nothing fast (the keys the gets
+/// promoted are the ones deleted, and their re-sets are admitted slow), and
+/// the quiescent check requires something fast; E, gets over every key,
+/// twice, refills the tier, and the full check follows it. No overwrite
+/// burst: an overwrite racing a migration of its own key is pinned there too.
+///
+/// That the burst OUTRAN the mirror is asserted, not assumed: phase A must
+/// leave corrective demotions behind -- `reconcile_set_to_slow` moves in the
+/// split builds, where the worker's reconcile queues them, and in every build
+/// the cache's `reconcile_applied_to_slow` (in the merged builds the store's
+/// own client-side corrective lands them).
+///
+/// Every build: the merged store's LFU admits a latched new key slow while
+/// `PaperCache::set` builds it fast, and relies on its client-side
+/// corrective, with the same reconcile behind it.
+#[test]
+fn an_lfu_burst_strands_no_value() {
+    burst(Design::Policy(PaperPolicy::LfuCompactHybrid), FULL);
+}
+
+/// T7's body: `run`'s bookkeeping, with each phase's sets made back to back.
+fn burst(design: Design, w: Workload) {
+    let _one = one_cache_at_a_time();
+
+    let label = format!("T7 {}", design.label());
+    let p0 = phys::fast_bytes_signed();
+
+    #[cfg(all(feature = "measured_accounting", feature = "segregated_value_arena"))]
+    let m0 = measured_values();
+    #[cfg(not(all(feature = "measured_accounting", feature = "segregated_value_arena")))]
+    let m0 = 0;
+
+    assert_eq!(
+        (phys::live_tiered_caches(), phys::live_flat_fast_caches()),
+        (0, 0),
+        "{label}: no other cache alive before this one",
+    );
+
+    let cache = design.build(w);
+    let mut lens = BTreeMap::new();
+    let mut hits = 0u64;
+
+    // The first key alone, for omega, as `run` takes it.
+    cache.set(0, &value(0, 0), None).expect("set");
+    lens.insert(0, len_of(0, 0));
+    let omega = quiesce(&cache, &lens, design, &format!("{label} set(0)")).0.fast_metadata_bytes;
+
+    let run = Run {
+        label: &label,
+        design,
+        fast: w.fast,
+        omega,
+        ghost_max: std::cell::Cell::new(0),
+        p0,
+        m0,
+    };
+
+    let audit_now = |cache: &Cache, phase: &str| {
+        let a = cache.placement_audit().expect("a tiered cache answers the audit");
+        eprintln!("{label} {phase}: audited at once: {a:?}");
+        assert!(
+            a.is_clean(),
+            "{label} {phase}: {} values stranded in DRAM ({} B), {} lagging in CXL ({} B), {} \
+             untracked ({} B), of {} live, once the worker landed all it decided",
+            a.stranded, a.stranded_bytes, a.lagging, a.lagging_bytes, a.untracked,
+            a.untracked_bytes, a.live,
+        );
+    };
+
+    // A. Every other new key, back to back.
+    let before = cache.hybrid_stats();
+    for key in 1..w.keys {
+        cache.set(key, &value(key, 0), None).expect("set");
+        lens.insert(key, len_of(key, 0));
+    }
+    audit_now(&cache, "A (a burst of new keys)");
+    check(&cache, &lens, &run, "A (a burst of new keys)", hits);
+    let after = cache.hybrid_stats();
+    assert!(after.slow_objects > 0, "{label}: the burst never filled the fast tier");
+    eprintln!(
+        "{label} A: reconcile set->slow +{}, corrective demotions landed +{}",
+        after.reconcile_set_to_slow - before.reconcile_set_to_slow,
+        after.reconcile_applied_to_slow - before.reconcile_applied_to_slow,
+    );
+    assert!(
+        after.reconcile_applied_to_slow > before.reconcile_applied_to_slow,
+        "{label}: no corrective demotion landed -- the burst never outran the latch mirror",
+    );
+    #[cfg(not(feature = "merged_object_store"))]
+    assert!(
+        after.reconcile_set_to_slow > before.reconcile_set_to_slow,
+        "{label}: the reconcile queued no demotion -- the burst never outran the latch mirror",
+    );
+
+    // B. Gets over every key, twice, back to back.
+    for _ in 0..2 {
+        for key in 0..w.keys {
+            if cache.get(&key).is_ok() {
+                hits += 1;
+            }
+        }
+    }
+    audit_now(&cache, "B (a burst of gets)");
+    check(&cache, &lens, &run, "B (a burst of gets)", hits);
+
+    // C. More new keys, every one evicting, back to back.
+    for key in w.keys..w.keys + w.evicting {
+        cache.set(key, &value(key, 0), None).expect("set");
+        lens.insert(key, len_of(key, 0));
+    }
+    audit_now(&cache, "C (a burst of evicting sets)");
+    check(&cache, &lens, &run, "C (a burst of evicting sets)", hits);
+
+    // D. Gets on every third live key, twice, then each of them deleted and
+    //    set again at once, all back to back.
+    let live: Vec<u64> = lens.keys().copied().filter(|k| cache.tier_of(k).is_some()).collect();
+    let chosen: Vec<u64> = live.iter().copied().step_by(3).collect();
+    for _ in 0..2 {
+        for key in &chosen {
+            if cache.get(key).is_ok() {
+                hits += 1;
+            }
+        }
+    }
+    for &key in &chosen {
+        cache.del(&key).expect("del of a live key");
+        cache.set(key, &value(key, 1), None).expect("set");
+        lens.insert(key, len_of(key, 1));
+    }
+    audit_now(&cache, "D (gets, then deletes and re-sets)");
+
+    // E. Gets over every key, twice, back to back.
+    for _ in 0..2 {
+        for key in 0..w.keys + w.evicting {
+            if cache.get(&key).is_ok() {
+                hits += 1;
+            }
+        }
+    }
+    audit_now(&cache, "E (a burst of gets)");
+    check(&cache, &lens, &run, "E (a burst of gets)", hits);
+
+    let stats = cache.hybrid_stats();
+    eprintln!(
+        "{label}: evictions={} fast_hits={} slow_hits={} reconcile set->fast/set->slow/get->fast/new-key \
+         {}/{}/{}/{} (process totals); correctives landed to fast/slow {}/{}",
+        stats.evictions, stats.fast_hits, stats.slow_hits,
+        stats.reconcile_set_to_fast, stats.reconcile_set_to_slow, stats.reconcile_get_to_fast,
+        stats.reconcile_set_new_key, stats.reconcile_applied_to_fast, stats.reconcile_applied_to_slow,
+    );
+    assert!(stats.evictions > 0, "{label}: the bursts never evicted");
+
+    drop(cache);
+
+    assert_eq!(
+        phys::fast_bytes_signed(),
+        p0,
+        "{label}: P did not return to its pre-cache value -- a fast allocation was never refunded",
+    );
+    assert_eq!(phys::live_tiered_caches(), 0, "{label}: uncounted on drop");
 }
 
 /// The second live count. A flat cache whose values are fast charges P like a

@@ -420,6 +420,13 @@ impl PolicyStack for ClockCompactHybridStack {
 		self.settle_fast_tier();
 	}
 
+	/// `tier_of`: FIFO's placement, plus the hand's second chance, which
+	/// pushes the promotion of a slow referenced key it recycles.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

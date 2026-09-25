@@ -485,6 +485,13 @@ impl PolicyStack for TwoQGhostCompactHybridStack {
 		self.settle_fast_tier();
 	}
 
+	/// `tier_of`: 2Q's placement; a ghost hit admits to main and pushes the
+	/// crossing like any other.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

@@ -104,10 +104,13 @@
 //! (`MergedStore::lfu_admission_tier`) while `PaperCache::set` has already
 //! BUILT the bytes in DRAM -- `admission_latched()` here is deliberately false,
 //! so `hybrid_policy::admission_tier` returns `Fast` for every new key. So a
-//! latched merged-LFU run emits one corrective `(key, Slow)` migration per
-//! admission. That is a real throughput cost on the SET path, of exactly the
-//! kind the split stack's latched branch avoids by trusting a mirror -- and
-//! trusting that mirror is what makes the split stack wrong under a burst. If
+//! latched merged-LFU run queues one corrective `(key, Slow)` migration per
+//! admission -- `MergedStore::insert` does, on the client, under the shard
+//! lock, and the policy worker's reconcile finds it in the drain (or, drained
+//! earlier, queues a duplicate its consumer declines). That is a real
+//! throughput cost, of exactly the kind the split stack's latched branch
+//! avoids by trusting a mirror -- and a stale mirror under a burst is what the
+//! reconcile now corrects for the split stack. If
 //! the cost proves dominant the fix is to let `admission_tier` read this
 //! store's own latch directly (it already receives the store as `objects`),
 //! which removes the mirror from the path rather than tolerating it.
@@ -116,7 +119,7 @@ use crate::{
 	error::CacheError,
 	merged_store::{MergedOrder, MergedStore},
 	object::ObjectSize,
-	worker::policy::policy_stack::{CacheSize, HashedKey, PolicyStack, Tier},
+	worker::policy::policy_stack::{CacheSize, HashedKey, PolicyStack, TaggedMigration, Tier},
 	PaperPolicy,
 };
 
@@ -282,8 +285,24 @@ where
 		self.store.resize_fast_tier(size);
 	}
 
+	/// The slot's tier (`MergedStore::tier_of`: one shard READ lock and a
+	/// probe). Every change of it pushes its migration under the shard's write
+	/// lock; a new key built in another tier than its slot's gets its
+	/// corrective from `MergedStore::insert`, on the client, and the policy
+	/// worker reconciles every `Set`'s built tier against it too. See
+	/// `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.store.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		self.store.drain_migrations()
+	}
+
+	/// The store's own tags: its clients' new-key correctives are
+	/// `MigrationOrigin::Reconcile`, everything else the store's decisions.
+	fn drain_tagged_migrations(&mut self) -> Vec<TaggedMigration> {
+		self.store.drain_tagged_migrations()
 	}
 
 	fn dram_reserved_bytes(&self) -> CacheSize {

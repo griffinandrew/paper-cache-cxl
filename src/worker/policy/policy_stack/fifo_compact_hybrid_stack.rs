@@ -287,6 +287,14 @@ impl PolicyStack for FifoCompactHybridStack {
 		self.settle_fast_tier();
 	}
 
+	/// `tier_of`: a key is admitted fast and only ever leaves the fast prefix
+	/// through `settle_fast_tier`, which pushes the demotion; a re-set moves
+	/// nothing.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

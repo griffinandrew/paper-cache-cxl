@@ -207,6 +207,73 @@ pub enum Tier {
 	Slow,
 }
 
+/// Who queued a tier migration: the policy stack, as a POLICY decision -- a
+/// promotion or a demotion in the paper's sense -- or the reconcile, as a
+/// CORRECTIVE that moves a value's bytes to where the stack already places
+/// its key (the policy worker's correctives, `Observed` in
+/// `worker/policy/mod.rs`, and the merged store's client-side push for a new
+/// key built in another tier than the store decided). The tag travels with
+/// the entry through `split_tier_migrations` and the migration queue, so a
+/// completed corrective is counted as `RECONCILE_APPLIED_TO_*` and never as a
+/// promotion or a demotion: it displaced nothing.
+#[cfg(any(feature = "hybrid_cache_common", feature = "merged_object_store"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationOrigin {
+	Stack,
+	Reconcile,
+}
+
+/// A migration with its origin: `(key, destination, origin)`. Sixteen bytes,
+/// the size of the untagged `(key, destination)` pair it replaced on the
+/// queue.
+#[cfg(any(feature = "hybrid_cache_common", feature = "merged_object_store"))]
+pub type TaggedMigration = (HashedKey, Tier, MigrationOrigin);
+
+/// A drain entry, tagged or not: what `split_tier_migrations`, the batch
+/// appliers and `MigrationQueue::push` read of it. An untagged `(key, tier)`
+/// -- what every stack's `drain_tier_migrations` returns -- is the stack's own
+/// decision (`MigrationOrigin::Stack`).
+#[cfg(any(feature = "hybrid_cache_common", feature = "merged_object_store"))]
+pub trait MigrationEntry: Copy + Send + Sync {
+	fn key(&self) -> HashedKey;
+	fn tier(&self) -> Tier;
+	fn origin(&self) -> MigrationOrigin;
+
+	fn tagged(&self) -> TaggedMigration {
+		(self.key(), self.tier(), self.origin())
+	}
+}
+
+#[cfg(any(feature = "hybrid_cache_common", feature = "merged_object_store"))]
+impl MigrationEntry for (HashedKey, Tier) {
+	fn key(&self) -> HashedKey {
+		self.0
+	}
+
+	fn tier(&self) -> Tier {
+		self.1
+	}
+
+	fn origin(&self) -> MigrationOrigin {
+		MigrationOrigin::Stack
+	}
+}
+
+#[cfg(any(feature = "hybrid_cache_common", feature = "merged_object_store"))]
+impl MigrationEntry for TaggedMigration {
+	fn key(&self) -> HashedKey {
+		self.0
+	}
+
+	fn tier(&self) -> Tier {
+		self.1
+	}
+
+	fn origin(&self) -> MigrationOrigin {
+		self.2
+	}
+}
+
 /// Narrows a DRAM-resident remainder so it fits an entry's spare padding byte.
 ///
 /// The remainder is `key + expiry field (16) + Expiries entry (64 with a TTL)`,
@@ -276,6 +343,70 @@ where
 	/// reversal is applied.
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		Vec::new()
+	}
+
+	/// `drain_tier_migrations`, each entry tagged with who queued it. Every
+	/// entry a stack drains is its own policy decision
+	/// (`MigrationOrigin::Stack`), so the default tags the drain and does
+	/// nothing else -- in place: the tagged entry is the same size. The
+	/// merged store's handle overrides it, because its drain also carries the
+	/// correctives its clients push for a new key built in another tier than
+	/// the store decided (`MigrationOrigin::Reconcile`).
+	#[cfg(any(feature = "hybrid_cache_common", feature = "merged_object_store"))]
+	fn drain_tagged_migrations(&mut self) -> Vec<TaggedMigration> {
+		self.drain_tier_migrations().into_iter().map(|entry| entry.tagged()).collect()
+	}
+
+	/// Where this stack places `key`'s BYTES once every migration it has
+	/// queued so far is applied -- its PHYSICAL intent -- or `None` if it does
+	/// not track the key. `None` for every all-DRAM stack, which has no tiers.
+	///
+	/// Read by the policy worker after the stack has handled a `Set` or a hit
+	/// served from the slow tier, to queue a corrective migration toward it
+	/// when the bytes are elsewhere (the reconcile and the heal: `Observed` in
+	/// `worker/policy/mod.rs`), and by the placement audit, which reports every
+	/// live value whose bytes are not where this says. So it must be what the
+	/// design CONVERGES the bytes to, not a logical classification: a tier the
+	/// design deliberately keeps the bytes out of would have the reconcile
+	/// fight the design, copying on every set what the design chose not to
+	/// copy.
+	///
+	/// For every design but one that is the tier the stack records for the
+	/// key, because every design but one pushes the migration for a tier
+	/// change in the same call that makes it (a promotion after the settle
+	/// that may undo it, guarded on the key still being fast; a promotion out
+	/// of a DRAM-resident queue pushes nothing because the bytes are already
+	/// there). Per design:
+	///
+	/// | design | `placement_of` |
+	/// |---|---|
+	/// | LRU, FIFO, CLOCK, LFU, LRU-LFU | `tier_of` |
+	/// | size-split LRU | `tier_of`: the tier of the key's queue |
+	/// | lazy-copy LRU | `physical_tier_of`, NOT `tier_of` (below) |
+	/// | 2Q, 2Q-ghost | `tier_of`: the admission FIFO slow, main by tier |
+	/// | 2Q fast admission, + reprieve | `tier_of`: the admission FIFO fast, main by tier |
+	/// | full 2Q (fast admission) | `tier_of`: `a1_in` fast, `a1_out` slow, `am` by tier |
+	/// | S3-FIFO, ghost, ghost lazy demotion, lazy demotion reprieve | `tier_of`: one-access queue slow, main by tier |
+	/// | the five S3-FIFO fast-admission designs | `tier_of`: one-access queue fast, main by tier (split slow: by segment) |
+	/// | faithful S3-FIFO, the four variants | `tier_of`: the small queue fast or slow per variant, main by tier |
+	/// | merged store (LRU, FIFO, CLOCK, LFU) | `MergedStore::tier_of`: the slot's tier |
+	///
+	/// The one design whose logical and physical placement legitimately
+	/// differ is the lazy-copy LRU: a CANDIDATE -- demoted by the policy, not
+	/// yet copied -- is logically slow with its bytes deliberately left in
+	/// DRAM until `reclaim_dram` copies it out under DRAM pressure. Its
+	/// placement is therefore `physical_tier_of`; `tier_of` would copy every
+	/// candidate out on its next set and report every one as stranded.
+	///
+	/// The S3-FIFO "lazy demotion" and "reprieve" designs are NOT such cases:
+	/// there the laziness is the POLICY's, and whatever it decides is pushed
+	/// at once. A key the settle reprieves (referenced since it was promoted)
+	/// is not demoted at all, and keeps `Tier::Fast` and its bytes; a key
+	/// spliced into main's slow segment instead of being evicted is pushed
+	/// slow if it leaves a DRAM queue, and moves no bytes if it leaves a slow
+	/// one.
+	fn placement_of(&self, _key: HashedKey) -> Option<Tier> {
+		None
 	}
 
 	/// DRAM reserved for shared per-object metadata across *both* tiers

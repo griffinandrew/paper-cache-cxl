@@ -602,6 +602,111 @@ pub(crate) fn format_memts(sample: &MemtsSample) -> String {
 	)
 }
 
+// ---------------------------------------------------------------------------
+// the placement audit
+// ---------------------------------------------------------------------------
+
+/// Where every live value's bytes ARE -- its tag -- against where the policy
+/// stack PLACES its key (`PolicyStack::placement_of`): the answer to
+/// `PaperCache::placement_audit`, a DIAGNOSTIC (backpressure plan S3).
+///
+/// Bytes are [`value_charge`]s, the stacks' own unit and P's, so in a
+/// one-cache process at quiescence `fast_bytes` is P. Every live value is
+/// counted once in `fast`/`slow`, by where its bytes are, and at most once
+/// more in one of the three mismatch classes:
+///
+///   * `stranded` -- bytes in the FAST tier, the stack places them SLOW: DRAM
+///     the stack believes it gave up, which no settle will ever free (it
+///     counts them in `slow_used`, not `fast_used`);
+///   * `lagging` -- bytes in the SLOW tier, the stack places them FAST:
+///     charged to the fast budget, served at CXL speed until the worker's
+///     heal sees a hit served from the slow tier, with nothing of its bucket
+///     in flight, and queues the promotion;
+///   * `untracked` -- the stack does not know the key (`placement_of` is
+///     `None`): a key the stack lost, or a value whose `Set` the worker has
+///     not taken yet.
+///
+/// The worker lands the MIGRATIONS it has decided before it walks -- its
+/// pending drain, and a flush of the migration consumers -- so a value merely
+/// waiting on a queued migration is not counted as a mismatch: what is counted
+/// is what nothing in flight will fix. It does not run the EVICTION pass the
+/// event may have fallen before (the audit is handled mid-batch, where its
+/// event is), so a cache over its size is audited with the values that pass
+/// will evict. EXACT ONLY AT CLIENT QUIESCENCE: clients running during the
+/// walk move values under it, and a value whose `Set` the worker has not
+/// taken yet is untracked. Nothing here is exported in `HybridStats`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PlacementAudit {
+	/// Live values walked.
+	pub live: u64,
+
+	/// Values whose bytes are in the fast tier, and their charge.
+	pub fast: u64,
+	pub fast_bytes: u64,
+
+	/// Values whose bytes are in the slow tier, and their charge.
+	pub slow: u64,
+	pub slow_bytes: u64,
+
+	/// In the fast tier, placed slow.
+	pub stranded: u64,
+	pub stranded_bytes: u64,
+
+	/// In the slow tier, placed fast.
+	pub lagging: u64,
+	pub lagging_bytes: u64,
+
+	/// Not tracked by the stack at all, wherever the bytes are.
+	pub untracked: u64,
+	pub untracked_bytes: u64,
+}
+
+impl PlacementAudit {
+	/// Counts one live value: the tier its bytes are in, where the stack
+	/// places it, and its charge.
+	pub(crate) fn record(&mut self, physical: crate::Tier, placement: Option<crate::Tier>, bytes: u64) {
+		use crate::Tier::{Fast, Slow};
+
+		self.live += 1;
+
+		match physical {
+			Fast => {
+				self.fast += 1;
+				self.fast_bytes += bytes;
+			},
+
+			Slow => {
+				self.slow += 1;
+				self.slow_bytes += bytes;
+			},
+		}
+
+		match (physical, placement) {
+			(_, None) => {
+				self.untracked += 1;
+				self.untracked_bytes += bytes;
+			},
+
+			(Fast, Some(Slow)) => {
+				self.stranded += 1;
+				self.stranded_bytes += bytes;
+			},
+
+			(Slow, Some(Fast)) => {
+				self.lagging += 1;
+				self.lagging_bytes += bytes;
+			},
+
+			(Fast, Some(Fast)) | (Slow, Some(Slow)) => {},
+		}
+	}
+
+	/// No value is stranded, lagging or untracked.
+	pub fn is_clean(&self) -> bool {
+		self.stranded == 0 && self.lagging == 0 && self.untracked == 0
+	}
+}
+
 /// Milliseconds since the Unix epoch.
 pub(crate) fn wall_ms() -> u64 {
 	std::time::SystemTime::now()
@@ -630,6 +735,44 @@ mod tests {
 	};
 
 	use super::*;
+
+	/// Every live value lands in exactly one of fast/slow by its tag, and in
+	/// at most one mismatch class by the placement; bytes are summed as given.
+	#[test]
+	fn the_audit_classifies_by_tag_against_placement_and_sums_the_charges() {
+		use crate::Tier::{Fast, Slow};
+
+		let mut a = PlacementAudit::default();
+		assert!(a.is_clean(), "an empty audit is clean");
+
+		a.record(Fast, Some(Fast), 100);
+		a.record(Slow, Some(Slow), 200);
+		assert!(a.is_clean(), "placed where the bytes are: clean");
+
+		a.record(Fast, Some(Slow), 1_000);
+		a.record(Slow, Some(Fast), 20_000);
+		a.record(Slow, Some(Fast), 30_000);
+		a.record(Fast, None, 400_000);
+		a.record(Slow, None, 5_000_000);
+
+		assert_eq!(
+			a,
+			PlacementAudit {
+				live: 7,
+				fast: 3,
+				fast_bytes: 100 + 1_000 + 400_000,
+				slow: 4,
+				slow_bytes: 200 + 20_000 + 30_000 + 5_000_000,
+				stranded: 1,
+				stranded_bytes: 1_000,
+				lagging: 2,
+				lagging_bytes: 50_000,
+				untracked: 2,
+				untracked_bytes: 5_400_000,
+			},
+		);
+		assert!(!a.is_clean());
+	}
 
 	#[test]
 	fn shards_sum_exactly_and_an_unfolded_shard_stays_out_of_approx() {

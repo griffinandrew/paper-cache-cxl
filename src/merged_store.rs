@@ -188,7 +188,7 @@ use std::{
 use crate::{
 	error::CacheError,
 	object::{Object, ObjectSize},
-	worker::Tier,
+	worker::{MigrationOrigin, TaggedMigration, Tier},
 	CacheSize, HashedKey, NoHasher, PaperPolicy,
 };
 
@@ -829,7 +829,12 @@ struct Inner<K, V> {
 	fast_buckets: FreqBuckets,
 	slow_buckets: FreqBuckets,
 
-	migrations: Vec<(HashedKey, Tier)>,
+	/// Tier crossings waiting for the policy worker's drain, in order, each
+	/// tagged with its origin: a settle's or a touch's decision
+	/// (`MigrationOrigin::Stack`), or the new-key corrective `insert` queues
+	/// when the bytes were built in another tier than the store decided
+	/// (`MigrationOrigin::Reconcile`).
+	migrations: Vec<TaggedMigration>,
 }
 
 impl<K, V> Inner<K, V> {
@@ -1193,7 +1198,7 @@ impl<K, V> Inner<K, V> {
 			// the slow tier while this slot counts it fast. Pinned by
 			// `merged_overwrite_tests::an_overwrite_is_repromoted_after_a_stale_demotion`.
 			let key = self.slots[i as usize].hashed;
-			self.migrations.push((key, Tier::Fast));
+			self.migrations.push((key, Tier::Fast, MigrationOrigin::Stack));
 		}
 	}
 
@@ -1227,7 +1232,7 @@ impl<K, V> Inner<K, V> {
 		self.slow_used += migrating;
 		self.fast_boundary = prev;
 
-		self.migrations.push((key, Tier::Slow));
+		self.migrations.push((key, Tier::Slow, MigrationOrigin::Stack));
 
 		Some(migrating)
 	}
@@ -1456,7 +1461,7 @@ impl<K, V> Inner<K, V> {
 		// the first -- per-key order is preserved, so the consumer applies
 		// promote-then-demote and lands on the same final placement." The
 		// placement the two reach is identical; only the record stream differs.
-		self.migrations.push((key, Tier::Fast));
+		self.migrations.push((key, Tier::Fast, MigrationOrigin::Stack));
 	}
 
 	/// Demotes this shard's least-frequently-used FAST key, at its own count.
@@ -1487,7 +1492,7 @@ impl<K, V> Inner<K, V> {
 		self.fast_count = self.fast_count.saturating_sub(1);
 		self.slow_used += migrating;
 
-		self.migrations.push((key, Tier::Slow));
+		self.migrations.push((key, Tier::Slow, MigrationOrigin::Stack));
 
 		Some(migrating)
 	}
@@ -2678,28 +2683,34 @@ impl<K, V> MergedStore<K, V> {
 					};
 
 					// The tier the bytes are ACTUALLY in, read off the value
-					// this store was just handed.
+					// this store was just handed -- against which `decided` is
+					// checked below, under this shard's write lock.
 					//
-					// This is the whole defence against the class of bug the
-					// split LFU stack's latched branch has: that branch records
-					// a tier and emits NO migration, trusting
-					// `hybrid_policy::admission_tier` to have built the bytes
-					// there -- and `admission_tier` consults a mirror that
-					// `refresh_tier_gauges` publishes once per worker pass, so
-					// under a burst it is stale and nothing ever repairs the
-					// placement. Measured, on the split path: 7,999 of 8,000
-					// objects physically in DRAM while the stack reported 5,966
-					// slow and `fast_bytes_used` reported a compliant 31.78
-					// MiB.
-					//
-					// Here the comparison is against the object itself, not
-					// against a prediction, so a stale `admission_tier` costs
-					// one corrective migration and never a wrong placement.
-					// It is symmetric, so it also covers the mirror-image case
-					// a grow produces -- bytes built slow, policy decides fast.
-					// And it needs no new trait bound: `Object::value` and
-					// `TieredValue::tier` are both inherent on the UNBOUNDED
-					// impls, under both value layouts.
+					// `hybrid_policy::admission_tier` built them from a MIRROR
+					// the worker publishes once per pass (the LFU latch) or
+					// from a physical read, so they can be elsewhere: a stale
+					// latch, or a grow's mirror image (built slow, decided
+					// fast). The policy worker's reconcile compares the `Set`
+					// event's built tier with this slot's tier too, for both
+					// stores alike -- and for the overwrite branch above, which
+					// has no client-side corrective. The push here is KEPT
+					// beside it (review m3 of backpressure plan S3) because it
+					// costs nothing the store does not already pay (a compare
+					// under a lock it holds) and it keeps the correction window
+					// to ONE drain: this entry is in the store's list before
+					// the `Set` is even sent, so the worker's next drain takes
+					// it, where the reconcile's own would wait for the worker to
+					// reach the `Set` through the whole event backlog -- the
+					// bytes sitting in DRAM, charged slow, meanwhile. The two
+					// cannot conflict: when this entry is in the drain of the
+					// `Set`'s own event, the reconcile finds it there and adds
+					// nothing (the drain scan); when an earlier event's drain
+					// took it, the reconcile appends a duplicate for the same
+					// tier behind it, which its consumer DECLINES -- one
+					// dequeue and one lookup. Tagged `MigrationOrigin::
+					// Reconcile`: it moves bytes to where the store already
+					// placed the key, so it is counted as a corrective, never as
+					// a promotion or a demotion.
 					let built = object.value().tier();
 
 					let fresh = Slot {
@@ -2763,11 +2774,10 @@ impl<K, V> MergedStore<K, V> {
 						g.fast_boundary = i;
 					}
 
-					// A corrective migration exactly when the policy's tier and
-					// the bytes' tier disagree, in either direction. Under the
-					// queue orders they never do, so this costs nothing there.
+					// A corrective exactly when the policy's tier and the bytes'
+					// tier disagree, in either direction (see `built` above).
 					if built != decided {
-						g.migrations.push((key, decided));
+						g.migrations.push((key, decided, MigrationOrigin::Reconcile));
 					}
 
 					self.tracked.fetch_add(1, Ordering::Relaxed);
@@ -2863,13 +2873,47 @@ impl<K, V> MergedStore<K, V> {
 		self.tracked.load(Ordering::Relaxed)
 	}
 
+	/// Calls `f(key, tier, len)` for every live object: its key, the tier its
+	/// value's bytes are in (the value's tag) and the value's length -- the
+	/// placement audit's walk, `ObjectStore::for_each_value`'s twin. One
+	/// difference: each shard is read under its lock into a buffer and `f`
+	/// runs after the lock is released, since the merged handle's
+	/// `placement_of` IS a lookup under that lock (`tier_of`).
+	pub fn for_each_value(&self, mut f: impl FnMut(HashedKey, Tier, crate::object::ObjectSize)) {
+		let mut shard = Vec::new();
+
+		for lock in self.shards.iter() {
+			{
+				let g = lock.read().unwrap();
+
+				for i in 0..g.slots.allocated {
+					if let Some(object) = &g.slots[i].object {
+						shard.push((g.slots[i].hashed, object.value().tier(), object.data_size()));
+					}
+				}
+			}
+
+			for (key, tier, len) in shard.drain(..) {
+				f(key, tier, len);
+			}
+		}
+	}
+
 	pub fn is_empty(&self) -> bool {
 		self.len() == 0
 	}
 
 	/// Drains every (key, new tier) pair that crossed the fast/slow boundary
-	/// since the last call, across all shards.
+	/// since the last call, across all shards, without the origin tags:
+	/// `drain_tagged_migrations`, as the tests and fidelity checks read it.
 	pub fn drain_migrations(&self) -> Vec<(HashedKey, Tier)> {
+		self.drain_tagged_migrations().into_iter().map(|(key, tier, _)| (key, tier)).collect()
+	}
+
+	/// Drains every tier crossing since the last call, across all shards,
+	/// each with its origin (`Inner::migrations`): the merged handle's
+	/// `PolicyStack::drain_tagged_migrations`.
+	pub fn drain_tagged_migrations(&self) -> Vec<TaggedMigration> {
 		// A plain load first, and the read-modify-write only once there is
 		// something to collect. `PolicyWorker::apply_tier_migrations` calls this
 		// once per EVENT and the overwhelmingly common answer is "nothing", so an
@@ -3015,7 +3059,9 @@ impl<K, V> MergedStore<K, V> {
 			.fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
 	}
 
-	/// The tier `key` is currently placed in, for tests and fidelity checks.
+	/// The tier `key` is currently placed in: its slot's tier. The merged
+	/// handle's `PolicyStack::placement_of`, and what tests and fidelity checks
+	/// read. One shard read lock.
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
 		let g = self.shards[shard_of(key)].read().unwrap();
 		let i = g.find(key)?;

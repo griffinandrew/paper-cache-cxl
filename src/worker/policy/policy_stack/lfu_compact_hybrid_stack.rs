@@ -289,6 +289,12 @@ impl PolicyStack for LfuCompactHybridStack {
 			// bytes are where this branch wants them. Emitting one anyway made
 			// the worker reallocate a byte-identical object -- one migration per
 			// admission, which was this stack's dominant cost.
+			//
+			// Except when the mirror `admission_tier` reads was stale: a burst
+			// of new keys outruns `refresh_tier_gauges`, and keys this branch
+			// places slow were built in DRAM. The `Set` event carries the built
+			// tier, and the policy worker's reconcile queues the `(key, Slow)`
+			// for exactly those (S3), so this branch still emits nothing.
 			return;
 		}
 
@@ -387,6 +393,16 @@ impl PolicyStack for LfuCompactHybridStack {
 
 		self.fast_capacity = size;
 		self.settle_fast_tier();
+	}
+
+	/// `tier_of`: every settle demotion and promotion is pushed; the one tier
+	/// it records WITHOUT pushing is a new key admitted slow while latched,
+	/// which trusts `admission_tier` to have built it there -- and when the
+	/// latch mirror was stale it did not, which is what the worker's
+	/// reconcile corrects against this.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
 	}
 
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {

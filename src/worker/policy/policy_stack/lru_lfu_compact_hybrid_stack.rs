@@ -470,6 +470,13 @@ impl PolicyStack for LruLfuCompactHybridStack {
 		self.settle_fast_tier();
 	}
 
+	/// `tier_of`: admission is fast, the LRU settle pushes its demotions and a
+	/// slow key's promotion (at `promote_k`) is pushed after the settle.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

@@ -590,6 +590,14 @@ impl PolicyStack for S3FifoGhostLazyDemotionCompactHybridStack {
 		self.settle_fast_tier();
 	}
 
+	/// `tier_of`: the lazy demotion is the POLICY's -- a referenced key is
+	/// reprieved at the settle and keeps `Tier::Fast` and its bytes -- and a
+	/// key it does demote is pushed at once.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

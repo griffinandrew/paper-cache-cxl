@@ -572,6 +572,13 @@ impl PolicyStack for S3FifoLazyDemotionReprieveCompactHybridStack {
 		self.settle_fast_tier();
 	}
 
+	/// `tier_of`: the one-access queue is slow, and a reprieve into main's slow
+	/// segment moves no bytes; main's crossings are pushed.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

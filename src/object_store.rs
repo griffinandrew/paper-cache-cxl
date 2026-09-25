@@ -43,8 +43,8 @@ use dashmap::DashMap;
 use hashbrown::HashMap;
 use nohash_hasher::NoHashHasher;
 
-use crate::{HashedKey, NoHasher};
-use crate::object::Object;
+use crate::{HashedKey, NoHasher, Tier};
+use crate::object::{Object, ObjectSize};
 
 /// Common operations `PaperCache`'s generic impl blocks need from the
 /// object map, independent of whether it's backed by a `DashMap` or an
@@ -65,6 +65,16 @@ pub trait ObjectStore<K, V> {
 
 	/// Returns the number of objects currently tracked.
 	fn len(&self) -> usize;
+
+	/// Calls `f(key, tier, len)` for every object: its hashed key, the tier
+	/// its value's bytes are in (the value's tag) and the value's length. The
+	/// placement audit's walk (`PaperCache::placement_audit`), a diagnostic:
+	/// it holds each shard's read lock while it reads that shard, and calls
+	/// `f` under it, so `f` must not touch the store. Shape B holds its ONE
+	/// `std::sync::RwLock` read guard for the whole walk, and that lock
+	/// prefers writers: once a writer waits, new readers wait behind it, so
+	/// the walk stalls every `get` as well as every `set`.
+	fn for_each_value(&self, f: impl FnMut(HashedKey, Tier, ObjectSize));
 }
 
 // ---------------------------------------------------------------------
@@ -90,6 +100,14 @@ impl<K, V> ObjectStore<K, V> for DashMap<HashedKey, Object<K, V>, NoHasher> {
 
 	fn len(&self) -> usize {
 		DashMap::len(self)
+	}
+
+	fn for_each_value(&self, mut f: impl FnMut(HashedKey, Tier, ObjectSize)) {
+		for entry in self.iter() {
+			let object = entry.value();
+
+			f(*entry.key(), object.value().tier(), object.data_size());
+		}
 	}
 }
 
@@ -171,5 +189,11 @@ impl<K, V, A: Allocator> ObjectStore<K, V>
 
 	fn len(&self) -> usize {
 		self.read().unwrap().len()
+	}
+
+	fn for_each_value(&self, mut f: impl FnMut(HashedKey, Tier, ObjectSize)) {
+		for (key, object) in self.read().unwrap().iter() {
+			f(*key, object.value().tier(), object.data_size());
+		}
 	}
 }

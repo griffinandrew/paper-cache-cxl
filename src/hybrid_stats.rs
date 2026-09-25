@@ -27,7 +27,12 @@
 //! peak, `effective_fast_capacity`, the over-budget integral, hits by serving
 //! tier, and the live tiered-cache and flat-fast-cache counts. Four of those
 //! are PROCESS-GLOBAL (`phys_fast_bytes`, `phys_fast_bytes_max`,
-//! `live_tiered_caches`, `live_flat_fast_caches`); see each field.
+//! `live_tiered_caches`, `live_flat_fast_caches`); see each field. Since S3,
+//! 4 more process-global totals -- the corrective migrations the policy
+//! worker's reconcile queued, by reason (`reconcile_set_*`,
+//! `reconcile_get_to_fast`) -- and 2 counters of this cache's own: the
+//! correctives that LANDED (`reconcile_applied_*`), which are not promotions
+//! or demotions.
 
 /// Feature-neutral snapshot of the active hybrid cache's tier-movement
 /// counters and live tier gauges.
@@ -39,10 +44,16 @@
 /// one polling interval stale.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HybridStats {
-	/// Total slow→fast tier migrations (objects physically moved into DRAM).
+	/// Total slow→fast tier migrations (objects physically moved into DRAM)
+	/// the policy stack DECIDED. A corrective -- a move to where the stack
+	/// already placed the key -- is not one: see `reconcile_applied_to_fast`.
 	pub promotions: u64,
 
-	/// Total fast→slow tier migrations (objects physically moved into PMEM).
+	/// Total fast→slow tier migrations (objects physically moved into PMEM)
+	/// the policy stack DECIDED, as far as the design counts them (the
+	/// LFU-style design counts its settle's demotions when it decides them,
+	/// not its admission-to-slow moves). A corrective is not one: see
+	/// `reconcile_applied_to_slow`.
 	pub demotions: u64,
 
 	/// Total terminal evictions — objects removed from the cache entirely,
@@ -127,6 +138,41 @@ pub struct HybridStats {
 	/// in this process (`phys::live_flat_fast_caches`). Their values are in
 	/// `phys_fast_bytes` too.
 	pub live_flat_fast_caches: u64,
+
+	/// Corrective migrations the policy worker's reconcile QUEUED: a `set`
+	/// whose value was built in the slow tier for a key the stack places
+	/// fast, the reverse, and a hit served from the slow tier on a key the
+	/// stack places fast (the heal). Intents: one that finds the bytes
+	/// already moved is declined by its consumer. PROCESS-GLOBAL totals, the
+	/// MIGSTATS line's `reconcile_*` fields.
+	pub reconcile_set_to_fast: u64,
+	pub reconcile_set_to_slow: u64,
+	pub reconcile_get_to_fast: u64,
+
+	/// Correctives the NEW-KEY RULE alone queued: a key (re-)admitted as new
+	/// while a migration of its bucket was in flight, or had landed after its
+	/// value was published, whose value was built where the stack places it
+	/// -- queued only to land LAST, behind any stale entry for the key. An
+	/// intent, PROCESS-GLOBAL like the three above; the MIGSTATS line's
+	/// `reconcile_set_new_key`.
+	pub reconcile_set_new_key: u64,
+
+	/// Reconcile-origin migrations -- the worker's correctives and the merged
+	/// store's client-side new-key push -- that LANDED, i.e. moved a value's
+	/// bytes, by destination. THIS cache's totals since its creation or its
+	/// last `wipe()`, like `promotions` and `demotions`, and never counted in
+	/// them: a corrective moves bytes to where the stack ALREADY placed the
+	/// key and displaces nothing, so it is not a promotion or a demotion in
+	/// the paper's sense. So every completed move into DRAM is `promotions +
+	/// reconcile_applied_to_fast`, and every completed move out of it is
+	/// `demotions + reconcile_applied_to_slow` -- except under the LFU-style
+	/// design, whose `demotions` count its settle's decisions rather than
+	/// completed moves (see `demotions`). One that found the bytes already
+	/// moved (declined), the key gone, or its value replaced mid-copy
+	/// (superseded) is not counted. The MIGSTATS line's
+	/// `reconcile_applied_*` are the process-global totals.
+	pub reconcile_applied_to_fast: u64,
+	pub reconcile_applied_to_slow: u64,
 }
 
 impl HybridStats {

@@ -35,14 +35,38 @@ pub type WorkerHandles = Vec<JoinHandle<Result<(), CacheError>>>;
 
 #[derive(Clone)]
 pub enum WorkerEvent {
-	Get(HashedKey, bool),
+	/// `(key, served)`: `served` is `Some(tier)` on a hit -- the tier of the
+	/// value the hit copied, read off the snapshot's tag -- and `None` on a
+	/// miss.
+	///
+	/// The tier is what the policy worker's heal needs (backpressure plan S3):
+	/// a hit served from the SLOW tier on a key the stack places fast is a
+	/// value left in CXL with nothing queued to move it, and the worker queues
+	/// its promotion. Only the client knows which copy it read, so it travels
+	/// with the event, in the byte the old `bool` took.
+	Get(HashedKey, Option<Tier>),
 	Promote(HashedKey),
-	/// `(key, base_size, dram_resident, expiry, previous (base_size, expiry))`
+	/// `(key, base_size, dram_resident, expiry, previous (base_size, expiry),
+	/// built, mark)`
 	///
 	/// `dram_resident` is the part of `base_size` that never migrates (see
 	/// `OverheadManager::dram_resident_size`). It travels with the event because
 	/// only the caller holds the `Object` it is derived from.
-	Set(HashedKey, ObjectSize, ObjectSize, ExpireTime, Option<(ObjectSize, ExpireTime)>),
+	///
+	/// `built` is the tier the new value's bytes were allocated in (its
+	/// `value().tier()`), which the policy worker's reconcile compares with the
+	/// tier the stack places the key in once it has handled the event (S3):
+	/// the client chose it from a mirror or a physical read the worker may
+	/// already have moved past, and the stack does not otherwise know it.
+	///
+	/// `mark` is the LANDED count of the key's migration bucket
+	/// (`migration_queue::InFlight::mark`), which the client read BEFORE it
+	/// published the value. Against the bucket as the worker finds it, it
+	/// tells whether any migration of the bucket was in flight, or landed,
+	/// after the value was published -- the new-key rule
+	/// (`PolicyWorker::handle_set`). 0 from a flat cache, which queues no
+	/// migrations; in the byte padding the variant already had.
+	Set(HashedKey, ObjectSize, ObjectSize, ExpireTime, Option<(ObjectSize, ExpireTime)>, Tier, u32),
 	Del(HashedKey, ExpireTime),
 
 	/// A `TtlWorker` reap: the object at this key expired, and that worker has
@@ -107,6 +131,17 @@ pub enum WorkerEvent {
 	/// call. See `PaperCache`'s `Drop` impl for the send-then-join sequence
 	/// this variant exists to support.
 	Shutdown,
+
+	/// DIAGNOSTIC: the policy worker lands every migration it has decided,
+	/// walks the object map, classifies each live value by where its bytes
+	/// are against where the stack places it, and replies. Sent only by
+	/// `PaperCache::placement_audit`, point to point in effect (only the
+	/// policy worker subscribes), and it blocks that worker for the flush and
+	/// the walk; handled where it falls in a batch, before that batch's
+	/// eviction pass, and exact only at client quiescence -- see
+	/// `phys::PlacementAudit`.
+	#[cfg(feature = "hybrid_cache_common")]
+	Audit(Sender<crate::phys::PlacementAudit>),
 }
 
 /// Bitmask over [`WorkerEvent`]'s variants. `WorkerFanout` pairs one of
@@ -144,6 +179,7 @@ impl Events {
 	pub const RESIZE_SIZE_THRESHOLD: EventMask = 1 << 9;
 	pub const POLICY: EventMask = 1 << 10;
 	pub const SHUTDOWN: EventMask = 1 << 11;
+	pub const AUDIT: EventMask = 1 << 13;
 
 	/// `PolicyWorker`. Note the two omissions: `Promote` is delivered to the
 	/// tiering worker directly through `PolicyWorker`'s own `promotion_tx`,
@@ -160,7 +196,8 @@ impl Events {
 		| Self::RESIZE_LARGE_FAST_TIER
 		| Self::RESIZE_SIZE_THRESHOLD
 		| Self::POLICY
-		| Self::SHUTDOWN;
+		| Self::SHUTDOWN
+		| Self::AUDIT;
 
 	/// `TtlWorker` -- expiry bookkeeping only. Reads never change an object's
 	/// expiry, so `Get` (the dominant event in a read-heavy workload) is
@@ -204,6 +241,8 @@ impl WorkerEvent {
 			WorkerEvent::ResizeSizeThreshold(..) => Events::RESIZE_SIZE_THRESHOLD,
 			WorkerEvent::Policy(..) => Events::POLICY,
 			WorkerEvent::Shutdown => Events::SHUTDOWN,
+			#[cfg(feature = "hybrid_cache_common")]
+			WorkerEvent::Audit(..) => Events::AUDIT,
 		}
 	}
 }
@@ -255,3 +294,16 @@ pub(crate) use crate::worker::policy::migration_test_lock;
 // The migration queue's pending entry counts, for `crate::phys`.
 #[cfg(feature = "hybrid_cache_common")]
 pub(crate) use crate::worker::policy::migration_queue::pending as pending_migrations;
+
+// The reconcile's corrective pushes, for `AtomicStatus::hybrid_stats`.
+#[cfg(feature = "hybrid_cache_common")]
+pub(crate) use crate::worker::policy::migstats::{reconcile_applied, reconciled};
+
+// The migration pipeline's per-key-bucket in-flight and landed counts, which
+// `AtomicStatus` holds for the client, the worker and the consumers.
+#[cfg(feature = "hybrid_cache_common")]
+pub(crate) use crate::worker::policy::migration_queue::InFlight;
+
+// The tagged drain entry, for the merged store's own migration list.
+#[cfg(feature = "merged_object_store")]
+pub(crate) use crate::worker::policy::{MigrationOrigin, TaggedMigration};

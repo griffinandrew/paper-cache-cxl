@@ -362,6 +362,15 @@ impl PolicyStack for LruCompactHybridStack {
 		self.settle_fast_tier();
 	}
 
+	/// `tier_of`: `settle_fast_tier` pushes every demotion and `touch_fast_key`
+	/// pushes the promotion after its settle, guarded on the key still being
+	/// fast -- also on a re-set, where the bytes are already fast, to follow
+	/// a stale queued demotion.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

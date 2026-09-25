@@ -860,6 +860,14 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridSt
 		self.settle_fast_tier();
 	}
 
+	/// `tier_of`: as the fast-admission variant; the midpoint checkpoint's
+	/// second chance promotes with a real `(key, Fast)` migration, as the
+	/// tail's does.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

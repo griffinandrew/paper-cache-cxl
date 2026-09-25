@@ -78,6 +78,13 @@ pub fn admission_tier<K>(
 		// function to have placed the bytes already). The fast tier then
 		// physically held objects the stack believed were in PMEM, and 63% of
 		// promotions were declined as "already in the requested tier".
+		//
+		// The latch is a MIRROR the worker refreshes once per pass, so a burst
+		// of new keys can still outrun it and be built fast after the stack
+		// has latched. The `Set` event carries the tier built here, and the
+		// policy worker's reconcile queues the correction (S3). The same holds
+		// for every arm that reads an existing key's PHYSICAL tier: a
+		// migration of the key can land between that read and the insert.
 		PaperPolicy::LfuCompactHybrid => {
 			match objects.get_ref(&hashed_key) {
 				Some(object) => match object.value().is_fast() {

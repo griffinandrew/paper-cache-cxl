@@ -395,18 +395,25 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 			if payload.freq > 1 {
 				self.place_at_main_front(key, Some(Q_SMALL), bytes);
 
-				// Promotion into a full main is resolved by main, exactly as
-				// flat does it.
-				if self.main_is_full() {
-					return self.evict_main();
-				}
-
 				// Bytes already in DRAM need no migration; a slow-resident
-				// small queue does.
+				// small queue does. Pushed BEFORE a full main is resolved: it
+				// used to come after the early return below, so a promotion
+				// into a full main was counted fast with its bytes left in CXL
+				// and nothing queued -- found by T9 (P below `fast_used`), and
+				// what the placement audit reports as lagging. `evict_main`'s
+				// requeues settle after this, so a demotion of the key there is
+				// a later entry and wins; if it evicts the key, the entry finds
+				// it gone.
 				if !SMALL_IS_FAST
 					&& self.queues.payload(key).and_then(|p| p.tier) == Some(Tier::Fast)
 				{
 					self.migrations.push((key, Tier::Fast));
+				}
+
+				// Promotion into a full main is resolved by main, exactly as
+				// flat does it.
+				if self.main_is_full() {
+					return self.evict_main();
 				}
 
 				continue;
@@ -628,6 +635,14 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> PolicyStack
 	fn resize_fast_tier(&mut self, size: CacheSize) {
 		self.fast_capacity = size;
 		self.settle_fast_tier();
+	}
+
+	/// `tier_of`: the small queue is DRAM or CXL per variant, main is placed by
+	/// its tier, and every crossing is pushed -- including a promotion out of
+	/// a slow small queue into a full main (`evict_small`).
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
 	}
 
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {

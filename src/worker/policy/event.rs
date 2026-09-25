@@ -43,8 +43,12 @@ pub enum TraceEvent {
 impl StackEvent {
 	pub fn maybe_from_worker_event(worker_event: &WorkerEvent) -> Option<Self> {
 		let event = match worker_event {
-			WorkerEvent::Get(key, hit) if *hit => StackEvent::Get(*key),
-			WorkerEvent::Set(key, size, resident, _, _) => StackEvent::Set(*key, *size, *resident),
+			// A hit, whichever tier served it: the trace records accesses, not
+			// placement, so its format is unchanged by the served tier.
+			WorkerEvent::Get(key, Some(_)) => StackEvent::Get(*key),
+			// The built tier is not traced either: a replay rebuilds a FLAT
+			// policy's stack after a switch, and flat stacks have no tiers.
+			WorkerEvent::Set(key, size, resident, _, _, _, _) => StackEvent::Set(*key, *size, *resident),
 			WorkerEvent::Del(key, _) => StackEvent::Del(*key),
 			WorkerEvent::Wipe => StackEvent::Wipe,
 			WorkerEvent::Resize(size) => StackEvent::Resize(*size),

@@ -85,8 +85,8 @@ where
     /// Process events from the worker manager
     fn process_event(&self, event: WorkerEvent) {
         match event {
-            WorkerEvent::Get(hashed_key, hit) => {
-                if hit {
+            WorkerEvent::Get(hashed_key, served) => {
+                if served.is_some() {
                     // Record access and check if we should promote
                     if self.tiering_manager.record_access(hashed_key) {
                         // Object should be promoted to DRAM - copy the Object
@@ -107,7 +107,7 @@ where
                 }
             }
             
-            WorkerEvent::Set(hashed_key, base_size, _resident, _expiry, old_object_info) => {
+            WorkerEvent::Set(hashed_key, base_size, _resident, _expiry, old_object_info, _built, _mark) => {
                 if old_object_info.is_none() {
                     // New object - register it in PMEM tier
                     self.tiering_manager.register_object(hashed_key, base_size);
@@ -185,8 +185,8 @@ where
     /// Process events from the worker manager
     fn process_event(&self, event: WorkerEvent) {
         match event {
-            WorkerEvent::Get(hashed_key, hit) => {
-                if hit {
+            WorkerEvent::Get(hashed_key, served) => {
+                if served.is_some() {
                     // Record access and check if we should promote
                     if self.tiering_manager.record_access(hashed_key) {
                         // Object should be promoted to DRAM - copy the Object
@@ -208,7 +208,7 @@ where
                 }
             }
             
-            WorkerEvent::Set(hashed_key, base_size, _resident, _expiry, old_object_info) => {
+            WorkerEvent::Set(hashed_key, base_size, _resident, _expiry, old_object_info, _built, _mark) => {
                 if old_object_info.is_none() {
                     // New object - register it in PMEM tier
                     self.tiering_manager.register_object(hashed_key, base_size);

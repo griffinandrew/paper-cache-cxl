@@ -109,6 +109,26 @@ pub struct AtomicStatus {
 	hybrid_demotions: AtomicU64,
 	#[cfg(feature = "hybrid_cache_common")]
 	hybrid_evictions: AtomicU64,
+
+	/// Completed CORRECTIVES (`MigrationOrigin::Reconcile`), by destination:
+	/// written by the migration consumers and the inline path, never counted
+	/// in `hybrid_promotions`/`hybrid_demotions`. See
+	/// `HybridStats::reconcile_applied_to_fast`.
+	#[cfg(feature = "hybrid_cache_common")]
+	hybrid_reconcile_applied_to_fast: AtomicU64,
+	#[cfg(feature = "hybrid_cache_common")]
+	hybrid_reconcile_applied_to_slow: AtomicU64,
+
+	/// The migration pipeline's per-key-bucket in-flight and landed counts
+	/// (`migration_queue::InFlight`): charged and finished by the policy
+	/// worker and the migration consumers, and read by `PaperCache::set` for
+	/// the new-key rule's mark. Here because the status is the one structure
+	/// the client, the worker and the consumers all hold. Built on first use
+	/// (128 KiB), so a flat cache never pays for it; never reset (a wipe
+	/// leaves entries in flight).
+	#[cfg(feature = "hybrid_cache_common")]
+	migration_in_flight: std::sync::OnceLock<Arc<crate::worker::InFlight>>,
+
 	#[cfg(feature = "hybrid_cache_common")]
 	hybrid_fast_bytes_used: AtomicCacheSize,
 	#[cfg(feature = "hybrid_cache_common")]
@@ -358,6 +378,12 @@ impl AtomicStatus {
 			hybrid_demotions: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			hybrid_evictions: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			hybrid_reconcile_applied_to_fast: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			hybrid_reconcile_applied_to_slow: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			migration_in_flight: std::sync::OnceLock::new(),
 			#[cfg(feature = "hybrid_cache_common")]
 			hybrid_fast_bytes_used: AtomicCacheSize::default(),
 			#[cfg(feature = "hybrid_cache_common")]
@@ -735,6 +761,9 @@ impl AtomicStatus {
 	/// whichever hybrid design is running.
 	#[must_use]
 	pub fn hybrid_stats(&self) -> HybridStats {
+		let (reconcile_set_to_fast, reconcile_set_to_slow, reconcile_get_to_fast, reconcile_set_new_key) =
+			crate::worker::reconciled();
+
 		HybridStats {
 			promotions: self.hybrid_promotions.load(Ordering::Relaxed),
 			demotions: self.hybrid_demotions.load(Ordering::Relaxed),
@@ -760,7 +789,37 @@ impl AtomicStatus {
 			slow_hits: self.hybrid_slow_hits.load(Ordering::Relaxed),
 			live_tiered_caches: crate::phys::live_tiered_caches(),
 			live_flat_fast_caches: crate::phys::live_flat_fast_caches(),
+			reconcile_set_to_fast,
+			reconcile_set_to_slow,
+			reconcile_get_to_fast,
+			reconcile_set_new_key,
+			reconcile_applied_to_fast: self.hybrid_reconcile_applied_to_fast.load(Ordering::Relaxed),
+			reconcile_applied_to_slow: self.hybrid_reconcile_applied_to_slow.load(Ordering::Relaxed),
 		}
+	}
+
+	/// Records completed correctives (`MigrationOrigin::Reconcile`), by
+	/// destination, for this cache and in the process-global MIGSTATS totals
+	/// -- batched like `record_hybrid_promotions`, and never counted as
+	/// promotions or demotions.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub(crate) fn record_reconcile_applied(&self, to_fast: u64, to_slow: u64) {
+		if to_fast != 0 {
+			self.hybrid_reconcile_applied_to_fast.fetch_add(to_fast, Ordering::Relaxed);
+		}
+
+		if to_slow != 0 {
+			self.hybrid_reconcile_applied_to_slow.fetch_add(to_slow, Ordering::Relaxed);
+		}
+
+		crate::worker::reconcile_applied(to_fast, to_slow);
+	}
+
+	/// The migration pipeline's per-key-bucket counts
+	/// (`migration_queue::InFlight`), built on first use.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub(crate) fn migration_in_flight(&self) -> &Arc<crate::worker::InFlight> {
+		self.migration_in_flight.get_or_init(|| Arc::new(crate::worker::InFlight::new()))
 	}
 
 
@@ -969,6 +1028,10 @@ impl AtomicStatus {
 		self.hybrid_demotions.store(0, Ordering::Relaxed);
 		#[cfg(feature = "hybrid_cache_common")]
 		self.hybrid_evictions.store(0, Ordering::Relaxed);
+		#[cfg(feature = "hybrid_cache_common")]
+		self.hybrid_reconcile_applied_to_fast.store(0, Ordering::Relaxed);
+		#[cfg(feature = "hybrid_cache_common")]
+		self.hybrid_reconcile_applied_to_slow.store(0, Ordering::Relaxed);
 
 		// Reset synchronously here (called from `wipe()` on the API-calling
 		// thread) rather than waiting for `PolicyWorker` to process the

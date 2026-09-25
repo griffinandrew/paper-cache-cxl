@@ -729,6 +729,14 @@ impl PolicyStack for S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
 		self.settle_fast_tier();
 	}
 
+	/// `tier_of`: the one-access queue is DRAM (its promotion into main moves
+	/// no bytes and pushes none); lazy demotion as in the slow-queue
+	/// variant.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

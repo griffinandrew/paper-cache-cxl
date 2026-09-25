@@ -809,6 +809,14 @@ where
 		self.status.try_to_status()
 	}
 
+	/// A flat cache has no tiers to audit: `None`. See the tiered cache's
+	/// `placement_audit`.
+	#[cfg(feature = "hybrid_cache_common")]
+	#[must_use]
+	pub fn placement_audit(&self) -> Option<crate::phys::PlacementAudit> {
+		None
+	}
+
 	/// Gets the value associated with the supplied key.
 	/// If the key was not found in the cache, returns a [`CacheError`].
 	///
@@ -838,7 +846,8 @@ where
 		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
 			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
 				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+				// Served from the manager's DRAM side-copy.
+				self.broadcast(WorkerEvent::Get(hashed_key, Some(Tier::Fast)))?;
 				let arc_val = dram_object_ref.data();
 				return Ok(arc_val.as_ref().to_vec());
 			}
@@ -848,7 +857,8 @@ where
 		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
 			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
 				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+				// Served from the manager's DRAM side-copy.
+				self.broadcast(WorkerEvent::Get(hashed_key, Some(Tier::Fast)))?;
 				// Use data_as_bytes to handle both PhysicalCopy and CxlReference
 				return Ok(dram_object_ref.data_as_bytes());
 			}
@@ -864,6 +874,10 @@ where
 			_ => None,
 		};
 
+		// The tier the hit is served from -- the snapshot's tag -- or `None`
+		// on a miss: the policy worker's heal needs it (`WorkerEvent::Get`).
+		let served = snapshot.as_ref().map(|value| value.tier());
+
 		let result = match snapshot {
 			Some(value) => {
 				self.status.incr_hits();
@@ -877,7 +891,7 @@ where
 		};
 
 
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		self.broadcast(WorkerEvent::Get(hashed_key, served))?;
 
 		result
 	}
@@ -920,6 +934,10 @@ where
 		#[allow(unused_mut)]
 		let mut gi_fast: u64 = 1;
 
+		// The tier the hit is served from -- the snapshot's tag -- or `None`
+		// on a miss: the policy worker's heal needs it (`WorkerEvent::Get`).
+		let served = snapshot.as_ref().map(|value| value.tier());
+
 		let result = match snapshot {
 			Some(value) => {
 				self.status.incr_hits();
@@ -935,7 +953,7 @@ where
 		};
 		let t3 = if prof { Some(std::time::Instant::now()) } else { None };
 
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		self.broadcast(WorkerEvent::Get(hashed_key, served))?;
 
 		if let (Some(t0), Some(t1), Some(t2), Some(t3), true) = (t0, t1, t2, t3, result.is_ok()) {
 			let t4 = std::time::Instant::now();
@@ -994,6 +1012,9 @@ where
 		let base_size = self.overhead_manager.base_size(&object);
 		let dram_resident = self.overhead_manager.dram_resident_size(&object);
 		let expiry = object.expiry();
+		// Where the bytes were allocated, for the worker's reconcile
+		// (`WorkerEvent::Set`).
+		let built = object.value().tier();
 
 		if base_size == 0 {
 			return Err(CacheError::ZeroValueSize);
@@ -1029,6 +1050,9 @@ where
 			dram_resident,
 			expiry,
 			old_object_info,
+			built,
+			// A flat cache queues no migration: nothing to mark.
+			0,
 		))?;
 
 		Ok(())
@@ -1543,6 +1567,14 @@ where
 		self.status.try_to_status()
 	}
 
+	/// A flat cache has no tiers to audit: `None`. See the tiered cache's
+	/// `placement_audit`.
+	#[cfg(feature = "hybrid_cache_common")]
+	#[must_use]
+	pub fn placement_audit(&self) -> Option<crate::phys::PlacementAudit> {
+		None
+	}
+
 	/// Gets the value associated with the supplied key.
 	/// If the key was not found in the cache, returns a [`CacheError`].
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
@@ -1552,7 +1584,8 @@ where
 		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
 			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
 				self.status.incr_hits();
-				self.broadcast(WorkerEvent::Get(hashed_key, true))?;
+				// Served from the manager's DRAM side-copy.
+				self.broadcast(WorkerEvent::Get(hashed_key, Some(Tier::Fast)))?;
 				let arc_val = dram_object_ref.data();
 				return Ok(arc_val.as_ref().to_vec());
 			}
@@ -1568,6 +1601,10 @@ where
 			_ => None,
 		};
 
+		// The tier the hit is served from -- the snapshot's tag -- or `None`
+		// on a miss: the policy worker's heal needs it (`WorkerEvent::Get`).
+		let served = snapshot.as_ref().map(|value| value.tier());
+
 		let result = match snapshot {
 			Some(value) => {
 				self.status.incr_hits();
@@ -1581,7 +1618,7 @@ where
 		};
 
 
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		self.broadcast(WorkerEvent::Get(hashed_key, served))?;
 
 		result
 	}
@@ -1600,6 +1637,9 @@ where
 		let base_size = self.overhead_manager.base_size(&object);
 		let dram_resident = self.overhead_manager.dram_resident_size(&object);
 		let expiry = object.expiry();
+		// Where the bytes were allocated, for the worker's reconcile
+		// (`WorkerEvent::Set`).
+		let built = object.value().tier();
 
 		if base_size == 0 {
 			return Err(CacheError::ZeroValueSize);
@@ -1633,6 +1673,9 @@ where
 			dram_resident,
 			expiry,
 			old_object_info,
+			built,
+			// A flat cache queues no migration: nothing to mark.
+			0,
 		))?;
 
 		Ok(())
@@ -2441,6 +2484,10 @@ where
 			_ => None,
 		};
 
+		// The tier the hit is served from -- the snapshot's tag -- or `None`
+		// on a miss: the policy worker's heal needs it (`WorkerEvent::Get`).
+		let served = snapshot.as_ref().map(|value| value.tier());
+
 		let result = match snapshot {
 			Some(value) => {
 				self.status.incr_hits();
@@ -2456,7 +2503,7 @@ where
 		};
 
 
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		self.broadcast(WorkerEvent::Get(hashed_key, served))?;
 
 		result
 	}
@@ -2498,6 +2545,10 @@ where
 		#[allow(unused_mut)]
 		let mut gi_fast: u64 = 1;
 
+		// The tier the hit is served from -- the snapshot's tag -- or `None`
+		// on a miss: the policy worker's heal needs it (`WorkerEvent::Get`).
+		let served = snapshot.as_ref().map(|value| value.tier());
+
 		let result = match snapshot {
 			Some(value) => {
 				self.status.incr_hits();
@@ -2515,7 +2566,7 @@ where
 		};
 		let t3 = if prof { Some(std::time::Instant::now()) } else { None };
 
-		self.broadcast(WorkerEvent::Get(hashed_key, result.is_ok()))?;
+		self.broadcast(WorkerEvent::Get(hashed_key, served))?;
 
 		if let (Some(t0), Some(t1), Some(t2), Some(t3), true) = (t0, t1, t2, t3, result.is_ok()) {
 			let t4 = std::time::Instant::now();
@@ -2564,6 +2615,9 @@ where
 		let base_size = self.overhead_manager.base_size(&object);
 		let dram_resident = self.overhead_manager.dram_resident_size(&object);
 		let expiry = object.expiry();
+		// Where the bytes were allocated, for the worker's reconcile
+		// (`WorkerEvent::Set`).
+		let built = object.value().tier();
 
 		if base_size == 0 {
 			return Err(CacheError::ZeroValueSize);
@@ -2574,6 +2628,12 @@ where
 		}
 
 		self.status.incr_sets();
+
+		// The new-key rule's mark (`WorkerEvent::Set`): the landed count of
+		// this key's migration bucket, read BEFORE the insert publishes the
+		// value, so that a migration landing on the value is ordered after
+		// this read. One load.
+		let mark = self.status.migration_in_flight().mark(hashed_key);
 
 		let old_object_info = self.objects
 			.insert(hashed_key, object)
@@ -2598,6 +2658,8 @@ where
 			dram_resident,
 			expiry,
 			old_object_info,
+			built,
+			mark,
 		))?;
 
 		Ok(())
@@ -2832,6 +2894,50 @@ where
 	#[must_use]
 	pub fn hybrid_stats(&self) -> HybridStats {
 		self.status.hybrid_stats()
+	}
+
+	/// DIAGNOSTIC: every live value's bytes against where the policy stack
+	/// places its key -- how many values, and how many bytes (the stacks'
+	/// unit), are stranded (in DRAM, placed slow), lagging (in CXL, placed
+	/// fast) or untracked. See [`phys::PlacementAudit`].
+	///
+	/// It BLOCKS THE POLICY WORKER for the whole run, and this thread waits for
+	/// it: the worker first lands every migration it has decided -- its pending
+	/// drain, then a flush that waits for the migration consumers to finish
+	/// their backlog -- and then walks the entire object map, one
+	/// `placement_of` lookup per value, before it takes another event. It is
+	/// handled where its event falls, possibly mid-batch: the eviction pass
+	/// that ends each batch has not run, so a cache over its size still holds
+	/// -- and the audit counts -- the values that pass will evict. The walk
+	/// holds each map shard's read lock while it reads that shard, so a writer
+	/// to it waits. In the hashbrown build it holds the map's ONE
+	/// `std::sync::RwLock` read guard for the whole walk, and that lock
+	/// prefers writers: once a `set` is waiting for it, every `get` waits too,
+	/// so the whole cache stalls for the walk. For end-of-run checks and
+	/// tests, not for a hot path.
+	///
+	/// EXACT ONLY AT CLIENT QUIESCENCE. While clients run, a value set, moved
+	/// or deleted during the walk is read before or after the change, and a
+	/// value whose `Set` the worker has not taken yet is reported untracked
+	/// (or, over a tracked key, against its old placement).
+	///
+	/// `None` if the policy worker is gone.
+	pub fn placement_audit(&self) -> Option<phys::PlacementAudit> {
+		let (reply, answer) = crossbeam_channel::bounded(1);
+
+		self.broadcast(WorkerEvent::Audit(reply)).ok()?;
+
+		answer.recv().ok()
+	}
+
+	/// DIAGNOSTIC: migrations handed to this cache's consumers and not
+	/// finished yet, summed over the per-key buckets the reconcile's new-key
+	/// and heal rules read (`migration_queue::InFlight`). The hand-offs and
+	/// the finishes balance, so this is 0 whenever the queue is idle -- at
+	/// quiescence, and after an audit's flush -- and always 0 with
+	/// `MIGRATION_QUEUE_THREADS=0`. One load per bucket (16,384).
+	pub fn migrations_in_flight(&self) -> u64 {
+		self.status.migration_in_flight().total_pending()
 	}
 
 	/// Returns which tier `key` currently lives in, or `None` if the key

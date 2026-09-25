@@ -635,6 +635,13 @@ impl PolicyStack for LruSizedCompactHybridStack {
 		self.size_threshold = size;
 	}
 
+	/// `tier_of`, the tier of the key's queue: each segment's settle pushes its
+	/// demotions and a promotion is pushed after the settle, per segment.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

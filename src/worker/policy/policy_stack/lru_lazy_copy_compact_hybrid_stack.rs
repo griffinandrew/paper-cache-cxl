@@ -497,6 +497,19 @@ impl PolicyStack for LruLazyCopyCompactHybridStack {
 		self.reclaim_dram();
 	}
 
+	/// `physical_tier_of`, NOT `tier_of` -- the one design whose policy
+	/// placement and byte placement legitimately differ. A CANDIDATE (demoted
+	/// by the policy, not yet copied) is logically slow with its bytes left in
+	/// DRAM on purpose until `reclaim_dram` copies it out under DRAM pressure;
+	/// every change of `phys` pushes its migration (`reclaim_dram` its copy
+	/// out, `touch_fast_key` a copy back from the slow tier), and a candidate's
+	/// promotion is a relabel that moves nothing. With `tier_of` the reconcile
+	/// would copy every candidate out on its next set, and the audit would
+	/// report every one as stranded. See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.physical_tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

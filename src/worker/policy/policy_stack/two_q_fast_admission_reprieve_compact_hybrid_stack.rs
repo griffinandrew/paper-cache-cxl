@@ -625,6 +625,13 @@ impl PolicyStack for TwoQFastAdmissionReprieveCompactHybridStack {
 		self.settle_fifo_queue();
 	}
 
+	/// `tier_of`: the DRAM admission FIFO as in fast admission; a key
+	/// reprieved out of it into main's slow segment is pushed slow at once.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

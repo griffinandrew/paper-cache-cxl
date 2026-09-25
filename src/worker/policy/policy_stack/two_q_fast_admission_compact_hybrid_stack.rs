@@ -580,6 +580,13 @@ impl PolicyStack for TwoQFastAdmissionCompactHybridStack {
 		self.settle_fast_tier();
 	}
 
+	/// `tier_of`: the admission FIFO is DRAM (a promotion out of it moves no
+	/// bytes and pushes none), main is placed by its tier.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

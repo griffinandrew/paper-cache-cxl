@@ -46,13 +46,20 @@ src/
   hybrid_policy.rs            No trait, no marker types: exports HybridObjectMap<K> and the free
                                function admission_tier(policy, hashed_key, status, objects)
                                -> Tier, a runtime match over PaperPolicy with one arm per
-                               design's admission rule, called from set() in lib.rs.
+                               design's admission rule, called from set() in lib.rs. Its
+                               answer can be stale (a mirror, or a physical read a migration
+                               overtakes); the Set event carries the tier actually built and
+                               the policy worker reconciles it.
   hybrid_stats.rs             HybridStats — design-neutral snapshot: 3 counters, 5 tier gauges,
                                8 size-split gauges that only LruSizedHybrid populates, and 8
                                physical-fast-tier readings (PHYS_FAST and its peak, the
                                effective capacity, the over-budget integral, fast/slow hits,
-                               live tiered caches, live flat caches with fast values). The
-                               single stats accessor for every design;
+                               live tiered caches, live flat caches with fast values), the
+                               4 process-global reconcile intent totals (S3: set->fast,
+                               set->slow, get->fast, new-key) and the cache's own landed
+                               correctives by destination (reconcile_applied_*), which are
+                               NOT promotions or demotions. The single stats accessor for
+                               every design;
                                the per-design *_hybrid_stats() methods are gone.
   phys.rs                     PHYS_FAST: bytes physically allocated in the fast tier's value
                                pool, charged in TieredValue::new_in and refunded by the value's
@@ -62,7 +69,14 @@ src/
                                live_flat_fast_caches() == 0 (a flat BufferDRAM cache's values
                                are in P too). Also the policy worker's per-pass over-budget
                                integral and the MEMTS line (PAPER_MEMTS=1).
-                               Reporting only; the fast-tier gate (S5) will read it.
+                               Reporting only; the fast-tier gate (S5) will read it. Also
+                               PlacementAudit, PaperCache::placement_audit()'s answer: every
+                               live value's tag against the stack's placement_of -- stranded
+                               (in DRAM, placed slow), lagging (in CXL, placed fast),
+                               untracked -- in the same unit. A diagnostic that blocks the
+                               policy worker for a queue flush and one map walk (and, in the
+                               hashbrown build, every reader too), exact only at client
+                               quiescence.
   numa_alloc.rs               Node-bound jemalloc arenas. NumaAlloc<NODE_FAST> is the crate's
                                #[global_allocator]; SlowObjects (aliased crate-wide as `Hybrid`)
                                backs the slow tier. Extents are mmap'd then mbind'd before
@@ -71,7 +85,8 @@ src/
   object/                     Object<K, V> + overhead accounting (object/overhead.rs computes
                                the per-object DRAM reservation the stacks subtract from
                                fast_capacity).
-  object_store.rs             ObjectStore trait over the object map.
+  object_store.rs             ObjectStore trait over the object map (for_each_value: the
+                               audit's walk; the merged store has an inherent twin).
   value_buffer.rs             ValueBuffer.
   <design>_hybrid_cache/      18 name-compatibility shims, three lines of code each: a
                                re-export of TieredBuffer and a type alias
@@ -88,7 +103,11 @@ src/
                                here so the hot get()/set() path stays lock-cheap.
     manager.rs                 WorkerFanout — routes each WorkerEvent to the sub-workers. NOT a
                                 thread: the fan-out runs inline on the calling thread.
-    mod.rs                     WorkerEvent enum + the Tier type.
+    mod.rs                     WorkerEvent enum + the Tier type. Get carries the tier a hit
+                                was served from (None on a miss), Set the tier the value was
+                                built in and the client's mark (its key's in-flight bucket's
+                                landed count, read before the insert); Audit (hybrid builds)
+                                asks the policy worker for a PlacementAudit.
     policy/
       mod.rs                    PolicyWorker — drives the active PolicyStack, applies tier
                                  migrations (demotions before promotions), runs evictions. Also
@@ -97,7 +116,25 @@ src/
                                  channel per consumer sharded by key hash, 2 threads by
                                  default), `parallel_migration` (the abandoned per-batch rayon
                                  fan-out, disabled by default) and `migstats` (the MIGSTATS
-                                 batch-size histograms dumped to stderr).
+                                 batch-size histograms dumped to stderr, and the RECONCILE_*
+                                 counters on a last line of their own). Queue entries carry a
+                                 MigrationOrigin (Stack | Reconcile) through the split and the
+                                 queue, so a landed corrective is counted apart from
+                                 promotions/demotions. `migration_queue::InFlight`: per key
+                                 bucket (2^14, key & mask), entries in flight and entries
+                                 landed, in one AtomicU64 each. The RECONCILE (S3, `Observed`
+                                 -- the full argument is its doc): after the stack handles a
+                                 Set, a corrective (key, placement_of) is appended to that
+                                 event's drain when the built tier is elsewhere and the stack
+                                 queued nothing that lands it there -- and, the NEW-KEY RULE,
+                                 even when it is not, for a key the stack did not place before
+                                 the Set whose bucket was in flight or landed since the
+                                 client's mark (a stale entry would otherwise land last on the
+                                 fresh value). After a hit served from the slow tier, the same
+                                 toward Fast only (the heal), and only while nothing of its
+                                 bucket is in flight. Per-key FIFO consumers, last intent
+                                 wins, a redundant one declines. The merged store also queues
+                                 its new-key corrective on the client, under the shard lock.
       policy_stack/             One file per policy, all implementing the PolicyStack trait.
                                  The 18 *_hybrid_stack.rs files carry each design's algorithm
                                  and its full derivation in the module doc — those are the
@@ -105,7 +142,11 @@ src/
                                  `drain_target` (in mod.rs) holds the single fast-tier
                                  level every settle maintains: 0.98 of the effective
                                  budget, overridable via FAST_TIER_DRAIN_TARGET. One
-                                 threshold, not a high/low band.
+                                 threshold, not a high/low band. `PolicyStack::placement_of`
+                                 is where a stack's bytes converge (its physical intent):
+                                 tier_of for every design but the lazy-copy LRU
+                                 (physical_tier_of), the slot's tier in the merged store,
+                                 None for flat stacks -- the table is on the trait.
       mini_stack/               Lightweight per-policy stacks for PaperCache's "auto" mode.
       trace/                    Access-trace recording/replay, replayed to rebuild a different
                                  policy's stack after a live switch. Only spawned when more than
@@ -121,11 +162,17 @@ tests/
   phys_fast_identity.rs                  PHYS_FAST == the stacks' fast_used at quiescence, and
                                          back to its start once the cache drops: LRU, FIFO,
                                          CLOCK and LFU in every unit build, and one test per
-                                         other design in the DashMap/hashbrown builds (the two
-                                         faithful S3-FIFO designs with a slow small queue are
-                                         #[ignore]d: their stack strands a promotion). Plus the
-                                         flat-fast-cache count. A binary of its own (P is
-                                         process-global); its tests hold one lock.
+                                         other design in the DashMap/hashbrown builds. Every
+                                         check also requires a clean placement audit (so each
+                                         design's case is its placement_of agreement check),
+                                         no migration counted in flight, and no set corrective
+                                         (to fast, to slow, new key) queued over the
+                                         one-at-a-time phases. T7: LFU bursts
+                                         (the stale-latch shape, then deletes with immediate
+                                         re-sets) strand nothing, and the burst is shown to
+                                         outrun the mirror. Plus the flat-fast-cache count. A
+                                         binary of its own (P is process-global); its tests
+                                         hold one lock.
   isolate_pmem_latency.rs                Allocator-level latency probe.
 ```
 

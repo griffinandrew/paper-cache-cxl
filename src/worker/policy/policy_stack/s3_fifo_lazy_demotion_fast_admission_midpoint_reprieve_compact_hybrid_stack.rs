@@ -716,6 +716,13 @@ impl PolicyStack for S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybri
 		self.settle_fast_tier();
 	}
 
+	/// `tier_of`: the one-access queue is DRAM; a reprieve splices a key into
+	/// main's slow segment and pushes it slow at once.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}

@@ -747,6 +747,14 @@ impl PolicyStack for S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybr
 		self.settle_slow_split();
 	}
 
+	/// `tier_of`, the tier of the key's queue: the one-access queue is DRAM,
+	/// both slow segments are the slow tier (a move between them is no byte
+	/// move), and every crossing of the tiers is pushed.
+	/// See `PolicyStack::placement_of`.
+	fn placement_of(&self, key: HashedKey) -> Option<Tier> {
+		self.tier_of(key)
+	}
+
 	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
 		std::mem::take(&mut self.migrations)
 	}
