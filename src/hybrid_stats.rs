@@ -33,7 +33,11 @@
 //! `reconcile_get_to_fast`) -- a fifth, the slow-served hits whose heal a
 //! busy in-flight bucket skipped (`reconcile_get_heal_skipped`), and 2
 //! counters of this cache's own: the correctives that LANDED
-//! (`reconcile_applied_*`), which are not promotions or demotions.
+//! (`reconcile_applied_*`), which are not promotions or demotions. Since S5a,
+//! 3 readings of the cache's MEASURED DRAM metadata: M
+//! (`dram_metadata_bytes`), its structures on the slow node beside it, and
+//! `F - M` -- beside the modelled `fast_metadata_bytes` and
+//! `effective_fast_capacity`, which they do not replace.
 
 /// Feature-neutral snapshot of the active hybrid cache's tier-movement
 /// counters and live tier gauges.
@@ -139,6 +143,23 @@ pub struct HybridStats {
 	/// in this process (`phys::live_flat_fast_caches`). Their values are in
 	/// `phys_fast_bytes` too.
 	pub live_flat_fast_caches: u64,
+	/// M (S5a): the bytes this cache's own DRAM metadata structures hold, in
+	/// jemalloc's usable-size unit -- the object map's (its tables, arrays and
+	/// `Arc`), the policy stack's (slab chunks and their table, index, free
+	/// list, bucket maps, ghost, and its box) and one value header per live
+	/// object -- counted from the structures, where `fast_metadata_bytes` is
+	/// the modelled reservation (`L * omega`, plus the ghost reservation of
+	/// the seven designs that make one). The policy worker's publication
+	/// (`AtomicStatus::dram_metadata_bytes`), up to one pass behind the map.
+	/// This cache's own; reporting only.
+	pub dram_metadata_bytes: u64,
+	/// This cache's structures on the SLOW node, which M leaves out: the
+	/// eviction stacks under `eviction_stacks_pmem`, the object table under
+	/// `global_hashtable_pmem`. 0 in every other build.
+	pub slow_metadata_bytes: u64,
+	/// `F - M`, saturating: `effective_fast_capacity` with the measured
+	/// metadata in place of the modelled. Reporting only.
+	pub effective_fast_capacity_measured: u64,
 
 	/// Corrective migrations the policy worker's reconcile QUEUED: a `set`
 	/// whose value was built in the slow tier for a key the stack places

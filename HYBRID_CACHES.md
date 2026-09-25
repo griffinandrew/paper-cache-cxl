@@ -320,6 +320,18 @@ values stay in DRAM on top of the reservation. Charging only fast keys was tried
 data plus metadata reached 5,851 MB in a 5,369 MB tier. The merged store charges the same
 `linked() × shared_overhead` -- the keys its policy worker has linked, a DashMap stack's `len()`.
 
+**Measured, beside the model (S5a).** The policy worker also publishes M, the bytes the cache's
+own DRAM metadata structures hold (`src/meta.rs`; `AtomicStatus::dram_metadata_bytes`,
+`HybridStats::dram_metadata_bytes`, MEMTS `meta=`): the object map's tables and arrays, the
+stack's structures and one value header per live object, each counted where the structure grows,
+in jemalloc's usable-size unit. It is reporting only -- every settle still reserves
+`tracked × shared_overhead` -- and it differs from that model by design: M carries each
+structure's first allocation (a 128 KiB slab chunk per split stack, the DashMap's shard array,
+the merged store's 32 first 160 KiB chunks) and its load (a hashbrown table at 7/16..7/8, a keyless
+index at 1/4..1/2), where `shared_overhead` is a per-object constant fitted at 2^k. On a small cache
+the fixed part dominates: T9's caches (16-48 KiB fast tiers, tens of objects) hold M of 170-190 KB,
+so `F - M` is 0 there.
+
 ### `eviction_stacks_pmem`
 
 Moves each stack's lists and per-key map into the slow tier via `crate::Hybrid`. The

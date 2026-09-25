@@ -473,7 +473,9 @@ fn render_self_stats(stats: &SelfStats, cache: &Cache) -> String {
 /// (run_mem.py's `^fast\s+\d+ objects`, `^slow\s+`, `^dram\s+`,
 /// `^promotions`, ...; the tests below check all fourteen). `flat caches`
 /// counts the flat caches whose values are fast -- the only flat caches whose
-/// values P counts.
+/// values P counts. `metadata` (S5a, appended last) is M, the bytes the
+/// cache's own DRAM metadata structures hold, measured; the modelled
+/// reservation stays where it was, under TIERS.
 #[cfg(not(feature = "all_dram"))]
 fn render_physical_fast_tier(out: &mut String, tier: &paper_cache::HybridStats) {
 	let _ = writeln!(out, "\n*** PHYSICAL FAST TIER (reporting only) ***\n");
@@ -484,6 +486,8 @@ fn render_physical_fast_tier(out: &mut String, tier: &paper_cache::HybridStats) 
 	let _ = writeln!(out, "hits fast/slow {}/{}", tier.fast_hits, tier.slow_hits);
 	let _ = writeln!(out, "tiered caches  {}", tier.live_tiered_caches);
 	let _ = writeln!(out, "flat caches    {} (fast values)", tier.live_flat_fast_caches);
+	let _ = writeln!(out, "metadata       {} B measured (eff {} B; slow node {} B)",
+		tier.dram_metadata_bytes, tier.effective_fast_capacity_measured, tier.slow_metadata_bytes);
 }
 
 #[cfg(not(feature = "all_dram"))]
@@ -1133,6 +1137,9 @@ mod tests {
 			slow_hits: 7,
 			live_tiered_caches: 1,
 			live_flat_fast_caches: 2,
+			dram_metadata_bytes: 131_072,
+			effective_fast_capacity_measured: 684_032,
+			slow_metadata_bytes: 4_096,
 			// Everything the section must NOT print: distinct values, so a
 			// line reading the wrong field shows up in the comparison.
 			fast_bytes_used: 11,
@@ -1154,7 +1161,8 @@ mod tests {
 			 over budget    2369712 B*s\n\
 			 hits fast/slow 429/7\n\
 			 tiered caches  1\n\
-			 flat caches    2 (fast values)\n",
+			 flat caches    2 (fast values)\n\
+			 metadata       131072 B measured (eff 684032 B; slow node 4096 B)\n",
 		);
 
 		for line in out.lines() {
@@ -1196,7 +1204,7 @@ mod tests {
 		assert_eq!(
 			labels,
 			["phys fast      ", "eff fast cap   ", "over budget    ", "hits fast/slow ",
-				"tiered caches  ", "flat caches    "],
+				"tiered caches  ", "flat caches    ", "metadata       "],
 		);
 		assert!(section.contains("hits fast/slow 1/0\n"), "the hit was served from DRAM: {section}");
 		assert!(section.contains("tiered caches  1\n"), "{section}");

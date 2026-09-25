@@ -79,6 +79,23 @@ src/
                                policy worker for a queue flush and one map walk (and, in the
                                hashbrown build, every reader too), exact only at client
                                quiescence.
+  meta.rs                     M (S5a): the bytes the cache's OWN DRAM metadata structures
+                               hold, counted from the structures in jemalloc's usable-size unit
+                               -- the object map's (the DashMap's shard tables and shard array,
+                               the hashbrown_dram table, the merged store's buckets, slab
+                               chunks, chunk tables, free lists, LFU maps and fixed arrays), the
+                               policy stack's (PolicyStack::structure_bytes: slab chunks and
+                               their table, keyless index, free list, LFU bucket maps through
+                               the Metered allocator, ghosts) and one DRAM value header per live
+                               object. Each structure counts itself where it grows; the DashMap,
+                               which has no hook, is re-read by the policy worker shard by shard
+                               where the writes it saw could have made a table reallocate
+                               (ShardState), and whole every 100 ms. Published by the policy
+                               worker (AtomicStatus::dram_metadata_bytes, one load; F - M is
+                               effective_fast_capacity_measured), exported in HybridStats, on
+                               the MEMTS line (meta=) and in the server's PHYSICAL FAST TIER
+                               section. Slow-node structures are reported apart, not in M.
+                               Reporting only: the settles still reserve L x omega (S5 switches).
   numa_alloc.rs               Node-bound jemalloc arenas. NumaAlloc<NODE_FAST> is the crate's
                                #[global_allocator]; SlowObjects (aliased crate-wide as `Hybrid`)
                                backs the slow tier. Extents are mmap'd then mbind'd before
@@ -191,7 +208,18 @@ tests/
                                          re-sets) strand nothing, and the burst is shown to
                                          outrun the mirror. Plus the flat-fast-cache count. A
                                          binary of its own (P is process-global); its tests
-                                         hold one lock.
+                                         hold one lock. Every check also reports M (S5a)
+                                         beside the model and holds it to its own parts.
+  dram_metadata_identity.rs              S5a, under measured_accounting: between two
+                                         quiescent points the NODE_FAST pool moves by exactly
+                                         M plus P (P in its own pool under
+                                         segregated_value_arena), one operation at a time,
+                                         up to whole blocks of the TTL worker's channel
+                                         (drained once a second) and exactly between drained
+                                         endpoints; the warm-up takes out every other term
+                                         (channel first blocks, worker buffers, the in-flight
+                                         table, rayon's global pool). One #[test], its own
+                                         binary.
   isolate_pmem_latency.rs                Allocator-level latency probe.
 ```
 

@@ -570,9 +570,12 @@ pub(crate) struct MemtsSample {
 	/// `VmRSS` from `/proc/self/status`, kB; `None` if unreadable.
 	pub vmrss_kb: Option<u64>,
 	/// Flat caches with fast values alive in this process: with
-	/// `live_tiered_caches`, what says whether `phys` is one cache's. Last,
-	/// like every field added after the line's first version.
+	/// `live_tiered_caches`, what says whether `phys` is one cache's.
 	pub live_flat_fast_caches: u64,
+	/// M (S5a, `AtomicStatus::dram_metadata_bytes`): the bytes the cache's own
+	/// DRAM metadata structures hold, beside `fast_metadata_bytes`'s model.
+	/// Last, like every field added after the line's first version.
+	pub meta: u64,
 }
 
 /// Pure. `key=value` pairs after a `MEMTS ` prefix, in a fixed order, so a
@@ -586,7 +589,7 @@ pub(crate) fn format_memts(sample: &MemtsSample) -> String {
 	format!(
 		"MEMTS t_ms={} wall_ms={} phys={} eff={} fast_used={} fast_metadata_bytes={} \
 		 over_budget_byte_seconds={} pending_net={} backlog={} live_tiered_caches={} vmrss_kb={} \
-		 live_flat_fast_caches={}",
+		 live_flat_fast_caches={} meta={}",
 		sample.t_ms,
 		sample.wall_ms,
 		sample.phys,
@@ -599,6 +602,7 @@ pub(crate) fn format_memts(sample: &MemtsSample) -> String {
 		sample.live_tiered_caches,
 		vmrss,
 		sample.live_flat_fast_caches,
+		sample.meta,
 	)
 }
 
@@ -920,13 +924,14 @@ mod tests {
 			live_tiered_caches: 1,
 			vmrss_kb: Some(123_456),
 			live_flat_fast_caches: 2,
+			meta: 131_072,
 		};
 
 		assert_eq!(
 			format_memts(&sample),
 			"MEMTS t_ms=1250 wall_ms=1790000000123 phys=-64 eff=5000000 fast_used=4900000 \
 			 fast_metadata_bytes=120000 over_budget_byte_seconds=42 pending_net=-3 backlog=17 \
-			 live_tiered_caches=1 vmrss_kb=123456 live_flat_fast_caches=2",
+			 live_tiered_caches=1 vmrss_kb=123456 live_flat_fast_caches=2 meta=131072",
 		);
 
 		let unread = MemtsSample { vmrss_kb: None, ..sample };

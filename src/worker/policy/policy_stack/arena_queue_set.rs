@@ -155,7 +155,7 @@
 use crate::{ObjectSize, worker::policy::policy_stack::{HashedKey, Tier}};
 
 pub use super::arena_index::{ArenaSlot, NIL};
-use super::arena_index::{KeylessIndex, SlotSlab, U32Vec, new_u32_vec};
+use super::arena_index::{FreeList, KeylessIndex, SlotSlab};
 
 // ---------------------------------------------------------------------------
 // the one node payload
@@ -268,7 +268,7 @@ pub const MAX_QUEUES: usize = 4;
 /// structure only maintains the orders.
 pub struct ArenaQueueSet<P: Copy> {
 	slots: SlotSlab<P>,
-	free: U32Vec,
+	free: FreeList,
 
 	/// Open-addressed, linear-probed table of slot numbers. `NIL` is empty.
 	/// Holds NO keys: a probe verifies against `slots[i].key`. Shared with
@@ -285,7 +285,7 @@ impl<P: Copy> Default for ArenaQueueSet<P> {
 	fn default() -> Self {
 		ArenaQueueSet {
 			slots: SlotSlab::new(),
-			free: new_u32_vec(),
+			free: FreeList::default(),
 			index: KeylessIndex::default(),
 			heads: [NIL; MAX_QUEUES],
 			tails: [NIL; MAX_QUEUES],
@@ -337,6 +337,16 @@ impl<P: Copy> ArenaQueueSet<P> {
 	/// has to know the table size to reason about a run.
 	pub fn index_capacity(&self) -> usize {
 		self.index.capacity()
+	}
+
+	/// Usable bytes this structure's own allocations hold (S5a): the slab's
+	/// chunks and their table, the index's buckets and the free list. Each
+	/// counts itself where it grows, so this is three loads.
+	// Read only through `PolicyStack::structure_bytes`, which only a tiered
+	// cache's worker calls (S5a).
+	#[cfg_attr(not(feature = "hybrid_cache_common"), allow(dead_code))]
+	pub fn allocated_bytes(&self) -> u64 {
+		self.slots.allocated_bytes() + self.index.allocated_bytes() + self.free.allocated_bytes()
 	}
 
 	/// Pre-sizes the slab (whole chunks) and the index.
@@ -576,6 +586,46 @@ mod tests {
 	use super::*;
 	use crate::worker::policy::policy_stack::arena_index::GOLDEN;
 	use crate::worker::policy::policy_stack::compact_queue_set::CompactQueueSet;
+
+	/// S5a: the queue set's own count of its bytes is what the allocator holds
+	/// for it -- slab, index and free list -- across growth, removals into the
+	/// free list, reuse of freed slots, and a clear and refill. Checked after
+	/// every operation.
+	#[test]
+	fn the_queue_set_counts_exactly_what_it_allocated() {
+		let base = crate::meta::thread_live_bytes();
+		let live = || (crate::meta::thread_live_bytes() - base) as u64;
+		let mut set = ArenaQueueSet::<P>::default();
+		let key = |i: u64| i.wrapping_mul(GOLDEN) | 1;
+
+		assert_eq!(live(), set.allocated_bytes(), "a new set allocates nothing");
+
+		for i in 0..10_000u64 {
+			set.push_back((i % 3) as usize, key(i), p((i % 3) as u8));
+			assert_eq!(live(), set.allocated_bytes(), "after push {i}");
+		}
+
+		for i in (0..10_000u64).step_by(2) {
+			set.remove((i % 3) as usize, key(i));
+			assert_eq!(live(), set.allocated_bytes(), "after remove {i}");
+		}
+
+		for i in 10_000..16_000u64 {
+			set.push_front(0, key(i), p(0));
+			assert_eq!(live(), set.allocated_bytes(), "after push {i}, reusing or growing");
+		}
+
+		set.clear();
+		assert_eq!(live(), set.allocated_bytes(), "a clear keeps everything");
+
+		for i in 0..16_000u64 {
+			set.push_back(1, key(i), p(1));
+		}
+		assert_eq!(live(), set.allocated_bytes(), "after the refill");
+
+		drop(set);
+		assert_eq!(live(), 0);
+	}
 
 	/// Stand-in for a real stack payload: LRU, 2Q and S3-FIFO entries are all
 	/// exactly 8 bytes.

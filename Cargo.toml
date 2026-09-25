@@ -14,7 +14,10 @@ categories = ["caching"]
 dlv-list = "0.6.0"
 kwik = "=1.18.7"
 thiserror = "2.0.16"
-dashmap = "6.1.0"
+# `raw-api` for `shards()` and `determine_map`: the policy worker re-reads a
+# shard's table layout to count the map's own bytes (S5a, `src/meta.rs`).
+# It only exposes those accessors; no map behaviour changes.
+dashmap = { version = "6.1.0", features = ["raw-api"] }
 crossbeam-channel = "0.5.15"
 # Epoch-based reclamation for value buffers: it replaces the per-object
 # refcount `Shared` carried, so a reader can copy a value's bytes with no

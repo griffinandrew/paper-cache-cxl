@@ -646,6 +646,10 @@ impl PolicyStack for LruSizedCompactHybridStack {
 		std::mem::take(&mut self.migrations)
 	}
 
+	fn structure_bytes(&self) -> Option<crate::meta::NodeBytes> {
+		Some(crate::meta::NodeBytes::stack(self.queues.allocated_bytes()))
+	}
+
 	fn dram_reserved_bytes(&self) -> CacheSize {
 		// The undivided total `reserved_shares` proportions between the two
 		// fast segments; shared metadata scales with everything tracked.

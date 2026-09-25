@@ -6,7 +6,7 @@
  * correct
  */
 
-#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "merged_object_store"), feature(allocator_api), feature(clone_from_ref), feature(btreemap_alloc))]
+#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "merged_object_store", feature = "hybrid_cache_common"), feature(allocator_api), feature(clone_from_ref), feature(btreemap_alloc))]
 
 
 // Validate that hashbrown_dram is not enabled with other global hashtable features
@@ -134,6 +134,15 @@ mod value_stress;
 mod object;
 mod policy;
 mod status;
+
+/// M, the bytes the cache's own DRAM metadata structures hold -- the object
+/// map's, the policy stack's and the value headers' -- counted from the
+/// structures (S5a). Public for its unit helpers (`usable`, `vec_bytes`) and
+/// for `DramMetadata`; see the module doc.
+pub mod meta;
+
+#[cfg(feature = "hybrid_cache_common")]
+pub use crate::meta::DramMetadata;
 
 // Shared object-map storage-backend abstraction and value-buffer
 // abstraction (see each module's doc comment) -- used by the generic
@@ -2954,6 +2963,31 @@ where
 	#[must_use]
 	pub fn effective_fast_capacity(&self) -> CacheSize {
 		self.status.effective_fast_capacity()
+	}
+
+	/// M, the bytes this cache's own DRAM metadata structures hold (S5a), in
+	/// jemalloc's usable-size unit: the object map's, the policy stack's and
+	/// one value header per live object, as the policy worker last published
+	/// it. See `crate::meta`.
+	#[must_use]
+	pub fn dram_metadata_bytes(&self) -> u64 {
+		self.status.dram_metadata_bytes()
+	}
+
+	/// M's parts, and the structures on the slow node reported apart. See
+	/// [`DramMetadata`].
+	#[must_use]
+	pub fn dram_metadata(&self) -> DramMetadata {
+		self.status.dram_metadata()
+	}
+
+	/// `F - M`, saturating: the fast tier's budget for value bytes with the
+	/// MEASURED metadata taken off, beside `effective_fast_capacity`'s
+	/// modelled `F - L * omega`. Reporting only at this step (S5a); S5
+	/// switches the budget's consumers onto it.
+	#[must_use]
+	pub fn effective_fast_capacity_measured(&self) -> CacheSize {
+		self.status.effective_fast_capacity_measured()
 	}
 
 	/// Returns the active hybrid design's tier-movement counters and live

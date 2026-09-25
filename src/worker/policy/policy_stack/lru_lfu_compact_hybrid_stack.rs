@@ -489,6 +489,10 @@ impl PolicyStack for LruLfuCompactHybridStack {
 	// corrects a brand-new key to slow without displacing anything; nothing
 	// here ever does that.
 
+	fn structure_bytes(&self) -> Option<crate::meta::NodeBytes> {
+		Some(crate::meta::NodeBytes::stack(self.chain.allocated_bytes()))
+	}
+
 	fn dram_reserved_bytes(&self) -> CacheSize {
 		self.reserved_overhead()
 	}

@@ -330,6 +330,28 @@ const _: () = assert!(std::mem::size_of::<ItemHeader<u64>>() == 16);
 const _: () = assert!(bytes_offset::<u64>() == 16);
 
 // ---------------------------------------------------------------------------
+// the header's size, for M
+// ---------------------------------------------------------------------------
+
+/// The DRAM header's allocation: `triomphe::Arc`'s `#[repr(C)]` `ArcInner`,
+/// its 8-byte count in front of a [`ValueHeader`]. One per live value,
+/// whichever tier its bytes are in.
+pub fn dram_header_layout<K>() -> Option<Layout> {
+	let (inner, _) = Layout::new::<core::sync::atomic::AtomicUsize>()
+		.extend(Layout::new::<ValueHeader<K>>())
+		.expect("an ArcInner layout");
+
+	Some(inner.pad_to_align())
+}
+
+/// Usable bytes of one DRAM value header: what M (S5a, `crate::meta`) counts
+/// per live object for it. 16 bytes for a `u64` key, the size class the
+/// per-object model's `VALUE_ALLOCATION_OVERHEAD` names.
+pub fn dram_header_bytes<K>() -> u64 {
+	dram_header_layout::<K>().map_or(0, crate::meta::layout_bytes)
+}
+
+// ---------------------------------------------------------------------------
 // the handle
 // ---------------------------------------------------------------------------
 

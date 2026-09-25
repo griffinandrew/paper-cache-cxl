@@ -254,6 +254,23 @@ fn item_layout<K>(len: u32) -> Layout {
 }
 
 // ---------------------------------------------------------------------------
+// the header's size, for M
+// ---------------------------------------------------------------------------
+
+/// No DRAM header of its own: the count, the key, the length and the expiry
+/// are a prefix of the ONE item that tiers, charged with it
+/// (`resident_object_bytes`), so M (S5a, `crate::meta`) counts nothing per
+/// object for a header in this layout.
+pub fn dram_header_layout<K>() -> Option<Layout> {
+	None
+}
+
+/// 0: see [`dram_header_layout`].
+pub fn dram_header_bytes<K>() -> u64 {
+	0
+}
+
+// ---------------------------------------------------------------------------
 // the handle
 // ---------------------------------------------------------------------------
 

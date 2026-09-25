@@ -244,6 +244,11 @@ pub struct ChunkedSlab<T> {
 
 	/// Elements pushed since the last `clear`: ids `0 .. len` are live.
 	len: usize,
+
+	/// Usable bytes the committed chunks and the chunk table hold (S5a):
+	/// counted in `commit_chunk`, the one place either grows. `clear` frees
+	/// nothing, so it changes nothing.
+	bytes: u64,
 }
 
 impl<T> ChunkedSlab<T> {
@@ -261,7 +266,30 @@ impl<T> ChunkedSlab<T> {
 		ChunkedSlab {
 			chunks: new_chunk_table(),
 			len: 0,
+			bytes: 0,
 		}
+	}
+
+	/// Usable bytes the slab holds (S5a): its committed chunks and the table
+	/// that holds them, as jemalloc sizes them. O(1).
+	// Read only through `PolicyStack::structure_bytes`, which only a tiered
+	// cache's worker calls (S5a).
+	#[cfg_attr(not(feature = "hybrid_cache_common"), allow(dead_code))]
+	pub fn allocated_bytes(&self) -> u64 {
+		self.bytes
+	}
+
+	/// Commits one more chunk, and counts it and any growth of the chunk
+	/// table.
+	fn commit_chunk(&mut self) {
+		let table = self.chunks.capacity();
+
+		self.chunks.push(new_chunk(Self::CHUNK));
+
+		self.bytes = self.bytes
+			+ crate::meta::vec_bytes::<T>(Self::CHUNK)
+			+ crate::meta::vec_bytes::<Chunk<T>>(self.chunks.capacity())
+			- crate::meta::vec_bytes::<Chunk<T>>(table);
 	}
 
 	/// Elements pushed, which is also the id the next push gets.
@@ -284,7 +312,7 @@ impl<T> ChunkedSlab<T> {
 		let chunk = self.len >> Self::CHUNK_BITS;
 
 		if chunk == self.chunks.len() {
-			self.chunks.push(new_chunk(Self::CHUNK));
+			self.commit_chunk();
 		}
 
 		let slots = &mut self.chunks[chunk];
@@ -304,7 +332,7 @@ impl<T> ChunkedSlab<T> {
 		let chunks = wanted.div_ceil(Self::CHUNK);
 
 		while self.chunks.len() < chunks {
-			self.chunks.push(new_chunk(Self::CHUNK));
+			self.commit_chunk();
 		}
 	}
 
@@ -366,6 +394,54 @@ fn new_buckets(capacity: usize) -> U32Vec {
 	buckets
 }
 
+/// A stack of freed slot ids -- an arena owner's free list -- that counts the
+/// usable bytes its buffer holds (S5a).
+///
+/// `push`, `pop` and `clear` are all its owners do with it, and only `push`
+/// can move the buffer (`pop` and `clear` keep it, as they keep a `Vec`'s), so
+/// `push` notices a growth by the capacity and records the new buffer's size.
+pub struct FreeList {
+	ids: U32Vec,
+	bytes: u64,
+}
+
+impl Default for FreeList {
+	fn default() -> Self {
+		FreeList { ids: new_u32_vec(), bytes: 0 }
+	}
+}
+
+impl FreeList {
+	#[inline]
+	pub fn push(&mut self, id: u32) {
+		let capacity = self.ids.capacity();
+
+		self.ids.push(id);
+
+		if self.ids.capacity() != capacity {
+			self.bytes = crate::meta::vec_bytes::<u32>(self.ids.capacity());
+		}
+	}
+
+	#[inline]
+	pub fn pop(&mut self) -> Option<u32> {
+		self.ids.pop()
+	}
+
+	/// Empties the list, keeping its buffer.
+	pub fn clear(&mut self) {
+		self.ids.clear();
+	}
+
+	/// Usable bytes the buffer holds. O(1).
+	// Read only through `PolicyStack::structure_bytes`, which only a tiered
+	// cache's worker calls (S5a).
+	#[cfg_attr(not(feature = "hybrid_cache_common"), allow(dead_code))]
+	pub fn allocated_bytes(&self) -> u64 {
+		self.bytes
+	}
+}
+
 /// An open-addressed, linear-probed table of slot numbers that holds no keys.
 ///
 /// Every method that has to compare a key takes the owner's slab, because the
@@ -386,6 +462,10 @@ pub struct KeylessIndex {
 	/// index does not depend on the order in which a caller links and indexes
 	/// a slot.
 	live: usize,
+
+	/// Usable bytes the bucket array holds (S5a): set in `rehash_into`, the
+	/// one place it is replaced. `clear` keeps it.
+	bytes: u64,
 }
 
 impl Default for KeylessIndex {
@@ -394,6 +474,7 @@ impl Default for KeylessIndex {
 			buckets: new_u32_vec(),
 			bucket_shift: 63,
 			live: 0,
+			bytes: 0,
 		}
 	}
 }
@@ -413,6 +494,14 @@ impl KeylessIndex {
 	/// measurements, which have to know the table size to reason about a run.
 	pub fn capacity(&self) -> usize {
 		self.buckets.len()
+	}
+
+	/// Usable bytes the bucket array holds (S5a). O(1).
+	// Read only through `PolicyStack::structure_bytes`, which only a tiered
+	// cache's worker calls (S5a).
+	#[cfg_attr(not(feature = "hybrid_cache_common"), allow(dead_code))]
+	pub fn allocated_bytes(&self) -> u64 {
+		self.bytes
 	}
 
 	/// The slot number in one bucket, or [`NIL`]. Exposed for the same
@@ -583,6 +672,7 @@ impl KeylessIndex {
 
 		let old = core::mem::replace(&mut self.buckets, new_buckets(capacity));
 		self.bucket_shift = 64 - capacity.trailing_zeros();
+		self.bytes = crate::meta::vec_bytes::<u32>(self.buckets.capacity());
 
 		let mask = capacity - 1;
 
@@ -973,6 +1063,118 @@ mod tests {
 			);
 			assert_eq!(slab.capacity(), (full + 1) * chunk);
 		}
+	}
+
+	/// This thread's live bytes since `(a0, d0)`.
+	fn live_since((a0, d0): (u64, u64)) -> u64 {
+		let (a, d) = counters();
+		(a - a0) - (d - d0)
+	}
+
+	/// S5a: the slab's own count of its bytes is what the allocator holds for
+	/// it -- its chunks and their table -- after EVERY push, across nine
+	/// chunk commits and the table's own growth, and after a reserve, a clear
+	/// and a refill. M reads this count, so it is held to the allocator
+	/// exactly rather than derived from the same arithmetic.
+	#[test]
+	fn the_slab_counts_exactly_what_it_allocated() {
+		let chunk = SlotSlab::<NodePayload>::CHUNK;
+		let base = counters();
+		let mut slab = SlotSlab::<NodePayload>::new();
+
+		assert_eq!(slab.allocated_bytes(), 0, "an empty slab commits nothing");
+
+		for i in 0..9 * chunk + 3 {
+			slab.push(node(i));
+			assert_eq!(live_since(base), slab.allocated_bytes(), "after {} pushes", i + 1);
+		}
+
+		slab.reserve(5 * chunk);
+		assert_eq!(live_since(base), slab.allocated_bytes(), "after a reserve");
+		assert_eq!(slab.capacity(), 15 * chunk);
+
+		let held = slab.allocated_bytes();
+		slab.clear();
+		assert_eq!(slab.allocated_bytes(), held, "a clear keeps every chunk");
+
+		for i in 0..10 * chunk {
+			slab.push(node(i));
+		}
+		assert_eq!(live_since(base), slab.allocated_bytes(), "after the refill");
+
+		drop(slab);
+		assert_eq!(live_since(base), 0, "the slab freed everything it counted");
+	}
+
+	/// S5a: the index's own count is the allocator's after every insert, and
+	/// each doubling is a step of exactly the new bucket array less the old --
+	/// sixteen buckets to 65,536, twelve doublings.
+	#[test]
+	fn the_index_counts_exactly_what_it_allocated_across_its_doublings() {
+		let n = 20_000;
+		let mut slab = SlotSlab::<NodePayload>::new();
+
+		// Pushed before the baseline, so only the index is in the delta.
+		for i in 0..n {
+			slab.push(node(i));
+		}
+
+		// Allocated before the baseline too: only the index is measured.
+		let mut steps = Vec::with_capacity(32);
+		let mut last = (0, 0);
+
+		let base = counters();
+		let mut index = KeylessIndex::default();
+
+		for i in 0..n {
+			index.insert(&slab, i as u32);
+
+			assert_eq!(live_since(base), index.allocated_bytes(), "after {} inserts", i + 1);
+
+			if index.capacity() != last.0 {
+				steps.push((last.0, index.capacity(), index.allocated_bytes() - last.1));
+				last = (index.capacity(), index.allocated_bytes());
+			}
+		}
+
+		assert_eq!(steps.len(), 13, "the first table and twelve doublings: {steps:?}");
+
+		for &(from, to, step) in &steps {
+			assert_eq!(to, (from * 2).max(16), "{steps:?}");
+			assert_eq!(step, class(to * 4) - class(from * 4), "{from} -> {to} buckets");
+		}
+
+		index.reserve(&slab, 40_000);
+		assert_eq!(live_since(base), index.allocated_bytes(), "after a reserve");
+
+		index.clear();
+		assert_eq!(live_since(base), index.allocated_bytes(), "a clear keeps the buckets");
+
+		drop(index);
+		assert_eq!(live_since(base), 0);
+	}
+
+	/// S5a: the free list's count is the allocator's after every push, and a
+	/// pop or a clear moves nothing.
+	#[test]
+	fn the_free_list_counts_exactly_what_it_allocated() {
+		let base = counters();
+		let mut free = FreeList::default();
+
+		for i in 0..10_000u32 {
+			free.push(i);
+			assert_eq!(live_since(base), free.allocated_bytes(), "after {} pushes", i + 1);
+		}
+
+		let held = free.allocated_bytes();
+
+		while free.pop().is_some() {}
+		free.clear();
+
+		assert_eq!((free.allocated_bytes(), live_since(base)), (held, held), "pop and clear keep the buffer");
+
+		drop(free);
+		assert_eq!(live_since(base), 0);
 	}
 
 	/// A cleared slab refills to its old length without allocating or

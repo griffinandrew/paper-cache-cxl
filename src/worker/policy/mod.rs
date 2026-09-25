@@ -1908,6 +1908,13 @@ pub struct PolicyWorker<K, V> {
 	#[cfg(feature = "hybrid_cache_common")]
 	phys_pass: crate::phys::PassInstrument,
 
+	/// S5a: what this worker keeps to publish M, the bytes the cache's own
+	/// DRAM metadata structures hold -- the map's per-shard reading, one
+	/// header's size, the stack's part as last published. See
+	/// `publish_metadata`.
+	#[cfg(feature = "hybrid_cache_common")]
+	metadata: WorkerMetadata,
+
 	/// What the event just handled observed of a key's bytes -- a `Set`'s
 	/// built tier, a slow-served hit -- for the next `apply_tier_migrations`
 	/// to reconcile (see `Observed`). The run loop drains after every event,
@@ -1939,6 +1946,46 @@ pub struct PolicyWorker<K, V> {
 	/// reconcile included, in order -- T14 compares them across stores.
 	#[cfg(all(test, feature = "hybrid_cache_common"))]
 	drained: Option<Vec<TaggedMigration>>,
+}
+
+/// What the policy worker keeps to publish M (S5a; `publish_metadata`).
+#[cfg(feature = "hybrid_cache_common")]
+struct WorkerMetadata {
+	/// The object map's worker-side reading (`crate::meta::MapState`): the
+	/// DashMap's per-shard table sizes and headroom, the `hashbrown_dram`
+	/// table's, nothing for the merged store, which counts itself.
+	map: crate::meta::MapState,
+
+	/// One DRAM value header's usable bytes, for this cache's key type and
+	/// the build's layout (`value::dram_header_bytes`).
+	header_bytes: u64,
+
+	/// The stack's structures as last published (`PolicyStack::
+	/// structure_bytes`, its box not included): an event that changes them
+	/// republishes at once. Loads only, so it is compared after every event.
+	structures: crate::meta::NodeBytes,
+
+	/// When the whole map was last re-read.
+	full_refresh: Instant,
+}
+
+/// How often `publish_metadata` re-reads the whole map regardless of its
+/// write counts: the bound on how long a table growth the worker cannot count
+/// (a `del` of an absent key) stays out of M. Every 256 DashMap shards'
+/// `try_read` at most ten times a second.
+#[cfg(feature = "hybrid_cache_common")]
+const METADATA_FULL_REFRESH: Duration = Duration::from_millis(100);
+
+#[cfg(feature = "hybrid_cache_common")]
+impl WorkerMetadata {
+	fn new<K>() -> Self {
+		WorkerMetadata {
+			map: Default::default(),
+			header_bytes: crate::value::dram_header_bytes::<K>(),
+			structures: crate::meta::NodeBytes::default(),
+			full_refresh: Instant::now(),
+		}
+	}
 }
 
 impl<K, V> Worker for PolicyWorker<K, V>
@@ -2096,6 +2143,11 @@ where
 				// now one log the stack owns, and a drain is a `mem::take`.
 				#[cfg(feature = "hybrid_cache_common")]
 				self.apply_tier_migrations();
+
+				// S5a: an event that changed the stack's structures republishes
+				// M now rather than at the end of a pass that may be long.
+				#[cfg(feature = "hybrid_cache_common")]
+				self.publish_metadata_if_the_stack_changed();
 			}
 
 			self.apply_buffered_events(&buffered_events, &policy_reconstruct_rx);
@@ -2148,6 +2200,11 @@ where
 			// `refresh_tier_gauges`.
 			#[cfg(feature = "hybrid_cache_common")]
 			self.refresh_tier_gauges();
+
+			// S5a: M, after this pass's sets, migrations and evictions, and
+			// before the MEMTS line that prints it.
+			#[cfg(feature = "hybrid_cache_common")]
+			self.publish_metadata(false);
 
 			// Once per pass: push this thread's retired values into the global
 			// garbage queue and try to advance the epoch.
@@ -2275,6 +2332,9 @@ where
 
 			#[cfg(feature = "hybrid_cache_common")]
 			phys_pass: crate::phys::PassInstrument::new(Instant::now()),
+
+			#[cfg(feature = "hybrid_cache_common")]
+			metadata: WorkerMetadata::new::<K>(),
 
 			#[cfg(feature = "hybrid_cache_common")]
 			observed: Vec::new(),
@@ -2421,6 +2481,9 @@ where
 			phys_pass: crate::phys::PassInstrument::new(Instant::now()),
 
 			#[cfg(feature = "hybrid_cache_common")]
+			metadata: WorkerMetadata::new::<K>(),
+
+			#[cfg(feature = "hybrid_cache_common")]
 			observed: Vec::new(),
 
 			#[cfg(all(test, feature = "hybrid_cache_common"))]
@@ -2435,6 +2498,11 @@ where
 			#[cfg(all(test, feature = "hybrid_cache_common"))]
 			drained: None,
 		};
+
+		// M from the start: an empty map's tables and arrays, an empty stack,
+		// no headers -- before the first `Set` can move it.
+		let mut worker = worker;
+		worker.publish_metadata(true);
 
 		Ok(worker)
 	}
@@ -2538,6 +2606,10 @@ where
 		#[cfg(feature = "hybrid_cache_common")]
 		if self.tier_migration {
 			self.observed.push(Observed::Built { key, built, fence });
+
+			// S5a: this set's insert may have grown the map's table (any
+			// insert can, at the load limit -- see `crate::meta::ShardState`).
+			crate::meta::map_write(&self.objects, &mut self.metadata.map, key);
 		}
 
 		#[cfg(not(feature = "hybrid_cache_common"))]
@@ -2550,6 +2622,13 @@ where
 		}
 
 		self.mini_stack_manager.handle_del(key);
+
+		// S5a: the delete looked the key up with `entry`, which reserves a
+		// slot in its DashMap shard first (`crate::meta::ShardState`).
+		#[cfg(feature = "hybrid_cache_common")]
+		if self.tier_migration {
+			crate::meta::map_write(&self.objects, &mut self.metadata.map, key);
+		}
 	}
 
 	/// Drops a key the `TtlWorker` has already reaped out of the object map.
@@ -2594,6 +2673,12 @@ where
 		// way the entry belongs to that live object.
 		if !live {
 			self.mini_stack_manager.handle_del(key);
+		}
+
+		// S5a: the reap looked the key up with `entry`, as a delete does.
+		#[cfg(feature = "hybrid_cache_common")]
+		if self.tier_migration {
+			crate::meta::map_write(&self.objects, &mut self.metadata.map, key);
 		}
 	}
 
@@ -2771,6 +2856,11 @@ where
 		{
 			self.observed.clear();
 			self.refresh_tier_gauges();
+
+			// S5a: every table kept its capacity (DashMap, hashbrown, the
+			// merged buckets), the merged slab freed its chunks, the headers
+			// went with their values. Re-read all of it.
+			self.publish_metadata(true);
 		}
 
 		// A client that stopped waiting is no loss.
@@ -3175,9 +3265,84 @@ where
 			live_tiered_caches: crate::phys::live_tiered_caches(),
 			vmrss_kb: crate::phys::vmrss_kb(),
 			live_flat_fast_caches: crate::phys::live_flat_fast_caches(),
+			meta: self.status.dram_metadata_bytes(),
 		};
 
 		eprintln!("{}", crate::phys::format_memts(&sample));
+	}
+
+	/// S5a: publishes M, the bytes the cache's own DRAM metadata structures
+	/// hold (`crate::meta`), into the status, on a TIERED cache's worker (a
+	/// flat cache has no fast tier to budget):
+	///
+	///   * the map: `crate::meta::map_bytes` -- the merged store's own count,
+	///     or the DashMap shards (the one `hashbrown_dram` table) re-read where
+	///     the writes counted since their last read (`Set`, `Del` and `Expire`
+	///     events, the worker's own evictions) could have made them
+	///     reallocate, every one when `all`;
+	///   * the stack: its `structure_bytes`, and the box it lives in;
+	///   * the headers: live objects times one header's usable size.
+	///
+	/// Called at construction and after a wipe with `all`, at the end of every
+	/// pass, and after any event that changed the stack's structures. The live
+	/// count is the status', which a client's insert moves at once; the map's
+	/// part trails it by up to a pass, as a DashMap shard's growth is seen at
+	/// the end of the pass that handled the `Set` that grew it.
+	///
+	/// And every `METADATA_FULL_REFRESH` the whole map is re-read whatever the
+	/// counts say, for the writes the worker cannot count: a `del` of an
+	/// absent key, whose `entry` lookup reserves in its shard and sends no
+	/// event (`crate::meta::ShardState`), and the eviction fallback that
+	/// erases an arbitrary map entry when the stack names no victim.
+	#[cfg(feature = "hybrid_cache_common")]
+	fn publish_metadata(&mut self, all: bool) {
+		if !self.tier_migration {
+			return;
+		}
+
+		let now = Instant::now();
+		let all = all || now.saturating_duration_since(self.metadata.full_refresh) >= METADATA_FULL_REFRESH;
+
+		if all {
+			self.metadata.full_refresh = now;
+		}
+
+		let map = crate::meta::map_bytes(&self.objects, &mut self.metadata.map, all);
+		let structures = self.stack_structures();
+
+		// The box the stack lives in: DRAM, whatever node its structures are on.
+		let boxed = self.policy_stack.as_deref().map_or(0, |stack| crate::meta::box_bytes_of_val(stack));
+		let headers = self.status.live_num_objects().saturating_mul(self.metadata.header_bytes);
+
+		self.metadata.structures = structures;
+
+		self.status.set_dram_metadata(crate::meta::DramMetadata {
+			map: map.dram,
+			stack: structures.dram + boxed,
+			headers,
+			slow: map.slow + structures.slow,
+		});
+	}
+
+	/// The stack's own structures by node (`PolicyStack::structure_bytes`;
+	/// every tiered design meters itself).
+	#[cfg(feature = "hybrid_cache_common")]
+	fn stack_structures(&self) -> crate::meta::NodeBytes {
+		self.policy_stack
+			.as_ref()
+			.and_then(|stack| stack.structure_bytes())
+			.unwrap_or_default()
+	}
+
+	/// S5a: republishes M when the event just handled changed the stack's
+	/// structures -- a slab chunk, an index doubling, a free list's buffer, a
+	/// bucket map's node. A virtual call and a handful of loads when it did
+	/// not.
+	#[cfg(feature = "hybrid_cache_common")]
+	fn publish_metadata_if_the_stack_changed(&mut self) {
+		if self.tier_migration && self.stack_structures() != self.metadata.structures {
+			self.publish_metadata(false);
+		}
 	}
 
 	fn apply_buffered_events(
@@ -3305,6 +3470,15 @@ where
 			let maybe_key = policy_stack
 				.evict_one()
 				.map(|key| EraseKey::Hashed(key));
+
+			// S5a: `erase` looks the victim up with `entry`, which reserves a
+			// slot in its DashMap shard first (`crate::meta::ShardState`).
+			#[cfg(feature = "hybrid_cache_common")]
+			if self.tier_migration {
+				if let Some(EraseKey::Hashed(victim)) = &maybe_key {
+					crate::meta::map_write(&self.objects, &mut self.metadata.map, *victim);
+				}
+			}
 
 			// A split design can legitimately have an empty stack over a
 			// non-empty map -- that divergence is what `erase`'s `None`

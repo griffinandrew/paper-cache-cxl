@@ -94,6 +94,16 @@
 //! quiescent P -- the peak is process-global, so without the reset one left
 //! by an earlier cache or an earlier phase would satisfy the check unsampled.
 //!
+//! S5a: every check also reports M, the cache's own DRAM metadata as its
+//! worker publishes it (`PaperCache::dram_metadata`: the map's structures,
+//! the stack's, one header per live object), beside the model's `L * omega`
+//! (`fast_metadata_bytes`), per object -- the two differ by design, since M
+//! counts the structures at whatever load they are at -- and holds M to its
+//! own parts: the export is the total, the header part is one header per
+//! live key, `F - M` is `effective_fast_capacity_measured`. M against the
+//! allocator is `tests/dram_metadata_identity.rs`'s. The quiescence wait
+//! includes M, so a check reads it settled. T7 goes through the same check.
+//!
 //! Under `measured_accounting` + `segregated_value_arena` it also checks P
 //! against the allocator: the change in `measured::allocated(NODE_FAST_VALUES)`
 //! -- every value allocation in the segregated pool, at jemalloc's usable size
@@ -329,9 +339,11 @@ fn quiesce(
             && (s.fast_objects == w.fast_live || design.fast_count_is_logical())
             && pending == (0, 0);
 
+        // M (S5a) too: its worker publishes it at the end of every pass, so a
+        // wait that ended before that pass would read a stale one.
         let key = (
             s.fast_objects, s.slow_objects, s.fast_bytes_used, s.slow_bytes_used,
-            s.promotions, s.demotions, s.evictions, w,
+            s.promotions, s.demotions, s.evictions, w, cache.dram_metadata(),
         );
 
         stable = if settled && last == Some(key) { stable + 1 } else { 0 };
@@ -386,6 +398,33 @@ fn check(cache: &Cache, lens: &BTreeMap<u64, u32>, run: &Run, phase: &str, hits:
          metadata={} eff={}",
         w.live, w.fast_live, s.fast_bytes_used, s.fast_objects, s.slow_objects,
         s.fast_metadata_bytes, s.effective_fast_capacity,
+    );
+
+    // S5a: M, measured, beside the model. Reported rather than held to the
+    // model: M counts the structures at whatever load they are at (at this
+    // size mostly the DashMap's 256 near-empty shards, or the merged store's
+    // 32 first slab chunks), the model a per-object constant fitted at 2^k.
+    let m = cache.dram_metadata();
+    let per_object = |bytes: u64| bytes as f64 / w.live.max(1) as f64;
+    eprintln!(
+        "T9 {label}: M={} (map {} stack {} headers {} slow-node {}) = {:.1} B/object against \
+         the model's {} = {:.1} B/object; eff measured {} vs modelled {}",
+        m.total(), m.map, m.stack, m.headers, m.slow, per_object(m.total()),
+        s.fast_metadata_bytes, per_object(s.fast_metadata_bytes),
+        s.effective_fast_capacity_measured, s.effective_fast_capacity,
+    );
+    assert_eq!(s.dram_metadata_bytes, m.total(), "{label}: HybridStats exports M, its parts' sum");
+    assert_eq!(
+        m.headers,
+        w.live * paper_cache::value::dram_header_bytes::<u64>(),
+        "{label}: M counts one DRAM value header per live object ({} live)",
+        w.live,
+    );
+    assert!(m.map > 0 && m.stack > 0, "{label}: M has a map part and a stack part: {m:?}");
+    assert_eq!(
+        s.effective_fast_capacity_measured,
+        run.fast.saturating_sub(m.total()),
+        "{label}: eff measured != F - M",
     );
 
     // Something is fast: with an empty fast tier `P == 0 == fast_used` would

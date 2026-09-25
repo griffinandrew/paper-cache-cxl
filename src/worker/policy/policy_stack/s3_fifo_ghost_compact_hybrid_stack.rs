@@ -527,6 +527,10 @@ impl PolicyStack for S3FifoGhostCompactHybridStack {
 		std::mem::take(&mut self.migrations)
 	}
 
+	fn structure_bytes(&self) -> Option<crate::meta::NodeBytes> {
+		Some(crate::meta::NodeBytes::stack(self.queues.allocated_bytes() + self.ghost.allocated_bytes()))
+	}
+
 	fn dram_reserved_bytes(&self) -> CacheSize {
 		self.reserved_overhead()
 	}

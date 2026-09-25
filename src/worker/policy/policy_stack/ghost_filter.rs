@@ -110,6 +110,9 @@ pub struct GhostFilter {
 	/// `remove`; entries that simply age out of the window are covered by
 	/// that cap rather than tracked individually.
 	live: u32,
+
+	/// Usable bytes of `slots` (S5a), taken once: the table never grows.
+	bytes: u64,
 }
 
 /// Non-zero 32-bit fingerprint of a key.
@@ -128,13 +131,16 @@ impl GhostFilter {
 	/// floored at 1024 so a small cache still gets a usable table.
 	pub fn with_capacity(hint: usize) -> Self {
 		let n = hint.max(1024).next_power_of_two();
+		let slots = new_slots(n);
+		let bytes = crate::meta::vec_bytes::<GhostSlot>(slots.capacity());
 
 		GhostFilter {
-			slots: new_slots(n),
+			slots,
 			mask: n - 1,
 			inserted: 0,
 			window: n as u32,
 			live: 0,
+			bytes,
 		}
 	}
 
@@ -194,6 +200,17 @@ impl GhostFilter {
 		}
 	}
 
+	/// Usable bytes the table holds (S5a): the WHOLE allocation, sized once at
+	/// construction and never grown -- unlike [`GhostFilter::dram_bytes`], the
+	/// reservation, which charges only the live entries. M counts what is
+	/// allocated.
+	// Read only through `PolicyStack::structure_bytes`, which only a tiered
+	// cache's worker calls (S5a).
+	#[cfg_attr(not(feature = "hybrid_cache_common"), allow(dead_code))]
+	pub fn allocated_bytes(&self) -> u64 {
+		self.bytes
+	}
+
 	pub fn clear(&mut self) {
 		self.slots.iter_mut().for_each(|slot| *slot = GhostSlot::default());
 		self.inserted = 0;
@@ -239,6 +256,29 @@ impl GhostFilter {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// S5a: the whole table, as the allocator holds it, from construction on,
+	/// and nothing more as entries are inserted, whatever the reservation says.
+	#[test]
+	fn the_ghost_counts_exactly_what_it_allocated() {
+		for hint in [0usize, 1024, 5_000, 1 << 16] {
+			let base = crate::meta::thread_live_bytes();
+			let mut g = GhostFilter::with_capacity(hint);
+
+			assert_eq!((crate::meta::thread_live_bytes() - base) as u64, g.allocated_bytes(), "hint {hint}");
+
+			g.set_window(hint.max(1));
+			for k in 0..(hint as u64) {
+				g.insert(k << 32 | k);
+			}
+
+			assert_eq!((crate::meta::thread_live_bytes() - base) as u64, g.allocated_bytes(), "hint {hint}, filled");
+			assert!(g.dram_bytes() <= g.allocated_bytes(), "the reservation charges no more than the table");
+
+			drop(g);
+			assert_eq!(crate::meta::thread_live_bytes(), base);
+		}
+	}
 
 	#[test]
 	fn a_slot_is_eight_bytes() {

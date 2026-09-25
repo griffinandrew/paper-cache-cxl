@@ -1008,6 +1008,12 @@ const S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EV
 /// fast-tier (DRAM) budget so demotion bounds total DRAM, not just fast-tier
 /// values.
 ///
+/// The MODEL of those structures. Since S5a `crate::meta` also counts them
+/// from their allocations (M, `AtomicStatus::dram_metadata_bytes`), and this
+/// per-object figure stays what every settle reserves until S5 switches the
+/// budget onto M -- and after that, a fallback and the sanity check M is
+/// reported beside.
+///
 /// Unlike [`get_policy_overhead`] — which `used_size` charges unconditionally
 /// because the eviction-stack bytes count toward the overall DRAM+PMEM budget
 /// regardless of which tier they physically live in — this counts only the
@@ -1848,6 +1854,49 @@ mod the_charge_matches_the_allocator {
 				 resident_object_bytes = {}, VALUE_ALLOCATION_OVERHEAD = {}",
 				resident_object_bytes::<u64>(len),
 				VALUE_ALLOCATION_OVERHEAD,
+			);
+
+			drop(held);
+		}
+	}
+
+	/// S5a: the DRAM value header M counts per live object
+	/// (`value::dram_header_bytes`) is what the allocator hands out for one,
+	/// in every layout -- an object costs its item and exactly that -- and it
+	/// is the size class the per-object model names
+	/// (`VALUE_ALLOCATION_OVERHEAD`: 32 split, 16 `thin_header`, 0
+	/// `fused_value`, whose header is inside the item).
+	#[test]
+	fn the_dram_header_m_counts_is_what_the_allocator_holds_per_object() {
+		const N: usize = 2048;
+
+		let header = crate::value::dram_header_bytes::<u64>();
+
+		assert_eq!(
+			header,
+			VALUE_ALLOCATION_OVERHEAD as u64,
+			"M's header ({header} B) and the model's constant disagree",
+		);
+
+		for len in [64u32, 100, 1000, 4096] {
+			let payload = vec![0u8; len as usize];
+			let mut held: Vec<Object<u64, crate::BufferDRAM>> = Vec::with_capacity(N);
+
+			let base = thread_live();
+
+			for i in 0..N {
+				held.push(Object::new(i as u64, &payload, None));
+			}
+
+			let per_object = (thread_live() - base).max(0) as u64 / N as u64;
+			core::hint::black_box(&held);
+
+			assert_eq!(
+				per_object - resident_object_bytes::<u64>(len) as u64,
+				header,
+				"a {len}-byte value: {per_object} B/object from the allocator, of which the \
+				 item is {} -- the rest is the header M counts as {header}",
+				resident_object_bytes::<u64>(len),
 			);
 
 			drop(held);

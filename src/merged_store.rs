@@ -269,7 +269,11 @@ use crate::{
 /// array and free list are all plain DRAM allocations. Gating only these two
 /// maps would put one structure of the merged store on the far node while the
 /// slot it points into stayed in DRAM, and would be charged as neither.
-type FreqBuckets = std::collections::BTreeMap<u16, (u32, u32)>;
+///
+/// Allocated through `crate::meta::Metered`, charging the store's `Meter`
+/// (S5a): its nodes are counted where `BTreeMap` makes them, as the rest of
+/// the store counts its structures where it grows them.
+type FreqBuckets = std::collections::BTreeMap<u16, (u32, u32), crate::meta::Metered>;
 
 const NIL: u32 = u32::MAX;
 
@@ -776,14 +780,25 @@ struct Slab<K, V> {
 	/// the next id and the high-water mark; recycled ids come off `Inner::free`
 	/// and never move it.
 	allocated: usize,
+
+	/// The store's meter (S5a), charged a chunk and any growth of `chunks`
+	/// when one is committed, and every chunk when `clear` frees them.
+	meter: crate::meta::Meter,
 }
 
 impl<K, V> Slab<K, V> {
-	fn new() -> Self {
+	fn new(meter: &crate::meta::Meter) -> Self {
 		Slab {
 			chunks: Vec::new(),
 			allocated: 0,
+			meter: meter.clone(),
 		}
+	}
+
+	/// Usable bytes of one chunk: `Vec::with_capacity(SLAB_CHUNK)`'s buffer,
+	/// which `push_chunk` boxes without reallocating.
+	fn chunk_bytes() -> u64 {
+		crate::meta::vec_bytes::<Slot<K, V>>(SLAB_CHUNK)
 	}
 
 	/// Slots handed out so far.
@@ -827,10 +842,17 @@ impl<K, V> Slab<K, V> {
 			.try_into()
 			.unwrap_or_else(|_| unreachable!("built with exactly SLAB_CHUNK slots"));
 
+		let table = self.chunks.capacity();
+
 		self.chunks.push(chunk);
+
+		self.meter.charge(Self::chunk_bytes() as i64);
+		self.meter.vec_resized::<Box<[Slot<K, V>; SLAB_CHUNK]>>(table, self.chunks.capacity());
 	}
 
+	/// Frees every chunk; the table keeps its capacity.
 	fn clear(&mut self) {
+		self.meter.charge(-((self.chunks.len() as u64 * Self::chunk_bytes()) as i64));
 		self.chunks.clear();
 		self.allocated = 0;
 	}
@@ -936,16 +958,24 @@ struct Inner<K, V> {
 	/// `MergedStore::linked` through the `totals()` bracket like the three
 	/// tier totals.
 	linked: usize,
+
+	/// The store's meter (S5a), which every structure of this shard charges
+	/// where it grows: the bucket array and the free list at their pushes, the
+	/// slab at its chunks, the frequency maps through their allocator.
+	meter: crate::meta::Meter,
 }
 
 impl<K, V> Inner<K, V> {
-	fn new() -> Self {
+	fn new(meter: &crate::meta::Meter) -> Self {
+		// The one allocation a new shard makes: its first buckets.
+		meter.charge(crate::meta::vec_bytes::<u32>(INITIAL_BUCKETS) as i64);
+
 		Inner {
 			buckets: vec![NIL; INITIAL_BUCKETS],
 			base: INITIAL_BUCKETS,
 			split: 0,
 			live: 0,
-			slots: Slab::new(),
+			slots: Slab::new(meter),
 			free: Vec::new(),
 
 			#[cfg(test)]
@@ -956,11 +986,12 @@ impl<K, V> Inner<K, V> {
 			fast_used: 0,
 			slow_used: 0,
 			fast_count: 0,
-			fast_buckets: FreqBuckets::new(),
-			slow_buckets: FreqBuckets::new(),
+			fast_buckets: FreqBuckets::new_in(crate::meta::Metered::new(meter)),
+			slow_buckets: FreqBuckets::new_in(crate::meta::Metered::new(meter)),
 			unfolded_fast: 0,
 			unfolded_slow: 0,
 			linked: 0,
+			meter: meter.clone(),
 		}
 	}
 
@@ -1108,7 +1139,9 @@ impl<K, V> Inner<K, V> {
 		// `push` rather than a resize: the table grows by one bucket, and the
 		// `Vec`'s own amortised doubling copies a flat array of `u32`s, which
 		// is a memcpy and not a walk of anything.
+		let capacity = self.buckets.capacity();
 		self.buckets.push(NIL);
+		self.meter.vec_resized::<u32>(capacity, self.buckets.capacity());
 
 		let mut i = self.buckets[from];
 		let mut stay = NIL;
@@ -1288,7 +1321,9 @@ impl<K, V> Inner<K, V> {
 		self.bucket_unlink_slot(i);
 
 		let taken = self.slots[i as usize].object.take();
+		let capacity = self.free.capacity();
 		self.free.push(i);
+		self.meter.vec_resized::<u32>(capacity, self.free.capacity());
 
 		taken
 	}
@@ -1963,12 +1998,19 @@ pub struct MergedStore<K, V> {
 	shared_overhead: AtomicU64,
 	high_ppm: AtomicU64,
 	low_ppm: AtomicU64,
+
+	/// The usable bytes of the store's own structures (S5a;
+	/// `structure_bytes`): charged by every shard where it grows a structure,
+	/// by the frequency maps' allocator, and here for the fixed arrays.
+	meter: crate::meta::Meter,
 }
 
 impl<K, V> Default for MergedStore<K, V> {
 	fn default() -> Self {
+		let meter = crate::meta::Meter::new();
+
 		let shards = (0..SHARDS)
-			.map(|_| RwLock::new(Inner::new()))
+			.map(|_| RwLock::new(Inner::new(&meter)))
 			.collect::<Vec<_>>()
 			.into_boxed_slice();
 
@@ -1984,6 +2026,15 @@ impl<K, V> Default for MergedStore<K, V> {
 
 		let tails = new_mirrors();
 		let fast_tails = new_mirrors();
+
+		// The fixed allocations, once: the shard array, the two mirror arrays
+		// and the meter's own `Arc`.
+		meter.charge(
+			(crate::meta::box_bytes_of_val(&*shards)
+				+ crate::meta::box_bytes_of_val(&*tails)
+				+ crate::meta::box_bytes_of_val(&*fast_tails)
+				+ crate::meta::Meter::own_bytes()) as i64,
+		);
 
 		MergedStore {
 			shards,
@@ -2013,6 +2064,7 @@ impl<K, V> Default for MergedStore<K, V> {
 			shared_overhead: AtomicU64::new(0),
 			high_ppm: AtomicU64::new(DEFAULT_HIGH_PPM),
 			low_ppm: AtomicU64::new(DEFAULT_LOW_PPM),
+			meter,
 		}
 	}
 }
@@ -3298,6 +3350,14 @@ impl<K, V> MergedStore<K, V> {
 		true
 	}
 
+	/// Test support: the store's structure allocations as `capacities` reads
+	/// them, for the S5a test.
+	#[cfg(test)]
+	fn shards_chunks(&self, shard: usize) -> (usize, usize) {
+		let g = self.shards[shard].read().unwrap();
+		(g.slots.chunks.len(), g.slots.chunks.capacity())
+	}
+
 	/// Test support: `take_evict`, as a bool.
 	#[cfg(test)]
 	pub fn remove_key(&self, key: HashedKey) -> bool {
@@ -3423,8 +3483,12 @@ impl<K, V> MergedStore<K, V> {
 				.filter_map(|i| g.slots[i].object.as_ref())
 				.fold((0usize, 0 as CacheSize), |(n, bytes), object| (n + 1, bytes + base_size(object) as CacheSize));
 
+			// Keeps its capacity, which is at least INITIAL_BUCKETS; counted
+			// all the same, so the meter stays right if that ever changes.
+			let buckets = g.buckets.capacity();
 			g.buckets.clear();
 			g.buckets.resize(INITIAL_BUCKETS, NIL);
+			g.meter.vec_resized::<u32>(buckets, g.buckets.capacity());
 			g.base = INITIAL_BUCKETS;
 			g.split = 0;
 			g.live = 0;
@@ -3465,6 +3529,19 @@ impl<K, V> MergedStore<K, V> {
 	/// map's `len()`.
 	pub fn len(&self) -> usize {
 		self.tracked.load(Ordering::Relaxed)
+	}
+
+	/// Usable bytes the store's own structures hold (S5a), one load: every
+	/// shard's bucket array, slab chunks and chunk table, free list and LFU
+	/// frequency maps, the shard array, the two tail-mirror arrays and the
+	/// meter's own allocation -- each charged where it is allocated or freed,
+	/// on whichever thread that is (a client's insert commits chunks and
+	/// splits buckets, the policy worker's retirements fill free lists). The
+	/// store's part of M: in this build the object map and the eviction stack
+	/// are this one structure. Not the `Arc` it lives in (the policy worker
+	/// adds that) and not the value headers (M counts one per live object).
+	pub fn structure_bytes(&self) -> u64 {
+		self.meter.bytes()
 	}
 
 	/// Slots the policy worker has linked and not yet retired -- the DashMap
@@ -3938,6 +4015,103 @@ mod tests {
 	/// which is exactly what would have happened here under `fused_value`.
 	fn migrating_bytes(size: ObjectSize) -> CacheSize {
 		crate::object::overhead::resident_object_bytes::<u64>(size) as CacheSize
+	}
+
+	/// S5a: the store's own count of its structures is what the allocator
+	/// holds for them, from construction (the fixed arrays and every shard's
+	/// first buckets) on: inserts across the shards (a slab chunk per shard,
+	/// bucket splits), one shard driven to six chunks (its chunk table grows
+	/// twice), LFU links and bumps (the frequency maps' nodes), evictions into
+	/// the free lists, a wipe that frees every chunk, and a refill. Checked
+	/// after every operation. The objects are built first and what the store
+	/// hands back is kept, so only the store's own allocations are measured;
+	/// the migration log is drained (and its buffer freed) before each check.
+	#[test]
+	fn the_store_counts_exactly_what_its_structures_allocated() {
+		const SPREAD: u64 = 3_000;
+		const ONE_SHARD: u64 = 6 * SLAB_CHUNK as u64 - 100;
+
+		let len = 48u32;
+		let mut objects: Vec<Object<u64, crate::BufferDRAM>> = (0..SPREAD + ONE_SHARD)
+			.map(|i| Object::new(i, &[7u8; 48], None))
+			.collect();
+		let mut kept: Vec<Object<u64, crate::BufferDRAM>> = Vec::with_capacity(objects.len());
+		let spread = |i: u64| mix(i + 1);
+		let packed = |i: u64| (3u64 << (64 - SHARD_BITS)) | (i + 1);
+
+		let base = crate::meta::thread_live_bytes();
+		let live = || (crate::meta::thread_live_bytes() - base) as u64;
+
+		let store = Store::new();
+		store.set_order(MergedOrder::Lfu);
+		store.configure_tiering(1 << 20, 0, DEFAULT_HIGH_PPM, DEFAULT_LOW_PPM);
+		let mut log = MigrationLog::default();
+
+		assert_eq!(live(), store.structure_bytes(), "a new store: its fixed arrays and first buckets");
+
+		let set = |store: &Store, log: &mut MigrationLog, key: HashedKey, object: Object<u64, crate::BufferDRAM>| {
+			assert!(store.insert(key, object).is_none());
+			store.worker_set(key, migrating_bytes(len) as ObjectSize, SetEvent::Fresh, log);
+			drop(log.take_entries());
+		};
+
+		for i in 0..SPREAD {
+			set(&store, &mut log, spread(i), objects.pop().unwrap());
+			assert_eq!(live(), store.structure_bytes(), "after spread insert {i}");
+		}
+
+		for i in 0..ONE_SHARD {
+			set(&store, &mut log, packed(i), objects.pop().unwrap());
+			assert_eq!(live(), store.structure_bytes(), "after packed insert {i}");
+		}
+
+		assert_eq!(store.shards_chunks(3).0, 6, "the packed shard holds six chunks");
+
+		// Distinct frequencies: key i touched i times.
+		for i in 0..300 {
+			for _ in 0..i {
+				store.touch(spread(i), &mut log);
+			}
+
+			drop(log.take_entries());
+			assert_eq!(live(), store.structure_bytes(), "after spread key {i}'s {i} touches");
+		}
+
+		for i in (0..SPREAD).step_by(2) {
+			kept.push(store.take_evict(&spread(i)).expect("a live key"));
+			assert_eq!(live(), store.structure_bytes(), "after evicting spread key {i}");
+		}
+
+		for i in (0..ONE_SHARD).step_by(3) {
+			kept.push(store.take_evict(&packed(i)).expect("a live key"));
+			assert_eq!(live(), store.structure_bytes(), "after evicting packed key {i}");
+		}
+
+		// Everything out, so the wipe frees structures and nothing else.
+		for i in (0..SPREAD).filter(|i| i % 2 != 0) {
+			kept.push(store.take_evict(&spread(i)).expect("a live key"));
+		}
+
+		for i in (0..ONE_SHARD).filter(|i| i % 3 != 0) {
+			kept.push(store.take_evict(&packed(i)).expect("a live key"));
+		}
+
+		assert_eq!(live(), store.structure_bytes(), "after emptying");
+
+		let held = store.structure_bytes();
+		store.clear_counted(|_| 0);
+		assert_eq!(live(), store.structure_bytes(), "after the wipe");
+		assert!(store.structure_bytes() < held, "the wipe freed the chunks and the maps' nodes");
+
+		for (i, object) in kept.drain(..).take(2_000).enumerate() {
+			set(&store, &mut log, spread(i as u64), object);
+			assert_eq!(live(), store.structure_bytes(), "after refill insert {i}");
+		}
+
+		drop(store);
+		drop(log);
+		drop(kept);
+		drop(objects);
 	}
 
 	/// A live key's queue-position stamp, straight out of the slot. The CLOCK

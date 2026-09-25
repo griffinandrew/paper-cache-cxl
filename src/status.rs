@@ -233,6 +233,24 @@ pub struct AtomicStatus {
 	#[cfg(feature = "hybrid_cache_common")]
 	hybrid_over_budget_byte_seconds: AtomicU64,
 
+	/// M, the bytes the cache's own DRAM metadata structures hold (S5a):
+	/// published by the policy worker (`PolicyWorker::publish_metadata`) at
+	/// construction, every pass, after a wipe and after any event that grew
+	/// its stack, and read with ONE load (`dram_metadata_bytes`). Its parts and
+	/// the slow-node structures beside it, for the reports; each is a load of
+	/// its own, so a reader of all four can see two publications mixed, and
+	/// only the total is a single reading.
+	#[cfg(feature = "hybrid_cache_common")]
+	dram_metadata: AtomicU64,
+	#[cfg(feature = "hybrid_cache_common")]
+	dram_metadata_map: AtomicU64,
+	#[cfg(feature = "hybrid_cache_common")]
+	dram_metadata_stack: AtomicU64,
+	#[cfg(feature = "hybrid_cache_common")]
+	dram_metadata_headers: AtomicU64,
+	#[cfg(feature = "hybrid_cache_common")]
+	slow_metadata: AtomicU64,
+
 	/// This cache's place in `phys::live_tiered_caches`. Installed by
 	/// `register_tiered_cache`, released when the status is freed -- after
 	/// the cache has joined the workers that share it.
@@ -445,6 +463,16 @@ impl AtomicStatus {
 			hybrid_slow_hits: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			hybrid_over_budget_byte_seconds: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			dram_metadata: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			dram_metadata_map: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			dram_metadata_stack: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			dram_metadata_headers: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			slow_metadata: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			tiered_registration: std::sync::OnceLock::new(),
 			#[cfg(feature = "hybrid_cache_common")]
@@ -709,6 +737,56 @@ impl AtomicStatus {
 		self.whole_fast_tier_capacity().saturating_sub(reserved)
 	}
 
+	/// M, the bytes this cache's own DRAM metadata structures hold, in
+	/// jemalloc's usable-size unit: the object map's (its tables, arrays and
+	/// `Arc`), the policy stack's (its slab chunks and their table, index,
+	/// free list, bucket maps, ghost, and its box) and one value header per
+	/// live object (S5a; `crate::meta`). One load of what the policy worker
+	/// last published; 0 on a status no tiered cache's worker publishes to.
+	///
+	/// Structures on the slow node are not in it (`dram_metadata().slow`).
+	/// It lags the map by up to one worker pass: a client's insert grows the
+	/// map before the worker handles its `Set`.
+	#[cfg(feature = "hybrid_cache_common")]
+	#[must_use]
+	pub fn dram_metadata_bytes(&self) -> u64 {
+		self.dram_metadata.load(Ordering::Relaxed)
+	}
+
+	/// M's parts and the slow-node structures beside them, as last published.
+	/// Four loads (see the field's doc): for the reports, not for a budget.
+	#[cfg(feature = "hybrid_cache_common")]
+	#[must_use]
+	pub fn dram_metadata(&self) -> crate::meta::DramMetadata {
+		crate::meta::DramMetadata {
+			map: self.dram_metadata_map.load(Ordering::Relaxed),
+			stack: self.dram_metadata_stack.load(Ordering::Relaxed),
+			headers: self.dram_metadata_headers.load(Ordering::Relaxed),
+			slow: self.slow_metadata.load(Ordering::Relaxed),
+		}
+	}
+
+	/// Publishes M (the policy worker's). The parts first, then the total.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub(crate) fn set_dram_metadata(&self, metadata: crate::meta::DramMetadata) {
+		self.dram_metadata_map.store(metadata.map, Ordering::Relaxed);
+		self.dram_metadata_stack.store(metadata.stack, Ordering::Relaxed);
+		self.dram_metadata_headers.store(metadata.headers, Ordering::Relaxed);
+		self.slow_metadata.store(metadata.slow, Ordering::Relaxed);
+		self.dram_metadata.store(metadata.total(), Ordering::Relaxed);
+	}
+
+	/// `F - M`, saturating at zero: the whole fast-tier budget
+	/// (`whole_fast_tier_capacity`) less the MEASURED metadata, where
+	/// `effective_fast_capacity` takes off the modelled `L * omega`. Beside
+	/// it, not instead of it: S5a changes no consumer, S5 moves them onto
+	/// this. Reporting only.
+	#[cfg(feature = "hybrid_cache_common")]
+	#[must_use]
+	pub fn effective_fast_capacity_measured(&self) -> CacheSize {
+		self.whole_fast_tier_capacity().saturating_sub(self.dram_metadata_bytes())
+	}
+
 	/// Counts a hit served from `tier`, the tier of the value the hit copies.
 	/// Called beside `incr_hits`, never instead of it.
 	#[cfg(feature = "hybrid_cache_common")]
@@ -823,6 +901,9 @@ impl AtomicStatus {
 			slow_hits: self.hybrid_slow_hits.load(Ordering::Relaxed),
 			live_tiered_caches: crate::phys::live_tiered_caches(),
 			live_flat_fast_caches: crate::phys::live_flat_fast_caches(),
+			dram_metadata_bytes: self.dram_metadata_bytes(),
+			slow_metadata_bytes: self.slow_metadata.load(Ordering::Relaxed),
+			effective_fast_capacity_measured: self.effective_fast_capacity_measured(),
 			reconcile_set_to_fast,
 			reconcile_set_to_slow,
 			reconcile_get_to_fast,

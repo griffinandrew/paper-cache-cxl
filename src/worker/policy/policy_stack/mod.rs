@@ -528,6 +528,25 @@ where
 		0
 	}
 
+	/// S5a: the usable bytes (jemalloc size classes) allocated right now for
+	/// this stack's OWN structures -- its slab chunks and their table, its
+	/// keyless index, its free list, its LFU bucket maps, its ghost -- by the
+	/// node they are on: DRAM, or the slow node under `eviction_stacks_pmem`,
+	/// which puts every one of them there. Not the box the stack lives in (the
+	/// policy worker adds that) and not the `migrations` vector a drain takes
+	/// whole.
+	///
+	/// What the per-object model charges as the stack's share of `omega`, but
+	/// counted from the structures, at whatever load they are at (see
+	/// `crate::meta`). Each structure counts itself where it grows, so this is
+	/// a handful of loads, cheap enough for the policy worker to compare after
+	/// every event. `None` for a stack that does not meter itself -- the flat
+	/// (all-DRAM) stacks, which only flat caches run, and a flat cache
+	/// publishes no M. Every tiered design returns `Some`.
+	fn structure_bytes(&self) -> Option<crate::meta::NodeBytes> {
+		None
+	}
+
 	/// Current bytes accounted to the fast tier. `0` for every stack except
 	/// the hybrid stacks.
 	fn fast_bytes_used(&self) -> CacheSize {
@@ -1608,5 +1627,162 @@ mod reservation_tests {
 			 in, so each must be charged:\n{}",
 			failures.join("\n"),
 		);
+	}
+}
+
+/// S5a: every tiered design's `structure_bytes` is what the allocator holds
+/// for its structures, EXACTLY, after every operation of a run that inserts,
+/// hits, evicts and removes -- slab chunks and their table, the keyless
+/// index, the free list, the LFU designs' bucket maps, the ghosts -- and puts
+/// them on the node its build does: DRAM, or the slow node under
+/// `eviction_stacks_pmem`. The stack's box, which the policy worker adds, is
+/// the rest of what the allocator sees; the `migrations` a drain takes are
+/// freed before each check.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod structure_bytes_tests {
+	use super::*;
+
+	/// Each design's fast tier is 20% of this.
+	const MAX_SIZE: CacheSize = 1_000_000;
+
+	/// 1_200_000 B of values at `SIZE`: the fast tier demotes, the cache
+	/// evicts, and 5,000 keys take every slab past one chunk.
+	const N: HashedKey = 5_000;
+	const SIZE: ObjectSize = 240;
+
+	const DESIGNS: [PaperPolicy; 25] = [
+		PaperPolicy::LruCompactHybrid,
+		PaperPolicy::LruLazyCopyCompactHybrid,
+		PaperPolicy::LfuCompactHybrid,
+		PaperPolicy::LruLfuCompactHybrid(3),
+		PaperPolicy::LruSizedCompactHybrid,
+		PaperPolicy::FifoCompactHybrid,
+		PaperPolicy::ClockCompactHybrid,
+		PaperPolicy::TwoQCompactHybrid(0.1),
+		PaperPolicy::TwoQFastAdmissionCompactHybrid(0.1),
+		PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.1),
+		PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.1, 0.5),
+		PaperPolicy::TwoQGhostCompactHybrid(0.1),
+		PaperPolicy::S3FifoCompactHybrid(0.1),
+		PaperPolicy::S3FifoFaithfulCompactHybrid(0.1),
+		PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.1),
+		PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(0.1),
+		PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(0.1),
+		PaperPolicy::S3FifoGhostCompactHybrid(0.1),
+		PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(0.1),
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(0.1),
+		PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(0.1),
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(0.1),
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(0.1),
+		PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(0.1),
+		PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(0.1),
+	];
+
+	/// The allocator against the stack's own count, after a drain: `None`
+	/// when they agree and every byte is on the build's node -- the slow one
+	/// under `eviction_stacks_pmem`, DRAM otherwise (stated here, not asked of
+	/// `NodeBytes::stack`, so a wrong split there fails this).
+	fn mismatch(stack: &mut dyn PolicyStack, base: i64, boxed: u64) -> Option<(u64, crate::meta::NodeBytes)> {
+		drop(stack.drain_tier_migrations());
+
+		let live = (crate::meta::thread_live_bytes() - base) as u64;
+		let bytes = stack.structure_bytes().expect("a tiered design meters itself");
+		let off_node = match cfg!(feature = "eviction_stacks_pmem") {
+			true => bytes.dram,
+			false => bytes.slow,
+		};
+
+		(live != bytes.total() + boxed || off_node != 0).then_some((live, bytes))
+	}
+
+	#[test]
+	fn every_tiered_design_counts_exactly_what_its_structures_allocated() {
+		// Under `eviction_stacks_pmem` the stacks allocate on the slow node,
+		// whose arenas are built on first use -- which allocates. Built here,
+		// before any baseline.
+		assert!(crate::numa_alloc::init_node(crate::numa_alloc::NODE_SLOW));
+
+		let mut failures = Vec::new();
+
+		for policy in DESIGNS {
+			let base = crate::meta::thread_live_bytes();
+			let mut stack = init_policy_stack(policy, MAX_SIZE);
+			let boxed = crate::meta::box_bytes_of_val(&*stack);
+			let mut checked = 0u64;
+			let mut failure = None;
+
+			let mut check = |stack: &mut dyn PolicyStack, what: HashedKey| {
+				checked += 1;
+
+				if failure.is_none() {
+					failure = mismatch(stack, base, boxed).map(|found| (what, found));
+				}
+			};
+
+			check(stack.as_mut(), 0);
+
+			for key in 1..=N {
+				stack.insert(key, SIZE);
+				check(stack.as_mut(), key);
+
+				while (stack.needs_capacity_eviction()
+					|| stack.fast_bytes_used() + stack.slow_bytes_used() > MAX_SIZE)
+					&& stack.evict_one().is_some()
+				{
+					check(stack.as_mut(), key);
+				}
+
+				// Hits: promotions, frequency bumps, reference bits.
+				if key % 3 == 0 {
+					for hit in [key, key / 2, key / 3] {
+						if stack.contains(hit) {
+							stack.update(hit);
+							check(stack.as_mut(), hit);
+						}
+					}
+				}
+
+				// Removals: the free list.
+				if key % 7 == 0 && stack.contains(key / 7) {
+					stack.remove(key / 7);
+					check(stack.as_mut(), key / 7);
+				}
+			}
+
+			let (stack_bytes, placed) = (stack.structure_bytes().map(|b| b.total()), stack.structure_bytes());
+
+			stack.clear();
+			check(stack.as_mut(), 0);
+
+			drop(check);
+
+			// Before anything below allocates a message.
+			drop(stack);
+			let leaked = crate::meta::thread_live_bytes() - base;
+
+			if let Some((key, (live, bytes))) = failure {
+				failures.push(format!(
+					"{policy}: at key {key}, the allocator holds {live} B (the {boxed} B box \
+					 included) where the stack counts {bytes:?}",
+				));
+			}
+
+			assert_eq!(leaked, 0, "{policy}: the stack did not free {leaked} B of what it allocated");
+			assert!(checked > N, "{policy}: checked {checked} times");
+			assert!(
+				stack_bytes.is_some_and(|b| b > 128 * 1024),
+				"{policy}: 5,000 keys should need more than one slab chunk: {placed:?}",
+			);
+		}
+
+		assert!(failures.is_empty(), "{}", failures.join("\n"));
+	}
+
+	/// A flat stack does not meter itself: only a tiered cache publishes M.
+	#[test]
+	fn a_flat_stack_meters_nothing() {
+		for policy in [PaperPolicy::Lru, PaperPolicy::LfuCompact, PaperPolicy::SThreeFifo(0.1)] {
+			assert_eq!(init_policy_stack(policy, MAX_SIZE).structure_bytes(), None, "{policy}");
+		}
 	}
 }

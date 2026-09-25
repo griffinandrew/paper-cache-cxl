@@ -339,6 +339,14 @@ where
 		self.store.lfu_latched()
 	}
 
+	/// The store's structures are the object map's, and the policy worker
+	/// counts them there (`MergedStore::structure_bytes`); the handle's own
+	/// migration log is a drain buffer, taken whole at every drain. So this
+	/// stack's own structures are none -- `Some(0)`, not "unmetered".
+	fn structure_bytes(&self) -> Option<crate::meta::NodeBytes> {
+		Some(crate::meta::NodeBytes::default())
+	}
+
 	fn dram_reserved_bytes(&self) -> CacheSize {
 		self.store.dram_reserved_bytes()
 	}

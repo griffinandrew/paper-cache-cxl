@@ -95,9 +95,8 @@ use crate::{
 			ArenaSlot,
 			KeylessIndex,
 			NIL,
+			FreeList,
 			SlotSlab,
-			U32Vec,
-			new_u32_vec,
 		},
 		arena_queue_set::NodePayload,
 	},
@@ -110,19 +109,65 @@ use crate::{
 // DRAM and be charged nothing.
 //
 // One entry per DISTINCT frequency rather than per object, so this stays small.
-#[cfg(not(feature = "eviction_stacks_pmem"))]
+//
+// Under `hybrid_cache_common` the maps allocate through `crate::meta::Metered`
+// (over the same allocator), so their B-tree nodes are counted for M (S5a)
+// where they are made: every other part of this structure counts itself at
+// its growth site, and a `BTreeMap` has none a caller can see. Elsewhere M is
+// never published, and the maps are left unmetered.
+#[cfg(all(feature = "hybrid_cache_common", not(feature = "eviction_stacks_pmem")))]
+type BucketMap = BTreeMap<u32, (u32, u32), crate::meta::Metered>;
+#[cfg(all(feature = "hybrid_cache_common", feature = "eviction_stacks_pmem"))]
+type BucketMap = BTreeMap<u32, (u32, u32), crate::meta::Metered<crate::Hybrid>>;
+#[cfg(all(not(feature = "hybrid_cache_common"), not(feature = "eviction_stacks_pmem")))]
 type BucketMap = BTreeMap<u32, (u32, u32)>;
-#[cfg(feature = "eviction_stacks_pmem")]
+#[cfg(all(not(feature = "hybrid_cache_common"), feature = "eviction_stacks_pmem"))]
 type BucketMap = BTreeMap<u32, (u32, u32), crate::Hybrid>;
 
-#[cfg(not(feature = "eviction_stacks_pmem"))]
-fn new_bucket_maps() -> (BucketMap, BucketMap) {
+/// What the bucket maps' allocations are charged to: a meter under
+/// `hybrid_cache_common`, nothing elsewhere.
+#[cfg(feature = "hybrid_cache_common")]
+type BucketMeter = crate::meta::Meter;
+#[cfg(not(feature = "hybrid_cache_common"))]
+type BucketMeter = ();
+
+#[cfg(all(feature = "hybrid_cache_common", not(feature = "eviction_stacks_pmem")))]
+fn new_bucket_maps(meter: &BucketMeter) -> (BucketMap, BucketMap) {
+	(
+		BTreeMap::new_in(crate::meta::Metered::new(meter)),
+		BTreeMap::new_in(crate::meta::Metered::new(meter)),
+	)
+}
+
+#[cfg(all(feature = "hybrid_cache_common", feature = "eviction_stacks_pmem"))]
+fn new_bucket_maps(meter: &BucketMeter) -> (BucketMap, BucketMap) {
+	(
+		BTreeMap::new_in(crate::meta::Metered::new_in(crate::Hybrid, meter)),
+		BTreeMap::new_in(crate::meta::Metered::new_in(crate::Hybrid, meter)),
+	)
+}
+
+#[cfg(all(not(feature = "hybrid_cache_common"), not(feature = "eviction_stacks_pmem")))]
+fn new_bucket_maps(_meter: &BucketMeter) -> (BucketMap, BucketMap) {
 	(BTreeMap::new(), BTreeMap::new())
 }
 
-#[cfg(feature = "eviction_stacks_pmem")]
-fn new_bucket_maps() -> (BucketMap, BucketMap) {
+#[cfg(all(not(feature = "hybrid_cache_common"), feature = "eviction_stacks_pmem"))]
+fn new_bucket_maps(_meter: &BucketMeter) -> (BucketMap, BucketMap) {
 	(BTreeMap::new_in(crate::Hybrid), BTreeMap::new_in(crate::Hybrid))
+}
+
+/// The bucket maps' usable bytes, and the meter's own allocation that counts
+/// them. 0 where they are not metered.
+#[cfg(feature = "hybrid_cache_common")]
+fn bucket_bytes(meter: &BucketMeter) -> u64 {
+	meter.bytes() + crate::meta::Meter::own_bytes()
+}
+
+#[cfg(not(feature = "hybrid_cache_common"))]
+#[allow(dead_code)]
+fn bucket_bytes(_meter: &BucketMeter) -> u64 {
+	0
 }
 
 /// Frequency-ordered buckets per tier, plus a recency-ordered list, over one
@@ -136,7 +181,7 @@ pub struct ArenaFrequencyChain {
 	index: KeylessIndex,
 
 	/// Freed slab slots, reused before the slab grows.
-	free: U32Vec,
+	free: FreeList,
 
 	/// frequency -> (head, tail) of that bucket's intrusive list, one map per
 	/// tier. Ordered, so a tier's minimum frequency is its first entry.
@@ -166,22 +211,29 @@ pub struct ArenaFrequencyChain {
 	/// life and every other method behaves exactly as it would without them.
 	recency_head: u32,
 	recency_tail: u32,
+
+	/// What the bucket maps' node allocations are charged to (S5a); see
+	/// `BucketMap`.
+	#[cfg_attr(not(feature = "hybrid_cache_common"), allow(dead_code))]
+	bucket_meter: BucketMeter,
 }
 
 impl Default for ArenaFrequencyChain {
 	fn default() -> Self {
-		let (fast_buckets, slow_buckets) = new_bucket_maps();
+		let bucket_meter = BucketMeter::default();
+		let (fast_buckets, slow_buckets) = new_bucket_maps(&bucket_meter);
 
 		ArenaFrequencyChain {
 			slots: SlotSlab::new(),
 			index: KeylessIndex::default(),
-			free: new_u32_vec(),
+			free: FreeList::default(),
 			fast_buckets,
 			slow_buckets,
 			fast_len: 0,
 			slow_len: 0,
 			recency_head: NIL,
 			recency_tail: NIL,
+			bucket_meter,
 		}
 	}
 }
@@ -222,6 +274,20 @@ impl ArenaFrequencyChain {
 	/// which has to know the table size to reason about its cost.
 	pub fn index_capacity(&self) -> usize {
 		self.index.capacity()
+	}
+
+	/// Usable bytes this structure's own allocations hold (S5a): the slab's
+	/// chunks and their table, the index's buckets, the free list, and the two
+	/// bucket maps' B-tree nodes with the meter that counts them (outside
+	/// `hybrid_cache_common` the maps are not metered and count 0). O(1).
+	// Read only through `PolicyStack::structure_bytes`, which only a tiered
+	// cache's worker calls (S5a).
+	#[cfg_attr(not(feature = "hybrid_cache_common"), allow(dead_code))]
+	pub fn allocated_bytes(&self) -> u64 {
+		self.slots.allocated_bytes()
+			+ self.index.allocated_bytes()
+			+ self.free.allocated_bytes()
+			+ bucket_bytes(&self.bucket_meter)
 	}
 
 	/// Pre-sizes the slab (whole chunks) and the index for `objects` entries.
@@ -672,6 +738,57 @@ mod tests {
 		arena_index::GOLDEN,
 		compact_frequency_chain::CompactFrequencyChain,
 	};
+
+	/// S5a: the chain's own count of its bytes is what the allocator holds for
+	/// it -- slab, index, free list AND the two bucket maps' B-tree nodes --
+	/// while 300 distinct frequencies grow the fast map past one node, keys
+	/// move to the slow map, removals empty buckets (and free their nodes) and
+	/// the free list fills, and after a clear. Checked after every operation.
+	#[cfg(feature = "hybrid_cache_common")]
+	#[test]
+	fn the_chain_counts_exactly_what_it_allocated_bucket_maps_included() {
+		let base = crate::meta::thread_live_bytes();
+		let live = || (crate::meta::thread_live_bytes() - base) as u64;
+		let mut chain = ArenaFrequencyChain::default();
+
+		assert_eq!(live(), chain.allocated_bytes(), "a new chain: the meter's Arc, nothing else");
+
+		let key = |i: u64| i.wrapping_mul(GOLDEN) | 1;
+
+		for i in 0..300u64 {
+			chain.insert(key(i), 100, 0, Tier::Fast);
+
+			for _ in 0..i {
+				chain.bump(key(i));
+			}
+
+			assert_eq!(live(), chain.allocated_bytes(), "after key {i}'s {i} bumps");
+		}
+
+		let grown = chain.allocated_bytes();
+
+		for i in (0..300u64).step_by(3) {
+			chain.set_tier(key(i), Tier::Slow);
+			assert_eq!(live(), chain.allocated_bytes(), "after key {i} moved slow");
+		}
+
+		for i in (1..300u64).step_by(2) {
+			chain.remove(key(i));
+			assert_eq!(live(), chain.allocated_bytes(), "after key {i} was removed");
+		}
+
+		for i in 300..600u64 {
+			chain.insert(key(i), 100, 0, Tier::Slow);
+			assert_eq!(live(), chain.allocated_bytes(), "after key {i} reused a free slot");
+		}
+
+		chain.clear();
+		assert_eq!(live(), chain.allocated_bytes(), "after a clear");
+		assert!(chain.allocated_bytes() < grown, "the clear freed the bucket maps' nodes");
+
+		drop(chain);
+		assert_eq!(live(), 0, "the chain freed everything it counted");
+	}
 
 	/// The premise, in one assertion. The node carries the payload, so a
 	/// tracked key costs 32 bytes of slab; the index carries no key, so it
