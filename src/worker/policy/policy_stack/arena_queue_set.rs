@@ -79,7 +79,16 @@
 //! doubling the slab is half empty (48) and the index quarter full (16). The
 //! real range is 32-64, and 32 is its bottom.
 //!
-//! MEASURED at the population a real cluster26 run reaches, by
+//! That range was the doubling `Vec`'s. The slab is chunked now
+//! ([`ChunkedSlab`](super::arena_index::ChunkedSlab)): growth appends one
+//! 96 KiB chunk of this 24-byte slot and moves nothing. So the slab term stays
+//! at 24 B/object plus at most one partly filled chunk, and only the index
+//! swings. DERIVED, not re-measured: 32-40 B/object across a cycle for this
+//! slot, and 40-48 for the 32-byte `NodePayload` node. The 2^k figures are
+//! unchanged, since 2^k slots is exactly full chunks.
+//!
+//! MEASURED at the population a real cluster26 run reaches, before the
+//! chunking (the slab rows below are a doubling `Vec`'s), by
 //! `tests::measure_four_structures_at_one_population`, on the same objects and
 //! in the same process as `CompactQueueSet` and `SlotArena`:
 //!
@@ -146,7 +155,7 @@
 use crate::{ObjectSize, worker::policy::policy_stack::{HashedKey, Tier}};
 
 pub use super::arena_index::{ArenaSlot, NIL};
-use super::arena_index::{KeylessIndex, SlotVec, U32Vec, new_slot_vec, new_u32_vec};
+use super::arena_index::{KeylessIndex, SlotSlab, U32Vec, new_u32_vec};
 
 // ---------------------------------------------------------------------------
 // the one node payload
@@ -258,7 +267,7 @@ pub const MAX_QUEUES: usize = 4;
 /// queue a key is in remains the caller's business, recorded inside `P`; this
 /// structure only maintains the orders.
 pub struct ArenaQueueSet<P: Copy> {
-	slots: SlotVec<P>,
+	slots: SlotSlab<P>,
 	free: U32Vec,
 
 	/// Open-addressed, linear-probed table of slot numbers. `NIL` is empty.
@@ -275,7 +284,7 @@ pub struct ArenaQueueSet<P: Copy> {
 impl<P: Copy> Default for ArenaQueueSet<P> {
 	fn default() -> Self {
 		ArenaQueueSet {
-			slots: new_slot_vec(),
+			slots: SlotSlab::new(),
 			free: new_u32_vec(),
 			index: KeylessIndex::default(),
 			heads: [NIL; MAX_QUEUES],
@@ -315,11 +324,11 @@ impl<P: Copy> ArenaQueueSet<P> {
 // ---------------------------------------------------------------------------
 
 impl<P: Copy> ArenaQueueSet<P> {
-	/// Slab slots currently allocated. Exposed so a test can assert that
-	/// construction does NOT allocate from the cache budget: these stacks grow
-	/// dynamically, and an eager reservation sized from capacity reserves
-	/// far more than the eval workload can hold while still not preventing
-	/// doubling on the real traces.
+	/// Slab slots the committed chunks hold (a chunk is committed whole).
+	/// Exposed so a test can assert that construction does NOT allocate from
+	/// the cache budget: these stacks grow dynamically, and an eager
+	/// reservation sized from capacity reserves far more than the eval
+	/// workload can hold.
 	pub fn slab_capacity(&self) -> usize {
 		self.slots.capacity()
 	}
@@ -330,10 +339,13 @@ impl<P: Copy> ArenaQueueSet<P> {
 		self.index.capacity()
 	}
 
-	/// Pre-sizes the slab and the index. Growth is never in place: every `Vec`
-	/// doubling copies every entry, which at eval-trace scale is one
-	/// multi-hundred-millisecond stall on the policy worker that the client
-	/// latency percentiles structurally cannot observe.
+	/// Pre-sizes the slab (whole chunks) and the index.
+	///
+	/// The slab's own growth copies nothing: it appends a chunk. The index
+	/// still doubles, and each doubling rehashes every entry, which at
+	/// eval-trace scale is a stall on the policy worker that the client latency
+	/// percentiles structurally cannot observe. While the slab was a `Vec`, its
+	/// doublings copied every entry too.
 	pub fn reserve(&mut self, objects: usize) {
 		self.slots.reserve(objects);
 		self.index.reserve(&self.slots, objects);
@@ -544,6 +556,8 @@ impl<P: Copy> ArenaQueueSet<P> {
 	}
 
 	pub fn clear(&mut self) {
+		// The slab keeps its chunks, as the `Vec` it replaced kept its
+		// capacity.
 		self.slots.clear();
 		self.free.clear();
 
@@ -773,6 +787,41 @@ mod tests {
 		s.push_back(0, 4, p(0));
 		assert_eq!(s.slots.len(), before, "slab grew instead of reusing a free slot");
 		assert_eq!(keys(&s, 0), vec![1, 3, 4]);
+	}
+
+	/// The set's slab is the chunked one. It grows by whole chunks, where
+	/// the doubling `Vec` jumped to the next power of two (32,768 slots for
+	/// these 16,385), keeps them through `clear` as the `Vec` kept its
+	/// capacity, and the refill reuses them.
+	#[test]
+	fn the_slab_grows_a_chunk_at_a_time_and_keeps_its_chunks_through_a_clear() {
+		use crate::worker::policy::policy_stack::arena_index::SlotSlab;
+
+		let chunk = SlotSlab::<P>::CHUNK;
+		let n = 4 * chunk as u64 + 1;
+		let mut s: ArenaQueueSet<P> = Default::default();
+		assert_eq!(s.slab_capacity(), 0, "construction committed a chunk");
+
+		for k in 0..n {
+			s.push_back(0, k.wrapping_mul(GOLDEN), p(0));
+		}
+		assert_eq!(s.slab_capacity(), 5 * chunk, "{n} slots are five whole chunks");
+
+		s.clear();
+		assert_eq!(s.slab_capacity(), 5 * chunk, "clear gave chunks back");
+
+		for k in n..2 * n {
+			s.push_back(1, k.wrapping_mul(GOLDEN), p(1));
+		}
+		assert_eq!(s.slab_capacity(), 5 * chunk, "the refill committed chunks the set had");
+		assert_eq!((s.len(), s.queue_len(0), s.queue_len(1)), (n as usize, 0, n as usize));
+
+		for k in 0..n {
+			assert!(!s.contains(k.wrapping_mul(GOLDEN)), "key {k} survived the clear");
+		}
+		for k in n..2 * n {
+			assert_eq!(s.payload(k.wrapping_mul(GOLDEN)).map(|pl| pl.queue), Some(1), "key {k}");
+		}
 	}
 
 	#[test]

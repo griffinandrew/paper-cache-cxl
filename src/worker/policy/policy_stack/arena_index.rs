@@ -5,7 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The arena's slab node, and the KEYLESS index that finds it.
+//! The arena's slab node, the chunked slab that holds it, and the KEYLESS
+//! index that finds it.
 //!
 //! This is the whole of what the arena conversion takes off `CompactQueueSet`
 //! and `CompactFrequencyChain`. Both were 72 B/object, and in both the key was
@@ -37,6 +38,27 @@
 //!
 //! [`ArenaQueueSet`]: super::arena_queue_set::ArenaQueueSet
 //! [`ArenaFrequencyChain`]: super::arena_frequency_chain::ArenaFrequencyChain
+//!
+//! # The slab is chunked
+//!
+//! A slot id is a plain `u32` into a [`ChunkedSlab`]: a `Vec` of fixed-size
+//! chunks indexed as one flat array. This is the merged store's chunked slab
+//! (`merged_store.rs`, "The chunked slab") made generic over its element. Id
+//! `i` is element `i & (CHUNK - 1)` of chunk `i >> CHUNK_BITS`. To grow, the
+//! slab appends one chunk. Nothing is copied and no slot moves, so ids, links
+//! and payloads are what they were.
+//!
+//! It replaced a plain doubling `Vec`, which cost the split stacks twice:
+//!
+//! - **Memory.** A doubling leaves up to half the capacity empty, so the 32-byte
+//!   node cost 32-64 B/object across a growth cycle.
+//! - **A stall.** Each doubling copied the whole slab on the policy worker. At
+//!   64M objects that is a 2 GiB copy, with 6 GiB live while it runs.
+//!
+//! A chunk is 128 KiB ([`SLAB_CHUNK_BYTES`]), 4096 of the 32-byte node. The
+//! slab now costs 32 B/object at every population, plus at most one partly
+//! filled chunk. The keyless index below still doubles, which is the part of
+//! the stack's per-object cost that still swings (8-16 B/object).
 //!
 //! # Deletion, which is where the bugs live
 //!
@@ -117,9 +139,11 @@ pub struct ArenaSlot<P> {
 	pub payload: P,
 }
 
-// Under `eviction_stacks_pmem` every structure built out of these aliases is
-// allocated through the crate-wide `Hybrid` allocator (the far CXL/PMEM node),
-// exactly as `CompactQueueSet` and `CompactFrequencyChain` are.
+// Under `eviction_stacks_pmem` everything this module allocates goes through
+// the crate-wide `Hybrid` allocator (the far CXL/PMEM node), exactly as
+// `CompactQueueSet` and `CompactFrequencyChain` do. That is the slab's chunks
+// and the table that holds them, the index's buckets, and the owners' free
+// lists.
 //
 // Not optional: `get_hybrid_dram_shared_overhead` drops the eviction-stack term
 // to ZERO under that feature, on the premise the stack is not in DRAM. A slab
@@ -127,23 +151,197 @@ pub struct ArenaSlot<P> {
 // wrong rather than merely unoptimised, and it would invalidate every
 // far-memory placement experiment run against this tree.
 #[cfg(not(feature = "eviction_stacks_pmem"))]
-pub type SlotVec<P> = Vec<ArenaSlot<P>>;
+type Chunk<T> = Vec<T>;
 #[cfg(feature = "eviction_stacks_pmem")]
-pub type SlotVec<P> = Vec<ArenaSlot<P>, crate::Hybrid>;
+type Chunk<T> = Vec<T, crate::Hybrid>;
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+type ChunkTable<T> = Vec<Chunk<T>>;
+#[cfg(feature = "eviction_stacks_pmem")]
+type ChunkTable<T> = Vec<Chunk<T>, crate::Hybrid>;
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
 pub type U32Vec = Vec<u32>;
 #[cfg(feature = "eviction_stacks_pmem")]
 pub type U32Vec = Vec<u32, crate::Hybrid>;
 
+/// A chunk with room for exactly `slots` elements, allocated whole.
 #[cfg(not(feature = "eviction_stacks_pmem"))]
-pub fn new_slot_vec<P>() -> SlotVec<P> {
+fn new_chunk<T>(slots: usize) -> Chunk<T> {
+	Vec::with_capacity(slots)
+}
+
+#[cfg(feature = "eviction_stacks_pmem")]
+fn new_chunk<T>(slots: usize) -> Chunk<T> {
+	Vec::with_capacity_in(slots, crate::Hybrid)
+}
+
+#[cfg(not(feature = "eviction_stacks_pmem"))]
+fn new_chunk_table<T>() -> ChunkTable<T> {
 	Vec::new()
 }
 
 #[cfg(feature = "eviction_stacks_pmem")]
-pub fn new_slot_vec<P>() -> SlotVec<P> {
+fn new_chunk_table<T>() -> ChunkTable<T> {
 	Vec::new_in(crate::Hybrid)
+}
+
+/// Bytes one slab chunk is sized to. 128 KiB is a jemalloc LARGE size class,
+/// so a chunk of the 32-byte node is one allocation with nothing rounded on
+/// top.
+pub const SLAB_CHUNK_BYTES: usize = 128 * 1024;
+
+/// log2 of the elements in one chunk of `size`-byte elements: the largest
+/// power of two whose chunk fits in [`SLAB_CHUNK_BYTES`]. A power of two, so
+/// an id splits into its chunk and its offset with a shift and a mask.
+const fn chunk_bits(size: usize) -> u32 {
+	assert!(
+		size != 0 && size <= SLAB_CHUNK_BYTES,
+		"a slab element must be between one byte and one chunk",
+	);
+
+	(SLAB_CHUNK_BYTES / size).ilog2()
+}
+
+/// The arena's slab: one [`ArenaSlot`] per slot id.
+pub type SlotSlab<P> = ChunkedSlab<ArenaSlot<P>>;
+
+/// A slab of `T`s addressed by id, stored as a `Vec` of fixed-size chunks.
+///
+/// Id `i` is element `i & (CHUNK - 1)` of chunk `i >> CHUNK_BITS`. Ids are
+/// handed out in push order, as they were by the `Vec` this replaced, and
+/// `Index`/`IndexMut` keep every call site reading `slots[i]`. Growth appends
+/// one chunk, allocated whole. No element is ever copied or moved, so an
+/// element's address holds until the slab is cleared or dropped.
+///
+/// `CHUNK` depends on the element: the largest power of two whose chunk fits
+/// in 128 KiB. All three chunk sizes below are jemalloc size classes.
+///
+/// ```text
+///   element                                        size    CHUNK    chunk
+///   the node every hybrid stack carries            32 B     4096  128 KiB
+///   ArenaSlot<()>, the faithful S3-FIFO's ghosts   16 B     8192  128 KiB
+///   a slot with an 8-byte payload (tests)          24 B     4096   96 KiB
+/// ```
+///
+/// The slab does what the `Vec` did for its owners, and only that: `len`,
+/// `push`, indexing, `capacity`, `reserve` and `clear`. The owners never
+/// popped, truncated or `swap_remove`d; the old `Vec` lost elements only in
+/// `clear`, and so does the slab. A freed slot's id goes on its owner's free
+/// list, and the slot is overwritten in place when the id is reused.
+///
+/// Two more `Vec` semantics are kept:
+///
+/// - `clear` keeps the chunks, as `Vec::clear` kept the capacity, so a wiped
+///   stack refills without allocating.
+/// - An id at or past `len` panics, as it did past the `Vec`'s length, even
+///   when it falls inside a committed chunk.
+pub struct ChunkedSlab<T> {
+	/// Every committed chunk, in id order. Chunks below `len >> CHUNK_BITS`
+	/// are full, the next holds the rest of `len`, and any after that are
+	/// empty: kept by `clear`, and refilled in order.
+	chunks: ChunkTable<T>,
+
+	/// Elements pushed since the last `clear`: ids `0 .. len` are live.
+	len: usize,
+}
+
+impl<T> ChunkedSlab<T> {
+	/// log2 of [`Self::CHUNK`].
+	pub const CHUNK_BITS: u32 = chunk_bits(core::mem::size_of::<T>());
+
+	/// Elements per chunk.
+	pub const CHUNK: usize = 1 << Self::CHUNK_BITS;
+
+	const OFFSET_MASK: usize = Self::CHUNK - 1;
+
+	/// An empty slab. Allocates nothing: the first push commits the first
+	/// chunk, so a stack built for a large budget still starts at zero.
+	pub fn new() -> Self {
+		ChunkedSlab {
+			chunks: new_chunk_table(),
+			len: 0,
+		}
+	}
+
+	/// Elements pushed, which is also the id the next push gets.
+	#[inline]
+	pub fn len(&self) -> usize {
+		self.len
+	}
+
+	/// Elements the committed chunks hold. A chunk is committed whole, so
+	/// this is what the slab costs: `capacity() x size_of::<T>()` bytes, plus
+	/// 24 bytes of chunk table per chunk.
+	pub fn capacity(&self) -> usize {
+		self.chunks.len() << Self::CHUNK_BITS
+	}
+
+	/// Appends `value` at id `len()`, committing one more chunk when every
+	/// committed one is full.
+	#[inline]
+	pub fn push(&mut self, value: T) {
+		let chunk = self.len >> Self::CHUNK_BITS;
+
+		if chunk == self.chunks.len() {
+			self.chunks.push(new_chunk(Self::CHUNK));
+		}
+
+		let slots = &mut self.chunks[chunk];
+
+		// Pushed only below `CHUNK` into a chunk allocated for `CHUNK`, so
+		// this push never reallocates. That is the point of the type.
+		debug_assert!(slots.len() < Self::CHUNK && slots.capacity() >= Self::CHUNK);
+
+		slots.push(value);
+		self.len += 1;
+	}
+
+	/// Commits whole chunks until `additional` more elements fit without
+	/// allocating.
+	pub fn reserve(&mut self, additional: usize) {
+		let wanted = self.len.checked_add(additional).expect("capacity overflow");
+		let chunks = wanted.div_ceil(Self::CHUNK);
+
+		while self.chunks.len() < chunks {
+			self.chunks.push(new_chunk(Self::CHUNK));
+		}
+	}
+
+	/// Empties the slab and KEEPS its chunks, as `Vec::clear` keeps its
+	/// capacity, so a cleared-and-refilled owner does not pay for its chunks
+	/// twice.
+	pub fn clear(&mut self) {
+		for chunk in self.chunks.iter_mut() {
+			chunk.clear();
+		}
+
+		self.len = 0;
+	}
+}
+
+/// For the allocator tests: the bytes the chunk table itself asks for.
+#[cfg(test)]
+impl<T> ChunkedSlab<T> {
+	fn table_bytes(&self) -> usize {
+		self.chunks.capacity() * core::mem::size_of::<Chunk<T>>()
+	}
+}
+
+impl<T> core::ops::Index<usize> for ChunkedSlab<T> {
+	type Output = T;
+
+	#[inline]
+	fn index(&self, id: usize) -> &T {
+		&self.chunks[id >> Self::CHUNK_BITS][id & Self::OFFSET_MASK]
+	}
+}
+
+impl<T> core::ops::IndexMut<usize> for ChunkedSlab<T> {
+	#[inline]
+	fn index_mut(&mut self, id: usize) -> &mut T {
+		&mut self.chunks[id >> Self::CHUNK_BITS][id & Self::OFFSET_MASK]
+	}
 }
 
 #[cfg(not(feature = "eviction_stacks_pmem"))]
@@ -225,7 +423,7 @@ impl KeylessIndex {
 
 	/// Slot holding `key`, or [`NIL`].
 	#[inline]
-	pub fn get<P>(&self, slots: &[ArenaSlot<P>], key: HashedKey) -> u32 {
+	pub fn get<P>(&self, slots: &SlotSlab<P>, key: HashedKey) -> u32 {
 		if self.buckets.is_empty() {
 			return NIL;
 		}
@@ -253,7 +451,7 @@ impl KeylessIndex {
 	///
 	/// [`get`]: KeylessIndex::get
 	#[inline]
-	fn bucket_of<P>(&self, slots: &[ArenaSlot<P>], key: HashedKey) -> Option<usize> {
+	fn bucket_of<P>(&self, slots: &SlotSlab<P>, key: HashedKey) -> Option<usize> {
 		if self.buckets.is_empty() {
 			return None;
 		}
@@ -278,7 +476,7 @@ impl KeylessIndex {
 
 	/// Places an ALREADY-ALLOCATED slot in the table. `slots[slot].key` must
 	/// already be written, since that is the only copy of the key there is.
-	pub fn insert<P>(&mut self, slots: &[ArenaSlot<P>], slot: u32) {
+	pub fn insert<P>(&mut self, slots: &SlotSlab<P>, slot: u32) {
 		self.grow_for_one_more(slots);
 
 		let key = slots[slot as usize].key;
@@ -305,7 +503,7 @@ impl KeylessIndex {
 
 	/// Removes `key` from the table, returning its slot. Frees nothing: the
 	/// slab slot is the owner's to reuse.
-	pub fn remove<P>(&mut self, slots: &[ArenaSlot<P>], key: HashedKey) -> Option<u32> {
+	pub fn remove<P>(&mut self, slots: &SlotSlab<P>, key: HashedKey) -> Option<u32> {
 		let bucket = self.bucket_of(slots, key)?;
 		let slot = self.buckets[bucket];
 
@@ -328,7 +526,7 @@ impl KeylessIndex {
 	/// The result is the table that would have existed had the key never been
 	/// inserted, so there is no tombstone to accumulate and no rehash to
 	/// schedule.
-	fn erase_at<P>(&mut self, slots: &[ArenaSlot<P>], bucket: usize) {
+	fn erase_at<P>(&mut self, slots: &SlotSlab<P>, bucket: usize) {
 		let mask = self.buckets.len() - 1;
 
 		let mut hole = bucket;
@@ -367,7 +565,7 @@ impl KeylessIndex {
 	/// index (4 bytes per bucket, so 8 B/object at 2x slack) AND the thing that
 	/// keeps linear-probe runs short. 8 B/object is cheap enough that trading
 	/// it for short runs is not a close call.
-	fn grow_for_one_more<P>(&mut self, slots: &[ArenaSlot<P>]) {
+	fn grow_for_one_more<P>(&mut self, slots: &SlotSlab<P>) {
 		let capacity = self.buckets.len();
 
 		if capacity != 0 && (self.live + 1) * 2 <= capacity {
@@ -379,7 +577,7 @@ impl KeylessIndex {
 	}
 
 	/// Rebuilds the table at `capacity` buckets, which must be a power of two.
-	fn rehash_into<P>(&mut self, slots: &[ArenaSlot<P>], capacity: usize) {
+	fn rehash_into<P>(&mut self, slots: &SlotSlab<P>, capacity: usize) {
 		debug_assert!(capacity.is_power_of_two());
 		debug_assert!(self.live * 2 <= capacity);
 
@@ -405,7 +603,7 @@ impl KeylessIndex {
 	}
 
 	/// Sizes the table so `additional` more keys fit without a rehash.
-	pub fn reserve<P>(&mut self, slots: &[ArenaSlot<P>], additional: usize) {
+	pub fn reserve<P>(&mut self, slots: &SlotSlab<P>, additional: usize) {
 		let wanted = (self.live + additional)
 			.saturating_mul(2)
 			.max(MIN_BUCKETS)
@@ -422,5 +620,386 @@ impl KeylessIndex {
 	pub fn clear(&mut self) {
 		self.buckets.fill(NIL);
 		self.live = 0;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::worker::policy::policy_stack::{Tier, arena_queue_set::NodePayload};
+
+	type Node = ArenaSlot<NodePayload>;
+
+	/// The node every hybrid stack carries, made distinct per id so a read
+	/// from the wrong id cannot pass for the right one.
+	fn node(i: usize) -> Node {
+		ArenaSlot {
+			key: (i as u64).wrapping_mul(GOLDEN),
+			prev: i as u32,
+			next: !(i as u32),
+			payload: NodePayload {
+				size: i as u32,
+				freq: 0,
+				ts: 0,
+				queue: 0,
+				tier: Some(Tier::Fast),
+				phys: Some(Tier::Fast),
+				dram_resident: 0,
+			},
+		}
+	}
+
+	fn slot24(i: usize) -> ArenaSlot<u64> {
+		ArenaSlot { key: i as u64, prev: NIL, next: NIL, payload: i as u64 }
+	}
+
+	// -------------------------------------------------------------------
+	// Shape
+	// -------------------------------------------------------------------
+
+	/// A chunk is the largest power of two of the element that fits in
+	/// 128 KiB, and for every element this crate puts in a slab it is a whole
+	/// jemalloc size class, so the chunk costs exactly what it holds.
+	#[test]
+	fn a_chunk_is_128_kib_of_the_node_and_a_whole_jemalloc_size_class() {
+		assert_eq!(core::mem::size_of::<Node>(), 32);
+		assert_eq!(SlotSlab::<NodePayload>::CHUNK, 4096, "4096 x 32 B = 128 KiB");
+		assert_eq!(SlotSlab::<()>::CHUNK, 8192, "the 16-byte ghost slot: 8192 x 16 B = 128 KiB");
+		assert_eq!(SlotSlab::<u64>::CHUNK, 4096, "a 24-byte slot: 4096 x 24 B = 96 KiB");
+
+		for (what, bytes) in [
+			("the 32-byte node", SlotSlab::<NodePayload>::CHUNK * core::mem::size_of::<Node>()),
+			("the 16-byte ghost slot", SlotSlab::<()>::CHUNK * core::mem::size_of::<ArenaSlot<()>>()),
+			("a 24-byte slot", SlotSlab::<u64>::CHUNK * core::mem::size_of::<ArenaSlot<u64>>()),
+		] {
+			assert!(
+				bytes <= SLAB_CHUNK_BYTES && bytes * 2 > SLAB_CHUNK_BYTES,
+				"{what}: a {bytes}-byte chunk is not the largest power of two under 128 KiB",
+			);
+
+			// SAFETY: a pure size-class computation on a non-zero size.
+			let class = unsafe { tikv_jemalloc_sys::nallocx(bytes, 0) };
+			assert_eq!(class, bytes, "{what}: jemalloc rounds a {bytes}-byte chunk to {class}");
+		}
+
+		assert_eq!(SlotSlab::<NodePayload>::CHUNK * core::mem::size_of::<Node>(), SLAB_CHUNK_BYTES);
+	}
+
+	// -------------------------------------------------------------------
+	// Behaviour: what the `Vec` did, kept (these pass on the `Vec` too)
+	// -------------------------------------------------------------------
+
+	/// Ids are the push order, across every chunk boundary, and a write
+	/// through an id lands on that id and nowhere else.
+	#[test]
+	fn every_id_reads_back_what_was_pushed_across_chunk_boundaries() {
+		let chunk = SlotSlab::<NodePayload>::CHUNK;
+		let n = 3 * chunk + 5;
+		let mut slab = SlotSlab::<NodePayload>::new();
+
+		for i in 0..n {
+			assert_eq!(slab.len(), i, "len before push {i}");
+			slab.push(node(i));
+		}
+
+		assert_eq!(slab.len(), n);
+
+		for i in 0..n {
+			let want = node(i);
+			let got = slab[i];
+			assert_eq!(
+				(got.key, got.prev, got.next, got.payload),
+				(want.key, want.prev, want.next, want.payload),
+				"id {i} read back something else",
+			);
+		}
+
+		let written = [0, chunk - 1, chunk, 2 * chunk + 1, n - 1];
+		for &i in &written {
+			slab[i].payload.freq = 7;
+		}
+
+		for i in 0..n {
+			let want = if written.contains(&i) { 7 } else { 0 };
+			assert_eq!(slab[i].payload.freq, want, "a write through an id landed at {i}");
+		}
+	}
+
+	/// An id at or past `len` panics, as it did past the `Vec`'s length --
+	/// inside a committed chunk as well, and after a clear, when every chunk
+	/// is still committed. A `Vec` semantic, so this passes on the `Vec` too.
+	#[test]
+	fn an_id_at_or_past_len_panics_even_inside_a_committed_chunk() {
+		let mut slab = SlotSlab::<u64>::new();
+		for i in 0..10 {
+			slab.push(slot24(i));
+		}
+
+		assert!(slab.capacity() > 10, "id 10 must be inside the committed capacity");
+		assert_eq!(slab[9].payload, 9);
+
+		let past = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slab[10].payload));
+		assert!(past.is_err(), "id 10 of a 10-slot slab read {past:?}");
+
+		slab.clear();
+
+		let cleared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slab[0].payload));
+		assert!(cleared.is_err(), "id 0 of a cleared slab read {cleared:?}");
+	}
+
+	/// `clear` keeps the chunks, as `Vec::clear` kept the capacity, and the
+	/// refill takes the same ids from 0 again. A `Vec` semantic, so this passes
+	/// on the `Vec` too.
+	#[test]
+	fn clear_keeps_the_chunks_as_vec_clear_kept_its_capacity() {
+		let chunk = SlotSlab::<NodePayload>::CHUNK;
+		let n = 2 * chunk + 3;
+		let mut slab = SlotSlab::<NodePayload>::new();
+
+		for i in 0..n {
+			slab.push(node(i));
+		}
+
+		let capacity = slab.capacity();
+
+		slab.clear();
+		assert_eq!(slab.len(), 0);
+		assert_eq!(slab.capacity(), capacity, "clear gave chunks back");
+
+		for i in 0..n {
+			slab.push(node(i + 1_000_000));
+		}
+
+		assert_eq!(slab.len(), n);
+		assert_eq!(slab.capacity(), capacity, "the refill committed chunks the slab already had");
+
+		for i in 0..n {
+			assert_eq!(slab[i].key, node(i + 1_000_000).key, "id {i} after the refill");
+		}
+	}
+
+	// -------------------------------------------------------------------
+	// Growth: what the `Vec` did not do
+	// -------------------------------------------------------------------
+
+	/// Growth appends ONE chunk, when the committed ones are full and not
+	/// before, and never moves a slot: a chunk's address holds for the slab's
+	/// life. A doubling `Vec` fails both, the capacity by the doubling and the
+	/// addresses whenever its reallocation moves.
+	#[test]
+	fn growth_appends_one_chunk_and_moves_no_slot() {
+		let chunk = SlotSlab::<NodePayload>::CHUNK;
+		let mut slab = SlotSlab::<NodePayload>::new();
+		assert_eq!(slab.capacity(), 0, "an empty slab commits nothing");
+
+		let mut firsts: Vec<(usize, *const Node)> = Vec::new();
+
+		for i in 0..8 * chunk + 1 {
+			slab.push(node(i));
+
+			assert_eq!(
+				slab.capacity(),
+				(i + 1).div_ceil(chunk) * chunk,
+				"{} slots are in {} whole chunks and no more",
+				i + 1,
+				(i + 1).div_ceil(chunk),
+			);
+
+			if i % chunk == 0 {
+				firsts.push((i, &slab[i] as *const Node));
+			}
+		}
+
+		assert_eq!(firsts.len(), 9);
+
+		for (i, at) in firsts {
+			assert!(core::ptr::eq(at, &slab[i]), "slot {i} moved when the slab grew");
+			assert_eq!(slab[i].key, node(i).key);
+		}
+	}
+
+	/// `reserve` commits whole chunks, enough for `len + additional`, and
+	/// nothing when they already fit.
+	#[test]
+	fn reserve_commits_whole_chunks_and_no_more() {
+		let chunk = SlotSlab::<NodePayload>::CHUNK;
+		let mut slab = SlotSlab::<NodePayload>::new();
+
+		slab.reserve(0);
+		assert_eq!(slab.capacity(), 0);
+
+		slab.reserve(1);
+		assert_eq!(slab.capacity(), chunk);
+
+		slab.reserve(chunk);
+		assert_eq!(slab.capacity(), chunk, "{chunk} more fit in the one chunk");
+
+		slab.reserve(chunk + 1);
+		assert_eq!(slab.capacity(), 2 * chunk);
+
+		for i in 0..5 {
+			slab.push(node(i));
+		}
+
+		slab.reserve(2 * chunk - 5);
+		assert_eq!(slab.capacity(), 2 * chunk, "5 + {} fit in two chunks", 2 * chunk - 5);
+
+		slab.reserve(2 * chunk - 4);
+		assert_eq!(slab.capacity(), 3 * chunk);
+		assert_eq!(slab.len(), 5, "reserve pushed nothing");
+	}
+
+	// -------------------------------------------------------------------
+	// What the allocator sees
+	// -------------------------------------------------------------------
+
+	/// This thread's cumulative jemalloc counter `name`, in usable
+	/// (size-class) bytes: `thread.allocated` or `thread.deallocated`.
+	///
+	/// Per thread rather than `stats.allocated`, for the reason
+	/// `object::overhead`'s allocator test gives: the process-wide figure
+	/// takes in the allocations and frees of every test running beside this
+	/// one, and per-thread counters make the delta exact without
+	/// `--test-threads=1`. They count the same usable bytes.
+	fn thread_counter(name: &core::ffi::CStr) -> u64 {
+		// SAFETY: reads one u64 statistic into a u64 of the size passed.
+		unsafe {
+			let mut v: u64 = 0;
+			let mut len = core::mem::size_of::<u64>();
+
+			let rc = tikv_jemalloc_sys::mallctl(
+				name.as_ptr(),
+				&mut v as *mut u64 as *mut core::ffi::c_void,
+				&mut len,
+				core::ptr::null_mut(),
+				0,
+			);
+
+			assert_eq!(rc, 0, "{name:?} unavailable");
+			v
+		}
+	}
+
+	/// (allocated, deallocated) on this thread so far.
+	fn counters() -> (u64, u64) {
+		(thread_counter(c"thread.allocated"), thread_counter(c"thread.deallocated"))
+	}
+
+	/// What jemalloc hands out for a request of `bytes`.
+	fn class(bytes: usize) -> u64 {
+		match bytes {
+			0 => 0,
+			// SAFETY: a pure size-class computation on a non-zero size.
+			n => unsafe { tikv_jemalloc_sys::nallocx(n, 0) as u64 },
+		}
+	}
+
+	/// Pushing `n` slots into an empty slab allocates `ceil(n / CHUNK)`
+	/// chunks of exactly 128 KiB and the table that holds them, and nothing
+	/// else. A doubling `Vec` allocates its power-of-two capacity instead:
+	/// 1 MiB for 16,385 nodes where this is five chunks, 640 KiB.
+	#[test]
+	fn pushing_n_slots_allocates_n_over_chunk_rounded_up_chunks() {
+		let chunk = SlotSlab::<NodePayload>::CHUNK;
+		let chunk_bytes = (chunk * core::mem::size_of::<Node>()) as u64;
+
+		for n in [1, chunk - 1, chunk, chunk + 1, 3 * chunk, 4 * chunk + 1, 6 * chunk + 17] {
+			let (a0, d0) = counters();
+
+			let mut slab = SlotSlab::<NodePayload>::new();
+			for i in 0..n {
+				slab.push(node(i));
+			}
+
+			let (a1, d1) = counters();
+			let live = (a1 - a0) - (d1 - d0);
+
+			let chunks = n.div_ceil(chunk) as u64;
+			let table = class(slab.table_bytes());
+
+			assert_eq!(
+				live,
+				chunks * chunk_bytes + table,
+				"{n} slots left {live} bytes allocated: want {chunks} chunks of {chunk_bytes} \
+				 bytes and a {table}-byte chunk table",
+			);
+
+			drop(slab);
+		}
+	}
+
+	/// One growth step -- a push into a slab whose chunks are all full --
+	/// allocates one chunk and frees nothing but the chunk table's old buffer
+	/// when the table itself grows, so no slot is copied. Taken at four full
+	/// chunks, 2^14 slots, where a doubling `Vec` doubles: it allocates 1 MiB
+	/// there and frees the 512 KiB it copied out of. And at six, where the
+	/// table does not grow.
+	#[test]
+	fn one_growth_step_allocates_one_chunk_and_frees_nothing() {
+		let chunk = SlotSlab::<NodePayload>::CHUNK;
+		let chunk_bytes = (chunk * core::mem::size_of::<Node>()) as u64;
+
+		for full in [4usize, 6] {
+			let mut slab = SlotSlab::<NodePayload>::new();
+			for i in 0..full * chunk {
+				slab.push(node(i));
+			}
+
+			let table_before = class(slab.table_bytes());
+			let (a0, d0) = counters();
+
+			slab.push(node(full * chunk));
+
+			let (a1, d1) = counters();
+			let table_after = class(slab.table_bytes());
+
+			let (table_new, table_old) = match table_after == table_before {
+				true => (0, 0),
+				false => (table_after, table_before),
+			};
+
+			assert_eq!(
+				d1 - d0,
+				table_old,
+				"the step past {full} full chunks freed {} bytes: slots were copied",
+				d1 - d0,
+			);
+			assert_eq!(
+				a1 - a0,
+				chunk_bytes + table_new,
+				"the step past {full} full chunks allocated {} bytes, not one {chunk_bytes}-byte \
+				 chunk (and a {table_new}-byte table)",
+				a1 - a0,
+			);
+			assert_eq!(slab.capacity(), (full + 1) * chunk);
+		}
+	}
+
+	/// A cleared slab refills to its old length without allocating or
+	/// freeing a byte, as a cleared `Vec` did, because it kept its chunks.
+	#[test]
+	fn a_cleared_slab_refills_to_its_old_length_without_allocating() {
+		let chunk = SlotSlab::<NodePayload>::CHUNK;
+		let n = 3 * chunk + 1;
+		let mut slab = SlotSlab::<NodePayload>::new();
+
+		for i in 0..n {
+			slab.push(node(i));
+		}
+
+		slab.clear();
+
+		let (a0, d0) = counters();
+		for i in 0..n {
+			slab.push(node(i));
+		}
+		let (a1, d1) = counters();
+
+		assert_eq!(
+			(a1 - a0, d1 - d0),
+			(0, 0),
+			"refilling a cleared slab allocated and freed bytes",
+		);
+		assert_eq!(slab.len(), n);
 	}
 }

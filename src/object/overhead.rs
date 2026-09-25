@@ -676,6 +676,21 @@ pub fn get_ttl_overhead() -> ObjectSize {
 /// residue above 40 is a fixed intercept, not a per-object term, which is why
 /// it shrinks with n.
 ///
+/// Forty is the 2^k figure, and chunking the slab (`arena_index::ChunkedSlab`)
+/// left it where it was: 2^k slots are whole 4096-slot chunks, exactly as full
+/// as the doubling `Vec` was there. Off 2^k the two differ. DERIVED from the
+/// growth rules, not measured:
+///
+/// - The node term is 32 B/object at every population, plus at most one
+///   partly filled 128 KiB chunk and 24 B of chunk table per chunk.
+/// - Only the index swings, 8-16 B/object.
+///
+/// So the stack costs 40-48 B/object across a growth cycle, where the doubling
+/// slab made it 40-80. The split design under `thin_header` is this stack, the
+/// map row and the 16 B header. The row is 40 B/object at 2^k and 23-46 across
+/// its 7/16..7/8 load. Together that is ~80-104 B/object, against the 96
+/// charged; it was ~85-136.
+///
 /// `lfu-compact-hybrid` was the control in THAT run and did not move, because
 /// it had not been converted. It has been converted since. `CompactQueueSet`
 /// could not hold it -- LFU needs one ordered bucket per DISTINCT FREQUENCY,

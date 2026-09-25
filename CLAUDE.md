@@ -160,6 +160,12 @@ src/
                                  tier_of for every design but the lazy-copy LRU
                                  (physical_tier_of), the slot's tier in the merged store,
                                  None for flat stacks -- the table is on the trait.
+                                 The hybrid stacks' nodes live in `arena_index::ChunkedSlab`,
+                                 the merged store's chunked slab made generic: 128 KiB
+                                 chunks (4096 of the 32-byte node), grown by appending one,
+                                 so nothing is copied and no slot id moves. Their keyless
+                                 index still doubles. Charged 40 B/object (the 2^k figure);
+                                 40-48 across a growth cycle, derived (overhead.rs, LRU).
       mini_stack/               Lightweight per-policy stacks for PaperCache's "auto" mode.
       trace/                    Access-trace recording/replay, replayed to rebuild a different
                                  policy's stack after a live switch. Only spawned when more than

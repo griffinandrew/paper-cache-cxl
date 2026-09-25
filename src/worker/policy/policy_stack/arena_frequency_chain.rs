@@ -95,9 +95,8 @@ use crate::{
 			ArenaSlot,
 			KeylessIndex,
 			NIL,
-			SlotVec,
+			SlotSlab,
 			U32Vec,
-			new_slot_vec,
 			new_u32_vec,
 		},
 		arena_queue_set::NodePayload,
@@ -129,7 +128,7 @@ fn new_bucket_maps() -> (BucketMap, BucketMap) {
 /// Frequency-ordered buckets per tier, plus a recency-ordered list, over one
 /// arena slab addressed by one keyless index.
 pub struct ArenaFrequencyChain {
-	slots: SlotVec<NodePayload>,
+	slots: SlotSlab<NodePayload>,
 
 	/// Bare slot numbers, verified against the slot's own key. This is the
 	/// whole of the saving over `CompactFrequencyChain`; see
@@ -174,7 +173,7 @@ impl Default for ArenaFrequencyChain {
 		let (fast_buckets, slow_buckets) = new_bucket_maps();
 
 		ArenaFrequencyChain {
-			slots: new_slot_vec(),
+			slots: SlotSlab::new(),
 			index: KeylessIndex::default(),
 			free: new_u32_vec(),
 			fast_buckets,
@@ -210,11 +209,11 @@ fn node(size: ObjectSize, freq: u32, dram_resident: u8, tier: Tier) -> NodePaylo
 }
 
 impl ArenaFrequencyChain {
-	/// Slab slots currently allocated. Exposed so a test can assert that
-	/// construction does NOT allocate from the cache budget: these stacks grow
-	/// dynamically, and an eager reservation sized from capacity was removed
-	/// because it reserved far more than the eval workload can hold while still
-	/// not preventing doubling on the real traces.
+	/// Slab slots the committed chunks hold (a chunk is committed whole).
+	/// Exposed so a test can assert that construction does NOT allocate from
+	/// the cache budget: these stacks grow dynamically, and an eager
+	/// reservation sized from capacity was removed because it reserved far
+	/// more than the eval workload can hold.
 	pub fn slab_capacity(&self) -> usize {
 		self.slots.capacity()
 	}
@@ -225,14 +224,16 @@ impl ArenaFrequencyChain {
 		self.index.capacity()
 	}
 
-	/// Pre-sizes the slab and the index for `objects` entries.
+	/// Pre-sizes the slab (whole chunks) and the index for `objects` entries.
 	///
-	/// The slab is a `Vec`, so growth is never in place: every doubling
-	/// reallocates and COPIES every entry. At eval-trace scale that is one
-	/// multi-hundred-millisecond stall on the policy worker -- measured at
-	/// 827 ms -- and it would never have surfaced as a regression, because the
-	/// policy stack runs behind an unbounded channel on its own thread and the
-	/// client latency columns structurally cannot observe it.
+	/// The slab's own growth copies nothing: it appends a chunk. The index
+	/// still doubles, and each doubling rehashes every entry on the policy
+	/// worker, where the client latency columns structurally cannot observe
+	/// it. While the slab was a `Vec`, every doubling reallocated and COPIED
+	/// every entry as well: one multi-hundred-millisecond stall at eval-trace
+	/// scale, measured at 827 ms, that would never have surfaced as a
+	/// regression, because the policy stack runs behind an unbounded channel on
+	/// its own thread.
 	///
 	/// Reserving costs no resident memory: the pages are not touched until
 	/// entries occupy them.
@@ -374,6 +375,8 @@ impl ArenaFrequencyChain {
 	}
 
 	pub fn clear(&mut self) {
+		// The slab keeps its chunks and the index its buckets, as the `Vec` and
+		// the table they replaced kept their capacity.
 		self.slots.clear();
 		self.index.clear();
 		self.free.clear();
@@ -783,6 +786,41 @@ mod tests {
 			"a hundred inserts after a hundred removes must reuse the slab",
 		);
 		assert_eq!(c.len(), 100);
+	}
+
+	/// The chain's slab is the chunked one, shared by both faces. It grows by
+	/// whole chunks where the doubling `Vec` jumped to the next power of two,
+	/// keeps them through `clear` as the `Vec` kept its capacity, and a refill
+	/// through the recency face reuses them.
+	#[test]
+	fn the_slab_grows_a_chunk_at_a_time_and_keeps_its_chunks_through_a_clear() {
+		use crate::worker::policy::policy_stack::arena_index::SlotSlab;
+
+		let chunk = SlotSlab::<NodePayload>::CHUNK;
+		let n = 4 * chunk as u64 + 1;
+		let mut c = ArenaFrequencyChain::default();
+		assert_eq!(c.slab_capacity(), 0, "construction committed a chunk");
+
+		for key in 0..n {
+			c.insert(key, 100, 0, Tier::Fast);
+		}
+		assert_eq!(c.slab_capacity(), 5 * chunk, "{n} slots are five whole chunks");
+
+		c.clear();
+		assert_eq!(c.slab_capacity(), 5 * chunk, "clear gave chunks back");
+
+		for key in n..2 * n {
+			c.recency_push_front(key, 100, 0, 3);
+		}
+		assert_eq!(c.slab_capacity(), 5 * chunk, "the refill committed chunks the chain had");
+		assert_eq!((c.len(), c.fast_len()), (n as usize, n as usize));
+
+		for key in 0..n {
+			assert!(!c.contains(key), "key {key} survived the clear");
+		}
+		for key in n..2 * n {
+			assert_eq!(c.get(key).map(|p| p.freq), Some(3), "key {key}");
+		}
 	}
 
 	#[test]
