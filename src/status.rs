@@ -283,6 +283,13 @@ pub struct AtomicStatus {
 	/// kick land without depending on what the pass did.
 	#[cfg(test)]
 	policy_worker_passes: AtomicU64,
+
+	/// S5: the admission state -- the configuration, the figures the policy
+	/// worker publishes for a set's decisions (eff, the key ceiling), the
+	/// metadata lane, the worker's idle and liveness bits, and the counters.
+	/// See `crate::gate`.
+	#[cfg(feature = "hybrid_cache_common")]
+	gate: crate::gate::Gate,
 }
 
 /// This struct holds the basic statistical information about `PaperCache`.
@@ -482,6 +489,9 @@ impl AtomicStatus {
 
 			#[cfg(test)]
 			policy_worker_passes: AtomicU64::default(),
+
+			#[cfg(feature = "hybrid_cache_common")]
+			gate: crate::gate::Gate::default(),
 		};
 
 		Ok(status)
@@ -512,10 +522,11 @@ impl AtomicStatus {
 	/// worker already parked on the long poll when the burst begins sleeps out
 	/// up to `LONG_POLLING_DURATION` before that pass runs -- as does a new
 	/// cache's worker, whose first pass normally sees no set and parks long.
-	/// Only a set-path kick closes that window (S5's gate, with a worker-idle
-	/// bit). Until then a merged store's values published in that window stay
-	/// unlinked -- uncharged and unevictable -- until the worker wakes, as a
-	/// DashMap stack's are untracked.
+	/// The set-path kick closes that window (S5, `PaperCache::commit`'s
+	/// `kick_idle_worker` with the gate's `worker_idle` bit): a merged store's
+	/// values published while the worker is parked were unlinked -- uncharged
+	/// and unevictable -- until it woke, as a DashMap stack's are untracked,
+	/// and the first set after an idle spell now wakes it.
 	pub(crate) fn kick_policy_worker(&self) {
 		if let Some(worker) = self.policy_worker.lock().as_ref() {
 			worker.unpark();
@@ -605,8 +616,11 @@ impl AtomicStatus {
 		signed_or_zero(self.num_objects.load(Ordering::Acquire))
 	}
 
-	pub fn incr_num_objects(&self) {
-		self.num_objects.fetch_add(1, Ordering::AcqRel);
+	/// Counts one new object and returns the count BEFORE it, clamped at zero
+	/// as `live_num_objects` reads it -- what a set's metadata-cap flag is
+	/// decided from (`gate::Gate::note_count`), at no extra load.
+	pub fn incr_num_objects(&self) -> u64 {
+		signed_or_zero(self.num_objects.fetch_add(1, Ordering::AcqRel))
 	}
 
 	pub fn add_num_objects(&self, count: u64) {
@@ -707,34 +721,47 @@ impl AtomicStatus {
 		self.fast_tier_capacity().saturating_add(self.hybrid_large_fast_capacity())
 	}
 
-	/// The fast tier's budget for VALUE bytes, `F - L * omega`, saturating at
-	/// zero: the whole budget (`whole_fast_tier_capacity`) less the
-	/// per-object reservation `omega` for each of the `L` live objects, which
-	/// every design charges to DRAM whichever tier an object's value is in.
-	///
-	/// Meant to be THE helper for this figure. Each stack's settle still
-	/// computes its own (`fast_capacity - reserved_overhead()`, over the
-	/// stack's own object count); S5 rewires the settles onto this function
-	/// with the gate. Until then only the instrumentation reads it --
-	/// `HybridStats::effective_fast_capacity` and the MEMTS line -- and
-	/// nothing decides anything on it.
-	///
-	/// `L` is the object map's count (`live_num_objects`), which leads the
-	/// stack's by whatever the worker has not taken yet.
-	///
-	/// Not every stack reserves only `L * omega`. Seven designs'
-	/// `reserved_overhead` also counts their ghost's DRAM -- the two faithful
-	/// S3-FIFO designs that keep a ghost (not the reprieve ones), the four
-	/// S3-FIFO ghost designs and 2Q-ghost -- which this figure does not, so
-	/// there it exceeds the value budget the stack's own settle leaves by the
-	/// ghost's bytes (T9 sees up to 112 B at its size). Rewiring those settles
-	/// onto this function (S5) has to decide which figure is right first.
+	/// eff, THE figure (S5): the fast tier's budget for VALUE bytes, `F -
+	/// M_model`, saturating, as the policy worker last published it
+	/// (`PolicyWorker::publish_gate`) -- what the stacks' settles, the
+	/// structural check and the metadata cap all read. `M_model` is the
+	/// cache's measured DRAM metadata (`dram_metadata_bytes`) or, under the
+	/// per-object model, the stack's own reservation (`L * omega`, plus a
+	/// ghost's DRAM), per `gate::MetadataModel`. One load.
 	#[cfg(feature = "hybrid_cache_common")]
 	#[must_use]
 	pub fn effective_fast_capacity(&self) -> CacheSize {
+		self.gate.eff()
+	}
+
+	/// The per-object model's figure from the status alone, `F - L * omega`,
+	/// saturating: what `effective_fast_capacity` was until S5 (S2's), with
+	/// `L` the object map's count. Kept as the model's sanity reading -- the
+	/// policy worker compares the measured M with `L * omega` -- and for its
+	/// unit test; nothing decides on it.
+	#[cfg(feature = "hybrid_cache_common")]
+	#[must_use]
+	pub fn per_object_effective_fast_capacity(&self) -> CacheSize {
 		let reserved = self.live_num_objects().saturating_mul(self.hybrid_shared_overhead());
 
 		self.whole_fast_tier_capacity().saturating_sub(reserved)
+	}
+
+	/// The admission state (S5, `crate::gate`).
+	#[cfg(feature = "hybrid_cache_common")]
+	pub(crate) fn gate(&self) -> &crate::gate::Gate {
+		&self.gate
+	}
+
+	/// Test builds: pins a status no constructor configured -- a hand-driven
+	/// harness's -- to the per-object metadata model its tests were written
+	/// against (S5). A cache built through a constructor gets its
+	/// `GateConfig` from it instead.
+	#[cfg(all(test, feature = "hybrid_cache_common"))]
+	pub(crate) fn pin_per_object(&self) {
+		let mut config = self.gate.config();
+		config.metadata_model = crate::gate::MetadataModel::PerObject;
+		self.gate.set_config(config);
 	}
 
 	/// M, the bytes this cache's own DRAM metadata structures hold, in
@@ -876,6 +903,8 @@ impl AtomicStatus {
 			reconcile_get_heal_skipped,
 		) = crate::worker::reconciled();
 
+		let gate = self.gate.stats();
+
 		HybridStats {
 			promotions: self.hybrid_promotions.load(Ordering::Relaxed),
 			demotions: self.hybrid_demotions.load(Ordering::Relaxed),
@@ -895,7 +924,7 @@ impl AtomicStatus {
 			large_slow_objects: self.hybrid_large_slow_objects.load(Ordering::Relaxed),
 			phys_fast_bytes: crate::phys::fast_bytes(),
 			phys_fast_bytes_max: crate::phys::fast_bytes_max(),
-			effective_fast_capacity: self.effective_fast_capacity(),
+			effective_fast_capacity: gate.eff,
 			over_budget_byte_seconds: self.hybrid_over_budget_byte_seconds.load(Ordering::Relaxed),
 			fast_hits: self.hybrid_fast_hits.load(Ordering::Relaxed),
 			slow_hits: self.hybrid_slow_hits.load(Ordering::Relaxed),
@@ -911,6 +940,18 @@ impl AtomicStatus {
 			reconcile_get_heal_skipped,
 			reconcile_applied_to_fast: self.hybrid_reconcile_applied_to_fast.load(Ordering::Relaxed),
 			reconcile_applied_to_slow: self.hybrid_reconcile_applied_to_slow.load(Ordering::Relaxed),
+			metadata_model: gate.model,
+			dram_metadata_bytes_model: gate.m_model,
+			metadata_key_ceiling: gate.k_max,
+			metadata_bound: gate.eff == 0,
+			metadata_overflows: gate.metadata_overflows,
+			make_room_requests: gate.make_room_requests,
+			make_room_evictions: gate.make_room_evictions,
+			make_room_failures: gate.make_room_failures,
+			structural_slow_sets: gate.structural_slow_sets,
+			structural_placements: gate.structural_placements,
+			idle_kicks: gate.idle_kicks,
+			metadata_model_divergence: gate.metadata_model_divergence,
 		}
 	}
 
@@ -1170,6 +1211,12 @@ impl AtomicStatus {
 		// latch right after; `wipe()` returns only then.
 		#[cfg(feature = "hybrid_cache_common")]
 		self.hybrid_admission_latched.store(false, Ordering::Relaxed);
+
+		// The admission counters, with the others. The gate's live state -- its
+		// configuration, the metadata lane and its waiters, the published
+		// figures, the worker's bits -- is not a counter and survives (S5).
+		#[cfg(feature = "hybrid_cache_common")]
+		self.gate.reset_counters();
 	}
 
 	pub fn try_to_status(&self) -> Result<Status, CacheError> {
@@ -1378,22 +1425,25 @@ mod tests {
 		).expect("Could not initialize atomic status");
 
 		status.set_fast_tier_capacity(10_000);
-		assert_eq!(status.effective_fast_capacity(), 10_000, "nothing live, nothing reserved");
+		assert_eq!(status.per_object_effective_fast_capacity(), 10_000, "nothing live, nothing reserved");
 
 		status.register_tiered_cache(100);
 		status.register_tiered_cache(7);
 		assert_eq!(status.hybrid_shared_overhead(), 100, "the first registration stands");
 
 		status.add_num_objects(30);
-		assert_eq!(status.effective_fast_capacity(), 10_000 - 30 * 100);
+		assert_eq!(status.per_object_effective_fast_capacity(), 10_000 - 30 * 100);
 
 		// The size-split design's large segment is part of F.
 		status.set_hybrid_large_fast_capacity(500);
-		assert_eq!(status.effective_fast_capacity(), 10_500 - 3_000);
+		assert_eq!(status.per_object_effective_fast_capacity(), 10_500 - 3_000);
 
 		// Saturating: a reservation past the budget leaves nothing, not a wrap.
 		status.add_num_objects(100);
-		assert_eq!(status.effective_fast_capacity(), 0);
-		assert_eq!(status.hybrid_stats().effective_fast_capacity, 0);
+		assert_eq!(status.per_object_effective_fast_capacity(), 0);
+
+		// S5: the exported figure is the one the policy worker publishes, and no
+		// worker has published to this status.
+		assert_eq!(status.hybrid_stats().effective_fast_capacity, status.effective_fast_capacity());
 	}
 }

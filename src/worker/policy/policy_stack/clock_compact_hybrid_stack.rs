@@ -58,7 +58,8 @@ use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
 		arena_queue_set::{ArenaQueueSet, NodePayload}, clock_hand_budget, narrow_resident,
-		drain_target, CacheSize, HashedKey, PolicyStack, Tier,
+		drain_target, CacheSize, HashedKey, PolicyStack, Tier, Placement, SetEvent,
+		fast_at_or_before, placed, prev_fast,
 	},
 	PaperPolicy,
 };
@@ -89,6 +90,11 @@ pub struct ClockCompactHybridStack {
 	fast_boundary: Option<HashedKey>,
 
 	migrations: Vec<(HashedKey, Tier)>,
+
+	/// S5: the measured M the policy worker pushed (`set_dram_metadata`),
+	/// reserved instead of `len x shared_overhead`; `None` under the
+	/// per-object model.
+	measured: Option<CacheSize>,
 }
 
 impl ClockCompactHybridStack {
@@ -102,6 +108,7 @@ impl ClockCompactHybridStack {
 			fast_count: 0,
 			fast_boundary: None,
 			migrations: Vec::new(),
+			measured: None,
 		}
 	}
 
@@ -121,7 +128,117 @@ impl ClockCompactHybridStack {
 	/// DRAM. See `PolicyStack::dram_reserved_bytes` for the rule, and for why
 	/// a reservation at or over `fast_capacity` is left to saturate.
 	fn reserved_overhead(&self) -> CacheSize {
-		self.list.len() as CacheSize * self.shared_overhead
+		self.measured.unwrap_or(self.list.len() as CacheSize * self.shared_overhead)
+	}
+
+	/// This stack's eff (S5): the whole fast tier's budget for values, its
+	/// settle's figure before the drain target.
+	fn own_eff(&self) -> CacheSize {
+		self.fast_capacity.saturating_sub(self.reserved_overhead())
+	}
+
+	/// Whether a value of `migrating` bytes is STRUCTURAL (S5): larger than an
+	/// empty fast tier. Such a key is placed slow and never promoted while it
+	/// stays that large. The stack's own check beside the client's flag, so a
+	/// key the client placed normally just before eff moved is placed as the
+	/// stack's own promotions would place it.
+	fn structural(&self, migrating: CacheSize) -> bool {
+		migrating > self.own_eff()
+	}
+
+	/// Takes a FAST key out of the fast set IN PLACE (S5): an overwrite with a
+	/// value larger than an empty fast tier -- CLOCK, like FIFO, keeps an
+	/// overwritten key where it is. Pushed `(key, Slow)`: its placement
+	/// changed.
+	fn demote_in_place(&mut self, key: HashedKey) {
+		let Some(payload) = self.list.payload(key) else { return };
+		let size = payload.migrating();
+
+		if self.fast_boundary == Some(key) {
+			self.fast_boundary = prev_fast(&self.list, key);
+		}
+
+		if let Some(slot) = self.list.payload_mut(key) {
+			slot.tier = Some(Tier::Slow);
+		}
+
+		self.fast_used = self.fast_used.saturating_sub(size);
+		self.fast_count = self.fast_count.saturating_sub(1);
+		self.slow_used += size;
+
+		self.migrations.push((key, Tier::Slow));
+	}
+
+	/// A `Set`, with the client's placement (S5). An existing key is resized in
+	/// place and NOT moved, and referenced; when the new value is STRUCTURAL
+	/// and the key fast, taken out of the fast set in place; re-settled only
+	/// if it was fast and resized, as before. A new key goes to the front,
+	/// unreferenced, fast -- or, when structural, slow, with nothing pushed or
+	/// settled. Returns the placement applied.
+	fn insert_with(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, placement: Placement) -> Placement {
+		let dram_resident = narrow_resident(dram_resident);
+		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+		let structural = placement == Placement::Structural || self.structural(migrating);
+
+		// An existing key is resized in place and NOT moved -- insertion order
+		// is the queue order -- but it IS referenced: `ClockCompactStack`'s
+		// `insert` forwards an existing key straight to `update`, so writing a
+		// key earns it a second chance exactly as reading it does. Re-settling
+		// only matters if the key is fast, since only then can the resize have
+		// pushed the fast tier over its budget.
+		if let Some(payload) = self.list.payload(key) {
+			let tier = payload.tier;
+			let resized = payload.size != size;
+
+			self.set_referenced(key, true);
+
+			if resized {
+				self.resize_key(key, size, dram_resident);
+			}
+
+			if structural && tier == Some(Tier::Fast) {
+				self.demote_in_place(key);
+			}
+
+			if resized && tier == Some(Tier::Fast) {
+				self.settle_fast_tier();
+			}
+
+			return placed(structural);
+		}
+
+		let tier = match structural {
+			true => Tier::Slow,
+			false => Tier::Fast,
+		};
+
+		self.list.push_front(Q_CLOCK, key, NodePayload {
+			size,
+			dram_resident,
+			tier: Some(tier),
+			phys: Some(tier),
+			// A brand-new key enters UNREFERENCED, so one pass of the hand can
+			// evict it. `push_front(Q, key, false)` in the flat stack.
+			freq: 0,
+			ts: 0,
+			queue: 0,
+		});
+
+		if structural {
+			self.slow_used += migrating;
+			return Placement::Structural;
+		}
+
+		self.fast_used += migrating;
+		self.fast_count += 1;
+
+		if self.fast_boundary.is_none() {
+			self.fast_boundary = Some(key);
+		}
+
+		self.settle_fast_tier();
+
+		Placement::Normal
 	}
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
@@ -174,15 +291,16 @@ impl ClockCompactHybridStack {
 	/// from every hit.
 	fn recycle_to_front(&mut self, key: HashedKey) {
 		let previous_tier = self.list.payload(key).and_then(|p| p.tier);
+		let structural = self.list.payload(key).is_some_and(|p| self.structural(p.migrating()));
 
 		let already_at_front = self.list.front(Q_CLOCK) == Some(key);
 		let is_boundary = self.fast_boundary == Some(key);
 
 		// Read the neighbour BEFORE moving: once the key is at the front its
 		// predecessor is gone, and the boundary has to step back to whatever
-		// was in front of it.
+		// fast key was in front of it.
 		let new_boundary_if_moved = if is_boundary && !already_at_front {
-			self.list.before(key)
+			prev_fast(&self.list, key)
 		} else {
 			None
 		};
@@ -191,6 +309,31 @@ impl ClockCompactHybridStack {
 
 		if is_boundary && !already_at_front {
 			self.fast_boundary = new_boundary_if_moved;
+		}
+
+		// S5: a STRUCTURAL key gets its second chance at the front with tier
+		// slow -- never promoted; a fast one leaves the fast set, pushed.
+		// `LruCompactHybridStack::touch_fast_key`'s rule.
+		if structural {
+			if previous_tier == Some(Tier::Fast) {
+				let size = self.list.payload(key).map(|p| p.migrating()).unwrap_or(0);
+				self.fast_used = self.fast_used.saturating_sub(size);
+				self.fast_count = self.fast_count.saturating_sub(1);
+				self.slow_used += size;
+
+				if let Some(slot) = self.list.payload_mut(key) {
+					slot.tier = Some(Tier::Slow);
+				}
+
+				if self.fast_boundary == Some(key) {
+					self.fast_boundary = None;
+				}
+
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			self.settle_fast_tier();
+			return;
 		}
 
 		let mut promoted = false;
@@ -207,10 +350,12 @@ impl ClockCompactHybridStack {
 			if let Some(slot) = self.list.payload_mut(key) {
 				slot.tier = Some(Tier::Fast);
 			}
+		}
 
-			if self.fast_boundary.is_none() {
-				self.fast_boundary = Some(key);
-			}
+		// The key is fast, at the front; with no fast key in front of it, it is
+		// the boundary.
+		if self.fast_boundary.is_none() {
+			self.fast_boundary = Some(key);
 		}
 
 		self.settle_fast_tier();
@@ -233,7 +378,7 @@ impl ClockCompactHybridStack {
 		while self.fast_used > target {
 			let Some(demote_key) = self.fast_boundary else { break };
 			let size = self.list.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
-			let new_boundary = self.list.before(demote_key);
+			let new_boundary = prev_fast(&self.list, demote_key);
 
 			if let Some(slot) = self.list.payload_mut(demote_key) {
 				slot.tier = Some(Tier::Slow);
@@ -267,49 +412,25 @@ impl PolicyStack for ClockCompactHybridStack {
 	}
 
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		let dram_resident = narrow_resident(dram_resident);
+		self.insert_with(key, size, dram_resident, Placement::Normal);
+	}
 
-		// An existing key is resized in place and NOT moved -- insertion order
-		// is the queue order -- but it IS referenced: `ClockCompactStack`'s
-		// `insert` forwards an existing key straight to `update`, so writing a
-		// key earns it a second chance exactly as reading it does. Re-settling
-		// only matters if the key is fast, since only then can the resize have
-		// pushed the fast tier over its budget.
-		if let Some(payload) = self.list.payload(key) {
-			let tier = payload.tier;
-			let resized = payload.size != size;
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		_event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_with(key, size, dram_resident, placement)
+	}
 
-			self.set_referenced(key, true);
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.measured = measured;
+	}
 
-			if resized {
-				self.resize_key(key, size, dram_resident);
-
-				if tier == Some(Tier::Fast) {
-					self.settle_fast_tier();
-				}
-			}
-
-			return;
-		}
-
-		self.list.push_front(Q_CLOCK, key, NodePayload {
-			size,
-			dram_resident,
-			tier: Some(Tier::Fast),
-			phys: Some(Tier::Fast),
-			// A brand-new key enters UNREFERENCED, so one pass of the hand can
-			// evict it. `push_front(Q, key, false)` in the flat stack.
-			freq: 0,
-			ts: 0,
-			queue: 0,
-		});
-		self.fast_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
-		self.fast_count += 1;
-
-		if self.fast_boundary.is_none() {
-			self.fast_boundary = Some(key);
-		}
-
+	fn resettle(&mut self) {
 		self.settle_fast_tier();
 	}
 
@@ -328,7 +449,7 @@ impl PolicyStack for ClockCompactHybridStack {
 		let tier = slot.tier;
 
 		let new_boundary_if_needed = if tier == Some(Tier::Fast) && self.fast_boundary == Some(key) {
-			self.list.before(key)
+			prev_fast(&self.list, key)
 		} else {
 			None
 		};
@@ -403,8 +524,10 @@ impl PolicyStack for ClockCompactHybridStack {
 					self.fast_used = self.fast_used.saturating_sub(size);
 					self.fast_count = self.fast_count.saturating_sub(1);
 
+					// The boundary was the tail: the nearest fast key from the
+					// new tail (S5: past any structural ones).
 					if self.fast_boundary == Some(key) {
-						self.fast_boundary = self.list.back(Q_CLOCK);
+						self.fast_boundary = fast_at_or_before(&self.list, self.list.back(Q_CLOCK));
 					}
 				},
 

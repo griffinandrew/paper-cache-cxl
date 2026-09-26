@@ -246,7 +246,7 @@ use crate::{
 	error::CacheError,
 	object::{Object, ObjectSize},
 	status::Cleared,
-	worker::{MigrationOrigin, SetEvent, TaggedMigration, Tier},
+	worker::{MigrationOrigin, Placement, SetEvent, TaggedMigration, Tier},
 	CacheSize, HashedKey, NoHasher, PaperPolicy,
 };
 
@@ -1240,12 +1240,13 @@ impl<K, V> Inner<K, V> {
 			true => self.freq_unlink(i, freq, tier),
 
 			// If the departing slot was the boundary, the new least-recently-
-			// used fast slot is the one in front of it. When the boundary was
-			// also the list tail -- every slot fast -- that is the new tail,
-			// which is the same answer.
+			// used fast slot is the nearest FAST one in front of it (S5: a
+			// structural slot keeps its place with tier slow, and the cursor
+			// steps over it). When the boundary was also the list tail -- every
+			// slot behind it gone -- that is the same walk from the new tail.
 			false => {
 				if self.fast_boundary == i {
-					self.fast_boundary = prev;
+					self.fast_boundary = self.fast_at_or_before(prev);
 				}
 			},
 		}
@@ -1340,6 +1341,91 @@ impl<K, V> Inner<K, V> {
 		self.free_slot(i);
 	}
 
+	/// The nearest slot at or before `start`, toward the list's front, whose
+	/// tier is FAST (`NIL` if none): the boundary's walk since S5. A structural
+	/// slot keeps its place in the order with tier slow, so the cursor -- the
+	/// least-recently-used fast slot -- steps over it; a DEAD slot keeps the
+	/// tier it had, as before. Amortized O(1) per structural slot: the cursor
+	/// only moves toward the front, and a slot it passed stays behind it until
+	/// a hit relinks it at the front. The DashMap stacks' `prev_fast`.
+	fn fast_at_or_before(&self, mut start: u32) -> u32 {
+		while start != NIL && self.slots[start as usize].tier != Tier::Fast {
+			start = self.slots[start as usize].prev;
+		}
+
+		start
+	}
+
+	/// Links slot `i` at the MRU end as a new STRUCTURAL key (S5): a value
+	/// larger than an empty fast tier, built slow and placed slow -- in its
+	/// place in the order, stamped `now`, unreferenced, charged to the slow
+	/// tier; never the boundary. The caller counts it in `linked`.
+	fn link_front_slow(&mut self, i: u32, now: u64) {
+		self.assert_folded();
+
+		{
+			let s = &mut self.slots[i as usize];
+			s.tier = Tier::Slow;
+			s.last_access = now;
+			s.referenced.store(0, Ordering::Relaxed);
+		}
+
+		self.link_front(i);
+
+		self.slow_used += self.slots[i as usize].migrating();
+	}
+
+	/// Takes a FAST slot out of the fast set in place (S5): an overwrite whose
+	/// value is larger than an empty fast tier under `Fifo` or `Clock` (the
+	/// orders that keep an overwritten key where it is). Its bytes move to
+	/// the slow total and the boundary steps off it. The caller queues
+	/// `(key, Slow)`: the key's placement changed.
+	fn demote_in_place(&mut self, i: u32) {
+		self.assert_folded();
+
+		let (migrating, prev) = {
+			let s = &self.slots[i as usize];
+			(s.migrating(), s.prev)
+		};
+
+		self.slots[i as usize].tier = Tier::Slow;
+		self.fast_used = self.fast_used.saturating_sub(migrating);
+		self.fast_count = self.fast_count.saturating_sub(1);
+		self.slow_used += migrating;
+
+		if self.fast_boundary == i {
+			self.fast_boundary = self.fast_at_or_before(prev);
+		}
+	}
+
+	/// `demote_in_place` under `Lfu` (S5): a fast slot overwritten with a value
+	/// larger than an empty fast tier moves to the slow bucket of its own
+	/// frequency, appended at its tail with a fresh stamp --
+	/// `ArenaFrequencyChain::set_tier`, as `demote_freq_min` does it. The
+	/// caller queues `(key, Slow)`.
+	fn demote_freq_in_place(&mut self, i: u32, now: u64) {
+		self.assert_folded();
+
+		let (freq, migrating) = {
+			let s = &self.slots[i as usize];
+			(s.freq, s.migrating())
+		};
+
+		self.freq_unlink(i, freq, Tier::Fast);
+
+		{
+			let s = &mut self.slots[i as usize];
+			s.tier = Tier::Slow;
+			s.last_access = now;
+		}
+
+		self.freq_link(i, freq, Tier::Slow);
+
+		self.fast_used = self.fast_used.saturating_sub(migrating);
+		self.fast_count = self.fast_count.saturating_sub(1);
+		self.slow_used += migrating;
+	}
+
 	/// Links slot `i` at the MRU end as a new FAST key: the DashMap stacks'
 	/// `push_front` of a new key under `Lru`, `Fifo` and `Clock` --
 	/// unreferenced, stamped `now`, charged its CURRENT object's bytes, and
@@ -1417,7 +1503,14 @@ impl<K, V> Inner<K, V> {
 	/// when the overwrite lands demotes the NEW one, and this entry, behind it
 	/// on the key's FIFO consumer, is what restores it. Pinned by
 	/// `merged_overwrite_tests::an_overwrite_is_repromoted_after_a_stale_demotion`.
-	fn touch_slot(&mut self, i: u32, now: u64) -> bool {
+	///
+	/// A STRUCTURAL slot (S5: its value larger than an empty fast tier) is
+	/// moved to the front all the same -- it keeps its place in the order --
+	/// but with tier slow: a slow one is not promoted, and a fast one (an
+	/// overwrite with a value too large, or an eff that shrank) leaves the fast
+	/// set, which the caller queues as `(key, Slow)`. `LruCompactHybridStack::
+	/// touch_fast_key`'s rule, move for move.
+	fn touch_slot(&mut self, i: u32, now: u64, structural: bool) -> Touched {
 		self.assert_folded();
 
 		let previous_tier = self.slots[i as usize].tier;
@@ -1426,9 +1519,9 @@ impl<K, V> Inner<K, V> {
 
 		// Read the neighbour BEFORE moving: once the slot is at the front its
 		// predecessor is gone, and the boundary has to step back to whatever
-		// was in front of it.
+		// fast slot was in front of it.
 		let new_boundary_if_moved = match is_boundary && !already_at_front {
-			true => self.slots[i as usize].prev,
+			true => self.fast_at_or_before(self.slots[i as usize].prev),
 			false => NIL,
 		};
 
@@ -1443,6 +1536,27 @@ impl<K, V> Inner<K, V> {
 
 		self.slots[i as usize].last_access = now;
 
+		if structural {
+			if previous_tier != Tier::Fast {
+				return Touched::default();
+			}
+
+			let migrating = self.slots[i as usize].migrating();
+
+			self.fast_used = self.fast_used.saturating_sub(migrating);
+			self.fast_count = self.fast_count.saturating_sub(1);
+			self.slow_used += migrating;
+			self.slots[i as usize].tier = Tier::Slow;
+
+			// Still the boundary only if it was already at the front: then it
+			// was the one fast slot, and none is left.
+			if self.fast_boundary == i {
+				self.fast_boundary = NIL;
+			}
+
+			return Touched { promoted: false, demoted: true };
+		}
+
 		if previous_tier != Tier::Fast {
 			let migrating = self.slots[i as usize].migrating();
 
@@ -1455,10 +1569,17 @@ impl<K, V> Inner<K, V> {
 				self.fast_boundary = i;
 			}
 
-			return true;
+			return Touched { promoted: true, demoted: false };
 		}
 
-		false
+		// The boundary relinked to the front with no fast slot in front of it
+		// (S5: only structural ones): it is the one fast slot, and still the
+		// boundary.
+		if self.fast_boundary == NIL {
+			self.fast_boundary = i;
+		}
+
+		Touched::default()
 	}
 
 	/// Demotes exactly ONE slot -- the boundary, the least-recently-used fast
@@ -1499,7 +1620,7 @@ impl<K, V> Inner<K, V> {
 		self.fast_used = self.fast_used.saturating_sub(migrating);
 		self.fast_count = self.fast_count.saturating_sub(1);
 		self.slow_used += migrating;
-		self.fast_boundary = prev;
+		self.fast_boundary = self.fast_at_or_before(prev);
 
 		Demote::Demoted(key)
 	}
@@ -1905,12 +2026,41 @@ impl MigrationLog {
 	}
 }
 
+/// What `Inner::touch_slot` did to the slot's tier: promoted it (queue
+/// `(key, Fast)` after the settle, if the settle leaves it fast), or -- a
+/// structural slot that was fast (S5) -- took it out of the fast set (queue
+/// `(key, Slow)` at once: its placement changed).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Touched {
+	promoted: bool,
+	demoted: bool,
+}
+
 /// What a policy-worker section leaves to do once its shard guard is dropped:
-/// nothing, or a settle -- after which a promotion the section made is queued
-/// `(key, Fast)` unless that settle demoted the key again.
-enum After {
-	Nothing,
-	Settle { promoted: bool },
+/// queue `(key, Slow)` for a structural move out of the fast set (S5) -- first,
+/// as the DashMap stacks push it where they make it, before their settle --
+/// then, if asked, a settle, after which a promotion the section made is
+/// queued `(key, Fast)` unless that settle demoted the key again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct After {
+	demoted: bool,
+	settle: bool,
+	promoted: bool,
+}
+
+impl After {
+	/// Nothing to do.
+	const NOTHING: After = After { demoted: false, settle: false, promoted: false };
+
+	/// A settle, and the push of a promotion it leaves standing.
+	fn settle(promoted: bool) -> After {
+		After { demoted: false, settle: true, promoted }
+	}
+
+	/// After a touch: its structural move's push, the settle, its promotion's.
+	fn touched(touched: Touched) -> After {
+		After { demoted: touched.demoted, settle: true, promoted: touched.promoted }
+	}
 }
 
 pub struct MergedStore<K, V> {
@@ -2003,6 +2153,11 @@ pub struct MergedStore<K, V> {
 	/// `structure_bytes`): charged by every shard where it grows a structure,
 	/// by the frequency maps' allocator, and here for the fixed arrays.
 	meter: crate::meta::Meter,
+
+	/// S5: the measured M the policy worker pushed under the measured model
+	/// (`set_dram_metadata`), which the reservation is then instead of
+	/// `linked x shared_overhead`; `u64::MAX` for none (the per-object model).
+	measured_metadata: AtomicU64,
 }
 
 impl<K, V> Default for MergedStore<K, V> {
@@ -2065,6 +2220,7 @@ impl<K, V> Default for MergedStore<K, V> {
 			high_ppm: AtomicU64::new(DEFAULT_HIGH_PPM),
 			low_ppm: AtomicU64::new(DEFAULT_LOW_PPM),
 			meter,
+			measured_metadata: AtomicU64::new(u64::MAX),
 		}
 	}
 }
@@ -2109,6 +2265,37 @@ impl<K, V> MergedStore<K, V> {
 		self.shared_overhead.store(shared_overhead, Ordering::Relaxed);
 		self.high_ppm.store(high_ppm, Ordering::Relaxed);
 		self.low_ppm.store(low_ppm.min(high_ppm), Ordering::Relaxed);
+	}
+
+	/// S5: the measured M the policy worker pushes under the measured model;
+	/// `None` restores the per-object reservation. The handle's
+	/// `set_dram_metadata`.
+	pub fn set_dram_metadata(&self, measured: Option<CacheSize>) {
+		self.measured_metadata.store(measured.unwrap_or(u64::MAX), Ordering::Relaxed);
+	}
+
+	/// The DRAM metadata reserved out of the fast tier: the pushed M under the
+	/// measured model, `linked x shared_overhead` under the per-object one.
+	fn reservation(&self, shared_overhead: CacheSize) -> CacheSize {
+		match self.measured_metadata.load(Ordering::Relaxed) {
+			u64::MAX => self.linked() as CacheSize * shared_overhead,
+			measured => measured,
+		}
+	}
+
+	/// This store's eff (S5): the whole fast tier's budget for values, the
+	/// settle's figure before its drain target. Untiered (a flat store), it is
+	/// the sentinel capacity, and nothing is ever structural.
+	fn own_eff(&self) -> CacheSize {
+		let budget = self.budget();
+
+		budget.capacity.saturating_sub(self.reservation(budget.shared_overhead))
+	}
+
+	/// Whether a value of `migrating` bytes is STRUCTURAL: larger than an
+	/// empty fast tier (S5). `LruCompactHybridStack::structural`'s rule.
+	fn structural(&self, migrating: CacheSize) -> bool {
+		migrating > self.own_eff()
 	}
 
 	fn budget(&self) -> TierBudget {
@@ -2254,11 +2441,12 @@ impl<K, V> MergedStore<K, V> {
 	fn settle_tier(&self, log: &mut MigrationLog) {
 		let budget = self.budget();
 
-		// The reservation is per LINKED object and applies across both tiers,
-		// so it comes off the budget before the watermarks are taken.
+		// The reservation is per LINKED object -- or, under the measured model,
+		// the pushed M (S5) -- and applies across both tiers, so it comes off
+		// the budget before the watermarks are taken.
 		let effective = budget
 			.capacity
-			.saturating_sub(self.linked() as CacheSize * budget.shared_overhead);
+			.saturating_sub(self.reservation(budget.shared_overhead));
 
 		if self.fast_used.load(Ordering::Relaxed) <= scale(effective, budget.high_ppm) {
 			return;
@@ -2347,12 +2535,16 @@ impl<K, V> MergedStore<K, V> {
 	/// After a section: the settle it asked for, then the push of a promotion
 	/// that settle left standing (`After`).
 	fn finish(&self, key: HashedKey, after: After, log: &mut MigrationLog) {
-		if let After::Settle { promoted } = after {
+		if after.demoted {
+			log.push(key, Tier::Slow);
+		}
+
+		if after.settle {
 			let mark = log.len();
 
 			self.settle_tier(log);
 
-			if promoted && !log.demoted_since(mark, key) {
+			if after.promoted && !log.demoted_since(mark, key) {
 				log.push(key, Tier::Fast);
 			}
 		}
@@ -2426,7 +2618,7 @@ impl<K, V> MergedStore<K, V> {
 			}
 		}
 
-		let promoted = {
+		let touched = {
 			let mut g = self.write_folded(s);
 
 			let Some(i) = g.find(key) else { return };
@@ -2437,17 +2629,18 @@ impl<K, V> MergedStore<K, V> {
 
 			let before = g.totals();
 
-			let promoted = g.touch_slot(i, now);
+			let structural = self.structural(g.slots[i as usize].migrating());
+			let touched = g.touch_slot(i, now, structural);
 
 			self.apply_totals_delta(before, g.totals());
 			self.publish_mirrors(s, &g);
 
-			promoted
+			touched
 		};
 
 		// AFTER the guard is dropped -- see `settle_tier`. Holding it here
 		// would let the settle take a second shard lock while holding this one.
-		self.finish(key, After::Settle { promoted }, log);
+		self.finish(key, After::touched(touched), log);
 	}
 
 	/// A CLOCK hit: set the slot's reference bit, and do nothing else.
@@ -2527,7 +2720,11 @@ impl<K, V> MergedStore<K, V> {
 				Some(min) => new_freq > min,
 			};
 
-			let promoted = promote && was_slow;
+			// S5: never a structural slot -- its value is larger than an empty
+			// fast tier; the bump counts all the same.
+			let promoted = promote
+				&& was_slow
+				&& !self.structural(g.slots[i as usize].migrating());
 
 			if promoted {
 				let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
@@ -2556,7 +2753,7 @@ impl<K, V> MergedStore<K, V> {
 		// AFTER the guard is dropped, as `touch` does it: the settle takes one
 		// shard lock at a time and must not find this thread holding another.
 		if was_slow {
-			self.finish(key, After::Settle { promoted }, log);
+			self.finish(key, After::settle(promoted), log);
 		}
 	}
 
@@ -2698,21 +2895,21 @@ impl<K, V> MergedStore<K, V> {
 	/// merely different: the settle demotes the lowest frequency, which is some
 	/// older frequency-1 key, not the newcomer that caused the overflow.
 	///
-	/// The gate is in the DashMap stack's units, deliberately: `fast_used +
-	/// size`, with `size` the `Set` event's BASE size, where `fast_used` is in
-	/// migrating bytes. It used to add the slot's `migrating()` instead --
-	/// consistent, but not what the reference does, so the two admitted
-	/// differently in a band of `size - migrating` bytes. Fixing the units is
-	/// S5's, for both stores at once.
+	/// The gate (S5, both stores at once): `fast_used + migrating <=
+	/// drain_target(F - reservation)`, the reservation counting the new key
+	/// (`(others + 1) x shared_overhead`, or the pushed M under the measured
+	/// model). In the stacks' unit -- `migrating`, the bytes `fast_used` is
+	/// kept in, where it added the `Set`'s BASE size until S5 -- and up to the
+	/// SETTLE TARGET rather than eff: an admission above it would be demoted by
+	/// the next settle, and the newcomer, at frequency 1, is the very minimum
+	/// it would pick. `LfuCompactHybridStack`'s rule, term for term.
 	///
 	/// `fast_used` and `others` are the tier's fast bytes and the linked keys
-	/// OTHER than this one, as the caller has them; `+ 1` reserves the new
-	/// object's own shared metadata, which is DRAM-resident whichever tier
-	/// its value lands in.
+	/// OTHER than this one, as the caller has them.
 	fn lfu_admission(
 		&self,
 		key: HashedKey,
-		size: ObjectSize,
+		migrating: CacheSize,
 		fast_used: CacheSize,
 		others: usize,
 		log: &mut MigrationLog,
@@ -2723,11 +2920,14 @@ impl<K, V> MergedStore<K, V> {
 
 		let budget = self.budget();
 
-		let admit_effective = budget
-			.capacity
-			.saturating_sub((others as CacheSize + 1) * budget.shared_overhead);
+		let reservation = match self.measured_metadata.load(Ordering::Relaxed) {
+			u64::MAX => (others as CacheSize + 1) * budget.shared_overhead,
+			measured => measured,
+		};
 
-		if fast_used + size as CacheSize <= admit_effective {
+		let target = scale(budget.capacity.saturating_sub(reservation), budget.high_ppm);
+
+		if fast_used + migrating <= target {
 			return Tier::Fast;
 		}
 
@@ -2774,27 +2974,53 @@ impl<K, V> MergedStore<K, V> {
 	/// (`write_folded`), so an overwrite's bytes are in the tier the slot is
 	/// in by the time the section decides anything.
 	pub fn worker_set(&self, key: HashedKey, size: ObjectSize, event: SetEvent, log: &mut MigrationLog) {
+		self.worker_set_placed(key, size, event, Placement::Normal, log);
+	}
+
+	/// `worker_set`, told where the client placed the value (S5; the handle's
+	/// `insert_placed`), and returning the placement APPLIED: a `Structural`
+	/// set -- its value larger than an empty fast tier -- or one this store's
+	/// own check finds structural (`structural`: eff moved since the client
+	/// decided) is linked, relinked or overwritten slow and never promoted,
+	/// in its place in the order: the DashMap stacks' rules, move for move.
+	pub fn worker_set_placed(
+		&self,
+		key: HashedKey,
+		size: ObjectSize,
+		event: SetEvent,
+		placement: Placement,
+		log: &mut MigrationLog,
+	) -> Placement {
 		let order = self.order();
 		let s = shard_of(key);
+		let flagged = placement == Placement::Structural;
 
 		// A same-size overwrite under `Fifo` or `Clock` moves nothing -- no
 		// bytes, no link -- so a linked slot is handled under the READ lock:
 		// nothing at all under `Fifo`, the reference bit under `Clock`, which a
 		// read guard may set (`mark_referenced`). Not taking the write lock for
 		// work that moves nothing is what `Clock` is for. An unlinked slot goes
-		// on to be linked.
+		// on to be linked -- and so does a FAST slot the set makes structural
+		// (S5), which leaves the fast set.
 		if let (SetEvent::Replaced { resized: false }, MergedOrder::Fifo | MergedOrder::Clock) = (event, order) {
 			let g = self.shards[s].read().unwrap();
 
 			match g.find(key) {
-				None => return,
+				None => return placement,
 
 				Some(i) if g.slots[i as usize].is_linked() => {
-					if order == MergedOrder::Clock {
-						g.slots[i as usize].referenced.store(1, Ordering::Relaxed);
-					}
+					let structural = flagged || self.structural(g.slots[i as usize].migrating());
 
-					return;
+					if !(structural && g.slots[i as usize].tier == Tier::Fast) {
+						if order == MergedOrder::Clock {
+							g.slots[i as usize].referenced.store(1, Ordering::Relaxed);
+						}
+
+						return match structural {
+							true => Placement::Structural,
+							false => placement,
+						};
+					}
 				},
 
 				Some(_) => {},
@@ -2807,45 +3033,66 @@ impl<K, V> MergedStore<K, V> {
 			_ => None,
 		};
 
-		let after = {
+		let (after, structural) = {
 			let mut g = self.write_folded(s);
 
-			let Some(i) = g.find(key) else { return };
+			let Some(i) = g.find(key) else { return placement };
 
 			let before = g.totals();
 
+			// The slot's CURRENT object, folded: what it would cost the tier.
+			let structural = flagged || self.structural(g.slots[i as usize].migrating());
+
 			let after = match (g.slots[i as usize].is_linked(), event) {
-				(false, _) => self.link(&mut g, i, key, size, log),
-				(true, SetEvent::Fresh) => self.readmit(&mut g, i, key, size, log),
-				(true, SetEvent::Replaced { resized }) => self.overwrite(&mut g, i, resized, fast_min),
+				(false, _) => self.link(&mut g, i, key, structural, log),
+				(true, SetEvent::Fresh) => self.readmit(&mut g, i, key, structural, log),
+				(true, SetEvent::Replaced { resized }) => self.overwrite(&mut g, i, resized, fast_min, structural),
 			};
 
 			self.apply_totals_delta(before, g.totals());
 			self.publish_mirrors(s, &g);
 
-			after
+			(after, structural)
 		};
+
+		let _ = size;
 
 		// Outside the guard: the settle takes one shard lock at a time and
 		// this thread must not be holding another one.
 		self.finish(key, after, log);
+
+		match structural {
+			true => Placement::Structural,
+			false => placement,
+		}
 	}
 
 	/// `worker_set` for an UNLINKED slot: its link, under the shard's write
 	/// lock. The stamp is taken under the lock, so a shard's list order and
 	/// stamp order agree even with several threads linking (tests do).
-	fn link(&self, g: &mut Inner<K, V>, i: u32, key: HashedKey, size: ObjectSize, log: &mut MigrationLog) -> After {
+	///
+	/// A STRUCTURAL slot (S5) is linked slow in its place -- `Lfu`: the slow
+	/// bucket at frequency 1, with no latch and nothing queued (a value too
+	/// large for the tier says nothing about its capacity); the others: the
+	/// MRU end, tier slow -- and nothing settles (no fast byte moved).
+	fn link(&self, g: &mut Inner<K, V>, i: u32, key: HashedKey, structural: bool, log: &mut MigrationLog) -> After {
 		let now = self.clock.fetch_add(1, Ordering::Relaxed);
 
 		g.linked += 1;
 
 		match self.order() {
+			MergedOrder::Lfu if structural => {
+				g.link_freq(i, now, Tier::Slow);
+
+				After::NOTHING
+			},
+
 			MergedOrder::Lfu => {
 				// The totals bracket has not published this section yet, so the
 				// atomics are the shard's state before the link: the others.
 				let tier = self.lfu_admission(
 					key,
-					size,
+					g.slots[i as usize].migrating(),
 					self.fast_used.load(Ordering::Relaxed),
 					self.linked(),
 					log,
@@ -2853,13 +3100,19 @@ impl<K, V> MergedStore<K, V> {
 
 				g.link_freq(i, now, tier);
 
-				After::Nothing
+				After::NOTHING
+			},
+
+			_ if structural => {
+				g.link_front_slow(i, now);
+
+				After::NOTHING
 			},
 
 			_ => {
 				g.link_front_fast(i, now);
 
-				After::Settle { promoted: false }
+				After::settle(false)
 			},
 		}
 	}
@@ -2868,10 +3121,18 @@ impl<K, V> MergedStore<K, V> {
 	/// -- see `worker_set`. Nothing is queued but an `Lfu` refusal's
 	/// `(key, Slow)`; where the value was built is the reconcile's business, as
 	/// for any new key.
-	fn readmit(&self, g: &mut Inner<K, V>, i: u32, key: HashedKey, size: ObjectSize, log: &mut MigrationLog) -> After {
+	fn readmit(&self, g: &mut Inner<K, V>, i: u32, key: HashedKey, structural: bool, log: &mut MigrationLog) -> After {
 		let now = self.clock.fetch_add(1, Ordering::Relaxed);
 
 		match self.order() {
+			// S5: re-admitted structural, as `link` admits one.
+			MergedOrder::Lfu if structural => {
+				g.detach_tier(i, true);
+				g.link_freq(i, now, Tier::Slow);
+
+				After::NOTHING
+			},
+
 			MergedOrder::Lfu => {
 				// The slot leaves its bucket and its tier's totals first, so the
 				// gate sees the tier without it -- as the DashMap stack's does,
@@ -2888,11 +3149,19 @@ impl<K, V> MergedStore<K, V> {
 					Tier::Slow => self.fast_used.load(Ordering::Relaxed),
 				};
 
-				let tier = self.lfu_admission(key, size, fast_used, self.linked() - 1, log);
+				let tier = self.lfu_admission(key, migrating, fast_used, self.linked() - 1, log);
 
 				g.link_freq(i, now, tier);
 
-				After::Nothing
+				After::NOTHING
+			},
+
+			_ if structural => {
+				g.detach_tier(i, false);
+				g.unlink(i);
+				g.link_front_slow(i, now);
+
+				After::NOTHING
 			},
 
 			_ => {
@@ -2900,7 +3169,7 @@ impl<K, V> MergedStore<K, V> {
 				g.unlink(i);
 				g.link_front_fast(i, now);
 
-				After::Settle { promoted: false }
+				After::settle(false)
 			},
 		}
 	}
@@ -2910,14 +3179,24 @@ impl<K, V> MergedStore<K, V> {
 	/// the object and the fold charged its bytes to the slot's tier; `resized`
 	/// is the DashMap FIFO and CLOCK stacks' criterion for settling (their
 	/// stored size against the event's).
-	fn overwrite(&self, g: &mut Inner<K, V>, i: u32, resized: bool, fast_min: Option<u16>) -> After {
+	///
+	/// A STRUCTURAL overwrite (S5: the new value larger than an empty fast
+	/// tier) of a FAST slot takes it out of the fast set -- in place under
+	/// `Fifo` and `Clock`, at the front under `Lru` (an overwrite is a touch),
+	/// in its frequency's slow bucket under `Lfu` -- and queues `(key, Slow)`:
+	/// the key's placement changed, and a promotion of the old value may still
+	/// be in flight. A structural slot is never promoted. The settle runs
+	/// where it ran before: `Fifo`/`Clock` when a fast slot was resized, the
+	/// others always.
+	fn overwrite(&self, g: &mut Inner<K, V>, i: u32, resized: bool, fast_min: Option<u16>, structural: bool) -> After {
 		let fast = g.slots[i as usize].tier == Tier::Fast;
+		let demoted = structural && fast;
 
 		match self.order() {
 			MergedOrder::Lru => {
 				let now = self.clock.fetch_add(1, Ordering::Relaxed);
 
-				After::Settle { promoted: g.touch_slot(i, now) }
+				After::touched(g.touch_slot(i, now, structural))
 			},
 
 			// A resize in place and nothing else: no move to the front, no
@@ -2925,9 +3204,12 @@ impl<K, V> MergedStore<K, V> {
 			// key is resized in place and NOT moved". Re-settling matters only
 			// if it is fast, since only then can the resize have pushed the
 			// fast tier over its budget.
-			MergedOrder::Fifo => match resized && fast {
-				true => After::Settle { promoted: false },
-				false => After::Nothing,
+			MergedOrder::Fifo => {
+				if demoted {
+					g.demote_in_place(i);
+				}
+
+				After { demoted, settle: resized && fast, promoted: false }
 			},
 
 			// FIFO's restraint PLUS the reference bit: `ClockCompactStack::
@@ -2936,10 +3218,11 @@ impl<K, V> MergedStore<K, V> {
 			MergedOrder::Clock => {
 				g.slots[i as usize].referenced.store(1, Ordering::Relaxed);
 
-				match resized && fast {
-					true => After::Settle { promoted: false },
-					false => After::Nothing,
+				if demoted {
+					g.demote_in_place(i);
 				}
+
+				After { demoted, settle: resized && fast, promoted: false }
 			},
 
 			// An ACCESS, as in both references: `LfuCompactStack::insert`
@@ -2950,14 +3233,19 @@ impl<K, V> MergedStore<K, V> {
 				let now = self.clock.fetch_add(1, Ordering::Relaxed);
 				let new_freq = g.bump_slot(i, now);
 
-				let promoted = !fast && fast_min.is_none_or(|min| new_freq > min);
+				if demoted {
+					let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
+					g.demote_freq_in_place(i, stamp);
+				}
+
+				let promoted = !fast && !structural && fast_min.is_none_or(|min| new_freq > min);
 
 				if promoted {
 					let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
 					g.promote_freq(i, stamp);
 				}
 
-				After::Settle { promoted }
+				After { demoted, settle: true, promoted }
 			},
 		}
 	}
@@ -3143,7 +3431,7 @@ impl<K, V> MergedStore<K, V> {
 	fn clock_victim(&self, log: &mut MigrationLog) -> Option<HashedKey> {
 		enum Step {
 			Victim(HashedKey),
-			Chance(HashedKey, bool),
+			Chance(HashedKey, Touched),
 			Retry,
 			Retired,
 		}
@@ -3187,14 +3475,16 @@ impl<K, V> MergedStore<K, V> {
 
 						// Clear THEN relink, so a hit racing this one is
 						// recorded against the slot's new position rather than
-						// being wiped by the clear.
+						// being wiped by the clear. A structural slot (S5) is
+						// relinked slow, and never promoted.
 						g.slots[t as usize].referenced.store(0, Ordering::Relaxed);
-						let promoted = g.touch_slot(t, now);
+						let structural = self.structural(g.slots[t as usize].migrating());
+						let touched = g.touch_slot(t, now, structural);
 
 						self.apply_totals_delta(before, g.totals());
 						self.publish_mirrors(s, &g);
 
-						Step::Chance(g.slots[t as usize].hashed, promoted)
+						Step::Chance(g.slots[t as usize].hashed, touched)
 					},
 				}
 			};
@@ -3204,8 +3494,8 @@ impl<K, V> MergedStore<K, V> {
 
 				// Outside the guard -- `settle_tier` takes one shard lock at a
 				// time and must not find this thread holding another.
-				Step::Chance(key, promoted) => {
-					self.finish(key, After::Settle { promoted }, log);
+				Step::Chance(key, touched) => {
+					self.finish(key, After::touched(touched), log);
 					budget = budget.saturating_sub(1);
 				},
 
@@ -3608,7 +3898,13 @@ impl<K, V> MergedStore<K, V> {
 	/// DRAM reserved out of the fast tier for shared per-object metadata across
 	/// both tiers, so demotion bounds total DRAM and not just fast-tier values.
 	pub fn dram_reserved_bytes(&self) -> CacheSize {
-		self.linked() as CacheSize * self.shared_overhead.load(Ordering::Relaxed)
+		self.reservation(self.shared_overhead.load(Ordering::Relaxed))
+	}
+
+	/// S5: the settle against the current budget -- the handle's `resettle`,
+	/// the policy worker's end-of-pass step.
+	pub fn resettle(&self, log: &mut MigrationLog) {
+		self.settle_tier(log);
 	}
 
 	/// The store-level total the settle loop tests, rather than a sum over the

@@ -48,7 +48,7 @@ use super::reconcile_tests::{
 
 // What only the merged store's races need.
 #[cfg(feature = "merged_object_store")]
-use super::reconcile_tests::Published;
+use super::reconcile_tests::{Published, restore_fast, shrink_fast};
 #[cfg(feature = "merged_object_store")]
 use std::num::NonZeroU32;
 #[cfg(feature = "merged_object_store")]
@@ -103,9 +103,39 @@ fn charges_exact(objects: &Objects, quiescent: bool) {
 	let _ = (objects, quiescent);
 }
 
+/// The fast tier `f` where the client's decision and the stack both read it
+/// -- the status, whose F the worker publishes eff from, and the stack -- then
+/// the publication: what `set_fast_tier_size` and the worker's next pass do.
+fn resize_fast(worker: &mut Worker, f: CacheSize) {
+	worker.status.set_fast_tier_capacity(f);
+	worker.handle_resize_fast_tier(f);
+	drain_and_apply(worker);
+	worker.publish_gate();
+	drain_and_apply(worker);
+}
+
+/// A client's set of a `len`-byte value of `key` as `PaperCache::set` makes
+/// it since S5: built where the admission decision (`gate::decide`) says,
+/// its `Set` carrying the decision's placement. The decision must admit.
+fn client_set(worker: &mut Worker, objects: &Objects, key: HashedKey, len: usize) {
+	let sizes = crate::gate::Sizes {
+		base: worker.overhead_manager.base_size_for(&key, len, None).expect("a length in range"),
+		resident: worker.overhead_manager.dram_resident_size_for(&key, None),
+		value: crate::phys::value_charge::<u64>(len as ObjectSize),
+	};
+
+	let Ok(crate::gate::Verdict::Admit { tier, placement }) = crate::gate::decide(&worker.status, objects, key, &sizes, false) else {
+		panic!("key {key} was not admitted");
+	};
+
+	let mut published = publish(&worker.status, &worker.overhead_manager, objects, key, len, tier);
+	published.placement = placement;
+
+	handle(worker, key, published);
+}
+
 /// What one `len`-byte value is charged to a tier (`Slot::migrating`, the
 /// DashMap stacks' `size - dram_resident`).
-#[cfg(feature = "merged_object_store")]
 fn charge(len: usize) -> CacheSize {
 	crate::object::overhead::resident_object_bytes::<u64>(len as ObjectSize) as CacheSize
 }
@@ -130,7 +160,7 @@ fn publish_expired(worker: &Worker, objects: &Objects, key: HashedKey, len: usiz
 		worker.status.update_base_used_size(base_size as i64);
 	}
 
-	Published { base_size, resident, built: Fast, previous, mark }
+	Published { base_size, resident, built: Fast, previous, mark, placement: crate::worker::Placement::Normal }
 }
 
 /// The TTL reaper's erase of a due key -- what `TtlWorker::reap_due` does
@@ -205,11 +235,15 @@ fn t15_a_clients_set_and_delete_move_nothing_the_stack_reports_until_the_worker_
 /// trip across drains. The DashMap stacks push a promotion after the settle
 /// and only if the key is still fast; the merged store did it the other way
 /// round until S4 put its settle on the worker, where the check against the
-/// log costs no lock. One case per touch path, with a fast tier of one byte,
-/// so no value fits: an LRU hit and an LRU overwrite of a slow key, a CLOCK
-/// second chance of a referenced slow key, an LFU hit and an LFU overwrite.
-/// Each event's raw drain (before the split) holds `[Slow]` for the key, its
-/// bytes stay slow, and nothing heals it.
+/// log costs no lock. One case per touch path -- an LRU hit and an LRU
+/// overwrite of a slow key, a CLOCK second chance of a referenced slow key, an
+/// LFU hit and an LFU overwrite -- at two fast tiers since S5. Where the value
+/// is exactly eff it fits the empty tier and is over the settle target, so the
+/// promotion happens and its settle undoes it: each event's raw drain (before
+/// the split) holds `[Slow]` for the key. On a tier of one byte the value is
+/// STRUCTURAL -- larger than the empty tier -- and is never promoted: `[]`
+/// (it was `[Slow]` before S5). Either way the bytes stay slow, and nothing
+/// heals them.
 #[test]
 fn t8_a_promotion_its_own_settle_undoes_queues_only_the_settles_entry() {
 	let _serialised = migration_test_lock::lock();
@@ -217,71 +251,94 @@ fn t8_a_promotion_its_own_settle_undoes_queues_only_the_settles_entry() {
 	const K: HashedKey = 1;
 	const X: HashedKey = 2;
 
-	let tiny = |worker: &mut Worker| {
-		worker.handle_resize_fast_tier(1);
-		drain_and_apply(worker);
+	let tiny = |worker: &mut Worker| resize_fast(worker, 1);
+
+	// The tier whose eff is exactly one value's charge with what the stack
+	// tracks now: the value fits the empty tier, and is over its settle
+	// target (0.98 of eff).
+	let exact = |worker: &mut Worker| {
+		let reserved = stack(worker).dram_reserved_bytes();
+		resize_fast(worker, charge(LEN) + reserved);
 	};
 
-	for (policy, overwrite) in [
-		(PaperPolicy::LruCompactHybrid, false),
-		(PaperPolicy::LruCompactHybrid, true),
-		(PaperPolicy::LfuCompactHybrid, false),
-		(PaperPolicy::LfuCompactHybrid, true),
-	] {
-		let (mut worker, objects) = make_worker(policy);
+	for fits in [false, true] {
+		// One byte: STRUCTURAL, nothing promoted or queued. Exactly eff: the
+		// promotion, undone by its own settle -- the settle's entry alone.
+		let expected: &[Tier] = if fits { &[Slow] } else { &[] };
+		let tier = if fits { "eff" } else { "1 B" };
+
+		for (policy, overwrite) in [
+			(PaperPolicy::LruCompactHybrid, false),
+			(PaperPolicy::LruCompactHybrid, true),
+			(PaperPolicy::LfuCompactHybrid, false),
+			(PaperPolicy::LfuCompactHybrid, true),
+		] {
+			let (mut worker, objects) = make_worker(policy);
+
+			set(&mut worker, &objects, K, LEN, Fast);
+			drain_and_apply(&mut worker);
+			tiny(&mut worker);
+			assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Slow), Slow), "{policy}: demoted");
+
+			if fits {
+				exact(&mut worker);
+				assert_eq!(placement(&worker, K), Some(Slow), "{policy}: a grow promotes nothing");
+			}
+
+			let drain = match overwrite {
+				false => {
+					worker.handle_get(K, Some(Slow));
+					drain_and_apply(&mut worker)
+				},
+
+				// Built where the client's decision builds it: slow, and
+				// structural, on the one-byte tier.
+				true => {
+					client_set(&mut worker, &objects, K, LEN);
+					drain_and_apply(&mut worker)
+				},
+			};
+
+			let what = if overwrite { "overwrite" } else { "hit" };
+
+			assert_eq!(of(&drain, K), expected, "{policy} {what}, {tier} tier: the settle's entry alone, no promote-then-demote pair");
+			assert_eq!(correctives(&drain, K), vec![], "{policy} {what}, {tier} tier: no heal, no corrective");
+			assert_eq!(bytes_tier(&objects, K), Slow, "{policy} {what}, {tier} tier: the bytes stay slow");
+			assert_settled(&mut worker);
+			charges_exact(&objects, true);
+		}
+
+		// CLOCK: the hand's second chance of a referenced slow key -- promoted
+		// and demoted again by its settle when it fits, left slow when it is
+		// structural; the unreferenced key behind it is evicted.
+		let (mut worker, objects) = make_worker(PaperPolicy::ClockCompactHybrid);
 
 		set(&mut worker, &objects, K, LEN, Fast);
 		drain_and_apply(&mut worker);
+		set(&mut worker, &objects, X, LEN, Fast);
+		drain_and_apply(&mut worker);
 		tiny(&mut worker);
-		assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Slow), Slow), "{policy}: demoted");
 
-		let drain = match overwrite {
-			false => {
-				worker.handle_get(K, Some(Slow));
-				drain_and_apply(&mut worker)
-			},
+		if fits {
+			exact(&mut worker);
+		}
 
-			true => {
-				let built = admission_tier(policy, K, &worker.status, &objects);
-				set(&mut worker, &objects, K, LEN, built);
-				drain_and_apply(&mut worker)
-			},
-		};
+		worker.handle_get(K, Some(Slow));
+		drain_and_apply(&mut worker);
 
-		let what = if overwrite { "overwrite" } else { "hit" };
+		// `evict_one_key`, keeping the drain of the pass.
+		let used = worker.status.used_size(&worker.status.policy());
+		worker.status.set_max_size(used - 1);
+		worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
+		worker.status.set_max_size(1 << 30);
+		let drain = drain_and_apply(&mut worker);
 
-		assert_eq!(of(&drain, K), vec![Slow], "{policy} {what}: the settle's entry alone, no promote-then-demote pair");
-		assert_eq!(correctives(&drain, K), vec![], "{policy} {what}: no heal, no corrective");
-		assert_eq!(bytes_tier(&objects, K), Slow, "{policy} {what}: the bytes stay slow");
+		assert_eq!(placement(&worker, X), None, "{tier} tier: the unreferenced key was the victim");
+		assert_eq!(of(&drain, K), expected, "clock second chance, {tier} tier: the settle's entry alone");
+		assert_eq!(bytes_tier(&objects, K), Slow);
 		assert_settled(&mut worker);
 		charges_exact(&objects, true);
 	}
-
-	// CLOCK: the hand's second chance promotes a referenced slow key, which
-	// its settle demotes again; the unreferenced key behind it is evicted.
-	let (mut worker, objects) = make_worker(PaperPolicy::ClockCompactHybrid);
-
-	set(&mut worker, &objects, K, LEN, Fast);
-	drain_and_apply(&mut worker);
-	set(&mut worker, &objects, X, LEN, Fast);
-	drain_and_apply(&mut worker);
-	tiny(&mut worker);
-
-	worker.handle_get(K, Some(Slow));
-	drain_and_apply(&mut worker);
-
-	// `evict_one_key`, keeping the drain of the pass.
-	let used = worker.status.used_size(&worker.status.policy());
-	worker.status.set_max_size(used - 1);
-	worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
-	worker.status.set_max_size(1 << 30);
-	let drain = drain_and_apply(&mut worker);
-
-	assert_eq!(placement(&worker, X), None, "the unreferenced key was the victim");
-	assert_eq!(of(&drain, K), vec![Slow], "clock second chance: the settle's entry alone");
-	assert_eq!(bytes_tier(&objects, K), Slow);
-	assert_settled(&mut worker);
-	charges_exact(&objects, true);
 }
 
 /// U12, in both stores: the LFU latch is published with the `Set` that shuts
@@ -456,6 +513,11 @@ fn wait_for(what: &str, deadline: Duration, mut done: impl FnMut() -> bool) {
 fn u7_wipe_returns_after_the_worker_cleared_everything() {
 	let _serialised = migration_test_lock::lock();
 
+	// The per-object metadata model (S5): at this toy fast tier the MEASURED
+	// M of the cache's own structures would leave the strict key ceiling
+	// no room, and every new key would fail with `MetadataOverflow`.
+	let _per_object = crate::object::overhead::test_overheads::per_object();
+
 	for policy in [PaperPolicy::LruCompactHybrid, PaperPolicy::LfuCompactHybrid] {
 		let cache = PaperCache::<u64, TieredBuffer>::new(1 << 20, CacheTierSize::Bytes(FAST), policy)
 			.expect("a hybrid cache");
@@ -565,6 +627,11 @@ fn u7_a_set_handled_before_the_wipe_is_not_left_untracked() {
 #[test]
 fn wipe_clears_the_cache_itself_when_the_policy_worker_is_gone() {
 	let _serialised = migration_test_lock::lock();
+
+	// The per-object metadata model (S5): at this toy fast tier the MEASURED
+	// M of the cache's own structures would leave the strict key ceiling
+	// no room, and every new key would fail with `MetadataOverflow`.
+	let _per_object = crate::object::overhead::test_overheads::per_object();
 
 	let policy = PaperPolicy::LruCompactHybrid;
 	let mut cache = PaperCache::<u64, TieredBuffer>::new(1 << 20, CacheTierSize::Bytes(FAST), policy)
@@ -964,7 +1031,9 @@ fn r3_sets_handled_out_of_order_link_once_and_charge_the_live_value() {
 /// before the fresh one's -- is fenced like a new key when its bucket moved
 /// since its mark, for the store does not place the key before the event
 /// (`placement_of` None) although the insert replaced a value. K's old value
-/// is demoted by another key's admission, and the worker takes that drain;
+/// is demoted by a settle (since S5 a shrink of the fast tier: the admission
+/// of a value twice the tier this used is placed slow, with no settle), and
+/// the worker takes that drain;
 /// before it lands, the clients delete K and set v1 (fresh) and v2 over it.
 /// The demotion then lands on v2, the value the key holds, after both marks.
 /// The worker takes the `Del` (the DEAD slot) and then Set(v2): it links the
@@ -981,17 +1050,18 @@ fn r3_a_replaced_set_on_an_unlinked_slot_is_fenced_like_a_new_key() {
 	let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
 
 	const K: HashedKey = 1;
-	// Twice the fast tier: its admission demotes K and itself.
-	const X: HashedKey = 7_777;
 
 	set(&mut worker, &objects, K, LEN, Fast);
 	drain_and_apply(&mut worker);
 	assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Fast), Fast));
 
-	// The worker takes the admission's drain, and has not applied it yet.
-	set(&mut worker, &objects, X, 2 * FAST as usize, Fast);
+	// A settle demotes K -- the fast tier shrunk, then restored (S5 places
+	// this fixture's old trigger, a value twice the tier, slow with no
+	// settle) -- and the worker takes its drain, and has not applied it yet.
+	shrink_fast(&mut worker);
 	let (inline, held) = worker.drain_reconciled().expect("a stack");
-	assert_eq!(of(&held, K), vec![Slow], "the admission demoted K");
+	restore_fast(&mut worker);
+	assert_eq!(of(&held, K), vec![Slow], "the settle demoted K");
 
 	// The clients: `del(K)`, then `set(K, v1)` -- new -- and `set(K, v2)`
 	// over it, both built in DRAM as LRU admits.
@@ -1556,12 +1626,21 @@ fn a_concurrent_workload_leaves_every_charge_exact_at_quiescence() {
 ///
 /// With `PAPER_T14_DIR` set, each test writes `<dir>/<name>.txt` and prints its
 /// hash; the bp-s4 runner diffs the D, M and H files (and TD, TM, TH). The
-/// LFU script opens with 32 sets built so that the 32nd admission's MIGRATING
+/// LFU script opens with 35 sets built so that the 35th admission's MIGRATING
 /// bytes fit the gate and its BASE size does not -- the case where the merged
-/// store's gate used to add the other one.
+/// store's gate used to add the other one (S5: at the gate's settle target;
+/// the other orders keep the 32-set prefix their files were recorded with).
+///
+/// Since S5 each set goes through the client's admission decision
+/// (`gate::decide`: the metadata cap, the design's tier, the structural
+/// check), and each op's batch end runs the pass end's publication --
+/// `publish_metadata`, then `publish_gate`, whose resettle's demotions are in
+/// the batch end's drain -- as the event loop does. T14c drives both on
+/// scripts built to cross eff and fill the key ceiling.
 mod t14 {
 	use super::*;
 	use super::super::reconcile_tests::Published;
+	use crate::gate::MetadataOverflow;
 	use crate::object::Object;
 	use std::num::NonZeroU32;
 
@@ -1572,6 +1651,17 @@ mod t14 {
 	const KEYS: u64 = 96;
 	const OPS: usize = 600;
 	const ITEMS: [ObjectSize; 9] = [512, 640, 768, 1024, 1280, 1536, 2048, 3072, 4096];
+
+	/// T14c's: a 6 KiB fast tier, so the key ceiling is 96 keys at omega 64
+	/// and eff crosses every item size as the count grows (4 KiB is structural
+	/// past 32 keys, 512 B past 88); 128 keys to fill past the ceiling; items
+	/// up to 8 KiB, which no eff here fits; a cache small enough that sets
+	/// also evict by size.
+	const FAST_C: CacheSize = 6 * 1024;
+	const MAX_SIZE_C: CacheSize = 384 * 1024;
+	const KEYS_C: u64 = 128;
+	const OPS_C: usize = 600;
+	const ITEMS_C: [ObjectSize; 6] = [512, 640, 1024, 2048, 4096, 8192];
 
 	fn key(i: u64) -> HashedKey {
 		(i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -1610,12 +1700,25 @@ mod t14 {
 		}
 	}
 
+	/// A set's placement in its record: nothing for `Normal`, so T14's files
+	/// read as they did before S5.
+	fn placed(placement: crate::worker::Placement) -> &'static str {
+		match placement {
+			crate::worker::Placement::Normal => "",
+			crate::worker::Placement::Structural => " structural",
+		}
+	}
+
 	struct Run {
 		policy: PaperPolicy,
 		tiered: bool,
 		/// T14b: no gauge refresh after an op -- the stack's own gauges are
 		/// recorded instead -- and TTL reaps, bursts and wipes among the ops.
 		b: bool,
+		/// T14c: the gate's figures and counters in each op's record.
+		c: bool,
+		/// The keys `0..keys` the script draws from.
+		keys: u64,
 		worker: Worker,
 		objects: Objects,
 		index: HashMap<HashedKey, u64>,
@@ -1640,11 +1743,25 @@ mod t14 {
 			},
 		}
 
-		Published { base_size, resident, built, previous, mark }
+		Published { base_size, resident, built, previous, mark, placement: crate::worker::Placement::Normal }
 	}
 
 	impl Run {
 		fn new(policy: PaperPolicy, tiered: bool, b: bool) -> Run {
+			Run::with(policy, tiered, b, false, FAST_TIER, MAX_SIZE, KEYS, MetadataOverflow::Error)
+		}
+
+		#[allow(clippy::too_many_arguments)]
+		fn with(
+			policy: PaperPolicy,
+			tiered: bool,
+			b: bool,
+			c: bool,
+			fast_tier: CacheSize,
+			max_size: CacheSize,
+			keys: u64,
+			overflow: MetadataOverflow,
+		) -> Run {
 			assert!(
 				std::env::var_os("MERGED_UPDATE_INTERVAL").is_none(),
 				"T14 compares exact orders: MERGED_UPDATE_INTERVAL must be unset",
@@ -1653,8 +1770,24 @@ mod t14 {
 			let (_tx, rx) = crossbeam_channel::unbounded::<WorkerEvent>();
 
 			let objects: Objects = crate::new_hybrid_object_map();
-			let status = Arc::new(AtomicStatus::new(MAX_SIZE, &[policy], policy).unwrap());
+			let status = Arc::new(AtomicStatus::new(max_size, &[policy], policy).unwrap());
 			let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+			// The per-object model: T14's constants are omega's (S5).
+			status.pin_per_object();
+
+			// What the hybrid constructors do before the worker's first
+			// publication (S5): omega registered -- the key ceiling's unit --
+			// F in the status, from which the worker publishes eff, and the
+			// admission configuration.
+			if tiered {
+				status.register_tiered_cache(OMEGA as CacheSize);
+				status.set_fast_tier_capacity(fast_tier);
+
+				let mut config = status.gate().config();
+				config.on_metadata_overflow = overflow;
+				status.gate().set_config(config);
+			}
 
 			let mut worker = match tiered {
 				true => PolicyWorker::new_with_tier_migration(rx, objects.clone(), status, overhead_manager).unwrap(),
@@ -1666,13 +1799,13 @@ mod t14 {
 			worker.drained = Some(Vec::new());
 
 			if tiered {
-				worker.handle_resize_fast_tier(FAST_TIER);
+				worker.handle_resize_fast_tier(fast_tier);
 				worker.apply_tier_migrations();
 			}
 
-			let index = (0..KEYS).map(|i| (key(i), i)).collect();
+			let index = (0..keys).map(|i| (key(i), i)).collect();
 
-			Run { policy, tiered, b, worker, objects, index, lines: Vec::new() }
+			Run { policy, tiered, b, c, keys, worker, objects, index, lines: Vec::new() }
 		}
 
 		fn live(&self, i: u64) -> bool {
@@ -1703,16 +1836,67 @@ mod t14 {
 				.join(",")
 		}
 
-		/// The client's set, as `PaperCache::set` does it, then its event.
+		/// `PaperCache::begin_set`'s decision for a `len`-byte value of `k`
+		/// (`gate::decide`, S5): the tier to build in and the `Set`'s
+		/// placement, or what the set returned instead. `EvictToFit`'s
+		/// `NeedsRoom` is answered as the cache answers it -- the policy
+		/// worker's `MakeRoom`, handled here inline where the cache's lane head
+		/// would wait for it -- and decided again as the head; a `MakeRoom`
+		/// that evicted nothing fails the set.
+		fn admit(&mut self, k: HashedKey, len: usize) -> Result<(Tier, crate::worker::Placement), String> {
+			use crate::gate::{self, Verdict};
+
+			let status = self.worker.status.clone();
+			let sizes = gate::Sizes {
+				base: self.worker.overhead_manager.base_size_for(&k, len, None).expect("a value within the size limit"),
+				resident: self.worker.overhead_manager.dram_resident_size_for(&k, None),
+				value: crate::phys::value_charge::<u64>(len as ObjectSize),
+			};
+
+			let mut head = false;
+			let mut evicted = None;
+
+			loop {
+				match gate::decide(&status, &self.objects, k, &sizes, head) {
+					Ok(Verdict::Admit { tier, placement }) => return Ok((tier, placement)),
+					Err(error) => return Err(format!("refused {error:?}")),
+
+					Ok(Verdict::NeedsRoom) => {
+						let gate = status.gate();
+
+						if evicted == Some(0) {
+							gate.count_make_room_failure();
+							return Err("refused MetadataOverflow, nothing to evict".to_string());
+						}
+
+						let request = gate.next_room_request();
+						gate.count_make_room_request();
+						self.worker.handle_make_room(request);
+
+						head = true;
+						evicted = Some(gate.room_outcome(request).expect("the MakeRoom was answered"));
+					},
+				}
+			}
+		}
+
+		/// The client's set, as `PaperCache::set` does it -- its admission
+		/// decision, the build and the insert -- then its event.
 		fn set(&mut self, i: u64, item: ObjectSize) -> String {
 			let k = key(i);
-			let built = admission_tier(self.policy, k, &self.worker.status, &self.objects);
-			let published = publish(&self.worker.status, &self.worker.overhead_manager, &self.objects, k, value_len(item), built);
+
+			let (built, placement) = match self.admit(k, value_len(item)) {
+				Ok(decision) => decision,
+				Err(refused) => return format!("set k{i} {item} {refused}"),
+			};
+
+			let mut published = publish(&self.worker.status, &self.worker.overhead_manager, &self.objects, k, value_len(item), built);
+			published.placement = placement;
 			let kind = if published.fresh() { "set" } else { "overwrite" };
 
 			handle(&mut self.worker, k, published);
 
-			format!("{kind} k{i} {item} built {}", tier(built))
+			format!("{kind} k{i} {item} built {}{}", tier(built), placed(placement))
 		}
 
 		/// The client's get, as `PaperCache::get` does it, then its event.
@@ -1754,13 +1938,19 @@ mod t14 {
 		/// get of it misses.
 		fn set_expired(&mut self, i: u64, item: ObjectSize) -> String {
 			let k = key(i);
-			let built = admission_tier(self.policy, k, &self.worker.status, &self.objects);
-			let published = publish_object(&self.worker, &self.objects, k, value_len(item), built, NonZeroU32::new(1));
+
+			let (built, placement) = match self.admit(k, value_len(item)) {
+				Ok(decision) => decision,
+				Err(refused) => return format!("set k{i} {item} expired {refused}"),
+			};
+
+			let mut published = publish_object(&self.worker, &self.objects, k, value_len(item), built, NonZeroU32::new(1));
+			published.placement = placement;
 			let kind = if published.fresh() { "set" } else { "overwrite" };
 
 			handle(&mut self.worker, k, published);
 
-			format!("{kind} k{i} {item} expired built {}", tier(built))
+			format!("{kind} k{i} {item} expired built {}{}", tier(built), placed(placement))
 		}
 
 		/// T14b: the TTL reaper's take of an expired value, then the worker's
@@ -1783,16 +1973,19 @@ mod t14 {
 		/// the reconcile's correctives. In the merged store the later keys are
 		/// UNLINKED while the earlier ones are linked, charged and settled.
 		fn burst(&mut self, keys: &[(u64, ObjectSize)]) -> String {
-			let published: Vec<(u64, ObjectSize, Tier, Published)> = keys
-				.iter()
-				.map(|&(i, item)| {
-					let k = key(i);
-					let built = admission_tier(self.policy, k, &self.worker.status, &self.objects);
-					let published = publish(&self.worker.status, &self.worker.overhead_manager, &self.objects, k, value_len(item), built);
+			let mut published: Vec<(u64, ObjectSize, Tier, Published)> = Vec::new();
 
-					(i, item, built, published)
-				})
-				.collect();
+			for &(i, item) in keys {
+				let k = key(i);
+
+				// Every key is new and under the ceiling here (T14b: Error, far
+				// below it), so each decision admits.
+				let (built, placement) = self.admit(k, value_len(item)).expect("a burst key is admitted");
+				let mut set = publish(&self.worker.status, &self.worker.overhead_manager, &self.objects, k, value_len(item), built);
+				set.placement = placement;
+
+				published.push((i, item, built, set));
+			}
 
 			let mut what = Vec::new();
 			let last = published.len() - 1;
@@ -1822,6 +2015,15 @@ mod t14 {
 			let evicted = self.worker.evicted.replace(Vec::new()).expect("recording");
 
 			self.worker.apply_tier_migrations();
+
+			// The pass end since S5: M, then the gate's figures and every
+			// settle re-run against them (`publish_gate`, which applies what
+			// its resettle queued) -- in the batch end's drain.
+			if self.tiered {
+				self.worker.publish_metadata(false);
+				self.worker.publish_gate();
+			}
+
 			let drain2 = self.worker.drained.replace(Vec::new()).expect("recording");
 
 			// T14b leaves the gauges and the latch as the events published them.
@@ -1841,7 +2043,7 @@ mod t14 {
 				);
 			}
 
-			let live: Vec<u64> = (0..KEYS).filter(|&i| self.live(i)).collect();
+			let live: Vec<u64> = (0..self.keys).filter(|&i| self.live(i)).collect();
 
 			let placements = live
 				.iter()
@@ -1888,8 +2090,25 @@ mod t14 {
 					self.entries(&drain2),
 				));
 			} else {
+			// T14c: the key ceiling, eff and the gate's counters too.
+			let gate = match self.c {
+				true => format!(
+					" | gate kmax={} eff={} overflows={} rooms={} roomev={} roomfail={} structural={} placed={}",
+					s.metadata_key_ceiling,
+					s.effective_fast_capacity,
+					s.metadata_overflows,
+					s.make_room_requests,
+					s.make_room_evictions,
+					s.make_room_failures,
+					s.structural_slow_sets,
+					s.structural_placements,
+				),
+
+				false => String::new(),
+			};
+
 			self.lines.push(format!(
-				"op {n} {what} | drain [{}] | evicted [{}] | drain2 [{}] | placement {placements} | stats fo={} so={} fb={} sb={} meta={} promo={} demo={} evict={} rafast={} raslow={} fasthits={} slowhits={} latched={} used={used} live={}",
+				"op {n} {what} | drain [{}] | evicted [{}] | drain2 [{}] | placement {placements} | stats fo={} so={} fb={} sb={} meta={} promo={} demo={} evict={} rafast={} raslow={} fasthits={} slowhits={} latched={} used={used} live={}{gate}",
 				self.entries(&drain),
 				self.names(&evicted),
 				self.entries(&drain2),
@@ -1934,12 +2153,30 @@ mod t14 {
 		let mut rng = Rng(seed);
 		let mut n = 0;
 
-		// 31 keys of 640 and 768 bytes, alternating, then a 768 whose
-		// migrating bytes fill the LFU gate exactly: 21,760 + 768 = 22,528 =
-		// 24,576 - 32 x 64, while its base size is 12 bytes more.
-		for i in 0..32u64 {
-			let item = if i % 2 == 0 && i < 31 { 640 } else { 768 };
-			run.step(n, |run| run.set(i, item), None);
+		// The LFU hybrid (S5's gate: the stacks' unit, at the settle target):
+		// 34 keys of 512, 640 and 768 bytes, then a 640 whose migrating bytes
+		// fit the gate -- 21,248 + 640 = 21,888 <= 21,889 = 0.98 x (24,576 -
+		// 35 x 64) -- while its base size, 12 bytes more, does not.
+		//
+		// Every other script keeps the prefix its file was recorded with
+		// before S5: 31 keys of 640 and 768 bytes, alternating, then a 768
+		// whose migrating bytes filled the gate as it was, exactly: 21,760 +
+		// 768 = 22,528 = 24,576 - 32 x 64.
+		let prefix: Vec<ObjectSize> = match policy {
+			PaperPolicy::LfuCompactHybrid => (0..35u64)
+				.map(|i| match i {
+					0..14 => 512,
+					14..24 => 640,
+					24..34 => 768,
+					_ => 640,
+				})
+				.collect(),
+
+			_ => (0..32u64).map(|i| if i % 2 == 0 && i < 31 { 640 } else { 768 }).collect(),
+		};
+
+		for (i, &item) in prefix.iter().enumerate() {
+			run.step(n, |run| run.set(i as u64, item), None);
 			n += 1;
 		}
 
@@ -1986,11 +2223,13 @@ mod t14 {
 				},
 
 				// The fast tier resized within [12, 32] KiB: shrinks and grows
-				// (a grow unlatches LFU).
+				// (a grow unlatches LFU). F into the status and the event, as
+				// `set_fast_tier_size` does.
 				93..97 if tiered => {
 					let size = (12 + rng.below(21)) * 1024;
 
 					run.step(n, |run| {
+						run.worker.status.set_fast_tier_capacity(size);
 						run.worker.handle_resize_fast_tier(size);
 						format!("resize_fast_tier {size}")
 					}, None);
@@ -2014,7 +2253,13 @@ mod t14 {
 			n += 1;
 		}
 
-		let text = run.lines.join("\n") + "\n";
+		emit(name, &run.lines, OPS);
+	}
+
+	/// A script's record: its hash printed, and with `PAPER_T14_DIR` set its
+	/// file written.
+	fn emit(name: &str, lines: &[String], ops: usize) {
+		let text = lines.join("\n") + "\n";
 
 		let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
 
@@ -2023,12 +2268,89 @@ mod t14 {
 			hash = hash.wrapping_mul(0x0100_0000_01b3);
 		}
 
-		println!("T14 {name} ops={OPS} fnv64={hash:016x}");
+		println!("T14 {name} ops={ops} fnv64={hash:016x}");
 
 		if let Some(dir) = std::env::var_os("PAPER_T14_DIR") {
 			let path = std::path::Path::new(&dir).join(format!("{name}.txt"));
 			std::fs::write(&path, &text).unwrap_or_else(|e| panic!("writing {path:?}: {e}"));
 		}
+	}
+
+	/// T14c (S5, B1's half): the client's admission decision through the
+	/// differential, in one mode of the metadata cap (`overflow`). A 6 KiB
+	/// tier and 128 keys (`FAST_C`), so eff crosses every item size as the
+	/// count grows -- structural new keys, overwrites and hits of them, a
+	/// CLOCK hand and the LFU gate meeting them -- and the count reaches the
+	/// key ceiling: `Error` refuses the new keys past it (recorded, with
+	/// nothing built or sent), `EvictToFit` runs the worker's `MakeRoom` for
+	/// them (its victims and drain in the op's record). Resizes move the
+	/// ceiling and eff both ways. Each op's record adds the gate's figures and
+	/// counters to T14's.
+	fn script_c(name: &str, policy: PaperPolicy, seed: u64, overflow: MetadataOverflow) {
+		// Its inline landings count in the process-wide migration counters,
+		// which other tests assert exact deltas on under this lock.
+		let _serialised = migration_test_lock::lock();
+		let _overheads = test_overheads::set(OMEGA, PER_OBJECT);
+
+		let mut run = Run::with(policy, true, false, true, FAST_C, MAX_SIZE_C, KEYS_C, overflow);
+		let mut rng = Rng(seed);
+
+		for n in 0..OPS_C {
+			let r = rng.below(100);
+			let i = rng.below(KEYS_C);
+			let item = ITEMS_C[rng.below(ITEMS_C.len() as u64) as usize];
+			let live = |run: &Run, from: u64| (0..KEYS_C).map(|d| (from + d) % KEYS_C).find(|&j| run.live(j));
+
+			match r {
+				// A set: of a new key (under the ceiling, or at it) or an
+				// overwrite.
+				0..45 => run.step(n, |run| run.set(i, item), None),
+
+				// An overwrite of a live key with any item: across eff either
+				// way.
+				45..60 => match live(&run, i) {
+					Some(j) => run.step(n, |run| run.set(j, item), Some(j)),
+					None => run.step(n, |run| run.set(i, item), None),
+				},
+
+				// A get: a hit if the key is live -- structural keys among them.
+				60..85 => run.step(n, |run| run.get(i), Some(i)),
+
+				// A delete of a live key: room under the ceiling.
+				85..92 => match live(&run, i) {
+					Some(j) => run.step(n, |run| run.del(j), None),
+					None => run.step(n, |run| run.get(i), Some(i)),
+				},
+
+				// The fast tier resized within [4, 8] KiB: the ceiling (64 to
+				// 128 keys) and eff move both ways.
+				92..97 => {
+					let size = (4 + rng.below(5)) * 1024;
+
+					run.step(n, |run| {
+						run.worker.status.set_fast_tier_capacity(size);
+						run.worker.handle_resize_fast_tier(size);
+						format!("resize_fast_tier {size}")
+					}, None);
+				},
+
+				// The cache's size: shrunk by up to a quarter, or restored.
+				_ => {
+					let size = match rng.below(2) {
+						0 => MAX_SIZE_C - rng.below(MAX_SIZE_C / 4),
+						_ => MAX_SIZE_C,
+					};
+
+					run.step(n, |run| {
+						run.worker.status.set_max_size(size);
+						run.worker.handle_resize(size);
+						format!("resize {size}")
+					}, None);
+				},
+			}
+		}
+
+		emit(name, &run.lines, OPS_C);
 	}
 
 	/// One T14b op. Over T14's mix: sets whose value has already expired, the
@@ -2111,11 +2433,13 @@ mod t14 {
 				}
 			},
 
-			// The fast tier resized within [12, 32] KiB.
+			// The fast tier resized within [12, 32] KiB (F into the status
+			// and the event, as `set_fast_tier_size` does).
 			92..95 => {
 				let size = (12 + rng.below(21)) * 1024;
 
 				run.step(n, |run| {
+					run.worker.status.set_fast_tier_capacity(size);
 					run.worker.handle_resize_fast_tier(size);
 					format!("resize_fast_tier {size}")
 				}, None);
@@ -2187,6 +2511,23 @@ mod t14 {
 	#[test]
 	fn t14b_lfu_scripts_match_across_stores() {
 		script("lfu-b", PaperPolicy::LfuCompactHybrid, true, 34, true);
+	}
+
+	/// T14c (S5, B1's half): the admission decision on scripts that cross eff
+	/// and fill the key ceiling, per order, in both modes of the metadata cap:
+	/// files `<order>-c.txt` (`Error`) and `<order>-c-evict.txt`
+	/// (`EvictToFit`).
+	#[test]
+	fn t14c_admission_scripts_match_across_stores() {
+		for (name, policy, seed) in [
+			("lru", PaperPolicy::LruCompactHybrid, 41),
+			("fifo", PaperPolicy::FifoCompactHybrid, 42),
+			("clock", PaperPolicy::ClockCompactHybrid, 43),
+			("lfu", PaperPolicy::LfuCompactHybrid, 44),
+		] {
+			script_c(&format!("{name}-c"), policy, seed, MetadataOverflow::Error);
+			script_c(&format!("{name}-c-evict"), policy, seed + 10, MetadataOverflow::EvictToFit);
+		}
 	}
 
 	/// The flat caches -- the other half of the merged store's use: the same

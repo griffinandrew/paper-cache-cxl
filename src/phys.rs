@@ -1017,6 +1017,11 @@ mod tests {
 		// released last: after the cache has dropped and joined its consumers.
 		let _serialised = crate::worker::migration_test_lock::lock();
 
+		// The per-object metadata model (S5): at this toy fast tier the MEASURED
+		// M of the cache's own structures would leave the strict key ceiling
+		// no room, and every new key would fail with `MetadataOverflow`.
+		let _per_object = crate::object::overhead::test_overheads::per_object();
+
 		let cache = PaperCache::<u64, TieredBuffer>::new(
 			1 << 20,
 			CacheTierSize::Bytes(8 << 10),

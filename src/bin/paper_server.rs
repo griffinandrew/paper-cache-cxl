@@ -1182,10 +1182,18 @@ mod tests {
 	/// and reading this process's one tiered cache.
 	#[test]
 	fn self_stats_end_with_the_physical_fast_tier_of_the_one_cache() {
-		let cache = Cache::new(
+		// The per-object metadata model (S5): this test is not about the
+		// model, and a 64 KiB tier is smaller than the cache's own empty
+		// structures -- under the measured model's key ceiling it would refuse
+		// every key.
+		let mut gate = paper_cache::GateConfig::default();
+		gate.metadata_model = paper_cache::MetadataModel::PerObject;
+
+		let cache = Cache::new_with_gate(
 			1 << 20,
 			CacheTierSize::Bytes(64 << 10),
 			PaperPolicy::LruCompactHybrid,
+			gate,
 		)
 		.expect("a tiered cache");
 

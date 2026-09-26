@@ -66,7 +66,12 @@ pub enum WorkerEvent {
 	/// after the value was published -- the new-key rule
 	/// (`PolicyWorker::handle_set`). 0 from a flat cache, which queues no
 	/// migrations; in the byte padding the variant already had.
-	Set(HashedKey, ObjectSize, ObjectSize, ExpireTime, Option<(ObjectSize, ExpireTime)>, Tier, u32),
+	///
+	/// `placement` (S5): `Structural` when the value was larger than an empty
+	/// fast tier and was built slow for that reason (`gate::decide`); every
+	/// stack then places the key slow (`PolicyStack::insert_placed`). `Normal`
+	/// from a flat cache. Also in the padding: the event stays 40 bytes.
+	Set(HashedKey, ObjectSize, ObjectSize, ExpireTime, Option<(ObjectSize, ExpireTime)>, Tier, u32, Placement),
 	Del(HashedKey, ExpireTime),
 
 	/// A `TtlWorker` reap: the object at this key expired, and that worker has
@@ -145,6 +150,14 @@ pub enum WorkerEvent {
 	/// this variant exists to support.
 	Shutdown,
 
+	/// S5, `MetadataOverflow::EvictToFit`: the metadata lane's head asks the
+	/// policy worker to evict the policy's own victims until a new key fits
+	/// under the key ceiling (`PolicyWorker::handle_make_room`); the worker
+	/// answers through the gate (`Gate::answer_make_room`). To the policy
+	/// worker only.
+	#[cfg(feature = "hybrid_cache_common")]
+	MakeRoom(u64),
+
 	/// DIAGNOSTIC: the policy worker lands every migration it has decided,
 	/// walks the object map, classifies each live value by where its bytes
 	/// are against where the stack places it, and replies. Sent only by
@@ -193,6 +206,7 @@ impl Events {
 	pub const POLICY: EventMask = 1 << 10;
 	pub const SHUTDOWN: EventMask = 1 << 11;
 	pub const AUDIT: EventMask = 1 << 13;
+	pub const MAKE_ROOM: EventMask = 1 << 14;
 
 	/// `PolicyWorker`. Note the two omissions: `Promote` is delivered to the
 	/// tiering worker directly through `PolicyWorker`'s own `promotion_tx`,
@@ -210,7 +224,8 @@ impl Events {
 		| Self::RESIZE_SIZE_THRESHOLD
 		| Self::POLICY
 		| Self::SHUTDOWN
-		| Self::AUDIT;
+		| Self::AUDIT
+		| Self::MAKE_ROOM;
 
 	/// `TtlWorker` -- expiry bookkeeping only. Reads never change an object's
 	/// expiry, so `Get` (the dominant event in a read-heavy workload) is
@@ -256,6 +271,8 @@ impl WorkerEvent {
 			WorkerEvent::Shutdown => Events::SHUTDOWN,
 			#[cfg(feature = "hybrid_cache_common")]
 			WorkerEvent::Audit(..) => Events::AUDIT,
+			#[cfg(feature = "hybrid_cache_common")]
+			WorkerEvent::MakeRoom(..) => Events::MAKE_ROOM,
 		}
 	}
 }
@@ -298,6 +315,9 @@ pub use crate::worker::tiering::TieringWorker;
 // in every configuration -- carries one in the low bit of its pointer. There
 // is no configuration left that does not need the name.
 pub use crate::worker::policy::Tier;
+
+// A set's placement byte (S5), for `gate` and the set path.
+pub use crate::worker::policy::Placement;
 
 // The lock every unit test that drives a migration holds, for `crate::phys`'s
 // served-hit test, which builds a real demoting cache. See its doc.

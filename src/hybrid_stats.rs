@@ -115,8 +115,13 @@ pub struct HybridStats {
 	/// (`phys::reset_fast_bytes_max`).
 	pub phys_fast_bytes_max: u64,
 
-	/// `F - L * omega`: the fast tier's budget for value bytes once the
-	/// per-object reservation is taken off. This cache's; reporting only.
+	/// eff (S5): the fast tier's budget for value bytes, `F - M_model`,
+	/// saturating -- THE figure every decision reads (the stacks' settles, the
+	/// structural check, the metadata cap), as the policy worker last
+	/// published it. `M_model` is `dram_metadata_bytes_model`: the measured M
+	/// by default, the stack's per-object reservation under
+	/// `MetadataModel::PerObject`. It was S2's reporting-only `F - L *
+	/// omega`, which `AtomicStatus::per_object_effective_fast_capacity` keeps.
 	pub effective_fast_capacity: u64,
 
 	/// The integral over time of `max(0, phys_fast_bytes + L * omega - F)`,
@@ -209,6 +214,51 @@ pub struct HybridStats {
 	/// `reconcile_applied_*` are the process-global totals.
 	pub reconcile_applied_to_fast: u64,
 	pub reconcile_applied_to_slow: u64,
+
+	/// S5: the metadata model the policy worker last published under
+	/// (`GateConfig::metadata_model`, forced to `PerObject` by
+	/// `PAPER_DISABLE_SHARED_OVERHEAD=1`).
+	pub metadata_model: crate::gate::MetadataModel,
+
+	/// `M_model`, the metadata figure eff takes off F: the measured M
+	/// (`dram_metadata_bytes`) under `Measured`, the stack's reservation
+	/// (`fast_metadata_bytes`) under `PerObject`.
+	pub dram_metadata_bytes_model: u64,
+
+	/// The key ceiling `K_max` a NEW key is checked against near it
+	/// (`gate::key_ceiling`); `u64::MAX` when there is none (omega 0).
+	pub metadata_key_ceiling: u64,
+
+	/// eff is 0: metadata fills the fast tier, every value is structural and
+	/// nothing tiers.
+	pub metadata_bound: bool,
+
+	/// New keys refused with `CacheError::MetadataOverflow` under `Error`.
+	pub metadata_overflows: u64,
+
+	/// `EvictToFit`: room requests sent to the policy worker, the victims it
+	/// evicted for them, and the waits that ended in `MetadataOverflow`
+	/// (nothing to evict, or no progress within the window).
+	pub make_room_requests: u64,
+	pub make_room_evictions: u64,
+	pub make_room_failures: u64,
+
+	/// Sets whose value was larger than an empty fast tier, built slow and
+	/// placed slow (`Placement::Structural`).
+	pub structural_slow_sets: u64,
+
+	/// Keys a stack placed slow by its OWN structural check against a set the
+	/// client placed normally -- eff moved between the two (expected near 0).
+	pub structural_placements: u64,
+
+	/// Times a set woke the policy worker from its long idle poll (the
+	/// set-path kick).
+	pub idle_kicks: u64,
+
+	/// Publications at which the measured M left 2x of `L * omega` either way
+	/// (`L > 10,000`), counted on entering that state: the model's sanity
+	/// check. A counter only.
+	pub metadata_model_divergence: u64,
 }
 
 impl HybridStats {

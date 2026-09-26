@@ -77,7 +77,7 @@ use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
 		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
-		HashedKey, PolicyStack, Tier,
+		HashedKey, PolicyStack, Tier, Placement, SetEvent, placed,
 	},
 	PaperPolicy,
 };
@@ -181,6 +181,11 @@ pub struct LruSizedCompactHybridStack {
 
 	/// (key, new tier) pairs recorded since the last `drain_tier_migrations`.
 	migrations: Vec<(HashedKey, Tier)>,
+
+	/// S5: the measured M the policy worker pushed (`set_dram_metadata`),
+	/// reserved instead of the per-object reservation; `None` under the
+	/// per-object model.
+	measured: Option<CacheSize>,
 }
 
 impl LruSizedCompactHybridStack {
@@ -203,6 +208,7 @@ impl LruSizedCompactHybridStack {
 
 			shared_overhead: 0,
 			migrations: Vec::new(),
+			measured: None,
 		}
 	}
 
@@ -249,13 +255,20 @@ impl LruSizedCompactHybridStack {
 		(size as CacheSize) < self.size_threshold
 	}
 
-	/// Splits the total reserved shared-structure DRAM cost (`tracked object
-	/// count x shared_overhead`, across all four queues -- shared metadata
-	/// scales with everything tracked, not just one segment) proportionally
-	/// between the two fast segments' capacities. `(0, 0)` if both capacities
-	/// are zero (nothing to proportion against).
+	/// The whole reservation: the measured M the policy worker pushed (S5),
+	/// or `tracked object count x shared_overhead` -- across all four queues,
+	/// since shared metadata scales with everything tracked, not just one
+	/// segment.
+	fn reserved_overhead(&self) -> CacheSize {
+		self.measured.unwrap_or(self.queues.len() as CacheSize * self.shared_overhead)
+	}
+
+	/// Splits `reserved_overhead()` proportionally between the two fast
+	/// segments' capacities. `(0, 0)` if both capacities are zero (nothing to
+	/// proportion against). `gate::size_split_shares` is the same split, for
+	/// the figures the policy worker publishes.
 	fn reserved_shares(&self) -> (CacheSize, CacheSize) {
-		let reserved = self.queues.len() as CacheSize * self.shared_overhead;
+		let reserved = self.reserved_overhead();
 		let total_capacity = self.small_capacity + self.large_capacity;
 
 		if total_capacity == 0 {
@@ -275,6 +288,18 @@ impl LruSizedCompactHybridStack {
 
 	fn effective_large(&self) -> CacheSize {
 		self.large_capacity.saturating_sub(self.reserved_shares().1)
+	}
+
+	/// Whether a value of `migrating` bytes, of base size `size`, is
+	/// STRUCTURAL (S5): larger than its size class's EMPTY fast segment --
+	/// `effective_small()` or `effective_large()`, the figures the policy
+	/// worker publishes as the class's eff. Such a key is placed at the front
+	/// of its class's SLOW list and never promoted while it stays that large.
+	fn structural(&self, size: ObjectSize, migrating: CacheSize) -> bool {
+		match self.classify(size) {
+			true => migrating > self.effective_small(),
+			false => migrating > self.effective_large(),
+		}
 	}
 
 	/// Subtracts `size` from whichever byte counter `queue` owns. Saturating,
@@ -352,13 +377,41 @@ impl LruSizedCompactHybridStack {
 	/// reclassification between the two fast queues are the same code path;
 	/// only the former emits a migration, because a fast->fast move never
 	/// crosses the `Tier` boundary.
-	fn touch_fast(&mut self, key: HashedKey) {
+	fn touch_fast(&mut self, key: HashedKey, structural: bool) {
 		let Some(payload) = self.queues.payload(key) else { return };
 
 		let queue = SizeQueue::from_u8(payload.queue);
 		let target_small = self.classify(payload.size);
 		let was_slow = queue.is_slow();
 		let migrating = payload.migrating();
+
+		// S5: a STRUCTURAL key goes to the front of its class's SLOW list -- a
+		// slow one is not promoted, a fast one leaves the fast set, pushed
+		// `(key, Slow)`; a reclassification between the two slow lists moves
+		// no bytes.
+		if structural || self.structural(payload.size, migrating) {
+			let target_queue = if target_small { SizeQueue::SmallSlow } else { SizeQueue::LargeSlow };
+
+			if queue == target_queue {
+				self.queues.move_front(target_queue.slot(), key);
+				return;
+			}
+
+			self.sub_used(queue, migrating);
+			self.queues.move_to_front_of(queue.slot(), target_queue.slot(), key);
+			self.add_used(target_queue, migrating);
+
+			if let Some(slot) = self.queues.payload_mut(key) {
+				slot.queue = target_queue.tag();
+				slot.tier = Some(Tier::Slow);
+			}
+
+			if !was_slow {
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			return;
+		}
 
 		match (queue, target_small) {
 			(SizeQueue::SmallFast, true) => {
@@ -404,6 +457,84 @@ impl LruSizedCompactHybridStack {
 		if was_slow && self.queues.payload(key).map(|p| p.queue) == Some(target_queue.tag()) {
 			self.migrations.push((key, Tier::Fast));
 		}
+	}
+
+	/// A `Set`, with the client's placement (S5): the design's insert, with a
+	/// STRUCTURAL value at the front of its class's slow list. Returns the
+	/// placement applied.
+	fn insert_with(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, placement: Placement) -> Placement {
+		let dram_resident = narrow_resident(dram_resident);
+		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+		let structural = placement == Placement::Structural || self.structural(size, migrating);
+
+		if self.queues.contains(key) {
+			// Existing key: track any size change, then treat as an access --
+			// a `set()` always re-admits to fast, reclassifying between
+			// segments if the new size crosses the threshold (S5: to its
+			// class's slow list if structural).
+			self.resize_key(key, size, dram_resident);
+			self.touch_fast(key, structural);
+			return placed(structural);
+		}
+
+		// S5: a STRUCTURAL new key goes to the front of its class's SLOW list:
+		// built slow, nothing pushed, nothing to settle.
+		if structural {
+			let queue = if self.classify(size) { SizeQueue::SmallSlow } else { SizeQueue::LargeSlow };
+
+			self.queues.push_front(
+				queue.slot(),
+				key,
+				NodePayload {
+					size,
+					dram_resident,
+					queue: queue.tag(),
+					tier: Some(Tier::Slow),
+					phys: Some(Tier::Slow),
+					freq: 0,
+					ts: 0,
+				},
+			);
+			self.add_used(queue, migrating);
+
+			return Placement::Structural;
+		}
+
+		if self.classify(size) {
+			self.queues.push_front(
+				Q_SMALL_FAST,
+				key,
+				NodePayload {
+					size,
+					dram_resident,
+					queue: SizeQueue::SmallFast.tag(),
+					tier: Some(Tier::Fast),
+					phys: Some(Tier::Fast),
+					freq: 0,
+					ts: 0,
+				},
+			);
+			self.small_fast_used += migrating;
+			self.settle_small_fast();
+		} else {
+			self.queues.push_front(
+				Q_LARGE_FAST,
+				key,
+				NodePayload {
+					size,
+					dram_resident,
+					queue: SizeQueue::LargeFast.tag(),
+					tier: Some(Tier::Fast),
+					phys: Some(Tier::Fast),
+					freq: 0,
+					ts: 0,
+				},
+			);
+			self.large_fast_used += migrating;
+			self.settle_large_fast();
+		}
+
+		Placement::Normal
 	}
 
 	/// Demotes the SMALL fast queue's LRU tail(s) into `small_slow` while
@@ -519,56 +650,35 @@ impl PolicyStack for LruSizedCompactHybridStack {
 	}
 
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		let dram_resident = narrow_resident(dram_resident);
-		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
-
-		if self.queues.contains(key) {
-			// Existing key: track any size change, then treat as an access --
-			// a `set()` always re-admits to fast, reclassifying between
-			// segments if the new size crosses the threshold.
-			self.resize_key(key, size, dram_resident);
-			self.touch_fast(key);
-			return;
-		}
-
-		if self.classify(size) {
-			self.queues.push_front(
-				Q_SMALL_FAST,
-				key,
-				NodePayload {
-					size,
-					dram_resident,
-					queue: SizeQueue::SmallFast.tag(),
-					tier: Some(Tier::Fast),
-					phys: Some(Tier::Fast),
-					freq: 0,
-					ts: 0,
-				},
-			);
-			self.small_fast_used += migrating;
-			self.settle_small_fast();
-		} else {
-			self.queues.push_front(
-				Q_LARGE_FAST,
-				key,
-				NodePayload {
-					size,
-					dram_resident,
-					queue: SizeQueue::LargeFast.tag(),
-					tier: Some(Tier::Fast),
-					phys: Some(Tier::Fast),
-					freq: 0,
-					ts: 0,
-				},
-			);
-			self.large_fast_used += migrating;
-			self.settle_large_fast();
-		}
+		self.insert_with(key, size, dram_resident, Placement::Normal);
 	}
+
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		_event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_with(key, size, dram_resident, placement)
+	}
+
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.measured = measured;
+	}
+
+	/// S5: every settle, against the current budget (the policy worker's
+	/// end-of-pass step).
+	fn resettle(&mut self) {
+		self.settle_small_fast();
+		self.settle_large_fast();
+	}
+
 
 	fn update(&mut self, key: HashedKey) {
 		if self.queues.contains(key) {
-			self.touch_fast(key);
+			self.touch_fast(key, false);
 		}
 	}
 
@@ -653,7 +763,7 @@ impl PolicyStack for LruSizedCompactHybridStack {
 	fn dram_reserved_bytes(&self) -> CacheSize {
 		// The undivided total `reserved_shares` proportions between the two
 		// fast segments; shared metadata scales with everything tracked.
-		self.queues.len() as CacheSize * self.shared_overhead
+		self.reserved_overhead()
 	}
 
 	fn fast_bytes_used(&self) -> CacheSize {

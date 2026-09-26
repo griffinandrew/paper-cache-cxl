@@ -104,7 +104,7 @@ use crate::{
 	error::CacheError,
 	merged_store::{MergedOrder, MergedStore, MigrationLog},
 	object::ObjectSize,
-	worker::policy::policy_stack::{CacheSize, HashedKey, PolicyStack, SetEvent, TaggedMigration, Tier},
+	worker::policy::policy_stack::{CacheSize, HashedKey, Placement, PolicyStack, SetEvent, TaggedMigration, Tier},
 	PaperPolicy,
 };
 
@@ -240,6 +240,29 @@ where
 	/// derives a slot's bytes from its object.
 	fn insert_set(&mut self, key: HashedKey, size: ObjectSize, _dram_resident: ObjectSize, event: SetEvent) {
 		self.store.worker_set(key, size, event, &mut self.log);
+	}
+
+	/// The `Set`, with the client's placement (S5): see
+	/// `MergedStore::worker_set_placed`.
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		_dram_resident: ObjectSize,
+		event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.store.worker_set_placed(key, size, event, placement, &mut self.log)
+	}
+
+	/// S5: the pushed M, or the per-object reservation back.
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.store.set_dram_metadata(measured);
+	}
+
+	/// S5: the store's settle, against the current budget.
+	fn resettle(&mut self) {
+		self.store.resettle(&mut self.log);
 	}
 
 	/// A cache hit.

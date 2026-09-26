@@ -118,8 +118,8 @@ use std::{
 };
 
 use paper_cache::{
-    phys, BufferDRAM, BufferPMEM, CacheTierSize, HybridStats, PaperCache, PaperPolicy, Tier,
-    TieredBuffer,
+    phys, BufferDRAM, BufferPMEM, CacheTierSize, GateConfig, HybridStats, MetadataModel,
+    PaperCache, PaperPolicy, Tier, TieredBuffer,
 };
 
 type Cache = PaperCache<u64, TieredBuffer>;
@@ -216,11 +216,12 @@ impl Design {
     /// per-object reservation (`self.ghost.dram_bytes()`, or ghost entries times
     /// `EXACT_GHOST_ENTRY_DRAM_OVERHEAD` in the faithful family), so their
     /// `fast_metadata_bytes` exceeds `L * omega` once anything has been
-    /// evicted into the ghost, and `eff = F - L * omega` exceeds the budget
-    /// their own settles leave for values by exactly that. The two faithful
-    /// REPRIEVE designs share that code but never populate their ghost (their
-    /// module doc: variants 3 and 4 carry none), so they are held to the
-    /// equality like every other design.
+    /// evicted into the ghost. Until S5, `eff = F - L * omega` exceeded the
+    /// budget their own settles left for values by exactly that; since S5's
+    /// ghost unification eff is `F - M_model`, the ghost included, in every
+    /// design. The two faithful REPRIEVE designs share that code but never
+    /// populate their ghost (their module doc: variants 3 and 4 carry none),
+    /// so they reserve `L * omega` exactly, like every other design.
     fn reserves_ghost_dram(self) -> bool {
         matches!(
             self,
@@ -236,14 +237,36 @@ impl Design {
         )
     }
 
+    /// The fast-admission pair of the faithful S3-FIFO family keeps its small
+    /// queue in DRAM at `ratio * max_size`, unclamped to the tier (S5's
+    /// design 0.6, question Q7): the one design whose DRAM its settles do not
+    /// bound, and so the one held to the identity but not to the settle
+    /// target.
+    fn bounds_its_dram(self) -> bool {
+        !matches!(
+            self,
+            Design::Policy(
+                PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(..)
+                    | PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(..)
+            )
+        )
+    }
+
+    /// Built under the PER-OBJECT metadata model (S5), which this binary's
+    /// identities are written in: `eff = F - M_model`, M_model the stack's
+    /// own reservation.
     fn build(self, w: Workload) -> Cache {
+        let mut gate = GateConfig::default();
+        gate.metadata_model = MetadataModel::PerObject;
+
         match self {
-            Design::Policy(policy) => Cache::new(w.max_size, CacheTierSize::Bytes(w.fast), policy),
-            Design::Sized => Cache::new_sized_compact(
+            Design::Policy(policy) => Cache::new_with_gate(w.max_size, CacheTierSize::Bytes(w.fast), policy, gate),
+            Design::Sized => Cache::new_sized_compact_with_gate(
                 w.max_size,
                 CacheTierSize::Bytes(w.fast / 2),
                 CacheTierSize::Bytes(w.fast - w.fast / 2),
                 CacheTierSize::Bytes(SIZED_THRESHOLD),
+                gate,
             ),
         }
         .expect("hybrid cache")
@@ -463,20 +486,11 @@ fn check(cache: &Cache, lens: &BTreeMap<u64, u32>, run: &Run, phase: &str, hits:
     assert_eq!(s.live_flat_fast_caches, 0, "{label}: and no flat cache with fast values");
     assert_eq!(s.fast_hits + s.slow_hits, hits, "{label}: every hit is counted in one tier");
 
-    // eff = F - L * omega: the status' figure (its object count times the
-    // omega it recorded at construction) against the test's (the map's live
-    // keys times the reservation the stack made for its first key).
+    // The stack reserves L * omega -- the map's live keys times the
+    // reservation it made for its first key -- plus, in the designs that keep
+    // one, its ghost's DRAM, whose excess is recorded and reported (see
+    // `Design::reserves_ghost_dram`).
     let per_object = w.live * run.omega;
-    assert_eq!(
-        s.effective_fast_capacity,
-        run.fast.saturating_sub(per_object),
-        "{label}: eff != F - L * omega ({} live, omega {})",
-        w.live, run.omega,
-    );
-
-    // And the stack reserves exactly that -- `eff == F - fast_metadata_bytes`
-    // -- except in the designs that also reserve their ghost's DRAM, where
-    // the excess is recorded and reported (see `Design::reserves_ghost_dram`).
     assert!(
         s.fast_metadata_bytes >= per_object,
         "{label}: the stack reserves {} B, less than L * omega = {per_object}",
@@ -486,11 +500,38 @@ fn check(cache: &Cache, lens: &BTreeMap<u64, u32>, run: &Run, phase: &str, hits:
     if run.design.reserves_ghost_dram() {
         run.ghost_max.set(run.ghost_max.get().max(ghost));
     } else {
-        assert_eq!(
-            s.effective_fast_capacity,
-            run.fast.saturating_sub(s.fast_metadata_bytes),
-            "{label}: eff != F - the stack's reservation ({} B for {} objects)",
-            s.fast_metadata_bytes, w.live,
+        assert_eq!(ghost, 0, "{label}: a design without a ghost reserves more than L * omega");
+    }
+
+    // eff = F - M_model (S5), one figure in every design -- the ghost's DRAM
+    // included, where until S5 the ghost designs' eff left it out: under the
+    // per-object model this binary pins, M_model is the stack's reservation.
+    assert_eq!(s.metadata_model, MetadataModel::PerObject, "{label}: the model");
+    assert_eq!(s.dram_metadata_bytes_model, s.fast_metadata_bytes, "{label}: M_model is the stack's reservation");
+    assert_eq!(
+        s.effective_fast_capacity,
+        run.fast.saturating_sub(s.fast_metadata_bytes),
+        "{label}: eff != F - M_model ({} B for {} objects)",
+        s.fast_metadata_bytes, w.live,
+    );
+
+    // T9+ (S5): at rest every design is at or under its settle target, `S =
+    // 0.98 eff` -- the settles, the resettle each pass (LFU's latched
+    // admissions never settled), the DRAM queues policed at their drain
+    // targets -- so P + M_model <= F. The faithful fast-admission pair's small
+    // queue is not bounded by the tier (`Design::bounds_its_dram`).
+    if run.design.bounds_its_dram() {
+        let target = (s.effective_fast_capacity as f64 * 0.98) as u64;
+
+        assert!(
+            s.fast_bytes_used <= target,
+            "{label}: {} fast bytes at rest, over the settle target {target} (eff {})",
+            s.fast_bytes_used, s.effective_fast_capacity,
+        );
+        assert!(
+            p as u64 + s.dram_metadata_bytes_model <= run.fast,
+            "{label}: P {p} + M_model {} over F {}",
+            s.dram_metadata_bytes_model, run.fast,
         );
     }
 

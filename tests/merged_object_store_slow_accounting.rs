@@ -39,16 +39,20 @@
 use std::time::{Duration, Instant};
 
 use paper_cache::{
-	numa_alloc::measured, CacheTierSize, HybridStats, PaperCache, PaperPolicy, TieredBuffer,
+	numa_alloc::measured, CacheTierSize, GateConfig, HybridStats, MetadataModel, PaperCache, PaperPolicy,
+	TieredBuffer,
 };
 
 const KEYS: u64 = 3_000;
 
 /// Small enough that the per-object metadata reservation (78 B an object in
-/// this build) takes the whole budget a third of the way through the fill, as
-/// 4 MiB did on the golden trace -- from then on every hit is a promotion the
-/// settle undoes at once.
-const FAST_TIER: u64 = 64 * 1024;
+/// this build) takes most of the budget by the end of the fill -- 234,000 of
+/// its 245,760 B -- so most hits land on slow keys. It was 64 KiB, which the
+/// reservation filled a third of the way through, until S5: with the key
+/// ceiling (per-object: F / 78 B) that tier refuses keys past 840, and it
+/// must admit all 3,000. (The regime it reached -- every hit a promotion the
+/// settle undid -- is T8's, in the lib.)
+const FAST_TIER: u64 = 240 * 1024;
 
 /// Varied, never a size class on the nose, never empty.
 fn value(key: u64, round: u64) -> Vec<u8> {
@@ -98,10 +102,18 @@ fn slow_bytes_measured_equal_slow_bytes_modelled() {
 		let before = measured::slow_allocated();
 
 		let (measured_slow, stats) = {
-			let cache = PaperCache::<u64, TieredBuffer>::new(
+			// The per-object model (S5), whose arithmetic the tier above is
+			// sized in: under the measured one this tier is smaller than the
+			// store's own structures, and its key ceiling would refuse every
+			// key.
+			let mut gate = GateConfig::default();
+			gate.metadata_model = MetadataModel::PerObject;
+
+			let cache = PaperCache::<u64, TieredBuffer>::new_with_gate(
 				64 * 1024 * 1024,
 				CacheTierSize::Bytes(FAST_TIER),
 				policy,
+				gate,
 			)
 			.expect("the merged store implements this policy");
 

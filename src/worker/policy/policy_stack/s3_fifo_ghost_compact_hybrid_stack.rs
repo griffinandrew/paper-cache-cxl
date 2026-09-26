@@ -32,7 +32,7 @@ use crate::{
 	worker::policy::policy_stack::{
 		arena_queue_set::{ArenaQueueSet, NodePayload}, ghost_filter::GhostFilter, narrow_resident, drain_target,
 		CacheSize, HashedKey,
-		PolicyStack, Tier,
+		PolicyStack, Tier, Placement, SetEvent, fast_at_or_before, placed, prev_fast,
 	},
 	PaperPolicy,
 };
@@ -103,6 +103,11 @@ pub struct S3FifoGhostCompactHybridStack {
 	main_boundary: Option<HashedKey>,
 
 	migrations: Vec<(HashedKey, Tier)>,
+
+	/// S5: the measured M the policy worker pushed (`set_dram_metadata`),
+	/// reserved instead of the per-object reservation; `None` under the
+	/// per-object model.
+	measured: Option<CacheSize>,
 }
 
 impl S3FifoGhostCompactHybridStack {
@@ -126,6 +131,7 @@ impl S3FifoGhostCompactHybridStack {
 			main_count: 0,
 			main_boundary: None,
 			migrations: Vec::new(),
+			measured: None,
 		}
 	}
 
@@ -144,8 +150,51 @@ impl S3FifoGhostCompactHybridStack {
 	/// moves the value and leaves the key's row, stack node and header in
 	/// DRAM -- plus the ghost filter's entries, which are DRAM as well. See
 	/// `PolicyStack::dram_reserved_bytes`.
+	///
+	/// Under the measured model the ghost filter's table is inside the pushed
+	/// M (`GhostFilter::allocated_bytes`), so its own term applies only to the
+	/// per-object reservation (S5).
 	fn reserved_overhead(&self) -> CacheSize {
-		self.queues.len() as CacheSize * self.shared_overhead + self.ghost.dram_bytes()
+		self.measured.unwrap_or(self.queues.len() as CacheSize * self.shared_overhead + self.ghost.dram_bytes())
+	}
+
+	/// This stack's eff (S5): the whole fast tier's budget for values -- the
+	/// tier's, not a segment's -- before the drain target.
+	fn own_eff(&self) -> CacheSize {
+		self.fast_capacity.saturating_sub(self.reserved_overhead())
+	}
+
+	/// Whether a value of `migrating` bytes is STRUCTURAL (S5): larger than an
+	/// empty fast tier. Such a key is placed slow, keeps its place in the
+	/// policy's order, and is never promoted while it stays that large. The
+	/// stack's own check beside the client's flag, so a key the client placed
+	/// normally just before eff moved is placed as the stack's own promotions
+	/// would place it.
+	fn structural(&self, migrating: CacheSize) -> bool {
+		migrating > self.own_eff()
+	}
+
+	/// Takes a FAST main key out of the fast set IN PLACE (S5): an overwrite
+	/// with a value larger than an empty fast tier -- S3-FIFO's main queue is
+	/// never reordered by an access. Pushed `(key, Slow)`: its placement
+	/// changed.
+	fn demote_in_place(&mut self, key: HashedKey) {
+		let Some(payload) = self.queues.payload(key) else { return };
+		let size = payload.migrating();
+
+		if self.main_boundary == Some(key) {
+			self.main_boundary = prev_fast(&self.queues, key);
+		}
+
+		if let Some(p) = self.queues.payload_mut(key) {
+			p.tier = Some(Tier::Slow);
+		}
+
+		self.fast_used = self.fast_used.saturating_sub(size);
+		self.fast_count = self.fast_count.saturating_sub(1);
+		self.slow_used += size;
+
+		self.migrations.push((key, Tier::Slow));
 	}
 
 	pub fn is_ghost(&self, key: HashedKey) -> bool {
@@ -154,7 +203,29 @@ impl S3FifoGhostCompactHybridStack {
 
 	/// A brand-new key whose fingerprint is in the ghost skips the one-access
 	/// queue and enters main directly, in the fast tier.
-	fn admit_via_ghost_hit(&mut self, key: HashedKey, size: ObjectSize, dram_resident: u8) {
+	fn admit_via_ghost_hit(&mut self, key: HashedKey, size: ObjectSize, dram_resident: u8, structural: bool) {
+		// S5: a structural key enters main's front with tier slow: built slow,
+		// nothing pushed or settled.
+		if structural {
+			self.queues.push_front(
+				Q_MAIN,
+				key,
+				NodePayload {
+					size,
+					freq: 0,
+					ts: 0,
+					queue: Queue::Main as u8,
+					tier: Some(Tier::Slow),
+					phys: Some(Tier::Slow),
+					dram_resident,
+				},
+			);
+			self.slow_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+			self.main_count += 1;
+
+			return;
+		}
+
 		self.queues.push_front(
 			Q_MAIN,
 			key,
@@ -226,9 +297,9 @@ impl S3FifoGhostCompactHybridStack {
 		}
 	}
 
-	fn touch(&mut self, key: HashedKey) {
+	fn touch(&mut self, key: HashedKey, structural: bool) {
 		match self.queues.payload(key).map(|p| Queue::from_u8(p.queue)) {
-			Some(Queue::OneAccess) => self.promote_from_one_access(key),
+			Some(Queue::OneAccess) => self.promote_from_one_access(key, structural),
 			Some(Queue::Main) => self.mark_accessed(key),
 			None => {},
 		}
@@ -243,9 +314,28 @@ impl S3FifoGhostCompactHybridStack {
 		}
 	}
 
-	fn promote_from_one_access(&mut self, key: HashedKey) {
+	fn promote_from_one_access(&mut self, key: HashedKey, structural: bool) {
 		let Some(payload) = self.queues.payload(key) else { return };
 		let size_bytes = payload.migrating();
+
+		// S5: a STRUCTURAL key moves to main's front all the same -- its place
+		// in the order -- with tier slow, and is not promoted.
+		if structural {
+			self.queues.move_to_front_of(Q_ONE_ACCESS, Q_MAIN, key);
+			self.one_access_used = self.one_access_used.saturating_sub(size_bytes);
+
+			if let Some(p) = self.queues.payload_mut(key) {
+				p.queue = Queue::Main as u8;
+				p.tier = Some(Tier::Slow);
+				p.freq = 0;
+			}
+
+			self.slow_used += size_bytes;
+			self.main_count += 1;
+
+			self.settle_fast_tier();
+			return;
+		}
 
 		self.queues.move_to_front_of(Q_ONE_ACCESS, Q_MAIN, key);
 		self.one_access_used = self.one_access_used.saturating_sub(size_bytes);
@@ -280,7 +370,7 @@ impl S3FifoGhostCompactHybridStack {
 		let was_boundary = was_fast && self.main_boundary == Some(key);
 
 		let new_boundary_if_moved = if was_boundary {
-			self.queues.before(key)
+			prev_fast(&self.queues, key)
 		} else {
 			None
 		};
@@ -289,6 +379,30 @@ impl S3FifoGhostCompactHybridStack {
 
 		if was_boundary {
 			self.main_boundary = new_boundary_if_moved;
+		}
+
+		// S5: a STRUCTURAL key gets its second chance at the front with tier
+		// slow -- never promoted; a fast one leaves the fast set, pushed.
+		if self.structural(size) {
+			if let Some(p) = self.queues.payload_mut(key) {
+				p.tier = Some(Tier::Slow);
+				p.freq = 0;
+			}
+
+			if was_fast {
+				self.fast_used = self.fast_used.saturating_sub(size);
+				self.fast_count = self.fast_count.saturating_sub(1);
+				self.slow_used += size;
+
+				if self.main_boundary == Some(key) {
+					self.main_boundary = None;
+				}
+
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			self.settle_fast_tier();
+			return;
 		}
 
 		if let Some(p) = self.queues.payload_mut(key) {
@@ -320,7 +434,7 @@ impl S3FifoGhostCompactHybridStack {
 		while self.fast_used > target {
 			let Some(demote_key) = self.main_boundary else { break };
 			let size = self.queues.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
-			let new_boundary = self.queues.before(demote_key);
+			let new_boundary = prev_fast(&self.queues, demote_key);
 
 			if let Some(p) = self.queues.payload_mut(demote_key) {
 				p.tier = Some(Tier::Slow);
@@ -337,6 +451,52 @@ impl S3FifoGhostCompactHybridStack {
 
 	fn main_is_full(&self) -> bool {
 		self.fast_used + self.slow_used >= self.main_capacity
+	}
+
+	/// A `Set`, with the client's placement (S5): an existing key is an access
+	/// (`touch`: a one-access key promotes, a main key is marked -- and a fast
+	/// one overwritten with a STRUCTURAL value leaves the fast set in place);
+	/// a new key enters the one-access queue, which is slow, as it always did; a ghost hit, main's front (slow when structural).
+	/// Returns the placement applied.
+	fn insert_with(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, placement: Placement) -> Placement {
+		let dram_resident = narrow_resident(dram_resident);
+		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+		let structural = placement == Placement::Structural || self.structural(migrating);
+
+		if let Some(payload) = self.queues.payload(key) {
+			self.resize_key(key, size, dram_resident);
+
+			// S5: a FAST main key overwritten with a structural value leaves the
+			// fast set in place (an access never reorders main).
+			if structural && Queue::from_u8(payload.queue) == Queue::Main && payload.tier == Some(Tier::Fast) {
+				self.demote_in_place(key);
+			}
+
+			self.touch(key, structural);
+			return placed(structural);
+		}
+
+		if self.ghost.contains(key) {
+			self.admit_via_ghost_hit(key, size, dram_resident, structural);
+			return placed(structural);
+		}
+
+		self.queues.push_front(
+			Q_ONE_ACCESS,
+			key,
+			NodePayload {
+				size,
+				freq: 0,
+				ts: 0,
+				queue: Queue::OneAccess as u8,
+				tier: None,
+				phys: None,
+				dram_resident,
+			},
+		);
+		self.one_access_used += migrating;
+
+		placed(structural)
 	}
 
 	fn evict_one_access_tail(&mut self) -> Option<HashedKey> {
@@ -365,38 +525,34 @@ impl PolicyStack for S3FifoGhostCompactHybridStack {
 	}
 
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		let dram_resident = narrow_resident(dram_resident);
+		self.insert_with(key, size, dram_resident, Placement::Normal);
+	}
 
-		if self.queues.contains(key) {
-			self.resize_key(key, size, dram_resident);
-			self.touch(key);
-			return;
-		}
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		_event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_with(key, size, dram_resident, placement)
+	}
 
-		if self.ghost.contains(key) {
-			self.admit_via_ghost_hit(key, size, dram_resident);
-			return;
-		}
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.measured = measured;
+	}
 
-		self.queues.push_front(
-			Q_ONE_ACCESS,
-			key,
-			NodePayload {
-				size,
-				freq: 0,
-				ts: 0,
-				queue: Queue::OneAccess as u8,
-				tier: None,
-				phys: None,
-				dram_resident,
-			},
-		);
-		self.one_access_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+	/// S5: every settle, against the current budget (the policy worker's
+	/// end-of-pass step).
+	fn resettle(&mut self) {
+		self.settle_fast_tier();
 	}
 
 	fn update(&mut self, key: HashedKey) {
-		if self.queues.contains(key) {
-			self.touch(key);
+		if let Some(payload) = self.queues.payload(key) {
+			let structural = self.structural(payload.migrating());
+			self.touch(key, structural);
 		}
 	}
 
@@ -417,7 +573,7 @@ impl PolicyStack for S3FifoGhostCompactHybridStack {
 			Queue::Main => {
 				let new_boundary_if_needed =
 					if payload.tier == Some(Tier::Fast) && self.main_boundary == Some(key) {
-						self.queues.before(key)
+						prev_fast(&self.queues, key)
 					} else {
 						None
 					};
@@ -492,7 +648,9 @@ impl PolicyStack for S3FifoGhostCompactHybridStack {
 					self.fast_count = self.fast_count.saturating_sub(1);
 
 					if self.main_boundary == Some(key) {
-						self.main_boundary = self.queues.back(Q_MAIN);
+						// The tail was the boundary: the nearest fast key from the
+						// new tail (S5: past any structural ones).
+						self.main_boundary = fast_at_or_before(&self.queues, self.queues.back(Q_MAIN));
 					}
 				},
 

@@ -113,6 +113,56 @@ impl OverheadManager {
 		total_size
 	}
 
+	/// `base_size` of the object a set WILL build -- its key, `len` value bytes
+	/// and `ttl` -- computed before anything is allocated (S5): the size checks
+	/// run from it, so an oversize value is refused without being built. The
+	/// same terms as `base_size`, from the inputs the object is made of:
+	/// `key_size()` is the key's `get_size()`, `data_size()` is `len`, and an
+	/// expiry exists exactly when the ttl is `Some` and not 0
+	/// (`expiry_from_ttl`). `base_size_for_equals_base_size` holds the two
+	/// equal. `None` for a length no object can carry (over `u32::MAX`).
+	pub fn base_size_for<K>(&self, key: &K, len: usize, ttl: Option<u32>) -> Option<ObjectSize>
+	where
+		K: TypeSize,
+	{
+		let len = ObjectSize::try_from(len).ok()?;
+		let value = resident_object_bytes::<K>(len);
+		let mut total_size = (key.get_size() as ObjectSize)
+			.checked_add(value)?
+			.checked_add(mem::size_of::<crate::object::ExpireTime>() as ObjectSize)?;
+
+		if ttl.is_some_and(|ttl| ttl != 0) {
+			total_size = total_size.checked_add(get_ttl_overhead())?;
+		}
+
+		Some(total_size)
+	}
+
+	/// `dram_resident_size` of the object a set will build (see
+	/// `base_size_for`).
+	pub fn dram_resident_size_for<K>(&self, key: &K, ttl: Option<u32>) -> ObjectSize
+	where
+		K: TypeSize,
+	{
+		#[cfg(feature = "fused_value")]
+		{
+			let _ = (key, ttl);
+			return 0;
+		}
+
+		#[cfg(not(feature = "fused_value"))]
+		{
+			let mut resident =
+				key.get_size() as ObjectSize + mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
+
+			if ttl.is_some_and(|ttl| ttl != 0) {
+				resident += get_ttl_overhead();
+			}
+
+			resident
+		}
+	}
+
 	/// Returns the size of the object including base and policy-related overheads.
 	pub fn total_size<K, V>(&self, object: &Object<K, V>) -> ObjectSize
 	where
@@ -273,6 +323,7 @@ pub(crate) mod test_overheads {
 	thread_local! {
 		static OMEGA: Cell<Option<ObjectSize>> = const { Cell::new(None) };
 		static POLICY: Cell<Option<ObjectSize>> = const { Cell::new(None) };
+		static PER_OBJECT: Cell<bool> = const { Cell::new(false) };
 	}
 
 	pub(crate) fn omega() -> Option<ObjectSize> {
@@ -283,11 +334,30 @@ pub(crate) mod test_overheads {
 		POLICY.with(Cell::get)
 	}
 
-	/// Both overrides, for this thread, until the guard drops.
+	/// Whether a cache built on this thread is pinned to the per-object
+	/// metadata model (S5): `set` and `per_object` pin it.
+	pub(crate) fn per_object_pinned() -> bool {
+		PER_OBJECT.with(Cell::get)
+	}
+
+	/// Both overrides, for this thread, until the guard drops -- and the
+	/// per-object metadata model (S5), whose arithmetic they are: T14's
+	/// constants are omega's.
 	#[must_use]
 	pub(crate) fn set(omega: ObjectSize, policy: ObjectSize) -> Guard {
 		OMEGA.with(|cell| cell.set(Some(omega)));
 		POLICY.with(|cell| cell.set(Some(policy)));
+		PER_OBJECT.with(|cell| cell.set(true));
+
+		Guard
+	}
+
+	/// The per-object metadata model alone, for this thread, until the guard
+	/// drops (S5): the real-cache lib tests at toy scales, whose fast tiers
+	/// the measured M's fixed first allocations would fill.
+	#[must_use]
+	pub(crate) fn per_object() -> Guard {
+		PER_OBJECT.with(|cell| cell.set(true));
 
 		Guard
 	}
@@ -298,6 +368,7 @@ pub(crate) mod test_overheads {
 		fn drop(&mut self) {
 			OMEGA.with(|cell| cell.set(None));
 			POLICY.with(|cell| cell.set(None));
+			PER_OBJECT.with(|cell| cell.set(false));
 		}
 	}
 }

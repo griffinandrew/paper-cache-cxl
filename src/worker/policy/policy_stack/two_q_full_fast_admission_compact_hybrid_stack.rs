@@ -76,7 +76,7 @@ use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
 		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
-		HashedKey, PolicyStack, Tier,
+		HashedKey, PolicyStack, Tier, Placement, SetEvent, fast_at_or_before, placed, prev_fast,
 	},
 	PaperPolicy,
 };
@@ -166,6 +166,11 @@ pub struct TwoQFullFastAdmissionCompactHybridStack {
 	carve_out_fills_fast_tier: bool,
 
 	migrations: Vec<(HashedKey, Tier)>,
+
+	/// S5: the measured M the policy worker pushed (`set_dram_metadata`),
+	/// reserved instead of the per-object reservation; `None` under the
+	/// per-object model.
+	measured: Option<CacheSize>,
 }
 
 impl TwoQFullFastAdmissionCompactHybridStack {
@@ -192,6 +197,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 			am_boundary: None,
 			carve_out_fills_fast_tier: false,
 			migrations: Vec::new(),
+			measured: None,
 		}
 	}
 
@@ -206,7 +212,114 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 	/// index bucket and a slab slot, and `queues.len()` counts all three
 	/// queues -- including `a1_out`, whose members are ordinary resident keys.
 	fn reserved_overhead(&self) -> CacheSize {
-		self.queues.len() as CacheSize * self.shared_overhead
+		self.measured.unwrap_or(self.queues.len() as CacheSize * self.shared_overhead)
+	}
+
+	/// This stack's eff (S5): the whole fast tier's budget for values -- the
+	/// tier's, not a segment's -- before the drain target.
+	fn own_eff(&self) -> CacheSize {
+		self.fast_capacity.saturating_sub(self.reserved_overhead())
+	}
+
+	/// Whether a value of `migrating` bytes is STRUCTURAL (S5): larger than an
+	/// empty fast tier. Such a key is placed slow, keeps its place in the
+	/// policy's order, and is never promoted while it stays that large. The
+	/// stack's own check beside the client's flag, so a key the client placed
+	/// normally just before eff moved is placed as the stack's own promotions
+	/// would place it.
+	fn structural(&self, migrating: CacheSize) -> bool {
+		migrating > self.own_eff()
+	}
+
+	/// A key the stack places FAST in `a1_in` whose new value is STRUCTURAL
+	/// (S5) goes where a structural new key goes: `a1_out`'s front, as
+	/// `settle_a1_in` demotes one -- pushed `(key, Slow)`, its placement
+	/// changed.
+	fn a1_in_to_a1_out(&mut self, key: HashedKey) {
+		let Some(payload) = self.queues.payload(key) else { return };
+		let size = payload.migrating();
+
+		self.queues.move_to_front_of(Q_A1_IN, Q_A1_OUT, key);
+
+		if let Some(p) = self.queues.payload_mut(key) {
+			p.queue = Queue::A1Out as u8;
+			p.tier = None;
+		}
+
+		self.a1_in_used = self.a1_in_used.saturating_sub(size);
+		self.a1_out_used += size;
+
+		self.migrations.push((key, Tier::Slow));
+	}
+
+	/// A `Set`, with the client's placement (S5). An existing key: its size
+	/// tracked, then an access -- an `a1_in` hit is a no-op (a key that grew
+	/// there re-polices `a1_in`), and a STRUCTURAL `a1_in` key moves to
+	/// `a1_out`; an `a1_out` or `am` hit as `touch`. A new key: `a1_in`, fast --
+	/// or, STRUCTURAL, `a1_out`'s front, slow, where `a1_in`'s overflow goes:
+	/// built slow, nothing pushed. Returns the placement applied.
+	fn insert_with(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, placement: Placement) -> Placement {
+		let dram_resident = narrow_resident(dram_resident);
+		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+		let structural = placement == Placement::Structural || self.structural(migrating);
+
+		if self.queues.contains(key) {
+			let grew_in_a1_in = self.resize_key(key, size, dram_resident);
+			let in_a1_in = self.queues.payload(key).map(|p| Queue::from_u8(p.queue)) == Some(Queue::A1In);
+
+			if structural && in_a1_in {
+				self.a1_in_to_a1_out(key);
+				return Placement::Structural;
+			}
+
+			self.touch(key, structural);
+
+			// The hit was a no-op, so a key that grew in `a1_in` is still there
+			// and may have pushed `a1_in` past its budget: demote its tail as
+			// an admission would, rather than leave the overrun to the next one.
+			if grew_in_a1_in {
+				self.settle_a1_in(0);
+			}
+
+			return placed(structural);
+		}
+
+		if structural {
+			self.queues.push_front(Q_A1_OUT, key, NodePayload {
+				size,
+				dram_resident,
+				tier: None,
+				phys: None,
+				freq: 0,
+				ts: 0,
+				queue: Queue::A1Out as u8,
+			});
+			self.a1_out_used += migrating;
+
+			return Placement::Structural;
+		}
+
+		// Brand-new key: `a1_in` first, which is FAST here.
+		self.settle_a1_in(size);
+
+		self.queues.push_front(Q_A1_IN, key, NodePayload {
+			size,
+			dram_resident,
+			tier: None,
+			phys: None,
+			freq: 0,
+			ts: 0,
+			queue: Queue::A1In as u8,
+		});
+		self.a1_in_used += migrating;
+
+		// Deliberately does NOT re-settle the fast tier: the carve-out taken
+		// out of `fast_capacity` is the fixed `a1_in_carve_out()`, not live
+		// `a1_in_used`, so admission moves `am`'s budget only by the new key's
+		// metadata, which `am` pays first -- as before the clamp. And it
+		// deliberately does not evict: `settle_a1_in` demoted instead, and any
+		// resulting `a1_out` overrun is reported via `needs_capacity_eviction`.
+		Placement::Normal
 	}
 
 	/// `a1_in`'s carve-out from the fast tier: its configured capacity, but
@@ -388,11 +501,11 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 	/// `TwoQStack`, where `a1_out.remove` misses and `am.move_front` is a
 	/// silent no-op; and the key is already Fast, so there is nothing to
 	/// migrate either.
-	fn touch(&mut self, key: HashedKey) {
+	fn touch(&mut self, key: HashedKey, structural: bool) {
 		match self.queues.payload(key).map(|p| Queue::from_u8(p.queue)) {
 			Some(Queue::A1In) => {},
-			Some(Queue::A1Out) => self.promote_from_a1_out(key),
-			Some(Queue::Am) => self.touch_am(key),
+			Some(Queue::A1Out) => self.promote_from_a1_out(key, structural),
+			Some(Queue::Am) => self.touch_am(key, structural),
 			None => {},
 		}
 	}
@@ -421,7 +534,10 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 	/// budget by at most one `shared_overhead` until the next settle.
 	fn settle_a1_in(&mut self, incoming_size: ObjectSize) {
 		let incoming = incoming_size as CacheSize;
-		let budget = self.effective_a1_in_capacity();
+
+		// At the DRAIN TARGET of `a1_in`'s budget (S5), as `am` rests at the
+		// drain target of its own.
+		let budget = drain_target::bytes(self.effective_a1_in_capacity());
 
 		while self.a1_in_used + incoming > budget {
 			let Some(key) = self.queues.back(Q_A1_IN) else { break };
@@ -448,9 +564,27 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 	/// `TwoQFastAdmissionCompactHybridStack`'s promotion, which is a Fast->Fast
 	/// bookkeeping move. Here the bytes really do live in PMEM beforehand,
 	/// because `a1_out` is the slow tier.
-	fn promote_from_a1_out(&mut self, key: HashedKey) {
+	fn promote_from_a1_out(&mut self, key: HashedKey, structural: bool) {
 		let Some(payload) = self.queues.payload(key) else { return };
 		let size_bytes = payload.migrating();
+
+		// S5: a STRUCTURAL key moves to `am`'s front all the same -- its place
+		// in the order -- with tier slow; its bytes stay in PMEM.
+		if structural {
+			self.queues.move_to_front_of(Q_A1_OUT, Q_AM, key);
+			self.a1_out_used = self.a1_out_used.saturating_sub(size_bytes);
+
+			if let Some(p) = self.queues.payload_mut(key) {
+				p.queue = Queue::Am as u8;
+				p.tier = Some(Tier::Slow);
+			}
+
+			self.am_slow_used += size_bytes;
+			self.am_count += 1;
+
+			self.settle_fast_tier();
+			return;
+		}
 
 		self.queues.move_to_front_of(Q_A1_OUT, Q_AM, key);
 		self.a1_out_used = self.a1_out_used.saturating_sub(size_bytes);
@@ -482,17 +616,17 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 
 	/// Faithful port of `TwoQFullFastAdmissionHybridStack::touch_am`: the LRU
 	/// reorder composed additively with the tier promotion.
-	fn touch_am(&mut self, key: HashedKey) {
+	fn touch_am(&mut self, key: HashedKey, structural: bool) {
 		let previous_tier = self.queues.payload(key).and_then(|p| p.tier);
 
 		let already_at_front = self.queues.front(Q_AM) == Some(key);
 		let is_boundary = self.am_boundary == Some(key);
 
 		// Read the neighbour BEFORE moving: once the key is at the front its
-		// predecessor is gone, and the boundary must step back to whatever was
-		// in front of it.
+		// predecessor is gone, and the boundary must step back to whatever fast
+		// key was in front of it (S5: past any structural ones).
 		let new_boundary_if_moved = if is_boundary && !already_at_front {
-			self.queues.before(key)
+			prev_fast(&self.queues, key)
 		} else {
 			None
 		};
@@ -501,6 +635,31 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 
 		if is_boundary && !already_at_front {
 			self.am_boundary = new_boundary_if_moved;
+		}
+
+		// S5: a STRUCTURAL key moves to the front all the same -- its place in
+		// the order -- with tier slow: a slow one is not promoted, a fast one
+		// leaves the fast set, pushed `(key, Slow)` (its placement changed).
+		if structural {
+			if previous_tier == Some(Tier::Fast) {
+				let size = self.queues.payload(key).map(|p| p.migrating()).unwrap_or(0);
+				self.am_fast_used = self.am_fast_used.saturating_sub(size);
+				self.am_fast_count = self.am_fast_count.saturating_sub(1);
+				self.am_slow_used += size;
+
+				if let Some(p) = self.queues.payload_mut(key) {
+					p.tier = Some(Tier::Slow);
+				}
+
+				if self.am_boundary == Some(key) {
+					self.am_boundary = None;
+				}
+
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			self.settle_fast_tier();
+			return;
 		}
 
 		let mut promoted = false;
@@ -517,10 +676,11 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 			if let Some(p) = self.queues.payload_mut(key) {
 				p.tier = Some(Tier::Fast);
 			}
+		}
 
-			if self.am_boundary.is_none() {
-				self.am_boundary = Some(key);
-			}
+		// Fast, at the front; with no fast key in front of it, the boundary.
+		if self.am_boundary.is_none() {
+			self.am_boundary = Some(key);
 		}
 
 		self.settle_fast_tier();
@@ -543,7 +703,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 		while self.am_fast_used > target {
 			let Some(demote_key) = self.am_boundary else { break };
 			let size = self.queues.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
-			let new_boundary = self.queues.before(demote_key);
+			let new_boundary = prev_fast(&self.queues, demote_key);
 
 			if let Some(p) = self.queues.payload_mut(demote_key) {
 				p.tier = Some(Tier::Slow);
@@ -586,17 +746,12 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 				self.am_fast_used = self.am_fast_used.saturating_sub(size);
 				self.am_fast_count = self.am_fast_count.saturating_sub(1);
 
-				// The tail of `am` can only be Fast-tagged if every tracked
-				// `am` key is still Fast (fast keys are a contiguous prefix),
-				// in which case the boundary equalled this key. Re-point it at
-				// the new tail, unless that tail is Slow or `am` is now empty.
+				// The tail of `am` can only be Fast-tagged if every `am` key
+				// behind the boundary is gone, in which case the boundary
+				// equalled this key. Re-point it at the nearest fast key from
+				// the new tail (S5: past any structural ones), or none.
 				if self.am_boundary == Some(key) {
-					self.am_boundary = match self.queues.back(Q_AM) {
-						Some(back)
-							if self.queues.payload(back).and_then(|p| p.tier)
-								== Some(Tier::Fast) => Some(back),
-						_ => None,
-					};
+					self.am_boundary = fast_at_or_before(&self.queues, self.queues.back(Q_AM));
 				}
 			},
 
@@ -634,47 +789,37 @@ impl PolicyStack for TwoQFullFastAdmissionCompactHybridStack {
 	}
 
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		let dram_resident = narrow_resident(dram_resident);
+		self.insert_with(key, size, dram_resident, Placement::Normal);
+	}
 
-		if self.queues.contains(key) {
-			let grew_in_a1_in = self.resize_key(key, size, dram_resident);
-			self.touch(key);
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		_event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_with(key, size, dram_resident, placement)
+	}
 
-			// The hit was a no-op, so a key that grew in `a1_in` is still there
-			// and may have pushed `a1_in` past its budget: demote its tail as
-			// an admission would, rather than leave the overrun to the next one.
-			if grew_in_a1_in {
-				self.settle_a1_in(0);
-			}
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.measured = measured;
+	}
 
-			return;
-		}
-
-		// Brand-new key: `a1_in` first, which is FAST here.
-		self.settle_a1_in(size);
-
-		self.queues.push_front(Q_A1_IN, key, NodePayload {
-			size,
-			dram_resident,
-			tier: None,
-			phys: None,
-			freq: 0,
-			ts: 0,
-			queue: Queue::A1In as u8,
-		});
-		self.a1_in_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
-
-		// Deliberately does NOT re-settle the fast tier: the carve-out taken
-		// out of `fast_capacity` is the fixed `a1_in_carve_out()`, not live
-		// `a1_in_used`, so admission moves `am`'s budget only by the new key's
-		// metadata, which `am` pays first -- as before the clamp. And it
-		// deliberately does not evict: `settle_a1_in` demoted instead, and any
-		// resulting `a1_out` overrun is reported via `needs_capacity_eviction`.
+	/// S5: every settle, against the current budget (the policy worker's
+	/// end-of-pass step).
+	fn resettle(&mut self) {
+		// `a1_in` first -- its budget moves with the reservation and it is
+		// policed only on an insert, a growth or a resize -- then `am`.
+		self.settle_a1_in(0);
+		self.settle_fast_tier();
 	}
 
 	fn update(&mut self, key: HashedKey) {
-		if self.queues.contains(key) {
-			self.touch(key);
+		if let Some(payload) = self.queues.payload(key) {
+			let structural = self.structural(payload.migrating());
+			self.touch(key, structural);
 		}
 	}
 
@@ -696,7 +841,7 @@ impl PolicyStack for TwoQFullFastAdmissionCompactHybridStack {
 			Queue::Am => {
 				let new_boundary_if_needed =
 					if payload.tier == Some(Tier::Fast) && self.am_boundary == Some(key) {
-						self.queues.before(key)
+						prev_fast(&self.queues, key)
 					} else {
 						None
 					};
@@ -1188,12 +1333,15 @@ mod dram_ceiling_tests {
 	}
 
 	/// A reservation at or over the whole tier. `am`'s budget and `a1_in`'s
-	/// are both 0, so every admission demotes the one before it into `a1_out`
-	/// and `a1_in` -- the only DRAM values left -- holds just the newest key.
-	/// Nothing is evicted for it. Before the clamp and the split `a1_in` kept
-	/// its whole raw capacity in DRAM on top of the reservation.
+	/// are both 0, so eff is 0 and every new key is STRUCTURAL (S5): it goes
+	/// where `a1_in`'s overflow goes, `a1_out`'s front, slow -- built slow,
+	/// nothing pushed -- and no value is left in DRAM. (Before S5 each
+	/// admission entered `a1_in`, demoting the one before it, so `a1_in` held
+	/// the newest key in DRAM on a tier the metadata had filled.) Nothing is
+	/// evicted for it. Before the clamp and the split `a1_in` kept its whole
+	/// raw capacity in DRAM on top of the reservation.
 	#[test]
-	fn a_metadata_bound_tier_holds_only_the_newest_admission_in_dram() {
+	fn a_metadata_bound_tier_places_each_new_key_in_a1_out() {
 		// k_in 0.01: a 100 B `a1_in`, so each admission demotes the key before
 		// it into `a1_out`, where a hit proves it into `am`.
 		let mut stack =
@@ -1221,17 +1369,15 @@ mod dram_ceiling_tests {
 		assert_eq!(stack.effective_am_fast_capacity(), 0, "no am budget left");
 		assert_eq!(stack.fast_bytes_used(), 0, "a1_in and am demoted every value");
 
+		stack.drain_tier_migrations();
+
 		for key in 100..110 {
 			stack.insert(key, SIZE);
 			evict_while_asked(&mut stack);
 
-			assert_eq!(stack.fast_bytes_used(), SIZE as CacheSize, "key {key}: only the newest admission is in DRAM");
-			assert_eq!(stack.tier_of(key), Some(Tier::Fast), "key {key} was admitted to a1_in");
-
-			if key > 100 {
-				assert_eq!(stack.tier_of(key - 1), Some(Tier::Slow), "key {} was demoted by the next admission", key - 1);
-			}
-
+			assert_eq!(stack.fast_bytes_used(), 0, "key {key}: no value is in DRAM");
+			assert_eq!(stack.tier_of(key), Some(Tier::Slow), "key {key} was placed in a1_out");
+			assert!(stack.drain_tier_migrations().is_empty(), "key {key}: built slow, nothing pushed");
 			assert_eq!(stack.len(), 31 + (key - 99) as usize, "key {key}: nothing is evicted");
 		}
 	}
@@ -1243,20 +1389,21 @@ mod dram_ceiling_tests {
 	fn re_setting_a_key_larger_in_a1_in_re_settles_a1_in() {
 		let mut stack = stack(FITTING);
 
-		// Forty admissions: `a1_in` holds the 25 newest (2_500 B), `a1_out` the
-		// 15 oldest.
+		// Forty admissions: `a1_in` holds the 24 newest (2_400 B: it rests at
+		// the drain target of its 2_500 B budget since S5), `a1_out` the 16
+		// oldest.
 		for key in 1..=40 {
 			stack.insert(key, SIZE);
 			evict_while_asked(&mut stack);
 		}
 
-		// Proving those 15 fills `am`'s fast segment to its budget.
+		// Proving 15 of those fills `am`'s fast segment to its budget.
 		for key in 1..=15 {
 			stack.update(key);
 			evict_while_asked(&mut stack);
 		}
 
-		assert_eq!(stack.a1_in_used, 2_500);
+		assert_eq!(stack.a1_in_used, 2_400);
 		assert_within_the_fast_tier(&stack, 0, "before the re-set");
 
 		// Key 40 is `a1_in`'s newest; re-set it 300 B larger.
@@ -1273,7 +1420,7 @@ mod dram_ceiling_tests {
 
 		assert_eq!(stack.tier_of(40), Some(Tier::Fast), "the re-set key is still in a1_in");
 
-		for key in 16..=18 {
+		for key in 17..=19 {
 			assert_eq!(stack.tier_of(key), Some(Tier::Slow), "key {key}, a1_in's oldest, was demoted");
 		}
 

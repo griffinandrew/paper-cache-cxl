@@ -98,7 +98,7 @@ use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
 		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
-		HashedKey, PolicyStack, Tier,
+		HashedKey, PolicyStack, Tier, Placement, SetEvent, placed,
 	},
 	PaperPolicy,
 };
@@ -194,6 +194,11 @@ pub struct S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	carve_out_fills_fast_tier: bool,
 
 	migrations: Vec<(HashedKey, Tier)>,
+
+	/// S5: the measured M the policy worker pushed (`set_dram_metadata`),
+	/// reserved instead of the per-object reservation; `None` under the
+	/// per-object model.
+	measured: Option<CacheSize>,
 }
 
 impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
@@ -210,6 +215,7 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 			shared_overhead: 0,
 			carve_out_fills_fast_tier: false,
 			migrations: Vec::new(),
+			measured: None,
 		}
 	}
 
@@ -253,7 +259,62 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	/// change this value -- which is what makes it loop-invariant inside
 	/// `settle_fast_tier` and `settle_one_access`.
 	fn reserved_overhead(&self) -> CacheSize {
-		self.queues.len() as CacheSize * self.shared_overhead
+		self.measured.unwrap_or(self.queues.len() as CacheSize * self.shared_overhead)
+	}
+
+	/// This stack's eff (S5): the whole fast tier's budget for values -- the
+	/// tier's, not a segment's -- before the drain target.
+	fn own_eff(&self) -> CacheSize {
+		self.fast_capacity.saturating_sub(self.reserved_overhead())
+	}
+
+	/// Whether a value of `migrating` bytes is STRUCTURAL (S5): larger than an
+	/// empty fast tier. Such a key is placed slow, keeps its place in the
+	/// policy's order, and is never promoted while it stays that large. The
+	/// stack's own check beside the client's flag, so a key the client placed
+	/// normally just before eff moved is placed as the stack's own promotions
+	/// would place it.
+	fn structural(&self, migrating: CacheSize) -> bool {
+		migrating > self.own_eff()
+	}
+
+	/// S5: moves `key` -- from any of the four lists -- to the FRONT OF
+	/// `slow_head` with tier slow, its reference bit cleared: where a
+	/// STRUCTURAL key (its value larger than an empty fast tier) goes when the
+	/// policy would put it at the fast list's front. A slow key cannot sit in
+	/// the fast list, so the front of the slow segments -- the seam -- is the
+	/// nearest place; this design's one departure from "keeps its place in the
+	/// order". Returns whether the key left a FAST placement (the one-access
+	/// queue or the fast list), which the caller pushes `(key, Slow)` for.
+	fn to_slow_front(&mut self, key: HashedKey) -> bool {
+		let Some(payload) = self.queues.payload(key) else { return false };
+		let size = payload.migrating();
+		let from = Queue::from_u8(payload.queue);
+
+		match from {
+			Queue::SlowHead => self.queues.move_front(Q_SLOW_HEAD, key),
+			from => self.queues.move_to_front_of(from as u8 as usize, Q_SLOW_HEAD, key),
+		}
+
+		if let Some(p) = self.queues.payload_mut(key) {
+			p.queue = Queue::SlowHead as u8;
+			p.tier = Some(Queue::SlowHead.tier());
+			p.phys = Some(Queue::SlowHead.tier());
+			p.freq = 0;
+		}
+
+		match from {
+			Queue::OneAccess => self.one_access_used = self.one_access_used.saturating_sub(size),
+			Queue::Fast => self.fast_used = self.fast_used.saturating_sub(size),
+			Queue::SlowTail => self.slow_tail_used = self.slow_tail_used.saturating_sub(size),
+			Queue::SlowHead => {},
+		}
+
+		if from != Queue::SlowHead {
+			self.slow_head_used += size;
+		}
+
+		matches!(from, Queue::OneAccess | Queue::Fast)
 	}
 
 	/// Splits `reserved_overhead()` proportionally between the two
@@ -357,9 +418,9 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 		*counter = (*counter as i64 + delta).max(0) as CacheSize;
 	}
 
-	fn touch(&mut self, key: HashedKey) {
+	fn touch(&mut self, key: HashedKey, structural: bool) {
 		match self.queues.payload(key).map(|p| Queue::from_u8(p.queue)) {
-			Some(Queue::OneAccess) => self.promote_from_one_access(key),
+			Some(Queue::OneAccess) => self.promote_from_one_access(key, structural),
 
 			// Lazy: a hit on any main-queue key only sets the reference bit.
 			// It is read at three points -- the demotion boundary
@@ -382,9 +443,20 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	/// Moves a re-accessed one-access key to the front of the fast list.
 	/// Emits NO migration: the one-access queue is fast-tier here, so the
 	/// key's bytes are already physically DRAM.
-	fn promote_from_one_access(&mut self, key: HashedKey) {
+	fn promote_from_one_access(&mut self, key: HashedKey, structural: bool) {
 		let Some(payload) = self.queues.payload(key) else { return };
 		let size_bytes = payload.migrating();
+
+		// S5: a STRUCTURAL key goes to the front of the slow list, slow, and is
+		// not promoted; if it leaves a fast placement, pushed.
+		if structural {
+			if self.to_slow_front(key) {
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			self.settle_fast_tier();
+			return;
+		}
 
 		self.queues.move_to_front_of(Q_ONE_ACCESS, Q_FAST, key);
 		self.one_access_used = self.one_access_used.saturating_sub(size_bytes);
@@ -408,6 +480,18 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	fn give_second_chance(&mut self, key: HashedKey) {
 		let Some(payload) = self.queues.payload(key) else { return };
 		let size = payload.migrating();
+
+		// S5: a STRUCTURAL key's second chance keeps it slow, at the front of
+		// the slow list; a fast one (the fast-tail fallback) moves there,
+		// pushed.
+		if self.structural(size) {
+			if self.to_slow_front(key) {
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			self.settle_fast_tier();
+			return;
+		}
 		let was_slow = Queue::from_u8(payload.queue).is_slow();
 
 		match Queue::from_u8(payload.queue) {
@@ -468,6 +552,77 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	/// `give_second_chance`, which calls back into here, so the two must not be
 	/// mutually recursive. `settle_slow_split` is driven from the public trait
 	/// methods instead, and its own loop re-checks after any nested demotion.
+	/// A `Set`, with the client's placement (S5): the design's insert, with a
+	/// STRUCTURAL value placed slow -- see `to_slow_front`. Returns the
+	/// placement applied.
+	fn insert_with(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, placement: Placement) -> Placement {
+		let dram_resident = narrow_resident(dram_resident);
+		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+		let structural = placement == Placement::Structural || self.structural(migrating);
+
+		if self.queues.contains(key) {
+			self.resize_key(key, size, dram_resident);
+
+			// S5: a FAST main key overwritten with a structural value leaves the
+			// fast set, to the front of the slow list, pushed.
+			if structural && self.queues.payload(key).is_some_and(|p| Queue::from_u8(p.queue) == Queue::Fast) {
+				if self.to_slow_front(key) {
+					self.migrations.push((key, Tier::Slow));
+				}
+			}
+
+			self.touch(key, structural);
+			self.settle_slow_split();
+			return placed(structural);
+		}
+
+		// S5: a STRUCTURAL new key goes where this design sends a key its DRAM
+		// one-access queue cannot hold: the front of the slow list -- built
+		// slow, nothing pushed, nothing to police.
+		if structural {
+			self.queues.push_front(
+				Q_SLOW_HEAD,
+				key,
+				NodePayload {
+					size,
+					freq: 0,
+					ts: 0,
+					queue: Queue::SlowHead as u8,
+					tier: Some(Queue::SlowHead.tier()),
+					phys: Some(Queue::SlowHead.tier()),
+					dram_resident,
+				},
+			);
+			self.slow_head_used += migrating;
+
+			// `slow_head` grew: the crossing check, as the design's own insert
+			// runs it.
+			self.settle_slow_split();
+
+			return Placement::Structural;
+		}
+
+		self.queues.push_front(
+			Q_ONE_ACCESS,
+			key,
+			NodePayload {
+				size,
+				freq: 0,
+				ts: 0,
+				queue: Queue::OneAccess as u8,
+				tier: Some(Queue::OneAccess.tier()),
+				phys: Some(Queue::OneAccess.tier()),
+				dram_resident,
+			},
+		);
+		self.one_access_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+
+		self.settle_one_access();
+		self.settle_slow_split();
+
+		Placement::Normal
+	}
+
 	fn settle_fast_tier(&mut self) {
 		let effective_capacity = self.effective_main_fast_capacity();
 		let target = drain_target::bytes(effective_capacity);
@@ -559,7 +714,9 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 	/// This segment relieves pressure synchronously rather than through a
 	/// `PolicyWorker` migration batch.
 	fn settle_one_access(&mut self) {
-		let effective_capacity = self.effective_one_access_capacity();
+		// At the DRAIN TARGET of the queue's budget (S5), as main rests at
+		// the drain target of its own.
+		let effective_capacity = drain_target::bytes(self.effective_one_access_capacity());
 
 		while self.one_access_used > effective_capacity {
 			let Some(key) = self.queues.back(Q_ONE_ACCESS) else { break };
@@ -602,37 +759,37 @@ impl PolicyStack for S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybr
 	}
 
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		let dram_resident = narrow_resident(dram_resident);
+		self.insert_with(key, size, dram_resident, Placement::Normal);
+	}
 
-		if self.queues.contains(key) {
-			self.resize_key(key, size, dram_resident);
-			self.touch(key);
-			self.settle_slow_split();
-			return;
-		}
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		_event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_with(key, size, dram_resident, placement)
+	}
 
-		self.queues.push_front(
-			Q_ONE_ACCESS,
-			key,
-			NodePayload {
-				size,
-				freq: 0,
-				ts: 0,
-				queue: Queue::OneAccess as u8,
-				tier: Some(Queue::OneAccess.tier()),
-				phys: Some(Queue::OneAccess.tier()),
-				dram_resident,
-			},
-		);
-		self.one_access_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.measured = measured;
+	}
 
+	/// S5: every settle, against the current budget (the policy worker's
+	/// end-of-pass step).
+	fn resettle(&mut self) {
 		self.settle_one_access();
+		self.settle_fast_tier();
 		self.settle_slow_split();
 	}
 
+
 	fn update(&mut self, key: HashedKey) {
-		if self.queues.contains(key) {
-			self.touch(key);
+		if let Some(payload) = self.queues.payload(key) {
+			let structural = self.structural(payload.migrating());
+			self.touch(key, structural);
 			self.settle_slow_split();
 		}
 	}

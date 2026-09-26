@@ -55,8 +55,18 @@
 
 #[cfg(feature = "lru_compact_hybrid_cache")]
 mod real_dram_tests {
-    use paper_cache::{PaperCache, PaperPolicy, TieredBuffer, CacheTierSize};
+    use paper_cache::{PaperCache, PaperPolicy, TieredBuffer, CacheTierSize, GateConfig, MetadataModel};
     use paper_cache::numa_alloc::{resident_pages_per_node, NODE_FAST, NODE_SLOW};
+
+    /// The per-object metadata model (S5): this test is about where demoted
+    /// bytes land, not the model, and its tiers are smaller than the merged
+    /// and hashbrown caches' own structures -- under the measured model's key
+    /// ceiling they would refuse every key.
+    fn per_object() -> GateConfig {
+        let mut gate = GateConfig::default();
+        gate.metadata_model = MetadataModel::PerObject;
+        gate
+    }
 
     const PAGE_BYTES: u64 = 4096;
     const OBJECTS: u32 = 4_000;
@@ -83,10 +93,11 @@ mod real_dram_tests {
         // not counted in the delta. Deliberately tiny: a large warm-up would
         // pre-map pages the measured workload would then reuse.
         {
-            let warm = PaperCache::<u32, TieredBuffer>::new(
+            let warm = PaperCache::<u32, TieredBuffer>::new_with_gate(
                 1_048_576,
                 CacheTierSize::Bytes(1_024),
                 PaperPolicy::LruCompactHybrid,
+                per_object(),
             )
             .expect("warm-up cache should construct");
             warm.set(1u32, &[0u8; 64], None).expect("warm-up set");
@@ -96,10 +107,11 @@ mod real_dram_tests {
         let (fast_before, slow_before) =
             resident_pages_per_node().expect("should read /proc/self/numa_maps");
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_with_gate(
             200_000_000, // far above the payload: nothing is evicted, only demoted
             CacheTierSize::Bytes(FAST_TIER_BYTES),
             PaperPolicy::LruCompactHybrid,
+            per_object(),
         )
         .expect("cache should construct");
 

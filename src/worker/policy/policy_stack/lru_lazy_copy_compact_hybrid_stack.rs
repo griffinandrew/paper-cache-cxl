@@ -67,7 +67,7 @@ use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
 		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
-		HashedKey, PolicyStack, Tier,
+		HashedKey, PolicyStack, Tier, Placement, SetEvent, placed, prev_fast, walk_to,
 	},
 	PaperPolicy,
 };
@@ -91,6 +91,13 @@ fn lazy_window() -> f64 {
 			.filter(|v| *v >= 0.0 && *v < 1.0)
 			.unwrap_or(0.2)
 	})
+}
+
+/// The PHYSICAL cursor's step off `key`: the nearest key before it whose
+/// bytes are in DRAM -- past STRUCTURAL keys (S5), which are physically slow
+/// wherever they stand. `prev_fast` is the logical cursor's step.
+fn prev_phys_fast(list: &ArenaQueueSet<NodePayload>, key: HashedKey) -> Option<HashedKey> {
+	walk_to(list, list.before(key), |payload| payload.phys == Some(Tier::Fast))
 }
 
 /// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
@@ -135,6 +142,11 @@ pub struct LruLazyCopyCompactHybridStack {
 	/// `reclaim_dram` reached it, so neither crossing happened. The whole
 	/// point, counted.
 	copies_avoided: u64,
+
+	/// S5: the measured M the policy worker pushed (`set_dram_metadata`),
+	/// reserved instead of the per-object reservation; `None` under the
+	/// per-object model.
+	measured: Option<CacheSize>,
 }
 
 impl LruLazyCopyCompactHybridStack {
@@ -152,6 +164,7 @@ impl LruLazyCopyCompactHybridStack {
 			migrations: Vec::new(),
 			lazy_window: lazy_window(),
 			copies_avoided: 0,
+			measured: None,
 		}
 	}
 
@@ -180,7 +193,86 @@ impl LruLazyCopyCompactHybridStack {
 	/// row, stack node and header come off `dram_capacity` in every state.
 	/// See `PolicyStack::dram_reserved_bytes`.
 	fn reserved_overhead(&self) -> CacheSize {
-		self.list.len() as CacheSize * self.shared_overhead
+		self.measured.unwrap_or(self.list.len() as CacheSize * self.shared_overhead)
+	}
+
+	/// Whether a value of `migrating` bytes is STRUCTURAL (S5): larger than an
+	/// EMPTY fast tier -- the whole DRAM budget for values, `physical_capacity`,
+	/// the tier's figure rather than the logical share the policy settles to.
+	/// Such a key is placed logically AND physically slow -- never a candidate
+	/// -- keeps its place in the order, and is never promoted while it stays
+	/// that large.
+	fn structural(&self, migrating: CacheSize) -> bool {
+		migrating > self.physical_capacity()
+	}
+
+	/// A `Set`, with the client's placement (S5): an existing key is an access
+	/// (`touch_fast_key`); a new one is admitted at the front, logically and
+	/// physically fast -- or, STRUCTURAL, logically and physically slow: built
+	/// slow, never a cursor, nothing pushed, nothing settled. Returns the
+	/// placement applied.
+	fn insert_with(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, placement: Placement) -> Placement {
+		let dram_resident = narrow_resident(dram_resident);
+		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+		let structural = placement == Placement::Structural || self.structural(migrating);
+
+		if self.list.contains(key) {
+			self.resize_key(key, size, dram_resident);
+			self.touch_fast_key(key, structural);
+			return placed(structural);
+		}
+
+		if structural {
+			self.list.push_front(
+				Q_LRU,
+				key,
+				NodePayload {
+					size,
+					dram_resident,
+					tier: Some(Tier::Slow),
+					phys: Some(Tier::Slow),
+					freq: 0,
+					ts: 0,
+					queue: 0,
+				},
+			);
+			self.slow_used += migrating;
+
+			return Placement::Structural;
+		}
+
+		// Admission is unconditionally fast, logically AND physically, exactly
+		// as in the baseline -- `admission_tier` builds the buffer in DRAM.
+		self.list.push_front(
+			Q_LRU,
+			key,
+			NodePayload {
+				size,
+				dram_resident,
+				tier: Some(Tier::Fast),
+				phys: Some(Tier::Fast),
+				freq: 0,
+				ts: 0,
+				queue: 0,
+			},
+		);
+
+		self.fast_used += migrating;
+		self.dram_used += migrating;
+		self.fast_count += 1;
+
+		if self.fast_boundary.is_none() {
+			self.fast_boundary = Some(key);
+		}
+
+		if self.phys_boundary.is_none() {
+			self.phys_boundary = Some(key);
+		}
+
+		self.settle_fast_tier();
+		self.reclaim_dram();
+
+		Placement::Normal
 	}
 
 	/// Budget the PHYSICAL cursor enforces: the whole DRAM allowance, net of
@@ -240,7 +332,7 @@ impl LruLazyCopyCompactHybridStack {
 	/// The one place the saving is realised: if the key is a CANDIDATE its
 	/// bytes never left DRAM, so promotion is a relabel and no migration is
 	/// enqueued at all.
-	fn touch_fast_key(&mut self, key: HashedKey) {
+	fn touch_fast_key(&mut self, key: HashedKey, structural: bool) {
 		let Some(before) = self.list.payload(key) else { return };
 
 		let already_front = self.list.front(Q_LRU) == Some(key);
@@ -248,13 +340,13 @@ impl LruLazyCopyCompactHybridStack {
 		let was_phys_boundary = self.phys_boundary == Some(key);
 
 		// Read predecessors BEFORE moving: once the key is at the front its
-		// neighbour is gone, and each cursor must step back to whatever
-		// preceded it.
+		// neighbour is gone, and each cursor must step back to whatever key of
+		// its kind preceded it (S5: past structural keys).
 		let (new_fast_b, new_phys_b) = match already_front {
 			true => (None, None),
 			false => (
-				was_fast_boundary.then(|| self.list.before(key)).flatten(),
-				was_phys_boundary.then(|| self.list.before(key)).flatten(),
+				was_fast_boundary.then(|| prev_fast(&self.list, key)).flatten(),
+				was_phys_boundary.then(|| prev_phys_fast(&self.list, key)).flatten(),
 			),
 		};
 
@@ -266,6 +358,45 @@ impl LruLazyCopyCompactHybridStack {
 
 		if was_phys_boundary && !already_front {
 			self.phys_boundary = new_phys_b;
+		}
+
+		// S5: a STRUCTURAL key moves to the front all the same -- its place in
+		// the order -- logically AND physically slow, never a candidate: a
+		// logically fast one leaves the fast set, a key whose bytes are in
+		// DRAM (fast, or a candidate) is copied out now, pushed `(key, Slow)`;
+		// a slow one is not promoted.
+		if structural {
+			let size = before.migrating();
+
+			if before.tier == Some(Tier::Fast) {
+				self.fast_used = self.fast_used.saturating_sub(size);
+				self.fast_count = self.fast_count.saturating_sub(1);
+				self.slow_used += size;
+			}
+
+			if before.phys == Some(Tier::Fast) {
+				self.dram_used = self.dram_used.saturating_sub(size);
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			if let Some(slot) = self.list.payload_mut(key) {
+				slot.tier = Some(Tier::Slow);
+				slot.phys = Some(Tier::Slow);
+			}
+
+			// Still a cursor only if it was already at the front: then it was
+			// the one key of its kind, and none is left.
+			if self.fast_boundary == Some(key) {
+				self.fast_boundary = None;
+			}
+
+			if self.phys_boundary == Some(key) {
+				self.phys_boundary = None;
+			}
+
+			self.settle_fast_tier();
+			self.reclaim_dram();
+			return;
 		}
 
 		let mut promoted_physically = false;
@@ -311,6 +442,17 @@ impl LruLazyCopyCompactHybridStack {
 			}
 		}
 
+		// The key is at the front, logically and physically fast; with no key
+		// of a cursor's kind in front of it -- none at all, or (S5) only
+		// structural ones -- it is that cursor.
+		if self.fast_boundary.is_none() {
+			self.fast_boundary = Some(key);
+		}
+
+		if self.phys_boundary.is_none() {
+			self.phys_boundary = Some(key);
+		}
+
 		self.settle_fast_tier();
 		self.reclaim_dram();
 
@@ -333,7 +475,7 @@ impl LruLazyCopyCompactHybridStack {
 		while self.fast_used > target {
 			let Some(key) = self.fast_boundary else { break };
 			let size = self.list.payload(key).map(|p| p.migrating()).unwrap_or(0);
-			let next = self.list.before(key);
+			let next = prev_fast(&self.list, key);
 
 			if let Some(slot) = self.list.payload_mut(key) {
 				slot.tier = Some(Tier::Slow);
@@ -355,7 +497,7 @@ impl LruLazyCopyCompactHybridStack {
 		while self.dram_used > target {
 			let Some(key) = self.phys_boundary else { break };
 			let size = self.list.payload(key).map(|p| p.migrating()).unwrap_or(0);
-			let next = self.list.before(key);
+			let next = prev_phys_fast(&self.list, key);
 
 			if let Some(slot) = self.list.payload_mut(key) {
 				slot.phys = Some(Tier::Slow);
@@ -375,11 +517,11 @@ impl LruLazyCopyCompactHybridStack {
 		let size = p.migrating();
 
 		if self.fast_boundary == Some(key) {
-			self.fast_boundary = self.list.before(key);
+			self.fast_boundary = prev_fast(&self.list, key);
 		}
 
 		if self.phys_boundary == Some(key) {
-			self.phys_boundary = self.list.before(key);
+			self.phys_boundary = prev_phys_fast(&self.list, key);
 		}
 
 		match p.tier {
@@ -419,50 +561,36 @@ impl PolicyStack for LruLazyCopyCompactHybridStack {
 	}
 
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		let dram_resident = narrow_resident(dram_resident);
+		self.insert_with(key, size, dram_resident, Placement::Normal);
+	}
 
-		if self.list.contains(key) {
-			self.resize_key(key, size, dram_resident);
-			self.touch_fast_key(key);
-			return;
-		}
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		_event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_with(key, size, dram_resident, placement)
+	}
 
-		// Admission is unconditionally fast, logically AND physically, exactly
-		// as in the baseline -- `admission_tier` builds the buffer in DRAM.
-		self.list.push_front(
-			Q_LRU,
-			key,
-			NodePayload {
-				size,
-				dram_resident,
-				tier: Some(Tier::Fast),
-				phys: Some(Tier::Fast),
-				freq: 0,
-				ts: 0,
-				queue: 0,
-			},
-		);
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.measured = measured;
+	}
 
-		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
-		self.fast_used += migrating;
-		self.dram_used += migrating;
-		self.fast_count += 1;
-
-		if self.fast_boundary.is_none() {
-			self.fast_boundary = Some(key);
-		}
-
-		if self.phys_boundary.is_none() {
-			self.phys_boundary = Some(key);
-		}
-
+	/// S5: every settle, against the current budget (the policy worker's
+	/// end-of-pass step).
+	fn resettle(&mut self) {
 		self.settle_fast_tier();
 		self.reclaim_dram();
 	}
 
+
 	fn update(&mut self, key: HashedKey) {
-		if self.list.contains(key) {
-			self.touch_fast_key(key);
+		if let Some(payload) = self.list.payload(key) {
+			let structural = self.structural(payload.migrating());
+			self.touch_fast_key(key, structural);
 		}
 	}
 

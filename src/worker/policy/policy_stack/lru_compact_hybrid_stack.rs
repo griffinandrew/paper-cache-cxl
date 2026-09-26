@@ -50,7 +50,7 @@ use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
 		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
-		HashedKey, PolicyStack, Tier,
+		HashedKey, PolicyStack, Tier, Placement, SetEvent, fast_at_or_before, placed, prev_fast,
 	},
 	PaperPolicy,
 };
@@ -72,11 +72,18 @@ pub struct LruCompactHybridStack {
 
 	fast_count: usize,
 
-	/// The least-recently-used FAST key: everything from the MRU end up to and
-	/// including this key is fast, everything after it is slow.
+	/// The least-recently-used FAST key: everything after it is slow, and
+	/// every key from the MRU end up to it is fast -- but for STRUCTURAL keys
+	/// (S5), which keep their place in the order with tier slow, and which
+	/// every step of this cursor walks over (`prev_fast`).
 	fast_boundary: Option<HashedKey>,
 
 	migrations: Vec<(HashedKey, Tier)>,
+
+	/// S5: the measured M the policy worker pushed (`set_dram_metadata`),
+	/// reserved instead of `len x shared_overhead`; `None` under the
+	/// per-object model.
+	measured: Option<CacheSize>,
 }
 
 impl LruCompactHybridStack {
@@ -90,6 +97,7 @@ impl LruCompactHybridStack {
 			fast_count: 0,
 			fast_boundary: None,
 			migrations: Vec::new(),
+			measured: None,
 		}
 	}
 
@@ -111,7 +119,22 @@ impl LruCompactHybridStack {
 	/// DRAM. See `PolicyStack::dram_reserved_bytes` for the rule, and for why
 	/// a reservation at or over `fast_capacity` is left to saturate.
 	fn reserved_overhead(&self) -> CacheSize {
-		self.list.len() as CacheSize * self.shared_overhead
+		self.measured.unwrap_or(self.list.len() as CacheSize * self.shared_overhead)
+	}
+
+	/// This stack's eff (S5): the whole fast tier's budget for values, its
+	/// settle's figure before the drain target.
+	fn own_eff(&self) -> CacheSize {
+		self.fast_capacity.saturating_sub(self.reserved_overhead())
+	}
+
+	/// Whether a value of `migrating` bytes is STRUCTURAL (S5): larger than an
+	/// empty fast tier. Such a key is placed slow and never promoted while it
+	/// stays that large. The stack's own check beside the client's flag, so a
+	/// key the client placed normally just before eff moved is placed as the
+	/// stack's own promotions would place it.
+	fn structural(&self, migrating: CacheSize) -> bool {
+		migrating > self.own_eff()
 	}
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
@@ -144,8 +167,15 @@ impl LruCompactHybridStack {
 		}
 	}
 
-	/// Faithful port of `LruHybridStack::touch_fast_key`.
-	fn touch_fast_key(&mut self, key: HashedKey) {
+	/// Faithful port of `LruHybridStack::touch_fast_key` -- and, since S5, the
+	/// structural rule: a STRUCTURAL key (its value larger than an empty fast
+	/// tier) moves to the front all the same -- its place in the order -- but
+	/// with tier slow. A slow one is not promoted; a fast one (an overwrite with
+	/// a value too large, or an eff that shrank) leaves the fast set, pushed
+	/// `(key, Slow)`: its placement changed, and a promotion of its old value
+	/// may still be in flight, which this entry, behind it on the key's FIFO
+	/// consumer, undoes.
+	fn touch_fast_key(&mut self, key: HashedKey, structural: bool) {
 		let previous_tier = self.list.payload(key).and_then(|p| p.tier);
 
 		let already_at_front = self.list.front(Q_LRU) == Some(key);
@@ -153,9 +183,9 @@ impl LruCompactHybridStack {
 
 		// Read the neighbour BEFORE moving: once the key is at the front its
 		// predecessor is gone, and the boundary has to step back to whatever
-		// was in front of it.
+		// fast key was in front of it.
 		let new_boundary_if_moved = if is_boundary && !already_at_front {
-			self.list.before(key)
+			prev_fast(&self.list, key)
 		} else {
 			None
 		};
@@ -164,6 +194,30 @@ impl LruCompactHybridStack {
 
 		if is_boundary && !already_at_front {
 			self.fast_boundary = new_boundary_if_moved;
+		}
+
+		if structural {
+			if previous_tier == Some(Tier::Fast) {
+				let size = self.list.payload(key).map(|p| p.migrating()).unwrap_or(0);
+				self.fast_used = self.fast_used.saturating_sub(size);
+				self.fast_count = self.fast_count.saturating_sub(1);
+				self.slow_used += size;
+
+				if let Some(slot) = self.list.payload_mut(key) {
+					slot.tier = Some(Tier::Slow);
+				}
+
+				// Still the boundary only if it was already at the front: then
+				// it was the one fast key, and none is left.
+				if self.fast_boundary == Some(key) {
+					self.fast_boundary = None;
+				}
+
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			self.settle_fast_tier();
+			return;
 		}
 
 		let mut promoted = false;
@@ -180,10 +234,12 @@ impl LruCompactHybridStack {
 			if let Some(slot) = self.list.payload_mut(key) {
 				slot.tier = Some(Tier::Fast);
 			}
+		}
 
-			if self.fast_boundary.is_none() {
-				self.fast_boundary = Some(key);
-			}
+		// The key is fast, at the front; with no fast key in front of it --
+		// none at all, or (S5) only structural ones -- it is the boundary.
+		if self.fast_boundary.is_none() {
+			self.fast_boundary = Some(key);
 		}
 
 		self.settle_fast_tier();
@@ -206,6 +262,59 @@ impl LruCompactHybridStack {
 		}
 	}
 
+	/// A `Set`, with the client's placement (S5): an existing key is an access
+	/// (`touch_fast_key`); a new one is admitted at the front, fast -- or, when
+	/// STRUCTURAL (the client's flag, or this stack's own check), slow: built
+	/// slow, charged slow, never the boundary, nothing pushed (the reconcile's
+	/// new-key rule covers a stale entry of the key), nothing settled (no fast
+	/// byte moved). Returns the placement applied.
+	fn insert_with(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, placement: Placement) -> Placement {
+		let dram_resident = narrow_resident(dram_resident);
+		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+		let structural = placement == Placement::Structural || self.structural(migrating);
+
+		if self.list.contains(key) {
+			self.resize_key(key, size, dram_resident);
+			self.touch_fast_key(key, structural);
+			return placed(structural);
+		}
+
+		if structural {
+			self.list.push_front(Q_LRU, key, NodePayload {
+				size,
+				dram_resident,
+				tier: Some(Tier::Slow),
+				phys: Some(Tier::Slow),
+				freq: 0,
+				ts: 0,
+				queue: 0,
+			});
+			self.slow_used += migrating;
+
+			return Placement::Structural;
+		}
+
+		self.list.push_front(Q_LRU, key, NodePayload {
+			size,
+			dram_resident,
+			tier: Some(Tier::Fast),
+			phys: Some(Tier::Fast),
+			freq: 0,
+			ts: 0,
+			queue: 0,
+		});
+		self.fast_used += migrating;
+		self.fast_count += 1;
+
+		if self.fast_boundary.is_none() {
+			self.fast_boundary = Some(key);
+		}
+
+		self.settle_fast_tier();
+
+		Placement::Normal
+	}
+
 	/// Demotes from the tier boundary until `fast_used` is back within the
 	/// effective budget. The victim is always `fast_boundary` -- the least-
 	/// recently-used fast key -- so nothing is searched.
@@ -216,7 +325,7 @@ impl LruCompactHybridStack {
 		while self.fast_used > target {
 			let Some(demote_key) = self.fast_boundary else { break };
 			let size = self.list.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
-			let new_boundary = self.list.before(demote_key);
+			let new_boundary = prev_fast(&self.list, demote_key);
 
 			if let Some(slot) = self.list.payload_mut(demote_key) {
 				slot.tier = Some(Tier::Slow);
@@ -250,36 +359,32 @@ impl PolicyStack for LruCompactHybridStack {
 	}
 
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		let dram_resident = narrow_resident(dram_resident);
+		self.insert_with(key, size, dram_resident, Placement::Normal);
+	}
 
-		if self.list.contains(key) {
-			self.resize_key(key, size, dram_resident);
-			self.touch_fast_key(key);
-			return;
-		}
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		_event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_with(key, size, dram_resident, placement)
+	}
 
-		self.list.push_front(Q_LRU, key, NodePayload {
-			size,
-			dram_resident,
-			tier: Some(Tier::Fast),
-			phys: Some(Tier::Fast),
-			freq: 0,
-			ts: 0,
-			queue: 0,
-		});
-		self.fast_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
-		self.fast_count += 1;
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.measured = measured;
+	}
 
-		if self.fast_boundary.is_none() {
-			self.fast_boundary = Some(key);
-		}
-
+	fn resettle(&mut self) {
 		self.settle_fast_tier();
 	}
 
 	fn update(&mut self, key: HashedKey) {
-		if self.list.contains(key) {
-			self.touch_fast_key(key);
+		if let Some(payload) = self.list.payload(key) {
+			let structural = self.structural(payload.migrating());
+			self.touch_fast_key(key, structural);
 		}
 	}
 
@@ -289,7 +394,7 @@ impl PolicyStack for LruCompactHybridStack {
 		let tier = slot.tier;
 
 		let new_boundary_if_needed = if tier == Some(Tier::Fast) && self.fast_boundary == Some(key) {
-			self.list.before(key)
+			prev_fast(&self.list, key)
 		} else {
 			None
 		};
@@ -338,8 +443,10 @@ impl PolicyStack for LruCompactHybridStack {
 				self.fast_used = self.fast_used.saturating_sub(size);
 				self.fast_count = self.fast_count.saturating_sub(1);
 
+				// The boundary was the tail: the nearest fast key from the
+				// new tail (S5: past any structural ones).
 				if self.fast_boundary == Some(key) {
-					self.fast_boundary = self.list.back(Q_LRU);
+					self.fast_boundary = fast_at_or_before(&self.list, self.list.back(Q_LRU));
 				}
 			},
 

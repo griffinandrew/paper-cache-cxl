@@ -197,6 +197,17 @@ whenever `fast_used` is above that level and stops the moment it is back at it.
 what the admission or promotion that triggered it displaced, and the tier steady-states just
 under its budget instead of sawtoothing between two marks.
 
+**Every DRAM queue rests there, and every pass settles (S5).** The fast-admission designs' DRAM
+admission queues -- 2Q FA's FIFO, full 2Q's `a1_in`, the S3-FIFO fast-admission designs'
+one-access queue, eight policing sites -- are held at the drain target of their own budgets too,
+as main always was (the faithful fast-admission pair's small queue is not policed at all: design
+question Q7). And the policy worker re-runs every settle of the stack against the current budget
+at the end of every pass (`PolicyStack::resettle`, from `publish_gate`): a design whose new-key
+path never settles -- LFU once latched, the slow admission queues -- or whose budget shrank under
+it as the reservation grew, still rests at or under its drain target after each pass. LFU's
+admission gate is the same shape: `fast_used + migrating <= drain_target(F - (L + 1) x omega)`
+(or `F - M` under the measured model), in the stacks' own unit, in both stores.
+
 **The 2% is burst headroom, and it is the whole reason the ratio is not 1.0.** `PaperCache::set()`
 writes a new object's bytes to DRAM synchronously at the API layer, before the event reaches
 `PolicyWorker` at all; and a demotion the stack decides is not physically applied until a
@@ -300,37 +311,87 @@ comes out of capacity first, and the ratio applies to what is left.
 The multiplier is *every* tracked key, not just fast ones — a slow-tier object still has a
 hashtable entry, a list node and an `entries` slot in DRAM.
 
-When `tracked × shared_overhead` meets or exceeds `fast_capacity`, every value budget derived
-from the fast tier saturates at 0: the fast tier is metadata-bound, which is the true DRAM state
-rather than an accounting fault. What follows differs by design. Most demote every value. The
-2Q and S3-FIFO fast-admission designs also close DRAM admission: their admission queue is a
-carve-out of the tier clamped to it and pays a share of the reservation — its proportional share
-in six of them, and in `two_q_fast_admission` and `two_q_full_fast_admission`, which charge the
-main queue first, whatever main cannot absorb — so with no budget left each new key is evicted
-on arrival where the queue's overflow is an eviction (`two_q_fast_admission`; the S3-FIFO ghost
-variants, into the ghost) and goes to PMEM where it is a demotion or reprieve (the reprieve
-variants at once, `two_q_full_fast_admission` on the next admission). In `two_q_fast_admission`
-that closes the cache for good: it has no ghost, so a key that comes back is new again and is
-evicted again, and main is never the victim, so it admits nothing until a delete, an expiry or a
-resize brings the reservation back under the tier. The S3-FIFO ghost variants lose only a key's
-first arrival: its second finds the ghost and goes straight into main. The faithful S3-FIFO
-fast-admission variants are the exception: their DRAM small queue has no ceiling at all, so its
+When the reservation meets or exceeds `fast_capacity`, every value budget derived from the fast
+tier saturates at 0: the fast tier is metadata-bound, which is the true DRAM state rather than an
+accounting fault. Since S5 every design treats it the same way: eff is 0, so every value is
+STRUCTURAL -- larger than the empty tier -- and is built and placed slow (see "Admission" below):
+no tiering at all, and no key evicted on arrival. (Until S5 what followed differed by design:
+most demoted every value; the fast-admission designs evicted each new key on arrival where their
+queue's overflow is an eviction -- which closed `two_q_fast_admission` for good -- or sent it to
+PMEM where it is a demotion or reprieve.) The faithful S3-FIFO fast-admission variants are still
+the exception for a key already in their small queue: that queue has no ceiling at all, so its
 values stay in DRAM on top of the reservation. Charging only fast keys was tried and reverted — on cluster35
 (DashMap LRU, 5 GiB fast tier) it reserved 313.6 MB against 896.7 MB of real metadata, so fast
 data plus metadata reached 5,851 MB in a 5,369 MB tier. The merged store charges the same
 `linked() × shared_overhead` -- the keys its policy worker has linked, a DashMap stack's `len()`.
 
-**Measured, beside the model (S5a).** The policy worker also publishes M, the bytes the cache's
-own DRAM metadata structures hold (`src/meta.rs`; `AtomicStatus::dram_metadata_bytes`,
-`HybridStats::dram_metadata_bytes`, MEMTS `meta=`): the object map's tables and arrays, the
-stack's structures and one value header per live object, each counted where the structure grows,
-in jemalloc's usable-size unit. It is reporting only -- every settle still reserves
-`tracked × shared_overhead` -- and it differs from that model by design: M carries each
-structure's first allocation (a 128 KiB slab chunk per split stack, the DashMap's shard array,
-the merged store's 32 first 160 KiB chunks) and its load (a hashbrown table at 7/16..7/8, a keyless
-index at 1/4..1/2), where `shared_overhead` is a per-object constant fitted at 2^k. On a small cache
-the fixed part dominates: T9's caches (16-48 KiB fast tiers, tens of objects) hold M of 170-190 KB,
-so `F - M` is 0 there.
+**Measured (S5a), and what the settles reserve (S5).** The policy worker also publishes M, the
+bytes the cache's own DRAM metadata structures hold (`src/meta.rs`;
+`AtomicStatus::dram_metadata_bytes`, `HybridStats::dram_metadata_bytes`, MEMTS `meta=`): the object
+map's tables and arrays, the stack's structures and one value header per live object, each counted
+where the structure grows, in jemalloc's usable-size unit. It differs from the per-object model by
+design: M carries each structure's first allocation (a 128 KiB slab chunk per split stack, the
+DashMap's shard array, the merged store's 32 first 160 KiB chunks) and its load (a hashbrown table
+at 7/16..7/8, a keyless index at 1/4..1/2), where `shared_overhead` is a per-object constant fitted
+at 2^k. On a small cache the fixed part dominates: T9's caches (16-48 KiB fast tiers, tens of
+objects) hold M of 170-190 KB, so `F - M` is 0 there.
+
+Since S5 the reservation IS a model's figure, `M_model`, chosen per cache by
+`GateConfig::metadata_model`: `Measured` (the default) reserves M -- the ghost structures are
+inside it -- and `PerObject` (the fallback, and what the toy-scale tests pin) reserves the
+stack's own `tracked × shared_overhead`, plus the ghost's DRAM in the seven designs that keep one.
+The policy worker publishes ONE figure from it once per pass, `eff = F - M_model`
+(`AtomicStatus::effective_fast_capacity`, `publish_gate`), and pushes the same M into the stack
+(`PolicyStack::set_dram_metadata`), so every settle, the structural check and the key ceiling read
+the same number. `PAPER_DISABLE_SHARED_OVERHEAD=1` forces the per-object model with
+`shared_overhead = 0` whatever the configuration says. Strict counting has a small-cache
+consequence under the measured model: a cache whose fast tier is smaller than its structures'
+fixed first allocations -- about 170 KiB for a DashMap cache, the merged store's first slab chunk
+per shard (over 5 MB once every shard holds a key), `hashbrown_dram`'s table preallocated for 1.5M
+objects (about 42 MB) -- has eff 0 and a key ceiling at the count it already holds: no further new
+key is admitted (`MetadataOverflow`; under `EvictToFit`, one eviction per new key). The toy-scale
+tests pin the per-object model for that reason.
+
+### Admission: what `set` decides before it allocates (S5)
+
+A tiered cache's `set` is `begin_set` then `commit` (`src/gate.rs`, `PaperCache::begin_set`):
+
+1. **The size checks**, from the value's length (`OverheadManager::base_size_for`, equal to the
+   built object's `base_size`), with the predicates they always had: a value too large is refused
+   WITHOUT being allocated (the two flat set paths check first too).
+2. **The metadata cap.** A new key whose metadata would not fit the tier is refused: a ceiling on
+   the object count, `K_max` -- `floor((F - floor - ghost) / omega)` under the per-object model
+   (the plan's `(L + 1) x omega > F`), `max(L_hw, L_pub + floor((F - floor - M) / omega))` under
+   the measured one (refilling up to the high-water mark is free, so a table step that lands M
+   above the tier leaves reuse possible and evicts nothing); no ceiling at `omega = 0`. Checked
+   only near it (the gate word's `META_NEAR`, one relaxed load otherwise). `MetadataOverflow::Error`
+   (the default) returns `CacheError::MetadataOverflow` with nothing built or sent;
+   `MetadataOverflow::EvictToFit` (opt-in) queues the set FIFO in the metadata lane while the
+   policy worker evicts the policy's own victims for it (`WorkerEvent::MakeRoom`), so the set that
+   needs room waits for its eviction -- `MetadataOverflow` at once if there is nothing to evict, or
+   after `stall_window` without worker progress; `Internal` if the worker is gone.
+3. `hybrid_policy::admission_tier`, unchanged.
+4. **Structural slow placement.** A value larger than an EMPTY fast tier (`v > eff`; the
+   size-split design compares with its size class's segment) is built slow whatever step 3 said,
+   and its `Set` carries `Placement::Structural`: every stack places it slow, never promotes it
+   while it stays that large, and pushes nothing for it. It keeps its place in the policy's order:
+   the list front in LRU/FIFO/CLOCK (and every boundary cursor steps over slow keys,
+   `policy_stack::prev_fast`), the slow chain at frequency 1 in LFU and LRU-LFU (no latch), its
+   size class's slow list, and in the designs whose DRAM queue cannot take it, where that queue's
+   overflow goes (main's back in 2Q FA, `a1_out` in full 2Q, the front of `Q_MAIN_SLOW` or of
+   `slow_head` in the S3-FIFO reprieve designs, the front of main in the S3-FIFO ghost designs).
+   Where main is two physical lists (the S3-FIFO lazy reprieve family, the faithful core) a slow
+   key cannot sit in the fast one, so it takes the SEAM -- the slow list's front -- which is the
+   front whenever the fast list is empty (eff 0 included) and otherwise behind the fast keys. A
+   Fast key whose value becomes structural leaves the fast set, pushed `(key, Slow)`. The stack's
+   own check stands beside the client's flag; a set the stack made structural because eff moved
+   in between is counted (`structural_placements`).
+
+`commit` builds exactly what `begin_set` checked, inserts it, sends the `Set`, and then kicks the
+policy worker if it is parked on its long idle poll (the gate's `worker_idle` bit, a Dekker pair
+with `delay_event_loop`): the first set after an idle spell is taken at once, in both stores, one
+kick per spell. `HybridStats` reports the model, `M_model`, `K_max`, and the cap's, structural
+placement's and kick's counters.
 
 ### `eviction_stacks_pmem`
 

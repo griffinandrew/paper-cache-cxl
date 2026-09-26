@@ -63,6 +63,17 @@
 //!     and some 355 KB of registry, once per process, at whichever sampled key
 //!     comes first. Found by this test (a one-off 363,392 B step in the second
 //!     design's run). Built here before the first cache.
+//!   * PARKING_LOT'S TABLE OF PARKED THREADS. `parking_lot_core` keeps one
+//!     process-global hash table of parked threads, created by the first park
+//!     on (or unpark from) any lock built on it -- a contended DashMap shard, a
+//!     parking_lot mutex -- at 16 buckets of 64 B plus its 32-byte header,
+//!     1,056 B, and grown (the old one kept, never freed) once more than a
+//!     third as many threads have parked as it has buckets. Whether the
+//!     process's first contended lock fell in the warm-up or in the middle of
+//!     the measurement was timing: with S5's gate it fell mid-measurement in
+//!     about half the DashMap-build runs (a step 1,056 B over M). Built here
+//!     before the first cache, and grown past what the cache's threads need:
+//!     sixteen threads parked on one condvar at once.
 //!   * OUTPUT. A test's output is captured into a heap buffer that every
 //!     spawned thread inherits, and the policy worker prints (DIVERGE,
 //!     MIGSTATS); `set_output_capture(None)` sends this test's and its
@@ -92,7 +103,8 @@ use std::time::{Duration, Instant};
 
 use paper_cache::{
     numa_alloc::{measured, NODE_FAST},
-    phys, CacheTierSize, DramMetadata, PaperCache, PaperPolicy, Tier, TieredBuffer,
+    phys, CacheTierSize, DramMetadata, GateConfig, MetadataModel, PaperCache, PaperPolicy, Tier,
+    TieredBuffer,
 };
 
 type Cache = PaperCache<u64, TieredBuffer>;
@@ -106,9 +118,11 @@ const WARM: u64 = 250;
 /// New keys per design, after the warm-up's.
 const KEYS: u64 = 700;
 
-/// 400 KB of cache over values of 100..700 B: it starts evicting some 750
-/// keys in. The fast tier holds a sixth of it, so it demotes from key ~150.
-const MAX_SIZE: u64 = 400 * 1024;
+/// 200 KB of cache over values of 100..700 B: it starts evicting some 390
+/// keys in. The fast tier holds a third of it, so it demotes from key ~150.
+/// (400 KB until S5: its ~750 keys would pass the per-object key ceiling,
+/// 64 KiB / omega -- 585 keys at the split build's 112 B.)
+const MAX_SIZE: u64 = 200 * 1024;
 const FAST: u64 = 64 * 1024;
 
 /// Whether the fast values are in NODE_FAST (and so in the pool this test
@@ -264,7 +278,14 @@ fn hashbrown_steps() -> Vec<i64> {
 fn run(policy: PaperPolicy, value: &[u8], log: &mut Vec<Step>) -> (Reading, Reading, u64) {
     log.clear();
 
-    let cache = Cache::new(MAX_SIZE, CacheTierSize::Bytes(FAST), policy).expect("a tiered cache");
+    // The per-object metadata model (S5): what this test holds M to is the
+    // allocator, not the model, and a 64 KiB tier is smaller than the cache's
+    // own structures -- under the measured model's key ceiling it would refuse
+    // every key.
+    let mut gate = GateConfig::default();
+    gate.metadata_model = MetadataModel::PerObject;
+
+    let cache = Cache::new_with_gate(MAX_SIZE, CacheTierSize::Bytes(FAST), policy, gate).expect("a tiered cache");
 
     // The warm-up, one operation at a time as the measurement will be: every
     // channel used, the worker's buffers and the in-flight table made, both
@@ -364,6 +385,38 @@ fn run(policy: PaperPolicy, value: &[u8], log: &mut Vec<Step>) -> (Reading, Read
     (empty, filled, checked)
 }
 
+/// Parks sixteen threads on one parking_lot condvar at once: creates
+/// `parking_lot_core`'s table of parked threads and grows it to 64 buckets,
+/// which the cache's own threads never outgrow. The table is kept for the
+/// process's life; everything else here is freed when the threads are joined.
+fn warm_parking_lot() {
+    const THREADS: usize = 16;
+
+    let pair = std::sync::Arc::new((parking_lot::Mutex::new(0usize), parking_lot::Condvar::new()));
+
+    let threads: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let pair = pair.clone();
+
+            std::thread::spawn(move || {
+                let (lock, arrived) = &*pair;
+                let mut count = lock.lock();
+
+                *count += 1;
+                arrived.notify_all();
+
+                while *count < THREADS {
+                    arrived.wait(&mut count);
+                }
+            })
+        })
+        .collect();
+
+    for thread in threads {
+        thread.join().expect("a parking thread");
+    }
+}
+
 /// Whether `step` is a sum of at most `terms` of `legal`: one step can hold a
 /// set's own shard's growth and those of the shards its evictions looked a
 /// victim up in (`erase`'s `entry` reserves too).
@@ -379,6 +432,9 @@ fn the_dram_pool_moves_by_exactly_m_between_quiescent_points() {
 
     // See the module doc: rayon's global pool, before any reading.
     assert!(rayon::current_num_threads() > 0);
+
+    // See the module doc: parking_lot's table of parked threads, likewise.
+    warm_parking_lot();
 
     let mut designs = vec![
         PaperPolicy::LruCompactHybrid,

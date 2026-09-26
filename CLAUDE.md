@@ -71,7 +71,8 @@ src/
                                live_flat_fast_caches() == 0 (a flat BufferDRAM cache's values
                                are in P too). Also the policy worker's per-pass over-budget
                                integral and the MEMTS line (PAPER_MEMTS=1).
-                               Reporting only; the fast-tier gate (S5) will read it. Also
+                               Reporting only; the fast-tier byte gate (S5's second commit)
+                               will read it. Also
                                PlacementAudit, PaperCache::placement_audit()'s answer: every
                                live value's tag against the stack's placement_of -- stranded
                                (in DRAM, placed slow), lagging (in CXL, placed fast),
@@ -95,15 +96,30 @@ src/
                                effective_fast_capacity_measured), exported in HybridStats, on
                                the MEMTS line (meta=) and in the server's PHYSICAL FAST TIER
                                section. Slow-node structures are reported apart, not in M.
-                               Reporting only: the settles still reserve L x omega (S5 switches).
+                               Since S5 the default metadata model reserves it (gate.rs).
+  gate.rs                     S5: a tiered cache's admission path -- what set decides from the
+                               value's length before anything is allocated: the size checks,
+                               the metadata cap (a key ceiling K_max; MetadataOverflow, or
+                               EvictToFit through WorkerEvent::MakeRoom and a FIFO metadata
+                               lane), admission_tier, structural slow placement (v > eff: built
+                               and placed slow in every design, Placement::Structural). eff =
+                               F - M_model, ONE figure the policy worker publishes per pass
+                               (publish_gate) under GateConfig's model -- Measured (M, the
+                               default) or PerObject (L x omega plus a ghost's DRAM) -- and
+                               pushes into the stack (set_dram_metadata); every settle, the
+                               structural check and the cap read it, and the worker re-runs
+                               every settle each pass (resettle). Also the set-path kick's
+                               worker_idle bit. PAPER_DISABLE_SHARED_OVERHEAD=1 forces the
+                               per-object model with omega 0.
   numa_alloc.rs               Node-bound jemalloc arenas. NumaAlloc<NODE_FAST> is the crate's
                                #[global_allocator]; SlowObjects (aliased crate-wide as `Hybrid`)
                                backs the slow tier. Extents are mmap'd then mbind'd before
                                jemalloc hands them out, and the alloc hook fails closed. This
                                replaced the UMF/TBB allocators and their FFI bindings.
   object/                     Object<K, V> + overhead accounting (object/overhead.rs computes
-                               the per-object DRAM reservation the stacks subtract from
-                               fast_capacity).
+                               the per-object DRAM reservation, omega: the PerObject metadata
+                               model's unit and the key ceiling's estimate; base_size_for, the
+                               size a set checks before it allocates).
   object_store.rs             ObjectStore trait over the object map (for_each_value: the
                                audit's walk; the merged store has an inherent twin).
   value_buffer.rs             ValueBuffer.
@@ -163,8 +179,8 @@ src/
                                  links, charges, places, settles and retires, and wipes
                                  (a round trip wipe() waits for, in every store). The LFU
                                  latch is published with the event that moved it (U12).
-                                 Until S5, no DRAM-bound merged measurement is valid (see
-                                 "Merged-store measurements until S5" below).
+                                 Since S5's commit B1 a set kicks a worker parked on its
+                                 idle poll (see "Merged-store measurements until S5" below).
       policy_stack/             One file per policy, all implementing the PolicyStack trait.
                                  The 18 *_hybrid_stack.rs files carry each design's algorithm
                                  and its full derivation in the module doc — those are the
@@ -210,6 +226,11 @@ tests/
                                          binary of its own (P is process-global); its tests
                                          hold one lock. Every check also reports M (S5a)
                                          beside the model and holds it to its own parts.
+                                         Since S5 its caches pin the per-object metadata
+                                         model, every check holds eff == F - M_model in
+                                         every design (the ghost's DRAM included), and
+                                         every design but the faithful fast-admission pair
+                                         rests at or under its settle target (T9+).
   dram_metadata_identity.rs              S5a, under measured_accounting: between two
                                          quiescent points the NODE_FAST pool moves by exactly
                                          M plus P (P in its own pool under
@@ -262,11 +283,13 @@ removal entries near the end of this file.
 ## Merged-store measurements until S5 (read before benchmarking it)
 
 - **No DRAM-bound measurement of the merged store is valid from ad054e3 (S4) until S5's set-path
-  kick.** Since S4 its sets are linked -- charged, placed, settled -- by the policy worker when it
-  reaches their `Set`, as the DashMap stores' are, and until then a value is neither charged to
-  the fast tier nor evictable. A worker parked on its idle poll (up to 1 s) links nothing until it
-  wakes. The client-side link that bounded the merged fast tier in real time is gone; S5's kick
-  (a set wakes an idle worker) restores a bound, in both stores.
+  kick (commit B1).** Since S4 its sets are linked -- charged, placed, settled -- by the policy
+  worker when it reaches their `Set`, as the DashMap stores' are, and until then a value is neither
+  charged to the fast tier nor evictable. A worker parked on its idle poll (up to 1 s) linked
+  nothing until it woke. The client-side link that bounded the merged fast tier in real time is
+  gone; since B1 the first set after an idle spell kicks the worker (the gate's `worker_idle` bit),
+  in both stores, which restores the bound for an idle worker. A set-path wait for fast bytes --
+  the byte gate -- is S5's second commit.
 - **The flat-merged matrix cells need rebaselining.** A flat cache over the merged store
   (`merged_object_store` with no hybrid feature, `paper-benchmark-flat-merged`) builds the same
   store handle (`PolicyWorker::new`), so S4 moved its linking and its evictions' candidates onto

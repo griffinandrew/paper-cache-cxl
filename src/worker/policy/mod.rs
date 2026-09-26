@@ -1549,6 +1549,9 @@ pub use policy_stack::Tier;
 // What a `Set` did to the object map (`PolicyStack::insert_set`), for the
 // merged store's `worker_set`; and the CLOCK hand's shared budget.
 pub use policy_stack::SetEvent;
+
+// Where a set's value was built, and why (S5): the `Set`'s placement byte.
+pub use policy_stack::Placement;
 #[cfg(feature = "merged_object_store")]
 pub(crate) use policy_stack::clock_hand_budget;
 
@@ -1915,6 +1918,13 @@ pub struct PolicyWorker<K, V> {
 	#[cfg(feature = "hybrid_cache_common")]
 	metadata: WorkerMetadata,
 
+	/// S5: what this worker keeps to publish the gate's figures -- the
+	/// high-water object count, the M last pushed into the stack, the model
+	/// and the metadata cap last published, and the events handled. See
+	/// `publish_gate`.
+	#[cfg(feature = "hybrid_cache_common")]
+	gate_pass: GatePass,
+
 	/// What the event just handled observed of a key's bytes -- a `Set`'s
 	/// built tier, a slow-served hit -- for the next `apply_tier_migrations`
 	/// to reconcile (see `Observed`). The run loop drains after every event,
@@ -1969,6 +1979,35 @@ struct WorkerMetadata {
 	full_refresh: Instant,
 }
 
+/// What the policy worker keeps to publish the gate's figures (S5;
+/// `publish_gate`).
+#[cfg(feature = "hybrid_cache_common")]
+#[derive(Default)]
+struct GatePass {
+	/// `L_hw`: the most objects the cache has held -- the key ceiling's reuse
+	/// floor (`gate::key_ceiling`). Never lowered, not even by a wipe (the
+	/// tables keep their capacity; the merged slab's chunks come back to at
+	/// most what they were at `L_hw`), except: reset to the live count when
+	/// the model changes, or when the metadata cap `F - floor` DECREASES (a
+	/// refill re-creates per-object bytes the smaller cap may not hold).
+	l_hw: u64,
+
+	/// The M last pushed into the stack (`PolicyStack::set_dram_metadata`);
+	/// `None` under the per-object model.
+	pushed: Option<CacheSize>,
+
+	/// The model and the metadata cap of the last publication.
+	model: Option<crate::gate::MetadataModel>,
+	c_meta: CacheSize,
+
+	/// Events handled, for the gate's progress figure.
+	events: u64,
+
+	/// The measured M is outside 2x of `L * omega` (`metadata_model_divergence`
+	/// counts the entries into it).
+	diverged: bool,
+}
+
 /// How often `publish_metadata` re-reads the whole map regardless of its
 /// write counts: the bound on how long a table growth the worker cannot count
 /// (a `del` of an absent key) stays out of M. Every 256 DashMap shards'
@@ -1988,6 +2027,20 @@ impl WorkerMetadata {
 	}
 }
 
+/// What one step of `PolicyWorker::evict_victim` did.
+enum Victim {
+	/// A victim of the stack's order, removed from the map.
+	Evicted(HashedKey),
+
+	/// The stack named a key the map no longer holds (it is gone from the
+	/// stack now); nothing was removed.
+	Missed,
+
+	/// Nothing to evict: the stack named none (and no fallback was asked for,
+	/// or the merged store has nothing linked).
+	Exhausted,
+}
+
 impl<K, V> Worker for PolicyWorker<K, V>
 where
 	Self: 'static + Send,
@@ -2001,6 +2054,12 @@ where
 		// the first, so a status ever handed to a second worker would wake
 		// the live one and not a thread that has exited.
 		self.status.set_policy_worker_thread(thread::current());
+
+		// S5: when this function ends -- by returning or by unwinding -- a set
+		// waiting on this worker (the metadata lane) sees it and returns
+		// `CacheError::Internal` rather than waiting out its window.
+		#[cfg(feature = "hybrid_cache_common")]
+		let _gone = crate::gate::WorkerGoneGuard::new(&self.status);
 
 		let (
 			policy_reconstruct_tx,
@@ -2028,8 +2087,8 @@ where
 				match event {
 					WorkerEvent::Get(key, served) => self.handle_get(key, served),
 
-					WorkerEvent::Set(key, size, resident, _, previous, built, mark) => {
-						self.handle_set(key, size, resident, built, previous.map(|(size, _)| size), mark);
+					WorkerEvent::Set(key, size, resident, _, previous, built, mark, placement) => {
+						self.handle_set(key, size, resident, built, previous.map(|(size, _)| size), mark, placement);
 						has_current_set = true;
 					},
 
@@ -2074,6 +2133,9 @@ where
 						// A requester that stopped waiting is no loss.
 						let _ = reply.send(self.placement_audit());
 					},
+
+					#[cfg(feature = "hybrid_cache_common")]
+					WorkerEvent::MakeRoom(request) => self.handle_make_room(request),
 
 					_ => {},
 				}
@@ -2148,6 +2210,17 @@ where
 				// M now rather than at the end of a pass that may be long.
 				#[cfg(feature = "hybrid_cache_common")]
 				self.publish_metadata_if_the_stack_changed();
+
+				// S5: a set waiting on this worker (the metadata lane) sees it
+				// working through the events ahead of its request.
+				#[cfg(feature = "hybrid_cache_common")]
+				{
+					self.gate_pass.events += 1;
+
+					if self.gate_pass.events % 64 == 0 {
+						self.status.gate().set_worker_progress(self.gate_pass.events);
+					}
+				}
 			}
 
 			self.apply_buffered_events(&buffered_events, &policy_reconstruct_rx);
@@ -2205,6 +2278,14 @@ where
 			// before the MEMTS line that prints it.
 			#[cfg(feature = "hybrid_cache_common")]
 			self.publish_metadata(false);
+
+			// S5: eff, the key ceiling and the stack's M from it -- and every
+			// stack's settles re-run against them (`publish_gate`).
+			#[cfg(feature = "hybrid_cache_common")]
+			{
+				self.publish_gate();
+				self.status.gate().set_worker_progress(self.gate_pass.events);
+			}
 
 			// Once per pass: push this thread's retired values into the global
 			// garbage queue and try to advance the epoch.
@@ -2335,6 +2416,9 @@ where
 
 			#[cfg(feature = "hybrid_cache_common")]
 			metadata: WorkerMetadata::new::<K>(),
+
+			#[cfg(feature = "hybrid_cache_common")]
+			gate_pass: GatePass::default(),
 
 			#[cfg(feature = "hybrid_cache_common")]
 			observed: Vec::new(),
@@ -2484,6 +2568,9 @@ where
 			metadata: WorkerMetadata::new::<K>(),
 
 			#[cfg(feature = "hybrid_cache_common")]
+			gate_pass: GatePass::default(),
+
+			#[cfg(feature = "hybrid_cache_common")]
 			observed: Vec::new(),
 
 			#[cfg(all(test, feature = "hybrid_cache_common"))]
@@ -2500,9 +2587,11 @@ where
 		};
 
 		// M from the start: an empty map's tables and arrays, an empty stack,
-		// no headers -- before the first `Set` can move it.
+		// no headers -- before the first `Set` can move it. And the gate's
+		// figures from it (S5), before the constructor returns the cache.
 		let mut worker = worker;
 		worker.publish_metadata(true);
+		worker.publish_gate();
 
 		Ok(worker)
 	}
@@ -2572,6 +2661,12 @@ where
 	///
 	/// The LFU latch this handling may have moved is published at once
 	/// (`publish_admission_latch`).
+	///
+	/// `placement` is where the client placed the value (S5): `Structural`
+	/// when it was larger than an empty fast tier and built slow for that;
+	/// the stack places such a key slow (`PolicyStack::insert_placed`). A
+	/// `Normal` set the stack's own check made structural -- eff moved between
+	/// the client's decision and this -- is counted.
 	fn handle_set(
 		&mut self,
 		key: HashedKey,
@@ -2580,6 +2675,7 @@ where
 		built: Tier,
 		previous: Option<ObjectSize>,
 		mark: u32,
+		placement: Placement,
 	) {
 		let fresh = previous.is_none();
 
@@ -2595,7 +2691,15 @@ where
 		};
 
 		if let Some(stack) = &mut self.policy_stack {
-			stack.insert_set(key, size, dram_resident, event);
+			let applied = stack.insert_placed(key, size, dram_resident, event, placement);
+
+			#[cfg(feature = "hybrid_cache_common")]
+			if applied == Placement::Structural && placement == Placement::Normal {
+				self.status.gate().count_structural_placement();
+			}
+
+			#[cfg(not(feature = "hybrid_cache_common"))]
+			let _ = applied;
 		}
 
 		#[cfg(feature = "hybrid_cache_common")]
@@ -2861,6 +2965,9 @@ where
 			// merged buckets), the merged slab freed its chunks, the headers
 			// went with their values. Re-read all of it.
 			self.publish_metadata(true);
+
+			// S5: and the gate's figures from it: L = 0 opens the key ceiling.
+			self.publish_gate();
 		}
 
 		// A client that stopped waiting is no loss.
@@ -3235,11 +3342,14 @@ where
 
 		let phys = crate::phys::observe();
 
+		// S5: the integrand is `P + M_model - F`, M_model being the metadata
+		// figure eff takes off F (the measured M, or the per-object model's) --
+		// passed as one "object" of `M_model` bytes.
 		let over_budget_byte_seconds = self.phys_pass.pass(
 			now,
 			phys,
-			self.status.live_num_objects(),
-			self.status.hybrid_shared_overhead(),
+			1,
+			self.status.gate().m_model(),
 			self.status.whole_fast_tier_capacity(),
 		);
 
@@ -3324,6 +3434,174 @@ where
 		});
 	}
 
+	/// S5: the gate's publication, once per pass (and at construction, after a
+	/// wipe and around a `MakeRoom`), on a TIERED cache's worker:
+	///
+	///   1. `M_model`: the measured M (`AtomicStatus::dram_metadata_bytes`,
+	///      just published) or, per-object, the stack's own reservation
+	///      (`dram_reserved_bytes`: `len x omega`, plus a ghost's DRAM);
+	///   2. under the measured model the stack is given the same M
+	///      (`set_dram_metadata`), so its settles reserve what eff takes off;
+	///   3. eff = `F - M_model` (the size-split design's two class figures
+	///      beside it, split as its stack splits them), `L_hw`, and the key
+	///      ceiling (`gate::key_ceiling`), published with the `META_NEAR` flag
+	///      (`Gate::publish`);
+	///   4. the model's sanity check: M against `L * omega`;
+	///   5. `resettle`: every settle of the stack against the budget just
+	///      published, and what it queues applied at once -- so after every
+	///      pass each design rests at or under its drain target, whatever its
+	///      new-key path does (the LFU latch, the slow admission queues).
+	///
+	/// Nothing to publish while a flat policy switch has no stack.
+	#[cfg(feature = "hybrid_cache_common")]
+	fn publish_gate(&mut self) {
+		use crate::gate::{self, MetadataModel};
+
+		if !self.tier_migration {
+			return;
+		}
+
+		let gate = self.status.gate();
+		let model = gate.model();
+		let floor = gate.config().metadata_floor;
+		let status = &self.status;
+		let pass = &mut self.gate_pass;
+
+		let Some(stack) = self.policy_stack.as_mut() else { return };
+
+		let fast_before = (stack.fast_bytes_used(), stack.fast_object_count());
+		let l_pub = status.live_num_objects();
+
+		if pass.model != Some(model) {
+			if model == MetadataModel::PerObject && pass.pushed.take().is_some() {
+				stack.set_dram_metadata(None);
+			}
+
+			pass.model = Some(model);
+			pass.l_hw = l_pub;
+		}
+
+		let m_model = match model {
+			MetadataModel::Measured => status.dram_metadata_bytes(),
+			MetadataModel::PerObject => stack.dram_reserved_bytes(),
+		};
+
+		if model == MetadataModel::Measured && pass.pushed != Some(m_model) {
+			stack.set_dram_metadata(Some(m_model));
+			pass.pushed = Some(m_model);
+		}
+
+		let whole = status.whole_fast_tier_capacity();
+		let eff = whole.saturating_sub(m_model);
+
+		let (eff_small, eff_large) = match status.policy() {
+			PaperPolicy::LruSizedCompactHybrid => {
+				let small = status.fast_tier_capacity();
+				let large = status.hybrid_large_fast_capacity();
+				let (small_share, large_share) = gate::size_split_shares(m_model, small, large);
+
+				(small.saturating_sub(small_share), large.saturating_sub(large_share))
+			},
+
+			_ => (eff, eff),
+		};
+
+		let c_meta = whole.saturating_sub(floor);
+
+		if c_meta < pass.c_meta {
+			pass.l_hw = l_pub;
+		}
+
+		pass.c_meta = c_meta;
+		pass.l_hw = pass.l_hw.max(l_pub);
+
+		let omega = status.hybrid_shared_overhead();
+		let k_max = gate::key_ceiling(model, omega, c_meta, m_model, stack.len() as u64, l_pub, pass.l_hw);
+
+		gate.publish(
+			gate::Published { model, m_model, eff, eff_small, eff_large, k_max },
+			|| status.live_num_objects(),
+		);
+
+		// The model's sanity check: the measured M against `L * omega`,
+		// counted when it leaves 2x either way at a population where the
+		// per-object figure means something.
+		let per_object = l_pub.saturating_mul(omega);
+		let measured = status.dram_metadata_bytes();
+		let diverged = l_pub > 10_000
+			&& omega > 0
+			&& (measured > per_object.saturating_mul(2) || measured.saturating_mul(2) < per_object);
+
+		if diverged && !pass.diverged {
+			gate.count_divergence();
+		}
+
+		pass.diverged = diverged;
+
+		stack.resettle();
+
+		let fast_after = (stack.fast_bytes_used(), stack.fast_object_count());
+
+		self.apply_tier_migrations();
+
+		if fast_after != fast_before {
+			self.refresh_tier_gauges();
+		}
+	}
+
+	/// S5, `MetadataOverflow::EvictToFit`: the metadata lane's head asked for
+	/// room. With the figures republished first (the events ahead of the
+	/// request are handled), evicts the policy's own victims -- the stack's
+	/// `evict_one` and `erase`, the eviction pass's victim step, so both
+	/// stores take the same victims -- until the object count is under the
+	/// key ceiling for every new key waiting, at most `MAKE_ROOM_BATCH` at a
+	/// time; applies what the evictions queued, republishes, and answers
+	/// through the gate. No victim at all (an empty stack): it answers 0, and
+	/// the waiting set fails with `MetadataOverflow` at once.
+	///
+	/// Why this is "the inserting set pays for it": the set that needs room
+	/// does not return until its victims are gone -- the eviction is inside its
+	/// latency, as Redis's `performEvictions` runs inside the command that
+	/// needs memory. Only the thread differs: this one, which owns the stack
+	/// and is the one place a victim is chosen the same way in both stores.
+	#[cfg(feature = "hybrid_cache_common")]
+	fn handle_make_room(&mut self, request: u64) {
+		#[cfg(test)]
+		if self.status.gate().test_panic_on_make_room.load(std::sync::atomic::Ordering::Relaxed) {
+			panic!("test: the policy worker dies at a MakeRoom");
+		}
+
+		self.publish_metadata(false);
+		self.publish_gate();
+
+		let waiting = self.status.gate().meta_lane.len().max(1) as u64;
+		let deficit = self.status
+			.live_num_objects()
+			.saturating_add(waiting)
+			.saturating_sub(self.status.gate().k_max())
+			.min(crate::gate::MAKE_ROOM_BATCH);
+
+		let mut evicted = 0;
+		let mut tries = self.policy_stack.as_ref().map_or(0, |stack| stack.len()) as u64 + deficit;
+
+		while evicted < deficit && tries > 0 {
+			tries -= 1;
+
+			match self.evict_victim(false) {
+				Ok(Victim::Evicted(_)) => evicted += 1,
+				Ok(Victim::Missed) => {},
+				Ok(Victim::Exhausted) | Err(_) => break,
+			}
+		}
+
+		self.apply_tier_migrations();
+		self.publish_metadata(false);
+		self.publish_gate();
+		self.refresh_tier_gauges();
+
+		self.status.gate().answer_make_room(request, evicted);
+	}
+
 	/// The stack's own structures by node (`PolicyStack::structure_bytes`;
 	/// every tiered design meters itself).
 	#[cfg(feature = "hybrid_cache_common")]
@@ -3406,6 +3684,86 @@ where
 		Ok(())
 	}
 
+	/// One victim of the stack's own order, removed from the map: `evict_one`
+	/// and `erase` -- the eviction pass's victim step, and `MakeRoom`'s (S5),
+	/// so both take victims the same way in both stores. `fallback`: when the
+	/// stack names no victim, let `erase` evict an arbitrary map entry (a
+	/// DashMap stack behind its map -- the eviction pass's last resort);
+	/// `MakeRoom` does not.
+	fn evict_victim(&mut self, fallback: bool) -> Result<Victim, CacheError> {
+		let Some(policy_stack) = self.policy_stack.as_mut() else {
+			error!("No active policy or mini stack");
+			return Err(CacheError::Internal);
+		};
+
+		let maybe_key = policy_stack
+			.evict_one()
+			.map(|key| EraseKey::Hashed(key));
+
+		// S5a: `erase` looks the victim up with `entry`, which reserves a
+		// slot in its DashMap shard first (`crate::meta::ShardState`).
+		#[cfg(feature = "hybrid_cache_common")]
+		if self.tier_migration {
+			if let Some(EraseKey::Hashed(victim)) = &maybe_key {
+				crate::meta::map_write(&self.objects, &mut self.metadata.map, *victim);
+			}
+		}
+
+		if maybe_key.is_none() && !fallback {
+			return Ok(Victim::Exhausted);
+		}
+
+		// A split design can legitimately have an empty stack over a
+		// non-empty map -- that divergence is what `erase`'s `None`
+		// fallback exists to clean up, by evicting an arbitrary map entry.
+		// The merged store has no such fallback: `None` means nothing
+		// LINKED is left, while `used_size` still counts what clients have
+		// published and this worker has not linked yet -- values whose
+		// `Set` arrives after this pass, which never evicts an unlinked
+		// value (`take_evict`). The pass stops, silently; the next links
+		// them and evicts. Without this the loop `continue`s on unchanged
+		// state forever. A store with NOTHING in it -- no unlinked value
+		// either -- and `used_size` still over the size is an accounting
+		// bug, not a backlog: the pass stops and says so, as it did before
+		// unlinked values existed.
+		#[cfg(feature = "merged_object_store")]
+		if maybe_key.is_none() {
+			if self.objects.len() == 0 {
+				error!("Nothing left to evict with used_size still over max");
+
+				#[cfg(test)]
+				{
+					self.nothing_left_to_evict += 1;
+				}
+			}
+
+			return Ok(Victim::Exhausted);
+		}
+
+		let erase_result = erase(
+			&self.objects,
+			&self.status,
+			&self.overhead_manager,
+			maybe_key,
+		);
+
+		let Ok((key, _evicted_obj)) = erase_result else {
+			return Ok(Victim::Missed);
+		};
+
+		#[cfg(test)]
+		if let Some(evicted) = &mut self.evicted {
+			evicted.push(key);
+		}
+
+		#[cfg(feature = "hybrid_cache_common")]
+		if self.current_policy.read().is_hybrid() {
+			self.status.record_hybrid_eviction();
+		}
+
+		Ok(Victim::Evicted(key))
+	}
+
 	fn apply_evictions(
 		&mut self,
 		buffered_events: &mut Vec<StackEvent>,
@@ -3415,7 +3773,9 @@ where
 			return Ok(());
 		}
 
-		let policy = self.current_policy.read();
+		// A copy, not the read guard: the victim step below needs the whole
+		// worker. The policy moves only on this thread (`handle_policy`).
+		let policy = *self.current_policy.read();
 		let max_cache_size = self.status.max_size();
 
 		// `trigger_size` arms a capacity pass; `drain_target` is how far that
@@ -3462,72 +3822,13 @@ where
 				break;
 			}
 
-			let Some(policy_stack) = self.policy_stack.as_mut() else {
-				error!("No active policy or mini stack");
-				return Err(CacheError::Internal);
+			let key = match self.evict_victim(true)? {
+				Victim::Evicted(key) => key,
+				Victim::Missed => continue,
+				Victim::Exhausted => break,
 			};
 
-			let maybe_key = policy_stack
-				.evict_one()
-				.map(|key| EraseKey::Hashed(key));
-
-			// S5a: `erase` looks the victim up with `entry`, which reserves a
-			// slot in its DashMap shard first (`crate::meta::ShardState`).
-			#[cfg(feature = "hybrid_cache_common")]
-			if self.tier_migration {
-				if let Some(EraseKey::Hashed(victim)) = &maybe_key {
-					crate::meta::map_write(&self.objects, &mut self.metadata.map, *victim);
-				}
-			}
-
-			// A split design can legitimately have an empty stack over a
-			// non-empty map -- that divergence is what `erase`'s `None`
-			// fallback exists to clean up, by evicting an arbitrary map entry.
-			// The merged store has no such fallback: `None` means nothing
-			// LINKED is left, while `used_size` still counts what clients have
-			// published and this worker has not linked yet -- values whose
-			// `Set` arrives after this pass, which never evicts an unlinked
-			// value (`take_evict`). The pass stops, silently; the next links
-			// them and evicts. Without this the loop `continue`s on unchanged
-			// state forever. A store with NOTHING in it -- no unlinked value
-			// either -- and `used_size` still over the size is an accounting
-			// bug, not a backlog: the pass stops and says so, as it did before
-			// unlinked values existed.
-			#[cfg(feature = "merged_object_store")]
-			if maybe_key.is_none() {
-				if self.objects.len() == 0 {
-					error!("Nothing left to evict with used_size still over max");
-
-					#[cfg(test)]
-					{
-						self.nothing_left_to_evict += 1;
-					}
-				}
-
-				break;
-			}
-
-			let erase_result = erase(
-				&self.objects,
-				&self.status,
-				&self.overhead_manager,
-				maybe_key,
-			);
-
-			let Ok((key, _evicted_obj)) = erase_result else {
-				continue;
-			};
 			_evicted_this_call += 1;
-
-			#[cfg(test)]
-			if let Some(evicted) = &mut self.evicted {
-				evicted.push(key);
-			}
-
-			#[cfg(feature = "hybrid_cache_common")]
-			if policy.is_hybrid() {
-				self.status.record_hybrid_eviction();
-			}
 
 			// Only recorded when something can replay it. Without this gate an
 			// eviction-heavy workload would keep pushing into a `Vec` that
@@ -3628,11 +3929,42 @@ where
 	/// second. The wait BEFORE that first pass is not this function's to
 	/// shorten: a worker parked on the long poll when a burst begins sleeps
 	/// it out unless it is kicked (see `AtomicStatus::kick_policy_worker`).
+	///
+	/// The long poll is IDLE (S5): before it this thread sets the gate's idle
+	/// bit, fences, and parks only if its channel is still empty -- the
+	/// worker's half of the Dekker pair with `PaperCache::kick_idle_worker`,
+	/// whose set wrote the channel, fenced, and reads the bit. So a set either
+	/// finds the bit and wakes this thread, or this thread finds the set and
+	/// does not park: the first set after an idle spell is taken at once, in
+	/// both stores. Nor does it park long while a set waits in the metadata
+	/// lane.
 	fn delay_event_loop(&mut self, now: Instant, has_current_set: bool) {
 		let delay = polling_delay(now, self.last_set_time, has_current_set);
 
 		if has_current_set {
 			self.last_set_time = Some(now);
+		}
+
+		#[cfg(feature = "hybrid_cache_common")]
+		if delay == LONG_POLLING_DURATION {
+			use std::sync::atomic::{fence, Ordering};
+
+			let gate = self.status.gate();
+
+			gate.worker_idle.store(true, Ordering::Relaxed);
+
+			#[cfg(test)]
+			gate.test_idle_spells.fetch_add(1, Ordering::Relaxed);
+
+			fence(Ordering::SeqCst);
+
+			if self.listener.is_empty() && gate.meta_lane.len() == 0 {
+				thread::park_timeout(delay);
+			}
+
+			gate.worker_idle.store(false, Ordering::Relaxed);
+
+			return;
 		}
 
 		thread::park_timeout(delay);
@@ -4693,6 +5025,9 @@ mod merged_placement_tests {
 		let status = Arc::new(AtomicStatus::new(1 << 30, &[policy], policy).unwrap());
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
+		// The per-object model this module was written against (S5).
+		status.pin_per_object();
+
 		let mut worker = PolicyWorker::new_with_tier_migration(
 			rx,
 			objects.clone(),
@@ -4721,7 +5056,7 @@ mod merged_placement_tests {
 			.insert(key, object)
 			.map(|old| worker.overhead_manager.base_size(&old));
 
-		worker.handle_set(key, base_size, resident, Tier::Fast, previous, 0);
+		worker.handle_set(key, base_size, resident, Tier::Fast, previous, 0, crate::worker::Placement::Normal);
 	}
 
 	/// Every key's bytes are in the tier the store charges it to, and each
@@ -5681,7 +6016,7 @@ mod policy_worker_kick_tests {
 		let passes = parked_on_the_long_poll(&status);
 
 		// Queued BEFORE the kick, so the pass the kick starts takes it.
-		tx.send(WorkerEvent::Set(1, 64, 0, None, None, Tier::Fast, 0)).unwrap();
+		tx.send(WorkerEvent::Set(1, 64, 0, None, None, Tier::Fast, 0, Placement::Normal)).unwrap();
 
 		let kicked = Instant::now();
 
@@ -5823,7 +6158,7 @@ mod capacity_watermark_tests {
 		objects.insert(key, object);
 		status.update_base_used_size(base_size as i64);
 		status.incr_num_objects();
-		worker.handle_set(key, base_size, dram_resident, built, None, 0);
+		worker.handle_set(key, base_size, dram_resident, built, None, 0, Placement::Normal);
 	}
 
 	fn fill(
@@ -6287,6 +6622,11 @@ mod phys_transient_tests {
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod s4_tests;
 
+// Backpressure plan S5, commit B1: the admission path -- the size checks, the
+// metadata cap, structural slow placement, every settle on eff, the kick.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod s5_tests;
+
 // S4's follow-ups: a flat cache over the merged store through a real worker,
 // reaper and wipe -- in every merged build, the flat-merged one included.
 #[cfg(all(test, feature = "merged_object_store"))]
@@ -6327,6 +6667,9 @@ mod reconcile_tests {
 		let status = Arc::new(AtomicStatus::new(1 << 30, &[policy], policy).unwrap());
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
+		// The per-object model these tests were written against (S5).
+		status.pin_per_object();
+
 		let mut worker = PolicyWorker::new_with_tier_migration(
 			rx,
 			objects.clone(),
@@ -6351,6 +6694,9 @@ mod reconcile_tests {
 		pub(super) previous: Option<ObjectSize>,
 		/// The key's bucket's landed count, read before the insert.
 		pub(super) mark: u32,
+		/// Where the client placed the value (S5): `Normal` unless a test
+		/// says otherwise, or the admission decision (`gate::decide`) did.
+		pub(super) placement: Placement,
 	}
 
 	impl Published {
@@ -6392,12 +6738,12 @@ mod reconcile_tests {
 			},
 		};
 
-		Published { base_size, resident, built, previous, mark }
+		Published { base_size, resident, built, previous, mark, placement: Placement::Normal }
 	}
 
 	/// The worker's handling of a published value's `Set`.
 	pub(super) fn handle(worker: &mut Worker, key: HashedKey, set: Published) {
-		worker.handle_set(key, set.base_size, set.resident, set.built, set.previous, set.mark);
+		worker.handle_set(key, set.base_size, set.resident, set.built, set.previous, set.mark, set.placement);
 	}
 
 	/// What `PaperCache::del` does before its broadcast: the client's erase.
@@ -6412,6 +6758,18 @@ mod reconcile_tests {
 		let published = publish(&worker.status, &worker.overhead_manager, objects, key, len, built);
 
 		handle(worker, key, published);
+	}
+
+	/// A settle that demotes every fast key -- what these tests' admission of
+	/// a value twice the fast tier did, until S5 made such a value STRUCTURAL
+	/// (built and placed slow, no settle): the fast tier shrunk to one byte.
+	/// `restore_fast` puts it back; a grow moves nothing in LRU or FIFO.
+	pub(super) fn shrink_fast(worker: &mut Worker) {
+		worker.handle_resize_fast_tier(1);
+	}
+
+	pub(super) fn restore_fast(worker: &mut Worker) {
+		worker.handle_resize_fast_tier(FAST);
 	}
 
 	/// The drain the event loop would apply after the event just handled --
@@ -7044,8 +7402,6 @@ mod reconcile_tests {
 
 		const J: HashedKey = 64;
 		let k = same_consumer(J, 4);
-		// Twice the fast tier: its admission demotes J, K and itself.
-		const X: HashedKey = 7_777;
 
 		set(&mut worker, &objects, J, LEN, Fast);
 		set(&mut worker, &objects, k, LEN, Fast);
@@ -7057,16 +7413,16 @@ mod reconcile_tests {
 
 		let (entered, release) = after_copy::arm(J);
 
-		let admitting = {
-			let objects = objects.clone();
-
-			std::thread::spawn(move || {
-				set(&mut worker, &objects, X, 2 * FAST as usize, Fast);
-				// Returns once the consumers are done: after the release.
-				let drain = drain_and_apply(&mut worker);
-				(worker, drain)
-			})
-		};
+		// A settle that demotes J and K: the fast tier shrunk (S5: a value
+		// twice the tier, this fixture until then, is placed slow with no
+		// settle), then restored once its drain is applied.
+		let admitting = std::thread::spawn(move || {
+			shrink_fast(&mut worker);
+			// Returns once the consumers are done: after the release.
+			let drain = drain_and_apply(&mut worker);
+			restore_fast(&mut worker);
+			(worker, drain)
+		});
 
 		entered
 			.recv_timeout(Duration::from_secs(10))
@@ -7101,7 +7457,9 @@ mod reconcile_tests {
 	/// set v2 -- fresh -- and v3 over it, NOT fresh, v3's mark read before
 	/// its insert. The worker takes Set(v2), then another client's admission
 	/// of twice the fast tier, whose settle demotes `K`: that entry lands on
-	/// v3, the value holding the key, after v3's mark. Then the `Del`, which
+	/// v3, the value holding the key, after v3's mark (since S5 a shrink of the
+	/// fast tier: that value is structural, placed slow with no settle). Then
+	/// the `Del`, which
 	/// untracks `K` while v3 is live, then Set(v3): LRU re-admits `K` fast,
 	/// where v3 was built, with no push, and nothing is in flight. v3's
 	/// insert replaced a value, but the stack did not place `K` before the
@@ -7118,8 +7476,6 @@ mod reconcile_tests {
 		let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
 
 		const K: HashedKey = 1;
-		// Twice the fast tier: its admission demotes K and itself.
-		const X: HashedKey = 7_777;
 
 		set(&mut worker, &objects, K, LEN, Fast);
 		drain_and_apply(&mut worker);
@@ -7140,10 +7496,14 @@ mod reconcile_tests {
 		drain_and_apply(&mut worker);
 		assert_eq!(placement(&worker, K), Some(Fast));
 
-		// Another client's admission demotes `K`: the entry lands on v3.
-		set(&mut worker, &objects, X, 2 * FAST as usize, Fast);
+		// A settle demotes `K`: the entry lands on v3. (The fast tier shrunk,
+		// then restored: S5 places this fixture's old trigger -- another
+		// client's admission of a value twice the tier -- slow, with no
+		// settle.)
+		shrink_fast(&mut worker);
 		let drain = drain_and_apply(&mut worker);
-		assert_eq!(of(&drain, K), vec![Slow], "the admission demoted K");
+		restore_fast(&mut worker);
+		assert_eq!(of(&drain, K), vec![Slow], "the settle demoted K");
 		assert_eq!(bytes_tier(&objects, K), Slow, "and the demotion moved v3");
 
 		// The racing `Del`, then Set(v3).
@@ -7355,8 +7715,9 @@ mod reconcile_tests {
 	}
 
 	/// Race (a), demotion side, in both stores (FIFO keeps an existing key's
-	/// physical tier on a re-set): an admission demotes `K`, parked after its
-	/// copy; the client overwrites `K` reading its bytes still fast, and builds
+	/// physical tier on a re-set): a settle demotes `K` (since S5 a shrink of
+	/// the fast tier: the admission of a value twice the tier this used is
+	/// placed slow, with no settle), parked after its copy; the client overwrites `K` reading its bytes still fast, and builds
 	/// the new value in DRAM; the demotion's swap loses. The stack places `K`
 	/// slow with its bytes in DRAM -- stranded -- until the reconcile of the
 	/// overwrite's `Set` demotes it. Red with the reconcile off.
@@ -7371,7 +7732,6 @@ mod reconcile_tests {
 		}
 
 		const K: HashedKey = 1;
-		const X: HashedKey = 7_777;
 
 		fill(&mut worker, &objects, K..=4, LEN);
 		assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Fast), Fast));
@@ -7381,15 +7741,15 @@ mod reconcile_tests {
 
 		let (entered, release) = after_copy::arm(K);
 
-		let admitting = {
-			let objects = objects.clone();
-
-			std::thread::spawn(move || {
-				set(&mut worker, &objects, X, 2 * FAST as usize, Fast);
-				let drain = drain_and_apply(&mut worker);
-				(worker, drain)
-			})
-		};
+		// A settle that demotes K: the fast tier shrunk, then restored (S5
+		// places this fixture's old trigger, a value twice the tier, slow with
+		// no settle).
+		let admitting = std::thread::spawn(move || {
+			shrink_fast(&mut worker);
+			let drain = drain_and_apply(&mut worker);
+			restore_fast(&mut worker);
+			(worker, drain)
+		});
 
 		entered
 			.recv_timeout(Duration::from_secs(10))
@@ -7403,7 +7763,7 @@ mod reconcile_tests {
 		release.send(()).unwrap();
 		let (mut worker, drain) = admitting.join().unwrap();
 
-		assert_eq!(of(&drain, K), vec![Slow], "the admission demoted K");
+		assert_eq!(of(&drain, K), vec![Slow], "the settle demoted K");
 		assert_eq!(bytes_tier(&objects, K), Fast, "its swap lost to the overwrite");
 		assert_eq!(placement(&worker, K), Some(Slow));
 
@@ -7425,6 +7785,11 @@ mod reconcile_tests {
 	#[test]
 	fn a_get_served_from_the_slow_tier_heals_its_value_through_the_cache() {
 		let _serialised = migration_test_lock::lock();
+
+		// The per-object metadata model (S5): at this toy fast tier the MEASURED
+		// M of the cache's own structures would leave the strict key ceiling
+		// no room, and every new key would fail with `MetadataOverflow`.
+		let _per_object = crate::object::overhead::test_overheads::per_object();
 
 		let cache = crate::PaperCache::<u64, TieredBuffer>::new(
 			1 << 20,

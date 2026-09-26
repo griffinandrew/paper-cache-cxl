@@ -48,7 +48,7 @@ impl StackEvent {
 			WorkerEvent::Get(key, Some(_)) => StackEvent::Get(*key),
 			// The built tier is not traced either: a replay rebuilds a FLAT
 			// policy's stack after a switch, and flat stacks have no tiers.
-			WorkerEvent::Set(key, size, resident, _, _, _, _) => StackEvent::Set(*key, *size, *resident),
+			WorkerEvent::Set(key, size, resident, _, _, _, _, _) => StackEvent::Set(*key, *size, *resident),
 			WorkerEvent::Del(key, _) => StackEvent::Del(*key),
 			WorkerEvent::Wipe(_) => StackEvent::Wipe,
 			WorkerEvent::Resize(size) => StackEvent::Resize(*size),

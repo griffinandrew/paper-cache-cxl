@@ -69,8 +69,10 @@ use crate::{
 	worker::policy::policy_stack::{
 		PolicyStack,
 		Tier,
+		Placement,
+		SetEvent,
 		arena_frequency_chain::ArenaFrequencyChain,
-		narrow_resident, drain_target,
+		narrow_resident, drain_target, placed,
 	},
 };
 
@@ -99,6 +101,11 @@ pub struct LfuCompactHybridStack {
 	/// leftover byte slack. Byte slack from an object-granular demotion would
 	/// otherwise let a frequency-1 newcomer bypass promotion.
 	fast_tier_latched: bool,
+
+	/// S5: the measured M the policy worker pushed (`set_dram_metadata`),
+	/// reserved instead of `len x shared_overhead`; `None` under the
+	/// per-object model.
+	measured: Option<CacheSize>,
 }
 
 impl LfuCompactHybridStack {
@@ -112,6 +119,7 @@ impl LfuCompactHybridStack {
 			migrations: Vec::new(),
 			pending_demotions: 0,
 			fast_tier_latched: false,
+			measured: None,
 		}
 	}
 
@@ -133,11 +141,132 @@ impl LfuCompactHybridStack {
 	/// DRAM. See `PolicyStack::dram_reserved_bytes` for the rule, and for why
 	/// a reservation at or over `fast_capacity` is left to saturate.
 	fn reserved_overhead(&self) -> CacheSize {
-		self.chain.len() as CacheSize * self.shared_overhead
+		self.measured.unwrap_or(self.chain.len() as CacheSize * self.shared_overhead)
 	}
 
 	fn effective_fast_capacity(&self) -> CacheSize {
 		self.fast_capacity.saturating_sub(self.reserved_overhead())
+	}
+
+	/// Whether a value of `migrating` bytes is STRUCTURAL (S5): larger than an
+	/// empty fast tier. Such a key is admitted to the slow chain -- with no
+	/// latch (a value too large for the tier says nothing about its capacity)
+	/// and nothing pushed -- and never promoted; its accesses still count.
+	fn structural(&self, migrating: CacheSize) -> bool {
+		migrating > self.effective_fast_capacity()
+	}
+
+	/// A FAST key overwritten with a STRUCTURAL value (S5) leaves the fast set:
+	/// to the slow chain at its own frequency (`set_tier`), pushed `(key,
+	/// Slow)` -- its placement changed. Not a settle demotion (not counted,
+	/// no latch).
+	fn demote_structural(&mut self, key: HashedKey) {
+		let Some(entry) = self.chain.get(key) else { return };
+		let size = entry.migrating();
+
+		self.chain.set_tier(key, Tier::Slow);
+		self.fast_used = self.fast_used.saturating_sub(size);
+		self.slow_used += size;
+
+		self.migrations.push((key, Tier::Slow));
+	}
+
+	/// A `Set`, with the client's placement (S5). An existing key: track its
+	/// size, then treat it as an access -- a fast one is bumped (and, when its
+	/// new value is structural, leaves the fast set), a slow one bumped and
+	/// promoted past the fast minimum unless it is structural -- then settle.
+	/// A new key: a STRUCTURAL one to the slow chain at frequency 1, no latch,
+	/// nothing pushed; otherwise the admission below. Returns the placement
+	/// applied.
+	///
+	/// The admission (S5, both stores at once): `fast_used + migrating <=
+	/// drain_target(F - reservation)`, the reservation counting the new key
+	/// (`(len + 1) x shared_overhead`, or the pushed M under the measured
+	/// model). In the stacks' unit -- the new key's MIGRATING bytes, the unit
+	/// `fast_used` is kept in, where it added the BASE size -- and up to the
+	/// SETTLE TARGET rather than eff: an admission above it would be demoted by
+	/// the next settle, and the newcomer, at frequency 1, is the very minimum
+	/// it would pick. A refusal still latches and queues `(key, Slow)`.
+	fn insert_with(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, placement: Placement) -> Placement {
+		let dram_resident = narrow_resident(dram_resident);
+		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+		let structural = placement == Placement::Structural || self.structural(migrating);
+
+		if self.chain.contains(key) {
+			// Existing key: track any size change, then treat as an access.
+			self.resize_key(key, size, dram_resident);
+
+			let promoted_key = match self.chain.get(key).and_then(|e| e.tier) {
+				Some(Tier::Fast) => {
+					self.chain.bump(key);
+
+					if structural {
+						self.demote_structural(key);
+					}
+
+					None
+				},
+
+				Some(Tier::Slow) if structural => { self.chain.bump(key); None },
+				Some(Tier::Slow) => self.maybe_promote(key),
+				None => None,
+			};
+
+			self.settle_fast_tier();
+
+			// After settling, and guarded on the key still being fast: a tight
+			// budget can demote it straight back out within the same settle,
+			// which already pushed the correct final `(key, Slow)` entry.
+			if let Some(k) = promoted_key {
+				if self.chain.get(k).and_then(|e| e.tier) == Some(Tier::Fast) {
+					self.migrations.push((k, Tier::Fast));
+				}
+			}
+
+			return placed(structural);
+		}
+
+		if structural {
+			self.chain.insert(key, size, dram_resident, Tier::Slow);
+			self.slow_used += migrating;
+
+			return Placement::Structural;
+		}
+
+		if self.fast_tier_latched {
+			self.chain.insert(key, size, dram_resident, Tier::Slow);
+			self.slow_used += migrating;
+
+			// No migration emitted: with the latch shut `admission_tier` already
+			// returns Slow, so the API thread built the value in PMEM and the
+			// bytes are where this branch wants them. Emitting one anyway made
+			// the worker reallocate a byte-identical object -- one migration per
+			// admission, which was this stack's dominant cost.
+			//
+			// Except when the mirror `admission_tier` reads was stale: a burst
+			// of new keys outruns `refresh_tier_gauges`, and keys this branch
+			// places slow were built in DRAM. The `Set` event carries the built
+			// tier, and the policy worker's reconcile queues the `(key, Slow)`
+			// for exactly those (S3), so this branch still emits nothing.
+			return Placement::Normal;
+		}
+
+		let reservation = self.measured
+			.unwrap_or((self.chain.len() as CacheSize + 1) * self.shared_overhead);
+		let target = drain_target::bytes(self.fast_capacity.saturating_sub(reservation));
+
+		if self.fast_used + migrating <= target {
+			self.chain.insert(key, size, dram_resident, Tier::Fast);
+			self.fast_used += migrating;
+		} else {
+			self.chain.insert(key, size, dram_resident, Tier::Slow);
+			self.slow_used += migrating;
+
+			self.migrations.push((key, Tier::Slow));
+			self.fast_tier_latched = true;
+		}
+
+		Placement::Normal
 	}
 
 	/// The tier this stack has `key` in, or `None` if it does not track it.
@@ -254,65 +383,26 @@ impl PolicyStack for LfuCompactHybridStack {
 	}
 
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		let dram_resident = narrow_resident(dram_resident);
+		self.insert_with(key, size, dram_resident, Placement::Normal);
+	}
 
-		if self.chain.contains(key) {
-			// Existing key: track any size change, then treat as an access.
-			self.resize_key(key, size, dram_resident);
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		_event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_with(key, size, dram_resident, placement)
+	}
 
-			let promoted_key = match self.chain.get(key).and_then(|e| e.tier) {
-				Some(Tier::Fast) => { self.chain.bump(key); None },
-				Some(Tier::Slow) => self.maybe_promote(key),
-				None => None,
-			};
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.measured = measured;
+	}
 
-			self.settle_fast_tier();
-
-			// After settling, and guarded on the key still being fast: a tight
-			// budget can demote it straight back out within the same settle,
-			// which already pushed the correct final `(key, Slow)` entry.
-			if let Some(k) = promoted_key {
-				if self.chain.get(k).and_then(|e| e.tier) == Some(Tier::Fast) {
-					self.migrations.push((k, Tier::Fast));
-				}
-			}
-
-			return;
-		}
-
-		if self.fast_tier_latched {
-			self.chain.insert(key, size, dram_resident, Tier::Slow);
-			self.slow_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
-
-			// No migration emitted: with the latch shut `admission_tier` already
-			// returns Slow, so the API thread built the value in PMEM and the
-			// bytes are where this branch wants them. Emitting one anyway made
-			// the worker reallocate a byte-identical object -- one migration per
-			// admission, which was this stack's dominant cost.
-			//
-			// Except when the mirror `admission_tier` reads was stale: a burst
-			// of new keys outruns `refresh_tier_gauges`, and keys this branch
-			// places slow were built in DRAM. The `Set` event carries the built
-			// tier, and the policy worker's reconcile queues the `(key, Slow)`
-			// for exactly those (S3), so this branch still emits nothing.
-			return;
-		}
-
-		// `+ 1` reserves for the new object's own shared metadata, which is
-		// DRAM-resident whichever tier it lands in.
-		let admit_effective = self.fast_capacity
-			.saturating_sub((self.chain.len() as CacheSize + 1) * self.shared_overhead);
-
-		if self.fast_used + size as CacheSize <= admit_effective {
-			self.chain.insert(key, size, dram_resident, Tier::Fast);
-			self.fast_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
-		} else {
-			self.chain.insert(key, size, dram_resident, Tier::Slow);
-			self.slow_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
-
-			self.migrations.push((key, Tier::Slow));
-			self.fast_tier_latched = true;
-		}
+	fn resettle(&mut self) {
+		self.settle_fast_tier();
 	}
 
 	fn update(&mut self, key: HashedKey) {
@@ -320,7 +410,14 @@ impl PolicyStack for LfuCompactHybridStack {
 			Some(Tier::Fast) => { self.chain.bump(key); },
 
 			Some(Tier::Slow) => {
-				let promoted_key = self.maybe_promote(key);
+				// S5: a structural key is bumped, never promoted.
+				let structural = self.chain.get(key).is_some_and(|e| self.structural(e.migrating()));
+
+				let promoted_key = match structural {
+					true => { self.chain.bump(key); None },
+					false => self.maybe_promote(key),
+				};
+
 				self.settle_fast_tier();
 
 				if let Some(k) = promoted_key {

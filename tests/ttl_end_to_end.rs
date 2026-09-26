@@ -29,7 +29,7 @@
 
 use std::{thread, time::Duration};
 
-use paper_cache::{CacheTierSize, PaperCache, PaperPolicy, TieredBuffer};
+use paper_cache::{CacheTierSize, GateConfig, MetadataModel, PaperCache, PaperPolicy, TieredBuffer};
 
 /// Long enough for `TtlWorker` to notice. Its loop sleeps 1 ms while anything
 /// is due within 2 s and 1000 ms otherwise, so a second past the deadline is
@@ -37,10 +37,18 @@ use paper_cache::{CacheTierSize, PaperCache, PaperPolicy, TieredBuffer};
 const SETTLE: Duration = Duration::from_secs(5);
 
 fn cache() -> PaperCache<u32, TieredBuffer> {
-	PaperCache::<u32, TieredBuffer>::new(
+	// The per-object metadata model (S5): this test is not about the model, and
+	// its fast tier is smaller than the cache's own empty structures in the
+	// merged and hashbrown builds -- under the measured model's key ceiling it
+	// would refuse every key.
+	let mut gate = GateConfig::default();
+	gate.metadata_model = MetadataModel::PerObject;
+
+	PaperCache::<u32, TieredBuffer>::new_with_gate(
 		1_000_000,
 		CacheTierSize::Bytes(500_000),
 		PaperPolicy::LruCompactHybrid,
+		gate,
 	)
 	.expect("cache should construct")
 }

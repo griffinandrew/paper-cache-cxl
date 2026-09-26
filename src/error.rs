@@ -45,6 +45,18 @@ pub enum CacheError {
 	#[error("the fast tier size must be greater than zero and cannot exceed the cache size")]
 	InvalidFastTierSize,
 
+	/// A NEW key's metadata would not fit the fast tier: the cache's DRAM
+	/// metadata is at its ceiling (`gate::key_ceiling`) and the cache's
+	/// `on_metadata_overflow` is `Error` (the default), or `EvictToFit`
+	/// found nothing to evict or no progress within its window. Nothing was
+	/// allocated or sent; overwrites, gets and deletes continue (S5).
+	#[error("the metadata of a new key would not fit the fast tier")]
+	MetadataOverflow,
+
+	/// A `GateConfig` no set could run under (`GateConfig::validate`).
+	#[error("invalid admission (gate) configuration")]
+	InvalidGateConfig,
+
 	/// This BUILD cannot honour the policy, which is not the same thing as the
 	/// policy being unparseable -- `InvalidPolicy` already means that, and
 	/// conflating the two would report a typo and an unimplemented eviction

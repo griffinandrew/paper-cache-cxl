@@ -20,13 +20,26 @@
 //! residents. The self-calibrating fixture puts value bytes at ~85% of the
 //! budget, so with the reservation zeroed every key would fit fast and
 //! `slow_objects` would stay 0 forever.
+//!
+//! Since S5 the default reservation is the MEASURED model's -- the cache's own
+//! structures' bytes, M -- and a new key whose metadata would not fit the
+//! fast tier is refused (`MetadataOverflow`): the key ceiling. The fixtures
+//! below whose arithmetic is the PER-OBJECT reservation (`L x omega`) build
+//! their caches with that model, S5's fallback, and keep their key count
+//! under its ceiling (`N x omega <= F`) with a payload large enough for it;
+//! the measured model's settle is the lib's
+//! `the_measured_model_settles_on_the_published_m`.
 
 #[cfg(feature = "lfu_compact_hybrid_cache")]
 mod shared_overhead_tests {
-    use paper_cache::{PaperCache, PaperPolicy, TieredBuffer, CacheTierSize};
+    use paper_cache::{CacheTierSize, GateConfig, MetadataModel, PaperCache, PaperPolicy, TieredBuffer};
 
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-    const PAYLOAD: &[u8] = b"shared overhead probe";
+    /// 300 B (was 21): a value large enough that N keys' per-object
+    /// reservation fits the tier their values need (S5's key ceiling), and
+    /// small enough that it still pushes the values over the settle target
+    /// at the merged store's omega (78 B): `budget` checks both.
+    const PAYLOAD: &[u8] = &[7u8; 300];
     const N: u32 = 400;
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -42,18 +55,27 @@ mod shared_overhead_tests {
         }
     }
 
-    /// The stack-accounted bytes of one `PAYLOAD` object, read back through
-    /// the `fast_bytes_used` gauge of a throwaway cache whose budgets are far
-    /// too large for anything to migrate. Deliberately NOT `cache.size()`:
-    /// that figure embeds the per-object overhead charge (measured: 126 vs
-    /// the stack's 41 for this payload), while the fast-tier watermark
-    /// compares the stack's own value-byte accounting against the budget --
-    /// calibrating on anything else makes the 85% claim below false.
-    fn accounted_size() -> u64 {
-        let probe = PaperCache::<u32, TieredBuffer>::new(
-            1_048_576,
-            CacheTierSize::Bytes(131_072),
-            PaperPolicy::LfuCompactHybrid,
+    /// This binary's per-object fixtures' model (S5's fallback).
+    fn per_object() -> GateConfig {
+        let mut gate = GateConfig::default();
+        gate.metadata_model = MetadataModel::PerObject;
+        gate
+    }
+
+    /// `(s, omega)`: the stack-accounted bytes of one `PAYLOAD` object --
+    /// read back through the `fast_bytes_used` gauge of a throwaway cache
+    /// whose budgets are far too large for anything to migrate -- and the
+    /// per-object reservation it made for that one key. Deliberately NOT
+    /// `cache.size()`: that figure embeds the per-object overhead charge,
+    /// while the fast-tier watermark compares the stack's own value-byte
+    /// accounting against the budget -- calibrating on anything else makes
+    /// the 85% claim below false.
+    fn accounted(policy: PaperPolicy) -> (u64, u64) {
+        let probe = PaperCache::<u32, TieredBuffer>::new_with_gate(
+            4_194_304,
+            CacheTierSize::Bytes(1_048_576),
+            policy,
+            per_object(),
         )
         .expect("probe cache should construct");
         probe.set(1u32, PAYLOAD, None).expect("probe set");
@@ -61,7 +83,32 @@ mod shared_overhead_tests {
             wait_until(TIMEOUT, || probe.hybrid_stats().fast_bytes_used > 0),
             "probe gauge never refreshed"
         );
-        probe.hybrid_stats().fast_bytes_used
+        let stats = probe.hybrid_stats();
+        (stats.fast_bytes_used, stats.fast_metadata_bytes)
+    }
+
+    /// The fixture's budget: values alone at <= 85% of it (below the 98%
+    /// settle target), the key count under the key ceiling, and the
+    /// reservation large enough to push the values over the target.
+    fn budget(s: u64, omega: u64) -> u64 {
+        let n = u64::from(N);
+        let budget = (n * s * 100).div_ceil(85);
+
+        assert!(
+            n * s * 100 <= budget * 85,
+            "fixture arithmetic drifted: {N} objects of {s} accounted bytes exceed 85% of {budget}"
+        );
+        assert!(
+            n * omega <= budget,
+            "fixture: {N} keys' reservation ({} B) exceeds the {budget} B tier -- the key ceiling would refuse keys",
+            n * omega,
+        );
+        assert!(
+            n * s * 100 > (budget - n * omega) * 98,
+            "fixture: with {N} x {omega} B reserved the values still fit the settle target of {budget} B"
+        );
+
+        budget
     }
 
     /// With values alone at ~85% of the budget, only the metadata reservation
@@ -69,17 +116,14 @@ mod shared_overhead_tests {
     /// to the slow tier, and nothing may be evicted.
     #[test]
     fn reservation_routes_admissions_to_slow_values_alone_would_fit() {
-        let s = accounted_size();
-        let budget = (u64::from(N) * s * 100).div_ceil(85);
-        assert!(
-            u64::from(N) * s * 100 <= budget * 85,
-            "fixture arithmetic drifted: {N} objects of {s} accounted bytes exceed 85% of {budget}"
-        );
+        let (s, omega) = accounted(PaperPolicy::LfuCompactHybrid);
+        let budget = budget(s, omega);
 
-        let cache = PaperCache::<u32, TieredBuffer>::new(
+        let cache = PaperCache::<u32, TieredBuffer>::new_with_gate(
             1_048_576,
             CacheTierSize::Bytes(budget),
             PaperPolicy::LfuCompactHybrid,
+            per_object(),
         )
         .expect("cache should construct");
 

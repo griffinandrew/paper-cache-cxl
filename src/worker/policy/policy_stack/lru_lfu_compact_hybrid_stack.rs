@@ -112,7 +112,7 @@ use crate::{
 		PolicyStack,
 		Tier,
 		arena_frequency_chain::ArenaFrequencyChain,
-		narrow_resident, drain_target,
+		narrow_resident, drain_target, Placement, SetEvent, placed,
 	},
 };
 
@@ -158,6 +158,11 @@ pub struct LruLfuCompactHybridStack {
 
 	/// (key, new tier) pairs recorded since the last `drain_tier_migrations`.
 	migrations: Vec<(HashedKey, Tier)>,
+
+	/// S5: the measured M the policy worker pushed (`set_dram_metadata`),
+	/// reserved instead of the per-object reservation; `None` under the
+	/// per-object model.
+	measured: Option<CacheSize>,
 }
 
 impl LruLfuCompactHybridStack {
@@ -179,6 +184,7 @@ impl LruLfuCompactHybridStack {
 			shared_overhead: 0,
 
 			migrations: Vec::new(),
+			measured: None,
 		}
 	}
 
@@ -206,7 +212,79 @@ impl LruLfuCompactHybridStack {
 	/// DRAM. See `PolicyStack::dram_reserved_bytes` for the rule, and for why
 	/// a reservation at or over `fast_capacity` is left to saturate.
 	fn reserved_overhead(&self) -> CacheSize {
-		self.chain.len() as CacheSize * self.shared_overhead
+		self.measured.unwrap_or(self.chain.len() as CacheSize * self.shared_overhead)
+	}
+
+	/// This stack's eff (S5): the whole fast tier's budget for values -- the
+	/// tier's, not a segment's -- before the drain target.
+	fn own_eff(&self) -> CacheSize {
+		self.fast_capacity.saturating_sub(self.reserved_overhead())
+	}
+
+	/// Whether a value of `migrating` bytes is STRUCTURAL (S5): larger than an
+	/// empty fast tier. Such a key is placed slow, keeps its place in the
+	/// policy's order, and is never promoted while it stays that large. The
+	/// stack's own check beside the client's flag, so a key the client placed
+	/// normally just before eff moved is placed as the stack's own promotions
+	/// would place it.
+	fn structural(&self, migrating: CacheSize) -> bool {
+		migrating > self.own_eff()
+	}
+
+	/// A `Set`, with the client's placement (S5): an existing key is an access
+	/// (`access`); a new one is admitted at the recency head at frequency 1 --
+	/// or, STRUCTURAL, into the slow frequency chain at 1: built slow, nothing
+	/// pushed, nothing settled. Returns the placement applied.
+	fn insert_with(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, placement: Placement) -> Placement {
+		let dram_resident = narrow_resident(dram_resident);
+		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+		let structural = placement == Placement::Structural || self.structural(migrating);
+
+		if self.chain.contains(key) {
+			// An overwrite is an access, not an automatic promotion — see the
+			// baseline's "A `set()` is an access" section.
+			self.resize_key(key, size, dram_resident);
+			self.access(key, structural);
+			return placed(structural);
+		}
+
+		if structural {
+			self.chain.insert(key, size, dram_resident, Tier::Slow);
+			self.slow_used += migrating;
+
+			return Placement::Structural;
+		}
+
+		self.chain.recency_push_front(key, size, dram_resident, 1);
+		self.fast_used += migrating;
+
+		self.settle_fast_tier();
+
+		Placement::Normal
+	}
+
+	/// An access, by tier: `touch_fast` or `touch_slow`. A STRUCTURAL key (S5)
+	/// is counted and never promoted; a fast one -- an overwrite with a value
+	/// too large, or an eff that shrank -- first leaves the recency list for
+	/// the slow chain at the count it carries, pushed `(key, Slow)`.
+	fn access(&mut self, key: HashedKey, structural: bool) {
+		match self.chain.get(key).and_then(|entry| entry.tier) {
+			Some(Tier::Fast) if structural => {
+				if let Some(entry) = self.chain.demote_recency_key(key) {
+					let size = entry.migrating();
+					self.fast_used = self.fast_used.saturating_sub(size);
+					self.slow_used += size;
+
+					self.migrations.push((key, Tier::Slow));
+				}
+
+				self.touch_slow(key, true);
+			},
+
+			Some(Tier::Fast) => self.touch_fast(key),
+			Some(Tier::Slow) => self.touch_slow(key, structural),
+			None => {},
+		}
 	}
 
 	/// Returns the tier the given (currently tracked) key is in, or `None`
@@ -282,14 +360,19 @@ impl LruLfuCompactHybridStack {
 	/// Handles an access to a key in the slow tier: bump its counter, keep
 	/// the frequency buckets ordered, and promote if that crossed
 	/// `promote_k`.
-	fn touch_slow(&mut self, key: HashedKey) {
+	///
+	/// A STRUCTURAL key (S5) only counts: it never earns the fast tier.
+	fn touch_slow(&mut self, key: HashedKey, structural: bool) {
 		let freq = self.next_frequency(key);
 
-		if freq < self.promote_k {
+		if freq < self.promote_k || structural {
 			// Still earning its way in — reorder within the slow tier only.
-			// `freq` has genuinely risen on this branch: `promote_k` is at
-			// most the cap, so a count pinned by the cap would have met the
-			// threshold and taken the other branch.
+			// `freq` has genuinely risen on this branch unless the key is
+			// structural: `promote_k` is at most the cap, so a count pinned by
+			// the cap would have met the threshold and taken the other branch.
+			// A structural key's pinned count relinks at the cap, refreshing
+			// its standing among its equally frequent peers
+			// (`slow_relink_at`'s contract).
 			self.chain.slow_relink_at(key, freq);
 			return;
 		}
@@ -381,27 +464,34 @@ impl PolicyStack for LruLfuCompactHybridStack {
 	}
 
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		let dram_resident = narrow_resident(dram_resident);
+		self.insert_with(key, size, dram_resident, Placement::Normal);
+	}
 
-		if self.chain.contains(key) {
-			// An overwrite is an access, not an automatic promotion — see the
-			// baseline's "A `set()` is an access" section.
-			self.resize_key(key, size, dram_resident);
-			self.update(key);
-			return;
-		}
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		_event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_with(key, size, dram_resident, placement)
+	}
 
-		self.chain.recency_push_front(key, size, dram_resident, 1);
-		self.fast_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.measured = measured;
+	}
 
+	/// S5: every settle, against the current budget (the policy worker's
+	/// end-of-pass step).
+	fn resettle(&mut self) {
 		self.settle_fast_tier();
 	}
 
 	fn update(&mut self, key: HashedKey) {
-		match self.chain.get(key).and_then(|entry| entry.tier) {
-			Some(Tier::Fast) => self.touch_fast(key),
-			Some(Tier::Slow) => self.touch_slow(key),
-			None => {},
+		if let Some(entry) = self.chain.get(key) {
+			let structural = self.structural(entry.migrating());
+			self.access(key, structural);
 		}
 	}
 

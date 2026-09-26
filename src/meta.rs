@@ -822,6 +822,13 @@ mod tests {
 	fn a_tiered_cache_publishes_what_a_fresh_reading_of_it_gives() {
 		use crate::{CacheTierSize, PaperCache, PaperPolicy, TieredBuffer};
 
+		// The per-object metadata model (S5): the test is about M's
+		// publication, which the model does not enter, and this 1 MiB tier is
+		// smaller than the merged store's and hashbrown_dram's own empty
+		// structures -- under the measured model's key ceiling it would refuse
+		// every key.
+		let _per_object = crate::object::overhead::test_overheads::per_object();
+
 		let cache = PaperCache::<u64, TieredBuffer>::new(
 			64 << 20,
 			CacheTierSize::Bytes(1 << 20),

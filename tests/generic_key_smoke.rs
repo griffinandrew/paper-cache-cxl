@@ -3,14 +3,25 @@
 #![cfg(feature = "lru_compact_hybrid_cache")]
 
 // Does the library actually accept a non-integer key type end to end?
-use paper_cache::{PaperCache, CacheTierSize, PaperPolicy, TieredBuffer};
+use paper_cache::{PaperCache, CacheTierSize, GateConfig, MetadataModel, PaperPolicy, TieredBuffer};
+
+// The per-object metadata model (S5): this test is not about the model, and
+// its fast tier is smaller than the cache's own empty structures in the
+// merged and hashbrown builds -- under the measured model's key ceiling it
+// would refuse every key.
+fn per_object() -> GateConfig {
+    let mut gate = GateConfig::default();
+    gate.metadata_model = MetadataModel::PerObject;
+    gate
+}
 
 #[test]
 fn string_keys_work_end_to_end() {
-    let cache = PaperCache::<String, TieredBuffer>::new(
+    let cache = PaperCache::<String, TieredBuffer>::new_with_gate(
         10_000_000,
         CacheTierSize::Bytes(2_000_000),
         PaperPolicy::LruCompactHybrid,
+        per_object(),
     )
     .expect("construct");
 
@@ -31,7 +42,7 @@ fn string_keys_work_end_to_end() {
 #[test]
 fn byte_vec_keys_work_too() {
     let cache =
-        PaperCache::<Vec<u8>, TieredBuffer>::new(10_000_000, CacheTierSize::Bytes(2_000_000), PaperPolicy::LruCompactHybrid)
+        PaperCache::<Vec<u8>, TieredBuffer>::new_with_gate(10_000_000, CacheTierSize::Bytes(2_000_000), PaperPolicy::LruCompactHybrid, per_object())
             .expect("construct");
 
     cache.set(vec![0xDE, 0xAD], b"beef".as_slice(), None).expect("set");
@@ -48,7 +59,7 @@ impl typesize::TypeSize for OpaqueKey {}
 #[test]
 fn keys_need_no_debug_impl() {
     let cache =
-        PaperCache::<OpaqueKey, TieredBuffer>::new(10_000_000, CacheTierSize::Bytes(2_000_000), PaperPolicy::LruCompactHybrid)
+        PaperCache::<OpaqueKey, TieredBuffer>::new_with_gate(10_000_000, CacheTierSize::Bytes(2_000_000), PaperPolicy::LruCompactHybrid, per_object())
             .expect("construct");
     let k = OpaqueKey(*b"0123456789abcdef");
     cache.set(k.clone(), b"v".as_slice(), None).expect("set");

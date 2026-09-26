@@ -298,6 +298,69 @@ pub enum SetEvent {
 	Replaced { resized: bool },
 }
 
+/// Where a set's value was built, and why, as its `Set` tells the stack (S5).
+/// One byte, in the event's existing padding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Placement {
+	/// Built where the design's admission rule said.
+	#[default]
+	Normal,
+
+	/// Larger than an EMPTY fast tier (`v > eff`, eff = 0 when metadata fills
+	/// the tier): built slow, and every stack places the key slow, keeps it in
+	/// its place in the policy's order, and never promotes it while it stays
+	/// that large (`gate::decide`, step 3).
+	Structural,
+}
+
+/// The nearest key at or before `start`, toward the front of its queue, that
+/// `is_stop` accepts. The boundary walk every design with a tier-boundary
+/// cursor takes since S5: a structural key keeps its place in the order with
+/// tier Slow, so the cursor -- the least-recently-used FAST key -- steps over
+/// slow keys to the next fast one. Amortized O(1) per structural key: a
+/// cursor only moves toward the front, and a key it stepped over stays behind
+/// it until a hit brings it back to the front.
+pub(crate) fn walk_to<P: Copy>(
+	list: &arena_queue_set::ArenaQueueSet<P>,
+	mut start: Option<HashedKey>,
+	is_stop: impl Fn(&P) -> bool,
+) -> Option<HashedKey> {
+	while let Some(key) = start {
+		match list.payload(key) {
+			Some(payload) if is_stop(&payload) => return Some(key),
+			_ => start = list.before(key),
+		}
+	}
+
+	None
+}
+
+/// `walk_to` for a `NodePayload` list whose cursor names the least-recently-
+/// used FAST key: the nearest key at or before `start` whose tier is Fast.
+pub(crate) fn fast_at_or_before(
+	list: &arena_queue_set::ArenaQueueSet<arena_queue_set::NodePayload>,
+	start: Option<HashedKey>,
+) -> Option<HashedKey> {
+	walk_to(list, start, |payload| payload.tier == Some(Tier::Fast))
+}
+
+/// The cursor's step off `key`: the nearest FAST key before it.
+pub(crate) fn prev_fast(
+	list: &arena_queue_set::ArenaQueueSet<arena_queue_set::NodePayload>,
+	key: HashedKey,
+) -> Option<HashedKey> {
+	fast_at_or_before(list, list.before(key))
+}
+
+/// The placement a stack applied (`PolicyStack::insert_placed`'s answer).
+pub(crate) fn placed(structural: bool) -> Placement {
+	match structural {
+		true => Placement::Structural,
+		false => Placement::Normal,
+	}
+}
+
 /// How many second chances a CLOCK hand may grant in one `evict_one` before
 /// it evicts whatever is at the tail: `2 * len + 8`. A liveness guard, not a
 /// policy: sequentially a hand makes at most as many second chances as there
@@ -371,6 +434,40 @@ where
 		let _ = event;
 		self.insert_resident(key, size, dram_resident);
 	}
+
+	/// The policy worker's handling of a `Set` (S5): `insert_set`, told where
+	/// the client placed the value (`Placement`). Returns the placement the
+	/// stack APPLIED: `Structural` also when the stack's own check -- the value
+	/// larger than its current eff -- made a `Normal` set structural (eff
+	/// moved between the client's decision and this), which the worker counts.
+	/// A flat stack has no tiers and ignores it.
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_set(key, size, dram_resident, event);
+		placement
+	}
+
+	/// S5: the metadata figure the stack reserves out of its fast capacity,
+	/// pushed by the policy worker at its publication under the MEASURED model
+	/// (`Some(M)`, replacing `len x omega` and a ghost's bytes); `None` under
+	/// the per-object model restores today's reservation. The carve-out
+	/// designs split it between their segments exactly as they split the
+	/// per-object one. Flat stacks reserve nothing.
+	fn set_dram_metadata(&mut self, _measured: Option<CacheSize>) {}
+
+	/// S5: every settle the stack runs, against its current budget -- the
+	/// policy worker's end-of-pass step (and `MakeRoom`'s), so a design whose
+	/// new-key path never settles (LFU latched, the slow admission queues)
+	/// still rests at or under its drain target once the reservation grew. A
+	/// settle under its target returns at its first comparison. Flat stacks
+	/// have none.
+	fn resettle(&mut self) {}
 
 	fn update(&mut self, _key: HashedKey) {}
 	fn record_access(&mut self, key: HashedKey, hit: bool) -> AccessOutcome {

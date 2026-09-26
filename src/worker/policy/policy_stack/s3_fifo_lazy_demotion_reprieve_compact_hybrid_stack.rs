@@ -90,7 +90,7 @@ use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
 		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
-		HashedKey, PolicyStack, Tier,
+		HashedKey, PolicyStack, Tier, Placement, SetEvent, placed,
 	},
 	PaperPolicy,
 };
@@ -162,6 +162,11 @@ pub struct S3FifoLazyDemotionReprieveCompactHybridStack {
 	shared_overhead: CacheSize,
 
 	migrations: Vec<(HashedKey, Tier)>,
+
+	/// S5: the measured M the policy worker pushed (`set_dram_metadata`),
+	/// reserved instead of the per-object reservation; `None` under the
+	/// per-object model.
+	measured: Option<CacheSize>,
 }
 
 impl S3FifoLazyDemotionReprieveCompactHybridStack {
@@ -176,6 +181,7 @@ impl S3FifoLazyDemotionReprieveCompactHybridStack {
 			slow_used: 0,
 			shared_overhead: 0,
 			migrations: Vec::new(),
+			measured: None,
 		}
 	}
 
@@ -196,7 +202,69 @@ impl S3FifoLazyDemotionReprieveCompactHybridStack {
 	/// charged too. There is no ghost-queue term: this variant has no ghost
 	/// queue at all, since no key is ever evicted from the one-access queue.
 	fn reserved_overhead(&self) -> CacheSize {
-		self.queues.len() as CacheSize * self.shared_overhead
+		self.measured.unwrap_or(self.queues.len() as CacheSize * self.shared_overhead)
+	}
+
+	/// This stack's eff (S5): the whole fast tier's budget for values -- the
+	/// tier's, not a segment's -- before the drain target.
+	fn own_eff(&self) -> CacheSize {
+		self.fast_capacity.saturating_sub(self.reserved_overhead())
+	}
+
+	/// Whether a value of `migrating` bytes is STRUCTURAL (S5): larger than an
+	/// empty fast tier. Such a key is placed slow, keeps its place in the
+	/// policy's order, and is never promoted while it stays that large. The
+	/// stack's own check beside the client's flag, so a key the client placed
+	/// normally just before eff moved is placed as the stack's own promotions
+	/// would place it.
+	fn structural(&self, migrating: CacheSize) -> bool {
+		migrating > self.own_eff()
+	}
+
+	/// S5: moves `key` -- a one-access, main-fast or main-slow key -- to the
+	/// FRONT OF THE SLOW LIST with tier slow, its reference bit cleared: where
+	/// a STRUCTURAL key (its value larger than an empty fast tier) goes when
+	/// the policy would put it at main's front. Main's order is two physical
+	/// lists here and a slow key cannot sit in the fast one, so the front of
+	/// the slow list -- the seam -- is the nearest place; this design's one
+	/// departure from "keeps its place in the order". Returns whether the key
+	/// left a FAST placement, which the caller pushes `(key, Slow)` for.
+	fn to_slow_front(&mut self, key: HashedKey) -> bool {
+		let Some(payload) = self.queues.payload(key) else { return false };
+		let size = payload.migrating();
+
+		let from = match (Queue::from_u8(payload.queue), payload.tier) {
+			(Queue::OneAccess, _) => Q_ONE_ACCESS,
+			(Queue::Main, Some(Tier::Fast)) => Q_MAIN_FAST,
+			_ => Q_MAIN_SLOW,
+		};
+
+		match from {
+			Q_MAIN_SLOW => self.queues.move_front(Q_MAIN_SLOW, key),
+			from => self.queues.move_to_front_of(from, Q_MAIN_SLOW, key),
+		}
+
+		if let Some(p) = self.queues.payload_mut(key) {
+			p.queue = Queue::Main as u8;
+			p.tier = Some(Tier::Slow);
+			p.freq = 0;
+		}
+
+		match from {
+			Q_ONE_ACCESS => {
+				self.one_access_used = self.one_access_used.saturating_sub(size);
+				self.slow_used += size;
+			},
+
+			Q_MAIN_FAST => {
+				self.fast_used = self.fast_used.saturating_sub(size);
+				self.slow_used += size;
+			},
+
+			_ => {},
+		}
+
+		from == Q_MAIN_FAST
 	}
 
 	/// The whole `fast_capacity`, less the shared per-object metadata
@@ -254,9 +322,9 @@ impl S3FifoLazyDemotionReprieveCompactHybridStack {
 		}
 	}
 
-	fn touch(&mut self, key: HashedKey) {
+	fn touch(&mut self, key: HashedKey, structural: bool) {
 		match self.queues.payload(key).map(|p| Queue::from_u8(p.queue)) {
-			Some(Queue::OneAccess) => self.promote_from_one_access(key),
+			Some(Queue::OneAccess) => self.promote_from_one_access(key, structural),
 			Some(Queue::Main) => self.mark_accessed(key),
 			None => {},
 		}
@@ -270,9 +338,20 @@ impl S3FifoLazyDemotionReprieveCompactHybridStack {
 		}
 	}
 
-	fn promote_from_one_access(&mut self, key: HashedKey) {
+	fn promote_from_one_access(&mut self, key: HashedKey, structural: bool) {
 		let Some(payload) = self.queues.payload(key) else { return };
 		let size_bytes = payload.migrating();
+
+		// S5: a STRUCTURAL key goes to the front of the slow list, slow, and is
+		// not promoted; if it leaves a fast placement, pushed.
+		if structural {
+			if self.to_slow_front(key) {
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			self.settle_fast_tier();
+			return;
+		}
 
 		self.queues.move_to_front_of(Q_ONE_ACCESS, Q_MAIN_FAST, key);
 		self.one_access_used = self.one_access_used.saturating_sub(size_bytes);
@@ -305,6 +384,18 @@ impl S3FifoLazyDemotionReprieveCompactHybridStack {
 	fn give_second_chance(&mut self, key: HashedKey) {
 		let Some(payload) = self.queues.payload(key) else { return };
 		let size = payload.migrating();
+
+		// S5: a STRUCTURAL key's second chance keeps it slow, at the front of
+		// the slow list; a fast one (the fast-tail fallback) moves there,
+		// pushed.
+		if self.structural(size) {
+			if self.to_slow_front(key) {
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			self.settle_fast_tier();
+			return;
+		}
 
 		match payload.tier {
 			// Already fast -- only reachable from `evict_one`'s fast-tail
@@ -360,6 +451,49 @@ impl S3FifoLazyDemotionReprieveCompactHybridStack {
 	/// still retags its payload, still moves between the two physical lists,
 	/// still moves `fast_used`/`slow_used` by its own size, and still emits
 	/// exactly one `Tier::Slow` migration.
+	/// A `Set`, with the client's placement (S5): the design's insert, with a
+	/// STRUCTURAL value placed slow -- see `to_slow_front`. Returns the
+	/// placement applied.
+	fn insert_with(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, placement: Placement) -> Placement {
+		let dram_resident = narrow_resident(dram_resident);
+		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+		let structural = placement == Placement::Structural || self.structural(migrating);
+
+		if self.queues.contains(key) {
+			self.resize_key(key, size, dram_resident);
+
+			// S5: a FAST main key overwritten with a structural value leaves the
+			// fast set, to the front of the slow list, pushed.
+			if structural && self.queues.payload(key).is_some_and(|p| Queue::from_u8(p.queue) == Queue::Main && p.tier == Some(Tier::Fast)) {
+				if self.to_slow_front(key) {
+					self.migrations.push((key, Tier::Slow));
+				}
+			}
+
+			self.touch(key, structural);
+			return placed(structural);
+		}
+
+		self.queues.push_front(
+			Q_ONE_ACCESS,
+			key,
+			NodePayload {
+				size,
+				freq: 0,
+				ts: 0,
+				queue: Queue::OneAccess as u8,
+				tier: None,
+				phys: None,
+				dram_resident,
+			},
+		);
+		self.one_access_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+
+		self.settle_one_access();
+
+		placed(structural)
+	}
+
 	fn settle_fast_tier(&mut self) {
 		let effective_capacity = self.effective_main_fast_capacity();
 		let target = drain_target::bytes(effective_capacity);
@@ -456,35 +590,35 @@ impl PolicyStack for S3FifoLazyDemotionReprieveCompactHybridStack {
 	}
 
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		let dram_resident = narrow_resident(dram_resident);
-
-		if self.queues.contains(key) {
-			self.resize_key(key, size, dram_resident);
-			self.touch(key);
-			return;
-		}
-
-		self.queues.push_front(
-			Q_ONE_ACCESS,
-			key,
-			NodePayload {
-				size,
-				freq: 0,
-				ts: 0,
-				queue: Queue::OneAccess as u8,
-				tier: None,
-				phys: None,
-				dram_resident,
-			},
-		);
-		self.one_access_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
-
-		self.settle_one_access();
+		self.insert_with(key, size, dram_resident, Placement::Normal);
 	}
 
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		_event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_with(key, size, dram_resident, placement)
+	}
+
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.measured = measured;
+	}
+
+	/// S5: every settle, against the current budget (the policy worker's
+	/// end-of-pass step).
+	fn resettle(&mut self) {
+		self.settle_fast_tier();
+	}
+
+
 	fn update(&mut self, key: HashedKey) {
-		if self.queues.contains(key) {
-			self.touch(key);
+		if let Some(payload) = self.queues.payload(key) {
+			let structural = self.structural(payload.migrating());
+			self.touch(key, structural);
 		}
 	}
 

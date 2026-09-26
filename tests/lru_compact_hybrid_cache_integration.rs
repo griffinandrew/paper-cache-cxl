@@ -55,7 +55,7 @@
 
 #[cfg(feature = "lru_compact_hybrid_cache")]
 mod hybrid_cache_tests {
-    use paper_cache::{PaperPolicy, PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
+    use paper_cache::{PaperPolicy, PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError, GateConfig, MetadataModel};
 
     fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + timeout;
@@ -103,10 +103,56 @@ mod hybrid_cache_tests {
         vec![seed; VALUE_LEN]
     }
 
+    // ── the metadata model (S5) ───────────────────────────────────────────
+
+    /// `PAPER_DISABLE_SHARED_OVERHEAD=1` -- which this process sets, in
+    /// `ensure_pmem_allocator_warm` -- zeroes the metadata term under EITHER
+    /// model: a cache built with the default (measured) model publishes the
+    /// per-object one with omega 0, so M_model is 0 (LRU keeps no ghost), eff
+    /// is the whole tier and there is no key ceiling; asked for the per-object
+    /// model, the same. The lib's `models_and_the_env_var` is the other half.
+    /// Red with the variable honoured only where the per-object model was
+    /// asked for (`envmeasured`).
+    #[test]
+    fn the_env_var_zeroes_the_metadata_term_under_either_model() {
+        ensure_pmem_allocator_warm();
+
+        let mut per_object = GateConfig::default();
+        per_object.metadata_model = MetadataModel::PerObject;
+
+        for config in [GateConfig::default(), per_object] {
+            let cache = PaperCache::<u32, TieredBuffer>::new_with_gate(
+                1_048_576,
+                CacheTierSize::Bytes(65_536), PaperPolicy::LruCompactHybrid, config).expect("cache should construct");
+
+            for key in 0..10u32 {
+                cache.set(key, &value(key as u8), None).expect("set should succeed");
+            }
+
+            assert!(wait_until(MIGRATION_TIMEOUT, || {
+                let s = cache.hybrid_stats();
+                s.fast_objects + s.slow_objects == 10
+            }));
+
+            let s = cache.hybrid_stats();
+            assert_eq!(s.metadata_model, MetadataModel::PerObject, "{config:?}: the model");
+            assert_eq!(s.dram_metadata_bytes_model, 0, "{config:?}: M_model");
+            assert_eq!(s.effective_fast_capacity, 65_536, "{config:?}: eff");
+            assert_eq!(s.metadata_key_ceiling, u64::MAX, "{config:?}: omega 0 has no ceiling");
+        }
+    }
+
     // ── admission ─────────────────────────────────────────────────────────
 
     #[test]
     fn admission_always_lands_in_fast_tier() {
+        // The environment variable first, as every test here (S5): a cache
+        // built before it would use the measured metadata model, whose key
+        // ceiling refuses keys on a tier smaller than the cache's own
+        // structures -- this 1 MiB one, in the merged and hashbrown builds --
+        // and whether a sibling test had set it yet was a race.
+        ensure_pmem_allocator_warm();
+
         let cache = PaperCache::<u32, TieredBuffer>::new(
             1_048_576,
             CacheTierSize::Bytes(1_048_576), PaperPolicy::LruCompactHybrid).expect("cache should construct");

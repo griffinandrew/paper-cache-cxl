@@ -144,6 +144,14 @@ pub mod meta;
 #[cfg(feature = "hybrid_cache_common")]
 pub use crate::meta::DramMetadata;
 
+/// S5 (B1): the admission path of a tiered cache's set -- the size checks,
+/// the metadata cap, structural slow placement -- and the figures it reads.
+#[cfg(feature = "hybrid_cache_common")]
+pub mod gate;
+
+#[cfg(feature = "hybrid_cache_common")]
+pub use crate::gate::{GateConfig, MetadataModel, MetadataOverflow};
+
 // Shared object-map storage-backend abstraction and value-buffer
 // abstraction (see each module's doc comment) -- used by the generic
 // `impl<K, V, S> PaperCache<K, V, S>` blocks below to replace what used to
@@ -1014,6 +1022,17 @@ where
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
+		// The size checks before anything is allocated (S5), with the
+		// predicates they always had: the length's base size
+		// (`OverheadManager::base_size_for`, which `base_size` of the object
+		// built below equals) -- a value too large is refused unbuilt.
+		match self.overhead_manager.base_size_for(&key, value.len(), ttl) {
+			None => return Err(CacheError::ExceedingValueSize),
+			Some(0) => return Err(CacheError::ZeroValueSize),
+			Some(base) if self.status.exceeds_max_size(base) => return Err(CacheError::ExceedingValueSize),
+			Some(_) => {},
+		}
+
 		// The one thing the shape still decides: which allocator the value
 		// comes from. `BufferDRAM` names the fast tier, `BufferPMEM` the slow
 		// one -- see `value::ValueShape`.
@@ -1024,14 +1043,6 @@ where
 		// Where the bytes were allocated, for the worker's reconcile
 		// (`WorkerEvent::Set`).
 		let built = object.value().tier();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
 
 		self.status.incr_sets();
 
@@ -1062,6 +1073,8 @@ where
 			built,
 			// A flat cache queues no migration: nothing to mark.
 			0,
+			// Nor places anything by tier.
+			crate::worker::Placement::Normal,
 		))?;
 
 		Ok(())
@@ -1659,6 +1672,17 @@ where
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let hashed_key = self.hash_key(&key);
 
+		// The size checks before anything is allocated (S5), with the
+		// predicates they always had: the length's base size
+		// (`OverheadManager::base_size_for`, which `base_size` of the object
+		// built below equals) -- a value too large is refused unbuilt.
+		match self.overhead_manager.base_size_for(&key, value.len(), ttl) {
+			None => return Err(CacheError::ExceedingValueSize),
+			Some(0) => return Err(CacheError::ZeroValueSize),
+			Some(base) if self.status.exceeds_max_size(base) => return Err(CacheError::ExceedingValueSize),
+			Some(_) => {},
+		}
+
 		// The one thing the shape still decides: which allocator the value
 		// comes from. `BufferDRAM` names the fast tier, `BufferPMEM` the slow
 		// one -- see `value::ValueShape`.
@@ -1670,14 +1694,6 @@ where
 		// Where the bytes were allocated, for the worker's reconcile
 		// (`WorkerEvent::Set`).
 		let built = object.value().tier();
-
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
 
 		self.status.incr_sets();
 
@@ -1706,6 +1722,8 @@ where
 			built,
 			// A flat cache queues no migration: nothing to mark.
 			0,
+			// Nor places anything by tier.
+			crate::worker::Placement::Normal,
 		))?;
 
 		Ok(())
@@ -2188,6 +2206,33 @@ fn new_hybrid_object_map<K, V>() -> ObjectMapRef<K, V> {
 	}
 }
 
+/// Installs a tiered cache's admission configuration on its status, before its
+/// policy worker is built (S5): validated; pinned to the per-object model on a
+/// thread a lib test pinned (`test_overheads`); and FORCED to it under
+/// `PAPER_DISABLE_SHARED_OVERHEAD=1`, the mechanics tests' switch, which also
+/// makes omega 0 -- so those caches run exactly the reservation they ran
+/// before S5: none, beyond a ghost's.
+#[cfg(feature = "hybrid_cache_common")]
+fn install_gate(status: &AtomicStatus, gate: GateConfig) -> Result<(), CacheError> {
+	gate.validate()?;
+
+	#[allow(unused_mut)]
+	let mut gate = gate;
+
+	#[cfg(test)]
+	if crate::object::overhead::test_overheads::per_object_pinned() {
+		gate.metadata_model = crate::gate::MetadataModel::PerObject;
+	}
+
+	status.gate().set_config(gate);
+
+	if std::env::var_os("PAPER_DISABLE_SHARED_OVERHEAD").is_some_and(|v| v == "1") {
+		status.gate().force_per_object();
+	}
+
+	Ok(())
+}
+
 /// True when `policy` sizes its main queue from `1 - ratio` and that budget
 /// truncates to zero at `max_size` -- the configuration that spins
 /// `apply_evictions`, since `Stack::is_full` is `used >= max` and so an empty
@@ -2363,7 +2408,35 @@ where
 		policy: PaperPolicy,
 		hasher: S,
 	) -> Result<Self, CacheError> {
-		Self::new_hybrid(max_size, fast_tier_size, policy, hasher)
+		Self::new_hybrid(max_size, fast_tier_size, policy, hasher, GateConfig::default())
+	}
+
+	/// [`Self::new`], with an admission configuration (S5): the metadata
+	/// model, the metadata floor, what a new key whose metadata would not fit
+	/// gets, and the waits. See [`GateConfig`].
+	///
+	/// # Errors
+	///
+	/// As [`Self::new`], and [`CacheError::InvalidGateConfig`] for a
+	/// configuration `GateConfig::validate` refuses.
+	pub fn new_with_gate(
+		max_size: CacheSize,
+		fast_tier_size: CacheTierSize,
+		policy: PaperPolicy,
+		gate: GateConfig,
+	) -> Result<Self, CacheError> {
+		Self::new_hybrid(max_size, fast_tier_size, policy, Default::default(), gate)
+	}
+
+	/// [`Self::new_with_gate`] with the supplied hasher.
+	pub fn with_hasher_and_gate(
+		max_size: CacheSize,
+		fast_tier_size: CacheTierSize,
+		policy: PaperPolicy,
+		hasher: S,
+		gate: GateConfig,
+	) -> Result<Self, CacheError> {
+		Self::new_hybrid(max_size, fast_tier_size, policy, hasher, gate)
 	}
 
 	// The size-split design doesn't call this: it needs three sizing
@@ -2377,6 +2450,7 @@ where
 		fast_tier_size: CacheTierSize,
 		policy: PaperPolicy,
 		hasher: S,
+		gate: GateConfig,
 	) -> Result<Self, CacheError> {
 		if max_size == 0 {
 			return Err(CacheError::ZeroCacheSize);
@@ -2442,6 +2516,10 @@ where
 		status.register_tiered_cache(
 			crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 		);
+
+		// S5: the admission configuration, on the status before the policy
+		// worker exists -- its construction publishes the first figures.
+		install_gate(&status, gate)?;
 
 		// Requirement: fast-tier size is runtime-configurable (not baked
 		// into the policy string, unlike e.g. `TwoQ`/`SThreeFifo`), so the
@@ -2652,36 +2730,131 @@ where
 		result
 	}
 
-	/// Sets the supplied key and value in the cache. Which tier the value's
-	/// bytes are built in is decided by `hybrid_policy::admission_tier`, whose
-	/// match arm for the cache's policy carries that design's admission rule.
-	/// Returns a
-	/// [`CacheError`] if the value size is zero or larger than the cache's
-	/// maximum size.
+	/// Sets the supplied key and value in the cache.
+	///
+	/// Decided from the value's LENGTH before anything is allocated
+	/// (`begin_set`, S5): the size checks; for a NEW key near the metadata
+	/// ceiling, the metadata cap; the tier, by `hybrid_policy::admission_tier`,
+	/// whose match arm for the cache's policy carries that design's admission
+	/// rule; and structural slow placement -- a value larger than an empty
+	/// fast tier is built in the slow tier and placed there. Then the value is
+	/// built and published (`commit`).
+	///
+	/// # Errors
+	///
+	/// [`CacheError::ExceedingValueSize`] for a value larger than the cache's
+	/// maximum size (refused before it is built); [`CacheError::ZeroValueSize`]
+	/// as before (a zero base size, which no object has -- an empty value is
+	/// stored); [`CacheError::MetadataOverflow`] for a new key whose metadata
+	/// would not fit (see [`GateConfig::on_metadata_overflow`]);
+	/// [`CacheError::Internal`] if the policy worker is gone while this set
+	/// waits for room, or a worker could not be told.
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
+		let permit = self.begin_set(&key, value.len(), ttl)?;
 
-		let tier = crate::hybrid_policy::admission_tier(
-			self.status.policy(),
-			hashed_key,
-			&self.status,
-			&self.objects,
-		);
+		self.commit(permit, key, value)
+	}
+
+	/// The admission half of `set` (S5): everything decided from `key`, the
+	/// value's length and its ttl, before anything is allocated -- the size
+	/// checks, the metadata cap (waiting in the metadata lane under
+	/// `EvictToFit`), `admission_tier`, the structural check
+	/// (`gate::decide`). No lock is held across a wait, and nothing has been
+	/// allocated or sent by then.
+	pub(crate) fn begin_set(&self, key: &K, len: usize, ttl: Option<u32>) -> Result<crate::gate::SetPermit, CacheError> {
+		use crate::gate::{self, Verdict};
+
+		let hashed = self.hash_key(key);
+
+		// 0. The size checks, with today's predicates.
+		let Some(base) = self.overhead_manager.base_size_for(key, len, ttl) else {
+			return Err(CacheError::ExceedingValueSize);
+		};
+
+		if base == 0 {
+			return Err(CacheError::ZeroValueSize);
+		}
+
+		if self.status.exceeds_max_size(base) {
+			return Err(CacheError::ExceedingValueSize);
+		}
+
+		let sizes = gate::Sizes {
+			base,
+			resident: self.overhead_manager.dram_resident_size_for(key, ttl),
+			value: crate::phys::value_charge::<K>(len as ObjectSize),
+		};
+
+		let gate = self.status.gate();
+		let mut lane: Option<gate::LaneGuard<'_>> = None;
+		let mut last_evicted: Option<u64> = None;
+
+		loop {
+			let head = lane.as_ref().is_some_and(|place| place.is_head());
+
+			match gate::decide(&self.status, &self.objects, hashed, &sizes, head)? {
+				// The lane place, if any, is released here, waking the next.
+				Verdict::Admit { tier, placement } => {
+					return Ok(gate::SetPermit { hashed, tier, placement, len, ttl, sizes });
+				},
+
+				// `EvictToFit`: a new key at the ceiling waits in FIFO order.
+				Verdict::NeedsRoom => {
+					if gate.worker_gone() {
+						return Err(CacheError::Internal);
+					}
+
+					let config = gate.config();
+
+					match &lane {
+						None => lane = Some(gate.meta_lane.enqueue()),
+
+						// Behind another new key: woken when the head leaves.
+						Some(place) if !place.is_head() => gate::park(std::time::Duration::from_millis(100)),
+
+						// The head: ask the worker to evict for it, and wait. A
+						// request that evicted nothing, with the ceiling still
+						// shut, is the end: there is nothing to make room from.
+						Some(_) => {
+							if last_evicted == Some(0) {
+								gate.count_make_room_failure();
+								return Err(CacheError::MetadataOverflow);
+							}
+
+							let request = gate.next_room_request();
+
+							gate.count_make_room_request();
+							self.broadcast(WorkerEvent::MakeRoom(request))?;
+							self.status.kick_policy_worker();
+
+							last_evicted = Some(gate::await_room(gate, request, &config)?);
+						},
+					}
+				},
+			}
+		}
+	}
+
+	/// The build-and-publish half of `set` (S5): builds exactly the object
+	/// `begin_set` decided on -- in its tier -- inserts it, and sends its
+	/// `Set`, carrying the placement. Then the set-path kick: a policy worker
+	/// parked on its long idle poll is woken by the first set after it.
+	pub(crate) fn commit(&self, permit: crate::gate::SetPermit, key: K, value: &[u8]) -> Result<(), CacheError> {
+		let crate::gate::SetPermit { hashed: hashed_key, tier, placement, len, ttl, sizes } = permit;
+
+		debug_assert_eq!(value.len(), len, "commit builds the value begin_set checked");
+		debug_assert_eq!(self.hash_key(&key), hashed_key, "commit builds the key begin_set checked");
+
 		let object = Object::new_in(key, value, tier, ttl);
-		let base_size = self.overhead_manager.base_size(&object);
-		let dram_resident = self.overhead_manager.dram_resident_size(&object);
+		let base_size = sizes.base;
+		let dram_resident = sizes.resident;
 		let expiry = object.expiry();
 		// Where the bytes were allocated, for the worker's reconcile
 		// (`WorkerEvent::Set`).
 		let built = object.value().tier();
 
-		if base_size == 0 {
-			return Err(CacheError::ZeroValueSize);
-		}
-
-		if self.status.exceeds_max_size(base_size) {
-			return Err(CacheError::ExceedingValueSize);
-		}
+		debug_assert_eq!(self.overhead_manager.base_size(&object), base_size, "base_size_for is base_size");
+		debug_assert_eq!(self.overhead_manager.dram_resident_size(&object), dram_resident);
 
 		self.status.incr_sets();
 
@@ -2703,7 +2876,11 @@ where
 		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
 			base_size as i64 - old_object_size as i64
 		} else {
-			self.status.incr_num_objects();
+			// A new object: near the key ceiling, the next new key's set
+			// checks it (`gate::META_NEAR`).
+			let before = self.status.incr_num_objects();
+			self.status.gate().note_count(before.saturating_add(1));
+
 			base_size as i64
 		};
 
@@ -2716,7 +2893,59 @@ where
 			old_object_info,
 			built,
 			mark,
+			placement,
 		))?;
+
+		self.kick_idle_worker();
+
+		Ok(())
+	}
+
+	/// The set-path kick (S5): after a `Set` is in the policy worker's
+	/// channel, wakes the worker if it is parked on its long idle poll. A
+	/// Dekker pair with `PolicyWorker::delay_event_loop`: the worker writes
+	/// its idle bit, fences, and parks only if its channel is empty; this
+	/// thread wrote the channel, fences, and reads the bit -- so at least one
+	/// sees the other: the worker does not park, or it is kicked. The `swap`
+	/// makes it one kick per idle spell. Per set: a fence and a relaxed load;
+	/// the kick (a lock and an unpark) only on the first set after an idle
+	/// spell. It restores the real-time bound S4 removed for the merged store
+	/// and closes S1's up-to-1 s window in both stores.
+	fn kick_idle_worker(&self) {
+		std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+		let gate = self.status.gate();
+
+		if gate.worker_idle.load(std::sync::atomic::Ordering::Relaxed)
+			&& gate.worker_idle.swap(false, std::sync::atomic::Ordering::AcqRel)
+		{
+			self.status.kick_policy_worker();
+			gate.count_idle_kick();
+		}
+	}
+
+	/// The cache's admission configuration (S5). See [`GateConfig`].
+	#[must_use]
+	pub fn gate_config(&self) -> GateConfig {
+		self.status.gate().config()
+	}
+
+	/// Replaces the cache's admission configuration (S5): validated, stored at
+	/// once (a set reads the overflow mode and the waits at once), and the
+	/// policy worker kicked; the metadata model and floor take effect at its
+	/// next pass, which republishes eff and the key ceiling. The model is
+	/// forced to `PerObject` under `PAPER_DISABLE_SHARED_OVERHEAD=1` whatever
+	/// this says.
+	///
+	/// # Errors
+	///
+	/// [`CacheError::InvalidGateConfig`] for a configuration
+	/// `GateConfig::validate` refuses.
+	pub fn set_gate_config(&self, gate: GateConfig) -> Result<(), CacheError> {
+		gate.validate()?;
+
+		self.status.gate().set_config(gate);
+		self.status.kick_policy_worker();
 
 		Ok(())
 	}
@@ -2947,6 +3176,9 @@ where
 		self.status.set_fast_tier_capacity(bytes);
 		self.broadcast(WorkerEvent::ResizeFastTier(bytes))?;
 
+		// S5: eff moved with F; the worker republishes it at its next pass.
+		self.status.kick_policy_worker();
+
 		Ok(())
 	}
 
@@ -2956,10 +3188,10 @@ where
 		self.status.fast_tier_capacity()
 	}
 
-	/// The fast tier's budget for VALUE bytes: the whole fast-tier budget
-	/// less the per-object DRAM reservation for every live object,
-	/// `F - L * omega`, saturating at zero. Reporting only at this step --
-	/// see `AtomicStatus::effective_fast_capacity`.
+	/// eff (S5): the fast tier's budget for VALUE bytes, `F - M_model`,
+	/// saturating, as the policy worker last published it -- the figure the
+	/// settles, the structural check and the metadata cap read. See
+	/// `AtomicStatus::effective_fast_capacity`.
 	#[must_use]
 	pub fn effective_fast_capacity(&self) -> CacheSize {
 		self.status.effective_fast_capacity()
@@ -3139,7 +3371,19 @@ where
 		size_threshold: CacheTierSize,
 		hasher: S,
 	) -> Result<Self, CacheError> {
-		Self::new_sized_hybrid(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold, PaperPolicy::LruSizedCompactHybrid, hasher)
+		Self::new_sized_hybrid(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold, PaperPolicy::LruSizedCompactHybrid, hasher, GateConfig::default())
+	}
+
+	/// [`Self::new_sized_compact`], with an admission configuration (S5).
+	/// See [`Self::new_with_gate`].
+	pub fn new_sized_compact_with_gate(
+		max_size: CacheSize,
+		small_fast_tier_size: CacheTierSize,
+		large_fast_tier_size: CacheTierSize,
+		size_threshold: CacheTierSize,
+		gate: GateConfig,
+	) -> Result<Self, CacheError> {
+		Self::new_sized_hybrid(max_size, small_fast_tier_size, large_fast_tier_size, size_threshold, PaperPolicy::LruSizedCompactHybrid, Default::default(), gate)
 	}
 
 	/// Duplicates `new_hybrid`'s common setup rather than reusing it: this
@@ -3156,6 +3400,7 @@ where
 		size_threshold: CacheTierSize,
 		policy: PaperPolicy,
 		hasher: S,
+		gate: GateConfig,
 	) -> Result<Self, CacheError> {
 		if max_size == 0 {
 			return Err(CacheError::ZeroCacheSize);
@@ -3183,6 +3428,9 @@ where
 		status.register_tiered_cache(
 			crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
 		);
+
+		// As in `new_hybrid`: the admission configuration, before the worker.
+		install_gate(&status, gate)?;
 
 		status.set_fast_tier_capacity(small_capacity);
 		status.set_hybrid_large_fast_capacity(large_capacity);
@@ -3246,6 +3494,9 @@ where
 		self.status.set_hybrid_large_fast_capacity(bytes);
 		self.broadcast(WorkerEvent::ResizeLargeFastTier(bytes))?;
 
+		// S5: as `set_fast_tier_size`.
+		self.status.kick_policy_worker();
+
 		Ok(())
 	}
 
@@ -3263,6 +3514,9 @@ where
 
 		self.status.set_hybrid_size_threshold(bytes);
 		self.broadcast(WorkerEvent::ResizeSizeThreshold(bytes))?;
+
+		// S5: a class's structural figure is chosen by the threshold.
+		self.status.kick_policy_worker();
 
 		Ok(())
 	}

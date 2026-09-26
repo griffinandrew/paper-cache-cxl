@@ -628,6 +628,32 @@ impl ArenaFrequencyChain {
 		Some((key, payload))
 	}
 
+	/// Moves a recency-list key -- ANY one, not only the tail -- into the slow
+	/// tier, into the bucket for the frequency it carries: `demote_recency_back`
+	/// for a key wherever it stands (S5: a key whose value outgrew an empty fast
+	/// tier leaves it at once). `None` if the key is untracked or not in the
+	/// fast tier. For the recency-list design only (LRU-LFU): a fast key of the
+	/// frequency-bucket design is linked into `fast_buckets`, not the recency
+	/// list, and must not be passed here.
+	pub fn demote_recency_key(&mut self, key: HashedKey) -> Option<NodePayload> {
+		let slot = self.slot_of(key)?;
+
+		if self.slots[slot as usize].payload.tier != Some(Tier::Fast) {
+			return None;
+		}
+
+		self.set_tier_fields(slot, Tier::Slow);
+		let payload = self.slots[slot as usize].payload;
+
+		self.recency_unlink(slot);
+		self.link(slot, payload.freq, Tier::Slow);
+
+		self.fast_len -= 1;
+		self.slow_len += 1;
+
+		Some(payload)
+	}
+
 	/// Moves a slow-tier key to the recency head, setting its frequency to
 	/// `freq`. The whole of a promotion; `None` if the key is untracked or is
 	/// not in the slow tier.

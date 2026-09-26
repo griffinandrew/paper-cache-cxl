@@ -28,6 +28,15 @@
 //! zero. That is a stronger guarantee than the rest of the family can make,
 //! and it is what `evicts_in_the_same_order_as_flat_at_every_fast_size` pins.
 //!
+//! One exception since S5: a STRUCTURAL value -- larger than an empty fast
+//! tier -- cannot sit in `Q_MAIN_FAST`, so wherever flat puts a key at main's
+//! front (a promotion, a requeue, a ghost admission; and, in the
+//! fast-admission pair, a new key the DRAM small queue does not take) it goes
+//! to the SEAM, `Q_MAIN_SLOW`'s front, slow. That is main's front whenever
+//! `Q_MAIN_FAST` is empty -- eff = 0 included, so every key structural keeps
+//! flat's order -- and otherwise behind the fast keys. Only a mix of values
+//! that fit the tier and values that do not can reorder.
+//!
 //! It also removes `main_boundary`, the cursor the other hybrids maintain in
 //! six places: the boundary IS `Q_MAIN_FAST`'s back. And it makes the reprieve
 //! splice an O(1) `move_to_front_of` rather than the O(number of fast keys)
@@ -78,7 +87,7 @@ use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
 		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
-		HashedKey, PolicyStack, Tier,
+		HashedKey, PolicyStack, Tier, Placement, SetEvent, placed,
 	},
 	PaperPolicy,
 };
@@ -146,6 +155,11 @@ pub struct S3FifoFaithfulCore<const SMALL_IS_FAST: bool, const REPRIEVE: bool> {
 	shared_overhead: CacheSize,
 
 	migrations: Vec<(HashedKey, Tier)>,
+
+	/// S5: the measured M the policy worker pushed (`set_dram_metadata`),
+	/// reserved instead of the per-object reservation; `None` under the
+	/// per-object model.
+	measured: Option<CacheSize>,
 }
 
 pub type S3FifoFaithfulCompactHybridStack = S3FifoFaithfulCore<false, false>;
@@ -167,6 +181,7 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 			fast_capacity,
 			shared_overhead: 0,
 			migrations: Vec::new(),
+			measured: None,
 		}
 	}
 
@@ -212,12 +227,85 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 	/// this file did -- overstates it by roughly 2.6x: a ghost entry is a bare
 	/// key with no object behind it, so there is no `Arc` header, no object-map
 	/// entry and no value to account for.
+	///
+	/// Under the measured model the ghost's slab is inside the pushed M
+	/// (`structure_bytes` counts it), so its own term applies only to the
+	/// per-object reservation (S5).
 	fn reserved_overhead(&self) -> CacheSize {
+		if let Some(measured) = self.measured {
+			return measured;
+		}
+
 		let ghost_entry =
 			crate::object::overhead::EXACT_GHOST_ENTRY_DRAM_OVERHEAD as CacheSize;
 
 		self.queues.len() as CacheSize * self.shared_overhead
 			+ self.ghost.queue_len(Q_GHOST) as CacheSize * ghost_entry
+	}
+
+	/// This stack's eff (S5): the whole fast tier's budget for values -- the
+	/// tier's, not a segment's -- before the drain target.
+	fn own_eff(&self) -> CacheSize {
+		self.fast_capacity.saturating_sub(self.reserved_overhead())
+	}
+
+	/// Whether a value of `migrating` bytes is STRUCTURAL (S5): larger than an
+	/// empty fast tier. Such a key is placed slow, keeps its place in the
+	/// policy's order, and is never promoted while it stays that large. The
+	/// stack's own check beside the client's flag, so a key the client placed
+	/// normally just before eff moved is placed as the stack's own promotions
+	/// would place it.
+	fn structural(&self, migrating: CacheSize) -> bool {
+		migrating > self.own_eff()
+	}
+
+	/// S5: moves `key` -- in small or either main segment -- to the SEAM,
+	/// `Q_MAIN_SLOW`'s front, as a main key with tier Slow and its counter
+	/// kept: where a STRUCTURAL key goes wherever the design would put it at
+	/// main's front (see the module doc). Returns whether the key left a FAST
+	/// placement -- `Q_MAIN_FAST`, or the DRAM small queue -- which the caller
+	/// pushes `(key, Slow)` for.
+	fn to_seam(&mut self, key: HashedKey) -> bool {
+		let Some(payload) = self.queues.payload(key) else { return false };
+		let q = Self::queue_index(&payload);
+		let bytes = payload.migrating();
+
+		if q == Q_MAIN_SLOW {
+			self.queues.move_front(Q_MAIN_SLOW, key);
+			return false;
+		}
+
+		self.queues.move_to_front_of(q, Q_MAIN_SLOW, key);
+		self.sub_used(q, bytes);
+		self.slow_used += bytes;
+
+		if let Some(p) = self.queues.payload_mut(key) {
+			p.queue = Queue::Main as u8;
+			p.tier = Some(Tier::Slow);
+		}
+
+		q == Q_MAIN_FAST || (q == Q_SMALL && SMALL_IS_FAST)
+	}
+
+	/// A new key's node at the seam, slow (S5): a STRUCTURAL ghost admission,
+	/// or -- the fast-admission pair -- a structural key the DRAM small queue
+	/// does not take (the reprieve variant's splice destination). Built slow:
+	/// nothing pushed, nothing to settle.
+	fn admit_at_seam(&mut self, key: HashedKey, size: ObjectSize, dram_resident: u8, bytes: CacheSize) {
+		self.queues.push_front(
+			Q_MAIN_SLOW,
+			key,
+			NodePayload {
+				size,
+				freq: 0,
+				ts: 0,
+				queue: Queue::Main as u8,
+				tier: Some(Tier::Slow),
+				phys: Some(Tier::Slow),
+				dram_resident,
+			},
+		);
+		self.slow_used += bytes;
 	}
 
 	/// The fast-tier budget available to `Q_MAIN_FAST`.
@@ -292,7 +380,18 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 
 	/// Enters main at the front, in the fast segment. Used by both the
 	/// ghost-hit admission and the small -> main promotion.
+	///
+	/// S5: a STRUCTURAL key goes to the seam instead, slow; leaving the DRAM
+	/// small queue, pushed.
 	fn place_at_main_front(&mut self, key: HashedKey, from: Option<usize>, bytes: CacheSize) {
+		if self.structural(bytes) && self.queues.contains(key) {
+			if self.to_seam(key) {
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			return;
+		}
+
 		match from {
 			Some(q) => {
 				self.queues.move_to_front_of(q, Q_MAIN_FAST, key);
@@ -311,8 +410,17 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 	}
 
 	/// A key that survives lazy eviction moves to main's front, which is
-	/// `Q_MAIN_FAST`'s front.
+	/// `Q_MAIN_FAST`'s front -- or, STRUCTURAL (S5), the seam: a slow key
+	/// stays slow, and a fast one leaves the fast set, pushed.
 	fn requeue_to_main_front(&mut self, key: HashedKey, from: usize, bytes: CacheSize) {
+		if self.structural(bytes) {
+			if self.to_seam(key) {
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			return;
+		}
+
 		let was_slow = from == Q_MAIN_SLOW;
 
 		if from == Q_MAIN_FAST {
@@ -333,6 +441,91 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 		if was_slow && self.queues.payload(key).and_then(|p| p.tier) == Some(Tier::Fast) {
 			self.migrations.push((key, Tier::Fast));
 		}
+	}
+
+	/// A `Set`, with the client's placement (S5): the design's insert, with a
+	/// STRUCTURAL value placed slow -- see `to_seam`. Returns the placement
+	/// applied.
+	fn insert_with(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, placement: Placement) -> Placement {
+		let dram_resident = narrow_resident(dram_resident);
+		let bytes = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+		let structural = placement == Placement::Structural || self.structural(bytes);
+
+		if self.queues.contains(key) {
+			self.resize_key(key, size, dram_resident);
+
+			// S5: a key in a FAST placement -- main's fast segment, or the DRAM
+			// small queue -- overwritten with a structural value leaves it for
+			// the seam, pushed. The access is still only a counter bump.
+			if structural && self.tier_of(key) == Some(Tier::Fast) && self.to_seam(key) {
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			self.bump_freq(key);
+			return placed(structural);
+		}
+
+		// A ghost hit skips probation and enters main directly, at freq 0.
+		// The ghost entry is deliberately NOT retired -- flat leaves it, which
+		// is why a key can be in both structures at once.
+		if !REPRIEVE && self.ghost.contains(key) {
+			if structural {
+				self.admit_at_seam(key, size, dram_resident, bytes);
+				return Placement::Structural;
+			}
+
+			self.queues.push_front(
+				Q_MAIN_FAST,
+				key,
+				NodePayload {
+					size,
+					freq: 0,
+					ts: 0,
+					queue: Queue::Main as u8,
+					tier: Some(Tier::Fast),
+					phys: Some(Tier::Fast),
+					dram_resident,
+				},
+			);
+			self.fast_used += bytes;
+			self.settle_fast_tier();
+
+			if self.queues.payload(key).and_then(|p| p.tier) == Some(Tier::Fast) {
+				self.migrations.push((key, Tier::Fast));
+			}
+
+			return Placement::Normal;
+		}
+
+		// S5: the DRAM small queue does not take a STRUCTURAL key: the seam,
+		// where the reprieve variant splices a key small cannot keep. A slow
+		// small queue takes it as any key (it is slow already).
+		if SMALL_IS_FAST && structural {
+			self.admit_at_seam(key, size, dram_resident, bytes);
+			return Placement::Structural;
+		}
+
+		self.queues.push_front(
+			Q_SMALL,
+			key,
+			NodePayload {
+				size,
+				freq: 0,
+				ts: 0,
+				queue: Queue::Small as u8,
+				tier: Self::small_tier(),
+				phys: Self::small_tier(),
+				dram_resident,
+			},
+		);
+
+		self.small_used += bytes;
+
+		if SMALL_IS_FAST {
+			self.settle_fast_tier();
+		}
+
+		placed(structural)
 	}
 
 	/// Demotes from `Q_MAIN_FAST`'s back to `Q_MAIN_SLOW`'s front -- across the
@@ -523,63 +716,30 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> PolicyStack
 	}
 
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		let dram_resident = narrow_resident(dram_resident);
-
-		if self.queues.contains(key) {
-			self.resize_key(key, size, dram_resident);
-			self.bump_freq(key);
-			return;
-		}
-
-		let bytes = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
-
-		// A ghost hit skips probation and enters main directly, at freq 0.
-		// The ghost entry is deliberately NOT retired -- flat leaves it, which
-		// is why a key can be in both structures at once.
-		if !REPRIEVE && self.ghost.contains(key) {
-			self.queues.push_front(
-				Q_MAIN_FAST,
-				key,
-				NodePayload {
-					size,
-					freq: 0,
-					ts: 0,
-					queue: Queue::Main as u8,
-					tier: Some(Tier::Fast),
-					phys: Some(Tier::Fast),
-					dram_resident,
-				},
-			);
-			self.fast_used += bytes;
-			self.settle_fast_tier();
-
-			if self.queues.payload(key).and_then(|p| p.tier) == Some(Tier::Fast) {
-				self.migrations.push((key, Tier::Fast));
-			}
-
-			return;
-		}
-
-		self.queues.push_front(
-			Q_SMALL,
-			key,
-			NodePayload {
-				size,
-				freq: 0,
-				ts: 0,
-				queue: Queue::Small as u8,
-				tier: Self::small_tier(),
-				phys: Self::small_tier(),
-				dram_resident,
-			},
-		);
-
-		self.small_used += bytes;
-
-		if SMALL_IS_FAST {
-			self.settle_fast_tier();
-		}
+		self.insert_with(key, size, dram_resident, Placement::Normal);
 	}
+
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		_event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_with(key, size, dram_resident, placement)
+	}
+
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.measured = measured;
+	}
+
+	/// S5: every settle, against the current budget (the policy worker's
+	/// end-of-pass step).
+	fn resettle(&mut self) {
+		self.settle_fast_tier();
+	}
+
 
 	/// Deliberately NOT overriding `record_access`: returning `GhostHit` would
 	/// reach a `debug_assert!(promotion_tx.is_some())` that these designs do

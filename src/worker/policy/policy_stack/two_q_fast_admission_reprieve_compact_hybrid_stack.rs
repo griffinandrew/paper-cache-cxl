@@ -51,7 +51,7 @@ use crate::{
 	object::ObjectSize,
 	worker::policy::policy_stack::{
 		arena_queue_set::{ArenaQueueSet, NodePayload}, narrow_resident, drain_target, CacheSize,
-		HashedKey, PolicyStack, Tier,
+		HashedKey, PolicyStack, Tier, Placement, SetEvent, fast_at_or_before, placed, prev_fast,
 	},
 	PaperPolicy,
 };
@@ -115,6 +115,11 @@ pub struct TwoQFastAdmissionReprieveCompactHybridStack {
 	carve_out_fills_fast_tier: bool,
 
 	migrations: Vec<(HashedKey, Tier)>,
+
+	/// S5: the measured M the policy worker pushed (`set_dram_metadata`),
+	/// reserved instead of the per-object reservation; `None` under the
+	/// per-object model.
+	measured: Option<CacheSize>,
 }
 
 impl TwoQFastAdmissionReprieveCompactHybridStack {
@@ -133,6 +138,7 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 			main_boundary: None,
 			carve_out_fills_fast_tier: false,
 			migrations: Vec::new(),
+			measured: None,
 		}
 	}
 
@@ -271,7 +277,23 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 	/// DRAM. See `PolicyStack::dram_reserved_bytes` for the rule, and for why
 	/// a reservation at or over `fast_capacity` is left to saturate.
 	fn reserved_overhead(&self) -> CacheSize {
-		self.queues.len() as CacheSize * self.shared_overhead
+		self.measured.unwrap_or(self.queues.len() as CacheSize * self.shared_overhead)
+	}
+
+	/// This stack's eff (S5): the whole fast tier's budget for values -- the
+	/// tier's, not a segment's -- before the drain target.
+	fn own_eff(&self) -> CacheSize {
+		self.fast_capacity.saturating_sub(self.reserved_overhead())
+	}
+
+	/// Whether a value of `migrating` bytes is STRUCTURAL (S5): larger than an
+	/// empty fast tier. Such a key is placed slow, keeps its place in the
+	/// policy's order, and is never promoted while it stays that large. The
+	/// stack's own check beside the client's flag, so a key the client placed
+	/// normally just before eff moved is placed as the stack's own promotions
+	/// would place it.
+	fn structural(&self, migrating: CacheSize) -> bool {
+		migrating > self.own_eff()
 	}
 
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
@@ -308,10 +330,10 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 		}
 	}
 
-	fn touch(&mut self, key: HashedKey) {
+	fn touch(&mut self, key: HashedKey, structural: bool) {
 		match self.queues.payload(key).map(|p| Queue::from_u8(p.queue)) {
-			Some(Queue::Fifo) => self.promote_from_fifo(key),
-			Some(Queue::Main) => self.touch_main_fast(key),
+			Some(Queue::Fifo) => self.promote_from_fifo(key, structural),
+			Some(Queue::Main) => self.touch_main_fast(key, structural),
 			None => {},
 		}
 	}
@@ -321,9 +343,30 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 	/// The slot does not move: this is an unlink from one queue and a relink
 	/// into the other, where the stack this replaces removed the key from one
 	/// hash-indexed list and inserted it into another.
-	fn promote_from_fifo(&mut self, key: HashedKey) {
+	fn promote_from_fifo(&mut self, key: HashedKey, structural: bool) {
 		let Some(payload) = self.queues.payload(key) else { return };
 		let size_bytes = payload.migrating();
+
+		// S5: a STRUCTURAL key moves to main's front all the same -- its place
+		// in the order -- with tier slow, and is not promoted.
+		if structural {
+			self.queues.move_to_front_of(Q_FIFO, Q_MAIN, key);
+			self.fifo_used = self.fifo_used.saturating_sub(size_bytes);
+
+			if let Some(p) = self.queues.payload_mut(key) {
+				p.queue = Queue::Main as u8;
+				p.tier = Some(Tier::Slow);
+			}
+
+			self.slow_used += size_bytes;
+			self.main_count += 1;
+
+			// The FIFO is DRAM: the key's placement changed.
+			self.migrations.push((key, Tier::Slow));
+
+			self.settle_fast_tier();
+			return;
+		}
 
 		self.queues.move_to_front_of(Q_FIFO, Q_MAIN, key);
 		self.fifo_used = self.fifo_used.saturating_sub(size_bytes);
@@ -348,17 +391,17 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 
 	/// Faithful port of `TwoQFastAdmissionReprieveHybridStack::touch_main_fast`,
 	/// which is itself unchanged from the non-reprieve stack's.
-	fn touch_main_fast(&mut self, key: HashedKey) {
+	fn touch_main_fast(&mut self, key: HashedKey, structural: bool) {
 		let previous_tier = self.queues.payload(key).and_then(|p| p.tier);
 
 		let already_at_front = self.queues.front(Q_MAIN) == Some(key);
 		let is_boundary = self.main_boundary == Some(key);
 
 		// Read the neighbour BEFORE moving: once the key is at the front its
-		// predecessor is gone, and the boundary must step back to whatever was
-		// in front of it.
+		// predecessor is gone, and the boundary must step back to whatever fast
+		// key was in front of it (S5: past any structural ones).
 		let new_boundary_if_moved = if is_boundary && !already_at_front {
-			self.queues.before(key)
+			prev_fast(&self.queues, key)
 		} else {
 			None
 		};
@@ -367,6 +410,31 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 
 		if is_boundary && !already_at_front {
 			self.main_boundary = new_boundary_if_moved;
+		}
+
+		// S5: a STRUCTURAL key moves to the front all the same -- its place in
+		// the order -- with tier slow: a slow one is not promoted, a fast one
+		// leaves the fast set, pushed `(key, Slow)` (its placement changed).
+		if structural {
+			if previous_tier == Some(Tier::Fast) {
+				let size = self.queues.payload(key).map(|p| p.migrating()).unwrap_or(0);
+				self.fast_used = self.fast_used.saturating_sub(size);
+				self.fast_count = self.fast_count.saturating_sub(1);
+				self.slow_used += size;
+
+				if let Some(p) = self.queues.payload_mut(key) {
+					p.tier = Some(Tier::Slow);
+				}
+
+				if self.main_boundary == Some(key) {
+					self.main_boundary = None;
+				}
+
+				self.migrations.push((key, Tier::Slow));
+			}
+
+			self.settle_fast_tier();
+			return;
 		}
 
 		let mut promoted = false;
@@ -383,10 +451,11 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 			if let Some(p) = self.queues.payload_mut(key) {
 				p.tier = Some(Tier::Fast);
 			}
+		}
 
-			if self.main_boundary.is_none() {
-				self.main_boundary = Some(key);
-			}
+		// Fast, at the front; with no fast key in front of it, the boundary.
+		if self.main_boundary.is_none() {
+			self.main_boundary = Some(key);
 		}
 
 		self.settle_fast_tier();
@@ -405,7 +474,7 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 		while self.fast_used > target {
 			let Some(demote_key) = self.main_boundary else { break };
 			let size = self.queues.payload(demote_key).map(|p| p.migrating()).unwrap_or(0);
-			let new_boundary = self.queues.before(demote_key);
+			let new_boundary = prev_fast(&self.queues, demote_key);
 
 			if let Some(p) = self.queues.payload_mut(demote_key) {
 				p.tier = Some(Tier::Slow);
@@ -432,7 +501,9 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 	/// used FAST key in main, and everything arriving here is slow and lands
 	/// behind it, so the boundary is still where it was.
 	fn settle_fifo_queue(&mut self) {
-		let effective = self.effective_fifo_capacity();
+		// At the DRAIN TARGET of the FIFO's budget (S5), as main rests at the
+		// drain target of its own.
+		let effective = drain_target::bytes(self.effective_fifo_capacity());
 
 		while self.fifo_used > effective {
 			let Some(key) = self.queues.back(Q_FIFO) else { break };
@@ -462,6 +533,59 @@ impl TwoQFastAdmissionReprieveCompactHybridStack {
 		}
 	}
 
+	/// A `Set`, with the client's placement (S5): an existing key is an access
+	/// (`touch`); a new one enters the DRAM FIFO, whose admission spills its
+	/// tail into main -- or, when STRUCTURAL, goes straight where that spill
+	/// sends a key the FIFO cannot hold: main's back, slow. Returns the
+	/// placement applied.
+	fn insert_with(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize, placement: Placement) -> Placement {
+		let dram_resident = narrow_resident(dram_resident);
+		let migrating = (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+		let structural = placement == Placement::Structural || self.structural(migrating);
+
+		if self.queues.contains(key) {
+			self.resize_key(key, size, dram_resident);
+			self.touch(key, structural);
+			return placed(structural);
+		}
+
+		// S5: a STRUCTURAL new key takes a slow place in main instead of the
+		// DRAM FIFO: its back, where the reprieve variant sends a key its FIFO
+		// cannot hold -- built slow, nothing pushed or settled.
+		if structural {
+			self.queues.push_back(Q_MAIN, key, NodePayload {
+				size,
+				dram_resident,
+				tier: Some(Tier::Slow),
+				phys: Some(Tier::Slow),
+				freq: 0,
+				ts: 0,
+				queue: Queue::Main as u8,
+			});
+			self.slow_used += migrating;
+			self.main_count += 1;
+
+			return Placement::Structural;
+		}
+
+		self.queues.push_front(Q_FIFO, key, NodePayload {
+			size,
+			dram_resident,
+			tier: None,
+			phys: None,
+			freq: 0,
+			ts: 0,
+			queue: Queue::Fifo as u8,
+		});
+		self.fifo_used += migrating;
+
+		// The reprieve: an admission that pushes the FIFO over budget spills
+		// its tail into main here, rather than leaving it for an eviction.
+		self.settle_fifo_queue();
+
+		Placement::Normal
+	}
+
 	fn evict_fifo_tail(&mut self) -> Option<HashedKey> {
 		let (key, payload) = self.queues.pop_back(Q_FIFO)?;
 		self.fifo_used = self.fifo_used.saturating_sub(payload.migrating());
@@ -487,33 +611,35 @@ impl PolicyStack for TwoQFastAdmissionReprieveCompactHybridStack {
 	}
 
 	fn insert_resident(&mut self, key: HashedKey, size: ObjectSize, dram_resident: ObjectSize) {
-		let dram_resident = narrow_resident(dram_resident);
+		self.insert_with(key, size, dram_resident, Placement::Normal);
+	}
 
-		if self.queues.contains(key) {
-			self.resize_key(key, size, dram_resident);
-			self.touch(key);
-			return;
-		}
+	fn insert_placed(
+		&mut self,
+		key: HashedKey,
+		size: ObjectSize,
+		dram_resident: ObjectSize,
+		_event: SetEvent,
+		placement: Placement,
+	) -> Placement {
+		self.insert_with(key, size, dram_resident, placement)
+	}
 
-		self.queues.push_front(Q_FIFO, key, NodePayload {
-			size,
-			dram_resident,
-			tier: None,
-			phys: None,
-			freq: 0,
-			ts: 0,
-			queue: Queue::Fifo as u8,
-		});
-		self.fifo_used += (size as CacheSize).saturating_sub(dram_resident as CacheSize);
+	fn set_dram_metadata(&mut self, measured: Option<CacheSize>) {
+		self.measured = measured;
+	}
 
-		// The reprieve: an admission that pushes the FIFO over budget spills
-		// its tail into main here, rather than leaving it for an eviction.
+	/// S5: every settle, against the current budget (the policy worker's
+	/// end-of-pass step).
+	fn resettle(&mut self) {
+		self.settle_fast_tier();
 		self.settle_fifo_queue();
 	}
 
 	fn update(&mut self, key: HashedKey) {
-		if self.queues.contains(key) {
-			self.touch(key);
+		if let Some(payload) = self.queues.payload(key) {
+			let structural = self.structural(payload.migrating());
+			self.touch(key, structural);
 		}
 	}
 
@@ -530,7 +656,7 @@ impl PolicyStack for TwoQFastAdmissionReprieveCompactHybridStack {
 			Queue::Main => {
 				let new_boundary_if_needed =
 					if payload.tier == Some(Tier::Fast) && self.main_boundary == Some(key) {
-						self.queues.before(key)
+						prev_fast(&self.queues, key)
 					} else {
 						None
 					};
@@ -600,8 +726,10 @@ impl PolicyStack for TwoQFastAdmissionReprieveCompactHybridStack {
 				self.fast_used = self.fast_used.saturating_sub(size);
 				self.fast_count = self.fast_count.saturating_sub(1);
 
+				// The boundary was main's tail: the nearest fast key from the
+				// new tail (S5: past any structural ones).
 				if self.main_boundary == Some(key) {
-					self.main_boundary = self.queues.back(Q_MAIN);
+					self.main_boundary = fast_at_or_before(&self.queues, self.queues.back(Q_MAIN));
 				}
 			},
 
@@ -730,15 +858,19 @@ mod dram_ceiling_tests {
 	/// The reprieve is what makes that enforceable -- the overflow splices into
 	/// main as `Tier::Slow` rather than waiting on an eviction that this stack
 	/// never asks for.
+	///
+	/// The FIFO rests at the DRAIN TARGET of its budget since S5, as main does:
+	/// four 50 B keys (200 B) fit 0.98 x 250 = 245 B, a fifth would not (it
+	/// was five, filling the 250 B budget exactly, before S5).
 	#[test]
 	fn shrinking_the_fast_tier_spills_the_admission_queue() {
 		let mut stack = TwoQFastAdmissionReprieveCompactHybridStack::new(0.25, 1_000, 400);
 
-		for key in 1..=5 {
+		for key in 1..=4 {
 			stack.insert(key, 50);
 		}
 
-		assert_eq!(stack.fast_bytes_used(), 250, "all five admitted straight to DRAM");
+		assert_eq!(stack.fast_bytes_used(), 200, "all four admitted straight to DRAM");
 
 		stack.resize_fast_tier(100);
 
@@ -748,7 +880,7 @@ mod dram_ceiling_tests {
 			stack.fast_bytes_used(),
 			stack.fast_capacity(),
 		);
-		assert_eq!(stack.slow_object_count(), 3, "the excess is reprieved into PMEM");
+		assert_eq!(stack.slow_object_count(), 3, "the excess is reprieved into PMEM: one 50 B key fits 0.98 x 100 B");
 	}
 }
 
