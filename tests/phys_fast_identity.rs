@@ -118,7 +118,7 @@ use std::{
 };
 
 use paper_cache::{
-    phys, BufferDRAM, BufferPMEM, CacheTierSize, GateConfig, GateMode, HybridStats, MetadataModel,
+    phys, BufferDRAM, BufferPMEM, CacheTierSize, GateConfig, GateMode, GateState, HybridStats, MetadataModel,
     PaperCache, PaperPolicy, Tier, TieredBuffer,
 };
 
@@ -257,6 +257,18 @@ impl Design {
     /// own reservation.
     fn build(self, w: Workload) -> Cache {
         self.build_with(w, GateConfig::default().mode)
+    }
+
+    /// The byte gate's state for this design's cache, alone in the process (S5
+    /// B2): the designs whose settles do not bound their DRAM -- the lazy-copy
+    /// LRU and the faithful fast-admission pair -- run ungated.
+    fn gate_state(self) -> GateState {
+        match self {
+            Design::Policy(PaperPolicy::LruLazyCopyCompactHybrid)
+            | Design::Policy(PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(_))
+            | Design::Policy(PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(_)) => GateState::Ungated,
+            _ => GateState::Enabled,
+        }
     }
 
     /// `build`, with the byte gate's mode (S5 B2): T9 runs with the default,
@@ -416,6 +428,9 @@ struct Run<'a> {
     p0: i64,
     #[allow(dead_code)]
     m0: i64,
+    /// The byte gate's state every check must find (S5 B2): T9's cache runs
+    /// gated, alone, except the designs the gate leaves ungated; T7's off.
+    gate: GateState,
 }
 
 /// The identity, checked at a quiescent point.
@@ -445,6 +460,12 @@ fn check(cache: &Cache, lens: &BTreeMap<u64, u32>, run: &Run, phase: &str, hits:
         s.effective_fast_capacity_measured, s.effective_fast_capacity,
     );
     assert_eq!(s.dram_metadata_bytes, m.total(), "{label}: HybridStats exports M, its parts' sum");
+
+    // S5 B2: the gate as it must be here -- running for T9's cache, alone (its
+    // only gated coverage of most designs: the test review) -- and no set held
+    // for a second.
+    assert_eq!(s.gate_state, run.gate, "{label}: the byte gate's state");
+    assert!(s.gate_wait_ns_max < 1_000_000_000, "{label}: a set waited {} ns", s.gate_wait_ns_max);
     assert_eq!(
         m.headers,
         w.live * paper_cache::value::dram_header_bytes::<u64>(),
@@ -693,6 +714,7 @@ fn run(design: Design, w: Workload) -> HybridStats {
         ghost_max: std::cell::Cell::new(0),
         p0,
         m0,
+        gate: design.gate_state(),
     };
 
     let get_burst = |cache: &Cache, keys: &[u64], rounds: usize, hits: &mut u64| {
@@ -982,6 +1004,7 @@ fn burst(design: Design, w: Workload) {
         ghost_max: std::cell::Cell::new(0),
         p0,
         m0,
+        gate: GateState::Off,
     };
 
     let audit_now = |cache: &Cache, phase: &str| {

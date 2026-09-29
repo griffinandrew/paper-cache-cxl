@@ -59,8 +59,11 @@ pub enum CacheError {
 
 	/// A set waited for room in the fast tier and NOTHING was freed for the
 	/// byte gate's `stall_window` -- no demotion landed, no byte was
-	/// refunded, while the policy worker kept passing: a stuck state (a dead
-	/// migration consumer, bytes pinned by readers, a bug), not load, and the
+	/// refunded -- once the policy worker had caught up with its channel, or
+	/// for five windows of a worker showing no sign of life (hung): a stuck
+	/// state (a dead migration consumer, bytes pinned by readers, a hung
+	/// worker, a bug), not load (a worker behind its channel only lengthens
+	/// the wait), and the
 	/// cache's `on_stall` is `Error` (the default). Nothing was allocated or
 	/// sent (S5).
 	#[error("the fast tier freed nothing for the gate's stall window")]

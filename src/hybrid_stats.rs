@@ -233,7 +233,8 @@ pub struct HybridStats {
 	/// nothing tiers.
 	pub metadata_bound: bool,
 
-	/// New keys refused with `CacheError::MetadataOverflow` under `Error`.
+	/// New keys refused with `CacheError::MetadataOverflow` under `Error`, or
+	/// under `EvictToFit` with `stall_window` 0.
 	pub metadata_overflows: u64,
 
 	/// `EvictToFit`: room requests sent to the policy worker, the victims it
@@ -282,7 +283,8 @@ pub struct HybridStats {
 	pub gate_wait_hist: [u64; crate::gate::WAIT_BUCKETS],
 
 	/// Times the no-progress watchdog found the gate stalled (nothing freed
-	/// for `stall_window` while the worker kept passing), and the sets that
+	/// for `stall_window` once the worker had caught up, or a hung worker),
+	/// and the sets that
 	/// returned `FastTierStalled` (`OnStall::Error`).
 	pub gate_stalls: u64,
 	pub gate_stall_errors: u64,

@@ -2772,7 +2772,8 @@ where
 	/// stored); [`CacheError::MetadataOverflow`] for a new key whose metadata
 	/// would not fit (see [`GateConfig::on_metadata_overflow`]);
 	/// [`CacheError::FastTierStalled`] when the set waited for room in the fast
-	/// tier and nothing was freed for the gate's `stall_window` (see
+	/// tier and nothing was freed for the gate's `stall_window` once the policy
+	/// worker had caught up, or the worker hung (see
 	/// [`GateConfig::on_stall`]); [`CacheError::Internal`] if the policy worker
 	/// is gone while this set waits, or a worker could not be told.
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
@@ -2832,6 +2833,15 @@ where
 					}
 
 					let config = gate.config();
+
+					// `stall_window` 0 never waits: a MakeRoom would evict the
+					// policy's victim for a set that then fails without waiting
+					// for it (the correctness review). It fails at once and
+					// evicts nothing, as `Error` does.
+					if config.stall_window.is_zero() {
+						gate.count_overflow();
+						return Err(CacheError::MetadataOverflow);
+					}
 
 					match &lane {
 						None => lane = Some(gate.meta_lane.enqueue()),

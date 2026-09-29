@@ -368,8 +368,9 @@ A tiered cache's `set` is `begin_set` then `commit` (`src/gate.rs`, `PaperCache:
    (the default) returns `CacheError::MetadataOverflow` with nothing built or sent;
    `MetadataOverflow::EvictToFit` (opt-in) queues the set FIFO in the metadata lane while the
    policy worker evicts the policy's own victims for it (`WorkerEvent::MakeRoom`), so the set that
-   needs room waits for its eviction -- `MetadataOverflow` at once if there is nothing to evict, or
-   after `stall_window` without worker progress; `Internal` if the worker is gone.
+   needs room waits for its eviction -- `MetadataOverflow` at once if there is nothing to evict or
+   `stall_window` is 0 (nothing evicted), or after `stall_window` without worker progress;
+   `Internal` if the worker is gone.
 3. `hybrid_policy::admission_tier`, unchanged.
 4. **Structural slow placement.** A value larger than an EMPTY fast tier (`v > eff`; the
    size-split design compares with its size class's segment) is built slow whatever step 3 said,
@@ -419,14 +420,19 @@ or `concurrency_hint` x `value_hint` when wider), never below `S + 1`.
   the bytes. A waiter holds no lock, no guard, no allocation and has sent nothing; nothing the
   worker or the consumers do waits on it.
 - **The watchdog.** A wait ends only in admission unless NOTHING is freed for `stall_window`
-  (2 s): no byte refunded anywhere (`phys::freed`, counted while a gate watches), no demotion
-  landed, no waiter admitted, no growth of B -- and the worker has completed passes, each with its
-  resettle, since the window began (a late worker is not a stall). The gate is then STALLED and
+  (2 s) -- no byte refunded anywhere (`phys::freed`, counted while a gate watches), no demotion
+  landed, no waiter admitted -- once the policy worker has CAUGHT UP: two whole passes of its run
+  loop ended since the window began, so it has handled every event sent before it, settled and
+  resettled. A worker behind its channel is load, not a stall; one that ends no pass and handles
+  no event for five windows (timed from the last one a waiter saw) is HUNG, and that is a stall.
+  A rise of the close level is not
+  progress (M_model moves it with every key that comes or goes). The gate is then STALLED and
   the set acts per `OnStall`: `CacheError::FastTierStalled` (the default); `Divert` (opt-in), built
   slow with `Placement::Diverted`, placed by its policy -- typically fast, so it LAGS in CXL until
   its first slow-served hit heals it; the reconcile never corrects it toward fast at its `Set` --
-  or `AdmitOver` (opt-in), admitted fast over the budget. Until the worker sees a byte freed, every
-  waiter and newcomer acts after a 50 ms probe without progress. `stall_window` 0 acts at once.
+  or `AdmitOver` (opt-in), admitted fast over the budget. Until the worker sees a byte freed (or P
+  below where it stalled), every waiter and newcomer acts after a 50 ms probe without progress, on
+  the same caught-up and hung rules. `stall_window` 0 acts at once.
 
 Load is never an error: bursts wait, at the rate demotions free room, and the waits are what a
 bounded DRAM tier costs (the gate's wait counters and histogram in `HybridStats`). The byte gate

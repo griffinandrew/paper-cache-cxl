@@ -82,8 +82,10 @@ pub(super) fn alone_in(module: &str, test: &str, body: impl FnOnce()) {
 	let file = std::fs::File::create(&path).expect("the child's output file");
 
 	let mut child = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-		.args([name.as_str(), "--exact", "--test-threads=1"])
+		.args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
 		.env(CHILD, "1")
+		// The consumer count the timing bounds assume (the default).
+		.env("MIGRATION_QUEUE_THREADS", "2")
 		.stdout(file.try_clone().expect("the output file, twice"))
 		.stderr(file)
 		.spawn()
@@ -212,8 +214,9 @@ fn waiters(cache: &Cache) -> u64 {
 /// paused, one client sets 1,000 values of 4 KiB into a 1 MiB tier (about
 /// four times the tier); they resume after 100 ms, inside the watchdog's
 /// window. Every set succeeds, some after waiting, and P -- read exact after
-/// each set -- never exceeds B by more than a value and the fold error. Red
-/// with the gate admitting everything (`nogate`): P runs to about 4 MiB.
+/// each set -- never exceeds B by more than a value and the fold error, and a
+/// set that found P past N kicked the worker. Reds: the gate admitting
+/// everything (`nogate`: P runs to about 4 MiB); no near kick (`nonearkick`).
 #[test]
 fn t1_a_burst_is_held_to_the_budget() {
 	alone("t1_a_burst_is_held_to_the_budget", || {
@@ -246,6 +249,7 @@ fn t1_a_burst_is_held_to_the_budget() {
 		eprintln!("T1: B {b}, v {}, P peaked at {peak} (bound {bound}); {} waits, at most {} waiting", v(), stats.gate_waits, stats.max_waiters);
 		assert!(stats.gate_waits > 0, "no set waited: the burst never met the gate");
 		assert!(peak <= bound, "P peaked at {peak} B, over the budget's bound {bound} B");
+		assert!(stats.near_kicks > 0, "P passed N and no set kicked the worker");
 	});
 }
 
@@ -394,6 +398,7 @@ fn the_oversize_path_waits_for_a_settled_tier() {
 			let after = waiter.join().expect("the waiter");
 
 			assert_eq!(cache.hybrid_stats().oversize_admits, 1);
+			assert_eq!(cache.status.gate().reserved(), 0, "the oversize reservation released");
 			assert!(after <= s.band_s + vb + E_FOLD, "P {after} B right after the admission, over S + v");
 		});
 
@@ -409,8 +414,9 @@ fn the_oversize_path_waits_for_a_settled_tier() {
 /// freed. The fill's values are pinned, and the demotions queued for them
 /// land before the set (they refund nothing: the pins hold the old copies).
 /// `Error`: FastTierStalled; `Divert`: built slow; `AdmitOver`: built fast,
-/// over the budget. Red without the watchdog (`nowatchdog`): the set waits
-/// until the child is killed.
+/// over the budget, its reservation released once built. Reds: no watchdog
+/// (`nowatchdog`: the set waits until the child is killed); the admit-over's
+/// reservation leaked (`admitoverleak`).
 #[test]
 fn t12_unfreeable_pinned_bytes_honour_each_on_stall() {
 	alone("t12_unfreeable_pinned_bytes_honour_each_on_stall", || {
@@ -459,6 +465,7 @@ fn t12_unfreeable_pinned_bytes_honour_each_on_stall() {
 					result.expect("an admitted-over set succeeds");
 					assert_eq!((stats.admit_over_sets, stats.admit_over_bytes), (1, v()));
 					assert_eq!(cache.tier_of(&next), Some(Fast), "built fast, over the budget");
+					assert_eq!(cache.status.gate().reserved(), 0, "the admit-over's reservation released");
 				},
 			}
 
@@ -517,7 +524,7 @@ fn t13_a_diverted_key_is_healed_on_its_first_slow_hit_and_untouched_costs_nothin
 /// FastTierStalled once the window passes. (b) The tier five values deeper
 /// over B than one landing frees, the consumers slowed to one landing per
 /// 200 ms each: the set waits longer than the window -- each landing is
-/// progress -- and succeeds. Reds: `notimeout` ((a) waits until the child is
+/// progress -- and succeeds. Reds: `nowatchdog` ((a) waits until the child is
 /// killed); `freedoff` (neither FREED nor a landed demotion counts as
 /// progress: (b) errs).
 #[test]
@@ -564,9 +571,10 @@ fn t19_a_stuck_gate_errs_within_the_window_and_a_slow_one_keeps_waiting() {
 
 /// T19b: a waiting set whose policy worker dies returns `Internal` at once --
 /// the worker's exit guard marks it gone and wakes every waiter -- not
-/// `FastTierStalled` after the window. Red without the guard (`noguard`): the
-/// set waits out its whole 60 s window (the passes the worker made before it
-/// died count toward it) and errs `FastTierStalled`.
+/// `FastTierStalled` after the window. Red without the guard (`noguard`): a
+/// dead worker is then only HUNG -- no pass, no event -- which the watchdog
+/// calls a stall after five 60 s windows, so the set waits until the child is
+/// killed.
 #[test]
 fn t19b_a_dead_worker_fails_a_waiting_set_with_internal() {
 	alone("t19b_a_dead_worker_fails_a_waiting_set_with_internal", || {
@@ -598,7 +606,10 @@ fn t19b_a_dead_worker_fails_a_waiting_set_with_internal() {
 /// the worker held for three windows, a waiting set does not err -- the
 /// watchdog also needs the worker's passes, each with its resettle, since the
 /// window began -- and it errs once the worker runs passes that free nothing.
-/// Red without that condition (`nopasses`): it errs while the worker is held.
+/// Held three windows, it is late, not hung (five). Red with the worker
+/// counted as caught up at once (`nocatchup`): it errs while the worker is
+/// held; and with the window NOT restarted at catch-up (`norestart`): it errs
+/// at once on release, not a window later.
 #[test]
 fn a_late_worker_is_not_a_stall() {
 	alone("a_late_worker_is_not_a_stall", || {
@@ -626,7 +637,12 @@ fn a_late_worker_is_not_a_stall() {
 			let (result, at) = waiter.join().expect("the waiter");
 
 			assert!(matches!(result, Err(CacheError::FastTierStalled)), "{result:?}");
-			assert!(at >= released, "stalled {:?} BEFORE the worker was released", released - at);
+			assert!(at >= released, "stalled {:?} BEFORE the worker was released", released.saturating_duration_since(at));
+			assert!(
+				at >= released + window / 2,
+				"stalled {:?} after the worker was released: its window did not start again at catch-up",
+				at.saturating_duration_since(released),
+			);
 		});
 	});
 }
@@ -659,6 +675,41 @@ fn a_stall_ends_at_the_first_byte_freed() {
 
 		let stats = cache.hybrid_stats();
 		assert_eq!((stats.gate_stalls, stats.gate_stall_errors), (1, 1));
+	});
+}
+
+/// A rise of the close level does not end a stall (fix 3's worker half, the
+/// review of this commit): with the consumers paused nothing is freed and P
+/// stays put; M_model falling by 48 KiB raises B, and through the worker's
+/// next passes the gate stays stalled -- only a byte freed (or P below where it
+/// stalled) ends it, as the consumers' landings then do. Red with a rise of B
+/// ending the stall, as B2's rule did (`bclear`).
+#[test]
+fn a_rise_of_the_close_level_does_not_end_a_stall() {
+	alone("a_rise_of_the_close_level_does_not_end_a_stall", || {
+		let _flush = test_hooks::no_flush();
+		let _m = test_hooks::override_m(M0);
+		let cache = cache(PaperPolicy::LruCompactHybrid, gated(Duration::from_millis(300), OnStall::Error));
+
+		let pause = test_hooks::pause_consumers();
+		let next = fill(&cache, 0);
+
+		let result = cache.set(next, &value(next), None);
+		assert!(matches!(result, Err(CacheError::FastTierStalled)), "{result:?}");
+		assert!(cache.status.gate().stalled(), "the gate is stalled");
+
+		let b = cache.hybrid_stats().band_b;
+		let _lower = test_hooks::override_m(M0 / 4);
+		wait_for("B to rise", Duration::from_secs(5), || cache.hybrid_stats().band_b > b);
+
+		let passes = cache.status.gate().passes();
+		wait_for("two more passes", Duration::from_secs(5), || cache.status.gate().passes() >= passes + 2);
+
+		eprintln!("B rose {b} -> {} with P {}", cache.hybrid_stats().band_b, p());
+		assert!(cache.status.gate().stalled(), "a rise of B ended the stall with nothing freed");
+
+		drop(pause);
+		wait_for("the stall to end at a byte freed", Duration::from_secs(5), || !cache.status.gate().stalled());
 	});
 }
 
@@ -1044,12 +1095,569 @@ fn concurrent_clients_finish_under_the_gate() {
 			);
 
 			assert!(errors.lock().unwrap().is_empty(), "{policy}: {:?}", errors.lock().unwrap());
-			assert!(took < Duration::from_secs(30), "{policy}: took {took:?}");
+			assert!(took < Duration::from_secs(15), "{policy}: took {took:?}");
 			assert!(peak <= bound, "{policy}: P peaked at {peak} B, over {bound} B");
 
 			if policy != PaperPolicy::LfuCompactHybrid {
 				assert!(stats.gate_waits > 0, "{policy}: no set waited");
 			}
 		}
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Commit C: what the implementation reviews found untested or wrong
+
+/// A worker BEHIND its channel is not a stall (the correctness review): the
+/// Sets that filled the tier sit behind ~3,000 gets the worker handles at
+/// 1 ms each, so nothing is settled or freed for ~3 s -- six windows -- and a
+/// set waiting meanwhile must wait, not err. Only the worker's whole passes
+/// count, and the window starts again once it has caught up. FIFO, whose hits
+/// migrate nothing, so the gets free nothing either. Red with a pass counted
+/// every 1,024 events of a batch while a set waits, as B2's mid-batch gate
+/// step did (`midbatchpass`).
+#[test]
+fn a_backlogged_worker_is_not_a_stall() {
+	alone("a_backlogged_worker_is_not_a_stall", || {
+		let _flush = test_hooks::no_flush();
+		let _m = test_hooks::override_m(M0);
+		let window = Duration::from_millis(500);
+		let cache = cache(PaperPolicy::FifoCompactHybrid, gated(window, OnStall::Error));
+
+		// At rest: P at the settle target, the consumers running.
+		let pause = test_hooks::pause_consumers();
+		let next = fill(&cache, 0);
+		drop(pause);
+		quiesce(&cache);
+
+		// The worker slowed to 1 ms an event, then ~3 s of gets queued ahead.
+		let _slow = test_hooks::slow_worker(Duration::from_millis(1));
+
+		for n in 0..3_000 {
+			let _ = cache.get(&(n % next));
+		}
+
+		// A burst over B: its first sets fit, their Sets queue behind the gets,
+		// and the next set waits for the worker to reach them.
+		let start = Instant::now();
+
+		for key in next..next + 20 {
+			cache.set(key, &value(key), None).expect("a set behind a worker's backlog waits and succeeds");
+		}
+
+		let took = start.elapsed();
+		let stats = cache.hybrid_stats();
+
+		eprintln!("backlog: 20 sets took {took:?}, {} waits, {} stalls", stats.gate_waits, stats.gate_stalls);
+		assert!(stats.gate_waits > 0, "no set waited");
+		assert_eq!(stats.gate_stalls, 0, "a backlog called a stall");
+		assert!(took > 2 * window, "the burst took {took:?}: the backlog did not outlast two windows");
+	});
+}
+
+/// A HUNG worker is a stall (the correctness review): with nothing freed and
+/// the worker held -- no pass ended, no event handled -- a waiting set errs
+/// after five windows, while the worker is still held. (A late worker, held
+/// for less, is not: `a_late_worker_is_not_a_stall`.) Red without the hung
+/// rule (`nohung`): it waits until the worker is released, at 3 s.
+#[test]
+fn a_hung_worker_is_a_stall_after_five_windows() {
+	alone("a_hung_worker_is_a_stall_after_five_windows", || {
+		let _flush = test_hooks::no_flush();
+		let _m = test_hooks::override_m(M0);
+		let window = Duration::from_millis(200);
+		let cache = cache(PaperPolicy::LruCompactHybrid, gated(window, OnStall::Error));
+
+		let _pause = test_hooks::pause_consumers();
+		let next = fill(&cache, 0);
+
+		thread::scope(|scope| {
+			let hold = test_hooks::hold_workers();
+
+			// The worker at its hold, and released after 3 s whatever happens.
+			thread::sleep(Duration::from_millis(20));
+			scope.spawn(move || {
+				thread::sleep(Duration::from_secs(3));
+				drop(hold);
+			});
+
+			let start = Instant::now();
+			let result = cache.set(next, &value(next), None);
+			let took = start.elapsed();
+
+			eprintln!("hung: {result:?} after {took:?}");
+			assert!(matches!(result, Err(CacheError::FastTierStalled)), "{result:?}");
+			assert!(took >= 5 * window && took < Duration::from_secs(2), "acted after {took:?}, not at five windows of a held worker");
+		});
+	});
+}
+
+/// A worker that MOVES ONCE and then hangs is hung too (the review of this
+/// commit): the hung clock runs from the last pass or event the waiter saw, not
+/// from its window's start. On a gate set by hand, alone (the frees the
+/// watchdog counts are the process's): the head waits; the worker ends ONE
+/// pass -- fewer than the two that make it caught up -- or publishes one
+/// 64-event step, and then nothing; five windows later the head stalls. Red
+/// with the hung rule anchored at the window's start (`hungbaseline`): after
+/// one pass the head waits for good.
+#[test]
+fn a_worker_that_moves_once_and_then_hangs_is_a_stall() {
+	alone("a_worker_that_moves_once_and_then_hangs_is_a_stall", || {
+		use crate::gate::{Bands, Gate, Published, Waiter, Watch};
+
+		// This process's one tiered registration, so the gate may run.
+		let _registered = phys::LiveRegistration::tiered_cache();
+		let window = Duration::from_millis(100);
+
+		for step in ["one pass", "one 64-event step"] {
+			let gate = Gate::default();
+
+			let mut config = GateConfig::default();
+			config.mode = GateMode::Block;
+			config.stall_window = window;
+			gate.set_config(config);
+
+			let eff: CacheSize = 10_000_000;
+			let bands = Bands { s: 9_800_000, n: 9_900_000, b: 10_000_000 };
+
+			gate.publish(
+				Published { model: MetadataModel::PerObject, m_model: 0, eff, eff_small: eff, eff_large: eff, k_max: u64::MAX, bands: Some(bands) },
+				|| 0,
+				|| 0,
+			);
+			gate.worker_pass(GateState::Enabled, phys::gate_epoch());
+
+			let config = gate.config();
+			let mut head = Waiter::enqueue(&gate);
+			assert!(head.is_head());
+			assert!(matches!(head.watch(&config), Watch::Park(_)), "{step}: a new waiter stalled");
+
+			// The worker's one sign of life after the window began, then nothing.
+			match step {
+				"one pass" => gate.end_pass(),
+				_ => gate.set_worker_progress(64),
+			}
+
+			let moved = Instant::now();
+
+			let at = loop {
+				match head.watch(&config) {
+					Watch::Stalled => break moved.elapsed(),
+
+					Watch::Park(park) => {
+						assert!(
+							moved.elapsed() < 10 * window,
+							"{step}: the head still waits {:?} after the worker's last sign of life",
+							moved.elapsed(),
+						);
+						thread::sleep(park);
+					},
+				}
+			};
+
+			eprintln!("moves once, then hangs ({step}): stalled {at:?} after");
+			assert!(at >= 5 * window, "{step}: stalled {at:?} after the worker's last sign of life, before five windows");
+			assert!(gate.stalled(), "{step}: the gate is marked stalled");
+			drop(head);
+		}
+	});
+}
+
+/// Churn that frees no fast byte is not progress (the correctness review):
+/// under the per-object model M_model moves by omega with every key, so every
+/// delete raises the close level B a little. The fast tier here is stuck --
+/// every value pinned by a reader's handle, M raised three quarters of the tier
+/// -- and a client deletes a key every 20 ms, freeing nothing in DRAM (the
+/// pins hold every copy). A waiting set must still err after its window. Red
+/// with a rise of B counted as progress, as B2 did (`bprogress`): the set
+/// waits for as long as the churn lasts, ~4 s.
+#[test]
+fn churn_that_frees_no_fast_byte_is_not_progress() {
+	alone("churn_that_frees_no_fast_byte_is_not_progress", || {
+		let _flush = test_hooks::no_flush();
+		let window = Duration::from_millis(300);
+		let mut config = gated(window, OnStall::Error);
+		config.metadata_model = MetadataModel::PerObject;
+		let cache = cache(PaperPolicy::LruCompactHybrid, config);
+
+		for key in 0..200 {
+			cache.set(key, &value(key), None).expect("under the budget");
+		}
+
+		quiesce(&cache);
+
+		let pins: Vec<_> = (0..200)
+			.filter_map(|key| cache.objects.get_ref(&cache.hash_key(&key)).map(|object| object.snapshot()))
+			.collect();
+
+		let _step = test_hooks::raise_m(3 * TIER / 4);
+		wait_for("the step's publication", Duration::from_secs(5), || cache.hybrid_stats().band_b + v() < p());
+		quiesce(&cache);
+
+		let stop = std::sync::atomic::AtomicBool::new(false);
+
+		thread::scope(|scope| {
+			scope.spawn(|| {
+				let mut key = 0;
+
+				while !stop.load(Ordering::Relaxed) {
+					let _ = cache.del(&key);
+					key = (key + 1) % 200;
+					thread::sleep(Duration::from_millis(20));
+				}
+			});
+
+			let start = Instant::now();
+			let result = cache.set(1_000, &value(1_000), None);
+			let took = start.elapsed();
+			stop.store(true, Ordering::Relaxed);
+
+			eprintln!("churn: {result:?} after {took:?}");
+			assert!(matches!(result, Err(CacheError::FastTierStalled)), "{result:?}");
+			assert!(took < window + Duration::from_secs(2), "erred after {took:?}: the churn kept it waiting");
+		});
+
+		drop(pins);
+	});
+}
+
+/// While a stall is unresolved, a newcomer acts after the short probe, not a
+/// whole window: a stuck state does not cost every set its full window
+/// (the liveness review). Red with the probe gone (`noprobe`): the second set
+/// waits its whole second.
+#[test]
+fn a_set_during_a_stall_acts_after_the_probe() {
+	alone("a_set_during_a_stall_acts_after_the_probe", || {
+		let _flush = test_hooks::no_flush();
+		let _m = test_hooks::override_m(M0);
+		let window = Duration::from_secs(1);
+		let cache = cache(PaperPolicy::LruCompactHybrid, gated(window, OnStall::Error));
+
+		let _pause = test_hooks::pause_consumers();
+		let next = fill(&cache, 0);
+
+		let first = cache.set(next, &value(next), None);
+		assert!(matches!(first, Err(CacheError::FastTierStalled)), "{first:?}");
+		assert!(cache.status.gate().stalled());
+
+		let start = Instant::now();
+		let second = cache.set(next + 1, &value(next + 1), None);
+		let took = start.elapsed();
+
+		eprintln!("probe: {second:?} after {took:?}");
+		assert!(matches!(second, Err(CacheError::FastTierStalled)), "{second:?}");
+		assert!(took < Duration::from_millis(500), "the newcomer acted after {took:?}, not after the probe");
+	});
+}
+
+/// Strict FIFO (the test review): a set that could be admitted still queues
+/// behind a waiter that cannot. An OVERSIZE set waits for a settled tier (P at
+/// or under S) while P sits just above S, with room under B for small values;
+/// three small sets arriving meanwhile queue behind it, and it is admitted
+/// first. Reds: newcomers not held behind the lane (`nofifo`); the lane not
+/// closing the gate (`noclosed`).
+#[test]
+fn newcomers_queue_behind_a_waiting_oversize_set() {
+	alone("newcomers_queue_behind_a_waiting_oversize_set", || {
+		let _flush = test_hooks::no_flush();
+		let _m = test_hooks::override_m(M0);
+		let cache = cache(PaperPolicy::LruCompactHybrid, gated(Duration::from_secs(30), OnStall::Error));
+		let s = cache.hybrid_stats();
+		let small = 1_024;
+
+		let pause = test_hooks::pause_consumers();
+		let mut next = 0;
+
+		// Just above the settle target, with room under B for the small ones.
+		while p() <= s.band_s {
+			cache.set(next, &value(next), None).expect("a set under S");
+			next += 1;
+		}
+
+		assert!(p() + 3 * phys::value_charge::<u64>(small as u32) <= s.band_b, "no room under B for the small sets");
+
+		thread::scope(|scope| {
+			let (big, cache_ref) = (next, &cache);
+			let oversize = scope.spawn(move || cache_ref.set(big, &vec![7u8; 64 * 1024], None));
+			wait_for("the oversize set to wait", Duration::from_secs(5), || waiters(&cache) == 1);
+
+			let mut smalls = Vec::new();
+
+			for i in 0..3 {
+				let (cache, key) = (&cache, next + 1 + i);
+				smalls.push(scope.spawn(move || cache.set(key, &vec![1u8; small], None)));
+				wait_for("a small set to queue behind it", Duration::from_secs(5), || waiters(cache) == 2 + i);
+			}
+
+			drop(pause);
+			oversize.join().expect("the oversize set").expect("admitted once the tier settled");
+
+			for set in smalls {
+				set.join().expect("a small set").expect("admitted after it");
+			}
+		});
+
+		assert_eq!(*cache.status.gate().test_admissions.lock(), vec![0, 1, 2, 3], "admitted out of join order");
+	});
+}
+
+/// Turning the gate off releases its waiters at once, not at the worker's next
+/// pass (`set_gate_config`): with the worker held, a waiting set is admitted
+/// ungated as soon as the configuration says Off. Red without the release
+/// (`nooffrelease`).
+#[test]
+fn turning_the_gate_off_releases_its_waiters_at_once() {
+	alone("turning_the_gate_off_releases_its_waiters_at_once", || {
+		let _flush = test_hooks::no_flush();
+		let _m = test_hooks::override_m(M0);
+		let cache = cache(PaperPolicy::LruCompactHybrid, gated(Duration::from_secs(60), OnStall::Error));
+
+		let _pause = test_hooks::pause_consumers();
+		let next = fill(&cache, 0);
+
+		thread::scope(|scope| {
+			let waiter = scope.spawn(|| cache.set(next, &value(next), None));
+			wait_for("the set to wait", Duration::from_secs(5), || waiters(&cache) == 1);
+
+			// Dropped before the scope joins the waiter, even unwinding.
+			let _hold = test_hooks::hold_workers();
+			thread::sleep(Duration::from_millis(20));
+
+			let mut off = cache.gate_config();
+			off.mode = GateMode::Off;
+			cache.set_gate_config(off).expect("a valid configuration");
+
+			wait_for("the waiter's release", Duration::from_secs(2), || waiters(&cache) == 0);
+			waiter.join().expect("the waiter").expect("admitted ungated");
+			assert_eq!(cache.hybrid_stats().gate_state, GateState::Off);
+		});
+	});
+}
+
+/// A diverted OVERWRITE is not promoted at its `Set` (the test review): a slow
+/// key overwritten while the tier is stalled is built slow and placed by LRU at
+/// the front, fast -- the promotion the stack queues for it there is dropped
+/// (`drain_reconciled`), so it lags until its first slow-served hit heals it.
+/// Red without the drop (`noretain`): the promotion lands at the Set.
+#[test]
+fn a_diverted_overwrite_is_not_promoted_at_its_set() {
+	alone("a_diverted_overwrite_is_not_promoted_at_its_set", || {
+		let _flush = test_hooks::no_flush();
+		let _m = test_hooks::override_m(M0);
+		let cache = cache(PaperPolicy::LruCompactHybrid, gated(Duration::ZERO, OnStall::Divert));
+
+		// The oldest keys demoted and landed: key 0 is slow.
+		let pause = test_hooks::pause_consumers();
+		let next = fill(&cache, 0);
+		drop(pause);
+		quiesce(&cache);
+		assert_eq!(cache.tier_of(&0), Some(Slow));
+
+		// The tier full again, and key 0 overwritten: it would wait, so it diverts.
+		let pause = test_hooks::pause_consumers();
+		fill(&cache, next);
+		cache.set(0, &value(0), None).expect("a diverted overwrite succeeds");
+		assert_eq!(cache.hybrid_stats().divert_sets, 1);
+		drop(pause);
+		quiesce(&cache);
+
+		assert_eq!(cache.tier_of(&0), Some(Slow), "promoted at its Set");
+		assert!(cache.placement_audit().expect("an audit").lagging >= 1);
+
+		assert_eq!(cache.get(&0).expect("a hit"), value(0));
+		quiesce(&cache);
+		assert_eq!(cache.tier_of(&0), Some(Fast), "healed on its first slow hit");
+	});
+}
+
+/// Bytes freed by DELETES keep a waiter waiting: with the consumers paused no
+/// demotion lands, and a client deletes a fast key every 200 ms -- each frees
+/// its bytes (FREED, which the lane's first waiter turns on) -- while a set of
+/// three values' size waits for room: longer than its window, and it
+/// succeeds. Red with the first waiter not watching FREED (`nowatchfirst`):
+/// nothing counts as progress, and it errs.
+#[test]
+fn bytes_freed_by_deletes_keep_a_waiter_waiting() {
+	alone("bytes_freed_by_deletes_keep_a_waiter_waiting", || {
+		let _flush = test_hooks::no_flush();
+		let _m = test_hooks::override_m(M0);
+		let window = Duration::from_millis(500);
+		let cache = cache(PaperPolicy::LruCompactHybrid, gated(window, OnStall::Error));
+
+		let _pause = test_hooks::pause_consumers();
+		let next = fill(&cache, 0);
+
+		thread::scope(|scope| {
+			let waiter = scope.spawn(|| {
+				let start = Instant::now();
+				(cache.set(next, &vec![1u8; 3 * LEN], None), start.elapsed())
+			});
+
+			wait_for("the set to wait", Duration::from_secs(5), || waiters(&cache) == 1);
+
+			// Every key is still physically fast: nothing has landed.
+			for key in 0..next {
+				if waiters(&cache) == 0 {
+					break;
+				}
+
+				thread::sleep(Duration::from_millis(200));
+				cache.del(&key).expect("a delete");
+			}
+
+			let (result, took) = waiter.join().expect("the waiter");
+
+			eprintln!("deletes: {result:?} after {took:?}");
+			result.expect("freed bytes keep it waiting, and it is admitted");
+			assert!(took > window, "admitted after {took:?}: the test did not span a window");
+		});
+
+		assert_eq!(cache.hybrid_stats().gate_stalls, 0);
+	});
+}
+
+/// The fast path and the fold hook, on a tier large enough that the near flag
+/// can be clear (`approx + E < N` needs N above E = 2 MiB): sets under N - E
+/// take the one-load path (no slow path counted); then, with the worker held
+/// so that no publication can set the flag, a burst past N - E is caught by
+/// the FOLDS alone -- the flag set, the exact path taken -- and P stays within
+/// the budget. Reds: no fold hook on a charge (`nohook`); no fast path
+/// (`nofastpath`).
+#[test]
+fn a_large_tier_takes_the_fast_path_and_its_folds_set_near() {
+	alone("a_large_tier_takes_the_fast_path_and_its_folds_set_near", || {
+		let _flush = test_hooks::no_flush();
+		let _m = test_hooks::override_m(1 << 20);
+		let tier: CacheSize = 64 << 20;
+		let cache = Cache::new_with_gate(MAX, CacheTierSize::Bytes(tier), PaperPolicy::LruCompactHybrid, gated(Duration::from_secs(5), OnStall::Error))
+			.expect("a tiered cache");
+		wait_for("the byte gate to enable", Duration::from_secs(10), || cache.hybrid_stats().gate_state == GateState::Enabled);
+
+		let s = cache.hybrid_stats();
+		let len = 64 * 1024;
+		let vb = phys::value_charge::<u64>(len as u32);
+		let e = phys::FOLD_ERROR as CacheSize;
+		let data = vec![5u8; len];
+
+		let _pause = test_hooks::pause_consumers();
+		let mut key = 0;
+
+		// Under N - E, with a page of margin: the fast path.
+		while p() + vb + e + (1 << 20) < s.band_n {
+			cache.set(key, &data, None).expect("a set under N - E");
+			key += 1;
+		}
+
+		let under = cache.hybrid_stats();
+		assert!(key > 100, "only {key} sets under N - E");
+		assert_eq!(under.gate_slow_paths, s.gate_slow_paths, "sets under N - E took the exact path");
+
+		// Past N - E with no publication possible: the folds set the flag.
+		let _hold = test_hooks::hold_workers();
+		thread::sleep(Duration::from_millis(20));
+
+		while p() + vb <= s.band_n {
+			cache.set(key, &data, None).expect("a set under N");
+			key += 1;
+		}
+
+		let over = cache.hybrid_stats();
+		eprintln!("large tier: {key} sets, slow paths {} -> {}, P {} (N {}, B {})", under.gate_slow_paths, over.gate_slow_paths, p(), s.band_n, s.band_b);
+		assert!(over.gate_slow_paths > under.gate_slow_paths, "no set past N - E took the exact path: the folds never set NEAR");
+		assert!(p() <= s.band_b + vb + E_FOLD);
+	});
+}
+
+/// The byte decision on a gate set by hand, alone (P and the live counts are
+/// the process's): a small value takes the fast path whatever P reads, with no
+/// slow path counted; a value over the page figure takes the exact path --
+/// admitted under B, and an OVERSIZE one only at P <= S with nothing reserved
+/// (with the near flag CLEAR, which no tier in the other tests has); behind a
+/// waiter a newcomer waits and the head does not. Reds: no fast path
+/// (`nofastpath`); newcomers not held behind the lane (`nofifo`).
+#[test]
+fn the_byte_decision_on_a_hand_set_gate() {
+	alone("the_byte_decision_on_a_hand_set_gate", || {
+		use crate::gate::{Bands, Bytes, Gate, Published, Waiter};
+
+		// This process's one tiered registration, so the gate may run.
+		let _registered = phys::LiveRegistration::tiered_cache();
+		let gate = Gate::default();
+
+		let mut config = GateConfig::default();
+		config.mode = GateMode::Block;
+		gate.set_config(config);
+
+		let eff: CacheSize = 10_000_000;
+		let bands = Bands { s: 9_800_000, n: 9_900_000, b: 10_000_000 };
+
+		gate.publish(
+			Published { model: MetadataModel::PerObject, m_model: 0, eff, eff_small: eff, eff_large: eff, k_max: u64::MAX, bands: Some(bands) },
+			|| 0,
+			|| 0,
+		);
+		gate.worker_pass(GateState::Enabled, phys::gate_epoch());
+
+		let admits = |bytes: Bytes<'_>| matches!(bytes, Bytes::Admit(_));
+		let slow = || gate.stats().gate_slow_paths;
+
+		// The fast path: one load, whatever P says.
+		assert!(admits(gate.admit_bytes(4_096, false, || i64::MAX, || {})));
+		assert_eq!(slow(), 0, "a small value took the exact path");
+
+		// Over the page figure (B - N): the exact path, admitted under B.
+		assert!(admits(gate.admit_bytes(150_000, false, || 9_000_000, || {})));
+		assert!(!admits(gate.admit_bytes(150_000, false, || 9_900_000, || {})), "P + v over B");
+
+		// OVERSIZE (v > B - S), the near flag clear: only on a settled tier.
+		assert!(!admits(gate.admit_bytes(300_000, false, || 9_800_001, || {})), "oversize over S");
+		assert!(admits(gate.admit_bytes(300_000, false, || 9_800_000, || {})), "oversize at S");
+		assert_eq!(slow(), 4);
+
+		// Behind a waiter: a newcomer waits, the head does not.
+		let head = Waiter::enqueue(&gate);
+		assert!(head.is_head());
+		assert!(!admits(gate.admit_bytes(4_096, false, || 0, || {})), "a newcomer overtook the lane");
+		assert!(admits(gate.admit_bytes(4_096, true, || 0, || {})), "the head was held");
+		drop(head);
+
+		assert_eq!(gate.reserved(), 0, "every reservation released");
+	});
+}
+
+/// A FLAT cache with fast values disables the byte gate too: its values are in
+/// P as well (design 3.9.8, the test review). With the workers held, the
+/// gate's next exact-path set sees the live counts move and turns it off.
+/// Red with P's sole-user check blind to flat caches (`noflat`).
+#[test]
+fn a_flat_fast_cache_beside_disables_the_gate() {
+	alone("a_flat_fast_cache_beside_disables_the_gate", || {
+		let _flush = test_hooks::no_flush();
+		let _m = test_hooks::override_m(M0);
+		let cache = cache(PaperPolicy::LruCompactHybrid, gated(Duration::from_secs(5), OnStall::Error));
+
+		let hold = test_hooks::hold_workers();
+		thread::sleep(Duration::from_millis(20));
+
+		let flat = PaperCache::<u64, crate::BufferDRAM>::new(1 << 20, &[PaperPolicy::Lru], PaperPolicy::Lru)
+			.expect("a flat cache with fast values");
+
+		// A fast set on the 1 MiB tier takes the exact path, which reads the
+		// live counts.
+		let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			cache.set(0, &value(0), None).expect("a set");
+			assert_eq!(cache.hybrid_stats().gate_state, GateState::NotSole);
+		}));
+
+		// Released before the flat cache drops, pass or fail: its drop joins
+		// its worker (a failure used to hang to the child's deadline).
+		drop(hold);
+		drop(flat);
+
+		if let Err(panic) = checked {
+			std::panic::resume_unwind(panic);
+		}
+
+		wait_for("the gate to enable again", Duration::from_secs(5), || cache.hybrid_stats().gate_state == GateState::Enabled);
 	});
 }

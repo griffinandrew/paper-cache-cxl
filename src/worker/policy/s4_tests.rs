@@ -1733,6 +1733,8 @@ mod t14 {
 		/// this `on_stall` -- every value to be built fast through it -- and its
 		/// levels, P and counters in each op's record.
 		g: Option<crate::gate::OnStall>,
+		/// The gate half's diverted keys: the only keys allowed to lag.
+		diverted: std::collections::HashSet<u64>,
 		/// The keys `0..keys` the script draws from.
 		keys: u64,
 		worker: Worker,
@@ -1847,7 +1849,7 @@ mod t14 {
 
 			let index = (0..keys).map(|i| (key(i), i)).collect();
 
-			Run { policy, tiered, b, c, g: None, keys, worker, objects, index, lines: Vec::new() }
+			Run { policy, tiered, b, c, g: None, diverted: Default::default(), keys, worker, objects, index, lines: Vec::new() }
 		}
 
 		fn live(&self, i: u64) -> bool {
@@ -1949,6 +1951,11 @@ mod t14 {
 			published.placement = placement;
 			drop(reservation);
 			let kind = if published.fresh() { "set" } else { "overwrite" };
+
+			match placement {
+				crate::worker::Placement::Diverted => self.diverted.insert(i),
+				_ => self.diverted.remove(&i),
+			};
 
 			handle(&mut self.worker, k, published);
 
@@ -2125,6 +2132,11 @@ mod t14 {
 				set.placement = placement;
 				drop(reservation);
 
+				match placement {
+					crate::worker::Placement::Diverted => self.diverted.insert(i),
+					_ => self.diverted.remove(&i),
+				};
+
 				what.push(format!("k{i} {item} built {}{}{note}", tier(built), placed(placement)));
 				published.push((i, set));
 			}
@@ -2298,10 +2310,17 @@ mod t14 {
 				// A diverted key LAGS by design (B2): its value in CXL, the key
 				// placed by its policy, until its first slow-served hit heals it.
 				// Nothing may be stranded or untracked all the same.
+				// ...and no more lagging keys than diverted ones still in CXL.
+				let diverted = self
+					.diverted
+					.iter()
+					.filter(|&&i| self.objects.get_ref(&key(i)).is_some_and(|object| object.value().tier() == Slow))
+					.count() as u64;
+
 				match self.g {
 					Some(crate::gate::OnStall::Divert) => assert!(
-						audit.stranded == 0 && audit.untracked == 0,
-						"{} op {n} ({what}): {audit:?}",
+						audit.stranded == 0 && audit.untracked == 0 && audit.lagging <= diverted,
+						"{} op {n} ({what}): {audit:?} with {diverted} diverted keys in CXL",
 						self.policy,
 					),
 

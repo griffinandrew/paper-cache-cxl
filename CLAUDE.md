@@ -121,9 +121,11 @@ src/
                                woken by landed demotions, the worker's pass, released
                                reservations, a wipe or a grown eff, re-deciding its tier and the
                                structural check at every wake. The no-progress watchdog
-                               (stall_window: nothing freed, while the worker kept passing)
-                               ends a wait per OnStall: FastTierStalled (default), Divert (built
-                               slow, Placement::Diverted, healed on its first slow hit) or
+                               (stall_window: nothing freed once the worker has caught up
+                               with its channel -- two whole passes -- or a worker hung for
+                               five windows) ends a wait per OnStall: FastTierStalled
+                               (default), Divert (built slow, Placement::Diverted, healed
+                               on its first slow hit) or
                                AdmitOver. GateMode::Block is the default -- Off in the lib's own
                                unit tests, whose P is shared -- and the gate disables itself
                                (GateState) unless its cache is P's only user, for the lazy-copy

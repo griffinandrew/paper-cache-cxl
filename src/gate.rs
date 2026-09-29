@@ -87,10 +87,14 @@
 //! A NO-PROGRESS WATCHDOG (`GateConfig::stall_window`, 2 s): the lane's head
 //! waits for as long as something is freed -- bytes refunded anywhere
 //! (`phys::freed`, counted while a gate watches), a demotion landed, a waiter
-//! admitted, the close level raised -- and the gate is STALLED only after a
-//! whole window with none of these AND with the worker having completed passes
-//! (each with its resettle) since the window began, so a late worker is not a
-//! stall. A stalled set acts per [`OnStall`]: `CacheError::FastTierStalled` (the
+//! admitted -- and the gate is STALLED only after a whole window with none of
+//! these once the policy worker had CAUGHT UP (two whole passes of its run
+//! loop ended since the window began, so it drained every event sent before
+//! it): a worker behind its channel is not a stall. A worker that ends no pass
+//! and handles no event for five windows (from the last one a waiter saw) is
+//! HUNG, and that is one. A rise of the close level is not progress: M_model
+//! moves it with every key. A stalled set acts per [`OnStall`]:
+//! `CacheError::FastTierStalled` (the
 //! default); built slow (`Divert`: `Placement::Diverted` -- placed by its policy,
 //! healed on its first slow-served hit, never corrected toward fast at its
 //! `Set`); or admitted over the budget (`AdmitOver`). While a stall is
@@ -263,7 +267,9 @@ pub struct GateConfig {
 	pub on_metadata_overflow: MetadataOverflow,
 
 	/// How long a waiting set waits with NOTHING freed before it acts: the
-	/// byte gate's no-progress watchdog (`on_stall`), and an `EvictToFit` set
+	/// byte gate's no-progress watchdog (`on_stall`; the window counts once the
+	/// policy worker has caught up with its channel, or is five of them while
+	/// the worker shows no sign of life -- `Waiter::watch`), and an `EvictToFit` set
 	/// waiting for the policy worker to answer while the worker makes no
 	/// progress at all (it counts every event it handles, so a set queued
 	/// behind a long backlog keeps waiting while the backlog drains). 2 s
@@ -368,11 +374,23 @@ const STALL_PROBE: Duration = Duration::from_millis(50);
 /// when the worker goes; this is only the safety net.
 const NON_HEAD_PARK: Duration = Duration::from_millis(100);
 
-/// The worker's gate passes that must complete after a no-progress window
-/// began before the window can end in a stall: the one that may have been
-/// running when it began, and one that began after it, with its resettle (the
-/// liveness review: a late worker is not a stall).
+/// The worker's WHOLE passes (`Gate::end_pass`: once per pass of its run
+/// loop, after its evictions and its publication) that must end after a
+/// no-progress window began before the worker counts as CAUGHT UP: the one that
+/// may have been running when the window began, and one that began after it
+/// -- which took the channel as it stood, every event sent before the window
+/// began, and ended with the pass end's evictions, settles and resettle. The
+/// window then starts again (`Waiter::watch`): a stall is a whole window with
+/// nothing freed once the worker was current, so a worker that is merely
+/// behind its channel is never one (the liveness and correctness reviews).
 const STALL_PASSES: u64 = 2;
+
+/// A worker that ends no pass and handles no event for this many windows --
+/// timed from the last one a waiter saw, with nothing freed meanwhile -- is
+/// HUNG, a stuck state as much as nothing freed, and a waiting set acts,
+/// caught up or not (the correctness review). A late worker is not a stall; a
+/// hung one is.
+const HUNG_WINDOWS: u32 = 5;
 
 /// Buckets of the wait histogram: `2^i` microseconds and up, the last open.
 pub(crate) const WAIT_BUCKETS: usize = 16;
@@ -441,7 +459,11 @@ impl GateShared {
 
 		self.word.fetch_and(!NEAR, Ordering::AcqRel);
 
-		if near(phys::fast_bytes_approx()) {
+		// Against N as it is NOW: a publication that lowered it since this fold
+		// read it must not be undone by this clear (the correctness review).
+		let n = self.band_n.load(Ordering::Relaxed);
+
+		if n != u64::MAX && phys::fast_bytes_approx().saturating_add(phys::FOLD_ERROR) >= n.min(i64::MAX as u64) as i64 {
 			self.word.fetch_or(NEAR, Ordering::AcqRel);
 		}
 	}
@@ -566,16 +588,16 @@ pub(crate) struct Gate {
 	/// every admission out of it: progress, for the watchdog.
 	lane_progress: AtomicU64,
 
-	/// The worker's gate passes (`worker_pass`): a no-progress window ends in
-	/// a stall only after passes, not only after time.
+	/// The worker's WHOLE passes (`end_pass`, once per pass of its run loop):
+	/// a no-progress window ends in a stall only once the worker has caught
+	/// up, not only after time (`STALL_PASSES`).
 	passes: AtomicU64,
 
 	/// The watchdog fired and the worker has seen nothing freed since; with
-	/// FREED, P and B when it fired.
+	/// FREED and P when it fired.
 	stalled: AtomicBool,
 	stall_freed: AtomicU64,
 	stall_p: AtomicI64,
-	stall_b: AtomicU64,
 
 	/// A near kick is allowed: re-armed at every worker pass, so at most one
 	/// set per pass takes the kick's lock.
@@ -658,7 +680,6 @@ impl Default for Gate {
 			stalled: AtomicBool::new(false),
 			stall_freed: AtomicU64::new(0),
 			stall_p: AtomicI64::new(0),
-			stall_b: AtomicU64::new(0),
 			near_kick_armed: AtomicBool::new(true),
 			gate_disabled_sets: AtomicU64::new(0),
 			gate_slow_paths: Sharded::new(),
@@ -1395,7 +1416,10 @@ pub(crate) fn park(timeout: Duration) {
 /// `CacheError::Internal` if the worker is gone; `MetadataOverflow` if no
 /// answer came while the worker made NO progress for `stall_window` (a worker
 /// working through a backlog ahead of the request keeps the waiter waiting:
-/// the backlog is part of this set's cost, as `MakeRoom` queues behind it).
+/// the backlog is part of this set's cost, as `MakeRoom` queues behind it). A
+/// request whose waiter gave up this way may still be served late, and evict
+/// once for a set that already failed (bounded: each `MakeRoom` evicts only
+/// what the live key count needs).
 pub(crate) fn await_room(gate: &Gate, request: u64, config: &GateConfig) -> Result<u64, CacheError> {
 	let mut since = Instant::now();
 	let mut progress = gate.worker_progress();
@@ -1573,17 +1597,18 @@ pub(crate) struct Marks {
 	pub(crate) freed: u64,
 	/// The bytes lane's progress count: landed demotions, admissions.
 	pub(crate) progress: u64,
-	/// The close level B.
-	pub(crate) b: CacheSize,
 }
 
 /// Progress, for the watchdog (design 3.9.6): bytes were freed anywhere (a
 /// demotion landing, an eviction, a delete, a reap, a reader dropping a copy),
-/// a demotion landed or a waiter was admitted, or the close level rose (eff
-/// grew). NOT "P fell": frees offset by promotion copies leave P flat, and
-/// that is load, which waits, not a stall (T19c).
+/// or a demotion landed or a waiter was admitted. NOT "P fell": frees offset by
+/// promotion copies leave P flat, and that is load, which waits, not a stall
+/// (T19c). And NOT the close level rising, which the design counted: M_model's
+/// per-object term moves B with every key that leaves, so a stuck tier with
+/// ordinary churn -- slow keys deleted or reaped -- would never err (the
+/// correctness review). A rise that makes room shows as the head's admission.
 pub(crate) fn progress_made(then: Marks, now: Marks) -> bool {
-	now.freed != then.freed || now.progress != then.progress || now.b > then.b
+	now.freed != then.freed || now.progress != then.progress
 }
 
 /// What the watchdog tells a waiting set (`Waiter::watch`).
@@ -1606,10 +1631,18 @@ pub(crate) struct Waiter<'g> {
 	started: Instant,
 
 	/// The current no-progress window: when it began, the progress readings
-	/// then, and the worker's gate passes then.
+	/// then, the worker's whole passes and handled events then, and when the
+	/// worker had caught up since (`STALL_PASSES`).
 	since: Instant,
 	marks: Marks,
 	passes: u64,
+	caught_up: Option<Instant>,
+
+	/// The worker's (passes, events) as this waiter last saw them, and when
+	/// they last moved: the HUNG clock runs from the worker's last sign of
+	/// life, not from the window's start.
+	seen: (u64, u64),
+	moved: Instant,
 
 	was_head: bool,
 }
@@ -1622,9 +1655,23 @@ impl<'g> Waiter<'g> {
 		gate.gate_waits.fetch_add(1, Ordering::Relaxed);
 		gate.max_waiters.fetch_max(gate.bytes_lane.len() as u64, Ordering::Relaxed);
 
+		// The worker's counters before the progress readings (see `watch`).
+		let passes = gate.passes();
+		let events = gate.worker_progress();
 		let now = Instant::now();
 
-		Waiter { gate, place, started: now, since: now, marks: gate.marks(), passes: gate.passes(), was_head: false }
+		Waiter {
+			gate,
+			place,
+			started: now,
+			since: now,
+			marks: gate.marks(),
+			passes,
+			caught_up: None,
+			seen: (passes, events),
+			moved: now,
+			was_head: false,
+		}
 	}
 
 	/// Whether this waiter is the lane's head.
@@ -1641,14 +1688,23 @@ impl<'g> Waiter<'g> {
 	}
 
 	/// The watchdog, once per wake. Progress (`progress_made`), or becoming
-	/// the head, starts a new window. The HEAD stalls after a whole window
-	/// with no progress and at least `STALL_PASSES` of the worker's passes
-	/// since the window began; it then marks the gate stalled (the worker
-	/// clears that at the first byte freed). While the gate is stalled any
-	/// waiter -- a newcomer included -- acts after `STALL_PROBE` without
-	/// progress. Otherwise: park until the next check.
+	/// the head, starts a new window. Once the worker has CAUGHT UP since the
+	/// window began (`STALL_PASSES` whole passes) the window starts again, and
+	/// the HEAD stalls after a whole window with no progress from then on --
+	/// or, caught up or not, after `HUNG_WINDOWS` windows with no progress in
+	/// which the worker ended no pass and handled no event, timed from the
+	/// last pass or event this waiter saw (a worker that moved once after the
+	/// window began and then hung is hung too). It then marks the gate stalled (the
+	/// worker clears that at the first byte freed). While the gate is stalled
+	/// any waiter -- a newcomer included -- acts the same way with
+	/// `STALL_PROBE` for the window. Otherwise: park until the next check. The
+	/// worker's counters are read before the progress readings, so a pass that
+	/// frees room between the two reads shows as progress (the correctness
+	/// review).
 	pub(crate) fn watch(&mut self, config: &GateConfig) -> Watch {
 		let gate = self.gate;
+		let passes = gate.passes();
+		let events = gate.worker_progress();
 		let now = Instant::now();
 		let head = self.place.is_head();
 		let marks = gate.marks();
@@ -1656,19 +1712,37 @@ impl<'g> Waiter<'g> {
 		if progress_made(self.marks, marks) || (head && !self.was_head) {
 			self.since = now;
 			self.marks = marks;
-			self.passes = gate.passes();
+			self.passes = passes;
+			self.caught_up = None;
+		}
+
+		// The worker's last sign of life: a pass ended, or an event handled.
+		if (passes, events) != self.seen {
+			self.seen = (passes, events);
+			self.moved = now;
 		}
 
 		self.was_head = head;
+
+		if self.caught_up.is_none() && passes >= self.passes.saturating_add(STALL_PASSES) {
+			self.caught_up = Some(now);
+		}
 
 		let stalled = gate.stalled();
 		let window = match stalled {
 			true => config.stall_window.min(STALL_PROBE),
 			false => config.stall_window,
 		};
-		let quiet = now.saturating_duration_since(self.since);
 
-		if (head || stalled) && quiet >= window && gate.passes() >= self.passes.saturating_add(STALL_PASSES) {
+		let hung_after = window.saturating_mul(HUNG_WINDOWS);
+		let current = self.caught_up.is_some_and(|at| now.saturating_duration_since(at) >= window);
+
+		// HUNG: no progress AND no sign of life from the worker -- the later
+		// of the two clocks -- for `HUNG_WINDOWS` windows.
+		let idle = now.saturating_duration_since(self.since.max(self.moved));
+		let hung = idle >= hung_after;
+
+		if (head || stalled) && (current || hung) {
 			gate.declare_stall(marks);
 			return Watch::Stalled;
 		}
@@ -1678,7 +1752,12 @@ impl<'g> Waiter<'g> {
 			false => NON_HEAD_PARK,
 		};
 
-		match window.saturating_sub(quiet) {
+		let left = match self.caught_up {
+			Some(at) => window.saturating_sub(now.saturating_duration_since(at)),
+			None => hung_after.saturating_sub(idle),
+		};
+
+		match left {
 			left if left.is_zero() => Watch::Park(park),
 			left => Watch::Park(park.min(left)),
 		}
@@ -1708,11 +1787,7 @@ impl Gate {
 		}
 	}
 
-	fn band_b(&self) -> CacheSize {
-		self.band_b.load(Ordering::Relaxed)
-	}
-
-	/// The worker's gate passes so far.
+	/// The worker's whole passes so far (`end_pass`).
 	pub(crate) fn passes(&self) -> u64 {
 		self.passes.load(Ordering::Acquire)
 	}
@@ -1731,7 +1806,6 @@ impl Gate {
 		Marks {
 			freed: phys::freed(),
 			progress: self.lane_progress.load(Ordering::Relaxed),
-			b: self.band_b(),
 		}
 	}
 
@@ -1929,7 +2003,6 @@ impl Gate {
 
 		self.stall_freed.store(marks.freed, Ordering::Relaxed);
 		self.stall_p.store(phys::fast_bytes_signed(), Ordering::Relaxed);
-		self.stall_b.store(marks.b, Ordering::Relaxed);
 
 		if !self.stalled.swap(true, Ordering::AcqRel) {
 			phys::watch_freed(true);
@@ -1952,9 +2025,10 @@ impl Gate {
 	/// The policy worker's gate pass, at the end of every publication (design
 	/// 3.9.9): the state `state` it evaluated -- the fold hook installed or
 	/// cleared with it, the waiters released when it disables the gate; a stall
-	/// ended when anything was freed since it fired, P fell below where it was,
-	/// or the close level rose (the worker owns the stall, the liveness
-	/// review); the bytes lane's head notified; the pass counted.
+	/// ended when anything was freed since it fired or P fell below where it
+	/// was (the worker owns the stall, the liveness review); the bytes lane's
+	/// head notified. The watchdog's pass count is `end_pass`'s, the run
+	/// loop's alone.
 	pub(crate) fn worker_pass(&self, state: GateState, epoch: u64) {
 		let enabled = state == GateState::Enabled;
 
@@ -1978,7 +2052,6 @@ impl Gate {
 
 			if freed != self.stall_freed.load(Ordering::Relaxed)
 				|| phys::fast_bytes_signed() < self.stall_p.load(Ordering::Relaxed)
-				|| self.band_b() > self.stall_b.load(Ordering::Relaxed)
 			{
 				if self.stalled.swap(false, Ordering::AcqRel) {
 					phys::watch_freed(false);
@@ -2002,14 +2075,21 @@ impl Gate {
 		}
 
 		self.near_kick_armed.store(true, Ordering::Relaxed);
+	}
+
+	/// The worker ended a WHOLE pass of its run loop -- its events, its
+	/// evictions, its publication and resettle (`STALL_PASSES`). Not a
+	/// publication elsewhere (a MakeRoom's, a wipe's): those follow no drained
+	/// channel.
+	pub(crate) fn end_pass(&self) {
 		self.passes.fetch_add(1, Ordering::AcqRel);
 	}
 }
 
 /// Test hooks for the byte gate's tests, process-global (every gate test runs
 /// alone in a child process): a pause and a pace for the migration consumers,
-/// the worker held, its per-pass notify and its test flush off, M
-/// overridden. Each is an RAII guard, released on drop and on unwinding, so a
+/// the worker held or slowed, its per-pass notify and its test flush off, M
+/// overridden or raised. Each is an RAII guard, released on drop and on unwinding, so a
 /// failing test never leaves the process's workers paused (the liveness
 /// review).
 #[cfg(test)]
@@ -2024,7 +2104,9 @@ pub(crate) mod test_hooks {
 	static NO_FLUSH: AtomicBool = AtomicBool::new(false);
 	static NO_PASS_NOTIFY: AtomicBool = AtomicBool::new(false);
 	static HOLD_WORKER: AtomicBool = AtomicBool::new(false);
+	static EVENT_DELAY_US: AtomicU64 = AtomicU64::new(0);
 	static M_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+	static M_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 	/// Sets `flag` until the guard drops, which restores what it was.
 	pub(crate) struct Flag(&'static AtomicBool, bool);
@@ -2084,9 +2166,24 @@ pub(crate) mod test_hooks {
 		flag(&HOLD_WORKER)
 	}
 
+	/// Each event the policy worker handles takes `delay` first.
+	pub(crate) fn slow_worker(delay: Duration) -> Value {
+		value(&EVENT_DELAY_US, delay.as_micros() as u64)
+	}
+
 	/// M_model is `bytes` at every publication.
 	pub(crate) fn override_m(bytes: u64) -> Value {
 		value(&M_OVERRIDE, bytes)
+	}
+
+	/// M_model is `bytes` MORE than the model says, at every publication: a
+	/// step that keeps the model's own movement (its per-object term).
+	pub(crate) fn raise_m(bytes: u64) -> Value {
+		value(&M_OFFSET, bytes)
+	}
+
+	pub(crate) fn m_offset() -> u64 {
+		M_OFFSET.load(Relaxed)
 	}
 
 	pub(crate) fn m_override() -> Option<u64> {
@@ -2113,6 +2210,14 @@ pub(crate) mod test_hooks {
 	pub(crate) fn worker_hold() {
 		while HOLD_WORKER.load(Relaxed) {
 			std::thread::sleep(Duration::from_millis(1));
+		}
+	}
+
+	/// A policy worker, before each event.
+	pub(crate) fn event_delay() {
+		match EVENT_DELAY_US.load(Relaxed) {
+			0 => {},
+			us => std::thread::sleep(Duration::from_micros(us)),
 		}
 	}
 }
@@ -2181,18 +2286,17 @@ mod tests {
 	}
 
 	/// The watchdog's progress (design 3.9.6, T19c): bytes freed, a landed
-	/// demotion or an admission, or a higher close level -- NOT "P fell": frees
-	/// offset by promotion copies leave P flat and are progress; a close level
-	/// that FELL is not. Red with FREED ignored (`nofreed`).
+	/// demotion or an admission -- NOT "P fell": frees offset by promotion
+	/// copies leave P flat and are progress. (Nor the close level rising: see
+	/// `churn_that_frees_no_fast_byte_is_not_progress`.) Red with FREED
+	/// ignored (`nofreed`).
 	#[test]
 	fn progress_is_something_freed_not_p_falling() {
-		let then = Marks { freed: 10, progress: 5, b: 1_000 };
+		let then = Marks { freed: 10, progress: 5, ..Marks::default() };
 
 		assert!(!progress_made(then, then), "nothing moved");
 		assert!(progress_made(then, Marks { freed: 11, ..then }), "bytes freed, whatever P did");
 		assert!(progress_made(then, Marks { progress: 6, ..then }), "a demotion landed, or a waiter was admitted");
-		assert!(progress_made(then, Marks { b: 1_001, ..then }), "the tier grew");
-		assert!(!progress_made(then, Marks { b: 999, ..then }), "the tier shrank");
 	}
 
 	/// The word's page figure is the fast path's whole bound: while the byte

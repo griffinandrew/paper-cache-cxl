@@ -482,6 +482,32 @@ fn evict_to_fit_with_nothing_to_evict_fails_at_once() {
 	assert_eq!((s.make_room_requests, s.make_room_evictions, s.make_room_failures), (1, 0, 1));
 }
 
+/// `EvictToFit` under `stall_window` 0 -- "never wait" -- fails a new key at
+/// the ceiling at once and evicts nothing (a 256 B tier, omega 64: a ceiling
+/// of 4 keys): a MakeRoom would take the policy's victim for a set that then
+/// fails without waiting for it (the correctness review). Red with the
+/// MakeRoom sent anyway (`zerowindowroom`).
+#[test]
+fn evict_to_fit_with_no_window_evicts_nothing() {
+	let _serialised = migration_test_lock::lock();
+	let _overheads = test_overheads::set(64, 100);
+
+	let mut config = evict_to_fit();
+	config.stall_window = Duration::ZERO;
+	let cache = cache_with(PaperPolicy::LruCompactHybrid, 256, config);
+	assert_eq!(cache.status.gate().k_max(), 4);
+
+	for key in 0..4 {
+		cache.set(key, &[1u8; 100], None).expect("under the ceiling");
+	}
+
+	assert_eq!(cache.set(4, &[1u8; 100], None), Err(CacheError::MetadataOverflow));
+
+	let s = cache.hybrid_stats();
+	assert_eq!((s.metadata_overflows, s.make_room_requests, s.make_room_evictions), (1, 0, 0));
+	assert!((0..4).all(|key| cache.has(&key)), "a key was evicted for a set that failed");
+}
+
 /// A dead policy worker cannot make room: the waiting set returns
 /// `CacheError::Internal` within a second -- the worker's thread, gone by
 /// unwinding through a test-only panic at its `MakeRoom`, marks the gate

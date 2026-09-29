@@ -2047,11 +2047,6 @@ struct GatePass {
 #[cfg(feature = "hybrid_cache_common")]
 const METADATA_FULL_REFRESH: Duration = Duration::from_millis(100);
 
-/// While a set waits in the byte gate's bytes lane, how many events a batch
-/// handles between two of the pass end's gate steps (S5 B2). A power of two.
-#[cfg(feature = "hybrid_cache_common")]
-const GATE_STEP_EVENTS: u64 = 1_024;
-
 #[cfg(feature = "hybrid_cache_common")]
 impl WorkerMetadata {
 	fn new<K>() -> Self {
@@ -2125,6 +2120,10 @@ where
 			let mut has_current_set = false;
 
 			for event in events.drain(..) {
+				// Test builds: a gate test slowing the worker down.
+				#[cfg(all(test, feature = "hybrid_cache_common"))]
+				crate::gate::test_hooks::event_delay();
+
 				match event {
 					WorkerEvent::Get(key, served) => self.handle_get(key, served),
 
@@ -2261,18 +2260,6 @@ where
 					if self.gate_pass.events % 64 == 0 {
 						self.status.gate().set_worker_progress(self.gate_pass.events);
 					}
-
-					// B2: while a set waits for fast bytes, a long batch runs the
-					// pass end's gate step every GATE_STEP_EVENTS events -- the
-					// gauges, M, eff and the byte gate's levels republished, every
-					// settle re-run, the head notified, the pass counted -- so the
-					// waiter is not held to the batch's length (the liveness
-					// review's bound on a pass).
-					if self.gate_pass.events % GATE_STEP_EVENTS == 0 && self.status.gate().bytes_lane.len() > 0 {
-						self.refresh_tier_gauges();
-						self.publish_metadata(false);
-						self.publish_gate();
-					}
 				}
 			}
 
@@ -2338,6 +2325,11 @@ where
 			{
 				self.publish_gate();
 				self.status.gate().set_worker_progress(self.gate_pass.events);
+
+				// A WHOLE pass ended -- this batch's events, the evictions, the
+				// publication and its resettle -- what the byte gate's watchdog
+				// counts (`gate::STALL_PASSES`); no other publication is one.
+				self.status.gate().end_pass();
 			}
 
 			// Once per pass: push this thread's retired values into the global
@@ -3536,8 +3528,9 @@ where
 	/// enabled, its levels (`gate::bands`) go out with eff; after the resettle
 	/// the gate's pass (`Gate::worker_pass`): the fold hook installed or
 	/// cleared, waiters released when the gate turns off, a stall ended once
-	/// anything was freed, the head notified, the pass counted -- what the
-	/// watchdog waits for before it calls a window a stall.
+	/// anything was freed, the head notified. The watchdog's whole-pass count
+	/// is `Gate::end_pass`, which the run loop calls after this; a MakeRoom's,
+	/// a wipe's or the constructor's publication is not a pass.
 	#[cfg(feature = "hybrid_cache_common")]
 	fn publish_gate(&mut self) {
 		use crate::gate::{self, GateState, MetadataModel};
@@ -3587,7 +3580,7 @@ where
 
 		// Test builds: M held where a gate test put it (a table step).
 		#[cfg(test)]
-		let m_model = gate::test_hooks::m_override().unwrap_or(m_model);
+		let m_model = gate::test_hooks::m_override().unwrap_or(m_model) + gate::test_hooks::m_offset();
 
 		if model == MetadataModel::Measured && pass.pushed != Some(m_model) {
 			stack.set_dram_metadata(Some(m_model));
