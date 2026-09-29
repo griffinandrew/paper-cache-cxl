@@ -259,6 +259,64 @@ pub struct HybridStats {
 	/// (`L > 10,000`), counted on entering that state: the model's sanity
 	/// check. A counter only.
 	pub metadata_model_divergence: u64,
+
+	/// S5, commit B2 -- the byte gate. Its state: `Enabled`, or why it is not
+	/// running (`GateState`: `Off`, `NotSole`, `Ungated`, `Bands`, `NoStack`).
+	pub gate_state: crate::gate::GateState,
+
+	/// Fast sets that reached the gate's slow path while it was disabled for a
+	/// reason other than `Off` (sets on the one-load fast path are not
+	/// counted).
+	pub gate_disabled_sets: u64,
+
+	/// Fast sets that took the exact path: `NEAR` or `CLOSED` set, or a value
+	/// over the fast path's bound.
+	pub gate_slow_paths: u64,
+
+	/// Sets that waited in the bytes lane, their total and longest wait, and a
+	/// histogram of the waits: bucket `i` counts waits of `2^i` microseconds
+	/// and more (under 2 us in bucket 0, the last bucket open-ended).
+	pub gate_waits: u64,
+	pub gate_wait_ns_total: u64,
+	pub gate_wait_ns_max: u64,
+	pub gate_wait_hist: [u64; crate::gate::WAIT_BUCKETS],
+
+	/// Times the no-progress watchdog found the gate stalled (nothing freed
+	/// for `stall_window` while the worker kept passing), and the sets that
+	/// returned `FastTierStalled` (`OnStall::Error`).
+	pub gate_stalls: u64,
+	pub gate_stall_errors: u64,
+
+	/// `OnStall::Divert`: sets built slow, and their bytes.
+	pub divert_sets: u64,
+	pub divert_bytes: u64,
+
+	/// `OnStall::AdmitOver`: sets admitted fast over the budget, and their
+	/// bytes.
+	pub admit_over_sets: u64,
+	pub admit_over_bytes: u64,
+
+	/// Values larger than `B - S` admitted on a settled tier.
+	pub oversize_admits: u64,
+
+	/// Times a set found P at or above the near level and kicked the policy
+	/// worker (at most one per worker pass).
+	pub near_kicks: u64,
+
+	/// The most sets seen waiting in the bytes lane at once.
+	pub max_waiters: u64,
+
+	/// Gauges: sets waiting in the bytes lane now, and the bytes admitted sets
+	/// hold reserved until their values are built.
+	pub waiters: u64,
+	pub reserved_bytes: u64,
+
+	/// The gate's levels as last published: the settle target S, the near
+	/// level N and the close level B (`P + M_model <= F + slack` is `P <= B`);
+	/// 0 while the gate is not enabled.
+	pub band_s: u64,
+	pub band_n: u64,
+	pub band_b: u64,
 }
 
 impl HybridStats {

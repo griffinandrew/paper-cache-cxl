@@ -393,6 +393,50 @@ with `delay_event_loop`): the first set after an idle spell is taken at once, in
 kick per spell. `HybridStats` reports the model, `M_model`, `K_max`, and the cap's, structural
 placement's and kick's counters.
 
+### The byte gate: a fast set waits for room (S5)
+
+Step 5 of `begin_set`, for a value to be built fast (`src/gate.rs`): the bytes physically in the
+fast tier, P (`crate::phys`, every fast value's allocation, in the stacks' unit), are held to
+`P + M_model <= F + slack`, i.e. `P <= B`. With eff the policy worker publishes three levels:
+the settle target `S = drain_target(eff)`, where every design rests after a pass; the close level
+`B = eff + slack`; and a near level `N`, one near band below B (`near_frac` x eff, 1% by default,
+or `concurrency_hint` x `value_hint` when wider), never below `S + 1`.
+
+- **Fast path.** The gate word's near and closed bits clear and a value no larger than `B - N`:
+  admitted on the one relaxed load that already decided the cap and the structural check. The
+  near bit is `approx + E >= N` (`approx`, P's folded part, is within `E` = 2 MiB of P),
+  re-evaluated at every fold of P and by the worker each pass, so a clear bit means `P < N`.
+  Small tiers (under ~200 MiB) have it set for good and take the exact path every time.
+- **Exact path.** P (17 loads) and `R`, the bytes admitted sets hold reserved until their values
+  are built: admitted iff `P + R + v <= B`, reserving `v` unless `P + v <= N`. A value larger than
+  `B - S` (OVERSIZE) is admitted only on a settled tier -- `P <= S`, nothing reserved -- so P
+  peaks at `S + v`.
+- **Waiting.** Otherwise the set joins the BYTES lane, FIFO (the closed bit is set while it holds
+  anyone, so a newcomer queues behind). Its head is woken by a migration consumer's landed
+  demotion, the worker's pass (every pass while a set waits, polling SHORT), a released
+  reservation, a wipe and an eff that grew; at every wake it decides its tier and the structural
+  check again -- a value that no longer fits even an empty tier leaves as a structural set -- then
+  the bytes. A waiter holds no lock, no guard, no allocation and has sent nothing; nothing the
+  worker or the consumers do waits on it.
+- **The watchdog.** A wait ends only in admission unless NOTHING is freed for `stall_window`
+  (2 s): no byte refunded anywhere (`phys::freed`, counted while a gate watches), no demotion
+  landed, no waiter admitted, no growth of B -- and the worker has completed passes, each with its
+  resettle, since the window began (a late worker is not a stall). The gate is then STALLED and
+  the set acts per `OnStall`: `CacheError::FastTierStalled` (the default); `Divert` (opt-in), built
+  slow with `Placement::Diverted`, placed by its policy -- typically fast, so it LAGS in CXL until
+  its first slow-served hit heals it; the reconcile never corrects it toward fast at its `Set` --
+  or `AdmitOver` (opt-in), admitted fast over the budget. Until the worker sees a byte freed, every
+  waiter and newcomer acts after a 50 ms probe without progress. `stall_window` 0 acts at once.
+
+Load is never an error: bursts wait, at the rate demotions free room, and the waits are what a
+bounded DRAM tier costs (the gate's wait counters and histogram in `HybridStats`). The byte gate
+runs only while its cache is P's only user (`live_tiered_caches() == 1` and no flat fast cache;
+re-read at once when a live count moves); otherwise, and for the lazy-copy LRU and the faithful
+fast-admission pair (whose settles do not bound their DRAM), it is disabled and `gate_state` says
+why. A dead policy worker fails a waiting set with `Internal`. `GateMode::Block` is the default
+(`Off` in the lib's own unit tests, which share one process's P); the metadata cap and structural
+placement run in either mode.
+
 ### `eviction_stacks_pmem`
 
 Moves each stack's lists and per-key map into the slow tier via `crate::Hybrid`. The

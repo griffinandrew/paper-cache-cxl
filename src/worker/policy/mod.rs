@@ -651,6 +651,10 @@ pub mod migration_queue {
 						let mut reconciled_to_slow: u64 = 0;
 
 						while let Ok((key, tier, origin)) = receiver.recv() {
+							// Test builds: a gate test's paused or paced consumers.
+							#[cfg(test)]
+							crate::gate::test_hooks::consumer_wait();
+
 							// Counted on every path out of this iteration.
 							let _done = CountOnDrop(&processed);
 							let _pending = PendingOnDrop(tier);
@@ -658,6 +662,14 @@ pub mod migration_queue {
 
 							if apply_migration(&objects, key, tier) {
 								finish.landed = true;
+
+								// S5 B2: a landed demotion freed fast bytes (the old
+								// copy went when `apply_migration` returned, unless a
+								// reader holds it): a set waiting for them is woken
+								// now. One load when none waits.
+								if tier == Tier::Slow {
+									status.gate().note_demotion();
+								}
 
 								match (origin, tier) {
 									(MigrationOrigin::Stack, Tier::Fast) => completed_promotions += 1,
@@ -1552,6 +1564,10 @@ pub use policy_stack::SetEvent;
 
 // Where a set's value was built, and why (S5): the `Set`'s placement byte.
 pub use policy_stack::Placement;
+
+// The settle target's ratio, for the byte gate's levels (S5, `gate::bands`).
+#[cfg(feature = "hybrid_cache_common")]
+pub(crate) use policy_stack::drain_target;
 #[cfg(feature = "merged_object_store")]
 pub(crate) use policy_stack::clock_hand_budget;
 
@@ -1738,13 +1754,21 @@ enum Observed {
 	/// A hit on the key was served from the slow tier. `quiet`: nothing of the
 	/// key's bucket was in flight -- the heal rule.
 	ServedSlow { key: HashedKey, quiet: bool },
+	/// A `set` the byte gate DIVERTED (S5 B2, `OnStall::Divert`): its value was
+	/// built slow because the fast tier was stalled, and the key is placed by
+	/// its policy. Reconciled as a slow build, except never toward fast: a
+	/// diverted key placed fast LAGS -- in CXL, charged to the fast budget --
+	/// until the heal promotes it on its first slow-served hit, so an untouched
+	/// one costs no copy; and a promotion the stack queued for it while
+	/// handling this `Set` is dropped from the drain (`drain_reconciled`).
+	Diverted { key: HashedKey, fence: bool },
 }
 
 #[cfg(feature = "hybrid_cache_common")]
 impl Observed {
 	fn key(self) -> HashedKey {
 		match self {
-			Observed::Built { key, .. } | Observed::ServedSlow { key, .. } => key,
+			Observed::Built { key, .. } | Observed::ServedSlow { key, .. } | Observed::Diverted { key, .. } => key,
 		}
 	}
 }
@@ -1818,6 +1842,14 @@ fn corrective<E: MigrationEntry>(
 		Observed::ServedSlow { quiet, .. } => {
 			(quiet && placement == Tier::Fast && queued.unwrap_or(Tier::Slow) == Tier::Slow)
 				.then_some((key, Tier::Fast, Reason::Heal))
+		},
+
+		// Built slow on purpose (S5 B2): never corrected toward fast here -- the
+		// heal does that on the key's first slow-served hit -- and toward slow
+		// exactly as any slow build.
+		Observed::Diverted { fence, .. } => match placement {
+			Tier::Fast => None,
+			Tier::Slow => corrective(drain, Observed::Built { key, built: Tier::Slow, fence }, Some(placement)),
 		},
 	}
 }
@@ -2015,6 +2047,11 @@ struct GatePass {
 #[cfg(feature = "hybrid_cache_common")]
 const METADATA_FULL_REFRESH: Duration = Duration::from_millis(100);
 
+/// While a set waits in the byte gate's bytes lane, how many events a batch
+/// handles between two of the pass end's gate steps (S5 B2). A power of two.
+#[cfg(feature = "hybrid_cache_common")]
+const GATE_STEP_EVENTS: u64 = 1_024;
+
 #[cfg(feature = "hybrid_cache_common")]
 impl WorkerMetadata {
 	fn new<K>() -> Self {
@@ -2078,6 +2115,10 @@ where
 		let mut events = Vec::<WorkerEvent>::new();
 
 		loop {
+			// Test builds: a gate test holding the workers.
+			#[cfg(all(test, feature = "hybrid_cache_common"))]
+			crate::gate::test_hooks::worker_hold();
+
 			events.clear();
 			events.extend(self.listener.try_iter());
 
@@ -2219,6 +2260,18 @@ where
 
 					if self.gate_pass.events % 64 == 0 {
 						self.status.gate().set_worker_progress(self.gate_pass.events);
+					}
+
+					// B2: while a set waits for fast bytes, a long batch runs the
+					// pass end's gate step every GATE_STEP_EVENTS events -- the
+					// gauges, M, eff and the byte gate's levels republished, every
+					// settle re-run, the head notified, the pass counted -- so the
+					// waiter is not held to the batch's length (the liveness
+					// review's bound on a pass).
+					if self.gate_pass.events % GATE_STEP_EVENTS == 0 && self.status.gate().bytes_lane.len() > 0 {
+						self.refresh_tier_gauges();
+						self.publish_metadata(false);
+						self.publish_gate();
 					}
 				}
 			}
@@ -2694,7 +2747,7 @@ where
 			let applied = stack.insert_placed(key, size, dram_resident, event, placement);
 
 			#[cfg(feature = "hybrid_cache_common")]
-			if applied == Placement::Structural && placement == Placement::Normal {
+			if applied == Placement::Structural && placement != Placement::Structural {
 				self.status.gate().count_structural_placement();
 			}
 
@@ -2709,7 +2762,10 @@ where
 
 		#[cfg(feature = "hybrid_cache_common")]
 		if self.tier_migration {
-			self.observed.push(Observed::Built { key, built, fence });
+			self.observed.push(match placement {
+				Placement::Diverted => Observed::Diverted { key, fence },
+				_ => Observed::Built { key, built, fence },
+			});
 
 			// S5a: this set's insert may have grown the map's table (any
 			// insert can, at the load limit -- see `crate::meta::ShardState`).
@@ -2968,6 +3024,10 @@ where
 
 			// S5: and the gate's figures from it: L = 0 opens the key ceiling.
 			self.publish_gate();
+
+			// B2: every waiter re-checks against the emptied tier now, not at
+			// its next poll.
+			self.status.gate().wake_waiters();
 		}
 
 		// A client that stopped waiting is no loss.
@@ -3056,6 +3116,17 @@ where
 		};
 
 		let mut migrations = stack.drain_tagged_migrations();
+
+		// A diverted set's value stays in CXL until its first slow-served hit
+		// (S5 B2): a promotion the stack queued for the key while handling its
+		// `Set` -- an overwrite's re-promotion, say -- is dropped, as no
+		// corrective toward fast is queued for it. What the stack places is
+		// unchanged: the key lags, and the audit counts it.
+		for observed in &self.observed {
+			if let Observed::Diverted { key, .. } = *observed {
+				migrations.retain(|&(k, tier, origin)| !(k == key && tier == Tier::Fast && origin == MigrationOrigin::Stack));
+			}
+		}
 
 		for observed in self.observed.drain(..) {
 			// A slow hit whose bucket is busy is not healed, wherever it is
@@ -3259,7 +3330,7 @@ where
 		// asynchronously, so drain it before returning -- unless the test
 		// parks a consumer and drives on (`test_flush`).
 		#[cfg(test)]
-		if let (Some(queue), true) = (migration_queue, self.test_flush) {
+		if let (Some(queue), true) = (migration_queue, self.test_flush && !crate::gate::test_hooks::flush_off()) {
 			queue.flush();
 		}
 	}
@@ -3361,6 +3432,8 @@ where
 
 		let stats = self.status.hybrid_stats();
 		let (pending_demote, pending_promote) = migration_queue::pending();
+		let gate = self.status.gate();
+		let bands = gate.bands();
 
 		let sample = crate::phys::MemtsSample {
 			t_ms: migstats::t_ms(),
@@ -3376,6 +3449,11 @@ where
 			vmrss_kb: crate::phys::vmrss_kb(),
 			live_flat_fast_caches: crate::phys::live_flat_fast_caches(),
 			meta: self.status.dram_metadata_bytes(),
+			s: bands.s,
+			n: bands.n,
+			b: bands.b,
+			waiters: gate.bytes_lane.len() as u64,
+			reserved: gate.reserved(),
 		};
 
 		eprintln!("{}", crate::phys::format_memts(&sample));
@@ -3453,21 +3531,42 @@ where
 	///      new-key path does (the LFU latch, the slow admission queues).
 	///
 	/// Nothing to publish while a flat policy switch has no stack.
+	///
+	/// B2, the byte gate: its state (`byte_gate_state`) and, while it is
+	/// enabled, its levels (`gate::bands`) go out with eff; after the resettle
+	/// the gate's pass (`Gate::worker_pass`): the fold hook installed or
+	/// cleared, waiters released when the gate turns off, a stall ended once
+	/// anything was freed, the head notified, the pass counted -- what the
+	/// watchdog waits for before it calls a window a stall.
 	#[cfg(feature = "hybrid_cache_common")]
 	fn publish_gate(&mut self) {
-		use crate::gate::{self, MetadataModel};
+		use crate::gate::{self, GateState, MetadataModel};
 
 		if !self.tier_migration {
 			return;
 		}
 
+		#[cfg(test)]
+		if self.status.gate().test_panic_on_pass.load(std::sync::atomic::Ordering::Relaxed) {
+			panic!("test: the policy worker dies at a gate pass");
+		}
+
+		// The live counts are read after the epoch, so a registration after
+		// this reading moves the epoch past what the gate records.
+		let epoch = crate::phys::gate_epoch();
+		let state = self.byte_gate_state();
+
 		let gate = self.status.gate();
+		let config = gate.config();
 		let model = gate.model();
-		let floor = gate.config().metadata_floor;
+		let floor = config.metadata_floor;
 		let status = &self.status;
 		let pass = &mut self.gate_pass;
 
-		let Some(stack) = self.policy_stack.as_mut() else { return };
+		let Some(stack) = self.policy_stack.as_mut() else {
+			gate.worker_pass(state, epoch);
+			return;
+		};
 
 		let fast_before = (stack.fast_bytes_used(), stack.fast_object_count());
 		let l_pub = status.live_num_objects();
@@ -3485,6 +3584,10 @@ where
 			MetadataModel::Measured => status.dram_metadata_bytes(),
 			MetadataModel::PerObject => stack.dram_reserved_bytes(),
 		};
+
+		// Test builds: M held where a gate test put it (a table step).
+		#[cfg(test)]
+		let m_model = gate::test_hooks::m_override().unwrap_or(m_model);
 
 		if model == MetadataModel::Measured && pass.pushed != Some(m_model) {
 			stack.set_dram_metadata(Some(m_model));
@@ -3518,9 +3621,12 @@ where
 		let omega = status.hybrid_shared_overhead();
 		let k_max = gate::key_ceiling(model, omega, c_meta, m_model, stack.len() as u64, l_pub, pass.l_hw);
 
+		let bands = (state == GateState::Enabled).then(|| gate::bands(eff, &config));
+
 		gate.publish(
-			gate::Published { model, m_model, eff, eff_small, eff_large, k_max },
+			gate::Published { model, m_model, eff, eff_small, eff_large, k_max, bands },
 			|| status.live_num_objects(),
+			crate::phys::fast_bytes_approx,
 		);
 
 		// The model's sanity check: the measured M against `L * omega`,
@@ -3546,6 +3652,49 @@ where
 
 		if fast_after != fast_before {
 			self.refresh_tier_gauges();
+		}
+
+		// B2: after the resettle queued its demotions.
+		self.status.gate().worker_pass(state, epoch);
+	}
+
+	/// The byte gate's state for this cache now (S5 B2, design 3.9.8): `Off`
+	/// by its configuration; `Bands` when the settle target could not be below
+	/// the near level; `Ungated` for the designs whose settles do not bound
+	/// their DRAM -- the lazy-copy LRU (plan P6) and the faithful S3-FIFO
+	/// fast-admission pair, whose small queue is not clamped to the tier (Q7);
+	/// `NoStack` while a flat policy switch has none; `NotSole` while the cache
+	/// is not P's only user; `Enabled` otherwise.
+	#[cfg(feature = "hybrid_cache_common")]
+	fn byte_gate_state(&self) -> crate::gate::GateState {
+		use crate::gate::{GateMode, GateState};
+
+		let config = self.status.gate().config();
+
+		if config.mode == GateMode::Off {
+			return GateState::Off;
+		}
+
+		if !config.bands_hold() {
+			return GateState::Bands;
+		}
+
+		if matches!(
+			self.status.policy(),
+			PaperPolicy::LruLazyCopyCompactHybrid
+				| PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(..)
+				| PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(..)
+		) {
+			return GateState::Ungated;
+		}
+
+		if self.policy_stack.is_none() {
+			return GateState::NoStack;
+		}
+
+		match crate::phys::sole_fast_user() {
+			true => GateState::Enabled,
+			false => GateState::NotSole,
 		}
 	}
 
@@ -3936,10 +4085,18 @@ where
 	/// whose set wrote the channel, fenced, and reads the bit. So a set either
 	/// finds the bit and wakes this thread, or this thread finds the set and
 	/// does not park: the first set after an idle spell is taken at once, in
-	/// both stores. Nor does it park long while a set waits in the metadata
-	/// lane.
+	/// both stores. Nor does it park long while a set waits in either of the
+	/// gate's lanes: it polls SHORT then (S5 B2).
 	fn delay_event_loop(&mut self, now: Instant, has_current_set: bool) {
 		let delay = polling_delay(now, self.last_set_time, has_current_set);
+
+		// S5 B2: SHORT while a set waits in either lane -- every pass resettles
+		// and notifies the head (design 3.9.10(3)).
+		#[cfg(feature = "hybrid_cache_common")]
+		let delay = match self.status.gate().waiting() {
+			true => SHORT_POLLING_DURATION,
+			false => delay,
+		};
 
 		if has_current_set {
 			self.last_set_time = Some(now);
@@ -3958,7 +4115,7 @@ where
 
 			fence(Ordering::SeqCst);
 
-			if self.listener.is_empty() && gate.meta_lane.len() == 0 {
+			if self.listener.is_empty() && !gate.waiting() {
 				thread::park_timeout(delay);
 			}
 
@@ -6626,6 +6783,11 @@ mod s4_tests;
 // metadata cap, structural slow placement, every settle on eff, the kick.
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod s5_tests;
+
+// Backpressure plan S5, commit B2: the byte gate, through real tiered caches,
+// each test alone in a child process.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod s5_gate_tests;
 
 // S4's follow-ups: a flat cache over the merged store through a real worker,
 // reaper and wipe -- in every merged build, the flat-merged one included.

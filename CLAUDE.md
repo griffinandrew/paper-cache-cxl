@@ -71,8 +71,10 @@ src/
                                live_flat_fast_caches() == 0 (a flat BufferDRAM cache's values
                                are in P too). Also the policy worker's per-pass over-budget
                                integral and the MEMTS line (PAPER_MEMTS=1).
-                               Reporting only; the fast-tier byte gate (S5's second commit)
-                               will read it. Also
+                               Since S5's commit B2 the fast-tier byte gate (gate.rs) acts on
+                               it: every fold re-evaluates the enabled gate's near flag
+                               (GATE_HOOK), and while a set waits a fast refund also counts in
+                               FREED, the watchdog's evidence. Also
                                PlacementAudit, PaperCache::placement_audit()'s answer: every
                                live value's tag against the stack's placement_of -- stranded
                                (in DRAM, placed slow), lagging (in CXL, placed fast),
@@ -110,7 +112,25 @@ src/
                                structural check and the cap read it, and the worker re-runs
                                every settle each pass (resettle). Also the set-path kick's
                                worker_idle bit. PAPER_DISABLE_SHARED_OVERHEAD=1 forces the
-                               per-object model with omega 0.
+                               per-object model with omega 0. Commit B2, the BYTE GATE: a value
+                               to be built fast is held to P + M_model <= F + slack (P <= B),
+                               with the settle target S and a near level N the worker publishes
+                               with eff (bands). Fast path: one relaxed load, for a value under
+                               B - N while no near/closed bit is set; exact path: P and the
+                               reservations; otherwise the set WAITS, FIFO, in the bytes lane,
+                               woken by landed demotions, the worker's pass, released
+                               reservations, a wipe or a grown eff, re-deciding its tier and the
+                               structural check at every wake. The no-progress watchdog
+                               (stall_window: nothing freed, while the worker kept passing)
+                               ends a wait per OnStall: FastTierStalled (default), Divert (built
+                               slow, Placement::Diverted, healed on its first slow hit) or
+                               AdmitOver. GateMode::Block is the default -- Off in the lib's own
+                               unit tests, whose P is shared -- and the gate disables itself
+                               (GateState) unless its cache is P's only user, for the lazy-copy
+                               LRU and the faithful fast-admission pair, and for bands that
+                               cannot hold. Its tests: worker/policy/s5_gate_tests.rs, each
+                               alone in a child process killed at a deadline (test_hooks pause
+                               or pace the consumers, hold the worker, hold M).
   numa_alloc.rs               Node-bound jemalloc arenas. NumaAlloc<NODE_FAST> is the crate's
                                #[global_allocator]; SlowObjects (aliased crate-wide as `Hybrid`)
                                backs the slow tier. Extents are mmap'd then mbind'd before
@@ -180,7 +200,9 @@ src/
                                  (a round trip wipe() waits for, in every store). The LFU
                                  latch is published with the event that moved it (U12).
                                  Since S5's commit B1 a set kicks a worker parked on its
-                                 idle poll (see "Merged-store measurements until S5" below).
+                                 idle poll (see "Merged-store measurements until S5" below),
+                                 and since B2 the worker polls SHORT, never parking long,
+                                 while a set waits in either of the gate's lanes.
       policy_stack/             One file per policy, all implementing the PolicyStack trait.
                                  The 18 *_hybrid_stack.rs files carry each design's algorithm
                                  and its full derivation in the module doc — those are the
@@ -230,7 +252,11 @@ tests/
                                          model, every check holds eff == F - M_model in
                                          every design (the ghost's DRAM included), and
                                          every design but the faithful fast-admission pair
-                                         rests at or under its settle target (T9+).
+                                         rests at or under its settle target (T9+). Since
+                                         B2 its caches run with the byte gate on -- one at a
+                                         time, so it enables: every design's run is a stall
+                                         check -- except T7's, which must outrun the LFU
+                                         latch mirror (GateMode::Off).
   dram_metadata_identity.rs              S5a, under measured_accounting: between two
                                          quiescent points the NODE_FAST pool moves by exactly
                                          M plus P (P in its own pool under
@@ -288,8 +314,8 @@ removal entries near the end of this file.
   charged to the fast tier nor evictable. A worker parked on its idle poll (up to 1 s) linked
   nothing until it woke. The client-side link that bounded the merged fast tier in real time is
   gone; since B1 the first set after an idle spell kicks the worker (the gate's `worker_idle` bit),
-  in both stores, which restores the bound for an idle worker. A set-path wait for fast bytes --
-  the byte gate -- is S5's second commit.
+  in both stores, which restores the bound for an idle worker. Since B2 a set also WAITS for fast
+  bytes (the byte gate): physical fast bytes are held to the budget in real time, in both stores.
 - **The flat-merged matrix cells need rebaselining.** A flat cache over the merged store
   (`merged_object_store` with no hybrid feature, `paper-benchmark-flat-merged`) builds the same
   store handle (`PolicyWorker::new`), so S4 moved its linking and its evictions' candidates onto

@@ -18,8 +18,9 @@
 //! sitting in DRAM, and the gap is not small: on cluster35 merged CLOCK every
 //! stack gauge read 5.26-5.28e9 B (`fast_dram_total` ~5.27 GB for a 5,120 MiB
 //! tier) while node 0 physically peaked at 14,167 MiB (the matrix's numastat
-//! log). This counter is the measurement the backpressure plan's gate (S5)
-//! will act on. In this step nothing reads it to make a decision.
+//! log). This counter is the measurement the backpressure plan's gate acts
+//! on: since S5's commit B2 the byte gate (`crate::gate`) holds a tiered
+//! cache's fast sets to `P + M_model <= F + slack`, reading it here.
 //!
 //! ## What P counts
 //!
@@ -151,11 +152,19 @@
 //! value, every ~128 of a 1 KiB one). A slow value pays one tier-tag branch.
 //! Arithmetic, not a measurement.
 //!
+//! The byte gate (S5, commit B2) adds, per fast refund, one relaxed load of
+//! `GATE_WATCH` -- and while a set waits for fast bytes (or a stall is
+//! unresolved) one relaxed `fetch_add` on the same shard's line of `FREED`,
+//! the watchdog's count of bytes freed -- and, per FOLD, a read lock of
+//! `GATE_HOOK` and the enabled gate's near-flag re-evaluation (a load, and a
+//! `fetch_or`/`fetch_and` of the gate word only when the flag changes).
+//!
 //! Not compiled without `hybrid_cache_common`: a build with no tiers pays
 //! nothing.
 
 use std::{
 	sync::{
+		Arc,
 		OnceLock,
 		atomic::{AtomicI64, AtomicU64, Ordering},
 	},
@@ -202,15 +211,19 @@ impl Counter {
 	}
 
 	/// Adds `delta` to shard `shard % SHARDS`, folding that shard once it
-	/// reaches `FOLD_BYTES` in magnitude.
+	/// reaches `FOLD_BYTES` in magnitude. Returns `approx` after the fold when
+	/// this add folded -- where the byte gate re-evaluates its near flag (S5
+	/// B2, `gate_hook`) -- and `None` otherwise.
 	#[inline]
-	pub(crate) fn add(&self, shard: usize, delta: i64) {
+	pub(crate) fn add(&self, shard: usize, delta: i64) -> Option<i64> {
 		let cell = &self.shards[shard % SHARDS].0;
 		let now = cell.fetch_add(delta, Ordering::Relaxed).wrapping_add(delta);
 
 		if now >= FOLD_BYTES || now <= -FOLD_BYTES {
-			self.fold(cell);
+			return Some(self.fold(cell));
 		}
+
+		None
 	}
 
 	/// Moves a shard's whole balance into `approx`. `swap` takes everything,
@@ -223,13 +236,14 @@ impl Counter {
 	/// reader whose `approx` load sees this add therefore also sees the swap
 	/// when it reads the shard. So a fold in flight can be MISSED by a read
 	/// (the balance in neither place it looked), never counted twice (in
-	/// both). See `exact`.
+	/// both). See `exact`. Returns `approx` as this fold left it.
 	#[cold]
 	#[inline(never)]
-	fn fold(&self, cell: &AtomicI64) {
+	fn fold(&self, cell: &AtomicI64) -> i64 {
 		let taken = cell.swap(0, Ordering::Relaxed);
-		self.approx.0.fetch_add(taken, Ordering::Release);
+		let approx = self.approx.0.fetch_add(taken, Ordering::Release).wrapping_add(taken);
 		self.observe_max(self.exact());
+		approx
 	}
 
 	/// Every shard plus `approx`: the counter's value, exact whenever no
@@ -312,14 +326,25 @@ pub fn value_charge<K>(len: u32) -> u64 {
 /// `TieredValue::new_in`, once the value exists.
 #[inline]
 pub(crate) fn charge(bytes: u64) {
-	PHYS_FAST.add(shard(), bytes as i64);
+	if let Some(approx) = PHYS_FAST.add(shard(), bytes as i64) {
+		gate_hook(approx);
+	}
 }
 
 /// Refunds one fast value allocation. Called once per allocation, by the drop
-/// that frees it.
+/// that frees it. While a byte gate watches (`GATE_WATCH`), the bytes also
+/// count in `FREED`, its watchdog's evidence that something was freed.
 #[inline]
 pub(crate) fn refund(bytes: u64) {
-	PHYS_FAST.add(shard(), -(bytes as i64));
+	let shard = shard();
+
+	if let Some(approx) = PHYS_FAST.add(shard, -(bytes as i64)) {
+		gate_hook(approx);
+	}
+
+	if GATE_WATCH.load(Ordering::Relaxed) != 0 {
+		FREED[shard % SHARDS].0.fetch_add(bytes, Ordering::Relaxed);
+	}
 }
 
 /// P (exact), clamped at zero for reporting.
@@ -414,6 +439,7 @@ impl LiveRegistration {
 
 	fn in_count(count: &'static AtomicU64) -> Self {
 		count.fetch_add(1, Ordering::Relaxed);
+		GATE_EPOCH.fetch_add(1, Ordering::AcqRel);
 		LiveRegistration { count }
 	}
 }
@@ -421,6 +447,90 @@ impl LiveRegistration {
 impl Drop for LiveRegistration {
 	fn drop(&mut self) {
 		self.count.fetch_sub(1, Ordering::Relaxed);
+		GATE_EPOCH.fetch_add(1, Ordering::AcqRel);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the byte gate's hooks (S5, commit B2)
+// ---------------------------------------------------------------------------
+
+/// `E`, the byte gate's bound on `approx`'s error: every shard's unfolded
+/// balance is under `FOLD_BYTES` in magnitude once its last add has returned,
+/// so `P < approx + E` (design 3.9.2-3.9.3) -- up to the adds still in flight.
+pub(crate) const FOLD_ERROR: i64 = SHARDS as i64 * FOLD_BYTES;
+
+/// How many reasons a byte gate has to watch for freed bytes: one per
+/// non-empty bytes lane and one per unresolved stall (`gate::Gate`). While it
+/// is non-zero every fast refund also counts its bytes in `FREED`.
+static GATE_WATCH: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes refunded while a gate watched, sharded like P. Monotonic, and only
+/// its ADVANCE means anything: the watchdog's "something was freed".
+static FREED: [Padded<AtomicU64>; SHARDS] = [const { Padded(AtomicU64::new(0)) }; SHARDS];
+
+/// Moved by every change of a live count (`LiveRegistration`): a byte gate
+/// that sees it move re-reads whether its cache is still P's only user at
+/// once, not at its worker's next pass (design 3.9.8).
+static GATE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The enabled byte gate's shared state, against which every fold
+/// re-evaluates the gate's near flag (`gate::GateShared::on_fold`). At most one
+/// gate is enabled at a time -- enabling requires its cache to be P's only
+/// user -- so one slot. A read lock per fold, never taken with another lock
+/// held by this module; the write lock only by a policy worker installing or
+/// clearing its own gate.
+static GATE_HOOK: std::sync::RwLock<Option<Arc<crate::gate::GateShared>>> = std::sync::RwLock::new(None);
+
+/// A byte gate starts (`true`) or stops (`false`) watching for freed bytes.
+pub(crate) fn watch_freed(on: bool) {
+	match on {
+		true => GATE_WATCH.fetch_add(1, Ordering::AcqRel),
+		false => GATE_WATCH.fetch_sub(1, Ordering::AcqRel),
+	};
+}
+
+/// Bytes refunded while a gate watched (`FREED`), summed over its shards.
+pub(crate) fn freed() -> u64 {
+	FREED.iter().map(|shard| shard.0.load(Ordering::Relaxed)).fold(0, u64::wrapping_add)
+}
+
+/// `GATE_EPOCH`: moved by every live-count change.
+pub(crate) fn gate_epoch() -> u64 {
+	GATE_EPOCH.load(Ordering::Acquire)
+}
+
+/// P describes ONE tiered cache: exactly one is alive and no flat cache with
+/// fast values -- the byte gate's condition (see the module doc).
+pub(crate) fn sole_fast_user() -> bool {
+	live_tiered_caches() == 1 && live_flat_fast_caches() == 0
+}
+
+/// Installs `shared` as the fold hook: its policy worker enabled its gate.
+pub(crate) fn install_gate_hook(shared: &Arc<crate::gate::GateShared>) {
+	*GATE_HOOK.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(shared.clone());
+}
+
+/// Clears the fold hook if it is `shared`'s: its gate was disabled or its
+/// worker exited. Compare-and-clear, so a gate going away never removes
+/// another's.
+pub(crate) fn clear_gate_hook(shared: &Arc<crate::gate::GateShared>) {
+	let mut hook = GATE_HOOK.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+	if hook.as_ref().is_some_and(|installed| Arc::ptr_eq(installed, shared)) {
+		*hook = None;
+	}
+}
+
+/// A fold of P left `approx`: the enabled gate, if any, re-evaluates its near
+/// flag (design 3.9.3).
+#[cold]
+#[inline(never)]
+fn gate_hook(approx: i64) {
+	let hook = GATE_HOOK.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+	if let Some(shared) = hook.as_ref() {
+		shared.on_fold(approx);
 	}
 }
 
@@ -446,10 +556,9 @@ impl Drop for LiveRegistration {
 /// head over-stated), and one that ends inside an interval is charged nothing
 /// for that interval, since the pass closing it sees the tier back under (its
 /// tail dropped). Each error is at most one poll interval of the excursion:
-/// 1 ms while sets are recent (a set within the last 5 s), 1 s otherwise.
-/// Nothing kicks the worker on the set path yet (S5's gate will), so the pass
-/// that first sees a burst after a quiet spell may come up to 1 s after the
-/// burst began, and charges that whole second at the level it sees.
+/// 1 ms while sets are recent (a set within the last 5 s, or a set waiting
+/// in the byte gate), 1 s otherwise. Since S5 the first set after an idle
+/// spell kicks the worker, so a burst is seen within its first pass.
 pub(crate) fn over_budget_increment(
 	phys: i64,
 	live: u64,
@@ -540,9 +649,11 @@ pub(crate) fn memts_due(enabled: bool, last: Option<Instant>, now: Instant) -> b
 	enabled && last.is_none_or(|last| now.saturating_duration_since(last) >= MEMTS_INTERVAL)
 }
 
-/// One MEMTS line's fields -- only what exists at this step. The gate's bands,
-/// waiters and pinned bytes come with the gate and are left OUT until then,
-/// not printed as zeros that would read like a gate that never engaged.
+/// One MEMTS line's fields -- only what exists at this step. The byte gate's
+/// levels, waiters and reservations are in since S5's commit B2 (last, as
+/// every field added after the line's first version); pinned bytes come with
+/// the server's permits (S9) and are left OUT until then, not printed as
+/// zeros that would read like a figure that exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MemtsSample {
 	/// Milliseconds since the policy workers' shared origin: the first cache
@@ -576,6 +687,16 @@ pub(crate) struct MemtsSample {
 	/// DRAM metadata structures hold, beside `fast_metadata_bytes`'s model.
 	/// Last, like every field added after the line's first version.
 	pub meta: u64,
+	/// The byte gate's levels (S5 B2, `gate::bands`): the settle target S, the
+	/// near level N and the close level B, as last published; 0 while the
+	/// gate is not enabled.
+	pub s: u64,
+	pub n: u64,
+	pub b: u64,
+	/// Sets waiting in the gate's bytes lane, and the bytes admitted sets
+	/// hold reserved until their values are built.
+	pub waiters: u64,
+	pub reserved: u64,
 }
 
 /// Pure. `key=value` pairs after a `MEMTS ` prefix, in a fixed order, so a
@@ -589,7 +710,7 @@ pub(crate) fn format_memts(sample: &MemtsSample) -> String {
 	format!(
 		"MEMTS t_ms={} wall_ms={} phys={} eff={} fast_used={} fast_metadata_bytes={} \
 		 over_budget_byte_seconds={} pending_net={} backlog={} live_tiered_caches={} vmrss_kb={} \
-		 live_flat_fast_caches={} meta={}",
+		 live_flat_fast_caches={} meta={} s={} n={} b={} waiters={} reserved={}",
 		sample.t_ms,
 		sample.wall_ms,
 		sample.phys,
@@ -603,6 +724,11 @@ pub(crate) fn format_memts(sample: &MemtsSample) -> String {
 		vmrss,
 		sample.live_flat_fast_caches,
 		sample.meta,
+		sample.s,
+		sample.n,
+		sample.b,
+		sample.waiters,
+		sample.reserved,
 	)
 }
 
@@ -833,7 +959,9 @@ mod tests {
 		assert_eq!(c.approx(), 0, "nothing folded yet");
 
 		let before = c.exact();
-		let torn = c.exact_with(|| c.add(3, 1)); // reaches FOLD_BYTES: folds shard 3
+		let torn = c.exact_with(|| {
+			c.add(3, 1); // reaches FOLD_BYTES: folds shard 3
+		});
 		let after = c.exact();
 
 		assert_eq!((before, after), (FOLD_BYTES + 99, FOLD_BYTES + 100));
@@ -925,13 +1053,19 @@ mod tests {
 			vmrss_kb: Some(123_456),
 			live_flat_fast_caches: 2,
 			meta: 131_072,
+			s: 4_900_000,
+			n: 4_950_000,
+			b: 5_000_000,
+			waiters: 3,
+			reserved: 4_096,
 		};
 
 		assert_eq!(
 			format_memts(&sample),
 			"MEMTS t_ms=1250 wall_ms=1790000000123 phys=-64 eff=5000000 fast_used=4900000 \
 			 fast_metadata_bytes=120000 over_budget_byte_seconds=42 pending_net=-3 backlog=17 \
-			 live_tiered_caches=1 vmrss_kb=123456 live_flat_fast_caches=2 meta=131072",
+			 live_tiered_caches=1 vmrss_kb=123456 live_flat_fast_caches=2 meta=131072 \
+			 s=4900000 n=4950000 b=5000000 waiters=3 reserved=4096",
 		);
 
 		let unread = MemtsSample { vmrss_kb: None, ..sample };
@@ -990,8 +1124,10 @@ mod tests {
 	fn a_live_registration_counts_up_and_down() {
 		static COUNT: AtomicU64 = AtomicU64::new(0);
 
+		let epoch = gate_epoch();
 		let a = LiveRegistration::in_count(&COUNT);
 		assert_eq!(COUNT.load(Ordering::Relaxed), 1);
+		assert!(gate_epoch() > epoch, "a registration moves the byte gate's epoch (S5 B2)");
 
 		let b = LiveRegistration::in_count(&COUNT);
 		assert_eq!(COUNT.load(Ordering::Relaxed), 2);
@@ -999,8 +1135,10 @@ mod tests {
 		drop(a);
 		assert_eq!(COUNT.load(Ordering::Relaxed), 1);
 
+		let epoch = gate_epoch();
 		drop(b);
 		assert_eq!(COUNT.load(Ordering::Relaxed), 0);
+		assert!(gate_epoch() > epoch, "and so does its drop");
 	}
 
 	/// Served-tier hits end to end, through a real cache. FIFO never promotes,

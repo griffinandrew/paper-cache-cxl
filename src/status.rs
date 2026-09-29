@@ -952,6 +952,27 @@ impl AtomicStatus {
 			structural_placements: gate.structural_placements,
 			idle_kicks: gate.idle_kicks,
 			metadata_model_divergence: gate.metadata_model_divergence,
+			gate_state: gate.state,
+			gate_disabled_sets: gate.gate_disabled_sets,
+			gate_slow_paths: gate.gate_slow_paths,
+			gate_waits: gate.gate_waits,
+			gate_wait_ns_total: gate.gate_wait_ns_total,
+			gate_wait_ns_max: gate.gate_wait_ns_max,
+			gate_wait_hist: gate.gate_wait_hist,
+			gate_stalls: gate.gate_stalls,
+			gate_stall_errors: gate.gate_stall_errors,
+			divert_sets: gate.divert_sets,
+			divert_bytes: gate.divert_bytes,
+			admit_over_sets: gate.admit_over_sets,
+			admit_over_bytes: gate.admit_over_bytes,
+			oversize_admits: gate.oversize_admits,
+			near_kicks: gate.near_kicks,
+			max_waiters: gate.max_waiters,
+			waiters: gate.waiters,
+			reserved_bytes: gate.reserved,
+			band_s: gate.bands.s,
+			band_n: gate.bands.n,
+			band_b: gate.bands.b,
 		}
 	}
 
@@ -1213,8 +1234,10 @@ impl AtomicStatus {
 		self.hybrid_admission_latched.store(false, Ordering::Relaxed);
 
 		// The admission counters, with the others. The gate's live state -- its
-		// configuration, the metadata lane and its waiters, the published
-		// figures, the worker's bits -- is not a counter and survives (S5).
+		// configuration, both lanes and their waiters, the reservations, a
+		// stall, the published figures and levels, the worker's bits -- is not a
+		// counter and survives (S5): an outstanding permit's release must find
+		// the reservation it added to.
 		#[cfg(feature = "hybrid_cache_common")]
 		self.gate.reset_counters();
 	}

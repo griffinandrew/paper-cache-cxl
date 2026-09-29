@@ -118,7 +118,7 @@ use std::{
 };
 
 use paper_cache::{
-    phys, BufferDRAM, BufferPMEM, CacheTierSize, GateConfig, HybridStats, MetadataModel,
+    phys, BufferDRAM, BufferPMEM, CacheTierSize, GateConfig, GateMode, HybridStats, MetadataModel,
     PaperCache, PaperPolicy, Tier, TieredBuffer,
 };
 
@@ -256,8 +256,16 @@ impl Design {
     /// identities are written in: `eff = F - M_model`, M_model the stack's
     /// own reservation.
     fn build(self, w: Workload) -> Cache {
+        self.build_with(w, GateConfig::default().mode)
+    }
+
+    /// `build`, with the byte gate's mode (S5 B2): T9 runs with the default,
+    /// `Block` -- one cache at a time, so the gate is on, and every design's
+    /// rest is checked against it -- and T7 with `Off` (see `burst`).
+    fn build_with(self, w: Workload, mode: GateMode) -> Cache {
         let mut gate = GateConfig::default();
         gate.metadata_model = MetadataModel::PerObject;
+        gate.mode = mode;
 
         match self {
             Design::Policy(policy) => Cache::new_with_gate(w.max_size, CacheTierSize::Bytes(w.fast), policy, gate),
@@ -954,7 +962,10 @@ fn burst(design: Design, w: Workload) {
         "{label}: no other cache alive before this one",
     );
 
-    let cache = design.build(w);
+    // The byte gate off (S5 B2, design 0.9): T7 needs its burst to outrun the
+    // LFU latch mirror, and a waiting gate would hold the burst to the rate
+    // demotions free room at, which can erase that precondition.
+    let cache = design.build_with(w, GateMode::Off);
     let mut lens = BTreeMap::new();
     let mut hits = 0u64;
 

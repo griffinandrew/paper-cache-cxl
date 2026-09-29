@@ -319,6 +319,10 @@ pub use crate::worker::policy::Tier;
 // A set's placement byte (S5), for `gate` and the set path.
 pub use crate::worker::policy::Placement;
 
+// The settle target's ratio, for the byte gate's levels (S5 B2).
+#[cfg(feature = "hybrid_cache_common")]
+pub(crate) use crate::worker::policy::drain_target;
+
 // The lock every unit test that drives a migration holds, for `crate::phys`'s
 // served-hit test, which builds a real demoting cache. See its doc.
 #[cfg(all(test, feature = "hybrid_cache_common"))]

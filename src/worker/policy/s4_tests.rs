@@ -1663,6 +1663,17 @@ mod t14 {
 	const OPS_C: usize = 600;
 	const ITEMS_C: [ObjectSize; 6] = [512, 640, 1024, 2048, 4096, 8192];
 
+	/// T14c's gate half (B2): a 64 KiB tier -- eff 56-64 KiB at omega 64 over
+	/// 128 keys, so the settled tier's headroom `B - S` (1.1-1.3 KiB) sits among
+	/// the items: the three smaller are admitted up to B, the larger only on a
+	/// settled tier (OVERSIZE) -- and a cache small enough that sets also evict
+	/// by size.
+	const FAST_G: CacheSize = 64 * 1024;
+	const MAX_SIZE_G: CacheSize = 384 * 1024;
+	const KEYS_G: u64 = 128;
+	const OPS_G: usize = 600;
+	const ITEMS_G: [ObjectSize; 6] = [512, 640, 1024, 2048, 4096, 8192];
+
 	fn key(i: u64) -> HashedKey {
 		(i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 	}
@@ -1706,6 +1717,7 @@ mod t14 {
 		match placement {
 			crate::worker::Placement::Normal => "",
 			crate::worker::Placement::Structural => " structural",
+			crate::worker::Placement::Diverted => " diverted",
 		}
 	}
 
@@ -1717,6 +1729,10 @@ mod t14 {
 		b: bool,
 		/// T14c: the gate's figures and counters in each op's record.
 		c: bool,
+		/// T14c's gate half (B2): the byte gate running, `stall_window` 0, with
+		/// this `on_stall` -- every value to be built fast through it -- and its
+		/// levels, P and counters in each op's record.
+		g: Option<crate::gate::OnStall>,
 		/// The keys `0..keys` the script draws from.
 		keys: u64,
 		worker: Worker,
@@ -1744,6 +1760,32 @@ mod t14 {
 		}
 
 		Published { base_size, resident, built, previous, mark, placement: crate::worker::Placement::Normal }
+	}
+
+	/// T14c's gate half: what `PaperCache::admit_bytes` decides for a value to
+	/// be built fast under `stall_window` 0 -- one attempt at the byte gate
+	/// (`Gate::admit_bytes`), and `on_stall` at once if it would wait
+	/// (`Gate::on_stall`) -- as the tier, placement and reservation to build
+	/// with and a note for the record, or the refusal.
+	#[allow(clippy::type_complexity)]
+	fn gate_bytes(
+		status: &AtomicStatus,
+		len: usize,
+		on_stall: crate::gate::OnStall,
+	) -> Result<(Tier, crate::worker::Placement, crate::gate::Reservation<'_>, &'static str), String> {
+		use crate::gate::Bytes;
+
+		let gate = status.gate();
+		let v = crate::phys::value_charge::<u64>(len as ObjectSize);
+
+		match gate.admit_bytes(v, false, crate::phys::fast_bytes_signed, || {}) {
+			Bytes::Admit(reservation) => Ok((Fast, crate::worker::Placement::Normal, reservation, "")),
+
+			Bytes::Wait => match gate.on_stall(v, on_stall) {
+				Ok((tier, placement, reservation)) => Ok((tier, placement, reservation, " would-wait")),
+				Err(error) => Err(format!("refused {error:?}")),
+			},
+		}
 	}
 
 	impl Run {
@@ -1805,7 +1847,7 @@ mod t14 {
 
 			let index = (0..keys).map(|i| (key(i), i)).collect();
 
-			Run { policy, tiered, b, c, keys, worker, objects, index, lines: Vec::new() }
+			Run { policy, tiered, b, c, g: None, keys, worker, objects, index, lines: Vec::new() }
 		}
 
 		fn live(&self, i: u64) -> bool {
@@ -1890,13 +1932,27 @@ mod t14 {
 				Err(refused) => return format!("set k{i} {item} {refused}"),
 			};
 
+			// T14c's gate half: a value to be built fast, through the byte gate;
+			// its reservation held until the value is built, as `commit` does.
+			let status = self.worker.status.clone();
+
+			let (built, placement, reservation, note) = match self.g {
+				Some(on_stall) if built == Fast => match gate_bytes(&status, value_len(item), on_stall) {
+					Ok(decided) => decided,
+					Err(refused) => return format!("set k{i} {item} {refused}"),
+				},
+
+				_ => (built, placement, crate::gate::Reservation::none(), ""),
+			};
+
 			let mut published = publish(&self.worker.status, &self.worker.overhead_manager, &self.objects, k, value_len(item), built);
 			published.placement = placement;
+			drop(reservation);
 			let kind = if published.fresh() { "set" } else { "overwrite" };
 
 			handle(&mut self.worker, k, published);
 
-			format!("{kind} k{i} {item} built {}{}", tier(built), placed(placement))
+			format!("{kind} k{i} {item} built {}{}{note}", tier(built), placed(placement))
 		}
 
 		/// The client's get, as `PaperCache::get` does it, then its event.
@@ -1998,6 +2054,89 @@ mod t14 {
 				}
 
 				what.push(format!("k{i} {item} built {}", tier(built)));
+			}
+
+			format!("burst {}", what.join(" "))
+		}
+
+		/// T14c's gate half: the byte gate on -- `stall_window` 0, so a set that
+		/// would wait takes `on_stall` at once -- and published before the first
+		/// op. The harness's status must be the process's only tiered cache for
+		/// the gate to enable: the scripts run alone, in a child process.
+		fn gate(&mut self, on_stall: crate::gate::OnStall) {
+			let status = self.worker.status.clone();
+			let mut config = status.gate().config();
+
+			config.mode = crate::gate::GateMode::Block;
+			config.stall_window = std::time::Duration::ZERO;
+			config.on_stall = on_stall;
+			status.gate().set_config(config);
+
+			self.g = Some(on_stall);
+			self.worker.publish_metadata(false);
+			self.worker.publish_gate();
+
+			assert_eq!(
+				status.gate().state(),
+				crate::gate::GateState::Enabled,
+				"{}: the byte gate did not enable (is this the only tiered cache alive?)",
+				self.policy,
+			);
+		}
+
+		/// T14c's gate half: new keys all published -- each through the byte
+		/// gate, against the P the ones before it left -- before the worker takes
+		/// the first, as a client's burst outruns the worker; then each `Set`
+		/// handled with its own drain (the last one's is the step's). The later
+		/// values of a burst find the tier over its close level and take
+		/// `on_stall` (`Error`: refused, nothing built or sent).
+		fn burst_g(&mut self, keys: &[(u64, ObjectSize)]) -> String {
+			let mut published: Vec<(u64, Published)> = Vec::new();
+			let mut what = Vec::new();
+
+			for &(i, item) in keys {
+				let k = key(i);
+
+				let (built, placement) = match self.admit(k, value_len(item)) {
+					Ok(decision) => decision,
+
+					Err(refused) => {
+						what.push(format!("k{i} {item} {refused}"));
+						continue;
+					},
+				};
+
+				let status = self.worker.status.clone();
+
+				let (built, placement, reservation, note) = match self.g {
+					Some(on_stall) if built == Fast => match gate_bytes(&status, value_len(item), on_stall) {
+						Ok(decided) => decided,
+
+						Err(refused) => {
+							what.push(format!("k{i} {item} {refused}"));
+							continue;
+						},
+					},
+
+					_ => (built, placement, crate::gate::Reservation::none(), ""),
+				};
+
+				let mut set = publish(&self.worker.status, &self.worker.overhead_manager, &self.objects, k, value_len(item), built);
+				set.placement = placement;
+				drop(reservation);
+
+				what.push(format!("k{i} {item} built {}{}{note}", tier(built), placed(placement)));
+				published.push((i, set));
+			}
+
+			let last = published.len().saturating_sub(1);
+
+			for (n, (i, set)) in published.into_iter().enumerate() {
+				handle(&mut self.worker, key(i), set);
+
+				if n < last {
+					self.worker.apply_tier_migrations();
+				}
 			}
 
 			format!("burst {}", what.join(" "))
@@ -2107,8 +2246,29 @@ mod t14 {
 				false => String::new(),
 			};
 
+			// T14c's gate half: P and the byte gate's levels, counters and the
+			// keys lagging by a divert.
+			let bytes = match self.g {
+				Some(_) => format!(
+					" | bytes p={} s={} n={} b={} reserved={} state={:?} errors={} diverts={} overs={} oversize={} lagging={}",
+					crate::phys::fast_bytes_signed(),
+					s.band_s,
+					s.band_n,
+					s.band_b,
+					s.reserved_bytes,
+					s.gate_state,
+					s.gate_stall_errors,
+					s.divert_sets,
+					s.admit_over_sets,
+					s.oversize_admits,
+					self.worker.placement_audit().lagging,
+				),
+
+				None => String::new(),
+			};
+
 			self.lines.push(format!(
-				"op {n} {what} | drain [{}] | evicted [{}] | drain2 [{}] | placement {placements} | stats fo={} so={} fb={} sb={} meta={} promo={} demo={} evict={} rafast={} raslow={} fasthits={} slowhits={} latched={} used={used} live={}{gate}",
+				"op {n} {what} | drain [{}] | evicted [{}] | drain2 [{}] | placement {placements} | stats fo={} so={} fb={} sb={} meta={} promo={} demo={} evict={} rafast={} raslow={} fasthits={} slowhits={} latched={} used={used} live={}{gate}{bytes}",
 				self.entries(&drain),
 				self.names(&evicted),
 				self.entries(&drain2),
@@ -2134,7 +2294,19 @@ mod t14 {
 
 			if self.tiered {
 				let audit = self.worker.placement_audit();
-				assert!(audit.is_clean(), "{} op {n} ({what}): {audit:?}", self.policy);
+
+				// A diverted key LAGS by design (B2): its value in CXL, the key
+				// placed by its policy, until its first slow-served hit heals it.
+				// Nothing may be stranded or untracked all the same.
+				match self.g {
+					Some(crate::gate::OnStall::Divert) => assert!(
+						audit.stranded == 0 && audit.untracked == 0,
+						"{} op {n} ({what}): {audit:?}",
+						self.policy,
+					),
+
+					_ => assert!(audit.is_clean(), "{} op {n} ({what}): {audit:?}", self.policy),
+				}
 			}
 
 			charges_exact(&self.objects, true);
@@ -2353,6 +2525,101 @@ mod t14 {
 		emit(name, &run.lines, OPS_C);
 	}
 
+	/// T14c's gate half (S5, B2): T14c's mix with the byte gate running -- every
+	/// value to be built fast through it (`gate_bytes`) -- and BURSTS of two to
+	/// six new keys published before the worker takes the first, which take P
+	/// over the close level; `stall_window` 0, so a set that would wait takes its
+	/// `on_stall` action at once and one thread records every would-wait
+	/// deterministically. Resizes move eff, and with it the levels, both ways.
+	/// Every other op ends settled -- the pass end's resettle and the inline
+	/// landings take P back to S -- so it is the bursts that find the gate
+	/// closed, and the oversize items that find the tier unsettled.
+	fn script_g(name: &str, policy: PaperPolicy, seed: u64, on_stall: crate::gate::OnStall) {
+		// Its inline landings count in the process-wide migration counters,
+		// which other tests assert exact deltas on under this lock.
+		let _serialised = migration_test_lock::lock();
+		let _overheads = test_overheads::set(OMEGA, PER_OBJECT);
+
+		let mut run = Run::with(policy, true, false, true, FAST_G, MAX_SIZE_G, KEYS_G, MetadataOverflow::Error);
+		run.gate(on_stall);
+
+		let mut rng = Rng(seed);
+
+		for n in 0..OPS_G {
+			let r = rng.below(100);
+			let i = rng.below(KEYS_G);
+			let item = ITEMS_G[rng.below(ITEMS_G.len() as u64) as usize];
+			let live = |run: &Run, from: u64| (0..KEYS_G).map(|d| (from + d) % KEYS_G).find(|&j| run.live(j));
+
+			match r {
+				// A set: of a new key or an overwrite.
+				0..30 => run.step(n, |run| run.set(i, item), None),
+
+				// An overwrite of a live key with any item.
+				30..42 => match live(&run, i) {
+					Some(j) => run.step(n, |run| run.set(j, item), Some(j)),
+					None => run.step(n, |run| run.set(i, item), None),
+				},
+
+				// A get: diverted keys' first slow hits among them.
+				42..62 => run.step(n, |run| run.get(i), Some(i)),
+
+				// A delete of a live key.
+				62..70 => match live(&run, i) {
+					Some(j) => run.step(n, |run| run.del(j), None),
+					None => run.step(n, |run| run.get(i), Some(i)),
+				},
+
+				// A burst of two to six new keys, distinct, from `i` on.
+				70..92 => {
+					let count = 2 + rng.below(5) as usize;
+					let mut keys = Vec::new();
+
+					for d in 0..KEYS_G {
+						let j = (i + d) % KEYS_G;
+
+						if keys.len() == count {
+							break;
+						}
+
+						if !run.live(j) {
+							keys.push((j, ITEMS_G[rng.below(ITEMS_G.len() as u64) as usize]));
+						}
+					}
+
+					run.step(n, |run| run.burst_g(&keys), None);
+				},
+
+				// The fast tier resized within [32, 64] KiB: eff and the levels move.
+				92..97 => {
+					let size = FAST_G / 2 + rng.below(FAST_G / 2 + 1);
+
+					run.step(n, |run| {
+						run.worker.status.set_fast_tier_capacity(size);
+						run.worker.handle_resize_fast_tier(size);
+						format!("resize_fast_tier {size}")
+					}, None);
+				},
+
+				// The cache's size: shrunk by up to a quarter, or restored.
+				_ => {
+					let size = match rng.below(2) {
+						0 => MAX_SIZE_G - rng.below(MAX_SIZE_G / 4),
+						_ => MAX_SIZE_G,
+					};
+
+					run.step(n, |run| {
+						run.worker.status.set_max_size(size);
+						run.worker.handle_resize(size);
+						format!("resize {size}")
+					}, None);
+				},
+			}
+		}
+
+		emit(name, &run.lines, OPS_G);
+	}
+
 	/// One T14b op. Over T14's mix: sets whose value has already expired, the
 	/// reaper's take of one and its `Expire`, bursts of three new keys
 	/// published before the worker takes the first, and wipes; deletes only of
@@ -2528,6 +2795,31 @@ mod t14 {
 			script_c(&format!("{name}-c"), policy, seed, MetadataOverflow::Error);
 			script_c(&format!("{name}-c-evict"), policy, seed + 10, MetadataOverflow::EvictToFit);
 		}
+	}
+
+	/// T14c's gate half (S5, B2): the byte gate's decisions -- admitted,
+	/// reserved, oversize, would-wait and the `on_stall` taken -- through the
+	/// differential, per order, one file per `on_stall`:
+	/// `<order>-g-error.txt`, `<order>-g-divert.txt`, `<order>-g-over.txt`. P is
+	/// process-global, so the scripts run alone in a child process, where the
+	/// harness's status is the only tiered cache registered and the gate
+	/// enables.
+	#[test]
+	fn t14c_gate_scripts_match_across_stores() {
+		super::super::s5_gate_tests::alone_in(module_path!(), "t14c_gate_scripts_match_across_stores", || {
+			use crate::gate::OnStall;
+
+			for (name, policy, seed) in [
+				("lru", PaperPolicy::LruCompactHybrid, 51),
+				("fifo", PaperPolicy::FifoCompactHybrid, 52),
+				("clock", PaperPolicy::ClockCompactHybrid, 53),
+				("lfu", PaperPolicy::LfuCompactHybrid, 54),
+			] {
+				script_g(&format!("{name}-g-error"), policy, seed, OnStall::Error);
+				script_g(&format!("{name}-g-divert"), policy, seed + 10, OnStall::Divert);
+				script_g(&format!("{name}-g-over"), policy, seed + 20, OnStall::AdmitOver);
+			}
+		});
 	}
 
 	/// The flat caches -- the other half of the merged store's use: the same

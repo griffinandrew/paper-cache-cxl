@@ -57,6 +57,15 @@ pub enum CacheError {
 	#[error("invalid admission (gate) configuration")]
 	InvalidGateConfig,
 
+	/// A set waited for room in the fast tier and NOTHING was freed for the
+	/// byte gate's `stall_window` -- no demotion landed, no byte was
+	/// refunded, while the policy worker kept passing: a stuck state (a dead
+	/// migration consumer, bytes pinned by readers, a bug), not load, and the
+	/// cache's `on_stall` is `Error` (the default). Nothing was allocated or
+	/// sent (S5).
+	#[error("the fast tier freed nothing for the gate's stall window")]
+	FastTierStalled,
+
 	/// This BUILD cannot honour the policy, which is not the same thing as the
 	/// policy being unparseable -- `InvalidPolicy` already means that, and
 	/// conflating the two would report a typo and an unimplemented eviction

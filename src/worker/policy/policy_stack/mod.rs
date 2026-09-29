@@ -312,6 +312,17 @@ pub enum Placement {
 	/// its place in the policy's order, and never promotes it while it stays
 	/// that large (`gate::decide`, step 3).
 	Structural,
+
+	/// Built slow by the byte gate's opt-in `OnStall::Divert`: the fast tier
+	/// freed nothing for the gate's window (S5, commit B2). Placed by the
+	/// design's policy exactly as a `Normal` set -- a divert changes where the
+	/// bytes are, not the policy -- so the key is typically LAGGING (in CXL,
+	/// placed fast) until its first slow-served hit heals it; the worker's
+	/// reconcile never corrects it toward fast at its `Set`, and drops a
+	/// promotion the stack queued for it there (`Observed::Diverted`). Built
+	/// only by the byte gate: never in a build without tiers.
+	#[cfg_attr(not(feature = "hybrid_cache_common"), allow(dead_code))]
+	Diverted,
 }
 
 /// The nearest key at or before `start`, toward the front of its queue, that
