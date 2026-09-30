@@ -1042,12 +1042,15 @@ impl Config {
 		//
 		// Setting a hybrid policy's fast tier equal to its max size does NOT
 		// give a DRAM-only cache. The fast tier is drained continuously to
-		// drain_target::ratio() of its capacity while eviction only fires at
-		// 1.00, so the slow tier becomes a victim queue holding the last 2%
-		// and every eviction is routed through a demotion. Measured on
-		// low_alpha_cold at 6 GB with lru-compact-hybrid: 119 MB and 6,684
-		// objects left on node 1, and demotions 2,515,180 == evictions
-		// 2,484,317 + promotions 30,863, an exact conservation identity.
+		// drain_target::ratio() of its capacity while eviction fires at
+		// its own level (eviction_watermarks, 0.98 of max_size), so the slow
+		// tier becomes a victim queue holding whatever lies between the two
+		// and every eviction is routed through a demotion. Measured at the
+		// pre-E1/E1b defaults (drain target 0.98, eviction only at 1.00, so
+		// the last 2%) on low_alpha_cold at 6 GB with lru-compact-hybrid:
+		// 119 MB and 6,684 objects left on node 1, and demotions 2,515,180
+		// == evictions 2,484,317 + promotions 30,863, an exact conservation
+		// identity.
 		//
 		// So the guard is a warning, not an error. PaperCache::new accepts any
 		// policy; the tier report just shows an empty slow tier for a flat one.

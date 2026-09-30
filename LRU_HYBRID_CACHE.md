@@ -151,7 +151,7 @@ next demotion candidate — and maintains it incrementally using `HashList::befo
   in `migrations`, then immediately run the same `settle_fast_tier` demotion check — a promotion
   can cascade into demoting whatever is now the fast tier's new least-recently-used key.
 - **Eviction** (`evict_one`, called by the existing generic `apply_evictions` loop whenever overall
-  `status.used_size() > max_size`): pops the absolute tail of the recency list. Once any demotion
+  `status.used_size()` is above the eviction watermark, 98% of `max_size` by default): pops the absolute tail of the recency list. Once any demotion
   has ever happened, that tail is guaranteed to be a `Slow` key (nothing Fast can be behind a Slow
   key, by the same invariant). If the whole working set still fits in the fast tier (no demotion
   has happened yet), this degrades gracefully to evicting the Fast tail instead of panicking or

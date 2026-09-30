@@ -231,8 +231,11 @@ tier for it. 0.98 keeps the headroom and pays for it once.
 > through a `OnceLock`, so it is startup configuration; a value that fails to parse or falls
 > outside `(0.0, 1.0]` is silently replaced by the default. `1.0` gives no headroom at all.
 
-`eviction_watermarks` in `worker/policy/mod.rs` is a separate, opt-in pair for capacity eviction
-whose defaults were always 1.0 / 1.0.
+`eviction_watermarks` in `worker/policy/mod.rs` is the cache-wide counterpart, for capacity
+eviction, and a separate pair: by default ONE threshold at 0.98 of `max_size` (E1), armed and
+drained to the same level like the fast tier's, one object at a time. Its defaults were 1.0 / 1.0
+until E1, and the published results were measured there. `EVICTION_HIGH_WATERMARK` and
+`EVICTION_LOW_WATERMARK` override it; `EVICTION_HIGH_WATERMARK=1.0` alone is the old cap.
 
 #### Measured
 

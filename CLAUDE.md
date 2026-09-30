@@ -177,8 +177,11 @@ src/
                                 waits for it).
     policy/
       mod.rs                    PolicyWorker — drives the active PolicyStack, applies tier
-                                 migrations (demotions before promotions), runs evictions. Also
-                                 holds two submodules: `migration_queue` (the standing
+                                 migrations (demotions before promotions), runs evictions
+                                 (`apply_evictions`: one cache-wide threshold, 0.98 of max_size
+                                 by default -- `eviction_watermarks`, env EVICTION_HIGH_WATERMARK
+                                 / EVICTION_LOW_WATERMARK; 1.0 is the old evict-above-the-cap).
+                                 Also holds two submodules: `migration_queue` (the standing
                                  consumer pool that actually performs the byte moves, one
                                  channel per consumer sharded by key hash, 2 threads by
                                  default) and `migstats` (the MIGSTATS
@@ -3403,3 +3406,34 @@ statements read 40. Tests: every test that ran several policies in one process r
 child process of its own (the process-global counters outlive a cache); the integration binaries
 share `tests/common` (and CLOCK has one); the worker tests share `worker/policy/test_support.rs`;
 the merged store's fidelity tests share one fixture.
+
+## A cache-wide eviction watermark, 0.98 of max_size by default (E1)
+
+A deliberate behaviour change (the user's decision of 2026-09-29). `apply_evictions` arms once
+`used_size` passes 98% of `max_size` and drains to the same 98%, one object at a time -- one
+threshold, the fast tier's shape, no high/low band -- where it used to settle exactly at the cap.
+The mechanism is `eviction_watermarks` (`worker/policy/mod.rs`); its defaults were 1.0 / 1.0 and
+its doc said they must stay there, because the published sweeps were measured at the cap. That is
+superseded: the published results were measured at the OLD default, and S10 rebaselines them.
+
+There is one capacity-eviction loop, so the mark applies to every cache: tiered and flat, over the
+DashMap store and the merged store, and `resize` moves it (it is read against `max_size()` on every
+pass). `MakeRoom` frees keys under the metadata ceiling, not bytes, and is untouched; the byte gate
+bounds the fast tier's bytes and is independent of this bound on the whole cache. Environment:
+`EVICTION_HIGH_WATERMARK` (default 0.98; `1.0` is the old cap) and `EVICTION_LOW_WATERMARK`
+(default: the high mark, so one threshold; set below it, a band, with its bursts). An unset low
+mark follows the high one, as it always did, so `EVICTION_HIGH_WATERMARK=1.0` alone restores the
+old behaviour.
+
+Tests: the two watermark tests that asserted the 1.0/1.0 default became tests of the 0.98 default
+(a flat and a tiered cache, one eviction per set at the steady state, a burst drained in one pass to
+the same level, a `resize`) and of the override to 1.0; `evict_one_key` (a test helper that sets the
+cap one byte under `used_size`) pins the mark to the cap for its pass, since at 0.98 it would take
+every key above the mark. Nothing else changed its expectation. T14: 24 of the 32 files changed
+(evictions begin earlier), D = M and TD = TM on the new ones; the eight `-c` and `-c-evict` files did
+not (their used size never passes 98% of the cache's size at any op; the victims in `-c-evict` are
+`MakeRoom`'s).
+
+A known edge, left for a decision: a set is refused only above `max_size`, so a value whose accounted
+size lands between 98% and 100% of it is accepted and then evicted at once, with the rest of the
+cache (before E1 that needed the value to be within the per-object overhead of the cap).

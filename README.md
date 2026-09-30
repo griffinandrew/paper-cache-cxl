@@ -121,6 +121,14 @@ set(k, v) ──WorkerEvent──> policy stack decides tiers
   back at it. One threshold, not a band — a settle moves only what the event that triggered it
   displaced. The 2% margin is headroom for the DRAM a burst of `set()`s puts down before the
   policy worker sees it, and for demotions still queued behind `migration_queue`.
+- **Eviction watermark.** Capacity eviction is held at `EVICTION_HIGH_WATERMARK` (0.98) of
+  `max_size`, cache-wide: evictions start once `used_size` passes 98% of the cap and drain to the
+  same level, one object at a time (the fast tier's shape: one threshold, not a band). It is read
+  against the current `max_size` on every pass, so `resize` moves it, and it is the same for
+  tiered and flat caches and for both object stores. It is separate from the drain target above
+  (which holds the fast tier, not the cache) and from the byte gate (which bounds the fast tier's
+  bytes). Before this default the cache settled exactly at `max_size`; set
+  `EVICTION_HIGH_WATERMARK=1.0` to reproduce that (published results predate the change).
 - **`migration_queue`** (`worker/policy/mod.rs`) is a standing pool of consumer threads that
   perform the allocate-copy-swap off the worker. It has **one channel per consumer, indexed by
   key hash**, so two migrations for the same key can never be applied out of order. On by
@@ -279,6 +287,8 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 |---|---|---|
 | `MIGRATION_QUEUE_THREADS` | `2` | Migration consumer count. `0` disables the queue and applies migrations inline on the worker. |
 | `FAST_TIER_DRAIN_TARGET` | `0.98` | Fraction of the effective fast-tier budget the tier is continuously held at. `1.0` leaves no burst headroom. |
+| `EVICTION_HIGH_WATERMARK` | `0.98` | Fraction of `max_size` above which capacity eviction starts, in `(0, 1]`. `1.0` evicts only past `max_size`, the behaviour before the 0.98 default. |
+| `EVICTION_LOW_WATERMARK` | the high mark | Fraction of `max_size` an armed eviction pass drains to, clamped to at most the high mark. Unset, it follows the high mark: one threshold. Set below it, the pass is a band and evicts in bursts. |
 | `NUMA_ARENAS_PER_NODE` | `8` | jemalloc arenas per node (clamped to 32). Swept on cluster12: a single arena costs 5% of SET latency at one client and 27% at sixteen, while 8→32 buys 1–2%, inside the run-to-run spread. |
 | `PAPER_CACHE_EVICTION_STACK_CAPACITY` | — | Pre-sizes the eviction stack's backing collections. |
 

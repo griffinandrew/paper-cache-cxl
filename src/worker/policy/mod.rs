@@ -1254,61 +1254,112 @@ pub mod migstats {
 	}
 }
 
-/// Capacity-eviction watermarks, for `apply_evictions`' `over_max_size` loop.
+/// Capacity-eviction watermarks, for `apply_evictions`' `over_max_size` loop:
+/// the cache-wide level a cache's `used_size` is held at, as a fraction of
+/// its `max_size`.
 ///
-/// That loop drains to exactly `max_size` one object at a time, so a cache
-/// sitting at capacity re-enters the whole eviction machinery on *every*
-/// subsequent set to free a single object -- the same batch-of-one shape a
-/// high/low band once batched for fast-tier demotions (that band is gone; the
-/// hybrid stacks now hold one continuous threshold, `policy_stack::drain_target`,
-/// at 0.98 of their budget). With watermarks a pass
-/// arms only once usage crosses `high * max_size`, and then drains to
-/// `low * max_size` in one go.
+/// THE DEFAULT (E1, the user's decision of 2026-09-29) IS ONE THRESHOLD AT
+/// 0.98: a pass arms once `used_size` passes 98% of `max_size` and drains to
+/// the same 98%, one object at a time -- so a full cache steady-states just
+/// under its budget, evicting only what each set added, and never rests at the
+/// cap itself. It is the fast tier's shape (`policy_stack::drain_target`: one
+/// continuous threshold, armed and drained at the same number) and for the
+/// same reason there is no high/low band by default: a band arms high, then
+/// drains low in one go, and that is a burst of evictions per pass (see
+/// `drain_target` for what the same gap cost the fast tier). The 2% is the
+/// cache's own headroom under `max_size`: the client charges a set's bytes
+/// before the worker evicts for them, so a burst of sets between two passes
+/// lands in the margin rather than past the cap.
 ///
-/// THE DEFAULTS ARE 1.0/1.0 AND MUST STAY THAT WAY. Both thresholds are then
-/// `max_size` exactly and the loop is the pre-watermark
-/// `while used_size > max_size`, object for object. Every published sweep
-/// (`results/policy_sweep_110_cells.md` and the others beside it) was measured
-/// against a cache that settles exactly at the cap; a default that evicted
-/// deeper would leave those numbers parsing perfectly and describing code that
-/// no longer exists. The feature is strictly opt-in, via
-/// `EVICTION_HIGH_WATERMARK` / `EVICTION_LOW_WATERMARK`.
+/// It applies per cache and to every eviction path, because there is only one:
+/// `apply_evictions` runs after every event of every cache -- tiered and flat,
+/// over the DashMap store and over the merged store alike (the merged store
+/// evicts through the same `evict_one`/`erase` pairing, see
+/// `MergedStackHandle`) -- and reads the mark against `max_size()` on every
+/// call, so a runtime `resize` moves it with the cap. `MakeRoom` is not a
+/// capacity eviction: it frees KEYS under the metadata key ceiling, and
+/// `Set` never evicts on the client. Tiered and flat caches are therefore held
+/// at one operating point (98% of `max_size`), so a tiered-versus-flat
+/// comparison is not skewed by where each rests. It is independent of the
+/// byte gate: the gate bounds the FAST TIER's bytes (`drain_target` of
+/// `eff`, closed at `B`), this bounds the WHOLE cache's `used_size`.
+///
+/// One consequence to know: a set is refused only above `max_size`
+/// (`ExceedingValueSize`), so a value whose accounted size lands between 98% of
+/// `max_size` and `max_size` is accepted, puts `used_size` over the threshold
+/// at once, and the pass that follows evicts everything else and then the
+/// value itself. That window was only the per-object overhead wide before E1
+/// (the refusal compares the base size with `max_size`, `used_size` adds the
+/// policy's overhead); it is 2% of `max_size` now. The refusal was left where
+/// it is.
+///
+/// Until E1 the defaults were 1.0/1.0 and this doc said they MUST STAY there,
+/// because every published sweep (`results/policy_sweep_110_cells.md` and the
+/// others beside it) was measured against a cache that settles exactly at the
+/// cap. That reason is superseded by the user's decision: a default that
+/// evicts 2% earlier changes every measured hit ratio a little, and the
+/// published results were measured at the OLD default -- S10 rebaselines
+/// them. To reproduce one, set `EVICTION_HIGH_WATERMARK=1.0`.
+///
+/// Environment (read once per process):
+///   * `EVICTION_HIGH_WATERMARK`: the arming level, a fraction of `max_size`
+///     in `(0.0, 1.0]`; anything else is ignored. Default 0.98. `1.0` is the
+///     pre-E1 `while used_size > max_size`, object for object.
+///   * `EVICTION_LOW_WATERMARK`: the level an armed pass drains to, same
+///     range, clamped to at most the arming level. Default: the arming level
+///     itself, whatever it is -- so `EVICTION_HIGH_WATERMARK=1.0` alone gives
+///     back the old behaviour, and only setting this BELOW the arming level
+///     makes a band (with its bursts).
 ///
 /// Deliberately its own pair, and not shared with the hybrid stacks'
-/// fast-tier settle. That settle is a SINGLE threshold -- `drain_target`, 0.98
-/// of the effective fast-tier budget -- armed and drained to the same number,
-/// so the tier steady-states just under its budget with 2% of burst headroom.
-/// It is not a band, and it says nothing about how far past `max_size` the
-/// cache as a whole may be trimmed.
+/// fast-tier settle: that one is `drain_target` (0.98 of the effective
+/// fast-tier budget, `FAST_TIER_DRAIN_TARGET`), and it says nothing about how
+/// full the cache as a whole may be.
 pub mod eviction_watermarks {
 	use std::sync::OnceLock;
 
 	use crate::CacheSize;
 
-	pub const DEFAULT_HIGH: f64 = 1.0;
-	pub const DEFAULT_LOW: f64 = 1.0;
+	/// The arming level: one threshold for the whole cache, 98% of `max_size`.
+	pub const DEFAULT_HIGH: f64 = 0.98;
 
 	static HIGH: OnceLock<f64> = OnceLock::new();
 	static LOW: OnceLock<f64> = OnceLock::new();
 
-	fn read(var: &str, default: f64) -> f64 {
+	/// A fraction of `max_size` from the environment: unset, unparsable or
+	/// outside `(0.0, 1.0]` is `None`.
+	fn read(var: &str) -> Option<f64> {
 		std::env::var(var)
 			.ok()
 			.and_then(|v| v.parse::<f64>().ok())
 			.filter(|v| *v > 0.0 && *v <= 1.0)
-			.unwrap_or(default)
+	}
+
+	/// The pair the environment asks for: an unset arming level is the
+	/// default, and an unset drain level is the arming level -- one threshold
+	/// -- before the clamp to it.
+	///
+	/// A drain level that defaulted to 0.98 instead would turn
+	/// `EVICTION_HIGH_WATERMARK=1.0` alone into a 1.0 -> 0.98 band. Following
+	/// the arming level is what every override did before E1 as well (the old
+	/// default of 1.0 was clamped down to whatever the arming level was), so
+	/// an existing single-variable setting keeps its meaning.
+	pub(crate) fn resolve(high: Option<f64>, low: Option<f64>) -> (f64, f64) {
+		let high = high.unwrap_or(DEFAULT_HIGH);
+
+		(high, clamped_low(high, low.unwrap_or(high)))
 	}
 
 	/// Fraction of `max_size` above which a capacity-eviction pass arms.
-	/// `1.0` (the default) arms at the cap, exactly as before this existed.
+	/// `1.0` arms at the cap, as before E1.
 	pub fn high() -> f64 {
-		*HIGH.get_or_init(|| read("EVICTION_HIGH_WATERMARK", DEFAULT_HIGH))
+		*HIGH.get_or_init(|| resolve(read("EVICTION_HIGH_WATERMARK"), read("EVICTION_LOW_WATERMARK")).0)
 	}
 
 	/// Fraction of `max_size` an armed pass drains down to. Clamped to at
 	/// most `high()` -- see `clamped_low`.
 	pub fn low() -> f64 {
-		*LOW.get_or_init(|| clamped_low(high(), read("EVICTION_LOW_WATERMARK", DEFAULT_LOW)))
+		*LOW.get_or_init(|| resolve(read("EVICTION_HIGH_WATERMARK"), read("EVICTION_LOW_WATERMARK")).1)
 	}
 
 	/// Clamps the drain target to the trigger point so a misconfigured pair
@@ -1328,12 +1379,14 @@ pub mod eviction_watermarks {
 	/// Turns a watermark into a byte threshold on `max_size`.
 	///
 	/// `>= 1.0` returns `max_size` untouched instead of round-tripping it
-	/// through `f64`, and that short-circuit is the whole 1.0-default
-	/// guarantee: an unconfigured build must perform *the same comparison* it
-	/// performed before this module existed, not one that agrees with it up to
-	/// a rounding step. `u64 -> f64` is lossy above 2^53 bytes, and the `as`
-	/// truncation could otherwise land a threshold a byte under the cap --
-	/// either of which is a silent change in eviction depth.
+	/// through `f64`, and that short-circuit is the whole
+	/// `EVICTION_HIGH_WATERMARK=1.0` guarantee: an override back to the cap
+	/// must perform *the same comparison* the loop performed before E1, not
+	/// one that agrees with it up to a rounding step. `u64 -> f64` is lossy
+	/// above 2^53 bytes, and the `as` truncation could otherwise land a
+	/// threshold a byte under the cap. Below 1.0 the threshold is the floor
+	/// of `max_size * watermark` (0.98 of a 1 000-byte cache is 980, of a
+	/// 40-byte one 39).
 	pub(crate) fn scaled(max_size: CacheSize, watermark: f64) -> CacheSize {
 		if watermark >= 1.0 {
 			return max_size;
@@ -1364,7 +1417,7 @@ pub mod eviction_watermarks {
 			}
 		}
 
-		/// The process-wide pair, from the environment or the 1.0 defaults.
+		/// The process-wide pair, from the environment or the 0.98 default.
 		/// Goes through `new` so the configured path and the test path cannot
 		/// drift apart on the clamp (`low()` has already applied it, and the
 		/// clamp is idempotent).
@@ -1372,8 +1425,8 @@ pub mod eviction_watermarks {
 			Watermarks::new(high(), low())
 		}
 
-		/// `(trigger, drain target)` in bytes. Both are exactly `max_size` at
-		/// the defaults.
+		/// `(trigger, drain target)` in bytes. At the default both are
+		/// `floor(0.98 * max_size)`.
 		pub fn bytes(&self, max_size: CacheSize) -> (CacheSize, CacheSize) {
 			(scaled(max_size, self.high), scaled(max_size, self.low))
 		}
@@ -1747,10 +1800,10 @@ pub struct PolicyWorker<K, V> {
 	policy_stack: Box<dyn PolicyStack>,
 
 	/// Capacity-eviction watermarks for `apply_evictions`, snapshotted at
-	/// construction (see `eviction_watermarks::Watermarks`). `1.0`/`1.0`
-	/// unless `EVICTION_HIGH_WATERMARK`/`EVICTION_LOW_WATERMARK` say
-	/// otherwise, which is the pre-watermark drain-to-exactly-`max_size`
-	/// loop.
+	/// construction (see `eviction_watermarks::Watermarks`). `0.98`/`0.98`
+	/// -- one threshold, 98% of `max_size` -- unless
+	/// `EVICTION_HIGH_WATERMARK`/`EVICTION_LOW_WATERMARK` say otherwise
+	/// (`1.0` is the pre-E1 drain-to-exactly-`max_size` loop).
 	eviction_watermarks: eviction_watermarks::Watermarks,
 
 	last_set_time: Option<Instant>,
@@ -3424,9 +3477,10 @@ where
 		let max_cache_size = self.status.max_size();
 
 		// `trigger_size` arms a capacity pass; `drain_target` is how far that
-		// pass then goes. Both are `max_cache_size` at the 1.0/1.0 default,
-		// which is what keeps an unconfigured build on the exact loop that
-		// predates the eviction watermarks.
+		// pass then goes. Both are 98% of `max_cache_size` by default (E1):
+		// one threshold, so a full cache evicts one object at a time as sets
+		// arrive and rests just under its budget. Read on every call, so a
+		// `resize` moves them with the cap.
 		let (trigger_size, drain_target) = self.eviction_watermarks.bytes(max_cache_size);
 
 		let mut _evicted_this_call: usize = 0;
@@ -3435,7 +3489,9 @@ where
 		// every iteration and stop the moment usage fell a byte back under the
 		// high mark -- which is not a batch at all, it is the old
 		// evict-exactly-one behaviour wearing a threshold, and it would
-		// oscillate across the high mark once per set.
+		// oscillate across the high mark once per set. (With the default
+		// single threshold the two levels are equal and the latch changes
+		// nothing; it matters only for a configured low mark.)
 		//
 		// Armed by the capacity condition alone, never by
 		// `needs_capacity_eviction`: a stack draining its own internal
@@ -5458,7 +5514,7 @@ mod policy_worker_kick_tests {
 mod capacity_watermark_tests {
 	use super::*;
 
-	use super::eviction_watermarks::{DEFAULT_HIGH, DEFAULT_LOW, Watermarks, clamped_low};
+	use super::eviction_watermarks::{DEFAULT_HIGH, Watermarks, clamped_low, resolve};
 
 	use crate::{
 		object::Object,
@@ -5562,53 +5618,237 @@ mod capacity_watermark_tests {
 		}
 	}
 
+	/// E1: the default is ONE threshold at 98% of `max_size`, the floor of
+	/// the product in bytes, for the arming level and the drain target alike.
 	#[test]
-	fn default_watermarks_are_exactly_max_size_at_every_cache_size() {
-		assert_eq!(DEFAULT_HIGH, 1.0);
-		assert_eq!(DEFAULT_LOW, 1.0);
+	fn the_default_is_one_threshold_at_98_percent_of_max_size() {
+		assert_eq!(DEFAULT_HIGH, 0.98);
 
-		let defaults = Watermarks::new(DEFAULT_HIGH, DEFAULT_LOW);
+		let (high, low) = resolve(None, None);
+		assert_eq!((high, low), (DEFAULT_HIGH, DEFAULT_HIGH), "one threshold, not a band");
 
-		// Includes caps past f64's exact-integer range: a `u64 -> f64 -> u64`
-		// round trip loses the low bits above 2^53, and a threshold a single
-		// byte off `max_size` is a silent change in eviction depth -- the one
-		// thing the default may never be.
-		for max_size in [0u64, 1, 1_000, (1u64 << 53) + 1, u64::MAX] {
-			assert_eq!(defaults.bytes(max_size), (max_size, max_size));
+		let defaults = Watermarks::new(high, low);
+
+		for (max_size, threshold) in [(100u64, 98u64), (1_000, 980), (40, 39), (1 << 30, 1_052_266_987)] {
+			assert_eq!(defaults.bytes(max_size), (threshold, threshold), "max_size {max_size}");
 		}
 	}
 
+	/// The override back to the cap is exact: `1.0` is `max_size` itself at
+	/// every cache size, not a threshold that agrees with it up to a rounding
+	/// step -- including caps past f64's exact-integer range, where a
+	/// `u64 -> f64 -> u64` round trip loses the low bits and a threshold a
+	/// single byte off `max_size` is a silent change in eviction depth.
 	#[test]
-	fn default_watermarks_settle_the_cache_at_exactly_max_size() {
+	fn a_watermark_of_one_is_exactly_max_size_at_every_cache_size() {
+		let at_the_cap = Watermarks::new(1.0, 1.0);
+
+		for max_size in [0u64, 1, 1_000, (1u64 << 53) + 1, u64::MAX] {
+			assert_eq!(at_the_cap.bytes(max_size), (max_size, max_size));
+		}
+	}
+
+	/// What the environment resolves to. An unset drain level follows the
+	/// arming level, as it did before E1 (when the default of 1.0 was clamped
+	/// down to whatever the arming level was), so `EVICTION_HIGH_WATERMARK`
+	/// alone is still a single threshold -- `1.0` is the pre-E1 loop --
+	/// and only a drain level BELOW the arming level makes a band.
+	#[test]
+	fn an_unset_drain_level_follows_the_arming_level() {
+		assert_eq!(resolve(None, None), (DEFAULT_HIGH, DEFAULT_HIGH));
+		assert_eq!(resolve(Some(1.0), None), (1.0, 1.0));
+		assert_eq!(resolve(Some(0.9), None), (0.9, 0.9));
+
+		// A band, when asked for.
+		assert_eq!(resolve(Some(0.75), Some(0.5)), (0.75, 0.5));
+		assert_eq!(resolve(None, Some(0.5)), (DEFAULT_HIGH, 0.5));
+
+		// A drain level above the arming level is clamped to it.
+		assert_eq!(resolve(None, Some(1.0)), (DEFAULT_HIGH, DEFAULT_HIGH));
+		assert_eq!(resolve(Some(0.5), Some(0.75)), (0.5, 0.5));
+	}
+
+	/// The whole default contract, for a worker whose cap is 200 objects of
+	/// `per_object` accounted bytes and whose objects `set_one` adds one at a
+	/// time: nothing is evicted while the cache is at or under 98% of
+	/// `max_size`; the first object over it -- one the pre-E1 loop would have
+	/// kept, it is still inside the cap -- costs exactly one eviction; every
+	/// set after that costs exactly one more (continuous, one object at a
+	/// time); and a burst of sets between two passes is drained in one pass to
+	/// the same 98%, no lower.
+	fn assert_default_holds_the_cache_at_98_percent<K>(
+		worker: &mut PolicyWorker<K, crate::TieredBuffer>,
+		status: &StatusRef,
+		objects: &ObjectMapRef<K, crate::TieredBuffer>,
+		per_object: CacheSize,
+		policy: PaperPolicy,
+		mut set_one: impl FnMut(&mut PolicyWorker<K, crate::TieredBuffer>, HashedKey),
+	)
+	where
+		K: 'static + Eq + Clone + typesize::TypeSize + Send + Sync,
+	{
+		let max_size = status.max_size();
+		let threshold = max_size / 100 * 98;
+
+		// The wiring half: a worker built with neither var set carries the
+		// defaults. Skipped rather than failed when the run itself exports an
+		// override, which is a deliberate configuration and not a regression.
+		if std::env::var("EVICTION_HIGH_WATERMARK").is_err()
+			&& std::env::var("EVICTION_LOW_WATERMARK").is_err()
+		{
+			assert_eq!(worker.eviction_watermarks, Watermarks::new(DEFAULT_HIGH, DEFAULT_HIGH));
+		}
+
+		// Pinned so the case still tests the default under such a run.
+		worker.eviction_watermarks = Watermarks::new(DEFAULT_HIGH, DEFAULT_HIGH);
+		worker.evicted = Some(Vec::new());
+
+		assert_eq!(worker.eviction_watermarks.bytes(max_size), (threshold, threshold));
+
+		// The most objects that fit under the threshold; two more fit the cap.
+		let fits = threshold / per_object;
+		assert_eq!(fits, 196, "{policy}");
+		assert_eq!(max_size / per_object, 200, "{policy}");
+
+		for key in 1..=fits {
+			set_one(worker, key);
+		}
+
+		worker.apply_evictions().unwrap();
+
+		assert_eq!(status.used_size(&policy), fits * per_object, "{policy}: nothing under 98% is evicted");
+		assert_eq!(worker.evicted.as_ref().unwrap().len(), 0);
+
+		set_one(worker, fits + 1);
+		assert!(status.used_size(&policy) <= max_size, "{policy}: the cache is still inside its cap");
+		assert!(status.used_size(&policy) > threshold, "{policy}: and over 98% of it");
+
+		worker.apply_evictions().unwrap();
+
+		assert_eq!(status.used_size(&policy), fits * per_object, "{policy}: back at 98%, not below it");
+		assert_eq!(worker.evicted.as_ref().unwrap().len(), 1, "{policy}: one object, not a batch");
+		assert_eq!(objects.len() as u64, fits);
+
+		for key in fits + 2..=fits + 6 {
+			set_one(worker, key);
+			worker.apply_evictions().unwrap();
+		}
+
+		assert_eq!(worker.evicted.as_ref().unwrap().len(), 6, "{policy}: one eviction per set");
+		assert_eq!(status.used_size(&policy), fits * per_object);
+
+		for key in fits + 7..=fits + 16 {
+			set_one(worker, key);
+		}
+
+		assert!(status.used_size(&policy) > max_size, "{policy}: the burst went past the cap");
+
+		worker.apply_evictions().unwrap();
+
+		assert_eq!(worker.evicted.as_ref().unwrap().len(), 16, "{policy}: exactly the excess");
+		assert_eq!(status.used_size(&policy), fits * per_object, "{policy}: the burst drains to 98%, no lower");
+		assert_eq!(objects.len() as u64, fits);
+	}
+
+	/// E1 on a FLAT stack, in this build's store: a cache holds 98% of
+	/// `max_size`, not `max_size`.
+	#[test]
+	fn a_flat_cache_is_held_at_98_percent_of_max_size() {
+		let (mut worker, objects, status, overhead_manager) = make_worker(200);
+		let per_object = per_object_size(&overhead_manager);
+
+		let (objs, stat, over) = (objects.clone(), status.clone(), overhead_manager.clone());
+
+		assert_default_holds_the_cache_at_98_percent(
+			&mut worker,
+			&status,
+			&objects,
+			per_object,
+			TEST_POLICY,
+			|worker, key| insert(&objs, &stat, &over, worker, key),
+		);
+	}
+
+	/// E1 on a TIERED stack (LRU hybrid, a 16 KiB fast tier under a cap of 200
+	/// objects), in this build's store: the same contract at the same
+	/// operating point as the flat cache.
+	#[test]
+	fn a_tiered_cache_is_held_at_98_percent_of_max_size() {
+		use super::reconcile_tests::{FAST, LEN, fill as fill_tiered};
+		use super::test_support::tiered_worker;
+
+		const POLICY: PaperPolicy = PaperPolicy::LruCompactHybrid;
+
+		// Its inline landings count in the process-wide migration counters,
+		// which other tests assert exact deltas on under this lock.
+		let _serialised = migration_test_lock::lock();
+
+		// One object's accounted bytes, measured on a worker of its own.
+		let probe_objects: ObjectMapRef<u64, crate::TieredBuffer> = crate::new_hybrid_object_map();
+		let (mut probe, probe_status, _) = tiered_worker(probe_objects.clone(), 1 << 30, POLICY, true, false);
+
+		fill_tiered(&mut probe, &probe_objects, 1..=1, LEN);
+
+		let per_object = probe_status.used_size(&POLICY);
+		assert!(per_object > LEN as CacheSize);
+
+		let objects: ObjectMapRef<u64, crate::TieredBuffer> = crate::new_hybrid_object_map();
+		let (mut worker, status, _) = tiered_worker(objects.clone(), 200 * per_object, POLICY, true, false);
+
+		worker.handle_resize_fast_tier(FAST);
+		worker.apply_tier_migrations();
+
+		let objs = objects.clone();
+
+		assert_default_holds_the_cache_at_98_percent(
+			&mut worker,
+			&status,
+			&objects,
+			per_object,
+			POLICY,
+			|worker, key| fill_tiered(worker, &objs, key..=key, LEN),
+		);
+	}
+
+	/// The default follows a runtime `resize`: the threshold is read against
+	/// the cache's CURRENT `max_size` on every pass.
+	#[test]
+	fn the_default_threshold_moves_with_a_resize() {
+		let (mut worker, objects, status, overhead_manager) = make_worker(16);
+		let per_object = per_object_size(&overhead_manager);
+
+		worker.eviction_watermarks = Watermarks::new(DEFAULT_HIGH, DEFAULT_HIGH);
+
+		fill(&objects, &status, &overhead_manager, &mut worker, 1..=12);
+		worker.apply_evictions().unwrap();
+		assert_eq!(objects.len() as u64, 12, "12 objects are under 98% of 16");
+
+		// 0.98 x 8 objects is 7.84: seven fit.
+		status.set_max_size(8 * per_object);
+		worker.apply_evictions().unwrap();
+
+		assert_eq!(used(&status), 7 * per_object);
+		assert_eq!(objects.len() as u64, 7);
+	}
+
+	/// The override back to the cap (`EVICTION_HIGH_WATERMARK=1.0`) is the
+	/// pre-E1 loop, object for object: settled at exactly `max_size`, not one
+	/// object under it. This is what the two 1.0/1.0 default tests asserted
+	/// before E1, with the pair now pinned instead of defaulted.
+	#[test]
+	fn pinned_to_the_cap_the_loop_settles_at_exactly_max_size() {
 		let (mut worker, objects, status, overhead_manager) = make_worker(16);
 		let per_object = per_object_size(&overhead_manager);
 		let max_size = status.max_size();
 
-		// The wiring half of the 1.0 guarantee: a worker built with neither
-		// var set carries the defaults. Skipped rather than failed when the
-		// run itself exports an override, which is a deliberate configuration
-		// and not a regression.
-		if std::env::var("EVICTION_HIGH_WATERMARK").is_err()
-			&& std::env::var("EVICTION_LOW_WATERMARK").is_err()
-		{
-			assert_eq!(
-				worker.eviction_watermarks,
-				Watermarks::new(DEFAULT_HIGH, DEFAULT_LOW),
-			);
-		}
-
-		// Pinned so the case still tests 1.0/1.0 semantics under such a run.
-		worker.eviction_watermarks = Watermarks::new(DEFAULT_HIGH, DEFAULT_LOW);
+		worker.eviction_watermarks = Watermarks::new(1.0, 1.0);
+		assert_eq!(worker.eviction_watermarks.bytes(max_size), (max_size, max_size));
 
 		fill(&objects, &status, &overhead_manager, &mut worker, 1..=18);
 		assert_eq!(used(&status), 18 * per_object);
 
 		worker.apply_evictions().unwrap();
 
-		// Exactly at the cap, not one object under it: the pre-watermark loop
-		// stops the instant `used_size` is no longer *over* `max_size`, and
-		// every published sweep in `results/` was measured against a cache
-		// that settles right there.
 		assert_eq!(used(&status), max_size);
 		assert_eq!(used(&status), 16 * per_object);
 		assert_eq!(objects.len() as u64, 16);
@@ -5634,8 +5874,8 @@ mod capacity_watermark_tests {
 
 		worker.apply_evictions().unwrap();
 
-		// One pass, and it went well past `max_size` -- the pre-watermark loop
-		// would have stopped at exactly 16 objects' worth.
+		// One pass, and it went well past the default's 15 objects (98% of 16)
+		// -- a single-threshold loop would have stopped there.
 		assert_eq!(used(&status), 8 * per_object);
 		assert_eq!(objects.len() as u64, 8);
 		assert!(used(&status) < max_size);
@@ -6230,12 +6470,19 @@ mod reconcile_tests {
 
 	/// Evicts one key through the worker's own eviction pass: the cache's size
 	/// set one byte under what it holds, then restored.
+	///
+	/// With the watermarks pinned to the cap for the pass (E1): at the default
+	/// 98% one byte under `used` would put the threshold a whole 2% below it
+	/// and the pass would take every key above that, not one.
 	pub(super) fn evict_one_key(worker: &mut Worker) {
 		let used = worker.status.used_size(&worker.status.policy());
+		let marks = worker.eviction_watermarks;
 
+		worker.eviction_watermarks = eviction_watermarks::Watermarks::new(1.0, 1.0);
 		worker.status.set_max_size(used - 1);
 		worker.apply_evictions().expect("an eviction pass");
 		worker.status.set_max_size(1 << 30);
+		worker.eviction_watermarks = marks;
 		drain_and_apply(worker);
 	}
 
