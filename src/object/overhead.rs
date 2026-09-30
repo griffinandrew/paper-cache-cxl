@@ -532,14 +532,14 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 
 		// Structurally identical to `LruCompactHybrid`: one slab slot plus one
 		// index row, the payload carrying tier and size — see
-		// `fifo_compact_hybrid_stack.rs`'s module doc.
+		// `arena_hybrid_stack.rs`'s module doc.
 		PaperPolicy::FifoCompactHybrid => FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to `FifoCompactHybrid`, which is the point:
 		// CLOCK is that queue plus a reference bit, and the bit rides in the
 		// `freq` field `NodePayload` already carries for the S3-FIFO family.
 		// No extra slab slot, no extra index row, no extra byte — see
-		// `clock_compact_hybrid_stack.rs`'s module doc.
+		// `arena_hybrid_stack.rs`'s module doc.
 		PaperPolicy::ClockCompactHybrid => CLOCK_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to `LruCompactHybrid` despite having 4

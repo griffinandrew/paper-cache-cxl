@@ -367,7 +367,8 @@ The code uses `#[cfg(...)]` attributes extensively to:
   `src/tiered_buffer.rs` (`TieredBuffer`). There are no per-design cache modules or per-design
   stats structs any more.
 - **lru_compact_hybrid_cache (segmented-LRU hybrid)**:
-  `src/worker/policy/policy_stack/lru_compact_hybrid_stack.rs` (`LruCompactHybridStack`),
+  `src/worker/policy/policy_stack/arena_hybrid_stack.rs` (`LruCompactHybridStack` =
+  `ArenaHybridStack<LruOrder>`),
   `src/policy.rs` (`PaperPolicy::LruCompactHybrid`). See `CLAUDE.md` and `LRU_HYBRID_CACHE.md`
   for the full design writeup.
 - **lfu_compact_hybrid_cache (frequency-segmented hybrid)**:

@@ -1472,7 +1472,7 @@ impl<K, V> Inner<K, V> {
 	/// Move to the MRU end and make fast, promoting from slow if needed.
 	/// Returns whether it promoted.
 	///
-	/// Faithful port of `LruCompactHybridStack::touch_fast_key`, minus the
+	/// Faithful port of `ArenaHybridStack::touch_to_front`, minus the
 	/// settle and the push: the tier boundary is settled globally, with no
 	/// shard lock held, so the caller drops this shard's guard and then calls
 	/// `MergedStore::settle_tier` -- and only after that queues `(key, Fast)`
@@ -1499,8 +1499,8 @@ impl<K, V> Inner<K, V> {
 	/// moved to the front all the same -- it keeps its place in the order --
 	/// but with tier slow: a slow one is not promoted, and a fast one (an
 	/// overwrite with a value too large, or an eff that shrank) leaves the fast
-	/// set, which the caller queues as `(key, Slow)`. `LruCompactHybridStack::
-	/// touch_fast_key`'s rule, move for move.
+	/// set, which the caller queues as `(key, Slow)`. `ArenaHybridStack::
+	/// touch_to_front`'s rule, move for move.
 	fn touch_slot(&mut self, i: u32, now: u64, structural: bool) -> Touched {
 		self.assert_folded();
 
@@ -2284,7 +2284,7 @@ impl<K, V> MergedStore<K, V> {
 	}
 
 	/// Whether a value of `migrating` bytes is STRUCTURAL: larger than an
-	/// empty fast tier (S5). `LruCompactHybridStack::structural`'s rule.
+	/// empty fast tier (S5). `ArenaHybridStack::structural`'s rule.
 	fn structural(&self, migrating: CacheSize) -> bool {
 		migrating > self.own_eff()
 	}
@@ -3191,7 +3191,7 @@ impl<K, V> MergedStore<K, V> {
 			},
 
 			// A resize in place and nothing else: no move to the front, no
-			// promotion, no new stamp -- `FifoCompactHybridStack`'s "an existing
+			// promotion, no new stamp -- `FifoOrder::overwrite`'s "an existing
 			// key is resized in place and NOT moved". Re-settling matters only
 			// if it is fast, since only then can the resize have pushed the
 			// fast tier over its budget.
@@ -3344,13 +3344,13 @@ impl<K, V> MergedStore<K, V> {
 	/// The hit path is what CLOCK keeps clean -- see `mark_referenced`. A
 	/// second chance that promotes queues its `(key, Fast)` after the settle
 	/// behind it, and only if that settle left the key fast
-	/// (`ClockCompactHybridStack::recycle_to_front`'s rule). A DEAD tail is
+	/// (`ClockOrder::evict`'s rule). A DEAD tail is
 	/// retired, not passed.
 	///
 	/// # The budget
 	///
 	/// `clock_hand_budget(linked)` second chances, then whatever is at the
-	/// tail is evicted -- the same cap `ClockCompactHybridStack::evict_one`
+	/// tail is evicted -- the same cap `ClockOrder::evict`
 	/// has. It cannot fire here: each second chance clears a bit, and bits
 	/// are set only on the policy worker (a hit's `update`, an overwrite's
 	/// `worker_set`), which is also the thread running this loop -- so one

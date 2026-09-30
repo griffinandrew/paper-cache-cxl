@@ -271,14 +271,9 @@ impl LfuCompactHybridStack {
 
 	/// The tier this stack has `key` in, or `None` if it does not track it.
 	///
-	/// Present on every other hybrid stack in this directory --
-	/// `LruCompactHybridStack:113`, `ClockCompactHybridStack:123`,
-	/// `FifoCompactHybridStack:98`, the 2Q and S3-FIFO families -- and missing
-	/// only here, because nothing had needed it: the differential tests that
-	/// exist for LFU drive `chain` directly, from inside this module. The
-	/// merged store's `lfu_order_fidelity` test compares
+	/// Public because the merged store's `lfu_order_fidelity` test compares
 	/// `MergedStore::tier_of` against this stack from ANOTHER module, where
-	/// `chain` is private and unreachable, so the accessor has to exist.
+	/// `chain` is private and unreachable.
 	pub fn tier_of(&self, key: HashedKey) -> Option<Tier> {
 		self.chain.get(key).and_then(|e| e.tier)
 	}

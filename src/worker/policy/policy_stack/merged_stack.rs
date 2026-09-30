@@ -431,7 +431,7 @@ mod global_demotion_fidelity {
 	use crate::{
 		object::Object,
 		worker::policy::policy_stack::{
-			lru_compact_hybrid_stack::LruCompactHybridStack,
+			arena_hybrid_stack::LruCompactHybridStack,
 		},
 		BufferDRAM,
 	};
@@ -830,7 +830,7 @@ mod fifo_order_fidelity {
 	use crate::{
 		object::Object,
 		worker::policy::policy_stack::{
-			fifo_compact_hybrid_stack::FifoCompactHybridStack,
+			arena_hybrid_stack::FifoCompactHybridStack,
 		},
 		BufferDRAM,
 	};
@@ -1242,7 +1242,7 @@ mod clock_order_fidelity {
 	use crate::{
 		object::Object,
 		worker::policy::policy_stack::{
-			clock_compact_hybrid_stack::ClockCompactHybridStack,
+			arena_hybrid_stack::ClockCompactHybridStack,
 			clock_compact_stack::ClockCompactStack,
 		},
 		BufferDRAM,
