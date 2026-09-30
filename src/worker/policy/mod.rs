@@ -2722,6 +2722,26 @@ where
 		mark: u32,
 		placement: Placement,
 	) {
+		// The value this `Set` published is gone: an eviction pass (or a
+		// MakeRoom) took it between the client's map insert and this event, or a
+		// delete or reap on another thread did. The client inserts before it
+		// broadcasts, so an absent key means removed since, and any later event
+		// for it is behind this one. Admitting it would track an object the map
+		// no longer holds, which nothing would ever remove (T9's 2Q full
+		// fast-admission "never quiesced": stack 44 against map 43). The merged
+		// store needs no check: it never evicts a value the worker has not
+		// linked.
+		#[cfg(not(feature = "merged_object_store"))]
+		if !self.object_exists(key) {
+			// S5a: the client's insert may still have grown the map's table.
+			#[cfg(feature = "hybrid_cache_common")]
+			if self.tier_migration {
+				crate::meta::map_write(&self.objects, &mut self.metadata.map, key);
+			}
+
+			return;
+		}
+
 		let fresh = previous.is_none();
 
 		#[cfg(feature = "hybrid_cache_common")]
@@ -7073,6 +7093,58 @@ mod reconcile_tests {
 
 		let audit = worker.placement_audit();
 		assert!(audit.is_clean(), "{audit:?}");
+	}
+
+
+	/// Race E (T9's 2Q full fast-admission "never quiesced", stack 44 against
+	/// map 43): an eviction pass between a re-set's publish -- its map insert
+	/// and its bytes' accounting, both before its broadcast -- and its `Set`
+	/// takes the very key being re-set (the stack's next victim, still known by
+	/// its OLD value), and its erase removes the NEW value. The late `Set` must
+	/// not admit the key: the stack would track an object the map no longer
+	/// holds, and nothing would ever remove it. Likewise a `del` on another
+	/// thread that erases a set's value and whose `Del` the worker handles first.
+	/// Pre-existing (an S4 diagnostic that widened the gap hit it). Red without
+	/// the map check in `handle_set` (`setnomapcheck`).
+	#[cfg(not(feature = "merged_object_store"))]
+	#[test]
+	fn a_set_whose_value_was_taken_before_its_event_admits_nothing() {
+		// Its worker's consumers apply migrations: the process-global counters
+		// other tests take exact deltas of.
+		let _serialised = migration_test_lock::lock();
+
+		for policy in [PaperPolicy::LruCompactHybrid, PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.5)] {
+			let (mut worker, objects) = make_worker(policy);
+			fill(&mut worker, &objects, 1..=40, LEN);
+			assert_settled(&mut worker);
+
+			// The eviction: key 1 is the stack's next victim (the LRU tail; 2Q's
+			// a1_out tail), re-set bigger, then an eviction pass before its Set.
+			const K: HashedKey = 1;
+			let published = publish(&worker.status, &worker.overhead_manager, &objects, K, 2 * LEN, Fast);
+			evict_one_key(&mut worker);
+			assert!(objects.get_ref(&K).is_none(), "{policy}: the eviction pass took the re-set key");
+
+			handle(&mut worker, K, published);
+			drain_and_apply(&mut worker);
+			assert_eq!(placement(&worker, K), None, "{policy}: the late Set admitted a key the map no longer holds");
+
+			// The delete: another thread erases a re-set's value; its Del first.
+			const J: HashedKey = 30;
+			let published = publish(&worker.status, &worker.overhead_manager, &objects, J, LEN, Fast);
+			publish_del(&worker.status, &worker.overhead_manager, &objects, J);
+			worker.handle_del(J);
+			handle(&mut worker, J, published);
+			drain_and_apply(&mut worker);
+			assert_eq!(placement(&worker, J), None, "{policy}: a Set behind its value's delete admitted the key");
+
+			assert_eq!(
+				worker.policy_stack.as_ref().expect("a stack").len() as u64,
+				worker.status.live_num_objects(),
+				"{policy}: the stack tracks exactly the map's keys",
+			);
+			assert_settled(&mut worker);
+		}
 	}
 
 	#[test]
