@@ -205,8 +205,8 @@ tier_migration_fn: Option<Box<dyn Fn(&V, Tier) -> V + Send + Sync>>,
 After processing *each* `Get`/`Set`/etc event (not once per batch, so a demotion decision made
 mid-batch gets physically executed as soon as possible under concurrent load), `PolicyWorker::run()`
 calls `apply_tier_migrations()`, which drains the stack's pending migrations
-and applies them in two parallel phases — every demotion, fully complete, before any promotion
-begins — via `rayon`. (Each drain is first split by `split_tier_migrations`, which drops every
+and applies them, every demotion before any promotion (once in two parallel `rayon` phases; no
+longer). (Each drain is first split by `split_tier_migrations`, which drops every
 entry that a later entry for the other tier supersedes, so that order cannot reverse a key's own
 intents.) See `HYBRID_CACHES.md`'s "Turning 'this key changed tier' into an actual byte
 move" section for the current, exact mechanism (this document previously showed a simple sequential
@@ -334,9 +334,9 @@ new logic beyond what's described above:
 | `lru_hybrid_stats(&self) -> LruHybridStats` | Snapshot, see above |
 | `tier_of(&self, key: &K) -> Option<Tier>` | Test/diagnostic accessor: reads the tier directly off the single object map (`object.data().is_fast()`), returning `None` if the key is absent or expired. There is no `has_in_dram`/`has_in_pmem` pair to reuse here (that pattern is specific to `hybridcache`'s two-instance design) since there's only one map to look in |
 
-There is deliberately **no `policy()` method** on this impl block — every other multi-policy
-`PaperCache` variant exposes `policy()` to switch between several configured policies at runtime,
-but this cache is only ever configured with the one, fixed `PaperPolicy::LruHybrid`.
+There is deliberately **no `policy()` method** on this impl block: this cache is only ever
+configured with the one, fixed `PaperPolicy::LruHybrid`. (The flat variants' runtime `policy()`
+switch has since been removed as well, in R1: no cache switches policy.)
 
 Note that `get()`'s promotion is *not* synchronous with the call that returns the value: `get()`
 reads whatever `TieredBuffer` variant is currently in the map (fast or slow, either way readable

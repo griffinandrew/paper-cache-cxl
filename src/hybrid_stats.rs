@@ -262,7 +262,7 @@ pub struct HybridStats {
 	pub metadata_model_divergence: u64,
 
 	/// S5, commit B2 -- the byte gate. Its state: `Enabled`, or why it is not
-	/// running (`GateState`: `Off`, `NotSole`, `Ungated`, `Bands`, `NoStack`).
+	/// running (`GateState`: `Off`, `NotSole`, `Ungated` or `Bands`).
 	pub gate_state: crate::gate::GateState,
 
 	/// Fast sets that reached the gate's slow path while it was disabled for a

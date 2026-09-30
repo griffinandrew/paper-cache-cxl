@@ -153,8 +153,7 @@ pub fn admission_tier<K>(
 		// compile error until its admission tier is stated.
 		// All-DRAM policies never reach here (no tiers), but the match must
 		// still name them.
-		PaperPolicy::Auto
-		| PaperPolicy::Lfu
+		PaperPolicy::Lfu
 		| PaperPolicy::Fifo
 		| PaperPolicy::Clock
 		| PaperPolicy::Sieve

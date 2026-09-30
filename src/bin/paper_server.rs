@@ -507,8 +507,7 @@ fn main() {
 
 	// The flat constructor takes the set of CONFIGURED policies rather than a
 	// tier size -- there is no tier to size. Only the running policy is
-	// configured, so a POLICY command still has nothing to switch to, and the
-	// two arms refuse it identically.
+	// configured.
 	#[cfg(feature = "all_dram")]
 	let built = PaperCache::<u64, BufferDRAM>::new(
 		config.max_size,
@@ -788,12 +787,12 @@ fn serve(
 			},
 
 			command::POLICY => {
-				// The policy arrives as a string; the tiered cache has no
-				// runtime policy setter (its `policy` method lives on the
-				// non-tiered impl, which `TieredBuffer` does not satisfy), so
-				// this is refused rather than silently ignored.
-				let _policy = read_string(&mut reader)?;
-				write_cache_error(&mut writer, &CacheError::InvalidPolicy)?;
+				// Unsupported: a cache's policy is fixed when it is built and
+				// nothing switches it at run time. Answered as an unknown command
+				// is, server error 1 -- but its one argument, a string, is read
+				// first, so the stream stays in step and the connection stays up.
+				read_string(&mut reader)?;
+				write_server_error(&mut writer, 1)?;
 			},
 
 			command::STATS => {
@@ -830,7 +829,8 @@ fn serve(
 						}
 
 						write_buf(&mut writer, status.policy().to_string().as_bytes())?;
-						write_bool(&mut writer, status.is_auto_policy())?;
+						// The auto flag: always false, a cache's policy being fixed.
+						write_bool(&mut writer, false)?;
 						write_u64(&mut writer, status.uptime())?;
 					},
 					Err(err) => write_cache_error(&mut writer, &err)?,

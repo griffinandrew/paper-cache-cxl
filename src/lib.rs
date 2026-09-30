@@ -256,7 +256,10 @@ use hashbrown::hash_map::Entry;
 
 use typesize::TypeSize;
 use nohash_hasher::NoHashHasher;
-use log::{info, error};
+use log::info;
+
+#[cfg(not(feature = "merged_object_store"))]
+use log::error;
 
 /// INSTRUMENTATION: times the eviction loop fell back to evicting a random
 /// object because the policy stack had no candidate. That path drops the
@@ -457,10 +460,8 @@ pub struct PaperCache<K, V, S = RandomState> {
 	/// a thread of its own.
 	workers: Arc<WorkerFanout>,
 	/// Join handles for every background thread spawned on this cache's
-	/// behalf (`PolicyWorker`/`TtlWorker` -- `PolicyWorker`'s
-	/// own `TraceWorker` child, when it has one, is joined internally by
-	/// `PolicyWorker` itself, see its `Shutdown` handling, so it never
-	/// appears here). `Drop` sends `WorkerEvent::Shutdown` through `workers`
+	/// behalf (`PolicyWorker`/`TtlWorker`). `Drop` sends `WorkerEvent::Shutdown`
+	/// through `workers`
 	/// and then joins these, so that by the time a `PaperCache` has finished
 	/// dropping, none of its background threads are still running --
 	/// closing the real race this fixes: before this existed, no worker
@@ -691,23 +692,17 @@ where
 			return Err(CacheError::EmptyPolicies);
 		}
 
-		if policies.contains(&PaperPolicy::Auto) {
-			return Err(CacheError::ConfiguredAutoPolicy);
-		}
-
 		if policies.iter().is_multiset() {
 			return Err(CacheError::DuplicatePolicies);
 		}
 
-		if !policy.is_auto() && !policies.contains(&policy) {
+		if !policies.contains(&policy) {
 			return Err(CacheError::UnconfiguredPolicy);
 		}
 
-		// Every CONFIGURED policy is checked, not just the active one:
-		// `PaperPolicy::Auto` can promote any of them later, and the runtime
-		// `policy` setter only accepts policies already on this list -- so
-		// validating the list here is what makes that setter safe by
-		// construction.
+		// Every configured policy is checked, not just the active one: the
+		// list is validated whole, as it always was, though only `policy`
+		// ever runs -- a cache's policy is fixed when it is built.
 		if policies
 			.iter()
 			.any(|configured| s_three_fifo_starves_main(*configured, max_size))
@@ -1333,32 +1328,6 @@ where
 		Ok(())
 	}
 
-	/// Sets the eviction policy of the cache to the supplied policy.
-	///
-	/// # Examples
-	/// ```
-	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
-	///
-	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
-	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
-	/// ).unwrap();
-	///
-	/// assert!(cache.policy(PaperPolicy::Lfu).is_ok());
-	/// assert!(cache.policy(PaperPolicy::Lru).is_err());
-	/// ```
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
 		self.workers.send(event)
 	}
@@ -1418,23 +1387,17 @@ where
 			return Err(CacheError::EmptyPolicies);
 		}
 
-		if policies.contains(&PaperPolicy::Auto) {
-			return Err(CacheError::ConfiguredAutoPolicy);
-		}
-
 		if policies.iter().is_multiset() {
 			return Err(CacheError::DuplicatePolicies);
 		}
 
-		if !policy.is_auto() && !policies.contains(&policy) {
+		if !policies.contains(&policy) {
 			return Err(CacheError::UnconfiguredPolicy);
 		}
 
-		// Every CONFIGURED policy is checked, not just the active one:
-		// `PaperPolicy::Auto` can promote any of them later, and the runtime
-		// `policy` setter only accepts policies already on this list -- so
-		// validating the list here is what makes that setter safe by
-		// construction.
+		// Every configured policy is checked, not just the active one: the
+		// list is validated whole, as it always was, though only `policy`
+		// ever runs -- a cache's policy is fixed when it is built.
 		if policies
 			.iter()
 			.any(|configured| s_three_fifo_starves_main(*configured, max_size))
@@ -1778,17 +1741,6 @@ where
 		Ok(())
 	}
 
-	pub fn policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if !policy.is_auto() && !self.status.policies().contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		self.status.set_policy(policy)?;
-		self.broadcast(WorkerEvent::Policy(policy))?;
-
-		Ok(())
-	}
-
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
 		self.workers.send(event)
 	}
@@ -1845,9 +1797,8 @@ where
 			// observed map>stack divergence. Counted so the hypothesis is
 			// testable rather than plausible.
 			crate::ERASE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-			// the policy has run out of keys to evict (either it's a mini stack or
-			// something went wrong during policy reconstruction) so we fall back
-			// to evicting a random object
+			// the stack has run out of keys to evict while the map has not (a
+			// stack behind its map), so we fall back to evicting a random object
 
 			//let Some(object) = objects.iter().next() else {
 			//let Some(object) = objects.read().unwrap().iter().next() else {
@@ -1923,10 +1874,9 @@ where
 ///     stack divergence `ERASE_FALLBACK` counts has no way to occur; it
 ///     refuses a value the worker has not linked, which is then
 ///     `KeyNotFound`;
-///   * the no-key fallback takes the LRU TAIL rather than an arbitrary object
-///     -- `oldest_linked_key`, read-only -- since this store IS the eviction
-///     order. Reachable only from `apply_mini_evictions`, which a merged build
-///     never runs.
+///   * no key: refused, `Internal` -- `evict_victim` never asks this store for
+///     an arbitrary victim (its `None` means nothing linked is left, and the
+///     pass stops there).
 #[cfg(feature = "merged_object_store")]
 pub fn erase<K, V>(
 	objects: &ObjectMapRef<K, V>,
@@ -1942,16 +1892,7 @@ where
 		Some(EraseKey::Hashed(hashed_key)) => hashed_key,
 		Some(EraseKey::Expired(hashed_key)) => hashed_key,
 
-		None => {
-			crate::ERASE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-			let Some(key) = objects.oldest_linked_key() else {
-				error!("Object store is empty with non-zero used size");
-				return Err(CacheError::Internal);
-			};
-
-			key
-		},
+		None => return Err(CacheError::Internal),
 	};
 
 	// Validate and remove under ONE shard write guard, so a hash collision
@@ -2005,9 +1946,8 @@ where
 			// observed map>stack divergence. Counted so the hypothesis is
 			// testable rather than plausible.
 			crate::ERASE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-			// the policy has run out of keys to evict (either it's a mini stack or
-			// something went wrong during policy reconstruction) so we fall back
-			// to evicting a random object
+			// the stack has run out of keys to evict while the map has not (a
+			// stack behind its map), so we fall back to evicting a random object
 
 			let Some(object) = objects.iter().next() else {
 				error!("Object store is empty with non-zero used size");

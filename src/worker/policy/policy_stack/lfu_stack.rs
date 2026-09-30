@@ -74,9 +74,9 @@ impl Default for LfuStack {
 	///    With `Node<CountStack>` at ~152 B that is ~7.6 GB of entries, 400 MB
 	///    of free list, and ~1.1 GB for the 50M-bucket index map: ~9 GB
 	///    committed to the node-1 arena at construction.
-	/// 3. It fired on shadow caches too. `MiniStackManager` builds one stack
-	///    per configured policy at roughly 0.1% of the cache size, and this
-	///    `Default` ignores the size argument entirely, so every mini stack
+	/// 3. It fired on shadow caches too. The mini stacks (since removed) built
+	///    one stack per configured policy at roughly 0.1% of the cache size, and
+	///    this `Default` ignores the size argument entirely, so every mini stack
 	///    reserved the same ~9 GB.
 	///
 	/// It also did not buy what its comment claimed. The containers that

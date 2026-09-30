@@ -452,8 +452,6 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// constant, and every one of those hand counts was low.
 
 	match policy {
-		PaperPolicy::Auto => 0,
-
 		// 24 bytes for the HashMap entry 48 bytes for the HashList entry,
 		// 8 bytes for the HashedKey, 4 bytes for the count
 		// Slab layout: 16-byte link-only slot plus one index entry
@@ -897,10 +895,12 @@ const LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 /// fast/DRAM tier nothing and the term drops to 0.
 ///
 /// Unlike the per-policy constants below this is *not* gated on
-/// `hybrid_cache_common`: the policy-stack modules are declared
-/// unconditionally (see `worker::policy::policy_stack`), so they compile —
-/// and reference this — under every feature combination, including none.
+/// `hybrid_cache_common`: the split policy stacks compile -- and reference
+/// this -- under every feature combination, including none, except in a
+/// merged build's lib, whose stack is the object map (see
+/// `worker::policy::policy_stack`); gated as they are.
 #[cfg(not(feature = "eviction_stacks_pmem"))]
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 8;
 
 /// Per-entry DRAM cost of an EXACT ghost queue -- a `CompactQueueSet<()>` of
@@ -917,11 +917,13 @@ pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 8;
 /// fidelity here; it is bounded by the main queue's length, which the ghost is
 /// trimmed against.
 #[cfg(not(feature = "eviction_stacks_pmem"))]
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub const EXACT_GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 16 + 12;
 
 /// PMEM-resident ghost list: costs the fast/DRAM tier nothing. See the
 /// `not(eviction_stacks_pmem)` arm above for the derivation and rationale.
 #[cfg(feature = "eviction_stacks_pmem")]
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 
 /// Zero under `eviction_stacks_pmem` for the same reason as
@@ -929,6 +931,7 @@ pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 /// so the exact ghost follows the eviction stacks to the far node and stops
 /// occupying fast-tier DRAM.
 #[cfg(feature = "eviction_stacks_pmem")]
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub const EXACT_GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 
 /// Per-object DRAM cost of `FifoCompactHybridStack`.
@@ -1417,8 +1420,7 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(..) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 
 			// All-DRAM policies have no tiers and reserve no fast-tier metadata.
-			PaperPolicy::Auto
-			| PaperPolicy::Lfu
+			PaperPolicy::Lfu
 			| PaperPolicy::Fifo
 			| PaperPolicy::Clock
 			| PaperPolicy::Sieve

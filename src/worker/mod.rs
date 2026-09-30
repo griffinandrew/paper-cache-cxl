@@ -17,7 +17,6 @@ use crate::{
 	HashedKey,
 	error::CacheError,
 	object::{ObjectSize, ExpireTime},
-	policy::PaperPolicy,
 };
 
 pub type WorkerSender = Sender<WorkerEvent>;
@@ -128,7 +127,6 @@ pub enum WorkerEvent {
 	/// `lru_sized_compact_hybrid_cache`. No-op for every other policy stack;
 	/// see `PolicyStack::resize_size_threshold`.
 	ResizeSizeThreshold(CacheSize),
-	Policy(PaperPolicy),
 
 	/// Tells a worker to stop its event loop and return. Sent exactly once,
 	/// by `PaperCache::drop`, fanned out to every sub-worker by
@@ -197,7 +195,6 @@ impl Events {
 	pub const RESIZE_FAST_TIER: EventMask = 1 << 7;
 	pub const RESIZE_LARGE_FAST_TIER: EventMask = 1 << 8;
 	pub const RESIZE_SIZE_THRESHOLD: EventMask = 1 << 9;
-	pub const POLICY: EventMask = 1 << 10;
 	pub const SHUTDOWN: EventMask = 1 << 11;
 	pub const AUDIT: EventMask = 1 << 13;
 	pub const MAKE_ROOM: EventMask = 1 << 14;
@@ -214,7 +211,6 @@ impl Events {
 		| Self::RESIZE_FAST_TIER
 		| Self::RESIZE_LARGE_FAST_TIER
 		| Self::RESIZE_SIZE_THRESHOLD
-		| Self::POLICY
 		| Self::SHUTDOWN
 		| Self::AUDIT
 		| Self::MAKE_ROOM;
@@ -246,7 +242,6 @@ impl WorkerEvent {
 			WorkerEvent::ResizeFastTier(..) => Events::RESIZE_FAST_TIER,
 			WorkerEvent::ResizeLargeFastTier(..) => Events::RESIZE_LARGE_FAST_TIER,
 			WorkerEvent::ResizeSizeThreshold(..) => Events::RESIZE_SIZE_THRESHOLD,
-			WorkerEvent::Policy(..) => Events::POLICY,
 			WorkerEvent::Shutdown => Events::SHUTDOWN,
 			#[cfg(feature = "hybrid_cache_common")]
 			WorkerEvent::Audit(..) => Events::AUDIT,

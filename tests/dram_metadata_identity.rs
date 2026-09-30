@@ -56,13 +56,6 @@
 //!   * THE MIGRATION PIPELINE'S IN-FLIGHT TABLE (128 KiB) is built by the
 //!     first set, in the warm-up. The worker's per-shard DashMap reading is
 //!     sized when the worker is built.
-//!   * RAYON'S GLOBAL THREAD POOL. The policy worker's mini-stack manager --
-//!     empty in a tiered cache -- still runs a `par_iter_mut` over its (zero)
-//!     mini stacks for the one key in 1,000 it samples, and that asks rayon
-//!     how many threads it has, which builds rayon's global pool: 48 threads
-//!     and some 355 KB of registry, once per process, at whichever sampled key
-//!     comes first. Found by this test (a one-off 363,392 B step in the second
-//!     design's run). Built here before the first cache.
 //!   * PARKING_LOT'S TABLE OF PARKED THREADS. `parking_lot_core` keeps one
 //!     process-global hash table of parked threads, created by the first park
 //!     on (or unpark from) any lock built on it -- a contended DashMap shard, a
@@ -430,10 +423,7 @@ fn the_dram_pool_moves_by_exactly_m_between_quiescent_points() {
     // See the module doc: the cache's threads inherit this.
     let _ = std::io::set_output_capture(None);
 
-    // See the module doc: rayon's global pool, before any reading.
-    assert!(rayon::current_num_threads() > 0);
-
-    // See the module doc: parking_lot's table of parked threads, likewise.
+    // See the module doc: parking_lot's table of parked threads, before any reading.
     warm_parking_lot();
 
     let mut designs = vec![

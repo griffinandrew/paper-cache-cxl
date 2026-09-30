@@ -229,10 +229,6 @@ pub enum GateState {
 	/// be below the near level (a plain constructor under an environment-chosen
 	/// drain target; `GateConfig::validate` refuses it elsewhere).
 	Bands,
-
-	/// No policy stack to settle anything (a flat policy switch's
-	/// reconstruction).
-	NoStack,
 }
 
 impl GateState {
@@ -242,7 +238,6 @@ impl GateState {
 			2 => GateState::NotSole,
 			3 => GateState::Ungated,
 			4 => GateState::Bands,
-			5 => GateState::NoStack,
 			_ => GateState::Off,
 		}
 	}
@@ -2382,7 +2377,6 @@ mod tests {
 			GateState::NotSole,
 			GateState::Ungated,
 			GateState::Bands,
-			GateState::NoStack,
 		] {
 			assert_eq!(GateState::from_u8(state as u8), state);
 		}

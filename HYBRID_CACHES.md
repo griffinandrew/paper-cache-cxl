@@ -150,14 +150,13 @@ strong reference makes this immune to ABA: the allocation cannot be reused while
 
 ### The abandoned fan-out
 
-`parallel_migration` fanned a single *batch* across a rayon pool. It is still on the call path
-as a dispatcher, but `DEFAULT_THRESHOLD = 0` makes it degenerate to a sequential `for_each` on
-the worker — which, with the queue enabled, is just a loop of channel pushes.
-
-It was measured and abandoned rather than tuned: 99.4% of demotion volume arrives as
-single-object batches (37M calls of exactly 1 object against 9 calls of ≥16K), so there is
-nothing to fan out. `migration_queue` replaced it by decoupling from batch boundaries
-entirely — the work is genuinely fine-grained, not genuinely serial.
+`parallel_migration` fanned a single *batch* across a rayon pool. It was measured and abandoned
+rather than tuned: 99.4% of demotion volume arrives as single-object batches (37M calls of exactly
+1 object against 9 calls of ≥16K), so there is nothing to fan out. `migration_queue` replaced it
+by decoupling from batch boundaries entirely. It stayed compiled in, off by default
+(`PARALLEL_MIGRATION_THRESHOLD=0`: every batch applied inline, which with the queue on is one
+channel push per entry), until R1 removed it and the `rayon` dependency; a batch is applied inline
+exactly as it was at that threshold.
 
 ### Counters vs physical copies
 

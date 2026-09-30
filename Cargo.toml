@@ -26,12 +26,10 @@ crossbeam-channel = "0.5.15"
 crossbeam-epoch = "0.9"
 typesize = "0.1.14"
 byteorder = "1.5.0"
-tempfile = "3.21.0"
 parking_lot = "0.12.4"
 log = "0.4.28"
 nohash-hasher = "0.2.0"
 serde = { version = "1.0.219", features = ["derive"] }
-rayon = "1.11.0"
 num-traits = "0.2.19"
 libc = "0.2.177"
 # Direct dependency so `numa_jemalloc` actually links libjemalloc: the

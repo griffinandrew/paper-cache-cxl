@@ -444,12 +444,6 @@ impl MergedOrder {
 	/// A policy's flat and hybrid spellings map to the same order: the tier
 	/// boundary is settled separately, by byte budget, and does not change what
 	/// a hit does to the queue.
-	///
-	/// `PaperPolicy::Auto` is deliberately NOT here. A merged build cannot
-	/// honour the *auto* part at all -- `handle_policy` refuses every switch
-	/// under `merged_object_store`, before it ever reaches the `is_auto` check
-	/// -- so resolving it to some fixed order would be exactly the silent
-	/// mislabelling this error exists to delete.
 	pub fn from_policy(policy: &PaperPolicy) -> Result<MergedOrder, CacheError> {
 		match policy {
 			PaperPolicy::Lru
@@ -3331,67 +3325,6 @@ impl<K, V> MergedStore<K, V> {
 			self.apply_totals_delta(before, g.totals());
 			self.publish_mirrors(s, &g);
 		}
-	}
-
-	/// `erase`'s no-key fallback: the oldest LIVE linked key by the store's
-	/// order, READ-ONLY -- no second chance and no retire, since the caller
-	/// has no log to record a CLOCK hand's promotion in. Walks past DEAD
-	/// slots. Reachable only from `apply_mini_evictions`, i.e. a policy
-	/// switch's reconstruction, which this store refuses; a sweep of every
-	/// shard, which is fine for that.
-	pub fn oldest_linked_key(&self) -> Option<HashedKey> {
-		let lfu = self.order() == MergedOrder::Lfu;
-
-		// `(tier rank, freq, stamp)`: under `Lfu` the slow tier first, then the
-		// lowest frequency, then the earliest entrant; otherwise the stamp.
-		let mut best: Option<((u8, u16, u64), HashedKey)> = None;
-
-		for lock in self.shards.iter() {
-			let g = lock.read().unwrap();
-
-			let mut consider = |i: u32, rank: u8| {
-				let slot = &g.slots[i as usize];
-				let order = (rank, if lfu { slot.freq } else { 0 }, slot.last_access);
-
-				if best.is_none_or(|(b, _)| order < b) {
-					best = Some((order, slot.hashed));
-				}
-			};
-
-			match lfu {
-				true => {
-					for (rank, tier) in [(0u8, Tier::Slow), (1u8, Tier::Fast)] {
-						'buckets: for (_, &(head, _)) in g.freq_buckets(tier).iter() {
-							let mut i = head;
-
-							while i != NIL {
-								if g.slots[i as usize].object.is_some() {
-									consider(i, rank);
-									break 'buckets;
-								}
-
-								i = g.slots[i as usize].next;
-							}
-						}
-					}
-				},
-
-				false => {
-					let mut i = g.tail;
-
-					while i != NIL {
-						if g.slots[i as usize].object.is_some() {
-							consider(i, 0);
-							break;
-						}
-
-						i = g.slots[i as usize].prev;
-					}
-				},
-			}
-		}
-
-		best.map(|(_, key)| key)
 	}
 
 	/// CLOCK's hand: the oldest slot whose reference bit is CLEAR, granting a

@@ -19,7 +19,6 @@ use crate::error::CacheError;
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum PaperPolicy {
-	Auto,
 	LfuCompact,
 
 	/// Slab-layout counterparts of the single-queue designs. Same policy,
@@ -122,16 +121,11 @@ impl PaperPolicy {
 	pub fn is_hybrid(&self) -> bool {
 		matches!(self, PaperPolicy::FifoCompactHybrid { .. } | PaperPolicy::ClockCompactHybrid { .. } | PaperPolicy::LfuCompactHybrid { .. } | PaperPolicy::LruCompactHybrid { .. } | PaperPolicy::LruLazyCopyCompactHybrid { .. } | PaperPolicy::LruLfuCompactHybrid { .. } | PaperPolicy::LruSizedCompactHybrid { .. } | PaperPolicy::S3FifoGhostCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid { .. } | PaperPolicy::S3FifoCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQGhostCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulReprieveCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQCompactHybrid { .. })
 	}
-
-	pub fn is_auto(&self) -> bool {
-		matches!(self, PaperPolicy::Auto)
-	}
 }
 
 impl Display for PaperPolicy {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			PaperPolicy::Auto => write!(f, "auto"),
 			PaperPolicy::LfuCompact => write!(f, "lfu-compact"),
 			PaperPolicy::FifoCompact => write!(f, "fifo-compact"),
 			PaperPolicy::ClockCompact => write!(f, "clock-compact"),
@@ -183,7 +177,6 @@ impl FromStr for PaperPolicy {
 
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
 		let policy = match value {
-			"auto" => PaperPolicy::Auto,
 			"lfu-compact" => PaperPolicy::LfuCompact,
 			"fifo-compact" => PaperPolicy::FifoCompact,
 			"clock-compact" => PaperPolicy::ClockCompact,

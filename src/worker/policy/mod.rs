@@ -9,8 +9,8 @@
 /// Persistent migration queue: a standing pool that drains physical tier
 /// copies continuously, decoupled from batch boundaries.
 ///
-/// `parallel_migration` below fans a single *batch* out across a pool, which
-/// measurement showed cannot help this workload: 99.4% of demotion volume
+/// Fanning a single *batch* out across a pool (the removed `parallel_migration`
+/// module) was measured not to help this workload: 99.4% of demotion volume
 /// arrives as single-object batches (37M calls of exactly 1 object against 9
 /// calls of >=16K), so there is nothing to fan out and the threshold check is
 /// pure overhead. The work is genuinely fine-grained, not genuinely serial --
@@ -835,8 +835,8 @@ pub mod migration_queue {
 		/// `demotion_accounting`'s doc on the struct.
 		///
 		/// One `Relaxed` store per `apply_tier_migrations` pass, not per
-		/// migration. The value is constant for the life of a hybrid cache (a
-		/// hybrid cache exposes no way to switch policy), so this is a cheap way
+		/// migration. The value is constant for the life of a hybrid cache (its
+		/// policy is fixed when it is built), so this is a cheap way
 		/// to keep the consumers policy-agnostic rather than a hot write.
 		pub fn set_demotion_accounting(&self, enabled: bool) {
 			self.demotion_accounting.store(enabled, Ordering::Relaxed);
@@ -972,123 +972,6 @@ pub mod migration_queue {
 		}
 	}
 
-}
-
-/// Optional parallel application of tier-migration batches.
-///
-/// `apply_tier_migrations` builds each destination buffer with `migrate`
-/// (a real allocation plus a full byte copy of the value) and then swaps the
-/// pointer under the object map's shard guard. Profiling the saturated
-/// `PolicyWorker` thread on the benchmark traces attributes ~52% of its time
-/// to that work -- ~37% in `__memmove_avx_unaligned_erms` for the copies
-/// themselves plus ~15% in the surrounding closure -- while the remaining
-/// ~38% is hash-table mutation on the single policy stack, which is
-/// inherently serial and stays on the worker.
-///
-/// The copies, unlike the stack mutation, share no mutable state: `migrate`
-/// is `Fn + Send + Sync`, the object map is a `DashMap`, and the demotion /
-/// promotion counters are atomics. So a batch can be fanned out across a
-/// dedicated pool.
-///
-/// Compiled in unconditionally and gated at run time on batch length, since
-/// the win is entirely batch-size dependent: every hybrid stack holds its fast
-/// tier at a single continuous threshold, so a settle moves only what the event
-/// that triggered it displaced and the overwhelming majority of calls carry
-/// 0 or 1 object, where a fan-out would be pure overhead. Only batches at or above
-/// [`threshold`] go to the pool; everything else runs inline exactly as
-/// before.
-pub mod parallel_migration {
-	use std::sync::OnceLock;
-
-	use rayon::ThreadPool;
-
-	/// Zero, i.e. parallel application is off by default: every batch
-	/// runs inline on the worker regardless of size. Set
-	/// `PARALLEL_MIGRATION_THRESHOLD` to a non-zero value to re-enable
-	/// the fan-out.
-	///
-	/// A measured dead end rather than a tuned value. The batch-size
-	/// distribution leaves nothing to fan out: 99.4% of demotion volume
-	/// arrives as single-object batches, so a threshold low enough to
-	/// engage at all would mostly have the pool paying dispatch cost to
-	/// hand one object to one thread. The ~626K-object passes this
-	/// module was built for only appeared under a wide high/low drain band
-	/// (since removed), and were far too rare to pay back the machinery -- so the value is 0,
-	/// not a compromise picked somewhere between 1 and that size.
-	///
-	/// Superseded by the `migration_queue` module above, which takes the
-	/// same win without depending on batch size: a standing pool of
-	/// consumers sharded by key hash drains migrations off the worker as
-	/// they are produced, one object at a time.
-	pub const DEFAULT_THRESHOLD: usize = 0;
-
-	/// Pool size when parallel application does engage.
-	pub const DEFAULT_THREADS: usize = 4;
-
-	static THRESHOLD: OnceLock<usize> = OnceLock::new();
-	static POOL: OnceLock<Option<ThreadPool>> = OnceLock::new();
-
-	/// `PARALLEL_MIGRATION_THRESHOLD=0` disables parallel application
-	/// entirely -- every batch runs inline, which is exactly the behaviour
-	/// that predates this module.
-	pub fn threshold() -> usize {
-		*THRESHOLD.get_or_init(|| {
-			std::env::var("PARALLEL_MIGRATION_THRESHOLD")
-				.ok()
-				.and_then(|value| value.parse::<usize>().ok())
-				.unwrap_or(DEFAULT_THRESHOLD)
-		})
-	}
-
-	/// Dedicated pool rather than rayon's global one: migration is latency
-	/// -sensitive background work and should not queue behind, or be starved
-	/// by, anything else that happens to use rayon. Threads are named
-	/// `mig-N` so they are identifiable in `perf`/`top`. Returns `None` if
-	/// the pool could not be built, in which case callers fall back to
-	/// inline application rather than failing the migration.
-	fn pool() -> Option<&'static ThreadPool> {
-		POOL.get_or_init(|| {
-			let threads = std::env::var("PARALLEL_MIGRATION_THREADS")
-				.ok()
-				.and_then(|value| value.parse::<usize>().ok())
-				.filter(|threads| *threads > 0)
-				.unwrap_or(DEFAULT_THREADS);
-
-			rayon::ThreadPoolBuilder::new()
-				.num_threads(threads)
-				.thread_name(|index| format!("mig-{index}"))
-				.build()
-				.ok()
-		})
-		.as_ref()
-	}
-
-	/// Applies `apply` to every entry of `batch`, on the pool when the batch
-	/// is large enough to be worth the fan-out and inline otherwise.
-	///
-	/// Returns how many entries `apply` reported as *completed* (`true`).
-	/// Tallied by the iterator rather than by a shared counter the closure
-	/// bumps: the serial path adds up a plain local and rayon's `count`
-	/// reduces per-thread partials, so counting costs no atomic per entry on
-	/// either path -- the caller pays one `fetch_add` for the whole batch.
-	pub fn apply_batch<E, F>(batch: Vec<E>, apply: F) -> u64
-	where
-		E: Copy + Send + Sync,
-		F: Fn(E) -> bool + Send + Sync,
-	{
-		let parallel_threshold = threshold();
-
-		if parallel_threshold == 0 || batch.len() < parallel_threshold {
-			return batch.into_iter().filter(|entry| apply(*entry)).count() as u64;
-		}
-
-		let Some(pool) = pool() else {
-			return batch.into_iter().filter(|entry| apply(*entry)).count() as u64;
-		};
-
-		use rayon::prelude::*;
-		pool.install(|| batch.into_par_iter().filter(|entry| apply(*entry)).count() as u64)
-	}
 }
 
 /// TEMPORARY DIAGNOSTIC: batch-size histograms for tier migrations and
@@ -1498,23 +1381,14 @@ pub mod eviction_watermarks {
 }
 
 mod policy_stack;
-mod mini_stack;
-mod event;
-mod trace;
 
 use std::{
 	thread,
-	sync::Arc,
 	time::{Instant, Duration},
-	io::{Seek, SeekFrom},
-	collections::VecDeque,
 };
 
 use typesize::TypeSize;
-use parking_lot::RwLock;
-use crossbeam_channel::{Sender, Receiver, unbounded};
-use log::{info, warn, error};
-use kwik::fmt;
+use crossbeam_channel::{Sender, Receiver};
 
 // Gated exactly as the `object_store` module itself is (see `lib.rs`) rather
 // than on the hybrid features that were its original users, because
@@ -1534,21 +1408,31 @@ use crate::{
 	EraseKey,
 	erase,
 	error::CacheError,
-	policy::PaperPolicy,
 	object::ObjectSize,
 	worker::{
 		Worker,
 		WorkerEvent,
 		WorkerReceiver,
-		register_worker,
-		policy::{
-			mini_stack::MiniStackManager,
-			event::{StackEvent, TraceEvent},
-			trace::{TraceWorker, TraceFragment},
-			policy_stack::{PolicyStack, init_policy_stack},
-		},
+		policy::policy_stack::PolicyStack,
 	},
 };
+
+// The split stacks' constructor: a merged build's stack is the object map itself.
+#[cfg(not(feature = "merged_object_store"))]
+use crate::worker::policy::policy_stack::init_policy_stack;
+
+// The policy, for the tiered paths (the byte gate's state, the size-split
+// shares) and the tests.
+#[cfg(feature = "hybrid_cache_common")]
+use crate::policy::PaperPolicy;
+
+// What the tiered test modules below take through `use super::*`.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+use std::sync::Arc;
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+use crossbeam_channel::unbounded;
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+use crate::worker::register_worker;
 
 // Re-exported (fully `pub`, not `pub(crate)`) so sibling modules (e.g.
 // `worker::manager`) can name `Tier` without reaching into the private
@@ -1574,9 +1458,6 @@ pub(crate) use policy_stack::clock_hand_budget;
 // consumer that counts it (see `MigrationOrigin`).
 #[cfg(any(feature = "hybrid_cache_common", feature = "merged_object_store"))]
 pub use policy_stack::{MigrationEntry, MigrationOrigin, TaggedMigration};
-
-// the polling value must be a power of 2
-const RECONSTRUCT_POLICY_POLLING: usize = 1_048_576;
 
 /// What a client observed of a key's bytes, carried to the policy worker by
 /// its event: the tier a `set` BUILT the new value in (`WorkerEvent::Set`), or
@@ -1649,8 +1530,7 @@ const RECONSTRUCT_POLICY_POLLING: usize = 1_048_576;
 /// then `handle_del`) and a wipe (`clear`). Each leaves the key's in-flight
 /// entries acting on whatever value holds the key next -- the new-key case.
 /// A resize changes placements only through evictions and the settle, which
-/// pushes (`resize_fast_tier`); a policy switch is unreachable for a tiered
-/// cache (one policy), and a flat stack has no tiers.
+/// pushes (`resize_fast_tier`), and a flat stack has no tiers.
 ///
 /// # The new-key rule (review M1)
 ///
@@ -1853,7 +1733,6 @@ fn corrective<E: MigrationEntry>(
 	}
 }
 
-const AUTO_POLICY_DURATION: Duration = Duration::from_secs(3_600);
 const SET_RECENCY_DURATION: Duration = Duration::from_secs(5);
 const SHORT_POLLING_DURATION: Duration = Duration::from_millis(1);
 const LONG_POLLING_DURATION: Duration = Duration::from_secs(1);
@@ -1865,7 +1744,7 @@ pub struct PolicyWorker<K, V> {
 	status: StatusRef,
 	overhead_manager: OverheadManagerRef,
 
-	policy_stack: Option<Box<dyn PolicyStack>>,
+	policy_stack: Box<dyn PolicyStack>,
 
 	/// Capacity-eviction watermarks for `apply_evictions`, snapshotted at
 	/// construction (see `eviction_watermarks::Watermarks`). `1.0`/`1.0`
@@ -1874,40 +1753,6 @@ pub struct PolicyWorker<K, V> {
 	/// loop.
 	eviction_watermarks: eviction_watermarks::Watermarks,
 
-	trace_fragments: Arc<RwLock<VecDeque<TraceFragment>>>,
-	/// Sender into `TraceWorker`, or `None` when access tracing is switched
-	/// off entirely (see `trace_is_useful`).
-	///
-	/// The trace exists for exactly one purpose: replaying past accesses to
-	/// rebuild a *different* policy's stack after a live policy switch (see
-	/// `handle_policy` -> `reconstruct_policy_stack`). A cache configured with
-	/// a single policy -- which is every hybrid cache, and any `paper-server`
-	/// instance pinned to one eviction policy -- can never perform that
-	/// switch, so every byte it records is written and never read.
-	///
-	/// Leaving it on wasn't free: each cache read produced a second channel
-	/// send from this thread into `TraceWorker`, which then copied a 13-byte
-	/// chunk per hit into an on-disk temp file and flushed it once a second.
-	/// At this crate's real request rates that is tens of MB/s of pure write
-	/// amplification, plus a whole extra thread competing for cores with the
-	/// GET path, in service of a reconstruction that can never be requested.
-	trace_worker: Option<Sender<StackEvent>>,
-	/// `TraceWorker`'s own thread handle -- `None` after `WorkerEvent::
-	/// Shutdown` has already been handled once (joined and taken; see the
-	/// `run` loop's `Shutdown` arm), `Some` otherwise. Owned here (not by
-	/// `WorkerManager`/`PaperCache` directly) because `TraceWorker` is
-	/// itself spawned from inside `PolicyWorker::new`, not from the
-	/// `WorkerManager::new*` call sites those two collect handles from --
-	/// joining it here, before this worker's own `run` returns, means
-	/// `PaperCache`'s top-level `WorkerHandles` list doesn't need to know
-	/// about this nested worker at all.
-	trace_handle: Option<thread::JoinHandle<Result<(), CacheError>>>,
-
-	mini_stack_manager: MiniStackManager,
-	mini_index: Option<usize>,
-	current_policy: Arc<RwLock<PaperPolicy>>,
-
-	last_auto_policy_time: Option<Instant>,
 	last_set_time: Option<Instant>,
 
 	/// Reallocates a value into the target tier's representation (e.g.
@@ -2059,7 +1904,7 @@ impl WorkerMetadata {
 /// What one step of `PolicyWorker::evict_victim` did.
 enum Victim {
 	/// A victim of the stack's order, removed from the map.
-	Evicted(HashedKey),
+	Evicted,
 
 	/// The stack named a key the map no longer holds (it is gone from the
 	/// stack now); nothing was removed.
@@ -2089,14 +1934,6 @@ where
 		// `CacheError::Internal` rather than waiting out its window.
 		#[cfg(feature = "hybrid_cache_common")]
 		let _gone = crate::gate::WorkerGoneGuard::new(&self.status);
-
-		let (
-			policy_reconstruct_tx,
-			policy_reconstruct_rx,
-		) = unbounded::<Box<dyn PolicyStack>>();
-
-		let policy_reconstruct_tx = Arc::new(policy_reconstruct_tx);
-		let mut buffered_events = Vec::<StackEvent>::new();
 
 		// Drained into and reused across iterations rather than re-collected
 		// into a fresh `Vec` each pass. The collect is needed at all only
@@ -2132,41 +1969,21 @@ where
 					WorkerEvent::Del(key, _) => self.handle_del(key),
 					WorkerEvent::Expire(key) => self.handle_expire(key),
 
-					// Borrowed, not moved: `event` is read again below.
-					WorkerEvent::Wipe(ref ack) => self.handle_wipe(ack.as_ref()),
+					WorkerEvent::Wipe(ack) => self.handle_wipe(ack.as_ref()),
 					WorkerEvent::Resize(max_size) => self.handle_resize(max_size),
 					WorkerEvent::ResizeFastTier(size) => self.handle_resize_fast_tier(size),
 					WorkerEvent::ResizeLargeFastTier(size) => self.handle_resize_large_fast_tier(size),
 					WorkerEvent::ResizeSizeThreshold(size) => self.handle_resize_size_threshold(size),
 
-					WorkerEvent::Policy(policy) => {
-						self.handle_policy(policy, policy_reconstruct_tx.clone());
-					},
-
 					WorkerEvent::Shutdown => {
-						// Cascade to our own child worker before stopping
-						// ourselves -- see `StackEvent::Shutdown`'s doc
-						// comment. Best-effort: if `TraceWorker` already
-						// exited on its own (e.g. a prior error return),
-						// the send is simply a no-op and the join returns
-						// immediately.
-						if let Some(trace_worker) = &self.trace_worker {
-							let _ = trace_worker.send(StackEvent::Shutdown);
-						}
-
-						if let Some(handle) = self.trace_handle.take() {
-							let _ = handle.join();
-						}
-
 						// Real totals, whatever this run's call volume was.
 						migstats::dump_final();
 
 						return Ok(());
 					},
 
-					// Borrowed, not moved: `event` is read again below.
 					#[cfg(feature = "hybrid_cache_common")]
-					WorkerEvent::Audit(ref reply) => {
+					WorkerEvent::Audit(reply) => {
 						// A requester that stopped waiting is no loss.
 						let _ = reply.send(self.placement_audit());
 					},
@@ -2175,24 +1992,6 @@ where
 					WorkerEvent::MakeRoom(request) => self.handle_make_room(request),
 
 					_ => {},
-				}
-
-				// Skipped entirely when tracing is off (see `trace_worker`'s
-				// doc comment) -- not just the send, but deriving the
-				// `StackEvent` in the first place. This is the per-access cost
-				// that a single-policy cache was paying for a replay it can
-				// never perform.
-				if let Some(trace_worker) = &self.trace_worker {
-					if let Some(stack_event) = StackEvent::maybe_from_worker_event(&event) {
-						if self.policy_stack.is_some() {
-							if let Err(err) = trace_worker.send(stack_event) {
-								error!("Could not send stack event to trace worker: {err:?}");
-								return Err(CacheError::Internal);
-							}
-						} else {
-							buffered_events.push(stack_event);
-						}
-					}
 				}
 
 				// Applied per-event rather than once after the whole batch
@@ -2260,9 +2059,7 @@ where
 				}
 			}
 
-			self.apply_buffered_events(&buffered_events, &policy_reconstruct_rx);
-			self.flush_buffered_events(&mut buffered_events)?;
-			self.apply_evictions(&mut buffered_events)?;
+			self.apply_evictions()?;
 
 			// INSTRUMENTATION: the invariant the failing run violated. Sampled on
 			// the same cadence as MIGSTATS so the two can be correlated.
@@ -2270,13 +2067,13 @@ where
 				use std::sync::atomic::Ordering;
 				static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 				if TICK.fetch_add(1, Ordering::Relaxed) % 4_096 == 0 {
-					let stack_len = self.policy_stack.as_ref().map_or(0, |s| s.len());
+					let stack_len = self.policy_stack.len();
 					let map_len = self.status.live_num_objects() as usize;
-					let (fo, so, fb, sb) = self.policy_stack.as_ref()
-						.map_or((0, 0, 0, 0), |s| (
-							s.fast_object_count(), s.slow_object_count(),
-							s.fast_bytes_used(), s.slow_bytes_used(),
-						));
+					let s = &self.policy_stack;
+					let (fo, so, fb, sb) = (
+						s.fast_object_count(), s.slow_object_count(),
+						s.fast_bytes_used(), s.slow_bytes_used(),
+					);
 					eprintln!(
 						"DIVERGE map={map_len} stack={stack_len} delta={} fallback={} fast_obj={fo} slow_obj={so} fast_b={fb} slow_b={sb} t_ms={}",
 						map_len as i64 - stack_len as i64,
@@ -2348,11 +2145,6 @@ where
 			#[cfg(feature = "hybrid_cache_common")]
 			self.instrument_pass(now);
 
-			if let Some(policy) = self.perform_auto_policy(now, has_current_set) {
-				self.status.set_auto_policy(policy)?;
-				self.handle_policy(policy, policy_reconstruct_tx.clone());
-			}
-
 			// The pass is complete: what a test waits on to see that a kick
 			// reached this thread.
 			#[cfg(test)]
@@ -2365,10 +2157,9 @@ where
 
 impl<K, V> PolicyWorker<K, V>
 where
-	// `Send + Sync` are required by `parallel_migration::apply_batch`, which
-	// fans a large migration batch out across a pool; they hold already for
-	// every real instantiation, since the worker owns the object map on its
-	// own thread. `Clone` is required because a tier migration now rebuilds the
+	// `Send + Sync`: the worker holds the object map on its own thread (and a
+	// tiered cache's migration consumers share it); they hold for every real
+	// instantiation. `Clone` is required because a tier migration now rebuilds the
 	// value header around the key it copies from the old one -- see
 	// `TieredValue::migrated_to`.
 	K: 'static + Eq + Clone + TypeSize + Send + Sync,
@@ -2384,11 +2175,6 @@ where
 		migstats::mark_origin();
 
 		let max_cache_size = status.max_size();
-
-		let mini_stacks = MiniStackManager::new(
-			status.policies(),
-			max_cache_size,
-		);
 
 		let policy = status.policy();
 		#[cfg(not(feature = "merged_object_store"))]
@@ -2414,13 +2200,6 @@ where
 			)?,
 		);
 
-		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
-		let (trace_worker, trace_handle) = spawn_trace_worker(
-			trace_is_useful(&status),
-			&trace_fragments,
-			status.max_size(),
-		)?;
-
 		let worker = PolicyWorker {
 			listener,
 
@@ -2428,19 +2207,9 @@ where
 			status,
 			overhead_manager,
 
-			policy_stack: Some(policy_stack),
+			policy_stack,
 			eviction_watermarks: eviction_watermarks::Watermarks::from_env(),
 
-			trace_fragments,
-			trace_worker,
-			trace_handle,
-
-			mini_stack_manager: mini_stacks,
-			mini_index: None,
-
-			current_policy: Arc::new(RwLock::new(policy)),
-
-			last_auto_policy_time: None,
 			last_set_time: None,
 
 			#[cfg(feature = "hybrid_cache_common")]
@@ -2503,29 +2272,6 @@ where
 
 		let max_cache_size = status.max_size();
 
-		// Hybrid caches (the only callers of this constructor) are always
-		// constructed with a single-element policies list containing only
-		// their own fixed policy (e.g. `[PaperPolicy::LruCompactHybrid]`)
-		// and never with `PaperPolicy::Auto` -- there is no public API to
-		// switch a hybrid cache's policy at all
-		// (see `PaperCache<K, TieredBuffer, S>`'s design: "no `policy()`
-		// method, there's only one policy"). `perform_auto_policy` already
-		// short-circuits on `!self.status.is_auto_policy()` before ever
-		// consulting a mini stack, so passing the real (single-entry)
-		// policies list here only bought a self-referential `MiniStack` that
-		// received a sampled copy of every get/set/del/resize/wipe/eviction
-		// event (`MiniStackManager`'s `handle_*` methods aren't gated by
-		// `is_auto_policy` at all) and could never possibly be switched to.
-		// An empty policies list here means zero `MiniStack`s are ever
-		// constructed, so those `handle_*` calls become true no-ops. Safe
-		// even for the eviction-during-reconstruction path
-		// (`apply_mini_evictions`/`MiniStackManager::get_eviction`, the one
-		// place that indexes directly into the mini-stacks slice): it only
-		// runs when `self.mini_index` is `Some`, which is only ever set by
-		// the explicit-policy-switch handler elsewhere in this file --
-		// unreachable here for the same reason auto-switching is.
-		let mini_stacks = MiniStackManager::new(&[], max_cache_size);
-
 		let policy = status.policy();
 		#[cfg(not(feature = "merged_object_store"))]
 		let policy_stack = init_policy_stack(policy, max_cache_size);
@@ -2550,16 +2296,6 @@ where
 			)?,
 		);
 
-		// A hybrid cache is always constructed with a single fixed policy and
-		// exposes no way to switch it, so `trace_is_useful` is always false
-		// here -- no `TraceWorker` thread, and no per-access trace writes.
-		let trace_fragments = Arc::new(RwLock::new(VecDeque::new()));
-		let (trace_worker, trace_handle) = spawn_trace_worker(
-			trace_is_useful(&status),
-			&trace_fragments,
-			status.max_size(),
-		)?;
-
 		#[cfg(feature = "hybrid_cache_common")]
 		let migration_queue = migration_queue::MigrationQueue::spawn(
 			objects.clone(),
@@ -2574,19 +2310,9 @@ where
 			status,
 			overhead_manager,
 
-			policy_stack: Some(policy_stack),
+			policy_stack,
 			eviction_watermarks: eviction_watermarks::Watermarks::from_env(),
 
-			trace_fragments,
-			trace_worker,
-			trace_handle,
-
-			mini_stack_manager: mini_stacks,
-			mini_index: None,
-
-			current_policy: Arc::new(RwLock::new(policy)),
-
-			last_auto_policy_time: None,
 			last_set_time: None,
 
 			tier_migration: true,
@@ -2631,15 +2357,11 @@ where
 
 	/// `served` is the tier a hit's value was served from, `None` on a miss.
 	fn handle_get(&mut self, key: HashedKey, served: Option<Tier>) {
-		if let Some(stack) = &mut self.policy_stack {
-			stack.record_access(key, served.is_some());
-		}
+		self.policy_stack.record_access(key, served.is_some());
 
 		// An LFU slow hit settles, and a settle can latch.
 		#[cfg(feature = "hybrid_cache_common")]
 		self.publish_admission_latch();
-
-		self.mini_stack_manager.handle_get(key);
 
 		// The heal (see `Observed`): only a hit served from the SLOW tier is
 		// checked against the stack's placement, and only while nothing of its
@@ -2655,8 +2377,6 @@ where
 
 	/// `dram_resident` is the part of `size` that never migrates; the policy
 	/// stack needs it to keep `fast_used` / `slow_used` to migrating bytes.
-	/// The mini stacks model policy behaviour, not tier occupancy, so they
-	/// keep taking the full `base_size`.
 	///
 	/// `previous` is the base size of the value the map insert replaced
 	/// (`None`: it replaced nothing). It tells the stack what the insert did
@@ -2731,29 +2451,25 @@ where
 		let fence = self.tier_migration
 			&& self.status.migration_in_flight().moved_since(key, mark)
 			&& (fresh
-				|| self.policy_stack.as_ref().is_some_and(|stack| stack.placement_of(key).is_none()));
+				|| self.policy_stack.placement_of(key).is_none());
 
 		let event = match previous {
 			None => SetEvent::Fresh,
 			Some(previous) => SetEvent::Replaced { resized: previous != size },
 		};
 
-		if let Some(stack) = &mut self.policy_stack {
-			let applied = stack.insert_placed(key, size, dram_resident, event, placement);
+		let applied = self.policy_stack.insert_placed(key, size, dram_resident, event, placement);
 
-			#[cfg(feature = "hybrid_cache_common")]
-			if applied == Placement::Structural && placement != Placement::Structural {
-				self.status.gate().count_structural_placement();
-			}
-
-			#[cfg(not(feature = "hybrid_cache_common"))]
-			let _ = applied;
+		#[cfg(feature = "hybrid_cache_common")]
+		if applied == Placement::Structural && placement != Placement::Structural {
+			self.status.gate().count_structural_placement();
 		}
+
+		#[cfg(not(feature = "hybrid_cache_common"))]
+		let _ = applied;
 
 		#[cfg(feature = "hybrid_cache_common")]
 		self.publish_admission_latch();
-
-		self.mini_stack_manager.handle_set(key, size);
 
 		#[cfg(feature = "hybrid_cache_common")]
 		if self.tier_migration {
@@ -2772,11 +2488,7 @@ where
 	}
 
 	fn handle_del(&mut self, key: HashedKey) {
-		if let Some(stack) = &mut self.policy_stack {
-			stack.remove(key);
-		}
-
-		self.mini_stack_manager.handle_del(key);
+		self.policy_stack.remove(key);
 
 		// S5a: the delete looked the key up with `entry`, which reserves a
 		// slot in its DashMap shard first (`crate::meta::ShardState`).
@@ -2813,21 +2525,15 @@ where
 	/// `remove` retires a DEAD slot of the key -- the one the reap left on the
 	/// list -- and never the live one, so it is called whatever the map holds.
 	/// Guarded, it would leave that DEAD slot behind whenever the key was set
-	/// again before this event. The mini stacks keep the guard.
+	/// again before this event.
 	fn handle_expire(&mut self, key: HashedKey) {
 		let live = self.object_exists(key);
-
-		if let Some(stack) = &mut self.policy_stack {
-			if !live || stack.remove_is_retire() {
-				stack.remove(key);
-			}
-		}
 
 		// Live: re-set between the reap and this notification, or live all
 		// along and left in place by the reap (`EraseKey::Expired`). Either
 		// way the entry belongs to that live object.
-		if !live {
-			self.mini_stack_manager.handle_del(key);
+		if !live || self.policy_stack.remove_is_retire() {
+			self.policy_stack.remove(key);
 		}
 
 		// S5a: the reap looked the key up with `entry`, as a delete does.
@@ -2855,11 +2561,7 @@ where
 	}
 
 	fn handle_resize(&mut self, size: CacheSize) {
-		if let Some(stack) = &mut self.policy_stack {
-			stack.resize(size);
-		}
-
-		self.mini_stack_manager.handle_resize(size);
+		self.policy_stack.resize(size);
 	}
 
 	/// Runtime-adjusts the fast-tier byte budget. Honoured by every hybrid
@@ -2867,9 +2569,7 @@ where
 	/// demotions, drained by `apply_tier_migrations` on the next pass through
 	/// the event loop.
 	fn handle_resize_fast_tier(&mut self, size: CacheSize) {
-		if let Some(stack) = &mut self.policy_stack {
-			stack.resize_fast_tier(size);
-		}
+		self.policy_stack.resize_fast_tier(size);
 
 		// A grow unlatches LFU admission; a shrink's settle can latch it.
 		#[cfg(feature = "hybrid_cache_common")]
@@ -2881,100 +2581,13 @@ where
 	/// policy stack. May itself trigger demotions, drained by
 	/// `apply_tier_migrations` on the next pass through the event loop.
 	fn handle_resize_large_fast_tier(&mut self, size: CacheSize) {
-		if let Some(stack) = &mut self.policy_stack {
-			stack.resize_large_fast_tier(size);
-		}
+		self.policy_stack.resize_large_fast_tier(size);
 	}
 
 	/// Runtime-adjusts the small/large size-classification threshold
 	/// (`lru_sized_compact_hybrid_cache`). No-op for every other policy stack.
 	fn handle_resize_size_threshold(&mut self, size: CacheSize) {
-		if let Some(stack) = &mut self.policy_stack {
-			stack.resize_size_threshold(size);
-		}
-	}
-
-	#[cfg_attr(feature = "merged_object_store", allow(unreachable_code))]
-	fn handle_policy(
-		&mut self,
-		policy: PaperPolicy,
-		policy_reconstruct_tx: Arc<Sender<Box<dyn PolicyStack>>>,
-	) {
-		#[cfg(feature = "merged_object_store")]
-		{
-			// Reconstruction replays a trace into a NEW stack and swaps it in.
-			// There is nothing to swap here: the stack is a handle on the object
-			// map, and a second one would be a second view of the same data, not
-			// a rebuilt structure. Unreachable in practice anyway -- a merged
-			// build runs one fixed policy -- but silent divergence is exactly
-			// what this design exists to make impossible, so it is refused
-			// rather than left to the trace-worker guard below.
-			let _ = policy_reconstruct_tx;
-			warn!("Ignoring switch to {policy}: the merged store has one policy");
-			return;
-		}
-		if policy.is_auto() || policy == *self.current_policy.read() {
-			return;
-		}
-
-		// Defensive: reconstruction replays the access trace, so without one
-		// there is nothing to rebuild the new stack from. Bail before the
-		// teardown below rather than after -- clearing `policy_stack` for a
-		// reconstruction that can never deliver would leave this worker with
-		// no stack at all, permanently. Unreachable in practice: tracing is
-		// only off when a single policy is configured, and both callers
-		// (`WorkerEvent::Policy`, itself validated against the configured
-		// policy list by `PaperCache::policy()`, and `perform_auto_policy`,
-		// which picks from that same list) can then only ever name the policy
-		// already running, which the equality check above already caught.
-		if self.trace_worker.is_none() {
-			warn!("Ignoring switch to {policy}: policy reconstruction is disabled");
-			return;
-		}
-
-		info!(
-			"Switching policy {} to {policy}",
-			self.current_policy.read(),
-		);
-
-		*self.current_policy.write() = policy;
-
-		let mini_index = self.mini_stack_manager.get_index(&policy);
-
-		self.policy_stack = None;
-		self.mini_index = Some(mini_index);
-
-		let max_cache_size = self.status.max_size();
-		let current_policy = self.current_policy.clone();
-		let trace_fragments = self.trace_fragments.clone();
-
-		thread::spawn(move || {
-			info!("Reconstructing {policy} stack");
-			let now = Instant::now();
-
-			let reconstruction_result = reconstruct_policy_stack(
-				policy,
-				max_cache_size,
-				current_policy.clone(),
-				trace_fragments.clone(),
-			);
-
-			if let Ok(stack) = reconstruction_result {
-				// check to make sure the configured policy was not modified
-				// before sending the reconstructed stack
-				if policy == *current_policy.read() {
-					info!(
-						"{policy} stack reconstructed with {} object(s) in {:?}",
-						fmt::number(stack.len()),
-						now.elapsed(),
-					);
-
-					let _ = policy_reconstruct_tx.send(stack);
-				} else {
-					warn!("The policy changed during reconstruction");
-				}
-			}
-		});
+		self.policy_stack.resize_size_threshold(size);
 	}
 
 	/// Empties the cache, on this thread, and then answers `ack` -- which
@@ -2983,7 +2596,7 @@ where
 	/// from the object count and the base size, so a client's insert racing
 	/// the clear stays counted exactly -- removed and taken off, or live and
 	/// kept -- and every counter reset, the LFU latch mirror among them);
-	/// then the stack, the mini stacks and, on a tiered cache, the tier gauges
+	/// then the stack and, on a tiered cache, the tier gauges
 	/// and the latch, republished from the empty stack: so when `wipe`
 	/// returns, `hybrid_stats` already reads an empty cache, and a `Set` this
 	/// worker handled before the `Wipe` cannot have left a live key its stack
@@ -3001,11 +2614,7 @@ where
 
 		self.status.clear(cleared);
 
-		if let Some(stack) = &mut self.policy_stack {
-			stack.clear();
-		}
-
-		self.mini_stack_manager.handle_wipe();
+		self.policy_stack.clear();
 
 		#[cfg(feature = "hybrid_cache_common")]
 		{
@@ -3045,9 +2654,7 @@ where
 	/// just handled observed (`drain_reconciled`).
 	#[cfg(feature = "hybrid_cache_common")]
 	fn apply_tier_migrations(&mut self) {
-		let Some((inline_demotion_accounting, migrations)) = self.drain_reconciled() else {
-			return;
-		};
+		let (inline_demotion_accounting, migrations) = self.drain_reconciled();
 
 		#[cfg(test)]
 		if let Some(drained) = &mut self.drained {
@@ -3061,10 +2668,7 @@ where
 			self.apply_migration_batches(migrations, inline_demotion_accounting);
 		}
 
-		let drained_demotions = match &mut self.policy_stack {
-			Some(stack) => stack.drain_demotions(),
-			None => 0,
-		};
+		let drained_demotions = self.policy_stack.drain_demotions();
 
 		if drained_demotions > 0 {
 			self.status.record_hybrid_demotions(drained_demotions);
@@ -3076,8 +2680,6 @@ where
 	/// tagged `MigrationOrigin::Reconcile` (see `Observed` for the whole
 	/// argument), and whether completed slow moves count as demotions for
 	/// this stack.
-	/// `None`, with the observations dropped, while there is no stack (a
-	/// flat policy switch's reconstruction).
 	///
 	/// The drain is taken FIRST and the placement read after it, so the
 	/// placement is at least as new as every intent the drain carries: read
@@ -3104,11 +2706,8 @@ where
 	/// move the key itself -- so handing it back would mean a new return
 	/// value through every stack, the flat ones included, to save one probe.
 	#[cfg(feature = "hybrid_cache_common")]
-	fn drain_reconciled(&mut self) -> Option<(bool, Vec<TaggedMigration>)> {
-		let Some(stack) = &mut self.policy_stack else {
-			self.observed.clear();
-			return None;
-		};
+	fn drain_reconciled(&mut self) -> (bool, Vec<TaggedMigration>) {
+		let stack = &mut self.policy_stack;
 
 		let mut migrations = stack.drain_tagged_migrations();
 
@@ -3140,7 +2739,7 @@ where
 			}
 		}
 
-		Some((stack.inline_demotion_accounting(), migrations))
+		(stack.inline_demotion_accounting(), migrations)
 	}
 
 	/// DIAGNOSTIC -- `WorkerEvent::Audit`, i.e. `PaperCache::placement_audit`:
@@ -3171,12 +2770,12 @@ where
 		}
 
 		let mut audit = crate::phys::PlacementAudit::default();
-		let stack = self.policy_stack.as_deref();
+		let stack = &*self.policy_stack;
 
 		self.objects.for_each_value(|key, tier, len| {
 			audit.record(
 				tier,
-				stack.and_then(|stack| stack.placement_of(key)),
+				stack.placement_of(key),
 				crate::phys::value_charge::<K>(len),
 			);
 		});
@@ -3194,7 +2793,7 @@ where
 	/// ways never to (see `migration_queue::apply_migration`). Measured
 	/// overstatement on one benchmark run was 4.6x. So the queued path leaves
 	/// the counting to the consumer that performs the swap, and the
-	/// synchronous path takes the completion count back from `apply_batch`.
+	/// synchronous path counts the completions itself.
 	///
 	/// Split out of [`Self::apply_tier_migrations`] so this accounting can be
 	/// unit-tested against hand-built batches, instead of having to coax a
@@ -3259,7 +2858,7 @@ where
 		}
 
 		// Correctives that landed inline, by destination (fast, slow): counted
-		// apart from the stack's completions `apply_batch` returns.
+		// apart from the stack's completions, which the two filters below count.
 		let inline_correctives = [AtomicU64::new(0), AtomicU64::new(0)];
 
 		// Build the destination buffer with NO object-map guard held -- see
@@ -3295,15 +2894,9 @@ where
 			}
 		};
 
-		let completed_demotions = parallel_migration::apply_batch(
-			demotions,
-			|entry| apply_physical(entry),
-		);
+		let completed_demotions = demotions.into_iter().filter(|&entry| apply_physical(entry)).count() as u64;
 
-		let completed_promotions = parallel_migration::apply_batch(
-			promotions,
-			|entry| apply_physical(entry),
-		);
+		let completed_promotions = promotions.into_iter().filter(|&entry| apply_physical(entry)).count() as u64;
 
 		// At most one atomic per direction per pass (and none at all when the
 		// count is zero, which with the queue on is every pass), where the old
@@ -3345,12 +2938,11 @@ where
 	/// behind the worker's back is republished.
 	#[cfg(feature = "hybrid_cache_common")]
 	fn publish_admission_latch(&self) {
-		if let Some(stack) = &self.policy_stack {
-			let latched = stack.admission_latched();
+		let stack = &self.policy_stack;
+		let latched = stack.admission_latched();
 
-			if self.status.hybrid_admission_latched() != latched {
-				self.status.set_hybrid_admission_latched(latched);
-			}
+		if self.status.hybrid_admission_latched() != latched {
+			self.status.set_hybrid_admission_latched(latched);
 		}
 	}
 
@@ -3367,26 +2959,25 @@ where
 	fn refresh_tier_gauges(&mut self) {
 		self.publish_admission_latch();
 
-		if let Some(stack) = &self.policy_stack {
-			self.status.set_hybrid_gauges(
-				stack.fast_bytes_used(),
-				stack.slow_bytes_used(),
-				stack.fast_object_count() as u64,
-				stack.slow_object_count() as u64,
-				stack.dram_reserved_bytes(),
-			);
+		let stack = &self.policy_stack;
+		self.status.set_hybrid_gauges(
+			stack.fast_bytes_used(),
+			stack.slow_bytes_used(),
+			stack.fast_object_count() as u64,
+			stack.slow_object_count() as u64,
+			stack.dram_reserved_bytes(),
+		);
 
-			self.status.set_hybrid_sized_gauges(
-				stack.small_fast_bytes_used(),
-				stack.large_fast_bytes_used(),
-				stack.small_slow_bytes_used(),
-				stack.large_slow_bytes_used(),
-				stack.small_fast_object_count() as u64,
-				stack.large_fast_object_count() as u64,
-				stack.small_slow_object_count() as u64,
-				stack.large_slow_object_count() as u64,
-			);
-		}
+		self.status.set_hybrid_sized_gauges(
+			stack.small_fast_bytes_used(),
+			stack.large_fast_bytes_used(),
+			stack.small_slow_bytes_used(),
+			stack.large_slow_bytes_used(),
+			stack.small_fast_object_count() as u64,
+			stack.large_fast_object_count() as u64,
+			stack.small_slow_object_count() as u64,
+			stack.large_slow_object_count() as u64,
+		);
 	}
 
 	/// The physical fast tier, once per pass, on a TIERED cache's worker (a
@@ -3494,7 +3085,7 @@ where
 		let structures = self.stack_structures();
 
 		// The box the stack lives in: DRAM, whatever node its structures are on.
-		let boxed = self.policy_stack.as_deref().map_or(0, |stack| crate::meta::box_bytes_of_val(stack));
+		let boxed = crate::meta::box_bytes_of_val(&*self.policy_stack);
 		let headers = self.status.live_num_objects().saturating_mul(self.metadata.header_bytes);
 
 		self.metadata.structures = structures;
@@ -3524,8 +3115,6 @@ where
 	///      published, and what it queues applied at once -- so after every
 	///      pass each design rests at or under its drain target, whatever its
 	///      new-key path does (the LFU latch, the slow admission queues).
-	///
-	/// Nothing to publish while a flat policy switch has no stack.
 	///
 	/// B2, the byte gate: its state (`byte_gate_state`) and, while it is
 	/// enabled, its levels (`gate::bands`) go out with eff; after the resettle
@@ -3559,10 +3148,7 @@ where
 		let status = &self.status;
 		let pass = &mut self.gate_pass;
 
-		let Some(stack) = self.policy_stack.as_mut() else {
-			gate.worker_pass(state, epoch);
-			return;
-		};
+		let stack = &mut self.policy_stack;
 
 		let fast_before = (stack.fast_bytes_used(), stack.fast_object_count());
 		let l_pub = status.live_num_objects();
@@ -3659,7 +3245,7 @@ where
 	/// the near level; `Ungated` for the designs whose settles do not bound
 	/// their DRAM -- the lazy-copy LRU (plan P6) and the faithful S3-FIFO
 	/// fast-admission pair, whose small queue is not clamped to the tier (Q7);
-	/// `NoStack` while a flat policy switch has none; `NotSole` while the cache
+	/// `NotSole` while the cache
 	/// is not P's only user; `Enabled` otherwise.
 	#[cfg(feature = "hybrid_cache_common")]
 	fn byte_gate_state(&self) -> crate::gate::GateState {
@@ -3682,10 +3268,6 @@ where
 				| PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(..)
 		) {
 			return GateState::Ungated;
-		}
-
-		if self.policy_stack.is_none() {
-			return GateState::NoStack;
 		}
 
 		match crate::phys::sole_fast_user() {
@@ -3727,13 +3309,13 @@ where
 			.min(crate::gate::MAKE_ROOM_BATCH);
 
 		let mut evicted = 0;
-		let mut tries = self.policy_stack.as_ref().map_or(0, |stack| stack.len()) as u64 + deficit;
+		let mut tries = self.policy_stack.len() as u64 + deficit;
 
 		while evicted < deficit && tries > 0 {
 			tries -= 1;
 
 			match self.evict_victim(false) {
-				Ok(Victim::Evicted(_)) => evicted += 1,
+				Ok(Victim::Evicted) => evicted += 1,
 				Ok(Victim::Missed) => {},
 				Ok(Victim::Exhausted) | Err(_) => break,
 			}
@@ -3751,10 +3333,7 @@ where
 	/// every tiered design meters itself).
 	#[cfg(feature = "hybrid_cache_common")]
 	fn stack_structures(&self) -> crate::meta::NodeBytes {
-		self.policy_stack
-			.as_ref()
-			.and_then(|stack| stack.structure_bytes())
-			.unwrap_or_default()
+		self.policy_stack.structure_bytes().unwrap_or_default()
 	}
 
 	/// S5a: republishes M when the event just handled changed the stack's
@@ -3768,67 +3347,6 @@ where
 		}
 	}
 
-	fn apply_buffered_events(
-		&mut self,
-		buffered_events: &[StackEvent],
-		policy_reconstruct_rx: &Receiver<Box<dyn PolicyStack>>,
-	) {
-		for mut stack in policy_reconstruct_rx.try_iter() {
-			for event in buffered_events {
-				match event {
-					StackEvent::Get(key) => stack.update(*key),
-					StackEvent::Set(key, size, resident) =>
-						stack.insert_resident(*key, *size, *resident),
-					StackEvent::Del(key) => stack.remove(*key),
-					StackEvent::Wipe => stack.clear(),
-					StackEvent::Resize(size) => stack.resize(*size),
-
-					// Never actually buffered -- `Shutdown` is sent
-					// directly to `trace_worker`, not derived from a
-					// `WorkerEvent` via `maybe_from_worker_event` (the only
-					// thing that populates `buffered_events`). Exhaustive
-					// match still needs an arm.
-					StackEvent::Shutdown => {},
-				}
-			}
-
-			info!("Policy switch complete");
-
-			self.policy_stack = Some(stack);
-			self.mini_index = None;
-		}
-	}
-
-	fn flush_buffered_events(
-		&self,
-		buffered_events: &mut Vec<StackEvent>,
-	) -> Result<(), CacheError> {
-		// Nothing ever buffers when tracing is off (both producers -- the run
-		// loop's stack-event derivation and `apply_evictions`' eviction
-		// record -- are gated on the same `Option`), so this is a plain
-		// no-op rather than a silent drop.
-		let Some(trace_worker) = &self.trace_worker else {
-			return Ok(());
-		};
-
-		if self.mini_index.is_some() {
-			// the mini policy is still running so stack events should be buffered
-			// until the full stack is reconstructed
-			return Ok(());
-		}
-
-		for event in buffered_events.iter() {
-			if let Err(err) = trace_worker.send(event.clone()) {
-				error!("Could not send buffered event to trace worker: {err:?}");
-				return Err(CacheError::Internal);
-			}
-		}
-
-		buffered_events.clear();
-
-		Ok(())
-	}
-
 	/// One victim of the stack's own order, removed from the map: `evict_one`
 	/// and `erase` -- the eviction pass's victim step, and `MakeRoom`'s (S5),
 	/// so both take victims the same way in both stores. `fallback`: when the
@@ -3836,12 +3354,7 @@ where
 	/// DashMap stack behind its map -- the eviction pass's last resort);
 	/// `MakeRoom` does not.
 	fn evict_victim(&mut self, fallback: bool) -> Result<Victim, CacheError> {
-		let Some(policy_stack) = self.policy_stack.as_mut() else {
-			error!("No active policy or mini stack");
-			return Err(CacheError::Internal);
-		};
-
-		let maybe_key = policy_stack
+		let maybe_key = self.policy_stack
 			.evict_one()
 			.map(|key| EraseKey::Hashed(key));
 
@@ -3874,7 +3387,7 @@ where
 		#[cfg(feature = "merged_object_store")]
 		if maybe_key.is_none() {
 			if self.objects.len() == 0 {
-				error!("Nothing left to evict with used_size still over max");
+				log::error!("Nothing left to evict with used_size still over max");
 
 				#[cfg(test)]
 				{
@@ -3892,35 +3405,26 @@ where
 			maybe_key,
 		);
 
-		let Ok((key, _evicted_obj)) = erase_result else {
+		let Ok((_key, _evicted_obj)) = erase_result else {
 			return Ok(Victim::Missed);
 		};
 
 		#[cfg(test)]
 		if let Some(evicted) = &mut self.evicted {
-			evicted.push(key);
+			evicted.push(_key);
 		}
 
 		#[cfg(feature = "hybrid_cache_common")]
-		if self.current_policy.read().is_hybrid() {
+		if self.status.policy().is_hybrid() {
 			self.status.record_hybrid_eviction();
 		}
 
-		Ok(Victim::Evicted(key))
+		Ok(Victim::Evicted)
 	}
 
-	fn apply_evictions(
-		&mut self,
-		buffered_events: &mut Vec<StackEvent>,
-	) -> Result<(), CacheError> {
-		if let Some(index) = self.mini_index {
-			self.apply_mini_evictions(index, buffered_events);
-			return Ok(());
-		}
-
-		// A copy, not the read guard: the victim step below needs the whole
-		// worker. The policy moves only on this thread (`handle_policy`).
-		let policy = *self.current_policy.read();
+	fn apply_evictions(&mut self) -> Result<(), CacheError> {
+		// The cache's one policy, for `used_size`'s per-object overhead.
+		let policy = self.status.policy();
 		let max_cache_size = self.status.max_size();
 
 		// `trigger_size` arms a capacity pass; `drain_target` is how far that
@@ -3958,8 +3462,7 @@ where
 			// whose `needs_capacity_eviction` stays true despite having
 			// nothing left to evict (which would indicate an accounting
 			// bug in the stack, not a real pending eviction).
-			let needs_capacity_eviction = self.policy_stack.as_ref()
-				.is_some_and(|stack| stack.len() > 0 && stack.needs_capacity_eviction());
+			let needs_capacity_eviction = self.policy_stack.len() > 0 && self.policy_stack.needs_capacity_eviction();
 
 			if !over_max_size && !needs_capacity_eviction {
 				migstats::rec(&migstats::EVICT, &migstats::EVICT_TOT, _evicted_this_call);
@@ -3967,77 +3470,16 @@ where
 				break;
 			}
 
-			let key = match self.evict_victim(true)? {
-				Victim::Evicted(key) => key,
+			match self.evict_victim(true)? {
+				Victim::Evicted => {},
 				Victim::Missed => continue,
 				Victim::Exhausted => break,
-			};
+			}
 
 			_evicted_this_call += 1;
-
-			// Only recorded when something can replay it. Without this gate an
-			// eviction-heavy workload would keep pushing into a `Vec` that
-			// `flush_buffered_events` now clears without sending, which is
-			// merely wasted work -- but wasted work inside the eviction loop,
-			// which is precisely the loop GET latency waits on.
-			if self.trace_worker.is_some() {
-				buffered_events.push(StackEvent::Del(key));
-			}
 		}
 
 		Ok(())
-	}
-
-	fn apply_mini_evictions(
-		&mut self,
-		mini_index: usize,
-		buffered_events: &mut Vec<StackEvent>,
-	) {
-		let max_cache_size = self.status.max_size();
-		let policy = self.current_policy.read();
-		let mut evictions = Vec::<HashedKey>::new();
-
-		while self.status.used_size(&policy) > max_cache_size {
-			let maybe_key = self.mini_stack_manager
-				.get_eviction(mini_index)
-				.map(|key| EraseKey::Hashed(key));
-
-			let erase_result = erase(
-				&self.objects,
-				&self.status,
-				&self.overhead_manager,
-				maybe_key,
-			);
-
-			let Ok((key, _)) = erase_result else {
-				continue;
-			};
-
-			evictions.push(key);
-			buffered_events.push(StackEvent::Del(key));
-		}
-
-		self.mini_stack_manager.apply_evictions(mini_index, evictions);
-	}
-
-	fn perform_auto_policy(&mut self, now: Instant, has_current_set: bool) -> Option<PaperPolicy> {
-		if has_current_set || !self.status.is_auto_policy() || self.mini_index.is_some() {
-			// don't switch the policy while (any of):
-			// * there is recent set activity
-			// * the auto policy is not configured
-			// * a stack is being reconstructed
-			return None;
-		}
-
-		let should_poll_policy = self.last_auto_policy_time
-			.is_none_or(|last_auto_policy_time| now - last_auto_policy_time > AUTO_POLICY_DURATION);
-
-		if !should_poll_policy {
-			return None;
-		}
-
-		self.last_auto_policy_time = Some(now);
-		self.mini_stack_manager.get_optimal_policy(&self.current_policy.read())
 	}
 
 	/// Parks this thread between polls.
@@ -4313,116 +3755,6 @@ fn split_tier_migrations<E: MigrationEntry>(migrations: Vec<E>) -> (Vec<E>, Vec<
 	let dropped = migrations.len() - demotions.len() - promotions.len();
 
 	(demotions, promotions, dropped)
-}
-
-/// Whether this cache can ever actually *use* an access trace.
-///
-/// The trace's only consumer is `reconstruct_policy_stack`, which replays it
-/// to rebuild a different policy's stack after a live policy switch. A switch
-/// requires a second policy to switch *to*: `PaperCache::policy()` rejects
-/// anything outside the configured `policies` list, and `handle_policy`
-/// early-returns when the requested policy already matches the current one.
-/// So with a single configured policy -- every hybrid cache, and any
-/// single-policy `paper-server` deployment -- reconstruction is unreachable
-/// and every trace write is dead weight on the hot path.
-///
-/// `PaperPolicy::Auto` doesn't change this: it drives `perform_auto_policy`,
-/// which picks from the same `policies` list via the mini stacks, so a
-/// one-entry list can only ever "switch" to the policy already running.
-fn trace_is_useful(status: &StatusRef) -> bool {
-	status.policies().len() > 1
-}
-
-/// Spawns `TraceWorker` and seeds it with the cache's starting size, or
-/// returns `(None, None)` when tracing is off (see `trace_is_useful`).
-///
-/// The initial `Resize` matters for reconstruction accuracy: a replay has to
-/// know the size the cache was at when the recorded accesses happened.
-fn spawn_trace_worker(
-	enabled: bool,
-	trace_fragments: &Arc<RwLock<VecDeque<TraceFragment>>>,
-	max_size: CacheSize,
-) -> Result<
-	(Option<Sender<StackEvent>>, Option<thread::JoinHandle<Result<(), CacheError>>>),
-	CacheError,
-> {
-	if !enabled {
-		return Ok((None, None));
-	}
-
-	let (trace_worker, trace_listener) = unbounded();
-
-	let trace_handle = register_worker(TraceWorker::new(
-		trace_listener,
-		trace_fragments.clone(),
-	));
-
-	if let Err(err) = trace_worker.send(StackEvent::Resize(max_size)) {
-		error!("Could not send initial cache size to trace worker: {err:?}");
-		return Err(CacheError::Internal);
-	}
-
-	Ok((Some(trace_worker), Some(trace_handle)))
-}
-
-fn reconstruct_policy_stack(
-	policy: PaperPolicy,
-	max_size: CacheSize,
-	current_policy: Arc<RwLock<PaperPolicy>>,
-	trace_fragments: Arc<RwLock<VecDeque<TraceFragment>>>,
-) -> Result<Box<dyn PolicyStack>, CacheError> {
-	let mut stack = init_policy_stack(policy, max_size);
-
-	for fragment in trace_fragments.read().iter() {
-		let mut fragment_modifiers = fragment.lock();
-		let fragment_reader = &mut fragment_modifiers.0;
-
-		let initial_position = match fragment_reader.stream_position() {
-			Ok(position) => position,
-
-			Err(err) => {
-				error!("Could not get trace fragment initial stream position: {err:?}");
-				return Err(CacheError::Internal);
-			},
-		};
-
-		// start reading the file from the beginning
-		if let Err(err) = fragment_reader.rewind() {
-			error!("Could not rewind trace fragment: {err:?}");
-			return Err(CacheError::Internal);
-		}
-
-		for (index, event) in fragment_reader.iter().enumerate() {
-			if index & (RECONSTRUCT_POLICY_POLLING - 1) == 0 && policy != *current_policy.read() {
-				// every RECONSTRUCT_POLICY_POLLING events, check if the currently
-				// configured policy is still the policy we're reconstructing and
-				// if it's not, move the reader back to its original position in
-				// the file and terminate the reconstruction
-				if let Err(err) = fragment_reader.seek(SeekFrom::Start(initial_position)) {
-					error!("Could not seek within trace fragment: {err:?}");
-				}
-
-				return Err(CacheError::Internal);
-			}
-
-			match event {
-				TraceEvent::Get(key) => stack.update(key),
-				TraceEvent::Set(key, size) => stack.insert(key, size),
-				TraceEvent::Del(key) => stack.remove(key),
-				TraceEvent::Resize(size) => stack.resize(size),
-			}
-		}
-
-		// ensure the underlying trace fragment is returned back to its original
-		// position (this is mostly just a sanity check as reading the file should
-		// already return it to the end which should be the orignal position)
-		if let Err(err) = fragment_reader.seek(SeekFrom::Start(initial_position)) {
-			error!("Could not seek within trace fragment: {err:?}");
-			return Err(CacheError::Internal);
-		}
-	}
-
-	Ok(stack)
 }
 
 unsafe impl<K, V> Send for PolicyWorker<K, V>
@@ -5571,7 +4903,7 @@ mod migration_accounting_tests {
 
 		let before = migration_queue::MIG_APPLIED.load(Ordering::Relaxed);
 
-		worker.policy_stack = Some(Box::new(ScriptedDrain { migrations }));
+		worker.policy_stack = Box::new(ScriptedDrain { migrations });
 		worker.apply_tier_migrations();
 
 		migration_queue::MIG_APPLIED.load(Ordering::Relaxed) - before
@@ -6220,6 +5552,8 @@ mod policy_worker_kick_tests {
 mod capacity_watermark_tests {
 	use super::*;
 
+	use std::collections::VecDeque;
+
 	use super::eviction_watermarks::{DEFAULT_HIGH, DEFAULT_LOW, Watermarks, clamped_low};
 
 	use crate::{
@@ -6411,8 +5745,7 @@ mod capacity_watermark_tests {
 		fill(&objects, &status, &overhead_manager, &mut worker, 1..=18);
 		assert_eq!(used(&status), 18 * per_object);
 
-		let mut buffered_events = Vec::new();
-		worker.apply_evictions(&mut buffered_events).unwrap();
+		worker.apply_evictions().unwrap();
 
 		// Exactly at the cap, not one object under it: the pre-watermark loop
 		// stops the instant `used_size` is no longer *over* `max_size`, and
@@ -6441,8 +5774,7 @@ mod capacity_watermark_tests {
 		fill(&objects, &status, &overhead_manager, &mut worker, 1..=18);
 		assert!(used(&status) > max_size);
 
-		let mut buffered_events = Vec::new();
-		worker.apply_evictions(&mut buffered_events).unwrap();
+		worker.apply_evictions().unwrap();
 
 		// One pass, and it went well past `max_size` -- the pre-watermark loop
 		// would have stopped at exactly 16 objects' worth.
@@ -6452,7 +5784,7 @@ mod capacity_watermark_tests {
 
 		// Back up to 11 objects: above the drain target, below the trigger.
 		fill(&objects, &status, &overhead_manager, &mut worker, 19..=21);
-		worker.apply_evictions(&mut buffered_events).unwrap();
+		worker.apply_evictions().unwrap();
 
 		// Nothing evicted at all. A pass that re-armed anywhere under the high
 		// mark would drain to 8 again on every set, which is the batch-of-one
@@ -6482,8 +5814,7 @@ mod capacity_watermark_tests {
 
 		fill(&objects, &status, &overhead_manager, &mut worker, 1..=18);
 
-		let mut buffered_events = Vec::new();
-		worker.apply_evictions(&mut buffered_events).unwrap();
+		worker.apply_evictions().unwrap();
 
 		assert_eq!(used(&status), 12 * per_object);
 		assert_eq!(objects.len() as u64, 12);
@@ -6497,10 +5828,10 @@ mod capacity_watermark_tests {
 		// Marks that would drain to 8 objects' worth if the internal condition
 		// were ever allowed to arm them.
 		worker.eviction_watermarks = Watermarks::new(0.75, 0.5);
-		worker.policy_stack = Some(Box::new(SubBudgetStack {
+		worker.policy_stack = Box::new(SubBudgetStack {
 			keys: VecDeque::new(),
 			budget: 2,
-		}));
+		});
 
 		fill(&objects, &status, &overhead_manager, &mut worker, 1..=4);
 
@@ -6517,8 +5848,7 @@ mod capacity_watermark_tests {
 			);
 		}
 
-		let mut buffered_events = Vec::new();
-		worker.apply_evictions(&mut buffered_events).unwrap();
+		worker.apply_evictions().unwrap();
 
 		// Four objects is far below even the low mark, so the capacity
 		// condition never fires: the stack drains to its own budget and stops
@@ -6931,7 +6261,7 @@ mod reconcile_tests {
 	/// The drain the event loop would apply after the event just handled --
 	/// the stack's entries and the reconcile's -- applied, and returned.
 	pub(super) fn drain_and_apply(worker: &mut Worker) -> Vec<TaggedMigration> {
-		let (inline, drain) = worker.drain_reconciled().expect("a stack");
+		let (inline, drain) = worker.drain_reconciled();
 		worker.apply_migration_batches(drain.clone(), inline);
 		drain
 	}
@@ -6957,7 +6287,7 @@ mod reconcile_tests {
 	}
 
 	pub(super) fn placement(worker: &Worker, key: HashedKey) -> Option<Tier> {
-		worker.policy_stack.as_ref().expect("a stack").placement_of(key)
+		worker.policy_stack.placement_of(key)
 	}
 
 	fn other(tier: Tier) -> Tier {
@@ -7054,7 +6384,7 @@ mod reconcile_tests {
 		let used = worker.status.used_size(&worker.status.policy());
 
 		worker.status.set_max_size(used - 1);
-		worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
+		worker.apply_evictions().expect("an eviction pass");
 		worker.status.set_max_size(1 << 30);
 		drain_and_apply(worker);
 	}
@@ -7120,7 +6450,7 @@ mod reconcile_tests {
 			assert_eq!(placement(&worker, J), None, "{policy}: a Set behind its value's delete admitted the key");
 
 			assert_eq!(
-				worker.policy_stack.as_ref().expect("a stack").len() as u64,
+				worker.policy_stack.len() as u64,
 				worker.status.live_num_objects(),
 				"{policy}: the stack tracks exactly the map's keys",
 			);
@@ -7313,7 +6643,7 @@ mod reconcile_tests {
 
 		assert_eq!(placement(&worker, K), None, "published, not yet placed");
 		assert_eq!(
-			worker.policy_stack.as_mut().expect("a stack").drain_tagged_migrations(),
+			worker.policy_stack.drain_tagged_migrations(),
 			vec![],
 			"nothing is queued before the worker takes the Set",
 		);

@@ -75,7 +75,7 @@ const TIERED: [PaperPolicy; 4] = [
 ];
 
 fn stack(worker: &Worker) -> &dyn PolicyStack {
-	worker.policy_stack.as_deref().expect("a stack")
+	&*worker.policy_stack
 }
 
 /// What the stack reports of its tiers: fast and slow bytes and objects, and
@@ -329,7 +329,7 @@ fn t8_a_promotion_its_own_settle_undoes_queues_only_the_settles_entry() {
 		// `evict_one_key`, keeping the drain of the pass.
 		let used = worker.status.used_size(&worker.status.policy());
 		worker.status.set_max_size(used - 1);
-		worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
+		worker.apply_evictions().expect("an eviction pass");
 		worker.status.set_max_size(1 << 30);
 		let drain = drain_and_apply(&mut worker);
 
@@ -1059,7 +1059,7 @@ fn r3_a_replaced_set_on_an_unlinked_slot_is_fenced_like_a_new_key() {
 	// this fixture's old trigger, a value twice the tier, slow with no
 	// settle) -- and the worker takes its drain, and has not applied it yet.
 	shrink_fast(&mut worker);
-	let (inline, held) = worker.drain_reconciled().expect("a stack");
+	let (inline, held) = worker.drain_reconciled();
 	restore_fast(&mut worker);
 	assert_eq!(of(&held, K), vec![Slow], "the settle demoted K");
 
@@ -1217,11 +1217,11 @@ fn r7_eviction_never_takes_an_unlinked_value() {
 	// Over the cache's size with nothing linked: the pass stops.
 	let used = worker.status.used_size(&worker.status.policy());
 	worker.status.set_max_size(used - 1);
-	worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
+	worker.apply_evictions().expect("an eviction pass");
 	assert!(objects.get_ref(&U).is_some(), "the pass took an unlinked value");
 
 	handle(&mut worker, U, published);
-	worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
+	worker.apply_evictions().expect("an eviction pass");
 	worker.status.set_max_size(1 << 30);
 	drain_and_apply(&mut worker);
 
@@ -1250,7 +1250,7 @@ fn an_eviction_pass_with_nothing_linked_errs_only_over_an_empty_store() {
 	// Only an unlinked value, over the size: the pass stops, silently.
 	let used = worker.status.used_size(&worker.status.policy());
 	worker.status.set_max_size(used - 1);
-	worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
+	worker.apply_evictions().expect("an eviction pass");
 
 	assert!(objects.get_ref(&U).is_some(), "the pass took an unlinked value");
 	assert_eq!(worker.nothing_left_to_evict, 0, "an unlinked value is a backlog, not an error");
@@ -1262,7 +1262,7 @@ fn an_eviction_pass_with_nothing_linked_errs_only_over_an_empty_store() {
 
 	worker.status.update_base_used_size(1 << 20);
 	worker.status.set_max_size(1 << 19);
-	worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
+	worker.apply_evictions().expect("an eviction pass");
 
 	assert_eq!(worker.nothing_left_to_evict, 1, "a store with nothing in it and used_size over the size is an error");
 
@@ -1295,7 +1295,7 @@ fn r9_a_dead_slot_at_the_tail_is_retired_once_by_the_evictor() {
 
 		publish_del(&worker.status, &worker.overhead_manager, &objects, K);
 
-		let victim = worker.policy_stack.as_mut().expect("a stack").evict_one();
+		let victim = worker.policy_stack.evict_one();
 		assert_eq!(victim, Some(X), "{policy}: the DEAD tail was nominated");
 		assert_eq!(objects.linked(), 1, "{policy}: the DEAD slot was retired");
 		charges_exact(&objects, false);
@@ -2162,7 +2162,7 @@ mod t14 {
 			self.worker.apply_tier_migrations();
 			let drain = self.worker.drained.replace(Vec::new()).expect("recording");
 
-			self.worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
+			self.worker.apply_evictions().expect("an eviction pass");
 			let evicted = self.worker.evicted.replace(Vec::new()).expect("recording");
 
 			self.worker.apply_tier_migrations();

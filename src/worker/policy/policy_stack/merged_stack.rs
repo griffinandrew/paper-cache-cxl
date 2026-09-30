@@ -124,8 +124,7 @@ pub struct MergedStackHandle<K, V> {
 
 	/// The configured policy, reported verbatim by `is_policy`. The merged
 	/// store is a build-time object-map shape rather than a policy, so it
-	/// answers to whichever policy the cache was configured with and never
-	/// triggers a stack reconstruction.
+	/// answers to whichever policy the cache was configured with.
 	policy: PaperPolicy,
 
 	/// The order the store was actually put into, which is the same value the
@@ -171,9 +170,7 @@ impl<K, V> MergedStackHandle<K, V> {
 
 		// The merged store's eviction order IS the object map's own link
 		// structure, so it implements the orders it has been taught and no
-		// others -- recency, insertion order, CLOCK and now LFU. `is_policy`
-		// still answers to the configured policy so nothing tries to
-		// reconstruct a stack that has no separate existence.
+		// others -- recency, insertion order, CLOCK and now LFU.
 		//
 		// Anything else is REFUSED. There used to be a fallback here: a
 		// `eprintln!` and then `MergedOrder::Lru`, so a merged build asked for

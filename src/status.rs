@@ -9,9 +9,12 @@ use std::{
 	process,
 	sync::{
 		Arc,
-		atomic::{Ordering, AtomicBool, AtomicU64, AtomicUsize},
+		atomic::{Ordering, AtomicU64},
 	},
 };
+
+#[cfg(feature = "hybrid_cache_common")]
+use std::sync::atomic::AtomicBool;
 
 use num_traits::AsPrimitive;
 use log::error;
@@ -77,7 +80,6 @@ pub struct Status {
 
 	policies: Arc<[PaperPolicy]>,
 	policy: PaperPolicy,
-	is_auto_policy: bool,
 
 	start_time: u64,
 }
@@ -93,8 +95,7 @@ pub struct AtomicStatus {
 	total_dels: AtomicU64,
 
 	policies: Arc<[PaperPolicy]>,
-	policy_index: AtomicUsize,
-	is_auto_policy: AtomicBool,
+	policy: PaperPolicy,
 
 	start_time: AtomicU64,
 
@@ -268,10 +269,9 @@ pub struct AtomicStatus {
 	///
 	/// On the status because the status is the one per-cache object every
 	/// API-side path already holds, and it is built before the worker thread
-	/// exists. One worker thread serves a cache for its whole life -- a policy
-	/// switch swaps the worker's STACK, the mini stacks live inside it, and a
-	/// wipe clears the stack; none of them respawns the thread -- so this is
-	/// written once in practice. It is still a replaceable slot rather than a
+	/// exists. One worker thread serves a cache for its whole life -- a wipe
+	/// clears the stack and respawns nothing -- so this is written once in
+	/// practice. It is still a replaceable slot rather than a
 	/// `OnceLock`, so a status ever run by a second worker kicks the live one
 	/// and not one that has exited.
 	///
@@ -370,13 +370,6 @@ impl Status {
 		self.policy
 	}
 
-	/// Returns `true` if the cache is configured to automatically
-	/// switch eviction policies.
-	#[must_use]
-	pub fn is_auto_policy(&self) -> bool {
-		self.is_auto_policy
-	}
-
 	/// Returns the cache's current uptime.
 	#[must_use]
 	pub fn uptime(&self) -> u64 {
@@ -390,16 +383,16 @@ impl AtomicStatus {
 	pub fn new(
 		max_size: CacheSize,
 		policies: &[PaperPolicy],
-		mut policy: PaperPolicy,
+		policy: PaperPolicy,
 	) -> Result<Self, CacheError> {
 		let policies: Arc<[PaperPolicy]> = policies.into();
-		let is_auto_policy = policy.is_auto();
 
-		if is_auto_policy {
-			policy = PaperPolicy::Lfu;
+		// The running policy, fixed for the cache's life: one of the configured
+		// ones, as it always had to be.
+		if !policies.contains(&policy) {
+			error!("The policy is not among the configured ones");
+			return Err(CacheError::Internal);
 		}
-
-		let policy_index = get_policy_index(&policies, policy)?;
 
 		let status = AtomicStatus {
 			max_size: AtomicCacheSize::new(max_size),
@@ -412,8 +405,7 @@ impl AtomicStatus {
 			total_dels: AtomicU64::default(),
 
 			policies,
-			policy_index: AtomicUsize::new(policy_index),
-			is_auto_policy: AtomicBool::new(is_auto_policy),
+			policy,
 
 			start_time: AtomicU64::new(time::timestamp()),
 
@@ -569,13 +561,7 @@ impl AtomicStatus {
 
 	#[must_use]
 	pub fn policy(&self) -> PaperPolicy {
-		let policy_index = self.policy_index.load(Ordering::Relaxed);
-		self.policies[policy_index]
-	}
-
-	#[must_use]
-	pub fn is_auto_policy(&self) -> bool {
-		self.is_auto_policy.load(Ordering::Relaxed)
+		self.policy
 	}
 
 	pub fn incr_hits(&self) {
@@ -631,32 +617,6 @@ impl AtomicStatus {
 
 	pub fn decr_num_objects(&self) {
 		self.num_objects.fetch_sub(1, Ordering::AcqRel);
-	}
-
-	pub fn set_policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if policy.is_auto() {
-			self.is_auto_policy.store(true, Ordering::Relaxed);
-			return Ok(());
-		}
-
-		let index = get_policy_index(&self.policies, policy)?;
-
-		self.policy_index.store(index, Ordering::Relaxed);
-		self.is_auto_policy.store(false, Ordering::Relaxed);
-
-		Ok(())
-	}
-
-	pub fn set_auto_policy(&self, policy: PaperPolicy) -> Result<(), CacheError> {
-		if policy.is_auto() {
-			error!("Attempting to set recursive auto policy");
-			return Err(CacheError::Internal);
-		}
-
-		let index = get_policy_index(&self.policies, policy)?;
-		self.policy_index.store(index, Ordering::Relaxed);
-
-		Ok(())
 	}
 
 	#[must_use]
@@ -1271,31 +1231,12 @@ impl AtomicStatus {
 			total_dels: self.total_dels.load(Ordering::Relaxed),
 
 			policies: self.policies.clone(),
-			policy: self.policies[self.policy_index.load(Ordering::Relaxed)],
-			is_auto_policy: self.is_auto_policy.load(Ordering::Relaxed),
+			policy: self.policy,
 
 			start_time: self.start_time.load(Ordering::Relaxed),
 		};
 
 		Ok(status)
-	}
-}
-
-fn get_policy_index(
-	policies: &[PaperPolicy],
-	policy: PaperPolicy,
-) -> Result<usize, CacheError> {
-	let maybe_index = policies
-		.iter()
-		.position(|configured_policy| configured_policy.eq(&policy));
-
-	match maybe_index {
-		Some(index) => Ok(index),
-
-		None => {
-			error!("Could not find policy index");
-			Err(CacheError::Internal)
-		},
 	}
 }
 

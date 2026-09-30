@@ -5,22 +5,38 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod lfu_compact_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod lfu_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod fifo_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod clock_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod sieve_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod lru_compact_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod lru_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod mru_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod two_q_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod arc_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s_three_fifo_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub(crate) mod ghost_filter;
 
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub(crate) mod compact_queue_set;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub mod arena_index;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub mod arena_queue_set;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub(crate) mod arena_frequency_chain;
 
 /// The frequency chain `ArenaFrequencyChain` replaces, kept ONLY as the
@@ -40,27 +56,49 @@ pub(crate) mod arena_frequency_chain;
 pub(crate) mod compact_frequency_chain;
 #[cfg(test)]
 mod measure_overhead;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod lru_lfu_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod lru_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod lru_lazy_copy_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod lfu_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod two_q_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod two_q_fast_admission_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod two_q_fast_admission_reprieve_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod two_q_full_fast_admission_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod fifo_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod clock_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod lru_sized_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_faithful_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod two_q_ghost_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_ghost_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_ghost_lazy_demotion_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_lazy_demotion_fast_admission_reprieve_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_lazy_demotion_reprieve_compact_hybrid_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod two_q_compact_stack;
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod merged_prototype;
@@ -69,11 +107,17 @@ mod merged_prototype;
 /// eviction stack, so this forwards rather than owning anything.
 #[cfg(feature = "merged_object_store")]
 pub(crate) mod merged_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s_three_fifo_compact_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod fifo_compact_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod clock_compact_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod sieve_compact_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod mru_compact_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_compact_hybrid_stack;
 
 #[cfg(feature = "eviction_stacks_pmem")] mod pmem_collections;
@@ -83,6 +127,12 @@ use crate::{
 	HashedKey,
 	policy::PaperPolicy,
 	object::ObjectSize,
+};
+
+// The split stacks `init_policy_stack` builds -- none in a merged build, whose
+// stack is the object map itself (`merged_stack`), but for its tests.
+#[cfg(any(test, not(feature = "merged_object_store")))]
+use crate::{
 	worker::policy::policy_stack::{
 		lfu_compact_stack::LfuCompactStack,
 		fifo_compact_stack::FifoCompactStack,
@@ -158,6 +208,7 @@ use crate::{
 ///
 /// `FAST_TIER_DRAIN_TARGET=1.0` holds the tier at exactly its ceiling, which is
 /// the no-headroom behaviour.
+#[cfg(any(test, not(feature = "merged_object_store"), feature = "hybrid_cache_common"))]
 pub mod drain_target {
 	use std::sync::OnceLock;
 
@@ -275,6 +326,7 @@ impl MigrationEntry for TaggedMigration {
 /// this accounting existed, so it degrades toward the old over-charge instead
 /// of going wrong in a new way.
 #[inline]
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub(crate) fn narrow_resident(resident: ObjectSize) -> u8 {
 	resident.min(u8::MAX as ObjectSize) as u8
 }
@@ -325,6 +377,7 @@ pub enum Placement {
 /// slow keys to the next fast one. Amortized O(1) per structural key: a
 /// cursor only moves toward the front, and a key it stepped over stays behind
 /// it until a hit brings it back to the front.
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub(crate) fn walk_to<P: Copy>(
 	list: &arena_queue_set::ArenaQueueSet<P>,
 	mut start: Option<HashedKey>,
@@ -342,6 +395,7 @@ pub(crate) fn walk_to<P: Copy>(
 
 /// `walk_to` for a `NodePayload` list whose cursor names the least-recently-
 /// used FAST key: the nearest key at or before `start` whose tier is Fast.
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub(crate) fn fast_at_or_before(
 	list: &arena_queue_set::ArenaQueueSet<arena_queue_set::NodePayload>,
 	start: Option<HashedKey>,
@@ -350,6 +404,7 @@ pub(crate) fn fast_at_or_before(
 }
 
 /// The cursor's step off `key`: the nearest FAST key before it.
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub(crate) fn prev_fast(
 	list: &arena_queue_set::ArenaQueueSet<arena_queue_set::NodePayload>,
 	key: HashedKey,
@@ -358,6 +413,7 @@ pub(crate) fn prev_fast(
 }
 
 /// The placement a stack applied (`PolicyStack::insert_placed`'s answer).
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub(crate) fn placed(structural: bool) -> Placement {
 	match structural {
 		true => Placement::Structural,
@@ -409,9 +465,11 @@ pub trait PolicyStack
 where
 	Self: Send,
 {
+	#[cfg_attr(not(test), expect(dead_code, reason = "the stacks' tests only, since R1 removed the mini stacks"))]
 	fn is_policy(&self, policy: &PaperPolicy) -> bool;
 	fn len(&self) -> usize;
 
+	#[cfg_attr(not(test), expect(dead_code, reason = "the stacks' tests only, since R1 removed the mini stacks"))]
 	fn contains(&self, key: HashedKey) -> bool;
 	fn insert(&mut self, key: HashedKey, size: ObjectSize);
 
@@ -792,9 +850,9 @@ where
 	}
 }
 
+#[cfg(any(test, not(feature = "merged_object_store")))]
 pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn PolicyStack> {
 	match policy {
-		PaperPolicy::Auto => Box::new(LfuStack::default()),
 		PaperPolicy::LfuCompact => Box::new(LfuCompactStack::default()),
 		PaperPolicy::FifoCompact => Box::new(FifoCompactStack::default()),
 		PaperPolicy::ClockCompact => Box::new(ClockCompactStack::default()),
@@ -1244,7 +1302,7 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 43;
+	const POLICY_VARIANT_COUNT: usize = 42;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the
 	/// tiered designs this crate exists to compare.
@@ -1262,7 +1320,6 @@ mod init_policy_stack_tests {
 	/// exhaustive match with no `_` arm, so adding a variant to `PaperPolicy`
 	/// stops this file compiling until the new design is added here too.
 	const POLICY_DISPATCH_TABLE: [(PaperPolicy, PaperPolicy); POLICY_VARIANT_COUNT] = [
-		(PaperPolicy::Auto, PaperPolicy::Auto),
 		(PaperPolicy::LfuCompact, PaperPolicy::LfuCompact),
 		(PaperPolicy::FifoCompact, PaperPolicy::FifoCompact),
 		(PaperPolicy::ClockCompact, PaperPolicy::ClockCompact),
@@ -1315,7 +1372,6 @@ mod init_policy_stack_tests {
 	/// `POLICY_VARIANT_COUNT`) so it is dispatch-tested like every other one.
 	fn variant_name(policy: &PaperPolicy) -> &'static str {
 		match policy {
-			PaperPolicy::Auto => "Auto",
 			PaperPolicy::LfuCompact => "LfuCompact",
 			PaperPolicy::FifoCompact => "FifoCompact",
 			PaperPolicy::ClockCompact => "ClockCompact",
@@ -1361,42 +1417,12 @@ mod init_policy_stack_tests {
 		}
 	}
 
-	/// The group of policy values that share one constructed stack.
-	///
-	/// The match above has exactly one such collision: `Auto` and `Lfu` both
-	/// build a bare `LfuStack` (`Auto` means "let the cache choose", and it is
-	/// resolved to LFU right there in the dispatch). A single `LfuStack` cannot
-	/// report two different identities, so those two are one family and the
-	/// too-loose-`is_policy` cross-check below skips that pair -- and only that
-	/// pair. Every other variant is its own family, so every other pairing is
-	/// checked.
-	fn dispatch_family(policy: &PaperPolicy) -> &'static str {
-		match policy {
-			PaperPolicy::Auto | PaperPolicy::Lfu => "Lfu",
-			other => variant_name(other),
-		}
-	}
-
 	/// The premise of the architecture: asking for a design gets you that
 	/// design, for every one of them.
 	#[test]
 	fn every_policy_variant_dispatches_to_a_stack_that_claims_it() {
 		for (policy, _) in POLICY_DISPATCH_TABLE {
 			let stack = init_policy_stack(policy, TEST_MAX_SIZE);
-
-			if policy.is_auto() {
-				// `Auto` is resolved to LFU by the dispatch itself, so the
-				// stack it hands back is a plain `LfuStack` and may answer to
-				// either name; which one it answers to is not this test's
-				// business. That the two arms stay in lockstep is pinned by
-				// `auto_dispatches_to_the_same_stack_as_lfu` below.
-				assert!(
-					stack.is_policy(&PaperPolicy::Auto) || stack.is_policy(&PaperPolicy::Lfu),
-					"the stack built for `{policy}` claims to be neither `auto` nor the LFU design `auto` resolves to",
-				);
-
-				continue;
-			}
 
 			assert!(
 				stack.is_policy(&policy),
@@ -1420,13 +1446,13 @@ mod init_policy_stack_tests {
 			let stack = init_policy_stack(policy, TEST_MAX_SIZE);
 
 			for (foil, _) in POLICY_DISPATCH_TABLE {
-				if dispatch_family(&foil) == dispatch_family(&policy) {
+				if variant_name(&foil) == variant_name(&policy) {
 					continue;
 				}
 
 				assert!(
 					!stack.is_policy(&foil),
-					"the stack built for `{policy}` also claims to be `{foil}`: `is_policy` is too loose, so a switch between those two designs would be treated as a no-op and the old design would keep running",
+					"the stack built for `{policy}` also claims to be `{foil}`: `is_policy` is too loose to tell the two designs apart",
 				);
 			}
 		}
@@ -1443,9 +1469,7 @@ mod init_policy_stack_tests {
 	#[test]
 	fn is_policy_discriminates_on_the_payload_of_a_parameterised_policy() {
 		// A parameterised policy names both a design AND its tuning, so a
-		// stack built for one payload must not answer to another: that is
-		// what makes `MiniStackManager` rebuild rather than silently keep a
-		// stack tuned to the old value (mini_stack/manager.rs:50, :125).
+		// stack built for one payload must not answer to another.
 		// `TwoQStack::is_policy` is the clearest statement of the rule --
 		// `self.k_in == *k_in && self.k_out == *k_out`.
 		//
@@ -1478,7 +1502,7 @@ mod init_policy_stack_tests {
 				!stack.is_policy(&same_variant_other_payload),
 				"the stack built for `{policy}` also claims to be \
 				 `{same_variant_other_payload}`: `is_policy` ignores the \
-				 payload, so a retune would not rebuild the stack",
+				 payload",
 			);
 		}
 	}
@@ -1553,25 +1577,6 @@ mod init_policy_stack_tests {
 			assert!(
 				!stack.contains(1),
 				"the stack built for `{policy}` claims to contain a key that was never inserted",
-			);
-		}
-	}
-
-	/// `Auto` and `Lfu` are the only two policies that share a stack. Pin that
-	/// down directly, rather than leaving it as an unstated exception in the
-	/// cross-check above: `Auto` is what a caller passes when it does not want
-	/// to name a design, so if its arm ever drifted, those callers would
-	/// quietly get different eviction behaviour with nothing else to notice.
-	#[test]
-	fn auto_dispatches_to_the_same_stack_as_lfu() {
-		let auto = init_policy_stack(PaperPolicy::Auto, TEST_MAX_SIZE);
-		let lfu = init_policy_stack(PaperPolicy::Lfu, TEST_MAX_SIZE);
-
-		for (candidate, _) in POLICY_DISPATCH_TABLE {
-			assert_eq!(
-				auto.is_policy(&candidate),
-				lfu.is_policy(&candidate),
-				"the stacks built for `auto` and `lfu` disagree about `{candidate}`, so `auto` is no longer resolving to the LFU design",
 			);
 		}
 	}

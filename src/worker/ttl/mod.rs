@@ -160,8 +160,8 @@ impl<K, V> TtlWorker<K, V> {
 		}
 	}
 
-	/// Reports a reaped key to `PolicyWorker` so it drops the key from the
-	/// active policy stack and the mini stacks.
+	/// Reports a reaped key to `PolicyWorker` so it drops the key from its
+	/// policy stack.
 	///
 	/// Best-effort by design. The channel is unbounded, so the only way
 	/// `try_send` fails is a disconnected receiver -- which means the policy

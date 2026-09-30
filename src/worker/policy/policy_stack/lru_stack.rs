@@ -120,7 +120,7 @@ impl PolicyStack for LruStack {
 		// implementation cannot mirror `insert`. The DRAM variant's
 		// `HashList::move_front` is a no-op on an absent key;
 		// `PmemHashList::push_front` INSERTS one. Without the guard, a
-		// `StackEvent::Get` for a key the worker has already evicted (the
+		// `Get` for a key the worker has already evicted (the
 		// client hit it, then eviction ran before the event was drained --
 		// both happen on the policy worker, in that order) silently
 		// resurrects it as a phantom: `len()` counts an entry with no object

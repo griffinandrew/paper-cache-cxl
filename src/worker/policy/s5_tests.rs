@@ -144,7 +144,7 @@ fn charge(len: usize) -> CacheSize {
 }
 
 fn stack(worker: &Worker) -> &dyn PolicyStack {
-	worker.policy_stack.as_deref().expect("a stack")
+	&*worker.policy_stack
 }
 
 /// This thread's jemalloc `thread.allocated`: every byte it has allocated,
@@ -252,7 +252,7 @@ fn evict_all_drained(worker: &mut Worker) -> (Vec<HashedKey>, Vec<TaggedMigratio
 	worker.evicted = Some(Vec::new());
 
 	worker.status.set_max_size(1);
-	worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
+	worker.apply_evictions().expect("an eviction pass");
 	worker.status.set_max_size(1 << 30);
 	let drain = drain_and_apply(worker);
 
@@ -882,7 +882,7 @@ fn the_measured_model_settles_on_the_published_m() {
 		for key in 1..=120 {
 			client_set(&mut worker, &objects, key, LEN);
 			drain_and_apply(&mut worker);
-			worker.apply_evictions(&mut Vec::new()).expect("an eviction pass");
+			worker.apply_evictions().expect("an eviction pass");
 			drain_and_apply(&mut worker);
 
 			// Hits, so the S3-FIFO design promotes into main.
@@ -1031,7 +1031,7 @@ fn make_room_goes_to_the_policy_worker_only() {
 	for other in [
 		Events::GET, Events::SET, Events::DEL, Events::EXPIRE, Events::TTL, Events::WIPE,
 		Events::RESIZE, Events::RESIZE_FAST_TIER, Events::RESIZE_LARGE_FAST_TIER, Events::RESIZE_SIZE_THRESHOLD,
-		Events::POLICY, Events::SHUTDOWN, Events::AUDIT,
+		Events::SHUTDOWN, Events::AUDIT,
 	] {
 		assert_eq!(other & bit, 0, "its bit is its own");
 	}

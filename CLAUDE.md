@@ -4,10 +4,10 @@ Guidance for Claude Code (and other agents) working in this repository.
 
 ## What this crate is
 
-`paper-cache` (crate name in `Cargo.toml`) is an in-memory Rust cache library ("PaperCache") that
-supports runtime-switchable eviction policies and, on this branch, DRAM/PMEM (CXL) memory
-tiering. It is consumed by a separate `paper-server` crate (not in this repo) and should not
-normally be used directly by application code.
+`paper-cache` (crate name in `Cargo.toml`) is an in-memory Rust cache library ("PaperCache") with
+a choice of eviction policies -- one per cache, fixed when it is built -- and, on this branch,
+DRAM/PMEM (CXL) memory tiering. It is consumed by a separate `paper-server` crate (not in this
+repo) and should not normally be used directly by application code.
 
 The defining theme of this fork/branch is **experimenting with where cache data structures and
 object bytes physically live** — DRAM vs. persistent/CXL memory (PMEM) — via a large matrix of
@@ -165,11 +165,10 @@ src/
     policy/
       mod.rs                    PolicyWorker — drives the active PolicyStack, applies tier
                                  migrations (demotions before promotions), runs evictions. Also
-                                 holds three submodules: `migration_queue` (the standing
+                                 holds two submodules: `migration_queue` (the standing
                                  consumer pool that actually performs the byte moves, one
                                  channel per consumer sharded by key hash, 2 threads by
-                                 default), `parallel_migration` (the abandoned per-batch rayon
-                                 fan-out, disabled by default) and `migstats` (the MIGSTATS
+                                 default) and `migstats` (the MIGSTATS
                                  batch-size histograms dumped to stderr, and the RECONCILE_*
                                  counters on a last line of their own). Queue entries carry a
                                  MigrationOrigin (Stack | Reconcile) through the split and the
@@ -218,11 +217,6 @@ src/
                                  so nothing is copied and no slot id moves. Their keyless
                                  index still doubles. Charged 40 B/object (the 2^k figure);
                                  40-48 across a growth cycle, derived (overhead.rs, LRU).
-      mini_stack/               Lightweight per-policy stacks for PaperCache's "auto" mode.
-      trace/                    Access-trace recording/replay, replayed to rebuild a different
-                                 policy's stack after a live switch. Only spawned when more than
-                                 one policy is configured — never for a hybrid cache, which has
-                                 exactly one, so no switch is reachable.
     ttl/                        TtlWorker — background expiry sweep.
 
 tests/
@@ -260,7 +254,7 @@ tests/
                                          (drained once a second) and exactly between drained
                                          endpoints; the warm-up takes out every other term
                                          (channel first blocks, worker buffers, the in-flight
-                                         table, rayon's global pool). One #[test], its own
+                                         table, parking_lot's parked-thread table). One #[test], its own
                                          binary.
   isolate_pmem_latency.rs                Allocator-level latency probe.
 ```
@@ -3247,3 +3241,20 @@ only consumer), and the `AccessOutcome` a stack's `record_access` returned so th
 ghost hit could be forwarded to that worker. `get_into` is no longer gated on the manager's
 absence. The compile checks of the feature (`key_value_pmem,enable_tiering_manager` and
 `all_dram,enable_tiering_manager`) became the same builds without it.
+
+## Removed policy switching, `parallel_migration` and `rayon` (R1)
+
+On the user's request ("the tiered variant and comparable flat implementations will not use the
+policy switching variant so all that code can be removed too"; of the parallel migration module,
+"get rid of it if its stale"): `PaperPolicy::Auto`, the flat caches' runtime `policy()` setter, the
+status's switching state (its policy index and auto flag), `WorkerEvent::Policy`, the policy
+worker's mini stacks (`src/worker/policy/mini_stack/`), its access trace (`trace/`, `event.rs`) and
+live-switch reconstruction, and the merged store's reconstruction-only erase fallback
+(`oldest_linked_key`). Nothing takes the worker's stack away any more, so it is no longer an
+`Option`, and the byte gate's `GateState::NoStack` went with that. The server answers `POLICY` as an
+unsupported command. `parallel_migration` -- the per-batch rayon fan-out, off by default since it
+was measured not to pay -- is gone with its two env knobs, and with it and the mini-stack manager
+(which started rayon's global pool from every tiered cache) the `rayon` dependency; `tempfile` went
+with the trace. `PolicyStack::is_policy` and `::contains` stay for the tests that use them. In a
+merged build the split stacks are compiled for the lib's tests only: the mini stacks were the only
+thing that built one there.

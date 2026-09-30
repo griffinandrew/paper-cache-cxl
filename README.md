@@ -1,7 +1,7 @@
 # paper-cache (DRAM/CXL tiering fork)
 
-PaperCache is an in-memory cache that supports switching between eviction policies at
-runtime. This fork adds **two-tier memory placement**: every object's bytes live either in
+PaperCache is an in-memory cache with a choice of eviction policies, one per cache and fixed when
+it is built. This fork adds **two-tier memory placement**: every object's bytes live either in
 DRAM (the *fast* tier, NUMA node 0) or in PMEM/CXL (the *slow* tier, NUMA node 1), and the
 cache moves them between the two as the access pattern changes.
 
@@ -128,11 +128,10 @@ set(k, v) ──WorkerEvent──> policy stack decides tiers
   default with 2 consumers; `MIGRATION_QUEUE_THREADS=0` disables it and applies every
   migration inline on the worker.
 
-An earlier approach, `parallel_migration`, fanned a single *batch* across a rayon pool. It is
-compiled in but **disabled by default** (`PARALLEL_MIGRATION_THRESHOLD=0`) because it was
-measured not to help: 99.4% of demotion volume arrives as single-object batches, so there is
-nothing to fan out. `migration_queue` replaced it by decoupling from batch boundaries
-entirely.
+An earlier approach, `parallel_migration`, fanned a single *batch* across a rayon pool. It was
+measured not to help -- 99.4% of demotion volume arrives as single-object batches, so there is
+nothing to fan out -- and has been removed (R1). `migration_queue` replaced it by decoupling
+from batch boundaries entirely.
 
 ### Where memory physically goes
 
@@ -281,8 +280,6 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | Variable | Default | Effect |
 |---|---|---|
 | `MIGRATION_QUEUE_THREADS` | `2` | Migration consumer count. `0` disables the queue and applies migrations inline on the worker. |
-| `PARALLEL_MIGRATION_THRESHOLD` | `0` (off) | Batch size at or above which batch fan-out engages. Off because it was measured not to pay; see `parallel_migration`. |
-| `PARALLEL_MIGRATION_THREADS` | `4` | Pool size if the above is enabled. |
 | `FAST_TIER_DRAIN_TARGET` | `0.98` | Fraction of the effective fast-tier budget the tier is continuously held at. `1.0` leaves no burst headroom. |
 | `NUMA_ARENAS_PER_NODE` | `8` | jemalloc arenas per node (clamped to 32). Swept on cluster12: a single arena costs 5% of SET latency at one client and 27% at sixteen, while 8→32 buys 1–2%, inside the run-to-run spread. |
 | `PAPER_NUMA_SLOW_TCACHE` | off | Per-thread cache for slow-tier allocations. Correct but measured not worth enabling. |
