@@ -42,22 +42,12 @@
 //!   * TTL survives a tier move; `set_fast_tier_size` / `resize` take effect
 //!     at runtime; both ratios are range-checked at construction
 
+mod common;
+
 #[cfg(feature = "two_q_full_fast_admission_compact_hybrid_cache")]
 mod hybrid_cache_tests {
     use paper_cache::{PaperPolicy, PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
-
-    fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if predicate() {
-                return true;
-            }
-            if std::time::Instant::now() > deadline {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
+    use crate::common::wait_until;
 
     const MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 

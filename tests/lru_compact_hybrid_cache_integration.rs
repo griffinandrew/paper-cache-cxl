@@ -53,54 +53,17 @@
 //! waits ~45s; every other call (in this test or any other) returns almost
 //! immediately once the allocator is warm.
 
+mod common;
+
 #[cfg(feature = "lru_compact_hybrid_cache")]
 mod hybrid_cache_tests {
     use paper_cache::{PaperPolicy, PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError, GateConfig, MetadataModel};
 
-    fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if predicate() {
-                return true;
-            }
-            if std::time::Instant::now() > deadline {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
-
-    /// Forces the one-time PMEM allocator pool init/prewarm to complete
-    /// before a test's own timing-sensitive assertions begin. See the module
-    /// doc comment above for why this is necessary.
-    fn ensure_pmem_allocator_warm() {
-        // Mechanics tests at toy scales: metadata reservation off (see
-        // `get_hybrid_dram_shared_overhead`).
-        unsafe { std::env::set_var("PAPER_DISABLE_SHARED_OVERHEAD", "1") };
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1), PaperPolicy::LruCompactHybrid)
-            .expect("warm-up cache should construct");
-
-        cache.set(0u32, b"warm", None).expect("warm-up set should succeed");
-
-        let ready = wait_until(std::time::Duration::from_secs(90), || {
-            cache.tier_of(&0u32) == Some(Tier::Slow)
-        });
-        assert!(ready, "PMEM allocator warm-up should complete within 90s");
-    }
-
-    const MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-    // The fast-tier budget now also reserves an approximate per-object DRAM
-    // cost for the shared object hashtable + eviction stacks (tens of bytes per
-    // object — see `object/overhead.rs::get_hybrid_dram_shared_overhead`). To
-    // keep the byte-sized fast-tier budgets below behaving intuitively
-    // (~value-sized) rather than being dominated by that reservation, the
-    // demotion/promotion tests use ~1 KB values, so the per-object reservation
-    // is a small fraction and the fast-tier sizes have a wide, robust margin.
-    const VALUE_LEN: usize = 1024;
-
-    fn value(seed: u8) -> Vec<u8> {
-        vec![seed; VALUE_LEN]
+    crate::common::hybrid_suite! {
+        policy: PaperPolicy::LruCompactHybrid,
+        value_len: 1024,
+        demoted_of_two: (1u32, 2u32),
+        ttl_demotion: true,
     }
 
     // ── the metadata model (S5) ───────────────────────────────────────────
@@ -140,30 +103,6 @@ mod hybrid_cache_tests {
             assert_eq!(s.effective_fast_capacity, 65_536, "{config:?}: eff");
             assert_eq!(s.metadata_key_ceiling, u64::MAX, "{config:?}: omega 0 has no ceiling");
         }
-    }
-
-    // ── admission ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn admission_always_lands_in_fast_tier() {
-        // The environment variable first, as every test here (S5): a cache
-        // built before it would use the measured metadata model, whose key
-        // ceiling refuses keys on a tier smaller than the cache's own
-        // structures -- this 1 MiB one, in the merged builds --
-        // and whether a sibling test had set it yet was a race.
-        ensure_pmem_allocator_warm();
-
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_048_576,
-            CacheTierSize::Bytes(1_048_576), PaperPolicy::LruCompactHybrid).expect("cache should construct");
-
-        cache.set(1u32, b"hello world", None).expect("set should succeed");
-
-        // Admission is synchronous (the object is inserted as `TieredBuffer::
-        // Fast` directly inside `set()`, before the WorkerEvent is even
-        // broadcast), so this doesn't need `wait_until`.
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-        assert_eq!(cache.get(&1u32).unwrap(), b"hello world");
     }
 
     // ── demotion ──────────────────────────────────────────────────────────
@@ -267,64 +206,6 @@ mod hybrid_cache_tests {
 
     // ── TTL ───────────────────────────────────────────────────────────────
 
-    // `overhead_manager.base_size` (internal, not part of the public API)
-    // adds a fixed TTL bookkeeping cost on top of key + value + expiry-slot
-    // size for any object with `Some` expiry (`get_ttl_overhead` in
-    // `object/overhead.rs`) — tens of bytes on top of what a `None`-ttl
-    // object of the same value costs. A fast-tier capacity sized only for
-    // `None`-ttl objects (as the demotion/promotion tests above use) is too
-    // tight for a *single* ttl'd object: promoting it back to fast can
-    // immediately trip `settle_fast_tier` again and re-demote the very key
-    // just promoted, before the test ever observes it as `Fast`. Use a
-    // capacity comfortably larger than one ttl'd object alone, and force
-    // demotion pressure with several filler keys. Sized (with the ~1 KB
-    // `value()` payloads and the per-object shared-metadata reservation) to
-    // hold ~2 objects, so the ttl'd key demotes under filler pressure yet can
-    // still be promoted back and observed as `Fast` before re-settling.
-    const TTL_FAST_TIER: u64 = 2_600;
-
-    #[test]
-    fn ttl_survives_a_demotion() {
-        ensure_pmem_allocator_warm();
-
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_048_576,
-            CacheTierSize::Bytes(TTL_FAST_TIER), PaperPolicy::LruCompactHybrid).expect("cache should construct");
-
-        // Note: a *short* TTL here (comparable to `MIGRATION_TIMEOUT`) would
-        // make this test racy against `tier_of` itself: `tier_of` treats an
-        // expired object as absent (`None`), same as `get`/`has`, so if the
-        // object happened to expire before the migration was observed, the
-        // `wait_until` below would spin until its own timeout with no way
-        // to distinguish "never migrated" from "migrated but already
-        // expired." A TTL comfortably longer than any plausible migration
-        // latency avoids that ambiguity; the assertions below still prove
-        // the *original* deadline survived rather than being reset/dropped.
-        let ttl_secs = 5u32;
-        let set_at = std::time::Instant::now();
-        cache.set(1u32, &value(0xC1), Some(ttl_secs)).expect("set should succeed");
-
-        for key in 2u32..=4 {
-            cache.set(key, &value(key as u8), None).expect("set should succeed");
-        }
-
-        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
-
-        // If `Object::set_data` (the migration) had reset or dropped
-        // `expiry`, the key would already be gone or immortal here.
-        assert!(cache.has(&1u32), "key should still be alive right after migrating");
-
-        // Sleep past the *original* deadline (measured from `set`, not from
-        // the migration), proving the original clock kept ticking through
-        // the tier move rather than being restarted or cleared.
-        let remaining = std::time::Duration::from_millis(ttl_secs as u64 * 1000 + 500)
-            .saturating_sub(set_at.elapsed());
-        std::thread::sleep(remaining);
-
-        assert!(matches!(cache.get(&1u32), Err(CacheError::KeyNotFound)));
-        assert!(!cache.has(&1u32));
-    }
-
     #[test]
     fn ttl_survives_a_promotion() {
         ensure_pmem_allocator_warm();
@@ -356,48 +237,6 @@ mod hybrid_cache_tests {
         std::thread::sleep(remaining);
 
         assert!(matches!(cache.get(&1u32), Err(CacheError::KeyNotFound)));
-    }
-
-    // ── eviction ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn terminal_eviction_only_removes_from_slow_tier_and_is_counted() {
-        ensure_pmem_allocator_warm();
-
-        // A small overall cache with a tiny fast tier: every object demotes
-        // to slow almost immediately, and once total usage exceeds max_size
-        // the slow-tier LRU tail must be evicted (never the fast tier,
-        // which by construction holds only the most-recently-touched key).
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            256,
-            CacheTierSize::Bytes(10), PaperPolicy::LruCompactHybrid).expect("cache should construct");
-
-        for key in 1u32..=10 {
-            let _ = cache.set(key, b"payload bytes", None);
-        }
-
-        let evicted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.hybrid_stats().evictions >= 1
-        });
-        assert!(evicted, "at least one terminal eviction should have occurred");
-
-        // Give the worker a moment to settle so the count below is stable.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let stats = cache.hybrid_stats();
-        let present = (1u32..=10).filter(|key| cache.has(key)).count() as u64;
-
-        // Every key is accounted for exactly once: either still present
-        // (in fast or slow — doesn't matter which) or evicted. None should
-        // be silently lost, and none double-counted.
-        assert_eq!(present + stats.evictions, 10);
-
-        // Every evicted key is fully gone, never left dangling in a tier.
-        for key in 1u32..=10 {
-            if !cache.has(&key) {
-                assert_eq!(cache.tier_of(&key), None);
-            }
-        }
     }
 
     // ── DRAM cap accounts for shared metadata (hashtable + eviction stacks) ──
@@ -441,121 +280,6 @@ mod hybrid_cache_tests {
 
         // The fast tier's live value bytes stay within the configured budget.
         assert!(stats.fast_bytes_used <= cache.fast_tier_size());
-    }
-
-    // ── runtime fast-tier resize ─────────────────────────────────────────
-
-    #[test]
-    fn set_fast_tier_size_takes_effect_at_runtime() {
-        ensure_pmem_allocator_warm();
-
-        let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(1_048_576), PaperPolicy::LruCompactHybrid).expect("cache should construct");
-
-        cache.set(1u32, b"first value 123", None).expect("set should succeed");
-        assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
-        assert_eq!(cache.fast_tier_size(), 1_048_576);
-
-        // Shrink the fast tier drastically; the existing key should demote
-        // even without any further access, once the worker applies the
-        // resize (mirrors `LruCompactHybridStack::resize_fast_tier`'s eager
-        // `settle_fast_tier` call).
-        cache.set_fast_tier_size(CacheTierSize::Bytes(1)).expect("resize should succeed");
-        assert_eq!(cache.fast_tier_size(), 1);
-
-        let demoted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.tier_of(&1u32) == Some(Tier::Slow)
-        });
-        assert!(demoted, "shrinking the fast tier should demote the existing key");
-    }
-
-    // ── edge cases ────────────────────────────────────────────────────────
-
-    #[test]
-    fn zero_fast_tier_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(0), PaperPolicy::LruCompactHybrid);
-        assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
-    }
-
-    #[test]
-    fn fast_tier_size_exceeding_max_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(1_024, CacheTierSize::Bytes(2_048), PaperPolicy::LruCompactHybrid);
-        assert!(matches!(result, Err(CacheError::InvalidFastTierSize)));
-    }
-
-    #[test]
-    fn zero_max_size_is_rejected() {
-        let result = PaperCache::<u32, TieredBuffer>::new(0, CacheTierSize::Bytes(100), PaperPolicy::LruCompactHybrid);
-        assert!(matches!(result, Err(CacheError::ZeroCacheSize)));
-    }
-
-    #[test]
-    fn tiny_fast_tier_demotes_everything_almost_immediately() {
-        ensure_pmem_allocator_warm();
-
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_048_576,
-            CacheTierSize::Bytes(1), PaperPolicy::LruCompactHybrid).expect("cache should construct");
-
-        cache.set(1u32, b"a value", None).expect("set should succeed");
-
-        let demoted = wait_until(MIGRATION_TIMEOUT, || {
-            cache.tier_of(&1u32) == Some(Tier::Slow)
-        });
-        assert!(demoted, "a 1-byte fast tier should demote any real value almost immediately");
-        assert_eq!(cache.get(&1u32).unwrap(), b"a value");
-    }
-
-    #[test]
-    fn del_removes_key_from_whichever_tier_it_is_in() {
-        ensure_pmem_allocator_warm();
-
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_048_576,
-            // 1_600 with ~1 KB values, matching every other demotion test in
-            // this file. These two used to pass 15-byte values against a
-            // 40-byte budget, from before the fast tier reserved per-object
-            // metadata. At ~16 B migrating per object two of them FIT in 40
-            // bytes, so nothing demoted and the wait below timed out -- the
-            // tests were stale, not the product.
-            CacheTierSize::Bytes(1_600), PaperPolicy::LruCompactHybrid).expect("cache should construct");
-
-        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
-        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
-        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
-
-        cache.del(&1u32).expect("del should succeed");
-        assert!(!cache.has(&1u32));
-        assert_eq!(cache.tier_of(&1u32), None);
-
-        cache.del(&2u32).expect("del should succeed");
-        assert!(!cache.has(&2u32));
-        assert_eq!(cache.tier_of(&2u32), None);
-    }
-
-    #[test]
-    fn wipe_clears_both_tiers() {
-        ensure_pmem_allocator_warm();
-
-        let cache = PaperCache::<u32, TieredBuffer>::new(
-            1_048_576,
-            // 1_600 with ~1 KB values, matching every other demotion test in
-            // this file. These two used to pass 15-byte values against a
-            // 40-byte budget, from before the fast tier reserved per-object
-            // metadata. At ~16 B migrating per object two of them FIT in 40
-            // bytes, so nothing demoted and the wait below timed out -- the
-            // tests were stale, not the product.
-            CacheTierSize::Bytes(1_600), PaperPolicy::LruCompactHybrid).expect("cache should construct");
-
-        cache.set(1u32, &value(0xA1), None).expect("set should succeed");
-        cache.set(2u32, &value(0xB2), None).expect("set should succeed");
-        assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
-
-        cache.wipe().expect("wipe should succeed");
-
-        assert!(!cache.has(&1u32));
-        assert!(!cache.has(&2u32));
-        assert_eq!(cache.tier_of(&1u32), None);
-        assert_eq!(cache.tier_of(&2u32), None);
     }
 
     // ── large-scale real-DRAM reproduction (manual, not part of the default
@@ -944,6 +668,4 @@ mod hybrid_cache_tests {
         );
         assert_eq!(cache.get(&1u32).unwrap(), value(0xD4));
     }
-
-
 }

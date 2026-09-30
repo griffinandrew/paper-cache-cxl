@@ -25,22 +25,12 @@
 //! demotion cascades, TTL survival, runtime resize, edge cases); this file
 //! focuses on what's actually new here: the ghost queue.
 
+mod common;
+
 #[cfg(feature = "two_q_ghost_compact_hybrid_cache")]
 mod hybrid_cache_tests {
     use paper_cache::{PaperPolicy, PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
-
-    fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if predicate() {
-                return true;
-            }
-            if std::time::Instant::now() > deadline {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
+    use crate::common::wait_until;
 
     fn ensure_pmem_allocator_warm() {
         // Mechanics tests at toy scales: metadata reservation off (see

@@ -55,22 +55,12 @@
 //! `ensure_pmem_allocator_warm()` below forces that cost to be paid
 //! synchronously before any test's own timing-sensitive assertions begin.
 
+mod common;
+
 #[cfg(feature = "lru_sized_compact_hybrid_cache")]
 mod hybrid_cache_tests {
     use paper_cache::{PaperCache, TieredBuffer, CacheTierSize, Tier, CacheError};
-
-    fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if predicate() {
-                return true;
-            }
-            if std::time::Instant::now() > deadline {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
+    use crate::common::wait_until;
 
     /// Forces the one-time PMEM allocator pool init/prewarm to complete
     /// before a test's own timing-sensitive assertions begin. See the module
