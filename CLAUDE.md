@@ -3560,3 +3560,42 @@ burst drained in one pass) also asserts the counters at each step (no pass under
 object over arms one; 7 passes took the 16 objects); the cap override (one pass, the two objects over
 it), the band (one pass took ten objects, and none armed for the refill) and the stack-budget
 eviction (no capacity pass) assert them, and a wipe resets them.
+
+## The gate's configuration from the environment (S8, part 3)
+
+`GateConfig` (`gate.rs`) was set by code (`new_with_gate`, `set_gate_config`) or defaulted; a
+process the user configures from outside -- the server, a benchmark run -- had no way to change the
+gate. Eleven environment variables now do, one per field (`PAPER_GATE_MODE`, `_ON_STALL`,
+`_ON_METADATA_OVERFLOW`, `_METADATA_MODEL`, `_STALL_WINDOW_MS`, `_POLL_INTERVAL_US`,
+`_METADATA_FLOOR_BYTES`, `_SLACK_BYTES`, `_NEAR_FRAC`, `_CONCURRENCY_HINT`, `_VALUE_HINT_BYTES`; the
+README's table, and the gate module's doc, list values), read once per process through a `OnceLock` like
+`FAST_TIER_DRAIN_TARGET` and `EVICTION_HIGH_WATERMARK`.
+
+Precedence, in the gate module's doc: (1) a `GateConfig` passed in code is used exactly as given --
+the environment is not consulted for it; (2) a plain constructor (`install_gate` with `None`) takes
+`GateConfig::default()` with the variables applied on top (`GateConfig::from_env`); (3) the defaults.
+The unit is the whole configuration: a struct cannot tell a field set on purpose from one left at its
+default, and per-field precedence would need a builder with optional fields (a public API change, not
+made). `from_env` is `pub(crate)` for the same reason: a caller who wants "the environment plus one
+change" cannot ask for it yet. `PAPER_DISABLE_SHARED_OVERHEAD=1` still forces the per-object model
+over all three.
+
+Validation: the variables apply in a fixed order (the mode first), each on top of the ones before it,
+and a value is IGNORED -- the field keeps what the earlier ones left -- with one note on stderr when
+it does not parse or when the configuration it would give fails `GateConfig::validate` (a zero poll
+interval; a near band outside `[0, 1)`; bands that cannot hold under `block`). The one exception is a
+configuration that already fails on its bands only because the drain target
+(`FAST_TIER_DRAIN_TARGET` >= 0.99) leaves no room for the default near band, which the plain
+constructor tolerates (`GateState::Bands`): a variable that leaves it failing in that way alone is
+not refused for it (`GateConfig::admits`). `from_lookup` is the pure decision over a lookup function,
+so the unit tests need no environment; a release build's default mode is `block`, the lib tests'
+`off`, so a `PAPER_GATE_MODE=block` a drain target of 0.995 cannot support is ignored in the tests and
+accepted (and the gate disabled) in a release build.
+
+Tests: `gate::tests` (unset is the default; one variable per field, each setting only its own, as a
+literal of the whole struct so a new field without a variable fails to compile; invalid values ignored
+with a note, beside valid ones that still apply; validation in order, the mode first) and
+`s8_tests.rs`, each in a child process that has the variables from the start (the environment
+configures a plain constructor and never an explicit configuration or `set_gate_config`; an invalid
+value is ignored and the valid ones apply; a failure already there is not a reason to refuse).
+

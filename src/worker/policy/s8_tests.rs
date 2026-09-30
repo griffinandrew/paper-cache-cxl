@@ -14,9 +14,9 @@
 use std::time::Duration;
 
 use super::*;
-use super::test_support::wait_for;
+use super::test_support::{alone_in_with_env, wait_for};
 
-use crate::gate::{GateConfig, MetadataModel};
+use crate::gate::{GateConfig, GateMode, GateState, MetadataModel, MetadataOverflow, OnStall};
 use crate::{CacheTierSize, HybridStats, PaperCache, TieredBuffer};
 
 type Cache = PaperCache<u64, TieredBuffer>;
@@ -210,4 +210,148 @@ fn the_eviction_fallback_is_counted_per_cache() {
 	let (_other, other_status, _) = tiered_worker(other_objects, 1 << 30, POLICY, true, false);
 
 	assert_eq!(other_status.hybrid_stats().erase_fallbacks, 0);
+}
+
+/// The tiered cache the gate-configuration tests build: a plain constructor, so
+/// it takes the environment's configuration.
+fn plain_cache() -> Cache {
+	Cache::new(1 << 20, CacheTierSize::Bytes(64 << 10), PaperPolicy::LruCompactHybrid).expect("a tiered cache")
+}
+
+/// S8: the `PAPER_GATE_*` environment configures a cache built WITHOUT a gate
+/// configuration, and never one built with one -- `new_with_gate` (and
+/// `set_gate_config` after it) is used as given, however the environment is
+/// set. The precedence the gate module documents, through real caches, in a
+/// child process that has the variables from the start (they are read once per
+/// process).
+#[test]
+fn the_environment_configures_a_plain_constructor_and_never_an_explicit_configuration() {
+	alone_in_with_env(
+		module_path!(),
+		"the_environment_configures_a_plain_constructor_and_never_an_explicit_configuration",
+		&[
+			("PAPER_GATE_MODE", "block"),
+			("PAPER_GATE_ON_STALL", "divert"),
+			("PAPER_GATE_ON_METADATA_OVERFLOW", "evict_to_fit"),
+			("PAPER_GATE_METADATA_MODEL", "per_object"),
+			("PAPER_GATE_STALL_WINDOW_MS", "750"),
+			("PAPER_GATE_POLL_INTERVAL_US", "500"),
+			("PAPER_GATE_SLACK_BYTES", "4096"),
+			("PAPER_GATE_NEAR_FRAC", "0.02"),
+		],
+		|| {
+			let mut expected = GateConfig::default();
+
+			expected.mode = GateMode::Block;
+			expected.on_stall = OnStall::Divert;
+			expected.on_metadata_overflow = MetadataOverflow::EvictToFit;
+			expected.metadata_model = MetadataModel::PerObject;
+			expected.stall_window = Duration::from_millis(750);
+			expected.poll_interval = Duration::from_micros(500);
+			expected.slack = 4_096;
+			expected.near_frac = 0.02;
+
+			// A plain constructor: the defaults with the environment on top.
+			let plain = plain_cache();
+
+			assert_eq!(plain.gate_config(), expected);
+			assert_eq!(plain.hybrid_stats().metadata_model, MetadataModel::PerObject, "and the worker runs it");
+
+			// An explicit configuration: exactly what was given.
+			let mut given = GateConfig::default();
+			given.stall_window = Duration::from_millis(40);
+
+			let explicit = Cache::new_with_gate(1 << 20, CacheTierSize::Bytes(64 << 10), PaperPolicy::LruCompactHybrid, given)
+				.expect("a tiered cache");
+
+			assert_eq!(explicit.gate_config(), given, "the environment is not consulted for it");
+			assert_eq!(explicit.gate_config().mode, GateConfig::default().mode);
+
+			let defaults = Cache::new_with_gate(1 << 20, CacheTierSize::Bytes(64 << 10), PaperPolicy::LruCompactHybrid, GateConfig::default())
+				.expect("a tiered cache");
+
+			assert_eq!(defaults.gate_config(), GateConfig::default(), "not even the defaults are overlaid");
+
+			// And at runtime.
+			plain.set_gate_config(given).expect("a valid configuration");
+			assert_eq!(plain.gate_config(), given);
+		},
+	);
+}
+
+/// S8: a variable that does not parse, or that the configuration could not
+/// run with, is ignored -- the default stays, the valid ones still apply -- and
+/// the cache builds.
+#[test]
+fn an_invalid_environment_value_is_ignored_and_the_valid_ones_apply() {
+	alone_in_with_env(
+		module_path!(),
+		"an_invalid_environment_value_is_ignored_and_the_valid_ones_apply",
+		&[
+			("PAPER_GATE_MODE", "off"),
+			("PAPER_GATE_STALL_WINDOW_MS", "soon"),
+			("PAPER_GATE_NEAR_FRAC", "1.5"),
+			("PAPER_GATE_ON_STALL", "admit_over"),
+		],
+		|| {
+			let mut expected = GateConfig::default();
+
+			expected.mode = GateMode::Off;
+			expected.on_stall = OnStall::AdmitOver;
+
+			assert_eq!(plain_cache().gate_config(), expected);
+		},
+	);
+}
+
+/// S8: a drain target that leaves no room for the default near band
+/// (`FAST_TIER_DRAIN_TARGET` of 0.995 against 0.01) already fails
+/// `validate` on its bands -- the plain constructor starts with the byte gate
+/// disabled (`GateState::Bands`) rather than refusing -- so a variable that
+/// leaves the configuration failing in that way and no other is not refused
+/// for a failure that was already there, while one that makes it invalid
+/// otherwise is; and a valid configuration is not made invalid on its bands
+/// (the mode asked to `block` when the bands cannot hold is ignored). In a
+/// child process with the drain target from the start (read once per process).
+#[test]
+fn a_variable_is_not_refused_for_a_failure_that_was_already_there() {
+	alone_in_with_env(
+		module_path!(),
+		"a_variable_is_not_refused_for_a_failure_that_was_already_there",
+		&[("FAST_TIER_DRAIN_TARGET", "0.995"), ("PAPER_GATE_MODE", "block"), ("PAPER_GATE_STALL_WINDOW_MS", "100")],
+		|| {
+			// The default of a release build: `Block`, with a near band of 1%.
+			let mut base = GateConfig::default();
+			base.mode = GateMode::Block;
+
+			assert!(!base.bands_hold(), "0.995 + 0.01 leaves no room");
+
+			let with = |change: fn(&mut GateConfig)| {
+				let mut config = base;
+				change(&mut config);
+				config
+			};
+
+			assert!(base.admits(&with(|config| config.stall_window = Duration::from_millis(100))), "an unrelated variable");
+			assert!(base.admits(&with(|config| config.near_frac = 0.008)), "a near band that fails the same way");
+			assert!(!base.admits(&with(|config| config.poll_interval = Duration::ZERO)), "but not one invalid otherwise");
+			assert!(!base.admits(&with(|config| config.near_frac = 1.5)));
+
+			let mut off = base;
+			off.mode = GateMode::Off;
+
+			assert!(off.validate().is_ok());
+			assert!(!off.admits(&base), "a valid configuration is not made one whose bands fail");
+
+			// The test build's default is `Off`, so through the environment the mode
+			// is ignored (with a note) and the window applies.
+			let mut expected = GateConfig::default();
+			expected.stall_window = Duration::from_millis(100);
+
+			let cache = plain_cache();
+
+			assert_eq!(cache.gate_config(), expected);
+			assert_eq!(cache.hybrid_stats().gate_state, GateState::Off);
+		},
+	);
 }

@@ -110,6 +110,49 @@
 //! tier, design Q7); for bands that would put the
 //! settle target at or above the near level; and with no stack. A dead policy
 //! worker fails a waiting set with `CacheError::Internal`.
+//!
+//! # Configuration, and where it comes from (S8)
+//!
+//! A tiered cache's [`GateConfig`] has three sources, in this order of
+//! precedence:
+//!
+//!   1. A configuration passed IN CODE -- to a `*_with_gate` constructor, or to
+//!      `PaperCache::set_gate_config` at runtime -- is used exactly as given: the
+//!      environment is not consulted for it, field by field or otherwise. A
+//!      struct cannot tell a field set on purpose from one left at its default,
+//!      so the granularity is the whole configuration.
+//!   2. A plain constructor (no configuration) starts from the defaults and
+//!      applies the `PAPER_GATE_*` environment variables on top
+//!      (`GateConfig::from_env`): what a process the user configures from
+//!      outside -- a server, a benchmark run -- gets, without a code change.
+//!   3. The built-in defaults (`GateConfig::default()`).
+//!
+//! `PAPER_DISABLE_SHARED_OVERHEAD=1`, the mechanics tests' switch, forces the
+//! per-object metadata model over all three.
+//!
+//! The variables are read ONCE per process, like `FAST_TIER_DRAIN_TARGET` and
+//! `EVICTION_HIGH_WATERMARK`, in this order (the first three change what the
+//! later ones are checked against):
+//!
+//! | variable | field | values |
+//! |---|---|---|
+//! | `PAPER_GATE_MODE` | `mode` | `block`, `off` |
+//! | `PAPER_GATE_ON_STALL` | `on_stall` | `error`, `divert`, `admit_over` |
+//! | `PAPER_GATE_ON_METADATA_OVERFLOW` | `on_metadata_overflow` | `error`, `evict_to_fit` |
+//! | `PAPER_GATE_METADATA_MODEL` | `metadata_model` | `measured`, `per_object` |
+//! | `PAPER_GATE_STALL_WINDOW_MS` | `stall_window` | whole milliseconds; 0 never waits |
+//! | `PAPER_GATE_POLL_INTERVAL_US` | `poll_interval` | whole microseconds, at least 1 |
+//! | `PAPER_GATE_METADATA_FLOOR_BYTES` | `metadata_floor` | whole bytes |
+//! | `PAPER_GATE_SLACK_BYTES` | `slack` | whole bytes |
+//! | `PAPER_GATE_NEAR_FRAC` | `near_frac` | a fraction in `[0, 1)` |
+//! | `PAPER_GATE_CONCURRENCY_HINT` | `concurrency_hint` | a whole number |
+//! | `PAPER_GATE_VALUE_HINT_BYTES` | `value_hint` | whole bytes |
+//!
+//! Words are case-insensitive, `-` and `_` alike; an empty variable is unset. A
+//! variable that does not parse, or whose value would make the configuration
+//! one [`GateConfig::validate`] refuses, is IGNORED -- the field keeps what the
+//! earlier variables left -- with one note on stderr. The configuration the
+//! cache runs is `PaperCache::gate_config()`.
 
 use std::{
 	collections::VecDeque,
@@ -246,7 +289,10 @@ impl GateState {
 
 /// A tiered cache's admission configuration. Built as `GateConfig::default()`
 /// and adjusted field by field (the struct is `non_exhaustive`), then passed to
-/// a `*_with_gate` constructor or `PaperCache::set_gate_config`.
+/// a `*_with_gate` constructor or `PaperCache::set_gate_config`. A cache built
+/// WITHOUT one takes the defaults with the `PAPER_GATE_*` environment variables
+/// applied (the module doc lists them, and the precedence: a configuration
+/// passed in code is used as given, the environment is not consulted for it).
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct GateConfig {
@@ -341,6 +387,144 @@ impl GateConfig {
 	pub fn bands_hold(&self) -> bool {
 		self.mode == GateMode::Off || drain_target::ratio() + self.near_frac < 1.0
 	}
+
+	/// The defaults with the `PAPER_GATE_*` environment variables applied (the
+	/// module doc's table): what a plain constructor -- one given no
+	/// configuration -- starts from. Read once per process; each variable that
+	/// is ignored gets one note on stderr, as it is first read.
+	pub(crate) fn from_env() -> GateConfig {
+		static CONFIG: std::sync::OnceLock<GateConfig> = std::sync::OnceLock::new();
+
+		*CONFIG.get_or_init(|| {
+			let (config, notes) = GateConfig::from_lookup(|name| std::env::var(name).ok());
+
+			for note in notes {
+				eprintln!("paper-cache: {note}");
+			}
+
+			config
+		})
+	}
+
+	/// `from_env` over any lookup of variables by name, and the notes for the
+	/// values it ignored: the whole decision, pure, so it can be tested without
+	/// touching the process's environment.
+	///
+	/// The variables apply in the order of `ENV`, each on top of what the ones
+	/// before it left. One is ignored when it does not parse, or when the
+	/// configuration it would give is one `validate` refuses -- except that a
+	/// configuration whose bands cannot hold only because the drain target does
+	/// not leave room for even the DEFAULT near band (`FAST_TIER_DRAIN_TARGET` of
+	/// 0.99 or more) is not made worse by a variable that leaves the same
+	/// failure in place, for the plain constructor tolerates that one
+	/// (`GateState::Bands`).
+	pub(crate) fn from_lookup(get: impl Fn(&str) -> Option<String>) -> (GateConfig, Vec<String>) {
+		let mut config = GateConfig::default();
+		let mut notes = Vec::new();
+
+		for &(name, apply) in ENV {
+			let Some(value) = get(name).filter(|value| !value.trim().is_empty()) else {
+				continue;
+			};
+
+			let mut candidate = config;
+
+			match apply(&mut candidate, value.trim()) {
+				Err(reason) => notes.push(format!("{name}={value:?} ignored: {reason}")),
+
+				Ok(()) if !config.admits(&candidate) => notes.push(format!(
+					"{name}={value:?} ignored: it would make the gate configuration invalid \
+					 (GateConfig::validate: a zero poll interval, a near band outside [0, 1), or bands that \
+					 cannot hold with the drain target)",
+				)),
+
+				Ok(()) => config = candidate,
+			}
+		}
+
+		(config, notes)
+	}
+
+	/// Whether `candidate`, a change to `self`, is acceptable: it validates, or
+	/// it fails only on bands that `self` did not hold either.
+	pub(crate) fn admits(&self, candidate: &GateConfig) -> bool {
+		if candidate.validate().is_ok() {
+			return true;
+		}
+
+		let mut without_bands = *candidate;
+		without_bands.mode = GateMode::Off;
+
+		!self.bands_hold() && !candidate.bands_hold() && without_bands.validate().is_ok()
+	}
+}
+
+/// The environment variables `GateConfig::from_env` reads, in the order they
+/// apply, each with the change it makes to a configuration (`Err`: why the
+/// value is not one).
+type Apply = fn(&mut GateConfig, &str) -> Result<(), String>;
+
+const ENV: &[(&str, Apply)] = &[
+	("PAPER_GATE_MODE", |config, value| {
+		config.mode = word(value, &[("block", GateMode::Block), ("off", GateMode::Off)])?;
+		Ok(())
+	}),
+	("PAPER_GATE_ON_STALL", |config, value| {
+		config.on_stall = word(value, &[("error", OnStall::Error), ("divert", OnStall::Divert), ("admit_over", OnStall::AdmitOver)])?;
+		Ok(())
+	}),
+	("PAPER_GATE_ON_METADATA_OVERFLOW", |config, value| {
+		config.on_metadata_overflow = word(value, &[("error", MetadataOverflow::Error), ("evict_to_fit", MetadataOverflow::EvictToFit)])?;
+		Ok(())
+	}),
+	("PAPER_GATE_METADATA_MODEL", |config, value| {
+		config.metadata_model = word(value, &[("measured", MetadataModel::Measured), ("per_object", MetadataModel::PerObject)])?;
+		Ok(())
+	}),
+	("PAPER_GATE_STALL_WINDOW_MS", |config, value| {
+		config.stall_window = Duration::from_millis(whole(value)?);
+		Ok(())
+	}),
+	("PAPER_GATE_POLL_INTERVAL_US", |config, value| {
+		config.poll_interval = Duration::from_micros(whole(value)?);
+		Ok(())
+	}),
+	("PAPER_GATE_METADATA_FLOOR_BYTES", |config, value| {
+		config.metadata_floor = whole(value)?;
+		Ok(())
+	}),
+	("PAPER_GATE_SLACK_BYTES", |config, value| {
+		config.slack = whole(value)?;
+		Ok(())
+	}),
+	("PAPER_GATE_NEAR_FRAC", |config, value| {
+		config.near_frac = value.parse::<f64>().map_err(|_| "not a number".to_string())?;
+		Ok(())
+	}),
+	("PAPER_GATE_CONCURRENCY_HINT", |config, value| {
+		config.concurrency_hint = u32::try_from(whole(value)?).map_err(|_| "too large".to_string())?;
+		Ok(())
+	}),
+	("PAPER_GATE_VALUE_HINT_BYTES", |config, value| {
+		config.value_hint = whole(value)?;
+		Ok(())
+	}),
+];
+
+/// `value` as one of `words`, ignoring case and treating `-` as `_`.
+fn word<T: Copy>(value: &str, words: &[(&str, T)]) -> Result<T, String> {
+	let value = value.to_ascii_lowercase().replace('-', "_");
+
+	words
+		.iter()
+		.find(|(word, _)| *word == value)
+		.map(|(_, meaning)| *meaning)
+		.ok_or_else(|| format!("expected one of: {}", words.iter().map(|(word, _)| *word).collect::<Vec<_>>().join(", ")))
+}
+
+/// `value` as a whole number.
+fn whole(value: &str) -> Result<u64, String> {
+	value.parse::<u64>().map_err(|_| "not a whole number".to_string())
 }
 
 /// The gate word's flag: the object count is within `NEAR_KEYS` of the key
@@ -2368,6 +2552,163 @@ mod tests {
 		let mut zero_poll = block((1.0 - tau) / 2.0);
 		zero_poll.poll_interval = Duration::ZERO;
 		assert!(refused(zero_poll));
+	}
+
+	/// A lookup over a fixed list of variables, for `GateConfig::from_lookup`.
+	fn vars<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+		move |name| vars.iter().find(|(var, _)| *var == name).map(|(_, value)| value.to_string())
+	}
+
+	/// S8: with no `PAPER_GATE_*` variable set -- or empty ones, which are unset
+	/// -- the configuration is `GateConfig::default()`, and nothing is noted.
+	#[test]
+	fn an_unset_environment_is_the_default_configuration() {
+		let (config, notes) = GateConfig::from_lookup(vars(&[]));
+
+		assert_eq!(config, GateConfig::default());
+		assert!(notes.is_empty());
+
+		let empty: Vec<(&str, &str)> = ENV.iter().map(|(name, _)| (*name, "  ")).collect();
+		let (config, notes) = GateConfig::from_lookup(vars(&empty));
+
+		assert_eq!(config, GateConfig::default());
+		assert!(notes.is_empty(), "{notes:?}");
+	}
+
+	/// S8: every field of a `GateConfig` has its variable, and each sets its own
+	/// field and no other. The expectation is a literal of the whole struct, so
+	/// a field added to `GateConfig` without a variable fails to compile here.
+	#[test]
+	fn every_field_has_a_variable_that_sets_it_and_nothing_else() {
+		let near_frac = (1.0 - drain_target::ratio()) / 2.0;
+		let near = near_frac.to_string();
+
+		let all = [
+			("PAPER_GATE_MODE", "Block"),
+			("PAPER_GATE_ON_STALL", "admit-over"),
+			("PAPER_GATE_ON_METADATA_OVERFLOW", "EVICT_TO_FIT"),
+			("PAPER_GATE_METADATA_MODEL", "per_object"),
+			("PAPER_GATE_STALL_WINDOW_MS", "750"),
+			("PAPER_GATE_POLL_INTERVAL_US", "500"),
+			("PAPER_GATE_METADATA_FLOOR_BYTES", "1024"),
+			("PAPER_GATE_SLACK_BYTES", "4096"),
+			("PAPER_GATE_NEAR_FRAC", near.as_str()),
+			("PAPER_GATE_CONCURRENCY_HINT", "4"),
+			("PAPER_GATE_VALUE_HINT_BYTES", "2000"),
+		];
+
+		let (config, notes) = GateConfig::from_lookup(vars(&all));
+
+		assert!(notes.is_empty(), "{notes:?}");
+		assert_eq!(
+			config,
+			GateConfig {
+				metadata_model: MetadataModel::PerObject,
+				metadata_floor: 1_024,
+				on_metadata_overflow: MetadataOverflow::EvictToFit,
+				stall_window: Duration::from_millis(750),
+				poll_interval: Duration::from_micros(500),
+				mode: GateMode::Block,
+				on_stall: OnStall::AdmitOver,
+				slack: 4_096,
+				near_frac,
+				concurrency_hint: 4,
+				value_hint: 2_000,
+			},
+		);
+		assert_eq!(all.len(), ENV.len(), "one variable per field, and no other");
+
+		// Each alone changes only its own field.
+		for (name, value) in all {
+			let (alone, notes) = GateConfig::from_lookup(vars(&[(name, value)]));
+
+			assert!(notes.is_empty(), "{name}: {notes:?}");
+			assert_ne!(alone, GateConfig::default(), "{name} sets nothing");
+
+			let mut expected = GateConfig::default();
+			let (_, only) = ENV.iter().find(|(var, _)| *var == name).map(|(var, apply)| (var, apply)).unwrap();
+			only(&mut expected, value).unwrap();
+
+			assert_eq!(alone, expected, "{name}");
+		}
+
+		// Zero is a window ("never wait"), a floor and a slack, but not a poll.
+		let (config, notes) = GateConfig::from_lookup(vars(&[("PAPER_GATE_STALL_WINDOW_MS", "0"), ("PAPER_GATE_SLACK_BYTES", "0")]));
+
+		assert!(notes.is_empty());
+		assert!(config.stall_window.is_zero() && config.slack == 0);
+	}
+
+	/// S8: a value that does not parse, or that `validate` would refuse the
+	/// configuration for, is ignored -- the field keeps its default, the others
+	/// still apply -- with one note that names the variable and its value.
+	#[test]
+	fn an_invalid_value_is_ignored_with_a_note() {
+		let bad = [
+			("PAPER_GATE_MODE", "maybe"),
+			("PAPER_GATE_ON_STALL", "explode"),
+			("PAPER_GATE_ON_METADATA_OVERFLOW", "2"),
+			("PAPER_GATE_METADATA_MODEL", "measure"),
+			("PAPER_GATE_STALL_WINDOW_MS", "-5"),
+			("PAPER_GATE_STALL_WINDOW_MS", "soon"),
+			("PAPER_GATE_STALL_WINDOW_MS", "1.5"),
+			("PAPER_GATE_POLL_INTERVAL_US", "0"),
+			("PAPER_GATE_POLL_INTERVAL_US", "fast"),
+			("PAPER_GATE_SLACK_BYTES", "4k"),
+			("PAPER_GATE_METADATA_FLOOR_BYTES", "-1"),
+			("PAPER_GATE_NEAR_FRAC", "1"),
+			("PAPER_GATE_NEAR_FRAC", "1.5"),
+			("PAPER_GATE_NEAR_FRAC", "-0.1"),
+			("PAPER_GATE_NEAR_FRAC", "NaN"),
+			("PAPER_GATE_NEAR_FRAC", "inf"),
+			("PAPER_GATE_NEAR_FRAC", "one percent"),
+			("PAPER_GATE_CONCURRENCY_HINT", "4294967296"),
+			("PAPER_GATE_VALUE_HINT_BYTES", "big"),
+		];
+
+		for (name, value) in bad {
+			// Beside a valid one, which still applies.
+			let (config, notes) = GateConfig::from_lookup(vars(&[(name, value), ("PAPER_GATE_STALL_WINDOW_MS", "300")]));
+
+			let mut expected = GateConfig::default();
+			if name != "PAPER_GATE_STALL_WINDOW_MS" {
+				expected.stall_window = Duration::from_millis(300);
+			}
+
+			assert_eq!(config, expected, "{name}={value}: ignored, the default kept");
+			assert_eq!(notes.len(), 1, "{name}={value}: {notes:?}");
+			assert!(notes[0].contains(name) && notes[0].contains(value), "{}", notes[0]);
+		}
+	}
+
+	/// S8: the configuration is checked with `validate` as it goes, in the order
+	/// the variables apply -- the mode first, so `off`, which needs no bands,
+	/// lets a wide near band stand that `block` would refuse. Under `Block` a
+	/// near band that leaves the settle target no room under the near level is
+	/// ignored. Not run under a drain-target override, which moves the limit.
+	#[test]
+	fn the_configuration_is_validated_in_order_and_the_mode_comes_first() {
+		if std::env::var_os("FAST_TIER_DRAIN_TARGET").is_some() {
+			return;
+		}
+
+		let wide = (1.0 - drain_target::ratio() + 0.01).to_string();
+
+		let (config, notes) = GateConfig::from_lookup(vars(&[("PAPER_GATE_MODE", "block"), ("PAPER_GATE_NEAR_FRAC", &wide)]));
+
+		assert_eq!(config.mode, GateMode::Block);
+		assert_eq!(config.near_frac, GateConfig::default().near_frac, "refused under Block");
+		assert_eq!(notes.len(), 1, "{notes:?}");
+		assert!(notes[0].contains("PAPER_GATE_NEAR_FRAC") && notes[0].contains("invalid"), "{}", notes[0]);
+
+		// The same near band beside `off`, whatever order the caller lists them in.
+		for listing in [[("PAPER_GATE_MODE", "off"), ("PAPER_GATE_NEAR_FRAC", &wide)], [("PAPER_GATE_NEAR_FRAC", &wide), ("PAPER_GATE_MODE", "off")]] {
+			let (config, notes) = GateConfig::from_lookup(vars(&listing));
+
+			assert_eq!(config.mode, GateMode::Off);
+			assert_eq!(config.near_frac, wide.parse::<f64>().unwrap(), "no bands to hold under Off");
+			assert!(notes.is_empty(), "{notes:?}");
+		}
 	}
 
 	#[test]

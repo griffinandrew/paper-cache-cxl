@@ -295,8 +295,29 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | `FAST_TIER_DRAIN_TARGET` | `0.95` | Fraction of the effective fast-tier budget the tier is continuously held at (`0.98` before the default moved). `1.0` leaves no burst headroom. |
 | `EVICTION_HIGH_WATERMARK` | `0.98` | Fraction of `max_size` above which capacity eviction starts, in `(0, 1]`. `1.0` evicts only past `max_size`, the behaviour before the 0.98 default. It is also the level above which a `set` is refused (`ExceedingValueSize`), by the object's accounted size; at `1.0`, by its base size against `max_size`, as before. |
 | `EVICTION_LOW_WATERMARK` | the high mark | Fraction of `max_size` an armed eviction pass drains to, clamped to at most the high mark. Unset, it follows the high mark: one threshold. Set below it, the pass is a band and evicts in bursts. |
+| `PAPER_GATE_MODE` | `block` | The fast-tier byte gate: `block` holds a fast set to the tier's budget and waits for demotions to free room; `off` admits fast sets ungated (the metadata cap and structural slow placement still apply). |
+| `PAPER_GATE_STALL_WINDOW_MS` | `2000` | How long a waiting set waits with nothing freed before it acts (`PAPER_GATE_ON_STALL`), in ms. `0` never waits: a set that would wait acts at once. |
+| `PAPER_GATE_ON_STALL` | `error` | What a set does when the watchdog fires: `error` (`FastTierStalled`), `divert` (built in the slow tier, healed on its first slow hit) or `admit_over` (admitted over the budget). |
+| `PAPER_GATE_ON_METADATA_OVERFLOW` | `error` | What a new key whose metadata would not fit the fast tier gets: `error` (`MetadataOverflow`) or `evict_to_fit` (wait while the worker evicts the policy's victims for it). |
+| `PAPER_GATE_METADATA_MODEL` | `measured` | The figure taken off the fast tier's budget for the cache's DRAM metadata: `measured` (counted from the structures) or `per_object` (the stacks' per-object reservation). |
+| `PAPER_GATE_NEAR_FRAC` | `0.01` | The near band, a fraction of the effective budget in `[0, 1)`, below the close level above which a fast set takes the exact path. With `block`, `FAST_TIER_DRAIN_TARGET + PAPER_GATE_NEAR_FRAC` must stay under 1. |
+| `PAPER_GATE_POLL_INTERVAL_US` | `200` | How often a waiting set re-checks when nothing wakes it, in microseconds (at least 1). |
+| `PAPER_GATE_METADATA_FLOOR_BYTES` | `0` | Bytes of the fast tier kept for values: the metadata cap is the tier's budget less this. |
+| `PAPER_GATE_SLACK_BYTES` | `0` | Bytes the fast tier may hold beyond its budget: the close level is the budget plus this. |
+| `PAPER_GATE_CONCURRENCY_HINT`, `PAPER_GATE_VALUE_HINT_BYTES` | `0`, `0` | Concurrent setters and a typical value size: they widen the near band to their product when that is wider. |
 | `NUMA_ARENAS_PER_NODE` | `8` | jemalloc arenas per node (clamped to 32). Swept on cluster12: a single arena costs 5% of SET latency at one client and 27% at sixteen, while 8→32 buys 1–2%, inside the run-to-run spread. |
 | `PAPER_CACHE_EVICTION_STACK_CAPACITY` | — | Pre-sizes the eviction stack's backing collections. |
+
+The `PAPER_GATE_*` variables are the tiered cache's `GateConfig` from the environment, read once
+per process. They configure a cache built **without** a `GateConfig` (the plain constructors:
+`PaperCache::new`, `with_hasher`, `new_sized_compact`, ...): the defaults, with these applied on top. A configuration passed in code --
+`new_with_gate`, `with_hasher_and_gate`, `set_gate_config` -- is used exactly as given and the
+environment is not consulted for it (a struct cannot tell a field set on purpose from one left at its
+default, so the granularity is the whole configuration). Words are case-insensitive (`admit_over`,
+`Admit-Over`); an empty variable is unset; a value that does not parse, or that would make the
+configuration one `GateConfig::validate` refuses, is ignored (the default stays) with one note on
+stderr. `PaperCache::gate_config()` reads back what the cache runs. `PAPER_DISABLE_SHARED_OVERHEAD=1`
+still forces the per-object metadata model over all of it.
 
 ## Testing
 

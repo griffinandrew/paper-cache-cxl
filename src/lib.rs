@@ -1349,7 +1349,10 @@ fn new_hybrid_object_map<K, V>() -> ObjectMapRef<K, V> {
 /// before S5: none, beyond a ghost's.
 ///
 /// `gate` is `None` from a plain constructor, which takes the default
-/// configuration. That one is not refused when its byte-gate levels cannot
+/// configuration with the `PAPER_GATE_*` environment variables applied
+/// (`GateConfig::from_env`; an explicit configuration is used as given and the
+/// environment is not consulted for it -- the precedence is in `crate::gate`'s
+/// module doc). That one is not refused when its byte-gate levels cannot
 /// hold under an environment-chosen drain target (`FAST_TIER_DRAIN_TARGET` of
 /// 0.99 or more, against the default 1% near band): the cache starts with the
 /// byte gate disabled (`GateState::Bands`) and says so once on stderr (design
@@ -1359,7 +1362,7 @@ fn install_gate(status: &AtomicStatus, gate: Option<GateConfig>) -> Result<(), C
 	let explicit = gate.is_some();
 
 	#[allow(unused_mut)]
-	let mut gate = gate.unwrap_or_default();
+	let mut gate = gate.unwrap_or_else(GateConfig::from_env);
 
 	match gate.validate() {
 		Ok(()) => {},
@@ -1567,7 +1570,9 @@ where
 
 	/// [`Self::new`], with an admission configuration (S5): the metadata
 	/// model, the metadata floor, what a new key whose metadata would not fit
-	/// gets, and the waits. See [`GateConfig`].
+	/// gets, and the waits. See [`GateConfig`]. The configuration is used as
+	/// given: the `PAPER_GATE_*` environment variables, which a cache built
+	/// with [`Self::new`] applies over the defaults, are not consulted for it.
 	///
 	/// # Errors
 	///
