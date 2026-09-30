@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::*;
+use super::test_support::each_alone;
 use super::reconcile_tests::{
 	Objects, Worker, FAST, LEN, assert_settled, bytes_tier, correctives, drain_and_apply,
 	evict_one_key, fill, handle, make_worker, of, placement, publish, publish_del, set,
@@ -181,7 +182,7 @@ fn reap(worker: &Worker, objects: &Objects, key: HashedKey) {
 fn t15_a_clients_set_and_delete_move_nothing_the_stack_reports_until_the_worker_takes_them() {
 	let _serialised = migration_test_lock::lock();
 
-	for policy in TIERED {
+	each_alone!("t15_a_clients_set_and_delete_move_nothing_the_stack_reports_until_the_worker_takes_them", TIERED, |policy| {
 		let (mut worker, objects) = make_worker(policy);
 
 		// Past the tier: fast and slow keys, and the LFU latched.
@@ -226,7 +227,7 @@ fn t15_a_clients_set_and_delete_move_nothing_the_stack_reports_until_the_worker_
 
 		assert_settled(&mut worker);
 		charges_exact(&objects, true);
-	}
+	});
 }
 
 /// T8, in both stores: a touch whose promotion its own settle undoes queues
@@ -261,84 +262,104 @@ fn t8_a_promotion_its_own_settle_undoes_queues_only_the_settles_entry() {
 		resize_fast(worker, charge(LEN) + reserved);
 	};
 
-	for fits in [false, true] {
+	#[derive(Clone, Copy)]
+	enum Touch {
+		Hit,
+		Overwrite,
+		SecondChance,
+	}
+
+	// Each case in a child process of its own: both tiers, every touch path.
+	let cases: Vec<_> = [false, true]
+		.into_iter()
+		.flat_map(|fits| [
+			(fits, PaperPolicy::LruCompactHybrid, Touch::Hit),
+			(fits, PaperPolicy::LruCompactHybrid, Touch::Overwrite),
+			(fits, PaperPolicy::LfuCompactHybrid, Touch::Hit),
+			(fits, PaperPolicy::LfuCompactHybrid, Touch::Overwrite),
+			(fits, PaperPolicy::ClockCompactHybrid, Touch::SecondChance),
+		])
+		.collect();
+
+	each_alone!("t8_a_promotion_its_own_settle_undoes_queues_only_the_settles_entry", cases, |(fits, policy, touch)| {
 		// One byte: STRUCTURAL, nothing promoted or queued. Exactly eff: the
 		// promotion, undone by its own settle -- the settle's entry alone.
 		let expected: &[Tier] = if fits { &[Slow] } else { &[] };
 		let tier = if fits { "eff" } else { "1 B" };
 
-		for (policy, overwrite) in [
-			(PaperPolicy::LruCompactHybrid, false),
-			(PaperPolicy::LruCompactHybrid, true),
-			(PaperPolicy::LfuCompactHybrid, false),
-			(PaperPolicy::LfuCompactHybrid, true),
-		] {
-			let (mut worker, objects) = make_worker(policy);
+		match touch {
+			Touch::Hit | Touch::Overwrite => {
+				let overwrite = matches!(touch, Touch::Overwrite);
 
-			set(&mut worker, &objects, K, LEN, Fast);
-			drain_and_apply(&mut worker);
-			tiny(&mut worker);
-			assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Slow), Slow), "{policy}: demoted");
+				let (mut worker, objects) = make_worker(policy);
 
-			if fits {
-				exact(&mut worker);
-				assert_eq!(placement(&worker, K), Some(Slow), "{policy}: a grow promotes nothing");
-			}
+				set(&mut worker, &objects, K, LEN, Fast);
+				drain_and_apply(&mut worker);
+				tiny(&mut worker);
+				assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Slow), Slow), "{policy}: demoted");
 
-			let drain = match overwrite {
-				false => {
-					worker.handle_get(K, Some(Slow));
-					drain_and_apply(&mut worker)
-				},
+				if fits {
+					exact(&mut worker);
+					assert_eq!(placement(&worker, K), Some(Slow), "{policy}: a grow promotes nothing");
+				}
 
-				// Built where the client's decision builds it: slow, and
-				// structural, on the one-byte tier.
-				true => {
-					client_set(&mut worker, &objects, K, LEN);
-					drain_and_apply(&mut worker)
-				},
-			};
+				let drain = match overwrite {
+					false => {
+						worker.handle_get(K, Some(Slow));
+						drain_and_apply(&mut worker)
+					},
 
-			let what = if overwrite { "overwrite" } else { "hit" };
+					// Built where the client's decision builds it: slow, and
+					// structural, on the one-byte tier.
+					true => {
+						client_set(&mut worker, &objects, K, LEN);
+						drain_and_apply(&mut worker)
+					},
+				};
 
-			assert_eq!(of(&drain, K), expected, "{policy} {what}, {tier} tier: the settle's entry alone, no promote-then-demote pair");
-			assert_eq!(correctives(&drain, K), vec![], "{policy} {what}, {tier} tier: no heal, no corrective");
-			assert_eq!(bytes_tier(&objects, K), Slow, "{policy} {what}, {tier} tier: the bytes stay slow");
-			assert_settled(&mut worker);
-			charges_exact(&objects, true);
+				let what = if overwrite { "overwrite" } else { "hit" };
+
+				assert_eq!(of(&drain, K), expected, "{policy} {what}, {tier} tier: the settle's entry alone, no promote-then-demote pair");
+				assert_eq!(correctives(&drain, K), vec![], "{policy} {what}, {tier} tier: no heal, no corrective");
+				assert_eq!(bytes_tier(&objects, K), Slow, "{policy} {what}, {tier} tier: the bytes stay slow");
+				assert_settled(&mut worker);
+				charges_exact(&objects, true);
+			},
+
+			Touch::SecondChance => {
+				// CLOCK: the hand's second chance of a referenced slow key -- promoted
+				// and demoted again by its settle when it fits, left slow when it is
+				// structural; the unreferenced key behind it is evicted.
+				let (mut worker, objects) = make_worker(PaperPolicy::ClockCompactHybrid);
+
+				set(&mut worker, &objects, K, LEN, Fast);
+				drain_and_apply(&mut worker);
+				set(&mut worker, &objects, X, LEN, Fast);
+				drain_and_apply(&mut worker);
+				tiny(&mut worker);
+
+				if fits {
+					exact(&mut worker);
+				}
+
+				worker.handle_get(K, Some(Slow));
+				drain_and_apply(&mut worker);
+
+				// `evict_one_key`, keeping the drain of the pass.
+				let used = worker.status.used_size(&worker.status.policy());
+				worker.status.set_max_size(used - 1);
+				worker.apply_evictions().expect("an eviction pass");
+				worker.status.set_max_size(1 << 30);
+				let drain = drain_and_apply(&mut worker);
+
+				assert_eq!(placement(&worker, X), None, "{tier} tier: the unreferenced key was the victim");
+				assert_eq!(of(&drain, K), expected, "clock second chance, {tier} tier: the settle's entry alone");
+				assert_eq!(bytes_tier(&objects, K), Slow);
+				assert_settled(&mut worker);
+				charges_exact(&objects, true);
+			},
 		}
-
-		// CLOCK: the hand's second chance of a referenced slow key -- promoted
-		// and demoted again by its settle when it fits, left slow when it is
-		// structural; the unreferenced key behind it is evicted.
-		let (mut worker, objects) = make_worker(PaperPolicy::ClockCompactHybrid);
-
-		set(&mut worker, &objects, K, LEN, Fast);
-		drain_and_apply(&mut worker);
-		set(&mut worker, &objects, X, LEN, Fast);
-		drain_and_apply(&mut worker);
-		tiny(&mut worker);
-
-		if fits {
-			exact(&mut worker);
-		}
-
-		worker.handle_get(K, Some(Slow));
-		drain_and_apply(&mut worker);
-
-		// `evict_one_key`, keeping the drain of the pass.
-		let used = worker.status.used_size(&worker.status.policy());
-		worker.status.set_max_size(used - 1);
-		worker.apply_evictions().expect("an eviction pass");
-		worker.status.set_max_size(1 << 30);
-		let drain = drain_and_apply(&mut worker);
-
-		assert_eq!(placement(&worker, X), None, "{tier} tier: the unreferenced key was the victim");
-		assert_eq!(of(&drain, K), expected, "clock second chance, {tier} tier: the settle's entry alone");
-		assert_eq!(bytes_tier(&objects, K), Slow);
-		assert_settled(&mut worker);
-		charges_exact(&objects, true);
-	}
+	});
 }
 
 /// U12, in both stores: the LFU latch is published with the `Set` that shuts
@@ -518,7 +539,7 @@ fn u7_wipe_returns_after_the_worker_cleared_everything() {
 	// no room, and every new key would fail with `MetadataOverflow`.
 	let _per_object = crate::object::overhead::test_overheads::per_object();
 
-	for policy in [PaperPolicy::LruCompactHybrid, PaperPolicy::LfuCompactHybrid] {
+	each_alone!("u7_wipe_returns_after_the_worker_cleared_everything", [PaperPolicy::LruCompactHybrid, PaperPolicy::LfuCompactHybrid], |policy| {
 		let cache = PaperCache::<u64, TieredBuffer>::new(1 << 20, CacheTierSize::Bytes(FAST), policy)
 			.expect("a hybrid cache");
 
@@ -545,7 +566,7 @@ fn u7_wipe_returns_after_the_worker_cleared_everything() {
 
 		cache.set(7, &[7; LEN], None).expect("a set after the wipe");
 		assert_eq!(cache.get(&7).expect("a get after the wipe"), vec![7; LEN]);
-	}
+	});
 }
 
 /// U7, in both stores: the wipe of a cache whose worker is parked on its
@@ -600,7 +621,7 @@ fn u7_wipe_and_audit_of_an_idle_cache_do_not_wait_out_the_idle_poll() {
 fn u7_a_set_handled_before_the_wipe_is_not_left_untracked() {
 	let _serialised = migration_test_lock::lock();
 
-	for policy in TIERED {
+	each_alone!("u7_a_set_handled_before_the_wipe_is_not_left_untracked", TIERED, |policy| {
 		let (mut worker, objects) = make_worker(policy);
 
 		const K: HashedKey = 1;
@@ -615,7 +636,7 @@ fn u7_a_set_handled_before_the_wipe_is_not_left_untracked() {
 		assert_eq!(stack(&worker).len(), 0);
 		assert_eq!(worker.status.used_size(&policy), 0, "{policy}: the status still counts it");
 		charges_exact(&objects, true);
-	}
+	});
 }
 
 /// U7's fallback, in both stores: with the policy worker gone -- ended here by
@@ -693,7 +714,7 @@ fn a_wipe_racing_client_sets_and_deletes_leaves_the_status_exact() {
 	const KEYS_EACH: u64 = 512;
 	const RACE: Duration = Duration::from_millis(400);
 
-	for policy in TIERED {
+	each_alone!("a_wipe_racing_client_sets_and_deletes_leaves_the_status_exact", TIERED, |policy| {
 		let cache = std::sync::Arc::new(
 			PaperCache::<u64, TieredBuffer>::new(1 << 20, CacheTierSize::Bytes(256 * 1024), policy)
 				.expect("a hybrid cache"),
@@ -784,7 +805,7 @@ fn a_wipe_racing_client_sets_and_deletes_leaves_the_status_exact() {
 
 		let audit = cache.placement_audit().expect("an audit");
 		assert!(audit.is_clean(), "{what}: {audit:?}");
-	}
+	});
 }
 
 /// Race R1, in both stores: a value a client published and whose `Set` the
@@ -797,7 +818,7 @@ fn a_wipe_racing_client_sets_and_deletes_leaves_the_status_exact() {
 fn r1_a_value_published_and_never_set_is_unlinked_and_untracked() {
 	let _serialised = migration_test_lock::lock();
 
-	for policy in TIERED {
+	each_alone!("r1_a_value_published_and_never_set_is_unlinked_and_untracked", TIERED, |policy| {
 		let (mut worker, objects) = make_worker(policy);
 
 		const K: HashedKey = 1;
@@ -814,7 +835,7 @@ fn r1_a_value_published_and_never_set_is_unlinked_and_untracked() {
 		assert_eq!(placement(&worker, K), Some(Fast));
 		assert_settled(&mut worker);
 		charges_exact(&objects, true);
-	}
+	});
 }
 
 /// Race R8, in both stores: a hit the worker handles before the key's `Set`
@@ -827,7 +848,7 @@ fn r1_a_value_published_and_never_set_is_unlinked_and_untracked() {
 fn r8_a_get_handled_before_its_keys_set_moves_nothing() {
 	let _serialised = migration_test_lock::lock();
 
-	for policy in TIERED {
+	each_alone!("r8_a_get_handled_before_its_keys_set_moves_nothing", TIERED, |policy| {
 		let (mut worker, objects) = make_worker(policy);
 
 		fill(&mut worker, &objects, 1..=4, LEN);
@@ -849,7 +870,7 @@ fn r8_a_get_handled_before_its_keys_set_moves_nothing() {
 		assert_eq!(placement(&worker, K), Some(Fast), "{policy}: admitted as a new key");
 		assert_settled(&mut worker);
 		charges_exact(&objects, true);
-	}
+	});
 }
 
 /// Race R5, in both stores: `set v1; del; set v2` of one key all published
@@ -922,14 +943,14 @@ fn r5_a_del_and_reset_before_the_worker_counts_one_admission() {
 
 	// LRU and FIFO, with X published between the set and the re-set: K is
 	// newer than X, so X goes first.
-	for policy in [PaperPolicy::LruCompactHybrid, PaperPolicy::FifoCompactHybrid] {
+	each_alone!("r5_a_del_and_reset_before_the_worker_counts_one_admission", [PaperPolicy::LruCompactHybrid, PaperPolicy::FifoCompactHybrid], |policy| {
 		let (mut worker, objects) = make_worker(policy);
 		reset_before_the_worker(&mut worker, &objects, Some(X));
 		evict_one_key(&mut worker);
 		assert_eq!((placement(&worker, X), placement(&worker, K).is_some()), (None, true), "{policy}: the re-set key is the newer");
 		assert_settled(&mut worker);
 		charges_exact(&objects, true);
-	}
+	});
 }
 
 /// Race R12, in both stores: a value published before the worker's wipe,
@@ -942,7 +963,7 @@ fn r5_a_del_and_reset_before_the_worker_counts_one_admission() {
 fn r12_a_wipe_during_a_pending_link_leaves_nothing_linked() {
 	let _serialised = migration_test_lock::lock();
 
-	for policy in TIERED {
+	each_alone!("r12_a_wipe_during_a_pending_link_leaves_nothing_linked", TIERED, |policy| {
 		let (mut worker, objects) = make_worker(policy);
 
 		const K: HashedKey = 1;
@@ -960,7 +981,7 @@ fn r12_a_wipe_during_a_pending_link_leaves_nothing_linked() {
 			assert_eq!((objects.linked(), objects.len()), (0, 0), "{policy}");
 			charges_exact(&objects, true);
 		}
-	}
+	});
 }
 
 // ---- The merged store's own races (section 6), and its oracle. ------------
@@ -1283,7 +1304,7 @@ fn an_eviction_pass_with_nothing_linked_errs_only_over_an_empty_store() {
 fn r9_a_dead_slot_at_the_tail_is_retired_once_by_the_evictor() {
 	let _serialised = migration_test_lock::lock();
 
-	for policy in TIERED {
+	each_alone!("r9_a_dead_slot_at_the_tail_is_retired_once_by_the_evictor", TIERED, |policy| {
 		let (mut worker, objects) = make_worker(policy);
 
 		const K: HashedKey = 1;
@@ -1306,7 +1327,7 @@ fn r9_a_dead_slot_at_the_tail_is_retired_once_by_the_evictor() {
 		assert_eq!(objects.linked(), 1, "{policy}: the Del retired something else");
 		assert_settled(&mut worker);
 		charges_exact(&objects, true);
-	}
+	});
 }
 
 /// Race R10: a DEAD slot where the settle's victim would be -- the fast
@@ -1319,7 +1340,7 @@ fn r9_a_dead_slot_at_the_tail_is_retired_once_by_the_evictor() {
 fn r10_a_dead_slot_at_the_tier_boundary_is_retired_not_demoted() {
 	let _serialised = migration_test_lock::lock();
 
-	for policy in [PaperPolicy::LruCompactHybrid, PaperPolicy::FifoCompactHybrid] {
+	each_alone!("r10_a_dead_slot_at_the_tier_boundary_is_retired_not_demoted", [PaperPolicy::LruCompactHybrid, PaperPolicy::FifoCompactHybrid], |policy| {
 		let (mut worker, objects) = make_worker(policy);
 
 		const K: HashedKey = 1;
@@ -1346,7 +1367,7 @@ fn r10_a_dead_slot_at_the_tier_boundary_is_retired_not_demoted() {
 		drain_and_apply(&mut worker);
 		assert_settled(&mut worker);
 		charges_exact(&objects, true);
-	}
+	});
 
 	// LFU: the DEAD slot is the fast MINIMUM (`demote_freq_min`). `k` at
 	// frequency 1 in one shard, `a` hit twice in another. The clients delete
@@ -1539,58 +1560,51 @@ fn a_del_of_an_expired_linked_value_is_retired_by_its_reap() {
 fn a_concurrent_workload_leaves_every_charge_exact_at_quiescence() {
 	let _serialised = migration_test_lock::lock();
 
-	let caches: Vec<_> = TIERED
+	// One cache per child process: the policy, in a TIGHT cache and a ROOMY one.
+	let cases: Vec<_> = TIERED
 		.iter()
 		.flat_map(|&policy| [(policy, 512 * 1024, 64 * 1024), (policy, 8 << 20, 4 << 20)])
-		.map(|(policy, max, fast)| {
-			std::thread::spawn(move || {
-				let cache = std::sync::Arc::new(
-					PaperCache::<u64, TieredBuffer>::new(max, CacheTierSize::Bytes(fast), policy)
-						.expect("a hybrid cache"),
-				);
-
-				let clients: Vec<_> = (0..4u64)
-					.map(|t| {
-						let cache = cache.clone();
-
-						std::thread::spawn(move || {
-							let mut x = 0x2545_F491_4F6C_DD1Du64 ^ (t + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-
-							for _ in 0..4_000 {
-								x ^= x << 13;
-								x ^= x >> 7;
-								x ^= x << 17;
-
-								let key = x % 384;
-								let len = 100 + (x >> 20) as usize % 3_000;
-
-								match (x >> 40) % 10 {
-									0..=3 => { let _ = cache.set(key, &vec![key as u8; len], None); },
-									4 => { let _ = cache.set(key, &vec![key as u8; len], Some(1)); },
-									5 => { let _ = cache.del(&key); },
-									_ => { let _ = cache.get(&key); },
-								}
-							}
-						})
-					})
-					.collect();
-
-				for client in clients {
-					client.join().expect("a client thread panicked");
-				}
-
-				(policy, max, cache)
-			})
-		})
-		.collect::<Vec<_>>()
-		.into_iter()
-		.map(|thread| thread.join().expect("a cache thread panicked"))
 		.collect();
 
-	// Past every TTL, so the reaper has taken them all and sent its `Expire`s.
-	std::thread::sleep(Duration::from_millis(2_500));
+	each_alone!("a_concurrent_workload_leaves_every_charge_exact_at_quiescence", cases, |(policy, max, fast)| {
+		let cache = std::sync::Arc::new(
+			PaperCache::<u64, TieredBuffer>::new(max, CacheTierSize::Bytes(fast), policy)
+				.expect("a hybrid cache"),
+		);
 
-	for (policy, max, cache) in caches {
+		let clients: Vec<_> = (0..4u64)
+			.map(|t| {
+				let cache = cache.clone();
+
+				std::thread::spawn(move || {
+					let mut x = 0x2545_F491_4F6C_DD1Du64 ^ (t + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+
+					for _ in 0..4_000 {
+						x ^= x << 13;
+						x ^= x >> 7;
+						x ^= x << 17;
+
+						let key = x % 384;
+						let len = 100 + (x >> 20) as usize % 3_000;
+
+						match (x >> 40) % 10 {
+							0..=3 => { let _ = cache.set(key, &vec![key as u8; len], None); },
+							4 => { let _ = cache.set(key, &vec![key as u8; len], Some(1)); },
+							5 => { let _ = cache.del(&key); },
+							_ => { let _ = cache.get(&key); },
+						}
+					}
+				})
+			})
+			.collect();
+
+		for client in clients {
+			client.join().expect("a client thread panicked");
+		}
+
+		// Past every TTL, so the reaper has taken them all and sent its `Expire`s.
+		std::thread::sleep(Duration::from_millis(2_500));
+
 		// The audit is handled after every event before it; two passes more
 		// and the worker's last eviction pass is done too.
 		let audit = cache.placement_audit().expect("an audit");
@@ -1601,7 +1615,7 @@ fn a_concurrent_workload_leaves_every_charge_exact_at_quiescence() {
 
 		let audit_again = cache.placement_audit().expect("an audit");
 		assert!(audit_again.is_clean(), "{policy} max {max}: {audit_again:?} (first: {audit:?})");
-	}
+	});
 }
 
 /// T14, the uniform differential: one script per order, run in every unit
@@ -2805,15 +2819,15 @@ mod t14 {
 	/// (`EvictToFit`).
 	#[test]
 	fn t14c_admission_scripts_match_across_stores() {
-		for (name, policy, seed) in [
+		each_alone!("t14c_admission_scripts_match_across_stores", [
 			("lru", PaperPolicy::LruCompactHybrid, 41),
 			("fifo", PaperPolicy::FifoCompactHybrid, 42),
 			("clock", PaperPolicy::ClockCompactHybrid, 43),
 			("lfu", PaperPolicy::LfuCompactHybrid, 44),
-		] {
+		], |(name, policy, seed)| {
 			script_c(&format!("{name}-c"), policy, seed, MetadataOverflow::Error);
 			script_c(&format!("{name}-c-evict"), policy, seed + 10, MetadataOverflow::EvictToFit);
-		}
+		});
 	}
 
 	/// T14c's gate half (S5, B2): the byte gate's decisions -- admitted,
@@ -2825,7 +2839,7 @@ mod t14 {
 	/// enables.
 	#[test]
 	fn t14c_gate_scripts_match_across_stores() {
-		super::super::s5_gate_tests::alone_in(module_path!(), "t14c_gate_scripts_match_across_stores", || {
+		super::super::test_support::alone_in(module_path!(), "t14c_gate_scripts_match_across_stores", || {
 			use crate::gate::OnStall;
 
 			for (name, policy, seed) in [
@@ -2847,13 +2861,13 @@ mod t14 {
 	/// stack counting the live keys.
 	#[test]
 	fn t14_flat_scripts_match_across_stores() {
-		for (name, policy, seed) in [
+		each_alone!("t14_flat_scripts_match_across_stores", [
 			("flat-lru", PaperPolicy::LruCompact, 21),
 			("flat-fifo", PaperPolicy::FifoCompact, 22),
 			("flat-clock", PaperPolicy::ClockCompact, 23),
 			("flat-lfu", PaperPolicy::LfuCompact, 24),
-		] {
+		], |(name, policy, seed)| {
 			script(name, policy, false, seed, false);
-		}
+		});
 	}
 }

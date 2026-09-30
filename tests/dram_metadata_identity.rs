@@ -91,6 +91,8 @@
 #![cfg(all(feature = "hybrid_cache_common", feature = "measured_accounting"))]
 #![feature(internal_output_capture)]
 
+mod common;
+
 use std::time::{Duration, Instant};
 
 use paper_cache::{
@@ -422,9 +424,6 @@ fn the_dram_pool_moves_by_exactly_m_between_quiescent_points() {
     // See the module doc: the cache's threads inherit this.
     let _ = std::io::set_output_capture(None);
 
-    // See the module doc: parking_lot's table of parked threads, before any reading.
-    warm_parking_lot();
-
     let mut designs = vec![
         PaperPolicy::LruCompactHybrid,
         PaperPolicy::FifoCompactHybrid,
@@ -448,9 +447,12 @@ fn the_dram_pool_moves_by_exactly_m_between_quiescent_points() {
 
     let value = vec![0xA5u8; 1024];
     let mut log: Vec<Step> = Vec::with_capacity(4 * KEYS as usize);
-    let mut summaries = Vec::with_capacity(designs.len());
 
-    for policy in designs {
+    // Each design in a child process of its own.
+    common::each_alone(module_path!(), "the_dram_pool_moves_by_exactly_m_between_quiescent_points", designs, |policy| {
+        // See the module doc: parking_lot's table of parked threads, before any reading.
+        warm_parking_lot();
+
         let (empty, filled, checked) = run(policy, &value, &mut log);
 
         #[cfg(not(feature = "merged_object_store"))]
@@ -483,8 +485,8 @@ fn the_dram_pool_moves_by_exactly_m_between_quiescent_points() {
         // The largest single step of the map part, and the key it came at.
         let largest = log.iter().filter(|s| s.map != 0).max_by_key(|s| s.map).map(|s| (s.map, s.at));
 
-        summaries.push(format!(
-            "{policy}: {checked} steps held exactly; empty {:?} -> filled {:?} at {} live; \
+        eprintln!(
+            "S5a {policy}: {checked} steps held exactly; empty {:?} -> filled {:?} at {} live; \
              M {:.1} B/object against the model's {:.1}; M's steps by part: map {:?} (largest \
              {:?} as (bytes, key)), stack {:?}, headers {:?}",
             empty.m,
@@ -496,10 +498,6 @@ fn the_dram_pool_moves_by_exactly_m_between_quiescent_points() {
             largest,
             steps(|s| s.stack),
             steps(|s| s.headers),
-        ));
-    }
-
-    for summary in &summaries {
-        eprintln!("S5a {summary}");
-    }
+        );
+    });
 }

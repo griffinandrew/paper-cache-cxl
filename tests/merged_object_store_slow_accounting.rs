@@ -36,6 +36,8 @@
 	feature = "lru_compact_hybrid_cache",
 ))]
 
+mod common;
+
 use std::time::{Duration, Instant};
 
 use paper_cache::{
@@ -93,12 +95,13 @@ fn idle(cache: &PaperCache<u64, TieredBuffer>, live: u64) -> (u64, HybridStats) 
 
 #[test]
 fn slow_bytes_measured_equal_slow_bytes_modelled() {
-	for policy in [
+	// Each order in a child process of its own.
+	common::each_alone(module_path!(), "slow_bytes_measured_equal_slow_bytes_modelled", [
 		PaperPolicy::LruCompactHybrid,
 		PaperPolicy::LfuCompactHybrid,
 		PaperPolicy::FifoCompactHybrid,
 		PaperPolicy::ClockCompactHybrid,
-	] {
+	], |policy| {
 		let before = measured::slow_allocated();
 
 		let (measured_slow, stats) = {
@@ -158,5 +161,5 @@ fn slow_bytes_measured_equal_slow_bytes_modelled() {
 			 to the slow tier (drift {:+} B): {stats:?}",
 			measured as i64 - modelled as i64,
 		);
-	}
+	});
 }

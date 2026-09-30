@@ -20,6 +20,7 @@
 use std::time::{Duration, Instant};
 
 use super::*;
+use super::test_support::each_alone;
 use super::reconcile_tests::{
 	Objects, Worker, FAST, LEN, assert_settled, bytes_tier, drain_and_apply, handle, make_worker, of,
 	placement, publish, publish_del,
@@ -341,7 +342,7 @@ fn a_new_key_past_the_metadata_ceiling_errs_and_allocates_nothing() {
 	let _serialised = migration_test_lock::lock();
 	let _overheads = test_overheads::set(64, 100);
 
-	for policy in [PaperPolicy::LruCompactHybrid, PaperPolicy::LfuCompactHybrid] {
+	each_alone!("a_new_key_past_the_metadata_ceiling_errs_and_allocates_nothing", [PaperPolicy::LruCompactHybrid, PaperPolicy::LfuCompactHybrid], |policy| {
 		let cache = cache_with(policy, 4_096, GateConfig::default());
 		let value = [7u8; 1_000];
 
@@ -364,7 +365,7 @@ fn a_new_key_past_the_metadata_ceiling_errs_and_allocates_nothing() {
 		cache.set(3, &[9u8; 1_000], None).expect("an overwrite adds no metadata");
 		cache.del(&5).expect("a delete");
 		cache.set(64, &value, None).expect("room again after a delete");
-	}
+	});
 }
 
 /// T10b, `EvictToFit`: at the ceiling a new key's set waits while the policy
@@ -556,7 +557,7 @@ fn a_structural_value_is_built_and_placed_slow_in_every_design() {
 
 	let v = charge(LEN);
 
-	for &policy in DESIGNS {
+	each_alone!("a_structural_value_is_built_and_placed_slow_in_every_design", DESIGNS, |policy| {
 		for eff_zero in [true, false] {
 			let case = if eff_zero { "eff 0" } else { "0 < eff < v" };
 			let (mut worker, objects) = make_worker(policy);
@@ -616,7 +617,7 @@ fn a_structural_value_is_built_and_placed_slow_in_every_design() {
 
 			assert_settled(&mut worker);
 		}
-	}
+	});
 }
 
 /// T18, the order: a structural key keeps its place in the policy's order --
@@ -630,7 +631,7 @@ fn a_structural_key_keeps_its_place_in_the_order() {
 
 	const K: HashedKey = 4;
 
-	for &policy in ONE_LIST {
+	each_alone!("a_structural_key_keeps_its_place_in_the_order", ONE_LIST, |policy| {
 		let order = |big: bool| {
 			let (mut worker, objects) = make_worker(policy);
 			set_fast(&mut worker, 4 << 10);
@@ -653,7 +654,7 @@ fn a_structural_key_keeps_its_place_in_the_order() {
 		};
 
 		assert_eq!(order(true), order(false), "{policy}: the structural key moved in the order");
-	}
+	});
 }
 
 /// T18b: the tier-boundary cursors step over structural keys. Fast keys and
@@ -674,7 +675,7 @@ fn boundaries_skip_structural_keys() {
 	const K2: HashedKey = 4;
 	const C: HashedKey = 5;
 
-	for &policy in CURSORS {
+	each_alone!("boundaries_skip_structural_keys", CURSORS, |policy| {
 		let (mut worker, objects) = make_worker(policy);
 		set_fast(&mut worker, 8 << 10);
 
@@ -703,7 +704,7 @@ fn boundaries_skip_structural_keys() {
 
 		assert_eq!((stack(&worker).fast_bytes_used(), stack(&worker).fast_object_count()), (0, 0), "{policy}: the fast gauges");
 		assert_settled(&mut worker);
-	}
+	});
 }
 
 /// T18c: the designs with a DRAM admission queue place a structural NEW key
@@ -861,7 +862,7 @@ fn the_measured_model_settles_on_the_published_m() {
 
 	const M: CacheSize = 6 << 10;
 
-	for policy in designs {
+	each_alone!("the_measured_model_settles_on_the_published_m", designs, |policy| {
 		let (mut worker, objects) = make_worker(policy);
 
 		let mut config = worker.status.gate().config();
@@ -898,7 +899,7 @@ fn the_measured_model_settles_on_the_published_m() {
 		assert!(stack(&worker).fast_bytes_used() > policy_stack::drain_target::bytes(FAST - M) - 2 * charge(LEN), "{policy}: the tier filled");
 		assert_eq!(worker.status.effective_fast_capacity(), FAST - M);
 		assert_settled(&mut worker);
-	}
+	});
 }
 
 /// The per-object model reproduces 0b2c41f's reservation -- `M_model` is the

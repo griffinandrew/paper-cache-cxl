@@ -111,6 +111,8 @@
 //! value (the one size where the two units differ; see `phys`'s module doc).
 #![cfg(feature = "hybrid_cache_common")]
 
+mod common;
+
 use std::{
     collections::BTreeMap,
     sync::{Mutex, MutexGuard},
@@ -816,25 +818,35 @@ fn run(design: Design, w: Workload) -> HybridStats {
 
 #[test]
 fn phys_fast_equals_the_stacks_fast_used_at_quiescence_and_returns_to_zero() {
-    let lru = run(Design::Policy(PaperPolicy::LruCompactHybrid), FULL);
-    let fifo = run(Design::Policy(PaperPolicy::FifoCompactHybrid), FULL);
-    let clock = run(Design::Policy(PaperPolicy::ClockCompactHybrid), FULL);
-    let lfu = run(Design::Policy(PaperPolicy::LfuCompactHybrid), FULL);
+    // Each order in a child process of its own. FIFO has no promotion rule.
+    let orders = [
+        ("LRU", PaperPolicy::LruCompactHybrid, true),
+        ("FIFO", PaperPolicy::FifoCompactHybrid, false),
+        ("CLOCK", PaperPolicy::ClockCompactHybrid, true),
+        ("LFU", PaperPolicy::LfuCompactHybrid, true),
+    ];
 
-    // The workload did what the identity is meant to survive: every design
-    // demoted and evicted, and every design with a promotion rule promoted
-    // (FIFO has none), so P was charged and refunded on consumer threads as
-    // well as client ones.
-    for (name, s) in [("LRU", lru), ("FIFO", fifo), ("CLOCK", clock), ("LFU", lfu)] {
-        assert!(s.demotions > 0, "{name}: the workload never demoted");
-        assert!(s.evictions > 0, "{name}: the workload never evicted");
-        assert!(s.slow_hits > 0, "{name}: no hit was served from the slow tier");
-        assert!(s.fast_hits > 0, "{name}: no hit was served from the fast tier");
-    }
+    common::each_alone(
+        module_path!(),
+        "phys_fast_equals_the_stacks_fast_used_at_quiescence_and_returns_to_zero",
+        orders,
+        |(name, policy, promotes)| {
+            let s = run(Design::Policy(policy), FULL);
 
-    for (name, s) in [("LRU", lru), ("CLOCK", clock), ("LFU", lfu)] {
-        assert!(s.promotions > 0, "{name}: the workload never promoted");
-    }
+            // The workload did what the identity is meant to survive: every
+            // design demoted and evicted, and every design with a promotion
+            // rule promoted, so P was charged and refunded on consumer
+            // threads as well as client ones.
+            assert!(s.demotions > 0, "{name}: the workload never demoted");
+            assert!(s.evictions > 0, "{name}: the workload never evicted");
+            assert!(s.slow_hits > 0, "{name}: no hit was served from the slow tier");
+            assert!(s.fast_hits > 0, "{name}: no hit was served from the fast tier");
+
+            if promotes {
+                assert!(s.promotions > 0, "{name}: the workload never promoted");
+            }
+        },
+    );
 }
 
 /// The identity for one design beyond the four orders, at the SMALL
@@ -860,7 +872,7 @@ macro_rules! other_designs {
         #[cfg(not(feature = "merged_object_store"))]
         #[test]
         fn $name() {
-            other_design($design);
+            common::alone(module_path!(), stringify!($name), || other_design($design));
         }
     )*};
 }
@@ -947,7 +959,9 @@ other_designs! {
 /// built before the worker reached that `Set`.
 #[test]
 fn an_lfu_burst_strands_no_value() {
-    burst(Design::Policy(PaperPolicy::LfuCompactHybrid), FULL);
+    common::alone(module_path!(), "an_lfu_burst_strands_no_value", || {
+        burst(Design::Policy(PaperPolicy::LfuCompactHybrid), FULL);
+    });
 }
 
 /// T7's body: `run`'s bookkeeping, with each phase's sets made back to back.

@@ -6092,6 +6092,10 @@ mod phys_transient_tests {
 /// across the events that make it stale. A test that needs a consumer is
 /// SKIPPED -- loudly, and only when `MIGRATION_QUEUE_THREADS` is 0 -- where
 /// migrations apply inline (`queue_or_skip`).
+// Helpers the test modules below share: child processes, one per test or per policy.
+#[cfg(all(test, any(feature = "hybrid_cache_common", feature = "merged_object_store")))]
+mod test_support;
+
 // Backpressure plan S4: the merged store's policy work on the policy worker,
 // and the uniform differential (T14) over both stores.
 #[cfg(all(test, feature = "hybrid_cache_common"))]
@@ -6118,6 +6122,8 @@ mod reconcile_tests {
 
 	use super::*;
 	use super::migration_queue::after_copy;
+	#[cfg(not(feature = "merged_object_store"))]
+	use super::test_support::each_alone;
 	use crate::hybrid_policy::admission_tier;
 	use crate::object::{Object, overhead::OverheadManager};
 	// The merged store answers these calls with inherent methods.
@@ -6418,7 +6424,7 @@ mod reconcile_tests {
 		// other tests take exact deltas of.
 		let _serialised = migration_test_lock::lock();
 
-		for policy in [PaperPolicy::LruCompactHybrid, PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.5)] {
+		each_alone!("a_set_whose_value_was_taken_before_its_event_admits_nothing", [PaperPolicy::LruCompactHybrid, PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.5)], |policy| {
 			let (mut worker, objects) = make_worker(policy);
 			fill(&mut worker, &objects, 1..=40, LEN);
 			assert_settled(&mut worker);
@@ -6449,7 +6455,7 @@ mod reconcile_tests {
 				"{policy}: the stack tracks exactly the map's keys",
 			);
 			assert_settled(&mut worker);
-		}
+		});
 	}
 
 	#[test]

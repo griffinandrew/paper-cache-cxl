@@ -16,6 +16,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::test_support::each_alone;
 use crate::{BufferDRAM, PaperCache, PaperPolicy};
 
 type Cache = PaperCache<u64, BufferDRAM>;
@@ -54,7 +55,7 @@ fn a_flat_merged_cache_links_reaps_and_wipes_on_its_worker() {
 	const MAX: u64 = 256 * 1024;
 	const KEYS: u64 = 600;
 
-	for policy in [PaperPolicy::LruCompact, PaperPolicy::FifoCompact, PaperPolicy::ClockCompact, PaperPolicy::LfuCompact] {
+	each_alone!("a_flat_merged_cache_links_reaps_and_wipes_on_its_worker", [PaperPolicy::LruCompact, PaperPolicy::FifoCompact, PaperPolicy::ClockCompact, PaperPolicy::LfuCompact], |policy| {
 		let cache = Cache::new(MAX, &[policy], policy).expect("a flat cache");
 
 		for key in 0..KEYS {
@@ -114,5 +115,5 @@ fn a_flat_merged_cache_links_reaps_and_wipes_on_its_worker() {
 		quiesce(&cache);
 		cache.objects.verify_charges(true);
 		assert_eq!(cache.objects.linked(), 1, "{policy}: the set after the wipe is linked");
-	}
+	});
 }

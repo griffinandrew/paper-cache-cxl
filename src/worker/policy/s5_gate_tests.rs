@@ -35,6 +35,7 @@ use std::{
 };
 
 use super::*;
+use super::test_support::{alone_in, each_alone};
 
 use crate::gate::{GateConfig, GateMode, GateState, MetadataModel, OnStall, test_hooks};
 // The merged store answers `get_ref` with an inherent method.
@@ -59,67 +60,6 @@ const MAX: CacheSize = 256 << 20;
 /// each thread that can fold at once -- a client and the two consumers (the
 /// liveness review's e_fold).
 const E_FOLD: CacheSize = 3 * phys::FOLD_BYTES as CacheSize;
-
-const CHILD: &str = "PAPER_GATE_TEST_CHILD";
-
-/// How long a child may run before it is killed and its test failed.
-const DEADLINE: Duration = Duration::from_secs(90);
-
-/// Runs `body` in a child process in which `test`, of `module`
-/// (`module_path!()`), is the only test, killed at `DEADLINE`. The parent
-/// passes only if the child ran exactly that one test and it passed. Also
-/// T14's gate half (`s4_tests`).
-pub(super) fn alone_in(module: &str, test: &str, body: impl FnOnce()) {
-	if std::env::var_os(CHILD).is_some_and(|value| value == "1") {
-		body();
-		return;
-	}
-
-	// libtest names a test by its path without the crate.
-	let (_, module) = module.split_once("::").expect("a module path");
-	let name = format!("{module}::{test}");
-	let path = std::env::temp_dir().join(format!("paper-gate-{}-{test}.out", std::process::id()));
-	let file = std::fs::File::create(&path).expect("the child's output file");
-
-	let mut child = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-		.args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
-		.env(CHILD, "1")
-		// The consumer count the timing bounds assume (the default).
-		.env("MIGRATION_QUEUE_THREADS", "2")
-		.stdout(file.try_clone().expect("the output file, twice"))
-		.stderr(file)
-		.spawn()
-		.expect("could not re-run this test binary");
-
-	let start = Instant::now();
-
-	let status = loop {
-		match child.try_wait().expect("the child's status") {
-			Some(status) => break Some(status),
-
-			// Killed through its own handle: never a process found by name.
-			None if start.elapsed() > DEADLINE => {
-				let _ = child.kill();
-				let _ = child.wait();
-				break None;
-			},
-
-			None => thread::sleep(Duration::from_millis(10)),
-		}
-	};
-
-	let output = std::fs::read_to_string(&path).unwrap_or_default();
-	let _ = std::fs::remove_file(&path);
-
-	assert!(
-		status.is_some_and(|status| status.success()) && output.contains("test result: ok. 1 passed;"),
-		"{name}, run alone in a child process ({}):\n{output}",
-		status.map_or_else(|| format!("killed after {DEADLINE:?}"), |status| status.to_string()),
-	);
-
-	// The child's diagnostics, for a run with --nocapture.
-	eprintln!("--- {name}, alone:\n{output}");
-}
 
 fn alone(test: &str, body: impl FnOnce()) {
 	alone_in(module_path!(), test, body);
@@ -1038,13 +978,13 @@ fn designs_whose_settles_do_not_bound_their_dram_run_ungated() {
 	config.mode = GateMode::Block;
 	config.metadata_model = MetadataModel::PerObject;
 
-	for policy in [
+	each_alone!("designs_whose_settles_do_not_bound_their_dram_run_ungated", [
 		PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.1),
 		PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(0.1),
-	] {
+	], |policy| {
 		let cache = build(policy, config);
 		wait_for(&format!("{policy} to run ungated"), Duration::from_secs(10), || cache.hybrid_stats().gate_state == GateState::Ungated);
-	}
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,78 +1001,77 @@ fn designs_whose_settles_do_not_bound_their_dram_run_ungated() {
 /// (Delta_promo, allowed 16 values here).
 #[test]
 fn concurrent_clients_finish_under_the_gate() {
-	alone("concurrent_clients_finish_under_the_gate", || {
+	// Each order in a child process of its own: P is process-global.
+	each_alone!("concurrent_clients_finish_under_the_gate", [
+		PaperPolicy::LruCompactHybrid,
+		PaperPolicy::FifoCompactHybrid,
+		PaperPolicy::ClockCompactHybrid,
+		PaperPolicy::LfuCompactHybrid,
+	], |policy| {
 		let _flush = test_hooks::no_flush();
 		let _m = test_hooks::override_m(M0);
 
-		for policy in [
-			PaperPolicy::LruCompactHybrid,
-			PaperPolicy::FifoCompactHybrid,
-			PaperPolicy::ClockCompactHybrid,
-			PaperPolicy::LfuCompactHybrid,
-		] {
-			let cache = cache(policy, gated(Duration::from_secs(5), OnStall::Error));
-			let b = cache.hybrid_stats().band_b;
-			let peak = AtomicU64::new(0);
-			let errors = Mutex::new(Vec::new());
-			let start = Instant::now();
+		let cache = cache(policy, gated(Duration::from_secs(5), OnStall::Error));
+		let b = cache.hybrid_stats().band_b;
+		let peak = AtomicU64::new(0);
+		let errors = Mutex::new(Vec::new());
+		let start = Instant::now();
 
-			thread::scope(|scope| {
-				for client in 0..4u64 {
-					let (cache, peak, errors) = (&cache, &peak, &errors);
+		thread::scope(|scope| {
+			for client in 0..4u64 {
+				let (cache, peak, errors) = (&cache, &peak, &errors);
 
-					scope.spawn(move || {
-						let mut rng = client.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+				scope.spawn(move || {
+					let mut rng = client.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
 
-						for op in 0..2_000 {
-							rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-							let key = client * 10_000 + (rng >> 33) % 500;
+					for op in 0..2_000 {
+						rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+						let key = client * 10_000 + (rng >> 33) % 500;
 
-							match (rng >> 20) % 10 {
-								0..7 => match cache.set(key, &value(key), None) {
-									Ok(()) => {
-										peak.fetch_max(p(), Ordering::Relaxed);
-									},
-
-									Err(error) => errors.lock().unwrap().push(format!("set {key}: {error:?}")),
+						match (rng >> 20) % 10 {
+							0..7 => match cache.set(key, &value(key), None) {
+								Ok(()) => {
+									peak.fetch_max(p(), Ordering::Relaxed);
 								},
 
-								7..9 => {
-									let _ = cache.get(&key);
-								},
+								Err(error) => errors.lock().unwrap().push(format!("set {key}: {error:?}")),
+							},
 
-								_ => {
-									let _ = cache.del(&key);
-								},
-							}
+							7..9 => {
+								let _ = cache.get(&key);
+							},
 
-							if op % 16 == 15 {
-								thread::sleep(Duration::from_micros(100));
-							}
+							_ => {
+								let _ = cache.del(&key);
+							},
 						}
-					});
-				}
-			});
 
-			let took = start.elapsed();
-			let stats = cache.hybrid_stats();
-			let peak = peak.load(Ordering::Relaxed);
-			let bound = b + (4 + 16) * v() + 6 * phys::FOLD_BYTES as CacheSize;
-
-			eprintln!(
-				"liveness {policy}: {took:?}, {} waits (longest {} us), P peaked at {peak} (bound {bound}), {} errors",
-				stats.gate_waits,
-				stats.gate_wait_ns_max / 1_000,
-				errors.lock().unwrap().len(),
-			);
-
-			assert!(errors.lock().unwrap().is_empty(), "{policy}: {:?}", errors.lock().unwrap());
-			assert!(took < Duration::from_secs(15), "{policy}: took {took:?}");
-			assert!(peak <= bound, "{policy}: P peaked at {peak} B, over {bound} B");
-
-			if policy != PaperPolicy::LfuCompactHybrid {
-				assert!(stats.gate_waits > 0, "{policy}: no set waited");
+						if op % 16 == 15 {
+							thread::sleep(Duration::from_micros(100));
+						}
+					}
+				});
 			}
+		});
+
+		let took = start.elapsed();
+		let stats = cache.hybrid_stats();
+		let peak = peak.load(Ordering::Relaxed);
+		let bound = b + (4 + 16) * v() + 6 * phys::FOLD_BYTES as CacheSize;
+
+		eprintln!(
+			"liveness {policy}: {took:?}, {} waits (longest {} us), P peaked at {peak} (bound {bound}), {} errors",
+			stats.gate_waits,
+			stats.gate_wait_ns_max / 1_000,
+			errors.lock().unwrap().len(),
+		);
+
+		assert!(errors.lock().unwrap().is_empty(), "{policy}: {:?}", errors.lock().unwrap());
+		assert!(took < Duration::from_secs(15), "{policy}: took {took:?}");
+		assert!(peak <= bound, "{policy}: P peaked at {peak} B, over {bound} B");
+
+		if policy != PaperPolicy::LfuCompactHybrid {
+			assert!(stats.gate_waits > 0, "{policy}: no set waited");
 		}
 	});
 }
