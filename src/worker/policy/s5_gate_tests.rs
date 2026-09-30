@@ -1671,7 +1671,7 @@ fn a_flat_fast_cache_beside_disables_the_gate() {
 		let hold = test_hooks::hold_workers();
 		thread::sleep(Duration::from_millis(20));
 
-		let flat = PaperCache::<u64, crate::BufferDRAM>::new(1 << 20, &[PaperPolicy::Lru], PaperPolicy::Lru)
+		let flat = PaperCache::<u64, crate::BufferDRAM>::new(1 << 20, &[PaperPolicy::LruCompact], PaperPolicy::LruCompact)
 			.expect("a flat cache with fast values");
 
 		// A fast set on the 1 MiB tier takes the exact path, which reads the

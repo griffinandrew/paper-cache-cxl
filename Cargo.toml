@@ -11,7 +11,6 @@ keywords = ["caching", "PaperCache"]
 categories = ["caching"]
 
 [dependencies]
-dlv-list = "0.6.0"
 kwik = "=1.18.7"
 thiserror = "2.0.16"
 # `raw-api` for `shards()` and `determine_map`: the policy worker re-reads a
@@ -134,11 +133,11 @@ hashbrown_dram = ["numa_jemalloc"]
 # rather than mysterious. Not because it is smaller. It is not.
 merged_object_store = ["numa_jemalloc"]
 
-# Enable PMEM-backed eviction stacks. Eviction-stack metadata
-# (PmemHashList/PmemVecList/EntryMap in worker/policy/policy_stack/) is
-# allocated via `crate::Hybrid` (`numa_alloc::SlowObjects`, node-1-bound
-# jemalloc arenas) -- the same allocator BufferPMEM and the other PMEM
-# features use, so enabling this alone requires no other PMEM feature.
+# Enable PMEM-backed eviction stacks. Eviction-stack metadata (the compact
+# stacks' slabs and indexes, the hybrid stacks' arenas) is allocated via
+# `crate::Hybrid` (`numa_alloc::SlowObjects`, node-1-bound jemalloc arenas) --
+# the same allocator BufferPMEM and the other PMEM features use, so enabling
+# this alone requires no other PMEM feature.
 eviction_stacks_pmem = ["numa_jemalloc"]
 
 # Force the TTL expiry index back into DRAM.
@@ -313,7 +312,7 @@ lru_lfu_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 s3_fifo_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # The FAITHFUL tier-segmented S3-FIFO family. Every other s3-fifo hybrid here
-# diverges from flat `SThreeFifoStack` in three ways at once -- an `accessed`
+# diverges from flat `SThreeFifoCompactStack` in three ways at once -- an `accessed`
 # reference bit rather than the 0..=3 saturating counter, EAGER promotion on
 # access rather than lazy promotion at eviction gated on freq > 1, and a
 # one-shot second chance rather than a decrement-and-requeue sweep. These four
@@ -332,8 +331,8 @@ s3_fifo_faithful_fast_admission_reprieve_compact_hybrid_cache = ["key_value_pmem
 
 # `two_q_compact_hybrid_cache` plus a bare-key ghost queue: objects that age
 # out of the one-access FIFO queue without a second access are remembered (key
-# only, no object data -- mirrors `s_three_fifo_stack.rs`'s existing plain
-# ghost queue, not plain `TwoQStack`'s heavier real-object `a1_out`), so a
+# only, no object data -- mirrors `s_three_fifo_compact_stack.rs`'s plain
+# ghost queue, not `TwoQCompactStack`'s heavier real-object `a1_out`), so a
 # later re-admission is trusted immediately (lands directly in the main
 # queue's fast tier) instead of restarting from the FIFO queue. See
 # worker/policy/policy_stack/two_q_ghost_compact_hybrid_stack.rs for the ghost

@@ -21,34 +21,23 @@ use crate::error::CacheError;
 pub enum PaperPolicy {
 	LfuCompact,
 
-	/// Slab-layout counterparts of the single-queue designs. Same policy,
-	/// different storage -- and unlike the `HashList` originals these honour
+	/// The flat (single-tier) designs, over the slab layout. They honour
 	/// `eviction_stacks_pmem`, because `CompactQueueSet` is
-	/// allocator-parameterised.
+	/// allocator-parameterised. (They replaced the original `HashList`
+	/// stacks, removed in R2; `Arc` never had a slab counterpart.)
 	FifoCompact,
 	ClockCompact,
 	SieveCompact,
 	MruCompact,
 
-	/// Faithful three-queue 2Q over the compact slab layout. Takes the
-	/// same two ratios as [`PaperPolicy::TwoQ`] and evicts in exactly the
-	/// same order; only the per-object bookkeeping is cheaper.
-	/// `2q-compact-<k_in>-<k_out>`.
+	/// Faithful three-queue 2Q over the compact slab layout, taking the
+	/// two ratios `k_in` and `k_out`. `2q-compact-<k_in>-<k_out>`.
 	TwoQCompact(f64, f64),
-	Lfu,
-	Fifo,
-	Clock,
-	Sieve,
 	LruCompact,
-	Lru,
-	Mru,
-	TwoQ(f64, f64),
 	Arc,
-	SThreeFifo(f64),
 
-	/// S3-FIFO over the compact slab layout. Same ratio as
-	/// [`PaperPolicy::SThreeFifo`] and the same eviction order; only the
-	/// per-object bookkeeping is cheaper. `s3-fifo-compact-<ratio>`.
+	/// S3-FIFO over the compact slab layout, with the one-access queue's
+	/// ratio. `s3-fifo-compact-<ratio>`.
 	SThreeFifoCompact(f64),
 
 	/// The tier-segmented LRU policy over a slab-backed recency list --
@@ -60,11 +49,11 @@ pub enum PaperPolicy {
 	TwoQCompactHybrid(f64),
 	TwoQFastAdmissionReprieveCompactHybrid(f64),
 	/// The full (three-queue) 2Q with fast-tier admission -- the only
-	/// hybrid design whose queue algorithm matches [`PaperPolicy::TwoQ`]'s,
+	/// hybrid design whose queue algorithm matches [`PaperPolicy::TwoQCompact`]'s,
 	/// and the only hybrid carrying TWO parameters: `k_in` sizes the
 	/// fast-tier probation FIFO and `k_out` sizes the slow-tier `a1_out`
 	/// overflow FIFO, which holds real resident objects rather than ghosts.
-	/// `k_out` is a live parameter here; `TwoQ` writes its equivalent and
+	/// `k_out` is a live parameter here; `TwoQCompact` writes its equivalent and
 	/// never reads it. See
 	/// `worker::policy::policy_stack::two_q_full_fast_admission_hybrid_stack`.
 	TwoQFullFastAdmissionCompactHybrid(f64, f64),
@@ -127,17 +116,9 @@ impl Display for PaperPolicy {
 			PaperPolicy::ClockCompact => write!(f, "clock-compact"),
 			PaperPolicy::SieveCompact => write!(f, "sieve-compact"),
 			PaperPolicy::MruCompact => write!(f, "mru-compact"),
-			PaperPolicy::Lfu => write!(f, "lfu"),
-			PaperPolicy::Fifo => write!(f, "fifo"),
-			PaperPolicy::Clock => write!(f, "clock"),
-			PaperPolicy::Sieve => write!(f, "sieve"),
 			PaperPolicy::LruCompact => write!(f, "lru-compact"),
-			PaperPolicy::Lru => write!(f, "lru"),
-			PaperPolicy::Mru => write!(f, "mru"),
-			PaperPolicy::TwoQ(k_in, k_out) => write!(f, "2q-{k_in}-{k_out}"),
 			PaperPolicy::TwoQCompact(k_in, k_out) => write!(f, "2q-compact-{k_in}-{k_out}"),
 			PaperPolicy::Arc => write!(f, "arc"),
-			PaperPolicy::SThreeFifo(ratio) => write!(f, "s3-fifo-{ratio}"),
 			PaperPolicy::SThreeFifoCompact(ratio) => write!(f, "s3-fifo-compact-{ratio}"),
 			PaperPolicy::TwoQCompactHybrid(k_in) => write!(f, "2q-compact-hybrid-{k_in}"),
 			PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(k_in) => write!(f, "2q-fast-admission-reprieve-compact-hybrid-{k_in}"),
@@ -176,13 +157,7 @@ impl FromStr for PaperPolicy {
 			"clock-compact" => PaperPolicy::ClockCompact,
 			"sieve-compact" => PaperPolicy::SieveCompact,
 			"mru-compact" => PaperPolicy::MruCompact,
-			"lfu" => PaperPolicy::Lfu,
-			"fifo" => PaperPolicy::Fifo,
-			"clock" => PaperPolicy::Clock,
-			"sieve" => PaperPolicy::Sieve,
 			"lru-compact" => PaperPolicy::LruCompact,
-			"lru" => PaperPolicy::Lru,
-			"mru" => PaperPolicy::Mru,
 			// Order matters and is load-bearing: every guard below also starts
 			// with a prefix of the ones above it ("2q-fast-admission-reprieve-
 			// compact-hybrid-" starts with "2q-", and so does "2q-compact-
@@ -195,15 +170,13 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("2q-compact-hybrid-") => parse_two_q_compact_hybrid(value)?,
 			// Must follow "2q-compact-hybrid-", which it is a prefix of.
 			value if value.starts_with("2q-compact-") => parse_two_q_compact(value)?,
-			value if value.starts_with("2q-") => parse_two_q(value)?,
 			"arc" => PaperPolicy::Arc,
 			value if value.starts_with("s3-fifo-ghost-lazy-demotion-fast-admission-midpoint-compact-hybrid-") => parse_s_three_fifo_ghost_lazy_demotion_fast_admission_midpoint_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-ghost-lazy-demotion-fast-admission-compact-hybrid-") => parse_s_three_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-ghost-lazy-demotion-compact-hybrid-") => parse_s_three_fifo_ghost_lazy_demotion_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-ghost-compact-hybrid-") => parse_s_three_fifo_ghost_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-compact-hybrid-") => parse_s_three_fifo_compact_hybrid(value)?,
-			// The faithful family, longest stem first. All four must precede
-			// the bare "s3-fifo-" guard, which would otherwise swallow them.
+			// The faithful family.
 			value if value.starts_with("s3-fifo-faithful-fast-admission-reprieve-compact-hybrid-") => parse_s3_fifo_faithful_fast_admission_reprieve_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-faithful-fast-admission-compact-hybrid-") => parse_s3_fifo_faithful_fast_admission_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-faithful-reprieve-compact-hybrid-") => parse_s3_fifo_faithful_reprieve_compact_hybrid(value)?,
@@ -214,7 +187,6 @@ impl FromStr for PaperPolicy {
 			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-reprieve-compact-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_reprieve_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-lazy-demotion-reprieve-compact-hybrid-") => parse_s_three_fifo_lazy_demotion_reprieve_compact_hybrid(value)?,
 			value if value.starts_with("s3-fifo-lazy-demotion-fast-admission-split-slow-reprieve-compact-hybrid-") => parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_compact_hybrid(value)?,
-			value if value.starts_with("s3-fifo-") => parse_s_three_fifo(value)?,
 			// Prefix guard, so it must be tested before any *exact* arm it
 			// could be confused with is irrelevant (exact arms cannot swallow a
 			// longer string) -- but it does have to precede nothing else here,
@@ -290,34 +262,6 @@ fn parse_two_q_compact(value: &str) -> Result<PaperPolicy, CacheError> {
 	}
 
 	Ok(PaperPolicy::TwoQCompact(k_in, k_out))
-}
-
-fn parse_two_q(value: &str) -> Result<PaperPolicy, CacheError> {
-	// skip the "2q-"
-	let tokens = value[3..]
-		.split('-')
-		.collect::<Vec<&str>>();
-
-	if tokens.len() != 2 {
-		return Err(CacheError::InvalidPolicy);
-	}
-
-	let Ok(k_in) = tokens[0].parse::<f64>() else {
-		return Err(CacheError::InvalidPolicy);
-	};
-
-	let Ok(k_out) = tokens[1].parse::<f64>() else {
-		return Err(CacheError::InvalidPolicy);
-	};
-
-	if k_in + k_out > 1.0
-		|| !(0.0..=1.0).contains(&k_in)
-		|| !(0.0..=1.0).contains(&k_out)
-	{
-		return Err(CacheError::InvalidPolicy);
-	}
-
-	Ok(PaperPolicy::TwoQ(k_in, k_out))
 }
 
 fn parse_lru_lfu_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
@@ -439,27 +383,6 @@ fn parse_s_three_fifo_compact(value: &str) -> Result<PaperPolicy, CacheError> {
 	}
 
 	Ok(PaperPolicy::SThreeFifoCompact(ratio))
-}
-
-fn parse_s_three_fifo(value: &str) -> Result<PaperPolicy, CacheError> {
-	// skip the "s3-fifo-"
-	let tokens = value[8..]
-		.split('-')
-		.collect::<Vec<&str>>();
-
-	if tokens.len() != 1 {
-		return Err(CacheError::InvalidPolicy);
-	}
-
-	let Ok(ratio) = tokens[0].parse::<f64>() else {
-		return Err(CacheError::InvalidPolicy);
-	};
-
-	if !(0.0..1.0).contains(&ratio) {
-		return Err(CacheError::InvalidPolicy);
-	}
-
-	Ok(PaperPolicy::SThreeFifo(ratio))
 }
 
 fn parse_s3_fifo_faithful_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
@@ -767,12 +690,10 @@ fn parse_s_three_fifo_lazy_demotion_fast_admission_split_slow_reprieve_compact_h
 mod tests {
 	use super::*;
 
-	/// Locks in `FromStr`'s guard ordering for the compact forms. Both new
-	/// strings start with a stem an existing guard already claims:
-	/// `"2q-compact-0.25-0.5"` starts with `"2q-"`, and
+	/// Locks in `FromStr`'s guard ordering for the compact forms:
 	/// `"2q-compact-hybrid-0.2"` starts with `"2q-compact-"`. Get the order
-	/// wrong in either direction and one of the two parses as the other
-	/// policy with no error, which a run would report under the wrong name.
+	/// wrong and one of the two parses as the other policy with no error,
+	/// which a run would report under the wrong name.
 	#[test]
 	fn compact_does_not_collide_with_other_2q_forms() {
 		assert_eq!(
@@ -786,8 +707,8 @@ mod tests {
 			Ok(PaperPolicy::TwoQCompactHybrid(0.2)),
 		);
 
-		// Unchanged by the new guard.
-		assert_eq!("2q-0.25-0.5".parse::<PaperPolicy>(), Ok(PaperPolicy::TwoQ(0.25, 0.5)));
+		// The plain `HashList` 2Q was removed in R2, and its spelling with it.
+		assert!("2q-0.25-0.5".parse::<PaperPolicy>().is_err());
 
 		assert_eq!(PaperPolicy::TwoQCompact(0.25, 0.5).to_string(), "2q-compact-0.25-0.5");
 
@@ -805,8 +726,8 @@ mod tests {
 	}
 
 	/// Same guard-ordering hazard as `compact_does_not_collide_with_other_2q_forms`,
-	/// for S3-FIFO: `"s3-fifo-compact-0.1"` starts with `"s3-fifo-"`, and
-	/// `"s3-fifo-compact-hybrid-0.1"` starts with `"s3-fifo-compact-"`.
+	/// for S3-FIFO: `"s3-fifo-compact-hybrid-0.1"` starts with
+	/// `"s3-fifo-compact-"`.
 	#[test]
 	fn compact_does_not_collide_with_other_s3_fifo_forms() {
 		assert_eq!(
@@ -819,8 +740,8 @@ mod tests {
 			Ok(PaperPolicy::S3FifoCompactHybrid(0.1)),
 		);
 
-		// Unchanged by the new guard.
-		assert_eq!("s3-fifo-0.1".parse::<PaperPolicy>(), Ok(PaperPolicy::SThreeFifo(0.1)));
+		// The plain `HashList` S3-FIFO was removed in R2, and its spelling with it.
+		assert!("s3-fifo-0.1".parse::<PaperPolicy>().is_err());
 
 		assert_eq!(PaperPolicy::SThreeFifoCompact(0.1).to_string(), "s3-fifo-compact-0.1");
 
@@ -836,14 +757,13 @@ mod tests {
 	}
 
 	/// The prefixes whose designs size a main queue at `(1 - ratio) * max_size`
-	/// -- the plain stack and the five corrected hybrids. These EXCLUDE 1.0.
+	/// -- the five corrected hybrids. These EXCLUDE 1.0.
 	///
-	/// Enumerated rather than spot-checked because the bound lives in ten
+	/// Enumerated rather than spot-checked because the bound lives in nine
 	/// separately hand-written parsers; the realistic mistake is tightening
-	/// five of six, or tightening one of the reprieve four by copy-paste.
+	/// four of five, or tightening one of the reprieve four by copy-paste.
 	#[cfg(test)]
 	const S3_FIFO_MAIN_SIZED_PREFIXES: &[&str] = &[
-		"s3-fifo-",
 		"s3-fifo-compact-hybrid-",
 		"s3-fifo-ghost-compact-hybrid-",
 		"s3-fifo-ghost-lazy-demotion-compact-hybrid-",
@@ -928,7 +848,7 @@ mod tests {
 	}
 
 	/// ...and the split is exactly where it should be: no design appears on
-	/// both lists, and between them they cover all ten parsers.
+	/// both lists, and between them they cover all nine parsers.
 	#[test]
 	fn every_s3_fifo_prefix_is_on_exactly_one_side_of_the_split() {
 		for prefix in S3_FIFO_REPRIEVE_PREFIXES {
@@ -940,8 +860,8 @@ mod tests {
 
 		assert_eq!(
 			S3_FIFO_MAIN_SIZED_PREFIXES.len() + S3_FIFO_REPRIEVE_PREFIXES.len(),
-			10,
-			"the two lists should account for all ten s3-fifo parsers",
+			9,
+			"the two lists should account for all nine s3-fifo parsers",
 		);
 	}
 
@@ -954,10 +874,10 @@ mod tests {
 	#[test]
 	fn two_q_family_still_accepts_a_ratio_of_exactly_one() {
 		for policy in [
-			// Plain `2q-` takes both k_in and k_out, and separately
+			// `2q-compact-` takes both k_in and k_out, and separately
 			// requires they sum to at most 1 -- so k_out is 0 here to
 			// isolate k_in at its upper bound.
-			"2q-1.0-0.0",
+			"2q-compact-1.0-0.0",
 			"2q-compact-hybrid-1.0",
 			"2q-fast-admission-reprieve-compact-hybrid-1.0",
 			"2q-ghost-compact-hybrid-1.0",

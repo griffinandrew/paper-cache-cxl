@@ -13,7 +13,7 @@
 //! # The semantics are the flat stack's, verbatim
 //!
 //! Taken from `ClockCompactStack` (and, identically, from the `HashList`
-//! original `ClockStack` it re-lays-out), not from a textbook:
+//! original `ClockStack` it re-lays-out, removed in R2), not from a textbook:
 //!
 //! ```text
 //!   insert, new key       push_front, bit CLEAR

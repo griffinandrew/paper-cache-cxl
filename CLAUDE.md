@@ -32,8 +32,9 @@ src/
                                with_hasher_sized. Carries exactly one compile_error!, rejecting
                                hashbrown_dram + global_hashtable_pmem -- unrelated to the
                                designs. The 153 pairwise hybrid guards are gone.
-  policy.rs                   PaperPolicy — the plain policies (Lfu, Fifo, Clock, Sieve, Lru,
-                               Mru, TwoQ, Arc, SThreeFifo) plus one variant per hybrid design
+  policy.rs                   PaperPolicy — the plain (flat) policies (LfuCompact, FifoCompact,
+                               ClockCompact, SieveCompact, LruCompact, MruCompact,
+                               TwoQCompact, SThreeFifoCompact, Arc) plus one variant per hybrid design
                                (LruHybrid, LfuHybrid, TwoQHybrid(f64), S3FifoHybrid(f64), ...),
                                with Display/FromStr for paper-server's string config format.
   error.rs                    CacheError.
@@ -198,7 +199,10 @@ src/
                                  idle poll (see "Merged-store measurements until S5" below),
                                  and since B2 the worker polls SHORT, never parking long,
                                  while a set waits in either of the gate's lanes.
-      policy_stack/             One file per policy, all implementing the PolicyStack trait.
+      policy_stack/             One file per policy, all implementing the PolicyStack trait (the
+                                 flat ones are the eight `*_compact_stack.rs` files over
+                                 `compact_queue_set.rs`, plus `arc_stack.rs`; `golden.rs`, test-only,
+                                 holds the eviction orders their tests assert).
                                  The 20 *_hybrid_stack.rs files carry each design's algorithm
                                  and its full derivation in the module doc — those are the
                                  authoritative description of what each design does.
@@ -3303,3 +3307,35 @@ which `prev_fast` uses. `NodePayload::phys`, whose one reader was the lazy-copy 
 by every stack and read by none; it costs nothing (the node is 32 bytes either way) and is left for
 a later cleanup. The documented measurement of the plain design (SET mean 7.11 -> 3.30 us) stays in
 `HYBRID_CACHES.md` and `FEATURE_FLAGS.md`, marked as the removed design's.
+
+## Removed the original flat stacks: the flat baseline is the Compact family (R2)
+
+On the user's decision (keep the eight Compact flat stacks and upstream ARC, delete the rest): the
+`HashList`-based `LruStack`, `FifoStack`, `ClockStack`, `LfuStack`, `MruStack`, `SieveStack`,
+`TwoQStack` and `SThreeFifoStack` (1,689 lines), `policy_stack/pmem_collections.rs` (855 lines,
+used only by the LRU and LFU originals under `eviction_stacks_pmem`) and the `dlv-list`
+dependency (only `lfu_stack` used it), with the `PaperPolicy` variants `Lru`, `Fifo`, `Clock`,
+`Lfu`, `Mru`, `Sieve`, `TwoQ(k_in, k_out)` and `SThreeFifo(ratio)` and their strings (`lru`,
+`fifo`, `clock`, `lfu`, `mru`, `sieve`, `2q-<k_in>-<k_out>`, `s3-fifo-<ratio>`). The flat policies
+are `lru-compact`, `fifo-compact`, `clock-compact`, `lfu-compact`, `mru-compact`,
+`sieve-compact`, `2q-compact-<k_in>-<k_out>`, `s3-fifo-compact-<ratio>` and `arc`. (The
+benchmark matrix's flat arm already ran the Compact family, through its `-compact` suffix.)
+
+Every Compact stack's tests were differential tests against its original, so before the
+originals went their eviction orders were recorded: `policy_stack/golden.rs` holds the same op
+sequences (scenarios), run on one stack and reduced to a fingerprint of every observation (the
+length and membership after each op, each interleaved eviction), the count, head and
+fingerprint of the final drain, and one recorded constant per scenario and stack. The constants
+were taken from the original and checked equal to the Compact stack's in the same run; each
+`*_compact_stack.rs` asserts its own (20 tests, replacing the 20 differential ones). The faithful
+S3-FIFO hybrid's oracle test now replays flat `SThreeFifoCompactStack`, and asserts that the
+oracle's order is the recorded one of the original on the same 40,000 ops.
+
+Uses converted to the Compact equivalents: the rustdoc examples and tests in `lib.rs`, the
+`status.rs`, `worker/ttl` and `worker/policy` tests, `s5_gate_tests.rs`, `phys_fast_identity.rs`,
+`init_policy_stack`'s tables, and the merged store's `MergedOrder::from_policy`, which no longer
+accepts the original spellings of LRU, FIFO, CLOCK and LFU. `s_three_fifo_starves_main`, the
+constructor's guard against a main queue that truncates to zero bytes, covered only the original
+`SThreeFifo`; the Compact stack has the identical `main_is_full` degeneracy, so the guard now
+covers `SThreeFifoCompact` (it refuses that configuration with `InvalidPolicy`, as it always
+did for the original).

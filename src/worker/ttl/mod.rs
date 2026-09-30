@@ -230,7 +230,7 @@ mod tests {
 
 		let objects: ObjectMapRef<u32, TestBuffer> = crate::new_hybrid_object_map();
 		let status: StatusRef = Arc::new(
-			AtomicStatus::new(1 << 20, &[PaperPolicy::Lru], PaperPolicy::Lru).unwrap(),
+			AtomicStatus::new(1 << 20, &[PaperPolicy::LruCompact], PaperPolicy::LruCompact).unwrap(),
 		);
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
@@ -267,7 +267,7 @@ mod tests {
 	fn a_stale_entry_does_not_reap_an_object_re_set_without_a_ttl() {
 		let mut rig = rig();
 		admit(&rig, None);
-		let used = rig.status.used_size(&PaperPolicy::Lru);
+		let used = rig.status.used_size(&PaperPolicy::LruCompact);
 		file_stale_entry(&mut rig);
 
 		rig.worker.reap_due(now_ticks());
@@ -277,14 +277,14 @@ mod tests {
 			"the reaper removed a live object on a stale index entry",
 		);
 		assert_eq!(rig.status.live_num_objects(), 1);
-		assert_eq!(rig.status.used_size(&PaperPolicy::Lru), used);
+		assert_eq!(rig.status.used_size(&PaperPolicy::LruCompact), used);
 	}
 
 	#[test]
 	fn a_stale_entry_does_not_reap_an_object_whose_ttl_was_extended() {
 		let mut rig = rig();
 		admit(&rig, Some(get_expiry_from_ttl(3_600)));
-		let used = rig.status.used_size(&PaperPolicy::Lru);
+		let used = rig.status.used_size(&PaperPolicy::LruCompact);
 		file_stale_entry(&mut rig);
 
 		rig.worker.reap_due(now_ticks());
@@ -294,13 +294,13 @@ mod tests {
 			"the reaper removed an object whose TTL runs another hour",
 		);
 		assert_eq!(rig.status.live_num_objects(), 1);
-		assert_eq!(rig.status.used_size(&PaperPolicy::Lru), used);
+		assert_eq!(rig.status.used_size(&PaperPolicy::LruCompact), used);
 	}
 
 	#[test]
 	fn an_expired_object_is_still_reaped_and_reported() {
 		let mut rig = rig();
-		let used_empty = rig.status.used_size(&PaperPolicy::Lru);
+		let used_empty = rig.status.used_size(&PaperPolicy::LruCompact);
 
 		// Due at the current tick: `is_expired` is `expiry <= now_ticks()`.
 		admit(&rig, NonZeroU32::new(now_ticks()));
@@ -312,7 +312,7 @@ mod tests {
 
 		assert!(rig.objects.get_ref(&KEY).is_none(), "an expired object survived its reap");
 		assert_eq!(rig.status.live_num_objects(), 0);
-		assert_eq!(rig.status.used_size(&PaperPolicy::Lru), used_empty);
+		assert_eq!(rig.status.used_size(&PaperPolicy::LruCompact), used_empty);
 		assert!(
 			matches!(rig.policy_rx.try_recv(), Ok(WorkerEvent::Expire(KEY))),
 			"the reap was not reported to the policy worker",

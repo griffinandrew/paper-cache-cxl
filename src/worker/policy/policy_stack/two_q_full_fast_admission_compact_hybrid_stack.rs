@@ -498,7 +498,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 	///
 	/// The `A1In` arm is the fidelity point of the whole design and is
 	/// deliberately empty: a hit on a probation key does NOTHING. Faithful to
-	/// `TwoQStack`, where `a1_out.remove` misses and `am.move_front` is a
+	/// `TwoQCompactStack`, where `a1_out.remove` misses and `am.move_front` is a
 	/// silent no-op; and the key is already Fast, so there is nothing to
 	/// migrate either.
 	fn touch(&mut self, key: HashedKey, structural: bool) {
@@ -510,7 +510,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 		}
 	}
 
-	/// `TwoQStack::restructure_to_fit`, with the transition it performs being a
+	/// `TwoQCompactStack::restructure_to_fit`, with the transition it performs being a
 	/// real DRAM->PMEM tier migration.
 	///
 	/// Drains the `a1_in` tail into `a1_out`'s head until `incoming_size` fits.
@@ -719,7 +719,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 		}
 	}
 
-	/// The FIRST eviction victim, per `TwoQStack::evict_one`.
+	/// The FIRST eviction victim, per `TwoQCompactStack::evict_one`.
 	fn evict_a1_out_tail(&mut self) -> Option<HashedKey> {
 		let (key, payload) = self.queues.pop_back(Q_A1_OUT)?;
 		self.a1_out_used = self.a1_out_used.saturating_sub(payload.migrating());
@@ -735,7 +735,7 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 		Some(key)
 	}
 
-	/// The last resort, per `TwoQStack::evict_one`.
+	/// The last resort, per `TwoQCompactStack::evict_one`.
 	fn evict_am_tail(&mut self) -> Option<HashedKey> {
 		let (key, payload) = self.queues.pop_back(Q_AM)?;
 		let size = payload.migrating();
@@ -904,7 +904,7 @@ impl PolicyStack for TwoQFullFastAdmissionCompactHybridStack {
 		// Capacities are configuration, not state: kept.
 	}
 
-	/// `TwoQStack::evict_one`, verbatim: `a1_out` tail, then `a1_in` tail, then
+	/// `TwoQCompactStack::evict_one`, verbatim: `a1_out` tail, then `a1_in` tail, then
 	/// `am`'s LRU tail. Emits no migrations -- an evicted object is gone, not
 	/// moved.
 	fn evict_one(&mut self) -> Option<HashedKey> {

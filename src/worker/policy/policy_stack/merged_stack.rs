@@ -2079,12 +2079,11 @@ mod lfu_order_fidelity {
 		(store, merged, split)
 	}
 
-	/// All three LFU spellings reach the store's order, and the three orders
+	/// Both LFU spellings reach the store's order, and the three orders
 	/// that were already there are untouched by its arrival.
 	#[test]
 	fn the_policy_selects_the_lfu_order() {
 		for policy in [
-			PaperPolicy::Lfu,
 			PaperPolicy::LfuCompact,
 			PaperPolicy::LfuCompactHybrid,
 		] {

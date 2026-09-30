@@ -1,5 +1,10 @@
 //! `MruCompactStack` — `MruStack`'s policy over the slab design.
 //!
+//! The `HashList`-based `MruStack` this re-lays-out was removed in R2 with the other
+//! original flat stacks, so the mentions of it below are historical. Its eviction
+//! orders for the op sequences in `fidelity_tests` are recorded in `golden.rs` and
+//! asserted there.
+//!
 //! MRU evicts the most recently used object, so the MRU key is held OUTSIDE
 //! the queue in its own slot and the queue holds everything else in recency
 //! order. Eviction takes the queue front, falling back to the held key when
@@ -130,81 +135,30 @@ impl PolicyStack for MruCompactStack {
 	}
 }
 
-/// Fidelity against `MruStack`, whose policy this re-lays-out. Same access
-/// sequence must give the same eviction order: this changes how the queue is
-/// STORED, not what the policy means.
+/// Fidelity to `MruStack`, whose policy this re-lays-out and which was removed in
+/// R2: the eviction order it gave for the two op sequences below is recorded in
+/// `golden` and asserted here. Same access sequence, same eviction order: this
+/// changes how the queue is STORED, not what the policy means.
 #[cfg(test)]
 mod fidelity_tests {
 	use super::*;
-	use super::super::mru_stack::MruStack;
+	use super::super::golden;
 
-	fn replay(ops: &[(HashedKey, bool)]) -> (Vec<HashedKey>, Vec<HashedKey>) {
-		let mut a = MruStack::default();
-		let mut b = MruCompactStack::default();
-
-		for &(key, is_update) in ops {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-			if is_update {
-				sa.update(key);
-				sb.update(key);
-			} else {
-				sa.insert(key, 1_024);
-				sb.insert(key, 1_024);
-			}
-			assert_eq!(sa.len(), sb.len(), "len diverged at key {key}");
-			assert_eq!(sa.contains(key), sb.contains(key), "contains diverged at key {key}");
-		}
-
-		let drain = |s: &mut dyn PolicyStack| {
-			let mut out = Vec::new();
-			while let Some(k) = s.evict_one() {
-				out.push(k);
-			}
-			out
-		};
-		(drain(&mut a), drain(&mut b))
+	/// 40,000 skewed ops, a third of them hits.
+	#[test]
+	fn evicts_in_the_recorded_order() {
+		assert_eq!(
+			golden::single_queue_skewed(&mut MruCompactStack::default()),
+			golden::MRU_SKEWED,
+		);
 	}
 
+	/// Removal must not disturb the order of what remains.
 	#[test]
-	fn evicts_in_the_same_order_as_the_original() {
-		let mut ops = Vec::new();
-		let mut x: u64 = 0x243F_6A88_85A3_08D3;
-		for i in 0..40_000u64 {
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-			let u = (x >> 11) as f64 / (1u64 << 53) as f64;
-			let key = ((u * u * 500.0) as u64) + 1;
-			ops.push((key, i % 3 == 0));
-		}
-		let (oa, ob) = replay(&ops);
-		assert_eq!(oa, ob, "eviction order diverged from MruStack");
-		assert!(!oa.is_empty());
-	}
-
-	#[test]
-	fn removal_matches_the_original() {
-		let mut a = MruStack::default();
-		let mut b = MruCompactStack::default();
-		for key in 0..2_000u64 {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-			sa.insert(key, 512);
-			sb.insert(key, 512);
-			if key % 3 == 0 { sa.update(key); sb.update(key); }
-		}
-		for key in (0..2_000u64).step_by(5) {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-			sa.remove(key);
-			sb.remove(key);
-		}
-		let drain = |s: &mut dyn PolicyStack| {
-			let mut out = Vec::new();
-			while let Some(k) = s.evict_one() { out.push(k); }
-			out
-		};
-		assert_eq!(drain(&mut a), drain(&mut b), "eviction order after removals diverged");
+	fn removal_leaves_the_recorded_order() {
+		assert_eq!(
+			golden::removal(&mut MruCompactStack::default(), 2_000, 512, true, 5),
+			golden::MRU_REMOVAL,
+		);
 	}
 }

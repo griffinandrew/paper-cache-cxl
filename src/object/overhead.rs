@@ -452,70 +452,46 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// constant, and every one of those hand counts was low.
 
 	match policy {
-		// 24 bytes for the HashMap entry 48 bytes for the HashList entry,
-		// 8 bytes for the HashedKey, 4 bytes for the count
 		// Slab layout: 16-byte link-only slot plus one index entry
-		// (8-byte key + 4-byte slot + 4-byte frequency), against `Lfu`s
-		// index_map entry + HashList node + key + count, each bucket
-		// carrying its own key-to-node index.
+		// (8-byte key + 4-byte slot + 4-byte frequency). The `HashList` LFU
+		// this replaced (removed in R2) charged 128: its index_map entry, a
+		// HashList node, the key and the count, each bucket carrying its own
+		// key-to-node index.
 		PaperPolicy::LfuCompact => 56 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::Lfu => 128 + OBJECT_MAP_ROW_OVERHEAD,
 
-		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
 		// Slab layout: a 16-byte link-only slot plus one index entry, against
-		// the original's 48-byte HashList node, key, and separate index. The
-		// CLOCK/SIEVE visited bit and MRU's held key live in the index value,
-		// so they cost nothing beyond it.
+		// the original's 48-byte HashList node, key, and separate index (72,
+		// for these and for LRU, MRU, 2Q and S3-FIFO alike). The CLOCK/SIEVE
+		// visited bit and MRU's held key live in the index value, so they
+		// cost nothing beyond it.
 		PaperPolicy::FifoCompact => 56 + OBJECT_MAP_ROW_OVERHEAD,
 		PaperPolicy::ClockCompact => 56 + OBJECT_MAP_ROW_OVERHEAD,
 		PaperPolicy::SieveCompact => 56 + OBJECT_MAP_ROW_OVERHEAD,
 		PaperPolicy::MruCompact => 56 + OBJECT_MAP_ROW_OVERHEAD,
 
-		PaperPolicy::Fifo => 72 + OBJECT_MAP_ROW_OVERHEAD,
-
-		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
-		// 1 byte for the visited flag
-		PaperPolicy::Clock => 72 + OBJECT_MAP_ROW_OVERHEAD,
-
-		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
-		// 1 byte for the visited flag
-		PaperPolicy::Sieve => 72 + OBJECT_MAP_ROW_OVERHEAD,
-
-		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
 		// Slab layout: a 16-byte link-only slot plus one index entry
-		// (8-byte key + 4-byte slot number, no payload), against
-		// `Lru`s 48-byte HashList node + 8-byte key + the HashLists own
+		// (8-byte key + 4-byte slot number, no payload), against the removed
+		// `LruStack`'s 48-byte HashList node + 8-byte key + the HashList's own
 		// separate key-to-node index.
 		PaperPolicy::LruCompact => 56 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::Lru => 72 + OBJECT_MAP_ROW_OVERHEAD,
 
-		// 48 bytes for the HashList entry, 8 bytes for the HashedKey
-		PaperPolicy::Mru => 72 + OBJECT_MAP_ROW_OVERHEAD,
-
-		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
-		// 4 bytes for the object size
 		// Slab layout: one 16-byte `QueueSlot` plus the index entry that
 		// finds it (8-byte key + 4-byte slot index + the 8-byte payload
-		// carrying the queue tag and the object size), against the
-		// original's 48-byte `HashList` node + 8-byte key + 4-byte size.
+		// carrying the queue tag and the object size), against the original's
+		// 48-byte `HashList` node + 8-byte key + 4-byte size.
 		PaperPolicy::TwoQCompact(_, _) => 72 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::TwoQ(_, _) => 72 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
 		// 4 bytes for the object size
 		PaperPolicy::Arc => 72 + OBJECT_MAP_ROW_OVERHEAD,
 
-		// 48 bytes for the HashList entry, 8 bytes for the HashedKey,
-		// 4 bytes for the object size, 1 byte for the frequency count
 		// Slab layout: one 16-byte `QueueSlot` plus the index entry that
 		// finds it (8-byte key + 4-byte slot index + the 8-byte payload
 		// carrying the size, the queue tag and the frequency counter),
 		// against the original's 48-byte `HashList` node + 8-byte key +
-		// 4-byte size + 1-byte freq. Like `SThreeFifo` above, neither
-		// charge covers the bare-key ghost queue, so the two stay
-		// directly comparable.
+		// 4-byte size + 1-byte freq. Neither charge covers the bare-key ghost
+		// queue.
 		PaperPolicy::SThreeFifoCompact(_) => 72 + OBJECT_MAP_ROW_OVERHEAD,
-		PaperPolicy::SThreeFifo(_) => 72 + OBJECT_MAP_ROW_OVERHEAD,
 
 		// One 32-byte slab slot plus a 16-byte index entry. No `entries` map
 		// and no per-key list node: the slot the index returns already carries
@@ -902,7 +878,7 @@ pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 8;
 /// Distinct from [`GHOST_ENTRY_DRAM_OVERHEAD`] above, which sizes a `GhostSlot`
 /// FINGERPRINT (8 bytes, approximate, fixed-capacity). An exact ghost costs a
 /// 16-byte `QueueSlot` plus the 12-byte index entry that finds it -- the same
-/// 16 + 12 shape charged for `LruCompact` -- because flat `SThreeFifoStack`'s
+/// 16 + 12 shape charged for `LruCompact` -- because flat S3-FIFO's
 /// ghost is exact and a faithful port cannot substitute an approximate filter
 /// without changing which keys get admitted to main.
 ///
@@ -1399,22 +1375,14 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 			PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(..) => S3_FIFO_LAZY_DEMOTION_FAST_ADMISSION_SPLIT_SLOW_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 
 			// All-DRAM policies have no tiers and reserve no fast-tier metadata.
-			PaperPolicy::Lfu
-			| PaperPolicy::Fifo
-			| PaperPolicy::Clock
-			| PaperPolicy::Sieve
-			| PaperPolicy::Lru
-			| PaperPolicy::LruCompact
+			PaperPolicy::LruCompact
 			| PaperPolicy::LfuCompact
 			| PaperPolicy::FifoCompact
 			| PaperPolicy::ClockCompact
 			| PaperPolicy::SieveCompact
 			| PaperPolicy::MruCompact
-			| PaperPolicy::Mru
-			| PaperPolicy::TwoQ(..)
 			| PaperPolicy::TwoQCompact(..)
 			| PaperPolicy::Arc
-			| PaperPolicy::SThreeFifo(..)
 			| PaperPolicy::SThreeFifoCompact(..) => 0,
 		};
 		overhead += stack_resident;

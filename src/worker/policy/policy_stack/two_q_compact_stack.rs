@@ -1,5 +1,10 @@
 //! `TwoQCompactStack` — `TwoQStack`'s policy over the slab design.
 //!
+//! The `HashList`-based `TwoQStack` this re-lays-out was removed in R2 with the other
+//! original flat stacks, so the mentions of it below are historical. Its eviction
+//! orders for the op sequences in `fidelity_tests` are recorded in `golden.rs` and
+//! asserted there.
+//!
 //! Faithful three-queue 2Q: `a1_in` (byte-budgeted FIFO), `a1_out` (byte-
 //! budgeted, holding what `a1_in` overflowed) and `am` (unbounded LRU). A hit
 //! in `a1_out` promotes to `am`; a hit in `a1_in` is deliberately ignored,
@@ -255,112 +260,43 @@ impl PolicyStack for TwoQCompactStack {
 	}
 }
 
-/// Fidelity against `TwoQStack`, whose policy this re-lays-out.
+/// Fidelity to `TwoQStack`, whose policy this re-lays-out and which was removed
+/// in R2: the eviction order it gave for the op sequences below is recorded in
+/// `golden` and asserted here.
 #[cfg(test)]
 mod fidelity_tests {
 	use super::*;
-	use super::super::two_q_stack::TwoQStack;
+	use super::super::golden;
 
 	const MAX: CacheSize = 100_000;
 	const K_IN: f64 = 0.25;
 	const K_OUT: f64 = 0.5;
 
-	fn drain(s: &mut dyn PolicyStack) -> Vec<HashedKey> {
-		let mut out = Vec::new();
-		while let Some(k) = s.evict_one() {
-			out.push(k);
-		}
-		out
-	}
-
 	/// Sizes are varied so the byte budgets on `a1_in`/`a1_out` actually bind
-	/// and the spill path runs — a fixed size would exercise one branch only.
+	/// and the spill path runs -- a fixed size would exercise one branch only.
 	#[test]
-	fn evicts_in_the_same_order_as_two_q_stack() {
-		let mut a = TwoQStack::new(K_IN, K_OUT, MAX);
-		let mut b = TwoQCompactStack::new(K_IN, K_OUT, MAX);
-		let mut x: u64 = 0x243F_6A88_85A3_08D3;
-
-		for i in 0..40_000u64 {
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-			let u = (x >> 11) as f64 / (1u64 << 53) as f64;
-			let key = ((u * u * 400.0) as u64) + 1;
-			let size = (1_024 + (x % 3_072)) as ObjectSize;
-
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-
-			if i % 4 == 3 && sa.contains(key) {
-				sa.update(key);
-				sb.update(key);
-			} else {
-				sa.insert(key, size);
-				sb.insert(key, size);
-			}
-
-			assert_eq!(sa.len(), sb.len(), "len diverged at op {i} key {key}");
-			assert_eq!(sa.contains(key), sb.contains(key), "contains diverged at op {i}");
-		}
-
-		assert_eq!(drain(&mut a), drain(&mut b), "eviction order diverged from TwoQStack");
+	fn evicts_in_the_recorded_order() {
+		assert_eq!(
+			golden::budgeted_skewed(&mut TwoQCompactStack::new(K_IN, K_OUT, MAX)),
+			golden::TWO_Q_SKEWED,
+		);
 	}
 
 	#[test]
-	fn removal_matches_two_q_stack() {
-		let mut a = TwoQStack::new(K_IN, K_OUT, MAX);
-		let mut b = TwoQCompactStack::new(K_IN, K_OUT, MAX);
-
-		for key in 0..3_000u64 {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-			sa.insert(key, 1_024);
-			sb.insert(key, 1_024);
-			if key % 3 == 0 {
-				sa.update(key);
-				sb.update(key);
-			}
-		}
-
-		for key in (0..3_000u64).step_by(7) {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-			sa.remove(key);
-			sb.remove(key);
-		}
-
-		assert_eq!(drain(&mut a), drain(&mut b), "eviction order after removals diverged");
+	fn removal_leaves_the_recorded_order() {
+		assert_eq!(
+			golden::removal(&mut TwoQCompactStack::new(K_IN, K_OUT, MAX), 3_000, 1_024, true, 7),
+			golden::TWO_Q_REMOVAL,
+		);
 	}
 
 	/// `resize` re-derives both budgets, which changes where the spill point
-	/// falls; the two must agree afterwards as well.
+	/// falls; the order after it is recorded too.
 	#[test]
-	fn resize_matches_two_q_stack() {
-		let mut a = TwoQStack::new(K_IN, K_OUT, MAX);
-		let mut b = TwoQCompactStack::new(K_IN, K_OUT, MAX);
-
-		for key in 0..1_500u64 {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-			sa.insert(key, 2_048);
-			sb.insert(key, 2_048);
-		}
-
-		{
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-			sa.resize(MAX * 4);
-			sb.resize(MAX * 4);
-		}
-
-		for key in 1_500..2_500u64 {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-			sa.insert(key, 2_048);
-			sb.insert(key, 2_048);
-		}
-
-		assert_eq!(drain(&mut a), drain(&mut b), "eviction order after resize diverged");
+	fn resize_keeps_the_recorded_order() {
+		assert_eq!(
+			golden::resize(&mut TwoQCompactStack::new(K_IN, K_OUT, MAX), MAX),
+			golden::TWO_Q_RESIZE,
+		);
 	}
 }

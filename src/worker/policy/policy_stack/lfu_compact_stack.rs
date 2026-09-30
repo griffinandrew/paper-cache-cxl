@@ -1,5 +1,10 @@
 //! `LfuCompactStack` — `LfuStack`'s policy over the slab design.
 //!
+//! The `HashList`-based `LfuStack` this re-lays-out was removed in R2 with the other
+//! original flat stacks, so the mentions of it below are historical. Its eviction
+//! orders for the op sequences in `fidelity_tests` are recorded in `golden.rs` and
+//! asserted there.
+//!
 //! The non-tiered counterpart to `LfuCompactHybridStack`, and the fourth cell
 //! of the layout/tiering matrix:
 //!
@@ -235,71 +240,31 @@ impl PolicyStack for LfuCompactStack {
 	}
 }
 
-/// Fidelity against `LfuStack`, whose policy this re-lays-out.
+/// Fidelity to `LfuStack`, whose policy this re-lays-out and which was removed in
+/// R2: the eviction order it gave for the two op sequences below is recorded in
+/// `golden` and asserted here. Same access sequence, same eviction order: this
+/// changes how the queue is STORED, not what the policy means.
 #[cfg(test)]
 mod fidelity_tests {
 	use super::*;
-	use super::super::lfu_stack::LfuStack;
+	use super::super::golden;
 
-	/// Same access sequence must give the same eviction order: this changes
-	/// how frequency is STORED, not what LFU means.
+	/// Same access sequence, same eviction order: this changes how frequency is
+	/// STORED, not what LFU means.
 	#[test]
-	fn evicts_in_the_same_order_as_lfu_stack() {
-		let mut a = LfuStack::default();
-		let mut b = LfuCompactStack::default();
-		let mut x: u64 = 0x243F_6A88_85A3_08D3;
-
-		for i in 0..40_000u64 {
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-			let u = (x >> 11) as f64 / (1u64 << 53) as f64;
-			let key = ((u * u * 400.0) as u64) + 1;
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-			if i % 4 == 3 && sa.contains(key) {
-				sa.update(key);
-				sb.update(key);
-			} else {
-				sa.insert(key, 1_024);
-				sb.insert(key, 1_024);
-			}
-			assert_eq!(sa.len(), sb.len(), "len diverged at op {i}");
-		}
-
-		let mut oa = Vec::new();
-		let mut ob = Vec::new();
-		let sa: &mut dyn PolicyStack = &mut a;
-		let sb: &mut dyn PolicyStack = &mut b;
-		while let Some(k) = sa.evict_one() { oa.push(k); }
-		while let Some(k) = sb.evict_one() { ob.push(k); }
-		assert_eq!(oa, ob, "eviction order diverged from LfuStack");
-		assert!(!oa.is_empty());
+	fn evicts_in_the_recorded_order() {
+		assert_eq!(
+			golden::lfu_skewed(&mut LfuCompactStack::default()),
+			golden::LFU_SKEWED,
+		);
 	}
 
+	/// Removal must not disturb the order of what remains.
 	#[test]
-	fn removal_matches_lfu_stack() {
-		let mut a = LfuStack::default();
-		let mut b = LfuCompactStack::default();
-		for key in 0..2_000u64 {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-			sa.insert(key, 512);
-			sb.insert(key, 512);
-			if key % 3 == 0 { sa.update(key); sb.update(key); }
-		}
-		for key in (0..2_000u64).step_by(5) {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-			sa.remove(key);
-			sb.remove(key);
-		}
-		let mut oa = Vec::new();
-		let mut ob = Vec::new();
-		let sa: &mut dyn PolicyStack = &mut a;
-		let sb: &mut dyn PolicyStack = &mut b;
-		while let Some(k) = sa.evict_one() { oa.push(k); }
-		while let Some(k) = sb.evict_one() { ob.push(k); }
-		assert_eq!(oa, ob, "eviction order after removals diverged");
+	fn removal_leaves_the_recorded_order() {
+		assert_eq!(
+			golden::removal(&mut LfuCompactStack::default(), 2_000, 512, true, 5),
+			golden::LFU_REMOVAL,
+		);
 	}
 }

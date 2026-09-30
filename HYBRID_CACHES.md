@@ -443,9 +443,8 @@ placement run in either mode.
 
 ### `eviction_stacks_pmem`
 
-Moves each stack's lists and per-key map into the slow tier via `crate::Hybrid`. The
-`PmemHashList`/`hashbrown` variants expose the same method surface as the DRAM ones, so stack
-logic is identical either way. Each stack still cfgs its own imports and type aliases, but none
+Moves each stack's lists and per-key map into the slow tier via `crate::Hybrid`. Every stack's
+slab and index are allocator-parameterised, so stack logic is identical either way. Each stack still cfgs its own imports and type aliases, but none
 needs a cfg for the *accounting*: under this flag the eviction-stack term simply drops out of the
 value `get_hybrid_dram_shared_overhead` returns.
 
@@ -736,8 +735,8 @@ is exactly what this variant exists to measure — a null result is a finding, n
 `TwoQGhostCompactHybridStack` · `PaperPolicy::TwoQGhostCompactHybrid(f64)`
 
 `two_q_compact_hybrid_cache` plus a bare-key ghost queue, adding what that stack deliberately left out.
-Mirrors `s_three_fifo_stack.rs`'s `ghost: HashList<HashedKey>` shape — a lightweight membership
-list, not a third place bytes can live (explicitly chosen over plain `TwoQStack`'s heavier
+Mirrors `s_three_fifo_compact_stack.rs`'s bare-key ghost queue — a lightweight membership
+list, not a third place bytes can live (explicitly chosen over `TwoQCompactStack`'s heavier
 `a1_out`, which holds real objects).
 
 Ghost lifecycle, matching `SThreeFifoStack`'s convention:

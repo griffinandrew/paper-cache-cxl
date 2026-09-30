@@ -4675,7 +4675,7 @@ mod migration_accounting_tests {
 		let objects: ObjectMapRef<u32, TestBuffer> = crate::new_hybrid_object_map();
 
 		let status = Arc::new(
-			AtomicStatus::new(1_000, &[PaperPolicy::Lru], PaperPolicy::Lru).unwrap(),
+			AtomicStatus::new(1_000, &[PaperPolicy::LruCompact], PaperPolicy::LruCompact).unwrap(),
 		);
 
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
@@ -4862,7 +4862,7 @@ mod migration_accounting_tests {
 
 	impl PolicyStack for ScriptedDrain {
 		fn is_policy(&self, policy: &PaperPolicy) -> bool {
-			matches!(policy, PaperPolicy::Lru)
+			matches!(policy, PaperPolicy::LruCompact)
 		}
 
 		fn len(&self) -> usize {
@@ -5388,7 +5388,7 @@ mod policy_worker_kick_tests {
 		let objects: ObjectMapRef<u32, crate::TieredBuffer> = crate::new_hybrid_object_map();
 
 		let status: StatusRef = Arc::new(
-			AtomicStatus::new(1_000_000, &[PaperPolicy::Lru], PaperPolicy::Lru).unwrap(),
+			AtomicStatus::new(1_000_000, &[PaperPolicy::LruCompact], PaperPolicy::LruCompact).unwrap(),
 		);
 
 		let overhead_manager = Arc::new(OverheadManager::new(&status));
@@ -5563,7 +5563,7 @@ mod capacity_watermark_tests {
 	/// rather than the value type -- every value is a `TieredValue`.
 	type TestBuffer = crate::TieredBuffer;
 
-	const TEST_POLICY: PaperPolicy = PaperPolicy::Lru;
+	const TEST_POLICY: PaperPolicy = PaperPolicy::LruCompact;
 	const VALUE_BYTES: usize = 16;
 
 	/// Cap the status is constructed with, replaced by `make_worker` as soon
@@ -5591,7 +5591,7 @@ mod capacity_watermark_tests {
 	/// The cap can only be sized once an `OverheadManager` exists to measure
 	/// an object with, and that needs a status that already carries a cap --
 	/// hence the placeholder, then `set_max_size`. Nothing goes stale:
-	/// `apply_evictions` reads `max_size()` on entry, and `LruStack` ignores
+	/// `apply_evictions` reads `max_size()` on entry, and `LruCompactStack` ignores
 	/// `resize` altogether.
 	fn make_worker(objects_at_max: u64) -> (
 		PolicyWorker<u32, TestBuffer>,
@@ -5668,7 +5668,7 @@ mod capacity_watermark_tests {
 
 	impl PolicyStack for SubBudgetStack {
 		fn is_policy(&self, policy: &PaperPolicy) -> bool {
-			matches!(policy, PaperPolicy::Lru)
+			matches!(policy, PaperPolicy::LruCompact)
 		}
 
 		fn len(&self) -> usize {

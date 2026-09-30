@@ -335,8 +335,8 @@ pub enum MergedOrder {
 	/// relinked to the head, which is exactly where a circular CLOCK's hand
 	/// would next reach it -- one full revolution away. That is the standard
 	/// linked-list rendering of CLOCK, and it is what the flat
-	/// `ClockCompactStack` and `ClockStack` in this tree both implement:
-	/// `pop_back`, and on a set bit `push_front` with the bit cleared.
+	/// `ClockCompactStack` in this tree implements: `pop_back`, and on a set
+	/// bit `push_front` with the bit cleared.
 	///
 	/// It is NOT SIEVE. SIEVE leaves the second-chance object where it is and
 	/// advances a separate hand, so the object keeps its place in insertion
@@ -446,20 +446,16 @@ impl MergedOrder {
 	/// a hit does to the queue.
 	pub fn from_policy(policy: &PaperPolicy) -> Result<MergedOrder, CacheError> {
 		match policy {
-			PaperPolicy::Lru
-			| PaperPolicy::LruCompact
+			PaperPolicy::LruCompact
 			| PaperPolicy::LruCompactHybrid => Ok(MergedOrder::Lru),
 
-			PaperPolicy::Fifo
-			| PaperPolicy::FifoCompact
+			PaperPolicy::FifoCompact
 			| PaperPolicy::FifoCompactHybrid => Ok(MergedOrder::Fifo),
 
-			PaperPolicy::Clock
-			| PaperPolicy::ClockCompact
+			PaperPolicy::ClockCompact
 			| PaperPolicy::ClockCompactHybrid => Ok(MergedOrder::Clock),
 
-			PaperPolicy::Lfu
-			| PaperPolicy::LfuCompact
+			PaperPolicy::LfuCompact
 			| PaperPolicy::LfuCompactHybrid => Ok(MergedOrder::Lfu),
 
 			other => Err(CacheError::PolicyNotImplemented(*other)),

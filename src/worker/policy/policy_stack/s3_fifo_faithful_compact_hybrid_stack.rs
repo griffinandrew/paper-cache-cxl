@@ -1,7 +1,7 @@
 //! Faithful tier-segmented S3-FIFO, in four variants.
 //!
 //! Every other S3-FIFO hybrid in this tree diverges from the flat algorithm in
-//! `s_three_fifo_stack.rs` in three ways at once, which is why `s3-fifo-0.1`
+//! `s_three_fifo_compact_stack.rs` in three ways at once, which is why `s3-fifo-0.1`
 //! and `s3-fifo-hybrid-0.1` are not a fair pair and never were:
 //!
 //!   1. they carry an `accessed: bool` reference bit where flat carries a
@@ -100,7 +100,7 @@ const Q_MAIN_SLOW: usize = 2;
 const Q_GHOST: usize = 0;
 
 /// S3-FIFO's frequency counter saturates at 3, matching `Object::incr_freq`
-/// in `s_three_fifo_stack.rs`. `u32` because that is [`NodePayload::freq`]'s
+/// in `s_three_fifo_compact_stack.rs`. `u32` because that is [`NodePayload::freq`]'s
 /// width; the saturation, not the width, is what is faithful to flat.
 const MAX_FREQ: u32 = 3;
 
@@ -841,7 +841,8 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> PolicyStack
 	}
 }
 
-/// Fidelity against flat `SThreeFifoStack`, plus the behavioural tests that
+/// Fidelity against flat S3-FIFO (`SThreeFifoCompactStack`, whose order is
+/// pinned to the removed `SThreeFifoStack`'s by `golden`), plus the behavioural tests that
 /// catch the three divergences this design exists to remove.
 ///
 /// Gated on this design's OWN feature. The habit elsewhere in the family is to
@@ -850,7 +851,7 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> PolicyStack
 #[cfg(all(test, feature = "s3_fifo_faithful_compact_hybrid_cache"))]
 mod fidelity_tests {
 	use super::*;
-	use crate::worker::policy::policy_stack::s_three_fifo_stack::SThreeFifoStack;
+	use crate::worker::policy::policy_stack::{golden, s_three_fifo_compact_stack::SThreeFifoCompactStack};
 
 	const MAX: CacheSize = 100_000;
 	const RATIO: f64 = 0.1;
@@ -893,7 +894,7 @@ mod fidelity_tests {
 	fn evicts_in_the_same_order_as_flat_at_every_fast_size() {
 		let ops = workload(40_000);
 
-		let mut flat = SThreeFifoStack::new(RATIO, MAX);
+		let mut flat = SThreeFifoCompactStack::new(RATIO, MAX);
 		for &(key, size, upd) in &ops {
 			let s: &mut dyn PolicyStack = &mut flat;
 			if upd && s.contains(key) {
@@ -903,6 +904,16 @@ mod fidelity_tests {
 			}
 		}
 		let expected = drain(&mut flat);
+
+		// This is `golden::budgeted_skewed`'s op sequence, so the flat oracle's
+		// order is the one the original `SThreeFifoStack` gave on it (recorded
+		// there): pinned, so the oracle cannot drift from the algorithm the
+		// faithful family is defined against.
+		assert_eq!(
+			golden::order_fingerprint(&expected),
+			golden::S3_SKEWED.order,
+			"the flat oracle no longer evicts in the recorded SThreeFifoStack order",
+		);
 
 		for fast in [MAX * 4, MAX / 5, 0] {
 			let mut hyb = Faithful::new(RATIO, MAX, fast);

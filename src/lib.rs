@@ -527,8 +527,8 @@ where
 	///
 	/// let cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// );
 	///
 	/// assert!(cache.is_ok());
@@ -536,8 +536,8 @@ where
 	/// // Supplying a maximum size of zero will return a `CacheError`.
 	/// let cache = PaperCache::<u32, BufferDRAM>::new(
 	///     0,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// );
 	///
 	/// assert!(cache.is_err());
@@ -545,8 +545,8 @@ where
 	/// // Supplying duplicate policies will return a `CacheError`.
 	/// let cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu, PaperPolicy::Lru, PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact, PaperPolicy::LruCompact, PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// );
 	///
 	/// assert!(cache.is_err());
@@ -554,8 +554,8 @@ where
 	/// // Supplying a non-configured policy will return a `CacheError`.
 	/// let cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lru,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LruCompact,
 	/// );
 	///
 	/// assert!(cache.is_err());
@@ -583,8 +583,8 @@ where
 	///
 	/// let cache = PaperCache::<u32, BufferDRAM>::with_hasher(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	///     RandomState::default(),
 	/// );
 	///
@@ -670,8 +670,8 @@ where
 	///
 	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact
 	/// ).unwrap();
 	///
 	/// assert_eq!(cache.version(), env!("CARGO_PKG_VERSION"));
@@ -689,8 +689,8 @@ where
 	///
 	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// ).unwrap();
 	///
 	/// cache.set(0, &[0], None);
@@ -719,8 +719,8 @@ where
 	///
 	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// ).unwrap();
 	///
 	/// cache.set(0, &[0], None);
@@ -821,8 +821,8 @@ where
 	///
 	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// ).unwrap();
 	///
 	/// assert!(cache.set(0, &[0], None).is_ok());
@@ -897,8 +897,8 @@ where
 	///
 	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// ).unwrap();
 	///
 	/// cache.set(0, &[0], None);
@@ -932,8 +932,8 @@ where
 	///
 	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// ).unwrap();
 	///
 	/// cache.set(0, &[0], None);
@@ -966,8 +966,8 @@ where
 	///
 	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// ).unwrap();
 	///
 	/// cache.set(0, &[0], None);
@@ -1024,8 +1024,8 @@ where
 	///
 	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// ).unwrap();
 	///
 	/// cache.set(0, &[0], None); // value will not expire
@@ -1062,8 +1062,8 @@ where
 	///
 	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// ).unwrap();
 	///
 	/// cache.set(0, &[0], None);
@@ -1103,8 +1103,8 @@ where
 	///
 	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// ).unwrap();
 	///
 	/// cache.wipe();
@@ -1154,8 +1154,8 @@ where
 	///
 	/// let mut cache = PaperCache::<u32, BufferDRAM>::new(
 	///     1000,
-	///     &[PaperPolicy::Lfu],
-	///     PaperPolicy::Lfu,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
 	/// ).unwrap();
 	///
 	/// assert!(cache.resize(1).is_ok());
@@ -1945,11 +1945,11 @@ fn install_gate(status: &AtomicStatus, gate: Option<GateConfig>) -> Result<(), C
 /// `apply_evictions`, since `Stack::is_full` is `used >= max` and so an empty
 /// zero-capacity queue reports itself full.
 ///
-/// Covers the non-tiered `SThreeFifo` design only. The hybrid designs go
-/// through `s3_fifo_queue_budgets`, which additionally has to tell the stacks
-/// that size a main queue apart from the reprieve stacks that do not.
+/// Covers the non-tiered `SThreeFifoCompact` design only. The hybrid designs
+/// go through `s3_fifo_queue_budgets`, which additionally has to tell the
+/// stacks that size a main queue apart from the reprieve stacks that do not.
 fn s_three_fifo_starves_main(policy: PaperPolicy, max_size: CacheSize) -> bool {
-	let PaperPolicy::SThreeFifo(ratio) = policy else {
+	let PaperPolicy::SThreeFifoCompact(ratio) = policy else {
 		return false;
 	};
 
@@ -1994,14 +1994,14 @@ fn params_ok(policy: PaperPolicy) -> bool {
 
 		// The s3-fifo family EXCLUDES 1.0. These stacks size the main
 		// queue at `(1 - ratio) * max_size`, mirroring
-		// `SThreeFifoStack`, so a ratio of exactly 1 leaves it zero
+		// `SThreeFifoCompactStack`, so a ratio of exactly 1 leaves it zero
 		// bytes. `Stack::is_full` is `used >= max`, so an *empty* main
 		// queue then reports itself full: `evict_one` skips the
 		// one-access queue and `evict_main` pops nothing, returning
 		// `None` while the cache is still over budget, and
 		// `apply_evictions` spins on it. Rejecting the endpoint makes
 		// that unreachable rather than guarding it after the fact.
-		// (`SThreeFifoStack` has the same degeneracy at 1.0; its own
+		// (`SThreeFifoCompactStack` has the same degeneracy at 1.0; its own
 		// parser is tightened to match.)
 		PaperPolicy::S3FifoFaithfulCompactHybrid(r)
 		| PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(r)
@@ -2039,7 +2039,7 @@ fn params_ok(policy: PaperPolicy) -> bool {
 fn s3_fifo_queue_budgets(policy: PaperPolicy) -> Option<(f64, bool)> {
 	match policy {
 		// These nine size main at `(1 - ratio) * max_size`, mirroring
-		// `SThreeFifoStack`, and gate eviction on its fullness.
+		// `SThreeFifoCompactStack`, and gate eviction on its fullness.
 		PaperPolicy::S3FifoCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostCompactHybrid(r)
 		| PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(r)
@@ -3313,8 +3313,8 @@ mod test_global_hashtable_pmem_alone {
         // Create cache with global hashtable in PMEM, values in DRAM
         let cache: PaperCache<u32, BufferDRAM, RandomState> = PaperCache::new(
             1000000,
-            &[PaperPolicy::Lfu],
-            PaperPolicy::Lfu,
+            &[PaperPolicy::LfuCompact],
+            PaperPolicy::LfuCompact,
         ).expect("Failed to create cache");
 
         // Test set operation
@@ -3338,8 +3338,8 @@ mod test_global_hashtable_pmem_alone {
     fn test_multiple_keys() {
         let cache: PaperCache<u32, BufferDRAM, RandomState> = PaperCache::new(
             10000000,
-            &[PaperPolicy::Lru],
-            PaperPolicy::Lru,
+            &[PaperPolicy::LruCompact],
+            PaperPolicy::LruCompact,
         ).expect("Failed to create cache");
 
         // Insert multiple key-value pairs
@@ -3360,8 +3360,8 @@ mod test_global_hashtable_pmem_alone {
     fn test_wipe() {
         let cache: PaperCache<String, BufferDRAM, RandomState> = PaperCache::new(
             1000000,
-            &[PaperPolicy::Lfu],
-            PaperPolicy::Lfu,
+            &[PaperPolicy::LfuCompact],
+            PaperPolicy::LfuCompact,
         ).expect("Failed to create cache");
 
         let key1 = "key1".to_string();
@@ -3386,21 +3386,21 @@ mod test_global_hashtable_pmem_alone {
 ///
 /// Gate on `all_dram` to get a DashMap-backed PaperCache<K, BufferDRAM> that is
 /// available without any PMEM hardware. The `eviction_stacks_pmem` feature is
-/// tested separately via its own test module in lfu_stack.rs.
+/// exercised by the compact stacks' own tests, built with it.
 #[cfg(all(test, feature = "all_dram"))]
 mod test_new_features {
     use crate::{BufferDRAM, PaperCache, PaperPolicy};
     use std::hash::RandomState;
 
     /// Verify that the cache initializes and operates correctly with the LFU policy.
-    /// The LfuStack used for eviction is backed by DRAM or PMEM depending on the
+    /// The `LfuCompactStack` used for eviction is backed by DRAM or PMEM depending on the
     /// `eviction_stacks_pmem` feature flag — both paths must initialize correctly.
     #[test]
     fn test_cache_init_with_lfu_eviction() {
         let cache: PaperCache<u32, BufferDRAM, RandomState> = PaperCache::new(
             1_000_000,
-            &[PaperPolicy::Lfu],
-            PaperPolicy::Lfu,
+            &[PaperPolicy::LfuCompact],
+            PaperPolicy::LfuCompact,
         ).expect("Cache with LFU policy must initialize successfully");
 
         let value: Vec<u8> = vec![10, 20, 30];
@@ -3419,8 +3419,8 @@ mod test_new_features {
     fn test_cache_init_with_multiple_policies() {
         let cache: PaperCache<u32, BufferDRAM, RandomState> = PaperCache::new(
             1_000_000,
-            &[PaperPolicy::Lfu, PaperPolicy::Lru],
-            PaperPolicy::Lfu,
+            &[PaperPolicy::LfuCompact, PaperPolicy::LruCompact],
+            PaperPolicy::LfuCompact,
         ).expect("Cache with multiple policies must initialize successfully");
 
         cache.set(42u32, b"hello", None).expect("set must succeed");
@@ -3569,14 +3569,14 @@ mod s_three_fifo_budget_tests {
 	#[test]
 	fn a_main_budget_that_truncates_to_zero_is_detected() {
 		// (1 - 1.0) * 1_000 == 0 -- the endpoint.
-		assert!(s_three_fifo_starves_main(PaperPolicy::SThreeFifo(1.0), 1_000));
+		assert!(s_three_fifo_starves_main(PaperPolicy::SThreeFifoCompact(1.0), 1_000));
 
 		// (1 - 0.9995) * 1_000 == 0.5, truncated to 0 -- inside the open
 		// range, and reachable only because `max_size` is small.
-		assert!(s_three_fifo_starves_main(PaperPolicy::SThreeFifo(0.9995), 1_000));
+		assert!(s_three_fifo_starves_main(PaperPolicy::SThreeFifoCompact(0.9995), 1_000));
 
 		// The same ratio is fine once main gets a byte: 500 here.
-		assert!(!s_three_fifo_starves_main(PaperPolicy::SThreeFifo(0.9995), 1_000_000));
+		assert!(!s_three_fifo_starves_main(PaperPolicy::SThreeFifoCompact(0.9995), 1_000_000));
 	}
 
 	/// A zero-length ONE-ACCESS queue is legal and must not be caught here:
@@ -3584,8 +3584,8 @@ mod s_three_fifo_budget_tests {
 	/// main then holds the entire budget.
 	#[test]
 	fn a_zero_length_one_access_queue_is_not_flagged() {
-		assert!(!s_three_fifo_starves_main(PaperPolicy::SThreeFifo(0.0), 1_000));
-		assert!(!s_three_fifo_starves_main(PaperPolicy::SThreeFifo(0.0005), 1_000));
+		assert!(!s_three_fifo_starves_main(PaperPolicy::SThreeFifoCompact(0.0), 1_000));
+		assert!(!s_three_fifo_starves_main(PaperPolicy::SThreeFifoCompact(0.0005), 1_000));
 	}
 
 	/// Only the s3-fifo design derives a budget from `1 - ratio`. 2Q sizes
@@ -3594,8 +3594,8 @@ mod s_three_fifo_budget_tests {
 	/// must not be rejected.
 	#[test]
 	fn other_policies_are_never_flagged() {
-		assert!(!s_three_fifo_starves_main(PaperPolicy::TwoQ(1.0, 0.0), 1_000));
-		assert!(!s_three_fifo_starves_main(PaperPolicy::Lru, 1_000));
-		assert!(!s_three_fifo_starves_main(PaperPolicy::Lfu, 1_000));
+		assert!(!s_three_fifo_starves_main(PaperPolicy::TwoQCompact(1.0, 0.0), 1_000));
+		assert!(!s_three_fifo_starves_main(PaperPolicy::LruCompact, 1_000));
+		assert!(!s_three_fifo_starves_main(PaperPolicy::LfuCompact, 1_000));
 	}
 }

@@ -1109,7 +1109,7 @@ fn a_flat_cache_with_fast_values_is_counted_apart_from_the_tiered_ones() {
 
     assert_eq!((phys::live_tiered_caches(), phys::live_flat_fast_caches()), (0, 0));
 
-    let flat = PaperCache::<u64, BufferDRAM>::new(1 << 20, &[PaperPolicy::Lru], PaperPolicy::Lru)
+    let flat = PaperCache::<u64, BufferDRAM>::new(1 << 20, &[PaperPolicy::LruCompact], PaperPolicy::LruCompact)
         .expect("a flat cache with fast values");
     assert_eq!(phys::live_flat_fast_caches(), 1, "counted on construction");
     assert_eq!(phys::live_tiered_caches(), 0, "a flat cache is not a tiered one");
@@ -1117,7 +1117,7 @@ fn a_flat_cache_with_fast_values_is_counted_apart_from_the_tiered_ones() {
     flat.set(1, &[7u8; 1_000], None).expect("set");
     assert_eq!(phys::fast_bytes_signed() - p0, one_value, "its value is in P");
 
-    let pmem = PaperCache::<u64, BufferPMEM>::new(1 << 20, &[PaperPolicy::Lru], PaperPolicy::Lru)
+    let pmem = PaperCache::<u64, BufferPMEM>::new(1 << 20, &[PaperPolicy::LruCompact], PaperPolicy::LruCompact)
         .expect("a flat cache with slow values");
     pmem.set(2, &[9u8; 1_000], None).expect("set");
     assert_eq!(phys::live_flat_fast_caches(), 1, "a flat cache with SLOW values is not counted");

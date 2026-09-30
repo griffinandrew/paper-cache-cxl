@@ -8,25 +8,9 @@
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod lfu_compact_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
-mod lfu_stack;
-#[cfg(any(test, not(feature = "merged_object_store")))]
-mod fifo_stack;
-#[cfg(any(test, not(feature = "merged_object_store")))]
-mod clock_stack;
-#[cfg(any(test, not(feature = "merged_object_store")))]
-mod sieve_stack;
-#[cfg(any(test, not(feature = "merged_object_store")))]
 mod lru_compact_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
-mod lru_stack;
-#[cfg(any(test, not(feature = "merged_object_store")))]
-mod mru_stack;
-#[cfg(any(test, not(feature = "merged_object_store")))]
-mod two_q_stack;
-#[cfg(any(test, not(feature = "merged_object_store")))]
 mod arc_stack;
-#[cfg(any(test, not(feature = "merged_object_store")))]
-mod s_three_fifo_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 pub(crate) mod ghost_filter;
 
@@ -56,6 +40,8 @@ pub(crate) mod arena_frequency_chain;
 pub(crate) mod compact_frequency_chain;
 #[cfg(test)]
 mod measure_overhead;
+#[cfg(test)]
+mod golden;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod lru_lfu_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
@@ -114,8 +100,6 @@ mod mru_compact_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_compact_hybrid_stack;
 
-#[cfg(feature = "eviction_stacks_pmem")] mod pmem_collections;
-
 use crate::{
 	CacheSize,
 	HashedKey,
@@ -139,16 +123,8 @@ use crate::{
 		s3_fifo_faithful_compact_hybrid_stack::S3FifoFaithfulFastAdmissionCompactHybridStack,
 		s3_fifo_faithful_compact_hybrid_stack::S3FifoFaithfulReprieveCompactHybridStack,
 		s3_fifo_faithful_compact_hybrid_stack::S3FifoFaithfulFastAdmissionReprieveCompactHybridStack,
-		lfu_stack::LfuStack,
-		fifo_stack::FifoStack,
-		clock_stack::ClockStack,
-		sieve_stack::SieveStack,
 		lru_compact_stack::LruCompactStack,
-		lru_stack::LruStack,
-		mru_stack::MruStack,
-		two_q_stack::TwoQStack,
 		arc_stack::ArcStack,
-		s_three_fifo_stack::SThreeFifoStack,
 		lru_lfu_compact_hybrid_stack::LruLfuCompactHybridStack,
 		lru_compact_hybrid_stack::LruCompactHybridStack,
 		lfu_compact_hybrid_stack::LfuCompactHybridStack,
@@ -837,17 +813,9 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		PaperPolicy::ClockCompact => Box::new(ClockCompactStack::default()),
 		PaperPolicy::SieveCompact => Box::new(SieveCompactStack::default()),
 		PaperPolicy::MruCompact => Box::new(MruCompactStack::default()),
-		PaperPolicy::Lfu => Box::new(LfuStack::default()),
-		PaperPolicy::Fifo => Box::new(FifoStack::default()),
-		PaperPolicy::Clock => Box::new(ClockStack::default()),
-		PaperPolicy::Sieve => Box::new(SieveStack::default()),
 		PaperPolicy::LruCompact => Box::new(LruCompactStack::default()),
-		PaperPolicy::Lru => Box::new(LruStack::default()),
-		PaperPolicy::Mru => Box::new(MruStack::default()),
-		PaperPolicy::TwoQ(k_in, k_out) => Box::new(TwoQStack::new(k_in, k_out, max_size)),
 		PaperPolicy::TwoQCompact(k_in, k_out) => Box::new(TwoQCompactStack::new(k_in, k_out, max_size)),
 		PaperPolicy::Arc => Box::new(ArcStack::new(max_size)),
-		PaperPolicy::SThreeFifo(ratio) => Box::new(SThreeFifoStack::new(ratio, max_size)),
 		PaperPolicy::SThreeFifoCompact(ratio) => Box::new(SThreeFifoCompactStack::new(ratio, max_size)),
 
 		// Default fast-tier budget is 20% of the overall cache size, matching
@@ -926,10 +894,10 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		),
 
 		// The full three-queue 2Q -- the only design here whose queue
-		// algorithm matches `PaperPolicy::TwoQ`'s (the other 2Q hybrids are
-		// Simplified 2Q). Two parameters, not one: `k_out` sizes the live
+		// algorithm matches `PaperPolicy::TwoQCompact`'s (the other 2Q hybrids
+		// are Simplified 2Q). Two parameters, not one: `k_out` sizes the live
 		// `a1_out` overflow queue and is a real, read parameter here, unlike
-		// in `TwoQStack`. Same default fast-tier budget and the same
+		// in `TwoQCompactStack`. Same default fast-tier budget and the same
 		// k_in-vs-fast-tier caveat as `TwoQFastAdmissionReprieveCompactHybrid`
 		// above -- more acutely so, since `a1_in`'s reservation is carved out of the same
 		// DRAM budget `am`'s fast segment draws on.
@@ -1255,7 +1223,7 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 40;
+	const POLICY_VARIANT_COUNT: usize = 32;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the
 	/// tiered designs this crate exists to compare.
@@ -1279,16 +1247,8 @@ mod init_policy_stack_tests {
 		(PaperPolicy::SieveCompact, PaperPolicy::SieveCompact),
 		(PaperPolicy::MruCompact, PaperPolicy::MruCompact),
 		(PaperPolicy::TwoQCompact(0.25, 0.5), PaperPolicy::TwoQCompact(0.25, 0.5)),
-		(PaperPolicy::Lfu, PaperPolicy::Lfu),
-		(PaperPolicy::Fifo, PaperPolicy::Fifo),
-		(PaperPolicy::Clock, PaperPolicy::Clock),
-		(PaperPolicy::Sieve, PaperPolicy::Sieve),
 		(PaperPolicy::LruCompact, PaperPolicy::LruCompact),
-		(PaperPolicy::Lru, PaperPolicy::Lru),
-		(PaperPolicy::Mru, PaperPolicy::Mru),
-		(PaperPolicy::TwoQ(0.25, 0.25), PaperPolicy::TwoQ(0.5, 0.4)),
 		(PaperPolicy::Arc, PaperPolicy::Arc),
-		(PaperPolicy::SThreeFifo(0.1), PaperPolicy::SThreeFifo(0.9)),
 		(PaperPolicy::SThreeFifoCompact(0.1), PaperPolicy::SThreeFifoCompact(0.9)),
 		(PaperPolicy::S3FifoFaithfulCompactHybrid(0.1), PaperPolicy::S3FifoFaithfulCompactHybrid(0.9)),
 		(PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.1), PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.9)),
@@ -1329,16 +1289,8 @@ mod init_policy_stack_tests {
 			PaperPolicy::SieveCompact => "SieveCompact",
 			PaperPolicy::MruCompact => "MruCompact",
 			PaperPolicy::TwoQCompact(..) => "TwoQCompact",
-			PaperPolicy::Lfu => "Lfu",
-			PaperPolicy::Fifo => "Fifo",
-			PaperPolicy::Clock => "Clock",
-			PaperPolicy::Sieve => "Sieve",
 			PaperPolicy::LruCompact => "LruCompact",
-			PaperPolicy::Lru => "Lru",
-			PaperPolicy::Mru => "Mru",
-			PaperPolicy::TwoQ(..) => "TwoQ",
 			PaperPolicy::Arc => "Arc",
-			PaperPolicy::SThreeFifo(_) => "SThreeFifo",
 			PaperPolicy::SThreeFifoCompact(_) => "SThreeFifoCompact",
 			PaperPolicy::S3FifoFaithfulCompactHybrid(_) => "S3FifoFaithfulCompactHybrid",
 			PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(_) => "S3FifoFaithfulFastAdmissionCompactHybrid",
@@ -1419,7 +1371,7 @@ mod init_policy_stack_tests {
 	fn is_policy_discriminates_on_the_payload_of_a_parameterised_policy() {
 		// A parameterised policy names both a design AND its tuning, so a
 		// stack built for one payload must not answer to another.
-		// `TwoQStack::is_policy` is the clearest statement of the rule --
+		// `TwoQCompactStack::is_policy` is the clearest statement of the rule --
 		// `self.k_in == *k_in && self.k_out == *k_out`.
 		//
 		// `LruLfuCompactHybrid` is the exception in the crate: it matches its
@@ -1836,7 +1788,7 @@ mod structure_bytes_tests {
 	/// A flat stack does not meter itself: only a tiered cache publishes M.
 	#[test]
 	fn a_flat_stack_meters_nothing() {
-		for policy in [PaperPolicy::Lru, PaperPolicy::LfuCompact, PaperPolicy::SThreeFifo(0.1)] {
+		for policy in [PaperPolicy::LruCompact, PaperPolicy::LfuCompact, PaperPolicy::SThreeFifoCompact(0.1)] {
 			assert_eq!(init_policy_stack(policy, MAX_SIZE).structure_bytes(), None, "{policy}");
 		}
 	}

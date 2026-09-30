@@ -1255,8 +1255,8 @@ mod tests {
 	fn it_clears_atomic_status() {
 		let status = AtomicStatus::new(
 			1000,
-			&[PaperPolicy::Lfu],
-			PaperPolicy::Lfu,
+			&[PaperPolicy::LfuCompact],
+			PaperPolicy::LfuCompact,
 		).expect("Could not initialize atomic status");
 
 		status.update_base_used_size(1);
@@ -1291,7 +1291,7 @@ mod tests {
 	/// readers see 2^64 less a little).
 	#[test]
 	fn a_clear_takes_off_what_the_map_removed_and_a_racing_insert_ends_exact() {
-		let policy = PaperPolicy::Lfu;
+		let policy = PaperPolicy::LfuCompact;
 		let status = AtomicStatus::new(1_000_000, &[policy], policy).expect("a status");
 		let overhead = get_policy_overhead(&policy) as CacheSize;
 
@@ -1334,8 +1334,8 @@ mod tests {
 	fn it_clears_hybrid_counters() {
 		let status = AtomicStatus::new(
 			1000,
-			&[PaperPolicy::Lfu],
-			PaperPolicy::Lfu,
+			&[PaperPolicy::LfuCompact],
+			PaperPolicy::LfuCompact,
 		).expect("Could not initialize atomic status");
 
 		status.record_hybrid_promotion();

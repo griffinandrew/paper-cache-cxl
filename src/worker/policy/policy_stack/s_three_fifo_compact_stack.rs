@@ -1,5 +1,10 @@
 //! `SThreeFifoCompactStack` — `SThreeFifoStack`'s policy over the slab design.
 //!
+//! The `HashList`-based `SThreeFifoStack` this re-lays-out was removed in R2 with the other
+//! original flat stacks, so the mentions of it below are historical. Its eviction
+//! orders for the op sequences in `fidelity_tests` are recorded in `golden.rs` and
+//! asserted there.
+//!
 //! Faithful S3-FIFO: a byte-budgeted `small` FIFO, a byte-budgeted `main`
 //! FIFO, and a ghost queue of bare keys. A miss whose key is in the ghost
 //! queue is admitted straight to `main`; everything else lands in `small`.
@@ -290,202 +295,65 @@ impl PolicyStack for SThreeFifoCompactStack {
 	}
 }
 
-/// Fidelity against `SThreeFifoStack`, whose policy this re-lays-out.
+/// Fidelity to `SThreeFifoStack`, whose policy this re-lays-out and which was
+/// removed in R2: the eviction order it gave for the op sequences below is
+/// recorded in `golden` and asserted here.
 #[cfg(test)]
 mod fidelity_tests {
 	use super::*;
-	use super::super::s_three_fifo_stack::SThreeFifoStack;
+	use super::super::golden;
 
 	const MAX: CacheSize = 100_000;
 	const RATIO: f64 = 0.1;
-
-	fn drain(s: &mut dyn PolicyStack) -> Vec<HashedKey> {
-		let mut out = Vec::new();
-
-		while let Some(k) = s.evict_one() {
-			out.push(k);
-		}
-
-		out
-	}
 
 	/// Sizes are varied so both byte budgets actually bind, and the key
 	/// distribution is skewed so keys accumulate frequency and exercise the
 	/// small-to-main promotion and the `main` clock sweep rather than only the
 	/// ghost path.
 	#[test]
-	fn evicts_in_the_same_order_as_s_three_fifo_stack() {
-		let mut a = SThreeFifoStack::new(RATIO, MAX);
-		let mut b = SThreeFifoCompactStack::new(RATIO, MAX);
-		let mut x: u64 = 0x243F_6A88_85A3_08D3;
-
-		for i in 0..40_000u64 {
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-
-			let u = (x >> 11) as f64 / (1u64 << 53) as f64;
-			let key = ((u * u * 400.0) as u64) + 1;
-			let size = (1_024 + (x % 3_072)) as ObjectSize;
-
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-
-			if i % 4 == 3 && sa.contains(key) {
-				sa.update(key);
-				sb.update(key);
-			} else {
-				sa.insert(key, size);
-				sb.insert(key, size);
-			}
-
-			assert_eq!(sa.len(), sb.len(), "len diverged at op {i} key {key}");
-			assert_eq!(sa.contains(key), sb.contains(key), "contains diverged at op {i}");
-		}
-
+	fn evicts_in_the_recorded_order() {
 		assert_eq!(
-			drain(&mut a),
-			drain(&mut b),
-			"eviction order diverged from SThreeFifoStack",
+			golden::budgeted_skewed(&mut SThreeFifoCompactStack::new(RATIO, MAX)),
+			golden::S3_SKEWED,
 		);
 	}
 
 	/// Interleaves evictions with inserts so the ghost queue fills, keys get
 	/// re-admitted through it into `main`, and the ghost trim in `evict_main`
-	/// runs — the paths a drain-at-the-end test never reaches.
+	/// runs -- the paths a drain-at-the-end test never reaches.
 	#[test]
-	fn ghost_readmission_matches_s_three_fifo_stack() {
-		let mut a = SThreeFifoStack::new(RATIO, MAX);
-		let mut b = SThreeFifoCompactStack::new(RATIO, MAX);
-		let mut x: u64 = 0x1357_9BDF_2468_ACE0;
-
-		for i in 0..40_000u64 {
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-
-			let key = (x % 600) + 1;
-			let size = (512 + (x % 2_048)) as ObjectSize;
-
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-
-			sa.insert(key, size);
-			sb.insert(key, size);
-
-			if i % 3 == 0 {
-				assert_eq!(
-					sa.evict_one(),
-					sb.evict_one(),
-					"eviction diverged at op {i}",
-				);
-			}
-
-			assert_eq!(sa.len(), sb.len(), "len diverged at op {i} key {key}");
-		}
-
-		assert_eq!(drain(&mut a), drain(&mut b), "final drain diverged");
+	fn ghost_readmission_keeps_the_recorded_order() {
+		assert_eq!(
+			golden::ghost_readmission(&mut SThreeFifoCompactStack::new(RATIO, MAX)),
+			golden::S3_GHOST_READMISSION,
+		);
 	}
 
 	#[test]
-	fn removal_matches_s_three_fifo_stack() {
-		let mut a = SThreeFifoStack::new(RATIO, MAX);
-		let mut b = SThreeFifoCompactStack::new(RATIO, MAX);
-
-		for key in 0..3_000u64 {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-
-			sa.insert(key, 1_024);
-			sb.insert(key, 1_024);
-
-			if key % 3 == 0 {
-				sa.update(key);
-				sb.update(key);
-			}
-		}
-
-		for key in (0..3_000u64).step_by(7) {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-
-			sa.remove(key);
-			sb.remove(key);
-		}
-
-		assert_eq!(drain(&mut a), drain(&mut b), "eviction order after removals diverged");
+	fn removal_leaves_the_recorded_order() {
+		assert_eq!(
+			golden::removal(&mut SThreeFifoCompactStack::new(RATIO, MAX), 3_000, 1_024, true, 7),
+			golden::S3_REMOVAL,
+		);
 	}
 
 	/// `resize` re-derives both budgets, which moves the `main`-is-full test
 	/// that decides whether `evict_one` drains `small` at all.
 	#[test]
-	fn resize_matches_s_three_fifo_stack() {
-		let mut a = SThreeFifoStack::new(RATIO, MAX);
-		let mut b = SThreeFifoCompactStack::new(RATIO, MAX);
-
-		for key in 0..1_500u64 {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-
-			sa.insert(key, 2_048);
-			sb.insert(key, 2_048);
-		}
-
-		{
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-
-			sa.resize(MAX * 4);
-			sb.resize(MAX * 4);
-		}
-
-		for key in 1_500..2_500u64 {
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-
-			sa.insert(key, 2_048);
-			sb.insert(key, 2_048);
-		}
-
-		assert_eq!(drain(&mut a), drain(&mut b), "eviction order after resize diverged");
+	fn resize_keeps_the_recorded_order() {
+		assert_eq!(
+			golden::resize(&mut SThreeFifoCompactStack::new(RATIO, MAX), MAX),
+			golden::S3_RESIZE,
+		);
 	}
 
 	/// `record_access` is the only place the ghost queue is observable from
-	/// outside, so it gets its own check.
+	/// outside, so it gets its own sequence.
 	#[test]
-	fn ghost_hits_are_reported_like_s_three_fifo_stack() {
-		let mut a = SThreeFifoStack::new(RATIO, MAX);
-		let mut b = SThreeFifoCompactStack::new(RATIO, MAX);
-		let mut x: u64 = 0x0BAD_C0DE_DEAD_BEEF;
-
-		for i in 0..20_000u64 {
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-
-			let key = (x % 400) + 1;
-			let size = (512 + (x % 1_024)) as ObjectSize;
-
-			let sa: &mut dyn PolicyStack = &mut a;
-			let sb: &mut dyn PolicyStack = &mut b;
-
-			let hit = sa.contains(key);
-			assert_eq!(hit, sb.contains(key), "contains diverged at op {i}");
-
-			assert_eq!(
-				sa.record_access(key, hit),
-				sb.record_access(key, hit),
-				"record_access diverged at op {i} key {key}",
-			);
-
-			if !hit {
-				sa.insert(key, size);
-				sb.insert(key, size);
-			}
-
-			if i % 3 == 0 {
-				assert_eq!(sa.evict_one(), sb.evict_one(), "eviction diverged at op {i}");
-			}
-		}
+	fn ghost_hits_keep_the_recorded_order() {
+		assert_eq!(
+			golden::ghost_hits(&mut SThreeFifoCompactStack::new(RATIO, MAX)),
+			golden::S3_GHOST_HITS,
+		);
 	}
 }

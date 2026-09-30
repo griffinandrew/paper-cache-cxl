@@ -47,8 +47,8 @@ The implementation provides explicit feature flags to control:
 
 ### `eviction_stacks_pmem`
 - **Purpose**: Allocate eviction policy tracking structures in PMEM using feature-selected PMEM allocators
-- **When enabled**: `LfuStack` (`index_map`, `count_stacks`) and `LruStack` (`stack`) internal data structures are PMEM-backed
-- **When disabled**: Standard DRAM-backed `std::collections::HashMap` and `kwik::collections::HashList` are used (default)
+- **When enabled**: the compact flat stacks' slabs and indexes (and the hybrid stacks' arenas) are PMEM-backed
+- **When disabled**: ordinary DRAM allocation is used (default)
 - **Use case**: Ensures eviction metadata is co-located with PMEM-stored objects for lower cross-tier access overhead
 - **Requirements**: Uses `Hybrid` (`numa_alloc::SlowObjects`, node-1-bound jemalloc arenas)
 
@@ -373,7 +373,7 @@ The code uses `#[cfg(...)]` attributes extensively to:
 2. **`key_value_pmem`**: Persistent data, volatile metadata
 3. **`global_hashtable_pmem`**: Test hashtable in PMEM independently
 4. **`hashbrown_dram`**: Use hashbrown HashMap in DRAM for direct performance comparison with `global_hashtable_pmem`
-5. **`eviction_stacks_pmem`**: LFU eviction stacks allocated in PMEM for co-location with PMEM objects
+5. **`eviction_stacks_pmem`**: eviction stacks allocated in PMEM for co-location with PMEM objects
 
 ## Code Locations
 
@@ -381,8 +381,7 @@ The code uses `#[cfg(...)]` attributes extensively to:
 - **Allocator**: `src/allocator.rs`
 - **Global hashtable**: `src/lib.rs`
 - **Worker manager integration**: `src/worker/manager.rs`
-- **PMEM eviction collections**: `src/worker/policy/policy_stack/pmem_collections.rs`
-- **LFU policy stack**: `src/worker/policy/policy_stack/lfu_stack.rs`
+- **Flat policy stacks**: `src/worker/policy/policy_stack/*_compact_stack.rs`, over `compact_queue_set.rs`
 - **Every hybrid design, shared machinery**: the one `PaperCache<K, TieredBuffer, S>` impl block
   in `src/lib.rs`; `src/hybrid_policy.rs` (`admission_tier`, the runtime placement rule);
   `src/hybrid_stats.rs` (`HybridStats`, the single stats snapshot every design reports through);
