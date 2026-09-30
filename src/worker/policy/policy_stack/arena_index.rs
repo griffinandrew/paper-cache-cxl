@@ -9,7 +9,7 @@
 //! index that finds it.
 //!
 //! This is the whole of what the arena conversion takes off `CompactQueueSet`
-//! and `CompactFrequencyChain`. Both were 72 B/object, and in both the key was
+//! and `CompactFrequencyChain`. Both were 72 B/object (40 with this), and in both the key was
 //! stored TWICE: once in the slab slot, so an eviction can name the victim it
 //! just unlinked, and once in a hashbrown index, so a probe can compare. Here
 //! the bucket array holds bare `u32` slot numbers and nothing else, and a probe

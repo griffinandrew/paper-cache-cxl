@@ -41,7 +41,8 @@
 //!
 //! **The baseline named above no longer exists in this crate.** Every
 //! non-compact hybrid stack was removed once its compact twin was shown
-//! behaviourally identical at 72 B/object of eviction stack instead of 112.
+//! behaviourally identical and cheaper: 72 B/object of eviction stack instead of
+//! 112 then, and 40 since the arena conversion (`ARENA_STACK_DRAM_OVERHEAD`).
 //! References to it here are historical: they say what this design is a
 //! compaction OF, and they are the reason the structure looks the way it
 //! does. Git history holds the baseline and the differential tests that

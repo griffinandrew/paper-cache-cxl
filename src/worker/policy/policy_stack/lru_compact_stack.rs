@@ -23,7 +23,7 @@
 //! The `HashList`-tiered cell is empty because `LruHybridStack` has been
 //! removed from the crate: it was behaviourally identical to
 //! `LruCompactHybridStack` and cost 112 B/object of eviction stack against
-//! its 72. The layout comparison it anchored lives in git history.
+//! its 72 then (40 since the arena conversion). The layout comparison it anchored lives in git history.
 //!
 //! Deliberately carries NO payload. `LruStack` ignores the size argument
 //! entirely (`fn insert(&mut self, key, _: ObjectSize)`) because a non-tiered

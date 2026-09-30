@@ -25,6 +25,9 @@
 //!   LruCompactHybridStack        72 B   key -> slot -> links + payload
 //! ```
 //!
+//! (As measured then; the stack has been 40 B/object since the arena
+//! conversion -- `ARENA_STACK_DRAM_OVERHEAD`.)
+//!
 //! Most of that 72 is two more copies of the key -- one in the stack's slab,
 //! one in its index -- present only to answer "where in the recency order is
 //! this key, and which tier is it in?". Merging answers both for free: finding
@@ -6433,7 +6436,8 @@ mod measure {
 	/// something -- the value buffer and its `Arc` are identical on both sides
 	/// and cancel, leaving only the structural difference. The split design's
 	/// third piece, the eviction stack, is not in this control: it is the
-	/// separately measured 72 B/object of `LruCompactHybridStack`, which has to
+	/// separately measured cost of `LruCompactHybridStack` (72 B/object then, 40
+	/// since the arena conversion), which has to
 	/// be added back to get the split design's true total.
 	#[test]
 	#[ignore]

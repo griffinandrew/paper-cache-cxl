@@ -48,8 +48,8 @@
 //!
 //! Splitting the slow tier costs nothing in the slab: a key still occupies one
 //! slot and one index bucket whichever of the four orders it is threaded into,
-//! so the per-object figure is the same 72 bytes every other converted queue
-//! stack measures. Moving between segments is an unlink plus a relink -- a
+//! so the per-object figure is the same 40 bytes every other arena queue
+//! stack costs (`ARENA_STACK_DRAM_OVERHEAD`). Moving between segments is an unlink plus a relink -- a
 //! handful of `u32` writes -- where the baseline pays a hash-indexed remove
 //! from one `HashList` and an insert into another.
 //!
@@ -88,7 +88,8 @@
 //!
 //! **The baseline named above no longer exists in this crate.** Every
 //! non-compact hybrid stack was removed once its compact twin was shown
-//! behaviourally identical at 72 B/object of eviction stack instead of 112.
+//! behaviourally identical and cheaper: 72 B/object of eviction stack instead of
+//! 112 then, and 40 since the arena conversion (`ARENA_STACK_DRAM_OVERHEAD`).
 //! References to it here are historical: they say what this design is a
 //! compaction OF, and they are the reason the structure looks the way it
 //! does. Git history holds the baseline and the differential tests that

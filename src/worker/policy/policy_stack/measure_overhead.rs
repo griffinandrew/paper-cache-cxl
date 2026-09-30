@@ -1,6 +1,6 @@
 //! Measured per-object DRAM cost of each eviction stack.
 //!
-//! Every `*_EVICTION_STACK_DRAM_OVERHEAD` constant in `object::overhead` was
+//! `ARENA_STACK_DRAM_OVERHEAD`, and the flat stacks' terms, in `object::overhead` were
 //! derived on paper -- struct fields added up by hand, with a guess for the
 //! index map's load factor. This measures them instead.
 //!
@@ -26,8 +26,8 @@
 //! The delta is taken immediately around the insert loop in a single-threaded
 //! test process with nothing else allocating between the two reads, so it is
 //! not contaminated by the rest of the binary. The evidence is in the output:
-//! marginal cost converges to exact integers (72.0000, 112.0007, 168.0000)
-//! across four independent processes each, which a contaminated delta cannot do.
+//! marginal cost converges to exact integers (72.0000, 112.0007 and 168.0000 for
+//! the layouts it was first run on) across four independent processes each, which a contaminated delta cannot do.
 //!
 //! Ignored by default: allocates gigabytes and takes ~30 s.
 //! Run with `cargo test --features <policies> -- --ignored --nocapture measure_`.
@@ -125,7 +125,7 @@ fn measure_one_point() {
 /// One measurement of the WHOLE cache, one process.
 ///
 /// `measure_one_point` above measures a bare eviction stack, which is what
-/// `*_EVICTION_STACK_DRAM_OVERHEAD` needs. `get_policy_overhead` is a
+/// `ARENA_STACK_DRAM_OVERHEAD` needs. `get_policy_overhead` is a
 /// different quantity: it is added to `Object::base_size` to give the bytes a
 /// cached object is CHARGED against `max_size`, so it must account for
 /// everything the cache allocates per object beyond the object's own bytes --

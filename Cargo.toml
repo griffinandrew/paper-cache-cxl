@@ -104,8 +104,8 @@ all_dram = ["numa_jemalloc"]
 #   DashMap alone                 179.1 B/object
 #   MergedStore, sharded+tiered   251.8 B/object   (+72.7)
 #
-# The merge REMOVES an eviction stack measured at 72 B/object
-# (LruCompactHybridStack) or 56 (LruCompactStack) and ADDS 72.7. Against the
+# The merge REMOVES an eviction stack measured at 72 B/object (40 since the
+# arena conversion) (LruCompactHybridStack) or 56 (LruCompactStack) and ADDS 72.7. Against the
 # tiered split design that is a wash; against the flat one it is a loss.
 #
 # An earlier note here claimed 144 B of overhead against 216, a 33% reduction.
@@ -142,8 +142,8 @@ eviction_stacks_pmem = ["numa_jemalloc"]
 # are not statements about build configuration.
 #
 # Every design here is a COMPACT one: its eviction stack is a single
-# slab-backed structure costing 72 B/object rather than the 112 B/object the
-# older multi-map stacks cost. Each compact design once had a non-compact twin,
+# slab-backed structure costing 40 B/object (72 before the arena conversion)
+# rather than the 112 B/object the older multi-map stacks cost. Each compact design once had a non-compact twin,
 # proven behaviourally identical to it by an in-tree differential test; those
 # twins, their stacks and their tests have been removed, so a design name and
 # its `*_compact_*` feature are now the same thing.
