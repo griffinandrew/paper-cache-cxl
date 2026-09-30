@@ -7,14 +7,14 @@
 
 //! Where each hybrid design's admission rule lives.
 //!
-//! All 24 `TieredBuffer`-based designs share the two
+//! All 23 `TieredBuffer`-based designs share the two
 //! `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks in `lib.rs`, gated only
 //! on `hybrid_cache_common`. The one thing that still genuinely differs
 //! between them on the `set()` path is which tier a value is built in, so
 //! that is all this module holds: [`admission_tier`], a runtime `match` over
 //! the cache's [`PaperPolicy`] with one arm per design.
 //!
-//! Dispatch is *runtime*, not compile-time. Every hybrid build compiles all 24
+//! Dispatch is *runtime*, not compile-time. Every hybrid build compiles all 23
 //! designs; the policy is chosen when the cache is constructed and stored in
 //! `AtomicStatus`, so two caches in one process can run different designs.
 //! An earlier revision dispatched through a `HybridPolicy` trait with one
@@ -98,7 +98,7 @@ pub fn admission_tier<K>(
 				None => crate::Tier::Fast,
 			}
 		},
-		PaperPolicy::LruCompactHybrid | PaperPolicy::LruLazyCopyCompactHybrid | PaperPolicy::LruSizedCompactHybrid | PaperPolicy::TwoQFastAdmissionCompactHybrid(..) | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(..) | PaperPolicy::TwoQFullFastAdmissionCompactHybrid(..) => {
+		PaperPolicy::LruCompactHybrid | PaperPolicy::LruSizedCompactHybrid | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(..) | PaperPolicy::TwoQFullFastAdmissionCompactHybrid(..) => {
 			// Unconditionally Fast, and correct for every case: a brand-new
 			// key lands in `a1_in`, which is structurally Fast; a re-set of an
 			// `a1_out` key falls through to `promote_from_a1_out`, which makes

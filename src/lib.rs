@@ -1989,7 +1989,6 @@ fn params_ok(policy: PaperPolicy) -> bool {
 		// queue the whole cache -- extreme, but every queue still has
 		// capacity and eviction drains the FIFO tail unconditionally.
 		PaperPolicy::TwoQCompactHybrid(r)
-		| PaperPolicy::TwoQFastAdmissionCompactHybrid(r)
 		| PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(r)
 		| PaperPolicy::TwoQGhostCompactHybrid(r) => (0.0..=1.0).contains(&r),
 

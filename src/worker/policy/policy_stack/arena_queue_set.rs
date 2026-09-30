@@ -222,9 +222,9 @@ pub struct NodePayload {
 
 	/// Where the bytes PHYSICALLY are, when that can differ from `tier`.
 	///
-	/// Only the lazy-copy design uses it: it promotes logically and defers the
-	/// byte copy, so for a window the two disagree. Everyone else leaves it
-	/// equal to `tier` and never reads it.
+	/// No stack reads it now. Its one reader was the lazy-copy LRU, removed
+	/// in R2: it promoted logically and deferred the byte copy, so for a
+	/// window the two disagreed. Every stack keeps it equal to `tier`.
 	pub phys: Option<Tier>,
 
 	/// The part of `size` that stays in DRAM whichever tier the object is in.

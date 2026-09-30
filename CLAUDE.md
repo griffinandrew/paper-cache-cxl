@@ -26,7 +26,7 @@ src/
                                per storage combination behind #[cfg(feature = ...)] impl blocks.
                                Grepping `impl<K, S> PaperCache<K, TieredBuffer` finds exactly
                                TWO blocks, both gated only on hybrid_cache_common and shared by
-                               all 18 designs: the engine (new(max_size, fast_tier_size,
+                               all 23 designs: the engine (new(max_size, fast_tier_size,
                                policy), with_hasher, the cache operations, hybrid_stats()) and
                                a second holding the size-split design's new_sized/
                                with_hasher_sized. Carries exactly one compile_error!, rejecting
@@ -128,9 +128,8 @@ src/
                                on its first slow hit) or
                                AdmitOver. GateMode::Block is the default -- Off in the lib's own
                                unit tests, whose P is shared -- and the gate disables itself
-                               (GateState) unless its cache is P's only user, for the lazy-copy
-                               LRU and the faithful fast-admission pair, and for bands that
-                               cannot hold. Its tests: worker/policy/s5_gate_tests.rs, each
+                               (GateState) unless its cache is P's only user, for the faithful
+                               fast-admission pair, and for bands that cannot hold. Its tests: worker/policy/s5_gate_tests.rs, each
                                alone in a child process killed at a deadline (test_hooks pause
                                or pace the consumers, hold the worker, hold M).
   numa_alloc.rs               Node-bound jemalloc arenas. NumaAlloc<NODE_FAST> is the crate's
@@ -200,7 +199,7 @@ src/
                                  and since B2 the worker polls SHORT, never parking long,
                                  while a set waits in either of the gate's lanes.
       policy_stack/             One file per policy, all implementing the PolicyStack trait.
-                                 The 18 *_hybrid_stack.rs files carry each design's algorithm
+                                 The 20 *_hybrid_stack.rs files carry each design's algorithm
                                  and its full derivation in the module doc — those are the
                                  authoritative description of what each design does.
                                  `drain_target` (in mod.rs) holds the single fast-tier
@@ -208,9 +207,8 @@ src/
                                  budget, overridable via FAST_TIER_DRAIN_TARGET. One
                                  threshold, not a high/low band. `PolicyStack::placement_of`
                                  is where a stack's bytes converge (its physical intent):
-                                 tier_of for every design but the lazy-copy LRU
-                                 (physical_tier_of), the slot's tier in the merged store,
-                                 None for flat stacks -- the table is on the trait.
+                                 tier_of for every design, the slot's tier in the merged
+                                 store, None for flat stacks -- the table is on the trait.
                                  The hybrid stacks' nodes live in `arena_index::ChunkedSlab`,
                                  the merged store's chunked slab made generic: 128 KiB
                                  chunks (4096 of the 32-byte node), grown by appending one,
@@ -274,14 +272,14 @@ placement strategies. Current state:
 - `all_dram` — force every allocation to DRAM.
 - `eviction_stacks_pmem` — move the eviction stacks' own bookkeeping into PMEM.
 - `global_hashtable_pmem`, `hashbrown_dram` — hashtable placement.
-- **The 18 `*_hybrid_cache` features** — each implies `key_value_pmem` and
+- **The 23 `*_hybrid_cache` features** — each implies `key_value_pmem` and
   `hybrid_cache_common`. They are **not** mutually exclusive: none defines an impl block, so any
   subset may be enabled. What a feature still does: ungates its `<design>_hybrid_cache` shim
   module and `<Design>HybridStats` alias, ungates its integration-test file, and contributes one
   per-object DRAM-overhead accounting term. It does **not** select the design -- that is the
-  runtime `PaperPolicy` argument, and any hybrid build hosts all 18.
+  runtime `PaperPolicy` argument, and any hybrid build hosts all 23.
 - `hybrid_cache_common` gates the entire hybrid subsystem (both impl blocks, the migration
-  queue). A build with none of the 18 has no hybrid API, though hybrid policies still parse and
+  queue). A build with none of the 23 has no hybrid API, though hybrid policies still parse and
   still build stacks.
 
 `BufferDRAM = Box<[u8]>` and `BufferPMEM = Box<[u8], Hybrid>` (see `lib.rs`) are the two value
@@ -291,8 +289,9 @@ types; `TieredBuffer` is the tagged union of them that the hybrid designs actual
 original two-PaperCache-instance S3-FIFO composition), `sets_dram`, `pmem_region_alloc`,
 `region_hybrid_allocator`, `devdax_bump`, `global_flatmap_dram`/`global_flatmap_pmem`, and the
 legacy copy-based tiering manager's `enable_tiering_manager`, `tiering`, `multitiering`,
-`hashtable_tiering` and `tiering_hashtable_pmem` (`src/tiering/`, removed in R1). See the removal
-entries near the end of this file.
+`hashtable_tiering` and `tiering_hashtable_pmem` (`src/tiering/`, removed in R1), and the design
+features `lru_lazy_copy_hybrid_cache` and `two_q_fast_admission_compact_hybrid_cache` (removed in
+R2). See the removal entries near the end of this file.
 
 ## Merged-store measurements until S5 (read before benchmarking it)
 
@@ -2641,7 +2640,7 @@ Fixed in `cache_report()` by summing the two segments for that design specifical
 `fast_tier_size()`: it is the whole DRAM budget for 14 of the 15 designs and half of it for the
 fifteenth.
 
-## Feature: `two_q_fast_admission_hybrid_cache` (implemented)
+## Feature: `two_q_fast_admission_hybrid_cache` (implemented; REMOVED in R2 -- history only)
 
 `two_q_hybrid_cache` with the one-access FIFO queue in the **fast** tier instead of the slow tier, so
 `set()` is a plain DRAM write rather than a synchronous PMEM/UMF allocation on the calling thread.
@@ -3280,3 +3279,27 @@ sets, and the sized stack's three getters. Kept although all 17 builds flag it: 
 S3-FIFO core's `is_ghost`, which the fidelity tests of the four `s3_fifo_faithful_*` features call
 (no suite build compiles them; a wide compile check of every feature alone found it). Nothing
 of the tiered designs, the flat stacks or the build features was touched: those are R2's.
+
+## Removed two tiered designs: the lazy-copy LRU and the plain fast-admission 2Q (R2)
+
+On the user's request ("get rid of the lru lazy"; and the plain fast-admission 2Q, design #9 of the
+inventory): `PaperPolicy::LruLazyCopyCompactHybrid` (`lru-lazy-copy-compact-hybrid`) and
+`PaperPolicy::TwoQFastAdmissionCompactHybrid(k_in)` (`2q-fast-admission-compact-hybrid-<k_in>`), with
+their stacks (`lru_lazy_copy_compact_hybrid_stack.rs`, 931 lines;
+`two_q_fast_admission_compact_hybrid_stack.rs`, 1,148), the second's integration test
+(`tests/two_q_fast_admission_compact_hybrid_cache_integration.rs`), the features
+`lru_lazy_copy_hybrid_cache` and `two_q_fast_admission_compact_hybrid_cache`, and every arm of
+either: the `PaperPolicy` variants with their `Display`, `FromStr` and parse function, the admission
+arm in `hybrid_policy.rs`, the `params_ok` arm in `lib.rs`, `init_policy_stack`'s arms (with and
+without `hybrid_cache_common`), the overhead constants and arms, the test tables (the dispatch table,
+the reservation and structure-byte designs, `s5_tests.rs`'s lists, `phys_fast_identity.rs`'s
+`other_designs!` entries) and the byte gate's `Ungated` arm for the lazy-copy LRU: only the faithful
+fast-admission pair runs ungated now. `phys_fast_identity.rs` lost the special case that only the
+lazy-copy LRU needed (its fast count was logical, so `quiesce` no longer takes the design).
+
+Kept: `TwoQFastAdmissionReprieve` and `TwoQFullFastAdmission`, which the plain design's siblings
+inherit their accounting from (the sections above stay as the record they cite), and `walk_to`,
+which `prev_fast` uses. `NodePayload::phys`, whose one reader was the lazy-copy LRU, is now written
+by every stack and read by none; it costs nothing (the node is 32 bytes either way) and is left for
+a later cleanup. The documented measurement of the plain design (SET mean 7.11 -> 3.30 us) stays in
+`HYBRID_CACHES.md` and `FEATURE_FLAGS.md`, marked as the removed design's.

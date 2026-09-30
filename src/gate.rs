@@ -106,8 +106,8 @@
 //! while the cache is not P's only user (another tiered cache, or a flat cache
 //! with fast values, is alive: `phys::sole_fast_user`, re-read at once when a
 //! live count moves); for the designs whose settles do not bound their DRAM
-//! (the lazy-copy LRU, plan P6; the faithful fast-admission pair, whose small
-//! queue is not clamped to the tier, design Q7); for bands that would put the
+//! (the faithful fast-admission pair, whose small queue is not clamped to the
+//! tier, design Q7); for bands that would put the
 //! settle target at or above the near level; and with no stack. A dead policy
 //! worker fails a waiting set with `CacheError::Internal`.
 
@@ -221,8 +221,9 @@ pub enum GateState {
 	/// tiered cache, or a flat cache with fast values, is alive.
 	NotSole,
 
-	/// The design's settles do not bound its DRAM: the lazy-copy LRU (plan
-	/// P6) and the faithful S3-FIFO fast-admission pair (design 0.6, Q7).
+	/// The design's settles do not bound its DRAM: the faithful S3-FIFO
+	/// fast-admission pair, whose small queue is not clamped to the tier
+	/// (design 0.6, Q7).
 	Ungated,
 
 	/// `drain_target::ratio() + near_frac >= 1`: the settle target would not

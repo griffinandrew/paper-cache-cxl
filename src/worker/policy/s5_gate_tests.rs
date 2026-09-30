@@ -1028,10 +1028,9 @@ fn mode_off_is_b1() {
 }
 
 /// The designs whose settles do not bound their DRAM run ungated (design 0.6,
-/// 3.9.8): the lazy-copy LRU (plan P6) and the faithful S3-FIFO fast-admission
-/// pair, whose small queue is not clamped to the tier (Q7) -- `Ungated`,
-/// whatever else is alive, so this one needs no child process. Red without
-/// the exception (`noungated`).
+/// 3.9.8): the faithful S3-FIFO fast-admission pair, whose small queue is not
+/// clamped to the tier (Q7) -- `Ungated`, whatever else is alive, so this one
+/// needs no child process. Red without the exception (`noungated`).
 #[cfg(not(feature = "merged_object_store"))]
 #[test]
 fn designs_whose_settles_do_not_bound_their_dram_run_ungated() {
@@ -1040,7 +1039,6 @@ fn designs_whose_settles_do_not_bound_their_dram_run_ungated() {
 	config.metadata_model = MetadataModel::PerObject;
 
 	for policy in [
-		PaperPolicy::LruLazyCopyCompactHybrid,
 		PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.1),
 		PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(0.1),
 	] {

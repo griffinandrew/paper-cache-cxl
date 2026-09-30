@@ -56,12 +56,8 @@ pub enum PaperPolicy {
 	/// `LruCompactHybridStack`.
 	LruCompactHybrid,
 
-	/// Same policy as `LruCompactHybrid`, with the tier copy deferred --
-	/// see `LruLazyCopyCompactHybridStack`.
-	LruLazyCopyCompactHybrid,
 	LfuCompactHybrid,
 	TwoQCompactHybrid(f64),
-	TwoQFastAdmissionCompactHybrid(f64),
 	TwoQFastAdmissionReprieveCompactHybrid(f64),
 	/// The full (three-queue) 2Q with fast-tier admission -- the only
 	/// hybrid design whose queue algorithm matches [`PaperPolicy::TwoQ`]'s,
@@ -119,7 +115,7 @@ impl PaperPolicy {
 	/// Whether this policy is one of the tiered (hybrid) designs.
 	#[must_use]
 	pub fn is_hybrid(&self) -> bool {
-		matches!(self, PaperPolicy::FifoCompactHybrid { .. } | PaperPolicy::ClockCompactHybrid { .. } | PaperPolicy::LfuCompactHybrid { .. } | PaperPolicy::LruCompactHybrid { .. } | PaperPolicy::LruLazyCopyCompactHybrid { .. } | PaperPolicy::LruLfuCompactHybrid { .. } | PaperPolicy::LruSizedCompactHybrid { .. } | PaperPolicy::S3FifoGhostCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid { .. } | PaperPolicy::S3FifoCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQGhostCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulReprieveCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQCompactHybrid { .. })
+		matches!(self, PaperPolicy::FifoCompactHybrid { .. } | PaperPolicy::ClockCompactHybrid { .. } | PaperPolicy::LfuCompactHybrid { .. } | PaperPolicy::LruCompactHybrid { .. } | PaperPolicy::LruLfuCompactHybrid { .. } | PaperPolicy::LruSizedCompactHybrid { .. } | PaperPolicy::S3FifoGhostCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid { .. } | PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid { .. } | PaperPolicy::S3FifoCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid { .. } | PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQFullFastAdmissionCompactHybrid { .. } | PaperPolicy::TwoQGhostCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulReprieveCompactHybrid { .. } | PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid { .. } | PaperPolicy::TwoQCompactHybrid { .. })
 	}
 }
 
@@ -144,14 +140,12 @@ impl Display for PaperPolicy {
 			PaperPolicy::SThreeFifo(ratio) => write!(f, "s3-fifo-{ratio}"),
 			PaperPolicy::SThreeFifoCompact(ratio) => write!(f, "s3-fifo-compact-{ratio}"),
 			PaperPolicy::TwoQCompactHybrid(k_in) => write!(f, "2q-compact-hybrid-{k_in}"),
-			PaperPolicy::TwoQFastAdmissionCompactHybrid(k_in) => write!(f, "2q-fast-admission-compact-hybrid-{k_in}"),
 			PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(k_in) => write!(f, "2q-fast-admission-reprieve-compact-hybrid-{k_in}"),
 			PaperPolicy::TwoQFullFastAdmissionCompactHybrid(k_in, k_out) => write!(f, "2q-full-fast-admission-compact-hybrid-{k_in}-{k_out}"),
 			PaperPolicy::FifoCompactHybrid => write!(f, "fifo-compact-hybrid"),
 			PaperPolicy::ClockCompactHybrid => write!(f, "clock-compact-hybrid"),
 			PaperPolicy::LruSizedCompactHybrid => write!(f, "lru-sized-compact-hybrid"),
 			PaperPolicy::LruCompactHybrid => write!(f, "lru-compact-hybrid"),
-			PaperPolicy::LruLazyCopyCompactHybrid => write!(f, "lru-lazy-copy-compact-hybrid"),
 			PaperPolicy::LfuCompactHybrid => write!(f, "lfu-compact-hybrid"),
 			PaperPolicy::LruLfuCompactHybrid(promote_k) => write!(f, "lru-lfu-compact-hybrid-{promote_k}"),
 			PaperPolicy::S3FifoCompactHybrid(ratio) => write!(f, "s3-fifo-compact-hybrid-{ratio}"),
@@ -190,14 +184,13 @@ impl FromStr for PaperPolicy {
 			"lru" => PaperPolicy::Lru,
 			"mru" => PaperPolicy::Mru,
 			// Order matters and is load-bearing: every guard below also starts
-			// with a prefix of the ones above it ("2q-fast-admission-compact-
-			// hybrid-" starts with "2q-", and so does "2q-compact-hybrid-"), so
-			// the most specific prefix has to be tested first or a more general
-			// guard silently swallows it. See
+			// with a prefix of the ones above it ("2q-fast-admission-reprieve-
+			// compact-hybrid-" starts with "2q-", and so does "2q-compact-
+			// hybrid-"), so the most specific prefix has to be tested first or
+			// a more general guard silently swallows it. See
 			// `compact_does_not_collide_with_other_2q_forms`.
 			value if value.starts_with("2q-full-fast-admission-compact-hybrid-") => parse_two_q_full_fast_admission_compact_hybrid(value)?,
 			value if value.starts_with("2q-fast-admission-reprieve-compact-hybrid-") => parse_two_q_fast_admission_reprieve_compact_hybrid(value)?,
-			value if value.starts_with("2q-fast-admission-compact-hybrid-") => parse_two_q_fast_admission_compact_hybrid(value)?,
 			value if value.starts_with("2q-ghost-compact-hybrid-") => parse_two_q_ghost_compact_hybrid(value)?,
 			value if value.starts_with("2q-compact-hybrid-") => parse_two_q_compact_hybrid(value)?,
 			// Must follow "2q-compact-hybrid-", which it is a prefix of.
@@ -229,7 +222,6 @@ impl FromStr for PaperPolicy {
 			// beside the other lru forms for readability.
 			value if value.starts_with("lru-lfu-compact-hybrid-") => parse_lru_lfu_compact_hybrid(value)?,
 			"lru-compact-hybrid" => PaperPolicy::LruCompactHybrid,
-			"lru-lazy-copy-compact-hybrid" => PaperPolicy::LruLazyCopyCompactHybrid,
 			"lfu-compact-hybrid" => PaperPolicy::LfuCompactHybrid,
 			"fifo-compact-hybrid" => PaperPolicy::FifoCompactHybrid,
 			// Both this and "clock-compact" above are EXACT arms, so neither
@@ -372,25 +364,6 @@ fn parse_two_q_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
 	}
 
 	Ok(PaperPolicy::TwoQCompactHybrid(k_in))
-}
-
-fn parse_two_q_fast_admission_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
-	// skip the "2q-fast-admission-compact-hybrid-"
-	let tokens = value[33..].split('-').collect::<Vec<&str>>();
-
-	if tokens.len() != 1 {
-		return Err(CacheError::InvalidPolicy);
-	}
-
-	let Ok(k_in) = tokens[0].parse::<f64>() else {
-		return Err(CacheError::InvalidPolicy);
-	};
-
-	if !(0.0..=1.0).contains(&k_in) {
-		return Err(CacheError::InvalidPolicy);
-	}
-
-	Ok(PaperPolicy::TwoQFastAdmissionCompactHybrid(k_in))
 }
 
 fn parse_two_q_fast_admission_reprieve_compact_hybrid(value: &str) -> Result<PaperPolicy, CacheError> {
@@ -986,7 +959,6 @@ mod tests {
 			// isolate k_in at its upper bound.
 			"2q-1.0-0.0",
 			"2q-compact-hybrid-1.0",
-			"2q-fast-admission-compact-hybrid-1.0",
 			"2q-fast-admission-reprieve-compact-hybrid-1.0",
 			"2q-ghost-compact-hybrid-1.0",
 			"2q-full-fast-admission-compact-hybrid-1.0-1.0",

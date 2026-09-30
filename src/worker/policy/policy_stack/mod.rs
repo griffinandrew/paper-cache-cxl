@@ -61,13 +61,9 @@ mod lru_lfu_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod lru_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
-mod lru_lazy_copy_compact_hybrid_stack;
-#[cfg(any(test, not(feature = "merged_object_store")))]
 mod lfu_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod two_q_compact_hybrid_stack;
-#[cfg(any(test, not(feature = "merged_object_store")))]
-mod two_q_fast_admission_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod two_q_fast_admission_reprieve_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
@@ -155,10 +151,8 @@ use crate::{
 		s_three_fifo_stack::SThreeFifoStack,
 		lru_lfu_compact_hybrid_stack::LruLfuCompactHybridStack,
 		lru_compact_hybrid_stack::LruCompactHybridStack,
-		lru_lazy_copy_compact_hybrid_stack::LruLazyCopyCompactHybridStack,
 		lfu_compact_hybrid_stack::LfuCompactHybridStack,
 		two_q_compact_hybrid_stack::TwoQCompactHybridStack,
-		two_q_fast_admission_compact_hybrid_stack::TwoQFastAdmissionCompactHybridStack,
 		two_q_fast_admission_reprieve_compact_hybrid_stack::TwoQFastAdmissionReprieveCompactHybridStack,
 		two_q_full_fast_admission_compact_hybrid_stack::TwoQFullFastAdmissionCompactHybridStack,
 		fifo_compact_hybrid_stack::FifoCompactHybridStack,
@@ -599,34 +593,25 @@ where
 	/// fight the design, copying on every set what the design chose not to
 	/// copy.
 	///
-	/// For every design but one that is the tier the stack records for the
-	/// key, because every design but one pushes the migration for a tier
-	/// change in the same call that makes it (a promotion after the settle
-	/// that may undo it, guarded on the key still being fast; a promotion out
-	/// of a DRAM-resident queue pushes nothing because the bytes are already
-	/// there). Per design:
+	/// For every design that is the tier the stack records for the key,
+	/// because every design pushes the migration for a tier change in the same
+	/// call that makes it (a promotion after the settle that may undo it,
+	/// guarded on the key still being fast; a promotion out of a DRAM-resident
+	/// queue pushes nothing because the bytes are already there). Per design:
 	///
 	/// | design | `placement_of` |
 	/// |---|---|
 	/// | LRU, FIFO, CLOCK, LFU, LRU-LFU | `tier_of` |
 	/// | size-split LRU | `tier_of`: the tier of the key's queue |
-	/// | lazy-copy LRU | `physical_tier_of`, NOT `tier_of` (below) |
 	/// | 2Q, 2Q-ghost | `tier_of`: the admission FIFO slow, main by tier |
-	/// | 2Q fast admission, + reprieve | `tier_of`: the admission FIFO fast, main by tier |
+	/// | 2Q fast admission reprieve | `tier_of`: the admission FIFO fast, main by tier |
 	/// | full 2Q (fast admission) | `tier_of`: `a1_in` fast, `a1_out` slow, `am` by tier |
 	/// | S3-FIFO, ghost, ghost lazy demotion, lazy demotion reprieve | `tier_of`: one-access queue slow, main by tier |
 	/// | the five S3-FIFO fast-admission designs | `tier_of`: one-access queue fast, main by tier (split slow: by segment) |
 	/// | faithful S3-FIFO, the four variants | `tier_of`: the small queue fast or slow per variant, main by tier |
 	/// | merged store (LRU, FIFO, CLOCK, LFU) | `MergedStore::tier_of`: the slot's tier |
 	///
-	/// The one design whose logical and physical placement legitimately
-	/// differ is the lazy-copy LRU: a CANDIDATE -- demoted by the policy, not
-	/// yet copied -- is logically slow with its bytes deliberately left in
-	/// DRAM until `reclaim_dram` copies it out under DRAM pressure. Its
-	/// placement is therefore `physical_tier_of`; `tier_of` would copy every
-	/// candidate out on its next set and report every one as stranded.
-	///
-	/// The S3-FIFO "lazy demotion" and "reprieve" designs are NOT such cases:
+	/// The S3-FIFO "lazy demotion" and "reprieve" designs are no exception:
 	/// there the laziness is the POLICY's, and whatever it decides is pushed
 	/// at once. A key the settle reprieves (referenced since it was promoted)
 	/// is not demoted at all, and keeps `Tier::Fast` and its bytes; a key
@@ -658,21 +643,17 @@ where
 	/// budget derived from the fast tier at 0 -- every stack subtracts it
 	/// saturating. That is the true DRAM state of a metadata-bound tier, not an
 	/// accounting fault, but what follows differs by design. Most demote every
-	/// value. The eight 2Q/S3-FIFO fast-admission designs also close DRAM
+	/// value. The seven 2Q/S3-FIFO fast-admission designs also close DRAM
 	/// admission: their admission queue is a carve-out of the tier clamped to
 	/// it, and it pays a share of the reservation -- in proportion to its part
-	/// of the tier in six of them, and in `two_q_fast_admission` and
-	/// `two_q_full_fast_admission`, which charge main first, whatever the main
-	/// queue cannot absorb. With no budget left it evicts each new key on
-	/// arrival where its overflow is an eviction (`two_q_fast_admission`, and
-	/// the S3-FIFO ghost variants, into the ghost) and sends it to PMEM where
-	/// its overflow is a demotion or reprieve (the reprieve variants at once,
-	/// `two_q_full_fast_admission` on the next admission). In
-	/// `two_q_fast_admission`, which has no ghost, that is permanent: a key that
-	/// comes back is new again and is evicted again, and main is never the
-	/// victim, so it admits nothing until a delete, an expiry or a resize lowers
-	/// the reservation. The S3-FIFO ghost variants lose only a key's first
-	/// arrival; its second goes from the ghost straight into main. The faithful S3-FIFO
+	/// of the tier in six of them, and in `two_q_full_fast_admission`, which
+	/// charges main first, whatever the main queue cannot absorb. With no
+	/// budget left it evicts each new key on arrival where its overflow is an
+	/// eviction (the S3-FIFO ghost variants, into the ghost) and sends it to
+	/// PMEM where its overflow is a demotion or reprieve (the reprieve
+	/// variants at once, `two_q_full_fast_admission` on the next admission).
+	/// The S3-FIFO ghost variants lose only a key's first arrival; its second
+	/// goes from the ghost straight into main. The faithful S3-FIFO
 	/// fast-admission variants are the exception: their DRAM small queue has no
 	/// ceiling at all, so its values stay in DRAM on top of the reservation.
 	///
@@ -905,21 +886,6 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		PaperPolicy::LruCompactHybrid =>
 			Box::new(LruCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 
-		// The budget handed here is the DRAM allowance; this stack derives its
-		// smaller LOGICAL fast capacity from it, holding back `LAZY_COPY_WINDOW`
-		// as room for candidates.
-		#[cfg(feature = "hybrid_cache_common")]
-		PaperPolicy::LruLazyCopyCompactHybrid => Box::new(
-			LruLazyCopyCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)
-				.with_shared_overhead(
-					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
-				),
-		),
-
-		#[cfg(not(feature = "hybrid_cache_common"))]
-		PaperPolicy::LruLazyCopyCompactHybrid =>
-			Box::new(LruLazyCopyCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
-
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::LfuCompactHybrid => Box::new(
 			LfuCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)
@@ -953,16 +919,6 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// the budget via `ResizeFastTier` immediately after construction
 		// anyway, but it is worth knowing when picking k_in.
 		#[cfg(feature = "hybrid_cache_common")]
-		PaperPolicy::TwoQFastAdmissionCompactHybrid(k_in) => Box::new(
-			TwoQFastAdmissionCompactHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)
-				.with_shared_overhead(
-					crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
-				),
-		),
-
-		// Same construction shape and the same k_in-vs-fast-tier caveat as
-		// `TwoQFastAdmissionCompactHybrid` above.
-		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(k_in) => Box::new(
 			TwoQFastAdmissionReprieveCompactHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
 				crate::object::overhead::get_hybrid_dram_shared_overhead(&policy) as CacheSize,
@@ -974,8 +930,8 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		// Simplified 2Q). Two parameters, not one: `k_out` sizes the live
 		// `a1_out` overflow queue and is a real, read parameter here, unlike
 		// in `TwoQStack`. Same default fast-tier budget and the same
-		// k_in-vs-fast-tier caveat as `TwoQFastAdmissionCompactHybrid` above --
-		// more acutely so, since `a1_in`'s reservation is carved out of the same
+		// k_in-vs-fast-tier caveat as `TwoQFastAdmissionReprieveCompactHybrid`
+		// above -- more acutely so, since `a1_in`'s reservation is carved out of the same
 		// DRAM budget `am`'s fast segment draws on.
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::TwoQFullFastAdmissionCompactHybrid(k_in, k_out) => Box::new(
@@ -1202,7 +1158,6 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		PaperPolicy::LfuCompactHybrid =>
 			Box::new(LfuCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
-		PaperPolicy::TwoQFastAdmissionCompactHybrid(k_in) => Box::new(TwoQFastAdmissionCompactHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
 		PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(k_in) => Box::new(TwoQFastAdmissionReprieveCompactHybridStack::new(k_in, max_size, (max_size as f64 * 0.2) as CacheSize)),
 		#[cfg(not(feature = "hybrid_cache_common"))]
@@ -1300,11 +1255,11 @@ mod init_policy_stack_tests {
 	/// Number of `PaperPolicy` variants, and therefore the number of rows the
 	/// table below must have. Kept as a named constant so a mismatch reads as
 	/// "a design is missing from the table", not as an off-by-one.
-	const POLICY_VARIANT_COUNT: usize = 42;
+	const POLICY_VARIANT_COUNT: usize = 40;
 
 	/// Number of variants for which `PaperPolicy::is_hybrid` must hold: the
 	/// tiered designs this crate exists to compare.
-	const HYBRID_DESIGN_COUNT: usize = 25;
+	const HYBRID_DESIGN_COUNT: usize = 23;
 
 	/// Every `PaperPolicy` variant, listed explicitly, in declaration order.
 	///
@@ -1340,10 +1295,8 @@ mod init_policy_stack_tests {
 		(PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(0.1), PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(0.9)),
 		(PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(0.1), PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(0.9)),
 		(PaperPolicy::LruCompactHybrid, PaperPolicy::LruCompactHybrid),
-		(PaperPolicy::LruLazyCopyCompactHybrid, PaperPolicy::LruLazyCopyCompactHybrid),
 		(PaperPolicy::LfuCompactHybrid, PaperPolicy::LfuCompactHybrid),
 		(PaperPolicy::TwoQCompactHybrid(0.1), PaperPolicy::TwoQCompactHybrid(0.9)),
-		(PaperPolicy::TwoQFastAdmissionCompactHybrid(0.1), PaperPolicy::TwoQFastAdmissionCompactHybrid(0.9)),
 		(PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.1), PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.9)),
 		(PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.25), PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.5, 0.4)),
 		(PaperPolicy::FifoCompactHybrid, PaperPolicy::FifoCompactHybrid),
@@ -1392,10 +1345,8 @@ mod init_policy_stack_tests {
 			PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(_) => "S3FifoFaithfulReprieveCompactHybrid",
 			PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(_) => "S3FifoFaithfulFastAdmissionReprieveCompactHybrid",
 			PaperPolicy::LruCompactHybrid => "LruCompactHybrid",
-			PaperPolicy::LruLazyCopyCompactHybrid => "LruLazyCopyCompactHybrid",
 			PaperPolicy::LfuCompactHybrid => "LfuCompactHybrid",
 			PaperPolicy::TwoQCompactHybrid(_) => "TwoQCompactHybrid",
-			PaperPolicy::TwoQFastAdmissionCompactHybrid(_) => "TwoQFastAdmissionCompactHybrid",
 			PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(_) => "TwoQFastAdmissionReprieveCompactHybrid",
 			PaperPolicy::TwoQFullFastAdmissionCompactHybrid(..) => "TwoQFullFastAdmissionCompactHybrid",
 			PaperPolicy::FifoCompactHybrid => "FifoCompactHybrid",
@@ -1576,6 +1527,12 @@ mod init_policy_stack_tests {
 				!stack.contains(1),
 				"the stack built for `{policy}` claims to contain a key that was never inserted",
 			);
+
+			assert_eq!(
+				stack.placement_of(1),
+				None,
+				"the stack built for `{policy}` places a key that was never inserted",
+			);
 		}
 	}
 }
@@ -1621,16 +1578,14 @@ mod reservation_tests {
 	const EXACT: CacheSize = crate::object::overhead::EXACT_GHOST_ENTRY_DRAM_OVERHEAD as CacheSize;
 
 	/// Every hybrid design, with what it charges per ghost entry (0: no ghost).
-	const DESIGNS: [(PaperPolicy, CacheSize); 25] = [
+	const DESIGNS: [(PaperPolicy, CacheSize); 23] = [
 		(PaperPolicy::LruCompactHybrid, 0),
-		(PaperPolicy::LruLazyCopyCompactHybrid, 0),
 		(PaperPolicy::LfuCompactHybrid, 0),
 		(PaperPolicy::LruLfuCompactHybrid(3), 0),
 		(PaperPolicy::LruSizedCompactHybrid, 0),
 		(PaperPolicy::FifoCompactHybrid, 0),
 		(PaperPolicy::ClockCompactHybrid, 0),
 		(PaperPolicy::TwoQCompactHybrid(0.1), 0),
-		(PaperPolicy::TwoQFastAdmissionCompactHybrid(0.1), 0),
 		(PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.1), 0),
 		(PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.1, 0.5), 0),
 		(PaperPolicy::TwoQGhostCompactHybrid(0.1), FILTER),
@@ -1752,16 +1707,14 @@ mod structure_bytes_tests {
 	const N: HashedKey = 5_000;
 	const SIZE: ObjectSize = 240;
 
-	const DESIGNS: [PaperPolicy; 25] = [
+	const DESIGNS: [PaperPolicy; 23] = [
 		PaperPolicy::LruCompactHybrid,
-		PaperPolicy::LruLazyCopyCompactHybrid,
 		PaperPolicy::LfuCompactHybrid,
 		PaperPolicy::LruLfuCompactHybrid(3),
 		PaperPolicy::LruSizedCompactHybrid,
 		PaperPolicy::FifoCompactHybrid,
 		PaperPolicy::ClockCompactHybrid,
 		PaperPolicy::TwoQCompactHybrid(0.1),
-		PaperPolicy::TwoQFastAdmissionCompactHybrid(0.1),
 		PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.1),
 		PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.1, 0.5),
 		PaperPolicy::TwoQGhostCompactHybrid(0.1),

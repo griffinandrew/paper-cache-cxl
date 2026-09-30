@@ -522,9 +522,6 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 		// tier, size and frequency. Measured 47.4 B/key against this 48.
 		PaperPolicy::LruCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
-		// Same 8-byte payload as `LruCompactHybrid`: `phys` was paid for out
-		// of padding `LruPayload` already carried, so the layout is unchanged.
-		PaperPolicy::LruLazyCopyCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 		PaperPolicy::LfuCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical to `LruCompactHybrid`, and deliberately so:
@@ -545,12 +542,9 @@ pub fn get_policy_overhead(policy: &PaperPolicy) -> ObjectSize {
 
 		// Structurally identical to `TwoQCompactHybrid`: the same
 		// one-slot/one-index-row shape, differing only in which physical tier
-		// the one-access FIFO queue's bytes live in (fast rather than slow) —
-		// a placement decision that costs no extra per-key metadata.
-		PaperPolicy::TwoQFastAdmissionCompactHybrid(_) => TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
-
-		// Structurally identical again: the reprieve variant changes where an
-		// aged-out one-access key goes, not what is tracked per key.
+		// the one-access FIFO queue's bytes live in (fast rather than slow)
+		// and where an aged-out one-access key goes -- placement decisions
+		// that cost no extra per-key metadata.
 		PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(_) => TWO_Q_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD + OBJECT_MAP_ROW_OVERHEAD,
 
 		// Structurally identical again, despite the third queue: a key is
@@ -736,7 +730,6 @@ pub fn get_ttl_overhead() -> ObjectSize {
 ///   lru-compact-hybrid           40.2100   40.1050   40.0518   40.0244
 ///   fifo-compact-hybrid          40.2100   40.1050   40.0518   40.0244
 ///   lru-sized-compact-hybrid     40.2100   40.1050   40.0518   40.0244
-///   lru-lazy-copy-compact-hybrid 40.2295   40.1147   40.0567   40.0268
 ///   lfu-compact-hybrid (control) 72.5952   72.2962   72.1451   72.0707
 /// ```
 ///
@@ -972,18 +965,6 @@ const CLOCK_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 /// the queue-dispatch read in `touch` are hot AND touch no queue order.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 const TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
-
-/// Per-object DRAM cost of `TwoQFastAdmissionCompactHybridStack`.
-///
-/// MEASURED: jemalloc `stats.allocated`, one point per process at 2^20..2^23
-/// objects, R^2 = 1.0000. See `policy_stack::measure_overhead`.
-///
-/// 72 B against the split fast-admission 2Q's 112 -- a 35.7% reduction, and
-/// equal to the compact 2Q, S3-FIFO and LRU stacks. All four share
-/// `CompactQueueSet` and an 8-byte payload, so equality was the prediction and
-/// the measurement confirms it.
-#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
-const TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
 /// Per-object DRAM cost of `TwoQFastAdmissionReprieveCompactHybridStack`.
 ///
@@ -1394,14 +1375,12 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	{
 		stack_resident = match policy {
 			PaperPolicy::LruCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::LruLazyCopyCompactHybrid => LRU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LfuCompactHybrid => LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruSizedCompactHybrid => LRU_SIZED_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::LruLfuCompactHybrid(..) => LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::FifoCompactHybrid => FIFO_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::ClockCompactHybrid => CLOCK_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQCompactHybrid(..) => TWO_Q_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
-			PaperPolicy::TwoQFastAdmissionCompactHybrid(..) => TWO_Q_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(..) => TWO_Q_FAST_ADMISSION_REPRIEVE_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQFullFastAdmissionCompactHybrid(..) => TWO_Q_FULL_FAST_ADMISSION_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
 			PaperPolicy::TwoQGhostCompactHybrid(..) => TWO_Q_GHOST_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD,
@@ -1764,14 +1743,12 @@ mod the_two_overhead_tables_agree {
 	fn every_hybrid_policy() -> Vec<PaperPolicy> {
 		vec![
 			PaperPolicy::LruCompactHybrid,
-			PaperPolicy::LruLazyCopyCompactHybrid,
 			PaperPolicy::LfuCompactHybrid,
 			PaperPolicy::LruSizedCompactHybrid,
 			PaperPolicy::LruLfuCompactHybrid(2),
 			PaperPolicy::FifoCompactHybrid,
 			PaperPolicy::ClockCompactHybrid,
 			PaperPolicy::TwoQCompactHybrid(0.25),
-			PaperPolicy::TwoQFastAdmissionCompactHybrid(0.25),
 			PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.25),
 			PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.5),
 			PaperPolicy::TwoQGhostCompactHybrid(0.25),
@@ -1824,8 +1801,8 @@ mod the_two_overhead_tables_agree {
 	fn every_hybrid_policy_is_actually_covered() {
 		assert_eq!(
 			every_hybrid_policy().len(),
-			25,
-			"the hybrid policy list has drifted from the 25 arms the two \
+			23,
+			"the hybrid policy list has drifted from the 23 arms the two \
 			 overhead tables carry",
 		);
 	}

@@ -6,14 +6,14 @@ This document explains the implementation of separate configuration options for 
 > of date. They cover six of the twenty-four designs, and they describe an architecture that no
 > longer exists: per-design constructors, per-design `<design>_hybrid_stats()` accessors,
 > per-design impl blocks, and `compile_error!` mutual-exclusion guards. Since the runtime-policy
-> unification, all 24 designs share one implementation, the features are not mutually exclusive,
+> unification, all 23 designs share one implementation, the features are not mutually exclusive,
 > and the design is chosen by the `PaperPolicy` passed to `new()`. See `HYBRID_CACHES.md` for the
 > current picture. Cargo.toml's per-feature comments carry the same stale mutual-exclusion
 > claims.
 >
 > The `all_dram`, `key_value_pmem` and hashtable-placement sections here are still accurate. The
 > `eviction_stacks_pmem` section understates its reach: besides `LfuStack`/`LruStack`, the flag
-> now also relocates all 24 hybrid stacks' lists and entry maps to PMEM.
+> now also relocates all 23 hybrid stacks' lists and entry maps to PMEM.
 
 ## Overview
 
@@ -187,65 +187,26 @@ The implementation provides explicit feature flags to control:
   `true` for an object the stack had already "forgotten") — caught by
   `tests/two_q_compact_hybrid_cache_integration.rs`'s FIFO-eviction tests failing outright, not merely flaking
 
-### `two_q_fast_admission_compact_hybrid_cache`
-- **Purpose**: `two_q_compact_hybrid_cache` with the one-access FIFO queue relocated to the **fast (DRAM)
-  tier**, so `set()` is a plain DRAM write rather than a synchronous PMEM allocation on the
-  calling thread. The same trade `s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_cache` makes for
-  the s3-fifo family. The logical 2Q structure is unchanged — only the physical placement of the
-  one-access queue's bytes differs
-- **When enabled**: Adds `PaperPolicy::TwoQFastAdmissionCompactHybrid(f64)` (string form
-  `"2q-fast-admission-compact-hybrid-{k_in}"`) and a new `PaperCache<K, TieredBuffer, S>` impl block with the
-  same `new(max_size, fast_tier_size, k_in)` signature as `two_q_compact_hybrid_cache`. Exports
-  `TwoQFastAdmissionCompactHybridStats`; shares `TieredBuffer`/`Tier`/`CacheTierSize` with every other hybrid
-- **When disabled**: None of the above types/methods are compiled
-- **Behavior**: Admission: every new object → the one-access FIFO queue, in the **fast** tier
-  (`admission_tier` is unconditionally `Tier::Fast`, needing no object-map probe at all — one fewer
-  `DashMap` lookup per `set()` than `two_q_compact_hybrid_cache`, on top of the avoided PMEM allocation).
-  Promotion: a re-accessed FIFO object moves into the main queue's fast portion — a bookkeeping move
-  that emits **no migration**, since the bytes are already in DRAM (so `promotions` counts only
-  genuine PMEM→DRAM moves in this design, never FIFO→main). Demotion, eviction priority, and the
-  no-ghost-queue decision are all identical to `two_q_compact_hybrid_cache`
-- **The one accounting difference that matters**: `fifo_capacity = k_in * max_size` is now a DRAM
-  reservation **carved out of `fast_tier_size`**, not an independent PMEM budget:
-  `effective_main_fast_capacity = fast_tier_size − min(k_in * max_size, fast_tier_size) − main_share`,
-  where `main_share` is the per-object metadata reservation up to what the carve-out leaves main
-  (main pays first; the FIFO pays the rest). Since `k_in` is denominated in
-  `max_size` while the budget it consumes is `fast_tier_size` (typically a small fraction of
-  `max_size`), a `k_in` that is unremarkable under `two_q_compact_hybrid_cache` can swallow the whole fast
-  tier here — at a 24 GB cache with a 4 GB fast tier, `k_in = 0.1` reserves 2.4 GB (60%) for objects
-  with no demonstrated reuse. If the reservation meets or exceeds `fast_tier_size`, the main queue
-  gets zero fast capacity and every promotion self-demotes immediately: legitimate, but rarely
-  intended. The FIFO itself is clamped to `fast_tier_size` (it can never hold more DRAM than the
-  tier) and pays only the part of the metadata reservation main cannot absorb, so wherever the
-  carve-out and the reservation fit the tier together both budgets are what they were before the
-  clamp. The configuration is flagged once by a warning printed to stderr (`eprintln!`: the crate
-  installs no `log` logger) when the budget arrives through `resize_fast_tier`. **Sweep `k_in` down here in a way that is unnecessary for `two_q_compact_hybrid_cache`.** The
-  reservation is the *fixed* `fifo_capacity`, not live `fifo_used`, so the main queue's budget stays
-  stable as the FIFO queue fills and drains (and admission therefore never demotes anyone by itself);
-  `resize()` re-settles, which `TwoQCompactHybridStack::resize` need not
-- **Requirements**: `["key_value_pmem"]`, same as every other hybrid, and combinable with all of
-  them
-- **Use case**: Workloads where SET latency matters and there is DRAM headroom to spend on unproven
-  objects — the inverse of `two_q_compact_hybrid_cache`'s tradeoff, which spends SET latency to keep DRAM
-  exclusively for proven-hot objects
-- **Measured** (800K accesses of `standard_web.bin`, `-c 1`, 2 GB cache / 1 GB fast tier, `k_in`
-  0.1, same binary otherwise): SET mean **7.11 µs → 3.30 µs (2.15x)**, SET p99 **25.48 µs → 9.36 µs
-  (2.72x)**, miss ratio essentially unchanged (0.3308 → 0.3211) — as expected, since the logical
-  queue structure is identical. GET mean also improved (4.09 → 3.34 µs), but that is **specific to
-  this configuration**, not a general property: at this scale the whole retained working set fit
-  inside the effective fast budget, so nothing was ever demoted (slow tier empty, 0 demotions) while
-  `two_q_compact_hybrid_cache` had 200 MB in PMEM by construction. The cost side shows in the same numbers:
-  624 MB of DRAM used versus 374 MB for the same workload
-
 ### `two_q_fast_admission_reprieve_compact_hybrid_cache`
-- **Purpose**: `two_q_fast_admission_compact_hybrid_cache` with one change — a one-access object that ages
-  out of the FIFO queue without a second access is **reprieved into the slow tier** (spliced onto
-  the bottom of the main queue) rather than evicted outright
+- **Purpose**: `two_q_compact_hybrid_cache` with the one-access FIFO queue relocated to the **fast
+  (DRAM) tier**, so `set()` is a plain DRAM write rather than a synchronous PMEM allocation on the
+  calling thread, and with one more change — a one-access object that ages out of the FIFO queue
+  without a second access is **reprieved into the slow tier** (spliced onto the bottom of the main
+  queue) rather than evicted outright. (The variant with the fast-tier FIFO and no reprieve,
+  `two_q_fast_admission_compact_hybrid_cache`, was removed in R2; its measurement is the middle
+  column of the table below)
 - **When enabled**: Adds `PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(f64)` (string form
   `"2q-fast-admission-reprieve-compact-hybrid-{k_in}"`), a `PaperCache<K, TieredBuffer, S>` impl block with
   the same `new(max_size, fast_tier_size, k_in)` signature, and `TwoQFastAdmissionReprieveCompactHybridStats`
-- **Behavior**: Admission, promotion, main-queue demotion and the fast-tier accounting are all
-  identical to `two_q_fast_admission_compact_hybrid_cache`. The difference is `settle_fifo_queue`, which runs
+- **Behavior**: Admission is the fast-tier FIFO queue (`admission_tier` is unconditionally
+  `Tier::Fast`); a re-accessed FIFO object moves into the main queue's fast portion, a bookkeeping
+  move that emits **no migration** since the bytes are already in DRAM. `fifo_capacity = k_in *
+  max_size` is a DRAM reservation **carved out of `fast_tier_size`**, not an independent PMEM
+  budget, and the metadata reservation is split between the two queues in proportion to their
+  fast-tier capacities (`reserved_shares`); since `k_in` is denominated in `max_size` while the
+  budget it consumes is `fast_tier_size`, a `k_in` that is unremarkable under
+  `two_q_compact_hybrid_cache` can swallow the whole fast tier here, so sweep it down. Aged-out
+  one-access keys are reprieved by `settle_fifo_queue`, which runs
   **synchronously from `insert`/`resize`** (never through `evict_one`) and moves the FIFO tail to the
   back of the main queue tagged `Tier::Slow`. `needs_capacity_eviction()` therefore returns to the
   trait default `false`, and `evict_one` becomes purely about the main queue's LRU tail — with a
@@ -258,7 +219,7 @@ The implementation provides explicit feature flags to control:
   minutes of worker CPU on a real trace
 - **Counter semantics**: a reprieve is counted in `demotions` (it is a real DRAM→PMEM copy), **not**
   `evictions`. So `evictions` here means only "removed from the cache", which is a narrower thing
-  than the same field in the non-reprieve variant
+  than the same field in a variant without the reprieve
 - **Requirements**: `["key_value_pmem"]`, and combinable with every other hybrid-cache feature
 - **Measured** (800K accesses of `standard_web.bin`, `-c 1`, 2 GB cache / 1 GB fast tier, `k_in` 0.1,
   same binary otherwise, all three 2Q designs run back to back):

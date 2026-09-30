@@ -30,9 +30,9 @@
 //!   * `phys_fast_equals_the_stacks_fast_used_at_quiescence_and_returns_to_zero`
 //!     runs the four orders both stores implement -- LRU, FIFO, CLOCK and LFU
 //!     (`MergedOrder::from_policy`) -- at the full workload, in every build;
-//!   * one test per OTHER design -- the lazy-copy LRU, the size-split LRU
-//!     (where P must also equal the small plus the large segment's fast
-//!     bytes), LRU-LFU, the five 2Q and the thirteen S3-FIFO designs -- at a
+//!   * one test per OTHER design -- the size-split LRU (where P must also
+//!     equal the small plus the large segment's fast bytes), LRU-LFU, the
+//!     four 2Q and the thirteen S3-FIFO designs -- at a
 //!     third of that workload, with every new key read twice and evicted keys
 //!     set again (see `Workload::touch_and_readmit`), in the DashMap and
 //!     hashbrown builds (the merged store refuses them at construction). One
@@ -201,17 +201,6 @@ impl Design {
         }
     }
 
-    /// The lazy-copy LRU counts its fast OBJECTS by the policy's placement but
-    /// its fast BYTES by where the bytes are (`LruLazyCopyCompactHybridStack::
-    /// fast_bytes_used`'s doc: "The PHYSICAL number, deliberately"): an object
-    /// it has demoted and not yet copied is counted slow and its bytes fast.
-    /// Its fast count therefore cannot be matched against the physically fast
-    /// values to detect quiescence; its bytes -- what the identity compares --
-    /// can.
-    fn fast_count_is_logical(self) -> bool {
-        matches!(self, Design::Policy(PaperPolicy::LruLazyCopyCompactHybrid))
-    }
-
     /// The designs whose `reserved_overhead` adds their ghost's DRAM to the
     /// per-object reservation (`self.ghost.dram_bytes()`, or ghost entries times
     /// `EXACT_GHOST_ENTRY_DRAM_OVERHEAD` in the faithful family), so their
@@ -260,12 +249,11 @@ impl Design {
     }
 
     /// The byte gate's state for this design's cache, alone in the process (S5
-    /// B2): the designs whose settles do not bound their DRAM -- the lazy-copy
-    /// LRU and the faithful fast-admission pair -- run ungated.
+    /// B2): the designs whose settles do not bound their DRAM -- the faithful
+    /// fast-admission pair -- run ungated.
     fn gate_state(self) -> GateState {
         match self {
-            Design::Policy(PaperPolicy::LruLazyCopyCompactHybrid)
-            | Design::Policy(PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(_))
+            Design::Policy(PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(_))
             | Design::Policy(PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(_)) => GateState::Ungated,
             _ => GateState::Enabled,
         }
@@ -356,15 +344,13 @@ fn measured_values() -> i64 {
 /// Waits until the worker has taken everything the test did and every
 /// migration it started has finished: the stack tracks exactly the keys the
 /// map holds with exactly their bytes, its fast count is the number of values
-/// physically in DRAM (not asked of the lazy-copy LRU, whose count is logical
-/// by design -- `Design::fast_count_is_logical`), nothing is queued, and all
-/// of that holds unchanged across five polls 1 ms apart (the worker passes
-/// every 1 ms while sets are recent). None of it reads P, so a broken counter
+/// physically in DRAM, nothing is queued, and all of that holds unchanged
+/// across five polls 1 ms apart (the worker passes every 1 ms while sets are
+/// recent). None of it reads P, so a broken counter
 /// cannot make the wait pass or fail -- only the assertions after it.
 fn quiesce(
     cache: &Cache,
     lens: &BTreeMap<u64, u32>,
-    design: Design,
     label: &str,
 ) -> (HybridStats, Walk) {
     let deadline = Instant::now() + QUIESCE_TIMEOUT;
@@ -379,7 +365,7 @@ fn quiesce(
         let settled = s.fast_objects + s.slow_objects == w.live
             && s.fast_bytes_used + s.slow_bytes_used
                 == w.total_charge + STACK_EXTRA_PER_OBJECT * w.live
-            && (s.fast_objects == w.fast_live || design.fast_count_is_logical())
+            && s.fast_objects == w.fast_live
             && pending == (0, 0);
 
         // M (S5a) too: its worker publishes it at the end of every pass, so a
@@ -436,7 +422,7 @@ struct Run<'a> {
 /// The identity, checked at a quiescent point.
 fn check(cache: &Cache, lens: &BTreeMap<u64, u32>, run: &Run, phase: &str, hits: u64) {
     let label = format!("{} {phase}", run.label);
-    let (s, w) = quiesce(cache, lens, run.design, &label);
+    let (s, w) = quiesce(cache, lens, &label);
     let p = phys::fast_bytes_signed() - run.p0;
 
     eprintln!(
@@ -678,7 +664,7 @@ fn run(design: Design, w: Workload) -> HybridStats {
     let set = |cache: &Cache, lens: &mut BTreeMap<u64, u32>, key: u64, generation: u64| {
         cache.set(key, &value(key, generation), None).expect("set");
         lens.insert(key, len_of(key, generation));
-        quiesce(cache, lens, design, &format!("{label} set({key}, gen {generation})")).0
+        quiesce(cache, lens, &format!("{label} set({key}, gen {generation})")).0
     };
 
     // Two reads of a key just set, when the workload asks for them.
@@ -695,7 +681,7 @@ fn run(design: Design, w: Workload) -> HybridStats {
                 }
             }
 
-            quiesce(cache, lens, design, &format!("{label} touch({key})"));
+            quiesce(cache, lens, &format!("{label} touch({key})"));
         }
     };
 
@@ -779,7 +765,7 @@ fn run(design: Design, w: Workload) -> HybridStats {
     let deleted: Vec<u64> = live.iter().copied().skip(1).step_by(5).collect();
     for key in &deleted {
         cache.del(key).expect("del of a live key");
-        quiesce(&cache, &lens, design, &format!("{label} del({key})"));
+        quiesce(&cache, &lens, &format!("{label} del({key})"));
     }
     check(&cache, &lens, &run, "E (dels)", hits);
 
@@ -880,14 +866,12 @@ macro_rules! other_designs {
 }
 
 other_designs! {
-    lru_lazy_copy => Design::Policy(PaperPolicy::LruLazyCopyCompactHybrid);
     lru_sized => Design::Sized;
     lru_lfu => Design::Policy(PaperPolicy::LruLfuCompactHybrid(2));
     two_q => Design::Policy(PaperPolicy::TwoQCompactHybrid(0.25));
     // k_in 0.1, not 0.25: at 0.25 of this cache the admission FIFO's
     // carve-out is the whole 16 KiB fast tier, and phase A ends with nothing
     // fast at all (P == fast_used == 0 -- vacuous, not wrong).
-    two_q_fast_admission => Design::Policy(PaperPolicy::TwoQFastAdmissionCompactHybrid(0.1));
     two_q_fast_admission_reprieve =>
         Design::Policy(PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.1));
     two_q_full_fast_admission =>
@@ -994,7 +978,7 @@ fn burst(design: Design, w: Workload) {
     // The first key alone, for omega, as `run` takes it.
     cache.set(0, &value(0, 0), None).expect("set");
     lens.insert(0, len_of(0, 0));
-    let omega = quiesce(&cache, &lens, design, &format!("{label} set(0)")).0.fast_metadata_bytes;
+    let omega = quiesce(&cache, &lens, &format!("{label} set(0)")).0.fast_metadata_bytes;
 
     let run = Run {
         label: &label,

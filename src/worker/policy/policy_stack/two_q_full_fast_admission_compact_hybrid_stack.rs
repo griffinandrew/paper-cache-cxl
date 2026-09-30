@@ -560,8 +560,9 @@ impl TwoQFullFastAdmissionCompactHybridStack {
 	/// The 2Q promotion: an `a1_out` hit moves the live key to `am`'s MRU end
 	/// at `Tier::Fast`.
 	///
-	/// Emits a genuine `(key, Tier::Fast)` migration -- unlike
-	/// `TwoQFastAdmissionCompactHybridStack`'s promotion, which is a Fast->Fast
+	/// Emits a genuine `(key, Tier::Fast)` migration -- unlike a promotion out
+	/// of a DRAM-resident admission FIFO
+	/// (`TwoQFastAdmissionReprieveCompactHybridStack`), which is a Fast->Fast
 	/// bookkeeping move. Here the bytes really do live in PMEM beforehand,
 	/// because `a1_out` is the slow tier.
 	fn promote_from_a1_out(&mut self, key: HashedKey, structural: bool) {

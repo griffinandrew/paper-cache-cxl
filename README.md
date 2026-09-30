@@ -7,8 +7,8 @@ cache moves them between the two as the access pattern changes.
 
 The research question the fork exists to answer is *which eviction discipline makes the best
 use of a small DRAM tier in front of a large CXL tier*. It is answered by running the same
-cache 24 different ways — one `PaperPolicy` variant per design — and measuring them against
-identical traces. Every hybrid build compiles all 24; the design is chosen at runtime, by the
+cache 23 different ways — one `PaperPolicy` variant per design — and measuring them against
+identical traces. Every hybrid build compiles all 23; the design is chosen at runtime, by the
 `PaperPolicy` value handed to the constructor, and is then fixed for that cache's lifetime.
 
 > This crate is a library and is not meant to be used directly by application code; the
@@ -33,7 +33,7 @@ cargo +nightly build --release --features lru_compact_hybrid_cache
 Enabling any one hybrid feature is all you need to get the hybrid API: `lru_compact_hybrid_cache` pulls
 in `key_value_pmem` and `hybrid_cache_common`, and `hybrid_cache_common` pulls in
 `numa_jemalloc`. Naming those explicitly is harmless but redundant. The feature does **not**
-select the design — that is a runtime argument, and any hybrid build hosts all 24.
+select the design — that is a runtime argument, and any hybrid build hosts all 23.
 
 ```rust
 use paper_cache::{PaperCache, CacheTierSize, TieredBuffer, Tier, PaperPolicy};
@@ -79,7 +79,7 @@ into a second map. This is the opposite of the legacy `tiering/` module (see
 [Legacy](#legacy-the-copy-based-tiering-manager)), which deliberately keeps a copy in both
 tiers.
 
-All 24 designs share **one** implementation. There are exactly two inherent
+All 23 designs share **one** implementation. There are exactly two inherent
 `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks — the shared engine, and a second holding the
 size-split design's three-scalar constructor — and both are gated only on `hybrid_cache_common`.
 The per-design behaviour that remains is dispatched at runtime: one `match` over the cache's
@@ -196,7 +196,7 @@ Consequences when interpreting stats:
 
 ## Choosing a design
 
-Seventeen of the 18 are built with the one shared constructor,
+Twenty-two of the 23 are built with the one shared constructor,
 `new(max_size, fast_tier_size, policy)`, where `policy` is the design's `PaperPolicy` variant and
 carries that design's tuning knob in its payload — `PaperPolicy::TwoQCompactHybrid(k_in)`,
 `PaperPolicy::LruLfuCompactHybrid(promote_k)`, and so on. Four variants take no payload.
@@ -222,14 +222,13 @@ design and its parameter can come from a config file or a command line with no r
 
 ### 2Q family — a one-access FIFO queue feeding a segmented main queue
 
-All four carry `k_in` in their policy payload — e.g. `PaperPolicy::TwoQCompactHybrid(k_in)` — where
+All three carry `k_in` in their policy payload — e.g. `PaperPolicy::TwoQCompactHybrid(k_in)` — where
 `k_in * max_size` is the FIFO queue's byte budget. `k_in` must lie in `0.0..=1.0`.
 
 | Feature | Builds on | Change |
 |---|---|---|
 | `two_q_compact_hybrid_cache` | -- | Baseline: FIFO queue in the **slow** tier, so every `set()` is a real PMEM write |
-| `two_q_fast_admission_compact_hybrid_cache` | baseline | FIFO queue moved to the **fast** tier; its budget is carved out of `fast_tier_size` |
-| `two_q_fast_admission_reprieve_compact_hybrid_cache` | fast admission | A key aging out of the FIFO queue is spliced into the slow tier instead of evicted |
+| `two_q_fast_admission_reprieve_compact_hybrid_cache` | baseline | FIFO queue moved to the **fast** tier (its budget is carved out of `fast_tier_size`); a key aging out of it is spliced into the slow tier instead of evicted |
 | `two_q_ghost_compact_hybrid_cache` | baseline | A bare-key ghost queue, so re-admission skips the FIFO queue |
 
 ### S3-FIFO family — lazy, reference-bit-gated promotion
@@ -308,7 +307,7 @@ contents are deterministic while still exercising the real queue path.
 `run_hybrid_benchmark_matrix.sh` rebuilt `paper-benchmark-cxl` once per design, rewriting the
 `features=[...]` line in its `Cargo.toml` between runs — a premise the unification removed (and
 the feature names it built no longer exist; it was deleted in R1). A single build now hosts all
-24 designs, so a sweep is a loop over `PaperPolicy` values (or over their string forms, via
+23 designs, so a sweep is a loop over `PaperPolicy` values (or over their string forms, via
 `FromStr`) with no rebuild between cells.
 
 `paper_cache::jemalloc_stats()` samples allocated/active/resident/mapped/retained at peak,

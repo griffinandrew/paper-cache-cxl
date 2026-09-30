@@ -3243,9 +3243,8 @@ where
 	/// The byte gate's state for this cache now (S5 B2, design 3.9.8): `Off`
 	/// by its configuration; `Bands` when the settle target could not be below
 	/// the near level; `Ungated` for the designs whose settles do not bound
-	/// their DRAM -- the lazy-copy LRU (plan P6) and the faithful S3-FIFO
-	/// fast-admission pair, whose small queue is not clamped to the tier (Q7);
-	/// `NotSole` while the cache
+	/// their DRAM -- the faithful S3-FIFO fast-admission pair, whose small
+	/// queue is not clamped to the tier (Q7); `NotSole` while the cache
 	/// is not P's only user; `Enabled` otherwise.
 	#[cfg(feature = "hybrid_cache_common")]
 	fn byte_gate_state(&self) -> crate::gate::GateState {
@@ -3263,8 +3262,7 @@ where
 
 		if matches!(
 			self.status.policy(),
-			PaperPolicy::LruLazyCopyCompactHybrid
-				| PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(..)
+			PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(..)
 				| PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(..)
 		) {
 			return GateState::Ungated;
@@ -3641,9 +3639,7 @@ fn polling_delay(now: Instant, last_set_time: Option<Instant>, has_current_set: 
 /// counts a completed slow move, and its demotions are tallied by
 /// `drain_demotions` when its settle DECIDES them, so a demotion dropped
 /// here because a later promotion in the same drain supersedes it stays
-/// counted although nothing moved. Lazy copy emits only PHYSICAL intents
-/// (its logical demotions queue nothing), and for those the last one is
-/// equally the answer. Dropped entries are counted in
+/// counted although nothing moved. Dropped entries are counted in
 /// `migstats::COALESCED_TOT`; `DEMO`/`PROMO`, `BURST_MAX` and the
 /// `PENDING_*` gauges see only what is kept.
 ///

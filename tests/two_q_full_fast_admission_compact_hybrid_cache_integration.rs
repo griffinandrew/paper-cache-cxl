@@ -26,8 +26,8 @@
 //! integration suites — `tier_of` reads the tier directly off the single
 //! object map.
 //!
-//! What distinguishes this design from `two_q_fast_admission_compact_hybrid_cache`,
-//! and therefore what this suite is actually for:
+//! What distinguishes this design from the Simplified-2Q hybrids, and
+//! therefore what this suite is actually for:
 //!
 //!   * Admission lands in `a1_in`, in the **fast** tier, on `set()` itself
 //!   * A re-access of an `a1_in` object is a **no-op** — it does NOT promote
@@ -73,8 +73,8 @@ mod hybrid_cache_tests {
 
     // ── sizing ────────────────────────────────────────────────────────────
     //
-    // The arithmetic trap this design inherits from
-    // `two_q_fast_admission_compact_hybrid_cache`, and sharpens: `k_in` is
+    // The arithmetic trap this design shares with the other fast-admission 2Q
+    // hybrids, and sharpens: `k_in` is
     // denominated in `max_size` but the budget it consumes is
     // `fast_tier_size`, because `a1_in` is DRAM. `effective_am_fast_capacity
     // = fast_tier_size - k_in * max_size`, so a `k_in` that looks tiny

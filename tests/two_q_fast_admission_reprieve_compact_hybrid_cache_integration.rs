@@ -25,10 +25,9 @@
 //! integration suites — `tier_of` reads the tier directly off the single
 //! object map.
 //!
-//! The defining difference from `two_q_fast_admission_compact_hybrid_cache`: a
-//! one-access object that ages out of the FIFO queue without a second access
-//! is **reprieved into the slow tier** (spliced onto the bottom of the main
-//! queue) rather than evicted outright. Admission is still a plain DRAM write,
+//! The defining feature: a one-access object that ages out of the FIFO queue
+//! without a second access is **reprieved into the slow tier** (spliced onto
+//! the bottom of the main queue) rather than evicted outright. Admission is still a plain DRAM write,
 //! so SET should be unaffected; the reprieve's DRAM->PMEM copy is paid on the
 //! `PolicyWorker` thread.
 //!
@@ -385,8 +384,6 @@ mod hybrid_cache_tests {
         );
 
         // Every key survives and reads back -- the whole point of a reprieve.
-        // In two_q_fast_admission_compact_hybrid_cache these same admissions drive
-        // real evictions instead.
         for key in 1..=30u32 {
             assert!(cache.has(&key), "key {key} should have survived the reprieve");
             assert_eq!(cache.get(&key).unwrap(), vec![key as u8; 64]);

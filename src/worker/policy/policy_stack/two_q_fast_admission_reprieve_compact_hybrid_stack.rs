@@ -8,36 +8,30 @@
 //! Slab-backed 2Q fast-admission REPRIEVE hybrid: the compact form of
 //! `TwoQFastAdmissionReprieveHybridStack`, one structure where that has three.
 //!
-//! Everything `TwoQFastAdmissionCompactHybridStack` does, this does too: the
-//! admission FIFO is DRAM-resident, so `tier_of` reports `Fast` for a key in
-//! it, its reservation is carved OUT of the fast tier, a promotion out of it
-//! emits no migration, and its bytes and objects count toward fast.
+//! The admission FIFO is DRAM-resident, so `tier_of` reports `Fast` for a key
+//! in it, its reservation is carved OUT of the fast tier, a promotion out of
+//! it emits no migration, and its bytes and objects count toward fast.
 //!
-//! What differs is what happens when the FIFO runs over budget. The
-//! non-reprieve stack lets it grow and asks the caller to evict its tail
-//! (`needs_capacity_eviction`). This one REPRIEVES the overflow instead:
-//! `settle_fifo_queue` splices the FIFO tail onto the BACK of the main queue
-//! as `Tier::Slow`, emitting a migration, so an aged-out one-access key gets a
-//! second chance in PMEM rather than being dropped. Four consequences, each
-//! carried over from the baseline:
+//! When the FIFO runs over budget this stack REPRIEVES the overflow rather
+//! than dropping it: `settle_fifo_queue` splices the FIFO tail onto the BACK of
+//! the main queue as `Tier::Slow`, emitting a migration, so an aged-out
+//! one-access key gets a second chance in PMEM. (The plain fast-admission 2Q,
+//! which let the FIFO grow and asked the caller to evict its tail
+//! (`needs_capacity_eviction`), was removed in R2; git history holds it.)
+//! Four consequences:
 //!
-//! - `settle_fifo_queue` runs after every admission and after either resize --
-//!   exactly the three call sites the baseline uses. It deliberately does NOT
-//!   run on the re-set path of `insert_resident`, which returns early, nor on
-//!   promotion out of the FIFO, which only ever lowers `fifo_used`.
+//! - `settle_fifo_queue` runs after every admission and after either resize.
+//!   It deliberately does NOT run on the re-set path of `insert_resident`,
+//!   which returns early, nor on promotion out of the FIFO, which only ever
+//!   lowers `fifo_used`.
 //! - `needs_capacity_eviction` is NOT overridden. The FIFO polices itself, so
-//!   the trait default (`false`) is the answer; the non-reprieve stack's
-//!   `fifo_used > effective_fifo_capacity()` override would ask the caller to
-//!   evict a queue that has already settled.
+//!   the trait default (`false`) is the answer: an override asking the caller
+//!   to evict from a queue that has already settled would be wrong.
 //! - `evict_one` drains the MAIN queue first and reaches the FIFO tail only
-//!   when main is empty. The non-reprieve stack has that order reversed.
+//!   when main is empty.
 //! - The `shared_overhead` reservation is SPLIT between the two queues in
 //!   proportion to their fast-tier capacities (`reserved_shares`), because
-//!   both now settle against a budget and each has to pay its own share. The
-//!   non-reprieve stack charges it MAIN-FIRST instead -- main pays up to
-//!   what the carve-out leaves it, the FIFO only the rest -- so its budgets
-//!   stay what they were before the clamp wherever they fit, and polices its
-//!   FIFO's budget through `needs_capacity_eviction`.
+//!   both settle against a budget and each has to pay its own share.
 //!
 //! **The baseline named above no longer exists in this crate.** Every
 //! non-compact hybrid stack was removed once its compact twin was shown

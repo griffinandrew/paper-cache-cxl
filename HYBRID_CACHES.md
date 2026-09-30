@@ -435,7 +435,7 @@ or `concurrency_hint` x `value_hint` when wider), never below `S + 1`.
 Load is never an error: bursts wait, at the rate demotions free room, and the waits are what a
 bounded DRAM tier costs (the gate's wait counters and histogram in `HybridStats`). The byte gate
 runs only while its cache is P's only user (`live_tiered_caches() == 1` and no flat fast cache;
-re-read at once when a live count moves); otherwise, and for the lazy-copy LRU and the faithful
+re-read at once when a live count moves); otherwise, and for the faithful
 fast-admission pair (whose settles do not bound their DRAM), it is disabled and `gate_state` says
 why. A dead policy worker fails a waiting set with `Internal`. `GateMode::Block` is the default
 (`Off` in the lib's own unit tests, which share one process's P); the metadata cap and structural
@@ -674,9 +674,12 @@ a `PolicyStack` has no reference to the object map.
 `entries` holds `TwoQEntry { queue, tier: Option<Tier>, size }`, with `tier: None` iff the key is
 in the FIFO queue.
 
-### `two_q_fast_admission_compact_hybrid_cache`
+### `two_q_fast_admission_compact_hybrid_cache` (REMOVED in R2)
 
 `TwoQFastAdmissionCompactHybridStack` · `PaperPolicy::TwoQFastAdmissionCompactHybrid(f64)`
+
+*Removed in R2 (the stack, its feature and its tests are gone). Kept as the record: its accounting and
+its measurement are what the reprieve, full-2Q and S3-FIFO fast-admission sections below refer to.*
 
 `two_q_compact_hybrid_cache` with the one-access queue in the **fast** tier, so admission is a cheap DRAM
 write instead of a synchronous PMEM allocation. Only the physical placement changes; the logical

@@ -33,19 +33,17 @@ use crate::{CacheTierSize, PaperCache, TieredBuffer};
 
 use Tier::{Fast, Slow};
 
-/// The designs the worker-level tests run: all 25 tiered designs where the
+/// The designs the worker-level tests run: all 23 tiered designs where the
 /// build's store has them, the merged store's four orders in its builds.
 #[cfg(not(feature = "merged_object_store"))]
 const DESIGNS: &[PaperPolicy] = &[
 	PaperPolicy::LruCompactHybrid,
-	PaperPolicy::LruLazyCopyCompactHybrid,
 	PaperPolicy::LfuCompactHybrid,
 	PaperPolicy::LruLfuCompactHybrid(3),
 	PaperPolicy::LruSizedCompactHybrid,
 	PaperPolicy::FifoCompactHybrid,
 	PaperPolicy::ClockCompactHybrid,
 	PaperPolicy::TwoQCompactHybrid(0.25),
-	PaperPolicy::TwoQFastAdmissionCompactHybrid(0.25),
 	PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.25),
 	PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.5),
 	PaperPolicy::TwoQGhostCompactHybrid(0.25),
@@ -77,7 +75,6 @@ const DESIGNS: &[PaperPolicy] = &[
 #[cfg(not(feature = "merged_object_store"))]
 const ONE_LIST: &[PaperPolicy] = &[
 	PaperPolicy::LruCompactHybrid,
-	PaperPolicy::LruLazyCopyCompactHybrid,
 	PaperPolicy::FifoCompactHybrid,
 	PaperPolicy::ClockCompactHybrid,
 ];
@@ -95,7 +92,6 @@ const ONE_LIST: &[PaperPolicy] = &[
 #[cfg(not(feature = "merged_object_store"))]
 const CURSORS: &[PaperPolicy] = &[
 	PaperPolicy::LruCompactHybrid,
-	PaperPolicy::LruLazyCopyCompactHybrid,
 	PaperPolicy::FifoCompactHybrid,
 	PaperPolicy::ClockCompactHybrid,
 	PaperPolicy::TwoQCompactHybrid(0.25),
@@ -108,11 +104,10 @@ const CURSORS: &[PaperPolicy] = &[
 #[cfg(feature = "merged_object_store")]
 const CURSORS: &[PaperPolicy] = ONE_LIST;
 
-/// The designs with a DRAM admission queue (T18c): the four that police it
+/// The designs with a DRAM admission queue (T18c): the three that police it
 /// by EVICTION, full 2Q (whose `a1_in` overflow is a demotion to `a1_out`)
 /// and the five REPRIEVE designs, which splice their overflow into main.
 const FAST_ADMISSION: &[PaperPolicy] = &[
-	PaperPolicy::TwoQFastAdmissionCompactHybrid(0.25),
 	PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(0.1),
 	PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(0.1),
 	PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.1),
@@ -124,10 +119,9 @@ const FAST_ADMISSION: &[PaperPolicy] = &[
 	PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(0.1),
 ];
 
-/// The eight DRAM admission queues S5 polices at the drain target (3.6.5);
+/// The seven DRAM admission queues S5 polices at the drain target (3.6.5);
 /// the faithful fast-admission pair's small queue is left ungated.
 const POLICED_QUEUES: &[PaperPolicy] = &[
-	PaperPolicy::TwoQFastAdmissionCompactHybrid(0.25),
 	PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(0.1),
 	PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(0.1),
 	PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.25),
@@ -713,10 +707,9 @@ fn boundaries_skip_structural_keys() {
 }
 
 /// T18c: the designs with a DRAM admission queue place a structural NEW key
-/// slow where the design sends a key its queue cannot keep -- the back of
-/// main (2Q FA), the front of main or `Q_MAIN_SLOW` (S3-FIFO), `a1_out`
-/// (full 2Q), the reprieve's destination -- instead of the queue: it is not
-/// evicted on arrival, nothing is pushed, and no DRAM holds it. At the stack.
+/// slow where the design sends a key its queue cannot keep -- the front of
+/// main or `Q_MAIN_SLOW` (S3-FIFO), `a1_out` (full 2Q), the reprieve's
+/// destination -- instead of the queue: it is not evicted on arrival, nothing is pushed, and no DRAM holds it. At the stack.
 /// Red at 0b2c41f: the evicting designs evicted it on arrival, the rest
 /// admitted it to DRAM and demoted it.
 #[test]

@@ -241,10 +241,10 @@ impl Default for ArenaFrequencyChain {
 /// A brand-new node for this chain.
 ///
 /// `phys` is set equal to `tier` and kept there by every tier move below.
-/// Nothing in either LFU stack reads it -- only the lazy-copy design does, and
-/// only because it promotes logically and defers the byte copy -- but the
-/// node's contract is that the two are equal for everyone else, and a `phys`
-/// left behind at admission tier would quietly make that false.
+/// Nothing in either LFU stack reads it -- its one reader, the lazy-copy LRU,
+/// which promoted logically and deferred the byte copy, was removed in R2 --
+/// but the node's contract is that the two are equal, and a `phys` left
+/// behind at admission tier would quietly make that false.
 ///
 /// `ts` and `queue` stay zero: recency here is `prev`/`next` and there are no
 /// queues. They exist so the node is the one shape every policy shares.
@@ -1029,9 +1029,9 @@ mod tests {
 	}
 
 	/// `phys` is the one node field this chain writes that neither LFU stack
-	/// reads, and the node's contract is that it equals `tier` for every design
-	/// but the lazy-copy one. A tier move that left it behind would make that
-	/// contract false for a key that had ever been demoted or promoted.
+	/// reads, and the node's contract is that it equals `tier`. A tier move
+	/// that left it behind would make that contract false for a key that had
+	/// ever been demoted or promoted.
 	#[test]
 	fn a_tier_move_carries_the_physical_tier_with_it() {
 		let mut c = ArenaFrequencyChain::default();

@@ -152,9 +152,9 @@ eviction_stacks_pmem = ["numa_jemalloc"]
 ttl_index_dram = []
 
 # ---------------------------------------------------------------------------
-# The 24 *_hybrid_cache features below are NOT mutually exclusive; any subset
+# The 23 *_hybrid_cache features below are NOT mutually exclusive; any subset
 # may be enabled together. They no longer select a design either -- every hybrid
-# build hosts all 24, and the design is chosen at runtime by the PaperPolicy
+# build hosts all 23, and the design is chosen at runtime by the PaperPolicy
 # passed to PaperCache::new(max_size, fast_tier_size, policy).
 #
 # What enabling one still does: ungates that design's integration-test file, and
@@ -187,14 +187,6 @@ ttl_index_dram = []
 #
 lru_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
-# LRU hybrid whose tier COPY is deferred until DRAM pressure demands it. Same
-# eviction policy as lru_compact_hybrid_cache -- identical tier assignment,
-# eviction order and miss ratio -- but a demoted object's bytes stay in DRAM as
-# a CANDIDATE until reclaim reaches them, so a candidate promoted back is a
-# relabel rather than two 16.5 KB crossings. Measured: 66% of that baseline's
-# migration bandwidth is round trips of exactly that shape.
-lru_lazy_copy_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
-
 # Single-instance, segmented-LFU hybrid cache: same one-PaperCache<K,
 # TieredBuffer> architecture as `lru_compact_hybrid_cache` above, but the
 # fast/slow boundary is frequency-ordered rather than recency-ordered -- LFU
@@ -214,25 +206,19 @@ lfu_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 two_q_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # Two-tier segmented-2Q hybrid cache with the one-access FIFO queue in the
-# FAST tier rather than the slow tier: identical to
-# `two_q_compact_hybrid_cache` except that admission is a plain DRAM write
-# instead of a synchronous PMEM allocation on the calling thread. The FIFO
-# queue's `k_in * max_size` budget becomes a reservation carved out of
-# `fast_tier_size` (both are DRAM now), so it directly reduces the room
-# available to proven-hot main-queue objects -- see
-# `worker/policy/policy_stack/two_q_fast_admission_compact_hybrid_stack.rs`'s
-# module doc for the accounting. Same trade, and the same mechanism, as
+# FAST tier rather than the slow tier: admission is a plain DRAM write instead
+# of a synchronous PMEM allocation on the calling thread, and the FIFO queue's
+# `k_in * max_size` budget becomes a reservation carved out of `fast_tier_size`
+# (both are DRAM now) -- see
+# `worker/policy/policy_stack/two_q_fast_admission_reprieve_compact_hybrid_stack.rs`'s
+# module doc. A one-access object that ages out of the FIFO queue without a
+# second access is REPRIEVED into the slow tier (spliced onto the bottom of
+# the main queue) rather than evicted outright. The DRAM->PMEM copy that costs
+# is paid on the PolicyWorker thread, not the set() path, so SET latency should
+# be unaffected; the cost shows up as worker CPU, PMEM write volume and
+# slow-tier occupancy. Same trade, and the same mechanism, as
 # `s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_cache` makes for
 # the s3-fifo family.
-#
-two_q_fast_admission_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
-
-# As `two_q_fast_admission_compact_hybrid_cache`, but a one-access object that
-# ages out of the FIFO queue without a second access is REPRIEVED into the slow
-# tier (spliced onto the bottom of the main queue) rather than evicted outright.
-# The DRAM->PMEM copy that costs is paid on the PolicyWorker thread, not the
-# set() path, so SET latency should be unaffected; the cost shows up as worker
-# CPU, PMEM write volume and slow-tier occupancy.
 #
 two_q_fast_admission_reprieve_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
@@ -456,7 +442,7 @@ s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_compact_hybrid_cache = 
 # reservation, or fails to compile) whenever that edit is forgotten.
 #
 # It also selects the tier allocator for every hybrid variant: enabling it
-# turns on `numa_jemalloc`, so all 24 designs get NUMA-bound jemalloc arenas
+# turns on `numa_jemalloc`, so all 23 designs get NUMA-bound jemalloc arenas
 # rather than an ordinary unbound heap.
 hybrid_cache_common = ["numa_jemalloc"]
 
