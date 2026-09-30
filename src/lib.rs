@@ -2937,7 +2937,13 @@ where
 				return Ok((tier, placement, gate::Reservation::none()));
 			}
 
-			if let Bytes::Admit(reservation) = gate.admit_bytes(v, waiter.is_head(), p, kick) {
+			// No kick from inside the wait: the worker polls SHORT while any
+			// set waits and every pass it ends wakes the head, so a kick here
+			// only started its next pass at once -- the head and the worker
+			// woke each other flat out, ~165,000 passes a second, for the whole
+			// wait (the critic of commit C's review). The first attempt's near
+			// kick and the kick at enqueue stay.
+			if let Bytes::Admit(reservation) = gate.admit_bytes(v, waiter.is_head(), p, || {}) {
 				waiter.admitted();
 				return Ok((Tier::Fast, Placement::Normal, reservation));
 			}

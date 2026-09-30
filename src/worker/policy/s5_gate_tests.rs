@@ -678,6 +678,40 @@ fn a_stall_ends_at_the_first_byte_freed() {
 	});
 }
 
+/// A waiting set does not spin the worker (the review of commit C's critic):
+/// every pass the worker ends wakes the lane's head, and a head that found P
+/// past N used to kick the worker straight back, so the two woke each other
+/// flat out for the whole wait -- ~165,000 passes a second -- instead of the
+/// 1 ms poll's thousand, the worker's pass loop competing with the clients it
+/// serves. The tier stuck (the consumers paused), one set waits out its window
+/// and errs; the worker's passes during the wait stay under five a
+/// millisecond. Red with the head kicking from inside its wait (`waitkick`).
+#[test]
+fn a_waiting_set_does_not_spin_the_worker() {
+	alone("a_waiting_set_does_not_spin_the_worker", || {
+		let _flush = test_hooks::no_flush();
+		let _m = test_hooks::override_m(M0);
+		let window = Duration::from_millis(500);
+		let cache = cache(PaperPolicy::LruCompactHybrid, gated(window, OnStall::Error));
+
+		let _pause = test_hooks::pause_consumers();
+		let next = fill(&cache, 0);
+
+		let passes = cache.status.gate().passes();
+		let start = Instant::now();
+		let result = cache.set(next, &value(next), None);
+		let took = start.elapsed();
+		let ran = cache.status.gate().passes() - passes;
+
+		eprintln!("no spin: {result:?} after {took:?}, {ran} worker passes ({:.0} a second)", ran as f64 / took.as_secs_f64());
+		assert!(matches!(result, Err(CacheError::FastTierStalled)), "{result:?}");
+		assert!(
+			ran < 5 * took.as_millis() as u64,
+			"the worker ran {ran} passes in a {took:?} wait: the head and the worker woke each other",
+		);
+	});
+}
+
 /// A rise of the close level does not end a stall (fix 3's worker half, the
 /// review of this commit): with the consumers paused nothing is freed and P
 /// stays put; M_model falling by 48 KiB raises B, and through the worker's
