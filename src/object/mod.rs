@@ -392,13 +392,13 @@ mod layout {
 	/// about the allocator rather than about the absence of a crash.
 	#[test]
 	fn dropping_the_last_handle_frees_the_value() {
-		// Asserts on THIS value's own strong count, not on the process-global
-		// `VALUE_FREES`. That counter is bumped by every test that drops a
-		// value, and cargo runs tests in parallel, so reading it as a delta
-		// raced everything else in the binary -- observed failing four runs in
-		// eight, reporting +2 where it required 0. Serialising the tests that
-		// read it does not help either, because the ones that MOVE it are all
-		// the others.
+		// Asserts on THIS value's own strong count, not on a process-global
+		// free counter (one existed, since removed). Such a counter is bumped by
+		// every test that drops a value, and cargo runs tests in parallel, so
+		// reading it as a delta raced everything else in the binary -- observed
+		// failing four runs in eight, reporting +2 where it required 0.
+		// Serialising the tests that read it does not help either, because the
+		// ones that MOVE it are all the others.
 		let object = Object::<u64, crate::value::BufferDRAM>::new(5, b"transient", None);
 		let snapshot = object.snapshot();
 

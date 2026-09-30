@@ -290,26 +290,7 @@ impl ArenaFrequencyChain {
 			+ bucket_bytes(&self.bucket_meter)
 	}
 
-	/// Pre-sizes the slab (whole chunks) and the index for `objects` entries.
-	///
-	/// The slab's own growth copies nothing: it appends a chunk. The index
-	/// still doubles, and each doubling rehashes every entry on the policy
-	/// worker, where the client latency columns structurally cannot observe
-	/// it. While the slab was a `Vec`, every doubling reallocated and COPIED
-	/// every entry as well: one multi-hundred-millisecond stall at eval-trace
-	/// scale, measured at 827 ms, that would never have surfaced as a
-	/// regression, because the policy stack runs behind an unbounded channel on
-	/// its own thread.
-	///
-	/// Reserving costs no resident memory: the pages are not touched until
-	/// entries occupy them.
-	pub fn reserve(&mut self, objects: usize) {
-		self.slots.reserve(objects);
-		self.index.reserve(&self.slots, objects);
-	}
-
 	pub fn len(&self) -> usize { self.fast_len + self.slow_len }
-	pub fn is_empty(&self) -> bool { self.len() == 0 }
 	pub fn fast_len(&self) -> usize { self.fast_len }
 	pub fn slow_len(&self) -> usize { self.slow_len }
 

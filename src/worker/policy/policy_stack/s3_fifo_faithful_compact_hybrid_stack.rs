@@ -190,10 +190,6 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 		self
 	}
 
-	pub fn fast_capacity(&self) -> CacheSize {
-		self.fast_capacity
-	}
-
 	/// Exposed for the fidelity tests.
 	pub fn is_ghost(&self, key: HashedKey) -> bool {
 		self.ghost.contains(key)

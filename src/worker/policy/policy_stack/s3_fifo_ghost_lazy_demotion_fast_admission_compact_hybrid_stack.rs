@@ -364,10 +364,6 @@ impl S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
 		newly
 	}
 
-	pub fn is_ghost(&self, key: HashedKey) -> bool {
-		self.ghost.contains(key)
-	}
-
 	/// A brand-new key whose fingerprint is in the ghost skips the one-access
 	/// queue and enters main directly, in the fast tier.
 	///

@@ -104,7 +104,7 @@ use std::{
 	alloc::Layout,
 	marker::PhantomData,
 	ptr::NonNull,
-	sync::atomic::{AtomicU32, AtomicU64, Ordering},
+	sync::atomic::{AtomicU32, Ordering},
 };
 
 /// The refcount, and the only thing besides the tag that stays in DRAM.
@@ -276,8 +276,6 @@ impl<K> Drop for ValueHeader<K> {
 
 		impl Drop for Free {
 			fn drop(&mut self) {
-				VALUE_FREES.fetch_add(1, Ordering::Relaxed);
-
 				// SAFETY: `ptr` came from the allocator `tier` names, with
 				// exactly `layout` -- see where the guard is built.
 				unsafe {
@@ -707,16 +705,6 @@ unsafe fn slow_dealloc(ptr: *mut u8, layout: Layout) {
 // lifetime: the refcount, and what is left to count
 // ---------------------------------------------------------------------------
 
-/// Value byte-allocations actually returned to an allocator.
-///
-/// v5 phase 1 needed a PAIR of counters here -- deferred and run -- because
-/// epoch reclamation put an unbounded-looking gap between the two, and the gap
-/// was the cache's un-reclaimed footprint. A refcount has no such gap: the
-/// last handle to drop frees, synchronously, on that thread. So there is one
-/// counter, and `deferred == run` is not a property that needs asserting
-/// because there is nothing to defer.
-pub static VALUE_FREES: AtomicU64 = AtomicU64::new(0);
-
 // ---------------------------------------------------------------------------
 // value shapes -- what is left of the old `ValueBuffer`
 // ---------------------------------------------------------------------------
@@ -848,8 +836,8 @@ mod tests {
 	const KEY: u64 = 0xC0FFEE;
 
 	/// EVERY test below that allocates a `TieredValue` holds this. The crate-
-	/// wide lock, not a private one: these tests race the `VALUE_FREES` and
-	/// `PENDING_DEMOTE` delta tests in other modules, and a lock only they took
+	/// wide lock, not a private one: these tests race the `PENDING_DEMOTE`
+	/// delta tests in other modules, and a lock only they took
 	/// would not serialise against those. See `value.rs` for the intermittent
 	/// failure that made it necessary.
 	fn routing_lock() -> MutexGuard<'static, ()> {

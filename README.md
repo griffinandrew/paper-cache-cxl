@@ -18,7 +18,7 @@ identical traces. Every hybrid build compiles all 24; the design is chosen at ru
 ## Requirements
 
 - **Nightly Rust.** The tiered value type is `Box<[u8], Hybrid>`, which needs
-  `allocator_api` and `clone_from_ref`. Every build command below uses `cargo +nightly`.
+  `allocator_api` (and `btreemap_alloc`). Every build command below uses `cargo +nightly`.
 - **A two-node NUMA machine.** `numa_alloc::NODE_FAST = 0` and `NODE_SLOW = 1` are compiled
   in. The crate still builds and runs on a single-node box, but the "slow tier" will not be
   physically distinct from the fast one, so latency numbers are meaningless.
@@ -282,7 +282,6 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | `MIGRATION_QUEUE_THREADS` | `2` | Migration consumer count. `0` disables the queue and applies migrations inline on the worker. |
 | `FAST_TIER_DRAIN_TARGET` | `0.98` | Fraction of the effective fast-tier budget the tier is continuously held at. `1.0` leaves no burst headroom. |
 | `NUMA_ARENAS_PER_NODE` | `8` | jemalloc arenas per node (clamped to 32). Swept on cluster12: a single arena costs 5% of SET latency at one client and 27% at sixteen, while 8→32 buys 1–2%, inside the run-to-run spread. |
-| `PAPER_NUMA_SLOW_TCACHE` | off | Per-thread cache for slow-tier allocations. Correct but measured not worth enabling. |
 | `PAPER_CACHE_EVICTION_STACK_CAPACITY` | — | Pre-sizes the eviction stack's backing collections. |
 
 ## Testing
@@ -305,11 +304,12 @@ contents are deterministic while still exercising the real queue path.
 
 ## Benchmarking
 
-There is no longer a `scripts/` directory in this repo. The old
+`scripts/` holds one tool, `probe_server.py`, a protocol probe for `paper_server`. The old
 `run_hybrid_benchmark_matrix.sh` rebuilt `paper-benchmark-cxl` once per design, rewriting the
-`features=[...]` line in its `Cargo.toml` between runs — a premise the unification removed. A
-single build now hosts all 24 designs, so a sweep is a loop over `PaperPolicy` values (or over
-their string forms, via `FromStr`) with no rebuild between cells.
+`features=[...]` line in its `Cargo.toml` between runs — a premise the unification removed (and
+the feature names it built no longer exist; it was deleted in R1). A single build now hosts all
+24 designs, so a sweep is a loop over `PaperPolicy` values (or over their string forms, via
+`FromStr`) with no rebuild between cells.
 
 `paper_cache::jemalloc_stats()` samples allocated/active/resident/mapped/retained at peak,
 which `stats_print:true` cannot do — that runs from an atexit handler, long after the cache

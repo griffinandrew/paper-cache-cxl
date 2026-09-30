@@ -129,10 +129,6 @@ impl TwoQCompactHybridStack {
 		self
 	}
 
-	pub fn fast_capacity(&self) -> CacheSize {
-		self.fast_capacity
-	}
-
 	/// Metadata reservation for EVERY tracked key, fast or slow: a demotion
 	/// moves the value and leaves the key's row, stack node and header in
 	/// DRAM. See `PolicyStack::dram_reserved_bytes` for the rule, and for why

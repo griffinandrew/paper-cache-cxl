@@ -137,10 +137,6 @@ impl TwoQGhostCompactHybridStack {
 		self
 	}
 
-	pub fn fast_capacity(&self) -> CacheSize {
-		self.fast_capacity
-	}
-
 	/// Metadata reservation for EVERY tracked key, fast or slow -- a demotion
 	/// moves the value and leaves the key's row, stack node and header in
 	/// DRAM -- plus the ghost filter's entries, which are DRAM as well. See
@@ -170,10 +166,6 @@ impl TwoQGhostCompactHybridStack {
 
 	fn effective_fast_capacity(&self) -> CacheSize {
 		self.fast_capacity.saturating_sub(self.reserved_overhead())
-	}
-
-	pub fn is_ghost(&self, key: HashedKey) -> bool {
-		self.ghost.contains(key)
 	}
 
 	/// A brand-new key whose fingerprint is in the ghost skips the FIFO and

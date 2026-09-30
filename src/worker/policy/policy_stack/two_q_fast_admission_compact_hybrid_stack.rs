@@ -144,10 +144,6 @@ impl TwoQFastAdmissionCompactHybridStack {
 		self
 	}
 
-	pub fn fast_capacity(&self) -> CacheSize {
-		self.fast_capacity
-	}
-
 	/// The FIFO's carve-out from the fast tier: its configured capacity, but
 	/// never more of the tier than the tier itself holds. The same accessor,
 	/// for the same reason, as

@@ -389,10 +389,6 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 		}
 	}
 
-	pub fn is_midpoint(&self, key: HashedKey) -> bool {
-		self.slow_midpoint == Some(key)
-	}
-
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize, new_resident: u8) {
 		let Some(payload) = self.queues.payload_mut(key) else { return };
 

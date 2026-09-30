@@ -612,20 +612,12 @@ std::thread_local! {
 	/// `arenas.create` performs do not recurse into it.
 	static IN_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
-	/// This thread's explicit tcache for slow-tier allocations.
-	///
-	/// The slow tier cannot share the default tcache with the fast tier: a
-	/// cache bin is indexed by size class alone and `tcache_alloc_small`
-	/// returns whatever block it holds without consulting the arena, so one
-	/// cache serving both nodes would hand a node-0 block to a node-1
-	/// request. Contrast TBB, which gets this isolation structurally by
-	/// having two independent pools rather than one allocator with several
-	/// arenas.
+	/// This thread's explicit tcache for value-buffer allocations
+	/// (`value_tcache_flag`).
 	///
 	/// Per *thread*, not per arena slot: arenas are lock-protected and safe to
 	/// share, tcaches are not, so two threads mapped to the same slot must
 	/// still hold different tcaches.
-	static SLOW_TCACHE: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
 	static VALUE_TCACHE: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
 
 	/// Guards the allocation `tcache.create` itself performs.
@@ -642,100 +634,6 @@ std::thread_local! {
 
 /// Number of explicit tcaches created, for observability.
 static TCACHES_CREATED: AtomicU64 = AtomicU64::new(0);
-
-/// This thread's slow-tier tcache flag, creating the tcache on first use.
-///
-/// Returns `MALLOCX_TCACHE_NONE` if one cannot be created, which is correct
-/// but uncached -- never the default tcache, which would reintroduce the
-/// cross-node mixing this exists to prevent.
-/// Whether slow-tier caching is on. Off by default; `PAPER_NUMA_SLOW_TCACHE=1`
-/// enables it.
-///
-/// Measured on cluster12 (15 GB cap / 5 GB fast tier), caching against
-/// `MALLOCX_TCACHE_NONE`, exact two-sided permutation tests:
-///
-/// ```text
-///            1 client (n=3/2)        8 clients (n=4/5)
-///   SET      -0.91%  not resolved    -1.00%  p=0.603
-///   GET      -0.36%  not resolved    -0.86%  p=0.294
-///   RSS      +0.13%  not resolved    +5.49%  p=0.056
-/// ```
-///
-/// Re-measured later on 8 arenas per node with the `dalloc`-under-retain fix
-/// in place (cluster12, 4M accesses, 15 GB / 1 GB, n=3 per arm):
-///
-/// ```text
-///            1 client              8 clients
-///   GET      +0.41%  p=0.30        -2.31%  p=0.20
-///   SET      +0.18%  p=0.50        -3.45%  p=0.50
-///   RSS      +0.00%  p=1.00        +0.35%  p=1.00
-/// ```
-///
-/// Directionally better than the first measurement -- the RSS cost is gone
-/// and the concurrent latencies favour it -- but nothing clears significance
-/// (n=3v3 floors p at 0.10).
-///
-/// It also does not compose with worker binding, which is on by default: at
-/// 8 clients binding alone moves SET -7.00%, while binding plus this knob
-/// moves it only -2.52%. Whatever binding gains, caching gives most of it
-/// back. Left off for that reason; `PAPER_NUMA_SLOW_TCACHE=1` enables it.
-///
-/// Correctness is settled independently of the performance question, see
-/// `tcache_hits_preserve_node_placement` and
-/// `concurrent_tcache_creation_is_safe`.
-///
-/// Read with `getenv` rather than `std::env::var` because this is reached from
-/// inside allocation and must not itself allocate.
-fn slow_tcache_enabled() -> bool {
-	static ENABLED: OnceLock<bool> = OnceLock::new();
-	*ENABLED.get_or_init(|| unsafe {
-		let raw = libc::getenv(c"PAPER_NUMA_SLOW_TCACHE".as_ptr());
-		!raw.is_null() && *raw == b'1' as libc::c_char
-	})
-}
-
-#[inline]
-fn slow_tcache_flag() -> c_int {
-	if !slow_tcache_enabled() {
-		return mallocx_tcache_none();
-	}
-
-	let existing = SLOW_TCACHE.with(|t| t.get());
-	if existing != u32::MAX {
-		return mallocx_tcache(existing);
-	}
-
-	// `tcache.create` allocates, which re-enters this function; the guard
-	// makes that inner allocation uncached rather than recursive.
-	if IN_TCACHE_INIT.with(|f| f.get()) {
-		return mallocx_tcache_none();
-	}
-
-	IN_TCACHE_INIT.with(|f| f.set(true));
-
-	let mut id: c_uint = 0;
-	let mut sz = size_of::<c_uint>();
-	let rc = unsafe {
-		mallctl(
-			c"tcache.create".as_ptr(),
-			(&raw mut id).cast(),
-			&raw mut sz,
-			std::ptr::null_mut(),
-			0,
-		)
-	};
-
-	IN_TCACHE_INIT.with(|f| f.set(false));
-
-	if rc != 0 {
-		return mallocx_tcache_none();
-	}
-
-	SLOW_TCACHE.with(|t| t.set(id));
-	TCACHES_CREATED.fetch_add(1, Ordering::Relaxed);
-
-	mallocx_tcache(id)
-}
 
 /// Creates one arena bound to `node`.
 fn create_node_arena(node: u32) -> Option<(c_uint, &'static NumaHooks)> {
@@ -891,7 +789,7 @@ fn flags_for(node: u32, align: usize) -> Option<c_int> {
 	if node == NODE_FAST_VALUES {
 		flags |= value_tcache_flag();
 	} else if node != NODE_FAST {
-		flags |= slow_tcache_flag();
+		flags |= mallocx_tcache_none();
 	}
 
 	if align > 1 {
@@ -1214,7 +1112,7 @@ unsafe impl<const NODE: u32> std::alloc::GlobalAlloc for NumaAlloc<NODE> {
 		} else if NODE == NODE_FAST_VALUES {
 			value_tcache_flag()
 		} else {
-			slow_tcache_flag()
+			mallocx_tcache_none()
 		};
 
 		if layout.align() > 1 {
@@ -1519,11 +1417,10 @@ pub fn stats() -> String {
 	format!(
 		"NUMAALLOC fast[mapped={fm} unmapped={fu} live={} mbind_ok={fok} mbind_failed={ffail} declined={fdec}] \
 slow[mapped={sm} unmapped={su} live={} mbind_ok={sok} mbind_failed={sfail} declined={sdec}] \
-unbound_fallbacks={} slow_tcache={} slow_tcaches={}",
+unbound_fallbacks={} tcaches={}",
 		fm.saturating_sub(fu),
 		sm.saturating_sub(su),
 		UNBOUND_FALLBACKS.load(Ordering::Relaxed),
-		if slow_tcache_enabled() { "on" } else { "off" },
 		TCACHES_CREATED.load(Ordering::Relaxed),
 	)
 }
@@ -2162,249 +2059,6 @@ fast_grew={grew_fast} slow_grew={grew_slow} -> on_target={target} elsewhere={oth
 		}
 	}
 
-	/// Blocks served *from* a tcache must still be on the right node.
-	///
-	/// This is the case the 256 MB `placement_check` tests cannot reach:
-	/// jemalloc's tcache only caches up to `opt.tcache_max` (32 KiB default),
-	/// so every existing placement test bypasses the cache entirely and would
-	/// pass even with the tcache flags wrong.
-	///
-	/// The hazard is specific: a cache bin is indexed by size class alone, and
-	/// on a hit `tcache_alloc_small` returns the cached block without ever
-	/// consulting `MALLOCX_ARENA`. So the arena flag is decorative on the hit
-	/// path, and correctness rests entirely on a cache never holding two
-	/// nodes' blocks. Interleaving same-size fast and slow allocations on one
-	/// thread, then freeing both, is the shortest path to violating that if
-	/// the flags are wrong.
-	#[test]
-	#[ignore = "needs PAPER_NUMA_SLOW_TCACHE=1; slow-tier tcache is off by default, so this returns without asserting anything"]
-	fn tcache_hits_preserve_node_placement() {
-		// Off by default, so this must opt in or it would assert on the
-		// uncached path and quietly stop testing what it names.
-		if !slow_tcache_enabled() {
-			eprintln!("skipping: set PAPER_NUMA_SLOW_TCACHE=1 to test the cached path");
-			return;
-		}
-
-		assert!(init(), "arena pool must build");
-
-		// Comfortably under tcache_max so these are cached, not extent-backed.
-		const BLOCK: usize = 4096;
-		const N: usize = 512;
-		const ROUNDS: usize = 6;
-
-		let layout = Layout::from_size_align(BLOCK, 64).unwrap();
-		let mut checked = 0usize;
-
-		// Pool construction itself allocates before the arenas exist, so a
-		// non-zero baseline is expected and is not what this test is about.
-		// Only the delta across the churn below can be attributed to tcaches.
-		let unbound_before = UNBOUND_FALLBACKS.load(Ordering::Relaxed);
-
-		for round in 0..ROUNDS {
-			let mut fast = Vec::with_capacity(N);
-			let mut slow = Vec::with_capacity(N);
-
-			// Interleave so both tiers churn the same size class together.
-			for _ in 0..N {
-				let f = FastAlloc::default().allocate(layout).expect("fast");
-				let s = SlowAlloc::default().allocate(layout).expect("slow");
-				unsafe {
-					std::ptr::write_volatile(f.as_ptr().cast::<u8>(), 1u8);
-					std::ptr::write_volatile(s.as_ptr().cast::<u8>(), 1u8);
-				}
-				fast.push(f);
-				slow.push(s);
-			}
-
-			// Rounds after the first are served from the tcache the frees below
-			// populated -- that is the path under test.
-			if round > 0 {
-				for p in &fast {
-					let n = node_of(p.as_ptr().cast());
-					assert_eq!(
-						n, NODE_FAST as i32,
-						"round {round}: fast block on node {n}; a tcache served \
-						 a node-1 block to a fast-tier request"
-					);
-					checked += 1;
-				}
-				for p in &slow {
-					let n = node_of(p.as_ptr().cast());
-					assert_eq!(
-						n, NODE_SLOW as i32,
-						"round {round}: slow block on node {n}; a tcache served \
-						 a node-0 block to a slow-tier request"
-					);
-					checked += 1;
-				}
-			}
-
-			unsafe {
-				for p in fast { FastAlloc::default().deallocate(p.cast(), layout); }
-				for p in slow { SlowAlloc::default().deallocate(p.cast(), layout); }
-			}
-		}
-
-		let report = stats();
-		println!("TCACHE PLACEMENT checked={checked} blocks -- {report}");
-		assert!(checked > 0, "no cached blocks were verified");
-		assert!(
-			report.contains("mbind_failed=0"),
-			"an mbind failed: {report}"
-		);
-		let leaked = UNBOUND_FALLBACKS.load(Ordering::Relaxed) - unbound_before;
-		println!("TCACHE unbound_delta={leaked} (baseline {unbound_before})");
-		assert_eq!(
-			leaked, 0,
-			"{leaked} allocations fell through to unbound memory during tcache \
-			 churn (baseline was {unbound_before}): {report}"
-		);
-	}
-
-	/// Many threads reaching tcache creation at once must not deadlock.
-	///
-	/// `tcache.create` allocates, so it re-enters the allocator on the very
-	/// path that is trying to set it up. The previous implementation
-	/// deadlocked on exactly this shape of reentrancy, so the guard is tested
-	/// under contention rather than on one thread.
-	#[test]
-	#[ignore = "needs PAPER_NUMA_SLOW_TCACHE=1; slow-tier tcache is off by default, so this returns without asserting anything"]
-	fn concurrent_tcache_creation_is_safe() {
-		// Off by default, so this must opt in or it would assert on the
-		// uncached path and quietly stop testing what it names.
-		if !slow_tcache_enabled() {
-			eprintln!("skipping: set PAPER_NUMA_SLOW_TCACHE=1 to test the cached path");
-			return;
-		}
-
-		assert!(init(), "arena pool must build");
-
-		const THREADS: usize = 32;
-		const PER_THREAD: usize = 400;
-		const BLOCK: usize = 2048;
-
-		let before = TCACHES_CREATED.load(Ordering::Relaxed);
-		let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
-		let bad = std::sync::Arc::new(AtomicU64::new(0));
-
-		let handles: Vec<_> = (0..THREADS)
-			.map(|_| {
-				let barrier = barrier.clone();
-				let bad = bad.clone();
-				std::thread::spawn(move || {
-					let layout = Layout::from_size_align(BLOCK, 64).unwrap();
-					// Release every thread into its first slow allocation
-					// simultaneously -- that is the creation path.
-					barrier.wait();
-					for _ in 0..PER_THREAD {
-						let f = FastAlloc::default().allocate(layout).expect("fast");
-						let s = SlowAlloc::default().allocate(layout).expect("slow");
-						unsafe {
-							std::ptr::write_volatile(f.as_ptr().cast::<u8>(), 1u8);
-							std::ptr::write_volatile(s.as_ptr().cast::<u8>(), 1u8);
-						}
-						if node_of(f.as_ptr().cast()) != NODE_FAST as i32
-							|| node_of(s.as_ptr().cast()) != NODE_SLOW as i32
-						{
-							bad.fetch_add(1, Ordering::Relaxed);
-						}
-						unsafe {
-							FastAlloc::default().deallocate(f.cast(), layout);
-							SlowAlloc::default().deallocate(s.cast(), layout);
-						}
-					}
-				})
-			})
-			.collect();
-
-		for h in handles {
-			h.join().expect("no thread may panic or hang");
-		}
-
-		let created = TCACHES_CREATED.load(Ordering::Relaxed) - before;
-		let misplaced = bad.load(Ordering::Relaxed);
-		println!(
-			"CONCURRENT threads={THREADS} tcaches_created={created} misplaced={misplaced} -- {}",
-			stats()
-		);
-		assert_eq!(misplaced, 0, "{misplaced} blocks landed on the wrong node");
-		// `>=`, not `==`: the counter is process-global, so if another test
-		// runs concurrently with the tcache enabled it also creates tcaches.
-		// What this test needs is that each of its own threads got one.
-		assert!(
-			created >= THREADS as u64,
-			"expected at least one tcache per thread ({THREADS}), got {created}"
-		);
-	}
-
-	/// Quantify what departing threads leave behind.
-	///
-	/// Explicit tcaches are process-lived, not thread-lived: jemalloc does not
-	/// destroy one when the thread that created it exits, so its cached blocks
-	/// stay retained. Long-lived workers make this bounded, but it is a real
-	/// cost under thread churn and worth a number rather than a caveat.
-	#[test]
-	#[ignore = "needs PAPER_NUMA_SLOW_TCACHE=1; slow-tier tcache is off by default, so this returns without asserting anything"]
-	fn departed_threads_leak_their_tcaches() {
-		// Off by default, so this must opt in -- with caching disabled no
-		// tcache is created and there is nothing to leak.
-		if !slow_tcache_enabled() {
-			eprintln!("skipping: set PAPER_NUMA_SLOW_TCACHE=1 to measure tcache retention");
-			return;
-		}
-
-		assert!(init(), "arena pool must build");
-
-		const CHURN: usize = 200;
-		let before = TCACHES_CREATED.load(Ordering::Relaxed);
-		let slow_before = SLOW_ARENAS
-			.get()
-			.and_then(|a| a.as_ref())
-			.map(|a| a.hooks.iter().flatten().map(|h| {
-				h.mapped_bytes.load(Ordering::Relaxed) - h.unmapped_bytes.load(Ordering::Relaxed)
-			}).sum::<u64>())
-			.unwrap_or(0);
-
-		for _ in 0..CHURN {
-			std::thread::spawn(|| {
-				let layout = Layout::from_size_align(4096, 64).unwrap();
-				let p = SlowAlloc::default().allocate(layout).expect("slow");
-				unsafe {
-					std::ptr::write_volatile(p.as_ptr().cast::<u8>(), 1u8);
-					SlowAlloc::default().deallocate(p.cast(), layout);
-				}
-			})
-			.join()
-			.expect("thread");
-		}
-
-		let created = TCACHES_CREATED.load(Ordering::Relaxed) - before;
-		let slow_after = SLOW_ARENAS
-			.get()
-			.and_then(|a| a.as_ref())
-			.map(|a| a.hooks.iter().flatten().map(|h| {
-				h.mapped_bytes.load(Ordering::Relaxed) - h.unmapped_bytes.load(Ordering::Relaxed)
-			}).sum::<u64>())
-			.unwrap_or(0);
-
-		println!(
-			"CHURN threads={CHURN} tcaches_created={created} \
-			 slow_live_delta={} bytes ({:.2} KiB/thread)",
-			slow_after as i64 - slow_before as i64,
-			(slow_after as i64 - slow_before as i64) as f64 / CHURN as f64 / 1024.0
-		);
-
-		// Documents the behaviour rather than asserting it away: one tcache
-		// per departed thread, never reclaimed.
-		// `>=` for the same reason as `concurrent_tcache_creation_is_safe`:
-		// the counter is process-global.
-		assert!(
-			created >= CHURN as u64,
-			"expected at least one tcache per churned thread ({CHURN}), got {created}"
-		);
-	}
-
 }
 
 
@@ -2515,7 +2169,7 @@ fn value_tcache_flag() -> c_int {
 /// The segregated DRAM value pool as a plain unit struct.
 ///
 /// Same two-namespace reason as [`SlowObjects`]: `Box<[u8], FastValues>` needs
-/// the type and `Box::clone_from_ref_in(bytes, FastValues)` needs the value.
+/// the type and building one from bytes needs the value.
 /// Delegates everything to `NumaAlloc<NODE_FAST_VALUES>`.
 #[derive(Clone, Copy, Default)]
 pub struct FastValues;

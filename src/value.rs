@@ -185,7 +185,7 @@
 use std::{
 	alloc::Layout,
 	ptr::NonNull,
-	sync::atomic::{AtomicU32, AtomicU64, Ordering},
+	sync::atomic::{AtomicU32, Ordering},
 };
 
 /// The refcount. `triomphe::Arc` rather than `std::sync::Arc` because std's
@@ -326,8 +326,6 @@ impl ValueBytes {
 	unsafe fn free(self, len: u32) {
 		let layout = value_layout(len);
 		let ptr = self.raw();
-
-		VALUE_FREES.fetch_add(1, Ordering::Relaxed);
 
 		// SAFETY: by the contract above `ptr` came from the allocator this arm
 		// names, with exactly `layout`.
@@ -736,16 +734,6 @@ unsafe fn slow_dealloc(ptr: *mut u8, layout: Layout) {
 // lifetime: the refcount, and what is left to count
 // ---------------------------------------------------------------------------
 
-/// Value byte-allocations actually returned to an allocator.
-///
-/// v5 phase 1 needed a PAIR of counters here -- deferred and run -- because
-/// epoch reclamation put an unbounded-looking gap between the two, and the gap
-/// was the cache's un-reclaimed footprint. A refcount has no such gap: the
-/// last handle to drop frees, synchronously, on that thread. So there is one
-/// counter, and `deferred == run` is not a property that needs asserting
-/// because there is nothing to defer.
-pub static VALUE_FREES: AtomicU64 = AtomicU64::new(0);
-
 // ---------------------------------------------------------------------------
 // value shapes -- what is left of the old `ValueBuffer`
 // ---------------------------------------------------------------------------
@@ -896,7 +884,7 @@ mod tests {
 	/// only hides which one broke.
 	fn routing_lock() -> MutexGuard<'static, ()> {
 		// The crate-wide lock, not a private one: these tests race the
-		// `VALUE_FREES` and `PENDING_DEMOTE` delta tests in other modules, and
+		// `PENDING_DEMOTE` delta tests in other modules, and
 		// a lock only they take would not serialise against those at all.
 		crate::global_counter_lock()
 	}

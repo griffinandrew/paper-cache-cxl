@@ -3258,3 +3258,25 @@ was measured not to pay -- is gone with its two env knobs, and with it and the m
 with the trace. `PolicyStack::is_policy` and `::contains` stay for the tests that use them. In a
 merged build the split stacks are compiled for the lib's tests only: the mini stacks were the only
 thing that built one there.
+
+## Removed dead code (R1)
+
+The plan's dead-code list, which needed no decision from the user (the two removals above were his
+requests): `src/value_stress.rs` (an `#[ignore]`d ten-second gate: eight readers against a flapper
+and an overwriter) and `policy_stack/merged_prototype.rs` (a test-only prototype no path reached);
+`get_into`'s sampled step profiler (`GETINTO_PROFILE=1`, its `GI_*` statics and the report `Drop`
+printed -- the analysis it served is in the benchmark repo's results); the `VALUE_FREES` counter
+(bumped, never read); `PAPER_NUMA_SLOW_TCACHE`, the slow tier's opt-in per-thread tcache (off by
+default, measured not worth enabling), with its three `#[ignore]`d tests, and the `slow_tcache=` /
+`slow_tcaches=` fields of `numa_alloc::stats()` (now `tcaches=`); a measurement in
+`arena_queue_set.rs` gated on a `merged_object_store_v3` feature that does not exist, so never
+compiled; the `byteorder` and `sysinfo` dependencies and the `clone_from_ref` nightly gate, which
+nothing used; `scripts/run_hybrid_benchmark_matrix.sh` (it built four features that no longer
+exist); an empty file named `]"` that commit 36dfc51 left in `policy_stack/`; and 29 accessors the
+compiler flags as never used in every one of the 17 builds of the
+suite harness -- the `fast_capacity` getters of the hybrid stacks, the `is_ghost` / `is_midpoint` /
+`is_in_slow_tail` probes, `reserve` / `slab_capacity` / `is_empty` of the compact chains and queue
+sets, and the sized stack's three getters. Kept although all 17 builds flag it: the faithful
+S3-FIFO core's `is_ghost`, which the fidelity tests of the four `s3_fifo_faithful_*` features call
+(no suite build compiles them; a wide compile check of every feature alone found it). Nothing
+of the tiered designs, the flat stacks or the build features was touched: those are R2's.

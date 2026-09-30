@@ -197,11 +197,6 @@ impl LruLfuCompactHybridStack {
 		self
 	}
 
-	/// The configured fast-tier byte budget.
-	pub fn fast_capacity(&self) -> CacheSize {
-		self.fast_capacity
-	}
-
 	/// The configured promotion threshold, after clamping.
 	pub fn promote_k(&self) -> u16 {
 		self.promote_k as u16

@@ -180,10 +180,6 @@ impl LruLazyCopyCompactHybridStack {
 		self
 	}
 
-	pub fn fast_capacity(&self) -> CacheSize {
-		self.logical_capacity()
-	}
-
 	pub fn copies_avoided(&self) -> u64 {
 		self.copies_avoided
 	}

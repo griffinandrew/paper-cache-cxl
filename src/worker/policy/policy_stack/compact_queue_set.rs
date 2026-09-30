@@ -144,25 +144,6 @@ impl<P: Copy> Default for CompactQueueSet<P> {
 }
 
 impl<P: Copy> CompactQueueSet<P> {
-	/// Pre-sizes the slab and index. Growth is never in place: every `Vec`
-	/// doubling copies every entry, which at eval-trace scale is one
-	/// multi-hundred-millisecond stall on the policy worker that the client
-	/// latency percentiles structurally cannot observe. Reserving costs no
-	/// resident memory, since untouched pages are not resident.
-	/// Slab slots currently allocated. Exposed so a test can assert that
-	/// construction does NOT allocate from the cache budget: these stacks
-	/// grow dynamically, and an eager reservation sized from capacity was
-	/// removed because it reserved 16x what the eval workload can hold
-	/// while still not preventing doubling on the real traces.
-	pub fn slab_capacity(&self) -> usize {
-		self.slots.capacity()
-	}
-
-	pub fn reserve(&mut self, objects: usize) {
-		self.slots.reserve(objects);
-		self.index.reserve(objects);
-	}
-
 	pub fn len(&self) -> usize {
 		self.lens.iter().sum()
 	}

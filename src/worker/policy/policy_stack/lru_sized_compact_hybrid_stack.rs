@@ -221,21 +221,6 @@ impl LruSizedCompactHybridStack {
 		self
 	}
 
-	/// The configured SMALL fast segment's byte budget.
-	pub fn small_capacity(&self) -> CacheSize {
-		self.small_capacity
-	}
-
-	/// The configured LARGE fast segment's byte budget.
-	pub fn large_capacity(&self) -> CacheSize {
-		self.large_capacity
-	}
-
-	/// The current small/large size-classification threshold.
-	pub fn size_threshold(&self) -> CacheSize {
-		self.size_threshold
-	}
-
 	/// The tier the given (currently tracked) key is in, or `None` if the key
 	/// isn't tracked. Derived from the queue tag, which is where the tier
 	/// actually lives here: the shared node HAS a `tier` field and this stack

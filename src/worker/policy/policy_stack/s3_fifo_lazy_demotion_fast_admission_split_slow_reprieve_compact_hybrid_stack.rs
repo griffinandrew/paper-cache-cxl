@@ -390,13 +390,6 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 		self.queues.payload(key).map(|payload| Queue::from_u8(payload.queue).tier())
 	}
 
-	/// Returns `true` if `key` currently sits in the older (`slow_tail`) slow
-	/// segment -- i.e. it has already survived a crossing check. Exposed for
-	/// tests, exactly as on the baseline.
-	pub fn is_in_slow_tail(&self, key: HashedKey) -> bool {
-		self.queues.payload(key).map(|payload| payload.queue) == Some(Queue::SlowTail as u8)
-	}
-
 	/// `new_resident` refreshes the entry's DRAM-resident remainder: a re-set
 	/// can add or drop a TTL, which changes it by the `Expiries` entry's cost.
 	fn resize_key(&mut self, key: HashedKey, new_size: ObjectSize, new_resident: u8) {

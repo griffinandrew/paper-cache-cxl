@@ -25,7 +25,6 @@ crossbeam-channel = "0.5.15"
 # until every pin that could have observed the old pointer has ended.
 crossbeam-epoch = "0.9"
 typesize = "0.1.14"
-byteorder = "1.5.0"
 parking_lot = "0.12.4"
 log = "0.4.28"
 nohash-hasher = "0.2.0"
@@ -52,7 +51,6 @@ libc = "0.2.177"
 tikv-jemalloc-sys = { version = "0.6.1", features = ["stats"] }
 hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"
-sysinfo = "=0.33"
 triomphe = { version = "0.1.16", default-features = false, features = ["std"] }
 
 

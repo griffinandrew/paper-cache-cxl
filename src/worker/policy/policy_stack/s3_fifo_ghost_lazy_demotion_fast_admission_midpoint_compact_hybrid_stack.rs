@@ -376,16 +376,6 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack {
 		newly
 	}
 
-	pub fn is_ghost(&self, key: HashedKey) -> bool {
-		self.ghost.contains(key)
-	}
-
-	/// Whether `key` is the object the mid-slow-segment cursor currently
-	/// tracks. Mirrors the baseline's accessor of the same name.
-	pub fn is_midpoint(&self, key: HashedKey) -> bool {
-		self.slow_midpoint == Some(key)
-	}
-
 	/// A brand-new key whose fingerprint is in the ghost skips the one-access
 	/// queue and enters main directly, in the fast tier.
 	///
