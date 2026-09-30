@@ -383,8 +383,9 @@ pub(crate) fn observe() -> i64 {
 }
 
 /// Migration-queue entries handed to the consumers and not yet finished, as
-/// `(demotions, promotions)`. Process-global, like the queue's own counters.
-/// Entry counts only: queue entries carry no sizes, so pending BYTES wait for
+/// `(demotions, promotions)`, summed over every cache in the process
+/// (process-global, like P); each cache's own are `HybridStats::pending_demote`
+/// and `pending_promote`. Entry counts only: queue entries carry no sizes, so pending BYTES wait for
 /// a later step. Always `(0, 0)` under `MIGRATION_QUEUE_THREADS=0`, where
 /// nothing is queued.
 pub fn pending_migrations() -> (u64, u64) {

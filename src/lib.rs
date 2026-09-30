@@ -226,7 +226,9 @@ use log::info;
 
 /// INSTRUMENTATION: times the eviction loop fell back to evicting a random
 /// object because the policy stack had no candidate. That path drops the
-/// object from the map WITHOUT removing it from the stack.
+/// object from the map WITHOUT removing it from the stack. The PROCESS-WIDE
+/// total, over every cache; each cache's own count is in its statistics
+/// (`HybridStats::erase_fallbacks`, and the DIVERGE line's `fallback`).
 pub static ERASE_FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 
@@ -1274,7 +1276,7 @@ where
 
 		// No key: the stack has none to nominate. The store names the victim
 		// it falls back to, or none at all.
-		None => Removal::fallback_victim(&**objects)?,
+		None => Removal::fallback_victim(&**objects, &status.migstats().erase_fallbacks)?,
 	};
 
 	let taken = match maybe_key {

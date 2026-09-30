@@ -37,8 +37,10 @@ pub trait Removal<K, V> {
 
 	/// The key `erase` evicts when it was given none -- the stack ran out of
 	/// candidates while the map did not, a stack behind its map. `Internal` if
-	/// there is none to name.
-	fn fallback_victim(&self) -> Result<HashedKey, CacheError>;
+	/// there is none to name. `fallbacks` is the calling cache's own count of
+	/// such evictions (`migstats::Stats::erase_fallbacks`), which a store that
+	/// takes this path counts in.
+	fn fallback_victim(&self, fallbacks: &std::sync::atomic::AtomicU64) -> Result<HashedKey, CacheError>;
 }
 
 impl<K, V> Removal<K, V> for DashMap<HashedKey, Object<K, V>, NoHasher> {
@@ -70,9 +72,11 @@ impl<K, V> Removal<K, V> for DashMap<HashedKey, Object<K, V>, NoHasher> {
 	/// INSTRUMENTATION: this path removes an object from the MAP without
 	/// informing the eviction STACK, which is exactly the shape of the observed
 	/// map>stack divergence. Counted so the hypothesis is testable rather than
-	/// plausible.
-	fn fallback_victim(&self) -> Result<HashedKey, CacheError> {
+	/// plausible: in the cache's own `fallbacks` and in the process-wide
+	/// `crate::ERASE_FALLBACK`.
+	fn fallback_victim(&self, fallbacks: &std::sync::atomic::AtomicU64) -> Result<HashedKey, CacheError> {
 		crate::ERASE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
 		// The stack has run out of keys to evict while the map has not (a stack
 		// behind its map), so this falls back to evicting a random object.
@@ -97,7 +101,7 @@ impl<K, V> Removal<K, V> for crate::merged_store::MergedStore<K, V> {
 
 	/// None: the eviction order is the store itself, which cannot run behind
 	/// its own map.
-	fn fallback_victim(&self) -> Result<HashedKey, CacheError> {
+	fn fallback_victim(&self, _fallbacks: &std::sync::atomic::AtomicU64) -> Result<HashedKey, CacheError> {
 		Err(CacheError::Internal)
 	}
 }

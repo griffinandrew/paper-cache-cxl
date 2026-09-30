@@ -97,6 +97,15 @@ pub struct AtomicStatus {
 	/// disagree.
 	eviction_watermarks: crate::worker::Watermarks,
 
+	/// This cache's migration and eviction statistics (`MIGSTATS`): owned here
+	/// because the status is the one structure its clients, its policy worker
+	/// and its migration consumers all hold, so each cache starts at zero and
+	/// reports only its own work (S8; they were process-global statics).
+	/// Exported through `hybrid_stats`. Boxed: a block of its own, so the
+	/// counters the worker and the consumers write do not share cache lines
+	/// with the request counters the clients write.
+	migstats: Box<crate::worker::MigStats>,
+
 	total_hits: AtomicU64,
 	total_gets: AtomicU64,
 	total_sets: AtomicU64,
@@ -409,6 +418,8 @@ impl AtomicStatus {
 
 			eviction_watermarks: crate::worker::Watermarks::from_env(),
 
+			migstats: Box::default(),
+
 			total_hits: AtomicU64::default(),
 			total_gets: AtomicU64::default(),
 			total_sets: AtomicU64::default(),
@@ -639,6 +650,11 @@ impl AtomicStatus {
 	/// status was built.
 	pub(crate) fn eviction_watermarks(&self) -> crate::worker::Watermarks {
 		self.eviction_watermarks
+	}
+
+	/// This cache's migration and eviction statistics (`MIGSTATS`).
+	pub(crate) fn migstats(&self) -> &crate::worker::MigStats {
+		&self.migstats
 	}
 
 	/// Whether a set of an object with this BASE size must be refused
@@ -907,7 +923,9 @@ impl AtomicStatus {
 			reconcile_get_to_fast,
 			reconcile_set_new_key,
 			reconcile_get_heal_skipped,
-		) = crate::worker::reconciled();
+		) = self.migstats.reconciled();
+
+		let migstats = &self.migstats;
 
 		let gate = self.gate.stats();
 
@@ -979,13 +997,37 @@ impl AtomicStatus {
 			band_s: gate.bands.s,
 			band_n: gate.bands.n,
 			band_b: gate.bands.b,
+			queue_depth_max: migstats.queue_depth_max.load(Ordering::Relaxed),
+			burst_max: migstats.burst_max.load(Ordering::Relaxed),
+			pending_demote: migstats.pending_demote.load(Ordering::Acquire),
+			pending_promote: migstats.pending_promote.load(Ordering::Acquire),
+			pending_demote_max: migstats.pending_demote_max.load(Ordering::Relaxed),
+			pending_promote_max: migstats.pending_promote_max.load(Ordering::Relaxed),
+			pending_net_max: migstats.pending_net_max.load(Ordering::Relaxed),
+			mig_applied: migstats.mig_applied.load(Ordering::Relaxed),
+			mig_gone: migstats.mig_gone.load(Ordering::Relaxed),
+			mig_declined: migstats.mig_declined.load(Ordering::Relaxed),
+			mig_superseded: migstats.mig_superseded.load(Ordering::Relaxed),
+			mig_calls: migstats.calls.load(Ordering::Relaxed),
+			evict_calls: migstats.ecalls.load(Ordering::Relaxed),
+			demo_tot: migstats.demo_tot.load(Ordering::Relaxed),
+			promo_tot: migstats.promo_tot.load(Ordering::Relaxed),
+			evict_tot: migstats.evict_tot.load(Ordering::Relaxed),
+			coalesced_tot: migstats.coalesced_tot.load(Ordering::Relaxed),
+			demo_hist: crate::worker::migstats_read(&migstats.demo),
+			promo_hist: crate::worker::migstats_read(&migstats.promo),
+			evict_hist: crate::worker::migstats_read(&migstats.evict),
+			reconcile_queued_to_fast: migstats.reconcile_queued_to_fast.load(Ordering::Relaxed),
+			reconcile_queued_to_slow: migstats.reconcile_queued_to_slow.load(Ordering::Relaxed),
+			erase_fallbacks: migstats.erase_fallbacks.load(Ordering::Relaxed),
 		}
 	}
 
 	/// Records completed correctives (`MigrationOrigin::Reconcile`), by
-	/// destination, for this cache and in the process-global MIGSTATS totals
-	/// -- batched like `record_hybrid_promotions`, and never counted as
-	/// promotions or demotions.
+	/// destination, in this cache's totals (reset by a wipe, like the
+	/// promotions) and in its MIGSTATS block (cumulative) -- batched like
+	/// `record_hybrid_promotions`, and never counted as promotions or
+	/// demotions.
 	#[cfg(feature = "hybrid_cache_common")]
 	pub(crate) fn record_reconcile_applied(&self, to_fast: u64, to_slow: u64) {
 		if to_fast != 0 {
@@ -996,7 +1038,7 @@ impl AtomicStatus {
 			self.hybrid_reconcile_applied_to_slow.fetch_add(to_slow, Ordering::Relaxed);
 		}
 
-		crate::worker::reconcile_applied(to_fast, to_slow);
+		self.migstats.reconcile_applied(to_fast, to_slow);
 	}
 
 	/// The migration pipeline's per-key-bucket counts

@@ -59,6 +59,7 @@ pub mod migration_queue {
 
 	use crate::object_store::ObjectStore;
 	use crate::{HashedKey, ObjectMapRef, StatusRef};
+	use crate::worker::policy::migstats::Stats as MigStats;
 	use crate::worker::policy::policy_stack::{MigrationEntry, MigrationOrigin, TaggedMigration, Tier};
 
 	/// Default consumer count.
@@ -87,89 +88,22 @@ pub mod migration_queue {
 		})
 	}
 
-	/// Increments the completion counter however the loop body exits, so a
-	/// migration skipped because its object vanished still counts as done.
-	/// High-water mark of `enqueued - processed`, i.e. the deepest the pool
-	/// has ever fallen behind. Purely observational and process-global
-	/// (unlike the per-queue counters that drive `flush`), so a run can
-	/// report whether the queue ever actually backed up.
-	pub static DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
-
-	/// Largest single batch ever handed to the consumers, in entries.
-	///
-	/// `DEPTH_MAX` alone cannot separate the two ways a queue gets deep: one
-	/// big slug, or sustained overproduction. When the consumers keep up,
-	/// `DEPTH_MAX` is set by the largest BURST and this is the number that
-	/// explains it; when they do not, `DEPTH_MAX` runs far past any burst and
-	/// the queue is throughput-bound instead. Mean batch size cannot tell them
-	/// apart -- it was identical (2.8) across two designs whose `DEPTH_MAX`
-	/// differed 3.4x.
-	pub static BURST_MAX: AtomicU64 = AtomicU64::new(0);
-
-	/// Migrations enqueued but not yet applied, split by destination tier.
-	///
-	/// These are the PHYSICAL mis-placement: a pending `Tier::Slow` entry is an
-	/// object the policy stack already counts as slow and has already removed
-	/// from `fast_used`, whose bytes are still in DRAM. A pending `Tier::Fast`
-	/// is the reverse.
-	///
-	/// The stack cannot account any other way -- `settle_fast_tier` reads
-	/// `fast_used` to decide whether to keep demoting, so completion-time
-	/// accounting would make it drain the entire fast tier in one pass, never
-	/// seeing its own decisions register. So `fast_used` is INTENT by
-	/// necessity, and these two counters are the gap between intent and
-	/// placement.
-	///
-	/// That gap is not only a reporting error. It biases latency: an object the
-	/// stack believes is in Optane but which is physically still in DRAM is
-	/// SERVED FROM DRAM, so a tiered run reports more fast-tier-speed hits than
-	/// its own tier assignment implies, and the bias grows with the backlog.
+	/// Migration-queue entries handed to the consumers and not yet finished,
+	/// by destination tier, summed over EVERY cache in the process. Process-
+	/// wide on purpose: `crate::phys::pending_migrations`, a public quiescence
+	/// check the identity tests poll, reads them and has no cache to ask. Each
+	/// cache's own gauges, and their peaks, are in its `migstats::Stats`
+	/// (`pending_demote`, `pending_promote`, ...), which is what `HybridStats`
+	/// and the MIGSTATS lines report.
 	pub static PENDING_DEMOTE: AtomicU64 = AtomicU64::new(0);
 	pub static PENDING_PROMOTE: AtomicU64 = AtomicU64::new(0);
-	pub static PENDING_DEMOTE_MAX: AtomicU64 = AtomicU64::new(0);
-	pub static PENDING_PROMOTE_MAX: AtomicU64 = AtomicU64::new(0);
-
-	/// Peak of `PENDING_DEMOTE - PENDING_PROMOTE`, sampled together.
-	///
-	/// The DRAM overrun is the NET mis-placement -- pending demotions are bytes
-	/// still in DRAM, pending promotions are bytes still in Optane, and they
-	/// cancel. Subtracting the two separate high-water marks is wrong: they
-	/// need not peak at the same instant, so their difference is neither the
-	/// peak of the difference nor the difference at any single moment. This
-	/// samples both counters at one point and takes the maximum of the result.
-	pub static PENDING_NET_MAX: AtomicU64 = AtomicU64::new(0);
 
 	/// `(PENDING_DEMOTE, PENDING_PROMOTE)`: entries handed to the consumers
-	/// and not finished yet. Read by `crate::phys::pending_migrations` and the
-	/// MEMTS line's `pending_net`.
+	/// and not finished yet, over every cache in the process. Read by
+	/// `crate::phys::pending_migrations`.
 	pub fn pending() -> (u64, u64) {
 		(PENDING_DEMOTE.load(Ordering::Acquire), PENDING_PROMOTE.load(Ordering::Acquire))
 	}
-
-	/// The three ways `apply_migration` moves nothing, counted separately.
-	///
-	/// Together they measure how much of the queue is WASTED work -- entries
-	/// the consumers pay a dequeue, a lock and a lookup for, and which copy no
-	/// bytes. `GONE` is an object evicted while its migration sat in the queue;
-	/// `DECLINED` is one already in the tier the entry asks for, which happens
-	/// when an earlier entry for the same key already moved it; `SUPERSEDED` is
-	/// a value replaced by a `set` mid-copy.
-	///
-	/// DECLINED counts less than it used to. `split_tier_migrations` already
-	/// drops, inside one drain, every entry that a later entry for the other
-	/// tier supersedes, so a key reversed within a drain no longer reaches the
-	/// queue as a pair. What reaches DECLINED now is chiefly redundancy ACROSS
-	/// drains (an entry for a key that an entry from an earlier drain already
-	/// moved), same-tier duplicates within a drain (kept on purpose: the
-	/// second declines), and the overwrite-restore no-op -- a `(k, Fast)` that
-	/// finds the value a `set` built in DRAM. GONE, and the cross-drain part of
-	/// DECLINED, are what a key-keyed pending map spanning drains would still
-	/// drop before dispatch.
-	pub static MIG_GONE: AtomicU64 = AtomicU64::new(0);
-	pub static MIG_DECLINED: AtomicU64 = AtomicU64::new(0);
-	pub static MIG_SUPERSEDED: AtomicU64 = AtomicU64::new(0);
-	pub static MIG_APPLIED: AtomicU64 = AtomicU64::new(0);
-
 
 	/// Migrations IN FLIGHT, and migrations LANDED, per key bucket: what the
 	/// policy worker knows of what a queued migration may yet do, or has just
@@ -218,7 +152,8 @@ pub mod migration_queue {
 	/// corrective that usually declines, and that is handed to the consumers
 	/// and counted in `PENDING_*` like any entry -- and the heal is
 	/// effectively off until the backlog drains: most slow-served hits find
-	/// their bucket busy (`migstats::RECONCILE_GET_HEAL_SKIPPED` counts them).
+	/// their bucket busy (`migstats::Stats::reconcile_get_heal_skipped` counts
+	/// them).
 	pub struct InFlight {
 		words: Box<[AtomicU64]>,
 	}
@@ -328,39 +263,43 @@ pub mod migration_queue {
 	}
 
 	/// Decrements the pending counter for `tier` however the consumer loop body
-	/// exits. Same reasoning as `CountOnDrop`: an entry leaves the queue whether
-	/// or not `apply_migration` moved anything, and a leaked increment here
-	/// would make the backlog look permanent.
-	struct PendingOnDrop(Tier);
+	/// exits -- the cache's own and the process-wide sum. Same reasoning as
+	/// `CountOnDrop`: an entry leaves the queue whether or not
+	/// `apply_migration` moved anything, and a leaked increment here would make
+	/// the backlog look permanent.
+	struct PendingOnDrop<'a>(&'a MigStats, Tier);
 
-	impl Drop for PendingOnDrop {
+	impl Drop for PendingOnDrop<'_> {
 		fn drop(&mut self) {
-			let counter = match self.0 {
-				Tier::Fast => &PENDING_PROMOTE,
-				Tier::Slow => &PENDING_DEMOTE,
+			let (counter, global) = match self.1 {
+				Tier::Fast => (&self.0.pending_promote, &PENDING_PROMOTE),
+				Tier::Slow => (&self.0.pending_demote, &PENDING_DEMOTE),
 			};
 
 			counter.fetch_sub(1, Ordering::Release);
+			global.fetch_sub(1, Ordering::Release);
 		}
 	}
 
 	/// Records one enqueued migration against its tier and updates that tier's
-	/// high-water mark.
-	fn record_pending(tier: Tier) {
-		let (counter, peak) = match tier {
-			Tier::Fast => (&PENDING_PROMOTE, &PENDING_PROMOTE_MAX),
-			Tier::Slow => (&PENDING_DEMOTE, &PENDING_DEMOTE_MAX),
+	/// high-water mark, in the cache's own statistics and in the process-wide
+	/// sum.
+	fn record_pending(stats: &MigStats, tier: Tier) {
+		let (counter, peak, global) = match tier {
+			Tier::Fast => (&stats.pending_promote, &stats.pending_promote_max, &PENDING_PROMOTE),
+			Tier::Slow => (&stats.pending_demote, &stats.pending_demote_max, &PENDING_DEMOTE),
 		};
 
+		global.fetch_add(1, Ordering::Release);
 		peak.fetch_max(counter.fetch_add(1, Ordering::Release) + 1, Ordering::Relaxed);
 
 		// Both counters read at one point, so the difference is a real
 		// instantaneous net rather than a difference of two unrelated peaks.
-		let net = PENDING_DEMOTE
+		let net = stats.pending_demote
 			.load(Ordering::Acquire)
-			.saturating_sub(PENDING_PROMOTE.load(Ordering::Acquire));
+			.saturating_sub(stats.pending_promote.load(Ordering::Acquire));
 
-		PENDING_NET_MAX.fetch_max(net, Ordering::Relaxed);
+		stats.pending_net_max.fetch_max(net, Ordering::Relaxed);
 	}
 
 	struct CountOnDrop<'a>(&'a Arc<AtomicU64>);
@@ -424,11 +363,14 @@ pub mod migration_queue {
 	///
 	/// Shared by the consumer threads and by `apply_tier_migrations`'
 	/// synchronous path (`MIGRATION_QUEUE_THREADS=0`) so the two cannot drift
-	/// apart on either the swap or what counts as a completion.
+	/// apart on either the swap or what counts as a completion. The
+	/// disposition is counted in `stats`, the cache's own (`mig_applied`,
+	/// `mig_gone`, `mig_declined`, `mig_superseded`).
 	pub(crate) fn apply_migration<K: Clone, V>(
 		objects: &ObjectMapRef<K, V>,
 		key: HashedKey,
 		tier: Tier,
+		stats: &MigStats,
 	) -> bool {
 		// The snapshot is a STRONG REFERENCE, and it is what makes every step
 		// below sound. It replaces the epoch pin this function used to take,
@@ -446,7 +388,7 @@ pub mod migration_queue {
 		//     would not be: a `set` that wrote identical content is a
 		//     different value and must be rejected.
 		let Some(old_value) = objects.get_ref(&key).map(|object| object.snapshot()) else {
-			MIG_GONE.fetch_add(1, Ordering::Relaxed);
+			stats.mig_gone.fetch_add(1, Ordering::Relaxed);
 			return false;
 		};
 
@@ -459,7 +401,7 @@ pub mod migration_queue {
 		// copy itself into another one, carrying its key and its current
 		// expiry, so the whole plumbing collapses to these four lines.
 		if old_value.tier() == tier {
-			MIG_DECLINED.fetch_add(1, Ordering::Relaxed);
+			stats.mig_declined.fetch_add(1, Ordering::Relaxed);
 			return false;
 		}
 
@@ -513,7 +455,7 @@ pub mod migration_queue {
 				// and nothing for a later epoch advance to run.
 				drop(superseded);
 
-				MIG_APPLIED.fetch_add(1, Ordering::Relaxed);
+				stats.mig_applied.fetch_add(1, Ordering::Relaxed);
 				return true;
 			}
 		}
@@ -523,7 +465,7 @@ pub mod migration_queue {
 		// dropping it here is its only decrement and frees it outright.
 		drop(new_value);
 
-		MIG_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
+		stats.mig_superseded.fetch_add(1, Ordering::Relaxed);
 		false
 	}
 
@@ -556,6 +498,10 @@ pub mod migration_queue {
 		/// The cache's per-bucket in-flight and landed counts (`InFlight`):
 		/// charged by `push`, finished by the consumers.
 		in_flight: Arc<InFlight>,
+
+		/// The cache's status, for its migration statistics
+		/// (`AtomicStatus::migstats`): `push` counts the backlog in them.
+		status: StatusRef,
 
 		/// Items handed to the pool, and items the pool has finished with.
 		/// `flush` waits for the second to catch up to the first. Both count
@@ -599,6 +545,7 @@ pub mod migration_queue {
 
 			let processed = Arc::new(AtomicU64::new(0));
 			let in_flight = status.migration_in_flight().clone();
+			let queue_status = status.clone();
 
 			// Seeded with the `PolicyStack` trait default; the first
 			// `apply_tier_migrations` pass overwrites it before it can push
@@ -657,10 +604,10 @@ pub mod migration_queue {
 
 							// Counted on every path out of this iteration.
 							let _done = CountOnDrop(&processed);
-							let _pending = PendingOnDrop(tier);
+							let _pending = PendingOnDrop(status.migstats(), tier);
 							let mut finish = Finish { in_flight: &in_flight, key, landed: false };
 
-							if apply_migration(&objects, key, tier) {
+							if apply_migration(&objects, key, tier, status.migstats()) {
 								finish.landed = true;
 
 								// S5 B2: a landed demotion freed fast bytes (the old
@@ -751,6 +698,7 @@ pub mod migration_queue {
 				senders,
 				handles,
 				in_flight,
+				status: queue_status,
 				enqueued: AtomicU64::new(0),
 				processed,
 				demotion_accounting,
@@ -791,7 +739,7 @@ pub mod migration_queue {
 			// order was wrong. A refused send therefore has to refund the
 			// charge, which `PendingOnDrop`'s own `Drop` already knows how to
 			// do -- constructing and dropping one is the decrement.
-			record_pending(item.1);
+			record_pending(self.status.migstats(), item.1);
 			self.in_flight.handed(item.0);
 
 			// Single consumer: one FIFO channel already preserves global
@@ -819,15 +767,15 @@ pub mod migration_queue {
 
 		/// A refused send: both charges `push` made, refunded.
 		fn refuse(&self, item: TaggedMigration) {
-			drop(PendingOnDrop(item.1));
+			drop(PendingOnDrop(self.status.migstats(), item.1));
 			self.in_flight.refund(item.0);
 		}
 
-		/// Updates the global high-water mark from an enqueue count.
+		/// Updates the cache's high-water mark from an enqueue count.
 		fn record_depth(&self, enqueued: u64) {
 			let depth = enqueued.saturating_sub(self.processed.load(Ordering::Acquire));
 
-			DEPTH_MAX.fetch_max(depth, Ordering::Relaxed);
+			self.status.migstats().queue_depth_max.fetch_max(depth, Ordering::Relaxed);
 		}
 
 		/// Tells the consumers whether a completed `Tier::Slow` move counts as a
@@ -886,37 +834,43 @@ pub mod migration_queue {
 		/// NEEDS THE PROCESS TO ITSELF, and is `#[ignore]`d for it. Run with
 		/// `--ignored --exact --test-threads=1`.
 		///
-		/// `PENDING_DEMOTE` is process-global and this reads it as a delta, but
-		/// the threads that move it are other tests' migration CONSUMERS, not
-		/// their test bodies -- so a shared lock between tests does not
+		/// It read the process-global `PENDING_DEMOTE` as a delta, but the
+		/// threads that move it are other tests' migration CONSUMERS, not
+		/// their test bodies -- so a shared lock between tests did not
 		/// serialise anything that matters. Observed failing four runs in ten
 		/// with `left: 1, right: 2`: a consumer elsewhere decremented between
-		/// the baseline read and the check. The assertion is exact on purpose,
-		/// because a `>=` form would pass against the unfixed `push` whenever
-		/// another test happened to leave the counter non-zero, which is the
-		/// entire discrimination this test exists for.
+		/// the baseline read and the check. It reads the queue's own cache's
+		/// `pending_demote` now (S8), which no other test's consumer touches;
+		/// the assertion is exact on purpose, because a `>=` form would pass
+		/// against the unfixed `push` whenever the counter happened to be
+		/// non-zero, which is the entire discrimination this test exists for.
 		#[test]
 		#[ignore]
 		fn push_charges_pending_before_the_item_can_reach_a_consumer() {
 			let (sender, receiver) = bounded::<TaggedMigration>(0);
 			let in_flight = Arc::new(InFlight::new());
 
+			let status = Arc::new(
+				crate::status::AtomicStatus::new(
+					1_000_000,
+					&[crate::PaperPolicy::LruCompactHybrid],
+					crate::PaperPolicy::LruCompactHybrid,
+				)
+				.unwrap(),
+			);
+
 			let queue = MigrationQueue {
 				senders: vec![sender],
 				handles: Vec::new(),
 				in_flight: in_flight.clone(),
+				status: status.clone(),
 				enqueued: AtomicU64::new(0),
 				processed: Arc::new(AtomicU64::new(0)),
 				demotion_accounting: Arc::new(AtomicBool::new(true)),
 			};
 
-			// These counters are process-global, so measure this push as a delta
-			// and take the baseline while the queue is quiescent -- which means
-			// holding off every other test that moves them, since cargo runs
-			// them in parallel.
-			let _serial = crate::global_counter_lock();
-
-			let before = PENDING_DEMOTE.load(Ordering::Acquire);
+			// The cache's own gauge: measured as a delta all the same.
+			let before = status.migstats().pending_demote.load(Ordering::Acquire);
 
 			let parked = Arc::new(AtomicBool::new(false));
 			let signal = parked.clone();
@@ -936,7 +890,7 @@ pub mod migration_queue {
 
 			std::thread::sleep(std::time::Duration::from_millis(250));
 
-			let charged = PENDING_DEMOTE.load(Ordering::Acquire);
+			let charged = status.migstats().pending_demote.load(Ordering::Acquire);
 
 			// Checked BEFORE the decrement below, so an unfixed `push` is reported
 			// as the ordering bug it is rather than as a mystery panic on the
@@ -960,7 +914,7 @@ pub mod migration_queue {
 				.recv()
 				.expect("the producer must still be parked in `send`");
 
-			drop(PendingOnDrop(tier));
+			drop(PendingOnDrop(status.migstats(), tier));
 			in_flight.finished(key, false);
 			assert_eq!(in_flight.total_pending(), 0, "the bucket's charge was paid back too");
 
@@ -968,147 +922,250 @@ pub mod migration_queue {
 
 			assert_eq!(key, 7);
 			assert_eq!(tier, Tier::Slow);
-			assert_eq!(PENDING_DEMOTE.load(Ordering::Acquire), before);
+			assert_eq!(status.migstats().pending_demote.load(Ordering::Acquire), before);
 		}
 	}
 
 }
 
-/// TEMPORARY DIAGNOSTIC: batch-size histograms for tier migrations and
-/// evictions, to decide whether parallelising the migration copies is
-/// worthwhile on a given trace. Buckets are log2: [0]=0, [1]=1, [2]=2-3,
-/// [3]=4-7 ... [15]=16384+. Dumped to stderr periodically.
+/// The migration and eviction statistics of ONE cache: batch-size histograms
+/// for tier migrations and evictions (to decide whether parallelising the
+/// migration copies is worthwhile on a given trace), the migration queue's
+/// depth, backlog and dispositions, and the reconcile's counters. Buckets are
+/// log2: [0]=0, [1]=1, [2]=2-3, [3]=4-7 ... [15]=16384+. Dumped to stderr
+/// periodically, and once at shutdown, as `MIGSTATS` lines of this cache's
+/// own; exported through `HybridStats`.
+///
+/// PER CACHE (S8): the block is built with the cache's `AtomicStatus`, which
+/// its policy worker, its migration consumers and its clients all hold, so it
+/// starts at zero with each cache and reports only that cache's own work -- a
+/// second cache in one process no longer reports its predecessors' totals too
+/// (until S8 these were process-global statics: "each policy run should reset
+/// all cache state"). Its counters are cumulative since the cache was built; a
+/// `wipe()` does not reset them (entries may still be in flight, which the
+/// gauges describe). What stays process-wide is what is: the clock origin of
+/// `t_ms` below (`mark_origin`), the physical fast-tier byte counter P and the
+/// allocators' state.
 pub mod migstats {
 	use std::sync::atomic::{AtomicU64, Ordering};
 	use std::sync::OnceLock;
 	use std::time::Instant;
-	const NB: usize = 16;
-	pub static DEMO: [AtomicU64; NB] = [const { AtomicU64::new(0) }; NB];
-	pub static PROMO: [AtomicU64; NB] = [const { AtomicU64::new(0) }; NB];
-	pub static EVICT: [AtomicU64; NB] = [const { AtomicU64::new(0) }; NB];
-	pub static DEMO_TOT: AtomicU64 = AtomicU64::new(0);
-	pub static PROMO_TOT: AtomicU64 = AtomicU64::new(0);
-	pub static EVICT_TOT: AtomicU64 = AtomicU64::new(0);
 
-	/// Drained migration entries `split_tier_migrations` dropped because a
-	/// later entry in the SAME drain named the same key for the OTHER tier --
-	/// the intents that never reach `DEMO`/`PROMO` above. So a drain's entries
-	/// are `DEMO_TOT + PROMO_TOT + COALESCED_TOT` plus the correctives kept,
-	/// `RECONCILE_QUEUED_TO_SLOW + RECONCILE_QUEUED_TO_FAST` (below), and a
-	/// promote-then-demote pair for one key shows up here as 1 rather than as
-	/// a promote copy undone by a demote copy. A same-tier duplicate is not
-	/// dropped: it is counted in `DEMO`/`PROMO` (or, a corrective, in
-	/// `RECONCILE_QUEUED_*`) like any other entry, and declines.
-	pub static COALESCED_TOT: AtomicU64 = AtomicU64::new(0);
+	/// Buckets of the batch-size histograms.
+	pub(crate) const NB: usize = 16;
 
-	/// Corrective migrations the policy worker's reconcile QUEUED (S3; see
-	/// `Observed`): a `set` whose value was built in the slow tier for a key
-	/// the stack places fast (`SET_TO_FAST`) or the reverse (`SET_TO_SLOW`),
-	/// and a hit served from the slow tier on a key the stack places fast --
-	/// the heal (`GET_TO_FAST`). Each is one queue entry pushed behind
-	/// whatever the stack queued for the key; one that finds the bytes
-	/// already moved is declined by its consumer, so these count intents, as
-	/// `DEMO`/`PROMO` do. Process-global, like everything here: printed on a
-	/// MIGSTATS line of their own and exported by `HybridStats`.
-	#[cfg(feature = "hybrid_cache_common")]
-	pub static RECONCILE_SET_TO_FAST: AtomicU64 = AtomicU64::new(0);
-	#[cfg(feature = "hybrid_cache_common")]
-	pub static RECONCILE_SET_TO_SLOW: AtomicU64 = AtomicU64::new(0);
-	#[cfg(feature = "hybrid_cache_common")]
-	pub static RECONCILE_GET_TO_FAST: AtomicU64 = AtomicU64::new(0);
+	/// One cache's migration and eviction statistics. See the module doc.
+	#[derive(Default)]
+	pub struct Stats {
+		/// Batch-size histograms, by log2 bucket: the demotions and the
+		/// promotions each drain handed on (after `split_tier_migrations`, the
+		/// stacks' decisions only -- correctives are counted below), and the
+		/// objects each eviction pass removed.
+		pub demo: [AtomicU64; NB],
+		pub promo: [AtomicU64; NB],
+		pub evict: [AtomicU64; NB],
+		pub demo_tot: AtomicU64,
+		pub promo_tot: AtomicU64,
+		pub evict_tot: AtomicU64,
 
-	/// Correctives the NEW-KEY RULE alone queued (`PolicyWorker::handle_set`):
-	/// a key (re-)admitted as new while a migration of its bucket was in
-	/// flight, or had landed since the value was published, and whose value
-	/// was built where the stack places it -- queued only so that it lands
-	/// LAST, behind whatever stale entry of the key may still be queued. A
-	/// corrective the built tier asked for anyway is `SET_TO_*`. Intents.
-	#[cfg(feature = "hybrid_cache_common")]
-	pub static RECONCILE_SET_NEW_KEY: AtomicU64 = AtomicU64::new(0);
+		/// Drained migration entries `split_tier_migrations` dropped because a
+		/// later entry in the SAME drain named the same key for the OTHER tier
+		/// -- the intents that never reach `demo`/`promo` above. So a drain's
+		/// entries are `demo_tot + promo_tot + coalesced_tot` plus the
+		/// correctives kept, `reconcile_queued_to_slow +
+		/// reconcile_queued_to_fast` (below), and a promote-then-demote pair
+		/// for one key shows up here as 1 rather than as a promote copy undone
+		/// by a demote copy. A same-tier duplicate is not dropped: it is counted
+		/// in `demo`/`promo` (or, a corrective, in `reconcile_queued_*`) like
+		/// any other entry, and declines.
+		pub coalesced_tot: AtomicU64,
 
-	/// Hits served from the slow tier whose HEAL the worker skipped because
-	/// something of the key's in-flight bucket was busy (`Observed`'s heal
-	/// rule): no `placement_of` probe and no corrective. An UPPER BOUND on the
-	/// heals skipped, not a count of them -- the placement is not read for
-	/// these hits (not reading it is the point), so a hit on a key placed
-	/// slow, or on a key whose own promotion is what is in flight, is counted
-	/// although it needed no heal. Under a backlog it is most slow-served
-	/// hits: with D entries in flight a bucket is busy with probability about
-	/// 1 - e^(-D/16384) (`migration_queue::InFlight`), and heals are then
-	/// effectively off until the backlog drains. Not a corrective, so in no
-	/// `RECONCILE_QUEUED_*` sum.
-	#[cfg(feature = "hybrid_cache_common")]
-	pub static RECONCILE_GET_HEAL_SKIPPED: AtomicU64 = AtomicU64::new(0);
+		/// Corrective migrations the policy worker's reconcile QUEUED (S3; see
+		/// `Observed`): a `set` whose value was built in the slow tier for a key
+		/// the stack places fast (`reconcile_set_to_fast`) or the reverse
+		/// (`reconcile_set_to_slow`), and a hit served from the slow tier on a
+		/// key the stack places fast -- the heal (`reconcile_get_to_fast`). Each
+		/// is one queue entry pushed behind whatever the stack queued for the
+		/// key; one that finds the bytes already moved is declined by its
+		/// consumer, so these count intents, as `demo`/`promo` do. Printed on a
+		/// MIGSTATS line of their own and exported by `HybridStats`.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub reconcile_set_to_fast: AtomicU64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub reconcile_set_to_slow: AtomicU64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub reconcile_get_to_fast: AtomicU64,
 
-	/// Reconcile-origin entries (`MigrationOrigin::Reconcile`: the worker's
-	/// correctives, in every store) handed on
-	/// after `split_tier_migrations`, by destination -- their own intent
-	/// counters, kept OUT of `DEMO`/`PROMO`, which count the stacks' policy
-	/// decisions. A drain's entries are `DEMO_TOT + PROMO_TOT +
-	/// RECONCILE_QUEUED_TO_SLOW + RECONCILE_QUEUED_TO_FAST + COALESCED_TOT`.
-	#[cfg(feature = "hybrid_cache_common")]
-	pub static RECONCILE_QUEUED_TO_FAST: AtomicU64 = AtomicU64::new(0);
-	#[cfg(feature = "hybrid_cache_common")]
-	pub static RECONCILE_QUEUED_TO_SLOW: AtomicU64 = AtomicU64::new(0);
+		/// Correctives the NEW-KEY RULE alone queued (`PolicyWorker::
+		/// handle_set`): a key (re-)admitted as new while a migration of its
+		/// bucket was in flight, or had landed since the value was published,
+		/// and whose value was built where the stack places it -- queued only
+		/// so that it lands LAST, behind whatever stale entry of the key may
+		/// still be queued. A corrective the built tier asked for anyway is
+		/// `reconcile_set_to_*`. Intents.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub reconcile_set_new_key: AtomicU64,
 
-	/// Reconcile-origin entries that LANDED -- moved a value's bytes -- on a
-	/// consumer or inline, by destination. Never promotions or demotions: a
-	/// corrective moves bytes to where the stack already placed the key, and
-	/// displaces nothing. Process-global; `HybridStats::reconcile_applied_*`
-	/// carries each cache's own.
-	#[cfg(feature = "hybrid_cache_common")]
-	pub static RECONCILE_APPLIED_TO_FAST: AtomicU64 = AtomicU64::new(0);
-	#[cfg(feature = "hybrid_cache_common")]
-	pub static RECONCILE_APPLIED_TO_SLOW: AtomicU64 = AtomicU64::new(0);
+		/// Hits served from the slow tier whose HEAL the worker skipped because
+		/// something of the key's in-flight bucket was busy (`Observed`'s heal
+		/// rule): no `placement_of` probe and no corrective. An UPPER BOUND on
+		/// the heals skipped, not a count of them -- the placement is not read
+		/// for these hits (not reading it is the point), so a hit on a key
+		/// placed slow, or on a key whose own promotion is what is in flight, is
+		/// counted although it needed no heal. Under a backlog it is most
+		/// slow-served hits: with D entries in flight a bucket is busy with
+		/// probability about 1 - e^(-D/16384) (`migration_queue::InFlight`), and
+		/// heals are then effectively off until the backlog drains. Not a
+		/// corrective, so in no `reconcile_queued_*` sum.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub reconcile_get_heal_skipped: AtomicU64,
 
-	/// `(RECONCILE_SET_TO_FAST, RECONCILE_SET_TO_SLOW, RECONCILE_GET_TO_FAST,
-	/// RECONCILE_SET_NEW_KEY, RECONCILE_GET_HEAL_SKIPPED)`.
-	#[cfg(feature = "hybrid_cache_common")]
-	pub fn reconciled() -> (u64, u64, u64, u64, u64) {
-		(
-			RECONCILE_SET_TO_FAST.load(Ordering::Relaxed),
-			RECONCILE_SET_TO_SLOW.load(Ordering::Relaxed),
-			RECONCILE_GET_TO_FAST.load(Ordering::Relaxed),
-			RECONCILE_SET_NEW_KEY.load(Ordering::Relaxed),
-			RECONCILE_GET_HEAL_SKIPPED.load(Ordering::Relaxed),
-		)
+		/// Reconcile-origin entries (`MigrationOrigin::Reconcile`: the worker's
+		/// correctives, in every store) handed on after `split_tier_migrations`,
+		/// by destination -- their own intent counters, kept OUT of
+		/// `demo`/`promo`, which count the stacks' policy decisions. A drain's
+		/// entries are `demo_tot + promo_tot + reconcile_queued_to_slow +
+		/// reconcile_queued_to_fast + coalesced_tot`.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub reconcile_queued_to_fast: AtomicU64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub reconcile_queued_to_slow: AtomicU64,
+
+		/// Reconcile-origin entries that LANDED -- moved a value's bytes -- on a
+		/// consumer or inline, by destination. Never promotions or demotions: a
+		/// corrective moves bytes to where the stack already placed the key, and
+		/// displaces nothing. Since the cache was built: a `wipe()` does not
+		/// reset these, which is the difference from `HybridStats::
+		/// reconcile_applied_*` (the status's own pair, reset with the request
+		/// counters).
+		#[cfg(feature = "hybrid_cache_common")]
+		pub reconcile_applied_to_fast: AtomicU64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub reconcile_applied_to_slow: AtomicU64,
+
+		/// High-water mark of `enqueued - processed`, i.e. the deepest the pool
+		/// has ever fallen behind. Purely observational (unlike the per-queue
+		/// counters that drive `flush`), so a run can report whether the queue
+		/// ever actually backed up.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub queue_depth_max: AtomicU64,
+
+		/// Largest single batch ever handed to the consumers, in entries.
+		///
+		/// `queue_depth_max` alone cannot separate the two ways a queue gets
+		/// deep: one big slug, or sustained overproduction. When the consumers
+		/// keep up, `queue_depth_max` is set by the largest BURST and this is the
+		/// number that explains it; when they do not, `queue_depth_max` runs far
+		/// past any burst and the queue is throughput-bound instead. Mean batch
+		/// size cannot tell them apart -- it was identical (2.8) across two
+		/// designs whose `queue_depth_max` differed 3.4x.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub burst_max: AtomicU64,
+
+		/// Migrations enqueued but not yet applied, split by destination tier.
+		///
+		/// These are the PHYSICAL mis-placement: a pending `Tier::Slow` entry is
+		/// an object the policy stack already counts as slow and has already
+		/// removed from `fast_used`, whose bytes are still in DRAM. A pending
+		/// `Tier::Fast` is the reverse.
+		///
+		/// The stack cannot account any other way -- `settle_fast_tier` reads
+		/// `fast_used` to decide whether to keep demoting, so completion-time
+		/// accounting would make it drain the entire fast tier in one pass, never
+		/// seeing its own decisions register. So `fast_used` is INTENT by
+		/// necessity, and these two counters are the gap between intent and
+		/// placement.
+		///
+		/// That gap is not only a reporting error. It biases latency: an object
+		/// the stack believes is in Optane but which is physically still in DRAM
+		/// is SERVED FROM DRAM, so a tiered run reports more fast-tier-speed hits
+		/// than its own tier assignment implies, and the bias grows with the
+		/// backlog.
+		///
+		/// Gauges of THIS cache's queue; the process-wide sums, which
+		/// `crate::phys::pending_migrations` reads, are `migration_queue::
+		/// PENDING_DEMOTE` and `PENDING_PROMOTE`.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub pending_demote: AtomicU64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub pending_promote: AtomicU64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub pending_demote_max: AtomicU64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub pending_promote_max: AtomicU64,
+
+		/// Peak of `pending_demote - pending_promote`, sampled together.
+		///
+		/// The DRAM overrun is the NET mis-placement -- pending demotions are
+		/// bytes still in DRAM, pending promotions are bytes still in Optane, and
+		/// they cancel. Subtracting the two separate high-water marks is wrong:
+		/// they need not peak at the same instant, so their difference is neither
+		/// the peak of the difference nor the difference at any single moment.
+		/// This samples both counters at one point and takes the maximum of the
+		/// result.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub pending_net_max: AtomicU64,
+
+		/// The three ways `apply_migration` moves nothing, counted separately,
+		/// and the one way it does.
+		///
+		/// The first three together measure how much of the queue is WASTED work
+		/// -- entries the consumers pay a dequeue, a lock and a lookup for, and
+		/// which copy no bytes. `mig_gone` is an object evicted while its
+		/// migration sat in the queue; `mig_declined` is one already in the tier
+		/// the entry asks for, which happens when an earlier entry for the same
+		/// key already moved it; `mig_superseded` is a value replaced by a `set`
+		/// mid-copy.
+		///
+		/// `mig_declined` counts less than it used to. `split_tier_migrations`
+		/// already drops, inside one drain, every entry that a later entry for
+		/// the other tier supersedes, so a key reversed within a drain no longer
+		/// reaches the queue as a pair. What reaches it now is chiefly redundancy
+		/// ACROSS drains (an entry for a key that an entry from an earlier drain
+		/// already moved), same-tier duplicates within a drain (kept on purpose:
+		/// the second declines), and the overwrite-restore no-op -- a `(k, Fast)`
+		/// that finds the value a `set` built in DRAM. `mig_gone`, and the
+		/// cross-drain part of `mig_declined`, are what a key-keyed pending map
+		/// spanning drains would still drop before dispatch.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub mig_gone: AtomicU64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub mig_declined: AtomicU64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub mig_superseded: AtomicU64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub mig_applied: AtomicU64,
+
+		/// Times the eviction loop fell back to evicting a random object because
+		/// the policy stack had no candidate (`Removal::fallback_victim`): that
+		/// path drops the object from the map WITHOUT removing it from the stack.
+		/// INSTRUMENTATION, this cache's own; `crate::ERASE_FALLBACK` is the
+		/// process-wide total.
+		pub erase_fallbacks: AtomicU64,
+
+		/// `apply_migration_batches` calls (`mig_calls` on the MIGSTATS line)
+		/// and eviction passes that ended (`evict_calls`); they pace the
+		/// periodic dump.
+		pub calls: AtomicU64,
+		pub ecalls: AtomicU64,
+
+		/// The worker loop's DIVERGE sampler: passes seen, so one in 4096 is
+		/// sampled.
+		pub diverge_tick: AtomicU64,
+
+		/// Paces the periodic dump: the instant of the first call that checked
+		/// the clock, and the millisecond (since it) of the last dump.
+		start: OnceLock<Instant>,
+		last_dump_ms: AtomicU64,
 	}
-
-	/// Counts reconcile-origin entries handed on after the split.
-	#[cfg(feature = "hybrid_cache_common")]
-	pub(crate) fn reconcile_queued(to_fast: usize, to_slow: usize) {
-		if to_fast != 0 {
-			RECONCILE_QUEUED_TO_FAST.fetch_add(to_fast as u64, Ordering::Relaxed);
-		}
-
-		if to_slow != 0 {
-			RECONCILE_QUEUED_TO_SLOW.fetch_add(to_slow as u64, Ordering::Relaxed);
-		}
-	}
-
-	/// Counts reconcile-origin entries that landed.
-	#[cfg(feature = "hybrid_cache_common")]
-	pub(crate) fn reconcile_applied(to_fast: u64, to_slow: u64) {
-		if to_fast != 0 {
-			RECONCILE_APPLIED_TO_FAST.fetch_add(to_fast, Ordering::Relaxed);
-		}
-
-		if to_slow != 0 {
-			RECONCILE_APPLIED_TO_SLOW.fetch_add(to_slow, Ordering::Relaxed);
-		}
-	}
-
-	pub static CALLS: AtomicU64 = AtomicU64::new(0);
-	static START: OnceLock<Instant> = OnceLock::new();
-	static LAST_DUMP_MS: AtomicU64 = AtomicU64::new(0);
 
 	/// The origin of every instrumentation line's `t_ms` -- MIGSTATS here,
 	/// DIVERGE and MEMTS in the worker loop -- so the three series share one
 	/// clock. Set by the first `PolicyWorker` built in the process
 	/// (`mark_origin`), i.e. when the first cache is constructed: in the
 	/// one-cache process the server and the benchmark run, `t_ms` is the time
-	/// since that cache started. `START` above paces the periodic dump and is
-	/// left as it was.
+	/// since that cache started. PROCESS-WIDE, deliberately: a clock, not a
+	/// count, and the lines of several caches in one process are ordered by it.
 	static ORIGIN: OnceLock<Instant> = OnceLock::new();
 
 	pub fn mark_origin() {
@@ -1119,16 +1176,24 @@ pub mod migstats {
 	pub fn t_ms() -> u64 {
 		ORIGIN.get_or_init(Instant::now).elapsed().as_millis() as u64
 	}
-	pub static ECALLS: AtomicU64 = AtomicU64::new(0);
+
 	fn bucket(n: usize) -> usize {
 		if n == 0 { return 0; }
 		let b = (usize::BITS - n.leading_zeros()) as usize;
 		if b >= NB { NB - 1 } else { b }
 	}
+
 	pub fn rec(h: &[AtomicU64; NB], tot: &AtomicU64, n: usize) {
 		h[bucket(n)].fetch_add(1, Ordering::Relaxed);
 		tot.fetch_add(n as u64, Ordering::Relaxed);
 	}
+
+	/// A histogram read out.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub(crate) fn read(h: &[AtomicU64; NB]) -> [u64; NB] {
+		std::array::from_fn(|i| h[i].load(Ordering::Relaxed))
+	}
+
 	/// Wall-clock interval between periodic dumps.
 	const DUMP_INTERVAL_MS: u64 = 10_000;
 
@@ -1139,116 +1204,239 @@ pub mod migstats {
 	/// making relatively few migration calls still dumps regularly.
 	const CLOCK_CHECK_MASK: u64 = 0xFFF;
 
-	fn maybe_dump(counter_value: u64) {
-		if counter_value & CLOCK_CHECK_MASK != 0 {
-			return;
+	impl Stats {
+		/// `(reconcile_set_to_fast, reconcile_set_to_slow, reconcile_get_to_fast,
+		/// reconcile_set_new_key, reconcile_get_heal_skipped)`.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub fn reconciled(&self) -> (u64, u64, u64, u64, u64) {
+			(
+				self.reconcile_set_to_fast.load(Ordering::Relaxed),
+				self.reconcile_set_to_slow.load(Ordering::Relaxed),
+				self.reconcile_get_to_fast.load(Ordering::Relaxed),
+				self.reconcile_set_new_key.load(Ordering::Relaxed),
+				self.reconcile_get_heal_skipped.load(Ordering::Relaxed),
+			)
 		}
 
-		let start = START.get_or_init(Instant::now);
-		let now_ms = start.elapsed().as_millis() as u64;
-		let last = LAST_DUMP_MS.load(Ordering::Relaxed);
+		/// Counts reconcile-origin entries handed on after the split.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub(crate) fn reconcile_queued(&self, to_fast: usize, to_slow: usize) {
+			if to_fast != 0 {
+				self.reconcile_queued_to_fast.fetch_add(to_fast as u64, Ordering::Relaxed);
+			}
 
-		if now_ms.saturating_sub(last) < DUMP_INTERVAL_MS {
-			return;
+			if to_slow != 0 {
+				self.reconcile_queued_to_slow.fetch_add(to_slow as u64, Ordering::Relaxed);
+			}
 		}
 
-		// Whichever thread wins the swap does the dump; the others skip it
-		// rather than interleaving four `eprintln!`s into the same stderr.
-		if LAST_DUMP_MS
-			.compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-			.is_ok()
-		{
-			dump();
+		/// Counts reconcile-origin entries that landed.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub(crate) fn reconcile_applied(&self, to_fast: u64, to_slow: u64) {
+			if to_fast != 0 {
+				self.reconcile_applied_to_fast.fetch_add(to_fast, Ordering::Relaxed);
+			}
+
+			if to_slow != 0 {
+				self.reconcile_applied_to_slow.fetch_add(to_slow, Ordering::Relaxed);
+			}
+		}
+
+		/// `(pending_demote, pending_promote)`: entries of THIS cache handed to
+		/// the consumers and not finished yet. The MEMTS line's `pending_net`.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub(crate) fn pending(&self) -> (u64, u64) {
+			(self.pending_demote.load(Ordering::Acquire), self.pending_promote.load(Ordering::Acquire))
+		}
+
+		fn maybe_dump(&self, counter_value: u64) {
+			if counter_value & CLOCK_CHECK_MASK != 0 {
+				return;
+			}
+
+			let start = self.start.get_or_init(Instant::now);
+			let now_ms = start.elapsed().as_millis() as u64;
+			let last = self.last_dump_ms.load(Ordering::Relaxed);
+
+			if now_ms.saturating_sub(last) < DUMP_INTERVAL_MS {
+				return;
+			}
+
+			// Whichever thread wins the swap does the dump; the others skip it
+			// rather than interleaving four `eprintln!`s into the same stderr.
+			if self.last_dump_ms
+				.compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+				.is_ok()
+			{
+				self.dump();
+			}
+		}
+
+		/// Emits the final totals.
+		///
+		/// The periodic path above is for progress, not totals: it was
+		/// previously keyed on `CALLS % 5_000_000`, which meant a variant making
+		/// fewer than 5M migration calls dumped exactly once -- at call #0,
+		/// before any work had happened -- and its "totals" were a snapshot of
+		/// an empty run. That produced a reported `queue_depth_max=0` and
+		/// `demo_tot=94,519` for a 530M-record lru run, both meaningless. Called
+		/// on worker shutdown so every run ends with real numbers regardless of
+		/// its call volume.
+		pub fn dump_final(&self) {
+			self.dump();
+		}
+
+		/// One migration drain handed on (`mig_calls`); paces the periodic dump.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub fn tick(&self) {
+			self.maybe_dump(self.calls.fetch_add(1, Ordering::Relaxed));
+		}
+
+		pub fn etick(&self) {
+			self.maybe_dump(self.ecalls.fetch_add(1, Ordering::Relaxed));
+		}
+
+		/// This cache's `MIGSTATS` lines, to stderr. The format is what it
+		/// was when the counters were process-global; there is no cache
+		/// identifier, so the lines of several caches in one process are told
+		/// apart by their order and `t_ms` alone.
+		pub fn dump(&self) {
+			for line in self.lines(t_ms()) {
+				eprintln!("{line}");
+			}
+		}
+
+		/// The lines `dump` prints, stamped `t_ms`.
+		pub(crate) fn lines(&self, t_ms: u64) -> Vec<String> {
+			let f = |h: &[AtomicU64; NB]| (0..NB)
+				.map(|i| h[i].load(Ordering::Relaxed).to_string())
+				.collect::<Vec<_>>().join(",");
+
+			let mut lines = Vec::new();
+
+			// One timestamp for the whole block, appended as the LAST field of
+			// every line -- the same rule `coalesced_tot` follows below, so every
+			// existing field keeps its place for a `key=value` reader.
+
+			#[cfg(feature = "hybrid_cache_common")]
+			lines.push(format!(
+				"MIGSTATS queue_depth_max={} burst_max={} pending_demote_max={} pending_promote_max={} t_ms={t_ms}",
+				self.queue_depth_max.load(Ordering::Relaxed),
+				self.burst_max.load(Ordering::Relaxed),
+				self.pending_demote_max.load(Ordering::Relaxed),
+				self.pending_promote_max.load(Ordering::Relaxed),
+			));
+
+			#[cfg(feature = "hybrid_cache_common")]
+			lines.push(format!(
+				"MIGSTATS pending_net_max={} t_ms={t_ms}",
+				self.pending_net_max.load(Ordering::Relaxed),
+			));
+
+			#[cfg(feature = "hybrid_cache_common")]
+			lines.push(format!(
+				"MIGSTATS applied={} gone={} declined={} superseded={} t_ms={t_ms}",
+				self.mig_applied.load(Ordering::Relaxed),
+				self.mig_gone.load(Ordering::Relaxed),
+				self.mig_declined.load(Ordering::Relaxed),
+				self.mig_superseded.load(Ordering::Relaxed),
+			));
+
+			// `coalesced_tot` goes LAST but for `t_ms`: scripts read this line as
+			// `key=value` pairs, and appending keeps every existing field where it
+			// was.
+			lines.push(format!("MIGSTATS mig_calls={} evict_calls={} demo_tot={} promo_tot={} evict_tot={} coalesced_tot={} t_ms={t_ms}",
+				self.calls.load(Ordering::Relaxed), self.ecalls.load(Ordering::Relaxed),
+				self.demo_tot.load(Ordering::Relaxed), self.promo_tot.load(Ordering::Relaxed),
+				self.evict_tot.load(Ordering::Relaxed), self.coalesced_tot.load(Ordering::Relaxed)));
+			lines.push(format!("MIGSTATS demo={} t_ms={t_ms}", f(&self.demo)));
+			lines.push(format!("MIGSTATS promo={} t_ms={t_ms}", f(&self.promo)));
+			lines.push(format!("MIGSTATS evict={} t_ms={t_ms}", f(&self.evict)));
+
+			// The reconcile (S3): a line of its own, LAST, so every line above
+			// keeps its fields and its place; `t_ms` last, as on every line. The
+			// correctives the worker queued, by reason; every reconcile-origin
+			// entry handed on after the split, which `demo`/`promo` above no
+			// longer count; those
+			// that landed, which are not promotions or demotions; and, appended
+			// after them so each keeps its place, the slow-served hits whose heal
+			// a busy bucket skipped.
+			#[cfg(feature = "hybrid_cache_common")]
+			{
+				let (set_to_fast, set_to_slow, get_to_fast, set_new_key, get_heal_skipped) = self.reconciled();
+
+				lines.push(format!(
+					"MIGSTATS reconcile_set_to_fast={set_to_fast} reconcile_set_to_slow={set_to_slow} \
+					 reconcile_get_to_fast={get_to_fast} reconcile_set_new_key={set_new_key} \
+					 reconcile_queued_to_fast={} reconcile_queued_to_slow={} \
+					 reconcile_applied_to_fast={} reconcile_applied_to_slow={} \
+					 reconcile_get_heal_skipped={get_heal_skipped} t_ms={t_ms}",
+					self.reconcile_queued_to_fast.load(Ordering::Relaxed),
+					self.reconcile_queued_to_slow.load(Ordering::Relaxed),
+					self.reconcile_applied_to_fast.load(Ordering::Relaxed),
+					self.reconcile_applied_to_slow.load(Ordering::Relaxed),
+				));
+			}
+
+			lines
 		}
 	}
 
-	/// Emits the final totals.
-	///
-	/// The periodic path above is for progress, not totals: it was previously
-	/// keyed on `CALLS % 5_000_000`, which meant a variant making fewer than
-	/// 5M migration calls dumped exactly once -- at call #0, before any work
-	/// had happened -- and its "totals" were a snapshot of an empty run. That
-	/// produced a reported `queue_depth_max=0` and `demo_tot=94,519` for a
-	/// 530M-record lru run, both meaningless. Called on worker shutdown so
-	/// every run ends with real numbers regardless of its call volume.
-	pub fn dump_final() {
-		dump();
-	}
+	/// The dump keeps the format the process-global counters printed in
+	/// (parsers of the `key=value` lines and their order): every field where it
+	/// was, `t_ms` last.
+	#[cfg(all(test, feature = "hybrid_cache_common"))]
+	mod tests {
+		use super::*;
 
-	pub fn tick() {
-		maybe_dump(CALLS.fetch_add(1, Ordering::Relaxed));
-	}
+		#[test]
+		fn the_dump_keeps_the_format_it_had_when_the_counters_were_process_global() {
+			let stats = Stats::default();
+			let set = |counter: &AtomicU64, value: u64| counter.store(value, Ordering::Relaxed);
 
-	pub fn etick() {
-		maybe_dump(ECALLS.fetch_add(1, Ordering::Relaxed));
-	}
-	pub fn dump() {
-		let f = |h: &[AtomicU64; NB]| (0..NB)
-			.map(|i| h[i].load(Ordering::Relaxed).to_string())
-			.collect::<Vec<_>>().join(",");
+			set(&stats.queue_depth_max, 11);
+			set(&stats.burst_max, 12);
+			set(&stats.pending_demote_max, 13);
+			set(&stats.pending_promote_max, 14);
+			set(&stats.pending_net_max, 15);
+			set(&stats.mig_applied, 16);
+			set(&stats.mig_gone, 17);
+			set(&stats.mig_declined, 18);
+			set(&stats.mig_superseded, 19);
+			set(&stats.calls, 20);
+			set(&stats.ecalls, 21);
+			set(&stats.demo_tot, 22);
+			set(&stats.promo_tot, 23);
+			set(&stats.evict_tot, 24);
+			set(&stats.coalesced_tot, 25);
+			set(&stats.demo[0], 1);
+			set(&stats.demo[15], 2);
+			set(&stats.promo[3], 4);
+			set(&stats.evict[1], 5);
+			set(&stats.reconcile_set_to_fast, 31);
+			set(&stats.reconcile_set_to_slow, 32);
+			set(&stats.reconcile_get_to_fast, 33);
+			set(&stats.reconcile_set_new_key, 34);
+			set(&stats.reconcile_queued_to_fast, 35);
+			set(&stats.reconcile_queued_to_slow, 36);
+			set(&stats.reconcile_applied_to_fast, 37);
+			set(&stats.reconcile_applied_to_slow, 38);
+			set(&stats.reconcile_get_heal_skipped, 39);
 
-		// One timestamp for the whole block, appended as the LAST field of
-		// every line -- the same rule `coalesced_tot` follows below, so every
-		// existing field keeps its place for a `key=value` reader.
-		let t_ms = t_ms();
-
-		#[cfg(feature = "hybrid_cache_common")]
-		eprintln!(
-			"MIGSTATS queue_depth_max={} burst_max={} pending_demote_max={} pending_promote_max={} t_ms={t_ms}",
-			super::migration_queue::DEPTH_MAX.load(Ordering::Relaxed),
-			super::migration_queue::BURST_MAX.load(Ordering::Relaxed),
-			super::migration_queue::PENDING_DEMOTE_MAX.load(Ordering::Relaxed),
-			super::migration_queue::PENDING_PROMOTE_MAX.load(Ordering::Relaxed),
-		);
-
-		#[cfg(feature = "hybrid_cache_common")]
-		eprintln!(
-			"MIGSTATS pending_net_max={} t_ms={t_ms}",
-			super::migration_queue::PENDING_NET_MAX.load(Ordering::Relaxed),
-		);
-
-		#[cfg(feature = "hybrid_cache_common")]
-		eprintln!(
-			"MIGSTATS applied={} gone={} declined={} superseded={} t_ms={t_ms}",
-			super::migration_queue::MIG_APPLIED.load(Ordering::Relaxed),
-			super::migration_queue::MIG_GONE.load(Ordering::Relaxed),
-			super::migration_queue::MIG_DECLINED.load(Ordering::Relaxed),
-			super::migration_queue::MIG_SUPERSEDED.load(Ordering::Relaxed),
-		);
-
-		// `coalesced_tot` goes LAST but for `t_ms`: scripts read this line as
-		// `key=value` pairs, and appending keeps every existing field where it
-		// was.
-		eprintln!("MIGSTATS mig_calls={} evict_calls={} demo_tot={} promo_tot={} evict_tot={} coalesced_tot={} t_ms={t_ms}",
-			CALLS.load(Ordering::Relaxed), ECALLS.load(Ordering::Relaxed),
-			DEMO_TOT.load(Ordering::Relaxed), PROMO_TOT.load(Ordering::Relaxed),
-			EVICT_TOT.load(Ordering::Relaxed), COALESCED_TOT.load(Ordering::Relaxed));
-		eprintln!("MIGSTATS demo={} t_ms={t_ms}", f(&DEMO));
-		eprintln!("MIGSTATS promo={} t_ms={t_ms}", f(&PROMO));
-		eprintln!("MIGSTATS evict={} t_ms={t_ms}", f(&EVICT));
-
-		// The reconcile (S3): a line of its own, LAST, so every line above
-		// keeps its fields and its place; `t_ms` last, as on every line. The
-		// correctives the worker queued, by reason; every reconcile-origin
-		// entry handed on after the split, which `demo`/`promo` above no
-		// longer count; those
-		// that landed, which are not promotions or demotions; and, appended
-		// after them so each keeps its place, the slow-served hits whose heal
-		// a busy bucket skipped.
-		#[cfg(feature = "hybrid_cache_common")]
-		{
-			let (set_to_fast, set_to_slow, get_to_fast, set_new_key, get_heal_skipped) = reconciled();
-
-			eprintln!(
-				"MIGSTATS reconcile_set_to_fast={set_to_fast} reconcile_set_to_slow={set_to_slow} \
-				 reconcile_get_to_fast={get_to_fast} reconcile_set_new_key={set_new_key} \
-				 reconcile_queued_to_fast={} reconcile_queued_to_slow={} \
-				 reconcile_applied_to_fast={} reconcile_applied_to_slow={} \
-				 reconcile_get_heal_skipped={get_heal_skipped} t_ms={t_ms}",
-				RECONCILE_QUEUED_TO_FAST.load(Ordering::Relaxed),
-				RECONCILE_QUEUED_TO_SLOW.load(Ordering::Relaxed),
-				RECONCILE_APPLIED_TO_FAST.load(Ordering::Relaxed),
-				RECONCILE_APPLIED_TO_SLOW.load(Ordering::Relaxed),
+			assert_eq!(
+				stats.lines(123),
+				[
+					"MIGSTATS queue_depth_max=11 burst_max=12 pending_demote_max=13 pending_promote_max=14 t_ms=123",
+					"MIGSTATS pending_net_max=15 t_ms=123",
+					"MIGSTATS applied=16 gone=17 declined=18 superseded=19 t_ms=123",
+					"MIGSTATS mig_calls=20 evict_calls=21 demo_tot=22 promo_tot=23 evict_tot=24 coalesced_tot=25 t_ms=123",
+					"MIGSTATS demo=1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2 t_ms=123",
+					"MIGSTATS promo=0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0 t_ms=123",
+					"MIGSTATS evict=0,5,0,0,0,0,0,0,0,0,0,0,0,0,0,0 t_ms=123",
+					"MIGSTATS reconcile_set_to_fast=31 reconcile_set_to_slow=32 reconcile_get_to_fast=33 \
+					 reconcile_set_new_key=34 reconcile_queued_to_fast=35 reconcile_queued_to_slow=36 \
+					 reconcile_applied_to_fast=37 reconcile_applied_to_slow=38 reconcile_get_heal_skipped=39 t_ms=123",
+				],
 			);
 		}
 	}
@@ -1656,7 +1844,7 @@ pub use policy_stack::{MigrationEntry, MigrationOrigin, TaggedMigration};
 /// probability about 1 - e^(-D/16384) (63% at D = 16k, 95% at 50k;
 /// `InFlight`), so the fence then fires for most fresh sets -- each a
 /// corrective that usually declines, counted in `PENDING_*` like any entry
-/// (and in `RECONCILE_SET_NEW_KEY` when only the rule asked for it).
+/// (and in `reconcile_set_new_key` when only the rule asked for it).
 ///
 /// # The heal (review M2)
 ///
@@ -1675,7 +1863,7 @@ pub use policy_stack::{MigrationEntry, MigrationOrigin, TaggedMigration};
 ///
 /// The backlog that fences most fresh sets (above) turns the heal
 /// effectively OFF until it drains: most slow-served hits then find their
-/// bucket busy. Each is counted in `RECONCILE_GET_HEAL_SKIPPED` -- every
+/// bucket busy. Each is counted in `reconcile_get_heal_skipped` -- every
 /// slow-served hit skipped for a busy bucket, so an upper bound on the heals
 /// skipped: the placement is not read for them, and a hit on a key placed
 /// slow, or on a key whose own promotion is what is in flight, needed none.
@@ -1725,26 +1913,27 @@ impl Observed {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reason {
 	/// Where the set leaves the bytes -- the drain's last entry for the key,
-	/// else the built tier -- is not the placement: `RECONCILE_SET_TO_*`.
+	/// else the built tier -- is not the placement: `reconcile_set_to_*`.
 	Built,
 	/// The new-key rule alone: built where placed, queued to land last:
-	/// `RECONCILE_SET_NEW_KEY`.
+	/// `reconcile_set_new_key`.
 	NewKey,
-	/// The heal: `RECONCILE_GET_TO_FAST`.
+	/// The heal: `reconcile_get_to_fast`.
 	Heal,
 }
 
 #[cfg(feature = "hybrid_cache_common")]
 impl Reason {
-	/// Counts one corrective queued for this reason, toward `tier`.
-	fn count(self, tier: Tier) {
+	/// Counts one corrective queued for this reason, toward `tier`, in the
+	/// cache's own statistics.
+	fn count(self, stats: &migstats::Stats, tier: Tier) {
 		use std::sync::atomic::Ordering::Relaxed;
 
 		let counter = match (self, tier) {
-			(Reason::Built, Tier::Fast) => &migstats::RECONCILE_SET_TO_FAST,
-			(Reason::Built, Tier::Slow) => &migstats::RECONCILE_SET_TO_SLOW,
-			(Reason::NewKey, _) => &migstats::RECONCILE_SET_NEW_KEY,
-			(Reason::Heal, _) => &migstats::RECONCILE_GET_TO_FAST,
+			(Reason::Built, Tier::Fast) => &stats.reconcile_set_to_fast,
+			(Reason::Built, Tier::Slow) => &stats.reconcile_set_to_slow,
+			(Reason::NewKey, _) => &stats.reconcile_set_new_key,
+			(Reason::Heal, _) => &stats.reconcile_get_to_fast,
 		};
 
 		counter.fetch_add(1, Relaxed);
@@ -2047,7 +2236,7 @@ where
 
 					WorkerEvent::Shutdown => {
 						// Real totals, whatever this run's call volume was.
-						migstats::dump_final();
+						self.status.migstats().dump_final();
 
 						return Ok(());
 					},
@@ -2135,8 +2324,8 @@ where
 			// the same cadence as MIGSTATS so the two can be correlated.
 			{
 				use std::sync::atomic::Ordering;
-				static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-				if TICK.fetch_add(1, Ordering::Relaxed) % 4_096 == 0 {
+				let stats = self.status.migstats();
+				if stats.diverge_tick.fetch_add(1, Ordering::Relaxed) % 4_096 == 0 {
 					let stack_len = self.policy_stack.len();
 					let map_len = self.status.live_num_objects() as usize;
 					let s = &self.policy_stack;
@@ -2147,7 +2336,7 @@ where
 					eprintln!(
 						"DIVERGE map={map_len} stack={stack_len} delta={} fallback={} fast_obj={fo} slow_obj={so} fast_b={fb} slow_b={sb} t_ms={}",
 						map_len as i64 - stack_len as i64,
-						crate::ERASE_FALLBACK.load(Ordering::Relaxed),
+						stats.erase_fallbacks.load(Ordering::Relaxed),
 						migstats::t_ms(),
 					);
 				}
@@ -2803,14 +2992,14 @@ where
 			// placed: no probe. Counted as a skipped heal -- an upper bound,
 			// the placement not being read.
 			if let Observed::ServedSlow { quiet: false, .. } = observed {
-				migstats::RECONCILE_GET_HEAL_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				self.status.migstats().reconcile_get_heal_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 				continue;
 			}
 
 			let placement = stack.placement_of(observed.key());
 
 			if let Some((key, tier, reason)) = corrective(&migrations, observed, placement) {
-				reason.count(tier);
+				reason.count(self.status.migstats(), tier);
 				migrations.push((key, tier, MigrationOrigin::Reconcile));
 			}
 		}
@@ -2887,7 +3076,7 @@ where
 	///
 	/// Each entry keeps its origin (`MigrationOrigin`) through the split and
 	/// the queue. A reconcile-origin entry -- a corrective -- is not counted
-	/// in `DEMO`/`PROMO` but in `RECONCILE_QUEUED_TO_*`, and its completion
+	/// in `demo`/`promo` but in `reconcile_queued_to_*`, and its completion
 	/// not as a promotion or a demotion but in `reconcile_applied_*`. Every
 	/// landing, inline or on a consumer, is counted in the key's `InFlight`
 	/// bucket, for the new-key rule.
@@ -2904,22 +3093,23 @@ where
 		}
 
 		let (demotions, promotions, coalesced) = split_tier_migrations(migrations);
+		let stats = self.status.migstats();
 
 		if coalesced > 0 {
-			migstats::COALESCED_TOT.fetch_add(coalesced as u64, Relaxed);
+			stats.coalesced_tot.fetch_add(coalesced as u64, Relaxed);
 		}
 
-		migration_queue::BURST_MAX.fetch_max((demotions.len() + promotions.len()) as u64, Relaxed);
+		stats.burst_max.fetch_max((demotions.len() + promotions.len()) as u64, Relaxed);
 
 		// The stacks' decisions and the correctives, counted apart.
 		let is_corrective = |entry: &&E| entry.origin() == MigrationOrigin::Reconcile;
 		let corrective_demotions = demotions.iter().filter(is_corrective).count();
 		let corrective_promotions = promotions.iter().filter(is_corrective).count();
 
-		migstats::rec(&migstats::DEMO, &migstats::DEMO_TOT, demotions.len() - corrective_demotions);
-		migstats::rec(&migstats::PROMO, &migstats::PROMO_TOT, promotions.len() - corrective_promotions);
-		migstats::reconcile_queued(corrective_promotions, corrective_demotions);
-		migstats::tick();
+		migstats::rec(&stats.demo, &stats.demo_tot, demotions.len() - corrective_demotions);
+		migstats::rec(&stats.promo, &stats.promo_tot, promotions.len() - corrective_promotions);
+		stats.reconcile_queued(corrective_promotions, corrective_demotions);
+		stats.tick();
 
 		let objects = &self.objects;
 		let status = &self.status;
@@ -2950,7 +3140,7 @@ where
 
 			let (key, tier, origin) = entry.tagged();
 
-			if !migration_queue::apply_migration(objects, key, tier) {
+			if !migration_queue::apply_migration(objects, key, tier, stats) {
 				return false;
 			}
 
@@ -3091,7 +3281,7 @@ where
 		}
 
 		let stats = self.status.hybrid_stats();
-		let (pending_demote, pending_promote) = migration_queue::pending();
+		let (pending_demote, pending_promote) = self.status.migstats().pending();
 		let gate = self.status.gate();
 		let bands = gate.bands();
 
@@ -3540,8 +3730,10 @@ where
 			let needs_capacity_eviction = self.policy_stack.len() > 0 && self.policy_stack.needs_capacity_eviction();
 
 			if !over_max_size && !needs_capacity_eviction {
-				migstats::rec(&migstats::EVICT, &migstats::EVICT_TOT, _evicted_this_call);
-				migstats::etick();
+				let stats = self.status.migstats();
+
+				migstats::rec(&stats.evict, &stats.evict_tot, _evicted_this_call);
+				stats.etick();
 				break;
 			}
 
@@ -3717,8 +3909,8 @@ fn polling_delay(now: Instant, last_set_time: Option<Instant>, has_current_set: 
 /// `drain_demotions` when its settle DECIDES them, so a demotion dropped
 /// here because a later promotion in the same drain supersedes it stays
 /// counted although nothing moved. Dropped entries are counted in
-/// `migstats::COALESCED_TOT`; `DEMO`/`PROMO`, `BURST_MAX` and the
-/// `PENDING_*` gauges see only what is kept.
+/// `migstats::Stats::coalesced_tot`; `demo`/`promo`, `burst_max` and the
+/// `pending_*` gauges see only what is kept.
 ///
 /// # Cost
 ///
@@ -3837,13 +4029,20 @@ where
 
 /// Serialises every test in this file that performs a tier migration.
 ///
-/// The `MIG_*` dispositions in [`migration_queue`] are process-global
-/// `AtomicU64`s and the test runner is parallel by default, so a sibling test
-/// applying one migration between a snapshot and its successor moves the
-/// count under the reader and an exact-delta assertion fails by one. Both
-/// migration modules below hold this, not just the ones that read the
-/// counters -- a module that only *perturbs* them is exactly as damaging as
-/// one that reads them.
+/// It was taken for the migration statistics: the `MIG_*` dispositions and the
+/// other MIGSTATS counters were process-global `AtomicU64`s and the test
+/// runner is parallel by default, so a sibling test applying one migration
+/// between a snapshot and its successor moved the count under the reader and
+/// an exact-delta assertion failed by one, and a module that only *perturbed*
+/// them was exactly as damaging as one that read them. Since S8 those counters
+/// are per cache (`migstats::Stats`, on each cache's status), so nothing that
+/// counts can be moved by another test any more and the tests that read them
+/// read their own cache's. The lock stays as it was, on every test that
+/// migrates: it also keeps those tests from running beside one another under
+/// load -- they park consumers, wait on timeouts and share the process's
+/// physical fast-tier count (P) -- and which of them could run without it is
+/// the reader's to establish, test by test, not something the counters'
+/// move settles.
 ///
 /// Two tests outside these modules drive migrations and hold it too, for the
 /// same reason: `arena_hybrid_stack`'s stale-demotion test, and
@@ -3906,13 +4105,7 @@ mod migration_queue_tests {
 
 	use std::sync::atomic::Ordering;
 
-	use super::migration_queue::{
-		MIG_APPLIED,
-		MIG_DECLINED,
-		MIG_GONE,
-		MIG_SUPERSEDED,
-		MigrationQueue,
-	};
+	use super::migration_queue::MigrationQueue;
 	use super::migration_test_lock;
 	use crate::TieredValue;
 	use crate::object::Object;
@@ -3936,19 +4129,22 @@ mod migration_queue_tests {
 		superseded: u64,
 	}
 
-	fn dispositions() -> Dispositions {
+	/// The dispositions `status`'s cache has recorded: its own, per cache (S8),
+	/// so no other test's migrations can move them.
+	fn dispositions(status: &AtomicStatus) -> Dispositions {
+		let stats = status.migstats();
+
 		Dispositions {
-			applied: MIG_APPLIED.load(Ordering::Relaxed),
-			gone: MIG_GONE.load(Ordering::Relaxed),
-			declined: MIG_DECLINED.load(Ordering::Relaxed),
-			superseded: MIG_SUPERSEDED.load(Ordering::Relaxed),
+			applied: stats.mig_applied.load(Ordering::Relaxed),
+			gone: stats.mig_gone.load(Ordering::Relaxed),
+			declined: stats.mig_declined.load(Ordering::Relaxed),
+			superseded: stats.mig_superseded.load(Ordering::Relaxed),
 		}
 	}
 
-	/// The dispositions recorded since `before`. Exact, because every test
-	/// that touches these counters holds `migration_test_lock`.
-	fn since(before: Dispositions) -> Dispositions {
-		let now = dispositions();
+	/// The dispositions `status`'s cache has recorded since `before`.
+	fn since(status: &AtomicStatus, before: Dispositions) -> Dispositions {
+		let now = dispositions(status);
 
 		Dispositions {
 			applied: now.applied - before.applied,
@@ -4026,13 +4222,14 @@ mod migration_queue_tests {
 
 		// Two consumers, so the per-key channel sharding is actually in play
 		// (a single consumer preserves global order trivially).
-		let queue = MigrationQueue::spawn(objects.clone(), 2, make_status()).unwrap();
+		let status = make_status();
+		let queue = MigrationQueue::spawn(objects.clone(), 2, status.clone()).unwrap();
 
 		// Demote then promote: the promote is the newer decision, so the value
 		// must physically end Fast. Both land in the same shard's FIFO
 		// channel, which is exactly the ordering the sharding exists to
 		// guarantee.
-		let before = dispositions();
+		let before = dispositions(&status);
 
 		queue.push((key, Tier::Slow));
 		queue.push((key, Tier::Fast));
@@ -4040,7 +4237,7 @@ mod migration_queue_tests {
 
 		assert_eq!(tier_of(&objects, key), Tier::Fast);
 		assert_eq!(
-			since(before),
+			since(&status, before),
 			Dispositions { applied: 2, gone: 0, declined: 0, superseded: 0 },
 			"both entries moved the value; neither was declined, which is what \
 			 the reverse order would have produced",
@@ -4059,7 +4256,7 @@ mod migration_queue_tests {
 
 		// Mirror: promote then demote must end Slow, and this time the first
 		// entry is the declined one.
-		let before = dispositions();
+		let before = dispositions(&status);
 
 		queue.push((key, Tier::Fast));
 		queue.push((key, Tier::Slow));
@@ -4067,7 +4264,7 @@ mod migration_queue_tests {
 
 		assert_eq!(tier_of(&objects, key), Tier::Slow);
 		assert_eq!(
-			since(before),
+			since(&status, before),
 			Dispositions { applied: 1, gone: 0, declined: 1, superseded: 0 },
 			"the promote is a no-op against an already-Fast value and the demote \
 			 does the work; the reverse order would have applied both",
@@ -4093,13 +4290,13 @@ mod migration_queue_tests {
 		// Key 3 is deliberately never inserted.
 
 		let untouched = header_of(&objects, 2);
-		let before = dispositions();
 
 		let status = make_status();
+		let before = dispositions(&status);
 		let in_flight = status.migration_in_flight().clone();
 		let marks = [1, 2, 3].map(|key| in_flight.mark(key));
 
-		let queue = Arc::new(MigrationQueue::spawn(objects.clone(), 2, status).unwrap());
+		let queue = Arc::new(MigrationQueue::spawn(objects.clone(), 2, status.clone()).unwrap());
 
 		queue.push((1, Tier::Slow)); // applied
 		queue.push((3, Tier::Fast)); // object absent from the map: skipped, still counted
@@ -4128,7 +4325,7 @@ mod migration_queue_tests {
 		flusher.join().unwrap();
 
 		assert_eq!(
-			since(before),
+			since(&status, before),
 			Dispositions { applied: 1, gone: 1, declined: 1, superseded: 0 },
 			"one of each: the migration that moved a value, the one whose object \
 			 had gone, and the one already in the tier it was asked for",
@@ -4229,7 +4426,7 @@ mod migration_queue_tests {
 		let (entered, release) = super::migration_queue::after_copy::arm(KEY);
 		let migrating = objects.clone();
 		let migration = std::thread::spawn(move || {
-			super::migration_queue::apply_migration(&migrating, KEY, Tier::Slow)
+			super::migration_queue::apply_migration(&migrating, KEY, Tier::Slow, &migstats::Stats::default())
 		});
 
 		entered
@@ -4290,16 +4487,16 @@ mod migration_queue_tests {
 		);
 
 		let snapshotted = objects.get_ref(&KEY).unwrap().snapshot();
-		let before = dispositions();
+		let status = make_status();
+		let before = dispositions(&status);
 
 		let (entered, release) = park::arm();
 
 		// One consumer, so exactly one thread can be parked and the entry
 		// cannot be picked up by a second.
-		let status = make_status();
 		let in_flight = status.migration_in_flight().clone();
 		let mark = in_flight.mark(KEY);
-		let queue = MigrationQueue::spawn(objects.clone(), 1, status).unwrap();
+		let queue = MigrationQueue::spawn(objects.clone(), 1, status.clone()).unwrap();
 
 		queue.push((KEY, Tier::Slow));
 
@@ -4350,7 +4547,7 @@ mod migration_queue_tests {
 		);
 
 		assert_eq!(
-			since(before),
+			since(&status, before),
 			Dispositions { applied: 0, gone: 0, declined: 0, superseded: 1 },
 			"the guard rejected it, which is a superseded disposition and not an \
 			 applied one",
@@ -4403,9 +4600,10 @@ mod migration_queue_tests {
 		let admitted: Vec<TieredValue<u32>> =
 			keys.iter().map(|&key| header_of(&objects, key)).collect();
 
-		let before = dispositions();
+		let status = make_status();
+		let before = dispositions(&status);
 
-		let queue = MigrationQueue::spawn(objects.clone(), 2, make_status()).unwrap();
+		let queue = MigrationQueue::spawn(objects.clone(), 2, status.clone()).unwrap();
 
 		for &key in &keys {
 			queue.push((key, requested_tier(key)));
@@ -4414,7 +4612,7 @@ mod migration_queue_tests {
 		queue.flush();
 
 		assert_eq!(
-			since(before),
+			since(&status, before),
 			Dispositions { applied: 32, gone: 0, declined: 0, superseded: 0 },
 			"every entry was a real move",
 		);
@@ -4489,8 +4687,7 @@ mod merged_overwrite_tests {
 	/// of the overwrite's `Set`, must restore it.
 	#[test]
 	fn an_overwrite_is_repromoted_after_a_stale_demotion() {
-		// `apply_migration` bumps the process-wide migration counters that the
-		// queue tests assert exact deltas on, so this runs under their lock.
+		// Migrating tests run under one lock (see `migration_test_lock`).
 		let _serialised = super::migration_test_lock::lock();
 
 		let objects: crate::ObjectMapRef<u64, crate::TieredBuffer> = Arc::new(MergedStore::new());
@@ -4521,8 +4718,10 @@ mod merged_overwrite_tests {
 		queue.extend(log.take_untagged());
 
 		// The key's consumer applies its entries in emission order.
+		let stats = crate::worker::MigStats::default();
+
 		for (key, tier) in queue {
-			apply_migration(&objects, key, tier);
+			apply_migration(&objects, key, tier, &stats);
 		}
 
 		let physical = objects.get_ref(&K).map(|object| object.value().tier());
@@ -4900,20 +5099,19 @@ mod migration_accounting_tests {
 	}
 
 	/// Runs one scripted drain through `apply_tier_migrations` and reports
-	/// the copies it made: `MIG_APPLIED`'s delta, exact under
-	/// `migration_test_lock`.
+	/// the copies it made: the worker's cache's `mig_applied` delta.
 	fn apply_scripted(
 		worker: &mut PolicyWorker<u32, TestBuffer>,
 		migrations: Vec<(HashedKey, Tier)>,
 	) -> u64 {
 		use std::sync::atomic::Ordering;
 
-		let before = migration_queue::MIG_APPLIED.load(Ordering::Relaxed);
+		let before = worker.status.migstats().mig_applied.load(Ordering::Relaxed);
 
 		worker.policy_stack = Box::new(super::test_support::FakeStack::scripted(migrations));
 		worker.apply_tier_migrations();
 
-		migration_queue::MIG_APPLIED.load(Ordering::Relaxed) - before
+		worker.status.migstats().mig_applied.load(Ordering::Relaxed) - before
 	}
 
 	/// A slow value whose key is promoted and then demoted again in ONE drain
@@ -4932,8 +5130,6 @@ mod migration_accounting_tests {
 
 		insert(&objects, 1, Tier::Slow);
 		let admitted = header_of(&objects, 1);
-
-		let coalesced_before = migstats::COALESCED_TOT.load(std::sync::atomic::Ordering::Relaxed);
 
 		let copies = apply_scripted(&mut worker, vec![(1, Tier::Fast), (1, Tier::Slow)]);
 
@@ -4954,10 +5150,10 @@ mod migration_accounting_tests {
 		assert_eq!(stats.promotions, 0, "queued = {queued}");
 		assert_eq!(stats.demotions, 0, "queued = {queued}");
 
-		// Process-global and bumped by any worker in the binary, so only a
-		// lower bound is exact.
-		assert!(
-			migstats::COALESCED_TOT.load(std::sync::atomic::Ordering::Relaxed) > coalesced_before,
+		// The cache's own count (S8): exactly the one superseded promotion.
+		assert_eq!(
+			status.migstats().coalesced_tot.load(std::sync::atomic::Ordering::Relaxed),
+			1,
 			"queued = {queued}: the dropped entry was not counted",
 		);
 	}
@@ -5802,8 +5998,8 @@ mod capacity_watermark_tests {
 
 		const POLICY: PaperPolicy = PaperPolicy::LruCompactHybrid;
 
-		// Its inline landings count in the process-wide migration counters,
-		// which other tests assert exact deltas on under this lock.
+		// A migrating test: it runs under the migrating tests' lock (see
+		// `migration_test_lock`).
 		let _serialised = migration_test_lock::lock();
 
 		// One object's accounted bytes, measured on a worker of its own.
@@ -6058,7 +6254,7 @@ mod phys_transient_tests {
 	) -> (std::thread::JoinHandle<bool>, crossbeam_channel::Sender<()>) {
 		let (entered, release) = after_copy::arm(key);
 		let migrating = objects.clone();
-		let migration = std::thread::spawn(move || apply_migration(&migrating, key, tier));
+		let migration = std::thread::spawn(move || apply_migration(&migrating, key, tier, &migstats::Stats::default()));
 
 		entered
 			.recv_timeout(Duration::from_secs(10))
@@ -6234,6 +6430,10 @@ mod s5_tests;
 // each test alone in a child process.
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod s5_gate_tests;
+
+// Backpressure plan S8: the migration statistics, per cache.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod s8_tests;
 
 // S4's follow-ups: a flat cache over the merged store through a real worker,
 // reaper and wipe -- in every merged build, the flat-merged one included.
@@ -6540,8 +6740,8 @@ mod reconcile_tests {
 	#[cfg(not(feature = "merged_object_store"))]
 	#[test]
 	fn a_set_whose_value_was_taken_before_its_event_admits_nothing() {
-		// Its worker's consumers apply migrations: the process-global counters
-		// other tests take exact deltas of.
+		// Its worker's consumers apply migrations: a migrating test, under
+		// the migrating tests' lock (see `migration_test_lock`).
 		let _serialised = migration_test_lock::lock();
 
 		each_alone!("a_set_whose_value_was_taken_before_its_event_admits_nothing", [PaperPolicy::LruCompactHybrid, PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.5)], |policy| {
@@ -7192,11 +7392,11 @@ mod reconcile_tests {
 	/// hits, served slow meanwhile, queue nothing. `M` is demoted, and a hit
 	/// promotes it -- the stack's own entry, parked the same way -- and twenty
 	/// slow hits after it queue no heal at all. Counted off the drains, not
-	/// off the process-global `RECONCILE_GET_TO_FAST`, which other tests'
-	/// caches move concurrently. Red with the bucket check off (`noquiet`):
-	/// 21 and 20. The 40 hits that found their bucket busy are each counted a
-	/// skipped heal -- `reconcile_get_heal_skipped`, process-global too, so
-	/// asserted as at least 40. Red with that count off (`noskipcount`).
+	/// off the cache's `reconcile_get_to_fast` (its own since S8). Red with
+	/// the bucket check off (`noquiet`): 21 and 20. The 40 hits that found
+	/// their bucket busy are each counted a skipped heal --
+	/// `reconcile_get_heal_skipped`, asserted as at least 40. Red with that
+	/// count off (`noskipcount`).
 	#[test]
 	fn m2_slow_hits_while_their_buckets_promotion_is_in_flight_queue_at_most_one_heal() {
 		let _serialised = migration_test_lock::lock();

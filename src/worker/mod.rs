@@ -303,13 +303,16 @@ pub(crate) use crate::worker::policy::eviction_watermarks::Watermarks;
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 pub(crate) use crate::worker::policy::migration_test_lock;
 
-// The migration queue's pending entry counts, for `crate::phys`.
+// The migration queue's pending entry counts, summed over every cache in the
+// process, for `crate::phys`.
 #[cfg(feature = "hybrid_cache_common")]
 pub(crate) use crate::worker::policy::migration_queue::pending as pending_migrations;
 
-// The reconcile's corrective pushes, for `AtomicStatus::hybrid_stats`.
+// One cache's migration and eviction statistics (S8), which `AtomicStatus`
+// owns for its policy worker, its migration consumers and `hybrid_stats`.
+pub(crate) use crate::worker::policy::migstats::Stats as MigStats;
 #[cfg(feature = "hybrid_cache_common")]
-pub(crate) use crate::worker::policy::migstats::{reconcile_applied, reconciled};
+pub(crate) use crate::worker::policy::migstats::{NB as MIGSTATS_BUCKETS, read as migstats_read};
 
 // The migration pipeline's per-key-bucket in-flight and landed counts, which
 // `AtomicStatus` holds for the client, the worker and the consumers.

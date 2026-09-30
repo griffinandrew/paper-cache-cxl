@@ -168,7 +168,7 @@ the counters record what was *requested*, the kernel reports where pages actuall
 
 ### Migration counters vs physical copies
 
-The hybrid stats (`hybrid_stats()` and the `MIGSTATS` instrumentation) count **tier decisions made by the policy stack**, not physical byte copies.
+The hybrid stats (`hybrid_stats()` and the `MIGSTATS` instrumentation) count **tier decisions made by the policy stack**, not physical byte copies. Both are per cache: each cache starts at zero, and the `MIGSTATS` stderr lines are its own (the migration queue's depth, backlog and dispositions, the batch-size histograms and the reconcile counters are in `HybridStats` too).
 The two are normally identical, but they are not the same quantity, and the distinction
 matters when reading the numbers.
 

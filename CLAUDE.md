@@ -56,12 +56,14 @@ src/
                                physical-fast-tier readings (PHYS_FAST and its peak, the
                                effective capacity, the over-budget integral, fast/slow hits,
                                live tiered caches, live flat caches with fast values), the
-                               4 process-global reconcile intent totals (S3: set->fast,
-                               set->slow, get->fast, new-key), the process-global count of
-                               slow-served hits whose heal a busy bucket skipped, and the
-                               cache's own landed correctives by destination
-                               (reconcile_applied_*), which are NOT promotions or
-                               demotions. The single stats accessor for
+                               4 reconcile intent totals (S3: set->fast, set->slow,
+                               get->fast, new-key), the count of slow-served hits whose
+                               heal a busy bucket skipped, and the landed correctives by
+                               destination (reconcile_applied_*), which are NOT promotions
+                               or demotions; and, since S8, the rest of the MIGSTATS
+                               counters (the migration queue's depth, backlog and
+                               dispositions, the batch-size histograms, the fallback
+                               count), all PER CACHE. The single stats accessor for
                                every design;
                                the per-design *_hybrid_stats() methods are gone.
   phys.rs                     PHYS_FAST: bytes physically allocated in the fast tier's value
@@ -134,8 +136,9 @@ src/
                                or pace the consumers, hold the worker, hold M).
                                worker/policy/test_support.rs holds the child-process helpers
                                (`alone_in`; `each_alone!`, which runs a test's policies each in
-                               a child of its own, since the process-global counters outlive a
-                               cache) and the hand-driven worker tests' shared helpers.
+                               a child of its own, since P and the allocators' state are
+                               process-global and outlive a cache) and the hand-driven worker
+                               tests' shared helpers.
   numa_alloc.rs               Node-bound jemalloc arenas. NumaAlloc<NODE_FAST> is the crate's
                                #[global_allocator]; SlowObjects (aliased crate-wide as `Hybrid`)
                                backs the slow tier. Extents are mmap'd then mbind'd before
@@ -184,9 +187,11 @@ src/
                                  Also holds two submodules: `migration_queue` (the standing
                                  consumer pool that actually performs the byte moves, one
                                  channel per consumer sharded by key hash, 2 threads by
-                                 default) and `migstats` (the MIGSTATS
-                                 batch-size histograms dumped to stderr, and the RECONCILE_*
-                                 counters on a last line of their own). Queue entries carry a
+                                 default) and `migstats` (the per-cache `Stats` block, owned
+                                 by each cache's AtomicStatus since S8: the MIGSTATS batch-size
+                                 histograms dumped to stderr, the queue's depth and
+                                 dispositions, and the reconcile counters on a last line of
+                                 their own). Queue entries carry a
                                  MigrationOrigin (Stack | Reconcile) through the split and the
                                  queue, so a landed corrective is counted apart from
                                  promotions/demotions. `migration_queue::InFlight`: per key
@@ -3492,3 +3497,42 @@ so ages key 1 out, where it fitted the 204 B target of 0.98 and nothing aged (th
 `FAST_TIER_DRAIN_TARGET=0.98` reproduces it. `tests/phys_fast_identity.rs`'s settle-target check and
 the two shared-overhead fixtures' arithmetic took the new figure, and the comments that worked the
 integration fixtures' byte budgets out at 0.98 (39 of 40, 1,568 of 1,600) read 0.95 (38, 1,520).
+
+## Per-cache migration statistics (S8, part 1)
+
+The MIGSTATS counters were process-global statics, cumulative over every cache a process had
+built: with several caches in one process each reported its predecessors' totals too (the user:
+"each policy run should reset all cache state"). They are per cache now. `migstats::Stats`
+(`worker/policy/mod.rs`) is one block per cache, a field of its `AtomicStatus` -- the one structure
+the clients, the policy worker and the migration consumers all hold -- so it starts at zero with
+the cache and reports only its own work: the queue's depth and burst maxima, the pending
+demote/promote gauges and their peaks (and the net peak), the four dispositions (`applied`, `gone`,
+`declined`, `superseded`), the batch-size histograms and totals (`demo`, `promo`, `evict`, and
+`coalesced_tot`), the reconcile counters (the five that were already in `HybridStats`, now per
+cache, plus the queued and landed pairs) and the eviction fallback (`ERASE_FALLBACK`, whose
+process-wide total stays, a public static, beside the per-cache count the DIVERGE line prints).
+`HybridStats` exports them under the MIGSTATS names (`queue_depth_max`, `burst_max`, `pending_*`,
+`mig_applied` / `mig_gone` / `mig_declined` / `mig_superseded`, `mig_calls`, `evict_calls`,
+`demo_tot`, `promo_tot`, `evict_tot`, `coalesced_tot`, `demo_hist` / `promo_hist` / `evict_hist`,
+`reconcile_queued_*`, `erase_fallbacks`). The counters are cumulative since the cache was built: a
+`wipe()` does not reset them (entries may be in flight, and the dump never was reset), which is the
+difference from the promotions and demotions, and from `reconcile_applied_*` (the status's own
+pair, reset by a wipe; the block keeps a cumulative pair for the dump).
+
+The MIGSTATS stderr dump is the same lines in the same format, now per cache (`Stats::dump`,
+periodic and once at shutdown; `Stats::lines` builds them and a test holds the format); with several
+caches in one process the lines carry no identifier and are told apart by order and `t_ms`. `t_ms`,
+and the DIVERGE and MEMTS lines' (now per cache: their sampling counter and the fallback count) share
+one process-wide clock origin, the first cache's construction. What stays process-wide is what is:
+P and its peak, the live-cache counts, the allocators' state, the clock origin, the environment
+(`OnceLock`) configuration, and the sum of the queues' pending entries that the public
+`phys::pending_migrations()` reads (the identity tests poll it).
+
+Tests that read the counters as deltas (the migration queue's dispositions, the scripted-drain copy
+count, the coalesced count) read their own cache's now, and the last of them can be exact instead of a
+lower bound (`coalesced_tot == 1`). `migration_test_lock` is unchanged: no test's counters can be
+moved by another's any more, but the lock also keeps migrating tests from running beside one another
+under load and the process-wide fast-tier count (P) is shared, so which of them could drop it is not
+a decision the counters' move makes (its doc says so). New tests (`s8_tests.rs`): a cache reports only
+its own migrations (a second cache starts at zero and its work moves none of the first's), and the
+eviction fallback is counted per cache; and the dump's format.

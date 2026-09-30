@@ -28,7 +28,7 @@
 //! tier, and the live tiered-cache and flat-fast-cache counts. Four of those
 //! are PROCESS-GLOBAL (`phys_fast_bytes`, `phys_fast_bytes_max`,
 //! `live_tiered_caches`, `live_flat_fast_caches`); see each field. Since S3,
-//! 4 more process-global totals -- the corrective migrations the policy
+//! 4 more totals -- the corrective migrations the policy
 //! worker's reconcile queued, by reason (`reconcile_set_*`,
 //! `reconcile_get_to_fast`) -- a fifth, the slow-served hits whose heal a
 //! busy in-flight bucket skipped (`reconcile_get_heal_skipped`), and 2
@@ -38,6 +38,15 @@
 //! (`dram_metadata_bytes`), its structures on the slow node beside it, and
 //! `F - M` -- beside the modelled `fast_metadata_bytes` and
 //! `effective_fast_capacity`, which they do not replace.
+//!
+//! Since S8 the migration statistics -- the fields the `MIGSTATS` stderr lines
+//! print, and the reconcile counters above -- are PER CACHE, not process-global:
+//! each cache starts at zero and reports only its own work (they used to be
+//! statics, so a second cache in a process reported its predecessors' totals
+//! too). They are cumulative since the cache was built and a `wipe()` does not
+//! reset them (`reconcile_applied_*` aside, which a wipe resets with the
+//! promotions and demotions). Only the four readings named above stay
+//! process-wide, being about the process's memory.
 
 /// Feature-neutral snapshot of the active hybrid cache's tier-movement
 /// counters and live tier gauges.
@@ -169,8 +178,9 @@ pub struct HybridStats {
 	/// whose value was built in the slow tier for a key the stack places
 	/// fast, the reverse, and a hit served from the slow tier on a key the
 	/// stack places fast (the heal). Intents: one that finds the bytes
-	/// already moved is declined by its consumer. PROCESS-GLOBAL totals, the
-	/// MIGSTATS line's `reconcile_*` fields.
+	/// already moved is declined by its consumer. THIS cache's totals since it
+	/// was built (S8; they were process-global), the MIGSTATS line's
+	/// `reconcile_*` fields.
 	pub reconcile_set_to_fast: u64,
 	pub reconcile_set_to_slow: u64,
 	pub reconcile_get_to_fast: u64,
@@ -179,7 +189,7 @@ pub struct HybridStats {
 	/// while a migration of its bucket was in flight, or had landed after its
 	/// value was published, whose value was built where the stack places it
 	/// -- queued only to land LAST, behind any stale entry for the key. An
-	/// intent, PROCESS-GLOBAL like the three above; the MIGSTATS line's
+	/// intent, this cache's own like the three above; the MIGSTATS line's
 	/// `reconcile_set_new_key`. Under a BACKLOG the rule fires for most fresh
 	/// sets: with D entries in flight a bucket is busy with probability about
 	/// 1 - e^(-D/16384) (63% at D = 16k, 95% at 50k), so this then counts
@@ -191,7 +201,7 @@ pub struct HybridStats {
 	/// something of the key's in-flight bucket was busy: the worker read no
 	/// placement and queued nothing. An UPPER BOUND on the heals skipped -- a
 	/// hit on a key placed slow, or on a key whose own promotion is what is
-	/// in flight, needed none. PROCESS-GLOBAL like the four above; the
+	/// in flight, needed none. This cache's own like the four above; the
 	/// MIGSTATS reconcile line's `reconcile_get_heal_skipped`, its last field
 	/// but `t_ms`. Under the backlog above it is most slow-served hits, and
 	/// heals are effectively off until the backlog drains.
@@ -210,7 +220,7 @@ pub struct HybridStats {
 	/// completed moves (see `demotions`). One that found the bytes already
 	/// moved (declined), the key gone, or its value replaced mid-copy
 	/// (superseded) is not counted. The MIGSTATS line's
-	/// `reconcile_applied_*` are the process-global totals.
+	/// `reconcile_applied_*` are the same counts without the wipe's reset.
 	pub reconcile_applied_to_fast: u64,
 	pub reconcile_applied_to_slow: u64,
 
@@ -318,6 +328,71 @@ pub struct HybridStats {
 	pub band_s: u64,
 	pub band_n: u64,
 	pub band_b: u64,
+
+	/// S8, the migration statistics of THIS cache -- what the `MIGSTATS` lines
+	/// print, which were process-global statics until S8. Cumulative since the
+	/// cache was built; a `wipe()` does not reset them (entries may still be in
+	/// flight).
+	///
+	/// The migration queue: the deepest it has fallen behind (`enqueued -
+	/// processed`), and the largest single batch handed to the consumers.
+	pub queue_depth_max: u64,
+	pub burst_max: u64,
+
+	/// Entries handed to the consumers and not yet finished, by destination
+	/// (`pending_demote`: bytes the stack counts as slow that are still in DRAM;
+	/// `pending_promote`: the reverse), gauges, and their peaks; and the peak of
+	/// `pending_demote - pending_promote` sampled at one instant, the net
+	/// mis-placement. Zero under `MIGRATION_QUEUE_THREADS=0`.
+	pub pending_demote: u64,
+	pub pending_promote: u64,
+	pub pending_demote_max: u64,
+	pub pending_promote_max: u64,
+	pub pending_net_max: u64,
+
+	/// How the queue's entries ended: `mig_applied` moved a value; `mig_gone`
+	/// found the object evicted meanwhile, `mig_declined` found it already in
+	/// the requested tier, `mig_superseded` lost a race with a `set`, and moved
+	/// nothing. Every entry is exactly one of the four, which is what `flush`
+	/// counts.
+	pub mig_applied: u64,
+	pub mig_gone: u64,
+	pub mig_declined: u64,
+	pub mig_superseded: u64,
+
+	/// Migration drains handed on (`mig_calls`) and eviction passes ended
+	/// (`evict_calls`); the objects the stacks' drains asked to demote
+	/// (`demo_tot`) and to promote (`promo_tot`) -- intents, not completions:
+	/// `demotions`/`promotions` count completions -- and the objects eviction
+	/// passes removed (`evict_tot`); and `coalesced_tot`, the entries dropped
+	/// because a later entry of the same drain sent the key the other way. A
+	/// drain's entries are `demo_tot + promo_tot + coalesced_tot +
+	/// reconcile_queued_to_fast + reconcile_queued_to_slow`.
+	pub mig_calls: u64,
+	pub evict_calls: u64,
+	pub demo_tot: u64,
+	pub promo_tot: u64,
+	pub evict_tot: u64,
+	pub coalesced_tot: u64,
+
+	/// The batch sizes behind those totals, as log2 histograms: bucket 0 counts
+	/// batches of 0 objects, 1 of 1, 2 of 2-3, 3 of 4-7 ... 15 of 16,384 and
+	/// more (drains of demotions, of promotions, and eviction passes).
+	pub demo_hist: [u64; crate::worker::MIGSTATS_BUCKETS],
+	pub promo_hist: [u64; crate::worker::MIGSTATS_BUCKETS],
+	pub evict_hist: [u64; crate::worker::MIGSTATS_BUCKETS],
+
+	/// Reconcile-origin entries (the correctives) handed on to the consumers,
+	/// by destination: intents, kept out of `demo_tot`/`promo_tot`, and
+	/// (`reconcile_applied_*`) counted separately when they land.
+	pub reconcile_queued_to_fast: u64,
+	pub reconcile_queued_to_slow: u64,
+
+	/// Times the eviction loop fell back to evicting an arbitrary object
+	/// because the policy stack named none (a stack behind its map; DashMap
+	/// store only). That path removes the object from the map without telling
+	/// the stack. The DIVERGE line's `fallback`.
+	pub erase_fallbacks: u64,
 }
 
 impl HybridStats {

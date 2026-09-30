@@ -752,8 +752,8 @@ mod overwrite_tests {
 	/// K's fresh value sits in the slow tier while the stack counts it fast.
 	#[test]
 	fn an_overwrite_is_repromoted_after_a_stale_demotion() {
-		// `apply_migration` bumps the process-wide migration counters that the
-		// queue tests assert exact deltas on, so this runs under their lock.
+		// A migrating test: it runs under the migrating tests' lock (see
+		// `migration_test_lock`).
 		let _serialised = crate::worker::policy::migration_test_lock::lock();
 
 		let objects: crate::ObjectMapRef<u32, crate::TieredBuffer> = crate::new_hybrid_object_map();
@@ -777,8 +777,10 @@ mod overwrite_tests {
 		stack.insert_resident(K, SIZE, 0);
 		queue.extend(stack.drain_tier_migrations());
 
+		let stats = crate::worker::MigStats::default();
+
 		for (key, tier) in queue {
-			apply_migration(&objects, key, tier);
+			apply_migration(&objects, key, tier, &stats);
 		}
 
 		let physical = objects.get_ref(&K).map(|object| object.value().tier());
