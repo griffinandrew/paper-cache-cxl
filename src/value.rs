@@ -352,14 +352,7 @@ pub struct ValueHeader<K> {
 	/// The real key, kept for the hash-collision check. The object map is
 	/// keyed on a 64-bit hash, so this is what distinguishes two keys that
 	/// collide.
-	#[cfg(not(feature = "key_pmem_value_pmem"))]
 	key: K,
-
-	/// Under `key_pmem_value_pmem` the key is owned in persistent memory
-	/// instead, with no DRAM copy -- the header itself stays in DRAM, only the
-	/// key's own allocation moves.
-	#[cfg(feature = "key_pmem_value_pmem")]
-	key: Box<K, crate::Hybrid>,
 
 	/// The value's bytes and their tier. Owned: see `Drop`.
 	bytes: ValueBytes,
@@ -462,10 +455,7 @@ impl<K> TieredValue<K> {
 
 		let value = TieredValue {
 			inner: Arc::new(ValueHeader {
-				#[cfg(not(feature = "key_pmem_value_pmem"))]
 				key,
-				#[cfg(feature = "key_pmem_value_pmem")]
-				key: Box::new_in(key, crate::Hybrid),
 
 				bytes: ValueBytes::new_in(bytes, tier),
 				len,
@@ -515,14 +505,7 @@ impl<K> TieredValue<K> {
 	/// The real key, for the hash-collision check.
 	#[inline]
 	pub fn key(&self) -> &K {
-		#[cfg(not(feature = "key_pmem_value_pmem"))]
-		return &self.inner.key;
-
-		// Under `key_pmem_value_pmem` the key is a `Box<K, Hybrid>`, so the
-		// comparison reads it from persistent memory -- which is the point of
-		// that feature, and the reason this deref is not elided.
-		#[cfg(feature = "key_pmem_value_pmem")]
-		return &self.inner.key;
+		&self.inner.key
 	}
 
 	/// Whether this value's key is `key`. The check that makes a 64-bit hash

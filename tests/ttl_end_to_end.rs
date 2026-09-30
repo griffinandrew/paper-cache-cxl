@@ -39,7 +39,7 @@ const SETTLE: Duration = Duration::from_secs(5);
 fn cache() -> PaperCache<u32, TieredBuffer> {
 	// The per-object metadata model (S5): this test is not about the model, and
 	// its fast tier is smaller than the cache's own empty structures in the
-	// merged and hashbrown builds -- under the measured model's key ceiling it
+	// merged builds -- under the measured model's key ceiling it
 	// would refuse every key.
 	let mut gate = GateConfig::default();
 	gate.metadata_model = MetadataModel::PerObject;

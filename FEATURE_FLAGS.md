@@ -39,26 +39,12 @@ The implementation provides explicit feature flags to control:
 - **When disabled**: Cache key/value pairs use default allocation (typically DRAM)
 - **Requirements**: Mutually exclusive with `all_dram`
 
-### `global_hashtable_pmem`
-- **Purpose**: Control memory placement of the main cache hashtable
-- **When enabled**: Global cache hashtable stored in PMEM
-- **When disabled**: Global cache hashtable stored in DRAM
-- **Requirements**: Can be used independently or with `key_value_pmem`
-
 ### `eviction_stacks_pmem`
 - **Purpose**: Allocate eviction policy tracking structures in PMEM using feature-selected PMEM allocators
 - **When enabled**: the compact flat stacks' slabs and indexes (and the hybrid stacks' arenas) are PMEM-backed
 - **When disabled**: ordinary DRAM allocation is used (default)
 - **Use case**: Ensures eviction metadata is co-located with PMEM-stored objects for lower cross-tier access overhead
 - **Requirements**: Uses `Hybrid` (`numa_alloc::SlowObjects`, node-1-bound jemalloc arenas)
-
-### `hashbrown_dram`
-- **Purpose**: Use hashbrown HashMap as global hashtable in DRAM (for performance comparison)
-- **When enabled**: `ObjectMapRef` uses `Arc<RwLock<HashMap<..., NoHasher>>>` in DRAM
-- **When disabled**: Default hashtable implementation (DashMap) is used
-- **Use case**: Direct performance comparison with `global_hashtable_pmem` using the same hashbrown implementation
-- **Performance**: Same hashbrown HashMap implementation as `global_hashtable_pmem` but allocated in DRAM instead of PMEM
-- **Requirements**: Mutually exclusive with `global_hashtable_pmem`
 
 ### `lru_compact_hybrid_cache`
 - **Purpose**: Single-instance, segmented-LRU hybrid cache — implements the paper design where the LRU
@@ -310,8 +296,7 @@ The implementation uses Rust's conditional compilation to select the appropriate
 
 **Global hashtable** (`objects` in `PaperCache`):
 - Default: `DashMap` (DRAM)
-- With `global_hashtable_pmem`: `RwLock<HashMap<..., Hybrid>>` (PMEM)
-- With `hashbrown_dram`: `RwLock<HashMap<..., NoHasher>>` (DRAM)
+- With `merged_object_store`: the merged store (map, order and tier in one structure)
 
 ### Allocator Integration
 
@@ -341,12 +326,7 @@ The code uses `#[cfg(...)]` attributes extensively to:
    features = ["key_value_pmem"]
    ```
 
-3. **Global hashtable in PMEM only** (data in DRAM, hashtable in PMEM):
-   ```toml
-   features = ["global_hashtable_pmem"]
-   ```
-
-4. **PMEM-backed eviction stacks + key/value in PMEM**:
+3. **PMEM-backed eviction stacks + key/value in PMEM**:
    ```toml
    features = ["eviction_stacks_pmem", "key_value_pmem"]
    ```
@@ -371,9 +351,7 @@ The code uses `#[cfg(...)]` attributes extensively to:
 
 1. **`all_dram`**: Maximum performance, baseline comparison
 2. **`key_value_pmem`**: Persistent data, volatile metadata
-3. **`global_hashtable_pmem`**: Test hashtable in PMEM independently
-4. **`hashbrown_dram`**: Use hashbrown HashMap in DRAM for direct performance comparison with `global_hashtable_pmem`
-5. **`eviction_stacks_pmem`**: eviction stacks allocated in PMEM for co-location with PMEM objects
+3. **`eviction_stacks_pmem`**: eviction stacks allocated in PMEM for co-location with PMEM objects
 
 ## Code Locations
 
@@ -407,12 +385,6 @@ The code uses `#[cfg(...)]` attributes extensively to:
 To test different combinations (requires nightly Rust for allocator features):
 
 ```bash
-# Check hashbrown HashMap in DRAM (for performance comparison)
-cargo +nightly check --no-default-features --features hashbrown_dram
-
-# Global hashtable in PMEM (global cache only)
-cargo +nightly check --features "global_hashtable_pmem,key_value_pmem"
-
 # Test baseline without any features
 cargo +nightly check --no-default-features
 

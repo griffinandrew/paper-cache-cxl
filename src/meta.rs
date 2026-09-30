@@ -23,10 +23,10 @@
 //! # The three parts
 //!
 //!   * the MAP -- the object map's own structures and the `Arc` it lives in.
-//!     DashMap: every shard's hashbrown table and the shard array.
-//!     `hashbrown_dram`: its one table. The merged store: its bucket arrays,
-//!     slab chunks and their tables, free lists, LFU frequency maps, the
-//!     shard array and the two tail-mirror arrays;
+//!     DashMap: every shard's hashbrown table and the shard array. The
+//!     merged store: its bucket arrays, slab chunks and their tables, free
+//!     lists, LFU frequency maps, the shard array and the two tail-mirror
+//!     arrays;
 //!   * the STACK -- the policy stack's structures
 //!     (`PolicyStack::structure_bytes`: slab chunks and their table, the
 //!     keyless index, the free list, the LFU bucket maps, the ghost) and the
@@ -37,15 +37,13 @@
 //!     `fused_value`, whose header is inside the item).
 //!
 //! Structures on the SLOW node are not in M -- the eviction stacks under
-//! `eviction_stacks_pmem`, the table under `global_hashtable_pmem` -- and are
-//! reported apart (`DramMetadata::slow`).
+//! `eviction_stacks_pmem` -- and are reported apart (`DramMetadata::slow`).
 //!
 //! NOT attributed, and not in M: the channels (one crossbeam block per
 //! channel once it has been used), the policy worker's reusable buffers and
 //! each stack's transient `migrations` vector, the migration pipeline's
 //! in-flight table (128 KiB, built on the first set), the status, the TTL
-//! index (on the slow node unless `ttl_index_dram`), and anything outside the
-//! cache. `tests/dram_metadata_identity.rs` holds the DRAM pool to M plus P
+//! index (on the slow node), and anything outside the cache. `tests/dram_metadata_identity.rs` holds the DRAM pool to M plus P
 //! with those taken out by a warm-up; the per-structure tests hold each
 //! structure to `thread.allocated`.
 //!
@@ -59,11 +57,10 @@
 //! [`Meter`]. The DashMap has no growth hook: the POLICY WORKER re-reads a
 //! shard's table layout (`RawTable::allocation_info`, under the shard's read
 //! lock, `try_read` so it never waits) at the end of any pass whose `Set`s
-//! could have made that table reallocate -- see [`ShardState`]. The
-//! `hashbrown_dram` table the same way, one table. The worker publishes M
-//! into the status each pass, after a wipe, and after any event that grew the
-//! stack (`PolicyWorker::publish_metadata`), where one load reads it
-//! (`AtomicStatus::dram_metadata_bytes`).
+//! could have made that table reallocate -- see [`ShardState`]. The worker
+//! publishes M into the status each pass, after a wipe, and after any event
+//! that grew the stack (`PolicyWorker::publish_metadata`), where one load
+//! reads it (`AtomicStatus::dram_metadata_bytes`).
 
 use std::alloc::Layout;
 
@@ -277,10 +274,7 @@ pub use published::*;
 
 #[cfg(feature = "hybrid_cache_common")]
 mod published {
-	use std::{
-		hash::{BuildHasher, Hash},
-		sync::RwLock,
-	};
+	use std::hash::BuildHasher;
 
 	use dashmap::DashMap;
 
@@ -297,8 +291,7 @@ mod published {
 		/// One DRAM value header per live object.
 		pub headers: u64,
 		/// NOT in M: the cache's structures on the slow node (the eviction
-		/// stacks under `eviction_stacks_pmem`, the table under
-		/// `global_hashtable_pmem`), reported apart.
+		/// stacks under `eviction_stacks_pmem`), reported apart.
 		pub slow: u64,
 	}
 
@@ -439,63 +432,9 @@ mod published {
 		state.shard_array + state.tables
 	}
 
-	/// The alignment of a hashbrown table's allocation: its control-group
-	/// width (16 with SSE2), which is more than the `(u64, Object)` bucket's
-	/// own. hashbrown 0.16's `allocation_size` gives the size alone; the
-	/// table test holds the pair to the allocator.
-	pub const HASHBROWN_TABLE_ALIGN: usize = 16;
-
-	/// The policy worker's reading of one `RwLock`ed hashbrown table: the
-	/// rule of [`ShardState`], for one table. hashbrown's `insert` reserves
-	/// before it looks, as DashMap's does; its `entry` does not, so `erase`
-	/// cannot grow it, and counting the removals is merely conservative.
-	#[derive(Default)]
-	pub struct TableState {
-		bytes: u64,
-		headroom: usize,
-		writes: usize,
-		stale: bool,
-		read: bool,
-	}
-
-	pub fn table_write(state: &mut TableState) {
-		state.writes += 1;
-
-		if state.writes > state.headroom {
-			state.stale = true;
-		}
-	}
-
-	/// The table's usable bytes, re-read when it could have reallocated.
-	pub fn table_bytes<K, V, S, A>(
-		map: &RwLock<hashbrown::HashMap<K, V, S, A>>,
-		state: &mut TableState,
-		all: bool,
-	) -> u64
-	where
-		K: Eq + Hash,
-		S: BuildHasher,
-		A: allocator_api2::alloc::Allocator,
-	{
-		if all || state.stale || !state.read {
-			if let Ok(table) = map.try_read() {
-				state.bytes = usable(table.allocation_size(), HASHBROWN_TABLE_ALIGN);
-				state.headroom = table.capacity() - table.len();
-				state.writes = 0;
-				state.stale = false;
-				state.read = true;
-			}
-		}
-
-		state.bytes
-	}
-
 	/// This build's object map's worker-side state.
-	#[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem", feature = "merged_object_store")))]
+	#[cfg(not(feature = "merged_object_store"))]
 	pub type MapState = ShardState;
-
-	#[cfg(all(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem"), not(feature = "merged_object_store")))]
-	pub type MapState = TableState;
 
 	#[cfg(feature = "merged_object_store")]
 	pub type MapState = ();
@@ -505,11 +444,8 @@ mod published {
 	/// [`ShardState`]. Nothing for the merged store, which counts itself.
 	#[allow(unused_variables)]
 	pub fn map_write<K, V>(objects: &ObjectMapRef<K, V>, state: &mut MapState, key: HashedKey) {
-		#[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem", feature = "merged_object_store")))]
+		#[cfg(not(feature = "merged_object_store"))]
 		dashmap_write(&**objects, state, key);
-
-		#[cfg(all(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem"), not(feature = "merged_object_store")))]
-		table_write(state);
 	}
 
 	/// The object map's own bytes, by node: its structures and the `Arc` it
@@ -517,18 +453,8 @@ mod published {
 	/// call (everything when `all`).
 	#[allow(unused_variables)]
 	pub fn map_bytes<K, V>(objects: &ObjectMapRef<K, V>, state: &mut MapState, all: bool) -> NodeBytes {
-		#[cfg(not(any(feature = "hashbrown_dram", feature = "global_hashtable_pmem", feature = "merged_object_store")))]
+		#[cfg(not(feature = "merged_object_store"))]
 		return NodeBytes::dram(super::arc_bytes_of_ref(objects) + dashmap_bytes(&**objects, state, all));
-
-		#[cfg(all(feature = "hashbrown_dram", not(feature = "merged_object_store")))]
-		return NodeBytes::dram(super::arc_bytes_of_ref(objects) + table_bytes(&**objects, state, all));
-
-		// The table is on the slow node; the `Arc` and the lock are DRAM.
-		#[cfg(all(feature = "global_hashtable_pmem", not(feature = "merged_object_store")))]
-		return NodeBytes {
-			dram: super::arc_bytes_of_ref(objects),
-			slow: table_bytes(&**objects, state, all),
-		};
 
 		#[cfg(feature = "merged_object_store")]
 		return NodeBytes::dram(super::arc_bytes_of_ref(objects) + objects.structure_bytes());
@@ -574,9 +500,6 @@ pub(crate) fn thread_live_bytes() -> i64 {
 #[cfg(test)]
 mod tests {
 	use std::alloc::Layout;
-
-	#[cfg(feature = "hybrid_cache_common")]
-	use std::sync::RwLock;
 
 	#[cfg(feature = "hybrid_cache_common")]
 	use dashmap::DashMap;
@@ -779,39 +702,6 @@ mod tests {
 		assert_eq!(live() + freed, after, "and the reading saw it");
 	}
 
-	/// The `hashbrown_dram` table's reading, exact across its growth: a
-	/// table built small so it grows, objects built first.
-	#[cfg(feature = "hybrid_cache_common")]
-	#[test]
-	fn the_hashbrown_table_reading_is_exact_across_its_growth() {
-		type Map = hashbrown::HashMap<HashedKey, crate::object::Object<u64, crate::BufferDRAM>, crate::NoHasher>;
-
-		let mut objects: Vec<_> = (0..5_000u64).map(|i| crate::object::Object::new(i, &[1u8; 8], None)).collect();
-
-		let base = thread_live_bytes();
-		let live = || (thread_live_bytes() - base) as u64;
-
-		let map = RwLock::new(Map::with_hasher(crate::NoHasher::default()));
-		let mut state = TableState::default();
-		let mut steps = 0;
-		let mut last = 0;
-
-		for i in 0..5_000u64 {
-			map.write().unwrap().insert(i, objects.pop().expect("an object"));
-			table_write(&mut state);
-
-			let now = table_bytes(&map, &mut state, false);
-			assert_eq!(live(), now, "after insert {i}");
-
-			if now != last {
-				steps += 1;
-				last = now;
-			}
-		}
-
-		assert!(steps >= 10, "the table grew {steps} times");
-	}
-
 	/// The worker's publication on a real tiered cache: at quiescence M's map
 	/// part is what a fresh full reading of the map gives (so the reading
 	/// kept up with every table's growth), the header part is one header per
@@ -824,9 +714,8 @@ mod tests {
 
 		// The per-object metadata model (S5): the test is about M's
 		// publication, which the model does not enter, and this 1 MiB tier is
-		// smaller than the merged store's and hashbrown_dram's own empty
-		// structures -- under the measured model's key ceiling it would refuse
-		// every key.
+		// smaller than the merged store's own empty structures -- under the
+		// measured model's key ceiling it would refuse every key.
 		let _per_object = crate::object::overhead::test_overheads::per_object();
 
 		let cache = PaperCache::<u64, TieredBuffer>::new(

@@ -209,13 +209,7 @@ pub struct ValueHeader<K> {
 	/// The real key, kept for the hash-collision check. The object map is
 	/// keyed on a 64-bit hash, so this is what distinguishes two keys that
 	/// collide.
-	#[cfg(not(feature = "key_pmem_value_pmem"))]
 	key: K,
-
-	/// Under `key_pmem_value_pmem` the key is owned in persistent memory
-	/// instead, with no DRAM copy -- only the key's own allocation moves.
-	#[cfg(feature = "key_pmem_value_pmem")]
-	key: Box<K, crate::Hybrid>,
 	// The value's bytes follow, at `bytes_offset::<K>()`.
 }
 
@@ -415,10 +409,7 @@ impl<K> TieredValue<K> {
 				len,
 				expiry: AtomicU32::new(expiry.map_or(0, |tick| tick.get())),
 
-				#[cfg(not(feature = "key_pmem_value_pmem"))]
 				key,
-				#[cfg(feature = "key_pmem_value_pmem")]
-				key: Box::new_in(key, crate::Hybrid),
 			});
 
 			std::ptr::copy_nonoverlapping(
@@ -493,15 +484,7 @@ impl<K> TieredValue<K> {
 	/// The real key, for the hash-collision check.
 	#[inline]
 	pub fn key(&self) -> &K {
-		#[cfg(not(feature = "key_pmem_value_pmem"))]
-		{
-			&self.header().key
-		}
-
-		#[cfg(feature = "key_pmem_value_pmem")]
-		{
-			&self.header().key
-		}
+		&self.header().key
 	}
 
 	/// Whether this item's key is the one asked for.

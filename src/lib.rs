@@ -6,12 +6,7 @@
  * correct
  */
 
-#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "merged_object_store", feature = "hybrid_cache_common"), feature(allocator_api), feature(btreemap_alloc))]
-
-
-// Validate that hashbrown_dram is not enabled with other global hashtable features
-#[cfg(all(feature = "hashbrown_dram", feature = "global_hashtable_pmem"))]
-compile_error!("Cannot enable both 'hashbrown_dram' and 'global_hashtable_pmem' features simultaneously. Please choose only one global hashtable mode.");
+#![cfg_attr(any(feature = "all_dram", feature = "key_value_pmem", feature = "eviction_stacks_pmem", feature = "merged_object_store", feature = "hybrid_cache_common"), feature(allocator_api), feature(btreemap_alloc))]
 
 
 /// Node-0-bound jemalloc arenas as the process allocator.
@@ -41,8 +36,6 @@ pub mod numa_alloc;
 // cluster12, and TBB retained ~1.75x the memory in use without returning it.
 #[cfg(any(
     feature = "key_value_pmem",
-    feature = "key_pmem_value_pmem",
-    feature = "global_hashtable_pmem",
     feature = "eviction_stacks_pmem",
     feature = "segregated_value_arena",
 ))]
@@ -100,16 +93,6 @@ pub mod value;
 #[cfg(all(feature = "thin_header", feature = "fused_value"))]
 compile_error!("thin_header and fused_value are alternative value layouts; enable at most one");
 
-// `key_pmem_value_pmem` boxes every key into its own persistent-memory
-// allocation. Under `thin_header` the key's placement IS the layout -- it lives
-// in the item and tiers with it -- so the two would disagree about where every
-// key is.
-#[cfg(all(feature = "thin_header", feature = "key_pmem_value_pmem"))]
-compile_error!(
-	"thin_header stores the key inside the tiered item; it cannot be combined \
-	 with key_pmem_value_pmem"
-);
-
 /// `paper_cache::TieredValue`, alongside `paper_cache::TieredBuffer`.
 pub use crate::value::TieredValue;
 
@@ -143,7 +126,7 @@ pub use crate::gate::{GateConfig, GateMode, GateState, MetadataModel, MetadataOv
 // abstraction (see each module's doc comment) -- used by the generic
 // `impl<K, V, S> PaperCache<K, V, S>` blocks below to replace what used to
 // be one impl block per (object-map shape, value-buffer type) combination.
-#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem"))]
 mod object_store;
 
 /// Object map, recency order and tier placement in ONE structure.
@@ -157,9 +140,9 @@ mod object_store;
 #[cfg(feature = "merged_object_store")]
 pub mod merged_store;
 
-#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem"))]
 use crate::object_store::ObjectStore;
-#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem"))]
 use crate::value::ValueShape;
 
 // Shared tier-size unit type (bytes/Mb/Gb), used by every hybrid design so
@@ -223,23 +206,10 @@ use std::{
 	},
 };
 
-#[cfg(any(
-	feature = "global_hashtable_pmem",
-	feature = "hashbrown_dram",
-))]
-use std::sync::RwLock;
-
-#[cfg(not(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram")))]
 use dashmap::{
 	DashMap,
 	mapref::entry::Entry,
 };
-
-#[cfg(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
-use hashbrown::HashMap;
-
-#[cfg(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
-use hashbrown::hash_map::Entry;
 
 use typesize::TypeSize;
 use nohash_hasher::NoHashHasher;
@@ -409,29 +379,13 @@ pub fn jemalloc_stats() -> Option<String> {
 
 
 
-/// Initial capacity (in entries) for the hashbrown-backed object map used
-/// by `hashbrown_dram`, `global_hashtable_pmem`, and any hybrid-cache
-/// feature combined with `hashbrown_dram` (see `new_hybrid_object_map`).
-/// Sized to hold every object across this project's real benchmark traces
-/// (`/home/griff/final_traces/*.bin`, distinct GET-driven keys measured at
-/// ~1.06M-1.09M per trace) without ever growing/rehashing mid-benchmark.
-#[cfg(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
-const HASHBROWN_INITIAL_CAPACITY: usize = 1_500_000;
-
-#[cfg(all(not(feature = "global_hashtable_pmem"), not(feature = "hashbrown_dram"), not(feature = "merged_object_store")))]
+#[cfg(not(feature = "merged_object_store"))]
 pub type ObjectMapRef<K, V> = Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>;
 
 /// Object map and LRU eviction order in ONE structure -- see `merged_store`.
 /// Measured 208 B/object against the split design's 280.
 #[cfg(feature = "merged_object_store")]
 pub type ObjectMapRef<K, V> = Arc<crate::merged_store::MergedStore<K, V>>;
-
-#[cfg(feature = "global_hashtable_pmem")]
-pub type ObjectMapRef<K, V> = Arc<RwLock<HashMap<HashedKey, Object<K, V>, BuildHasherDefault<NoHashHasher<HashedKey>>, Hybrid>>>;
-
-// Hashbrown HashMap in DRAM (for performance comparison with global_hashtable_pmem)
-#[cfg(feature = "hashbrown_dram")]
-pub type ObjectMapRef<K, V> = Arc<RwLock<HashMap<HashedKey, Object<K, V>, BuildHasherDefault<NoHashHasher<HashedKey>>>>>;
 
 
 pub type StatusRef = Arc<AtomicStatus>;
@@ -497,19 +451,12 @@ impl<K, V, S> Drop for PaperCache<K, V, S> {
 /// 
 
 // ---------------------------------------------------------------------
-// Shape A: DashMap-backed object map. Covers `all_dram` (V = BufferDRAM)
-// and `key_value_pmem` without `global_hashtable_pmem` (V = BufferPMEM) --
-// see `ObjectMapRef`'s DashMap arm above. One generic-over-`V: ValueBuffer`
-// block replaces what used to be two nearly-identical impl blocks (one per
-// concrete V).
-//
-// Excludes `hashbrown_dram` (in addition to `global_hashtable_pmem`) to
-// stay disjoint from Shape B below, mirroring `ObjectMapRef`'s own DashMap
-// arm gate exactly -- without this, `hashbrown_dram` combined with
-// `all_dram`/`key_value_pmem` would compile both this block and Shape B
-// for the same `V: ValueBuffer`, a duplicate-inherent-impl error.
+// DashMap-backed object map. Covers `all_dram` (V = BufferDRAM) and
+// `key_value_pmem` (V = BufferPMEM) -- see `ObjectMapRef`'s DashMap arm above.
+// One generic-over-`V: ValueBuffer` block replaces what used to be two
+// nearly-identical impl blocks (one per concrete V).
 // ---------------------------------------------------------------------
-#[cfg(any(all(feature = "all_dram", not(feature = "hashbrown_dram")), all(feature = "key_value_pmem", not(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram")))))]
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem"))]
 impl<K, V, S> PaperCache<K, V, S>
 where
 	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
@@ -1206,419 +1153,6 @@ where
 	}
 }
 
-// ---------------------------------------------------------------------
-// Shape B: `RwLock<HashMap<..., A>>`-backed object map, generic over the
-// allocator `A`. Covers `global_hashtable_pmem` alone (V = BufferDRAM,
-// A = Hybrid), `hashbrown_dram` (V = BufferDRAM, A = default/Global), and
-// `key_value_pmem` + `global_hashtable_pmem` together (V = BufferPMEM,
-// A = Hybrid) -- see `ObjectMapRef`'s two RwLock arms above. One
-// generic-over-`V: ValueBuffer` block replaces what used to be three
-// nearly-identical impl blocks.
-// ---------------------------------------------------------------------
-#[cfg(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
-impl<K, V, S> PaperCache<K, V, S>
-where
-	// `Send + Sync` because `WorkerFanout::new` hands the object map to worker
-	// threads. Every other `PaperCache` impl carries these; this shape was
-	// merged without them, so the two features that select it never built.
-	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
-	V: ValueShape,
-	S: Default + Clone + BuildHasher,
-{
-	/// Creates an empty `PaperCache` with maximum size `max_size` and
-	/// eviction policy `policy`. If the maximum size is zero, a
-	/// [`CacheError`] will be returned.
-	pub fn new(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-	) -> Result<Self, CacheError> {
-		Self::with_hasher(
-			max_size,
-			policies,
-			policy,
-			Default::default(),
-		)
-	}
-
-	/// Creates an empty `PaperCache` with the supplied hasher.
-	pub fn with_hasher(
-		max_size: CacheSize,
-		policies: &[PaperPolicy],
-		policy: PaperPolicy,
-		hasher: S,
-	) -> Result<Self, CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		if policies.is_empty() {
-			return Err(CacheError::EmptyPolicies);
-		}
-
-		if policies.iter().is_multiset() {
-			return Err(CacheError::DuplicatePolicies);
-		}
-
-		if !policies.contains(&policy) {
-			return Err(CacheError::UnconfiguredPolicy);
-		}
-
-		// Every configured policy is checked, not just the active one: the
-		// list is validated whole, as it always was, though only `policy`
-		// ever runs -- a cache's policy is fixed when it is built.
-		if policies
-			.iter()
-			.any(|configured| s_three_fifo_starves_main(*configured, max_size))
-			|| s_three_fifo_starves_main(policy, max_size)
-		{
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		// Global hashtable in PMEM (Hybrid allocator) when
-		// `global_hashtable_pmem` is on; otherwise a plain-DRAM hashbrown
-		// table (`hashbrown_dram`'s default allocator).
-		#[cfg(feature = "global_hashtable_pmem")]
-		let objects = Arc::new(RwLock::new(HashMap::with_capacity_and_hasher_in(
-			HASHBROWN_INITIAL_CAPACITY,
-			NoHasher::default(),
-			Hybrid,
-		)));
-
-		#[cfg(not(feature = "global_hashtable_pmem"))]
-		let objects = Arc::new(RwLock::new(HashMap::with_capacity_and_hasher(
-			HASHBROWN_INITIAL_CAPACITY,
-			NoHasher::default(),
-		)));
-
-		let status = Arc::new(AtomicStatus::new(max_size, policies, policy)?);
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		// A flat cache whose values are FAST builds them through the same
-		// `TieredValue::new_in` as a tiered one, so PHYS_FAST counts them:
-		// counted in `phys::live_flat_fast_caches` until the status is freed,
-		// since P describes one tiered cache only while that reads 0.
-		#[cfg(feature = "hybrid_cache_common")]
-		if matches!(V::TIER, crate::Tier::Fast) {
-			status.register_flat_fast_cache();
-		}
-
-		let (worker_fanout, worker_handles) = WorkerFanout::new(
-			&objects,
-			&status,
-			&overhead_manager,
-		)?;
-
-		let cache = PaperCache {
-			objects,
-			status,
-			workers: Arc::new(worker_fanout),
-			worker_handles,
-			overhead_manager,
-
-			hasher,
-		};
-
-		Ok(cache)
-	}
-
-	#[must_use]
-	pub fn version(&self) -> String {
-		env!("CARGO_PKG_VERSION").to_owned()
-	}
-
-	pub fn status(&self) -> Result<Status, CacheError> {
-		self.status.try_to_status()
-	}
-
-	/// A flat cache has no tiers to audit: `None`. See the tiered cache's
-	/// `placement_audit`.
-	#[cfg(feature = "hybrid_cache_common")]
-	#[must_use]
-	pub fn placement_audit(&self) -> Option<crate::phys::PlacementAudit> {
-		None
-	}
-
-	/// Gets the value associated with the supplied key.
-	/// If the key was not found in the cache, returns a [`CacheError`].
-	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		// Take the value handle under the shard guard, release the guard, and
-		// only then copy. The handle owns a strong reference, so a writer that
-		// unpublishes this value while the copy is in flight decrements a count
-		// that is not yet zero and frees nothing.
-		let snapshot = match self.objects.get_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Some(object.snapshot()),
-			_ => None,
-		};
-
-		// The tier the hit is served from -- the snapshot's tag -- or `None`
-		// on a miss: the policy worker's heal needs it (`WorkerEvent::Get`).
-		let served = snapshot.as_ref().map(|value| value.tier());
-
-		let result = match snapshot {
-			Some(value) => {
-				self.status.incr_hits();
-				Ok(value.bytes().to_vec())
-			},
-
-			None => {
-				self.status.incr_misses();
-				Err(CacheError::KeyNotFound)
-			},
-		};
-
-
-		self.broadcast(WorkerEvent::Get(hashed_key, served))?;
-
-		result
-	}
-
-	/// Sets the supplied key and value in the cache.
-	/// Returns a [`CacheError`] if the value size is zero or larger than
-	/// the cache's maximum size.
-	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(&key);
-
-		// The size checks before anything is allocated (S5), with the
-		// predicates they always had: the length's base size
-		// (`OverheadManager::base_size_for`, which `base_size` of the object
-		// built below equals) -- a value too large is refused unbuilt.
-		match self.overhead_manager.base_size_for(&key, value.len(), ttl) {
-			None => return Err(CacheError::ExceedingValueSize),
-			Some(0) => return Err(CacheError::ZeroValueSize),
-			Some(base) if self.status.exceeds_max_size(base) => return Err(CacheError::ExceedingValueSize),
-			Some(_) => {},
-		}
-
-		// The one thing the shape still decides: which allocator the value
-		// comes from. `BufferDRAM` names the fast tier, `BufferPMEM` the slow
-		// one -- see `value::ValueShape`.
-		let object = Object::new_in(key, value, V::TIER, ttl);
-
-		let base_size = self.overhead_manager.base_size(&object);
-		let dram_resident = self.overhead_manager.dram_resident_size(&object);
-		let expiry = object.expiry();
-		// Where the bytes were allocated, for the worker's reconcile
-		// (`WorkerEvent::Set`).
-		let built = object.value().tier();
-
-		self.status.incr_sets();
-
-		let old_object_info = self.objects
-			.insert(hashed_key, object)
-			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
-				(base_size, expiry)
-			});
-
-		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
-			base_size as i64 - old_object_size as i64
-		} else {
-			self.status.incr_num_objects();
-			base_size as i64
-		};
-
-		self.status.update_base_used_size(base_size_delta);
-		self.broadcast(WorkerEvent::Set(
-			hashed_key,
-			base_size,
-			dram_resident,
-			expiry,
-			old_object_info,
-			built,
-			// A flat cache queues no migration: nothing to mark.
-			0,
-			// Nor places anything by tier.
-			crate::worker::Placement::Normal,
-		))?;
-
-		Ok(())
-	}
-
-	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
-
-		self.status.incr_dels();
-		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
-
-		Ok(())
-	}
-
-	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
-
-		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
-		// reads the key, the expiry, the length and the tag bit, never the
-		// value's bytes, and the shard guard it holds while doing so keeps the
-		// object -- and through its handle everything those live in -- alive.
-		// A pin would protect nothing that is read here. (Under `thin_header`
-		// the first three are in the tiered item: one remote cache line for a
-		// slow object.)
-		self.objects
-			.get_ref(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
-	}
-
-	/// # API change (v5)
-	///
-	/// This returned a `Shared<V>` -- a refcounted handle onto the value --
-	/// until the refcount was removed. It now returns an owned `Vec<u8>`, the
-	/// same thing [`Self::get`] returns.
-	///
-	/// It cannot return a borrow. A value is now a bare pointer whose lifetime
-	/// is managed by epoch reclamation, so the only two honest return types
-	/// are a copy or a guard object holding the pin open -- and a guard held by
-	/// a caller that then blocks would pin the epoch and stall reclamation for
-	/// every thread, which is the one failure mode this design has to avoid.
-	/// A copy has the same semantics the `Shared` did anyway: a snapshot that
-	/// was live at the moment of the lookup.
-	pub fn peek(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
-		let snapshot = match self.objects.get_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Some(object.snapshot()),
-
-			_ => None,
-		};
-
-		let result = match snapshot {
-			Some(value) => Ok(value.bytes().to_vec()),
-			None => Err(CacheError::KeyNotFound),
-		};
-
-
-		result
-	}
-
-	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		let mut object = match self.objects.get_mut_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
-			_ => return Err(CacheError::KeyNotFound),
-		};
-
-		let old_expiry = object.expiry();
-		let old_base_size = self.overhead_manager.base_size(&object);
-
-		object.expires(ttl);
-
-		let new_expiry = object.expiry();
-		let new_base_size = self.overhead_manager.base_size(&object);
-
-		self.status.update_base_used_size(new_base_size as i64 - old_base_size as i64);
-		self.broadcast(WorkerEvent::Ttl(hashed_key, old_expiry, new_expiry))?;
-
-		Ok(())
-	}
-
-	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
-
-		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
-		// reads the key, the expiry, the length and the tag bit, never the
-		// value's bytes, and the shard guard it holds while doing so keeps the
-		// object -- and through its handle everything those live in -- alive.
-		// A pin would protect nothing that is read here. (Under `thin_header`
-		// the first three are in the tiered item: one remote cache line for a
-		// slow object.)
-		match self.objects.get_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
-				Ok(self.overhead_manager.total_size(&object)),
-			_ => Err(CacheError::KeyNotFound),
-		}
-	}
-
-	pub fn wipe(&self) -> Result<(), CacheError> {
-		info!("Wiping cache");
-
-		// The policy worker wipes -- the object map, its stack, the status
-		// counters and the tier gauges -- and answers when it is done
-		// (`PolicyWorker::handle_wipe`); this thread waits for the answer. It
-		// used to clear the map and the status here and leave the stack to
-		// the worker, and a `Set` the worker handled in between left a live
-		// key its stack no longer tracked. The kick wakes a worker parked on
-		// its idle poll (up to 1 s); the wait still includes the events queued
-		// ahead of the `Wipe`. The values `clear_counted` drops retire into the
-		// worker's epoch bag, which its pass flushes.
-		let (ack, done) = crossbeam_channel::bounded(1);
-		let sent = self.broadcast(WorkerEvent::Wipe(Some(ack)));
-
-		self.status.kick_policy_worker();
-
-		match done.recv() {
-			// Wiped. A failed delivery to another subscriber (a dead TTL
-			// worker) is still reported, as it always was.
-			Ok(()) => sent,
-
-			// Every sender is gone without an answer: the policy worker is dead
-			// (its channel dropped, with the event in it) and the other
-			// subscribers have handled or dropped their copies -- the TTL
-			// worker within its poll, 1 s at most. Wipe here so the cache is
-			// empty all the same, and say it failed.
-			Err(_) => {
-				let cleared = self.objects.clear_counted(|object| self.overhead_manager.base_size(object));
-				self.status.clear(cleared);
-
-				Err(CacheError::Internal)
-			},
-		}
-	}
-
-	pub fn resize(&self, max_size: CacheSize) -> Result<(), CacheError> {
-		if max_size == 0 {
-			return Err(CacheError::ZeroCacheSize);
-		}
-
-		// `Stack::resize` recomputes the main budget against the NEW size, so
-		// a resize can starve a queue that was fine at construction.
-		if self
-			.status
-			.policies()
-			.iter()
-			.any(|configured| s_three_fifo_starves_main(*configured, max_size))
-		{
-			return Err(CacheError::InvalidPolicy);
-		}
-
-		let current_max_size = self.status.max_size();
-
-		if max_size == current_max_size {
-			return Ok(());
-		}
-
-		info!(
-			"Resizing cache from {} to {}",
-			fmt::memory(current_max_size, Some(2)),
-			fmt::memory(max_size, Some(2)),
-		);
-
-		self.status.set_max_size(max_size);
-		self.broadcast(WorkerEvent::Resize(max_size))?;
-
-		Ok(())
-	}
-
-	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
-		self.workers.send(event)
-	}
-
-	fn hash_key(&self, key: &K) -> HashedKey {
-		self.hasher.hash_one(key)
-	}
-}
-
 
 
 pub enum EraseKey<'a, K> {
@@ -1645,107 +1179,6 @@ pub enum EraseKey<'a, K> {
 }
 
 
-#[cfg(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
-pub fn erase<K, V>(
-	objects: &ObjectMapRef<K, V>,
-	status: &StatusRef,
-	overhead_manager: &OverheadManagerRef,
-	maybe_key: Option<EraseKey<K>>,
-) -> Result<(HashedKey, Object<K, V>), CacheError>
-where
-	K: Eq + TypeSize,
-{
-	let hashed_key = match maybe_key {
-		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
-		Some(EraseKey::Hashed(hashed_key)) => hashed_key,
-		Some(EraseKey::Expired(hashed_key)) => hashed_key,
-
-		None => {
-			// INSTRUMENTATION: this path removes an object from the MAP without
-			// informing the eviction STACK, which is exactly the shape of the
-			// observed map>stack divergence. Counted so the hypothesis is
-			// testable rather than plausible.
-			crate::ERASE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-			// the stack has run out of keys to evict while the map has not (a
-			// stack behind its map), so we fall back to evicting a random object
-
-			//let Some(object) = objects.iter().next() else {
-			//let Some(object) = objects.read().unwrap().iter().next() else {
-			let mut objects_guard = objects.write().unwrap();
-			let Some(object) = objects_guard.iter().next() else {
-				error!("Object store is empty with non-zero used size");
-				return Err(CacheError::Internal);
-			};
-
-			//object.key().to_owned()
-			object.0.to_owned()
-		},
-	};
-
-	// don't remove the object right away because if we have the original key,
-	// we need to do a validation check that it matches the object's key in
-	// case of a hash collision
-	//let Entry::Occupied(entry) = objects.entry(hashed_key) else {
-	let mut objects_lock = objects.write().unwrap();
-	let Entry::Occupied(entry) = objects_lock.entry(hashed_key) else {
-		return Err(CacheError::KeyNotFound);
-	};
-
-	//if let Some(EraseKey::Original(key, _)) = maybe_key && !entry.get().key_matches(key) {
-	if let Some(EraseKey::Original(key, _)) = maybe_key && !entry.get().key_matches(key) {
-		return Err(CacheError::KeyNotFound);
-	};
-
-	// A reap must not take an object that is live again -- see
-	// `EraseKey::Expired`. Tested on the occupied entry, under the lock the
-	// removal below also holds.
-	if matches!(maybe_key, Some(EraseKey::Expired(_))) && !entry.get().is_expired() {
-		return Err(CacheError::KeyNotFound);
-	};
-
-	let object = entry.remove();
-	let base_size = overhead_manager.base_size(&object) as i64;
-
-	status.update_base_used_size(-base_size);
-	status.decr_num_objects();
-
-	match !object.is_expired() {
-		true => Ok((hashed_key, object)),
-		false => Err(CacheError::KeyNotFound),
-	}
-}
-
-
-
-
-
-
-
-
-
-
-
-// merged_erase_marker
-/// `erase` for the merged store.
-///
-/// The arms map onto who is removing, because in this store a removal is
-/// policy work only on the policy worker:
-///
-///   * `Original` (a client's `del`) and `Expired` (the TTL reaper) are the
-///     CLIENT's `MergedStore::take_if`: a value the worker has not linked is
-///     freed, a linked one goes DEAD -- its object gone, its slot left on the
-///     list for the worker to retire at the `Del`/`Expire` that follows, as a
-///     DashMap stack keeps a deleted key until its `Del` -- and no policy state
-///     moves;
-///   * `Hashed` (the eviction `apply_evictions` pairs with a nomination) is the
-///     WORKER's `MergedStore::take_evict`, which unlinks and uncharges in the
-///     same operation that removes from the index, so the map-greater-than-
-///     stack divergence `ERASE_FALLBACK` counts has no way to occur; it
-///     refuses a value the worker has not linked, which is then
-///     `KeyNotFound`;
-///   * no key: refused, `Internal` -- `evict_victim` never asks this store for
-///     an arbitrary victim (its `None` means nothing linked is left, and the
-///     pass stops there).
 #[cfg(feature = "merged_object_store")]
 pub fn erase<K, V>(
 	objects: &ObjectMapRef<K, V>,
@@ -1794,7 +1227,7 @@ where
 	}
 }
 
-#[cfg(not(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram", feature = "merged_object_store")))]
+#[cfg(not(feature = "merged_object_store"))]
 pub fn erase<K, V>(
 	objects: &ObjectMapRef<K, V>,
 	status: &StatusRef,
@@ -1864,25 +1297,12 @@ unsafe impl<K, V, S> Send for PaperCache<K, V, S> {}
 // is exposed, so sharing a `&PaperCache` across threads is safe.
 unsafe impl<K, V, S> Sync for PaperCache<K, V, S> {}
 
-/// Builds the object map every hybrid-cache design stores its objects in --
-/// mirrors Shape B's
-/// `with_hasher` (see above) rather than hardcoding `DashMap`, so
-/// `hashbrown_dram` gets the same plain-DRAM `hashbrown::HashMap` object
-/// table it already gives the non-hybrid storage combos, instead of always
-/// silently using `DashMap` regardless of that feature. The return type
-/// (`ObjectMapRef<K, V>`) is picked by the same cfg that already selects it
+/// Builds the object map every hybrid-cache design stores its objects in. The
+/// return type (`ObjectMapRef<K, V>`) is picked by the cfg that selects it
 /// crate-wide -- this just has to build a matching value.
 #[cfg(feature = "hybrid_cache_common")]
 fn new_hybrid_object_map<K, V>() -> ObjectMapRef<K, V> {
-	#[cfg(feature = "hashbrown_dram")]
-	{
-		Arc::new(RwLock::new(HashMap::with_capacity_and_hasher(
-			HASHBROWN_INITIAL_CAPACITY,
-			NoHasher::default(),
-		)))
-	}
-
-	#[cfg(all(not(feature = "hashbrown_dram"), not(feature = "merged_object_store")))]
+	#[cfg(not(feature = "merged_object_store"))]
 	{
 		Arc::new(DashMap::with_hasher(NoHasher::default()))
 	}
@@ -3022,11 +2442,7 @@ where
 	/// that ends each batch has not run, so a cache over its size still holds
 	/// -- and the audit counts -- the values that pass will evict. The walk
 	/// holds each map shard's read lock while it reads that shard, so a writer
-	/// to it waits. In the hashbrown build it holds the map's ONE
-	/// `std::sync::RwLock` read guard for the whole walk, and that lock
-	/// prefers writers: once a `set` is waiting for it, every `get` waits too,
-	/// so the whole cache stalls for the walk. For end-of-run checks and
-	/// tests, not for a hot path.
+	/// to it waits. For end-of-run checks and tests, not for a hot path.
 	///
 	/// EXACT ONLY AT CLIENT QUIESCENCE. While clients run, a value set, moved
 	/// or deleted during the walk is read before or after the change, and a
@@ -3299,85 +2715,6 @@ where
 	pub fn size_threshold(&self) -> CacheSize {
 		self.status.hybrid_size_threshold()
 	}
-}
-
-// Tests for global_hashtable_pmem alone (without key_value_pmem)
-#[cfg(all(feature = "global_hashtable_pmem", not(feature = "key_value_pmem")))]
-#[cfg(all(test, feature = "global_hashtable_pmem"))]
-mod test_global_hashtable_pmem_alone {
-    use crate::{BufferDRAM, PaperCache, PaperPolicy};
-    use std::hash::RandomState;
-
-    #[test]
-    fn test_basic_operations() {
-        // Create cache with global hashtable in PMEM, values in DRAM
-        let cache: PaperCache<u32, BufferDRAM, RandomState> = PaperCache::new(
-            1000000,
-            &[PaperPolicy::LfuCompact],
-            PaperPolicy::LfuCompact,
-        ).expect("Failed to create cache");
-
-        // Test set operation
-        let value = vec![1, 2, 3, 4, 5];
-        assert!(cache.set(1, &value, None).is_ok());
-
-        // Test get operation
-        let retrieved = cache.get(&1).expect("Failed to get value");
-        assert_eq!(retrieved, value);
-
-        // Test has operation
-        assert!(cache.has(&1));
-        assert!(!cache.has(&999));
-
-        // Test del operation
-        assert!(cache.del(&1).is_ok());
-        assert!(!cache.has(&1));
-    }
-
-    #[test]
-    fn test_multiple_keys() {
-        let cache: PaperCache<u32, BufferDRAM, RandomState> = PaperCache::new(
-            10000000,
-            &[PaperPolicy::LruCompact],
-            PaperPolicy::LruCompact,
-        ).expect("Failed to create cache");
-
-        // Insert multiple key-value pairs
-        for i in 0..100 {
-            let value = vec![i as u8; 10];
-            assert!(cache.set(i, &value, None).is_ok());
-        }
-
-        // Verify all keys exist
-        for i in 0..100 {
-            assert!(cache.has(&i));
-            let retrieved = cache.get(&i).expect("Failed to get value");
-            assert_eq!(retrieved, vec![i as u8; 10]);
-        }
-    }
-
-    #[test]
-    fn test_wipe() {
-        let cache: PaperCache<String, BufferDRAM, RandomState> = PaperCache::new(
-            1000000,
-            &[PaperPolicy::LfuCompact],
-            PaperPolicy::LfuCompact,
-        ).expect("Failed to create cache");
-
-        let key1 = "key1".to_string();
-        let key2 = "key2".to_string();
-        
-        cache.set(key1.clone(), b"value1", None).unwrap();
-        cache.set(key2.clone(), b"value2", None).unwrap();
-        
-        assert!(cache.has(&key1));
-        assert!(cache.has(&key2));
-
-        cache.wipe().expect("Failed to wipe cache");
-
-        assert!(!cache.has(&key1));
-        assert!(!cache.has(&key2));
-    }
 }
 
 /// Unit tests verifying structural compilation and initialization with new feature flags.

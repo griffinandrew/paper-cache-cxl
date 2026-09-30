@@ -29,9 +29,9 @@ src/
                                all 23 designs: the engine (new(max_size, fast_tier_size,
                                policy), with_hasher, the cache operations, hybrid_stats()) and
                                a second holding the size-split design's new_sized/
-                               with_hasher_sized. Carries exactly one compile_error!, rejecting
-                               hashbrown_dram + global_hashtable_pmem -- unrelated to the
-                               designs. The 153 pairwise hybrid guards are gone.
+                               with_hasher_sized. Its two compile_error!s (thin_header with
+                               fused_value, measured_accounting with stock_jemalloc) concern the
+                               build, not the designs. The 153 pairwise hybrid guards are gone.
   policy.rs                   PaperPolicy — the plain (flat) policies (LfuCompact, FifoCompact,
                                ClockCompact, SieveCompact, LruCompact, MruCompact,
                                TwoQCompact, SThreeFifoCompact, Arc) plus one variant per hybrid design
@@ -80,13 +80,12 @@ src/
                                live value's tag against the stack's placement_of -- stranded
                                (in DRAM, placed slow), lagging (in CXL, placed fast),
                                untracked -- in the same unit. A diagnostic that blocks the
-                               policy worker for a queue flush and one map walk (and, in the
-                               hashbrown build, every reader too), exact only at client
-                               quiescence.
+                               policy worker for a queue flush and one map walk, exact only at
+                               client quiescence.
   meta.rs                     M (S5a): the bytes the cache's OWN DRAM metadata structures
                                hold, counted from the structures in jemalloc's usable-size unit
                                -- the object map's (the DashMap's shard tables and shard array,
-                               the hashbrown_dram table, the merged store's buckets, slab
+                               the merged store's buckets, slab
                                chunks, chunk tables, free lists, LFU maps and fixed arrays), the
                                policy stack's (PolicyStack::structure_bytes: slab chunks and
                                their table, keyless index, free list, LFU bucket maps through
@@ -269,13 +268,11 @@ placement strategies. Current state:
 - `numa_jemalloc` — node-bound jemalloc arenas (`src/numa_alloc.rs`). Pulled in by every feature
   below. It does not gate the arenas themselves: `pub mod numa_alloc` and the
   `#[global_allocator]` are unconditional; `Hybrid` exists only under one of the
-  PMEM features (`cfg(any(key_value_pmem, key_pmem_value_pmem, global_hashtable_pmem,
-  eviction_stacks_pmem))`) — notably *not* under `all_dram` alone, or under the empty default
+  PMEM features (`cfg(any(key_value_pmem, eviction_stacks_pmem))`) — notably *not* under `all_dram` alone, or under the empty default
   feature set.
-- `key_value_pmem` / `key_pmem_value_pmem` — value (or key+value) bytes in PMEM via `Hybrid`.
+- `key_value_pmem` — value bytes in PMEM via `Hybrid`.
 - `all_dram` — force every allocation to DRAM.
 - `eviction_stacks_pmem` — move the eviction stacks' own bookkeeping into PMEM.
-- `global_hashtable_pmem`, `hashbrown_dram` — hashtable placement.
 - **The 23 `*_hybrid_cache` features** — each implies `key_value_pmem` and
   `hybrid_cache_common`. They are **not** mutually exclusive: none defines an impl block, so any
   subset may be enabled. What a feature still does: ungates its `<design>_hybrid_cache` shim
@@ -293,9 +290,10 @@ types; `TieredBuffer` is the tagged union of them that the hybrid designs actual
 original two-PaperCache-instance S3-FIFO composition), `sets_dram`, `pmem_region_alloc`,
 `region_hybrid_allocator`, `devdax_bump`, `global_flatmap_dram`/`global_flatmap_pmem`, and the
 legacy copy-based tiering manager's `enable_tiering_manager`, `tiering`, `multitiering`,
-`hashtable_tiering` and `tiering_hashtable_pmem` (`src/tiering/`, removed in R1), and the design
-features `lru_lazy_copy_hybrid_cache` and `two_q_fast_admission_compact_hybrid_cache` (removed in
-R2). See the removal entries near the end of this file.
+`hashtable_tiering` and `tiering_hashtable_pmem` (`src/tiering/`, removed in R1), the design
+features `lru_lazy_copy_hybrid_cache` and `two_q_fast_admission_compact_hybrid_cache`, and the
+build features `hashbrown_dram`, `global_hashtable_pmem`, `key_pmem_value_pmem` and
+`ttl_index_dram` (removed in R2). See the removal entries near the end of this file.
 
 ## Merged-store measurements until S5 (read before benchmarking it)
 
@@ -3339,3 +3337,20 @@ constructor's guard against a main queue that truncates to zero bytes, covered o
 `SThreeFifo`; the Compact stack has the identical `main_is_full` degeneracy, so the guard now
 covers `SThreeFifoCompact` (it refuses that configuration with `InvalidPolicy`, as it always
 did for the original).
+
+## Removed four build features: the RwLock object map, `key_pmem_value_pmem`, `ttl_index_dram` (R2)
+
+On the user's decision: `hashbrown_dram` and `global_hashtable_pmem` together -- the two features
+that selected the `RwLock<hashbrown::HashMap>` object map ("Shape B"), one in DRAM and one on the
+slow node -- `key_pmem_value_pmem` (each key in its own slow-node box; after R1 nothing enabled
+it) and `ttl_index_dram` (the TTL index back in DRAM, an A/B knob). Gone with them: Shape B's
+`PaperCache` impl block and its `erase` (`lib.rs`), the `RwLock` impl of `ObjectStore` and its two
+guard types (`object_store.rs`), the hashbrown table's reading and its test (`meta.rs`), the
+initial-capacity constant, the `compile_error!` that refused the pair, and every cfg arm of the
+four (the `Hybrid` alias, the object-map and worker cfg lists, the key's `Box<K, Hybrid>` arm in
+`value.rs` and `value_fused.rs`, the overhead gates, `measure_overhead.rs`'s gate, the expiry
+set's). The DashMap shape is the only non-merged `ObjectMapRef` now, so `ObjectStore` has one
+implementation.
+
+Kept, on the user's instruction until they are benchmarked: `thin_header`, `fused_value` and the
+default value layout. `all_dram`, `segregated_value_arena` and `stock_jemalloc` stay too.

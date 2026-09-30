@@ -7,7 +7,7 @@ use paper_cache::{PaperCache, CacheTierSize, GateConfig, MetadataModel, PaperPol
 
 // The per-object metadata model (S5): this test is not about the model, and
 // its fast tier is smaller than the cache's own empty structures in the
-// merged and hashbrown builds -- under the measured model's key ceiling it
+// merged builds -- under the measured model's key ceiling it
 // would refuse every key.
 fn per_object() -> GateConfig {
     let mut gate = GateConfig::default();

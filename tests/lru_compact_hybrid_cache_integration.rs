@@ -149,7 +149,7 @@ mod hybrid_cache_tests {
         // The environment variable first, as every test here (S5): a cache
         // built before it would use the measured metadata model, whose key
         // ceiling refuses keys on a tier smaller than the cache's own
-        // structures -- this 1 MiB one, in the merged and hashbrown builds --
+        // structures -- this 1 MiB one, in the merged builds --
         // and whether a sibling test had set it yet was a race.
         ensure_pmem_allocator_warm();
 

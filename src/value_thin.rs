@@ -87,9 +87,7 @@
 //!
 //! Stored as a `K` inside the item, so for a POD key its bytes tier with the
 //! value. A `String` or `Vec<u8>` key still keeps its heap bytes in a separate
-//! global allocation, as it does under every layout. `key_pmem_value_pmem`,
-//! which puts the key in its own persistent-memory box, is refused at compile
-//! time in `lib.rs`: the key's placement is the whole point of this layout.
+//! global allocation, as it does under every layout.
 //!
 //! ## Shared with `value.rs`
 //!

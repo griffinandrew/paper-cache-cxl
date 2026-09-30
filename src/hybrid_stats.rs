@@ -159,8 +159,7 @@ pub struct HybridStats {
 	/// This cache's own; reporting only.
 	pub dram_metadata_bytes: u64,
 	/// This cache's structures on the SLOW node, which M leaves out: the
-	/// eviction stacks under `eviction_stacks_pmem`, the object table under
-	/// `global_hashtable_pmem`. 0 in every other build.
+	/// eviction stacks under `eviction_stacks_pmem`. 0 in every other build.
 	pub slow_metadata_bytes: u64,
 	/// `F - M`, saturating: `effective_fast_capacity` with the measured
 	/// metadata in place of the modelled. Reporting only.

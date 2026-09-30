@@ -188,8 +188,8 @@ unsafe impl<K, V> Send for TtlWorker<K, V> {}
 /// entry over an object that is not due -- instead of racing threads for it.
 ///
 /// Gated on `hybrid_cache_common` because `new_hybrid_object_map` is, which is
-/// also what runs them against whichever object map the build selects: DashMap,
-/// `hashbrown_dram` or `merged_object_store`, each with its own `erase`.
+/// also what runs them against whichever object map the build selects: DashMap
+/// or `merged_object_store`, each with its own `erase`.
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod tests {
 	use std::{num::NonZeroU32, sync::Arc};

@@ -315,9 +315,7 @@ fn measure_value_class() {
 /// if it does not hold then the whole-cache measurement is what is wrong.
 ///
 /// The map is the DEFAULT `ObjectMapRef` shape -- `DashMap` on the GLOBAL
-/// allocator. Not the `global_hashtable_pmem` variant: copying the wrong cfg
-/// arm here once put the map in PMEM and measured a different structure
-/// entirely.
+/// allocator.
 ///
 /// Same rules as every other measurement in this module: jemalloc
 /// `stats.allocated` rather than RSS, ONE point per process, and the caller
@@ -330,11 +328,7 @@ fn measure_value_class() {
 /// target. The merged store's own equivalent is
 /// `merged_store::measure::measure_merged_store_point`, and its DashMap
 /// control is `measure_dashmap_point` in the same module.
-#[cfg(not(any(
-	feature = "global_hashtable_pmem",
-	feature = "key_pmem_value_pmem",
-	feature = "merged_object_store",
-)))]
+#[cfg(not(feature = "merged_object_store"))]
 #[cfg(feature = "hybrid_cache_common")]
 #[test]
 #[ignore]

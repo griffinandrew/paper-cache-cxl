@@ -8,7 +8,8 @@
 //! `MergedStore` -- object map, recency order and tier placement in ONE
 //! structure.
 //!
-//! A fourth `ObjectMapRef` shape behind `merged_object_store`. A FEATURE and
+//! The other `ObjectMapRef` shape (the default is a `DashMap`), behind
+//! `merged_object_store`. A FEATURE and
 //! not a `PaperPolicy` variant because the object store is a compile-time
 //! choice here: `ObjectStore::get_ref` returns `impl Deref`, so the trait is
 //! not object-safe and `objects` cannot be `dyn`.

@@ -87,8 +87,7 @@
 //! A binary of its own: the pool is process-global. Run with
 //!   cargo +nightly test --release --features \
 //!     server,lru_compact_hybrid_cache,measured_accounting --test dram_metadata_identity
-//! and with merged_object_store, hashbrown_dram, thin_header or
-//! segregated_value_arena added.
+//! and with merged_object_store, thin_header or segregated_value_arena added.
 #![cfg(all(feature = "hybrid_cache_common", feature = "measured_accounting"))]
 #![feature(internal_output_capture)]
 
@@ -254,7 +253,7 @@ fn step(cache: &Cache, keys: u64, policy: PaperPolicy, previous: &mut Reading, l
 /// table -- can take: its first table (4 buckets), and every doubling after
 /// it. Its layout is `16 * b` of buckets and `b + 16` control bytes, aligned
 /// to 16 (hashbrown's `calculate_layout_for`, a 16-byte bucket).
-#[cfg(not(any(feature = "merged_object_store", feature = "hashbrown_dram")))]
+#[cfg(not(feature = "merged_object_store"))]
 fn hashbrown_steps() -> Vec<i64> {
     let table = |b: usize| paper_cache::meta::usable(17 * b + 16, 16) as i64;
     let mut steps = vec![table(4)];
@@ -413,7 +412,7 @@ fn warm_parking_lot() {
 /// Whether `step` is a sum of at most `terms` of `legal`: one step can hold a
 /// set's own shard's growth and those of the shards its evictions looked a
 /// victim up in (`erase`'s `entry` reserves too).
-#[cfg(not(any(feature = "merged_object_store", feature = "hashbrown_dram")))]
+#[cfg(not(feature = "merged_object_store"))]
 fn decomposes(step: i64, legal: &[i64], terms: usize) -> bool {
     step == 0 || (terms > 0 && legal.iter().any(|&l| l <= step && decomposes(step - l, legal, terms - 1)))
 }
@@ -433,7 +432,7 @@ fn the_dram_pool_moves_by_exactly_m_between_quiescent_points() {
         PaperPolicy::LfuCompactHybrid,
     ];
 
-    // The DashMap and hashbrown builds host every design; a ghost filter and
+    // The DashMap builds host every design; a ghost filter and
     // the recency-plus-frequency chain besides. Not the faithful S3-FIFO's
     // exact ghost (the stack test holds it to the allocator): its fast-small
     // variant's DRAM queue has no ceiling, so a shrink moves nothing and its
@@ -454,7 +453,7 @@ fn the_dram_pool_moves_by_exactly_m_between_quiescent_points() {
     for policy in designs {
         let (empty, filled, checked) = run(policy, &value, &mut log);
 
-        #[cfg(not(any(feature = "merged_object_store", feature = "hashbrown_dram")))]
+        #[cfg(not(feature = "merged_object_store"))]
         {
             let legal = hashbrown_steps();
 

@@ -1,11 +1,11 @@
 # The hybrid caches
 
-This crate hosts 24 two-tier cache designs, to compare how eviction disciplines use a small DRAM
+This crate hosts 23 two-tier cache designs, to compare how eviction disciplines use a small DRAM
 tier in front of a large CXL/PMEM tier. Every hybrid build compiles all 24; which one a given
 cache runs is chosen at construction time by the `PaperPolicy` value passed to the constructor,
 and is fixed for that cache's lifetime. Two caches in one process may run different designs.
 
-This document covers the machinery all 24 share, then each catalogued design individually --
+This document covers the machinery all 23 share, then each catalogued design individually --
 Part 2 has a written entry for 18 of the 24. For the
 feature-flag matrix see `FEATURE_FLAGS.md`; for one design end to end in maximum detail see
 `LRU_HYBRID_CACHE.md`.
@@ -29,17 +29,17 @@ pub enum TieredBuffer {
 A live object's bytes exist in **exactly one** tier. Promotion and demotion replace the
 `TieredBuffer` in place (`Object::set_data`), so a migration is a byte *move*.
 
-All 24 share one implementation. There are exactly two inherent
+All 23 share one implementation. There are exactly two inherent
 `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks — the shared engine, and a second carrying the
 size-split design's three-scalar constructor — both gated only on `hybrid_cache_common`. The
 per-design behaviour that survives is dispatched at runtime: `hybrid_policy::admission_tier`
 matches on the policy to pick a placement, and `init_policy_stack` builds the matching
 `PolicyStack`.
 
-The 24 `*_hybrid_cache` features are consequently **not** mutually exclusive; any subset may be
+The 23 `*_hybrid_cache` features are consequently **not** mutually exclusive; any subset may be
 enabled. Each now gates only its integration-test file and one per-object DRAM-overhead
-accounting term. `lib.rs`'s single `compile_error!` rejects `hashbrown_dram` with
-`global_hashtable_pmem`, unrelated to the designs.
+accounting term. `lib.rs`'s two `compile_error!`s (`thin_header` with `fused_value`,
+`measured_accounting` with `stock_jemalloc`) concern the build, not the designs.
 
 > Earlier revisions gave each design its own impl block, forcing mutual exclusion and 153
 > pairwise guards, plus a per-design `<design>_hybrid_cache` shim module aliasing a per-design
@@ -345,8 +345,7 @@ the same number. `PAPER_DISABLE_SHARED_OVERHEAD=1` forces the per-object model w
 `shared_overhead = 0` whatever the configuration says. Strict counting has a small-cache
 consequence under the measured model: a cache whose fast tier is smaller than its structures'
 fixed first allocations -- about 170 KiB for a DashMap cache, the merged store's first slab chunk
-per shard (over 5 MB once every shard holds a key), `hashbrown_dram`'s table preallocated for 1.5M
-objects (about 42 MB) -- has eff 0 and a key ceiling at the count it already holds: no further new
+per shard (over 5 MB once every shard holds a key) -- has eff 0 and a key ceiling at the count it already holds: no further new
 key is admitted (`MetadataOverflow`; under `EvictToFit`, one eviction per new key). The toy-scale
 tests pin the per-object model for that reason.
 

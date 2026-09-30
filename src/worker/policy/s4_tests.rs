@@ -20,7 +20,7 @@
 //!     differ by design forced equal, every op's drains, victims, placements
 //!     and stats recorded as text. With `PAPER_T14_DIR` set each test writes
 //!     its file there, and the bp-s4 runner requires the files of the
-//!     DashMap, merged and hashbrown builds to be identical (and the three
+//!     DashMap and merged builds to be identical (and the two
 //!     thin-header builds'). T14b (S4's follow-ups) is the same differential
 //!     without the gauge refresh after every op, with TTL reaps, bursts of
 //!     sets published before the worker takes them, and wipes.

@@ -13,35 +13,19 @@ use crate::{
 };
 
 /// `true` when the expiry index is slow-tier allocated: a hybrid build that
-/// has PMEM available and has not opted back out via `ttl_index_dram`.
-#[cfg(all(
-	feature = "hybrid_cache_common",
-	feature = "key_value_pmem",
-	not(feature = "ttl_index_dram"),
-))]
+/// has PMEM available.
+#[cfg(all(feature = "hybrid_cache_common", feature = "key_value_pmem"))]
 type ExpirySet = BTreeSet<(u32, HashedKey), crate::Hybrid>;
 
-#[cfg(not(all(
-	feature = "hybrid_cache_common",
-	feature = "key_value_pmem",
-	not(feature = "ttl_index_dram"),
-)))]
+#[cfg(not(all(feature = "hybrid_cache_common", feature = "key_value_pmem")))]
 type ExpirySet = BTreeSet<(u32, HashedKey)>;
 
-#[cfg(all(
-	feature = "hybrid_cache_common",
-	feature = "key_value_pmem",
-	not(feature = "ttl_index_dram"),
-))]
+#[cfg(all(feature = "hybrid_cache_common", feature = "key_value_pmem"))]
 fn new_expiry_set() -> ExpirySet {
 	BTreeSet::new_in(crate::Hybrid)
 }
 
-#[cfg(not(all(
-	feature = "hybrid_cache_common",
-	feature = "key_value_pmem",
-	not(feature = "ttl_index_dram"),
-)))]
+#[cfg(not(all(feature = "hybrid_cache_common", feature = "key_value_pmem")))]
 fn new_expiry_set() -> ExpirySet {
 	BTreeSet::new()
 }
@@ -71,7 +55,7 @@ pub struct Expiries {
 	/// bytes, just arranged so the ordering is total.
 	/// Slow-tier allocated for the hybrid designs (see `ExpirySet`). `TtlWorker`
 	/// is its only user and never runs on a client get/set path, so the extra
-	/// access latency is off the critical path; `ttl_index_dram` forces DRAM.
+	/// access latency is off the critical path.
 	set: ExpirySet,
 }
 
@@ -202,22 +186,14 @@ mod tests {
 	/// unaccounted DRAM again. This fires instead.
 	#[test]
 	fn hybrid_builds_allocate_the_expiry_index_in_the_slow_tier() {
-		let slow_tier = cfg!(all(
-			feature = "hybrid_cache_common",
-			feature = "key_value_pmem",
-			not(feature = "ttl_index_dram"),
-		));
+		let slow_tier = cfg!(all(feature = "hybrid_cache_common", feature = "key_value_pmem"));
 
-		if cfg!(feature = "hybrid_cache_common") && !cfg!(feature = "ttl_index_dram") {
+		if cfg!(feature = "hybrid_cache_common") {
 			assert!(
 				slow_tier,
 				"a hybrid build must allocate the expiry index in the slow tier; \
 				 it fell back to DRAM, so `key_value_pmem` is no longer implied",
 			);
-		}
-
-		if cfg!(feature = "ttl_index_dram") {
-			assert!(!slow_tier, "`ttl_index_dram` must force the index back to DRAM");
 		}
 	}
 }

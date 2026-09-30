@@ -86,10 +86,9 @@ The per-design behaviour that remains is dispatched at runtime: one `match` over
 `PaperPolicy` selects the admission rule, and `init_policy_stack` builds the corresponding
 `PolicyStack`.
 
-The hybrid features are therefore **not mutually exclusive** — enable any subset. `lib.rs`
-carries a single `compile_error!`, rejecting `hashbrown_dram` together with
-`global_hashtable_pmem`; it has nothing to do with the designs. (Earlier revisions gave each
-design its own impl block, which forced mutual exclusion and 153 pairwise guards. Both are gone.)
+The hybrid features are therefore **not mutually exclusive** — enable any subset. (Earlier
+revisions gave each design its own impl block, which forced mutual exclusion and 153 pairwise
+guards. Both are gone.)
 
 ### Who decides, and who moves the bytes
 

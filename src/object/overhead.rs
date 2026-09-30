@@ -858,8 +858,7 @@ const LRU_LFU_COMPACT_HYBRID_EVICTION_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 /// that populated it: on a no-reuse trace the ghost grew without limit, to
 /// 1.94 GB — 45% of a 4 GiB fast tier — on Twitter cluster38.
 ///
-/// Gated on `eviction_stacks_pmem` **only** (never `global_hashtable_pmem`,
-/// per the no-hashtable-slot point above): when that feature moves the
+/// Gated on `eviction_stacks_pmem` **only**: when that feature moves the
 /// eviction stacks — ghost list included — to PMEM, the ghost costs the
 /// fast/DRAM tier nothing and the term drops to 0.
 ///
@@ -1400,17 +1399,13 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// `get_policy_overhead` can be compared line for line.
 	overhead += VALUE_ALLOCATION_OVERHEAD;
 
-	// The object map lives in DRAM unless a hashtable-PMEM feature
-	// relocates it (`global_hashtable_pmem`).
+	// The object map lives in DRAM.
 	//
-	// MEASURED at 80.0 B/object for the default `DashMap` shape: the whole
-	// map measures 144.0 at a 64-byte value (R2 = 1.000000), and the non-value
+	// MEASURED at 80.0 B/object for the `DashMap` shape: the whole map
+	// measures 144.0 at a 64-byte value (R2 = 1.000000), and the non-value
 	// remainder is 79.998 at 16-, 32-, 64- AND 128-byte values, so it is a
 	// container cost rather than a mis-attributed value cost.
-	#[cfg(not(feature = "global_hashtable_pmem"))]
-	{
-		overhead += OBJECT_MAP_ENTRY_OVERHEAD;
-	}
+	overhead += OBJECT_MAP_ENTRY_OVERHEAD;
 
 	// No resident factor. Every term above is now MEASURED from jemalloc
 	// `stats.allocated`, which is the size-class-rounded usable figure -- the
@@ -1698,8 +1693,7 @@ mod what_jemalloc_actually_rounds_to {
 	test,
 	feature = "hybrid_cache_common",
 	not(feature = "merged_object_store"),
-	not(feature = "eviction_stacks_pmem"),
-	not(feature = "global_hashtable_pmem")
+	not(feature = "eviction_stacks_pmem")
 ))]
 mod the_two_overhead_tables_agree {
 	use super::*;
@@ -1802,7 +1796,7 @@ mod the_two_overhead_tables_agree {
 /// The sizes are chosen so the header crosses a size class in some and not in
 /// others: `nallocx(4096)` is 4096 but `nallocx(4120)` is 5120, so under fusing
 /// a 4 KiB value costs a whole extra KiB that nothing was charging for.
-#[cfg(all(test, feature = "numa_jemalloc", not(feature = "key_pmem_value_pmem")))]
+#[cfg(all(test, feature = "numa_jemalloc"))]
 mod the_charge_matches_the_allocator {
 	use super::*;
 	use crate::object::Object;

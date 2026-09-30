@@ -1396,7 +1396,7 @@ use crossbeam_channel::{Sender, Receiver};
 // selects no storage feature at all (e.g. bare `eviction_stacks_pmem`) has no
 // `object_store` module to import; `PolicyWorker::object_exists` carries a
 // second body for that case.
-#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem"))]
 use crate::object_store::ObjectStore;
 
 use crate::{
@@ -1836,8 +1836,8 @@ pub struct PolicyWorker<K, V> {
 #[cfg(feature = "hybrid_cache_common")]
 struct WorkerMetadata {
 	/// The object map's worker-side reading (`crate::meta::MapState`): the
-	/// DashMap's per-shard table sizes and headroom, the `hashbrown_dram`
-	/// table's, nothing for the merged store, which counts itself.
+	/// DashMap's per-shard table sizes and headroom, nothing for the merged
+	/// store, which counts itself.
 	map: crate::meta::MapState,
 
 	/// One DRAM value header's usable bytes, for this cache's key type and
@@ -2550,12 +2550,12 @@ where
 	/// storage feature being selected (`lib.rs`). A build that selects none
 	/// (bare `eviction_stacks_pmem`, say) still resolves `ObjectMapRef` to the
 	/// default `DashMap` shape, which answers this directly.
-	#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
+	#[cfg(any(feature = "all_dram", feature = "key_value_pmem"))]
 	fn object_exists(&self, key: HashedKey) -> bool {
 		self.objects.get_ref(&key).is_some()
 	}
 
-	#[cfg(not(any(feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "hashbrown_dram")))]
+	#[cfg(not(any(feature = "all_dram", feature = "key_value_pmem")))]
 	fn object_exists(&self, key: HashedKey) -> bool {
 		self.objects.contains_key(&key)
 	}
@@ -2621,7 +2621,7 @@ where
 			self.observed.clear();
 			self.refresh_tier_gauges();
 
-			// S5a: every table kept its capacity (DashMap, hashbrown, the
+			// S5a: every table kept its capacity (DashMap, the
 			// merged buckets), the merged slab freed its chunks, the headers
 			// went with their values. Re-read all of it.
 			self.publish_metadata(true);
@@ -2758,9 +2758,7 @@ where
 	/// batch, BEFORE the eviction pass that ends the batch, so a cache over
 	/// its size is walked with the values that pass will evict; and a
 	/// client's `Set` still behind it in the channel is untracked -- exact
-	/// only at client quiescence. The hashbrown map's walk holds its one
-	/// writer-preferring `std::sync::RwLock` read guard throughout, so it
-	/// stalls readers as well as writers (`ObjectStore::for_each_value`).
+	/// only at client quiescence.
 	#[cfg(feature = "hybrid_cache_common")]
 	fn placement_audit(&mut self) -> crate::phys::PlacementAudit {
 		self.apply_tier_migrations();
@@ -3050,7 +3048,7 @@ where
 	/// flat cache has no fast tier to budget):
 	///
 	///   * the map: `crate::meta::map_bytes` -- the merged store's own count,
-	///     or the DashMap shards (the one `hashbrown_dram` table) re-read where
+	///     or the DashMap shards re-read where
 	///     the writes counted since their last read (`Set`, `Del` and `Expire`
 	///     events, the worker's own evictions) could have made them
 	///     reallocate, every one when `all`;
@@ -6076,7 +6074,7 @@ mod phys_transient_tests {
 /// new-key rule and the heal rule, the correctives' own counters, and the
 /// placement audit, driven through the worker the way its event loop drives
 /// it -- `handle_set` / `handle_get`, then the drain -- over the build's own
-/// store: the split stacks in the DashMap and hashbrown builds, the merged
+/// store: the split stacks in the DashMap builds, the merged
 /// store in the merged builds, with orders both implement (LRU, FIFO, LFU);
 /// 2Q, which only the split store implements, in the split builds.
 ///

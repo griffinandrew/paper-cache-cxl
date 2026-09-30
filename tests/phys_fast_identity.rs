@@ -20,7 +20,7 @@
 //! thread would be counted in the same P. Inside this binary every test
 //! takes [`one_cache_at_a_time`] for its whole body, so exactly one cache is
 //! alive at a time here too. The full-suite builds (`--tests`) run it in
-//! every unit build -- default, merged_object_store and hashbrown_dram, each
+//! every unit build -- default and merged_object_store, each
 //! with and without thin_header -- since it is gated only on
 //! `hybrid_cache_common`.
 //!
@@ -34,8 +34,8 @@
 //!     equal the small plus the large segment's fast bytes), LRU-LFU, the
 //!     four 2Q and the thirteen S3-FIFO designs -- at a
 //!     third of that workload, with every new key read twice and evicted keys
-//!     set again (see `Workload::touch_and_readmit`), in the DashMap and
-//!     hashbrown builds (the merged store refuses them at construction). One
+//!     set again (see `Workload::touch_and_readmit`), in the DashMap builds
+//!     (the merged store refuses them at construction). One
 //!     test each, so a design whose identity fails can be `#[ignore]`d with
 //!     its reason without hiding the rest. None is: the two faithful S3-FIFO
 //!     designs with a SLOW small queue were, until S3 fixed the promotion

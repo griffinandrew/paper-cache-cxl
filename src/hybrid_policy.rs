@@ -28,12 +28,10 @@ use crate::tiered_buffer::TieredBuffer;
 
 /// The object map type every hybrid-cache design uses. Resolves to whatever
 /// `ObjectMapRef<K, TieredBuffer>` resolves to crate-wide -- a plain
-/// `DashMap` by default, or the `hashbrown_dram`-selected
-/// `RwLock<HashMap<..., Global>>` shape when that feature is enabled --
-/// rather than always hardcoding `DashMap` regardless of the active
-/// storage-backend feature. `admission_tier` implementations go through the
-/// `ObjectStore` abstraction (see `crate::object_store`) so they work
-/// unchanged against either shape.
+/// `DashMap`, or the merged store under `merged_object_store` --
+/// rather than always hardcoding `DashMap`. `admission_tier` implementations
+/// go through the `ObjectStore` abstraction (see `crate::object_store`) so
+/// they work unchanged against either.
 pub type HybridObjectMap<K> = ObjectMapRef<K, TieredBuffer>;
 
 /// Which tier a `set()` builds the value's bytes in, for the given hybrid

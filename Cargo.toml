@@ -73,8 +73,8 @@ fused_value = []
 # A 16-byte DRAM header -- the refcount and a tagged pointer, nothing else --
 # in front of ONE tiered item holding the length, the expiry, the key and the
 # bytes. The metadata demotes with the value; the refcount a read bumps stays
-# local. See `src/value_thin.rs`. Excludes `fused_value` and
-# `key_pmem_value_pmem` (compile errors in `src/lib.rs`).
+# local. See `src/value_thin.rs`. Excludes `fused_value` (a compile error in
+# `src/lib.rs`).
 thin_header = []
 # Serves the tiered cache over a socket. Pulls in `hybrid_cache_common` for the
 # tiering machinery; the caller still picks which hybrid DESIGN to compile, e.g.
@@ -83,19 +83,8 @@ server = ["hybrid_cache_common"]
 # Core feature to enable key and value storage in PMEM
 key_value_pmem = ["numa_jemalloc"]
 
-# Extended PMEM feature: places BOTH key bytes AND value bytes each in their own
-# BufferPMEM (Hybrid-allocated persistent memory).  Implies key_value_pmem so
-# that the Hybrid allocator and all other PMEM infrastructure are available.
-key_pmem_value_pmem = ["key_value_pmem", "numa_jemalloc"]
-
 # All data structures in DRAM (no PMEM usage)
 all_dram = ["numa_jemalloc"]
-
-# Place global hashtable in PMEM (requires key_value_pmem)
-global_hashtable_pmem = ["numa_jemalloc"]
-
-# Use hashbrown HashMap as global hashtable in DRAM (for performance comparison)
-hashbrown_dram = ["numa_jemalloc"]
 
 # Object map, recency order AND tier placement in ONE structure
 # (src/merged_store.rs). 32 shards on the hash's HIGH bits (the index is
@@ -140,16 +129,6 @@ merged_object_store = ["numa_jemalloc"]
 # this alone requires no other PMEM feature.
 eviction_stacks_pmem = ["numa_jemalloc"]
 
-# Force the TTL expiry index back into DRAM.
-#
-# For the hybrid designs that index lives in the slow tier by default: it is
-# owned solely by `TtlWorker`, never touched on a client get/set, and its hot
-# operations are `first()`/`pop_first()` on the leftmost node, so it is the
-# structure in this cache least sensitive to slow-tier latency. Enable this to
-# put it back in DRAM -- to A/B the placement, or if `TtlWorker` falls behind
-# on a set-heavy workload (every Set/Del/Ttl event is an insert or remove).
-ttl_index_dram = []
-
 # ---------------------------------------------------------------------------
 # The 23 *_hybrid_cache features below are NOT mutually exclusive; any subset
 # may be enabled together. They no longer select a design either -- every hybrid
@@ -178,11 +157,10 @@ ttl_index_dram = []
 # map. See worker/policy/policy_stack/lru_compact_hybrid_stack.rs for the
 # algorithm.
 #
-# Only needs `key_value_pmem` (not `key_pmem_value_pmem`): a plain `Box<[u8]>`
-# already allocates through the crate's global DRAM allocator regardless of
-# feature flags, and this feature only needs to migrate *value* bytes between
-# tiers, not force the key into PMEM. Every hybrid below shares that dependency
-# reasoning.
+# Only needs `key_value_pmem`: a plain `Box<[u8]>` already allocates through
+# the crate's global DRAM allocator regardless of feature flags, and this
+# feature only needs to migrate *value* bytes between tiers, not force the key
+# into PMEM. Every hybrid below shares that dependency reasoning.
 #
 lru_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
