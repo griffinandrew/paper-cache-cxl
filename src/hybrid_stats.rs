@@ -74,6 +74,24 @@ pub struct HybridStats {
 	/// as opposed to moved between tiers.
 	pub evictions: u64,
 
+	/// Capacity passes (S8): the eviction passes the cache-wide threshold
+	/// ARMED -- `used_size` passed the arming level (`EVICTION_HIGH_WATERMARK`,
+	/// 0.98 of `max_size`) -- and the objects and accounted bytes (base size
+	/// plus the per-object overhead, what `used_size` charged for them) they
+	/// evicted, this cache's own, since it was built or last wiped, like
+	/// `evictions`. Under the default one threshold a full cache arms a pass
+	/// per set and each evicts about what the set added, so `capacity_passes`
+	/// is nearly the number of sets that found the cache full and
+	/// `capacity_pass_evictions / capacity_passes` the objects a pass took (a
+	/// burst between two passes, or a band, makes it larger). A pass that armed
+	/// and found nothing to evict counts as a pass. Evictions of a stack's own
+	/// internal budget (`needs_capacity_eviction`), of `MakeRoom` and of a
+	/// delete or a reaped TTL are not capacity passes; `evictions` counts every
+	/// eviction the policy worker made, these included.
+	pub capacity_passes: u64,
+	pub capacity_pass_evictions: u64,
+	pub capacity_pass_bytes: u64,
+
 	/// Bytes currently accounted to the fast (DRAM) tier.
 	pub fast_bytes_used: u64,
 

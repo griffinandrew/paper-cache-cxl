@@ -1269,6 +1269,20 @@ pub fn erase<K, V>(
 where
 	K: Eq + TypeSize,
 {
+	erase_sized(objects, status, overhead_manager, maybe_key).map(|(key, object, _)| (key, object))
+}
+
+/// [`erase`], also returning the removed object's base size -- the figure it
+/// took off the status, already computed -- for the eviction pass's statistics.
+pub(crate) fn erase_sized<K, V>(
+	objects: &ObjectMapRef<K, V>,
+	status: &StatusRef,
+	overhead_manager: &OverheadManagerRef,
+	maybe_key: Option<EraseKey<K>>,
+) -> Result<(HashedKey, Object<K, V>, ObjectSize), CacheError>
+where
+	K: Eq + TypeSize,
+{
 	let hashed_key = match maybe_key {
 		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
 		Some(EraseKey::Hashed(hashed_key)) => hashed_key,
@@ -1293,13 +1307,13 @@ where
 		return Err(CacheError::KeyNotFound);
 	};
 
-	let base_size = overhead_manager.base_size(&object) as i64;
+	let base_size = overhead_manager.base_size(&object);
 
-	status.update_base_used_size(-base_size);
+	status.update_base_used_size(-(base_size as i64));
 	status.decr_num_objects();
 
 	match !object.is_expired() {
-		true => Ok((hashed_key, object)),
+		true => Ok((hashed_key, object, base_size)),
 		false => Err(CacheError::KeyNotFound),
 	}
 }

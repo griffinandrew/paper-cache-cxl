@@ -3536,3 +3536,27 @@ under load and the process-wide fast-tier count (P) is shared, so which of them 
 a decision the counters' move makes (its doc says so). New tests (`s8_tests.rs`): a cache reports only
 its own migrations (a second cache starts at zero and its work moves none of the first's), and the
 eviction fallback is counted per cache; and the dump's format.
+
+## Capacity passes (S8, part 2)
+
+The statistic E1 deferred to S8 ("capacity passes armed by the watermark"): per cache, in
+`HybridStats`. `capacity_passes` counts the eviction passes the cache-wide threshold ARMED --
+`apply_evictions` calls in which `used_size` passed the arming level -- and `capacity_pass_evictions`
+and `capacity_pass_bytes` what those passes evicted, in objects and in accounted bytes (each victim's
+base size, which `erase` already computes and now hands back through `erase_sized`, plus the
+per-object overhead: exactly what `used_size` charged for it). They are counted while the pass is
+armed, so an eviction a stack makes for its own internal budget (`needs_capacity_eviction`), a
+`MakeRoom` and a delete are not capacity evictions, and a pass that armed and found nothing to evict
+still counts as a pass (the `Exhausted` case). Under the default single threshold a full cache arms
+one pass per set and each takes about what the set added, so `capacity_pass_evictions /
+capacity_passes` is the objects a pass took: 1 at the steady state, more after a burst between two
+passes or under an opted-in band. `evictions` is unchanged (every eviction the worker made).
+Like `evictions` they are the cache's totals since it was built or last wiped, and a wipe resets
+them (`AtomicStatus::clear`); the flat caches count them too, though only the tiered caches export
+them.
+
+Tests: the existing 98%-threshold contract test (a flat and a tiered cache, one eviction per set, a
+burst drained in one pass) also asserts the counters at each step (no pass under 98%; the first
+object over arms one; 7 passes took the 16 objects); the cap override (one pass, the two objects over
+it), the band (one pass took ten objects, and none armed for the refill) and the stack-budget
+eviction (no capacity pass) assert them, and a wipe resets them.

@@ -148,6 +148,19 @@ pub struct AtomicStatus {
 	#[cfg(feature = "hybrid_cache_common")]
 	hybrid_evictions: AtomicU64,
 
+	/// Capacity passes: eviction passes ARMED by the cache-wide threshold
+	/// (`eviction_watermarks`: `used_size` passed the arming level), and what
+	/// they evicted -- objects, and their accounted bytes (base size plus the
+	/// per-object overhead, what `used_size` charged for them). Written by the
+	/// policy worker's `apply_evictions`; reset by a wipe with the other
+	/// counters. See `HybridStats::capacity_passes`.
+	#[cfg(feature = "hybrid_cache_common")]
+	hybrid_capacity_passes: AtomicU64,
+	#[cfg(feature = "hybrid_cache_common")]
+	hybrid_capacity_evictions: AtomicU64,
+	#[cfg(feature = "hybrid_cache_common")]
+	hybrid_capacity_bytes: AtomicU64,
+
 	/// Completed CORRECTIVES (`MigrationOrigin::Reconcile`), by destination:
 	/// written by the migration consumers and the inline path, never counted
 	/// in `hybrid_promotions`/`hybrid_demotions`. See
@@ -438,6 +451,12 @@ impl AtomicStatus {
 			hybrid_demotions: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			hybrid_evictions: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			hybrid_capacity_passes: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			hybrid_capacity_evictions: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			hybrid_capacity_bytes: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			hybrid_reconcile_applied_to_fast: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
@@ -869,6 +888,18 @@ impl AtomicStatus {
 		self.hybrid_evictions.fetch_add(1, Ordering::Relaxed);
 	}
 
+	/// Records one capacity pass -- an eviction pass the cache-wide threshold
+	/// armed -- and the `objects`, `bytes` (accounted) it evicted.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub(crate) fn record_capacity_pass(&self, objects: u64, bytes: u64) {
+		self.hybrid_capacity_passes.fetch_add(1, Ordering::Relaxed);
+
+		if objects != 0 {
+			self.hybrid_capacity_evictions.fetch_add(objects, Ordering::Relaxed);
+			self.hybrid_capacity_bytes.fetch_add(bytes, Ordering::Relaxed);
+		}
+	}
+
 	/// Overwrites the live tier gauges (bytes/objects currently in each
 	/// tier). Called by `PolicyWorker` each time it drains tier migrations.
 	#[cfg(feature = "hybrid_cache_common")]
@@ -933,6 +964,9 @@ impl AtomicStatus {
 			promotions: self.hybrid_promotions.load(Ordering::Relaxed),
 			demotions: self.hybrid_demotions.load(Ordering::Relaxed),
 			evictions: self.hybrid_evictions.load(Ordering::Relaxed),
+			capacity_passes: self.hybrid_capacity_passes.load(Ordering::Relaxed),
+			capacity_pass_evictions: self.hybrid_capacity_evictions.load(Ordering::Relaxed),
+			capacity_pass_bytes: self.hybrid_capacity_bytes.load(Ordering::Relaxed),
 			fast_bytes_used: self.hybrid_fast_bytes_used.load(Ordering::Relaxed),
 			slow_bytes_used: self.hybrid_slow_bytes_used.load(Ordering::Relaxed),
 			fast_metadata_bytes: self.hybrid_fast_metadata_bytes.load(Ordering::Relaxed),
@@ -1270,6 +1304,12 @@ impl AtomicStatus {
 		self.hybrid_demotions.store(0, Ordering::Relaxed);
 		#[cfg(feature = "hybrid_cache_common")]
 		self.hybrid_evictions.store(0, Ordering::Relaxed);
+		#[cfg(feature = "hybrid_cache_common")]
+		self.hybrid_capacity_passes.store(0, Ordering::Relaxed);
+		#[cfg(feature = "hybrid_cache_common")]
+		self.hybrid_capacity_evictions.store(0, Ordering::Relaxed);
+		#[cfg(feature = "hybrid_cache_common")]
+		self.hybrid_capacity_bytes.store(0, Ordering::Relaxed);
 		#[cfg(feature = "hybrid_cache_common")]
 		self.hybrid_reconcile_applied_to_fast.store(0, Ordering::Relaxed);
 		#[cfg(feature = "hybrid_cache_common")]

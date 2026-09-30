@@ -1662,7 +1662,7 @@ use crate::{
 	StatusRef,
 	OverheadManagerRef,
 	EraseKey,
-	erase,
+	erase_sized,
 	error::CacheError,
 	object::ObjectSize,
 	worker::{
@@ -1676,6 +1676,14 @@ use crate::{
 // The split stacks' constructor: a merged build's stack is the object map itself.
 #[cfg(not(feature = "merged_object_store"))]
 use crate::worker::policy::policy_stack::init_policy_stack;
+
+// What the test modules below take through `use super::*`.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+use crate::erase;
+
+// The per-object overhead `used_size` charges, for a capacity pass's bytes.
+#[cfg(feature = "hybrid_cache_common")]
+use crate::object::overhead::get_policy_overhead;
 
 // The policy, for the tiered paths (the byte gate's state, the size-split
 // shares) and the tests.
@@ -2162,8 +2170,9 @@ impl WorkerMetadata {
 
 /// What one step of `PolicyWorker::evict_victim` did.
 enum Victim {
-	/// A victim of the stack's order, removed from the map.
-	Evicted,
+	/// A victim of the stack's order, removed from the map, with its base
+	/// size -- the figure `erase` took off the status.
+	Evicted(ObjectSize),
 
 	/// The stack named a key the map no longer holds (it is gone from the
 	/// stack now); nothing was removed.
@@ -3577,7 +3586,7 @@ where
 			tries -= 1;
 
 			match self.evict_victim(false) {
-				Ok(Victim::Evicted) => evicted += 1,
+				Ok(Victim::Evicted(_)) => evicted += 1,
 				Ok(Victim::Missed) => {},
 				Ok(Victim::Exhausted) | Err(_) => break,
 			}
@@ -3660,14 +3669,14 @@ where
 			return Ok(Victim::Exhausted);
 		}
 
-		let erase_result = erase(
+		let erase_result = erase_sized(
 			&self.objects,
 			&self.status,
 			&self.overhead_manager,
 			maybe_key,
 		);
 
-		let Ok((_key, _evicted_obj)) = erase_result else {
+		let Ok((_key, _evicted_obj, base_size)) = erase_result else {
 			return Ok(Victim::Missed);
 		};
 
@@ -3681,7 +3690,7 @@ where
 			self.status.record_hybrid_eviction();
 		}
 
-		Ok(Victim::Evicted)
+		Ok(Victim::Evicted(base_size))
 	}
 
 	fn apply_evictions(&mut self) -> Result<(), CacheError> {
@@ -3713,6 +3722,10 @@ where
 		// effect.
 		let mut draining = false;
 
+		// The capacity pass's own statistics (S8): what it evicted while armed.
+		#[cfg(feature = "hybrid_cache_common")]
+		let (mut capacity_objects, mut capacity_bytes) = (0u64, 0u64);
+
 		loop {
 			let used_size = self.status.used_size(&policy);
 
@@ -3738,12 +3751,26 @@ where
 			}
 
 			match self.evict_victim(true)? {
-				Victim::Evicted => {},
+				Victim::Evicted(_base_size) => {
+					#[cfg(feature = "hybrid_cache_common")]
+					if draining {
+						capacity_objects += 1;
+						capacity_bytes += _base_size as u64 + get_policy_overhead(&policy) as u64;
+					}
+				},
+
 				Victim::Missed => continue,
 				Victim::Exhausted => break,
 			}
 
 			_evicted_this_call += 1;
+		}
+
+		// An armed pass, and what it took (S8): `draining` is set by the
+		// capacity condition alone, never by a stack's own budget.
+		#[cfg(feature = "hybrid_cache_common")]
+		if draining {
+			self.status.record_capacity_pass(capacity_objects, capacity_bytes);
 		}
 
 		Ok(())
@@ -5938,6 +5965,16 @@ mod capacity_watermark_tests {
 		assert_eq!(status.used_size(&policy), fits * per_object, "{policy}: nothing under 98% is evicted");
 		assert_eq!(worker.evicted.as_ref().unwrap().len(), 0);
 
+		// S8: the passes the threshold armed, and what they took (objects, and
+		// accounted bytes -- what `used_size` charged for them).
+		let capacity = |status: &StatusRef| {
+			let stats = status.hybrid_stats();
+
+			(stats.capacity_passes, stats.capacity_pass_evictions, stats.capacity_pass_bytes)
+		};
+
+		assert_eq!(capacity(status), (0, 0, 0), "{policy}: no pass armed under 98%");
+
 		set_one(worker, fits + 1);
 		assert!(status.used_size(&policy) <= max_size, "{policy}: the cache is still inside its cap");
 		assert!(status.used_size(&policy) > threshold, "{policy}: and over 98% of it");
@@ -5947,6 +5984,7 @@ mod capacity_watermark_tests {
 		assert_eq!(status.used_size(&policy), fits * per_object, "{policy}: back at 98%, not below it");
 		assert_eq!(worker.evicted.as_ref().unwrap().len(), 1, "{policy}: one object, not a batch");
 		assert_eq!(objects.len() as u64, fits);
+		assert_eq!(capacity(status), (1, 1, per_object), "{policy}: the first object over 98% armed one pass");
 
 		for key in fits + 2..=fits + 6 {
 			set_one(worker, key);
@@ -5967,6 +6005,10 @@ mod capacity_watermark_tests {
 		assert_eq!(worker.evicted.as_ref().unwrap().len(), 16, "{policy}: exactly the excess");
 		assert_eq!(status.used_size(&policy), fits * per_object, "{policy}: the burst drains to 98%, no lower");
 		assert_eq!(objects.len() as u64, fits);
+
+		// One pass per set that found the cache over it (the first, five more,
+		// and the burst's one), each taking what it should.
+		assert_eq!(capacity(status), (7, 16, 16 * per_object), "{policy}: 7 passes took the 16 objects");
 	}
 
 	/// E1 on a FLAT stack, in this build's store: a cache holds 98% of
@@ -6071,6 +6113,14 @@ mod capacity_watermark_tests {
 		assert_eq!(used(&status), max_size);
 		assert_eq!(used(&status), 16 * per_object);
 		assert_eq!(objects.len() as u64, 16);
+
+		// One pass armed past the cap, taking the two objects over it.
+		let stats = status.hybrid_stats();
+
+		assert_eq!(
+			(stats.capacity_passes, stats.capacity_pass_evictions, stats.capacity_pass_bytes),
+			(1, 2, 2 * per_object),
+		);
 	}
 
 	#[test]
@@ -6099,6 +6149,14 @@ mod capacity_watermark_tests {
 		assert_eq!(objects.len() as u64, 8);
 		assert!(used(&status) < max_size);
 
+		// One capacity pass, which took the ten objects from 18 down to 8.
+		let stats = status.hybrid_stats();
+
+		assert_eq!(
+			(stats.capacity_passes, stats.capacity_pass_evictions, stats.capacity_pass_bytes),
+			(1, 10, 10 * per_object),
+		);
+
 		// Back up to 11 objects: above the drain target, below the trigger.
 		fill(&objects, &status, &overhead_manager, &mut worker, 19..=21);
 		worker.apply_evictions().unwrap();
@@ -6108,6 +6166,7 @@ mod capacity_watermark_tests {
 		// behaviour the watermark exists to get rid of.
 		assert_eq!(used(&status), 11 * per_object);
 		assert_eq!(objects.len() as u64, 11);
+		assert_eq!(status.hybrid_stats().capacity_passes, 1, "and no pass armed for it");
 	}
 
 	#[test]
@@ -6170,6 +6229,32 @@ mod capacity_watermark_tests {
 		// by a watermark that has nothing to say about its sub-structure.
 		assert_eq!(objects.len() as u64, 2);
 		assert_eq!(used(&status), 2 * per_object);
+
+		// S8: and it was not a capacity pass -- the threshold armed nothing.
+		let stats = status.hybrid_stats();
+
+		assert_eq!((stats.capacity_passes, stats.capacity_pass_evictions, stats.capacity_pass_bytes), (0, 0, 0));
+	}
+
+	/// S8: the capacity-pass counters are reset by a wipe with the other
+	/// counters (`clear`), like `evictions`, and start again from zero.
+	#[test]
+	fn a_wipe_resets_the_capacity_pass_counters() {
+		let (mut worker, objects, status, overhead_manager) = make_worker(16);
+
+		worker.eviction_watermarks = Watermarks::new(DEFAULT_HIGH, DEFAULT_HIGH);
+
+		fill(&objects, &status, &overhead_manager, &mut worker, 1..=18);
+		worker.apply_evictions().unwrap();
+
+		assert_eq!(status.hybrid_stats().capacity_passes, 1);
+		assert!(status.hybrid_stats().capacity_pass_evictions > 0 && status.hybrid_stats().capacity_pass_bytes > 0);
+
+		status.clear(crate::status::Cleared::default());
+
+		let stats = status.hybrid_stats();
+
+		assert_eq!((stats.capacity_passes, stats.capacity_pass_evictions, stats.capacity_pass_bytes), (0, 0, 0));
 	}
 }
 
