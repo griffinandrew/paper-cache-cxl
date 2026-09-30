@@ -35,7 +35,7 @@ use std::{
 };
 
 use super::*;
-use super::test_support::{alone_in, each_alone};
+use super::test_support::{alone_in, each_alone, wait_for};
 
 use crate::gate::{GateConfig, GateMode, GateState, MetadataModel, OnStall, test_hooks};
 // The merged store answers `get_ref` with an inherent method.
@@ -63,16 +63,6 @@ const E_FOLD: CacheSize = 3 * phys::FOLD_BYTES as CacheSize;
 
 fn alone(test: &str, body: impl FnOnce()) {
 	alone_in(module_path!(), test, body);
-}
-
-/// Polls `done` every millisecond until it holds, failing after `deadline`.
-fn wait_for(what: &str, deadline: Duration, mut done: impl FnMut() -> bool) {
-	let start = Instant::now();
-
-	while !done() {
-		assert!(start.elapsed() < deadline, "{what} did not happen within {deadline:?}");
-		thread::sleep(Duration::from_millis(1));
-	}
 }
 
 /// The byte gate on, with `window` and `on_stall`; the measured model, whose M

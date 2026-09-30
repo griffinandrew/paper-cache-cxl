@@ -14,7 +14,7 @@
 //! hand-driven tests (`s4_tests`) reach none of that through a real cache;
 //! this does: a worker thread, the TTL reaper, and `wipe()`.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::test_support::each_alone;
 use crate::{BufferDRAM, PaperCache, PaperPolicy};
@@ -23,13 +23,10 @@ type Cache = PaperCache<u64, BufferDRAM>;
 
 /// Waits for `done`, up to ten seconds, kicking the worker off its idle poll.
 fn wait_for(cache: &Cache, what: &str, mut done: impl FnMut() -> bool) {
-	let start = Instant::now();
-
-	while !done() {
-		assert!(start.elapsed() < Duration::from_secs(10), "{what}");
+	super::test_support::wait_for(what, Duration::from_secs(10), || {
 		cache.status.kick_policy_worker();
-		std::thread::sleep(Duration::from_millis(1));
-	}
+		done()
+	});
 }
 
 /// Every event sent before this call has been handled: two whole passes of

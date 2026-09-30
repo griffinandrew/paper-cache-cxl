@@ -20,13 +20,13 @@
 use std::time::{Duration, Instant};
 
 use super::*;
-use super::test_support::each_alone;
+use super::test_support::{client_set, decide, each_alone, parked_on_the_long_poll, stack, wait_for};
 use super::reconcile_tests::{
 	Objects, Worker, FAST, LEN, assert_settled, bytes_tier, drain_and_apply, handle, make_worker, of,
 	placement, publish, publish_del,
 };
 
-use crate::gate::{self, GateConfig, MetadataModel, MetadataOverflow, Verdict};
+use crate::gate::{GateConfig, MetadataModel, MetadataOverflow, Verdict};
 use crate::object::Object;
 use crate::object::overhead::{OverheadManager, test_overheads};
 use crate::status::AtomicStatus;
@@ -138,10 +138,6 @@ fn charge(len: usize) -> CacheSize {
 	crate::phys::value_charge::<u64>(len as ObjectSize)
 }
 
-fn stack(worker: &Worker) -> &dyn PolicyStack {
-	&*worker.policy_stack
-}
-
 /// This thread's jemalloc `thread.allocated`: every byte it has allocated,
 /// freed or not -- so an allocation made and freed inside a call still shows.
 fn thread_allocated() -> u64 {
@@ -161,16 +157,6 @@ fn thread_allocated() -> u64 {
 
 	assert_eq!(rc, 0, "thread.allocated unavailable");
 	value
-}
-
-/// Polls `done` every millisecond until it holds, failing after `deadline`.
-fn wait_for(what: &str, deadline: Duration, mut done: impl FnMut() -> bool) {
-	let start = Instant::now();
-
-	while !done() {
-		assert!(start.elapsed() < deadline, "{what} did not happen within {deadline:?}");
-		std::thread::sleep(Duration::from_millis(1));
-	}
 }
 
 /// The fast tier `f` everywhere the decision and the stack read it -- the
@@ -200,34 +186,6 @@ fn set_fast(worker: &mut Worker, f: CacheSize) {
 	drain_and_apply(worker);
 	worker.publish_gate();
 	drain_and_apply(worker);
-}
-
-/// `PaperCache::begin_set`'s decision for a `len`-byte value of `key`, from
-/// the sizes it computes before allocating.
-fn decide(worker: &Worker, objects: &Objects, key: HashedKey, len: usize) -> Result<Verdict, CacheError> {
-	let sizes = gate::Sizes {
-		base: worker.overhead_manager.base_size_for(&key, len, None).expect("a length in range"),
-		resident: worker.overhead_manager.dram_resident_size_for(&key, None),
-		value: charge(len),
-	};
-
-	gate::decide(&worker.status, objects, key, &sizes, false)
-}
-
-/// A client's set through the decision -- built where it says, its `Set`
-/// carrying its placement -- then the worker's handling of the `Set`.
-/// Returns the decision.
-fn client_set(worker: &mut Worker, objects: &Objects, key: HashedKey, len: usize) -> (Tier, Placement) {
-	let Ok(Verdict::Admit { tier, placement }) = decide(worker, objects, key, len) else {
-		panic!("{}: key {key} was not admitted", worker.status.policy());
-	};
-
-	let mut published = publish(&worker.status, &worker.overhead_manager, objects, key, len, tier);
-	published.placement = placement;
-
-	handle(worker, key, published);
-
-	(tier, placement)
 }
 
 /// A hit, served from where the key's bytes are, and its drain.
@@ -946,20 +904,6 @@ fn models_and_the_env_var() {
 // ---------------------------------------------------------------------------
 // The set-path kick (3.7)
 
-/// Waits for the worker's first passes, then checks the premise the kick
-/// tests rest on: with no set ever seen it parks on the LONG poll, so no
-/// other pass runs for 100 ms.
-fn parked_on_the_long_poll(status: &AtomicStatus) -> u64 {
-	wait_for("the worker's first pass", Duration::from_secs(10), || status.policy_worker_passes() >= 1);
-
-	let passes = status.policy_worker_passes();
-	std::thread::sleep(Duration::from_millis(100));
-
-	assert_eq!(status.policy_worker_passes(), passes, "the idle worker is not parked on the long poll");
-
-	passes
-}
-
 /// T17: the first set after an idle spell wakes the policy worker -- the
 /// stack has it within 200 ms, where a worker left parked on its 1 s poll
 /// would take up to a second -- in both stores. One kick. Red with the
@@ -970,7 +914,7 @@ fn a_set_after_an_idle_spell_wakes_the_worker() {
 	let _per_object = test_overheads::per_object();
 
 	let cache = cache_with(PaperPolicy::LruCompactHybrid, 256 << 10, GateConfig::default());
-	parked_on_the_long_poll(&cache.status);
+	parked_on_the_long_poll(&cache.status, Duration::from_millis(1));
 
 	let started = Instant::now();
 	cache.set(1, &[1u8; 100], None).expect("set");
@@ -996,7 +940,7 @@ fn one_kick_per_idle_spell() {
 	let _per_object = test_overheads::per_object();
 
 	let cache = cache_with(PaperPolicy::LruCompactHybrid, 256 << 10, GateConfig::default());
-	parked_on_the_long_poll(&cache.status);
+	parked_on_the_long_poll(&cache.status, Duration::from_millis(1));
 
 	for key in 0..1_000u64 {
 		cache.set(key % 200, &[key as u8; 100], None).expect("set");

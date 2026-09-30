@@ -132,6 +132,10 @@ src/
                                fast-admission pair, and for bands that cannot hold. Its tests: worker/policy/s5_gate_tests.rs, each
                                alone in a child process killed at a deadline (test_hooks pause
                                or pace the consumers, hold the worker, hold M).
+                               worker/policy/test_support.rs holds the child-process helpers
+                               (`alone_in`; `each_alone!`, which runs a test's policies each in
+                               a child of its own, since the process-global counters outlive a
+                               cache) and the hand-driven worker tests' shared helpers.
   numa_alloc.rs               Node-bound jemalloc arenas. NumaAlloc<NODE_FAST> is the crate's
                                #[global_allocator]; SlowObjects (aliased crate-wide as `Hybrid`)
                                backs the slow tier. Extents are mmap'd then mbind'd before
@@ -143,6 +147,16 @@ src/
                                size a set checks before it allocates).
   object_store.rs             ObjectStore trait over the object map (for_each_value: the
                                audit's walk; the merged store has an inherent twin).
+  removal.rs                  Removal trait, implemented by the DashMap and the merged store:
+                               take_if / take_evict / fallback_victim, what lib.rs's one `erase`
+                               removes with (the check and the removal under one lock; the
+                               DashMap's through `entry`, whose reserve the DRAM identity
+                               test's model counts).
+  cache_shape.rs              The two hooks the shared read side of PaperCache (get, get_into,
+                               del, has, peek, ttl, size, wipe, resize -- one impl block, generic
+                               over the value shape) calls: a hit served from a tier is counted
+                               by the tiered cache, and a resize is checked against the queue
+                               budgets of the policies the cache can run.
   value_buffer.rs             ValueBuffer.
   <design>_hybrid_cache/      18 name-compatibility shims, three lines of code each: a
                                re-export of TieredBuffer and a type alias
@@ -202,9 +216,14 @@ src/
                                  flat ones are the eight `*_compact_stack.rs` files over
                                  `compact_queue_set.rs`, plus `arc_stack.rs`; `golden.rs`, test-only,
                                  holds the eviction orders their tests assert).
-                                 The 20 *_hybrid_stack.rs files carry each design's algorithm
-                                 and its full derivation in the module doc — those are the
-                                 authoritative description of what each design does.
+                                 `arena_hybrid_stack.rs` is ONE generic `ArenaHybridStack<Order>`
+                                 for LRU, FIFO and CLOCK (`LruCompactHybridStack` etc. are its
+                                 aliases): the queue set, the boundary, the settle and the
+                                 accounting are shared, an `ArenaOrder` supplies a hit, an
+                                 overwrite and the victim. The 17 other *_hybrid_stack.rs
+                                 files carry each remaining design's algorithm and its full
+                                 derivation in the module doc — those, and that file's, are
+                                 the authoritative description of what each design does.
                                  `drain_target` (in mod.rs) holds the single fast-tier
                                  level every settle maintains: 0.98 of the effective
                                  budget, overridable via FAST_TIER_DRAIN_TARGET. One
@@ -217,12 +236,25 @@ src/
                                  chunks (4096 of the 32-byte node), grown by appending one,
                                  so nothing is copied and no slot id moves. Their keyless
                                  index still doubles. Charged 40 B/object (the 2^k figure);
-                                 40-48 across a growth cycle, derived (overhead.rs, LRU).
+                                 40-48 across a growth cycle, derived
+                                 (`ARENA_STACK_DRAM_OVERHEAD` in overhead.rs: one constant and
+                                 one measurement table for every tiered design, fed to both
+                                 get_policy_overhead and get_hybrid_dram_shared_overhead by
+                                 `stack_dram_overhead(policy)`).
     ttl/                        TtlWorker — background expiry sweep.
 
 tests/
-  <design>_hybrid_cache_integration.rs   One per hybrid design (18), each gated on its own
+  <design>_hybrid_cache_integration.rs   One per hybrid design (19), each gated on its own
                                          feature. Some carry #[ignore]d at-scale reproductions.
+                                         LRU, FIFO, CLOCK and LFU run the generic tests from
+                                         common::hybrid_suite! (FIFO and CLOCK also
+                                         common::insertion_order_suite!), so a design's file holds
+                                         only what is its own.
+  common/mod.rs                          Shared by the integration binaries (`mod common;`):
+                                         hybrid_suite!, insertion_order_suite!, wait_until,
+                                         settle (the identity tests' quiesce loop), and the child
+                                         processes -- `alone` and `each_alone`, which run each
+                                         policy of a multi-policy test in a process of its own.
   phys_fast_identity.rs                  PHYS_FAST == the stacks' fast_used at quiescence, and
                                          back to its start once the cache drops: LRU, FIFO,
                                          CLOCK and LFU in every unit build, and one test per
@@ -3354,3 +3386,20 @@ implementation.
 
 Kept, on the user's instruction until they are benchmarked: `thin_header`, `fused_value` and the
 default value layout. `all_dram`, `segregated_value_arena` and `stock_jemalloc` stay too.
+
+## Deduplication pass (R3)
+
+No behaviour change, and none of the S3-FIFO family touched. One generic
+`ArenaHybridStack<Order>` (`arena_hybrid_stack.rs`) replaces the LRU, FIFO and CLOCK hybrid
+stacks; every decision, migration entry and byte of accounting is the old stacks', shown by the
+T14 files (byte-identical in every build), the merged store's order-fidelity tests, the
+phys/M identity tests and mutations of the generic code (each turned a named test red). The write-
+only `NodePayload::phys` and the `layout_ab` / `layout_timing` experiments are gone. lib.rs has one
+read-side impl for the flat and the tiered cache (`cache_shape.rs` carries the two differences),
+one `erase` over the `Removal` trait (`removal.rs`) and one constructor tail.
+`overhead.rs` has one `ARENA_STACK_DRAM_OVERHEAD` (40, unchanged) and one `stack_dram_overhead`;
+the tests that compared two tables that are now one are gone, and the stale 72 B/object
+statements read 40. Tests: every test that ran several policies in one process runs each in a
+child process of its own (the process-global counters outlive a cache); the integration binaries
+share `tests/common` (and CLOCK has one); the worker tests share `worker/policy/test_support.rs`;
+the merged store's fidelity tests share one fixture.

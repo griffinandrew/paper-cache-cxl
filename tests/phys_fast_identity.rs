@@ -355,51 +355,44 @@ fn quiesce(
     lens: &BTreeMap<u64, u32>,
     label: &str,
 ) -> (HybridStats, Walk) {
-    let deadline = Instant::now() + QUIESCE_TIMEOUT;
-    let mut last = None;
-    let mut stable = 0;
+    common::settle(
+        QUIESCE_TIMEOUT,
+        Duration::from_millis(1),
+        || {
+            let s = cache.hybrid_stats();
+            let w = walk(cache, lens);
+            let pending = phys::pending_migrations();
 
-    loop {
-        let s = cache.hybrid_stats();
-        let w = walk(cache, lens);
-        let pending = phys::pending_migrations();
+            let settled = s.fast_objects + s.slow_objects == w.live
+                && s.fast_bytes_used + s.slow_bytes_used
+                    == w.total_charge + STACK_EXTRA_PER_OBJECT * w.live
+                && s.fast_objects == w.fast_live
+                && pending == (0, 0);
 
-        let settled = s.fast_objects + s.slow_objects == w.live
-            && s.fast_bytes_used + s.slow_bytes_used
-                == w.total_charge + STACK_EXTRA_PER_OBJECT * w.live
-            && s.fast_objects == w.fast_live
-            && pending == (0, 0);
+            // M (S5a) too: its worker publishes it at the end of every pass, so a
+            // wait that ended before that pass would read a stale one.
+            let key = (
+                s.fast_objects, s.slow_objects, s.fast_bytes_used, s.slow_bytes_used,
+                s.promotions, s.demotions, s.evictions, w, cache.dram_metadata(),
+            );
 
-        // M (S5a) too: its worker publishes it at the end of every pass, so a
-        // wait that ended before that pass would read a stale one.
-        let key = (
-            s.fast_objects, s.slow_objects, s.fast_bytes_used, s.slow_bytes_used,
-            s.promotions, s.demotions, s.evictions, w, cache.dram_metadata(),
-        );
-
-        stable = if settled && last == Some(key) { stable + 1 } else { 0 };
-        last = Some(key);
-
-        if stable >= 5 {
-            return (s, w);
-        }
-
-        // P and the stack's fast bytes appear in the message only, for the
-        // reader: the wait itself never reads P.
-        assert!(
-            Instant::now() < deadline,
-            "{label}: never quiesced -- stack fast/slow objects {}/{} vs map {} ({} \
-             physically fast), stack bytes {} vs model {}, pending {:?}; stack fast \
-             bytes {} vs the physically fast values' {} (P {})",
-            s.fast_objects, s.slow_objects, w.live, w.fast_live,
-            s.fast_bytes_used + s.slow_bytes_used,
-            w.total_charge + STACK_EXTRA_PER_OBJECT * w.live,
-            pending,
-            s.fast_bytes_used, w.fast_charge, s.phys_fast_bytes,
-        );
-
-        std::thread::sleep(Duration::from_millis(1));
-    }
+            (settled, key, (s, w))
+        },
+        |(s, w)| {
+            // P and the stack's fast bytes appear in the message only, for the
+            // reader: the wait itself never reads P.
+            format!(
+                "{label}: never quiesced -- stack fast/slow objects {}/{} vs map {} ({} \
+                 physically fast), stack bytes {} vs model {}, pending {:?}; stack fast \
+                 bytes {} vs the physically fast values' {} (P {})",
+                s.fast_objects, s.slow_objects, w.live, w.fast_live,
+                s.fast_bytes_used + s.slow_bytes_used,
+                w.total_charge + STACK_EXTRA_PER_OBJECT * w.live,
+                phys::pending_migrations(),
+                s.fast_bytes_used, w.fast_charge, s.phys_fast_bytes,
+            )
+        },
+    )
 }
 
 /// What one run's checks need besides the cache.

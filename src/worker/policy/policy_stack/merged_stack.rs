@@ -427,23 +427,16 @@ where
 #[cfg(all(test, feature = "lru_compact_hybrid_cache"))]
 mod global_demotion_fidelity {
 	use super::*;
+	use super::fidelity::{Handle, SHARD_BITS, Store, in_shard, value_len};
 
 	use crate::{
 		object::Object,
 		worker::policy::policy_stack::{
 			arena_hybrid_stack::LruCompactHybridStack,
 		},
-		BufferDRAM,
 	};
 
 	use std::collections::HashSet;
-
-	type Store = MergedStore<u64, BufferDRAM>;
-	type Handle = MergedStackHandle<u64, BufferDRAM>;
-
-	/// `MergedStore::shard_of` reads the top five bits of the key.
-	const SHARD_BITS: u32 = 5;
-	const SHARDS: u64 = 1 << SHARD_BITS;
 
 	const COLD_SHARD: u64 = 0;
 	const HOT_SHARD: u64 = 1;
@@ -465,17 +458,6 @@ mod global_demotion_fidelity {
 	/// none of the small objects would let a per-shard rule agree by accident.
 	const FAST_CAPACITY: CacheSize = 880_000;
 
-	fn mix(i: u64) -> HashedKey {
-		i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-	}
-
-	/// A key that lands in shard `s`: the mixed value shifted clear of the
-	/// shard field, then the shard written into it.
-	fn in_shard(s: u64, i: u64) -> HashedKey {
-		assert!(s < SHARDS);
-		(mix(i) >> SHARD_BITS) | (s << (64 - SHARD_BITS))
-	}
-
 	/// Feeds ONE sequence to both structures.
 	///
 	/// The merged handle needs the object in the map first: in that design
@@ -496,34 +478,6 @@ mod global_demotion_fidelity {
 			merged.insert_resident(key, size, 0);
 			split.insert_resident(key, size, 0);
 		}
-	}
-
-	/// The value LENGTH whose WHOLE ITEM costs exactly `item` bytes.
-	///
-	/// The constants above name what each object must be CHARGED, because the
-	/// budget is expressed in those bytes and the scenario is built on them.
-	/// The merged store does not take that figure from the caller: it derives
-	/// it from the object, through `Slot::migrating` -> `resident_object_bytes`
-	/// -- so under `fused_value` a 512-BYTE VALUE is a 536-byte item that
-	/// rounds to 640, and feeding the reference stack 512 charged the two
-	/// structures differently. The tier comparison then stopped being about
-	/// ORDER, which is the only thing it exists to check.
-	///
-	/// Subtracting the header makes the item land back on the class in BOTH
-	/// layouts: 488 + 24 = 512 fused, and 488 rounds to 512 split. Every
-	/// capacity and count in this module is therefore unchanged.
-	fn value_len(item: ObjectSize) -> ObjectSize {
-		let len = item - crate::object::overhead::value_header_bytes::<u64>();
-
-		assert_eq!(
-			crate::object::overhead::resident_object_bytes::<u64>(len),
-			item,
-			"a {len}-byte value does not make an item of exactly {item} bytes, \
-			 so the merged store and the reference stack are being charged \
-			 different numbers and this fixture is not comparing orders",
-		);
-
-		len
 	}
 
 	#[test]
@@ -768,6 +722,174 @@ mod global_demotion_fidelity {
 	}
 }
 
+/// What the merged store's order-fidelity tests share: one fixture, so each
+/// test states only what its order is (its sequence and what it asserts of the
+/// result). The store and a policy handle over it are compared, key for key,
+/// with the reference stacks the order is defined by, fed the identical
+/// `(key, size, dram_resident)` calls through `PolicyStack`.
+///
+/// The sizes are exact jemalloc size classes, so `nallocx` rounds none of them
+/// and the structures charge the identical number of bytes per object; no
+/// per-object shared overhead is reserved on any side.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod fidelity {
+	use super::*;
+
+	use crate::{object::Object, BufferDRAM};
+
+	pub(super) type Store = MergedStore<u64, BufferDRAM>;
+	pub(super) type Handle = MergedStackHandle<u64, BufferDRAM>;
+
+	/// `MergedStore::shard_of` reads the top five bits of the key.
+	pub(super) const SHARD_BITS: u32 = 5;
+	pub(super) const SHARDS: u64 = 1 << SHARD_BITS;
+
+	/// All exact jemalloc size classes, so `nallocx` rounds none of them and
+	/// the structures charge the identical number of bytes per object.
+	///
+	/// These are ITEM sizes -- what the object COSTS -- and `value_len` below
+	/// turns each into the value length that produces it.
+	pub(super) const SMALL: ObjectSize = 512;
+	pub(super) const MEDIUM: ObjectSize = 1024;
+	pub(super) const LARGE: ObjectSize = 8192;
+
+	pub(super) const N_KEYS: u64 = 240;
+
+	/// Room for roughly 117 of the 240 small objects, so the budget bites in
+	/// the MIDDLE of the sequence: a capacity that demoted all or none of them
+	/// would let a wrong order agree by accident.
+	pub(super) const FAST_CAPACITY: CacheSize = 60_000;
+
+	pub(super) fn mix(i: u64) -> HashedKey {
+		i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+	}
+
+	/// A key that lands in shard `s`: the mixed value shifted clear of the
+	/// shard field, then the shard written into it.
+	pub(super) fn in_shard(s: u64, i: u64) -> HashedKey {
+		assert!(s < SHARDS);
+		(mix(i) >> SHARD_BITS) | (s << (64 - SHARD_BITS))
+	}
+
+	/// The n-th key of the sequence, round-robin over three shards.
+	pub(super) fn key_at(n: u64) -> HashedKey {
+		in_shard(n % 3, n)
+	}
+
+	/// The value LENGTH whose WHOLE ITEM costs exactly `item` bytes.
+	///
+	/// The constants above name what each object must be CHARGED, because the
+	/// budget is expressed in those bytes and the scenario is built on them.
+	/// The merged store does not take that figure from the caller: it derives
+	/// it from the object, through `Slot::migrating` -> `resident_object_bytes`
+	/// -- so under `fused_value` a 512-BYTE VALUE is a 536-byte item that
+	/// rounds to 640, and feeding the reference stack 512 charged the two
+	/// structures differently. The tier comparison then stopped being about
+	/// ORDER, which is the only thing it exists to check.
+	///
+	/// Subtracting the header makes the item land back on the class in BOTH
+	/// layouts: 488 + 24 = 512 fused, and 488 rounds to 512 split. Every
+	/// capacity and count in these tests is therefore unchanged.
+	pub(super) fn value_len(item: ObjectSize) -> ObjectSize {
+		let len = item - crate::object::overhead::value_header_bytes::<u64>();
+
+		assert_eq!(
+			crate::object::overhead::resident_object_bytes::<u64>(len),
+			item,
+			"a {len}-byte value does not make an item of exactly {item} bytes, \
+			 so the merged store and the reference stack are being charged \
+			 different numbers and this fixture is not comparing orders",
+		);
+
+		len
+	}
+
+	/// Spelled out rather than inferred from whether the key happens to be
+	/// present: an `Insert` that silently became an overwrite, or an
+	/// `Overwrite` whose key had gone, would quietly delete the case the
+	/// sequence exists to cover.
+	#[derive(Clone, Copy, Debug)]
+	pub(super) enum Op {
+		Insert(HashedKey, ObjectSize),
+		Hit(HashedKey),
+		Overwrite(HashedKey, ObjectSize),
+	}
+
+	/// One op, to the merged handle and to every reference stack.
+	///
+	/// The merged handle needs the object in the map first: in that design
+	/// inserting into the map IS inserting into the stack, and
+	/// `insert_resident` only settles. The reference stacks own their own
+	/// rows, so `insert_resident` is the whole insert. An overwrite is the same
+	/// pair of calls -- which is the point, since no side is told which it is.
+	pub(super) fn apply(
+		store: &Arc<Store>,
+		merged: &mut Handle,
+		references: &mut [&mut dyn PolicyStack],
+		op: Op,
+	) {
+		match op {
+			Op::Insert(key, size) => {
+				assert!(!store.contains(key), "Insert of a key already present");
+
+				for reference in references.iter() {
+					assert!(!reference.contains(key), "Insert of a key already present");
+				}
+
+				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
+				merged.insert_resident(key, size, 0);
+
+				for reference in references.iter_mut() {
+					reference.insert_resident(key, size, 0);
+				}
+			},
+
+			Op::Hit(key) => {
+				assert!(store.contains(key), "Hit on a key that is not present");
+
+				for reference in references.iter() {
+					assert!(reference.contains(key), "Hit on a key that is not present");
+				}
+
+				merged.update(key);
+
+				for reference in references.iter_mut() {
+					reference.update(key);
+				}
+			},
+
+			Op::Overwrite(key, size) => {
+				assert!(store.contains(key), "Overwrite of a key that is not present");
+
+				for reference in references.iter() {
+					assert!(reference.contains(key), "Overwrite of a key that is not present");
+				}
+
+				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
+				merged.insert_resident(key, size, 0);
+
+				for reference in references.iter_mut() {
+					reference.insert_resident(key, size, 0);
+				}
+			},
+		}
+	}
+
+	/// The store and its policy handle for `policy`, with the exact budget the
+	/// experiment needs and no per-object reservation on either side
+	/// (overriding whatever `Handle::new` derived from `max_size`; the
+	/// reference stacks leave their own shared overhead at zero).
+	pub(super) fn build(policy: PaperPolicy) -> (Arc<Store>, Handle) {
+		let store = Arc::new(Store::new());
+		let merged = Handle::new(store.clone(), policy, FAST_CAPACITY * 5)
+			.unwrap_or_else(|error| panic!("{policy} is implemented: {error:?}"));
+
+		store.configure_tiering(FAST_CAPACITY, 0, drain_target_ppm(), drain_target_ppm());
+
+		(store, merged)
+	}
+}
+
 /// The acceptance test for `MergedOrder::Fifo`: it is the SAME order
 /// [`FifoCompactHybridStack`] implements, key for key, step for step.
 ///
@@ -826,136 +948,11 @@ mod global_demotion_fidelity {
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod fifo_order_fidelity {
 	use super::*;
+	use super::fidelity::*;
 
-	use crate::{
-		object::Object,
-		worker::policy::policy_stack::{
-			arena_hybrid_stack::FifoCompactHybridStack,
-		},
-		BufferDRAM,
-	};
+	use crate::worker::policy::policy_stack::arena_hybrid_stack::FifoCompactHybridStack;
 
 	use std::collections::HashSet;
-
-	type Store = MergedStore<u64, BufferDRAM>;
-	type Handle = MergedStackHandle<u64, BufferDRAM>;
-
-	/// `MergedStore::shard_of` reads the top five bits of the key.
-	const SHARD_BITS: u32 = 5;
-	const SHARDS: u64 = 1 << SHARD_BITS;
-
-	/// All exact jemalloc size classes, so `nallocx` rounds none of them and
-	/// the two structures charge the identical number of bytes per object.
-	///
-	/// These are ITEM sizes -- what the object COSTS -- and `value_len` below
-	/// turns each into the value length that produces it.
-	const SMALL: ObjectSize = 512;
-	const MEDIUM: ObjectSize = 1024;
-	const LARGE: ObjectSize = 8192;
-
-	const N_KEYS: u64 = 240;
-
-	/// Room for roughly 117 of the 240 small objects, so the budget bites in
-	/// the MIDDLE of the sequence: a capacity that demoted all or none of them
-	/// would let a wrong order agree by accident.
-	const FAST_CAPACITY: CacheSize = 60_000;
-
-	fn mix(i: u64) -> HashedKey {
-		i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-	}
-
-	/// A key that lands in shard `s`: the mixed value shifted clear of the
-	/// shard field, then the shard written into it.
-	fn in_shard(s: u64, i: u64) -> HashedKey {
-		assert!(s < SHARDS);
-		(mix(i) >> SHARD_BITS) | (s << (64 - SHARD_BITS))
-	}
-
-	/// The n-th key of the sequence, round-robin over three shards.
-	fn key_at(n: u64) -> HashedKey {
-		in_shard(n % 3, n)
-	}
-
-	/// The value LENGTH whose WHOLE ITEM costs exactly `item` bytes.
-	///
-	/// The constants above name what each object must be CHARGED, because the
-	/// budget is expressed in those bytes and the scenario is built on them.
-	/// The merged store does not take that figure from the caller: it derives
-	/// it from the object, through `Slot::migrating` -> `resident_object_bytes`
-	/// -- so under `fused_value` a 512-BYTE VALUE is a 536-byte item that
-	/// rounds to 640, and feeding the reference stack 512 charged the two
-	/// structures differently. The tier comparison then stopped being about
-	/// ORDER, which is the only thing it exists to check.
-	///
-	/// Subtracting the header makes the item land back on the class in BOTH
-	/// layouts: 488 + 24 = 512 fused, and 488 rounds to 512 split. Every
-	/// capacity and count in this module is therefore unchanged.
-	fn value_len(item: ObjectSize) -> ObjectSize {
-		let len = item - crate::object::overhead::value_header_bytes::<u64>();
-
-		assert_eq!(
-			crate::object::overhead::resident_object_bytes::<u64>(len),
-			item,
-			"a {len}-byte value does not make an item of exactly {item} bytes, \
-			 so the merged store and the reference stack are being charged \
-			 different numbers and this fixture is not comparing orders",
-		);
-
-		len
-	}
-
-	/// Spelled out rather than inferred from whether the key happens to be
-	/// present: an `Insert` that silently became an overwrite, or an
-	/// `Overwrite` whose key had gone, would quietly delete the case the
-	/// sequence exists to cover.
-	#[derive(Clone, Copy, Debug)]
-	enum Op {
-		Insert(HashedKey, ObjectSize),
-		Hit(HashedKey),
-		Overwrite(HashedKey, ObjectSize),
-	}
-
-	/// One op, to both structures.
-	///
-	/// The merged handle needs the object in the map first: in that design
-	/// inserting into the map IS inserting into the stack, and
-	/// `insert_resident` only settles. The split stack owns its own row, so
-	/// `insert_resident` is the whole insert. An overwrite is the same pair of
-	/// calls -- which is the point, since neither side is told which it is.
-	fn apply(
-		store: &Arc<Store>,
-		merged: &mut Handle,
-		split: &mut FifoCompactHybridStack,
-		op: Op,
-	) {
-		match op {
-			Op::Insert(key, size) => {
-				assert!(!store.contains(key), "Insert of a key already present");
-				assert!(!split.contains(key), "Insert of a key already present");
-
-				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
-				merged.insert_resident(key, size, 0);
-				split.insert_resident(key, size, 0);
-			},
-
-			Op::Hit(key) => {
-				assert!(store.contains(key), "Hit on a key that is not present");
-				assert!(split.contains(key), "Hit on a key that is not present");
-
-				merged.update(key);
-				split.update(key);
-			},
-
-			Op::Overwrite(key, size) => {
-				assert!(store.contains(key), "Overwrite of a key that is not present");
-				assert!(split.contains(key), "Overwrite of a key that is not present");
-
-				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
-				merged.insert_resident(key, size, 0);
-				split.insert_resident(key, size, 0);
-			},
-		}
-	}
 
 	/// The sequence. Built rather than written out so the interesting ops sit
 	/// at positions the budget has already bitten at.
@@ -1002,20 +999,9 @@ mod fifo_order_fidelity {
 	}
 
 	fn build() -> (Arc<Store>, Handle, FifoCompactHybridStack) {
-		let store = Arc::new(Store::new());
-		let merged =
-			Handle::new(store.clone(), PaperPolicy::FifoCompactHybrid, FAST_CAPACITY * 5)
-				.expect("fifo-compact-hybrid is implemented");
+		let (store, merged) = fidelity::build(PaperPolicy::FifoCompactHybrid);
 
-		// Override whatever `Handle::new` derived from `max_size`: the
-		// experiment needs an exact budget and no per-object reservation on
-		// either side, and `FifoCompactHybridStack::new` leaves its own shared
-		// overhead at zero.
-		store.configure_tiering(FAST_CAPACITY, 0, drain_target_ppm(), drain_target_ppm());
-
-		let split = FifoCompactHybridStack::new(FAST_CAPACITY);
-
-		(store, merged, split)
+		(store, merged, FifoCompactHybridStack::new(FAST_CAPACITY))
 	}
 
 	/// The policy string really does reach the store's order, rather than
@@ -1095,7 +1081,7 @@ mod fifo_order_fidelity {
 		// 1. Tier placement, after EVERY op, so a failure names the step that
 		//    introduced the divergence rather than the end state.
 		for (n, &op) in ops.iter().enumerate() {
-			apply(&store, &mut merged, &mut split, op);
+			apply(&store, &mut merged, &mut [&mut split], op);
 
 			for &key in &keys {
 				if !store.contains(key) {
@@ -1238,41 +1224,14 @@ mod fifo_order_fidelity {
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod clock_order_fidelity {
 	use super::*;
+	use super::fidelity::*;
 
-	use crate::{
-		object::Object,
-		worker::policy::policy_stack::{
-			arena_hybrid_stack::ClockCompactHybridStack,
-			clock_compact_stack::ClockCompactStack,
-		},
-		BufferDRAM,
+	use crate::worker::policy::policy_stack::{
+		arena_hybrid_stack::ClockCompactHybridStack,
+		clock_compact_stack::ClockCompactStack,
 	};
 
 	use std::collections::HashSet;
-
-	type Store = MergedStore<u64, BufferDRAM>;
-	type Handle = MergedStackHandle<u64, BufferDRAM>;
-
-	/// `MergedStore::shard_of` reads the top five bits of the key.
-	const SHARD_BITS: u32 = 5;
-	const SHARDS: u64 = 1 << SHARD_BITS;
-
-	/// All exact jemalloc size classes, so `nallocx` rounds none of them and
-	/// the two tiered structures charge the identical number of bytes per
-	/// object.
-	///
-	/// These are ITEM sizes -- what the object COSTS -- and `value_len` below
-	/// turns each into the value length that produces it.
-	const SMALL: ObjectSize = 512;
-	const MEDIUM: ObjectSize = 1024;
-	const LARGE: ObjectSize = 8192;
-
-	const N_KEYS: u64 = 240;
-
-	/// Room for roughly 117 of the 240 small objects, so the budget bites in
-	/// the MIDDLE of the sequence: a capacity that demoted all or none of them
-	/// would let a wrong order agree by accident.
-	const FAST_CAPACITY: CacheSize = 60_000;
 
 	/// Hit exactly ONCE, immediately after it is inserted, and never mentioned
 	/// again. Its reference bit is therefore set for the whole run.
@@ -1313,107 +1272,6 @@ mod clock_order_fidelity {
 			|| i == OVERWRITE_ONLY
 			|| i == NEVER_TOUCHED
 			|| i == MANY_HITS
-	}
-
-	fn mix(i: u64) -> HashedKey {
-		i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-	}
-
-	/// A key that lands in shard `s`: the mixed value shifted clear of the
-	/// shard field, then the shard written into it.
-	fn in_shard(s: u64, i: u64) -> HashedKey {
-		assert!(s < SHARDS);
-		(mix(i) >> SHARD_BITS) | (s << (64 - SHARD_BITS))
-	}
-
-	/// The n-th key of the sequence, round-robin over three shards.
-	fn key_at(n: u64) -> HashedKey {
-		in_shard(n % 3, n)
-	}
-
-	/// The value LENGTH whose WHOLE ITEM costs exactly `item` bytes.
-	///
-	/// The constants above name what each object must be CHARGED, because the
-	/// budget is expressed in those bytes and the scenario is built on them.
-	/// The merged store does not take that figure from the caller: it derives
-	/// it from the object, through `Slot::migrating` -> `resident_object_bytes`
-	/// -- so under `fused_value` a 512-BYTE VALUE is a 536-byte item that
-	/// rounds to 640, and feeding the reference stack 512 charged the two
-	/// structures differently. The tier comparison then stopped being about
-	/// ORDER, which is the only thing it exists to check.
-	///
-	/// Subtracting the header makes the item land back on the class in BOTH
-	/// layouts: 488 + 24 = 512 fused, and 488 rounds to 512 split. Every
-	/// capacity and count in this module is therefore unchanged.
-	fn value_len(item: ObjectSize) -> ObjectSize {
-		let len = item - crate::object::overhead::value_header_bytes::<u64>();
-
-		assert_eq!(
-			crate::object::overhead::resident_object_bytes::<u64>(len),
-			item,
-			"a {len}-byte value does not make an item of exactly {item} bytes, \
-			 so the merged store and the reference stack are being charged \
-			 different numbers and this fixture is not comparing orders",
-		);
-
-		len
-	}
-
-	/// Spelled out rather than inferred from whether the key happens to be
-	/// present: an `Insert` that silently became an overwrite, or an
-	/// `Overwrite` whose key had gone, would quietly delete the case the
-	/// sequence exists to cover.
-	#[derive(Clone, Copy, Debug)]
-	enum Op {
-		Insert(HashedKey, ObjectSize),
-		Hit(HashedKey),
-		Overwrite(HashedKey, ObjectSize),
-	}
-
-	/// One op, to all three structures.
-	///
-	/// The merged handle needs the object in the map first: in that design
-	/// inserting into the map IS inserting into the stack, and
-	/// `insert_resident` only settles. The two split stacks own their own rows,
-	/// so `insert_resident` is the whole insert. An overwrite is the same pair
-	/// of calls -- which is the point, since no side is told which it is.
-	fn apply(
-		store: &Arc<Store>,
-		merged: &mut Handle,
-		split: &mut ClockCompactHybridStack,
-		flat: &mut ClockCompactStack,
-		op: Op,
-	) {
-		match op {
-			Op::Insert(key, size) => {
-				assert!(!store.contains(key), "Insert of a key already present");
-				assert!(!split.contains(key), "Insert of a key already present");
-
-				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
-				merged.insert_resident(key, size, 0);
-				split.insert_resident(key, size, 0);
-				flat.insert(key, size);
-			},
-
-			Op::Hit(key) => {
-				assert!(store.contains(key), "Hit on a key that is not present");
-				assert!(split.contains(key), "Hit on a key that is not present");
-
-				merged.update(key);
-				split.update(key);
-				flat.update(key);
-			},
-
-			Op::Overwrite(key, size) => {
-				assert!(store.contains(key), "Overwrite of a key that is not present");
-				assert!(split.contains(key), "Overwrite of a key that is not present");
-
-				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
-				merged.insert_resident(key, size, 0);
-				split.insert_resident(key, size, 0);
-				flat.insert(key, size);
-			},
-		}
 	}
 
 	/// The sequence. Built rather than written out so the interesting ops sit
@@ -1508,20 +1366,9 @@ mod clock_order_fidelity {
 	}
 
 	fn build() -> (Arc<Store>, Handle, ClockCompactHybridStack, ClockCompactStack) {
-		let store = Arc::new(Store::new());
-		let merged =
-			Handle::new(store.clone(), PaperPolicy::ClockCompactHybrid, FAST_CAPACITY * 5)
-				.expect("clock-compact-hybrid is implemented");
+		let (store, merged) = fidelity::build(PaperPolicy::ClockCompactHybrid);
 
-		// Override whatever `Handle::new` derived from `max_size`: the
-		// experiment needs an exact budget and no per-object reservation on
-		// either side, and `ClockCompactHybridStack::new` leaves its own shared
-		// overhead at zero.
-		store.configure_tiering(FAST_CAPACITY, 0, drain_target_ppm(), drain_target_ppm());
-
-		let split = ClockCompactHybridStack::new(FAST_CAPACITY);
-
-		(store, merged, split, ClockCompactStack::default())
+		(store, merged, ClockCompactHybridStack::new(FAST_CAPACITY), ClockCompactStack::default())
 	}
 
 	/// `clock-compact-hybrid` really does reach the store's order, and the two
@@ -1567,7 +1414,7 @@ mod clock_order_fidelity {
 		// 1. Tier placement, after EVERY op, so a failure names the step that
 		//    introduced the divergence rather than the end state.
 		for (n, &op) in ops.iter().enumerate() {
-			apply(&store, &mut merged, &mut split, &mut flat, op);
+			apply(&store, &mut merged, &mut [&mut split, &mut flat], op);
 
 			for &key in &keys {
 				if !store.contains(key) {
@@ -1820,6 +1667,7 @@ mod clock_order_fidelity {
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod lfu_order_fidelity {
 	use super::*;
+	use super::fidelity::*;
 
 	use crate::{
 		object::Object,
@@ -1827,29 +1675,9 @@ mod lfu_order_fidelity {
 			lfu_compact_hybrid_stack::LfuCompactHybridStack,
 			lfu_compact_stack::LfuCompactStack,
 		},
-		BufferDRAM,
 	};
 
 	use std::collections::HashSet;
-
-	type Store = MergedStore<u64, BufferDRAM>;
-	type Handle = MergedStackHandle<u64, BufferDRAM>;
-
-	/// `MergedStore::shard_of` reads the top five bits of the key.
-	const SHARD_BITS: u32 = 5;
-	const SHARDS: u64 = 1 << SHARD_BITS;
-
-	/// All exact jemalloc size classes -- see `value_len`.
-	const SMALL: ObjectSize = 512;
-	const MEDIUM: ObjectSize = 1024;
-	const LARGE: ObjectSize = 8192;
-
-	const N_KEYS: u64 = 240;
-
-	/// Room for roughly 117 of the 240 small objects, so the budget bites in
-	/// the MIDDLE of the sequence: a capacity that demoted all or none of them
-	/// would let a wrong order agree by accident.
-	const FAST_CAPACITY: CacheSize = 60_000;
 
 	/// Hit at every opportunity, so its count climbs far above everything
 	/// else's and it must leave LAST. This is the key whose position the CLOCK
@@ -1883,96 +1711,6 @@ mod lfu_order_fidelity {
 			|| i == NEVER_HIT
 			|| i == OVERWRITE_ONLY
 			|| i == NEVER_TOUCHED
-	}
-
-	fn mix(i: u64) -> HashedKey {
-		i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-	}
-
-	/// A key that lands in shard `s`: the mixed value shifted clear of the
-	/// shard field, then the shard written into it.
-	fn in_shard(s: u64, i: u64) -> HashedKey {
-		assert!(s < SHARDS);
-		(mix(i) >> SHARD_BITS) | (s << (64 - SHARD_BITS))
-	}
-
-	/// The n-th key of the sequence, round-robin over three shards.
-	fn key_at(n: u64) -> HashedKey {
-		in_shard(n % 3, n)
-	}
-
-	/// The value LENGTH whose WHOLE ITEM costs exactly `item` bytes.
-	///
-	/// The merged store derives what to charge from the object, through
-	/// `Slot::migrating` -> `resident_object_bytes`, while the reference stack
-	/// is told a figure -- so feeding the reference `item` while the store
-	/// rounded something else would charge the two differently and the
-	/// comparison would stop being about ORDER.
-	fn value_len(item: ObjectSize) -> ObjectSize {
-		let len = item - crate::object::overhead::value_header_bytes::<u64>();
-
-		assert_eq!(
-			crate::object::overhead::resident_object_bytes::<u64>(len),
-			item,
-			"a {len}-byte value does not make an item of exactly {item} bytes, \
-			 so the merged store and the reference stack are being charged \
-			 different numbers and this fixture is not comparing orders",
-		);
-
-		len
-	}
-
-	/// Spelled out rather than inferred from whether the key happens to be
-	/// present: an `Insert` that silently became an overwrite, or an
-	/// `Overwrite` whose key had gone, would quietly delete the case the
-	/// sequence exists to cover.
-	#[derive(Clone, Copy, Debug)]
-	enum Op {
-		Insert(HashedKey, ObjectSize),
-		Hit(HashedKey),
-		Overwrite(HashedKey, ObjectSize),
-	}
-
-	/// One op, to both structures.
-	///
-	/// The merged handle needs the object in the map first: in that design
-	/// inserting into the map IS inserting into the stack, and
-	/// `insert_resident` only settles. The split stack owns its own row, so
-	/// `insert_resident` is the whole insert. An overwrite is the same pair of
-	/// calls -- which is the point, since neither side is told which it is.
-	fn apply(
-		store: &Arc<Store>,
-		merged: &mut Handle,
-		split: &mut LfuCompactHybridStack,
-		op: Op,
-	) {
-		match op {
-			Op::Insert(key, size) => {
-				assert!(!store.contains(key), "Insert of a key already present");
-				assert!(!split.contains(key), "Insert of a key already present");
-
-				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
-				merged.insert_resident(key, size, 0);
-				split.insert_resident(key, size, 0);
-			},
-
-			Op::Hit(key) => {
-				assert!(store.contains(key), "Hit on a key that is not present");
-				assert!(split.contains(key), "Hit on a key that is not present");
-
-				merged.update(key);
-				split.update(key);
-			},
-
-			Op::Overwrite(key, size) => {
-				assert!(store.contains(key), "Overwrite of a key that is not present");
-				assert!(split.contains(key), "Overwrite of a key that is not present");
-
-				store.insert(key, Object::new(key, &vec![0u8; value_len(size) as usize], None));
-				merged.insert_resident(key, size, 0);
-				split.insert_resident(key, size, 0);
-			},
-		}
 	}
 
 	/// The sequence. Built rather than written out so the interesting ops sit
@@ -2064,19 +1802,9 @@ mod lfu_order_fidelity {
 	}
 
 	fn build() -> (Arc<Store>, Handle, LfuCompactHybridStack) {
-		let store = Arc::new(Store::new());
-		let merged = Handle::new(store.clone(), PaperPolicy::LfuCompactHybrid, FAST_CAPACITY * 5)
-			.expect("lfu-compact-hybrid is implemented");
+		let (store, merged) = fidelity::build(PaperPolicy::LfuCompactHybrid);
 
-		// Override whatever `Handle::new` derived from `max_size`: the
-		// experiment needs an exact budget and no per-object reservation on
-		// either side, and `LfuCompactHybridStack::new` leaves its own shared
-		// overhead at zero.
-		store.configure_tiering(FAST_CAPACITY, 0, drain_target_ppm(), drain_target_ppm());
-
-		let split = LfuCompactHybridStack::new(FAST_CAPACITY);
-
-		(store, merged, split)
+		(store, merged, LfuCompactHybridStack::new(FAST_CAPACITY))
 	}
 
 	/// Both LFU spellings reach the store's order, and the three orders
@@ -2122,7 +1850,7 @@ mod lfu_order_fidelity {
 		//    new key's tier itself, and getting that wrong shows up here one op
 		//    after it happens.
 		for (n, &op) in ops.iter().enumerate() {
-			apply(&store, &mut merged, &mut split, op);
+			apply(&store, &mut merged, &mut [&mut split], op);
 
 			for &key in &keys {
 				if !store.contains(key) {

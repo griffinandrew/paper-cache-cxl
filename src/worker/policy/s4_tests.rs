@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::*;
-use super::test_support::each_alone;
+use super::test_support::{client_set, each_alone, stack, wait_for};
 use super::reconcile_tests::{
 	Objects, Worker, FAST, LEN, assert_settled, bytes_tier, correctives, drain_and_apply,
 	evict_one_key, fill, handle, make_worker, of, placement, publish, publish_del, set,
@@ -74,10 +74,6 @@ const TIERED: [PaperPolicy; 4] = [
 	PaperPolicy::ClockCompactHybrid,
 	PaperPolicy::LfuCompactHybrid,
 ];
-
-fn stack(worker: &Worker) -> &dyn PolicyStack {
-	&*worker.policy_stack
-}
 
 /// What the stack reports of its tiers: fast and slow bytes and objects, and
 /// the metadata reservation.
@@ -113,26 +109,6 @@ fn resize_fast(worker: &mut Worker, f: CacheSize) {
 	drain_and_apply(worker);
 	worker.publish_gate();
 	drain_and_apply(worker);
-}
-
-/// A client's set of a `len`-byte value of `key` as `PaperCache::set` makes
-/// it since S5: built where the admission decision (`gate::decide`) says,
-/// its `Set` carrying the decision's placement. The decision must admit.
-fn client_set(worker: &mut Worker, objects: &Objects, key: HashedKey, len: usize) {
-	let sizes = crate::gate::Sizes {
-		base: worker.overhead_manager.base_size_for(&key, len, None).expect("a length in range"),
-		resident: worker.overhead_manager.dram_resident_size_for(&key, None),
-		value: crate::phys::value_charge::<u64>(len as ObjectSize),
-	};
-
-	let Ok(crate::gate::Verdict::Admit { tier, placement }) = crate::gate::decide(&worker.status, objects, key, &sizes, false) else {
-		panic!("key {key} was not admitted");
-	};
-
-	let mut published = publish(&worker.status, &worker.overhead_manager, objects, key, len, tier);
-	published.placement = placement;
-
-	handle(worker, key, published);
 }
 
 /// What one `len`-byte value is charged to a tier (`Slot::migrating`, the
@@ -512,16 +488,6 @@ fn u9_the_clock_hand_stops_at_its_budget() {
 		assert!(objects.get_ref(&victim).is_none(), "budget {budget:?}: the victim left the map");
 		assert!(placement(&worker, K ^ X ^ victim).is_some(), "budget {budget:?}: the other key stayed");
 		assert_settled(&mut worker);
-	}
-}
-
-/// Waits for `done`, up to `deadline`.
-fn wait_for(what: &str, deadline: Duration, mut done: impl FnMut() -> bool) {
-	let start = Instant::now();
-
-	while !done() {
-		assert!(start.elapsed() < deadline, "{what}");
-		std::thread::sleep(Duration::from_millis(1));
 	}
 }
 

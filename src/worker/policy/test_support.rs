@@ -19,6 +19,28 @@ use std::{
 	time::{Duration, Instant},
 };
 
+#[cfg(feature = "hybrid_cache_common")]
+use std::sync::Arc;
+
+#[cfg(feature = "hybrid_cache_common")]
+use crossbeam_channel::unbounded;
+
+#[cfg(feature = "hybrid_cache_common")]
+use crate::{
+	CacheSize, HashedKey, ObjectMapRef, OverheadManagerRef, PaperPolicy, StatusRef, TieredBuffer,
+	gate::{self, Verdict},
+	object::{ObjectSize, overhead::OverheadManager},
+	status::AtomicStatus,
+	worker::WorkerEvent,
+};
+
+#[cfg(feature = "hybrid_cache_common")]
+use super::{
+	PolicyWorker, Tier,
+	policy_stack::PolicyStack,
+	reconcile_tests::{Objects, Worker, handle, publish},
+};
+
 const CHILD: &str = "PAPER_GATE_TEST_CHILD";
 
 /// How long a child may run before it is killed and its test failed.
@@ -129,6 +151,200 @@ fn run_in_child(module: &str, test: &str, case: Option<usize>) {
 
 	// The child's diagnostics, for a run with --nocapture.
 	eprintln!("--- {what}, alone:\n{output}");
+}
+
+/// Polls `done` every millisecond until it holds, failing after `deadline`
+/// (a hang detector, not the measurement).
+pub(super) fn wait_for(what: &str, deadline: Duration, done: impl FnMut() -> bool) {
+	wait_for_every(Duration::from_millis(1), what, deadline, done);
+}
+
+/// `wait_for`, polling every `poll`: a test that times what it waits for is
+/// bounded by its own poll.
+pub(super) fn wait_for_every(poll: Duration, what: &str, deadline: Duration, mut done: impl FnMut() -> bool) {
+	let start = Instant::now();
+
+	while !done() {
+		assert!(start.elapsed() < deadline, "{what} did not happen within {deadline:?}");
+		thread::sleep(poll);
+	}
+}
+
+/// The policy stack of a hand-driven worker.
+#[cfg(feature = "hybrid_cache_common")]
+pub(super) fn stack<K, V>(worker: &PolicyWorker<K, V>) -> &dyn PolicyStack {
+	&*worker.policy_stack
+}
+
+/// Waits for the worker's first pass, then CHECKS the premise the kick tests
+/// rest on rather than assuming it: with nothing queued and no set ever seen,
+/// that pass chose the LONG poll, so no other pass runs in the next 100 ms (on
+/// the SHORT poll about a hundred would). `poll` is the interval the first
+/// wait polls at. Returns the pass count to measure from.
+#[cfg(feature = "hybrid_cache_common")]
+pub(super) fn parked_on_the_long_poll(status: &AtomicStatus, poll: Duration) -> u64 {
+	wait_for_every(poll, "the worker's first pass", Duration::from_secs(10), || {
+		status.policy_worker_passes() >= 1
+	});
+
+	let passes = status.policy_worker_passes();
+
+	thread::sleep(Duration::from_millis(100));
+
+	assert_eq!(
+		status.policy_worker_passes(),
+		passes,
+		"the idle worker ran another pass within 100 ms of its first: it is not \
+		 parked on the {:?} poll, so a kick would prove nothing",
+		super::LONG_POLLING_DURATION,
+	);
+
+	passes
+}
+
+/// A worker driven by hand over `objects`: its status (a cache of `max_size`
+/// running `policy`), its overhead manager and, unless `queued` is false, its
+/// migration queue. `per_object` pins the per-object metadata model the hand-
+/// driven tests are written against (S5).
+///
+/// The worker never runs on a thread here -- the event channel is dropped
+/// with this call -- so a test calls its handlers itself.
+#[cfg(feature = "hybrid_cache_common")]
+pub(super) fn tiered_worker<K>(
+	objects: ObjectMapRef<K, TieredBuffer>,
+	max_size: CacheSize,
+	policy: PaperPolicy,
+	per_object: bool,
+	queued: bool,
+) -> (PolicyWorker<K, TieredBuffer>, StatusRef, OverheadManagerRef)
+where
+	K: 'static + Eq + Clone + typesize::TypeSize + Send + Sync,
+{
+	let (_tx, rx) = unbounded::<WorkerEvent>();
+
+	let status = Arc::new(AtomicStatus::new(max_size, &[policy], policy).unwrap());
+	let overhead_manager = Arc::new(OverheadManager::new(&status));
+
+	if per_object {
+		status.pin_per_object();
+	}
+
+	let mut worker = PolicyWorker::new_with_tier_migration(
+		rx,
+		objects,
+		status.clone(),
+		overhead_manager.clone(),
+	).unwrap();
+
+	if !queued {
+		// Dropping the queue joins its consumers, so nothing is left in
+		// flight and `apply_migration_batches` takes the synchronous path.
+		worker.migration_queue = None;
+	}
+
+	(worker, status, overhead_manager)
+}
+
+/// `PaperCache::begin_set`'s decision for a `len`-byte value of `key`, from
+/// the sizes it computes before allocating.
+#[cfg(feature = "hybrid_cache_common")]
+pub(super) fn decide(worker: &Worker, objects: &Objects, key: HashedKey, len: usize) -> Result<Verdict, crate::CacheError> {
+	let sizes = gate::Sizes {
+		base: worker.overhead_manager.base_size_for(&key, len, None).expect("a length in range"),
+		resident: worker.overhead_manager.dram_resident_size_for(&key, None),
+		value: crate::phys::value_charge::<u64>(len as ObjectSize),
+	};
+
+	gate::decide(&worker.status, objects, key, &sizes, false)
+}
+
+/// A client's set through the decision -- built where it says, its `Set`
+/// carrying its placement -- then the worker's handling of the `Set`, as
+/// `PaperCache::set` makes it since S5. The decision must admit. Returns it.
+#[cfg(feature = "hybrid_cache_common")]
+pub(super) fn client_set(worker: &mut Worker, objects: &Objects, key: HashedKey, len: usize) -> (Tier, super::Placement) {
+	let Ok(Verdict::Admit { tier, placement }) = decide(worker, objects, key, len) else {
+		panic!("{}: key {key} was not admitted", worker.status.policy());
+	};
+
+	let mut published = publish(&worker.status, &worker.overhead_manager, objects, key, len, tier);
+	published.placement = placement;
+
+	handle(worker, key, published);
+
+	(tier, placement)
+}
+
+/// A stack that stands in for a real one where a test needs a particular
+/// answer of it and nothing else: it tracks the keys it is inserted (in
+/// order, evicting the oldest first), reports the drain it was given, and --
+/// with a `budget` -- insists on draining to that many objects.
+#[cfg(feature = "hybrid_cache_common")]
+pub(super) struct FakeStack {
+	keys: std::collections::VecDeque<HashedKey>,
+	migrations: Vec<(HashedKey, Tier)>,
+	budget: usize,
+}
+
+#[cfg(feature = "hybrid_cache_common")]
+impl FakeStack {
+	/// Hands the worker ONE scripted drain and nothing else, so an exact entry
+	/// sequence can go through `apply_tier_migrations` -- the path production
+	/// takes, `split_tier_migrations` included -- without coaxing a real stack
+	/// into emitting it.
+	pub(super) fn scripted(migrations: Vec<(HashedKey, Tier)>) -> Self {
+		FakeStack { keys: Default::default(), migrations, budget: usize::MAX }
+	}
+
+	/// A stack whose *internal* sub-structure is over its own budget -- the
+	/// `needs_capacity_eviction` case: it insists on draining to `budget`
+	/// objects however much room the cache as a whole still has.
+	/// `TwoQCompactHybridStack`'s `k_in`-derived fifo budget is the real
+	/// instance; this stands in for it because that one needs a hybrid design
+	/// compiled in and a fast tier configured, neither of which the condition
+	/// (or the watermark that must stay off it) has anything to do with.
+	pub(super) fn over_budget(budget: usize) -> Self {
+		FakeStack { keys: Default::default(), migrations: Vec::new(), budget }
+	}
+}
+
+#[cfg(feature = "hybrid_cache_common")]
+impl PolicyStack for FakeStack {
+	fn is_policy(&self, policy: &PaperPolicy) -> bool {
+		matches!(policy, PaperPolicy::LruCompact)
+	}
+
+	fn len(&self) -> usize {
+		self.keys.len()
+	}
+
+	fn contains(&self, key: HashedKey) -> bool {
+		self.keys.contains(&key)
+	}
+
+	fn insert(&mut self, key: HashedKey, _size: ObjectSize) {
+		self.keys.push_back(key);
+	}
+
+	fn remove(&mut self, key: HashedKey) {
+		self.keys.retain(|existing| *existing != key);
+	}
+
+	fn clear(&mut self) {
+		self.keys.clear();
+	}
+
+	fn evict_one(&mut self) -> Option<HashedKey> {
+		self.keys.pop_front()
+	}
+
+	fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
+		std::mem::take(&mut self.migrations)
+	}
+
+	fn needs_capacity_eviction(&self) -> bool {
+		self.keys.len() > self.budget
+	}
 }
 
 /// `each_alone_in` for the calling module's `test`: `each_alone!("name", CASES,

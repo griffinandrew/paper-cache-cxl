@@ -4476,14 +4476,11 @@ mod merged_overwrite_tests {
 mod merged_placement_tests {
 	use std::sync::Arc;
 
-	use crossbeam_channel::unbounded;
-
-	use super::{PolicyWorker, Tier, WorkerEvent, migration_test_lock};
+	use super::{PolicyWorker, Tier, migration_test_lock};
 	use crate::{
 		CacheSize, HashedKey, ObjectMapRef, PaperPolicy, TieredBuffer,
 		merged_store::MergedStore,
-		object::{Object, overhead::{OverheadManager, resident_object_bytes}},
-		status::AtomicStatus,
+		object::{Object, overhead::resident_object_bytes},
 	};
 
 	type Objects = ObjectMapRef<u64, TieredBuffer>;
@@ -4497,28 +4494,18 @@ mod merged_placement_tests {
 	/// constructs it, with the fast budget then set to `fast_capacity` and no
 	/// metadata reservation, so the budget is in value bytes alone.
 	fn make_worker(queued: bool, fast_capacity: CacheSize) -> (PolicyWorker<u64, TieredBuffer>, Objects) {
-		let (_tx, rx) = unbounded::<WorkerEvent>();
-
 		let objects: Objects = Arc::new(MergedStore::new());
-		let policy = PaperPolicy::LruCompactHybrid;
-		let status = Arc::new(AtomicStatus::new(1 << 30, &[policy], policy).unwrap());
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
 		// The per-object model this module was written against (S5).
-		status.pin_per_object();
-
-		let mut worker = PolicyWorker::new_with_tier_migration(
-			rx,
+		let (worker, _status, _overhead_manager) = super::test_support::tiered_worker(
 			objects.clone(),
-			status,
-			overhead_manager,
-		).unwrap();
+			1 << 30,
+			PaperPolicy::LruCompactHybrid,
+			true,
+			queued,
+		);
 
 		objects.configure_tiering(fast_capacity, 0, 1_000_000, 1_000_000);
-
-		if !queued {
-			worker.migration_queue = None;
-		}
 
 		(worker, objects)
 	}
@@ -4650,11 +4637,7 @@ mod migration_accounting_tests {
 
 	use super::migration_test_lock;
 	use crate::TieredValue;
-	use crate::{
-		object::Object,
-		object::overhead::OverheadManager,
-		status::AtomicStatus,
-	};
+	use crate::object::Object;
 
 	/// The cache SHAPE under test. Never `Box<[u8]>`: that is a
 	/// feature-dependent alias, and since v5 `V` is a zero-sized marker
@@ -4668,28 +4651,15 @@ mod migration_accounting_tests {
 		ObjectMapRef<u32, TestBuffer>,
 		StatusRef,
 	) {
-		let (_tx, rx) = unbounded::<WorkerEvent>();
-
 		let objects: ObjectMapRef<u32, TestBuffer> = crate::new_hybrid_object_map();
 
-		let status = Arc::new(
-			AtomicStatus::new(1_000, &[PaperPolicy::LruCompact], PaperPolicy::LruCompact).unwrap(),
-		);
-
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
-
-		let mut worker = PolicyWorker::new_with_tier_migration(
-			rx,
+		let (worker, status, _overhead_manager) = super::test_support::tiered_worker(
 			objects.clone(),
-			status.clone(),
-			overhead_manager,
-		).unwrap();
-
-		if !queued {
-			// Dropping the queue joins its consumers, so nothing is left in
-			// flight and `apply_migration_batches` takes the synchronous path.
-			worker.migration_queue = None;
-		}
+			1_000,
+			PaperPolicy::LruCompact,
+			false,
+			queued,
+		);
 
 		(worker, objects, status)
 	}
@@ -4850,42 +4820,6 @@ mod migration_accounting_tests {
 		}
 	}
 
-	/// A stack that hands the worker ONE scripted drain and nothing else, so an
-	/// exact entry sequence can go through `apply_tier_migrations` -- the path
-	/// production takes, `split_tier_migrations` included -- without coaxing
-	/// a real stack into emitting it.
-	struct ScriptedDrain {
-		migrations: Vec<(HashedKey, Tier)>,
-	}
-
-	impl PolicyStack for ScriptedDrain {
-		fn is_policy(&self, policy: &PaperPolicy) -> bool {
-			matches!(policy, PaperPolicy::LruCompact)
-		}
-
-		fn len(&self) -> usize {
-			0
-		}
-
-		fn contains(&self, _key: HashedKey) -> bool {
-			false
-		}
-
-		fn insert(&mut self, _key: HashedKey, _size: ObjectSize) {}
-
-		fn remove(&mut self, _key: HashedKey) {}
-
-		fn clear(&mut self) {}
-
-		fn evict_one(&mut self) -> Option<HashedKey> {
-			None
-		}
-
-		fn drain_tier_migrations(&mut self) -> Vec<(HashedKey, Tier)> {
-			std::mem::take(&mut self.migrations)
-		}
-	}
-
 	/// Runs one scripted drain through `apply_tier_migrations` and reports
 	/// the copies it made: `MIG_APPLIED`'s delta, exact under
 	/// `migration_test_lock`.
@@ -4897,7 +4831,7 @@ mod migration_accounting_tests {
 
 		let before = migration_queue::MIG_APPLIED.load(Ordering::Relaxed);
 
-		worker.policy_stack = Box::new(ScriptedDrain { migrations });
+		worker.policy_stack = Box::new(super::test_support::FakeStack::scripted(migrations));
 		worker.apply_tier_migrations();
 
 		migration_queue::MIG_APPLIED.load(Ordering::Relaxed) - before
@@ -5368,13 +5302,8 @@ mod policy_worker_kick_tests {
 
 	/// Polls `done` every 100 us until it holds, failing after `deadline`.
 	/// The deadline is a hang detector, not the measurement.
-	fn wait_for(what: &str, deadline: Duration, mut done: impl FnMut() -> bool) {
-		let start = Instant::now();
-
-		while !done() {
-			assert!(start.elapsed() < deadline, "{what} did not happen within {deadline:?}");
-			thread::sleep(Duration::from_micros(100));
-		}
+	fn wait_for(what: &str, deadline: Duration, done: impl FnMut() -> bool) {
+		super::test_support::wait_for_every(Duration::from_micros(100), what, deadline, done);
 	}
 
 	type WorkerHandle = thread::JoinHandle<Result<(), CacheError>>;
@@ -5401,28 +5330,11 @@ mod policy_worker_kick_tests {
 		(tx, status, register_worker(worker))
 	}
 
-	/// Waits for the worker's first pass, then CHECKS the premise both tests
-	/// rest on rather than assuming it: with nothing queued and no set ever
-	/// seen, that pass chose the LONG poll, so no other pass runs in the next
-	/// 100 ms (on the SHORT poll about a hundred would). Returns the pass
-	/// count to measure from.
+	/// The premise both tests rest on, checked (see
+	/// `test_support::parked_on_the_long_poll`), the first pass polled every 100
+	/// us. Returns the pass count to measure from.
 	fn parked_on_the_long_poll(status: &StatusRef) -> u64 {
-		wait_for("the worker's first pass", Duration::from_secs(10), || {
-			status.policy_worker_passes() >= 1
-		});
-
-		let passes = status.policy_worker_passes();
-
-		thread::sleep(Duration::from_millis(100));
-
-		assert_eq!(
-			status.policy_worker_passes(),
-			passes,
-			"the idle worker ran another pass within 100 ms of its first: it is not \
-			 parked on the {LONG_POLLING_DURATION:?} poll, so a kick would prove nothing",
-		);
-
-		passes
+		super::test_support::parked_on_the_long_poll(status, Duration::from_micros(100))
 	}
 
 	/// Stops the worker -- kicked, so the shutdown does not wait out a poll
@@ -5546,8 +5458,6 @@ mod policy_worker_kick_tests {
 mod capacity_watermark_tests {
 	use super::*;
 
-	use std::collections::VecDeque;
-
 	use super::eviction_watermarks::{DEFAULT_HIGH, DEFAULT_LOW, Watermarks, clamped_low};
 
 	use crate::{
@@ -5649,52 +5559,6 @@ mod capacity_watermark_tests {
 	) {
 		for key in keys {
 			insert(objects, status, overhead_manager, worker, key);
-		}
-	}
-
-	/// A stack whose *internal* sub-structure is over its own budget -- the
-	/// `needs_capacity_eviction` case. It insists on draining to `budget`
-	/// objects however much room the cache as a whole still has.
-	/// `TwoQCompactHybridStack`'s `k_in`-derived fifo budget is the real
-	/// instance; this stands in for it because that one needs a hybrid design
-	/// compiled in and a fast tier configured, neither of which this condition
-	/// (or the watermark that must stay off it) has anything to do with.
-	struct SubBudgetStack {
-		keys: VecDeque<HashedKey>,
-		budget: usize,
-	}
-
-	impl PolicyStack for SubBudgetStack {
-		fn is_policy(&self, policy: &PaperPolicy) -> bool {
-			matches!(policy, PaperPolicy::LruCompact)
-		}
-
-		fn len(&self) -> usize {
-			self.keys.len()
-		}
-
-		fn contains(&self, key: HashedKey) -> bool {
-			self.keys.contains(&key)
-		}
-
-		fn insert(&mut self, key: HashedKey, _size: ObjectSize) {
-			self.keys.push_back(key);
-		}
-
-		fn remove(&mut self, key: HashedKey) {
-			self.keys.retain(|existing| *existing != key);
-		}
-
-		fn clear(&mut self) {
-			self.keys.clear();
-		}
-
-		fn evict_one(&mut self) -> Option<HashedKey> {
-			self.keys.pop_front()
-		}
-
-		fn needs_capacity_eviction(&self) -> bool {
-			self.keys.len() > self.budget
 		}
 	}
 
@@ -5822,10 +5686,7 @@ mod capacity_watermark_tests {
 		// Marks that would drain to 8 objects' worth if the internal condition
 		// were ever allowed to arm them.
 		worker.eviction_watermarks = Watermarks::new(0.75, 0.5);
-		worker.policy_stack = Box::new(SubBudgetStack {
-			keys: VecDeque::new(),
-			budget: 2,
-		});
+		worker.policy_stack = Box::new(super::test_support::FakeStack::over_budget(2));
 
 		fill(&objects, &status, &overhead_manager, &mut worker, 1..=4);
 
@@ -6125,12 +5986,11 @@ mod reconcile_tests {
 	#[cfg(not(feature = "merged_object_store"))]
 	use super::test_support::each_alone;
 	use crate::hybrid_policy::admission_tier;
-	use crate::object::{Object, overhead::OverheadManager};
+	use crate::object::Object;
 	// The merged store answers these calls with inherent methods.
 	#[cfg(not(feature = "merged_object_store"))]
 	use crate::object_store::ObjectStore;
 	use crate::phys::{PlacementAudit, value_charge};
-	use crate::status::AtomicStatus;
 	use crate::TieredBuffer;
 	use MigrationOrigin::Reconcile;
 	use Tier::{Fast, Slow};
@@ -6147,21 +6007,11 @@ mod reconcile_tests {
 	const NONE: &[(HashedKey, Tier)] = &[];
 
 	pub(super) fn make_worker(policy: PaperPolicy) -> (Worker, Objects) {
-		let (_tx, rx) = unbounded::<WorkerEvent>();
-
 		let objects: Objects = crate::new_hybrid_object_map();
-		let status = Arc::new(AtomicStatus::new(1 << 30, &[policy], policy).unwrap());
-		let overhead_manager = Arc::new(OverheadManager::new(&status));
 
 		// The per-object model these tests were written against (S5).
-		status.pin_per_object();
-
-		let mut worker = PolicyWorker::new_with_tier_migration(
-			rx,
-			objects.clone(),
-			status,
-			overhead_manager,
-		).unwrap();
+		let (mut worker, _status, _overhead_manager) =
+			super::test_support::tiered_worker(objects.clone(), 1 << 30, policy, true, true);
 
 		worker.handle_resize_fast_tier(FAST);
 		worker.apply_tier_migrations();

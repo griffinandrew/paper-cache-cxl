@@ -53,6 +53,37 @@ pub fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> boo
     }
 }
 
+/// Polls `sample` every `poll` until it reports the same settled key five
+/// polls running, then returns that sample's value; panics with `failure` after
+/// `timeout`. The skeleton of the identity tests' `quiesce`: what a sample
+/// reads and what settled means is the test's, so a broken counter cannot make
+/// the wait pass or fail -- only the assertions after it.
+pub fn settle<K: Copy + PartialEq, V>(
+    timeout: Duration,
+    poll: Duration,
+    mut sample: impl FnMut() -> (bool, K, V),
+    failure: impl Fn(&V) -> String,
+) -> V {
+    let deadline = Instant::now() + timeout;
+    let mut last = None;
+    let mut stable = 0;
+
+    loop {
+        let (settled, key, value) = sample();
+
+        stable = if settled && last == Some(key) { stable + 1 } else { 0 };
+        last = Some(key);
+
+        if stable >= 5 {
+            return value;
+        }
+
+        assert!(Instant::now() < deadline, "{}", failure(&value));
+
+        thread::sleep(poll);
+    }
+}
+
 /// Runs `body` in a child process in which `test`, of `module`
 /// (`module_path!()`), is the only test, killed at `DEADLINE`. The parent
 /// passes only if the child ran exactly that one test and it passed.

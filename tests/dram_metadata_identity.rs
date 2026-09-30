@@ -93,7 +93,7 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use paper_cache::{
     numa_alloc::{measured, NODE_FAST},
@@ -167,43 +167,36 @@ impl Reading {
 /// P and M hold still for five polls; then returns the reading. Reads only
 /// atomics and the map: nothing here allocates.
 fn quiesce(cache: &Cache, keys: u64) -> Reading {
-    let deadline = Instant::now() + QUIESCE_TIMEOUT;
-    let mut last = None;
-    let mut stable = 0;
+    common::settle(
+        QUIESCE_TIMEOUT,
+        Duration::from_micros(300),
+        || {
+            let pool = measured::allocated(NODE_FAST) as i64;
+            let s = cache.hybrid_stats();
+            let live = (0..keys).filter(|key| cache.tier_of(key).is_some()).count() as u64;
+            let r = Reading {
+                pool,
+                p: phys::fast_bytes_signed(),
+                m: cache.dram_metadata(),
+                live,
+                model: s.fast_metadata_bytes,
+            };
 
-    loop {
-        let pool = measured::allocated(NODE_FAST) as i64;
-        let s = cache.hybrid_stats();
-        let live = (0..keys).filter(|key| cache.tier_of(key).is_some()).count() as u64;
-        let r = Reading {
-            pool,
-            p: phys::fast_bytes_signed(),
-            m: cache.dram_metadata(),
-            live,
-            model: s.fast_metadata_bytes,
-        };
+            let settled = s.fast_objects + s.slow_objects == live
+                && phys::pending_migrations() == (0, 0)
+                && cache.migrations_in_flight() == 0
+                && s.dram_metadata_bytes == r.m.total();
 
-        let settled = s.fast_objects + s.slow_objects == live
-            && phys::pending_migrations() == (0, 0)
-            && cache.migrations_in_flight() == 0
-            && s.dram_metadata_bytes == r.m.total();
-
-        stable = if settled && last == Some(r) { stable + 1 } else { 0 };
-        last = Some(r);
-
-        if stable >= 5 {
-            return r;
-        }
-
-        assert!(
-            Instant::now() < deadline,
-            "never quiesced over keys 0..{keys}: {r:?}, stack {}, pending {:?}",
-            s.fast_objects + s.slow_objects,
-            phys::pending_migrations(),
-        );
-
-        std::thread::sleep(Duration::from_micros(300));
-    }
+            (settled, r, (r, s.fast_objects + s.slow_objects))
+        },
+        |(r, tracked)| {
+            format!(
+                "never quiesced over keys 0..{keys}: {r:?}, stack {tracked}, pending {:?}",
+                phys::pending_migrations(),
+            )
+        },
+    )
+    .0
 }
 
 /// A step whose M moved.
