@@ -9,9 +9,6 @@ mod manager;
 mod policy;
 mod ttl;
 
-#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-mod tiering;
-
 use std::thread::{self, JoinHandle};
 use crossbeam_channel::{Sender, Receiver};
 
@@ -45,7 +42,6 @@ pub enum WorkerEvent {
 	/// its promotion. Only the client knows which copy it read, so it travels
 	/// with the event, in the byte the old `bool` took.
 	Get(HashedKey, Option<Tier>),
-	Promote(HashedKey),
 	/// `(key, base_size, dram_resident, expiry, previous (base_size, expiry),
 	/// built, mark)`
 	///
@@ -107,9 +103,8 @@ pub enum WorkerEvent {
 	/// which `PaperCache::wipe` waits: so a `Set` the worker handled before
 	/// the `Wipe` cannot leave a live key its stack no longer tracks, and the
 	/// merged store's worker-owned state (its link count, its latch, its
-	/// retired slots) has one writer. The TTL and tiering workers clear their
-	/// own state and ignore the sender. `None` from a test that sends the raw
-	/// event.
+	/// retired slots) has one writer. The TTL worker clears its own state and
+	/// ignores the sender. `None` from a test that sends the raw event.
 	///
 	/// Still `Clone` (each subscriber gets a clone of the sender), and still 40
 	/// bytes: a crossbeam `Sender` is 16, with a niche for the `None`.
@@ -193,7 +188,6 @@ pub struct Events;
 
 impl Events {
 	pub const GET: EventMask = 1 << 0;
-	pub const PROMOTE: EventMask = 1 << 1;
 	pub const SET: EventMask = 1 << 2;
 	pub const DEL: EventMask = 1 << 3;
 	pub const EXPIRE: EventMask = 1 << 12;
@@ -208,11 +202,9 @@ impl Events {
 	pub const AUDIT: EventMask = 1 << 13;
 	pub const MAKE_ROOM: EventMask = 1 << 14;
 
-	/// `PolicyWorker`. Note the two omissions: `Promote` is delivered to the
-	/// tiering worker directly through `PolicyWorker`'s own `promotion_tx`,
-	/// never routed back through the manager, and `Ttl` has no arm in the
-	/// policy loop (an expiry change doesn't reorder or resize anything the
-	/// policy stack tracks).
+	/// `PolicyWorker`. Note the omission: `Ttl` has no arm in the policy loop
+	/// (an expiry change doesn't reorder or resize anything the policy stack
+	/// tracks).
 	pub const POLICY_WORKER: EventMask = Self::GET
 		| Self::SET
 		| Self::DEL
@@ -236,18 +228,6 @@ impl Events {
 		| Self::TTL
 		| Self::WIPE
 		| Self::SHUTDOWN;
-
-	/// `TieringWorker` (`enable_tiering_manager`). Unlike the policy worker
-	/// this one *does* consume `Get` -- hotness counting is its whole job --
-	/// and `Promote`, which `PolicyWorker` forwards to it on a ghost hit.
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	pub const TIERING_WORKER: EventMask = Self::GET
-		| Self::PROMOTE
-		| Self::SET
-		| Self::DEL
-		| Self::WIPE
-		| Self::RESIZE
-		| Self::SHUTDOWN;
 }
 
 impl WorkerEvent {
@@ -257,7 +237,6 @@ impl WorkerEvent {
 	pub const fn mask_bit(&self) -> EventMask {
 		match self {
 			WorkerEvent::Get(..) => Events::GET,
-			WorkerEvent::Promote(..) => Events::PROMOTE,
 			WorkerEvent::Set(..) => Events::SET,
 			WorkerEvent::Del(..) => Events::DEL,
 			WorkerEvent::Expire(..) => Events::EXPIRE,
@@ -301,9 +280,6 @@ pub use crate::worker::{
 	policy::PolicyWorker,
 	ttl::TtlWorker,
 };
-
-#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-pub use crate::worker::tiering::TieringWorker;
 
 // Flattens `worker::policy::Tier` (itself a re-export of the private
 // `policy_stack` submodule's `Tier`, see `worker/policy/mod.rs`) so `lib.rs`

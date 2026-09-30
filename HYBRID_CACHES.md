@@ -27,8 +27,7 @@ pub enum TieredBuffer {
 ```
 
 A live object's bytes exist in **exactly one** tier. Promotion and demotion replace the
-`TieredBuffer` in place (`Object::set_data`), so a migration is a byte *move*. Contrast
-`src/tiering/`, the legacy manager, which deliberately keeps a copy in both tiers at once.
+`TieredBuffer` in place (`Object::set_data`), so a migration is a byte *move*.
 
 All 24 share one implementation. There are exactly two inherent
 `impl<K, S> PaperCache<K, TieredBuffer, S>` blocks — the shared engine, and a second carrying the

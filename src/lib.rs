@@ -6,7 +6,7 @@
  * correct
  */
 
-#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "tiering_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "merged_object_store", feature = "hybrid_cache_common"), feature(allocator_api), feature(clone_from_ref), feature(btreemap_alloc))]
+#![cfg_attr(any(feature = "hashbrown_dram", feature = "all_dram", feature = "key_value_pmem", feature = "global_hashtable_pmem", feature = "eviction_stacks_pmem", feature = "merged_object_store", feature = "hybrid_cache_common"), feature(allocator_api), feature(clone_from_ref), feature(btreemap_alloc))]
 
 
 // Validate that hashbrown_dram is not enabled with other global hashtable features
@@ -43,7 +43,6 @@ pub mod numa_alloc;
     feature = "key_value_pmem",
     feature = "key_pmem_value_pmem",
     feature = "global_hashtable_pmem",
-    feature = "tiering_hashtable_pmem",
     feature = "eviction_stacks_pmem",
     feature = "segregated_value_arena",
 ))]
@@ -209,9 +208,6 @@ pub use crate::hybrid_stats::HybridStats;
 #[cfg(feature = "hybrid_cache_common")]
 pub mod phys;
 
-#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-pub mod tiering;
-
 // Re-exported so `PaperCache::tier_of`'s return type is nameable by callers
 // without reaching into the private `worker` module tree directly.
 //
@@ -292,9 +288,6 @@ pub use crate::{
 	error::CacheError,
 	policy::PaperPolicy,
 };
-
-#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-pub use crate::tiering::{TieringManager, TieringConfig, TieringStats};
 
 pub type CacheSize = u64;
 pub type AtomicCacheSize = AtomicU64;
@@ -464,7 +457,7 @@ pub struct PaperCache<K, V, S = RandomState> {
 	/// a thread of its own.
 	workers: Arc<WorkerFanout>,
 	/// Join handles for every background thread spawned on this cache's
-	/// behalf (`PolicyWorker`/`TtlWorker`/`TieringWorker` -- `PolicyWorker`'s
+	/// behalf (`PolicyWorker`/`TtlWorker` -- `PolicyWorker`'s
 	/// own `TraceWorker` child, when it has one, is joined internally by
 	/// `PolicyWorker` itself, see its `Shutdown` handling, so it never
 	/// appears here). `Drop` sends `WorkerEvent::Shutdown` through `workers`
@@ -479,9 +472,6 @@ pub struct PaperCache<K, V, S = RandomState> {
 	/// allocations, racing that pool's own teardown.
 	worker_handles: WorkerHandles,
 	overhead_manager: OverheadManagerRef,
-
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	tiering_manager: Arc<TieringManager<K, V>>,
 
 	hasher: S,
 }
@@ -598,9 +588,7 @@ impl<K, V, S> Drop for PaperCache<K, V, S> {
 // and `key_value_pmem` without `global_hashtable_pmem` (V = BufferPMEM) --
 // see `ObjectMapRef`'s DashMap arm above. One generic-over-`V: ValueBuffer`
 // block replaces what used to be two nearly-identical impl blocks (one per
-// concrete V); the value-buffer axis and the tiering-manager machinery
-// below (V-agnostic: `TieringManager<K, V>` is itself generic) are the only
-// things that used to force separate blocks.
+// concrete V).
 //
 // Excludes `hashbrown_dram` (in addition to `global_hashtable_pmem`) to
 // stay disjoint from Shape B below, mirroring `ObjectMapRef`'s own DashMap
@@ -747,23 +735,6 @@ where
 			status.register_flat_fast_cache();
 		}
 
-		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-		let tiering_manager = {
-			// Create tiering manager with default DRAM threshold at 20% of max_size
-			let mut tiering_config = tiering::TieringConfig::default();
-			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
-			Arc::new(TieringManager::new(tiering_config))
-		};
-
-		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-		let (worker_fanout, worker_handles) = WorkerFanout::new(
-			&objects,
-			&status,
-			&overhead_manager,
-			&tiering_manager,
-		)?;
-
-		#[cfg(not(all(feature = "key_value_pmem", feature = "enable_tiering_manager")))]
 		let (worker_fanout, worker_handles) = WorkerFanout::new(
 			&objects,
 			&status,
@@ -777,9 +748,6 @@ where
 			workers: Arc::new(worker_fanout),
 			worker_handles,
 			overhead_manager,
-
-			#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-			tiering_manager,
 
 			hasher,
 		};
@@ -858,30 +826,6 @@ where
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
 
-		// Check the DRAM tier first (only ever wired up together with the
-		// `key_value_pmem` copy-based tiering manager -- see `src/tiering/`).
-		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", not(feature = "hashtable_tiering")))]
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				// Served from the manager's DRAM side-copy.
-				self.broadcast(WorkerEvent::Get(hashed_key, Some(Tier::Fast)))?;
-				let arc_val = dram_object_ref.data();
-				return Ok(arc_val.as_ref().to_vec());
-			}
-		}
-
-		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager", feature = "hashtable_tiering"))]
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				// Served from the manager's DRAM side-copy.
-				self.broadcast(WorkerEvent::Get(hashed_key, Some(Tier::Fast)))?;
-				// Use data_as_bytes to handle both PhysicalCopy and CxlReference
-				return Ok(dram_object_ref.data_as_bytes());
-			}
-		}
-
 		// Take the value handle under the shard guard, release the guard, and
 		// only then copy. The handle owns a strong reference, so a writer that
 		// unpublishes this value while the copy is in flight decrements a count
@@ -925,7 +869,6 @@ where
 	/// Comparing two cache designs through `get()` therefore compares their
 	/// allocator behaviour as much as their cache behaviour; this method exists
 	/// to measure them apart. See the `segregated_value_arena` feature.
-	#[cfg(not(feature = "enable_tiering_manager"))]
 	pub fn get_into(&self, key: &K, out: &mut Vec<u8>) -> Result<(), CacheError> {
 		// Sampled step profiler -- see the GI_* statics at the bottom of this
 		// file. One call in 64; hits only, matching what GET latency measures.
@@ -1416,36 +1359,6 @@ where
 		Ok(())
 	}
 
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	/// Gets tiering statistics including objects in DRAM, promotions, and demotions.
-	pub fn tiering_stats(&self) -> tiering::TieringStats {
-		self.tiering_manager.stats()
-	}
-
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	/// Sets the DRAM tier threshold in bytes.
-	pub fn set_dram_threshold(&self, threshold: u64) {
-		self.tiering_manager.set_dram_threshold(threshold);
-	}
-
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	/// Gets the current DRAM tier threshold in bytes.
-	pub fn dram_threshold(&self) -> u64 {
-		self.tiering_manager.dram_threshold()
-	}
-
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	/// Sets the hotness threshold for promotion to DRAM.
-	pub fn set_hotness_threshold(&self, threshold: u64) {
-		self.tiering_manager.set_hotness_threshold(threshold);
-	}
-
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	/// Gets the current hotness threshold.
-	pub fn hotness_threshold(&self) -> u64 {
-		self.tiering_manager.hotness_threshold()
-	}
-
 	fn broadcast(&self, event: WorkerEvent) -> Result<(), CacheError> {
 		self.workers.send(event)
 	}
@@ -1463,11 +1376,6 @@ where
 // A = Hybrid) -- see `ObjectMapRef`'s two RwLock arms above. One
 // generic-over-`V: ValueBuffer` block replaces what used to be three
 // nearly-identical impl blocks.
-//
-// Unlike Shape A, this shape's tiering-manager support is limited to the
-// plain `enable_tiering_manager` DRAM-side-cache check in `get()` -- there
-// is no `tiering_stats`/`set_dram_threshold`/etc. accessors here, matching
-// this shape's pre-merge behavior exactly (only Shape A ever had those).
 // ---------------------------------------------------------------------
 #[cfg(any(feature = "global_hashtable_pmem", feature = "hashbrown_dram"))]
 impl<K, V, S> PaperCache<K, V, S>
@@ -1563,23 +1471,6 @@ where
 			status.register_flat_fast_cache();
 		}
 
-		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-		let tiering_manager = {
-			// Create tiering manager with default DRAM threshold at 20% of max_size
-			let mut tiering_config = tiering::TieringConfig::default();
-			tiering_config.dram_threshold = (max_size as f64 * 0.2) as u64;
-			Arc::new(TieringManager::new(tiering_config))
-		};
-
-		#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-		let (worker_fanout, worker_handles) = WorkerFanout::new(
-			&objects,
-			&status,
-			&overhead_manager,
-			&tiering_manager,
-		)?;
-
-		#[cfg(not(all(feature = "key_value_pmem", feature = "enable_tiering_manager")))]
 		let (worker_fanout, worker_handles) = WorkerFanout::new(
 			&objects,
 			&status,
@@ -1592,9 +1483,6 @@ where
 			workers: Arc::new(worker_fanout),
 			worker_handles,
 			overhead_manager,
-
-			#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-			tiering_manager,
 
 			hasher,
 		};
@@ -1623,17 +1511,6 @@ where
 	/// If the key was not found in the cache, returns a [`CacheError`].
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
 		let hashed_key = self.hash_key(key);
-
-		#[cfg(feature = "enable_tiering_manager")]
-		if let Some(dram_object_ref) = self.tiering_manager.get_from_dram(&hashed_key) {
-			if !dram_object_ref.is_expired() && dram_object_ref.key_matches(key) {
-				self.status.incr_hits();
-				// Served from the manager's DRAM side-copy.
-				self.broadcast(WorkerEvent::Get(hashed_key, Some(Tier::Fast)))?;
-				let arc_val = dram_object_ref.data();
-				return Ok(arc_val.as_ref().to_vec());
-			}
-		}
 
 		// Take the value handle under the shard guard, release the guard, and
 		// only then copy. The handle owns a strong reference, so a writer that
@@ -2674,7 +2551,6 @@ where
 	/// Comparing two cache designs through `get()` therefore compares their
 	/// allocator behaviour as much as their cache behaviour; this method exists
 	/// to measure them apart. See the `segregated_value_arena` feature.
-	#[cfg(not(feature = "enable_tiering_manager"))]
 	pub fn get_into(&self, key: &K, out: &mut Vec<u8>) -> Result<(), CacheError> {
 		// Sampled step profiler -- see the GI_* statics at the bottom of this
 		// file. One call in 64; hits only, matching what GET latency measures.

@@ -330,20 +330,6 @@ has been dropped.
 Design rationale generally lives in module doc comments rather than in these files — the policy
 stacks in `src/worker/policy/policy_stack/` each carry their algorithm's derivation at the top.
 
-## Legacy: the copy-based tiering manager
-
-`src/tiering/` implements an older, unrelated design, still reachable behind `tiering` /
-`multitiering` (or `enable_tiering_manager` together with `key_value_pmem` -- on its own that
-feature implies nothing and the module is not compiled at all). It is a *hotness-threshold, copy-based*
-scheme: PMEM is the permanent source of truth, and an object accessed at least
-`hotness_threshold` times gets a **second, physical copy** placed in a DRAM side-cache, kept
-consistent on write and dropped on demotion. Under `hashtable_tiering` it adds a third,
-zero-copy "warm" state holding a CXL reference instead of a copy.
-
-This is the opposite data-movement model from the hybrid designs above, which keep exactly one
-copy and move it. The two are not interchangeable, and the hybrid designs do not use any of
-this module. It is documented here only so the feature flags are not mysterious.
-
 ## License
 
 AGPL-3.0. See `LICENSE`.

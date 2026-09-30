@@ -96,12 +96,6 @@ key_pmem_value_pmem = ["key_value_pmem", "numa_jemalloc"]
 # All data structures in DRAM (no PMEM usage)
 all_dram = ["numa_jemalloc"]
 
-# Enable the tiering manager functionality
-enable_tiering_manager = []
-
-# Place tiering manager's hashtable in PMEM (requires enable_tiering_manager + key_value_pmem)
-tiering_hashtable_pmem = ["numa_jemalloc"]
-
 # Place global hashtable in PMEM (requires key_value_pmem)
 global_hashtable_pmem = ["numa_jemalloc"]
 
@@ -160,33 +154,6 @@ eviction_stacks_pmem = ["numa_jemalloc"]
 # put it back in DRAM -- to A/B the placement, or if `TtlWorker` falls behind
 # on a set-heavy workload (every Set/Del/Ttl event is an insert or remove).
 ttl_index_dram = []
-
-#to emnable 3 tier based data movement
-hashtable_tiering = []
-
-
-
-# Tiering with both key and value in PMEM.
-# Activates the tiering manager (hot objects are copied to DRAM for fast access)
-# while placing *both* the key and the value in persistent memory via the Hybrid
-# allocator.  Objects are therefore either:
-#   • PMEM-only   – cold objects live exclusively in persistent memory, or
-#   • PMEM + DRAM – hot objects have their primary copy in PMEM and a fast DRAM
-#                   read-cache copy that is kept consistent by the tiering manager.
-# This is equivalent to enabling `key_pmem_value_pmem` + `enable_tiering_manager`
-# together.
-tiering = ["key_pmem_value_pmem", "enable_tiering_manager"]
-
-# Multi-tier data movement with both key and value in PMEM.
-# Extends the `tiering` feature with a three-tier promotion hierarchy:
-#   • PMEM-only      – cold objects live exclusively in persistent memory,
-#   • Warm (pointer) – a metadata/pointer record is kept in DRAM while data
-#                      stays in CXL/PMEM (zero-copy promotion), or
-#   • Hot (copy)     – a full physical copy of the object resides in DRAM for
-#                      the fastest possible read latency.
-# Combines `key_pmem_value_pmem` + `enable_tiering_manager` + `hashtable_tiering`
-# and uses the warm_threshold / hot_threshold knobs from TieringConfig.
-multitiering = ["key_pmem_value_pmem", "enable_tiering_manager", "hashtable_tiering"]
 
 # ---------------------------------------------------------------------------
 # The 24 *_hybrid_cache features below are NOT mutually exclusive; any subset

@@ -194,9 +194,7 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 		self.fast_capacity
 	}
 
-	/// Exposed for the fidelity tests: flat signals ghost membership through
-	/// `record_access`'s `GhostHit`, which this stack deliberately does not
-	/// override (see the module doc on `record_access` in the risks).
+	/// Exposed for the fidelity tests.
 	pub fn is_ghost(&self, key: HashedKey) -> bool {
 		self.ghost.contains(key)
 	}
@@ -741,9 +739,6 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> PolicyStack
 	}
 
 
-	/// Deliberately NOT overriding `record_access`: returning `GhostHit` would
-	/// reach a `debug_assert!(promotion_tx.is_some())` that these designs do
-	/// not satisfy -- a debug panic and a silent drop in release.
 	fn update(&mut self, key: HashedKey) {
 		if self.queues.contains(key) {
 			self.bump_freq(key);

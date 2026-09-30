@@ -32,7 +32,8 @@ Two hard requirements shaped every design decision below:
    time. Promotion/demotion physically reallocate the object; nothing is ever copied into both
    tiers simultaneously.
 
-This is a deliberate departure from the two other tiering mechanisms already in this crate:
+This is a deliberate departure from the two other tiering mechanisms this crate had when it was
+written (both since removed: `hybridcache` earlier, the `tiering/` manager in R1):
 
 - `hybridcache` (`S3FifoHybridCache`) gets its "two tiers" by composing **two independent**
   `PaperCache` instances (one `BufferDRAM`, one `BufferPMEM`), glued together with channels and
@@ -281,7 +282,7 @@ The natural-looking design — a dedicated `Arc<AtomicLruHybridStats>` field on 
 `hybridcache`'s `S3FifoHybridCache::stats: Arc<AtomicHybridStats>` — turned out to be wrong for this
 feature specifically, because `PaperCache<K, V, S>`'s struct definition is **one shared definition**
 used by every value type in the crate, and its literal is duplicated across roughly ten
-constructors throughout `lib.rs` (the same reason the existing `tiering_manager` field is
+constructors throughout `lib.rs` (the same reason the legacy tiering manager's field, since removed, was
 `#[cfg(...)]`-gated rather than added unconditionally). Adding a new field there would force every
 other constructor — none of which know or care about `TieredBuffer` — to also learn how to
 initialize it.
@@ -378,6 +379,8 @@ tests/
 ```
 
 ## How this differs from `hybridcache` and `tiering/`, concretely
+
+(Both have since been removed from the crate; the comparison is kept as this design's rationale.)
 
 | | `tiering/` (`enable_tiering_manager`) | `hybridcache` (`S3FifoHybridCache`) | `lru_hybrid_cache` |
 |---|---|---|---|

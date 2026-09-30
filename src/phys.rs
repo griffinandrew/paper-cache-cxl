@@ -93,20 +93,14 @@
 //! zero-length fast value is live, and trails it by 8 per one otherwise
 //! (split layout only: a thin or fused item is never zero-sized).
 //!
-//! ## Clones, and `enable_tiering_manager`
+//! ## Clones
 //!
 //! A `TieredValue` clone is a refcount bump in all three layouts (`Arc` in
 //! the split and thin layouts, the item's own count under fusing): it
 //! allocates nothing and charges nothing, and the allocation it keeps alive
 //! stays charged until the LAST handle drops, which is when it leaves the
 //! pool. So every path that clones an `Object` -- a reader's snapshot, a
-//! migration's snapshot, `Object::clone` -- is exact by construction. The
-//! legacy copy-based manager needs no `cfg` exclusion for the same reason,
-//! and two more: the hybrid constructors never build one (only the flat impl
-//! blocks do), and its DRAM side-copy is a plain `Box<[u8]>` from the global
-//! allocator, not a `TieredValue`, so it is neither charged nor refunded.
-//! That copy is DRAM outside the value pool, like the object map, and is
-//! not what P measures.
+//! migration's snapshot, `Object::clone` -- is exact by construction.
 //!
 //! ## Process-global
 //!
@@ -1182,15 +1176,13 @@ mod tests {
 		cache.get(&16).expect("a hit");
 		cache.get(&1).expect("a hit");
 
-		#[cfg(not(feature = "enable_tiering_manager"))]
 		cache.get_into(&1, &mut Vec::new()).expect("a hit");
 
 		cache.peek(&1).expect("a peek");
 		cache.peek(&16).expect("a peek");
 		assert!(cache.get(&999).is_err());
 
-		let slow = if cfg!(feature = "enable_tiering_manager") { 1 } else { 2 };
 		let stats = cache.hybrid_stats();
-		assert_eq!((stats.fast_hits, stats.slow_hits), (1, slow));
+		assert_eq!((stats.fast_hits, stats.slow_hits), (1, 2));
 	}
 }

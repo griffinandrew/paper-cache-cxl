@@ -1539,14 +1539,13 @@ use crate::{
 	worker::{
 		Worker,
 		WorkerEvent,
-		WorkerSender,
 		WorkerReceiver,
 		register_worker,
 		policy::{
 			mini_stack::MiniStackManager,
 			event::{StackEvent, TraceEvent},
 			trace::{TraceWorker, TraceFragment},
-			policy_stack::{AccessOutcome, PolicyStack, init_policy_stack},
+			policy_stack::{PolicyStack, init_policy_stack},
 		},
 	},
 };
@@ -1910,8 +1909,6 @@ pub struct PolicyWorker<K, V> {
 
 	last_auto_policy_time: Option<Instant>,
 	last_set_time: Option<Instant>,
-
-	promotion_tx: Option<WorkerSender>,
 
 	/// Reallocates a value into the target tier's representation (e.g.
 	/// `TieredBuffer::new_fast`/`new_slow`). Used by the hybrid designs
@@ -2382,7 +2379,6 @@ where
 		objects: ObjectMapRef<K, V>,
 		status: StatusRef,
 		overhead_manager: OverheadManagerRef,
-		promotion_tx: Option<WorkerSender>,
 	) -> Result<Self, CacheError> {
 		// The first worker built in the process fixes the `t_ms` origin.
 		migstats::mark_origin();
@@ -2446,8 +2442,6 @@ where
 
 			last_auto_policy_time: None,
 			last_set_time: None,
-
-			promotion_tx,
 
 			#[cfg(feature = "hybrid_cache_common")]
 			#[cfg(feature = "hybrid_cache_common")]
@@ -2595,12 +2589,6 @@ where
 			last_auto_policy_time: None,
 			last_set_time: None,
 
-			// None of `LruCompactHybridStack`, `LfuCompactHybridStack`, or
-			// `TwoQCompactHybridStack` ever emits
-			// `AccessOutcome::GhostHit`, so no ghost-hit-driven promotion
-			// channel is needed for any of them.
-			promotion_tx: None,
-
 			tier_migration: true,
 
 			#[cfg(feature = "hybrid_cache_common")]
@@ -2644,12 +2632,7 @@ where
 	/// `served` is the tier a hit's value was served from, `None` on a miss.
 	fn handle_get(&mut self, key: HashedKey, served: Option<Tier>) {
 		if let Some(stack) = &mut self.policy_stack {
-			if let AccessOutcome::GhostHit = stack.record_access(key, served.is_some()) {
-				debug_assert!(self.promotion_tx.is_some(), "promotion channel must exist for ghost hits");
-				if let Some(tx) = &self.promotion_tx {
-					let _ = tx.try_send(WorkerEvent::Promote(key));
-				}
-			}
+			stack.record_access(key, served.is_some());
 		}
 
 		// An LFU slow hit settles, and a settle can latch.
@@ -6087,7 +6070,6 @@ mod policy_worker_kick_tests {
 			objects,
 			status.clone(),
 			overhead_manager,
-			None,
 		).unwrap();
 
 		(tx, status, register_worker(worker))
@@ -6304,7 +6286,6 @@ mod capacity_watermark_tests {
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
-			None,
 		).unwrap();
 
 		(worker, objects, status, overhead_manager)

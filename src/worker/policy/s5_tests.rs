@@ -1029,7 +1029,7 @@ fn make_room_goes_to_the_policy_worker_only() {
 	assert_eq!(Events::TTL_WORKER & bit, 0, "the TTL worker does not");
 
 	for other in [
-		Events::GET, Events::PROMOTE, Events::SET, Events::DEL, Events::EXPIRE, Events::TTL, Events::WIPE,
+		Events::GET, Events::SET, Events::DEL, Events::EXPIRE, Events::TTL, Events::WIPE,
 		Events::RESIZE, Events::RESIZE_FAST_TIER, Events::RESIZE_LARGE_FAST_TIER, Events::RESIZE_SIZE_THRESHOLD,
 		Events::POLICY, Events::SHUTDOWN, Events::AUDIT,
 	] {

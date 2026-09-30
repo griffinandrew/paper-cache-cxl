@@ -1835,7 +1835,7 @@ mod t14 {
 
 			let mut worker = match tiered {
 				true => PolicyWorker::new_with_tier_migration(rx, objects.clone(), status, overhead_manager).unwrap(),
-				false => PolicyWorker::new(rx, objects.clone(), status, overhead_manager, None).unwrap(),
+				false => PolicyWorker::new(rx, objects.clone(), status, overhead_manager).unwrap(),
 			};
 
 			worker.migration_queue = None;

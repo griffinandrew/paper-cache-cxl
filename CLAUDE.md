@@ -150,11 +150,6 @@ src/
                                <Design>HybridStats = HybridStats. No marker type, no impl block,
                                no distinct stats struct. NOTE their module doc comments still
                                describe the pre-unification per-design architecture.
-  tiering/                    LEGACY copy-based tiering manager (enable_tiering_manager /
-                               tiering / multitiering). Keeps a *second* physical copy of hot
-                               objects in a DRAM side-cache — the opposite data-movement model
-                               from the hybrid designs, which keep one copy and move it. The
-                               hybrid designs do not use any of this.
 
   worker/                     Background-thread machinery. All mutation of eviction state lives
                                here so the hot get()/set() path stays lock-cheap.
@@ -229,12 +224,10 @@ src/
                                  one policy is configured — never for a hybrid cache, which has
                                  exactly one, so no switch is reachable.
     ttl/                        TtlWorker — background expiry sweep.
-    tiering.rs                  TieringWorker — bridges WorkerEvent to the legacy TieringManager.
 
 tests/
   <design>_hybrid_cache_integration.rs   One per hybrid design (18), each gated on its own
                                          feature. Some carry #[ignore]d at-scale reproductions.
-  tiering_integration.rs                 The legacy copy-based manager.
   phys_fast_identity.rs                  PHYS_FAST == the stacks' fast_used at quiescence, and
                                          back to its start once the cache drops: LRU, FIFO,
                                          CLOCK and LFU in every unit build, and one test per
@@ -278,18 +271,15 @@ Nearly everything is gated by Cargo features, because the point of the branch is
 placement strategies. Current state:
 
 - `numa_jemalloc` — node-bound jemalloc arenas (`src/numa_alloc.rs`). Pulled in by every feature
-  below except `enable_tiering_manager` and `hashtable_tiering`, whose dependency lists are
-  empty. It does not gate the arenas themselves: `pub mod numa_alloc` and the
+  below. It does not gate the arenas themselves: `pub mod numa_alloc` and the
   `#[global_allocator]` are unconditional; `Hybrid` exists only under one of the
   PMEM features (`cfg(any(key_value_pmem, key_pmem_value_pmem, global_hashtable_pmem,
-  tiering_hashtable_pmem, eviction_stacks_pmem))`) — notably *not* under `all_dram` alone, or
-  under the empty default feature set.
+  eviction_stacks_pmem))`) — notably *not* under `all_dram` alone, or under the empty default
+  feature set.
 - `key_value_pmem` / `key_pmem_value_pmem` — value (or key+value) bytes in PMEM via `Hybrid`.
 - `all_dram` — force every allocation to DRAM.
 - `eviction_stacks_pmem` — move the eviction stacks' own bookkeeping into PMEM.
-- `global_hashtable_pmem`, `tiering_hashtable_pmem`, `hashbrown_dram` — hashtable placement.
-- `enable_tiering_manager`, `tiering`, `multitiering`, `hashtable_tiering` — the legacy
-  copy-based tiering manager (`src/tiering/`).
+- `global_hashtable_pmem`, `hashbrown_dram` — hashtable placement.
 - **The 18 `*_hybrid_cache` features** — each implies `key_value_pmem` and
   `hybrid_cache_common`. They are **not** mutually exclusive: none defines an impl block, so any
   subset may be enabled. What a feature still does: ungates its `<design>_hybrid_cache` shim
@@ -305,8 +295,10 @@ types; `TieredBuffer` is the tagged union of them that the hybrid designs actual
 
 **Features that no longer exist**, but are still named in the log below: `hybridcache` (the
 original two-PaperCache-instance S3-FIFO composition), `sets_dram`, `pmem_region_alloc`,
-`region_hybrid_allocator`, `devdax_bump`, `global_flatmap_dram`/`global_flatmap_pmem`. See the
-removal entries near the end of this file.
+`region_hybrid_allocator`, `devdax_bump`, `global_flatmap_dram`/`global_flatmap_pmem`, and the
+legacy copy-based tiering manager's `enable_tiering_manager`, `tiering`, `multitiering`,
+`hashtable_tiering` and `tiering_hashtable_pmem` (`src/tiering/`, removed in R1). See the removal
+entries near the end of this file.
 
 ## Merged-store measurements until S5 (read before benchmarking it)
 
@@ -3239,3 +3231,19 @@ misconfiguration.
 - **The traces that would actually test this design have not been run.** `cluster12` (526 GiB
   reachable WSS, 29.2% GET reuse) is the discriminating case; `cluster31` cannot evaluate it at all
   (zero GET reuse, 100% compulsory miss floor).
+
+## Removed the legacy copy-based tiering manager (R1)
+
+On the user's request ("the old multi tiering and original tiering builds should be removed ...
+that functionality is no longer needed"): the `enable_tiering_manager`, `tiering`, `multitiering`,
+`hashtable_tiering` and `tiering_hashtable_pmem` features, `src/tiering/` (`TieringManager`,
+`TieringConfig`, `TieringStats`, `TieringObject`), `src/worker/tiering.rs` (`TieringWorker`) and
+`tests/tiering_integration.rs`. The manager kept a second, DRAM copy of hot objects beside the
+PMEM primary -- the opposite of the hybrid designs, which keep one copy and move it -- and no hybrid
+design, benchmark or server build enabled it. With it went every cfg site of those features (the
+flat constructors' manager, the DRAM side-copy `get` path, the five accessors, the worker's event
+mask), `WorkerEvent::Promote` and the policy worker's `promotion_tx` (the manager's worker was the
+only consumer), and the `AccessOutcome` a stack's `record_access` returned so that a flat S3-FIFO
+ghost hit could be forwarded to that worker. `get_into` is no longer gated on the manager's
+absence. The compile checks of the feature (`key_value_pmem,enable_tiering_manager` and
+`all_dram,enable_tiering_manager`) became the same builds without it.

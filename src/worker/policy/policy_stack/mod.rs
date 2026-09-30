@@ -129,13 +129,6 @@ use crate::{
 	},
 };
 
-/// Outcome of a policy stack access that may carry extra routing signals.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AccessOutcome {
-	None,
-	GhostHit,
-}
-
 /// The level the fast tier is continuously held at, as a fraction of its
 /// effective budget.
 ///
@@ -481,12 +474,10 @@ where
 	fn resettle(&mut self) {}
 
 	fn update(&mut self, _key: HashedKey) {}
-	fn record_access(&mut self, key: HashedKey, hit: bool) -> AccessOutcome {
+	fn record_access(&mut self, key: HashedKey, hit: bool) {
 		if hit {
 			self.update(key);
 		}
-
-		AccessOutcome::None
 	}
 	fn remove(&mut self, key: HashedKey);
 

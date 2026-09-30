@@ -28,7 +28,6 @@ use crate::{
 };
 
 use super::{
-	AccessOutcome,
 	PolicyStack,
 	compact_queue_set::CompactQueueSet,
 };
@@ -247,23 +246,6 @@ impl PolicyStack for SThreeFifoCompactStack {
 		} else {
 			self.insert_into(Queue::Small, key, size, 0);
 		}
-	}
-
-	fn record_access(&mut self, key: HashedKey, hit: bool) -> AccessOutcome {
-		if hit {
-			self.update(key);
-			return AccessOutcome::None;
-		}
-
-		if self.queues.contains(key) {
-			return AccessOutcome::None;
-		}
-
-		if self.ghost.contains(key) {
-			return AccessOutcome::GhostHit;
-		}
-
-		AccessOutcome::None
 	}
 
 	/// S3-FIFO never re-orders on a hit; it only bumps the saturating

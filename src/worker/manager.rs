@@ -26,15 +26,6 @@ use crate::{
 	},
 };
 
-#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-use crate::{
-	tiering::TieringManager,
-	worker::TieringWorker,
-};
-
 /// Routes each `WorkerEvent` to the background workers that consume it.
 ///
 /// This used to be a background thread of its own: `PaperCache` pushed every
@@ -154,57 +145,6 @@ impl WorkerFanout {
 		Ok(())
 	}
 
-	#[cfg(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))]
-	pub fn new<K, V>(
-		objects: &ObjectMapRef<K, V>,
-		status: &StatusRef,
-		overhead_manager: &OverheadManagerRef,
-		tiering_manager: &Arc<TieringManager<K, V>>,
-	) -> Result<(Self, WorkerHandles), CacheError>
-	where
-		K: 'static + Eq + TypeSize + Clone + Send + Sync,
-		V: 'static + Send + Sync,
-	{
-		let (policy_worker, policy_listener) = unbounded();
-		let (ttl_worker, ttl_listener) = unbounded();
-		let (tiering_worker, tiering_listener) = unbounded();
-
-		let mut handles: WorkerHandles = Vec::new();
-
-		handles.push(register_worker(PolicyWorker::<K, V>::new(
-			policy_listener,
-			objects.clone(),
-			status.clone(),
-			overhead_manager.clone(),
-			Some(tiering_worker.clone()),
-		)?));
-
-		handles.push(register_worker(TtlWorker::<K, V>::new(
-			ttl_listener,
-			policy_worker.clone(),
-			objects.clone(),
-			status.clone(),
-			overhead_manager.clone(),
-		)));
-
-		handles.push(register_worker(TieringWorker::<K, V>::new(
-			tiering_listener,
-			objects.clone(),
-			status.clone(),
-			overhead_manager.clone(),
-			tiering_manager.clone(),
-		)));
-
-		let workers: Box<[(WorkerSender, EventMask)]> = Box::new([
-			(policy_worker, Events::POLICY_WORKER),
-			(ttl_worker, Events::TTL_WORKER),
-			(tiering_worker, Events::TIERING_WORKER),
-		]);
-
-		Ok((WorkerFanout { workers }, handles))
-	}
-
-	#[cfg(all(not(all(feature = "key_value_pmem", feature = "enable_tiering_manager"))))]
 	pub fn new<K, V>(
 		objects: &ObjectMapRef<K, V>,
 		status: &StatusRef,
@@ -224,7 +164,6 @@ impl WorkerFanout {
 			objects.clone(),
 			status.clone(),
 			overhead_manager.clone(),
-			None,
 		)?));
 
 		handles.push(register_worker(TtlWorker::<K, V>::new(
