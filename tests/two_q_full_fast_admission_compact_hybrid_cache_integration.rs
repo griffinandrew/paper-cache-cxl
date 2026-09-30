@@ -91,11 +91,14 @@ mod hybrid_cache_tests {
     // than nine, 24 sets aged only 12 keys out, and `set_and_age_out(24, 15)`
     // sat out its timeout waiting for a fifteenth that could never arrive.
     //
-    //   a1_in reservation   = K_IN  * MAX_SIZE = 614 bytes -> 9 residents
-    //                         (8 * 64 + 84 = 596 fits, 9 * 64 + 84 = 660 does
-    //                         not), so 24 sets age exactly 15 keys out
+    //   a1_in reservation   = K_IN  * MAX_SIZE = 614 bytes, held at the DRAIN
+    //                         TARGET: 583 bytes at 0.95 (601 at the 0.98 it
+    //                         was until E1b, which held nine) -> 8 residents
+    //                         (7 * 64 + 72 = 520 fits, 8 * 64 + 72 = 584 does
+    //                         not, by one byte), so 24 sets age exactly 16
+    //                         keys out
     //   effective am fast   = FAST_TIER - 614  = 410 bytes -> 6 objects, well
-    //                         short of the 15 * 64 = 960 bytes those aged keys
+    //                         short of the 16 * 64 = 1_024 bytes those aged keys
     //                         carry back into `am` on promotion, which is what
     //                         makes the main queue shed its LRU tail
     //   a1_out budget       = K_OUT * MAX_SIZE = 4_096 bytes (roomy, so the
@@ -390,9 +393,13 @@ mod hybrid_cache_tests {
     fn eviction_prefers_a1_out_over_the_main_queue() {
         ensure_pmem_allocator_warm();
 
-        // a1_in reservation = 0.0002 × 1_048_576 = 200 bytes, which holds two
-        // 84-byte objects, so the THIRD set is the one that ages key 1 out —
-        // the original two-set fixture never overflowed a1_in at all. a1_out's
+        // a1_in reservation = 0.0002 × 1_048_576 = 209 bytes, held at its drain
+        // target: 198 bytes at 0.95. Two objects rest in it at 64 migrating
+        // bytes each, and the incoming third is measured in full, 72, so the
+        // THIRD set (128 + 72 = 200 > 198) is the one that ages key 1 out —
+        // the original two-set fixture never overflowed a1_in at all. (At the
+        // 0.98 target of 204 bytes the third set fitted, nothing aged, and this
+        // test failed on its first wait until E1b moved the target.) a1_out's
         // budget = 0.0005 × 1_048_576 = 500 bytes = 5 objects, so the churn
         // below overruns it repeatedly. The 524_288-byte fast tier leaves am
         // an effective 499_800, so nothing in `am` is ever under pressure:
@@ -480,17 +487,19 @@ mod hybrid_cache_tests {
         // to age out of `a1_in` first and take the hit in `a1_out`.
         //
         // 24 sets against a 614-byte `a1_in` (K_IN * MAX_SIZE, 64 MIGRATING
-        // bytes per 64-byte object) keeps 9 resident and ages the other 15
-        // out. Charged at 84 bytes apiece — which is what the old 819-byte
-        // reservation was sized for — the same queue held twelve, only 12
-        // keys ever reached a1_out, and this wait timed out.
-        let aged = set_and_age_out(&cache, 24, 15);
+        // bytes per 64-byte object) held at its drain target, 583 bytes, keeps
+        // 8 resident and ages the other 16 out (it kept 9 and aged 15 at the
+        // 0.98 target of 601 bytes, until E1b). Charged at 84 bytes apiece —
+        // which is what the old 819-byte reservation was sized for — the same
+        // queue held twelve, only 12 keys ever reached a1_out, and this wait
+        // timed out.
+        let aged = set_and_age_out(&cache, 24, 16);
 
-        assert_eq!(aged.len(), 15, "sizing: 24 sets should age exactly 15 keys into a1_out");
+        assert_eq!(aged.len(), 16, "sizing: 24 sets should age exactly 16 keys into a1_out");
 
         let ageing_demotions = cache.hybrid_stats().demotions;
 
-        // 15 × 64 = 960 bytes of promoted objects against am's effective
+        // 16 × 64 = 1_024 bytes of promoted objects against am's effective
         // fast budget of FAST_TIER - K_IN * MAX_SIZE = 410: `am` has to shed
         // its LRU tail into PMEM. No further `set` happens after this point,
         // so every demotion past `ageing_demotions` came out of `am`.
@@ -501,7 +510,7 @@ mod hybrid_cache_tests {
                 cache.hybrid_stats().demotions > ageing_demotions
                     && aged.iter().any(|key| cache.tier_of(key) == Some(Tier::Slow))
             }),
-            "promoting 960 bytes into a 410-byte am fast budget must demote from am",
+            "promoting 1_024 bytes into a 410-byte am fast budget must demote from am",
         );
 
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -641,11 +650,11 @@ mod hybrid_cache_tests {
     fn set_fast_tier_size_takes_effect_at_runtime() {
         ensure_pmem_allocator_warm();
 
-        // `make_cache`'s queue sizing (a1_in = K_IN × MAX_SIZE = 614 bytes = 9
+        // `make_cache`'s queue sizing (a1_in = K_IN × MAX_SIZE = 614 bytes = 8
         // residents at 64 migrating bytes each; a1_out = 4_096 bytes, roomy)
         // but with a deliberately generous 4_096-byte fast tier: am's
-        // effective fast budget is 4_096 - 614 = 3_482, which holds all 15
-        // promotions (15 × 64 = 960) with room to spare. `am` therefore
+        // effective fast budget is 4_096 - 614 = 3_482, which holds all 16
+        // promotions (16 × 64 = 1_024) with room to spare. `am` therefore
         // demotes NOTHING until the fast tier itself is resized, so every
         // demotion after `before` is attributable to `set_fast_tier_size`
         // alone.
@@ -662,19 +671,19 @@ mod hybrid_cache_tests {
         // An a1_in hit is a no-op, so `get`ting a key twice right after
         // `set`ting it promotes nothing: `am` is reachable only by ageing into
         // a1_out and taking the hit there.
-        let aged = set_and_age_out(&cache, 24, 15);
+        let aged = set_and_age_out(&cache, 24, 16);
         promote_out_of_a1_out(&cache, &aged);
 
         assert!(
             wait_until(MIGRATION_TIMEOUT, || {
                 aged.iter().all(|key| cache.tier_of(key) == Some(Tier::Fast))
             }),
-            "a 3_482-byte am fast budget should hold all 15 promoted objects",
+            "a 3_482-byte am fast budget should hold all 16 promoted objects",
         );
 
         let before = cache.hybrid_stats().demotions;
 
-        // 1_200 - 614 = 586 bytes left for `am`, against 960 bytes resident.
+        // 1_200 - 614 = 586 bytes left for `am`, against 1_024 bytes resident.
         cache.set_fast_tier_size(CacheTierSize::Bytes(1_200))
             .expect("resize should succeed");
 
@@ -690,7 +699,7 @@ mod hybrid_cache_tests {
 
         let stats = cache.hybrid_stats();
 
-        // The new budget is actually respected — a1_in's 576 bytes plus what
+        // The new budget is actually respected — a1_in's 512 bytes plus what
         // is left of am's fast segment — rather than merely producing one
         // token migration.
         assert!(
@@ -731,7 +740,7 @@ mod hybrid_cache_tests {
         // reservation — 11 of these 84-byte objects — while the whole 2_000-
         // byte cache could not even hold 12 of them, so no key could ever age
         // into a1_out and `am` stayed empty through both resizes. `make_cache`
-        // is sized for exactly this: a1_in 614 bytes (9 objects at 64
+        // is sized for exactly this: a1_in 614 bytes (8 objects at 64
         // migrating bytes each), am's effective fast budget
         // FAST_TIER - 614 = 410 bytes.
         let cache = make_cache();
@@ -739,11 +748,11 @@ mod hybrid_cache_tests {
         // An a1_in hit is a complete no-op, so `am` has to be populated the
         // long way round — age out into a1_out, then hit it there — before a
         // resize can be seen to squeeze it.
-        let aged = set_and_age_out(&cache, 24, 15);
+        let aged = set_and_age_out(&cache, 24, 16);
         promote_out_of_a1_out(&cache, &aged);
 
         // Keys that never aged out were never promoted either, so they are
-        // exactly a1_in's 9 residents: 9 × 64 = 576 migrating bytes against
+        // exactly a1_in's 8 residents: 8 × 64 = 512 migrating bytes against
         // the 614-byte reservation.
         let a1_in_residents: Vec<u32> = (1..=24u32).filter(|key| !aged.contains(key)).collect();
 
@@ -787,7 +796,7 @@ mod hybrid_cache_tests {
         //    deleted between the call and the assertion.
         let before_shrink = cache.hybrid_stats().demotions;
 
-        // K_IN × 10_240 = 307 bytes of a1_in against 576 bytes resident, so
+        // K_IN × 10_240 = 307 bytes of a1_in against 512 bytes resident, so
         // a1_in's tail must drain into a1_out unprompted.
         cache.resize(10_240).expect("resize should succeed");
 
@@ -827,8 +836,8 @@ mod hybrid_cache_tests {
 
         let cache = make_cache();
 
-        // `a1_in` holds 9 of these (see the sizing block), so the 10th set is
-        // the first to demote and 12 sets leave three keys in a1_out. Against
+        // `a1_in` holds 8 of these (see the sizing block), so the 9th set is
+        // the first to demote and 12 sets leave four keys in a1_out. Against
         // the old 819-byte reservation a1_in held twelve of them, so these
         // same 12 sets demoted NOTHING and this wait timed out.
         for key in 1..=12u32 {

@@ -232,7 +232,7 @@ fn t8_a_promotion_its_own_settle_undoes_queues_only_the_settles_entry() {
 
 	// The tier whose eff is exactly one value's charge with what the stack
 	// tracks now: the value fits the empty tier, and is over its settle
-	// target (0.98 of eff).
+	// target (0.95 of eff).
 	let exact = |worker: &mut Worker| {
 		let reserved = stack(worker).dram_reserved_bytes();
 		resize_fast(worker, charge(LEN) + reserved);
@@ -1606,10 +1606,11 @@ fn a_concurrent_workload_leaves_every_charge_exact_at_quiescence() {
 ///
 /// With `PAPER_T14_DIR` set, each test writes `<dir>/<name>.txt` and prints its
 /// hash; the bp-s4 runner diffs the D, M and H files (and TD, TM, TH). The
-/// LFU script opens with 35 sets built so that the 35th admission's MIGRATING
+/// LFU script opens with 26 sets built so that the 26th admission's MIGRATING
 /// bytes fit the gate and its BASE size does not -- the case where the merged
-/// store's gate used to add the other one (S5: at the gate's settle target;
-/// the other orders keep the 32-set prefix their files were recorded with).
+/// store's gate used to add the other one (S5: at the gate's settle target,
+/// which is why the prefix moved when the drain target did; the other orders
+/// keep the 32-set prefix their files were recorded with).
 ///
 /// Since S5 each set goes through the client's admission decision
 /// (`gate::decide`: the metadata cap, the design's tier, the structural
@@ -2325,26 +2326,45 @@ mod t14 {
 		let mut n = 0;
 
 		// The LFU hybrid (S5's gate: the stacks' unit, at the settle target):
-		// 34 keys of 512, 640 and 768 bytes, then a 640 whose migrating bytes
-		// fit the gate -- 21,248 + 640 = 21,888 <= 21,889 = 0.98 x (24,576 -
-		// 35 x 64) -- while its base size, 12 bytes more, does not.
+		// 25 keys -- five of 512 bytes, five of 640, fifteen of 1,024 -- then
+		// a 640 whose migrating bytes fit the gate -- 21,120 + 640 = 21,760 <=
+		// 21,766 = 0.95 x (24,576 - 26 x 64) -- while its base size, 12 bytes
+		// more, does not. (It was 34 keys of 512, 640 and 768 and a 35th, 21,248
+		// + 640 = 21,888 <= 21,889 = 0.98 x (24,576 - 35 x 64), until the drain
+		// target moved to 0.95: at 0.95 that 35th no longer fit, and the case
+		// the prefix exists for would have gone untested without a failure. The
+		// sizes are all multiples of 128, which is why the prefix is this
+		// long: the fit has to land within 12 bytes of the target.)
 		//
 		// Every other script keeps the prefix its file was recorded with
 		// before S5: 31 keys of 640 and 768 bytes, alternating, then a 768
 		// whose migrating bytes filled the gate as it was, exactly: 21,760 +
 		// 768 = 22,528 = 24,576 - 32 x 64.
 		let prefix: Vec<ObjectSize> = match policy {
-			PaperPolicy::LfuCompactHybrid => (0..35u64)
+			PaperPolicy::LfuCompactHybrid => (0..26u64)
 				.map(|i| match i {
-					0..14 => 512,
-					14..24 => 640,
-					24..34 => 768,
+					0..5 => 512,
+					5..10 => 640,
+					10..25 => 1024,
 					_ => 640,
 				})
 				.collect(),
 
 			_ => (0..32u64).map(|i| if i % 2 == 0 && i < 31 { 640 } else { 768 }).collect(),
 		};
+
+		// The property the LFU prefix exists for, checked rather than assumed:
+		// the last set's migrating bytes fit the settle target and its base
+		// size (12 bytes more) does not. Not under an override of the target.
+		if policy == PaperPolicy::LfuCompactHybrid && std::env::var_os("FAST_TIER_DRAIN_TARGET").is_none() {
+			let (last, filled) = prefix.split_last().expect("a prefix");
+			let filled: CacheSize = filled.iter().map(|&item| CacheSize::from(item)).sum();
+			let migrating = filled + CacheSize::from(*last);
+			let target = drain_target::bytes(FAST_TIER - prefix.len() as CacheSize * CacheSize::from(OMEGA));
+
+			assert!(migrating <= target, "the last prefix set's migrating bytes {migrating} exceed the settle target {target}");
+			assert!(migrating + 12 > target, "its base size would fit too: {migrating} + 12 <= {target}");
+		}
 
 		for (i, &item) in prefix.iter().enumerate() {
 			run.step(n, |run| run.set(i as u64, item), None);

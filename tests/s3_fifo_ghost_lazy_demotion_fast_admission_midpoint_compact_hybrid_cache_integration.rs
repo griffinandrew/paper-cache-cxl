@@ -276,9 +276,9 @@ mod hybrid_cache_tests {
         // that subtraction eats the budget this test intends.
         //
         // 1_600 holds one ~1 KB value and not two: 1_024 migrating bytes is
-        // under the 0.98 high watermark's 1_568, and 2_048 is over it. It was
+        // under the 0.95 drain target's 1_520, and 2_048 is over it. It was
         // 40 bytes against 15-byte values, whose two objects migrate ~32 bytes
-        // between them -- comfortably under the 39-byte trigger -- so
+        // between them -- comfortably under the 38-byte target -- so
         // promoting key 2 demoted nothing and the wait below timed out.
         //
         // Back on the file-wide max_size/ratio pair, too: the local 131_072
@@ -334,8 +334,8 @@ mod hybrid_cache_tests {
 
         // Same 1_600 bytes of effective main-queue room, and the same
         // one-access reservation on top, as the second-chance test above: one
-        // ~1 KB value migrates 1_024 bytes, under the 0.98 high watermark's
-        // 1_568, and two migrate 2_048, over it. It was 40 bytes against
+        // ~1 KB value migrates 1_024 bytes, under the 0.95 drain target's
+        // 1_520, and two migrate 2_048, over it. It was 40 bytes against
         // 15-byte values, where BOTH objects' ~32 migrating bytes fit, so no
         // demotion pass ever ran -- which left no demotion boundary for key
         // 1's reference bit to be consulted at, and key 2 simply stayed Fast.
@@ -462,7 +462,7 @@ mod hybrid_cache_tests {
     // ── TTL ───────────────────────────────────────────────────────────────
 
     /// Holds one ~1 KB value but not two: 1_024 migrating bytes is under the
-    /// 0.98 high watermark's 1_568, and 2_048 is over it. It was 200, sized
+    /// 0.95 drain target's 1_520, and 2_048 is over it. It was 200, sized
     /// for the 15-byte values this test used to store -- twelve of those fit,
     /// so promoting key 1 and then all five fillers on top of it (six objects,
     /// ~96 migrating bytes in total) never came near the demotion trigger and

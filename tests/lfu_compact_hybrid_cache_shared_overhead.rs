@@ -87,7 +87,7 @@ mod shared_overhead_tests {
         (stats.fast_bytes_used, stats.fast_metadata_bytes)
     }
 
-    /// The fixture's budget: values alone at <= 85% of it (below the 98%
+    /// The fixture's budget: values alone at <= 85% of it (below the 95%
     /// settle target), the key count under the key ceiling, and the
     /// reservation large enough to push the values over the target.
     fn budget(s: u64, omega: u64) -> u64 {
@@ -104,7 +104,7 @@ mod shared_overhead_tests {
             n * omega,
         );
         assert!(
-            n * s * 100 > (budget - n * omega) * 98,
+            n * s * 100 > (budget - n * omega) * 95,
             "fixture: with {N} x {omega} B reserved the values still fit the settle target of {budget} B"
         );
 

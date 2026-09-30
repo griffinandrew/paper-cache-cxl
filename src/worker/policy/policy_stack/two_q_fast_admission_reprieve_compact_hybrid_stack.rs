@@ -853,7 +853,7 @@ mod dram_ceiling_tests {
 	/// never asks for.
 	///
 	/// The FIFO rests at the DRAIN TARGET of its budget since S5, as main does:
-	/// four 50 B keys (200 B) fit 0.98 x 250 = 245 B, a fifth would not (it
+	/// four 50 B keys (200 B) fit 0.95 x 250 = 237 B, a fifth would not (it
 	/// was five, filling the 250 B budget exactly, before S5).
 	#[test]
 	fn shrinking_the_fast_tier_spills_the_admission_queue() {
@@ -873,7 +873,7 @@ mod dram_ceiling_tests {
 			stack.fast_bytes_used(),
 			stack.fast_capacity(),
 		);
-		assert_eq!(stack.slow_object_count(), 3, "the excess is reprieved into PMEM: one 50 B key fits 0.98 x 100 B");
+		assert_eq!(stack.slow_object_count(), 3, "the excess is reprieved into PMEM: one 50 B key fits 0.95 x 100 B");
 	}
 }
 

@@ -135,6 +135,20 @@ const STACK_EXTRA_PER_OBJECT: u64 =
 
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The fast tier's drain target, as a fraction of its effective budget: the
+/// crate's default (0.95, since E1b -- it was 0.98) unless this run overrides
+/// it, read the way the crate reads it. Not exported by the crate, so the
+/// default is restated here: the settle-target check below is only as tight
+/// as this figure, and a default that moves again fails it rather than
+/// leaving it loose.
+fn drain_target_ratio() -> f64 {
+    std::env::var("FAST_TIER_DRAIN_TARGET")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0 && *v <= 1.0)
+        .unwrap_or(0.95)
+}
+
 /// One design's run: the cache's size and how many keys each phase sets.
 #[derive(Debug, Clone, Copy)]
 struct Workload {
@@ -526,12 +540,12 @@ fn check(cache: &Cache, lens: &BTreeMap<u64, u32>, run: &Run, phase: &str, hits:
     );
 
     // T9+ (S5): at rest every design is at or under its settle target, `S =
-    // 0.98 eff` -- the settles, the resettle each pass (LFU's latched
+    // 0.95 eff` (E1b; 0.98 before) -- the settles, the resettle each pass (LFU's latched
     // admissions never settled), the DRAM queues policed at their drain
     // targets -- so P + M_model <= F. The faithful fast-admission pair's small
     // queue is not bounded by the tier (`Design::bounds_its_dram`).
     if run.design.bounds_its_dram() {
-        let target = (s.effective_fast_capacity as f64 * 0.98) as u64;
+        let target = (s.effective_fast_capacity as f64 * drain_target_ratio()) as u64;
 
         assert!(
             s.fast_bytes_used <= target,

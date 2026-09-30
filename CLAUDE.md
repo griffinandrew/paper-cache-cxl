@@ -228,8 +228,8 @@ src/
                                  derivation in the module doc — those, and that file's, are
                                  the authoritative description of what each design does.
                                  `drain_target` (in mod.rs) holds the single fast-tier
-                                 level every settle maintains: 0.98 of the effective
-                                 budget, overridable via FAST_TIER_DRAIN_TARGET. One
+                                 level every settle maintains: 0.95 of the effective
+                                 budget (0.98 until E1b), overridable via FAST_TIER_DRAIN_TARGET. One
                                  threshold, not a high/low band. `PolicyStack::placement_of`
                                  is where a stack's bytes converge (its physical intent):
                                  tier_of for every design, the slot's tier in the merged
@@ -3437,3 +3437,31 @@ not (their used size never passes 98% of the cache's size at any op; the victims
 A known edge, left for a decision: a set is refused only above `max_size`, so a value whose accounted
 size lands between 98% and 100% of it is accepted and then evicted at once, with the rest of the
 cache (before E1 that needed the value to be within the per-object overhead of the cap).
+
+## The fast tier's drain target, 0.95 by default (E1b)
+
+A deliberate behaviour change (the user's decision of 2026-09-29): `drain_target::DEFAULT_RATIO`
+went from 0.98 to 0.95, for more room to absorb bursts -- 5% of the effective budget under the byte
+gate's close level `B` where there was 2%. It is still one continuous threshold; the band that was
+removed is not back (the doc of `drain_target` says why 0.95 is not the band's 5%). The gate's
+levels follow (`S = 0.95 x eff`), and `GateConfig::validate`'s `drain_target + near_frac < 1` holds
+with room: the near band may now be up to just under 5%. `FAST_TIER_DRAIN_TARGET=0.98` restores the
+old level. The published results were measured at 0.98 (and at an eviction level of 1.0, E1);
+S10 rebaselines them.
+
+Tests. The T14 LFU script's opening prefix is re-derived: it exists so that the 35th admission's
+migrating bytes fit the LFU gate and its base size (12 bytes more) does not, and it was built
+against 0.98 x (F - 35 x omega); at 0.95 the same prefix no longer fits, so it is now 25 keys (five
+of 512 bytes, five of 640, fifteen of 1,024) and a 26th of 640, which fits 0.95 x (F - 26 x omega)
+= 21,766 by 6 bytes -- and the script now asserts the property instead of assuming it (unless
+`FAST_TIER_DRAIN_TARGET` overrides). The 2Q full fast-admission design rests `a1_in` at the drain
+target of its budget, so its byte-exact fixtures moved: the unit test
+`re_setting_a_key_larger_in_a1_in_re_settles_a1_in` (2,500 B budget: 23 keys, 2,300 B, where 24 and
+2,400 fitted) and the integration fixture, where 24 sets now age 16 keys into `a1_out` and not 15 (the 614 B `a1_in` holds 8 of the 64
+migrating-byte objects at 583 B, not 9 at 601 B -- by one byte: 7 x 64 + 72 = 520 fits, 8 x 64 + 72
+= 584 does not). Its known failure, `eviction_prefers_a1_out_over_the_main_queue`, now passes: that
+fixture's third set (128 B resident + 72 B incoming = 200) is over `a1_in`'s 198 B target at 0.95 and
+so ages key 1 out, where it fitted the 204 B target of 0.98 and nothing aged (the failure) --
+`FAST_TIER_DRAIN_TARGET=0.98` reproduces it. `tests/phys_fast_identity.rs`'s settle-target check and
+the two shared-overhead fixtures' arithmetic took the new figure, and the comments that worked the
+integration fixtures' byte budgets out at 0.98 (39 of 40, 1,568 of 1,600) read 0.95 (38, 1,520).

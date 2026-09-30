@@ -149,9 +149,9 @@ mod hybrid_cache_tests {
         assert_eq!(cache.hybrid_stats().demotions, 0, "nothing should have demoted yet");
 
         // Room for 2.5 objects: three residents put `fast_used` above the
-        // high watermark (0.98 x 2.5 = 2.45 objects), so a pass runs; it
-        // drains to the low watermark (0.95 x 2.5 = 2.375 objects), which
-        // the two survivors already satisfy -- exactly one demotion.
+        // drain target (0.95 x 2.5 = 2.375 objects), so a pass runs; it
+        // drains to that same target, which the two survivors already
+        // satisfy -- exactly one demotion.
         cache.set_fast_tier_size(CacheTierSize::Bytes(per_object * 5 / 2))
             .expect("resize should succeed");
 

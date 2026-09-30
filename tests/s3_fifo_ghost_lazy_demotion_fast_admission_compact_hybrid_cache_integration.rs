@@ -132,12 +132,13 @@ mod hybrid_cache_tests {
     /// the key and the expiry stay in DRAM whichever tier the value is in, so
     /// they never move). A 15-byte value migrates 16 bytes -- one jemalloc
     /// size class -- so the old 40-byte budget held TWO of them under the
-    /// 0.98 high watermark (32 <= 39) and nothing ever demoted: every one of
+    /// 0.95 drain target (32 <= 38) and nothing ever demoted: every one of
     /// these tests timed out waiting for a demotion that could not happen.
     /// The whole band of budgets that hold one 16-byte value and not two is
-    /// 17..=32 bytes wide at that scale; at ~1 KB the same band runs
-    /// 1_078..=2_089, so which side of it a budget lands on no longer turns on
-    /// a handful of accounted bytes.
+    /// 17..=33 bytes wide at that scale; at ~1 KB the same band runs
+    /// 1_078..=2_155, so which side of it a budget lands on no longer turns on
+    /// a handful of accounted bytes. (At the 0.98 target this was before
+    /// E1b the bands were 17..=32 and 1_045..=2_089.)
     ///
     /// Deliberately NOT applied file-wide -- scoped to those three functions.
     /// `a_key_with_no_ghost_history_still_lands_in_the_one_access_queue_fast`
@@ -394,7 +395,7 @@ mod hybrid_cache_tests {
         //
         // Was `Bytes(40 + ONE_ACCESS_RESERVE)` against 15-byte payloads, which
         // could not work: 40 bytes of effective main budget holds TWO 16-byte
-        // migrating values under the 0.98 high watermark (32 <= 39), so
+        // migrating values under the 0.95 drain target (32 <= 38), so
         // promoting key 2 demoted nothing and the wait below timed out. See
         // VALUE_LEN.
         //
@@ -450,7 +451,7 @@ mod hybrid_cache_tests {
         // and not two -- and the same one-access reservation on top, as the
         // second-chance test above. Was `Bytes(40 + ONE_ACCESS_RESERVE)` with
         // 15-byte payloads, which held BOTH keys' 16 migrating bytes (32 <= the
-        // 0.98 watermark's 39), so promoting key 2 never reached the demotion
+        // 0.95 target's 38), so promoting key 2 never reached the demotion
         // boundary and neither the reprieve nor the demotion under test could
         // happen. See VALUE_LEN.
         let cache = PaperCache::<u32, TieredBuffer>::new(
@@ -534,7 +535,7 @@ mod hybrid_cache_tests {
     /// Holds one ~1 KB value but not two, exactly like the two tier-pressure
     /// tests above -- `KB_FAST_TIER`, restated here because this is the knob
     /// the TTL fixture turns. Was 200, sized for 15-byte values: six of those
-    /// migrate 16 bytes each, so all six sat inside the 0.98 watermark's 196
+    /// migrate 16 bytes each, so all six sat inside the 0.95 target's 190
     /// and key 1 was never demoted -- the wait below timed out. A TTL changes
     /// nothing about the migrating figure (the `Expiries` entry is part of the
     /// DRAM-resident remainder, which never moves), only about the accounted

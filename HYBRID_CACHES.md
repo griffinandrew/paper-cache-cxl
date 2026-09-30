@@ -188,7 +188,7 @@ once let the gauges go stale indefinitely.
 ### The drain target
 
 `settle_fast_tier` holds the fast tier at **`drain_target::ratio()` of its effective budget**
-— `DEFAULT_RATIO = 0.98`, overridable at startup via `FAST_TIER_DRAIN_TARGET`. It demotes
+— `DEFAULT_RATIO = 0.95` (0.98 until E1b), overridable at startup via `FAST_TIER_DRAIN_TARGET`. It demotes
 whenever `fast_used` is above that level and stops the moment it is back at it.
 
 **One threshold, not a band.** There is no arm-here / drain-to-there gap, so a settle moves only
@@ -206,15 +206,19 @@ it as the reservation grew, still rests at or under its drain target after each 
 admission gate is the same shape: `fast_used + migrating <= drain_target(F - (L + 1) x omega)`
 (or `F - M` under the measured model), in the stacks' own unit, in both stores.
 
-**The 2% is burst headroom, and it is the whole reason the ratio is not 1.0.** `PaperCache::set()`
+**The margin is burst headroom, and it is the whole reason the ratio is not 1.0** -- 5% of the
+effective budget at 0.95, 2% at the 0.98 this was until E1b, which the user judged too little room
+to absorb bursts (the byte gate admits up to `B = eff + slack` and holds a settled tier at
+`S = ratio x eff`, so `B - S` is the room a burst has before the gate closes). `PaperCache::set()`
 writes a new object's bytes to DRAM synchronously at the API layer, before the event reaches
 `PolicyWorker` at all; and a demotion the stack decides is not physically applied until a
 `migration_queue` consumer runs it. Real DRAM therefore sits above what the stack believes for
 as long as those two windows last — `MIGSTATS pending_demote_max` measures the second one
 directly. Held at exactly its ceiling, a tier has nowhere for that overshoot to go but *outside*
-the budget. Held at 0.98, it lands inside.
+the budget. Held at 0.95, it lands inside.
 
-**What was removed is the band, not the margin.** A 0.98 / 0.95 pair
+**What was removed is the band, not the margin.** (The single threshold first kept the band's
+upper mark, 0.98, as its level; since E1b it takes the lower one, 0.95, on purpose.) A 0.98 / 0.95 pair
 (`FAST_TIER_HIGH_WATERMARK` / `FAST_TIER_LOW_WATERMARK`) armed at 0.98 and only then drained to
 0.95. That cost 5% of the allocation at the bottom of every sawtooth — headroom the workload
 never got to use — and emitted the drop as one burst: ~3% of the budget in a single
@@ -224,10 +228,13 @@ why `parallel_migration` was written and then turned off again — a fan-out can
 at batch-of-one). But `migration_queue` already takes that win without depending on batch size:
 a standing pool of consumers sharded by key hash drains migrations as they are produced. So the
 band was buying a batching effect the consumer pool provides anyway, and charging 5% of the
-tier for it. 0.98 keeps the headroom and pays for it once.
+tier for it. A single level keeps the headroom and pays for it once: at 0.95 it is the same 5% of
+the tier the band's sawtooth reached at its bottom, held as a standing margin with no burst -- the
+0.95 arm below measured `burst_max` 100, against 20,631 for the band.
 
-> 0.98 is also where this tree's burst margin sat before the band replaced it
-> (`FAST_TIER_LOW_WATER_RATIO`, see `LRU_HYBRID_CACHE.md`). `FAST_TIER_DRAIN_TARGET` is read once
+> 0.98 is where this tree's burst margin sat before the band replaced it
+> (`FAST_TIER_LOW_WATER_RATIO`, see `LRU_HYBRID_CACHE.md`), and where the single threshold kept it
+> until E1b. `FAST_TIER_DRAIN_TARGET` is read once
 > through a `OnceLock`, so it is startup configuration; a value that fails to parse or falls
 > outside `(0.0, 1.0]` is silently replaced by the default. `1.0` gives no headroom at all.
 
@@ -238,6 +245,9 @@ until E1, and the published results were measured there. `EVICTION_HIGH_WATERMAR
 `EVICTION_LOW_WATERMARK` override it; `EVICTION_HIGH_WATERMARK=1.0` alone is the old cap.
 
 #### Measured
+
+(At the 0.98 default of the time; the 0.95 arm below is the one E1b made the default, and its
+cost is the 5% of fast-tier occupancy it shows.)
 
 cluster13, 750 MB slice, 30M records, 12 GB cache, 4 GiB fast tier, `-c 1`, `USE_GET_INTO=0`.
 The four ratio arms are ONE binary driven by `FAST_TIER_DRAIN_TARGET`, so nothing separates them

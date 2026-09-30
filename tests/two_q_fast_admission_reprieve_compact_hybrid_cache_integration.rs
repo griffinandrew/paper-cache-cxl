@@ -82,13 +82,13 @@ mod hybrid_cache_tests {
     // `make_cache` gives a 1_600-byte fast tier of which K_IN reserves 819 for
     // the FIFO -- admission is a DRAM write in this design, so that reservation
     // is carved out of the same budget -- leaving the main queue about 781, and
-    // a high watermark near 765. Ten 64-byte objects total 640 migrating bytes
+    // a drain target near 742. Ten 64-byte objects total 640 migrating bytes
     // (the value alone; key and expiry never move), which sits UNDER it, so
     // `settle_fast_tier` never triggered, nothing demoted, and every test
     // asserting a demotion timed out.
     //
     // 256 puts ten objects at 2_560, unambiguously over: the settle holds the
-    // tier at ~765 (0.98 of the ~781-byte budget), leaving two objects fast and
+    // tier at ~742 (0.95 of the ~781-byte budget), leaving two objects fast and
     // eight slow. The FIFO
     // never sees more than one at a time (each set is followed by a get, which
     // promotes it straight out), so this does not trip `fifo_capacity` and

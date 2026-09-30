@@ -116,11 +116,13 @@ set(k, v) ──WorkerEvent──> policy stack decides tiers
   the other tier supersedes (`split_tier_migrations`), so it can never reverse a key's own
   intents: a key promoted and demoted again in one drain used to come out demote-first and stay
   in DRAM while the stack counted it slow.
-- **Drain target.** `settle_fast_tier` holds the fast tier at `FAST_TIER_DRAIN_TARGET` (0.98) of
+- **Drain target.** `settle_fast_tier` holds the fast tier at `FAST_TIER_DRAIN_TARGET` (0.95) of
   its effective budget: it demotes whenever usage is above that level and stops the moment it is
   back at it. One threshold, not a band — a settle moves only what the event that triggered it
-  displaced. The 2% margin is headroom for the DRAM a burst of `set()`s puts down before the
-  policy worker sees it, and for demotions still queued behind `migration_queue`.
+  displaced. The 5% margin is headroom for the DRAM a burst of `set()`s puts down before the
+  policy worker sees it, and for demotions still queued behind `migration_queue`; it is also the
+  room under the byte gate's close level (`B - S`). It was 0.98 (2%) until the default moved to
+  give bursts more room; set `FAST_TIER_DRAIN_TARGET=0.98` to reproduce earlier results.
 - **Eviction watermark.** Capacity eviction is held at `EVICTION_HIGH_WATERMARK` (0.98) of
   `max_size`, cache-wide: evictions start once `used_size` passes 98% of the cap and drain to the
   same level, one object at a time (the fast tier's shape: one threshold, not a band). It is read
@@ -286,7 +288,7 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | Variable | Default | Effect |
 |---|---|---|
 | `MIGRATION_QUEUE_THREADS` | `2` | Migration consumer count. `0` disables the queue and applies migrations inline on the worker. |
-| `FAST_TIER_DRAIN_TARGET` | `0.98` | Fraction of the effective fast-tier budget the tier is continuously held at. `1.0` leaves no burst headroom. |
+| `FAST_TIER_DRAIN_TARGET` | `0.95` | Fraction of the effective fast-tier budget the tier is continuously held at (`0.98` before the default moved). `1.0` leaves no burst headroom. |
 | `EVICTION_HIGH_WATERMARK` | `0.98` | Fraction of `max_size` above which capacity eviction starts, in `(0, 1]`. `1.0` evicts only past `max_size`, the behaviour before the 0.98 default. |
 | `EVICTION_LOW_WATERMARK` | the high mark | Fraction of `max_size` an armed eviction pass drains to, clamped to at most the high mark. Unset, it follows the high mark: one threshold. Set below it, the pass is a band and evicts in bursts. |
 | `NUMA_ARENAS_PER_NODE` | `8` | jemalloc arenas per node (clamped to 32). Swept on cluster12: a single arena costs 5% of SET latency at one client and 27% at sixteen, while 8→32 buys 1–2%, inside the run-to-run spread. |

@@ -1312,7 +1312,7 @@ pub mod migstats {
 ///     makes a band (with its bursts).
 ///
 /// Deliberately its own pair, and not shared with the hybrid stacks'
-/// fast-tier settle: that one is `drain_target` (0.98 of the effective
+/// fast-tier settle: that one is `drain_target` (0.95 of the effective
 /// fast-tier budget, `FAST_TIER_DRAIN_TARGET`), and it says nothing about how
 /// full the cache as a whole may be.
 pub mod eviction_watermarks {

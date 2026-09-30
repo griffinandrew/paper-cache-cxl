@@ -23,7 +23,7 @@
 //! The demotion fixture below is self-calibrating: it measures the accounted
 //! `ObjectSize` of its own payload via `cache.size()`, then chooses a
 //! fast-tier budget that puts the values at ~85% of it -- safely below the
-//! 98% high watermark, so with the reservation zeroed NO demotion could
+//! 95% settle target, so with the reservation zeroed NO demotion could
 //! occur. Any demotion the test then observes is attributable only to the
 //! per-object metadata reservation.
 //!
@@ -93,7 +93,7 @@ mod shared_overhead_tests {
         (stats.fast_bytes_used, stats.fast_metadata_bytes)
     }
 
-    /// The fixture's budget: values alone at <= 85% of it (below the 98%
+    /// The fixture's budget: values alone at <= 85% of it (below the 95%
     /// settle target), the key count under the key ceiling, and the
     /// reservation large enough to push the values over the target.
     fn budget(s: u64, omega: u64) -> u64 {
@@ -110,7 +110,7 @@ mod shared_overhead_tests {
             n * omega,
         );
         assert!(
-            n * s * 100 > (budget - n * omega) * 98,
+            n * s * 100 > (budget - n * omega) * 95,
             "fixture: with {N} x {omega} B reserved the values still fit the settle target of {budget} B"
         );
 
@@ -151,7 +151,7 @@ mod shared_overhead_tests {
         assert_eq!(stats.metadata_overflows, 3);
     }
 
-    /// With values alone at ~85% of the budget (below the 98% trigger), any
+    /// With values alone at ~85% of the budget (below the 95% settle target), any
     /// demotion can only come from the metadata reservation -- and it must
     /// demote, never evict. The per-object model; every key under the
     /// ceiling (`budget`).

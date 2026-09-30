@@ -725,7 +725,7 @@ fn a_structural_admission_does_not_latch_lfu() {
 /// Every DRAM admission queue rests at the DRAIN TARGET of its budget, as
 /// main does (3.6.5): after each insert, its policing and the pass end's
 /// resettle (a queue budget shrinks with the new key's reservation after the
-/// insert policed it) the queue's DRAM is at most 0.98 of its budget. At the
+/// insert policed it) the queue's DRAM is at most 0.95 of its budget. At the
 /// stack, with the queue's carve-out clamped to the whole tier, so its budget
 /// is the tier's eff (`F - M`) and its DRAM the stack's fast bytes (no key is
 /// ever hit into main). Red with 3.6.5 reverted (`fullqueue`).
@@ -803,7 +803,7 @@ fn lfu_admits_in_the_stacks_unit_up_to_the_settle_target() {
 }
 
 /// The measured model: the stacks settle on the M the policy worker
-/// published -- `0.98 x (F - M)`, with no ghost term on top (the ghost's
+/// published -- `0.95 x (F - M)`, with no ghost term on top (the ghost's
 /// structures are inside the measured M) -- and reserve exactly M. With an M
 /// held by hand: LRU in both stores, and in the DashMap builds a design with
 /// a ghost, filled until the ghost holds keys. Red with a ghost's term added

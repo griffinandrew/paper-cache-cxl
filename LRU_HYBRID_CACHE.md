@@ -186,8 +186,9 @@ effective budget (`FAST_TIER_LOW_WATER_RATIO`) to leave such a burst room to lan
 0.98 / 0.95 high/low pair then replaced that, and has since been replaced in turn by a single
 continuously-maintained level at the same 98% — see `HYBRID_CACHES.md`'s "The drain target". The
 margin has therefore survived all three shapes, because the reason for it never went away. What
-changed is that it is no longer paired with a separate arming threshold, so the tier holds at 98%
-instead of sawtoothing down to 95%. The window itself is shrunk by `apply_tier_migrations` running
+changed is that it is no longer paired with a separate arming threshold, so the tier holds at one
+level instead of sawtoothing down to 95%. That level was 98% until E1b, which moved it to 95%
+to give bursts more room. The window itself is shrunk by `apply_tier_migrations` running
 per-event rather than per-batch, and is measured rather than guessed at: `MIGSTATS
 pending_demote_max` reports the backlog in objects.
 

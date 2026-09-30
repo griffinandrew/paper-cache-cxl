@@ -142,7 +142,7 @@ use crate::{
 };
 
 /// The level the fast tier is continuously held at, as a fraction of its
-/// effective budget.
+/// effective budget: 0.95 by default (E1b; it was 0.98 until then).
 ///
 /// `settle_fast_tier` demotes whenever `fast_used` is above
 /// `ratio * effective_capacity` and stops the moment it is back at it. ONE
@@ -158,23 +158,38 @@ use crate::{
 /// `migration_queue` consumer runs it. Real DRAM therefore sits above what the
 /// stack believes for as long as those two windows last. Held at exactly its
 /// ceiling, a tier has nowhere for that overshoot to go but outside the
-/// budget; held at 0.98, it lands inside.
+/// budget; held at 0.95, it lands inside.
 ///
-/// 0.98 is where this tree's own burst margin sat before a 0.98/0.95 high/low
-/// pair replaced it (`FAST_TIER_LOW_WATER_RATIO`; see `LRU_HYBRID_CACHE.md`).
-/// It is the band that is gone, not the margin. The band ARMED at 0.98 and
-/// only then drained to 0.95, which cost 5% of the allocation at the bottom of
-/// every sawtooth and emitted the drop as one burst of demotions -- ~3% of the
-/// budget in a single `apply_tier_migrations` batch. This keeps the headroom
-/// and pays for it once, not per pass.
+/// Why 0.95, and not the 0.98 this was: the user asked for more room to
+/// absorb bursts. The byte gate (S5) holds a settled tier at
+/// `S = ratio * eff` and admits a fast set up to `B = eff + slack`, so what a
+/// burst can land in before the gate closes is `B - S`: 5% of `eff` at 0.95
+/// (with the default zero slack), 2% at 0.98. It is the depth of the margin
+/// that changed, not its shape: one continuous level, one object at a time.
 ///
-/// `FAST_TIER_DRAIN_TARGET=1.0` holds the tier at exactly its ceiling, which is
-/// the no-headroom behaviour.
+/// The band this replaced is the counter-example, and what was wrong with it
+/// was not its 5% of depth. That 0.98/0.95 high/low pair
+/// (`FAST_TIER_LOW_WATER_RATIO`; see `LRU_HYBRID_CACHE.md`) ARMED at 0.98 and
+/// only then drained to 0.95 in one go, which emitted the drop as one burst
+/// of demotions -- ~3% of the budget in a single `apply_tier_migrations`
+/// batch -- on every pass. A single threshold at 0.95 pays the same 5% of the
+/// tier once, as a standing margin, and never emits that burst. The single
+/// threshold first kept the band's upper mark (0.98) as its level; this takes
+/// the lower one, on purpose.
+///
+/// The gate's bands follow the ratio, and `GateConfig::validate` requires
+/// `ratio + near_frac < 1` so the settle target stays below the near level:
+/// at 0.95 the near band may be up to (just under) 5% of `eff`, against the
+/// default 1%.
+///
+/// `FAST_TIER_DRAIN_TARGET=0.98` restores the previous default and `=1.0`
+/// holds the tier at exactly its ceiling, which is the no-headroom behaviour.
+/// The published results were measured at 0.98; S10 rebaselines them.
 #[cfg(any(test, not(feature = "merged_object_store"), feature = "hybrid_cache_common"))]
 pub mod drain_target {
 	use std::sync::OnceLock;
 
-	pub const DEFAULT_RATIO: f64 = 0.98;
+	pub const DEFAULT_RATIO: f64 = 0.95;
 
 	static RATIO: OnceLock<f64> = OnceLock::new();
 

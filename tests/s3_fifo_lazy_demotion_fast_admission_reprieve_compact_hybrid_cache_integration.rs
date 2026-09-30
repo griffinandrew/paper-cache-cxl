@@ -316,7 +316,7 @@ mod hybrid_cache_tests {
         // the expiry, which are DRAM-resident in either tier), so a 15-byte
         // payload costs 16 rather than the ~36 of its whole `base_size`. A
         // main budget of 40 therefore held BOTH keys -- 32 bytes never
-        // crossed the 0.98 high watermark -- so promoting key 2 demoted
+        // crossed the 0.95 drain target -- so promoting key 2 demoted
         // nothing and the wait for key 1 to reach Slow timed out. At 20 the
         // watermarks land where the fixture always assumed: one 16-byte
         // object sits under the 19-byte high mark, two do not, and the pass

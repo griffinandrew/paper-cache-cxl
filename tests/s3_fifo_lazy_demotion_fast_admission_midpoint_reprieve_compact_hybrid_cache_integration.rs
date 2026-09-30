@@ -322,11 +322,11 @@ mod hybrid_cache_tests {
         // is the MAIN queue's `effective_main_fast_capacity`: `fast_capacity`
         // 80 minus `one_access_capacity` 40 = 40. At 16 bytes apiece TWO
         // promoted objects sat inside it: promoting key 2 left `fast_used` at
-        // 32, under the high watermark of floor(0.98 * 40) = 39, so nothing
+        // 32, under the drain target of floor(0.95 * 40) = 38, so nothing
         // demoted and key 1 never reached the tail this test is about. At the
-        // next size class up one object fits (32 <= 39), two do not
-        // (64 > 39), and one demotion drains back under the low watermark
-        // (32 <= floor(0.95 * 40) = 38), so exactly key 1 moves. The
+        // next size class up one object fits (32 <= 38), two do not
+        // (64 > 38), and one demotion drains back to the target, so exactly
+        // key 1 moves. The
         // `resize(180)` further down still forces exactly one terminal
         // eviction: a padded object accounts 139 bytes (`base_size`
         // 4 + 32 + 16, plus 87 of policy overhead), so two exceed 180 and one
@@ -389,12 +389,12 @@ mod hybrid_cache_tests {
         // is the MAIN queue's `effective_main_fast_capacity`: `fast_capacity`
         // 80 minus `one_access_capacity` 41 = 39. At 16 bytes apiece TWO
         // promoted objects sat inside it: promoting key 2 left `fast_used` at
-        // 32, under the high watermark of floor(0.98 * 39) = 38, so
+        // 32, under the drain target of floor(0.95 * 39) = 37, so
         // `settle_fast_tier` never ran and there was no demotion boundary at
         // which to observe key 1's reprieve -- key 2 stayed Fast and the wait
         // below timed out. At the next size class up one object fits
-        // (32 <= 38) and two do not (64 > 38), and a single demotion drains
-        // back under the low watermark (32 <= floor(0.95 * 39) = 37), so
+        // (32 <= 37) and two do not (64 > 37), and a single demotion drains
+        // back to the target, so
         // exactly ONE object moves -- which is what the `demotions` assertion
         // at the end of this test is counting. The `&[u8; 32]` annotation
         // keeps the padding honest: a miscount is a compile error rather than

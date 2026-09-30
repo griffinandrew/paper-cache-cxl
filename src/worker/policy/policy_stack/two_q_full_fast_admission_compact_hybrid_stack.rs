@@ -1389,8 +1389,9 @@ mod dram_ceiling_tests {
 	fn re_setting_a_key_larger_in_a1_in_re_settles_a1_in() {
 		let mut stack = stack(FITTING);
 
-		// Forty admissions: `a1_in` holds the 24 newest (2_400 B: it rests at
-		// the drain target of its 2_500 B budget since S5), `a1_out` the 16
+		// Forty admissions: `a1_in` holds the 23 newest (2_300 B: it rests at
+		// the drain target of its 2_500 B budget since S5, 2_375 B at 0.95 and
+		// 2_450 B, 24 keys, at the 0.98 it was until E1b), `a1_out` the 17
 		// oldest.
 		for key in 1..=40 {
 			stack.insert(key, SIZE);
@@ -1403,7 +1404,7 @@ mod dram_ceiling_tests {
 			evict_while_asked(&mut stack);
 		}
 
-		assert_eq!(stack.a1_in_used, 2_400);
+		assert_eq!(stack.a1_in_used, 2_300);
 		assert_within_the_fast_tier(&stack, 0, "before the re-set");
 
 		// Key 40 is `a1_in`'s newest; re-set it 300 B larger.
@@ -1420,7 +1421,7 @@ mod dram_ceiling_tests {
 
 		assert_eq!(stack.tier_of(40), Some(Tier::Fast), "the re-set key is still in a1_in");
 
-		for key in 17..=19 {
+		for key in 18..=20 {
 			assert_eq!(stack.tier_of(key), Some(Tier::Slow), "key {key}, a1_in's oldest, was demoted");
 		}
 
