@@ -139,8 +139,7 @@ impl Queue {
 /// the `PolicyWorker` migration path both want it as a cheap single-probe
 /// lookup rather than a pair of `contains()` probes.
 ///
-/// `ts` and `phys` belong to other policies; `phys` is set once at admission to
-/// match `tier` and never read here.
+/// `ts` belongs to other policies.
 pub struct S3FifoLazyDemotionReprieveCompactHybridStack {
 	/// One slab holding all three orders: `Q_ONE_ACCESS`, `Q_MAIN_FAST`,
 	/// `Q_MAIN_SLOW`.
@@ -483,7 +482,6 @@ impl S3FifoLazyDemotionReprieveCompactHybridStack {
 				ts: 0,
 				queue: Queue::OneAccess as u8,
 				tier: None,
-				phys: None,
 				dram_resident,
 			},
 		);

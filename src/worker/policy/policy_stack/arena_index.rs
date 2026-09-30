@@ -733,7 +733,6 @@ mod tests {
 				ts: 0,
 				queue: 0,
 				tier: Some(Tier::Fast),
-				phys: Some(Tier::Fast),
 				dram_resident: 0,
 			},
 		}

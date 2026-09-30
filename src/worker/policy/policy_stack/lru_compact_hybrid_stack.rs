@@ -59,8 +59,8 @@ use crate::{
 const Q_LRU: usize = 0;
 
 /// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
-/// This stack reads `tier`, `size` and `dram_resident`; `freq`, `ts`, `queue`
-/// and `phys` belong to other policies and stay at their defaults here.
+/// This stack reads `tier`, `size` and `dram_resident`; `freq`, `ts` and
+/// `queue` belong to other policies and stay at their defaults here.
 pub struct LruCompactHybridStack {
 	list: ArenaQueueSet<NodePayload>,
 
@@ -280,7 +280,6 @@ impl LruCompactHybridStack {
 				size,
 				dram_resident,
 				tier: Some(Tier::Slow),
-				phys: Some(Tier::Slow),
 				freq: 0,
 				ts: 0,
 				queue: 0,
@@ -294,7 +293,6 @@ impl LruCompactHybridStack {
 			size,
 			dram_resident,
 			tier: Some(Tier::Fast),
-			phys: Some(Tier::Fast),
 			freq: 0,
 			ts: 0,
 			queue: 0,

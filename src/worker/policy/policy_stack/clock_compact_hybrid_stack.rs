@@ -68,8 +68,8 @@ use crate::{
 const Q_CLOCK: usize = 0;
 
 /// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
-/// This stack reads `tier`, `size`, `dram_resident` and `freq`; `ts`, `queue`
-/// and `phys` belong to other policies and stay at their defaults here.
+/// This stack reads `tier`, `size`, `dram_resident` and `freq`; `ts` and
+/// `queue` belong to other policies and stay at their defaults here.
 ///
 /// The reference bit rides in `freq`, as `freq != 0` -- the idiom the S3-FIFO
 /// family already uses, and the reason this design costs not one byte more per
@@ -212,7 +212,6 @@ impl ClockCompactHybridStack {
 			size,
 			dram_resident,
 			tier: Some(tier),
-			phys: Some(tier),
 			// A brand-new key enters UNREFERENCED, so one pass of the hand can
 			// evict it. `push_front(Q, key, false)` in the flat stack.
 			freq: 0,

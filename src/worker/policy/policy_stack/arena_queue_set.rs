@@ -220,13 +220,6 @@ pub struct NodePayload {
 	/// own to record. The niche makes that free.
 	pub tier: Option<Tier>,
 
-	/// Where the bytes PHYSICALLY are, when that can differ from `tier`.
-	///
-	/// No stack reads it now. Its one reader was the lazy-copy LRU, removed
-	/// in R2: it promoted logically and deferred the byte copy, so for a
-	/// window the two disagreed. Every stack keeps it equal to `tier`.
-	pub phys: Option<Tier>,
-
 	/// The part of `size` that stays in DRAM whichever tier the object is in.
 	pub dram_resident: u8,
 }
@@ -1581,7 +1574,6 @@ mod tests {
 					ts: 0,
 					queue: 0,
 					tier: Some(Tier::Fast),
-					phys: Some(Tier::Fast),
 					dram_resident: 0,
 				},
 			);

@@ -44,8 +44,8 @@ use crate::{
 const Q_FIFO: usize = 0;
 
 /// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
-/// This stack reads `tier`, `size` and `dram_resident`; `freq`, `ts`, `queue`
-/// and `phys` belong to other policies and stay at their defaults here.
+/// This stack reads `tier`, `size` and `dram_resident`; `freq`, `ts` and
+/// `queue` belong to other policies and stay at their defaults here.
 pub struct FifoCompactHybridStack {
 	list: ArenaQueueSet<NodePayload>,
 
@@ -163,7 +163,6 @@ impl FifoCompactHybridStack {
 			size,
 			dram_resident,
 			tier: Some(tier),
-			phys: Some(tier),
 			freq: 0,
 			ts: 0,
 			queue: 0,

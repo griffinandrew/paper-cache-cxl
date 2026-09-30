@@ -240,12 +240,6 @@ impl Default for ArenaFrequencyChain {
 
 /// A brand-new node for this chain.
 ///
-/// `phys` is set equal to `tier` and kept there by every tier move below.
-/// Nothing in either LFU stack reads it -- its one reader, the lazy-copy LRU,
-/// which promoted logically and deferred the byte copy, was removed in R2 --
-/// but the node's contract is that the two are equal, and a `phys` left
-/// behind at admission tier would quietly make that false.
-///
 /// `ts` and `queue` stay zero: recency here is `prev`/`next` and there are no
 /// queues. They exist so the node is the one shape every policy shares.
 fn node(size: ObjectSize, freq: u32, dram_resident: u8, tier: Tier) -> NodePayload {
@@ -255,7 +249,6 @@ fn node(size: ObjectSize, freq: u32, dram_resident: u8, tier: Tier) -> NodePaylo
 		ts: 0,
 		queue: 0,
 		tier: Some(tier),
-		phys: Some(tier),
 		dram_resident,
 	}
 }
@@ -451,12 +444,11 @@ impl ArenaFrequencyChain {
 		}
 	}
 
-	/// Records a tier on a slot, keeping `phys` equal to it. See [`node`].
+	/// Records a tier on a slot.
 	fn set_tier_fields(&mut self, slot: u32, tier: Tier) {
 		let payload = &mut self.slots[slot as usize].payload;
 
 		payload.tier = Some(tier);
-		payload.phys = Some(tier);
 	}
 
 	/// Takes a free slab slot, or grows the slab by one. Shared by the
@@ -1026,27 +1018,6 @@ mod tests {
 
 		assert_eq!(c.get(9).unwrap().tier, Some(Tier::Slow));
 		assert_eq!(c.get(9).unwrap().migrating(), 712);
-	}
-
-	/// `phys` is the one node field this chain writes that neither LFU stack
-	/// reads, and the node's contract is that it equals `tier`. A tier move
-	/// that left it behind would make that contract false for a key that had
-	/// ever been demoted or promoted.
-	#[test]
-	fn a_tier_move_carries_the_physical_tier_with_it() {
-		let mut c = ArenaFrequencyChain::default();
-		c.insert(1, 100, 0, Tier::Fast);
-		assert_eq!(c.get(1).unwrap().phys, Some(Tier::Fast));
-
-		c.set_tier(1, Tier::Slow);
-		assert_eq!(c.get(1).unwrap().phys, Some(Tier::Slow));
-
-		c.recency_push_front(2, 100, 0, 1);
-		c.demote_recency_back();
-		assert_eq!(c.get(2).unwrap().phys, Some(Tier::Slow));
-
-		c.promote_to_recency_front(2, 1);
-		assert_eq!(c.get(2).unwrap().phys, Some(Tier::Fast));
 	}
 
 	// ── the distinguished recency list ────────────────────────────────────

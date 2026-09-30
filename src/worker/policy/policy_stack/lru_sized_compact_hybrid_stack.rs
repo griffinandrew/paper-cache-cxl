@@ -153,7 +153,7 @@ impl SizeQueue {
 /// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
 /// This stack reads `queue` -- its `SizeQueue` tag, narrowed to `u8` -- along
 /// with `size` and `dram_resident`, and writes `tier` as a mirror of the tag
-/// for the policies that read it. `freq`, `ts` and `phys` belong to other
+/// for the policies that read it. `freq` and `ts` belong to other
 /// policies and keep the values they were constructed with, which is what
 /// `LruCompactHybridStack` does with them too.
 ///
@@ -475,7 +475,6 @@ impl LruSizedCompactHybridStack {
 					dram_resident,
 					queue: queue.tag(),
 					tier: Some(Tier::Slow),
-					phys: Some(Tier::Slow),
 					freq: 0,
 					ts: 0,
 				},
@@ -494,7 +493,6 @@ impl LruSizedCompactHybridStack {
 					dram_resident,
 					queue: SizeQueue::SmallFast.tag(),
 					tier: Some(Tier::Fast),
-					phys: Some(Tier::Fast),
 					freq: 0,
 					ts: 0,
 				},
@@ -510,7 +508,6 @@ impl LruSizedCompactHybridStack {
 					dram_resident,
 					queue: SizeQueue::LargeFast.tag(),
 					tier: Some(Tier::Fast),
-					phys: Some(Tier::Fast),
 					freq: 0,
 					ts: 0,
 				},

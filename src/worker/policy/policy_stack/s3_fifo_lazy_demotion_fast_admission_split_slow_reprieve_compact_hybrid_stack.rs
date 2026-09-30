@@ -164,7 +164,7 @@ impl Queue {
 ///
 /// The QUEUE remains the tier's single source of truth here -- this design's
 /// whole point is that the split slow tier makes a separate tier field
-/// redundant -- but `tier` and `phys` are kept in step with it at every queue
+/// redundant -- but `tier` is kept in step with it at every queue
 /// write (`Some(queue.tier())`), so the shared node never carries a tier that
 /// contradicts the order the key is actually threaded into. `tier` is therefore
 /// never `None` in this stack, and no match here has a `None` arm to spell out.
@@ -299,7 +299,6 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 		if let Some(p) = self.queues.payload_mut(key) {
 			p.queue = Queue::SlowHead as u8;
 			p.tier = Some(Queue::SlowHead.tier());
-			p.phys = Some(Queue::SlowHead.tier());
 			p.freq = 0;
 		}
 
@@ -457,7 +456,6 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 		if let Some(p) = self.queues.payload_mut(key) {
 			p.queue = Queue::Fast as u8;
 			p.tier = Some(Queue::Fast.tier());
-			p.phys = Some(Queue::Fast.tier());
 			p.freq = 0;
 		}
 
@@ -513,7 +511,6 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 		if let Some(p) = self.queues.payload_mut(key) {
 			p.queue = Queue::Fast as u8;
 			p.tier = Some(Queue::Fast.tier());
-			p.phys = Some(Queue::Fast.tier());
 			p.freq = 0;
 		}
 
@@ -582,7 +579,6 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 					ts: 0,
 					queue: Queue::SlowHead as u8,
 					tier: Some(Queue::SlowHead.tier()),
-					phys: Some(Queue::SlowHead.tier()),
 					dram_resident,
 				},
 			);
@@ -604,7 +600,6 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 				ts: 0,
 				queue: Queue::OneAccess as u8,
 				tier: Some(Queue::OneAccess.tier()),
-				phys: Some(Queue::OneAccess.tier()),
 				dram_resident,
 			},
 		);
@@ -642,7 +637,6 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 			if let Some(p) = self.queues.payload_mut(candidate) {
 				p.queue = Queue::SlowHead as u8;
 				p.tier = Some(Queue::SlowHead.tier());
-				p.phys = Some(Queue::SlowHead.tier());
 			}
 
 			self.fast_used = self.fast_used.saturating_sub(size);
@@ -687,7 +681,6 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 			if let Some(p) = self.queues.payload_mut(candidate) {
 				p.queue = Queue::SlowTail as u8;
 				p.tier = Some(Queue::SlowTail.tier());
-				p.phys = Some(Queue::SlowTail.tier());
 			}
 
 			self.slow_head_used = self.slow_head_used.saturating_sub(size);
@@ -723,7 +716,6 @@ impl S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybridStack {
 			if let Some(p) = self.queues.payload_mut(key) {
 				p.queue = Queue::SlowHead as u8;
 				p.tier = Some(Queue::SlowHead.tier());
-				p.phys = Some(Queue::SlowHead.tier());
 				p.freq = 0;
 			}
 

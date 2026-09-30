@@ -121,8 +121,7 @@ impl Queue {
 /// as the S3-FIFO REFERENCE BIT: `freq != 0` is "accessed", `freq = 1` sets it
 /// and `freq = 0` clears it. A reference bit is a one-bit frequency counter,
 /// so nothing above 1 is ever stored here. `ts` belongs to the aging policies
-/// and `phys` to none now: both stay at their defaults, `phys` set equal to
-/// `tier` at construction and never read again.
+/// and stays at its default.
 ///
 /// `tier` is meaningful only while `queue == Queue::Main`. The one-access
 /// queue is entirely fast-tier in this variant and `tier_of` reports that from
@@ -396,7 +395,6 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack {
 					ts: 0,
 					queue: Queue::Main as u8,
 					tier: Some(Tier::Slow),
-					phys: Some(Tier::Slow),
 					dram_resident,
 				},
 			);
@@ -415,7 +413,6 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack {
 				ts: 0,
 				queue: Queue::Main as u8,
 				tier: Some(Tier::Fast),
-				phys: Some(Tier::Fast),
 				dram_resident,
 			},
 		);
@@ -791,7 +788,6 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack {
 					ts: 0,
 					queue: Queue::Main as u8,
 					tier: Some(Tier::Slow),
-					phys: Some(Tier::Slow),
 					dram_resident,
 				},
 			);
@@ -810,7 +806,6 @@ impl S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack {
 				ts: 0,
 				queue: Queue::OneAccess as u8,
 				tier: None,
-				phys: None,
 				dram_resident,
 			},
 		);

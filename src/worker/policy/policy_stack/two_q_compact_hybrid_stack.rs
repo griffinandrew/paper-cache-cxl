@@ -69,8 +69,8 @@ impl Queue {
 }
 
 /// Per-key bookkeeping is [`NodePayload`], the one node every policy shares.
-/// This stack reads `queue`, `tier`, `size` and `dram_resident`; `freq`, `ts`
-/// and `phys` belong to other policies and stay at their defaults here.
+/// This stack reads `queue`, `tier`, `size` and `dram_resident`; `freq` and `ts`
+/// belong to other policies and stay at their defaults here.
 ///
 /// `tier` is `None` while `queue == Fifo`: the FIFO is entirely slow-tier, so a
 /// key there has no tier of its own to record. `queue` is a bare `u8` in the
@@ -362,7 +362,6 @@ impl TwoQCompactHybridStack {
 			size,
 			dram_resident,
 			tier: None,
-			phys: None,
 			freq: 0,
 			ts: 0,
 			queue: Queue::Fifo as u8,

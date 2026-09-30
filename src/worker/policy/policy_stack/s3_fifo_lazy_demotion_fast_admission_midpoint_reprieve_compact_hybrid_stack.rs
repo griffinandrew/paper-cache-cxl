@@ -137,8 +137,7 @@ impl Queue {
 /// and the `PolicyWorker` migration path both want it as a cheap single-probe
 /// lookup rather than a pair of `contains()` probes.
 ///
-/// `ts` and `phys` belong to other policies; `phys` is set once at admission to
-/// match `tier` and never read here.
+/// `ts` belongs to other policies.
 pub struct S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 	queues: ArenaQueueSet<NodePayload>,
 
@@ -611,7 +610,6 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 					ts: 0,
 					queue: Queue::Main as u8,
 					tier: Some(Tier::Slow),
-					phys: Some(Tier::Slow),
 					dram_resident,
 				},
 			);
@@ -639,7 +637,6 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 				ts: 0,
 				queue: Queue::OneAccess as u8,
 				tier: None,
-				phys: None,
 				dram_resident,
 			},
 		);

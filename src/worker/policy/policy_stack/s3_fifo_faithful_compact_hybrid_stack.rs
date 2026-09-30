@@ -130,8 +130,8 @@ impl Queue {
 /// `dram_resident`. `freq` is the 0..=3 SATURATING COUNTER that makes this
 /// family faithful, and it is the same field the other S3-FIFO stacks use for
 /// their one-bit reference flag -- a reference bit being a one-bit frequency
-/// counter, the shared node carries one field, not two. `ts` and `phys` belong
-/// to other policies and stay at their defaults here.
+/// counter, the shared node carries one field, not two. `ts` belongs
+/// to other policies and stays at its default here.
 pub struct S3FifoFaithfulCore<const SMALL_IS_FAST: bool, const REPRIEVE: bool> {
 	ratio: f64,
 
@@ -295,7 +295,6 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 				ts: 0,
 				queue: Queue::Main as u8,
 				tier: Some(Tier::Slow),
-				phys: Some(Tier::Slow),
 				dram_resident,
 			},
 		);
@@ -477,7 +476,6 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 					ts: 0,
 					queue: Queue::Main as u8,
 					tier: Some(Tier::Fast),
-					phys: Some(Tier::Fast),
 					dram_resident,
 				},
 			);
@@ -508,7 +506,6 @@ impl<const SMALL_IS_FAST: bool, const REPRIEVE: bool> S3FifoFaithfulCore<SMALL_I
 				ts: 0,
 				queue: Queue::Small as u8,
 				tier: Self::small_tier(),
-				phys: Self::small_tier(),
 				dram_resident,
 			},
 		);
