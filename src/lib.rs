@@ -1142,8 +1142,10 @@ where
 	}
 
 	/// Sets the supplied key and value in the cache.
-	/// Returns a [`CacheError`] if the value size is zero or larger than
-	/// the cache's maximum size.
+	/// Returns a [`CacheError`] if the value size is zero or too large for the
+	/// cache to hold: [`CacheError::ExceedingValueSize`] when the object's
+	/// accounted size is over the level capacity eviction holds the cache at
+	/// (`EVICTION_HIGH_WATERMARK`, 0.98 of the maximum size by default).
 	///
 	/// If the key already exists in the cache, the associated value is updated
 	/// to the supplied value.
@@ -1170,7 +1172,7 @@ where
 		match self.overhead_manager.base_size_for(&key, value.len(), ttl) {
 			None => return Err(CacheError::ExceedingValueSize),
 			Some(0) => return Err(CacheError::ZeroValueSize),
-			Some(base) if self.status.exceeds_max_size(base) => return Err(CacheError::ExceedingValueSize),
+			Some(base) if self.status.exceeds_eviction_threshold(base) => return Err(CacheError::ExceedingValueSize),
 			Some(_) => {},
 		}
 
@@ -1735,8 +1737,10 @@ where
 	///
 	/// # Errors
 	///
-	/// [`CacheError::ExceedingValueSize`] for a value larger than the cache's
-	/// maximum size (refused before it is built); [`CacheError::ZeroValueSize`]
+	/// [`CacheError::ExceedingValueSize`] for a value the cache could not hold:
+	/// its accounted size is over the eviction threshold, `EVICTION_HIGH_WATERMARK`
+	/// (0.98 by default) of the cache's maximum size (refused before it is
+	/// built); [`CacheError::ZeroValueSize`]
 	/// as before (a zero base size, which no object has -- an empty value is
 	/// stored); [`CacheError::MetadataOverflow`] for a new key whose metadata
 	/// would not fit (see [`GateConfig::on_metadata_overflow`]);
@@ -1772,7 +1776,7 @@ where
 			return Err(CacheError::ZeroValueSize);
 		}
 
-		if self.status.exceeds_max_size(base) {
+		if self.status.exceeds_eviction_threshold(base) {
 			return Err(CacheError::ExceedingValueSize);
 		}
 

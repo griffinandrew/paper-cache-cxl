@@ -294,6 +294,10 @@ pub use crate::worker::policy::Placement;
 #[cfg(feature = "hybrid_cache_common")]
 pub(crate) use crate::worker::policy::drain_target;
 
+// The capacity-eviction watermarks, for `AtomicStatus`: the one snapshot the
+// policy worker's passes and the client's size check read.
+pub(crate) use crate::worker::policy::eviction_watermarks::Watermarks;
+
 // The lock every unit test that drives a migration holds, for `crate::phys`'s
 // served-hit test, which builds a real demoting cache. See its doc.
 #[cfg(all(test, feature = "hybrid_cache_common"))]

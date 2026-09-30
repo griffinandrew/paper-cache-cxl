@@ -1284,14 +1284,22 @@ pub mod migstats {
 /// byte gate: the gate bounds the FAST TIER's bytes (`drain_target` of
 /// `eff`, closed at `B`), this bounds the WHOLE cache's `used_size`.
 ///
-/// One consequence to know: a set is refused only above `max_size`
-/// (`ExceedingValueSize`), so a value whose accounted size lands between 98% of
-/// `max_size` and `max_size` is accepted, puts `used_size` over the threshold
-/// at once, and the pass that follows evicts everything else and then the
-/// value itself. That window was only the per-object overhead wide before E1
-/// (the refusal compares the base size with `max_size`, `used_size` adds the
-/// policy's overhead); it is 2% of `max_size` now. The refusal was left where
-/// it is.
+/// A set is therefore refused (`ExceedingValueSize`) when its ACCOUNTED size --
+/// the base size plus the per-object overhead, which is what `used_size` and
+/// this loop charge for it -- exceeds the arming level
+/// (`AtomicStatus::exceeds_eviction_threshold`, read from the same
+/// `Watermarks` the loop reads, against the current `max_size()`, so an
+/// override and a `resize` move it alike). A value over the level cannot be
+/// held: `used_size` would pass the level at once and the pass that follows
+/// would evict everything else and then the value itself, so it is refused
+/// where it is offered instead. (Until then a set was refused only above
+/// `max_size` on its base size, so a value between the level and the cap was
+/// accepted and lost: a window the per-object overhead wide before E1, 2% of
+/// `max_size` after it.) With the arming level at the cap
+/// (`EVICTION_HIGH_WATERMARK=1.0`) the refusal is the old one exactly, the
+/// base size against `max_size`. Only the arming level matters to it: with an
+/// opted-in band (a low mark below the level), a value between the two is
+/// kept until a pass arms and then drains it with the rest.
 ///
 /// Until E1 the defaults were 1.0/1.0 and this doc said they MUST STAY there,
 /// because every published sweep (`results/policy_sweep_110_cells.md` and the
@@ -1429,6 +1437,13 @@ pub mod eviction_watermarks {
 		/// `floor(0.98 * max_size)`.
 		pub fn bytes(&self, max_size: CacheSize) -> (CacheSize, CacheSize) {
 			(scaled(max_size, self.high), scaled(max_size, self.low))
+		}
+
+		/// Whether the arming level is the cap itself (`>= 1.0`): the
+		/// pre-E1 loop, and the pre-E1 size check (see
+		/// `AtomicStatus::exceeds_eviction_threshold`).
+		pub fn at_cap(&self) -> bool {
+			self.high >= 1.0
 		}
 	}
 }
@@ -1800,7 +1815,9 @@ pub struct PolicyWorker<K, V> {
 	policy_stack: Box<dyn PolicyStack>,
 
 	/// Capacity-eviction watermarks for `apply_evictions`, snapshotted at
-	/// construction (see `eviction_watermarks::Watermarks`). `0.98`/`0.98`
+	/// construction from the status (`AtomicStatus::eviction_watermarks`, which
+	/// the client's size check reads too; see `eviction_watermarks::
+	/// Watermarks`). `0.98`/`0.98`
 	/// -- one threshold, 98% of `max_size` -- unless
 	/// `EVICTION_HIGH_WATERMARK`/`EVICTION_LOW_WATERMARK` say otherwise
 	/// (`1.0` is the pre-E1 drain-to-exactly-`max_size` loop).
@@ -2253,6 +2270,9 @@ where
 			)?,
 		);
 
+		// The status's snapshot: the one the client's size check reads.
+		let eviction_watermarks = status.eviction_watermarks();
+
 		let worker = PolicyWorker {
 			listener,
 
@@ -2261,7 +2281,7 @@ where
 			overhead_manager,
 
 			policy_stack,
-			eviction_watermarks: eviction_watermarks::Watermarks::from_env(),
+			eviction_watermarks,
 
 			last_set_time: None,
 
@@ -2356,6 +2376,9 @@ where
 			status.clone(),
 		);
 
+		// The status's snapshot: the one the client's size check reads.
+		let eviction_watermarks = status.eviction_watermarks();
+
 		let worker = PolicyWorker {
 			listener,
 
@@ -2364,7 +2387,7 @@ where
 			overhead_manager,
 
 			policy_stack,
-			eviction_watermarks: eviction_watermarks::Watermarks::from_env(),
+			eviction_watermarks,
 
 			last_set_time: None,
 

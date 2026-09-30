@@ -3434,9 +3434,36 @@ every key above the mark. Nothing else changed its expectation. T14: 24 of the 3
 not (their used size never passes 98% of the cache's size at any op; the victims in `-c-evict` are
 `MakeRoom`'s).
 
-A known edge, left for a decision: a set is refused only above `max_size`, so a value whose accounted
-size lands between 98% and 100% of it is accepted and then evicted at once, with the rest of the
-cache (before E1 that needed the value to be within the per-object overhead of the cap).
+A known edge, left for a decision (settled by the next section): a set is refused only above
+`max_size`, so a value whose accounted size lands between 98% and 100% of it is accepted and then
+evicted at once, with the rest of the cache (before E1 that needed the value to be within the
+per-object overhead of the cap).
+
+## A value the eviction threshold cannot hold is refused (V)
+
+The edge above, closed (the user approved it, 2026-09-29): a set is now refused with
+`ExceedingValueSize` when its ACCOUNTED size -- the base size plus the per-object overhead, exactly
+what `used_size` and the eviction loop charge for it -- is over the arming level, the high watermark
+times the cache's current `max_size`. (It used to be refused only when its BASE size exceeded
+`max_size`; a 30,000-byte value, 32,876 accounted, alone in a cache of 33,276 to 33,526 bytes was
+kept before E1 and was lost under it, and is refused now.) The predicate is
+`AtomicStatus::exceeds_eviction_threshold`, called by both set paths (`PaperCache::set` for the flat
+cache, `begin_set` for the tiered one), so it holds for every cache -- flat and tiered, over the
+DashMap and the merged store. It reads the same `Watermarks` the eviction loop reads (the status keeps
+the one snapshot, taken from the environment when it is built, and the policy worker's
+`apply_evictions` takes its own from it) against the current `max_size`, so an override and a
+`resize` move it together. `EVICTION_HIGH_WATERMARK=1.0` restores the old edge exactly: the base size
+against `max_size`, in no case an accounted-size test. With an opted-in band (a low mark below the high
+one) only the arming level matters: a value between the two is kept until a pass arms, then drained
+with the rest. `CacheError::ExceedingValueSize` says all of this now, and its message no longer says
+"cache size".
+
+Tests (in `s5_tests.rs`, over this build's store): the reproduction, refused in the window, held at
+the smallest cap whose threshold reaches its accounted size and refused one byte under it (flat and
+tiered, kept after the worker has handled it); the refusal following a `resize`, on the status and
+through real caches; and, each in a child process that has the variable from the start, the cap
+(`=1.0`) restoring the old edge and a band (`=0.75`, `EVICTION_LOW_WATERMARK=0.5`) refusing above its
+arming level. Each was made red against the old check. No other test changed, and T14 is untouched.
 
 ## The fast tier's drain target, 0.95 by default (E1b)
 

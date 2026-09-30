@@ -89,6 +89,14 @@ pub struct AtomicStatus {
 	base_used_size: AtomicCacheSize,
 	num_objects: AtomicU64,
 
+	/// The capacity-eviction watermarks (`eviction_watermarks`), snapshotted
+	/// from the environment when the status is built: the pair the policy
+	/// worker's `apply_evictions` arms and drains at, and the level the
+	/// client's size check refuses a value above
+	/// (`exceeds_eviction_threshold`). One snapshot, so the two cannot
+	/// disagree.
+	eviction_watermarks: crate::worker::Watermarks,
+
 	total_hits: AtomicU64,
 	total_gets: AtomicU64,
 	total_sets: AtomicU64,
@@ -399,6 +407,8 @@ impl AtomicStatus {
 			base_used_size: AtomicCacheSize::default(),
 			num_objects: AtomicU64::default(),
 
+			eviction_watermarks: crate::worker::Watermarks::from_env(),
+
 			total_hits: AtomicU64::default(),
 			total_gets: AtomicU64::default(),
 			total_sets: AtomicU64::default(),
@@ -622,6 +632,42 @@ impl AtomicStatus {
 	#[must_use]
 	pub fn exceeds_max_size(&self, size: impl AsPrimitive<u64>) -> bool {
 		size.as_() > self.max_size.load(Ordering::Relaxed)
+	}
+
+	/// The capacity-eviction watermarks this cache runs under: the process's
+	/// (`EVICTION_HIGH_WATERMARK`, `EVICTION_LOW_WATERMARK`), as read when the
+	/// status was built.
+	pub(crate) fn eviction_watermarks(&self) -> crate::worker::Watermarks {
+		self.eviction_watermarks
+	}
+
+	/// Whether a set of an object with this BASE size must be refused
+	/// (`CacheError::ExceedingValueSize`): the object could not be held.
+	///
+	/// The eviction loop arms when `used_size` passes the arming level (the
+	/// high watermark times `max_size`, read as `apply_evictions` reads it: the
+	/// same `Watermarks`, the current `max_size`) and drains until it is under
+	/// it, and `used_size` charges an object its base size plus the policy's
+	/// per-object overhead. An object whose accounted size alone is over the
+	/// level would arm a pass that evicts everything else and then the object
+	/// itself, so it is refused instead of accepted and lost.
+	///
+	/// With the arming level at the cap (`EVICTION_HIGH_WATERMARK=1.0`) this is
+	/// the check the cache had before the watermark, exactly: the BASE size
+	/// against `max_size`.
+	#[must_use]
+	pub fn exceeds_eviction_threshold(&self, base_size: impl AsPrimitive<u64>) -> bool {
+		let base_size = base_size.as_();
+
+		if self.eviction_watermarks.at_cap() {
+			return self.exceeds_max_size(base_size);
+		}
+
+		let max_size = self.max_size.load(Ordering::Relaxed);
+		let (trigger, _) = self.eviction_watermarks.bytes(max_size);
+		let accounted = base_size.saturating_add(get_policy_overhead(&self.policy) as CacheSize);
+
+		accounted > trigger
 	}
 
 	/// Current fast-tier byte budget (every hybrid design's whole fast tier,

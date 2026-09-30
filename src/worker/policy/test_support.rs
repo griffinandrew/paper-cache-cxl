@@ -60,12 +60,21 @@ fn in_child() -> bool {
 /// T14's gate half (`s4_tests`).
 #[cfg(feature = "hybrid_cache_common")]
 pub(super) fn alone_in(module: &str, test: &str, body: impl FnOnce()) {
+	alone_in_with_env(module, test, &[], body);
+}
+
+/// `alone_in`, with `env` set in the child: for a setting the crate reads once
+/// per process (`EVICTION_HIGH_WATERMARK` and the like, memoised in a
+/// `OnceLock`), which a test can only choose by starting a process of its own
+/// with it. The parent's environment is untouched.
+#[cfg(feature = "hybrid_cache_common")]
+pub(super) fn alone_in_with_env(module: &str, test: &str, env: &[(&str, &str)], body: impl FnOnce()) {
 	if in_child() {
 		body();
 		return;
 	}
 
-	run_in_child(module, test, None);
+	run_in_child(module, test, None, env);
 }
 
 /// `test`, of `module`, once per case of `cases` -- a policy, a design, an
@@ -89,12 +98,13 @@ pub(super) fn each_alone_in<T: Copy>(module: &str, test: &str, cases: impl AsRef
 	}
 
 	for index in 0..cases.len() {
-		run_in_child(module, test, Some(index));
+		run_in_child(module, test, Some(index), &[]);
 	}
 }
 
-/// Runs the child copy of this test binary for `alone_in` and `each_alone_in`.
-fn run_in_child(module: &str, test: &str, case: Option<usize>) {
+/// Runs the child copy of this test binary for `alone_in` and `each_alone_in`,
+/// with `env` added to its environment.
+fn run_in_child(module: &str, test: &str, case: Option<usize>, env: &[(&str, &str)]) {
 	// libtest names a test by its path without the crate.
 	let (_, module) = module.split_once("::").expect("a module path");
 	let name = format!("{module}::{test}");
@@ -111,6 +121,10 @@ fn run_in_child(module: &str, test: &str, case: Option<usize>) {
 		.env("MIGRATION_QUEUE_THREADS", "2")
 		.stdout(file.try_clone().expect("the output file, twice"))
 		.stderr(file);
+
+	for (name, value) in env {
+		command.env(name, value);
+	}
 
 	if let Some(index) = case {
 		command.env(CASE, index.to_string());

@@ -20,7 +20,8 @@
 use std::time::{Duration, Instant};
 
 use super::*;
-use super::test_support::{client_set, decide, each_alone, parked_on_the_long_poll, stack, wait_for};
+use super::eviction_watermarks::{DEFAULT_HIGH, Watermarks};
+use super::test_support::{alone_in_with_env, client_set, decide, each_alone, parked_on_the_long_poll, stack, wait_for};
 use super::reconcile_tests::{
 	Objects, Worker, FAST, LEN, assert_settled, bytes_tier, drain_and_apply, handle, make_worker, of,
 	placement, publish, publish_del,
@@ -28,7 +29,7 @@ use super::reconcile_tests::{
 
 use crate::gate::{GateConfig, MetadataModel, MetadataOverflow, Verdict};
 use crate::object::Object;
-use crate::object::overhead::{OverheadManager, test_overheads};
+use crate::object::overhead::{OverheadManager, get_policy_overhead, test_overheads};
 use crate::status::AtomicStatus;
 use crate::{CacheTierSize, PaperCache, TieredBuffer};
 
@@ -284,6 +285,299 @@ fn an_oversize_value_is_refused_before_it_is_allocated() {
 	assert_eq!(result, Err(CacheError::ExceedingValueSize));
 	assert!(allocated < 4_096, "the refused 2 MiB set allocated {allocated} bytes");
 	assert_eq!(cache.status.live_num_objects(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The eviction threshold and the size check (V)
+
+/// A cache of either shape, for the tests of the size check below: FLAT
+/// (`BufferDRAM`, LRU) and TIERED (`TieredBuffer`, LRU hybrid, the fast tier as
+/// large as the cache, the per-object metadata model so that a cache of a few
+/// tens of KB is not "metadata bound"). Both go through the client's real
+/// `set`, over this build's object store.
+trait Probe {
+	fn set_value(&self, key: u64, len: usize) -> Result<(), CacheError>;
+	fn resize_to(&self, max_size: CacheSize) -> Result<(), CacheError>;
+	fn status(&self) -> &AtomicStatus;
+}
+
+/// The flat cache exists in the builds that select a flat object store.
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem"))]
+impl Probe for PaperCache<u64, crate::BufferDRAM> {
+	fn set_value(&self, key: u64, len: usize) -> Result<(), CacheError> {
+		self.set(key, &vec![0xAB; len], None)
+	}
+
+	fn resize_to(&self, max_size: CacheSize) -> Result<(), CacheError> {
+		self.resize(max_size)
+	}
+
+	fn status(&self) -> &AtomicStatus {
+		&self.status
+	}
+}
+
+impl Probe for PaperCache<u64, TieredBuffer> {
+	fn set_value(&self, key: u64, len: usize) -> Result<(), CacheError> {
+		self.set(key, &vec![0xAB; len], None)
+	}
+
+	fn resize_to(&self, max_size: CacheSize) -> Result<(), CacheError> {
+		self.resize(max_size)
+	}
+
+	fn status(&self) -> &AtomicStatus {
+		&self.status
+	}
+}
+
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem"))]
+const FLAT: PaperPolicy = PaperPolicy::LruCompact;
+const TIERED: PaperPolicy = PaperPolicy::LruCompactHybrid;
+
+/// The shapes' names and policies: the tiered cache, and the flat one where the
+/// build has it.
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem"))]
+const SHAPES: [(&str, PaperPolicy); 2] = [("flat", FLAT), ("tiered", TIERED)];
+#[cfg(not(any(feature = "all_dram", feature = "key_value_pmem")))]
+const SHAPES: [(&str, PaperPolicy); 1] = [("tiered", TIERED)];
+
+/// A cache of `policy`'s shape with a cap of `max_size` bytes, handed to `body`
+/// and dropped (its workers joined) after it.
+fn with_cache(policy: PaperPolicy, max_size: CacheSize, body: impl FnOnce(&dyn Probe)) {
+	#[cfg(any(feature = "all_dram", feature = "key_value_pmem"))]
+	if policy == FLAT {
+		let cache = PaperCache::<u64, crate::BufferDRAM>::new(max_size, &[FLAT], FLAT).expect("a flat cache");
+
+		return body(&cache);
+	}
+
+	let mut config = GateConfig::default();
+	config.metadata_model = MetadataModel::PerObject;
+
+	let cache = PaperCache::<u64, TieredBuffer>::new_with_gate(max_size, CacheTierSize::Bytes(max_size), policy, config)
+		.expect("a tiered cache");
+
+	body(&cache);
+}
+
+/// Base size and accounted size -- the base plus the per-object overhead
+/// `used_size` charges, which is what the eviction loop counts -- of a `len`-byte
+/// value of a `u64` key under `policy`.
+fn base_and_accounted(policy: PaperPolicy, len: usize) -> (CacheSize, CacheSize) {
+	let status = Arc::new(AtomicStatus::new(1 << 30, &[policy], policy).unwrap());
+	let overhead_manager = OverheadManager::new(&status);
+
+	let base = overhead_manager.base_size_for(&1u64, len, None).expect("a length in range") as CacheSize;
+
+	(base, base + get_policy_overhead(&policy) as CacheSize)
+}
+
+/// The smallest cap whose arming level under `marks` is at least `accounted`
+/// bytes: a value of that accounted size is held by it and refused by every
+/// cap one byte smaller.
+fn smallest_cap_holding(marks: Watermarks, accounted: CacheSize) -> CacheSize {
+	let cap = (0..).map(|extra| accounted + extra).find(|cap| marks.bytes(*cap).0 >= accounted).unwrap();
+
+	assert_eq!(marks.bytes(cap).0, accounted, "the level steps by at most one byte per byte of cap");
+	assert_eq!(marks.bytes(cap - 1).0, accounted - 1);
+
+	cap
+}
+
+/// Every event sent so far has been handled: two whole passes of the policy
+/// worker after this call, the worker kicked off its idle poll.
+fn quiesce(status: &AtomicStatus) {
+	let passes = status.policy_worker_passes();
+
+	wait_for("two more passes of the policy worker", Duration::from_secs(10), || {
+		status.kick_policy_worker();
+		status.policy_worker_passes() >= passes + 2
+	});
+}
+
+/// A run that exports an eviction watermark override chose its own operating
+/// point, and the tests of the DEFAULT one have nothing to say about it.
+fn overridden() -> bool {
+	std::env::var_os("EVICTION_HIGH_WATERMARK").is_some() || std::env::var_os("EVICTION_LOW_WATERMARK").is_some()
+}
+
+/// V: a value the eviction threshold cannot hold is REFUSED, not accepted and
+/// then evicted with the whole cache. The E1 agent's reproduction: a
+/// 30,000-byte value (32,876 accounted in some builds) alone in a cache a
+/// hundredth over its accounted size -- inside the 2% window between the
+/// threshold (98% of `max_size`) and the cap -- was kept before E1 and was lost
+/// under it, because a set was refused only above `max_size` on its BASE size.
+/// Now `ExceedingValueSize`, nothing built or counted. And the boundary is
+/// exact, to the byte, on the ACCOUNTED size (base plus per-object overhead,
+/// what the loop charges): a value whose accounted size equals the threshold
+/// is held -- kept, after the worker has handled it -- and a cap one byte
+/// smaller refuses it. Flat and tiered, over this build's store. Red with the
+/// check on the base size against `max_size` (the code before V).
+#[test]
+fn a_value_the_eviction_threshold_cannot_hold_is_refused() {
+	if overridden() {
+		return;
+	}
+
+	let _serialised = migration_test_lock::lock();
+
+	const LEN: usize = 30_000;
+
+	let marks = Watermarks::new(DEFAULT_HIGH, DEFAULT_HIGH);
+
+	for (shape, policy) in SHAPES {
+		let (base, accounted) = base_and_accounted(policy, LEN);
+
+		assert!(accounted > base, "{shape}: an object is charged an overhead beyond its base size");
+
+		// Inside the window: the threshold is under the accounted size, the cap over it.
+		let window = accounted + accounted / 100;
+
+		assert!(marks.bytes(window).0 < accounted && accounted <= window, "{shape}: {accounted} accounted in a cache of {window}");
+		assert!(base <= window, "{shape}: the base size fits, as the old check saw it");
+
+		with_cache(policy, window, |cache| {
+			assert_eq!(cache.set_value(1, LEN), Err(CacheError::ExceedingValueSize), "{shape}: refused in the window");
+			assert_eq!(cache.status().live_num_objects(), 0, "{shape}: and nothing was built");
+
+			quiesce(cache.status());
+			assert_eq!(cache.status().live_num_objects(), 0, "{shape}");
+		});
+
+		// The boundary: held at the smallest cap whose threshold reaches the
+		// accounted size, refused one byte under it.
+		let cap = smallest_cap_holding(marks, accounted);
+
+		with_cache(policy, cap, |cache| {
+			assert_eq!(cache.set_value(1, LEN), Ok(()), "{shape}: held at a cap of {cap} ({accounted} accounted)");
+			quiesce(cache.status());
+			assert_eq!(cache.status().live_num_objects(), 1, "{shape}: and kept, not evicted with the cache");
+		});
+
+		with_cache(policy, cap - 1, |cache| {
+			assert_eq!(
+				cache.set_value(1, LEN),
+				Err(CacheError::ExceedingValueSize),
+				"{shape}: refused at a cap of {} ({accounted} accounted, threshold {})",
+				cap - 1,
+				marks.bytes(cap - 1).0,
+			);
+			assert_eq!(cache.status().live_num_objects(), 0);
+		});
+	}
+}
+
+/// V: the refusal is read against the CURRENT `max_size`, as the eviction loop
+/// reads its threshold, so a `resize` moves it -- on the status and through a
+/// real cache of either shape. A value held at a cap is refused after the
+/// cache shrinks by a byte, and held again after it grows back.
+#[test]
+fn the_refusal_moves_with_a_resize() {
+	if overridden() {
+		return;
+	}
+
+	let _serialised = migration_test_lock::lock();
+
+	const LEN: usize = 5_000;
+
+	let marks = Watermarks::new(DEFAULT_HIGH, DEFAULT_HIGH);
+
+	for (shape, policy) in SHAPES {
+		let (base, accounted) = base_and_accounted(policy, LEN);
+		let cap = smallest_cap_holding(marks, accounted);
+
+		let status = AtomicStatus::new(cap, &[policy], policy).unwrap();
+
+		assert_eq!(status.eviction_watermarks(), marks, "{shape}: the status runs the default watermarks");
+		assert!(!status.exceeds_eviction_threshold(base), "{shape}: held at {cap}");
+
+		status.set_max_size(cap - 1);
+		assert!(status.exceeds_eviction_threshold(base), "{shape}: refused at {}", cap - 1);
+
+		status.set_max_size(cap);
+		assert!(!status.exceeds_eviction_threshold(base), "{shape}: held again at {cap}");
+
+		with_cache(policy, 1 << 20, |cache| {
+			assert_eq!(cache.set_value(1, LEN), Ok(()), "{shape}: held in a cache of 1 MiB");
+
+			cache.resize_to(cap - 1).expect("resize");
+			assert_eq!(cache.set_value(2, LEN), Err(CacheError::ExceedingValueSize), "{shape}: refused after a shrink to {}", cap - 1);
+
+			cache.resize_to(cap).expect("resize");
+			assert_eq!(cache.set_value(2, LEN), Ok(()), "{shape}: held after growing back to {cap}");
+		});
+	}
+}
+
+/// V, `EVICTION_HIGH_WATERMARK=1.0`: the arming level at the cap restores the
+/// old edge EXACTLY -- a set is refused when its BASE size exceeds `max_size`,
+/// not one byte earlier, and a value whose base size fits but whose accounted
+/// size does not is accepted, as it always was. In a child process, where the
+/// variable (memoised per process) is in place from the start.
+#[test]
+fn at_the_cap_the_refusal_is_the_old_edge_exactly() {
+	alone_in_with_env(module_path!(), "at_the_cap_the_refusal_is_the_old_edge_exactly", &[("EVICTION_HIGH_WATERMARK", "1.0")], || {
+		const LEN: usize = 30_000;
+
+		for (shape, policy) in SHAPES {
+			let (base, accounted) = base_and_accounted(policy, LEN);
+
+			assert!(accounted >= base + 2, "{shape}: the window between the base and the accounted size has room");
+
+			// The base size fits, the accounted size does not: accepted. Exactly
+			// the base size: accepted. One byte under it: refused.
+			for (cap, expected) in [
+				(base + (accounted - base) / 2, Ok(())),
+				(base, Ok(())),
+				(base - 1, Err(CacheError::ExceedingValueSize)),
+			] {
+				with_cache(policy, cap, |cache| {
+					assert!(cache.status().eviction_watermarks().at_cap(), "the child runs the override");
+					assert_eq!(cache.status().exceeds_eviction_threshold(base), cap < base);
+					assert_eq!(cache.set_value(1, LEN), expected, "{shape}: cap {cap}, base {base}, accounted {accounted}");
+				});
+			}
+		}
+	});
+}
+
+/// V, an opted-in band (`EVICTION_HIGH_WATERMARK=0.75`, `EVICTION_LOW_WATERMARK=
+/// 0.5`): the refusal follows the ARMING level, the high mark, not the drain
+/// target -- a value whose accounted size is over the high mark is refused and
+/// one at it is held until a pass arms. In a child process (see above).
+#[test]
+fn a_band_refuses_above_its_arming_level() {
+	alone_in_with_env(
+		module_path!(),
+		"a_band_refuses_above_its_arming_level",
+		&[("EVICTION_HIGH_WATERMARK", "0.75"), ("EVICTION_LOW_WATERMARK", "0.5")],
+		|| {
+			const LEN: usize = 20_000;
+
+			let marks = Watermarks::new(0.75, 0.5);
+
+			for (shape, policy) in SHAPES {
+				let (_, accounted) = base_and_accounted(policy, LEN);
+				let cap = smallest_cap_holding(marks, accounted);
+
+				// Between the drain target and the arming level: kept until a pass arms.
+				assert!(marks.bytes(cap).1 < accounted);
+
+				with_cache(policy, cap, |cache| {
+					assert_eq!(cache.status().eviction_watermarks(), marks);
+					assert_eq!(cache.set_value(1, LEN), Ok(()), "{shape}: held at the arming level");
+					quiesce(cache.status());
+					assert_eq!(cache.status().live_num_objects(), 1, "{shape}: and no pass armed");
+				});
+
+				with_cache(policy, cap - 1, |cache| {
+					assert_eq!(cache.set_value(1, LEN), Err(CacheError::ExceedingValueSize), "{shape}: refused over it");
+				});
+			}
+		},
+	);
 }
 
 // ---------------------------------------------------------------------------

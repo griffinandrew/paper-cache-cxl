@@ -18,7 +18,20 @@ pub enum CacheError {
 	#[error("the value size cannot be zero")]
 	ZeroValueSize,
 
-	#[error("the value size cannot exceed the cache size")]
+	/// The value could not be held by the cache: its accounted size -- the
+	/// base size (key, value and expiry as the allocator rounds them) plus the
+	/// per-object overhead the cache charges for every object -- is over the
+	/// level capacity eviction holds the cache at, so accepting it would evict
+	/// the whole cache and then the value itself.
+	///
+	/// That level is `EVICTION_HIGH_WATERMARK` (0.98 by default) of the cache's
+	/// current `max_size`, so it moves with `resize`; a value whose size is
+	/// close to `max_size` is refused, not only one larger than it. With
+	/// `EVICTION_HIGH_WATERMARK=1.0` only a value whose base size exceeds
+	/// `max_size` is (the check before the watermark existed). Refused before
+	/// the value is allocated, in every cache: flat and tiered, over either
+	/// object store.
+	#[error("the value size cannot exceed the cache's eviction threshold")]
 	ExceedingValueSize,
 
 	#[error("the cache size cannot be zero")]
