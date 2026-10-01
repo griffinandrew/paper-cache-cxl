@@ -52,14 +52,6 @@ hashbrown = "0.16.1"
 allocator-api2 =  "0.2.21"
 triomphe = { version = "0.1.16", default-features = false, features = ["std"] }
 
-
-# The cache served over TCP. Behind `server` so a library consumer never
-# builds it, and so the binary's argument handling stays out of the lib.
-[[bin]]
-name = "paper-server"
-path = "src/bin/paper_server.rs"
-required-features = ["server"]
-
 [features]
 # Per-pool live-byte counters in `numa_alloc`, incremented per allocation the
 # way Redis's `zmalloc` does. Reporting only -- nothing reads them to make a
@@ -70,10 +62,6 @@ measured_accounting = []
 # bytes. The metadata demotes with the value; the refcount a read bumps stays
 # local. See `src/value_thin.rs`.
 thin_header = []
-# Serves the tiered cache over a socket. Pulls in `hybrid_cache_common` for the
-# tiering machinery; the caller still picks which hybrid DESIGN to compile, e.g.
-# `--features server,lru_compact_hybrid_cache`.
-server = ["hybrid_cache_common"]
 # Core feature to enable key and value storage in PMEM
 key_value_pmem = ["numa_jemalloc"]
 
@@ -118,7 +106,7 @@ merged_object_store = ["numa_jemalloc"]
 
 # Enable PMEM-backed eviction stacks. Eviction-stack metadata (the compact
 # stacks' slabs and indexes, the hybrid stacks' arenas) is allocated via
-# `crate::Hybrid` (`numa_alloc::SlowObjects`, node-1-bound jemalloc arenas) --
+# `crate::Hybrid` (`numa_alloc::SlowObjects`, node-2-bound jemalloc arenas) --
 # the same allocator BufferPMEM and the other PMEM features use, so enabling
 # this alone requires no other PMEM feature.
 eviction_stacks_pmem = ["numa_jemalloc"]

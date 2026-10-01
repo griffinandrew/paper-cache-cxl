@@ -11,7 +11,8 @@
 //! `numa_alloc::measured::slow_allocated()` is what the slow allocator actually
 //! handed out. Nothing but cached values is allocated on the slow node, so once
 //! the cache is idle the two must be the same number. This is the slow row of
-//! paper-server's `*** MEASURED vs MODELLED ***` report, pinned.
+//! paper-server's `*** MEASURED vs MODELLED ***` report (paper-server-cxl, `src/selfstats.rs`),
+//! pinned.
 //!
 //! It was not the same number before `split_tier_migrations`. A hit on a key
 //! the fast budget could not hold queued a promotion and, from the settle

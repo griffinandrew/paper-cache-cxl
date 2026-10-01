@@ -12,7 +12,7 @@
 //! dropped P is back where it started: every fast allocation was refunded.
 //!
 //! Run with:
-//!   cargo +nightly test --release --features server,lru_compact_hybrid_cache \
+//!   cargo +nightly test --release --features lru_compact_hybrid_cache \
 //!     --test phys_fast_identity
 //!
 //! A binary of its own because P and the live-cache counts are

@@ -7,7 +7,8 @@ Guidance for Claude Code (and other agents) working in this repository.
 `paper-cache` (crate name in `Cargo.toml`) is an in-memory Rust cache library ("PaperCache") with
 a choice of eviction policies -- one per cache, fixed when it is built -- and, on this branch,
 DRAM/PMEM (CXL) memory tiering. It is consumed by a separate `paper-server` crate (not in this
-repo) and should not normally be used directly by application code.
+repo: github.com/griffinandrew/paper-server-cxl, branch `tiered-cache`, from commit 898a263) and
+should not normally be used directly by application code.
 
 The defining theme of this fork/branch is **experimenting with where cache data structures and
 object bytes physically live** — DRAM vs. persistent/CXL memory (PMEM) — via a large matrix of
@@ -3714,9 +3715,12 @@ the tiers (`tests/generic_key_smoke.rs`).
 `PaperCache::set` takes the value as a slice, so a server has to read a request's body into a buffer of its
 own before the cache can even decide whether to take it -- a buffer no budget covers, and a copy into the
 cache's allocation after it. A server can now admit the set first, then read the body straight into the
-value's final allocation (`src/permit.rs`; the in-repo `src/bin/paper_server.rs` is unchanged: the server
-moves to its own repository, which is where the wire half -- error codes for `FastTierStalled` and
-`MetadataOverflow`, `SO_RCVTIMEO` while a permit is held, `get_with` -- belongs):
+value's final allocation (`src/permit.rs`; the server has moved to its own repository,
+github.com/griffinandrew/paper-server-cxl, branch `tiered-cache`, from commit 898a263 -- `src/bin/paper_server.rs`,
+`scripts/probe_server.py` and the `server` feature are gone from this one -- which is where the wire half --
+error codes for `FastTierStalled` and `MetadataOverflow`, `SO_RCVTIMEO`
+while a permit is held, `get_with` -- belongs; its SET arm, `set_timeout` and codes 8 and 9 are built there,
+`get_with` is not):
 
 - `PaperCache::reserve_set(key, len, ttl, deadline: Instant) -> Result<SetPermit, CacheError>`: everything
   `set` decides from the key and the LENGTH (`begin_set`: the size checks, the metadata cap, the tier,
@@ -3751,12 +3755,15 @@ set that is out of time is not built slow or admitted over the budget), and a de
 passed waits not at all. With `stall_window` 0 and time left, `on_stall` still acts at once. `set` has none.
 The docs of `FastTierStalled` and `MetadataOverflow` say so.
 
-The concurrency hint. `PaperCache::register_setter() -> SetterGuard` counts a live setter (a connection a
-server has accepted) until the guard drops; `live_setters()` reads the count. The policy worker publishes the
-near band with `(concurrency_hint + live setters) x value_hint` (`Gate::bands_for`), so the setters in flight
-when the tier fills overshoot by what the band leaves room for; registering and releasing both kick the worker.
-With no setter registered the band is the configuration's exactly, and with `value_hint` 0 (the default) a
-registered setter widens nothing.
+The concurrency hint. `PaperCache::register_setter() -> SetterGuard` counts a live setter until the guard
+drops; `live_setters()` reads the count. What a setter is, is the caller's to say: paper-server-cxl registers
+one per SET in flight (not one per accepted connection: an idle connection overshoots nothing), and only when
+that can widen anything -- the gate on (`PAPER_GATE_MODE` not `off`: the policy worker publishes bands only
+while the gate is enabled) and `value_hint` above 0 -- because registering and releasing both kick the
+worker, two wake-ups per SET. The policy worker publishes the near band with `(concurrency_hint + live
+setters) x value_hint` (`Gate::bands_for`), so the setters in flight when the tier fills overshoot by what
+the band leaves room for. With no setter registered the band is the configuration's exactly, and with
+`value_hint` 0 (the default) a registered setter widens nothing.
 
 Tests (`worker/policy/s9_tests.rs`, T16's library side; each that reads P alone in a child process): reserve +
 fill + commit and `set` give the same objects, status, stack bytes and P, over `u64` and `String` keys, with

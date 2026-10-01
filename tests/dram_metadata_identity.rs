@@ -86,7 +86,7 @@
 //!
 //! A binary of its own: the pool is process-global. Run with
 //!   cargo +nightly test --release --features \
-//!     server,lru_compact_hybrid_cache,measured_accounting --test dram_metadata_identity
+//!     lru_compact_hybrid_cache,measured_accounting --test dram_metadata_identity
 //! and with merged_object_store, thin_header or segregated_value_arena added.
 #![cfg(all(feature = "hybrid_cache_common", feature = "measured_accounting"))]
 #![feature(internal_output_capture)]

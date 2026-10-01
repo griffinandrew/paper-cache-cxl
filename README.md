@@ -2,7 +2,7 @@
 
 PaperCache is an in-memory cache with a choice of eviction policies, one per cache and fixed when
 it is built. This fork adds **two-tier memory placement**: every object's bytes live either in
-DRAM (the *fast* tier, NUMA node 0) or in PMEM/CXL (the *slow* tier, NUMA node 1), and the
+DRAM (the *fast* tier, NUMA node 0) or in PMEM/CXL (the *slow* tier, NUMA node 2), and the
 cache moves them between the two as the access pattern changes.
 
 The research question the fork exists to answer is *which eviction discipline makes the best
@@ -12,16 +12,19 @@ identical traces. Every hybrid build compiles all 23; the design is chosen at ru
 `PaperPolicy` value handed to the constructor, and is then fixed for that cache's lifetime.
 
 > This crate is a library and is not meant to be used directly by application code; the
-> intended consumer is the separate `paper-server` crate. The benchmark harness is
-> `paper-benchmark-cxl`.
+> intended consumer is the server in [paper-server-cxl](https://github.com/griffinandrew/paper-server-cxl)
+> (branch `tiered-cache`, from commit 898a263), a fork of PaperCache's `paper-server` that depends on
+> this crate by Git revision and serves it over the PaperCache socket protocol. The benchmark harness
+> is `paper-benchmark-cxl`.
 
 ## Requirements
 
 - **Nightly Rust.** The tiered value type is `Box<[u8], Hybrid>`, which needs
   `allocator_api` (and `btreemap_alloc`). Every build command below uses `cargo +nightly`.
-- **A two-node NUMA machine.** `numa_alloc::NODE_FAST = 0` and `NODE_SLOW = 1` are compiled
-  in. The crate still builds and runs on a single-node box, but the "slow tier" will not be
-  physically distinct from the fast one, so latency numbers are meaningless.
+- **A two-node NUMA machine.** `numa_alloc::NODE_FAST = 0` and `NODE_SLOW = 2` are compiled
+  in (on mlsys-03 the CXL expander is the CPU-less node 2; another machine means other
+  constants). The crate still builds and runs on a single-node box, but the "slow tier" will
+  not be physically distinct from the fast one, so latency numbers are meaningless.
 - **Linux.** `mbind(2)` and `/proc/self/numa_maps` are used directly.
 
 ## Quick start
@@ -69,7 +72,7 @@ recording where this object's bytes currently are:
 ```rust
 pub enum TieredBuffer {
     Fast(Box<[u8]>),          // node-0 arenas, via the global allocator
-    Slow(Box<[u8], Hybrid>),  // node-1 arenas, via numa_alloc::SlowObjects
+    Slow(Box<[u8], Hybrid>),  // node-2 arenas, via numa_alloc::SlowObjects
 }
 ```
 
@@ -277,9 +280,9 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | `get(&key) -> Result<Vec<u8>>` | May trigger a promotion decision |
 | `set(key, &[u8], ttl: Option<u32>)` | Placement chosen by `hybrid_policy::admission_tier` for the active policy |
 | `reserve_set(key, len, ttl, deadline: Instant) -> Result<SetPermit>` | Admits a set BEFORE its value is read (a server's SET): the size checks, the metadata cap, the tier, the byte gate -- waiting for room at most until `deadline` (`FastTierStalled`; `MetadataOverflow` in the metadata lane). `permit.fill()` allocates the value in its tier, uninitialized, and returns a `PendingSet` to write in place (`read_exact_from(&mut reader)`, `write`, or `unfilled` + `advance`); `commit()` publishes it exactly as `set` does; `set_ttl` gives a TTL read after the value. Dropping a permit or a pending set abandons the set: reservation released, P refunded once, nothing inserted. `set` is these steps |
-| `register_setter() -> SetterGuard`, `live_setters()` | Counts a live setter (an accepted connection) into the byte gate's near band until the guard drops |
+| `register_setter() -> SetterGuard`, `live_setters()` | Counts a live setter into the byte gate's near band until the guard drops. What a setter is, is the caller's: the server ([paper-server-cxl](https://github.com/griffinandrew/paper-server-cxl)) registers one per SET in flight, not one per accepted connection, and only when that can widen anything -- the gate on (`PAPER_GATE_MODE` not `off`) and a `value_hint` above 0 -- because each registration and release wakes the policy worker |
 | `del(&key)`, `has(&key)`, `size(&key)` | |
-| `peek(&key) -> Result<Arc<TieredBuffer>>` | No access recorded, so no promotion |
+| `peek(&key) -> Result<Vec<u8>>` | No access recorded, so no promotion |
 | `ttl(&key, Option<u32>)` | |
 | `tier_of(&key) -> Option<Tier>` | Where the bytes are right now |
 | `hybrid_stats() -> HybridStats` | The only stats accessor: 3 counters + 4 tier gauges + 8 size-split gauges (the latter zero unless running `LruSizedCompactHybrid`) |
@@ -306,7 +309,7 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | `PAPER_GATE_POLL_INTERVAL_US` | `200` | How often a waiting set re-checks when nothing wakes it, in microseconds (at least 1). |
 | `PAPER_GATE_METADATA_FLOOR_BYTES` | `0` | Bytes of the fast tier kept for values: the metadata cap is the tier's budget less this. |
 | `PAPER_GATE_SLACK_BYTES` | `0` | Bytes the fast tier may hold beyond its budget: the close level is the budget plus this. |
-| `PAPER_GATE_CONCURRENCY_HINT`, `PAPER_GATE_VALUE_HINT_BYTES` | `0`, `0` | Concurrent setters and a typical value size: they widen the near band to their product when that is wider. The setters a server registers (`register_setter`) count with the hint, so it need not know its connections up front; with no value size they widen nothing. |
+| `PAPER_GATE_CONCURRENCY_HINT`, `PAPER_GATE_VALUE_HINT_BYTES` | `0`, `0` | Concurrent setters and a typical value size: they widen the near band to their product when that is wider. The setters a server registers (`register_setter`) count with the hint, so it need not know its connections up front (paper-server-cxl registers one per SET in flight, and only with the gate on and a value size above 0); with no value size they widen nothing. |
 | `NUMA_ARENAS_PER_NODE` | `8` | jemalloc arenas per node (clamped to 32). Swept on cluster12: a single arena costs 5% of SET latency at one client and 27% at sixteen, while 8→32 buys 1–2%, inside the run-to-run spread. |
 | `PAPER_CACHE_EVICTION_STACK_CAPACITY` | — | Pre-sizes the eviction stack's backing collections. |
 
@@ -341,7 +344,10 @@ contents are deterministic while still exercising the real queue path.
 
 ## Benchmarking
 
-`scripts/` holds one tool, `probe_server.py`, a protocol probe for `paper_server`. The old
+The server that puts a cache behind a socket -- with its protocol probe (`scripts/probe_server.py`) and its
+self-reported latency report -- is [paper-server-cxl](https://github.com/griffinandrew/paper-server-cxl), branch
+`tiered-cache` (from commit 898a263). It was `src/bin/paper_server.rs` here, behind a `server` feature, and
+the probe was this repo's `scripts/probe_server.py`, until they moved. The old
 `run_hybrid_benchmark_matrix.sh` rebuilt `paper-benchmark-cxl` once per design, rewriting the
 `features=[...]` line in its `Cargo.toml` between runs — a premise the unification removed (and
 the feature names it built no longer exist; it was deleted in R1). A single build now hosts all
