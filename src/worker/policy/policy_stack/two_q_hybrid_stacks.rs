@@ -217,3 +217,22 @@ mod capacity_tests {
 		assert!(!stack.needs_capacity_eviction(), "a resize moves the budget");
 	}
 }
+
+/// A resize of the cache queues nothing in 2Q, with or without its ghost, even
+/// on a stack the metadata push has left over its budget: only `resettle` and a
+/// resize of the fast tier settle it.
+#[cfg(test)]
+mod resize_tests {
+	use super::*;
+	use super::super::tiered_stack::testing::a_resize_settles_nothing;
+
+	#[test]
+	fn two_q() {
+		a_resize_settles_nothing(TwoQCompactHybridStack::new(0.5, 1_000_000, 10_000));
+	}
+
+	#[test]
+	fn two_q_ghost() {
+		a_resize_settles_nothing(TwoQGhostCompactHybridStack::new(0.5, 1_000_000, 10_000));
+	}
+}

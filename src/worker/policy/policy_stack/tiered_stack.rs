@@ -584,6 +584,11 @@ impl<P: TierPolicy> TieredStack<P> {
 		self.lanes.set.back(lane)
 	}
 
+	/// The lane `key` is in.
+	pub fn lane_of(&self, key: HashedKey) -> Option<Lane> {
+		self.lanes.set.payload(key).map(|p| p.queue as Lane)
+	}
+
 	/// Keys in `lane`.
 	pub fn lane_len(&self, lane: Lane) -> usize {
 		self.lanes.set.queue_len(lane)
@@ -675,6 +680,14 @@ impl<P: TierPolicy> TieredStack<P> {
 		}
 	}
 
+	/// Takes a FAST key out of the fast set IN PLACE (S5): an overwrite with a
+	/// value larger than an empty fast tier, in an order that keeps an
+	/// overwritten key where it is. Pushed `(key, Slow)`: its placement changed.
+	pub fn demote_in_place(&mut self, key: HashedKey) {
+		self.lanes.demote(key);
+		self.lanes.log.push((key, Tier::Slow));
+	}
+
 	/// An overwrite that leaves the key WHERE IT IS in its order -- FIFO's and
 	/// CLOCK's: it is resized, taken out of the fast set in place when its new
 	/// value is STRUCTURAL and it was fast, and re-settled only if it was fast
@@ -691,8 +704,7 @@ impl<P: TierPolicy> TieredStack<P> {
 		}
 
 		if m.structural && fast {
-			self.lanes.demote(key);
-			self.lanes.log.push((key, Tier::Slow));
+			self.demote_in_place(key);
 		}
 
 		if resized && fast {
@@ -869,11 +881,6 @@ pub(super) mod testing {
 		pub fn front(&self, lane: Lane) -> Option<HashedKey> {
 			self.lanes.set.front(lane)
 		}
-
-		/// The lane `key` is in.
-		pub fn lane_of(&self, key: HashedKey) -> Option<Lane> {
-			self.lanes.set.payload(key).map(|p| p.queue as Lane)
-		}
 	}
 
 	/// Walks every lane from its newest end and holds the books to it: the
@@ -972,6 +979,39 @@ pub(super) mod testing {
 
 		(demoted, promoted)
 	}
+
+	/// Eight 1,000-byte keys, each set and then hit (a design with a probation
+	/// queue promotes it), all fast in a tier of 10,000; then the measured metadata
+	/// takes the whole tier: the stack is over its budget, and nothing has settled
+	/// it.
+	pub fn over_its_budget<P: TierPolicy>(stack: &mut TieredStack<P>) {
+		for key in 1..=8 {
+			stack.insert(key, 1_000);
+			stack.update(key);
+		}
+
+		assert_eq!(stack.fast_bytes_used(), 8_000, "the fixture must leave every key fast");
+
+		drop(stack.drain_tier_migrations());
+
+		stack.set_dram_metadata(Some(20_000));
+	}
+
+	/// A resize of the cache settles the lanes the policy lists for it, and the
+	/// designs on this layer list none: on a stack over its budget, `resize` queues
+	/// nothing, and the demotions are the next settle's. A recorded run shows the
+	/// difference only for a cache of hundreds of keys against a tier of a few,
+	/// which the checked-in grid does not have: this is what pins it.
+	pub fn a_resize_settles_nothing<P: TierPolicy>(mut stack: TieredStack<P>) {
+		over_its_budget(&mut stack);
+		stack.resize(1 << 20);
+
+		assert_eq!(stack.drain_tier_migrations(), vec![], "a resize settled the stack");
+
+		stack.resettle();
+
+		assert!(!stack.drain_tier_migrations().is_empty(), "the stack was not over its budget: this shows nothing");
+	}
 }
 
 /// The layer on a policy of its own: two lanes, a slow probation queue and a
@@ -981,23 +1021,25 @@ pub(super) mod testing {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use super::testing::books_match_the_queue_after_every_operation;
+	use super::testing::{a_resize_settles_nothing, books_match_the_queue_after_every_operation, over_its_budget};
 
 	const PROBATION: Lane = 0;
 	const MAIN: Lane = 1;
 
 	/// A hit promotes a probation key to main's front; a hit in main is a
 	/// second chance, by the S3-FIFO rule (`ENDS_FAST`) or the common one; the
-	/// victim is probation's tail, else main's.
-	struct Toy<const ENDS_FAST: bool>;
+	/// victim is probation's tail, else main's; a resize of the cache settles
+	/// main or nothing (`RESIZE_SETTLES`).
+	struct Toy<const ENDS_FAST: bool, const RESIZE_SETTLES: bool = false>;
 
-	impl<const ENDS_FAST: bool> TierPolicy for Toy<ENDS_FAST> {
+	impl<const ENDS_FAST: bool, const RESIZE_SETTLES: bool> TierPolicy for Toy<ENDS_FAST, RESIZE_SETTLES> {
 		type Layout = SlowSplit;
 		type Ghost = NoGhost;
 
 		const ADMIT: Lane = PROBATION;
 		const RESETTLE: &'static [Lane] = &[MAIN];
 		const ON_TIER_RESIZE: &'static [Lane] = &[MAIN];
+		const ON_RESIZE: &'static [Lane] = if RESIZE_SETTLES { &[MAIN] } else { &[] };
 		const SECOND_CHANCE: Push = if ENDS_FAST { Push::IfEndsFast } else { Push::IfPromoted };
 
 		fn is_policy(&self, _policy: &PaperPolicy) -> bool {
@@ -1097,5 +1139,22 @@ mod tests {
 		assert!(table(2 << 30) > table(1 << 30), "the table does not grow with the cache");
 		assert!(table(4 << 30) > table(2 << 30), "the table stops growing before 8 Mi slots");
 		assert_eq!(table(8 << 30), table(4 << 30), "the table is not capped at 8 Mi slots");
+	}
+
+	/// A resize settles nothing unless the policy lists a lane for it...
+	#[test]
+	fn a_resize_settles_nothing_by_default() {
+		a_resize_settles_nothing(TieredStack::with(Toy::<true>, 10_000));
+	}
+
+	/// ... and settles exactly that lane when it does.
+	#[test]
+	fn a_resize_settles_the_lane_the_policy_lists() {
+		let mut stack = TieredStack::with(Toy::<true, true>, 10_000);
+
+		over_its_budget(&mut stack);
+		stack.resize(1 << 20);
+
+		assert!(!stack.drain_tier_migrations().is_empty(), "the resize did not settle the lane the policy lists");
 	}
 }

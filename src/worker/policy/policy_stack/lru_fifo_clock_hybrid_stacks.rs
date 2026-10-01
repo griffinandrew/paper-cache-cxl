@@ -714,3 +714,27 @@ mod flat_clock_fidelity {
 		assert_eq!(stack.evict_one(), Some(1));
 	}
 }
+
+/// A resize of the cache queues nothing in LRU, FIFO or CLOCK, even on a stack
+/// the metadata push has left over its budget: only `resettle` and a resize of
+/// the fast tier settle it (`tiered_stack::testing::a_resize_settles_nothing`).
+#[cfg(test)]
+mod resize_tests {
+	use super::*;
+	use super::super::tiered_stack::testing::a_resize_settles_nothing;
+
+	#[test]
+	fn lru() {
+		a_resize_settles_nothing(LruCompactHybridStack::new(10_000));
+	}
+
+	#[test]
+	fn fifo() {
+		a_resize_settles_nothing(FifoCompactHybridStack::new(10_000));
+	}
+
+	#[test]
+	fn clock() {
+		a_resize_settles_nothing(ClockCompactHybridStack::new(10_000));
+	}
+}

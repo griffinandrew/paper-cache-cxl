@@ -279,7 +279,7 @@ lru_lfu_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # queue's promotion is the classic S3-FIFO/CLOCK lazy, reference-bit-gated
 # mechanism rather than `two_q_compact_hybrid_cache`'s eager,
 # reorder-on-every-touch LRU one -- see
-# worker/policy/policy_stack/s3_fifo_compact_hybrid_stack.rs for the algorithm.
+# worker/policy/policy_stack/s3_fifo_hybrid_stacks.rs for the algorithm.
 #
 s3_fifo_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 

@@ -61,7 +61,7 @@ mod two_q_full_fast_admission_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod lru_sized_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
-mod s3_fifo_compact_hybrid_stack;
+mod s3_fifo_hybrid_stacks;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_faithful_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
@@ -130,7 +130,7 @@ use crate::{
 		two_q_fast_admission_reprieve_compact_hybrid_stack::TwoQFastAdmissionReprieveCompactHybridStack,
 		two_q_full_fast_admission_compact_hybrid_stack::TwoQFullFastAdmissionCompactHybridStack,
 		lru_sized_compact_hybrid_stack::LruSizedCompactHybridStack,
-		s3_fifo_compact_hybrid_stack::S3FifoCompactHybridStack,
+		s3_fifo_hybrid_stacks::S3FifoCompactHybridStack,
 		s3_fifo_ghost_compact_hybrid_stack::S3FifoGhostCompactHybridStack,
 		s3_fifo_ghost_lazy_demotion_compact_hybrid_stack::S3FifoGhostLazyDemotionCompactHybridStack,
 		s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack,
