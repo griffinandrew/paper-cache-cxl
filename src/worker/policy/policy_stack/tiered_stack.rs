@@ -24,7 +24,9 @@
 //! says which lanes are SPLIT: a split lane holds a fast prefix and a slow
 //! suffix of one order, with a cursor at its OLDEST fast key, so a demotion is
 //! one step of the cursor and nothing is searched. Every other lane is
-//! entirely slow (a probation queue whose bytes were built in the slow tier).
+//! entirely slow (a probation queue whose bytes were built in the slow tier)
+//! or, if the layout says so, entirely FAST: the DRAM admission queue of the
+//! fast-admission designs, a carve-out of the fast tier (see `carve`).
 //! The cursor steps over STRUCTURAL keys (S5): a key whose value is larger
 //! than an empty fast tier keeps its place in the order with tier slow, and
 //! the walk (`prev_fast`) skips it. The payload's `queue` is the lane and its
@@ -84,6 +86,10 @@ use super::{
 	drain_target, fast_at_or_before, narrow_resident, placed, prev_fast, CacheSize, HashedKey, Placement, PolicyStack, SetEvent, Tier,
 };
 
+pub(super) mod carve;
+
+pub use carve::newly_fills;
+
 /// A lane: a queue of the shared [`ArenaQueueSet`].
 pub type Lane = usize;
 
@@ -94,8 +100,13 @@ pub trait Layout: 'static {
 	const LANES: usize;
 
 	/// Bit `i` set: lane `i` is SPLIT (a fast prefix, a cursor, a slow suffix);
-	/// clear: lane `i` is entirely slow.
+	/// clear: lane `i` is entirely slow, or entirely fast if its bit of `FAST`
+	/// is set.
 	const SPLIT: u8;
+
+	/// Bit `i` set: lane `i` is FAST, a DRAM admission queue carved out of the
+	/// fast tier (see `carve`): every key in it fast, and no cursor.
+	const FAST: u8 = 0;
 }
 
 /// One split lane: LRU, FIFO and CLOCK.
@@ -115,6 +126,16 @@ impl Layout for SlowSplit {
 	const SPLIT: u8 = 0b10;
 }
 
+/// Lane 0 an entirely fast DRAM admission queue, lane 1 a split main queue:
+/// the fast-admission 2Q and S3-FIFO designs.
+pub struct FastSplit;
+
+impl Layout for FastSplit {
+	const LANES: usize = 2;
+	const SPLIT: u8 = 0b10;
+	const FAST: u8 = 0b01;
+}
+
 /// When a key moved to the front of a split lane is pushed `(key, Fast)`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Push {
@@ -124,6 +145,21 @@ pub enum Push {
 	/// Whenever it ends fast, even if it already was: the S3-FIFO family's
 	/// second chance.
 	IfEndsFast,
+}
+
+/// An end of a lane.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum End {
+	Front,
+	Back,
+}
+
+/// What a fast lane does with the bytes over its budget: its tail is spliced
+/// onto `end` of lane `to` as slow, a demotion pushed `(key, Slow)`.
+#[derive(Clone, Copy)]
+pub struct Spill {
+	pub to: Lane,
+	pub end: End,
 }
 
 /// What a `Set` says about its value, for the hooks.
@@ -263,6 +299,10 @@ pub trait TierPolicy: Sized + Send + 'static {
 	/// a fresh start at the front instead of demoting it.
 	const LAZY_DEMOTION: bool = false;
 
+	/// What a fast lane does with the bytes over its budget; `None`: nothing,
+	/// the design evicts from it (`wants_eviction`).
+	const SPILL: Option<Spill> = None;
+
 	/// Whether `policy` names this design.
 	fn is_policy(&self, policy: &PaperPolicy) -> bool;
 
@@ -305,6 +345,17 @@ pub trait TierPolicy: Sized + Send + 'static {
 
 	/// `resize`: the cache's size changed.
 	fn resized(_s: &mut TieredStack<Self>, _max_size: CacheSize) {}
+
+	/// `resize_fast_tier`: the fast tier's size changed, before the lanes
+	/// `ON_TIER_RESIZE` lists are settled.
+	fn tier_resized(_s: &mut TieredStack<Self>) {}
+
+	/// What `lane` may hold of fast bytes before the drain target: eff, unless
+	/// the design carves the fast tier up between its lanes
+	/// (`TieredStack::carve_budgets`).
+	fn budget(s: &TieredStack<Self>, _lane: Lane) -> CacheSize {
+		s.eff()
+	}
 }
 
 /// Bytes and objects a lane holds, per tier (index 0 fast, 1 slow).
@@ -359,6 +410,19 @@ impl<L: Layout> Lanes<L> {
 		L::SPLIT >> lane & 1 == 1
 	}
 
+	fn fast(lane: Lane) -> bool {
+		L::FAST >> lane & 1 == 1
+	}
+
+	/// The tier a brand-new key is built in at an end of `lane`: fast in a fast
+	/// lane, and in a split lane unless its value is structural; else slow.
+	fn tier_for(lane: Lane, structural: bool) -> Tier {
+		match Self::fast(lane) || Self::split(lane) && !structural {
+			true => Tier::Fast,
+			false => Tier::Slow,
+		}
+	}
+
 	fn credit(&mut self, lane: Lane, tier: Tier, bytes: CacheSize) {
 		let book = &mut self.books[lane];
 
@@ -392,21 +456,27 @@ impl<L: Layout> Lanes<L> {
 		*bytes = (*bytes as i64 + delta).max(0) as CacheSize;
 	}
 
-	/// A brand-new key at the front of `lane`, in `tier` (fast only in a split
-	/// lane).
-	fn add(&mut self, lane: Lane, key: HashedKey, m: Meta, tier: Tier) {
-		self.set.push_front(lane, key, NodePayload {
+	/// A brand-new key at `end` of `lane`, in `tier` (fast only in a fast lane,
+	/// or at the front of a split one).
+	fn add(&mut self, lane: Lane, key: HashedKey, m: Meta, tier: Tier, end: End) {
+		let payload = NodePayload {
 			size: m.size,
 			dram_resident: m.resident,
 			tier: Some(tier),
 			freq: 0,
 			ts: 0,
 			queue: lane as u8,
-		});
+		};
+
+		match end {
+			End::Front => self.set.push_front(lane, key, payload),
+			End::Back => self.set.push_back(lane, key, payload),
+		}
+
 		self.credit(lane, tier, m.migrating());
 
 		// A fast key with no fast key in front of it is the cursor.
-		if tier == Tier::Fast && self.cursor[lane].is_none() {
+		if tier == Tier::Fast && Self::split(lane) && self.cursor[lane].is_none() {
 			self.cursor[lane] = Some(key);
 		}
 	}
@@ -694,32 +764,50 @@ impl<P: TierPolicy> TieredStack<P> {
 		self.lanes.resize_key(key, m);
 	}
 
-	/// Settles `lane`: demotes from its cursor until its fast bytes are back
-	/// within the drain target of eff.
+	pub fn fast_capacity(&self) -> CacheSize {
+		self.fast_capacity
+	}
+
+	/// Settles `lane` against its budget's drain target: a split lane demotes
+	/// from its cursor, a fast lane spills its tail (if the design says
+	/// where), and a slow lane has nothing to settle.
 	pub fn settle(&mut self, lane: Lane) {
-		self.lanes.settle(lane, drain_target::bytes(self.eff()), P::LAZY_DEMOTION);
+		let target = drain_target::bytes(P::budget(self, lane));
+
+		match (Lanes::<P::Layout>::split(lane), P::SPILL) {
+			(true, _) => self.lanes.settle(lane, target, P::LAZY_DEMOTION),
+			(false, Some(spill)) if Lanes::<P::Layout>::fast(lane) => self.lanes.spill(lane, target, spill),
+			_ => {},
+		}
 	}
 
 	/// A brand-new key at the front of `lane`: fast, settled, if the lane is
-	/// split and the value not structural; else slow (built slow, charged
-	/// slow, nothing settled, nothing pushed). `push`: the key was built slow
-	/// and goes to fast (a ghost hit), so it is pushed `(key, Fast)` after the
-	/// settle, guarded on still being fast.
+	/// fast, or split and the value not structural; else slow (built slow,
+	/// charged slow, nothing settled, nothing pushed). `push`: the key was
+	/// built slow and goes to fast (a ghost hit), so it is pushed `(key, Fast)`
+	/// after the settle, guarded on still being fast.
 	pub fn admit(&mut self, key: HashedKey, m: Meta, lane: Lane, push: bool) {
-		let tier = match Lanes::<P::Layout>::split(lane) && !m.structural {
-			true => Tier::Fast,
-			false => Tier::Slow,
-		};
-
-		self.lanes.add(lane, key, m, tier);
-
-		if tier == Tier::Fast {
+		if self.place(key, m, lane, End::Front) == Tier::Fast {
 			self.settle(lane);
 
 			if push && self.tier_of(key) == Some(Tier::Fast) {
 				self.lanes.log.push((key, Tier::Fast));
 			}
 		}
+	}
+
+	/// A brand-new key at `end` of `lane`, built in the tier the lane gives it
+	/// (see `admit`) and booked there: nothing settled, nothing pushed. Returns
+	/// the tier. A key at the back is a slow one: a fast key there would break
+	/// the cursor.
+	pub fn place(&mut self, key: HashedKey, m: Meta, lane: Lane, end: End) -> Tier {
+		let tier = Lanes::<P::Layout>::tier_for(lane, m.structural);
+
+		debug_assert!(end == End::Front || tier == Tier::Slow, "a fast key is placed at the front");
+
+		self.lanes.add(lane, key, m, tier, end);
+
+		tier
 	}
 
 	/// Moves `key` to the front of `to` and re-places it -- LRU's hit, and a
@@ -897,6 +985,8 @@ impl<P: TierPolicy> PolicyStack for TieredStack<P> {
 	fn resize_fast_tier(&mut self, size: CacheSize) {
 		self.fast_capacity = size;
 
+		P::tier_resized(self);
+
 		for &lane in P::ON_TIER_RESIZE {
 			self.settle(lane);
 		}
@@ -964,8 +1054,8 @@ pub(super) mod testing {
 	/// Walks every lane from its newest end and holds the books to it: the
 	/// object and byte counts of each tier are what walking finds, the cursor
 	/// of a split lane is its oldest FAST key with nothing but slow keys
-	/// behind it, a lane that is not split holds no fast key, and every gauge
-	/// is the sum of the lanes'.
+	/// behind it, a slow lane holds no fast key and a fast lane no slow one,
+	/// and every gauge is the sum of the lanes'.
 	pub fn audit<P: TierPolicy>(stack: &TieredStack<P>, step: usize) {
 		let lanes = &stack.lanes;
 		let mut walked = 0;
@@ -997,10 +1087,15 @@ pub(super) mod testing {
 
 			assert_eq!((count, bytes), (book.count, book.bytes), "step {step}: lane {lane}'s books");
 
-			match Lanes::<P::Layout>::split(lane) {
-				true => assert_eq!(lanes.cursor[lane], oldest_fast, "step {step}: lane {lane}'s cursor is the oldest fast key"),
+			match (Lanes::<P::Layout>::split(lane), Lanes::<P::Layout>::fast(lane)) {
+				(true, _) => assert_eq!(lanes.cursor[lane], oldest_fast, "step {step}: lane {lane}'s cursor is the oldest fast key"),
 
-				false => {
+				(false, true) => {
+					assert_eq!(count[idx(Tier::Slow)], 0, "step {step}: lane {lane} is fast and holds a slow key");
+					assert_eq!(lanes.cursor[lane], None, "step {step}: lane {lane} has no cursor");
+				},
+
+				(false, false) => {
 					assert_eq!(count[idx(Tier::Fast)], 0, "step {step}: lane {lane} is slow and holds a fast key");
 					assert_eq!(lanes.cursor[lane], None, "step {step}: lane {lane} has no cursor");
 				},
@@ -1234,5 +1329,74 @@ mod tests {
 		stack.resize(1 << 20);
 
 		assert!(!stack.drain_tier_migrations().is_empty(), "the resize did not settle the lane the policy lists");
+	}
+
+	/// A fast lane (`PROBATION`, here) in front of a split main: a new key
+	/// enters the fast lane, a hit moves it to main's front, the fast lane's
+	/// overflow is spliced onto main's BACK as slow, and the victim is main's
+	/// tail, else the fast lane's. The fast lane's budget is a carve-out of
+	/// 6,000 B of the tier, main's what is left.
+	struct ToyCarve;
+
+	impl TierPolicy for ToyCarve {
+		type Layout = FastSplit;
+		type Ghost = NoGhost;
+
+		const ADMIT: Lane = PROBATION;
+		const RESETTLE: &'static [Lane] = &[MAIN, PROBATION];
+		const SPILL: Option<Spill> = Some(Spill { to: MAIN, end: End::Back });
+
+		fn is_policy(&self, _policy: &PaperPolicy) -> bool {
+			false
+		}
+
+		fn touch(s: &mut TieredStack<Self>, key: HashedKey, structural: bool) {
+			s.to_front(key, MAIN, structural, Push::IfPromoted);
+		}
+
+		fn victim(s: &mut TieredStack<Self>) -> Option<HashedKey> {
+			s.evict_tail(MAIN).or_else(|| s.evict_tail(PROBATION))
+		}
+
+		fn budget(s: &TieredStack<Self>, lane: Lane) -> CacheSize {
+			let (fast, main) = s.carve_budgets(6_000);
+
+			match lane {
+				PROBATION => fast,
+				_ => main,
+			}
+		}
+	}
+
+	#[test]
+	fn the_books_of_a_fast_lane_stack_match_its_queues_after_every_operation() {
+		let (demoted, promoted) = books_match_the_queue_after_every_operation(TieredStack::with(ToyCarve, 24_000).with_shared_overhead(40));
+
+		assert!(demoted > 100, "the sequence never demoted ({demoted})");
+		assert!(promoted > 0, "the sequence never promoted ({promoted})");
+	}
+
+	#[test]
+	fn a_fast_lane_spills_its_tail_to_the_back_of_the_lane_the_policy_names() {
+		let mut stack = TieredStack::with(ToyCarve, 24_000);
+
+		// Six keys of 1,000 B fill the fast lane past 0.95 x 6,000 B: the oldest spills.
+		for key in 1..=6 {
+			stack.insert(key, 1_000);
+		}
+
+		assert_eq!(stack.drain_tier_migrations(), vec![(1, Tier::Slow)], "the overflow is a demotion, pushed");
+		assert_eq!((stack.lane_of(1), stack.tier_of(1)), (Some(MAIN), Some(Tier::Slow)));
+		assert_eq!((stack.fast_object_count(), stack.slow_object_count()), (5, 1));
+
+		// A hit moves key 2 to main's front, ahead of the spilled key 1; the next
+		// overflow lands behind both.
+		stack.update(2);
+		stack.insert(7, 1_000);
+		stack.insert(8, 1_000);
+
+		assert_eq!(stack.front(MAIN), Some(2));
+		assert_eq!(stack.tail(MAIN), Some(3), "a spilled key goes to main's back");
+		assert_eq!(stack.fast_bytes_used() + stack.slow_bytes_used(), 8_000);
 	}
 }

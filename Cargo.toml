@@ -169,7 +169,7 @@ two_q_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # of a synchronous PMEM allocation on the calling thread, and the FIFO queue's
 # `k_in * max_size` budget becomes a reservation carved out of `fast_tier_size`
 # (both are DRAM now) -- see
-# `worker/policy/policy_stack/two_q_fast_admission_reprieve_compact_hybrid_stack.rs`'s
+# `worker/policy/policy_stack/two_q_fast_admission_hybrid_stacks.rs`'s
 # module doc. A one-access object that ages out of the FIFO queue without a
 # second access is REPRIEVED into the slow tier (spliced onto the bottom of
 # the main queue) rather than evicted outright. The DRAM->PMEM copy that costs

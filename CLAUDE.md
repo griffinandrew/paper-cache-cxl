@@ -230,7 +230,7 @@ src/
                                  flat ones are the eight `*_compact_stack.rs` files over
                                  `compact_queue_set.rs`, plus `arc_stack.rs`; `golden.rs`, test-only,
                                  holds the eviction orders their tests assert).
-                                 `tiered_stack.rs` is the ONE tiering layer, `TieredStack<P>`:
+                                 `tiered_stack.rs` (and `tiered_stack/carve.rs`) is the ONE tiering layer, `TieredStack<P>`:
                                  the queue set (its lanes), the boundary cursor, the books and
                                  gauges, the settle, the migration log and push rules, the
                                  reservation and the `PolicyStack` impl; a `TierPolicy` supplies
@@ -3429,7 +3429,7 @@ the merged store's fidelity tests share one fixture.
 `TieredStack<P: TierPolicy>` (`tiered_stack.rs`) is R3's generic stack for any number of queues.
 A stack is up to four LANES of one `ArenaQueueSet`; a `Layout` says which are SPLIT (a fast
 prefix, a cursor at the oldest fast key, a slow suffix: a demotion is one step of the cursor) and
-which entirely slow (a probation queue). The layer keeps per-lane books (bytes and objects per
+which entirely slow (a probation queue) or entirely FAST (the DRAM admission queue of the fast-admission designs, a carve-out of the fast tier: `tiered_stack/carve.rs`). The layer keeps per-lane books (bytes and objects per
 tier) and sums them into every gauge, the migration log with the push rule (a demotion pushes
 `(k, Slow)`; a promotion pushes `(k, Fast)` after the settle that may undo it; a new key pushes
 nothing), the reservation, eff and the structural test, and the settle loop; it implements
@@ -3439,7 +3439,7 @@ enters and the lanes each entry point settles, copied from each design's own bod
 family's second chance pushes `(k, Fast)` for a key that was already fast
 (`Push::IfEndsFast`); everything else pushes only for a promotion: both are kept, as knobs.
 
-Ported so far: LRU, FIFO and CLOCK (`lru_fifo_clock_hybrid_stacks.rs`); 2Q and 2Q-ghost (`two_q_hybrid_stacks.rs`); S3-FIFO, S3-FIFO-ghost and S3-FIFO-ghost-lazy-demotion (`s3_fifo_hybrid_stacks.rs`).
+Ported so far: LRU, FIFO and CLOCK (`lru_fifo_clock_hybrid_stacks.rs`); 2Q and 2Q-ghost (`two_q_hybrid_stacks.rs`); S3-FIFO, S3-FIFO-ghost and S3-FIFO-ghost-lazy-demotion (`s3_fifo_hybrid_stacks.rs`); 2Q-fast-admission-reprieve (`two_q_fast_admission_hybrid_stacks.rs`, its admission FIFO a FAST lane).
 
 Hot paths cost the index no more than the stacks they replaced. Every key-addressed operation on the
 queues is one probe of the keyed index (a hash and, at scale, a cache miss), and a layer over every

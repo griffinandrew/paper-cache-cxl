@@ -29,6 +29,7 @@ use super::{
 	arena_index::probes,
 	ClockCompactHybridStack, FifoCompactHybridStack, HashedKey, LruCompactHybridStack, PolicyStack,
 	S3FifoCompactHybridStack, S3FifoGhostLazyDemotionCompactHybridStack, TwoQCompactHybridStack,
+	TwoQFastAdmissionReprieveCompactHybridStack,
 };
 
 /// Runs `op` and holds the probes it makes to `most`.
@@ -183,4 +184,56 @@ fn s3_fifo_with_lazy_demotion() {
 
 	// The flat stack: 11.
 	within("a promotion that demotes one key", 10, || stack.update(5));
+}
+
+/// 2Q with a DRAM admission FIFO and a reprieve: the FIFO's overflow is spliced
+/// onto the back of main, and a hit moves a key into main. First a tier the
+/// FIFO's carve-out covers (so main has no budget and every promotion falls
+/// straight back out), then a FIFO of 4,500 B in a tier of 10,000 B.
+#[test]
+fn two_q_fast_admission_reprieve() {
+	let mut stack = TwoQFastAdmissionReprieveCompactHybridStack::new(0.5, 1_000_000, 100_000);
+
+	fill(&mut stack, 1..=8);
+
+	// The flat stack: 8.
+	within("a hit on a FIFO key: a promotion to main", 7, || stack.update(3));
+	// The flat stack: 10.
+	within("a hit on a main key", 8, || stack.update(3));
+	within("a new key", 2, || stack.insert(9, 1_000));
+	// The flat stack: 9.
+	within("an overwrite of a FIFO key", 8, || stack.insert(8, 1_000));
+	within("a removal", 2, || stack.remove(7));
+	within("an eviction of main's tail", 1, || stack.evict_one());
+
+	let mut stack = TwoQFastAdmissionReprieveCompactHybridStack::new(0.0045, 1_000_000, 10_000);
+
+	fill(&mut stack, 1..=4);
+
+	within("a new key that spills one", 5, || stack.insert(5, 1_000));
+
+	fill(&mut stack, 6..=12);
+
+	for key in 1..=5 {
+		stack.update(key);
+	}
+
+	// The flat stack: 11.
+	within("a hit on a slow main key: a promotion and a demotion", 9, || stack.update(6));
+	// The flat stack: 9.
+	within("a hit on a FIFO key that demotes one", 8, || stack.update(12));
+	within("a structural new key", 2, || stack.insert(40, 50_000));
+	within("an eviction of a slow main tail", 1, || stack.evict_one());
+
+	let mut stack = TwoQFastAdmissionReprieveCompactHybridStack::new(0.0045, 1_000_000, 10_000);
+
+	fill(&mut stack, 1..=4);
+
+	for _ in 0..4 {
+		stack.evict_one();
+	}
+
+	fill(&mut stack, 5..=6);
+
+	within("an eviction of the FIFO's tail, main empty", 1, || stack.evict_one());
 }

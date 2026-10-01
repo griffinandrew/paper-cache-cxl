@@ -189,10 +189,10 @@ The implementation provides explicit feature flags to control:
   move that emits **no migration** since the bytes are already in DRAM. `fifo_capacity = k_in *
   max_size` is a DRAM reservation **carved out of `fast_tier_size`**, not an independent PMEM
   budget, and the metadata reservation is split between the two queues in proportion to their
-  fast-tier capacities (`reserved_shares`); since `k_in` is denominated in `max_size` while the
+  fast-tier capacities (`carve::shares`); since `k_in` is denominated in `max_size` while the
   budget it consumes is `fast_tier_size`, a `k_in` that is unremarkable under
   `two_q_compact_hybrid_cache` can swallow the whole fast tier here, so sweep it down. Aged-out
-  one-access keys are reprieved by `settle_fifo_queue`, which runs
+  one-access keys are reprieved by the FIFO's settle (a `Spill`), which runs
   **synchronously from `insert`/`resize`** (never through `evict_one`) and moves the FIFO tail to the
   back of the main queue tagged `Tier::Slow`. `needs_capacity_eviction()` therefore returns to the
   trait default `false`, and `evict_one` becomes purely about the main queue's LRU tail — with a

@@ -724,7 +724,7 @@ them only where the old ones over-subscribed the tier. `two_q_full_fast_admissio
 `TwoQFastAdmissionReprieveCompactHybridStack` · `PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(f64)`
 
 As above, but a one-access key ageing out **without** a second access is reprieved into the slow
-tier rather than evicted. `settle_fifo_queue` splices it onto the **back** of `main_stack` — the
+tier rather than evicted. The FIFO's settle (a `Spill`) splices it onto the **back** of main — the
 absolute LRU tail, i.e. the next eviction candidate — tagged `Tier::Slow`.
 
 Deliberately weaker than the s3-fifo equivalent, which splices to the *front* of its slow
