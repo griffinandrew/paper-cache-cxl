@@ -1,0 +1,2990 @@
+# Fingerprints of the 23 tiered designs, recorded from the stacks as they were before R4 ported any of them
+# (2a944c5, the tip of S8). Format: <drain target> <design> <configuration> <fingerprint>; 't14 <script> <hash>'
+# is T14's script for a design it did not cover; 'seen <design> <event>' is a path a design's runs reached.
+# See tier_golden.rs for what is fingerprinted and how to bisect a mismatch.
+0.95 lru s0-f0-o0-r0 af20623901567404
+0.95 lru s0-f0-o64-r0 6fce656e1bc7412b
+0.95 lru s0-f0-o400-r0 4e1fbed254f00884
+0.95 lru s0-f1-o0-r0 78640b829df612f3
+0.95 lru s0-f1-o64-r0 76b5718928b95f1b
+0.95 lru s0-f1-o400-r0 166b0fdc079bfa25
+0.95 lru s0-f2-o0-r0 38e4790d6ad379ee
+0.95 lru s0-f2-o64-r0 624447df9eaed2e8
+0.95 lru s0-f2-o400-r0 2fefb90e40eb685e
+0.95 lru s1-f0-o0-r0 b959455bafd70e92
+0.95 lru s1-f0-o64-r0 23a1e78e39a7fe67
+0.95 lru s1-f0-o400-r0 5f4620791b88dd15
+0.95 lru s1-f1-o0-r0 ee8369f37f390022
+0.95 lru s1-f1-o64-r0 738b97c90536210f
+0.95 lru s1-f1-o400-r0 0901c76bd1415a5b
+0.95 lru s1-f2-o0-r0 3ff195196160d150
+0.95 lru s1-f2-o64-r0 6bcbe841038b4915
+0.95 lru s1-f2-o400-r0 ee98d6c596574bdc
+0.95 fifo s0-f0-o0-r0 678e055d80ea0bbc
+0.95 fifo s0-f0-o64-r0 464033d687c62a25
+0.95 fifo s0-f0-o400-r0 afddc5efd1c0853c
+0.95 fifo s0-f1-o0-r0 fd8f38966be5d7a7
+0.95 fifo s0-f1-o64-r0 c0f3c28dca23abbf
+0.95 fifo s0-f1-o400-r0 d5f32adff20adfd8
+0.95 fifo s0-f2-o0-r0 ba965ae0c6062e35
+0.95 fifo s0-f2-o64-r0 a10a382d87fe7379
+0.95 fifo s0-f2-o400-r0 d6fe58bca52b9ddb
+0.95 fifo s1-f0-o0-r0 7bf6f6f186c97db7
+0.95 fifo s1-f0-o64-r0 249fa0661dc179da
+0.95 fifo s1-f0-o400-r0 2931668512c7e1a1
+0.95 fifo s1-f1-o0-r0 4d540d0e16bc2b6e
+0.95 fifo s1-f1-o64-r0 1763fa7f5e0c2f25
+0.95 fifo s1-f1-o400-r0 0980bcebebaf5625
+0.95 fifo s1-f2-o0-r0 d2b6531cfdd03f86
+0.95 fifo s1-f2-o64-r0 be5b37d243a46413
+0.95 fifo s1-f2-o400-r0 d79d4514fbd43003
+0.95 clock s0-f0-o0-r0 59a69bb57f83f448
+0.95 clock s0-f0-o64-r0 a5f28d810254d00d
+0.95 clock s0-f0-o400-r0 9b61c50297021f96
+0.95 clock s0-f1-o0-r0 7ba4347d7db20ef3
+0.95 clock s0-f1-o64-r0 ec3dc5df327c047f
+0.95 clock s0-f1-o400-r0 395df1c659703169
+0.95 clock s0-f2-o0-r0 ef4ed48d10e80f38
+0.95 clock s0-f2-o64-r0 2f5d3ae1c42fa46c
+0.95 clock s0-f2-o400-r0 723f52fbc9cdad07
+0.95 clock s1-f0-o0-r0 ce3fdd9757dabcb3
+0.95 clock s1-f0-o64-r0 e36f89af81fb8ec9
+0.95 clock s1-f0-o400-r0 f68d3a1edf87a660
+0.95 clock s1-f1-o0-r0 81d1c6bcfa4e9ca6
+0.95 clock s1-f1-o64-r0 9ff438f4ddb19edc
+0.95 clock s1-f1-o400-r0 84d74d7a57590e27
+0.95 clock s1-f2-o0-r0 614a1bad3cf35401
+0.95 clock s1-f2-o64-r0 211ce8b7db2c137f
+0.95 clock s1-f2-o400-r0 36398699464752f3
+0.95 lfu s0-f0-o0-r0 895a61a99667cc4b
+0.95 lfu s0-f0-o64-r0 276946b7372bec68
+0.95 lfu s0-f0-o400-r0 024c628f4c33d817
+0.95 lfu s0-f1-o0-r0 f035750ad83f2463
+0.95 lfu s0-f1-o64-r0 82a05e5808f0ef7b
+0.95 lfu s0-f1-o400-r0 f64c8b82dbfc98bf
+0.95 lfu s0-f2-o0-r0 3ffcc0f9152cad68
+0.95 lfu s0-f2-o64-r0 468d27daf280b98d
+0.95 lfu s0-f2-o400-r0 167704a7a748c586
+0.95 lfu s1-f0-o0-r0 33d3c703f9e060fe
+0.95 lfu s1-f0-o64-r0 ae1e2d3a33bef4d4
+0.95 lfu s1-f0-o400-r0 5f586cf99ec062ac
+0.95 lfu s1-f1-o0-r0 36c2d87ecf039160
+0.95 lfu s1-f1-o64-r0 026263e500cf655d
+0.95 lfu s1-f1-o400-r0 4e8043d46fa211cd
+0.95 lfu s1-f2-o0-r0 7181b6a7c4588829
+0.95 lfu s1-f2-o64-r0 2f354a9044cba1ba
+0.95 lfu s1-f2-o400-r0 eabdf1c19557e658
+0.95 lru-lfu s0-f0-o0-r0 ef0a5cd53a7e4bc2
+0.95 lru-lfu s0-f0-o0-r1 1a2fbd6fa9eb5cc8
+0.95 lru-lfu s0-f0-o0-r2 0c1e91ac1826d4d0
+0.95 lru-lfu s0-f0-o64-r0 458436563bfd5aac
+0.95 lru-lfu s0-f0-o64-r1 12b4ef613467b8c2
+0.95 lru-lfu s0-f0-o64-r2 cb2fcc8f23ea18bd
+0.95 lru-lfu s0-f0-o400-r0 84355d6a67746461
+0.95 lru-lfu s0-f0-o400-r1 835b7e62b856e519
+0.95 lru-lfu s0-f0-o400-r2 c550225b6d3c99f3
+0.95 lru-lfu s0-f1-o0-r0 c89463cbc8987139
+0.95 lru-lfu s0-f1-o0-r1 45c6a96f0476d176
+0.95 lru-lfu s0-f1-o0-r2 98cfc0344a64c10e
+0.95 lru-lfu s0-f1-o64-r0 fcf515254d15ccbc
+0.95 lru-lfu s0-f1-o64-r1 b04d0abb372e08f4
+0.95 lru-lfu s0-f1-o64-r2 933088649ace9cfc
+0.95 lru-lfu s0-f1-o400-r0 8f934c6f0dfcff6d
+0.95 lru-lfu s0-f1-o400-r1 78052f6441b3e05e
+0.95 lru-lfu s0-f1-o400-r2 6e51a11b034124bd
+0.95 lru-lfu s0-f2-o0-r0 4cf1b3eb5e1c8f97
+0.95 lru-lfu s0-f2-o0-r1 4279fd3dd7728a37
+0.95 lru-lfu s0-f2-o0-r2 5a3f9831b4d65f40
+0.95 lru-lfu s0-f2-o64-r0 b7a617417fe59821
+0.95 lru-lfu s0-f2-o64-r1 4799058a8ed5c5f4
+0.95 lru-lfu s0-f2-o64-r2 fd52ad5304a4cd27
+0.95 lru-lfu s0-f2-o400-r0 b12974ae38b7cb91
+0.95 lru-lfu s0-f2-o400-r1 e70aae3057b29edb
+0.95 lru-lfu s0-f2-o400-r2 b5252193c9b6c0fc
+0.95 lru-lfu s1-f0-o0-r0 9a9ffed24e009ca6
+0.95 lru-lfu s1-f0-o0-r1 902c38b4a7094234
+0.95 lru-lfu s1-f0-o0-r2 cdfbbcac0004342a
+0.95 lru-lfu s1-f0-o64-r0 7d3c73cb6f0c5c8b
+0.95 lru-lfu s1-f0-o64-r1 aeaf70568e77ae38
+0.95 lru-lfu s1-f0-o64-r2 e31081eeb1cbd962
+0.95 lru-lfu s1-f0-o400-r0 e9d14847ae912d30
+0.95 lru-lfu s1-f0-o400-r1 e18a3c208d11afa8
+0.95 lru-lfu s1-f0-o400-r2 3c2b20dac1aadd4c
+0.95 lru-lfu s1-f1-o0-r0 6e7d2c6fc2088326
+0.95 lru-lfu s1-f1-o0-r1 ef7b91a0ec6569d8
+0.95 lru-lfu s1-f1-o0-r2 f2af9faa7f8729da
+0.95 lru-lfu s1-f1-o64-r0 ede22c92f17f31d2
+0.95 lru-lfu s1-f1-o64-r1 d30b2624e0ae0e68
+0.95 lru-lfu s1-f1-o64-r2 0e918a3014c2546d
+0.95 lru-lfu s1-f1-o400-r0 a137d9878b70751e
+0.95 lru-lfu s1-f1-o400-r1 22d140fd55061ed5
+0.95 lru-lfu s1-f1-o400-r2 a832245c2510f4e1
+0.95 lru-lfu s1-f2-o0-r0 7b6170cc6b16de1f
+0.95 lru-lfu s1-f2-o0-r1 dbe956491ec266c7
+0.95 lru-lfu s1-f2-o0-r2 f99010dfeed0b6cc
+0.95 lru-lfu s1-f2-o64-r0 88658ed43b5be7d0
+0.95 lru-lfu s1-f2-o64-r1 d2139b380fd7513c
+0.95 lru-lfu s1-f2-o64-r2 53fae4c0a5fb41ab
+0.95 lru-lfu s1-f2-o400-r0 67b935e5b79f06e3
+0.95 lru-lfu s1-f2-o400-r1 7c4cc0066f58f21f
+0.95 lru-lfu s1-f2-o400-r2 5ca581be58835304
+0.95 lru-sized s0-f0-o0-r0 7cb1860c9555109c
+0.95 lru-sized s0-f0-o0-r1 2852d6113fe336cf
+0.95 lru-sized s0-f0-o0-r2 bd4f39fdbdd9b836
+0.95 lru-sized s0-f0-o64-r0 669e805fc1c11d33
+0.95 lru-sized s0-f0-o64-r1 675dd3f306b1e8e4
+0.95 lru-sized s0-f0-o64-r2 0b1c922513bb53bd
+0.95 lru-sized s0-f0-o400-r0 fd49c32e268ee6d2
+0.95 lru-sized s0-f0-o400-r1 0978006eaa339205
+0.95 lru-sized s0-f0-o400-r2 c21845e61e54441b
+0.95 lru-sized s0-f1-o0-r0 2d8caa13967ac1b0
+0.95 lru-sized s0-f1-o0-r1 cc3fe7a009223c45
+0.95 lru-sized s0-f1-o0-r2 d96c90ccdb3548a6
+0.95 lru-sized s0-f1-o64-r0 919e4abbd6ab8905
+0.95 lru-sized s0-f1-o64-r1 4ee6df0907f66ad4
+0.95 lru-sized s0-f1-o64-r2 81beb81c905f3c67
+0.95 lru-sized s0-f1-o400-r0 66a1d755f588e3cf
+0.95 lru-sized s0-f1-o400-r1 4af0c0ccc46da582
+0.95 lru-sized s0-f1-o400-r2 84dff8c007c355f1
+0.95 lru-sized s0-f2-o0-r0 3c8e6cfeb73f1a85
+0.95 lru-sized s0-f2-o0-r1 c348ba66e38ed945
+0.95 lru-sized s0-f2-o0-r2 c5a617e80f24f705
+0.95 lru-sized s0-f2-o64-r0 915e507c703ac886
+0.95 lru-sized s0-f2-o64-r1 35452b79cac89d46
+0.95 lru-sized s0-f2-o64-r2 a5cd18f4e26bea06
+0.95 lru-sized s0-f2-o400-r0 b7af615b9f46f34a
+0.95 lru-sized s0-f2-o400-r1 e0cecb3af0293f8a
+0.95 lru-sized s0-f2-o400-r2 cb95319c8c8d9e8a
+0.95 lru-sized s1-f0-o0-r0 e009502d516d0705
+0.95 lru-sized s1-f0-o0-r1 6aaac2599791e637
+0.95 lru-sized s1-f0-o0-r2 9532775e59aa5c2b
+0.95 lru-sized s1-f0-o64-r0 cbe0e14cc6e02952
+0.95 lru-sized s1-f0-o64-r1 1f70c2c387b00e68
+0.95 lru-sized s1-f0-o64-r2 e3c87fbe5787cae8
+0.95 lru-sized s1-f0-o400-r0 32ca5cb994b59391
+0.95 lru-sized s1-f0-o400-r1 2ceff7a4235ec183
+0.95 lru-sized s1-f0-o400-r2 8b2bd4e99b78ea07
+0.95 lru-sized s1-f1-o0-r0 6a34019cbc14895e
+0.95 lru-sized s1-f1-o0-r1 e40afd84ce07e42b
+0.95 lru-sized s1-f1-o0-r2 88ebd03b2d5a2360
+0.95 lru-sized s1-f1-o64-r0 a00ab2d64c93df49
+0.95 lru-sized s1-f1-o64-r1 738e83c262d6b7dc
+0.95 lru-sized s1-f1-o64-r2 3c30bcc1105ad1b3
+0.95 lru-sized s1-f1-o400-r0 3353a8fd1a87a498
+0.95 lru-sized s1-f1-o400-r1 50a040224adf2a6d
+0.95 lru-sized s1-f1-o400-r2 f3accd49469b47a6
+0.95 lru-sized s1-f2-o0-r0 a78a1ecb775e815f
+0.95 lru-sized s1-f2-o0-r1 8a551b80ecb7623f
+0.95 lru-sized s1-f2-o0-r2 1ca5bcc44c89c4bf
+0.95 lru-sized s1-f2-o64-r0 6be975fe3bf00079
+0.95 lru-sized s1-f2-o64-r1 e0c5d538c67987d9
+0.95 lru-sized s1-f2-o64-r2 b1cc9e6308af3ad9
+0.95 lru-sized s1-f2-o400-r0 f34913a95ab3b8d9
+0.95 lru-sized s1-f2-o400-r1 25cabef59e0515f9
+0.95 lru-sized s1-f2-o400-r2 14ff515941538fb9
+0.95 q2 s0-f0-o0-r0 8fa87b7bd7f65496
+0.95 q2 s0-f0-o0-r1 ea9361f34f71c01b
+0.95 q2 s0-f0-o0-r2 870a309fdc153b8b
+0.95 q2 s0-f0-o64-r0 a571963748d1c478
+0.95 q2 s0-f0-o64-r1 31a6c445fa07c032
+0.95 q2 s0-f0-o64-r2 70b9e86c43cdcf5e
+0.95 q2 s0-f0-o400-r0 9afbb6c45b763c00
+0.95 q2 s0-f0-o400-r1 108990770a8e6d6e
+0.95 q2 s0-f0-o400-r2 478f9dffd67db6d5
+0.95 q2 s0-f1-o0-r0 09fab908d140bc0e
+0.95 q2 s0-f1-o0-r1 594799c1e92a28f7
+0.95 q2 s0-f1-o0-r2 118c1984011747cc
+0.95 q2 s0-f1-o64-r0 7203c57e3a55b5dd
+0.95 q2 s0-f1-o64-r1 a147daba37abb2a2
+0.95 q2 s0-f1-o64-r2 98a6d87e7922fb29
+0.95 q2 s0-f1-o400-r0 5ab6f8cd64c6baf2
+0.95 q2 s0-f1-o400-r1 55b77d117f99b9de
+0.95 q2 s0-f1-o400-r2 681ed868698de55c
+0.95 q2 s0-f2-o0-r0 6d23549aac3aa345
+0.95 q2 s0-f2-o0-r1 669a75401b3c5cb3
+0.95 q2 s0-f2-o0-r2 64dd28ffe19c2259
+0.95 q2 s0-f2-o64-r0 8c9290577d73f463
+0.95 q2 s0-f2-o64-r1 6429c211efe554e8
+0.95 q2 s0-f2-o64-r2 700afe6ed8301e54
+0.95 q2 s0-f2-o400-r0 2113b741cdd95c49
+0.95 q2 s0-f2-o400-r1 5f5c7d5335a7f3ba
+0.95 q2 s0-f2-o400-r2 d80c797854339afe
+0.95 q2 s1-f0-o0-r0 ddf589eddfbb4cdb
+0.95 q2 s1-f0-o0-r1 d98513ba8a53a88d
+0.95 q2 s1-f0-o0-r2 4a0fd62b81caa37b
+0.95 q2 s1-f0-o64-r0 5e4250fe120ca723
+0.95 q2 s1-f0-o64-r1 9e0fddf708909673
+0.95 q2 s1-f0-o64-r2 95d8ddeb553b6548
+0.95 q2 s1-f0-o400-r0 ee2987054cc86203
+0.95 q2 s1-f0-o400-r1 6ca3a7dc95085dd4
+0.95 q2 s1-f0-o400-r2 dd1a1de074c6d539
+0.95 q2 s1-f1-o0-r0 d42d6ce933307fab
+0.95 q2 s1-f1-o0-r1 5a24e606bf95e608
+0.95 q2 s1-f1-o0-r2 183b54040264a45e
+0.95 q2 s1-f1-o64-r0 3eabfa4092859f05
+0.95 q2 s1-f1-o64-r1 d7c043e68559d35f
+0.95 q2 s1-f1-o64-r2 c13ef7c5349339e7
+0.95 q2 s1-f1-o400-r0 ff60670f0d0c7379
+0.95 q2 s1-f1-o400-r1 ba440239990be33c
+0.95 q2 s1-f1-o400-r2 b48ec87016470990
+0.95 q2 s1-f2-o0-r0 6b408968b73578b4
+0.95 q2 s1-f2-o0-r1 70450f85ab1fa7a2
+0.95 q2 s1-f2-o0-r2 5647d83dd8b8e73a
+0.95 q2 s1-f2-o64-r0 7812d30d466c4dc5
+0.95 q2 s1-f2-o64-r1 2adf748bbd9cba4a
+0.95 q2 s1-f2-o64-r2 d26c1378872a658c
+0.95 q2 s1-f2-o400-r0 005c41f7fd473ed6
+0.95 q2 s1-f2-o400-r1 9a7ecfc55f2719d9
+0.95 q2 s1-f2-o400-r2 c25afc14063035d7
+0.95 q2gh s0-f0-o0-r0 658ba5ef7150c784
+0.95 q2gh s0-f0-o0-r1 a0d5ca7ed8d73885
+0.95 q2gh s0-f0-o0-r2 b040e7262beb9094
+0.95 q2gh s0-f0-o64-r0 3d262ba30a55f80c
+0.95 q2gh s0-f0-o64-r1 61e1b2d94ddc3f5f
+0.95 q2gh s0-f0-o64-r2 cf7149135ca54f97
+0.95 q2gh s0-f0-o400-r0 d3219d15378472ca
+0.95 q2gh s0-f0-o400-r1 6ec95783b56cf82a
+0.95 q2gh s0-f0-o400-r2 9a654dcbfb61e5f6
+0.95 q2gh s0-f1-o0-r0 77d0e75fba7825a3
+0.95 q2gh s0-f1-o0-r1 95357c5aac4536ba
+0.95 q2gh s0-f1-o0-r2 6592fd4ba5a29d92
+0.95 q2gh s0-f1-o64-r0 e9c0432daaff2dc1
+0.95 q2gh s0-f1-o64-r1 fb0a51f7224d531b
+0.95 q2gh s0-f1-o64-r2 795ff86629417e1c
+0.95 q2gh s0-f1-o400-r0 06f7f35f0d8596aa
+0.95 q2gh s0-f1-o400-r1 b56ac55eed31892a
+0.95 q2gh s0-f1-o400-r2 5e8bcdf0ea9e52f3
+0.95 q2gh s0-f2-o0-r0 e92a1a0bb4681440
+0.95 q2gh s0-f2-o0-r1 6c9d4b9f0ffc61e9
+0.95 q2gh s0-f2-o0-r2 203997dd39366dbb
+0.95 q2gh s0-f2-o64-r0 e37b30b6353680c2
+0.95 q2gh s0-f2-o64-r1 d8825ef3029f17eb
+0.95 q2gh s0-f2-o64-r2 ec127144104aacfe
+0.95 q2gh s0-f2-o400-r0 090fb140e2fac171
+0.95 q2gh s0-f2-o400-r1 20680cea873a8009
+0.95 q2gh s0-f2-o400-r2 e27840687f07bc90
+0.95 q2gh s1-f0-o0-r0 3f1a71089fe8f06c
+0.95 q2gh s1-f0-o0-r1 748e252b280681ed
+0.95 q2gh s1-f0-o0-r2 d6f06575b84768c7
+0.95 q2gh s1-f0-o64-r0 175892bac5d50829
+0.95 q2gh s1-f0-o64-r1 8bc10f006d23d012
+0.95 q2gh s1-f0-o64-r2 21738935e56a88d4
+0.95 q2gh s1-f0-o400-r0 c6e0e9e29c71423b
+0.95 q2gh s1-f0-o400-r1 5c6a4e81364eecab
+0.95 q2gh s1-f0-o400-r2 3305eae0483ebefc
+0.95 q2gh s1-f1-o0-r0 bc0ee61b4577bed8
+0.95 q2gh s1-f1-o0-r1 3eaface669907e13
+0.95 q2gh s1-f1-o0-r2 ef6c6b63cbb8dbc3
+0.95 q2gh s1-f1-o64-r0 785c9dff34f67252
+0.95 q2gh s1-f1-o64-r1 82888499b85cac1e
+0.95 q2gh s1-f1-o64-r2 ca71bf787083e6dc
+0.95 q2gh s1-f1-o400-r0 5866fae0f1053e07
+0.95 q2gh s1-f1-o400-r1 81b5ad360a5ec9e2
+0.95 q2gh s1-f1-o400-r2 e02287ecd0a3dbb8
+0.95 q2gh s1-f2-o0-r0 87479675433f7554
+0.95 q2gh s1-f2-o0-r1 08d19b716a6c680d
+0.95 q2gh s1-f2-o0-r2 ab86426a5fbe6bdf
+0.95 q2gh s1-f2-o64-r0 5a5e31c272797835
+0.95 q2gh s1-f2-o64-r1 fb238a7e5865ec12
+0.95 q2gh s1-f2-o64-r2 9473f5527421f610
+0.95 q2gh s1-f2-o400-r0 3ff4b1bfc5590fc0
+0.95 q2gh s1-f2-o400-r1 0889a30039a70ffd
+0.95 q2gh s1-f2-o400-r2 d9d32be12082601c
+0.95 q2far s0-f0-o0-r0 5d19de64a6f1cb83
+0.95 q2far s0-f0-o0-r1 696128954e7bb097
+0.95 q2far s0-f0-o0-r2 103669ddb32aa04d
+0.95 q2far s0-f0-o64-r0 9db4dbe664f0af0b
+0.95 q2far s0-f0-o64-r1 7701e1af511594d4
+0.95 q2far s0-f0-o64-r2 c2df9306f4faee85
+0.95 q2far s0-f0-o400-r0 7503e64c062b34ab
+0.95 q2far s0-f0-o400-r1 010a892490d8c8fa
+0.95 q2far s0-f0-o400-r2 51a5e97c92d1cfcd
+0.95 q2far s0-f1-o0-r0 22b0c434bfc5421b
+0.95 q2far s0-f1-o0-r1 d8d412e03515d53c
+0.95 q2far s0-f1-o0-r2 33ac15969aed2386
+0.95 q2far s0-f1-o64-r0 5dc34b08fb69ffb8
+0.95 q2far s0-f1-o64-r1 61c7b0a7492d706b
+0.95 q2far s0-f1-o64-r2 3e2d8fda6c57a091
+0.95 q2far s0-f1-o400-r0 0cf225e469c4457f
+0.95 q2far s0-f1-o400-r1 4c56e1cd86763d2c
+0.95 q2far s0-f1-o400-r2 66b7661a813e4d7a
+0.95 q2far s0-f2-o0-r0 104e0df75cd6dc9d
+0.95 q2far s0-f2-o0-r1 863d5425fa78bad7
+0.95 q2far s0-f2-o0-r2 fb1ce98b1755f5b3
+0.95 q2far s0-f2-o64-r0 7cf63daf4dba9cc8
+0.95 q2far s0-f2-o64-r1 109dc0971aedd382
+0.95 q2far s0-f2-o64-r2 07aa685ff0eb0c8a
+0.95 q2far s0-f2-o400-r0 4eab486995ee0d9d
+0.95 q2far s0-f2-o400-r1 3bb5e80ce58aab5f
+0.95 q2far s0-f2-o400-r2 8488a20a540d14ff
+0.95 q2far s1-f0-o0-r0 ed4cc0b93dceb421
+0.95 q2far s1-f0-o0-r1 1491b1acae47b3dc
+0.95 q2far s1-f0-o0-r2 2a5bcb422c26f4be
+0.95 q2far s1-f0-o64-r0 e30c9a50c9dc8945
+0.95 q2far s1-f0-o64-r1 cac2e35fd862bf4f
+0.95 q2far s1-f0-o64-r2 941315e98e34fa5f
+0.95 q2far s1-f0-o400-r0 6f840d45bccc0712
+0.95 q2far s1-f0-o400-r1 3240a93b7c57f11a
+0.95 q2far s1-f0-o400-r2 9443b41f5bbd0aaa
+0.95 q2far s1-f1-o0-r0 149e3ddadf3eb648
+0.95 q2far s1-f1-o0-r1 1a4c55aa5664c18b
+0.95 q2far s1-f1-o0-r2 1ea68faaec34c5e3
+0.95 q2far s1-f1-o64-r0 17a33209babdb62c
+0.95 q2far s1-f1-o64-r1 3d8da2b91c93a68a
+0.95 q2far s1-f1-o64-r2 bc7b1452375c031f
+0.95 q2far s1-f1-o400-r0 6db3deb44ac83fa0
+0.95 q2far s1-f1-o400-r1 ef445715cbc51058
+0.95 q2far s1-f1-o400-r2 4c55ec66f4239fb0
+0.95 q2far s1-f2-o0-r0 8cd6ee3a335e13cd
+0.95 q2far s1-f2-o0-r1 c7c3f6db9bbcf83d
+0.95 q2far s1-f2-o0-r2 3e17566b4e2c453c
+0.95 q2far s1-f2-o64-r0 fda1f896f3ac095e
+0.95 q2far s1-f2-o64-r1 a3d1b6921b80ae2e
+0.95 q2far s1-f2-o64-r2 5ac8cdced278b7cf
+0.95 q2far s1-f2-o400-r0 c4f3a3a41b17e591
+0.95 q2far s1-f2-o400-r1 ee3196d9d6741fd5
+0.95 q2far s1-f2-o400-r2 8706d81501d20c64
+0.95 q2full s0-f0-o0-r0 8fbdb5e9f77b600b
+0.95 q2full s0-f0-o0-r1 b7f1cbeee2d0c590
+0.95 q2full s0-f0-o0-r2 41ba49d7e96f2072
+0.95 q2full s0-f0-o64-r0 44ad0ffab424d75b
+0.95 q2full s0-f0-o64-r1 18f8850341ffeb99
+0.95 q2full s0-f0-o64-r2 4cacc11e2f6543c7
+0.95 q2full s0-f0-o400-r0 bd33f9d62751122e
+0.95 q2full s0-f0-o400-r1 1d23c4d352c25785
+0.95 q2full s0-f0-o400-r2 36be3bfff50d27ca
+0.95 q2full s0-f1-o0-r0 c8ff2b81c577627d
+0.95 q2full s0-f1-o0-r1 7c99f4ac2aa90cda
+0.95 q2full s0-f1-o0-r2 c3e06241e4ac4623
+0.95 q2full s0-f1-o64-r0 d446f58be9ec8321
+0.95 q2full s0-f1-o64-r1 a422690247a1bbf9
+0.95 q2full s0-f1-o64-r2 1acf945eaca306cf
+0.95 q2full s0-f1-o400-r0 382cc496d654d4ac
+0.95 q2full s0-f1-o400-r1 c70ce74ad7b4de9a
+0.95 q2full s0-f1-o400-r2 e76b0e59ab73fe13
+0.95 q2full s0-f2-o0-r0 16da3278a005fcc1
+0.95 q2full s0-f2-o0-r1 38abb51960aba692
+0.95 q2full s0-f2-o0-r2 2b7f3e5465f01016
+0.95 q2full s0-f2-o64-r0 785e37e3d586b910
+0.95 q2full s0-f2-o64-r1 4aa2d759493b74d3
+0.95 q2full s0-f2-o64-r2 cf66be309b848733
+0.95 q2full s0-f2-o400-r0 67d22f4641753964
+0.95 q2full s0-f2-o400-r1 e67e2fe9192c15af
+0.95 q2full s0-f2-o400-r2 ae0bf6761a16960f
+0.95 q2full s1-f0-o0-r0 8761affd973d3523
+0.95 q2full s1-f0-o0-r1 efc029b6e93f91e0
+0.95 q2full s1-f0-o0-r2 ae2451878114ff44
+0.95 q2full s1-f0-o64-r0 8ef5f2581dd52eb1
+0.95 q2full s1-f0-o64-r1 f64d546b6bd8f0e2
+0.95 q2full s1-f0-o64-r2 80b6426a4bc87d31
+0.95 q2full s1-f0-o400-r0 e375cf795efd5b92
+0.95 q2full s1-f0-o400-r1 d8b4e01b58d31d3c
+0.95 q2full s1-f0-o400-r2 9e93548de469fd56
+0.95 q2full s1-f1-o0-r0 38a5d7c4a68fde95
+0.95 q2full s1-f1-o0-r1 f1d8acc468373c3a
+0.95 q2full s1-f1-o0-r2 97a7754fd3ff369c
+0.95 q2full s1-f1-o64-r0 e185e0acc900d7d4
+0.95 q2full s1-f1-o64-r1 28430d7911ebcb54
+0.95 q2full s1-f1-o64-r2 2f92fad7db85c25c
+0.95 q2full s1-f1-o400-r0 3b65efa17b676f0e
+0.95 q2full s1-f1-o400-r1 c8a30e9c39ea50b5
+0.95 q2full s1-f1-o400-r2 c998b954cf52fde3
+0.95 q2full s1-f2-o0-r0 8f74b43b01b87a6f
+0.95 q2full s1-f2-o0-r1 f31010111014e664
+0.95 q2full s1-f2-o0-r2 fea82e84b0517522
+0.95 q2full s1-f2-o64-r0 5736d4704a859066
+0.95 q2full s1-f2-o64-r1 5fe8209fc5446274
+0.95 q2full s1-f2-o64-r2 436d3634fbaa970a
+0.95 q2full s1-f2-o400-r0 5e29968ffc80f9c6
+0.95 q2full s1-f2-o400-r1 1d1dbe69dceb80a2
+0.95 q2full s1-f2-o400-r2 fb4b07e51c063554
+0.95 s3 s0-f0-o0-r0 98624d44cb8db5c1
+0.95 s3 s0-f0-o0-r1 6ae5b951282c76ec
+0.95 s3 s0-f0-o0-r2 763c2feb5d170a9f
+0.95 s3 s0-f0-o64-r0 df6cdf7de2582b72
+0.95 s3 s0-f0-o64-r1 341897321c5b6fc3
+0.95 s3 s0-f0-o64-r2 86a6f9a9840bb401
+0.95 s3 s0-f0-o400-r0 06d8c8e4325d8434
+0.95 s3 s0-f0-o400-r1 de4d8e61da1f7e9f
+0.95 s3 s0-f0-o400-r2 ed4b20ada6ad8bb1
+0.95 s3 s0-f1-o0-r0 ff3a863c2eae2b97
+0.95 s3 s0-f1-o0-r1 ac6fb0e6f791a512
+0.95 s3 s0-f1-o0-r2 462aac12676e63e8
+0.95 s3 s0-f1-o64-r0 664cd93fa657145a
+0.95 s3 s0-f1-o64-r1 9f13d21b0393a78a
+0.95 s3 s0-f1-o64-r2 d55fee5d3ea03553
+0.95 s3 s0-f1-o400-r0 fd1691b9dd65fc57
+0.95 s3 s0-f1-o400-r1 577d1bcf97eb4893
+0.95 s3 s0-f1-o400-r2 a4246923d10d8ff5
+0.95 s3 s0-f2-o0-r0 152ff9791625bfc6
+0.95 s3 s0-f2-o0-r1 697efca836277711
+0.95 s3 s0-f2-o0-r2 b571bcec0600035b
+0.95 s3 s0-f2-o64-r0 f4ea5eb533cf6989
+0.95 s3 s0-f2-o64-r1 e026424188ec00aa
+0.95 s3 s0-f2-o64-r2 f8ec0af69c5d7826
+0.95 s3 s0-f2-o400-r0 5cb4ffa92df4b8da
+0.95 s3 s0-f2-o400-r1 5920c3ba0045774b
+0.95 s3 s0-f2-o400-r2 26f84b7523e49e71
+0.95 s3 s1-f0-o0-r0 866acb2242aaee08
+0.95 s3 s1-f0-o0-r1 20b735e4887cd402
+0.95 s3 s1-f0-o0-r2 d68c519cf077592d
+0.95 s3 s1-f0-o64-r0 21f595a94b7dba15
+0.95 s3 s1-f0-o64-r1 19f7558c6cb2b9ca
+0.95 s3 s1-f0-o64-r2 3982e695fdb1d8f8
+0.95 s3 s1-f0-o400-r0 48005a3438b04a94
+0.95 s3 s1-f0-o400-r1 bdab591dbcd92c29
+0.95 s3 s1-f0-o400-r2 70a5a9b844759294
+0.95 s3 s1-f1-o0-r0 d0e5835e1940a56b
+0.95 s3 s1-f1-o0-r1 6b58867b8391fb4c
+0.95 s3 s1-f1-o0-r2 6697b58d821e2ec1
+0.95 s3 s1-f1-o64-r0 37dcd9f4600c56f5
+0.95 s3 s1-f1-o64-r1 1504872d92d94b0d
+0.95 s3 s1-f1-o64-r2 6fdcdbc9ea65d757
+0.95 s3 s1-f1-o400-r0 d03cda410a188a0a
+0.95 s3 s1-f1-o400-r1 3804ccb67719e9db
+0.95 s3 s1-f1-o400-r2 5ca8b5848ba80ebe
+0.95 s3 s1-f2-o0-r0 c6cb5ce6c29c805e
+0.95 s3 s1-f2-o0-r1 1460eaf47a6e9c0c
+0.95 s3 s1-f2-o0-r2 bd71506c89c0d87b
+0.95 s3 s1-f2-o64-r0 d9fbb8221e4f2dd3
+0.95 s3 s1-f2-o64-r1 f896afaf06915ff3
+0.95 s3 s1-f2-o64-r2 c7e9d992cafd79b5
+0.95 s3 s1-f2-o400-r0 e835f04799db1220
+0.95 s3 s1-f2-o400-r1 04e9062c38f24ff4
+0.95 s3 s1-f2-o400-r2 d63affb1bfac9a34
+0.95 s3gh s0-f0-o0-r0 7240328595fc621d
+0.95 s3gh s0-f0-o0-r1 d0d6114e1dbe0d22
+0.95 s3gh s0-f0-o0-r2 f46847db17f32b0f
+0.95 s3gh s0-f0-o64-r0 623823176f649628
+0.95 s3gh s0-f0-o64-r1 1eb30b7905eb2489
+0.95 s3gh s0-f0-o64-r2 c4789611f2f1be81
+0.95 s3gh s0-f0-o400-r0 7f73744b52ca08ac
+0.95 s3gh s0-f0-o400-r1 703c3ef5d179d872
+0.95 s3gh s0-f0-o400-r2 283c70e15b465909
+0.95 s3gh s0-f1-o0-r0 bdaeac27ffd13486
+0.95 s3gh s0-f1-o0-r1 d0d2ba6c45755153
+0.95 s3gh s0-f1-o0-r2 992dd278e187e42d
+0.95 s3gh s0-f1-o64-r0 afb8194cefe1b0c6
+0.95 s3gh s0-f1-o64-r1 b9d53c4ee1319b74
+0.95 s3gh s0-f1-o64-r2 8b85c256e8e66c39
+0.95 s3gh s0-f1-o400-r0 63c738043e0a9acd
+0.95 s3gh s0-f1-o400-r1 4ff77b09318143e7
+0.95 s3gh s0-f1-o400-r2 a84b9dfebaee4179
+0.95 s3gh s0-f2-o0-r0 941ef952fdb7f51a
+0.95 s3gh s0-f2-o0-r1 0c589abae59ee1b6
+0.95 s3gh s0-f2-o0-r2 96b522123846655b
+0.95 s3gh s0-f2-o64-r0 3f3bb593824a7a05
+0.95 s3gh s0-f2-o64-r1 934768b955876129
+0.95 s3gh s0-f2-o64-r2 f8b35416ad69b7ce
+0.95 s3gh s0-f2-o400-r0 2dc9256c3ad47330
+0.95 s3gh s0-f2-o400-r1 195d78858839a682
+0.95 s3gh s0-f2-o400-r2 bfe9d20ed51ab278
+0.95 s3gh s1-f0-o0-r0 50f8a5e919b3712d
+0.95 s3gh s1-f0-o0-r1 8be74a19f84e8984
+0.95 s3gh s1-f0-o0-r2 246671b77ad31892
+0.95 s3gh s1-f0-o64-r0 e87df2efd12e0422
+0.95 s3gh s1-f0-o64-r1 a0c2f22b3229e397
+0.95 s3gh s1-f0-o64-r2 af4704fc9add93e8
+0.95 s3gh s1-f0-o400-r0 a81050a7772c408d
+0.95 s3gh s1-f0-o400-r1 94f6cfc374daf454
+0.95 s3gh s1-f0-o400-r2 0ae6adb7c18ae8e8
+0.95 s3gh s1-f1-o0-r0 9ce1e98a2c13e231
+0.95 s3gh s1-f1-o0-r1 a616d2d5cbb4fbc7
+0.95 s3gh s1-f1-o0-r2 cf3bb4c0be0be55d
+0.95 s3gh s1-f1-o64-r0 a135f85b4a528ae7
+0.95 s3gh s1-f1-o64-r1 a20d889f8b0a819f
+0.95 s3gh s1-f1-o64-r2 07c804f04c517d00
+0.95 s3gh s1-f1-o400-r0 9c4a8b0311f2480b
+0.95 s3gh s1-f1-o400-r1 b9f16cf9c86eb11e
+0.95 s3gh s1-f1-o400-r2 874bf592b645006f
+0.95 s3gh s1-f2-o0-r0 84d81ba5bb192c4f
+0.95 s3gh s1-f2-o0-r1 9604aa3552237e2d
+0.95 s3gh s1-f2-o0-r2 b438a038cf89d23f
+0.95 s3gh s1-f2-o64-r0 b6aca2c7ac7f1ca7
+0.95 s3gh s1-f2-o64-r1 a642fad4c6d0e727
+0.95 s3gh s1-f2-o64-r2 83431cc627d6af24
+0.95 s3gh s1-f2-o400-r0 49563db3e1d18693
+0.95 s3gh s1-f2-o400-r1 6f11df713ca8a006
+0.95 s3gh s1-f2-o400-r2 04d09c07745fa309
+0.95 gld s0-f0-o0-r0 c8211298d70e0976
+0.95 gld s0-f0-o0-r1 bc09f71438afe201
+0.95 gld s0-f0-o0-r2 d842c46568abbde7
+0.95 gld s0-f0-o64-r0 d7e63784a5c12084
+0.95 gld s0-f0-o64-r1 7460fe1d5273fc64
+0.95 gld s0-f0-o64-r2 989344f1e6b436f0
+0.95 gld s0-f0-o400-r0 3c1c22ad4ffa99a5
+0.95 gld s0-f0-o400-r1 eeb5c13c8546aae3
+0.95 gld s0-f0-o400-r2 090269f941552bf5
+0.95 gld s0-f1-o0-r0 17543c8caae9ab9a
+0.95 gld s0-f1-o0-r1 1860fc2819f1b0ee
+0.95 gld s0-f1-o0-r2 19d21efdb46cddce
+0.95 gld s0-f1-o64-r0 c8b0ee7c6fd1c98d
+0.95 gld s0-f1-o64-r1 cc10e94fb38c32d9
+0.95 gld s0-f1-o64-r2 0d3da8e3886e0d76
+0.95 gld s0-f1-o400-r0 2dc428cfb4a4439a
+0.95 gld s0-f1-o400-r1 122e61b9ac8ca664
+0.95 gld s0-f1-o400-r2 70c01b384603d22e
+0.95 gld s0-f2-o0-r0 a8b42d33481c2c71
+0.95 gld s0-f2-o0-r1 28e1fc5917e3c662
+0.95 gld s0-f2-o0-r2 71a310674a749213
+0.95 gld s0-f2-o64-r0 e8153df2725c06f5
+0.95 gld s0-f2-o64-r1 899f9dfa6286c728
+0.95 gld s0-f2-o64-r2 55b312e2b28b9ab6
+0.95 gld s0-f2-o400-r0 4762aa784c70df20
+0.95 gld s0-f2-o400-r1 767c974b5b938acf
+0.95 gld s0-f2-o400-r2 0369b8b053eb89c1
+0.95 gld s1-f0-o0-r0 e716f5429c4f3ab9
+0.95 gld s1-f0-o0-r1 910090ac966eb1e8
+0.95 gld s1-f0-o0-r2 7bdef670453422e8
+0.95 gld s1-f0-o64-r0 a6c350e086091442
+0.95 gld s1-f0-o64-r1 78375a8a393b253e
+0.95 gld s1-f0-o64-r2 42a4b8679540886b
+0.95 gld s1-f0-o400-r0 72a32b736ba92f4b
+0.95 gld s1-f0-o400-r1 7d9e18efb0535479
+0.95 gld s1-f0-o400-r2 1a51543a00ee1b18
+0.95 gld s1-f1-o0-r0 0beeca43154087cd
+0.95 gld s1-f1-o0-r1 c84e943274c25a46
+0.95 gld s1-f1-o0-r2 1c1d52b67f1fa92e
+0.95 gld s1-f1-o64-r0 1062cb54d7df2817
+0.95 gld s1-f1-o64-r1 87d56212aee96aee
+0.95 gld s1-f1-o64-r2 051620968be151be
+0.95 gld s1-f1-o400-r0 c0f629e4feb2751f
+0.95 gld s1-f1-o400-r1 73d26040760e8805
+0.95 gld s1-f1-o400-r2 9b82bd633ac55821
+0.95 gld s1-f2-o0-r0 b462a69f27293caa
+0.95 gld s1-f2-o0-r1 14ab1c1c1698c213
+0.95 gld s1-f2-o0-r2 a0d71e5020b972a3
+0.95 gld s1-f2-o64-r0 a04d0d355b9cf1ea
+0.95 gld s1-f2-o64-r1 3b9656ac8b877cf7
+0.95 gld s1-f2-o64-r2 3567d5975861a4b5
+0.95 gld s1-f2-o400-r0 72620fba7488fad3
+0.95 gld s1-f2-o400-r1 ca463785d88067b8
+0.95 gld s1-f2-o400-r2 a0ba3e584018c60c
+0.95 gldfa s0-f0-o0-r0 9af33d7220858683
+0.95 gldfa s0-f0-o0-r1 bb1b2399798084ae
+0.95 gldfa s0-f0-o0-r2 5191eb692d5b02a9
+0.95 gldfa s0-f0-o64-r0 e416236ac55f6fcc
+0.95 gldfa s0-f0-o64-r1 c209c32a29f36b28
+0.95 gldfa s0-f0-o64-r2 0d1f746921b4ebd5
+0.95 gldfa s0-f0-o400-r0 3ac3c0e2ad5b5bd6
+0.95 gldfa s0-f0-o400-r1 b06c3e81857ba709
+0.95 gldfa s0-f0-o400-r2 24858363b6b60be9
+0.95 gldfa s0-f1-o0-r0 f81679b7adbf5f7a
+0.95 gldfa s0-f1-o0-r1 038a94f7abe30abe
+0.95 gldfa s0-f1-o0-r2 f0b5447b03fe7cc1
+0.95 gldfa s0-f1-o64-r0 992cef6c56d67c20
+0.95 gldfa s0-f1-o64-r1 dd6ed2827b055c47
+0.95 gldfa s0-f1-o64-r2 5c0073599b8fae37
+0.95 gldfa s0-f1-o400-r0 fcab8922b2489f15
+0.95 gldfa s0-f1-o400-r1 32ac28029c6c9c28
+0.95 gldfa s0-f1-o400-r2 07b6094a577eebba
+0.95 gldfa s0-f2-o0-r0 3abf8c1bef44d0a0
+0.95 gldfa s0-f2-o0-r1 678206de3b450958
+0.95 gldfa s0-f2-o0-r2 160ae9393dfa02de
+0.95 gldfa s0-f2-o64-r0 2b6ba76ebab24371
+0.95 gldfa s0-f2-o64-r1 849331019b420625
+0.95 gldfa s0-f2-o64-r2 fd1c3d5e9281e4a7
+0.95 gldfa s0-f2-o400-r0 62d0ef5bcf44a069
+0.95 gldfa s0-f2-o400-r1 d18857f009d493f1
+0.95 gldfa s0-f2-o400-r2 d0936ed396d9d3c9
+0.95 gldfa s1-f0-o0-r0 e9dcbe30de2c8c5f
+0.95 gldfa s1-f0-o0-r1 89ce2a5d1b6c23bc
+0.95 gldfa s1-f0-o0-r2 eaf34f516a5de196
+0.95 gldfa s1-f0-o64-r0 1da92c571327e929
+0.95 gldfa s1-f0-o64-r1 e9851b3b982917fd
+0.95 gldfa s1-f0-o64-r2 184ac206d742b5dd
+0.95 gldfa s1-f0-o400-r0 1732047e6be08e9f
+0.95 gldfa s1-f0-o400-r1 3d1e41d2bd65af71
+0.95 gldfa s1-f0-o400-r2 c1c756ba8352783c
+0.95 gldfa s1-f1-o0-r0 f27cc14fafc7b112
+0.95 gldfa s1-f1-o0-r1 306676fd182c0e82
+0.95 gldfa s1-f1-o0-r2 fd0e48f5967e25be
+0.95 gldfa s1-f1-o64-r0 334b4d1044a06c8d
+0.95 gldfa s1-f1-o64-r1 c72bfa7e26d3cec9
+0.95 gldfa s1-f1-o64-r2 aa5d243cee4c756c
+0.95 gldfa s1-f1-o400-r0 87d3310c48c2a03c
+0.95 gldfa s1-f1-o400-r1 0a98367927d47182
+0.95 gldfa s1-f1-o400-r2 a66b9a5f0f189e3b
+0.95 gldfa s1-f2-o0-r0 826add23c4703ce8
+0.95 gldfa s1-f2-o0-r1 383407e1e10530a1
+0.95 gldfa s1-f2-o0-r2 06efb8206aa5b8d4
+0.95 gldfa s1-f2-o64-r0 b526c456cd944ccb
+0.95 gldfa s1-f2-o64-r1 e28115dec57854ec
+0.95 gldfa s1-f2-o64-r2 5014baaeefa76d1d
+0.95 gldfa s1-f2-o400-r0 deafc76f0210076b
+0.95 gldfa s1-f2-o400-r1 ac369eaf8b337d11
+0.95 gldfa s1-f2-o400-r2 10ae4a95402ebb07
+0.95 mid21 s0-f0-o0-r0 787cb18174e90750
+0.95 mid21 s0-f0-o0-r1 c386b4398935b22e
+0.95 mid21 s0-f0-o0-r2 5c9e3ec4ff7d5d6f
+0.95 mid21 s0-f0-o64-r0 3757b8c7d7e4a4a4
+0.95 mid21 s0-f0-o64-r1 36eb816ae5d8104b
+0.95 mid21 s0-f0-o64-r2 5906c59daea24a5e
+0.95 mid21 s0-f0-o400-r0 c0f4b3c6d76cbd4e
+0.95 mid21 s0-f0-o400-r1 51f94bd1f98e0572
+0.95 mid21 s0-f0-o400-r2 36e22f95110c079f
+0.95 mid21 s0-f1-o0-r0 e3af3bfbc08e7a31
+0.95 mid21 s0-f1-o0-r1 1ffa3355f734bdd4
+0.95 mid21 s0-f1-o0-r2 1fe8538386941911
+0.95 mid21 s0-f1-o64-r0 1bbdf5c9b64326ec
+0.95 mid21 s0-f1-o64-r1 af7e812742fe14c6
+0.95 mid21 s0-f1-o64-r2 d371c7dc078b8d0b
+0.95 mid21 s0-f1-o400-r0 9878df75b80eac6c
+0.95 mid21 s0-f1-o400-r1 8f130c495f7bd19d
+0.95 mid21 s0-f1-o400-r2 c0e4804882e1aa71
+0.95 mid21 s0-f2-o0-r0 06febc95fcf30033
+0.95 mid21 s0-f2-o0-r1 37060b6cf142f711
+0.95 mid21 s0-f2-o0-r2 49c08d2e7cf01d13
+0.95 mid21 s0-f2-o64-r0 6aa81dbe1a9ffaca
+0.95 mid21 s0-f2-o64-r1 557ca8a1c8f0a6a8
+0.95 mid21 s0-f2-o64-r2 8a20d31cafbd339e
+0.95 mid21 s0-f2-o400-r0 46b31773791a880c
+0.95 mid21 s0-f2-o400-r1 670eaa7caeb2c7be
+0.95 mid21 s0-f2-o400-r2 eebd8ff789c07701
+0.95 mid21 s1-f0-o0-r0 b77f7898e2713a31
+0.95 mid21 s1-f0-o0-r1 e3e4f8b32cf9090a
+0.95 mid21 s1-f0-o0-r2 2a73a9e8ab60b341
+0.95 mid21 s1-f0-o64-r0 3425beb1349a7f7a
+0.95 mid21 s1-f0-o64-r1 0eda13222404bbab
+0.95 mid21 s1-f0-o64-r2 549fe3b9b8044c73
+0.95 mid21 s1-f0-o400-r0 45c1085c827504e0
+0.95 mid21 s1-f0-o400-r1 cc6f94fe57fd78a0
+0.95 mid21 s1-f0-o400-r2 a9fa630422c53fc1
+0.95 mid21 s1-f1-o0-r0 e99b673375a1d984
+0.95 mid21 s1-f1-o0-r1 83e54712bb39e162
+0.95 mid21 s1-f1-o0-r2 043fc476e3b9403d
+0.95 mid21 s1-f1-o64-r0 aa04b98765525f92
+0.95 mid21 s1-f1-o64-r1 7ff1b1df1a25806f
+0.95 mid21 s1-f1-o64-r2 b71ab77be917a0f6
+0.95 mid21 s1-f1-o400-r0 68069dadb642590c
+0.95 mid21 s1-f1-o400-r1 d2453e40f9498848
+0.95 mid21 s1-f1-o400-r2 25b5f34999feb1e0
+0.95 mid21 s1-f2-o0-r0 fd71d322296dc965
+0.95 mid21 s1-f2-o0-r1 b81aaea4773db456
+0.95 mid21 s1-f2-o0-r2 3c30fdf7ce2679f4
+0.95 mid21 s1-f2-o64-r0 dacbcaf62771a6f7
+0.95 mid21 s1-f2-o64-r1 e4d229d583659efb
+0.95 mid21 s1-f2-o64-r2 53e2c37ce97f8f93
+0.95 mid21 s1-f2-o400-r0 98f16346c025f85c
+0.95 mid21 s1-f2-o400-r1 bbbd3995b2dd7786
+0.95 mid21 s1-f2-o400-r2 387c7abc090320bb
+0.95 ldr s0-f0-o0-r0 9ce0b9639ba41c8d
+0.95 ldr s0-f0-o0-r1 5d213ab821222e2e
+0.95 ldr s0-f0-o0-r2 5650c7ac8b1050d7
+0.95 ldr s0-f0-o64-r0 f50ff4e3a069c0be
+0.95 ldr s0-f0-o64-r1 c782e3f390e4108b
+0.95 ldr s0-f0-o64-r2 9c333d7c230d0f0c
+0.95 ldr s0-f0-o400-r0 e045d140056ea321
+0.95 ldr s0-f0-o400-r1 962d235ec27745b0
+0.95 ldr s0-f0-o400-r2 9c62a5918c7480a3
+0.95 ldr s0-f1-o0-r0 2fefe92db6105380
+0.95 ldr s0-f1-o0-r1 70bc528eceaad225
+0.95 ldr s0-f1-o0-r2 5577de10d347daf5
+0.95 ldr s0-f1-o64-r0 2a189b2005728093
+0.95 ldr s0-f1-o64-r1 4ff0dea2d4e7bbc1
+0.95 ldr s0-f1-o64-r2 d76fef89f4eba619
+0.95 ldr s0-f1-o400-r0 fb023dadd3f3044c
+0.95 ldr s0-f1-o400-r1 a90e14af141d7427
+0.95 ldr s0-f1-o400-r2 62f9f11c732eb6ef
+0.95 ldr s0-f2-o0-r0 68e4d99fdc6df248
+0.95 ldr s0-f2-o0-r1 0a41f7c5b952d3c3
+0.95 ldr s0-f2-o0-r2 dd806b4a0d9fa7fe
+0.95 ldr s0-f2-o64-r0 d442371c28df37d0
+0.95 ldr s0-f2-o64-r1 ef86147dc046bd8f
+0.95 ldr s0-f2-o64-r2 527aa294870aa0ae
+0.95 ldr s0-f2-o400-r0 3dee15b2133a5dae
+0.95 ldr s0-f2-o400-r1 2f2747691a6b8e43
+0.95 ldr s0-f2-o400-r2 af6dba221b9809a2
+0.95 ldr s1-f0-o0-r0 015f3b4e0d702978
+0.95 ldr s1-f0-o0-r1 0ade728e192ccf6d
+0.95 ldr s1-f0-o0-r2 0cb943adfdfb59fe
+0.95 ldr s1-f0-o64-r0 9bc7a75d252bdf58
+0.95 ldr s1-f0-o64-r1 7a77c2042cb005f0
+0.95 ldr s1-f0-o64-r2 4e771d22c6325629
+0.95 ldr s1-f0-o400-r0 a3a5a32a07bd3e68
+0.95 ldr s1-f0-o400-r1 2ddd7d4ea7cdc2f7
+0.95 ldr s1-f0-o400-r2 20b9e12de1b7bb61
+0.95 ldr s1-f1-o0-r0 e3a375cb17dae4f3
+0.95 ldr s1-f1-o0-r1 0430e87d2656b4c7
+0.95 ldr s1-f1-o0-r2 5f40d7ad47d725ce
+0.95 ldr s1-f1-o64-r0 23d58643e3edf262
+0.95 ldr s1-f1-o64-r1 fdac9b093585e7cb
+0.95 ldr s1-f1-o64-r2 2d2531897ada6ed1
+0.95 ldr s1-f1-o400-r0 11a61e55bcd42e7d
+0.95 ldr s1-f1-o400-r1 5591b301fec3ba85
+0.95 ldr s1-f1-o400-r2 b3e35676eecc20bb
+0.95 ldr s1-f2-o0-r0 6e014ea4cf70f0a1
+0.95 ldr s1-f2-o0-r1 4ec7b19dd384c046
+0.95 ldr s1-f2-o0-r2 db812efd16f3d9b2
+0.95 ldr s1-f2-o64-r0 de44147e2a89767c
+0.95 ldr s1-f2-o64-r1 3448a1b61893d2e0
+0.95 ldr s1-f2-o64-r2 fec90b3035d56c13
+0.95 ldr s1-f2-o400-r0 995b53f332894020
+0.95 ldr s1-f2-o400-r1 a3e6b9ff2d824626
+0.95 ldr s1-f2-o400-r2 bd10cfeaa6c01054
+0.95 ldfar s0-f0-o0-r0 8cf564d7ce31ec16
+0.95 ldfar s0-f0-o0-r1 3a752a8a1166a110
+0.95 ldfar s0-f0-o0-r2 2ad249f75a798e24
+0.95 ldfar s0-f0-o64-r0 b63abd9bde29e2dc
+0.95 ldfar s0-f0-o64-r1 9bd8cea727c28c12
+0.95 ldfar s0-f0-o64-r2 f05c0cef37b77a1b
+0.95 ldfar s0-f0-o400-r0 40492b9982b3ee8c
+0.95 ldfar s0-f0-o400-r1 f3fcd084c7d6f95c
+0.95 ldfar s0-f0-o400-r2 ec6f676188c63225
+0.95 ldfar s0-f1-o0-r0 a7e1fe9f6bcb8f1b
+0.95 ldfar s0-f1-o0-r1 bc8594d7c8832de9
+0.95 ldfar s0-f1-o0-r2 3d6a99d0a7e8565b
+0.95 ldfar s0-f1-o64-r0 af8b51ea9fcd61ab
+0.95 ldfar s0-f1-o64-r1 712670f4f3f2ab8d
+0.95 ldfar s0-f1-o64-r2 a5d32275c09ed6cf
+0.95 ldfar s0-f1-o400-r0 f47b5978c3b6c855
+0.95 ldfar s0-f1-o400-r1 0a427e551c68e190
+0.95 ldfar s0-f1-o400-r2 e891d536afce6d01
+0.95 ldfar s0-f2-o0-r0 612a0577b8bd13f0
+0.95 ldfar s0-f2-o0-r1 210d6bacf714a1aa
+0.95 ldfar s0-f2-o0-r2 4048d8a52eb6f1f6
+0.95 ldfar s0-f2-o64-r0 9c8f941520f84c3c
+0.95 ldfar s0-f2-o64-r1 7d1c1d2e7f845ff2
+0.95 ldfar s0-f2-o64-r2 3bbf059796cf4dbe
+0.95 ldfar s0-f2-o400-r0 2804e041f214e826
+0.95 ldfar s0-f2-o400-r1 c878ce3bdaa1db7d
+0.95 ldfar s0-f2-o400-r2 25eb1d736ac759a1
+0.95 ldfar s1-f0-o0-r0 0ca35fc562dcdc5d
+0.95 ldfar s1-f0-o0-r1 aa8ae8a5ee0165d5
+0.95 ldfar s1-f0-o0-r2 21c910b13d83a1df
+0.95 ldfar s1-f0-o64-r0 924b8ef275aafdff
+0.95 ldfar s1-f0-o64-r1 d0bb534a55a55676
+0.95 ldfar s1-f0-o64-r2 f9102631d5b0f2cf
+0.95 ldfar s1-f0-o400-r0 808187682c538f68
+0.95 ldfar s1-f0-o400-r1 0114ae3d0c6b114e
+0.95 ldfar s1-f0-o400-r2 f7a085dfbf32020f
+0.95 ldfar s1-f1-o0-r0 84ad8569ce5f4c68
+0.95 ldfar s1-f1-o0-r1 ff08ff1de4286e44
+0.95 ldfar s1-f1-o0-r2 4291228d62209570
+0.95 ldfar s1-f1-o64-r0 b50a610047dd83e6
+0.95 ldfar s1-f1-o64-r1 c5aa5f25183522b9
+0.95 ldfar s1-f1-o64-r2 6c247a09d4a5768e
+0.95 ldfar s1-f1-o400-r0 cea9988e70139174
+0.95 ldfar s1-f1-o400-r1 ef9876681e4cfa64
+0.95 ldfar s1-f1-o400-r2 6a42c23220bd594a
+0.95 ldfar s1-f2-o0-r0 e8a950d24519fad2
+0.95 ldfar s1-f2-o0-r1 fc98a07b272288ed
+0.95 ldfar s1-f2-o0-r2 5f7fff5968d625a7
+0.95 ldfar s1-f2-o64-r0 6c4feda465605970
+0.95 ldfar s1-f2-o64-r1 be3ed446212160aa
+0.95 ldfar s1-f2-o64-r2 2ea220ab989a59f0
+0.95 ldfar s1-f2-o400-r0 f7f506d29cbdbfde
+0.95 ldfar s1-f2-o400-r1 89256bec7fc28b60
+0.95 ldfar s1-f2-o400-r2 68c628529619a836
+0.95 mid22 s0-f0-o0-r0 b056497b3423f053
+0.95 mid22 s0-f0-o0-r1 a6b1a0f695e52908
+0.95 mid22 s0-f0-o0-r2 ee5a2d68c49f18e3
+0.95 mid22 s0-f0-o64-r0 08de603b068b89af
+0.95 mid22 s0-f0-o64-r1 aa73c735b7e47c8e
+0.95 mid22 s0-f0-o64-r2 7c30cb855ae1d962
+0.95 mid22 s0-f0-o400-r0 da5c827cc20aab22
+0.95 mid22 s0-f0-o400-r1 e257b26ed8fc3f63
+0.95 mid22 s0-f0-o400-r2 ef251acb03bd0e11
+0.95 mid22 s0-f1-o0-r0 c988461396182073
+0.95 mid22 s0-f1-o0-r1 6416c32c7703c8dc
+0.95 mid22 s0-f1-o0-r2 778afc4bb9abbb4e
+0.95 mid22 s0-f1-o64-r0 efc87016ba414b94
+0.95 mid22 s0-f1-o64-r1 4b596509d8fda478
+0.95 mid22 s0-f1-o64-r2 671e9795c0a1f516
+0.95 mid22 s0-f1-o400-r0 7dd31e1d44b16bac
+0.95 mid22 s0-f1-o400-r1 df0129cb3f8f9136
+0.95 mid22 s0-f1-o400-r2 a39031a4b35453eb
+0.95 mid22 s0-f2-o0-r0 0e12d75873ce35e0
+0.95 mid22 s0-f2-o0-r1 146d4838e986f013
+0.95 mid22 s0-f2-o0-r2 ecae0cfa6e275699
+0.95 mid22 s0-f2-o64-r0 32a2088dff3756c1
+0.95 mid22 s0-f2-o64-r1 15a6f08344a2cdfa
+0.95 mid22 s0-f2-o64-r2 76c4dfae7c41d34c
+0.95 mid22 s0-f2-o400-r0 a0a380308113c7d7
+0.95 mid22 s0-f2-o400-r1 7f82a5819eae67c3
+0.95 mid22 s0-f2-o400-r2 4bc7a31c531445ca
+0.95 mid22 s1-f0-o0-r0 7af3620a4f8196e9
+0.95 mid22 s1-f0-o0-r1 efeff5a3a9bbd299
+0.95 mid22 s1-f0-o0-r2 ce3a91846edf20a5
+0.95 mid22 s1-f0-o64-r0 2843b331db13274f
+0.95 mid22 s1-f0-o64-r1 061911d71b60e481
+0.95 mid22 s1-f0-o64-r2 2c6cdfda9910ce4a
+0.95 mid22 s1-f0-o400-r0 8a9de84f48988795
+0.95 mid22 s1-f0-o400-r1 89b02dd631fda1fb
+0.95 mid22 s1-f0-o400-r2 f3891fdcc003c5a0
+0.95 mid22 s1-f1-o0-r0 2102b2c861d1ecc8
+0.95 mid22 s1-f1-o0-r1 08f8f4bec8b9d344
+0.95 mid22 s1-f1-o0-r2 dbfa4ae8d5fc58df
+0.95 mid22 s1-f1-o64-r0 be771ba41659040d
+0.95 mid22 s1-f1-o64-r1 76de9e6fe9d85b29
+0.95 mid22 s1-f1-o64-r2 d53f79c76e99d6d7
+0.95 mid22 s1-f1-o400-r0 b87ddda53868e427
+0.95 mid22 s1-f1-o400-r1 62e0938c1b71f180
+0.95 mid22 s1-f1-o400-r2 8bdfe3d20c310e35
+0.95 mid22 s1-f2-o0-r0 621b64390a6c9f6c
+0.95 mid22 s1-f2-o0-r1 3a15e80e1ea2839b
+0.95 mid22 s1-f2-o0-r2 c8fb14c6359c860b
+0.95 mid22 s1-f2-o64-r0 92803cd01c72e672
+0.95 mid22 s1-f2-o64-r1 0b18c01ae9efdd04
+0.95 mid22 s1-f2-o64-r2 e2545a152b8ac7ba
+0.95 mid22 s1-f2-o400-r0 22f06fd5d9423342
+0.95 mid22 s1-f2-o400-r1 6015ec9e42e60372
+0.95 mid22 s1-f2-o400-r2 8f19d16ca96273c3
+0.95 split25 s0-f0-o0-r0 73fad0f0a69aaf2a
+0.95 split25 s0-f0-o0-r1 48edf2bd702a4dc7
+0.95 split25 s0-f0-o0-r2 1f3bf9414d369616
+0.95 split25 s0-f0-o64-r0 e052a72685687568
+0.95 split25 s0-f0-o64-r1 fa3016532368a94c
+0.95 split25 s0-f0-o64-r2 d6517006f25c8b9a
+0.95 split25 s0-f0-o400-r0 4738a02fc45424c7
+0.95 split25 s0-f0-o400-r1 10a348977f7206a6
+0.95 split25 s0-f0-o400-r2 92def30e4c7becef
+0.95 split25 s0-f1-o0-r0 6d21771870568f73
+0.95 split25 s0-f1-o0-r1 dae5b0c447e30a6b
+0.95 split25 s0-f1-o0-r2 ed12df4ff19bc964
+0.95 split25 s0-f1-o64-r0 35ba6dcfa9301519
+0.95 split25 s0-f1-o64-r1 b38fa039c721c7a4
+0.95 split25 s0-f1-o64-r2 5a9637e8f33e54fb
+0.95 split25 s0-f1-o400-r0 b9378f97e9287b7e
+0.95 split25 s0-f1-o400-r1 237859b271a1a842
+0.95 split25 s0-f1-o400-r2 857cba95fee5f4eb
+0.95 split25 s0-f2-o0-r0 a9de0c112ee3dff4
+0.95 split25 s0-f2-o0-r1 f7dd091c691463e9
+0.95 split25 s0-f2-o0-r2 091accd16f6a1356
+0.95 split25 s0-f2-o64-r0 2e14ea60361d9334
+0.95 split25 s0-f2-o64-r1 759268a57a3c64b4
+0.95 split25 s0-f2-o64-r2 991764ea82cd4c8f
+0.95 split25 s0-f2-o400-r0 ed08cb75299a573d
+0.95 split25 s0-f2-o400-r1 498a79f788234bc8
+0.95 split25 s0-f2-o400-r2 42e05771282c898b
+0.95 split25 s1-f0-o0-r0 2a119a17dee1a4a0
+0.95 split25 s1-f0-o0-r1 3bd0ef8930d2182e
+0.95 split25 s1-f0-o0-r2 6012de1d50366563
+0.95 split25 s1-f0-o64-r0 ec8de9666733ad2c
+0.95 split25 s1-f0-o64-r1 8ea5b1668bedc4df
+0.95 split25 s1-f0-o64-r2 64fa37e51dcf9a13
+0.95 split25 s1-f0-o400-r0 39eea41f349fb6f8
+0.95 split25 s1-f0-o400-r1 f01ddc088d1a8abf
+0.95 split25 s1-f0-o400-r2 670bed782904c24b
+0.95 split25 s1-f1-o0-r0 134b628056b768a6
+0.95 split25 s1-f1-o0-r1 fbd4e8ec336cb1a6
+0.95 split25 s1-f1-o0-r2 8ff7f563e26ffa56
+0.95 split25 s1-f1-o64-r0 9a112e071ccf6adb
+0.95 split25 s1-f1-o64-r1 5e0b93b310e62ac8
+0.95 split25 s1-f1-o64-r2 14e84244a4987ba7
+0.95 split25 s1-f1-o400-r0 b64d74fc94b908aa
+0.95 split25 s1-f1-o400-r1 681d3aa58e5b364c
+0.95 split25 s1-f1-o400-r2 d5ddec0f4d39142f
+0.95 split25 s1-f2-o0-r0 62ac8579839a5360
+0.95 split25 s1-f2-o0-r1 0e2946a0ce7561d4
+0.95 split25 s1-f2-o0-r2 fab8239ff751366b
+0.95 split25 s1-f2-o64-r0 61e5f8b431cc5cea
+0.95 split25 s1-f2-o64-r1 82a39f231f0527a1
+0.95 split25 s1-f2-o64-r2 29b984115f1b14ea
+0.95 split25 s1-f2-o400-r0 53d60572666b945e
+0.95 split25 s1-f2-o400-r1 74b7bec90f4f9ecc
+0.95 split25 s1-f2-o400-r2 ec5597916de2731f
+0.95 faith s0-f0-o0-r0 8ea5894c83b744d4
+0.95 faith s0-f0-o0-r1 8ea5894c83b744d4
+0.95 faith s0-f0-o0-r2 8ea5894c83b744d4
+0.95 faith s0-f0-o64-r0 5bc3d873887cd861
+0.95 faith s0-f0-o64-r1 5bc3d873887cd861
+0.95 faith s0-f0-o64-r2 5bc3d873887cd861
+0.95 faith s0-f0-o400-r0 12ee88264f86efc5
+0.95 faith s0-f0-o400-r1 12ee88264f86efc5
+0.95 faith s0-f0-o400-r2 12ee88264f86efc5
+0.95 faith s0-f1-o0-r0 85fb4a07410cf5e6
+0.95 faith s0-f1-o0-r1 85fb4a07410cf5e6
+0.95 faith s0-f1-o0-r2 85fb4a07410cf5e6
+0.95 faith s0-f1-o64-r0 43afac3376355a88
+0.95 faith s0-f1-o64-r1 43afac3376355a88
+0.95 faith s0-f1-o64-r2 43afac3376355a88
+0.95 faith s0-f1-o400-r0 f6db0fa69b0a04e5
+0.95 faith s0-f1-o400-r1 f6db0fa69b0a04e5
+0.95 faith s0-f1-o400-r2 f6db0fa69b0a04e5
+0.95 faith s0-f2-o0-r0 74119b6977dd2043
+0.95 faith s0-f2-o0-r1 74119b6977dd2043
+0.95 faith s0-f2-o0-r2 b1ad2fd0f8c7bf86
+0.95 faith s0-f2-o64-r0 12276f1234af51f4
+0.95 faith s0-f2-o64-r1 12276f1234af51f4
+0.95 faith s0-f2-o64-r2 a68ae19bdd349c5b
+0.95 faith s0-f2-o400-r0 9dfc5b82f35b76a5
+0.95 faith s0-f2-o400-r1 9dfc5b82f35b76a5
+0.95 faith s0-f2-o400-r2 9ce17e3b90928c25
+0.95 faith s1-f0-o0-r0 ba8da767652b94c1
+0.95 faith s1-f0-o0-r1 ba8da767652b94c1
+0.95 faith s1-f0-o0-r2 477e77c3f5135058
+0.95 faith s1-f0-o64-r0 d7a9c69bf2254636
+0.95 faith s1-f0-o64-r1 d7a9c69bf2254636
+0.95 faith s1-f0-o64-r2 01a3913d87345224
+0.95 faith s1-f0-o400-r0 25a57f19d085fa66
+0.95 faith s1-f0-o400-r1 25a57f19d085fa66
+0.95 faith s1-f0-o400-r2 e73e3872238b5097
+0.95 faith s1-f1-o0-r0 d8afd1f9f98a7445
+0.95 faith s1-f1-o0-r1 d8afd1f9f98a7445
+0.95 faith s1-f1-o0-r2 40c4e8ba8225f028
+0.95 faith s1-f1-o64-r0 d77c0dea9d4074e4
+0.95 faith s1-f1-o64-r1 d77c0dea9d4074e4
+0.95 faith s1-f1-o64-r2 c6c1492224a83990
+0.95 faith s1-f1-o400-r0 1b0f6ec468ae894d
+0.95 faith s1-f1-o400-r1 3d1e4263ddcf5111
+0.95 faith s1-f1-o400-r2 c19381ac49c6f28a
+0.95 faith s1-f2-o0-r0 45e8706bb5a0ab4d
+0.95 faith s1-f2-o0-r1 45e8706bb5a0ab4d
+0.95 faith s1-f2-o0-r2 b181a7d8f9999996
+0.95 faith s1-f2-o64-r0 404766c13e6fb37d
+0.95 faith s1-f2-o64-r1 404766c13e6fb37d
+0.95 faith s1-f2-o64-r2 874ae0bb06fe1cb0
+0.95 faith s1-f2-o400-r0 679094f87f9b2937
+0.95 faith s1-f2-o400-r1 679094f87f9b2937
+0.95 faith s1-f2-o400-r2 8851b0bf94e2d8af
+0.95 faith-fa s0-f0-o0-r0 5deb53b99a19fbf3
+0.95 faith-fa s0-f0-o0-r1 94afa26e1010a5dd
+0.95 faith-fa s0-f0-o0-r2 12f346478de49252
+0.95 faith-fa s0-f0-o64-r0 25ab63a36f7b0da9
+0.95 faith-fa s0-f0-o64-r1 53db3e3251d5b036
+0.95 faith-fa s0-f0-o64-r2 fb49e3a39da614b5
+0.95 faith-fa s0-f0-o400-r0 34ab5ab6eae6e431
+0.95 faith-fa s0-f0-o400-r1 d1020ae6d6c1a681
+0.95 faith-fa s0-f0-o400-r2 917941d9f56e5b8c
+0.95 faith-fa s0-f1-o0-r0 2aae3590214a7d0a
+0.95 faith-fa s0-f1-o0-r1 ec5dd3942db0e555
+0.95 faith-fa s0-f1-o0-r2 614a6f849519e9c8
+0.95 faith-fa s0-f1-o64-r0 af18c140573bc7ad
+0.95 faith-fa s0-f1-o64-r1 092cbadaa20df55b
+0.95 faith-fa s0-f1-o64-r2 03270e13eba4ff93
+0.95 faith-fa s0-f1-o400-r0 c32bb046e2ea4b95
+0.95 faith-fa s0-f1-o400-r1 d5e8b07243f1d2ad
+0.95 faith-fa s0-f1-o400-r2 760dfc6c87bebde8
+0.95 faith-fa s0-f2-o0-r0 2396b269b74c5cec
+0.95 faith-fa s0-f2-o0-r1 7c297af1b51f30e4
+0.95 faith-fa s0-f2-o0-r2 684861fc2d2ac310
+0.95 faith-fa s0-f2-o64-r0 2fa387f31ba54fd7
+0.95 faith-fa s0-f2-o64-r1 a6390cf8fe13cecb
+0.95 faith-fa s0-f2-o64-r2 61684fda75105af1
+0.95 faith-fa s0-f2-o400-r0 d0e0f1f110204730
+0.95 faith-fa s0-f2-o400-r1 328e02e1f188e6a5
+0.95 faith-fa s0-f2-o400-r2 8d4e879b50187690
+0.95 faith-fa s1-f0-o0-r0 f1ba4f9c8597e5f2
+0.95 faith-fa s1-f0-o0-r1 6df1810720f3dc82
+0.95 faith-fa s1-f0-o0-r2 f25b692122a3de40
+0.95 faith-fa s1-f0-o64-r0 4f67c9cb5a4091a6
+0.95 faith-fa s1-f0-o64-r1 3f679726665af9f8
+0.95 faith-fa s1-f0-o64-r2 d3f61b78a8a2efc3
+0.95 faith-fa s1-f0-o400-r0 d141964f369219a2
+0.95 faith-fa s1-f0-o400-r1 d4ce340ca823fdc3
+0.95 faith-fa s1-f0-o400-r2 e3a65735b05ce7c3
+0.95 faith-fa s1-f1-o0-r0 c2673dc2c36d7d36
+0.95 faith-fa s1-f1-o0-r1 593623341318d612
+0.95 faith-fa s1-f1-o0-r2 f71fa0f0b49c96f3
+0.95 faith-fa s1-f1-o64-r0 d5a43eaf1e2a9aa2
+0.95 faith-fa s1-f1-o64-r1 f8ca27202dc9fdb1
+0.95 faith-fa s1-f1-o64-r2 8398c4d82defc6d3
+0.95 faith-fa s1-f1-o400-r0 000568eb37fbe363
+0.95 faith-fa s1-f1-o400-r1 5b5147ecadf82c11
+0.95 faith-fa s1-f1-o400-r2 9cd35ba13e9f1f7b
+0.95 faith-fa s1-f2-o0-r0 44fe126f362b6c34
+0.95 faith-fa s1-f2-o0-r1 6c76847a085bedfe
+0.95 faith-fa s1-f2-o0-r2 4be0dd1e784f13e6
+0.95 faith-fa s1-f2-o64-r0 b52e136796d6702d
+0.95 faith-fa s1-f2-o64-r1 0aabc47a3a902807
+0.95 faith-fa s1-f2-o64-r2 1257de52e3fc0caa
+0.95 faith-fa s1-f2-o400-r0 19faa9b00525b812
+0.95 faith-fa s1-f2-o400-r1 7edbee75b20aa6dc
+0.95 faith-fa s1-f2-o400-r2 a25577a03aaf1562
+0.95 faith-r s0-f0-o0-r0 b7b1f5b75d45d2b7
+0.95 faith-r s0-f0-o0-r1 b7b1f5b75d45d2b7
+0.95 faith-r s0-f0-o0-r2 a2a9046d7d32737a
+0.95 faith-r s0-f0-o64-r0 593dd675a488f133
+0.95 faith-r s0-f0-o64-r1 593dd675a488f133
+0.95 faith-r s0-f0-o64-r2 8b76e68bf0124a4d
+0.95 faith-r s0-f0-o400-r0 cf7c60d4ed76ca24
+0.95 faith-r s0-f0-o400-r1 cf7c60d4ed76ca24
+0.95 faith-r s0-f0-o400-r2 4e02d4766af77970
+0.95 faith-r s0-f1-o0-r0 df71bab87ed4f856
+0.95 faith-r s0-f1-o0-r1 df71bab87ed4f856
+0.95 faith-r s0-f1-o0-r2 df71bab87ed4f856
+0.95 faith-r s0-f1-o64-r0 f86c824ba881cd24
+0.95 faith-r s0-f1-o64-r1 f86c824ba881cd24
+0.95 faith-r s0-f1-o64-r2 f86c824ba881cd24
+0.95 faith-r s0-f1-o400-r0 774422a16eb4218d
+0.95 faith-r s0-f1-o400-r1 774422a16eb4218d
+0.95 faith-r s0-f1-o400-r2 774422a16eb4218d
+0.95 faith-r s0-f2-o0-r0 a9365fa19b68e358
+0.95 faith-r s0-f2-o0-r1 a9365fa19b68e358
+0.95 faith-r s0-f2-o0-r2 8d9d4e977e2752af
+0.95 faith-r s0-f2-o64-r0 0e4f3e22afd264e5
+0.95 faith-r s0-f2-o64-r1 0e4f3e22afd264e5
+0.95 faith-r s0-f2-o64-r2 d3f961f6e1625fd2
+0.95 faith-r s0-f2-o400-r0 d2990cec255b90d0
+0.95 faith-r s0-f2-o400-r1 d2990cec255b90d0
+0.95 faith-r s0-f2-o400-r2 6f4e61ef16f0c053
+0.95 faith-r s1-f0-o0-r0 32d5c9575e76026e
+0.95 faith-r s1-f0-o0-r1 4af4d2c16a9ef2fb
+0.95 faith-r s1-f0-o0-r2 545f843dbd915510
+0.95 faith-r s1-f0-o64-r0 7947cb45be8a5a5e
+0.95 faith-r s1-f0-o64-r1 50fcbc981ccb5f3f
+0.95 faith-r s1-f0-o64-r2 4672a470824aeb5b
+0.95 faith-r s1-f0-o400-r0 cb261a916f80e061
+0.95 faith-r s1-f0-o400-r1 529de6cf0a91ee6d
+0.95 faith-r s1-f0-o400-r2 b9df72dd6413302e
+0.95 faith-r s1-f1-o0-r0 03edd7642bed507f
+0.95 faith-r s1-f1-o0-r1 03edd7642bed507f
+0.95 faith-r s1-f1-o0-r2 7f6093904a79437a
+0.95 faith-r s1-f1-o64-r0 c308509b019a9306
+0.95 faith-r s1-f1-o64-r1 606ad997b0df47b8
+0.95 faith-r s1-f1-o64-r2 627346c3dff0838c
+0.95 faith-r s1-f1-o400-r0 b2679cb437239e5b
+0.95 faith-r s1-f1-o400-r1 9101b8e6231a3f57
+0.95 faith-r s1-f1-o400-r2 4622c410ccbbc47d
+0.95 faith-r s1-f2-o0-r0 5b6da55a52331af6
+0.95 faith-r s1-f2-o0-r1 5b6da55a52331af6
+0.95 faith-r s1-f2-o0-r2 2971124b02d85012
+0.95 faith-r s1-f2-o64-r0 4de2a3a1aeb83ecf
+0.95 faith-r s1-f2-o64-r1 4de2a3a1aeb83ecf
+0.95 faith-r s1-f2-o64-r2 22ea34f7c5f5d527
+0.95 faith-r s1-f2-o400-r0 018d3b1b26f8ea13
+0.95 faith-r s1-f2-o400-r1 018d3b1b26f8ea13
+0.95 faith-r s1-f2-o400-r2 d5f8becbc3b25e57
+0.95 faith-fa-r s0-f0-o0-r0 bc5a5078ab8ee8e8
+0.95 faith-fa-r s0-f0-o0-r1 0be54b4ecd0a65e3
+0.95 faith-fa-r s0-f0-o0-r2 96aa85919bca37d8
+0.95 faith-fa-r s0-f0-o64-r0 e219076cfc635a20
+0.95 faith-fa-r s0-f0-o64-r1 e0605afae8c89f8b
+0.95 faith-fa-r s0-f0-o64-r2 7c6110709f3b0242
+0.95 faith-fa-r s0-f0-o400-r0 a8399f1d2888d1d6
+0.95 faith-fa-r s0-f0-o400-r1 7e9b4d2b0315c06c
+0.95 faith-fa-r s0-f0-o400-r2 acda93aed3e080f4
+0.95 faith-fa-r s0-f1-o0-r0 743899c8aea2ebe3
+0.95 faith-fa-r s0-f1-o0-r1 116f172b578e0b59
+0.95 faith-fa-r s0-f1-o0-r2 b1c7e8d4c9c18e7a
+0.95 faith-fa-r s0-f1-o64-r0 f36378a23cfd836c
+0.95 faith-fa-r s0-f1-o64-r1 1d67af4e9a85e65a
+0.95 faith-fa-r s0-f1-o64-r2 f0cb343198494071
+0.95 faith-fa-r s0-f1-o400-r0 ea34a62c15cede59
+0.95 faith-fa-r s0-f1-o400-r1 16e5713019d9f828
+0.95 faith-fa-r s0-f1-o400-r2 6a07e2152b56e637
+0.95 faith-fa-r s0-f2-o0-r0 64c6ff0adca2a31a
+0.95 faith-fa-r s0-f2-o0-r1 61b72380e4c432dc
+0.95 faith-fa-r s0-f2-o0-r2 dc62a0134db46852
+0.95 faith-fa-r s0-f2-o64-r0 1adac02ab5f5c2e3
+0.95 faith-fa-r s0-f2-o64-r1 72fb50ad2e818625
+0.95 faith-fa-r s0-f2-o64-r2 10195e32c235ae1b
+0.95 faith-fa-r s0-f2-o400-r0 6c06ede9d2701810
+0.95 faith-fa-r s0-f2-o400-r1 bc839da2944cd002
+0.95 faith-fa-r s0-f2-o400-r2 56ccdf33fb8f4f84
+0.95 faith-fa-r s1-f0-o0-r0 2379c1b5acaf2f42
+0.95 faith-fa-r s1-f0-o0-r1 7d2197fea34fbf45
+0.95 faith-fa-r s1-f0-o0-r2 1f2578dbb1a55697
+0.95 faith-fa-r s1-f0-o64-r0 c01333653c65c5d4
+0.95 faith-fa-r s1-f0-o64-r1 22569278f1267adf
+0.95 faith-fa-r s1-f0-o64-r2 a177f8663b79957d
+0.95 faith-fa-r s1-f0-o400-r0 c50eaaee26f9f1b8
+0.95 faith-fa-r s1-f0-o400-r1 97d6d12ba6d0a3bc
+0.95 faith-fa-r s1-f0-o400-r2 2d97a6a132176697
+0.95 faith-fa-r s1-f1-o0-r0 a40e60d892365ca6
+0.95 faith-fa-r s1-f1-o0-r1 b5bef867baf9d00b
+0.95 faith-fa-r s1-f1-o0-r2 4cb2e6bd22435aef
+0.95 faith-fa-r s1-f1-o64-r0 cf948d47fd976464
+0.95 faith-fa-r s1-f1-o64-r1 a2bc9da872303a47
+0.95 faith-fa-r s1-f1-o64-r2 9c31556c92f1469a
+0.95 faith-fa-r s1-f1-o400-r0 00d2039629837281
+0.95 faith-fa-r s1-f1-o400-r1 6f1e133ce8ea2187
+0.95 faith-fa-r s1-f1-o400-r2 d7e16cae43cf24fc
+0.95 faith-fa-r s1-f2-o0-r0 64a1176a8be88036
+0.95 faith-fa-r s1-f2-o0-r1 5e4796d6c7f068fb
+0.95 faith-fa-r s1-f2-o0-r2 d227f33e1e1ea1b2
+0.95 faith-fa-r s1-f2-o64-r0 6cd3f3b584ec8449
+0.95 faith-fa-r s1-f2-o64-r1 dacc557ab47d58f5
+0.95 faith-fa-r s1-f2-o64-r2 a9b1ce8e56fc6db7
+0.95 faith-fa-r s1-f2-o400-r0 91228f517088b53a
+0.95 faith-fa-r s1-f2-o400-r1 2720c7fcd2bbf6d2
+0.95 faith-fa-r s1-f2-o400-r2 513aa7d1f811bc57
+seen clock SetNewFast
+seen clock SetNewSlow
+seen clock SetNewStructuralFlagged
+seen clock SetNewStructuralOwnCheck
+seen clock SetOverFastFast
+seen clock SetOverFastSlow
+seen clock SetOverSlowSlow
+seen clock SetOverStructural
+seen clock SetDemoted
+seen clock SetOverDemoted
+seen clock HitFastFast
+seen clock HitSlowSlow
+seen clock RemoveFast
+seen clock RemoveSlow
+seen clock RemoveAbsent
+seen clock EvictFast
+seen clock EvictSlow
+seen clock EvictNone
+seen clock EvictPromotedAnother
+seen clock EvictPromotedAFastKey
+seen clock EvictDemotedAnother
+seen clock EvictedKeyReadmitted
+seen clock ResizeFastDemoted
+seen clock ResizeFastGrown
+seen clock ResettleDemoted
+seen clock MeasuredDemoted
+seen clock ResizeMax
+seen clock Cleared
+seen clock TwoOrMoreMigrations
+seen clock BothDirections
+seen faith SetNewFast
+seen faith SetNewSlow
+seen faith SetNewStructuralFlagged
+seen faith SetNewStructuralOwnCheck
+seen faith SetNewPromoted
+seen faith SetOverFastFast
+seen faith SetOverFastSlow
+seen faith SetOverSlowSlow
+seen faith SetOverStructural
+seen faith SetDemoted
+seen faith SetOverDemoted
+seen faith HitFastFast
+seen faith HitSlowSlow
+seen faith RemoveFast
+seen faith RemoveSlow
+seen faith RemoveAbsent
+seen faith EvictFast
+seen faith EvictSlow
+seen faith EvictNone
+seen faith EvictPromotedAnother
+seen faith EvictPromotedAFastKey
+seen faith EvictDemotedAnother
+seen faith EvictedKeyReadmitted
+seen faith ResizeFastDemoted
+seen faith ResizeFastGrown
+seen faith ResettleDemoted
+seen faith MeasuredDemoted
+seen faith ResizeMax
+seen faith Cleared
+seen faith TwoOrMoreMigrations
+seen faith BothDirections
+seen faith-fa SetNewFast
+seen faith-fa SetNewSlow
+seen faith-fa SetNewStructuralFlagged
+seen faith-fa SetNewStructuralOwnCheck
+seen faith-fa SetNewPromoted
+seen faith-fa SetOverFastFast
+seen faith-fa SetOverFastSlow
+seen faith-fa SetOverSlowSlow
+seen faith-fa SetOverStructural
+seen faith-fa SetDemoted
+seen faith-fa SetOverDemoted
+seen faith-fa HitFastFast
+seen faith-fa HitSlowSlow
+seen faith-fa RemoveFast
+seen faith-fa RemoveSlow
+seen faith-fa RemoveAbsent
+seen faith-fa EvictFast
+seen faith-fa EvictSlow
+seen faith-fa EvictNone
+seen faith-fa EvictPromotedAnother
+seen faith-fa EvictPromotedAFastKey
+seen faith-fa EvictDemotedAnother
+seen faith-fa EvictedKeyReadmitted
+seen faith-fa ResizeFastDemoted
+seen faith-fa ResizeFastGrown
+seen faith-fa ResettleDemoted
+seen faith-fa MeasuredDemoted
+seen faith-fa ResizeMax
+seen faith-fa Cleared
+seen faith-fa TwoOrMoreMigrations
+seen faith-fa BothDirections
+seen faith-fa-r SetNewFast
+seen faith-fa-r SetNewSlow
+seen faith-fa-r SetNewStructuralFlagged
+seen faith-fa-r SetNewStructuralOwnCheck
+seen faith-fa-r SetOverFastFast
+seen faith-fa-r SetOverFastSlow
+seen faith-fa-r SetOverSlowSlow
+seen faith-fa-r SetOverStructural
+seen faith-fa-r SetDemoted
+seen faith-fa-r SetOverDemoted
+seen faith-fa-r HitFastFast
+seen faith-fa-r HitSlowSlow
+seen faith-fa-r RemoveFast
+seen faith-fa-r RemoveSlow
+seen faith-fa-r RemoveAbsent
+seen faith-fa-r EvictFast
+seen faith-fa-r EvictSlow
+seen faith-fa-r EvictNone
+seen faith-fa-r EvictPromotedAnother
+seen faith-fa-r EvictPromotedAFastKey
+seen faith-fa-r EvictDemotedAnother
+seen faith-fa-r EvictedKeyReadmitted
+seen faith-fa-r ResizeFastDemoted
+seen faith-fa-r ResizeFastGrown
+seen faith-fa-r ResettleDemoted
+seen faith-fa-r MeasuredDemoted
+seen faith-fa-r ResizeMax
+seen faith-fa-r Cleared
+seen faith-fa-r TwoOrMoreMigrations
+seen faith-fa-r BothDirections
+seen faith-r SetNewSlow
+seen faith-r SetNewStructuralFlagged
+seen faith-r SetNewStructuralOwnCheck
+seen faith-r SetOverFastFast
+seen faith-r SetOverFastSlow
+seen faith-r SetOverSlowSlow
+seen faith-r SetOverStructural
+seen faith-r SetOverDemoted
+seen faith-r HitFastFast
+seen faith-r HitSlowSlow
+seen faith-r RemoveFast
+seen faith-r RemoveSlow
+seen faith-r RemoveAbsent
+seen faith-r EvictFast
+seen faith-r EvictSlow
+seen faith-r EvictNone
+seen faith-r EvictPromotedAnother
+seen faith-r EvictPromotedAFastKey
+seen faith-r EvictDemotedAnother
+seen faith-r EvictedKeyReadmitted
+seen faith-r ResizeFastDemoted
+seen faith-r ResizeFastGrown
+seen faith-r ResettleDemoted
+seen faith-r MeasuredDemoted
+seen faith-r ResizeMax
+seen faith-r Cleared
+seen faith-r TwoOrMoreMigrations
+seen faith-r BothDirections
+seen fifo SetNewFast
+seen fifo SetNewSlow
+seen fifo SetNewStructuralFlagged
+seen fifo SetNewStructuralOwnCheck
+seen fifo SetOverFastFast
+seen fifo SetOverFastSlow
+seen fifo SetOverSlowSlow
+seen fifo SetOverStructural
+seen fifo SetDemoted
+seen fifo SetOverDemoted
+seen fifo HitFastFast
+seen fifo HitSlowSlow
+seen fifo RemoveFast
+seen fifo RemoveSlow
+seen fifo RemoveAbsent
+seen fifo EvictFast
+seen fifo EvictSlow
+seen fifo EvictNone
+seen fifo EvictedKeyReadmitted
+seen fifo ResizeFastDemoted
+seen fifo ResizeFastGrown
+seen fifo ResettleDemoted
+seen fifo MeasuredDemoted
+seen fifo ResizeMax
+seen fifo Cleared
+seen fifo TwoOrMoreMigrations
+seen gld SetNewFast
+seen gld SetNewSlow
+seen gld SetNewStructuralFlagged
+seen gld SetNewStructuralOwnCheck
+seen gld SetNewPromoted
+seen gld SetOverFastFast
+seen gld SetOverFastSlow
+seen gld SetOverSlowFast
+seen gld SetOverSlowSlow
+seen gld SetOverStructural
+seen gld SetOverPromoted
+seen gld SetDemoted
+seen gld SetOverDemoted
+seen gld HitFastFast
+seen gld HitSlowFast
+seen gld HitSlowSlow
+seen gld HitPromoted
+seen gld HitDemoted
+seen gld RemoveFast
+seen gld RemoveSlow
+seen gld RemoveAbsent
+seen gld EvictFast
+seen gld EvictSlow
+seen gld EvictNone
+seen gld EvictPromotedAnother
+seen gld EvictPromotedAFastKey
+seen gld EvictDemotedAnother
+seen gld EvictedKeyReadmitted
+seen gld NeedsEviction
+seen gld ResizeFastDemoted
+seen gld ResizeFastGrown
+seen gld ResettleDemoted
+seen gld MeasuredDemoted
+seen gld ResizeMax
+seen gld Cleared
+seen gld TwoOrMoreMigrations
+seen gld BothDirections
+seen gldfa SetNewFast
+seen gldfa SetNewSlow
+seen gldfa SetNewStructuralFlagged
+seen gldfa SetNewStructuralOwnCheck
+seen gldfa SetOverFastFast
+seen gldfa SetOverFastSlow
+seen gldfa SetOverSlowSlow
+seen gldfa SetOverStructural
+seen gldfa SetDemoted
+seen gldfa SetOverDemoted
+seen gldfa HitFastFast
+seen gldfa HitFastSlow
+seen gldfa HitSlowSlow
+seen gldfa HitDemoted
+seen gldfa RemoveFast
+seen gldfa RemoveSlow
+seen gldfa RemoveAbsent
+seen gldfa EvictFast
+seen gldfa EvictSlow
+seen gldfa EvictNone
+seen gldfa EvictPromotedAnother
+seen gldfa EvictPromotedAFastKey
+seen gldfa EvictDemotedAnother
+seen gldfa EvictedKeyReadmitted
+seen gldfa NeedsEviction
+seen gldfa ResizeFastDemoted
+seen gldfa ResizeFastGrown
+seen gldfa ResettleDemoted
+seen gldfa MeasuredDemoted
+seen gldfa ResizeMax
+seen gldfa Cleared
+seen gldfa TwoOrMoreMigrations
+seen gldfa BothDirections
+seen ldfar SetNewFast
+seen ldfar SetNewSlow
+seen ldfar SetNewStructuralFlagged
+seen ldfar SetNewStructuralOwnCheck
+seen ldfar SetOverFastFast
+seen ldfar SetOverFastSlow
+seen ldfar SetOverSlowSlow
+seen ldfar SetOverStructural
+seen ldfar SetDemoted
+seen ldfar SetOverDemoted
+seen ldfar HitFastFast
+seen ldfar HitFastSlow
+seen ldfar HitSlowSlow
+seen ldfar HitDemoted
+seen ldfar RemoveFast
+seen ldfar RemoveSlow
+seen ldfar RemoveAbsent
+seen ldfar EvictFast
+seen ldfar EvictSlow
+seen ldfar EvictNone
+seen ldfar EvictPromotedAnother
+seen ldfar EvictPromotedAFastKey
+seen ldfar EvictDemotedAnother
+seen ldfar EvictedKeyReadmitted
+seen ldfar ResizeFastDemoted
+seen ldfar ResizeFastGrown
+seen ldfar ResettleDemoted
+seen ldfar MeasuredDemoted
+seen ldfar ResizeMax
+seen ldfar Cleared
+seen ldfar TwoOrMoreMigrations
+seen ldfar BothDirections
+seen ldr SetNewSlow
+seen ldr SetNewStructuralFlagged
+seen ldr SetNewStructuralOwnCheck
+seen ldr SetOverFastFast
+seen ldr SetOverFastSlow
+seen ldr SetOverSlowFast
+seen ldr SetOverSlowSlow
+seen ldr SetOverStructural
+seen ldr SetOverPromoted
+seen ldr SetOverDemoted
+seen ldr HitFastFast
+seen ldr HitSlowFast
+seen ldr HitSlowSlow
+seen ldr HitPromoted
+seen ldr HitDemoted
+seen ldr RemoveFast
+seen ldr RemoveSlow
+seen ldr RemoveAbsent
+seen ldr EvictFast
+seen ldr EvictSlow
+seen ldr EvictNone
+seen ldr EvictPromotedAnother
+seen ldr EvictPromotedAFastKey
+seen ldr EvictDemotedAnother
+seen ldr EvictedKeyReadmitted
+seen ldr ResizeFastDemoted
+seen ldr ResizeFastGrown
+seen ldr ResettleDemoted
+seen ldr MeasuredDemoted
+seen ldr ResizeMax
+seen ldr Cleared
+seen ldr TwoOrMoreMigrations
+seen ldr BothDirections
+seen lfu SetNewFast
+seen lfu SetNewSlow
+seen lfu SetNewStructuralFlagged
+seen lfu SetNewStructuralOwnCheck
+seen lfu SetOverFastFast
+seen lfu SetOverFastSlow
+seen lfu SetOverSlowFast
+seen lfu SetOverSlowSlow
+seen lfu SetOverStructural
+seen lfu SetOverPromoted
+seen lfu SetOverDemoted
+seen lfu HitFastFast
+seen lfu HitSlowFast
+seen lfu HitSlowSlow
+seen lfu HitPromoted
+seen lfu HitDemoted
+seen lfu RemoveFast
+seen lfu RemoveSlow
+seen lfu RemoveAbsent
+seen lfu EvictFast
+seen lfu EvictSlow
+seen lfu EvictNone
+seen lfu EvictedKeyReadmitted
+seen lfu ResizeFastDemoted
+seen lfu ResizeFastGrown
+seen lfu ResettleDemoted
+seen lfu MeasuredDemoted
+seen lfu ResizeMax
+seen lfu Cleared
+seen lfu LatchSet
+seen lfu LatchCleared
+seen lfu DemotionsCounted
+seen lfu TwoOrMoreMigrations
+seen lfu BothDirections
+seen lru SetNewFast
+seen lru SetNewSlow
+seen lru SetNewStructuralFlagged
+seen lru SetNewStructuralOwnCheck
+seen lru SetOverFastFast
+seen lru SetOverFastSlow
+seen lru SetOverSlowFast
+seen lru SetOverSlowSlow
+seen lru SetOverStructural
+seen lru SetOverPromoted
+seen lru SetDemoted
+seen lru SetOverDemoted
+seen lru HitFastFast
+seen lru HitSlowFast
+seen lru HitSlowSlow
+seen lru HitPromoted
+seen lru HitDemoted
+seen lru RemoveFast
+seen lru RemoveSlow
+seen lru RemoveAbsent
+seen lru EvictFast
+seen lru EvictSlow
+seen lru EvictNone
+seen lru EvictedKeyReadmitted
+seen lru ResizeFastDemoted
+seen lru ResizeFastGrown
+seen lru ResettleDemoted
+seen lru MeasuredDemoted
+seen lru ResizeMax
+seen lru Cleared
+seen lru TwoOrMoreMigrations
+seen lru BothDirections
+seen lru-lfu SetNewFast
+seen lru-lfu SetNewSlow
+seen lru-lfu SetNewStructuralFlagged
+seen lru-lfu SetNewStructuralOwnCheck
+seen lru-lfu SetOverFastFast
+seen lru-lfu SetOverFastSlow
+seen lru-lfu SetOverSlowFast
+seen lru-lfu SetOverSlowSlow
+seen lru-lfu SetOverStructural
+seen lru-lfu SetOverPromoted
+seen lru-lfu SetDemoted
+seen lru-lfu SetOverDemoted
+seen lru-lfu HitFastFast
+seen lru-lfu HitFastSlow
+seen lru-lfu HitSlowFast
+seen lru-lfu HitSlowSlow
+seen lru-lfu HitPromoted
+seen lru-lfu HitDemoted
+seen lru-lfu RemoveFast
+seen lru-lfu RemoveSlow
+seen lru-lfu RemoveAbsent
+seen lru-lfu EvictFast
+seen lru-lfu EvictSlow
+seen lru-lfu EvictNone
+seen lru-lfu EvictedKeyReadmitted
+seen lru-lfu ResizeFastDemoted
+seen lru-lfu ResizeFastGrown
+seen lru-lfu ResettleDemoted
+seen lru-lfu MeasuredDemoted
+seen lru-lfu ResizeMax
+seen lru-lfu Cleared
+seen lru-lfu TwoOrMoreMigrations
+seen lru-lfu BothDirections
+seen lru-sized SetNewFast
+seen lru-sized SetNewSlow
+seen lru-sized SetNewStructuralFlagged
+seen lru-sized SetNewStructuralOwnCheck
+seen lru-sized SetOverFastFast
+seen lru-sized SetOverFastSlow
+seen lru-sized SetOverSlowFast
+seen lru-sized SetOverSlowSlow
+seen lru-sized SetOverStructural
+seen lru-sized SetOverPromoted
+seen lru-sized SetDemoted
+seen lru-sized SetOverDemoted
+seen lru-sized HitFastFast
+seen lru-sized HitFastSlow
+seen lru-sized HitSlowFast
+seen lru-sized HitSlowSlow
+seen lru-sized HitPromoted
+seen lru-sized HitDemoted
+seen lru-sized RemoveFast
+seen lru-sized RemoveSlow
+seen lru-sized RemoveAbsent
+seen lru-sized EvictFast
+seen lru-sized EvictSlow
+seen lru-sized EvictNone
+seen lru-sized EvictedKeyReadmitted
+seen lru-sized ResizeFastDemoted
+seen lru-sized ResizeFastGrown
+seen lru-sized ResettleDemoted
+seen lru-sized MeasuredDemoted
+seen lru-sized ResizeMax
+seen lru-sized Cleared
+seen lru-sized SmallFast
+seen lru-sized LargeFast
+seen lru-sized SmallSlow
+seen lru-sized LargeSlow
+seen lru-sized TwoOrMoreMigrations
+seen lru-sized BothDirections
+seen mid21 SetNewFast
+seen mid21 SetNewSlow
+seen mid21 SetNewStructuralFlagged
+seen mid21 SetNewStructuralOwnCheck
+seen mid21 SetOverFastFast
+seen mid21 SetOverFastSlow
+seen mid21 SetOverSlowSlow
+seen mid21 SetOverStructural
+seen mid21 SetDemoted
+seen mid21 SetOverDemoted
+seen mid21 HitFastFast
+seen mid21 HitFastSlow
+seen mid21 HitSlowSlow
+seen mid21 HitDemoted
+seen mid21 RemoveFast
+seen mid21 RemoveSlow
+seen mid21 RemoveAbsent
+seen mid21 EvictFast
+seen mid21 EvictSlow
+seen mid21 EvictNone
+seen mid21 EvictPromotedAnother
+seen mid21 EvictPromotedAFastKey
+seen mid21 EvictDemotedAnother
+seen mid21 EvictedKeyReadmitted
+seen mid21 NeedsEviction
+seen mid21 ResizeFastDemoted
+seen mid21 ResizeFastGrown
+seen mid21 ResettleDemoted
+seen mid21 MeasuredDemoted
+seen mid21 ResizeMax
+seen mid21 Cleared
+seen mid21 TwoOrMoreMigrations
+seen mid21 BothDirections
+seen mid22 SetNewFast
+seen mid22 SetNewSlow
+seen mid22 SetNewStructuralFlagged
+seen mid22 SetNewStructuralOwnCheck
+seen mid22 SetOverFastFast
+seen mid22 SetOverFastSlow
+seen mid22 SetOverSlowSlow
+seen mid22 SetOverStructural
+seen mid22 SetDemoted
+seen mid22 SetOverDemoted
+seen mid22 HitFastFast
+seen mid22 HitFastSlow
+seen mid22 HitSlowSlow
+seen mid22 HitDemoted
+seen mid22 RemoveFast
+seen mid22 RemoveSlow
+seen mid22 RemoveAbsent
+seen mid22 EvictFast
+seen mid22 EvictSlow
+seen mid22 EvictNone
+seen mid22 EvictPromotedAnother
+seen mid22 EvictPromotedAFastKey
+seen mid22 EvictDemotedAnother
+seen mid22 EvictedKeyReadmitted
+seen mid22 ResizeFastDemoted
+seen mid22 ResizeFastGrown
+seen mid22 ResettleDemoted
+seen mid22 MeasuredDemoted
+seen mid22 ResizeMax
+seen mid22 Cleared
+seen mid22 TwoOrMoreMigrations
+seen mid22 BothDirections
+seen q2 SetNewSlow
+seen q2 SetNewStructuralFlagged
+seen q2 SetNewStructuralOwnCheck
+seen q2 SetOverFastFast
+seen q2 SetOverFastSlow
+seen q2 SetOverSlowFast
+seen q2 SetOverSlowSlow
+seen q2 SetOverStructural
+seen q2 SetOverPromoted
+seen q2 SetOverDemoted
+seen q2 HitFastFast
+seen q2 HitFastSlow
+seen q2 HitSlowFast
+seen q2 HitSlowSlow
+seen q2 HitPromoted
+seen q2 HitDemoted
+seen q2 RemoveFast
+seen q2 RemoveSlow
+seen q2 RemoveAbsent
+seen q2 EvictFast
+seen q2 EvictSlow
+seen q2 EvictNone
+seen q2 EvictedKeyReadmitted
+seen q2 NeedsEviction
+seen q2 ResizeFastDemoted
+seen q2 ResizeFastGrown
+seen q2 ResettleDemoted
+seen q2 MeasuredDemoted
+seen q2 ResizeMax
+seen q2 Cleared
+seen q2 TwoOrMoreMigrations
+seen q2 BothDirections
+seen q2far SetNewFast
+seen q2far SetNewSlow
+seen q2far SetNewStructuralFlagged
+seen q2far SetNewStructuralOwnCheck
+seen q2far SetOverFastFast
+seen q2far SetOverFastSlow
+seen q2far SetOverSlowFast
+seen q2far SetOverSlowSlow
+seen q2far SetOverStructural
+seen q2far SetOverPromoted
+seen q2far SetDemoted
+seen q2far SetOverDemoted
+seen q2far HitFastFast
+seen q2far HitFastSlow
+seen q2far HitSlowFast
+seen q2far HitSlowSlow
+seen q2far HitPromoted
+seen q2far HitDemoted
+seen q2far RemoveFast
+seen q2far RemoveSlow
+seen q2far RemoveAbsent
+seen q2far EvictFast
+seen q2far EvictSlow
+seen q2far EvictNone
+seen q2far EvictedKeyReadmitted
+seen q2far ResizeFastDemoted
+seen q2far ResizeFastGrown
+seen q2far ResettleDemoted
+seen q2far MeasuredDemoted
+seen q2far ResizeMax
+seen q2far Cleared
+seen q2far TwoOrMoreMigrations
+seen q2far BothDirections
+seen q2full SetNewFast
+seen q2full SetNewSlow
+seen q2full SetNewStructuralFlagged
+seen q2full SetNewStructuralOwnCheck
+seen q2full SetOverFastFast
+seen q2full SetOverFastSlow
+seen q2full SetOverSlowFast
+seen q2full SetOverSlowSlow
+seen q2full SetOverStructural
+seen q2full SetOverPromoted
+seen q2full SetDemoted
+seen q2full SetOverDemoted
+seen q2full HitFastFast
+seen q2full HitFastSlow
+seen q2full HitSlowFast
+seen q2full HitSlowSlow
+seen q2full HitPromoted
+seen q2full HitDemoted
+seen q2full RemoveFast
+seen q2full RemoveSlow
+seen q2full RemoveAbsent
+seen q2full EvictFast
+seen q2full EvictSlow
+seen q2full EvictNone
+seen q2full EvictedKeyReadmitted
+seen q2full NeedsEviction
+seen q2full ResizeFastDemoted
+seen q2full ResizeFastGrown
+seen q2full ResettleDemoted
+seen q2full MeasuredDemoted
+seen q2full ResizeMax
+seen q2full Cleared
+seen q2full TwoOrMoreMigrations
+seen q2full BothDirections
+seen q2gh SetNewFast
+seen q2gh SetNewSlow
+seen q2gh SetNewStructuralFlagged
+seen q2gh SetNewStructuralOwnCheck
+seen q2gh SetNewPromoted
+seen q2gh SetOverFastFast
+seen q2gh SetOverFastSlow
+seen q2gh SetOverSlowFast
+seen q2gh SetOverSlowSlow
+seen q2gh SetOverStructural
+seen q2gh SetOverPromoted
+seen q2gh SetDemoted
+seen q2gh SetOverDemoted
+seen q2gh HitFastFast
+seen q2gh HitFastSlow
+seen q2gh HitSlowFast
+seen q2gh HitSlowSlow
+seen q2gh HitPromoted
+seen q2gh HitDemoted
+seen q2gh RemoveFast
+seen q2gh RemoveSlow
+seen q2gh RemoveAbsent
+seen q2gh EvictFast
+seen q2gh EvictSlow
+seen q2gh EvictNone
+seen q2gh EvictedKeyReadmitted
+seen q2gh NeedsEviction
+seen q2gh ResizeFastDemoted
+seen q2gh ResizeFastGrown
+seen q2gh ResettleDemoted
+seen q2gh MeasuredDemoted
+seen q2gh ResizeMax
+seen q2gh Cleared
+seen q2gh TwoOrMoreMigrations
+seen q2gh BothDirections
+seen s3 SetNewSlow
+seen s3 SetNewStructuralFlagged
+seen s3 SetNewStructuralOwnCheck
+seen s3 SetOverFastFast
+seen s3 SetOverFastSlow
+seen s3 SetOverSlowFast
+seen s3 SetOverSlowSlow
+seen s3 SetOverStructural
+seen s3 SetOverPromoted
+seen s3 SetOverDemoted
+seen s3 HitFastFast
+seen s3 HitSlowFast
+seen s3 HitSlowSlow
+seen s3 HitPromoted
+seen s3 HitDemoted
+seen s3 RemoveFast
+seen s3 RemoveSlow
+seen s3 RemoveAbsent
+seen s3 EvictFast
+seen s3 EvictSlow
+seen s3 EvictNone
+seen s3 EvictPromotedAnother
+seen s3 EvictPromotedAFastKey
+seen s3 EvictDemotedAnother
+seen s3 EvictedKeyReadmitted
+seen s3 NeedsEviction
+seen s3 ResizeFastDemoted
+seen s3 ResizeFastGrown
+seen s3 ResettleDemoted
+seen s3 MeasuredDemoted
+seen s3 ResizeMax
+seen s3 Cleared
+seen s3 TwoOrMoreMigrations
+seen s3 BothDirections
+seen s3gh SetNewFast
+seen s3gh SetNewSlow
+seen s3gh SetNewStructuralFlagged
+seen s3gh SetNewStructuralOwnCheck
+seen s3gh SetNewPromoted
+seen s3gh SetOverFastFast
+seen s3gh SetOverFastSlow
+seen s3gh SetOverSlowFast
+seen s3gh SetOverSlowSlow
+seen s3gh SetOverStructural
+seen s3gh SetOverPromoted
+seen s3gh SetDemoted
+seen s3gh SetOverDemoted
+seen s3gh HitFastFast
+seen s3gh HitSlowFast
+seen s3gh HitSlowSlow
+seen s3gh HitPromoted
+seen s3gh HitDemoted
+seen s3gh RemoveFast
+seen s3gh RemoveSlow
+seen s3gh RemoveAbsent
+seen s3gh EvictFast
+seen s3gh EvictSlow
+seen s3gh EvictNone
+seen s3gh EvictPromotedAnother
+seen s3gh EvictPromotedAFastKey
+seen s3gh EvictDemotedAnother
+seen s3gh EvictedKeyReadmitted
+seen s3gh NeedsEviction
+seen s3gh ResizeFastDemoted
+seen s3gh ResizeFastGrown
+seen s3gh ResettleDemoted
+seen s3gh MeasuredDemoted
+seen s3gh ResizeMax
+seen s3gh Cleared
+seen s3gh TwoOrMoreMigrations
+seen s3gh BothDirections
+seen split25 SetNewFast
+seen split25 SetNewSlow
+seen split25 SetNewStructuralFlagged
+seen split25 SetNewStructuralOwnCheck
+seen split25 SetOverFastFast
+seen split25 SetOverFastSlow
+seen split25 SetOverSlowFast
+seen split25 SetOverSlowSlow
+seen split25 SetOverStructural
+seen split25 SetOverPromoted
+seen split25 SetDemoted
+seen split25 SetOverDemoted
+seen split25 HitFastFast
+seen split25 HitFastSlow
+seen split25 HitSlowFast
+seen split25 HitSlowSlow
+seen split25 HitPromoted
+seen split25 HitDemoted
+seen split25 RemoveFast
+seen split25 RemoveSlow
+seen split25 RemoveAbsent
+seen split25 EvictFast
+seen split25 EvictSlow
+seen split25 EvictNone
+seen split25 EvictPromotedAnother
+seen split25 EvictDemotedAnother
+seen split25 EvictedKeyReadmitted
+seen split25 ResizeFastDemoted
+seen split25 ResizeFastGrown
+seen split25 ResettleDemoted
+seen split25 MeasuredDemoted
+seen split25 ResizeMax
+seen split25 Cleared
+seen split25 TwoOrMoreMigrations
+seen split25 BothDirections
+1.00 lru s0-f0-o0-r0 9596cdc803f80126
+1.00 lru s0-f0-o64-r0 e6c5ee63dfb0388f
+1.00 lru s0-f0-o400-r0 6816a24bff840ead
+1.00 lru s0-f1-o0-r0 e6678079dfc43fbd
+1.00 lru s0-f1-o64-r0 b4a54975e0c78a4e
+1.00 lru s0-f1-o400-r0 23bebc23b50c69a4
+1.00 lru s0-f2-o0-r0 409700e243aab461
+1.00 lru s0-f2-o64-r0 fdead77f9799de73
+1.00 lru s0-f2-o400-r0 b6eee1dbacddb0a9
+1.00 lru s1-f0-o0-r0 1e29c6223d91ac24
+1.00 lru s1-f0-o64-r0 352e9bbd6ee616c6
+1.00 lru s1-f0-o400-r0 fd7bc8a818093b95
+1.00 lru s1-f1-o0-r0 1a756739b6a76f51
+1.00 lru s1-f1-o64-r0 602265f5ea31fd71
+1.00 lru s1-f1-o400-r0 9196d31f3ccfa088
+1.00 lru s1-f2-o0-r0 0d49bab77fb71737
+1.00 lru s1-f2-o64-r0 68882b526f9773e4
+1.00 lru s1-f2-o400-r0 23d8900f1e56cc1f
+1.00 fifo s0-f0-o0-r0 751f2a80b169279f
+1.00 fifo s0-f0-o64-r0 6feb530f23b48714
+1.00 fifo s0-f0-o400-r0 093a820d7a62b7bb
+1.00 fifo s0-f1-o0-r0 96b2609097830fe8
+1.00 fifo s0-f1-o64-r0 e8cdcdc6e29073c5
+1.00 fifo s0-f1-o400-r0 8a4824737ce0dea2
+1.00 fifo s0-f2-o0-r0 141e5282e5286df2
+1.00 fifo s0-f2-o64-r0 3ec99022477a471e
+1.00 fifo s0-f2-o400-r0 19ae59aa6a3ce598
+1.00 fifo s1-f0-o0-r0 0dda86a663f76053
+1.00 fifo s1-f0-o64-r0 b8555b3f82fe015d
+1.00 fifo s1-f0-o400-r0 ae29c00eb0c6a155
+1.00 fifo s1-f1-o0-r0 c8d0731d38594081
+1.00 fifo s1-f1-o64-r0 3d9fcb9e7b1fa709
+1.00 fifo s1-f1-o400-r0 4fb777924a9093ff
+1.00 fifo s1-f2-o0-r0 c74200c86f52f3f6
+1.00 fifo s1-f2-o64-r0 cacac4769777d177
+1.00 fifo s1-f2-o400-r0 8184ded1f1494dab
+1.00 clock s0-f0-o0-r0 d7ddf60bbf2d87b1
+1.00 clock s0-f0-o64-r0 09d997e8c5e479be
+1.00 clock s0-f0-o400-r0 4ce6d9f198aa709a
+1.00 clock s0-f1-o0-r0 3d48905422dabbf6
+1.00 clock s0-f1-o64-r0 dbcb887ee3602c55
+1.00 clock s0-f1-o400-r0 0dca571d69d17dee
+1.00 clock s0-f2-o0-r0 9985effc782a60e6
+1.00 clock s0-f2-o64-r0 d071fe253666d126
+1.00 clock s0-f2-o400-r0 853e25e2dd2b5479
+1.00 clock s1-f0-o0-r0 b8078d23fc82f940
+1.00 clock s1-f0-o64-r0 e4c0d45bd0d7f913
+1.00 clock s1-f0-o400-r0 e1e1c8a4754bd995
+1.00 clock s1-f1-o0-r0 bd26f3839420e885
+1.00 clock s1-f1-o64-r0 b7afc774a01a302e
+1.00 clock s1-f1-o400-r0 dd77ed14a76cd379
+1.00 clock s1-f2-o0-r0 c06d2960a483bd43
+1.00 clock s1-f2-o64-r0 03c283cdf2080939
+1.00 clock s1-f2-o400-r0 1f66e4627b75db55
+1.00 lfu s0-f0-o0-r0 42db298104926e45
+1.00 lfu s0-f0-o64-r0 a7247ea85c68c2ae
+1.00 lfu s0-f0-o400-r0 f296ee44fbfeb1bb
+1.00 lfu s0-f1-o0-r0 7fbc401985395704
+1.00 lfu s0-f1-o64-r0 36bcfec44cd1a72e
+1.00 lfu s0-f1-o400-r0 414fa2fc762cf3d1
+1.00 lfu s0-f2-o0-r0 61d034c631cd8399
+1.00 lfu s0-f2-o64-r0 887d52eb3b8052e0
+1.00 lfu s0-f2-o400-r0 0e4bdcf10efa4dff
+1.00 lfu s1-f0-o0-r0 b5844432945715ba
+1.00 lfu s1-f0-o64-r0 c55cc74d7d984ded
+1.00 lfu s1-f0-o400-r0 fa59564f3088ba1b
+1.00 lfu s1-f1-o0-r0 0aa46df5af222df9
+1.00 lfu s1-f1-o64-r0 779937db18fb98af
+1.00 lfu s1-f1-o400-r0 3a520e0cc3a25122
+1.00 lfu s1-f2-o0-r0 14f9692880b3e950
+1.00 lfu s1-f2-o64-r0 90b33345b28a442f
+1.00 lfu s1-f2-o400-r0 929100eab3ad27b1
+1.00 lru-lfu s0-f0-o0-r0 fb6d23fcdc14ea98
+1.00 lru-lfu s0-f0-o0-r1 53f96b7149ba01b8
+1.00 lru-lfu s0-f0-o0-r2 dc7654bb128c70a5
+1.00 lru-lfu s0-f0-o64-r0 00d6562f39875ddb
+1.00 lru-lfu s0-f0-o64-r1 40e50b83561a80b6
+1.00 lru-lfu s0-f0-o64-r2 09d88e16b44ec00c
+1.00 lru-lfu s0-f0-o400-r0 1465c4acd29cad40
+1.00 lru-lfu s0-f0-o400-r1 48c24e4695a0992e
+1.00 lru-lfu s0-f0-o400-r2 8d6f67c135de1649
+1.00 lru-lfu s0-f1-o0-r0 26296d7e87ca5d4d
+1.00 lru-lfu s0-f1-o0-r1 7d8f3ee6f9d3be7b
+1.00 lru-lfu s0-f1-o0-r2 ccc09002cce1da7c
+1.00 lru-lfu s0-f1-o64-r0 a6654f8566e9494a
+1.00 lru-lfu s0-f1-o64-r1 84c163b315015470
+1.00 lru-lfu s0-f1-o64-r2 8eed62248888ad17
+1.00 lru-lfu s0-f1-o400-r0 fc4d19bbf3ffadfd
+1.00 lru-lfu s0-f1-o400-r1 3ec3ddba76325d75
+1.00 lru-lfu s0-f1-o400-r2 aecca2c090cf851c
+1.00 lru-lfu s0-f2-o0-r0 834777ef918f563c
+1.00 lru-lfu s0-f2-o0-r1 4a35a8fb68b89437
+1.00 lru-lfu s0-f2-o0-r2 b9627073b9187524
+1.00 lru-lfu s0-f2-o64-r0 4a63608101ea43fe
+1.00 lru-lfu s0-f2-o64-r1 d7070864caea50a4
+1.00 lru-lfu s0-f2-o64-r2 76c350d9996c72c3
+1.00 lru-lfu s0-f2-o400-r0 28d774a5a73739a6
+1.00 lru-lfu s0-f2-o400-r1 433c8068565ea0a2
+1.00 lru-lfu s0-f2-o400-r2 569bb2e28701a180
+1.00 lru-lfu s1-f0-o0-r0 9b015cd120bda553
+1.00 lru-lfu s1-f0-o0-r1 d5351bf069d01ed5
+1.00 lru-lfu s1-f0-o0-r2 1db6625c3a7ce915
+1.00 lru-lfu s1-f0-o64-r0 1f920e25f6fa12ff
+1.00 lru-lfu s1-f0-o64-r1 ef65e55008d7488f
+1.00 lru-lfu s1-f0-o64-r2 c0dea62d3edb218e
+1.00 lru-lfu s1-f0-o400-r0 df9b43b88bbda009
+1.00 lru-lfu s1-f0-o400-r1 c15c5ee0808d3bed
+1.00 lru-lfu s1-f0-o400-r2 0f9603093fba5a11
+1.00 lru-lfu s1-f1-o0-r0 07597c33fe17fa1f
+1.00 lru-lfu s1-f1-o0-r1 70e340d31cd77315
+1.00 lru-lfu s1-f1-o0-r2 eca3c28a01a3ac84
+1.00 lru-lfu s1-f1-o64-r0 e6498c204277ee46
+1.00 lru-lfu s1-f1-o64-r1 76228d3e096e82a7
+1.00 lru-lfu s1-f1-o64-r2 a9920d9919b6e655
+1.00 lru-lfu s1-f1-o400-r0 09e53d1e2956485d
+1.00 lru-lfu s1-f1-o400-r1 c2c3054d1eb596be
+1.00 lru-lfu s1-f1-o400-r2 aef3e27ee8b87750
+1.00 lru-lfu s1-f2-o0-r0 ced978e20cf82396
+1.00 lru-lfu s1-f2-o0-r1 1860768981d14ec0
+1.00 lru-lfu s1-f2-o0-r2 c8d2fbf04528c041
+1.00 lru-lfu s1-f2-o64-r0 adbb24980cacdb51
+1.00 lru-lfu s1-f2-o64-r1 6172290b436f597f
+1.00 lru-lfu s1-f2-o64-r2 9bede69818ac5e6e
+1.00 lru-lfu s1-f2-o400-r0 bfdf018ebbc0635e
+1.00 lru-lfu s1-f2-o400-r1 22c8fb095ca362b4
+1.00 lru-lfu s1-f2-o400-r2 e31a7e1779f46531
+1.00 lru-sized s0-f0-o0-r0 1382bb421f43040a
+1.00 lru-sized s0-f0-o0-r1 2c97bb92d4570bd1
+1.00 lru-sized s0-f0-o0-r2 1fa6f2bf4c62bf00
+1.00 lru-sized s0-f0-o64-r0 d7132be45c1910d4
+1.00 lru-sized s0-f0-o64-r1 a828c45bd559fd7f
+1.00 lru-sized s0-f0-o64-r2 00359578cf0bd0e2
+1.00 lru-sized s0-f0-o400-r0 61ed95473f2f2961
+1.00 lru-sized s0-f0-o400-r1 a29bb25d644bf1d6
+1.00 lru-sized s0-f0-o400-r2 7a3423056227a1a7
+1.00 lru-sized s0-f1-o0-r0 48494993785fbdf4
+1.00 lru-sized s0-f1-o0-r1 c91323f3ee59f6ed
+1.00 lru-sized s0-f1-o0-r2 7d3a73881151b98a
+1.00 lru-sized s0-f1-o64-r0 9fdc2c171fafb809
+1.00 lru-sized s0-f1-o64-r1 a08172677210ced0
+1.00 lru-sized s0-f1-o64-r2 54a446d6bcc28d9b
+1.00 lru-sized s0-f1-o400-r0 2dcfc234f39dfe16
+1.00 lru-sized s0-f1-o400-r1 27285546a7df56ef
+1.00 lru-sized s0-f1-o400-r2 5f3154c7cb4fa2d8
+1.00 lru-sized s0-f2-o0-r0 2e83f41959cd8db8
+1.00 lru-sized s0-f2-o0-r1 ec02b352d30dd0f8
+1.00 lru-sized s0-f2-o0-r2 f50151c7e13b7638
+1.00 lru-sized s0-f2-o64-r0 34420ef467dd4d6f
+1.00 lru-sized s0-f2-o64-r1 2fc6abe0a8e2d5af
+1.00 lru-sized s0-f2-o64-r2 2fc692912d7cf2ef
+1.00 lru-sized s0-f2-o400-r0 3abd9cd351fb9ac0
+1.00 lru-sized s0-f2-o400-r1 889538726e383100
+1.00 lru-sized s0-f2-o400-r2 663e708d81941000
+1.00 lru-sized s1-f0-o0-r0 27756b7c5ef5d24e
+1.00 lru-sized s1-f0-o0-r1 7f6e248c580b6d10
+1.00 lru-sized s1-f0-o0-r2 454bfd0525623564
+1.00 lru-sized s1-f0-o64-r0 3c9dff44a0c12895
+1.00 lru-sized s1-f0-o64-r1 8f72c4965ce56e6b
+1.00 lru-sized s1-f0-o64-r2 8c3d60094947608f
+1.00 lru-sized s1-f0-o400-r0 53ff08c6c8f4d457
+1.00 lru-sized s1-f0-o400-r1 678e7575af3d75b1
+1.00 lru-sized s1-f0-o400-r2 3bda5549d58dac01
+1.00 lru-sized s1-f1-o0-r0 8e4dfb4dbd84ccd7
+1.00 lru-sized s1-f1-o0-r1 dd1a577761b34aee
+1.00 lru-sized s1-f1-o0-r2 6225fd15c8f9006d
+1.00 lru-sized s1-f1-o64-r0 c34755105428b38a
+1.00 lru-sized s1-f1-o64-r1 6fd9d694f0eb5a73
+1.00 lru-sized s1-f1-o64-r2 403f682b67ce7324
+1.00 lru-sized s1-f1-o400-r0 dd4214e226afade7
+1.00 lru-sized s1-f1-o400-r1 1237a28e41ea5d9e
+1.00 lru-sized s1-f1-o400-r2 42c4dfe1f2a5c48d
+1.00 lru-sized s1-f2-o0-r0 3767719861cc341f
+1.00 lru-sized s1-f2-o0-r1 90fdebf40558dabf
+1.00 lru-sized s1-f2-o0-r2 62497c8c7a1fe33f
+1.00 lru-sized s1-f2-o64-r0 cf84f4617fb59eb5
+1.00 lru-sized s1-f2-o64-r1 ded5f71391e65d55
+1.00 lru-sized s1-f2-o64-r2 29c2b4ae1fb8d055
+1.00 lru-sized s1-f2-o400-r0 0c5eea3925d35f21
+1.00 lru-sized s1-f2-o400-r1 dd319208ae87b181
+1.00 lru-sized s1-f2-o400-r2 741e310be845b0c1
+1.00 q2 s0-f0-o0-r0 e762960c1f58340c
+1.00 q2 s0-f0-o0-r1 e921370de5f33999
+1.00 q2 s0-f0-o0-r2 4c43da4842437029
+1.00 q2 s0-f0-o64-r0 53f5b2c0aeaf8ab3
+1.00 q2 s0-f0-o64-r1 c432708cb9eb414e
+1.00 q2 s0-f0-o64-r2 e96aa631279559ba
+1.00 q2 s0-f0-o400-r0 79bdc361863f7a4d
+1.00 q2 s0-f0-o400-r1 7e73a51670c66242
+1.00 q2 s0-f0-o400-r2 828ae223882ef7ff
+1.00 q2 s0-f1-o0-r0 7746f58b9cce5df6
+1.00 q2 s0-f1-o0-r1 c0fc501bb47693b7
+1.00 q2 s0-f1-o0-r2 b613ae9a14967898
+1.00 q2 s0-f1-o64-r0 c2fac8e988c38efc
+1.00 q2 s0-f1-o64-r1 b40c3a05c85f73b0
+1.00 q2 s0-f1-o64-r2 fab7e7df0e8d8df0
+1.00 q2 s0-f1-o400-r0 d3713210b71b0149
+1.00 q2 s0-f1-o400-r1 2054fc40f2ebeb0b
+1.00 q2 s0-f1-o400-r2 a36105b3d111aa08
+1.00 q2 s0-f2-o0-r0 fd4bb604c7dab735
+1.00 q2 s0-f2-o0-r1 e658a470cd3f921c
+1.00 q2 s0-f2-o0-r2 72e9bb8110dfde92
+1.00 q2 s0-f2-o64-r0 948247e6bf43217b
+1.00 q2 s0-f2-o64-r1 725257fad8a8662f
+1.00 q2 s0-f2-o64-r2 cb9991b1df7d422b
+1.00 q2 s0-f2-o400-r0 74fb480adf8986d9
+1.00 q2 s0-f2-o400-r1 cde7d7ff61c4a79d
+1.00 q2 s0-f2-o400-r2 f75efce9aa522745
+1.00 q2 s1-f0-o0-r0 c6b38369712dd3b0
+1.00 q2 s1-f0-o0-r1 edd4f8429a855a7a
+1.00 q2 s1-f0-o0-r2 2075411f0f7afa3b
+1.00 q2 s1-f0-o64-r0 6c0fce1ede01f339
+1.00 q2 s1-f0-o64-r1 37e242fcc03c057c
+1.00 q2 s1-f0-o64-r2 614a7e204e637e29
+1.00 q2 s1-f0-o400-r0 eaec7522f204303a
+1.00 q2 s1-f0-o400-r1 bc16b479bf861edb
+1.00 q2 s1-f0-o400-r2 1467a31e61f6d5af
+1.00 q2 s1-f1-o0-r0 0c3518ff24690482
+1.00 q2 s1-f1-o0-r1 bb7570ae55c4a39e
+1.00 q2 s1-f1-o0-r2 e667499af141682c
+1.00 q2 s1-f1-o64-r0 e9192fb9931f4dbb
+1.00 q2 s1-f1-o64-r1 2723115375fa4fb9
+1.00 q2 s1-f1-o64-r2 ff97816a3e791fc8
+1.00 q2 s1-f1-o400-r0 ffe11492f9a53ad9
+1.00 q2 s1-f1-o400-r1 335d3d32fdbe050d
+1.00 q2 s1-f1-o400-r2 73eb1e219c664d14
+1.00 q2 s1-f2-o0-r0 9fe0e30aa968eef8
+1.00 q2 s1-f2-o0-r1 54eb50260333c9a9
+1.00 q2 s1-f2-o0-r2 89a3c94d11383664
+1.00 q2 s1-f2-o64-r0 f13903c8d2cb74e4
+1.00 q2 s1-f2-o64-r1 ff44f8b85bcde5e7
+1.00 q2 s1-f2-o64-r2 c9338dd9997f23e8
+1.00 q2 s1-f2-o400-r0 ba6e16ea62d04f8b
+1.00 q2 s1-f2-o400-r1 49a682a32bc91da2
+1.00 q2 s1-f2-o400-r2 f44b3330f07b8ff9
+1.00 q2gh s0-f0-o0-r0 c42f95ac2417431d
+1.00 q2gh s0-f0-o0-r1 4404cc0b7b725ca7
+1.00 q2gh s0-f0-o0-r2 ce825b0dba1c87df
+1.00 q2gh s0-f0-o64-r0 7ba56399684dc342
+1.00 q2gh s0-f0-o64-r1 822d3c479a1bf179
+1.00 q2gh s0-f0-o64-r2 178f657d8601e578
+1.00 q2gh s0-f0-o400-r0 627078214ce6321e
+1.00 q2gh s0-f0-o400-r1 ddbbc5ea86a70a33
+1.00 q2gh s0-f0-o400-r2 a46a08b9b9b2661b
+1.00 q2gh s0-f1-o0-r0 55d307f0278ef640
+1.00 q2gh s0-f1-o0-r1 e5838ede14cadc15
+1.00 q2gh s0-f1-o0-r2 f452e6cc8cb8397d
+1.00 q2gh s0-f1-o64-r0 0f84f4fcda62f601
+1.00 q2gh s0-f1-o64-r1 60ec486fdafba2f3
+1.00 q2gh s0-f1-o64-r2 119960949aa2cfb6
+1.00 q2gh s0-f1-o400-r0 6fcb70c5a91e17ae
+1.00 q2gh s0-f1-o400-r1 c65839972657acd9
+1.00 q2gh s0-f1-o400-r2 b566bccc99740b4f
+1.00 q2gh s0-f2-o0-r0 45e5d2e7b5ea458d
+1.00 q2gh s0-f2-o0-r1 84ebd1ea5f91a2e4
+1.00 q2gh s0-f2-o0-r2 8d75581e33dc96e6
+1.00 q2gh s0-f2-o64-r0 14019541e2caae6b
+1.00 q2gh s0-f2-o64-r1 02a6817bbe47c9ce
+1.00 q2gh s0-f2-o64-r2 e27000acc0b2baf7
+1.00 q2gh s0-f2-o400-r0 ddad0c2190f81afa
+1.00 q2gh s0-f2-o400-r1 d5bfe1c5e0cc9fa0
+1.00 q2gh s0-f2-o400-r2 3f03eb096812080d
+1.00 q2gh s1-f0-o0-r0 2bc168e0801ab1cf
+1.00 q2gh s1-f0-o0-r1 088c069ec4d820a7
+1.00 q2gh s1-f0-o0-r2 23330da35e8a8a25
+1.00 q2gh s1-f0-o64-r0 56400c70e3dac396
+1.00 q2gh s1-f0-o64-r1 87a3c4737e8f2d8b
+1.00 q2gh s1-f0-o64-r2 8cf86f62bf4efd8c
+1.00 q2gh s1-f0-o400-r0 8c0209d0d6be40dd
+1.00 q2gh s1-f0-o400-r1 c755cd39b36ac731
+1.00 q2gh s1-f0-o400-r2 1dc7c5734dce8758
+1.00 q2gh s1-f1-o0-r0 b79dc1b62cd0d092
+1.00 q2gh s1-f1-o0-r1 04bf40f5f9ec23eb
+1.00 q2gh s1-f1-o0-r2 864cd6d617740978
+1.00 q2gh s1-f1-o64-r0 08309731cf4672c2
+1.00 q2gh s1-f1-o64-r1 c1bbdafb79bcf80a
+1.00 q2gh s1-f1-o64-r2 d418c55b185090d1
+1.00 q2gh s1-f1-o400-r0 23ed9f35fc9237a5
+1.00 q2gh s1-f1-o400-r1 640584af105ca5e5
+1.00 q2gh s1-f1-o400-r2 c7467bd10465bd67
+1.00 q2gh s1-f2-o0-r0 cda72bf8487fe69b
+1.00 q2gh s1-f2-o0-r1 6e8d63cf923cd458
+1.00 q2gh s1-f2-o0-r2 813d2e786213914a
+1.00 q2gh s1-f2-o64-r0 7c4fa23bf31dd3c2
+1.00 q2gh s1-f2-o64-r1 3ce88a05a1d919fd
+1.00 q2gh s1-f2-o64-r2 f80325dac564604b
+1.00 q2gh s1-f2-o400-r0 c68fb76f28e66b17
+1.00 q2gh s1-f2-o400-r1 b5a3c1b1059c1ae0
+1.00 q2gh s1-f2-o400-r2 d05cfaddf3e15cbd
+1.00 q2far s0-f0-o0-r0 a9d44c3c23bb5315
+1.00 q2far s0-f0-o0-r1 0d1b23b392a71537
+1.00 q2far s0-f0-o0-r2 1d33400f39d326d5
+1.00 q2far s0-f0-o64-r0 23aea9f1675954cb
+1.00 q2far s0-f0-o64-r1 488e5afcec8caefd
+1.00 q2far s0-f0-o64-r2 77ea27f1eb73541e
+1.00 q2far s0-f0-o400-r0 fea3a6d50477e8c6
+1.00 q2far s0-f0-o400-r1 fcb9d2f1931cdccc
+1.00 q2far s0-f0-o400-r2 7f1df9fe0055fd3e
+1.00 q2far s0-f1-o0-r0 5f4083de00f1e551
+1.00 q2far s0-f1-o0-r1 4c24d62eb61007ea
+1.00 q2far s0-f1-o0-r2 eb0c5481753bec55
+1.00 q2far s0-f1-o64-r0 a00ac8b1b988e641
+1.00 q2far s0-f1-o64-r1 27fceca36a936a87
+1.00 q2far s0-f1-o64-r2 03d6fb00baa0fba7
+1.00 q2far s0-f1-o400-r0 03ad453b8a74247d
+1.00 q2far s0-f1-o400-r1 c5916a8f9939c9b4
+1.00 q2far s0-f1-o400-r2 01430a990a219ab9
+1.00 q2far s0-f2-o0-r0 4322aeaeff8fb129
+1.00 q2far s0-f2-o0-r1 769bee88e54abebd
+1.00 q2far s0-f2-o0-r2 eaae008c2bc9564c
+1.00 q2far s0-f2-o64-r0 80921da3673b71a4
+1.00 q2far s0-f2-o64-r1 3d3b3e01c1f7a900
+1.00 q2far s0-f2-o64-r2 038be30e48520d85
+1.00 q2far s0-f2-o400-r0 5e982f40ccc06ca9
+1.00 q2far s0-f2-o400-r1 90eae9d052ae4042
+1.00 q2far s0-f2-o400-r2 2e1881ff96214c64
+1.00 q2far s1-f0-o0-r0 16c78f3a3ef37a80
+1.00 q2far s1-f0-o0-r1 ccbff1eca3f31f1e
+1.00 q2far s1-f0-o0-r2 dede851eb4497fe1
+1.00 q2far s1-f0-o64-r0 fecc5b5726575597
+1.00 q2far s1-f0-o64-r1 74edf1822af2cfae
+1.00 q2far s1-f0-o64-r2 851df57442bc6ce9
+1.00 q2far s1-f0-o400-r0 6e106af3c6443cef
+1.00 q2far s1-f0-o400-r1 40659767eabe18e7
+1.00 q2far s1-f0-o400-r2 de9a3e7062d9ede9
+1.00 q2far s1-f1-o0-r0 be5d515ac285066d
+1.00 q2far s1-f1-o0-r1 a5a9fb05f8a3df28
+1.00 q2far s1-f1-o0-r2 53e3008b5ed73182
+1.00 q2far s1-f1-o64-r0 6f79fd7c9d2c30b8
+1.00 q2far s1-f1-o64-r1 0c8d9bc26a9df5d9
+1.00 q2far s1-f1-o64-r2 d5ccc76f3259dc26
+1.00 q2far s1-f1-o400-r0 5d0e3ed0581923c4
+1.00 q2far s1-f1-o400-r1 40304ed67da57c68
+1.00 q2far s1-f1-o400-r2 68c4e67a9ed36dab
+1.00 q2far s1-f2-o0-r0 56cb7bd11b7eebbd
+1.00 q2far s1-f2-o0-r1 d614a522e4eb539c
+1.00 q2far s1-f2-o0-r2 3e17566b4e2c453c
+1.00 q2far s1-f2-o64-r0 6cbb0d914a1a536a
+1.00 q2far s1-f2-o64-r1 ab7ec194b6cf7583
+1.00 q2far s1-f2-o64-r2 5ac8cdced278b7cf
+1.00 q2far s1-f2-o400-r0 deed73373d2fb321
+1.00 q2far s1-f2-o400-r1 8ed8d26cabdfa348
+1.00 q2far s1-f2-o400-r2 8706d81501d20c64
+1.00 q2full s0-f0-o0-r0 46c30bf06c8fc53c
+1.00 q2full s0-f0-o0-r1 3040afbd7b2cfed2
+1.00 q2full s0-f0-o0-r2 4c61a20a0e7d26e0
+1.00 q2full s0-f0-o64-r0 f02de9632c83bcd9
+1.00 q2full s0-f0-o64-r1 4f3e3e90c04e74a8
+1.00 q2full s0-f0-o64-r2 e7c7f83974bd4a11
+1.00 q2full s0-f0-o400-r0 9a38b7fc0f9fef12
+1.00 q2full s0-f0-o400-r1 439a62414b657a99
+1.00 q2full s0-f0-o400-r2 b5c3c6d81f6bd0e9
+1.00 q2full s0-f1-o0-r0 096d6d742fe83e70
+1.00 q2full s0-f1-o0-r1 026ffea4ab5acd70
+1.00 q2full s0-f1-o0-r2 2869787e252d965e
+1.00 q2full s0-f1-o64-r0 dd5bc960a40f9cec
+1.00 q2full s0-f1-o64-r1 e84ac50995a2d129
+1.00 q2full s0-f1-o64-r2 7ed88b6d0aa83fe3
+1.00 q2full s0-f1-o400-r0 6aeec4b2a1449f17
+1.00 q2full s0-f1-o400-r1 8e32c0dd500a81df
+1.00 q2full s0-f1-o400-r2 dea315d54d85ae39
+1.00 q2full s0-f2-o0-r0 2b4ad944b5eee17e
+1.00 q2full s0-f2-o0-r1 860c52c01e962074
+1.00 q2full s0-f2-o0-r2 5fa27da8fd4ac91c
+1.00 q2full s0-f2-o64-r0 a421aa83e5a760e7
+1.00 q2full s0-f2-o64-r1 e41c2611cb32de11
+1.00 q2full s0-f2-o64-r2 50495fb558b6f9dd
+1.00 q2full s0-f2-o400-r0 5a2584a182b4170b
+1.00 q2full s0-f2-o400-r1 cbae754d35f488a1
+1.00 q2full s0-f2-o400-r2 1a910c754bbe22c5
+1.00 q2full s1-f0-o0-r0 a5636d02123878a9
+1.00 q2full s1-f0-o0-r1 44e46f1e757386a4
+1.00 q2full s1-f0-o0-r2 38d60634dc3e9353
+1.00 q2full s1-f0-o64-r0 1ee1bc0592dab3db
+1.00 q2full s1-f0-o64-r1 9a33bbb26454f948
+1.00 q2full s1-f0-o64-r2 794905d27db7f55b
+1.00 q2full s1-f0-o400-r0 2c59f16af1f69f27
+1.00 q2full s1-f0-o400-r1 d9ba77ee4065dd2c
+1.00 q2full s1-f0-o400-r2 8c4c7b1b6360501f
+1.00 q2full s1-f1-o0-r0 a63b0622062054de
+1.00 q2full s1-f1-o0-r1 9572884127288eb8
+1.00 q2full s1-f1-o0-r2 aa7d9e032e370176
+1.00 q2full s1-f1-o64-r0 e166e383f373691e
+1.00 q2full s1-f1-o64-r1 a055845ba83e96dd
+1.00 q2full s1-f1-o64-r2 e440d6bb26bd15b1
+1.00 q2full s1-f1-o400-r0 71274734c560d36e
+1.00 q2full s1-f1-o400-r1 d48a2d652c58370e
+1.00 q2full s1-f1-o400-r2 034284bc971725fa
+1.00 q2full s1-f2-o0-r0 9cff745dde546188
+1.00 q2full s1-f2-o0-r1 b4bc24f1a2c579e1
+1.00 q2full s1-f2-o0-r2 9d93e91f3fbd6f5c
+1.00 q2full s1-f2-o64-r0 6b04110a22e8bd4d
+1.00 q2full s1-f2-o64-r1 7221f4d6e6b7462d
+1.00 q2full s1-f2-o64-r2 bc8ce7e352a7fce4
+1.00 q2full s1-f2-o400-r0 b2ae0bc1f0f24df9
+1.00 q2full s1-f2-o400-r1 cd371f3fa0d5cad3
+1.00 q2full s1-f2-o400-r2 85fd9f7e466db70a
+1.00 s3 s0-f0-o0-r0 9be78707b5d35bbd
+1.00 s3 s0-f0-o0-r1 bd398480fe36e736
+1.00 s3 s0-f0-o0-r2 606ab87fb33e213a
+1.00 s3 s0-f0-o64-r0 2d0ade75c4335a94
+1.00 s3 s0-f0-o64-r1 eeab252aa1bd12fa
+1.00 s3 s0-f0-o64-r2 eaf3579221d84dfc
+1.00 s3 s0-f0-o400-r0 fbdd4b50fb19fb6c
+1.00 s3 s0-f0-o400-r1 90a5fb4bca905e80
+1.00 s3 s0-f0-o400-r2 0594c46d408ea29d
+1.00 s3 s0-f1-o0-r0 1cd0b1e51e0d3ee0
+1.00 s3 s0-f1-o0-r1 4ce9e1b0578149a2
+1.00 s3 s0-f1-o0-r2 adcf72b2aee8ed80
+1.00 s3 s0-f1-o64-r0 18914c25ce689905
+1.00 s3 s0-f1-o64-r1 78f2596f8de90a20
+1.00 s3 s0-f1-o64-r2 f37ba1af1b20bedd
+1.00 s3 s0-f1-o400-r0 e6121cc82a73ce17
+1.00 s3 s0-f1-o400-r1 c02b76dd7bd71576
+1.00 s3 s0-f1-o400-r2 d4cd3ba762c31a33
+1.00 s3 s0-f2-o0-r0 ea6f48021308ea82
+1.00 s3 s0-f2-o0-r1 62e28737450785ca
+1.00 s3 s0-f2-o0-r2 e938868d157aa95f
+1.00 s3 s0-f2-o64-r0 762d5f15420f16e1
+1.00 s3 s0-f2-o64-r1 516d035cb4cd96dd
+1.00 s3 s0-f2-o64-r2 add7ac41a49bb74a
+1.00 s3 s0-f2-o400-r0 44bdd22766e7d1aa
+1.00 s3 s0-f2-o400-r1 c16f5eab38dfedcc
+1.00 s3 s0-f2-o400-r2 f59883415e04a8f9
+1.00 s3 s1-f0-o0-r0 89714dad3acfaad4
+1.00 s3 s1-f0-o0-r1 24c404988a24a31f
+1.00 s3 s1-f0-o0-r2 8a24f77492eaa25f
+1.00 s3 s1-f0-o64-r0 6400bdfe54794b3e
+1.00 s3 s1-f0-o64-r1 b69973acbf4e1e27
+1.00 s3 s1-f0-o64-r2 7a34466886f73a34
+1.00 s3 s1-f0-o400-r0 da70f7b2a54c4214
+1.00 s3 s1-f0-o400-r1 84a1518aeee72df3
+1.00 s3 s1-f0-o400-r2 8ecfea15dd21f6a0
+1.00 s3 s1-f1-o0-r0 8507e4e92a90fd22
+1.00 s3 s1-f1-o0-r1 da100f62822418b8
+1.00 s3 s1-f1-o0-r2 f59d10e19d3848a5
+1.00 s3 s1-f1-o64-r0 3504ef111e057bf1
+1.00 s3 s1-f1-o64-r1 9148baf50c52ada1
+1.00 s3 s1-f1-o64-r2 b37aef43b628478d
+1.00 s3 s1-f1-o400-r0 a136e3d5ee8b296e
+1.00 s3 s1-f1-o400-r1 13c1d2be742ea3fe
+1.00 s3 s1-f1-o400-r2 28ddb9052d7c2ada
+1.00 s3 s1-f2-o0-r0 330cee650c6398a2
+1.00 s3 s1-f2-o0-r1 237e35648b1bc171
+1.00 s3 s1-f2-o0-r2 09f1fe9d893a8e57
+1.00 s3 s1-f2-o64-r0 4619b830bc846a63
+1.00 s3 s1-f2-o64-r1 d0459d7c51050b12
+1.00 s3 s1-f2-o64-r2 d3626a36c1143c01
+1.00 s3 s1-f2-o400-r0 8dd59c150dc28128
+1.00 s3 s1-f2-o400-r1 739401f3899775e8
+1.00 s3 s1-f2-o400-r2 b6b4339a8d5ae599
+1.00 s3gh s0-f0-o0-r0 dc234a587a2e4cc3
+1.00 s3gh s0-f0-o0-r1 d0121dcc5fc1b6f4
+1.00 s3gh s0-f0-o0-r2 68c9402e3f4cab43
+1.00 s3gh s0-f0-o64-r0 42ddb4c82a4fd285
+1.00 s3gh s0-f0-o64-r1 d78756d0c5091e3f
+1.00 s3gh s0-f0-o64-r2 4fa170e141e54742
+1.00 s3gh s0-f0-o400-r0 11a140b4112c58d8
+1.00 s3gh s0-f0-o400-r1 fe04683cd8830036
+1.00 s3gh s0-f0-o400-r2 33c07d7804ac5cb6
+1.00 s3gh s0-f1-o0-r0 86d4433a3370b1b4
+1.00 s3gh s0-f1-o0-r1 06a78138865eab4a
+1.00 s3gh s0-f1-o0-r2 911ceb6b9f27908c
+1.00 s3gh s0-f1-o64-r0 3e4e7ed6810cbb04
+1.00 s3gh s0-f1-o64-r1 5ec2976d72794181
+1.00 s3gh s0-f1-o64-r2 9c8e60faabbda9c0
+1.00 s3gh s0-f1-o400-r0 3c937b52addea600
+1.00 s3gh s0-f1-o400-r1 e69d41ebb18cd36d
+1.00 s3gh s0-f1-o400-r2 2842d0613976fe00
+1.00 s3gh s0-f2-o0-r0 ec9f3a413dc0c284
+1.00 s3gh s0-f2-o0-r1 1faa202da5a610eb
+1.00 s3gh s0-f2-o0-r2 4e423240fa2cd56f
+1.00 s3gh s0-f2-o64-r0 b9871d4db9018917
+1.00 s3gh s0-f2-o64-r1 3ecf6672089621c0
+1.00 s3gh s0-f2-o64-r2 313656a48ca6eb12
+1.00 s3gh s0-f2-o400-r0 d3c261a05b7c3a16
+1.00 s3gh s0-f2-o400-r1 8163532141306dd3
+1.00 s3gh s0-f2-o400-r2 bcc0b0bc767985e8
+1.00 s3gh s1-f0-o0-r0 84b8ed08b608e8f8
+1.00 s3gh s1-f0-o0-r1 c70b14a75f6efd9b
+1.00 s3gh s1-f0-o0-r2 bc61abd0cbe9699f
+1.00 s3gh s1-f0-o64-r0 39d36866abc12c4a
+1.00 s3gh s1-f0-o64-r1 6e9a180849f57f34
+1.00 s3gh s1-f0-o64-r2 a28d004c9a99da7f
+1.00 s3gh s1-f0-o400-r0 4ad79fe2bb889d7a
+1.00 s3gh s1-f0-o400-r1 5019656b42e68dc7
+1.00 s3gh s1-f0-o400-r2 fc5b23b3c578bc7a
+1.00 s3gh s1-f1-o0-r0 295ad1350d7ea258
+1.00 s3gh s1-f1-o0-r1 a08834e2c358c92e
+1.00 s3gh s1-f1-o0-r2 d86c8850cfff7227
+1.00 s3gh s1-f1-o64-r0 787d9cc21d278493
+1.00 s3gh s1-f1-o64-r1 4cf30845a6316a97
+1.00 s3gh s1-f1-o64-r2 d283c192f9e1f97c
+1.00 s3gh s1-f1-o400-r0 753031a1804392f5
+1.00 s3gh s1-f1-o400-r1 7c33e9810123170e
+1.00 s3gh s1-f1-o400-r2 0933c7cc55295fdc
+1.00 s3gh s1-f2-o0-r0 5f4dda623a7440dd
+1.00 s3gh s1-f2-o0-r1 1e39a0940e3db91f
+1.00 s3gh s1-f2-o0-r2 aaa103fa6c256318
+1.00 s3gh s1-f2-o64-r0 1e5f034bb06e8255
+1.00 s3gh s1-f2-o64-r1 5ff93bb20d376dc9
+1.00 s3gh s1-f2-o64-r2 c3a2bdb72ef1e307
+1.00 s3gh s1-f2-o400-r0 a318b8c4aa04cf25
+1.00 s3gh s1-f2-o400-r1 0a584aa9d44d4989
+1.00 s3gh s1-f2-o400-r2 0c2e5d74e9cc673b
+1.00 gld s0-f0-o0-r0 c97329dc90cf083e
+1.00 gld s0-f0-o0-r1 28ef26835231b407
+1.00 gld s0-f0-o0-r2 89eaf419bdc06399
+1.00 gld s0-f0-o64-r0 6a31855f6fed5a63
+1.00 gld s0-f0-o64-r1 763dc6a2588c3f89
+1.00 gld s0-f0-o64-r2 97f60418336f7ec1
+1.00 gld s0-f0-o400-r0 ed7ec5dfcbb731d7
+1.00 gld s0-f0-o400-r1 787bd285279a6863
+1.00 gld s0-f0-o400-r2 dfb42c224c4b9ef0
+1.00 gld s0-f1-o0-r0 3fab10aea02945f7
+1.00 gld s0-f1-o0-r1 1fee9de6e0d7afb2
+1.00 gld s0-f1-o0-r2 a1bb4511e2e2db4e
+1.00 gld s0-f1-o64-r0 6aa546b6a67d5a1b
+1.00 gld s0-f1-o64-r1 ab88bdd3f904e32a
+1.00 gld s0-f1-o64-r2 a1cd5e55744ad1ad
+1.00 gld s0-f1-o400-r0 af9a2eac690490a0
+1.00 gld s0-f1-o400-r1 03deda80745b521b
+1.00 gld s0-f1-o400-r2 fe7180db9bb44079
+1.00 gld s0-f2-o0-r0 405bdb6d452b102a
+1.00 gld s0-f2-o0-r1 8b7de2929c93c67d
+1.00 gld s0-f2-o0-r2 45d1fe20e6442701
+1.00 gld s0-f2-o64-r0 97dbe7c8482d6996
+1.00 gld s0-f2-o64-r1 aaa6880fffec6f6f
+1.00 gld s0-f2-o64-r2 65b01ddb4a308b74
+1.00 gld s0-f2-o400-r0 8dfff02ffb135473
+1.00 gld s0-f2-o400-r1 f74807bd44f356a0
+1.00 gld s0-f2-o400-r2 61bd19c867371fbb
+1.00 gld s1-f0-o0-r0 fe887e4e54286d70
+1.00 gld s1-f0-o0-r1 3b9925ae5dc3cdca
+1.00 gld s1-f0-o0-r2 fec277076a1a63aa
+1.00 gld s1-f0-o64-r0 e711f5136b06ae93
+1.00 gld s1-f0-o64-r1 3488514f630e5e4a
+1.00 gld s1-f0-o64-r2 939bb426f1592bae
+1.00 gld s1-f0-o400-r0 51de2e30b1c08c6f
+1.00 gld s1-f0-o400-r1 02b37ff1be18656b
+1.00 gld s1-f0-o400-r2 579ac2d4ba970df2
+1.00 gld s1-f1-o0-r0 a8e8c692c62d95b4
+1.00 gld s1-f1-o0-r1 0c94f178a6c95d8d
+1.00 gld s1-f1-o0-r2 26feb71fc7f8509e
+1.00 gld s1-f1-o64-r0 0e8ed3448776866c
+1.00 gld s1-f1-o64-r1 94c0f61267d06734
+1.00 gld s1-f1-o64-r2 699f9daabc86262e
+1.00 gld s1-f1-o400-r0 ef683f94cef44eb1
+1.00 gld s1-f1-o400-r1 df3c8235a2de35a5
+1.00 gld s1-f1-o400-r2 e8618203c595101f
+1.00 gld s1-f2-o0-r0 5a2dca07acbeaf2f
+1.00 gld s1-f2-o0-r1 fa0f075706ee3106
+1.00 gld s1-f2-o0-r2 b69830a3063328d2
+1.00 gld s1-f2-o64-r0 ce03e6345131d897
+1.00 gld s1-f2-o64-r1 3898b96af0e29fa2
+1.00 gld s1-f2-o64-r2 0ae3a7e49126b734
+1.00 gld s1-f2-o400-r0 751204ce0bb5e4f8
+1.00 gld s1-f2-o400-r1 d97453472eeb1e79
+1.00 gld s1-f2-o400-r2 e7c96cf2771c328d
+1.00 gldfa s0-f0-o0-r0 5e92f9e03a0efbc4
+1.00 gldfa s0-f0-o0-r1 ae5089d1b3704970
+1.00 gldfa s0-f0-o0-r2 10612916f3e94f25
+1.00 gldfa s0-f0-o64-r0 8998eb5223c6ede6
+1.00 gldfa s0-f0-o64-r1 03509b755556bb8c
+1.00 gldfa s0-f0-o64-r2 83bdf473be967abf
+1.00 gldfa s0-f0-o400-r0 ef8954697f640ecf
+1.00 gldfa s0-f0-o400-r1 36dbd10a4506651d
+1.00 gldfa s0-f0-o400-r2 251afda58014b662
+1.00 gldfa s0-f1-o0-r0 19812c0fd27d2a4d
+1.00 gldfa s0-f1-o0-r1 82e5879415f35ea4
+1.00 gldfa s0-f1-o0-r2 9fc4f56701570dbf
+1.00 gldfa s0-f1-o64-r0 9e3e0c09c6cd2671
+1.00 gldfa s0-f1-o64-r1 3f47a9ede90fd9d9
+1.00 gldfa s0-f1-o64-r2 f5959d404fc11620
+1.00 gldfa s0-f1-o400-r0 c56039336227e96e
+1.00 gldfa s0-f1-o400-r1 adaab8c78e89224f
+1.00 gldfa s0-f1-o400-r2 7961cac3b12eb234
+1.00 gldfa s0-f2-o0-r0 e214b0323020f78c
+1.00 gldfa s0-f2-o0-r1 9551111303cb002d
+1.00 gldfa s0-f2-o0-r2 2c47ebcebf40a6a5
+1.00 gldfa s0-f2-o64-r0 f7f7185d1399cbed
+1.00 gldfa s0-f2-o64-r1 a30f4e3c2cb28534
+1.00 gldfa s0-f2-o64-r2 942ca90bc19030d4
+1.00 gldfa s0-f2-o400-r0 acae0e29c4a30a1d
+1.00 gldfa s0-f2-o400-r1 9fbdf6d199202650
+1.00 gldfa s0-f2-o400-r2 3b6d1987a5bda582
+1.00 gldfa s1-f0-o0-r0 d75991043e3c324d
+1.00 gldfa s1-f0-o0-r1 143191ca940ea60b
+1.00 gldfa s1-f0-o0-r2 32c1f38ef57d5f92
+1.00 gldfa s1-f0-o64-r0 9fa4536d89c081ad
+1.00 gldfa s1-f0-o64-r1 f48243beae2c2d9e
+1.00 gldfa s1-f0-o64-r2 51b364d6ea46f280
+1.00 gldfa s1-f0-o400-r0 d37e4cb982c0d7cf
+1.00 gldfa s1-f0-o400-r1 878c1501c216e93e
+1.00 gldfa s1-f0-o400-r2 85d06e2b3b7dbd64
+1.00 gldfa s1-f1-o0-r0 fdf9d8464c360ed3
+1.00 gldfa s1-f1-o0-r1 b97fd89da272f0d0
+1.00 gldfa s1-f1-o0-r2 6709c3f77af79f94
+1.00 gldfa s1-f1-o64-r0 e504982abddd8c82
+1.00 gldfa s1-f1-o64-r1 dc98c4ae7893191c
+1.00 gldfa s1-f1-o64-r2 f9227aed62a537bf
+1.00 gldfa s1-f1-o400-r0 6f942a8ab7e5032f
+1.00 gldfa s1-f1-o400-r1 ab9ff9be78d6639c
+1.00 gldfa s1-f1-o400-r2 431248d104fc38a6
+1.00 gldfa s1-f2-o0-r0 41cb7447e6ce9927
+1.00 gldfa s1-f2-o0-r1 383407e1e10530a1
+1.00 gldfa s1-f2-o0-r2 06efb8206aa5b8d4
+1.00 gldfa s1-f2-o64-r0 4ce96846a30c0266
+1.00 gldfa s1-f2-o64-r1 e28115dec57854ec
+1.00 gldfa s1-f2-o64-r2 5014baaeefa76d1d
+1.00 gldfa s1-f2-o400-r0 764b2e2a6a399915
+1.00 gldfa s1-f2-o400-r1 ac369eaf8b337d11
+1.00 gldfa s1-f2-o400-r2 10ae4a95402ebb07
+1.00 mid21 s0-f0-o0-r0 75e76f4a0f895222
+1.00 mid21 s0-f0-o0-r1 3f2053b11427d7ba
+1.00 mid21 s0-f0-o0-r2 b6efd8e255df0326
+1.00 mid21 s0-f0-o64-r0 6642a6488a5f3372
+1.00 mid21 s0-f0-o64-r1 c9c4dff02b3b3c7d
+1.00 mid21 s0-f0-o64-r2 747ef33a25571e32
+1.00 mid21 s0-f0-o400-r0 883ba644d759471f
+1.00 mid21 s0-f0-o400-r1 24fb6d667bc3154a
+1.00 mid21 s0-f0-o400-r2 bab6be247834fee7
+1.00 mid21 s0-f1-o0-r0 59ad82d5a88c8ad5
+1.00 mid21 s0-f1-o0-r1 42e7fa2eba0cbd56
+1.00 mid21 s0-f1-o0-r2 70c2b956367dda79
+1.00 mid21 s0-f1-o64-r0 ed0561186cd8cd1d
+1.00 mid21 s0-f1-o64-r1 dc768191b61dbb0b
+1.00 mid21 s0-f1-o64-r2 ada6ed4fb63df98a
+1.00 mid21 s0-f1-o400-r0 1a8bcf6b8a58d086
+1.00 mid21 s0-f1-o400-r1 23b7737f36d0b345
+1.00 mid21 s0-f1-o400-r2 599fcbdf52e17029
+1.00 mid21 s0-f2-o0-r0 5cac5a16e8a56057
+1.00 mid21 s0-f2-o0-r1 7d67dd15bc1fc060
+1.00 mid21 s0-f2-o0-r2 62caa4a29ffdcb60
+1.00 mid21 s0-f2-o64-r0 8f29d6a7dd4784de
+1.00 mid21 s0-f2-o64-r1 785d9c6881514d8d
+1.00 mid21 s0-f2-o64-r2 df687c5c51fc6105
+1.00 mid21 s0-f2-o400-r0 c2776e946e03dbe8
+1.00 mid21 s0-f2-o400-r1 77560d030181b9fb
+1.00 mid21 s0-f2-o400-r2 f833b5d0ce97ee22
+1.00 mid21 s1-f0-o0-r0 1a2ca5b706d0bcc5
+1.00 mid21 s1-f0-o0-r1 ebecc724a22180f2
+1.00 mid21 s1-f0-o0-r2 5875811c54207642
+1.00 mid21 s1-f0-o64-r0 95e222e63321ec56
+1.00 mid21 s1-f0-o64-r1 08fe9ad227e25c0d
+1.00 mid21 s1-f0-o64-r2 67ab0ceb5e136b20
+1.00 mid21 s1-f0-o400-r0 ae039c431e80769b
+1.00 mid21 s1-f0-o400-r1 735c8436eb171e0b
+1.00 mid21 s1-f0-o400-r2 be853a390401f47f
+1.00 mid21 s1-f1-o0-r0 8ed2cc48efeb0146
+1.00 mid21 s1-f1-o0-r1 a385d5b053078e3d
+1.00 mid21 s1-f1-o0-r2 82b079ac8cf2d913
+1.00 mid21 s1-f1-o64-r0 00a542fe2e55a605
+1.00 mid21 s1-f1-o64-r1 f74287f8b4856131
+1.00 mid21 s1-f1-o64-r2 b3bc56dd62fe9351
+1.00 mid21 s1-f1-o400-r0 cc682c3fe931c36c
+1.00 mid21 s1-f1-o400-r1 f80cf8406e9bccaf
+1.00 mid21 s1-f1-o400-r2 348e3bbc7ed9d319
+1.00 mid21 s1-f2-o0-r0 35ca396caf15511f
+1.00 mid21 s1-f2-o0-r1 b81aaea4773db456
+1.00 mid21 s1-f2-o0-r2 3c30fdf7ce2679f4
+1.00 mid21 s1-f2-o64-r0 ba4aefce159e651b
+1.00 mid21 s1-f2-o64-r1 e4d229d583659efb
+1.00 mid21 s1-f2-o64-r2 53e2c37ce97f8f93
+1.00 mid21 s1-f2-o400-r0 b1540f4ec533f92b
+1.00 mid21 s1-f2-o400-r1 bbbd3995b2dd7786
+1.00 mid21 s1-f2-o400-r2 387c7abc090320bb
+1.00 ldr s0-f0-o0-r0 69e2c3815c13e8ed
+1.00 ldr s0-f0-o0-r1 8cf751fbabfb9685
+1.00 ldr s0-f0-o0-r2 a9b3a5d26e005944
+1.00 ldr s0-f0-o64-r0 f31a054fa6bfd3af
+1.00 ldr s0-f0-o64-r1 7cb23fece62f5b3f
+1.00 ldr s0-f0-o64-r2 66757ded8cd0f6b6
+1.00 ldr s0-f0-o400-r0 cd5483258b1392a8
+1.00 ldr s0-f0-o400-r1 53d8bb160fb982f6
+1.00 ldr s0-f0-o400-r2 ae6d556bc4e344f2
+1.00 ldr s0-f1-o0-r0 6c5f7588d964aed7
+1.00 ldr s0-f1-o0-r1 d00beeaf397319b8
+1.00 ldr s0-f1-o0-r2 d1f3a832342395df
+1.00 ldr s0-f1-o64-r0 d4850dff8c2ac1aa
+1.00 ldr s0-f1-o64-r1 74c302b5809cccea
+1.00 ldr s0-f1-o64-r2 253bfffc10915076
+1.00 ldr s0-f1-o400-r0 998c2c40803e6619
+1.00 ldr s0-f1-o400-r1 0eebc41130014b2e
+1.00 ldr s0-f1-o400-r2 66c9505425411031
+1.00 ldr s0-f2-o0-r0 b2d512955df4fd8f
+1.00 ldr s0-f2-o0-r1 eebaa2292ce733b4
+1.00 ldr s0-f2-o0-r2 ca6079a92e69e4e2
+1.00 ldr s0-f2-o64-r0 2ec192b8509a209f
+1.00 ldr s0-f2-o64-r1 bc7807487e429c80
+1.00 ldr s0-f2-o64-r2 1080dc41ac7d752a
+1.00 ldr s0-f2-o400-r0 35b4a1bd48ee6d0d
+1.00 ldr s0-f2-o400-r1 e45b6b594ee779bc
+1.00 ldr s0-f2-o400-r2 53004754f563d22e
+1.00 ldr s1-f0-o0-r0 13ca788c54bc7671
+1.00 ldr s1-f0-o0-r1 efe7c5ed0ddf6625
+1.00 ldr s1-f0-o0-r2 04e59c00098ed792
+1.00 ldr s1-f0-o64-r0 980ad0e7c3c5bb44
+1.00 ldr s1-f0-o64-r1 a8ce47d4e520efbc
+1.00 ldr s1-f0-o64-r2 8f9edfbd5ae9e51c
+1.00 ldr s1-f0-o400-r0 73f1335500c93960
+1.00 ldr s1-f0-o400-r1 de148ae2a4a8cf1d
+1.00 ldr s1-f0-o400-r2 e832880dcbaad35c
+1.00 ldr s1-f1-o0-r0 332ad58e0fbd4b22
+1.00 ldr s1-f1-o0-r1 c8961f8d31e21748
+1.00 ldr s1-f1-o0-r2 ea84aaa8794700b6
+1.00 ldr s1-f1-o64-r0 8cd0b5f576882da6
+1.00 ldr s1-f1-o64-r1 0175a67fb854a6ee
+1.00 ldr s1-f1-o64-r2 a81ed65c2ea2bb9e
+1.00 ldr s1-f1-o400-r0 02249d4b82ed5ba2
+1.00 ldr s1-f1-o400-r1 e0e1e83b61ca76d0
+1.00 ldr s1-f1-o400-r2 2bbcb3ea52660888
+1.00 ldr s1-f2-o0-r0 784dfa9bcbc74534
+1.00 ldr s1-f2-o0-r1 949bb2dfbfc27d65
+1.00 ldr s1-f2-o0-r2 9e592e67cadf016c
+1.00 ldr s1-f2-o64-r0 c87d82bf5df9543d
+1.00 ldr s1-f2-o64-r1 8641ccc50b797b67
+1.00 ldr s1-f2-o64-r2 52f0d951379c1fb1
+1.00 ldr s1-f2-o400-r0 402210194bce390d
+1.00 ldr s1-f2-o400-r1 fd93c6e24097bdad
+1.00 ldr s1-f2-o400-r2 34dc01d125908812
+1.00 ldfar s0-f0-o0-r0 c3a8d865309b68c5
+1.00 ldfar s0-f0-o0-r1 e611e59de58cc66e
+1.00 ldfar s0-f0-o0-r2 32c79c921b68d14d
+1.00 ldfar s0-f0-o64-r0 a3776db45509db79
+1.00 ldfar s0-f0-o64-r1 7fd209a7033cd6a6
+1.00 ldfar s0-f0-o64-r2 8fb8c3fb497676bd
+1.00 ldfar s0-f0-o400-r0 e76c577abea3ac6b
+1.00 ldfar s0-f0-o400-r1 2185071f8c250798
+1.00 ldfar s0-f0-o400-r2 e5777c61b6db4c84
+1.00 ldfar s0-f1-o0-r0 93cef84a96e2e98e
+1.00 ldfar s0-f1-o0-r1 35324de6e56a98be
+1.00 ldfar s0-f1-o0-r2 7e34d3c56bb5b34f
+1.00 ldfar s0-f1-o64-r0 765777ecf9f8f031
+1.00 ldfar s0-f1-o64-r1 e277fad2dd54b237
+1.00 ldfar s0-f1-o64-r2 0c52277982b3a166
+1.00 ldfar s0-f1-o400-r0 99592ac0c93ff72b
+1.00 ldfar s0-f1-o400-r1 5dde588574704398
+1.00 ldfar s0-f1-o400-r2 3e61d70d566785ad
+1.00 ldfar s0-f2-o0-r0 612a0577b8bd13f0
+1.00 ldfar s0-f2-o0-r1 bdc4075c1946b514
+1.00 ldfar s0-f2-o0-r2 4048d8a52eb6f1f6
+1.00 ldfar s0-f2-o64-r0 9c8f941520f84c3c
+1.00 ldfar s0-f2-o64-r1 3d70aa4fe44b60f4
+1.00 ldfar s0-f2-o64-r2 3bbf059796cf4dbe
+1.00 ldfar s0-f2-o400-r0 2804e041f214e826
+1.00 ldfar s0-f2-o400-r1 301a6224de052143
+1.00 ldfar s0-f2-o400-r2 25eb1d736ac759a1
+1.00 ldfar s1-f0-o0-r0 eb9e3d802fd18789
+1.00 ldfar s1-f0-o0-r1 ed4b52ddf99e4307
+1.00 ldfar s1-f0-o0-r2 58261fe3b0ac2cc1
+1.00 ldfar s1-f0-o64-r0 af4fe21fbb4c58de
+1.00 ldfar s1-f0-o64-r1 d022851f28cc94dc
+1.00 ldfar s1-f0-o64-r2 5d865fa111cff1a9
+1.00 ldfar s1-f0-o400-r0 eaf801f77ea958d3
+1.00 ldfar s1-f0-o400-r1 cdfaf1140cde16e1
+1.00 ldfar s1-f0-o400-r2 00358a9f8deb3b88
+1.00 ldfar s1-f1-o0-r0 03ed8d0b8af88a4e
+1.00 ldfar s1-f1-o0-r1 6a025067702ac7fc
+1.00 ldfar s1-f1-o0-r2 e2304327efbdc970
+1.00 ldfar s1-f1-o64-r0 70f728f200a3ac4d
+1.00 ldfar s1-f1-o64-r1 94fbdf768f8a5fcc
+1.00 ldfar s1-f1-o64-r2 db306bc83ae91c8e
+1.00 ldfar s1-f1-o400-r0 c8badd2f2a40bb82
+1.00 ldfar s1-f1-o400-r1 10716cadaf78b022
+1.00 ldfar s1-f1-o400-r2 a4d2d7afb60e57a0
+1.00 ldfar s1-f2-o0-r0 5c04373fd88d39d7
+1.00 ldfar s1-f2-o0-r1 b3823b2f9c9939a3
+1.00 ldfar s1-f2-o0-r2 82f90731da89103a
+1.00 ldfar s1-f2-o64-r0 c198a6aa66112d41
+1.00 ldfar s1-f2-o64-r1 d8636c69eca92cb8
+1.00 ldfar s1-f2-o64-r2 936f2daa94d75ed1
+1.00 ldfar s1-f2-o400-r0 0f4248e778ba4177
+1.00 ldfar s1-f2-o400-r1 f49b2a33b8fe65ca
+1.00 ldfar s1-f2-o400-r2 e66237770ac52fbb
+1.00 mid22 s0-f0-o0-r0 a00068b5ea8e8fe1
+1.00 mid22 s0-f0-o0-r1 20579140553b537b
+1.00 mid22 s0-f0-o0-r2 e5c3b49816fca8bd
+1.00 mid22 s0-f0-o64-r0 a57384195559e098
+1.00 mid22 s0-f0-o64-r1 10c1eb41af6e3322
+1.00 mid22 s0-f0-o64-r2 572421c98897b655
+1.00 mid22 s0-f0-o400-r0 5468a64c7ad29bef
+1.00 mid22 s0-f0-o400-r1 9639cff2588fb4fe
+1.00 mid22 s0-f0-o400-r2 aecbbbef7c0a834b
+1.00 mid22 s0-f1-o0-r0 2c7e5e89f69b9679
+1.00 mid22 s0-f1-o0-r1 8e7e327c67ee282e
+1.00 mid22 s0-f1-o0-r2 7959980d1a657309
+1.00 mid22 s0-f1-o64-r0 3cc20c36a32cb9a6
+1.00 mid22 s0-f1-o64-r1 a432db3498e00571
+1.00 mid22 s0-f1-o64-r2 42547a84625fc4bf
+1.00 mid22 s0-f1-o400-r0 7ba2d8f976c434f1
+1.00 mid22 s0-f1-o400-r1 d274b75c1de15515
+1.00 mid22 s0-f1-o400-r2 63315c8969ef1895
+1.00 mid22 s0-f2-o0-r0 0e12d75873ce35e0
+1.00 mid22 s0-f2-o0-r1 6bc1d69efb08b5e2
+1.00 mid22 s0-f2-o0-r2 ee4a59a2e8585777
+1.00 mid22 s0-f2-o64-r0 32a2088dff3756c1
+1.00 mid22 s0-f2-o64-r1 4dca949d01f69a37
+1.00 mid22 s0-f2-o64-r2 f3cfa8a2e1e27bfa
+1.00 mid22 s0-f2-o400-r0 a0a380308113c7d7
+1.00 mid22 s0-f2-o400-r1 9499dbe26c4fc2ce
+1.00 mid22 s0-f2-o400-r2 6b2c59f1d28dec18
+1.00 mid22 s1-f0-o0-r0 83353bb4aa3a8fad
+1.00 mid22 s1-f0-o0-r1 f7bcf4520755384b
+1.00 mid22 s1-f0-o0-r2 344eb4d6291649fd
+1.00 mid22 s1-f0-o64-r0 c1abac1081382cc1
+1.00 mid22 s1-f0-o64-r1 c0288d2e6c270ef7
+1.00 mid22 s1-f0-o64-r2 eba12aef9fd555a2
+1.00 mid22 s1-f0-o400-r0 13e025e502692380
+1.00 mid22 s1-f0-o400-r1 7a5496577f37f6bf
+1.00 mid22 s1-f0-o400-r2 a2b239e00574275c
+1.00 mid22 s1-f1-o0-r0 56c46645dc387b87
+1.00 mid22 s1-f1-o0-r1 bd7ecc87f4ee0ff0
+1.00 mid22 s1-f1-o0-r2 5d4063bf4efd944c
+1.00 mid22 s1-f1-o64-r0 ae3d4f9a7485439d
+1.00 mid22 s1-f1-o64-r1 8afbf53c476c3d5e
+1.00 mid22 s1-f1-o64-r2 a776bdd85f26c4aa
+1.00 mid22 s1-f1-o400-r0 6d684939b6224680
+1.00 mid22 s1-f1-o400-r1 11c6a541b34ddf49
+1.00 mid22 s1-f1-o400-r2 c989a42d82ae7095
+1.00 mid22 s1-f2-o0-r0 02a12a54d7eea422
+1.00 mid22 s1-f2-o0-r1 1a6f3f11df648b6b
+1.00 mid22 s1-f2-o0-r2 111ce58ab020cb99
+1.00 mid22 s1-f2-o64-r0 2645f45972570874
+1.00 mid22 s1-f2-o64-r1 74ca97c62a84eebc
+1.00 mid22 s1-f2-o64-r2 871c8e6b9f7b637c
+1.00 mid22 s1-f2-o400-r0 2440afe6c9ed63db
+1.00 mid22 s1-f2-o400-r1 00a4b1b547394fda
+1.00 mid22 s1-f2-o400-r2 1859af3ccb42f821
+1.00 split25 s0-f0-o0-r0 b2330d040ad6507b
+1.00 split25 s0-f0-o0-r1 478526d144119a74
+1.00 split25 s0-f0-o0-r2 c85c25dd55edc63d
+1.00 split25 s0-f0-o64-r0 a6714500de81ddfe
+1.00 split25 s0-f0-o64-r1 ee07ea9bb972f591
+1.00 split25 s0-f0-o64-r2 21bc1c0b6b51d0d3
+1.00 split25 s0-f0-o400-r0 b155dca286c814b3
+1.00 split25 s0-f0-o400-r1 d57bd3bf2d467d69
+1.00 split25 s0-f0-o400-r2 05bd76df346c831f
+1.00 split25 s0-f1-o0-r0 3b3b4db008c2205d
+1.00 split25 s0-f1-o0-r1 0d80029e10e3a9cf
+1.00 split25 s0-f1-o0-r2 033a0462150ced6c
+1.00 split25 s0-f1-o64-r0 db5ffc3559b9aef5
+1.00 split25 s0-f1-o64-r1 933a6c1e7f51d9ec
+1.00 split25 s0-f1-o64-r2 ebc3476d1889aa04
+1.00 split25 s0-f1-o400-r0 448825b8defdac77
+1.00 split25 s0-f1-o400-r1 95f5af0673728070
+1.00 split25 s0-f1-o400-r2 0ac2a2cd24faa8a5
+1.00 split25 s0-f2-o0-r0 a9de0c112ee3dff4
+1.00 split25 s0-f2-o0-r1 a9951fd963055044
+1.00 split25 s0-f2-o0-r2 ecf2efaf6fe70780
+1.00 split25 s0-f2-o64-r0 2e14ea60361d9334
+1.00 split25 s0-f2-o64-r1 1dfd7517e0db1d71
+1.00 split25 s0-f2-o64-r2 bc83af3021e19671
+1.00 split25 s0-f2-o400-r0 ed08cb75299a573d
+1.00 split25 s0-f2-o400-r1 ae9011a484d8856d
+1.00 split25 s0-f2-o400-r2 a49e6c4580e28445
+1.00 split25 s1-f0-o0-r0 4e88432166bf8fc0
+1.00 split25 s1-f0-o0-r1 e8d7716300f9c002
+1.00 split25 s1-f0-o0-r2 eaad3dbd865b1abb
+1.00 split25 s1-f0-o64-r0 8988a0590709ea1c
+1.00 split25 s1-f0-o64-r1 c1fef41072691984
+1.00 split25 s1-f0-o64-r2 bc9172e012ca3964
+1.00 split25 s1-f0-o400-r0 658a892bf862dfe6
+1.00 split25 s1-f0-o400-r1 19a4e2275bee30a9
+1.00 split25 s1-f0-o400-r2 3f6c18bc92ca52e6
+1.00 split25 s1-f1-o0-r0 3f13b69a93d65bf2
+1.00 split25 s1-f1-o0-r1 65a42380922525a6
+1.00 split25 s1-f1-o0-r2 5a7c99c356b880e8
+1.00 split25 s1-f1-o64-r0 622b12e9d3e5248e
+1.00 split25 s1-f1-o64-r1 7d6f8ce4cf6261b5
+1.00 split25 s1-f1-o64-r2 3eadf662ed7065dd
+1.00 split25 s1-f1-o400-r0 4b4087796d7aaa82
+1.00 split25 s1-f1-o400-r1 d274bf51dcf259b0
+1.00 split25 s1-f1-o400-r2 97d65738950f46f1
+1.00 split25 s1-f2-o0-r0 1da89c9a0ec9bb9f
+1.00 split25 s1-f2-o0-r1 7c415f8d80fbe78c
+1.00 split25 s1-f2-o0-r2 85087da7d7e3c502
+1.00 split25 s1-f2-o64-r0 5919a5835d86c155
+1.00 split25 s1-f2-o64-r1 a89ee9fce8e523b1
+1.00 split25 s1-f2-o64-r2 1be9680e7b621d9b
+1.00 split25 s1-f2-o400-r0 50fb5755f7becc33
+1.00 split25 s1-f2-o400-r1 bb0e6003d79bf6e0
+1.00 split25 s1-f2-o400-r2 615c267715ccc406
+1.00 faith s0-f0-o0-r0 d9ad9ef84c044959
+1.00 faith s0-f0-o0-r1 d9ad9ef84c044959
+1.00 faith s0-f0-o0-r2 d9ad9ef84c044959
+1.00 faith s0-f0-o64-r0 eba6b923bcd71b59
+1.00 faith s0-f0-o64-r1 eba6b923bcd71b59
+1.00 faith s0-f0-o64-r2 eba6b923bcd71b59
+1.00 faith s0-f0-o400-r0 ee88a632724fccfe
+1.00 faith s0-f0-o400-r1 ee88a632724fccfe
+1.00 faith s0-f0-o400-r2 ee88a632724fccfe
+1.00 faith s0-f1-o0-r0 66a71c34f53e2c39
+1.00 faith s0-f1-o0-r1 66a71c34f53e2c39
+1.00 faith s0-f1-o0-r2 66a71c34f53e2c39
+1.00 faith s0-f1-o64-r0 2e2b8fad964459c0
+1.00 faith s0-f1-o64-r1 2e2b8fad964459c0
+1.00 faith s0-f1-o64-r2 2e2b8fad964459c0
+1.00 faith s0-f1-o400-r0 ea485408297222fb
+1.00 faith s0-f1-o400-r1 ea485408297222fb
+1.00 faith s0-f1-o400-r2 ea485408297222fb
+1.00 faith s0-f2-o0-r0 37f9eb304c7cdca5
+1.00 faith s0-f2-o0-r1 37f9eb304c7cdca5
+1.00 faith s0-f2-o0-r2 5af60ef7c7bff062
+1.00 faith s0-f2-o64-r0 21c2bc399a722a1e
+1.00 faith s0-f2-o64-r1 21c2bc399a722a1e
+1.00 faith s0-f2-o64-r2 8b947067963e2127
+1.00 faith s0-f2-o400-r0 b08e015646a0fc97
+1.00 faith s0-f2-o400-r1 b08e015646a0fc97
+1.00 faith s0-f2-o400-r2 1cd507dd70765249
+1.00 faith s1-f0-o0-r0 88d3c88ae0c6ab00
+1.00 faith s1-f0-o0-r1 88d3c88ae0c6ab00
+1.00 faith s1-f0-o0-r2 4b7c6c1099b58b66
+1.00 faith s1-f0-o64-r0 84074d9f91a0f268
+1.00 faith s1-f0-o64-r1 84074d9f91a0f268
+1.00 faith s1-f0-o64-r2 c62f71652e39f17b
+1.00 faith s1-f0-o400-r0 bc0d669e9f129109
+1.00 faith s1-f0-o400-r1 bc0d669e9f129109
+1.00 faith s1-f0-o400-r2 54fdd616abd46b90
+1.00 faith s1-f1-o0-r0 d85a54f7a78b51f2
+1.00 faith s1-f1-o0-r1 d85a54f7a78b51f2
+1.00 faith s1-f1-o0-r2 2807b34409b10635
+1.00 faith s1-f1-o64-r0 61a6b97e3854c6bd
+1.00 faith s1-f1-o64-r1 61a6b97e3854c6bd
+1.00 faith s1-f1-o64-r2 70da8061a4cf13be
+1.00 faith s1-f1-o400-r0 de48613c16025ba0
+1.00 faith s1-f1-o400-r1 9946d95b29406840
+1.00 faith s1-f1-o400-r2 044f6cf44cccd9f5
+1.00 faith s1-f2-o0-r0 af9ae2f1a1bb97c4
+1.00 faith s1-f2-o0-r1 af9ae2f1a1bb97c4
+1.00 faith s1-f2-o0-r2 50daba96f0158e59
+1.00 faith s1-f2-o64-r0 aa24a1dd33526390
+1.00 faith s1-f2-o64-r1 aa24a1dd33526390
+1.00 faith s1-f2-o64-r2 3f7fc186ffdb139a
+1.00 faith s1-f2-o400-r0 066555f0872a34d2
+1.00 faith s1-f2-o400-r1 066555f0872a34d2
+1.00 faith s1-f2-o400-r2 f60a5dc56d222f5f
+1.00 faith-fa s0-f0-o0-r0 3507eb9868b2c15b
+1.00 faith-fa s0-f0-o0-r1 7250aedfc482461d
+1.00 faith-fa s0-f0-o0-r2 12f346478de49252
+1.00 faith-fa s0-f0-o64-r0 a9c6d79cf5691bb2
+1.00 faith-fa s0-f0-o64-r1 d9353a2b7cb5862b
+1.00 faith-fa s0-f0-o64-r2 bc1b2a1ee9789da2
+1.00 faith-fa s0-f0-o400-r0 99dfb7ea21b9f45b
+1.00 faith-fa s0-f0-o400-r1 7ef39232fdbe9e88
+1.00 faith-fa s0-f0-o400-r2 917941d9f56e5b8c
+1.00 faith-fa s0-f1-o0-r0 af5a0ebde4409c37
+1.00 faith-fa s0-f1-o0-r1 a6482fd0d22fd1a3
+1.00 faith-fa s0-f1-o0-r2 614a6f849519e9c8
+1.00 faith-fa s0-f1-o64-r0 d72e64870f50863b
+1.00 faith-fa s0-f1-o64-r1 89c89ae0de9e961b
+1.00 faith-fa s0-f1-o64-r2 03270e13eba4ff93
+1.00 faith-fa s0-f1-o400-r0 6b54056de2f4102d
+1.00 faith-fa s0-f1-o400-r1 8028de582b89a163
+1.00 faith-fa s0-f1-o400-r2 760dfc6c87bebde8
+1.00 faith-fa s0-f2-o0-r0 6a38c2cb98cb7117
+1.00 faith-fa s0-f2-o0-r1 7c297af1b51f30e4
+1.00 faith-fa s0-f2-o0-r2 7827f3692f52e8d5
+1.00 faith-fa s0-f2-o64-r0 ab8b25d31d2ebfe4
+1.00 faith-fa s0-f2-o64-r1 a6390cf8fe13cecb
+1.00 faith-fa s0-f2-o64-r2 a9164d8d175faaf4
+1.00 faith-fa s0-f2-o400-r0 bdc971192fd4ef33
+1.00 faith-fa s0-f2-o400-r1 328e02e1f188e6a5
+1.00 faith-fa s0-f2-o400-r2 e1a97fccf48e79b9
+1.00 faith-fa s1-f0-o0-r0 2e81518b9c57281c
+1.00 faith-fa s1-f0-o0-r1 c624295792aed356
+1.00 faith-fa s1-f0-o0-r2 f25b692122a3de40
+1.00 faith-fa s1-f0-o64-r0 dce24f1b591e2c11
+1.00 faith-fa s1-f0-o64-r1 5c71da04a48eba98
+1.00 faith-fa s1-f0-o64-r2 e06ca626c94c8cc3
+1.00 faith-fa s1-f0-o400-r0 1901424e3da1dab2
+1.00 faith-fa s1-f0-o400-r1 ef18e52faab6a859
+1.00 faith-fa s1-f0-o400-r2 e3a65735b05ce7c3
+1.00 faith-fa s1-f1-o0-r0 f450444f59168959
+1.00 faith-fa s1-f1-o0-r1 d9006f9df4ee4ca5
+1.00 faith-fa s1-f1-o0-r2 187c7583aa208ef3
+1.00 faith-fa s1-f1-o64-r0 150dc83e23f448e5
+1.00 faith-fa s1-f1-o64-r1 c03bd1fb491c15c7
+1.00 faith-fa s1-f1-o64-r2 520e75d6e27c7e2c
+1.00 faith-fa s1-f1-o400-r0 c7f05ca39286e1cf
+1.00 faith-fa s1-f1-o400-r1 e4c22408a5db3627
+1.00 faith-fa s1-f1-o400-r2 15138682fe12f811
+1.00 faith-fa s1-f2-o0-r0 b6497eab60b0aa2e
+1.00 faith-fa s1-f2-o0-r1 93d6c140141a91bd
+1.00 faith-fa s1-f2-o0-r2 4be0dd1e784f13e6
+1.00 faith-fa s1-f2-o64-r0 3a89137dd5e0cc9b
+1.00 faith-fa s1-f2-o64-r1 b9cd11f2a077e530
+1.00 faith-fa s1-f2-o64-r2 1257de52e3fc0caa
+1.00 faith-fa s1-f2-o400-r0 d416854de13974e4
+1.00 faith-fa s1-f2-o400-r1 d9b59c435506ab5f
+1.00 faith-fa s1-f2-o400-r2 a25577a03aaf1562
+1.00 faith-r s0-f0-o0-r0 258586d9b37b3f52
+1.00 faith-r s0-f0-o0-r1 258586d9b37b3f52
+1.00 faith-r s0-f0-o0-r2 2207f2515365fe3b
+1.00 faith-r s0-f0-o64-r0 d0d1e407f01c9d49
+1.00 faith-r s0-f0-o64-r1 d0d1e407f01c9d49
+1.00 faith-r s0-f0-o64-r2 5a2e56b09b9d1f6e
+1.00 faith-r s0-f0-o400-r0 578e1d4ccca8425b
+1.00 faith-r s0-f0-o400-r1 578e1d4ccca8425b
+1.00 faith-r s0-f0-o400-r2 a5f6e45abde6ca65
+1.00 faith-r s0-f1-o0-r0 c17f70caa5d3d142
+1.00 faith-r s0-f1-o0-r1 c17f70caa5d3d142
+1.00 faith-r s0-f1-o0-r2 c17f70caa5d3d142
+1.00 faith-r s0-f1-o64-r0 cfecfc0323c696fa
+1.00 faith-r s0-f1-o64-r1 cfecfc0323c696fa
+1.00 faith-r s0-f1-o64-r2 cfecfc0323c696fa
+1.00 faith-r s0-f1-o400-r0 597b48b9b89275c1
+1.00 faith-r s0-f1-o400-r1 597b48b9b89275c1
+1.00 faith-r s0-f1-o400-r2 597b48b9b89275c1
+1.00 faith-r s0-f2-o0-r0 2238f0119bc31b24
+1.00 faith-r s0-f2-o0-r1 2238f0119bc31b24
+1.00 faith-r s0-f2-o0-r2 78ff595fe3ba2947
+1.00 faith-r s0-f2-o64-r0 1c75dc8da54aca09
+1.00 faith-r s0-f2-o64-r1 1c75dc8da54aca09
+1.00 faith-r s0-f2-o64-r2 b14f697c84a9caa6
+1.00 faith-r s0-f2-o400-r0 4ffe1a83c523ea80
+1.00 faith-r s0-f2-o400-r1 4ffe1a83c523ea80
+1.00 faith-r s0-f2-o400-r2 514074fa2f40271b
+1.00 faith-r s1-f0-o0-r0 5a83d2352bee205f
+1.00 faith-r s1-f0-o0-r1 3be319565426d908
+1.00 faith-r s1-f0-o0-r2 2cebae936f1d44ae
+1.00 faith-r s1-f0-o64-r0 d061e7e38365325f
+1.00 faith-r s1-f0-o64-r1 eb4894a2b1baadb9
+1.00 faith-r s1-f0-o64-r2 f45f602c964cc60f
+1.00 faith-r s1-f0-o400-r0 61f7bbeb6763b499
+1.00 faith-r s1-f0-o400-r1 3b54fbcd68653ba9
+1.00 faith-r s1-f0-o400-r2 7cb8eb0bfd84e303
+1.00 faith-r s1-f1-o0-r0 3f0d8ab93a4fe2e4
+1.00 faith-r s1-f1-o0-r1 bf551aeffaf233f9
+1.00 faith-r s1-f1-o0-r2 db9a2b63866af12f
+1.00 faith-r s1-f1-o64-r0 0ab1340bf33ee705
+1.00 faith-r s1-f1-o64-r1 0ab1340bf33ee705
+1.00 faith-r s1-f1-o64-r2 e19357036ae99b4d
+1.00 faith-r s1-f1-o400-r0 42ee723ec7161a36
+1.00 faith-r s1-f1-o400-r1 77cc6f2573f1983b
+1.00 faith-r s1-f1-o400-r2 d355d47b525ef295
+1.00 faith-r s1-f2-o0-r0 2e7e586118764b3f
+1.00 faith-r s1-f2-o0-r1 2e7e586118764b3f
+1.00 faith-r s1-f2-o0-r2 164f7035a8714d86
+1.00 faith-r s1-f2-o64-r0 33a5aeaaf9774a0a
+1.00 faith-r s1-f2-o64-r1 33a5aeaaf9774a0a
+1.00 faith-r s1-f2-o64-r2 815aa59d9bafe3c7
+1.00 faith-r s1-f2-o400-r0 41d840dfe8eabf3a
+1.00 faith-r s1-f2-o400-r1 41d840dfe8eabf3a
+1.00 faith-r s1-f2-o400-r2 83014aca2543e09b
+1.00 faith-fa-r s0-f0-o0-r0 a52ae4147c9625fb
+1.00 faith-fa-r s0-f0-o0-r1 98d741baa1853cb2
+1.00 faith-fa-r s0-f0-o0-r2 426813659411a385
+1.00 faith-fa-r s0-f0-o64-r0 12338c8e70eccb2b
+1.00 faith-fa-r s0-f0-o64-r1 9a69d3304163b062
+1.00 faith-fa-r s0-f0-o64-r2 7c70e3d3cc2fea96
+1.00 faith-fa-r s0-f0-o400-r0 99e1144a24ab527c
+1.00 faith-fa-r s0-f0-o400-r1 9546ae9544260063
+1.00 faith-fa-r s0-f0-o400-r2 acda93aed3e080f4
+1.00 faith-fa-r s0-f1-o0-r0 23a7cdd730111eae
+1.00 faith-fa-r s0-f1-o0-r1 5589c5b252866086
+1.00 faith-fa-r s0-f1-o0-r2 b1c7e8d4c9c18e7a
+1.00 faith-fa-r s0-f1-o64-r0 d19e39f24082fd38
+1.00 faith-fa-r s0-f1-o64-r1 125287213216e534
+1.00 faith-fa-r s0-f1-o64-r2 f0cb343198494071
+1.00 faith-fa-r s0-f1-o400-r0 13c37431ec725f4f
+1.00 faith-fa-r s0-f1-o400-r1 bc4ad1387d258ab6
+1.00 faith-fa-r s0-f1-o400-r2 6a07e2152b56e637
+1.00 faith-fa-r s0-f2-o0-r0 b7a941006ff61a74
+1.00 faith-fa-r s0-f2-o0-r1 7bb7b594d7b1d45c
+1.00 faith-fa-r s0-f2-o0-r2 f2c71cc85732a764
+1.00 faith-fa-r s0-f2-o64-r0 c412a0d2db568ad9
+1.00 faith-fa-r s0-f2-o64-r1 ebc63a62b6108da5
+1.00 faith-fa-r s0-f2-o64-r2 1aa8c335f0388709
+1.00 faith-fa-r s0-f2-o400-r0 369191cb654c05ae
+1.00 faith-fa-r s0-f2-o400-r1 9f0d53ffbe58d482
+1.00 faith-fa-r s0-f2-o400-r2 b0cc3f585ce14aba
+1.00 faith-fa-r s1-f0-o0-r0 7b39d35211eaff74
+1.00 faith-fa-r s1-f0-o0-r1 9e560815cb804a92
+1.00 faith-fa-r s1-f0-o0-r2 c8cef3c6ae7acdc9
+1.00 faith-fa-r s1-f0-o64-r0 80d09a79d7df875b
+1.00 faith-fa-r s1-f0-o64-r1 000f585eee273391
+1.00 faith-fa-r s1-f0-o64-r2 84d318b8aa29ef53
+1.00 faith-fa-r s1-f0-o400-r0 15b5df43300ed0ca
+1.00 faith-fa-r s1-f0-o400-r1 dc71954880cce1e5
+1.00 faith-fa-r s1-f0-o400-r2 a27b5cf503a2bc0d
+1.00 faith-fa-r s1-f1-o0-r0 57ab1aa21b6a5700
+1.00 faith-fa-r s1-f1-o0-r1 6ac1ed91fa175650
+1.00 faith-fa-r s1-f1-o0-r2 e5823397954e0631
+1.00 faith-fa-r s1-f1-o64-r0 c63955a870d4d013
+1.00 faith-fa-r s1-f1-o64-r1 c913dd28992999f1
+1.00 faith-fa-r s1-f1-o64-r2 1d0001eddc58c59a
+1.00 faith-fa-r s1-f1-o400-r0 5c54cdf3880ad167
+1.00 faith-fa-r s1-f1-o400-r1 05858349328c4d5e
+1.00 faith-fa-r s1-f1-o400-r2 d7e16cae43cf24fc
+1.00 faith-fa-r s1-f2-o0-r0 2ddb245fbb5e6fd7
+1.00 faith-fa-r s1-f2-o0-r1 cf70bf7ccec3469b
+1.00 faith-fa-r s1-f2-o0-r2 d227f33e1e1ea1b2
+1.00 faith-fa-r s1-f2-o64-r0 58d07f3c11194a90
+1.00 faith-fa-r s1-f2-o64-r1 26c6be1812fe092d
+1.00 faith-fa-r s1-f2-o64-r2 a9b1ce8e56fc6db7
+1.00 faith-fa-r s1-f2-o400-r0 797cd6c44d2e902f
+1.00 faith-fa-r s1-f2-o400-r1 f60e6e2500518d98
+1.00 faith-fa-r s1-f2-o400-r2 513aa7d1f811bc57
+t14 faith dfe39d19c4e9a247
+t14 faith-b dd0de2ae44b6b885
+t14 faith-fa 15898736ad7412ea
+t14 faith-fa-b 2145ae096482d32d
+t14 faith-fa-r 88e03518b790f4d0
+t14 faith-fa-r-b ce29fd53c2f5ddb2
+t14 faith-r d1869e1c9abab538
+t14 faith-r-b a1be1c4a02a89c90
+t14 gld f83789de68f128bb
+t14 gld-b 2a7e36adaa474d06
+t14 gldfa 48c245d65e96d435
+t14 gldfa-b b011ee21f6db8c15
+t14 ldfar 99578e27d849a471
+t14 ldfar-b 748e3055227864bd
+t14 ldr 4fc49e99ee6d3da0
+t14 ldr-b ecd30e77536e35ba
+t14 lru-lfu eb66e424adf86091
+t14 lru-lfu-b addcb870cfb3bd2e
+t14 lru-sized 21a42d8b03dd8c1a
+t14 lru-sized-b f867bbcad56d6786
+t14 mid21 5ed6e37e48d1e765
+t14 mid21-b c2f833e5e360bd00
+t14 mid22 50eee8830c46c2b2
+t14 mid22-b 4d501ab4231aa3c7
+t14 q2 188021450c924c30
+t14 q2-b aa6d33b79efa87f7
+t14 q2far 66cbb139d297780e
+t14 q2far-b 785daa44dc037f4d
+t14 q2full f407ed8f458e56b1
+t14 q2full-b debea905b06bcfec
+t14 q2gh 385f2a347c751d75
+t14 q2gh-b 58b3132f94a9aa96
+t14 s3 8985cbb03cfde1c3
+t14 s3-b 54f65b819e7c3629
+t14 s3gh 148174b00fce46cd
+t14 s3gh-b 6a12721dc70ae84d
+t14 split25 1cf1faf97c43d887
+t14 split25-b 8b4ca73f9aecd9ea

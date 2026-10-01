@@ -42,6 +42,8 @@ pub(crate) mod compact_frequency_chain;
 mod measure_overhead;
 #[cfg(test)]
 mod golden;
+#[cfg(all(test, feature = "hybrid_cache_common", not(feature = "eviction_stacks_pmem")))]
+pub(crate) mod tier_golden;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod lru_lfu_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]

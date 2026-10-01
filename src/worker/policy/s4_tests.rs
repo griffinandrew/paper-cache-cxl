@@ -2316,6 +2316,11 @@ mod t14 {
 	/// The script: the LFU prefix, then `OPS` ops drawn from a fixed LCG --
 	/// T14's mix, or with `b` T14b's (`script_b_op`).
 	fn script(name: &str, policy: PaperPolicy, tiered: bool, seed: u64, b: bool) {
+		emit(name, &script_lines(policy, tiered, seed, b), OPS);
+	}
+
+	/// `script`'s record: one line per op.
+	fn script_lines(policy: PaperPolicy, tiered: bool, seed: u64, b: bool) -> Vec<String> {
 		// Its inline landings count in the process-wide migration counters,
 		// which other tests assert exact deltas on under this lock.
 		let _serialised = migration_test_lock::lock();
@@ -2444,20 +2449,26 @@ mod t14 {
 			n += 1;
 		}
 
-		emit(name, &run.lines, OPS);
+		run.lines
 	}
 
-	/// A script's record: its hash printed, and with `PAPER_T14_DIR` set its
-	/// file written.
-	fn emit(name: &str, lines: &[String], ops: usize) {
-		let text = lines.join("\n") + "\n";
-
+	/// FNV-1a of a script's text: the hash `emit` prints.
+	fn fnv64(text: &str) -> u64 {
 		let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
 
 		for byte in text.bytes() {
 			hash ^= byte as u64;
 			hash = hash.wrapping_mul(0x0100_0000_01b3);
 		}
+
+		hash
+	}
+
+	/// A script's record: its hash printed, and with `PAPER_T14_DIR` set its
+	/// file written.
+	fn emit(name: &str, lines: &[String], ops: usize) {
+		let text = lines.join("\n") + "\n";
+		let hash = fnv64(&text);
 
 		println!("T14 {name} ops={ops} fnv64={hash:016x}");
 
@@ -2855,5 +2866,65 @@ mod t14 {
 		], |(name, policy, seed)| {
 			script(name, policy, false, seed, false);
 		});
+	}
+
+	/// R4, step 0: T14's two scripts for the nineteen designs it did not cover
+	/// -- every tiered design but LRU, FIFO, CLOCK and LFU -- recorded from the
+	/// stacks as they were before any was ported (`tier_goldens.txt`) and
+	/// required of each one that is. There is no second store to differ from
+	/// (the merged store has only those four orders), so the files are not
+	/// compared across builds: what is pinned is each script's hash, per
+	/// design, in the DashMap builds. `PAPER_T14X_DIR` writes the files, for
+	/// bisecting a hash that moved; `PAPER_TIER_GOLDEN_OUT` records.
+	#[cfg(not(any(feature = "merged_object_store", feature = "eviction_stacks_pmem")))]
+	fn script_x(name: &str, policy: PaperPolicy, seed: u64) {
+		use super::super::policy_stack::tier_golden;
+
+		for (file, b, seed) in [(name.to_string(), false, seed), (format!("{name}-b"), true, seed + 20)] {
+			let text = script_lines(policy, true, seed, b).join("\n") + "\n";
+			let hash = fnv64(&text);
+
+			println!("T14x {file} ops={OPS} fnv64={hash:016x}");
+
+			if let Some(dir) = std::env::var_os("PAPER_T14X_DIR") {
+				let path = std::path::Path::new(&dir).join(format!("{file}.txt"));
+				std::fs::write(&path, &text).unwrap_or_else(|e| panic!("writing {path:?}: {e}"));
+			}
+
+			tier_golden::check_script(&file, hash);
+		}
+	}
+
+	#[cfg(not(any(feature = "merged_object_store", feature = "eviction_stacks_pmem")))]
+	macro_rules! t14x {
+		($($test:ident: $name:literal, $policy:expr, $seed:literal;)*) => {$(
+			#[test]
+			fn $test() {
+				script_x($name, $policy, $seed);
+			}
+		)*};
+	}
+
+	#[cfg(not(any(feature = "merged_object_store", feature = "eviction_stacks_pmem")))]
+	t14x! {
+		t14x_lru_lfu_scripts: "lru-lfu", PaperPolicy::LruLfuCompactHybrid(3), 61;
+		t14x_lru_sized_scripts: "lru-sized", PaperPolicy::LruSizedCompactHybrid, 62;
+		t14x_q2_scripts: "q2", PaperPolicy::TwoQCompactHybrid(0.25), 63;
+		t14x_q2gh_scripts: "q2gh", PaperPolicy::TwoQGhostCompactHybrid(0.25), 64;
+		t14x_q2far_scripts: "q2far", PaperPolicy::TwoQFastAdmissionReprieveCompactHybrid(0.25), 65;
+		t14x_q2full_scripts: "q2full", PaperPolicy::TwoQFullFastAdmissionCompactHybrid(0.25, 0.5), 66;
+		t14x_s3_scripts: "s3", PaperPolicy::S3FifoCompactHybrid(0.1), 67;
+		t14x_s3gh_scripts: "s3gh", PaperPolicy::S3FifoGhostCompactHybrid(0.1), 68;
+		t14x_gld_scripts: "gld", PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(0.1), 69;
+		t14x_gldfa_scripts: "gldfa", PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(0.1), 70;
+		t14x_mid21_scripts: "mid21", PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybrid(0.1), 71;
+		t14x_ldr_scripts: "ldr", PaperPolicy::S3FifoLazyDemotionReprieveCompactHybrid(0.1), 72;
+		t14x_ldfar_scripts: "ldfar", PaperPolicy::S3FifoLazyDemotionFastAdmissionReprieveCompactHybrid(0.1), 73;
+		t14x_mid22_scripts: "mid22", PaperPolicy::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybrid(0.1), 74;
+		t14x_split25_scripts: "split25", PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(0.1), 75;
+		t14x_faith_scripts: "faith", PaperPolicy::S3FifoFaithfulCompactHybrid(0.1), 76;
+		t14x_faith_fa_scripts: "faith-fa", PaperPolicy::S3FifoFaithfulFastAdmissionCompactHybrid(0.1), 77;
+		t14x_faith_r_scripts: "faith-r", PaperPolicy::S3FifoFaithfulReprieveCompactHybrid(0.1), 78;
+		t14x_faith_fa_r_scripts: "faith-fa-r", PaperPolicy::S3FifoFaithfulFastAdmissionReprieveCompactHybrid(0.1), 79;
 	}
 }
