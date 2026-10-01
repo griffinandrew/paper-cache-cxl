@@ -214,12 +214,12 @@ fn evict_all_drained(worker: &mut Worker) -> (Vec<HashedKey>, Vec<TaggedMigratio
 }
 
 /// A real tiered cache with an admission configuration.
-fn cache_with(policy: PaperPolicy, fast: CacheSize, config: GateConfig) -> PaperCache<u64, TieredBuffer> {
+pub(super) fn cache_with(policy: PaperPolicy, fast: CacheSize, config: GateConfig) -> PaperCache<u64, TieredBuffer> {
 	PaperCache::<u64, TieredBuffer>::new_with_gate(1 << 20, CacheTierSize::Bytes(fast), policy, config)
 		.expect("a tiered cache")
 }
 
-fn evict_to_fit() -> GateConfig {
+pub(super) fn evict_to_fit() -> GateConfig {
 	let mut config = GateConfig::default();
 	config.on_metadata_overflow = MetadataOverflow::EvictToFit;
 	config

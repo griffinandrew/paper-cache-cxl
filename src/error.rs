@@ -58,8 +58,10 @@ pub enum CacheError {
 	/// A NEW key's metadata would not fit the fast tier: the cache's DRAM
 	/// metadata is at its ceiling (`gate::key_ceiling`) and the cache's
 	/// `on_metadata_overflow` is `Error` (the default), or `EvictToFit`
-	/// found nothing to evict or no progress within its window. Nothing was
-	/// allocated or sent; overwrites, gets and deletes continue (S5).
+	/// found nothing to evict or no progress within its window -- or, for
+	/// `PaperCache::reserve_set` (S9), the deadline passed while it waited.
+	/// Nothing was allocated or sent; overwrites, gets and deletes continue
+	/// (S5).
 	#[error("the metadata of a new key would not fit the fast tier")]
 	MetadataOverflow,
 
@@ -76,6 +78,11 @@ pub enum CacheError {
 	/// the wait), and the
 	/// cache's `on_stall` is `Error` (the default). Nothing was allocated or
 	/// sent (S5).
+	///
+	/// Also what `PaperCache::reserve_set` returns when its DEADLINE passes
+	/// while the set waits for room in the fast tier (S9): the tier stayed full
+	/// -- whether or not anything was being freed -- for as long as the caller
+	/// would wait, whatever `on_stall` is.
 	#[error("the fast tier freed nothing for the gate's stall window")]
 	FastTierStalled,
 

@@ -48,13 +48,13 @@ use Tier::{Fast, Slow};
 type Cache = PaperCache<u64, TieredBuffer>;
 
 /// The fast tier, the M held under it, and so eff = 960 KiB.
-const TIER: CacheSize = 1 << 20;
-const M0: u64 = 64 * 1024;
+pub(super) const TIER: CacheSize = 1 << 20;
+pub(super) const M0: u64 = 64 * 1024;
 
 /// The value length most sets use, and a cache size with room for every
 /// value: nothing is evicted by size.
-const LEN: usize = 4_096;
-const MAX: CacheSize = 256 << 20;
+pub(super) const LEN: usize = 4_096;
+pub(super) const MAX: CacheSize = 256 << 20;
 
 /// What exact P may read under the truth: one shard's unfolded balance for
 /// each thread that can fold at once -- a client and the two consumers (the
@@ -68,7 +68,7 @@ fn alone(test: &str, body: impl FnOnce()) {
 /// The byte gate on, with `window` and `on_stall`; the measured model, whose M
 /// `override_m` holds. The lib's test builds default to `Off` (P is shared
 /// with every test running beside them), so each test opts in here.
-fn gated(window: Duration, on_stall: OnStall) -> GateConfig {
+pub(super) fn gated(window: Duration, on_stall: OnStall) -> GateConfig {
 	let mut config = GateConfig::default();
 	config.mode = GateMode::Block;
 	config.metadata_model = MetadataModel::Measured;
@@ -82,23 +82,23 @@ fn build(policy: PaperPolicy, config: GateConfig) -> Cache {
 }
 
 /// `build`, once the worker has enabled the byte gate.
-fn cache(policy: PaperPolicy, config: GateConfig) -> Cache {
+pub(super) fn cache(policy: PaperPolicy, config: GateConfig) -> Cache {
 	let cache = build(policy, config);
 	wait_for("the byte gate to enable", Duration::from_secs(10), || cache.hybrid_stats().gate_state == GateState::Enabled);
 	cache
 }
 
 /// What one `LEN`-byte value charges P.
-fn v() -> CacheSize {
+pub(super) fn v() -> CacheSize {
 	phys::value_charge::<u64>(LEN as u32)
 }
 
 /// P, exact, as the gate reads it.
-fn p() -> CacheSize {
+pub(super) fn p() -> CacheSize {
 	phys::fast_bytes_signed().max(0) as CacheSize
 }
 
-fn value(key: u64) -> Vec<u8> {
+pub(super) fn value(key: u64) -> Vec<u8> {
 	vec![key as u8; LEN]
 }
 
@@ -107,7 +107,7 @@ fn value(key: u64) -> Vec<u8> {
 /// after it the next fast set of a `LEN`-byte value waits. Returns the next
 /// key. For the designs that admit new keys fast (not LFU, whose latch sends
 /// them slow once the tier is full).
-fn fill(cache: &Cache, mut next: u64) -> u64 {
+pub(super) fn fill(cache: &Cache, mut next: u64) -> u64 {
 	let b = cache.hybrid_stats().band_b;
 	let limit = next + 10_000;
 
@@ -133,7 +133,7 @@ fn quiesce(cache: &Cache) {
 	wait_for("the migrations to land", Duration::from_secs(10), || cache.migrations_in_flight() == 0);
 }
 
-fn waiters(cache: &Cache) -> u64 {
+pub(super) fn waiters(cache: &Cache) -> u64 {
 	cache.hybrid_stats().waiters
 }
 

@@ -3473,7 +3473,9 @@ where
 		let omega = status.hybrid_shared_overhead();
 		let k_max = gate::key_ceiling(model, omega, c_meta, m_model, stack.len() as u64, l_pub, pass.l_hw);
 
-		let bands = (state == GateState::Enabled).then(|| gate::bands(eff, &config));
+		// S9: the near band is widened by the setters a server has registered
+		// (`PaperCache::register_setter`) -- none, no change.
+		let bands = (state == GateState::Enabled).then(|| gate.bands_for(eff, &config));
 
 		gate.publish(
 			gate::Published { model, m_model, eff, eff_small, eff_large, k_max, bands },
@@ -6516,6 +6518,12 @@ mod s5_gate_tests;
 // Backpressure plan S8: the migration statistics, per cache.
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod s8_tests;
+
+// Backpressure plan S9 (T16): the library half of the server's SET permit --
+// reserve, fill in place, commit; abandoning a set; the deadline; the live-setter
+// count. Each test that reads P alone in a child process.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod s9_tests;
 
 // S4's follow-ups: a flat cache over the merged store through a real worker,
 // reaper and wipe -- in every merged build, the flat-merged one included.

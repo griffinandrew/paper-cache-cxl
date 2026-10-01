@@ -8,6 +8,11 @@
 
 #![cfg_attr(any(feature = "all_dram", feature = "key_value_pmem", feature = "eviction_stacks_pmem", feature = "merged_object_store", feature = "hybrid_cache_common"), feature(allocator_api), feature(btreemap_alloc))]
 
+// S9: `PendingSet::read_exact_from` reads a request body straight into the
+// value's uninitialized allocation through `BorrowedBuf`, so that no zero-fill
+// is ever written (to CXL, for a slow value). Nightly, as the allocator API is.
+#![cfg_attr(feature = "hybrid_cache_common", feature(read_buf, core_io_borrowed_buf))]
+
 
 /// Node-0-bound jemalloc arenas as the process allocator.
 ///
@@ -109,6 +114,15 @@ pub mod gate;
 
 #[cfg(feature = "hybrid_cache_common")]
 pub use crate::gate::{GateConfig, GateMode, GateState, MetadataModel, MetadataOverflow, OnStall};
+
+/// S9: a set admitted before its value is read -- `PaperCache::reserve_set`,
+/// the permit it returns, the value's allocation the permit hands out to be
+/// written in place, and the live-setter count a server feeds the gate.
+#[cfg(feature = "hybrid_cache_common")]
+pub mod permit;
+
+#[cfg(feature = "hybrid_cache_common")]
+pub use crate::permit::{PendingSet, SetPermit, SetterGuard};
 
 // Shared object-map storage-backend abstraction and value-buffer
 // abstraction (see each module's doc comment) -- used by the generic
@@ -1742,7 +1756,10 @@ where
 	/// built in the fast tier, the byte gate, which holds it to the tier's
 	/// budget and WAITS, FIFO, while the tier is over it, until demotions free
 	/// room (`GateConfig::mode`). Then the value is built and published
-	/// (`commit`).
+	/// (`commit`). It is `reserve_set` with no deadline, the value copied from
+	/// `value` into its allocation, and `commit`: a server that would rather
+	/// admit a set BEFORE it reads the value's bytes does those steps itself
+	/// (see [`PaperCache::reserve_set`]).
 	///
 	/// # Errors
 	///
@@ -1759,9 +1776,9 @@ where
 	/// [`GateConfig::on_stall`]); [`CacheError::Internal`] if the policy worker
 	/// is gone while this set waits, or a worker could not be told.
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
-		let permit = self.begin_set(&key, value.len(), ttl)?;
+		let admission = self.begin_set(&key, value.len(), ttl)?;
 
-		self.commit(permit, key, value)
+		self.commit(admission, key, value)
 	}
 
 	/// The admission half of `set` (S5): everything decided from `key`, the
@@ -1771,7 +1788,25 @@ where
 	/// (`gate::decide`) -- and, for a value to be built fast, the byte gate
 	/// (`admit_bytes`, B2), which may wait in the bytes lane. No lock is held
 	/// across a wait, and nothing has been allocated or sent by then.
-	pub(crate) fn begin_set(&self, key: &K, len: usize, ttl: Option<u32>) -> Result<crate::gate::SetPermit<'_>, CacheError> {
+	pub(crate) fn begin_set(&self, key: &K, len: usize, ttl: Option<u32>) -> Result<crate::gate::Admission<'_>, CacheError> {
+		self.begin_set_until(key, len, ttl, None)
+	}
+
+	/// `begin_set` with a deadline (S9, `reserve_set`): the waits -- in the
+	/// metadata lane, and in the bytes lane -- end at `deadline` at the latest,
+	/// each with its own lane's error: `MetadataOverflow` from the metadata
+	/// lane, `FastTierStalled` from the bytes lane, exactly what each returns
+	/// when its own watchdog gives up -- and, unlike the watchdog's, never an
+	/// `on_stall` action (a set that is out of time is not built slow or
+	/// admitted over the budget). A deadline that has already passed waits not
+	/// at all: a set that would wait fails at once. `None` is `begin_set`.
+	pub(crate) fn begin_set_until(
+		&self,
+		key: &K,
+		len: usize,
+		ttl: Option<u32>,
+		deadline: Option<std::time::Instant>,
+	) -> Result<crate::gate::Admission<'_>, CacheError> {
 		use crate::gate::{self, Verdict};
 
 		let hashed = self.hash_key(key);
@@ -1825,11 +1860,19 @@ where
 						return Err(CacheError::MetadataOverflow);
 					}
 
+					// S9: out of time. The same error as the lane's watchdog.
+					if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+						gate.count_overflow();
+						return Err(CacheError::MetadataOverflow);
+					}
+
 					match &lane {
 						None => lane = Some(gate.meta_lane.enqueue()),
 
 						// Behind another new key: woken when the head leaves.
-						Some(place) if !place.is_head() => gate::park(std::time::Duration::from_millis(100)),
+						Some(place) if !place.is_head() => {
+							gate::park(gate::until(std::time::Duration::from_millis(100), deadline))
+						},
 
 						// The head: ask the worker to evict for it, and wait. A
 						// request that evicted nothing, with the ceiling still
@@ -1846,7 +1889,7 @@ where
 							self.broadcast(WorkerEvent::MakeRoom(request))?;
 							self.status.kick_policy_worker();
 
-							last_evicted = Some(gate::await_room(gate, request, &config)?);
+							last_evicted = Some(gate::await_room(gate, request, &config, deadline)?);
 						},
 					}
 				},
@@ -1860,11 +1903,11 @@ where
 
 		// 4. The byte gate (B2), for a value to be built fast.
 		let (tier, placement, reservation) = match tier {
-			Tier::Fast => self.admit_bytes(hashed, &sizes)?,
+			Tier::Fast => self.admit_bytes(hashed, &sizes, deadline)?,
 			Tier::Slow => (tier, placement, gate::Reservation::none()),
 		};
 
-		Ok(gate::SetPermit { hashed, tier, placement, len, ttl, sizes, reservation })
+		Ok(gate::Admission { hashed, tier, placement, len, ttl, sizes, reservation })
 	}
 
 	/// Step 4 of `begin_set` (S5, commit B2): the byte gate, for a value to be
@@ -1878,11 +1921,14 @@ where
 	/// watchdog ends a wait with nothing freed per `GateConfig::on_stall`;
 	/// `stall_window` 0 acts at once, without waiting. `Internal` if the policy
 	/// worker is gone. Returns the tier and placement to build with and the
-	/// bytes held for the value until it is built.
+	/// bytes held for the value until it is built. A `deadline` (S9) ends the
+	/// wait with `FastTierStalled` -- before it starts, if it has passed --
+	/// whatever `on_stall` is.
 	fn admit_bytes(
 		&self,
 		hashed: HashedKey,
 		sizes: &crate::gate::Sizes,
+		deadline: Option<std::time::Instant>,
 	) -> Result<(Tier, crate::worker::Placement, crate::gate::Reservation<'_>), CacheError> {
 		use crate::gate::{self, Bytes, Watch};
 		use crate::worker::Placement;
@@ -1897,6 +1943,11 @@ where
 		}
 
 		let config = gate.config();
+
+		// S9: out of time before a wait begins.
+		if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+			return Err(CacheError::FastTierStalled);
+		}
 
 		// `stall_window` 0: never wait -- a set that would wait acts at once.
 		if config.stall_window.is_zero() {
@@ -1932,8 +1983,13 @@ where
 
 			let config = gate.config();
 
+			// S9: out of time.
+			if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+				return Err(CacheError::FastTierStalled);
+			}
+
 			match waiter.watch(&config) {
-				Watch::Park(timeout) => gate::park(timeout),
+				Watch::Park(timeout) => gate::park(gate::until(timeout, deadline)),
 				Watch::Stalled => return gate.on_stall(v, config.on_stall),
 			}
 		}
@@ -1943,19 +1999,33 @@ where
 	/// `begin_set` decided on -- in its tier -- inserts it, and sends its
 	/// `Set`, carrying the placement. Then the set-path kick: a policy worker
 	/// parked on its long idle poll is woken by the first set after it.
-	pub(crate) fn commit(&self, permit: crate::gate::SetPermit<'_>, key: K, value: &[u8]) -> Result<(), CacheError> {
-		let crate::gate::SetPermit { hashed: hashed_key, tier, placement, len, ttl, sizes, reservation } = permit;
+	///
+	/// Since S9 the build is the permit's own steps -- the value's allocation
+	/// (`allocate`, charged to P, the byte gate's reservation released), the
+	/// copy of `value` into it, and the commit of the filled value (`PendingSet`)
+	/// -- so a set from a slice and a set a server fills in place are one path.
+	pub(crate) fn commit(&self, admission: crate::gate::Admission<'_>, key: K, value: &[u8]) -> Result<(), CacheError> {
+		debug_assert_eq!(value.len(), admission.len, "commit builds the value begin_set checked");
 
-		debug_assert_eq!(value.len(), len, "commit builds the value begin_set checked");
-		debug_assert_eq!(self.hash_key(&key), hashed_key, "commit builds the key begin_set checked");
+		let mut pending = self.allocate(admission, key);
 
-		let object = Object::new_in(key, value, tier, ttl);
+		pending.write(value);
+		pending.commit()
+	}
 
-		// B2: the value is built -- charged to P if fast -- so the bytes the byte
-		// gate held for it go back (waking the lane's head if anyone waits).
-		drop(reservation);
-		let base_size = sizes.base;
-		let dram_resident = sizes.resident;
+	/// The publish half of a set: `object` -- built from a value copied from a
+	/// slice or written in place -- is inserted, its size charged, and its
+	/// `Set` sent with `placement`; `base_size` and `dram_resident` are its
+	/// `OverheadManager` figures (`begin_set`'s, or the object's own when its
+	/// TTL changed after admission).
+	pub(crate) fn publish_set(
+		&self,
+		hashed_key: HashedKey,
+		object: Object<K, TieredBuffer>,
+		placement: crate::worker::Placement,
+		base_size: ObjectSize,
+		dram_resident: ObjectSize,
+	) -> Result<(), CacheError> {
 		let expiry = object.expiry();
 		// Where the bytes were allocated, for the worker's reconcile
 		// (`WorkerEvent::Set`).

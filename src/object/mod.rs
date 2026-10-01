@@ -299,7 +299,7 @@ impl<K, V> Clone for Object<K, V> {
 }
 
 /// Turns a TTL in seconds into an expiry tick.
-fn expiry_from_ttl(ttl: Option<u32>) -> ExpireTime {
+pub(crate) fn expiry_from_ttl(ttl: Option<u32>) -> ExpireTime {
 	match ttl {
 		Some(0) | None => None,
 		Some(ttl) => Some(get_expiry_from_ttl(ttl)),

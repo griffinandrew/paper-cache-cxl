@@ -45,6 +45,11 @@
 //!      promotes it (the user's decision: no DRAM write, no demotion copy, and
 //!      when metadata fills the tier -- eff = 0 -- no tiering at all).
 //!
+//! All of it runs from the key and the LENGTH, so a server can run it before it
+//! has read the value (S9): `PaperCache::reserve_set` is `begin_set`, with a
+//! DEADLINE for its waits, and `set` is the same admission followed by the
+//! value's allocation, its copy and its commit (`crate::permit`).
+//!
 //! # The key ceiling
 //!
 //! A table keeps its capacity, so M does not fall when a key is evicted, and a
@@ -100,6 +105,14 @@
 //! `Set`); or admitted over the budget (`AdmitOver`). While a stall is
 //! unresolved every waiter and newcomer acts after a short probe with nothing
 //! freed; the worker ends the stall at the first byte freed.
+//!
+//! A wait has one more end (S9), the caller's own: a `reserve_set` DEADLINE.
+//! It ends the wait with the lane's error -- `FastTierStalled` in the bytes
+//! lane, `MetadataOverflow` in the metadata lane -- and never with an
+//! `OnStall` action, and a deadline that has already passed waits not at all.
+//! A server's live setters (`PaperCache::register_setter`) add to
+//! `GateConfig::concurrency_hint` where the near band is computed, so the
+//! fast path's overshoot -- one value per setter in flight -- stays inside it.
 //!
 //! The byte gate is DISABLED -- fast sets are admitted ungated, and
 //! `HybridStats::gate_state` says why ([`GateState`]) -- under `GateMode::Off`;
@@ -158,7 +171,7 @@ use std::{
 	collections::VecDeque,
 	sync::{
 		Arc,
-		atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+		atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
 	},
 	thread::Thread,
 	time::{Duration, Instant},
@@ -341,6 +354,13 @@ pub struct GateConfig {
 	/// Concurrent setters and a typical value size, which widen the near band
 	/// to `concurrency_hint x value_hint` when that is wider: what a server
 	/// with many connections sets (S9). 0.
+	///
+	/// A server need not know its connection count when it builds the cache:
+	/// `PaperCache::register_setter` counts the setters that are live (one per
+	/// accepted connection, released when it closes) and the near band is
+	/// widened by `(concurrency_hint + live setters) x value_hint`. With
+	/// `value_hint` 0 -- the default -- the hint widens nothing, whatever the
+	/// count.
 	pub concurrency_hint: u32,
 	pub value_hint: CacheSize,
 }
@@ -761,6 +781,11 @@ pub(crate) struct Gate {
 	/// Bytes admitted sets hold until their values are built (`Reservation`).
 	reserved: AtomicU64,
 
+	/// Live setters a server has registered (`PaperCache::register_setter`, S9):
+	/// added to `GateConfig::concurrency_hint` where the near band is computed
+	/// (`Gate::bands_for`). 0 for every cache that registers none.
+	setters: AtomicU32,
+
 	/// The bytes lane: fast sets waiting for room, FIFO.
 	pub(crate) bytes_lane: Lane,
 
@@ -854,6 +879,7 @@ impl Default for Gate {
 			band_s: AtomicU64::new(0),
 			band_b: AtomicU64::new(0),
 			reserved: AtomicU64::new(0),
+			setters: AtomicU32::new(0),
 			bytes_lane: Lane::default(),
 			lane_progress: AtomicU64::new(0),
 			passes: AtomicU64::new(0),
@@ -1348,10 +1374,11 @@ pub(crate) struct Sizes {
 /// the tier to build in, the `Set`'s placement, and the inputs it was decided
 /// from -- `commit` builds exactly the object `begin_set` checked -- and (B2)
 /// the fast bytes the byte gate reserved for it, released once the value is
-/// built (or the permit abandoned). Crate-only: the client path is `set`,
-/// which pairs the two at once.
+/// built (or the admission dropped). Crate-only: the client path is `set`,
+/// which pairs the two at once, and a server's is `reserve_set` (S9), whose
+/// `SetPermit` wraps this.
 #[derive(Debug)]
-pub(crate) struct SetPermit<'g> {
+pub(crate) struct Admission<'g> {
 	pub(crate) hashed: HashedKey,
 	pub(crate) tier: Tier,
 	pub(crate) placement: Placement,
@@ -1601,7 +1628,11 @@ pub(crate) fn park(timeout: Duration) {
 /// request whose waiter gave up this way may still be served late, and evict
 /// once for a set that already failed (bounded: each `MakeRoom` evicts only
 /// what the live key count needs).
-pub(crate) fn await_room(gate: &Gate, request: u64, config: &GateConfig) -> Result<u64, CacheError> {
+///
+/// `deadline` (S9, a server's `reserve_set`): `MetadataOverflow` too, once it
+/// has passed with no answer -- the request may still be served late, as
+/// above. `None` for every other caller: no deadline.
+pub(crate) fn await_room(gate: &Gate, request: u64, config: &GateConfig, deadline: Option<Instant>) -> Result<u64, CacheError> {
 	let mut since = Instant::now();
 	let mut progress = gate.worker_progress();
 
@@ -1624,7 +1655,23 @@ pub(crate) fn await_room(gate: &Gate, request: u64, config: &GateConfig) -> Resu
 			return Err(CacheError::MetadataOverflow);
 		}
 
-		park(config.poll_interval.min(config.stall_window.max(Duration::from_micros(1))));
+		if deadline.is_some_and(|deadline| now >= deadline) {
+			gate.count_overflow();
+			return Err(CacheError::MetadataOverflow);
+		}
+
+		park(until(config.poll_interval.min(config.stall_window.max(Duration::from_micros(1))), deadline));
+	}
+}
+
+/// How long a waiter with a `deadline` may park: `timeout`, or what is left
+/// of the deadline if that is less (none at all once it has passed, so the
+/// waiter wakes to find it so). `timeout` itself when there is no deadline,
+/// which is every set that is not a `reserve_set`.
+pub(crate) fn until(timeout: Duration, deadline: Option<Instant>) -> Duration {
+	match deadline {
+		Some(deadline) => timeout.min(deadline.saturating_duration_since(Instant::now())),
+		None => timeout,
 	}
 }
 
@@ -1955,6 +2002,39 @@ impl Gate {
 	/// The byte gate's state.
 	pub(crate) fn state(&self) -> GateState {
 		GateState::from_u8(self.state.load(Ordering::Acquire))
+	}
+
+	/// Live setters (`PaperCache::register_setter`).
+	pub(crate) fn setters(&self) -> u32 {
+		self.setters.load(Ordering::Relaxed)
+	}
+
+	/// One more live setter.
+	pub(crate) fn add_setter(&self) {
+		self.setters.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// One live setter fewer: saturating, so a count that was never added to
+	/// cannot wrap into a near band as wide as the tier.
+	pub(crate) fn remove_setter(&self) {
+		let mut setters = self.setters.load(Ordering::Relaxed);
+
+		while setters > 0 {
+			match self.setters.compare_exchange_weak(setters, setters - 1, Ordering::Relaxed, Ordering::Relaxed) {
+				Ok(_) => break,
+				Err(actual) => setters = actual,
+			}
+		}
+	}
+
+	/// The levels for `eff` under `config`, with the live setters counted into
+	/// its concurrency hint: what the policy worker publishes. With none
+	/// registered it is `bands(eff, config)` exactly.
+	pub(crate) fn bands_for(&self, eff: CacheSize, config: &GateConfig) -> Bands {
+		let mut config = *config;
+
+		config.concurrency_hint = config.concurrency_hint.saturating_add(self.setters());
+		bands(eff, &config)
 	}
 
 	/// The levels as last published (all 0 while the gate is not enabled).

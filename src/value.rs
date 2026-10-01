@@ -188,6 +188,9 @@ use std::{
 	sync::atomic::{AtomicU32, Ordering},
 };
 
+#[cfg(feature = "hybrid_cache_common")]
+use std::mem::{ManuallyDrop, MaybeUninit};
+
 /// The refcount. `triomphe::Arc` rather than `std::sync::Arc` because std's
 /// carries a `weak` count this design never uses, and those 8 bytes are the
 /// difference between the header fitting jemalloc's 32-byte class exactly and
@@ -245,27 +248,7 @@ impl ValueBytes {
 			bytes.len(),
 		);
 
-		let layout = value_layout(bytes.len() as u32);
-
-		// SAFETY: `value_layout` never yields a zero-sized layout, which is
-		// the only precondition either allocator entry point has.
-		let raw = unsafe {
-			match tier {
-				Tier::Fast => fast_alloc(layout),
-				Tier::Slow => slow_alloc(layout),
-			}
-		};
-
-		let Some(ptr) = NonNull::new(raw) else {
-			std::alloc::handle_alloc_error(layout);
-		};
-
-		debug_assert_eq!(
-			ptr.as_ptr().addr() % VALUE_ALIGN,
-			0,
-			"the allocator returned an address that is not {VALUE_ALIGN}-aligned, \
-			 so the tier tag would alias the address itself",
-		);
+		let ptr = alloc_bytes(bytes.len() as u32, tier);
 
 		// SAFETY: `ptr` owns at least `bytes.len()` freshly allocated bytes
 		// (`value_layout` only ever rounds a length UP, to 1), and a fresh
@@ -487,6 +470,47 @@ impl<K> TieredValue<K> {
 		Self::new_in(key, bytes, Tier::Slow, expiry)
 	}
 
+	/// Allocates the bytes of a `len`-byte value in `tier` and leaves them
+	/// UNINITIALIZED, for the caller to write in place (a server reading a
+	/// request body straight off its socket, S9): no zero-fill, which for a
+	/// slow value would be a write to CXL nobody asked for, and no staging
+	/// copy. The allocation is charged to P now, exactly as `new_in` charges
+	/// the one it makes, and the figure travels with it: the
+	/// [`UninitValue`] refunds it if it is dropped unfinished, and the value
+	/// [`UninitValue::assume_init`] builds refunds it, once, when it drops.
+	///
+	/// # Panics
+	///
+	/// If `len` does not fit a `u32`, for the reason `new_in` gives.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub(crate) fn new_uninit_in(key: K, len: usize, tier: Tier) -> UninitValue<K>
+	where
+		K: 'static,
+	{
+		assert!(
+			u32::try_from(len).is_ok(),
+			"a cached value must fit a u32 length; got {len} bytes",
+		);
+
+		let len = len as u32;
+		let ptr = alloc_bytes(len, tier);
+
+		// PHYS_FAST: charged once, at the allocation -- and what is charged
+		// is what is refunded, whichever way this ends.
+		let charge = match tier {
+			Tier::Fast => {
+				let charge = crate::phys::value_charge_for(&key, len);
+
+				crate::phys::charge(charge);
+				charge
+			},
+
+			Tier::Slow => 0,
+		};
+
+		UninitValue { key, ptr, len, tier, charge }
+	}
+
 	/// The same value's bytes, re-copied into `tier`, carrying the key and the
 	/// CURRENT expiry across.
 	///
@@ -650,6 +674,102 @@ impl<K> TieredValue<K> {
 	}
 }
 
+/// A value whose bytes are allocated in their tier and not yet written, and
+/// the key the header will hold: [`TieredValue::new_uninit_in`]'s result.
+/// Write all `len` bytes through [`UninitValue::bytes_mut`], then
+/// [`UninitValue::assume_init`] builds the value around them.
+///
+/// Dropped before that, it frees the bytes to the allocator their tier names
+/// and refunds P exactly what was charged -- a request abandoned half way.
+/// It owns nothing else: the header (`Arc`) is built at `assume_init`, so
+/// there is nothing in the allocation to drop and nothing to unwind.
+#[cfg(feature = "hybrid_cache_common")]
+#[must_use = "an unwritten value is freed and refunded when it drops"]
+pub(crate) struct UninitValue<K> {
+	key: K,
+
+	/// The address of the bytes, untagged.
+	ptr: NonNull<u8>,
+
+	len: u32,
+	tier: Tier,
+
+	/// What `new_uninit_in` charged to P (a fast value's accounted bytes), and
+	/// so what a drop before `assume_init` refunds.
+	charge: u64,
+}
+
+// The allocation is owned exclusively and its free routes on the tier alone,
+// so the value may move to, and be dropped on, any thread.
+#[cfg(feature = "hybrid_cache_common")]
+unsafe impl<K: Send> Send for UninitValue<K> {}
+#[cfg(feature = "hybrid_cache_common")]
+unsafe impl<K: Sync> Sync for UninitValue<K> {}
+
+#[cfg(feature = "hybrid_cache_common")]
+impl<K> UninitValue<K> {
+	/// The value's length in bytes: how many `bytes_mut` hands out.
+	#[inline]
+	pub(crate) fn len(&self) -> usize {
+		self.len as usize
+	}
+
+	/// The tier the bytes were allocated in.
+	#[inline]
+	pub(crate) fn tier(&self) -> Tier {
+		self.tier
+	}
+
+	/// The value's bytes, uninitialized: all `len` of them, to be written
+	/// before `assume_init`.
+	#[inline]
+	pub(crate) fn bytes_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+		// SAFETY: `ptr` names an allocation of at least `len` bytes (`len.max(1)`),
+		// exclusively ours while `self` lives, and a `MaybeUninit<u8>` has no
+		// validity requirement and the alignment of a `u8`.
+		unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().cast::<MaybeUninit<u8>>(), self.len as usize) }
+	}
+
+	/// Builds the value around the bytes, with `expiry`.
+	///
+	/// # Safety
+	///
+	/// All `len` bytes of [`UninitValue::bytes_mut`] must have been written.
+	pub(crate) unsafe fn assume_init(self, expiry: ExpireTime) -> TieredValue<K> {
+		let this = ManuallyDrop::new(self);
+
+		// SAFETY: `this` is never dropped, so the key is moved out exactly
+		// once and the bytes are owned by the header from here on; the P charge
+		// `new_uninit_in` made is the one `ValueHeader::drop` refunds.
+		let key = unsafe { std::ptr::read(&this.key) };
+
+		TieredValue {
+			inner: Arc::new(ValueHeader {
+				key,
+
+				bytes: ValueBytes { word: tag(this.ptr, this.tier) },
+				len: this.len,
+				expiry: AtomicU32::new(expiry.map_or(0, |tick| tick.get())),
+			}),
+		}
+	}
+}
+
+#[cfg(feature = "hybrid_cache_common")]
+impl<K> Drop for UninitValue<K> {
+	fn drop(&mut self) {
+		// PHYS_FAST: the refund for `new_uninit_in`'s charge; `assume_init`
+		// does not run this, so it is once per allocation.
+		if self.charge > 0 {
+			crate::phys::refund(self.charge);
+		}
+
+		// SAFETY: `ptr` came from `alloc_bytes` for this tier and length, and
+		// nothing else owns it.
+		unsafe { ValueBytes { word: tag(self.ptr, self.tier) }.free(self.len) }
+	}
+}
+
 impl<K> std::fmt::Debug for TieredValue<K> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("TieredValue")
@@ -671,6 +791,36 @@ fn value_layout(len: u32) -> Layout {
 	// documents that rather than guarding a reachable case.
 	Layout::from_size_align((len as usize).max(1), VALUE_ALIGN)
 		.expect("a u32 length can always be laid out with 8-byte alignment")
+}
+
+/// Allocates the bytes of a `len`-byte value in `tier`, UNINITIALIZED: the one
+/// place a value's bytes are allocated, for the copy `ValueBytes::new_in`
+/// makes and for the bytes `new_uninit_in` hands out to be written in place.
+/// The address is untagged and `VALUE_ALIGN`-aligned.
+fn alloc_bytes(len: u32, tier: Tier) -> NonNull<u8> {
+	let layout = value_layout(len);
+
+	// SAFETY: `value_layout` never yields a zero-sized layout, which is the
+	// only precondition either allocator entry point has.
+	let raw = unsafe {
+		match tier {
+			Tier::Fast => fast_alloc(layout),
+			Tier::Slow => slow_alloc(layout),
+		}
+	};
+
+	let Some(ptr) = NonNull::new(raw) else {
+		std::alloc::handle_alloc_error(layout);
+	};
+
+	debug_assert_eq!(
+		ptr.as_ptr().addr() % VALUE_ALIGN,
+		0,
+		"the allocator returned an address that is not {VALUE_ALIGN}-aligned, \
+		 so the tier tag would alias the address itself",
+	);
+
+	ptr
 }
 
 /// Folds `tier` into bit 0 of an 8-aligned value address.

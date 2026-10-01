@@ -3680,3 +3680,65 @@ overwrites and deletes, and the refund on drop agree, in both layouts); the slow
 (`tests/merged_object_store_slow_accounting.rs`) also runs with `String` keys, where the store's charge to
 the slow tier equals the allocator's count with the key bytes in it; and `Box<[u8]>` keys end to end across
 the tiers (`tests/generic_key_smoke.rs`).
+
+## The server's SET permit, library half (S9)
+
+`PaperCache::set` takes the value as a slice, so a server has to read a request's body into a buffer of its
+own before the cache can even decide whether to take it -- a buffer no budget covers, and a copy into the
+cache's allocation after it. A server can now admit the set first, then read the body straight into the
+value's final allocation (`src/permit.rs`; the in-repo `src/bin/paper_server.rs` is unchanged: the server
+moves to its own repository, which is where the wire half -- error codes for `FastTierStalled` and
+`MetadataOverflow`, `SO_RCVTIMEO` while a permit is held, `get_with` -- belongs):
+
+- `PaperCache::reserve_set(key, len, ttl, deadline: Instant) -> Result<SetPermit, CacheError>`: everything
+  `set` decides from the key and the LENGTH (`begin_set`: the size checks, the metadata cap, the tier,
+  structural slow placement, the byte gate), waiting at most until `deadline`. Nothing is allocated.
+- `SetPermit::fill(self) -> PendingSet`: allocates the value in the tier decided, UNINITIALIZED (no zero-fill:
+  for a slow value a write to CXL nobody asked for), charges P and gives the gate's reservation back (the
+  bytes are P's now). `PendingSet` hands out the unwritten part as `&mut [MaybeUninit<u8>]` (`unfilled`,
+  `advance`), copies a slice (`write`) or reads straight into it (`read_exact_from`, which is
+  `Read::read_buf_exact` into a `BorrowedBuf`, so a reader that implements `read_buf` itself -- std's sockets,
+  files and slices -- writes into the slot with nothing written first, and the trait's default zero-fills it:
+  the lib enables `read_buf` and `core_io_borrowed_buf` under `hybrid_cache_common`, nightly as the allocator
+  API is; the public surface is stable types).
+- `PendingSet::commit(self)`: inserts exactly as `set` does. A value not written whole panics at its commit
+  (and is abandoned as the panic unwinds): an uninitialized byte is never published. `set_ttl` gives a TTL
+  that was read after the value -- the wire's order is key, value, TTL -- and the commit takes the object's
+  own sizes then (the DRAM charged for a TTL'd object comes and goes) and refuses with `ExceedingValueSize`
+  a value that fit without the TTL and does not with it.
+- Dropping a `SetPermit` releases its reservation; dropping a `PendingSet` at any point frees the
+  allocation to its tier and refunds P what it was charged, once; neither inserts anything (a client that
+  disconnects mid-value). `UninitValue` (`value.rs` and `value_thin.rs`, one per layout, `pub(crate)`) is
+  what makes that so: it owns the allocation and the charge, writes the header only at `assume_init` (so an
+  abandoned item holds nothing to drop; under `thin_header` the key bytes of a bytes-key item are copied at
+  that point too), and `assume_init` hands the charge to the value's own drop.
+- `set` is `reserve_set` with no deadline, the value copied into its allocation (`write`), and `commit`
+  (`allocate`, `commit` and `publish_set` in `lib.rs`): one path for both. `gate::SetPermit`, the crate-only
+  record of what `begin_set` decided, is `gate::Admission` now.
+
+The DEADLINE. A wait ends there with the error of the lane it waits in, the one that lane gives when its own
+watchdog gives up: `CacheError::FastTierStalled` in the bytes lane (the fast tier stayed full) and
+`MetadataOverflow` in the metadata lane (`EvictToFit` found no room in time) -- never an `OnStall` action (a
+set that is out of time is not built slow or admitted over the budget), and a deadline that has already
+passed waits not at all. With `stall_window` 0 and time left, `on_stall` still acts at once. `set` has none.
+The docs of `FastTierStalled` and `MetadataOverflow` say so.
+
+The concurrency hint. `PaperCache::register_setter() -> SetterGuard` counts a live setter (a connection a
+server has accepted) until the guard drops; `live_setters()` reads the count. The policy worker publishes the
+near band with `(concurrency_hint + live setters) x value_hint` (`Gate::bands_for`), so the setters in flight
+when the tier fills overshoot by what the band leaves room for; registering and releasing both kick the worker.
+With no setter registered the band is the configuration's exactly, and with `value_hint` 0 (the default) a
+registered setter widens nothing.
+
+Tests (`worker/policy/s9_tests.rs`, T16's library side; each that reads P alone in a child process): reserve +
+fill + commit and `set` give the same objects, status, stack bytes and P, over `u64` and `String` keys, with
+TTLs, through all three ways to write the slot; a permit dropped before its fill releases its reservation
+and a value dropped after it (unwritten, half written, whole but not committed; fast and slow) refunds P
+exactly once, and neither inserts anything; a part-written value does not commit, and a reader that ends early
+leaves what it delivered; setters running together, a good part of whose sets are abandoned at a random point,
+leave nothing behind (no reservation held, P the stack's fast bytes, only the committed keys); a reserve past
+its deadline fails with `FastTierStalled` (the bytes lane, the tier held full) or `MetadataOverflow` (the
+metadata lane, the worker held), not at the watchdog, not diverted or admitted over, and at once when the
+deadline has passed; a TTL given after the value is the set's and its recheck refuses what it tips over the
+threshold; the registered setters move N as documented and a release narrows it; `bands_for` is `bands` with
+none; and the permit types are `Send`. The tests' docs name the guard each is red without.
