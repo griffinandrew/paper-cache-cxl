@@ -626,10 +626,25 @@ std::thread_local! {
 
 #[cfg(test)]
 std::thread_local! {
+	/// Allocations this thread has made through the pools (`thread_allocs`).
+	/// A `Cell<u64>` with a const initialiser, as the slots above, so that
+	/// counting never allocates.
+	static THREAD_ALLOCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
 	/// Makes `node_arenas` report every pool as unbuilt on this thread, so a
 	/// test can reach the unbound fallback after the pools exist. See
 	/// `tests::ForceUnbound`.
 	static FORCE_UNBOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How many allocations the calling thread has made through the pools (the
+/// global allocator and the explicit slow-tier one), ever: a test that wants
+/// to know whether a code path allocates takes the difference around it. Only
+/// this thread's, so the cache's workers do not count; and zero-size requests
+/// are not allocations.
+#[cfg(all(test, feature = "hybrid_cache_common", not(feature = "stock_jemalloc")))]
+pub(crate) fn thread_allocs() -> u64 {
+	THREAD_ALLOCS.with(std::cell::Cell::get)
 }
 
 /// Number of explicit tcaches created, for observability.
@@ -1042,6 +1057,10 @@ impl<const NODE: u32> NumaAlloc<NODE> {
 		if layout.size() == 0 {
 			return layout.align() as *mut u8;
 		}
+
+		// Test builds only: one more allocation on this thread (`thread_allocs`).
+		#[cfg(test)]
+		THREAD_ALLOCS.with(|count| count.set(count.get() + 1));
 
 		let ptr = match flags_for(NODE, layout.align()) {
 			Some(mut flags) => {

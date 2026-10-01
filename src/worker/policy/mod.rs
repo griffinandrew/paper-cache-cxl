@@ -6525,6 +6525,12 @@ mod s8_tests;
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod s9_tests;
 
+// The borrowed-key API (`crate::key_bytes`): the `*_borrowed` methods, which take
+// the key of a byte-string cache as `&[u8]`. Each test that reads P alone in a
+// child process. Needs the flat caches (`key_value_pmem` or `all_dram`) as well.
+#[cfg(all(test, feature = "hybrid_cache_common", any(feature = "key_value_pmem", feature = "all_dram")))]
+mod borrowed_key_tests;
+
 // S4's follow-ups: a flat cache over the merged store through a real worker,
 // reaper and wipe -- in every merged build, the flat-merged one included.
 #[cfg(all(test, feature = "merged_object_store"))]

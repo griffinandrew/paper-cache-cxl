@@ -315,8 +315,16 @@ pub fn value_charge<K>(len: u32) -> u64 {
 /// does, because the byte gate reserves it at admission. Equal to
 /// [`value_charge`] for every key the item holds as a `K`.
 #[inline]
+#[cfg(any(test, not(feature = "thin_header")))]
 pub(crate) fn value_charge_for<K: 'static>(key: &K, len: u32) -> u64 {
 	crate::object::overhead::resident_item_bytes_for(key, len) as u64
+}
+
+/// [`value_charge_for`] of a key given by its item's prefix (a borrowed byte
+/// string: `TieredValue::item_prefix_bytes_for_bytes`), not by the key.
+#[inline]
+pub(crate) fn value_charge_with(prefix: usize, len: u32) -> u64 {
+	crate::object::overhead::resident_item_bytes_with(prefix, len) as u64
 }
 
 /// The figure P charges for one item of `len` value bytes behind `prefix`

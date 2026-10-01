@@ -34,6 +34,14 @@ pub enum CacheError {
 	#[error("the value size cannot exceed the cache's eviction threshold")]
 	ExceedingValueSize,
 
+	/// A set by a borrowed key (`PaperCache::set_borrowed`,
+	/// `PaperCache::reserve_set_borrowed`) whose bytes no key of the cache's key
+	/// type can hold: only a `String` cache refuses any, those that are not
+	/// UTF-8. Nothing was allocated or sent. A lookup of such bytes is not an
+	/// error, it is a miss: no key is stored under them.
+	#[error("the key's bytes are not a valid key of this cache")]
+	InvalidKey,
+
 	#[error("the cache size cannot be zero")]
 	ZeroCacheSize,
 

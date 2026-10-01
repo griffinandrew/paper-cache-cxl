@@ -113,7 +113,7 @@
 //! `nallocx(32 + 100) = 160` plus the key's own `nallocx(42) = 48`, which
 //! stayed in DRAM whatever the object's tier.
 //!
-//! Which shape a key gets is decided by its TYPE (`key_as_bytes`), and each
+//! Which shape a key gets is decided by its TYPE (`key_bytes::key_as_bytes`), and each
 //! item records it in bit 1 of the header's tagged word, so the free -- which
 //! runs from `Drop` and so cannot ask the key's type anything -- knows which
 //! layout to rebuild. The map row keeps the key's 64-bit hash either way; the
@@ -130,7 +130,6 @@
 
 use std::{
 	alloc::Layout,
-	any::{Any, TypeId},
 	marker::PhantomData,
 	ptr::NonNull,
 	sync::atomic::{AtomicU32, Ordering},
@@ -139,10 +138,17 @@ use std::{
 #[cfg(feature = "hybrid_cache_common")]
 use std::mem::{ManuallyDrop, MaybeUninit};
 
+#[cfg(feature = "hybrid_cache_common")]
+use crate::key_bytes::is_key_bytes_type;
+
 /// The refcount, and the only thing besides the tag that stays in DRAM.
 use triomphe::Arc;
 
-use crate::{Tier, object::ExpireTime};
+use crate::{
+	Tier,
+	key_bytes::{KeyBytes, key_as_bytes, key_from_bytes},
+	object::ExpireTime,
+};
 
 /// Bit 0 of the item-pointer word: set means the slow tier, clear the fast one.
 const SLOW_BIT: usize = 0b1;
@@ -280,51 +286,6 @@ const _: () = assert!(std::mem::offset_of!(ItemHeader<[u64; 8]>, expiry) == 4);
 const _: () = assert!(std::mem::offset_of!(BytesItemHeader, len) == 0);
 const _: () = assert!(std::mem::offset_of!(BytesItemHeader, expiry) == 4);
 const _: () = assert!(std::mem::size_of::<BytesItemHeader>() == 12);
-
-/// The key's bytes, if `K` is a type whose item holds its key as bytes: one
-/// that owns a heap buffer the item would otherwise only point at. `None` for
-/// every other key, which the item holds as a `K`.
-///
-/// Decided by the key's TYPE. Once `K` is monomorphised the `TypeId`
-/// comparisons behind `downcast_ref` are constants, so this costs nothing at
-/// run time.
-fn key_as_bytes<K: 'static>(key: &K) -> Option<&[u8]> {
-	let key = key as &dyn Any;
-
-	if let Some(key) = key.downcast_ref::<String>() {
-		return Some(key.as_bytes());
-	}
-
-	if let Some(key) = key.downcast_ref::<Vec<u8>>() {
-		return Some(key);
-	}
-
-	key.downcast_ref::<Box<[u8]>>().map(|key| &**key)
-}
-
-/// Rebuilds an owned key from the bytes an item holds for it: the inverse of
-/// [`key_as_bytes`], for the types it accepts.
-///
-/// # Panics
-///
-/// If `K` is not one of those types -- which cannot happen for an item that
-/// set `KEY_BYTES_BIT`, since only [`key_as_bytes`] sets it.
-fn key_from_bytes<K: 'static>(bytes: &[u8]) -> K {
-	let id = TypeId::of::<K>();
-
-	let key: Box<dyn Any> = if id == TypeId::of::<String>() {
-		// They were a `String`'s `as_bytes` when the item was built.
-		Box::new(String::from_utf8(bytes.to_vec()).expect("a String key's bytes are UTF-8"))
-	} else if id == TypeId::of::<Vec<u8>>() {
-		Box::new(bytes.to_vec())
-	} else if id == TypeId::of::<Box<[u8]>>() {
-		Box::new(Box::<[u8]>::from(bytes))
-	} else {
-		unreachable!("only the key types key_as_bytes accepts are held as bytes")
-	};
-
-	*key.downcast::<K>().expect("rebuilt as the key type it was asked for")
-}
 
 // ---------------------------------------------------------------------------
 // the DRAM header: refcounted by `Arc`, owns the item
@@ -645,6 +606,20 @@ impl<K> TieredValue<K> {
 		value
 	}
 
+	/// Builds a value from a BORROWED key: [`TieredValue::new_in`] for a byte-string
+	/// key given as its bytes. The item holds them, so they are copied into it
+	/// once and no `K` is built.
+	///
+	/// # Panics
+	///
+	/// As [`TieredValue::new_in`].
+	pub fn new_in_bytes(key: &[u8], bytes: &[u8], tier: Tier, expiry: ExpireTime) -> Self
+	where
+		K: KeyBytes,
+	{
+		Self::new_with_key_bytes(key, bytes, tier, expiry)
+	}
+
 	/// Builds an item that holds its key as a `K` (`ItemHeader<K>`).
 	fn new_with_key_value(key: K, bytes: &[u8], tier: Tier, expiry: ExpireTime) -> Self {
 		assert!(
@@ -736,7 +711,7 @@ impl<K> TieredValue<K> {
 
 		let len = len as u32;
 
-		let (layout, prefix, as_bytes) = match key_as_bytes(&key) {
+		let (layout, prefix, as_bytes, key_len) = match key_as_bytes(&key) {
 			Some(key_bytes) => {
 				assert!(
 					u32::try_from(key_bytes.len()).is_ok(),
@@ -748,10 +723,11 @@ impl<K> TieredValue<K> {
 					key_bytes_item_layout(key_bytes.len(), len),
 					key_bytes_value_offset(key_bytes.len()),
 					true,
+					key_bytes.len() as u32,
 				)
 			},
 
-			None => (item_layout::<K>(len), bytes_offset::<K>(), false),
+			None => (item_layout::<K>(len), bytes_offset::<K>(), false, 0),
 		};
 
 		let ptr = alloc_item(layout, tier);
@@ -769,7 +745,67 @@ impl<K> TieredValue<K> {
 			Tier::Slow => 0,
 		};
 
-		UninitValue { key, ptr, layout, prefix, len, tier, as_bytes, charge }
+		UninitValue { key: Some(key), key_len, ptr, layout, prefix, len, tier, as_bytes, charge }
+	}
+
+	/// [`TieredValue::new_uninit_in`] for a BORROWED key -- a byte-string key given
+	/// as its bytes (`PaperCache::reserve_set_borrowed`). The item holds the key
+	/// as bytes, so they are copied into it now, once, in front of the value's
+	/// own bytes, and no `K` is ever built: the allocation is the only one a
+	/// set of this key makes. What `new_uninit_in` charges, for the same key.
+	///
+	/// # Panics
+	///
+	/// If `len`, or the key's length, does not fit a `u32`, for the reason
+	/// `new_in` gives; in a debug build, if `K` is not a byte-string key type.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub(crate) fn new_uninit_in_bytes(key: &[u8], len: usize, tier: Tier) -> UninitValue<K>
+	where
+		K: 'static,
+	{
+		debug_assert!(is_key_bytes_type::<K>(), "a borrowed key is a byte-string key's");
+
+		assert!(
+			u32::try_from(len).is_ok(),
+			"a cached value must fit a u32 length; got {len} bytes",
+		);
+		assert!(
+			u32::try_from(key.len()).is_ok(),
+			"a cached key must fit a u32 length; got {} bytes",
+			key.len(),
+		);
+
+		let len = len as u32;
+		let layout = key_bytes_item_layout(key.len(), len);
+		let prefix = key_bytes_value_offset(key.len());
+		let ptr = alloc_item(layout, tier);
+
+		// SAFETY: `ptr` names `layout.size()` writable bytes, 8-aligned, and the
+		// layout's size is at least `prefix + len`, which is past the 12-byte
+		// header and the `key.len()` bytes written here. A fresh allocation
+		// cannot overlap the caller's slice. The header itself is written when
+		// the value is built (`assume_init`), as it is for an owned key.
+		unsafe {
+			std::ptr::copy_nonoverlapping(
+				key.as_ptr(),
+				ptr.as_ptr().add(std::mem::size_of::<BytesItemHeader>()),
+				key.len(),
+			);
+		}
+
+		// PHYS_FAST: charged once, at the allocation, as for an owned key.
+		let charge = match tier {
+			Tier::Fast => {
+				let charge = crate::phys::item_charge(prefix, len);
+
+				crate::phys::charge(charge);
+				charge
+			},
+
+			Tier::Slow => 0,
+		};
+
+		UninitValue { key: None, key_len: key.len() as u32, ptr, layout, prefix, len, tier, as_bytes: true, charge }
 	}
 
 	/// The item's metadata as an `ItemHeader<K>`, borrowed for as long as this
@@ -890,6 +926,19 @@ impl<K> TieredValue<K> {
 		}
 	}
 
+	/// [`TieredValue::key_matches`] for a key given as its bytes: whether this
+	/// value's key holds exactly `key`. Nothing is built to compare.
+	#[inline]
+	pub fn key_matches_bytes(&self, key: &[u8]) -> bool
+	where
+		K: KeyBytes,
+	{
+		match self.key_bytes() {
+			Some(stored) => stored == key,
+			None => self.key().key_bytes() == key,
+		}
+	}
+
 	/// The key's byte cost as `object::overhead::base_size` counts it.
 	///
 	/// For a key held as a `K`, what `TypeSize` says, as under every layout.
@@ -934,6 +983,25 @@ impl<K> TieredValue<K> {
 			Some(key) => key_bytes_value_offset(key.len()),
 			None => bytes_offset::<K>(),
 		}
+	}
+
+	/// [`TieredValue::item_prefix_bytes_for`] of a byte-string key given as
+	/// `key_len` bytes, which is a function of the length alone.
+	#[inline]
+	#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "hybrid_cache_common"))]
+	pub(crate) fn item_prefix_bytes_for_bytes(key_len: usize) -> usize {
+		key_bytes_value_offset(key_len)
+	}
+
+	/// [`TieredValue::key_accounted_size_for`] of a byte-string key given as
+	/// bytes: a `HashedKey`, however long, as the bytes are charged in the item.
+	#[inline]
+	#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "hybrid_cache_common"))]
+	pub(crate) fn key_accounted_size_for_bytes(_key_len: usize) -> usize
+	where
+		K: KeyBytes,
+	{
+		std::mem::size_of::<crate::HashedKey>()
 	}
 
 	/// [`TieredValue::key_accounted_size`] of the value a set of `key` WILL
@@ -1074,7 +1142,13 @@ impl<K> TieredValue<K> {
 #[cfg(feature = "hybrid_cache_common")]
 #[must_use = "an unwritten value is freed and refunded when it drops"]
 pub(crate) struct UninitValue<K> {
-	key: K,
+	/// The key, moved into the item when the value is built: `None` for a key
+	/// that was given as bytes (`new_uninit_in_bytes`), which are already in
+	/// the item and have no `K` to move.
+	key: Option<K>,
+
+	/// The key's length when the item holds it as bytes.
+	key_len: u32,
 
 	/// The item's address, untagged, and its layout.
 	ptr: NonNull<u8>,
@@ -1149,32 +1223,44 @@ impl<K> UninitValue<K> {
 		let expiry = AtomicU32::new(expiry.map_or(0, |tick| tick.get()));
 
 		let word = if this.as_bytes {
-			let key_bytes = key_as_bytes(&key).expect("an item built for a bytes key is given one");
-
-			// SAFETY: `ptr` names the item `new_uninit_in` allocated, aligned
-			// for the header, with `key_bytes_value_offset(key_len)` bytes
-			// ahead of the value for the header and the key (`prefix`), and
-			// this is the only code that writes them; the value's own bytes
-			// are untouched. A fresh allocation cannot overlap the key's.
+			// SAFETY: `ptr` names the item `new_uninit_in` or
+			// `new_uninit_in_bytes` allocated, aligned for the header, with
+			// `key_bytes_value_offset(key_len)` bytes ahead of the value for the
+			// header and the key (`prefix`); the value's own bytes are untouched.
 			unsafe {
 				this.ptr.as_ptr().cast::<BytesItemHeader>().write(BytesItemHeader {
 					len: this.len,
 					expiry,
-					key_len: key_bytes.len() as u32,
+					key_len: this.key_len,
 				});
-
-				std::ptr::copy_nonoverlapping(
-					key_bytes.as_ptr(),
-					this.ptr.as_ptr().add(std::mem::size_of::<BytesItemHeader>()),
-					key_bytes.len(),
-				);
 			}
 
-			// The item holds the key's bytes; its own buffer is freed here.
-			drop(key);
+			// An owned key's bytes are copied in now, and its own buffer is
+			// freed; a key given as bytes was copied in when the item was
+			// allocated.
+			if let Some(key) = key {
+				let key_bytes = key_as_bytes(&key).expect("an item built for a bytes key is given one");
+
+				debug_assert_eq!(key_bytes.len(), this.key_len as usize);
+
+				// SAFETY: as above, and this is the only code that writes the
+				// key's bytes of an owned key; a fresh allocation cannot overlap
+				// the key's.
+				unsafe {
+					std::ptr::copy_nonoverlapping(
+						key_bytes.as_ptr(),
+						this.ptr.as_ptr().add(std::mem::size_of::<BytesItemHeader>()),
+						key_bytes.len(),
+					);
+				}
+
+				drop(key);
+			}
 
 			tag_key_bytes(tag(this.ptr, this.tier))
 		} else {
+			let key = key.expect("an item that holds its key as a K is built from one");
+
 			// SAFETY: as above, for the `ItemHeader<K>` that precedes the
 			// value at `bytes_offset::<K>()`; the key moves into it.
 			unsafe {

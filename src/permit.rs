@@ -35,6 +35,18 @@
 //! paths cannot drift apart (T14, which only calls `set`, covers the shared
 //! decisions).
 //!
+//! # A key borrowed from the request
+//!
+//! The key is the first thing a server reads, and a server that keeps a buffer
+//! for it per connection has it as a `&[u8]`, not as a `K`.
+//! [`PaperCache::reserve_set_borrowed`] is `reserve_set` for such a key (a cache
+//! keyed by `Box<[u8]>`, `Vec<u8>` or `String`, see [`KeyBytes`]): admission is
+//! decided from the key's hash and length, so nothing is built to ask; under
+//! `thin_header` the bytes are copied from the slice into the item when
+//! [`SetPermit::fill`] allocates it, and no key buffer is allocated at all;
+//! under the default layout the header stores a `K`, and `fill` builds one from
+//! the bytes, once. The permit borrows the slice until `fill`.
+//!
 //! # Abandoning a set
 //!
 //! A client that disconnects mid-value is the normal case here, not an
@@ -96,6 +108,7 @@ use typesize::TypeSize;
 use crate::{
 	CacheError,
 	HashedKey,
+	KeyBytes,
 	PaperCache,
 	StatusRef,
 	TieredBuffer,
@@ -140,21 +153,29 @@ where
 		ttl: Option<u32>,
 		deadline: Instant,
 	) -> Result<SetPermit<'_, K, S>, CacheError> {
-		let admission = self.begin_set_until(&key, len, ttl, Some(deadline))?;
+		let admission = self.begin_set_until(self.key_figures(&key), len, ttl, Some(deadline))?;
 
-		Ok(SetPermit { cache: self, key, admission })
+		Ok(SetPermit { cache: self, key: PermitKey::Owned(key), admission })
 	}
 
 	/// Allocates the value `admission` decided on, UNINITIALIZED, in its tier --
 	/// charged to P -- and releases the byte gate's reservation (the bytes are
 	/// P's now). The one place a set's value is made, for `set` and for a
 	/// permit's `fill`.
-	pub(crate) fn allocate(&self, admission: Admission<'_>, key: K) -> PendingSet<'_, K, S> {
+	pub(crate) fn allocate(&self, admission: Admission<'_>, key: PermitKey<'_, K>) -> PendingSet<'_, K, S> {
 		let Admission { hashed, tier, placement, len, ttl, sizes, reservation } = admission;
 
-		debug_assert_eq!(self.hash_key(&key), hashed, "a value is built for the key begin_set checked");
+		let value = match key {
+			PermitKey::Owned(key) => {
+				debug_assert_eq!(self.hash_key(&key), hashed, "a value is built for the key begin_set checked");
 
-		let value = TieredValue::new_uninit_in(key, len, tier);
+				TieredValue::new_uninit_in(key, len, tier)
+			},
+
+			// The bytes are copied into the item (`thin_header`), or a `K` is
+			// built from them (the default layout), here and nowhere else.
+			PermitKey::Borrowed(bytes) => TieredValue::new_uninit_in_bytes(bytes, len, tier),
+		};
 
 		// B2: the value is allocated -- charged to P if fast -- so the bytes the
 		// byte gate held for it go back (waking the lane's head if anyone waits).
@@ -191,6 +212,34 @@ where
 	}
 }
 
+impl<K, S> PaperCache<K, TieredBuffer, S>
+where
+	K: KeyBytes,
+	S: Default + Clone + BuildHasher,
+{
+	/// [`PaperCache::reserve_set`] with the key given as its bytes: for a cache
+	/// keyed by `Box<[u8]>`, `Vec<u8>` or `String`. See the [module
+	/// documentation](self), "A key borrowed from the request". The permit
+	/// borrows `key` until [`SetPermit::fill`], which copies it where it
+	/// belongs.
+	///
+	/// # Errors
+	///
+	/// As `reserve_set`, and [`CacheError::InvalidKey`] if no key of this cache's
+	/// type holds the bytes (a `String` cache, bytes that are not UTF-8).
+	pub fn reserve_set_borrowed<'c>(
+		&'c self,
+		key: &'c [u8],
+		len: usize,
+		ttl: Option<u32>,
+		deadline: Instant,
+	) -> Result<SetPermit<'c, K, S>, CacheError> {
+		let admission = self.begin_set_borrowed(key, len, ttl, Some(deadline))?;
+
+		Ok(SetPermit { cache: self, key: PermitKey::Borrowed(key), admission })
+	}
+}
+
 /// A set the cache has admitted whose value has not been read: what
 /// [`PaperCache::reserve_set`] returns. Dropping it abandons the set -- the
 /// bytes the byte gate reserved for it are released, nothing was allocated or
@@ -198,8 +247,16 @@ where
 #[must_use = "a permit that is dropped abandons the set"]
 pub struct SetPermit<'c, K, S> {
 	cache: &'c PaperCache<K, TieredBuffer, S>,
-	key: K,
+	key: PermitKey<'c, K>,
 	admission: Admission<'c>,
+}
+
+/// A set's key between its admission and the allocation of its value: the key
+/// the caller gave, or -- for a cache of byte-string keys -- the bytes of one,
+/// borrowed from the request (`PaperCache::reserve_set_borrowed`).
+pub(crate) enum PermitKey<'k, K> {
+	Owned(K),
+	Borrowed(&'k [u8]),
 }
 
 impl<'c, K, S> SetPermit<'c, K, S>

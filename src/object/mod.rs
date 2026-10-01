@@ -57,6 +57,9 @@ use std::{marker::PhantomData, time::Instant};
 
 use crate::{Tier, value::TieredValue};
 
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "hybrid_cache_common"))]
+use crate::key_bytes::KeyBytes;
+
 pub type ObjectSize = u32;
 
 /// Expiry as a tick count, where one tick is one second since a process-global
@@ -124,6 +127,20 @@ impl<K, V> Object<K, V> {
 		K: 'static,
 	{
 		Self::with_expiry_in(key, bytes, tier, expiry_from_ttl(ttl))
+	}
+
+	/// [`Object::new_in`] for a byte-string key given as its bytes: the value
+	/// is copied into `tier`, and the key is built from `key` only if this
+	/// layout stores one (`TieredValue::new_in_bytes`).
+	#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "hybrid_cache_common"))]
+	pub fn new_in_bytes(key: &[u8], bytes: &[u8], tier: Tier, ttl: Option<u32>) -> Self
+	where
+		K: KeyBytes,
+	{
+		Object {
+			value: TieredValue::new_in_bytes(key, bytes, tier, expiry_from_ttl(ttl)),
+			_shape: PhantomData,
+		}
 	}
 
 	/// Creates an object with an explicit expiry time, value in the fast tier.
@@ -263,6 +280,16 @@ impl<K, V> Object<K, V> {
 		K: Eq + 'static,
 	{
 		self.value.key_matches(key)
+	}
+
+	/// [`Object::key_matches`] for a key given as its bytes. Nothing is built
+	/// to compare.
+	#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "hybrid_cache_common"))]
+	pub fn key_matches_bytes(&self, key: &[u8]) -> bool
+	where
+		K: KeyBytes,
+	{
+		self.value.key_matches_bytes(key)
 	}
 
 	pub fn expiry(&self) -> ExpireTime {

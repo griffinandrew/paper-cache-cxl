@@ -197,7 +197,10 @@ use std::mem::{ManuallyDrop, MaybeUninit};
 /// spilling into the 48. See the module documentation.
 use triomphe::Arc;
 
-use crate::{Tier, object::ExpireTime};
+use crate::{Tier, key_bytes::KeyBytes, object::ExpireTime};
+
+#[cfg(feature = "hybrid_cache_common")]
+use crate::key_bytes::key_from_bytes;
 
 /// Bit 0 of the byte-pointer word: set means the slow tier, clear the fast one.
 const SLOW_BIT: usize = 0b1;
@@ -458,6 +461,23 @@ impl<K> TieredValue<K> {
 		value
 	}
 
+	/// Builds a value from a BORROWED key: [`TieredValue::new_in`] for a
+	/// byte-string key given as its bytes. This layout stores the key in the
+	/// header as a `K`, so one is built from them, once.
+	///
+	/// # Panics
+	///
+	/// If `K` is `String` and `key` is not UTF-8 (`KeyBytes::holds` is checked
+	/// by the caller), or as [`TieredValue::new_in`].
+	pub fn new_in_bytes(key: &[u8], bytes: &[u8], tier: Tier, expiry: ExpireTime) -> Self
+	where
+		K: KeyBytes,
+	{
+		let key = K::from_key_bytes(key).expect("the caller checked that the key's bytes are a key");
+
+		Self::new_in(key, bytes, tier, expiry)
+	}
+
 	/// Builds a value in the fast (DRAM) tier.
 	#[inline]
 	pub fn new_fast(key: K, bytes: &[u8], expiry: ExpireTime) -> Self {
@@ -511,6 +531,25 @@ impl<K> TieredValue<K> {
 		UninitValue { key, ptr, len, tier, charge }
 	}
 
+	/// [`TieredValue::new_uninit_in`] for a BORROWED key -- a byte-string key
+	/// given as its bytes (`PaperCache::reserve_set_borrowed`). This layout
+	/// stores the key in the header as a `K`, so one is built from the bytes,
+	/// once, here -- when the value is allocated, not when the set was
+	/// admitted. What `new_uninit_in` charges, for the same key.
+	///
+	/// # Panics
+	///
+	/// If `len` does not fit a `u32`, or `K` is not a byte-string key type or
+	/// is `String` and `key` is not UTF-8 (`KeyBytes::holds` is checked by the
+	/// caller).
+	#[cfg(feature = "hybrid_cache_common")]
+	pub(crate) fn new_uninit_in_bytes(key: &[u8], len: usize, tier: Tier) -> UninitValue<K>
+	where
+		K: 'static,
+	{
+		Self::new_uninit_in(key_from_bytes::<K>(key), len, tier)
+	}
+
 	/// The same value's bytes, re-copied into `tier`, carrying the key and the
 	/// CURRENT expiry across.
 	///
@@ -540,6 +579,16 @@ impl<K> TieredValue<K> {
 		K: Eq,
 	{
 		self.key().eq(key)
+	}
+
+	/// [`TieredValue::key_matches`] for a key given as its bytes: whether this
+	/// value's key holds exactly `key`. Nothing is built to compare.
+	#[inline]
+	pub fn key_matches_bytes(&self, key: &[u8]) -> bool
+	where
+		K: KeyBytes,
+	{
+		self.key().key_bytes() == key
 	}
 
 	/// The key, owned. A clone here; `value_thin.rs` rebuilds a key its item
@@ -572,6 +621,26 @@ impl<K> TieredValue<K> {
 	#[inline]
 	pub(crate) fn item_prefix_bytes_for(_key: &K) -> usize {
 		0
+	}
+
+	/// [`TieredValue::item_prefix_bytes_for`] of a byte-string key given as
+	/// `key_len` bytes: none, whatever the key.
+	#[inline]
+	#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "hybrid_cache_common"))]
+	pub(crate) fn item_prefix_bytes_for_bytes(_key_len: usize) -> usize {
+		0
+	}
+
+	/// [`TieredValue::key_accounted_size_for`] of a byte-string key given as
+	/// `key_len` bytes: what `TypeSize` says of the key built from them, as it
+	/// lives in the DRAM header.
+	#[inline]
+	#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "hybrid_cache_common"))]
+	pub(crate) fn key_accounted_size_for_bytes(key_len: usize) -> usize
+	where
+		K: KeyBytes,
+	{
+		K::accounted_size(key_len)
 	}
 
 	/// [`TieredValue::key_accounted_size`] of the value a set of `key` WILL

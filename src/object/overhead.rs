@@ -115,9 +115,29 @@ impl OverheadManager {
 		K: TypeSize + 'static,
 	{
 		let len = ObjectSize::try_from(len).ok()?;
-		let value = resident_item_bytes_for(key, len);
-		let mut total_size = (crate::value::TieredValue::<K>::key_accounted_size_for(key) as ObjectSize)
-			.checked_add(value)?
+
+		self.base_size_from(
+			crate::value::TieredValue::<K>::key_accounted_size_for(key),
+			resident_item_bytes_for(key, len),
+			ttl,
+		)
+	}
+
+	/// `base_size_for` from the two figures it asks of the key -- its accounted
+	/// size and its item's prefix -- for a key that is not a `K` (a borrowed
+	/// byte string, which asks its layout for them by length) and so cannot be
+	/// asked. `base_size_for` is the same sum, with the figures it reads off the key.
+	pub fn base_size_with(&self, key_size: usize, prefix: usize, len: usize, ttl: Option<u32>) -> Option<ObjectSize> {
+		let len = ObjectSize::try_from(len).ok()?;
+
+		self.base_size_from(key_size, resident_item_bytes_with(prefix, len), ttl)
+	}
+
+	/// The sum behind `base_size_for` and `base_size_with`: the key's accounted
+	/// size, the item's resident bytes, an expiry's, and a TTL's overhead.
+	fn base_size_from(&self, key_size: usize, resident_item: ObjectSize, ttl: Option<u32>) -> Option<ObjectSize> {
+		let mut total_size = (key_size as ObjectSize)
+			.checked_add(resident_item)?
 			.checked_add(mem::size_of::<crate::object::ExpireTime>() as ObjectSize)?;
 
 		if ttl.is_some_and(|ttl| ttl != 0) {
@@ -133,8 +153,13 @@ impl OverheadManager {
 	where
 		K: TypeSize + 'static,
 	{
-		let mut resident = crate::value::TieredValue::<K>::key_accounted_size_for(key) as ObjectSize
-			+ mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
+		self.dram_resident_size_with(crate::value::TieredValue::<K>::key_accounted_size_for(key), ttl)
+	}
+
+	/// `dram_resident_size_for` from the key's accounted size (see
+	/// `base_size_with`).
+	pub fn dram_resident_size_with(&self, key_size: usize, ttl: Option<u32>) -> ObjectSize {
+		let mut resident = key_size as ObjectSize + mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
 
 		if ttl.is_some_and(|ttl| ttl != 0) {
 			resident += get_ttl_overhead();
@@ -863,9 +888,13 @@ pub(crate) fn resident_item_bytes<K, V>(object: &Object<K, V>) -> ObjectSize {
 /// (`TieredValue::item_prefix_bytes_for`), so the two are equal --
 /// `base_size_for_equals_base_size` holds it.
 pub(crate) fn resident_item_bytes_for<K: 'static>(key: &K, value_len: ObjectSize) -> ObjectSize {
-	resident_value_bytes(
-		value_len.saturating_add(prefix_size(crate::value::TieredValue::<K>::item_prefix_bytes_for(key))),
-	)
+	resident_item_bytes_with(crate::value::TieredValue::<K>::item_prefix_bytes_for(key), value_len)
+}
+
+/// [`resident_item_bytes_for`] from the item's prefix: for a key that is not a
+/// `K` (a borrowed byte string; `TieredValue::item_prefix_bytes_for_bytes`).
+pub(crate) fn resident_item_bytes_with(prefix: usize, value_len: ObjectSize) -> ObjectSize {
+	resident_value_bytes(value_len.saturating_add(prefix_size(prefix)))
 }
 
 /// A prefix length as an `ObjectSize`, saturating: a key so long its prefix

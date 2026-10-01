@@ -156,6 +156,11 @@ src/
                                removes with (the check and the removal under one lock; the
                                DashMap's through `entry`, whose reserve the DRAM identity
                                test's model counts).
+  key_bytes.rs                KeyBytes (sealed: Box<[u8]>, Vec<u8>, String): what the *_borrowed methods
+                               need of a byte-string key -- its hash from bytes (a String hashes as a
+                               str, not a [u8]), which bytes it can hold, what the default layout
+                               charges for it by length -- and the TypeId helpers value_thin.rs
+                               (key_as_bytes) and the permit (key_from_bytes) use.
   cache_shape.rs              The two hooks the shared read side of PaperCache (get, get_into,
                                del, has, peek, ttl, size, wipe, resize -- one impl block, generic
                                over the value shape) calls: a hit served from a tier is counted
@@ -3777,3 +3782,39 @@ metadata lane, the worker held), not at the watchdog, not diverted or admitted o
 deadline has passed; a TTL given after the value is the set's and its recheck refuses what it tips over the
 threshold; the registered setters move N as documented and a release narrows it; `bands_for` is `bands` with
 none; and the permit types are `Send`. The tests' docs name the guard each is red without.
+
+## Keys borrowed from the request (`*_borrowed`)
+
+`get_borrowed`, `get_into_borrowed`, `peek_borrowed`, `has_borrowed`, `del_borrowed`, `ttl_borrowed`,
+`size_borrowed` (every cache, flat or tiered), `tier_of_borrowed`, `set_borrowed` and `reserve_set_borrowed`
+(tiered; `set_borrowed` on the flat caches too) take the key as `&[u8]`, for a cache whose key type is
+`Box<[u8]>`, `Vec<u8>` or `String` (`KeyBytes`, `src/key_bytes.rs`, sealed: exactly the types `thin_header` holds as
+bytes). Why a trait and not `Borrow<[u8]>`: a `String` hashes as a `str` (its bytes, then 0xff), not as a `[u8]`
+(a length, then its bytes), and none of the three has a uniform `From<&[u8]>` (a `String` needs UTF-8).
+
+* The hash is `hash_key`'s of the key that holds the bytes (`KeyBytes::hash_key_bytes`; tests over `RandomState`
+  and a hasher that tells calls apart, for all three types), so an entry is found by either spelling. The reads
+  are the owned ones' bodies (`get_hashed`, ..., which `get(&K)` and the rest now call) with the comparison
+  `Object::key_matches_bytes`; `del` removes through `Removal::take_if` and the shared tail `erased`.
+* Admission is decided from the key's hash and two figures the layout charges for it (`KeyFigures`: the key's
+  accounted size, the item's prefix), so `begin_set_until` no longer takes a key; `OverheadManager::base_size_with`,
+  `dram_resident_size_with` and `phys::value_charge_with` are the `*_for` computations from those figures (and
+  the `*_for` ones call them). A key's figures from its length: `TieredValue::item_prefix_bytes_for_bytes` (0 in
+  the default layout, `key_bytes_value_offset` in `thin_header`) and `key_accounted_size_for_bytes` (`TypeSize`
+  of the key built, by length, in the default layout; a `HashedKey` under `thin_header`).
+* Under `thin_header` a borrowed set copies the bytes into the item at `new_uninit_in_bytes` and builds no key
+  (`UninitValue::key` is `None`; the header is written at `assume_init`). Under the default layout the header
+  stores a `K`, so `new_uninit_in_bytes` builds one, once, at `fill` -- not at `reserve_set_borrowed`, so a set the
+  cache refuses builds none. A permit holds the slice (`PermitKey::Borrowed`) until `fill`.
+* A `String` cache holds no key that is not UTF-8: a set of one is `CacheError::InvalidKey` (new; the server's
+  error table needs an arm), a lookup of one is a miss.
+
+Tests: `key_bytes::tests` (the hash equation, the accounted size, the type lists) and
+`worker/policy/borrowed_key_tests.rs`: an entry is found, sized, re-TTLed and deleted by either spelling (flat and
+tiered, three key types); keys that collide on the hash are told apart by their bytes (a constant hasher); the
+figures of a borrowed key are the key's; a value built from borrowed bytes is the value built from the key; a
+borrowed set, `set_borrowed` and the three steps leave `set`'s objects, status, stack and P (alone, in a child);
+allocation counts (a counter in the pools, `numa_alloc::thread_allocs`, test builds only): a borrowed lookup builds
+no key, a borrowed set builds none under `thin_header` and one under the default layout, a refused or abandoned
+borrowed reservation allocates nothing; `InvalidKey`; an abandoned borrowed set is refunded once; the deadline.
+

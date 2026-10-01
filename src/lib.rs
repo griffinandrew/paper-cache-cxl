@@ -86,6 +86,12 @@ compile_error!(
 #[path = "value_thin.rs"]
 pub mod value;
 
+/// Byte-string keys, borrowed: `PaperCache`'s `*_borrowed` methods take the
+/// key as `&[u8]`, for a cache keyed by `Box<[u8]>`, `Vec<u8>` or `String`.
+mod key_bytes;
+
+pub use crate::key_bytes::KeyBytes;
+
 /// `paper_cache::TieredValue`, alongside `paper_cache::TieredBuffer`.
 pub use crate::value::TieredValue;
 
@@ -576,12 +582,21 @@ where
 	/// and frees nothing, and the caller gets a snapshot that was live at the
 	/// moment of the lookup.
 	pub fn get(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
+		self.get_hashed(self.hash_key(key), |object| object.key_matches(key))
+	}
 
+	/// `get` once the key is hashed, with `matches` the comparison of the
+	/// object found at the hash against the key: the one body behind `get` and
+	/// `get_borrowed`.
+	fn get_hashed(
+		&self,
+		hashed_key: HashedKey,
+		matches: impl Fn(&Object<K, V>) -> bool,
+	) -> Result<Vec<u8>, CacheError> {
 		// Take the value handle under the shard guard, release the guard, and
 		// only then copy.
 		let snapshot = match self.objects.get_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
+			Some(object) if matches(&*object) && !object.is_expired() =>
 				Some(object.snapshot()),
 			_ => None,
 		};
@@ -622,10 +637,18 @@ where
 	/// allocator behaviour as much as their cache behaviour; this method exists
 	/// to measure them apart. See the `segregated_value_arena` feature.
 	pub fn get_into(&self, key: &K, out: &mut Vec<u8>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
+		self.get_into_hashed(self.hash_key(key), |object| object.key_matches(key), out)
+	}
 
+	/// `get_into` once the key is hashed (see `get_hashed`).
+	fn get_into_hashed(
+		&self,
+		hashed_key: HashedKey,
+		matches: impl Fn(&Object<K, V>) -> bool,
+		out: &mut Vec<u8>,
+	) -> Result<(), CacheError> {
 		let snapshot = match self.objects.get_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
+			Some(object) if matches(&*object) && !object.is_expired() =>
 				Some(object.snapshot()),
 			_ => None,
 		};
@@ -675,14 +698,21 @@ where
 	/// assert!(cache.del(&1).is_err());
 	/// ```
 	pub fn del(&self, key: &K) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
+		self.del_hashed(self.hash_key(key), |object| object.key_matches(key))
+	}
 
-		let (removed_hashed_key, object) = erase(
-			&self.objects,
-			&self.status,
-			&self.overhead_manager,
-			Some(EraseKey::Original(key, hashed_key)),
-		)?;
+	/// `del` once the key is hashed: removes the object at the hash if `matches`
+	/// holds of it -- the check and the removal under one lock, as
+	/// `EraseKey::Original` does -- and takes it off the status.
+	fn del_hashed(
+		&self,
+		hashed_key: HashedKey,
+		matches: impl FnOnce(&Object<K, V>) -> bool,
+	) -> Result<(), CacheError> {
+		let taken = Removal::take_if(&*self.objects, &hashed_key, matches);
+
+		let (removed_hashed_key, object, _) =
+			erased(&self.status, &self.overhead_manager, hashed_key, taken)?;
 
 		self.status.incr_dels();
 		self.broadcast(WorkerEvent::Del(removed_hashed_key, object.expiry()))?;
@@ -709,8 +739,11 @@ where
 	/// assert!(!cache.has(&1));
 	/// ```
 	pub fn has(&self, key: &K) -> bool {
-		let hashed_key = self.hash_key(key);
+		self.has_hashed(self.hash_key(key), |object| object.key_matches(key))
+	}
 
+	/// `has` once the key is hashed (see `get_hashed`).
+	fn has_hashed(&self, hashed_key: HashedKey, matches: impl Fn(&Object<K, V>) -> bool) -> bool {
 		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
 		// reads the key, the expiry, the length and the tag bit, never the
 		// value's bytes, and the shard guard it holds while doing so keeps the
@@ -720,7 +753,7 @@ where
 		// slow object.)
 		self.objects
 			.get_ref(&hashed_key)
-			.is_some_and(|object| object.key_matches(key) && !object.is_expired())
+			.is_some_and(|object| matches(&*object) && !object.is_expired())
 	}
 
 	/// Gets (peeks) the value associated with the supplied key without altering
@@ -765,9 +798,17 @@ where
 	/// A copy has the same semantics the `Shared` did anyway: a snapshot that
 	/// was live at the moment of the lookup.
 	pub fn peek(&self, key: &K) -> Result<Vec<u8>, CacheError> {
-		let hashed_key = self.hash_key(key);
+		self.peek_hashed(self.hash_key(key), |object| object.key_matches(key))
+	}
+
+	/// `peek` once the key is hashed (see `get_hashed`).
+	fn peek_hashed(
+		&self,
+		hashed_key: HashedKey,
+		matches: impl Fn(&Object<K, V>) -> bool,
+	) -> Result<Vec<u8>, CacheError> {
 		let snapshot = match self.objects.get_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
+			Some(object) if matches(&*object) && !object.is_expired() =>
 				Some(object.snapshot()),
 
 			_ => None,
@@ -799,10 +840,18 @@ where
 	/// cache.ttl(&0, Some(5)); // value will expire in 5 seconds
 	/// ```
 	pub fn ttl(&self, key: &K, ttl: Option<u32>) -> Result<(), CacheError> {
-		let hashed_key = self.hash_key(key);
+		self.ttl_hashed(self.hash_key(key), |object| object.key_matches(key), ttl)
+	}
 
+	/// `ttl` once the key is hashed (see `get_hashed`).
+	fn ttl_hashed(
+		&self,
+		hashed_key: HashedKey,
+		matches: impl Fn(&Object<K, V>) -> bool,
+		ttl: Option<u32>,
+	) -> Result<(), CacheError> {
 		let mut object = match self.objects.get_mut_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() => object,
+			Some(object) if matches(&*object) && !object.is_expired() => object,
 			_ => return Err(CacheError::KeyNotFound),
 		};
 
@@ -841,8 +890,15 @@ where
 	/// assert!(cache.size(&1).is_err());
 	/// ```
 	pub fn size(&self, key: &K) -> Result<ObjectSize, CacheError> {
-		let hashed_key = self.hash_key(key);
+		self.size_hashed(self.hash_key(key), |object| object.key_matches(key))
+	}
 
+	/// `size` once the key is hashed (see `get_hashed`).
+	fn size_hashed(
+		&self,
+		hashed_key: HashedKey,
+		matches: impl Fn(&Object<K, V>) -> bool,
+	) -> Result<ObjectSize, CacheError> {
 		// No epoch pin, deliberately -- unlike `get`/`get_into`/`peek`. This
 		// reads the key, the expiry, the length and the tag bit, never the
 		// value's bytes, and the shard guard it holds while doing so keeps the
@@ -851,7 +907,7 @@ where
 		// the first three are in the tiered item: one remote cache line for a
 		// slow object.)
 		match self.objects.get_ref(&hashed_key) {
-			Some(object) if object.key_matches(key) && !object.is_expired() =>
+			Some(object) if matches(&*object) && !object.is_expired() =>
 				Ok(self.overhead_manager.total_size(&object)),
 
 			_ => Err(CacheError::KeyNotFound),
@@ -986,6 +1042,82 @@ where
 
 	fn hash_key(&self, key: &K) -> HashedKey {
 		self.hasher.hash_one(key)
+	}
+}
+
+// ---------------------------------------------------------------------
+// The read side by a BORROWED key: the same bodies as above (the `*_hashed`
+// helpers), reached with the key as `&[u8]` -- see `key_bytes`. The hash is
+// `hash_key`'s of the key that holds those bytes, so an object stored under an
+// owned key is found by the borrowed one and the other way round; nothing is
+// built to look an object up.
+// ---------------------------------------------------------------------
+#[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "hybrid_cache_common"))]
+impl<K, V, S> PaperCache<K, V, S>
+where
+	K: KeyBytes,
+	V: CacheShape,
+	S: Default + Clone + BuildHasher,
+{
+	/// [`PaperCache::get`] with the key given as its bytes: nothing is built
+	/// to look it up. A key no cache of this type can hold (a `String` cache,
+	/// bytes that are not UTF-8) is a miss.
+	///
+	/// # Examples
+	/// ```
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
+	///
+	/// let cache = PaperCache::<Box<[u8]>, BufferDRAM>::new(
+	///     1000,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
+	/// ).unwrap();
+	///
+	/// cache.set(Box::from(&b"key"[..]), &[1, 2], None).unwrap();
+	///
+	/// // The same entry, by owned key and by bytes.
+	/// assert_eq!(cache.get(&Box::from(&b"key"[..])).unwrap(), [1, 2]);
+	/// assert_eq!(cache.get_borrowed(b"key").unwrap(), [1, 2]);
+	/// assert!(cache.get_borrowed(b"other").is_err());
+	/// ```
+	pub fn get_borrowed(&self, key: &[u8]) -> Result<Vec<u8>, CacheError> {
+		self.get_hashed(self.hash_key_bytes(key), |object| object.key_matches_bytes(key))
+	}
+
+	/// [`PaperCache::get_into`] with the key given as its bytes.
+	pub fn get_into_borrowed(&self, key: &[u8], out: &mut Vec<u8>) -> Result<(), CacheError> {
+		self.get_into_hashed(self.hash_key_bytes(key), |object| object.key_matches_bytes(key), out)
+	}
+
+	/// [`PaperCache::del`] with the key given as its bytes.
+	pub fn del_borrowed(&self, key: &[u8]) -> Result<(), CacheError> {
+		self.del_hashed(self.hash_key_bytes(key), |object| object.key_matches_bytes(key))
+	}
+
+	/// [`PaperCache::has`] with the key given as its bytes.
+	pub fn has_borrowed(&self, key: &[u8]) -> bool {
+		self.has_hashed(self.hash_key_bytes(key), |object| object.key_matches_bytes(key))
+	}
+
+	/// [`PaperCache::peek`] with the key given as its bytes.
+	pub fn peek_borrowed(&self, key: &[u8]) -> Result<Vec<u8>, CacheError> {
+		self.peek_hashed(self.hash_key_bytes(key), |object| object.key_matches_bytes(key))
+	}
+
+	/// [`PaperCache::ttl`] with the key given as its bytes.
+	pub fn ttl_borrowed(&self, key: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
+		self.ttl_hashed(self.hash_key_bytes(key), |object| object.key_matches_bytes(key), ttl)
+	}
+
+	/// [`PaperCache::size`] with the key given as its bytes.
+	pub fn size_borrowed(&self, key: &[u8]) -> Result<ObjectSize, CacheError> {
+		self.size_hashed(self.hash_key_bytes(key), |object| object.key_matches_bytes(key))
+	}
+
+	/// The hash of the key that holds `key`'s bytes: `hash_key` of it, without
+	/// building it (`KeyBytes::hash_key_bytes`).
+	fn hash_key_bytes(&self, key: &[u8]) -> HashedKey {
+		K::hash_key_bytes(&self.hasher, key)
 	}
 }
 
@@ -1184,6 +1316,69 @@ where
 		// comes from. `BufferDRAM` names the fast tier, `BufferPMEM` the slow
 		// one -- see `value::ValueShape`.
 		let object = Object::new_in(key, value, V::TIER, ttl);
+
+		self.insert_flat(hashed_key, object)
+	}
+
+	/// [`PaperCache::set`] with the key given as its bytes. Under `thin_header`
+	/// the item holds the key as bytes, so they are copied from `key` into it
+	/// and no `K` is built; under the default layout the key is stored as a
+	/// `K`, and one is built from them, once.
+	///
+	/// # Errors
+	///
+	/// As `set`, and [`CacheError::InvalidKey`] if no key of this cache's type
+	/// holds the bytes (a `String` cache, bytes that are not UTF-8).
+	///
+	/// # Examples
+	/// ```
+	/// use paper_cache::{BufferDRAM, PaperCache, PaperPolicy};
+	///
+	/// let cache = PaperCache::<String, BufferDRAM>::new(
+	///     1000,
+	///     &[PaperPolicy::LfuCompact],
+	///     PaperPolicy::LfuCompact,
+	/// ).unwrap();
+	///
+	/// assert!(cache.set_borrowed(b"key", &[1, 2], None).is_ok());
+	/// assert_eq!(cache.get(&String::from("key")).unwrap(), [1, 2]);
+	///
+	/// // A `String` cache holds no key that is not UTF-8.
+	/// assert!(cache.set_borrowed(&[0xff], &[1], None).is_err());
+	/// ```
+	pub fn set_borrowed(&self, key: &[u8], value: &[u8], ttl: Option<u32>) -> Result<(), CacheError>
+	where
+		K: KeyBytes,
+	{
+		if !K::holds(key) {
+			return Err(CacheError::InvalidKey);
+		}
+
+		let hashed_key = K::hash_key_bytes(&self.hasher, key);
+
+		// The size checks of `set`, from the figures its key would give.
+		let base = self.overhead_manager.base_size_with(
+			crate::value::TieredValue::<K>::key_accounted_size_for_bytes(key.len()),
+			crate::value::TieredValue::<K>::item_prefix_bytes_for_bytes(key.len()),
+			value.len(),
+			ttl,
+		);
+
+		match base {
+			None => return Err(CacheError::ExceedingValueSize),
+			Some(0) => return Err(CacheError::ZeroValueSize),
+			Some(base) if self.status.exceeds_eviction_threshold(base) => return Err(CacheError::ExceedingValueSize),
+			Some(_) => {},
+		}
+
+		let object = Object::new_in_bytes(key, value, V::TIER, ttl);
+
+		self.insert_flat(hashed_key, object)
+	}
+
+	/// The publish half of a flat set: `object` is inserted, sized, and its
+	/// `Set` sent.
+	fn insert_flat(&self, hashed_key: HashedKey, object: Object<K, V>) -> Result<(), CacheError> {
 		let base_size = self.overhead_manager.base_size(&object);
 		let dram_resident = self.overhead_manager.dram_resident_size(&object);
 		let expiry = object.expiry();
@@ -1305,6 +1500,22 @@ where
 		Some(EraseKey::Hashed(_)) | None => Removal::take_evict(&**objects, &hashed_key),
 	};
 
+	erased(status, overhead_manager, hashed_key, taken)
+}
+
+/// What every removal does once the store has handed back the object it took
+/// (or none): takes its bytes off the status, and answers `KeyNotFound` for no
+/// object, or for one that had already expired. The tail of `erase_sized`, and
+/// of `del` by a borrowed key, which removes by its own comparison.
+fn erased<K, V>(
+	status: &StatusRef,
+	overhead_manager: &OverheadManagerRef,
+	hashed_key: HashedKey,
+	taken: Option<Object<K, V>>,
+) -> Result<(HashedKey, Object<K, V>, ObjectSize), CacheError>
+where
+	K: 'static + Eq + TypeSize,
+{
 	let Some(object) = taken else {
 		return Err(CacheError::KeyNotFound);
 	};
@@ -1778,7 +1989,7 @@ where
 	pub fn set(&self, key: K, value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
 		let admission = self.begin_set(&key, value.len(), ttl)?;
 
-		self.commit(admission, key, value)
+		self.commit(admission, crate::permit::PermitKey::Owned(key), value)
 	}
 
 	/// The admission half of `set` (S5): everything decided from `key`, the
@@ -1789,7 +2000,19 @@ where
 	/// (`admit_bytes`, B2), which may wait in the bytes lane. No lock is held
 	/// across a wait, and nothing has been allocated or sent by then.
 	pub(crate) fn begin_set(&self, key: &K, len: usize, ttl: Option<u32>) -> Result<crate::gate::Admission<'_>, CacheError> {
-		self.begin_set_until(key, len, ttl, None)
+		self.begin_set_until(self.key_figures(key), len, ttl, None)
+	}
+
+	/// What admission asks of a set's key, read off an owned one: its hash and the
+	/// two figures the layout charges for it. `begin_set_until` takes these and
+	/// not the key, so that a key that is not a `K` (`reserve_set_borrowed`)
+	/// is admitted by the same code.
+	pub(crate) fn key_figures(&self, key: &K) -> KeyFigures {
+		KeyFigures {
+			hashed: self.hash_key(key),
+			key_size: crate::value::TieredValue::<K>::key_accounted_size_for(key),
+			prefix: crate::value::TieredValue::<K>::item_prefix_bytes_for(key),
+		}
 	}
 
 	/// `begin_set` with a deadline (S9, `reserve_set`): the waits -- in the
@@ -1802,17 +2025,17 @@ where
 	/// at all: a set that would wait fails at once. `None` is `begin_set`.
 	pub(crate) fn begin_set_until(
 		&self,
-		key: &K,
+		key: KeyFigures,
 		len: usize,
 		ttl: Option<u32>,
 		deadline: Option<std::time::Instant>,
 	) -> Result<crate::gate::Admission<'_>, CacheError> {
 		use crate::gate::{self, Verdict};
 
-		let hashed = self.hash_key(key);
+		let hashed = key.hashed;
 
 		// 0. The size checks, with today's predicates.
-		let Some(base) = self.overhead_manager.base_size_for(key, len, ttl) else {
+		let Some(base) = self.overhead_manager.base_size_with(key.key_size, key.prefix, len, ttl) else {
 			return Err(CacheError::ExceedingValueSize);
 		};
 
@@ -1826,8 +2049,8 @@ where
 
 		let sizes = gate::Sizes {
 			base,
-			resident: self.overhead_manager.dram_resident_size_for(key, ttl),
-			value: crate::phys::value_charge_for(key, len as ObjectSize),
+			resident: self.overhead_manager.dram_resident_size_with(key.key_size, ttl),
+			value: crate::phys::value_charge_with(key.prefix, len as ObjectSize),
 		};
 
 		let gate = self.status.gate();
@@ -2004,7 +2227,12 @@ where
 	/// (`allocate`, charged to P, the byte gate's reservation released), the
 	/// copy of `value` into it, and the commit of the filled value (`PendingSet`)
 	/// -- so a set from a slice and a set a server fills in place are one path.
-	pub(crate) fn commit(&self, admission: crate::gate::Admission<'_>, key: K, value: &[u8]) -> Result<(), CacheError> {
+	pub(crate) fn commit(
+		&self,
+		admission: crate::gate::Admission<'_>,
+		key: crate::permit::PermitKey<'_, K>,
+		value: &[u8],
+	) -> Result<(), CacheError> {
 		debug_assert_eq!(value.len(), admission.len, "commit builds the value begin_set checked");
 
 		let mut pending = self.allocate(admission, key);
@@ -2265,10 +2493,13 @@ where
 	/// one object map here, so tier is a property read off the object itself.
 	#[must_use]
 	pub fn tier_of(&self, key: &K) -> Option<Tier> {
-		let hashed_key = self.hash_key(key);
+		self.tier_of_hashed(self.hash_key(key), |object| object.key_matches(key))
+	}
 
+	/// `tier_of` once the key is hashed (see `get_hashed`).
+	fn tier_of_hashed(&self, hashed_key: HashedKey, matches: impl Fn(&Object<K, TieredBuffer>) -> bool) -> Option<Tier> {
 		self.objects.get_ref(&hashed_key).and_then(|object| {
-			if !object.key_matches(key) || object.is_expired() {
+			if !matches(&*object) || object.is_expired() {
 				return None;
 			}
 
@@ -2277,6 +2508,71 @@ where
 			Some(object.value().tier())
 		})
 	}
+}
+
+/// The tiered cache's set, and tier query, by a BORROWED key -- see `key_bytes`.
+#[cfg(feature = "hybrid_cache_common")]
+impl<K, S> PaperCache<K, TieredBuffer, S>
+where
+	K: KeyBytes,
+	S: Default + Clone + BuildHasher,
+{
+	/// [`PaperCache::set`] with the key given as its bytes. Under `thin_header`
+	/// they are copied from `key` into the item, once, and no `K` is built --
+	/// no key buffer is allocated for the set; under the default layout the
+	/// header stores the key as a `K`, and one is built from them, once, when
+	/// the value is allocated -- so a set the cache refuses builds none.
+	///
+	/// # Errors
+	///
+	/// As `set`, and [`CacheError::InvalidKey`] if no key of this cache's type
+	/// holds the bytes (a `String` cache, bytes that are not UTF-8).
+	pub fn set_borrowed(&self, key: &[u8], value: &[u8], ttl: Option<u32>) -> Result<(), CacheError> {
+		let admission = self.begin_set_borrowed(key, value.len(), ttl, None)?;
+
+		self.commit(admission, crate::permit::PermitKey::Borrowed(key), value)
+	}
+
+	/// [`PaperCache::tier_of`] with the key given as its bytes.
+	#[must_use]
+	pub fn tier_of_borrowed(&self, key: &[u8]) -> Option<Tier> {
+		self.tier_of_hashed(K::hash_key_bytes(&self.hasher, key), |object| object.key_matches_bytes(key))
+	}
+
+	/// The admission half of a set by a borrowed key: `begin_set_until` from
+	/// the figures the key's bytes give -- its hash, and what the layout
+	/// charges for a key of that length -- with nothing built. Refuses bytes
+	/// no key of this type holds, before it looks at anything else.
+	pub(crate) fn begin_set_borrowed(
+		&self,
+		key: &[u8],
+		len: usize,
+		ttl: Option<u32>,
+		deadline: Option<std::time::Instant>,
+	) -> Result<crate::gate::Admission<'_>, CacheError> {
+		if !K::holds(key) {
+			return Err(CacheError::InvalidKey);
+		}
+
+		let figures = KeyFigures {
+			hashed: K::hash_key_bytes(&self.hasher, key),
+			key_size: crate::value::TieredValue::<K>::key_accounted_size_for_bytes(key.len()),
+			prefix: crate::value::TieredValue::<K>::item_prefix_bytes_for_bytes(key.len()),
+		};
+
+		self.begin_set_until(figures, len, ttl, deadline)
+	}
+}
+
+/// What the admission of a set asks of its key, so that it is asked of an owned
+/// `K` and of a borrowed byte string by one body (`begin_set_until`): the key's
+/// hash, the bytes the layout charges for the key itself, and the length of the
+/// item's prefix the key makes (`TieredValue::item_prefix_bytes_for`).
+#[cfg(feature = "hybrid_cache_common")]
+pub(crate) struct KeyFigures {
+	pub(crate) hashed: HashedKey,
+	pub(crate) key_size: usize,
+	pub(crate) prefix: usize,
 }
 
 /// Single-instance, segmented-LRU hybrid cache with a size-split fast AND
