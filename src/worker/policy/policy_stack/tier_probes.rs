@@ -28,7 +28,8 @@ use std::ops::RangeInclusive;
 use super::{
 	arena_index::probes,
 	ClockCompactHybridStack, FifoCompactHybridStack, HashedKey, LruCompactHybridStack, PolicyStack,
-	S3FifoCompactHybridStack, S3FifoGhostLazyDemotionCompactHybridStack, TwoQCompactHybridStack,
+	S3FifoCompactHybridStack, S3FifoGhostLazyDemotionCompactHybridStack, S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack,
+	TwoQCompactHybridStack,
 	TwoQFastAdmissionReprieveCompactHybridStack,
 };
 
@@ -236,4 +237,68 @@ fn two_q_fast_admission_reprieve() {
 	fill(&mut stack, 5..=6);
 
 	within("an eviction of the FIFO's tail, main empty", 1, || stack.evict_one());
+}
+
+/// S3-FIFO with a ghost, lazy demotion and a DRAM one-access queue: a hit on a
+/// one-access key promotes it to main with nothing pushed, a ghost hit enters
+/// main fast.
+#[test]
+fn s3_fifo_with_lazy_demotion_and_fast_admission() {
+	let mut stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(0.5, 1_000_000, 100_000);
+
+	fill(&mut stack, 1..=8);
+
+	// The flat stack: 9.
+	within("a hit on a one-access key: a promotion to main", 8, || stack.update(3));
+	within("a hit on a main key: the reference bit", 3, || stack.update(3));
+	within("an eviction of the one-access tail", 1, || stack.evict_one());
+	within("a new key", 2, || stack.insert(9, 1_000));
+	// The flat stack: 10.
+	within("an overwrite of a one-access key", 9, || stack.insert(8, 1_000));
+	within("a structural new key", 2, || stack.insert(40, 200_000));
+
+	let mut stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(0.5, 1_000_000, 100_000);
+
+	fill(&mut stack, 1..=4);
+	stack.evict_one();
+
+	// The flat stack: 6.
+	within("a ghost hit", 5, || stack.insert(1, 1_000));
+
+	// A one-access queue of 4,500 B in a tier of 10,000 B: main holds five.
+	let mut stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(0.0045, 1_000_000, 10_000);
+
+	fill(&mut stack, 1..=7);
+
+	for key in 1..=5 {
+		stack.update(key);
+	}
+
+	stack.update(1);
+
+	// The flat stack: 15.
+	within("a promotion with one reprieve and one demotion", 14, || stack.update(6));
+
+	let mut stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(0.0045, 1_000_000, 10_000);
+
+	fill(&mut stack, 1..=7);
+
+	for key in 1..=5 {
+		stack.update(key);
+	}
+
+	// The flat stack: 10.
+	within("a promotion with one demotion", 9, || stack.update(6));
+
+	let mut stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(0.9, 20_000, 100_000);
+
+	fill(&mut stack, 1..=4);
+
+	for key in 1..=3 {
+		stack.update(key);
+	}
+
+	stack.update(1);
+
+	within("an eviction past one second chance", 10, || stack.evict_one());
 }

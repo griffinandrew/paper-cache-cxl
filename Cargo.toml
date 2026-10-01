@@ -323,7 +323,7 @@ s3_fifo_ghost_lazy_demotion_compact_hybrid_cache = ["key_value_pmem", "hybrid_ca
 # PMEM allocation. The one-access queue's own byte budget
 # (`one_access_ratio * max_size`) is now reserved out of the fast-tier size
 # rather than being an independent PMEM-side budget -- see
-# worker/policy/policy_stack/s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_stack.rs
+# worker/policy/policy_stack/s3_fifo_hybrid_stacks.rs
 # for the shared-DRAM-budget accounting.
 #
 s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]

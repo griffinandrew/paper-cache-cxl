@@ -67,7 +67,6 @@ mod s3_fifo_hybrid_stacks;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_faithful_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
-mod s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
@@ -128,8 +127,7 @@ use crate::{
 		two_q_fast_admission_hybrid_stacks::TwoQFastAdmissionReprieveCompactHybridStack,
 		two_q_full_fast_admission_compact_hybrid_stack::TwoQFullFastAdmissionCompactHybridStack,
 		lru_sized_compact_hybrid_stack::LruSizedCompactHybridStack,
-		s3_fifo_hybrid_stacks::{S3FifoCompactHybridStack, S3FifoGhostCompactHybridStack, S3FifoGhostLazyDemotionCompactHybridStack},
-		s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack,
+		s3_fifo_hybrid_stacks::{S3FifoCompactHybridStack, S3FifoGhostCompactHybridStack, S3FifoGhostLazyDemotionCompactHybridStack, S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack},
 		s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_compact_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack,
 		s3_fifo_lazy_demotion_fast_admission_midpoint_reprieve_compact_hybrid_stack::S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack,
 		s3_fifo_lazy_demotion_fast_admission_reprieve_compact_hybrid_stack::S3FifoLazyDemotionFastAdmissionReprieveCompactHybridStack,
@@ -1049,7 +1047,7 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 
 		// Same construction/default-fast-tier-budget shape as
 		// S3FifoGhostLazyDemotionCompactHybrid above -- see
-		// s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_stack.rs's
+		// s3_fifo_hybrid_stacks.rs's
 		// module doc for the shared-DRAM-budget accounting this adds (the
 		// one-access queue now competes with the main queue's fast segment
 		// for the same fast_capacity).

@@ -288,7 +288,7 @@ impl S3FifoLazyDemotionFastAdmissionMidpointReprieveCompactHybridStack {
 
 	/// The one-access queue's carve-out as the FAST TIER can pay for it, before
 	/// the shared-metadata reservation. The S3-FIFO family's clamp, as
-	/// `S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::raw_one_access_capacity`.
+	/// `tiered_stack::carve::budgets` (what `S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack` carves with).
 	///
 	/// The `one_access_capacity` field is `one_access_ratio * max_size`, a
 	/// slice of the CACHE budget. The one-access queue is DRAM here and

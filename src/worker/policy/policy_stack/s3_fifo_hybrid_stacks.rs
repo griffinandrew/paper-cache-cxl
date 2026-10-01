@@ -57,6 +57,24 @@
 //! `needs_capacity_eviction` is the one-access queue's own budget
 //! (`ratio x max_size`), raw.
 //!
+//! Fast admission (`FastAdmission`, and `S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack`)
+//! makes the one-access queue DRAM: a FAST lane of the layer, carved out of the
+//! fast tier (`tiered_stack::carve`). `placement_of` reports `Fast` for a key in
+//! it and `fast_bytes_used` and `fast_object_count` count it, so admission is a
+//! plain DRAM write rather than a synchronous PMEM allocation on the calling
+//! thread. Three things follow. The two fast segments share one budget: the
+//! queue's capacity is sized from the CACHE, so it is carved out of the tier
+//! only up to what the tier can pay for, main's fast segment is what is left,
+//! and the reservation is split between them in proportion; the queue's
+//! eviction trigger reads its own budget, main's demotion trigger reads main's,
+//! and a resize of the cache settles main, since it moves the carve-out. A
+//! promotion out of the queue, and a ghost-hit admission, emit NO `(key, Fast)`
+//! migration: those keys' bytes are already DRAM (the API layer built them
+//! fast), and a migration would copy correct DRAM bytes into a fresh DRAM
+//! buffer for nothing. The second chance keeps its push: a key reaching it can
+//! really be in PMEM. And a STRUCTURAL new key takes a slow place at main's
+//! front instead of the queue, whose overflow is an eviction.
+//!
 //! The second chance pushes `(key, Fast)` whenever the key ends fast, even if
 //! it already was -- [`Push::IfEndsFast`], this family's rule, where a
 //! promotion elsewhere pushes only for a key that was slow. A structural key
@@ -77,22 +95,56 @@ use crate::PaperPolicy;
 
 use super::{
 	ghost_filter::GhostFilter,
-	tiered_stack::{Ghost, Lane, Meta, NoGhost, Push, SlowSplit, TierPolicy, TieredStack},
-	CacheSize, HashedKey, Tier,
+	tiered_stack::{newly_fills, FastSplit, Ghost, Lane, Layout, Meta, NoGhost, Push, SlowSplit, TierPolicy, TieredStack},
+	drain_target, CacheSize, HashedKey, Tier,
 };
 
-/// The slow one-access queue and the main queue.
+/// The one-access queue and the main queue.
 const ONE: Lane = 0;
 const MAIN: Lane = 1;
 
+/// Where a brand-new key is admitted: a slow one-access queue, the base
+/// design's, or a DRAM one.
+pub trait Admission: 'static {
+	type Layout: Layout;
+
+	/// Whether the one-access queue is DRAM: a FAST lane, carved out of the
+	/// fast tier.
+	const FAST: bool;
+}
+
+/// The one-access queue is entirely slow.
+pub struct SlowAdmission;
+
+/// The one-access queue is DRAM.
+pub struct FastAdmission;
+
+impl Admission for SlowAdmission {
+	type Layout = SlowSplit;
+
+	const FAST: bool = false;
+}
+
+impl Admission for FastAdmission {
+	type Layout = FastSplit;
+
+	const FAST: bool = true;
+}
+
 /// S3-FIFO: `ratio` is the one-access queue's share of the cache, with the
 /// byte budgets it and main are held to; `G` is the ghost, if any; `LAZY`
-/// gates the settle's demotion on the reference bit.
-pub struct S3<G: Ghost, const LAZY: bool> {
+/// gates the settle's demotion on the reference bit; `A` says where a new key
+/// is admitted.
+pub struct S3<G: Ghost, const LAZY: bool, A: Admission = SlowAdmission> {
 	ratio: f64,
 	one_capacity: CacheSize,
 	main_capacity: CacheSize,
-	ghost: PhantomData<fn() -> G>,
+
+	/// Whether the last check found `one_capacity` at least the whole fast
+	/// tier (`FastAdmission`): the warning for that crossing has been given.
+	filled: bool,
+
+	ghost: PhantomData<fn() -> (G, A)>,
 }
 
 /// `PaperPolicy::S3FifoCompactHybrid`.
@@ -104,25 +156,66 @@ pub type S3FifoGhostCompactHybridStack = TieredStack<S3<GhostFilter, false>>;
 /// `PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid`.
 pub type S3FifoGhostLazyDemotionCompactHybridStack = TieredStack<S3<GhostFilter, true>>;
 
-impl<G: Ghost, const LAZY: bool> S3<G, LAZY> {
+/// `PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid`.
+pub type S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack = TieredStack<S3<GhostFilter, true, FastAdmission>>;
+
+impl<G: Ghost, const LAZY: bool, A: Admission> S3<G, LAZY, A> {
+	/// The byte capacities of the one-access queue and of main, for a cache of
+	/// `max_size`.
+	fn capacities(ratio: f64, max_size: CacheSize) -> (CacheSize, CacheSize) {
+		((ratio * max_size as f64) as CacheSize, ((1.0 - ratio) * max_size as f64) as CacheSize)
+	}
+
 	fn sized(ratio: f64, max_size: CacheSize) -> Self {
-		S3 {
-			ratio,
-			one_capacity: (ratio * max_size as f64) as CacheSize,
-			main_capacity: ((1.0 - ratio) * max_size as f64) as CacheSize,
-			ghost: PhantomData,
+		let (one_capacity, main_capacity) = Self::capacities(ratio, max_size);
+
+		S3 { ratio, one_capacity, main_capacity, filled: false, ghost: PhantomData }
+	}
+
+	/// The one-access queue's budget and main's (`FastAdmission`): the
+	/// carve-out clamped to the tier, the reservation split in proportion.
+	fn budgets(s: &TieredStack<Self>) -> (CacheSize, CacheSize) {
+		s.carve_budgets(s.policy.one_capacity)
+	}
+
+	/// ONE warning to stderr when the configured one-access queue
+	/// (`ratio * max_size`) is at least the whole fast tier -- the
+	/// configuration the carve-out clamps, in which that queue takes all of the
+	/// tier and the main queue gets no fast segment -- and again only when a
+	/// later resize makes that NEWLY true. Returns whether it warned.
+	///
+	/// `eprintln!`, not `log::warn!`: this crate installs no logger (see
+	/// `merged_stack.rs`), so a `log` warning would print nowhere. Stderr is
+	/// where the crate's other diagnostics go.
+	///
+	/// Checked from `resize_fast_tier` and `resize`, not from the constructor:
+	/// `init_policy_stack` builds this stack against a 20%-of-`max_size`
+	/// placeholder and `new_hybrid` sends the real budget through
+	/// `resize_fast_tier` straight away, so that is where it first arrives.
+	fn warn(s: &mut TieredStack<Self>) -> bool {
+		let fast = s.fast_capacity();
+		let newly = newly_fills(s.policy.one_capacity, fast, &mut s.policy.filled);
+
+		if newly {
+			eprintln!(
+				"s3-fifo-ghost-lazy-demotion-fast-admission-compact-hybrid: the one-access queue's configured capacity (one_access_ratio * max_size = {} bytes) meets or exceeds the fast-tier budget ({} bytes); the queue is clamped to the whole fast tier, so the main queue gets no fast segment and every promotion will demote straight back out. Lower the ratio or raise fast_tier_size.",
+				s.policy.one_capacity,
+				fast,
+			);
 		}
+
+		newly
 	}
 }
 
-impl<G: Ghost, const LAZY: bool> TieredStack<S3<G, LAZY>> {
+impl<G: Ghost, const LAZY: bool, A: Admission> TieredStack<S3<G, LAZY, A>> {
 	pub fn new(ratio: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
 		TieredStack::with_ghost(S3::sized(ratio, max_size), fast_capacity, G::sized_for(max_size))
 	}
 }
 
-impl<G: Ghost, const LAZY: bool> TierPolicy for S3<G, LAZY> {
-	type Layout = SlowSplit;
+impl<G: Ghost, const LAZY: bool, A: Admission> TierPolicy for S3<G, LAZY, A> {
+	type Layout = A::Layout;
 	type Ghost = G;
 
 	const LAZY_DEMOTION: bool = LAZY;
@@ -130,22 +223,30 @@ impl<G: Ghost, const LAZY: bool> TierPolicy for S3<G, LAZY> {
 	const ADMIT: Lane = ONE;
 	const RESETTLE: &'static [Lane] = &[MAIN];
 	const ON_TIER_RESIZE: &'static [Lane] = &[MAIN];
+
+	/// With a DRAM one-access queue a resize of the cache moves its carve-out,
+	/// and so main's budget.
+	const ON_RESIZE: &'static [Lane] = if A::FAST { &[MAIN] } else { &[] };
 	const SECOND_CHANCE: Push = Push::IfEndsFast;
 
 	fn is_policy(&self, policy: &PaperPolicy) -> bool {
 		match policy {
-			PaperPolicy::S3FifoCompactHybrid(ratio) => !G::PRESENT && !LAZY && *ratio == self.ratio,
-			PaperPolicy::S3FifoGhostCompactHybrid(ratio) => G::PRESENT && !LAZY && *ratio == self.ratio,
-			PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(ratio) => G::PRESENT && LAZY && *ratio == self.ratio,
+			PaperPolicy::S3FifoCompactHybrid(ratio) => !G::PRESENT && !LAZY && !A::FAST && *ratio == self.ratio,
+			PaperPolicy::S3FifoGhostCompactHybrid(ratio) => G::PRESENT && !LAZY && !A::FAST && *ratio == self.ratio,
+			PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(ratio) => G::PRESENT && LAZY && !A::FAST && *ratio == self.ratio,
+			PaperPolicy::S3FifoGhostLazyDemotionFastAdmissionCompactHybrid(ratio) => G::PRESENT && LAZY && A::FAST && *ratio == self.ratio,
 			_ => false,
 		}
 	}
 
 	/// A brand-new key enters the one-access queue; one the ghost remembers
-	/// enters main.
+	/// enters main. With a DRAM one-access queue the value is already where it
+	/// goes, so a ghost hit is pushed nothing, and a STRUCTURAL key takes a slow
+	/// place at main's front instead of the queue.
 	fn admit(s: &mut TieredStack<Self>, key: HashedKey, m: Meta) {
 		match s.ghost.contains(key) {
-			true => s.admit(key, m, MAIN, true),
+			true => s.admit(key, m, MAIN, !A::FAST),
+			false if A::FAST && m.structural => s.admit(key, m, MAIN, false),
 			false => s.admit(key, m, ONE, false),
 		}
 	}
@@ -201,12 +302,38 @@ impl<G: Ghost, const LAZY: bool> TierPolicy for S3<G, LAZY> {
 		}
 	}
 
+	/// The one-access queue's own budget: raw (`ratio x max_size`), or, when it
+	/// is DRAM, its budget net of its share of the reservation, at the drain
+	/// target as main rests at the drain target of its own.
 	fn wants_eviction(s: &TieredStack<Self>) -> bool {
-		s.lane_bytes(ONE) > s.policy.one_capacity
+		match A::FAST {
+			true => s.lane_bytes(ONE) > drain_target::bytes(Self::budgets(s).0),
+			false => s.lane_bytes(ONE) > s.policy.one_capacity,
+		}
 	}
 
 	fn resized(s: &mut TieredStack<Self>, max_size: CacheSize) {
-		s.policy = S3::sized(s.policy.ratio, max_size);
+		(s.policy.one_capacity, s.policy.main_capacity) = Self::capacities(s.policy.ratio, max_size);
+
+		if A::FAST {
+			Self::warn(s);
+		}
+	}
+
+	fn tier_resized(s: &mut TieredStack<Self>) {
+		if A::FAST {
+			Self::warn(s);
+		}
+	}
+
+	/// With a DRAM one-access queue each lane settles against its budget net
+	/// of its share of the reservation; else main's is eff.
+	fn budget(s: &TieredStack<Self>, lane: Lane) -> CacheSize {
+		match (A::FAST, lane) {
+			(false, _) => s.eff(),
+			(true, ONE) => Self::budgets(s).0,
+			(true, _) => Self::budgets(s).1,
+		}
 	}
 }
 
@@ -454,5 +581,206 @@ mod resize_tests {
 	#[test]
 	fn s3_fifo_ghost_lazy_demotion() {
 		a_resize_settles_nothing(S3FifoGhostLazyDemotionCompactHybridStack::new(0.1, 1_000_000, 10_000));
+	}
+}
+
+/// Fast admission's two DRAM segments share one budget. The one-access queue's
+/// capacity is sized from the CACHE (`ratio * max_size`), so nothing ties it to
+/// the DRAM the fast tier holds: it is a carve-out of the tier only up to what
+/// the tier can pay for, and what is left is main's fast segment. The
+/// reservation is split in proportion, so that the two budgets plus ONE
+/// reservation are the fast tier exactly, for every `(ratio, max_size,
+/// fast_capacity)` -- the ones where `ratio * max_size` alone exceeds the tier
+/// included, where an unclamped queue would let the stack hold `max(fast_capacity,
+/// ratio * max_size)` bytes of DRAM.
+#[cfg(test)]
+mod fast_budget_tests {
+	use super::*;
+	use super::super::{tiered_stack::carve::shares, PolicyStack};
+
+	type Stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack;
+	type Policy = S3<GhostFilter, true, FastAdmission>;
+
+	/// Both of this design's segments are DRAM (the one-access queue is fast),
+	/// so their budgets plus the reservation they were jointly charged for ARE
+	/// the fast tier. An admission into a DRAM-resident queue has to draw down
+	/// the DRAM budget, not the cache budget.
+	///
+	/// The configurations that matter are the ones where `ratio * max_size`
+	/// alone exceeds `fast_capacity`: without the clamp the queue is capped
+	/// ABOVE the whole tier while main's budget saturates to 0, and the settle,
+	/// which governs only main, cannot pull any of it back.
+	#[test]
+	fn the_two_fast_segments_never_exceed_the_fast_budget() {
+		const MAX_SIZE: CacheSize = 12_000_000_000;
+		const FAST_CAPACITY: CacheSize = 4 * 1024 * 1024 * 1024;
+
+		for ratio in [0.0f64, 0.1, 0.25, 0.3, 0.5, 1.0] {
+			let mut stack = Stack::new(ratio, MAX_SIZE, FAST_CAPACITY).with_shared_overhead(224);
+
+			// A populated stack, so the reservation is a real number and the
+			// proportional split is actually exercised rather than trivially zero.
+			for i in 0..1_000u64 {
+				stack.insert(i, 4_096);
+			}
+
+			let (one, main) = Policy::budgets(&stack);
+			let total = one + main + stack.dram_reserved_bytes();
+
+			assert!(total <= FAST_CAPACITY, "ratio {ratio}: the DRAM-resident caps sum to {total}, over the {FAST_CAPACITY} byte fast tier");
+
+			// And exactly, not merely under: the split hands the remainder to main,
+			// so the two shares re-sum to the reservation.
+			assert_eq!(total, FAST_CAPACITY, "ratio {ratio}: the split must account for the budget exactly");
+		}
+	}
+
+	/// The clamp must be invisible to every configuration that already fits --
+	/// which is every published sweep -- so those results stay bit-identical.
+	#[test]
+	fn a_carve_out_that_fits_is_untouched() {
+		const MAX_SIZE: CacheSize = 12_000_000_000;
+		const FAST_CAPACITY: CacheSize = 4 * 1024 * 1024 * 1024;
+
+		// 0.1 * MAX_SIZE = 1.2e9, comfortably inside the 4 GiB budget.
+		let stack = Stack::new(0.1, MAX_SIZE, FAST_CAPACITY).with_shared_overhead(224);
+		let one_capacity = stack.policy.one_capacity;
+		let (_, main_share) = shares(one_capacity, stack.dram_reserved_bytes(), FAST_CAPACITY);
+
+		assert_eq!(one_capacity.min(FAST_CAPACITY), one_capacity, "a carve-out under the budget must pass through unchanged");
+		assert_eq!(Policy::budgets(&stack).1, FAST_CAPACITY - one_capacity - main_share, "and main must still get the plain remainder");
+	}
+}
+
+/// The carve-out warning: one stderr line per crossing of
+/// `one_capacity >= fast_capacity`, checked from both resize entry points.
+#[cfg(test)]
+mod carve_out_warning_tests {
+	use super::*;
+	use super::super::PolicyStack;
+
+	type Stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack;
+	type Policy = S3<GhostFilter, true, FastAdmission>;
+
+	#[test]
+	fn the_carve_out_warning_fires_once_per_crossing() {
+		// 0.6 * 1_000 = 600 B of admission queue against a 1_000 B tier: fits.
+		let mut stack = Stack::new(0.6, 1_000, 1_000);
+
+		assert!(!Policy::warn(&mut stack), "a queue that fits the tier must not warn");
+
+		stack.resize_fast_tier(600);
+		assert!(stack.policy.filled, "resize_fast_tier checks: a 600 B queue on a 600 B tier covers it");
+		assert!(!Policy::warn(&mut stack), "once per crossing, not once per check");
+
+		stack.resize_fast_tier(1_000);
+		assert!(!stack.policy.filled, "resize_fast_tier re-checks: 600 B fits 1_000 B again");
+
+		stack.resize_fast_tier(400);
+		assert!(stack.policy.filled, "resize_fast_tier re-checks: 600 B covers 400 B");
+
+		stack.resize(500);
+		assert!(!stack.policy.filled, "resize re-checks: 0.6 * 500 = 300 B fits 400 B");
+	}
+
+	/// The slow-admission designs have no carve-out to warn about.
+	#[test]
+	fn a_slow_one_access_queue_never_warns() {
+		let mut stack = S3FifoGhostLazyDemotionCompactHybridStack::new(1.0, 1_000, 1_000);
+
+		stack.resize_fast_tier(400);
+		stack.resize(500);
+
+		assert!(!stack.policy.filled);
+	}
+}
+
+/// The books against the queues after EVERY operation of a long random
+/// sequence (`tiered_stack::testing`), the DRAM one-access queue's included.
+#[cfg(test)]
+mod invariant_tests {
+	use super::*;
+	use super::super::tiered_stack::testing::books_match_the_queue_after_every_operation;
+
+	#[test]
+	fn the_books_match_the_queues_after_every_operation() {
+		let stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(0.04, 240_000, 24_000).with_shared_overhead(40);
+		let (demoted, promoted) = books_match_the_queue_after_every_operation(stack);
+
+		assert!(demoted > 100, "the sequence never demoted ({demoted})");
+		assert!(promoted > 0, "the sequence never promoted ({promoted})");
+	}
+}
+
+/// With a DRAM one-access queue a resize of the cache settles main, as
+/// `resettle` and a resize of the fast tier do: the queue's capacity moves with
+/// the cache, and main's budget with that. (With a slow one it settles
+/// nothing.)
+#[cfg(test)]
+mod fast_resize_tests {
+	use super::*;
+	use super::super::PolicyStack;
+
+	/// A tier of 10_000 B with a 2_000 B one-access queue. Six keys of 1_000 B
+	/// are admitted and five of them hit, which promotes them to main, all
+	/// fast; then the measured metadata takes 7_000 B of the tier, so main's
+	/// budget is 2_400 B and nothing has settled it.
+	fn over_its_budget() -> S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack {
+		let mut stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(0.02, 100_000, 10_000);
+
+		for key in 1..=6 {
+			stack.insert(key, 1_000);
+		}
+
+		for key in 1..=5 {
+			stack.update(key);
+		}
+
+		assert_eq!(stack.fast_bytes_used(), 6_000, "the fixture must leave five keys fast in main and one in the queue");
+
+		drop(stack.drain_tier_migrations());
+		stack.set_dram_metadata(Some(7_000));
+
+		stack
+	}
+
+	#[test]
+	fn a_resize_settles_main() {
+		let mut stack = over_its_budget();
+
+		stack.resize(100_000);
+
+		assert_eq!(
+			stack.drain_tier_migrations(),
+			vec![(1, Tier::Slow), (2, Tier::Slow), (3, Tier::Slow)],
+			"main drains to 0.95 x 2_400 B: three of its five keys go",
+		);
+	}
+
+	#[test]
+	fn a_resize_of_the_fast_tier_and_a_resettle_settle_the_same_lane() {
+		let (mut by_tier, mut by_resettle) = (over_its_budget(), over_its_budget());
+
+		by_tier.resize_fast_tier(10_000);
+		by_resettle.resettle();
+
+		let migrations = by_tier.drain_tier_migrations();
+
+		assert_eq!(migrations.len(), 3, "the fixture must leave main over its budget");
+		assert_eq!(migrations, by_resettle.drain_tier_migrations());
+	}
+
+	/// The one-access queue's own budget is the carve-out net of its share of
+	/// the reservation, at the drain target: 1_400 B of the 2_000 B are the
+	/// queue's share, so 600 B x 0.95 = 570 B, and one 1_000 B key is over it.
+	#[test]
+	fn the_queue_asks_for_an_eviction_over_its_budget_at_the_drain_target() {
+		let mut stack = over_its_budget();
+
+		assert!(stack.needs_capacity_eviction(), "1_000 B in a queue whose budget is 570 B");
+
+		stack.set_dram_metadata(None);
+
+		assert!(!stack.needs_capacity_eviction(), "1_000 B against a 2_000 B budget at its drain target of 1_900 B");
 	}
 }
