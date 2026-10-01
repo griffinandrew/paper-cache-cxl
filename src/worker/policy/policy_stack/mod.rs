@@ -65,8 +65,6 @@ mod s3_fifo_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_faithful_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
-mod two_q_ghost_compact_hybrid_stack;
-#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_ghost_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_ghost_lazy_demotion_compact_hybrid_stack;
@@ -128,12 +126,11 @@ use crate::{
 		lru_lfu_compact_hybrid_stack::LruLfuCompactHybridStack,
 		lru_fifo_clock_hybrid_stacks::{ClockCompactHybridStack, FifoCompactHybridStack, LruCompactHybridStack},
 		lfu_compact_hybrid_stack::LfuCompactHybridStack,
-		two_q_hybrid_stacks::TwoQCompactHybridStack,
+		two_q_hybrid_stacks::{TwoQCompactHybridStack, TwoQGhostCompactHybridStack},
 		two_q_fast_admission_reprieve_compact_hybrid_stack::TwoQFastAdmissionReprieveCompactHybridStack,
 		two_q_full_fast_admission_compact_hybrid_stack::TwoQFullFastAdmissionCompactHybridStack,
 		lru_sized_compact_hybrid_stack::LruSizedCompactHybridStack,
 		s3_fifo_compact_hybrid_stack::S3FifoCompactHybridStack,
-		two_q_ghost_compact_hybrid_stack::TwoQGhostCompactHybridStack,
 		s3_fifo_ghost_compact_hybrid_stack::S3FifoGhostCompactHybridStack,
 		s3_fifo_ghost_lazy_demotion_compact_hybrid_stack::S3FifoGhostLazyDemotionCompactHybridStack,
 		s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack,
@@ -1025,7 +1022,7 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 
 		// Same construction/default-fast-tier-budget shape as
 		// TwoQCompactHybrid/S3FifoCompactHybrid above -- see
-		// two_q_ghost_compact_hybrid_stack.rs's module doc for the ghost-queue
+		// two_q_hybrid_stacks.rs's module doc for the ghost-queue
 		// mechanics these add on top.
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::TwoQGhostCompactHybrid(k_in) => Box::new(

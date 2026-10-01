@@ -7,7 +7,8 @@
 
 //! Simplified 2Q, tier-segmented: a [`TierPolicy`] over a slow admission FIFO
 //! and a main queue whose fast prefix is the tier (R4; it was a whole stack
-//! of its own, `TwoQCompactHybridStack`, in a file of its own).
+//! of its own, `TwoQCompactHybridStack`, in a file of its own), with and
+//! without a ghost (`TwoQGhostCompactHybridStack`).
 //!
 //! Admission lands at the front of the FIFO and is entirely slow-tier: a
 //! new key is built slow, and nothing is pushed or settled. A hit there
@@ -16,6 +17,16 @@
 //! layer's cursor names its least-recently-used fast key, and demotion steps
 //! it one place toward the MRU end per victim. Terminal eviction prefers the
 //! FIFO tail, falling back to the main tail. Nothing is searched for.
+//!
+//! The ghost: a key evicted from the FIFO tail leaves a fingerprint behind
+//! ([`GhostFilter`](super::ghost_filter::GhostFilter): a fixed table with no
+//! keys and no index, outside the slab), and a later admission that hits it
+//! skips the FIFO entirely and enters the front of main, fast -- a real
+//! promotion, since the value was built slow, so it is pushed `(key, Fast)`.
+//! (Slow, and pushed nothing, when the value is structural.) A hit does not
+//! retire the entry, the ghost's window follows main's population and is
+//! trimmed only by a genuine main eviction, and the layer clears a key's
+//! fingerprint in `remove` before it asks whether the key is tracked.
 //!
 //! `needs_capacity_eviction` is the FIFO's own budget: its bytes over
 //! `k_in x max_size`, raw (not scaled by the drain target, and not clamped to
@@ -31,10 +42,13 @@
 //! differential tests that proved the two agreed, and `tier_goldens.txt` holds
 //! what this design did, fingerprinted, before it was ported.
 
+use std::marker::PhantomData;
+
 use crate::PaperPolicy;
 
 use super::{
-	tiered_stack::{Lane, Push, SlowSplit, TierPolicy, TieredStack},
+	ghost_filter::GhostFilter,
+	tiered_stack::{Ghost, Lane, Meta, NoGhost, Push, SlowSplit, TierPolicy, TieredStack},
 	CacheSize, HashedKey,
 };
 
@@ -42,30 +56,59 @@ use super::{
 const FIFO: Lane = 0;
 const MAIN: Lane = 1;
 
-/// 2Q: `k_in` is the FIFO's share of the cache, `fifo_capacity` its bytes.
-pub struct TwoQ {
+/// 2Q: `k_in` is the FIFO's share of the cache, `fifo_capacity` its bytes;
+/// `G` is the ghost, if any.
+pub struct TwoQ<G: Ghost> {
 	k_in: f64,
 	fifo_capacity: CacheSize,
+	ghost: PhantomData<fn() -> G>,
 }
 
 /// `PaperPolicy::TwoQCompactHybrid`.
-pub type TwoQCompactHybridStack = TieredStack<TwoQ>;
+pub type TwoQCompactHybridStack = TieredStack<TwoQ<NoGhost>>;
 
-impl TwoQCompactHybridStack {
+/// `PaperPolicy::TwoQGhostCompactHybrid`.
+pub type TwoQGhostCompactHybridStack = TieredStack<TwoQ<GhostFilter>>;
+
+impl<G: Ghost> TieredStack<TwoQ<G>> {
 	pub fn new(k_in: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
-		TieredStack::with(TwoQ { k_in, fifo_capacity: (k_in * max_size as f64) as CacheSize }, fast_capacity)
+		let policy = TwoQ { k_in, fifo_capacity: (k_in * max_size as f64) as CacheSize, ghost: PhantomData };
+
+		TieredStack::with_ghost(policy, fast_capacity, G::sized_for(max_size))
 	}
 }
 
-impl TierPolicy for TwoQ {
+impl<G: Ghost> TierPolicy for TwoQ<G> {
 	type Layout = SlowSplit;
+	type Ghost = G;
 
 	const ADMIT: Lane = FIFO;
 	const RESETTLE: &'static [Lane] = &[MAIN];
 	const ON_TIER_RESIZE: &'static [Lane] = &[MAIN];
 
 	fn is_policy(&self, policy: &PaperPolicy) -> bool {
-		matches!(policy, PaperPolicy::TwoQCompactHybrid(k_in) if *k_in == self.k_in)
+		match policy {
+			PaperPolicy::TwoQCompactHybrid(k_in) => !G::PRESENT && *k_in == self.k_in,
+			PaperPolicy::TwoQGhostCompactHybrid(k_in) => G::PRESENT && *k_in == self.k_in,
+			_ => false,
+		}
+	}
+
+	/// A brand-new key enters the FIFO; one the ghost remembers enters main.
+	fn admit(s: &mut TieredStack<Self>, key: HashedKey, m: Meta) {
+		match s.ghost.contains(key) {
+			true => s.admit(key, m, MAIN, true),
+			false => s.admit(key, m, FIFO, false),
+		}
+	}
+
+	/// The FIFO's evictions populate the ghost; a main eviction trims it to
+	/// main's population (a second chance does not).
+	fn evicted(s: &mut TieredStack<Self>, lane: Lane, key: HashedKey) {
+		match lane {
+			FIFO => s.ghost.insert(key),
+			_ => s.ghost.set_window(s.lane_len(MAIN)),
+		}
 	}
 
 	/// A FIFO key goes to the front of main, fast; a main key is moved to the

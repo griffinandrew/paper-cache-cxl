@@ -3433,7 +3433,7 @@ enters and the lanes each entry point settles, copied from each design's own bod
 family's second chance pushes `(k, Fast)` for a key that was already fast
 (`Push::IfEndsFast`); everything else pushes only for a promotion: both are kept, as knobs.
 
-Ported so far: LRU, FIFO and CLOCK (`lru_fifo_clock_hybrid_stacks.rs`); 2Q (`two_q_hybrid_stacks.rs`).
+Ported so far: LRU, FIFO and CLOCK (`lru_fifo_clock_hybrid_stacks.rs`); 2Q and 2Q-ghost (`two_q_hybrid_stacks.rs`).
 
 What pins each design that is on it: `policy_stack/tier_golden.rs` records, for all 23 designs
 and before any was ported, a fingerprint of every observable over a grid (`tier_goldens.txt`,

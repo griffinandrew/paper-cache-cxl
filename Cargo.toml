@@ -307,7 +307,7 @@ s3_fifo_faithful_fast_admission_reprieve_compact_hybrid_cache = ["key_value_pmem
 # ghost queue, not `TwoQCompactStack`'s heavier real-object `a1_out`), so a
 # later re-admission is trusted immediately (lands directly in the main
 # queue's fast tier) instead of restarting from the FIFO queue. See
-# worker/policy/policy_stack/two_q_ghost_compact_hybrid_stack.rs for the ghost
+# worker/policy/policy_stack/two_q_hybrid_stacks.rs for the ghost
 # mechanics.
 #
 two_q_ghost_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]

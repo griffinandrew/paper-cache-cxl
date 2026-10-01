@@ -32,9 +32,9 @@
 //!
 //! The layer keeps one [`Book`] per lane -- bytes and objects, per tier -- and
 //! every gauge is a sum of them; the migration log, in emission order; the
-//! reservation (measured M, else `len x omega`), eff and the structural test;
-//! and the settle loop, which demotes the cursor's key while the fast bytes
-//! of a lane are over the drain target of eff.
+//! reservation (measured M, else `len x omega` and the ghost's entries), eff
+//! and the structural test; and the settle loop, which demotes the cursor's
+//! key while the fast bytes of a lane are over the drain target of eff.
 //!
 //! # The push rule
 //!
@@ -43,10 +43,12 @@
 //! demotion pushes `(key, Slow)`; a key that leaves the fast set because it
 //! is structural pushes it before the settle; a promotion pushes `(key, Fast)`
 //! AFTER the settle that may undo it, guarded on the key still being fast. A
-//! new key pushes nothing. One accident of history is a knob rather than a
-//! rule: the S3-FIFO family's second chance pushes `(key, Fast)` for a key
-//! that was already fast ([`Push::IfEndsFast`]), where everything else pushes
-//! only for a real promotion ([`Push::IfPromoted`]). Both are kept.
+//! new key pushes nothing -- unless the ghost remembers it: built slow and
+//! admitted fast, it is pushed `(key, Fast)` after the settle. One accident
+//! of history is a knob rather than a rule: the S3-FIFO family's second
+//! chance pushes `(key, Fast)` for a key that was already fast
+//! ([`Push::IfEndsFast`]), where everything else pushes only for a real
+//! promotion ([`Push::IfPromoted`]). Both are kept.
 //!
 //! # A policy
 //!
@@ -65,6 +67,7 @@ use crate::{object::ObjectSize, PaperPolicy};
 
 use super::{
 	arena_queue_set::{ArenaQueueSet, MAX_QUEUES, NodePayload},
+	ghost_filter::GhostFilter,
 	drain_target, narrow_resident, placed, prev_fast, CacheSize, HashedKey, Placement, PolicyStack, SetEvent, Tier,
 };
 
@@ -128,9 +131,107 @@ impl Meta {
 	}
 }
 
+/// What a design remembers of the keys it evicted: the S3-FIFO family's
+/// fingerprint table, or nothing ([`NoGhost`]). The layer owns its lifecycle --
+/// a `remove` drops a key's fingerprint before it asks whether the key is
+/// tracked (after a probation eviction a key lives ONLY in the ghost), a
+/// `clear` empties it, and its bytes join the reservation and the structure
+/// -- and the policy decides what goes in and when it is trimmed.
+pub trait Ghost: Send + 'static {
+	/// Whether the design has a ghost at all.
+	const PRESENT: bool;
+
+	/// A ghost for a cache of `max_size` bytes.
+	fn sized_for(max_size: CacheSize) -> Self;
+
+	fn contains(&self, key: HashedKey) -> bool;
+	fn insert(&mut self, key: HashedKey);
+	fn remove(&mut self, key: HashedKey);
+	fn clear(&mut self);
+
+	/// Ages out what was inserted more than `entries` insertions ago.
+	fn set_window(&mut self, entries: usize);
+
+	/// DRAM its entries are charged, in the per-object reservation.
+	fn dram_bytes(&self) -> CacheSize;
+
+	/// Usable bytes its table holds (S5a).
+	// Read only through `PolicyStack::structure_bytes`, which only a tiered
+	// cache's worker calls.
+	#[cfg_attr(not(feature = "hybrid_cache_common"), allow(dead_code))]
+	fn allocated_bytes(&self) -> u64;
+}
+
+/// No ghost.
+pub struct NoGhost;
+
+impl Ghost for NoGhost {
+	const PRESENT: bool = false;
+
+	fn sized_for(_max_size: CacheSize) -> Self {
+		NoGhost
+	}
+
+	fn contains(&self, _key: HashedKey) -> bool {
+		false
+	}
+
+	fn insert(&mut self, _key: HashedKey) {}
+	fn remove(&mut self, _key: HashedKey) {}
+	fn clear(&mut self) {}
+	fn set_window(&mut self, _entries: usize) {}
+
+	fn dram_bytes(&self) -> CacheSize {
+		0
+	}
+
+	fn allocated_bytes(&self) -> u64 {
+		0
+	}
+}
+
+impl Ghost for GhostFilter {
+	const PRESENT: bool = true;
+
+	/// Sized from the cache's own capacity assuming a 512-byte nominal object,
+	/// capped at 8 Mi slots. Under-sizing only costs ghost hits.
+	fn sized_for(max_size: CacheSize) -> Self {
+		GhostFilter::with_capacity(((max_size / 512) as usize).min(8 << 20))
+	}
+
+	fn contains(&self, key: HashedKey) -> bool {
+		GhostFilter::contains(self, key)
+	}
+
+	fn insert(&mut self, key: HashedKey) {
+		GhostFilter::insert(self, key);
+	}
+
+	fn remove(&mut self, key: HashedKey) {
+		GhostFilter::remove(self, key);
+	}
+
+	fn clear(&mut self) {
+		GhostFilter::clear(self);
+	}
+
+	fn set_window(&mut self, entries: usize) {
+		GhostFilter::set_window(self, entries);
+	}
+
+	fn dram_bytes(&self) -> CacheSize {
+		GhostFilter::dram_bytes(self)
+	}
+
+	fn allocated_bytes(&self) -> u64 {
+		GhostFilter::allocated_bytes(self)
+	}
+}
+
 /// The rules a design supplies to the layer.
 pub trait TierPolicy: Sized + Send + 'static {
 	type Layout: Layout;
+	type Ghost: Ghost;
 
 	/// The lane a brand-new key enters.
 	const ADMIT: Lane = 0;
@@ -168,13 +269,17 @@ pub trait TierPolicy: Sized + Send + 'static {
 
 	/// A `Set` of a key it does not: the front of the admission lane.
 	fn admit(s: &mut TieredStack<Self>, key: HashedKey, m: Meta) {
-		s.admit(key, m, Self::ADMIT);
+		s.admit(key, m, Self::ADMIT, false);
 	}
 
 	/// Removes and returns the key this design evicts next: the tail of lane 0.
 	fn victim(s: &mut TieredStack<Self>) -> Option<HashedKey> {
 		s.evict_tail(0)
 	}
+
+	/// A key was evicted from `lane` (not removed, not moved): the ghost's to
+	/// hear of.
+	fn evicted(_s: &mut TieredStack<Self>, _lane: Lane, _key: HashedKey) {}
 
 	/// `needs_capacity_eviction`: a sub-queue over its own capacity.
 	fn wants_eviction(_s: &TieredStack<Self>) -> bool {
@@ -406,6 +511,9 @@ pub struct TieredStack<P: TierPolicy> {
 	/// The design's own state: its ratios, capacities, counters.
 	pub policy: P,
 
+	/// What it remembers of the keys it evicted.
+	pub ghost: P::Ghost,
+
 	lanes: Lanes<P::Layout>,
 
 	fast_capacity: CacheSize,
@@ -417,9 +525,15 @@ pub struct TieredStack<P: TierPolicy> {
 	measured: Option<CacheSize>,
 }
 
-impl<P: TierPolicy> TieredStack<P> {
+impl<P: TierPolicy<Ghost = NoGhost>> TieredStack<P> {
 	pub fn with(policy: P, fast_capacity: CacheSize) -> Self {
-		TieredStack { policy, lanes: Lanes::new(), fast_capacity, shared_overhead: 0, measured: None }
+		Self::with_ghost(policy, fast_capacity, NoGhost)
+	}
+}
+
+impl<P: TierPolicy> TieredStack<P> {
+	pub fn with_ghost(policy: P, fast_capacity: CacheSize, ghost: P::Ghost) -> Self {
+		TieredStack { policy, ghost, lanes: Lanes::new(), fast_capacity, shared_overhead: 0, measured: None }
 	}
 
 	/// Per-object DRAM reserved from the fast tier for shared metadata.
@@ -433,10 +547,13 @@ impl<P: TierPolicy> TieredStack<P> {
 
 	/// Metadata reservation for EVERY tracked key, fast or slow: a demotion
 	/// moves the value and leaves the key's row, stack node and header in
-	/// DRAM. See `PolicyStack::dram_reserved_bytes` for the rule, and for why a
+	/// DRAM -- plus the ghost's entries, which are DRAM as well (under the
+	/// measured model its table is inside the pushed M, so its own term applies
+	/// only to the per-object reservation). See
+	/// `PolicyStack::dram_reserved_bytes` for the rule, and for why a
 	/// reservation at or over `fast_capacity` is left to saturate.
 	fn reserved(&self) -> CacheSize {
-		self.measured.unwrap_or(self.lanes.set.len() as CacheSize * self.shared_overhead)
+		self.measured.unwrap_or(self.lanes.set.len() as CacheSize * self.shared_overhead + self.ghost.dram_bytes())
 	}
 
 	/// This stack's eff (S5): the whole fast tier's budget for values, its
@@ -465,6 +582,11 @@ impl<P: TierPolicy> TieredStack<P> {
 
 	pub fn tail(&self, lane: Lane) -> Option<HashedKey> {
 		self.lanes.set.back(lane)
+	}
+
+	/// Keys in `lane`.
+	pub fn lane_len(&self, lane: Lane) -> usize {
+		self.lanes.set.queue_len(lane)
 	}
 
 	/// Bytes `lane` holds, in both tiers.
@@ -496,8 +618,10 @@ impl<P: TierPolicy> TieredStack<P> {
 
 	/// A brand-new key at the front of `lane`: fast, settled, if the lane is
 	/// split and the value not structural; else slow (built slow, charged
-	/// slow, nothing settled, nothing pushed).
-	pub fn admit(&mut self, key: HashedKey, m: Meta, lane: Lane) {
+	/// slow, nothing settled, nothing pushed). `push`: the key was built slow
+	/// and goes to fast (a ghost hit), so it is pushed `(key, Fast)` after the
+	/// settle, guarded on still being fast.
+	pub fn admit(&mut self, key: HashedKey, m: Meta, lane: Lane, push: bool) {
 		let tier = match Lanes::<P::Layout>::split(lane) && !m.structural {
 			true => Tier::Fast,
 			false => Tier::Slow,
@@ -507,6 +631,10 @@ impl<P: TierPolicy> TieredStack<P> {
 
 		if tier == Tier::Fast {
 			self.settle(lane);
+
+			if push && self.tier_of(key) == Some(Tier::Fast) {
+				self.lanes.log.push((key, Tier::Fast));
+			}
 		}
 	}
 
@@ -574,7 +702,11 @@ impl<P: TierPolicy> TieredStack<P> {
 
 	/// Removes `key` from its lane and the books; the victim.
 	pub fn evict(&mut self, key: HashedKey) -> Option<HashedKey> {
-		self.lanes.unlink(key).map(|_| key)
+		let lane = self.lanes.unlink(key)?.queue as Lane;
+
+		P::evicted(self, lane, key);
+
+		Some(key)
 	}
 
 	/// Evicts the tail of `lane`.
@@ -649,6 +781,9 @@ impl<P: TierPolicy> PolicyStack for TieredStack<P> {
 	}
 
 	fn remove(&mut self, key: HashedKey) {
+		// BEFORE the tracked check: after a probation eviction a key lives only
+		// in the ghost, with no entry row to find.
+		self.ghost.remove(key);
 		self.lanes.unlink(key);
 	}
 
@@ -662,6 +797,7 @@ impl<P: TierPolicy> PolicyStack for TieredStack<P> {
 
 	fn clear(&mut self) {
 		self.lanes.clear();
+		self.ghost.clear();
 	}
 
 	fn evict_one(&mut self) -> Option<HashedKey> {
@@ -689,7 +825,7 @@ impl<P: TierPolicy> PolicyStack for TieredStack<P> {
 	}
 
 	fn structure_bytes(&self) -> Option<crate::meta::NodeBytes> {
-		Some(crate::meta::NodeBytes::stack(self.lanes.set.allocated_bytes()))
+		Some(crate::meta::NodeBytes::stack(self.lanes.set.allocated_bytes() + self.ghost.allocated_bytes()))
 	}
 
 	fn dram_reserved_bytes(&self) -> CacheSize {
@@ -737,11 +873,6 @@ pub(super) mod testing {
 		/// The lane `key` is in.
 		pub fn lane_of(&self, key: HashedKey) -> Option<Lane> {
 			self.lanes.set.payload(key).map(|p| p.queue as Lane)
-		}
-
-		/// Keys in `lane`.
-		pub fn lane_len(&self, lane: Lane) -> usize {
-			self.lanes.set.queue_len(lane)
 		}
 	}
 
@@ -862,6 +993,7 @@ mod tests {
 
 	impl<const ENDS_FAST: bool> TierPolicy for Toy<ENDS_FAST> {
 		type Layout = SlowSplit;
+		type Ghost = NoGhost;
 
 		const ADMIT: Lane = PROBATION;
 		const RESETTLE: &'static [Lane] = &[MAIN];
@@ -953,5 +1085,17 @@ mod tests {
 
 		check::<true>(true);
 		check::<false>(false);
+	}
+
+	/// The ghost is sized from the cache -- a slot per 512 bytes, rounded up to a
+	/// power of two -- and capped at 8 Mi slots, so a cache of any size gets a
+	/// table of 64 MiB at most.
+	#[test]
+	fn the_ghost_grows_with_the_cache_up_to_8_mi_slots() {
+		let table = |max_size: CacheSize| <GhostFilter as Ghost>::sized_for(max_size).allocated_bytes();
+
+		assert!(table(2 << 30) > table(1 << 30), "the table does not grow with the cache");
+		assert!(table(4 << 30) > table(2 << 30), "the table stops growing before 8 Mi slots");
+		assert_eq!(table(8 << 30), table(4 << 30), "the table is not capped at 8 Mi slots");
 	}
 }

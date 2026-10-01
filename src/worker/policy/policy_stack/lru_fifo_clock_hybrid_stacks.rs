@@ -69,7 +69,7 @@ use crate::PaperPolicy;
 
 use super::{
 	clock_hand_budget,
-	tiered_stack::{Lane, Meta, Push, Single, TierPolicy, TieredStack},
+	tiered_stack::{Lane, Meta, NoGhost, Push, Single, TierPolicy, TieredStack},
 	CacheSize, HashedKey, PolicyStack,
 };
 
@@ -108,6 +108,7 @@ constructors!(LruCompactHybridStack = Lru, FifoCompactHybridStack = Fifo, ClockC
 
 impl TierPolicy for Lru {
 	type Layout = Single;
+	type Ghost = NoGhost;
 
 	fn is_policy(&self, policy: &PaperPolicy) -> bool {
 		matches!(policy, PaperPolicy::LruCompactHybrid)
@@ -122,6 +123,7 @@ impl TierPolicy for Lru {
 
 impl TierPolicy for Fifo {
 	type Layout = Single;
+	type Ghost = NoGhost;
 
 	fn is_policy(&self, policy: &PaperPolicy) -> bool {
 		matches!(policy, PaperPolicy::FifoCompactHybrid)
@@ -139,6 +141,7 @@ impl TierPolicy for Fifo {
 
 impl TierPolicy for Clock {
 	type Layout = Single;
+	type Ghost = NoGhost;
 
 	fn is_policy(&self, policy: &PaperPolicy) -> bool {
 		matches!(policy, PaperPolicy::ClockCompactHybrid)
