@@ -3627,3 +3627,56 @@ Tests removed: the two that existed only under `fused_value` --
 `value::tests::the_item_layout_always_demands_eight_byte_alignment` (the second name also exists in
 `thin_header`'s module, so it still runs there). No suite build ever enabled the feature (the harness has
 no fused build), so no test in the D, M, TD, TM, ID, IT, IM, MD, MTD, MTM, FLATM or ESP logs goes.
+
+## Byte-string keys held inline in the tiered item (`thin_header`)
+
+Re-ported from the real-keys side branch (`e68dac4`) onto the code S5 to S8 built. Under `thin_header` a
+`String`, `Vec<u8>` or `Box<[u8]>` key was held in the item as a `K` -- a 24- or 16-byte handle whose
+characters were a separate allocation from the global allocator: DRAM, whatever tier the object was in,
+charged to no tier. Now such a key goes into the item as its bytes, in the same allocation as the length,
+the expiry and the value, and tiers with them:
+
+```
+[len u32 | expiry u32 | key_len u32 | key bytes | pad to 8 | value]
+```
+
+Bit 1 of the 16-byte DRAM header's word marks an item that holds its key so (`KEY_BYTES_BIT`; bit 0 is still
+the tier), and which shape a key takes is decided by its TYPE (`key_as_bytes`, through `TypeId`, so it costs
+nothing at run time). Every other key type, and every build without `thin_header`, is held as a `K` exactly as
+before: a `u64`-keyed build is unchanged (T14, which uses `u64` keys, is byte-identical to its parent's).
+`value_thin.rs`'s module doc ("The key") has the layout and the sizes.
+
+`TieredValue::key()` and `Object::key()` panic for an item that holds bytes -- there is no `K` to lend --
+naming the alternatives: `key_matches` compares bytes and `key_owned` rebuilds the key. No library path
+calls `key()` (the cache's own lookups go through `key_matches`). `Object::new*` and `key_matches` gain `K:
+'static`, as do `erase`, `erase_sized` and the TTL worker; `PaperCache` already required it.
+
+What the re-port added to `e68dac4`, which predates S5: every figure the admission path computes before the
+object exists is asked of the KEY now, because the item's prefix depends on the key's length. The value
+reports `item_prefix_bytes()` and `key_accounted_size()` once it is built and `item_prefix_bytes_for(&key)` and
+`key_accounted_size_for(&key)` before (`value.rs` answers 0 and `get_size()`, in the default layout, whatever
+the key); `overhead::resident_item_bytes(object)` and `resident_item_bytes_for(key, len)` are the one rounding
+of what the item costs, and `base_size`, `base_size_for`, `dram_resident_size_for`, `Slot::migrating` and the
+byte gate's reservation (`phys::value_charge_for`, in `begin_set`) all come from them. A bytes key's `key_size`
+is a `HashedKey`, which `DOUBLE_COUNTED_IN_BASE_SIZE` takes back off, so the key is charged once, inside the
+item, and `size - dram_resident` is still exactly the item a migration moves. P: `new_with_key_bytes` charges
+`phys::item_charge(prefix, len)` once the value exists and `ValueHeader::drop` refunds it, as for a key held as
+a `K`; `ObjectStore::for_each_value` (and the merged store's) hands the placement audit the object's charge
+rather than its length, so the audit's model is exact for these keys too. `resident_object_bytes::<K>` and
+`value_header_bytes::<K>` remain, as the per-type form for what has no key to ask: `phys::value_charge` and the
+fixtures that build an object of a given cost from a length, all of which key by `u64`.
+
+Tests. From `e68dac4`, in `value_thin.rs`: a `String` key is held as its bytes inside the item (one
+allocation, bit 1 set, the key at 12 and the value at its rounded end); keys of every length survive
+fast -> slow -> fast; `Vec<u8>` and `Box<[u8]>` keys take the same path, non-UTF-8 bytes included, and a POD
+key the other; borrowing a bytes key panics; a bytes-key item is freed to its tier exactly once; a slow
+item's key bytes are on the slow node. In `overhead.rs`: an allocator-exact accounting check for `String`
+keys (key lengths 0 to 250 against value lengths either side of the size classes: the allocator's
+per-object figure equals the item plus the 16-byte header). New: the figures asked of a key are the built
+value's (`value_thin.rs`); `base_size_for_equals_base_size` also runs over empty, long, `Vec<u8>` and
+`Box<[u8]>` keys; `string_keys_hold_p_to_the_stacks_fast_used_and_return_it_to_zero`
+(`tests/phys_fast_identity.rs`: the admission path, the charge at allocation, migrations both ways,
+overwrites and deletes, and the refund on drop agree, in both layouts); the slow-tier accounting test
+(`tests/merged_object_store_slow_accounting.rs`) also runs with `String` keys, where the store's charge to
+the slow tier equals the allocator's count with the key bytes in it; and `Box<[u8]>` keys end to end across
+the tiers (`tests/generic_key_smoke.rs`).

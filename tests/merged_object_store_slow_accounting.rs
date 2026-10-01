@@ -20,10 +20,18 @@
 //! went back to DRAM, and the store went on charging them to the slow tier:
 //! 6,877 objects and 793,088 B, ratio 0.944, on the cluster99 golden trace.
 //!
-//! ONE test, in a binary of its own, on purpose: the counter is process-global,
-//! so a second cache alive at the same time -- another test on another thread
-//! -- would be counted too. The caches below run one after another, each
-//! dropped (and its workers joined) before the next is built.
+//! Its own binary, on purpose, and every cache in a child process of its own:
+//! the counter is process-global, so a second cache alive at the same time --
+//! another test on another thread -- would be counted too. The caches below
+//! run one after another, each dropped (and its workers joined) before the
+//! next is built.
+//!
+//! The keys are `u64`s, and in a second test `String`s: under `thin_header` a
+//! `String` key is held as bytes INSIDE the slow item (`value_thin.rs`, "The
+//! key"), so the allocator holds the key's characters on the slow node and the
+//! store has to charge them there. In the default layout the key's buffer is
+//! an allocation on node 0 and the slow tier holds the values alone; the same
+//! two numbers must agree in both.
 //!
 //! ```text
 //! cargo +nightly test --test merged_object_store_slow_accounting \
@@ -40,10 +48,13 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use std::hash::Hash;
+
 use paper_cache::{
 	numa_alloc::measured, CacheTierSize, GateConfig, HybridStats, MetadataModel, PaperCache, PaperPolicy,
 	TieredBuffer,
 };
+use typesize::TypeSize;
 
 const KEYS: u64 = 3_000;
 
@@ -65,7 +76,10 @@ fn value(key: u64, round: u64) -> Vec<u8> {
 /// object, and neither they nor the allocator's counter have changed across
 /// several polls. The worker applies migrations asynchronously, and a hit
 /// that has not been processed yet is not a hit this test has checked.
-fn idle(cache: &PaperCache<u64, TieredBuffer>, live: u64) -> (u64, HybridStats) {
+fn idle<K>(cache: &PaperCache<K, TieredBuffer>, live: u64) -> (u64, HybridStats)
+where
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
+{
 	let deadline = Instant::now() + Duration::from_secs(60);
 	let mut last = None;
 	let mut unchanged = 0;
@@ -93,6 +107,12 @@ fn idle(cache: &PaperCache<u64, TieredBuffer>, live: u64) -> (u64, HybridStats) 
 	}
 }
 
+/// A `String` key of a length that varies with the key (14 to 54 bytes), so the
+/// item's prefix rounding and the size classes see many different lengths.
+fn string_key(key: u64) -> String {
+	format!("user:{key:08}:{}", "p".repeat((key % 41) as usize))
+}
+
 #[test]
 fn slow_bytes_measured_equal_slow_bytes_modelled() {
 	// Each order in a child process of its own.
@@ -101,65 +121,83 @@ fn slow_bytes_measured_equal_slow_bytes_modelled() {
 		PaperPolicy::LfuCompactHybrid,
 		PaperPolicy::FifoCompactHybrid,
 		PaperPolicy::ClockCompactHybrid,
-	], |policy| {
-		let before = measured::slow_allocated();
+	], |policy| modelled_equals_measured(policy, |key| key));
+}
 
-		let (measured_slow, stats) = {
-			// The per-object model (S5), whose arithmetic the tier above is
-			// sized in: under the measured one this tier is smaller than the
-			// store's own structures, and its key ceiling would refuse every
-			// key.
-			let mut gate = GateConfig::default();
-			gate.metadata_model = MetadataModel::PerObject;
+/// The same run with `String` keys: the store charges the slow tier what the
+/// allocator holds for it, key bytes included.
+#[test]
+fn slow_bytes_measured_equal_slow_bytes_modelled_for_string_keys() {
+	common::each_alone(module_path!(), "slow_bytes_measured_equal_slow_bytes_modelled_for_string_keys", [
+		PaperPolicy::LruCompactHybrid,
+		PaperPolicy::FifoCompactHybrid,
+	], |policy| modelled_equals_measured(policy, string_key));
+}
 
-			let cache = PaperCache::<u64, TieredBuffer>::new_with_gate(
-				64 * 1024 * 1024,
-				CacheTierSize::Bytes(FAST_TIER),
-				policy,
-				gate,
-			)
-			.expect("the merged store implements this policy");
+/// One order, one key type: the fill, the overwrites and the removals, then
+/// the store's charge to the slow tier against the allocator's count.
+/// `key_of` makes the cache's key for key number `n`.
+fn modelled_equals_measured<K>(policy: PaperPolicy, key_of: impl Fn(u64) -> K)
+where
+	K: 'static + Eq + Hash + TypeSize + Clone + Send + Sync,
+{
+	let before = measured::slow_allocated();
 
-			// A read-through fill, hitting older keys all the way: most of
-			// them are slow by the time they are hit.
-			for key in 0..KEYS {
-				cache.set(key, &value(key, 0), None).expect("set");
+	let (measured_slow, stats) = {
+		// The per-object model (S5), whose arithmetic the tier above is
+		// sized in: under the measured one this tier is smaller than the
+		// store's own structures, and its key ceiling would refuse every
+		// key.
+		let mut gate = GateConfig::default();
+		gate.metadata_model = MetadataModel::PerObject;
 
-				for back in [1, 5, 50, 500] {
-					if key >= back {
-						cache.get(&(key - back)).expect("a live key hits");
-					}
+		let cache = PaperCache::<K, TieredBuffer>::new_with_gate(
+			64 * 1024 * 1024,
+			CacheTierSize::Bytes(FAST_TIER),
+			policy,
+			gate,
+		)
+		.expect("the merged store implements this policy");
+
+		// A read-through fill, hitting older keys all the way: most of
+		// them are slow by the time they are hit.
+		for key in 0..KEYS {
+			cache.set(key_of(key), &value(key, 0), None).expect("set");
+
+			for back in [1, 5, 50, 500] {
+				if key >= back {
+					cache.get(&key_of(key - back)).expect("a live key hits");
 				}
 			}
+		}
 
-			// Overwrites that change the size, of fast and slow keys alike, and
-			// the hits that follow them.
-			for key in (0..KEYS).step_by(7) {
-				cache.set(key, &value(key, 1), None).expect("overwrite");
-				cache.get(&key).expect("an overwritten key hits");
-			}
+		// Overwrites that change the size, of fast and slow keys alike, and
+		// the hits that follow them.
+		for key in (0..KEYS).step_by(7) {
+			cache.set(key_of(key), &value(key, 1), None).expect("overwrite");
+			cache.get(&key_of(key)).expect("an overwritten key hits");
+		}
 
-			// And removals, so a freed slot's bytes must leave the tier too.
-			let mut live = KEYS;
+		// And removals, so a freed slot's bytes must leave the tier too.
+		let mut live = KEYS;
 
-			for key in (3..KEYS).step_by(11) {
-				cache.del(&key).expect("del");
-				live -= 1;
-			}
+		for key in (3..KEYS).step_by(11) {
+			cache.del(&key_of(key)).expect("del");
+			live -= 1;
+		}
 
-			idle(&cache, live)
-		};
+		idle(&cache, live)
+	};
 
-		let modelled = stats.slow_bytes_used;
-		let measured = measured_slow - before;
+	let modelled = stats.slow_bytes_used;
+	let measured = measured_slow - before;
 
-		assert!(modelled > 0, "{policy}: the fast tier must have demoted: {stats:?}");
-		assert_eq!(
-			measured,
-			modelled,
-			"{policy}: the slow allocator holds {measured} B but the store charges {modelled} B \
-			 to the slow tier (drift {:+} B): {stats:?}",
-			measured as i64 - modelled as i64,
-		);
-	});
+	assert!(modelled > 0, "{policy}: the fast tier must have demoted: {stats:?}");
+	assert_eq!(
+		measured,
+		modelled,
+		"{policy}: the slow allocator holds {measured} B but the store charges {modelled} B \
+		 to the slow tier (drift {:+} B): {stats:?}",
+		measured as i64 - modelled as i64,
+	);
 }

@@ -518,6 +518,48 @@ impl<K> TieredValue<K> {
 		self.key().eq(key)
 	}
 
+	/// The key, owned. A clone here; `value_thin.rs` rebuilds a key its item
+	/// holds as bytes, which is why callers ask for this rather than `key()`.
+	pub fn key_owned(&self) -> K
+	where
+		K: Clone,
+	{
+		self.key().clone()
+	}
+
+	/// The key's byte cost as `object::overhead::base_size` counts it.
+	pub fn key_accounted_size(&self) -> usize
+	where
+		K: typesize::TypeSize,
+	{
+		self.key().get_size()
+	}
+
+	/// The value allocation's bytes in front of the value. None under this
+	/// layout: the bytes are their own allocation.
+	#[inline]
+	pub fn item_prefix_bytes(&self) -> usize {
+		0
+	}
+
+	/// [`TieredValue::item_prefix_bytes`] of the value a set of `key` WILL
+	/// build, asked before it exists (the admission path sizes a set from its
+	/// key and its value's length): none under this layout, whatever the key.
+	#[inline]
+	pub(crate) fn item_prefix_bytes_for(_key: &K) -> usize {
+		0
+	}
+
+	/// [`TieredValue::key_accounted_size`] of the value a set of `key` WILL
+	/// build: what `TypeSize` says, as the key lives in the DRAM header.
+	#[inline]
+	pub(crate) fn key_accounted_size_for(key: &K) -> usize
+	where
+		K: typesize::TypeSize,
+	{
+		key.get_size()
+	}
+
 	/// The value's bytes.
 	///
 	/// Safe, because the header owns both the pointer and the length and this

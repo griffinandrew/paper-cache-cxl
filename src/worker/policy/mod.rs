@@ -3045,12 +3045,8 @@ where
 		let mut audit = crate::phys::PlacementAudit::default();
 		let stack = &*self.policy_stack;
 
-		self.objects.for_each_value(|key, tier, len| {
-			audit.record(
-				tier,
-				stack.placement_of(key),
-				crate::phys::value_charge::<K>(len),
-			);
+		self.objects.for_each_value(|key, tier, charge| {
+			audit.record(tier, stack.placement_of(key), charge as u64);
 		});
 
 		audit

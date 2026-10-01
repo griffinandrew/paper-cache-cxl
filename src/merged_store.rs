@@ -742,18 +742,15 @@ impl<K, V> Slot<K, V> {
 	/// `base_size` is `key + value + expiry (+ ttl)` and `dram_resident_size`
 	/// is the same sum without the value.
 	///
-	/// It calls `resident_object_bytes` -- the SAME accessor `base_size` calls,
+	/// It calls `resident_item_bytes` -- the SAME accessor `base_size` calls,
 	/// and deliberately not a second rounding of `data_size()`. The two used to
 	/// round `nallocx(len)` independently, which was right under the split
-	/// layout and wrong under `thin_header`, where the item is
-	/// `bytes_offset::<K>() + len` and the whole of it travels. One accessor is
+	/// layout and wrong under `thin_header`, where the item is its prefix plus
+	/// `len` and the whole of it travels. One accessor is
 	/// what stops a third caller repeating the mistake.
 	fn migrating(&self) -> CacheSize {
 		match &self.object {
-			Some(object) => {
-				crate::object::overhead::resident_object_bytes::<K>(object.data_size())
-					as CacheSize
-			},
+			Some(object) => crate::object::overhead::resident_item_bytes(object) as CacheSize,
 
 			None => 0,
 		}
@@ -3779,9 +3776,10 @@ impl<K, V> MergedStore<K, V> {
 		self.lfu_latched.load(Ordering::Relaxed)
 	}
 
-	/// Calls `f(key, tier, len)` for every live object: its key, the tier its
-	/// value's bytes are in (the value's tag) and the value's length -- the
-	/// placement audit's walk, `ObjectStore::for_each_value`'s twin. One
+	/// Calls `f(key, tier, charge)` for every live object: its key, the tier its
+	/// value's bytes are in (the value's tag) and the bytes its allocation is
+	/// charged (`overhead::resident_item_bytes`) -- the placement audit's walk,
+	/// `ObjectStore::for_each_value`'s twin. One
 	/// difference: each shard is read under its lock into a buffer and `f`
 	/// runs after the lock is released, since the merged handle's
 	/// `placement_of` IS a lookup under that lock (`tier_of`).
@@ -3794,13 +3792,17 @@ impl<K, V> MergedStore<K, V> {
 
 				for i in 0..g.slots.allocated {
 					if let Some(object) = &g.slots[i].object {
-						shard.push((g.slots[i].hashed, object.value().tier(), object.data_size()));
+						shard.push((
+							g.slots[i].hashed,
+							object.value().tier(),
+							crate::object::overhead::resident_item_bytes(object),
+						));
 					}
 				}
 			}
 
-			for (key, tier, len) in shard.drain(..) {
-				f(key, tier, len);
+			for (key, tier, charge) in shard.drain(..) {
+				f(key, tier, charge);
 			}
 		}
 	}
@@ -4239,7 +4241,8 @@ mod tests {
 	/// counts it: the allocator's rounded figure for the object's whole
 	/// allocation, not the request and not the value bytes alone.
 	///
-	/// Routed through the same accessor `Slot::migrating` uses, so a test
+	/// Routed through `resident_object_bytes`, the per-type form of the
+	/// accessor `Slot::migrating` uses and exact for these `u64` keys, so a test
 	/// cannot pass by agreeing with a formula the store no longer applies --
 	/// which is exactly what would have happened here under `thin_header`.
 	fn migrating_bytes(size: ObjectSize) -> CacheSize {

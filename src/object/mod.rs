@@ -111,24 +111,39 @@ impl<K, V> Object<K, V> {
 	/// The default tier rather than a required argument because that is what
 	/// every all-DRAM shape and every test wants; the callers that choose use
 	/// [`Object::new_in`].
-	pub fn new(key: K, bytes: &[u8], ttl: Option<u32>) -> Self {
+	pub fn new(key: K, bytes: &[u8], ttl: Option<u32>) -> Self
+	where
+		K: 'static,
+	{
 		Self::new_in(key, bytes, Tier::Fast, ttl)
 	}
 
 	/// Creates an object whose value is copied into `tier`.
-	pub fn new_in(key: K, bytes: &[u8], tier: Tier, ttl: Option<u32>) -> Self {
+	pub fn new_in(key: K, bytes: &[u8], tier: Tier, ttl: Option<u32>) -> Self
+	where
+		K: 'static,
+	{
 		Self::with_expiry_in(key, bytes, tier, expiry_from_ttl(ttl))
 	}
 
 	/// Creates an object with an explicit expiry time, value in the fast tier.
-	pub fn with_expiry(key: K, bytes: &[u8], expiry: ExpireTime) -> Self {
+	pub fn with_expiry(key: K, bytes: &[u8], expiry: ExpireTime) -> Self
+	where
+		K: 'static,
+	{
 		Self::with_expiry_in(key, bytes, Tier::Fast, expiry)
 	}
 
 	/// Creates an object with an explicit expiry time and an explicit tier.
 	///
 	/// The one constructor: every other one funnels here.
-	pub fn with_expiry_in(key: K, bytes: &[u8], tier: Tier, expiry: ExpireTime) -> Self {
+	///
+	/// `K: 'static` because under `thin_header` the key's TYPE decides whether
+	/// the item holds it as a `K` or as bytes (`value_thin.rs`, "The key").
+	pub fn with_expiry_in(key: K, bytes: &[u8], tier: Tier, expiry: ExpireTime) -> Self
+	where
+		K: 'static,
+	{
 		Object {
 			value: TieredValue::new_in(key, bytes, tier, expiry),
 			_shape: PhantomData,
@@ -209,17 +224,31 @@ impl<K, V> Object<K, V> {
 		self.value.len()
 	}
 
-	/// The key's own byte cost, as `base_size` counts it.
+	/// The key's own byte cost, as `base_size` counts it -- asked of the value,
+	/// because under `thin_header` a key held as bytes is inside the item and
+	/// is charged there (`TieredValue::key_accounted_size`).
 	pub fn key_size(&self) -> ObjectSize
 	where
 		K: typesize::TypeSize,
 	{
-		use typesize::TypeSize;
-		self.key().get_size() as ObjectSize
+		self.value.key_accounted_size() as ObjectSize
 	}
 
+	/// The key, borrowed. Under `thin_header` an item that holds its key as
+	/// bytes (a `String`, `Vec<u8>` or `Box<[u8]>` key) has no `K` to lend and
+	/// this panics; code that may meet one uses [`Object::key_owned`] or
+	/// [`Object::key_matches`].
 	pub fn key(&self) -> &K {
 		self.value.key()
+	}
+
+	/// The key, owned: rebuilt from its bytes under `thin_header` when the item
+	/// holds it as bytes, cloned otherwise.
+	pub fn key_owned(&self) -> K
+	where
+		K: Clone + 'static,
+	{
+		self.value.key_owned()
 	}
 
 	/// Whether this object's key matches the given key.
@@ -231,7 +260,7 @@ impl<K, V> Object<K, V> {
 	/// slow object it does.
 	pub fn key_matches(&self, key: &K) -> bool
 	where
-		K: Eq,
+		K: Eq + 'static,
 	{
 		self.value.key_matches(key)
 	}

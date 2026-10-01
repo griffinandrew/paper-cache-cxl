@@ -1255,7 +1255,7 @@ pub fn erase<K, V>(
 	maybe_key: Option<EraseKey<K>>,
 ) -> Result<(HashedKey, Object<K, V>), CacheError>
 where
-	K: Eq + TypeSize,
+	K: 'static + Eq + TypeSize,
 {
 	erase_sized(objects, status, overhead_manager, maybe_key).map(|(key, object, _)| (key, object))
 }
@@ -1269,7 +1269,7 @@ pub(crate) fn erase_sized<K, V>(
 	maybe_key: Option<EraseKey<K>>,
 ) -> Result<(HashedKey, Object<K, V>, ObjectSize), CacheError>
 where
-	K: Eq + TypeSize,
+	K: 'static + Eq + TypeSize,
 {
 	let hashed_key = match maybe_key {
 		Some(EraseKey::Original(_, hashed_key)) => hashed_key,
@@ -1792,7 +1792,7 @@ where
 		let sizes = gate::Sizes {
 			base,
 			resident: self.overhead_manager.dram_resident_size_for(key, ttl),
-			value: crate::phys::value_charge::<K>(len as ObjectSize),
+			value: crate::phys::value_charge_for(key, len as ObjectSize),
 		};
 
 		let gate = self.status.gate();

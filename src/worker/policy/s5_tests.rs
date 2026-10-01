@@ -230,13 +230,15 @@ fn evict_to_fit() -> GateConfig {
 
 /// `OverheadManager::base_size_for` -- what `begin_set` checks and charges
 /// before anything is allocated -- is `base_size` of the object `commit`
-/// builds, and `dram_resident_size_for` its `dram_resident_size`: over three
-/// key types, lengths around the value header's size classes, and a TTL of
-/// none, 0 (none) and 5 s. Red with the length taken as the value's size
-/// (`layoutsize`).
+/// builds, and `dram_resident_size_for` its `dram_resident_size`: over key
+/// types of every shape -- POD keys, and the byte-string keys (`String`,
+/// `Vec<u8>`, `Box<[u8]>`) that `thin_header` holds as bytes inside the item,
+/// where the item's size depends on the key's length -- lengths around the
+/// value header's size classes, and a TTL of none, 0 (none) and 5 s. Red with
+/// the length taken as the value's size (`layoutsize`).
 #[test]
 fn base_size_for_equals_base_size() {
-	fn agree<K: typesize::TypeSize + Clone + std::fmt::Debug>(overhead_manager: &OverheadManager, key: K) {
+	fn agree<K: typesize::TypeSize + Clone + std::fmt::Debug + 'static>(overhead_manager: &OverheadManager, key: K) {
 		let mut lens: Vec<usize> = vec![0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 100, 1_000, 4_095, 4_096, 4_097, 16_384, 70_000, 1 << 20];
 		lens.extend((0..40).map(|i| 8 * i + 3));
 
@@ -264,6 +266,41 @@ fn base_size_for_equals_base_size() {
 	agree(&overhead_manager, 7u32);
 	agree(&overhead_manager, 7u64);
 	agree(&overhead_manager, String::from("a key of some length"));
+	agree(&overhead_manager, String::new());
+	agree(&overhead_manager, "k".repeat(250));
+	agree(&overhead_manager, vec![0xFFu8, 0x00, 0x80, b'k', 0xC3]);
+	agree(&overhead_manager, Box::<[u8]>::from(&b"a boxed key, Kia's server's key type"[..]));
+}
+
+/// What the byte gate reserves for a set before its value exists
+/// (`Sizes::value`, from `phys::value_charge_for`) is what the value it then
+/// builds is charged: the object's own `resident_item_bytes`, and for a key
+/// held as bytes under `thin_header` that depends on the key. Over every key
+/// shape and lengths around the size classes.
+#[test]
+fn the_gate_reserves_what_the_built_value_charges() {
+	fn agree<K: 'static + Eq + std::hash::Hash + typesize::TypeSize + Clone + Send + Sync + std::fmt::Debug>(key: K) {
+		let cache = PaperCache::<K, TieredBuffer>::new_with_gate(1 << 30, CacheTierSize::Bytes(1 << 20), PaperPolicy::LruCompactHybrid, GateConfig::default())
+			.expect("a tiered cache");
+
+		for len in [0usize, 1, 7, 8, 100, 4_080, 4_096, 5_000] {
+			let permit = cache.begin_set(&key, len, None).expect("a permit");
+			let object = Object::<K, TieredBuffer>::new_in(key.clone(), &vec![1u8; len], Fast, None);
+
+			assert_eq!(
+				permit.sizes.value,
+				crate::object::overhead::resident_item_bytes(&object) as CacheSize,
+				"{key:?}, {len} bytes: what the gate reserves against what the value is charged",
+			);
+		}
+	}
+
+	agree(7u64);
+	agree(String::new());
+	agree("k".repeat(43));
+	agree("k".repeat(250));
+	agree(vec![0xFFu8, 0x00, 0x80, b'k', 0xC3]);
+	agree(Box::<[u8]>::from(&b"a boxed key, Kia's server's key type"[..]));
 }
 
 /// A value larger than the whole cache is refused -- `ExceedingValueSize`,

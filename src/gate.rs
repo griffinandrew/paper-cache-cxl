@@ -1339,7 +1339,8 @@ pub(crate) struct Sizes {
 	/// Its DRAM-resident part (`dram_resident_size`).
 	pub(crate) resident: ObjectSize,
 	/// The bytes that tier -- P's unit, and the stacks'
-	/// (`resident_object_bytes`): what the structural check compares.
+	/// (`resident_item_bytes_for` the key and the length): what the
+	/// structural check compares.
 	pub(crate) value: CacheSize,
 }
 

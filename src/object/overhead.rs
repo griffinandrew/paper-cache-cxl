@@ -50,7 +50,9 @@ impl OverheadManager {
 		// in the item and tier with it -- and this figure is right anyway, because
 		// what callers do with the figure is subtract it. `base_size` counts
 		// them twice there: once as `key_size + 4`, and again inside
-		// `resident_object_bytes`, which rounds `bytes_offset::<K>() + len`.
+		// `resident_item_bytes`, which rounds the item's prefix plus `len`.
+		// (A key held as bytes is no exception: its `key_size` is the 8-byte
+		// hash, and its characters are only in the item.)
 		// Taking the first copy off leaves `size - dram_resident` equal to the
 		// item's own allocation, which is exactly what a migration moves and
 		// what `fast_used`/`slow_used` charge. What the object keeps in DRAM
@@ -75,7 +77,7 @@ impl OverheadManager {
 	{
 		// The value is counted as the bytes jemalloc actually commits for the
 		// object's OWN allocation, asked of the allocator rather than estimated
-		// -- see `resident_object_bytes`. Before this it was counted as the
+		// -- see `resident_item_bytes`. Before this it was counted as the
 		// bytes *requested*, so a tier sized to its accounted bytes overran;
 		// and under `thin_header` the allocation is `nallocx(bytes_offset::<K>()
 		// + len)`, not `nallocx(len)`.
@@ -87,7 +89,7 @@ impl OverheadManager {
 		// item this line now rounds, and `DOUBLE_COUNTED_IN_BASE_SIZE` takes
 		// them back off in `get_policy_overhead` -- the two meet and cancel
 		// exactly.
-		let value = resident_object_bytes::<K>(object.data_size());
+		let value = resident_item_bytes(object);
 		let mut total_size = object.key_size()
 			+ value
 			+ mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
@@ -103,17 +105,18 @@ impl OverheadManager {
 	/// and `ttl` -- computed before anything is allocated (S5): the size checks
 	/// run from it, so an oversize value is refused without being built. The
 	/// same terms as `base_size`, from the inputs the object is made of:
-	/// `key_size()` is the key's `get_size()`, `data_size()` is `len`, and an
-	/// expiry exists exactly when the ttl is `Some` and not 0
-	/// (`expiry_from_ttl`). `base_size_for_equals_base_size` holds the two
-	/// equal. `None` for a length no object can carry (over `u32::MAX`).
+	/// `key_size()` is the key's accounted size (`key_accounted_size_for`),
+	/// the item is `resident_item_bytes_for` the key and `len`, and an expiry
+	/// exists exactly when the ttl is `Some` and not 0 (`expiry_from_ttl`).
+	/// `base_size_for_equals_base_size` holds the two equal. `None` for a
+	/// length no object can carry (over `u32::MAX`).
 	pub fn base_size_for<K>(&self, key: &K, len: usize, ttl: Option<u32>) -> Option<ObjectSize>
 	where
-		K: TypeSize,
+		K: TypeSize + 'static,
 	{
 		let len = ObjectSize::try_from(len).ok()?;
-		let value = resident_object_bytes::<K>(len);
-		let mut total_size = (key.get_size() as ObjectSize)
+		let value = resident_item_bytes_for(key, len);
+		let mut total_size = (crate::value::TieredValue::<K>::key_accounted_size_for(key) as ObjectSize)
 			.checked_add(value)?
 			.checked_add(mem::size_of::<crate::object::ExpireTime>() as ObjectSize)?;
 
@@ -128,10 +131,10 @@ impl OverheadManager {
 	/// `base_size_for`).
 	pub fn dram_resident_size_for<K>(&self, key: &K, ttl: Option<u32>) -> ObjectSize
 	where
-		K: TypeSize,
+		K: TypeSize + 'static,
 	{
-		let mut resident =
-			key.get_size() as ObjectSize + mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
+		let mut resident = crate::value::TieredValue::<K>::key_accounted_size_for(key) as ObjectSize
+			+ mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
 
 		if ttl.is_some_and(|ttl| ttl != 0) {
 			resident += get_ttl_overhead();
@@ -793,16 +796,34 @@ pub(crate) fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
 ///
 /// Under the split layout the header is its own `Arc` allocation, charged as
 /// `VALUE_ALLOCATION_OVERHEAD`, and this is zero.
-#[cfg(feature = "thin_header")]
+///
+/// Only where something asks by type -- `phys::value_charge` (the tiered
+/// builds) and the tests' fixtures; the accounting asks the object or its key.
+#[cfg(all(feature = "thin_header", any(test, feature = "hybrid_cache_common")))]
 #[inline]
 pub(crate) fn value_header_bytes<K>() -> ObjectSize {
 	crate::value::bytes_offset::<K>() as ObjectSize
 }
 
-#[cfg(not(feature = "thin_header"))]
+#[cfg(all(not(feature = "thin_header"), any(test, feature = "hybrid_cache_common")))]
 #[inline]
 pub(crate) fn value_header_bytes<K>() -> ObjectSize {
 	0
+}
+
+/// What jemalloc would commit for the item of a `value_len`-byte value whose
+/// key the item holds as a `K`: the value behind `value_header_bytes::<K>()`.
+///
+/// A per-TYPE figure, so it is exact only for that shape of key. Under
+/// `thin_header` a key held as bytes (`String`, `Vec<u8>`, `Box<[u8]>`) makes
+/// the prefix as long as the key, and the accounting asks the object
+/// (`resident_item_bytes`) or, before there is one, the key
+/// (`resident_item_bytes_for`). This survives for what has no key to ask --
+/// `phys::value_charge` -- and for the fixtures that build an object of a
+/// given cost from a length, all of which key by `u64`.
+#[cfg(any(test, feature = "hybrid_cache_common"))]
+pub(crate) fn resident_object_bytes<K>(value_len: ObjectSize) -> ObjectSize {
+	resident_value_bytes(value_len.saturating_add(value_header_bytes::<K>()))
 }
 
 /// Bytes jemalloc commits for an object's OWN allocation -- the one that tiers.
@@ -816,14 +837,42 @@ pub(crate) fn value_header_bytes<K>() -> ObjectSize {
 /// split layout that is also the whole of the value's own allocation, so
 /// `nallocx(len)` is right. Under `thin_header` it is not: the length, expiry
 /// and key sit in front of the bytes in the SAME allocation, so the request is
-/// `bytes_offset::<K>() + len` -- 16 bytes more for a `u64` key, and a WHOLE
+/// the item's prefix plus `len` -- 16 bytes more for a `u64` key, and a WHOLE
 /// SIZE CLASS more whenever the value alone was landing on a class boundary.
 /// `nallocx(4096)` is 4096 and `nallocx(4112)` is 5120: rounding the length
 /// alone would under-charge by 16 bytes in the ordinary case and by 1024 in the
 /// common one, because powers of two are common in both traces and synthetic
 /// workloads.
-pub(crate) fn resident_object_bytes<K>(value_len: ObjectSize) -> ObjectSize {
-	resident_value_bytes(value_len.saturating_add(value_header_bytes::<K>()))
+///
+/// It is asked of the OBJECT, not of a length and a key type, because under
+/// `thin_header` a key held as bytes is in the item, so the item's prefix is
+/// as long as the key and differs object to object. The value reports its own
+/// prefix (`item_prefix_bytes`): nothing for the split layout,
+/// `bytes_offset::<K>()` for a key held as a `K`, and the offset past the
+/// key's bytes for a key held as bytes.
+pub(crate) fn resident_item_bytes<K, V>(object: &Object<K, V>) -> ObjectSize {
+	resident_value_bytes(
+		object.data_size().saturating_add(prefix_size(object.value().item_prefix_bytes())),
+	)
+}
+
+/// `resident_item_bytes` of the object a set WILL build, from its key and its
+/// value's length, before there is an object: how the admission path sizes a
+/// set (`OverheadManager::base_size_for`, `phys::value_charge_for`). The
+/// prefix comes from the key's type the way the built value will report it
+/// (`TieredValue::item_prefix_bytes_for`), so the two are equal --
+/// `base_size_for_equals_base_size` holds it.
+pub(crate) fn resident_item_bytes_for<K: 'static>(key: &K, value_len: ObjectSize) -> ObjectSize {
+	resident_value_bytes(
+		value_len.saturating_add(prefix_size(crate::value::TieredValue::<K>::item_prefix_bytes_for(key))),
+	)
+}
+
+/// A prefix length as an `ObjectSize`, saturating: a key so long its prefix
+/// does not fit makes an item no set can hold, which the size checks refuse.
+#[inline]
+fn prefix_size(prefix: usize) -> ObjectSize {
+	ObjectSize::try_from(prefix).unwrap_or(ObjectSize::MAX)
 }
 
 // resident_factor() / DRAM_OVERHEAD_RESIDENT_FACTOR were deleted: INERT, by
@@ -1254,6 +1303,60 @@ mod the_charge_matches_the_allocator {
 			);
 
 			drop(held);
+		}
+	}
+
+	/// The same identity for a `String`-keyed object under `thin_header`, where
+	/// the key's bytes are IN the item: one allocation of
+	/// `nallocx(align8(12 + key_len) + len)` plus the 16-byte DRAM header, and
+	/// nothing for the key anywhere else. Each key is built inside the window,
+	/// so its own buffer -- allocated, then freed once the item holds a copy --
+	/// nets to zero, as a server's request buffer would. The key lengths are
+	/// the ones the prefix's rounding and the size classes treat differently.
+	#[test]
+	#[cfg(feature = "thin_header")]
+	fn a_string_keyed_object_costs_what_the_accounting_says_it_costs() {
+		const N: usize = 4096;
+
+		for key_len in [0usize, 1, 3, 4, 5, 11, 12, 13, 19, 43, 44, 250] {
+			for len in [64u32, 100, 1000, 4096] {
+				let payload = vec![0u8; len as usize];
+				let mut held: Vec<Object<String, crate::BufferDRAM>> = Vec::with_capacity(N);
+
+				let base = thread_live();
+
+				for _ in 0..N {
+					held.push(Object::new("k".repeat(key_len), &payload, None));
+				}
+
+				let delta = (thread_live() - base).max(0) as u64;
+				core::hint::black_box(&held);
+
+				let item = resident_item_bytes(&held[0]);
+				let prefix = (12 + key_len).next_multiple_of(8) as ObjectSize;
+
+				assert_eq!(
+					item,
+					resident_value_bytes(prefix + len),
+					"key {key_len} B, value {len} B: the item is its header, key and value",
+				);
+				assert_eq!(
+					item,
+					resident_item_bytes_for(&"k".repeat(key_len), len),
+					"key {key_len} B, value {len} B: the object and the key it is built from agree",
+				);
+
+				let charged = item as u64 + VALUE_ALLOCATION_OVERHEAD as u64;
+				let measured = delta / N as u64;
+
+				assert_eq!(
+					measured, charged,
+					"a {key_len}-byte key and a {len}-byte value cost {measured} B/object \
+					 from the allocator but are charged {charged}",
+				);
+
+				drop(held);
+			}
 		}
 	}
 

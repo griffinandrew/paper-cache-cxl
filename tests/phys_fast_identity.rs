@@ -1155,3 +1155,141 @@ fn a_flat_cache_with_fast_values_is_counted_apart_from_the_tiered_ones() {
     );
     assert_eq!(phys::fast_bytes_signed(), p0, "the flat cache's value was refunded");
 }
+
+/// Byte-string keys. Under `thin_header` a `String` key is held as BYTES in
+/// the item, so the item -- and what P is charged for it -- is as long as the
+/// key says; in the other layout it is a function of the value's length alone
+/// (`phys::value_charge`). A set is sized from its key before its value exists
+/// (what the byte gate reserves and the stack is charged), the value charges P
+/// itself once it is built, and a migration moves the whole item: if any of
+/// the three missed the key's bytes, P and the stack's `fast_used` would part
+/// at quiescence. Keys of every length up to the bound below (none, too), a
+/// fast tier a third of the data so that keys demote and promote, then
+/// overwrites that change the length and deletes.
+///
+/// The bound is 250 bytes under `thin_header` and 100 otherwise: a DashMap
+/// stack keeps the DRAM-resident remainder of an object (`key_size + 4`) in
+/// one saturating byte (see this file's header), which a default-layout
+/// `String` key of 100 bytes and the 24-byte handle still fits.
+#[test]
+fn string_keys_hold_p_to_the_stacks_fast_used_and_return_it_to_zero() {
+    let _one = one_cache_at_a_time();
+
+    let p0 = phys::fast_bytes_signed();
+    let longest: u64 = if cfg!(feature = "thin_header") { 250 } else { 100 };
+
+    // Key 0 is the empty key; the others are 4 to `longest` bytes, spread so
+    // that every rounding of the item's prefix shows, each with its number in
+    // front of it so that no two are alike.
+    let key = |i: u64| -> String {
+        if i == 0 {
+            return String::new();
+        }
+
+        let len = 4 + ((i * 7_919) % (longest - 3)) as usize;
+        let mut key = format!("{i:03}-{}", "k".repeat(len - 4));
+
+        key.shrink_to_fit();
+        key
+    };
+
+    const KEYS: u64 = 120;
+
+    let mut gate = GateConfig::default();
+    gate.metadata_model = MetadataModel::PerObject;
+
+    let cache = PaperCache::<String, TieredBuffer>::new_with_gate(
+        1 << 20,
+        CacheTierSize::Bytes(40 * 1024),
+        PaperPolicy::LruCompactHybrid,
+        gate,
+    )
+    .expect("a tiered cache");
+
+    let mut live: BTreeMap<u64, u32> = BTreeMap::new();
+
+    let quiesce = |live: &BTreeMap<u64, u32>, label: &str| -> HybridStats {
+        common::settle(
+            QUIESCE_TIMEOUT,
+            Duration::from_millis(1),
+            || {
+                let s = cache.hybrid_stats();
+                let fast_live = live.keys().filter(|i| cache.tier_of(&key(**i)) == Some(Tier::Fast)).count() as u64;
+                let settled = s.fast_objects + s.slow_objects == live.len() as u64
+                    && s.fast_objects == fast_live
+                    && phys::pending_migrations() == (0, 0);
+
+                let state = (s.fast_objects, s.slow_objects, s.fast_bytes_used, s.slow_bytes_used, s.promotions, s.demotions);
+
+                (settled, state, s)
+            },
+            |s| {
+                format!(
+                    "{label}: never quiesced -- stack fast/slow objects {}/{} vs {} live, pending {:?}",
+                    s.fast_objects, s.slow_objects, live.len(), phys::pending_migrations(),
+                )
+            },
+        )
+    };
+
+    let check = |live: &BTreeMap<u64, u32>, label: &str| {
+        let s = quiesce(live, label);
+        let p = phys::fast_bytes_signed() - p0;
+
+        assert!(s.fast_objects > 0 && s.slow_objects > 0, "{label}: both tiers hold keys ({s:?})");
+        assert_eq!(
+            p as u64, s.fast_bytes_used,
+            "{label}: P != the stack's fast_used at quiescence ({} fast objects)", s.fast_objects,
+        );
+
+        // The placement audit walks every object and charges it what it
+        // holds: its fast bytes, in P's unit, are P.
+        let a = cache.placement_audit().expect("a tiered cache answers the audit");
+
+        assert!(a.is_clean(), "{label}: placement audit -- {a:?}");
+        assert_eq!(
+            (a.live, a.fast_bytes),
+            (live.len() as u64, p as u64),
+            "{label}: the audit's live objects and fast bytes against the model's",
+        );
+    };
+
+    for i in 0..KEYS {
+        let len = len_of(i, 0);
+
+        cache.set(key(i), &value(i, 0), None).expect("set");
+        live.insert(i, len);
+    }
+
+    check(&live, "after the sets");
+    assert!(cache.hybrid_stats().demotions > 0, "the fast tier is a third of the data: keys demoted");
+
+    // Hits on the keys that are slow promote them (through the settle's
+    // demotions of others): the item moves, key and all, in both directions.
+    for _ in 0..2 {
+        for i in (0..KEYS).step_by(3) {
+            assert_eq!(cache.get(&key(i)).expect("a live key hits"), value(i, 0));
+        }
+    }
+
+    check(&live, "after the reads");
+
+    for i in (0..KEYS).step_by(4) {
+        cache.set(key(i), &value(i, 1), None).expect("overwrite");
+        live.insert(i, len_of(i, 1));
+    }
+
+    check(&live, "after the overwrites");
+
+    for i in (1..KEYS).step_by(5) {
+        cache.del(&key(i)).expect("del");
+        live.remove(&i);
+    }
+
+    check(&live, "after the deletes");
+
+    drop(cache);
+
+    assert_eq!(phys::fast_bytes_signed(), p0, "P did not return to its pre-cache value: an item was never refunded");
+    assert_eq!(phys::live_tiered_caches(), 0, "uncounted on drop");
+}

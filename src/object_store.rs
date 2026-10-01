@@ -54,11 +54,13 @@ pub trait ObjectStore<K, V> {
 	/// Returns the number of objects currently tracked.
 	fn len(&self) -> usize;
 
-	/// Calls `f(key, tier, len)` for every object: its hashed key, the tier
-	/// its value's bytes are in (the value's tag) and the value's length. The
-	/// placement audit's walk (`PaperCache::placement_audit`), a diagnostic:
-	/// it holds each shard's read lock while it reads that shard, and calls
-	/// `f` under it, so `f` must not touch the store.
+	/// Calls `f(key, tier, charge)` for every object: its hashed key, the tier
+	/// its value's bytes are in (the value's tag) and the bytes its allocation
+	/// is charged (`overhead::resident_item_bytes`: P's unit, which for an item
+	/// that holds its key as bytes is not a function of the value's length
+	/// alone). The placement audit's walk (`PaperCache::placement_audit`), a
+	/// diagnostic: it holds each shard's read lock while it reads that shard,
+	/// and calls `f` under it, so `f` must not touch the store.
 	fn for_each_value(&self, f: impl FnMut(HashedKey, Tier, ObjectSize));
 }
 
@@ -102,7 +104,7 @@ impl<K, V> ObjectStore<K, V> for DashMap<HashedKey, Object<K, V>, NoHasher> {
 		for entry in self.iter() {
 			let object = entry.value();
 
-			f(*entry.key(), object.value().tier(), object.data_size());
+			f(*entry.key(), object.value().tier(), crate::object::overhead::resident_item_bytes(object));
 		}
 	}
 }

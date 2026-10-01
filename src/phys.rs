@@ -300,10 +300,37 @@ fn shard() -> usize {
 }
 
 /// The figure P charges for one value allocation of `len` bytes keyed by `K`:
-/// `resident_object_bytes::<K>(len)`, the stacks' own unit.
+/// `resident_object_bytes::<K>(len)`, the stacks' own unit. Exact for a key
+/// the item holds as a `K`, which is every key but the byte-string ones under
+/// `thin_header`: the prefix of an item that holds its key as bytes depends on
+/// the key's length, so that item's charge is asked of the key
+/// (`value_charge_for`) or of the item (`item_charge`).
 #[inline]
 pub fn value_charge<K>(len: u32) -> u64 {
 	crate::object::overhead::resident_object_bytes::<K>(len) as u64
+}
+
+/// The figure P charges for the value a set of `key` and `len` bytes will
+/// build: what `TieredValue::new_in` charges once it exists, known before it
+/// does, because the byte gate reserves it at admission. Equal to
+/// [`value_charge`] for every key the item holds as a `K`.
+#[inline]
+pub(crate) fn value_charge_for<K: 'static>(key: &K, len: u32) -> u64 {
+	crate::object::overhead::resident_item_bytes_for(key, len) as u64
+}
+
+/// The figure P charges for one item of `len` value bytes behind `prefix`
+/// bytes of its own -- a header, and for an item that holds its key as bytes
+/// the key: `nallocx(prefix + len)`, the allocation the item is. Only
+/// `thin_header` has an item that holds a key's bytes.
+#[cfg(feature = "thin_header")]
+#[inline]
+pub(crate) fn item_charge(prefix: usize, len: u32) -> u64 {
+	use crate::object::ObjectSize;
+
+	crate::object::overhead::resident_value_bytes(
+		(len as ObjectSize).saturating_add(ObjectSize::try_from(prefix).unwrap_or(ObjectSize::MAX)),
+	) as u64
 }
 
 /// Charges one fast value allocation. Called once per allocation, by
