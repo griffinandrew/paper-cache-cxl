@@ -325,8 +325,7 @@ s3_fifo_ghost_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # given a fresh start at the front instead of being demoted, and the sweep
 # continues to the next candidate -- S3-FIFO's usual "quick demotion, lazy
 # promotion" becomes "lazy demotion, lazy promotion". See
-# worker/policy/policy_stack/s3_fifo_ghost_lazy_demotion_compact_hybrid_stack.rs
-# for the mechanics.
+# worker/policy/policy_stack/s3_fifo_hybrid_stacks.rs for the mechanics.
 #
 s3_fifo_ghost_lazy_demotion_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 

@@ -34,7 +34,9 @@
 //! every gauge is a sum of them; the migration log, in emission order; the
 //! reservation (measured M, else `len x omega` and the ghost's entries), eff
 //! and the structural test; and the settle loop, which demotes the cursor's
-//! key while the fast bytes of a lane are over the drain target of eff.
+//! key while the fast bytes of a lane are over the drain target of eff (or,
+//! for a design with lazy demotion, reprieves it if its reference bit is
+//! set).
 //!
 //! # The push rule
 //!
@@ -245,6 +247,10 @@ pub trait TierPolicy: Sized + Send + 'static {
 
 	/// The push rule of [`TieredStack::second_chance`].
 	const SECOND_CHANCE: Push = Push::IfPromoted;
+
+	/// Lazy demotion: the settle gives a candidate whose reference bit is set
+	/// a fresh start at the front instead of demoting it.
+	const LAZY_DEMOTION: bool = false;
 
 	/// Whether `policy` names this design.
 	fn is_policy(&self, policy: &PaperPolicy) -> bool;
@@ -482,11 +488,35 @@ impl<L: Layout> Lanes<L> {
 		self.credit(lane, Tier::Slow, payload.migrating());
 	}
 
+	/// A reprieve (lazy demotion): the settle's candidate, still fast, goes to
+	/// the front with its bit cleared -- no books, no migration. The cursor
+	/// steps to the fast key in front of it; with none, the candidate, now at
+	/// the front, is the cursor again, and its cleared bit demotes it at the
+	/// next step.
+	fn reprieve(&mut self, lane: Lane, key: HashedKey) {
+		let next = prev_fast(&self.set, key);
+
+		self.set.move_front(lane, key);
+		self.cursor[lane] = next.or(Some(key));
+
+		if let Some(slot) = self.set.payload_mut(key) {
+			slot.freq = 0;
+		}
+	}
+
 	/// Demotes from the cursor of `lane` until its fast bytes are within
-	/// `target`. The victim is always the cursor, so nothing is searched.
-	fn settle(&mut self, lane: Lane, target: CacheSize) {
+	/// `target`. The victim is always the cursor, so nothing is searched. With
+	/// `lazy`, a candidate whose bit is set is reprieved instead and the sweep
+	/// goes on to the next.
+	fn settle(&mut self, lane: Lane, target: CacheSize, lazy: bool) {
 		while self.books[lane].bytes[idx(Tier::Fast)] > target {
 			let Some(candidate) = self.cursor[lane] else { break };
+
+			if lazy && self.set.payload(candidate).is_some_and(|p| p.freq != 0) {
+				self.reprieve(lane, candidate);
+
+				continue;
+			}
 
 			match self.set.payload(candidate) {
 				Some(_) => self.demote(candidate),
@@ -618,7 +648,7 @@ impl<P: TierPolicy> TieredStack<P> {
 	/// Settles `lane`: demotes from its cursor until its fast bytes are back
 	/// within the drain target of eff.
 	pub fn settle(&mut self, lane: Lane) {
-		self.lanes.settle(lane, drain_target::bytes(self.eff()));
+		self.lanes.settle(lane, drain_target::bytes(self.eff()), P::LAZY_DEMOTION);
 	}
 
 	/// A brand-new key at the front of `lane`: fast, settled, if the lane is

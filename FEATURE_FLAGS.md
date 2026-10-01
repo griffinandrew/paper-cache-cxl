@@ -367,15 +367,16 @@ The code uses `#[cfg(...)]` attributes extensively to:
   `src/tiered_buffer.rs` (`TieredBuffer`). There are no per-design cache modules or per-design
   stats structs any more.
 - **lru_compact_hybrid_cache (segmented-LRU hybrid)**:
-  `src/worker/policy/policy_stack/arena_hybrid_stack.rs` (`LruCompactHybridStack` =
-  `ArenaHybridStack<LruOrder>`),
+  `src/worker/policy/policy_stack/tiered_stack.rs` (the tiering layer, `TieredStack<P>`) and
+  `lru_fifo_clock_hybrid_stacks.rs` (`LruCompactHybridStack` = `TieredStack<Lru>`),
   `src/policy.rs` (`PaperPolicy::LruCompactHybrid`). See `CLAUDE.md` and `LRU_HYBRID_CACHE.md`
   for the full design writeup.
 - **lfu_compact_hybrid_cache (frequency-segmented hybrid)**:
   `src/worker/policy/policy_stack/lfu_compact_hybrid_stack.rs` (`LfuCompactHybridStack` + its
   internal frequency-chain helper), `src/policy.rs` (`PaperPolicy::LfuCompactHybrid`).
 - **two_q_compact_hybrid_cache (2Q-segmented hybrid)**:
-  `src/worker/policy/policy_stack/two_q_compact_hybrid_stack.rs` (`TwoQCompactHybridStack`),
+  `src/worker/policy/policy_stack/two_q_hybrid_stacks.rs` (`TwoQCompactHybridStack` =
+  `TieredStack<TwoQ<NoGhost>>`),
   `src/policy.rs` (`PaperPolicy::TwoQCompactHybrid(f64)`). Also the source of the
   `PolicyStack::needs_capacity_eviction` trait method (default `false`) and
   `PolicyWorker::apply_evictions`'s loop-condition change in `src/worker/policy/mod.rs` — both

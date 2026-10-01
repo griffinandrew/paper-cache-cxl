@@ -8,7 +8,8 @@
 //! S3-FIFO, tier-segmented: a [`TierPolicy`] over a slow one-access queue and
 //! a main queue whose fast prefix is the tier (R4; it was a whole stack of
 //! its own, `S3FifoCompactHybridStack`, in a file of its own), with and
-//! without a ghost (`S3FifoGhostCompactHybridStack`).
+//! without a ghost (`S3FifoGhostCompactHybridStack`), and with lazy demotion
+//! (`S3FifoGhostLazyDemotionCompactHybridStack`).
 //!
 //! Admission lands at the front of the one-access queue and is entirely
 //! slow-tier: a new key is built slow, and nothing is pushed or settled. A
@@ -36,6 +37,22 @@
 //! main's population and is trimmed only by a genuine main eviction, not by
 //! a second chance or a one-access eviction; and the layer clears a key's
 //! fingerprint in `remove` before it asks whether the key is tracked.
+//!
+//! Lazy demotion (`LAZY`) is the one change to the settle. The base design is
+//! classic "quick demotion, lazy promotion": the settle demotes the cursor's
+//! key unconditionally and the reference bit is consulted only at eviction.
+//! This variant gates demotion on the bit too: a candidate whose bit is set was
+//! touched since it was promoted, and is given a fresh start instead -- moved
+//! to the front of main, bit cleared, tier and accounting left alone (it was
+//! fast and stays fast: a reprieve, not a promotion, so no migration) -- and
+//! the sweep goes on to the next-oldest fast key. A candidate whose bit is
+//! clear is demoted as before. It terminates: a reprieve clears the bit and
+//! moves the key to the front, and the cursor only walks toward the back, so
+//! a reprieved key is not examined again until every other fast key has had
+//! its turn. The eviction-time second chance protects a SLOW key touched
+//! again before it reaches the tail; the two mechanisms compose. With no
+//! other fast key in front of it a reprieved candidate is the cursor again,
+//! and its cleared bit demotes it at the next step.
 //!
 //! `needs_capacity_eviction` is the one-access queue's own budget
 //! (`ratio x max_size`), raw.
@@ -69,8 +86,9 @@ const ONE: Lane = 0;
 const MAIN: Lane = 1;
 
 /// S3-FIFO: `ratio` is the one-access queue's share of the cache, with the
-/// byte budgets it and main are held to; `G` is the ghost, if any.
-pub struct S3<G: Ghost> {
+/// byte budgets it and main are held to; `G` is the ghost, if any; `LAZY`
+/// gates the settle's demotion on the reference bit.
+pub struct S3<G: Ghost, const LAZY: bool> {
 	ratio: f64,
 	one_capacity: CacheSize,
 	main_capacity: CacheSize,
@@ -78,12 +96,15 @@ pub struct S3<G: Ghost> {
 }
 
 /// `PaperPolicy::S3FifoCompactHybrid`.
-pub type S3FifoCompactHybridStack = TieredStack<S3<NoGhost>>;
+pub type S3FifoCompactHybridStack = TieredStack<S3<NoGhost, false>>;
 
 /// `PaperPolicy::S3FifoGhostCompactHybrid`.
-pub type S3FifoGhostCompactHybridStack = TieredStack<S3<GhostFilter>>;
+pub type S3FifoGhostCompactHybridStack = TieredStack<S3<GhostFilter, false>>;
 
-impl<G: Ghost> S3<G> {
+/// `PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid`.
+pub type S3FifoGhostLazyDemotionCompactHybridStack = TieredStack<S3<GhostFilter, true>>;
+
+impl<G: Ghost, const LAZY: bool> S3<G, LAZY> {
 	fn sized(ratio: f64, max_size: CacheSize) -> Self {
 		S3 {
 			ratio,
@@ -94,15 +115,17 @@ impl<G: Ghost> S3<G> {
 	}
 }
 
-impl<G: Ghost> TieredStack<S3<G>> {
+impl<G: Ghost, const LAZY: bool> TieredStack<S3<G, LAZY>> {
 	pub fn new(ratio: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
 		TieredStack::with_ghost(S3::sized(ratio, max_size), fast_capacity, G::sized_for(max_size))
 	}
 }
 
-impl<G: Ghost> TierPolicy for S3<G> {
+impl<G: Ghost, const LAZY: bool> TierPolicy for S3<G, LAZY> {
 	type Layout = SlowSplit;
 	type Ghost = G;
+
+	const LAZY_DEMOTION: bool = LAZY;
 
 	const ADMIT: Lane = ONE;
 	const RESETTLE: &'static [Lane] = &[MAIN];
@@ -111,8 +134,9 @@ impl<G: Ghost> TierPolicy for S3<G> {
 
 	fn is_policy(&self, policy: &PaperPolicy) -> bool {
 		match policy {
-			PaperPolicy::S3FifoCompactHybrid(ratio) => !G::PRESENT && *ratio == self.ratio,
-			PaperPolicy::S3FifoGhostCompactHybrid(ratio) => G::PRESENT && *ratio == self.ratio,
+			PaperPolicy::S3FifoCompactHybrid(ratio) => !G::PRESENT && !LAZY && *ratio == self.ratio,
+			PaperPolicy::S3FifoGhostCompactHybrid(ratio) => G::PRESENT && !LAZY && *ratio == self.ratio,
+			PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(ratio) => G::PRESENT && LAZY && *ratio == self.ratio,
 			_ => false,
 		}
 	}
@@ -265,6 +289,111 @@ mod reservation_tests {
 	}
 }
 
+/// What survives of this design's original `fidelity_tests` module.
+///
+/// That module replayed an op stream through this stack and through
+/// `S3FifoGhostLazyDemotionHybridStack`, the non-compact baseline it is a
+/// compaction of, and asserted the two were indistinguishable. The baseline
+/// has since been removed from the crate, so the oracle is gone and the
+/// differential cases went with it -- git history keeps them.
+///
+/// These two do not need the baseline. The first pins the registration
+/// surface, which is easy for a copied parser to get subtly wrong; the second
+/// compares this stack against the NON-lazy compact ghost stack, which is very
+/// much alive, and is what proves the lazy-demotion delta was actually applied
+/// rather than copied across unchanged.
+#[cfg(all(test, feature = "s3_fifo_ghost_lazy_demotion_compact_hybrid_cache"))]
+mod compact_tests {
+	use super::*;
+	use super::super::{drain_target, PolicyStack, Tier};
+	use crate::object::ObjectSize;
+
+	/// The policy string round-trips and rejects the ratio that would starve
+	/// the main queue.
+	///
+	/// `policy.rs`'s own `S3_FIFO_MAIN_SIZED_PREFIXES` would be the natural
+	/// home for this, but its companion test asserts the two prefix lists
+	/// account for exactly ten s3-fifo parsers, and none of the earlier
+	/// compact conversions added themselves to it. Pinned here instead so the
+	/// guarantee is tested somewhere rather than nowhere.
+	#[test]
+	fn the_policy_string_round_trips_and_rejects_a_starving_ratio() {
+		let parsed = "s3-fifo-ghost-lazy-demotion-compact-hybrid-0.25"
+			.parse::<PaperPolicy>()
+			.expect("should parse");
+
+		assert_eq!(parsed, PaperPolicy::S3FifoGhostLazyDemotionCompactHybrid(0.25));
+		assert_eq!(parsed.to_string(), "s3-fifo-ghost-lazy-demotion-compact-hybrid-0.25");
+		assert!(parsed.is_hybrid(), "the compact variant is still a tiered design");
+
+		// This stack sizes `main_capacity` at `(1 - ratio) * max_size` and
+		// gates `evict_one` on `main_is_full`, so a ratio of exactly 1 leaves
+		// the main queue zero bytes and the eviction loop spins.
+		assert!(
+			"s3-fifo-ghost-lazy-demotion-compact-hybrid-1.0".parse::<PaperPolicy>().is_err(),
+			"a ratio of 1 leaves the main queue zero bytes and must be rejected",
+		);
+		assert!(
+			"s3-fifo-ghost-lazy-demotion-compact-hybrid-0.999".parse::<PaperPolicy>().is_ok(),
+			"the exclusion must be an endpoint exclusion and nothing more",
+		);
+		assert!(
+			"s3-fifo-ghost-lazy-demotion-compact-hybrid-0.0".parse::<PaperPolicy>().is_ok(),
+			"zero means no one-access queue, which starves nothing",
+		);
+	}
+
+	/// The lazy-demotion delta really was applied. Under a workload that leaves
+	/// the demotion candidates' reference bits SET, the non-lazy compact ghost
+	/// stack demotes them anyway; this stack must reprieve them. If
+	/// the settle had been copied across from the non-lazy stack unchanged,
+	/// this is the assertion that would catch it.
+	#[test]
+	fn lazy_demotion_actually_diverges_from_the_non_lazy_compact_stack() {
+		let fast_capacity: CacheSize = 1_000;
+		let size: ObjectSize = 10;
+		let bytes = size as CacheSize;
+		let count = drain_target::bytes(fast_capacity) / bytes + 1;
+
+		let mut lazy = S3FifoGhostLazyDemotionCompactHybridStack::new(1.0, 100_000, fast_capacity);
+		let mut eager = S3FifoGhostCompactHybridStack::new(1.0, 100_000, fast_capacity);
+
+		for key in 1..count {
+			lazy.insert(key, size);
+			lazy.update(key);
+			eager.insert(key, size);
+			eager.update(key);
+		}
+		lazy.drain_tier_migrations();
+		eager.drain_tier_migrations();
+
+		for key in 1..=3 {
+			lazy.update(key);
+			eager.update(key);
+		}
+
+		lazy.insert(count, size);
+		lazy.update(count);
+		eager.insert(count, size);
+		eager.update(count);
+
+		let m_lazy = lazy.drain_tier_migrations();
+		let m_eager = eager.drain_tier_migrations();
+
+		assert!(
+			m_eager.contains(&(1, Tier::Slow)),
+			"the non-lazy stack demotes unconditionally; got {m_eager:?}",
+		);
+		assert!(
+			!m_lazy.contains(&(1, Tier::Slow)),
+			"the lazy stack must reprieve an accessed candidate; got {m_lazy:?}",
+		);
+		assert_ne!(m_lazy, m_eager, "the lazy-demotion delta was not applied");
+		assert_eq!(lazy.tier_of(1), Some(Tier::Fast));
+		assert_eq!(eager.tier_of(1), Some(Tier::Slow));
+	}
+}
+
 /// S3-FIFO's two byte budgets are thresholds, and at exactly the threshold they
 /// fall on different sides: the one-access queue is over its capacity only
 /// ABOVE it, main is full AT it. (No golden reaches a byte total that equals a
@@ -305,8 +434,8 @@ mod capacity_tests {
 }
 
 /// A resize of the cache queues nothing in S3-FIFO, with or without its ghost,
-/// even on a stack the metadata push has left over its budget: only `resettle`
-/// and a resize of the fast tier settle it.
+/// or with lazy demotion, even on a stack the metadata push has left over its
+/// budget: only `resettle` and a resize of the fast tier settle it.
 #[cfg(test)]
 mod resize_tests {
 	use super::*;
@@ -320,5 +449,10 @@ mod resize_tests {
 	#[test]
 	fn s3_fifo_ghost() {
 		a_resize_settles_nothing(S3FifoGhostCompactHybridStack::new(0.1, 1_000_000, 10_000));
+	}
+
+	#[test]
+	fn s3_fifo_ghost_lazy_demotion() {
+		a_resize_settles_nothing(S3FifoGhostLazyDemotionCompactHybridStack::new(0.1, 1_000_000, 10_000));
 	}
 }
