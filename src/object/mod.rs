@@ -227,8 +227,8 @@ impl<K, V> Object<K, V> {
 	/// The object map is keyed on a 64-bit hash, so this is what makes a hash
 	/// collision harmless. Under the default layout the key lives in the DRAM
 	/// header whatever tier the bytes are in, so this never crosses the
-	/// interconnect; under `fused_value` and `thin_header` it lives in the
-	/// tiered item, and for a slow object it does.
+	/// interconnect; under `thin_header` it lives in the tiered item, and for a
+	/// slow object it does.
 	pub fn key_matches(&self, key: &K) -> bool
 	where
 		K: Eq,

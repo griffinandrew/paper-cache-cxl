@@ -29,9 +29,9 @@ src/
                                all 23 designs: the engine (new(max_size, fast_tier_size,
                                policy), with_hasher, the cache operations, hybrid_stats()) and
                                a second holding the size-split design's new_sized/
-                               with_hasher_sized. Its two compile_error!s (thin_header with
-                               fused_value, measured_accounting with stock_jemalloc) concern the
-                               build, not the designs. The 153 pairwise hybrid guards are gone.
+                               with_hasher_sized. Its compile_error! (measured_accounting with
+                               stock_jemalloc) concerns the build, not the designs. The 153
+                               pairwise hybrid guards are gone.
   policy.rs                   PaperPolicy — the plain (flat) policies (LfuCompact, FifoCompact,
                                ClockCompact, SieveCompact, LruCompact, MruCompact,
                                TwoQCompact, SThreeFifoCompact, Arc) plus one variant per hybrid design
@@ -3393,7 +3393,8 @@ set's). The DashMap shape is the only non-merged `ObjectMapRef` now, so `ObjectS
 implementation.
 
 Kept, on the user's instruction until they are benchmarked: `thin_header`, `fused_value` and the
-default value layout. `all_dram`, `segregated_value_arena` and `stock_jemalloc` stay too.
+default value layout. `all_dram`, `segregated_value_arena` and `stock_jemalloc` stay too. (`fused_value`
+was removed afterwards: see "Removed the fused value layout" below.)
 
 ## Deduplication pass (R3)
 
@@ -3599,3 +3600,30 @@ with a note, beside valid ones that still apply; validation in order, the mode f
 configures a plain constructor and never an explicit configuration or `set_gate_config`; an invalid
 value is ignored and the valid ones apply; a failure already there is not a reason to refuse).
 
+## Removed the fused value layout
+
+On the user's decision: the `fused_value` feature and `src/value_fused.rs`, the layout that kept the count,
+the length, the expiry, the key and the bytes in ONE allocation that tiers as a unit. It was built and
+measured (`value.rs`'s "Why the bytes are a SECOND allocation" keeps the numbers), then made an opt-in
+feature. The default layout (a DRAM header pointing at tiered bytes) and `thin_header` (a 16-byte DRAM
+header in front of one tiered item) are what remain, and neither changes: no behaviour changes in any
+build the suites run, and T14 (u64 keys) is byte-identical to its parent's in both layouts, D = M and
+TD = TM.
+
+Gone with the feature: the layout's module and its dispatch in `lib.rs` (with the `compile_error!` that
+refused it beside `thin_header`; `measured_accounting` with `stock_jemalloc` is the one left); its arms in
+`object/overhead.rs` (`dram_resident_size` and `dram_resident_size_for` returned 0 under it,
+`VALUE_ALLOCATION_OVERHEAD` was 0, and `value_header_bytes` served it and `thin_header` together, so
+it now reads `thin_header` alone); the one test constant that adjusted for it
+(`STACK_EXTRA_PER_OBJECT` in `tests/phys_fast_identity.rs`: the DashMap stacks' 12-byte surplus per
+fast object under fusing, zero in every other build); and the docs that named it (the identity table in
+`phys.rs` with its one exceptional build pair, the derivations in `overhead.rs`, `meta.rs`, `value.rs`,
+the integration tests' fixture comments, FEATURE_FLAGS.md, HYBRID_CACHES.md and this file's layout list).
+The measurements that chose the merged store's constants stay in `overhead.rs`, worded as the record of a
+layout that was measured and removed.
+
+Tests removed: the two that existed only under `fused_value` --
+`value::tests::a_slow_value_puts_its_metadata_on_the_slow_node_too` and
+`value::tests::the_item_layout_always_demands_eight_byte_alignment` (the second name also exists in
+`thin_header`'s module, so it still runs there). No suite build ever enabled the feature (the harness has
+no fused build), so no test in the D, M, TD, TM, ID, IT, IM, MD, MTD, MTM, FLATM or ESP logs goes.

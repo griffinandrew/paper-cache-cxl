@@ -126,13 +126,6 @@ use paper_cache::{
 
 type Cache = PaperCache<u64, TieredBuffer>;
 
-/// What the DashMap-family stacks add per FAST object on top of P under
-/// `fused_value`: the u64 key and the 4-byte expiry, which `base_size` counts
-/// although they are inside the item (no TTLs here, so no `get_ttl_overhead`).
-/// Zero in every other build: there the stack's figure IS P's.
-const STACK_EXTRA_PER_OBJECT: u64 =
-    if cfg!(all(feature = "fused_value", not(feature = "merged_object_store"))) { 8 + 4 } else { 0 };
-
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The fast tier's drain target, as a fraction of its effective budget: the
@@ -378,8 +371,7 @@ fn quiesce(
             let pending = phys::pending_migrations();
 
             let settled = s.fast_objects + s.slow_objects == w.live
-                && s.fast_bytes_used + s.slow_bytes_used
-                    == w.total_charge + STACK_EXTRA_PER_OBJECT * w.live
+                && s.fast_bytes_used + s.slow_bytes_used == w.total_charge
                 && s.fast_objects == w.fast_live
                 && pending == (0, 0);
 
@@ -401,7 +393,7 @@ fn quiesce(
                  bytes {} vs the physically fast values' {} (P {})",
                 s.fast_objects, s.slow_objects, w.live, w.fast_live,
                 s.fast_bytes_used + s.slow_bytes_used,
-                w.total_charge + STACK_EXTRA_PER_OBJECT * w.live,
+                w.total_charge,
                 phys::pending_migrations(),
                 s.fast_bytes_used, w.fast_charge, s.phys_fast_bytes,
             )
@@ -489,7 +481,7 @@ fn check(cache: &Cache, lens: &BTreeMap<u64, u32>, run: &Run, phase: &str, hits:
 
     // THE identity: the physical counter equals the stack's intent gauge.
     assert_eq!(
-        p as u64 + STACK_EXTRA_PER_OBJECT * s.fast_objects,
+        p as u64,
         s.fast_bytes_used,
         "{label}: P != the stack's fast_used at quiescence ({} fast objects)",
         s.fast_objects,
@@ -498,7 +490,7 @@ fn check(cache: &Cache, lens: &BTreeMap<u64, u32>, run: &Run, phase: &str, hits:
     // The size-split design's two fast segments, each gauged apart.
     if matches!(run.design, Design::Sized) {
         assert_eq!(
-            p as u64 + STACK_EXTRA_PER_OBJECT * s.fast_objects,
+            p as u64,
             s.small_fast_bytes_used + s.large_fast_bytes_used,
             "{label}: P != the small plus the large segment's fast bytes ({} + {})",
             s.small_fast_bytes_used, s.large_fast_bytes_used,

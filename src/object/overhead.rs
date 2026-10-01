@@ -46,20 +46,8 @@ impl OverheadManager {
 	where
 		K: TypeSize,
 	{
-		// Under `fused_value` the key and the expiry live INSIDE the one
-		// allocation that tiers, so they travel with the bytes and NONE of the
-		// object stays in DRAM once it is slow. `NodePayload::migrating()` is
-		// `size - dram_resident`, so reporting the split layout's figure here
-		// would under-charge every migration by exactly the key and expiry --
-		// and the stack would believe a demotion freed less DRAM than it did.
-		#[cfg(feature = "fused_value")]
-		{
-			let _ = object;
-			return 0;
-		}
-
 		// Under `thin_header` the key and the expiry are NOT in DRAM -- they are
-		// in the item and tier with it -- and this arm is right anyway, because
+		// in the item and tier with it -- and this figure is right anyway, because
 		// what callers do with the figure is subtract it. `base_size` counts
 		// them twice there: once as `key_size + 4`, and again inside
 		// `resident_object_bytes`, which rounds `bytes_offset::<K>() + len`.
@@ -71,17 +59,14 @@ impl OverheadManager {
 		// live object, whichever tier its value is in, since none of them
 		// moves on a demotion: the merged store in `settle_tier`, the DashMap
 		// stacks in `reserved_overhead`.
-		#[cfg(not(feature = "fused_value"))]
-		{
-			let mut resident =
-				object.key_size() + mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
+		let mut resident =
+			object.key_size() + mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
 
-			if object.expiry().is_some() {
-				resident += get_ttl_overhead();
-			}
-
-			resident
+		if object.expiry().is_some() {
+			resident += get_ttl_overhead();
 		}
+
+		resident
 	}
 
 	pub fn base_size<K, V>(&self, object: &Object<K, V>) -> ObjectSize
@@ -92,15 +77,16 @@ impl OverheadManager {
 		// object's OWN allocation, asked of the allocator rather than estimated
 		// -- see `resident_object_bytes`. Before this it was counted as the
 		// bytes *requested*, so a tier sized to its accounted bytes overran;
-		// and then, under `fused_value`, as `nallocx(len)` for an allocation
-		// that is really `nallocx(bytes_offset::<K>() + len)`.
+		// and under `thin_header` the allocation is `nallocx(bytes_offset::<K>()
+		// + len)`, not `nallocx(len)`.
 		//
 		// The key and expiry are deliberately NOT scaled here: they are inside
 		// `shared_overhead`, which applies its own factor to them already, and
 		// scaling them twice is exactly the double-charge this module has been
-		// untangling elsewhere. Under fusing they are ALSO inside the item this
-		// line now rounds, and `DOUBLE_COUNTED_IN_BASE_SIZE` takes them back
-		// off in `get_policy_overhead` -- the two meet and cancel exactly.
+		// untangling elsewhere. Under `thin_header` they are ALSO inside the
+		// item this line now rounds, and `DOUBLE_COUNTED_IN_BASE_SIZE` takes
+		// them back off in `get_policy_overhead` -- the two meet and cancel
+		// exactly.
 		let value = resident_object_bytes::<K>(object.data_size());
 		let mut total_size = object.key_size()
 			+ value
@@ -144,23 +130,14 @@ impl OverheadManager {
 	where
 		K: TypeSize,
 	{
-		#[cfg(feature = "fused_value")]
-		{
-			let _ = (key, ttl);
-			return 0;
+		let mut resident =
+			key.get_size() as ObjectSize + mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
+
+		if ttl.is_some_and(|ttl| ttl != 0) {
+			resident += get_ttl_overhead();
 		}
 
-		#[cfg(not(feature = "fused_value"))]
-		{
-			let mut resident =
-				key.get_size() as ObjectSize + mem::size_of::<crate::object::ExpireTime>() as ObjectSize;
-
-			if ttl.is_some_and(|ttl| ttl != 0) {
-				resident += get_ttl_overhead();
-			}
-
-			resident
-		}
+		resident
 	}
 
 	/// Returns the size of the object including base and policy-related overheads.
@@ -210,25 +187,26 @@ const OBJECT_MAP_ROW_OVERHEAD: ObjectSize =
 ///
 /// RE-MEASURED for the 40-byte slot -- jemalloc `stats.allocated`,
 /// `measure_merged_store_point`, ONE PROCESS per point, `MSTORE_VALUE=64`,
-/// least squares over 2^20..2^23. Run TWICE, once under `fused_value` and once
-/// under the split value layout, because the slot is 40 bytes in both and the
-/// two fits are the check on each other:
+/// least squares over 2^20..2^23. Run TWICE, once under the fused value layout
+/// (a `fused_value` feature, since removed) and once under the split value
+/// layout, because the slot is 40 bytes in both and the two fits are the check
+/// on each other:
 ///
 /// ```text
 ///                        slope B/object     R^2      less value   structural
-///   merged + fused_value     141.2966    0.999999        96         45.2966
+///   merged + fused value     141.2966    0.999999        96         45.2966
 ///   merged + split value     141.2966    0.999999        96         45.2966
 /// ```
 ///
 /// The 96 is not assumed. The DashMap control ran in the same processes over
 /// the same objects and fits 136.0008 (fused) and 136.0003 (split) B/object at
 /// R^2 = 1.000000, and its row is `OBJECT_MAP_ENTRY_OVERHEAD` = 40 -- so the
-/// value item is 136 - 40 = 96 from the other side, in both layouts. Under
-/// fusing it is ONE allocation, `nallocx(bytes_offset::<u64>() + 64)` =
-/// `nallocx(88)` = 96; under the split layout it is TWO, `nallocx(64)` = 64
-/// plus the 32-byte `Arc<ValueHeader>`. That the two structural fits agree to
-/// four decimal places is the evidence that this constant is a property of the
-/// SLOT and not of the value layout.
+/// value item is 136 - 40 = 96 from the other side, in both layouts. Fused, it
+/// was ONE allocation, `nallocx(24 + 64)` = `nallocx(88)` = 96; under the
+/// split layout it is TWO, `nallocx(64)` = 64 plus the 32-byte
+/// `Arc<ValueHeader>`. That the two structural fits agree to four decimal
+/// places is the evidence that this constant is a property of the SLOT and not
+/// of the value layout.
 ///
 /// It was **62**, and 62 was fitted when the merged slot was 56 bytes. The slot
 /// is 40 bytes now, pinned by two const asserts in `merged_store.rs`, and the
@@ -283,14 +261,15 @@ const MERGED_STORE_STRUCTURE_OVERHEAD: ObjectSize = 46;
 ///
 /// ```text
 ///   split value    46 + 32 - 12 = 66     (was 62 + 32 - 12 = 82)
-///   fused_value    46 +  0 - 12 = 34     (was 62 + 32 - 12 = 82)
+///   thin_header    46 + 16 - 12 = 50
 /// ```
 ///
-/// Under fusing the 12 that comes off here is exactly the 12 that
-/// `resident_object_bytes` now puts back inside `base_size`, because the key
-/// and expiry are inside the item's `bytes_offset::<K>()` header. The two
-/// halves of the correction meet here and cancel, which is why `total_size`
-/// under fusing is `nallocx(bytes_offset + len) + 46` and nothing else.
+/// Under `thin_header` the 12 that comes off here is exactly the 12 that
+/// `resident_object_bytes` puts back inside `base_size`, because the key and
+/// expiry are inside the item's `bytes_offset::<K>()` header. The two halves
+/// of the correction meet here and cancel, which is why `total_size` under
+/// `thin_header` is `nallocx(bytes_offset + len) + 16 + 46`: the item, the
+/// DRAM header and the structure, and nothing else.
 ///
 /// The two functions agree here in a way they do not for the split designs:
 /// both name `MERGED_STORE_STRUCTURE_OVERHEAD`, and they differ by exactly
@@ -698,39 +677,28 @@ pub const EXACT_GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 0;
 /// cancelled and the net was an 8 B/object OVER-charge -- which is exactly why
 /// neither showed up as a crash or an obvious mis-sizing.
 ///
-/// ## Why this is gated, and was not
+/// ## Why this is gated
 ///
-/// It named a SEPARATE DRAM allocation holding the value header. Under
-/// `fused_value` there is no separate allocation: the strong count, the key,
-/// the length and the expiry live inside the ONE item that tiers, in front of
-/// the bytes at `bytes_offset::<K>()` -- see `value_fused.rs`. Charging 32 for
-/// it there reserved fast-tier DRAM for an allocation the build does not make,
-/// and the header's real cost was meanwhile going uncharged at the other end
-/// (see `resident_object_bytes`). The two errors ran in OPPOSITE directions and
-/// largely offset, which is why neither surfaced as a mis-sizing.
+/// It names a SEPARATE DRAM allocation holding the value header, and what that
+/// allocation holds depends on the layout: under `thin_header` it is half the
+/// size (the constant below). A third layout, the fused one, kept the count,
+/// the key, the length and the expiry inside the ONE item that tiers, with no
+/// separate header, so the term was zero there; that layout has been removed.
 ///
-/// MEASURED, in the harness rather than inferred: the DashMap control fits
-/// 136.0 B/object in BOTH layouts, of which 40 is the row and 96 the value
-/// item. Split, that 96 is `nallocx(64) = 64` plus this 32. Fused, it is a
-/// single `nallocx(bytes_offset::<u64>() + 64) = nallocx(88) = 96` with no
-/// second allocation anywhere in it. There is nothing here to charge.
-#[cfg(not(any(feature = "fused_value", feature = "thin_header")))]
+/// MEASURED, in the harness rather than inferred: the DashMap control fit
+/// 136.0 B/object in BOTH the split and the fused layouts, of which 40 is the
+/// row and 96 the value item. Split, that 96 is `nallocx(64) = 64` plus this
+/// 32. Fused, it was a single `nallocx(24 + 64) = nallocx(88) = 96` with no
+/// second allocation anywhere in it.
+#[cfg(not(feature = "thin_header"))]
 const VALUE_ALLOCATION_OVERHEAD: ObjectSize = 32;
-
-/// Under `fused_value` the header shares the value's allocation, so there is no
-/// second allocation to charge for -- see the split-layout constant above for
-/// the measurement. Kept as a named zero rather than deleted, so both overhead
-/// tables still NAME the term and can be read line for line against each other.
-#[cfg(all(feature = "fused_value", not(feature = "thin_header")))]
-const VALUE_ALLOCATION_OVERHEAD: ObjectSize = 0;
 
 /// Under `thin_header` the separate DRAM allocation exists and is half the
 /// split layout's: `triomphe::Arc<ValueHeader<K>>` is an 8-byte strong count
 /// in front of ONE 8-byte tagged item pointer, 16 bytes, jemalloc's 16-byte
 /// class exactly. The length, the expiry and the key moved into the item and
-/// are charged through `resident_object_bytes` instead, as `fused_value`'s
-/// whole header is. Held to the allocator by
-/// `an_object_costs_what_the_accounting_says_it_costs`.
+/// are charged through `resident_object_bytes` instead. Held to the allocator
+/// by `an_object_costs_what_the_accounting_says_it_costs`.
 #[cfg(feature = "thin_header")]
 const VALUE_ALLOCATION_OVERHEAD: ObjectSize = 16;
 
@@ -816,24 +784,22 @@ pub(crate) fn resident_value_bytes(requested: ObjectSize) -> ObjectSize {
 }
 
 /// The header bytes that share the VALUE'S OWN allocation: `bytes_offset::<K>()`
-/// under `fused_value` and `thin_header`, nothing under the split layout.
+/// under `thin_header`, nothing under the split layout.
 ///
 /// Under `thin_header` that prefix is the length, the expiry and the key; the
 /// count and the item pointer are the separate 16-byte DRAM allocation charged
 /// as `VALUE_ALLOCATION_OVERHEAD`. So both terms are non-zero there, and each
-/// names a different allocation -- the property below still holds per byte.
+/// names a different allocation: no byte is counted twice or not at all.
 ///
-/// Under the split layout the header is its own `Arc` allocation and is charged
-/// as `VALUE_ALLOCATION_OVERHEAD`; under fusing it is a prefix of the item and
-/// is charged here. Exactly one of the two is non-zero in any build, which is
-/// the property that keeps the header from being counted twice or not at all.
-#[cfg(any(feature = "fused_value", feature = "thin_header"))]
+/// Under the split layout the header is its own `Arc` allocation, charged as
+/// `VALUE_ALLOCATION_OVERHEAD`, and this is zero.
+#[cfg(feature = "thin_header")]
 #[inline]
 pub(crate) fn value_header_bytes<K>() -> ObjectSize {
 	crate::value::bytes_offset::<K>() as ObjectSize
 }
 
-#[cfg(not(any(feature = "fused_value", feature = "thin_header")))]
+#[cfg(not(feature = "thin_header"))]
 #[inline]
 pub(crate) fn value_header_bytes<K>() -> ObjectSize {
 	0
@@ -848,17 +814,14 @@ pub(crate) fn value_header_bytes<K>() -> ObjectSize {
 ///
 /// `Object::data_size()` is the value's LENGTH and nothing else. Under the
 /// split layout that is also the whole of the value's own allocation, so
-/// `nallocx(len)` was right. Under `fused_value` it is not: the count, key,
-/// length and expiry sit in front of the bytes in the SAME allocation, so the
-/// request is `bytes_offset::<K>() + len` -- about 24 bytes more for a `u64`
-/// key, and a WHOLE SIZE CLASS more whenever the value alone was landing on a
-/// class boundary. `nallocx(4096)` is 4096 and `nallocx(4120)` is 5120: the
-/// under-charge was 24 bytes in the ordinary case and 1024 in the common one,
-/// because powers of two are common in both traces and synthetic workloads.
-///
-/// This is the OPPOSITE error to the one `VALUE_ALLOCATION_OVERHEAD` carried
-/// under fusing, and the two largely offset -- which is why the build measured
-/// plausibly while being wrong in both directions at once.
+/// `nallocx(len)` is right. Under `thin_header` it is not: the length, expiry
+/// and key sit in front of the bytes in the SAME allocation, so the request is
+/// `bytes_offset::<K>() + len` -- 16 bytes more for a `u64` key, and a WHOLE
+/// SIZE CLASS more whenever the value alone was landing on a class boundary.
+/// `nallocx(4096)` is 4096 and `nallocx(4112)` is 5120: rounding the length
+/// alone would under-charge by 16 bytes in the ordinary case and by 1024 in the
+/// common one, because powers of two are common in both traces and synthetic
+/// workloads.
 pub(crate) fn resident_object_bytes<K>(value_len: ObjectSize) -> ObjectSize {
 	resident_value_bytes(value_len.saturating_add(value_header_bytes::<K>()))
 }
@@ -905,16 +868,14 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// and the merged build would be measured on a smaller effective fast tier
 	// than the baseline it is being compared against.
 	//
-	// 46 for the 40-byte slot, measured at 45.2966 B/object structural under
-	// BOTH value layouts -- see `MERGED_STORE_STRUCTURE_OVERHEAD`. The
-	// reservation is per LIVE object and `MergedStore::settle_tier` takes it
-	// off the fast budget before it drains, so this number directly sets how
-	// many objects fit in DRAM. It was 62 + 32 = 94 in every build; it is now
-	// 46 + 32 = 78 split and 46 + 0 = 46 fused, and the fused arm is the one
-	// that was over-reserving twice over -- a stale slot and a header this
-	// build does not separately allocate. Under `thin_header` it is
-	// 46 + 16 = 62: the header is back, holding only the count and the item
-	// pointer.
+	// 46 for the 40-byte slot, measured at 45.2966 B/object structural, the
+	// same in both layouts it was measured in -- see
+	// `MERGED_STORE_STRUCTURE_OVERHEAD`. The reservation is per LIVE object and
+	// `MergedStore::settle_tier` takes it off the fast budget before it drains,
+	// so this number directly sets how many objects fit in DRAM. It was
+	// 62 + 32 = 94 in every build; it is now 46 + 32 = 78 split. Under
+	// `thin_header` it is 46 + 16 = 62: the header holds only the count and the
+	// item pointer.
 	#[cfg(feature = "merged_object_store")]
 	{
 		let _ = policy;
@@ -947,13 +908,11 @@ pub fn get_hybrid_dram_shared_overhead(policy: &PaperPolicy) -> ObjectSize {
 	// The value's own allocation costs a DRAM-resident refcounted header
 	// regardless of which tier the bytes themselves occupy -- 32 bytes of
 	// `Arc<ValueHeader<K>>` under the split layout, 16 under `thin_header`,
-	// whose header holds only the count and the item pointer. Under
-	// `fused_value` there
-	// is no such allocation and the term is ZERO: the header is a prefix of the
-	// item and travels with it, so it is charged through
-	// `resident_object_bytes` instead, against the tier the item is actually
-	// in. Kept as a named term in both builds so that this reservation and
-	// `get_policy_overhead` can be compared line for line.
+	// whose header holds only the count and the item pointer (the length, the
+	// expiry and the key are in the item, charged through
+	// `resident_object_bytes` against the tier the item is actually in). Kept
+	// as a named term so that this reservation and `get_policy_overhead` can
+	// be compared line for line.
 	overhead += VALUE_ALLOCATION_OVERHEAD;
 
 	// The object map lives in DRAM.
@@ -1082,9 +1041,9 @@ mod value_counted_at_its_allocated_size {
 		// `data_size` is now the value's length and nothing else -- there is no
 		// fat pointer left to count, in any shape.
 		let raw = object.data_size();
-		// The object's OWN allocation, which under `fused_value` is the header
-		// and the bytes together. Asserting `resident_value_bytes(raw)` here
-		// would re-state the bug: it is the value BYTES, not the allocation.
+		// The object's OWN allocation, which under `thin_header` is the item's
+		// header and the bytes together. Asserting `resident_value_bytes(raw)`
+		// here would re-state the bug: it is the value BYTES, not the allocation.
 		let scaled = resident_object_bytes::<u32>(raw);
 
 		assert_eq!(
@@ -1170,17 +1129,16 @@ mod what_jemalloc_actually_rounds_to {
 /// ```
 ///
 /// Split, the right-hand side is `nallocx(len) + 32`: the bytes, plus the
-/// `Arc<ValueHeader<K>>` that owns them. Fused, it is
-/// `nallocx(bytes_offset::<K>() + len) + 0`: one item, no second allocation.
-/// Thin (`thin_header`), it is `nallocx(bytes_offset::<K>() + len) + 16`: the
-/// item, plus the count-and-pointer header in DRAM.
+/// `Arc<ValueHeader<K>>` that owns them. Thin (`thin_header`), it is
+/// `nallocx(bytes_offset::<K>() + len) + 16`: the item, plus the
+/// count-and-pointer header in DRAM.
 /// A build that gates either term wrongly fails here, and so does one that
 /// rounds the value's LENGTH when the allocation is the length plus a header --
 /// which is what both sides of this identity were doing before.
 ///
 /// The sizes are chosen so the header crosses a size class in some and not in
-/// others: `nallocx(4096)` is 4096 but `nallocx(4120)` is 5120, so under fusing
-/// a 4 KiB value costs a whole extra KiB that nothing was charging for.
+/// others: `nallocx(4096)` is 4096 but `nallocx(4112)` is 5120, so under
+/// `thin_header` a 4 KiB value's item is a whole KiB larger than its bytes.
 #[cfg(all(test, feature = "numa_jemalloc"))]
 mod the_charge_matches_the_allocator {
 	use super::*;
@@ -1261,8 +1219,7 @@ mod the_charge_matches_the_allocator {
 	/// (`value::dram_header_bytes`) is what the allocator hands out for one,
 	/// in every layout -- an object costs its item and exactly that -- and it
 	/// is the size class the per-object model names
-	/// (`VALUE_ALLOCATION_OVERHEAD`: 32 split, 16 `thin_header`, 0
-	/// `fused_value`, whose header is inside the item).
+	/// (`VALUE_ALLOCATION_OVERHEAD`: 32 split, 16 `thin_header`).
 	#[test]
 	fn the_dram_header_m_counts_is_what_the_allocator_holds_per_object() {
 		const N: usize = 2048;

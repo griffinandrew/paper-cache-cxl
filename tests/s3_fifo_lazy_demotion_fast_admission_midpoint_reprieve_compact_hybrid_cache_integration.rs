@@ -96,10 +96,6 @@ mod hybrid_cache_tests {
     /// key. The budgets below were sized against a 32-byte charge, so the payload gives up
     /// exactly that prefix, and the charge -- with every "one fits, two do
     /// not" built on it -- is the same in both.
-    ///
-    /// `fused_value` cannot express this charge at all: it also charges the
-    /// key and the expiry to the tier (its `dram_resident_size` is 0), so its
-    /// smallest object here costs 40.
     const PAYLOAD_LEN: usize =
         if cfg!(feature = "thin_header") { 16 } else { 32 };
 

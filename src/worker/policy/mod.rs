@@ -450,9 +450,10 @@ pub mod migration_queue {
 				// the whole retirement: if a reader lifted this value out a
 				// moment ago it still holds a reference and the free waits
 				// for it, and if not the count reaches zero here and the
-				// value goes back to its allocator immediately -- one
-				// allocation or two, depending on `fused_value`. No deferral,
-				// and nothing for a later epoch advance to run.
+				// value goes back to its allocator immediately -- the DRAM
+				// header's allocation, and the bytes' (the item's, under
+				// `thin_header`). No deferral, and nothing for a later epoch
+				// advance to run.
 				drop(superseded);
 
 				stats.mig_applied.fetch_add(1, Ordering::Relaxed);

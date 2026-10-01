@@ -58,15 +58,13 @@ mod worker;
 ///
 /// * default -- a DRAM-resident refcounted header pointing at bytes that live
 ///   in their own allocation, on whichever tier the policy put them.
-/// * `fused_value` -- one allocation holding the count, the metadata, the key
-///   AND the bytes, tiering as a unit.
 /// * `thin_header` -- a 16-byte DRAM header holding only the count and a
 ///   tagged pointer, in front of one tiered item holding the length, the
 ///   expiry, the key and the bytes.
 ///
 /// The default is not an accident: see `value.rs`'s "Why the bytes are a
 /// SECOND allocation" for the measurements that chose it.
-#[cfg(not(any(feature = "fused_value", feature = "thin_header")))]
+#[cfg(not(feature = "thin_header"))]
 #[path = "value.rs"]
 pub mod value;
 
@@ -79,19 +77,9 @@ compile_error!(
 	 fast-pool counter would silently read zero"
 );
 
-#[cfg(all(feature = "fused_value", not(feature = "thin_header")))]
-#[path = "value_fused.rs"]
-pub mod value;
-
 #[cfg(feature = "thin_header")]
 #[path = "value_thin.rs"]
 pub mod value;
-
-// Alternative layouts for the same type, and each moves the accounting
-// differently (`object::overhead`), so a silent precedence between them would
-// measure one while the build said the other.
-#[cfg(all(feature = "thin_header", feature = "fused_value"))]
-compile_error!("thin_header and fused_value are alternative value layouts; enable at most one");
 
 /// `paper_cache::TieredValue`, alongside `paper_cache::TieredBuffer`.
 pub use crate::value::TieredValue;

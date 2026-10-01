@@ -190,8 +190,10 @@ fn run_in_child(module: &str, test: &str, case: Option<usize>) {
 /// ```
 ///
 /// * `policy`: the design under test.
-/// * `value_len`: the length of a demotion test's ~1 KB values. 1008 where a
-///   fused value's header must round the item to exactly 1 KiB (see FIFO's).
+/// * `value_len`: the length of a demotion test's ~1 KB values. 1008 where the
+///   item must be exactly 1 KiB in both layouts: `nallocx(1008)` under the
+///   default layout, the 16 bytes in front of the value plus 1008 under
+///   `thin_header` (see FIFO's).
 /// * `demoted_of_two`: `(demoted, kept)`: which of two keys set in turn into
 ///   a tier that holds one the design demotes -- the older in an ordered
 ///   design, the newcomer in LFU, whose admission ranks by frequency.

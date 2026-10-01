@@ -57,23 +57,14 @@
 //!   value.rs                                                   = nallocx(len); merged: Slot::migrating,
 //!                                                              the same call
 //!   thin_header   offset+len @ 8      nallocx(offset+len)    the same, in both stores: dram_resident_size
-//!   value_thin                                                 keeps the split arm ON PURPOSE, so the
-//!                                                              difference is exactly the item
-//!   fused_value   offset+len @ 8      nallocx(offset+len)    merged: the same; DashMap: base_size,
-//!   value_fused                                                since dram_resident_size is 0 there
+//!   value_thin                                                 is the split layout's figure ON PURPOSE, so
+//!                                                              the difference is exactly the item
 //! ```
 //!
-//! In every build the full suites run (split and thin_header; DashMap,
-//! hashbrown and merged) the charge IS the stacks' figure. The one pair where
-//! it is not is `fused_value` with a DashMap-family store: that stack charges
-//! `base_size`, which re-adds the key and the 4-byte expiry (and
-//! `get_ttl_overhead()` for a TTL'd object) although both are inside the item
-//! -- `base_size`'s own doc says so, and `get_policy_overhead` takes them back
-//! off for the FLAT budget only. P does not copy that. A charge has to be a
-//! function of the allocation alone, or charge and refund stop pairing (a
-//! `ttl()` can change the expiry between them). There `fast_used = P +
-//! fast_objects * (key_size + 4)`, plus 64 per TTL'd fast object, and the
-//! identity test asserts that relation instead.
+//! In every build the full suites run (split and thin_header; DashMap and
+//! merged) the charge IS the stacks' figure. A charge has to be a function of
+//! the allocation alone, or charge and refund stop pairing (a `ttl()` can
+//! change the expiry between them).
 //!
 //! One more condition, on the DashMap-family stacks in the split and thin
 //! layouts: they keep the DRAM-resident remainder of an object -- `key_size +
@@ -91,16 +82,16 @@
 //! so under `measured_accounting` + `segregated_value_arena` P equals the
 //! change in `measured::allocated(NODE_FAST_VALUES)` exactly while no
 //! zero-length fast value is live, and trails it by 8 per one otherwise
-//! (split layout only: a thin or fused item is never zero-sized).
+//! (split layout only: a thin item is never zero-sized).
 //!
 //! ## Clones
 //!
-//! A `TieredValue` clone is a refcount bump in all three layouts (`Arc` in
-//! the split and thin layouts, the item's own count under fusing): it
-//! allocates nothing and charges nothing, and the allocation it keeps alive
-//! stays charged until the LAST handle drops, which is when it leaves the
-//! pool. So every path that clones an `Object` -- a reader's snapshot, a
-//! migration's snapshot, `Object::clone` -- is exact by construction.
+//! A `TieredValue` clone is a refcount bump in both layouts (an `Arc` in
+//! each): it allocates nothing and charges nothing, and the allocation it
+//! keeps alive stays charged until the LAST handle drops, which is when it
+//! leaves the pool. So every path that clones an `Object` -- a reader's
+//! snapshot, a migration's snapshot, `Object::clone` -- is exact by
+//! construction.
 //!
 //! ## Process-global
 //!
@@ -309,8 +300,7 @@ fn shard() -> usize {
 }
 
 /// The figure P charges for one value allocation of `len` bytes keyed by `K`:
-/// `resident_object_bytes::<K>(len)`, the stacks' own unit. See the module doc
-/// for the one build pair (fused + DashMap) whose stacks charge more.
+/// `resident_object_bytes::<K>(len)`, the stacks' own unit.
 #[inline]
 pub fn value_charge<K>(len: u32) -> u64 {
 	crate::object::overhead::resident_object_bytes::<K>(len) as u64

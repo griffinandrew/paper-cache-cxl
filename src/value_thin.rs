@@ -42,8 +42,9 @@
 //!   * the COUNT. A `get` bumps it under the shard guard and drops it after the
 //!     copy. Both are atomic read-modify-writes, which neither pipeline nor
 //!     prefetch, so on the far node they serialise where a streaming copy would
-//!     not. This is the cost that sank `fused_value` (see `value.rs`, "THE
-//!     READ PATH"), and the reason the count is not in the item here.
+//!     not. This is the cost that sank the fused layout (removed; see
+//!     `value.rs`, "THE READ PATH"), and the reason the count is not in the
+//!     item here.
 //!   * the TIER TAG, which every path reads first to route -- the free, the
 //!     policy's tier query, the migration's "already there?" check.
 //!
@@ -70,8 +71,8 @@
 //! ```
 //!
 //! The cliff is the price of co-locating ANY metadata with the bytes, and
-//! `fused_value` pays it with a 24-byte prefix. Which way the total goes is a
-//! property of the workload's value sizes, not of this module, so it is
+//! the fused layout paid it with a 24-byte prefix. Which way the total goes
+//! is a property of the workload's value sizes, not of this module, so it is
 //! measured rather than asserted here -- `object::overhead`'s
 //! `an_object_costs_what_the_accounting_says_it_costs` holds the accounting to
 //! whatever the allocator actually hands out.
@@ -1379,7 +1380,7 @@ mod tests {
 	/// The property this layout exists for, asked of the kernel: a slow value
 	/// keeps its COUNT in DRAM and puts its METADATA -- length, expiry, key --
 	/// on the slow node with its bytes. The default layout passes the first
-	/// half and fails the second; `fused_value` the other way round.
+	/// half and fails the second.
 	///
 	/// Skipped under `stock_jemalloc`, as above.
 	#[test]

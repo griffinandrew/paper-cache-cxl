@@ -309,7 +309,7 @@ The `Hybrid` allocator is used to place data in PMEM:
 
 The code uses `#[cfg(...)]` attributes extensively to:
 1. Select different hashtable implementations based on pmem flags
-2. Select the value layout (`fused_value`, `thin_header`) and the object store
+2. Select the value layout (the default, or `thin_header`) and the object store
    (`merged_object_store`)
 
 ## Valid Feature Combinations

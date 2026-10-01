@@ -65,16 +65,10 @@ required-features = ["server"]
 # way Redis's `zmalloc` does. Reporting only -- nothing reads them to make a
 # decision. See `numa_alloc::measured`.
 measured_accounting = []
-# One allocation per cached value -- count, metadata, key and bytes together,
-# tiering as a unit -- instead of a DRAM header pointing at separately tiered
-# bytes. Built and measured on this branch, then made non-default: see
-# `src/value.rs`'s module doc for the size-class and read-path numbers.
-fused_value = []
 # A 16-byte DRAM header -- the refcount and a tagged pointer, nothing else --
 # in front of ONE tiered item holding the length, the expiry, the key and the
 # bytes. The metadata demotes with the value; the refcount a read bumps stays
-# local. See `src/value_thin.rs`. Excludes `fused_value` (a compile error in
-# `src/lib.rs`).
+# local. See `src/value_thin.rs`.
 thin_header = []
 # Serves the tiered cache over a socket. Pulls in `hybrid_cache_common` for the
 # tiering machinery; the caller still picks which hybrid DESIGN to compile, e.g.

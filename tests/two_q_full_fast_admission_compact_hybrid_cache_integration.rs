@@ -56,8 +56,7 @@ mod hybrid_cache_tests {
     /// default layout that is a 64-byte value. Under `thin_header` the length,
     /// the expiry and the key share the value's allocation, 16 bytes in front
     /// of it for a `u32` key, so it is 48; the incoming object's `base_size` is
-    /// 84 either way. (`fused_value` also charges the key and the expiry to the
-    /// tier, so no length reproduces these figures under it.)
+    /// 84 either way.
     const VALUE_LEN: usize =
         if cfg!(feature = "thin_header") { 48 } else { 64 };
 

@@ -42,9 +42,9 @@
 //!
 //! ## Why the bytes are a SECOND allocation, and not a tail on this one
 //!
-//! Folding them in was built and measured on this branch, then reverted. It is
-//! recorded here because the numbers decide the question and re-deriving them
-//! costs a day.
+//! Folding them in was built and measured on this branch, then made an opt-in
+//! feature (`fused_value`) and finally removed. It is recorded here because the
+//! numbers decide the question and re-deriving them costs a day.
 //!
 //! One allocation holding `[count | len | expiry | key | bytes...]`, tagged at
 //! its head, tiering as a unit. It works -- 194 tests green -- and it halves
@@ -1213,7 +1213,9 @@ mod tests {
 	/// `node_of(slow.bytes().as_ptr())`, i.e. the payload, and that passes
 	/// under BOTH value layouts. It therefore says nothing about whether the
 	/// count, key, length and expiry travel with the bytes -- which is the one
-	/// thing `fused_value` changes, and the reason it exists.
+	/// thing `thin_header` changes (its own
+	/// `a_slow_value_keeps_its_count_in_dram_and_its_item_on_the_slow_node`
+	/// asserts it), and the reason it exists.
 	///
 	/// Skipped under `stock_jemalloc` for the same reason as the test above:
 	/// there the global allocator is deliberately unbound and has no node to
@@ -1244,7 +1246,8 @@ mod tests {
 		// global allocator, which is `numa_alloc::FastAlloc` and node-0-bound,
 		// so the header cannot follow the bytes even when they leave DRAM.
 		// That is deliberate -- see the module doc on the slow-tier read path
-		// -- and `fused_value` is the layout that trades it away.
+		// -- and `thin_header` is the layout that trades part of it away: the
+		// length, the expiry and the key follow the bytes, the count does not.
 		assert_eq!(
 			header_node, NODE_FAST as i32,
 			"this layout pins the header to DRAM: expected node {NODE_FAST}, got {header_node}",

@@ -33,8 +33,7 @@
 //!     box it lives in;
 //!   * the HEADERS -- one DRAM value header per live object: `live x` the
 //!     header allocation's usable size in the build's layout
-//!     (`value::dram_header_bytes`: 32 split, 16 `thin_header`, 0
-//!     `fused_value`, whose header is inside the item).
+//!     (`value::dram_header_bytes`: 32 split, 16 `thin_header`).
 //!
 //! Structures on the SLOW node are not in M -- the eviction stacks under
 //! `eviction_stacks_pmem` -- and are reported apart (`DramMetadata::slow`).

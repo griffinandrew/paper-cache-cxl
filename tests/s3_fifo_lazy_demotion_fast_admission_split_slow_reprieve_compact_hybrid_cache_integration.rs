@@ -82,8 +82,7 @@ mod hybrid_cache_tests {
     /// That 32 is the CHARGE, and the length that buys it depends on the value
     /// layout: under `thin_header` the length, the expiry and the key share the
     /// value's allocation, 16 bytes in front of it for a `u32` key, so there
-    /// the payload is 16 and the item is still 32. (`fused_value` also charges
-    /// the key and the expiry to the tier, so no length gives it 32.)
+    /// the payload is 16 and the item is still 32.
     const PAYLOAD_BYTES: usize =
         if cfg!(feature = "thin_header") { 16 } else { 32 };
 

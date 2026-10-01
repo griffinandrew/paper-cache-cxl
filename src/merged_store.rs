@@ -745,8 +745,8 @@ impl<K, V> Slot<K, V> {
 	/// It calls `resident_object_bytes` -- the SAME accessor `base_size` calls,
 	/// and deliberately not a second rounding of `data_size()`. The two used to
 	/// round `nallocx(len)` independently, which was right under the split
-	/// layout and wrong under `fused_value` and `thin_header`, where the item
-	/// is `bytes_offset::<K>() + len` and the whole of it travels. One accessor is
+	/// layout and wrong under `thin_header`, where the item is
+	/// `bytes_offset::<K>() + len` and the whole of it travels. One accessor is
 	/// what stops a third caller repeating the mistake.
 	fn migrating(&self) -> CacheSize {
 		match &self.object {
@@ -4241,7 +4241,7 @@ mod tests {
 	///
 	/// Routed through the same accessor `Slot::migrating` uses, so a test
 	/// cannot pass by agreeing with a formula the store no longer applies --
-	/// which is exactly what would have happened here under `fused_value`.
+	/// which is exactly what would have happened here under `thin_header`.
 	fn migrating_bytes(size: ObjectSize) -> CacheSize {
 		crate::object::overhead::resident_object_bytes::<u64>(size) as CacheSize
 	}

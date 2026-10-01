@@ -38,8 +38,8 @@ matches on the policy to pick a placement, and `init_policy_stack` builds the ma
 
 The 23 `*_hybrid_cache` features are consequently **not** mutually exclusive; any subset may be
 enabled. Each now gates only its integration-test file and one per-object DRAM-overhead
-accounting term. `lib.rs`'s two `compile_error!`s (`thin_header` with `fused_value`,
-`measured_accounting` with `stock_jemalloc`) concern the build, not the designs.
+accounting term. `lib.rs`'s `compile_error!` (`measured_accounting` with `stock_jemalloc`)
+concerns the build, not the designs.
 
 > Earlier revisions gave each design its own impl block, forcing mutual exclusion and 153
 > pairwise guards, plus a per-design `<design>_hybrid_cache` shim module aliasing a per-design
