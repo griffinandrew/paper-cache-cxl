@@ -1786,7 +1786,7 @@ pub use policy_stack::{MigrationEntry, MigrationOrigin, TaggedMigration};
 /// key ends at the placement once the key's in-flight entries have landed,
 /// whatever they found, and an OVERWRITE needs only the plain rule (its
 /// built tier against the placement). The overwrite-restore argument --
-/// `touch_slot`'s and `ArenaHybridStack::touch_to_front`'s `(k, Fast)`
+/// `touch_slot`'s and `TieredStack::to_front`'s `(k, Fast)`
 /// queued behind a stale demotion of the old value -- is this invariant for
 /// the case where the stack pushes the re-placement itself, and still holds.
 ///
@@ -3918,7 +3918,7 @@ fn polling_delay(now: Instant, last_set_time: Option<Instant>, has_current_set: 
 /// The overwrite case is the same rule. A stack queues `(k, Slow)` for an OLD
 /// object; a `set` replaces it with a new one built in DRAM; the stack's
 /// re-promotion queues `(k, Fast)` so that the stale demotion, landing on the
-/// new object, is undone (`ArenaHybridStack::touch_to_front`, the merged
+/// new object, is undone (`TieredStack::to_front`, the merged
 /// store's `touch_slot`). When both are in one drain the Slow is dropped and
 /// the Fast declines against the DRAM-built value -- exactly the intended end
 /// state, with neither copy. When they are in different drains the migration
@@ -4071,7 +4071,7 @@ where
 /// move settles.
 ///
 /// Two tests outside these modules drive migrations and hold it too, for the
-/// same reason: `arena_hybrid_stack`'s stale-demotion test, and
+/// same reason: `lru_fifo_clock_hybrid_stacks`' stale-demotion test, and
 /// `phys::tests::a_hit_is_counted_by_the_tier_it_was_served_from`, whose real
 /// FIFO cache demotes through its own queue (it reaches the lock through the
 /// `crate::worker::migration_test_lock` re-export, and holds it until the
@@ -4682,7 +4682,7 @@ mod migration_queue_tests {
 /// the "did the swap really happen" assertion is now the object's TIER, and
 /// -- for the declined case, where the tier does not change by definition --
 /// its header identity.
-/// The merged store's twin of `arena_hybrid_stack::overwrite_tests`: the
+/// The merged store's twin of `lru_fifo_clock_hybrid_stacks::overwrite_tests`: the
 /// re-promotion the worker queues after an overwrite's settle
 /// (`MergedStore::worker_set`) is load-bearing even though `set` already built
 /// the value in DRAM.

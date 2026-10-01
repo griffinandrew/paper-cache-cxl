@@ -224,14 +224,18 @@ src/
                                  flat ones are the eight `*_compact_stack.rs` files over
                                  `compact_queue_set.rs`, plus `arc_stack.rs`; `golden.rs`, test-only,
                                  holds the eviction orders their tests assert).
-                                 `arena_hybrid_stack.rs` is ONE generic `ArenaHybridStack<Order>`
-                                 for LRU, FIFO and CLOCK (`LruCompactHybridStack` etc. are its
-                                 aliases): the queue set, the boundary, the settle and the
-                                 accounting are shared, an `ArenaOrder` supplies a hit, an
-                                 overwrite and the victim. The 17 other *_hybrid_stack.rs
-                                 files carry each remaining design's algorithm and its full
-                                 derivation in the module doc — those, and that file's, are
-                                 the authoritative description of what each design does.
+                                 `tiered_stack.rs` is the ONE tiering layer, `TieredStack<P>`:
+                                 the queue set (its lanes), the boundary cursor, the books and
+                                 gauges, the settle, the migration log and push rules, the
+                                 reservation and the `PolicyStack` impl; a `TierPolicy` supplies
+                                 a hit, an overwrite, the victim and the consts that place a new
+                                 key and pick the settles (see "The tiering layer (R4)" below).
+                                 `lru_fifo_clock_hybrid_stacks.rs` is LRU, FIFO and CLOCK on it
+                                 (`LruCompactHybridStack` etc. are aliases). The other
+                                 *_hybrid_stack.rs files are the designs not ported yet; they
+                                 carry each design's algorithm and its full derivation in the
+                                 module doc — those, and the ported ones', are the
+                                 authoritative description of what each design does.
                                  `drain_target` (in mod.rs) holds the single fast-tier
                                  level every settle maintains: 0.95 of the effective
                                  budget (0.98 until E1b), overridable via FAST_TIER_DRAIN_TARGET. One
@@ -3399,8 +3403,8 @@ was removed afterwards: see "Removed the fused value layout" below.)
 ## Deduplication pass (R3)
 
 No behaviour change, and none of the S3-FIFO family touched. One generic
-`ArenaHybridStack<Order>` (`arena_hybrid_stack.rs`) replaces the LRU, FIFO and CLOCK hybrid
-stacks; every decision, migration entry and byte of accounting is the old stacks', shown by the
+`ArenaHybridStack<Order>` (`arena_hybrid_stack.rs`; R4 made it `TieredStack<Lru | Fifo | Clock>`)
+replaces the LRU, FIFO and CLOCK hybrid stacks; every decision, migration entry and byte of accounting is the old stacks', shown by the
 T14 files (byte-identical in every build), the merged store's order-fidelity tests, the
 phys/M identity tests and mutations of the generic code (each turned a named test red). The write-
 only `NodePayload::phys` and the `layout_ab` / `layout_timing` experiments are gone. lib.rs has one
@@ -3412,6 +3416,30 @@ statements read 40. Tests: every test that ran several policies in one process r
 child process of its own (the process-global counters outlive a cache); the integration binaries
 share `tests/common` (and CLOCK has one); the worker tests share `worker/policy/test_support.rs`;
 the merged store's fidelity tests share one fixture.
+
+
+## The tiering layer (R4)
+
+`TieredStack<P: TierPolicy>` (`tiered_stack.rs`) is R3's generic stack for any number of queues.
+A stack is up to four LANES of one `ArenaQueueSet`; a `Layout` says which are SPLIT (a fast
+prefix, a cursor at the oldest fast key, a slow suffix: a demotion is one step of the cursor) and
+which entirely slow (a probation queue). The layer keeps per-lane books (bytes and objects per
+tier) and sums them into every gauge, the migration log with the push rule (a demotion pushes
+`(k, Slow)`; a promotion pushes `(k, Fast)` after the settle that may undo it; a new key pushes
+nothing), the reservation, eff and the structural test, and the settle loop; it implements
+`PolicyStack` once. A `TierPolicy` supplies `hit`, `overwrite` and `victim` (R3's three hooks,
+same defaults, read lazily: `update` is `P::hit(self, key)`) and consts for the lane a new key
+enters and the lanes each entry point settles, copied from each design's own bodies. The S3-FIFO
+family's second chance pushes `(k, Fast)` for a key that was already fast
+(`Push::IfEndsFast`); everything else pushes only for a promotion: both are kept, as knobs.
+
+Ported so far: LRU, FIFO and CLOCK (`lru_fifo_clock_hybrid_stacks.rs`).
+
+What pins each design that is on it: `policy_stack/tier_golden.rs` records, for all 23 designs
+and before any was ported, a fingerprint of every observable over a grid (`tier_goldens.txt`,
+checked in; `PAPER_TIER_GOLDEN_ONLY` / `_DUMP` bisect a mismatch, `_OUT` records), and T14's two
+scripts for the 19 designs T14 did not cover (`t14x_*`, `s4_tests.rs`). LRU, FIFO and CLOCK are
+also held by T14 and the merged store's fidelity tests.
 
 ## A cache-wide eviction watermark, 0.98 of max_size by default (E1)
 

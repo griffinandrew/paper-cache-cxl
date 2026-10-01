@@ -432,7 +432,7 @@ mod global_demotion_fidelity {
 	use crate::{
 		object::Object,
 		worker::policy::policy_stack::{
-			arena_hybrid_stack::LruCompactHybridStack,
+			lru_fifo_clock_hybrid_stacks::LruCompactHybridStack,
 		},
 	};
 
@@ -950,7 +950,7 @@ mod fifo_order_fidelity {
 	use super::*;
 	use super::fidelity::*;
 
-	use crate::worker::policy::policy_stack::arena_hybrid_stack::FifoCompactHybridStack;
+	use crate::worker::policy::policy_stack::lru_fifo_clock_hybrid_stacks::FifoCompactHybridStack;
 
 	use std::collections::HashSet;
 
@@ -1227,7 +1227,7 @@ mod clock_order_fidelity {
 	use super::fidelity::*;
 
 	use crate::worker::policy::policy_stack::{
-		arena_hybrid_stack::ClockCompactHybridStack,
+		lru_fifo_clock_hybrid_stacks::ClockCompactHybridStack,
 		clock_compact_stack::ClockCompactStack,
 	};
 

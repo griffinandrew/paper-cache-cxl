@@ -47,7 +47,9 @@ pub(crate) mod tier_golden;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod lru_lfu_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
-mod arena_hybrid_stack;
+mod tiered_stack;
+#[cfg(any(test, not(feature = "merged_object_store")))]
+mod lru_fifo_clock_hybrid_stacks;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod lfu_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
@@ -124,7 +126,7 @@ use crate::{
 		lru_compact_stack::LruCompactStack,
 		arc_stack::ArcStack,
 		lru_lfu_compact_hybrid_stack::LruLfuCompactHybridStack,
-		arena_hybrid_stack::{ClockCompactHybridStack, FifoCompactHybridStack, LruCompactHybridStack},
+		lru_fifo_clock_hybrid_stacks::{ClockCompactHybridStack, FifoCompactHybridStack, LruCompactHybridStack},
 		lfu_compact_hybrid_stack::LfuCompactHybridStack,
 		two_q_compact_hybrid_stack::TwoQCompactHybridStack,
 		two_q_fast_admission_reprieve_compact_hybrid_stack::TwoQFastAdmissionReprieveCompactHybridStack,
@@ -934,7 +936,7 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 
 		// Same construction as `FifoCompactHybrid` above, which is the design
 		// this is a second chance bolted onto -- see
-		// `arena_hybrid_stack.rs`'s module doc.
+		// `lru_fifo_clock_hybrid_stacks.rs`'s module doc.
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::ClockCompactHybrid => Box::new(
 			ClockCompactHybridStack::new((max_size as f64 * 0.2) as CacheSize).with_shared_overhead(
