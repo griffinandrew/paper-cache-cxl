@@ -800,7 +800,7 @@ impl PolicyStack for S3FifoGhostLazyDemotionCompactHybridStack {
 #[cfg(all(test, feature = "s3_fifo_ghost_lazy_demotion_compact_hybrid_cache"))]
 mod compact_tests {
 	use super::*;
-	use crate::worker::policy::policy_stack::s3_fifo_ghost_compact_hybrid_stack::S3FifoGhostCompactHybridStack;
+	use crate::worker::policy::policy_stack::s3_fifo_hybrid_stacks::S3FifoGhostCompactHybridStack;
 
 	/// The policy string round-trips and rejects the ratio that would starve
 	/// the main queue.

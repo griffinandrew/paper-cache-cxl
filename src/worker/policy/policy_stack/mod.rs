@@ -65,8 +65,6 @@ mod s3_fifo_hybrid_stacks;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_faithful_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
-mod s3_fifo_ghost_compact_hybrid_stack;
-#[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_ghost_lazy_demotion_compact_hybrid_stack;
 #[cfg(any(test, not(feature = "merged_object_store")))]
 mod s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_stack;
@@ -130,8 +128,7 @@ use crate::{
 		two_q_fast_admission_reprieve_compact_hybrid_stack::TwoQFastAdmissionReprieveCompactHybridStack,
 		two_q_full_fast_admission_compact_hybrid_stack::TwoQFullFastAdmissionCompactHybridStack,
 		lru_sized_compact_hybrid_stack::LruSizedCompactHybridStack,
-		s3_fifo_hybrid_stacks::S3FifoCompactHybridStack,
-		s3_fifo_ghost_compact_hybrid_stack::S3FifoGhostCompactHybridStack,
+		s3_fifo_hybrid_stacks::{S3FifoCompactHybridStack, S3FifoGhostCompactHybridStack},
 		s3_fifo_ghost_lazy_demotion_compact_hybrid_stack::S3FifoGhostLazyDemotionCompactHybridStack,
 		s3_fifo_ghost_lazy_demotion_fast_admission_compact_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack,
 		s3_fifo_ghost_lazy_demotion_fast_admission_midpoint_compact_hybrid_stack::S3FifoGhostLazyDemotionFastAdmissionMidpointCompactHybridStack,
@@ -1032,7 +1029,7 @@ pub fn init_policy_stack(policy: PaperPolicy, max_size: CacheSize) -> Box<dyn Po
 		),
 
 		// Same shape again, with the ghost queue keyed on the S3-FIFO
-		// one-access queue -- see s3_fifo_ghost_compact_hybrid_stack.rs.
+		// one-access queue -- see s3_fifo_hybrid_stacks.rs.
 		#[cfg(feature = "hybrid_cache_common")]
 		PaperPolicy::S3FifoGhostCompactHybrid(ratio) => Box::new(
 			S3FifoGhostCompactHybridStack::new(ratio, max_size, (max_size as f64 * 0.2) as CacheSize).with_shared_overhead(

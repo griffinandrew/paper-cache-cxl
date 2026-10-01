@@ -314,7 +314,7 @@ two_q_ghost_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 
 # `s3_fifo_compact_hybrid_cache` plus the same bare-key ghost queue described
 # above, applied to the one-access queue there. See
-# worker/policy/policy_stack/s3_fifo_ghost_compact_hybrid_stack.rs for the
+# worker/policy/policy_stack/s3_fifo_hybrid_stacks.rs for the
 # ghost mechanics.
 #
 s3_fifo_ghost_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]

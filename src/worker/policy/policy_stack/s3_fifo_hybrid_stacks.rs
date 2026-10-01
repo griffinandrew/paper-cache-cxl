@@ -7,7 +7,8 @@
 
 //! S3-FIFO, tier-segmented: a [`TierPolicy`] over a slow one-access queue and
 //! a main queue whose fast prefix is the tier (R4; it was a whole stack of
-//! its own, `S3FifoCompactHybridStack`, in a file of its own).
+//! its own, `S3FifoCompactHybridStack`, in a file of its own), with and
+//! without a ghost (`S3FifoGhostCompactHybridStack`).
 //!
 //! Admission lands at the front of the one-access queue and is entirely
 //! slow-tier: a new key is built slow, and nothing is pushed or settled. A
@@ -23,6 +24,18 @@
 //! bytes of main under `(1 - ratio) x max_size`), and otherwise walks main's
 //! tail. So a full main evicts from main even when the one-access queue is
 //! what is over its budget.
+//!
+//! The ghost: a key evicted from the one-access tail leaves a fingerprint
+//! behind ([`GhostFilter`](super::ghost_filter::GhostFilter): a fixed table
+//! with no keys and no index, outside the slab -- so it is charged as a
+//! separate term beside the per-object reservation), and a later admission
+//! that hits it skips the one-access queue entirely and enters the front of
+//! main, fast: a real promotion, since the value was built slow, so it is
+//! pushed `(key, Fast)` (slow, and pushed nothing, when the value is
+//! structural). A hit does not retire the entry; the ghost's window follows
+//! main's population and is trimmed only by a genuine main eviction, not by
+//! a second chance or a one-access eviction; and the layer clears a key's
+//! fingerprint in `remove` before it asks whether the key is tracked.
 //!
 //! `needs_capacity_eviction` is the one-access queue's own budget
 //! (`ratio x max_size`), raw.
@@ -41,10 +54,13 @@
 //! differential tests that proved the two agreed, and `tier_goldens.txt` holds
 //! what this design did, fingerprinted, before it was ported.
 
+use std::marker::PhantomData;
+
 use crate::PaperPolicy;
 
 use super::{
-	tiered_stack::{Lane, Meta, NoGhost, Push, SlowSplit, TierPolicy, TieredStack},
+	ghost_filter::GhostFilter,
+	tiered_stack::{Ghost, Lane, Meta, NoGhost, Push, SlowSplit, TierPolicy, TieredStack},
 	CacheSize, HashedKey, Tier,
 };
 
@@ -53,35 +69,40 @@ const ONE: Lane = 0;
 const MAIN: Lane = 1;
 
 /// S3-FIFO: `ratio` is the one-access queue's share of the cache, with the
-/// byte budgets it and main are held to.
-pub struct S3 {
+/// byte budgets it and main are held to; `G` is the ghost, if any.
+pub struct S3<G: Ghost> {
 	ratio: f64,
 	one_capacity: CacheSize,
 	main_capacity: CacheSize,
+	ghost: PhantomData<fn() -> G>,
 }
 
 /// `PaperPolicy::S3FifoCompactHybrid`.
-pub type S3FifoCompactHybridStack = TieredStack<S3>;
+pub type S3FifoCompactHybridStack = TieredStack<S3<NoGhost>>;
 
-impl S3 {
+/// `PaperPolicy::S3FifoGhostCompactHybrid`.
+pub type S3FifoGhostCompactHybridStack = TieredStack<S3<GhostFilter>>;
+
+impl<G: Ghost> S3<G> {
 	fn sized(ratio: f64, max_size: CacheSize) -> Self {
 		S3 {
 			ratio,
 			one_capacity: (ratio * max_size as f64) as CacheSize,
 			main_capacity: ((1.0 - ratio) * max_size as f64) as CacheSize,
+			ghost: PhantomData,
 		}
 	}
 }
 
-impl S3FifoCompactHybridStack {
+impl<G: Ghost> TieredStack<S3<G>> {
 	pub fn new(ratio: f64, max_size: CacheSize, fast_capacity: CacheSize) -> Self {
-		TieredStack::with(S3::sized(ratio, max_size), fast_capacity)
+		TieredStack::with_ghost(S3::sized(ratio, max_size), fast_capacity, G::sized_for(max_size))
 	}
 }
 
-impl TierPolicy for S3 {
+impl<G: Ghost> TierPolicy for S3<G> {
 	type Layout = SlowSplit;
-	type Ghost = NoGhost;
+	type Ghost = G;
 
 	const ADMIT: Lane = ONE;
 	const RESETTLE: &'static [Lane] = &[MAIN];
@@ -89,7 +110,29 @@ impl TierPolicy for S3 {
 	const SECOND_CHANCE: Push = Push::IfEndsFast;
 
 	fn is_policy(&self, policy: &PaperPolicy) -> bool {
-		matches!(policy, PaperPolicy::S3FifoCompactHybrid(ratio) if *ratio == self.ratio)
+		match policy {
+			PaperPolicy::S3FifoCompactHybrid(ratio) => !G::PRESENT && *ratio == self.ratio,
+			PaperPolicy::S3FifoGhostCompactHybrid(ratio) => G::PRESENT && *ratio == self.ratio,
+			_ => false,
+		}
+	}
+
+	/// A brand-new key enters the one-access queue; one the ghost remembers
+	/// enters main.
+	fn admit(s: &mut TieredStack<Self>, key: HashedKey, m: Meta) {
+		match s.ghost.contains(key) {
+			true => s.admit(key, m, MAIN, true),
+			false => s.admit(key, m, ONE, false),
+		}
+	}
+
+	/// The one-access queue's evictions populate the ghost; a main eviction
+	/// trims it to main's population (a second chance does not).
+	fn evicted(s: &mut TieredStack<Self>, lane: Lane, key: HashedKey) {
+		match lane {
+			ONE => s.ghost.insert(key),
+			_ => s.ghost.set_window(s.lane_len(MAIN)),
+		}
 	}
 
 	/// A one-access key is promoted to main's front, fast; a main key's bit is
@@ -143,6 +186,85 @@ impl TierPolicy for S3 {
 	}
 }
 
+/// The fast tier is charged the metadata of EVERY tracked key -- one-access,
+/// fast main and slow main alike -- and the ghost entries on top. A
+/// reservation of `fast_object_count() x shared_overhead` understates DRAM by
+/// every slow key's metadata and fails this test.
+#[cfg(test)]
+mod reservation_tests {
+	use super::*;
+	use super::super::{drain_target, PolicyStack};
+	use crate::object::ObjectSize;
+
+	const FAST_CAPACITY: CacheSize = 10_000;
+	const OVERHEAD: CacheSize = 200;
+	const SIZE: ObjectSize = 1_000;
+	/// Large enough that main is never full, so an eviction always takes the
+	/// one-access tail and leaves a ghost.
+	const MAX_SIZE: CacheSize = 1_000_000;
+
+	/// 24 admissions, four one-access evictions (four ghosts), twelve hits
+	/// promoting into main. Twenty keys x 200 B plus the ghost leave ~6_000 B
+	/// for values: five main keys stay fast, seven go slow, eight are still
+	/// one-access. Charging the fast ones alone would keep eight fast.
+	#[test]
+	fn every_tracked_key_is_charged_and_the_ghost_on_top() {
+		let mut stack = S3FifoGhostCompactHybridStack::new(0.1, MAX_SIZE, FAST_CAPACITY)
+			.with_shared_overhead(OVERHEAD);
+
+		for key in 1..=24 {
+			stack.insert(key, SIZE);
+		}
+
+		for oldest in 1..=4 {
+			assert_eq!(stack.evict_one(), Some(oldest));
+		}
+
+		for key in 5..=16 {
+			stack.update(key);
+		}
+
+		let tracked = stack.len() as CacheSize;
+		let one_access = stack.lane_len(ONE);
+		let main_slow = stack.slow_object_count() - one_access;
+
+		assert_eq!(tracked, 20);
+		assert!(
+			one_access > 0 && main_slow > 0 && stack.fast_object_count() > 0,
+			"the fixture must populate every state: {one_access} one-access, {} fast, \
+			 {main_slow} slow in main",
+			stack.fast_object_count(),
+		);
+		assert!((1..=4).all(|k| stack.ghost.contains(k)), "each eviction must leave a ghost");
+
+		let ghost = stack.ghost.dram_bytes();
+
+		assert_eq!(
+			ghost,
+			4 * crate::object::overhead::GHOST_ENTRY_DRAM_OVERHEAD as CacheSize,
+			"four live ghost entries",
+		);
+		assert_eq!(
+			stack.dram_reserved_bytes(),
+			tracked * OVERHEAD + ghost,
+			"all {tracked} tracked keys keep their metadata in DRAM and the ghost is \
+			 charged on top, but the reservation covers {} keys' worth ({} fast, \
+			 {main_slow} slow in main, {one_access} one-access)",
+			stack.dram_reserved_bytes().saturating_sub(ghost) / OVERHEAD,
+			stack.fast_object_count(),
+		);
+
+		let effective = FAST_CAPACITY - tracked * OVERHEAD - ghost;
+
+		assert!(
+			stack.fast_bytes_used() <= drain_target::bytes(effective),
+			"{} B of values are fast against {effective} B left once every key's \
+			 metadata and the ghost are reserved",
+			stack.fast_bytes_used(),
+		);
+	}
+}
+
 /// S3-FIFO's two byte budgets are thresholds, and at exactly the threshold they
 /// fall on different sides: the one-access queue is over its capacity only
 /// ABOVE it, main is full AT it. (No golden reaches a byte total that equals a
@@ -182,9 +304,9 @@ mod capacity_tests {
 	}
 }
 
-/// A resize of the cache queues nothing in S3-FIFO, even on a stack the
-/// metadata push has left over its budget: only `resettle` and a resize of the
-/// fast tier settle it.
+/// A resize of the cache queues nothing in S3-FIFO, with or without its ghost,
+/// even on a stack the metadata push has left over its budget: only `resettle`
+/// and a resize of the fast tier settle it.
 #[cfg(test)]
 mod resize_tests {
 	use super::*;
@@ -193,5 +315,10 @@ mod resize_tests {
 	#[test]
 	fn s3_fifo() {
 		a_resize_settles_nothing(S3FifoCompactHybridStack::new(0.1, 1_000_000, 10_000));
+	}
+
+	#[test]
+	fn s3_fifo_ghost() {
+		a_resize_settles_nothing(S3FifoGhostCompactHybridStack::new(0.1, 1_000_000, 10_000));
 	}
 }
