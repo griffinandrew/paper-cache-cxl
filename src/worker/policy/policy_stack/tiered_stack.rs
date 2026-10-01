@@ -62,6 +62,17 @@
 //! hooks get the stack and read what they need from it: `update` is
 //! `P::hit(self, key)`, so a FIFO hit costs nothing and a CLOCK hit one
 //! payload write.
+//!
+//! # Cost
+//!
+//! Every key-addressed operation on the queues is one probe of the keyed
+//! index (a hash and, at scale, a cache miss), and the layer makes no more of
+//! them than the stacks it replaced: a payload is written only when it
+//! changes (an LRU hit on a fast key writes nothing), a tail eviction is one
+//! removal that hands back the payload, a settle hands its candidate's
+//! payload to the demotion, and a second chance reads whether the key is
+//! structural from the payload the relocation reads anyway. `tier_probes.rs`
+//! counts them.
 
 use std::marker::PhantomData;
 
@@ -70,7 +81,7 @@ use crate::{object::ObjectSize, PaperPolicy};
 use super::{
 	arena_queue_set::{ArenaQueueSet, MAX_QUEUES, NodePayload},
 	ghost_filter::GhostFilter,
-	drain_target, narrow_resident, placed, prev_fast, CacheSize, HashedKey, Placement, PolicyStack, SetEvent, Tier,
+	drain_target, fast_at_or_before, narrow_resident, placed, prev_fast, CacheSize, HashedKey, Placement, PolicyStack, SetEvent, Tier,
 };
 
 /// A lane: a queue of the shared [`ArenaQueueSet`].
@@ -316,6 +327,12 @@ fn placed_in(payload: &NodePayload) -> Tier {
 	payload.tier.expect("a tiered stack records a tier for every key")
 }
 
+/// Whether a value of `migrating` bytes is STRUCTURAL (S5) in a fast tier of
+/// `eff` bytes: larger than the tier empty.
+fn structural_in(eff: CacheSize, migrating: CacheSize) -> bool {
+	migrating > eff
+}
+
 /// The queues, their cursors and books, and the log: everything that depends
 /// on the layout but not on the policy.
 struct Lanes<L: Layout> {
@@ -411,13 +428,34 @@ impl<L: Layout> Lanes<L> {
 		Some(payload)
 	}
 
+	/// Takes the tail of `lane` out, off the books: one probe, since the lane is
+	/// known and the removal hands back the payload. If it was the cursor, the
+	/// cursor steps to the fast key now at or before the new tail (S5: past any
+	/// structural ones) -- the nearest fast key in front of the one that left.
+	fn unlink_tail(&mut self, lane: Lane) -> Option<HashedKey> {
+		let key = self.set.back(lane)?;
+		let was_cursor = self.cursor[lane] == Some(key);
+		let payload = self.set.remove(lane, key)?;
+
+		self.debit(lane, placed_in(&payload), payload.migrating());
+
+		if was_cursor && placed_in(&payload) == Tier::Fast {
+			self.cursor[lane] = fast_at_or_before(&self.set, self.set.back(lane));
+		}
+
+		Some(key)
+	}
+
 	/// Moves a tracked key to the front of `to`, re-placing it: slow if
-	/// `structural`, else fast. Books, cursors and the bit follow; a fast key
-	/// that turns slow is pushed now, before the caller settles. Returns
-	/// whether it was a promotion (slow to fast).
-	fn relocate(&mut self, key: HashedKey, to: Lane, structural: bool) -> Option<bool> {
+	/// `structural`, else fast. `structural` is the caller's when it has it;
+	/// otherwise it is read from the payload this reads anyway, against `eff`.
+	/// Books, cursors and the bit follow; a fast key that turns slow is pushed
+	/// now, before the caller settles. Returns whether it was a promotion (slow
+	/// to fast) and whether it is structural.
+	fn relocate(&mut self, key: HashedKey, to: Lane, structural: Option<bool>, eff: CacheSize) -> Option<(bool, bool)> {
 		let payload = self.set.payload(key)?;
 		let (from, was, size) = (payload.queue as usize, placed_in(&payload), payload.migrating());
+		let structural = structural.unwrap_or_else(|| structural_in(eff, size));
 		let now = if structural { Tier::Slow } else { Tier::Fast };
 		let at_front = from == to && self.set.front(to) == Some(key);
 
@@ -439,10 +477,14 @@ impl<L: Layout> Lanes<L> {
 			self.credit(to, now, size);
 		}
 
-		if let Some(slot) = self.set.payload_mut(key) {
-			slot.queue = to as u8;
-			slot.tier = Some(now);
-			slot.freq = 0;
+		// Not written when it would write what is there -- the same lane, the same
+		// tier, a clear bit: an LRU hit on a fast key, the common one.
+		if from != to || was != now || payload.freq != 0 {
+			if let Some(slot) = self.set.payload_mut(key) {
+				slot.queue = to as u8;
+				slot.tier = Some(now);
+				slot.freq = 0;
+			}
 		}
 
 		match (structural, was) {
@@ -466,14 +508,13 @@ impl<L: Layout> Lanes<L> {
 			},
 		}
 
-		Some(was == Tier::Slow && now == Tier::Fast)
+		Some((was == Tier::Slow && now == Tier::Fast, structural))
 	}
 
 	/// Books a fast key as slow, in place, and steps the cursor off it if it
-	/// was the cursor. The caller pushes `(key, Slow)` where the demotion is
-	/// not a settle's.
-	fn demote(&mut self, key: HashedKey) {
-		let Some(payload) = self.set.payload(key) else { return };
+	/// was the cursor. `payload` is what the caller read of it. The caller
+	/// pushes `(key, Slow)` where the demotion is not a settle's.
+	fn demote(&mut self, key: HashedKey, payload: NodePayload) {
 		let lane = payload.queue as usize;
 
 		if self.cursor[lane] == Some(key) {
@@ -486,6 +527,13 @@ impl<L: Layout> Lanes<L> {
 
 		self.debit(lane, Tier::Fast, payload.migrating());
 		self.credit(lane, Tier::Slow, payload.migrating());
+	}
+
+	/// `demote`, for a caller that has not read the key.
+	fn demote_key(&mut self, key: HashedKey) {
+		if let Some(payload) = self.set.payload(key) {
+			self.demote(key, payload);
+		}
 	}
 
 	/// A reprieve (lazy demotion): the settle's candidate, still fast, goes to
@@ -511,15 +559,16 @@ impl<L: Layout> Lanes<L> {
 	fn settle(&mut self, lane: Lane, target: CacheSize, lazy: bool) {
 		while self.books[lane].bytes[idx(Tier::Fast)] > target {
 			let Some(candidate) = self.cursor[lane] else { break };
+			let payload = self.set.payload(candidate);
 
-			if lazy && self.set.payload(candidate).is_some_and(|p| p.freq != 0) {
+			if lazy && payload.is_some_and(|p| p.freq != 0) {
 				self.reprieve(lane, candidate);
 
 				continue;
 			}
 
-			match self.set.payload(candidate) {
-				Some(_) => self.demote(candidate),
+			match payload {
+				Some(payload) => self.demote(candidate, payload),
 				None => self.cursor[lane] = None,
 			}
 
@@ -598,7 +647,7 @@ impl<P: TierPolicy> TieredStack<P> {
 	/// key the client placed normally just before eff moved is placed as the
 	/// stack's own promotions would place it.
 	fn structural(&self, migrating: CacheSize) -> bool {
-		migrating > self.eff()
+		structural_in(self.eff(), migrating)
 	}
 
 	/// Whether the tracked `key`'s value is structural now.
@@ -691,7 +740,14 @@ impl<P: TierPolicy> TieredStack<P> {
 	/// when the new one replaced it demotes the new one, and this entry behind
 	/// it restores it.
 	pub fn to_front(&mut self, key: HashedKey, to: Lane, structural: bool, push: Push) {
-		let Some(promoted) = self.lanes.relocate(key, to, structural) else { return };
+		self.bring_to_front(key, to, Some(structural), push);
+	}
+
+	/// `to_front`, with `structural` the caller's, or `None` for the layer to
+	/// read it from the payload it reads anyway.
+	fn bring_to_front(&mut self, key: HashedKey, to: Lane, structural: Option<bool>, push: Push) {
+		let eff = if structural.is_none() { self.eff() } else { 0 };
+		let Some((promoted, structural)) = self.lanes.relocate(key, to, structural, eff) else { return };
 
 		self.settle(to);
 
@@ -705,16 +761,14 @@ impl<P: TierPolicy> TieredStack<P> {
 	/// A second chance: `key` to the front of `lane` by the rule of
 	/// [`TierPolicy::SECOND_CHANCE`].
 	pub fn second_chance(&mut self, key: HashedKey, lane: Lane) {
-		if let Some(structural) = self.structural_of(key) {
-			self.to_front(key, lane, structural, P::SECOND_CHANCE);
-		}
+		self.bring_to_front(key, lane, None, P::SECOND_CHANCE);
 	}
 
 	/// Takes a FAST key out of the fast set IN PLACE (S5): an overwrite with a
 	/// value larger than an empty fast tier, in an order that keeps an
 	/// overwritten key where it is. Pushed `(key, Slow)`: its placement changed.
 	pub fn demote_in_place(&mut self, key: HashedKey) {
-		self.lanes.demote(key);
+		self.lanes.demote_key(key);
 		self.lanes.log.push((key, Tier::Slow));
 	}
 
@@ -742,20 +796,14 @@ impl<P: TierPolicy> TieredStack<P> {
 		}
 	}
 
-	/// Removes `key` from its lane and the books; the victim.
-	pub fn evict(&mut self, key: HashedKey) -> Option<HashedKey> {
-		let lane = self.lanes.unlink(key)?.queue as Lane;
+	/// Removes the tail of `lane` from the lane and the books, and returns it:
+	/// the victim.
+	pub fn evict_tail(&mut self, lane: Lane) -> Option<HashedKey> {
+		let key = self.lanes.unlink_tail(lane)?;
 
 		P::evicted(self, lane, key);
 
 		Some(key)
-	}
-
-	/// Evicts the tail of `lane`.
-	pub fn evict_tail(&mut self, lane: Lane) -> Option<HashedKey> {
-		let key = self.lanes.set.back(lane)?;
-
-		self.evict(key)
 	}
 
 	/// `insert`'s body: a `Set`, with the client's placement (S5). A tracked

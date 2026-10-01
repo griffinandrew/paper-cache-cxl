@@ -3441,6 +3441,15 @@ family's second chance pushes `(k, Fast)` for a key that was already fast
 
 Ported so far: LRU, FIFO and CLOCK (`lru_fifo_clock_hybrid_stacks.rs`); 2Q and 2Q-ghost (`two_q_hybrid_stacks.rs`); S3-FIFO, S3-FIFO-ghost and S3-FIFO-ghost-lazy-demotion (`s3_fifo_hybrid_stacks.rs`).
 
+Hot paths cost the index no more than the stacks they replaced. Every key-addressed operation on the
+queues is one probe of the keyed index (a hash and, at scale, a cache miss), and a layer over every
+design is where a probe too many hides: `relocate` writes the payload only when it changes (an LRU
+hit on a fast key writes nothing), a tail eviction is one removal (`unlink_tail`) with the cursor
+mended from the new tail, a settle reads its candidate once and hands it to the demotion, and a
+second chance reads the structural test from the payload `relocate` reads anyway. In test builds the
+index counts its probes (`arena_index::probes`), and `policy_stack/tier_probes.rs` holds each design's
+hot operations to the figure of the flat stack it replaced, or the lower one the layer has reached.
+
 What pins each design that is on it: `policy_stack/tier_golden.rs` records, for all 23 designs
 and before any was ported, a fingerprint of every observable over a grid (`tier_goldens.txt`,
 checked in; `PAPER_TIER_GOLDEN_ONLY` / `_DUMP` bisect a mismatch, `_OUT` records), and T14's two

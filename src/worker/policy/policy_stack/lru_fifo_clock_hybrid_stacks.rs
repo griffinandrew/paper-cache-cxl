@@ -195,7 +195,7 @@ impl TierPolicy for Clock {
 				continue;
 			}
 
-			return s.evict(key);
+			return s.evict_tail(MAIN);
 		}
 	}
 }

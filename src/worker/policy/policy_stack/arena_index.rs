@@ -442,6 +442,26 @@ impl FreeList {
 	}
 }
 
+// Test builds count every keyed operation the index serves on a thread --
+// each `get`, `insert` and `remove` is one probe -- so that a test can hold a
+// hot path to the number of probes the stack it replaced made (see
+// `tier_probes.rs`).
+#[cfg(test)]
+thread_local! {
+	static PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The probes this thread's indexes have served so far.
+#[cfg(test)]
+pub fn probes() -> u64 {
+	PROBES.with(|probes| probes.get())
+}
+
+#[cfg(test)]
+fn count_probe() {
+	PROBES.with(|probes| probes.set(probes.get() + 1));
+}
+
 /// An open-addressed, linear-probed table of slot numbers that holds no keys.
 ///
 /// Every method that has to compare a key takes the owner's slab, because the
@@ -513,6 +533,9 @@ impl KeylessIndex {
 	/// Slot holding `key`, or [`NIL`].
 	#[inline]
 	pub fn get<P>(&self, slots: &SlotSlab<P>, key: HashedKey) -> u32 {
+		#[cfg(test)]
+		count_probe();
+
 		if self.buckets.is_empty() {
 			return NIL;
 		}
@@ -566,6 +589,9 @@ impl KeylessIndex {
 	/// Places an ALREADY-ALLOCATED slot in the table. `slots[slot].key` must
 	/// already be written, since that is the only copy of the key there is.
 	pub fn insert<P>(&mut self, slots: &SlotSlab<P>, slot: u32) {
+		#[cfg(test)]
+		count_probe();
+
 		self.grow_for_one_more(slots);
 
 		let key = slots[slot as usize].key;
@@ -593,6 +619,9 @@ impl KeylessIndex {
 	/// Removes `key` from the table, returning its slot. Frees nothing: the
 	/// slab slot is the owner's to reuse.
 	pub fn remove<P>(&mut self, slots: &SlotSlab<P>, key: HashedKey) -> Option<u32> {
+		#[cfg(test)]
+		count_probe();
+
 		let bucket = self.bucket_of(slots, key)?;
 		let slot = self.buckets[bucket];
 

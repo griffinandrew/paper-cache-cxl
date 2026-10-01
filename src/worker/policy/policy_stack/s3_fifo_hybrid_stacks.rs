@@ -194,7 +194,7 @@ impl<G: Ghost, const LAZY: bool> TierPolicy for S3<G, LAZY> {
 			let key = s.tail(MAIN)?;
 
 			if !s.bit(key) {
-				return s.evict(key);
+				return s.evict_tail(MAIN);
 			}
 
 			s.second_chance(key, MAIN);
