@@ -172,7 +172,7 @@ lfu_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 # lands in a one-access FIFO queue entirely in the slow tier (a real,
 # synchronous PMEM write on every set()); only a re-access promotes an object
 # into the fast-tier portion of the main LRU queue -- see
-# worker/policy/policy_stack/two_q_compact_hybrid_stack.rs for the algorithm.
+# worker/policy/policy_stack/two_q_hybrid_stacks.rs for the algorithm.
 #
 two_q_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 

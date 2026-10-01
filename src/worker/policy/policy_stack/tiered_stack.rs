@@ -90,6 +90,15 @@ impl Layout for Single {
 	const SPLIT: u8 = 0b1;
 }
 
+/// Lane 0 an entirely slow probation queue (2Q's FIFO, S3-FIFO's one-access
+/// queue), lane 1 a split main queue.
+pub struct SlowSplit;
+
+impl Layout for SlowSplit {
+	const LANES: usize = 2;
+	const SPLIT: u8 = 0b10;
+}
+
 /// When a key moved to the front of a split lane is pushed `(key, Fast)`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Push {
@@ -458,6 +467,11 @@ impl<P: TierPolicy> TieredStack<P> {
 		self.lanes.set.back(lane)
 	}
 
+	/// Bytes `lane` holds, in both tiers.
+	pub fn lane_bytes(&self, lane: Lane) -> CacheSize {
+		self.lanes.books[lane].bytes.iter().sum()
+	}
+
 	/// The reference bit (`freq != 0`).
 	pub fn bit(&self, key: HashedKey) -> bool {
 		self.lanes.set.payload(key).is_some_and(|p| p.freq != 0)
@@ -725,9 +739,9 @@ pub(super) mod testing {
 			self.lanes.set.payload(key).map(|p| p.queue as Lane)
 		}
 
-		/// Bytes `lane` holds, in both tiers.
-		pub fn lane_bytes(&self, lane: Lane) -> CacheSize {
-			self.lanes.books[lane].bytes.iter().sum()
+		/// Keys in `lane`.
+		pub fn lane_len(&self, lane: Lane) -> usize {
+			self.lanes.set.queue_len(lane)
 		}
 	}
 
@@ -837,13 +851,6 @@ pub(super) mod testing {
 mod tests {
 	use super::*;
 	use super::testing::books_match_the_queue_after_every_operation;
-
-	struct SlowSplit;
-
-	impl Layout for SlowSplit {
-		const LANES: usize = 2;
-		const SPLIT: u8 = 0b10;
-	}
 
 	const PROBATION: Lane = 0;
 	const MAIN: Lane = 1;
