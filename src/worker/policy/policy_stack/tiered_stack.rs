@@ -88,7 +88,7 @@ use super::{
 
 pub(super) mod carve;
 
-pub use carve::newly_fills;
+pub use carve::{newly_fills, Shares};
 
 /// A lane: a queue of the shared [`ArenaQueueSet`].
 pub type Lane = usize;
@@ -134,6 +134,16 @@ impl Layout for FastSplit {
 	const LANES: usize = 2;
 	const SPLIT: u8 = 0b10;
 	const FAST: u8 = 0b01;
+}
+
+/// Lane 0 an entirely fast DRAM admission queue, lane 1 an entirely slow
+/// overflow queue, lane 2 a split main queue: the full fast-admission 2Q.
+pub struct FastSlowSplit;
+
+impl Layout for FastSlowSplit {
+	const LANES: usize = 3;
+	const SPLIT: u8 = 0b100;
+	const FAST: u8 = 0b001;
 }
 
 /// When a key moved to the front of a split lane is pushed `(key, Fast)`.
@@ -441,9 +451,10 @@ impl<L: Layout> Lanes<L> {
 		self.books[..L::LANES].iter().map(of).sum()
 	}
 
-	/// Applies a re-`set`'s size to a tracked key and its lane's books.
-	fn resize_key(&mut self, key: HashedKey, m: Meta) {
-		let Some(payload) = self.set.payload_mut(key) else { return };
+	/// Applies a re-`set`'s size to a tracked key and its lane's books. Returns
+	/// the lane it is in and whether its bytes grew.
+	fn resize_key(&mut self, key: HashedKey, m: Meta) -> Option<(Lane, bool)> {
+		let payload = self.set.payload_mut(key)?;
 
 		let old = payload.migrating();
 
@@ -451,9 +462,12 @@ impl<L: Layout> Lanes<L> {
 		payload.dram_resident = m.resident;
 
 		let delta = payload.migrating() as i64 - old as i64;
-		let bytes = &mut self.books[payload.queue as usize].bytes[idx(placed_in(payload))];
+		let lane = payload.queue as usize;
+		let bytes = &mut self.books[lane].bytes[idx(placed_in(payload))];
 
 		*bytes = (*bytes as i64 + delta).max(0) as CacheSize;
+
+		Some((lane, delta > 0))
 	}
 
 	/// A brand-new key at `end` of `lane`, in `tier` (fast only in a fast lane,
@@ -759,9 +773,10 @@ impl<P: TierPolicy> TieredStack<P> {
 		}
 	}
 
-	/// Applies a re-`set`'s size to a tracked key's books.
-	pub fn resize_key(&mut self, key: HashedKey, m: Meta) {
-		self.lanes.resize_key(key, m);
+	/// Applies a re-`set`'s size to a tracked key's books. Returns the lane it
+	/// is in and whether its bytes grew.
+	pub fn resize_key(&mut self, key: HashedKey, m: Meta) -> Option<(Lane, bool)> {
+		self.lanes.resize_key(key, m)
 	}
 
 	pub fn fast_capacity(&self) -> CacheSize {
@@ -772,11 +787,17 @@ impl<P: TierPolicy> TieredStack<P> {
 	/// from its cursor, a fast lane spills its tail (if the design says
 	/// where), and a slow lane has nothing to settle.
 	pub fn settle(&mut self, lane: Lane) {
+		self.settle_with(lane, 0);
+	}
+
+	/// `settle`, with `incoming` bytes about to join a fast lane counted
+	/// against it: a design that makes room before it places a key.
+	pub fn settle_with(&mut self, lane: Lane, incoming: CacheSize) {
 		let target = drain_target::bytes(P::budget(self, lane));
 
 		match (Lanes::<P::Layout>::split(lane), P::SPILL) {
 			(true, _) => self.lanes.settle(lane, target, P::LAZY_DEMOTION),
-			(false, Some(spill)) if Lanes::<P::Layout>::fast(lane) => self.lanes.spill(lane, target, spill),
+			(false, Some(spill)) if Lanes::<P::Layout>::fast(lane) => self.lanes.spill(lane, target, incoming, spill),
 			_ => {},
 		}
 	}
@@ -1359,7 +1380,7 @@ mod tests {
 		}
 
 		fn budget(s: &TieredStack<Self>, lane: Lane) -> CacheSize {
-			let (fast, main) = s.carve_budgets(6_000);
+			let (fast, main) = s.carve_budgets(6_000, Shares::MainFirst);
 
 			match lane {
 				PROBATION => fast,

@@ -193,7 +193,7 @@ two_q_fast_admission_reprieve_compact_hybrid_cache = ["key_value_pmem", "hybrid_
 # evicts. This is the first design in which `k_out` is a live parameter, hence
 # the only two-parameter policy string:
 # `2q-full-fast-admission-compact-hybrid-<k_in>-<k_out>`. See
-# `worker/policy/policy_stack/two_q_full_fast_admission_compact_hybrid_stack.rs`.
+# `worker/policy/policy_stack/two_q_fast_admission_hybrid_stacks.rs`.
 #
 two_q_full_fast_admission_compact_hybrid_cache = ["key_value_pmem", "hybrid_cache_common"]
 

@@ -3439,7 +3439,7 @@ enters and the lanes each entry point settles, copied from each design's own bod
 family's second chance pushes `(k, Fast)` for a key that was already fast
 (`Push::IfEndsFast`); everything else pushes only for a promotion: both are kept, as knobs.
 
-Ported so far: LRU, FIFO and CLOCK (`lru_fifo_clock_hybrid_stacks.rs`); 2Q and 2Q-ghost (`two_q_hybrid_stacks.rs`); S3-FIFO, S3-FIFO-ghost and S3-FIFO-ghost-lazy-demotion (`s3_fifo_hybrid_stacks.rs`); 2Q-fast-admission-reprieve (`two_q_fast_admission_hybrid_stacks.rs`, its admission FIFO a FAST lane); S3-FIFO-ghost-lazy-demotion-fast-admission (`S3<GhostFilter, true, FastAdmission>`, its one-access queue a FAST lane).
+Ported so far: LRU, FIFO and CLOCK (`lru_fifo_clock_hybrid_stacks.rs`); 2Q and 2Q-ghost (`two_q_hybrid_stacks.rs`); S3-FIFO, S3-FIFO-ghost and S3-FIFO-ghost-lazy-demotion (`s3_fifo_hybrid_stacks.rs`); 2Q-fast-admission-reprieve (`two_q_fast_admission_hybrid_stacks.rs`, its admission FIFO a FAST lane); S3-FIFO-ghost-lazy-demotion-fast-admission (`S3<GhostFilter, true, FastAdmission>`, its one-access queue a FAST lane); 2Q-full-fast-admission (`two_q_fast_admission_hybrid_stacks.rs`: a FAST, a slow and a split lane).
 
 Hot paths cost the index no more than the stacks they replaced. Every key-addressed operation on the
 queues is one probe of the keyed index (a hash and, at scale, a cache miss), and a layer over every

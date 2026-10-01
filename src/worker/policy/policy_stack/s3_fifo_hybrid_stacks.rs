@@ -95,7 +95,7 @@ use crate::PaperPolicy;
 
 use super::{
 	ghost_filter::GhostFilter,
-	tiered_stack::{newly_fills, FastSplit, Ghost, Lane, Layout, Meta, NoGhost, Push, SlowSplit, TierPolicy, TieredStack},
+	tiered_stack::{newly_fills, FastSplit, Ghost, Lane, Layout, Meta, NoGhost, Push, Shares, SlowSplit, TierPolicy, TieredStack},
 	drain_target, CacheSize, HashedKey, Tier,
 };
 
@@ -175,7 +175,7 @@ impl<G: Ghost, const LAZY: bool, A: Admission> S3<G, LAZY, A> {
 	/// The one-access queue's budget and main's (`FastAdmission`): the
 	/// carve-out clamped to the tier, the reservation split in proportion.
 	fn budgets(s: &TieredStack<Self>) -> (CacheSize, CacheSize) {
-		s.carve_budgets(s.policy.one_capacity)
+		s.carve_budgets(s.policy.one_capacity, Shares::Proportional)
 	}
 
 	/// ONE warning to stderr when the configured one-access queue
@@ -645,7 +645,7 @@ mod fast_budget_tests {
 		// 0.1 * MAX_SIZE = 1.2e9, comfortably inside the 4 GiB budget.
 		let stack = Stack::new(0.1, MAX_SIZE, FAST_CAPACITY).with_shared_overhead(224);
 		let one_capacity = stack.policy.one_capacity;
-		let (_, main_share) = shares(one_capacity, stack.dram_reserved_bytes(), FAST_CAPACITY);
+		let (_, main_share) = shares(one_capacity, Shares::Proportional, stack.dram_reserved_bytes(), FAST_CAPACITY);
 
 		assert_eq!(one_capacity.min(FAST_CAPACITY), one_capacity, "a carve-out under the budget must pass through unchanged");
 		assert_eq!(Policy::budgets(&stack).1, FAST_CAPACITY - one_capacity - main_share, "and main must still get the plain remainder");

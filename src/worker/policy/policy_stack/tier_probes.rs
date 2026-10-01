@@ -30,7 +30,7 @@ use super::{
 	ClockCompactHybridStack, FifoCompactHybridStack, HashedKey, LruCompactHybridStack, PolicyStack,
 	S3FifoCompactHybridStack, S3FifoGhostLazyDemotionCompactHybridStack, S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack,
 	TwoQCompactHybridStack,
-	TwoQFastAdmissionReprieveCompactHybridStack,
+	TwoQFastAdmissionReprieveCompactHybridStack, TwoQFullFastAdmissionCompactHybridStack,
 };
 
 /// Runs `op` and holds the probes it makes to `most`.
@@ -301,4 +301,46 @@ fn s3_fifo_with_lazy_demotion_and_fast_admission() {
 	stack.update(1);
 
 	within("an eviction past one second chance", 10, || stack.evict_one());
+}
+
+/// The full 2Q with a DRAM probation queue: an a1_in hit does nothing, its
+/// overflow is demoted into a1_out, and a hit on an a1_out key promotes it
+/// into am. First a tier a1_in's carve-out covers, then an a1_in of 4,500 B
+/// in a tier of 10,000 B.
+#[test]
+fn two_q_full_fast_admission() {
+	let mut stack = TwoQFullFastAdmissionCompactHybridStack::new(0.5, 0.5, 1_000_000, 100_000);
+
+	fill(&mut stack, 1..=8);
+
+	within("a hit on an a1_in key: nothing", 2, || stack.update(3));
+	within("a new key", 2, || stack.insert(9, 1_000));
+	// The flat stack: 4.
+	within("an overwrite of the same size", 3, || stack.insert(8, 1_000));
+	// The flat stack: 4.
+	within("an overwrite that grows the key", 3, || stack.insert(8, 1_500));
+	within("a removal", 2, || stack.remove(7));
+	within("a structural new key", 2, || stack.insert(40, 200_000));
+	within("an eviction of a1_out's tail", 1, || stack.evict_one());
+	within("an eviction of a1_in's tail", 1, || stack.evict_one());
+
+	let mut stack = TwoQFullFastAdmissionCompactHybridStack::new(0.0045, 0.5, 1_000_000, 10_000);
+
+	fill(&mut stack, 1..=3);
+
+	within("a new key that demotes none", 2, || stack.insert(4, 1_000));
+	within("a new key that demotes one", 5, || stack.insert(5, 1_000));
+	within("a hit on an a1_out key: a promotion into am", 6, || stack.update(1));
+	within("a hit on an am key", 4, || stack.update(1));
+	within("an eviction of a1_out's tail", 1, || stack.evict_one());
+
+	let mut stack = TwoQFullFastAdmissionCompactHybridStack::new(0.0045, 0.5, 1_000_000, 10_000);
+
+	fill(&mut stack, 1..=14);
+
+	for key in 1..=5 {
+		stack.update(key);
+	}
+
+	within("a hit on an a1_out key: a promotion and a demotion", 10, || stack.update(6));
 }
