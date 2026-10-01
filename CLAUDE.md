@@ -3452,7 +3452,11 @@ hot operations to the figure of the flat stack it replaced, or the lower one the
 
 What pins each design that is on it: `policy_stack/tier_golden.rs` records, for all 23 designs
 and before any was ported, a fingerprint of every observable over a grid (`tier_goldens.txt`,
-checked in; `PAPER_TIER_GOLDEN_ONLY` / `_DUMP` bisect a mismatch, `_OUT` records), and T14's two
+checked in; `PAPER_TIER_GOLDEN_ONLY` / `_DUMP` bisect a mismatch, `_OUT` records) of two small
+universes (60 and 250 keys) and wider ones (600 and 2,000 keys, and 40 at one tier), the
+configurations a differential against the legacy stacks ran too: a cache of hundreds of keys against
+a tier of a few is what shows a rule that matters only while the stack is over its budget, such as a
+resize that also settles. T14's two
 scripts for the 19 designs T14 did not cover (`t14x_*`, `s4_tests.rs`). LRU, FIFO and CLOCK are
 also held by T14 and the merged store's fidelity tests.
 

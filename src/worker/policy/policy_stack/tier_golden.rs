@@ -51,6 +51,19 @@
 //! target (`FAST_TIER_DRAIN_TARGET`) is read once per process, so the 0.95
 //! default and 1.0 are two tests, the second in a child process.
 //!
+//! Wider universes follow: `w3` (600 keys) and `w4` (2,000), each at three
+//! fast tiers (8, 24 and 64 KiB) and the same reservations and ratios, and
+//! `w0` (40 keys) at 24 KiB alone. A cache of hundreds of keys against a tier
+//! of a few is where a rule that matters only while the stack is over its
+//! budget, and nothing has settled it yet, shows: a `resize` of the cache that
+//! also settles, for one, which the two seeds above show in the S3-FIFO
+//! designs alone, and these show in 2Q, 2Q-ghost, LRU, FIFO and CLOCK as well
+//! (by one or two runs each; LRU's only in `w0`, at the default target). They
+//! are drawn the way the widened differential against the legacy stacks drew
+//! its seeds (an xorshift from `0x9E37_79B9_7F4A_7C15`; the number in the name
+//! is the place in that list), so each of them was recorded on the stacks the
+//! layer replaced as well, and a design ported later is held to that too.
+//!
 //! # Using it
 //!
 //!   * A mismatch names every (design, configuration) that moved. Re-run with
@@ -242,8 +255,32 @@ fn grid(design: &Design) -> Vec<(String, Cfg)> {
 		}
 	}
 
+	for (w, seed, keys, tiers) in WIDE {
+		for &f in tiers {
+			for omega in [0u64, 64, 400] {
+				for (r, &ratio) in design.ratios.iter().enumerate() {
+					let fast = WIDE_TIERS[f];
+					let cfg = Cfg { fast, max: fast * 8, omega, ratio, seed: seed ^ (f as u64) << 8, keys };
+
+					out.push((format!("w{w}-f{f}-o{omega}-r{r}"), cfg));
+				}
+			}
+		}
+	}
+
 	out
 }
+
+/// The wide universes: their place in the differential's list of seeds, the
+/// seed, the keys, and the tiers (indices into `WIDE_TIERS`) they run at.
+const WIDE: [(usize, u64, u64, &[usize]); 3] = [
+	(0, 0xDC1B_77AE_0BF3_4DAD, 40, &[1]),
+	(3, 0x305F_050C_368D_CC74, 600, &[0, 1, 2]),
+	(4, 0x2CEB_16E0_A1C5_4AEC, 2_000, &[0, 1, 2]),
+];
+
+/// Their fast tiers: a few values, then the reservation crossing the item sizes.
+const WIDE_TIERS: [u64; 3] = [8 * 1024, 24 * 1024, 64 * 1024];
 
 // ---------------------------------------------------------------------------
 // the stream
