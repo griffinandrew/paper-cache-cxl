@@ -175,9 +175,9 @@ impl KeyBytes for String {
 
 /// The key's bytes if `K` is one of the types that implement [`KeyBytes`], for
 /// the code that has `K: 'static` and no more (`thin_header`'s item holds
-/// exactly these as bytes). Decided by the TYPE: once `K` is monomorphised the
+/// exactly these as bytes; the default layout's M charges their heap bytes,
+/// `TieredValue::key_heap_bytes`). Decided by the TYPE: once `K` is monomorphised the
 /// `TypeId` comparisons behind `downcast_ref` are constants.
-#[cfg(feature = "thin_header")]
 pub(crate) fn key_as_bytes<K: 'static>(key: &K) -> Option<&[u8]> {
 	let key = key as &dyn std::any::Any;
 

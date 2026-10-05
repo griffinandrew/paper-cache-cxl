@@ -20,7 +20,7 @@
 //! Like Redis's `used_memory` it counts allocations, not residency, but only
 //! the cache's own: nothing outside the three parts below.
 //!
-//! # The three parts
+//! # The four parts
 //!
 //!   * the MAP -- the object map's own structures and the `Arc` it lives in.
 //!     DashMap: every shard's hashbrown table and the shard array. The
@@ -33,7 +33,12 @@
 //!     box it lives in;
 //!   * the HEADERS -- one DRAM value header per live object: `live x` the
 //!     header allocation's usable size in the build's layout
-//!     (`value::dram_header_bytes`: 32 split, 16 `thin_header`).
+//!     (`value::dram_header_bytes`: 32 split, 16 `thin_header`);
+//!   * the KEYS -- under the default layout, the allocation behind each
+//!     `String`, `Vec<u8>` or `Box<[u8]>` key, which the header's inline `K`
+//!     points at: `nallocx(len)`, charged when the object enters the map and
+//!     refunded when it leaves (`AtomicStatus::key_heap_bytes`, kept beside the
+//!     object count). Nothing for an inline key, nor under `thin_header`.
 //!
 //! Structures on the SLOW node are not in M -- the eviction stacks under
 //! `eviction_stacks_pmem` -- and are reported apart (`DramMetadata::slow`).
@@ -289,6 +294,11 @@ mod published {
 		pub stack: u64,
 		/// One DRAM value header per live object.
 		pub headers: u64,
+		/// The heap bytes behind the live objects' keys: `nallocx(len)` per
+		/// `String`, `Vec<u8>` or `Box<[u8]>` key under the default layout (the
+		/// header counts the key's inline handle only), 0 for an inline key and
+		/// under `thin_header`, where the key is inside the item.
+		pub keys: u64,
 		/// NOT in M: the cache's structures on the slow node (the eviction
 		/// stacks under `eviction_stacks_pmem`), reported apart.
 		pub slow: u64,
@@ -297,7 +307,7 @@ mod published {
 	impl DramMetadata {
 		/// M: the three DRAM parts.
 		pub fn total(&self) -> u64 {
-			self.map + self.stack + self.headers
+			self.map + self.stack + self.headers + self.keys
 		}
 	}
 

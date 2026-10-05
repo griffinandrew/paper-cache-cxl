@@ -608,6 +608,20 @@ impl<K> TieredValue<K> {
 		self.key().get_size()
 	}
 
+	/// The DRAM bytes behind the key that the header's inline `K` does not
+	/// hold: a `String`, `Vec<u8>` or `Box<[u8]>` key keeps its bytes in an
+	/// allocation of its own, `nallocx(len)` (the unit of `crate::meta`; 0 for
+	/// an empty key, which allocates nothing). Zero for an inline key (`u64`).
+	/// M counts these (`AtomicStatus::key_heap_bytes`): the header counts the
+	/// `K` itself, the map only the handle.
+	#[inline]
+	pub fn key_heap_bytes(&self) -> u64
+	where
+		K: 'static,
+	{
+		crate::key_bytes::key_as_bytes(self.key()).map_or(0, |bytes| crate::meta::usable(bytes.len(), 1))
+	}
+
 	/// The value allocation's bytes in front of the value. None under this
 	/// layout: the bytes are their own allocation.
 	#[inline]

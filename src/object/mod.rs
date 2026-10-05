@@ -251,6 +251,16 @@ impl<K, V> Object<K, V> {
 		self.value.key_accounted_size() as ObjectSize
 	}
 
+	/// The DRAM heap bytes behind the key, which the DRAM header does not
+	/// hold: see [`TieredValue::key_heap_bytes`].
+	#[inline]
+	pub fn key_heap_bytes(&self) -> u64
+	where
+		K: 'static,
+	{
+		self.value.key_heap_bytes()
+	}
+
 	/// The key, borrowed. Under `thin_header` an item that holds its key as
 	/// bytes (a `String`, `Vec<u8>` or `Box<[u8]>` key) has no `K` to lend and
 	/// this panics; code that may meet one uses [`Object::key_owned`] or

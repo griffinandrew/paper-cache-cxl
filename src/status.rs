@@ -44,6 +44,10 @@ use crate::hybrid_stats::HybridStats;
 pub struct Cleared {
 	pub objects: u64,
 	pub base_bytes: CacheSize,
+	/// The heap bytes behind their keys (`Object::key_heap_bytes`): counted by
+	/// the caller (`PaperCache::wipe`, `PolicyWorker::handle_wipe`), as the stores are not bound to
+	/// `K: 'static`.
+	pub key_bytes: u64,
 }
 
 /// A figure the status keeps as a sum of signed changes, read as the signed
@@ -88,6 +92,10 @@ pub struct AtomicStatus {
 	max_size: AtomicCacheSize,
 	base_used_size: AtomicCacheSize,
 	num_objects: AtomicU64,
+	/// The DRAM heap bytes behind the live objects' keys, as a sum of signed
+	/// changes like `num_objects` (`Object::key_heap_bytes`): charged when an
+	/// object enters the map, refunded when one leaves it. M's fourth part.
+	key_heap_bytes: AtomicU64,
 
 	/// The capacity-eviction watermarks (`eviction_watermarks`), snapshotted
 	/// from the environment when the status is built: the pair the policy
@@ -280,6 +288,8 @@ pub struct AtomicStatus {
 	#[cfg(feature = "hybrid_cache_common")]
 	dram_metadata_headers: AtomicU64,
 	#[cfg(feature = "hybrid_cache_common")]
+	dram_metadata_keys: AtomicU64,
+	#[cfg(feature = "hybrid_cache_common")]
 	slow_metadata: AtomicU64,
 
 	/// This cache's place in `phys::live_tiered_caches`. Installed by
@@ -428,6 +438,7 @@ impl AtomicStatus {
 			max_size: AtomicCacheSize::new(max_size),
 			base_used_size: AtomicCacheSize::default(),
 			num_objects: AtomicU64::default(),
+			key_heap_bytes: AtomicU64::default(),
 
 			eviction_watermarks: crate::worker::Watermarks::from_env(),
 
@@ -510,6 +521,8 @@ impl AtomicStatus {
 			dram_metadata_stack: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			dram_metadata_headers: AtomicU64::default(),
+			#[cfg(feature = "hybrid_cache_common")]
+			dram_metadata_keys: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			slow_metadata: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
@@ -653,6 +666,22 @@ impl AtomicStatus {
 		if count > 0 {
 			self.num_objects.fetch_add(count, Ordering::AcqRel);
 		}
+	}
+
+	/// Adds `delta` to the heap bytes behind the live keys (negative: a
+	/// refund).
+	pub fn update_key_heap_bytes(&self, delta: i64) {
+		if delta > 0 {
+			self.key_heap_bytes.fetch_add(delta.unsigned_abs(), Ordering::AcqRel);
+		} else if delta < 0 {
+			self.key_heap_bytes.fetch_sub(delta.unsigned_abs(), Ordering::AcqRel);
+		}
+	}
+
+	/// The heap bytes behind the live keys, clamped at zero as
+	/// `live_num_objects` is.
+	pub fn key_heap_bytes(&self) -> u64 {
+		signed_or_zero(self.key_heap_bytes.load(Ordering::Acquire))
 	}
 
 	pub fn decr_num_objects(&self) {
@@ -830,6 +859,7 @@ impl AtomicStatus {
 			map: self.dram_metadata_map.load(Ordering::Relaxed),
 			stack: self.dram_metadata_stack.load(Ordering::Relaxed),
 			headers: self.dram_metadata_headers.load(Ordering::Relaxed),
+			keys: self.dram_metadata_keys.load(Ordering::Relaxed),
 			slow: self.slow_metadata.load(Ordering::Relaxed),
 		}
 	}
@@ -840,6 +870,7 @@ impl AtomicStatus {
 		self.dram_metadata_map.store(metadata.map, Ordering::Relaxed);
 		self.dram_metadata_stack.store(metadata.stack, Ordering::Relaxed);
 		self.dram_metadata_headers.store(metadata.headers, Ordering::Relaxed);
+		self.dram_metadata_keys.store(metadata.keys, Ordering::Relaxed);
 		self.slow_metadata.store(metadata.slow, Ordering::Relaxed);
 		self.dram_metadata.store(metadata.total(), Ordering::Relaxed);
 	}
@@ -1283,6 +1314,7 @@ impl AtomicStatus {
 	pub fn clear(&self, cleared: Cleared) {
 		self.base_used_size.fetch_sub(cleared.base_bytes, Ordering::AcqRel);
 		self.num_objects.fetch_sub(cleared.objects, Ordering::AcqRel);
+		self.key_heap_bytes.fetch_sub(cleared.key_bytes, Ordering::AcqRel);
 
 		self.total_hits.store(0, Ordering::Relaxed);
 		self.total_gets.store(0, Ordering::Relaxed);
@@ -1400,7 +1432,7 @@ mod tests {
 		assert_eq!(status.total_sets.load(Ordering::Relaxed), 1);
 		assert_eq!(status.total_dels.load(Ordering::Relaxed), 1);
 
-		status.clear(Cleared { objects: 1, base_bytes: 1 });
+		status.clear(Cleared { objects: 1, base_bytes: 1, ..Default::default() });
 
 		assert_eq!(status.base_used_size.load(Ordering::Acquire), 0);
 		assert_eq!(status.num_objects.load(Ordering::Acquire), 0);
@@ -1433,7 +1465,7 @@ mod tests {
 		assert_eq!(status.used_size(&policy), 200 + 2 * overhead);
 
 		// The map's clear removed all three.
-		status.clear(Cleared { objects: 3, base_bytes: 300 });
+		status.clear(Cleared { objects: 3, base_bytes: 300, ..Default::default() });
 
 		assert_eq!(status.live_num_objects(), 0, "below zero, read as zero");
 		assert_eq!(status.used_size(&policy), 0, "below zero, read as zero");

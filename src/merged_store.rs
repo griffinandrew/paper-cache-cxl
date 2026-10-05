@@ -5865,7 +5865,7 @@ mod tests {
 		let cleared = s.clear_counted(|object| object.data_size());
 
 		let bytes = (1..=10u64).filter(|&i| i != 3).map(|i| 256 * i).sum::<u64>() + 100;
-		assert_eq!(cleared, Cleared { objects: 10, base_bytes: bytes as CacheSize });
+		assert_eq!(cleared, Cleared { objects: 10, base_bytes: bytes as CacheSize, key_bytes: 0 });
 		assert_eq!((s.len(), s.linked(), s.fast_bytes_used()), (0, 0, 0));
 		s.verify_charges(true);
 	}

@@ -965,7 +965,13 @@ where
 			// worker within its poll, 1 s at most. Wipe here so the cache is
 			// empty all the same, and say it failed.
 			Err(_) => {
-				let cleared = self.objects.clear_counted(|object| self.overhead_manager.base_size(object));
+				// The heap bytes behind the keys are summed here: the stores are not bound to `K: 'static`.
+				let key_bytes = std::cell::Cell::new(0u64);
+				let cleared = self.objects.clear_counted(|object| {
+					key_bytes.set(key_bytes.get() + object.key_heap_bytes());
+					self.overhead_manager.base_size(object)
+				});
+				let cleared = crate::status::Cleared { key_bytes: key_bytes.get(), ..cleared };
 				self.status.clear(cleared);
 
 				Err(CacheError::Internal)
@@ -1388,14 +1394,22 @@ where
 
 		self.status.incr_sets();
 
+		let key_heap = object.key_heap_bytes();
+		let mut old_key_heap = 0;
+
 		let old_object_info = self.objects
 			.insert(hashed_key, object)
 			.map(|old_object| {
 				let base_size = self.overhead_manager.base_size(&old_object);
 				let expiry = old_object.expiry();
 
+				// The map now holds the new object's key, not this one's.
+				old_key_heap = old_object.key_heap_bytes();
+
 				(base_size, expiry)
 			});
+
+		self.status.update_key_heap_bytes(key_heap as i64 - old_key_heap as i64);
 
 		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
 			base_size as i64 - old_object_size as i64
@@ -1524,6 +1538,7 @@ where
 
 	status.update_base_used_size(-(base_size as i64));
 	status.decr_num_objects();
+	status.update_key_heap_bytes(-(object.key_heap_bytes() as i64));
 
 	match !object.is_expired() {
 		true => Ok((hashed_key, object, base_size)),
@@ -2270,14 +2285,22 @@ where
 		// this read. One load.
 		let mark = self.status.migration_in_flight().mark(hashed_key);
 
+		let key_heap = object.key_heap_bytes();
+		let mut old_key_heap = 0;
+
 		let old_object_info = self.objects
 			.insert(hashed_key, object)
 			.map(|old_object| {
 				let base_size = self.overhead_manager.base_size(&old_object);
 				let expiry = old_object.expiry();
 
+				// The map now holds the new object's key, not this one's.
+				old_key_heap = old_object.key_heap_bytes();
+
 				(base_size, expiry)
 			});
+
+		self.status.update_key_heap_bytes(key_heap as i64 - old_key_heap as i64);
 
 		let base_size_delta = if let Some((old_object_size, _)) = old_object_info {
 			base_size as i64 - old_object_size as i64

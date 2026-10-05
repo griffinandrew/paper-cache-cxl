@@ -2885,7 +2885,14 @@ where
 	/// inserts it anyway, a ghost entry evicted later as `KeyNotFound`.
 	fn handle_wipe(&mut self, ack: Option<&Sender<()>>) {
 		let overhead_manager = &self.overhead_manager;
-		let cleared = self.objects.clear_counted(|object| overhead_manager.base_size(object));
+
+		// The heap bytes behind the keys are summed here: the stores are not bound to `K: 'static`.
+		let key_bytes = std::cell::Cell::new(0u64);
+		let cleared = self.objects.clear_counted(|object| {
+			key_bytes.set(key_bytes.get() + object.key_heap_bytes());
+			overhead_manager.base_size(object)
+		});
+		let cleared = crate::status::Cleared { key_bytes: key_bytes.get(), ..cleared };
 
 		self.status.clear(cleared);
 
@@ -3325,7 +3332,9 @@ where
 	///     events, the worker's own evictions) could have made them
 	///     reallocate, every one when `all`;
 	///   * the stack: its `structure_bytes`, and the box it lives in;
-	///   * the headers: live objects times one header's usable size.
+	///   * the headers: live objects times one header's usable size;
+	///   * the keys: the heap bytes behind the live objects' keys, as the
+	///     status counts them (`AtomicStatus::key_heap_bytes`).
 	///
 	/// Called at construction and after a wipe with `all`, at the end of every
 	/// pass, and after any event that changed the stack's structures. The live
@@ -3364,6 +3373,7 @@ where
 			map: map.dram,
 			stack: structures.dram + boxed,
 			headers,
+			keys: self.status.key_heap_bytes(),
 			slow: map.slow + structures.slow,
 		});
 	}
@@ -6530,6 +6540,10 @@ mod s9_tests;
 // child process. Needs the flat caches (`key_value_pmem` or `all_dram`) as well.
 #[cfg(all(test, feature = "hybrid_cache_common", any(feature = "key_value_pmem", feature = "all_dram")))]
 mod borrowed_key_tests;
+
+// M counts the heap bytes behind a byte-string key (`meta::DramMetadata::keys`).
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod key_heap_tests;
 
 // S4's follow-ups: a flat cache over the merged store through a real worker,
 // reaper and wipe -- in every merged build, the flat-merged one included.

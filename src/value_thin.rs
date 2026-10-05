@@ -939,6 +939,17 @@ impl<K> TieredValue<K> {
 		}
 	}
 
+	/// Heap bytes behind the key that M counts separately: none under this
+	/// layout. A byte-string key is inside the item, counted with the value's
+	/// bytes (`P`), and any other key is the header's inline `K`.
+	#[inline]
+	pub fn key_heap_bytes(&self) -> u64
+	where
+		K: 'static,
+	{
+		0
+	}
+
 	/// The key's byte cost as `object::overhead::base_size` counts it.
 	///
 	/// For a key held as a `K`, what `TypeSize` says, as under every layout.

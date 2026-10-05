@@ -1222,7 +1222,7 @@ fn models_and_the_env_var() {
 	config.metadata_model = MetadataModel::Measured;
 	worker.status.gate().set_config(config);
 
-	worker.status.set_dram_metadata(crate::meta::DramMetadata { map: 1_234, stack: 100, headers: 10, slow: 0 });
+	worker.status.set_dram_metadata(crate::meta::DramMetadata { map: 1_234, stack: 100, headers: 10, keys: 0, slow: 0 });
 	worker.publish_gate();
 
 	let s = worker.status.hybrid_stats();
