@@ -1059,6 +1059,16 @@ impl<K> TieredValue<K> {
 		self.prefix().len
 	}
 
+	/// What P charges for this value's bytes in the FAST tier: the figure a
+	/// promotion's copy will charge (`migrated_to` builds it through the same
+	/// allocation), asked before it is built. Equal to `phys::value_charge_for`
+	/// of the key and length, in either layout.
+	#[cfg(feature = "hybrid_cache_common")]
+	#[inline]
+	pub(crate) fn fast_charge(&self) -> u64 {
+		crate::phys::value_charge_with(self.item_prefix_bytes(), self.len())
+	}
+
 	#[inline]
 	pub fn is_empty(&self) -> bool {
 		self.len() == 0

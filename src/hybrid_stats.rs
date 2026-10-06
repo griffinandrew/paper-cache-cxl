@@ -347,6 +347,33 @@ pub struct HybridStats {
 	pub band_n: u64,
 	pub band_b: u64,
 
+	/// The promotion gate (`GateConfig::promotion_gate`). `promo_level`: the
+	/// level `P + v` may reach for a consumer to copy a promotion (`u64::MAX`
+	/// unless the gate is `On` and enabled). `promo_gated`, `promo_gated_bytes`:
+	/// promotions a consumer declined (no copy made) and the bytes they would
+	/// have charged; `promo_retried`: declined promotions the worker queued
+	/// again (a corrective, landing as `reconcile_applied_to_fast`);
+	/// `promo_dropped`: abandoned by the worker (the key's placement is no
+	/// longer fast, or it is gone) or at the cap (`promo_dropped_overflow`, a
+	/// part of the first); `promo_retry_pending(_max)`: the worker's retry set
+	/// now and at its peak. All 0 while the gate is `Off`.
+	pub promo_level: u64,
+	pub promo_gated: u64,
+	pub promo_gated_bytes: u64,
+	pub promo_retried: u64,
+	pub promo_dropped: u64,
+	pub promo_dropped_overflow: u64,
+	pub promo_retry_pending: u64,
+	pub promo_retry_pending_max: u64,
+
+	/// What the migration consumers observed of P against the close level B
+	/// when they built a copy (`Observe` or `On`): the largest `P - B`, the
+	/// integral of `max(0, P - B)` in byte-seconds (right Riemann at the
+	/// samples, a gap capped at 50 ms), and the samples taken.
+	pub phys_over_b_max: u64,
+	pub phys_over_b_byte_seconds: u64,
+	pub phys_obs: u64,
+
 	/// S8, the migration statistics of THIS cache -- what the `MIGSTATS` lines
 	/// print, which were process-global statics until S8. Cumulative since the
 	/// cache was built; a `wipe()` does not reset them (entries may still be in

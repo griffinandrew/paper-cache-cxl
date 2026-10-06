@@ -119,7 +119,7 @@ pub use crate::meta::DramMetadata;
 pub mod gate;
 
 #[cfg(feature = "hybrid_cache_common")]
-pub use crate::gate::{GateConfig, GateMode, GateState, MetadataModel, MetadataOverflow, OnStall};
+pub use crate::gate::{GateConfig, GateMode, GateState, MetadataModel, MetadataOverflow, OnStall, PromotionGate};
 
 /// S9: a set admitted before its value is read -- `PaperCache::reserve_set`,
 /// the permit it returns, the value's allocation the permit hands out to be

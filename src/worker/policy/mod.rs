@@ -366,11 +366,29 @@ pub mod migration_queue {
 	/// apart on either the swap or what counts as a completion. The
 	/// disposition is counted in `stats`, the cache's own (`mig_applied`,
 	/// `mig_gone`, `mig_declined`, `mig_superseded`).
+	#[cfg(test)]
 	pub(crate) fn apply_migration<K: Clone, V>(
 		objects: &ObjectMapRef<K, V>,
 		key: HashedKey,
 		tier: Tier,
 		stats: &MigStats,
+	) -> bool {
+		apply_migration_with(objects, key, tier, stats, None)
+	}
+
+	/// [`apply_migration`] with the cache's gate, which the consumers and the
+	/// inline path pass: the PROMOTION GATE (`PromotionGate`). A promotion
+	/// whose copy would take `P + v` past the promotion level is declined
+	/// BEFORE the copy is built -- counted and kept for the worker's retry
+	/// (`Gate::promotion_admit`) -- and returns `false` like any no-op, so the
+	/// key's `InFlight` entry finishes as not landed. With the gate `Off` this
+	/// is one relaxed load per promotion and one per copy; with `None`, nothing.
+	pub(crate) fn apply_migration_with<K: Clone, V>(
+		objects: &ObjectMapRef<K, V>,
+		key: HashedKey,
+		tier: Tier,
+		stats: &MigStats,
+		gate: Option<&crate::gate::Gate>,
 	) -> bool {
 		// The snapshot is a STRONG REFERENCE, and it is what makes every step
 		// below sound. It replaces the epoch pin this function used to take,
@@ -405,7 +423,21 @@ pub mod migration_queue {
 			return false;
 		}
 
+		// The promotion gate: a copy that would take P past the promotion level
+		// is not built. Asked after the decline above (a value already fast
+		// charges nothing) and before the copy (nothing to free, no CXL read).
+		if let Some(gate) = gate {
+			if tier == Tier::Fast && !gate.promotion_admit(key, old_value.fast_charge()) {
+				return false;
+			}
+		}
+
 		let new_value = old_value.migrated_to(tier);
+
+		// P against B, as this copy leaves it (a promotion's charge is in P).
+		if let Some(gate) = gate {
+			gate.observe_phys();
+		}
 
 		// The expiry the copy carried, read here -- outside the guard -- so
 		// the swap below only has to compare. `new_value` is private to this
@@ -608,7 +640,7 @@ pub mod migration_queue {
 							let _pending = PendingOnDrop(status.migstats(), tier);
 							let mut finish = Finish { in_flight: &in_flight, key, landed: false };
 
-							if apply_migration(&objects, key, tier, status.migstats()) {
+							if apply_migration_with(&objects, key, tier, status.migstats(), Some(status.gate())) {
 								finish.landed = true;
 
 								// S5 B2: a landed demotion freed fast bytes (the old
@@ -1999,6 +2031,141 @@ fn corrective<E: MigrationEntry>(
 	}
 }
 
+/// The policy worker's retry of the promotions the consumers declined (the
+/// promotion gate, `PromotionGate::On`).
+///
+/// A decline copies nothing, so the value stays in the slow tier while the
+/// stack places its key fast -- a state the reconcile already has (a promotion
+/// in flight, a diverted key) and moves toward the PLACEMENT, never away from
+/// it. So the retry asks only the placement: each call, at most `BATCH` of the
+/// oldest declined keys are looked at and
+///
+///   * dropped when the drain already carries an entry for the key (a newer
+///     decision of the stack, which supersedes) or the stack no longer places
+///     it fast (demoted, evicted, deleted: the move it needed is gone);
+///   * kept when the room P leaves under the promotion level is smaller than
+///     the copy;
+///   * queued again as a corrective `(key, Fast, Reconcile)` otherwise, through
+///     `push` like any entry -- charged in the key's `InFlight` bucket, FIFO
+///     behind everything queued for the key, so it can never land on a newer
+///     value out of turn -- and the room reduced by its bytes, so one call
+///     cannot queue more than fits.
+///
+/// A key that is declined again comes back through the gate's list. A key hit
+/// while it waits is also healed by the existing heal rule.
+#[cfg(feature = "hybrid_cache_common")]
+struct PromotionRetry {
+	pending: std::collections::VecDeque<(HashedKey, u32)>,
+
+	/// A lower bound on the smallest copy in `pending` (`u32::MAX` while it is
+	/// empty): while the room under the level is below it nothing is looked
+	/// at, so a call that cannot queue anything costs one read of P. Lowered
+	/// by every key kept; exact again whenever a call looks at the whole set.
+	min_v: u32,
+
+	/// The last call queued something, or declines are arriving: the worker
+	/// polls SHORT while it is set.
+	hot: bool,
+
+	/// A call looks at the declined keys at most this often, and when it last
+	/// did. `drain_reconciled` runs after EVERY event -- a hit is an event --
+	/// and a read of P sums sixteen cache lines the consumers are writing, so
+	/// an unthrottled retry slowed the worker enough for its channel to back up
+	/// (measured: 16x the migration backlog, 2.8 GB of queued events).
+	interval: Duration,
+	last: Option<Instant>,
+}
+
+#[cfg(feature = "hybrid_cache_common")]
+impl Default for PromotionRetry {
+	fn default() -> Self {
+		PromotionRetry { pending: Default::default(), min_v: u32::MAX, hot: false, interval: Self::INTERVAL, last: None }
+	}
+}
+
+#[cfg(feature = "hybrid_cache_common")]
+impl PromotionRetry {
+	/// Declined keys looked at per call.
+	const BATCH: usize = 64;
+
+	/// The default `interval`.
+	const INTERVAL: Duration = Duration::from_micros(500);
+
+	fn run(&mut self, gate: &crate::gate::Gate, stack: &dyn PolicyStack, migrations: &mut Vec<TaggedMigration>) {
+		// Nothing waiting, or looked at a moment ago: one load and out.
+		if self.pending.is_empty() && !gate.has_declined() {
+			self.hot = false;
+			return;
+		}
+
+		let now = Instant::now();
+
+		if self.last.is_some_and(|last| now.saturating_duration_since(last) < self.interval) {
+			return;
+		}
+
+		self.last = Some(now);
+
+		let mut dropped = 0u64;
+
+		for entry in gate.take_declined() {
+			match self.pending.len() < crate::gate::PROMO_DECLINED_CAP {
+				true => {
+					self.min_v = self.min_v.min(entry.1);
+					self.pending.push_back(entry);
+				},
+
+				false => dropped += 1,
+			}
+		}
+
+		let mut retried = 0u64;
+
+		if !self.pending.is_empty() {
+			let p = crate::phys::fast_bytes_signed().max(0) as u64;
+			let mut room = gate.promo_level().saturating_sub(p);
+
+			if room >= self.min_v as u64 {
+				let looked = self.pending.len().min(Self::BATCH);
+				let whole = looked == self.pending.len();
+				let mut smallest = u32::MAX;
+
+				for _ in 0..looked {
+					let Some((key, v)) = self.pending.pop_front() else { break };
+
+					if migrations.iter().any(|entry| entry.key() == key) || stack.placement_of(key) != Some(Tier::Fast) {
+						dropped += 1;
+						continue;
+					}
+
+					if v as u64 > room {
+						smallest = smallest.min(v);
+						self.pending.push_back((key, v));
+						continue;
+					}
+
+					room -= v as u64;
+					migrations.push((key, Tier::Fast, MigrationOrigin::Reconcile));
+					retried += 1;
+				}
+
+				match whole {
+					true => self.min_v = smallest,
+					false => self.min_v = self.min_v.min(smallest),
+				}
+			}
+		}
+
+		if self.pending.is_empty() {
+			self.min_v = u32::MAX;
+		}
+
+		self.hot = retried > 0 || gate.has_declined();
+
+		gate.note_retry(retried, dropped, self.pending.len() as u64);
+	}
+}
+
 const SET_RECENCY_DURATION: Duration = Duration::from_secs(5);
 const SHORT_POLLING_DURATION: Duration = Duration::from_millis(1);
 const LONG_POLLING_DURATION: Duration = Duration::from_secs(1);
@@ -2052,6 +2219,10 @@ pub struct PolicyWorker<K, V> {
 	/// the MEMTS rate limit. See `instrument_pass`.
 	#[cfg(feature = "hybrid_cache_common")]
 	phys_pass: crate::phys::PassInstrument,
+
+	/// The declined promotions this worker retries (`PromotionRetry`).
+	#[cfg(feature = "hybrid_cache_common")]
+	promo_retry: PromotionRetry,
 
 	/// S5a: what this worker keeps to publish M, the bytes the cache's own
 	/// DRAM metadata structures hold -- the map's per-shard reading, one
@@ -2495,6 +2666,9 @@ where
 			phys_pass: crate::phys::PassInstrument::new(Instant::now()),
 
 			#[cfg(feature = "hybrid_cache_common")]
+			promo_retry: PromotionRetry::default(),
+
+			#[cfg(feature = "hybrid_cache_common")]
 			metadata: WorkerMetadata::new::<K>(),
 
 			#[cfg(feature = "hybrid_cache_common")]
@@ -2597,6 +2771,9 @@ where
 
 			#[cfg(feature = "hybrid_cache_common")]
 			phys_pass: crate::phys::PassInstrument::new(Instant::now()),
+
+			#[cfg(feature = "hybrid_cache_common")]
+			promo_retry: PromotionRetry::default(),
 
 			#[cfg(feature = "hybrid_cache_common")]
 			metadata: WorkerMetadata::new::<K>(),
@@ -3021,6 +3198,14 @@ where
 			}
 		}
 
+		// The promotion gate's retry (see `PromotionRetry`): after the
+		// correctives, so a key they already name is not queued twice.
+		let gate = self.status.gate();
+
+		if gate.promotion_gate() == crate::gate::PromotionGate::On {
+			self.promo_retry.run(gate, &**stack, &mut migrations);
+		}
+
 		(stack.inline_demotion_accounting(), migrations)
 	}
 
@@ -3153,7 +3338,7 @@ where
 
 			let (key, tier, origin) = entry.tagged();
 
-			if !migration_queue::apply_migration(objects, key, tier, stats) {
+			if !migration_queue::apply_migration_with(objects, key, tier, stats, Some(status.gate())) {
 				return false;
 			}
 
@@ -3834,7 +4019,7 @@ where
 		// S5 B2: SHORT while a set waits in either lane -- every pass resettles
 		// and notifies the head (design 3.9.10(3)).
 		#[cfg(feature = "hybrid_cache_common")]
-		let delay = match self.status.gate().waiting() {
+		let delay = match self.status.gate().waiting() || self.promo_retry.hot {
 			true => SHORT_POLLING_DURATION,
 			false => delay,
 		};
@@ -6534,6 +6719,11 @@ mod s8_tests;
 // count. Each test that reads P alone in a child process.
 #[cfg(all(test, feature = "hybrid_cache_common"))]
 mod s9_tests;
+
+// The promotion gate (`gate::PromotionGate`): the consumers' P check, the
+// worker's retry of what they declined. Each test alone in a child process.
+#[cfg(all(test, feature = "hybrid_cache_common"))]
+mod promogate_tests;
 
 // The borrowed-key API (`crate::key_bytes`): the `*_borrowed` methods, which take
 // the key of a byte-string cache as `&[u8]`. Each test that reads P alone in a

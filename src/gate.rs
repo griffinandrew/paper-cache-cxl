@@ -114,6 +114,30 @@
 //! `GateConfig::concurrency_hint` where the near band is computed, so the
 //! fast path's overshoot -- one value per setter in flight -- stays inside it.
 //!
+//! # The promotion gate (bp-promogate; `GateConfig::promotion_gate`, off by default)
+//!
+//! The byte gate holds SETs to B, but a PROMOTION -- a migration consumer
+//! copying a slow value into the fast tier -- charges P when the consumer builds
+//! the copy, while the demotions the stack decided to pay for it land when
+//! THEIR consumer reaches them, and the stacks rest at S, with B only slightly
+//! above. Under sustained promotion P overshoots B (the sets wait on the
+//! migration backlog, or the tier exceeds its budget). With
+//! `PromotionGate::On` a consumer copies a promotion only if `P + v <=
+//! min(promo_frac x eff, S)` (`Gate::promotion_admit`, from
+//! `migration_queue::apply_migration_with`, before the copy is built), else it
+//! declines it -- counted, the key kept -- and the policy worker re-queues it as
+//! a corrective once there is room, or drops it when the stack no longer
+//! places the key fast (`worker::policy::PromotionRetry`). Demotions are
+//! never held; within one drain they are dispatched first
+//! (`apply_migration_batches`). `Observe` only counts what the consumers see of
+//! P against B. `PAPER_GATE_PROMOTIONS=off|observe|on`,
+//! `PAPER_GATE_PROMO_FRAC` (0.90).
+//!
+//! What it costs: the stack counts a declined key as fast while its bytes are
+//! still slow (the placement audit's `lagging`) until the retry lands it, so
+//! with `promo_frac` below the drain target the fast tier holds about
+//! `promo_frac x eff` of promoted values where the stack believes `S`.
+//!
 //! The byte gate is DISABLED -- fast sets are admitted ungated, and
 //! `HybridStats::gate_state` says why ([`GateState`]) -- under `GateMode::Off`;
 //! while the cache is not P's only user (another tiered cache, or a flat cache
@@ -160,6 +184,8 @@
 //! | `PAPER_GATE_NEAR_FRAC` | `near_frac` | a fraction in `[0, 1)` |
 //! | `PAPER_GATE_CONCURRENCY_HINT` | `concurrency_hint` | a whole number |
 //! | `PAPER_GATE_VALUE_HINT_BYTES` | `value_hint` | whole bytes |
+//! | `PAPER_GATE_PROMOTIONS` | `promotion_gate` | `off`, `observe`, `on` |
+//! | `PAPER_GATE_PROMO_FRAC` | `promo_frac` | a fraction in `(0, 1]` |
 //!
 //! Words are case-insensitive, `-` and `_` alike; an empty variable is unset. A
 //! variable that does not parse, or whose value would make the configuration
@@ -260,6 +286,31 @@ pub enum OnStall {
 	/// Admitted to the fast tier over the budget (its bytes reserved like any
 	/// admission's). Opt-in.
 	AdmitOver,
+}
+
+/// Whether migrations that PROMOTE a value into the fast tier are held to a
+/// level below the settle target (the promotion gate; `GateConfig::promo_frac`).
+///
+/// Without it a promotion's copy is charged to P when a migration consumer
+/// builds it, while the demotions that pay for it land whenever THEIR consumer
+/// reaches them, so P overshoots the close level B under sustained promotion
+/// and the sets waiting at the byte gate wait on the migration backlog.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromotionGate {
+	/// Nothing is read or counted on the migration path: the behaviour that
+	/// predates the promotion gate, byte for byte. The default.
+	#[default]
+	Off,
+
+	/// Counters only: the migration consumers observe P against B (the peak
+	/// and the integral of the overshoot), and nothing is declined. The "off"
+	/// arm of a measurement of the gate.
+	Observe,
+
+	/// A consumer copies a promotion only if `P + v <= promo_level` (`promo_frac`
+	/// of eff, at most S); otherwise it declines it, counts it, and the policy
+	/// worker retries it once there is room (`PromotionRetry`).
+	On,
 }
 
 /// The byte gate's state: running, or why not (`HybridStats::gate_state`).
@@ -363,6 +414,16 @@ pub struct GateConfig {
 	/// count.
 	pub concurrency_hint: u32,
 	pub value_hint: CacheSize,
+
+	/// `Off` (default), `Observe` or `On`: the promotion gate (`PromotionGate`).
+	/// Applies only while the byte gate is enabled.
+	pub promotion_gate: PromotionGate,
+
+	/// The promotion level as a fraction of eff: a consumer copies a promotion
+	/// only while `P + v <= min(promo_frac x eff, S)`. 0.90 (provisional): below
+	/// the settle target S (0.95 by default), so promotions stop short of where
+	/// the tier rests and the margin up to B stays for sets. In `(0, 1]`.
+	pub promo_frac: f64,
 }
 
 impl Default for GateConfig {
@@ -379,6 +440,8 @@ impl Default for GateConfig {
 			near_frac: 0.01,
 			concurrency_hint: 0,
 			value_hint: 0,
+			promotion_gate: PromotionGate::Off,
+			promo_frac: 0.90,
 		}
 	}
 }
@@ -391,6 +454,7 @@ impl GateConfig {
 		if self.poll_interval.is_zero()
 			|| !self.near_frac.is_finite()
 			|| !(0.0..1.0).contains(&self.near_frac)
+			|| !(self.promo_frac > 0.0 && self.promo_frac <= 1.0)
 			|| !self.bands_hold()
 		{
 			return Err(CacheError::InvalidGateConfig);
@@ -529,6 +593,14 @@ const ENV: &[(&str, Apply)] = &[
 		config.value_hint = whole(value)?;
 		Ok(())
 	}),
+	("PAPER_GATE_PROMOTIONS", |config, value| {
+		config.promotion_gate = word(value, &[("off", PromotionGate::Off), ("observe", PromotionGate::Observe), ("on", PromotionGate::On)])?;
+		Ok(())
+	}),
+	("PAPER_GATE_PROMO_FRAC", |config, value| {
+		config.promo_frac = value.parse::<f64>().map_err(|_| "not a number".to_string())?;
+		Ok(())
+	}),
 ];
 
 /// `value` as one of `words`, ignoring case and treating `-` as `_`.
@@ -591,6 +663,19 @@ const STALL_PASSES: u64 = 2;
 /// caught up or not (the correctness review). A late worker is not a stall; a
 /// hung one is.
 const HUNG_WINDOWS: u32 = 5;
+
+/// The published promotion gate (`Gate::promo_mode`).
+const PROMO_OFF: u8 = 0;
+const PROMO_OBSERVE: u8 = 1;
+const PROMO_ON: u8 = 2;
+
+/// Declined promotions kept for the worker's retry: past it a decline is
+/// dropped (counted), and the heal retries the keys that are hit again.
+pub(crate) const PROMO_DECLINED_CAP: usize = 1 << 20;
+
+/// The longest gap between two observations of P that is charged to the
+/// overshoot integral: an idle spell is not an excursion.
+const OBS_MAX_GAP: Duration = Duration::from_millis(50);
 
 /// Buckets of the wait histogram: `2^i` microseconds and up, the last open.
 pub(crate) const WAIT_BUCKETS: usize = 16;
@@ -824,6 +909,40 @@ pub(crate) struct Gate {
 	near_kicks: AtomicU64,
 	max_waiters: AtomicU64,
 
+	/// The promotion gate, as the worker last published it (`PROMO_*`): `Off`
+	/// whenever the byte gate is not enabled, so a gate that is off, shared or
+	/// out of bands never declines a promotion.
+	promo_mode: AtomicU8,
+
+	/// The level `P + v` may reach for a consumer to copy a promotion:
+	/// `min(promo_frac x eff, S)`; `u64::MAX` unless the mode is `On`.
+	promo_level: AtomicU64,
+
+	/// Promotions a consumer declined, as `(key, bytes the copy would have
+	/// charged)`, for the policy worker's retry. Capped at `PROMO_DECLINED_CAP`.
+	declined: parking_lot::Mutex<Vec<(HashedKey, u32)>>,
+	declined_len: AtomicUsize,
+
+	/// The promotion gate's counters: promotions declined (and their bytes),
+	/// retried by the worker, dropped by it (overflow is a part of dropped),
+	/// the retry set's size now and at its peak.
+	promo_gated: AtomicU64,
+	promo_gated_bytes: AtomicU64,
+	promo_retried: AtomicU64,
+	promo_dropped: AtomicU64,
+	promo_dropped_overflow: AtomicU64,
+	promo_retry_pending: AtomicU64,
+	promo_retry_pending_max: AtomicU64,
+
+	/// What the migration consumers observed of P against B (`observe_phys`):
+	/// the largest `P - B`, the integral of `max(0, P - B)` in byte-microseconds
+	/// and the samples taken.
+	phys_over_b_max: AtomicU64,
+	phys_over_b_byte_us: AtomicU64,
+	phys_obs: AtomicU64,
+	obs_born: Instant,
+	obs_last_ns: AtomicU64,
+
 	/// Test builds: the policy worker panics at its next `MakeRoom`, for the
 	/// dead-worker test.
 	#[cfg(test)]
@@ -902,6 +1021,22 @@ impl Default for Gate {
 			oversize_admits: AtomicU64::new(0),
 			near_kicks: AtomicU64::new(0),
 			max_waiters: AtomicU64::new(0),
+			promo_mode: AtomicU8::new(PROMO_OFF),
+			promo_level: AtomicU64::new(u64::MAX),
+			declined: parking_lot::Mutex::new(Vec::new()),
+			declined_len: AtomicUsize::new(0),
+			promo_gated: AtomicU64::new(0),
+			promo_gated_bytes: AtomicU64::new(0),
+			promo_retried: AtomicU64::new(0),
+			promo_dropped: AtomicU64::new(0),
+			promo_dropped_overflow: AtomicU64::new(0),
+			promo_retry_pending: AtomicU64::new(0),
+			promo_retry_pending_max: AtomicU64::new(0),
+			phys_over_b_max: AtomicU64::new(0),
+			phys_over_b_byte_us: AtomicU64::new(0),
+			phys_obs: AtomicU64::new(0),
+			obs_born: Instant::now(),
+			obs_last_ns: AtomicU64::new(0),
 			#[cfg(test)]
 			test_panic_on_make_room: AtomicBool::new(false),
 			#[cfg(test)]
@@ -991,6 +1126,17 @@ pub(crate) struct GateStats {
 	pub(crate) waiters: u64,
 	pub(crate) reserved: u64,
 	pub(crate) bands: Bands,
+	pub(crate) promo_gated: u64,
+	pub(crate) promo_gated_bytes: u64,
+	pub(crate) promo_retried: u64,
+	pub(crate) promo_dropped: u64,
+	pub(crate) promo_dropped_overflow: u64,
+	pub(crate) promo_retry_pending: u64,
+	pub(crate) promo_retry_pending_max: u64,
+	pub(crate) promo_level: u64,
+	pub(crate) phys_over_b_max: u64,
+	pub(crate) phys_over_b_byte_us: u64,
+	pub(crate) phys_obs: u64,
 }
 
 impl Gate {
@@ -1082,6 +1228,24 @@ impl Gate {
 				self.band_b.store(0, Ordering::Relaxed);
 				self.shared.band_n.store(u64::MAX, Ordering::Relaxed);
 			},
+		}
+
+		// The promotion gate runs only with the byte gate (P means this cache's
+		// bytes only then), at `min(promo_frac x eff, S)`.
+		{
+			let config = self.config();
+
+			let (mode, level) = match (published.bands, config.promotion_gate) {
+				(Some(bands), PromotionGate::On) => (
+					PROMO_ON,
+					((config.promo_frac * published.eff as f64) as CacheSize).min(bands.s),
+				),
+				(Some(_), PromotionGate::Observe) => (PROMO_OBSERVE, u64::MAX),
+				_ => (PROMO_OFF, u64::MAX),
+			};
+
+			self.promo_level.store(level, Ordering::Relaxed);
+			self.promo_mode.store(mode, Ordering::Relaxed);
 		}
 
 		let word_eff = published.eff.min(published.eff_small).min(published.eff_large);
@@ -1244,6 +1408,15 @@ impl Gate {
 			&self.oversize_admits,
 			&self.near_kicks,
 			&self.max_waiters,
+			&self.promo_gated,
+			&self.promo_gated_bytes,
+			&self.promo_retried,
+			&self.promo_dropped,
+			&self.promo_dropped_overflow,
+			&self.promo_retry_pending_max,
+			&self.phys_over_b_max,
+			&self.phys_over_b_byte_us,
+			&self.phys_obs,
 		] {
 			counter.store(0, Ordering::Relaxed);
 		}
@@ -1291,6 +1464,17 @@ impl Gate {
 			waiters: self.bytes_lane.len() as u64,
 			reserved: self.reserved.load(Ordering::Relaxed),
 			bands: self.bands(),
+			promo_gated: self.promo_gated.load(Ordering::Relaxed),
+			promo_gated_bytes: self.promo_gated_bytes.load(Ordering::Relaxed),
+			promo_retried: self.promo_retried.load(Ordering::Relaxed),
+			promo_dropped: self.promo_dropped.load(Ordering::Relaxed),
+			promo_dropped_overflow: self.promo_dropped_overflow.load(Ordering::Relaxed),
+			promo_retry_pending: self.promo_retry_pending.load(Ordering::Relaxed),
+			promo_retry_pending_max: self.promo_retry_pending_max.load(Ordering::Relaxed),
+			promo_level: self.promo_level.load(Ordering::Relaxed),
+			phys_over_b_max: self.phys_over_b_max.load(Ordering::Relaxed),
+			phys_over_b_byte_us: self.phys_over_b_byte_us.load(Ordering::Relaxed),
+			phys_obs: self.phys_obs.load(Ordering::Relaxed),
 		}
 	}
 }
@@ -2231,6 +2415,110 @@ impl Gate {
 		}
 	}
 
+	/// The promotion gate as published: `Off` unless the byte gate is enabled.
+	pub(crate) fn promotion_gate(&self) -> PromotionGate {
+		match self.promo_mode.load(Ordering::Relaxed) {
+			PROMO_ON => PromotionGate::On,
+			PROMO_OBSERVE => PromotionGate::Observe,
+			_ => PromotionGate::Off,
+		}
+	}
+
+	/// The level a promotion's copy may take P to (`u64::MAX`: no gate).
+	pub(crate) fn promo_level(&self) -> u64 {
+		self.promo_level.load(Ordering::Relaxed)
+	}
+
+	/// A migration consumer (or the worker, inline) about to copy a promotion
+	/// of `v` bytes: whether `P + v` is within the promotion level. A refusal is
+	/// counted and the key kept for the worker's retry. One relaxed load when
+	/// the gate is not `On`.
+	pub(crate) fn promotion_admit(&self, key: HashedKey, v: u64) -> bool {
+		if self.promo_mode.load(Ordering::Relaxed) != PROMO_ON {
+			return true;
+		}
+
+		let p = phys::fast_bytes_signed().max(0) as u64;
+
+		if p.saturating_add(v) <= self.promo_level.load(Ordering::Relaxed) {
+			return true;
+		}
+
+		self.promo_gated.fetch_add(1, Ordering::Relaxed);
+		self.promo_gated_bytes.fetch_add(v, Ordering::Relaxed);
+
+		let mut declined = self.declined.lock();
+
+		match declined.len() < PROMO_DECLINED_CAP {
+			true => {
+				declined.push((key, v.min(u32::MAX as u64) as u32));
+				self.declined_len.store(declined.len(), Ordering::Release);
+			},
+
+			false => {
+				self.promo_dropped.fetch_add(1, Ordering::Relaxed);
+				self.promo_dropped_overflow.fetch_add(1, Ordering::Relaxed);
+			},
+		}
+
+		false
+	}
+
+	/// The promotions consumers declined since the last call, as `(key, v)`.
+	pub(crate) fn take_declined(&self) -> Vec<(HashedKey, u32)> {
+		if self.declined_len.load(Ordering::Acquire) == 0 {
+			return Vec::new();
+		}
+
+		let mut declined = self.declined.lock();
+		self.declined_len.store(0, Ordering::Release);
+
+		std::mem::take(&mut *declined)
+	}
+
+	/// Whether a declined promotion waits for the worker.
+	pub(crate) fn has_declined(&self) -> bool {
+		self.declined_len.load(Ordering::Acquire) > 0
+	}
+
+	/// The worker's retry of declined promotions: `retried` queued again,
+	/// `dropped` abandoned, `pending` kept.
+	pub(crate) fn note_retry(&self, retried: u64, dropped: u64, pending: u64) {
+		self.promo_retried.fetch_add(retried, Ordering::Relaxed);
+		self.promo_dropped.fetch_add(dropped, Ordering::Relaxed);
+		self.promo_retry_pending.store(pending, Ordering::Relaxed);
+		self.promo_retry_pending_max.fetch_max(pending, Ordering::Relaxed);
+	}
+
+	/// A migration consumer built a copy: P against B, observed. The peak of
+	/// `P - B` and the integral of its positive part, charged at the level
+	/// seen now for the gap since the last observation (right Riemann, a gap
+	/// capped at `OBS_MAX_GAP`). Nothing unless the promotion gate is
+	/// `Observe` or `On`.
+	pub(crate) fn observe_phys(&self) {
+		if self.promo_mode.load(Ordering::Relaxed) == PROMO_OFF {
+			return;
+		}
+
+		let b = self.band_b.load(Ordering::Relaxed);
+
+		if b == 0 {
+			return;
+		}
+
+		let over = (phys::fast_bytes_signed().max(0) as u64).saturating_sub(b);
+		let now = self.obs_born.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+		let last = self.obs_last_ns.swap(now, Ordering::Relaxed);
+		let gap = now.saturating_sub(last).min(OBS_MAX_GAP.as_nanos() as u64);
+
+		self.phys_obs.fetch_add(1, Ordering::Relaxed);
+		self.phys_over_b_max.fetch_max(over, Ordering::Relaxed);
+
+		if over > 0 {
+			self.phys_over_b_byte_us.fetch_add(over.saturating_mul(gap / 1_000), Ordering::Relaxed);
+		}
+	}
+
 	/// A migration consumer landed a demotion (design 3.9.6): while a set
 	/// waits for fast bytes, progress, and the head woken. One relaxed load
 	/// otherwise.
@@ -2676,6 +2964,8 @@ mod tests {
 			("PAPER_GATE_NEAR_FRAC", near.as_str()),
 			("PAPER_GATE_CONCURRENCY_HINT", "4"),
 			("PAPER_GATE_VALUE_HINT_BYTES", "2000"),
+			("PAPER_GATE_PROMOTIONS", "On"),
+			("PAPER_GATE_PROMO_FRAC", "0.8"),
 		];
 
 		let (config, notes) = GateConfig::from_lookup(vars(&all));
@@ -2695,6 +2985,8 @@ mod tests {
 				near_frac,
 				concurrency_hint: 4,
 				value_hint: 2_000,
+				promotion_gate: PromotionGate::On,
+				promo_frac: 0.8,
 			},
 		);
 		assert_eq!(all.len(), ENV.len(), "one variable per field, and no other");
@@ -2745,6 +3037,10 @@ mod tests {
 			("PAPER_GATE_NEAR_FRAC", "one percent"),
 			("PAPER_GATE_CONCURRENCY_HINT", "4294967296"),
 			("PAPER_GATE_VALUE_HINT_BYTES", "big"),
+			("PAPER_GATE_PROMOTIONS", "yes"),
+			("PAPER_GATE_PROMO_FRAC", "0"),
+			("PAPER_GATE_PROMO_FRAC", "1.5"),
+			("PAPER_GATE_PROMO_FRAC", "NaN"),
 		];
 
 		for (name, value) in bad {
