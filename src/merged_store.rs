@@ -411,10 +411,10 @@ pub enum MergedOrder {
 	/// Many keys share a count, so the secondary key is `last_access`, read
 	/// under this order as "the stamp at which this key entered its CURRENT
 	/// bucket" -- it is restamped on every bump and on every tier move, which
-	/// is exactly when the bucket changes. Earliest entrant leaves first, and
-	/// both references agree on that from opposite ends: `ArenaFrequencyChain`
-	/// appends at the bucket tail and takes `min_key` from its head, while the
-	/// flat `LfuCompactStack` pushes at the head and evicts the tail.
+	/// is exactly when the bucket changes. Earliest entrant leaves first, as in
+	/// both references, which are one structure: `ArenaFrequencyChain` appends
+	/// at the bucket tail and takes `min_key` from its head, and the flat
+	/// `LfuCompactStack` is that chain with every key in one tier.
 	///
 	/// # Eviction prefers SLOW, and that is not free here
 	///
@@ -1675,9 +1675,9 @@ impl<K, V> Inner<K, V> {
 	/// The tail rather than the head, because that is where
 	/// `ArenaFrequencyChain::link` puts it while `min_key` reads the head -- so
 	/// the key that entered a bucket EARLIEST leaves first. The flat
-	/// `LfuCompactStack` states the same order from the other end (`link_front`
-	/// at the head, `evict_one` from the tail), and matching both is what makes
-	/// the differential tests passable at all.
+	/// `LfuCompactStack` is the same chain in one tier, so it gives the same
+	/// order, and matching it is what makes the differential tests passable at
+	/// all.
 	fn freq_link(&mut self, i: u32, freq: u16, tier: Tier) {
 		// The tripwire for the one mistake this order can make silently.
 		// `head`/`tail` and `link_front`/`unlink` are the RECENCY list, shared

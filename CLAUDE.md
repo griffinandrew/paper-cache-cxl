@@ -227,9 +227,12 @@ src/
                                  and since B2 the worker polls SHORT, never parking long,
                                  while a set waits in either of the gate's lanes.
       policy_stack/             One file per policy, all implementing the PolicyStack trait (the
-                                 flat ones are the eight `*_compact_stack.rs` files over
-                                 `compact_queue_set.rs`, plus `arc_stack.rs`; `golden.rs`, test-only,
-                                 holds the eviction orders their tests assert).
+                                 flat ones are the eight `*_compact_stack.rs` files, plus
+                                 `arc_stack.rs`; `golden.rs`, test-only, holds the eviction orders
+                                 their tests assert. Six are over `compact_queue_set.rs`; LFU is
+                                 the tiered LFU's `arena_frequency_chain.rs` in one tier and LRU
+                                 one queue of `arena_queue_set.rs` with no payload -- see "Flat
+                                 LFU and LRU on the arena" below).
                                  `tiered_stack.rs` (and `tiered_stack/carve.rs`) is the ONE tiering layer, `TieredStack<P>`:
                                  the queue set (its lanes), the boundary cursor, the books and
                                  gauges, the settle, the migration log and push rules, the
@@ -3831,3 +3834,31 @@ allocation counts (a counter in the pools, `numa_alloc::thread_allocs`, test bui
 no key, a borrowed set builds none under `thin_header` and one under the default layout, a refused or abandoned
 borrowed reservation allocates nothing; `InvalidKey`; an abandoned borrowed set is refunded once; the deadline.
 
+## Flat LFU and LRU on the arena
+
+`LfuCompactStack` and `LruCompactStack` keep their names, their policies and their goldens, and now run on
+the tiered stacks' arena structures. Before, flat LFU owned a slab of 16-byte slots, a
+`HashMap<HashedKey, (slot, freq)>` and a bucket `BTreeMap`, and flat LRU sat on `CompactQueueSet<()>`; both
+stored every key twice and measured 55.99 B/object (charged 56), against the tiered stacks' 40, so at equal
+`max_size` a flat cache held fewer objects than a tiered one for a reason that had nothing to do with
+tiering.
+
+* Flat LFU is `ArenaFrequencyChain` with every key in `Tier::Fast`: the tiered LFU's own chain, 32-byte
+  node and keyless index, charged `ARENA_STACK_DRAM_OVERHEAD` (40) as every tiered design is. Measured
+  40.0059 B/object (`lfu-compact-hybrid`: 40.0059). Only `freq` of the node's payload is read; the chain
+  is not generic over its payload.
+* Flat LRU is one queue of `ArenaQueueSet<()>`: a 16-byte node plus the keyless index, charged the new
+  `FLAT_LRU_STACK_DRAM_OVERHEAD` (24). Measured 23.9920 B/object: the tiered LRU's 40 (`lru-compact-hybrid`:
+  40.0059) less the 16-byte `NodePayload` a flat stack never reads.
+
+Measured with `measure_one_point`, release, one process per point, as the slope between 2^20 and 2^22
+objects. FIFO, CLOCK, SIEVE, MRU, 2Q, ARC and S3-FIFO keep their slab stacks and their 56/72. What moves is
+`get_policy_overhead` for `lfu-compact` (16 B/object less) and `lru-compact` (32 less): at a given `max_size`
+those two caches now hold more objects than they did, so flat results from before this change are not
+comparable with later ones at equal `max_size`.
+
+The tie order was proved on this tree's chain before the slab code went: both new stacks ran victim by
+victim against the old ones over 20 random histories of inserts, hits, removals and evictions, and agreed
+at every step and in the final drain. That test went with the old code. Each stack's `differential_tests`
+now holds it to a naive model written in the test -- LFU a scan for the minimum `(count, last touch)`, LRU
+a `VecDeque` -- over the same histories, every victim, length and membership; the goldens stay.

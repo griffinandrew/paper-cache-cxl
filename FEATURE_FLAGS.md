@@ -360,6 +360,7 @@ The code uses `#[cfg(...)]` attributes extensively to:
 - **Global hashtable**: `src/lib.rs`
 - **Worker manager integration**: `src/worker/manager.rs`
 - **Flat policy stacks**: `src/worker/policy/policy_stack/*_compact_stack.rs`, over `compact_queue_set.rs`
+  (LFU over `arena_frequency_chain.rs` and LRU over `arena_queue_set.rs`, the tiered stacks' arena)
 - **Every hybrid design, shared machinery**: the one `PaperCache<K, TieredBuffer, S>` impl block
   in `src/lib.rs`; `src/hybrid_policy.rs` (`admission_tier`, the runtime placement rule);
   `src/hybrid_stats.rs` (`HybridStats`, the single stats snapshot every design reports through);

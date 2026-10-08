@@ -19,6 +19,8 @@ use crate::error::CacheError;
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum PaperPolicy {
+	/// Flat LFU over the tiered LFU's arena chain, every key in one tier, so
+	/// it is charged the tiered stacks' per-object stack. `lfu-compact`.
 	LfuCompact,
 
 	/// The flat (single-tier) designs, over the slab layout. They honour
@@ -33,6 +35,9 @@ pub enum PaperPolicy {
 	/// Faithful three-queue 2Q over the compact slab layout, taking the
 	/// two ratios `k_in` and `k_out`. `2q-compact-<k_in>-<k_out>`.
 	TwoQCompact(f64, f64),
+
+	/// Flat LRU over one queue of the arena, with no per-key payload.
+	/// `lru-compact`.
 	LruCompact,
 	Arc,
 

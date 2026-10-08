@@ -1,45 +1,64 @@
-//! `LfuCompactStack` — `LfuStack`'s policy over the slab design.
+//! `LfuCompactStack` — the flat (untiered) LFU stack: `LfuCompactHybridStack`'s
+//! [`ArenaFrequencyChain`] with every key in one tier.
 //!
-//! The `HashList`-based `LfuStack` this re-lays-out was removed in R2 with the other
-//! original flat stacks, so the mentions of it below are historical. Its eviction
-//! orders for the op sequences in `fidelity_tests` are recorded in `golden.rs` and
-//! asserted there.
-//!
-//! The non-tiered counterpart to `LfuCompactHybridStack`, and the fourth cell
-//! of the layout/tiering matrix:
+//! The `HashList`-based `LfuStack` whose policy this keeps was removed in R2
+//! with the other original flat stacks, so the mentions of it below are
+//! historical. Its eviction orders for the op sequences in `fidelity_tests` are
+//! recorded in `golden.rs` and asserted there.
 //!
 //! ```text
-//!                    multi-map layout       slab layout
-//!   no tiering       LfuStack               LfuCompactStack   <- this
-//!   tiered           (removed)              LfuCompactHybridStack
+//!                    eviction stack
+//!   no tiering       LfuCompactStack         ArenaFrequencyChain, one tier   <- this
+//!   tiered           LfuCompactHybridStack   ArenaFrequencyChain, two tiers
 //! ```
 //!
-//! The multi-map-tiered cell is empty because `LfuHybridStack` has been
-//! removed from the crate: it was behaviourally identical to
-//! `LfuCompactHybridStack` and cost 112 B/object of eviction stack against
-//! its 72 then (40 since the arena conversion). The layout comparison it anchored lives in git history.
+//! # The policy
 //!
-//! Without it, comparing all-DRAM LFU against a tiered compact LFU moves two
-//! variables at once — which is how cluster13 produced an all-DRAM LFU that
-//! was SLOWER on GET (1045 ns) than either tiered variant (845 / 793 ns)
-//! with no way to attribute it.
+//! `LfuStack`'s, unchanged. A new key enters at count 1; a hit, or an overwrite
+//! (`insert` of a tracked key forwards to `update`), raises its count by one;
+//! the victim is the least-frequent key, ties broken toward the key that
+//! reached its count EARLIEST. Every touch moves a key up one count, so that is
+//! also the least recently touched. The chain gives this order by construction:
+//! `link` appends a key at the TAIL of its bucket and `min_key` reads the HEAD.
+//! The old slab stated the same order from the other end (link at the head,
+//! evict the tail).
 //!
-//! Deliberately NOT `CompactFrequencyChain`: that carries two bucket maps
-//! (fast and slow) and a 12-byte `CompactEntry` with `tier` and
-//! `dram_resident`, none of which a non-tiered design has any use for. This
-//! keeps one bucket map and a bare `u32` frequency, so the index value is
-//! `(u32 slot, u32 freq)` — 8 bytes against `LfuStack`'s separate
-//! `index_map` + `VecList<CountStack>` + a `HashList` per bucket, each with
-//! its own key-to-node index.
+//! Size is recorded in the node and never read: `LfuStack` ignored it, and
+//! byte accounting belongs to the cache.
 //!
-//! `LfuStack` ignores the size argument, so this does too: byte accounting
-//! belongs to the cache.
-
-#[cfg(not(feature = "eviction_stacks_pmem"))]
-use std::collections::HashMap;
-#[cfg(feature = "eviction_stacks_pmem")]
-use hashbrown::HashMap;
-use std::collections::BTreeMap;
+//! # The layout, and why it is the tiered one
+//!
+//! This stack used to own its structures: a slab of 16-byte link-only slots, a
+//! `HashMap<HashedKey, (u32 slot, u32 freq)>` index that stored every key a
+//! second time, and a `BTreeMap` of per-frequency bucket lists. That measured
+//! 55.99 B/object and was charged 56, against the 40 every tiered design is
+//! charged for its arena (`ARENA_STACK_DRAM_OVERHEAD`). At equal `max_size` a
+//! flat LFU cache therefore held fewer objects than a tiered one, for a reason
+//! that has nothing to do with tiering.
+//!
+//! Over the tiered LFU's own chain the two pay the same per-object stack: a
+//! 32-byte node (key, prev, next and the shared 16-byte `NodePayload`) plus the
+//! keyless index, bare `u32` slot numbers verified against the node's own key,
+//! 8 B/object at the half load it grows to. Only `freq` of the payload is read
+//! here; the tier, size and residency fields are carried because
+//! `ArenaFrequencyChain` is not generic over its payload. (Flat LRU, over the
+//! generic `ArenaQueueSet`, drops the payload and costs 24.) The slow bucket map
+//! and the recency list stay empty.
+//!
+//! MEASURED with `measure_one_point` (jemalloc `stats.allocated`, release, one
+//! process per point), B/object = (bytes at 2^22 - bytes at 2^20) / (2^22 - 2^20):
+//!
+//! ```text
+//!   lfu-compact, slab + keyed HashMap (before)     55.9931
+//!   lfu-compact, this                              40.0059
+//!   lfu-compact-hybrid                             40.0059
+//! ```
+//!
+//! Under `eviction_stacks_pmem` the chain allocates its slab, index, free list
+//! and bucket maps through `Hybrid`, as the old stack's collections did.
+//!
+//! `differential_tests` holds it to a naive statement of the policy, victim by
+//! victim, over random histories.
 
 use crate::{
 	HashedKey,
@@ -47,130 +66,18 @@ use crate::{
 	PaperPolicy,
 };
 
-use super::PolicyStack;
+use super::{
+	PolicyStack,
+	Tier,
+	arena_frequency_chain::ArenaFrequencyChain,
+};
 
-const NIL: u32 = u32::MAX;
+/// Every key lives in this tier; the chain's other one is never touched.
+const TIER: Tier = Tier::Fast;
 
-/// Link-only slab slot. 16 bytes, asserted below.
-#[derive(Clone, Copy)]
-struct Slot {
-	key: HashedKey,
-	prev: u32,
-	next: u32,
-}
-
-const _: () = assert!(
-	std::mem::size_of::<Slot>() == 16,
-	"Slot must stay 16 bytes: it is the per-object cost this design exists to minimise",
-);
-
-// Under `eviction_stacks_pmem` every structure here is allocated through the
-// crate-wide `Hybrid` allocator (the far CXL/PMEM node), matching
-// `CompactQueueSet` and `CompactFrequencyChain`.
-//
-// Without this the feature was a SILENT NO-OP for this stack. `LruCompactStack`
-// is a thin wrapper over `CompactQueueSet` and inherited the relocation for
-// free; this one owns its collections directly and kept them in DRAM, so a
-// `lfu-compact` run built with the feature measured an unchanged stack while
-// `get_policy_overhead` was (separately) still charging its bytes to the DRAM
-// budget.
-#[cfg(not(feature = "eviction_stacks_pmem"))]
-type SlotVec = Vec<Slot>;
-#[cfg(feature = "eviction_stacks_pmem")]
-type SlotVec = Vec<Slot, crate::Hybrid>;
-
-#[cfg(not(feature = "eviction_stacks_pmem"))]
-type FreeVec = Vec<u32>;
-#[cfg(feature = "eviction_stacks_pmem")]
-type FreeVec = Vec<u32, crate::Hybrid>;
-
-#[cfg(not(feature = "eviction_stacks_pmem"))]
-type Index = HashMap<HashedKey, (u32, u32), crate::NoHasher>;
-#[cfg(feature = "eviction_stacks_pmem")]
-type Index = HashMap<HashedKey, (u32, u32), crate::NoHasher, crate::Hybrid>;
-
-#[cfg(not(feature = "eviction_stacks_pmem"))]
-type BucketMap = BTreeMap<u32, (u32, u32)>;
-#[cfg(feature = "eviction_stacks_pmem")]
-type BucketMap = BTreeMap<u32, (u32, u32), crate::Hybrid>;
-
-/// The four empty collections, built in whichever allocator the feature selects.
-#[cfg(not(feature = "eviction_stacks_pmem"))]
-fn empty_collections() -> (SlotVec, FreeVec, Index, BucketMap) {
-	(
-		Vec::new(),
-		Vec::new(),
-		HashMap::with_hasher(crate::NoHasher::default()),
-		BTreeMap::new(),
-	)
-}
-
-#[cfg(feature = "eviction_stacks_pmem")]
-fn empty_collections() -> (SlotVec, FreeVec, Index, BucketMap) {
-	(
-		Vec::new_in(crate::Hybrid),
-		Vec::new_in(crate::Hybrid),
-		HashMap::with_hasher_in(crate::NoHasher::default(), crate::Hybrid),
-		BTreeMap::new_in(crate::Hybrid),
-	)
-}
-
+#[derive(Default)]
 pub struct LfuCompactStack {
-	slots: SlotVec,
-	free: FreeVec,
-	/// key -> (slot, frequency). One probe returns both, which is the whole
-	/// point: `LfuStack` needs index_map -> count_stacks -> node.
-	index: Index,
-	/// frequency -> (head, tail) of that bucket's intrusive list. Ordered, so
-	/// the minimum frequency is the first entry — that is the eviction victim.
-	buckets: BucketMap,
-}
-
-impl Default for LfuCompactStack {
-	fn default() -> Self {
-		let (slots, free, index, buckets) = empty_collections();
-		LfuCompactStack { slots, free, index, buckets }
-	}
-}
-
-impl LfuCompactStack {
-	fn alloc(&mut self, key: HashedKey) -> u32 {
-		let slot = Slot { key, prev: NIL, next: NIL };
-		match self.free.pop() {
-			Some(i) => { self.slots[i as usize] = slot; i },
-			None => { self.slots.push(slot); (self.slots.len() - 1) as u32 },
-		}
-	}
-
-	/// Unlinks `i` from bucket `freq`, dropping the bucket if it empties.
-	fn unlink(&mut self, freq: u32, i: u32) {
-		let (prev, next) = {
-			let s = &self.slots[i as usize];
-			(s.prev, s.next)
-		};
-		if prev != NIL { self.slots[prev as usize].next = next; }
-		if next != NIL { self.slots[next as usize].prev = prev; }
-
-		if let Some((head, tail)) = self.buckets.get_mut(&freq) {
-			if *head == i { *head = next; }
-			if *tail == i { *tail = prev; }
-			if *head == NIL { self.buckets.remove(&freq); }
-		}
-	}
-
-	/// Links `i` at the FRONT of bucket `freq`, so the bucket is
-	/// recency-ordered within a frequency and its tail is the LRU victim —
-	/// matching `CountStack::push`/`pop` in `LfuStack`.
-	fn link_front(&mut self, freq: u32, i: u32) {
-		let entry = self.buckets.entry(freq).or_insert((NIL, NIL));
-		let old_head = entry.0;
-		entry.0 = i;
-		if entry.1 == NIL { entry.1 = i; }
-
-		self.slots[i as usize].prev = NIL;
-		self.slots[i as usize].next = old_head;
-		if old_head != NIL { self.slots[old_head as usize].prev = i; }
-	}
+	chain: ArenaFrequencyChain,
 }
 
 impl PolicyStack for LfuCompactStack {
@@ -179,69 +86,45 @@ impl PolicyStack for LfuCompactStack {
 	}
 
 	fn len(&self) -> usize {
-		self.index.len()
+		self.chain.len()
 	}
 
 	fn contains(&self, key: HashedKey) -> bool {
-		self.index.contains_key(&key)
+		self.chain.contains(key)
 	}
 
-	fn insert(&mut self, key: HashedKey, _: ObjectSize) {
-		if self.index.contains_key(&key) {
+	fn insert(&mut self, key: HashedKey, size: ObjectSize) {
+		if self.chain.contains(key) {
 			return self.update(key);
 		}
-		let i = self.alloc(key);
-		self.link_front(1, i);
-		self.index.insert(key, (i, 1));
+
+		self.chain.insert(key, size, 0, TIER);
 	}
 
 	fn update(&mut self, key: HashedKey) {
-		let Some(&(i, freq)) = self.index.get(&key) else { return };
-		self.unlink(freq, i);
-
-		// get_mut, NOT insert. This runs on every GET hit, and an insert of
-		// an already-present key re-hashes, probes, writes, then returns and
-		// drops the old value, plus checks growth -- where a get_mut only
-		// hashes and probes. The tiered CompactFrequencyChain::bump mutates
-		// in place for exactly this reason; using insert here handicapped the
-		// flat stack against the tiered one on the very path being compared,
-		// which is how a flat all-DRAM LFU first measured SLOWER than a
-		// tiered one doing migrations.
-		if let Some(e) = self.index.get_mut(&key) {
-			e.1 = freq + 1;
-		}
-
-		self.link_front(freq + 1, i);
+		self.chain.bump(key);
 	}
 
 	fn remove(&mut self, key: HashedKey) {
-		let Some((i, freq)) = self.index.remove(&key) else { return };
-		self.unlink(freq, i);
-		self.free.push(i);
+		self.chain.remove(key);
 	}
 
 	fn clear(&mut self) {
-		self.slots.clear();
-		self.free.clear();
-		self.index.clear();
-		self.buckets.clear();
+		self.chain.clear();
 	}
 
-	/// Evicts the least-frequent key, breaking ties by least-recently-used —
-	/// the bucket tail, matching `LfuStack::evict_one`'s `CountStack::pop`.
+	/// Evicts the least-frequent key, breaking ties toward the one that reached
+	/// its count earliest -- the head of the lowest bucket.
 	fn evict_one(&mut self) -> Option<HashedKey> {
-		let (&freq, &(_, tail)) = self.buckets.iter().next()?;
-		if tail == NIL { return None }
-		let key = self.slots[tail as usize].key;
-		self.unlink(freq, tail);
-		self.index.remove(&key);
-		self.free.push(tail);
+		let key = self.chain.min_key(TIER)?;
+		self.chain.remove(key);
+
 		Some(key)
 	}
 }
 
-/// Fidelity to `LfuStack`, whose policy this re-lays-out and which was removed in
-/// R2: the eviction order it gave for the two op sequences below is recorded in
+/// Fidelity to `LfuStack`, whose policy this keeps and which was removed in R2:
+/// the eviction order it gave for the two op sequences below is recorded in
 /// `golden` and asserted here. Same access sequence, same eviction order: this
 /// changes how the queue is STORED, not what the policy means.
 #[cfg(test)]
@@ -266,5 +149,125 @@ mod fidelity_tests {
 			golden::removal(&mut LfuCompactStack::default(), 2_000, 512, true, 5),
 			golden::LFU_REMOVAL,
 		);
+	}
+}
+
+/// The stack against the policy written out as plainly as it can be, over
+/// random histories of inserts, hits, removals and evictions.
+///
+/// The goldens above pin two fixed sequences. This pins the RULE, and it is
+/// the check that matters for the tie order: the stack shares its chain with
+/// `LfuCompactHybridStack`, so agreeing with that stack would prove nothing
+/// about either. The reference shares nothing with it -- no buckets, no links,
+/// no index -- so a chain that broke ties toward the wrong end of a bucket, or
+/// lost a key's count across a removal and a re-insert, fails here. (Checked
+/// when this was written: with the reference's tie-break turned newest-first,
+/// every one of the twenty seeds diverged.)
+#[cfg(test)]
+mod differential_tests {
+	use super::*;
+
+	/// Every tracked key with its count and the tick it was last touched; the
+	/// victim is the minimum `(count, last touch)`, found by a scan.
+	#[derive(Default)]
+	struct Reference {
+		keys: Vec<(HashedKey, u32, u64)>,
+		clock: u64,
+	}
+
+	impl Reference {
+		fn position(&self, key: HashedKey) -> Option<usize> {
+			self.keys.iter().position(|&(k, _, _)| k == key)
+		}
+
+		fn contains(&self, key: HashedKey) -> bool {
+			self.position(key).is_some()
+		}
+
+		/// A new key enters at count 1. A tracked one is touched, as a hit.
+		fn insert(&mut self, key: HashedKey) {
+			match self.position(key) {
+				Some(_) => self.update(key),
+
+				None => {
+					self.clock += 1;
+					self.keys.push((key, 1, self.clock));
+				},
+			}
+		}
+
+		fn update(&mut self, key: HashedKey) {
+			let Some(i) = self.position(key) else { return };
+
+			self.clock += 1;
+			self.keys[i].1 += 1;
+			self.keys[i].2 = self.clock;
+		}
+
+		fn remove(&mut self, key: HashedKey) {
+			if let Some(i) = self.position(key) {
+				self.keys.swap_remove(i);
+			}
+		}
+
+		fn evict_one(&mut self) -> Option<HashedKey> {
+			let i = (0..self.keys.len()).min_by_key(|&i| (self.keys[i].1, self.keys[i].2))?;
+
+			Some(self.keys.swap_remove(i).0)
+		}
+	}
+
+	/// Twenty seeds, each over its own key universe (64 to 463 keys) so the
+	/// counts spread differently: 40% inserts, 30% hits, 10% removals and 20%
+	/// evictions, interleaved. Every victim, every length and the membership of
+	/// every key touched must match, and so must the final drain.
+	#[test]
+	fn every_victim_matches_the_reference() {
+		for seed in 1..=20u64 {
+			let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+			let mut next = || {
+				rng ^= rng << 13;
+				rng ^= rng >> 7;
+				rng ^= rng << 17;
+				rng
+			};
+
+			let mut stack = LfuCompactStack::default();
+			let mut reference = Reference::default();
+			let keys = 64 + (seed * 37) % 400;
+
+			for step in 0..20_000 {
+				let key = (next() % keys).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+
+				match next() % 10 {
+					0..=3 => {
+						stack.insert(key, 100);
+						reference.insert(key);
+					},
+
+					4..=6 => {
+						stack.update(key);
+						reference.update(key);
+					},
+
+					7 => {
+						stack.remove(key);
+						reference.remove(key);
+					},
+
+					_ => assert_eq!(stack.evict_one(), reference.evict_one(), "seed {seed} step {step}"),
+				}
+
+				assert_eq!(stack.len(), reference.keys.len(), "seed {seed} step {step}");
+				assert_eq!(stack.contains(key), reference.contains(key), "seed {seed} step {step}");
+			}
+
+			while let Some(victim) = reference.evict_one() {
+				assert_eq!(stack.evict_one(), Some(victim), "seed {seed} drain");
+			}
+
+			assert_eq!(stack.evict_one(), None, "seed {seed}: the stack outlived the reference");
+			assert_eq!(stack.len(), 0);
+		}
 	}
 }

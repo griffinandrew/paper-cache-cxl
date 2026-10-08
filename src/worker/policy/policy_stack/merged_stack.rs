@@ -1610,6 +1610,9 @@ mod clock_order_fidelity {
 ///
 /// * `LfuCompactStack` -- the FLAT stack serving `PaperPolicy::LfuCompact`,
 ///   with no tiers and no shards, which is the arbiter of what the order IS.
+///   It runs on the same `ArenaFrequencyChain` as the hybrid stack, so its own
+///   arbiter is the naive model in its `differential_tests`, which shares no
+///   structure with either.
 ///
 /// The CLOCK module checks both against ONE sequence. That is not available
 /// here, and the reason is worth stating because it looks like a gap. Tiered

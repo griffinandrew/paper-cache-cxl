@@ -455,7 +455,8 @@ pub fn get_ttl_overhead() -> ObjectSize {
 // `numa_alloc::measured` counts the row directly under `measured_accounting`.
 
 /// Per-object DRAM cost of an ARENA eviction stack, **40 B/object**: the one term
-/// every tiered design's stack is charged ([`stack_dram_overhead`]).
+/// every tiered design's stack is charged ([`stack_dram_overhead`]), and flat
+/// LFU's, which is the tiered LFU's chain in one tier.
 ///
 /// One 32-byte arena node -- key 8, prev 4, next 4 and the 16-byte
 /// `NodePayload` (size, frequency, aging epoch, queue, tier, resident bytes) --
@@ -492,6 +493,15 @@ pub fn get_ttl_overhead() -> ObjectSize {
 /// the node and the index and carry the same term by construction, not by a
 /// measurement of their own.
 ///
+/// Flat LFU (`lfu-compact`, `LfuCompactStack`) is the same chain with every key
+/// in one tier. Measured with the same harness, one process per point, it
+/// allocated 41,934,544 bytes at 2^20 and 167,782,096 at 2^22: a slope of
+/// 40.0059 B/object, the slope `lfu-compact-hybrid` and `lru-compact-hybrid`
+/// give in the same build (41,933,056 and 167,780,608 for LFU). Its slab
+/// layout before that measured 55.9931 and was charged 56. (The rows above
+/// were measured on an earlier build; this build's single points sit at 39.99
+/// at 2^20 and 40.00 at 2^22, so compare slopes, not points.)
+///
 /// Forty is the 2^k figure. Off 2^k, DERIVED from the growth rules and not
 /// measured: the node is 32 B/object at every population (plus at most one
 /// partly filled 128 KiB chunk and 24 B of chunk table per chunk), and only the
@@ -516,37 +526,67 @@ pub fn get_ttl_overhead() -> ObjectSize {
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 pub const ARENA_STACK_DRAM_OVERHEAD: ObjectSize = 40;
 
+/// Per-object DRAM cost of the FLAT LRU stack (`LruCompactStack`),
+/// **24 B/object**: one queue of an `ArenaQueueSet<()>`, so a 16-byte node --
+/// key 8, prev 4, next 4, no payload -- plus the keyless index's 8 B/object at
+/// the half load it grows to. [`ARENA_STACK_DRAM_OVERHEAD`] less the 16-byte
+/// `NodePayload` (size, tier, residency, ...) that only a tiered stack reads.
+///
+/// MEASURED with `measure_one_point` (`policy_stack::measure_overhead`): jemalloc
+/// `stats.allocated`, release, ONE PROCESS PER POINT, at powers of two,
+/// `MEASURE_POLICY=lru-compact`, the slope between the two points:
+///
+/// ```text
+///   n          allocated bytes
+///   2^20       25,188,328
+///   2^22       100,660,720
+///   (2^22 bytes - 2^20 bytes) / (2^22 - 2^20) = 23.9920 B/object
+/// ```
+///
+/// It was 56 while the stack sat on `CompactQueueSet<()>`, the same 16-byte
+/// slot found through a keyed hash map that stored every key a second time:
+/// 55.9931 B/object, measured the same way. Flat LFU moved to the arena in
+/// the same change and is charged [`ARENA_STACK_DRAM_OVERHEAD`]: its stack is
+/// the tiered LFU's `ArenaFrequencyChain`, whose node carries the payload
+/// whether or not it is read.
+#[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
+pub const FLAT_LRU_STACK_DRAM_OVERHEAD: ObjectSize = 24;
+
 /// The eviction stack's own per-object DRAM cost under `policy`: what
 /// `get_policy_overhead` adds to the map row and, for a tiered design only,
 /// what `get_hybrid_dram_shared_overhead` reserves out of the fast tier.
 ///
-/// Every TIERED design is one arena stack, [`ARENA_STACK_DRAM_OVERHEAD`]. The
-/// FLAT stacks are the older slab layout, and were re-measured with
-/// `measure_one_point`: each fits its term to within 0.01 B/object at
-/// R^2 = 1.000000. 56 for the one-queue stacks -- a 16-byte link-only slot plus
-/// one 12-byte index entry (8-byte key, 4-byte slot number; the CLOCK/SIEVE
-/// visited bit and MRU's held key live in the index value) -- and 72 for the
-/// stacks whose index value carries a payload (2Q's queue tag and size, ARC,
-/// S3-FIFO's tag and frequency counter). Neither charge covers a bare-key ghost
-/// queue.
+/// Every TIERED design is one arena stack, [`ARENA_STACK_DRAM_OVERHEAD`], and
+/// so is flat LFU: `LfuCompactStack` is the tiered LFU's chain with every key
+/// in one tier, so flat and tiered LFU are charged the same per-object stack.
+/// Flat LRU is an arena queue without the payload,
+/// [`FLAT_LRU_STACK_DRAM_OVERHEAD`]. The other FLAT stacks are the older slab
+/// layout (`CompactQueueSet`), and were re-measured with `measure_one_point`:
+/// each fits its term to within 0.01 B/object at R^2 = 1.000000. 56 for the
+/// one-queue stacks -- a 16-byte link-only slot plus one 12-byte index entry
+/// (8-byte key, 4-byte slot number; the CLOCK/SIEVE visited bit and MRU's held
+/// key live in the index value) -- and 72 for the stacks whose index value
+/// carries a payload (2Q's queue tag and size, ARC, S3-FIFO's tag and frequency
+/// counter). Neither charge covers a bare-key ghost queue.
 ///
 /// The match is exhaustive deliberately: adding a policy without giving it an
 /// overhead term is a compile error rather than a silent zero.
 #[cfg(any(feature = "hybrid_cache_common", not(feature = "merged_object_store")))]
 fn stack_dram_overhead(policy: &PaperPolicy) -> ObjectSize {
 	match policy {
-		PaperPolicy::LfuCompact
-		| PaperPolicy::FifoCompact
+		PaperPolicy::FifoCompact
 		| PaperPolicy::ClockCompact
 		| PaperPolicy::SieveCompact
-		| PaperPolicy::MruCompact
-		| PaperPolicy::LruCompact => 56,
+		| PaperPolicy::MruCompact => 56,
+
+		PaperPolicy::LruCompact => FLAT_LRU_STACK_DRAM_OVERHEAD,
 
 		PaperPolicy::TwoQCompact(..)
 		| PaperPolicy::Arc
 		| PaperPolicy::SThreeFifoCompact(..) => 72,
 
-		PaperPolicy::LruCompactHybrid
+		PaperPolicy::LfuCompact
+		| PaperPolicy::LruCompactHybrid
 		| PaperPolicy::LfuCompactHybrid
 		| PaperPolicy::LruSizedCompactHybrid
 		| PaperPolicy::LruLfuCompactHybrid(..)
@@ -614,10 +654,9 @@ pub const GHOST_ENTRY_DRAM_OVERHEAD: ObjectSize = 8;
 ///
 /// Distinct from [`GHOST_ENTRY_DRAM_OVERHEAD`] above, which sizes a `GhostSlot`
 /// FINGERPRINT (8 bytes, approximate, fixed-capacity). An exact ghost costs a
-/// 16-byte `QueueSlot` plus the 12-byte index entry that finds it -- the same
-/// 16 + 12 shape charged for `LruCompact` -- because flat S3-FIFO's
-/// ghost is exact and a faithful port cannot substitute an approximate filter
-/// without changing which keys get admitted to main.
+/// 16-byte `QueueSlot` plus the 12-byte index entry that finds it, because
+/// flat S3-FIFO's ghost is exact and a faithful port cannot substitute an
+/// approximate filter without changing which keys get admitted to main.
 ///
 /// 3.5x the fingerprint's cost per entry, and that is the real price of
 /// fidelity here; it is bounded by the main queue's length, which the ghost is
@@ -1083,6 +1122,30 @@ mod shared_overhead_is_feature_independent {
 		const KEYLESS_INDEX_PER_OBJECT: ObjectSize = 8;
 
 		assert_eq!(ARENA_STACK_DRAM_OVERHEAD, ARENA_NODE + KEYLESS_INDEX_PER_OBJECT);
+	}
+}
+
+#[cfg(all(test, any(feature = "hybrid_cache_common", not(feature = "merged_object_store"))))]
+mod flat_arena_stack_terms {
+	use super::*;
+
+	/// Flat and tiered LFU are one chain, so they are charged one stack, and a
+	/// flat cache no longer holds fewer objects than a tiered one at the same
+	/// `max_size` for a reason unrelated to tiering. Flat LRU is the tiered
+	/// LRU's arena queue without the 16-byte `NodePayload` (the 16-byte node is
+	/// pinned in `lru_compact_stack`, the 32-byte one in `arena_queue_set`).
+	#[test]
+	fn the_flat_arena_stacks_are_charged_the_arena_terms() {
+		const NODE_PAYLOAD: ObjectSize = 16;
+
+		assert_eq!(
+			stack_dram_overhead(&PaperPolicy::LfuCompact),
+			stack_dram_overhead(&PaperPolicy::LfuCompactHybrid),
+		);
+		assert_eq!(
+			stack_dram_overhead(&PaperPolicy::LruCompact) + NODE_PAYLOAD,
+			stack_dram_overhead(&PaperPolicy::LruCompactHybrid),
+		);
 	}
 }
 
