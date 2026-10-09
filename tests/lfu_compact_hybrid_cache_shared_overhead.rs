@@ -19,7 +19,9 @@
 //! slow tier (and the admission latch closing), not as demotions of existing
 //! residents. The self-calibrating fixture puts value bytes at ~85% of the
 //! budget, so with the reservation zeroed every key would fit fast and
-//! `slow_objects` would stay 0 forever.
+//! `slow_objects` would stay 0 forever -- at the 0.95 drain target it was
+//! sized at (E1b's default; the default is 0.85 since), which the test runs
+//! under in a child process (`common::alone_with_env`).
 //!
 //! Since S5 the default reservation is the MEASURED model's -- the cache's own
 //! structures' bytes, M -- and a new key whose metadata would not fit the
@@ -29,6 +31,8 @@
 //! under its ceiling (`N x omega <= F`) with a payload large enough for it;
 //! the measured model's settle is the lib's
 //! `the_measured_model_settles_on_the_published_m`.
+
+mod common;
 
 #[cfg(feature = "lfu_compact_hybrid_cache")]
 mod shared_overhead_tests {
@@ -116,30 +120,35 @@ mod shared_overhead_tests {
     /// to the slow tier, and nothing may be evicted.
     #[test]
     fn reservation_routes_admissions_to_slow_values_alone_would_fit() {
-        let (s, omega) = accounted(PaperPolicy::LfuCompactHybrid);
-        let budget = budget(s, omega);
+        // At the 0.95 drain target `budget` was sized against, in a child
+        // given it: at the 0.85 default the values alone would sit AT the
+        // admission target rather than safely under it.
+        crate::common::alone_with_env(module_path!(), "reservation_routes_admissions_to_slow_values_alone_would_fit", crate::common::AT_FIXTURE_DRAIN_TARGET, || {
+            let (s, omega) = accounted(PaperPolicy::LfuCompactHybrid);
+            let budget = budget(s, omega);
 
-        let cache = PaperCache::<u32, TieredBuffer>::new_with_gate(
-            1_048_576,
-            CacheTierSize::Bytes(budget),
-            PaperPolicy::LfuCompactHybrid,
-            per_object(),
-        )
-        .expect("cache should construct");
+            let cache = PaperCache::<u32, TieredBuffer>::new_with_gate(
+                1_048_576,
+                CacheTierSize::Bytes(budget),
+                PaperPolicy::LfuCompactHybrid,
+                per_object(),
+            )
+            .expect("cache should construct");
 
-        for key in 1u32..=N {
-            cache.set(key, PAYLOAD, None).expect("set should succeed");
-        }
+            for key in 1u32..=N {
+                cache.set(key, PAYLOAD, None).expect("set should succeed");
+            }
 
-        assert!(
-            wait_until(TIMEOUT, || cache.hybrid_stats().slow_objects >= 1),
-            "values sit at 85% of the fast budget, so only the metadata \
-             reservation can fill the fast tier -- yet no key was routed slow"
-        );
+            assert!(
+                wait_until(TIMEOUT, || cache.hybrid_stats().slow_objects >= 1),
+                "values sit at 85% of the fast budget, so only the metadata \
+                 reservation can fill the fast tier -- yet no key was routed slow"
+            );
 
-        let stats = cache.hybrid_stats();
-        assert_eq!(stats.evictions, 0, "reservation pressure must route/demote, never evict");
-        let present = (1u32..=N).filter(|key| cache.has(key)).count();
-        assert_eq!(present, N as usize, "every key must survive reservation pressure");
+            let stats = cache.hybrid_stats();
+            assert_eq!(stats.evictions, 0, "reservation pressure must route/demote, never evict");
+            let present = (1u32..=N).filter(|key| cache.has(key)).count();
+            assert_eq!(present, N as usize, "every key must survive reservation pressure");
+        });
     }
 }

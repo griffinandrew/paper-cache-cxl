@@ -420,9 +420,11 @@ pub struct GateConfig {
 	pub promotion_gate: PromotionGate,
 
 	/// The promotion level as a fraction of eff: a consumer copies a promotion
-	/// only while `P + v <= min(promo_frac x eff, S)`. 0.90 (provisional): below
-	/// the settle target S (0.95 by default), so promotions stop short of where
-	/// the tier rests and the margin up to B stays for sets. In `(0, 1]`.
+	/// only while `P + v <= min(promo_frac x eff, S)`. 0.90 (provisional), set
+	/// below the settle target S when S was 0.95 of eff, so promotions stopped
+	/// short of where the tier rests. At the 0.85 default drain target it is
+	/// above S, and the level is S itself: promotions stop where the tier
+	/// rests, and the margin up to B still stays for sets. In `(0, 1]`.
 	pub promo_frac: f64,
 }
 
@@ -2778,9 +2780,12 @@ mod tests {
 	/// The byte gate's levels (design 3.9.2): S the settle target, B = eff +
 	/// slack, N one near band below B -- the wider of `near_frac x eff` and
 	/// `concurrency_hint x value_hint` -- clamped into `[S + 1, B]`; at eff 0
-	/// all three 0.
+	/// all three 0. At the drain target its hints were sized at (0.95), pinned
+	/// on this thread: the last is wider than `B - S` there, 5% of eff, and
+	/// not at the 0.85 default's 15%.
 	#[test]
 	fn the_bands_are_ordered_and_a_hint_widens_the_near_band() {
+		let _drain = drain_target::pin(drain_target::FIXTURE_RATIO);
 		let mut config = GateConfig::default();
 		config.mode = GateMode::Block;
 

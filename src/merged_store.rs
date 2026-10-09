@@ -4929,9 +4929,9 @@ mod tests {
 
 		assert!(s.drain_migrations().is_empty(), "an unbounded tier demotes nothing");
 
-		// The settle drains to 0.95 of the budget: three objects' worth of
-		// budget keeps two of the four fast, so it demotes the two oldest,
-		// shard 9's first.
+		// The settle drains to the drain target of the budget (0.85 by
+		// default, and so at 0.95 too): three objects' worth of budget keeps
+		// two of the four fast, so it demotes the two oldest, shard 9's first.
 		s.resize_fast_tier(migrating_bytes(256) * 3);
 
 		assert_eq!(

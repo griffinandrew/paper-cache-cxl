@@ -65,6 +65,14 @@ fn alone(test: &str, body: impl FnOnce()) {
 	alone_in(module_path!(), test, body);
 }
 
+/// `alone`, at the drain target the test's byte budgets were sized at (0.95;
+/// `test_support::alone_at_fixture_ratio`): an oversize value is one over the
+/// settled tier's headroom `B - S`, 5% of eff there and 15% at the 0.85
+/// default, and a burst over B is a burst over that headroom.
+fn alone_at_fixture_ratio(test: &str, body: impl FnOnce()) {
+	super::test_support::alone_at_fixture_ratio(module_path!(), test, body);
+}
+
 /// The byte gate on, with `window` and `on_stall`; the measured model, whose M
 /// `override_m` holds. The lib's test builds default to `Off` (P is shared
 /// with every test running beside them), so each test opts in here.
@@ -302,7 +310,7 @@ fn t11_waiters_are_admitted_in_fifo_order() {
 /// FastTierStalled.
 #[test]
 fn the_oversize_path_waits_for_a_settled_tier() {
-	alone("the_oversize_path_waits_for_a_settled_tier", || {
+	alone_at_fixture_ratio("the_oversize_path_waits_for_a_settled_tier", || {
 		let _flush = test_hooks::no_flush();
 		let _m = test_hooks::override_m(M0);
 		let cache = cache(PaperPolicy::LruCompactHybrid, gated(Duration::from_secs(5), OnStall::Error));
@@ -1079,7 +1087,7 @@ fn concurrent_clients_finish_under_the_gate() {
 /// step did (`midbatchpass`).
 #[test]
 fn a_backlogged_worker_is_not_a_stall() {
-	alone("a_backlogged_worker_is_not_a_stall", || {
+	alone_at_fixture_ratio("a_backlogged_worker_is_not_a_stall", || {
 		let _flush = test_hooks::no_flush();
 		let _m = test_hooks::override_m(M0);
 		let window = Duration::from_millis(500);
@@ -1319,7 +1327,7 @@ fn a_set_during_a_stall_acts_after_the_probe() {
 /// closing the gate (`noclosed`).
 #[test]
 fn newcomers_queue_behind_a_waiting_oversize_set() {
-	alone("newcomers_queue_behind_a_waiting_oversize_set", || {
+	alone_at_fixture_ratio("newcomers_queue_behind_a_waiting_oversize_set", || {
 		let _flush = test_hooks::no_flush();
 		let _m = test_hooks::override_m(M0);
 		let cache = cache(PaperPolicy::LruCompactHybrid, gated(Duration::from_secs(30), OnStall::Error));

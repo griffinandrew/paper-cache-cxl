@@ -753,7 +753,7 @@ mod fast_resize_tests {
 		assert_eq!(
 			stack.drain_tier_migrations(),
 			vec![(1, Tier::Slow), (2, Tier::Slow), (3, Tier::Slow)],
-			"main drains to 0.95 x 2_400 B: three of its five keys go",
+			"main drains to 0.85 x 2_400 B: three of its five keys go",
 		);
 	}
 
@@ -772,15 +772,15 @@ mod fast_resize_tests {
 
 	/// The one-access queue's own budget is the carve-out net of its share of
 	/// the reservation, at the drain target: 1_400 B of the 2_000 B are the
-	/// queue's share, so 600 B x 0.95 = 570 B, and one 1_000 B key is over it.
+	/// queue's share, so 600 B x 0.85 = 510 B, and one 1_000 B key is over it.
 	#[test]
 	fn the_queue_asks_for_an_eviction_over_its_budget_at_the_drain_target() {
 		let mut stack = over_its_budget();
 
-		assert!(stack.needs_capacity_eviction(), "1_000 B in a queue whose budget is 570 B");
+		assert!(stack.needs_capacity_eviction(), "1_000 B in a queue whose budget is 510 B");
 
 		stack.set_dram_metadata(None);
 
-		assert!(!stack.needs_capacity_eviction(), "1_000 B against a 2_000 B budget at its drain target of 1_900 B");
+		assert!(!stack.needs_capacity_eviction(), "1_000 B against a 2_000 B budget at its drain target of 1_700 B");
 	}
 }

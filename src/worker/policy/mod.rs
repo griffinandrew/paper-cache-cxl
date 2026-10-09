@@ -49,17 +49,25 @@
 /// On by default: `MIGRATION_QUEUE_THREADS` sets the consumer count, and 0
 /// disables the queue entirely, in which case migrations apply inline on the
 /// worker exactly as before.
+///
+/// A consumer whose channel goes empty spins for up to `MIG_SPIN_US` (50 us
+/// by default, `DEFAULT_SPIN_US`; at most `MAX_SPIN_US`, 10,000; 0 = park at
+/// once, as before) before it parks in the blocking `recv` (`receive`). A consumer that parks after
+/// every item makes every hand-off a futex wake on the policy worker's
+/// `send`, which is the worker's time and so every waiting set's; one that is
+/// still spinning when the next item arrives costs the `send` nothing.
 #[cfg(feature = "hybrid_cache_common")]
 pub mod migration_queue {
 	use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	use std::sync::{Arc, OnceLock};
 	use std::thread::JoinHandle;
+	use std::time::{Duration, Instant};
 
-	use crossbeam_channel::{Sender, unbounded};
+	use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 
 	use crate::object_store::ObjectStore;
 	use crate::{HashedKey, ObjectMapRef, StatusRef};
-	use crate::worker::policy::migstats::Stats as MigStats;
+	use crate::worker::policy::migstats::{MqSlot, MQ_SLOTS, Stats as MigStats};
 	use crate::worker::policy::policy_stack::{MigrationEntry, MigrationOrigin, TaggedMigration, Tier};
 
 	/// Default consumer count.
@@ -86,6 +94,217 @@ pub mod migration_queue {
 				.and_then(|value| value.parse::<usize>().ok())
 				.unwrap_or(DEFAULT_THREADS)
 		})
+	}
+
+	/// Default spin-before-park window, in microseconds (`MIG_SPIN_US`; see
+	/// `receive`).
+	///
+	/// Measured with one prototype binary at 50 against 0 (cluster53, 8
+	/// clients, the batched benchmark, tiered LRU; single runs on a heavily
+	/// loaded shared host; run dirs `wake_*`): at 8 consumers, the consumers'
+	/// blocking receives (`mq_blocks`) fell from 8.26M to 1.46M, the policy
+	/// worker's time handing migrations off from 43.1 to 25.6 s, the byte
+	/// gate's SET wait time from 54.4 to 13.4 s and SET p99 from 177 to 21 us.
+	/// At 2 consumers the hand-off fell from 1.76 to 1.64 us per call (-7%)
+	/// and nothing else moved beyond run-to-run noise.
+	///
+	/// The cost is CPU: a consumer whose channel goes empty burns up to the
+	/// window before it parks, so one fed more often than once a window never
+	/// parks at all. In the 8-consumer run the migration threads used 366
+	/// CPU-seconds against 233 without the spin; with the 0.85 drain target
+	/// that ships with it, migration CPU rose 33% at one client and 45% at 8
+	/// consumers against the build before both (`drain_target`'s doc).
+	pub const DEFAULT_SPIN_US: u64 = 50;
+
+	/// The largest window `MIG_SPIN_US` may ask for, in microseconds: 10 ms,
+	/// 200 times the default. A window of N us is up to N us of one CPU per
+	/// consumer after every burst, so a larger value is clamped to this, with
+	/// one note on stderr, rather than taken as given.
+	pub const MAX_SPIN_US: u64 = 10_000;
+
+	/// The spin-before-park window, in microseconds: `MIG_SPIN_US`, read once.
+	/// `0` turns the spin off, and an empty channel then goes straight to the
+	/// blocking `recv`, which is the behaviour before the spin. A value above
+	/// `MAX_SPIN_US` (one too large for a `u64` included) is clamped to it, and
+	/// one that is not a whole number of microseconds is ignored and the
+	/// default applies, each with one note on stderr.
+	pub fn spin_us() -> u64 {
+		static SPIN_US: OnceLock<u64> = OnceLock::new();
+
+		*SPIN_US.get_or_init(|| {
+			let (spin, note) = spin_us_from(std::env::var("MIG_SPIN_US").ok().as_deref());
+
+			if let Some(note) = note {
+				eprintln!("paper-cache: {note}");
+			}
+
+			spin
+		})
+	}
+
+	/// `spin_us` over the variable's value (`None`: unset), and the note for a
+	/// value it clamped or ignored: the decision alone, so it can be tested
+	/// without touching the process's environment.
+	pub(crate) fn spin_us_from(value: Option<&str>) -> (u64, Option<String>) {
+		let Some(value) = value else {
+			return (DEFAULT_SPIN_US, None);
+		};
+
+		let clamped = || {
+			(MAX_SPIN_US, Some(format!("MIG_SPIN_US={value:?} clamped to {MAX_SPIN_US} us, the most it may ask for")))
+		};
+
+		match value.parse::<u64>() {
+			Ok(spin) if spin > MAX_SPIN_US => clamped(),
+			Ok(spin) => (spin, None),
+			// Too large for a `u64` -- and a whole number all the same, not one
+			// whose overflow `parse` met before a stray character.
+			Err(reason)
+				if *reason.kind() == std::num::IntErrorKind::PosOverflow
+					&& value.strip_prefix('+').unwrap_or(value).bytes().all(|byte| byte.is_ascii_digit()) =>
+			{
+				clamped()
+			},
+			Err(reason) => (
+				DEFAULT_SPIN_US,
+				Some(format!("MIG_SPIN_US={value:?} ignored: {reason}; the default {DEFAULT_SPIN_US} us applies")),
+			),
+		}
+	}
+
+	/// Spin iterations between `yield_now`s: the rest are `spin_loop` hints.
+	const SPIN_YIELD_EVERY: u32 = 64;
+
+	/// One consumer's receive-side counters, kept in plain locals and
+	/// published (`publish`) into its `MqSlot` only on the idle path -- just
+	/// before a spin starts, just before a blocking `recv`, and when the loop
+	/// exits -- never between two ready items.
+	#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+	pub(crate) struct RecvCounts {
+		/// Items taken during a spin: the channel was empty when the consumer
+		/// came back for its next item, and a `send` landed inside the window.
+		/// Each is a hand-off that found the consumer awake.
+		pub(crate) spin_hits: u64,
+		/// Blocking `recv`s entered on an empty channel -- after an expired
+		/// spin, or at once with no spin. Each is a consumer that registers as
+		/// a waiter and (unless crossbeam's own short backoff inside `recv`
+		/// catches an item first) parks, so the next `send` pays a wake-up.
+		pub(crate) blocks: u64,
+		/// Time spent spinning, hits and misses both.
+		pub(crate) spin_ns: u64,
+		/// Time spent inside the blocking `recv`s.
+		pub(crate) block_ns: u64,
+	}
+
+	impl RecvCounts {
+		/// Adds what was counted since the last publish to `slot` and starts
+		/// over. Deltas, not totals, so consumers sharing a slot (more than
+		/// `MQ_SLOTS` of them) still sum correctly.
+		///
+		/// `blocks` goes LAST, and `Release`: a reader that waits for a block
+		/// to appear (`Acquire`) then sees the spin and block times published
+		/// with it, never a block without them.
+		pub(crate) fn publish(&mut self, slot: &MqSlot) {
+			for (counter, value) in [
+				(&slot.spin_hits, self.spin_hits),
+				(&slot.spin_ns, self.spin_ns),
+				(&slot.block_ns, self.block_ns),
+			] {
+				if value != 0 {
+					counter.fetch_add(value, Ordering::Relaxed);
+				}
+			}
+
+			if self.blocks != 0 {
+				slot.blocks.fetch_add(self.blocks, Ordering::Release);
+			}
+
+			*self = RecvCounts::default();
+		}
+	}
+
+	/// The consumer loop's receive, with spin-before-park.
+	///
+	/// `None` exactly when a plain `receiver.recv()` returns `Err`: the
+	/// channel is disconnected AND empty (a disconnected channel still hands
+	/// out its backlog first, `try_recv` and `recv` alike).
+	///
+	///   1. READY: `try_recv`. Under load the channel is usually non-empty and
+	///      this is the whole cost -- the same attempt `recv` makes first.
+	///   2. SPIN (`spin` > 0): poll `try_recv` until an item, a disconnect, or
+	///      `spin` has elapsed, with `spin_loop` between polls and `yield_now`
+	///      every `SPIN_YIELD_EVERY`. The consumer is not registered as a
+	///      waiter meanwhile, so a `send` finds no one to wake: crossbeam's
+	///      `send` then takes no waker lock and makes no `unpark` (no futex).
+	///   3. BLOCK: crossbeam's blocking `recv`, as before.
+	///
+	/// With `spin` zero, step 2 is skipped: an empty channel goes straight to
+	/// the blocking `recv`, which is the old behaviour (one extra `try_recv`
+	/// on the empty path, which `recv` would have made itself).
+	pub(crate) fn receive<T>(
+		receiver: &Receiver<T>,
+		spin: Duration,
+		counts: &mut RecvCounts,
+		slot: &MqSlot,
+	) -> Option<T> {
+		match receiver.try_recv() {
+			Ok(item) => return Some(item),
+			Err(TryRecvError::Disconnected) => return None,
+			Err(TryRecvError::Empty) => {},
+		}
+
+		if !spin.is_zero() {
+			// Idle from here: the last burst's counts go out now, while
+			// nothing is waiting on this thread.
+			counts.publish(slot);
+
+			let start = Instant::now();
+			let mut polls: u32 = 0;
+
+			loop {
+				polls = polls.wrapping_add(1);
+
+				if polls % SPIN_YIELD_EVERY == 0 {
+					std::thread::yield_now();
+				} else {
+					std::hint::spin_loop();
+				}
+
+				match receiver.try_recv() {
+					Ok(item) => {
+						counts.spin_hits += 1;
+						counts.spin_ns += start.elapsed().as_nanos() as u64;
+
+						return Some(item);
+					},
+					Err(TryRecvError::Disconnected) => {
+						counts.spin_ns += start.elapsed().as_nanos() as u64;
+
+						return None;
+					},
+					Err(TryRecvError::Empty) => {},
+				}
+
+				let spun = start.elapsed();
+
+				if spun >= spin {
+					counts.spin_ns += spun.as_nanos() as u64;
+					break;
+				}
+			}
+		}
+
+		// Published BEFORE blocking, so a parked consumer's block is already
+		// in its slot (and in the next dump).
+		counts.blocks += 1;
+		counts.publish(slot);
+
+		let start = Instant::now();
+		let item = receiver.recv().ok();
+
+		counts.block_ns += start.elapsed().as_nanos() as u64;
+
+		item
 	}
 
 	/// Migration-queue entries handed to the consumers and not yet finished,
@@ -524,7 +743,7 @@ pub mod migration_queue {
 		/// which is where the throughput comes from.
 		///
 		/// Emptied by `Drop` before joining: dropping the senders is what
-		/// makes each consumer's `recv` return `Err` and its loop exit.
+		/// makes each consumer's `receive` return `None` and its loop exit.
 		senders: Vec<Sender<TaggedMigration>>,
 		handles: Vec<JoinHandle<()>>,
 
@@ -630,7 +849,25 @@ pub mod migration_queue {
 						let mut reconciled_to_fast: u64 = 0;
 						let mut reconciled_to_slow: u64 = 0;
 
-						while let Ok((key, tier, origin)) = receiver.recv() {
+						// Spin-before-park (`receive`), and this consumer's own
+						// pair of cache lines for its receive counters;
+						// consumers past `MQ_SLOTS` share one, which
+						// `RecvCounts::publish`'s deltas tolerate.
+						let spin = Duration::from_micros(spin_us());
+						let slot = &status.migstats().mq[index % MQ_SLOTS];
+						let mut recv_counts = RecvCounts::default();
+
+						// The completion flush below stays inside the
+						// iteration, on an empty channel, BEFORE `_done` counts
+						// the item -- so before this consumer spins in the next
+						// `receive`, not after. After the spin it would (1)
+						// break `flush()`'s contract: `processed` would be
+						// released before the counters, so a `flush()` caller
+						// could read stale promotions and demotions; (2) hold
+						// completions back by up to the window, or for as long
+						// as spins keep hitting; and (3) save nothing, since it
+						// is one flush per drained burst either way.
+						while let Some((key, tier, origin)) = receive(&receiver, spin, &mut recv_counts, slot) {
 							// Test builds: a gate test's paused or paced consumers.
 							#[cfg(test)]
 							crate::gate::test_hooks::consumer_wait();
@@ -709,6 +946,7 @@ pub mod migration_queue {
 						status.record_hybrid_promotions(completed_promotions);
 						status.record_hybrid_demotions(completed_demotions);
 						status.record_reconcile_applied(reconciled_to_fast, reconciled_to_slow);
+						recv_counts.publish(slot);
 					});
 
 				match handle {
@@ -957,6 +1195,177 @@ pub mod migration_queue {
 			assert_eq!(tier, Tier::Slow);
 			assert_eq!(status.migstats().pending_demote.load(Ordering::Acquire), before);
 		}
+
+		/// `MIG_SPIN_US`: unset is the default, a whole number of microseconds
+		/// up to `MAX_SPIN_US` is taken as given (0 included: no spin), a larger
+		/// one -- too large for a `u64` included -- is clamped to the cap with a
+		/// note, and anything else is ignored with a note and the default applies.
+		#[test]
+		fn mig_spin_us_takes_whole_microseconds_up_to_a_cap_and_notes_what_it_clamps_or_ignores() {
+			assert_eq!(spin_us_from(None), (DEFAULT_SPIN_US, None));
+			assert_eq!(spin_us_from(Some("0")), (0, None));
+			assert_eq!(spin_us_from(Some("200")), (200, None));
+			assert_eq!(spin_us_from(Some("10000")), (MAX_SPIN_US, None), "the cap itself is taken as given");
+
+			for value in ["10001", "1000000", "18446744073709551615", "18446744073709551616", "99999999999999999999999"] {
+				let (spin, note) = spin_us_from(Some(value));
+
+				assert_eq!(spin, MAX_SPIN_US, "{value:?}");
+				assert_eq!(
+					note.as_deref(),
+					Some(format!("MIG_SPIN_US={value:?} clamped to {MAX_SPIN_US} us, the most it may ask for").as_str()),
+					"{value:?}",
+				);
+			}
+
+			for value in ["", "-5", "1.5", "50us", " 50", "-18446744073709551616", "99999999999999999999999us"] {
+				let (spin, note) = spin_us_from(Some(value));
+
+				assert_eq!(spin, DEFAULT_SPIN_US, "{value:?}");
+				assert!(
+					note.as_deref().is_some_and(|note| note.starts_with(&format!("MIG_SPIN_US={value:?} ignored: "))),
+					"{value:?}: {note:?}",
+				);
+			}
+		}
+
+		/// `receive`'s three phases, driven directly so both spin settings run
+		/// in one process whatever `MIG_SPIN_US` says. A spin window far longer
+		/// than any wait here: a hit cannot turn into a block because the box
+		/// is loaded.
+		const LONG_SPIN: Duration = Duration::from_secs(30);
+
+		/// Waits until `counter` reaches `at_least`. The receiver publishes
+		/// right before it spins and right before it blocks, so a slot counter
+		/// is a deterministic "it is spinning / in `recv` now" signal.
+		fn await_counter(counter: &AtomicU64, at_least: u64) {
+			let deadline = Instant::now() + Duration::from_secs(10);
+
+			while counter.load(Ordering::Acquire) < at_least {
+				assert!(Instant::now() < deadline, "the receiver never reached the expected phase");
+				std::thread::yield_now();
+			}
+		}
+
+		#[test]
+		fn ready_items_take_no_idle_path_and_a_backlog_outlives_the_disconnect() {
+			for spin in [Duration::ZERO, LONG_SPIN] {
+				let (sender, receiver) = unbounded::<u32>();
+				let slot = MqSlot::default();
+				let mut counts = RecvCounts::default();
+
+				sender.send(1).unwrap();
+				sender.send(2).unwrap();
+
+				assert_eq!(receive(&receiver, spin, &mut counts, &slot), Some(1));
+
+				// Disconnected with one item left: it is still handed out, as
+				// `recv` would, and only then does the loop end -- at once,
+				// without spinning or blocking.
+				drop(sender);
+
+				assert_eq!(receive(&receiver, spin, &mut counts, &slot), Some(2));
+				assert_eq!(receive(&receiver, spin, &mut counts, &slot), None);
+				assert_eq!(counts, RecvCounts::default(), "{spin:?}: no idle path was taken");
+			}
+		}
+
+		#[test]
+		fn a_send_inside_the_spin_window_is_a_spin_hit_not_a_block() {
+			let (sender, receiver) = unbounded::<u32>();
+			let slot = Arc::new(MqSlot::default());
+
+			// A marker the spin-start publish carries out: once the producer
+			// sees it, the receiver is past its ready `try_recv` and spinning.
+			let mut counts = RecvCounts { block_ns: 1, ..RecvCounts::default() };
+
+			let producer = {
+				let slot = slot.clone();
+
+				std::thread::spawn(move || {
+					await_counter(&slot.block_ns, 1);
+					sender.send(7).unwrap();
+					sender
+				})
+			};
+
+			assert_eq!(receive(&receiver, LONG_SPIN, &mut counts, &slot), Some(7));
+			assert_eq!((counts.spin_hits, counts.blocks, counts.block_ns), (1, 0, 0));
+			assert!(counts.spin_ns > 0);
+
+			// Not published until the next idle path, which a disconnect during
+			// the spin is: it ends the loop without blocking.
+			assert_eq!(slot.spin_hits.load(Ordering::Relaxed), 0);
+
+			let sender = producer.join().unwrap();
+			let dropper = {
+				let slot = slot.clone();
+
+				std::thread::spawn(move || {
+					await_counter(&slot.spin_hits, 1);
+					drop(sender);
+				})
+			};
+
+			assert_eq!(receive(&receiver, LONG_SPIN, &mut counts, &slot), None);
+			dropper.join().unwrap();
+
+			assert_eq!(slot.spin_hits.load(Ordering::Relaxed), 1, "published when the second spin began");
+			assert_eq!(slot.blocks.load(Ordering::Relaxed), 0, "a disconnect mid-spin never blocks");
+			assert_eq!((counts.spin_hits, counts.blocks), (0, 0));
+		}
+
+		#[test]
+		fn an_expired_spin_or_no_spin_falls_back_to_the_blocking_recv() {
+			for spin in [Duration::ZERO, Duration::from_millis(1)] {
+				let (sender, receiver) = unbounded::<u32>();
+				let slot = Arc::new(MqSlot::default());
+				let mut counts = RecvCounts::default();
+
+				// Sends only once the receiver has published its block, so the
+				// item can only arrive through the blocking `recv`.
+				let producer = {
+					let slot = slot.clone();
+
+					std::thread::spawn(move || {
+						await_counter(&slot.blocks, 1);
+						sender.send(9).unwrap();
+						sender
+					})
+				};
+
+				assert_eq!(receive(&receiver, spin, &mut counts, &slot), Some(9));
+
+				let sender = producer.join().unwrap();
+
+				assert_eq!(slot.blocks.load(Ordering::Relaxed), 1, "{spin:?}");
+				assert_eq!(slot.spin_hits.load(Ordering::Relaxed), 0, "{spin:?}");
+				assert_eq!(counts.blocks, 0, "{spin:?}: published before blocking");
+				assert!(counts.block_ns > 0, "{spin:?}: the block's time is local until the next publish");
+
+				match spin.is_zero() {
+					true => assert_eq!(slot.spin_ns.load(Ordering::Relaxed), 0, "no spin at all"),
+					false => assert!(slot.spin_ns.load(Ordering::Relaxed) >= 1_000_000, "the whole window was spun"),
+				}
+
+				// The shutdown path: a blocked receiver sees the disconnect.
+				let dropper = {
+					let slot = slot.clone();
+
+					std::thread::spawn(move || {
+						await_counter(&slot.blocks, 2);
+						drop(sender);
+					})
+				};
+
+				assert_eq!(receive(&receiver, spin, &mut counts, &slot), None);
+				dropper.join().unwrap();
+
+				counts.publish(&slot);
+				assert_eq!(slot.blocks.load(Ordering::Relaxed), 2, "{spin:?}");
+				assert!(slot.block_ns.load(Ordering::Relaxed) > 0, "{spin:?}");
+			}
+		}
 	}
 
 }
@@ -986,6 +1395,30 @@ pub mod migstats {
 
 	/// Buckets of the batch-size histograms.
 	pub(crate) const NB: usize = 16;
+
+	/// Consumer slots in `Stats::mq`: consumer `i` uses slot `i % MQ_SLOTS`.
+	/// 32, the largest array `Default` is derived for, and well past the
+	/// consumer counts measured (2 by default, 8 at most).
+	#[cfg(feature = "hybrid_cache_common")]
+	pub const MQ_SLOTS: usize = 32;
+
+	/// One migration consumer's receive counters (`migration_queue::
+	/// RecvCounts`, published there), on a pair of cache lines of its own so
+	/// no two consumers ever write one line.
+	#[cfg(feature = "hybrid_cache_common")]
+	#[derive(Default)]
+	#[repr(align(128))]
+	pub struct MqSlot {
+		/// Items received during a spin-before-park: hand-offs that found the
+		/// consumer awake.
+		pub spin_hits: AtomicU64,
+		/// Blocking `recv`s entered on an empty channel (possible parks).
+		/// Published last, `Release`, by `RecvCounts::publish`.
+		pub blocks: AtomicU64,
+		/// Nanoseconds spent spinning, and inside the blocking `recv`s.
+		pub spin_ns: AtomicU64,
+		pub block_ns: AtomicU64,
+	}
 
 	/// One cache's migration and eviction statistics. See the module doc.
 	#[derive(Default)]
@@ -1169,6 +1602,12 @@ pub mod migstats {
 		#[cfg(feature = "hybrid_cache_common")]
 		pub mig_applied: AtomicU64,
 
+		/// The migration consumers' receive counters, one slot per consumer
+		/// (spin-before-park, `migration_queue::receive`); summed on the
+		/// `MIGSTATS mq_*` line.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub mq: [MqSlot; MQ_SLOTS],
+
 		/// Times the eviction loop fell back to evicting a random object because
 		/// the policy stack had no candidate (`Removal::fallback_victim`): that
 		/// path drops the object from the map WITHOUT removing it from the stack.
@@ -1282,6 +1721,29 @@ pub mod migstats {
 			(self.pending_demote.load(Ordering::Acquire), self.pending_promote.load(Ordering::Acquire))
 		}
 
+		/// `MIGSTATS mq_spin_us=.. mq_spin_hits=.. mq_blocks=.. mq_spin_ns=..
+		/// mq_block_ns=.. t_ms=..`: the window in force (`MIG_SPIN_US`) and
+		/// every consumer slot summed. `mq_blocks` is the blocking `recv`s
+		/// entered on an empty channel, each a possible park and so a futex
+		/// wake for the next `send`; `mq_spin_hits` the items the spin caught
+		/// instead. A consumer publishes only when it goes idle, so a dump
+		/// taken mid-burst lags by that burst.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub(crate) fn mq_line(&self, t_ms: u64) -> String {
+			let sum = |field: fn(&MqSlot) -> &AtomicU64| -> u64 {
+				self.mq.iter().map(|slot| field(slot).load(Ordering::Relaxed)).sum()
+			};
+
+			format!(
+				"MIGSTATS mq_spin_us={} mq_spin_hits={} mq_blocks={} mq_spin_ns={} mq_block_ns={} t_ms={t_ms}",
+				crate::worker::policy::migration_queue::spin_us(),
+				sum(|slot| &slot.spin_hits),
+				sum(|slot| &slot.blocks),
+				sum(|slot| &slot.spin_ns),
+				sum(|slot| &slot.block_ns),
+			)
+		}
+
 		fn maybe_dump(&self, counter_value: u64) {
 			if counter_value & CLOCK_CHECK_MASK != 0 {
 				return;
@@ -1386,8 +1848,8 @@ pub mod migstats {
 			lines.push(format!("MIGSTATS promo={} t_ms={t_ms}", f(&self.promo)));
 			lines.push(format!("MIGSTATS evict={} t_ms={t_ms}", f(&self.evict)));
 
-			// The reconcile (S3): a line of its own, LAST, so every line above
-			// keeps its fields and its place; `t_ms` last, as on every line. The
+			// The reconcile (S3): a line of its own, after the lines above, so
+			// each keeps its fields and its place; `t_ms` last, as on every line. The
 			// correctives the worker queued, by reason; every reconcile-origin
 			// entry handed on after the split, which `demo`/`promo` above no
 			// longer count; those
@@ -1410,6 +1872,11 @@ pub mod migstats {
 					self.reconcile_applied_to_slow.load(Ordering::Relaxed),
 				));
 			}
+
+			// The consumers' spin-before-park (`mq_line`): a line of its own,
+			// LAST, so every line above keeps its fields and its place.
+			#[cfg(feature = "hybrid_cache_common")]
+			lines.push(self.mq_line(t_ms));
 
 			lines
 		}
@@ -1455,6 +1922,17 @@ pub mod migstats {
 			set(&stats.reconcile_applied_to_fast, 37);
 			set(&stats.reconcile_applied_to_slow, 38);
 			set(&stats.reconcile_get_heal_skipped, 39);
+			set(&stats.mq[0].spin_hits, 41);
+			set(&stats.mq[0].blocks, 42);
+			set(&stats.mq[0].spin_ns, 43);
+			set(&stats.mq[0].block_ns, 44);
+
+			// The consumers' receive line, appended after the rest: the window
+			// is this process's `MIG_SPIN_US`.
+			let mq = format!(
+				"MIGSTATS mq_spin_us={} mq_spin_hits=41 mq_blocks=42 mq_spin_ns=43 mq_block_ns=44 t_ms=123",
+				crate::worker::policy::migration_queue::spin_us(),
+			);
 
 			assert_eq!(
 				stats.lines(123),
@@ -1469,7 +1947,36 @@ pub mod migstats {
 					"MIGSTATS reconcile_set_to_fast=31 reconcile_set_to_slow=32 reconcile_get_to_fast=33 \
 					 reconcile_set_new_key=34 reconcile_queued_to_fast=35 reconcile_queued_to_slow=36 \
 					 reconcile_applied_to_fast=37 reconcile_applied_to_slow=38 reconcile_get_heal_skipped=39 t_ms=123",
+					mq.as_str(),
 				],
+			);
+		}
+
+		/// The `mq_*` line sums every consumer slot: the first, the second and
+		/// the last.
+		#[test]
+		fn the_mq_line_sums_every_consumer_slot() {
+			let stats = Stats::default();
+
+			for (i, slot) in [0, 1, MQ_SLOTS - 1].into_iter().map(|i| (i as u64, &stats.mq[i])) {
+				slot.spin_hits.store(1 + i, Ordering::Relaxed);
+				slot.blocks.store(10 + i, Ordering::Relaxed);
+				slot.spin_ns.store(100 + i, Ordering::Relaxed);
+				slot.block_ns.store(1000 + i, Ordering::Relaxed);
+			}
+
+			let n = (MQ_SLOTS - 1) as u64;
+
+			assert_eq!(
+				stats.mq_line(7),
+				format!(
+					"MIGSTATS mq_spin_us={} mq_spin_hits={} mq_blocks={} mq_spin_ns={} mq_block_ns={} t_ms=7",
+					crate::worker::policy::migration_queue::spin_us(),
+					3 + 1 + n,
+					30 + 1 + n,
+					300 + 1 + n,
+					3000 + 1 + n,
+				),
 			);
 		}
 	}
@@ -1541,7 +2048,7 @@ pub mod migstats {
 ///     makes a band (with its bursts).
 ///
 /// Deliberately its own pair, and not shared with the hybrid stacks'
-/// fast-tier settle: that one is `drain_target` (0.95 of the effective
+/// fast-tier settle: that one is `drain_target` (0.85 of the effective
 /// fast-tier budget, `FAST_TIER_DRAIN_TARGET`), and it says nothing about how
 /// full the cache as a whole may be.
 pub mod eviction_watermarks {
@@ -4575,6 +5082,64 @@ mod migration_queue_tests {
 		);
 		assert_eq!(tier_of(&objects, 2), Tier::Fast);
 		assert_eq!(bytes_of(&objects, 2), vec![0x22; BUFFER_LEN]);
+	}
+
+	/// A real consumer under whatever `MIG_SPIN_US` the process has (the
+	/// suites run it at the default and at 0): an idle consumer ends up in its
+	/// blocking `recv` with the block in its slot, a migration handed to it
+	/// then lands and is counted exactly as before, and it goes back to
+	/// blocking once the channel drains. Nothing is sent while it spins, so
+	/// there are no spin hits.
+	#[test]
+	fn a_consumer_spins_then_blocks_and_still_lands_what_it_is_handed() {
+		let _serialised = migration_test_lock::lock();
+
+		let objects = make_objects();
+		insert(&objects, 1, Tier::Fast, 0x31);
+
+		let status = make_status();
+		let before = dispositions(&status);
+		let queue = MigrationQueue::spawn(objects.clone(), 1, status.clone()).unwrap();
+		let slot = &status.migstats().mq[0];
+
+		// `blocks` is published last and `Release` (`RecvCounts::publish`),
+		// so once a block shows here the times published with it do too.
+		let await_blocks = |blocks: u64| {
+			let deadline = Instant::now() + Duration::from_secs(10);
+
+			while slot.blocks.load(Ordering::Acquire) < blocks {
+				assert!(Instant::now() < deadline, "the consumer never blocked: {blocks}");
+				thread::yield_now();
+			}
+		};
+
+		await_blocks(1);
+
+		queue.push((1, Tier::Slow));
+		queue.flush();
+
+		assert_eq!(tier_of(&objects, 1), Tier::Slow);
+		assert_eq!(bytes_of(&objects, 1), vec![0x31; BUFFER_LEN]);
+		assert_eq!(since(&status, before), Dispositions { applied: 1, gone: 0, declined: 0, superseded: 0 });
+
+		await_blocks(2);
+
+		assert_eq!(slot.spin_hits.load(Ordering::Relaxed), 0);
+		assert!(slot.block_ns.load(Ordering::Relaxed) > 0, "the first block's time went out with the second");
+
+		match super::migration_queue::spin_us() {
+			0 => assert_eq!(slot.spin_ns.load(Ordering::Relaxed), 0),
+			us => assert!(slot.spin_ns.load(Ordering::Relaxed) >= 2 * us * 1_000, "two whole windows spun"),
+		}
+
+		let line = status.migstats().mq_line(0);
+		assert!(line.contains(" mq_spin_hits=0 mq_blocks=2 "), "{line}");
+
+		// Shutdown: the blocked consumer sees the disconnect and exits.
+		drop(queue);
+
+		assert_eq!(slot.blocks.load(Ordering::Relaxed), 2);
+		assert_eq!(status.migstats().pending(), (0, 0));
 	}
 
 	/// A key whose `Clone` parks the thread cloning it -- see

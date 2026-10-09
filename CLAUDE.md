@@ -193,11 +193,14 @@ src/
                                  Also holds two submodules: `migration_queue` (the standing
                                  consumer pool that actually performs the byte moves, one
                                  channel per consumer sharded by key hash, 2 threads by
-                                 default) and `migstats` (the per-cache `Stats` block, owned
+                                 default, each spinning MIG_SPIN_US -- 50 us -- on an empty
+                                 channel before it parks: `receive`) and `migstats` (the
+                                 per-cache `Stats` block, owned
                                  by each cache's AtomicStatus since S8: the MIGSTATS batch-size
                                  histograms dumped to stderr, the queue's depth and
-                                 dispositions, and the reconcile counters on a last line of
-                                 their own). Queue entries carry a
+                                 dispositions, the reconcile counters on a line of their own,
+                                 and the consumers' spin and park counters, `mq_*`, on the
+                                 last). Queue entries carry a
                                  MigrationOrigin (Stack | Reconcile) through the split and the
                                  queue, so a landed corrective is counted apart from
                                  promotions/demotions. `migration_queue::InFlight`: per key
@@ -243,8 +246,9 @@ src/
                                  module doc — those, and the ported ones', are the
                                  authoritative description of what each design does.
                                  `drain_target` (in mod.rs) holds the single fast-tier
-                                 level every settle maintains: 0.95 of the effective
-                                 budget (0.98 until E1b), overridable via FAST_TIER_DRAIN_TARGET. One
+                                 level every settle maintains: 0.85 of the effective
+                                 budget (0.95 from E1b, 0.98 before), overridable via
+                                 FAST_TIER_DRAIN_TARGET. One
                                  threshold, not a high/low band. `PolicyStack::placement_of`
                                  is where a stack's bytes converge (its physical intent):
                                  tier_of for every design, the slot's tier in the merged
@@ -3518,7 +3522,11 @@ through real caches; and, each in a child process that has the variable from the
 (`=1.0`) restoring the old edge and a band (`=0.75`, `EVICTION_LOW_WATERMARK=0.5`) refusing above its
 arming level. Each was made red against the old check. No other test changed, and T14 is untouched.
 
-## The fast tier's drain target, 0.95 by default (E1b)
+## The fast tier's drain target, 0.95 by default (E1b) -- historical, the default is 0.85 now
+
+(Historical: the default has been 0.85 since the migration consumers spin before they park -- see "The
+migration consumers spin before they park, and the fast tier drains to 0.85" below. 0.95 is still the level
+the goldens, T14's hashes and the byte-exact fixtures were recorded at, `drain_target::FIXTURE_RATIO`.)
 
 A deliberate behaviour change (the user's decision of 2026-09-29): `drain_target::DEFAULT_RATIO`
 went from 0.98 to 0.95, for more room to absorb bursts -- 5% of the effective budget under the byte
@@ -3831,3 +3839,102 @@ allocation counts (a counter in the pools, `numa_alloc::thread_allocs`, test bui
 no key, a borrowed set builds none under `thin_header` and one under the default layout, a refused or abandoned
 borrowed reservation allocates nothing; `InvalidKey`; an abandoned borrowed set is refunded once; the deadline.
 
+
+## The migration consumers spin before they park, and the fast tier drains to 0.85
+
+Two defaults that ship together (the user's decision of 2026-10-09). The figures below are all SINGLE runs on a
+heavily loaded shared box (load average 36-77 on 48 CPUs, other users busy on 13-18 of the node-0 CPUs): cluster53, 8 clients
+and tiered LRU unless noted, the batched benchmark dispatch. Each names the run directories it comes from,
+under `~/paper-cache-run/bp-promoload/` on the cxl host.
+
+- **Spin-before-park** (`migration_queue::receive`). A consumer whose channel is empty polls `try_recv` for up
+  to `MIG_SPIN_US` microseconds (`DEFAULT_SPIN_US` 50; `std::hint::spin_loop` between polls, `yield_now` every
+  64) before crossbeam's blocking `recv`. While it spins it is not registered as a waiter, so a `send` landing
+  meanwhile takes no waker lock and makes no futex wake: the policy worker's hand-off is cheaper, and with it
+  every set waiting on the worker. `MIG_SPIN_US=0` is the old behaviour exactly (an empty channel goes
+  straight to `recv`; one extra `try_recv`, which `recv` makes itself). A value that does not parse as a whole
+  number is ignored with one `paper-cache:` note on stderr and the default applies; a value above
+  `MAX_SPIN_US` (10,000 us) -- an overflowing one included -- is clamped to it with the same kind of note
+  (`spin_us_from`, the pure decision), since every microsecond of window is up to a microsecond of one CPU per
+  consumer after every burst. `None` from `receive` is exactly `recv`'s `Err` (disconnected AND empty: a
+  backlog is still handed out). The completion flush stays where it was, inside the iteration and before
+  `_done` counts the item, so `flush()`'s ordering contract is unchanged.
+- **Counters.** Each consumer keeps `RecvCounts` (spin hits, blocking `recv`s entered, time spinning, time
+  blocked) in locals and publishes deltas into its own `migstats::MqSlot` (`#[repr(align(128))]`, consumer `i`
+  in slot `i % MQ_SLOTS`, 32 slots) only on the idle path: before a spin, before a block, and at exit.
+  `blocks` is published last and `Release`, so a reader that sees a block (`Acquire`) sees the times published
+  with it. The dump appends `MIGSTATS mq_spin_us= mq_spin_hits= mq_blocks= mq_spin_ns= mq_block_ns= t_ms=` as
+  its LAST line, so every existing line keeps its place. Not in `HybridStats`.
+- **Drain target 0.85** (`drain_target::DEFAULT_RATIO`, was 0.95 since E1b; `FAST_TIER_DRAIN_TARGET` overrides
+  as before). The byte gate's headroom `B - S` is 15% of eff, and the price is the same 15% of the tier's DRAM
+  held free at rest. The drain target's doc carries the argument. `GateConfig::validate`'s `ratio + near_frac
+  < 1` now allows a near band up to just under 15%. The promotion gate's provisional `promo_frac` 0.90 is
+  above the 0.85 settle target, so its level, `min(promo_frac x eff, S)`, is S itself; it was not changed
+  (the gate is off by default).
+
+Measured, the parts:
+
+- **The spin alone** (`wake_*`: one prototype binary, `MIG_SPIN_US=50` against `0`). At 8 consumers: blocking
+  receives (`mq_blocks`) 8.26M to 1.46M; the worker's hand-off time 43.1 to 25.6 s (51.1 s on the binary before
+  the prototype); the byte gate's SET wait time 54.4 to 13.4 s; SET p99 177 to 21 us (212 us on the binary
+  before). Cost: the 8 consumers' CPU 233 to 366 CPU-seconds -- a consumer fed more often than once a window
+  never parks. At 2 consumers: hand-off 1.76 to 1.64 us per call (-7%), everything else within noise.
+- **Spin x drain target, 2 x 2 at 8 consumers** (`best_*`, the same prototype binary). SET gate waits / wait
+  time: control (no spin, 0.95) 509K / 125 s; spin only 208K / 96 s; 0.85 only 512K / 244 s, and 23% less
+  throughput -- worse than control, which is why the two are one change; spin and 0.85 together 302 / 0.3 s,
+  SET mean 22.6 to 5.2 us, at 8% less throughput than control (cause not isolated: the control ran on a less-loaded node).
+- **0.85 alone at 2 consumers** (`combo_*`): gate wait time ~8-12 s to 1.5 s, SET p99 ~26 to 17.5 us, miss
+  ratio unchanged.
+
+Measured, this commit against its clean base 1bd8941 (`v_*`, defaults only):
+
+| run | base | this commit |
+|---|---|---|
+| cluster53, 2 consumers (default): Mops | 1.760, 1.870 (repeat) | 1.719 |
+| SET mean / p99 (us) | 10.0 / 181, 14.5 / 190 | 8.7 / 157 |
+| SET gate waits, worst wait | 141K, 350K; 30-34 ms | 156K; 9.2 ms |
+| fast-hit share | 0.9485, 0.9438 | 0.9383 |
+| `queue_depth_max` | 33K | 103K |
+| cluster53, 8 consumers: Mops | 1.512 | 1.908 |
+| SET mean / p99 (us) | 24.3 / 396 | 7.9 / 23 |
+| SET gate waits, worst wait | 334K; 39 ms | 31K; 92 ms |
+| GET p99 (us) | 11.4 | 14.6 |
+| fast-hit share | 0.944 | 0.930 |
+| migration CPU (CPU-s) | 233 | 339 |
+| cluster26, 2 consumers | gate waits 114 | 0; latencies within 2% |
+| cluster53, 1 client, 2 consumers | | within 2%; migration CPU 139 to 184 CPU-s |
+| cluster53 LFU, 2 consumers: Mops | 1.578 | 1.703 (GET mean -21%) |
+| LFU fast-hit share, miss ratio | 0.548, 0.0291 | 0.642, 0.0299 (one pair, borderline) |
+
+The costs, next to those gains: the LRU fast-hit share falls 0.5 to 1.4 points (the tier rests 10 points
+lower); migration CPU rises 33% (1 client) to 45% (8 consumers); at 2 consumers the queue's deepest backlog
+triples (33K to 103K entries) and throughput is not better (1.719 against a base pair of 1.760 and 1.870); at
+8 consumers GET p99 rises 28% (11.4 to 14.6 us) and the worst single gate wait goes from 39 to 92 ms, though
+there are a tenth as many. **8 consumers** (`MIGRATION_QUEUE_THREADS=8`) is the high-concurrency option: on
+this commit it beat 2 consumers at 8 clients (1.908 against 1.719 Mops; SET p99 23 against 157 us), for twice
+the migration CPU (339 against 163 CPU-seconds, `v_c53_8c_lru_t8_new` / `v_c53_8c_lru_t2_new`), a GET p99 of
+14.6 against 11.7 us and that 92 ms worst wait. The default stays 2.
+
+Tests. New: `receive`'s phases driven directly at both spin settings (ready items take no idle path and a
+backlog outlives the disconnect; a send inside the window is a hit, not a block, and a disconnect mid-spin
+never blocks; an expired spin, or none, falls back to the blocking `recv`, and a blocked receiver sees the
+disconnect), `MIG_SPIN_US` parsing and its clamp, a real consumer that spins, blocks, lands what it is handed and exits
+(`migration_queue_tests`, at whatever `MIG_SPIN_US` the process has: the suites run it at the default and at
+0), the `mq_*` line summing every slot, and the dump-format test with the new line.
+
+No golden was re-recorded: the fingerprints, the `seen` lines and T14's hashes are what each design DOES at a
+given target, and they were recorded at 0.95. `drain_target::FIXTURE_RATIO` (0.95, test builds) names that
+level, and the tests whose byte budgets or expectations were worked out at it pin it instead of moving: on
+their own thread with `drain_target::pin` where the test drives a stack or a worker by hand (the 0.95 golden
+test, whose coverage check and recording now key on `FIXTURE_RATIO` rather than the default; T14's
+`script_lines`, `script_c` and `script_g`, so every T14 file is what it was and the LFU prefix property is now
+always checked -- the gate half's items are sized against `B - S`, and at 0.85 none would be OVERSIZE; every
+`tier_probes` test; the LFU admission and 2Q `a1_in` re-settle unit tests; the merged store's global-demotion
+fidelity test; the gate's band-ordering test), and in a child process given `FAST_TIER_DRAIN_TARGET=0.95`
+where a real cache's worker and consumers read it (`test_support::alone_at_fixture_ratio`: three byte-gate
+tests and the promotion gate's T7; `common::alone_with_env` with `AT_FIXTURE_DRAIN_TARGET`: the
+insertion-order suite's overwrite test, and the LRU, LRU-sized and LFU shared-overhead reservation tests, whose
+values would otherwise sit AT the target rather than under it). The 1.0 golden test is unchanged. Tests that pass at
+0.85 run at the default, and the comments that worked their budgets out at 0.95 were redone at 0.85 (several
+now hold by a byte: 2Q full fast-admission's `a1_in` keeps 8 at 521 B, split-slow's 39-byte main budget holds
+one 32-byte object under 33); `tests/phys_fast_identity.rs` restates the default as 0.85.

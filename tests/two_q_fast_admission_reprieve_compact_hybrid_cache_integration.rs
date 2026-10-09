@@ -82,13 +82,13 @@ mod hybrid_cache_tests {
     // `make_cache` gives a 1_600-byte fast tier of which K_IN reserves 819 for
     // the FIFO -- admission is a DRAM write in this design, so that reservation
     // is carved out of the same budget -- leaving the main queue about 781, and
-    // a drain target near 742. Ten 64-byte objects total 640 migrating bytes
+    // a drain target near 664 (0.85). Ten 64-byte objects total 640 migrating bytes
     // (the value alone; key and expiry never move), which sits UNDER it, so
     // `settle_fast_tier` never triggered, nothing demoted, and every test
     // asserting a demotion timed out.
     //
     // 256 puts ten objects at 2_560, unambiguously over: the settle holds the
-    // tier at ~742 (0.95 of the ~781-byte budget), leaving two objects fast and
+    // tier at ~664 (0.85 of the ~781-byte budget), leaving two objects fast and
     // eight slow. The FIFO
     // never sees more than one at a time (each set is followed by a get, which
     // promotes it straight out), so this does not trip `fifo_capacity` and
@@ -501,11 +501,12 @@ mod hybrid_cache_tests {
     fn ttl_survives_a_demotion() {
         ensure_pmem_allocator_warm();
 
-        // `PRESSURE_LEN`, not 64: the main queue's budget is ~781 bytes, so the
-        // drain target sits near 765, and twelve 64-byte objects come to 768
-        // migrating bytes -- a three-byte margin. This test asserts a demotion
-        // and should not rest on three bytes, so it belongs with the file's
-        // other pressure tests rather than with the ones that assert everything
+        // `PRESSURE_LEN`, not 64: the main queue's budget is ~781 bytes, and
+        // twelve 64-byte objects come to 768 migrating bytes -- over the drain
+        // target (~664 at 0.85) by about a hundred bytes, but over the ~765 of
+        // a 0.98 target by three. This test asserts a demotion and should not
+        // rest on where the target sits, so it belongs with the file's other
+        // pressure tests rather than with the ones that assert everything
         // stays fast.
         let cache = make_cache();
 

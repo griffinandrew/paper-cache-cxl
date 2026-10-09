@@ -46,6 +46,14 @@ fn alone(test: &str, body: impl FnOnce()) {
 	alone_in(module_path!(), test, body);
 }
 
+/// `alone`, at the drain target the test's levels were set against (0.95;
+/// `test_support::alone_at_fixture_ratio`): its premise is a promotion level
+/// (0.90 of eff) under the settle target, and at the 0.85 default
+/// `min(promo_frac x eff, S)` is S itself.
+fn alone_at_fixture_ratio(test: &str, body: impl FnOnce()) {
+	super::test_support::alone_at_fixture_ratio(module_path!(), test, body);
+}
+
 fn v() -> u64 {
 	phys::value_charge::<u64>(LEN as u32)
 }
@@ -527,7 +535,7 @@ fn t7_reads_do_not_overshoot_through_promotions_and_the_declined_land_when_room_
 	use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	use std::time::Duration;
 
-	alone("t7_reads_do_not_overshoot_through_promotions_and_the_declined_land_when_room_appears", || {
+	alone_at_fixture_ratio("t7_reads_do_not_overshoot_through_promotions_and_the_declined_land_when_room_appears", || {
 		let _m = test_hooks::override_m(M0);
 		let mut config = gated(Duration::from_secs(5), OnStall::Error);
 

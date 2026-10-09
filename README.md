@@ -119,13 +119,20 @@ set(k, v) ──WorkerEvent──> policy stack decides tiers
   the other tier supersedes (`split_tier_migrations`), so it can never reverse a key's own
   intents: a key promoted and demoted again in one drain used to come out demote-first and stay
   in DRAM while the stack counted it slow.
-- **Drain target.** `settle_fast_tier` holds the fast tier at `FAST_TIER_DRAIN_TARGET` (0.95) of
+- **Drain target.** `settle_fast_tier` holds the fast tier at `FAST_TIER_DRAIN_TARGET` (0.85) of
   its effective budget: it demotes whenever usage is above that level and stops the moment it is
   back at it. One threshold, not a band — a settle moves only what the event that triggered it
-  displaced. The 5% margin is headroom for the DRAM a burst of `set()`s puts down before the
+  displaced. The 15% margin is headroom for the DRAM a burst of `set()`s puts down before the
   policy worker sees it, and for demotions still queued behind `migration_queue`; it is also the
-  room under the byte gate's close level (`B - S`). It was 0.98 (2%) until the default moved to
-  give bursts more room; set `FAST_TIER_DRAIN_TARGET=0.98` to reproduce earlier results.
+  room under the byte gate's close level (`B - S`), so sets wait for demotions far less often.
+  It moved from 0.95 together with the consumers' spin-before-park (below), and the two belong
+  together: on cluster53 at 8 consumers (8 clients, tiered LRU, single runs on a heavily loaded
+  box), 0.85 with the spin took SET gate waits from 509K to 302, while 0.85 without it doubled
+  the wait time and cost 23% of throughput. The costs: the 15% of the tier's DRAM held free
+  (an LRU fast-hit share 0.5 to 1.4 points lower), 33-45% more migration CPU, and at 2
+  consumers a migration queue whose deepest backlog tripled; `HYBRID_CACHES.md`'s "Why 0.85"
+  has the figures. It was 0.95 (5%) before that and 0.98 (2%) before E1b; set
+  `FAST_TIER_DRAIN_TARGET=0.95` (or `0.98`) to reproduce earlier results.
 - **Eviction watermark.** Capacity eviction is held at `EVICTION_HIGH_WATERMARK` (0.98) of
   `max_size`, cache-wide: evictions start once `used_size` passes 98% of the cap and drain to the
   same level, one object at a time (the fast tier's shape: one threshold, not a band). It is read
@@ -142,7 +149,16 @@ set(k, v) ──WorkerEvent──> policy stack decides tiers
   perform the allocate-copy-swap off the worker. It has **one channel per consumer, indexed by
   key hash**, so two migrations for the same key can never be applied out of order. On by
   default with 2 consumers; `MIGRATION_QUEUE_THREADS=0` disables it and applies every
-  migration inline on the worker.
+  migration inline on the worker. A consumer whose channel goes empty spins for up to
+  `MIG_SPIN_US` (50 µs) before it parks, so a hand-off that arrives meanwhile costs the policy
+  worker no wake-up: at 8 consumers on cluster53 (single runs, loaded box) this cut the worker's
+  hand-off time from 43.1 to 25.6 s, the byte gate's SET wait time from 54.4 to 13.4 s and SET
+  p99 from 177 to 21 µs; at 2 consumers it moved little (hand-off -7% per call). The price is
+  CPU — a consumer fed more often than once a window never parks (366 against 233 CPU-seconds
+  for 8 consumers). `MIG_SPIN_US=0` parks at once, as before; the `MIGSTATS mq_*` line counts
+  spin hits, blocks and the time in each. `MIGRATION_QUEUE_THREADS=8` is the high-concurrency
+  option (at 8 clients 1.908 against 1.719 Mops for 2 consumers, for twice the migration CPU and
+  a GET p99 of 14.6 against 11.7 µs); the default stays 2.
 
 An earlier approach, `parallel_migration`, fanned a single *batch* across a rayon pool. It was
 measured not to help -- 99.4% of demotion volume arrives as single-object batches, so there is
@@ -298,7 +314,8 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | Variable | Default | Effect |
 |---|---|---|
 | `MIGRATION_QUEUE_THREADS` | `2` | Migration consumer count. `0` disables the queue and applies migrations inline on the worker. |
-| `FAST_TIER_DRAIN_TARGET` | `0.95` | Fraction of the effective fast-tier budget the tier is continuously held at (`0.98` before the default moved). `1.0` leaves no burst headroom. |
+| `MIG_SPIN_US` | `50` | Microseconds a migration consumer spins (`try_recv`, yielding every 64 polls) on an empty channel before it parks, at most `10000`. `0` parks at once (the behaviour before the spin). A larger value is clamped to 10,000 with a note on stderr; a value that is not a whole number is ignored with a note on stderr, and the default applies. Each µs of window can cost up to a µs of one CPU per consumer after every burst. |
+| `FAST_TIER_DRAIN_TARGET` | `0.85` | Fraction of the effective fast-tier budget the tier is continuously held at (`0.95` before the default moved, `0.98` before that). `1.0` leaves no burst headroom. |
 | `EVICTION_HIGH_WATERMARK` | `0.98` | Fraction of `max_size` above which capacity eviction starts, in `(0, 1]`. `1.0` evicts only past `max_size`, the behaviour before the 0.98 default. It is also the level above which a `set` is refused (`ExceedingValueSize`), by the object's accounted size; at `1.0`, by its base size against `max_size`, as before. |
 | `EVICTION_LOW_WATERMARK` | the high mark | Fraction of `max_size` an armed eviction pass drains to, clamped to at most the high mark. Unset, it follows the high mark: one threshold. Set below it, the pass is a band and evicts in bursts. |
 | `PAPER_GATE_MODE` | `block` | The fast-tier byte gate: `block` holds a fast set to the tier's budget and waits for demotions to free room; `off` admits fast sets ungated (the metadata cap and structural slow placement still apply). |

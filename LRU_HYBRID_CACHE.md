@@ -188,9 +188,10 @@ continuously-maintained level at the same 98% — see `HYBRID_CACHES.md`'s "The 
 margin has therefore survived all three shapes, because the reason for it never went away. What
 changed is that it is no longer paired with a separate arming threshold, so the tier holds at one
 level instead of sawtoothing down to 95%. That level was 98% until E1b, which moved it to 95%
-to give bursts more room. The window itself is shrunk by `apply_tier_migrations` running
-per-event rather than per-batch, and is measured rather than guessed at: `MIGSTATS
-pending_demote_max` reports the backlog in objects.
+to give bursts more room, and it is 85% since the migration consumers spin before they park
+(the two measured together; `HYBRID_CACHES.md`'s "Why 0.85"). The window itself is shrunk by
+`apply_tier_migrations` running per-event rather than per-batch, and is measured rather than
+guessed at: `MIGSTATS pending_demote_max` reports the backlog in objects.
 
 ## Turning "this key changed tier" into an actual byte move
 

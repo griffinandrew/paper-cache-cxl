@@ -464,7 +464,7 @@ mod dram_ceiling_tests {
 	/// asks for.
 	///
 	/// The FIFO rests at the DRAIN TARGET of its budget since S5, as main does:
-	/// four 50 B keys (200 B) fit 0.95 x 250 = 237 B, a fifth would not (it
+	/// four 50 B keys (200 B) fit 0.85 x 250 = 212 B, a fifth would not (it
 	/// was five, filling the 250 B budget exactly, before S5).
 	#[test]
 	fn shrinking_the_fast_tier_spills_the_admission_queue() {
@@ -484,7 +484,7 @@ mod dram_ceiling_tests {
 			stack.fast_bytes_used(),
 			stack.fast_capacity(),
 		);
-		assert_eq!(stack.slow_object_count(), 3, "the excess is reprieved into PMEM: one 50 B key fits 0.95 x 100 B");
+		assert_eq!(stack.slow_object_count(), 3, "the excess is reprieved into PMEM: one 50 B key fits 0.85 x 100 B");
 	}
 }
 
@@ -577,7 +577,7 @@ mod resize_tests {
 		assert_eq!(
 			stack.drain_tier_migrations(),
 			vec![(1, Tier::Slow), (2, Tier::Slow), (3, Tier::Slow), (6, Tier::Slow)],
-			"main drains to 0.95 x 2_400 B (three keys), then the FIFO to 0.95 x 600 B (its one key)",
+			"main drains to 0.85 x 2_400 B (three keys go), then the FIFO to 0.85 x 600 B (its one key)",
 		);
 	}
 
@@ -610,7 +610,7 @@ mod resize_tests {
 #[cfg(test)]
 mod full_dram_ceiling_tests {
 	use super::*;
-	use super::super::{tiered_stack::carve::shares, PolicyStack, Tier};
+	use super::super::{drain_target, tiered_stack::carve::shares, PolicyStack, Tier};
 	use crate::object::ObjectSize;
 
 	const MAX_SIZE: CacheSize = 10_000;
@@ -999,8 +999,12 @@ mod full_dram_ceiling_tests {
 	/// A re-set is a hit, and an `a1_in` hit is a no-op, so a key that GROWS
 	/// in `a1_in` stays there. `insert_resident` then re-settles `a1_in`
 	/// rather than leaving the overrun to the next admission.
+	///
+	/// At the drain target its byte counts were worked out at (0.95), pinned on
+	/// this thread: at the 0.85 default `a1_in` rests at 21 keys, not 23.
 	#[test]
 	fn re_setting_a_key_larger_in_a1_in_re_settles_a1_in() {
+		let _drain = drain_target::pin(drain_target::FIXTURE_RATIO);
 		let mut stack = stack(FITTING);
 
 		// Forty admissions: `a1_in` holds the 23 newest (2_300 B: it rests at
@@ -1184,7 +1188,7 @@ mod full_resize_tests {
 		assert_eq!(
 			stack.drain_tier_migrations(),
 			vec![(6, Tier::Slow), (1, Tier::Slow), (2, Tier::Slow), (3, Tier::Slow), (4, Tier::Slow), (5, Tier::Slow)],
-			"a1_in drains to 0.95 x 500 B (its one key goes), then am to nothing (its five)",
+			"a1_in drains to 0.85 x 500 B (its one key goes), then am to nothing (its five)",
 		);
 	}
 
