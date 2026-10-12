@@ -109,6 +109,28 @@ pub fn alone_with_env(module: &str, test: &str, env: &[(&str, &str)], body: impl
 /// (0.85 since). For a test of something other than the default.
 pub const AT_FIXTURE_DRAIN_TARGET: &[(&str, &str)] = &[("FAST_TIER_DRAIN_TARGET", "0.95")];
 
+/// `AT_FIXTURE_DRAIN_TARGET`'s ratio, as a number.
+pub const FIXTURE_DRAIN_TARGET: f64 = 0.95;
+
+/// For a body `alone_with_env` runs with `AT_FIXTURE_DRAIN_TARGET`: asserts
+/// that the CRATE runs at that drain target -- it reads the variable once,
+/// on whichever of its threads asks first -- not merely that the child's
+/// environment holds it. A body sized at 0.95 that ran at the 0.85 default
+/// tests something else, and could still pass. `published` returns a tiered
+/// cache's `effective_fast_capacity` (eff) and `band_s`, the settle target its
+/// policy worker published for eff: `drain_target::bytes(eff)`, `(eff as f64 x
+/// ratio) as u64` (0 while the byte gate is not enabled).
+pub fn assert_at_fixture_drain_target(published: impl Fn() -> (u64, u64)) {
+	let at_fixture = |(eff, band_s): (u64, u64)| eff > 0 && band_s == (eff as f64 * FIXTURE_DRAIN_TARGET) as u64;
+
+	assert!(
+		wait_until(Duration::from_secs(20), || at_fixture(published())),
+		"the child does not settle at the {FIXTURE_DRAIN_TARGET} drain target its budgets were sized at: \
+		 (eff, settle target) = {:?}",
+		published(),
+	);
+}
+
 /// `test`, of `module`, once per case of `cases` -- a policy, a design -- each
 /// in a child process of its own, in which it is the only test and only that
 /// case runs `body`.

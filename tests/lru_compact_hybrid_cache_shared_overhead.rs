@@ -176,6 +176,11 @@ mod shared_overhead_tests {
             )
             .expect("cache should construct");
 
+            crate::common::assert_at_fixture_drain_target(|| {
+                let stats = cache.hybrid_stats();
+                (stats.effective_fast_capacity, stats.band_s)
+            });
+
             for key in 1u32..=N {
                 cache.set(key, PAYLOAD, None).expect("set should succeed");
             }
