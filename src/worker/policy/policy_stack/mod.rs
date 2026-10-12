@@ -182,7 +182,8 @@ use crate::{
 /// times as deep (33K to 103K entries); at 8 consumers GET p99 +28% (11.4 to
 /// 14.6 us) and a worst single gate wait of 92 ms against 39. (LFU, one
 /// pair: 1.578 to 1.703 Mops, fast-hit share 0.548 to 0.642, miss ratio
-/// 0.0291 to 0.0299, borderline.)
+/// 0.0291 to 0.0299; three repeats each put that inside run-to-run noise:
+/// 0.0297-0.0324 on the base, 0.0292-0.0312 on these defaults.)
 ///
 /// The band the single level replaced is the counter-example, and what was
 /// wrong with it was not its depth. That 0.98/0.95 high/low pair

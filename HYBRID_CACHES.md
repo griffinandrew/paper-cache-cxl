@@ -248,7 +248,8 @@ SET mean 10.0 / 14.5 µs (base and repeat) to 8.7, SET p99 181 / 190 to 157 µs,
 30-34 to 9.2 ms, throughput 1.760 / 1.870 to 1.719 Mops; at 8 consumers 1.512 to 1.908 Mops, SET
 p99 396 to 23 µs, gate waits 334K to 31K; cluster26 gate waits 114 to 0, latencies within 2%; one
 client within 2%; LFU 1.578 to 1.703 Mops, fast-hit share 0.548 to 0.642, miss ratio 0.0291 to
-0.0299 (one pair, borderline). **The costs:** the margin itself, 15% of the tier's DRAM held free
+0.0299 in that pair -- run-to-run noise: three interleaved repeats each (`lfurep_*`) gave
+0.0297-0.0324 (mean 0.0309) on the base and 0.0292-0.0312 (mean 0.0299) on these defaults. **The costs:** the margin itself, 15% of the tier's DRAM held free
 at rest, and with it an LRU fast-hit share 0.5 to 1.4 points lower; migration CPU +33% at one
 client (139 to 184 CPU-seconds) and +45% at 8 consumers (233 to 339); at 2 consumers the queue's
 deepest backlog tripled (`queue_depth_max` 33K to 103K); at 8 consumers GET p99 rose 28% (11.4 to

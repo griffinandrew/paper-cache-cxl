@@ -3935,7 +3935,7 @@ Measured, this commit against its clean base 1bd8941 (`v_*`, defaults only):
 | cluster26, 2 consumers | gate waits 114 | 0; latencies within 2% |
 | cluster53, 1 client, 2 consumers | | within 2%; migration CPU 139 to 184 CPU-s |
 | cluster53 LFU, 2 consumers: Mops | 1.578 | 1.703 (GET mean -21%) |
-| LFU fast-hit share, miss ratio | 0.548, 0.0291 | 0.642, 0.0299 (one pair, borderline) |
+| LFU fast-hit share, miss ratio | 0.548, 0.0291 | 0.642, 0.0299 (one pair; 3 repeats each, `lfurep_*`: miss 0.0297-0.0324 base, 0.0292-0.0312 new -- noise) |
 
 The costs, next to those gains: the LRU fast-hit share falls 0.5 to 1.4 points (the tier rests 10 points
 lower); migration CPU rises 33% (1 client) to 45% (8 consumers); at 2 consumers the queue's deepest backlog
