@@ -28,7 +28,11 @@
 //! capacity (`LruSizedCompactHybridStack::reserved_shares`), so the fixture gives
 //! the large segment a minimal 1-byte capacity to concentrate the
 //! reservation on the small segment, whose values alone sit at ~85% of its
-//! budget.
+//! budget -- below the 95% settle target the fixture was sized at (E1b's
+//! default; the default is 0.85 since), which the test runs under in a child
+//! process given it (`common::alone_with_env`), as its LRU and LFU siblings do.
+
+mod common;
 
 #[cfg(feature = "lru_sized_compact_hybrid_cache")]
 mod shared_overhead_tests {
@@ -81,40 +85,45 @@ mod shared_overhead_tests {
     /// must demote, never evict.
     #[test]
     fn reservation_forces_demotion_values_alone_would_not() {
-        let s = accounted_size();
-        assert!(s < SIZE_THRESHOLD, "payload must classify small for this fixture");
+        // At the 0.95 drain target `budget` was sized against, in a child
+        // given it: at the 0.85 default the values alone would sit AT the
+        // settle target rather than safely under it.
+        crate::common::alone_with_env(module_path!(), "reservation_forces_demotion_values_alone_would_not", crate::common::AT_FIXTURE_DRAIN_TARGET, || {
+            let s = accounted_size();
+            assert!(s < SIZE_THRESHOLD, "payload must classify small for this fixture");
 
-        let budget = (u64::from(N) * s * 100).div_ceil(85);
-        assert!(
-            u64::from(N) * s * 100 <= budget * 85,
-            "fixture arithmetic drifted: {N} objects of {s} accounted bytes exceed 85% of {budget}"
-        );
+            let budget = (u64::from(N) * s * 100).div_ceil(85);
+            assert!(
+                u64::from(N) * s * 100 <= budget * 85,
+                "fixture arithmetic drifted: {N} objects of {s} accounted bytes exceed 85% of {budget}"
+            );
 
-        // A minimal (but non-zero, since 0 is rejected) large-segment
-        // capacity concentrates the reservation almost entirely on the small
-        // segment (`LruSizedCompactHybridStack::reserved_shares` splits it in
-        // proportion to each segment's capacity).
-        let cache = PaperCache::<u32, TieredBuffer>::new_sized_compact(
-            1_048_576,
-            CacheTierSize::Bytes(budget),
-            CacheTierSize::Bytes(1),
-            CacheTierSize::Bytes(SIZE_THRESHOLD),
-        )
-        .expect("cache should construct");
+            // A minimal (but non-zero, since 0 is rejected) large-segment
+            // capacity concentrates the reservation almost entirely on the small
+            // segment (`LruSizedCompactHybridStack::reserved_shares` splits it in
+            // proportion to each segment's capacity).
+            let cache = PaperCache::<u32, TieredBuffer>::new_sized_compact(
+                1_048_576,
+                CacheTierSize::Bytes(budget),
+                CacheTierSize::Bytes(1),
+                CacheTierSize::Bytes(SIZE_THRESHOLD),
+            )
+            .expect("cache should construct");
 
-        for key in 1u32..=N {
-            cache.set(key, PAYLOAD, None).expect("set should succeed");
-        }
+            for key in 1u32..=N {
+                cache.set(key, PAYLOAD, None).expect("set should succeed");
+            }
 
-        assert!(
-            wait_until(TIMEOUT, || cache.hybrid_stats().demotions >= 1),
-            "small-segment values sit at 85% of that segment's budget, so only \
-             the metadata reservation can trigger demotion -- none was observed"
-        );
+            assert!(
+                wait_until(TIMEOUT, || cache.hybrid_stats().demotions >= 1),
+                "small-segment values sit at 85% of that segment's budget, so only \
+                 the metadata reservation can trigger demotion -- none was observed"
+            );
 
-        let stats = cache.hybrid_stats();
-        assert_eq!(stats.evictions, 0, "the DRAM cap must demote, never evict");
-        let present = (1u32..=N).filter(|key| cache.has(key)).count();
-        assert_eq!(present, N as usize, "every key must survive a reservation-driven demotion");
+            let stats = cache.hybrid_stats();
+            assert_eq!(stats.evictions, 0, "the DRAM cap must demote, never evict");
+            let present = (1u32..=N).filter(|key| cache.has(key)).count();
+            assert_eq!(present, N as usize, "every key must survive a reservation-driven demotion");
+        });
     }
 }

@@ -88,13 +88,26 @@ pub fn settle<K: Copy + PartialEq, V>(
 /// (`module_path!()`), is the only test, killed at `DEADLINE`. The parent
 /// passes only if the child ran exactly that one test and it passed.
 pub fn alone(module: &str, test: &str, body: impl FnOnce()) {
+	alone_with_env(module, test, &[], body);
+}
+
+/// `alone`, with `env` set in the child: for a setting the crate reads once
+/// per process (`FAST_TIER_DRAIN_TARGET` and the like, memoised in a
+/// `OnceLock`), which a test can only choose by starting a process of its own
+/// with it. The parent's environment is untouched.
+pub fn alone_with_env(module: &str, test: &str, env: &[(&str, &str)], body: impl FnOnce()) {
 	if in_child() {
 		body();
 		return;
 	}
 
-	run_in_child(module, test, None);
+	run_in_child(module, test, None, env);
 }
+
+/// The drain target a test's byte budgets were sized at, for `alone_with_env`:
+/// 0.95, the default from E1b until the migration consumers' spin-before-park
+/// (0.85 since). For a test of something other than the default.
+pub const AT_FIXTURE_DRAIN_TARGET: &[(&str, &str)] = &[("FAST_TIER_DRAIN_TARGET", "0.95")];
 
 /// `test`, of `module`, once per case of `cases` -- a policy, a design -- each
 /// in a child process of its own, in which it is the only test and only that
@@ -113,11 +126,11 @@ pub fn each_alone<T: Copy>(module: &str, test: &str, cases: impl AsRef<[T]>, mut
 	}
 
 	for index in 0..cases.len() {
-		run_in_child(module, test, Some(index));
+		run_in_child(module, test, Some(index), &[]);
 	}
 }
 
-fn run_in_child(module: &str, test: &str, case: Option<usize>) {
+fn run_in_child(module: &str, test: &str, case: Option<usize>, env: &[(&str, &str)]) {
 	// libtest names a test by its path without the crate.
 	let name = match module.split_once("::") {
 		Some((_, module)) => format!("{module}::{test}"),
@@ -135,6 +148,10 @@ fn run_in_child(module: &str, test: &str, case: Option<usize>) {
 		.env(CHILD, "1")
 		.stdout(file.try_clone().expect("the output file, twice"))
 		.stderr(file);
+
+	for (name, value) in env {
+		command.env(name, value);
+	}
 
 	if let Some(index) = case {
 		command.env(CASE, index.to_string());
@@ -574,38 +591,46 @@ macro_rules! insertion_order_suite {
 
         #[test]
         fn overwriting_an_existing_key_does_not_reposition_it_in_the_queue() {
-            ensure_pmem_allocator_warm();
+            // At the drain target its budget was sized at (0.95; 0.85 is the
+            // default since the migration consumers spin before they park), in
+            // a child given it: 3,400 B holds three objects there and two at
+            // 0.85, so the fourth admission would demote a different key.
+            let test = "overwriting_an_existing_key_does_not_reposition_it_in_the_queue";
 
-            // Overwriting a key that is still in the fast tier must not
-            // reposition it (unlike LRU, which would move it to MRU), and a
-            // subsequent demotion must still pick the same oldest key, not
-            // whichever key was most recently overwritten.
-            //
-            // The budget holds exactly three objects and refuses a fourth. It is
-            // expressed in what an object COSTS, which is why `VALUE_LEN` is
-            // sized to make that cost a round 1 KiB in both value layouts.
-            let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(3_400), $policy)
-                .expect("cache should construct");
+            crate::common::alone_with_env(module_path!(), test, crate::common::AT_FIXTURE_DRAIN_TARGET, || {
+                ensure_pmem_allocator_warm();
 
-            cache.set(1u32, &value(0x11), None).expect("set should succeed"); // oldest
-            cache.set(2u32, &value(0x22), None).expect("set should succeed");
-            cache.set(3u32, &value(0x33), None).expect("set should succeed"); // newest
+                // Overwriting a key that is still in the fast tier must not
+                // reposition it (unlike LRU, which would move it to MRU), and a
+                // subsequent demotion must still pick the same oldest key, not
+                // whichever key was most recently overwritten.
+                //
+                // The budget holds exactly three objects and refuses a fourth. It is
+                // expressed in what an object COSTS, which is why `VALUE_LEN` is
+                // sized to make that cost a round 1 KiB in both value layouts.
+                let cache = PaperCache::<u32, TieredBuffer>::new(1_048_576, CacheTierSize::Bytes(3_400), $policy)
+                    .expect("cache should construct");
 
-            // Overwrite the oldest key. Under LRU semantics this would move it
-            // to MRU; here it must stay the oldest.
-            cache.set(1u32, &value(0x11), None).expect("overwrite should succeed");
-            assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast), "overwrite must not change tier");
+                cache.set(1u32, &value(0x11), None).expect("set should succeed"); // oldest
+                cache.set(2u32, &value(0x22), None).expect("set should succeed");
+                cache.set(3u32, &value(0x33), None).expect("set should succeed"); // newest
 
-            // A fourth admission that forces exactly one demotion should demote
-            // key 1 (still oldest by insertion order), never key 2 or key 3.
-            cache.set(4u32, &value(0x44), None).expect("set should succeed");
+                // Overwrite the oldest key. Under LRU semantics this would move it
+                // to MRU; here it must stay the oldest.
+                cache.set(1u32, &value(0x11), None).expect("overwrite should succeed");
+                assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast), "overwrite must not change tier");
 
-            assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
-            assert_eq!(cache.tier_of(&2u32), Some(Tier::Fast));
-            assert_eq!(cache.tier_of(&3u32), Some(Tier::Fast));
-            assert_eq!(cache.tier_of(&4u32), Some(Tier::Fast));
+                // A fourth admission that forces exactly one demotion should demote
+                // key 1 (still oldest by insertion order), never key 2 or key 3.
+                cache.set(4u32, &value(0x44), None).expect("set should succeed");
 
-            assert_eq!(cache.get(&1u32).unwrap(), value(0x11));
+                assert!(wait_until(MIGRATION_TIMEOUT, || cache.tier_of(&1u32) == Some(Tier::Slow)));
+                assert_eq!(cache.tier_of(&2u32), Some(Tier::Fast));
+                assert_eq!(cache.tier_of(&3u32), Some(Tier::Fast));
+                assert_eq!(cache.tier_of(&4u32), Some(Tier::Fast));
+
+                assert_eq!(cache.get(&1u32).unwrap(), value(0x11));
+            });
         }
     };
 }

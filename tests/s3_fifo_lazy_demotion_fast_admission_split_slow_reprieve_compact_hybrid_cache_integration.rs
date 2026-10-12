@@ -73,11 +73,12 @@ mod hybrid_cache_tests {
     ///
     /// 32 is the next jemalloc size class up, so a value of this length is
     /// accounted exactly as asked rather than rounded: ONE object fits each of
-    /// those budgets with room to spare, two do not. It is deliberately no
-    /// larger -- the tightest budget in this file is the 39-byte main-fast
-    /// remainder of the demotion-boundary test, whose low watermark is 37, so
-    /// the next size class up (48) would demote the very first key on its own
-    /// and break the tests that need one key to sit in the fast tier.
+    /// those budgets, two do not. It is deliberately no larger -- the tightest
+    /// budget in this file is the 39-byte main-fast remainder of the
+    /// demotion-boundary test, whose drain target is 33 (0.85 x 39: one byte
+    /// to spare), so the next size class up (48) would demote the very first
+    /// key on its own and break the tests that need one key to sit in the
+    /// fast tier.
     ///
     /// That 32 is the CHARGE, and the length that buys it depends on the value
     /// layout: under `thin_header` the length, the expiry and the key share the
@@ -311,11 +312,11 @@ mod hybrid_cache_tests {
 
         // 32-byte payloads -- see `PAYLOAD_BYTES`. The main queue's fast budget
         // here is `fast_capacity - one_access_capacity` = 80 - 40 = 40 bytes,
-        // whose high watermark is 39, and the 15-byte values this fixture used
-        // to write migrate only 16 bytes each: BOTH keys fit under that
-        // watermark, so key 1 was never demoted and never reached the
+        // whose drain target is 34 (0.85 x 40), and the 15-byte values this
+        // fixture used to write migrate only 16 bytes each: BOTH keys fit
+        // under it, so key 1 was never demoted and never reached the
         // main-queue tail this test is about. One 32-byte object fits, two do
-        // not, and demoting one lands back under the 38-byte low watermark.
+        // not, and demoting one lands back under the target.
         cache.set(1u32, &payload(1), None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));
@@ -362,12 +363,12 @@ mod hybrid_cache_tests {
             CacheTierSize::Bytes(80), PaperPolicy::S3FifoLazyDemotionFastAdmissionSplitSlowReprieveCompactHybrid(0.00004)).expect("cache should construct");
 
         // 32-byte payloads -- see `PAYLOAD_BYTES`. This test's main-fast budget
-        // is 80 - 41 = 39 bytes (high watermark 38, low 37), and two 15-byte
+        // is 80 - 41 = 39 bytes (drain target 33, 0.85 x 39), and two 15-byte
         // values migrate only 32 bytes between them, so promoting key 2 never
         // triggered a demotion pass at all and the demotion-boundary reprieve
         // this test exists to observe never ran. One 32-byte object fits under
-        // the high watermark, two do not, and demoting exactly one lands back
-        // under the low watermark.
+        // the target, two do not, and demoting exactly one lands back under
+        // it.
         cache.set(1u32, &payload(1), None).expect("set should succeed");
         cache.get(&1u32).expect("get should succeed");
         assert_eq!(cache.tier_of(&1u32), Some(Tier::Fast));

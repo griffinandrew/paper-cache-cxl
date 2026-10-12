@@ -312,10 +312,10 @@ mod hybrid_cache_tests {
         // the expiry, which are DRAM-resident in either tier), so a 15-byte
         // payload costs 16 rather than the ~36 of its whole `base_size`. A
         // main budget of 40 therefore held BOTH keys -- 32 bytes never
-        // crossed the 0.95 drain target -- so promoting key 2 demoted
-        // nothing and the wait for key 1 to reach Slow timed out. At 20 the
-        // watermarks land where the fixture always assumed: one 16-byte
-        // object sits under the 19-byte high mark, two do not, and the pass
+        // crossed its drain target -- so promoting key 2 demoted nothing and
+        // the wait for key 1 to reach Slow timed out. At 20 the drain target
+        // lands where the fixture always assumed: one 16-byte object sits
+        // under the 17-byte target (0.85 x 20), two do not, and the pass
         // drains back to one.
         let cache = PaperCache::<u32, TieredBuffer>::new(
             4_096,
@@ -366,8 +366,8 @@ mod hybrid_cache_tests {
         //
         // The fixture this test's siblings in the midpoint and split-slow
         // files use: each payload is charged exactly 32 bytes (`payload`), one
-        // fits under the 38-byte high watermark, two do not, and a single
-        // demotion drains back under the 37-byte low one. It used to pair a
+        // fits under the 33-byte drain target (0.85 x 39), two do not, and a
+        // single demotion drains back under it. It used to pair a
         // 15-byte payload, charged 16, with a 20-byte main budget -- a charge
         // only the default layout can make. Under `thin_header` the length,
         // the expiry and the key share the value's allocation, so the

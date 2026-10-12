@@ -25,7 +25,9 @@
 //! fast-tier budget that puts the values at ~85% of it -- safely below the
 //! 95% settle target, so with the reservation zeroed NO demotion could
 //! occur. Any demotion the test then observes is attributable only to the
-//! per-object metadata reservation.
+//! per-object metadata reservation. 95% is the drain target the fixture was
+//! sized at (E1b's default; the default is 0.85 since), and the test runs in a
+//! child process given it (`common::alone_with_env`).
 //!
 //! Since S5 the default reservation is the MEASURED model's -- the cache's own
 //! structures' bytes, M -- and a new key whose metadata would not fit the
@@ -35,6 +37,8 @@
 //! under its ceiling (`N x omega <= F`) with a payload large enough for it;
 //! the measured model's settle is the lib's
 //! `the_measured_model_settles_on_the_published_m`.
+
+mod common;
 
 #[cfg(feature = "lru_compact_hybrid_cache")]
 mod shared_overhead_tests {
@@ -157,32 +161,37 @@ mod shared_overhead_tests {
     /// ceiling (`budget`).
     #[test]
     fn reservation_forces_demotion_values_alone_would_not() {
-        let (s, omega) = accounted(PaperPolicy::LruCompactHybrid);
-        let budget = budget(s, omega);
+        // At the 0.95 drain target `budget` was sized against, in a child
+        // given it: at the 0.85 default the values alone would sit AT the
+        // settle target rather than safely under it.
+        crate::common::alone_with_env(module_path!(), "reservation_forces_demotion_values_alone_would_not", crate::common::AT_FIXTURE_DRAIN_TARGET, || {
+            let (s, omega) = accounted(PaperPolicy::LruCompactHybrid);
+            let budget = budget(s, omega);
 
-        let cache = PaperCache::<u32, TieredBuffer>::new_with_gate(
-            1_048_576,
-            CacheTierSize::Bytes(budget),
-            PaperPolicy::LruCompactHybrid,
-            per_object(),
-        )
-        .expect("cache should construct");
+            let cache = PaperCache::<u32, TieredBuffer>::new_with_gate(
+                1_048_576,
+                CacheTierSize::Bytes(budget),
+                PaperPolicy::LruCompactHybrid,
+                per_object(),
+            )
+            .expect("cache should construct");
 
-        for key in 1u32..=N {
-            cache.set(key, PAYLOAD, None).expect("set should succeed");
-        }
+            for key in 1u32..=N {
+                cache.set(key, PAYLOAD, None).expect("set should succeed");
+            }
 
-        assert!(
-            wait_until(TIMEOUT, || cache.hybrid_stats().demotions >= 1),
-            "values sit at 85% of the fast budget, so only the metadata \
-             reservation can trigger demotion -- and none was observed"
-        );
+            assert!(
+                wait_until(TIMEOUT, || cache.hybrid_stats().demotions >= 1),
+                "values sit at 85% of the fast budget, so only the metadata \
+                 reservation can trigger demotion -- and none was observed"
+            );
 
-        // The reservation responds with demotions only: nothing is evicted,
-        // every key survives.
-        let stats = cache.hybrid_stats();
-        assert_eq!(stats.evictions, 0, "the DRAM cap must demote, never evict");
-        let present = (1u32..=N).filter(|key| cache.has(key)).count();
-        assert_eq!(present, N as usize, "every key must survive a reservation-driven demotion");
+            // The reservation responds with demotions only: nothing is evicted,
+            // every key survives.
+            let stats = cache.hybrid_stats();
+            assert_eq!(stats.evictions, 0, "the DRAM cap must demote, never evict");
+            let present = (1u32..=N).filter(|key| cache.has(key)).count();
+            assert_eq!(present, N as usize, "every key must survive a reservation-driven demotion");
+        });
     }
 }

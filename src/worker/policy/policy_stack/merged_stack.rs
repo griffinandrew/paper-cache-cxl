@@ -480,8 +480,15 @@ mod global_demotion_fidelity {
 		}
 	}
 
+	/// At the drain target `FAST_CAPACITY` was last checked against (0.95),
+	/// pinned on this thread, which drives both structures: at the 0.85
+	/// default the settle target (748,000 B) is under the large objects alone
+	/// (819,200 B), so the budget bites in them and not in the cold ones.
 	#[test]
 	fn demotion_victims_are_the_globally_oldest_fast_objects() {
+		use crate::worker::policy::policy_stack::drain_target;
+
+		let _drain = drain_target::pin(drain_target::FIXTURE_RATIO);
 		let cold: Vec<HashedKey> = (1..=N_SMALL).map(|i| in_shard(COLD_SHARD, i)).collect();
 		let hot: Vec<HashedKey> =
 			(1..=N_LARGE).map(|i| in_shard(HOT_SHARD, 1_000_000 + i)).collect();

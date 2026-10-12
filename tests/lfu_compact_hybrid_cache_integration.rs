@@ -149,7 +149,7 @@ mod hybrid_cache_tests {
         assert_eq!(cache.hybrid_stats().demotions, 0, "nothing should have demoted yet");
 
         // Room for 2.5 objects: three residents put `fast_used` above the
-        // drain target (0.95 x 2.5 = 2.375 objects), so a pass runs; it
+        // drain target (0.85 x 2.5 = 2.125 objects), so a pass runs; it
         // drains to that same target, which the two survivors already
         // satisfy -- exactly one demotion.
         cache.set_fast_tier_size(CacheTierSize::Bytes(per_object * 5 / 2))

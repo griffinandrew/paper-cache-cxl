@@ -22,16 +22,27 @@
 //!
 //! The counter is the index's own, in test builds (`arena_index::probes`), and
 //! per thread, so the tests do not disturb one another.
+//!
+//! The figures were measured at a drain target of 0.95 (E1b's default; 0.85
+//! since), and the tiers are sized against it -- 4,500 bytes holds four of the
+//! 1,000-byte keys at 0.95 and three at 0.85 -- so each test pins it on its
+//! thread (`at_the_fixture_ratio`).
 
 use std::ops::RangeInclusive;
 
 use super::{
-	arena_index::probes,
+	arena_index::probes, drain_target,
 	ClockCompactHybridStack, FifoCompactHybridStack, HashedKey, LruCompactHybridStack, PolicyStack,
 	S3FifoCompactHybridStack, S3FifoGhostLazyDemotionCompactHybridStack, S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack,
 	TwoQCompactHybridStack,
 	TwoQFastAdmissionReprieveCompactHybridStack, TwoQFullFastAdmissionCompactHybridStack,
 };
+
+/// Holds this thread at the drain target the figures were measured at,
+/// until the guard drops.
+fn at_the_fixture_ratio() -> drain_target::Pinned {
+	drain_target::pin(drain_target::FIXTURE_RATIO)
+}
 
 /// Runs `op` and holds the probes it makes to `most`.
 fn within<R>(what: &str, most: u64, op: impl FnOnce() -> R) {
@@ -64,6 +75,8 @@ fn four_in_main(stack: &mut dyn PolicyStack) {
 /// LRU: the whole cache fast, and then a tier that holds four of eight keys.
 #[test]
 fn lru() {
+	let _drain = at_the_fixture_ratio();
+
 	let mut stack = LruCompactHybridStack::new(100_000);
 
 	fill(&mut stack, 1..=8);
@@ -88,6 +101,8 @@ fn lru() {
 
 #[test]
 fn fifo() {
+	let _drain = at_the_fixture_ratio();
+
 	let mut stack = FifoCompactHybridStack::new(100_000);
 
 	fill(&mut stack, 1..=8);
@@ -98,6 +113,8 @@ fn fifo() {
 
 #[test]
 fn clock() {
+	let _drain = at_the_fixture_ratio();
+
 	let mut stack = ClockCompactHybridStack::new(100_000);
 
 	fill(&mut stack, 1..=8);
@@ -114,6 +131,8 @@ fn clock() {
 /// 2Q: a slow FIFO in front of a main queue whose head is the tier.
 #[test]
 fn two_q() {
+	let _drain = at_the_fixture_ratio();
+
 	let mut stack = TwoQCompactHybridStack::new(0.5, 1_000_000, 100_000);
 
 	fill(&mut stack, 1..=8);
@@ -137,6 +156,8 @@ fn two_q() {
 /// tier; a hit in main sets a bit, and eviction acts on it.
 #[test]
 fn s3_fifo() {
+	let _drain = at_the_fixture_ratio();
+
 	let mut stack = S3FifoCompactHybridStack::new(0.1, 1_000_000, 100_000);
 
 	fill(&mut stack, 1..=8);
@@ -171,6 +192,8 @@ fn s3_fifo() {
 /// fresh start instead of demoting it.
 #[test]
 fn s3_fifo_with_lazy_demotion() {
+	let _drain = at_the_fixture_ratio();
+
 	let mut stack = S3FifoGhostLazyDemotionCompactHybridStack::new(0.1, 1_000_000, 4_500);
 
 	four_in_main(&mut stack);
@@ -193,6 +216,8 @@ fn s3_fifo_with_lazy_demotion() {
 /// straight back out), then a FIFO of 4,500 B in a tier of 10,000 B.
 #[test]
 fn two_q_fast_admission_reprieve() {
+	let _drain = at_the_fixture_ratio();
+
 	let mut stack = TwoQFastAdmissionReprieveCompactHybridStack::new(0.5, 1_000_000, 100_000);
 
 	fill(&mut stack, 1..=8);
@@ -244,6 +269,8 @@ fn two_q_fast_admission_reprieve() {
 /// main fast.
 #[test]
 fn s3_fifo_with_lazy_demotion_and_fast_admission() {
+	let _drain = at_the_fixture_ratio();
+
 	let mut stack = S3FifoGhostLazyDemotionFastAdmissionCompactHybridStack::new(0.5, 1_000_000, 100_000);
 
 	fill(&mut stack, 1..=8);
@@ -309,6 +336,8 @@ fn s3_fifo_with_lazy_demotion_and_fast_admission() {
 /// in a tier of 10,000 B.
 #[test]
 fn two_q_full_fast_admission() {
+	let _drain = at_the_fixture_ratio();
+
 	let mut stack = TwoQFullFastAdmissionCompactHybridStack::new(0.5, 0.5, 1_000_000, 100_000);
 
 	fill(&mut stack, 1..=8);

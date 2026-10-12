@@ -135,7 +135,8 @@ use crate::{
 };
 
 /// The level the fast tier is continuously held at, as a fraction of its
-/// effective budget: 0.95 by default (E1b; it was 0.98 until then).
+/// effective budget: 0.85 by default (since the migration consumers spin
+/// before they park; 0.95 from E1b until then, 0.98 before E1b).
 ///
 /// `settle_fast_tier` demotes whenever `fast_used` is above
 /// `ratio * effective_capacity` and stops the moment it is back at it. ONE
@@ -151,45 +152,110 @@ use crate::{
 /// `migration_queue` consumer runs it. Real DRAM therefore sits above what the
 /// stack believes for as long as those two windows last. Held at exactly its
 /// ceiling, a tier has nowhere for that overshoot to go but outside the
-/// budget; held at 0.95, it lands inside.
+/// budget; held at 0.85, it lands inside.
 ///
-/// Why 0.95, and not the 0.98 this was: the user asked for more room to
-/// absorb bursts. The byte gate (S5) holds a settled tier at
-/// `S = ratio * eff` and admits a fast set up to `B = eff + slack`, so what a
-/// burst can land in before the gate closes is `B - S`: 5% of `eff` at 0.95
-/// (with the default zero slack), 2% at 0.98. It is the depth of the margin
-/// that changed, not its shape: one continuous level, one object at a time.
+/// The byte gate (S5) holds a settled tier at `S = ratio * eff` and admits a
+/// fast set up to `B = eff + slack`, so what a burst can land in before the
+/// gate closes is `B - S`: 15% of `eff` at 0.85 (with the default zero
+/// slack), 5% at 0.95, 2% at 0.98. Each move changed the depth of the
+/// margin, not its shape: one continuous level, one object at a time. The
+/// price is the same margin of the tier's DRAM held free at rest.
 ///
-/// The band this replaced is the counter-example, and what was wrong with it
-/// was not its 5% of depth. That 0.98/0.95 high/low pair
+/// Why 0.85, and not the 0.95 this was: measured on cluster53 (8 clients,
+/// the batched benchmark, tiered LRU; single runs on a heavily loaded shared
+/// host). At 2 migration consumers, 0.85 alone took the gate's SET wait time
+/// from ~8-12 s to 1.5 s and SET p99 from ~26 to 17.5 us, with the miss
+/// ratio unchanged (run dirs `combo_*`). At 8 consumers (`best_*`, a 2 x 2):
+/// control 509K SET gate waits / 125 s, the consumers' spin-before-park
+/// (`migration_queue::receive`) alone 208K / 96 s, 0.85 alone 512K / 244 s
+/// and 23% less throughput (the cause was not isolated), and the two
+/// together 302 / 0.3 s, SET mean 22.6 to 5.2 us, at 8% less throughput
+/// than control (cause not isolated: the control ran on a less-loaded node). That is why they are one default.
+///
+/// Against the build before both (`v_*`, defaults only): at the default 2
+/// consumers SET mean 10.0 / 14.5 us (base and repeat) to 8.7, SET p99 181 /
+/// 190 to 157 us, the worst gate wait 30-34 to 9.2 ms, throughput 1.760 /
+/// 1.870 to 1.719 Mops; at 8 consumers 1.512 to 1.908 Mops, SET p99 396 to
+/// 23 us, gate waits 334K to 31K. The costs, beside the margin itself: an LRU
+/// fast-hit share 0.5 to 1.4 points lower; migration CPU +33% at one client
+/// and +45% at 8 consumers; at 2 consumers a deepest queue backlog three
+/// times as deep (33K to 103K entries); at 8 consumers GET p99 +28% (11.4 to
+/// 14.6 us) and a worst single gate wait of 92 ms against 39. (LFU, one
+/// pair: 1.578 to 1.703 Mops, fast-hit share 0.548 to 0.642, miss ratio
+/// 0.0291 to 0.0299, borderline.)
+///
+/// The band the single level replaced is the counter-example, and what was
+/// wrong with it was not its depth. That 0.98/0.95 high/low pair
 /// (`FAST_TIER_LOW_WATER_RATIO`; see `LRU_HYBRID_CACHE.md`) ARMED at 0.98 and
 /// only then drained to 0.95 in one go, which emitted the drop as one burst
 /// of demotions -- ~3% of the budget in a single `apply_tier_migrations`
-/// batch -- on every pass. A single threshold at 0.95 pays the same 5% of the
-/// tier once, as a standing margin, and never emits that burst. The single
-/// threshold first kept the band's upper mark (0.98) as its level; this takes
-/// the lower one, on purpose.
+/// batch -- on every pass. A single threshold holds its margin standing, and
+/// never emits that burst. It first kept the band's upper mark (0.98) as its
+/// level, E1b took the lower one (0.95), and 0.85 is below both.
 ///
 /// The gate's bands follow the ratio, and `GateConfig::validate` requires
 /// `ratio + near_frac < 1` so the settle target stays below the near level:
-/// at 0.95 the near band may be up to (just under) 5% of `eff`, against the
+/// at 0.85 the near band may be up to (just under) 15% of `eff`, against the
 /// default 1%.
 ///
-/// `FAST_TIER_DRAIN_TARGET=0.98` restores the previous default and `=1.0`
-/// holds the tier at exactly its ceiling, which is the no-headroom behaviour.
-/// The published results were measured at 0.98; S10 rebaselines them.
+/// `FAST_TIER_DRAIN_TARGET=0.95` restores the previous default (`=0.98` the
+/// one before it) and `=1.0` holds the tier at exactly its ceiling, which is
+/// the no-headroom behaviour. The published results were measured at 0.98;
+/// S10 rebaselines them.
 #[cfg(any(test, not(feature = "merged_object_store"), feature = "hybrid_cache_common"))]
 pub mod drain_target {
 	use std::sync::OnceLock;
 
-	pub const DEFAULT_RATIO: f64 = 0.95;
+	pub const DEFAULT_RATIO: f64 = 0.85;
 
 	static RATIO: OnceLock<f64> = OnceLock::new();
 
+	/// Test builds: the ratio the goldens (`tier_goldens.txt`: the
+	/// fingerprints, the `seen` lines, T14's script hashes) and the byte-exact
+	/// fixtures were recorded and sized at -- E1b's default, the one before
+	/// this. What those tests pin is a design's behaviour, not the default, so
+	/// they pin this ratio (`pin`, or `test_support::alone_at_fixture_ratio`
+	/// for a test whose cache runs its own threads) rather than being
+	/// re-recorded at the new one.
+	#[cfg(test)]
+	pub const FIXTURE_RATIO: f64 = 0.95;
+
+	#[cfg(test)]
+	thread_local! {
+		static PINNED: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+	}
+
+	/// Test builds: holds THIS thread at `ratio`, whatever the process's, until
+	/// the guard drops. For a test that drives a stack by hand on its own
+	/// thread, where every settle reads the ratio; a cache's policy worker and
+	/// consumers are threads of their own, which this does not reach.
+	#[cfg(test)]
+	#[must_use]
+	pub fn pin(ratio: f64) -> Pinned {
+		Pinned(PINNED.with(|cell| cell.replace(Some(ratio))))
+	}
+
+	/// The guard `pin` returns: puts back what the thread had.
+	#[cfg(test)]
+	pub struct Pinned(Option<f64>);
+
+	#[cfg(test)]
+	impl Drop for Pinned {
+		fn drop(&mut self) {
+			PINNED.with(|cell| cell.set(self.0));
+		}
+	}
+
 	/// Read once through a `OnceLock`, so the env var is startup configuration
 	/// rather than runtime adjustable. A value that fails to parse or falls
-	/// outside `(0.0, 1.0]` is silently replaced by the default.
+	/// outside `(0.0, 1.0]` is silently replaced by the default. (Test builds:
+	/// a thread `pin`ned answers its pin.)
 	pub fn ratio() -> f64 {
+		#[cfg(test)]
+		if let Some(ratio) = PINNED.with(std::cell::Cell::get) {
+			return ratio;
+		}
+
 		*RATIO.get_or_init(|| {
 			std::env::var("FAST_TIER_DRAIN_TARGET")
 				.ok()

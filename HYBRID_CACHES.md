@@ -91,6 +91,22 @@ consumer threads** (`mig-N`, 2 by default) perform the allocate-copy-swap. Setti
 `MIGRATION_QUEUE_THREADS=0` disables the queue, and the worker runs the identical body inline
 instead.
 
+A consumer whose channel goes empty **spins before it parks** (`migration_queue::receive`): it
+polls `try_recv` for up to `MIG_SPIN_US` (50 µs by default; `std::hint::spin_loop` between polls,
+`yield_now` every 64) and only then enters crossbeam's blocking `recv`. A consumer that parks after
+every item makes every hand-off a futex wake on the policy worker's `send`, which is the worker's
+time and so every waiting set's; one still spinning when the next item lands costs the `send`
+nothing. Measured with one prototype binary at `MIG_SPIN_US=50` against `0` (cluster53, 8
+clients, batched benchmark, tiered LRU; single runs on a heavily loaded shared box; run dirs
+`wake_*`), at 8 consumers: blocking receives (`mq_blocks`) 8.26M to 1.46M, the worker's hand-off
+time 43.1 to 25.6 s, the byte gate's SET wait time 54.4 to 13.4 s, SET p99 177 to 21 µs; at 2
+consumers the hand-off fell from 1.76 to 1.64 µs per call (-7%) and the rest moved within noise.
+The price is CPU: a consumer fed more often than once a window never parks (the 8 consumers used
+366 CPU-seconds against 233 without the spin). `MIG_SPIN_US=0` parks at once, as before; the
+window is capped at 10,000 µs (`MAX_SPIN_US`; a larger value is clamped, with a note on stderr).
+The `MIGSTATS mq_*` line, last in the dump, sums the consumers' spin hits,
+blocking `recv`s and the time spent in each.
+
 The queue keeps **one channel per consumer, indexed by key hash**. A single shared channel with
 N consumers would let two migrations for the *same* key be applied out of order: a demote and a
 following promote could be picked up concurrently, and whichever won the shard lock last would
@@ -188,7 +204,8 @@ once let the gauges go stale indefinitely.
 ### The drain target
 
 `settle_fast_tier` holds the fast tier at **`drain_target::ratio()` of its effective budget**
-— `DEFAULT_RATIO = 0.95` (0.98 until E1b), overridable at startup via `FAST_TIER_DRAIN_TARGET`. It demotes
+— `DEFAULT_RATIO = 0.85` (0.95 from E1b until the consumers' spin-before-park, 0.98 before E1b),
+overridable at startup via `FAST_TIER_DRAIN_TARGET`. It demotes
 whenever `fast_used` is above that level and stops the moment it is back at it.
 
 **One threshold, not a band.** There is no arm-here / drain-to-there gap, so a settle moves only
@@ -206,19 +223,45 @@ it as the reservation grew, still rests at or under its drain target after each 
 admission gate is the same shape: `fast_used + migrating <= drain_target(F - (L + 1) x omega)`
 (or `F - M` under the measured model), in the stacks' own unit, in both stores.
 
-**The margin is burst headroom, and it is the whole reason the ratio is not 1.0** -- 5% of the
-effective budget at 0.95, 2% at the 0.98 this was until E1b, which the user judged too little room
-to absorb bursts (the byte gate admits up to `B = eff + slack` and holds a settled tier at
-`S = ratio x eff`, so `B - S` is the room a burst has before the gate closes). `PaperCache::set()`
+**The margin is burst headroom, and it is the whole reason the ratio is not 1.0** -- 15% of the
+effective budget at 0.85; 5% at 0.95, from E1b; 2% at the 0.98 this was until E1b, which the
+user judged too little room to absorb bursts (the byte gate admits up to `B = eff + slack` and
+holds a settled tier at `S = ratio x eff`, so `B - S` is the room a burst has before the gate
+closes). `PaperCache::set()`
 writes a new object's bytes to DRAM synchronously at the API layer, before the event reaches
 `PolicyWorker` at all; and a demotion the stack decides is not physically applied until a
 `migration_queue` consumer runs it. Real DRAM therefore sits above what the stack believes for
 as long as those two windows last — `MIGSTATS pending_demote_max` measures the second one
 directly. Held at exactly its ceiling, a tier has nowhere for that overshoot to go but *outside*
-the budget. Held at 0.95, it lands inside.
+the budget. Held at 0.85, it lands inside.
+
+**Why 0.85.** Measured on cluster53 (8 clients, batched benchmark, tiered LRU; single runs on a
+heavily loaded shared box) against 0.95. At 2 consumers, 0.85 alone took the gate's SET wait time
+from ~8-12 s to 1.5 s and SET p99 from ~26 to 17.5 µs, with the miss ratio unchanged (`combo_*`).
+At 8 consumers (`best_*`, 2 x 2): control 509K SET gate waits / 125 s; the spin alone 208K / 96 s;
+0.85 alone 512K / 244 s and 23% less throughput -- worse than control, which is why the two ship
+together; both 302 / 0.3 s, SET mean 22.6 to 5.2 µs, for 8% less throughput than control (cause not isolated:
+the control ran on a less-loaded node).
+
+Against its clean base (`v_*`, defaults only), the change that shipped: at the default 2 consumers
+SET mean 10.0 / 14.5 µs (base and repeat) to 8.7, SET p99 181 / 190 to 157 µs, the worst gate wait
+30-34 to 9.2 ms, throughput 1.760 / 1.870 to 1.719 Mops; at 8 consumers 1.512 to 1.908 Mops, SET
+p99 396 to 23 µs, gate waits 334K to 31K; cluster26 gate waits 114 to 0, latencies within 2%; one
+client within 2%; LFU 1.578 to 1.703 Mops, fast-hit share 0.548 to 0.642, miss ratio 0.0291 to
+0.0299 (one pair, borderline). **The costs:** the margin itself, 15% of the tier's DRAM held free
+at rest, and with it an LRU fast-hit share 0.5 to 1.4 points lower; migration CPU +33% at one
+client (139 to 184 CPU-seconds) and +45% at 8 consumers (233 to 339); at 2 consumers the queue's
+deepest backlog tripled (`queue_depth_max` 33K to 103K); at 8 consumers GET p99 rose 28% (11.4 to
+14.6 µs) and the worst single gate wait went from 39 to 92 ms, though there were a tenth as many.
+
+`MIGRATION_QUEUE_THREADS=8` is the high-concurrency option: at 8 clients it measured 1.908 Mops
+and a 23 µs SET p99 against 1.719 and 157 µs at 2 consumers on the same build, for twice the
+migration CPU (339 against 163 CPU-seconds), a GET p99 of 14.6 against 11.7 µs and that 92 ms
+worst wait. The default stays 2.
 
 **What was removed is the band, not the margin.** (The single threshold first kept the band's
-upper mark, 0.98, as its level; since E1b it takes the lower one, 0.95, on purpose.) A 0.98 / 0.95 pair
+upper mark, 0.98, as its level; E1b took the lower one, 0.95, on purpose, and the level is 0.85,
+below both, since the consumers spin before they park.) A 0.98 / 0.95 pair
 (`FAST_TIER_HIGH_WATERMARK` / `FAST_TIER_LOW_WATERMARK`) armed at 0.98 and only then drained to
 0.95. That cost 5% of the allocation at the bottom of every sawtooth — headroom the workload
 never got to use — and emitted the drop as one burst: ~3% of the budget in a single
@@ -247,7 +290,8 @@ until E1, and the published results were measured there. `EVICTION_HIGH_WATERMAR
 #### Measured
 
 (At the 0.98 default of the time; the 0.95 arm below is the one E1b made the default, and its
-cost is the 5% of fast-tier occupancy it shows.)
+cost is the 5% of fast-tier occupancy it shows. The 0.85 default came later, with its own
+measurements: "Why 0.85" above.)
 
 cluster13, 750 MB slice, 30M records, 12 GB cache, 4 GiB fast tier, `-c 1`, `USE_GET_INTO=0`.
 The four ratio arms are ONE binary driven by `FAST_TIER_DRAIN_TARGET`, so nothing separates them

@@ -48,8 +48,11 @@
 //! have one, three ratios (the 2Q and S3-FIFO probation share of `max_size`:
 //! small enough that a carve-out fits the tier, about equal to it, and
 //! larger; promote_k for LRU-LFU; the size threshold for LruSized). The drain
-//! target (`FAST_TIER_DRAIN_TARGET`) is read once per process, so the 0.95
-//! default and 1.0 are two tests, the second in a child process.
+//! target is recorded at two levels: 0.95 (E1b's default,
+//! `drain_target::FIXTURE_RATIO`, which the first test pins on its own thread
+//! -- the default is 0.85 since, and what a design does at 0.95 is still what
+//! it did) and 1.0 (`FAST_TIER_DRAIN_TARGET`, read once per process, so in a
+//! child process).
 //!
 //! Wider universes follow: `w3` (600 keys) and `w4` (2,000), each at three
 //! fast tiers (8, 24 and 64 KiB) and the same reservations and ratios, and
@@ -58,7 +61,7 @@
 //! budget, and nothing has settled it yet, shows: a `resize` of the cache that
 //! also settles, for one, which the two seeds above show in the S3-FIFO
 //! designs alone, and these show in 2Q, 2Q-ghost, LRU, FIFO and CLOCK as well
-//! (by one or two runs each; LRU's only in `w0`, at the default target). They
+//! (by one or two runs each; LRU's only in `w0`, at the 0.95 target). They
 //! are drawn the way the widened differential against the legacy stacks drew
 //! its seeds (an xorshift from `0x9E37_79B9_7F4A_7C15`; the number in the name
 //! is the place in that list), so each of them was recorded on the stacks the
@@ -73,7 +76,7 @@
 //!     from a build of each tree, and diff the two: the first differing line is
 //!     the first operation at which they disagree.
 //!   * `PAPER_TIER_GOLDEN_OUT=<dir>` records instead of checking: it writes
-//!     `<dir>/drain-<ratio>.txt` (the fingerprints, and at the default target
+//!     `<dir>/drain-<ratio>.txt` (the fingerprints, and at the 0.95 target
 //!     the `seen` lines below), runs every configuration twice to show the
 //!     recording is deterministic, and T14's scripts (`t14x_*` in
 //!     `s4_tests.rs`, which ask [`check_script`] for their hashes) each write
@@ -82,7 +85,7 @@
 //!     stack's paths from outside (see [`Event`]), and the events a design
 //!     reached when this was recorded are listed in `tier_goldens.txt` as
 //!     `seen <design> <event>`. A design that stops reaching one fails the
-//!     default-target test, so a change to the stream cannot quietly turn a
+//!     0.95 test, so a change to the stream cannot quietly turn a
 //!     golden into a test of less. That a golden is SENSITIVE to what happens
 //!     inside a path is shown by mutating the stacks, not by this table.
 //!   * `admission::the_clients_build_tier_is_what_every_design_does_to_a_set`:
@@ -1118,7 +1121,7 @@ fn check_at(ratio: f64) {
 	assert_eq!(
 		drain_target::ratio(),
 		ratio,
-		"these fingerprints are for FAST_TIER_DRAIN_TARGET {ratio}; unset it (or run the `of_one` test, which sets it)",
+		"these fingerprints are for a drain target of {ratio}: the 0.95 test pins it, the `of_one` test's child sets it",
 	);
 
 	let (results, coverage) = record();
@@ -1135,8 +1138,8 @@ fn check_at(ratio: f64) {
 			let _ = writeln!(text, "{} {design} {config} {fingerprint:016x}", label(ratio));
 		}
 
-		// What each design's runs reached (once, at the default target).
-		if ratio == drain_target::DEFAULT_RATIO {
+		// What each design's runs reached (once, at the first target).
+		if ratio == drain_target::FIXTURE_RATIO {
 			for (design, seen) in &coverage {
 				for event in (0..EVENTS).filter(|&i| seen[i] > 0) {
 					let _ = writeln!(text, "seen {design} {}", EVENT_NAMES[event]);
@@ -1173,7 +1176,7 @@ fn check_at(ratio: f64) {
 
 	// Every path a design's runs reached when this was recorded is still
 	// reached: the stream cannot be edited into a test of less.
-	if ratio == drain_target::DEFAULT_RATIO && std::env::var_os("PAPER_TIER_GOLDEN_ONLY").is_none() {
+	if ratio == drain_target::FIXTURE_RATIO && std::env::var_os("PAPER_TIER_GOLDEN_ONLY").is_none() {
 		let mut lost = Vec::new();
 
 		for line in RECORDED.lines().filter(|line| line.starts_with("seen ")) {
@@ -1252,9 +1255,14 @@ mod tests {
 	use super::*;
 	use crate::worker::policy::test_support::alone_in_with_env;
 
+	/// At 0.95, the target the fingerprints were recorded at, pinned on this
+	/// thread (the runs drive the stacks on it): the default has moved since
+	/// (0.85), and what a design does at a given target has not.
 	#[test]
 	fn every_design_reproduces_its_recorded_fingerprints() {
-		check_at(0.95);
+		let _drain = drain_target::pin(drain_target::FIXTURE_RATIO);
+
+		check_at(drain_target::FIXTURE_RATIO);
 	}
 
 	/// `FAST_TIER_DRAIN_TARGET` is read once per process, so the second target

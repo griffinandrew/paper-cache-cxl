@@ -232,7 +232,7 @@ fn t8_a_promotion_its_own_settle_undoes_queues_only_the_settles_entry() {
 
 	// The tier whose eff is exactly one value's charge with what the stack
 	// tracks now: the value fits the empty tier, and is over its settle
-	// target (0.95 of eff).
+	// target (0.85 of eff).
 	let exact = |worker: &mut Worker| {
 		let reserved = stack(worker).dram_reserved_bytes();
 		resize_fast(worker, charge(LEN) + reserved);
@@ -1609,8 +1609,11 @@ fn a_concurrent_workload_leaves_every_charge_exact_at_quiescence() {
 /// LFU script opens with 26 sets built so that the 26th admission's MIGRATING
 /// bytes fit the gate and its BASE size does not -- the case where the merged
 /// store's gate used to add the other one (S5: at the gate's settle target,
-/// which is why the prefix moved when the drain target did; the other orders
-/// keep the 32-set prefix their files were recorded with).
+/// which is why the prefix moved when the drain target went from 0.98 to 0.95;
+/// the other orders keep the 32-set prefix their files were recorded with).
+/// The scripts (T14c's too) run at 0.95 whatever the default (0.85 since the
+/// migration consumers spin before they park): `script_lines`, `script_c` and
+/// `script_g` pin it.
 ///
 /// Since S5 each set goes through the client's admission decision
 /// (`gate::decide`: the metadata cap, the design's tier, the structural
@@ -1645,10 +1648,12 @@ mod t14 {
 	const ITEMS_C: [ObjectSize; 6] = [512, 640, 1024, 2048, 4096, 8192];
 
 	/// T14c's gate half (B2): a 64 KiB tier -- eff 56-64 KiB at omega 64 over
-	/// 128 keys, so the settled tier's headroom `B - S` (1.1-1.3 KiB) sits among
-	/// the items: the three smaller are admitted up to B, the larger only on a
-	/// settled tier (OVERSIZE) -- and a cache small enough that sets also evict
-	/// by size.
+	/// 128 keys, so the settled tier's headroom `B - S` sits among the items:
+	/// 2.8-3.2 KiB at the 0.95 drain target the scripts pin (1.1-1.3 KiB at the
+	/// 0.98 they were written at, where three items were under it), so the four
+	/// smaller are admitted up to B and the larger only on a settled tier
+	/// (OVERSIZE); at the 0.85 default (8.4-9.6 KiB) none would be OVERSIZE --
+	/// and a cache small enough that sets also evict by size.
 	const FAST_G: CacheSize = 64 * 1024;
 	const MAX_SIZE_G: CacheSize = 384 * 1024;
 	const KEYS_G: u64 = 128;
@@ -2326,6 +2331,14 @@ mod t14 {
 		let _serialised = migration_test_lock::lock();
 		let _overheads = test_overheads::set(OMEGA, PER_OBJECT);
 
+		// The drain target the scripts were built for and the T14x hashes
+		// recorded at (0.95, E1b's default; 0.85 since), on this thread, which
+		// drives the worker and its stack: the scripts pin what the stores and
+		// the designs do, not the default. T14c's (`script_c`, `script_g`)
+		// pin it too: the gate half's items are sized against the headroom
+		// between S and B (`FAST_G`).
+		let _drain = drain_target::pin(drain_target::FIXTURE_RATIO);
+
 		let mut run = Run::new(policy, tiered, b);
 		let mut rng = Rng(seed);
 		let mut n = 0;
@@ -2360,8 +2373,8 @@ mod t14 {
 
 		// The property the LFU prefix exists for, checked rather than assumed:
 		// the last set's migrating bytes fit the settle target and its base
-		// size (12 bytes more) does not. Not under an override of the target.
-		if policy == PaperPolicy::LfuCompactHybrid && std::env::var_os("FAST_TIER_DRAIN_TARGET").is_none() {
+		// size (12 bytes more) does not.
+		if policy == PaperPolicy::LfuCompactHybrid {
 			let (last, filled) = prefix.split_last().expect("a prefix");
 			let filled: CacheSize = filled.iter().map(|&item| CacheSize::from(item)).sum();
 			let migrating = filled + CacheSize::from(*last);
@@ -2493,6 +2506,7 @@ mod t14 {
 		// which other tests assert exact deltas on under this lock.
 		let _serialised = migration_test_lock::lock();
 		let _overheads = test_overheads::set(OMEGA, PER_OBJECT);
+		let _drain = drain_target::pin(drain_target::FIXTURE_RATIO);
 
 		let mut run = Run::with(policy, true, false, true, FAST_C, MAX_SIZE_C, KEYS_C, overflow);
 		let mut rng = Rng(seed);
@@ -2569,6 +2583,7 @@ mod t14 {
 		// which other tests assert exact deltas on under this lock.
 		let _serialised = migration_test_lock::lock();
 		let _overheads = test_overheads::set(OMEGA, PER_OBJECT);
+		let _drain = drain_target::pin(drain_target::FIXTURE_RATIO);
 
 		let mut run = Run::with(policy, true, false, true, FAST_G, MAX_SIZE_G, KEYS_G, MetadataOverflow::Error);
 		run.gate(on_stall);

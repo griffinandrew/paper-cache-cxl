@@ -1401,7 +1401,7 @@ mod tests {
 	fn a_fast_lane_spills_its_tail_to_the_back_of_the_lane_the_policy_names() {
 		let mut stack = TieredStack::with(ToyCarve, 24_000);
 
-		// Six keys of 1,000 B fill the fast lane past 0.95 x 6,000 B: the oldest spills.
+		// Six keys of 1,000 B fill the fast lane past 0.85 x 6,000 B: the oldest spills.
 		for key in 1..=6 {
 			stack.insert(key, 1_000);
 		}

@@ -564,8 +564,12 @@ mod tests {
 		assert_eq!(stack.slow_object_count(), 0);
 	}
 
+	/// At the drain target the sizes were picked for (0.95): a 90-byte key
+	/// fits a 100-byte tier's 95 and a second does not; at the 0.85 default
+	/// not even the first fits the 85.
 	#[test]
 	fn admission_once_fast_is_full_goes_directly_to_slow() {
+		let _drain = drain_target::pin(drain_target::FIXTURE_RATIO);
 		let mut stack = LfuCompactHybridStack::new(100);
 
 		stack.insert(1, 90);

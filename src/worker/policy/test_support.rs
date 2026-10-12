@@ -77,6 +77,22 @@ pub(super) fn alone_in_with_env(module: &str, test: &str, env: &[(&str, &str)], 
 	run_in_child(module, test, None, env);
 }
 
+/// `alone_in` at the drain target the test's byte budgets were sized at,
+/// `drain_target::FIXTURE_RATIO` (0.95, E1b's default; the default is 0.85
+/// since the migration consumers spin before they park). In a child given
+/// `FAST_TIER_DRAIN_TARGET`, because a cache's policy worker and consumers
+/// read the ratio on threads of their own, where `drain_target::pin` does
+/// not reach. For a test of something other than the default.
+#[cfg(feature = "hybrid_cache_common")]
+pub(super) fn alone_at_fixture_ratio(module: &str, test: &str, body: impl FnOnce()) {
+	use super::policy_stack::drain_target;
+
+	alone_in_with_env(module, test, &[("FAST_TIER_DRAIN_TARGET", "0.95")], || {
+		assert_eq!(drain_target::ratio(), drain_target::FIXTURE_RATIO, "the child runs at the fixtures' drain target");
+		body();
+	});
+}
+
 /// `test`, of `module`, once per case of `cases` -- a policy, a design, an
 /// order -- each in a child process of its own, in which it is the only test
 /// and only that case runs `body`. "Each policy run resets all cache state":

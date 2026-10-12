@@ -91,11 +91,11 @@ mod hybrid_cache_tests {
     // sat out its timeout waiting for a fifteenth that could never arrive.
     //
     //   a1_in reservation   = K_IN  * MAX_SIZE = 614 bytes, held at the DRAIN
-    //                         TARGET: 583 bytes at 0.95 (601 at the 0.98 it
-    //                         was until E1b, which held nine) -> 8 residents
-    //                         (7 * 64 + 72 = 520 fits, 8 * 64 + 72 = 584 does
-    //                         not, by one byte), so 24 sets age exactly 16
-    //                         keys out
+    //                         TARGET: 521 bytes at 0.85 (583 at the 0.95 of
+    //                         E1b, 601 at the 0.98 before it, which held
+    //                         nine) -> 8 residents (7 * 64 + 72 = 520 fits, by
+    //                         one byte, and 8 * 64 + 72 = 584 does not), so
+    //                         24 sets age exactly 16 keys out
     //   effective am fast   = FAST_TIER - 614  = 410 bytes -> 6 objects, well
     //                         short of the 16 * 64 = 1_024 bytes those aged keys
     //                         carry back into `am` on promotion, which is what
@@ -393,9 +393,9 @@ mod hybrid_cache_tests {
         ensure_pmem_allocator_warm();
 
         // a1_in reservation = 0.0002 × 1_048_576 = 209 bytes, held at its drain
-        // target: 198 bytes at 0.95. Two objects rest in it at 64 migrating
-        // bytes each, and the incoming third is measured in full, 72, so the
-        // THIRD set (128 + 72 = 200 > 198) is the one that ages key 1 out —
+        // target: 177 bytes at 0.85 (198 at 0.95). Two objects rest in it at 64
+        // migrating bytes each, and the incoming third is measured in full, 72,
+        // so the THIRD set (128 + 72 = 200 > 177) is the one that ages key 1 out —
         // the original two-set fixture never overflowed a1_in at all. (At the
         // 0.98 target of 204 bytes the third set fitted, nothing aged, and this
         // test failed on its first wait until E1b moved the target.) a1_out's
@@ -486,9 +486,9 @@ mod hybrid_cache_tests {
         // to age out of `a1_in` first and take the hit in `a1_out`.
         //
         // 24 sets against a 614-byte `a1_in` (K_IN * MAX_SIZE, 64 MIGRATING
-        // bytes per 64-byte object) held at its drain target, 583 bytes, keeps
-        // 8 resident and ages the other 16 out (it kept 9 and aged 15 at the
-        // 0.98 target of 601 bytes, until E1b). Charged at 84 bytes apiece —
+        // bytes per 64-byte object) held at its drain target, 521 bytes (583
+        // at the 0.95 of E1b), keeps 8 resident and ages the other 16 out (it
+        // kept 9 and aged 15 at the 0.98 target of 601 bytes, until E1b). Charged at 84 bytes apiece —
         // which is what the old 819-byte reservation was sized for — the same
         // queue held twelve, only 12 keys ever reached a1_out, and this wait
         // timed out.
