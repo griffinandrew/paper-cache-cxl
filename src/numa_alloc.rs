@@ -1199,13 +1199,16 @@ impl<const NODE: u32> NumaAlloc<NODE> {
 			// construction). Counted, never silent -- see UNBOUND_FALLBACKS.
 			None => {
 				UNBOUND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+				let mut flags = if zeroed { MALLOCX_ZERO } else { 0 };
 				// An unbound block now exists in the slow pool, and it must
 				// never be freed into a slow tcache: latch before the pointer
-				// is returned (see `slow_tcache_flag`).
+				// is returned (see `slow_tcache_flag`). And uncached: with no
+				// tcache flag this would pop whatever the thread's DEFAULT
+				// tcache -- the fast tier's -- holds, a node-0 block.
 				if NODE != NODE_FAST && NODE != NODE_FAST_VALUES {
 					poison_slow_tcache();
+					flags |= mallocx_tcache_none();
 				}
-				let mut flags = if zeroed { MALLOCX_ZERO } else { 0 };
 				// `dealloc` frees with `align_flags`, so the fallback must
 				// allocate with them too, or the block is freed under another
 				// size class.
@@ -1318,12 +1321,17 @@ unsafe impl<const NODE: u32> std::alloc::GlobalAlloc for NumaAlloc<NODE> {
 			Some(flags) => unsafe { rallocx(ptr as *mut c_void, new_size, flags) as *mut u8 },
 			None => {
 				UNBOUND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-				// As in `raw_alloc`: the new block is unbound.
+				// Same reason as the fallback in `raw_alloc`.
+				let mut flags = align_flags(layout.align(), new_size);
+				// As in `raw_alloc`: the new block is unbound, and must not come
+				// from the default tcache. Here it matters twice: `rallocx` that
+				// moves the block frees the OLD one -- a slow-arena, node-2
+				// block -- into the tcache the call names, and the default one
+				// would hand it to the fast tier's next allocation of its class.
 				if NODE != NODE_FAST && NODE != NODE_FAST_VALUES {
 					poison_slow_tcache();
+					flags |= mallocx_tcache_none();
 				}
-				// Same reason as the fallback in `raw_alloc`.
-				let flags = align_flags(layout.align(), new_size);
 				unsafe { rallocx(ptr as *mut c_void, new_size, flags) as *mut u8 }
 			},
 		};
@@ -2040,6 +2048,104 @@ fast_grew={grew_fast} slow_grew={grew_slow} -> on_target={target} elsewhere={oth
 		unbound_fallback_alignment_check::<NODE_SLOW>();
 	}
 
+	/// The slow pool's unbound fallback must bypass the thread's DEFAULT
+	/// tcache -- the fast tier's cache -- in both directions. With no tcache
+	/// flag there, a fallback `mallocx` pops whatever that cache's bin holds,
+	/// a fast-arena (node-0) block, into the slow tier, and a fallback
+	/// `rallocx` that moves its block frees the old one -- a slow-arena
+	/// (node-2) block -- into it, where the fast tier's next allocation of
+	/// that class takes it. Each step is checked right after it, since a
+	/// tcache bin is LIFO: fast blocks of both classes are freed onto the
+	/// cache, the fallbacks run, then the fast tier asks for the old block's
+	/// class. Classes: two small bins, and 20 KB (the 20 KiB class), above
+	/// 14 KiB and below the default `tcache_max` -- with natural alignment off
+	/// it is not served FROM the cache, but is still freed into it. Every
+	/// grow or shrink changes class, so `rallocx` must move the block. On a
+	/// thread of its own, so nothing else touches that thread's default cache
+	/// between the steps. Holds under any `SLOW_TCACHE` and
+	/// `ALLOC_NATURAL_ALIGN`. With the fallback passing no tcache flag, every
+	/// one of the three counts was non-zero.
+	#[test]
+	fn unbound_slow_fallback_bypasses_the_default_tcache() {
+		assert!(init(), "the node-0 and node-2 arena pools must build");
+
+		std::thread::spawn(|| {
+			use std::alloc::GlobalAlloc;
+
+			const PAIRS: [(usize, usize); 3] = [(64, 3000), (3000, 20_000), (20_000, 64)];
+			const ROUNDS: usize = 32 * PAIRS.len();
+
+			let fast = NumaAlloc::<NODE_FAST>;
+			let slow = NumaAlloc::<NODE_SLOW>;
+			let fast_arenas = pool_arenas(NODE_FAST);
+			let slow_arenas = pool_arenas(NODE_SLOW);
+			let arena = |p: *mut u8| arena_of(p).expect("arenas.lookup");
+			let fallbacks_before = UNBOUND_FALLBACKS.load(Ordering::Relaxed);
+			// Fallback allocs and reallocs served a fast block; fast
+			// allocations served a slow one; reallocs that moved.
+			let (mut took_alloc, mut took_realloc, mut gave_fast, mut moved) = (0usize, 0usize, 0usize, 0usize);
+
+			for round in 0..ROUNDS {
+				let (size, grown) = PAIRS[round % PAIRS.len()];
+				let small = Layout::from_size_align(size, 8).unwrap();
+				let big = Layout::from_size_align(grown, 8).unwrap();
+				unsafe {
+					// A slow-arena block, from the bound path.
+					let s = slow.alloc(small);
+					// A fast block of each class, on top of the default cache's bins.
+					let fs = fast.alloc(small);
+					let fb = fast.alloc(big);
+					assert!(!s.is_null() && !fs.is_null() && !fb.is_null(), "round {round}: bound allocation failed");
+					fast.dealloc(fs, small);
+					fast.dealloc(fb, big);
+
+					let (a, m) = {
+						let _unbound = ForceUnbound::new();
+						(slow.alloc(small), slow.realloc(s, small, grown))
+					};
+					assert!(!a.is_null() && !m.is_null(), "round {round}: fallback allocation failed");
+					// The fast tier's next block of `s`'s class.
+					let f = fast.alloc(small);
+					assert!(!f.is_null(), "round {round}: fast allocation failed");
+
+					if a == fs || fast_arenas.contains(&arena(a)) {
+						took_alloc += 1;
+					}
+					if m == fb || fast_arenas.contains(&arena(m)) {
+						took_realloc += 1;
+					}
+					if f == s || slow_arenas.contains(&arena(f)) {
+						gave_fast += 1;
+					}
+					if m != s {
+						moved += 1;
+					}
+
+					slow.dealloc(a, small);
+					slow.dealloc(m, big);
+					fast.dealloc(f, small);
+				}
+			}
+
+			let fallbacks = UNBOUND_FALLBACKS.load(Ordering::Relaxed) - fallbacks_before;
+			println!(
+				"FALLBACKTCACHE rounds={ROUNDS} took_alloc={took_alloc} took_realloc={took_realloc} gave_fast={gave_fast} \
+moved={moved} fallbacks={fallbacks} natural_align={} slow_tcache={}",
+				natural_align_enabled(),
+				slow_tcache_enabled()
+			);
+			// `>=`: the counter is process-global. Less means the loop ran on
+			// the bound path and tested nothing.
+			assert!(fallbacks >= 2 * ROUNDS as u64, "{fallbacks} fallbacks counted for {ROUNDS} allocs and {ROUNDS} reallocs");
+			assert_eq!(moved, ROUNDS, "every realloc changes class, so every one must move its block");
+			assert_eq!(took_alloc, 0, "slow fallback allocations took {took_alloc} of {ROUNDS} blocks from the default tcache");
+			assert_eq!(took_realloc, 0, "slow fallback reallocs took {took_realloc} of {ROUNDS} blocks from the default tcache");
+			assert_eq!(gave_fast, 0, "the fast tier got {gave_fast} of {ROUNDS} slow blocks a fallback realloc freed into the default tcache");
+		})
+		.join()
+		.expect("the fallback thread");
+	}
+
 	/// Cross-thread free must not move a block between nodes.
 	///
 	/// This is the pattern the cache actually runs -- allocate on one thread,
@@ -2647,8 +2753,8 @@ arena_large_mallocs={arena_mallocs} {}",
 
 
 /// Plain jemalloc: no arena binding, no NUMA extent hooks, no tcache flags --
-/// exactly what `raw_alloc`'s unbound fallback path already does, alignment
-/// bits included (`align_flags`, which with natural alignment on is also
+/// exactly what `raw_alloc`'s unbound fallback path already does for the DRAM
+/// pools (the slow pool's adds `MALLOCX_TCACHE_NONE`), alignment bits included (`align_flags`, which with natural alignment on is also
 /// tikv-jemallocator's own rule). Exists to answer whether the custom
 /// allocator is itself the per-operation cost.
 #[cfg(feature = "stock_jemalloc")]
@@ -2757,7 +2863,13 @@ fn poison_slow_tcache() {
 ///    unbound fallback (`flags_for` returned `None`); allocating one latches
 ///    `SLOW_TCACHE_POISONED` before the pointer is returned, and a poisoned
 ///    process frees every slow block with `MALLOCX_TCACHE_NONE`, so a fallback
-///    block can never enter the cache.
+///    block can never enter the cache. The fallback itself allocates and
+///    reallocates with `MALLOCX_TCACHE_NONE` too, never the DEFAULT tcache:
+///    with no tcache flag it would take a fast-tier block out of that cache,
+///    and a moving `rallocx` would free the old slow block into it, for the
+///    fast tier to hand out (`unbound_slow_fallback_bypasses_the_default_tcache`).
+///    A fallback block is not recognisable at its free, so the free side rests
+///    on the latch alone.
 /// 2. *Fills.* A miss is served from the arena in the call's
 ///    `MALLOCX_ARENA` -- always a slow one, because this flag is only ever
 ///    added next to `flags_for(NODE_SLOW)`'s arena bits.

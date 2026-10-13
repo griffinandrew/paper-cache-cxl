@@ -4156,6 +4156,19 @@ of 2,000; with natural alignment off, the large classes get no hits and 2,000 ar
 Each asserts for whichever settings the process has; the suites run (a) at the defaults, with `SLOW_TCACHE=1
 ALLOC_NATURAL_ALIGN=1`, and with `SLOW_TCACHE=0 ALLOC_NATURAL_ALIGN=0`.
 
+**The slow pool's unbound fallback bypasses the default tcache** (a fix made on the combined branch). A slow-pool
+allocation or reallocation that cannot reach a bound arena (`flags_for` returns `None`: the pool failed to build, or a
+test's `ForceUnbound`) called `mallocx`/`rallocx` with no tcache flag -- through the thread's DEFAULT tcache, the fast
+tier's. A fallback `mallocx` then popped a fast-arena (node-0) block into the slow tier, and a fallback `rallocx` that
+moved its block freed the old slow-arena (node-2) block into that cache, where the fast tier's next allocation of the
+class took it. Small classes were always exposed; natural alignment adds the large ones up to `tcache_max`. Both
+fallback calls now pass `MALLOCX_TCACHE_NONE` (the DRAM pools' fallbacks are unchanged). The free side needs nothing
+new: a fallback block cannot be recognised at its free, but the fallback latches `SLOW_TCACHE_POISONED` first and every
+slow free is uncached from then on (and always is with `SLOW_TCACHE` off).
+`unbound_slow_fallback_bypasses_the_default_tcache` checks the three paths over 96 rounds (64 B, 3,000 B and 20 KB
+blocks): with the old flags each hit 96 times of 96, with the fix 0 -- at the defaults, with `SLOW_TCACHE=1` and with
+`ALLOC_NATURAL_ALIGN=0`.
+
 ## Tagged moves: queued migrations carry their value's identity (`MIG_TAGGED`, default on)
 
 `worker/policy/move_ledger.rs` (its module doc has the protocol, the ABA argument and the correctness proof).
