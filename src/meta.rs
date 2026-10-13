@@ -14,7 +14,9 @@
 //!
 //! Every figure is an allocation's USABLE size: jemalloc's size class for the
 //! request, `nallocx` with the alignment flag this crate's allocators pass
-//! (`numa_alloc::flags_for`: `MALLOCX_LG_ALIGN` whenever `align > 1`). That is
+//! (`numa_alloc::align_flags`: `MALLOCX_LG_ALIGN` where jemalloc would not give
+//! the alignment anyway, or whenever `align > 1` under
+//! `ALLOC_NATURAL_ALIGN=0`; the class is the same either way). That is
 //! what `thread.allocated`, `numa_alloc::measured` and Redis's `used_memory`
 //! count, and the unit the value charges (`resident_object_bytes`) are in.
 //! Like Redis's `used_memory` it counts allocations, not residency, but only
@@ -70,16 +72,14 @@ use std::alloc::Layout;
 
 /// What jemalloc hands out for a request of `size` bytes aligned to `align`:
 /// its usable size. The alignment flag is the one the crate's allocators pass
-/// (`MALLOCX_LG_ALIGN(log2 align)` whenever `align > 1`), which is also what
-/// `numa_alloc::measured` charges. 0 for a zero-sized request, which allocates
-/// nothing.
+/// (`numa_alloc::align_flags`), which is also what `numa_alloc::measured`
+/// charges. 0 for a zero-sized request, which allocates nothing.
 pub fn usable(size: usize, align: usize) -> u64 {
 	if size == 0 {
 		return 0;
 	}
 
-	// `MALLOCX_LG_ALIGN(la)` is `la` itself.
-	let flags = if align > 1 { align.trailing_zeros() as core::ffi::c_int } else { 0 };
+	let flags = crate::numa_alloc::align_flags(align, size);
 
 	// SAFETY: a pure size-class computation on a non-zero size.
 	unsafe { tikv_jemalloc_sys::nallocx(size, flags) as u64 }

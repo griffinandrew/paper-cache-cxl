@@ -44,10 +44,30 @@
 //! Hook return convention, which is easy to invert: `false` means **success**
 //! for every `bool`-returning hook. `alloc` signals failure with null, and
 //! `destroy` cannot fail.
+//!
+//! # Thread caches and the alignment flag
+//!
+//! Which jemalloc tcache a call names decides placement as surely as the
+//! arena does: a tcache hit pops whatever block its bin holds, from whichever
+//! arena -- and so node -- it came. The fast tier uses the thread's default
+//! tcache and the segregated value pool an explicit one of its own
+//! (`value_tcache_flag`). The slow tier uses none (`MALLOCX_TCACHE_NONE`)
+//! unless `SLOW_TCACHE=1` gives each thread an explicit slow-only cache
+//! (`slow_tcache_flag`, which states the invariant that keeps placement).
+//!
+//! The alignment flag decides whether a tcache is used at all. With any
+//! `MALLOCX_LG_ALIGN`, `mallocx` takes jemalloc's aligned path, which serves a
+//! size above `SC_SMALL_MAXCLASS` (14 KiB) straight from the arena
+//! (`arena_palloc` -> `large_malloc`) and never looks at the tcache, while
+//! `sdallocx` still frees the block INTO it (`arena_dalloc_large` ->
+//! `tcache_dalloc_large`). Every value is allocated `align = 8`, so the flag is
+//! passed only where jemalloc would not give the alignment anyway
+//! ([`align_flags`]); `ALLOC_NATURAL_ALIGN=0` puts it back on every
+//! `align > 1` call, the flags this module passed before.
 
 use std::ffi::c_char;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use libc::{c_int, c_uint, c_void, size_t};
 
@@ -531,7 +551,8 @@ unsafe extern "C" fn numa_extent_merge(
 ///
 /// Caveats: single runs per cell, so trust the monotonic trend rather than any
 /// one number; and the 16-client row is oversubscribed on this 8-CPU host, so
-/// it mixes scheduler queueing into the figure. Override with
+/// it mixes scheduler queueing into the figure. The sweep predates
+/// `SLOW_TCACHE` (it ran with the slow tier uncached). Override with
 /// `NUMA_ARENAS_PER_NODE`.
 const DEFAULT_ARENAS_PER_NODE: usize = 8;
 
@@ -624,6 +645,15 @@ std::thread_local! {
 
 	/// Guards the allocation `tcache.create` itself performs.
 	static IN_TCACHE_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+	/// This thread's explicit tcache for SLOW-tier allocations and frees
+	/// (`slow_tcache_flag`, `SLOW_TCACHE=1`). Its own cache: never
+	/// `VALUE_TCACHE` and never the default one, since a cache shared with
+	/// another pool would hand that pool's blocks to slow-tier requests.
+	/// `u32::MAX` = not created yet; `SLOW_TCACHE_FAILED` = `tcache.create`
+	/// failed on this thread, so it runs uncached rather than retrying on
+	/// every call.
+	static SLOW_TCACHE: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
 }
 
 #[cfg(test)]
@@ -649,8 +679,19 @@ pub(crate) fn thread_allocs() -> u64 {
 	THREAD_ALLOCS.with(std::cell::Cell::get)
 }
 
-/// Number of explicit tcaches created, for observability.
+/// Number of explicit value-pool tcaches created (`value_tcache_flag`), for
+/// observability. The slow tier's are counted apart, below.
 static TCACHES_CREATED: AtomicU64 = AtomicU64::new(0);
+
+/// Slow-tier tcaches created, and `tcache.create` calls for one that failed
+/// (that thread then runs uncached); see [`tcache_report`].
+static SLOW_TCACHES_CREATED: AtomicU64 = AtomicU64::new(0);
+static SLOW_TCACHE_CREATE_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Latched once any slow-pool allocation takes the unbound fallback: from
+/// then on the slow tier allocates and frees with `MALLOCX_TCACHE_NONE`, so
+/// that unbound block can never enter a slow tcache. See `slow_tcache_flag`.
+static SLOW_TCACHE_POISONED: AtomicBool = AtomicBool::new(false);
 
 /// Creates one arena bound to `node`.
 fn create_node_arena(node: u32) -> Option<(c_uint, &'static NumaHooks)> {
@@ -789,29 +830,32 @@ pub(crate) fn arena_slot() -> u32 {
 	SLOT.with(|s| s.get())
 }
 
-/// `mallocx` flags for an allocation on `node`.
+/// `mallocx` flags for a `size`-byte allocation aligned to `align` on `node`.
 ///
-/// The fast tier uses the default per-thread cache; the slow tier disables
-/// caching entirely (`MALLOCX_TCACHE_NONE`). That asymmetry is load-bearing: a
-/// tcache hands back whatever block it holds without consulting the arena, so
-/// one cache serving both nodes would recycle a node-0 block into a node-1
-/// allocation. Nothing crashes -- placement just decays, and only under
-/// cross-thread free patterns, which is exactly this workload. Keeping the
-/// slow tier out of the cache makes that impossible by construction.
+/// The fast tier uses the default per-thread cache and the value pool its
+/// own explicit one. The slow tier uses no cache (`MALLOCX_TCACHE_NONE`)
+/// unless `SLOW_TCACHE=1` gives it an explicit cache of its own
+/// (`slow_tcache_flag`). What is load-bearing is that the slow tier never
+/// SHARES a cache: a tcache hands back whatever block it holds without
+/// consulting the arena, so one cache serving both nodes would recycle a
+/// node-0 block into a node-2 allocation. Nothing crashes -- placement just
+/// decays, and only under cross-thread free patterns, which is exactly this
+/// workload.
+///
+/// The alignment bits are [`align_flags`]'s, the same function the free,
+/// `realloc` and `measured::usable` use.
 #[inline]
-fn flags_for(node: u32, align: usize) -> Option<c_int> {
+fn flags_for(node: u32, align: usize, size: usize) -> Option<c_int> {
 	let arenas = node_arenas(node)?;
 	let mut flags = mallocx_arena(arenas.indices[slot_for_thread(arenas.count)]);
 
 	if node == NODE_FAST_VALUES {
 		flags |= value_tcache_flag();
 	} else if node != NODE_FAST {
-		flags |= mallocx_tcache_none();
+		flags |= slow_tcache_flag();
 	}
 
-	if align > 1 {
-		flags |= mallocx_lg_align(align.trailing_zeros());
-	}
+	flags |= align_flags(align, size);
 
 	Some(flags)
 }
@@ -819,6 +863,87 @@ fn flags_for(node: u32, align: usize) -> Option<c_int> {
 /// `MALLOCX_TCACHE_NONE` is `MALLOCX_TCACHE(-1)`.
 const fn mallocx_tcache_none() -> c_int {
 	((-1i32) + 2) << 8
+}
+
+// ---------------------------------------------------------------------------
+// the alignment flag
+// ---------------------------------------------------------------------------
+
+/// The largest alignment jemalloc gives a request of at least that many
+/// bytes without being asked: its quantum, `1 << LG_QUANTUM`.
+///
+/// From the jemalloc 5.3.0 source this crate links (tikv-jemalloc-sys 0.6.1):
+/// `quantum.h` sets `LG_QUANTUM 4` on x86-64 (its `build.rs` passes
+/// `--with-lg-quantum` only for `JEMALLOC_SYS_WITH_LG_QUANTUM`, which nothing
+/// here sets). `sc.h`: "all objects of size (1 << LG_QUANTUM) or larger are
+/// at least (1 << LG_QUANTUM) aligned"; below that are the tiny classes,
+/// powers of two from `1 << SC_LG_TINY_MIN` = 8. `sz_sa2u`, which sizes an
+/// aligned request, takes `sz_s2u(ALIGNMENT_CEILING(size, alignment))` for a
+/// small class and plain `sz_s2u(size)` for a large one (large extents are
+/// `large_malloc`'s `CACHELINE`-aligned at least). So when `align <= 16 &&
+/// align <= size` the class `sz_s2u(size)` is already a multiple of `align`,
+/// rounding the size up to `align` first lands in that same class, and the
+/// flag changes neither the size class nor the usable size -- only the path
+/// `mallocx` takes. This is tikv-jemallocator's rule too (`layout_to_flags`:
+/// no flag when `align <= ALIGNOF_MAX_ALIGN_T`, 16 on x86-64, `&& align <=
+/// size`). `natural_alignment_keeps_every_size_class` reads the quantum and
+/// the smallest class back from the linked jemalloc and checks the classes
+/// against `nallocx`, rather than trusting this comment.
+const NATURAL_ALIGN_MAX: usize = 16;
+
+/// `ALLOC_NATURAL_ALIGN`: `0` passes `MALLOCX_LG_ALIGN` on every `align > 1`
+/// call, exactly the flags this module passed before; unset or anything else
+/// drops it where jemalloc gives the alignment anyway ([`NATURAL_ALIGN_MAX`]).
+/// For A/B runs only.
+///
+/// Read once, with `libc::getenv` and not `std::env`: the global allocator
+/// asks on its very first allocation, and `std::env::var` allocates, which
+/// would re-enter here. That first allocation is made before `main` (or the
+/// test harness) has spawned a thread, so no `setenv` can race the read.
+/// Racing first reads all store the same answer.
+#[inline]
+fn natural_align_enabled() -> bool {
+	match NATURAL_ALIGN_STATE.load(Ordering::Relaxed) {
+		1 => false,
+		2 => true,
+		_ => read_natural_align(),
+	}
+}
+
+/// [`natural_align_enabled`]'s latch: 0 = not read yet, 1 = off, 2 = on.
+static NATURAL_ALIGN_STATE: AtomicU8 = AtomicU8::new(0);
+
+#[cold]
+fn read_natural_align() -> bool {
+	let off = unsafe {
+		let raw = libc::getenv(c"ALLOC_NATURAL_ALIGN".as_ptr());
+		!raw.is_null() && *raw as u8 == b'0' && *raw.add(1) == 0
+	};
+	NATURAL_ALIGN_STATE.store(if off { 1 } else { 2 }, Ordering::Relaxed);
+	!off
+}
+
+/// The `MALLOCX_LG_ALIGN` bits for a `size`-byte request aligned to `align`,
+/// with natural alignment on or off: none for `align <= 1`, none when
+/// `natural` and jemalloc's size class already guarantees `align`
+/// ([`NATURAL_ALIGN_MAX`]), else `MALLOCX_LG_ALIGN(log2 align)`.
+#[inline]
+const fn align_flags_with(natural: bool, align: usize, size: usize) -> c_int {
+	if align <= 1 || (natural && align <= NATURAL_ALIGN_MAX && align <= size) {
+		0
+	} else {
+		mallocx_lg_align(align.trailing_zeros())
+	}
+}
+
+/// The `MALLOCX_LG_ALIGN` bits every `mallocx`, `rallocx`, `sdallocx` and
+/// `nallocx` this crate makes for a `size`-byte request aligned to `align`
+/// carries, both tiers and every pool alike, so a block is always allocated,
+/// resized, freed and counted under one size class. See the module docs for
+/// why the flag is left off where it can be.
+#[inline]
+pub(crate) fn align_flags(align: usize, size: usize) -> c_int {
+	align_flags_with(natural_align_enabled(), align, size)
 }
 
 // ---------------------------------------------------------------------------
@@ -922,8 +1047,9 @@ unsafe impl std::alloc::AllocatorClone for SlowObjects {}
 /// `stats.arenas.<i>.small.allocated` is `curregs * size_class`, and `curregs`
 /// moves when a TCACHE BATCH is filled or flushed, not when the application
 /// allocates. The fast tier here runs on the default tcache and the slow tier
-/// on `MALLOCX_TCACHE_NONE`, so sampling is exact for node 1 and inexact for
-/// node 0 -- the tier being bounded. The error scales with thread count and
+/// on `MALLOCX_TCACHE_NONE` (unless `SLOW_TCACHE=1`), so sampling is exact
+/// for the slow node only while it runs uncached, and inexact for node 0 --
+/// the tier being bounded -- always. The error scales with thread count and
 /// free burstiness, so it cannot be calibrated away. Refreshing `epoch` also
 /// takes a process-global lock and walks every arena's bins.
 ///
@@ -944,7 +1070,7 @@ unsafe impl std::alloc::AllocatorClone for SlowObjects {}
 pub mod measured {
 	use std::sync::atomic::{AtomicI64, Ordering};
 
-	use super::{mallocx_lg_align, NODE_FAST, NODE_FAST_VALUES, NODE_SLOW, SLOT};
+	use super::{align_flags, NODE_FAST, NODE_FAST_VALUES, NODE_SLOW, SLOT};
 
 	/// One per pool: fast (node 0), slow (`NODE_SLOW`), fast values (node 0 too --
 	/// a separate ARENA set, not a separate node; see `physical_node`).
@@ -974,20 +1100,17 @@ pub mod measured {
 	///
 	/// NOTE the align bits. `object::overhead::resident_value_bytes` calls
 	/// `nallocx(n, 0)`, which is correct only for `align <= 8`; copying that
-	/// here would mis-round every over-aligned allocation.
+	/// here would mis-round every over-aligned allocation. They are
+	/// `align_flags`', the bits the allocation itself carried; where natural
+	/// alignment leaves them off the class is the flagged one anyway
+	/// (`natural_alignment_keeps_every_size_class`).
 	#[inline]
 	pub fn usable(size: usize, align: usize) -> usize {
 		if size == 0 {
 			return 0;
 		}
 
-		let flags = if align > 1 {
-			mallocx_lg_align(align.trailing_zeros())
-		} else {
-			0
-		};
-
-		unsafe { tikv_jemalloc_sys::nallocx(size, flags) }
+		unsafe { tikv_jemalloc_sys::nallocx(size, align_flags(align, size)) }
 	}
 
 	/// Reuses the arena slot the allocator already assigns per thread rather
@@ -1064,7 +1187,7 @@ impl<const NODE: u32> NumaAlloc<NODE> {
 		#[cfg(test)]
 		THREAD_ALLOCS.with(|count| count.set(count.get() + 1));
 
-		let ptr = match flags_for(NODE, layout.align()) {
+		let ptr = match flags_for(NODE, layout.align(), layout.size()) {
 			Some(mut flags) => {
 				if zeroed {
 					flags |= MALLOCX_ZERO;
@@ -1076,13 +1199,17 @@ impl<const NODE: u32> NumaAlloc<NODE> {
 			// construction). Counted, never silent -- see UNBOUND_FALLBACKS.
 			None => {
 				UNBOUND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-				let mut flags = if zeroed { MALLOCX_ZERO } else { 0 };
-				// `dealloc` always frees with the alignment flag, so the fallback
-				// must allocate with it too, or the block is freed under another
-				// size class.
-				if layout.align() > 1 {
-					flags |= mallocx_lg_align(layout.align().trailing_zeros());
+				// An unbound block now exists in the slow pool, and it must
+				// never be freed into a slow tcache: latch before the pointer
+				// is returned (see `slow_tcache_flag`).
+				if NODE != NODE_FAST && NODE != NODE_FAST_VALUES {
+					poison_slow_tcache();
 				}
+				let mut flags = if zeroed { MALLOCX_ZERO } else { 0 };
+				// `dealloc` frees with `align_flags`, so the fallback must
+				// allocate with them too, or the block is freed under another
+				// size class.
+				flags |= align_flags(layout.align(), layout.size());
 				unsafe { mallocx(layout.size(), flags) as *mut u8 }
 			},
 		};
@@ -1119,26 +1246,25 @@ unsafe impl<const NODE: u32> std::alloc::GlobalAlloc for NumaAlloc<NODE> {
 
 		// The arena is recovered from the extent's own metadata, so the arena
 		// flag is not needed on free and would be wrong for a block allocated
-		// by a thread in a different slot. The tcache flag *does* matter: it
-		// decides which cache the block lands in, so the slow tier must bypass
-		// the cache here for the same reason it does on alloc.
-		// Must match the alloc path: the tcache flag decides which cache the
-		// block lands in, so freeing a slow-tier block into the default cache
-		// would put a node-1 block where a node-0 allocation could take it.
-		// Must mirror the alloc path exactly: the tcache flag decides which
-		// cache the block lands in, and a value block freed into the default
-		// cache would reintroduce the very mixing this pool exists to prevent.
-		let mut flags = if NODE == NODE_FAST {
+		// by a thread in a different slot. The tcache flag *does* matter, and
+		// must mirror the alloc path exactly: it decides which cache the block
+		// lands in. A slow-tier block freed into the default cache would put a
+		// node-2 block where a node-0 allocation could take it, and a value
+		// block freed there would reintroduce the very mixing the value pool
+		// exists to prevent. The slow tier frees into its own tcache under
+		// `SLOW_TCACHE=1` (`MALLOCX_TCACHE_NONE` otherwise) -- the same flag
+		// its alloc and realloc use; this and `rallocx`'s free of the old block
+		// are the only ways into that cache, and both only ever see blocks the
+		// slow pool handed out.
+		let tcache = if NODE == NODE_FAST {
 			0
 		} else if NODE == NODE_FAST_VALUES {
 			value_tcache_flag()
 		} else {
-			mallocx_tcache_none()
+			slow_tcache_flag()
 		};
 
-		if layout.align() > 1 {
-			flags |= mallocx_lg_align(layout.align().trailing_zeros());
-		}
+		let flags = tcache | align_flags(layout.align(), layout.size());
 
 		// Mirror of the add in `raw_alloc`: `usable` is a pure function of
 		// (size, align), so this cancels the birth charge exactly without any
@@ -1185,16 +1311,19 @@ unsafe impl<const NODE: u32> std::alloc::GlobalAlloc for NumaAlloc<NODE> {
 		// Charged INSIDE these two arms rather than at function entry: the
 		// degenerate branch above already routes through `raw_alloc` and
 		// `self.dealloc`, so an entry hook would double count it.
-		let new_ptr = match flags_for(NODE, layout.align()) {
+		// The alignment bits are the NEW block's, `align_flags(align,
+		// new_size)`: that is the block `dealloc` will free (rallocx frees the
+		// old one itself, by its looked-up size).
+		let new_ptr = match flags_for(NODE, layout.align(), new_size) {
 			Some(flags) => unsafe { rallocx(ptr as *mut c_void, new_size, flags) as *mut u8 },
 			None => {
 				UNBOUND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+				// As in `raw_alloc`: the new block is unbound.
+				if NODE != NODE_FAST && NODE != NODE_FAST_VALUES {
+					poison_slow_tcache();
+				}
 				// Same reason as the fallback in `raw_alloc`.
-				let flags = if layout.align() > 1 {
-					mallocx_lg_align(layout.align().trailing_zeros())
-				} else {
-					0
-				};
+				let flags = align_flags(layout.align(), new_size);
 				unsafe { rallocx(ptr as *mut c_void, new_size, flags) as *mut u8 }
 			},
 		};
@@ -1955,6 +2084,356 @@ fast_grew={grew_fast} slow_grew={grew_slow} -> on_target={target} elsewhere={oth
 		assert!(report.contains("mbind_failed=0"), "{report}");
 	}
 
+	/// A plain-old-data mallctl read, or `None` if jemalloc refuses it.
+	fn ctl<T: Default + Copy>(name: &str) -> Option<T> {
+		let name = std::ffi::CString::new(name).unwrap();
+		let mut v = T::default();
+		let mut len = size_of::<T>();
+		let rc = unsafe { mallctl(name.as_ptr(), (&raw mut v).cast(), &raw mut len, std::ptr::null_mut(), 0) };
+		(rc == 0).then_some(v)
+	}
+
+	/// Index of the large size class `class` (`arenas.lextent.<j>.size`).
+	fn lextent_index(class: usize) -> usize {
+		let n: c_uint = ctl("arenas.nlextents").expect("arenas.nlextents");
+		(0..n as usize)
+			.find(|j| ctl::<size_t>(&format!("arenas.lextent.{j}.size")) == Some(class))
+			.unwrap_or_else(|| panic!("no large class of {class} B"))
+	}
+
+	/// `stats.arenas.<i>.lextents.<j>.nmalloc` summed over one pool's arenas,
+	/// for the large class `class`: arena-level large allocations only, so a
+	/// tcache hit does not count and a miss does. Other tests in the process
+	/// can only add to it.
+	fn pool_lextent_nmalloc(node: u32, class: usize) -> u64 {
+		unsafe {
+			let mut e: u64 = 1;
+			let mut l = size_of::<u64>();
+			mallctl(c"epoch".as_ptr(), (&raw mut e).cast(), &raw mut l, (&raw mut e).cast(), size_of::<u64>());
+		}
+		let j = lextent_index(class);
+		pool_arenas(node)
+			.into_iter()
+			.map(|a| {
+				ctl::<u64>(&format!("stats.arenas.{a}.lextents.{j}.nmalloc"))
+					.unwrap_or_else(|| panic!("stats unavailable for arena {a}"))
+			})
+			.sum()
+	}
+
+	/// Natural alignment (`align_flags` with `ALLOC_NATURAL_ALIGN` on) must
+	/// change only the path `mallocx` takes, never a size class: what the
+	/// cache charges (`measured::usable`, `meta::usable`, and the
+	/// `nallocx(n, 0)` of `object::overhead`) and what `sdallocx` is told
+	/// must be what the block really is, whichever way the flag went.
+	///
+	/// 1. The threshold's premise, read from the jemalloc this binary links:
+	///    the quantum is `NATURAL_ALIGN_MAX` and the smallest class is 8 B.
+	/// 2. `nallocx` with and without the flag, for every size up to 64 KiB --
+	///    every small class, and the large ones past four times the default
+	///    `tcache_max` -- and both edges of every large class up to 64 GiB, at
+	///    alignments 2 to 16. That covers every value layout the crate makes:
+	///    `value`'s `(len.max(1), 8)` and `value_thin`'s items (header plus
+	///    bytes, aligned to 8 or to a key's 16).
+	/// 3. Real blocks of the value alignment (8) and of 16 from every pool,
+	///    fresh and recycled through a cache: aligned -- so a value pointer's
+	///    three tag bits are clear -- and in exactly the flagged class
+	///    (`sallocx`).
+	///
+	/// Holds under either `ALLOC_NATURAL_ALIGN`; the suites run it at both.
+	#[test]
+	fn natural_alignment_keeps_every_size_class() {
+		assert!(init(), "the node-0 and node-2 arena pools must build");
+		assert!(init_node(NODE_FAST_VALUES), "the value pool must build");
+
+		assert_eq!(ctl::<size_t>("arenas.quantum"), Some(NATURAL_ALIGN_MAX), "the quantum is the threshold");
+		assert_eq!(ctl::<size_t>("arenas.bin.0.size"), Some(8), "the smallest class must be 8 B (8-aligned)");
+
+		let nallocx = |size: usize, flags: c_int| unsafe { tikv_jemalloc_sys::nallocx(size, flags) };
+
+		let mut sizes: Vec<usize> = (1..=65_536).collect();
+		let nlextents: c_uint = ctl("arenas.nlextents").expect("arenas.nlextents");
+		for j in 0..nlextents {
+			let class: size_t = ctl(&format!("arenas.lextent.{j}.size")).expect("a large class");
+			if class > 1 << 36 {
+				break;
+			}
+			sizes.extend([class - 1, class, class + 1]);
+		}
+
+		let mut unflagged = 0usize;
+		for align in [2usize, 4, 8, 16] {
+			for &size in &sizes {
+				let natural = align_flags_with(true, align, size);
+				let flagged = align_flags_with(false, align, size);
+				assert_ne!(flagged, 0, "align {align} must be flagged without natural alignment");
+				if natural == 0 {
+					unflagged += 1;
+				}
+
+				let class = nallocx(size, flagged);
+				assert_eq!(nallocx(size, natural), class, "{size} B aligned to {align}: the class moved");
+				assert_eq!(class % align, 0, "{size} B aligned to {align}: class {class}");
+				assert_eq!(crate::meta::usable(size, align), class as u64, "{size} B aligned to {align}: meta::usable");
+				#[cfg(feature = "measured_accounting")]
+				assert_eq!(measured::usable(size, align), class, "{size} B aligned to {align}: measured::usable");
+			}
+		}
+		// The rule must actually drop the flag, or (2) proved nothing: at each
+		// of the four alignments, for every size from the alignment up.
+		assert!(unflagged > 4 * 60_000, "natural alignment dropped the flag for only {unflagged} requests");
+		assert_eq!(align_flags_with(true, 8, 7), mallocx_lg_align(3), "align > size keeps the flag");
+		assert_eq!(align_flags_with(true, 32, 4096), mallocx_lg_align(5), "align > 16 keeps the flag");
+		assert_eq!(align_flags_with(true, 1, 1), 0);
+		assert_eq!(align_flags_with(false, 1, 1), 0, "align 1 never had a flag");
+
+		natural_alignment_blocks::<NODE_FAST>();
+		natural_alignment_blocks::<NODE_SLOW>();
+		natural_alignment_blocks::<NODE_FAST_VALUES>();
+	}
+
+	fn natural_alignment_blocks<const NODE: u32>() {
+		use std::alloc::GlobalAlloc;
+
+		const SIZES: [usize; 23] = [
+			1, 7, 8, 9, 15, 16, 17, 24, 40, 100, 4096, 4097, 14_336, 14_337, 16_384, 16_385, 20_000, 28_672,
+			32_768, 32_769, 65_536, 100_000, 1 << 20,
+		];
+
+		let allocator = NumaAlloc::<NODE>;
+		for align in [VALUE_ALIGN_FOR_TESTS, 16] {
+			for size in SIZES {
+				let layout = Layout::from_size_align(size, align).unwrap();
+				let class = unsafe { tikv_jemalloc_sys::nallocx(size, align_flags_with(false, align, size)) };
+				let check = |ptr: *mut u8, when: &str| {
+					assert!(!ptr.is_null(), "pool {NODE}: {size} B aligned to {align} ({when}) failed");
+					assert_eq!(ptr as usize % align, 0, "pool {NODE}: {size} B aligned to {align} ({when}) at {ptr:p}");
+					assert_eq!(ptr as usize & 0b111, 0, "pool {NODE}: {ptr:p} ({when}) has a tag bit set");
+					let real = unsafe { tikv_jemalloc_sys::sallocx(ptr.cast_const().cast(), 0) };
+					assert_eq!(real, class, "pool {NODE}: {size} B aligned to {align} ({when}) is in class {real}, not {class}");
+					unsafe {
+						ptr.write_volatile(1);
+						ptr.add(size - 1).write_volatile(1);
+					}
+				};
+
+				// Fresh, then -- after the frees -- recycled through whatever
+				// cache the pool's frees went into.
+				let blocks: Vec<*mut u8> = (0..4)
+					.map(|_| {
+						let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+						check(ptr, "fresh");
+						ptr
+					})
+					.collect();
+				for ptr in blocks {
+					unsafe { GlobalAlloc::dealloc(&allocator, ptr, layout) };
+				}
+				for _ in 0..4 {
+					let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+					check(ptr, "recycled");
+					unsafe { GlobalAlloc::dealloc(&allocator, ptr, layout) };
+				}
+			}
+		}
+	}
+
+	/// `value::VALUE_ALIGN`, which is private to that module.
+	const VALUE_ALIGN_FOR_TESTS: usize = 8;
+
+	/// What natural alignment is FOR, shown where nothing else interferes: on
+	/// the value pool's own explicit tcache, a 28 KB (28 KiB class) block --
+	/// above `SC_SMALL_MAXCLASS`, below the default `tcache_max` -- allocated
+	/// and freed in a loop reaches the arena about once with natural
+	/// alignment, and every time without it, because the flagged request takes
+	/// the aligned path past the cache. Asserted for whichever
+	/// `ALLOC_NATURAL_ALIGN` the process has; the suites run both.
+	#[test]
+	fn natural_alignment_lets_a_large_class_use_the_tcache() {
+		assert!(init_node(NODE_FAST_VALUES), "the value pool must build");
+
+		const LOOP: u64 = 2_000;
+		const SIZE: usize = 28_000;
+		let class = unsafe { tikv_jemalloc_sys::nallocx(SIZE, 0) };
+		let tcache_max: size_t = ctl("arenas.tcache_max").expect("arenas.tcache_max");
+		if class > tcache_max {
+			println!("NATURALTCACHE skipped: class {class} above tcache_max {tcache_max}");
+			return;
+		}
+
+		let layout = Layout::from_size_align(SIZE, VALUE_ALIGN_FOR_TESTS).unwrap();
+		let before = pool_lextent_nmalloc(NODE_FAST_VALUES, class);
+		for _ in 0..LOOP {
+			let block = std::alloc::Allocator::allocate(&FastValues, layout).expect("value block");
+			unsafe { std::alloc::Allocator::deallocate(&FastValues, block.cast(), layout) };
+		}
+		let arena_mallocs = pool_lextent_nmalloc(NODE_FAST_VALUES, class) - before;
+		let cached = VALUE_TCACHE.with(|t| t.get()) != u32::MAX;
+
+		println!(
+			"NATURALTCACHE natural_align={} value_tcache={cached} loop={LOOP} class={class} arena_large_mallocs={arena_mallocs}",
+			natural_align_enabled()
+		);
+		if !natural_align_enabled() {
+			assert!(arena_mallocs >= LOOP, "{arena_mallocs} arena mallocs for {LOOP} flagged allocations");
+		} else if cached {
+			assert!(arena_mallocs < LOOP / 10, "the value tcache is not serving {class} B: {arena_mallocs} arena mallocs for {LOOP}");
+		} else {
+			println!("NATURALTCACHE tcache.create failed on this thread; caching assertion skipped");
+		}
+	}
+
+	/// The slow tier's explicit tcache (`SLOW_TCACHE=1`) must keep every slow
+	/// block on the slow node, in a slow arena, under the pattern that makes a
+	/// tcache dangerous -- allocate on one thread, free on another, with DRAM
+	/// blocks of the SAME size classes churning through the same threads'
+	/// other caches -- and it must actually cache (the positive control), or
+	/// the placement half proves nothing.
+	///
+	/// Runs under either setting; with `SLOW_TCACHE` off it checks placement
+	/// and that the slow tier stays uncached. Classes above 14 KiB are served
+	/// from the cache only with natural alignment, so with
+	/// `ALLOC_NATURAL_ALIGN=0` the caching half expects hits for the small
+	/// classes only. If another test in this process latched
+	/// `SLOW_TCACHE_POISONED` (the unbound-fallback test does), or this
+	/// thread's `tcache.create` failed, the caching half is skipped with a
+	/// note; run it alone to be sure it ran:
+	///
+	/// ```text
+	/// SLOW_TCACHE=1 cargo test --release --lib --features <cache> -- --exact \
+	///     numa_alloc::tests::slow_tcache_cross_thread_placement --nocapture
+	/// ```
+	#[test]
+	fn slow_tcache_cross_thread_placement() {
+		assert!(init());
+
+		// Small (bin) classes, and large ones up to the default tcache_max.
+		const SIZES: [usize; 5] = [64, 3000, 14_336, 16_384, 20_000];
+		const ROUNDS: usize = 3_000;
+		const SMALL_MAX: usize = 14_336;
+		let poisoned_at_start = SLOW_TCACHE_POISONED.load(Ordering::Relaxed);
+		let slow_arenas = pool_arenas(NODE_SLOW);
+		let check = |ptr: *mut u8, arenas: &[c_uint], who: &str| {
+			unsafe { std::ptr::write_volatile(ptr, 1u8) };
+			let node = node_of(ptr);
+			assert_eq!(node, NODE_SLOW as i32, "{who}: slow block {ptr:p} on node {node}");
+			let arena = arena_of(ptr).expect("arenas.lookup");
+			assert!(arenas.contains(&arena), "{who}: slow block {ptr:p} from arena {arena}, not {arenas:?}");
+		};
+
+		let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, bool)>();
+		let (back_tx, back_rx) = std::sync::mpsc::channel::<(usize, usize, bool)>();
+
+		// B frees what A sent (slow blocks into B's slow cache, DRAM blocks
+		// into B's default cache), then allocates the same sizes from both
+		// tiers and returns them for A to free.
+		let b_arenas = slow_arenas.clone();
+		let b = std::thread::spawn(move || {
+			let mut hits = [0usize; SIZES.len()];
+			while let Ok((addr, size, slow)) = rx.recv() {
+				let layout = Layout::from_size_align(size, 8).unwrap();
+				let ptr = std::ptr::NonNull::new(addr as *mut u8).unwrap();
+				unsafe {
+					if slow { SlowAlloc::default().deallocate(ptr, layout) } else { FastAlloc::default().deallocate(ptr, layout) }
+				}
+				let p = if slow { SlowAlloc::default().allocate(layout) } else { FastAlloc::default().allocate(layout) }
+					.unwrap()
+					.as_ptr() as *mut u8;
+				if slow {
+					if p as usize == addr {
+						hits[SIZES.iter().position(|&x| x == size).unwrap()] += 1;
+					}
+					check(p, &b_arenas, "B");
+				}
+				back_tx.send((p as usize, size, slow)).unwrap();
+			}
+			(hits, SLOW_TCACHE.with(|t| t.get()))
+		});
+
+		for round in 0..ROUNDS {
+			let size = SIZES[round % SIZES.len()];
+			let layout = Layout::from_size_align(size, 8).unwrap();
+			for slow in [true, false] {
+				let p = if slow { SlowAlloc::default().allocate(layout) } else { FastAlloc::default().allocate(layout) }
+					.unwrap()
+					.as_ptr() as *mut u8;
+				if slow {
+					check(p, &slow_arenas, "A");
+				}
+				tx.send((p as usize, size, slow)).unwrap();
+			}
+			// A frees B's blocks: B-allocated slow blocks into A's slow cache.
+			while let Ok((addr, size, slow)) = back_rx.try_recv() {
+				let layout = Layout::from_size_align(size, 8).unwrap();
+				let ptr = std::ptr::NonNull::new(addr as *mut u8).unwrap();
+				unsafe {
+					if slow { SlowAlloc::default().deallocate(ptr, layout) } else { FastAlloc::default().deallocate(ptr, layout) }
+				}
+			}
+		}
+		drop(tx);
+		let (b_hits, b_tcache) = b.join().expect("B");
+		while let Ok((addr, size, slow)) = back_rx.recv() {
+			let layout = Layout::from_size_align(size, 8).unwrap();
+			let ptr = std::ptr::NonNull::new(addr as *mut u8).unwrap();
+			unsafe {
+				if slow { SlowAlloc::default().deallocate(ptr, layout) } else { FastAlloc::default().deallocate(ptr, layout) }
+			}
+		}
+
+		// Positive control: an alloc/free loop of one large class on this
+		// thread reaches the arena about once with a working cache, every
+		// time without one.
+		const LOOP: u64 = 2_000;
+		let class = unsafe { tikv_jemalloc_sys::nallocx(20_000, 0) };
+		let layout = Layout::from_size_align(20_000, 8).unwrap();
+		let before = pool_lextent_nmalloc(NODE_SLOW, class);
+		for _ in 0..LOOP {
+			let p = SlowAlloc::default().allocate(layout).unwrap();
+			check(p.as_ptr() as *mut u8, &slow_arenas, "loop");
+			unsafe { SlowAlloc::default().deallocate(p.cast(), layout) };
+		}
+		let arena_mallocs = pool_lextent_nmalloc(NODE_SLOW, class) - before;
+		let poisoned_at_end = SLOW_TCACHE_POISONED.load(Ordering::Relaxed);
+		let a_tcache = SLOW_TCACHE.with(|t| t.get());
+		let large_cached = natural_align_enabled();
+
+		println!(
+			"SLOWTCACHE enabled={} natural_align={large_cached} poisoned={poisoned_at_start}->{poisoned_at_end} \
+a_tcache={a_tcache} b_tcache={b_tcache} sizes={SIZES:?} b_same_addr_hits={b_hits:?} of {} each, loop={LOOP} \
+arena_large_mallocs={arena_mallocs} {}",
+			slow_tcache_enabled(),
+			ROUNDS / SIZES.len(),
+			tcache_report()
+		);
+
+		let created = |id: u32| id < SLOW_TCACHE_FAILED;
+		if !slow_tcache_enabled() {
+			// Other tests may add to the count, never subtract.
+			assert!(arena_mallocs >= LOOP, "slow tier cached with SLOW_TCACHE off: {arena_mallocs} arena mallocs for {LOOP}");
+		} else if poisoned_at_start || poisoned_at_end {
+			println!("SLOWTCACHE poisoned by another test in this process; caching assertion skipped");
+		} else if !created(a_tcache) || !created(b_tcache) {
+			println!("SLOWTCACHE tcache.create failed on a test thread (ids exhausted?); caching assertion skipped");
+		} else {
+			if large_cached {
+				assert!(arena_mallocs < LOOP / 10, "slow tcache not caching: {arena_mallocs} arena mallocs for {LOOP} allocs");
+			} else {
+				assert!(arena_mallocs >= LOOP, "{arena_mallocs} arena mallocs for {LOOP} flagged allocations");
+			}
+			// B freed A's block and asked for the same size: a LIFO cache hands
+			// that very block back, for every class it serves.
+			for (size, hits) in SIZES.iter().zip(b_hits) {
+				if *size <= SMALL_MAX || large_cached {
+					assert!(hits * 10 >= (ROUNDS / SIZES.len()) * 9, "size {size}: only {hits} cache hits on B");
+				}
+			}
+		}
+
+		let report = stats();
+		assert!(report.contains("mbind_failed=0"), "{report}");
+	}
+
 	/// A DRAM-only configuration must not create node-1 arenas.
 	///
 	/// The all-DRAM case installs `FastAlloc` globally and never constructs
@@ -2168,8 +2647,10 @@ fast_grew={grew_fast} slow_grew={grew_slow} -> on_target={target} elsewhere={oth
 
 
 /// Plain jemalloc: no arena binding, no NUMA extent hooks, no tcache flags --
-/// exactly what `raw_alloc`'s unbound fallback path already does. Exists to
-/// answer whether the custom allocator is itself the per-operation cost.
+/// exactly what `raw_alloc`'s unbound fallback path already does, alignment
+/// bits included (`align_flags`, which with natural alignment on is also
+/// tikv-jemallocator's own rule). Exists to answer whether the custom
+/// allocator is itself the per-operation cost.
 #[cfg(feature = "stock_jemalloc")]
 pub struct StockAlloc;
 
@@ -2177,11 +2658,7 @@ pub struct StockAlloc;
 impl StockAlloc {
 	#[inline]
 	fn align_flags(layout: std::alloc::Layout) -> c_int {
-		if layout.align() > 1 {
-			mallocx_lg_align(layout.align().trailing_zeros())
-		} else {
-			0
-		}
+		align_flags(layout.align(), layout.size())
 	}
 }
 
@@ -2215,13 +2692,202 @@ unsafe impl std::alloc::GlobalAlloc for StockAlloc {
 
 
 // ---------------------------------------------------------------------------
+// slow-tier tcache
+// ---------------------------------------------------------------------------
+
+/// Whether the slow tier runs on its own per-thread tcache when
+/// `SLOW_TCACHE` is unset: no, for now. The prototype's single runs
+/// (CLAUDE.md, "Natural alignment for both tiers") gained 10% throughput on
+/// cluster53 and lost 35% on cluster50, a loss not yet repeated or explained;
+/// the default stays off until it is.
+const SLOW_TCACHE_DEFAULT: bool = false;
+
+/// `SLOW_TCACHE`: `1` gives the slow tier a per-thread explicit jemalloc
+/// tcache (`slow_tcache_flag`), `0` runs it uncached (`MALLOCX_TCACHE_NONE` on
+/// every slow alloc, realloc and free, as before); unset or anything else is
+/// [`SLOW_TCACHE_DEFAULT`]. Read once. `std::env` is safe here, unlike in
+/// [`natural_align_enabled`]: it allocates through the GLOBAL allocator
+/// (node 0), never the slow pool, so the read cannot re-enter itself, and it
+/// takes std's environment lock against the tests' `set_var`.
+#[inline]
+fn slow_tcache_enabled() -> bool {
+	static ON: OnceLock<bool> = OnceLock::new();
+	*ON.get_or_init(|| match std::env::var_os("SLOW_TCACHE") {
+		Some(v) if v == "1" => true,
+		Some(v) if v == "0" => false,
+		_ => SLOW_TCACHE_DEFAULT,
+	})
+}
+
+/// Sentinel in `SLOW_TCACHE`: creation failed on this thread, run uncached.
+const SLOW_TCACHE_FAILED: u32 = u32::MAX - 1;
+
+/// Called when a slow-pool allocation took the unbound fallback. From then on
+/// the slow tier allocates and frees with `MALLOCX_TCACHE_NONE`, so that
+/// unbound block can never enter a slow tcache. Relaxed is enough: the store
+/// is sequenced before the pointer is returned, and any thread that frees the
+/// block received it through some synchronising hand-off after that, so the
+/// store happens-before the freeing thread's load.
+#[cold]
+fn poison_slow_tcache() {
+	SLOW_TCACHE_POISONED.store(true, Ordering::Relaxed);
+}
+
+/// The tcache bits for every slow-tier `mallocx`, `rallocx` and `sdallocx`:
+/// `MALLOCX_TCACHE_NONE` unless `SLOW_TCACHE=1` (and nothing has poisoned
+/// it), else this thread's own slow tcache, created on first use.
+///
+/// # Why this keeps the placement guarantee
+///
+/// A jemalloc tcache does not consult the arena on a hit: `tcache_alloc_*`
+/// pops whatever its bin holds, whichever arena -- and so node -- the block
+/// came from. That is why the slow tier ran uncached: the DEFAULT tcache is
+/// shared by every allocation the thread makes, so a node-0 block freed into
+/// it would be handed to a node-2 request. The guarantee therefore rests on
+/// one invariant: **every block in a slow tcache came from a slow-pool
+/// (node-2-bound) arena.** It holds because of who can put blocks in and
+/// where fills come from:
+///
+/// 1. *Frees.* Only `NumaAlloc::<NODE_SLOW>::dealloc`, and `rallocx`'s own
+///    free of the old block on the slow `realloc` path, pass this flag. Both
+///    only ever see blocks the slow pool allocated -- `SlowObjects` and
+///    `Hybrid` free only what they allocated (the allocator contract) -- and
+///    those came from `mallocx`/`rallocx` with `MALLOCX_ARENA(<slow arena>)`,
+///    or from this cache. The only slow-pool block NOT from a slow arena is an
+///    unbound fallback (`flags_for` returned `None`); allocating one latches
+///    `SLOW_TCACHE_POISONED` before the pointer is returned, and a poisoned
+///    process frees every slow block with `MALLOCX_TCACHE_NONE`, so a fallback
+///    block can never enter the cache.
+/// 2. *Fills.* A miss is served from the arena in the call's
+///    `MALLOCX_ARENA` -- always a slow one, because this flag is only ever
+///    added next to `flags_for(NODE_SLOW)`'s arena bits.
+/// 3. *Other pools.* No other call site uses this tcache id: the fast tier
+///    uses the default tcache, the value pool `VALUE_TCACHE`, and the id lives
+///    in a thread-local no other flag is built from.
+///
+/// Cross-thread frees are fine: a migration thread freeing a CXL copy that a
+/// client thread allocated puts it in the MIGRATION thread's slow cache, still
+/// a slow-arena block in a slow-only cache. Which slow arena (slot) it came
+/// from does not matter -- every slow arena is bound to the same node -- and
+/// a flush returns each block to its own arena, looked up from its extent
+/// (`tcache_bin_flush_impl`), not to the tcache's associated one.
+/// `slow_tcache_cross_thread_placement` checks node and arena for every
+/// block of that pattern.
+///
+/// # Costs and caveats
+///
+/// - Only classes up to `opt.tcache_max` (32 KiB by default in 5.3) are
+///   cached; larger ones go to the arena as before. `_RJEM_MALLOC_CONF=
+///   tcache_max:<bytes>` raises it, process-wide (the default and value
+///   tcaches too).
+/// - Classes above 14 KiB are only served FROM the cache with natural
+///   alignment on: under `ALLOC_NATURAL_ALIGN=0` their allocations take the
+///   aligned path past it (see the module docs) while their frees still enter
+///   it, so it caches only the small classes and churns the large ones.
+/// - Memory parked in the cache is slow-node memory the cache's accounting
+///   (`nallocx` per live allocation) does not see. Bounded per thread by the
+///   bin limits (5.3: up to 200 slots per small class, 20 per large class up
+///   to `tcache_max`). An explicit tcache gets no incremental GC -- jemalloc
+///   runs that (`tcache_event`) on a thread's own default tcache only -- so
+///   its bins are trimmed only when one fills and flushes.
+/// - jemalloc's per-arena stats for the slow arenas stop being exact (blocks
+///   in a tcache count as allocated). `measured` is unaffected.
+/// - THREAD EXIT: an explicit tcache is not destroyed when its thread exits
+///   (`tcache_cleanup` destroys only the thread's own default tcache, and
+///   nothing here calls `tcache.destroy`). Its cached blocks stay stranded,
+///   bounded as above, and its id stays taken; jemalloc allows
+///   `MALLOCX_TCACHE_MAX` (4093) explicit tcaches, past which `tcache.create`
+///   fails and that thread runs uncached. Fine for the benchmark, whose
+///   client, policy-worker and migration threads live for the process; a
+///   server with a thread per connection would want a `thread_local!` guard
+///   whose `Drop` calls `tcache.destroy`. `VALUE_TCACHE` has always had the
+///   same property.
+#[inline]
+fn slow_tcache_flag() -> c_int {
+	if !slow_tcache_enabled() || SLOW_TCACHE_POISONED.load(Ordering::Relaxed) {
+		return mallocx_tcache_none();
+	}
+
+	let existing = SLOW_TCACHE.with(|t| t.get());
+	if existing == SLOW_TCACHE_FAILED {
+		return mallocx_tcache_none();
+	}
+	if existing != u32::MAX {
+		return mallocx_tcache(existing);
+	}
+
+	// Same reentrancy guard as `value_tcache_flag`.
+	if IN_TCACHE_INIT.with(|f| f.get()) {
+		return mallocx_tcache_none();
+	}
+
+	IN_TCACHE_INIT.with(|f| f.set(true));
+
+	let mut id: c_uint = 0;
+	let mut sz = size_of::<c_uint>();
+	let rc = unsafe {
+		mallctl(
+			c"tcache.create".as_ptr(),
+			(&raw mut id).cast(),
+			&raw mut sz,
+			std::ptr::null_mut(),
+			0,
+		)
+	};
+
+	IN_TCACHE_INIT.with(|f| f.set(false));
+
+	// Creation failed: uncached on this thread from now on -- never the
+	// default cache, which would defeat the whole point.
+	if rc != 0 || id >= SLOW_TCACHE_FAILED {
+		SLOW_TCACHE.with(|t| t.set(SLOW_TCACHE_FAILED));
+		SLOW_TCACHE_CREATE_FAILED.fetch_add(1, Ordering::Relaxed);
+		return mallocx_tcache_none();
+	}
+
+	SLOW_TCACHE.with(|t| t.set(id));
+	SLOW_TCACHES_CREATED.fetch_add(1, Ordering::Relaxed);
+
+	mallocx_tcache(id)
+}
+
+/// One line for a run log: the effective tcache limits (to see that a
+/// `_RJEM_MALLOC_CONF=tcache_max:...` took effect), the two allocator knobs
+/// as read, and the slow tcaches' state. `paper_cache::jemalloc_stats`
+/// appends it as its second line.
+pub fn tcache_report() -> String {
+	fn read<T: Default + Copy>(name: &std::ffi::CStr) -> Option<T> {
+		let mut v = T::default();
+		let mut len = size_of::<T>();
+		let rc = unsafe { mallctl(name.as_ptr(), (&raw mut v).cast(), &raw mut len, std::ptr::null_mut(), 0) };
+		(rc == 0).then_some(v)
+	}
+	let show = |v: Option<i64>| v.map_or("-1".to_string(), |v| v.to_string());
+
+	format!(
+		"TCACHE opt.tcache={} opt.tcache_max={} arenas.tcache_max={} natural_align={} slow_tcache={} \
+slow_tcache_poisoned={} slow_tcaches_created={} slow_tcache_create_failed={} value_tcaches_created={}",
+		show(read::<bool>(c"opt.tcache").map(i64::from)),
+		show(read::<size_t>(c"opt.tcache_max").map(|v| v as i64)),
+		show(read::<size_t>(c"arenas.tcache_max").map(|v| v as i64)),
+		natural_align_enabled() as u8,
+		slow_tcache_enabled() as u8,
+		SLOW_TCACHE_POISONED.load(Ordering::Relaxed) as u8,
+		SLOW_TCACHES_CREATED.load(Ordering::Relaxed),
+		SLOW_TCACHE_CREATE_FAILED.load(Ordering::Relaxed),
+		TCACHES_CREATED.load(Ordering::Relaxed),
+	)
+}
+
+// ---------------------------------------------------------------------------
 // segregated value pool
 // ---------------------------------------------------------------------------
 
 /// This thread's explicit tcache for value-buffer allocations.
 ///
-/// Unlike the slow tier -- which defaults to `MALLOCX_TCACHE_NONE` because a
-/// shared cache would recycle a node-0 block into a node-1 allocation -- the
+/// Unlike the slow tier -- which runs uncached, or on a slow-only cache of its
+/// own (`slow_tcache_flag`), because a shared cache would recycle a node-0
+/// block into a node-2 allocation -- the
 /// value pool is on the same physical node as everything else, so there is no
 /// placement hazard and caching is pure upside. It gets its OWN tcache rather
 /// than the default one: an explicit cache keeps value traffic from evicting

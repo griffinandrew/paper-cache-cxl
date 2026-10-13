@@ -178,6 +178,12 @@ arena is counted in `unbound_fallbacks` instead of passing unnoticed.
   Rust allocation are the same thing.
 - `numa_alloc::SlowObjects` (aliased crate-wide as `Hybrid`) backs `TieredBuffer::Slow`.
 
+A jemalloc tcache hands back whatever block it holds without asking which arena it came from, so
+the slow tier never shares one: it runs uncached, or (`SLOW_TCACHE=1`) on an explicit per-thread
+cache that only slow-tier blocks enter. The alignment flag is passed only where jemalloc would
+not give the alignment anyway (`ALLOC_NATURAL_ALIGN`), because with any alignment flag jemalloc
+serves sizes above 14 KiB straight from the arena and never from a tcache.
+
 **This cannot cover the whole process.** jemalloc is built with `JEMALLOC_PREFIX=_rjem_` and
 does not interpose `malloc`, so glibc's heap, bindgen'd C libraries and pthread stacks are
 outside its reach. Pair with `numactl --membind=0` when the whole process must be bound.
@@ -344,6 +350,8 @@ Shared by every hybrid design (`impl<K, S> PaperCache<K, TieredBuffer, S>`):
 | `PAPER_GATE_SLACK_BYTES` | `0` | Bytes the fast tier may hold beyond its budget: the close level is the budget plus this. |
 | `PAPER_GATE_CONCURRENCY_HINT`, `PAPER_GATE_VALUE_HINT_BYTES` | `0`, `0` | Concurrent setters and a typical value size: they widen the near band to their product when that is wider. The setters a server registers (`register_setter`) count with the hint, so it need not know its connections up front (paper-server-cxl registers one per SET in flight, and only with the gate on and a value size above 0); with no value size they widen nothing. |
 | `NUMA_ARENAS_PER_NODE` | `8` | jemalloc arenas per node (clamped to 32). Swept on cluster12: a single arena costs 5% of SET latency at one client and 27% at sixteen, while 8→32 buys 1–2%, inside the run-to-run spread. |
+| `ALLOC_NATURAL_ALIGN` | `1` | `0` puts `MALLOCX_LG_ALIGN` back on every `align > 1` allocation, as before (A/B only). With it on, the flag is left off where jemalloc's size class already guarantees the alignment (`align <= 16 && align <= size`), which is what lets allocations above 14 KiB -- every value is `align = 8` -- be served from a tcache. Size classes and the cache's accounting are the same either way. Read once, at the first allocation. |
+| `SLOW_TCACHE` | `0` | `1` gives the slow (CXL) tier a per-thread jemalloc tcache of its own; `0` runs it uncached (`MALLOCX_TCACHE_NONE`), as before. Only classes up to `opt.tcache_max` (32 KiB by default; `_RJEM_MALLOC_CONF=tcache_max:<bytes>` raises it, process-wide) are cached. Off by default until a regression on cluster50 is repeated or ruled out (single prototype runs: +10% throughput on cluster53, -35% on cluster50; see CLAUDE.md). See `numa_alloc::slow_tcache_flag` for why placement holds. |
 | `PAPER_CACHE_EVICTION_STACK_CAPACITY` | — | Pre-sizes the eviction stack's backing collections. |
 
 The `PAPER_GATE_*` variables are the tiered cache's `GateConfig` from the environment, read once

@@ -152,7 +152,9 @@
 //! its low three bits are always zero. Bit 0 carries the tier (`0` = fast,
 //! `1` = slow); bits 1 and 2 are spare. jemalloc's smallest size class is 8
 //! bytes and 8-aligned, so demanding 8-byte alignment moves nothing into a
-//! larger class.
+//! larger class. Nor, from 8 bytes up, does it put `MALLOCX_LG_ALIGN` on the
+//! request (`numa_alloc::align_flags`): every class from 8 B is 8-aligned
+//! already, and the flag would send a value above 14 KiB past the tcache.
 //!
 //! `len.max(1)` is not cosmetic: a zero-sized allocation is not required to
 //! return a unique address.

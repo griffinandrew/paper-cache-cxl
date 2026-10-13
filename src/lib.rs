@@ -321,6 +321,10 @@ pub type NoHasher = BuildHasherDefault<NoHashHasher<HashedKey>>;
 /// `stats_print:true` via `_RJEM_MALLOC_CONF` cannot answer this: it runs from
 /// jemalloc's atexit handler, by which point the cache has been dropped and
 /// `allocated` has fallen to a few MB. This can be called at peak.
+///
+/// A second line, `numa_alloc::tcache_report`'s `TCACHE ...`, gives the
+/// effective `tcache_max` and the allocator knobs as read
+/// (`ALLOC_NATURAL_ALIGN`, `SLOW_TCACHE`), so a run log says which it ran.
 #[cfg(feature = "numa_jemalloc")]
 pub fn jemalloc_stats() -> Option<String> {
 	unsafe extern "C" {
@@ -378,10 +382,11 @@ pub fn jemalloc_stats() -> Option<String> {
 	Some(format!(
 		"JEMALLOC allocated={allocated} active={active} resident={resident} \
 mapped={mapped} retained={retained} \
-active/allocated={:.4} resident/active={:.4} resident/allocated={:.4}",
+active/allocated={:.4} resident/active={:.4} resident/allocated={:.4}\n{}",
 		ratio(active, allocated),
 		ratio(resident, active),
 		ratio(resident, allocated),
+		numa_alloc::tcache_report(),
 	))
 }
 

@@ -145,6 +145,9 @@ src/
                                backs the slow tier. Extents are mmap'd then mbind'd before
                                jemalloc hands them out, and the alloc hook fails closed. This
                                replaced the UMF/TBB allocators and their FFI bindings.
+                               align_flags: the alignment flag only where jemalloc would not
+                               give the alignment anyway (ALLOC_NATURAL_ALIGN); slow_tcache_flag:
+                               the slow tier's own per-thread tcache (SLOW_TCACHE).
   object/                     Object<K, V> + overhead accounting (object/overhead.rs computes
                                the per-object DRAM reservation, omega: the PerObject metadata
                                model's unit and the key ceiling's estimate; base_size_for, the
@@ -4059,3 +4062,88 @@ values would otherwise sit AT the target rather than under it). The 1.0 golden t
 0.85 run at the default, and the comments that worked their budgets out at 0.95 were redone at 0.85 (several
 now hold by a byte: 2Q full fast-admission's `a1_in` keeps 8 at 521 B, split-slow's 39-byte main budget holds
 one 32-byte object under 33); `tests/phys_fast_identity.rs` restates the default as 0.85.
+
+## Natural alignment for both tiers, and an opt-in slow-tier tcache
+
+Two allocator changes in `src/numa_alloc.rs`, ported from a scratch prototype (`cache_alloc` on the cxl host, a
+copy of the profiling build `cache_q`; its diff is `~/paper-cache-run/bp-promoload/alloc.diff`) onto b828259.
+
+- **The alignment flag only where it changes something** (`align_flags`; `ALLOC_NATURAL_ALIGN`, default on). Every
+  `mallocx`, `rallocx`, `sdallocx` and `nallocx` the crate makes -- both tiers, the value pool, the unbound
+  fallbacks, `measured::usable`, `meta::usable` and `StockAlloc` -- now carries `MALLOCX_LG_ALIGN` only when
+  `align > 16 || align > size` (and never for `align <= 1`, as before). Why it matters: with ANY alignment flag,
+  jemalloc 5.3's `mallocx` takes the aligned path (`imalloc_no_sample` -> `ipalloct` -> `arena_palloc`), which
+  serves a size above `SC_SMALL_MAXCLASS` (14 KiB) with `large_malloc` straight from the arena and never looks at
+  the tcache, while `sdallocx` still frees it INTO the tcache (`arena_dalloc_large` -> `tcache_dalloc_large`).
+  Every value is allocated `align = 8` (`value::VALUE_ALIGN`), so every value from 14 KiB to `tcache_max` (32 KiB)
+  missed the cache on allocation and filled it on free. Why the threshold is safe, from the jemalloc 5.3.0 source
+  tikv-jemalloc-sys 0.6.1 builds: `quantum.h` sets `LG_QUANTUM 4` on x86-64 (its `build.rs` overrides it only for
+  `JEMALLOC_SYS_WITH_LG_QUANTUM`); `sc.h` guarantees every object of at least the quantum is quantum-aligned, with
+  tiny classes from `1 << SC_LG_TINY_MIN` = 8; `sz_sa2u` sizes a small aligned request as
+  `sz_s2u(ALIGNMENT_CEILING(size, align))` and a large one as `sz_s2u(size)` (large extents are `CACHELINE`-aligned
+  at least, `large_malloc`). So for `align <= 16 && align <= size` the class is already a multiple of `align` and the
+  flag changes neither the class nor the usable size -- tikv-jemallocator's own `layout_to_flags` rule
+  (`ALIGNOF_MAX_ALIGN_T` = 16). Read once, with `getenv` (the global allocator asks, and `std::env` allocates);
+  `ALLOC_NATURAL_ALIGN=0` restores the old flags exactly. Nothing about accounting moves: the cache already charged
+  values `nallocx(n, 0)`.
+- **`SLOW_TCACHE`** (default **off**). `1` gives each thread an explicit jemalloc tcache used only for slow-tier
+  allocations, reallocations and frees (`slow_tcache_flag`); `0` is `MALLOCX_TCACHE_NONE`, as before. Placement
+  rests on one invariant, argued in the function's doc: every block in a slow tcache came from a node-2-bound
+  arena -- only the slow pool's `dealloc` and `rallocx` put blocks in, fills come from the call's slow arena, no
+  other flag is built from the id, and flushes return each block to its own arena. A slow-pool allocation that
+  takes the unbound fallback latches `SLOW_TCACHE_POISONED` before the pointer is returned, and from then on the
+  slow tier runs uncached, so an unbound block can never enter the cache. A thread whose `tcache.create` fails runs
+  uncached. Explicit tcaches are never destroyed: a thread's cached blocks stay stranded when it exits, and its id
+  stays taken (jemalloc allows 4,093); nothing here calls `tcache.destroy`, which a thread-per-connection server
+  would need. Only classes up to `opt.tcache_max` are cached (`_RJEM_MALLOC_CONF=tcache_max:<bytes>`, process-wide);
+  classes above 14 KiB are served from it only with natural alignment on. Blocks parked in it are node-2 memory
+  the accounting does not see (bounded per thread by the bin limits: 200 slots per small class, 20 per large).
+- `jemalloc_stats()` gains a second line, `TCACHE opt.tcache= opt.tcache_max= arenas.tcache_max= natural_align=
+  slow_tcache= slow_tcache_poisoned= slow_tcaches_created= slow_tcache_create_failed= value_tcaches_created=`
+  (`numa_alloc::tcache_report`), so a run log says which settings it ran.
+
+History: the opt-in slow tcache removed in R1 (`PAPER_NUMA_SLOW_TCACHE`, commit 025c675, "measured not worth
+enabling") ran with `MALLOCX_LG_ALIGN` on every value allocation (its `flags_for`), so values above 14 KiB were
+never served from it; whether that explains its null result was not checked.
+
+Measured, the prototype only: no run of this commit backs a number here. The prototype's `fix` arm turned on its
+slow tcache AND dropped the alignment flag for slow-tier calls only -- the fast-tier half of natural alignment is
+unmeasured -- and it was built on `cache_q`, which carries profiling code (`PAPER_PROF=1`). One run per arm, all
+flagged by the harness for foreign load (`foreign_max` 1.18-2.37; the prototype's log records ~7 foreign cores busy on
+node 0); tiered LRU, 8 clients, batched, `MIG_SPIN_US=50 FAST_TIER_DRAIN_TARGET=0.85`; run directories
+`alloc_<trace>_t<consumers>_{base,fix}` under `~/paper-cache-run/bp-promoload/` on the cxl host:
+
+| run | base (uncached) | fix (slow tcache) |
+|---|---|---|
+| cluster53, 2 consumers: Mops | 1.582 | 1.738 |
+| SET mean / p99 (us) | 40.0 / 370 | 28.3 / 299 |
+| SET gate wait total (s) | 237 | 160 |
+| free of a promoted 16 KB CXL copy (ns per move) | 2,680 | 391 |
+| cluster53, 8 consumers: Mops | 1.707 | 1.880 |
+| SET mean (us) | 28.7 | 20.1 |
+| cluster26, 2 consumers: Mops | 1.313 | 1.573 |
+| SET mean (ns) | 1,553 | 1,526 |
+| cluster50, 2 consumers, `tcache_max:131072` in both arms: Mops | 0.072 | 0.047 |
+| SET mean (us) | 407 | 648 |
+| demote memcpy per 64 KiB move (us) | 40.6 | 71.4 |
+| migration CPU (CPU-s) | 1,966 | 2,994 |
+
+The cluster50 loss is why `SLOW_TCACHE` ships off. Most of its values are in the 64 KiB class (25M of 32M
+demotions), which the cache serves only with `tcache_max` raised, and the largest single move in the loss is the
+memcpy of the copy itself (1.8-2.2x at every demote class from 8 KiB to 64 KiB), where the tcache only decides which
+destination block is used -- so box noise is the leading suspicion, but that is a hypothesis until the pair is
+repeated. Turn the default on (`SLOW_TCACHE_DEFAULT`) only once a repeated cluster50
+pair shows no loss beyond the old-against-old spread, on top of a cluster53 confirmation.
+
+Tests. New in `numa_alloc::tests`: `natural_alignment_keeps_every_size_class` (the quantum and smallest class read
+back from the linked jemalloc; `nallocx` with and without the flag equal, and a multiple of the alignment, for every
+size to 64 KiB and both edges of every large class to 64 GiB, at alignments 2-16, with `meta::usable` and
+`measured::usable` matching; real blocks of alignment 8 and 16 from all three pools, fresh and recycled, aligned
+with the tag bits clear and in exactly the flagged class); `natural_alignment_lets_a_large_class_use_the_tcache`
+(a 28 KB alloc/free loop on the value pool reaches the arena once with natural alignment, every time without:
+1 against 2,000); `slow_tcache_cross_thread_placement` (allocate on one thread, free on another, DRAM blocks of
+the same classes churning alongside: every slow block on node 2 and from a slow arena; with `SLOW_TCACHE=1` the
+other thread gets the very block back for every class -- 600 of 600 -- and a 20 KB loop reaches the arena 0 times
+of 2,000; with natural alignment off, the large classes get no hits and 2,000 arena allocations; uncached, 2,000).
+Each asserts for whichever settings the process has; the suites run (a) at the defaults, with `SLOW_TCACHE=1
+ALLOC_NATURAL_ALIGN=1`, and with `SLOW_TCACHE=0 ALLOC_NATURAL_ALIGN=0`.
