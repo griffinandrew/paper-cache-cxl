@@ -2288,7 +2288,12 @@ where
 		// this key's migration bucket, read BEFORE the insert publishes the
 		// value, so that a migration landing on the value is ordered after
 		// this read. One load.
-		let mark = self.status.migration_in_flight().mark(hashed_key);
+		//
+		// Under tagged moves (`MIG_TAGGED`, the default) no mark is read: the
+		// key's publication count in the move ledger is bumped instead, BEFORE
+		// the insert, and the `Set` carries `LEDGERED` -- one shard lock and a
+		// table probe (`move_ledger::client_mark`, protocol step 1).
+		let mark = crate::worker::move_ledger::client_mark(&self.status, hashed_key);
 
 		let key_heap = object.key_heap_bytes();
 		let mut old_key_heap = 0;

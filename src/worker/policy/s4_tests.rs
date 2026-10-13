@@ -124,7 +124,9 @@ fn publish_expired(worker: &Worker, objects: &Objects, key: HashedKey, len: usiz
 	let object = Object::with_expiry_in(key, &vec![key as u8; len], Fast, NonZeroU32::new(1));
 	let base_size = worker.overhead_manager.base_size(&object);
 	let resident = worker.overhead_manager.dram_resident_size(&object);
-	let mark = worker.status.migration_in_flight().mark(key);
+	// As `publish_set`: the mark, or under tagged moves the ledger's
+	// publication.
+	let mark = crate::worker::move_ledger::client_mark(&worker.status, key);
 
 	let previous = objects.insert(key, object).map(|old| {
 		let old_size = worker.overhead_manager.base_size(&old);
@@ -1029,12 +1031,16 @@ fn r3_sets_handled_out_of_order_link_once_and_charge_the_live_value() {
 /// linked slot: a re-admission, fenced too, whose corrective declines. Red
 /// with the fence's `placement_of` clause removed (`nonfresh`, S3's): v2 is
 /// not fresh, is not fenced, and stays in CXL, placed fast.
+///
+/// The fence is the untagged reconcile's: this runs with tagged moves OFF,
+/// whatever `MIG_TAGGED` says (`r3_tagged_*` is the same race with them on).
 #[cfg(feature = "merged_object_store")]
 #[test]
 fn r3_a_replaced_set_on_an_unlinked_slot_is_fenced_like_a_new_key() {
 	let _serialised = migration_test_lock::lock();
 
 	let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
+	worker.status.move_ledger().set_mode(super::move_ledger::Mode::default());
 
 	const K: HashedKey = 1;
 
@@ -1085,6 +1091,74 @@ fn r3_a_replaced_set_on_an_unlinked_slot_is_fenced_like_a_new_key() {
 	// Set(v1), fresh on the linked slot: re-admitted; its corrective declines.
 	handle(&mut worker, K, v1);
 	drain_and_apply(&mut worker);
+
+	assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Fast), Fast));
+	assert_eq!(objects.get_ref(&K).map(|o| o.data_size() as usize), Some(LEN + 100), "v2 is the value");
+	assert_settled(&mut worker);
+	charges_exact(&objects, true);
+}
+
+/// Race R3 under tagged moves (`move_ledger`), in the merged store: the same
+/// settle demotion of K's old value, drained before the clients delete K and
+/// set v1 (fresh) and v2 over it, is handed off only AFTER both publications,
+/// with neither `Set` handled: inside K's pending window, so it is stamped
+/// with v2's publication and counted (`pending_handoffs`) -- and it moves v2.
+/// Set(v2) is handled first, with v1's still unhandled: reconciled with its
+/// own built tier (fast, as placed), the window still open, no fence. Set(v1)
+/// closes the window: it FENCES, `(K, Fast)` last, and v2 ends where the store
+/// placed it -- the untagged rule's outcome, from the key's own count rather
+/// than its bucket's, and at the closing `Set` rather than at Set(v2).
+#[cfg(feature = "merged_object_store")]
+#[test]
+fn r3_tagged_a_stale_demotion_handed_off_inside_the_window_is_fenced_at_its_close() {
+	use std::sync::atomic::Ordering::Relaxed;
+
+	let _serialised = migration_test_lock::lock();
+
+	let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
+	worker.status.move_ledger().set_mode(super::move_ledger::Mode { tagged: true, latest: false, count: false });
+
+	const K: HashedKey = 1;
+
+	set(&mut worker, &objects, K, LEN, Fast);
+	drain_and_apply(&mut worker);
+	assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Fast), Fast));
+
+	shrink_fast(&mut worker);
+	let (inline, held) = worker.drain_reconciled();
+	restore_fast(&mut worker);
+	assert_eq!(of(&held, K), vec![Slow], "the settle demoted K");
+
+	let status = worker.status.clone();
+	let overhead_manager = worker.overhead_manager.clone();
+
+	publish_del(&status, &overhead_manager, &objects, K);
+	let v1 = publish(&status, &overhead_manager, &objects, K, LEN, Fast);
+	let v2 = publish(&status, &overhead_manager, &objects, K, LEN + 100, Fast);
+	assert!(v1.fresh() && !v2.fresh(), "v1 was new to the map, v2 replaced it");
+	assert_eq!((v1.mark, v2.mark), (super::move_ledger::LEDGERED, super::move_ledger::LEDGERED));
+
+	let stats = worker.status.migstats();
+	let (handed, fences) = (stats.pending_handoffs.load(Relaxed), stats.pending_fences.load(Relaxed));
+
+	worker.apply_migration_batches(held, inline);
+	assert_eq!(bytes_tier(&objects, K), Slow, "handed off inside the window, the demotion moved v2");
+	assert_eq!(worker.status.migstats().pending_handoffs.load(Relaxed), handed + 1);
+
+	worker.handle_del(K);
+	drain_and_apply(&mut worker);
+
+	handle(&mut worker, K, v2);
+	assert_eq!(placement(&worker, K), Some(Fast), "linked fast, where v2 was built");
+	assert_eq!(worker.observed, vec![Observed::Built { key: K, built: Fast, fence: false }], "v1's Set is unhandled: no fence yet");
+	assert_eq!(correctives(&drain_and_apply(&mut worker), K), vec![], "built where placed");
+
+	handle(&mut worker, K, v1);
+	let observed = worker.observed.clone();
+	let drain = drain_and_apply(&mut worker);
+	assert_eq!(observed, vec![Observed::Built { key: K, built: Fast, fence: true }], "Set(v1) closes the window and fences");
+	assert_eq!(correctives(&drain, K), vec![Fast], "the fence, last");
+	assert_eq!(worker.status.migstats().pending_fences.load(Relaxed), fences + 1);
 
 	assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Fast), Fast));
 	assert_eq!(objects.get_ref(&K).map(|o| o.data_size() as usize), Some(LEN + 100), "v2 is the value");
@@ -1232,7 +1306,7 @@ fn an_eviction_pass_with_nothing_linked_errs_only_over_an_empty_store() {
 	let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
 
 	const U: HashedKey = 1;
-	publish(&worker.status, &worker.overhead_manager, &objects, U, LEN, Fast);
+	let published = publish(&worker.status, &worker.overhead_manager, &objects, U, LEN, Fast);
 
 	// Only an unlinked value, over the size: the pass stops, silently.
 	let used = worker.status.used_size(&worker.status.policy());
@@ -1255,6 +1329,11 @@ fn an_eviction_pass_with_nothing_linked_errs_only_over_an_empty_store() {
 
 	worker.status.update_base_used_size(-(1i64 << 20));
 	worker.status.set_max_size(1 << 30);
+
+	// The worker takes U's `Set` -- which finds nothing to link (R4) -- and
+	// then its `Del`, in the order the client sent them: every publication
+	// has its `Set` handled, so the move ledger is empty at quiescence.
+	handle(&mut worker, U, published);
 	worker.handle_del(U);
 	drain_and_apply(&mut worker);
 	assert_settled(&mut worker);
@@ -1734,7 +1813,9 @@ mod t14 {
 		let object = Object::with_expiry_in(key, &vec![key as u8; len], built, expiry);
 		let base_size = worker.overhead_manager.base_size(&object);
 		let resident = worker.overhead_manager.dram_resident_size(&object);
-		let mark = worker.status.migration_in_flight().mark(key);
+		// As `publish_set`: the mark, or under tagged moves the ledger's
+		// publication.
+		let mark = crate::worker::move_ledger::client_mark(&worker.status, key);
 
 		let previous = objects.insert(key, object).map(|old| worker.overhead_manager.base_size(&old));
 

@@ -124,7 +124,7 @@
 //! migration backlog, or the tier exceeds its budget). With
 //! `PromotionGate::On` a consumer copies a promotion only if `P + v <=
 //! min(promo_frac x eff, S)` (`Gate::promotion_admit`, from
-//! `migration_queue::apply_migration_with`, before the copy is built), else it
+//! `migration_queue::apply_migration_guarded`, before the copy is built), else it
 //! declines it -- counted, the key kept -- and the policy worker re-queues it as
 //! a corrective once there is room, or drops it when the stack no longer
 //! places the key fast (`worker::policy::PromotionRetry`). Demotions are

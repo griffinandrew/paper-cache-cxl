@@ -319,6 +319,10 @@ pub(crate) use crate::worker::policy::migstats::{NB as MIGSTATS_BUCKETS, read as
 #[cfg(feature = "hybrid_cache_common")]
 pub(crate) use crate::worker::policy::migration_queue::InFlight;
 
+// The move ledger (tagged moves, `MIG_TAGGED`), for the status and the client.
+#[cfg(feature = "hybrid_cache_common")]
+pub(crate) use crate::worker::policy::move_ledger;
+
 // The tagged drain entry, for the merged store's migration log; what a `Set`
 // did to the map, for its `worker_set`; and the CLOCK hand's budget.
 #[cfg(feature = "merged_object_store")]

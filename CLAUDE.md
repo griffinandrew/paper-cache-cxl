@@ -202,8 +202,8 @@ src/
                                  by each cache's AtomicStatus since S8: the MIGSTATS batch-size
                                  histograms dumped to stderr, the queue's depth and
                                  dispositions, the reconcile counters on a line of their own,
-                                 and the consumers' spin and park counters, `mq_*`, on the
-                                 last). Queue entries carry a
+                                 the consumers' spin and park counters, `mq_*`, and the
+                                 move ledger's `tagged=` line last). Queue entries carry a
                                  MigrationOrigin (Stack | Reconcile) through the split and the
                                  queue, so a landed corrective is counted apart from
                                  promotions/demotions. `migration_queue::InFlight`: per key
@@ -222,7 +222,15 @@ src/
                                  backlog most buckets are busy: the fence fires for most
                                  fresh sets and heals are effectively off until it drains
                                  (InFlight's doc). Per-key FIFO consumers, last intent
-                                 wins, a redundant one declines. The merged store divides
+                                 wins, a redundant one declines. That is MIG_TAGGED=0;
+                                 by default TAGGED MOVES (`move_ledger.rs`, see "Tagged
+                                 moves" below): a per-key published/seen count; a move
+                                 stamped with its key's newest publication and skipped by
+                                 its consumer if the key was published since; the fence
+                                 made exact (the Set that closes a key's pending window
+                                 fences if a move of the key was handed off inside it);
+                                 no client mark; the heal only under OnStall::Divert or
+                                 PromotionGate::On. The merged store divides
                                  its work as the DashMap stores do (S4): its client only
                                  publishes, swaps and takes map entries; the policy worker
                                  links, charges, places, settles and retires, and wipes
@@ -4147,3 +4155,75 @@ other thread gets the very block back for every class -- 600 of 600 -- and a 20 
 of 2,000; with natural alignment off, the large classes get no hits and 2,000 arena allocations; uncached, 2,000).
 Each asserts for whichever settings the process has; the suites run (a) at the defaults, with `SLOW_TCACHE=1
 ALLOC_NATURAL_ALIGN=1`, and with `SLOW_TCACHE=0 ALLOC_NATURAL_ALIGN=0`.
+
+## Tagged moves: queued migrations carry their value's identity (`MIG_TAGGED`, default on)
+
+`worker/policy/move_ledger.rs` (its module doc has the protocol, the ABA argument and the correctness proof).
+Before this a queued migration carried no identity -- it acted on whatever value held its key when dequeued --
+and the reconcile's NEW-KEY FENCE (a client mark per set, `moved_since` and `placement_of` on the worker, a
+corrective queued behind any entry of the key's 1/16,384th bucket in flight or landed) and the HEAL (a
+slow-served hit on a fast-placed key promoted) existed to repair what a stale entry did to a key deleted or
+evicted and set again (`Observed`'s doc, races (i)-(iii)). Now a per-cache MOVE LEDGER keeps, per key, the
+values PUBLISHED (the client, under a shard lock, before its map insert; its `Set` carries `LEDGERED` in the
+mark field) and the `Set`s the policy worker has HANDLED. A record lives only while the key has a `Set`
+unhandled or a move in flight: zero bytes per object, ~0.9 MiB of tables per cache plus 48 B per live record.
+Every move is stamped at its hand-off with the key's newest publication, and its consumer, after its snapshot
+and before the copy, SKIPS it if the key was published since (`stale_skipped`). A move handed off while a `Set`
+of its key is unhandled -- inside the key's PENDING WINDOW -- is queued all the same and counted
+(`pending_handoffs`); the `Set` that closes the window FENCES, queuing the key's placement last
+(`pending_fences`). The invariant that replaces "the last entry in flight names the placement": a value is only
+ever moved by a move handed off after the value was published, and a move handed off inside a window is
+followed, on the key's consumer, by the closing `Set`'s fence. So the new-key rule survives, exact -- per key,
+from the ledger, no client mark, no bucket -- and the plain rule (built against placed, every `Set`) is
+unchanged. Under tagged moves:
+
+- the heal is kept only where bytes can lag a fast placement for another reason: `PAPER_GATE_ON_STALL=divert`
+  (a diverted key is promoted by its first slow-served hit, by design) and `PAPER_GATE_PROMOTIONS=on` (the retry
+  drops declined promotions past its cap). Elsewhere a slow-served hit is counted `heal_off`, and one in 64
+  (`HEAL_PROBE_EVERY`) is still looked up, for the record only: `heal_off_lagging` counts those the heal would
+  have promoted -- a lag the argument does not explain, e.g. a design breaking the `placement_of` contract;
+- the merged store is covered by the same code and the same argument: its client publishes through the same
+  `publish_set`, and its moves go through the same hand-off and `apply_migration_guarded`. Its race R3
+  (`s4_tests`) has a tagged twin (`r3_tagged_*`): the stale demotion lands on the newest value inside the
+  window, and the closing `Set` fences it back.
+
+`MIG_TAGGED=0` is the reconcile exactly as before (mark, bucket fence, heal; the ledger's hand-off and finish
+return at once). `MIG_LATEST=1` (default 0) skips a queued move that a newer queued move of the same key
+supersedes (`latest_skipped`; the key still ends at its last move's tier -- but a superseded promotion never
+lands, so a reader counting promotions per hit can come up short: the 2Q full fast-admission integration test
+`resize_rescales_both_budgets_and_re_settles` failed so once in three `MIG_LATEST=1` runs of the suite).
+`MIG_REVCOUNT=1` (default 0) counts `reversal_copies` and `dup_same_tier`. All three are read once per process.
+One `MIGSTATS tagged=` line, after the others: the knobs, the counters above and `ledger_max` (the live records'
+high-water mark, SAMPLED by the worker every 4,096th pass, idle or not, and at shutdown; the samples also
+shrink a shard's table that a burst left at more than four times its records).
+
+The prototype (2f47d8f, on b1d0ee1) DROPPED a move handed off inside a pending window instead of fencing. The
+port's unit benchmark (`bench_tagged_set_cost`, `backlog` case: 8 clients overwriting 200,000 keys of 256 B
+faster than the worker handles their `Set`s, so every key's window stays open) showed what that costs: settle
+demotions fell from ~1.5M per run to between 17 and 163,000, with up to 2.6M hand-offs dropped -- the fast tier
+left holding bytes the stack counted slow until the overload ended. This branch never drops a move: in the same benchmark its tagged arms made as many demotions as the untagged
+ones (~1.56M per complete run), each key's window closing with one fence once the overload ended.
+
+What a client pays (`bench_tagged_set_cost`, release, `--ignored`; LRU, 9 interleaved repetitions per arm, a
+loaded shared box -- the 8-client figures are bimodal across repetitions, so read the minima too). The ledger
+alone, a publication plus the worker's `seen` per key: 39 ns on one thread and 150 ns on eight, against the
+untagged client's `InFlight` mark load of 6-7 ns. A whole `set` of a new 64 B key with nothing migrating:
+527 -> 664 ns median (476 -> 613 minimum) on one thread, about +137 ns; on eight, the medians are noise
+(3,036 -> 2,522) and the minima 1,900 -> 2,072 ns. Overwrites with a demotion per set (`backlog`): 653 -> 883 ns
+median (623 -> 762 minimum) on one thread, 1,787 -> 1,904 (1,645 -> 1,770) on eight. Most of the cost is the
+record's cache line, written by the client's publication and then by the worker's `seen`, so it grows with a
+busy worker; under a worker backlog every pending `Set` holds a record (the 8-client runs left 0.55-1.08M of
+them live, ~50 MB, when the clients stopped).
+
+The prototype's runs (b1d0ee1 + the ledger, one binary for every arm; tiered LRU, 8 clients, b64, single runs on
+a loaded shared box, every one flagged for foreign load, `MIG_REVCOUNT=1` in all but the `_norev` pair; run dirs
+`tag_*` in `~/paper-cache-run/bp-promoload`, summary `tagtest/tagres.txt`): no move was handed off inside a
+pending window and none was skipped -- `stale_dropped` and `stale_skipped` were 0 in every tagged arm -- so the
+exact fence would not have fired either, and what tagged moves removed is the corrective machinery's own no-ops:
+declined migrations 7.63M -> 0 (`tag_c53lru_t2_base` / `_tagged`, 2 consumers), 14.55M -> 0
+(`tag_c53lru_t8_base` / `_tagged`, 8 consumers) and 8.22M -> 0 (`tag_c26lru_t2_base` / `_tagged`). On cluster26
+SET mean 4,370 -> 2,121 ns, SET p99 15.4 -> 7.5 us, gate waits 115,261 -> 3,662, migration CPU 112.8 -> 79.8 s at
+1.385 -> 1.401 Mops. On cluster53 the deltas are inside these runs' noise (t2: 1.495 -> 1.517 Mops, SET 33.1 ->
+44.2 us; t8: 1.318 -> 1.443 Mops, SET 62.5 -> 50.9 us, migration CPU 787 -> 653 s). The ledger's peak was
+85k-127k records (4-6 MB) at 2 consumers, 28k at 8. Not measured end to end on this branch (b828259) yet: the
+merge is to be benchmarked on the combined branch.
