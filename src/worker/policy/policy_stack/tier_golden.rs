@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Golden fingerprints of all 23 tiered designs, on `dyn PolicyStack` (R4,
+//! Golden fingerprints of 23 of the 24 tiered designs, on `dyn PolicyStack` (R4,
 //! step 0).
 //!
 //! The tiering bookkeeping every hybrid stack replicates is moving into one

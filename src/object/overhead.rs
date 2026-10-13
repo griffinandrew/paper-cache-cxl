@@ -588,6 +588,7 @@ fn stack_dram_overhead(policy: &PaperPolicy) -> ObjectSize {
 		PaperPolicy::LfuCompact
 		| PaperPolicy::LruCompactHybrid
 		| PaperPolicy::LfuCompactHybrid
+		| PaperPolicy::LfuGlobalCompactHybrid
 		| PaperPolicy::LruSizedCompactHybrid
 		| PaperPolicy::LruLfuCompactHybrid(..)
 		| PaperPolicy::FifoCompactHybrid
@@ -1122,6 +1123,24 @@ mod shared_overhead_is_feature_independent {
 		const KEYLESS_INDEX_PER_OBJECT: ObjectSize = 8;
 
 		assert_eq!(ARENA_STACK_DRAM_OVERHEAD, ARENA_NODE + KEYLESS_INDEX_PER_OBJECT);
+	}
+
+	/// `lfu-global-compact-hybrid` is `LfuCompactHybridStack` with a different
+	/// victim rule, so it must reserve and charge exactly what
+	/// `lfu-compact-hybrid` does -- in every build, whatever the two tables
+	/// resolve to there. A different number would hand one of the two policies
+	/// a different effective fast tier, and a comparison between them would
+	/// measure the budget rather than the eviction rule.
+	#[test]
+	fn the_global_lfu_variant_costs_what_lfu_costs() {
+		assert_eq!(
+			get_hybrid_dram_shared_overhead(&PaperPolicy::LfuGlobalCompactHybrid),
+			get_hybrid_dram_shared_overhead(&PaperPolicy::LfuCompactHybrid),
+		);
+		assert_eq!(
+			get_policy_overhead(&PaperPolicy::LfuGlobalCompactHybrid),
+			get_policy_overhead(&PaperPolicy::LfuCompactHybrid),
+		);
 	}
 }
 

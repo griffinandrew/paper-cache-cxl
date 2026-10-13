@@ -254,7 +254,7 @@ use crate::{
 	CacheSize, HashedKey, NoHasher, PaperPolicy,
 };
 
-/// `frequency -> (head, tail)` of that bucket's intrusive list, one map per
+/// `frequency -> FreqBucket` (that bucket's intrusive lists), one map per
 /// tier per shard, under [`MergedOrder::Lfu`] only.
 ///
 /// Ordered, so a tier's minimum frequency is its first entry -- the same
@@ -277,7 +277,74 @@ use crate::{
 /// Allocated through `crate::meta::Metered`, charging the store's `Meter`
 /// (S5a): its nodes are counted where `BTreeMap` makes them, as the rest of
 /// the store counts its structures where it grows them.
-type FreqBuckets = std::collections::BTreeMap<u16, (u32, u32), crate::meta::Metered>;
+type FreqBuckets = std::collections::BTreeMap<u16, FreqBucket, crate::meta::Metered>;
+
+/// One frequency bucket: TWO intrusive FIFO lists over the slots' `prev`/`next`,
+/// and the bucket's order is their MERGE by `last_access`.
+///
+/// # Why two lists
+///
+/// Under `Lfu` a slot's `last_access` is the stamp at which it ENTERED ITS
+/// CURRENT COUNT, and keys of equal count leave in that order -- the flat
+/// `LfuCompactStack`'s order (the same chain in one tier: append on reaching a
+/// count, evict the bucket's head). Every way into a bucket except one appends
+/// a key that genuinely is the newest entrant at that count: admission at 1, a
+/// bump, a promotion --
+/// which only ever runs immediately after a bump of the same key under the
+/// same lock (`bump`, and `worker_set`'s overwrite arm) -- and an S5
+/// structural move out of the fast set, which also directly follows the
+/// overwrite's bump. Those go on `head..tail`, the ARRIVED list, and it is
+/// stamp-sorted because each append carries the newest stamp.
+///
+/// The exception is a settle DEMOTION. The key keeps its count and its stamp
+/// -- it reached that count long ago, while fast -- so appending it after keys
+/// that arrived later would rank it as the newest entrant, which is the
+/// "re-append" deviation this list exists to remove. Demotions go on
+/// `demoted_head..demoted_tail` instead, and that list is ALSO stamp-sorted:
+/// a demotion always takes the HEAD of this shard's lowest fast bucket, fast
+/// buckets are themselves stamp-sorted (every append into one is a newest
+/// entrant), and anything entering that fast bucket later carries a newer stamp
+/// still -- so the keys demoted into slow bucket `c` of one shard arrive in
+/// increasing stamp order. Two sorted lists: the bucket's oldest key is the
+/// older of the two heads, O(1), with no walk under the shard lock.
+///
+/// A fast bucket's demoted list is always empty -- nothing is demoted INTO the
+/// fast tier. Membership needs no per-slot tag: a slot with no predecessor is
+/// the head of whichever list it is on, and slot ids are unique, so
+/// `freq_unlink` tells the lists apart by comparing against the endpoints.
+///
+/// Per DISTINCT frequency, not per slot: this struct is the `BTreeMap` value,
+/// 8 bytes wider than the `(u32, u32)` it replaces, and the map's allocator
+/// meters it like every other node. The slot is untouched.
+///
+/// Exact sequentially, which is what the differential tests replay -- and
+/// every bucket move is made on the policy worker, under the shard lock, with
+/// a stamp taken there.
+#[derive(Clone, Copy, Debug)]
+struct FreqBucket {
+	/// The ARRIVED list: appended at `now`, so stamp-sorted.
+	head: u32,
+	tail: u32,
+
+	/// The DEMOTED list (slow tier only): appended in demotion order, carrying
+	/// each key's original stamp -- also stamp-sorted, see above.
+	demoted_head: u32,
+	demoted_tail: u32,
+}
+
+impl FreqBucket {
+	const EMPTY: FreqBucket = FreqBucket {
+		head: NIL,
+		tail: NIL,
+		demoted_head: NIL,
+		demoted_tail: NIL,
+	};
+
+	#[inline]
+	fn is_empty(&self) -> bool {
+		self.head == NIL && self.demoted_head == NIL
+	}
+}
 
 const NIL: u32 = u32::MAX;
 
@@ -410,11 +477,20 @@ pub enum MergedOrder {
 	///
 	/// Many keys share a count, so the secondary key is `last_access`, read
 	/// under this order as "the stamp at which this key entered its CURRENT
-	/// bucket" -- it is restamped on every bump and on every tier move, which
-	/// is exactly when the bucket changes. Earliest entrant leaves first, as in
-	/// both references, which are one structure: `ArenaFrequencyChain` appends
-	/// at the bucket tail and takes `min_key` from its head, and the flat
-	/// `LfuCompactStack` is that chain with every key in one tier.
+	/// COUNT" -- it is restamped on every bump (and on the promotion that can
+	/// only ever immediately follow one), and NOT on a settle demotion, which
+	/// changes the key's tier but not its count. Earliest entrant leaves first,
+	/// as in both references, which are one structure: `ArenaFrequencyChain`
+	/// appends at the bucket tail, takes `min_key` from its head and keeps that
+	/// order across tier moves, and the flat `LfuCompactStack` is that chain
+	/// with every key in one tier.
+	///
+	/// It used to be restamped on every tier move, so a demoted key was
+	/// re-appended as if it had just reached its count and was evicted after
+	/// slow keys that reached that count long after it. A demoted key now keeps
+	/// its stamp and joins its slow bucket's second, DEMOTED list; the bucket's
+	/// head is the older of its two list heads -- see [`FreqBucket`] for why
+	/// both lists are already sorted and the merge is O(1).
 	///
 	/// # Eviction prefers SLOW, and that is not free here
 	///
@@ -427,6 +503,17 @@ pub enum MergedOrder {
 	/// and falls back to fast, and `lfu_victim` has to do the same
 	/// deliberately. Missing it would quietly evict hot new keys and report a
 	/// worse miss ratio that looked like a property of the merged store.
+	///
+	/// # ...unless the policy is `lfu-global-compact-hybrid`
+	///
+	/// That policy evicts the global minimum ON PURPOSE -- flat LFU's victim,
+	/// whichever tier it is in -- and refills DRAM room its fast evictions free
+	/// with slow keys that tie the fast minimum. Same buckets, same stamps, same
+	/// mirrors: it is this order with `MergedStore::lfu_global` set, not an
+	/// order of its own, so every `== MergedOrder::Lfu` site that keeps the
+	/// bucket chains sound covers it without being touched. What differs is
+	/// `lfu_global_victim`, the tie branch of `lfu_maybe_promote`, and the
+	/// credit `take_evict` grants a nominated fast victim.
 	Lfu = 3,
 }
 
@@ -459,8 +546,14 @@ impl MergedOrder {
 			PaperPolicy::ClockCompact
 			| PaperPolicy::ClockCompactHybrid => Ok(MergedOrder::Clock),
 
+			// The global-eviction variant is the SAME order -- the same bucket
+			// sets, stamps and mirrors -- with a different victim rule and a
+			// refill on ties, so it is this order plus the store's
+			// `lfu_global` flag rather than an order of its own. See
+			// `MergedStore::set_lfu_global_eviction`.
 			PaperPolicy::LfuCompact
-			| PaperPolicy::LfuCompactHybrid => Ok(MergedOrder::Lfu),
+			| PaperPolicy::LfuCompactHybrid
+			| PaperPolicy::LfuGlobalCompactHybrid => Ok(MergedOrder::Lfu),
 
 			other => Err(CacheError::PolicyNotImplemented(*other)),
 		}
@@ -507,8 +600,9 @@ fn shard_of(key: HashedKey) -> usize {
 #[repr(align(64))]
 struct TailSeq {
 	/// `Lru`/`Fifo`/`Clock`: the shard tail's `last_access`. `Lfu`: the
-	/// `last_access` of the HEAD of this tier's lowest-frequency bucket, which
-	/// is the stamp that separates two shards tied at the same frequency.
+	/// `last_access` of the HEAD of this tier's lowest-frequency bucket -- the
+	/// OLDER of its two list heads, see [`FreqBucket`] -- which is the stamp
+	/// that separates two shards tied at the same frequency.
 	seq: AtomicU64,
 
 	/// `Lfu` only: this tier's minimum frequency, `EMPTY_TAIL` when the tier
@@ -531,6 +625,12 @@ struct TailSeq {
 
 /// A shard with nothing in it, distinguishable from a real `last_access` of 0.
 const EMPTY_TAIL: u64 = u64::MAX;
+
+/// `MergedStore::lfu_nominated` when no fast victim is outstanding. A real key
+/// that hashes to exactly this value can never be credited -- it is refused on
+/// both sides -- so the collision can only withhold one refill, never grant a
+/// spurious one.
+const NO_NOMINATION: HashedKey = HashedKey::MAX;
 
 /// `Slot::last_access` of a PUBLISHED but UNLINKED slot: in the object map --
 /// findable, readable, overwritable, deletable, migratable -- but on no list
@@ -906,9 +1006,9 @@ struct Inner<K, V> {
 	slow_used: CacheSize,
 	fast_count: usize,
 
-	/// `MergedOrder::Lfu` only: `frequency -> (head, tail)` per tier, with the
+	/// `MergedOrder::Lfu` only: `frequency -> FreqBucket` per tier, with the
 	/// chains threaded through the slots' own `prev`/`next`. See
-	/// [`FreqBuckets`] and [`MergedOrder::Lfu`].
+	/// [`FreqBuckets`], [`FreqBucket`] and [`MergedOrder::Lfu`].
 	///
 	/// Deliberately NOT `cfg`'d. The order is a runtime field so that a policy
 	/// A/B is not also a binary A/B -- this project has measured binary layout
@@ -1391,9 +1491,13 @@ impl<K, V> Inner<K, V> {
 
 	/// `demote_in_place` under `Lfu` (S5): a fast slot overwritten with a value
 	/// larger than an empty fast tier moves to the slow bucket of its own
-	/// frequency, appended at its tail with a fresh stamp --
-	/// `ArenaFrequencyChain::set_tier`, as `demote_freq_min` does it. The
-	/// caller queues `(key, Slow)`.
+	/// frequency, appended at the tail of its ARRIVED list with a fresh stamp
+	/// -- `ArenaFrequencyChain::set_tier`, which `LfuCompactHybridStack::
+	/// demote_structural` uses for the same move. Unlike a settle demotion
+	/// (`demote_freq_min`, which keeps the stamp and goes on the DEMOTED list),
+	/// appending is right here: the only caller runs this immediately after
+	/// the overwrite's `bump_slot` made the key the newest entrant at its
+	/// count, under the same lock. The caller queues `(key, Slow)`.
 	fn demote_freq_in_place(&mut self, i: u32, now: u64) {
 		self.assert_folded();
 
@@ -1670,7 +1774,10 @@ impl<K, V> Inner<K, V> {
 		}
 	}
 
-	/// Appends slot `i` at the TAIL of bucket `freq` in `tier`'s bucket set.
+	/// Appends slot `i` at the TAIL of bucket `freq`'s ARRIVED list in `tier`'s
+	/// bucket set -- for a key that has just entered this count: admission, a
+	/// bump, or the promotion (or S5 structural move) that only ever
+	/// immediately follows a bump.
 	///
 	/// The tail rather than the head, because that is where
 	/// `ArenaFrequencyChain::link` puts it while `min_key` reads the head -- so
@@ -1679,6 +1786,17 @@ impl<K, V> Inner<K, V> {
 	/// order, and matching it is what makes the differential tests passable at
 	/// all.
 	fn freq_link(&mut self, i: u32, freq: u16, tier: Tier) {
+		self.freq_append(i, freq, tier, false);
+	}
+
+	/// Appends slot `i` at the TAIL of SLOW bucket `freq`'s DEMOTED list,
+	/// keeping its stamp. Only `demote_freq_min` calls this; see [`FreqBucket`]
+	/// for why that list stays stamp-sorted.
+	fn freq_link_demoted(&mut self, i: u32, freq: u16) {
+		self.freq_append(i, freq, Tier::Slow, true);
+	}
+
+	fn freq_append(&mut self, i: u32, freq: u16, tier: Tier, demoted: bool) {
 		// The tripwire for the one mistake this order can make silently.
 		// `head`/`tail` and `link_front`/`unlink` are the RECENCY list, shared
 		// by the other three orders; under `Lfu` `prev`/`next` are bucket
@@ -1692,28 +1810,34 @@ impl<K, V> Inner<K, V> {
 			 link_front, and prev/next are bucket chains here",
 		);
 
+		debug_assert!(
+			!(demoted && tier == Tier::Fast),
+			"nothing is ever demoted INTO the fast tier",
+		);
+
 		let buckets = match tier {
 			Tier::Fast => &mut self.fast_buckets,
 			Tier::Slow => &mut self.slow_buckets,
 		};
 
-		match buckets.get_mut(&freq) {
-			Some((_, tail)) => {
-				let old_tail = *tail;
-				*tail = i;
+		let bucket = buckets.entry(freq).or_insert(FreqBucket::EMPTY);
 
-				self.slots[old_tail as usize].next = i;
-				self.slots[i as usize].prev = old_tail;
-				self.slots[i as usize].next = NIL;
-			},
+		let (head, tail) = match demoted {
+			false => (&mut bucket.head, &mut bucket.tail),
+			true => (&mut bucket.demoted_head, &mut bucket.demoted_tail),
+		};
 
-			None => {
-				buckets.insert(freq, (i, i));
+		let old_tail = *tail;
+		*tail = i;
 
-				self.slots[i as usize].prev = NIL;
-				self.slots[i as usize].next = NIL;
-			},
+		match old_tail {
+			NIL => *head = i,
+			old_tail => self.slots[old_tail as usize].next = i,
 		}
+
+		let s = &mut self.slots[i as usize];
+		s.prev = old_tail;
+		s.next = NIL;
 	}
 
 	/// Unlinks slot `i` from bucket `freq` in `tier`, dropping the bucket when
@@ -1738,16 +1862,24 @@ impl<K, V> Inner<K, V> {
 			Tier::Slow => &mut self.slow_buckets,
 		};
 
-		if let Some((head, tail)) = buckets.get_mut(&freq) {
-			if *head == i {
-				*head = next;
+		if let Some(bucket) = buckets.get_mut(&freq) {
+			// Which of the two lists `i` is on needs no tag: an endpoint of a
+			// list IS that list's head or tail, slot ids are unique, and a slot
+			// is on exactly one list -- so at most one of each pair matches, and
+			// a slot strictly inside a list matches neither.
+			if bucket.head == i {
+				bucket.head = next;
+			} else if bucket.demoted_head == i {
+				bucket.demoted_head = next;
 			}
 
-			if *tail == i {
-				*tail = prev;
+			if bucket.tail == i {
+				bucket.tail = prev;
+			} else if bucket.demoted_tail == i {
+				bucket.demoted_tail = prev;
 			}
 
-			if *head == NIL {
+			if bucket.is_empty() {
 				buckets.remove(&freq);
 			}
 		}
@@ -1765,7 +1897,8 @@ impl<K, V> Inner<K, V> {
 	/// two shards tied at a frequency are separated exactly the way two keys
 	/// inside one bucket are. O(log D) in the distinct frequencies present.
 	fn min_freq(&self, tier: Tier) -> Option<(u16, u64)> {
-		let (&freq, &(head, _)) = self.freq_buckets(tier).iter().next()?;
+		let (&freq, bucket) = self.freq_buckets(tier).iter().next()?;
+		let head = self.bucket_head(bucket);
 
 		Some((freq, self.slots[head as usize].last_access))
 	}
@@ -1773,18 +1906,42 @@ impl<K, V> Inner<K, V> {
 	/// The slot holding this tier's least-frequently-used key: the head of its
 	/// lowest-frequency bucket.
 	fn freq_min_slot(&self, tier: Tier) -> Option<u32> {
-		let (_, &(head, _)) = self.freq_buckets(tier).iter().next()?;
+		let (_, bucket) = self.freq_buckets(tier).iter().next()?;
 
-		Some(head)
+		Some(self.bucket_head(bucket))
+	}
+
+	/// A bucket's oldest entrant: the older of its two list heads by stamp,
+	/// which is the merge of two sorted lists taken one element at a time. A
+	/// fast bucket never has a demoted list, so for it this is `head`. Stamps
+	/// come from one `fetch_add`, so they are unique and the order is total.
+	#[inline]
+	fn bucket_head(&self, bucket: &FreqBucket) -> u32 {
+		match (bucket.head, bucket.demoted_head) {
+			(head, NIL) => head,
+			(NIL, demoted) => demoted,
+
+			(head, demoted) => {
+				let older_demoted = self.slots[demoted as usize].last_access
+					< self.slots[head as usize].last_access;
+
+				match older_demoted {
+					true => demoted,
+					false => head,
+				}
+			},
+		}
 	}
 
 	/// A frequency bump: unlink, increment, restamp, relink at the tail of the
 	/// next bucket. Returns the new count.
 	///
 	/// The restamp is not cosmetic. Under this order `last_access` means "when
-	/// this key entered its current bucket", which is what orders two keys of
+	/// this key entered its current COUNT", which is what orders two keys of
 	/// equal frequency -- so a bump that moved the key without restamping it
-	/// would leave it ranked against its new peers by a stale position.
+	/// would leave it ranked against its new peers by a stale position. (A
+	/// settle demotion is the converse: it changes the bucket but not the
+	/// count, so it must NOT restamp -- see `demote_freq_min`.)
 	fn bump_slot(&mut self, i: u32, now: u64) -> u16 {
 		let (freq, tier) = {
 			let s = &self.slots[i as usize];
@@ -1813,8 +1970,35 @@ impl<K, V> Inner<K, V> {
 	/// `ArenaFrequencyChain::set_tier`: the key keeps its count, and because
 	/// `set_tier` relinks by APPENDING at the destination bucket's tail, the
 	/// stamp is refreshed here too.
+	///
+	/// Unlike a demotion, appending is RIGHT here, and the restamp harmless:
+	/// the one caller, `MergedStore::lfu_maybe_promote` -- reached from `bump`
+	/// and from `worker_set`'s overwrite arm -- runs this immediately after
+	/// `bump_slot` moved the same key into this count under the same lock
+	/// hold, so it genuinely is the newest entrant at its count -- in either
+	/// tier. That holds for a refill as much as for a strict promotion. Do not
+	/// add a caller that promotes WITHOUT a bump: that would need the
+	/// demoted-list treatment in the fast tier too.
 	fn promote_freq(&mut self, i: u32, now: u64) {
 		self.assert_folded();
+
+		// The promotion-follows-bump rule, checked where it is relied on: the
+		// fast buckets' ARRIVED lists stay stamp-sorted -- which is what keeps
+		// every DEMOTED list sorted in turn -- only because a promoted key is
+		// the newest entrant at its count. `bump_slot` just appended it at the
+		// tail of its slow bucket's arrived list; anything else there means
+		// some other path is promoting.
+		debug_assert!(
+			{
+				let s = &self.slots[i as usize];
+
+				s.tier == Tier::Slow
+					&& self.slow_buckets.get(&s.freq).is_some_and(|b| b.tail == i)
+			},
+			"promote_freq on slot {i}, which is not the tail of its slow bucket's \
+			 arrived list -- a promotion must immediately follow the bump that put \
+			 it there",
+		);
 
 		let (freq, migrating) = {
 			let s = &self.slots[i as usize];
@@ -1844,9 +2028,15 @@ impl<K, V> Inner<K, V> {
 	///
 	/// `LfuCompactHybridStack::settle_fast_tier` demotes `min_with_count(Fast)`
 	/// and carries the count across, which is what
-	/// `ArenaFrequencyChain::set_tier` does for free. A DEAD minimum is
-	/// retired instead, as in `demote_boundary`.
-	fn demote_freq_min(&mut self, now: u64) -> Demote {
+	/// `ArenaFrequencyChain::demote_min_fast` does. A DEAD minimum is retired
+	/// instead, as in `demote_boundary`.
+	///
+	/// The key keeps its `last_access` -- the moment it entered this count --
+	/// and joins the slow bucket's DEMOTED list rather than the tail of its
+	/// arrived list. It used to be restamped and appended, which ranked it
+	/// behind every slow key that reached this count after it did. See
+	/// [`FreqBucket`] for why the demoted list needs no ordered insert.
+	fn demote_freq_min(&mut self) -> Demote {
 		self.assert_folded();
 
 		let Some(d) = self.freq_min_slot(Tier::Fast) else { return Demote::Empty };
@@ -1863,13 +2053,9 @@ impl<K, V> Inner<K, V> {
 
 		self.freq_unlink(d, freq, Tier::Fast);
 
-		{
-			let s = &mut self.slots[d as usize];
-			s.tier = Tier::Slow;
-			s.last_access = now;
-		}
+		self.slots[d as usize].tier = Tier::Slow;
 
-		self.freq_link(d, freq, Tier::Slow);
+		self.freq_link_demoted(d, freq);
 
 		self.fast_used = self.fast_used.saturating_sub(migrating);
 		self.fast_count = self.fast_count.saturating_sub(1);
@@ -2134,6 +2320,47 @@ pub struct MergedStore<K, V> {
 	/// own Set queues its corrective.
 	lfu_latched: AtomicBool,
 
+	/// `MergedOrder::Lfu` only: `true` for `lfu-global-compact-hybrid`, whose
+	/// eviction takes the minimum `(freq, stamp)` over BOTH tiers and whose
+	/// promotion rule admits a tie with the fast minimum into room a fast
+	/// eviction freed; `false` for every other LFU spelling, including the
+	/// flat one -- which never demotes, so for it the two rules would pick
+	/// the same victim anyway. Written once, by `MergedStackHandle::new`, like
+	/// `order`.
+	lfu_global: AtomicBool,
+
+	/// `lfu_global` only: migrating bytes that terminal evictions of FAST slots
+	/// freed and no promotion has spent since -- `LfuCompactHybridStack`'s
+	/// `refill_credit`, and like it a byte budget rather than a claim on the
+	/// room it was earned in (an admission does not spend it). Raised only by
+	/// `take_evict` -- the eviction path's removal; a client's delete or reap
+	/// is `take_if`, and its retire `retire_dead`, neither of which earns it --
+	/// and only for the key `lfu_global_victim` nominated (see
+	/// `lfu_nominated`). Lowered by every promotion, zeroed by every settle
+	/// step that demotes (or retires a DEAD minimum in a demotion's place) and
+	/// by `clear_counted`.
+	///
+	/// An atomic for the same reason `lfu_latched` is (the store is shared
+	/// through an `Arc`), but policy state like it: written only on the
+	/// policy worker. The tests that drive the store from several threads at
+	/// once can race on it -- two ties spending one credit, a spend landing
+	/// just after a demotion zeroed it -- which is tolerable because it is a
+	/// heuristic about WHEN a promotion may happen, not an account of bytes:
+	/// every promotion it admits goes through `promote_freq` and the totals
+	/// bracket like any other, so the tier totals stay exact.
+	refill_credit: AtomicU64,
+
+	/// `lfu_global` only: the FAST key `lfu_global_victim` last nominated, or
+	/// `NO_NOMINATION`. `apply_evictions` pairs the nomination with `erase`'s
+	/// `take_evict` of the same key, and that `take_evict` credits the refill
+	/// only when the slot it removes is this key and is still fast.
+	///
+	/// The worker's removal of the nominated key consumes it, crediting or not
+	/// (`take_evict`, and `retire_dead` for a DEAD slot of the key), so a
+	/// nomination never outlives the key it names; one whose key is never
+	/// removed is overwritten by the next nomination.
+	lfu_nominated: AtomicU64,
+
 	/// Fast-tier byte budget across ALL shards, settled against globally.
 	fast_capacity: AtomicU64,
 	shared_overhead: AtomicU64,
@@ -2202,6 +2429,9 @@ impl<K, V> Default for MergedStore<K, V> {
 			order: AtomicU8::new(MergedOrder::Lru as u8),
 
 			lfu_latched: AtomicBool::new(false),
+			lfu_global: AtomicBool::new(false),
+			refill_credit: AtomicU64::new(0),
+			lfu_nominated: AtomicU64::new(NO_NOMINATION),
 
 			// Untiered until the worker configures it: nothing can ever exceed
 			// this, so `settle_tier` returns at its first comparison -- one
@@ -2234,6 +2464,25 @@ impl<K, V> MergedStore<K, V> {
 	#[inline]
 	pub fn order(&self) -> MergedOrder {
 		MergedOrder::from_repr(self.order.load(Ordering::Relaxed))
+	}
+
+	/// Installs `MergedOrder::Lfu`'s eviction scope: global (`true`, for
+	/// `lfu-global-compact-hybrid`) or slow-first (`false`, every other LFU
+	/// spelling). Called once, by `MergedStackHandle::new`, beside `set_order`
+	/// and for the same reason. Meaningless under the other three orders.
+	///
+	/// A flag rather than a fifth `MergedOrder`: the two LFU policies share the
+	/// order's whole structure, and an extra variant would have had to be added
+	/// to every site that tests `== MergedOrder::Lfu` to keep the bucket chains
+	/// sound -- where one missed site is a silent corruption, not a compile
+	/// error. See [`MergedOrder::Lfu`].
+	pub fn set_lfu_global_eviction(&self, global: bool) {
+		self.lfu_global.store(global, Ordering::Relaxed);
+	}
+
+	#[inline]
+	pub fn lfu_global_eviction(&self) -> bool {
+		self.lfu_global.load(Ordering::Relaxed)
 	}
 
 	/// Installs the fast-tier budget and the per-object DRAM reservation.
@@ -2480,10 +2729,11 @@ impl<K, V> MergedStore<K, V> {
 			let before = g.totals();
 
 			let step = match order {
-				// A demotion carries the key into a slow bucket at its own
-				// count, as the newest entrant of that frequency, so it needs a
-				// stamp -- see `Inner::demote_freq_min`.
-				MergedOrder::Lfu => g.demote_freq_min(self.clock.fetch_add(1, Ordering::Relaxed)),
+				// No stamp: a demotion carries the key into its slow bucket at
+				// its own count AND its own stamp -- see
+				// `Inner::demote_freq_min`. (This used to tick the global clock
+				// once per demotion to restamp it.)
+				MergedOrder::Lfu => g.demote_freq_min(),
 				_ => g.demote_boundary(),
 			};
 
@@ -2496,15 +2746,24 @@ impl<K, V> MergedStore<K, V> {
 					// same rule, and the same reason, as `settle_fast_tier`'s
 					// `fast_tier_latched = true`; and it is counted where it is
 					// decided, as `pending_demotions` is there.
+					//
+					// And, under the global scope, that the tier is full again:
+					// the refill credit is spent, exactly as `settle_fast_tier`
+					// zeroes it. (Always 0 -> 0 under slow-first.)
 					if order == MergedOrder::Lfu {
 						self.lfu_latched.store(true, Ordering::Relaxed);
+						self.refill_credit.store(0, Ordering::Relaxed);
 						log.lfu_demotions += 1;
 					}
 				},
 
+				// A DEAD minimum retired in a demotion's place: the DashMap
+				// stack at this point demotes the deleted-but-unhandled key,
+				// which latches AND zeroes its credit -- so both happen here.
 				Demote::Retired => {
 					if order == MergedOrder::Lfu {
 						self.lfu_latched.store(true, Ordering::Relaxed);
+						self.refill_credit.store(0, Ordering::Relaxed);
 					}
 				},
 
@@ -2666,7 +2925,9 @@ impl<K, V> MergedStore<K, V> {
 	}
 
 	/// An LFU hit: bump the frequency, and promote out of the slow tier if the
-	/// new count STRICTLY exceeds the fast tier's global minimum.
+	/// new count STRICTLY exceeds the fast tier's global minimum -- or, under
+	/// `lfu-global-compact-hybrid`, ties it and the refill admits it (see
+	/// `lfu_maybe_promote`).
 	///
 	/// `LfuCompactHybridStack::maybe_promote`, with `min_count(Tier::Fast)`
 	/// taken across the 32 shards instead of out of one chain.
@@ -2704,23 +2965,10 @@ impl<K, V> MergedStore<K, V> {
 
 			let new_freq = g.bump_slot(i, now);
 
-			// STRICTLY greater, and an empty fast tier promotes: the reference
-			// rule verbatim, so a TIE with the fast minimum does not promote.
-			let promote = match fast_min {
-				None => true,
-				Some(min) => new_freq > min,
-			};
-
 			// S5: never a structural slot -- its value is larger than an empty
 			// fast tier; the bump counts all the same.
-			let promoted = promote
-				&& was_slow
-				&& !self.structural(g.slots[i as usize].migrating());
-
-			if promoted {
-				let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
-				g.promote_freq(i, stamp);
-			}
+			let structural = self.structural(g.slots[i as usize].migrating());
+			let promoted = self.lfu_maybe_promote(&mut g, i, new_freq, fast_min, structural);
 
 			self.apply_totals_delta(before, g.totals());
 			self.publish_mirrors(s, &g);
@@ -2758,6 +3006,11 @@ impl<K, V> MergedStore<K, V> {
 	/// two shards holding equally-frequent keys would be separated arbitrarily
 	/// and the differential test could not pass.
 	fn lfu_min_shard(&self, mirrors: &[TailSeq]) -> Option<usize> {
+		self.lfu_min_entry(mirrors).map(|(_, _, s)| s)
+	}
+
+	/// `lfu_min_shard`'s minimum itself: `(freq, stamp, shard)`.
+	fn lfu_min_entry(&self, mirrors: &[TailSeq]) -> Option<(u64, u64, usize)> {
 		let mut best: Option<(u64, u64, usize)> = None;
 
 		for (s, t) in mirrors.iter().enumerate() {
@@ -2779,7 +3032,7 @@ impl<K, V> MergedStore<K, V> {
 			}
 		}
 
-		best.map(|(_, _, s)| s)
+		best
 	}
 
 	/// The lowest frequency present in a tier across every shard, or `None`
@@ -2820,7 +3073,21 @@ impl<K, V> MergedStore<K, V> {
 	/// so the unqualified global minimum is very often a FAST newcomer, and
 	/// evicting it would be a different policy that still reported a plausible
 	/// miss ratio.
+	///
+	/// Under `lfu-global-compact-hybrid` (`lfu_global`) that different policy
+	/// is the point, and `lfu_global_victim` chooses instead.
 	fn lfu_victim(&self) -> Option<HashedKey> {
+		if self.lfu_global_eviction() {
+			return self.lfu_global_victim();
+		}
+
+		self.lfu_slow_first_pick().map(|(key, _)| key)
+	}
+
+	/// The slow-first victim and the tier it was found in: `lfu_victim` for
+	/// every LFU policy but the global one, and the global one's liveness
+	/// fallback. A DEAD minimum is retired in place and the choice made again.
+	fn lfu_slow_first_pick(&self) -> Option<(HashedKey, Tier)> {
 		'choose: loop {
 			for tier in [Tier::Slow, Tier::Fast] {
 				let mirrors: &[TailSeq] = match tier {
@@ -2835,7 +3102,7 @@ impl<K, V> MergedStore<K, V> {
 
 					match g.freq_min_slot(tier) {
 						Some(i) if g.slots[i as usize].object.is_some() => {
-							return Some(g.slots[i as usize].hashed);
+							return Some((g.slots[i as usize].hashed, tier));
 						},
 
 						// Emptied since the mirror was read: the other tier.
@@ -2850,23 +3117,264 @@ impl<K, V> MergedStore<K, V> {
 				// handled yet. It is not a victim (its object is gone); it is
 				// retired in place, under the write lock the read lock could not
 				// be upgraded to, and the choice is made again.
-				let mut g = self.write_folded(s);
-				let before = g.totals();
-
-				if let Some(i) = g.freq_min_slot(tier) {
-					if g.slots[i as usize].object.is_none() {
-						g.retire_dead_slot(i, true);
-					}
-				}
-
-				self.apply_totals_delta(before, g.totals());
-				self.publish_mirrors(s, &g);
+				self.lfu_retire_dead_min(s, tier);
 
 				continue 'choose;
 			}
 
 			return None;
 		}
+	}
+
+	/// Retires `tier`'s minimum in shard `s` if it is a DEAD slot -- the
+	/// victim choosers' step for a minimum whose object a client already took
+	/// -- under the folded write lock, and republishes both mirrors.
+	fn lfu_retire_dead_min(&self, s: usize, tier: Tier) {
+		let mut g = self.write_folded(s);
+		let before = g.totals();
+
+		if let Some(i) = g.freq_min_slot(tier) {
+			if g.slots[i as usize].object.is_none() {
+				g.retire_dead_slot(i, true);
+			}
+		}
+
+		self.apply_totals_delta(before, g.totals());
+		self.publish_mirrors(s, &g);
+	}
+
+	/// `lfu-global-compact-hybrid`'s victim: the lexicographic minimum of
+	/// `(freq, stamp)` over BOTH mirror arrays -- `tails` (slow) and
+	/// `fast_tails` (fast) -- with equal pairs going to the slow tier. That is
+	/// `ArenaFrequencyChain::min_over_both_tiers` taken across 32 shards, and
+	/// exact for the reason the one-tier minimum is: each shard's tier is
+	/// frequency-ordered within itself, and a demotion keeps its stamp, so the
+	/// 64 mirrored pairs are one comparable ranking and the global LFU victim is
+	/// the least of them.
+	///
+	/// `SHARDS` * 2 relaxed loads and then ONE shard read lock. A DEAD minimum
+	/// -- a client deleted it and the worker has not handled the `Del` -- is
+	/// retired in place and the choice made again, as `lfu_slow_first_pick`
+	/// does (S4); it earns no credit, as a delete must not. If the chosen
+	/// shard's tier is empty -- the mirror was stale, which only a test driving
+	/// the store from several threads can arrange, since every policy-worker
+	/// section republishes before it releases -- the mirror is republished
+	/// and the choice made again; after a bounded number of such misses it
+	/// falls back to the slow-first scan, which always finds something if
+	/// anything is there. A liveness guard, not a policy -- and it nominates
+	/// what it returns exactly as the main path does, so a fast key it falls
+	/// back to still earns its credit.
+	///
+	/// A FAST victim is recorded in `lfu_nominated`, so the `take_evict` that
+	/// removes it can credit the refill; a slow victim clears the record.
+	fn lfu_global_victim(&self) -> Option<HashedKey> {
+		let mut misses = SHARDS;
+
+		loop {
+			let slow = self.lfu_min_entry(&self.tails);
+			let fast = self.lfu_min_entry(&self.fast_tails);
+
+			let (tier, s) = match (slow, fast) {
+				(None, None) => return None,
+				(Some((_, _, s)), None) => (Tier::Slow, s),
+				(None, Some((_, _, s))) => (Tier::Fast, s),
+
+				(Some((slow_freq, slow_seq, slow_shard)), Some((fast_freq, fast_seq, fast_shard))) => {
+					match (slow_freq, slow_seq) <= (fast_freq, fast_seq) {
+						true => (Tier::Slow, slow_shard),
+						false => (Tier::Fast, fast_shard),
+					}
+				},
+			};
+
+			{
+				let g = self.shards[s].read().unwrap();
+
+				match g.freq_min_slot(tier) {
+					Some(i) if g.slots[i as usize].object.is_some() => {
+						let key = g.slots[i as usize].hashed;
+
+						let nominated = match tier {
+							Tier::Fast => key,
+							Tier::Slow => NO_NOMINATION,
+						};
+
+						self.lfu_nominated.store(nominated, Ordering::Relaxed);
+
+						return Some(key);
+					},
+
+					// DEAD: retired below, then chosen again. Not a miss: each
+					// retire removes a slot, so this cannot loop forever.
+					Some(_) => {},
+
+					// Stale mirror. Republishing under the READ lock is sound:
+					// the mirrors are atomics, and no writer can be inside this
+					// shard.
+					None => {
+						self.publish_mirrors(s, &g);
+						drop(g);
+
+						if misses == 0 {
+							let fallback = self.lfu_slow_first_pick();
+
+							let nominated = match fallback {
+								Some((key, Tier::Fast)) => key,
+								_ => NO_NOMINATION,
+							};
+
+							self.lfu_nominated.store(nominated, Ordering::Relaxed);
+
+							return fallback.map(|(key, _)| key);
+						}
+
+						misses -= 1;
+
+						continue;
+					},
+				}
+			}
+
+			self.lfu_retire_dead_min(s, tier);
+		}
+	}
+
+	/// The promotion half of an LFU ACCESS -- a hit (`bump`) or an overwrite
+	/// (`worker_set`'s overwrite arm) -- run right after `bump_slot` moved slot
+	/// `i` to `new_freq`, under the same shard write guard. Returns whether it
+	/// promoted.
+	///
+	/// A slow, non-structural (S5) slot promotes when its new count STRICTLY
+	/// exceeds `fast_min`, the fast tier's global minimum read from the mirror
+	/// before the lock, or when the fast tier is empty: the reference rule,
+	/// `LfuCompactHybridStack::maybe_promote`. Under the global scope a count
+	/// EQUAL to `fast_min` also promotes when `lfu_refill_admits` it. A fast
+	/// slot is left alone.
+	///
+	/// One function for both callers, so the two access paths cannot drift on
+	/// the rule -- and so the promotion-follows-bump precondition
+	/// `promote_freq` asserts is met in one place.
+	fn lfu_maybe_promote(
+		&self,
+		g: &mut Inner<K, V>,
+		i: u32,
+		new_freq: u16,
+		fast_min: Option<u16>,
+		structural: bool,
+	) -> bool {
+		if structural || g.slots[i as usize].tier != Tier::Slow {
+			return false;
+		}
+
+		let migrating = g.slots[i as usize].migrating();
+
+		let promote = match fast_min {
+			None => true,
+			Some(min) if new_freq > min => true,
+
+			// Tested last, and only under the global scope, so every other LFU
+			// policy takes exactly the path it always took.
+			Some(min) => {
+				new_freq == min
+					&& self.lfu_global_eviction()
+					&& self.lfu_refill_admits(migrating)
+			},
+		};
+
+		if !promote {
+			return false;
+		}
+
+		let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
+		g.promote_freq(i, stamp);
+
+		// Every promotion spends credit, strict ones included -- as
+		// `LfuCompactHybridStack::maybe_promote` does. Always 0 -> 0 unless the
+		// scope is global, since nothing else ever credits it.
+		self.lfu_spend_credit(migrating);
+
+		true
+	}
+
+	/// Whether a slow key that has just TIED the fast minimum may refill room
+	/// fast evictions freed: its bytes fit in `refill_credit`, and the fast
+	/// tier with them stays at or under the level `settle_tier` arms at, so the
+	/// settle after this access demotes nothing.
+	///
+	/// That level is the settle's own -- `scale(own_eff(), high_ppm)`, eff
+	/// being the budget less the reservation for every LINKED key (or the
+	/// pushed M) -- which the promoted key is already part of, so promoting it
+	/// does not change it. `lfu-global-eviction` as first written reserved
+	/// `len() x shared_overhead`, the object map's count, which since the
+	/// policy work moved onto the worker includes values the worker has not
+	/// linked yet and so is not what the settle charges;
+	/// `LfuCompactHybridStack::refill_admits` takes the settle's own budget
+	/// the same way (`drain_target::bytes(effective_fast_capacity())`).
+	///
+	/// A zero credit refuses outright, as in the split stack's
+	/// `refill_admits`: under the split layout an EMPTY value migrates zero
+	/// bytes (`resident_value_bytes(0)` is 0), and `0 > 0` is false, so the
+	/// size test alone would let such a slot refill with no eviction behind it.
+	fn lfu_refill_admits(&self, migrating: CacheSize) -> bool {
+		let credit = self.refill_credit.load(Ordering::Relaxed);
+
+		if credit == 0 || migrating > credit {
+			return false;
+		}
+
+		let target = scale(self.own_eff(), self.high_ppm.load(Ordering::Relaxed));
+
+		self.fast_used.load(Ordering::Relaxed) + migrating <= target
+	}
+
+	/// `refill_credit -= bytes`, saturating at zero. A compare-and-swap loop
+	/// rather than `fetch_sub`, which would wrap on a race with the zeroing in
+	/// `settle_tier` and hand out a near-infinite credit.
+	fn lfu_spend_credit(&self, bytes: CacheSize) {
+		let mut current = self.refill_credit.load(Ordering::Relaxed);
+
+		while current != 0 {
+			match self.refill_credit.compare_exchange_weak(
+				current,
+				current.saturating_sub(bytes),
+				Ordering::Relaxed,
+				Ordering::Relaxed,
+			) {
+				Ok(_) => return,
+				Err(actual) => current = actual,
+			}
+		}
+	}
+
+	/// Consumes `lfu_global_victim`'s nomination if it names `key`, and then --
+	/// only then -- adds `credit` bytes to the refill credit. Called on the
+	/// policy worker's removals of a slot under `Lfu`: by `take_evict`, which
+	/// passes the slot's migrating bytes when the slot is fast, and by
+	/// `retire_dead`, which passes 0. Consuming on removal is what keeps a
+	/// nomination from outliving its key: see `lfu_nominated`.
+	///
+	/// A relaxed load first, so the common case -- the key is not the one
+	/// nominated -- costs no read-modify-write. The compare-and-swap then
+	/// makes exactly one of two racing removals of the key the consumer.
+	fn lfu_consume_nomination(&self, key: HashedKey, credit: CacheSize) {
+		if key == NO_NOMINATION || self.lfu_nominated.load(Ordering::Relaxed) != key {
+			return;
+		}
+
+		let consumed = self
+			.lfu_nominated
+			.compare_exchange(key, NO_NOMINATION, Ordering::Relaxed, Ordering::Relaxed)
+			.is_ok();
+
+		if consumed && credit > 0 {
+			self.refill_credit.fetch_add(credit, Ordering::Relaxed);
+		}
+	}
+
+	/// The refill credit, for tests and fidelity checks.
+	#[cfg(test)]
+	pub(crate) fn refill_credit(&self) -> CacheSize {
+		self.refill_credit.load(Ordering::Relaxed)
 	}
 
 	/// Where a brand-new key is admitted under `Lfu`, decided on the policy
@@ -3229,12 +3737,10 @@ impl<K, V> MergedStore<K, V> {
 					g.demote_freq_in_place(i, stamp);
 				}
 
-				let promoted = !fast && !structural && fast_min.is_none_or(|min| new_freq > min);
-
-				if promoted {
-					let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
-					g.promote_freq(i, stamp);
-				}
+				// A slot that was slow before the overwrite: the strict rule, or
+				// under the global scope a refill on a tie (`lfu_maybe_promote`).
+				// `!fast` first -- a slot just demoted in place is slow now too.
+				let promoted = !fast && self.lfu_maybe_promote(g, i, new_freq, fast_min, structural);
 
 				After { demoted, settle: true, promoted }
 			},
@@ -3261,7 +3767,8 @@ impl<K, V> MergedStore<K, V> {
 			MergedOrder::Lru | MergedOrder::Fifo => self.oldest_tail_key(),
 			MergedOrder::Clock => self.clock_victim(log),
 
-			// The minimum over 32 `(freq, stamp)` mirrors, slow tier first.
+			// The minimum over 32 `(freq, stamp)` mirrors, slow tier first --
+			// or over all 64, both tiers at once, under the global scope.
 			MergedOrder::Lfu => self.lfu_victim(),
 		}
 	}
@@ -3461,6 +3968,11 @@ impl<K, V> MergedStore<K, V> {
 	/// client's delete and re-set of the nominated key leaves an unlinked
 	/// value under it, and `erase` then answers `KeyNotFound` and the loop
 	/// nominates again.
+	///
+	/// Under `lfu-global-compact-hybrid` this is the one removal that may
+	/// credit the refill: the eviction of the FAST key `lfu_global_victim`
+	/// nominated. Its bytes are read after the fold, from the object being
+	/// evicted.
 	pub fn take_evict(&self, key: &HashedKey) -> Option<Object<K, V>> {
 		let s = shard_of(*key);
 		let lfu = self.order() == MergedOrder::Lfu;
@@ -3474,6 +3986,20 @@ impl<K, V> MergedStore<K, V> {
 		}
 
 		let before = g.totals();
+
+		// Read before `unlink_linked`, while the slot still says which tier it
+		// was in. Every removal consumes a nomination of its key, crediting or
+		// not; only a fast slot's credits.
+		if lfu {
+			let slot = &g.slots[i as usize];
+
+			let credit = match slot.tier {
+				Tier::Fast => slot.migrating(),
+				Tier::Slow => 0,
+			};
+
+			self.lfu_consume_nomination(slot.hashed, credit);
+		}
 
 		g.unlink_linked(i, lfu);
 		let taken = g.free_slot(i);
@@ -3561,6 +4087,12 @@ impl<K, V> MergedStore<K, V> {
 		let Some(j) = g.find_dead(key) else { return false };
 
 		let before = g.totals();
+
+		// A removal, not an eviction: it consumes a nomination of the key and
+		// credits nothing (see `lfu_nominated`).
+		if lfu {
+			self.lfu_consume_nomination(key, 0);
+		}
 
 		g.retire_dead_slot(j, lfu);
 
@@ -3739,8 +4271,11 @@ impl<K, V> MergedStore<K, V> {
 
 		// An empty cache has reached no capacity, so admission reopens --
 		// `LfuCompactHybridStack::clear` resets `fast_tier_latched` for the
-		// same reason.
+		// same reason -- and the refill credit and the nomination with it, as
+		// `LfuCompactHybridStack::clear` zeroes `refill_credit`.
 		self.lfu_latched.store(false, Ordering::Relaxed);
+		self.refill_credit.store(0, Ordering::Relaxed);
+		self.lfu_nominated.store(NO_NOMINATION, Ordering::Relaxed);
 
 		cleared
 	}
@@ -3920,12 +4455,14 @@ impl<K, V> MergedStore<K, V> {
 			match lfu {
 				true => {
 					for tier in [Tier::Fast, Tier::Slow] {
-						for (_, &(head, _)) in g.freq_buckets(tier).iter() {
-							let mut i = head;
+						for bucket in g.freq_buckets(tier).values() {
+							for head in [bucket.head, bucket.demoted_head] {
+								let mut i = head;
 
-							while i != NIL {
-								listed.push(i);
-								i = g.slots[i as usize].next;
+								while i != NIL {
+									listed.push(i);
+									i = g.slots[i as usize].next;
+								}
 							}
 						}
 					}
@@ -3999,13 +4536,17 @@ impl<K, V> MergedStore<K, V> {
 		let mut out = Vec::new();
 
 		out.push(format!(
-			"store clock={} fast_used={} slow_used={} fast_count={} linked={} latched={}",
+			"store clock={} fast_used={} slow_used={} fast_count={} linked={} latched={} \
+			 lfu_global={} refill_credit={} lfu_nominated={:#x}",
 			self.clock.load(Ordering::Relaxed),
 			self.fast_used.load(Ordering::Relaxed),
 			self.slow_used.load(Ordering::Relaxed),
 			self.fast_count.load(Ordering::Relaxed),
 			self.linked(),
 			self.lfu_latched(),
+			self.lfu_global_eviction(),
+			self.refill_credit.load(Ordering::Relaxed),
+			self.lfu_nominated.load(Ordering::Relaxed),
 		));
 
 		for (s, (t, f)) in self.tails.iter().zip(self.fast_tails.iter()).enumerate() {
@@ -4036,12 +4577,14 @@ impl<K, V> MergedStore<K, V> {
 			}
 
 			for tier in [Tier::Fast, Tier::Slow] {
-				for (_, &(head, _)) in g.freq_buckets(tier).iter() {
-					let mut i = head;
+				for bucket in g.freq_buckets(tier).values() {
+					for head in [bucket.head, bucket.demoted_head] {
+						let mut i = head;
 
-					while i != NIL {
-						listed.push(i);
-						i = g.slots[i as usize].next;
+						while i != NIL {
+							listed.push(i);
+							i = g.slots[i as usize].next;
+						}
 					}
 				}
 			}
@@ -5903,6 +6446,14 @@ mod tests {
 		(mix(i) >> SHARD_BITS) | (sh << (64 - SHARD_BITS))
 	}
 
+	/// A bucket's two lists as `(head, tail)` pairs: arrived, then demoted.
+	fn lists(bucket: &FreqBucket) -> [(u32, u32); 2] {
+		[
+			(bucket.head, bucket.tail),
+			(bucket.demoted_head, bucket.demoted_tail),
+		]
+	}
+
 	/// Sum of what every live slot claims to be migrating, walked through the
 	/// FREQUENCY BUCKETS.
 	///
@@ -5917,12 +6468,14 @@ mod tests {
 				let mut total = 0;
 
 				for tier in [Tier::Fast, Tier::Slow] {
-					for (_, &(head, _)) in g.freq_buckets(tier).iter() {
-						let mut i = head;
+					for bucket in g.freq_buckets(tier).values() {
+						for (head, _) in lists(bucket) {
+							let mut i = head;
 
-						while i != NIL {
-							total += g.slots[i as usize].migrating();
-							i = g.slots[i as usize].next;
+							while i != NIL {
+								total += g.slots[i as usize].migrating();
+								i = g.slots[i as usize].next;
+							}
 						}
 					}
 				}
@@ -6165,6 +6718,72 @@ mod tests {
 		assert!(s.lfu_latched.load(Ordering::Relaxed), "a shrink reopened admission");
 	}
 
+	/// A DEMOTION does not re-rank a key among its equals: it keeps the place
+	/// it earned when it reached its count, so it leaves before slow keys that
+	/// reached the same count after it -- the flat `LfuCompactStack`'s order.
+	///
+	/// This is the re-append regression test. Before the fix a demotion
+	/// restamped the key and appended it behind every slow key at its count,
+	/// and this drain came out `d e a f b c`.
+	///
+	/// ONE shard, so the order is decided inside a bucket and not by the mirror;
+	/// and two separate demotions with an admission between them, so the slow
+	/// bucket really is two interleaved streams -- `d e f` arrived while slow,
+	/// `a b` were demoted -- and the drain has to merge them by stamp.
+	#[test]
+	fn a_demoted_key_keeps_its_place_among_equal_counts() {
+		let m = migrating_bytes(128);
+
+		// Not a fast tier of exactly 3m, as `lfu-global-eviction` had it: S5
+		// gates admission at the settle's target, `high_ppm` of the tier, so 3m
+		// would refuse `c`. This is the smallest tier whose target still admits
+		// exactly `a b c`, which keeps the fixture's intent and both shrinks
+		// below demoting exactly one key each.
+		let s = lfu((3 * m * 1_000_000).div_ceil(DEFAULT_HIGH_PPM) + 1);
+
+		let [a, b, c, d, e, f] = [1, 2, 3, 4, 5, 6].map(|i| in_test_shard(7, i));
+
+		// `a b c` fill the fast tier; `d` is refused and latches admission, so
+		// `d` and `e` enter the slow tier at count 1, AFTER `a b c` reached it.
+		for k in [a, b, c, d, e] {
+			put(&s, k, 128);
+		}
+
+		assert_eq!(
+			[a, b, c, d, e].map(|k| s.tier_of(k)),
+			[Some(Tier::Fast), Some(Tier::Fast), Some(Tier::Fast), Some(Tier::Slow), Some(Tier::Slow)],
+			"the fixture did not fill the fast tier with exactly a, b, c",
+		);
+
+		// 3m > 0.98 x 2.5m, and 2m <= 0.95 x 2.5m: exactly ONE demotion, `a`.
+		s.resize_fast_tier(m * 5 / 2);
+		assert_eq!(s.tier_of(a), Some(Tier::Slow), "the first shrink did not demote a");
+		assert_eq!(s.tier_of(b), Some(Tier::Fast), "the first shrink demoted b too");
+
+		put(&s, f, 128);
+
+		// 2m > 0.98 x 1.5m, and m <= 0.95 x 1.5m: exactly one more, `b`.
+		s.resize_fast_tier(m * 3 / 2);
+		assert_eq!(s.tier_of(b), Some(Tier::Slow), "the second shrink did not demote b");
+		assert_eq!(s.tier_of(c), Some(Tier::Fast), "the second shrink demoted c too");
+
+		// Every key is still at count 1, so the drain is decided by the
+		// tie-break alone: slow keys first (the deliberate shield of `c`), in
+		// the order they REACHED count 1 -- a, b, d, e, f -- then `c`.
+		let mut drained = Vec::new();
+
+		while let Some(k) = s.tail_key() {
+			assert!(s.take(&k).is_some(), "nominated victim must be present");
+			drained.push(k);
+		}
+
+		assert_eq!(
+			drained,
+			vec![a, b, d, e, f, c],
+			"a demoted key was re-ranked as the newest entrant at its count",
+		);
+	}
+
 	/// The gauge drift test, for this order's own mutation sites.
 	///
 	/// Every path below goes through the same `totals()` bracket the other
@@ -6310,38 +6929,570 @@ mod tests {
 			let mut seen = std::collections::HashSet::new();
 
 			for tier in [Tier::Fast, Tier::Slow] {
-				for (&bucket_freq, &(head, tail)) in g.freq_buckets(tier).iter() {
-					let mut i = head;
-					let mut last = NIL;
+				for (&bucket_freq, bucket) in g.freq_buckets(tier).iter() {
+					assert!(!bucket.is_empty(), "an empty bucket was kept");
 
-					while i != NIL {
-						assert!(seen.insert(i), "slot {i} is on two frequency buckets");
+					if tier == Tier::Fast {
 						assert_eq!(
-							g.slots[i as usize].freq, bucket_freq,
-							"slot {i} is in the bucket for a frequency it does not hold",
+							bucket.demoted_head, NIL,
+							"a FAST bucket has a demoted list -- something was demoted into it",
 						);
-						assert_eq!(
-							g.slots[i as usize].tier, tier,
-							"slot {i} is in the wrong tier's bucket set",
-						);
-						assert!(
-							g.slots[i as usize].object.is_some(),
-							"slot {i} is bucketed but holds no object -- it is recycled",
-						);
-
-						bucketed += 1;
-						last = i;
-						i = g.slots[i as usize].next;
-
-						assert!(bucketed <= s.len() + 1, "a bucket chain does not terminate");
 					}
 
-					assert_eq!(tail, last, "a bucket's tail is not the end of its chain");
+					for (head, tail) in lists(bucket) {
+						let mut i = head;
+						let mut last = NIL;
+
+						assert!(
+							head == NIL || g.slots[head as usize].prev == NIL,
+							"a list head has a predecessor",
+						);
+
+						while i != NIL {
+							assert!(seen.insert(i), "slot {i} is on two frequency buckets");
+							assert_eq!(
+								g.slots[i as usize].freq, bucket_freq,
+								"slot {i} is in the bucket for a frequency it does not hold",
+							);
+							assert_eq!(
+								g.slots[i as usize].tier, tier,
+								"slot {i} is in the wrong tier's bucket set",
+							);
+							assert!(
+								g.slots[i as usize].object.is_some(),
+								"slot {i} is bucketed but holds no object -- it is recycled",
+							);
+
+							bucketed += 1;
+							last = i;
+							i = g.slots[i as usize].next;
+
+							assert!(bucketed <= s.len() + 1, "a bucket chain does not terminate");
+						}
+
+						assert_eq!(tail, last, "a list's tail is not the end of its chain");
+					}
 				}
 			}
 		}
 
 		assert_eq!(bucketed, s.len(), "bucket membership disagrees with the tracked total");
+	}
+
+	// ── lfu-global-compact-hybrid ────────────────────────────────────────
+
+	fn lfu_global(fast_capacity: CacheSize) -> Driven {
+		let s = lfu(fast_capacity);
+		s.set_lfu_global_eviction(true);
+		s
+	}
+
+	/// `a` and `b` admitted fast at count 1, `c`, `d` and `e` admitted slow at
+	/// count 1 once the tier is full (the latch shuts on `c`), then `a` hit
+	/// once. One key per shard, so every choice below is made across the
+	/// mirrors rather than inside one bucket. Needs a fast tier of 2.5 slots
+	/// (S5's gate at 0.98 of it still admits two and refuses the third).
+	fn global_cohort(s: &Driven) -> [HashedKey; 5] {
+		let keys = [1, 2, 3, 4, 5].map(|i| in_test_shard(i, i));
+
+		for k in keys {
+			put(s, k, 128);
+		}
+
+		s.touch(keys[0]);
+		s.drain_migrations();
+
+		assert_eq!(
+			keys.map(|k| s.tier_of(k)),
+			[Some(Tier::Fast), Some(Tier::Fast), Some(Tier::Slow), Some(Tier::Slow), Some(Tier::Slow)],
+			"the fixture did not fill the fast tier with exactly a and b",
+		);
+
+		keys
+	}
+
+	/// The victim rule, the credit and the refill, through the store's own API.
+	/// Slow-first nominates `c`; global nominates `b`, which reached count 1
+	/// first. Only the eviction (`take_evict`) of that nominated fast victim
+	/// earns credit -- nominating does not, and neither does removing some
+	/// other fast key it did not nominate. The credit then admits exactly one
+	/// tie into the freed room, with no demotion.
+	#[test]
+	fn global_lfu_evicts_across_tiers_and_credits_only_its_own_fast_victim() {
+		let m = migrating_bytes(128);
+
+		let slow_first = lfu(m * 5 / 2);
+		let [_, _, c, _, _] = global_cohort(&slow_first);
+		assert_eq!(slow_first.tail_key(), Some(c), "slow-first shields the fast tier");
+
+		let s = lfu_global(m * 5 / 2);
+		let [a, b, c, d, e] = global_cohort(&s);
+
+		assert_eq!(s.tail_key(), Some(b), "b reached count 1 before c, d and e");
+		assert_eq!(s.refill_credit(), 0, "nominating is not evicting");
+
+		assert!(s.take(&b).is_some());
+		assert_eq!(s.refill_credit(), m, "the fast victim's bytes are credited");
+		assert_eq!((s.fast_object_count(), s.fast_bytes_used()), (1, m));
+		assert_eq!(s.drain_migrations(), vec![], "a fast victim is freed in place");
+		assert!(s.lfu_latched.load(Ordering::Relaxed), "evicting does not reopen admission");
+		s.verify_gauges();
+
+		s.touch(d);            // count 2, ties `a` at the fast minimum
+
+		assert_eq!(s.tier_of(d), Some(Tier::Fast), "the tie refilled the freed room");
+		assert_eq!(s.drain_migrations(), vec![(d, Tier::Fast)], "and demoted nothing");
+		assert_eq!(s.refill_credit(), 0);
+
+		s.touch(e);            // ties too, with the credit spent
+
+		assert_eq!(s.tier_of(e), Some(Tier::Slow));
+		assert_eq!(s.tier_of(a), Some(Tier::Fast));
+		assert_eq!(s.tier_of(c), Some(Tier::Slow));
+		s.verify_gauges();
+
+		// Removing a fast key that was never nominated earns nothing, and
+		// neither does a slow victim.
+		let s = lfu_global(m * 5 / 2);
+		let [_, b, c, _, _] = global_cohort(&s);
+
+		assert!(s.take(&b).is_some(), "a removal nothing nominated");
+		assert_eq!(s.refill_credit(), 0, "an un-nominated removal earned credit");
+
+		assert_eq!(s.tail_key(), Some(c));
+		assert!(s.take(&c).is_some());
+		assert_eq!(s.refill_credit(), 0, "a slow victim earned credit");
+	}
+
+	/// A demotion means the fast tier is full again, so it zeroes the credit,
+	/// as `LfuCompactHybridStack::settle_fast_tier` does.
+	#[test]
+	fn a_demotion_zeroes_the_merged_refill_credit() {
+		let m = migrating_bytes(128);
+		let s = lfu_global(m * 5 / 2);
+		let [a, b, ..] = global_cohort(&s);
+
+		assert_eq!(s.tail_key(), Some(b));
+		assert!(s.take(&b).is_some());
+		assert_eq!(s.refill_credit(), m);
+
+		s.resize_fast_tier(m / 2);
+
+		assert_eq!(s.tier_of(a), Some(Tier::Slow), "the shrink did not demote a");
+		assert_eq!(s.refill_credit(), 0, "the demotion left the credit standing");
+	}
+
+	/// Puts `key` back after it was removed and gets it into the fast tier --
+	/// admitted there if a grow reopened admission, promoted there by two hits
+	/// (count 3, above `a`'s 2) if not -- so a later `take` of it would earn
+	/// credit if a nomination of it were still standing.
+	fn bring_back_fast(s: &Driven, key: HashedKey) {
+		put(s, key, 128);
+		s.touch(key);
+		s.touch(key);
+		s.drain_migrations();
+
+		assert_eq!(s.tier_of(key), Some(Tier::Fast), "the fixture did not get the key back into DRAM");
+	}
+
+	/// A nomination lives exactly as long as the key it names: the worker's
+	/// first removal of that key consumes it, by any path, in either tier.
+	///
+	/// Three ways the nominated fast key `b` can leave without being the
+	/// eviction the credit is for -- demoted before the worker's `take`, so
+	/// the take removes a SLOW key; deleted by a client between the nomination
+	/// and the take, and retired at its `Del`; deleted by a client and retired
+	/// by the victim chooser itself, which finds it DEAD at the minimum -- and
+	/// each time nothing is credited, and a later `take` of the same key, back
+	/// in DRAM, earns nothing either.
+	#[test]
+	fn a_nomination_dies_with_its_key_whatever_removes_it() {
+		let m = migrating_bytes(128);
+
+		// Demoted between the nomination and the take.
+		let s = lfu_global(m * 5 / 2);
+		let [_, b, ..] = global_cohort(&s);
+
+		assert_eq!(s.tail_key(), Some(b), "b is the fast victim");
+		s.resize_fast_tier(m * 3 / 2);
+		assert_eq!(s.tier_of(b), Some(Tier::Slow), "the shrink did not demote b");
+
+		assert!(s.take(&b).is_some(), "the worker's take of its now-slow victim");
+		assert_eq!(s.refill_credit(), 0, "a slow victim earned credit");
+
+		s.resize_fast_tier(m * 5 / 2);
+		bring_back_fast(&s, b);
+
+		assert!(s.take(&b).is_some(), "a removal of b, back in DRAM");
+		assert_eq!(s.refill_credit(), 0, "the stale nomination credited a removal");
+		s.verify_gauges();
+
+		// Deleted by a client -- `take_if`, the API delete and the TTL reaper --
+		// between the nomination and the take, and retired at its `Del`.
+		//
+		// On `lfu-global-eviction` the client's `take_if` removed the slot and
+		// consumed the nomination itself. Here a client's delete changes no
+		// policy state (T15): it leaves the slot DEAD, and the policy worker's
+		// `retire_dead` -- its handling of the `Del` -- is the removal, so that
+		// is where the nomination dies.
+		let s = lfu_global(m * 5 / 2);
+		let [_, b, ..] = global_cohort(&s);
+
+		assert_eq!(s.tail_key(), Some(b));
+		assert!(s.take_if(&b, |_| true).is_some(), "a delete in the window");
+		assert_eq!(s.refill_credit(), 0, "a delete earned credit");
+		assert!(s.take(&b).is_none(), "the worker's take finds its victim gone");
+		assert_eq!(s.refill_credit(), 0);
+		assert!(s.retire_dead(b), "the worker's Del found no DEAD slot to retire");
+		assert_eq!(s.refill_credit(), 0, "a retire earned credit");
+
+		bring_back_fast(&s, b);
+
+		assert!(s.take(&b).is_some());
+		assert_eq!(s.refill_credit(), 0, "the delete left the nomination standing");
+		s.verify_charges(true);
+
+		// Deleted by a client and retired by the victim chooser (S4), which
+		// reaches the DEAD `b` at the global minimum before the worker handles
+		// the `Del`: it is retired in place, credits nothing, and the choice
+		// moves on to `c`.
+		//
+		// This replaces `lfu-global-eviction`'s `remove_key` case: here
+		// `remove_key` is test support for `take_evict` -- an eviction, which a
+		// nominated fast key rightly credits -- and the non-crediting removals
+		// are the two above and this one.
+		let s = lfu_global(m * 5 / 2);
+		let [_, b, c, ..] = global_cohort(&s);
+
+		assert_eq!(s.tail_key(), Some(b));
+		assert!(s.take_if(&b, |_| true).is_some(), "a delete in the window");
+		assert!(s.take(&b).is_none(), "the worker's take finds its victim gone");
+
+		assert_eq!(s.tail_key(), Some(c), "the chooser did not move past the DEAD minimum");
+		assert_eq!(s.refill_credit(), 0, "retiring a DEAD fast minimum earned credit");
+		assert!(!s.retire_dead(b), "the chooser left the DEAD slot standing");
+
+		bring_back_fast(&s, b);
+
+		assert!(s.take(&b).is_some());
+		assert_eq!(s.refill_credit(), 0, "a nomination outlived the slot the chooser retired");
+		s.verify_charges(true);
+	}
+
+	/// The refill's room test counts this store's per-object reservation,
+	/// `linked() x shared_overhead` over every linked object -- which every
+	/// other global-LFU test leaves at zero. `a` and `b` fill the fast tier,
+	/// `c`, `d` and `e` go slow, and evicting `b` earns one object of credit.
+	/// Two more slow admissions then shrink the effective budget by two
+	/// reservations, so `d`'s tie -- covered by the credit, and with room
+	/// against the raw capacity -- no longer fits and stays slow, while the
+	/// smaller `f` still fits and refills. Neither demotes anything.
+	#[test]
+	fn a_merged_refill_counts_the_shared_overhead_reservation() {
+		let m = migrating_bytes(128);
+		let small = migrating_bytes(16);
+		let overhead = m / 4;
+
+		// Two objects just fit the high watermark with five reservations out.
+		let capacity = (2 * m * 1_000_000).div_ceil(DEFAULT_HIGH_PPM) + 5 * overhead;
+
+		let s = Store::new();
+		s.set_order(MergedOrder::Lfu);
+		s.set_lfu_global_eviction(true);
+		s.configure_tiering(capacity, overhead, DEFAULT_HIGH_PPM, DEFAULT_LOW_PPM);
+		let s = Driven::new(s);
+
+		let [a, b, c, d, e, f, g] = [1, 2, 3, 4, 5, 6, 7].map(|i| in_test_shard(i, i));
+
+		for k in [a, b, c, d, e] {
+			put(&s, k, 128);
+		}
+
+		s.touch(a);
+		s.drain_migrations();
+
+		assert_eq!(
+			[a, b, c].map(|k| s.tier_of(k)),
+			[Some(Tier::Fast), Some(Tier::Fast), Some(Tier::Slow)],
+			"the fixture did not fill the fast tier with exactly a and b",
+		);
+
+		assert_eq!(s.tail_key(), Some(b));
+		assert!(s.take(&b).is_some());
+		assert_eq!(s.refill_credit(), m);
+
+		put(&s, f, 16);
+		put(&s, g, 128);
+		s.drain_migrations();
+
+		assert_eq!((s.tier_of(f), s.tier_of(g)), (Some(Tier::Slow), Some(Tier::Slow)), "admission is latched");
+		assert_eq!((s.len(), s.linked()), (6, 6));
+
+		let reserved = capacity - 6 * overhead;
+
+		assert!(
+			m + m <= scale(capacity, DEFAULT_HIGH_PPM) && m + m > scale(reserved, DEFAULT_HIGH_PPM),
+			"the fixture no longer tells the reserved budget from the raw one",
+		);
+		assert!(m + small <= scale(reserved, DEFAULT_HIGH_PPM), "the fixture leaves no room for f");
+
+		s.touch(d);            // count 2, ties `a`: credit covers it, the reservation does not
+
+		assert_eq!(s.tier_of(d), Some(Tier::Slow), "the refill ignored the shared-overhead reservation");
+		assert_eq!(s.drain_migrations(), vec![]);
+		assert_eq!(s.refill_credit(), m, "a refused refill spends nothing");
+
+		s.touch(f);            // count 2, ties `a`, and fits
+
+		assert_eq!(s.tier_of(f), Some(Tier::Fast));
+		assert_eq!(s.drain_migrations(), vec![(f, Tier::Fast)], "and demoted nothing");
+		assert_eq!(s.refill_credit(), m - small);
+		assert_eq!(s.tier_of(e), Some(Tier::Slow));
+		s.verify_gauges();
+	}
+
+	/// The reservation the refill counts is the LINKED keys', not the object
+	/// map's: a value a client has published and the worker has not linked yet
+	/// is reserved by neither the settle nor the refill, so it cannot refuse a
+	/// refill the settle would keep.
+	///
+	/// New with the merge of `lfu-global-eviction`, which reserved `len() x
+	/// shared_overhead`: here `len()` counts unlinked values too and the settle
+	/// reserves `linked()`, so that check would refuse this tie although the
+	/// settle after it demotes nothing.
+	#[test]
+	fn a_merged_refill_reserves_only_what_the_settle_reserves() {
+		let m = migrating_bytes(128);
+		let overhead = m / 4;
+
+		// Two objects just fit the high watermark with five reservations out.
+		let capacity = (2 * m * 1_000_000).div_ceil(DEFAULT_HIGH_PPM) + 5 * overhead;
+
+		let s = Store::new();
+		s.set_order(MergedOrder::Lfu);
+		s.set_lfu_global_eviction(true);
+		s.configure_tiering(capacity, overhead, DEFAULT_HIGH_PPM, DEFAULT_LOW_PPM);
+		let s = Driven::new(s);
+
+		let [a, b, c, d, e] = [1, 2, 3, 4, 5].map(|i| in_test_shard(i, i));
+
+		for k in [a, b, c, d, e] {
+			put(&s, k, 128);
+		}
+
+		s.touch(a);
+		s.drain_migrations();
+
+		assert_eq!(s.tail_key(), Some(b));
+		assert!(s.take(&b).is_some());
+		assert_eq!(s.refill_credit(), m);
+
+		// Two values published by a client and not yet linked: in `len()`,
+		// not in `linked()`.
+		for i in [6, 7] {
+			let k = in_test_shard(i, i);
+			s.insert(k, Object::new(k, &[0u8; 128], None));
+		}
+
+		assert_eq!((s.len(), s.linked()), (6, 4));
+
+		let by_len = capacity - 6 * overhead;
+		let by_linked = capacity - 4 * overhead;
+
+		assert!(
+			m + m > scale(by_len, DEFAULT_HIGH_PPM) && m + m <= scale(by_linked, DEFAULT_HIGH_PPM),
+			"the fixture no longer tells the linked reservation from the map's",
+		);
+
+		s.touch(d);            // count 2, ties `a`, fits the budget the settle sees
+
+		assert_eq!(s.tier_of(d), Some(Tier::Fast), "the refill reserved for unlinked values");
+		assert_eq!(s.drain_migrations(), vec![(d, Tier::Fast)], "and the settle demoted nothing");
+		assert_eq!(s.refill_credit(), 0);
+		s.verify_gauges();
+	}
+
+	/// A zero credit refuses a refill outright, even for a slot that migrates
+	/// nothing -- an empty value under the split layout, where `0 > 0` would
+	/// have let it through with no eviction behind it. Under `thin_header`
+	/// every slot migrates its item prefix, so no slot can reach this.
+	///
+	/// Gated on `thin_header` rather than `fused_value`, as
+	/// `lfu-global-eviction` had it: the fused layout is gone, and
+	/// `thin_header` is the layout whose value allocation carries a header.
+	#[cfg(not(feature = "thin_header"))]
+	#[test]
+	fn a_merged_refill_needs_credit_even_for_a_slot_that_migrates_nothing() {
+		let m = migrating_bytes(128);
+		let s = lfu_global(m * 5 / 2);
+		let [a, b, ..] = global_cohort(&s);
+		let z = in_test_shard(6, 6);
+
+		s.touch(b);            // both fast keys at count 2
+		put(&s, z, 0);         // latched, so slow
+		s.drain_migrations();
+
+		assert_eq!(migrating_bytes(0), 0, "an empty value migrates bytes here after all");
+		assert_eq!((s.tier_of(a), s.tier_of(z)), (Some(Tier::Fast), Some(Tier::Slow)));
+		assert_eq!(s.refill_credit(), 0);
+
+		s.touch(z);            // count 2, ties the fast minimum
+
+		assert_eq!(s.tier_of(z), Some(Tier::Slow), "no eviction, no credit, no refill");
+		assert_eq!(s.drain_migrations(), vec![]);
+	}
+
+	/// The global victim choice, the credit and the refill under contention:
+	/// eight threads admitting, hitting, evicting by key and resizing, each
+	/// with a log of its own, and two more evicting the way `apply_evictions`
+	/// does -- nominate, then take. Races on the credit are allowed (it only
+	/// decides WHEN a promotion may happen), but the tier accounting must come
+	/// out exact and every live slot must still be on exactly one bucket of
+	/// its own tier.
+	#[test]
+	fn concurrent_global_lfu_evictions_keep_the_accounting_exact() {
+		use std::sync::Arc;
+		use std::sync::atomic::AtomicBool;
+
+		let s = Arc::new(Store::new());
+		s.set_order(MergedOrder::Lfu);
+		s.set_lfu_global_eviction(true);
+		s.configure_tiering(64 * 1_024, 0, DEFAULT_HIGH_PPM, DEFAULT_LOW_PPM);
+
+		let done = Arc::new(AtomicBool::new(false));
+
+		let evictors: Vec<_> = (0..2)
+			.map(|_| {
+				let s = Arc::clone(&s);
+				let done = Arc::clone(&done);
+
+				std::thread::spawn(move || {
+					let mut log = MigrationLog::default();
+					let mut evicted = 0u64;
+
+					while !done.load(Ordering::Relaxed) {
+						if s.fast_bytes_used() + s.slow_bytes_used() <= 96 * 1_024 {
+							std::thread::yield_now();
+							continue;
+						}
+
+						if let Some(k) = s.tail_key(&mut log)
+							&& s.take_evict(&k).is_some()
+						{
+							evicted += 1;
+						}
+					}
+
+					evicted
+				})
+			})
+			.collect();
+
+		let workers: Vec<_> = (0..8u64)
+			.map(|t| {
+				let s = Arc::clone(&s);
+
+				std::thread::spawn(move || {
+					// Each thread both publishes and links -- a client and a
+					// worker in one -- with a log of its own.
+					let mut log = MigrationLog::default();
+
+					for i in 1..=2_000u64 {
+						let key = mix(t * 1_000_000 + i);
+
+						put_with(&s, &mut log, key, 128);
+						s.touch(mix(t * 1_000_000 + (i / 2).max(1)), &mut log);
+						s.touch(mix(t * 1_000_000 + (i / 3).max(1)), &mut log);
+
+						if i % 13 == 0 {
+							s.remove_key(mix(t * 1_000_000 + i / 13));
+						}
+
+						if i % 17 == 0 {
+							s.take_evict(&mix(t * 1_000_000 + i / 17));
+						}
+
+						if i % 211 == 0 {
+							s.resize_fast_tier(32 * 1_024 * (1 + i % 3), &mut log);
+						}
+					}
+				})
+			})
+			.collect();
+
+		for w in workers {
+			w.join().expect("a worker panicked -- or the settle loop deadlocked");
+		}
+
+		done.store(true, Ordering::Relaxed);
+
+		let evicted: u64 = evictors
+			.into_iter()
+			.map(|e| e.join().expect("an evictor panicked"))
+			.sum();
+
+		assert!(evicted > 0, "nothing was ever evicted, so the victim path is untested");
+
+		s.verify_gauges();
+
+		assert_eq!(
+			s.fast_object_count() + s.slow_object_count(),
+			s.len(),
+			"the tier counts lost track of objects under contention",
+		);
+
+		let (mut bucketed, mut fast_bytes) = (0usize, 0);
+
+		for lock in s.shards.iter() {
+			let g = lock.read().unwrap();
+
+			for tier in [Tier::Fast, Tier::Slow] {
+				for bucket in g.freq_buckets(tier).values() {
+					for (head, _) in lists(bucket) {
+						let mut i = head;
+
+						while i != NIL {
+							assert_eq!(g.slots[i as usize].tier, tier, "slot {i} is in the wrong tier's buckets");
+							assert!(g.slots[i as usize].object.is_some(), "slot {i} is bucketed but recycled");
+
+							if tier == Tier::Fast {
+								fast_bytes += g.slots[i as usize].migrating();
+							}
+
+							bucketed += 1;
+							i = g.slots[i as usize].next;
+
+							assert!(bucketed <= s.len() + 1, "a bucket chain does not terminate");
+						}
+					}
+				}
+			}
+		}
+
+		assert_eq!(bucketed, s.len(), "bucket membership disagrees with the tracked total");
+		assert_eq!(fast_bytes, s.fast_bytes_used(), "the fast gauge disagrees with the fast buckets");
+
+		// Quiesced now, so the mirrors are exact again: a sequential drain must
+		// come out in count order across both tiers.
+		let mut log = MigrationLog::default();
+		let mut last: Option<(u16, u64)> = None;
+
+		while let Some(k) = s.tail_key(&mut log) {
+			let rank = {
+				let g = s.shards[shard_of(k)].read().unwrap();
+				let i = g.find(k).expect("nominated victim must be present");
+				(g.slots[i as usize].freq, g.slots[i as usize].last_access)
+			};
+
+			if let Some(prev) = last {
+				assert!(prev.0 <= rank.0, "the drain went back down a count: {prev:?} then {rank:?}");
+			}
+
+			last = Some(rank);
+			assert!(s.take_evict(&k).is_some());
+		}
+
+		assert_eq!(s.len(), 0);
 	}
 }
 

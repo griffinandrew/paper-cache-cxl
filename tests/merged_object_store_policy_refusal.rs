@@ -6,13 +6,21 @@
 //! `PaperCache`, which is the only thing that proves the error propagates out
 //! through `MergedStackHandle::new` -> `PolicyWorker::new` -> `WorkerFanout::new`
 //! -> `PaperCache::new` rather than being swallowed on the way.
-#![cfg(all(feature = "merged_object_store", feature = "lfu_compact_hybrid_cache"))]
+//!
+//! Built under either LFU hybrid's feature, and each LFU test under its own
+//! design's: every hybrid build hosts both policies, so the gates only decide
+//! which designs' tests a run asks for, as for every `*_hybrid_cache` feature.
+#![cfg(all(
+    feature = "merged_object_store",
+    any(feature = "lfu_compact_hybrid_cache", feature = "lfu_global_compact_hybrid_cache"),
+))]
 
 use paper_cache::{CacheTierSize, PaperCache, PaperPolicy, TieredBuffer};
 
 const MAX: u64 = 64 * 1_048_576;
 
 /// LFU is implemented now, so it must construct and report itself as LFU.
+#[cfg(feature = "lfu_compact_hybrid_cache")]
 #[test]
 fn lfu_constructs_under_the_merged_store() {
     let cache = PaperCache::<u64, TieredBuffer>::new(
@@ -23,6 +31,24 @@ fn lfu_constructs_under_the_merged_store() {
     assert!(
         cache.is_ok(),
         "merged LFU must construct now that the order exists: {:?}",
+        cache.err(),
+    );
+}
+
+/// The global-eviction LFU variant is the same merged order with a different
+/// victim rule, so it must construct too -- and not be refused as a policy the
+/// store has never heard of.
+#[cfg(feature = "lfu_global_compact_hybrid_cache")]
+#[test]
+fn global_lfu_constructs_under_the_merged_store() {
+    let cache = PaperCache::<u64, TieredBuffer>::new(
+        MAX,
+        CacheTierSize::Mib(16),
+        PaperPolicy::LfuGlobalCompactHybrid,
+    );
+    assert!(
+        cache.is_ok(),
+        "merged global LFU must construct: {:?}",
         cache.err(),
     );
 }
