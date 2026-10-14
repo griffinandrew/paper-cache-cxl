@@ -165,6 +165,18 @@ mod cache_shape;
 #[cfg(feature = "merged_object_store")]
 pub mod merged_store;
 
+/// The per-tier object map (`tiered_object_map`): each shard holds a DRAM table
+/// for the keys whose values are fast and a slow-tier table for the rest. See
+/// the module doc.
+#[cfg(feature = "tiered_object_map")]
+pub mod tiered_object_map;
+
+#[cfg(all(feature = "tiered_object_map", feature = "merged_object_store"))]
+compile_error!("tiered_object_map and merged_object_store are two different object maps: enable one");
+
+#[cfg(all(feature = "tiered_object_map", not(feature = "hybrid_cache_common")))]
+compile_error!("tiered_object_map needs a tiered build: enable a *_hybrid_cache feature with it");
+
 #[cfg(any(feature = "all_dram", feature = "key_value_pmem"))]
 use crate::object_store::ObjectStore;
 #[cfg(any(feature = "all_dram", feature = "key_value_pmem", feature = "hybrid_cache_common"))]
@@ -233,7 +245,7 @@ use std::{
 	},
 };
 
-#[cfg(not(feature = "merged_object_store"))]
+#[cfg(not(any(feature = "merged_object_store", feature = "tiered_object_map")))]
 use dashmap::DashMap;
 
 use typesize::TypeSize;
@@ -408,8 +420,12 @@ pub fn jemalloc_stats() -> Option<String> {
 
 
 
-#[cfg(not(feature = "merged_object_store"))]
+#[cfg(not(any(feature = "merged_object_store", feature = "tiered_object_map")))]
 pub type ObjectMapRef<K, V> = Arc<DashMap<HashedKey, Object<K, V>, NoHasher>>;
+
+/// One map per tier per shard -- see `tiered_object_map`.
+#[cfg(feature = "tiered_object_map")]
+pub type ObjectMapRef<K, V> = Arc<crate::tiered_object_map::TieredObjectMap<K, V>>;
 
 /// Object map and LRU eviction order in ONE structure -- see `merged_store`.
 /// Measured 208 B/object against the split design's 280.
@@ -1279,8 +1295,11 @@ where
 			return Err(CacheError::InvalidPolicy);
 		}
 
-		#[cfg(not(feature = "merged_object_store"))]
+		#[cfg(not(any(feature = "merged_object_store", feature = "tiered_object_map")))]
 		let objects = Arc::new(DashMap::with_hasher(NoHasher::default()));
+
+		#[cfg(feature = "tiered_object_map")]
+		let objects = Arc::new(crate::tiered_object_map::TieredObjectMap::new());
 
 		// The merged store is both the object map and the eviction order; the
 		// worker builds its `PolicyStack` from this same `Arc`.
@@ -1590,9 +1609,14 @@ unsafe impl<K, V, S> Sync for PaperCache<K, V, S> {}
 /// crate-wide -- this just has to build a matching value.
 #[cfg(feature = "hybrid_cache_common")]
 fn new_hybrid_object_map<K, V>() -> ObjectMapRef<K, V> {
-	#[cfg(not(feature = "merged_object_store"))]
+	#[cfg(not(any(feature = "merged_object_store", feature = "tiered_object_map")))]
 	{
 		Arc::new(DashMap::with_hasher(NoHasher::default()))
+	}
+
+	#[cfg(feature = "tiered_object_map")]
+	{
+		Arc::new(crate::tiered_object_map::TieredObjectMap::new())
 	}
 
 	#[cfg(feature = "merged_object_store")]
@@ -2519,6 +2543,20 @@ where
 	/// (or, over a tracked key, against its old placement).
 	///
 	/// `None` if the policy worker is gone.
+	/// DIAGNOSTIC (`tiered_object_map`): every row of the object map against
+	/// the table it is filed in -- see `tiered_object_map::MapAudit`.
+	#[cfg(feature = "tiered_object_map")]
+	pub fn object_map_audit(&self) -> crate::tiered_object_map::MapAudit {
+		self.objects.audit()
+	}
+
+	/// DIAGNOSTIC (`tiered_object_map`): the object map's own bytes by node --
+	/// the shard array and fast tables (DRAM), the slow tables (slow node).
+	#[cfg(feature = "tiered_object_map")]
+	pub fn object_map_bytes(&self) -> crate::meta::NodeBytes {
+		self.objects.structure_bytes()
+	}
+
 	pub fn placement_audit(&self) -> Option<phys::PlacementAudit> {
 		let (reply, answer) = crossbeam_channel::bounded(1);
 

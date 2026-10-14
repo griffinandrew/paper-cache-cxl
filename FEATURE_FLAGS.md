@@ -339,6 +339,17 @@ The implementation uses Rust's conditional compilation to select the appropriate
 **Global hashtable** (`objects` in `PaperCache`):
 - Default: `DashMap` (DRAM)
 - With `merged_object_store`: the merged store (map, order and tier in one structure)
+- With `tiered_object_map` (off by default): the per-tier map
+  (`src/tiered_object_map.rs`) -- per shard, one lock over a DRAM hashbrown table for the keys whose
+  values are fast and a slow-tier (`Hybrid`, node 2) table for the keys whose values are slow. A row
+  moves between the tables under the shard's write lock whenever its value's tier changes (a set, the
+  migration swap -- `removal::SwapValue` -- or a `get_mut_ref` handle that changed the value). A table
+  that falls under 3/8 full is shrunk (DashMap never shrinks). Accounting: the map counts its tables'
+  allocations per tier; the measured metadata M (`meta::map_bytes`) takes the fast tables and the
+  shard array, and the slow tables are reported in `DramMetadata::slow`, not budgeted against the fast
+  tier. `get_policy_overhead` (the charge against `max_size`) and omega are unchanged, so the opt-in
+  per-object model still reserves a fast-tier row for every object. The 32 B value header stays in
+  DRAM. Requires a `*_hybrid_cache` feature; conflicts with `merged_object_store`.
 
 ### Allocator Integration
 

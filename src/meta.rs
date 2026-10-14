@@ -442,10 +442,11 @@ mod published {
 	}
 
 	/// This build's object map's worker-side state.
-	#[cfg(not(feature = "merged_object_store"))]
+	#[cfg(not(any(feature = "merged_object_store", feature = "tiered_object_map")))]
 	pub type MapState = ShardState;
 
-	#[cfg(feature = "merged_object_store")]
+	/// None: the merged store and the per-tier map count their own bytes.
+	#[cfg(any(feature = "merged_object_store", feature = "tiered_object_map"))]
 	pub type MapState = ();
 
 	/// A write into the map at `key` that the policy worker saw: a `Set`,
@@ -453,7 +454,7 @@ mod published {
 	/// [`ShardState`]. Nothing for the merged store, which counts itself.
 	#[allow(unused_variables)]
 	pub fn map_write<K, V>(objects: &ObjectMapRef<K, V>, state: &mut MapState, key: HashedKey) {
-		#[cfg(not(feature = "merged_object_store"))]
+		#[cfg(not(any(feature = "merged_object_store", feature = "tiered_object_map")))]
 		dashmap_write(&**objects, state, key);
 	}
 
@@ -462,8 +463,16 @@ mod published {
 	/// call (everything when `all`).
 	#[allow(unused_variables)]
 	pub fn map_bytes<K, V>(objects: &ObjectMapRef<K, V>, state: &mut MapState, all: bool) -> NodeBytes {
-		#[cfg(not(feature = "merged_object_store"))]
+		#[cfg(not(any(feature = "merged_object_store", feature = "tiered_object_map")))]
 		return NodeBytes::dram(super::arc_bytes_of_ref(objects) + dashmap_bytes(&**objects, state, all));
+
+		// The per-tier map (`tiered_object_map`) counts its tables through
+		// their allocators, per tier: the shard array and the FAST tables are
+		// DRAM (in M), the SLOW tables are on the slow node and go to
+		// `DramMetadata::slow`, reported apart and not budgeted against the
+		// fast tier. No shard is re-read.
+		#[cfg(feature = "tiered_object_map")]
+		return NodeBytes::dram(super::arc_bytes_of_ref(objects)) + objects.structure_bytes();
 
 		#[cfg(feature = "merged_object_store")]
 		return NodeBytes::dram(super::arc_bytes_of_ref(objects) + objects.structure_bytes());

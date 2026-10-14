@@ -689,9 +689,15 @@ pub mod migration_queue {
 
 		// Check-and-act under one shard write lock: any writer must take the
 		// same lock, so nothing can replace the value between the comparison
-		// and the swap.
-		if let Some(mut object) = objects.get_mut_ref(&key) {
-			if crate::TieredValue::ptr_eq(object.value(), &old_value) {
+		// and the swap. Through the store's `SwapValue` (`crate::removal`): the
+		// DashMap and the merged store swap in place; the per-tier map
+		// (`tiered_object_map`) also moves the row to the new tier's table under
+		// the same lock.
+		let mut new_value = Some(new_value);
+
+		let swapped = crate::removal::SwapValue::swap_value(&**objects, &key, &old_value, |object| {
+			let new_value = new_value.take().expect("the swap runs once");
+			{
 				// Carry the LIVE expiry across, here, under the guard.
 				// `migrated_to` read it before the copy with no guard held, so
 				// a `ttl()` that landed during the copy is on the old value
@@ -728,9 +734,12 @@ pub mod migration_queue {
 				// advance to run.
 				drop(superseded);
 
-				stats.mig_applied.fetch_add(1, Ordering::Relaxed);
-				return true;
 			}
+		});
+
+		if let crate::removal::Swap::Swapped(()) = swapped {
+			stats.mig_applied.fetch_add(1, Ordering::Relaxed);
+			return true;
 		}
 
 		// Superseded, or the object vanished between the two lookups. The copy
@@ -9203,5 +9212,159 @@ mod reconcile_tests {
 				untracked_bytes: untracked.unwrap_or(0),
 			},
 		);
+	}
+}
+
+/// `tiered_object_map`: the production migration swap (`apply_migration`, the
+/// path the consumers take) racing sets, deletes and reads on the same keys.
+/// Every row stays in the table of its value's tier, the stats add up, and no
+/// set is lost to a migration (a swap lands only on the value it copied).
+#[cfg(all(test, feature = "tiered_object_map"))]
+mod tiered_map_migration_tests {
+	use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+	use crate::{HashedKey, ObjectMapRef, Tier, TieredBuffer};
+	use crate::object::Object;
+	use crate::removal::Removal;
+	use super::migstats;
+	use super::migration_queue::apply_migration;
+
+	const KEYS: u64 = 256;
+	const LEN: usize = 200;
+
+	fn key(i: u64) -> HashedKey {
+		i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1
+	}
+
+	#[test]
+	fn migrations_racing_set_del_get_keep_every_row_in_its_table() {
+		let _serialised = super::migration_test_lock::lock();
+
+		let objects: ObjectMapRef<u64, TieredBuffer> = crate::new_hybrid_object_map();
+		let stats = Arc::new(migstats::Stats::default());
+		let stop = Arc::new(AtomicBool::new(false));
+
+		for i in 0..KEYS {
+			objects.insert(key(i), Object::new_in(key(i), &[1u8; LEN], Tier::Fast, None));
+		}
+
+		let mut threads = Vec::new();
+
+		// Four migrators: flip random keys between the tiers.
+		for t in 0..4u64 {
+			let (objects, stats, stop) = (objects.clone(), stats.clone(), stop.clone());
+
+			threads.push(std::thread::spawn(move || {
+				let mut x = (t + 1).wrapping_mul(0x2545_F491_4F6C_DD1D);
+				let mut n = 0u64;
+
+				while !stop.load(Ordering::Relaxed) || n < 20_000 {
+					x ^= x << 13;
+					x ^= x >> 7;
+					x ^= x << 17;
+
+					let tier = if x & 1 == 0 { Tier::Fast } else { Tier::Slow };
+					apply_migration(&objects, key(x % KEYS), tier, &stats);
+					n += 1;
+
+					if n >= 200_000 {
+						break;
+					}
+				}
+			}));
+		}
+
+		// Two setters (a byte that names the writer and a sequence), one
+		// deleter, one reader.
+		let mut clients = Vec::new();
+
+		for t in 0..4u64 {
+			let objects = objects.clone();
+
+			clients.push(std::thread::spawn(move || {
+				let mut x = (t + 11).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+
+				for _ in 0..30_000 {
+					x ^= x << 13;
+					x ^= x >> 7;
+					x ^= x << 17;
+
+					let k = key(x % KEYS);
+					let tier = if x & 2 == 0 { Tier::Fast } else { Tier::Slow };
+
+					match t {
+						0 | 1 => {
+							let mark = (t as u8 + 2, (x >> 8) as u8);
+							let mut bytes = [mark.1; LEN];
+							bytes[0] = mark.0;
+							objects.insert(k, Object::new_in(k, &bytes, tier, None));
+
+							// The set is visible (or a later set/del already
+							// replaced it): a migration never brings back an
+							// older value over it.
+							if let Some(object) = objects.get_ref(&k) {
+								let first = object.bytes()[0];
+								assert!(first == 1 || first == 2 || first == 3, "a value no set wrote: {first}");
+							}
+						},
+						2 => {
+							let _ = Removal::take_if(&*objects, &k, |_| x & 4 == 0);
+						},
+						_ => {
+							if let Some(object) = objects.get_ref(&k) {
+								let bytes = object.bytes();
+								assert!(bytes[1..].iter().all(|&b| b == bytes[1]), "a torn value");
+							}
+						},
+					}
+				}
+			}));
+		}
+
+		for client in clients {
+			client.join().expect("a client panicked");
+		}
+
+		stop.store(true, Ordering::Relaxed);
+
+		for thread in threads {
+			thread.join().expect("a migrator panicked");
+		}
+
+		let audit = objects.audit();
+		assert_eq!((audit.misplaced_in_fast, audit.misplaced_in_slow), (0, 0), "{audit:?}");
+		assert_eq!(audit.fast_rows + audit.slow_rows, objects.len() as u64);
+
+		let applied = stats.mig_applied.load(Ordering::Relaxed);
+		assert!(applied > 0, "no migration landed");
+		assert!(objects.moves() >= applied, "every applied migration moved its row");
+		assert_eq!(objects.table_bytes(), objects.table_bytes_by_layout());
+	}
+
+	/// A migration whose copy is overtaken by a set does not land, and the
+	/// set's row is where its value is.
+	#[test]
+	fn a_set_during_the_copy_supersedes_the_migration() {
+		let _serialised = super::migration_test_lock::lock();
+
+		const K: HashedKey = 0x5EED_0001;
+
+		let objects: ObjectMapRef<u64, TieredBuffer> = crate::new_hybrid_object_map();
+		objects.insert(K, Object::new_in(K, &[1u8; LEN], Tier::Fast, None));
+
+		let (entered, release) = super::migration_queue::after_copy::arm(K);
+		let migrating = objects.clone();
+		let migration = std::thread::spawn(move || {
+			apply_migration(&migrating, K, Tier::Slow, &migstats::Stats::default())
+		});
+
+		entered.recv_timeout(std::time::Duration::from_secs(10)).expect("the migration never parked");
+		objects.insert(K, Object::new_in(K, &[2u8; LEN], Tier::Fast, None));
+		release.send(()).expect("release");
+
+		assert!(!migration.join().expect("the migration panicked"), "superseded");
+		assert_eq!(objects.table_of(&K), Some(Tier::Fast));
+		assert_eq!(objects.get_ref(&K).unwrap().bytes()[0], 2);
+		assert_eq!(objects.moves(), 0);
 	}
 }

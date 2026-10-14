@@ -417,6 +417,15 @@ s3_fifo_lazy_demotion_fast_admission_split_slow_reprieve_compact_hybrid_cache = 
 # rather than an ordinary unbound heap.
 hybrid_cache_common = ["numa_jemalloc"]
 
+# A per-tier object map (src/tiered_object_map.rs): each shard holds, under one lock, a DRAM
+# hashbrown table for the keys whose values are in the fast tier and a
+# slow-tier (`Hybrid`, node 2) table for the keys whose values are slow, so a
+# slow object's map row costs no DRAM. Requires a *_hybrid_cache feature;
+# conflicts with merged_object_store. Off by default. Accounting: the map
+# counts its own table bytes per tier (meta.rs); slow tables are reported in
+# DramMetadata::slow, not in M.
+tiered_object_map = []
+
 
 # NUMA-bound jemalloc arenas (src/numa_alloc.rs). Each node gets its own
 # arenas whose extents are mmap'd and mbind'd to that node before jemalloc

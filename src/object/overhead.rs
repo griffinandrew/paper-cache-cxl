@@ -807,6 +807,33 @@ const VALUE_ALLOCATION_OVERHEAD: ObjectSize = 16;
 /// tracking content rather than shard-doubling slack.
 const OBJECT_MAP_ENTRY_OVERHEAD: ObjectSize = 40;
 
+// `tiered_object_map`: the row is the same 16-byte
+// `(HashedKey, Object)` pair in a hashbrown table, but it lives in the table of
+// its value's tier -- a DRAM table for a fast value, a slow-tier (node 2)
+// table for a slow one. What changes, and what deliberately does not:
+//
+//   * `get_policy_overhead` (the charge against `max_size`, which bounds BOTH
+//     tiers) keeps the row: every object still has one, on one node or the
+//     other, and the two tables' load-factor slack is the DashMap's.
+//   * The MEASURED metadata model (the default; `meta::map_bytes`) charges the
+//     fast tier only what the fast tables and the shard array really hold: the
+//     map counts its tables' allocations per tier, and the slow tables go to
+//     `DramMetadata::slow`, out of M. That is where a slow object's row stops
+//     costing fast-tier DRAM.
+//   * `get_hybrid_dram_shared_overhead` (omega) is NOT changed: it still names
+//     the full row. Under the measured model omega only sizes the key
+//     ceiling's growth estimate and the M-vs-L*omega sanity counter, where an
+//     over-estimate is conservative. Under the PER-OBJECT model (opt-in) it is
+//     the reservation itself, so that model still reserves a fast-tier row
+//     for every object, slow ones included -- conservative by
+//     OBJECT_MAP_ENTRY_OVERHEAD per slow object. Correcting it needs every
+//     stack's `reserved_overhead` (nine of them) to take the slow count off,
+//     and changes the opt-in model's fixtures; not done.
+//   * The value's DRAM header stays in DRAM for every object: 32 bytes under
+//     the default layout, 16 under `thin_header` -- the two features
+//     compose, and together a slow object's DRAM is its header, its stack
+//     node and nothing else.
+
 
 /// Bytes jemalloc will actually commit for a value of this requested size.
 ///

@@ -145,6 +145,11 @@ src/
                                a child of its own, since P and the allocators' state are
                                process-global and outlive a cache) and the hand-driven worker
                                tests' shared helpers.
+  tiered_object_map.rs        Feature `tiered_object_map` (off by default): the object map as two
+                               hashbrown tables per shard, DRAM for fast values' rows and the slow
+                               allocator for slow values' rows; rows move with their values' tier
+                               under the shard lock (insert, removal::SwapValue, the get_mut_ref
+                               guard's drop). Counts its own table bytes per tier for meta.rs.
   numa_alloc.rs               Node-bound jemalloc arenas. NumaAlloc<NODE_FAST> is the crate's
                                #[global_allocator]; SlowObjects (aliased crate-wide as `Hybrid`)
                                backs the slow tier. Extents are mmap'd then mbind'd before
@@ -4227,3 +4232,34 @@ the thin layout's slow hits, which that trace's hit mix dilutes. Not kept: a set
 item's first line (SET mean 1560 -> 2223 ns, more gate waits) and the key/expiry checks moved after the copy
 (no clear gain).
 
+
+## A per-tier object map (`tiered_object_map`, off by default)
+
+`src/tiered_object_map.rs`: the object map as N shards (DashMap's count: four per CPU rounded up to a power of two, 256 on the cxl host),
+each one `parking_lot::RwLock` (DRAM) over TWO `hashbrown::HashTable`s of `(HashedKey, Object)` rows -- the FAST
+table on the global allocator, the SLOW table on `crate::Hybrid` (the node-2 arenas). A key's row is in the
+table of its value's tier (the DRAM tag), re-filed under the shard's write lock by every path that changes a
+value: `insert` (an overwrite into the other tier moves the row), the migration's check-and-act
+(`removal::SwapValue::swap_value`, which `apply_migration_guarded` now goes through for every map; the DashMap and
+the merged store swap in place as before), and the `get_mut_ref` guard's drop (`TieredRefMut`). Reads take the
+read lock and probe fast, then slow (a slow hit or a miss probes the slow table's control bytes on CXL). A table
+under 3/8 full is shrunk (`shrink_if_sparse`; DashMap never shrinks), so rows flowing fast -> slow free their
+DRAM. Diagnostics: `PaperCache::object_map_audit()` (every row against its table; both "misplaced" counts are
+0 at every instant) and `object_map_bytes()`.
+
+Accounting: each table allocates through `Counted`, which charges `meta::layout_bytes` per allocation to its
+tier's counter. `meta::map_bytes` publishes the shard array and the fast tables as DRAM (in M) and the slow
+tables as `DramMetadata::slow`, outside M and the fast tier's budget. `get_policy_overhead` (the `max_size`
+charge) and omega are unchanged; so the opt-in PER-OBJECT metadata model still reserves a fast row for every
+object, slow ones included (conservative by `OBJECT_MAP_ENTRY_OVERHEAD` per slow object; fixing it means the
+nine stacks' `reserved_overhead` taking the slow count off -- not done). Requires a `*_hybrid_cache` feature;
+refuses `merged_object_store`. Composes with `thin_header`: then a slow object's DRAM is its 16-byte header and
+its stack node, and its row, item, key, length and expiry are all on node 2
+(`string_keyed_values_keep_their_rows_and_read_back_whole`, and suite g runs every test with both).
+
+Measured (prototype `split-map` 9beb179, Meta kvcache_202401, tiered LRU, 8 clients, b64, one run each, foreign
+load flagged): M 2.201 -> 1.615 GiB with 0.3125 GiB of slow tables on node 2; the effective fast budget for
+values 0.799 -> 1.385 GiB; fast objects 702k -> 1292k; GET mean 1244 -> 1244 ns, SET 1497 -> 1648 ns, with
+3,451 byte-gate waits (0 before) -- the fast tier's extra room is used, and the gate waits that come with it are
+being root-caused separately. Throughput not attributable (same-config runs of other jobs that night spread
+1.656-1.708 Mops).

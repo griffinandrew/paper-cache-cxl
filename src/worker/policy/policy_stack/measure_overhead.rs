@@ -344,9 +344,9 @@ fn measure_object_map_point() {
 	let value = vec![0u8; vsize];
 
 	let base = allocated_bytes();
-	let map: crate::ObjectMapRef<u64, crate::TieredBuffer> = std::sync::Arc::new(
-		dashmap::DashMap::with_hasher(crate::NoHasher::default()),
-	);
+	// The build's map: the DashMap, or under `tiered_object_map` the per-tier
+	// map (every value here is fast, so every row is in its DRAM tables).
+	let map: crate::ObjectMapRef<u64, crate::TieredBuffer> = crate::new_hybrid_object_map();
 	for i in 0..n {
 		let key = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
 		map.insert(key, crate::object::Object::new(key, &value, None));
@@ -394,3 +394,97 @@ fn print_row_layout() {
 	println!("LAYOUT (HashedKey, Object) pair {}", size_of::<(crate::HashedKey, Obj)>());
 }
 
+
+/// One point of a WHOLE tiered cache's memory BY NODE with objects in both
+/// tiers, one process: `MEASURE_SPLIT_N` objects of
+/// `MEASURE_VALUE` bytes into `MEASURE_SPLIT_POLICY` (default
+/// lru-compact-hybrid) with a fast tier of `MEASURE_SPLIT_FAST` bytes, then --
+/// once the worker has settled (the fast/slow counts unchanged for 2 s) -- the
+/// live bytes of the DRAM pools (node 0 and the segregated fast-value pool)
+/// and of the slow pool, from `numa_alloc::measured` (`measured_accounting`),
+/// each less its reading before the cache was built.
+///
+/// Prints `MEASURED_SPLIT policy n v fast_objects slow_objects dram slow
+/// dram_meta slow_meta map_dram map_slow`: the caller subtracts the values
+/// (`fast_objects` x nallocx(v) from dram, `slow_objects` x nallocx(v) from
+/// slow) and divides by n. Run with `PAPER_DISABLE_SHARED_OVERHEAD=1` so the
+/// fast tier's budget is the values' alone and `MEASURE_SPLIT_FAST` sets the
+/// split directly; it changes no structure's size.
+#[cfg(all(feature = "hybrid_cache_common", feature = "measured_accounting"))]
+#[test]
+#[ignore]
+fn measure_split_point() {
+	use crate::numa_alloc::measured;
+
+	let n: u64 = match std::env::var("MEASURE_SPLIT_N") {
+		Ok(v) => v.parse().expect("MEASURE_SPLIT_N"),
+		Err(_) => return,
+	};
+	let vsize: usize = std::env::var("MEASURE_VALUE").map(|v| v.parse().expect("MEASURE_VALUE")).unwrap_or(64);
+	let fast: crate::CacheSize = std::env::var("MEASURE_SPLIT_FAST").expect("MEASURE_SPLIT_FAST").parse().expect("bytes");
+	let want = std::env::var("MEASURE_SPLIT_POLICY").unwrap_or_else(|_| "lru-compact-hybrid".to_string());
+	let policy: PaperPolicy = want.parse().expect("policy string");
+
+	let max_size: crate::CacheSize = 1 << 40;
+	let value = vec![0u8; vsize];
+
+	// Warm-up, as `measure_cache_point`: the first cache in a process is
+	// cheaper than every later one. Both tiers touched.
+	{
+		let warm = crate::PaperCache::<u64, crate::TieredBuffer>::new(max_size, crate::CacheTierSize::Bytes(1 << 16), policy)
+			.expect("warm-up cache");
+		for i in 0..4_096u64 {
+			let _ = warm.set(i, &value, None);
+		}
+		std::thread::sleep(std::time::Duration::from_millis(500));
+	}
+	std::thread::sleep(std::time::Duration::from_millis(500));
+
+	let (dram0, slow0) = (measured::dram_allocated(), measured::slow_allocated());
+
+	let cache = crate::PaperCache::<u64, crate::TieredBuffer>::new(max_size, crate::CacheTierSize::Bytes(fast), policy)
+		.expect("cache");
+
+	for i in 0..n {
+		cache.set(i.wrapping_mul(0x9E37_79B9_7F4A_7C15), &value, None).expect("set");
+	}
+
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+	let mut last = (0, 0);
+	let mut stable = 0;
+
+	loop {
+		std::thread::sleep(std::time::Duration::from_millis(250));
+
+		let stats = cache.hybrid_stats();
+		let now = (stats.fast_objects, stats.slow_objects);
+
+		stable = if now == last && now.0 + now.1 == n { stable + 1 } else { 0 };
+		last = now;
+
+		if stable >= 8 || std::time::Instant::now() >= deadline {
+			break;
+		}
+	}
+
+	let (dram1, slow1) = (measured::dram_allocated(), measured::slow_allocated());
+	let stats = cache.hybrid_stats();
+	let meta = cache.dram_metadata();
+
+	#[cfg(feature = "tiered_object_map")]
+	let (map_dram, map_slow) = {
+		let nodes = cache.object_map_bytes();
+		(nodes.dram, nodes.slow)
+	};
+	#[cfg(not(feature = "tiered_object_map"))]
+	let (map_dram, map_slow) = (meta.map, 0u64);
+
+	core::hint::black_box(&cache);
+
+	println!(
+		"MEASURED_SPLIT {} {} {} {} {} {} {} {} {} {} {}",
+		want, n, vsize, stats.fast_objects, stats.slow_objects,
+		dram1 as i64 - dram0 as i64, slow1 as i64 - slow0 as i64,
+		meta.total(), meta.slow, map_dram, map_slow,
+	);
+}

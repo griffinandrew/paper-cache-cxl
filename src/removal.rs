@@ -20,8 +20,74 @@ use dashmap::{
 };
 use log::error;
 
-use crate::{CacheError, HashedKey, NoHasher};
+use crate::{CacheError, HashedKey, NoHasher, TieredValue};
 use crate::object::Object;
+
+/// What [`SwapValue::swap_value`] found under the key's write lock.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Swap<R> {
+	/// No object at the key.
+	Gone,
+	/// An object whose value is not the expected one (a set replaced it).
+	Superseded,
+	/// The swap ran; its result.
+	Swapped(R),
+}
+
+/// The migration's check-and-act, per object map: under the key's write lock,
+/// if the key's value is still `expected` (`TieredValue::ptr_eq`), `swap`
+/// replaces it. The DashMap and the merged store swap in place; the per-tier
+/// map (`tiered_object_map`) also moves the row to the table of the new
+/// value's tier, under the same lock.
+pub trait SwapValue<K, V> {
+	fn swap_value<R>(
+		&self,
+		key: &HashedKey,
+		expected: &TieredValue<K>,
+		swap: impl FnOnce(&mut Object<K, V>) -> R,
+	) -> Swap<R>;
+}
+
+impl<K, V> SwapValue<K, V> for DashMap<HashedKey, Object<K, V>, NoHasher> {
+	/// In place, under the shard's write lock (`get_mut`).
+	fn swap_value<R>(
+		&self,
+		key: &HashedKey,
+		expected: &TieredValue<K>,
+		swap: impl FnOnce(&mut Object<K, V>) -> R,
+	) -> Swap<R> {
+		let Some(mut object) = self.get_mut(key) else {
+			return Swap::Gone;
+		};
+
+		if !TieredValue::ptr_eq((*object).value(), expected) {
+			return Swap::Superseded;
+		}
+
+		Swap::Swapped(swap(&mut *object))
+	}
+}
+
+#[cfg(feature = "merged_object_store")]
+impl<K, V> SwapValue<K, V> for crate::merged_store::MergedStore<K, V> {
+	/// In place, under the shard's write lock (`get_mut_ref`).
+	fn swap_value<R>(
+		&self,
+		key: &HashedKey,
+		expected: &TieredValue<K>,
+		swap: impl FnOnce(&mut Object<K, V>) -> R,
+	) -> Swap<R> {
+		let Some(mut object) = self.get_mut_ref(key) else {
+			return Swap::Gone;
+		};
+
+		if !TieredValue::ptr_eq((*object).value(), expected) {
+			return Swap::Superseded;
+		}
+
+		Swap::Swapped(swap(&mut *object))
+	}
+}
 
 /// The removal half of an object map. See the module doc.
 pub trait Removal<K, V> {
