@@ -332,8 +332,14 @@ fn set_parts_one(threads: usize, size: usize, scenario: Scenario, tpn: f64) {
 				let t3 = tsc();
 				let old = map.insert(hashed, object);
 				let t4 = tsc();
-				// What `publish_set` reads of the old object: its size inputs and expiry.
-				let info = old.as_ref().map(|o| (o.len(), o.expiry(), o.key_size()));
+				// What `publish_set` reads of the old object
+				// (`OverheadManager::replaced_size_and_expiry`): the word's
+				// hint, and the item only when the hint is missing or says
+				// the item may carry an expiry.
+				let info = old.as_ref().map(|o| match o.value().accounting_hint() {
+					Some((item, false)) => (o.key_size() + item, None),
+					_ => (o.key_size() + o.len(), o.expiry()),
+				});
 				black_box(&info);
 				let t5 = tsc();
 				let _ = tx.send([hashed, size as u64, 0, 0, 0, 0, 0, 0]);

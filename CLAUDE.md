@@ -4263,3 +4263,39 @@ values 0.799 -> 1.385 GiB; fast objects 702k -> 1292k; GET mean 1244 -> 1244 ns,
 3,451 byte-gate waits (0 before) -- the fast tier's extra room is used, and the gate waits that come with it are
 being root-caused separately. Throughput not attributable (same-config runs of other jobs that night spread
 1.656-1.708 Mops).
+
+## A set no longer reads the item it replaces (`thin_header`: accounting from the DRAM word)
+
+`publish_set` (and the flat `insert_flat`) charge back the REPLACED object's `base_size` and hand its expiry to
+the TTL worker (`WorkerEvent::Set`'s `previous`). Under `thin_header` both inputs -- the length and the expiry
+-- are in the item, so a set that overwrote a SLOW object waited on a remote load of the item's first line
+(+420-530 ns over a fresh key in `set_parts_bench`; +150-200 ns for a fast one, a DRAM miss), and the old
+handle's drop read `len` again to rebuild the deallocation layout. Now the item constructors also fold into
+the word's high bits (`value_thin.rs`, "The word's high bits"): the item's ACCOUNTED bytes
+(`resident_item_bytes` = `nallocx(prefix + len)`, the figure `base_size` counts and P charges) as an 8-bit
+size-class code in bits 50-57, and `EXPIRY_HINT_BIT` (bit 49) when the item may carry an expiry -- set at
+construction with an expiry and by `set_expiry(Some)` (under the shard's write lock, or before the value is
+published), never cleared, so the word is an `AtomicPtr` now (relaxed loads; the CAS that sets the bit runs
+only on a `ttl`/migration that adds an expiry to a word without it).
+
+- `OverheadManager::replaced_size_and_expiry`: with a size code and no expiry hint, `(key_size + item + 4,
+  None)` -- `key_size` is the type's (`TypeSize` of a POD key reads nothing) or a `HashedKey`'s for a key held
+  as bytes; otherwise `(base_size, expiry())` as before. Equal by construction and by test
+  (`s5_tests::replaced_size_and_expiry_is_base_size_and_expiry`: every key shape, lengths around the classes,
+  both tiers, TTL none/0/5 s, after `expires(Some)`/`expires(None)` and across a migration, with the word's
+  hint checked too).
+- `ValueHeader::drop`: with a size code, frees the item with `Layout(class size, 8)` -- `sdallocx` accepts the
+  class size, and the measured-accounting/`align_flags` path maps it to the same class -- and refunds P that
+  figure (what was charged); the item is touched only to drop a `K` with drop glue. Codes are written only
+  when the layout is 8-aligned and the figure is at least the layout's size, so a non-jemalloc build (where
+  `resident_value_bytes` is the request) codes only exact sizes.
+- Not changed: the default layout (its header is DRAM; `accounting_hint` is `None` there and every reader
+  reads the header as before), the worker's events and their timing (`used_size`, the object count, P and the
+  gate are updated where and when they were), `del` and eviction (they read `is_expired` anyway).
+
+So it is a pure cost removal: no knob. Exactness: the numbers are the same numbers (the unit test above), and
+`s5_tests::overwrites_across_tiers_keep_the_used_size_exact` (eight threads overwriting demoted and fast
+objects with values changing size and TTLs added/removed between sets) ends with `used_size` equal to every
+live key's `base_size_for` of what it last holds plus the policy overhead; T9 (`phys_fast_identity`) holds P
+to the stacks' fast bytes through overwrites and back to its start after the cache drops, in the full suites
+built with `thin_header`.

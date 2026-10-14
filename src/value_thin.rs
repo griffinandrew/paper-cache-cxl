@@ -87,11 +87,40 @@
 //! ## The word's high bits
 //!
 //! An x86-64 user address stays below bit 47, so the top of the word is free.
-//! Bits 58-63 carry how many cache lines the item spans (`LINES_SHIFT`), for
-//! the read path's prefetch (`crate::read_path`): a hit on a slow item issues
-//! the item's lines from the DRAM word, before the key check reads the first
-//! of them, and the copy that follows finds them in flight. `item_addr` strips
-//! them with the tag bits.
+//! The item constructors fill three fields there, from figures they have in
+//! hand, so that the paths that would otherwise read a SLOW item's first line
+//! only to learn its size can take it from DRAM:
+//!
+//! ```text
+//!   63      58 57       50  49        48 ... 3   2   1   0
+//!   [ lines  ][ size code ][ E ]  [ address  ][ - ][ K ][ S ]
+//! ```
+//!
+//!   * LINES (bits 58-63): how many cache lines the item spans, at most 63,
+//!     for the read path's prefetch (`crate::read_path`): a hit on a slow item
+//!     issues the item's lines from the DRAM word, before the key check reads
+//!     the first of them.
+//!   * SIZE CODE (bits 50-57): the item's ACCOUNTED bytes --
+//!     `resident_item_bytes`, `nallocx(prefix + len)`, the figure `base_size`
+//!     counts and P charges -- as `(4 + k) << s`, coded `4s + k + 1`. Every
+//!     jemalloc size class has that form. 0 means "not carried" (an address
+//!     at or above bit 49, a key aligned above 8, or an allocator whose figure
+//!     is not a size class), and every reader then reads the item as before.
+//!   * E (bit 49): the item MAY carry an expiry. Set by the constructors when
+//!     they write one and by `set_expiry` before it stores one, never cleared
+//!     -- so a clear bit means the expiry is 0, while a set one only means
+//!     "read it". The one bit of the word that changes after construction,
+//!     which is why the word is an `AtomicPtr` (relaxed loads: a plain `mov`).
+//!
+//! The readers: the drop frees the item and refunds P from the size code
+//! without reading the item's `len` (`sdallocx` takes the class size as well
+//! as the requested one); a `set` that REPLACES an object takes the replaced
+//! object's `base_size` and expiry from the word
+//! (`OverheadManager::replaced_size_and_expiry`). Together they take the
+//! replaced item off the set's path: under this layout a set that overwrote a
+//! slow object used to wait on two dependent remote loads of it, measured at
+//! +420-530 ns over a fresh key (+150-200 ns for a fast one). `item_addr`
+//! strips all three fields with the tag bits.
 //!
 //! ## The key
 //!
@@ -141,7 +170,7 @@ use std::{
 	alloc::Layout,
 	marker::PhantomData,
 	ptr::NonNull,
-	sync::atomic::{AtomicU32, Ordering},
+	sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
 
 #[cfg(feature = "hybrid_cache_common")]
@@ -156,7 +185,7 @@ use triomphe::Arc;
 use crate::{
 	Tier,
 	key_bytes::{KeyBytes, key_as_bytes, key_from_bytes},
-	object::ExpireTime,
+	object::{ExpireTime, ObjectSize},
 };
 
 /// Bit 0 of the item-pointer word: set means the slow tier, clear the fast one.
@@ -170,17 +199,63 @@ const KEY_BYTES_BIT: usize = 0b10;
 /// Every flag the word may carry in its low bits.
 const TAG_BITS: usize = SLOW_BIT | KEY_BYTES_BIT;
 
-/// Bits 58-63 of the word: how many 64-byte lines the item spans from the
-/// line its address is in, saturating at 63 -- what the read path's `auto`
-/// prefetch fetches (`crate::read_path`), known from DRAM without reading the
-/// item's length. Zero when the address itself reaches bit 58 (no x86-64
-/// user address does), which only turns the prefetch off.
+/// The word's high fields (module doc, "The word's high bits") are filled
+/// only for an item whose address is below this bit -- every x86-64 user
+/// address; for any other they stay 0, which every reader treats as "not
+/// carried".
+const HIGH_SHIFT: usize = 49;
+
+/// Bit 49: the item MAY carry an expiry (sticky; clear means it has none).
+const EXPIRY_HINT_BIT: usize = 1 << HIGH_SHIFT;
+
+/// Bits 50-57: the item's accounted bytes as a size code (`size_code`).
+const SIZE_SHIFT: usize = 50;
+const SIZE_BITS: usize = 0xff << SIZE_SHIFT;
+
+/// Bits 58-63: how many 64-byte lines the item spans from the line its
+/// address is in, saturating at 63 -- what the read path's `auto` prefetch
+/// fetches (`crate::read_path`), known from DRAM without reading the item's
+/// length.
 const LINES_SHIFT: usize = 58;
 const LINES_BITS: usize = 0x3f << LINES_SHIFT;
 
+/// Every high field.
+const HIGH_BITS: usize = EXPIRY_HINT_BIT | SIZE_BITS | LINES_BITS;
+
 /// Every bit of the word that is not the item's address -- what
 /// `ValueHeader::item_addr` strips.
-const NON_ADDRESS_BITS: usize = TAG_BITS | LINES_BITS;
+const NON_ADDRESS_BITS: usize = TAG_BITS | HIGH_BITS;
+
+/// `bytes` as the word's 8-bit size code: `(4 + k) << s`, `k` in 0..4, is
+/// `4s + k + 1`. 0 -- not carried -- for any other figure. Every jemalloc
+/// size class has that form (four classes per doubling, from 8 B up).
+const fn size_code(bytes: ObjectSize) -> usize {
+	if bytes < 4 {
+		return 0;
+	}
+
+	let s = 31 - bytes.leading_zeros() - 2;
+	let k = (bytes >> s) - 4;
+
+	if (4 + k) << s != bytes {
+		return 0;
+	}
+
+	(4 * s + k + 1) as usize
+}
+
+/// The figure a non-zero [`size_code`] names.
+const fn size_from_code(code: usize) -> ObjectSize {
+	let c = code - 1;
+
+	((4 + (c & 3)) as ObjectSize) << (c >> 2)
+}
+
+const _: () = assert!(size_code(16) != 0 && size_from_code(size_code(16)) == 16);
+const _: () = assert!(size_code(80) != 0 && size_from_code(size_code(80)) == 80);
+const _: () = assert!(size_code(5 << 12) != 0 && size_from_code(size_code(5 << 12)) == 5 << 12);
+const _: () = assert!(size_code(u32::MAX) == 0 && size_code(3 << 30) != 0 && size_code(24) != 0);
+const _: () = assert!(size_code(36) == 0 && size_code(0) == 0);
 
 /// Alignment demanded of every item allocation, which is what keeps the low
 /// three bits of the address available for tagging -- and what the bytes keep
@@ -322,10 +397,13 @@ const _: () = assert!(std::mem::size_of::<BytesItemHeader>() == 12);
 /// Not `Clone`: it OWNS the item the way a `Box` owns its pointee, and a copy
 /// would free it twice. Sharing goes through the `Arc` around it.
 pub struct ValueHeader<K> {
-	/// The item's address, with the tier OR-ed into bit 0 and, for an item that
-	/// holds its key as bytes, `KEY_BYTES_BIT` into bit 1. Never dereference
-	/// directly -- go through [`ValueHeader::item_addr`].
-	word: NonNull<u8>,
+	/// The item's address, with the tier OR-ed into bit 0, for an item that
+	/// holds its key as bytes `KEY_BYTES_BIT` into bit 1, and the high fields
+	/// (module doc, "The word's high bits"). Never dereference directly -- go
+	/// through [`ValueHeader::item_addr`]. Atomic only for `EXPIRY_HINT_BIT`,
+	/// the one bit set after construction; every other bit is fixed when the
+	/// header is built, and every read is relaxed.
+	word: AtomicPtr<u8>,
 
 	/// This header owns an `ItemHeader<K>`, and through it a `K`: that is what
 	/// drop check and the auto traits have to see.
@@ -346,10 +424,20 @@ unsafe impl<K: Send> Send for ValueHeader<K> {}
 unsafe impl<K: Sync> Sync for ValueHeader<K> {}
 
 impl<K> ValueHeader<K> {
+	fn new(word: NonNull<u8>) -> Self {
+		ValueHeader { word: AtomicPtr::new(word.as_ptr()), _item: PhantomData }
+	}
+
+	/// The word.
+	#[inline]
+	fn word(&self) -> *mut u8 {
+		self.word.load(Ordering::Relaxed)
+	}
+
 	/// Which tier the ITEM lives in. The header itself is always DRAM.
 	#[inline]
 	fn tier(&self) -> Tier {
-		if self.word.as_ptr().addr() & SLOW_BIT == 0 {
+		if self.word().addr() & SLOW_BIT == 0 {
 			Tier::Fast
 		} else {
 			Tier::Slow
@@ -360,19 +448,51 @@ impl<K> ValueHeader<K> {
 	/// as a `K` (`ItemHeader<K>`). Read from the DRAM word, like the tier.
 	#[inline]
 	fn holds_key_bytes(&self) -> bool {
-		self.word.as_ptr().addr() & KEY_BYTES_BIT != 0
+		self.word().addr() & KEY_BYTES_BIT != 0
+	}
+
+	/// The item's accounted bytes, from the word's size code; `None` when
+	/// the word does not carry them.
+	#[inline]
+	fn item_bytes_hint(&self) -> Option<ObjectSize> {
+		match (self.word().addr() & SIZE_BITS) >> SIZE_SHIFT {
+			0 => None,
+			code => Some(size_from_code(code)),
+		}
+	}
+
+	/// Whether the item may carry an expiry (`EXPIRY_HINT_BIT`): false means
+	/// its expiry is 0. Meaningful only when the word carries a size code.
+	#[inline]
+	fn may_expire(&self) -> bool {
+		self.word().addr() & EXPIRY_HINT_BIT != 0
+	}
+
+	/// Sets `EXPIRY_HINT_BIT`, for an expiry about to be stored, on a word
+	/// that carries the high fields. Once set it stays.
+	#[inline]
+	fn note_expiry(&self) {
+		let word = self.word().addr();
+
+		if word & SIZE_BITS == 0 || word & EXPIRY_HINT_BIT != 0 {
+			return;
+		}
+
+		// Only this bit changes after construction, and a racing setter sets
+		// the same bit: an atomic OR, which keeps the address's provenance.
+		self.word.fetch_or(EXPIRY_HINT_BIT, Ordering::Relaxed);
 	}
 
 	/// The lines the item spans, from the word (see `LINES_SHIFT`).
 	#[inline]
 	fn item_lines(&self) -> u32 {
-		(self.word.as_ptr().addr() >> LINES_SHIFT) as u32
+		(self.word().addr() >> LINES_SHIFT) as u32
 	}
 
 	/// The item's address, with the tag and line bits stripped.
 	#[inline]
 	fn item_addr(&self) -> *mut u8 {
-		let untagged = self.word.as_ptr().map_addr(|addr| addr & !NON_ADDRESS_BITS);
+		let untagged = self.word().map_addr(|addr| addr & !NON_ADDRESS_BITS);
 
 		debug_assert_eq!(
 			untagged.addr() % VALUE_ALIGN,
@@ -426,6 +546,36 @@ impl<K> Drop for ValueHeader<K> {
 					}
 				}
 			}
+		}
+
+		// The word carries the item's size class: free it, and refund P, from
+		// DRAM alone. The class size is a layout `sdallocx` accepts for the
+		// block (jemalloc frees by size class, and the class is what the item
+		// was allocated as), and it is the figure P was charged; the alignment
+		// is `VALUE_ALIGN`, the only one the constructors code a size for. The
+		// item itself is touched only to drop a `K` that has drop glue.
+		if let Some(bytes) = self.item_bytes_hint() {
+			let free = Free {
+				ptr: self.item_addr(),
+				layout: Layout::from_size_align(bytes as usize, VALUE_ALIGN)
+					.expect("a coded size class is a valid layout"),
+				tier: self.tier(),
+			};
+
+			#[cfg(feature = "hybrid_cache_common")]
+			if matches!(free.tier, Tier::Fast) {
+				crate::phys::refund(bytes as u64);
+			}
+
+			if !self.holds_key_bytes() && std::mem::needs_drop::<K>() {
+				// SAFETY: as below; the item is initialised and unreachable,
+				// and `free` deallocates only once this has returned or unwound.
+				unsafe { std::ptr::drop_in_place(self.item()) };
+			}
+
+			drop(free);
+
+			return;
 		}
 
 		// An item holding its key as bytes has no key to drop -- the bytes are
@@ -618,10 +768,13 @@ impl<K> TieredValue<K> {
 		}
 
 		let value = TieredValue {
-			inner: Arc::new(ValueHeader {
-				word: tag_lines(tag_key_bytes(tag(ptr, tier)), layout.size()),
-				_item: PhantomData,
-			}),
+			inner: Arc::new(ValueHeader::new(tag_high(
+				tag_key_bytes(tag(ptr, tier)),
+				layout,
+				key_bytes_value_offset(key.len()),
+				len,
+				expiry.is_some(),
+			))),
 		};
 
 		// PHYS_FAST: one charge per fast ITEM, key bytes included, once the
@@ -679,7 +832,7 @@ impl<K> TieredValue<K> {
 		}
 
 		let value = TieredValue {
-			inner: Arc::new(ValueHeader { word: tag_lines(tag(ptr, tier), layout.size()), _item: PhantomData }),
+			inner: Arc::new(ValueHeader::new(tag_high(tag(ptr, tier), layout, bytes_offset::<K>(), len, expiry.is_some()))),
 		};
 
 		// PHYS_FAST: one charge per fast ITEM -- metadata, key and bytes, the
@@ -1088,6 +1241,15 @@ impl<K> TieredValue<K> {
 		self.prefix().len
 	}
 
+	/// What the DRAM word knows of the item's accounting, without reading
+	/// it: its accounted bytes (`resident_item_bytes`) and whether it may
+	/// carry an expiry (false: it has none). `None` when the word does not
+	/// carry them (module doc, "The word's high bits").
+	#[inline]
+	pub(crate) fn accounting_hint(&self) -> Option<(ObjectSize, bool)> {
+		self.inner.item_bytes_hint().map(|bytes| (bytes, self.inner.may_expire()))
+	}
+
 	/// Prefetches the first cache lines of the ITEM -- its header (length,
 	/// expiry, key) and the first bytes -- for a slow-tier item or, with
 	/// `knobs.fast_too()`, any (see `crate::read_path`).
@@ -1149,6 +1311,12 @@ impl<K> TieredValue<K> {
 	/// correct: they are the same object.
 	#[inline]
 	pub fn set_expiry(&self, expiry: ExpireTime) {
+		// The word's hint first: a word that says "no expiry" must never
+		// name an item that has one.
+		if expiry.is_some() {
+			self.inner.note_expiry();
+		}
+
 		self.prefix()
 			.expiry
 			.store(expiry.map_or(0, |tick| tick.get()), Ordering::Relaxed);
@@ -1176,12 +1344,11 @@ impl<K> TieredValue<K> {
 	}
 
 	/// The raw tagged word naming this value's ITEM -- address with the tier
-	/// in bit 0 and `KEY_BYTES_BIT` in bit 1 -- without the line count in its
-	/// high bits. Test-only: the tag discipline is asserted against it, and
+	/// in bit 0 and `KEY_BYTES_BIT` in bit 1 -- without its high fields. Test-only: the tag discipline is asserted against it, and
 	/// nothing in the release path should ever need the tagged form.
 	#[cfg(test)]
 	pub(crate) fn tagged_word(&self) -> usize {
-		self.inner.word.as_ptr().addr() & !LINES_BITS
+		self.inner.word().addr() & !HIGH_BITS
 	}
 
 	/// The line count the word carries. Test-only.
@@ -1295,6 +1462,7 @@ impl<K> UninitValue<K> {
 		// once and the item is owned by the header from here on; the P charge
 		// `new_uninit_in` made is the one `ValueHeader::drop` refunds.
 		let key = unsafe { std::ptr::read(&this.key) };
+		let expires = expiry.is_some();
 		let expiry = AtomicU32::new(expiry.map_or(0, |tick| tick.get()));
 
 		let word = if this.as_bytes {
@@ -1332,7 +1500,7 @@ impl<K> UninitValue<K> {
 				drop(key);
 			}
 
-			tag_lines(tag_key_bytes(tag(this.ptr, this.tier)), this.layout.size())
+			tag_high(tag_key_bytes(tag(this.ptr, this.tier)), this.layout, this.prefix, this.len, expires)
 		} else {
 			let key = key.expect("an item that holds its key as a K is built from one");
 
@@ -1342,11 +1510,11 @@ impl<K> UninitValue<K> {
 				this.ptr.as_ptr().cast::<ItemHeader<K>>().write(ItemHeader { len: this.len, expiry, key });
 			}
 
-			tag_lines(tag(this.ptr, this.tier), this.layout.size())
+			tag_high(tag(this.ptr, this.tier), this.layout, this.prefix, this.len, expires)
 		};
 
 		TieredValue {
-			inner: Arc::new(ValueHeader { word, _item: PhantomData }),
+			inner: Arc::new(ValueHeader::new(word)),
 		}
 	}
 }
@@ -1426,22 +1594,37 @@ fn tag(ptr: NonNull<u8>, tier: Tier) -> NonNull<u8> {
 	}
 }
 
-/// Folds the line count of an item of `size` bytes into bits 58-63 of its
-/// word (see `LINES_SHIFT`): the lines from the one the item starts in to the
-/// one its last byte is in, at most 63. Nothing for an address that reaches
-/// bit 58.
+/// Folds the high fields of an item allocated as `layout`, holding `len`
+/// value bytes `prefix` bytes in, into its word (module doc, "The word's high
+/// bits"): the lines it spans from the one it starts in, at most 63; its
+/// accounted bytes as a size code, when they are a size class at least the
+/// layout's size and the layout is `VALUE_ALIGN`-aligned (what the drop frees
+/// with); and `EXPIRY_HINT_BIT` when it is built with an expiry. Nothing for
+/// an address that reaches `HIGH_SHIFT`.
 #[inline]
-fn tag_lines(word: NonNull<u8>, size: usize) -> NonNull<u8> {
+fn tag_high(word: NonNull<u8>, layout: Layout, prefix: usize, len: u32, expires: bool) -> NonNull<u8> {
 	let addr = word.as_ptr().addr() & !TAG_BITS;
 
-	if addr >> LINES_SHIFT != 0 {
+	if addr >> HIGH_SHIFT != 0 {
 		return word;
 	}
 
-	let lines = ((addr & 63) + size).div_ceil(64).min(63);
+	let lines = ((addr & 63) + layout.size()).div_ceil(64).min(63);
+	let bytes = crate::object::overhead::resident_item_bytes_with(prefix, len);
+
+	let code = match layout.align() == VALUE_ALIGN && bytes as usize >= layout.size() {
+		true => size_code(bytes),
+		false => 0,
+	};
+
+	let mut high = (lines << LINES_SHIFT) | (code << SIZE_SHIFT);
+
+	if code != 0 && expires {
+		high |= EXPIRY_HINT_BIT;
+	}
 
 	// SAFETY: setting bits cannot turn a non-null address into a null one.
-	unsafe { NonNull::new_unchecked(word.as_ptr().map_addr(|addr| addr | (lines << LINES_SHIFT))) }
+	unsafe { NonNull::new_unchecked(word.as_ptr().map_addr(|addr| addr | high)) }
 }
 
 /// Folds `KEY_BYTES_BIT` into an item word: the item holds its key as bytes.

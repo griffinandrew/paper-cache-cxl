@@ -58,8 +58,9 @@
 //! for 256 B, 8 lines cost 50 ns on 64 B values). Two related experiments
 //! were not kept: prefetching the replaced item's first line on a set (on
 //! the Meta kvcache_202401 trace SET mean 1560 -> 2223 ns and more byte-gate
-//! waits) and moving the key and expiry checks after the copy, off the guard
-//! (no clear gain there).
+//! waits; a set now takes what it needs of the replaced item from its DRAM
+//! word instead -- `value_thin.rs`, "The word's high bits") and moving the key
+//! and expiry checks after the copy, off the guard (no clear gain there).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 

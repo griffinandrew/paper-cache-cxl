@@ -101,6 +101,33 @@ impl OverheadManager {
 		total_size
 	}
 
+	/// `base_size` and the expiry of an object a set has just REPLACED in the
+	/// map: what `publish_set` charges back and tells the TTL worker. Equal to
+	/// `(self.base_size(object), object.expiry())`, always
+	/// (`replaced_size_and_expiry_is_base_size_and_expiry`); what differs is
+	/// what it reads. Under `thin_header` the length and the expiry are in the
+	/// ITEM, on the far node for a slow object, and the item's accounted bytes
+	/// and whether it may carry an expiry are in the DRAM word
+	/// (`TieredValue::accounting_hint`): when the word says "no expiry", the
+	/// item is not read at all -- the key's accounted size is the type's, or
+	/// a `HashedKey`'s for a key held as bytes. An item that may carry an
+	/// expiry, or a word without the hint (and the default layout, whose
+	/// header is DRAM anyway), is read as before.
+	#[inline]
+	pub fn replaced_size_and_expiry<K, V>(&self, object: &Object<K, V>) -> (ObjectSize, crate::object::ExpireTime)
+	where
+		K: TypeSize,
+	{
+		match object.value().accounting_hint() {
+			Some((item, false)) => (
+				object.key_size() + item + mem::size_of::<crate::object::ExpireTime>() as ObjectSize,
+				None,
+			),
+
+			_ => (self.base_size(object), object.expiry()),
+		}
+	}
+
 	/// `base_size` of the object a set WILL build -- its key, `len` value bytes
 	/// and `ttl` -- computed before anything is allocated (S5): the size checks
 	/// run from it, so an oversize value is refused without being built. The

@@ -687,6 +687,15 @@ impl<K> TieredValue<K> {
 		self.inner.len
 	}
 
+	/// What a reader could learn of the value's accounting without reading it
+	/// (`thin_header` carries it in its word): nothing here -- this layout's
+	/// length and expiry are in this DRAM header already, so the readers read
+	/// them (`OverheadManager::replaced_size_and_expiry`).
+	#[inline]
+	pub(crate) fn accounting_hint(&self) -> Option<(crate::object::ObjectSize, bool)> {
+		None
+	}
+
 	/// Prefetches the first cache lines of the value's BYTES, for a slow-tier
 	/// value or, with `knobs.fast_too()`, any (see `crate::read_path`). The
 	/// length is in this DRAM header, so the count never exceeds the lines

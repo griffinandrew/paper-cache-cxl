@@ -272,6 +272,158 @@ fn base_size_for_equals_base_size() {
 	agree(&overhead_manager, Box::<[u8]>::from(&b"a boxed key, Kia's server's key type"[..]));
 }
 
+/// `OverheadManager::replaced_size_and_expiry` -- what a set charges back for
+/// the object it replaced, and tells the TTL worker -- is `base_size` and
+/// `expiry()` of that object, over every key shape, lengths around the size
+/// classes, both tiers, a TTL of none, 0 and 5 s, after an expiry is added
+/// and removed through `expires` (the word's hint is sticky), and across a
+/// migration. Under `thin_header` the word carries the item's accounted bytes
+/// for every one of these items (u64 and byte-string keys are 8-aligned), and
+/// says "no expiry" exactly for the items that never had one -- the case in
+/// which the replaced item is not read at all.
+#[test]
+fn replaced_size_and_expiry_is_base_size_and_expiry() {
+	fn agree<K: typesize::TypeSize + Clone + std::fmt::Debug + 'static>(overhead_manager: &OverheadManager, key: K) {
+		let check = |object: &Object<K, TieredBuffer>, ever_expired: bool, what: &str| {
+			assert_eq!(
+				overhead_manager.replaced_size_and_expiry(object),
+				(overhead_manager.base_size(object), object.expiry()),
+				"{key:?}, {what}",
+			);
+
+			match cfg!(feature = "thin_header") {
+				true => assert_eq!(
+					object.value().accounting_hint(),
+					Some((crate::object::overhead::resident_item_bytes(object), ever_expired)),
+					"{key:?}, {what}: the word's hint",
+				),
+				false => assert_eq!(object.value().accounting_hint(), None, "{key:?}, {what}"),
+			}
+		};
+
+		let mut lens: Vec<usize> = vec![0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 100, 1_000, 4_080, 4_095, 4_096, 4_097, 16_384, 70_000, 1 << 20];
+		lens.extend((0..40).map(|i| 8 * i + 3));
+
+		for len in lens {
+			for tier in [Fast, Slow] {
+				for ttl in [None, Some(0), Some(5)] {
+					let built_with = ttl.is_some_and(|ttl| ttl != 0);
+					let mut object = Object::<K, TieredBuffer>::new_in(key.clone(), &vec![1u8; len], tier, ttl);
+					check(&object, built_with, &format!("{len} B {tier:?} ttl {ttl:?}"));
+
+					let moved = Object::<K, TieredBuffer>::from_value(object.value().migrated_to(match tier {
+						Fast => Slow,
+						Slow => Fast,
+					}));
+					check(&moved, built_with, &format!("{len} B {tier:?} ttl {ttl:?}, migrated"));
+
+					object.expires(Some(60));
+					check(&object, true, &format!("{len} B {tier:?} ttl {ttl:?}, then 60 s"));
+
+					object.expires(None);
+					check(&object, true, &format!("{len} B {tier:?} ttl {ttl:?}, then none"));
+				}
+			}
+		}
+	}
+
+	let status = Arc::new(AtomicStatus::new(1 << 30, &[PaperPolicy::LruCompactHybrid], PaperPolicy::LruCompactHybrid).unwrap());
+	let overhead_manager = OverheadManager::new(&status);
+
+	agree(&overhead_manager, 7u64);
+	agree(&overhead_manager, String::from("a key of some length"));
+	agree(&overhead_manager, String::new());
+	agree(&overhead_manager, "k".repeat(250));
+	agree(&overhead_manager, vec![0xFFu8, 0x00, 0x80, b'k', 0xC3]);
+	agree(&overhead_manager, Box::<[u8]>::from(&b"a boxed key"[..]));
+}
+
+/// Overwrites that replace FAST and SLOW objects -- with and without an
+/// expiry, one added by `ttl` after the set, one removed, values changing
+/// size -- from eight threads at once keep the used size exact: at the end it
+/// is every live object's `base_size` (computed from what each key last
+/// holds) plus the policy's per-object overhead, and the object count is the
+/// keys'. The fast tier holds a fraction of the data, so most overwrites
+/// replace an object the worker has demoted. In both layouts; under
+/// `thin_header` the replaced items' figures come from their words.
+#[test]
+fn overwrites_across_tiers_keep_the_used_size_exact() {
+	const THREADS: u64 = 8;
+	const PER_THREAD: u64 = 300;
+	const ROUNDS: u64 = 4;
+
+	let policy = PaperPolicy::LruCompactHybrid;
+	let cache = Arc::new(
+		PaperCache::<u64, TieredBuffer>::new_with_gate(1 << 30, CacheTierSize::Bytes(16 << 20), policy, GateConfig::default())
+			.expect("a tiered cache"),
+	);
+
+	// About 29 MB of values against a 16 MiB fast tier (room for the merged
+	// store's metadata too, whose reservation is the largest).
+	let len = |k: u64, round: u64| 1 + ((k * 131 + round * 977) % 24_000) as usize;
+	let ttl = |k: u64, round: u64| match (k + round) % 3 {
+		0 => Some(3_600),
+		1 => Some(0),
+		_ => None,
+	};
+
+	for k in 0..THREADS * PER_THREAD {
+		cache.set(k, &vec![k as u8; len(k, 0)], ttl(k, 0)).expect("a set");
+	}
+
+	wait_for("demotions", Duration::from_secs(60), || cache.hybrid_stats().slow_objects > THREADS * PER_THREAD / 4);
+
+	let slow_before = (0..THREADS * PER_THREAD).filter(|k| cache.tier_of(k) == Some(Slow)).count();
+	assert!(slow_before > 0, "no overwrite would replace a slow object");
+
+	// Each thread owns its keys, so what each key holds at the end is known.
+	let threads: Vec<_> = (0..THREADS)
+		.map(|t| {
+			let cache = cache.clone();
+
+			std::thread::spawn(move || {
+				let mut last = Vec::new();
+
+				for k in t * PER_THREAD..(t + 1) * PER_THREAD {
+					let mut held = (len(k, 0), ttl(k, 0));
+
+					for round in 1..=ROUNDS {
+						// Add or drop an expiry on the live object first, now and then.
+						if (k + round) % 5 == 0 {
+							let added = if round % 2 == 0 { Some(600) } else { None };
+							cache.ttl(&k, added).expect("a live key");
+							held.1 = added;
+						}
+
+						cache.set(k, &vec![(k + round) as u8; len(k, round)], ttl(k, round)).expect("an overwrite");
+						held = (len(k, round), ttl(k, round));
+
+						let _ = cache.get(&k);
+					}
+
+					last.push((k, held));
+				}
+
+				last
+			})
+		})
+		.collect();
+
+	let mut expected = 0u64;
+	let mut keys = 0u64;
+
+	for thread in threads {
+		for (k, (len, ttl)) in thread.join().expect("a client panicked") {
+			let base = cache.overhead_manager.base_size_for(&k, len, ttl).expect("a size");
+			expected += base as u64 + get_policy_overhead(&policy) as u64;
+			keys += 1;
+		}
+	}
+
+	assert_eq!(cache.status.live_num_objects(), keys);
+	assert_eq!(cache.status.used_size(&policy), expected as CacheSize, "{slow_before} slow before the overwrites");
+}
+
 /// What the byte gate reserves for a set before its value exists
 /// (`Sizes::value`, from `phys::value_charge_for`) is what the value it then
 /// builds is charged: the object's own `resident_item_bytes`, and for a key

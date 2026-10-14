@@ -1451,8 +1451,10 @@ where
 		let old_object_info = self.objects
 			.insert(hashed_key, object)
 			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
+				// From the DRAM word where it can (`thin_header`): the replaced
+				// item -- slow or fast -- is not read, and its drop below frees it
+				// without reading it either.
+				let (base_size, expiry) = self.overhead_manager.replaced_size_and_expiry(&old_object);
 
 				// The map now holds the new object's key, not this one's.
 				old_key_heap = old_object.key_heap_bytes();
@@ -2351,8 +2353,10 @@ where
 		let old_object_info = self.objects
 			.insert(hashed_key, object)
 			.map(|old_object| {
-				let base_size = self.overhead_manager.base_size(&old_object);
-				let expiry = old_object.expiry();
+				// From the DRAM word where it can (`thin_header`): the replaced
+				// item -- slow or fast -- is not read, and its drop below frees it
+				// without reading it either.
+				let (base_size, expiry) = self.overhead_manager.replaced_size_and_expiry(&old_object);
 
 				// The map now holds the new object's key, not this one's.
 				old_key_heap = old_object.key_heap_bytes();
