@@ -188,13 +188,6 @@ pub struct AtomicStatus {
 	#[cfg(feature = "hybrid_cache_common")]
 	migration_in_flight: std::sync::OnceLock<Arc<crate::worker::InFlight>>,
 
-	/// The move ledger (`worker::policy::move_ledger`), held by the client,
-	/// the policy worker and the migration consumers. Built on first use, in
-	/// the mode the environment asks for (`MIG_TAGGED`, `MIG_LATEST`,
-	/// `MIG_REVCOUNT`).
-	#[cfg(feature = "hybrid_cache_common")]
-	move_ledger: std::sync::OnceLock<Arc<crate::worker::move_ledger::MoveLedger>>,
-
 	#[cfg(feature = "hybrid_cache_common")]
 	hybrid_fast_bytes_used: AtomicCacheSize,
 	#[cfg(feature = "hybrid_cache_common")]
@@ -481,8 +474,6 @@ impl AtomicStatus {
 			hybrid_reconcile_applied_to_slow: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			migration_in_flight: std::sync::OnceLock::new(),
-			#[cfg(feature = "hybrid_cache_common")]
-			move_ledger: std::sync::OnceLock::new(),
 			#[cfg(feature = "hybrid_cache_common")]
 			hybrid_fast_bytes_used: AtomicCacheSize::default(),
 			#[cfg(feature = "hybrid_cache_common")]
@@ -1131,12 +1122,6 @@ impl AtomicStatus {
 	#[cfg(feature = "hybrid_cache_common")]
 	pub(crate) fn migration_in_flight(&self) -> &Arc<crate::worker::InFlight> {
 		self.migration_in_flight.get_or_init(|| Arc::new(crate::worker::InFlight::new()))
-	}
-
-	/// The move ledger, built on first use.
-	#[cfg(feature = "hybrid_cache_common")]
-	pub(crate) fn move_ledger(&self) -> &Arc<crate::worker::move_ledger::MoveLedger> {
-		self.move_ledger.get_or_init(|| Arc::new(crate::worker::move_ledger::MoveLedger::default()))
 	}
 
 

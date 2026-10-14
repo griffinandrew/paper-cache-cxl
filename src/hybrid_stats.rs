@@ -398,11 +398,8 @@ pub struct HybridStats {
 	/// How the queue's entries ended: `mig_applied` moved a value; `mig_gone`
 	/// found the object evicted meanwhile, `mig_declined` found it already in
 	/// the requested tier, `mig_superseded` lost a race with a `set`, and moved
-	/// nothing. Every entry the consumers take is one of the four, which is
-	/// what `flush` counts -- or one of the dispositions these do not list: a
-	/// promotion the promotion gate declined (`PromotionGate::On`), or a move
-	/// the move ledger skipped (tagged moves, `MIG_LATEST`: `stale_skipped`,
-	/// `latest_skipped`, on the `MIGSTATS tagged=` line).
+	/// nothing. Every entry is exactly one of the four, which is what `flush`
+	/// counts.
 	pub mig_applied: u64,
 	pub mig_gone: u64,
 	pub mig_declined: u64,

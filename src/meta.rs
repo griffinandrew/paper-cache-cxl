@@ -48,10 +48,7 @@
 //! NOT attributed, and not in M: the channels (one crossbeam block per
 //! channel once it has been used), the policy worker's reusable buffers and
 //! each stack's transient `migrations` vector, the migration pipeline's
-//! in-flight table (128 KiB, built on the first set), the move ledger
-//! (`worker::policy::move_ledger`: ~0.9 MiB of tables when it tracks, built
-//! when the migration queue starts or on the first set, and 48 bytes per key
-//! with a `Set` or a move in flight), the status, the TTL
+//! in-flight table (128 KiB, built on the first set), the status, the TTL
 //! index (on the slow node), and anything outside the cache. `tests/dram_metadata_identity.rs` holds the DRAM pool to M plus P
 //! with those taken out by a warm-up; the per-structure tests hold each
 //! structure to `thread.allocated`.

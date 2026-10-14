@@ -69,12 +69,6 @@ pub mod migration_queue {
 	use crate::{HashedKey, ObjectMapRef, StatusRef};
 	use crate::worker::policy::migstats::{MqSlot, MQ_SLOTS, Stats as MigStats};
 	use crate::worker::policy::policy_stack::{MigrationEntry, MigrationOrigin, TaggedMigration, Tier};
-	use crate::worker::policy::move_ledger::{MoveLedger, Tag, Verdict};
-
-	/// What a consumer channel carries: the move and its ledger tag
-	/// (`move_ledger::Tag`, stamped by `push`; zeros when the ledger does not
-	/// track -- `MIG_TAGGED`, `MIG_LATEST` and `MIG_REVCOUNT` all off).
-	pub(crate) type QueuedMigration = (TaggedMigration, Tag);
 
 	/// Default consumer count.
 	///
@@ -479,16 +473,10 @@ pub mod migration_queue {
 		in_flight: &'a InFlight,
 		key: HashedKey,
 		landed: bool,
-		/// The move ledger's finish (`MoveLedger::finish`), with the move's
-		/// tier and the stats its reversal counter goes to.
-		ledger: &'a MoveLedger,
-		tier: Tier,
-		stats: &'a MigStats,
 	}
 
 	impl Drop for Finish<'_> {
 		fn drop(&mut self) {
-			self.ledger.finish(self.key, self.tier, self.landed, Some(self.stats));
 			self.in_flight.finished(self.key, self.landed);
 		}
 	}
@@ -614,32 +602,12 @@ pub mod migration_queue {
 	/// (`Gate::promotion_admit`) -- and returns `false` like any no-op, so the
 	/// key's `InFlight` entry finishes as not landed. With the gate `Off` this
 	/// is one relaxed load per promotion and one per copy; with `None`, nothing.
-	/// Tests: production calls `apply_migration_guarded`, with the ledger.
-	#[cfg(test)]
 	pub(crate) fn apply_migration_with<K: Clone, V>(
 		objects: &ObjectMapRef<K, V>,
 		key: HashedKey,
 		tier: Tier,
 		stats: &MigStats,
 		gate: Option<&crate::gate::Gate>,
-	) -> bool {
-		apply_migration_guarded(objects, key, tier, stats, gate, None)
-	}
-
-	/// [`apply_migration_with`] with the move ledger's check (`move_ledger`):
-	/// `guard` is the ledger and the move's tag, `None` when the ledger checks
-	/// nothing (`Mode::checks`). The check runs AFTER the snapshot and BEFORE
-	/// the copy -- the ledger's protocol, step 4, which is why it is here and
-	/// not at the dequeue -- and a move it rejects is counted
-	/// (`stale_skipped`, `latest_skipped`) and returns `false` like any no-op:
-	/// nothing was copied, so its `InFlight` entry finishes as not landed.
-	pub(crate) fn apply_migration_guarded<K: Clone, V>(
-		objects: &ObjectMapRef<K, V>,
-		key: HashedKey,
-		tier: Tier,
-		stats: &MigStats,
-		gate: Option<&crate::gate::Gate>,
-		guard: Option<(&MoveLedger, Tag)>,
 	) -> bool {
 		// The snapshot is a STRONG REFERENCE, and it is what makes every step
 		// below sound. It replaces the epoch pin this function used to take,
@@ -660,23 +628,6 @@ pub mod migration_queue {
 			stats.mig_gone.fetch_add(1, Ordering::Relaxed);
 			return false;
 		};
-
-		// The ledger's verdict, taken AFTER the snapshot: the snapshotted
-		// value's client bumped the key's `published` count before inserting
-		// it, so the check sees that bump (`move_ledger`, protocol step 4).
-		if let Some((ledger, tag)) = guard {
-			match ledger.check(key, tag) {
-				Verdict::Apply => {},
-				Verdict::Stale => {
-					stats.stale_skipped.fetch_add(1, Ordering::Relaxed);
-					return false;
-				},
-				Verdict::Superseded => {
-					stats.latest_skipped.fetch_add(1, Ordering::Relaxed);
-					return false;
-				},
-			}
-		}
 
 		// Declined: already in the requested tier, nothing to move.
 		//
@@ -793,12 +744,8 @@ pub mod migration_queue {
 		///
 		/// Emptied by `Drop` before joining: dropping the senders is what
 		/// makes each consumer's `receive` return `None` and its loop exit.
-		senders: Vec<Sender<QueuedMigration>>,
+		senders: Vec<Sender<TaggedMigration>>,
 		handles: Vec<JoinHandle<()>>,
-
-		/// The cache's move ledger (`move_ledger`): stamped by `push`, checked
-		/// and finished by the consumers.
-		ledger: Arc<MoveLedger>,
 
 		/// The cache's per-bucket in-flight and landed counts (`InFlight`):
 		/// charged by `push`, finished by the consumers.
@@ -850,7 +797,6 @@ pub mod migration_queue {
 
 			let processed = Arc::new(AtomicU64::new(0));
 			let in_flight = status.migration_in_flight().clone();
-			let ledger = status.move_ledger().clone();
 			let queue_status = status.clone();
 
 			// Seeded with the `PolicyStack` trait default; the first
@@ -864,12 +810,11 @@ pub mod migration_queue {
 			for index in 0..threads {
 				// Per-consumer channel rather than one shared queue -- see the
 				// ordering note on `senders`.
-				let (sender, receiver) = unbounded::<QueuedMigration>();
+				let (sender, receiver) = unbounded::<TaggedMigration>();
 
 				let objects = objects.clone();
 				let processed = processed.clone();
 				let in_flight = in_flight.clone();
-				let ledger = ledger.clone();
 				let status = status.clone();
 				let demotion_accounting = demotion_accounting.clone();
 
@@ -922,7 +867,7 @@ pub mod migration_queue {
 						// completions back by up to the window, or for as long
 						// as spins keep hitting; and (3) save nothing, since it
 						// is one flush per drained burst either way.
-						while let Some(((key, tier, origin), tag)) = receive(&receiver, spin, &mut recv_counts, slot) {
+						while let Some((key, tier, origin)) = receive(&receiver, spin, &mut recv_counts, slot) {
 							// Test builds: a gate test's paused or paced consumers.
 							#[cfg(test)]
 							crate::gate::test_hooks::consumer_wait();
@@ -930,13 +875,9 @@ pub mod migration_queue {
 							// Counted on every path out of this iteration.
 							let _done = CountOnDrop(&processed);
 							let _pending = PendingOnDrop(status.migstats(), tier);
-							let mut finish = Finish { in_flight: &in_flight, key, landed: false, ledger: &ledger, tier, stats: status.migstats() };
+							let mut finish = Finish { in_flight: &in_flight, key, landed: false };
 
-							// The ledger's check, when it makes one (`MIG_TAGGED`,
-							// `MIG_LATEST`); `None` costs nothing more.
-							let guard = ledger.mode().checks().then_some((&*ledger, tag));
-
-							if apply_migration_guarded(&objects, key, tier, status.migstats(), Some(status.gate()), guard) {
+							if apply_migration_with(&objects, key, tier, status.migstats(), Some(status.gate())) {
 								finish.landed = true;
 
 								// S5 B2: a landed demotion freed fast bytes (the old
@@ -1027,7 +968,6 @@ pub mod migration_queue {
 			Some(MigrationQueue {
 				senders,
 				handles,
-				ledger,
 				in_flight,
 				status: queue_status,
 				enqueued: AtomicU64::new(0),
@@ -1050,13 +990,6 @@ pub mod migration_queue {
 			let Some(first) = self.senders.first() else {
 				return;
 			};
-
-			// The ledger's stamp (`MoveLedger::hand_off`): the newest
-			// publication of the key, which a consumer checks the key against
-			// after its snapshot. A hand-off inside the key's pending window
-			// (a `Set` of it still unhandled) is counted for the fence of the
-			// `Set` that closes it.
-			let tag = self.ledger.hand_off(item.0, item.1, self.status.migstats());
 
 			// Charge the pending counter BEFORE publishing, not after.
 			//
@@ -1085,7 +1018,7 @@ pub mod migration_queue {
 			// Sharding only does work when there is more than one consumer to
 			// distribute across.
 			if self.senders.len() == 1 {
-				match first.send((item, tag)).is_ok() {
+				match first.send(item).is_ok() {
 					true => self
 						.record_depth(self.enqueued.fetch_add(1, Ordering::Release) + 1),
 					false => self.refuse(item),
@@ -1096,19 +1029,17 @@ pub mod migration_queue {
 
 			let shard = (item.0 % self.senders.len() as HashedKey) as usize;
 
-			match self.senders[shard].send((item, tag)).is_ok() {
+			match self.senders[shard].send(item).is_ok() {
 				true => self
 					.record_depth(self.enqueued.fetch_add(1, Ordering::Release) + 1),
 				false => self.refuse(item),
 			}
 		}
 
-		/// A refused send: both charges `push` made, refunded, and the
-		/// ledger's hand-off finished as not landed.
+		/// A refused send: both charges `push` made, refunded.
 		fn refuse(&self, item: TaggedMigration) {
 			drop(PendingOnDrop(self.status.migstats(), item.1));
 			self.in_flight.refund(item.0);
-			self.ledger.finish(item.0, item.1, false, None);
 		}
 
 		/// Updates the cache's high-water mark from an enqueue count.
@@ -1187,7 +1118,7 @@ pub mod migration_queue {
 		#[test]
 		#[ignore]
 		fn push_charges_pending_before_the_item_can_reach_a_consumer() {
-			let (sender, receiver) = bounded::<QueuedMigration>(0);
+			let (sender, receiver) = bounded::<TaggedMigration>(0);
 			let in_flight = Arc::new(InFlight::new());
 
 			let status = Arc::new(
@@ -1202,7 +1133,6 @@ pub mod migration_queue {
 			let queue = MigrationQueue {
 				senders: vec![sender],
 				handles: Vec::new(),
-				ledger: status.move_ledger().clone(),
 				in_flight: in_flight.clone(),
 				status: status.clone(),
 				enqueued: AtomicU64::new(0),
@@ -1251,7 +1181,7 @@ pub mod migration_queue {
 			// `record_pending` panics on the checked add, so the join below fails
 			// too. Against the fixed one the pair is balanced and the counter is
 			// left exactly as this test found it.
-			let ((key, tier, _origin), _tag) = receiver
+			let (key, tier, _origin) = receiver
 				.recv()
 				.expect("the producer must still be parked in `send`");
 
@@ -1695,47 +1625,6 @@ pub mod migstats {
 		/// sampled.
 		pub diverge_tick: AtomicU64,
 
-		/// The move ledger's counters (`move_ledger`), reported on the
-		/// `MIGSTATS tagged=` line (`tagged_line`):
-		///
-		///   * `stale_skipped` (`MIG_TAGGED`): queued moves a consumer (or the
-		///     inline path) skipped because the key was given a newer value
-		///     after the move was handed off;
-		///   * `pending_handoffs` (`MIG_TAGGED`): moves handed off inside their
-		///     key's pending window -- a newer value of the key published and
-		///     its `Set` not yet handled -- queued all the same;
-		///   * `pending_fences` (`MIG_TAGGED`): `Set`s that closed a pending
-		///     window with such a move in it, and fenced (the exact, per-key
-		///     new-key rule; the correctives it queued are in
-		///     `reconcile_set_new_key` and `reconcile_set_to_*`);
-		///   * `latest_skipped` (`MIG_LATEST`): queued moves a consumer skipped
-		///     because a newer move of the same key was handed off after them;
-		///   * `reversal_copies` (`MIG_REVCOUNT`): copies made while a later
-		///     move of the same key naming the OTHER tier was already queued --
-		///     a copy that move undoes, unless it is skipped or declined;
-		///   * `dup_same_tier` (`MIG_REVCOUNT`): moves handed off while the
-		///     key's newest in-flight move named the same tier;
-		///   * `heal_off` (`MIG_TAGGED`): slow-served hits not considered for a
-		///     heal, because no heal is needed in this configuration
-		///     (`PolicyWorker::heals_needed`);
-		///   * `heal_off_lagging` (`MIG_TAGGED`): of the one in
-		///     `HEAL_PROBE_EVERY` of those hits that is still looked up, those
-		///     the heal would have promoted -- a lag nothing but a broken
-		///     `placement_of` contract should leave;
-		///   * `ledger_max`: the high-water mark of the ledger's live records
-		///     (its transient memory), as the policy worker samples it
-		///     (`MoveLedger::sample`: every `SAMPLE_EVERY`th pass, and at
-		///     shutdown) -- a lower bound of the true peak.
-		pub stale_skipped: AtomicU64,
-		pub pending_handoffs: AtomicU64,
-		pub pending_fences: AtomicU64,
-		pub latest_skipped: AtomicU64,
-		pub reversal_copies: AtomicU64,
-		pub dup_same_tier: AtomicU64,
-		pub heal_off: AtomicU64,
-		pub heal_off_lagging: AtomicU64,
-		pub ledger_max: AtomicU64,
-
 		/// Paces the periodic dump: the instant of the first call that checked
 		/// the clock, and the millisecond (since it) of the last dump.
 		start: OnceLock<Instant>,
@@ -1902,37 +1791,6 @@ pub mod migstats {
 			self.maybe_dump(self.ecalls.fetch_add(1, Ordering::Relaxed));
 		}
 
-		/// `MIGSTATS tagged=.. latest=.. revcount=.. stale_skipped=..
-		/// pending_handoffs=.. pending_fences=.. latest_skipped=..
-		/// reversal_copies=.. dup_same_tier=.. heal_off=.. heal_off_lagging=..
-		/// ledger_max=.. t_ms=..`: the three
-		/// ledger knobs as this PROCESS read them from the environment
-		/// (`move_ledger::Mode::from_env`, what every cache is built with
-		/// outside tests), and this cache's ledger counters.
-		#[cfg(feature = "hybrid_cache_common")]
-		pub(crate) fn tagged_line(&self, t_ms: u64) -> String {
-			use crate::worker::policy::move_ledger as ml;
-
-			let l = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
-
-			format!(
-				"MIGSTATS tagged={} latest={} revcount={} stale_skipped={} pending_handoffs={} pending_fences={} \
-				 latest_skipped={} reversal_copies={} dup_same_tier={} heal_off={} heal_off_lagging={} ledger_max={} t_ms={t_ms}",
-				ml::tagged_env() as u8,
-				ml::latest_env() as u8,
-				ml::revcount_env() as u8,
-				l(&self.stale_skipped),
-				l(&self.pending_handoffs),
-				l(&self.pending_fences),
-				l(&self.latest_skipped),
-				l(&self.reversal_copies),
-				l(&self.dup_same_tier),
-				l(&self.heal_off),
-				l(&self.heal_off_lagging),
-				l(&self.ledger_max),
-			)
-		}
-
 		/// This cache's `MIGSTATS` lines, to stderr. The format is what it
 		/// was when the counters were process-global; there is no cache
 		/// identifier, so the lines of several caches in one process are told
@@ -2020,11 +1878,6 @@ pub mod migstats {
 			#[cfg(feature = "hybrid_cache_common")]
 			lines.push(self.mq_line(t_ms));
 
-			// The move ledger's line: after every existing line, so each keeps
-			// its fields and its place.
-			#[cfg(feature = "hybrid_cache_common")]
-			lines.push(self.tagged_line(t_ms));
-
 			lines
 		}
 	}
@@ -2074,35 +1927,12 @@ pub mod migstats {
 			set(&stats.mq[0].spin_ns, 43);
 			set(&stats.mq[0].block_ns, 44);
 
-			// The consumers' receive line, after the reconcile line: the window
+			// The consumers' receive line, appended after the rest: the window
 			// is this process's `MIG_SPIN_US`.
 			let mq = format!(
 				"MIGSTATS mq_spin_us={} mq_spin_hits=41 mq_blocks=42 mq_spin_ns=43 mq_block_ns=44 t_ms=123",
 				crate::worker::policy::migration_queue::spin_us(),
 			);
-
-			set(&stats.stale_skipped, 51);
-			set(&stats.pending_handoffs, 52);
-			set(&stats.pending_fences, 53);
-			set(&stats.latest_skipped, 54);
-			set(&stats.reversal_copies, 55);
-			set(&stats.dup_same_tier, 56);
-			set(&stats.heal_off, 57);
-			set(&stats.heal_off_lagging, 58);
-			set(&stats.ledger_max, 59);
-
-			// The move ledger's line, last: the knobs are this process's.
-			let tagged = {
-				use crate::worker::policy::move_ledger as ml;
-
-				format!(
-					"MIGSTATS tagged={} latest={} revcount={} stale_skipped=51 pending_handoffs=52 pending_fences=53 \
-					 latest_skipped=54 reversal_copies=55 dup_same_tier=56 heal_off=57 heal_off_lagging=58 ledger_max=59 t_ms=123",
-					ml::tagged_env() as u8,
-					ml::latest_env() as u8,
-					ml::revcount_env() as u8,
-				)
-			};
 
 			assert_eq!(
 				stats.lines(123),
@@ -2118,7 +1948,6 @@ pub mod migstats {
 					 reconcile_set_new_key=34 reconcile_queued_to_fast=35 reconcile_queued_to_slow=36 \
 					 reconcile_applied_to_fast=37 reconcile_applied_to_slow=38 reconcile_get_heal_skipped=39 t_ms=123",
 					mq.as_str(),
-					tagged.as_str(),
 				],
 			);
 		}
@@ -2349,12 +2178,6 @@ pub mod eviction_watermarks {
 
 mod policy_stack;
 
-// The move ledger: tagged moves (`MIG_TAGGED`), superseded-move skipping
-// (`MIG_LATEST`) and the reversal counters (`MIG_REVCOUNT`). Its module doc
-// has the design and the correctness argument.
-#[cfg(feature = "hybrid_cache_common")]
-pub mod move_ledger;
-
 use std::{
 	thread,
 	time::{Instant, Duration},
@@ -2487,21 +2310,6 @@ pub use policy_stack::{MigrationEntry, MigrationOrigin, TaggedMigration};
 /// finds the value replaced mid-copy is SUPERSEDED, and the replacement's own
 /// `Set` is reconciled in its turn.
 ///
-/// # Two modes
-///
-/// The sections from "The tracked invariant" to "Cost" describe the reconcile
-/// WITHOUT tagged moves (`MIG_TAGGED=0`). With them -- the default -- every
-/// queued move carries the newest publication of its key at its hand-off,
-/// and its consumer skips it if the key was published since (`move_ledger`):
-/// the tracked invariant is replaced by the ledger's ("a value is only ever
-/// moved by a move handed off after the value was published, and a move
-/// handed off while a `Set` of its key was unhandled is followed by the fence
-/// of the `Set` that closes that window"), the new-key rule becomes exact --
-/// that fence, per key, from the ledger's counts, with no client mark and no
-/// bucket -- and the heal is kept only under `OnStall::Divert` and
-/// `PromotionGate::On` (`PolicyWorker::heals_needed`). The plain rule --
-/// built against placed, at every `Set` -- is the same in both modes.
-///
 /// # The tracked invariant
 ///
 /// Queued migrations carry no identity: an entry acts on whatever value holds
@@ -2617,8 +2425,7 @@ pub use policy_stack::{MigrationEntry, MigrationOrigin, TaggedMigration};
 /// insert replaced a value while its bucket moved. One load per slow-served
 /// hit (and, when its bucket is busy, no `placement_of` -- one relaxed
 /// increment of the skipped-heal count instead). Nothing per fast-served hit
-/// or miss. (Tagged moves cost what `move_ledger`'s "Cost" says instead; the
-/// `InFlight` RMWs stay, for the heal they keep and `total_pending`.)
+/// or miss.
 #[cfg(feature = "hybrid_cache_common")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Observed {
@@ -2630,10 +2437,6 @@ enum Observed {
 	/// A hit on the key was served from the slow tier. `quiet`: nothing of the
 	/// key's bucket was in flight -- the heal rule.
 	ServedSlow { key: HashedKey, quiet: bool },
-	/// Under tagged moves with the heal off (`PolicyWorker::heals_needed`), a
-	/// sampled slow-served hit: judged as `ServedSlow` would be, and counted
-	/// in `heal_off_lagging` when that would heal -- never queued.
-	Probe { key: HashedKey, quiet: bool },
 	/// A `set` the byte gate DIVERTED (S5 B2, `OnStall::Divert`): its value was
 	/// built slow because the fast tier was stalled, and the key is placed by
 	/// its policy. Reconciled as a slow build, except never toward fast: a
@@ -2648,10 +2451,7 @@ enum Observed {
 impl Observed {
 	fn key(self) -> HashedKey {
 		match self {
-			Observed::Built { key, .. }
-			| Observed::ServedSlow { key, .. }
-			| Observed::Probe { key, .. }
-			| Observed::Diverted { key, .. } => key,
+			Observed::Built { key, .. } | Observed::ServedSlow { key, .. } | Observed::Diverted { key, .. } => key,
 		}
 	}
 }
@@ -2723,7 +2523,7 @@ fn corrective<E: MigrationEntry>(
 			}
 		},
 
-		Observed::ServedSlow { quiet, .. } | Observed::Probe { quiet, .. } => {
+		Observed::ServedSlow { quiet, .. } => {
 			(quiet && placement == Tier::Fast && queued.unwrap_or(Tier::Slow) == Tier::Slow)
 				.then_some((key, Tier::Fast, Reason::Heal))
 		},
@@ -3123,14 +2923,6 @@ where
 					WorkerEvent::ResizeSizeThreshold(size) => self.handle_resize_size_threshold(size),
 
 					WorkerEvent::Shutdown => {
-						// The move ledger's high-water mark, sampled once more
-						// for the final line.
-						#[cfg(feature = "hybrid_cache_common")]
-						if self.tier_migration && self.status.move_ledger().mode().tracks() {
-							let max = self.status.move_ledger().sample();
-							self.status.migstats().ledger_max.store(max, std::sync::atomic::Ordering::Relaxed);
-						}
-
 						// Real totals, whatever this run's call volume was.
 						self.status.migstats().dump_final();
 
@@ -3235,19 +3027,6 @@ where
 						stats.erase_fallbacks.load(Ordering::Relaxed),
 						migstats::t_ms(),
 					);
-				}
-			}
-
-			// The move ledger's high-water mark (`ledger_max`), sampled every
-			// `SAMPLE_EVERY`th pass, idle or not (`evict_calls` counts the
-			// passes): one pass over its shards, which also shrinks a table a
-			// burst left oversized (`MoveLedger::sample`).
-			#[cfg(feature = "hybrid_cache_common")]
-			if self.tier_migration {
-				let (stats, ledger) = (self.status.migstats(), self.status.move_ledger());
-
-				if ledger.sample_due(stats.ecalls.load(std::sync::atomic::Ordering::Relaxed)) {
-					stats.ledger_max.store(ledger.sample(), std::sync::atomic::Ordering::Relaxed);
 				}
 			}
 
@@ -3549,45 +3328,10 @@ where
 		// this one comparison and nothing else.
 		#[cfg(feature = "hybrid_cache_common")]
 		if self.tier_migration && served == Some(Tier::Slow) {
-			// Under tagged moves a stale move cannot leave a value lagging its
-			// placement, so the heal is considered only where something else
-			// can (`heals_needed`); elsewhere the hit is counted and nothing
-			// is looked up.
-			if self.status.move_ledger().mode().tagged && !self.heals_needed() {
-				let off = self.status.migstats().heal_off.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-				// One such hit in `HEAL_PROBE_EVERY` is still looked at, for
-				// the record only: `heal_off_lagging` counts those the heal
-				// would have promoted (`drain_reconciled`).
-				if off % move_ledger::HEAL_PROBE_EVERY == 0 {
-					let quiet = self.status.migration_in_flight().pending(key) == 0;
-
-					self.observed.push(Observed::Probe { key, quiet });
-				}
-
-				return;
-			}
-
 			let quiet = self.status.migration_in_flight().pending(key) == 0;
 
 			self.observed.push(Observed::ServedSlow { key, quiet });
 		}
-	}
-
-	/// Whether, under tagged moves (`MIG_TAGGED`), a slow-served hit is still
-	/// considered for a heal: only where bytes can lag a FAST placement for a
-	/// reason other than a stale move -- the byte gate's `OnStall::Divert` (a
-	/// diverted key is promoted by its first slow-served hit, by design) and
-	/// `PromotionGate::On` (the retry of declined promotions drops keys past
-	/// its cap). See `move_ledger`, "Which configurations keep the heal". Read
-	/// live, per slow-served hit: a relaxed load and the gate configuration's
-	/// read lock.
-	#[cfg(feature = "hybrid_cache_common")]
-	fn heals_needed(&self) -> bool {
-		let gate = self.status.gate();
-
-		gate.promotion_gate() == crate::gate::PromotionGate::On
-			|| gate.config().on_stall == crate::gate::OnStall::Divert
 	}
 
 	/// `dram_resident` is the part of `size` that never migrates; the policy
@@ -3622,14 +3366,6 @@ where
 	/// one an earlier `Set` of the key linked on its behalf) is treated as
 	/// new: one declined corrective at most.
 	///
-	/// Under tagged moves (`MIG_TAGGED`, `move_ledger`) `mark` is `LEDGERED`,
-	/// and the `Set` is counted in the key's ledger record first
-	/// (`MoveLedger::seen`). The new-key rule is then exact: the `Set` fences
-	/// if it closes its key's pending window -- no newer publication of the
-	/// key unhandled -- and a move of the key was handed off inside that
-	/// window, whatever `fresh` and the stack's placement say. No bucket, no
-	/// mark, no `placement_of` probe.
-	///
 	/// The LFU latch this handling may have moved is published at once
 	/// (`publish_admission_latch`).
 	///
@@ -3648,20 +3384,6 @@ where
 		mark: u32,
 		placement: Placement,
 	) {
-		// Tagged moves (`move_ledger`, protocol step 2): a `LEDGERED` `Set` is
-		// counted handled first, whatever this event then finds, and learns
-		// whether it closes its key's pending window with a fence. Only a
-		// tiered cache's client sends one (`publish_set`; a flat cache's
-		// `Set` carries 0), so a flat cache never builds the ledger.
-		#[cfg(feature = "hybrid_cache_common")]
-		let tagged = mark == move_ledger::LEDGERED && self.status.move_ledger().mode().tagged;
-
-		#[cfg(feature = "hybrid_cache_common")]
-		let seen = match tagged {
-			true => self.status.move_ledger().seen(key),
-			false => move_ledger::Seen::default(),
-		};
-
 		// The value this `Set` published is gone: an eviction pass (or a
 		// MakeRoom) took it between the client's map insert and this event, or a
 		// delete or reap on another thread did. The client inserts before it
@@ -3684,22 +3406,11 @@ where
 
 		let fresh = previous.is_none();
 
-		// The new-key rule. Under tagged moves, exact: this `Set` closes its
-		// key's pending window and a move of the key was handed off inside it
-		// (`move_ledger`, "Correctness"); the client read no mark. Otherwise
-		// the bucket-wide rule (`Observed`).
 		#[cfg(feature = "hybrid_cache_common")]
 		let fence = self.tier_migration
-			&& match tagged {
-				true => seen.fence,
-				false => self.status.migration_in_flight().moved_since(key, mark)
-					&& (fresh || self.policy_stack.placement_of(key).is_none()),
-			};
-
-		#[cfg(feature = "hybrid_cache_common")]
-		if tagged && fence {
-			self.status.migstats().pending_fences.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-		}
+			&& self.status.migration_in_flight().moved_since(key, mark)
+			&& (fresh
+				|| self.policy_stack.placement_of(key).is_none());
 
 		let event = match previous {
 			None => SetEvent::Fresh,
@@ -3986,16 +3697,6 @@ where
 				continue;
 			}
 
-			// A sampled hit with the heal off (tagged moves): counted when it
-			// would have healed, never queued; a busy bucket says nothing.
-			if let Observed::Probe { quiet, .. } = observed {
-				if quiet && corrective(&migrations, observed, stack.placement_of(observed.key())).is_some() {
-					self.status.migstats().heal_off_lagging.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-				}
-
-				continue;
-			}
-
 			let placement = stack.placement_of(observed.key());
 
 			if let Some((key, tier, reason)) = corrective(&migrations, observed, placement) {
@@ -4144,17 +3845,7 @@ where
 
 			let (key, tier, origin) = entry.tagged();
 
-			// The inline path is a hand-off and an apply in one, for the move
-			// ledger: stamped, checked after the snapshot, finished.
-			let ledger = status.move_ledger();
-			let tag = ledger.hand_off(key, tier, stats);
-
-			let guard = ledger.mode().checks().then_some((&**ledger, tag));
-			let landed = migration_queue::apply_migration_guarded(objects, key, tier, stats, Some(status.gate()), guard);
-
-			ledger.finish(key, tier, landed, Some(stats));
-
-			if !landed {
+			if !migration_queue::apply_migration_with(objects, key, tier, stats, Some(status.gate())) {
 				return false;
 			}
 
@@ -5268,41 +4959,25 @@ mod migration_queue_tests {
 		// guarantee.
 		let before = dispositions(&status);
 
-		// Under MIG_LATEST the demotion is skipped
-		// when the promotion is already queued as it is checked -- then the
-		// promotion declines and nothing is copied -- or it was taken before
-		// the promotion's push and both copy, as without the knob.
-		let latest = status.move_ledger().mode().latest;
-		let skipped = |status: &StatusRef| status.migstats().latest_skipped.load(Ordering::Relaxed);
-		let skipped_before = skipped(&status);
-
 		queue.push((key, Tier::Slow));
 		queue.push((key, Tier::Fast));
 		queue.flush();
 
 		assert_eq!(tier_of(&objects, key), Tier::Fast);
+		assert_eq!(
+			since(&status, before),
+			Dispositions { applied: 2, gone: 0, declined: 0, superseded: 0 },
+			"both entries moved the value; neither was declined, which is what \
+			 the reverse order would have produced",
+		);
 
-		let both = Dispositions { applied: 2, gone: 0, declined: 0, superseded: 0 };
-
-		if latest && since(&status, before) != both {
-			assert_eq!(since(&status, before), Dispositions { applied: 0, gone: 0, declined: 1, superseded: 0 }, "latest: skipped, then declined");
-			assert_eq!(skipped(&status), skipped_before + 1);
-		} else {
-			assert_eq!(
-				since(&status, before),
-				both,
-				"both entries moved the value; neither was declined, which is what \
-				 the reverse order would have produced",
-			);
-
-			// Two real copies happened, so neither header can be the admitted one.
-			let after_promote = header_of(&objects, key);
-			assert!(
-				!TieredValue::ptr_eq(&after_promote, &admitted),
-				"an applied migration installs a NEW header -- it does not edit the \
-				 one that was there",
-			);
-		}
+		// Two real copies happened, so neither header can be the admitted one.
+		let after_promote = header_of(&objects, key);
+		assert!(
+			!TieredValue::ptr_eq(&after_promote, &admitted),
+			"an applied migration installs a NEW header -- it does not edit the \
+			 one that was there",
+		);
 
 		// A migration is a faithful copy: the tier moved, the payload did not.
 		assert_eq!(bytes_of(&objects, key), vec![0xA1; BUFFER_LEN]);
@@ -5311,28 +4986,17 @@ mod migration_queue_tests {
 		// entry is the declined one.
 		let before = dispositions(&status);
 
-		let skipped_before = skipped(&status);
-
 		queue.push((key, Tier::Fast));
 		queue.push((key, Tier::Slow));
 		queue.flush();
 
 		assert_eq!(tier_of(&objects, key), Tier::Slow);
-
-		// Under MIG_LATEST the promotion may be skipped
-		// instead of declined; the demotion does the work either way.
-		let latest_skip = Dispositions { applied: 1, gone: 0, declined: 0, superseded: 0 };
-
-		if latest && since(&status, before) == latest_skip {
-			assert_eq!(skipped(&status), skipped_before + 1);
-		} else {
-			assert_eq!(
-				since(&status, before),
-				Dispositions { applied: 1, gone: 0, declined: 1, superseded: 0 },
-				"the promote is a no-op against an already-Fast value and the demote \
-				 does the work; the reverse order would have applied both",
-			);
-		}
+		assert_eq!(
+			since(&status, before),
+			Dispositions { applied: 1, gone: 0, declined: 1, superseded: 0 },
+			"the promote is a no-op against an already-Fast value and the demote \
+			 does the work; the reverse order would have applied both",
+		);
 		assert_eq!(bytes_of(&objects, key), vec![0xA1; BUFFER_LEN]);
 	}
 
@@ -7719,9 +7383,7 @@ mod reconcile_tests {
 		let object = Object::new_in(key, &vec![key as u8; len], built, None);
 		let base_size = overhead_manager.base_size(&object);
 		let resident = overhead_manager.dram_resident_size(&object);
-		// As `publish_set`: the mark, or under tagged moves the ledger's
-		// publication (`LEDGERED`).
-		let mark = crate::worker::move_ledger::client_mark(status, key);
+		let mark = status.migration_in_flight().mark(key);
 
 		let previous = match objects.insert(key, object) {
 			Some(old) => {
@@ -7797,23 +7459,6 @@ mod reconcile_tests {
 			.collect()
 	}
 
-	/// Whether this worker's cache runs tagged moves
-	/// (`MIG_TAGGED`, or a test's `force`).
-	pub(super) fn tagged(worker: &Worker) -> bool {
-		worker.status.move_ledger().mode().tagged
-	}
-
-	/// Sets the ledger's mode of a quiescent worker (`MIG_REVCOUNT`'s counting
-	/// on, whatever the process says).
-	pub(super) fn force(worker: &Worker, tagged: bool, latest: bool) {
-		worker.status.move_ledger().set_mode(super::move_ledger::Mode { tagged, latest, count: true });
-	}
-
-	/// One ledger counter of the worker's cache.
-	pub(super) fn ledger_count(worker: &Worker, counter: fn(&migstats::Stats) -> &std::sync::atomic::AtomicU64) -> u64 {
-		counter(worker.status.migstats()).load(std::sync::atomic::Ordering::Relaxed)
-	}
-
 	/// Where `key`'s bytes are: its value's tag.
 	pub(super) fn bytes_tier(objects: &Objects, key: HashedKey) -> Tier {
 		objects.get_ref(&key).expect("a live key").value().tier()
@@ -7823,7 +7468,7 @@ mod reconcile_tests {
 		worker.policy_stack.placement_of(key)
 	}
 
-	pub(super) fn other(tier: Tier) -> Tier {
+	fn other(tier: Tier) -> Tier {
 		match tier {
 			Fast => Slow,
 			Slow => Fast,
@@ -7832,7 +7477,7 @@ mod reconcile_tests {
 
 	/// Moves `key`'s bytes to `tier` behind the stack's back -- what a stale
 	/// or a lost migration leaves.
-	pub(super) fn move_bytes(objects: &Objects, key: HashedKey, tier: Tier) {
+	fn move_bytes(objects: &Objects, key: HashedKey, tier: Tier) {
 		let mut object = objects.get_mut_ref(&key).expect("a live key");
 		let moved = object.value().migrated_to(tier);
 
@@ -7882,14 +7527,14 @@ mod reconcile_tests {
 
 	/// The `n`th key after `key` on the same migration consumer (the queue
 	/// shards by key modulo its consumer count), in another in-flight bucket.
-	pub(super) fn same_consumer(key: HashedKey, n: HashedKey) -> HashedKey {
+	fn same_consumer(key: HashedKey, n: HashedKey) -> HashedKey {
 		key + n * migration_queue::threads() as HashedKey
 	}
 
 	/// Parks the consumer that owns the live key `j`: a raw migration of `j`
 	/// to its other tier, stopped by `after_copy` after its copy. Everything
 	/// queued for that consumer behind it waits. `unpark` releases it.
-	pub(super) fn park(worker: &Worker, objects: &Objects, j: HashedKey) -> crossbeam_channel::Sender<()> {
+	fn park(worker: &Worker, objects: &Objects, j: HashedKey) -> crossbeam_channel::Sender<()> {
 		let (entered, release) = after_copy::arm(j);
 
 		worker.migration_queue.as_ref().expect("a queue").push((j, other(bytes_tier(objects, j))));
@@ -7903,7 +7548,7 @@ mod reconcile_tests {
 
 	/// Releases `park`'s consumer, moves `j` back to `j_tier` and waits for
 	/// every consumer to finish.
-	pub(super) fn unpark(worker: &Worker, j: HashedKey, j_tier: Tier, release: crossbeam_channel::Sender<()>) {
+	fn unpark(worker: &Worker, j: HashedKey, j_tier: Tier, release: crossbeam_channel::Sender<()>) {
 		let queue = worker.migration_queue.as_ref().expect("a queue");
 
 		release.send(()).unwrap();
@@ -7944,10 +7589,6 @@ mod reconcile_tests {
 
 		let audit = worker.placement_audit();
 		assert!(audit.is_clean(), "{audit:?}");
-
-		// And the move ledger holds nothing: no move in flight, no `Set`
-		// unhandled (a record left here is a leak).
-		assert_eq!(worker.status.move_ledger().live(), 0, "the move ledger is empty at quiescence");
 	}
 
 
@@ -8230,31 +7871,6 @@ mod reconcile_tests {
 		assert!(worker.observed.is_empty(), "a fast-served hit and a miss observe nothing");
 		assert_eq!(of(&drain_and_apply(&mut worker), K), vec![]);
 
-		// Under tagged moves a value moved behind the stack's back -- a state
-		// only a stale move produced -- is not healed in this configuration
-		// (no Divert, promotion gate off): the hit is counted `heal_off` and
-		// queues nothing. It is this cache's first such hit, so it is the one
-		// in `HEAL_PROBE_EVERY` still looked at: it is counted lagging.
-		if tagged(&worker) {
-			let off = ledger_count(&worker, |stats| &stats.heal_off);
-			assert_eq!(off % move_ledger::HEAL_PROBE_EVERY, 0, "the probed hit");
-
-			worker.handle_get(K, Some(bytes_tier(&objects, K)));
-			assert_eq!(worker.observed, vec![Observed::Probe { key: K, quiet: true }], "tagged: probed, not healed");
-			assert_eq!(of(&drain_and_apply(&mut worker), K), vec![], "tagged: nothing queued");
-			assert_eq!(ledger_count(&worker, |stats| &stats.heal_off), off + 1);
-			assert_eq!(ledger_count(&worker, |stats| &stats.heal_off_lagging), 1, "the probe saw the lag");
-
-			// The next hit is not probed.
-			worker.handle_get(K, Some(Slow));
-			assert!(worker.observed.is_empty(), "tagged: one hit in HEAL_PROBE_EVERY");
-			assert_eq!(of(&drain_and_apply(&mut worker), K), vec![]);
-
-			move_bytes(&objects, K, Fast);
-			assert_settled(&mut worker);
-			return;
-		}
-
 		worker.handle_get(K, Some(bytes_tier(&objects, K)));
 
 		let drain = drain_and_apply(&mut worker);
@@ -8331,27 +7947,6 @@ mod reconcile_tests {
 		let published = publish(&status, &overhead_manager, &objects, K, LEN, built);
 		assert!(published.fresh());
 
-		// Tagged, the hit heals nothing in this configuration; v2 is admitted
-		// where it was built and nothing moves it, and its `Set` closes a
-		// window with no hand-off in it: no fence. (With heals kept, the heal
-		// is handed off inside v2's window and the `Set` fences it back:
-		// `tagged_race_i_*`.)
-		if tagged(&worker) {
-			worker.handle_get(K, Some(served));
-			assert_eq!(correctives(&drain_and_apply(&mut worker), K), vec![], "tagged: no heal");
-
-			worker.handle_del(K);
-			drain_and_apply(&mut worker);
-			handle(&mut worker, K, published);
-			assert_eq!(placement(&worker, K), Some(Slow));
-
-			let drain = drain_and_apply(&mut worker);
-			assert_eq!(correctives(&drain, K), vec![], "tagged: nothing to fence");
-			assert_eq!(bytes_tier(&objects, K), Slow, "the fresh value is where the stack placed it");
-			assert_settled(&mut worker);
-			return;
-		}
-
 		// The worker: the hit, healed onto the fresh value.
 		worker.handle_get(K, Some(served));
 		assert_eq!(correctives(&drain_and_apply(&mut worker), K), vec![Fast], "the heal");
@@ -8379,35 +7974,14 @@ mod reconcile_tests {
 	/// then does the worker take v2's `Set`: nothing in flight, but the bucket
 	/// landed since the mark, so the new-key rule queues `(K, Slow)` last. Red
 	/// with the rule off (`nofence`) and with the in-flight count alone
-	/// (`pendingonly`). Untagged, whatever `MIG_TAGGED` says.
+	/// (`pendingonly`).
 	#[test]
 	fn m1_ii_a_corrective_landing_on_an_evicted_and_reset_lfu_key_is_undone_at_its_set() {
-		m1_ii_body("m1_ii_a_corrective_landing_on_an_evicted_and_reset_lfu_key_is_undone_at_its_set", false);
-	}
-
-	/// Race (ii) under tagged moves, whatever `MIG_TAGGED` says: the stale
-	/// corrective `(K, Fast)` was handed off before v2's publication and
-	/// carries v1's epoch; v2's publication bumped the key's count, so the
-	/// consumer SKIPS it (`stale_skipped`), v2 stays slow where it was built
-	/// and placed, and its `Set` closes a window with no hand-off in it: no
-	/// fence.
-	#[test]
-	fn tagged_race_ii_a_stale_lfu_corrective_is_skipped_on_the_reset_value() {
-		m1_ii_body("tagged_race_ii_a_stale_lfu_corrective_is_skipped_on_the_reset_value", true);
-	}
-
-	fn m1_ii_body(test: &str, force_tagged: bool) {
 		let _serialised = migration_test_lock::lock();
 
 		let (mut worker, objects) = make_worker(PaperPolicy::LfuCompactHybrid);
 
-		// Each variant runs its own mode, whatever `MIG_TAGGED` says.
-		match force_tagged {
-			true => force(&worker, true, false),
-			false => worker.status.move_ledger().set_mode(super::move_ledger::Mode::default()),
-		}
-
-		if !queue_or_skip(&worker, test) {
+		if !queue_or_skip(&worker, "m1_ii_a_corrective_landing_on_an_evicted_and_reset_lfu_key_is_undone_at_its_set") {
 			return;
 		}
 
@@ -8447,17 +8021,8 @@ mod reconcile_tests {
 		let published = publish(&worker.status, &worker.overhead_manager, &objects, K, LEN, Slow);
 		assert!(published.fresh());
 
-		let skipped = ledger_count(&worker, |stats| &stats.stale_skipped);
-
 		unpark(&worker, j, j_tier, release);
-
-		match tagged(&worker) {
-			true => {
-				assert_eq!(bytes_tier(&objects, K), Slow, "tagged: the stale corrective was skipped");
-				assert_eq!(ledger_count(&worker, |stats| &stats.stale_skipped), skipped + 1, "counted stale_skipped");
-			},
-			false => assert_eq!(bytes_tier(&objects, K), Fast, "the stale corrective promoted the FRESH value"),
-		}
+		assert_eq!(bytes_tier(&objects, K), Fast, "the stale corrective promoted the FRESH value");
 
 		handle(&mut worker, K, published);
 		assert_eq!(placement(&worker, K), Some(Slow), "admitted slow, latched, with no push");
@@ -8468,13 +8033,7 @@ mod reconcile_tests {
 		worker.migration_queue.as_ref().expect("a queue").flush();
 		assert_eq!(bytes_tier(&objects, K), Slow, "the fresh value is where the stack placed it");
 		assert_settled(&mut worker);
-
-		match tagged(&worker) {
-			true => assert_eq!(correctives(&drain, K), vec![], "tagged: no fence, nothing to correct"),
-			false => assert_eq!(correctives(&drain, K), vec![Slow], "the new-key rule's corrective"),
-		}
-
-		assert_eq!(worker.status.move_ledger().live(), 0, "the ledger is empty at quiescence");
+		assert_eq!(correctives(&drain, K), vec![Slow], "the new-key rule's corrective");
 	}
 
 	/// Review M1 (iii), in both stores, the rule's IN-FLIGHT path: a stale
@@ -8486,33 +8045,14 @@ mod reconcile_tests {
 	/// behind the stale promotion. Released, the promotion lands on the fresh
 	/// value and the corrective takes it back. Red with the rule off
 	/// (`nofence`); green with the in-flight count alone (`pendingonly`),
-	/// which is this path. Untagged, whatever `MIG_TAGGED` says.
+	/// which is this path.
 	#[test]
 	fn m1_iii_a_stale_stack_promotion_of_a_deleted_key_does_not_strand_its_slow_readmission() {
-		m1_iii_body("m1_iii_a_stale_stack_promotion_of_a_deleted_key_does_not_strand_its_slow_readmission", false);
-	}
-
-	/// Race (iii) under tagged moves, whatever `MIG_TAGGED` says: the stack's
-	/// stale `(K, Fast)`, handed off before v2's publication, carries v1's
-	/// epoch and is skipped on v2; v2 is admitted slow where it was built, and
-	/// its `Set` closes a window with no hand-off in it: no fence.
-	#[test]
-	fn tagged_race_iii_a_stale_stack_promotion_is_skipped_on_the_reset_value() {
-		m1_iii_body("tagged_race_iii_a_stale_stack_promotion_is_skipped_on_the_reset_value", true);
-	}
-
-	fn m1_iii_body(test: &str, force_tagged: bool) {
 		let _serialised = migration_test_lock::lock();
 
 		let (mut worker, objects) = make_worker(PaperPolicy::LfuCompactHybrid);
 
-		// Each variant runs its own mode, whatever `MIG_TAGGED` says.
-		match force_tagged {
-			true => force(&worker, true, false),
-			false => worker.status.move_ledger().set_mode(super::move_ledger::Mode::default()),
-		}
-
-		if !queue_or_skip(&worker, test) {
+		if !queue_or_skip(&worker, "m1_iii_a_stale_stack_promotion_of_a_deleted_key_does_not_strand_its_slow_readmission") {
 			return;
 		}
 
@@ -8556,23 +8096,12 @@ mod reconcile_tests {
 		assert_eq!(placement(&worker, K), Some(Slow), "admitted slow, with no push");
 		let drain = drain_and_apply(&mut worker);
 
-		let skipped = ledger_count(&worker, |stats| &stats.stale_skipped);
-
 		unpark(&worker, j, j_tier, release);
 
 		worker.test_flush = true;
 		assert_eq!(bytes_tier(&objects, K), Slow, "the fresh value is where the stack placed it");
 		assert_settled(&mut worker);
-
-		match tagged(&worker) {
-			true => {
-				assert_eq!(correctives(&drain, K), vec![], "tagged: no fence");
-				assert!(ledger_count(&worker, |stats| &stats.stale_skipped) > skipped, "the stale promotion was skipped");
-			},
-			false => assert_eq!(correctives(&drain, K), vec![Slow], "the new-key rule's corrective, behind the stale promotion"),
-		}
-
-		assert_eq!(worker.status.move_ledger().live(), 0, "the ledger is empty at quiescence");
+		assert_eq!(correctives(&drain, K), vec![Slow], "the new-key rule's corrective, behind the stale promotion");
 	}
 
 	/// Race (b), in both stores, now fixed at the re-set's `Set` rather than
@@ -8605,12 +8134,6 @@ mod reconcile_tests {
 		let status = worker.status.clone();
 		let overhead_manager = worker.overhead_manager.clone();
 
-		// The ledger's counts before the race (tagged moves).
-		let count = |counter: fn(&migstats::Stats) -> &std::sync::atomic::AtomicU64| {
-			counter(status.migstats()).load(std::sync::atomic::Ordering::Relaxed)
-		};
-		let (skipped_before, handed_before) = (count(|s| &s.stale_skipped), count(|s| &s.pending_handoffs));
-
 		let (entered, release) = after_copy::arm(J);
 
 		// A settle that demotes J and K: the fast tier shrunk (S5: a value
@@ -8635,28 +8158,7 @@ mod reconcile_tests {
 		release.send(()).unwrap();
 		let (mut worker, drain) = admitting.join().unwrap();
 		assert_eq!(of(&drain, k), vec![Slow], "K's demotion was queued behind J's");
-
-		// Tagged: K's demotion was handed off either before the client's
-		// publication -- then it carries the old value's epoch and is skipped
-		// on the fresh value -- or after it, inside the fresh value's pending
-		// window (its `Set` unhandled) -- then it lands on the fresh value, and
-		// the `Set` fences. Which one is the race between the parked consumer
-		// and the push of K's entry.
-		let tagged = tagged(&worker);
-		let skipped = count(|s| &s.stale_skipped) - skipped_before;
-		let handed = count(|s| &s.pending_handoffs) - handed_before;
-
-		match tagged {
-			true => {
-				assert_eq!(skipped + handed, 1, "skipped as stale, or handed off inside the window");
-
-				match skipped {
-					1 => assert_eq!(bytes_tier(&objects, k), Fast, "tagged: the stale demotion did not move the FRESH value"),
-					_ => assert_eq!(bytes_tier(&objects, k), Slow, "tagged: handed off inside the window, it moved the fresh value"),
-				}
-			},
-			false => assert_eq!(bytes_tier(&objects, k), Slow, "the stale demotion moved the FRESH value"),
-		}
+		assert_eq!(bytes_tier(&objects, k), Slow, "the stale demotion moved the FRESH value");
 
 		// The worker takes the del and the set only now.
 		worker.handle_del(k);
@@ -8666,12 +8168,7 @@ mod reconcile_tests {
 		let drain = drain_and_apply(&mut worker);
 		assert_eq!(bytes_tier(&objects, k), Fast, "the fresh value is where the stack placed it");
 		assert_settled(&mut worker);
-
-		match (tagged, skipped) {
-			(true, 1) => assert_eq!(correctives(&drain, k), vec![], "tagged: nothing to fence"),
-			(true, _) => assert_eq!(correctives(&drain, k), vec![Fast], "tagged: the closing Set's fence"),
-			(false, _) => assert_eq!(correctives(&drain, k), vec![Fast], "the new-key rule's corrective"),
-		}
+		assert_eq!(correctives(&drain, k), vec![Fast], "the new-key rule's corrective");
 	}
 
 	/// The new-key rule's NON-FRESH branch, in the split builds (in the merged
@@ -8730,13 +8227,6 @@ mod reconcile_tests {
 		let drain = drain_and_apply(&mut worker);
 		restore_fast(&mut worker);
 		assert_eq!(of(&drain, K), vec![Slow], "the settle demoted K");
-
-		// Tagged moves end the same way, by their own rule: the demotion was
-		// handed off inside v3's pending window (v3's `Set` unhandled), so it
-		// lands on v3, and Set(v3), closing the window, fences -- exactly, for
-		// this key, where the untagged rule fences for its bucket.
-		let handed = ledger_count(&worker, |stats| &stats.pending_handoffs);
-
 		assert_eq!(bytes_tier(&objects, K), Slow, "and the demotion moved v3");
 
 		// The racing `Del`, then Set(v3).
@@ -8758,11 +8248,6 @@ mod reconcile_tests {
 			"fenced: v3 replaced a value, but the stack did not place K before its Set",
 		);
 		assert_eq!(correctives(&drain, K), vec![Fast], "the new-key rule's corrective (built where placed)");
-
-		if tagged(&worker) {
-			assert_eq!(handed, 1, "tagged: the demotion was handed off inside v3's window");
-			assert_eq!(ledger_count(&worker, |stats| &stats.pending_fences), 1, "and Set(v3) closed it with the fence");
-		}
 	}
 
 	/// Review M2, in both stores: slow-served hits while a promotion of their
@@ -8808,40 +8293,6 @@ mod reconcile_tests {
 		// K: one heal, then its own heal in flight.
 		move_bytes(&objects, k, Slow);
 
-		// Tagged, no slow hit is considered for a heal
-		// in this configuration: 41 hits counted `heal_off`, none queued, none
-		// counted skipped. K's bytes, moved behind the stack's back, are put
-		// back by hand before the audit.
-		if tagged(&worker) {
-			let off = ledger_count(&worker, |stats| &stats.heal_off);
-			let mut heals = 0;
-
-			for _ in 0..21 {
-				worker.handle_get(k, Some(Slow));
-				heals += correctives(&drain_and_apply(&mut worker), k).len();
-			}
-
-			worker.handle_get(M, Some(Slow));
-			let drain = drain_and_apply(&mut worker);
-			assert_eq!((of(&drain, M), correctives(&drain, M)), (vec![Fast], vec![]), "the stack promotes M");
-
-			for _ in 0..20 {
-				worker.handle_get(M, Some(Slow));
-				heals += correctives(&drain_and_apply(&mut worker), M).len();
-			}
-
-			assert_eq!(heals, 0, "tagged: no heal");
-			assert_eq!(ledger_count(&worker, |stats| &stats.heal_off), off + 42, "every slow-served hit, K's 21 and M's 21");
-			assert_eq!(worker.status.hybrid_stats().reconcile_get_heal_skipped, skipped_before);
-
-			unpark(&worker, j, j_tier, release);
-			worker.test_flush = true;
-			move_bytes(&objects, k, Fast);
-			assert_settled(&mut worker);
-			assert_eq!((bytes_tier(&objects, k), bytes_tier(&objects, M)), (Fast, Fast));
-			return;
-		}
-
 		let mut heals = 0;
 		for _ in 0..21 {
 			worker.handle_get(k, Some(Slow));
@@ -8881,32 +8332,17 @@ mod reconcile_tests {
 	fn a_landed_corrective_is_counted_apart_from_promotions_and_demotions() {
 		let _serialised = migration_test_lock::lock();
 
-		// To fast: the heal -- or, under tagged moves, where the heal is off
-		// in this configuration, the plain rule's: FIFO admits a new key
-		// built slow fast, with one corrective.
-		let tagged_mode = crate::worker::move_ledger::tagged_env();
-		let (mut worker, objects) = make_worker(match tagged_mode {
-			true => PaperPolicy::FifoCompactHybrid,
-			false => PaperPolicy::LruCompactHybrid,
-		});
+		// To fast: the heal.
+		let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
 
 		const K: HashedKey = 1;
-		let before;
-		let drain;
+		set(&mut worker, &objects, K, LEN, Fast);
+		drain_and_apply(&mut worker);
+		move_bytes(&objects, K, Slow);
 
-		if tagged_mode {
-			before = worker.status.hybrid_stats();
-			set(&mut worker, &objects, K, LEN, Slow);
-			drain = drain_and_apply(&mut worker);
-		} else {
-			set(&mut worker, &objects, K, LEN, Fast);
-			drain_and_apply(&mut worker);
-			move_bytes(&objects, K, Slow);
-
-			before = worker.status.hybrid_stats();
-			worker.handle_get(K, Some(Slow));
-			drain = drain_and_apply(&mut worker);
-		}
+		let before = worker.status.hybrid_stats();
+		worker.handle_get(K, Some(Slow));
+		let drain = drain_and_apply(&mut worker);
 		assert_settled(&mut worker);
 		let after = worker.status.hybrid_stats();
 
@@ -9113,17 +8549,6 @@ mod reconcile_tests {
 		cache.get_into(&L, &mut out).expect("a hit");
 		assert_eq!(out, vec![2u8; LEN]);
 
-		// Tagged, neither slow-served hit is healed
-		// in this configuration; both are counted `heal_off` and stay lagging.
-		if cache.status.move_ledger().mode().tagged {
-			wait("the slow-served hits were never seen", &|| {
-				cache.status.migstats().heal_off.load(std::sync::atomic::Ordering::Relaxed) >= 2
-			});
-			let audit = cache.placement_audit().expect("an audit");
-			assert_eq!((audit.lagging, audit.stranded), (2, 0), "tagged: not healed: {audit:?}");
-			return;
-		}
-
 		wait("the slow-served get was never healed", &|| cache.tier_of(&K) == Some(Fast));
 		wait("the slow-served get_into was never healed", &|| cache.tier_of(&L) == Some(Fast));
 		assert!(cache.placement_audit().expect("an audit").is_clean());
@@ -9204,628 +8629,5 @@ mod reconcile_tests {
 				untracked_bytes: untracked.unwrap_or(0),
 			},
 		);
-	}
-}
-
-/// The move ledger through a real worker and its consumers -- races (i)-(iii)
-/// under tagged moves, and MIG_LATEST. Each test sets the ledger's mode itself,
-/// so it runs the same whatever `MIG_TAGGED` / `MIG_LATEST` the process has.
-/// In both stores, but for race (i)'s two, which need 2Q (the merged store
-/// implements LRU, FIFO, CLOCK and LFU).
-#[cfg(all(test, feature = "hybrid_cache_common"))]
-mod tagged_moves_tests {
-	use super::*;
-	use super::reconcile_tests::*;
-	use super::reconcile_tests::Worker;
-	use Tier::{Fast, Slow};
-
-	/// The heal stays on under tagged moves where bytes can lag for another
-	/// reason: the byte gate's `OnStall::Divert`.
-	#[cfg(not(feature = "merged_object_store"))]
-	fn keep_heals(worker: &Worker) {
-		let gate = worker.status.gate();
-		gate.set_config(crate::gate::GateConfig { on_stall: crate::gate::OnStall::Divert, ..gate.config() });
-		assert!(worker.heals_needed());
-	}
-
-	/// `(applied, declined, latest_skipped, stale_skipped, reversal_copies)`.
-	fn counts(worker: &Worker) -> [u64; 5] {
-		let stats = worker.status.migstats();
-		let l = |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed);
-
-		[l(&stats.mig_applied), l(&stats.mig_declined), l(&stats.latest_skipped), l(&stats.stale_skipped), l(&stats.reversal_copies)]
-	}
-
-	fn delta(after: [u64; 5], before: [u64; 5]) -> [u64; 5] {
-		std::array::from_fn(|i| after[i] - before[i])
-	}
-
-	/// Releases `park`'s consumer, lets it finish everything queued, THEN
-	/// moves `j` back: so `j`'s two moves are never queued together and count
-	/// no reversal.
-	fn release_and_return(worker: &Worker, j: HashedKey, j_tier: Tier, release: crossbeam_channel::Sender<()>) {
-		let queue = worker.migration_queue.as_ref().expect("a queue");
-
-		release.send(()).unwrap();
-		queue.flush();
-		queue.push((j, j_tier));
-		queue.flush();
-	}
-
-	/// Race (i), the window half: under tagged moves with the heal kept
-	/// (Divert), a 2Q key placed fast with its bytes slow is hit; the client
-	/// deletes it and sets v2, built slow, BEFORE the worker takes the hit. The
-	/// worker decides the heal from a stack state older than v2 and hands it
-	/// off inside v2's pending window (v2's `Set` unhandled): stamped with v2's
-	/// publication, counted (`pending_handoffs`), and it promotes v2. v2's
-	/// `Set` closes the window and FENCES: 2Q admits v2 to the slow FIFO, and
-	/// the fence's `(K, Slow)` lands behind the heal -- v2 ends slow, where it
-	/// is placed. Runs inline too.
-	#[cfg(not(feature = "merged_object_store"))]
-	#[test]
-	fn tagged_race_i_a_heal_handed_off_inside_the_reset_window_is_fenced_back() {
-		let _serialised = migration_test_lock::lock();
-
-		let (mut worker, objects) = make_worker(PaperPolicy::TwoQCompactHybrid(0.25));
-		force(&worker, true, false);
-		keep_heals(&worker);
-
-		const K: HashedKey = 1;
-
-		let built = built_by_the_client(&mut worker, &objects, K);
-		assert_eq!(built, Slow, "2Q builds a new key slow");
-		set(&mut worker, &objects, K, LEN, built);
-		drain_and_apply(&mut worker);
-
-		worker.handle_get(K, Some(Slow));
-		drain_and_apply(&mut worker);
-		assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Fast), Fast));
-
-		// Lagging, as a diverted key is.
-		move_bytes(&objects, K, Slow);
-
-		let served = bytes_tier(&objects, K);
-		let status = worker.status.clone();
-		let overhead_manager = worker.overhead_manager.clone();
-
-		publish_del(&status, &overhead_manager, &objects, K);
-		let published = publish(&status, &overhead_manager, &objects, K, LEN, Slow);
-		assert!(published.fresh());
-
-		let handed = ledger_count(&worker, |stats| &stats.pending_handoffs);
-		let fences = ledger_count(&worker, |stats| &stats.pending_fences);
-
-		worker.handle_get(K, Some(served));
-		let drain = drain_and_apply(&mut worker);
-		assert_eq!(correctives(&drain, K), vec![Fast], "the heal was decided (kept under Divert)");
-		assert_eq!(ledger_count(&worker, |stats| &stats.pending_handoffs), handed + 1, "handed off inside v2's window");
-		assert_eq!(bytes_tier(&objects, K), Fast, "and it promoted v2, the newest value");
-
-		worker.handle_del(K);
-		drain_and_apply(&mut worker);
-		handle(&mut worker, K, published);
-		assert_eq!(placement(&worker, K), Some(Slow), "admitted to the slow FIFO, where it was built");
-
-		let drain = drain_and_apply(&mut worker);
-		assert_eq!(correctives(&drain, K), vec![Slow], "the closing Set's fence");
-		assert_eq!(ledger_count(&worker, |stats| &stats.pending_fences), fences + 1);
-		assert_eq!(bytes_tier(&objects, K), Slow, "v2 is where the stack placed it");
-		assert_settled(&mut worker);
-	}
-
-	/// Race (i), the consumer half: the same heal, handed off BEFORE the
-	/// client's delete and re-set and parked behind another key on its
-	/// consumer. It carries v1's epoch; v2's publication bumped the key's
-	/// count; the consumer SKIPS it (`stale_skipped`). v2 ends slow, where it
-	/// was built and placed, with no fence.
-	#[cfg(not(feature = "merged_object_store"))]
-	#[test]
-	fn tagged_race_i_a_heal_queued_before_a_reset_is_skipped_at_its_consumer() {
-		let _serialised = migration_test_lock::lock();
-
-		let (mut worker, objects) = make_worker(PaperPolicy::TwoQCompactHybrid(0.25));
-		force(&worker, true, false);
-		keep_heals(&worker);
-
-		if !queue_or_skip(&worker, "tagged_race_i_a_heal_queued_before_a_reset_is_skipped_at_its_consumer") {
-			return;
-		}
-
-		const K: HashedKey = 1;
-		let j = same_consumer(K, 4);
-
-		for key in [K, j] {
-			let built = built_by_the_client(&mut worker, &objects, key);
-			set(&mut worker, &objects, key, LEN, built);
-			drain_and_apply(&mut worker);
-		}
-
-		worker.handle_get(K, Some(Slow));
-		drain_and_apply(&mut worker);
-		assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Fast), Fast));
-		move_bytes(&objects, K, Slow);
-
-		worker.test_flush = false;
-		let j_tier = bytes_tier(&objects, j);
-		let release = park(&worker, &objects, j);
-
-		worker.handle_get(K, Some(Slow));
-		let drain = drain_and_apply(&mut worker);
-		assert_eq!(correctives(&drain, K), vec![Fast], "the heal, queued behind the parked one");
-
-		let status = worker.status.clone();
-		let overhead_manager = worker.overhead_manager.clone();
-
-		publish_del(&status, &overhead_manager, &objects, K);
-		let published = publish(&status, &overhead_manager, &objects, K, LEN, Slow);
-
-		worker.handle_del(K);
-		drain_and_apply(&mut worker);
-		handle(&mut worker, K, published);
-		assert_eq!(placement(&worker, K), Some(Slow));
-
-		let drain = drain_and_apply(&mut worker);
-		assert_eq!(correctives(&drain, K), vec![], "no fence");
-
-		let skipped = ledger_count(&worker, |stats| &stats.stale_skipped);
-
-		release_and_return(&worker, j, j_tier, release);
-		worker.test_flush = true;
-
-		assert_eq!(bytes_tier(&objects, K), Slow, "the stale heal did not move the FRESH value");
-		assert_eq!(ledger_count(&worker, |stats| &stats.stale_skipped), skipped + 1, "skipped at its consumer");
-		assert_settled(&mut worker);
-		assert_eq!(worker.status.move_ledger().live(), 0);
-	}
-
-	/// MIG_LATEST, demote-then-promote of one value across two drains, queued
-	/// together (behind a parked move). Expected, exactly:
-	///   * MIG_LATEST=1: the demotion is SKIPPED (a newer move of the key is
-	///     queued: `latest_skipped` +1), the promotion finds the value fast and
-	///     DECLINES: zero copies of K, no reversal.
-	///   * MIG_LATEST=0: both copy (2 copies of K), and the demotion's copy is a
-	///     REVERSAL (`reversal_copies` +1: the promotion was already queued).
-	/// The parked key's own two moves are 2 more copies in both.
-	#[test]
-	fn latest_demote_then_promote_across_drains_copies_nothing() {
-		let _serialised = migration_test_lock::lock();
-
-		for latest in [false, true] {
-			let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
-			force(&worker, false, latest);
-
-			if !queue_or_skip(&worker, "latest_demote_then_promote_across_drains_copies_nothing") {
-				return;
-			}
-
-			const K: HashedKey = 1;
-			let j = same_consumer(K, 4);
-
-			set(&mut worker, &objects, K, LEN, Fast);
-			set(&mut worker, &objects, j, LEN, Fast);
-			drain_and_apply(&mut worker);
-			assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Fast), Fast));
-
-			worker.test_flush = false;
-			let j_tier = bytes_tier(&objects, j);
-			let release = park(&worker, &objects, j);
-			let before = counts(&worker);
-
-			worker.apply_migration_batches(vec![(K, Slow)], true);
-			worker.apply_migration_batches(vec![(K, Fast)], true);
-
-			release_and_return(&worker, j, j_tier, release);
-			worker.test_flush = true;
-
-			let [applied, declined, latest_skipped, stale_skipped, reversals] = delta(counts(&worker), before);
-
-			assert_eq!(bytes_tier(&objects, K), Fast, "latest={latest}: the last decision");
-			assert_eq!(stale_skipped, 0);
-
-			match latest {
-				true => assert_eq!((applied - 2, declined, latest_skipped, reversals), (0, 1, 1, 0), "zero copies of K"),
-				false => assert_eq!((applied - 2, declined, latest_skipped, reversals), (2, 0, 0, 1), "two copies, one a reversal"),
-			}
-
-			assert_settled(&mut worker);
-			assert_eq!(worker.status.move_ledger().live(), 0, "latest={latest}");
-		}
-	}
-
-	/// MIG_LATEST, promote-then-demote of one value across two drains, queued
-	/// together. Expected, exactly (copies of K; the value ends slow in every
-	/// case):
-	///   * MIG_LATEST=1, value fast: the promotion is skipped, the demotion
-	///     copies -- ONE copy;
-	///   * MIG_LATEST=1, value slow: the promotion is skipped, the demotion
-	///     declines -- ZERO copies;
-	///   * MIG_LATEST=0, value fast: the promotion declines, the demotion
-	///     copies -- one copy, no reversal;
-	///   * MIG_LATEST=0, value slow: both copy -- two copies, the promotion's a
-	///     reversal.
-	#[test]
-	fn latest_promote_then_demote_moves_once_only_if_the_value_was_fast() {
-		let _serialised = migration_test_lock::lock();
-
-		for (latest, was) in [(true, Fast), (true, Slow), (false, Fast), (false, Slow)] {
-			let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
-			force(&worker, false, latest);
-
-			if !queue_or_skip(&worker, "latest_promote_then_demote_moves_once_only_if_the_value_was_fast") {
-				return;
-			}
-
-			const K: HashedKey = 1;
-			let j = same_consumer(K, 4);
-
-			set(&mut worker, &objects, K, LEN, Fast);
-			set(&mut worker, &objects, j, LEN, Fast);
-			drain_and_apply(&mut worker);
-
-			if was == Slow {
-				move_bytes(&objects, K, Slow);
-			}
-
-			worker.test_flush = false;
-			let j_tier = bytes_tier(&objects, j);
-			let release = park(&worker, &objects, j);
-			let before = counts(&worker);
-
-			worker.apply_migration_batches(vec![(K, Fast)], true);
-			worker.apply_migration_batches(vec![(K, Slow)], true);
-
-			release_and_return(&worker, j, j_tier, release);
-
-			let [applied, _declined, latest_skipped, _stale, reversals] = delta(counts(&worker), before);
-			let case = format!("latest={latest} was={was:?}");
-
-			assert_eq!(bytes_tier(&objects, K), Slow, "{case}: the last decision");
-
-			let expected = match (latest, was) {
-				(true, Fast) => (1, 1, 0),
-				(true, Slow) => (0, 1, 0),
-				(false, Fast) => (1, 0, 0),
-				(false, Slow) => (2, 0, 1),
-			};
-
-			assert_eq!((applied - 2, latest_skipped, reversals), expected, "{case}: (copies of K, latest_skipped, reversals)");
-
-			// K is placed fast: back where the stack has it, for the audit.
-			worker.test_flush = true;
-			worker.apply_migration_batches(vec![(K, Fast)], true);
-			assert_settled(&mut worker);
-			assert_eq!(worker.status.move_ledger().live(), 0, "{case}");
-		}
-	}
-
-	/// A stale promotion interleaved with a client's delete-and-set, and with
-	/// a plain overwrite, in all four modes. K is slow (LRU demoted it); a hit
-	/// promotes it -- `P = (K, Fast)`, queued behind a parked move -- and the
-	/// client then (a) deletes K and sets v2, or (b) overwrites K with v2,
-	/// built SLOW either way; the worker takes it all while P is queued; v2's
-	/// `Set` queues the plain rule's `(K, Fast)` (LRU places it fast). Every
-	/// mode ends with v2 fast, where the stack places it, and the ledger empty.
-	/// Exactly one copy of v2 in every mode -- base: P copies it and the
-	/// corrective declines; MIG_LATEST: P is skipped as superseded
-	/// (`latest_skipped` +1) and the corrective copies; MIG_TAGGED (with or
-	/// without MIG_LATEST): P is skipped as stale (`stale_skipped` +1, the tag
-	/// checked first) and the corrective copies.
-	#[test]
-	fn latest_and_tagged_interleaved_with_a_del_and_a_set_end_at_the_placement() {
-		let _serialised = migration_test_lock::lock();
-
-		for (tagged, latest) in [(false, false), (false, true), (true, false), (true, true)] {
-			for reset in [true, false] {
-				let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
-				force(&worker, tagged, latest);
-
-				if !queue_or_skip(&worker, "latest_and_tagged_interleaved_with_a_del_and_a_set_end_at_the_placement") {
-					return;
-				}
-
-				let case = format!("tagged={tagged} latest={latest} reset={reset}");
-
-				fill(&mut worker, &objects, 1..=24, LEN);
-
-				const K: HashedKey = 1;
-				assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Slow), Slow), "{case}: demoted");
-
-				// Room for K and v2 without a settle (a grow moves nothing in
-				// LRU), so the only moves queued below are K's and j's.
-				worker.handle_resize_fast_tier(FAST * 4);
-				drain_and_apply(&mut worker);
-
-				let j = (2..=24).find(|&key| key % migration_queue::threads() as HashedKey == K % migration_queue::threads() as HashedKey)
-					.expect("a key on K's consumer");
-
-				worker.test_flush = false;
-				let j_tier = bytes_tier(&objects, j);
-				let release = park(&worker, &objects, j);
-
-				worker.handle_get(K, Some(Slow));
-				let drain = drain_and_apply(&mut worker);
-				assert_eq!(of(&drain, K), vec![Fast], "{case}: P, the stack's promotion");
-
-				let status = worker.status.clone();
-				let overhead_manager = worker.overhead_manager.clone();
-
-				if reset {
-					publish_del(&status, &overhead_manager, &objects, K);
-				}
-
-				let published = publish(&status, &overhead_manager, &objects, K, LEN + 10, Slow);
-				assert_eq!(published.fresh(), reset);
-
-				if reset {
-					worker.handle_del(K);
-					drain_and_apply(&mut worker);
-				}
-
-				handle(&mut worker, K, published);
-				assert_eq!(placement(&worker, K), Some(Fast), "{case}: LRU places v2 fast");
-				let drain = drain_and_apply(&mut worker);
-				assert_eq!(of(&drain, K).last(), Some(&Fast), "{case}: v2's corrective, toward fast");
-
-				let before = counts(&worker);
-
-				release_and_return(&worker, j, j_tier, release);
-				worker.test_flush = true;
-
-				let [applied, _declined, latest_skipped, stale_skipped, _reversals] = delta(counts(&worker), before);
-
-				assert_eq!(bytes_tier(&objects, K), Fast, "{case}: v2 is where the stack placed it");
-				assert_eq!(applied - 2, 1, "{case}: one copy of v2 (j's two moves aside)");
-
-				let expected = match (tagged, latest) {
-					(false, false) => (0, 0),
-					(false, true) => (1, 0),
-					(true, _) => (0, 1),
-				};
-
-				assert_eq!((latest_skipped, stale_skipped), expected, "{case}: (latest_skipped, stale_skipped)");
-
-				assert_settled(&mut worker);
-				assert_eq!(worker.status.move_ledger().live(), 0, "{case}");
-			}
-		}
-	}
-
-	/// Two sets of one key whose `Set`s reach the worker in the reverse of
-	/// their publication order, under tagged moves. The first handled (v3's,
-	/// built slow) leaves the window open (v2's `Set` is unhandled) and is
-	/// reconciled with its own built tier: LRU places the overwrite fast, so
-	/// its corrective `(K, Fast)` is handed off inside the window and promotes
-	/// v3. The second handled (v2's, built fast) closes the window: it fences,
-	/// `(K, Fast)` last -- a decline here -- and v3 ends where the stack places
-	/// it.
-	#[test]
-	fn tagged_sets_arriving_out_of_order_are_fenced_at_the_last() {
-		let _serialised = migration_test_lock::lock();
-
-		let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
-		force(&worker, true, false);
-
-		const K: HashedKey = 1;
-		set(&mut worker, &objects, K, LEN, Fast);
-		drain_and_apply(&mut worker);
-
-		let status = worker.status.clone();
-		let overhead_manager = worker.overhead_manager.clone();
-
-		let v2 = publish(&status, &overhead_manager, &objects, K, LEN + 1, Fast);
-		let v3 = publish(&status, &overhead_manager, &objects, K, LEN + 2, Slow);
-
-		let handed = ledger_count(&worker, |stats| &stats.pending_handoffs);
-		let fences = ledger_count(&worker, |stats| &stats.pending_fences);
-
-		handle(&mut worker, K, v3);
-		assert_eq!(worker.observed, vec![Observed::Built { key: K, built: Slow, fence: false }], "the window stays open: no fence yet");
-		let drain = drain_and_apply(&mut worker);
-		assert_eq!(correctives(&drain, K), vec![Fast], "v3's own reconcile");
-		assert_eq!(ledger_count(&worker, |stats| &stats.pending_handoffs), handed + 1, "handed off inside the window");
-		assert_eq!(bytes_tier(&objects, K), Fast, "it promoted v3, the newest value");
-
-		handle(&mut worker, K, v2);
-		assert_eq!(worker.observed, vec![Observed::Built { key: K, built: Fast, fence: true }], "the closing Set fences");
-		let drain = drain_and_apply(&mut worker);
-
-		assert_eq!(placement(&worker, K), Some(Fast));
-		assert_eq!(of(&drain, K), vec![Fast], "the fence, last");
-		assert_eq!(ledger_count(&worker, |stats| &stats.pending_fences), fences + 1);
-		assert_eq!(bytes_tier(&objects, K), Fast);
-		assert_settled(&mut worker);
-	}
-
-	/// MICROBENCHMARK, ignored (release, run alone): what tagged moves cost a
-	/// client's `set`. Interleaved fresh caches, untagged and tagged
-	/// (`MIG_TAGGED` forced per cache, the order alternating), LRU, on 1 and 8
-	/// threads, `PAPER_LEDGER_BENCH_SETS` sets per thread (default 200,000),
-	/// `PAPER_LEDGER_BENCH_REPS` repetitions (default 9):
-	///
-	///   * `uncontended`: new keys of 64 B and a 2 GiB fast tier, so nothing
-	///     migrates -- the ledger's records are only the `Set`s the policy
-	///     worker has not handled yet;
-	///   * `backlog`: 200,000 keys of 256 B (split between the threads), each
-	///     thread overwriting its keys round-robin, and a 32 MiB fast tier that
-	///     holds about a third of them -- so a set's key is mostly slow, LRU
-	///     promotes it and demotes the tail, and the consumers carry a standing
-	///     queue of moves, each holding its key's record.
-	///
-	/// Reported per (case, threads): the median and the minimum over the
-	/// repetitions of the mean ns per `set` (each thread's timed loop over its
-	/// sets), each mode, and per repetition the live records right after the
-	/// loop, the time the worker then took to handle the rest, the queue's
-	/// high-water mark, the demotions, and the ledger's hand-offs inside a
-	/// pending window, fences and skips. Then
-	/// the ledger alone: `publish` + `seen` per key on 1 and 8 threads, against
-	/// the untagged client's one `InFlight::mark` load.
-	#[test]
-	#[ignore]
-	fn bench_tagged_set_cost() {
-		use std::sync::atomic::Ordering::Relaxed;
-		use std::time::Instant;
-		use super::move_ledger::{Mode, MoveLedger};
-
-		let _serialised = migration_test_lock::lock();
-		let _per_object = crate::object::overhead::test_overheads::per_object();
-
-		let env = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
-		let per_thread = env("PAPER_LEDGER_BENCH_SETS", 200_000);
-		let reps = env("PAPER_LEDGER_BENCH_REPS", 9);
-
-		let median = |v: &[f64]| {
-			let mut v = v.to_vec();
-			v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-			v[v.len() / 2]
-		};
-		let min = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
-
-		// (case, fast tier, value bytes, keys in all: 0 = a new key per set)
-		for (case, fast, len, keys) in [("uncontended", 2u64 << 30, 64usize, 0u64), ("backlog", 32 << 20, 256, 200_000)] {
-			let value = vec![7u8; len];
-
-			for threads in [1u64, 8] {
-				let mut runs: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
-				let mut notes: [Vec<String>; 2] = [Vec::new(), Vec::new()];
-				let range = if keys == 0 { per_thread } else { keys / threads };
-				let distinct = if keys == 0 { threads * per_thread } else { range * threads };
-
-				for rep in 0..reps {
-					let order = if rep % 2 == 0 { [false, true] } else { [true, false] };
-
-					for tagged in order {
-						let cache = crate::PaperCache::<u64, crate::TieredBuffer>::new(
-							8 << 30,
-							crate::CacheTierSize::Bytes(fast as CacheSize),
-							PaperPolicy::LruCompactHybrid,
-						)
-						.expect("an LRU hybrid cache");
-
-						cache.status.move_ledger().set_mode(Mode { tagged, latest: false, count: false });
-
-						let barrier = std::sync::Barrier::new(threads as usize);
-
-						let per_set: Vec<f64> = std::thread::scope(|scope| {
-							let handles: Vec<_> = (0..threads)
-								.map(|t| {
-									let (cache, barrier, value) = (&cache, &barrier, &value);
-
-									scope.spawn(move || {
-										barrier.wait();
-										let t0 = Instant::now();
-
-										for k in 0..per_thread {
-											cache.set(t * range + k % range, value, None).expect("set");
-										}
-
-										t0.elapsed().as_nanos() as f64 / per_thread as f64
-									})
-								})
-								.collect();
-
-							handles.into_iter().map(|h| h.join().unwrap()).collect()
-						});
-
-						let live = cache.status.move_ledger().sample();
-						let t0 = Instant::now();
-
-						while { let h = cache.hybrid_stats(); h.fast_objects + h.slow_objects } < distinct
-							|| cache.status.migration_in_flight().total_pending() != 0
-						{
-							assert!(t0.elapsed() < Duration::from_secs(600), "the worker never caught up");
-							std::thread::sleep(Duration::from_millis(1));
-						}
-
-						let caught_up = t0.elapsed().as_millis();
-						let stats = cache.status.migstats();
-						let mean = per_set.iter().sum::<f64>() / per_set.len() as f64;
-
-						runs[tagged as usize].push(mean);
-						notes[tagged as usize].push(format!(
-							"{mean:.0}ns(live={live} catchup={caught_up}ms qmax={} demo={} in_window={} fences={} skipped={})",
-							stats.queue_depth_max.load(Relaxed),
-							cache.hybrid_stats().demotions,
-							stats.pending_handoffs.load(Relaxed),
-							stats.pending_fences.load(Relaxed),
-							stats.stale_skipped.load(Relaxed),
-						));
-					}
-				}
-
-				let (off, on) = (median(&runs[0]), median(&runs[1]));
-				let (off_min, on_min) = (min(&runs[0]), min(&runs[1]));
-
-				println!(
-					"LEDGERBENCH set case={case} threads={threads} sets_per_thread={per_thread} keys={distinct} value={len} reps={reps} \
-					 median: untagged_ns={off:.1} tagged_ns={on:.1} delta_ns={:.1} ({:+.1}%) min: untagged_ns={off_min:.1} tagged_ns={on_min:.1} delta_ns={:.1}",
-					on - off,
-					100.0 * (on - off) / off,
-					on_min - off_min,
-				);
-				println!("LEDGERBENCH   untagged: {}", notes[0].join(" "));
-				println!("LEDGERBENCH   tagged:   {}", notes[1].join(" "));
-			}
-		}
-
-		// The ledger alone: a client's publication and the worker's `Set`,
-		// back to back on each thread, keys spread over the shards.
-		let mix = |x: u64| {
-			let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-			z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-			z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-			z ^ (z >> 31)
-		};
-		let n = per_thread * 10;
-
-		for threads in [1u64, 8] {
-			let mut pair = Vec::new();
-			let mut mark = Vec::new();
-
-			for _ in 0..reps {
-				let ledger = MoveLedger::new(Mode { tagged: true, latest: false, count: false });
-				let in_flight = super::migration_queue::InFlight::new();
-
-				let time = |f: &(dyn Fn(u64) + Sync)| -> f64 {
-					let per: Vec<f64> = std::thread::scope(|scope| {
-						let handles: Vec<_> = (0..threads)
-							.map(|t| {
-								scope.spawn(move || {
-									let t0 = Instant::now();
-
-									for k in 0..n {
-										f(mix(t * n + k));
-									}
-
-									t0.elapsed().as_nanos() as f64 / n as f64
-								})
-							})
-							.collect();
-
-						handles.into_iter().map(|h| h.join().unwrap()).collect()
-					});
-
-					per.iter().sum::<f64>() / per.len() as f64
-				};
-
-				pair.push(time(&|key| {
-					std::hint::black_box(ledger.publish(key));
-					std::hint::black_box(ledger.seen(key));
-				}));
-				mark.push(time(&|key| {
-					std::hint::black_box(in_flight.mark(key));
-				}));
-
-				assert_eq!(ledger.live(), 0);
-			}
-
-			println!(
-				"LEDGERBENCH ledger threads={threads} ops_per_thread={n} reps={reps} publish_plus_seen_ns={:.1} inflight_mark_ns={:.1} \
-				 (runs: {:?} / {:?})",
-				median(&pair),
-				median(&mark),
-				pair.iter().map(|v| format!("{v:.1}")).collect::<Vec<_>>(),
-				mark.iter().map(|v| format!("{v:.1}")).collect::<Vec<_>>(),
-			);
-		}
 	}
 }

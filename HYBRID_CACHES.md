@@ -104,7 +104,7 @@ consumers the hand-off fell from 1.76 to 1.64 µs per call (-7%) and the rest mo
 The price is CPU: a consumer fed more often than once a window never parks (the 8 consumers used
 366 CPU-seconds against 233 without the spin). `MIG_SPIN_US=0` parks at once, as before; the
 window is capped at 10,000 µs (`MAX_SPIN_US`; a larger value is clamped, with a note on stderr).
-The `MIGSTATS mq_*` line, after the reconcile line (only the move ledger's `tagged=` line follows it), sums the consumers' spin hits,
+The `MIGSTATS mq_*` line, last in the dump, sums the consumers' spin hits,
 blocking `recv`s and the time spent in each.
 
 The queue keeps **one channel per consumer, indexed by key hash**. A single shared channel with
@@ -113,36 +113,6 @@ following promote could be picked up concurrently, and whichever won the shard l
 be the one whose `Arc::ptr_eq` check fails and gets discarded. Each swap is individually
 correct — the value is never corrupted — but the survivor could be the *older* decision,
 stranding the object in the wrong tier. Sharding by key hash makes per-key order structural.
-
-**Tagged moves** (`MIG_TAGGED`, on by default; `worker/policy/move_ledger.rs`). Per-key order
-says nothing about WHICH value an entry moves: an entry decided for one value of a key used to act
-on whatever value held the key when it was dequeued, so a key deleted (or evicted) and set again
-could have its fresh value moved by a stale entry -- what the reconcile's new-key fence and the heal
-existed to repair (`Observed`'s doc in `worker/policy/mod.rs`). A per-cache move ledger now counts,
-per key, the values PUBLISHED (the client, before its map insert) and the `Set`s the policy worker
-has HANDLED; a record exists only while the key has a move in flight or a `Set` unhandled, so it
-costs zero bytes per object. Every move is stamped at its hand-off with its key's newest
-publication, and its consumer skips it, after its snapshot and before the copy, if the key has been
-published since (`stale_skipped`). A move handed off while a `Set` of its key is still unhandled --
-inside the key's pending window -- is queued all the same (it names the placement, and the fast
-tier's budget needs its demotions) and counted (`pending_handoffs`); the `Set` that closes the
-window then FENCES, queuing the key's placement last (`pending_fences`). That is the new-key rule
-made exact: per key, from the ledger's counts, with no client mark, where the old rule fenced for
-any move of the key's 1/16,384th bucket. The heal is kept only where bytes can lag a fast placement
-for another reason (`PAPER_GATE_ON_STALL=divert`, `PAPER_GATE_PROMOTIONS=on`); elsewhere one
-slow-served hit in 64 is still looked up and counted in `heal_off_lagging` if it would have healed.
-The same holds in the merged store, whose client publishes through the same `publish_set` and whose
-moves go through the same queue. `MIG_TAGGED=0` restores the bucket-wide fence, the mark and the
-heal exactly. `MIG_LATEST=1` additionally skips a queued move that a newer queued move of the same
-key supersedes. In the prototype's runs (one binary, single runs on a loaded box, cluster53 and
-cluster26, tiered LRU, 8 clients, b1d0ee1 + the ledger, run dirs `tag_*`), no move was ever handed
-off inside a pending window nor skipped as stale (the prototype dropped such hand-offs; it counted
-zero): what tagged moves removed was the corrective machinery's own no-ops -- 7.6M to 14.5M declined
-correctives per cluster53 run and 8.2M on cluster26, to zero. (The prototype DROPPED a hand-off
-inside a window instead of fencing; a unit benchmark that keeps every key's window open -- 8
-clients overwriting 200,000 keys faster than the worker handles their `Set`s -- showed what that
-costs: settle demotions fell from ~1.5M to as few as 17 per run, the fast tier left over budget.
-This branch never drops a move.)
 
 ### Ordering: demotions before promotions, at enqueue time
 
