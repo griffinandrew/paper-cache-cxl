@@ -50,6 +50,14 @@ pub(crate) use crate::numa_alloc::SlowObjects as Hybrid;
 mod error;
 mod worker;
 
+/// The read path's prefetch of a hit's first cache lines
+/// (`THIN_PREFETCH_LINES`, `THIN_PREFETCH_FAST`). See the module doc.
+mod read_path;
+
+/// Microbenchmarks of the get and set paths, `#[ignore]`d. See the module doc.
+#[cfg(all(test, feature = "hybrid_cache_common", feature = "key_value_pmem"))]
+mod value_bench;
+
 /// The v5 value representation: an entire cached value in one eight-byte
 /// tagged pointer, with no refcount and no per-value allocation header. The
 /// ONLY module in this crate holding unsafe value code -- see `value`.
@@ -599,11 +607,21 @@ where
 		matches: impl Fn(&Object<K, V>) -> bool,
 	) -> Result<Vec<u8>, CacheError> {
 		// Take the value handle under the shard guard, release the guard, and
-		// only then copy.
+		// only then copy. The prefetch (`crate::read_path`) is issued from the
+		// DRAM header before the checks read the first line it fetches.
+		let knobs = crate::read_path::knobs();
+
 		let snapshot = match self.objects.get_ref(&hashed_key) {
-			Some(object) if matches(&*object) && !object.is_expired() =>
-				Some(object.snapshot()),
-			_ => None,
+			Some(object) => {
+				object.value().prefetch(knobs);
+
+				match matches(&*object) && !object.is_expired() {
+					true => Some(object.snapshot()),
+					false => None,
+				}
+			},
+
+			None => None,
 		};
 
 		// The tier the hit is served from -- the snapshot's tag -- or `None`
@@ -652,10 +670,19 @@ where
 		matches: impl Fn(&Object<K, V>) -> bool,
 		out: &mut Vec<u8>,
 	) -> Result<(), CacheError> {
+		let knobs = crate::read_path::knobs();
+
 		let snapshot = match self.objects.get_ref(&hashed_key) {
-			Some(object) if matches(&*object) && !object.is_expired() =>
-				Some(object.snapshot()),
-			_ => None,
+			Some(object) => {
+				object.value().prefetch(knobs);
+
+				match matches(&*object) && !object.is_expired() {
+					true => Some(object.snapshot()),
+					false => None,
+				}
+			},
+
+			None => None,
 		};
 
 		// The tier the hit is served from -- the snapshot's tag -- or `None`

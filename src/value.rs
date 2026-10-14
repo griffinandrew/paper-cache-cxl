@@ -687,6 +687,22 @@ impl<K> TieredValue<K> {
 		self.inner.len
 	}
 
+	/// Prefetches the first cache lines of the value's BYTES, for a slow-tier
+	/// value or, with `knobs.fast_too()`, any (see `crate::read_path`). The
+	/// length is in this DRAM header, so the count never exceeds the lines
+	/// the bytes span. Off by default in this layout.
+	#[inline]
+	pub(crate) fn prefetch(&self, knobs: crate::read_path::ReadKnobs) {
+		if knobs.lines() == 0 || (!knobs.fast_too() && !self.is_slow()) {
+			return;
+		}
+
+		let addr = self.inner.bytes.raw().addr();
+		let spans = ((addr & 63) + (self.inner.len as usize).max(1)).div_ceil(64) as u32;
+
+		crate::read_path::prefetch_lines(addr, knobs.lines_for(spans).min(spans));
+	}
+
 	/// What P charges for this value's bytes in the FAST tier: the figure a
 	/// promotion's copy will charge (`migrated_to` builds it through the same
 	/// allocation), asked before it is built. Equal to `phys::value_charge_for`

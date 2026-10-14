@@ -84,6 +84,15 @@
 //! collision) now pays one remote line it did not pay before. So does the
 //! last free, which reads `len` to rebuild the deallocation layout.
 //!
+//! ## The word's high bits
+//!
+//! An x86-64 user address stays below bit 47, so the top of the word is free.
+//! Bits 58-63 carry how many cache lines the item spans (`LINES_SHIFT`), for
+//! the read path's prefetch (`crate::read_path`): a hit on a slow item issues
+//! the item's lines from the DRAM word, before the key check reads the first
+//! of them, and the copy that follows finds them in flight. `item_addr` strips
+//! them with the tag bits.
+//!
 //! ## The key
 //!
 //! The key is in the item either way, in one of two shapes:
@@ -158,8 +167,20 @@ const SLOW_BIT: usize = 0b1;
 /// module documentation, "The key". Bit 2 stays reserved.
 const KEY_BYTES_BIT: usize = 0b10;
 
-/// Every flag the word may carry -- what `ValueHeader::item` strips.
+/// Every flag the word may carry in its low bits.
 const TAG_BITS: usize = SLOW_BIT | KEY_BYTES_BIT;
+
+/// Bits 58-63 of the word: how many 64-byte lines the item spans from the
+/// line its address is in, saturating at 63 -- what the read path's `auto`
+/// prefetch fetches (`crate::read_path`), known from DRAM without reading the
+/// item's length. Zero when the address itself reaches bit 58 (no x86-64
+/// user address does), which only turns the prefetch off.
+const LINES_SHIFT: usize = 58;
+const LINES_BITS: usize = 0x3f << LINES_SHIFT;
+
+/// Every bit of the word that is not the item's address -- what
+/// `ValueHeader::item_addr` strips.
+const NON_ADDRESS_BITS: usize = TAG_BITS | LINES_BITS;
 
 /// Alignment demanded of every item allocation, which is what keeps the low
 /// three bits of the address available for tagging -- and what the bytes keep
@@ -342,10 +363,16 @@ impl<K> ValueHeader<K> {
 		self.word.as_ptr().addr() & KEY_BYTES_BIT != 0
 	}
 
-	/// The item's address, with the tag bits stripped.
+	/// The lines the item spans, from the word (see `LINES_SHIFT`).
+	#[inline]
+	fn item_lines(&self) -> u32 {
+		(self.word.as_ptr().addr() >> LINES_SHIFT) as u32
+	}
+
+	/// The item's address, with the tag and line bits stripped.
 	#[inline]
 	fn item_addr(&self) -> *mut u8 {
-		let untagged = self.word.as_ptr().map_addr(|addr| addr & !TAG_BITS);
+		let untagged = self.word.as_ptr().map_addr(|addr| addr & !NON_ADDRESS_BITS);
 
 		debug_assert_eq!(
 			untagged.addr() % VALUE_ALIGN,
@@ -562,7 +589,8 @@ impl<K> TieredValue<K> {
 		);
 
 		let len = bytes.len() as u32;
-		let ptr = alloc_item(key_bytes_item_layout(key.len(), len), tier);
+		let layout = key_bytes_item_layout(key.len(), len);
+		let ptr = alloc_item(layout, tier);
 
 		// SAFETY: `ptr` names `layout.size()` writable bytes, 8-aligned, which
 		// is at least `key_bytes_value_offset(key.len()) + len`: the header,
@@ -591,7 +619,7 @@ impl<K> TieredValue<K> {
 
 		let value = TieredValue {
 			inner: Arc::new(ValueHeader {
-				word: tag_key_bytes(tag(ptr, tier)),
+				word: tag_lines(tag_key_bytes(tag(ptr, tier)), layout.size()),
 				_item: PhantomData,
 			}),
 		};
@@ -629,7 +657,8 @@ impl<K> TieredValue<K> {
 		);
 
 		let len = bytes.len() as u32;
-		let ptr = alloc_item(item_layout::<K>(len), tier);
+		let layout = item_layout::<K>(len);
+		let ptr = alloc_item(layout, tier);
 
 		// SAFETY: `ptr` names `layout.size()` writable bytes aligned for
 		// `ItemHeader<K>`, and that size is at least `bytes_offset::<K>() +
@@ -650,7 +679,7 @@ impl<K> TieredValue<K> {
 		}
 
 		let value = TieredValue {
-			inner: Arc::new(ValueHeader { word: tag(ptr, tier), _item: PhantomData }),
+			inner: Arc::new(ValueHeader { word: tag_lines(tag(ptr, tier), layout.size()), _item: PhantomData }),
 		};
 
 		// PHYS_FAST: one charge per fast ITEM -- metadata, key and bytes, the
@@ -1059,6 +1088,25 @@ impl<K> TieredValue<K> {
 		self.prefix().len
 	}
 
+	/// Prefetches the first cache lines of the ITEM -- its header (length,
+	/// expiry, key) and the first bytes -- for a slow-tier item or, with
+	/// `knobs.fast_too()`, any (see `crate::read_path`).
+	///
+	/// Reads only the DRAM word (the tier tag, the address and the line
+	/// count), so it runs the moment the map hit yields the handle, before the
+	/// key check that would otherwise be the first, blocking, remote load.
+	/// Under `auto` the count is the item's own span, from the word; a fixed
+	/// count is not capped by the item's size (its length is in the item), so
+	/// lines past its end are fetched for nothing (a prefetch never faults).
+	#[inline]
+	pub(crate) fn prefetch(&self, knobs: crate::read_path::ReadKnobs) {
+		if knobs.lines() == 0 || (!knobs.fast_too() && self.tier() == Tier::Fast) {
+			return;
+		}
+
+		crate::read_path::prefetch_lines(self.inner.item_addr().addr(), knobs.lines_for(self.inner.item_lines()));
+	}
+
 	/// What P charges for this value's bytes in the FAST tier: the figure a
 	/// promotion's copy will charge (`migrated_to` builds it through the same
 	/// allocation), asked before it is built. Equal to `phys::value_charge_for`
@@ -1128,12 +1176,18 @@ impl<K> TieredValue<K> {
 	}
 
 	/// The raw tagged word naming this value's ITEM -- address with the tier
-	/// in bit 0 and `KEY_BYTES_BIT` in bit 1. Test-only: the tag discipline is
-	/// asserted against it, and nothing in the release path should ever need
-	/// the tagged form.
+	/// in bit 0 and `KEY_BYTES_BIT` in bit 1 -- without the line count in its
+	/// high bits. Test-only: the tag discipline is asserted against it, and
+	/// nothing in the release path should ever need the tagged form.
 	#[cfg(test)]
 	pub(crate) fn tagged_word(&self) -> usize {
-		self.inner.word.as_ptr().addr()
+		self.inner.word.as_ptr().addr() & !LINES_BITS
+	}
+
+	/// The line count the word carries. Test-only.
+	#[cfg(test)]
+	pub(crate) fn word_lines(&self) -> u32 {
+		self.inner.item_lines()
 	}
 
 	/// The item's untagged address. Test-only, for placement assertions.
@@ -1278,7 +1332,7 @@ impl<K> UninitValue<K> {
 				drop(key);
 			}
 
-			tag_key_bytes(tag(this.ptr, this.tier))
+			tag_lines(tag_key_bytes(tag(this.ptr, this.tier)), this.layout.size())
 		} else {
 			let key = key.expect("an item that holds its key as a K is built from one");
 
@@ -1288,7 +1342,7 @@ impl<K> UninitValue<K> {
 				this.ptr.as_ptr().cast::<ItemHeader<K>>().write(ItemHeader { len: this.len, expiry, key });
 			}
 
-			tag(this.ptr, this.tier)
+			tag_lines(tag(this.ptr, this.tier), this.layout.size())
 		};
 
 		TieredValue {
@@ -1370,6 +1424,24 @@ fn tag(ptr: NonNull<u8>, tier: Tier) -> NonNull<u8> {
 			NonNull::new_unchecked(ptr.as_ptr().map_addr(|addr| addr | SLOW_BIT))
 		},
 	}
+}
+
+/// Folds the line count of an item of `size` bytes into bits 58-63 of its
+/// word (see `LINES_SHIFT`): the lines from the one the item starts in to the
+/// one its last byte is in, at most 63. Nothing for an address that reaches
+/// bit 58.
+#[inline]
+fn tag_lines(word: NonNull<u8>, size: usize) -> NonNull<u8> {
+	let addr = word.as_ptr().addr() & !TAG_BITS;
+
+	if addr >> LINES_SHIFT != 0 {
+		return word;
+	}
+
+	let lines = ((addr & 63) + size).div_ceil(64).min(63);
+
+	// SAFETY: setting bits cannot turn a non-null address into a null one.
+	unsafe { NonNull::new_unchecked(word.as_ptr().map_addr(|addr| addr | (lines << LINES_SHIFT))) }
 }
 
 /// Folds `KEY_BYTES_BIT` into an item word: the item holds its key as bytes.
@@ -1976,6 +2048,39 @@ mod tests {
 					0,
 					"len {len} in {tier:?}: bits 1-2 are reserved and must be clear",
 				);
+			}
+		}
+	}
+
+	/// The word's line count (bits 58-63) is the span of the item from the
+	/// line it starts in, for both item shapes and both tiers, saturating at
+	/// 63; the address and the tags it sits beside are untouched (the test
+	/// above), and the item is read whole through the stripped address.
+	#[test]
+	fn the_word_carries_the_lines_the_item_spans() {
+		let _guard = routing_lock();
+
+		for len in [0usize, 1, 47, 48, 49, 100, 1000, 4080, 4096, 1 << 14] {
+			let bytes = vec![0x3Cu8; len];
+
+			for tier in [Tier::Fast, Tier::Slow] {
+				let value = TieredValue::new_in(KEY, &bytes, tier, None);
+				let item = value.item_ptr().addr();
+				let size = item_layout::<u64>(len as u32).size();
+				let want = ((item & 63) + size).div_ceil(64).min(63) as u32;
+
+				assert_eq!(value.word_lines(), want, "len {len} in {tier:?}");
+				assert_eq!(value.bytes(), &bytes[..], "len {len} in {tier:?}");
+
+				let key = format!("key-{len}");
+				let value = TieredValue::<String>::new_in(key.clone(), &bytes, tier, None);
+				let item = value.inner.item_addr().addr();
+				let size = key_bytes_item_layout(key.len(), len as u32).size();
+				let want = ((item & 63) + size).div_ceil(64).min(63) as u32;
+
+				assert_eq!(value.word_lines(), want, "string key, len {len} in {tier:?}");
+				assert_eq!(value.key_owned(), key);
+				assert_eq!(value.bytes(), &bytes[..]);
 			}
 		}
 	}

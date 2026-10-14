@@ -42,6 +42,11 @@ src/
   status.rs                   AtomicStatus — size accounting, hit/miss/set/del counters, the
                                hybrid tier counters and gauges, current policy, max size.
   size.rs                     CacheTierSize (Bytes/Mb/Gb, decimal).
+  read_path.rs                The get path's prefetch of a hit's first cache lines from the
+                               DRAM header (THIN_PREFETCH_LINES, THIN_PREFETCH_FAST; on by
+                               default only under thin_header), read once into one word.
+  value_bench.rs              #[ignore]d microbenchmarks of the get and set paths per layout
+                               (get_bench, set_parts_bench, set_cache_bench; VBENCH_* env).
   tiered_buffer.rs            TieredBuffer — Fast(Box<[u8]>) / Slow(Box<[u8], Hybrid>), the
                                value type every hybrid design stores. Tier is a property of the
                                value; a live object's bytes are in exactly one tier.
@@ -4198,3 +4203,27 @@ Tests: every test that asserts a fence or a heal pins the corrections on (reconc
 left in the wrong tier only until the key's next `Set`; `corrections_off_a_lagging_value_is_probed_*`
 (the 1-in-64 probe), `corrections_off_divert_keeps_the_heal`, and promogate's
 `corrections_off_the_promotion_gate_keeps_the_heal`.
+
+## The read path prefetches a hit's first lines (`THIN_PREFETCH_LINES`; on under `thin_header`)
+
+`get`/`get_into` (and their `_borrowed` twins) call `TieredValue::prefetch` on the map hit's value, under the
+shard guard, BEFORE the key check and `is_expired` (`src/read_path.rs`). It reads only DRAM: under `thin_header`
+the word's tag, address and the item's line count, which the item constructors now store in bits 58-63 of the
+word (`value_thin.rs`, "The word's high bits"; `item_addr` strips them, `tagged_word` hides them from the tag
+tests); under the default layout the header's length and bytes pointer. Then `prefetcht0` per line, so the slow
+item's first remote line (the key, the length, the expiry) and the copy's lines are in flight while the refcount
+bump and the guard release run.
+
+Knobs, read once: `THIN_PREFETCH_LINES` = `auto` | `auto:CAP` | `N` | `0` (CAP, N clamped to 64; the word's
+count saturates at 63) and `THIN_PREFETCH_FAST` = 1 | 0. Defaults: `auto:64` and fast on under `thin_header`;
+`0` (a relaxed load and a branch per get) under the default layout, where the prefetch measured nothing.
+
+Measured (`value_bench`'s `get_bench`, release, one thread on node 0, 1 GiB working set, cxl host, prototype
+`thin-prefetch` 2f5c563): thin slow-hit p50 off/auto:64 = 1540/1172 ns at 128 B, 1619/1227 at 256 B, 1830/1420
+at 1 KiB, 2366/1962 at 4 KiB; fast hits 1026/924 at 128 B, 1202/1091 at 4 KiB; default layout unchanged
+(slow 1163/1159 at 128 B). auto:64 >= auto:16 everywhere and better from 4 KiB. Meta kvcache_202401, tiered
+LRU, 8 clients, thin: GET mean 1244 (off, the noise-control rerun) vs 1236 (auto); the read path's gain is in
+the thin layout's slow hits, which that trace's hit mix dilutes. Not kept: a set prefetching the replaced
+item's first line (SET mean 1560 -> 2223 ns, more gate waits) and the key/expiry checks moved after the copy
+(no clear gain).
+
