@@ -1036,6 +1036,9 @@ fn r3_a_replaced_set_on_an_unlinked_slot_is_fenced_like_a_new_key() {
 
 	let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
 
+	// The new-key rule's fence: corrections on.
+	worker.status.set_corrections(true);
+
 	const K: HashedKey = 1;
 
 	set(&mut worker, &objects, K, LEN, Fast);

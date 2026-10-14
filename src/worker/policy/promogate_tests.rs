@@ -665,3 +665,26 @@ fn t8_the_retry_is_throttled() {
 		assert!(!worker.promo_retry.hot, "an idle retry leaves no flag up");
 	});
 }
+
+/// Corrections off (`MIG_CORRECTIONS`, the default): `PromotionGate::On`
+/// keeps the heal -- its retry drops declined promotions past its cap,
+/// leaving keys placed fast with their bytes slow and nothing queued -- and
+/// the defaults (gate off, `OnStall::Error`) do not.
+#[test]
+fn corrections_off_the_promotion_gate_keeps_the_heal() {
+	alone("corrections_off_the_promotion_gate_keeps_the_heal", || {
+		let objects = objects();
+		let (mut worker, status, _) = tiered_worker(objects.clone(), 1 << 30, PaperPolicy::LruCompactHybrid, true, false);
+
+		status.set_corrections(false);
+
+		worker.refresh_heals_kept();
+		assert!(!worker.heals_kept, "the defaults keep no heal");
+
+		publish(status.gate(), config(PromotionGate::On), true);
+		assert_eq!(status.gate().promotion_gate(), PromotionGate::On);
+
+		worker.refresh_heals_kept();
+		assert!(worker.heals_kept, "the promotion gate keeps the heal");
+	});
+}

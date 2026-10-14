@@ -957,15 +957,36 @@ other_designs! {
 /// `reconcile_applied_to_slow` counts them landing. In every build: the latch
 /// is published with the `Set` that shuts it, and the burst's later keys were
 /// built before the worker reached that `Set`.
+///
+/// Phase D is the new-key rule's case, so this runs with the reconcile's
+/// corrections ON (`MIG_CORRECTIONS=1`, in its child); the default, off, is
+/// `an_lfu_burst_with_corrections_off_strands_values_only_until_their_next_set`.
 #[test]
 fn an_lfu_burst_strands_no_value() {
-    common::alone(module_path!(), "an_lfu_burst_strands_no_value", || {
-        burst(Design::Policy(PaperPolicy::LfuCompactHybrid), FULL);
+    common::alone_with_env(module_path!(), "an_lfu_burst_strands_no_value", &[("MIG_CORRECTIONS", "1")], || {
+        burst(Design::Policy(PaperPolicy::LfuCompactHybrid), FULL, true);
+    });
+}
+
+/// T7 with the corrections at the process's setting -- OFF by default
+/// (`MIG_CORRECTIONS`; `worker::policy::Observed`, "Corrections off"). Phase
+/// D's stale promotions, decided for the old values, land on the fresh ones
+/// a latched stack re-admits slow, and no fence takes them back: those
+/// values may be left STRANDED in DRAM (nothing lagging, nothing untracked).
+/// Phase D2 sets each of D's keys once more, back to back: every new value
+/// is built where the client builds it, the plain rule corrects it against
+/// the placement, and the audit taken at once is clean again -- the strand
+/// lasts only until the key's next `Set`. Then E and the full check, as T7.
+#[test]
+fn an_lfu_burst_with_corrections_off_strands_values_only_until_their_next_set() {
+    common::alone(module_path!(), "an_lfu_burst_with_corrections_off_strands_values_only_until_their_next_set", || {
+        burst(Design::Policy(PaperPolicy::LfuCompactHybrid), FULL, false);
     });
 }
 
 /// T7's body: `run`'s bookkeeping, with each phase's sets made back to back.
-fn burst(design: Design, w: Workload) {
+/// `strict_d`: phase D's audit must be clean (the corrections are on).
+fn burst(design: Design, w: Workload, strict_d: bool) {
     let _one = one_cache_at_a_time();
 
     let label = format!("T7 {}", design.label());
@@ -1008,6 +1029,17 @@ fn burst(design: Design, w: Workload) {
     let audit_now = |cache: &Cache, phase: &str| {
         let a = cache.placement_audit().expect("a tiered cache answers the audit");
         eprintln!("{label} {phase}: audited at once: {a:?}");
+
+        // Corrections off: D may strand, and nothing else may be wrong.
+        if !strict_d && phase.starts_with("D ") {
+            assert_eq!(
+                (a.lagging, a.untracked),
+                (0, 0),
+                "{label} {phase}: with the corrections off a stale promotion can only strand: {a:?}",
+            );
+            return;
+        }
+
         assert!(
             a.is_clean(),
             "{label} {phase}: {} values stranded in DRAM ({} B), {} lagging in CXL ({} B), {} \
@@ -1077,6 +1109,14 @@ fn burst(design: Design, w: Workload) {
         lens.insert(key, len_of(key, 1));
     }
     audit_now(&cache, "D (gets, then deletes and re-sets)");
+
+    // D2. Each of D's keys set once more, back to back: the next `Set` puts
+    //     any value D stranded where the stack places the key (the plain rule).
+    for &key in &chosen {
+        cache.set(key, &value(key, 2), None).expect("set");
+        lens.insert(key, len_of(key, 2));
+    }
+    audit_now(&cache, "D2 (each of D's keys set again)");
 
     // E. Gets over every key, twice, back to back.
     for _ in 0..2 {

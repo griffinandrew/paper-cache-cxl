@@ -188,6 +188,14 @@ pub struct AtomicStatus {
 	#[cfg(feature = "hybrid_cache_common")]
 	migration_in_flight: std::sync::OnceLock<Arc<crate::worker::InFlight>>,
 
+	/// Whether the reconcile's CORRECTIONS -- the new-key rule's fences and
+	/// the heal -- are on for this cache (`MIG_CORRECTIONS`, default off; see
+	/// `worker::policy::Observed`, "Corrections off"). Copied from the
+	/// process's knob at construction; read by `publish_set` (whether to read
+	/// the mark at all) and by the policy worker. Changed only by tests.
+	#[cfg(feature = "hybrid_cache_common")]
+	corrections: AtomicBool,
+
 	#[cfg(feature = "hybrid_cache_common")]
 	hybrid_fast_bytes_used: AtomicCacheSize,
 	#[cfg(feature = "hybrid_cache_common")]
@@ -474,6 +482,8 @@ impl AtomicStatus {
 			hybrid_reconcile_applied_to_slow: AtomicU64::default(),
 			#[cfg(feature = "hybrid_cache_common")]
 			migration_in_flight: std::sync::OnceLock::new(),
+			#[cfg(feature = "hybrid_cache_common")]
+			corrections: AtomicBool::new(crate::worker::corrections_env()),
 			#[cfg(feature = "hybrid_cache_common")]
 			hybrid_fast_bytes_used: AtomicCacheSize::default(),
 			#[cfg(feature = "hybrid_cache_common")]
@@ -1122,6 +1132,21 @@ impl AtomicStatus {
 	#[cfg(feature = "hybrid_cache_common")]
 	pub(crate) fn migration_in_flight(&self) -> &Arc<crate::worker::InFlight> {
 		self.migration_in_flight.get_or_init(|| Arc::new(crate::worker::InFlight::new()))
+	}
+
+	/// Whether this cache's corrections are on (`MIG_CORRECTIONS`).
+	#[cfg(feature = "hybrid_cache_common")]
+	#[inline]
+	pub(crate) fn corrections(&self) -> bool {
+		self.corrections.load(Ordering::Relaxed)
+	}
+
+	/// Tests: pins this cache's corrections on or off, whatever the process's
+	/// `MIG_CORRECTIONS` says. Takes effect at the next `Set` or slow-served
+	/// hit the worker handles.
+	#[cfg(all(test, feature = "hybrid_cache_common"))]
+	pub(crate) fn set_corrections(&self, on: bool) {
+		self.corrections.store(on, Ordering::Relaxed);
 	}
 
 

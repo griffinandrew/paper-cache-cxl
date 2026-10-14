@@ -2287,8 +2287,12 @@ where
 		// The new-key rule's mark (`WorkerEvent::Set`): the landed count of
 		// this key's migration bucket, read BEFORE the insert publishes the
 		// value, so that a migration landing on the value is ordered after
-		// this read. One load.
-		let mark = self.status.migration_in_flight().mark(hashed_key);
+		// this read. One load -- and none with the corrections off (the
+		// default, `MIG_CORRECTIONS`), where the worker never reads it: 0.
+		let mark = match self.status.corrections() {
+			true => self.status.migration_in_flight().mark(hashed_key),
+			false => 0,
+		};
 
 		let key_heap = object.key_heap_bytes();
 		let mut old_key_heap = 0;

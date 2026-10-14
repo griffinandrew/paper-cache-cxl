@@ -5,6 +5,27 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! The policy worker: the stacks' decisions, the migration queue that applies
+//! them, and the RECONCILE that compares where a client built or served a
+//! value with where the stack places its key (`Observed`).
+//!
+//! CORRECTIONS ARE OFF BY DEFAULT (`MIG_CORRECTIONS`, read once per process;
+//! `corrections_env`). The reconcile's plain rule -- a `Set`'s built tier
+//! against the placement -- runs on every `Set` whatever the knob says; the
+//! new-key rule's fences and the heal, which existed to repair what a STALE
+//! queued move does to a key deleted or evicted and set again (races
+//! (i)-(iii) and (b)), run only with `MIG_CORRECTIONS=1`, except that the heal
+//! is kept under `OnStall::Divert` and `PromotionGate::On`, where bytes lag
+//! a fast placement by design. With them off a stale move leaves a value in
+//! the other tier until the key's next `Set`, eviction or delete (a read-only
+//! hot key: until it is evicted). Accepted because measured: every one of
+//! 41.5M correctives on Meta kvcache_202401 was declined, the exact (tagged)
+//! guard caught 0 stale moves and cost +207 ns of SET mean. A one-in-64
+//! sample of slow-served hits (`lagging_probe`) and the per-pass P minus the
+//! stack's fast bytes (`fast_div`) watch for it on the `MIGSTATS
+//! mig_corrections=` line. The whole argument, the run names and the races:
+//! `Observed`, "Corrections off".
+
 
 /// Persistent migration queue: a standing pool that drains physical tier
 /// copies continuously, decoupled from batch boundaries.
@@ -1486,6 +1507,32 @@ pub mod migstats {
 		#[cfg(feature = "hybrid_cache_common")]
 		pub reconcile_get_heal_skipped: AtomicU64,
 
+		/// With the heal off (corrections off, `Observed`): the slow-served
+		/// hits sampled, one in `LAGGING_PROBE_EVERY` (`lagging_probe_samples`),
+		/// and of those the ones the heal WOULD have promoted -- placed fast,
+		/// nothing of the bucket in flight, nothing in the drain promoting the
+		/// key -- whose bytes are still slow when the worker looks
+		/// (`lagging_probe`): values left lagging by a stale move, or by a
+		/// design breaking the `placement_of` contract. Never queued.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub lagging_probe_samples: AtomicU64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub lagging_probe: AtomicU64,
+
+		/// The stack-versus-physical fast-tier divergence: P (the process's
+		/// physical fast-tier bytes, `crate::phys::observe`) minus the stack's
+		/// `fast_bytes_used`, sampled by the policy worker every pass
+		/// (`instrument_pass`): the last sample, and the lowest and highest
+		/// (both start at 0). Pending demotions and stranded values push it up,
+		/// pending promotions and lagging values pull it down; 0 at a quiescent,
+		/// clean, one-cache process. Written by the worker only.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub fast_div: std::sync::atomic::AtomicI64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub fast_div_min: std::sync::atomic::AtomicI64,
+		#[cfg(feature = "hybrid_cache_common")]
+		pub fast_div_max: std::sync::atomic::AtomicI64,
+
 		/// Reconcile-origin entries (`MigrationOrigin::Reconcile`: the worker's
 		/// correctives, in every store) handed on after `split_tier_migrations`,
 		/// by destination -- their own intent counters, kept OUT of
@@ -1878,7 +1925,45 @@ pub mod migstats {
 			#[cfg(feature = "hybrid_cache_common")]
 			lines.push(self.mq_line(t_ms));
 
+			// The corrections (`Observed`, "Corrections off"): the process's
+			// `MIG_CORRECTIONS`, the lagging probe, and the stack-versus-physical
+			// fast-tier divergence. LAST, so every line above keeps its place.
+			#[cfg(feature = "hybrid_cache_common")]
+			lines.push(self.corrections_line(t_ms));
+
 			lines
+		}
+
+		/// `MIGSTATS mig_corrections=.. lagging_probe_samples=.. lagging_probe=..
+		/// fast_div=.. fast_div_min=.. fast_div_max=.. t_ms=..`.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub(crate) fn corrections_line(&self, t_ms: u64) -> String {
+			format!(
+				"MIGSTATS mig_corrections={} lagging_probe_samples={} lagging_probe={} fast_div={} fast_div_min={} fast_div_max={} t_ms={t_ms}",
+				crate::worker::policy::corrections_env() as u8,
+				self.lagging_probe_samples.load(Ordering::Relaxed),
+				self.lagging_probe.load(Ordering::Relaxed),
+				self.fast_div.load(Ordering::Relaxed),
+				self.fast_div_min.load(Ordering::Relaxed),
+				self.fast_div_max.load(Ordering::Relaxed),
+			)
+		}
+
+		/// The policy worker's per-pass sample of P minus the stack's fast
+		/// bytes (`fast_div`). Only the worker writes these, so plain stores.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub(crate) fn sample_fast_div(&self, div: i64) {
+			use std::sync::atomic::Ordering::Relaxed;
+
+			self.fast_div.store(div, Relaxed);
+
+			if div < self.fast_div_min.load(Relaxed) {
+				self.fast_div_min.store(div, Relaxed);
+			}
+
+			if div > self.fast_div_max.load(Relaxed) {
+				self.fast_div_max.store(div, Relaxed);
+			}
 		}
 	}
 
@@ -1926,12 +2011,23 @@ pub mod migstats {
 			set(&stats.mq[0].blocks, 42);
 			set(&stats.mq[0].spin_ns, 43);
 			set(&stats.mq[0].block_ns, 44);
+			set(&stats.lagging_probe_samples, 45);
+			set(&stats.lagging_probe, 46);
+			stats.sample_fast_div(-47);
+			stats.sample_fast_div(48);
+			stats.sample_fast_div(-7);
 
 			// The consumers' receive line, appended after the rest: the window
 			// is this process's `MIG_SPIN_US`.
 			let mq = format!(
 				"MIGSTATS mq_spin_us={} mq_spin_hits=41 mq_blocks=42 mq_spin_ns=43 mq_block_ns=44 t_ms=123",
 				crate::worker::policy::migration_queue::spin_us(),
+			);
+
+			// The corrections line, LAST: this process's `MIG_CORRECTIONS`.
+			let corrections = format!(
+				"MIGSTATS mig_corrections={} lagging_probe_samples=45 lagging_probe=46 fast_div=-7 fast_div_min=-47 fast_div_max=48 t_ms=123",
+				crate::worker::policy::corrections_env() as u8,
 			);
 
 			assert_eq!(
@@ -1948,8 +2044,26 @@ pub mod migstats {
 					 reconcile_set_new_key=34 reconcile_queued_to_fast=35 reconcile_queued_to_slow=36 \
 					 reconcile_applied_to_fast=37 reconcile_applied_to_slow=38 reconcile_get_heal_skipped=39 t_ms=123",
 					mq.as_str(),
+					corrections.as_str(),
 				],
 			);
+		}
+
+		#[test]
+		fn mig_corrections_is_a_whole_number_and_off_by_default() {
+			use crate::worker::policy::corrections_from;
+
+			assert_eq!(corrections_from(None), (false, None), "unset: off");
+			assert_eq!(corrections_from(Some("0")), (false, None));
+			assert_eq!(corrections_from(Some("1")), (true, None));
+			assert_eq!(corrections_from(Some(" 2 ")), (true, None));
+
+			let (on, note) = corrections_from(Some("yes"));
+			assert!(!on && note.is_some_and(|note| note.contains("MIG_CORRECTIONS")), "not a number: off, with a note");
+
+			if std::env::var_os("MIG_CORRECTIONS").is_none() {
+				assert!(!crate::worker::policy::corrections_env(), "this process: unset, so off");
+			}
 		}
 
 		/// The `mq_*` line sums every consumer slot: the first, the second and
@@ -2426,6 +2540,69 @@ pub use policy_stack::{MigrationEntry, MigrationOrigin, TaggedMigration};
 /// hit (and, when its bucket is busy, no `placement_of` -- one relaxed
 /// increment of the skipped-heal count instead). Nothing per fast-served hit
 /// or miss.
+///
+/// # Corrections off: the default (`MIG_CORRECTIONS`)
+///
+/// The new-key rule and the heal above are the CORRECTIONS, and they are OFF
+/// unless `MIG_CORRECTIONS=1` (`corrections_env`, read once per process; a
+/// cache takes it at construction, `AtomicStatus::corrections`). Off:
+///
+///   * no new-key fence: the client does not read its mark (the `Set`
+///     carries 0), the worker does not probe `moved_since` nor, for a
+///     replacing `Set`, `placement_of` -- `fence` is always `false`, and
+///     `reconcile_set_new_key` stays 0;
+///   * no heal, except where bytes can lag a fast placement WITHOUT a stale
+///     move, which keeps it whatever the knob says (`PolicyWorker::
+///     heals_needed`, read once per worker pass): the byte gate's
+///     `OnStall::Divert` (a diverted key is promoted by its first
+///     slow-served hit, by design -- `Observed::Diverted`) and
+///     `PromotionGate::On` (`PromotionRetry` drops declined promotions past
+///     its cap, leaving such keys placed fast with their bytes slow and
+///     nothing queued);
+///   * the PLAIN RULE stays, on every `Set`: its built tier (or the drain's
+///     last entry for it) against the placement. It is what corrects a value
+///     BUILT in the wrong tier -- the LFU stale latch, race (a) -- and it
+///     costs one `placement_of` per `Set`.
+///
+/// What races (i)-(iii) do then. A stale queued move -- a heal pushed for a
+/// hit on the old value (i: only where the heal is kept), a plain-rule
+/// corrective (ii) or a stack entry (iii) for a
+/// key since deleted or evicted -- lands on the fresh value, and the fresh
+/// `Set`, admitted without a push, queues nothing: the value is left in the
+/// other tier -- STRANDED in DRAM, charged slow (i, ii, iii), or LAGGING in
+/// CXL, charged fast (race (b), a stale demotion of a key re-admitted fast).
+/// It stays there until the key's next `Set` (the plain rule reconciles the
+/// new value's built tier; the stale value itself is replaced and freed),
+/// until the key is evicted or deleted, or until the stack's own next move of
+/// the key (a demotion or promotion of a lagging or stranded key declines --
+/// the bytes are already there -- and the placement then agrees). A key that
+/// is only ever READ keeps a stranded or lagging value until it is evicted.
+///
+/// Why that is accepted: it was measured not to happen, and the machinery
+/// that guards against it was measured to cost. Meta kvcache_202401, tiered
+/// LRU, 8 clients, batched (b64), one binary (da1a276) with only the old
+/// switch differing (run dirs `meta_202401_lru_tiered`, the move ledger, and
+/// `meta_202401_lru_tiered_untagged`, these corrections, under
+/// `~/paper-cache-run/bp-promoload` on the cxl host): the reconcile queued
+/// 41.5M correctives, 9.0M of them heals, and EVERY ONE was declined (applied
+/// == promotions + demotions; real moves 219.2M in both runs); the ledger,
+/// which made the new-key rule exact, skipped 0 stale moves in every run that
+/// day, and cost +207 ns of SET mean (1,732 against 1,525 ns; GET 1,234
+/// against 1,246). So a stale move is rare, and when one happens it is
+/// self-correcting on the key's next `Set` or eviction.
+///
+/// What still watches for it, at the cost of one in `LAGGING_PROBE_EVERY`
+/// slow-served hits: such a hit with the heal off is SAMPLED
+/// (`Observed::Probe`) and judged as the heal would judge it -- placed fast,
+/// nothing of its bucket in flight, nothing in the drain promoting it -- and,
+/// unlike the heal, against its bytes as they are NOW (still slow: a
+/// promotion that landed after the client read the value is no lag; the
+/// heal queued one for each such hit, and each declined), and counted in
+/// `lagging_probe` (out of `lagging_probe_samples`), never queued. With the worker's per-pass P minus the stack's `fast_bytes_used`
+/// (`fast_div`, its minimum and maximum: lagging and pending promotions pull
+/// it down, stranded values and pending demotions push it up), both are on
+/// the `MIGSTATS mig_corrections=` line. `MIG_CORRECTIONS=1` restores the
+/// fences and the heals exactly as described above.
 #[cfg(feature = "hybrid_cache_common")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Observed {
@@ -2437,6 +2614,10 @@ enum Observed {
 	/// A hit on the key was served from the slow tier. `quiet`: nothing of the
 	/// key's bucket was in flight -- the heal rule.
 	ServedSlow { key: HashedKey, quiet: bool },
+	/// With the heal off (corrections off and `heals_needed` false), one
+	/// slow-served hit in `LAGGING_PROBE_EVERY`: judged as `ServedSlow` would
+	/// be, and counted in `lagging_probe` when that would heal -- never queued.
+	Probe { key: HashedKey, quiet: bool },
 	/// A `set` the byte gate DIVERTED (S5 B2, `OnStall::Divert`): its value was
 	/// built slow because the fast tier was stalled, and the key is placed by
 	/// its policy. Reconciled as a slow build, except never toward fast: a
@@ -2451,8 +2632,52 @@ enum Observed {
 impl Observed {
 	fn key(self) -> HashedKey {
 		match self {
-			Observed::Built { key, .. } | Observed::ServedSlow { key, .. } | Observed::Diverted { key, .. } => key,
+			Observed::Built { key, .. }
+			| Observed::ServedSlow { key, .. }
+			| Observed::Probe { key, .. }
+			| Observed::Diverted { key, .. } => key,
 		}
+	}
+}
+
+/// One slow-served hit in this many is sampled for `lagging_probe` while the
+/// heal is off (`Observed::Probe`).
+#[cfg(feature = "hybrid_cache_common")]
+pub(crate) const LAGGING_PROBE_EVERY: u64 = 64;
+
+/// `MIG_CORRECTIONS`, read once per process: whether the reconcile's
+/// CORRECTIONS -- the new-key rule's fences and the heal (`Observed`) -- are
+/// on. Default OFF; see `Observed`, "Corrections off". Each cache copies it
+/// at construction (`AtomicStatus::corrections`), so a test can pin one
+/// cache's mode without touching the process.
+#[cfg(feature = "hybrid_cache_common")]
+pub(crate) fn corrections_env() -> bool {
+	static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+	*ON.get_or_init(|| {
+		let value = std::env::var("MIG_CORRECTIONS").ok();
+		let (on, note) = corrections_from(value.as_deref());
+
+		if let Some(note) = note {
+			eprintln!("paper-cache: {note}");
+		}
+
+		on
+	})
+}
+
+/// `corrections_env` over the variable's value (`None`: unset), and the note
+/// for a value it ignored: a whole number, 0 = off, anything else = on;
+/// unset, or not a whole number, off.
+#[cfg(feature = "hybrid_cache_common")]
+pub(crate) fn corrections_from(value: Option<&str>) -> (bool, Option<String>) {
+	let Some(value) = value else {
+		return (false, None);
+	};
+
+	match value.trim().parse::<u64>() {
+		Ok(n) => (n != 0, None),
+		Err(reason) => (false, Some(format!("MIG_CORRECTIONS={value:?} ignored: {reason}; corrections stay off"))),
 	}
 }
 
@@ -2523,7 +2748,7 @@ fn corrective<E: MigrationEntry>(
 			}
 		},
 
-		Observed::ServedSlow { quiet, .. } => {
+		Observed::ServedSlow { quiet, .. } | Observed::Probe { quiet, .. } => {
 			(quiet && placement == Tier::Fast && queued.unwrap_or(Tier::Slow) == Tier::Slow)
 				.then_some((key, Tier::Fast, Reason::Heal))
 		},
@@ -2754,6 +2979,19 @@ pub struct PolicyWorker<K, V> {
 	#[cfg(feature = "hybrid_cache_common")]
 	observed: Vec<Observed>,
 
+	/// Whether a slow-served hit is considered for the heal although the
+	/// cache's corrections are off (`heals_needed`: `OnStall::Divert` or
+	/// `PromotionGate::On`), as of the start of this worker pass -- read once
+	/// per pass rather than per hit, since it takes the gate configuration's
+	/// read lock, which the clients' sets take too.
+	#[cfg(feature = "hybrid_cache_common")]
+	heals_kept: bool,
+
+	/// Slow-served hits not considered for the heal, for the one-in-
+	/// `LAGGING_PROBE_EVERY` sample (`Observed::Probe`). The worker's own.
+	#[cfg(feature = "hybrid_cache_common")]
+	probe_tick: u64,
+
 	/// Test builds flush the migration consumers after every batch, so a test
 	/// sees a migration land when the call that queued it returns. A test
 	/// that parks a consumer and keeps driving the worker turns this off.
@@ -2897,6 +3135,13 @@ where
 
 			events.clear();
 			events.extend(self.listener.try_iter());
+
+			// Whether this pass's slow-served hits may heal with the
+			// corrections off: the gate's configuration, once per pass.
+			#[cfg(feature = "hybrid_cache_common")]
+			if self.tier_migration && !events.is_empty() {
+				self.refresh_heals_kept();
+			}
 
 			let mut has_current_set = false;
 
@@ -3184,6 +3429,12 @@ where
 			#[cfg(feature = "hybrid_cache_common")]
 			observed: Vec::new(),
 
+			#[cfg(feature = "hybrid_cache_common")]
+			heals_kept: false,
+
+			#[cfg(feature = "hybrid_cache_common")]
+			probe_tick: 0,
+
 			#[cfg(all(test, feature = "hybrid_cache_common"))]
 			test_flush: true,
 
@@ -3291,6 +3542,12 @@ where
 			#[cfg(feature = "hybrid_cache_common")]
 			observed: Vec::new(),
 
+			#[cfg(feature = "hybrid_cache_common")]
+			heals_kept: false,
+
+			#[cfg(feature = "hybrid_cache_common")]
+			probe_tick: 0,
+
 			#[cfg(all(test, feature = "hybrid_cache_common"))]
 			test_flush: true,
 
@@ -3311,6 +3568,9 @@ where
 		worker.publish_metadata(true);
 		worker.publish_gate();
 
+		#[cfg(feature = "hybrid_cache_common")]
+		worker.refresh_heals_kept();
+
 		Ok(worker)
 	}
 
@@ -3328,10 +3588,49 @@ where
 		// this one comparison and nothing else.
 		#[cfg(feature = "hybrid_cache_common")]
 		if self.tier_migration && served == Some(Tier::Slow) {
+			// Corrections off (`Observed`, "Corrections off") and no reason to
+			// keep the heal: nothing is healed, and one such hit in
+			// `LAGGING_PROBE_EVERY` is looked at for the record only.
+			if !self.heals_kept && !self.status.corrections() {
+				let tick = self.probe_tick;
+				self.probe_tick = tick.wrapping_add(1);
+
+				if tick % LAGGING_PROBE_EVERY == 0 {
+					let quiet = self.status.migration_in_flight().pending(key) == 0;
+
+					self.observed.push(Observed::Probe { key, quiet });
+				}
+
+				return;
+			}
+
 			let quiet = self.status.migration_in_flight().pending(key) == 0;
 
 			self.observed.push(Observed::ServedSlow { key, quiet });
 		}
+	}
+
+	/// Whether a slow-served hit is considered for the heal although the
+	/// corrections are off: only where bytes can lag a FAST placement without
+	/// a stale move (`Observed`, "Corrections off") -- the byte gate's
+	/// `OnStall::Divert` (a diverted key is promoted by its first slow-served
+	/// hit, by design) and `PromotionGate::On` (the retry of declined
+	/// promotions drops keys past its cap). A relaxed load and the gate
+	/// configuration's read lock.
+	#[cfg(feature = "hybrid_cache_common")]
+	fn heals_needed(&self) -> bool {
+		let gate = self.status.gate();
+
+		gate.promotion_gate() == crate::gate::PromotionGate::On
+			|| gate.config().on_stall == crate::gate::OnStall::Divert
+	}
+
+	/// `heals_kept` from the gate's configuration now: once per worker pass
+	/// that has events, at construction, and by a test that changes the
+	/// configuration under a worker it drives itself.
+	#[cfg(feature = "hybrid_cache_common")]
+	pub(crate) fn refresh_heals_kept(&mut self) {
+		self.heals_kept = self.heals_needed();
 	}
 
 	/// `dram_resident` is the part of `size` that never migrates; the policy
@@ -3406,8 +3705,10 @@ where
 
 		let fresh = previous.is_none();
 
+		// Corrections off (the default): no fence, and neither probe.
 		#[cfg(feature = "hybrid_cache_common")]
 		let fence = self.tier_migration
+			&& self.status.corrections()
 			&& self.status.migration_in_flight().moved_since(key, mark)
 			&& (fresh
 				|| self.policy_stack.placement_of(key).is_none());
@@ -3697,6 +3998,29 @@ where
 				continue;
 			}
 
+			// A sampled hit with the heal off: counted when the heal would have
+			// promoted it AND the value's bytes are still slow now (a promotion
+			// that landed between the client's read and this event is not a
+			// lag -- the heal would have queued it, and it would have
+			// declined); never queued. A busy bucket says nothing.
+			if let Observed::Probe { quiet, .. } = observed {
+				use std::sync::atomic::Ordering::Relaxed;
+
+				let stats = self.status.migstats();
+				stats.lagging_probe_samples.fetch_add(1, Relaxed);
+
+				let key = observed.key();
+
+				if quiet
+					&& corrective(&migrations, observed, stack.placement_of(key)).is_some()
+					&& self.objects.get_ref(&key).is_some_and(|object| object.snapshot().tier() == Tier::Slow)
+				{
+					stats.lagging_probe.fetch_add(1, Relaxed);
+				}
+
+				continue;
+			}
+
 			let placement = stack.placement_of(observed.key());
 
 			if let Some((key, tier, reason)) = corrective(&migrations, observed, placement) {
@@ -3967,6 +4291,10 @@ where
 		}
 
 		let phys = crate::phys::observe();
+
+		// The stack-versus-physical fast-tier divergence, for the MIGSTATS
+		// corrections line: one stack call and a few worker-owned stores.
+		self.status.migstats().sample_fast_div(phys - self.policy_stack.fast_bytes_used() as i64);
 
 		// S5: the integrand is `P + M_model - F`, M_model being the metadata
 		// figure eff takes off F (the measured M, or the per-object model's) --
@@ -7591,6 +7919,22 @@ mod reconcile_tests {
 		assert!(audit.is_clean(), "{audit:?}");
 	}
 
+	/// Pins this worker's cache's corrections ON -- the new-key rule's fences
+	/// and the heal, `MIG_CORRECTIONS=1` -- whatever the process says: for the
+	/// tests of those two rules. The default is off.
+	pub(super) fn corrections_on(worker: &Worker) {
+		worker.status.set_corrections(true);
+	}
+
+	/// The cache's lagging probe so far: `(lagging_probe_samples,
+	/// lagging_probe)`.
+	pub(super) fn lagging_probe(worker: &Worker) -> (u64, u64) {
+		let stats = worker.status.migstats();
+		let l = |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed);
+
+		(l(&stats.lagging_probe_samples), l(&stats.lagging_probe))
+	}
+
 
 	/// Race E (T9's 2Q full fast-admission "never quiesced", stack 44 against
 	/// map 43): an eviction pass between a re-set's publish -- its map insert
@@ -7852,6 +8196,7 @@ mod reconcile_tests {
 		let _serialised = migration_test_lock::lock();
 
 		let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
+		corrections_on(&worker);
 
 		const K: HashedKey = 1;
 		set(&mut worker, &objects, K, LEN, Fast);
@@ -7877,6 +8222,92 @@ mod reconcile_tests {
 		assert_eq!(of(&drain, K), vec![Fast], "one promotion");
 		assert_eq!(correctives(&drain, K), vec![Fast], "the heal's");
 		assert_eq!(bytes_tier(&objects, K), Fast);
+		assert_settled(&mut worker);
+	}
+
+	/// Corrections off (the default), in both stores: a value lagging its fast
+	/// placement -- moved behind the stack's back here -- is NOT healed by a
+	/// slow-served hit. One such hit in `LAGGING_PROBE_EVERY` is sampled
+	/// (`Observed::Probe`) and, judged as the heal would judge it, counted
+	/// `lagging_probe`; the rest observe nothing. The key's next `Set` puts a
+	/// value where the key is placed.
+	#[test]
+	fn corrections_off_a_lagging_value_is_probed_not_healed_and_its_next_set_fixes_it() {
+		let _serialised = migration_test_lock::lock();
+
+		let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
+		worker.status.set_corrections(false);
+
+		const K: HashedKey = 1;
+		set(&mut worker, &objects, K, LEN, Fast);
+		drain_and_apply(&mut worker);
+
+		move_bytes(&objects, K, Slow);
+
+		let heals = worker.status.migstats().reconcile_get_to_fast.load(std::sync::atomic::Ordering::Relaxed);
+		assert_eq!(lagging_probe(&worker), (0, 0));
+
+		for hit in 0..2 * LAGGING_PROBE_EVERY {
+			worker.handle_get(K, Some(Slow));
+
+			let sampled = hit % LAGGING_PROBE_EVERY == 0;
+			assert_eq!(worker.observed.len(), sampled as usize, "hit {hit}: one in LAGGING_PROBE_EVERY is sampled");
+			assert_eq!(correctives(&drain_and_apply(&mut worker), K), vec![], "hit {hit}: never healed");
+		}
+
+		assert_eq!(lagging_probe(&worker), (2, 2), "both samples saw K lagging");
+		assert_eq!(
+			worker.status.migstats().reconcile_get_to_fast.load(std::sync::atomic::Ordering::Relaxed),
+			heals,
+			"no heal queued",
+		);
+		assert_eq!(bytes_tier(&objects, K), Slow, "still lagging");
+
+		let audit = worker.placement_audit();
+		assert_eq!((audit.lagging, audit.stranded, audit.untracked), (1, 0, 0), "{audit:?}");
+
+		// The next Set: built fast, as LRU builds, where it is placed.
+		set(&mut worker, &objects, K, LEN + 7, Fast);
+		drain_and_apply(&mut worker);
+		assert_eq!((placement(&worker, K), bytes_tier(&objects, K)), (Some(Fast), Fast), "fixed by the next Set");
+		assert_settled(&mut worker);
+	}
+
+	/// Corrections off, the byte gate's `OnStall::Divert`: the heal is KEPT
+	/// (a diverted key is promoted by its first slow-served hit, by design),
+	/// whatever `MIG_CORRECTIONS` says -- a lagging value is promoted once by
+	/// a slow-served hit, and nothing is probed. In the split stores, as the
+	/// gate's divert tests run.
+	#[cfg(not(feature = "merged_object_store"))]
+	#[test]
+	fn corrections_off_divert_keeps_the_heal() {
+		let _serialised = migration_test_lock::lock();
+
+		let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
+		worker.status.set_corrections(false);
+
+		assert!(!worker.heals_kept, "the defaults keep no heal");
+
+		{
+			let gate = worker.status.gate();
+			gate.set_config(crate::gate::GateConfig { on_stall: crate::gate::OnStall::Divert, ..gate.config() });
+		}
+
+		worker.refresh_heals_kept();
+		assert!(worker.heals_kept, "Divert keeps the heal");
+
+		const K: HashedKey = 1;
+		set(&mut worker, &objects, K, LEN, Fast);
+		drain_and_apply(&mut worker);
+
+		move_bytes(&objects, K, Slow);
+
+		worker.handle_get(K, Some(Slow));
+		let drain = drain_and_apply(&mut worker);
+
+		assert_eq!(correctives(&drain, K), vec![Fast], "healed");
+		assert_eq!(bytes_tier(&objects, K), Fast);
+		assert_eq!(lagging_probe(&worker), (0, 0), "nothing probed");
 		assert_settled(&mut worker);
 	}
 
@@ -7917,9 +8348,24 @@ mod reconcile_tests {
 	#[cfg(not(feature = "merged_object_store"))]
 	#[test]
 	fn m1_i_a_heal_landing_on_a_deleted_and_reset_2q_key_is_undone_at_its_set() {
+		m1_i(true);
+	}
+
+	/// (i) with the corrections off (the default): the slow-served hit queues
+	/// no heal, so nothing lands on the fresh value, and the `Set` admits it
+	/// slow where it was built -- nothing stranded, nothing to correct.
+	#[cfg(not(feature = "merged_object_store"))]
+	#[test]
+	fn corrections_off_m1_i_a_slow_hit_before_a_2q_delete_and_reset_heals_nothing_and_strands_nothing() {
+		m1_i(false);
+	}
+
+	#[cfg(not(feature = "merged_object_store"))]
+	fn m1_i(corrections: bool) {
 		let _serialised = migration_test_lock::lock();
 
 		let (mut worker, objects) = make_worker(PaperPolicy::TwoQCompactHybrid(0.25));
+		worker.status.set_corrections(corrections);
 
 		const K: HashedKey = 1;
 
@@ -7947,10 +8393,22 @@ mod reconcile_tests {
 		let published = publish(&status, &overhead_manager, &objects, K, LEN, built);
 		assert!(published.fresh());
 
-		// The worker: the hit, healed onto the fresh value.
+		// The worker: the hit, healed onto the fresh value -- with the
+		// corrections on; off, not healed at all.
 		worker.handle_get(K, Some(served));
-		assert_eq!(correctives(&drain_and_apply(&mut worker), K), vec![Fast], "the heal");
-		assert_eq!(bytes_tier(&objects, K), Fast, "it landed on the FRESH value");
+
+		match corrections {
+			true => {
+				assert_eq!(correctives(&drain_and_apply(&mut worker), K), vec![Fast], "the heal");
+				assert_eq!(bytes_tier(&objects, K), Fast, "it landed on the FRESH value");
+			},
+
+			false => {
+				assert_eq!(correctives(&drain_and_apply(&mut worker), K), vec![], "corrections off: no heal");
+				assert_eq!(bytes_tier(&objects, K), Slow, "the fresh value stays where it was built");
+			},
+		}
+
 		assert_eq!(worker.status.migration_in_flight().pending(K), 0, "and nothing is in flight");
 
 		worker.handle_del(K);
@@ -7962,7 +8420,11 @@ mod reconcile_tests {
 		let drain = drain_and_apply(&mut worker);
 		assert_eq!(bytes_tier(&objects, K), Slow, "the fresh value is where the stack placed it");
 		assert_settled(&mut worker);
-		assert_eq!(correctives(&drain, K), vec![Slow], "the new-key rule's corrective");
+
+		match corrections {
+			true => assert_eq!(correctives(&drain, K), vec![Slow], "the new-key rule's corrective"),
+			false => assert_eq!(correctives(&drain, K), vec![], "nothing landed on it: nothing to correct"),
+		}
 	}
 
 	/// Review M1 (ii), in both stores: LFU's value v1 is built slow under a
@@ -7977,11 +8439,25 @@ mod reconcile_tests {
 	/// (`pendingonly`).
 	#[test]
 	fn m1_ii_a_corrective_landing_on_an_evicted_and_reset_lfu_key_is_undone_at_its_set() {
+		m1_ii(true, "m1_ii_a_corrective_landing_on_an_evicted_and_reset_lfu_key_is_undone_at_its_set");
+	}
+
+	/// (ii) with the corrections off (the default): the stale plain-rule
+	/// corrective lands on the fresh value and its `Set` queues nothing, so
+	/// v2 is left STRANDED in DRAM, placed slow -- until the key's next `Set`,
+	/// whose plain rule demotes the new value. Transient, and fixed there.
+	#[test]
+	fn corrections_off_m1_ii_a_stale_corrective_strands_a_reset_lfu_key_until_its_next_set() {
+		m1_ii(false, "corrections_off_m1_ii_a_stale_corrective_strands_a_reset_lfu_key_until_its_next_set");
+	}
+
+	fn m1_ii(corrections: bool, test: &str) {
 		let _serialised = migration_test_lock::lock();
 
 		let (mut worker, objects) = make_worker(PaperPolicy::LfuCompactHybrid);
+		worker.status.set_corrections(corrections);
 
-		if !queue_or_skip(&worker, "m1_ii_a_corrective_landing_on_an_evicted_and_reset_lfu_key_is_undone_at_its_set") {
+		if !queue_or_skip(&worker, test) {
 			return;
 		}
 
@@ -8031,9 +8507,41 @@ mod reconcile_tests {
 
 		worker.test_flush = true;
 		worker.migration_queue.as_ref().expect("a queue").flush();
+
+		if !corrections {
+			stranded_until_the_next_set(&mut worker, &objects, K, drain);
+			return;
+		}
+
 		assert_eq!(bytes_tier(&objects, K), Slow, "the fresh value is where the stack placed it");
 		assert_settled(&mut worker);
 		assert_eq!(correctives(&drain, K), vec![Slow], "the new-key rule's corrective");
+	}
+
+	/// Corrections off: `drain`, the fresh value's `Set`'s, fenced nothing, and
+	/// the stale promotion left the value STRANDED -- in DRAM, placed slow.
+	/// The key's next `Set` -- built where the client builds it -- ends with
+	/// the new value where the stack places it, by the plain rule (or the
+	/// stack's own entry), and the cache clean.
+	fn stranded_until_the_next_set(worker: &mut Worker, objects: &Objects, key: HashedKey, drain: Vec<TaggedMigration>) {
+		assert_eq!(correctives(&drain, key), vec![], "corrections off: no fence");
+		assert_eq!((placement(worker, key), bytes_tier(objects, key)), (Some(Slow), Fast), "stranded: in DRAM, placed slow");
+
+		let audit = worker.placement_audit();
+		assert_eq!((audit.stranded, audit.lagging, audit.untracked), (1, 0, 0), "{audit:?}");
+
+		let built = built_by_the_client(worker, objects, key);
+		set(worker, objects, key, LEN + 7, built);
+		let drain = drain_and_apply(worker);
+
+		let placed = placement(worker, key).expect("still tracked");
+		assert_eq!(bytes_tier(objects, key), placed, "the next Set's value is where the stack places it");
+
+		if built != placed {
+			assert_eq!(of(&drain, key).last(), Some(&placed), "moved there by its own Set's drain");
+		}
+
+		assert_settled(worker);
 	}
 
 	/// Review M1 (iii), in both stores, the rule's IN-FLIGHT path: a stale
@@ -8048,11 +8556,24 @@ mod reconcile_tests {
 	/// which is this path.
 	#[test]
 	fn m1_iii_a_stale_stack_promotion_of_a_deleted_key_does_not_strand_its_slow_readmission() {
+		m1_iii(true, "m1_iii_a_stale_stack_promotion_of_a_deleted_key_does_not_strand_its_slow_readmission");
+	}
+
+	/// (iii) with the corrections off (the default): the stale stack promotion
+	/// lands on the fresh value, admitted slow with no fence -- STRANDED in
+	/// DRAM -- until the key's next `Set`.
+	#[test]
+	fn corrections_off_m1_iii_a_stale_stack_promotion_strands_a_reset_key_until_its_next_set() {
+		m1_iii(false, "corrections_off_m1_iii_a_stale_stack_promotion_strands_a_reset_key_until_its_next_set");
+	}
+
+	fn m1_iii(corrections: bool, test: &str) {
 		let _serialised = migration_test_lock::lock();
 
 		let (mut worker, objects) = make_worker(PaperPolicy::LfuCompactHybrid);
+		worker.status.set_corrections(corrections);
 
-		if !queue_or_skip(&worker, "m1_iii_a_stale_stack_promotion_of_a_deleted_key_does_not_strand_its_slow_readmission") {
+		if !queue_or_skip(&worker, test) {
 			return;
 		}
 
@@ -8099,6 +8620,12 @@ mod reconcile_tests {
 		unpark(&worker, j, j_tier, release);
 
 		worker.test_flush = true;
+
+		if !corrections {
+			stranded_until_the_next_set(&mut worker, &objects, K, drain);
+			return;
+		}
+
 		assert_eq!(bytes_tier(&objects, K), Slow, "the fresh value is where the stack placed it");
 		assert_settled(&mut worker);
 		assert_eq!(correctives(&drain, K), vec![Slow], "the new-key rule's corrective, behind the stale promotion");
@@ -8115,11 +8642,26 @@ mod reconcile_tests {
 	/// in-flight count alone (`pendingonly`).
 	#[test]
 	fn race_b_a_stale_demotion_of_a_deleted_and_reset_key_is_undone_at_its_set() {
+		race_b(true, "race_b_a_stale_demotion_of_a_deleted_and_reset_key_is_undone_at_its_set");
+	}
+
+	/// Race (b) with the corrections off (the default): the stale demotion
+	/// leaves the fresh value LAGGING -- in CXL, placed fast -- and its `Set`
+	/// fences nothing (`fence: false`); a slow-served hit on it is probed and
+	/// counted `lagging_probe`, not healed; the key's next `Set` replaces it
+	/// with a value built fast, where it is placed, and the cache is clean.
+	#[test]
+	fn corrections_off_race_b_a_stale_demotion_leaves_a_reset_key_lagging_until_its_next_set() {
+		race_b(false, "corrections_off_race_b_a_stale_demotion_leaves_a_reset_key_lagging_until_its_next_set");
+	}
+
+	fn race_b(corrections: bool, test: &str) {
 		let _serialised = migration_test_lock::lock();
 
 		let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
+		worker.status.set_corrections(corrections);
 
-		if !queue_or_skip(&worker, "race_b_a_stale_demotion_of_a_deleted_and_reset_key_is_undone_at_its_set") {
+		if !queue_or_skip(&worker, test) {
 			return;
 		}
 
@@ -8165,6 +8707,32 @@ mod reconcile_tests {
 		handle(&mut worker, k, published);
 		assert_eq!(placement(&worker, k), Some(Fast), "the stack admitted the fresh K fast");
 
+		if !corrections {
+			assert_eq!(worker.observed, vec![Observed::Built { key: k, built: Fast, fence: false }], "corrections off: never fenced");
+
+			let drain = drain_and_apply(&mut worker);
+			assert_eq!(correctives(&drain, k), vec![], "nothing queued for the fresh value");
+			assert_eq!(bytes_tier(&objects, k), Slow, "LAGGING: in CXL, placed fast");
+
+			let audit = worker.placement_audit();
+			assert_eq!((audit.lagging, audit.stranded, audit.untracked), (1, 0, 0), "{audit:?}");
+
+			// A slow-served hit: probed (the worker's first such hit), not healed.
+			let probe = lagging_probe(&worker);
+			worker.handle_get(k, Some(bytes_tier(&objects, k)));
+			assert_eq!(worker.observed, vec![Observed::Probe { key: k, quiet: true }], "sampled");
+			assert_eq!(correctives(&drain_and_apply(&mut worker), k), vec![], "not healed");
+			assert_eq!(lagging_probe(&worker), (probe.0 + 1, probe.1 + 1), "counted lagging");
+			assert_eq!(bytes_tier(&objects, k), Slow, "still lagging");
+
+			// The next Set: built fast as LRU builds, where it is placed.
+			set(&mut worker, &objects, k, LEN + 7, Fast);
+			drain_and_apply(&mut worker);
+			assert_eq!((placement(&worker, k), bytes_tier(&objects, k)), (Some(Fast), Fast), "fixed by the next Set");
+			assert_settled(&mut worker);
+			return;
+		}
+
 		let drain = drain_and_apply(&mut worker);
 		assert_eq!(bytes_tier(&objects, k), Fast, "the fresh value is where the stack placed it");
 		assert_settled(&mut worker);
@@ -8197,6 +8765,7 @@ mod reconcile_tests {
 		let _serialised = migration_test_lock::lock();
 
 		let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
+		corrections_on(&worker);
 
 		const K: HashedKey = 1;
 
@@ -8267,6 +8836,7 @@ mod reconcile_tests {
 		let _serialised = migration_test_lock::lock();
 
 		let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
+		corrections_on(&worker);
 
 		if !queue_or_skip(&worker, "m2_slow_hits_while_their_buckets_promotion_is_in_flight_queue_at_most_one_heal") {
 			return;
@@ -8334,6 +8904,7 @@ mod reconcile_tests {
 
 		// To fast: the heal.
 		let (mut worker, objects) = make_worker(PaperPolicy::LruCompactHybrid);
+		corrections_on(&worker);
 
 		const K: HashedKey = 1;
 		set(&mut worker, &objects, K, LEN, Fast);
@@ -8520,6 +9091,9 @@ mod reconcile_tests {
 			PaperPolicy::LruCompactHybrid,
 		)
 		.expect("an LRU hybrid cache");
+
+		// The heal: corrections on.
+		cache.status.set_corrections(true);
 
 		const K: u64 = 1;
 		const L: u64 = 2;

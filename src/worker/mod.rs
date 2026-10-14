@@ -60,7 +60,9 @@ pub enum WorkerEvent {
 	/// tells whether any migration of the bucket was in flight, or landed,
 	/// after the value was published -- the new-key rule
 	/// (`PolicyWorker::handle_set`). 0 from a flat cache, which queues no
-	/// migrations; in the byte padding the variant already had.
+	/// migrations, and from a cache whose corrections are off (the default,
+	/// `MIG_CORRECTIONS`), whose worker never reads it; in the byte padding
+	/// the variant already had.
 	///
 	/// `placement` (S5): `Structural` when the value was larger than an empty
 	/// fast tier and was built slow for that reason (`gate::decide`); every
@@ -318,6 +320,10 @@ pub(crate) use crate::worker::policy::migstats::{NB as MIGSTATS_BUCKETS, read as
 // `AtomicStatus` holds for the client, the worker and the consumers.
 #[cfg(feature = "hybrid_cache_common")]
 pub(crate) use crate::worker::policy::migration_queue::InFlight;
+
+// `MIG_CORRECTIONS`, read once per process (`policy::Observed`, "Corrections off").
+#[cfg(feature = "hybrid_cache_common")]
+pub(crate) use crate::worker::policy::corrections_env;
 
 // The tagged drain entry, for the merged store's migration log; what a `Set`
 // did to the map, for its `worker_set`; and the CLOCK hand's budget.

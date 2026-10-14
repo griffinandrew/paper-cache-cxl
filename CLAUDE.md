@@ -4160,3 +4160,41 @@ slow free is uncached from then on (and always is with `SLOW_TCACHE` off).
 `unbound_slow_fallback_bypasses_the_default_tcache` checks the three paths over 96 rounds (64 B, 3,000 B and 20 KB
 blocks): with the old flags each hit 96 times of 96, with the fix 0 -- at the defaults, with `SLOW_TCACHE=1` and with
 `ALLOC_NATURAL_ALIGN=0`.
+
+## Corrections off by default (`MIG_CORRECTIONS`, default 0); tagged moves removed
+
+The tagged-moves port (597e9b1, `MIG_TAGGED`, the move ledger) is reverted, and the reconcile's
+CORRECTIONS -- the new-key rule's fence and the heal (`worker/policy/mod.rs`, `Observed`) -- are now off
+unless `MIG_CORRECTIONS=1` (read once per process; each cache copies it at construction,
+`AtomicStatus::corrections`, which tests pin per cache with `set_corrections`). Off:
+
+- the client reads no mark (its `Set` carries 0), and the worker probes neither `moved_since` nor, for a
+  replacing `Set`, `placement_of`: no fence, `reconcile_set_new_key` stays 0;
+- a slow-served hit is not healed -- except under `PAPER_GATE_ON_STALL=divert` or
+  `PAPER_GATE_PROMOTIONS=on`, where bytes lag a fast placement by design (`PolicyWorker::heals_needed`,
+  read once per worker pass, `heals_kept`); one such hit in 64 (`LAGGING_PROBE_EVERY`) is still judged as
+  the heal would judge it, plus its bytes' tier NOW (still slow; a promotion that landed after the client's
+  read is no lag), and counted `lagging_probe` (of `lagging_probe_samples`), never queued;
+- the PLAIN RULE (built tier, or the drain's last entry, against the placement) still runs on every `Set`:
+  it corrects the LFU stale latch and race (a);
+- the `InFlight` hand-off/finish counts stay (the probe's and the kept heal's "quiet" bucket check).
+
+With them off a stale queued move (races (i)-(iii), (b)) can leave a fresh value in the other tier --
+stranded in DRAM or lagging in CXL -- until the key's next `Set` (the plain rule), its eviction or delete,
+or the stack's next move of it; a key that is only read keeps it until evicted. Accepted on measurement:
+Meta kvcache_202401, tiered LRU, 8 clients, b64, da1a276 with only `MIG_TAGGED` differing
+(`meta_202401_lru_tiered` vs `meta_202401_lru_tiered_untagged`, `~/paper-cache-run/bp-promoload` on the
+cxl host): the untagged reconcile queued 41.5M correctives (9.0M heals) and every one was declined
+(applied == promotions + demotions, 219.2M real moves in both); the ledger skipped 0 stale moves in every
+run that day and cost +207 ns of SET mean (1,732 vs 1,525 ns; GET 1,234 vs 1,246).
+
+New `MIGSTATS` line, LAST: `mig_corrections= lagging_probe_samples= lagging_probe= fast_div=
+fast_div_min= fast_div_max= t_ms=`, where `fast_div` is the worker's per-pass P minus the stack's
+`fast_bytes_used` (last, lowest, highest; both extremes start at 0): stranded values and pending
+demotions push it up, lagging values and pending promotions pull it down.
+
+Tests: every test that asserts a fence or a heal pins the corrections on (reconcile_tests
+`corrections_on`, s4 R3); m1 (i)-(iii) and race (b) run twice, `corrections_off_*` showing the value
+left in the wrong tier only until the key's next `Set`; `corrections_off_a_lagging_value_is_probed_*`
+(the 1-in-64 probe), `corrections_off_divert_keeps_the_heal`, and promogate's
+`corrections_off_the_promotion_gate_keeps_the_heal`.
